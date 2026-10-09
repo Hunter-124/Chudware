@@ -44,9 +44,10 @@ constexpr float kPickerWDp    = 380.0f;  // default grouped-picker width (logica
 constexpr float kPickerMaxHFrac = 0.70f; // grouped picker never exceeds this share of the viewport
 constexpr int   kPickerDescLines = 2;    // picker descriptions wrap to at most this many lines
 constexpr int   kStatusLines  = 2;       // footer status / blocker: at most this many lines
-constexpr float kFadeBottomU  = 3.5f;    // scroll-body "more below" fade height (metrics::U)
+constexpr float kFadeBottomU  = 3.0f;    // scroll-body "more below" fade height above the cue band (metrics::U)
 constexpr float kFadeTopU     = 2.0f;    // scroll-body "more above" fade height (metrics::U)
 constexpr float kFadeChevronU = 1.0f;    // "more below" chevron half-width (metrics::U)
+constexpr float kCueBandU     = 2.5f;    // "more below" band the body content is clipped out of (metrics::U)
 constexpr float kCanvasMinWDp = 160.0f;
 constexpr float kCanvasMinHDp = 120.0f;
 constexpr float kMinTitleEm   = 8.0f;    // a header title never elides below ~8 em ...
@@ -217,9 +218,12 @@ struct PanelFrame {
     float           footStartY = 0.0f;
     float           savedMaxY  = 0.0f;      // host CursorMaxPos.y before the footer
     float           laneW      = 0.0f;      // scrollbar lane reserved in the body this frame
+    float           cueBandH   = 0.0f;      // bottom band clipped out of the body (0 = none pushed)
     bool            footer     = false;
     bool            inBody     = false;
     bool            pagePushed = false;
+    bool            cueAbove   = false;     // content scrolled past the top edge
+    bool            cueBelow   = false;     // more content below the bottom edge
     bool            hasSurf    = false;
     AdaptiveSurface surf;
 };
@@ -786,16 +790,36 @@ void panelBodyBegin(const char* page) {
                       ImGuiWindowFlags_NoScrollbar);
     ImGui::PopStyleVar();
     ImGui::Indent(-f.laneW);
+    // Scroll state is final for this frame once the child has begun (wheel/SetScroll land at the
+    // next Begin). Same phantom-overflow tolerance as drawWindowPillScrollbarV: cues exactly when
+    // the pill shows. While more content sits below, the bottom band is clipped out of the body
+    // (nested cards inherit the clip at their Begin), so the "more below" chevron owns that band
+    // and is never painted over a row's text.
+    ImGuiWindow* body     = ImGui::GetCurrentWindow();
+    const float  scrollY  = ImGui::GetScrollY();
+    const float  scrollMx = ImGui::GetScrollMaxY();
+    const bool   overflow = scrollMx > body->WindowPadding.y + ui::metrics::px(4.0f);
+    const float  edge     = ui::metrics::stroke(1.0f);
+    f.cueAbove = overflow && scrollY > edge;
+    f.cueBelow = overflow && scrollY < scrollMx - edge;
+    f.cueBandH = 0.0f;
+    if (f.cueBelow) {
+        f.cueBandH = ImMin(ui::metrics::U(kCueBandU), body->Size.y * 0.25f);
+        const float clipMaxY = body->Pos.y + body->Size.y - f.cueBandH;
+        ImGui::PushClipRect(body->ClipRect.Min, ImVec2(body->ClipRect.Max.x, clipMaxY), true);
+    }
     f.inBody = true;
 }
 
 namespace {
 // Scroll-edge cues over the body rect `r` (lane excluded): a fade into the pane surface at each
-// edge with content beyond it, plus a small down chevron while more content sits below. Drawn in
-// a NoInputs overlay child created after the body, so it paints ABOVE the body's card children
-// (child windows render after their parent's draw list) and never takes a click or the wheel.
+// edge with content beyond it, plus a small down chevron while more content sits below. The
+// chevron sits in the bottom `bandH` band the body clipped its content out of (panelBodyBegin),
+// with the fade just above it, so it never overdraws a row. Drawn in a NoInputs overlay child
+// created after the body, so it paints ABOVE the body's card children (child windows render
+// after their parent's draw list) and never takes a click or the wheel.
 // Layout-neutral: the host's cursor and content size are restored afterwards.
-void bodyEdgeCues(const ImRect& r, bool above, bool below, const ImVec4& surface) {
+void bodyEdgeCues(const ImRect& r, bool above, bool below, float bandH, const ImVec4& surface) {
     if ((!above && !below) || r.GetWidth() <= 0.0f || r.GetHeight() <= 0.0f) return;
     const LayoutSnap snap;
     ImGui::SetCursorScreenPos(r.Min);
@@ -813,10 +837,13 @@ void bodyEdgeCues(const ImRect& r, bool above, bool below, const ImVec4& surface
         dl->AddRectFilledMultiColor(r.Min, ImVec2(r.Max.x, r.Min.y + fh), solid, solid, clear, clear);
     }
     if (below) {
-        const float fh = ImMin(ui::metrics::U(kFadeBottomU), r.GetHeight() * 0.5f);
-        dl->AddRectFilledMultiColor(ImVec2(r.Min.x, r.Max.y - fh), r.Max, clear, clear, solid, solid);
-        const float cr = ui::metrics::U(kFadeChevronU);
-        paintChevronDown(dl, ImVec2((r.Min.x + r.Max.x) * 0.5f, r.Max.y - fh * 0.45f), cr,
+        const float bandY = r.Max.y - bandH;
+        const float fh    = ImMin(ui::metrics::U(kFadeBottomU), (bandY - r.Min.y) * 0.5f);
+        dl->AddRectFilledMultiColor(ImVec2(r.Min.x, bandY - fh), ImVec2(r.Max.x, bandY), clear, clear,
+                                    solid, solid);
+        if (bandH > 0.0f) dl->AddRectFilled(ImVec2(r.Min.x, bandY), r.Max, solid);
+        const float cr = ImMin(ui::metrics::U(kFadeChevronU), bandH);
+        paintChevronDown(dl, ImVec2((r.Min.x + r.Max.x) * 0.5f, bandY + bandH * 0.5f), cr,
                          role(palette.textDim));
     }
     ImGui::EndChild();
@@ -828,15 +855,9 @@ void panelBodyEnd() {
     if (g_panels.empty()) return;
     PanelFrame& f = g_panels.back();
     if (!f.inBody) return;
+    if (f.cueBandH > 0.0f) ImGui::PopClipRect();   // before the scrollbar paints the full lane
     ImGui::Indent(f.laneW);   // undo before the scrollbar geometry read
-    // Same phantom-overflow tolerance as drawWindowPillScrollbarV: cues exactly when the pill shows.
-    ImGuiWindow* body     = ImGui::GetCurrentWindow();
-    const float  scrollY  = ImGui::GetScrollY();
-    const float  scrollMx = ImGui::GetScrollMaxY();
-    const bool   overflow = scrollMx > body->WindowPadding.y + ui::metrics::px(4.0f);
-    const float  edge     = ui::metrics::stroke(1.0f);
-    const bool   above    = overflow && scrollY > edge;
-    const bool   below    = overflow && scrollY < scrollMx - edge;
+    ImGuiWindow* body = ImGui::GetCurrentWindow();
     const ImRect cueRect(body->Pos, ImVec2(body->Pos.x + body->Size.x - f.laneW,
                                            body->Pos.y + body->Size.y));
     const AdaptiveSurface surf = f.hasSurf ? f.surf : inkSurf();
@@ -844,11 +865,14 @@ void panelBodyEnd() {
     ImGui::EndChild();
     // Fade into the pane's own surface (its adaptive tint when the host passed one).
     const ImVec4 surface = (f.hasSurf && f.surf.tint.w > 0.0f) ? f.surf.tint : roleV(palette.glassBg);
-    bodyEdgeCues(cueRect, above, below, surface);
+    bodyEdgeCues(cueRect, f.cueAbove, f.cueBelow, f.cueBandH, surface);
     if (f.pagePushed) ImGui::PopID();
     f.pagePushed = false;
     f.inBody     = false;
     f.laneW      = 0.0f;
+    f.cueBandH   = 0.0f;
+    f.cueAbove   = false;
+    f.cueBelow   = false;
 }
 
 void panelFooterBegin() {

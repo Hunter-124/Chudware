@@ -602,6 +602,14 @@ void drawLeftPane(AppState& st,
                                      nullptr, lpFlags);
     ImGui::PopStyleVar(2);
     if (!lpOpen) { ImGui::End(); return; }
+    // Dark theme: one theme glass slab under the whole column (no-op in light, where the column
+    // stays transparent over the viewport). Painted first so the resize hairline and every row
+    // draw above it; its surface matches the theme-toned ink adaptivePanel hands the column.
+    {
+        const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+        ui::pinnedColumnSurface(ImGui::GetWindowDrawList(), ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)),
+                                ui::GlassGroup::FeatureManager);
+    }
 
     // Right-edge resize boundary, submitted before any content so the column body (submitted later,
     // overlap-permissive strip) keeps every click. Electronics forces its width and mobile pins the

@@ -993,7 +993,11 @@ std::string fmtTokens(int n) {
 //   2. Cached model catalog metadata for the selected (provider, model): the real window the
 //      provider reports, so a known model shows its capacity instead of a guess.
 //   3. ui::defaultContextWindowForModel() with that catalog row folded into a ModelInfo probe.
-//      Its substring guess table is the last resort when the catalog has no usable row.
+//      Its substring guess table is the last resort when the catalog has no usable row. That
+//      answer is a GUESS: the composer meter (composer.cpp contextMeterWindow) shows usage
+//      without a denominator or over-limit color until a catalog row or the provider reports
+//      the real window. The catalog itself is persisted across restarts (settings.cpp), so a
+//      known model is never in this branch on startup.
 // This is no longer a plain mirror of core default_context_window: the most authoritative value
 // of all is st.lastContextWindow (what the server reported for the model that ACTUALLY ran),
 // which outranks every branch here. The composer's context meter applies it — this function only

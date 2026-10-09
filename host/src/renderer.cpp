@@ -1755,7 +1755,30 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     // solid faces (depthMask stays off so they never occlude the mesh).
     drawReferencePlanes(mvp);
     drawRefDatums(mvp, /*axesOnly=*/false);
-    drawRefDatums(mvp, /*axesOnly=*/true);
+    {
+        // Datum axes stay inside the viewport's clear rect when one is set (setDatumAxisClip):
+        // the image runs under the glass columns and crisp dashed axes would cross pane text.
+        // Caller scissor state is saved and restored exactly.
+        const bool axisClip = datumAxisClip_ && sw_ > 0 && sh_ > 0;
+        GLint prevBox[4] = {0, 0, 0, 0};
+        GLboolean prevScissor = GL_FALSE;
+        if (axisClip) {
+            prevScissor = glIsEnabled(GL_SCISSOR_TEST);
+            glGetIntegerv(GL_SCISSOR_BOX, prevBox);
+            const float* c = datumAxisClipUV_;
+            const int x0 = (int)std::floor(c[0] * (float)sw_);
+            const int x1 = (int)std::ceil(c[2] * (float)sw_);
+            const int y0 = (int)std::floor((1.0f - c[3]) * (float)sh_);   // GL origin bottom-left
+            const int y1 = (int)std::ceil((1.0f - c[1]) * (float)sh_);
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(x0, y0, std::max(0, x1 - x0), std::max(0, y1 - y0));
+        }
+        drawRefDatums(mvp, /*axesOnly=*/true);
+        if (axisClip) {
+            glScissor(prevBox[0], prevBox[1], prevBox[2], prevBox[3]);
+            if (!prevScissor) glDisable(GL_SCISSOR_TEST);
+        }
+    }
 
     endGpuTimer(sceneTimer_, sceneMs_, sceneTimingValid_);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -2180,6 +2203,14 @@ void Renderer::refreshDatumBatch() {
     datumBatchHidden_ = hiddenDatums_;
     datumBatchPalette_ = pal;
     datumBatchValid_ = true;
+}
+
+void Renderer::setDatumAxisClip(float u0, float v0, float u1, float v1) {
+    u0 = std::clamp(u0, 0.0f, 1.0f); u1 = std::clamp(u1, u0, 1.0f);
+    v0 = std::clamp(v0, 0.0f, 1.0f); v1 = std::clamp(v1, v0, 1.0f);
+    datumAxisClipUV_[0] = u0; datumAxisClipUV_[1] = v0;
+    datumAxisClipUV_[2] = u1; datumAxisClipUV_[3] = v1;
+    datumAxisClip_ = true;
 }
 
 // Feature reference geometry: datum axes (lines), planes (quads), points (markers), and coordinate

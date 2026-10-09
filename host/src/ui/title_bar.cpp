@@ -854,7 +854,7 @@ struct FilMenuDrawer {
             ImGui::MenuItem("Viewport",         nullptr, &st.showViewport);
             ImGui::Separator();
             bool isLight = (ui::activeTheme == ui::Theme::Light);
-            if (ImGui::MenuItem("Light theme (SolidWorks-style)", nullptr, isLight)) {
+            if (ImGui::MenuItem("Light theme", nullptr, isLight)) {
                 ui::Theme next = isLight ? ui::Theme::Dark : ui::Theme::Light;
                 ui::applyTheme(next, st.scale);
                 st.settings.theme = (next == ui::Theme::Light) ? "light" : "dark";

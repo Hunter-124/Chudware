@@ -391,6 +391,10 @@ public:
     bool routeSetupDrop(AppState& st, const std::string& tool,
                         const nlohmann::json& selector, uint32_t body, uint32_t topo);
     nlohmann::json activeStudyDefinition() const;
+    // Exactly the JSON the Advanced parameters editor renders for a study definition: only
+    // the keys that study's kind uses (from its "type"), floats in shortest round-trip form.
+    // Apply merges the hidden keys and exact stored floats back from the definition.
+    static nlohmann::json parameterEditorView(const nlohmann::json& definition);
     nlohmann::json activeStudyResult() const {
         return sel_ >= 0 && sel_ < static_cast<int>(studies_.size()) ?
                studies_[sel_].advResult : nlohmann::json();

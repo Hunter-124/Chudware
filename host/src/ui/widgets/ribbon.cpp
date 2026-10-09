@@ -124,7 +124,7 @@ static_assert(sizeof(kTabDisplayOrder) / sizeof(kTabDisplayOrder[0]) == kRibbonT
 static int s_workspace = 0;
 
 // sim-gui: dynamic command gating. Commands whose cmd_id starts with s_disabledPrefix render
-// disabled with s_disabledReason in their tooltip (instead of the static "Coming soon"). Used by
+// disabled with s_disabledReason in their tooltip (instead of the static reserved-row reason). Used by
 // SimManager to grey the EM tools while the em_* solver backend is not installed. A second
 // consumer exists: ribbon_dynDisabledReason also falls through to ui::webGapReason(cmd_id),
 // which greys web-unsupported commands in the WASM build (T-RF12, data-driven from
@@ -158,6 +158,22 @@ static const char* ribbon_dynDisabledReason(const char* cmd_id) {
 // gates above. Every button/flyout/overflow row goes through this.
 static bool ribbon_cmdEnabled(const ui::RibbonCmd* c) {
     return !c->stretch && !ribbon_dynDisabledReason(c->cmd_id);
+}
+
+// Why a schema-reserved (stretch) row is greyed: the concrete missing capability, so a hover tells
+// an engineer what is not supported instead of a placeholder. Unlisted rows get a plain statement.
+static const char* ribbon_reservedReason(const char* cmd_id) {
+    struct R { const char* id; const char* why; };
+    static const R kReasons[] = {
+        {"sk_spline_surface", "Not available yet: splines cannot be sketched directly on curved "
+                              "faces."},
+        {"sim_load_torque",   "Not available yet: the structural solver has no torque or moment "
+                              "load."},
+    };
+    if (cmd_id)
+        for (const auto& r : kReasons)
+            if (std::strcmp(r.id, cmd_id) == 0) return r.why;
+    return "Not available in this version.";
 }
 
 // W17 + per-workspace: control which tabs appear in the ribbon for the current workspace.
@@ -910,6 +926,7 @@ static const char* ribbon_tipFor(const char* cmd_id) {
         {"sim_fixture",       "Restrain the selected faces (zero displacement)."},
         {"sim_load_force",    "Apply a force to the selected faces."},
         {"sim_load_pressure", "Apply a pressure normal to the selected faces."},
+        {"sim_load_torque",   "Apply a torque about an axis to the selected faces."},
         {"sim_load_heat",     "Apply a heat load to the selected faces of a thermal FEA study: heat "
                               "flux or convection to ambient."},
         {"sim_mesh",          "Set the mesh size and generate the study's mesh."},
@@ -1166,7 +1183,7 @@ static void ribbon_tooltip(const char* title, const char* cmd_id, const char* ic
         ImVec2 ws = ImGui::GetWindowSize();
         ui::glassBackground(ImGui::GetWindowDrawList(), wp, ImVec2(wp.x + ws.x, wp.y + ws.y));
         // Icon mini-preview: the same glyph the button shows, so the tooltip previews what the tool
-        // does. Tinted like the button — white when enabled, grey when disabled / "Coming soon".
+        // does. Tinted like the button — white when enabled, grey when disabled / reserved.
         const bool  hasIcon  = iconName && *iconName;
         if (hasIcon) {
             float isz = 36.0f * ui::uiScale;
@@ -1187,10 +1204,10 @@ static void ribbon_tooltip(const char* title, const char* cmd_id, const char* ic
             ImGui::PopStyleColor();
         }
         if (!enabled) {
-            // Dynamic gate (e.g. "EM solver not installed") beats the static "Coming soon".
+            // Dynamic gate (e.g. "EM solver not installed") beats the static reserved-row reason.
             const char* why = ribbon_dynDisabledReason(cmd_id);
             ImGui::PushStyleColor(ImGuiCol_Text, col(ui::palette.textDisabled));
-            ImGui::TextUnformatted(why ? why : "Coming soon");
+            ImGui::TextUnformatted(why ? why : ribbon_reservedReason(cmd_id));
             ImGui::PopStyleColor();
         }
         ImGui::PopTextWrapPos();
@@ -1742,7 +1759,7 @@ static const char* ribbon_flyoutPopup(const char* parentId,
             }
 
             // Same glass tooltip as the buttons: description, and the real disabled reason (e.g. a
-            // web-build gap) instead of a blanket "Coming soon".
+            // web-build gap, or what a reserved row lacks).
             if (rowHov && ribbon_tooltipsEnabled())
                 ribbon_tooltip(sc->label, sc->cmd_id, sc->icon, scEnabled);
 

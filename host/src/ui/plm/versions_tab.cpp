@@ -3,6 +3,8 @@
 #include "plm_hub.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -29,9 +31,21 @@ struct VersionsView {
     float panX = 0.0f, panY = 0.0f, panTargetX = 0.0f, panTargetY = 0.0f;
     bool fit = true;
     bool compareLoading = false, timelineLoading = false;
-    int comparePending = 0;  // outstanding per-item plm_compare calls for compareKey
+    // "What changed in this version" is one plm_compare per project item. They run ONE AT A
+    // TIME (pumped from the inspector) instead of being queued all at once: the GUI's RPCs share
+    // a single FIFO, so a 300-item fan-out used to park every other panel's request behind it.
+    struct CompareJob { std::string itemId, label; };
+    std::vector<CompareJob> compareQueue;
+    size_t compareNext = 0;          // next job to issue
+    size_t compareDone = 0;          // answered jobs (progress)
+    int compareInFlight = 0;         // issued, unanswered jobs
+    std::string compareA, compareB;  // commit pair of compareKey
+    bool pairCompare = false;        // "Compare these two" pressed for selected + compareSecond
     std::string compareKey, compareSummary, compareError;
     std::vector<std::string> compareChanges;
+    // Runs of consecutive no-change checkpoints the user expanded (keyed by the run's first
+    // commit); every other run draws as one summary row.
+    std::unordered_set<std::string> expandedRuns;
     std::string timelineKey, timelineError;
     struct TimelineRow { std::string authoredAt, authoredBy, summary; };
     std::vector<TimelineRow> timeline;
@@ -46,6 +60,39 @@ float px(float v) { return v * ui::uiScale; }
 
 std::string shortSha(const std::string& sha) {
     return sha.size() > 8 ? sha.substr(0, 8) : sha;
+}
+
+constexpr const char* kNoDesignChanges = "No design changes.";
+
+// A bare commit id is not a message: a hex run of hash length.
+bool looksLikeHash(const std::string& s) {
+    if (s.size() < 7 || s.size() > 64) return false;
+    return std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isxdigit(c) != 0; });
+}
+
+bool humanText(const std::string& s) { return !s.empty() && !looksLikeHash(s); }
+
+// The words a commit row shows: its message, else its change summary, else what kind of
+// version it is and when — never a raw hash (that is drawn separately as dim secondary text).
+std::string versionLabel(const PlmVersionNodeRow& n) {
+    if (humanText(n.message)) return n.message;
+    if (humanText(n.summary)) return n.summary;
+    const char* what = n.kind == "release" ? "Release"
+                     : n.kind == "merge"   ? "Merge"
+                     : n.kind == "restore" ? "Restore"
+                     : n.kind == "auto"    ? "Auto-save"
+                                           : "Checkpoint";
+    const std::string when = plmNiceTime(n.authoredAt);
+    return when.empty() ? std::string(what) : std::string(what) + " \xc2\xb7 " + when;
+}
+
+// True when the row's words came from the fallback, so the hash is worth showing beside it.
+bool labelIsFallback(const PlmVersionNodeRow& n) {
+    return !humanText(n.message) && !humanText(n.summary);
+}
+
+bool isNoChange(const PlmVersionNodeRow& n) {
+    return !humanText(n.message) && n.summary == kNoDesignChanges;
 }
 
 bool containsInsensitive(const std::string& haystack, const char* needle) {
@@ -115,31 +162,25 @@ void callMutation(AppState& st, const char* method, nlohmann::json p, const char
 // not exist at both ends. "What changed in this version" is therefore the union over the
 // project's items, with the not-present refusals treated as "untouched" rather than surfaced
 // as an error (which is what made this panel read as broken on a perfectly good commit).
-void fetchCompare(AppState& st, const PlmVersionNodeRow& node) {
+// Issues the next queued item compare when none is in flight; called every frame the
+// changes section is open, so the walk pauses when the user looks elsewhere.
+void pumpCompare(AppState& st) {
+    // A few in flight keeps the walk quick while any other panel's request still waits
+    // behind at most this many short compares.
+    constexpr int kMaxInFlight = 4;
     auto& V = view();
-    if (node.parents.empty()) return;
-    const std::string key = node.parents.front() + "|" + node.commit;
-    if (V.compareLoading || V.compareKey == key) return;
-    if (g_plmHub.items.empty()) { plmEnsureItems(st); return; }
-    V.compareKey = key;
-    V.compareSummary.clear(); V.compareChanges.clear(); V.compareError.clear();
-    V.comparePending = 0;
-    for (const auto& item : g_plmHub.items) {
-        if (item.itemId.empty()) continue;
-        ++V.comparePending;
-        V.compareLoading = true;
-        nlohmann::json p{{"path", st.plmProjectPath()}, {"item_id", item.itemId},
-                         {"commit_a", node.parents.front()}, {"commit_b", node.commit},
+    while (V.compareInFlight < kMaxInFlight && V.compareNext < V.compareQueue.size()) {
+        const VersionsView::CompareJob job = V.compareQueue[V.compareNext++];
+        ++V.compareInFlight;
+        nlohmann::json p{{"path", st.plmProjectPath()}, {"item_id", job.itemId},
+                         {"commit_a", V.compareA}, {"commit_b", V.compareB},
                          {"visual", false}, {"annotate", false}};
-        std::string label = item.path;
-        if (const size_t slash = label.find_last_of("/\\"); slash != std::string::npos)
-            label = label.substr(slash + 1);
-        if (label.empty()) label = item.partNumber.empty() ? item.itemId : item.partNumber;
-        st.rpc.call("plm_compare", p, [key, label](const core::RpcResult& r) {
+        st.rpc.call("plm_compare", p, [key = V.compareKey, label = job.label](const core::RpcResult& r) {
             auto& V = view();
-            if (V.compareKey != key) return;
-            if (V.comparePending > 0) --V.comparePending;
-            V.compareLoading = V.comparePending > 0;
+            if (V.compareKey != key) return;  // superseded; the new walk owns the counters
+            if (V.compareInFlight > 0) --V.compareInFlight;
+            ++V.compareDone;
+            V.compareLoading = V.compareInFlight > 0 || V.compareNext < V.compareQueue.size();
             std::string reason;
             if (!plmOk(r, reason)) return;  // absent at one end == untouched here
             std::string summary = r.result.value("summary", std::string());
@@ -150,10 +191,45 @@ void fetchCompare(AppState& st, const PlmVersionNodeRow& node) {
                         (it->is_string() ? it->get<std::string>() : it->dump()));
                 }
             }
-            if (!summary.empty()) V.compareChanges.push_back(label + " — " + summary);
+            if (!summary.empty() && summary != kNoDesignChanges)
+                V.compareChanges.push_back(label + " — " + summary);
         });
     }
-    if (V.comparePending == 0) V.compareLoading = false;
+    V.compareLoading = V.compareInFlight > 0 || V.compareNext < V.compareQueue.size();
+}
+
+// Start (or keep pumping) the walk for commitA -> commitB. `noDesignChange` is the vault's own
+// verdict for exactly that pair (a checkpoint against its first parent); walking every item
+// would only re-derive it, so the panel says so without a single compare.
+void fetchCompare(AppState& st, const std::string& commitA, const std::string& commitB,
+                  bool noDesignChange) {
+    auto& V = view();
+    if (commitA.empty() || commitB.empty()) return;
+    const std::string key = commitA + "|" + commitB;
+    if (V.compareKey == key) { pumpCompare(st); return; }
+    if (g_plmHub.items.empty()) { plmEnsureItems(st); return; }
+    V.compareKey = key;
+    V.compareA = commitA;
+    V.compareB = commitB;
+    V.compareSummary.clear(); V.compareChanges.clear(); V.compareError.clear();
+    V.compareQueue.clear();
+    V.compareNext = V.compareDone = 0;
+    V.compareInFlight = 0;
+    if (noDesignChange) {
+        V.compareSummary = "No design changes in this checkpoint.";
+        V.compareLoading = false;
+        return;
+    }
+    V.compareQueue.reserve(g_plmHub.items.size());
+    for (const auto& item : g_plmHub.items) {
+        if (item.itemId.empty()) continue;
+        std::string label = item.path;
+        if (const size_t slash = label.find_last_of("/\\"); slash != std::string::npos)
+            label = label.substr(slash + 1);
+        if (label.empty()) label = item.partNumber.empty() ? item.itemId : item.partNumber;
+        V.compareQueue.push_back({item.itemId, std::move(label)});
+    }
+    pumpCompare(st);
 }
 
 // plm_timeline is the AI-VC micro-history: per-DOC agent checkpoints, addressed by doc_id,
@@ -221,11 +297,10 @@ void drawToolbar(AppState& st) {
     const bool two = !G.selected.empty() && !G.compareSecond.empty();
     if (kit::secondaryButton(two ? "Compare these two" : "Compare", two,
                              "Ctrl-click or Cmd-click a second commit")) {
-        const PlmVersionNodeRow* a = selectedNode();
-        if (a) {
-            PlmVersionNodeRow temp = *a;
-            temp.parents = {G.compareSecond};
-            fetchCompare(st, temp);
+        // The inspector keeps pumping this pair while both commits stay picked.
+        if (const PlmVersionNodeRow* a = selectedNode()) {
+            V.pairCompare = true;
+            fetchCompare(st, G.compareSecond, a->commit, /*noDesignChange=*/false);
         }
     }
 }
@@ -248,9 +323,43 @@ void drawCanvas(AppState& st, ImVec2 size) {
     const auto lanes = assignLanes(G.nodes);
     const float lanePitch = px(34.0f), rowPitch = px(58.0f), left = px(42.0f), top = px(34.0f);
     int maxLane = 0; for (const auto& l : lanes) maxLane = std::max(maxLane, l.lane);
-    if (V.fit && !G.nodes.empty()) {
+
+    // Fold each run of consecutive no-change checkpoints (a straight first-parent chain on one
+    // lane, carrying no refs) into ONE summary row unless the user expanded that run. Every
+    // node maps to a display row; folded members share their run's row.
+    const size_t nodeCount = G.nodes.size();
+    std::vector<int> rowOf(nodeCount, 0);
+    std::vector<size_t> rowNode;  // first node of each display row
+    std::vector<int> rowRun;      // nodes folded into that row (1 = an ordinary commit)
+    rowNode.reserve(nodeCount);
+    rowRun.reserve(nodeCount);
+    auto foldable = [&](size_t i) {
+        const auto& n = G.nodes[i];
+        if (!isNoChange(n) || n.parents.size() > 1 || n.hasRelease || n.pin) return false;
+        if (n.commit == G.head || n.commit == G.selected || n.commit == G.compareSecond)
+            return false;
+        for (const auto& ref : n.refs)
+            if (!ref.name.empty()) return false;
+        return true;
+    };
+    for (size_t i = 0; i < nodeCount;) {
+        size_t j = i + 1;
+        if (foldable(i) && !V.expandedRuns.count(G.nodes[i].commit)) {
+            while (j < nodeCount && foldable(j) && lanes[j].lane == lanes[i].lane &&
+                   !G.nodes[j - 1].parents.empty() &&
+                   G.nodes[j - 1].parents.front() == G.nodes[j].commit)
+                ++j;
+        }
+        for (size_t k = i; k < j; ++k) rowOf[k] = (int)rowNode.size();
+        rowNode.push_back(i);
+        rowRun.push_back((int)(j - i));
+        i = j;
+    }
+    const int rowCount = (int)rowNode.size();
+
+    if (V.fit && rowCount > 0) {
         const float worldW = left * 2.0f + lanePitch * (maxLane + 1) + px(280.0f);
-        const float worldH = top * 2.0f + rowPitch * G.nodes.size();
+        const float worldH = top * 2.0f + rowPitch * rowCount;
         V.zoomTarget = std::clamp(std::min(size.x / worldW, size.y / worldH), 0.35f, 1.25f);
         V.panTargetX = px(16.0f); V.panTargetY = px(10.0f); V.fit = false;
     }
@@ -284,14 +393,15 @@ void drawCanvas(AppState& st, ImVec2 size) {
     }
 
     std::unordered_map<std::string, size_t> index;
-    for (size_t i = 0; i < G.nodes.size(); ++i) index[G.nodes[i].commit] = i;
-    for (size_t i = 0; i < G.nodes.size(); ++i) {
+    for (size_t i = 0; i < nodeCount; ++i) index[G.nodes[i].commit] = i;
+    for (size_t i = 0; i < nodeCount; ++i) {
         const auto& n = G.nodes[i];
-        const ImVec2 a = screen(lanes[i].lane, (int)i);
+        const ImVec2 a = screen(lanes[i].lane, rowOf[i]);
         for (size_t p = 0; p < n.parents.size(); ++p) {
             auto found = index.find(n.parents[p]); if (found == index.end()) continue;
             const size_t pi = found->second;
-            const ImVec2 b = screen(lanes[pi].lane, (int)pi);
+            if (rowOf[pi] == rowOf[i] && lanes[pi].lane == lanes[i].lane) continue;  // inside a fold
+            const ImVec2 b = screen(lanes[pi].lane, rowOf[pi]);
             const float bend = std::min(px(26.0f), std::fabs(b.y - a.y) * 0.35f);
             dl->AddBezierCubic(a, ImVec2(a.x, a.y + bend), ImVec2(b.x, b.y - bend), b,
                                laneColor((int)(p == 0 ? lanes[i].lane : lanes[pi].lane), 0.78f), px(2.0f));
@@ -300,6 +410,7 @@ void drawCanvas(AppState& st, ImVec2 size) {
 
     std::vector<ImRect> labels;
     std::string hoverCommit;
+    bool hoverFolded = false;
     // Rows are a fixed pitch, so the visible span is arithmetic — at limit=400 nodes this
     // keeps the per-frame draw work proportional to what is actually on screen.
     const float rowStepPx = rowPitch * V.zoom;
@@ -307,20 +418,36 @@ void drawCanvas(AppState& st, ImVec2 size) {
         ? std::max(0, (int)std::floor((-V.panY - top * V.zoom - rowStepPx) / rowStepPx))
         : 0;
     const int lastRow = rowStepPx > 0.0f
-        ? std::min((int)G.nodes.size(), (int)std::ceil((size.y - V.panY) / rowStepPx) + 1)
-        : (int)G.nodes.size();
-    for (size_t i = (size_t)firstRow; i < (size_t)lastRow; ++i) {
+        ? std::min(rowCount, (int)std::ceil((size.y - V.panY) / rowStepPx) + 1)
+        : rowCount;
+    for (int row = firstRow; row < lastRow; ++row) {
+        const size_t i = rowNode[(size_t)row];
+        const int run = rowRun[(size_t)row];
         const auto& n = G.nodes[i];
-        std::string searchable = n.message + " " + n.summary + " " + n.author.display;
+        std::string label, secondary;
+        if (run > 1) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "%d checkpoints without design changes", run);
+            label = buf;
+        } else {
+            label = versionLabel(n);
+            if (labelIsFallback(n)) secondary = shortSha(n.commit);
+        }
+        std::string searchable = label + " " + n.message + " " + n.summary + " " + n.author.display;
         for (const auto& ref : n.refs) searchable += " " + ref.name;
         if (!containsInsensitive(searchable, G.search)) continue;
-        const ImVec2 c = screen(lanes[i].lane, (int)i);
+        const ImVec2 c = screen(lanes[i].lane, row);
         const float radius = px(n.kind == "auto" ? 4.0f : 7.0f) * std::max(0.75f, V.zoom);
         const float dx = ImGui::GetIO().MousePos.x - c.x, dy = ImGui::GetIO().MousePos.y - c.y;
-        if (hovered && dx * dx + dy * dy <= radius * radius) hoverCommit = n.commit;
+        const float hitR = run > 1 ? radius + px(4.0f) : radius;
+        if (hovered && dx * dx + dy * dy <= hitR * hitR) { hoverCommit = n.commit; hoverFolded = run > 1; }
         const bool selected = n.commit == G.selected || n.commit == G.compareSecond;
         const ImU32 color = laneColor(lanes[i].lane);
-        if (n.kind == "release") {
+        if (run > 1) {
+            // A folded run reads as a small stack: the dot plus a ring around it.
+            dl->AddCircleFilled(c, radius, color);
+            dl->AddCircle(c, radius + px(3.0f), laneColor(lanes[i].lane, 0.55f), 20, px(1.5f));
+        } else if (n.kind == "release") {
             dl->AddCircleFilled(c, radius, Palette::toU32(palette.panelBg));
             dl->AddCircle(c, radius, color, 20, px(3.0f));
         } else if (n.kind == "merge") {
@@ -332,18 +459,22 @@ void drawCanvas(AppState& st, ImVec2 size) {
             dl->AddCircleFilled(c, radius, color);
         }
         if (selected || n.commit == G.head) dl->AddCircle(c, radius + px(3.0f), Palette::toU32(palette.accent), 24, px(2.0f));
-        std::string label = n.message.empty() ? n.summary : n.message;
-        if (label.empty()) label = shortSha(n.commit);
         const ImVec2 lp(c.x + px(14.0f), c.y - ImGui::GetTextLineHeight() * 0.5f);
         const ImVec2 ts = ImGui::CalcTextSize(label.c_str());
-        ImRect r(lp, ImVec2(lp.x + std::min(ts.x, px(260.0f)), lp.y + ts.y));
+        const float labelW = std::min(ts.x, px(260.0f));
+        const float secondaryW = secondary.empty() ? 0.0f
+            : px(8.0f) + ImGui::CalcTextSize(secondary.c_str()).x;
+        ImRect r(lp, ImVec2(lp.x + labelW + secondaryW, lp.y + ts.y));
         bool clash = false; for (const auto& used : labels) if (used.Overlaps(r)) { clash = true; break; }
         if (!clash || selected || n.commit == hoverCommit) {
             labels.push_back(r);
             const std::string elided = kit::elide(label.c_str(), px(260.0f));
             dl->AddText(lp, Palette::toU32(selected ? palette.text : palette.textDim), elided.c_str());
+            if (!secondary.empty())
+                dl->AddText(ImVec2(lp.x + labelW + px(8.0f), lp.y),
+                            Palette::toU32(palette.textDisabled), secondary.c_str());
         }
-        float badgeX = lp.x + std::min(ts.x, px(260.0f)) + px(8.0f);
+        float badgeX = lp.x + labelW + secondaryW + px(8.0f);
         // A tip commit carries BOTH a branch ref and a head ref with the same name, and the
         // pin collapse can hand the release node a second copy. The accent rim already says
         // "this is HEAD", so chip only distinct branch/version/release names.
@@ -359,16 +490,20 @@ void drawCanvas(AppState& st, ImVec2 size) {
             badgeX = p1.x + px(5.0f);
         }
     }
+    if (hoverFolded) kit::tooltip("Click to show each checkpoint");
     // Select on RELEASE and only when the press did not turn into a pan drag: the canvas
     // pans with the left button too, so selecting on press would fire on every drag start.
     const bool dragged = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left).x != 0.0f ||
                          ImGui::GetMouseDragDelta(ImGuiMouseButton_Left).y != 0.0f;
     if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Left) && !dragged &&
         !hoverCommit.empty()) {
-        if (ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeySuper) {
-            if (hoverCommit != G.selected) G.compareSecond = hoverCommit;
+        if (hoverFolded) {
+            V.expandedRuns.insert(hoverCommit);  // unfold; the members draw individually
+        } else if (ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeySuper) {
+            if (hoverCommit != G.selected) { G.compareSecond = hoverCommit; V.pairCompare = false; }
         } else {
             G.selected = hoverCommit; G.compareSecond.clear();
+            V.pairCompare = false;
             V.compareKey.clear(); V.timelineKey.clear();
         }
     }
@@ -379,8 +514,8 @@ void drawInspector(AppState& st, const PlmVersionNodeRow& n) {
     auto& G = g_plmHub.versionsGraph;
     auto& V = view();
     plmSectionHeader("Version details", "history");
-    ImGui::TextUnformatted((n.message.empty() ? n.summary : n.message).c_str());
-    ImGui::TextDisabled("%s  %s", shortSha(n.commit).c_str(), n.authoredAt.c_str());
+    ImGui::TextWrapped("%s", versionLabel(n).c_str());
+    ImGui::TextDisabled("%s  %s", shortSha(n.commit).c_str(), plmNiceTime(n.authoredAt).c_str());
     if (!n.author.display.empty()) ImGui::Text("By %s", n.author.display.c_str());
     if (!n.ai.model.empty()) {
         kit::valueChip("AI model", n.ai.model.c_str(), kit::Tone::Accent);
@@ -416,19 +551,37 @@ void drawInspector(AppState& st, const PlmVersionNodeRow& n) {
     }
     ImGui::Separator();
     if (ImGui::CollapsingHeader("Show changes", ImGuiTreeNodeFlags_DefaultOpen)) {
-        fetchCompare(st, n);
-        if (V.compareLoading) kit::spinner("Comparing geometry and document changes");
-        else if (!V.compareError.empty()) kit::inlineStatus(V.compareError.c_str(), kit::Tone::Warn);
-        else {
+        // An explicit "Compare these two" pair wins while both commits stay picked; otherwise
+        // the version is compared against its first parent.
+        const bool pair = V.pairCompare && !G.compareSecond.empty();
+        if (pair)
+            fetchCompare(st, G.compareSecond, n.commit, /*noDesignChange=*/false);
+        else if (!n.parents.empty())
+            fetchCompare(st, n.parents.front(), n.commit, isNoChange(n));
+        if (!V.compareError.empty()) {
+            kit::inlineStatus(V.compareError.c_str(), kit::Tone::Warn);
+        } else if (!pair && n.parents.empty()) {
+            kit::emptyState("history", "First commit", "There is no parent version to compare.");
+        } else {
+            // Short spinner copy so it fits the narrow inspector; progress on its own line.
+            if (V.compareLoading) {
+                kit::spinner("Comparing changes");
+                char progress[64];
+                std::snprintf(progress, sizeof(progress), "%zu of %zu files checked",
+                              V.compareDone, V.compareQueue.size());
+                kit::dimText(progress);
+            }
             if (!V.compareSummary.empty()) ImGui::TextWrapped("%s", V.compareSummary.c_str());
             // BulletText does not wrap, and a doc_diff row is long enough to be clipped to
-            // uselessness in a 300px inspector.
+            // uselessness in a 300px inspector. Rows found so far show while the walk runs.
             for (const auto& change : V.compareChanges) {
                 ImGui::Bullet();
                 ImGui::SameLine();
                 ImGui::TextWrapped("%s", change.c_str());
             }
-            if (n.parents.empty()) kit::emptyState("history", "First commit", "There is no parent version to compare.");
+            if (!V.compareLoading && V.compareSummary.empty() && V.compareChanges.empty() &&
+                !V.compareKey.empty())
+                kit::dimText("No differences found.");
         }
     }
     if (ImGui::CollapsingHeader("AI activity", ImGuiTreeNodeFlags_DefaultOpen)) {

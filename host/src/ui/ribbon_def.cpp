@@ -426,6 +426,8 @@ static const RibbonCmd kCmds[] = {
     { "dwg_fit",          "Fit",           "zoom_fit",      "View Layout", "Sheet", false, nullptr, false, CommandCapability::Inspect },
     { "dwg_export_dxf",   "Export DXF",    "file_doc",     "View Layout", "Sheet", false, nullptr, false, CommandCapability::Export },
     { "dwg_export_pdf",   "Export PDF",    "save",          "View Layout", "Sheet", false, nullptr, false, CommandCapability::Export },
+    { "dwg_export_svg",   "Export SVG",    "file_doc",      "View Layout", "Sheet", false, nullptr, false, CommandCapability::Export },
+    { "dwg_arrange",      "Auto Arrange",  "view_cube",     "View Layout", "Sheet", false, nullptr, false },
     // --- Group: Section --- custom-section controls applied by the Section tool.
     { "dwg_section_half",   "Half Section",  "section_view",  "View Layout", "Section", false, nullptr, false },
     { "dwg_section_reverse","Flip Side",     "orientation",   "View Layout", "Section", false, nullptr, false },

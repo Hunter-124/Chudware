@@ -2135,10 +2135,10 @@ void saBuildSteps(SimAuditShot& A) {
     // Time domain first, then the driven sweep the setup focus commands act on: each of ports /
     // boundaries / range then scrolls a different card of the same driven form into view.
     S.push_back(saCmd("em_time_domain", kSaTabEm, "sim_em_time"));
-    S.push_back(saExpanded("em_time_exact_parameters", kSaTabEm, "sim_em_time", "Advanced (native parameters)"));
+    S.push_back(saExpanded("em_time_exact_parameters", kSaTabEm, "sim_em_time", "Advanced parameters"));
     S.push_back(saCmd("em_freq_sweep", kSaTabEm, "sim_em_sweep"));
     S.push_back(saExpanded("em_waveguide_palette", kSaTabEm, "sim_em_sweep", "Standard waveguide palette"));
-    S.push_back(saExpanded("em_sweep_exact_parameters", kSaTabEm, "sim_em_sweep", "Advanced (native parameters)"));
+    S.push_back(saExpanded("em_sweep_exact_parameters", kSaTabEm, "sim_em_sweep", "Advanced parameters"));
     S.push_back(saCmd("em_ports", kSaTabEm, "sim_em_ports"));
     S.push_back(saCmd("em_boundaries", kSaTabEm, "sim_em_boundary"));
     S.push_back(saCmd("em_freq_range", kSaTabEm, "sim_em_range"));
@@ -2334,9 +2334,9 @@ void saBuildSteps(SimAuditShot& A) {
                              return true;
                          }, kSaIdleTimeoutS, VP));
     S.push_back(saExpanded("hyd_simulate_native_parameters", hydTab, nullptr,
-                            "All simulation parameters (native JSON)", VP));
+                            "Advanced simulation parameters", VP));
     S.push_back(saExpanded("hyd_handoff_native_parameters", hydTab, "sim_hyd_piping",
-                            "All piping handoff inputs (native JSON)", VP));
+                            "Advanced piping handoff parameters", VP));
 
     // Author a real native schematic. The CAD manager remains active while its circuit panel
     // targets the separate schematic tab by stable identity; no probe/netlist data is fabricated.
@@ -3395,7 +3395,7 @@ void simInteractiveTick(AppState& st) {
         siGo(60); break;
     }
     case 7:
-        if (siWriteText(I.edited.dump(2))) siNext();
+        if (siWriteText(ui::SimManager::parameterEditorView(I.edited).dump(2))) siNext();
         break;
     case 8:
         if (!siSeek("Apply parameters", p)) return;
@@ -3414,7 +3414,7 @@ void simInteractiveTick(AppState& st) {
         I.edited["metadata"]["siminteractive"] = {{"owner", "agent"}, {"note", "retained-not-executed"}};
         siNext(); break;
     case 10:
-        if (siWriteText(I.edited.dump(2))) siNext();
+        if (siWriteText(ui::SimManager::parameterEditorView(I.edited).dump(2))) siNext();
         break;
     case 11:
         if (!siSeek("Apply parameters", p)) return;
@@ -3455,14 +3455,15 @@ void simInteractiveTick(AppState& st) {
     case 61: {
         nlohmann::json draft;
         if (!siReadDraft(draft)) return;
-        if (!check("pristine_draft_reload_after_gesture", draft == I.before,
+        if (!check("pristine_draft_reload_after_gesture",
+                   draft == ui::SimManager::parameterEditorView(I.before),
                    {{"rendered_draft", draft}, {"native_setup", I.before}})) return;
         I.edited = I.before;
         I.edited["mesh_order"] = 0;
         siGo(7); break;
     }
     case 100:
-        if (siWriteText(I.edited.dump(2))) siNext();
+        if (siWriteText(ui::SimManager::parameterEditorView(I.edited).dump(2))) siNext();
         break;
     case 101:
         if (!siSeek("Pressure", p)) return;
@@ -3480,7 +3481,8 @@ void simInteractiveTick(AppState& st) {
     case 103: {
         nlohmann::json draft;
         if (!siReadDraft(draft)) return;
-        if (!check("dirty_draft_preserved_after_gesture", draft == I.edited,
+        if (!check("dirty_draft_preserved_after_gesture",
+                   draft == ui::SimManager::parameterEditorView(I.edited),
                    {{"rendered_draft", draft}, {"native_setup", I.before}})) return;
         if (!siSeek("Apply parameters", p)) return;
         siGesture(p, p, false, "Refuse Apply of stale dirty draft without overwriting real gesture");
@@ -3501,7 +3503,8 @@ void simInteractiveTick(AppState& st) {
     case 105: {
         nlohmann::json draft;
         if (!siReadDraft(draft)) return;
-        if (!check("dirty_draft_preserved_after_refusal", draft == I.edited, draft)) return;
+        if (!check("dirty_draft_preserved_after_refusal",
+                   draft == ui::SimManager::parameterEditorView(I.edited), draft)) return;
         if (!siSeek("Revert", p)) return;
         siGesture(p, p, false, "Explicitly reload current native setup after stale draft refusal");
         siNext(); break;
@@ -3512,7 +3515,8 @@ void simInteractiveTick(AppState& st) {
     case 107: {
         nlohmann::json draft;
         if (!siReadDraft(draft)) return;
-        if (!check("dirty_draft_revert_reloads_current", draft == I.before, draft)) return;
+        if (!check("dirty_draft_revert_reloads_current",
+                   draft == ui::SimManager::parameterEditorView(I.before), draft)) return;
         I.fidelityCase = 0;
         siGo(120); break;
     }
@@ -3534,7 +3538,7 @@ void simInteractiveTick(AppState& st) {
         siNext(); break;
     }
     case 121:
-        if (siWriteText(I.edited.dump(2))) siNext();
+        if (siWriteText(ui::SimManager::parameterEditorView(I.edited).dump(2))) siNext();
         break;
     case 122:
         if (!siSeek("Apply parameters", p)) return;
@@ -3588,7 +3592,7 @@ void simInteractiveTick(AppState& st) {
         break;
     }
     case 125:
-        if (siWriteText(I.edited.dump(2))) siNext();
+        if (siWriteText(ui::SimManager::parameterEditorView(I.edited).dump(2))) siNext();
         break;
     case 126:
         if (!siSeek("Apply parameters", p)) return;
@@ -4210,7 +4214,7 @@ void simInteractiveTick(AppState& st) {
     }
     case 201: {
         auto& hp = st.simManager->hydraulic();
-        if (!siExpand("All simulation parameters (native JSON)", "Expand actual hydraulic simulation JSON")) return;
+        if (!siExpand("Advanced simulation parameters", "Expand actual hydraulic simulation JSON")) return;
         if (!siNativeEditor("Apply JSON")) return;
         const char* keys[] = {"density_kgm3", "density_kgm3", "density_kgm3", "density_kgm3",
                               "bulk_modulus_bar", "viscosity_cst", "air_fraction"};
@@ -4288,7 +4292,7 @@ void simInteractiveTick(AppState& st) {
         siNext(); break;
     }
     case 211: {
-        if (!siExpand("All hose parameters and ends (native JSON)", "Expand original gesture-created hose JSON")) return;
+        if (!siExpand("Advanced hose parameters", "Expand original gesture-created hose JSON")) return;
         if (!siNativeEditor("Apply JSON")) return;
         for (const auto& hose : st.simManager->hydraulic().circuit()["hoses"])
             if (hose.value("id", std::string()) == I.hose) I.edited = hose;
@@ -4343,7 +4347,7 @@ void simInteractiveTick(AppState& st) {
         siNext(); break;
     }
     case 218:
-        if (!siExpand("All hose parameters and ends (native JSON)", "Reopen exact hose JSON")) return;
+        if (!siExpand("Advanced hose parameters", "Reopen exact hose JSON")) return;
         if (!siNativeEditor("Apply JSON")) return;
         I.edited["length_mm"] = 1000.0;
         siNext(); break;
@@ -4364,7 +4368,7 @@ void simInteractiveTick(AppState& st) {
         I.edited["native_note"] = {{"authored", true}};
         siNext(); break;
     case 222:
-        if (!siExpand("All piping handoff inputs (native JSON)", "Expand exact native handoff parameters")) return;
+        if (!siExpand("Advanced piping handoff parameters", "Expand exact native handoff parameters")) return;
         if (!siNativeEditor("Apply JSON")) return;
         siNext(); break;
     case 223:
@@ -7417,10 +7421,11 @@ void ScenarioRunner::runTabPerf(AppState& st) {
     }
 }
 
-// W17 engineering-drawing scenario (CHUDWARE_SHOT=drawing). Build a plate with a through hole, Make
-// Drawing (standard views), then exercise the new detailing engine: Model Items auto-dimensioning,
-// a smart hole callout, a critical ±toleranced dimension, and the title block — with the contextual
-// View Layout / Annotation ribbon visible. One capture (drawing_01_detailed.png).
+// Engineering-drawing scenario (CHUDWARE_SHOT=drawing). Build a plate with a Ø12 bore and a 4-hole
+// pattern, Make Drawing (one drawing_make: ISO frame + title block, third-angle layout at one
+// standard scale, auto-dimensions, centre marks/lines), fill the title block, tolerance a dim,
+// add a section, export PDF/DXF/SVG, then re-arrange first-angle. Self-checking: every check
+// prints PASS/CHECK. Captures drawing_01_third_angle.png and drawing_02_first_angle.png.
 void ScenarioRunner::runDrawing(AppState& st) {
     if (!(st.wantDrawing && st.workerStarted && !st.drawingShotDone && st.frame >= 5)) return;
     if (!dwgDirReady) {
@@ -7453,10 +7458,19 @@ void ScenarioRunner::runDrawing(AppState& st) {
                     {"height",{{"value",12.0},{"expr",nullptr}}},
                     {"centered",true}}}}}});
             ops.push_back({{"op","add_feature"},{"feature",{
-                {"type","cylinder"},{"name","Hole"},{"params",{
+                {"type","cylinder"},{"name","Bore"},{"params",{
                     {"radius",{{"value",6.0},{"expr",nullptr}}},
                     {"height",{{"value",16.0},{"expr",nullptr}}},
                     {"centered",true},{"mode","cut"}}}}}});
+            ops.push_back({{"op","add_feature"},{"feature",{
+                {"type","hole"},{"name","Mounting Holes"},{"params",{
+                    {"style","simple"},{"standard","custom"},
+                    {"diameter",{{"value",6.6},{"expr",nullptr}}},{"end","through_all"},
+                    {"positions", nlohmann::json::array({nlohmann::json::array({30.0, 17.0}),
+                                                         nlohmann::json::array({-30.0, 17.0}),
+                                                         nlohmann::json::array({30.0, -17.0}),
+                                                         nlohmann::json::array({-30.0, -17.0})})}}},
+                {"refs",{{"face",{{"of","face"},{"side","top"}}}}}}}});
             auto r = st.docMirror.applyOps(st.worker, ops);
             if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
             std::printf("drawing: plate+hole ok=%d rev=%d\n", (int)r.ok, r.revision);
@@ -7470,120 +7484,141 @@ void ScenarioRunner::runDrawing(AppState& st) {
             std::fflush(stdout);
             dwgSettle = kSettle; ++dwgStep; break;
         }
-        case 2: {  // Detailing: model items + hole callout + critical toleranced dim + title block
+        case 2: {  // Detailing on top of the auto-dimensioned sheet + section + exports
             if (!st.activeTabIsDrawing()) {
-                std::printf("drawing: NO drawing tab after makeDrawing\n"); std::fflush(stdout);
+                std::printf("drawing: NO drawing tab after makeDrawing CHECK\n"); std::fflush(stdout);
                 st.drawingShotDone = true; break;
             }
             AppState::DocTab& tab = st.docTabs[st.activeTab];
-            // Find a view with a closed projected circle (the hole in the top view).
-            std::string circVid; double cx = 0, cy = 0; bool haveCirc = false;
-            if (tab.drawingDoc.contains("sheets") && tab.drawingDoc["sheets"].is_array() &&
-                !tab.drawingDoc["sheets"].empty()) {
-                for (const auto& v : tab.drawingDoc["sheets"][0].value("views",
-                                                                       nlohmann::json::array())) {
-                    for (const auto& a : v.value("arcs", nlohmann::json::array()))
-                        if (a.value("closed", false) && a.contains("center") &&
-                            a["center"].is_array() && a["center"].size() == 2) {
-                            circVid = vid_of(v);
-                            cx = a["center"][0].get<double>(); cy = a["center"][1].get<double>();
-                            haveCirc = true; break;
-                        }
-                    if (haveCirc) break;
+            auto sheet0 = [&]() -> nlohmann::json {
+                if (tab.drawingDoc.contains("sheets") && tab.drawingDoc["sheets"].is_array() &&
+                    !tab.drawingDoc["sheets"].empty())
+                    return tab.drawingDoc["sheets"][0];
+                return nlohmann::json::object();
+            };
+            {
+                const nlohmann::json sh = sheet0();
+                int views = 0, anns = 0;
+                for (const auto& v : sh.value("views", nlohmann::json::array())) {
+                    if (v.value("type", std::string()) == "table_overlay") continue;
+                    ++views;
+                    anns += (int)v.value("annotations", nlohmann::json::array()).size();
                 }
-            }
-            std::string mvid = circVid;
-            if (mvid.empty() && tab.drawingDoc.contains("sheets")) {
-                const auto& vs = tab.drawingDoc["sheets"][0].value("views", nlohmann::json::array());
-                if (vs.is_array() && !vs.empty()) mvid = vid_of(vs[0]);
-            }
-            nlohmann::json res;
-            if (!mvid.empty())
-                st.worker.call("drawing_model_items",
-                               {{"doc_id", tab.drawingDocId}, {"view_id", mvid}}, res, err);
-            if (haveCirc) {
-                nlohmann::json r2;
-                st.worker.call("drawing_add_callout",
-                               {{"doc_id", tab.drawingDocId}, {"view_id", circVid}, {"kind", "hole"},
-                                {"a", nlohmann::json::array({cx, cy})}}, r2, err);
+                const bool framed = sh.contains("frame") && sh["frame"].is_object() &&
+                                    !sh["frame"].value("texts", nlohmann::json::array()).empty();
+                const std::string proj =
+                    sh.value("title_block", nlohmann::json::object()).value("projection", std::string());
+                std::printf("drawing: make_drawing views=%d annotations=%d frame=%d projection=%s %s\n",
+                            views, anns, (int)framed, proj.c_str(),
+                            (views >= 4 && anns > 0 && framed && proj == "third") ? "PASS" : "CHECK");
             }
             nlohmann::json r3;
-            st.worker.call("drawing_set_titleblock",
-                           {{"doc_id", tab.drawingDocId}, {"sheet_id", "s1"},
-                            {"fields", {{"title", "PLATE"}, {"drawn_by", "Chudware"},
-                                        {"date", "2026-08-15"}, {"material", "AL 6061"},
-                                        {"scale", "1:1"}, {"rev", "A"}, {"sheet", "1/1"}}}},
-                           r3, err);
+            const bool tb_ok = st.worker.call(
+                "drawing_set_titleblock",
+                {{"doc_id", tab.drawingDocId}, {"sheet_id", "s1"},
+                 {"fields", {{"title", "MOUNTING PLATE"}, {"part_number", "CW-PLT-0042"},
+                             {"drawn_by", "H. Hunter"}, {"checked_by", "QA"},
+                             {"material", "AL 6061-T6"}, {"finish", "ANODISE CLEAR"},
+                             {"general_tolerance", "ISO 2768-m"}, {"company", "CHUDWARE"},
+                             {"rev", "A"}}}},
+                r3, err);
             st.refreshDrawingTab(st.activeTab);
             // Make the first linear dim a critical +/-0.1 tolerance.
-            std::string tvid, tann;
-            if (tab.drawingDoc.contains("sheets"))
-                for (const auto& v : tab.drawingDoc["sheets"][0].value("views",
-                                                                       nlohmann::json::array())) {
-                    for (const auto& a : v.value("annotations", nlohmann::json::array()))
-                        if (a.value("type", std::string()) == "linear_dim") {
-                            tvid = vid_of(v); tann = a.value("id", std::string()); break;
-                        }
-                    if (!tann.empty()) break;
+            std::string tvid, tann, top_vid;
+            nlohmann::json top_bbox;
+            for (const auto& v : sheet0().value("views", nlohmann::json::array())) {
+                if (v.value("orientation", std::string()) == "top") {
+                    top_vid = vid_of(v);
+                    top_bbox = v.value("bbox", nlohmann::json());
                 }
+                for (const auto& a : v.value("annotations", nlohmann::json::array()))
+                    if (tann.empty() && a.value("type", std::string()) == "linear_dim") {
+                        tvid = vid_of(v); tann = a.value("id", std::string());
+                    }
+            }
+            bool tol_ok = false;
             if (!tann.empty()) {
                 nlohmann::json r4;
-                st.worker.call("drawing_set_annotation",
+                tol_ok = st.worker.call("drawing_set_annotation",
                                {{"doc_id", tab.drawingDocId}, {"view_id", tvid}, {"ann_id", tann},
                                 {"tol_type", "symmetric"}, {"tol_upper", 0.1}, {"precision", 2},
                                 {"critical", true}}, r4, err);
             }
+            // Section A-A through the bore (horizontal cut on the top view), then re-fit.
+            bool sec_ok = false;
+            if (!top_vid.empty() && top_bbox.is_array() && top_bbox.size() == 4) {
+                const double x0 = top_bbox[0].get<double>(), x1 = top_bbox[2].get<double>();
+                const double cy = (top_bbox[1].get<double>() + top_bbox[3].get<double>()) * 0.5;
+                nlohmann::json r5;
+                sec_ok = st.worker.call(
+                    "drawing_add_section",
+                    {{"doc_id", tab.drawingDocId}, {"parent_view_id", top_vid},
+                     {"cut_line", nlohmann::json::array({nlohmann::json::array({x0 - 6.0, cy}),
+                                                         nlohmann::json::array({x1 + 6.0, cy})})},
+                     {"label", "A"}, {"sheet_id", "s1"}},
+                    r5, err);
+                nlohmann::json r6;
+                st.worker.call("drawing_arrange", {{"doc_id", tab.drawingDocId}, {"sheet_id", "s1"}},
+                               r6, err);
+            }
             st.refreshDrawingTab(st.activeTab);
             tab.drawNeedFit = true;
-            int nann = 0;
-            if (tab.drawingDoc.contains("sheets"))
-                for (const auto& v : tab.drawingDoc["sheets"][0].value("views",
-                                                                       nlohmann::json::array()))
-                    nann += (int)v.value("annotations", nlohmann::json::array()).size();
-            std::printf("drawing: detail done circle=%d critical_dim=%s annotations=%d\n",
-                        (int)haveCirc, tann.empty() ? "none" : tann.c_str(), nann);
-            std::fflush(stdout);
-            // Copilot one-shot path: agent_make_drawing builds a complete drawing (views +
-            // auto-dims + hole callouts + title block) from the source part in a single call.
-            {
-                nlohmann::json r5;
-                nlohmann::json spec = {
-                    {"views", nlohmann::json::array({"front", "top", "right", "iso"})},
-                    {"model_items", true}, {"hole_callouts", true},
-                    {"title", {{"title", "COPILOT"}, {"material", "STEEL"}, {"rev", "A"}}}};
-                if (st.worker.call("drawing_make",
-                                   {{"source_doc_id", tab.sourceDocId}, {"spec", spec}}, r5, err) &&
-                    r5.is_object() && !r5.contains("code")) {
-                    int v5 = 0, a5 = 0;
-                    if (r5.contains("drawing") && r5["drawing"].contains("sheets") &&
-                        r5["drawing"]["sheets"].is_array() && !r5["drawing"]["sheets"].empty())
-                        for (const auto& v : r5["drawing"]["sheets"][0].value("views",
-                                                                        nlohmann::json::array())) {
-                            ++v5; a5 += (int)v.value("annotations", nlohmann::json::array()).size();
-                        }
-                    std::printf("drawing: drawing_make one-shot views=%d annotations=%d %s\n",
-                                v5, a5, (v5 >= 3 && a5 > 0) ? "PASS" : "CHECK");
-                } else {
-                    std::printf("drawing: drawing_make FAILED: %s\n", err.c_str());
-                }
-                std::fflush(stdout);
+            std::printf("drawing: titleblock=%d critical_dim=%s section=%d %s\n", (int)tb_ok,
+                        tann.empty() ? "none" : tann.c_str(), (int)sec_ok,
+                        (tb_ok && tol_ok && sec_ok) ? "PASS" : "CHECK");
+            // Deliverables: vector PDF + DXF + SVG of the same sheet.
+            for (const char* fmt : {"pdf", "dxf", "svg"}) {
+                const std::string out = dwgSavePath + "/mounting_plate." + fmt;
+                nlohmann::json rx;
+                const bool ok = st.worker.call("export_drawing",
+                                               {{"doc_id", tab.drawingDocId}, {"path", out},
+                                                {"format", fmt}}, rx, err);
+                std::error_code ec;
+                const auto bytes = std::filesystem::file_size(out, ec);
+                std::printf("drawing: export %s -> %s bytes=%llu %s\n", fmt, out.c_str(),
+                            ec ? 0ull : (unsigned long long)bytes,
+                            (ok && !ec && bytes > 200) ? "PASS" : "CHECK");
             }
             // In-app copilot trigger: a chat "make an engineering drawing of this part" is
             // intercepted by the agent fast-path (no provider needed) and builds a drawing.
             {
-                nlohmann::json r6;
-                bool ok6 = st.worker.call(
+                nlohmann::json r7;
+                bool ok7 = st.worker.call(
                     "agent_run_v2",
                     {{"request", "make an engineering drawing of this part"},
                      {"doc_id", tab.sourceDocId}},
-                    r6, err);
-                bool made = ok6 && r6.is_object() && r6.value("created_drawing", false);
-                std::printf("drawing: agent fast-path created_drawing=%d doc=%s %s\n", (int)made,
-                            made ? r6.value("drawing_doc_id", std::string()).c_str() : "-",
+                    r7, err);
+                bool made = ok7 && r7.is_object() && r7.value("created_drawing", false);
+                std::printf("drawing: agent fast-path created_drawing=%d %s\n", (int)made,
                             made ? "PASS" : "CHECK");
-                std::fflush(stdout);
             }
-            dwgCapture = dwgSavePath + "/drawing_01_detailed.png"; dwgSettle = kSettle; ++dwgStep;
+            std::fflush(stdout);
+            dwgCapture = dwgSavePath + "/drawing_01_third_angle.png"; dwgSettle = kSettle; ++dwgStep;
+            break;
+        }
+        case 3: {  // Re-lay first-angle: top view drops below the front, right view moves left
+            if (!st.activeTabIsDrawing()) { st.drawingShotDone = true; break; }
+            AppState::DocTab& tab = st.docTabs[st.activeTab];
+            nlohmann::json r;
+            const bool ok = st.worker.call("drawing_arrange",
+                                           {{"doc_id", tab.drawingDocId}, {"sheet_id", "s1"},
+                                            {"projection", "first"}},
+                                           r, err);
+            st.refreshDrawingTab(st.activeTab);
+            tab.drawNeedFit = true;
+            double front_y = 0, top_y = 0;
+            if (ok && r.contains("drawing"))
+                for (const auto& v : r["drawing"]["sheets"][0].value("views", nlohmann::json::array())) {
+                    const auto& bb = v.value("bbox", nlohmann::json());
+                    if (!bb.is_array() || bb.size() != 4) continue;
+                    const double cy = (bb[1].get<double>() + bb[3].get<double>()) * 0.5;
+                    if (v.value("orientation", std::string()) == "front") front_y = cy;
+                    if (v.value("orientation", std::string()) == "top") top_y = cy;
+                }
+            std::printf("drawing: first-angle arrange ok=%d top_below_front=%d %s\n", (int)ok,
+                        (int)(top_y < front_y), (ok && top_y < front_y) ? "PASS" : "CHECK");
+            std::fflush(stdout);
+            dwgCapture = dwgSavePath + "/drawing_02_first_angle.png"; dwgSettle = kSettle; ++dwgStep;
             break;
         }
         default:

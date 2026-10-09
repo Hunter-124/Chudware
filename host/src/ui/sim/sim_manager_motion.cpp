@@ -1309,7 +1309,8 @@ void SimManager::drawMotionForm(AppState &st, Study &s) {
   }
   kit::RowStyle dropStyle;
   dropStyle.icon = "mate";
-  dropStyle.secondary = "Add a joint, or move a driver to the end";
+  dropStyle.secondary = "Adds it last";
+  dropStyle.tooltip = "Drop a joint to add it as a driver, or drop a driver to move it to the end.";
   dropStyle.disabled = locked;
   kit::row("driver_drop", "Drop joint or driver here", dropStyle);
   IMGUI_TEST_ENGINE_ITEM_INFO(ImGui::GetItemID(), "Drop joint or driver here",

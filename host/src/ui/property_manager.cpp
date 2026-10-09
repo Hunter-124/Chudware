@@ -3297,11 +3297,69 @@ void PropertyManager::drawBody(AppState& st) {
     // from the post-loop "click elsewhere in PM ends profile select" dismiss.
     bool wellClickedThisFrame = false;
 
+    // PM group cards are CONTENT-sized groups, not auto-resize child windows. An AutoResizeY child
+    // sizes itself from LAST frame's content, so on the frame a form opens (feature edit, command,
+    // scenario capture) every card painted as an empty padding-tall shell with its fields clipped
+    // away. A group measures this frame's content: fields draw on draw-list channel 1 inside a
+    // work rect inset by the card padding, and closeGroupCard paints the wash + border behind them
+    // on channel 0 once the height is final, so the form is complete on its very first frame.
+    const float cardPadX = 9.0f * ui::uiScale;
+    const float cardPadY = 7.0f * ui::uiScale;
+    ImVec2 cardMin(0.0f, 0.0f);
+    float  cardRight = 0.0f;
+    float  backupWorkMaxX = 0.0f, backupRegionMaxX = 0.0f;
+
+    auto openGroupCard = [&]() {
+        ImGuiWindow* win = ImGui::GetCurrentWindow();
+        ImGui::PushID(curGroup);
+        cardMin   = ImGui::GetCursorScreenPos();
+        cardRight = cardMin.x + ImGui::GetContentRegionAvail().x;
+        // Inset the right edge so full-width rows (wells, combos, "-1" widths, wrapped text) stop
+        // at the card padding, exactly like the old child window's content region.
+        backupWorkMaxX   = win->WorkRect.Max.x;
+        backupRegionMaxX = win->ContentRegionRect.Max.x;
+        win->WorkRect.Max.x          = cardRight - cardPadX;
+        win->ContentRegionRect.Max.x = cardRight - cardPadX;
+        win->DrawList->ChannelsSplit(2);
+        win->DrawList->ChannelsSetCurrent(1);
+        ImGui::BeginGroup();
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                            ImVec2(7.0f * ui::uiScale, 5.0f * ui::uiScale));
+        // Group offset stays at the card edge (SameLine(labelW) columns measure from it, as they
+        // did from the child's origin); new lines start one padding in.
+        ImGui::Indent(cardPadX);
+        ImGui::SetCursorScreenPos(ImVec2(cardMin.x + cardPadX, cardMin.y + cardPadY));
+        groupCardOpen = true;
+    };
+
     auto closeGroupCard = [&]() {
         if (!groupCardOpen) return;
-        ImGui::EndChild();
-        ImGui::PopStyleColor(2);
-        ImGui::PopStyleVar(2);
+        ImGuiWindow* win = ImGui::GetCurrentWindow();
+        ImGui::Unindent(cardPadX);
+        ImGui::PopStyleVar();
+        ImGui::EndGroup();
+        const float cardBottom = ImGui::GetItemRectMax().y + cardPadY;
+        win->WorkRect.Max.x          = backupWorkMaxX;
+        win->ContentRegionRect.Max.x = backupRegionMaxX;
+        // PM group cards adopt the ADAPTIVE glass tint (surf.tint) — NOT the theme-static
+        // pal.glassBg — so the card fill tracks the SAME live-backdrop surface the labels and
+        // values read against (surf.textPrimary/textSecondary). T-G14: pal.glassBg is dark in the
+        // dark theme, which over the light viewport gave dark card + dark adaptive label text
+        // (black-on-black), and light-on-light when the tone flipped. surf.tint contrasts
+        // surf.text* by construction in both themes and both regimes.
+        const ImGuiStyle& stl = ImGui::GetStyle();
+        const ImVec2 cardMax(cardRight, cardBottom);
+        win->DrawList->ChannelsSetCurrent(0);
+        win->DrawList->AddRectFilled(cardMin, cardMax,
+            ImGui::ColorConvertFloat4ToU32(ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.55f)),
+            stl.ChildRounding);
+        if (stl.ChildBorderSize > 0.0f)
+            win->DrawList->AddRect(cardMin, cardMax, Palette::toU32(pal.glassBorder),
+                                   stl.ChildRounding, 0, stl.ChildBorderSize);
+        win->DrawList->ChannelsMerge();
+        // Advance the parent layout past the whole card (bottom padding included).
+        ImGui::SetCursorScreenPos(ImVec2(cardMin.x, cardBottom));
+        ImGui::Dummy(ImVec2(cardRight - cardMin.x, 0.0f));
         ImGui::PopID();
         ImGui::Dummy(ImVec2(0, 4.0f * ui::uiScale));
         groupCardOpen = false;
@@ -3315,28 +3373,7 @@ void PropertyManager::drawBody(AppState& st) {
             closeGroupCard();
             curGroup = f.def->group;
             groupOpen = pmSectionHeader(curGroup, pal);
-            if (groupOpen) {
-                ImGui::PushID(curGroup);
-                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                                    ImVec2(9.0f * ui::uiScale, 7.0f * ui::uiScale));
-                ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                                    ImVec2(7.0f * ui::uiScale, 5.0f * ui::uiScale));
-                // PM group cards adopt the ADAPTIVE glass tint (surf.tint) — NOT the theme-static
-                // pal.glassBg — so the card fill tracks the SAME live-backdrop surface the labels
-                // and values read against (surf.textPrimary/textSecondary). T-G14: pal.glassBg is
-                // dark in the dark theme, which over the light viewport gave dark card + dark
-                // adaptive label text (black-on-black), and light-on-light when the tone flipped.
-                // surf.tint contrasts surf.text* by construction in both themes and both regimes.
-                ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                    ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.55f));
-                ImGui::PushStyleColor(ImGuiCol_Border,
-                    ImVec4(pal.glassBorder[0], pal.glassBorder[1], pal.glassBorder[2],
-                           pal.glassBorder[3]));
-                ImGui::BeginChild("##pm_group_card", ImVec2(0, 0),
-                                  ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY |
-                                  ImGuiChildFlags_AlwaysUseWindowPadding);
-                groupCardOpen = true;
-            }
+            if (groupOpen) openGroupCard();
         }
         if (!groupOpen) continue;
 
@@ -3953,10 +3990,10 @@ void PropertyManager::drawBody(AppState& st) {
     // ---- live-preview status hint -----------------------------------------
     ImGui::Separator();
     pushTextColorV(surf.textSecondary);
-    if (dirty_)            ImGui::TextUnformatted("editing\xe2\x80\xa6 (live preview)");
+    if (dirty_)            ImGui::TextUnformatted("Editing\xe2\x80\xa6 (live preview)");
     else if (firstPreviewDone_ && !targetId_.empty())
-        ImGui::Text("preview: %s", targetId_.c_str());
-    else                  ImGui::TextUnformatted("set parameters to preview");
+        ImGui::TextUnformatted("Preview up to date");
+    else                  ImGui::TextUnformatted("Set parameters to preview");
     ImGui::PopStyleColor();
 
     // C38 (P2f): record whether a PM widget is active at the end of OUR draw, scoped to this PM

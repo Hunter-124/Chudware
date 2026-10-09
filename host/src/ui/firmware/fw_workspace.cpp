@@ -9,10 +9,9 @@
 //                instead of a dead button.
 //   center     : tabs — Editor (read-only source preview) | Debug (fw_debug_gdb_* console:
 //                reset/halt/step, breakpoints, memory view) | Emulate (fw_sim_run scenario
-//                editor, engineering evidence, UART and GPIO trace viewer, contract §7).
-//   right      : AI Copilot pane — reuses the docked Copilot's own chat state/send path
-//                (ui/copilot/copilot.h reuse hooks) so the firmware hub doesn't fork a second
-//                chat implementation.
+//                editor, engineering evidence, UART and GPIO trace viewer, contract §7). Fills
+//                the band right of the rail: the AI chat is the app's docked Copilot column,
+//                never a second transcript/composer inside this workspace.
 //   bottom dock: tabs — Build Log | Serial Monitor (fw_serial_*) | Flash Progress | GDB
 //                Console. Collapsible via ui::PanelCollapseAnim (vertical roll-up, same
 //                recipe as the FeatureManager column).
@@ -45,7 +44,6 @@
 #include <nlohmann/json.hpp>
 
 #include "core/app_state.h"
-#include "ui/copilot/copilot.h"
 #include "ui/file_dialog.h"
 #include "ui/icons.h"
 #include "ui/metrics.h"
@@ -314,20 +312,31 @@ static bool fwProjectRow(const FwProject& p, bool selected) {
     const ImVec2 p1(p0.x + w, p0.y + rowH);
     const bool clicked = ImGui::InvisibleButton("##fw_row", ImVec2(w, rowH));
     const bool hov = ImGui::IsItemHovered();
+    const ImVec2 nextRow = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     if (selected || hov) {
         ui::glassRowBackground(dl, p0, p1, 6.0f, false, false, 0.20f);
         ui::coloredRowWash(dl, p0, p1, 6.0f, palette.accent, selected ? 0.34f : 0.16f, false);
     }
     if (selected) ui::glassSelectionGlow(dl, p0, p1, 6.0f, palette.accent);
-    const float ty = p0.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f;
-    dl->AddText(ImVec2(p0.x + 10.0f * sc, ty), palette.toU32(palette.text), p.name.c_str());
+    // Laid out right to left: the MCU family is its own kit chip pinned to the right edge and
+    // the project name elides into the room left of it, so a long name never runs into the tag.
+    const float padX = 10.0f * sc;
+    float nameRight = p1.x - padX;
     if (!p.mcu.empty()) {
-        const ImVec2 ms = ImGui::CalcTextSize(p.mcu.c_str());
-        dl->AddText(ImVec2(p1.x - ms.x - 10.0f * sc, ty),
-                    palette.toU32(selected ? palette.accent : palette.textDisabled),
-                    p.mcu.c_str());
+        // kit::chip geometry: U(1.5) horizontal / U(0.5) vertical padding around the label.
+        const float chipW = ImGui::CalcTextSize(p.mcu.c_str()).x + ui::metrics::U(1.5f) * 2.0f;
+        const float chipH = ImGui::GetTextLineHeight() + ui::metrics::U(0.5f) * 2.0f;
+        const float chipX = std::max(p0.x + padX, p1.x - padX - chipW);
+        ImGui::SetCursorScreenPos(ImVec2(chipX, p0.y + (rowH - chipH) * 0.5f));
+        ui::kit::chip(p.mcu.c_str(), selected ? ui::kit::Tone::Accent : ui::kit::Tone::Neutral);
+        ImGui::SetCursorScreenPos(nextRow);
+        nameRight = chipX - ui::metrics::U(2.0f);
     }
+    const float ty = p0.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f;
+    const std::string name = ui::kit::elide(p.name.c_str(), nameRight - (p0.x + padX));
+    dl->AddText(ImVec2(p0.x + padX, ty), palette.toU32(palette.text), name.c_str());
+    if (hov && name != p.name) ImGui::SetTooltip("%s", p.name.c_str());
     return clicked;
 }
 
@@ -992,9 +1001,9 @@ static void drawProjectRail(AppState& st, float w) {
     ImGui::SetNextItemWidth(-1);
     ImGui::InputTextWithHint("##fw_new_name", "New project name", s.newNameBuf,
                              sizeof(s.newNameBuf));
-    ImGui::SetNextItemWidth(-1);
-    ImGui::Combo("##fw_new_mcu", &s.newMcuIdx, kMcuFamilies,
-                 (int)(sizeof(kMcuFamilies) / sizeof(kMcuFamilies[0])));
+    ui::kit::fieldEnum("fw_new_mcu", "MCU family", &s.newMcuIdx, kMcuFamilies,
+                       (int)(sizeof(kMcuFamilies) / sizeof(kMcuFamilies[0])),
+                       ui::kit::FieldOpts().withTip("Toolchain family for the new project."));
     const bool canCreate = st.workerStarted && !s.createPending;
     if (fwGlassButton("##fw_create",
                       s.createPending ? "Creating\xe2\x80\xa6" : "New Project",
@@ -1088,9 +1097,8 @@ static void drawProjectRail(AppState& st, float w) {
         for (const std::string& pin : pins) ImGui::BulletText("%s", pin.c_str());
     }
 
-    // Backend doctor (fw_status) — moved here from the old right rail now that the right
-    // column hosts the AI Copilot pane. Flash/Debug actions themselves live in the target
-    // bar + Debug tab; this stays the honest-gating status readout.
+    // Backend doctor (fw_status). Flash/Debug actions themselves live in the target bar +
+    // Debug tab; this stays the honest-gating status readout.
     ImGui::Spacing();
     ImGui::PushID("backend_refresh");
     fwHeaderAction(s.statusPending ? "..." : "Recheck",
@@ -1353,10 +1361,11 @@ static void drawEmulationSection(AppState& st, float h) {
     // Full-width controls stay usable in a narrow centre pane, including at high DPI.
     bool setupChanged = false;
     ImGui::BeginDisabled(s.simPending);
-    ImGui::SetNextItemWidth(-1.0f);
-    setupChanged |= ImGui::Combo("##fw_sim_backend", &s.simBackend, "Auto\0Renode\0QEMU\0simavr\0");
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Forced backends never silently fall back. Scenarios require Renode.");
+    static const char* const kSimBackends[] = {"Auto", "Renode", "QEMU", "simavr"};
+    setupChanged |= ui::kit::fieldEnum(
+        "fw_sim_backend", "Backend", &s.simBackend, kSimBackends, 4,
+        ui::kit::FieldOpts().withTip("Forced backends never silently fall back. "
+                                     "Scenarios require Renode."));
     if (ImGui::CollapsingHeader("Scenario JSON / file", ImGuiTreeNodeFlags_DefaultOpen)) {
         setupChanged |= ui::sim::drawFwScenarioEditor(s.scenarioEditor, s.scenario,
                                                      "firmware_scenario", &s.scenarioBuf);
@@ -1634,48 +1643,6 @@ static void drawCenterTabs(AppState& st) {
     }
 }
 
-// ---- right pane: AI Copilot (reuses the docked Copilot's own chat state/send path) -------
-
-static void drawCopilotPane(AppState& st, float w) {
-    const float sc = ui::uiScale;
-    ui::pushGlassChildStyle(10.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 8 * sc));
-    ImGui::BeginChild("##fw_copilot", ImVec2(w, 0), ImGuiChildFlags_Border);
-    ImGui::PopStyleVar();
-
-    fwSectionHeader("ai_panel", "AI Copilot");
-
-    const bool busy = st.convRunning(st.activeConvId());
-    const bool canRun = st.workerStarted && !busy;
-
-    // Same one-frame-lag composer-height trick the docked Copilot / AI workspace use, so the
-    // log fills exactly what the composer doesn't need.
-    static float s_composerH = 0.0f;
-    const float reserve = (s_composerH > 0.0f ? s_composerH
-                                               : ImGui::GetFrameHeightWithSpacing() * 4.0f) +
-                          10.0f * sc;
-    const float logH = std::max(80.0f * sc, ImGui::GetContentRegionAvail().y - reserve);
-
-    ImGui::BeginChild("##fw_copilot_log", ImVec2(0, logH), ImGuiChildFlags_None);
-    if (st.chat.empty()) {
-        ImGui::TextDisabled("Ask the copilot about this firmware project — it shares the "
-                            "same conversation as the docked panel.");
-    } else {
-        ui::chatDrawLog(st);
-        ui::chatLogStickToBottom("firmware.workspace");
-    }
-    ImGui::EndChild();
-
-    ImGui::Dummy(ImVec2(0, 4.0f * sc));
-    ImGui::BeginGroup();
-    ui::chatDrawComposer(st, busy, canRun);
-    ImGui::EndGroup();
-    s_composerH = ImGui::GetItemRectSize().y + 6.0f * sc;
-
-    ImGui::EndChild();
-    ui::popGlassChildStyle();
-}
-
 // ---- bottom dock: Build Log | Serial Monitor | Flash Progress | GDB Console --------------
 
 static void drawBuildLogDockTab(AppState& st) {
@@ -1903,7 +1870,6 @@ static void drawFirmwareWorkspaceBody(AppState& st) {
     loadStatus(st);
     loadProjects(st);
     pollSerial(st);
-    ui::chatWorkspaceSync(st);
 
     FwState& s = S();
     const float sc = ui::uiScale;
@@ -1913,7 +1879,6 @@ static void drawFirmwareWorkspaceBody(AppState& st) {
     ImGui::Spacing();
 
     const float railW = 250.0f * sc;
-    const float copilotW = 320.0f * sc;
     const float dockFullH = 220.0f * sc;
     // Tick the dock's collapse animation ONCE per frame up front so the top row below can
     // reclaim/cede exactly the space the dock animates through — no one-frame lag between
@@ -1926,19 +1891,16 @@ static void drawFirmwareWorkspaceBody(AppState& st) {
     ImGui::BeginChild("##fw_top_row", ImVec2(0, topH), ImGuiChildFlags_None);
     drawProjectRail(st, railW);
     ImGui::SameLine(0.0f, gutter);
+    // The docked Copilot column is the workspace's chat; the centre tabs take every pixel
+    // right of the rail.
 
-    const float midW =
-        std::max(220.0f * sc, ImGui::GetContentRegionAvail().x - copilotW - gutter);
     ui::pushGlassChildStyle(10.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14 * sc, 10 * sc));
-    ImGui::BeginChild("##fw_center", ImVec2(midW, 0), ImGuiChildFlags_Border);
+    ImGui::BeginChild("##fw_center", ImVec2(0, 0), ImGuiChildFlags_Border);
     ImGui::PopStyleVar();
     drawCenterTabs(st);
     ImGui::EndChild();
     ui::popGlassChildStyle();
-
-    ImGui::SameLine(0.0f, gutter);
-    drawCopilotPane(st, copilotW);
     ImGui::EndChild();   // ##fw_top_row
 
     ImGui::Spacing();

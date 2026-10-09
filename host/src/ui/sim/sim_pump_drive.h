@@ -26,12 +26,22 @@ struct PumpDriveInputs {
     double pumpEff = 0.7;         // overall pump efficiency at the duty point, 0..1
     double speedRpm = 1500.0;     // required pump speed (picks the motor pole count)
     double serviceFactor = 1.15;
+    // Mains supply. These are only a starting point: defaultSupplyForUnits() picks the regional
+    // supply that matches the document's units the first time the form is shown, and the
+    // Motor card leads with an explicit "Mains supply" choice.
     double voltageV = 400.0;
     double frequencyHz = 50.0;
     int standard = 0;             // 0 IEC, 1 NEMA
     int phases = 3;               // 1 or 3
     int effClass = 1;             // 0 IE2, 1 IE3, 2 IE4
+    bool supplyChosen = false;    // set once a supply was picked (by the user or a region default)
+    bool customSupply = false;    // the user chose "Custom" supply (shows the individual fields)
 };
+
+// Region default for a form whose supply nobody has chosen yet: US customary documents get the
+// North American 460 V / 60 Hz NEMA supply, metric documents 400 V / 50 Hz IEC. A supply the
+// user already picked is left alone.
+void defaultSupplyForUnits(PumpDriveInputs& in, bool usCustomary);
 
 // pump_drive_size params for these inputs: kind, the kind's duty pair (flow_lpm + pressure_bar,
 // or flow_m3h + head_m), fluid density, pump efficiency/speed and the motor settings.

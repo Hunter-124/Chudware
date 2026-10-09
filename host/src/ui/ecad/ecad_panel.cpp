@@ -4,6 +4,7 @@
 
 #include "ecad_panel.h"
 #include "../doc_tabs.h"      // document tabs share the central node with the Viewport (see below)
+#include "../layout.h"        // overlayColumnEdge — the pinned columns float over this window
 #include "../feature_tree.h"  // fmPaneHeaderChip/fmSectionDivider/fmRowPill/fmToolbarIconBtn — the
                               // ECAD manager body reuses the Feature Manager's own row/header chrome
                               // so the two panels read as the same design language (item 2).
@@ -14,6 +15,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <set>
 #include <string>
@@ -2046,7 +2048,8 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
 
     if (!m.hasDoc()) {
         ui::kit::emptyState("ecad_pcb", "No ECAD document open",
-                            "Open a schematic or PCB to use the manager.");
+                            "Describe a circuit on the canvas, or start a blank document with "
+                            "PCB Layout or New Schematic on the ribbon.");
         return;
     }
     const bool pcb = m.isPcb();
@@ -2417,6 +2420,91 @@ void drawResultsStrip(AppState& st, EcadEditorState& es) {
     ImGui::EndChild();
 }
 
+// Screen-x span of the ECAD window that no pinned glass column covers, measured from the current
+// cursor row. The PCB/Schematic Manager column (left, slot 0) and the Copilot column (right,
+// slot 1) float OVER this window, so anything laid out beneath them is hidden.
+struct ClearSpan {
+    float x0, x1;
+};
+ClearSpan ecadClearSpan() {
+    const float left = ImGui::GetCursorScreenPos().x;
+    ClearSpan span{left, left + ImGui::GetContentRegionAvail().x};
+    const float managerEdge = ui::overlayColumnEdge(0);
+    const float copilotEdge = ui::overlayColumnEdge(1);
+    if (managerEdge > span.x0 && managerEdge < span.x1) span.x0 = managerEdge;
+    if (copilotEdge > span.x0 && copilotEdge < span.x1) span.x1 = copilotEdge;
+    return span;
+}
+
+// No-document launchpad: describe a circuit -> the AI designs a verified schematic (AI Board goes
+// on to a populated, outlined, autorouted PCB). The buttons hand the request to the app loop via
+// st.ecadAiRequest + ecadAiGo / ecadAiBoardGo. Centred in the clear span below the floating
+// doc-tab strip, so neither pinned column covers any of it.
+void drawEcadLaunchpad(AppState& st) {
+    const ClearSpan span = ecadClearSpan();
+    const float pad = ui::metrics::U(6.0f);
+    const float spanW = std::max(span.x1 - span.x0 - pad * 2.0f, ui::metrics::U(1.0f));
+    const float colW = std::min(spanW, ui::metrics::px(560.0f));
+    const float top = ImGui::GetCursorScreenPos().y + ui::docTabStripHeight(st) + pad;
+    ImGui::SetCursorScreenPos(ImVec2(span.x0 + pad + (spanW - colW) * 0.5f, top));
+    ImGui::BeginChild("##ecadLaunchpad", ImVec2(colW, 0.0f), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
+    const auto surf = ui::adaptiveSurface(-1.0f);
+    ui::kit::pushDensity(ui::kit::Density::Roomy);
+    if (ui::kit::cardBegin("ecad_launchpad", "Design a circuit with AI", "ai_panel")) {
+        ui::kit::dimText("Describe a circuit and the AI designs a verified schematic. AI Board "
+                         "continues to a populated, outlined and autorouted PCB, ready for "
+                         "Board to 3D. For a blank document use PCB Layout or New Schematic on "
+                         "the ribbon.");
+        static char aibuf[512] = "5V divider with 2.5V output";
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        ImGui::InputTextWithHint("##ecad_ai", "Describe a circuit...", aibuf, sizeof(aibuf));
+        const bool haveRequest = aibuf[0] != '\0';
+        const char* needRequest = "Describe a circuit first.";
+
+        // Two equal buttons on one row while both labels fit; stacked full-width otherwise.
+        const ImGuiStyle& style = ImGui::GetStyle();
+        const float rowW = ImGui::GetContentRegionAvail().x;
+        const float halfW = (rowW - style.ItemSpacing.x) * 0.5f;
+        const bool oneRow =
+            halfW >= ImGui::CalcTextSize("Design with AI").x + style.FramePadding.x * 4.0f;
+        const float btnW = oneRow ? halfW : rowW;
+        if (ui::kit::primaryButton("Design with AI", haveRequest, needRequest,
+                                   ImVec2(btnW, 0.0f))) {
+            st.ecadAiRequest = aibuf;
+            st.ecadAiGo = true;
+        }
+        if (haveRequest) ui::kit::itemTooltip("Generate a verified schematic from the description.");
+        if (oneRow) ImGui::SameLine(0.0f, style.ItemSpacing.x);
+        if (ui::kit::secondaryButton("AI Board", haveRequest, needRequest, ImVec2(btnW, 0.0f))) {
+            // One click all the way to a routed PCB: design the schematic, then populate +
+            // outline + autoroute a board from it (ecadAiBoard in the app loop).
+            st.ecadAiRequest = aibuf;
+            st.ecadAiBoardGo = true;
+        }
+        if (haveRequest)
+            ui::kit::itemTooltip("Schematic plus a populated, outlined, autorouted PCB, ready for "
+                                 "Board to 3D.");
+
+        static const char* const kExamples[] = {"Inverting amp, gain 10", "RC low-pass, 1 kHz",
+                                                "555 astable"};
+        ui::kit::chipFlowBegin("ecad_examples");
+        for (int i = 0; i < (int)(sizeof(kExamples) / sizeof(kExamples[0])); ++i) {
+            ImGui::PushID(i);
+            bool on = std::strcmp(aibuf, kExamples[i]) == 0;
+            if (ui::kit::flowToggleChip(kExamples[i], &on, ui::kit::Tone::Accent,
+                                        "Use this example as the description") && on)
+                std::snprintf(aibuf, sizeof(aibuf), "%s", kExamples[i]);
+            ImGui::PopID();
+        }
+        ui::kit::chipFlowEnd();
+    }
+    ui::kit::cardEnd();
+    ui::kit::popDensity();
+    ui::drawWindowPillScrollbarV(surf);
+    ImGui::EndChild();
+}
+
 }  // namespace
 
 // ---- public API ----
@@ -2530,7 +2618,6 @@ void drawEcadEditor(AppState& st) {
     g_app = &st;                  // Wave 2: route state() to this frame's active ECAD tab
     EcadEditorState& es = state();
     const ui::Palette& pal = ui::palette;
-    const float sc = ui::uiScale;
 
     // Pop the ECAD tab forward the frame a document first appears (New Schematic/PCB, or a shot),
     // so the editor surfaces instead of staying hidden behind the Viewport tab.
@@ -2549,43 +2636,7 @@ void drawEcadEditor(AppState& st) {
     ecadDockStripDraw(st);   // hide the redundant dock tab; app.cpp owns the filename strip
 
     if (!es.mirror.hasDoc()) {
-        // Launchpad: describe a circuit -> the AI designs a verified schematic. (Blank docs come
-        // from the PCB ribbon's New Schematic / New PCB.) The button hands the request to the app
-        // loop via st.ecadAiRequest/ecadAiGo, which runs ecad_design + loads the result here.
-        // Reserve the floating doc-tab strip's height first (see the toolbar's identical Dummy below)
-        // so the launchpad copy doesn't start under the tab pills.
-        ImGui::Dummy(ImVec2(0, ui::docTabStripHeight(st) + 18 * sc));
-        ImGui::Indent(24 * sc);
-        ImGui::TextColored(v4(pal.accent), "AI-ECAD  -  electronics design");
-        ImGui::Spacing();
-        ImGui::TextColored(v4(pal.textDim),
-            "Describe a circuit and the AI designs a verified schematic, or start a blank");
-        ImGui::TextColored(v4(pal.textDim),
-            "document from the PCB ribbon (New Schematic / New PCB).");
-        ImGui::Dummy(ImVec2(0, 10 * sc));
-        static char aibuf[512] = "5V divider with 2.5V output";
-        ImGui::SetNextItemWidth(440 * sc);
-        ImGui::InputTextWithHint("##ecad_ai", "describe a circuit...", aibuf, sizeof(aibuf));
-        ImGui::SameLine();
-        if (ImGui::Button("Design with AI", ImVec2(150 * sc, 0))) {
-            st.ecadAiRequest = aibuf;
-            st.ecadAiGo = true;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Generate a verified schematic from the description.");
-        ImGui::SameLine();
-        if (ImGui::Button("AI Board", ImVec2(110 * sc, 0))) {
-            // One-click all the way to a routed PCB: design the schematic, then populate +
-            // outline + autoroute a board from it (ecadAiBoard in the app loop).
-            st.ecadAiRequest = aibuf;
-            st.ecadAiBoardGo = true;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Schematic + populated, outlined, autorouted PCB - ready for Board to 3D.");
-        ImGui::Dummy(ImVec2(0, 6 * sc));
-        ImGui::TextColored(v4(pal.textDisabled),
-            "examples:  inverting amp gain 10    RC low-pass 1kHz    555 astable");
-        ImGui::Unindent(24 * sc);
+        drawEcadLaunchpad(st);
         ImGui::End();
         return;
     }
@@ -2630,7 +2681,22 @@ void drawEcadEditor(AppState& st) {
     es.bottomStripTopScreenY =
         bottomH > 0.0f ? ImGui::GetCursorScreenPos().y + mainH : 0.0f;
 
-    // Canvas.
+    // Canvas. The pinned Manager column floats over this window's left side, so the canvas starts
+    // at the column's published edge: its origin, zoom-to-fit and hit area then cover only what is
+    // visible (fitting the full window centred boards partly underneath the column and cut their
+    // traces at the left edge). The Copilot side keeps the canvas's own visible-strip fit. The strip
+    // under the column keeps the canvas fill so the column's glass backdrop is unchanged.
+    {
+        const ImVec2 hostMin = ImGui::GetCursorScreenPos();
+        const float canvasX = ecadClearSpan().x0;
+        if (canvasX > hostMin.x) {
+            const float hostH = mainH > 0.0f ? mainH : avail.y;
+            ImGui::GetWindowDrawList()->AddRectFilled(
+                hostMin, ImVec2(canvasX, hostMin.y + hostH),
+                ui::Palette::toU32(pal.viewportBottom));
+            ImGui::SetCursorScreenPos(ImVec2(canvasX, hostMin.y));
+        }
+    }
     ImGui::BeginChild("##ecadCanvasHost",
                       ImVec2(0, mainH), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);

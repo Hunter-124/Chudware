@@ -41,6 +41,9 @@ std::string simVerdict(const json& summary, double relief, kit::Tone& tone) {
         tone = kit::Tone::Warn;
         return "The peak exceeds the " + rs + " relief setting by " + over + ".";
     }
+    // Normal behavior, but not an all-clear: an informational note, so it never reads as a
+    // green "pass" sitting next to a warning chip.
+    tone = kit::Tone::Info;
     return "The peak is " + over + " above the " + rs +
            " relief setting: normal while the relief valve opens (up to 15 %).";
 }
@@ -64,7 +67,8 @@ bool HydraulicPanel::drawNativeJson(const char* id, const char* title, const jso
             draft.text = value.dump(2);
             draft.error.clear();
         }
-        kit::dimText("Native key units; all keys are retained. Solver capability validation still applies.");
+        kit::dimText("Every setting as JSON, in the units each key names. Settings the "
+                     "solver does not use are kept; Apply still checks what the solver supports.");
         {
             kit::FieldGroup g("native_json");
             kit::FieldOpts opts;
@@ -243,10 +247,10 @@ void HydraulicPanel::drawComponentEditor(AppState& st) {
     }
     json& params = comp["params"];
     if (!params.is_object()) {
-        kit::inlineStatus("This component has non-object native parameters. Correct the JSON before editing fields.",
+        kit::inlineStatus("This component's parameters are not a JSON object. Fix them below before editing fields.",
                           kit::Tone::Err);
         json edited;
-        if (drawNativeJson(("component_params_" + id).c_str(), "All parameters (native JSON)", params, edited))
+        if (drawNativeJson(("component_params_" + id).c_str(), "Advanced parameters", params, edited))
             setComponentParams(st, id, edited);
         return;
     }
@@ -379,7 +383,7 @@ void HydraulicPanel::drawComponentEditor(AppState& st) {
         }
         if (changed) circuitChanged(st);
         json edited;
-        if (drawNativeJson(("component_params_" + id).c_str(), "All parameters (native JSON)", params, edited))
+        if (drawNativeJson(("component_params_" + id).c_str(), "Advanced parameters", params, edited))
             setComponentParams(st, id, edited);
 
         // Port connection state: one chip per port, open required ports in Warn.
@@ -465,7 +469,7 @@ void HydraulicPanel::drawAddComponent(AppState& st) {
         addType_ = std::clamp(addType_, 0, (int)labels.size() - 1);
         kit::FieldGroup g("add", "Type (ISO 1219)");
         kit::fieldEnum("type", "Type (ISO 1219)", &addType_, labels.data(), (int)labels.size(),
-                       kit::FieldOpts().withTip("Select the native ISO 1219 component type. Drag its palette tile to place it."));
+                       kit::FieldOpts().withTip("Select the ISO 1219 component type. Drag its palette tile to place it."));
         // The placeholder reads as a default, not as a greyed-out value.
         const std::string hint = std::string(labels[addType_]) + " (default)";
         kit::fieldText("name", "Name", &addName_,
@@ -477,7 +481,7 @@ void HydraulicPanel::drawAddComponent(AppState& st) {
             addParamsType_ = addType_;
         }
         json edited;
-        if (drawNativeJson("add_params", "All parameters (native JSON)", addParams_, edited)) {
+        if (drawNativeJson("add_params", "Advanced parameters", addParams_, edited)) {
             std::string error;
             if (validComponentParams(typeDefs()[addType_].type, edited, error)) addParams_ = std::move(edited);
             else setStatus(error, 3);
@@ -548,7 +552,7 @@ void HydraulicPanel::drawHoses(AppState& st, int onlyIndex) {
             }
             json edited;
             const std::string hoseId = jstr(h, "id");
-            if (drawNativeJson(("hose_" + hoseId).c_str(), "All hose parameters and ends (native JSON)", h, edited)) {
+            if (drawNativeJson(("hose_" + hoseId).c_str(), "Advanced hose parameters", h, edited)) {
                 std::string error;
                 configureHose(st, hoseId, edited, error);
             }
@@ -658,7 +662,11 @@ void HydraulicPanel::drawSizingForm(AppState& st) {
 
 namespace {
 // Field picking a circuit component of `type` (or "(not linked)") into `target`; true on change.
-// An unlinked sizing says so inline: its result is a calculation only.
+// A circuit that has a component of this type links it automatically (the first one), so Design
+// never claims "not linked" while the schematic shows the pump; choosing "(not linked)" by hand
+// is remembered for this field. An unlinked sizing says so inline: its result is a calculation.
+// The combo sits in its OWN field group: its text width must not stack the numeric fields
+// (each sizing card keeps one label-left layout for its numbers).
 bool targetField(const char* id, const char* label, const json& circuit, const char* type, std::string& target) {
     std::vector<std::string> ids = {""};
     std::vector<std::string> items = {"(not linked)"};
@@ -667,13 +675,25 @@ bool targetField(const char* id, const char* label, const json& circuit, const c
             ids.push_back(jstr(c, "id"));
             items.push_back(jstr(c, "name", typeLabel(type)));
         }
+    kit::FieldGroup g(id);
+    ImGuiStorage* storage = ImGui::GetStateStorage();
+    const ImGuiID unlinkedKey = ImGui::GetID("##user_unlinked");
     int idx = 0;
     for (int i = 0; i < (int)ids.size(); ++i)
         if (ids[i] == target) idx = i;
-    const bool changed = kit::fieldCombo(
-        id, label, &idx, items,
-        kit::FieldOpts().withTip("The circuit component this sizing belongs to; Apply writes the result into it."));
-    if (changed) target = ids[idx];
+    bool changed = false;
+    if (idx == 0 && ids.size() > 1 && (!target.empty() || !storage->GetBool(unlinkedKey, false))) {
+        idx = 1;  // stale or never-chosen target: link the circuit's component
+        target = ids[idx];
+        changed = true;
+    }
+    if (kit::fieldCombo(id, label, &idx, items,
+                        kit::FieldOpts().withTip(
+                            "The circuit component this sizing belongs to; Apply writes the result into it."))) {
+        target = ids[idx];
+        storage->SetBool(unlinkedKey, idx == 0);
+        changed = true;
+    }
     if (target.empty()) kit::inlineStatus("Not linked: the result is a calculation only.", kit::Tone::Info);
     return changed;
 }
@@ -688,18 +708,18 @@ kit::FieldOpts ratioOpts(const char* tip) {
 void HydraulicPanel::drawCylinderSizing(AppState& st) {
     const char* kWidest = "Working pressure";
     if (kit::cardBegin("cyl_in", "Cylinder", "size_actuator")) {
-        {
-            kit::FieldGroup g("cyl_target", kWidest);
-            if (targetField("target", "Component", circuit_, "cylinder_linear", cylTarget_)) {
-                boreNote_.clear();
-                const int i = componentIndex(cylTarget_);
-                if (i >= 0) {
-                    const json& p = jobj(jarr(circuit_, "components")[i], "params");
-                    cylBore_ = jnum(p, "bore_mm", cylBore_);
-                    cylRod_ = jnum(p, "rod_mm", cylRod_);
-                    cylStroke_ = jnum(p, "stroke_mm", cylStroke_);
-                }
+        if (targetField("target", "Component", circuit_, "cylinder_linear", cylTarget_)) {
+            boreNote_.clear();
+            const int i = componentIndex(cylTarget_);
+            if (i >= 0) {
+                const json& p = jobj(jarr(circuit_, "components")[i], "params");
+                cylBore_ = jnum(p, "bore_mm", cylBore_);
+                cylRod_ = jnum(p, "rod_mm", cylRod_);
+                cylStroke_ = jnum(p, "stroke_mm", cylStroke_);
             }
+        }
+        {
+            kit::FieldGroup g("cyl_force", kWidest);
             kit::fieldNumber("force", "Required force", &cylForceKn_,
                              kit::FieldOpts().withUnit(kit::Unit::kN).withMin(0.0).withTip(
                                  "Force the cylinder must push at the working pressure."));
@@ -773,14 +793,14 @@ void HydraulicPanel::drawCylinderSizing(AppState& st) {
 
 void HydraulicPanel::drawPumpSizing(AppState& st) {
     if (kit::cardBegin("pump_in", "Pump", "size_pump")) {
-        kit::FieldGroup g("pump", "Overall efficiency");
         if (targetField("target", "Component", circuit_, "pump", pumpTarget_)) {
             const int i = componentIndex(pumpTarget_);
             if (i >= 0) pumpSpeed_ = jnum(jobj(jarr(circuit_, "components")[i], "params"), "speed_rpm", pumpSpeed_);
         }
+        kit::FieldGroup g("pump", "Efficiency");
         kit::fieldNumber("flow", "Flow", &pumpFlow_, kit::FieldOpts().withUnit(kit::Unit::L_min).withMin(0.0));
         kit::fieldNumber("pressure", "Pressure", &pumpPressure_, kit::FieldOpts().withUnit(kit::Unit::bar).withMin(0.0));
-        kit::fieldNumber("eff", "Overall efficiency", &pumpEff_, ratioOpts("Overall pump efficiency at the duty point."));
+        kit::fieldNumber("eff", "Efficiency", &pumpEff_, ratioOpts("Overall pump efficiency at the duty point."));
         kit::fieldNumber("speed", "Speed", &pumpSpeed_, kit::FieldOpts().withUnit(kit::Unit::rpm).withMin(0.0));
     }
     kit::cardEnd();
@@ -822,8 +842,8 @@ void HydraulicPanel::drawMotorSizing(AppState& st) {
     // Labels short enough for the inline layout the Cylinder and Pump cards use (the card never
     // flips to stacked fields between tabs); the tips carry the full terms.
     if (kit::cardBegin("motor_in", "Hydraulic motor", "size_motor")) {
-        kit::FieldGroup g("motor", "Torque efficiency");
         targetField("target", "Component", circuit_, "motor_hydraulic", motorTarget_);
+        kit::FieldGroup g("motor", "Torque efficiency");
         kit::fieldNumber("torque", "Output torque", &motTorque_, kit::FieldOpts().withUnit(kit::Unit::N_m).withMin(0.0));
         kit::fieldNumber("speed", "Output speed", &motSpeed_, kit::FieldOpts().withUnit(kit::Unit::rpm).withMin(0.0));
         kit::fieldNumber("pressure", "Pressure drop", &motPressure_,
@@ -865,13 +885,14 @@ void HydraulicPanel::drawDriveSizing(AppState& st) {
     // every other input (the same widget as Piping > Solve > Pump drive).
     if (drive_.kind == 0) {
         if (kit::cardBegin("drv_pump", "Circuit pump", "pump_drive")) {
-            kit::FieldGroup g("drv", "Pump");
             if (targetField("target", "Pump", circuit_, "pump", driveTarget_) && !driveTarget_.empty())
                 setDriveFromPump(driveTarget_);
         }
         kit::cardEnd();
         kit::gapRow();
     }
+    // Mains supply follows the document's region until the user picks one.
+    sim::defaultSupplyForUnits(drive_, st.ips());
     sim::drawPumpDriveInputs("drive", drive_, true);
     if (driveRes_.is_object() && !driveRes_.empty()) {
         kit::gapRow();
@@ -925,7 +946,7 @@ void HydraulicPanel::drawSimulateForm(AppState& st) {
         double maxStep = jnum(simulationExtra_, "max_step_s", 0.01);
         if (kit::fieldNumber("max_step", "Maximum step", &maxStep,
                              kit::FieldOpts().withUnit(kit::Unit::s).withMin(1e-8).withPresent(&present)
-                                 .withHint("engine default").withTip("Native integrator maximum step, independent of output sampling."))) {
+                                 .withHint("engine default").withTip("Largest integrator time step, independent of output sampling."))) {
             if (present) simulationExtra_["max_step_s"] = maxStep;
             else simulationExtra_.erase("max_step_s");
             setupChanged = true;
@@ -1069,13 +1090,13 @@ void HydraulicPanel::drawSimulateForm(AppState& st) {
     }
     kit::cardEnd();
     if (setupChanged) circuitChanged(st);
-    if (ImGui::CollapsingHeader("All simulation parameters (native JSON)###hyd_all_sim")) {
+    if (ImGui::CollapsingHeader("Advanced simulation parameters###hyd_all_sim")) {
         if (simulationJsonDirty_) {
             simulationJsonCache_ = simulationDefinition();
             simulationJsonDirty_ = false;
         }
         json edited;
-        if (drawNativeJson("simulation_params", "All simulation parameters (native JSON)", simulationJsonCache_, edited, true)) {
+        if (drawNativeJson("simulation_params", "Advanced simulation parameters", simulationJsonCache_, edited, true)) {
             std::string error;
             if (!configureSimulation(st, edited, error)) jsonDrafts_["simulation_params"].error = error;
         }
@@ -1106,7 +1127,9 @@ void HydraulicPanel::drawSimResults(AppState& st) {
     if (kit::cardBegin("outcome", "Outcome", "plots_view")) {
         kit::chipFlowBegin("facts");
         if (nWarn > 0) {
-            const std::string w = sim::countNoun((long long)nWarn, "warning");
+            // The chip counts the solver's warnings listed further down; it is not a verdict on
+            // the relief comparison that follows, so it says where to look.
+            const std::string w = sim::countNoun((long long)nWarn, "warning") + " (see below)";
             kit::flowChip(w.c_str(), kit::Tone::Warn, true, "Listed under the result cards below.");
         } else {
             kit::flowChip("Completed", kit::Tone::Ok, true);
@@ -1322,10 +1345,10 @@ void HydraulicPanel::drawPipingForm(AppState& st) {
         pipingOpenReq_ = false;
         persist(st);
     }
-    if (ImGui::CollapsingHeader("All piping handoff inputs (native JSON)###hyd_all_handoff")) {
+    if (ImGui::CollapsingHeader("Advanced piping handoff parameters###hyd_all_handoff")) {
         kit::dimText("Per-hose lines, fluid, defaults and operating point use hydraulic_piping_handoff keys.");
         json next;
-        if (drawNativeJson("handoff_params", "All piping handoff inputs (native JSON)", handoffParams_, next, true)) {
+        if (drawNativeJson("handoff_params", "Advanced piping handoff parameters", handoffParams_, next, true)) {
             std::string error;
             if (!configureHandoff(st, next, error)) jsonDrafts_["handoff_params"].error = error;
         }

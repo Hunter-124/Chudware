@@ -18,6 +18,7 @@
 #include "ui/icons.h"     // hasIconSdf / getIcon — mirror glassRow's icon test for label budget
 #include "ui/metrics.h"   // ui::metrics::partsPadX — the ONE horizontal gutter of this workspace
 #include "ui_theme.h"
+#include "ui/widgets/kit.h"   // ui::kit::blockedState — the categories-unavailable state
 
 #include "parts_internal.h"
 #include "parts_widgets.h"
@@ -231,11 +232,18 @@ void drawTaxonomyPane(AppState& st, float paneW) {
     // which is exactly the "everything" colour the rest of the workspace already uses.
     float allTint[3] = {palette.accent[0], palette.accent[1], palette.accent[2]};
 
+    // Loading covers every state in which a reply is still owed: the call in flight, the flat
+    // fallback in flight, a backoff retry pending, and the one frame between a Retry click and
+    // the loader re-issuing (taxonomyLoaded cleared, nothing sent yet) — so the error state
+    // below only ever shows once the loader has actually given up.
     const bool retrying = S().taxonomyAttempts > 0 && S().taxonomyRetryAt > 0.0;
-    if (S().taxonomyLoading || (S().categoriesLoading && !S().taxonomyIsTree) || retrying) {
+    const bool awaitingReply = S().taxonomyLoading || !S().taxonomyLoaded ||
+                               (S().categoriesLoading && !S().taxonomyIsTree) || retrying;
+    if (awaitingReply && !S().taxonomyIsTree && S().categories.empty()) {
         // A retry is pending: the parts worker is most likely still booting. Say so rather
         // than flashing an error the user is expected to act on.
-        spinner(S().taxonomyAttempts > 0 ? "Waiting for the parts service" : "Loading");
+        spinner(S().taxonomyAttempts > 0 ? "Waiting for the parts service"
+                                         : "Loading categories");
     } else if (S().taxonomyIsTree) {
         // ---- recursive taxonomy tree ------------------------------------------------
         {
@@ -254,20 +262,21 @@ void drawTaxonomyPane(AppState& st, float paneW) {
             firstRoot = false;
         }
     } else if (S().categories.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                   palette.textDisabled[2], 1.0f));
-        ImGui::TextWrapped("No catalog data. The parts service did not respond.");
-        ImGui::PopStyleColor();
-        ImGui::Spacing();
-        // Auto-retry gave up (kTaxonomyMaxAttempts exhausted). Clearing the attempt counter
-        // re-arms both the one-shot guard and the backoff schedule.
-        if (ImGui::SmallButton("Retry##cat_retry")) {
+        // Every load attempt failed and the backoff gave up (kTaxonomyMaxAttempts, ~75 s).
+        // Say what failed and offer the one action that helps; Retry clears the attempt
+        // counter, which re-arms both the one-shot guard and the backoff schedule.
+        const std::string why = S().taxonomyError.empty()
+            ? std::string("The parts service did not respond.") : S().taxonomyError;
+        if (ui::kit::blockedState("Categories unavailable", why.c_str(),
+                                  "Automatic retries have stopped. Retry once the parts "
+                                  "service is running.",
+                                  "Retry")) {
             S().taxonomyLoaded    = false;
             S().taxonomyIsTree    = false;
             S().categoriesLoaded  = false;
             S().taxonomyAttempts  = 0;
             S().taxonomyRetryAt   = 0.0;
+            S().taxonomyError.clear();
         }
     } else {
         // ---- fallback: flat parts_list_categories 2-level list -----------------------

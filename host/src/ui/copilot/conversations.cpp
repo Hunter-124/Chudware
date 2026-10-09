@@ -106,7 +106,29 @@ static void wasmApplySharedChatPending(AppState& st);
 // optional reference to the related document, never an ownership key.
 
 std::string chatHistoryPath() { return appdataAppDir() + "/chat_history.json"; }
-static std::string promptDraftsPath() { return appdataAppDir() + "/prompt_drafts.json"; }
+// Scripted screenshot scenarios (CHUDWARE_SHOT) seed, replay and persist conversations. They
+// must never write into the user's real Sessions folder or prompt drafts, so unless the run
+// names an explicit CHUDWARE_SESSIONS_DIR, a shot gets its own store under scratch/, one per
+// scenario name, emptied when the process first resolves it so every run starts identically.
+static std::string shotChatStoreDir() {
+    static const std::string cached = [] {
+        const char* shot = std::getenv("CHUDWARE_SHOT");
+        if (!shot || !*shot) return std::string();
+        const char* repo = std::getenv("CHUDWARE_REPO");
+        const std::string dir =
+            std::string(repo && *repo ? repo : ".") + "/scratch/shot_sessions/" + shot;
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        std::filesystem::create_directories(dir, ec);
+        return dir;
+    }();
+    return cached;
+}
+static std::string promptDraftsPath() {
+    const std::string shotDir = shotChatStoreDir();
+    if (!shotDir.empty() && !std::getenv("CHUDWARE_SESSIONS_DIR")) return shotDir + "/prompt_drafts.json";
+    return appdataAppDir() + "/prompt_drafts.json";
+}
 
 // Session transcripts live as ONE FILE PER SESSION under <Documents>/Chudware/Sessions
 // (override: CHUDWARE_SESSIONS_DIR) — human-browsable, next to Bug-Reports. index.json is
@@ -116,6 +138,8 @@ std::string chatSessionsDir() {
     static const std::string cached = [] {
         const char* env = std::getenv("CHUDWARE_SESSIONS_DIR");
         if (env && *env) return std::string(env);
+        const std::string shotDir = shotChatStoreDir();
+        if (!shotDir.empty()) return shotDir;
         return defaultWorkspaceDir() + "/Sessions";
     }();
     return cached;

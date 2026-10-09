@@ -412,11 +412,16 @@ void SketchTool::drawHud(PipingPanel& panel,const simscene::ViewportCtx& vp,ImDr
             ImVec2 a; if(project(vp,points_.back(),a)) {
                 dl->AddLine(a,cursorScreen,color,1.5f*scale);
                 const Point delta=cursor_-points_.back();
-                char label[128]; std::snprintf(label,sizeof(label),"%.1f mm%s",length(delta),
+                // Lengths in the panel's display unit (mm, or in when US customary).
+                const float unitMm=float(panel.lengthUnitMm());
+                const char* lu=panel.lengthUnit();
+                const int prec=unitMm>1.0f?2:1;
+                char label[128]; std::snprintf(label,sizeof(label),"%.*f %s%s",prec,length(delta)/unitMm,lu,
                     snap_==Snap::Interior?" · Tee":snap_==Snap::Vertical?" · Normal lock":"");
                 const float lineHeight=ImGui::GetTextLineHeight();
                 dl->AddText({cursorScreen.x+12.0f*scale,cursorScreen.y-2*lineHeight-6*scale},ink(pal.sketchInk),label);
-                std::snprintf(label,sizeof(label),"dx %+.1f  dy %+.1f  dz %+.1f mm",delta.x,delta.y,delta.z);
+                std::snprintf(label,sizeof(label),"dx %+.*f  dy %+.*f  dz %+.*f %s",prec,delta.x/unitMm,
+                              prec,delta.y/unitMm,prec,delta.z/unitMm,lu);
                 dl->AddText({cursorScreen.x+12.0f*scale,cursorScreen.y-lineHeight-4*scale},ink(pal.sketchInk,0.8f),label);
             }
             if(snap_==Snap::Axis || snap_==Snap::Vertical) {
@@ -430,7 +435,7 @@ void SketchTool::drawHud(PipingPanel& panel,const simscene::ViewportCtx& vp,ImDr
             }
         }
         if(numeric_) {
-            char label[96]; std::snprintf(label,sizeof(label),"Length: %s mm · Enter to place",number_.data());
+            char label[96]; std::snprintf(label,sizeof(label),"Length: %s %s · Enter to place",number_.data(),panel.lengthUnit());
             const ImVec2 size=ImGui::CalcTextSize(label),p{cursorScreen.x+12.0f*scale,cursorScreen.y+ImGui::GetTextLineHeight()+8*scale};
             dl->AddRectFilled({p.x-6.0f*scale,p.y-4.0f*scale},{p.x+size.x+6.0f*scale,p.y+size.y+4.0f*scale},ink(pal.overlayBg),4.0f*scale);
             dl->AddText(p,ink(pal.overlayText),label);
@@ -525,7 +530,8 @@ bool SketchTool::handle(AppState& st,PipingPanel& panel,MeshCache& mesh,const si
                 if(ImGui::IsKeyPressed(ImGuiKey_Backspace) && numberLength_>0) { number_[--numberLength_]='\0'; }
                 char* end=nullptr; const float value=std::strtof(number_.data(),&end);
                 const bool valid=end && end!=number_.data() && *end=='\0' && std::isfinite(value) && value>0;
-                if(valid && !points_.empty()) { cursor_=points_.back()+numericDirection_*value; haveCursor_=true; snap_=Snap::None; }
+                // The typed number is in the panel's display length unit (mm, or in when US).
+                if(valid && !points_.empty()) { cursor_=points_.back()+numericDirection_*(value*float(panel.lengthUnitMm())); haveCursor_=true; snap_=Snap::None; }
                 if(ImGui::IsKeyPressed(ImGuiKey_Enter) && valid) {
                     points_.push_back(cursor_); numeric_=false; numberLength_=0; number_[0]='\0';
                 }

@@ -88,8 +88,8 @@ constexpr WorkspaceChoice kWorkspaces[] = {
     {"Model", "Parametric parts & assemblies", "ws_model", "model", AppState::Workspace::Model},
     {"Drawing", "Production drawings & sheets", "ws_drawing", "drawing",
      AppState::Workspace::Drawing},
-    {"Simulate", "Structural & motion studies", "ws_simulate", "simulate",
-     AppState::Workspace::Simulate},
+    {"Simulate", "Structural, thermal, flow, piping, hydraulics, topology", "ws_simulate",
+     "simulate", AppState::Workspace::Simulate},
     {"Electronics", "Schematics & PCB layout", "ws_electronics", "electronics",
      AppState::Workspace::Electronics},
     {"Manufacture", "CAM setup, toolpaths & shop", "ws_manufacture", "manufacture",
@@ -172,12 +172,28 @@ void endCard() { ImGui::EndChild(); }
 
 void showAccountSummary() {
     if (!s_wizard.account.signedIn) {
-        dimWrapped("Not signed in. Your plan and Chudware credit balance will appear here after sign-in.");
+        ImGui::TextUnformatted("Not signed in");
+        dimWrapped("Your plan will appear here after sign-in.");
         return;
     }
-    ImGui::Text("Plan: %s", s_wizard.account.plan.empty() ? "unknown" : s_wizard.account.plan.c_str());
-    ImGui::Text("Credit balance: %lld credits", s_wizard.account.creditBalance);
+    kit::keyValueRow("Plan", s_wizard.account.plan.empty() ? "Unknown" : s_wizard.account.plan.c_str(),
+                     kit::Tone::Ok);
     if (!s_wizard.account.detail.empty()) dimWrapped(s_wizard.account.detail.c_str());
+}
+
+// What the account gates, stated from the entitlement contract (AppState::entitlementReadOnly):
+// signing in activates editing; opening, viewing, measuring and exporting never require it.
+void showAccountScope() {
+    kit::rule();
+    ImGui::TextUnformatted("Signing in activates");
+    kit::dimText("Creating, editing and saving documents, and the AI copilot.");
+    ImGui::Dummy(ImVec2(0, 4.0f * uiScale));
+    ImGui::TextUnformatted("Always available without an account");
+    kit::dimText("Opening, viewing, measuring and exporting existing work.");
+    ImGui::Dummy(ImVec2(0, 4.0f * uiScale));
+    ImGui::TextUnformatted("AI usage");
+    kit::dimText("The copilot runs on your own AI subscription or provider API key, which you "
+                 "connect in the next step.");
 }
 
 void refreshAccount(AppState& st) {
@@ -191,7 +207,7 @@ void drawAccountStep(AppState& st) {
     ImGui::TextUnformatted("Sign in to Chudware");
     dimWrapped("Connect this desktop to your Chudware account. Authorization happens in your system browser, never inside the app.");
     ImGui::Dummy(ImVec2(0, 8.0f * uiScale));
-    if (beginCard("##onboarding_account", 155.0f)) {
+    if (beginCard("##onboarding_account", 290.0f)) {
         showAccountSummary();
         ImGui::Dummy(ImVec2(0, 8.0f * uiScale));
         if (!s_accountLogin) {
@@ -199,7 +215,8 @@ void drawAccountStep(AppState& st) {
             ImGui::TextWrapped("Account sign-in is not available in this build yet. You can continue without it; a later update will connect this desktop to your Chudware account.");
             ImGui::PopStyleColor();
         } else if (!s_wizard.account.signedIn) {
-            if (ImGui::Button("Open Chudware sign-in in browser", ImVec2(-1, 0))) {
+            if (kit::primaryButton("Open Chudware sign-in in browser", true, nullptr,
+                                   ImVec2(-1, 0))) {
                 s_wizard.accountActionBusy = true;
                 OnboardingAccountSummary refreshed = s_wizard.account;
                 const bool accepted = s_accountLogin(st, OnboardingAccountAction::BeginLogin, refreshed);
@@ -208,9 +225,11 @@ void drawAccountStep(AppState& st) {
                 if (!accepted && s_wizard.account.detail.empty())
                     s_wizard.account.detail = "Chudware sign-in could not be started.";
             }
-        } else if (ImGui::Button("Refresh account", ImVec2(-1, 0))) {
+        } else if (kit::secondaryButton("Refresh account", true, nullptr, ImVec2(-1, 0))) {
             refreshAccount(st);
         }
+        ImGui::Dummy(ImVec2(0, 6.0f * uiScale));
+        showAccountScope();
     }
     endCard();
 }
@@ -256,44 +275,35 @@ void beginValidatedKeySave(AppState& st) {
 }
 
 void drawPowerStep(AppState& st) {
-    refreshAccount(st);
     const ExternalProviderSignInStatus oauth = pollExternalProviderSignIn(st);
 
     ImGui::TextUnformatted("Choose how the copilot is powered");
-    dimWrapped("Use Chudware credits, an AI subscription you already pay for, or your own provider API key.");
+    dimWrapped("Bring your own AI: sign in to a subscription you already pay for, or paste a provider API key.");
     ImGui::Dummy(ImVec2(0, 6.0f * uiScale));
-
-    // This card is intentionally absent unless account truth says the current plan permits pooled keys.
-    if (s_wizard.account.signedIn && s_wizard.account.pooledKeysAllowed) {
-        if (beginCard("##onboarding_credits", 112.0f)) {
-            ImGui::TextUnformatted("Use Chudware credits");
-            ImGui::Text("Balance: %lld credits", s_wizard.account.creditBalance);
-            if (ImGui::Button("Use credits")) {
-                OnboardingAccountSummary refreshed = s_wizard.account;
-                s_accountLogin(st, OnboardingAccountAction::UseCredits, refreshed);
-                s_wizard.account = std::move(refreshed);
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Top up in browser"))
-                openExternalHttpUrl("https://app.chudware.com/account/billing");
-        }
-        endCard();
-        ImGui::Dummy(ImVec2(0, 6.0f * uiScale));
-    }
 
     if (beginCard("##onboarding_oauth", 142.0f)) {
         ImGui::TextUnformatted("Sign in to an AI account you already pay for");
         dimWrapped("One click opens the provider in your system browser.");
+        ImGui::Dummy(ImVec2(0, 4.0f * uiScale));
+        const float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+        bool first = true;
         for (const auto& provider : kOAuthProviders) {
+            // Flow the provider buttons left-to-right, wrapping before one would cross the
+            // card edge (kit buttons size to label + horizontal frame padding).
+            const float w = ImGui::CalcTextSize(provider.label).x +
+                             ImGui::GetStyle().FramePadding.x * 2.0f;
+            if (!first) {
+                ImGui::SameLine();
+                if (ImGui::GetCursorScreenPos().x + w > right) ImGui::NewLine();
+            }
+            first = false;
             ImGui::PushID(provider.id);
-            if (oauth.active && oauth.provider != provider.id) ImGui::BeginDisabled();
-            if (ImGui::SmallButton(provider.label))
+            const bool otherActive = oauth.active && oauth.provider != provider.id;
+            if (kit::secondaryButton(provider.label, !otherActive,
+                                     "Another provider sign-in is in progress."))
                 beginExternalProviderSignIn(st, provider.id);
-            if (oauth.active && oauth.provider != provider.id) ImGui::EndDisabled();
             ImGui::PopID();
-            ImGui::SameLine();
         }
-        ImGui::NewLine();
         if (!oauth.provider.empty()) {
             if (oauth.connected) {
                 ImGui::PushStyleColor(ImGuiCol_Text, Palette::toU32(palette.statusOk));
@@ -303,7 +313,7 @@ void drawPowerStep(AppState& st) {
                 ImGui::PushStyleColor(ImGuiCol_Text, Palette::toU32(palette.statusErr));
                 ImGui::TextWrapped("%s", oauth.error.c_str());
                 ImGui::PopStyleColor();
-                if (!oauth.url.empty() && ImGui::SmallButton("Open sign-in link again"))
+                if (!oauth.url.empty() && kit::secondaryButton("Open sign-in link again"))
                     openExternalHttpUrl(oauth.url);
             } else {
                 const char* progress = !oauth.progress.empty() ? oauth.progress.c_str()
@@ -316,32 +326,34 @@ void drawPowerStep(AppState& st) {
     endCard();
     ImGui::Dummy(ImVec2(0, 6.0f * uiScale));
 
-    if (beginCard("##onboarding_apikey", 166.0f)) {
+    if (beginCard("##onboarding_apikey", 176.0f)) {
         ImGui::TextUnformatted("Paste an API key");
-        ImGui::SetNextItemWidth(190.0f * uiScale);
-        if (ImGui::BeginCombo("##onboarding_key_provider", kKeyProviders[s_wizard.keyProvider].label)) {
-            for (int i = 0; i < static_cast<int>(std::size(kKeyProviders)); ++i) {
-                const bool selected = s_wizard.keyProvider == i;
-                if (ImGui::Selectable(kKeyProviders[i].label, selected)) {
-                    s_wizard.keyProvider = i;
-                    s_wizard.keyStatus.clear();
-                    s_wizard.keyError = false;
-                }
-                if (selected) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
+        static const char* const kKeyProviderLabels[] = {
+            kKeyProviders[0].label, kKeyProviders[1].label, kKeyProviders[2].label,
+            kKeyProviders[3].label, kKeyProviders[4].label, kKeyProviders[5].label,
+        };
+        static_assert(std::size(kKeyProviderLabels) == std::size(kKeyProviders),
+                      "every key provider needs a combo label");
+        int providerSel = s_wizard.keyProvider;
+        if (kit::fieldEnum("onboarding_key_provider", "Provider", &providerSel, kKeyProviderLabels,
+                           static_cast<int>(std::size(kKeyProviderLabels))) &&
+            providerSel != s_wizard.keyProvider) {
+            s_wizard.keyProvider = providerSel;
+            s_wizard.keyStatus.clear();
+            s_wizard.keyError = false;
         }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Where do I get one?"))
-            openExternalHttpUrl(kKeyProviders[s_wizard.keyProvider].consoleUrl);
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputTextWithHint("##onboarding_key", "Paste API key\xe2\x80\xa6", s_wizard.key,
                                  sizeof(s_wizard.key), ImGuiInputTextFlags_Password);
-        if (s_wizard.keyBusy) ImGui::BeginDisabled();
-        if (ImGui::Button(s_wizard.keyBusy ? "Validating\xe2\x80\xa6" : "Validate and save") &&
+        if (kit::primaryButton(s_wizard.keyBusy ? "Validating\xe2\x80\xa6###validate" : "Validate and save###validate",
+                               s_wizard.key[0] != 0 && !s_wizard.keyBusy,
+                               s_wizard.keyBusy ? "Checking the key with the provider."
+                                                : "Paste a key first.") &&
             s_wizard.key[0] != 0 && !s_wizard.keyBusy)
             beginValidatedKeySave(st);
-        if (s_wizard.keyBusy) ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (kit::secondaryButton("Where do I get one?"))
+            openExternalHttpUrl(kKeyProviders[s_wizard.keyProvider].consoleUrl);
         if (!s_wizard.keyStatus.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text,
                                   Palette::toU32(s_wizard.keyError ? palette.statusErr : palette.statusOk));
@@ -383,11 +395,15 @@ void drawTestStep(AppState& st, bool appBusy) {
     ImGui::TextUnformatted("Test it");
     dimWrapped("Send one tiny real completion through the provider you configured. The reply below comes from the provider; it is never simulated.");
     ImGui::Dummy(ImVec2(0, 10.0f * uiScale));
-    if ((appBusy || s_wizard.testBusy)) ImGui::BeginDisabled();
-    if (ImGui::Button(s_wizard.testBusy ? "Waiting for the provider\xe2\x80\xa6" : "Run real copilot test",
-                      ImVec2(-1, 42.0f * uiScale)) && !appBusy && !s_wizard.testBusy)
+    const bool testBlocked = appBusy || s_wizard.testBusy;
+    if (kit::primaryButton(s_wizard.testBusy ? "Waiting for the provider\xe2\x80\xa6###run_test"
+                                             : "Run real copilot test###run_test",
+                           !testBlocked,
+                           s_wizard.testBusy ? "A test request is already in flight."
+                                             : "Chudware is busy; try again in a moment.",
+                           ImVec2(-1, 42.0f * uiScale)) &&
+        !testBlocked)
         beginRealTest(st);
-    if ((appBusy || s_wizard.testBusy)) ImGui::EndDisabled();
     ImGui::Dummy(ImVec2(0, 10.0f * uiScale));
     if (!s_wizard.testReply.empty()) {
         if (beginCard("##onboarding_test_reply", 170.0f)) {
@@ -418,6 +434,8 @@ void drawWorkspaceStep() {
 
     // Keep two balanced columns while both lines can remain intact. On narrower windows the
     // cards become one scrollable column rather than clipping a capability label or destination.
+    // Selection reads from the row's selected glow and accent icon, so no trailing meta text
+    // competes with the capability line for width.
     float widestText = 0.0f;
     for (const WorkspaceChoice& choice : kWorkspaces) {
         widestText = std::max(widestText, ImGui::CalcTextSize(choice.label).x);
@@ -425,10 +443,8 @@ void drawWorkspaceStep() {
     }
     const float twoLineH =
         ImGui::GetTextLineHeight() * 2.0f + metrics::U(0.5f);
-    const float selectedMetaW =
-        ImGui::CalcTextSize("Selected").x + metrics::U(1.5f);
     const float minimumCardW =
-        kit::padX() * 2.0f + twoLineH + metrics::U(1.5f) + widestText + selectedMetaW;
+        kit::padX() * 2.0f + twoLineH + metrics::U(1.5f) + widestText;
     const float availableW = ImGui::GetContentRegionAvail().x;
     const int columns =
         availableW >= minimumCardW * 2.0f + kit::rowGap() ? 2 : 1;
@@ -446,7 +462,6 @@ void drawWorkspaceStep() {
             style.icon = kWorkspaces[i].icon;
             style.iconTone = selected ? kit::Tone::Accent : kit::Tone::Neutral;
             style.secondary = kWorkspaces[i].detail;
-            style.meta = selected ? "Selected" : nullptr;
             style.tooltip = kWorkspaces[i].detail;
             style.selected = selected;
             if (kit::row(kWorkspaces[i].configName, kWorkspaces[i].label, style))
@@ -478,10 +493,10 @@ bool finishWizard(AppState& st) {
 
 void drawFooter(AppState& st) {
     ImGui::Separator();
-    if (s_wizard.step > 0 && ImGui::Button("Back")) --s_wizard.step;
+    if (s_wizard.step > 0 && kit::secondaryButton("Back")) --s_wizard.step;
     if (s_wizard.step > 0) ImGui::SameLine();
     const char* skip = s_wizard.step == 3 ? "Skip and finish" : "Skip this step";
-    if (ImGui::Button(skip)) {
+    if (kit::secondaryButton(skip)) {
         if (s_wizard.step < 3) ++s_wizard.step;
         else finishWizard(st);
     }
@@ -490,7 +505,7 @@ void drawFooter(AppState& st) {
     ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(),
                                   ImGui::GetWindowContentRegionMax().x - continueWidth));
     const char* next = s_wizard.step == 3 ? "Start here" : "Continue";
-    if (ImGui::Button(next, ImVec2(continueWidth, 0))) {
+    if (kit::primaryButton(next, true, nullptr, ImVec2(continueWidth, 0))) {
         if (s_wizard.step < 3) ++s_wizard.step;
         else finishWizard(st);
     }
@@ -551,7 +566,8 @@ void drawOnboarding(AppState& st, bool appBusy) {
 
     const float sc = uiScale;
     ImGuiViewport* viewport = ImGui::GetMainViewport();
-    const float width = std::min(820.0f * sc, viewport->WorkSize.x - 40.0f * sc);
+    // Wide enough for the workspace step's two columns with every capability line intact.
+    const float width = std::min(1000.0f * sc, viewport->WorkSize.x - 40.0f * sc);
     const float height = std::min(690.0f * sc, viewport->WorkSize.y - 40.0f * sc);
     ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Appearing);
     ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));

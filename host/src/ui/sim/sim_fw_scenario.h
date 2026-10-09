@@ -2,6 +2,7 @@
 // Thin kit editor for the executable aicad.fwscenario/1 object. Only explicit edits
 // change keys; raw JSON retains all native timing/electrical and unknown metadata.
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <set>
+#include <utility>
 #include <vector>
 #include <nlohmann/json.hpp>
 #include "ui/dragdrop.h"
@@ -409,6 +411,7 @@ inline int fwScenarioResizeInput(ImGuiInputTextCallbackData* data) {
     }
     return 0;
 }
+// Unit of a scenario number, read from its native key suffix (t_ms -> ms).
 inline const char* fwScenarioFieldUnit(const char* key) {
     const std::string name(key);
     if (name.size() > 3 && name.compare(name.size() - 3, 3, "_ms") == 0) return "ms";
@@ -417,7 +420,60 @@ inline const char* fwScenarioFieldUnit(const char* key) {
     if (name.size() > 2 && name.compare(name.size() - 2, 2, "_s") == 0) return "s";
     if (name.size() > 2 && name.compare(name.size() - 2, 2, "_f") == 0) return "F";
     if (name.size() > 2 && name.compare(name.size() - 2, 2, "_v") == 0) return "V";
+    if (name.size() > 2 && name.compare(name.size() - 2, 2, "_c") == 0) return "\xc2\xb0" "C";
     return "";
+}
+// Display name of a stimulus kind (the palette and track titles use the same words).
+inline const char* fwScenarioKindTitle(const std::string& kind) {
+    static const std::pair<const char*, const char*> kTitles[] = {
+        {"gpio_edges", "GPIO edges"}, {"uart_rx", "UART receive"},
+        {"i2c_register_stream", "I2C register stream"}, {"spi_peer", "SPI peer"},
+        {"can_frames", "CAN frames"}, {"button", "Button"}, {"quadrature", "Quadrature"},
+        {"i2c_sensor", "I2C TMP103"}, {"i2c_registers", "I2C registers"},
+        {"spi_stub", "SPI bus (no peer)"}, {"adc_waveform", "ADC waveform"}};
+    for (const auto& t : kTitles)
+        if (kind == t.first) return t.second;
+    return nullptr;
+}
+// Field label for a native scenario key: plain words, unit suffix dropped (the unit is shown
+// beside the value), bus acronyms upper-cased. The key itself stays the JSON identity.
+inline std::string fwScenarioKeyLabel(const std::string& key) {
+    static const std::pair<const char*, const char*> kKnown[] = {
+        {"t_ms", "Time"}, {"hold_ms", "Hold time"}, {"kind", "Stimulus"}, {"schema", "Schema"},
+        {"uart", "UART"}, {"bus", "Bus"}, {"pin", "Pin"}, {"level", "Level"},
+        {"address", "Address"}, {"response", "Response bytes"}, {"response_hex", "Response (hex)"},
+        {"payload_hex", "Payload (hex)"}, {"id", "ID"}, {"temperature_c", "Temperature"},
+        {"baud_hz", "Baud rate"}, {"text", "Text"}, {"events", "Events"}, {"presses", "Presses"},
+        {"samples", "Samples"}, {"model", "Model"}, {"tracks", "Tracks"}, {"links", "Electrical links"}};
+    for (const auto& k : kKnown)
+        if (key == k.first) return k.second;
+    std::string base = key;
+    for (const char* suffix : {"_ms", "_hz", "_ohm", "_s", "_f", "_v", "_c"}) {
+        const std::size_t n = std::strlen(suffix);
+        if (base.size() > n && base.compare(base.size() - n, n, suffix) == 0) {
+            base.resize(base.size() - n);
+            break;
+        }
+    }
+    std::string out;
+    std::size_t start = 0;
+    while (start <= base.size()) {
+        std::size_t end = base.find('_', start);
+        if (end == std::string::npos) end = base.size();
+        std::string word = base.substr(start, end - start);
+        std::string upper = word;
+        for (char& ch : upper) ch = (char)std::toupper((unsigned char)ch);
+        if (upper == "GPIO" || upper == "UART" || upper == "I2C" || upper == "SPI" ||
+            upper == "CAN" || upper == "ADC" || upper == "ID" || upper == "TX" || upper == "RX")
+            word = upper;
+        if (!word.empty()) {
+            if (!out.empty()) out += ' ';
+            out += word;
+        }
+        start = end + 1;
+    }
+    if (!out.empty()) out[0] = (char)std::toupper((unsigned char)out[0]);
+    return out.empty() ? key : out;
 }
 inline bool drawFwScenarioValue(const char* id, const char* label, nlohmann::json& value, int depth = 0) {
     bool changed = false;
@@ -427,9 +483,14 @@ inline bool drawFwScenarioValue(const char* id, const char* label, nlohmann::jso
             if (value.is_object()) {
                 kit::FieldGroup fields("fields_group");
                 for (auto& item : value.items()) {
+                    const std::string itemLabel = fwScenarioKeyLabel(item.key());
                     if (item.key() == "kind" || item.key() == "schema") {
-                        if (item.value().is_string()) kit::fieldReadout(item.key().c_str(), item.key().c_str(), item.value().get_ref<const std::string&>().c_str());
-                    } else changed |= drawFwScenarioValue(item.key().c_str(), item.key().c_str(), item.value(), depth + 1);
+                        if (item.value().is_string()) {
+                            const std::string& raw = item.value().get_ref<const std::string&>();
+                            const char* title = item.key() == "kind" ? fwScenarioKindTitle(raw) : nullptr;
+                            kit::fieldReadout(item.key().c_str(), itemLabel.c_str(), title ? title : raw.c_str());
+                        }
+                    } else changed |= drawFwScenarioValue(item.key().c_str(), itemLabel.c_str(), item.value(), depth + 1);
                 }
             } else {
                 int remove = -1, moveFrom = -1, moveTo = -1;
@@ -476,7 +537,7 @@ inline bool drawFwScenarioValue(const char* id, const char* label, nlohmann::jso
         }
     } else if (value.is_number()) {
         double field = value.get<double>();
-        if (kit::fieldNumber("value", label, &field, kit::FieldOpts().withUnit(fwScenarioFieldUnit(label)).withSigFigs(12))) {
+        if (kit::fieldNumber("value", label, &field, kit::FieldOpts().withUnit(fwScenarioFieldUnit(id)).withSigFigs(12))) {
             value = field; changed = true;
         }
     } else if (value.is_string()) {
@@ -525,18 +586,18 @@ inline bool drawFwScenarioEditor(FwScenarioEditor& editor, nlohmann::json& canon
     }
     ImGui::BeginDisabled(editor.draftBlocked);
     kit::sectionHeader("Stimulus palette", nullptr, nullptr, -1, true);
-    kit::dimText("Click to add or drag to the track list. Functional examples only; set the actual target and stimulus. No electrical calibration is added.");
+    kit::dimText("Click a stimulus to add it, or drag it to the track list. Each starts as an "
+                 "example: set its pins, bus and timing for your board.");
     const char* kinds[] = {"gpio_edges", "uart_rx", "i2c_register_stream", "spi_peer", "can_frames",
                           "button", "quadrature", "i2c_sensor", "i2c_registers", "spi_stub", "adc_waveform"};
-    const char* titles[] = {"GPIO edges", "UART receive", "I2C register stream", "SPI peer", "CAN frames",
-                           "Button", "Quadrature", "I2C TMP103", "I2C registers", "SPI connectivity stub", "ADC waveform"};
     for (int i = 0; i < 11; ++i) {
-        if (i == 5 && !ImGui::CollapsingHeader("Additional native stimuli")) break;
+        if (i == 5 && !ImGui::CollapsingHeader("More stimuli")) break;
+        const char* title = fwScenarioKindTitle(kinds[i]);
         ImGui::PushID(i);
-        if (kit::secondaryButton(titles[i], true, nullptr, ImVec2(-1, 0))) changed |= addFwScenarioTrack(canonical, kinds[i], editor.error);
+        if (kit::secondaryButton(title, true, nullptr, ImVec2(-1, 0))) changed |= addFwScenarioTrack(canonical, kinds[i], editor.error);
         if (ImGui::BeginDragDropSource()) {
             ImGui::SetDragDropPayload(kFwTrackDragPayload, kinds[i], std::strlen(kinds[i]) + 1);
-            ImGui::TextUnformatted(titles[i]);
+            ImGui::TextUnformatted(title);
             ImGui::EndDragDropSource();
         }
         ImGui::PopID();
@@ -555,8 +616,10 @@ inline bool drawFwScenarioEditor(FwScenarioEditor& editor, nlohmann::json& canon
             ImGui::PushID(static_cast<int>(i));
             bool removed = false;
             const std::string kind = tracks[i].is_object() && tracks[i].contains("kind") && tracks[i]["kind"].is_string()
-                ? tracks[i]["kind"].get<std::string>() : "Invalid track";
-            const std::string title = "Track " + std::to_string(i + 1) + " · " + kind;
+                ? tracks[i]["kind"].get<std::string>() : std::string();
+            const char* kindTitle = fwScenarioKindTitle(kind);
+            const std::string title = "Track " + std::to_string(i + 1) + " \xc2\xb7 " +
+                (kindTitle ? std::string(kindTitle) : kind.empty() ? std::string("Invalid track") : kind);
             if (kit::removableCard("track", title.c_str(), nullptr, nullptr, "Remove stimulus track", &removed)) {
                 kit::secondaryButton("Drag track to reorder", true, nullptr, ImVec2(-1, 0));
                 if (ImGui::BeginDragDropSource()) {
@@ -589,9 +652,11 @@ inline bool drawFwScenarioEditor(FwScenarioEditor& editor, nlohmann::json& canon
         if (remove >= 0) { tracks.erase(tracks.begin() + remove); changed = true; }
         else if (moveFrom >= 0) changed |= moveFwScenarioTrack(canonical, moveFrom, moveTo, editor.error);
         if (ImGui::CollapsingHeader("Scenario metadata and electrical links")) {
-            kit::dimText("Existing native parameters are editable below. Unknown metadata is retained; native support, not presence of a key, determines execution.");
+            kit::dimText("Settings stored with the scenario. Unrecognized settings are kept; "
+                         "only what the emulator supports affects the run.");
             for (auto& item : canonical.items())
-                if (item.key() != "tracks") changed |= drawFwScenarioValue(item.key().c_str(), item.key().c_str(), item.value());
+                if (item.key() != "tracks")
+                    changed |= drawFwScenarioValue(item.key().c_str(), fwScenarioKeyLabel(item.key()).c_str(), item.value());
         }
     }
     ImGui::EndDisabled();

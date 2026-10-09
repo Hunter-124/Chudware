@@ -33,6 +33,7 @@ bool active(AppState& st) {
 }
 void collect(AppState& st,simscene::Scene& out) {
     auto* panel=openPanel(st); if(!panel) return;
+    panel->syncUnits(st);   // viewport HUD lengths follow the display unit even before the pane draws
     auto& s=state(*panel);
     s.sketch.tick(st,*panel);
     s.mesh.collect(out);
@@ -43,6 +44,7 @@ bool toolArmed(AppState& st) {
 }
 bool handleViewport(AppState& st,const simscene::ViewportCtx& vp,ImDrawList* dl) {
     auto* panel=openPanel(st); if(!panel) return false;
+    panel->syncUnits(st);
     auto& s=state(*panel);
     return s.sketch.handle(st,*panel,s.mesh,vp,dl);
 }

@@ -680,9 +680,25 @@ void SimManager::drawFlowForm(AppState &st, Study &s) {
   const std::string docId = st.docMirror.hasDoc() ? st.docMirror.docId() : "";
   ImGui::PushID(docId.c_str());
   ImGui::PushID(s.id.c_str());
-  if ((thermalStudy || s.flowSolver == 1) && fc.known && !fc.openfoam)
-    kit::inlineStatus("OpenFOAM is unavailable. Setup remains editable; running "
-                      "this configuration is blocked.", kit::Tone::Warn);
+  if (thermalStudy && fc.known && !fc.openfoam) {
+    // One calm explanation (not an error): nothing in the setup is wrong, the solver is simply
+    // not installed. The stepper and footer agree (forms: thermalCfdUnavailable).
+    if (kit::cardBegin("cfd_unavailable", "Thermal CFD needs OpenFOAM", "study_thermal")) {
+      kit::dimText("Thermal CFD runs on OpenFOAM, the open-source CFD solver, which is not "
+                   "installed on this computer. You can still edit and save this setup.");
+      kit::dimText("To run it, install OpenFOAM from openfoam.org or openfoam.com and "
+                   "restart Chudware; it is detected automatically.");
+      kit::inlineStatus("For heat conduction in the part alone, use Switch to Thermal FEA "
+                        "below.",
+                        kit::Tone::Info);
+    }
+    kit::cardEnd();
+  } else if (s.flowSolver == 1 && fc.known && !fc.openfoam) {
+    kit::inlineStatus("OpenFOAM is not installed, so the Detailed (OpenFOAM RANS) engine "
+                      "cannot run. Choose Fast (LBM) under Resolution, or install OpenFOAM "
+                      "and restart Chudware.",
+                      kit::Tone::Info);
+  }
 
   // ======================================================== Fluid page
   auto fluidPage = [&]() {
@@ -702,8 +718,8 @@ void SimManager::drawFlowForm(AppState &st, Study &s) {
           ", kinematic viscosity " +
           kit::fmtQuantity(kFluids[1].visc * 1e6, kit::unitText(Unit::cSt)) +
           ". About 815 times the density and 15 times the Reynolds number of "
-          "air at the same speed and size: pick it for hull / hydrodynamic "
-          "studies.";
+          "air at the same speed and size: pick it for marine and other "
+          "underwater studies.";
       const char *const fluidTips[3] = {
           airTip.c_str(), waterTip.c_str(),
           "Enter the density and kinematic viscosity of your fluid."};
@@ -712,7 +728,7 @@ void SimManager::drawFlowForm(AppState &st, Study &s) {
       const bool fluidHelpers = kit::popoverBegin("fluid_helpers", "Fluid presets",
                                                   "fluid");
       if (fluidHelpers) {
-        kit::dimText("Click to apply, or drag to Drop fluid preset.");
+        kit::dimText("Click a preset to apply it, or drag it onto the drop area.");
         for (int i = 0; i < kNFluids - 1; ++i) {
           ImGui::PushID(i);
           if (kit::secondaryButton(kFluidLabels[i])) {
@@ -725,7 +741,7 @@ void SimManager::drawFlowForm(AppState &st, Study &s) {
         }
         kit::popoverEnd();
       }
-      kit::secondaryButton("Drop fluid preset###fluid_drop", true, nullptr,
+      kit::secondaryButton("Drop a fluid preset here###fluid_drop", true, nullptr,
                            ImVec2(ImGui::GetContentRegionAvail().x, 0));
       applyPreset |= flowPresetDrop(docId, s, "fluid", kNFluids - 1, fi);
       if (kit::fieldEnum("medium", "Medium", &fi, kFluidLabels, kNFluids,
@@ -808,7 +824,7 @@ void SimManager::drawFlowForm(AppState &st, Study &s) {
                                                     "Surface presets",
                                                     "appr_paint");
       if (surfaceHelpers) {
-        kit::dimText("Click to apply, or drag to Drop roughness preset.");
+        kit::dimText("Click a preset to apply it, or drag it onto the drop area.");
         for (int i = 0; i < kNRoughness - 1; ++i) {
           ImGui::PushID(i);
           kit::RowStyle row;
@@ -822,15 +838,15 @@ void SimManager::drawFlowForm(AppState &st, Study &s) {
         }
         kit::popoverEnd();
       }
-      kit::secondaryButton("Drop roughness preset###roughness_drop", true, nullptr,
+      kit::secondaryButton("Drop a roughness preset here###roughness_drop", true, nullptr,
                            ImVec2(ImGui::GetContentRegionAvail().x, 0));
       applyPreset |= flowPresetDrop(docId, s, "roughness", kNRoughness - 1, ri);
       if (kit::fieldEnum("roughness", "Roughness", &ri, roughLabels, kNRoughness,
                          FieldOpts().withItemTips(roughTips).withTip(
                              "Equivalent sand-grain roughness of the wetted "
-                             "surface. Rougher skin raises the friction drag: "
-                             "significant for hulls and large surfaces "
-                             "(qualitative correction).")) || applyPreset) {
+                             "surface. A rougher surface raises friction drag, "
+                             "which matters most for long, smooth bodies with "
+                             "large wetted areas (qualitative correction).")) || applyPreset) {
         s.flowRoughness = ri;
         changed = true;
       }
@@ -1077,7 +1093,7 @@ void SimManager::drawFlowForm(AppState &st, Study &s) {
                       .withMin(0.0)
                       .withRequired()
                       .withTip("Thermal conductivity of the part material. "
-                               "~200 aluminium, ~50 steel, ~0.2 plastic.")
+                               "~200 aluminum, ~50 steel, ~0.2 plastic.")
                       .withIssue(s.flowSolidKappa > 0.0f
                                      ? nullptr
                                      : "Conductivity must be greater than "
@@ -1217,9 +1233,12 @@ void SimManager::drawFlowForm(AppState &st, Study &s) {
         r = kFlowFidelity[fidelity];
         changed = true;
       }
-      kit::fieldReadout("cells", "Grid resolution", std::to_string(r.cells).c_str(),
+      kit::fieldReadout("cells", "Grid resolution",
+                        (std::to_string(r.cells) + " cells").c_str(),
                         FieldOpts().withTip("Cells along the longest wind-tunnel axis."));
-      kit::fieldReadout("steps", "Iteration budget", std::to_string(r.steps).c_str());
+      kit::fieldReadout("steps", "Iteration budget",
+                        (std::to_string(r.steps) + " iterations").c_str(),
+                        FieldOpts().withTip("Maximum solver iterations for this run."));
       kit::dimText("Run shows live progress and an estimated remaining time. "
                    "Refine the grid for thin walls or small details.");
     }
@@ -1263,9 +1282,10 @@ void SimManager::drawFlowForm(AppState &st, Study &s) {
         kit::spinner("Checking OpenFOAM availability\xe2\x80\xa6", kit::Tone::Info);
       else if (!ofAvail)
         kit::inlineStatus(thermalStudy
-                              ? "Install OpenFOAM to run Thermal CFD."
-                              : "OpenFOAM runs are blocked; choose Fast (LBM) "
-                                "explicitly to run on this backend.",
+                              ? "OpenFOAM is not installed. Install it and restart "
+                                "Chudware to run Thermal CFD."
+                              : "OpenFOAM is not installed; choose Fast (LBM) to run "
+                                "on this computer.",
                           kit::Tone::Info);
     }
     kit::cardEnd();

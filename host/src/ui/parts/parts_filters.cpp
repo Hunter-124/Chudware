@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstdio>
+#include <cstdlib>
 
 #include "imgui.h"
 
@@ -210,7 +211,44 @@ void drawFiltersBlock(AppState& st, float paneW) {
     // No card behind this group: the per-field liquid-glass frames (glassFieldBegin /
     // glassFieldEnd, all in the one pane hue) are the only chrome it needs.
 
+    // Price span of the results on screen, from the rows that actually CARRY a price
+    // (priceUsd > 0; 0 means the source quoted none). It is only a caption — the two fields
+    // below stay unset ("min"/"max" hints) until the user types a bound, so the row can never
+    // read as a literal "$0.00 – $0.00" filter.
+    double pricedLo = 0.0, pricedHi = 0.0;
+    int    pricedN  = 0;
+    for (const auto& r : S().results) {
+        if (!(r.priceUsd > 0.0)) continue;
+        pricedLo = pricedN == 0 ? r.priceUsd : std::min(pricedLo, r.priceUsd);
+        pricedHi = pricedN == 0 ? r.priceUsd : std::max(pricedHi, r.priceUsd);
+        ++pricedN;
+    }
+    const bool priceFilterSet = S().priceMin > 0.0f || S().priceMax > 0.0f;
+    // Right edge of the label row, measured before fieldLabel moves the cursor.
+    const float labelRowRight =
+        ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x - laneW;
     fieldLabel("Price (USD)");
+    if (!priceFilterSet) {
+        // Right-aligned dim caption: what the results cost, or "Any price" when none of them
+        // carries a price. Falls back to the bare range, then to nothing, on a narrow pane.
+        char span[48], spanLong[64];
+        if (pricedN == 0)
+            std::snprintf(span, sizeof(span), "Any price");
+        else if (pricedLo == pricedHi)
+            std::snprintf(span, sizeof(span), "$%.2f", pricedLo);
+        else
+            std::snprintf(span, sizeof(span), "$%.2f\xe2\x80\x93$%.2f", pricedLo, pricedHi);
+        std::snprintf(spanLong, sizeof(spanLong), "%s in results", span);
+        const ImVec2 lMin = ImGui::GetItemRectMin(), lMax = ImGui::GetItemRectMax();
+        const float  room = labelRowRight - lMax.x - 8.0f * sc;
+        const char*  cap  = pricedN > 0 && ImGui::CalcTextSize(spanLong).x <= room ? spanLong
+                          : ImGui::CalcTextSize(span).x <= room                   ? span
+                                                                                  : nullptr;
+        if (cap)
+            ImGui::GetWindowDrawList()->AddText(
+                ImVec2(labelRowRight - ImGui::CalcTextSize(cap).x, lMin.y),
+                Palette::toU32(palette.textDisabled), cap);
+    }
     ImGui::Dummy(ImVec2(0, gapLabel));
     // Both ends split the content width that is actually left, minus the separator and its
     // two spacings — a hardcoded pane-width guess overflowed the pane once the gutter
@@ -219,15 +257,22 @@ void drawFiltersBlock(AppState& st, float paneW) {
     const float fieldW = std::max(ui::metrics::U(8),
         (ImGui::GetContentRegionAvail().x - sepW - laneW -
          ImGui::GetStyle().ItemSpacing.x * 2.0f) * 0.5f);
-    // The "$" is chrome drawn into the frame's left inset, NOT part of the format string.
-    // InputScalar prints the buffer with the decorated format but parses it back with a bare
-    // "%f" (imgui_widgets.cpp, DataTypeApplyFromText): a "$%.2f" field hands sscanf "$12.00",
-    // the scan fails, and every edit that does not replace the whole auto-selection is
-    // silently thrown away — the field snaps back to its old value on deactivate. A suffix
-    // would parse, a prefix cannot, so the glyph lives in the padding and the format stays
-    // clean. FramePadding.x is widened by exactly the glyph so the value never sits under it.
+    // The "$" is chrome drawn into the frame's left inset, NOT part of the text, so the
+    // buffer parses as a bare number. FramePadding.x is widened by exactly the glyph so the
+    // value (or hint) never sits under it.
+    // Text fields rather than InputFloat: 0 means "this end unset", and InputFloat can only
+    // print it as "0.00" — which is exactly the degenerate "$0.00 – $0.00" the row used to
+    // show. An unset end is an EMPTY buffer showing its hint. The buffer mirrors the float
+    // whenever the field is not being edited, so Clear all (and any other writer) shows up.
+    struct PriceText { char buf[24] = {}; float shown = -1.0f; bool editing = false; };
+    static PriceText priceText[2];
     const float curW = ImGui::CalcTextSize("$").x;
-    auto priceField = [&](const char* id, float* v) {
+    auto priceField = [&](const char* id, const char* hint, float* v, PriceText& t) {
+        if (!t.editing && t.shown != *v) {
+            if (*v > 0.0f) std::snprintf(t.buf, sizeof(t.buf), "%.2f", *v);
+            else           t.buf[0] = '\0';
+            t.shown = *v;
+        }
         // Captured BY VALUE: GetStyle() returns a reference whose FramePadding the PushStyleVar
         // below mutates, and the "$" belongs at the BASE inset, not the widened one.
         const float basePadX = ImGui::GetStyle().FramePadding.x;
@@ -236,8 +281,11 @@ void drawFiltersBlock(AppState& st, float paneW) {
                                    ImGui::GetStyle().FramePadding.y));
         glassFieldBegin();
         ImGui::SetNextItemWidth(fieldW);
-        const bool changed = ImGui::InputFloat(id, v, 0, 0, "%.2f");
+        const bool edited = ImGui::InputTextWithHint(id, hint, t.buf, sizeof(t.buf),
+                                                     ImGuiInputTextFlags_CharsDecimal);
         ImGui::PopStyleVar();
+        t.editing = ImGui::IsItemActive();
+        const bool left = ImGui::IsItemDeactivated();
         const ImVec2 r0 = ImGui::GetItemRectMin();
         const float  rh = ImGui::GetItemRectSize().y;
         // Still on glassFieldBegin's FOREGROUND channel (1): glassFieldEnd paints the gradient
@@ -246,10 +294,19 @@ void drawFiltersBlock(AppState& st, float paneW) {
             ImVec2(r0.x + basePadX, r0.y + (rh - ImGui::GetTextLineHeight()) * 0.5f),
             Palette::toU32(palette.textDim), "$");
         glassFieldEnd(tint);
-        if (changed) *v = std::max(0.0f, *v);   // 0 = "this end unset" to the serializer
+        bool changed = false;
+        if (edited) {
+            // Empty or unparsable = unset (0, which the serializer omits); never negative.
+            const float parsed = t.buf[0] ? std::max(0.0f, std::strtof(t.buf, nullptr)) : 0.0f;
+            changed = parsed != *v;
+            *v = parsed;
+            t.shown = parsed;
+        }
+        // Leaving the field re-prints the canonical "12.50" (or clears a bare "0").
+        if (left) t.shown = -1.0f;
         return changed;
     };
-    if (priceField("##pmin", &S().priceMin)) markDirty();
+    if (priceField("##pmin", "min", &S().priceMin, priceText[0])) markDirty();
     ImGui::SameLine();
     // A drawn rule rather than a "-" glyph: the glyph hangs on the text baseline, well above
     // the centre of the two boxes it joins, and left the row reading as three loose items.
@@ -262,7 +319,7 @@ void drawFiltersBlock(AppState& st, float paneW) {
         ImGui::Dummy(ImVec2(sepW, ImGui::GetFrameHeight()));
     }
     ImGui::SameLine();
-    if (priceField("##pmax", &S().priceMax)) markDirty();
+    if (priceField("##pmax", "max", &S().priceMax, priceText[1])) markDirty();
 
     ImGui::Dummy(ImVec2(0, gapField));
     fieldLabel("Vendor");

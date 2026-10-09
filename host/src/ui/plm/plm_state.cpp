@@ -258,14 +258,16 @@ PlmLockRow parseLock(const nlohmann::json& x) {
     return l;
 }
 
-// Keep each fan-out single-flight until every response has arrived. Invalidation
-// during a batch discards its payloads and the next ensure schedules one fresh batch.
-bool finishGitFetch(int gen, bool details) {
+// Keep each fan-out single-flight until every response has arrived. Returns whether the
+// payload may be applied: only an answer for the current project. An answer that an
+// invalidation overtook still applies (stale-while-revalidate, see plmEnsureOverview) —
+// gitGen/gitDetailsGen already lag, so the next ensure schedules one fresh batch.
+bool finishGitFetch(bool details, const std::string& proj, AppState& st) {
     auto& H = g_plmHub;
     int& pending = details ? H.gitDetailsPending : H.gitPending;
     bool& loading = details ? H.gitDetailsLoading : H.gitLoading;
     loading = --pending != 0;
-    return gen == H.generation;
+    return proj == st.plmProjectPath();
 }
 
 }  // namespace
@@ -383,12 +385,18 @@ void plmEnsureOverview(AppState& st) {
     }
     if (H.ovLoading || H.ovGen == H.generation) return;
     H.ovLoading = true;
-    int gen = H.generation;
-    st.rpc.call("plm_overview", pathParam(st), [gen](const core::RpcResult& r) {
+    const int gen = H.generation;
+    const std::string proj = st.plmProjectPath();
+    st.rpc.call("plm_overview", pathParam(st), [gen, proj, &st](const core::RpcResult& r) {
         auto& H = g_plmHub;
         H.ovLoading = false;
-        if (gen != H.generation) return;
-        H.ovGen = gen;
+        // A different project's answer is never shown. An answer for this project that an
+        // invalidation overtook (a save, a checkpoint) is still shown — it is at most one
+        // mutation old — and ovGen stays behind so the next frame refetches. Dropping it
+        // instead left every card on "Loading" for as long as saves kept arriving faster than
+        // the shared worker lane could answer.
+        if (proj != st.plmProjectPath()) return;
+        if (gen == H.generation) H.ovGen = gen;
         if (!plmOk(r, H.ovErr)) return;
         H.ovErr.clear();
         PlmOverview ov;
@@ -410,6 +418,7 @@ void plmEnsureOverview(AppState& st) {
         if (auto m = res.find("next_milestone"); m != res.end() && m->is_object())
             ov.nextMilestone = getStr(*m, "title");
         H.overview = std::move(ov);
+        H.ovProject = proj;
     });
 }
 
@@ -423,8 +432,10 @@ void plmEnsureItems(AppState& st) {
     st.rpc.call("plm_item_list", pathParam(st), [gen, proj, &st](const core::RpcResult& r) {
         auto& H = g_plmHub;
         H.itemsLoading = false;
-        if (gen != H.generation || proj != st.plmProjectPath()) return;
-        H.itemsGen = gen;
+        // Same stale-while-revalidate rule as plmEnsureOverview: never another project's
+        // rows, but an overtaken answer for this project still replaces the spinner.
+        if (proj != st.plmProjectPath()) return;
+        if (gen == H.generation) H.itemsGen = gen;
         H.itemsProjectDir = proj;
         if (!plmOk(r, H.itemsErr)) return;
         H.itemsErr.clear();
@@ -446,11 +457,13 @@ void plmEnsureHistory(AppState& st) {
     p["limit"] = 100;
     p["scope"] = (H.histScope == 1) ? "planning" : (H.histScope == 2) ? "all" : "design";
     if (!H.histItemFilter.empty()) p["item_id"] = H.histItemFilter;
-    st.rpc.call("plm_history", p, [gen, scope, item](const core::RpcResult& r) {
+    const std::string proj = st.plmProjectPath();
+    st.rpc.call("plm_history", p, [gen, scope, item, proj, &st](const core::RpcResult& r) {
         auto& H = g_plmHub;
         H.histLoading = false;
-        if (gen != H.generation || scope != H.histScope || item != H.histItemFilter) return;
-        H.histGen = gen;
+        if (scope != H.histScope || item != H.histItemFilter || proj != st.plmProjectPath())
+            return;
+        if (gen == H.generation) H.histGen = gen;
         if (!plmOk(r, H.histErr)) return;
         H.histErr.clear();
         H.history.clear();
@@ -565,14 +578,17 @@ void plmEnsurePlanning(AppState& st) {
     H.planGen = gen;
     H.planErr.clear();
     H.planPending = 3;
+    const std::string proj = st.plmProjectPath();
     auto call = [&](const char* entity, int slot) {
         nlohmann::json p = pathParam(st);
         p["op"] = "list";
         p["entity"] = entity;
-        st.rpc.call("plm_plan", p, [slot, gen](const core::RpcResult& r) {
+        st.rpc.call("plm_plan", p, [slot, proj, &st](const core::RpcResult& r) {
             auto& H = g_plmHub;
             H.planLoading = --H.planPending != 0;
-            if (gen != H.generation) return;
+            // Stale-while-revalidate (see plmEnsureOverview): planGen already lags an
+            // invalidation, so the next ensure refetches; this answer still fills the cards.
+            if (proj != st.plmProjectPath()) return;
             std::string h;
             if (plmOk(r, h)) {
                 if (auto it = r.result.find("items"); it != r.result.end() && it->is_array()) {
@@ -606,12 +622,12 @@ void ensureGitHistory(AppState& st) {
     H.gitLoading = true;
     H.gitGen = H.generation;
     H.gitPending = 2;
-    const int gen = H.generation;
+    const std::string proj = st.plmProjectPath();
 
     // git status — branch, ahead/behind, changed files, is-repo/missing state.
-    st.rpc.call("git_status", pathParam(st), [gen](const core::RpcResult& r) {
+    st.rpc.call("git_status", pathParam(st), [proj, &st](const core::RpcResult& r) {
         auto& H = g_plmHub;
-        if (!finishGitFetch(gen, false)) return;
+        if (!finishGitFetch(false, proj, st)) return;
         std::string h;
         if (plmOk(r, h)) {
             H.gitIsRepo = true; H.gitMissing = false; H.gitErr.clear();
@@ -632,9 +648,9 @@ void ensureGitHistory(AppState& st) {
     });
 
     st.rpc.call("git_log", [&]{ nlohmann::json p = pathParam(st); p["limit"] = 60; return p; }(),
-                [gen](const core::RpcResult& r) {
+                [proj, &st](const core::RpcResult& r) {
         auto& H = g_plmHub; std::string h;
-        if (!finishGitFetch(gen, false)) return;
+        if (!finishGitFetch(false, proj, st)) return;
         if (!plmOk(r, h)) return;
         H.gitLog.clear();
         if (auto c = r.result.find("commits"); c != r.result.end() && c->is_array())
@@ -652,11 +668,11 @@ void plmEnsureGit(AppState& st, bool details) {
     H.gitDetailsLoading = true;
     H.gitDetailsGen = H.generation;
     H.gitDetailsPending = 7;
-    const int gen = H.generation;
+    const std::string proj = st.plmProjectPath();
 
-    st.rpc.call("git_branches", pathParam(st), [gen](const core::RpcResult& r) {
+    st.rpc.call("git_branches", pathParam(st), [proj, &st](const core::RpcResult& r) {
         auto& H = g_plmHub; std::string h;
-        if (!finishGitFetch(gen, true)) return;
+        if (!finishGitFetch(true, proj, st)) return;
         if (!plmOk(r, h)) return;
         H.gitBranches.clear();
         if (auto b = r.result.find("branches"); b != r.result.end() && b->is_array())
@@ -669,9 +685,9 @@ void plmEnsureGit(AppState& st, bool details) {
             }
     });
 
-    st.rpc.call("git_remotes", pathParam(st), [gen](const core::RpcResult& r) {
+    st.rpc.call("git_remotes", pathParam(st), [proj, &st](const core::RpcResult& r) {
         auto& H = g_plmHub; std::string h;
-        if (!finishGitFetch(gen, true)) return;
+        if (!finishGitFetch(true, proj, st)) return;
         if (!plmOk(r, h)) return;
         H.gitRemotes.clear();
         if (auto rm = r.result.find("remotes"); rm != r.result.end() && rm->is_array())
@@ -683,9 +699,9 @@ void plmEnsureGit(AppState& st, bool details) {
             }
     });
 
-    st.rpc.call("git_tree", pathParam(st), [gen](const core::RpcResult& r) {
+    st.rpc.call("git_tree", pathParam(st), [proj, &st](const core::RpcResult& r) {
         auto& H = g_plmHub; std::string h;
-        if (!finishGitFetch(gen, true)) return;
+        if (!finishGitFetch(true, proj, st)) return;
         if (!plmOk(r, h)) return;
         H.gitTree.clear();
         ++H.gitTreeRevision;
@@ -694,17 +710,17 @@ void plmEnsureGit(AppState& st, bool details) {
     });
 
     // GitHub side (gh) — auth, repo, PRs, issues. All degrade quietly.
-    st.rpc.call("git_gh_auth_status", pathParam(st), [gen](const core::RpcResult& r) {
+    st.rpc.call("git_gh_auth_status", pathParam(st), [proj, &st](const core::RpcResult& r) {
         auto& H = g_plmHub; std::string h;
-        if (!finishGitFetch(gen, true)) return;
+        if (!finishGitFetch(true, proj, st)) return;
         if (!plmOk(r, h)) { H.ghAuthed = false; return; }
         H.ghAuthed = r.result.value("authed", false);
         H.ghUser   = getStr(r.result, "user");
     });
 
-    st.rpc.call("git_repo_info", pathParam(st), [gen](const core::RpcResult& r) {
+    st.rpc.call("git_repo_info", pathParam(st), [proj, &st](const core::RpcResult& r) {
         auto& H = g_plmHub; std::string h;
-        if (!finishGitFetch(gen, true)) return;
+        if (!finishGitFetch(true, proj, st)) return;
         if (!plmOk(r, h)) { H.ghRepoName.clear(); return; }
         H.ghRepoName  = getStr(r.result, "name");
         H.ghRepoOwner = getStr(r.result, "owner");
@@ -712,18 +728,18 @@ void plmEnsureGit(AppState& st, bool details) {
         H.ghRepoUrl   = getStr(r.result, "url");
     });
 
-    st.rpc.call("git_pr_list", pathParam(st), [gen](const core::RpcResult& r) {
+    st.rpc.call("git_pr_list", pathParam(st), [proj, &st](const core::RpcResult& r) {
         auto& H = g_plmHub; std::string h;
-        if (!finishGitFetch(gen, true)) return;
+        if (!finishGitFetch(true, proj, st)) return;
         if (!plmOk(r, h)) { H.gitPrs.clear(); return; }
         H.gitPrs.clear();
         if (auto p = r.result.find("prs"); p != r.result.end() && p->is_array())
             for (const auto& row : *p) H.gitPrs.push_back(parseGitRef(row));
     });
 
-    st.rpc.call("git_issue_list", pathParam(st), [gen](const core::RpcResult& r) {
+    st.rpc.call("git_issue_list", pathParam(st), [proj, &st](const core::RpcResult& r) {
         auto& H = g_plmHub; std::string h;
-        if (!finishGitFetch(gen, true)) return;
+        if (!finishGitFetch(true, proj, st)) return;
         if (!plmOk(r, h)) { H.gitIssues.clear(); return; }
         H.gitIssues.clear();
         if (auto i = r.result.find("issues"); i != r.result.end() && i->is_array())

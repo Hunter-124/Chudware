@@ -252,7 +252,9 @@ static void fillDark(Palette& p) {
     set4(p.treeSection,    0.620f, 0.660f, 0.720f, 1.0f);   // muted section-header label
     // copilot blocks (chat action cards)
     set4(p.blockActionBg,  0.094f, 0.110f, 0.141f, 0.96f);  // near-opaque action card
-    set4(p.controlBorder,  0.290f, 0.330f, 0.420f, 0.60f);  // soft cool control edge
+    // Soft cool control edge. Dark frames sit only a few levels above the card glass, so the edge
+    // carries the shape: at 0.60a an unchecked checkbox / empty field read as a borderless block.
+    set4(p.controlBorder,  0.360f, 0.410f, 0.520f, 0.80f);
 }
 
 // =========================================================================
@@ -434,7 +436,9 @@ void applyTheme(Theme t, float scale) {
     s.WindowBorderSize  = 1.0f;
     s.ChildBorderSize   = 1.0f;
     s.PopupBorderSize   = 1.0f;
-    s.FrameBorderSize   = (t == Theme::Light) ? 1.0f : 0.0f;
+    // Frame outlines in BOTH themes: dark frames are only a few levels above the panels they sit
+    // on, so without an edge an unchecked native checkbox or empty field reads as a black block.
+    s.FrameBorderSize   = 1.0f;
     s.TabBorderSize     = 0.0f;
     s.WindowTitleAlign         = ImVec2(0.02f, 0.5f);
     s.WindowMenuButtonPosition = ImGuiDir_None;
@@ -450,7 +454,13 @@ void applyTheme(Theme t, float scale) {
     c[ImGuiCol_TextDisabled]        = fromRole(p.textDisabled);
     c[ImGuiCol_WindowBg]            = fromRole(p.windowBg);
     c[ImGuiCol_ChildBg]             = fromRole(p.panelBg);
-    c[ImGuiCol_PopupBg]             = fromRole(p.glassBg);
+    // Popups, popovers, combos and tooltips float over live UI text, not just the 3D backdrop:
+    // at the frosted-glass alpha (0.87 dark / 0.92 light) the rows underneath ghost through and
+    // fight the popup's own text. Keep the glass hue (the subtle tint) but make the fill all but
+    // opaque so a popup always reads as one clean surface.
+    constexpr float kPopupFillA = 0.98f;
+    c[ImGuiCol_PopupBg]             = ImVec4(p.glassBg[0], p.glassBg[1], p.glassBg[2],
+                                             std::max(p.glassBg[3], kPopupFillA));
     // T-G14: subwindow / popup OS-border. p.border is tuned for SEPARATORS (soft, low-contrast) and
     // read as "fully transparent" on floating windows — especially in light mode where a light-grey
     // border sits on a near-white window over the light viewport. Give the WINDOW/POPUP border its
@@ -1155,6 +1165,20 @@ const AdaptiveSurface& adaptivePanel(ImGuiID id, const ImRect& rect, GlassGroup 
     if (st.lastFrame == frame) return st.cur;   // cache fallback as well as live surfaces
     st.lastFrame = frame;
 
+    // Dark theme: panes, pinned columns and dialogs follow the THEME, not the backdrop. The
+    // viewport keeps its light studio gradient in both themes (C25), so a sampled surface came
+    // back light with dark ink inside dark chrome (mixed theme, theme-colored frames reading as
+    // black blocks), and a stale sample from a viewport hidden behind PLM/AI/CAM bodies left
+    // those panes light or their ink dark-on-dark. Only HUD chips drawn ON the viewport adapt.
+    if (activeTheme == Theme::Dark && group != GlassGroup::Hud) {
+        st.lum    = -1.f;   // a later switch to light snaps to its first live sample
+        st.dynHue = -1.f;
+        st.dynSat = st.dynVar = 0.f;
+        st.cur    = adaptiveSurface(-1.f, group);
+        st.cur.themeTone = true;
+        return st.cur;
+    }
+
     const float sampled = sampleLuminance(rect.Min, rect.Max);
     if (sampled < 0.f) {
         // A live texture can temporarily lack a grid (resize, pending/failed readback).
@@ -1267,7 +1291,7 @@ void glassPanel(ImDrawList* dl, const ImRect& rect, GlassLevel level, float roun
     const ImVec2 mx = rect.Max;
 
     const ViewportBackdropInfo& bd = viewportBackdrop();
-    if (bd.valid()) {
+    if (bd.valid() && !surf.themeTone) {
         // Project the panel rect into backdrop UV space (per-rect, not the whole texture):
         // clamped 0..1 so a rect spilling past the viewport image clamps into the edge texel
         // band — that IS the intended frosted edge-bleed for docked side panels.
@@ -1296,7 +1320,8 @@ void glassPanel(ImDrawList* dl, const ImRect& rect, GlassLevel level, float roun
         tint.w = tintA * alpha;
         dl->AddRectFilled(mn, mx, ImGui::ColorConvertFloat4ToU32(tint), r);
     } else {
-        // Layered fallback when no live backdrop (first frame / hidden viewport).
+        // Layered fallback when no live backdrop (first frame / hidden viewport), and the theme
+        // glass for themeTone surfaces (dark theme panes must not show the light backdrop).
         glassBackground(dl, mn, mx, rDp, alpha * std::min(1.f, rs.opacityMul));
         ImVec4 tint = surf.tint;
         tint.w = tintAlpha * 0.5f * rs.opacityMul * alpha;
@@ -1329,6 +1354,17 @@ void glassPanel(ImDrawList* dl, const ImRect& rect, GlassLevel level, float roun
     float borderCol[4];
     Palette::withAlpha(palette.glassBorder, borderCol, 0.75f * alpha);
     dl->AddRect(mn, mx, Palette::toU32(borderCol), r, 0, strokeW);
+}
+
+void pinnedColumnSurface(ImDrawList* dl, const ImRect& rect, GlassGroup group) {
+    if (activeTheme != Theme::Dark || !dl || rect.GetWidth() <= 0.f || rect.GetHeight() <= 0.f)
+        return;
+    // Same bubble radius rule as the column windows: the group's rounding knob (applied inside
+    // glassPanel) wins, else the 12 dp column default.
+    constexpr float kColumnRoundingDp = 12.0f;
+    AdaptiveSurface surf = adaptiveSurface(-1.f, group);
+    surf.themeTone = true;
+    glassPanel(dl, rect, GlassLevel::Regular, kColumnRoundingDp, surf);
 }
 
 // "Pill on a hairline track" scrollbar — shared look for the doc-tab file strip and the

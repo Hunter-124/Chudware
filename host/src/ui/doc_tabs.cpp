@@ -88,8 +88,9 @@ static bool s_openChooser = false;
 // ---- horizontal scroll + overflow edge treatment (file-display strip) ----
 // The strip never wraps. When the open tabs overflow the visible width we scroll them horizontally
 // and reserve a dedicated "+N" glass chip after the last visible tab (and before the first when
-// scrolled) so the count never paints over a filename. Boundary tab titles get a clean alpha fade.
-static float s_scrollX = 0.0f;   // px of content hidden past the LEFT edge (0 = flush left)
+// scrolled) so the count never paints over a filename. The lane always shows whole tabs (it scrolls
+// in tab steps); only a tab wider than the lane is cut, with a clean alpha fade at the cut edge.
+static float s_scrollX = 0.0f;   // px of content hidden past the LEFT edge; a tab boundary
 // Reveal only on selection/content/strip-size changes, not on every frame: browsing other tabs
 // with the wheel or overflow chips must be allowed to move away from the selected document.
 static CloseTabIdentity s_visibleActive;
@@ -800,6 +801,54 @@ float drawDocTabs(AppState& st, float availW) {
     leftTitles.reserve((size_t)nTabs);
     rightTitles.reserve((size_t)nTabs);
 
+    // Whole-tab lane: while the strip overflows, the lane's left edge always sits on a tab
+    // boundary and a tab that would straddle the right edge is folded into the right "+N" chip.
+    // A sliver of a tab (its clipped title or a lone "×" slot) beside a "+N" chip read as a
+    // rendering fault, so the only tab ever drawn cut is one wider than the whole lane (the
+    // revealed oversized title keeps its close control in view).
+    // Smallest tab boundary that still shows the content's right end — the scroll ceiling.
+    auto boundaryCap = [&](float maxS) {
+        for (int i = 0; i < nTabs; ++i)
+            if (tabOff[(size_t)i] >= maxS - 0.5f) return tabOff[(size_t)i];
+        return maxS;
+    };
+    // Moves `v` forward onto the next boundary when it lands inside a tab.
+    auto snapForward = [&](float v, float laneW) {
+        for (int i = 0; i < nTabs; ++i) {
+            const float l = tabOff[(size_t)i];
+            const float r = l + tabWs[(size_t)i];
+            if (r <= v + 0.5f) continue;                       // fully left of the lane
+            if (l >= v - 0.5f) return v;                       // already on a boundary
+            if (i == reveal && tabWs[(size_t)i] > laneW) return v;  // oversized reveal
+            return i + 1 < nTabs ? tabOff[(size_t)i + 1] : l;
+        }
+        return v;
+    };
+    // Tab-boundary stepping for the wheel and the "+N" chips: free pixel scrolling would land
+    // mid-tab and the lane would snap forward again, so a short step could never move left.
+    auto prevBoundary = [&](float v) {
+        float best = 0.0f;
+        for (int i = 0; i < nTabs; ++i)
+            if (tabOff[(size_t)i] < v - 0.5f) best = tabOff[(size_t)i];
+        return best;
+    };
+    auto nextBoundary = [&](float v) {
+        for (int i = 0; i < nTabs; ++i)
+            if (tabOff[(size_t)i] > v + 0.5f) return tabOff[(size_t)i];
+        return v;
+    };
+    // Wheel over the strip scrolls it horizontally (horizontal wheel, or a plain wheel as a
+    // fallback so a trackpad / mouse without an H-wheel still works), one tab per notch. Applied
+    // before the layout so this frame's chip counts match what is drawn; the layout clamps it.
+    if (overflow && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) {
+        float wheel = ImGui::GetIO().MouseWheelH;
+        if (wheel == 0.0f) wheel = ImGui::GetIO().MouseWheel;
+        if (wheel > 0.0f) s_scrollX = prevBoundary(s_scrollX);
+        else if (wheel < 0.0f) s_scrollX = nextBoundary(s_scrollX);
+    }
+    float viewScroll = 0.0f;
+    float scrollCap = 0.0f;
+
     for (int pass = 0; pass < 3; ++pass) {
         tabsL = outerL + (leftChipW > 0.5f ? leftChipW + gap : 0.0f);
         tabsR = outerR - (rightChipW > 0.5f ? rightChipW + gap : 0.0f);
@@ -807,12 +856,12 @@ float drawDocTabs(AppState& st, float availW) {
         tabsR = tabsL + tabsW;   // keep consistent if clamped
 
         maxScroll = std::max(0.0f, fullContentW - tabsW);
-        // Count hidden tabs against a CLAMPED VIEW of the scroll — but never write the clamp back
-        // here: pass 0 runs with no chips reserved, so clamping the persistent s_scrollX inside
-        // this loop permanently ate the chip width off the reachable scroll range (the right end
-        // could never be scrolled into view). The real clamp happens once, after the final
-        // geometry is settled (below the loop).
-        float viewScroll = overflow ? std::min(std::max(s_scrollX, 0.0f), maxScroll) : 0.0f;
+        scrollCap = overflow ? boundaryCap(maxScroll) : 0.0f;
+        // Count hidden tabs against a CLAMPED VIEW of the scroll — never write it back inside
+        // this loop: pass 0 runs with no chips reserved, so clamping the persistent s_scrollX
+        // here permanently ate the chip width off the reachable scroll range. The settled view
+        // is stored once, after the final geometry (below the loop).
+        viewScroll = overflow ? std::min(std::max(s_scrollX, 0.0f), scrollCap) : 0.0f;
         if (overflow && reveal >= 0 && reveal < nTabs) {
             const float tL = tabOff[(size_t)reveal];
             const float tR = tL + tabWs[(size_t)reveal];
@@ -823,15 +872,15 @@ float drawDocTabs(AppState& st, float availW) {
                 viewScroll = tL;
             else if (tR > viewScroll + tabsW - 0.5f)
                 viewScroll = tR - tabsW;
-            // This is an explicit reveal, not a passive clamp: repeat it as chip slots settle.
-            viewScroll = std::min(std::max(viewScroll, 0.0f), maxScroll);
-            s_scrollX = viewScroll;
+            viewScroll = std::max(viewScroll, 0.0f);
         }
+        if (overflow) viewScroll = std::min(snapForward(viewScroll, tabsW), scrollCap);
 
         nLeft = 0;
         nRight = 0;
         leftTitles.clear();
         rightTitles.clear();
+        bool anyShown = false;
         for (int i = 0; i < nTabs; ++i) {
             const float x = tabsL + tabOff[i] - viewScroll;
             const float xr = x + tabWs[i];
@@ -840,15 +889,16 @@ float drawDocTabs(AppState& st, float availW) {
                 leftTitles.push_back(st.docTabs[i].displayTitle());
                 continue;
             }
-            if (x >= tabsR - 0.5f) {
+            // Past the right edge, or straddling it behind a fully shown tab: folded into "+N".
+            if (x >= tabsR - 0.5f || (overflow && anyShown && xr > tabsR + 0.5f)) {
                 ++nRight;
                 rightTitles.push_back(st.docTabs[i].displayTitle());
                 continue;
             }
+            anyShown = true;
         }
 
-        // Show a chip only when at least one tab is fully hidden on that side (partial-only
-        // truncation gets the alpha fade alone — no "+0" chip).
+        // Show a chip only when at least one tab is hidden on that side.
         const float nextLeft  = (overflow && nLeft  > 0) ? measureOverflowChipW(nLeft,  s) : 0.0f;
         const float nextRight = (overflow && nRight > 0) ? measureOverflowChipW(nRight, s) : 0.0f;
         if (std::fabs(nextLeft - leftChipW) < 0.5f && std::fabs(nextRight - rightChipW) < 0.5f)
@@ -857,58 +907,69 @@ float drawDocTabs(AppState& st, float availW) {
         rightChipW = nextRight;
     }
 
-    // NOW clamp the persistent scroll against the FINAL geometry (chips settled) — see the in-loop
+    // NOW store the settled view against the FINAL geometry (chips settled) — see the in-loop
     // comment above. Overflow-off collapses the scroll to flush-left.
-    if (!overflow) s_scrollX = 0.0f;
-    s_scrollX = std::min(std::max(s_scrollX, 0.0f), maxScroll);
+    s_scrollX = overflow ? viewScroll : 0.0f;
 
-    // Wheel over the strip scrolls it horizontally (horizontal wheel, or a plain wheel as a fallback
-    // so a trackpad / mouse without an H-wheel still works).
-    if (overflow && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) {
-        float wheel = ImGui::GetIO().MouseWheelH;
-        if (wheel == 0.0f) wheel = ImGui::GetIO().MouseWheel;
-        if (wheel != 0.0f)
-            s_scrollX = std::min(std::max(s_scrollX - wheel * 60.0f * s, 0.0f), maxScroll);
-    }
+    // Page toward `target` on a boundary that keeps the previous lane edge in view (no tab is
+    // skipped), moving at least one tab even when the lane holds a single wide tab.
+    auto pageTo = [&](float v, float target) {
+        float best = v;
+        if (target < v) {
+            for (int i = nTabs - 1; i >= 0; --i)
+                if (tabOff[(size_t)i] >= target - 0.5f) best = tabOff[(size_t)i];
+            if (best >= v - 0.5f) best = prevBoundary(v);
+        } else {
+            for (int i = 0; i < nTabs; ++i)
+                if (tabOff[(size_t)i] <= target + 0.5f) best = tabOff[(size_t)i];
+            if (best <= v + 0.5f) best = nextBoundary(v);
+        }
+        return std::min(std::max(best, 0.0f), scrollCap);
+    };
 
-    // Draw the tabs clipped to the reserved tab region (chips live outside this clip).
-    // A partially-scrolled boundary tab stays drawn; the edge fade below dissolves it (title AND
-    // pill edge treatment), so the truncation never reads as a hard slice through border/shadow.
+    // Draw the tabs clipped to the reserved tab region (chips live outside this clip). Tabs
+    // folded into a chip are skipped; only an oversized tab can still cross a lane edge, and the
+    // edge fade below dissolves it (title AND pill edge treatment) instead of a hard slice.
     const float fadeW = 28.0f * s;
     // ImGui's clip updates BOTH renderer and window logical bounds. A draw-list-only clip
     // hides pixels but leaves the invisible tab/close targets live over the chips and "+".
     // The item audit captures this same logical lane at submission time.
     ImGui::PushClipRect(ImVec2(tabsL, y0), ImVec2(tabsR, y0 + barH), true);
+    bool cutLeft = false, cutRight = false, drewAny = false;
     for (int i = 0; i < nTabs; ++i) {
         const float x = tabsL + tabOff[i] - s_scrollX;
         const float xr = x + tabWs[i];
         if (xr <= tabsL + 0.5f) continue;
         if (x  >= tabsR - 0.5f) continue;
+        if (overflow && drewAny && xr > tabsR + 0.5f) continue;   // counted in the right chip
+        cutLeft = cutLeft || x < tabsL - 0.5f;
+        cutRight = cutRight || xr > tabsR + 0.5f;
+        drewAny = true;
         drawOneTab(st, i, x, y0, barH, surf, tabsL, tabsR, fadeW);
     }
-    // Clean alpha fade on truncated edges (drawn inside the tab clip so it only covers tab content).
+    // Clean alpha fade on a cut edge (drawn inside the tab clip so it only covers tab content).
     // When a "+N" chip owns that side the fade edge is INTERIOR to the band, so it runs the full
     // pill height and dissolves the sliced border/separator/shadow with the title. When the fade
     // edge coincides with the band's own rounded corner (no chip), keep the MultiColor inset past
     // the 8dp corner radius — the square-corner guard shared with coloredRowWash/ribbon_vGrad.
     const float bandRdp = 8.0f * s;
-    if (overflow && s_scrollX > 0.5f)
+    if (cutLeft)
         drawTabEdgeFade(dl, tabsL, y0, y0 + barH, fadeW, /*fromRight=*/false, surf,
                         leftChipW > 0.5f ? 0.0f : bandRdp);
-    if (overflow && s_scrollX < maxScroll - 0.5f)
+    if (cutRight)
         drawTabEdgeFade(dl, tabsR, y0, y0 + barH, fadeW, /*fromRight=*/true, surf,
                         rightChipW > 0.5f ? 0.0f : bandRdp);
     ImGui::PopClipRect();
 
-    // Reserved-slot overflow chips — never over a tab title.
+    // Reserved-slot overflow chips — never over a tab title. Each click pages most of a lane.
     if (leftChipW > 0.5f && nLeft > 0) {
         if (drawOverflowChip(dl, outerL, y0, barH, leftChipW, nLeft, surf, s, "ovfL", leftTitles))
-            s_scrollX = std::max(0.0f, s_scrollX - tabsW * 0.8f);
+            s_scrollX = pageTo(s_scrollX, s_scrollX - tabsW * 0.8f);
     }
     if (rightChipW > 0.5f && nRight > 0) {
         if (drawOverflowChip(dl, outerR - rightChipW, y0, barH, rightChipW, nRight, surf, s,
                              "ovfR", rightTitles))
-            s_scrollX = std::min(maxScroll, s_scrollX + tabsW * 0.8f);
+            s_scrollX = pageTo(s_scrollX, s_scrollX + tabsW * 0.8f);
     }
 
     // Scroll-position hint: an app-default 2dp hairline (ui::drawScrollPill idiom) laid INSIDE the
@@ -923,7 +984,9 @@ float drawDocTabs(AppState& st, float availW) {
         const float trackW = trackR - trackL;
         if (trackW > 16.0f * s) {
             const float thumbW = std::min(trackW, std::max(16.0f * s, trackW * (tabsW / fullContentW)));
-            const float thumbX = trackL + (s_scrollX / maxScroll) * (trackW - thumbW);
+            // The whole-tab lane may rest one boundary past maxScroll (trailing slack).
+            const float thumbX =
+                trackL + std::min(1.0f, s_scrollX / maxScroll) * (trackW - thumbW);
             const float lineY = bandB - 2.5f * s;   // hairline centre, just above the pill bottoms
             ui::drawScrollPill(dl, ImVec2(trackL, lineY - 1.0f * s), ImVec2(trackR, lineY + 1.0f * s),
                                thumbX, thumbX + thumbW, /*vertical=*/false, /*hovered=*/false, surf);

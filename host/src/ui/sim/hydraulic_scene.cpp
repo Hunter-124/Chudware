@@ -289,16 +289,19 @@ bool handleViewport(AppState& st,const simscene::ViewportCtx& vp,ImDrawList* dl)
     auto& p = *panel(st);
     ensure(p);
     if (cache.pressureColored && !cache.hoses.xyz.empty() && dl) {
-        // Exactly the hose ramp normalization: blue at zero, red at the largest node peak,
-        // already in bar. The shared legend owns tick formatting and framing reservation.
+        // Exactly the hose ramp normalization: blue at zero, red at the largest node peak (in
+        // bar). The legend shows it in the Simulation pane's units (psi when US customary; the
+        // conversion is linear, so the ramp is unchanged). The shared legend owns tick
+        // formatting and framing reservation.
+        const bool us = SimManager::unitSys(st).us;
         const bool previousOn = st.legendOn;
         const auto previousMin = st.legendMin, previousMax = st.legendMax;
-        std::string title = "Peak pressure", units = "bar";
+        std::string title = "Peak pressure", units = us ? "psi" : "bar";
         title.swap(st.legendTitle);
         units.swap(st.legendUnits);
         st.legendOn = true;
         st.legendMin = 0;
-        st.legendMax = cache.peak;
+        st.legendMax = us ? (float)(cache.peak * (1.0e5 / 6894.757293168)) : cache.peak;
         dl->PushClipRect(vp.imgMin, vp.imgMax, true);
         ui::drawLegend(st, dl, vp.imgMin, vp.imgMax);
         dl->PopClipRect();

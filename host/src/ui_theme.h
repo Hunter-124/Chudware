@@ -305,7 +305,8 @@ ImU32 controlBorderU32(float alphaMul = 1.0f);
 // Push/pop ImGuiStyle overrides for the BeginTooltip() + glassBackground() pattern.
 // pushGlassTooltipStyle() sets PopupBg=transparent so ImGui's native rect fill does not
 // compete with the custom-drawn glass layers. popGlassTooltipStyle() restores all pushed state.
-// Callers of SetTooltip() do NOT need push/pop — ImGuiCol_PopupBg==glassBg globally.
+// Callers of SetTooltip() do NOT need push/pop — ImGuiCol_PopupBg is the glassBg hue at a
+// near-opaque alpha globally (applyTheme), so popups never let the rows beneath ghost through.
 // Usage pattern:
 //   ui::pushGlassTooltipStyle();
 //   if (ImGui::BeginTooltip()) {
@@ -454,6 +455,10 @@ struct AdaptiveSurface {
     // v2.1: resolved textContrastBoost (+ the dynamic-color busyness term when active), consumed
     // by glassText()/glassIconHalo() halo alpha. 0 = today's halo.
     float contrastBoost = 0.f;
+    // Tone pinned to the active theme (palette chrome) rather than sampled from the backdrop —
+    // adaptivePanel() sets it for every non-HUD surface in the dark theme. glassPanel() then paints
+    // the layered theme glass instead of the (light) viewport backdrop image.
+    bool themeTone = false;
 };
 
 // Published once per frame by the viewport (after its render) so glassPanel()/adaptivePanel()
@@ -510,15 +515,25 @@ AdaptiveSurface adaptiveSurface(float avgLuminance, GlassGroup group = GlassGrou
 // call every frame; live AND fallback results are idempotent within a frame, GUI thread only.
 // Missing readbacks retain the last live contrast pair while the backdrop remains live.
 // `group` selects GlassStyle; pass the SAME group every frame for a given id.
+// Dark theme: every group except Hud resolves to the theme surface (palette fallback,
+// themeTone = true) — panes, pinned columns and dialogs follow the theme; only the HUD chips
+// drawn ON the viewport (light studio gradient in both themes) keep sampling the backdrop.
 const AdaptiveSurface& adaptivePanel(ImGuiID id, const ImRect& rect,
                                      GlassGroup group = GlassGroup::Global);
 
 // Frosted panel: projects `rect` into the live backdrop's UV space (clamped => frosted
 // edge-bleed for rects that spill past the viewport image) and tints with `surf`; falls back to
-// the layered glassBackground() above when no backdrop is live. `rounding` < 0 uses the default
-// panel rounding.
+// the layered glassBackground() above when no backdrop is live or `surf.themeTone` is set.
+// `rounding` < 0 uses the default panel rounding.
 void glassPanel(ImDrawList* dl, const ImRect& rect, GlassLevel level, float rounding,
                 const AdaptiveSurface& surf, float alpha = 1.f);
+
+// Pinned overlay column surface (FeatureManager / Copilot columns, whose windows are
+// NoBackground). Light theme: paints nothing — the column stays transparent over the light
+// viewport and only its rows/cards carry glass. Dark theme: one theme glass slab over the whole
+// column, so its theme-toned (light) ink never lands on the light viewport. Call right after the
+// column's Begin, before any content, with the window rect and the column's group.
+void pinnedColumnSurface(ImDrawList* dl, const ImRect& rect, GlassGroup group);
 
 // Draw text with a contrast halo (1px offset soft shadow in the opposite tone) — for text
 // painted directly on the viewport (legend, HUD labels, doc-name overlay).

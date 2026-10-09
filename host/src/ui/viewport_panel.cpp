@@ -2208,6 +2208,19 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         invalidateViewportBackdrop();
         return;
     }
+    // Drawing workspace with no drawing tab active: a kit empty state (Make Drawing + open
+    // drawings) instead of the 3D scene.
+    if (st.showViewport && st.activeWorkspace == AppState::Workspace::Drawing &&
+        !st.activeTabIsDrawing()) {
+        const std::string title = viewportTitle();
+        if (ImGui::Begin(title.c_str())) {
+            vpDockStripDraw(st);
+            ui::drawDrawingEmptyState(st);
+        }
+        ImGui::End();
+        invalidateViewportBackdrop();
+        return;
+    }
 
     // ---------- Simulate > Hydraulics (hook): while the Hydraulics panel shows its Schematic or
     // Plots view, the central Viewport window paints that full-size 2D canvas instead of the 3D
@@ -2767,7 +2780,15 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             s_lastAuxGen = -1;
             s_lastAuxFrame = -1;
         }
+        // Datum axes are scene-scale ink: keep them inside the clear rect so the dashed lines never
+        // cross the text of the translucent glass columns. No clip when nothing is pinned (the clear
+        // rect is the whole image, e.g. headless shots with hidden columns or narrow layouts).
+        const bool clipDatumAxes = clr0.x > imgX0 || clr1.x < imgX1 || clr0.y > imgY0;
+        if (clipDatumAxes)
+            renderer.setDatumAxisClip((clr0.x - imgX0) / (float)vw, (clr0.y - imgY0) / (float)vh,
+                                      (clr1.x - imgX0) / (float)vw, (clr1.y - imgY0) / (float)vh);
         renderer.renderOrbit(st.yaw, st.pitch, st.zoom, st.pan);
+        if (clipDatumAxes) renderer.clearDatumAxisClip();
 
         // ---- topology picking (C15): id pass + overlay highlights drawn over the shaded view ----
         const bool picking = st.hasDocMesh && st.idPass && st.overlays;
@@ -5802,12 +5823,23 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 if (bestD2 < 0.0f) continue;  // every corner behind the camera
                 const char* nm = kPlaneName[p];
                 ImVec2 ts = ImGui::CalcTextSize(nm);
-                // Keep the chip inside the clear region so it never shows through a glass pane.
+                // Keep the chip inside the clear region so it never shows through a glass pane,
+                // with a margin that clears the Copilot column's resize grip, and below the
+                // heads-up view toolbar row (drawn whenever this block runs: !inSketch) — the
+                // toolbar sits at docTabBandBottom + 6dp and is 26dp tall (22dp buttons + 2*2dp).
+                const float chipMargin = 10.0f * ui::uiScale;
+                float chipTop = clr0.y + chipMargin;
+                {
+                    const float dtb = ui::docTabBandBottom();
+                    const float huTop = dtb > clr0.y - 6.0f * ui::uiScale ? dtb + 6.0f * ui::uiScale
+                                                                          : clr0.y;
+                    chipTop = std::max(chipTop, huTop + 26.0f * ui::uiScale + chipMargin);
+                }
                 float x0 = sp.x, y0 = sp.y;
-                if (x0 + ts.x + 12 > clr1.x) x0 = clr1.x - ts.x - 12;
-                if (x0 < clr0.x + 2) x0 = clr0.x + 2;
-                if (y0 + ts.y + 6 > clr1.y) y0 = clr1.y - ts.y - 6;
-                if (y0 < clr0.y + 2) y0 = clr0.y + 2;
+                if (x0 + ts.x + 12 > clr1.x - chipMargin) x0 = clr1.x - chipMargin - ts.x - 12;
+                if (x0 < clr0.x + chipMargin) x0 = clr0.x + chipMargin;
+                if (y0 + ts.y + 6 > clr1.y - chipMargin) y0 = clr1.y - chipMargin - ts.y - 6;
+                if (y0 < chipTop) y0 = chipTop;
                 ImVec2 q0(x0, y0), q1(x0 + ts.x + 12, y0 + ts.y + 6);
                 // C43: during plane-pick the label chips are CLICK TARGETS (the quads overlap
                 // heavily near the origin; the labels are unambiguous). Outside a pick — and outside

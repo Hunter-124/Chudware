@@ -1161,23 +1161,25 @@ static bool tryHandleSkillsListCommand(AppState& st) {
     return true;
 }
 
+// Descriptions are user copy: what the command does, in plain words. Argument syntax lives in
+// /help, never in the menu row (raw "[elide|images]" read as developer notation).
 static const SlashItem kSessionSlashItems[] = {
     {SlashKind::Session, "/compact ", "/compact",
-     "Compact conversation with the Compaction setting [summary|snapcompact]", "ai_panel", true},
+     "Summarize older messages to free up context", "ai_panel", true},
     {SlashKind::Session, "/shake ", "/shake",
-     "Shake loose tokens [elide|images]", "ai_panel", true},
+     "Drop bulky tool output and old images to free up context", "ai_panel", true},
     {SlashKind::Session, "/handoff ", "/handoff",
-     "New session seeded with a handoff document", "ai_panel", true},
+     "Start a new session from a handoff summary of this one", "ai_panel", true},
     {SlashKind::Session, "/btw ", "/btw",
-     "Side question (does not enter the transcript)", "ask"},
+     "Ask a side question that stays out of the transcript", "ask"},
     {SlashKind::Session, "/prewalk", "/prewalk",
-     "Arm agent prewalk for the next turn", "plan_board"},
+     "Walk through the project before the next run", "plan_board"},
     {SlashKind::Session, "/rule ", "/rule",
-     "New rule: /rule <trigger words> -> <context to inject>", "plan_board", true},
+     "Add a rule that injects context when trigger words appear", "plan_board", true},
     {SlashKind::Meta, "/skills", "/skills",
      "List available skills", "team"},
     {SlashKind::Meta, "/help", "/help",
-     "Show slash-command help", "ask"},
+     "Show every command and its options", "ask"},
 };
 
 // The built-in command `text` invokes (first token, case-insensitive), or nullptr.
@@ -1244,11 +1246,43 @@ static void applySlashInsert(std::vector<char>& buf, const std::string& text) {
     std::memcpy(buf.data(), text.c_str(), text.size() + 1);
 }
 
-// Each row is two text lines (command, then its description) plus padding. Rows used to be one
-// frame tall while drawing two lines, so the lines overlapped each other and the last row's
-// description ran out of the list.
-static float slashRowHeight() {
-    return ImGui::GetTextLineHeight() * 2.0f + 8.0f * ui::uiScale;
+// Each row is the command line plus its description WRAPPED to the row's text width (up to
+// kSlashDetailLines lines, the last one ellipsized only past that), plus padding. Heights are
+// measured per row from the same text width the painter uses, so the list height computed
+// before the window opens matches what is drawn. A fixed one-line description elided every
+// longer description ("Compact conversation with the…").
+static constexpr int kSlashDetailLines = 2;
+static float slashRowPad()     { return 8.0f * ui::uiScale; }
+static float slashIconLane()   { return ImGui::GetFontSize() * 1.02f + 7.0f * ui::uiScale; }
+// Text width of a row whose Selectable spans `rowW` (icon lane + both side pads excluded).
+static float slashTextWidth(float rowW) {
+    return std::max(1.0f, rowW - slashRowPad() * 2.0f - slashIconLane());
+}
+// The description as drawn: wrapped at `textW`, cut with an ellipsis after kSlashDetailLines.
+static std::string slashFitDetail(const char* text, float textW) {
+    std::string s = text ? text : "";
+    const float maxH = ImGui::GetTextLineHeight() * (float)kSlashDetailLines + 0.5f;
+    auto wrappedH = [&](const std::string& t) {
+        return ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, textW, t.c_str())
+            .y;
+    };
+    if (s.empty() || wrappedH(s) <= maxH) return s;
+    const std::string ell = "\xe2\x80\xa6";
+    while (!s.empty() && wrappedH(s + ell) > maxH) {
+        do s.pop_back();
+        while (!s.empty() && (static_cast<unsigned char>(s.back()) & 0xC0) == 0x80);
+    }
+    while (!s.empty() && s.back() == ' ') s.pop_back();
+    return s + ell;
+}
+static float slashRowHeight(const char* detail, float textW) {
+    const float lineH = ImGui::GetTextLineHeight();
+    float h = lineH;
+    if (detail && detail[0]) {
+        const std::string d = slashFitDetail(detail, textW);
+        h += ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, textW, d.c_str()).y;
+    }
+    return h + slashRowPad();
 }
 
 // Trim `s` (UTF-8) with a trailing ellipsis so it fits `maxW` pixels. Shrinks by whole
@@ -1271,15 +1305,16 @@ static std::string slashFitText(const char* text, float maxW) {
 static bool slashMenuRow(const char* iconName, const char* label, const char* detail,
                          bool selected, int uid, bool disabled = false) {
     const auto& pal = ui::palette;
-    const float sc = ui::uiScale;
-    const float rowH = slashRowHeight();
     const float fh = ImGui::GetFontSize();
     const float lineH = ImGui::GetTextLineHeight();
+    const float rowW = ImGui::GetContentRegionAvail().x;
+    const float textW = slashTextWidth(rowW);
+    const float rowH = slashRowHeight(detail, textW);
     ImGui::PushID(uid);
     const bool clicked = ImGui::Selectable("##slashrow", selected,
                                            ImGuiSelectableFlags_AllowItemOverlap |
                                                ImGuiSelectableFlags_DontClosePopups,
-                                           ImVec2(ImGui::GetContentRegionAvail().x, rowH));
+                                           ImVec2(rowW, rowH));
     const bool hov = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
@@ -1291,35 +1326,34 @@ static bool slashMenuRow(const char* iconName, const char* label, const char* de
         ui::coloredRowWash(dl, mn, mx, rnd, pal.accent,
                            selected ? 0.34f : 0.18f, /*selected=*/selected);
     }
-    const float pad = 8.0f * sc;
-    const float labelY = mn.y + (rowH - 2.0f * lineH) * 0.5f;
+    const float pad = slashRowPad();
+    const float labelY = mn.y + pad * 0.5f;
     const float isz = fh * 1.02f;
     const ImU32 ink = ui::Palette::toU32(selected && !disabled ? pal.text : pal.textDim);
-    float textX = mn.x + pad;
+    // The icon lane is reserved on every row (icon or not) so the wrap width used to measure the
+    // row height above is exactly the one the description is drawn with.
+    const float textX = mn.x + pad + slashIconLane();
     IconUV ic = ui::getIcon(iconName, 20);
     if (ic.valid) {
         const ImVec2 i0(mn.x + pad, labelY + (lineH - isz) * 0.5f);
         dl->AddImage(ic.texId, i0, ImVec2(i0.x + isz, i0.y + isz), ic.uv0, ic.uv1, ink);
-        textX = i0.x + isz + 7.0f * sc;
     }
-    // Measure against what is actually visible: the list's clip rect excludes its scrollbar
-    // and the popup padding, which the item rect does not.
-    const float textMaxX = ImMin(mx.x, dl->GetClipRectMax().x) - pad;
-    const float textW = textMaxX - textX;
     dl->AddText(ImVec2(textX, labelY), ui::Palette::toU32(disabled ? pal.textDim : pal.text),
                 slashFitText(label, textW).c_str());
     if (detail && detail[0]) {
-        dl->AddText(ImVec2(textX, labelY + lineH), ui::Palette::toU32(pal.textDim),
-                    slashFitText(detail, textW).c_str());
+        const std::string d = slashFitDetail(detail, textW);
+        dl->AddText(ImGui::GetFont(), fh, ImVec2(textX, labelY + lineH),
+                    ui::Palette::toU32(pal.textDim), d.c_str(), nullptr, textW);
     }
     ImGui::PopID();
     return clicked && !disabled;
 }
 
-// Draw the drop-up slash menu above the composer input. Returns true when an item was
-// accepted (caller must bump the InputText generation so the insert is visible).
+// Draw the drop-up slash menu above the composer (its bottom sits `anchorTopY`, the top of the
+// prelude row, minus a gap, so it never covers the mode chip or the gauges). Returns true when
+// an item was accepted (caller must bump the InputText generation so the insert is visible).
 static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const ImVec2& inputMax,
-                                  bool& ateEnter) {
+                                  float anchorTopY, bool& ateEnter) {
     ateEnter = false;
     std::string filter;
     const bool want = parseSlashQuery(st.prompt.data(), filter);
@@ -1376,25 +1410,41 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
     const ui::AdaptiveSurface& surf = chatSurf();
     const auto& pal = ui::palette;
     const float popW = ImMax(inputMax.x - inputMin.x, 280.0f * sc);
-    const float rowH = slashRowHeight();
+    const float winPad = 6.0f * sc;
     const float rowGap = 2.0f * sc;  // ItemSpacing.y pushed below
     const float headerH = ImGui::GetTextLineHeight() + 10.0f * sc;
     const float gap = 4.0f * sc;
+    // Any run (this session's or another's) holds the agent lane these commands need.
+    const bool runBusy = aiTurnActive(st) || st.anyRunActive();
+    auto rowDisabled = [runBusy](const SlashItem& it) { return runBusy && it.needsIdle; };
     // Up to 8 rows, but never taller than the space above the composer: the menu drops UP
-    // and must not run off the top of the window. The list scrolls for the rest.
-    const float roomAbove = (inputMin.y - gap) - ImGui::GetMainViewport()->WorkPos.y -
+    // and must not run off the top of the window. The list scrolls for the rest. Rows are
+    // measured with the list's text width (a scrollbar's width is held back once the list
+    // overflows) so the computed height matches the drawn rows.
+    const float roomAbove = (anchorTopY - gap) - ImGui::GetMainViewport()->WorkPos.y -
                             headerH - 20.0f * sc;
-    const int fitRows = std::max(1, (int)((roomAbove + rowGap) / (rowH + rowGap)));
-    const int visible = std::min(
-        fitRows, (int)std::min<size_t>(8, std::max<size_t>(1, s_slash.matches.size())));
-    const float listH = (rowH + rowGap) * (float)visible - rowGap + 6.0f * sc;
+    const size_t shownMax = std::min<size_t>(8, s_slash.matches.size());
+    const bool   overflows = s_slash.matches.size() > shownMax;
+    const float  listW = popW - winPad * 2.0f - (overflows ? ImGui::GetStyle().ScrollbarSize : 0.0f);
+    const float  textW = slashTextWidth(listW);
+    float listContentH = 0.0f;
+    for (size_t i = 0; i < shownMax; ++i) {
+        const SlashItem& it = s_slash.matches[i];
+        const float h = slashRowHeight(rowDisabled(it) ? kAvailableAfterRun : it.detail.c_str(),
+                                       textW);
+        const float next = listContentH + (i ? rowGap : 0.0f) + h;
+        if (i > 0 && next > roomAbove) break;   // always at least one row
+        listContentH = next;
+    }
+    if (listContentH <= 0.0f) listContentH = ImGui::GetTextLineHeight() + slashRowPad();
+    const float listH = listContentH + 6.0f * sc;
     const float popH = headerH + listH + 8.0f * sc;
 
-    ImGui::SetNextWindowPos(ImVec2(inputMin.x, inputMin.y - gap), ImGuiCond_Always,
+    ImGui::SetNextWindowPos(ImVec2(inputMin.x, anchorTopY - gap), ImGuiCond_Always,
                             ImVec2(0.0f, 1.0f));
     ImGui::SetNextWindowSize(ImVec2(popW, popH), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * sc, 6.0f * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(winPad, winPad));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 2.0f * sc));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui::metrics::rounding(8.0f));
     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
@@ -1404,9 +1454,6 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
 
     bool accepted = false;
     std::string acceptText;
-    // Any run (this session's or another's) holds the agent lane these commands need.
-    const bool runBusy = aiTurnActive(st) || st.anyRunActive();
-    auto rowDisabled = [runBusy](const SlashItem& it) { return runBusy && it.needsIdle; };
     ImGuiWindowFlags wflags =
         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
@@ -1448,7 +1495,9 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
             ImVec2 p0 = ImGui::GetWindowPos();
             ImVec2 p1(p0.x + ImGui::GetWindowSize().x, p0.y + ImGui::GetWindowSize().y);
             dl->ChannelsSetCurrent(0);
-            ui::glassPanel(dl, ImRect(p0, p1), ui::GlassLevel::Regular,
+            // Thick glass: the menu floats over the transcript, so what is behind it must not
+            // read through the command rows.
+            ui::glassPanel(dl, ImRect(p0, p1), ui::GlassLevel::Thick,
                            ImGui::GetStyle().WindowRounding / sc, surf);
             // Subtle border so the menu reads against busy chat backdrops.
             dl->AddRect(p0, p1,
@@ -2126,19 +2175,29 @@ static bool ctxWindowSourceTrusted() {
 //      is a real answer ("user"/"catalog"/"probe"). A sourced server value describes the model
 //      that ACTUALLY ran, which Settings cannot know: the picker may have been changed
 //      mid-session, and an auto-route may have run a different model entirely.
-//   3. effectiveContextWindow() — curated catalog metadata for the selected model, then an id
-//      estimate (ui_common.cpp).
-//   4. st.lastContextWindow even when its source is heuristic/unstated — better than nothing,
-//      but only once 3 has produced nothing at all.
+//   3. The model catalog row for the selected model (the live fetch, or the copy persisted from
+//      the last session — see settings.cpp, so a restart knows the real window from frame one).
+//   4. effectiveContextWindow()'s id-pattern estimate, then st.lastContextWindow even when its
+//      source is heuristic/unstated. Both are GUESSES: `known` is false, and the meter then
+//      shows the token count alone — never a denominator, fraction ring or over-limit red built
+//      on a family default (that is what painted "145k/128k" red before the catalog landed).
 //
 // A heuristic provider default must lose to model-specific catalog metadata. Otherwise the
 // first provider call can downgrade a correct model window to a generic family estimate.
-// 0 = genuinely unknown, never a real capacity.
-static int contextMeterWindow(const AppState& st) {
-    if (st.settings.contextWindow > 0) return st.settings.contextWindow;
-    if (st.lastContextWindow > 0 && ctxWindowSourceTrusted()) return st.lastContextWindow;
-    if (const int eff = effectiveContextWindow(st.settings); eff > 0) return eff;
-    return st.lastContextWindow > 0 ? st.lastContextWindow : 0;
+// tokens 0 = genuinely unknown, never a real capacity.
+struct CtxWindow {
+    int  tokens = 0;
+    bool known  = false;   // false = a guess; the meter must not show a fraction of it
+};
+static CtxWindow contextMeterWindow(const AppState& st) {
+    if (st.settings.contextWindow > 0) return {st.settings.contextWindow, true};
+    if (st.lastContextWindow > 0 && ctxWindowSourceTrusted()) return {st.lastContextWindow, true};
+    if (const ui::BridgeModelMeta* bm = ui::bridgeModelMetaForCad(
+            st.settings.provider, st.settings.model, st.settings.baseUrl);
+        bm && bm->contextWindow > 0)
+        return {bm->contextWindow, true};
+    if (const int eff = effectiveContextWindow(st.settings); eff > 0) return {eff, false};
+    return {st.lastContextWindow > 0 ? st.lastContextWindow : 0, false};
 }
 
 // ---- precomposed system-prompt baseline ------------------------------------------------------
@@ -2301,18 +2360,22 @@ static CtxMeterUsage contextMeterUsage(const AppState& st) {
 //                         numerator is an em dash and the ring sits empty — a pure capacity hint
 //   win == 0           -> "ctx \xe2\x80\x94" with NO ring: the window is unknown, so there is no
 //                         fraction to show at all
+//   win is a guess     -> "ctx 145k" with NO ring and no denominator: an id-pattern estimate
+//                         is not a capacity, so the meter stays neutral (never over-limit red)
+//                         until the catalog or the provider reports the real window
 struct CtxMeterText {
     std::string full;      // ring-adjacent readout (or the bare unknown mark)
     bool        ringOk;    // false = window unknown; draw the compact tag only, never a ring
 };
 static CtxMeterText contextMeterText(const AppState& st) {
-    const int win = contextMeterWindow(st);
-    if (win <= 0) return {std::string("\xe2\x80\x94"), false};
+    const CtxWindow win = contextMeterWindow(st);
+    if (win.tokens <= 0) return {std::string("\xe2\x80\x94"), false};
     const CtxMeterUsage u = contextMeterUsage(st);
     std::string num = u.tokens <= 0  ? std::string("\xe2\x80\x94")
                       : u.estimate   ? "~" + fmtTokens(u.tokens)
                                      : fmtTokens(u.tokens);
-    return {num + "/" + fmtTokens(win), true};
+    if (!win.known) return {num, false};
+    return {num + "/" + fmtTokens(win.tokens), true};
 }
 
 // Context-window gauge for the composer prelude row: a fraction ring + "N/M" readout (compact
@@ -2323,7 +2386,10 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
     refreshPromptBaseline(st);   // async, guarded; never a synchronous call on a draw path
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
-    const int   win  = contextMeterWindow(st);
+    const CtxWindow winInfo = contextMeterWindow(st);
+    // A guessed window never drives a fraction (ring, tooltip bar or percentage): only a real
+    // capacity may tell the user they are near or over the limit.
+    const int   win  = winInfo.known ? winInfo.tokens : 0;
     const CtxMeterUsage usage = contextMeterUsage(st);
     const int   used = usage.tokens;   // measured OR estimated; the ring follows what is SHOWN
     const float frac = (win > 0 && used > 0) ? std::min(1.0f, (float)used / (float)win) : 0.0f;
@@ -2392,17 +2458,8 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
                                ? "the harness's curated catalog entry for the model that "
                                  "actually ran"
                                : "probed from the provider for the model that actually ran";
-        } else if (effectiveContextWindow(st.settings) > 0) {
-            const ui::BridgeModelMeta* bm = ui::bridgeModelMetaForCad(
-                st.settings.provider, st.settings.model, st.settings.baseUrl);
-            srcTxt = (bm && bm->contextWindow > 0)
-                         ? "from the model catalog entry for the selected model"
-                         : "a fallback estimate from the model id \xe2\x80\x94 no catalog entry "
-                           "for it yet";
-        } else if (st.lastContextWindow > 0) {
-            // Only reachable once the catalog answered nothing at all: a heuristic is the last
-            // thing left, and it says so instead of posing as a probe.
-            srcTxt = "reported by the harness (rough per-provider default)";
+        } else if (winInfo.known) {
+            srcTxt = "from the model catalog entry for the selected model";
         }
         std::string tip = "Context window usage \xe2\x80\x94 ";
         if (used > 0 && !usage.estimate)
@@ -2422,6 +2479,12 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
             tip += "Window " + std::to_string(win) + " tokens, ";
             tip += srcTxt;
             tip += ".\n";
+        } else if (winInfo.tokens > 0) {
+            // A guess (id pattern or the harness's per-provider default) is said to be one and
+            // never turned into a fraction of the window.
+            tip += "The model's window is not reported yet (roughly " + fmtTokens(winInfo.tokens)
+                   + " by its family), so no share of it is shown until the model catalog "
+                     "loads.\n";
         }
         if (win > 0 && used > 0) {
             char pct[48];
@@ -4297,6 +4360,9 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     }
 
     // ---- composer: prelude row -> transparent input -> toolbar row ----
+    // The slash drop-up anchors ABOVE the prelude (mode chip + gauges): anchored to the input it
+    // covered that row, and the chip and meter showed through the menu's glass.
+    const float composerTopY = ImGui::GetCursorScreenPos().y;
     drawComposerPrelude(st, busy);
 
     const char* placeholder =
@@ -4401,7 +4467,8 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
 
     // Slash autocomplete drop-up (commands + skills). Accept steals Enter from submit.
     bool slashAteEnter = false;
-    if (drawSlashAutocomplete(st, inputMin, inputMax, slashAteEnter)) {
+    if (drawSlashAutocomplete(st, inputMin, inputMax, std::min(composerTopY, inputMin.y),
+                              slashAteEnter)) {
         ++s_composerGen;          // active InputText ignores external buffer writes
         s_refocusComposer = true;
         submitInput = false;

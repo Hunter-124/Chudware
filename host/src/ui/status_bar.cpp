@@ -10,6 +10,7 @@
 #include "metrics.h"
 #include "model_registry.h"
 #include "status_bar.h"
+#include "copilot/copilot.h"  // bridgeModelMetaForCad — the model's display name
 
 #include "../core/app_state.h"
 #include "sketch_mode.h"   // C18
@@ -411,17 +412,32 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     // DashScope) instead of reading "OpenRouter / Cloud API" for all of them.
     const char* provName =
         ui::providerLabelForEndpoint(st.settings.provider, st.settings.baseUrl);
-    // The old suffix read "[plan mode]" for every planPreference != 0, so an advisory
-    // "Option" (the model MAY plan; nothing is gated) looked like a hard plan gate.
-    // Name the actual preference instead — Settings -> AI -> Autonomy uses these words.
-    static const char* kPlanPrefLabels[] = {"Off", "Option", "Encourage", "Require"};
-    const int planPref = (st.settings.planPreference < 0 || st.settings.planPreference > 3)
-                             ? 0
-                             : st.settings.planPreference;
-    const std::string planTxt =
-        planPref == 0 ? std::string() : std::string("   [plan: ") + kPlanPrefLabels[planPref] + "]";
-    std::string ptxt = std::string(provName) + "  /  " +
-                       (st.settings.model[0] ? st.settings.model : "default") + planTxt;
+    // A plan indicator appears ONLY when planning actually constrains the agent: the composer is
+    // in Plan mode (read-only drafting, nothing changes) or Autonomy requires a plan before any
+    // action. Advisory preferences gate nothing and are not status.
+    std::string planTxt;
+    if (normalizeCopilotMode(st.aiInteraction) == (int)CopilotMode::Plan)
+        planTxt = "   \xc2\xb7  Plan mode";
+    else if (st.settings.planPreference == 3)
+        planTxt = "   \xc2\xb7  Plans before acting";
+    // The model's display name, resolved like the composer chip (catalog row, then the
+    // built-in table, then the raw id) so both read the same name.
+    std::string modelName = st.settings.model[0] ? st.settings.model : "default";
+    if (st.settings.model[0]) {
+        if (const BridgeModelMeta* bm = bridgeModelMetaForCad(
+                st.settings.provider, st.settings.model, st.settings.baseUrl);
+            bm && !bm->name.empty()) {
+            modelName = bm->name;
+        } else {
+            for (const ModelInfo& mi : builtinModels())
+                if (mi.provider == st.settings.provider && mi.id == st.settings.model &&
+                    !mi.label.empty()) {
+                    modelName = mi.label;
+                    break;
+                }
+        }
+    }
+    std::string ptxt = std::string(provName) + "  /  " + modelName + planTxt;
     // C24: the unit-system cluster mirrors SolidWorks — it shows MMGS / IPS and clicking it
     // toggles the active document unit system, reformatting every dimension display app-wide.
     const char* unitsTxt = st.ips() ? "IPS" : "MMGS";

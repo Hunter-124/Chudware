@@ -4499,6 +4499,19 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       a.activity.push_back(ops);
     }
     st.chat.push_back(a);
+    // Second turn: a live multi-agent run, so the agent overview above the composer shows a
+    // plan with progress, a running / finished / failed sub-agent and inter-agent messages. The
+    // bubble is only the shell; its rows, the plan and the agent trace are produced at frame 1
+    // by replaying the worker's own event stream (see the frame-1 shot block).
+    ChatMsg u2;
+    u2.fromUser = true;
+    u2.text = "Add four M3 mounting bosses for the sensor board and check clearance "
+              "against the enclosure lid.";
+    st.chat.push_back(u2);
+    ChatMsg live;
+    live.running = true;
+    live.ts = chatNowEpoch() - 95.0;   // header elapsed reads as a run in progress
+    st.chat.push_back(live);
   }
 
   // The four chat seeds above run BEFORE the startup session restore, which assigns over
@@ -6968,6 +6981,102 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         std::snprintf(st.prompt.data(), st.prompt.size(), "/");
       if (shotChatContext) st.pendingContextRefs = shotPendingChips;
     }
+    // chat shot: replay a live multi-agent run into the seeded running bubble through the SAME
+    // two sinks the event drain feeds (feedAgentDagEvent -> agent trace / overview roster,
+    // feedTurnActivity -> transcript rows + plan), with the event kinds and payload keys the
+    // worker sends (orch_<kind> with the prefix stripped). Runs once the restore has settled on
+    // a conversation id. The run is marked live with a sentinel run id no worker event can bind
+    // to (runForEvent matches by id first and only binds runs whose id is empty).
+    if (shot && st.wantChat && st.frame >= 1) {
+      static bool s_chatRunSeeded = false;
+      const std::string convId = st.activeConvId();
+      if (!s_chatRunSeeded && !convId.empty() && !st.chat.empty() &&
+          !st.chat.back().fromUser && st.chat.back().running) {
+        s_chatRunSeeded = true;
+        ChatMsg &live = st.chat.back();
+        auto emit = [&](const char *kind, nlohmann::json data) {
+          ui::feedAgentDagEvent(convId, kind, data);
+          feedTurnActivity(live, kind, data);
+        };
+        const std::string model = st.settings.model[0] ? st.settings.model : "default";
+        emit("run_started", {{"run_id", "shot-chat-run"}, {"model", model}});
+        emit("plan_state",
+             {{"shape", "checklist"},
+              {"title", "Sensor board mounting"},
+              {"items",
+               {{{"id", "bosses:1"}, {"title", "Read the board's hole pattern"},
+                 {"status", "done"}},
+                {{"id", "bosses:2"}, {"title", "Sketch the boss layout on the floor"},
+                 {"status", "done"}},
+                {{"id", "bosses:3"}, {"title", "Extrude four M3 bosses with pilot holes"},
+                 {"status", "running"}},
+                {{"id", "bosses:4"}, {"title", "Check clearance against the enclosure lid"},
+                 {"status", "pending"}},
+                {{"id", "bosses:5"}, {"title", "Update the drawing and BOM"},
+                 {"status", "pending"}}}}});
+        emit("agent.tool_call", {{"id", "main-1"}, {"tool_name", "inspect_part"},
+                                 {"target", "enclosure base"}, {"ok", true},
+                                 {"latency_ms", 640},
+                                 {"args_preview", "{\"detail\": \"holes\"}"}});
+        emit("agent.spawn", {{"subagent_id", "datasheet"}, {"id", "spawn-datasheet"},
+                             {"role", "Datasheet reader"},
+                             {"brief", "Pull the sensor board's hole pattern"},
+                             {"spawn_kind", "task"}});
+        emit("agent.spawn", {{"subagent_id", "geometry"}, {"id", "spawn-geometry"},
+                             {"role", "Geometry"},
+                             {"brief", "Model the four bosses and pilot holes"},
+                             {"spawn_kind", "task"}});
+        emit("agent.spawn", {{"subagent_id", "clearance"}, {"id", "spawn-clearance"},
+                             {"role", "Clearance check"},
+                             {"brief", "Check boss height against the lid ribs"},
+                             {"spawn_kind", "task"}});
+        for (const char *sub : {"datasheet", "geometry", "clearance"})
+          emit("run_started", {{"subagent_id", sub}, {"run_id", std::string("shot-") + sub},
+                               {"model", model}});
+        // Datasheet reader: one read, a message to Geometry, done.
+        emit("agent.tool_call", {{"subagent_id", "datasheet"}, {"id", "ds-1"},
+                                 {"tool_name", "read_document"},
+                                 {"target", "SHT45 sensor board datasheet"}, {"ok", true},
+                                 {"latency_ms", 1820}});
+        emit("agent.message",
+             {{"from", "datasheet"}, {"to", "geometry"}, {"channel", "irc"},
+              {"message_id", "shot-msg-1"},
+              {"text", "Hole pattern is 21.0 x 15.5 mm with 2.7 mm holes. M3 bosses with "
+                       "2.5 mm pilots line up."}});
+        emit("sub_run", {{"subagent_id", "datasheet"}, {"id", "datasheet"},
+                         {"purpose", "Datasheet reader"}, {"status", "done"},
+                         {"detail", "Hole pattern 21.0 x 15.5 mm"}});
+        // Clearance check: the lid is not open, so it fails.
+        emit("agent.tool_call",
+             {{"subagent_id", "clearance"}, {"id", "cl-1"}, {"tool_name", "measure_clearance"},
+              {"target", "enclosure lid ribs"}, {"ok", false}, {"latency_ms", 410},
+              {"error_preview", "The enclosure lid is not open, so there is nothing to "
+                                "measure against."}});
+        emit("sub_run", {{"subagent_id", "clearance"}, {"id", "clearance"},
+                         {"purpose", "Clearance check"}, {"status", "failed"},
+                         {"detail", "The enclosure lid is not open in this session."}});
+        // Geometry: two finished calls and one in flight (its last step on the roster row).
+        emit("agent.tool_call", {{"subagent_id", "geometry"}, {"id", "geo-1"},
+                                 {"tool_name", "sketch_points"}, {"target", "base floor"},
+                                 {"ok", true}, {"latency_ms", 930}});
+        emit("agent.tool_call", {{"subagent_id", "geometry"}, {"id", "geo-2"},
+                                 {"tool_name", "extrude"}, {"target", "boss sketch"},
+                                 {"ok", true}, {"latency_ms", 2100}});
+        emit("agent.message",
+             {{"from", "geometry"}, {"channel", "board"}, {"message_id", "shot-msg-2"},
+              {"text", "Bosses are placed on the datasheet pattern; pilot holes next. The "
+                       "clearance check needs the lid open."}});
+        emit("status", {{"subagent_id", "geometry"}, {"phase", "tool"},
+                        {"tool_call_id", "geo-3"}, {"tool_name", "add_hole"}});
+        std::shared_ptr<JobState> job = st.runFor(convId);
+        {
+          std::lock_guard<std::mutex> lk(job->mtx);
+          job->convId = convId;
+          job->runId = "shot-chat-run";
+        }
+        job->running = true;
+      }
+    }
     // chat_context: bind the seeded chips to the shot's open document as soon as its tab has a
     // hostd doc id, creating a fresh part for the shot when none is open, so they render live.
     if (shotChatContext && st.frame >= 1 && chatContextBoundAt < 0) {
@@ -7090,9 +7199,16 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // active title-bar workspace so Model shows modeling tools, Simulate shows
     // sim tools, etc. (WIRE_REQUESTS).
     ui::setRibbonWorkspace(static_cast<int>(st.activeWorkspace));
+    // The Drawing workspace always shows the drawing tabs (View Layout / Annotation), with or
+    // without a drawing open, so it never lands on an unrelated modeling tab.
+    const bool drawingRibbon = st.activeTabIsDrawing() ||
+                               st.activeWorkspace == AppState::Workspace::Drawing;
+    if (drawingRibbon && st.ribbonTab != AppState::RT_ViewLayout &&
+        st.ribbonTab != AppState::RT_Annotation)
+      st.ribbonTab = AppState::RT_ViewLayout;
     float ribbonH =
         ui::drawRibbon(st.ribbonTab, st.showRibbon, st.showSimulationTools,
-                       st.showPcbTools, barH, st.activeTabIsDrawing());
+                       st.showPcbTools, barH, drawingRibbon);
 
     // Electronics: surface the PCB DRC/unrouted summary in the ribbon band's
     // trailing dead space (the board canvas gave up its bottom results strip to
@@ -8362,6 +8478,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       // Hard ceiling so a wedged fetch fails as a visible spinner shot rather
       // than hanging the harness forever.
       shotFrame = plmShotAt > 0 ? plmShotAt : (st.frame >= 1200 ? st.frame : 99999);
+    }
+    // Parts Library: its taxonomy/vendor fetches queue behind startup traffic on the single
+    // async RPC lane, so capture once they have settled (bounded, never the 99999 abort path).
+    if (shot && shotMode && std::strcmp(shotMode, "parts") == 0) {
+      static int partsShotAt = -1;
+      if (partsShotAt < 0 && st.frame > 6 && ui::partsLibrarySettled(st)) partsShotAt = st.frame + 8;
+      shotFrame = partsShotAt > 0 ? partsShotAt : 900;
     }
     // T-G15 iconpipe: keep the loop alive (offscreen icon renders happen in
     // tick()) until every recipe is captured, then exit promptly — the --shot

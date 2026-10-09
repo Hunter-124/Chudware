@@ -897,17 +897,19 @@ void drawSessionsPanel(AppState& st, bool busy) {
         drawSessionsProjectSwitcher(projects, unassigned, activeKey,
                                     ImGui::GetContentRegionAvail().x * 0.45f);
         ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
-        // Checkbox ink must come from the glass surface like every other label in this menu:
-        // the theme's default text tone is tuned for opaque panels and vanished against the
-        // bright viewport backdrop showing through the copilot column.
+        // The kit checkbox paints its own themed box (the raw ImGui box rendered as a bare black
+        // block on dark glass). Its ink still comes from the glass surface like every other label
+        // in this menu: the theme's default text tone vanished against the bright viewport
+        // backdrop showing through the copilot column.
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-        ImGui::Checkbox("Show archived", &s_showArchived);
+        ui::kit::checkbox("sess_show_archived", "Show archived", &s_showArchived,
+                          s_showArchived
+                              ? "Showing archived sessions only. Turn off to return to your "
+                                "active list."
+                              : "Archived sessions are hidden from this list \xe2\x80\x94 turn "
+                                "on to review or restore them. Archiving keeps the full "
+                                "transcript (unlike Delete).");
         ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(s_showArchived
-                ? "Showing archived sessions only. Uncheck to return to your active list."
-                : "Archived sessions are hidden from this list \xe2\x80\x94 check to review or "
-                  "restore them. Archiving keeps the full transcript (unlike Delete).");
     });
     const bool allProjects = scope.scope == SessScope::All;
     // Peeking at another project's sessions: offer the real project switch (the same path as
@@ -1008,8 +1010,6 @@ void drawSessionsPanel(AppState& st, bool busy) {
         const float delBtnW = delImg + style.FramePadding.x * 2.0f;
         const float delBtnH = delImg + style.FramePadding.y * 2.0f;
         const float rightMargin = 4.0f * sc;
-        const float actionsW = delBtnW + archBtnW + forkBtnW + manageBtnW +
-                               actionGap * 3.0f + rightMargin;
         // The overflow button is PERMANENT on every row — the visible sign that a session can be
         // managed, and the only route to its actions without a hover-capable pointer. The hover
         // buttons stay as a shortcut to its left.
@@ -1023,12 +1023,29 @@ void drawSessionsPanel(AppState& st, bool busy) {
         const ImVec2 rowMax(rowMin.x + rowW, rowMin.y + rowH);
 
         // Every row reserves the permanent overflow button; the hover shortcut buttons
-        // (Manage/Fork/Archive/Delete) only EXIST on hover/active rows, so only those rows
-        // reserve their width — reserving it on idle rows squeezed every title to a stub for
-        // buttons that were not even drawn. Hover is tested against the row rect directly:
-        // the reserve is needed BEFORE this frame's InvisibleButton reports its hover state.
-        const bool rowHot = active || ImGui::IsMouseHoveringRect(rowMin, rowMax);
-        const float actionsReserve = moreReserve + ((rowHot && !renaming) ? actionsW : 0.0f);
+        // (Manage/Fork/Archive/Delete) only EXIST while the pointer is on the row, so only that
+        // row reserves their width. The ACTIVE row is marked by its highlight, not by permanent
+        // buttons — showing them there squeezed the open session's title to one letter. Hover is
+        // tested against the row rect directly: the reserve is needed BEFORE this frame's
+        // InvisibleButton reports its hover state.
+        const bool rowHot = ImGui::IsMouseHoveringRect(rowMin, rowMax);
+        // Shortcuts are added right-to-left (Delete, Archive, Fork, Manage) only while the title
+        // keeps a readable share of the row; whatever does not fit stays in the overflow menu,
+        // which carries every action. The title is never covered.
+        const float titleKeep = std::max(ui::metrics::px(110.0f), rowW * 0.45f);
+        const float shortcutRoom = rowW - padX * 2.0f - moreReserve - titleKeep;
+        float actionsW = 0.0f;
+        bool showDelBtn = false, showArchBtn = false, showForkBtn = false, showManageBtn = false;
+        auto takeShortcut = [&](float w, bool& flag) {
+            if (actionsW + w + actionGap > shortcutRoom) return false;
+            actionsW += w + actionGap;
+            flag = true;
+            return true;
+        };
+        if (rowHot && !renaming && takeShortcut(delBtnW, showDelBtn) &&
+            takeShortcut(archBtnW, showArchBtn) && takeShortcut(forkBtnW, showForkBtn))
+            takeShortcut(manageBtnW, showManageBtn);
+        const float actionsReserve = moreReserve + actionsW;
 
         // While the title is an edit box the row must not also be a click target: the button
         // would claim hover first and swallow the clicks meant for the text field.
@@ -1199,8 +1216,12 @@ void drawSessionsPanel(AppState& st, bool busy) {
         bool doRename = false;
         const float btnY = rowMin.y + (rowH - delBtnH) * 0.5f;
         const float moreX = rowMax.x - rightMargin - moreW;
-        if (rowHot && !renaming) {
-            const float delX = moreX - actionGap - delBtnW;
+        // Shortcuts are laid out right-to-left from the overflow button, each only when
+        // takeShortcut() above found room for it (the same set the title clip reserved).
+        float nextX = moreX;
+        if (showDelBtn) {
+            const float delX = nextX - actionGap - delBtnW;
+            nextX = delX;
             ImGui::SetCursorScreenPos(ImVec2(delX, btnY));
             IconUV trash = ui::getIcon("delete", 20);
             bool del = trash.valid
@@ -1212,24 +1233,29 @@ void drawSessionsPanel(AppState& st, bool busy) {
             // Destructive row actions are blocked only for the row whose own run is live —
             // an unrelated background run never locks them.
             doDel = del && !running;
-
-            const float archX = delX - archBtnW - actionGap;
+        }
+        if (showArchBtn) {
+            const float archX = nextX - archBtnW - actionGap;
+            nextX = archX;
             ImGui::SetCursorScreenPos(ImVec2(archX, btnY));
             bool archClick = ImGui::Button(archLabel, ImVec2(archBtnW, delBtnH));
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(c.archived
                     ? "Restore to the active sessions list"
                     : "Archive: hides from the default list but keeps the full transcript "
-                      "(unlike Delete). Toggle \"Show archived\" above to find it again.");
+                      "(unlike Delete). Turn on \"Show archived\" above to find it again.");
             doArchiveToggle = archClick && !running;
-
-            const float forkX = archX - forkBtnW - actionGap;
+        }
+        if (showForkBtn) {
+            const float forkX = nextX - forkBtnW - actionGap;
+            nextX = forkX;
             ImGui::SetCursorScreenPos(ImVec2(forkX, btnY));
             doFork = ImGui::Button("Fork", ImVec2(forkBtnW, delBtnH));
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Fork this session into a new idle copy");
-
-            const float mgX = forkX - manageBtnW - actionGap;
+        }
+        if (showManageBtn) {
+            const float mgX = nextX - manageBtnW - actionGap;
             ImGui::SetCursorScreenPos(ImVec2(mgX, btnY));
             doManage = ImGui::Button("Manage", ImVec2(manageBtnW, delBtnH));
             if (ImGui::IsItemHovered())
@@ -2216,6 +2242,14 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     const bool cpOpen = ImGui::Begin("Copilot###AI", nullptr, flags);
     ImGui::PopStyleVar(2);
     if (!cpOpen) { ImGui::End(); return; }
+    // Theme glass slab under the whole column (no-op in light theme): in dark theme the adaptive
+    // ink follows the theme, so the column must never let light ink sit on a light viewport.
+    {
+        const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+        ui::pinnedColumnSurface(ImGui::GetWindowDrawList(),
+                                ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)),
+                                ui::GlassGroup::Copilot);
+    }
     ui::Fonts& fonts = st.fonts;
 
     // Liquid-Glass v2 host port (contract H5): ONE fully transparent glass surface for the whole

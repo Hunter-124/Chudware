@@ -101,7 +101,7 @@ const KeySpec kSpecs[] = {
     {"filter_radius_mm", Group::Regularization, Kind::Real, Unit::Length, 0.0,
      false, kInf, false, "Filter radius",
      "Spatial filter radius; sets the smallest feature scale the optimizer "
-     "favours. 0 disables "
+     "favors. 0 disables "
      "filtering."},
     {"projection_beta", Group::Regularization, Kind::Real, Unit::None, 0.0,
      false, kInf, false, "Projection sharpness (beta)",
@@ -110,7 +110,7 @@ const KeySpec kSpecs[] = {
      0.0, true, 1.0, true, "Solid threshold",
      "Density at which the result surface is extracted and the thresholded "
      "design is "
-     "re-analysed."},
+     "re-analyzed."},
     {"min_density", Group::Regularization, Kind::Real, Unit::Fraction, 0.0,
      true, 1.0, true, "Minimum density",
      "Lower bound on the design variables; keeps the void phase non-singular."},
@@ -1294,18 +1294,20 @@ void scrollCursorToTop() {
       ImGui::GetCursorScreenPos().y - ImGui::GetWindowPos().y, 0.0f);
 }
 
-// Placeholder of an empty scalar: the solver default this pair applies. A
-// default of 0 on a key whose range starts at an inclusive 0 is the "disabled"
-// value (no skin depth, no filter, no penalty), so it reads "off".
+// Placeholder of an empty scalar: the solver default this pair applies, kept
+// short enough for the value cell ("0.05", "Off", "Auto"); the field tip says
+// in words that an empty field uses it. A default of 0 on a key whose range
+// starts at an inclusive 0 is the "disabled" value (no skin depth, no filter,
+// no penalty), so it reads "Off".
 std::string defaultHint(const Combination &c, const KeySpec &s, double factor) {
   const json &d = member(c.defaults, s.key);
   if (d.is_number()) {
     const double v = d.get<double>();
     if (v == 0.0 && s.lo == 0.0 && !s.loOpen)
       return "Off";
-    return "Default " + kit::fmtValue(v * factor);
+    return kit::fmtValue(v * factor);
   }
-  return "Solver default";
+  return "Auto";
 }
 
 // Owns the labels / tips / disabled reasons of one enum field for the call.
@@ -1383,7 +1385,10 @@ bool numberField(const KeySpec &s, json &topo, const Combination &c,
   const auto it = topo.find(s.key);
   bool present = it != topo.end() && it->is_number();
   kit::FieldOpts o;
-  o.withTip(s.tip).withHint(hint.c_str()).withPresent(&present);
+  const std::string tip = std::string(s.tip) + " Leave empty to use the " +
+                          (hint == "Auto" ? std::string("solver's default.")
+                                          : "default (" + hint + ").");
+  o.withTip(tip.c_str()).withHint(hint.c_str()).withPresent(&present);
   if (!unit.empty())
     o.withUnit(unit.c_str());
   withFieldIssue(o, fi);

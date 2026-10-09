@@ -203,6 +203,7 @@ std::string simStageLabel(const std::string &stage, const std::string &detail) {
       {"mesh_interface_band_refine", "Meshing \xc2\xb7 refining interface band"},
       {"mesh_interface_band_quality", "Meshing \xc2\xb7 checking element quality"},
       {"mesh_interface_band_complete", "Meshing \xc2\xb7 interface band done"},
+      {"Starting", "Starting the solver"},
       {"setup", "Setting up"},
       {"cache.hit", "Loading the cached result"},
       {"assemble", "Assembling"},
@@ -256,9 +257,12 @@ float simStageFraction(const std::string &stage, const std::string &detail) {
   return std::clamp((float)done / (float)total, 0.0f, 1.0f);
 }
 
-// Status-line notice while a run exports/prepares (before the status bar's job chip appears);
-// cleared by the first progress event.
-static const char *const kSimPreparingStatus = "Preparing simulation\xe2\x80\xa6";
+// Phase text while a run exports/prepares the model, before any solver job exists. The pane
+// footer (runUi) and the status line show this SAME wording; once the solver job launches, the
+// status bar's job chip and the footer both read the solver's own stage (simStageLabel), and
+// this status line is cleared so no third, stale phase lingers.
+static const char *const kSimPreparingStage = "Preparing model";
+static const char *const kSimPreparingStatus = "Preparing model\xe2\x80\xa6";
 
 // Footer stage line of one progress event: the iteration counter while iterating, else the
 // shared stage label (legacy free text when the event names no stage).
@@ -304,7 +308,9 @@ std::string SimManager::runBlockerFor(AppState &st, const Study &s) const {
     const nlohmann::json flowCaps =
         st.simClient ? st.simClient->caps() : nlohmann::json::object();
     if (!flowCaps.is_object() || !flowCaps.value("openfoam", false))
-      return "Use the Fast (LBM) solver: OpenFOAM is missing.";
+      return s.type == StudyType::Thermal
+                 ? "Thermal CFD needs OpenFOAM, which is not installed."
+                 : "Choose Fast (LBM): OpenFOAM is not installed.";
   }
   if (s.type == StudyType::Contact || s.type == StudyType::FreqResponse) {
     if (capsStatus_ == 0)
@@ -355,7 +361,7 @@ SimRunUi SimManager::runUi() const {
     r.elapsed = elapsed;
     if (prepInFlight_) {
       const bool topoPrep = staticModalPrep_ && staticModalPrep_->type == StudyType::Topology;
-      r.stage = topoPrep ? "Preparing design domain" : "Preparing model";
+      r.stage = topoPrep ? "Preparing design domain" : kSimPreparingStage;
       r.cancellable = topoPrep;
       if (!topoPrep)
         r.cancelBlocker = "Model export and face resolution cannot be interrupted; Cancel "
@@ -363,7 +369,14 @@ SimRunUi SimManager::runUi() const {
       return r;
     }
     const bool jobRunning = sim && sim->job().running.load();
-    r.stage = !runStageText_.empty() ? runStageText_ : std::string("Solving");
+    // Before the first progress event, read the solver's current stage exactly as the status
+    // bar's job chip does, so the footer never says "Solving" while the chip says "Starting".
+    if (!runStageText_.empty())
+      r.stage = runStageText_;
+    else if (jobRunning)
+      r.stage = simStageLabel(sim->stage(), sim->recentLog());
+    else
+      r.stage = "Loading the result";
     if (runPct_ > 0)
       r.progress = std::min(1.0f, runPct_ / 100.0f);
     r.cancellable = jobRunning;
@@ -1361,6 +1374,9 @@ void SimManager::drainSimClientJob(AppState &st) {
       job.ownerDocId.empty()
           ? st.simManager == this
           : simOriginActive(st, this, job.ownerDocId);
+  // The solver job owns the phase now (job chip + footer); drop the prep notice.
+  if (uiActive && !prepInFlight_ && job.running.load() && st.status == kSimPreparingStatus)
+    st.status.clear();
 
   {
     std::vector<core::SimProgress> evs;
@@ -1820,7 +1836,8 @@ void SimManager::drainSimClientJob(AppState &st) {
           saeq = sm["theories"][kTheoryKeys[m]].value("sa_eq_mpa", 0.0);
         const double fos = (saeq > 1e-9) ? SeD / saeq : 15.0;
         const double life = sn_life(saeq, SeD, Sut);
-        s.summary = std::string(kTheoryNames[m]) + " \xc2\xb7 FoS " + kit::fmtValue(fos, 3) +
+        s.summary = std::string(kTheoryNames[m]) + " \xc2\xb7 FoS " +
+                    (fos >= 15.0 - 1e-6 ? std::string("15+") : kit::fmtValue(fos, 3)) +
                     " \xc2\xb7 " +
                     (life >= 1e6 ? std::string("infinite life (over 1,000,000 cycles)")
                                  : "life " + kit::fmtValue(life, 3) + " cycles");
@@ -1830,7 +1847,10 @@ void SimManager::drainSimClientJob(AppState &st) {
                     kit::fmtQuantity(sm.value("max_von_mises_mpa", 0.0), "MPa", 3) +
                     " \xc2\xb7 max displacement " +
                     kit::fmtQuantity(sm.value("max_disp_mm", 0.0), "mm", 3) +
-                    " \xc2\xb7 min FoS " + kit::fmtValue(sm.value("min_fos", 0.0), 3);
+                    " \xc2\xb7 min FoS " +
+                    (sm.value("min_fos", 0.0) >= 15.0 - 1e-6
+                         ? std::string("15+")
+                         : kit::fmtValue(sm.value("min_fos", 0.0), 3));
       }
       s.hasResult = true;
       st.addLog("[sim] FEA done: " + s.summary);

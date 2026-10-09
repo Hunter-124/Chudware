@@ -11,6 +11,9 @@
 #include "../chudcode_descriptors.h" // ui::parseChudcode* — Chudcode worker payload parsing
 #include "../provider_usage.h"     // shared subscription status cache and single-flight poller
 
+#include <filesystem>
+#include <fstream>
+
 namespace ui {
 
 namespace {
@@ -998,20 +1001,11 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     };
 
     auto drawGeneration = [&]() {
-    // Wide panels keep label and control on one row. A narrow Settings modal
-    // stacks them: 180dp label + 160dp field otherwise overruns the 390px
-    // viewport, and the inline wrapped "0 = automatic" hint consumes ~200px
-    // of invisible height when its available width becomes negative.
+    // kit fields own the label column, the stacked layout on narrow panes and the "Auto"
+    // placeholder: a raw InputInt read "0" for the automatic setting, which looked like a
+    // zero-token cap / zero-token window.
     {
-        const float labelW = 180.0f * S;
-        const float fieldW = 160.0f * S;
-        const bool compact = ImGui::GetContentRegionAvail().x < labelW + fieldW + 16.0f * S;
-        auto labeledField = [&](const char* label) {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted(label);
-            if (!compact) ImGui::SameLine(labelW);
-            ImGui::SetNextItemWidth(compact ? -1.0f : fieldW);
-        };
+        ui::kit::FieldGroup group("ai_generation", "Model context window");
 
         const char* effLabels[8] = {};
         const char* effValues[8] = {};
@@ -1026,76 +1020,57 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         }
         int nEff = ui::reasoningEffortOptions(s.provider, s.model, effLabels, effValues, 8, probeP);
         if (nEff > 0) {
-            labeledField("Reasoning effort");
             int effIdx = -1;
             for (int i = 0; i < nEff; ++i)
                 if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
-            const char* selected = effIdx < 0 ? "Default" : effLabels[effIdx];
-            if (ImGui::BeginCombo("##effort", selected)) {
-                for (int i = 0; i < nEff; ++i) {
-                    if (ImGui::Selectable(effLabels[i], effIdx == i)) {
-                        std::strncpy(s.reasoningEffort, effValues[i],
-                                     sizeof(s.reasoningEffort) - 1);
-                        changed = true;
-                    }
-                }
-                ImGui::EndCombo();
+            if (ui::kit::fieldEnum("effort", "Reasoning effort", &effIdx, effLabels, nEff,
+                    ui::kit::FieldOpts()
+                        .withEnumStyle(ui::kit::EnumStyle::Combo)
+                        .withHint("Default")
+                        .withTip("How much hidden reasoning the model spends before answering. "
+                                 "Higher = better planning on hard parts, slower and more "
+                                 "tokens.")) &&
+                effIdx >= 0 && effIdx < nEff) {
+                std::strncpy(s.reasoningEffort, effValues[effIdx], sizeof(s.reasoningEffort) - 1);
+                changed = true;
             }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("How much hidden reasoning the model spends before answering.\n"
-                                  "Higher = better planning on hard parts, slower + more tokens.");
-            ImGui::Dummy(ImVec2(0, 4 * S));
         } else {
             // Settings search has a "Reasoning effort" entry pointing here, and the chat toolbar
             // has the same dial: say why the control is absent instead of showing nothing and
             // letting the user conclude the search lied.
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Reasoning effort");
-            if (!compact) ImGui::SameLine(labelW);
-            ImGui::AlignTextToFramePadding();
-            dimText("not offered by this model");
-            ImGui::Dummy(ImVec2(0, 4 * S));
+            ui::kit::fieldReadout("effort_na", "Reasoning effort", "not offered by this model");
         }
 
-        // Max response tokens (0 = auto). The field stays alongside its caption
-        // on wide panes and immediately underneath it on narrow panes.
-        labeledField("Max response tokens");
-        int mt = s.maxTokens;  // 0 = auto
-        if (ImGui::InputInt("##maxtokens", &mt, 1024, 4096)) {
-            if (mt < 0) mt = 0;
-            if (mt > 0 && mt < 512) mt = 512;
-            if (mt > 200000) mt = 200000;
-            s.maxTokens = mt;
+        // 0 = automatic is stored as "absent": the field shows the "Auto" placeholder, clearing it
+        // stores 0 again, and a typed value keeps the old clamp range.
+        bool hasMt = s.maxTokens > 0;
+        int  mt    = hasMt ? s.maxTokens : 512;
+        if (ui::kit::fieldInt("maxtokens", "Max response tokens", &mt,
+                ui::kit::FieldOpts()
+                    .withPresent(&hasMt)
+                    .withHint("Auto")
+                    .withRange(512, 200000)
+                    .withTip("Output token cap per model call. Leave empty for automatic. Raise "
+                             "this if the agent reports \"budget exhausted\" or \"no JSON ops\" "
+                             "\xe2\x80\x94 a reasoning model spent its budget thinking before "
+                             "emitting the build."))) {
+            s.maxTokens = hasMt ? mt : 0;
             changed = true;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Output token cap per model call. 0 = automatic.\n"
-                              "Raise this if the agent reports \"budget exhausted\" or \"no JSON ops\"\n"
-                              "— a reasoning model spent its budget thinking before emitting the build.");
-        if (mt == 0) {
-            if (!compact) ImGui::SameLine(0.0f, 8.0f * S);
-            ImGui::AlignTextToFramePadding();
-            dimText("0 = automatic");
         }
 
-        ImGui::Dummy(ImVec2(0, 4 * S));
-        labeledField("Model context window");
-        int cw = s.contextWindow;  // 0 = auto
-        if (ImGui::InputInt("##ctxwindow", &cw, 1024, 8192)) {
-            if (cw < 0) cw = 0;
-            if (cw > 0 && cw < 2048) cw = 2048;
-            if (cw > 2000000) cw = 2000000;
-            s.contextWindow = cw;
+        bool hasCw = s.contextWindow > 0;
+        int  cw    = hasCw ? s.contextWindow : 2048;
+        if (ui::kit::fieldInt("ctxwindow", "Model context window", &cw,
+                ui::kit::FieldOpts()
+                    .withPresent(&hasCw)
+                    .withHint("Auto")
+                    .withRange(2048, 2000000)
+                    .withTip("The model's total token context window. Leave empty for automatic "
+                             "(from the model catalog). Set your LOCAL server's real window so "
+                             "the agent trims the prompt to fit instead of overrunning it and "
+                             "breaking the run."))) {
+            s.contextWindow = hasCw ? cw : 0;
             changed = true;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("The model's total token context window. 0 = automatic\n"
-                              "(cloud large; local 8192). Set your LOCAL server's real window so the\n"
-                              "agent trims the prompt to fit instead of overrunning it and breaking the run.");
-        if (cw == 0) {
-            if (!compact) ImGui::SameLine(0.0f, 8.0f * S);
-            ImGui::AlignTextToFramePadding();
-            dimText("0 = automatic");
         }
     }
 
@@ -1209,9 +1184,11 @@ void drawAISettingsBody(AppState& st, bool busy) {
     // Two-column rows: caption left in ONE shared column (sized from the widest caption, capped
     // so the control keeps most of the row), control right. Small enumerations are kit segmented
     // controls; when the remainder cannot hold every segment unelided the control drops under its
-    // caption at full width — decided per row from the measured need, so a narrow pane never
-    // shows a clipped "Enc...". No combo popups here at all: the old hand-sized combo rows were
-    // the source of the dropdown that grew wider than its frame and flipped left.
+    // caption at full width — decided per row from the measured need. Segments are equal width,
+    // so a narrow column can still be too small for {"Off","Option","Encourage","Require"} even at
+    // full width; then the row becomes a full-width combo under its caption (popup bounded by
+    // kit::constrainNextComboPopup, so it never grows past its frame or flips left). An option
+    // name is never elided.
     static const char* kRowLabels[] = {"Plan", "Task list", "Subagents", "Advisor",
                                        "Max nesting", "Project memory"};
     float labelCol = 0.0f;
@@ -1226,6 +1203,11 @@ void drawAISettingsBody(AppState& st, bool busy) {
         for (int i = 0; i < n; ++i) widest = std::max(widest, ImGui::CalcTextSize(items[i]).x);
         const float need = (widest + ui::kit::padX() * 2.0f) * (float)n;
         const bool  fits = avail - col - gap >= need;
+        // Full width only has to clear the segment's own inset on both sides (kit::segmented
+        // elides at segW - 2 * stroke(2)), plus a hairline of breathing room.
+        const float needFull =
+            (widest + ui::metrics::stroke(2.0f) * 2.0f + ui::metrics::px(4.0f)) * (float)n;
+        const bool  segOk = fits || avail >= needFull;
         ImGui::AlignTextToFramePadding();
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
         ImGui::TextUnformatted(label);
@@ -1237,7 +1219,21 @@ void drawAISettingsBody(AppState& st, bool busy) {
             ImGui::SetCursorScreenPos(ImVec2(x0 + col + gap, ImGui::GetCursorScreenPos().y));
             w = avail - col - gap;
         }
-        return ui::kit::segmented(id, items, n, sel, w);
+        if (segOk) return ui::kit::segmented(id, items, n, sel, w);
+        bool changed = false;
+        const int cur = (*sel >= 0 && *sel < n) ? *sel : 0;
+        ImGui::SetNextItemWidth(w);
+        ui::kit::constrainNextComboPopup(ImGui::GetCursorScreenPos().x, w, n);
+        if (ImGui::BeginCombo(id, items[cur])) {
+            for (int i = 0; i < n; ++i)
+                if (ImGui::Selectable(items[i], i == cur) && i != cur) {
+                    *sel = i;
+                    changed = true;
+                }
+            ImGui::EndCombo();
+        }
+        if (tip && ImGui::IsItemHovered()) ui::kit::tooltip(tip);
+        return changed;
     };
     // Checkboxes flow two-up when the card is wide enough and wrap otherwise, so three booleans
     // cost one or two lines instead of three.
@@ -1688,9 +1684,103 @@ bool isDeprecatedModelId(const std::string& id) {
     return false;
 }
 
+// One catalog payload (`chudcode_models_list` "models") -> sorted rows. Shared by the live fetch
+// and the on-disk copy below so both produce byte-identical metadata.
+std::vector<ui::BridgeModelMeta> parseBridgeCatalogRows(const nlohmann::json& models) {
+    std::vector<ui::BridgeModelMeta> rows;
+    if (!models.is_array()) return rows;
+    for (const auto& m : models) {
+        if (!m.is_object()) continue;
+        ui::BridgeModelMeta b;
+        b.id = m.value("id", std::string());
+        if (b.id.empty()) continue;
+        b.name = m.value("name", b.id);
+        b.provider = m.value("provider", std::string());
+        b.vision = m.value("vision", false);
+        b.tools = m.value("supportsTools", false);
+        b.reasoning = m.value("reasoning", false);
+        const auto ef = m.find("reasoningEfforts");
+        if (ef != m.end() && ef->is_array())
+            for (const auto& e : *ef)
+                if (e.is_string()) b.reasoningEfforts.push_back(e.get<std::string>());
+        if (m.contains("contextWindow") && m["contextWindow"].is_number())
+            b.contextWindow = m["contextWindow"].get<int>();
+        if (m.contains("maxTokens") && m["maxTokens"].is_number())
+            b.maxTokens = m["maxTokens"].get<int>();
+        const auto c = m.find("cost");
+        if (c != m.end() && c->is_object()) {
+            b.hasCost = true;
+            b.costIn = c->value("input", 0.0);
+            b.costOut = c->value("output", 0.0);
+            b.costCacheRead = c->value("cacheRead", 0.0);
+            b.costCacheWrite = c->value("cacheWrite", 0.0);
+        }
+        // Pricing provenance: the bridge marks a row `priced` only when the catalog carries
+        // a real non-zero price. `hasCost` cannot answer that — `cost` is an object even
+        // when every field is zero, which is why an unpriced model used to render as "free".
+        // A bridge predating the field gets the bridge's own rule applied locally instead of
+        // every model silently losing its price.
+        if (m.contains("priced") && m["priced"].is_boolean())
+            b.priced = m["priced"].get<bool>();
+        else
+            b.priced = b.costIn > 0.0 || b.costOut > 0.0 ||
+                       b.costCacheRead > 0.0 || b.costCacheWrite > 0.0;
+        inferReleaseDate(b.id, b.name, b.releaseDate, b.releaseSort);
+        b.deprecated = isDeprecatedModelId(b.id);
+        rows.push_back(std::move(b));
+    }
+    // Newest-first per provider: provider ASC, deprecated last, then newest release first,
+    // then name ASC as a stable tiebreak for same-day/unknown-date rows.
+    std::stable_sort(rows.begin(), rows.end(),
+                     [](const ui::BridgeModelMeta& a, const ui::BridgeModelMeta& b) {
+        if (a.provider != b.provider) return a.provider < b.provider;
+        if (a.deprecated != b.deprecated) return !a.deprecated;  // non-deprecated first
+        if (a.releaseSort != b.releaseSort) return a.releaseSort > b.releaseSort;
+        return a.name < b.name;
+    });
+    return rows;
+}
+
+// ---- persisted catalog --------------------------------------------------------------------
+// The live catalog only arrives after worker boot + startup phases, so a restart used to spend
+// its first seconds on raw model ids ("gpt-6.1-sol" flipping to "GPT-6.1-Sol") and an id-pattern
+// context window (128k flipping to 272k — red over-limit on a restored long session). The last
+// successful payload is kept beside config.json and seeded before the first lookup; the live
+// fetch replaces it wholesale exactly as before. A missing/corrupt file just means "cold".
+std::string bridgeCatalogCachePath() { return appdataAppDir() + "/model_catalog_cache.json"; }
+
+void saveBridgeCatalogCache(const nlohmann::json& models) {
+    if (!models.is_array() || models.empty()) return;
+    const std::string path = bridgeCatalogCachePath();
+    const std::string tmp  = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) return;
+        f << nlohmann::json{{"models", models}}.dump();
+        if (!f) return;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) std::filesystem::remove(tmp, ec);
+}
+
+void ensureBridgeCatalogSeeded() {
+    static bool s_seeded = false;
+    if (s_seeded) return;
+    s_seeded = true;
+    if (!s_bridgeModels.empty()) return;
+    std::ifstream f(bridgeCatalogCachePath(), std::ios::binary);
+    if (!f) return;
+    const nlohmann::json j = nlohmann::json::parse(f, nullptr, /*allow_exceptions=*/false);
+    if (!j.is_object()) return;
+    const auto it = j.find("models");
+    if (it != j.end()) s_bridgeModels = parseBridgeCatalogRows(*it);
+}
+
 }  // namespace
 
 void refreshBridgeModelCatalog(AppState& st, bool force) {
+    ensureBridgeCatalogSeeded();   // before any clear below, so a stale seed can never resurface
     if (!s_bridgeCatalogAvailable || s_bridgeCatalogInFlight) return;
     const double now = ImGui::GetTime();
     const bool followupReady = startupCatalogFollowupReady(st);
@@ -1718,64 +1808,19 @@ void refreshBridgeModelCatalog(AppState& st, bool force) {
         if (!r.ok || !r.result.is_object() || !r.result.value("ok", true)) return;  // soft fail
         const auto it = r.result.find("models");
         if (it == r.result.end() || !it->is_array()) return;
-        std::vector<ui::BridgeModelMeta> rows;
-        for (const auto& m : *it) {
-            if (!m.is_object()) continue;
-            ui::BridgeModelMeta b;
-            b.id = m.value("id", std::string());
-            if (b.id.empty()) continue;
-            b.name = m.value("name", b.id);
-            b.provider = m.value("provider", std::string());
-            b.vision = m.value("vision", false);
-            b.tools = m.value("supportsTools", false);
-            b.reasoning = m.value("reasoning", false);
-            const auto ef = m.find("reasoningEfforts");
-            if (ef != m.end() && ef->is_array())
-                for (const auto& e : *ef)
-                    if (e.is_string()) b.reasoningEfforts.push_back(e.get<std::string>());
-            if (m.contains("contextWindow") && m["contextWindow"].is_number())
-                b.contextWindow = m["contextWindow"].get<int>();
-            if (m.contains("maxTokens") && m["maxTokens"].is_number())
-                b.maxTokens = m["maxTokens"].get<int>();
-            const auto c = m.find("cost");
-            if (c != m.end() && c->is_object()) {
-                b.hasCost = true;
-                b.costIn = c->value("input", 0.0);
-                b.costOut = c->value("output", 0.0);
-                b.costCacheRead = c->value("cacheRead", 0.0);
-                b.costCacheWrite = c->value("cacheWrite", 0.0);
-            }
-            // Pricing provenance: the bridge marks a row `priced` only when the catalog carries
-            // a real non-zero price. `hasCost` cannot answer that — `cost` is an object even
-            // when every field is zero, which is why an unpriced model used to render as "free".
-            // A bridge predating the field gets the bridge's own rule applied locally instead of
-            // every model silently losing its price.
-            if (m.contains("priced") && m["priced"].is_boolean())
-                b.priced = m["priced"].get<bool>();
-            else
-                b.priced = b.costIn > 0.0 || b.costOut > 0.0 ||
-                           b.costCacheRead > 0.0 || b.costCacheWrite > 0.0;
-            inferReleaseDate(b.id, b.name, b.releaseDate, b.releaseSort);
-            b.deprecated = isDeprecatedModelId(b.id);
-            rows.push_back(std::move(b));
-        }
-        // Newest-first per provider: provider ASC, deprecated last, then newest release first,
-        // then name ASC as a stable tiebreak for same-day/unknown-date rows.
-        std::stable_sort(rows.begin(), rows.end(),
-                         [](const ui::BridgeModelMeta& a, const ui::BridgeModelMeta& b) {
-            if (a.provider != b.provider) return a.provider < b.provider;
-            if (a.deprecated != b.deprecated) return !a.deprecated;  // non-deprecated first
-            if (a.releaseSort != b.releaseSort) return a.releaseSort > b.releaseSort;
-            return a.name < b.name;
-        });
-        s_bridgeModels = std::move(rows);
+        s_bridgeModels = parseBridgeCatalogRows(*it);
+        if (!s_bridgeModels.empty()) saveBridgeCatalogCache(*it);
     }, 15000);
 }
 
-const std::vector<ui::BridgeModelMeta>& bridgeModelCatalog() { return s_bridgeModels; }
+const std::vector<ui::BridgeModelMeta>& bridgeModelCatalog() {
+    ensureBridgeCatalogSeeded();
+    return s_bridgeModels;
+}
 
 const ui::BridgeModelMeta* bridgeModelMeta(const std::string& providerId,
                                                const std::string& modelId) {
+    ensureBridgeCatalogSeeded();
     for (const auto& m : s_bridgeModels) {
         if (m.id != modelId) continue;
         if (providerId.empty() || m.provider == providerId) return &m;

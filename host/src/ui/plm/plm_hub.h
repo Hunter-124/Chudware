@@ -201,6 +201,7 @@ struct PlmHubState {
 
     // overview
     int         ovGen = -1; bool ovLoading = false; std::string ovErr;
+    std::string ovProject;               // project `overview` was answered for ("" = none yet)
     PlmOverview overview;
 
     // items (Files page)

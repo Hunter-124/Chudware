@@ -22,6 +22,7 @@
 #include "../ui_theme.h"
 #include "icons.h"              // drawIconGlass (per-tool cursor badge)
 #include "layout.h"             // ui::overlayColumnEdge (sketch overlay dodges the pinned columns)
+#include "viewport_panel.h"     // ui::viewportClearRect (overlay clip + HUD anchor)
 #include "ribbon_def.h"         // getRibbonCmds (armed-tool cmd id -> icon name)
 #include "property_manager.h"   // pmParseDim (Smart Dimension value parsing)
 #include "airfoil.h"            // NACA 4-/5-digit + .dat profile generator (SketchTool::Airfoil)
@@ -274,6 +275,31 @@ void glassHudBanner(ImDrawList* dl, const char* id, const ImVec2& imgMin, const 
                                imgMin.x + edgeMargin,
                                imgMax.x - edgeMargin - pillW);
     glassHudPill(dl, id, ImVec2(x, y), shown.c_str(), borderCol);
+}
+
+// Sketch HUD / overlay ownership rectangle: the viewport's CLEAR rect — between the pinned
+// FeatureManager / Copilot columns and below the floating doc-tab band (which the full-bleed 3D
+// image runs under). Before the viewport has published it, fall back to the per-frame column
+// edges and the tab-band bottom; a degenerate result falls back to the full image.
+void skOverlayRect(const ImVec2& imgMin, const ImVec2& imgMax, ImVec2& outMin, ImVec2& outMax) {
+    outMin = imgMin;
+    outMax = imgMax;
+    ImVec2 cMin, cMax;
+    if (ui::viewportClearRect(cMin, cMax)) {
+        outMin = ImVec2(std::max(cMin.x, imgMin.x), std::max(cMin.y, imgMin.y));
+        outMax = ImVec2(std::min(cMax.x, imgMax.x), std::min(cMax.y, imgMax.y));
+    } else {
+        const float fmEdge = ui::overlayColumnEdge(0);   // FeatureManager right edge
+        const float cpEdge = ui::overlayColumnEdge(1);   // Copilot left edge
+        const float tabBot = ui::docTabBandBottom();     // floating doc-tab strip bottom
+        if (fmEdge > imgMin.x) outMin.x = fmEdge;
+        if (cpEdge > 0.0f && cpEdge < imgMax.x) outMax.x = cpEdge;
+        if (tabBot > imgMin.y && tabBot < imgMax.y) outMin.y = tabBot;
+    }
+    if (outMax.x <= outMin.x || outMax.y <= outMin.y) {
+        outMin = imgMin;
+        outMax = imgMax;
+    }
 }
 
 // Circumcircle of three (u,v) points. Returns false when (near-)collinear.
@@ -5366,9 +5392,13 @@ bool SketchMode::drawPlanePicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin
     }
     // Compact hint pill (below the heads-up view toolbar, same slot as the new-sketch banner).
     // Only in well mode — plain select shouldn't nag a banner every time a plane is on screen.
-    if (wellMode)
-        glassHudBanner(wdl, "sk_pm_plane_banner", imgMin, imgMax, imgMin.y + 52.0f * ui::uiScale,
+    if (wellMode) {
+        ImVec2 hudMin, hudMax;
+        skOverlayRect(imgMin, imgMax, hudMin, hudMax);
+        glassHudBanner(wdl, "sk_pm_plane_banner", hudMin, hudMax,
+                       hudMin.y + ImGui::GetTextLineHeight() + 26.0f * ui::uiScale,
                        "Click a reference plane (incl. your datum planes) \xE2\x80\x94 or a planar face");
+    }
     wdl->PopClipRect();
 
     // Click a plane -> route its datum ref into the active well (a created datum plane routes its
@@ -5490,8 +5520,13 @@ bool SketchMode::drawAxisPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
     ImDrawList* wdl = ImGui::GetWindowDrawList();
     wdl->PushClipRect(imgMin, imgMax, true);
     wdl->AddLine(a, b, col(pal.accent, 0.95f), 4.0f * ui::uiScale);
-    glassHudBanner(wdl, "sk_pm_axis_banner", imgMin, imgMax, imgMin.y + 52.0f * ui::uiScale,
-                   "Click the reference axis");
+    {
+        ImVec2 hudMin, hudMax;
+        skOverlayRect(imgMin, imgMax, hudMin, hudMax);
+        glassHudBanner(wdl, "sk_pm_axis_banner", hudMin, hudMax,
+                       hudMin.y + ImGui::GetTextLineHeight() + 26.0f * ui::uiScale,
+                       "Click the reference axis");
+    }
     wdl->PopClipRect();
 
     st.requestCursor(ui::CursorKind::Hand);
@@ -5564,8 +5599,13 @@ bool SketchMode::drawPointPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin
     ImDrawList* wdl = ImGui::GetWindowDrawList();
     wdl->PushClipRect(imgMin, imgMax, true);
     wdl->AddCircle(bestScreen, grabRadius * 0.8f, col(pal.accent, 0.95f), 24, 2.0f * ui::uiScale);
-    glassHudBanner(wdl, "sk_pm_point_banner", imgMin, imgMax, imgMin.y + 52.0f * ui::uiScale,
-                   "Click the reference point");
+    {
+        ImVec2 hudMin, hudMax;
+        skOverlayRect(imgMin, imgMax, hudMin, hudMax);
+        glassHudBanner(wdl, "sk_pm_point_banner", hudMin, hudMax,
+                       hudMin.y + ImGui::GetTextLineHeight() + 26.0f * ui::uiScale,
+                       "Click the reference point");
+    }
     wdl->PopClipRect();
 
     st.requestCursor(ui::CursorKind::Hand);
@@ -5713,8 +5753,13 @@ bool SketchMode::drawCurvePathPicker(AppState& st, ImGuiIO& io, const ImVec2& im
     wdl->PushClipRect(imgMin, imgMax, true);
     for (const auto& s : bestSegs)
         wdl->AddLine(s.first, s.second, col(pal.accent, 0.95f), 4.0f * ui::uiScale);
-    glassHudBanner(wdl, "sk_pm_path_banner", imgMin, imgMax, imgMin.y + 52.0f * ui::uiScale,
-                   "Click to set this as the sweep path");
+    {
+        ImVec2 hudMin, hudMax;
+        skOverlayRect(imgMin, imgMax, hudMin, hudMax);
+        glassHudBanner(wdl, "sk_pm_path_banner", hudMin, hudMax,
+                       hudMin.y + ImGui::GetTextLineHeight() + 26.0f * ui::uiScale,
+                       "Click to set this as the sweep path");
+    }
     wdl->PopClipRect();
 
     st.requestCursor(ui::CursorKind::Hand);
@@ -5905,14 +5950,14 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     const auto& pal = ui::palette;
 
     // Sketch-overlay safe area: clip all on-canvas drawing (geometry, relations, dimensions, plane
-    // labels…) to the region BETWEEN the pinned FeatureManager / Copilot columns, so nothing draws
-    // under those columns and clashes with their text. imgMin/imgMax stay the TRUE image bounds for
-    // coordinate projection + hit-testing — only the DRAW clip is inset. Column edges are published
-    // per frame (overlayColumnEdge, valid even when collapsed to a pill); fall back to the image.
-    const float skFmEdge = ui::overlayColumnEdge(0);   // FeatureManager right edge
-    const float skCpEdge = ui::overlayColumnEdge(1);   // Copilot left edge
-    const ImVec2 skClipMin(skFmEdge > imgMin.x ? skFmEdge : imgMin.x, imgMin.y);
-    const ImVec2 skClipMax((skCpEdge > 0.0f && skCpEdge < imgMax.x) ? skCpEdge : imgMax.x, imgMax.y);
+    // labels…) and anchor the top-center HUD inside the viewport's clear rect (skOverlayRect), so
+    // nothing draws under the pinned panes and clashes with their text. imgMin/imgMax stay the TRUE
+    // image bounds for coordinate projection + hit-testing — only the DRAW clip is inset.
+    ImVec2 skClipMin, skClipMax;
+    skOverlayRect(imgMin, imgMax, skClipMin, skClipMax);
+    // Top-center HUD stack: status/DOF island first, banners/tool hints one row below it.
+    const float skHudTopY = skClipMin.y + 8.0f * ui::uiScale;
+    const float skHudRow2Y = skHudTopY + ImGui::GetTextLineHeight() + 18.0f * ui::uiScale;
 
     // ---- C37-D: SolidWorks plane-pick step (runs while !active_, before a sketch exists) ----
     // The viewport keeps calling drawOverlay (and force-shows the origin planes) while
@@ -6075,8 +6120,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         const char* banner = planeEditFid_.empty()
             ? "Select a plane or a planar face for the sketch \xE2\x80\x94 Esc to cancel"
             : "Select the new sketch plane or a planar face \xE2\x80\x94 Esc to cancel";
-        glassHudBanner(wdl, "sk_plane_pick_banner", skClipMin, skClipMax,
-                       imgMin.y + 52.0f * ui::uiScale, banner);
+        glassHudBanner(wdl, "sk_plane_pick_banner", skClipMin, skClipMax, skHudRow2Y, banner);
         wdl->PopClipRect();
         // Esc cancels the whole thing (new-sketch pick OR an Edit-Sketch-Plane reparent).
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
@@ -9413,7 +9457,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     if (pastePlacing_) {
         st.requestCursor(ui::CursorKind::Crosshair);
         drawPastePreview(st, dl, io.MousePos);
-        glassHudBanner(dl, "sk_paste_banner", imgMin, imgMax, imgMin.y + 52.0f * ui::uiScale,
+        glassHudBanner(dl, "sk_paste_banner", skClipMin, skClipMax, skHudRow2Y,
                        "Click to place \xE2\x80\x94 Esc to cancel");
         bool overCanvas = ImGui::IsMouseHoveringRect(imgMin, imgMax);
         // (The ✓/✗ confirmation corner moved to the Sketch-tab ribbon; no in-viewport carve-out.)
@@ -9629,10 +9673,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             hint += trimKeepConstruction_ ? "  [Keep as construction: ON \xC2\xB7 C toggles]"
                                           : "  [Keep as construction: off \xC2\xB7 C toggles]";
         hint += "  (ESC to end)";
-        // Stacks BELOW the top-center status/DOF island (y+52); centered on the inter-column safe
-        // area so it never slides under the pinned columns.
+        // Stacks one row BELOW the top-center status/DOF island; centered on the clear rect so it
+        // never slides under the pinned columns or the doc-tab strip.
         glassHudBanner(ImGui::GetWindowDrawList(), "sk_tool_hint", skClipMin, skClipMax,
-                       imgMin.y + 52.0f * ui::uiScale, hint.c_str());
+                       skHudRow2Y, hint.c_str());
     }
 
     // ---- status/DOF chip (top-CENTER "dynamic island") ----
@@ -9648,7 +9692,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                  : status_ == "over" ? col(pal.statusErr)
                  : status_ == "full" ? col(pal.statusOk) : col(pal.sketchUnder);
         ImDrawList* wdl = ImGui::GetWindowDrawList();
-        const float statusY = imgMin.y + 12.0f * s;
+        const float statusY = skHudTopY;   // first HUD row inside the clear rect (below the tabs)
         glassHudBanner(wdl, "sk_status_chip", skClipMin, skClipMax, statusY, sl.c_str(), sc);
         float pillBot = statusY + ImGui::CalcTextSize(sl.c_str()).y + 10.0f * s;
 

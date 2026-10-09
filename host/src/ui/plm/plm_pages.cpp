@@ -401,6 +401,9 @@ void plmDrawOverviewPage(AppState& st) {
     if (!H.ovErr.empty()) { plmError(H.ovErr); return; }
 
     const auto& ov = H.overview;
+    // `overview` may still hold nothing (first visit) or the previous project's answer;
+    // cards that read it show a spinner until this project's answer lands, never zeros.
+    const bool ovReady = H.ovProject == st.plmProjectPath();
     constexpr size_t kPreviewRows = 3;
 
     auto bodyCheckpoint = [&]() {
@@ -416,7 +419,7 @@ void plmDrawOverviewPage(AppState& st) {
         if (!H.actionOk.empty())
             ui::kit::inlineStatus(H.actionOk.c_str(), ui::kit::Tone::Ok);
 
-        if (ov.dirtyCount > 0) {
+        if (ovReady && ov.dirtyCount > 0) {
             ui::kit::gapSection();
             plmSectionHeader("Unrecorded changes", "warning_badge");
             char pending[96];
@@ -442,6 +445,10 @@ void plmDrawOverviewPage(AppState& st) {
     };
 
     auto bodyStats = [&]() {
+        if (!ovReady) {
+            plmSpinner("Loading project overview");
+            return;
+        }
         struct SC { const char* label; int n; const float* col; };
         const SC scs[] = {
             {"Files",      ov.itemsCount,     palette.accent},
@@ -466,7 +473,7 @@ void plmDrawOverviewPage(AppState& st) {
 
     auto bodyCheckpointActivity = [&]() {
         plmSectionHeader("Checkpoint activity", "history");
-        if (H.ovLoading && ov.recent.empty()) {
+        if (!ovReady) {
             plmSpinner("Loading checkpoints");
             return;
         }
@@ -541,7 +548,7 @@ void plmDrawOverviewPage(AppState& st) {
     };
 
     auto bodyTasks = [&]() {
-        if (H.ovLoading && ov.tasks.empty()) {
+        if (!ovReady) {
             plmSpinner("Loading tasks");
             return;
         }
@@ -579,7 +586,10 @@ void plmDrawOverviewPage(AppState& st) {
             plmSpinner("Loading issues");
             return;
         }
-        if (openCount == 0 && ov.openIssues > 0) {
+        // Counts and the issue list are separate answers; spin only while the list can
+        // still change, never forever on a count the finished list disagrees with.
+        if (openCount == 0 && ovReady && ov.openIssues > 0 &&
+            (H.planLoading || H.planGen != H.generation)) {
             plmSpinner("Loading issue details");
             return;
         }
@@ -972,17 +982,29 @@ void drawFilesTab(AppState& st) {
         plmCardBegin("##fitem", sel, 8.0f, 4.0f, ftint, 0.13f);
 
         // one padded row: [TAG] path .......... rev · lifecycle  ●
+        // The badge is measured (same text plmLifecycleBadge prints) and pinned right; the
+        // path is elided to the space left of it so a long path never runs under the badge.
+        const std::string& badgeRev = !it.rev.empty() ? it.rev : it.workingRev;
+        const std::string badgeText =
+            badgeRev.empty() ? it.lifecycle : badgeRev + " \xc2\xb7 " + it.lifecycle;
+        const float dotW = it.dirty ? ImGui::GetStyle().ItemSpacing.x + 8.0f * S : 0.0f;
+        const float badgeW = ImGui::CalcTextSize(badgeText.c_str()).x + dotW;
+        const float badgeGap = 12.0f * S;
         plmDocTypeTag(it.docType, it.kind);
         ImGui::SameLine();
         ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(it.path.c_str());
+        const float pathX = ImGui::GetCursorPosX();
+        const float rightX = ImGui::GetContentRegionMax().x;
+        const float pinX = rightX - badgeW;
+        // Below a readable path width the badge drops to its own line instead.
+        const bool badgeInline = pinX - badgeGap - pathX >= 96.0f * S;
+        const float pathMaxW = badgeInline ? pinX - badgeGap - pathX : rightX - pathX;
+        const std::string pathShown = ui::kit::elide(it.path.c_str(), pathMaxW);
+        ImGui::TextUnformatted(pathShown.c_str());
+        if (pathShown != it.path) ui::kit::itemTooltip(it.path.c_str());
 
-        // right-pinned badge, clamped so it never crosses the text on narrow cards
-        float badgeW = 130 * S + (it.dirty ? 16 * S : 0);
-        float pinX = ImGui::GetContentRegionMax().x - badgeW;
-        if (pinX > ImGui::GetCursorPosX() + 8 * S) ImGui::SameLine(pinX);
-        else ImGui::SameLine(0, 12 * S);
-        plmLifecycleBadge(it.lifecycle, !it.rev.empty() ? it.rev : it.workingRev);
+        if (badgeInline) ImGui::SameLine(pinX);
+        plmLifecycleBadge(it.lifecycle, badgeRev);
         if (it.dirty) {
             // filled dot via the draw-list — the ● glyph isn't in the font atlas.
             ImGui::SameLine();

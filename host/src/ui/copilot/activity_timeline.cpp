@@ -94,7 +94,10 @@ static void sanitizeActivityItem(AppState& st, ActivityItem& a) {
             if (!s->empty() && ui::agentTextMayChange(*s)) *s = ui::foldToAtlasGlyphs(*s);
         return;
     }
-    sanitizeAgentTextInPlace(st, a.reason);
+    // A tool row's reason is its TARGET ("AI: surface"), a compact label on the row's title
+    // line: the "(doc-cpp00000002)" parenthetical is engine noise there, exactly as in the args
+    // JSON. Prose rows keep it (it reads well inside a sentence).
+    sanitizeAgentTextInPlace(st, a.reason, /*jsonBody=*/a.rowKind == 3);
     sanitizeAgentTextInPlace(st, a.detail, /*jsonBody=*/a.rowKind == 3);
     sanitizeAgentTextInPlace(st, a.title);
 }
@@ -1853,14 +1856,17 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     }
 
     // ---- the target — "what it acts on" — on the SAME line, dim, elided with the full text on
-    // hover. A fold's members' targets are joined here too: one line, not one line per member.
+    // hover. A fold's members' targets are joined here too: one line, not one line per member,
+    // and each distinct target once — two reads of the same place used to print "docs, docs".
     std::string tgt, tgtTip;
     if (groupN == 1) {
         tgt = tgtTip = ui::humanTarget(a.reason);
     } else {
+        std::vector<std::string> seen;
         for (const ActivityItem* mi : *group) {
             const std::string t = ui::humanTarget(mi->reason);
-            if (t.empty()) continue;
+            if (t.empty() || std::find(seen.begin(), seen.end(), t) != seen.end()) continue;
+            seen.push_back(t);
             if (!tgt.empty()) { tgt += ", "; tgtTip += "\n"; }
             tgt += t;
             tgtTip += t;

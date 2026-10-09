@@ -599,6 +599,10 @@ void drawPlmWorkspace(AppState& st) {
         case PlmPage::Graph:    plmDrawGraphPage(st);    break;
         case PlmPage::Settings: plmDrawSettingsPage(st); break;
     }
+    // Once the visible page's own fetches have landed, warm the Graph page in
+    // the background so switching to it shows the graph instead of a spinner.
+    if (g_plmHub.page != PlmPage::Graph && plmGraphAvailable() && !plmBusy())
+        plmGraphPrefetch(st);
     ImGui::PopStyleVar();  // ItemSpacing
     ImGui::EndChild();
     ImGui::Unindent(M);

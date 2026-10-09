@@ -268,9 +268,18 @@ void drawVendorStrip(AppState& st, float paneW) {
         char countNum[32];
         std::snprintf(countNum, sizeof(countNum), "%d/%d", signedIn, total);
         const char* const countTail = " signed in";
+        // An empty vendor list has three distinct meanings; "no vendors" conflated them. The
+        // status call may still be in flight, it may have failed, or this build may ship no
+        // signed-in vendor sources at all (browser vendors need the in-app browser) — in which
+        // case the library still searches local standards and public CAD, as the search
+        // notice says for the same condition.
+        const bool vendorsPending = !S().vendorsLoaded || S().vendorsLoading;
+        const char* emptyText = vendorsPending              ? "checking vendors\xe2\x80\xa6"
+                              : !S().vendorsError.empty()   ? "vendors offline"
+                                                            : "local standards only";
         const float countW = total > 0
             ? ImGui::CalcTextSize(countNum).x + ImGui::CalcTextSize(countTail).x
-            : ImGui::CalcTextSize("no vendors").x;
+            : ImGui::CalcTextSize(emptyText).x;
         // kCtrlInset is reserved on the right so the count text stops short of the band's
         // inset edge instead of running onto (or past) it.
         const float budget =
@@ -347,7 +356,12 @@ void drawVendorStrip(AppState& st, float paneW) {
             ImGui::SameLine(0.0f, 0.0f);
             textRole(palette.textDim, countTail);
         } else {
-            ImGui::TextDisabled("no vendors");
+            ImGui::TextDisabled("%s", emptyText);
+            if (!vendorsPending && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", !S().vendorsError.empty()
+                    ? S().vendorsError.c_str()
+                    : "No vendor sources are available in this build. Local standard parts "
+                      "and public CAD search still work.");
         }
 
         // Every status line fits the band (kCtrlInset short of its right edge): a narrow

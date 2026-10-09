@@ -506,8 +506,20 @@ void SimManager::drawResultControls(AppState &st, Study &s) {
   const bool adaptShort =
       isStatic && !s.adaptPasses.empty() && !s.adaptEtaTargetMet;
   const double vmMpa = isStatic ? num("max_von_mises_mpa", 0.0) : 0.0;
+  // The solver caps every factor of safety at 15 (fea_run clamp_fos); a value
+  // at the cap means "15 or more", never a computed 15.
+  constexpr double kFosCap = 15.0;
+  const bool fosAtCap = fos >= kFosCap - 1e-6;
   const std::string fosTip =
-      std::string("Minimum factor of safety (") + critName + " criterion).";
+      std::string("Minimum factor of safety (") + critName + " criterion)." +
+      (fosAtCap ? " The solver reports factors of safety up to 15; this part "
+                  "is at least that safe everywhere."
+                : "");
+  // Same masking as the peak chip: the ring of elements around ideal fixtures
+  // is left out of the headline numbers (clamp singularity). When the full
+  // nodal peak there is clearly higher, the chip says so in its label.
+  const double vmRawMpa = isStatic ? num("max_von_mises_raw_mpa", 0.0) : 0.0;
+  const bool peakMasked = vmRawMpa > vmMpa * 1.05;
   // Flow context for the verdict line: the inputs that frame the numbers
   // (speed, Reynolds), which the chips and the metric card do not repeat.
   std::string flowContext;
@@ -532,17 +544,24 @@ void SimManager::drawResultControls(AppState &st, Study &s) {
                : adaptShort ? kit::Status::Retry
                             : kit::Status::Done;
       if (fos > 0.0) {
-        chips.push_back({"Min FoS", kit::fmtValue(fos, 3),
+        chips.push_back({"Min FoS",
+                         fosAtCap ? std::string("15+") : kit::fmtValue(fos, 3),
                          fosFail ? kit::Tone::Err : kit::Tone::Ok, fosTip.c_str()});
         verdict = std::string(fosFail ? "Yields under this load ("
                                       : "Holds under this load (") +
                   critName + " criterion).";
       }
-      chips.push_back({"Peak stress",
+      chips.push_back({peakMasked ? "Peak stress (away from fixtures)"
+                                  : "Peak stress",
                        kit::fmtQuantity(vmMpa * u.stressFromMpa, stressU),
                        vmExceeds ? kit::Tone::Warn : kit::Tone::Neutral,
-                       "Maximum von Mises stress, excluding two element rings "
-                       "around fixed faces."});
+                       peakMasked
+                           ? "Highest von Mises stress, leaving out the two "
+                             "element rings around fixed faces: an ideal clamp "
+                             "makes the stress there depend on the mesh. The "
+                             "color legend and 'Peak at fixtures' include those "
+                             "nodes, so they read higher."
+                           : "Highest von Mises stress in the part."});
       if (!s.adaptPasses.empty())
         chips.push_back({adaptShort ? "Under-resolved" : "Converged", "",
                          adaptShort ? kit::Tone::Warn : kit::Tone::Ok,
@@ -637,29 +656,40 @@ void SimManager::drawResultControls(AppState &st, Study &s) {
     auto stress = [&](const char *key) {
       return kit::fmtQuantity(num(key, 0.0) * u.stressFromMpa, stressU);
     };
+    // A key/value row with a hover explanation (keyValueRowId has no tip).
+    auto rowWithTip = [](const char *id, const char *label,
+                         const std::string &value, const char *tip) {
+      const ImVec2 rowMin = ImGui::GetCursorScreenPos();
+      const float rowW = ImGui::GetContentRegionAvail().x;
+      kit::keyValueRowId(id, label, value.c_str());
+      const ImVec2 rowMax(rowMin.x + rowW, ImGui::GetCursorScreenPos().y);
+      if (ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(rowMin, rowMax))
+        kit::tooltip(tip);
+    };
     // The headline peak leaves out two element rings around ideal fixtures (a
     // clamp singularity); the nodal colormap does not. Show the nodal peak too
     // so the legend maximum never silently contradicts the headline.
-    const double vmRaw = num("max_von_mises_raw_mpa", 0.0);
-    const bool rawHigher = vmRaw > num("max_von_mises_mpa", 0.0) * 1.05;
     if (kit::cardBegin("metrics", "Key results", "results")) {
-      if (rawHigher) {
-        const ImVec2 rowMin = ImGui::GetCursorScreenPos();
-        const float rowW = ImGui::GetContentRegionAvail().x;
-        kit::keyValueRowId("fixtures", "Peak at fixtures",
-                           stress("max_von_mises_raw_mpa").c_str());
-        const ImVec2 rowMax(rowMin.x + rowW, ImGui::GetCursorScreenPos().y);
-        if (ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(rowMin, rowMax))
-          kit::tooltip("Highest nodal von Mises stress, including the nodes "
-                       "beside fixed faces; the colormap shows it. Peak stress "
-                       "excludes two element rings there, where an ideal clamp "
-                       "makes stress depend on the mesh.");
-      }
+      if (peakMasked)
+        rowWithTip("fixtures", "Peak at fixtures",
+                   stress("max_von_mises_raw_mpa"),
+                   "Highest nodal von Mises stress, including the nodes beside "
+                   "fixed faces; the color legend shows it. The peak stress "
+                   "chip leaves out two element rings there, where an ideal "
+                   "clamp makes the stress depend on the mesh.");
+      // Shear: tau_max = (P1 - P3) / 2. The solver's max_tresca_mpa is the
+      // Tresca stress INTENSITY P1 - P3 (2 x tau_max, always >= von Mises), so
+      // it is shown under that name and never passed off as a shear stress.
+      if (sm.contains("max_shear_mpa"))
+        rowWithTip("shear", "Max shear stress", stress("max_shear_mpa"),
+                   "Largest (P1 - P3) / 2, away from fixed faces like the "
+                   "peak stress chip.");
       if (sm.contains("max_tresca_mpa"))
-        kit::keyValueRowId("tresca", "Max shear (Tresca)",
-                           stress("max_tresca_mpa").c_str());
-      else if (sm.contains("max_shear_mpa"))
-        kit::keyValueRowId("shear", "Max shear", stress("max_shear_mpa").c_str());
+        rowWithTip("tresca", "Tresca stress intensity", stress("max_tresca_mpa"),
+                   "Largest P1 - P3 (twice the max shear stress), including "
+                   "the nodes beside fixed faces. The Tresca criterion compares "
+                   "it with yield strength; it is always at least the von Mises "
+                   "stress at the same point.");
       if (sm.contains("max_principal_mpa"))
         kit::keyValueRowId("p1", "Max principal (P1)",
                            stress("max_principal_mpa").c_str());

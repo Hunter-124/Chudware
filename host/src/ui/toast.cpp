@@ -135,20 +135,39 @@ void drawToasts(AppState& st) {
     const float scale = ui::uiScale;
     const auto& pal = ui::palette;
 
-    // Anchor top-LEFT of the main viewport (toasts float over everything, SolidWorks-style).
-    // A modest inset from the left edge, below the REAL ribbon bottom (T-BL31 NEW-3: a fixed
-    // 64dp guess undershot the ribbon's actual height and pinned the card over its leftmost
-    // groups). overlayBand().minY is the same ribbon-bottom Y the FeatureManager/Copilot columns
-    // already anchor to; fall back to a modest fixed inset for the pre-publish first frame.
+    // Anchor top-RIGHT of the viewport span the pinned columns leave clear, below the REAL ribbon
+    // bottom (T-BL31 NEW-3: a fixed 64dp guess undershot the ribbon's actual height and pinned the
+    // card over its leftmost groups). overlayBand().minY is the same ribbon-bottom Y the
+    // FeatureManager/Copilot columns already anchor to; fall back to a modest fixed inset for the
+    // pre-publish first frame.
     ImGuiViewport* vp = ImGui::GetMainViewport();
     const float pad     = 12.0f * scale;
     float toastW        = 320.0f * scale;
     const float rowGap  = 8.0f * scale;
     const float rounding = 6.0f * scale;
     const ui::OverlayBand& band = ui::overlayBand();
-    const float topInset = band.valid ? (band.minY - vp->Pos.y) + 8.0f * scale : 64.0f * scale;
-    // Default remains the fixed-width top-right stack.
-    float x = vp->Pos.x + vp->Size.x - toastW - pad;
+    // Start below the doc-tab band when it drew (the pinned columns anchor there too), so a toast
+    // never covers the open-document tabs.
+    float topY = band.valid ? band.minY : vp->Pos.y + 56.0f * scale;
+    if (const float tabsBottom = ui::docTabBandBottom(); tabsBottom > topY) topY = tabsBottom;
+    const float topInset = (topY - vp->Pos.y) + 8.0f * scale;
+    // The stack's right edge is the Copilot column's published LEFT edge (layout.h slot 1) when
+    // that column is pinned, never the window edge: anchoring to the window edge put every toast
+    // over the Copilot header (a recurring regression). The column publishes its edge even while
+    // rolled up to its header row, which still owns the top-right corner. The left bound is the
+    // FeatureManager column's right edge, so a narrow window shrinks the card between the two
+    // columns instead of sliding it under either.
+    float rightX = vp->Pos.x + vp->Size.x;
+    if (band.valid) rightX = band.maxX;
+    if (const float cpEdge = ui::overlayColumnEdge(1); cpEdge > 0.0f && cpEdge < rightX)
+        rightX = cpEdge;
+    float leftX = vp->Pos.x;
+    if (const float fmEdge = ui::overlayColumnEdge(0); fmEdge > leftX && fmEdge < rightX)
+        leftX = fmEdge;
+    const float spanW = rightX - leftX - 2.0f * pad;
+    const float minToastW = 180.0f * scale;
+    if (spanW < toastW) toastW = spanW > minToastW ? spanW : minToastW;
+    float x = rightX - toastW - pad;
 #if defined(__EMSCRIPTEN__)
     // The short mobile web layout paints a horizontal DOM HUD across the rightmost ~360 ImGui
     // pixels. Keep toasts in the left span instead; the HUD lane is already expressed in viewport

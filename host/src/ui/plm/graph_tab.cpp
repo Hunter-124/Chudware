@@ -167,6 +167,9 @@ struct GraphTabState {
   float panX = 0.0f, panY = 0.0f, zoom = 1.0f;
   bool wasAppFocusLost = false;
   double lastFetch = -1e9;
+  // When the current blocking (non-silent) load was issued — drives the
+  // elapsed-time line of the loading overlay.
+  double loadStartedAt = 0.0;
   // One-shot fit request — set ONLY by the explicit Fit button. Nothing
   // else may touch the user's view (data polls/relayouts never refit).
   bool fitRequested = false;
@@ -2397,6 +2400,27 @@ void maybeSaveLayout(GraphTabState &G, bool force = false) {
 // ---- fetch
 // -------------------------------------------------------------------
 
+// Second line of the first-load indicator: what is being mapped (the hub's
+// tracked-file count once Files/Explorer has it) and, after a couple of
+// seconds, how long it has been running — so a slow scan reads as progress,
+// not a hang.
+std::string graphLoadingDetail(const GraphTabState &G) {
+  const auto &H = g_plmHub;
+  std::string s;
+  if (H.itemsProjectDir == G.projectDir && !H.items.empty())
+    s = "Linking " + std::to_string(H.items.size()) +
+        (H.items.size() == 1 ? " tracked file" : " tracked files");
+  else
+    s = "Reading project files";
+  const double elapsed = ImGui::GetTime() - G.loadStartedAt;
+  if (elapsed >= 2.0) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), " \xc2\xb7 %d s", (int)elapsed);
+    s += buf;
+  }
+  return s;
+}
+
 void requestGraph(AppState &st, bool force) {
   auto &G = S();
   if (!G.available)
@@ -2407,8 +2431,12 @@ void requestGraph(AppState &st, bool force) {
   if (proj.empty())
     return;
   const double now = ImGui::GetTime();
-  if (!force && (now - G.lastFetch) < 2.0 && proj == G.projectDir &&
-      !G.nodes.empty())
+  // Background poll cadence. Every request — including an empty graph or a
+  // failed one — waits this long before the next automatic attempt: the
+  // worker answers RPCs one at a time, so an unthrottled retry loop starves
+  // every other panel's requests behind it.
+  constexpr double kGraphPollSeconds = 10.0;
+  if (!force && proj == G.projectDir && (now - G.lastFetch) < kGraphPollSeconds)
     return;
 
   G.err.clear();
@@ -2417,6 +2445,8 @@ void requestGraph(AppState &st, bool force) {
   // Background change-probes stay invisible: no spinner, no button flicker.
   const bool silent = !force && G.mtimesMax > 0.0 && !G.nodes.empty();
   G.loading = !silent;
+  if (G.loading)
+    G.loadStartedAt = now;
 
   nlohmann::json p;
   p["project_dir"] = proj;
@@ -2439,6 +2469,9 @@ void requestGraph(AppState &st, bool force) {
 
   st.rpc.call("cad_graph_get", p, [](const core::RpcResult &r) {
     auto &G = S();
+    // The poll interval runs from when the answer landed, not from when it
+    // was queued, so a slow response is never immediately re-requested.
+    G.lastFetch = ImGui::GetTime();
     G.loading = false;
     if (isAbsent(r)) {
       G.available = false;
@@ -5448,11 +5481,13 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
     }
   }
   if (G.loading && G.nodes.empty()) {
-    const char *msg = "Loading graph…";
+    const char *msg = "Mapping project graph\xe2\x80\xa6";
+    const std::string detail = graphLoadingDetail(G);
     ImVec2 ts = ImGui::CalcTextSize(msg);
-    const float r = 12.0f * S;
-    const float gap = 10.0f * S;
-    const float blockH = r * 2.0f + gap + ts.y;
+    ImVec2 ds = ImGui::CalcTextSize(detail.c_str());
+    const float r = 9.0f * S;
+    const float gap = 8.0f * S;
+    const float blockH = r * 2.0f + gap + ts.y + gap * 0.5f + ds.y;
     const ImVec2 spinC(origin.x + canvasSz.x * 0.5f,
                        origin.y + (canvasSz.y - blockH) * 0.5f + r);
     // The brand mark, not a bespoke arc: this file used to carry its own drawArcSpinner, one of
@@ -5462,9 +5497,12 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
     ui::anim::requestFrames();
     ui::drawTesseractSpinner(dl, spinC, r * 2.0f, ImGui::GetTime(),
                              Palette::toU32(palette.accent));
-    dl->AddText(
-        ImVec2(origin.x + (canvasSz.x - ts.x) * 0.5f, spinC.y + r + gap),
-        Palette::toU32(palette.accent), msg);
+    const float textY = spinC.y + r + gap;
+    dl->AddText(ImVec2(origin.x + (canvasSz.x - ts.x) * 0.5f, textY),
+                Palette::toU32(palette.accent), msg);
+    dl->AddText(ImVec2(origin.x + (canvasSz.x - ds.x) * 0.5f,
+                       textY + ts.y + gap * 0.5f),
+                Palette::toU32(palette.textDim), detail.c_str());
   }
 
   dl->PopClipRect();
@@ -5506,7 +5544,8 @@ void drawListView(AppState &st, ImVec2 canvasSz) {
     // Widget spinner (plmSpinner) — same brand mark as the rest of PLM.
     // Continuous redraw while loading is covered by st.rpc.busy() in the
     // frame loop.
-    plmSpinner("Loading graph");
+    plmSpinner("Mapping project graph");
+    ui::kit::dimText(graphLoadingDetail(G).c_str());
     ImGui::EndChild();
     return;
   }
@@ -5685,7 +5724,8 @@ void drawGridView(AppState &st, ImVec2 canvasSz) {
   }
   if (G.loading && G.nodes.empty()) {
     ImGui::Dummy(ImVec2(0, 24 * Sc));
-    plmSpinner("Loading graph");
+    plmSpinner("Mapping project graph");
+    ui::kit::dimText(graphLoadingDetail(G).c_str());
     ImGui::EndChild();
     return;
   }
@@ -6146,6 +6186,15 @@ bool plmGraphAvailable() { return S().available; }
 // True once a cad_graph_get response has landed (headless shot sync).
 bool plmGraphLoaded() { return !S().loading && !S().nodes.empty(); }
 
+void plmGraphPrefetch(AppState &st) {
+  auto &G = S();
+  // lastFetch is -1e9 only until the first request for this project (project
+  // changes reset it), so this issues at most one background load per project.
+  if (!G.available || G.loading || !G.nodes.empty() || G.lastFetch > -1e8)
+    return;
+  requestGraph(st, /*force=*/false);
+}
+
 void plmGraphOnProjectChanged() {
   auto &G = S();
   maybeSaveLayout(G, /*force=*/true); // final solve-state save for old project
@@ -6269,11 +6318,12 @@ void plmDrawGraphPage(AppState &st) {
     G.projectDir = proj;
   }
 
-  // Auto-refresh when the OS app regains focus. Use force=false so a warm
-  // ME489-scale cache can serve without a full rebuild (mtime fast-path).
+  // Auto-refresh when the OS app regains focus (bypasses the poll interval).
+  // Use force=false so a warm ME489-scale cache can serve without a full
+  // rebuild (mtime fast-path).
   const bool lost = ImGui::GetIO().AppFocusLost;
   if (G.wasAppFocusLost && !lost)
-    requestGraph(st, /*force=*/false);
+    G.lastFetch = -1e9;
   G.wasAppFocusLost = lost;
 
   requestGraph(st, /*force=*/false);

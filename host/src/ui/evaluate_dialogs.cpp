@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
+#include <string>
 #include <unordered_map>
 
 #include "imgui.h"
@@ -31,11 +33,11 @@ static const auto& kEvalPalette = ui::evalEmphasisPalette;
 // Display-only readouts. The property-manager formatters ("%.4g" glued to the unit) double as
 // edit-buffer text, so the dialogs format through kit::fmtQuantity instead: significant digits,
 // thousands separators, a space before the unit, no e-notation noise. Values arrive canonical
-// (mm, mm², mm³, mm⁴, g, g·mm²) and read in the document's unit system. Anything below 1e-9 of
+// (mm, mm², mm³, mm⁴, g, g·mm², N) and read in the document's unit system. Anything below 1e-9 of
 // `ref` (the magnitude the value is read against: part size, the larger moment), and anything
 // below 1e-9 canonical units, is floating-point residue from a symmetric part ("-1.049e-17in")
 // and reads as 0.
-enum class EvalQty { Length, Area, Volume, Mass, AreaMoment, MassMoment };
+enum class EvalQty { Length, Area, Volume, Mass, AreaMoment, MassMoment, Force };
 static std::string evalQty(bool ips, EvalQty q, double canonical, double ref = 0.0) {
     struct Sys {
         double      perUnit;   // canonical units per displayed unit
@@ -45,11 +47,13 @@ static std::string evalQty(bool ips, EvalQty q, double canonical, double ref = 0
         {1.0, kit::unitText(kit::Unit::mm)},  {1.0, kit::unitText(kit::Unit::mm2)},
         {1.0, kit::unitText(kit::Unit::mm3)}, {1.0, kit::unitText(kit::Unit::g)},
         {1.0, "mm\xE2\x81\xB4"},              {1.0, "g\xC2\xB7mm\xC2\xB2"},
+        {1.0, kit::unitText(kit::Unit::N)},
     };
     static const Sys kIps[] = {
         {25.4, kit::unitText(kit::Unit::in)}, {645.16, kit::unitText(kit::Unit::in2)},
         {16387.064, "in\xC2\xB3"},            {453.59237, kit::unitText(kit::Unit::lb)},
         {416231.4256, "in\xE2\x81\xB4"},      {292639.66, "lb\xC2\xB7in\xC2\xB2"},
+        {4.4482216152605, kit::unitText(kit::Unit::lbf)},
     };
     const Sys& s = (ips ? kIps : kMetric)[(int)q];
     const double noise = std::max(1e-9, std::fabs(ref) * 1e-9);
@@ -73,6 +77,77 @@ static void evalSwatch(const float rgba[4], const char* tip = nullptr) {
     ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(p.x + h * 0.5f, p.y + h * 0.5f),
                                                 ui::metrics::U(1.25f),
                                                 ImGui::GetColorU32(ImVec4(rgba[0], rgba[1], rgba[2], 1.0f)));
+}
+
+// Window name of the exclusive Evaluate tool window ("Measure###eval_measure"). One definition so
+// the cascade below can find it from the other dialogs.
+static std::string evalExclusiveWindowName(const std::string& title, const std::string& kind) {
+    return (title.empty() ? std::string("Evaluate") : title) + "###eval_" + kind;
+}
+
+// Every Evaluate dialog asks setNextCommandDialogPlacement for the same anchor (right of the
+// viewport, top of the overlay band), so two tools opened together landed exactly on top of each
+// other — and over the floating doc-tab strip. On the frame a dialog APPEARS, keep it below the
+// doc-tab band and cascade it down-left past any other Evaluate dialog already on screen at the
+// same spot. Only the appearing frame is touched: drags/resizes stick for the rest of the session.
+// Call right after setNextCommandDialogPlacement (this SetNextWindowPos takes precedence).
+static void evalPlaceAppearing(const char* windowName, ImVec2 preferredSizePx,
+                               std::initializer_list<const char*> others) {
+    ImGuiWindow* self = ImGui::FindWindowByName(windowName);
+    if (self && self->WasActive) return;   // already on screen: never move it
+
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    float loX = vp->WorkPos.x, loY = vp->WorkPos.y;
+    float hiX = loX + vp->WorkSize.x, hiY = loY + vp->WorkSize.y;
+    const OverlayBand& band = overlayBand();
+    if (band.valid) {
+        loX = std::max(loX, band.minX); loY = std::max(loY, band.minY);
+        hiX = std::min(hiX, band.maxX); hiY = std::min(hiY, band.maxY);
+    }
+    if (hiX <= loX || hiY <= loY) return;
+    const float margin = metrics::px(12);
+
+    // Where it would open: the live/remembered rect, else the shared command-dialog anchor.
+    ImVec2 size = preferredSizePx, pos;
+    if (self) {
+        pos = self->Pos; size = self->SizeFull;
+    } else if (const ImGuiWindowSettings* s = ImGui::FindWindowSettingsByID(ImHashStr(windowName))) {
+        const ImVec2 vpPos = s->ViewportId ? ImVec2((float)s->ViewportPos.x, (float)s->ViewportPos.y)
+                                           : vp->Pos;
+        pos  = ImVec2(s->Pos.x + vpPos.x, s->Pos.y + vpPos.y);
+        size = ImVec2((float)s->Size.x, (float)s->Size.y);
+    } else {
+        const float cpEdge = overlayColumnEdge(1);
+        const float right  = cpEdge >= loX ? std::min(hiX, cpEdge) : hiX;
+        pos = ImVec2(right - margin - size.x, loY + margin);
+    }
+
+    // Never open under the floating doc-tab strip.
+    float topY = loY + margin;
+    const float tabBottom = docTabBandBottom();
+    if (tabBottom > 0.0f) topY = std::max(topY, tabBottom + margin);
+    pos.y = std::max(pos.y, topY);
+
+    // Cascade down-left while another visible Evaluate dialog sits at (nearly) the same spot.
+    const float step = metrics::px(32);
+    for (int k = 0; k < 8; ++k) {
+        bool clash = false;
+        for (const char* name : others) {
+            const ImGuiWindow* w = name ? ImGui::FindWindowByName(name) : nullptr;
+            if (!w || w == self || !w->WasActive) continue;
+            if (std::fabs(w->Pos.x - pos.x) < step * 0.75f &&
+                std::fabs(w->Pos.y - pos.y) < step * 0.75f) { clash = true; break; }
+        }
+        if (!clash) break;
+        pos.x -= step;
+        pos.y += step;
+    }
+
+    if (hiX - margin - size.x > loX + margin)
+        pos.x = std::clamp(pos.x, loX + margin, hiX - margin - size.x);
+    if (hiY - margin - size.y > topY)
+        pos.y = std::clamp(pos.y, topY, hiY - margin - size.y);
+    ImGui::SetNextWindowPos(pos, ImGuiCond_Always);
 }
 
 struct MeasureSelection {
@@ -1768,9 +1843,16 @@ void EvaluateDialogs::syncMassMaterial(AppState& st) {
 void EvaluateDialogs::drawMassWindow(AppState& st) {
     if (!massOpen_) return;
 
-    ui::setNextCommandDialogPlacement("Mass Properties##eval_mass",
-        ImVec2(ui::metrics::px(480), ui::metrics::px(620)),
+    const ImVec2 massSize(ui::metrics::px(480), ui::metrics::px(620));
+    ui::setNextCommandDialogPlacement("Mass Properties##eval_mass", massSize,
         ImVec2(ui::metrics::px(340), ui::metrics::px(260)));
+    {
+        const std::string exclusive =
+            openWindow_.empty() ? std::string() : evalExclusiveWindowName(title_, openWindow_);
+        evalPlaceAppearing("Mass Properties##eval_mass", massSize,
+                           {"Section Properties##eval_section",
+                            exclusive.empty() ? nullptr : exclusive.c_str()});
+    }
     bool open = true;
     ImGui::SetNextWindowBgAlpha(1.0f);
     const bool vis = ImGui::Begin("Mass Properties##eval_mass", &open, ImGuiWindowFlags_NoScrollbar);
@@ -1914,9 +1996,41 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
                 kit::cardEnd();
             }
 
-            // Moment of inertia (bending area I + polar J) per principal axis: numbers first,
-            // then what to show.
-            if (kit::cardBegin("mass_moi", "Moment of inertia", "section_props")) {
+            // Mass moment of inertia: the engine's inertia tensor is central (OCCT
+            // MatrixOfInertia is taken at the center of mass, model-axis aligned) and its
+            // eigenvalues are the principal moments about the CG — the number an engineer reads
+            // for rotational dynamics. Mass units follow the document (lb·in² / g·mm²).
+            if (massResult_.contains("principal_moments") &&
+                massResult_["principal_moments"].is_array() &&
+                massResult_["principal_moments"].size() == 3) {
+                if (kit::cardBegin("mass_moi", "Moment of inertia", "mass_props")) {
+                    const auto& Pm = massResult_["principal_moments"];
+                    std::string vals[3];
+                    for (int i = 0; i < 3; ++i)
+                        vals[i] = evalQty(ips, EvalQty::MassMoment,
+                                          Pm[i].is_number() ? Pm[i].get<double>() : 0.0);
+                    kit::cardHeaderRight(ImGui::GetFrameHeight());
+                    if (kit::iconButton("copy", "copy", "Copy the principal moments of inertia")) {
+                        const std::string text = "P1: " + vals[0] + " \xc2\xb7 P2: " + vals[1] +
+                                                 " \xc2\xb7 P3: " + vals[2];
+                        ImGui::SetClipboardText(text.c_str());
+                    }
+                    static const char* const kPrincipal[] = {"Principal axis 1", "Principal axis 2",
+                                                             "Principal axis 3"};
+                    for (int i = 0; i < 3; ++i) {
+                        ImGui::PushID(i);
+                        kit::keyValueRowId("p", kPrincipal[i], vals[i].c_str());
+                        ImGui::PopID();
+                    }
+                    kit::dimText("Principal mass moments about the center of gravity.");
+                }
+                kit::cardEnd();
+            }
+
+            // Section properties: AREA moments (bending I + polar J) of the cut through the CG
+            // normal to each principal axis — geometry stiffness, not mass inertia. Numbers
+            // first, then what to show.
+            if (kit::cardBegin("mass_section", "Section properties", "section_props")) {
                 if (designSectionsPending_ > 0) kit::spinner("Computing section I and J…");
                 bool firstAxis = true;
                 for (int i = 0; designSections_.is_array() && i < 3; ++i) {
@@ -1939,25 +2053,24 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
                     const double J = sec.value("J", Ixx + Iyy);
                     ImGui::TextUnformatted(axis.c_str());
                     if (showI_) {
-                        kit::keyValueRowId("imax", "Imax",
+                        kit::keyValueRowId("imax", "Area moment Imax",
                             evalQty(ips, EvalQty::AreaMoment, std::max(Ixx, Iyy)).c_str());
-                        kit::keyValueRowId("imin", "Imin",
+                        kit::keyValueRowId("imin", "Area moment Imin",
                             evalQty(ips, EvalQty::AreaMoment, std::min(Ixx, Iyy)).c_str());
                     }
                     if (showJ_)
-                        kit::keyValueRowId("j", "Polar J",
+                        kit::keyValueRowId("j", "Polar moment J",
                                            evalQty(ips, EvalQty::AreaMoment, J).c_str());
                     if (showK_ && sec.contains("EA") && sec["EA"].is_number())
                         kit::keyValueRowId("ea", "EA (k = EA / L)",
-                                           kit::fmtQuantity(sec["EA"].get<double>(),
-                                                            kit::unitText(kit::Unit::N)).c_str());
+                            evalQty(ips, EvalQty::Force, sec["EA"].get<double>()).c_str());
                     if (sec.contains("area_mm2"))
                         kit::keyValueRowId("area", "Section area",
                             evalQty(ips, EvalQty::Area, sec.value("area_mm2", 0.0)).c_str());
                     ImGui::PopID();
                 }
-                kit::dimText("About centroidal planes through the center of gravity. I resists "
-                             "bending; polar J resists torsion.");
+                kit::dimText("Area moments of the section through the center of gravity, normal "
+                             "to each principal axis. I resists bending; polar J resists torsion.");
                 bool overlays = false;
                 kit::chipFlowBegin("mass_moi_show");
                 overlays |= kit::flowToggleChip("Bending I", &showI_, kit::Tone::Accent,
@@ -1972,8 +2085,9 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
             kit::cardEnd();
 
             if (kit::cardBegin("mass_tensor", "Mass inertia tensor", "csys", &massTensorOpen_)) {
-                // Rows first, so the header's one copy action carries the whole tensor.
-                std::vector<std::pair<std::string, std::string>> tensor, principal;
+                // Rows first, so the header's one copy action carries the whole tensor. The
+                // principal moments live in the "Moment of inertia" card above.
+                std::vector<std::pair<std::string, std::string>> tensor;
                 if (massResult_.contains("inertia") && massResult_["inertia"].is_array() &&
                     massResult_["inertia"].size() == 9) {
                     const auto& I = massResult_["inertia"];
@@ -1987,46 +2101,27 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
                         tensor.emplace_back(kKeys[r], evalQty(ips, EvalQty::MassMoment,
                                                               I[kIdx[r]].get<double>(), ref));
                 }
-                if (massResult_.contains("principal_moments") &&
-                    massResult_["principal_moments"].is_array() &&
-                    massResult_["principal_moments"].size() == 3) {
-                    const auto& Pm = massResult_["principal_moments"];
-                    for (int i = 0; i < 3; ++i)
-                        principal.emplace_back("Principal P" + std::to_string(i + 1),
-                                               evalQty(ips, EvalQty::MassMoment,
-                                                       Pm[i].get<double>()));
-                }
-                if (!tensor.empty() || !principal.empty()) {
+                if (!tensor.empty()) {
                     kit::cardHeaderRight(ImGui::GetFrameHeight());
                     if (kit::iconButton("copy", "copy", "Copy the inertia tensor")) {
                         std::string text;
-                        for (const auto* list : {&tensor, &principal})
-                            for (const auto& kv : *list) {
-                                if (!text.empty()) text += " \xc2\xb7 ";
-                                text += kv.first + ": " + kv.second;
-                            }
+                        for (const auto& kv : tensor) {
+                            if (!text.empty()) text += " \xc2\xb7 ";
+                            text += kv.first + ": " + kv.second;
+                        }
                         ImGui::SetClipboardText(text.c_str());
                     }
-                }
-                if (!tensor.empty()) {
-                    kit::dimText("About the origin.");
+                    // The engine reports the central tensor (taken at the center of mass, axes
+                    // parallel to the model X/Y/Z).
+                    kit::dimText("About the center of gravity, aligned with the model axes.");
                     for (int r = 0; r < (int)tensor.size(); ++r) {
                         ImGui::PushID(r);
                         kit::keyValueRowId("t", tensor[r].first.c_str(), tensor[r].second.c_str());
                         ImGui::PopID();
                     }
-                }
-                if (!principal.empty()) {
-                    if (!tensor.empty()) kit::rule();
-                    for (int i = 0; i < (int)principal.size(); ++i) {
-                        ImGui::PushID(i);
-                        kit::keyValueRowId("p", principal[i].first.c_str(),
-                                           principal[i].second.c_str());
-                        ImGui::PopID();
-                    }
-                }
-                if (tensor.empty() && principal.empty())
+                } else {
                     kit::dimText("No inertia tensor was reported for this part.");
+                }
             }
             kit::cardEnd();
         }
@@ -2057,9 +2152,16 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
 void EvaluateDialogs::drawSectionWindow(AppState& st) {
     if (!sectionOpen_) return;
 
-    ui::setNextCommandDialogPlacement("Section Properties##eval_section",
-        ImVec2(ui::metrics::px(480), ui::metrics::px(640)),
+    const ImVec2 sectionSize(ui::metrics::px(480), ui::metrics::px(640));
+    ui::setNextCommandDialogPlacement("Section Properties##eval_section", sectionSize,
         ImVec2(ui::metrics::px(340), ui::metrics::px(280)));
+    {
+        const std::string exclusive =
+            openWindow_.empty() ? std::string() : evalExclusiveWindowName(title_, openWindow_);
+        evalPlaceAppearing("Section Properties##eval_section", sectionSize,
+                           {"Mass Properties##eval_mass",
+                            exclusive.empty() ? nullptr : exclusive.c_str()});
+    }
     bool open = true;
     ImGui::SetNextWindowBgAlpha(1.0f);
     const bool vis = ImGui::Begin("Section Properties##eval_section", &open, ImGuiWindowFlags_NoScrollbar);
@@ -2510,18 +2612,18 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
     if (openWindow_.empty()) return;
 
     bool open = true;
-    char winTitle[128];
-    std::snprintf(winTitle, sizeof(winTitle), "%s###eval_%s",
-                  title_.empty() ? "Evaluate" : title_.c_str(), openWindow_.c_str());
-    ui::setNextCommandDialogPlacement(winTitle,
-        // Measure's reading + picks fit ~420 px (a long chain scrolls); interference lists pairs.
-        ImVec2(ui::metrics::px(480),
-               ui::metrics::px(openWindow_ == "interference" ? 580
-                               : openWindow_ == "measure"    ? 420
-                                                             : 380)),
+    const std::string winTitle = evalExclusiveWindowName(title_, openWindow_);
+    // Measure's reading + picks fit ~420 px (a long chain scrolls); interference lists pairs.
+    const ImVec2 toolSize(ui::metrics::px(480),
+                          ui::metrics::px(openWindow_ == "interference" ? 580
+                                          : openWindow_ == "measure"    ? 420
+                                                                        : 380));
+    ui::setNextCommandDialogPlacement(winTitle.c_str(), toolSize,
         ImVec2(ui::metrics::px(340), ui::metrics::px(240)));
+    evalPlaceAppearing(winTitle.c_str(), toolSize,
+                       {"Mass Properties##eval_mass", "Section Properties##eval_section"});
     ImGui::SetNextWindowBgAlpha(1.0f);
-    const bool evVis = ImGui::Begin(winTitle, &open, ImGuiWindowFlags_NoScrollbar);
+    const bool evVis = ImGui::Begin(winTitle.c_str(), &open, ImGuiWindowFlags_NoScrollbar);
     if (evVis) {
         const auto surf = ui::adaptiveSurface(-1.0f);
         // A footer action may close the tool mid-frame; the layout keys off the tool that opened it.

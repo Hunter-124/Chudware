@@ -39,7 +39,7 @@ bool finiteF(double v) { return std::isfinite(v); }
 // setup is blocked permanently and the footer offers the Thermal FEA route instead. An unanswered
 // capability probe never reads as "unavailable".
 constexpr const char *kThermalCfdUnavailable =
-    "Needs OpenFOAM, which is not installed.";
+    "Setup is complete, but Thermal CFD needs OpenFOAM, which is not installed.";
 bool thermalCfdUnavailable(AppState &st, const Study &s) {
   if (s.type != StudyType::Thermal || !st.simClient)
     return false;
@@ -303,10 +303,10 @@ std::vector<SimManager::SetupStep> SimManager::setupSteps(AppState &st, const St
         bcIssue = "Set a non-zero wall temperature, heat flux or power.";
     }
     std::string resIssue;
+    // A missing OpenFOAM is not a setup problem: the chips stay truthful about the setup, and the
+    // single unavailable state lives in the Fluid page card, the Setup step and the footer.
     if (s.flowPreset < 0 || s.flowPreset > 3)
       resIssue = "Choose a grid resolution.";
-    else if (thermalCfdUnavailable(st, s))
-      resIssue = kThermalCfdUnavailable; // the solver this study needs is missing
     auto status = [](const std::string &issue) {
       return issue.empty() ? kStepReady : kStepAttention;
     };
@@ -501,7 +501,7 @@ void SimManager::drawCustomMaterialPopup(AppState &st, Study &s) {
                          .withUnit(stressUnit)
                          .withScale(u.stressFromMpa)
                          .withMin(0.0)
-                         .withTip("Elastic stiffness. Steel ~200 GPa, aluminium ~69 GPa, most "
+                         .withTip("Elastic stiffness. Steel ~200 GPa, aluminum ~69 GPa, most "
                                   "plastics 1.5-3.5 GPa."));
     kit::fieldNumber("nu", "Poisson ratio", &cmNu_,
                      kit::FieldOpts().withRequired().withRange(0.0, 0.499).withTip(
@@ -531,7 +531,7 @@ void SimManager::drawCustomMaterialPopup(AppState &st, Study &s) {
                          .withScale(u.stressFromMpa)
                          .withMin(0.0)
                          .withTip("Fatigue endurance limit. ~0.5 x Sut for steels; lower for "
-                                  "aluminium and other non-ferrous alloys."));
+                                  "aluminum and other non-ferrous alloys."));
   }
   const char *reason = cmName_[0] == '\0' ? "Name the material."
                        : !(std::isfinite(cmE_) && cmE_ > 0.0f)
@@ -1656,7 +1656,7 @@ void SimManager::drawStudyOptions(AppState &st, Study &s) {
                                .withIssue(s.thermK > 0.0f ? nullptr : "Must be greater than zero.")
                                .withTip("Conductivity of the solid, entered here: the material "
                                         "library carries no thermal conductivity. ~200 "
-                                        "aluminium, ~50 steel, ~400 copper, ~0.3 FR4 / "
+                                        "aluminum, ~50 steel, ~400 copper, ~0.3 FR4 / "
                                         "plastics.")))
         persist(st, s);
       // The Material step carries no conductivity: say so at the field, not only in its tooltip.
@@ -1693,7 +1693,7 @@ void SimManager::drawStudyOptions(AppState &st, Study &s) {
                                  .withMin(0.0)
                                  .withIssue(s.thermCp > 0.0f ? nullptr
                                                              : "Must be greater than zero.")
-                                 .withTip("~900 aluminium, ~490 steel.")))
+                                 .withTip("~900 aluminum, ~490 steel.")))
           persist(st, s);
       }
     }
@@ -1923,12 +1923,14 @@ void SimManager::drawForm(AppState &st, Study &s) {
       firstIssue = &step;
   kit::StepItem track[3];
   track[0].label = "Setup";
-  track[0].status = cfdUnavailable ? kit::Status::Failed
-                    : firstIssue   ? kit::Status::Retry
-                                   : kit::Status::Done;
-  track[0].tooltip = cfdUnavailable ? kThermalCfdUnavailable
-                     : firstIssue   ? firstIssue->issue.c_str()
-                                    : "Setup is complete.";
+  // Unavailable is not a setup error (every chip can be green): show the step as waiting, not
+  // failed; the Fluid page explains the missing solver and the footer offers Thermal FEA.
+  track[0].status = firstIssue       ? kit::Status::Retry
+                    : cfdUnavailable ? kit::Status::Pending
+                                     : kit::Status::Done;
+  track[0].tooltip = firstIssue       ? firstIssue->issue.c_str()
+                     : cfdUnavailable ? kThermalCfdUnavailable
+                                      : "Setup is complete.";
   track[1].label = "Run";
   track[1].status = mineRunning ? kit::Status::Running
                     : hasResults ? kit::Status::Done
@@ -1989,7 +1991,10 @@ void SimManager::drawForm(AppState &st, Study &s) {
 
   // ---- scroll body ----
   const std::size_t studyCount = studies_.size();
-  kit::panelBodyBegin(runPage ? "run" : nodePage(node_));
+  // Scroll position per study AND node: a new study must open at the top of its own setup, not
+  // inherit the previous study's scroll (which could land straight in Advanced parameters).
+  const std::string bodyPage = std::string(runPage ? "run" : nodePage(node_)) + "/" + s.id;
+  kit::panelBodyBegin(bodyPage.c_str());
   ImGui::PushTextWrapPos(0.0f);
   const bool setupBody = !runPage && node_ != SimNode::Results;
   ImGui::BeginDisabled(setupBody && mineRunning);
@@ -2123,10 +2128,16 @@ void SimManager::drawForm(AppState &st, Study &s) {
           const SetupStep &setupStep = steps[i];
           ImGui::PushID(i);
           kit::RowStyle row;
-          row.secondary = !setupStep.issue.empty() ? setupStep.issue.c_str()
-                          : setupStep.status == kStepOptional ? "Optional"
-                                                              : "Ready";
-          row.tooltip = "Open this setup editor.";
+          // The row's second column is narrow: optional steps say just "Optional" and every
+          // explanation is in full in the tooltip, so nothing is only readable truncated.
+          const bool optional = setupStep.status == kStepOptional;
+          row.secondary = optional                   ? "Optional"
+                          : !setupStep.issue.empty() ? setupStep.issue.c_str()
+                                                     : "Ready";
+          const std::string tip = setupStep.issue.empty()
+                                      ? std::string("Open this setup editor.")
+                                      : setupStep.issue + " Click to open this setup editor.";
+          row.tooltip = tip.c_str();
           if (kit::row("edit_step", setupStep.title ? setupStep.title : setupStep.label, row)) {
             goToSetupStep(st, s, setupStep, node_, loadIdx_, armedWell_);
             requestFocus(setupFocus(node_, s.type));

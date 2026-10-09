@@ -1,6 +1,8 @@
 // SimManager core: study state/JSON, refresh/persist, study CRUD, command routing, materials, probes.
 #include "sim_manager.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -933,6 +935,111 @@ int resizeParameterText(ImGuiInputTextCallbackData* data) {
   }
   return 0;
 }
+
+// Study fields are mostly `float`; widened to double they print as float noise
+// ("0.050000000745"). Show such a value as the shortest decimal that reads back
+// as the same float. Values a float cannot hold exactly are true doubles: kept.
+double tidyFloat(double v) {
+  const float f = static_cast<float>(v);
+  if (!std::isfinite(v) || static_cast<double>(f) != v) return v;
+  char buf[32];
+  for (int digits = 1; digits <= 9; ++digits) {
+    std::snprintf(buf, sizeof(buf), "%.*g", digits, static_cast<double>(f));
+    if (std::strtof(buf, nullptr) == f) return std::strtod(buf, nullptr);
+  }
+  return v;
+}
+
+void tidyFloats(nlohmann::json& j) {
+  if (j.is_number_float()) j = tidyFloat(j.get<double>());
+  else if (j.is_structured())
+    for (auto& child : j) tidyFloats(child);
+}
+
+// Undo tidyFloats on an applied draft: a number the user left as displayed gets
+// its exact stored value back, so applying an untouched draft changes nothing.
+void restoreExactFloats(nlohmann::json& draft, const nlohmann::json& base) {
+  if (draft.is_number_float() && base.is_number_float()) {
+    if (tidyFloat(base.get<double>()) == draft.get<double>()) draft = base;
+  } else if (draft.is_object() && base.is_object()) {
+    for (auto it = draft.begin(); it != draft.end(); ++it)
+      if (base.contains(it.key())) restoreExactFloats(it.value(), base[it.key()]);
+  } else if (draft.is_array() && base.is_array() && draft.size() == base.size()) {
+    for (std::size_t i = 0; i < draft.size(); ++i) restoreExactFloats(draft[i], base[i]);
+  }
+}
+
+// The parameter editor shows a study only the settings its kind uses: the typed
+// record carries every kind's block (flow, fatigue, motion, adv...), which reads
+// as noise on, say, a Buckling study. Hidden values are kept and restored on apply.
+bool parameterKeyShown(StudyType type, const std::string& key) {
+  using T = StudyType;
+  if (key == "flow") return isFlowFamily(type);
+  if (key == "fatigue") return type == T::Fatigue;
+  if (key == "motion") return type == T::Motion;
+  if (key == "criterion" || key.rfind("adapt_", 0) == 0) return type == T::Static;
+  if (key == "n_modes")
+    return type == T::Modal || type == T::Buckling || type == T::FreqResponse;
+  if (key.rfind("mesh_", 0) == 0 || key == "learned_advisor" || key == "advisor_max_dof")
+    return type != T::Motion;
+  return true;
+}
+
+// Which "adv" sub-keys belong to a study kind (empty prefix: none of them).
+const char* advPrefixFor(StudyType type) {
+  using T = StudyType;
+  switch (type) {
+  case T::Contact: return "contact_";
+  case T::FreqResponse: return "fr_";
+  case T::ThermalFea: return "therm_";
+  default: return "";
+  }
+}
+
+// The study kind a definition belongs to, read exactly as studyFromJson does.
+StudyType parameterViewType(const nlohmann::json& definition) {
+  return definition.is_object()
+             ? studyTypeFromKey(definition.value("type", std::string("static")))
+             : StudyType::Static;
+}
+
+// Put back everything the editor view left out (and the user therefore never saw),
+// so applying the shown subset cannot drop another kind's stored settings.
+void restoreHiddenParameters(nlohmann::json& draft, const nlohmann::json& full) {
+  if (parameterViewType(full) == StudyType::Topology || !draft.is_object() || !full.is_object())
+    return;
+  const nlohmann::json view = SimManager::parameterEditorView(full);
+  for (auto it = full.begin(); it != full.end(); ++it) {
+    if (it.key() == "adv" && it->is_object() && view.contains("adv")) {
+      if (!draft.contains("adv") || !draft["adv"].is_object()) continue;
+      for (auto sub = it->begin(); sub != it->end(); ++sub)
+        if (!view["adv"].contains(sub.key()) && !draft["adv"].contains(sub.key()))
+          draft["adv"][sub.key()] = sub.value();
+    } else if (!view.contains(it.key()) && !draft.contains(it.key())) {
+      draft[it.key()] = it.value();
+    }
+  }
+}
+}
+
+nlohmann::json SimManager::parameterEditorView(const nlohmann::json& definition) {
+  const StudyType type = parameterViewType(definition);
+  nlohmann::json view = definition;
+  if (type != StudyType::Topology && view.is_object()) {
+    for (auto it = definition.begin(); it != definition.end(); ++it)
+      if (!parameterKeyShown(type, it.key())) view.erase(it.key());
+    if (view.contains("adv") && view["adv"].is_object()) {
+      const std::string prefix = advPrefixFor(type);
+      nlohmann::json adv = nlohmann::json::object();
+      if (!prefix.empty())
+        for (auto it = view["adv"].begin(); it != view["adv"].end(); ++it)
+          if (it.key().rfind(prefix, 0) == 0) adv[it.key()] = it.value();
+      if (adv.empty()) view.erase("adv");
+      else view["adv"] = std::move(adv);
+    }
+  }
+  tidyFloats(view);
+  return view;
 }
 
 bool SimManager::configureActiveStudy(AppState& st, const nlohmann::json& candidate,
@@ -1139,12 +1246,15 @@ void SimManager::drawParameterEditor(AppState& st, Study& s) {
     parameterWasVisible_ = false;
   }
   if (takeFocus("sim_parameters")) parameterEditorOpen_ = true;
-  const bool body = kit::cardBegin("sim_parameters", "Complete parameters", nullptr,
+  const bool body = kit::cardBegin("sim_parameters", "Advanced parameters", nullptr,
                                     &parameterEditorOpen_);
   if (body) {
     const auto reload = [&](nlohmann::json current) {
       parameterBase_ = std::move(current);
-      parameterBaseText_ = parameterBase_.dump(2);
+      // The text shows this study kind's settings only, with float noise removed; Apply
+      // restores the hidden settings and exact stored values (restoreHiddenParameters /
+      // restoreExactFloats), so an untouched draft round-trips unchanged.
+      parameterBaseText_ = parameterEditorView(parameterBase_).dump(2);
       parameterDraft_ = parameterBaseText_;
       parameterDraftDirty_ = false;
       parameterError_.clear();
@@ -1172,8 +1282,10 @@ void SimManager::drawParameterEditor(AppState& st, Study& s) {
       if (parameterBase_.is_null() || (!parameterDraftDirty_ && parameterStale_))
         reload(std::move(current));
     }
-    kit::dimText("Exact persisted study schema. Native supported fields use the existing solver; "
-                 "retained unknown keys are not solver extensions. Identity and result evidence are read-only.");
+    kit::dimText("Every setting this study saves, as editable JSON. Units follow the key "
+                 "names (for example _mm, _mpa). Settings that only other study types use "
+                 "are hidden. Apply checks your edits before saving; the study's ID, type "
+                 "and results cannot be changed here.");
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::PushID(parameterInputGeneration_);
     if (ImGui::InputTextMultiline("##sim_parameter_json", parameterDraft_.data(),
@@ -1199,6 +1311,8 @@ void SimManager::drawParameterEditor(AppState& st, Study& s) {
         parameterStale_ = true;
         parameterError_.clear();
       } else {
+        restoreHiddenParameters(draft, parameterBase_);
+        restoreExactFloats(draft, parameterBase_);
         if (configureActiveStudy(st, draft, parameterError_)) reload(studyToJson(s));
       }
     }
@@ -1700,6 +1814,8 @@ bool SimManager::handleCommand(AppState &st, const std::string &cmdId) {
     if (sel_ >= 0) {
       node_ = SimNode::Study;
       panelOpen_ = true;
+      // A fresh study opens on its guided setup; the advanced editor stays folded.
+      parameterEditorOpen_ = false;
     }
     return true;
   };

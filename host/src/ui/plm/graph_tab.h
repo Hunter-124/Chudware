@@ -21,6 +21,10 @@ bool plmGraphLoaded();
 // Drop caches when the active project folder changes (called from the hub shell).
 void plmGraphOnProjectChanged();
 
+// Warm the graph in the background while another hub page is showing, so the
+// Graph page opens populated. One request per project; no-op once loaded.
+void plmGraphPrefetch(AppState& st);
+
 // Page body for PlmPage::Graph.
 void plmDrawGraphPage(AppState& st);
 

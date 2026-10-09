@@ -146,6 +146,12 @@ public:
     // not re-frame the camera. Used to stop the view "bouncing" during sketch editing — the view
     // stays normal-to-plane at a stable zoom while geometry updates live underneath.
     void setFramingFrozen(bool f) { framingFrozen_ = f; }
+    // Screen clip for the datum-AXIS pass, in image-normalized coords (0..1, v down). The 3D image
+    // runs full-bleed under the translucent glass columns, so the viewport limits the dashed axes
+    // to its clear rect and they never read as ink across pane text. Set per frame around the
+    // live render; clearDatumAxisClip() (the default) draws them unclipped.
+    void setDatumAxisClip(float u0, float v0, float u1, float v1);
+    void clearDatumAxisClip() { datumAxisClip_ = false; }
     void setBackground(float tr, float tg, float tb, float br, float bg, float bb);
     // 3-stop vertical background gradient (top / mid-band ~55% / bottom floor glow).
     void setBackground3(const float top[3], const float mid[3], const float bot[3]);
@@ -694,5 +700,7 @@ private:
     bool colormap_ = false;
     float deformScale_ = 0.0f;
     bool framingFrozen_ = false;   // when true, setMeshes() keeps center_/radius_ (no re-frame)
+    bool datumAxisClip_ = false;   // setDatumAxisClip(): scissor the datum-axis pass
+    float datumAxisClipUV_[4] = {0.0f, 0.0f, 1.0f, 1.0f};   // u0, v0, u1, v1 (v down)
     unsigned int lutTex_ = 0;  // 256x1 RGB jet ramp
 };

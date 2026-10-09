@@ -25,12 +25,49 @@ const char* const kStandardTips[] = {"IEC motors: kW ratings and IEC frames.",
 const char* const kPhases[] = {"Single-phase", "Three-phase"};
 const char* const kEffClasses[] = {"IE2", "IE3", "IE4"};
 
+// Common mains supplies; the last entry (Custom) shows the individual supply fields.
+struct Supply {
+    const char* label;
+    double volts, hz;
+    int phases, standard;  // standard: 0 IEC, 1 NEMA
+};
+const Supply kSupplies[] = {
+    {"460 V, 60 Hz, three-phase (North America)", 460.0, 60.0, 3, 1},
+    {"230 V, 60 Hz, three-phase (North America)", 230.0, 60.0, 3, 1},
+    {"400 V, 50 Hz, three-phase (IEC regions)", 400.0, 50.0, 3, 0},
+    {"230 V, 50 Hz, single-phase (IEC regions)", 230.0, 50.0, 1, 0},
+};
+constexpr int kNSupplies = (int)(sizeof(kSupplies) / sizeof(kSupplies[0]));
+const char* const kSupplyLabels[kNSupplies + 1] = {kSupplies[0].label, kSupplies[1].label,
+                                                   kSupplies[2].label, kSupplies[3].label, "Custom"};
+
+// The shown supply: Custom when the user chose it (even if the numbers match a preset), else
+// the preset matching the current values, else Custom.
+int supplyIndex(const PumpDriveInputs& in) {
+    if (in.customSupply) return kNSupplies;
+    for (int i = 0; i < kNSupplies; ++i)
+        if (in.voltageV == kSupplies[i].volts && in.frequencyHz == kSupplies[i].hz &&
+            in.phases == kSupplies[i].phases)
+            return i;
+    return kNSupplies;  // Custom
+}
+
 // "12.3 kW" from a numeric member, or an em dash when absent.
 std::string qty(const json& o, const char* k, kit::Unit u) {
     return jhas(o, k) ? kit::fmtQuantity(jnum(o, k), kit::unitText(u)) : std::string("\xe2\x80\x94");
 }
 
 }  // namespace
+
+void defaultSupplyForUnits(PumpDriveInputs& in, bool usCustomary) {
+    if (in.supplyChosen) return;
+    const Supply& s = kSupplies[usCustomary ? 0 : 2];
+    in.voltageV = s.volts;
+    in.frequencyHz = s.hz;
+    in.phases = s.phases;
+    in.standard = s.standard;
+    in.supplyChosen = true;
+}
 
 nlohmann::json pumpDriveParams(const PumpDriveInputs& in) {
     json p = {{"kind", in.kind == 0 ? "hydraulic" : "centrifugal"},
@@ -98,7 +135,40 @@ bool drawPumpDriveInputs(const char* id, PumpDriveInputs& in, bool showKindAndDu
     kit::cardEnd();
 
     if (kit::cardBegin("motor", "Motor", "pump_drive")) {
+        {
+            // The supply decides voltage, frequency and the motor standard together, so it is
+            // the first, explicit choice; Custom reveals the individual fields.
+            kit::FieldGroup g("supply_fields");
+            int supply = supplyIndex(in);
+            if (kit::fieldEnum("supply", "Mains supply", &supply, kSupplyLabels, kNSupplies + 1,
+                               kit::FieldOpts()
+                                   .withEnumStyle(kit::EnumStyle::Combo)
+                                   .withTip("Electrical supply the motor runs from. Sets voltage, "
+                                            "frequency, phases and the motor standard; choose "
+                                            "Custom to enter them yourself."))) {
+                if (supply >= 0 && supply < kNSupplies) {
+                    in.voltageV = kSupplies[supply].volts;
+                    in.frequencyHz = kSupplies[supply].hz;
+                    in.phases = kSupplies[supply].phases;
+                    in.standard = kSupplies[supply].standard;
+                }
+                in.customSupply = supply == kNSupplies;
+                in.supplyChosen = true;
+                committed = true;
+            }
+        }
         kit::FieldGroup g("motor_fields", "Efficiency class");
+        if (supplyIndex(in) == kNSupplies) {
+            committed |= kit::fieldNumber("voltage", "Voltage", &in.voltageV,
+                                          kit::FieldOpts().withUnit(kit::Unit::V).withMin(1.0));
+            int phase = in.phases == 1 ? 0 : 1;
+            if (kit::fieldEnum("phases", "Phases", &phase, kPhases, 2)) {
+                in.phases = phase == 0 ? 1 : 3;
+                committed = true;
+            }
+            committed |= kit::fieldNumber("freq", "Frequency", &in.frequencyHz,
+                                          kit::FieldOpts().withUnit(kit::Unit::Hz).withMin(1.0));
+        }
         int standard = std::clamp(in.standard, 0, 1);
         if (kit::fieldEnum("standard", "Standard", &standard, kStandards, 2,
                            kit::FieldOpts().withItemTips(kStandardTips))) {
@@ -108,18 +178,10 @@ bool drawPumpDriveInputs(const char* id, PumpDriveInputs& in, bool showKindAndDu
         committed |= kit::fieldNumber("sf", "Service factor", &in.serviceFactor,
                                       kit::FieldOpts().withRange(1.0, 2.0).withHint("1.15")
                                           .withTip("Margin applied to the shaft power before picking a rating."));
-        committed |= kit::fieldNumber("voltage", "Voltage", &in.voltageV,
-                                      kit::FieldOpts().withUnit(kit::Unit::V).withMin(1.0).withHint("400"));
-        int phase = in.phases == 1 ? 0 : 1;
-        if (kit::fieldEnum("phases", "Supply", &phase, kPhases, 2)) {
-            in.phases = phase == 0 ? 1 : 3;
-            committed = true;
-        }
-        committed |= kit::fieldNumber("freq", "Frequency", &in.frequencyHz,
-                                      kit::FieldOpts().withUnit(kit::Unit::Hz).withMin(1.0).withHint("50"));
         int cls = std::clamp(in.effClass, 0, 2);
         if (kit::fieldEnum("class", "Efficiency class", &cls, kEffClasses, 3,
-                           kit::FieldOpts().withTip("IEC 60034-30-1 motor efficiency class."))) {
+                           kit::FieldOpts().withTip("IEC 60034-30-1 motor efficiency class "
+                                                    "(IE3 is comparable to NEMA Premium)."))) {
             in.effClass = cls;
             committed = true;
         }

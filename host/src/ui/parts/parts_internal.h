@@ -160,7 +160,7 @@ struct PartsState {
     char  materialBuf[64] = {};
     char  vendorBuf[64]   = {};
     int   sourceFilter = 0;     // 0=All 1=Local 2=Live
-    int   sortMode     = 0;     // 0=Relevance 1=Price low→high 2=Price high→low 3=Name
+    int   sortMode     = 0;     // 0=Relevance 1=Lowest price 2=Highest price 3=Name
 
     bool gridView = false;
 
@@ -177,6 +177,9 @@ struct PartsState {
     double taxonomyStartedAt = 0.0;   // GetTime() when the in-flight call started
     double taxonomyRetryAt   = 0.0;   // GetTime() after which the next attempt may fire
     int    taxonomyAttempts  = 0;     // consecutive failed attempts; reset on success/Retry
+    // Why the last category load failed (transport error or the worker's `reason`). Shown
+    // by the pane's blocked state once the backoff gives up; cleared on success/Retry.
+    std::string taxonomyError;
     std::set<std::string> expandedCats;
     std::map<std::string, FacetValue> facetValues;
     double filterDirtyAt = 0;
@@ -184,6 +187,9 @@ struct PartsState {
     // ---- vendors (strip + popup) ----
     bool vendorsLoaded   = false;
     bool vendorsLoading  = false;
+    // Why the last vendor_status call failed; empty on success. Lets the vendor strip tell
+    // "status unavailable" apart from "this build has no vendor sources".
+    std::string vendorsError;
     std::vector<VendorEntry> vendors;
     std::vector<ApiProvider> apiProviders;
     double lastVendorPoll = 0.0;

@@ -53,7 +53,7 @@
 #include "tesseract.h"  // ui::drawTesseract + TesseractAnim — Appearance > Brand mark picker
 #include "../ui_theme.h"  // ui::busyLabel — the one inline "working" indicator
 #include "widgets/kit.h"  // ui::kit::sectionHeader — the one accent-caption treatment
-#include "ai/rules_authoring.h"  // ui::drawRulesAuthoringPopup (Settings → AI → Rules → New…)
+#include "ai/rules_authoring.h"  // ui::drawRulesAuthoringPopup (Settings → AI → Rules → New rule…)
 #include "copilot/agent_text.h"  // ui::foldToAtlasGlyphs — Rules tab renders Python-authored text
 
 
@@ -422,6 +422,11 @@ static void settingsLabelLead(const char* label, const char* help, float columnW
     ImGui::SameLine(0.0f, ImMax(style.ItemSpacing.x, x0 + colW + style.ItemSpacing.x - endX));
 }
 
+// Laid-out width of a ui::kit::checkbox (box + label gap + label), for right-aligning one.
+static float settingsCheckboxWidth(const char* label) {
+    return ImGui::GetTextLineHeight() + ui::metrics::U(2.0f) + ImGui::CalcTextSize(label).x;
+}
+
 // Popup rows (combo drop-downs): Selectable owns input/focus/close semantics, while its header
 // colors stay transparent and the current window draw list paints the wash after the item.
 // Rows are sized only to the pinned popup interior so a long label can never make the popup
@@ -487,58 +492,84 @@ static bool settingsChildRowSelectable(const char* label, bool selected, float c
     return clicked;
 }
 
-static float settingsWidestComboLabel(const char* const* labels, int count) {
-    float widest = 0.0f;
-    for (int i = 0; i < count; ++i)
-        widest = ImMax(widest, ImGui::CalcTextSize(labels[i]).x);
-    return widest;
-}
-
+// Custom-content combo (type-to-filter box, logo rows) wearing the kit combo face: ImGui's own
+// frame is drawn clear and without its stock arrow button, then the rounded control face, the
+// elided preview and a vector chevron are painted on the parent draw list — the same look as
+// kit::fieldEnum / kit::fieldCombo, which cannot host custom popup content. The face spans the
+// caller's item width; the popup is pinned (min == max, so a row sized from the popup interior
+// can never feed its auto-fit) at least face-wide and wide enough for `widestLabel`, but never
+// past the work area's right edge.
 static bool settingsBeginPopupRowCombo(
     const char* id, const char* preview, float widestLabel,
     ImGuiComboFlags flags = ImGuiComboFlags_None) {
     const ImGuiStyle& style = ImGui::GetStyle();
-    const float requestedWidth = ImGui::CalcItemWidth();
-    // A stretched table cell can leave almost no width after an inline label/help chip.
-    // Clamp both the closed box and popup to the widest label plus frame padding; otherwise
-    // pin min == max, following the model-picker precedent in copilot/composer.cpp.
-    const float width = ImMax(requestedWidth, widestLabel + 2.0f * style.FramePadding.x);
-    ImGui::SetNextItemWidth(width);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(width, 0.0f), ImVec2(width, FLT_MAX));
-    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 6.0f * ui::uiScale);
-    ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 1.0f);
+    const float h = ImGui::GetFrameHeight();
+    const float w = ImMax(ImGui::CalcItemWidth(), h * 3.0f);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const ImVec2 p1(p0.x + w, p0.y + h);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const bool hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
+                         ImGui::IsMouseHoveringRect(p0, p1);
+    const ImU32 fill = ImGui::GetColorU32(hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg);
+    const ImU32 fillOpen = ImGui::GetColorU32(ImGuiCol_FrameBgActive);
+
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float room = ImMax(vp->WorkPos.x + vp->WorkSize.x - p0.x, w);
+    const float popupW = ImMin(ImMax(w, widestLabel + 2.0f * style.FramePadding.x), room);
+    ImGui::SetNextItemWidth(w);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(popupW, 0.0f), ImVec2(popupW, FLT_MAX));
+    const ImVec4 clear(ui::palette.frameBg[0], ui::palette.frameBg[1], ui::palette.frameBg[2],
+                       0.0f);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, clear);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, clear);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, clear);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, ui::kit::rowRound());
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, ui::metrics::stroke(1.0f));
     // Nonzero popup padding is dead space the edge-to-edge row wash cannot paint over.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
-    if (ImGui::BeginCombo(id, preview, flags)) return true;
+    const bool open = ImGui::BeginCombo(id, "", flags | ImGuiComboFlags_NoArrowButton);
+    // Border/padding are consumed when the popup window begins. Row spacing is read live by the
+    // popup content and the row wash rounds its corners with PopupRounding, so those two stay
+    // pushed until settingsEndPopupRowCombo.
+    ImGui::PopStyleColor(3);
     ImGui::PopStyleVar(4);
-    return false;
+    if (open) {
+        ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, ui::kit::rowRound());
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+    }
+
+    // Face + preview + chevron on the PARENT draw list (captured before the popup opened).
+    ui::controlFace(dl, p0, p1, open ? fillOpen : fill, ui::controlBorderU32(),
+                    ui::kit::chipRound(), open ? 0.35f : 1.0f);
+    const float textW = ImMax(w - style.FramePadding.x - h, ui::metrics::stroke(1.0f));
+    const std::string shown = ui::kit::elide(preview ? preview : "", textW);
+    const float ty = p0.y + (h - ImGui::GetTextLineHeight()) * 0.5f;
+    dl->AddText(ImVec2(p0.x + style.FramePadding.x, ty), ImGui::GetColorU32(ImGuiCol_Text),
+                shown.c_str());
+    const ImVec2 c(p1.x - h * 0.5f, p0.y + h * 0.5f);
+    const float r = h * 0.16f;
+    const ImVec2 chev[3] = {ImVec2(c.x - r, c.y - r * 0.5f), ImVec2(c.x, c.y + r * 0.5f),
+                            ImVec2(c.x + r, c.y - r * 0.5f)};
+    dl->AddPolyline(chev, 3, ImGui::GetColorU32(ImGuiCol_Text, 0.62f), ImDrawFlags_None,
+                    ui::metrics::stroke(1.5f));
+    if (!open && hovered && shown != (preview ? preview : "") && preview && preview[0])
+        ui::kit::tooltip(preview);
+    return open;
 }
 
 static void settingsEndPopupRowCombo() {
     ImGui::EndCombo();
-    ImGui::PopStyleVar(4);
+    ImGui::PopStyleVar(2);  // PopupRounding, ItemSpacing
 }
 
+// Fixed-label combo: the kit combo (rounded face, vector chevron, pill rows) filling the rest of
+// the current line, so it composes with settingsLabelLead captions and table cells. Unlabelled on
+// purpose — the caption is the caller's. Returns true when *current changed.
 static bool settingsPopupRowCombo(const char* id, int* current,
                                   const char* const* labels, int count) {
-    bool changed = false;
-    if (settingsBeginPopupRowCombo(id, labels[*current],
-                                   settingsWidestComboLabel(labels, count))) {
-        for (int i = 0; i < count; ++i) {
-            const bool selected = (i == *current);
-            ImDrawFlags corners = ImDrawFlags_RoundCornersNone;
-            if (i == 0) corners |= ImDrawFlags_RoundCornersTop;
-            if (i == count - 1) corners |= ImDrawFlags_RoundCornersBottom;
-            if (settingsPopupRowSelectable(labels[i], selected, 0.0f, corners)) {
-                *current = i;
-                changed = true;
-            }
-            if (selected) ImGui::SetItemDefaultFocus();
-        }
-        settingsEndPopupRowCombo();
-    }
-    return changed;
+    return ui::kit::fieldEnum(id, "", current, labels, count,
+                              ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo));
 }
 
 
@@ -745,6 +776,17 @@ static std::string ellipsizeToFit(const std::string& s, float maxW) {
     }
     while (lo > 0 && (s[lo] & 0xC0) == 0x80) --lo;   // never split a UTF-8 continuation
     return s.substr(0, lo) + kEll;
+}
+
+// Provider list name: catalog labels carry a parenthetical qualifier ("ChatGPT Plus/Pro (Codex
+// Subscription)", "Antigravity (Gemini 3, Claude, GPT-OSS)") that cut mid-word in the list pane.
+// When the full label does not fit, the product name before the qualifier is shown whole (the
+// caller tooltips the full label); only a name that still does not fit gets an ellipsis.
+static std::string providerListLabel(const std::string& label, float maxW) {
+    if (ImGui::CalcTextSize(label.c_str()).x <= maxW) return label;
+    const size_t paren = label.find(" (");
+    if (paren != std::string::npos && paren > 0) return ellipsizeToFit(label.substr(0, paren), maxW);
+    return ellipsizeToFit(label, maxW);
 }
 
 // Primary row label: display_name → email/label → shortened account id.
@@ -1912,8 +1954,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
     else if (prov.id == "kimi-code") catKey = "kimi-code";
     else if (prov.id == "moonshot") catKey = "moonshot";
     if (catKey) {
-        const float cbW = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x
-                          + ImGui::CalcTextSize("Disable").x;
+        const float cbW = settingsCheckboxWidth("Disable");
         // Cursor has wrapped to the next line start after the state text, so line-start +
         // avail IS the right edge — but the fit guard must compare against the measured
         // state-text end (stateX + stateW), not the wrapped cursor.
@@ -1924,7 +1965,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         else if (headerEnd + 16.0f * sc + cbW <= rightEdge) ImGui::SameLine(0, 16.0f * sc);
         // else: too narrow even inline — the checkbox wraps to its own line.
         bool disabled = st.settings.disabledProviders.count(catKey) != 0;
-        if (ImGui::Checkbox("Disable", &disabled)) {
+        if (ui::kit::checkbox("prov_disable", "Disable", &disabled)) {
             if (disabled) st.settings.disabledProviders.insert(catKey);
             else st.settings.disabledProviders.erase(catKey);
             saveSettings(st.settings);
@@ -2135,7 +2176,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
                 beginOmpOAuth(st, prov.id);
         } else if (flow.status == "cancelled") {
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-            ImGui::TextUnformatted("Sign-in cancelled.");
+            ImGui::TextUnformatted("Sign-in canceled.");
             ImGui::PopStyleColor();
             if (prov.hasOAuth && ImGui::SmallButton("Try again"))
                 beginOmpOAuth(st, prov.id);
@@ -2331,7 +2372,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             const float x0 = ImGui::GetCursorPosX();
             bool hidden = st.settings.hiddenModels.count(m.id) != 0;
             bool shown = !hidden;
-            if (ImGui::Checkbox("##show", &shown)) {
+            if (ui::kit::checkbox("show", "", &shown)) {
                 if (shown) st.settings.hiddenModels.erase(m.id);
                 else st.settings.hiddenModels.insert(m.id);
                 saveSettings(st.settings);
@@ -2555,19 +2596,21 @@ static void drawOmpProviderManager(AppState& st) {
 
     static char s_provSearchBuf[64] = "";
     {
-        // Search + logos toggle share one row — they used to be two full-width rows.
-        const float logosW = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x
-                             + ImGui::CalcTextSize("Show provider logos").x;
-        ImGui::SetNextItemWidth(ImMax(140.0f * sc, availW - logosW - 8.0f * sc));
-        ImGui::InputTextWithHint("##prov_search", "Search providers...", s_provSearchBuf,
+        // Search + logos toggle share one row — they used to be two full-width rows. The
+        // toggle's real kit width plus one item gap of right margin is reserved up front, so its
+        // label never runs into the pane's right edge / scrollbar lane.
+        const float gap = 8.0f * sc;
+        const float logosW = settingsCheckboxWidth("Show provider logos");
+        ImGui::SetNextItemWidth(
+            ImMax(140.0f * sc, availW - logosW - gap - ImGui::GetStyle().ItemSpacing.x));
+        ImGui::InputTextWithHint("##prov_search", "Search providers\xe2\x80\xa6", s_provSearchBuf,
                                  sizeof(s_provSearchBuf));
-        ImGui::SameLine(0, 8.0f * sc);
+        ImGui::SameLine(0, gap);
         bool logosOn = ui::providerLogosEnabled();
-        if (ImGui::Checkbox("Show provider logos", &logosOn))
+        if (ui::kit::checkbox("prov_logos", "Show provider logos", &logosOn,
+                              "Fetch each provider's real brand icon (cached locally).\n"
+                              "Off = colored letter badges, no network."))
             ui::setProviderLogosEnabled(logosOn);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Fetch each provider's real brand icon (cached locally in appdata).\n"
-                              "Off = colored letter badges, no network.");
     }
     const std::string provNeedle = toLowerAscii(s_provSearchBuf);
     std::vector<const OmpProviderRow*> filteredRows;
@@ -2683,7 +2726,10 @@ static void drawOmpProviderManager(AppState& st) {
             ui::drawProviderLogo(dl, ImVec2(badgeX, badgeY), badgeSide, r.id);
             const float textX = badgeX + badgeSide + badgeGap;
             const float textMaxW = ImMax(bodyRight - textX, ui::metrics::stroke(1.0f));
-            const std::string labelFit = ellipsizeToFit(r.label, textMaxW);
+            const std::string labelFit = providerListLabel(r.label, textMaxW);
+            if (labelFit != r.label && ImGui::IsWindowHovered() &&
+                ImGui::IsMouseHoveringRect(mn, mx))
+                ui::kit::tooltip(r.label.c_str());
             dl->AddText(ImVec2(textX, textTop),
                         ui::Palette::toU32(sel ? pal.text : pal.textDim), labelFit.c_str());
             const float* c = ompStateColor(r.state);
@@ -3275,35 +3321,14 @@ static void drawBenchStatusLine(AppState& st, float sc) {
         ImGui::TextWrapped("%s", s_bench.lastError.c_str());
         ImGui::PopStyleColor();
     } else {
-        dimText("Idle \xe2\x80\x94 pick a category or legacy smoke/diag run.");
+        dimText("Idle \xe2\x80\x94 no legacy run in progress.");
     }
     (void)st; (void)sc;
 }
 
+// Legacy per-tool-family category table. The Benchmarks page draws it only when the worker
+// reported categories (no empty/unavailable card), so this body assumes a non-empty list.
 static void drawBenchCategories(AppState& st, float sc) {
-    pollBenchCategories(st, /*force=*/false);
-
-    if (!s_cats.loaded && s_cats.pollInFlight) {
-        dimText("Loading categories\xe2\x80\xa6");
-        return;
-    }
-    if (s_cats.rpcMissing || (!s_cats.loaded && !st.workerStarted)) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
-        ImGui::TextWrapped(
-            "Benchmark categories unavailable \xe2\x80\x94 start the worker to load "
-            "category runs. The legacy runner below still works.");
-        ImGui::PopStyleColor();
-        if (!s_cats.lastError.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
-            ImGui::TextWrapped("%s", s_cats.lastError.c_str());
-            ImGui::PopStyleColor();
-        }
-        return;
-    }
-    if (s_cats.cats.empty()) {
-        dimText("No benchmark categories reported yet.");
-        return;
-    }
 
     dimText("One row per tool family. Run queues that suite; history comes from the last cycle.");
 
@@ -3428,20 +3453,14 @@ static void drawBenchCategories(AppState& st, float sc) {
         }
         ImGui::EndTable();
     }
-
-    ImGui::Dummy(ImVec2(0, 4.0f * sc));
-    drawBenchStatusLine(st, sc);
 }
 
 static void drawBenchRunner(AppState& st, float sc, ui::leaderboard::Board& lb,
                             double& lbLast) {
     ImGui::Dummy(ImVec2(0, 6.0f * sc));
-    ImGui::Separator();
-    ImGui::Dummy(ImVec2(0, 4.0f * sc));
     ImGui::TextUnformatted("Legacy quick run");
-    dimText("Spawns the gym CLI detached on the worker (diag / C1 smoke). Prefer the "
-            "category rows above for full tool-family coverage. On finish rebuilds "
-            "benchmarks/leaderboard/leaderboard.json and refreshes the table.");
+    dimText("Spawns the retired gym CLI detached on the worker (diag / C1 smoke). On finish it "
+            "rebuilds benchmarks/leaderboard/leaderboard.json and refreshes the table above.");
 
     static const char* kSources[] = {
         "Current copilot model",
@@ -3452,11 +3471,11 @@ static void drawBenchRunner(AppState& st, float sc, ui::leaderboard::Board& lb,
         "Quick diag",
         "C1 smoke",
     };
-    ImGui::SetNextItemWidth(220.0f * sc);
-    settingsPopupRowCombo("##bench_src", &s_bench.source, kSources, 3);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(140.0f * sc);
-    settingsPopupRowCombo("##bench_mode", &s_bench.mode, kModes, 2);
+    {
+        ui::kit::FieldGroup group("bench_run", "Model");
+        ui::kit::fieldEnum("bench_src", "Model", &s_bench.source, kSources, 3);
+        ui::kit::fieldEnum("bench_mode", "Run", &s_bench.mode, kModes, 2);
+    }
 
     if (benchSourceIsPaid(st.settings, s_bench.source)) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
@@ -4173,14 +4192,15 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         // correct normal configuration.
         if (adv) {
             ImGui::TableNextColumn();
-            if (ImGui::Checkbox("Proactive advisor", &settings.proactiveAdvisor))
+            if (ui::kit::checkbox("h_proactive", "Proactive advisor", &settings.proactiveAdvisor))
                 changed = true;
             helpMarker("Opt-in mid-run guidance on failure streaks and thrash. "
                        "Cheap deterministic notes by default; at most one short "
                        "advisor-model call on severe streaks (encourage/require). "
                        "Off = no proactive injects (pull request_advice still works).");
             ImGui::TableNextColumn();
-            if (ImGui::Checkbox("Company structure auto-route", &settings.corporateMode))
+            if (ui::kit::checkbox("h_company", "Company structure auto-route",
+                                  &settings.corporateMode))
                 changed = true;
             helpMarker("Applies to the explicit offline modeling fallback only: when on, a "
                        "complex cross-discipline request may route as company (director + "
@@ -4189,24 +4209,23 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         }
 
         ImGui::TableNextColumn();
-        if (ImGui::Checkbox("Vision (send screenshots)", &settings.vision)) changed = true;
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Attach viewport screenshots so the model can see the part.");
+        if (ui::kit::checkbox("h_vision", "Vision (send screenshots)", &settings.vision,
+                              "Attach viewport screenshots so the model can see the part."))
+            changed = true;
         ImGui::TableNextColumn();
-        if (ImGui::Checkbox("Offline mode (local only)", &settings.offlineMode)) changed = true;
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "Refuses any cloud provider. Only a local loopback endpoint is allowed.");
+        if (ui::kit::checkbox("h_offline", "Offline mode (local only)", &settings.offlineMode,
+                              "Refuses any cloud provider. Only a local loopback endpoint is "
+                              "allowed."))
+            changed = true;
 
         ImGui::TableNextColumn();
-        ImGui::Checkbox("Show assistant thoughts", &ui::assistantThoughtsVisible());
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Show the AI's reasoning steps inline in the conversation.");
+        ui::kit::checkbox("h_thoughts", "Show assistant thoughts", &ui::assistantThoughtsVisible(),
+                          "Show the AI's reasoning steps inline in the conversation.");
 
         ImGui::TableNextColumn();
         {
             bool redact = std::strcmp(settings.complianceMode, "redact") == 0;
-            if (ImGui::Checkbox("Redact sensitive data (local, IP-safe)", &redact)) {
+            if (ui::kit::checkbox("h_redact", "Redact sensitive data (local, IP-safe)", &redact)) {
                 std::memset(settings.complianceMode, 0, sizeof(settings.complianceMode));
                 std::strncpy(settings.complianceMode, redact ? "redact" : "off",
                              sizeof(settings.complianceMode) - 1);
@@ -4223,8 +4242,8 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
             // Moved out of the retired Experimental tab: a modeling-behaviour preference,
             // so it belongs beside the other run preferences (and rides along into the AI
             // workspace's Options view, which shares this grid). ADVANCED: experimental.
-            if (ImGui::Checkbox("Editable feature sequence",
-                                &settings.expCadSequenceMode))
+            if (ui::kit::checkbox("h_sequence", "Editable feature sequence",
+                                  &settings.expCadSequenceMode))
                 changed = true;
             helpMarker(
                 "Nudges the modeler to build the part as an ordered sequence of "
@@ -4249,7 +4268,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
     // formatting, so Basic shows the one and drops the section header with them.
     if (!adv) {
         bool renders = ui::chatShowRenders();
-        if (ImGui::Checkbox("Show renders inline", &renders))
+        if (ui::kit::checkbox("h_renders", "Show renders inline", &renders))
             ui::setChatShowRenders(renders);
         helpMarker("Display the images the vision model is looking at in the "
                    "transcript and the Artifacts panel. Off shows file paths instead.");
@@ -4282,7 +4301,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
             ImGui::TableNextColumn();
             {
                 bool anim = ui::chatCollapseAnim();
-                if (ImGui::Checkbox("Animate collapsing boxes", &anim))
+                if (ui::kit::checkbox("h_collapse_anim", "Animate collapsing boxes", &anim))
                     ui::setChatCollapseAnim(anim);
                 helpMarker("Thinking boxes and tool drawers slide shut when the next step "
                            "starts instead of snapping.");
@@ -4291,7 +4310,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
             ImGui::TableNextColumn();
             {
                 bool group = ui::chatGroupToolCalls();
-                if (ImGui::Checkbox("Group repeated tool calls", &group))
+                if (ui::kit::checkbox("h_group_calls", "Group repeated tool calls", &group))
                     ui::setChatGroupToolCalls(group);
                 helpMarker("Fold consecutive calls of the same tool into one card with a "
                            "count. Failures are never folded.");
@@ -4300,7 +4319,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
             ImGui::TableNextColumn();
             {
                 bool renders = ui::chatShowRenders();
-                if (ImGui::Checkbox("Show renders inline", &renders))
+                if (ui::kit::checkbox("h_renders", "Show renders inline", &renders))
                     ui::setChatShowRenders(renders);
                 helpMarker("Display the images the vision model is looking at in the "
                            "transcript and the Artifacts panel. Off shows file paths "
@@ -4310,7 +4329,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
             ImGui::TableNextColumn();
             {
                 bool human = ui::chatHumanizeDocIds();
-                if (ImGui::Checkbox("Humanize document ids", &human))
+                if (ui::kit::checkbox("h_humanize", "Humanize document ids", &human))
                     ui::setChatHumanizeDocIds(human);
                 helpMarker("Replace engine ids like doc-cpp0000001f with the part's name "
                            "in agent text. Turn off to see exactly what the model sent.");
@@ -4341,18 +4360,22 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                 s_toolCallBudget = ui::loadSubagentToolCallBudget();
             settingsLabelLead("Subagent tool-call budget",
                               "A delegated subagent gets a soft warning to converge at this "
-                              "many tool calls. 0 = automatic based on its token grant. The "
-                              "main chat has no tool-call budget. Saved to config.json "
-                              "agent.subagent_tool_call_budget.",
+                              "many tool calls. Leave empty (Auto) to derive it from the "
+                              "subagent's token grant. The main chat has no tool-call budget. "
+                              "Saved to config.json agent.subagent_tool_call_budget.",
                               harnessLeftColW);
-            ImGui::SetNextItemWidth(-1.0f);
-            int budget = s_toolCallBudget;
-            if (ImGui::SliderInt("##h_subagent_calls", &budget, 0, 64,
-                                 budget == 0 ? "automatic" : "%d calls")) {
-                if (budget < 0) budget = 0;
-                if (budget > 64) budget = 64;
-                s_toolCallBudget = budget;
-                ui::saveSubagentToolCallBudget(budget);
+            // 0 = automatic: shown as an empty field with an "Auto" hint, never as a zero.
+            bool manual = s_toolCallBudget > 0;
+            int budget = manual ? s_toolCallBudget : 16;
+            if (ui::kit::fieldInt("h_subagent_calls", "", &budget,
+                                  ui::kit::FieldOpts()
+                                      .withPresent(&manual)
+                                      .withHint("Auto")
+                                      .withRange(1, 64)
+                                      .withTip("Tool calls before a subagent is told to "
+                                               "converge (1-64). Empty = Auto."))) {
+                s_toolCallBudget = manual ? budget : 0;
+                ui::saveSubagentToolCallBudget(s_toolCallBudget);
             }
         }
 
@@ -4365,11 +4388,16 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                               "Root chat = depth 0. Saved to config.json "
                               "agent.max_subagent_depth.",
                               harnessRightColW);
-            ImGui::SetNextItemWidth(-1.0f);
-            int depth = s_maxDepth;
-            if (ImGui::SliderInt("##h_depth", &depth, 0, 4, "%d")) {
-                if (depth < 0) depth = 0;
-                if (depth > 4) depth = 4;
+            static const char* kDepthLabels[] = {"0", "1", "2", "3", "4"};
+            static const char* kDepthTips[] = {
+                "Subagents cannot spawn subagents.",
+                "Subagents may spawn one level of helpers.",
+                "Two nested levels below the main chat.",
+                "Three nested levels below the main chat.",
+                "Four nested levels below the main chat."};
+            int depth = ImClamp(s_maxDepth, 0, 4);
+            if (ui::kit::segmented("##h_depth", kDepthLabels, 5, &depth,
+                                   ImGui::GetContentRegionAvail().x, kDepthTips)) {
                 s_maxDepth = depth;
                 ui::saveMaxSubagentDepth(depth);
             }
@@ -4433,8 +4461,8 @@ static void drawVisionRoutingSection(AppState& st, float sc) {
     }
 
     ImGui::Dummy(ImVec2(0, 6 * sc));
-    ImGui::Checkbox("Route vision & spatial reasoning through a separate model",
-                    &settings.expVisionReview);
+    ui::kit::checkbox("vis_route", "Route vision & spatial reasoning through a separate model",
+                      &settings.expVisionReview);
     helpMarker("When on, a vision model judges the rendered viewport during the review/fix "
                "stages (spatial awareness), while the command model above plans and emits ops "
                "— the Seek-CAD split. It can be local (ITAR-safe) or a cloud vision model. "
@@ -4626,13 +4654,13 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
     // Project memory and its token budget already live in the persisted Session knobs
     // grid above. Keep a single control for each in both Basic and Advanced modes.
     if (!st.settings.showAdvanced) {
-        if (ImGui::Checkbox("Remember decisions & notes", &s_learn))
+        if (ui::kit::checkbox("mem_learn", "Remember decisions & notes", &s_learn))
             saveAgentConfigValue("memory_learn", s_learn);
         helpMarker("Learning switch: when on, the agent writes decisions and notes it "
                    "judges worth keeping into project memory (agent.memory_learn, "
                    "default on). Recall still works when off; nothing new is learned.");
         bool follow = ui::aiFollowActiveSession();
-        if (ImGui::Checkbox(ui::aiPrefCopy::kFollowLabel, &follow))
+        if (ui::kit::checkbox("mem_follow", ui::aiPrefCopy::kFollowLabel, &follow))
             ui::setAiFollowActiveSession(follow);
         helpMarker(ui::aiPrefCopy::kFollowHelp);
         return;
@@ -4684,20 +4712,20 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         }
 
         ImGui::TableNextColumn();
-        if (ImGui::Checkbox("Remember decisions & notes", &s_learn))
+        if (ui::kit::checkbox("mem_learn", "Remember decisions & notes", &s_learn))
             saveAgentConfigValue("memory_learn", s_learn);
         helpMarker("Learning switch: when on, the agent writes decisions and notes it "
                    "judges worth keeping into project memory (agent.memory_learn, "
                    "default on). Recall still works when off; nothing new is learned.");
 
         ImGui::TableNextColumn();
-        if (ImGui::Checkbox("Supersede stale reads", &s_supersedeReads))
+        if (ui::kit::checkbox("mem_supersede", "Supersede stale reads", &s_supersedeReads))
             saveAgentConfigNestedBool("compaction", "supersede_reads", s_supersedeReads);
         helpMarker("When the agent reads the same file again, the older read result is "
                    "pruned from the context every turn (cache-aware). Applies to each "
                    "chat from its next turn (agent.compaction.supersede_reads, default on).");
         ImGui::TableNextColumn();
-        if (ImGui::Checkbox("Drop useless turns", &s_dropUseless))
+        if (ui::kit::checkbox("mem_drop_useless", "Drop useless turns", &s_dropUseless))
             saveAgentConfigNestedBool("compaction", "drop_useless", s_dropUseless);
         helpMarker("Tool results that carried nothing (no matches, timed-out waits) are "
                    "pruned from the context once the agent has seen them (cache-aware). "
@@ -4757,7 +4785,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
                 });
             };
             if (s_sessInFlight) ImGui::BeginDisabled();
-            if (ImGui::Checkbox("Auto-compaction", &s_sessAutoCompaction))
+            if (ui::kit::checkbox("sess_autocompact", "Auto-compaction", &s_sessAutoCompaction))
                 applySessionFlag("chudcode_set_auto_compaction", s_sessAutoCompaction,
                                  &s_sessAutoCompaction, !s_sessAutoCompaction);
             helpMarker("Switches automatic compaction on or off for the active chat session "
@@ -4765,7 +4793,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
                        "Compaction setting still chooses the method (with Off or Automatic, "
                        "the agent service's own method order).");
             ImGui::SameLine(0, 16.0f * sc);
-            if (ImGui::Checkbox("Auto-retry", &s_sessAutoRetry))
+            if (ui::kit::checkbox("sess_autoretry", "Auto-retry", &s_sessAutoRetry))
                 applySessionFlag("chudcode_set_auto_retry", s_sessAutoRetry,
                                  &s_sessAutoRetry, !s_sessAutoRetry);
             helpMarker("The agent service retries transient provider failures (rate limits, "
@@ -4791,14 +4819,14 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
                           ImGuiTableFlags_SizingStretchSame |
                           ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableNextColumn();
-        if (ImGui::Checkbox("Auto-Learn (experimental)", &s_autolearn))
+        if (ui::kit::checkbox("mem_autolearn", "Auto-Learn (experimental)", &s_autolearn))
             saveAgentConfigValue("autolearn_enabled", s_autolearn);
         helpMarker("After the agent stops, nudge it to capture lessons to memory "
                    "(agent.autolearn_enabled). Standing guidance is injected into "
                    "the system prompt when on. Default off.");
         ImGui::TableNextColumn();
         if (!s_autolearn) ImGui::BeginDisabled();
-        if (ImGui::Checkbox("Auto-run capture at stop", &s_autoContinue))
+        if (ui::kit::checkbox("mem_autocontinue", "Auto-run capture at stop", &s_autoContinue))
             saveAgentConfigValue("autolearn_auto_continue", s_autoContinue);
         helpMarker("When on, auto-write one project-memory note after a turn with "
                    "enough tool calls (agent.autolearn_auto_continue). Uses a little "
@@ -4829,13 +4857,13 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         }
         ImGui::TableNextColumn();
         bool follow = ui::aiFollowActiveSession();
-        if (ImGui::Checkbox(ui::aiPrefCopy::kFollowLabel, &follow))
+        if (ui::kit::checkbox("mem_follow", ui::aiPrefCopy::kFollowLabel, &follow))
             ui::setAiFollowActiveSession(follow);
         helpMarker(ui::aiPrefCopy::kFollowHelp);
 
         ImGui::TableNextColumn();
         bool previews = ui::aiActiveWorkPreviews();
-        if (ImGui::Checkbox(ui::aiPrefCopy::kPreviewsLabel, &previews))
+        if (ui::kit::checkbox("mem_previews", ui::aiPrefCopy::kPreviewsLabel, &previews))
             ui::setAiActiveWorkPreviews(previews);
         helpMarker(ui::aiPrefCopy::kPreviewsHelp);
         ImGui::EndTable();
@@ -5119,7 +5147,7 @@ struct OvTriggersUi {
     char newId[96] = {};
 };
 static OvTriggersUi s_ovTrig;
-// Guided rule/skill/context authoring popup (opened by "New…" in the Rules tab).
+// Guided rule/skill/context authoring popup (opened by "New rule…" in the Rules tab).
 static bool s_rulesAuthorOpen = false;
 
 static bool ovTriggersAbsent(const core::RpcResult& r) {
@@ -5588,19 +5616,126 @@ static std::string ovTriggerLabel(const OvTriggerRow& tr) {
     return ui::foldToAtlasGlyphs(tr.label.empty() ? tr.id : tr.label);
 }
 
-// One compact line naming exactly what fires a rule: keyword regexes, tool names, events.
+// Human reading of one keyword regex, for the Rules list: "\bbearing seat\b" -> "bearing seat",
+// "(?i)\bcolou?rs?\b" -> "color", "\bbolt[\s-]?hole\b" -> "bolt hole", "(nut|washer)" ->
+// "nut/washer". Anchors, inline flags and group syntax drop; an optional/repeated atom (x?, x*)
+// drops unless it is a separator, which reads as one space; alternation reads as "/". The raw
+// pattern stays in the row tooltip and the editor. Falls back to the pattern when nothing
+// readable is left.
+static std::string ovRegexWords(const std::string& re) {
+    std::string out;
+    std::vector<size_t> groups;   // out.size() at each open '('
+    size_t atom = 0;              // out.size() before the most recent atom
+    const size_t n = re.size();
+    size_t i = 0;
+    while (i < n) {
+        const char c = re[i];
+        if (c == '\\' && i + 1 < n) {
+            const char e = re[i + 1];
+            i += 2;
+            if (e == 'b' || e == 'B' || e == 'A' || e == 'Z' || e == 'z') continue;
+            atom = out.size();
+            if (e == 's') out += ' ';
+            else if (e == 'd') out += '#';
+            else if (e != 'w' && e != 'W' && e != 'S' && e != 'D') out += e;
+            continue;
+        }
+        if (c == '(') {
+            ++i;
+            if (i < n && re[i] == '?') {
+                ++i;
+                size_t j = i;
+                while (j < n && std::isalpha((unsigned char)re[j])) ++j;
+                if (j < n && re[j] == ')') { i = j + 1; continue; }   // inline flags "(?i)"
+                while (i < n && (re[i] == ':' || re[i] == '=' || re[i] == '!' || re[i] == '<'))
+                    ++i;   // non-capturing / lookaround opener
+            }
+            groups.push_back(out.size());
+            continue;
+        }
+        if (c == ')') {
+            atom = groups.empty() ? out.size() : groups.back();
+            if (!groups.empty()) groups.pop_back();
+            ++i;
+            continue;
+        }
+        if (c == '[') {
+            size_t j = i + 1;
+            bool sep = false;
+            char first = 0;
+            while (j < n && re[j] != ']') {
+                if (re[j] == '\\' && j + 1 < n) {
+                    if (re[j + 1] == 's') sep = true;
+                    else if (!first) first = re[j + 1];
+                    j += 2;
+                    continue;
+                }
+                if (re[j] == ' ' || re[j] == '_' || re[j] == '-') sep = true;
+                else if (!first && re[j] != '^') first = re[j];
+                ++j;
+            }
+            i = j < n ? j + 1 : n;
+            atom = out.size();
+            if (sep) out += ' ';
+            else if (first) out += first;
+            continue;
+        }
+        if (c == '?' || c == '*') {
+            const bool sepAtom = atom < out.size() &&
+                                 out.find_first_not_of(' ', atom) == std::string::npos;
+            out.resize(ImMin(atom, out.size()));
+            if (sepAtom) out += ' ';
+            ++i;
+            continue;
+        }
+        if (c == '{') {
+            while (i < n && re[i] != '}') ++i;
+            ++i;
+            continue;
+        }
+        if (c == '+' || c == '^' || c == '$') { ++i; continue; }
+        atom = out.size();
+        out += (c == '|') ? '/' : (c == '.') ? ' ' : c;
+        ++i;
+    }
+    // Collapse runs of spaces, trim, and tighten " / " to "/".
+    std::string tidy;
+    for (char ch : out) {
+        if (ch == ' ' && (tidy.empty() || tidy.back() == ' ' || tidy.back() == '/')) continue;
+        if (ch == '/' && !tidy.empty() && tidy.back() == ' ') tidy.pop_back();
+        tidy += ch;
+    }
+    while (!tidy.empty() && (tidy.back() == ' ' || tidy.back() == '/')) tidy.pop_back();
+    while (!tidy.empty() && tidy.front() == '/') tidy.erase(0, 1);
+    return tidy.empty() ? re : tidy;
+}
+
+// Engine identifier as words ("build_failed" -> "build failed").
+static std::string ovIdWords(std::string s) {
+    std::replace(s.begin(), s.end(), '_', ' ');
+    return s;
+}
+
+// One compact line naming what fires a rule in plain words: the trigger words its keyword
+// patterns match, the tools and the events. Raw patterns live in the tooltip and the editor.
 static std::string ovTriggerSummary(const OvTriggerRow& tr) {
     std::string s;
-    auto add = [&s](const char* tag, const std::vector<std::string>& v) {
-        if (v.empty()) return;
+    auto add = [&s](const char* tag, const std::vector<std::string>& v,
+                    std::string (*read)(const std::string&)) {
+        std::vector<std::string> shown;
+        for (const auto& e : v) {
+            std::string w = read(e);
+            if (std::find(shown.begin(), shown.end(), w) == shown.end()) shown.push_back(w);
+        }
+        if (shown.empty()) return;
         if (!s.empty()) s += "  \xc2\xb7  ";
         s += tag;
-        for (size_t i = 0; i < v.size(); ++i) s += (i ? ", " : " ") + v[i];
+        for (size_t i = 0; i < shown.size(); ++i) s += (i ? ", " : " ") + shown[i];
     };
-    add("kw", tr.keywords);
-    add("tool", tr.tools);
-    add("evt", tr.events);
-    if (s.empty()) s = "no match clause \xe2\x80\x94 never fires";
+    add("Words:", tr.keywords, ovRegexWords);
+    add("Tools:", tr.tools, [](const std::string& x) { return ovIdWords(x); });
+    add("Events:", tr.events, [](const std::string& x) { return ovIdWords(x); });
+    if (s.empty()) s = "No trigger \xe2\x80\x94 never fires";
     return ui::foldToAtlasGlyphs(s);
 }
 
@@ -5614,16 +5749,53 @@ static std::string ovTriggerTooltip(const OvTriggerRow& tr) {
         t += head;
         for (const auto& e : v) t += "\n  " + e;
     };
-    block("Keywords (regex):", tr.keywords);
+    std::vector<std::string> words;
+    for (const auto& k : tr.keywords) words.push_back(ovRegexWords(k));
+    block("Trigger words:", words);
+    block("Patterns (regex):", tr.keywords);
     block("Tools:", tr.tools);
     block("Events:", tr.events);
     if (tr.keywords.empty() && tr.tools.empty() && tr.events.empty())
-        t += "\n\nNo match clause \xe2\x80\x94 this rule can never fire.";
+        t += "\n\nNo trigger \xe2\x80\x94 this rule can never fire.";
     if (!tr.pack.empty()) t += "\n\nInjects pack: " + tr.pack;
-    t += "\n" + std::to_string(tr.budgetTokens) + " token budget \xc2\xb7 "
+    t += "\n" + std::to_string(tr.budgetTokens) + "-token budget \xc2\xb7 "
        + std::to_string(tr.cooldownTurns) + "-turn cooldown";
-    t += std::string("\nSource: ") + (tr.source.empty() ? "builtin" : tr.source.c_str());
+    t += std::string("\nSource: ") + (tr.source.empty() ? "built-in" : tr.source.c_str());
     return ui::foldToAtlasGlyphs(t);
+}
+
+// Seed the editor with a blank, hand-edited rule + pack (the guided "New rule…" popup is the
+// primary create path; this is the expert route from the editor's empty state).
+static void ovBeginBlankRule() {
+    s_ovTrig.creating = true;
+    s_ovTrig.selected.clear();
+    s_ovTrig.enabled = true;
+    s_ovTrig.budgetTokens = 250;
+    s_ovTrig.cooldownTurns = 8;
+    std::memset(s_ovTrig.purpose, 0, sizeof(s_ovTrig.purpose));
+    std::strncpy(s_ovTrig.purpose, "What this pack teaches the model.",
+                 sizeof(s_ovTrig.purpose) - 1);
+    std::memset(s_ovTrig.packName, 0, sizeof(s_ovTrig.packName));
+    std::strncpy(s_ovTrig.packName, "my_pack", sizeof(s_ovTrig.packName) - 1);
+    std::memset(s_ovTrig.keywords, 0, sizeof(s_ovTrig.keywords));
+    std::strncpy(s_ovTrig.keywords, "\\bmy_keyword\\b", sizeof(s_ovTrig.keywords) - 1);
+    std::memset(s_ovTrig.tools, 0, sizeof(s_ovTrig.tools));
+    std::memset(s_ovTrig.events, 0, sizeof(s_ovTrig.events));
+    std::memset(s_ovTrig.exemplar, 0, sizeof(s_ovTrig.exemplar));
+    std::fill(s_ovTrig.packBody.begin(), s_ovTrig.packBody.end(), 0);
+    std::strncpy(s_ovTrig.packBody.data(),
+                 "# My context pack\n\nImportant considerations:\n- ...\n",
+                 s_ovTrig.packBody.size() - 1);
+    s_ovTrig.prerunCalcs = nlohmann::json::array();
+    // No Python source behind these C++ templates: save() must write the buffers.
+    for (OvRawField* f : {&s_ovTrig.purposeSrc, &s_ovTrig.packNameSrc, &s_ovTrig.exemplarSrc,
+                          &s_ovTrig.keywordsSrc, &s_ovTrig.toolsSrc, &s_ovTrig.eventsSrc,
+                          &s_ovTrig.packBodySrc})
+        f->clear();
+    s_ovTrig.bodyDirty = true;
+    s_ovTrig.packDirty = true;
+    std::memset(s_ovTrig.newId, 0, sizeof(s_ovTrig.newId));
+    std::strncpy(s_ovTrig.newId, "my_trigger", sizeof(s_ovTrig.newId) - 1);
 }
 
 static void drawSettingsContextTab(AppState& st, float S) {
@@ -5662,50 +5834,12 @@ static void drawSettingsContextTab(AppState& st, float S) {
         ImGui::TextUnformatted(rulesMeta.c_str());
         ImGui::PopStyleColor();
         ImGui::Dummy(ImVec2(0, 2.0f * S));
-        const float gap = 6.0f * S;
-        const float halfW = ImMax(60.0f * S,
-                                  (ImGui::GetContentRegionAvail().x - gap) * 0.5f);
-        if (ui::kit::secondaryButton("New rule", true, nullptr, ImVec2(halfW, 0))) {
-            s_ovTrig.creating = true;
-            s_ovTrig.selected.clear();
-            s_ovTrig.enabled = true;
-            s_ovTrig.budgetTokens = 250;
-            s_ovTrig.cooldownTurns = 8;
-            std::memset(s_ovTrig.purpose, 0, sizeof(s_ovTrig.purpose));
-            std::strncpy(s_ovTrig.purpose, "What this pack teaches the model.",
-                         sizeof(s_ovTrig.purpose) - 1);
-            std::memset(s_ovTrig.packName, 0, sizeof(s_ovTrig.packName));
-            std::strncpy(s_ovTrig.packName, "my_pack", sizeof(s_ovTrig.packName) - 1);
-            std::memset(s_ovTrig.keywords, 0, sizeof(s_ovTrig.keywords));
-            std::strncpy(s_ovTrig.keywords, "\\bmy_keyword\\b",
-                         sizeof(s_ovTrig.keywords) - 1);
-            std::memset(s_ovTrig.tools, 0, sizeof(s_ovTrig.tools));
-            std::memset(s_ovTrig.events, 0, sizeof(s_ovTrig.events));
-            std::memset(s_ovTrig.exemplar, 0, sizeof(s_ovTrig.exemplar));
-            std::fill(s_ovTrig.packBody.begin(), s_ovTrig.packBody.end(), 0);
-            std::strncpy(s_ovTrig.packBody.data(),
-                         "# My context pack\n\nImportant considerations:\n- ...\n",
-                         s_ovTrig.packBody.size() - 1);
-            s_ovTrig.prerunCalcs = nlohmann::json::array();
-            // No Python source behind these C++ templates: save() must write the buffers.
-            for (OvRawField* f : {&s_ovTrig.purposeSrc, &s_ovTrig.packNameSrc,
-                                  &s_ovTrig.exemplarSrc, &s_ovTrig.keywordsSrc,
-                                  &s_ovTrig.toolsSrc, &s_ovTrig.eventsSrc,
-                                  &s_ovTrig.packBodySrc})
-                f->clear();
-            s_ovTrig.bodyDirty = true;
-            s_ovTrig.packDirty = true;
-            std::memset(s_ovTrig.newId, 0, sizeof(s_ovTrig.newId));
-            std::strncpy(s_ovTrig.newId, "my_trigger", sizeof(s_ovTrig.newId) - 1);
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "Blank rule + pack, edited on the right (saved under context_injection/).");
-        ImGui::SameLine(0, gap);
-        if (ui::kit::secondaryButton("New\xe2\x80\xa6", true, nullptr, ImVec2(-1, 0)))
+        // ONE create entry: the guided authoring popup (rules, skills, context packs). The blank
+        // hand-edited template is offered from the editor pane's empty state instead of as a
+        // second, near-identical button beside this one.
+        if (ui::kit::secondaryButton("New rule\xe2\x80\xa6", true, nullptr, ImVec2(-1, 0)))
             s_rulesAuthorOpen = true;
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Guided authoring for rules, skills and context injections.");
+        ui::kit::itemTooltip("Guided authoring for a rule, skill or context pack.");
         ImGui::Separator();
 
         if (!s_ovTrig.loaded && s_ovTrig.listInFlight) {
@@ -5733,12 +5867,13 @@ static void drawSettingsContextTab(AppState& st, float S) {
                 if (sel) ImGui::SetItemDefaultFocus();
 
                 const float textW = ImMax(40.0f * S, bodyW);
-                const std::string source = tr.source.empty() ? "builtin" : tr.source;
-                std::string meta = ui::foldToAtlasGlyphs(tr.id);
-                meta += tr.enabled ? "  \xc2\xb7  enabled" : "  \xc2\xb7  disabled";
-                meta += "  \xc2\xb7  " + source + "  \xc2\xb7  "
-                      + std::to_string(tr.budgetTokens) + " tok  \xc2\xb7  cd "
-                      + std::to_string(tr.cooldownTurns);
+                const char* source = tr.source == "override" ? "Customized"
+                                   : tr.source == "user"     ? "Your rule"
+                                                             : "Built-in";
+                std::string meta = tr.enabled ? "Enabled" : "Disabled";
+                meta += std::string("  \xc2\xb7  ") + source + "  \xc2\xb7  "
+                      + std::to_string(tr.budgetTokens) + "-token budget  \xc2\xb7  "
+                      + std::to_string(tr.cooldownTurns) + "-turn cooldown";
                 const std::string metaFit = ovFitText(meta, textW);
                 std::string purpose;
                 if (!tr.purpose.empty())
@@ -5783,11 +5918,11 @@ static void drawSettingsContextTab(AppState& st, float S) {
                 "Letters, digits, _ and - only. Saved as a user trigger.");
             ImGui::PopStyleColor();
         } else if (s_ovTrig.selected.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                       ui::palette.textDim[2], 1));
-            ImGui::TextWrapped("Select a trigger to edit, or New trigger.");
-            ImGui::PopStyleColor();
+            if (ui::kit::emptyState(nullptr, "No rule selected",
+                                    "Pick a rule on the left to edit it, or start a blank rule "
+                                    "and write its trigger and pack by hand.",
+                                    "Start blank rule"))
+                ovBeginBlankRule();
         } else {
             // Label first (Python-authored, so folded), id kept as its own row.
             const OvTriggerRow* selRow = nullptr;
@@ -5805,11 +5940,10 @@ static void drawSettingsContextTab(AppState& st, float S) {
             if (s_ovTrig.bodyInFlight && !s_ovTrig.creating) {
                 ImGui::TextUnformatted("Loading\xe2\x80\xa6");
             } else {
-                if (ui::InterwebzCheckbox("Enabled", &s_ovTrig.enabled))
+                if (ui::kit::checkbox("trig_enabled", "Enabled", &s_ovTrig.enabled,
+                                      "Off = never inject this pack (user override of "
+                                      "shipped)."))
                     s_ovTrig.bodyDirty = true;
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip(
-                        "Off = never inject this pack (user override of shipped).");
 
                 ImGui::TextUnformatted("Purpose");
                 ImGui::SetNextItemWidth(-1);
@@ -5855,16 +5989,18 @@ static void drawSettingsContextTab(AppState& st, float S) {
                                      sizeof(s_ovTrig.exemplar)))
                     s_ovTrig.bodyDirty = true;
 
-                ImGui::SetNextItemWidth(ImMax(100.0f * S,
-                    ImGui::GetContentRegionAvail().x * 0.48f));
-                if (ImGui::SliderInt("Budget tokens", &s_ovTrig.budgetTokens,
-                                     50, 2000))
-                    s_ovTrig.bodyDirty = true;
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(ImMax(80.0f * S,
-                    ImGui::GetContentRegionAvail().x * 0.9f));
-                if (ImGui::SliderInt("Cooldown", &s_ovTrig.cooldownTurns, 0, 32))
-                    s_ovTrig.bodyDirty = true;
+                {
+                    ui::kit::FieldGroup limits("trig_limits", "Cooldown (turns)");
+                    if (ui::kit::fieldInt("trig_budget", "Token budget", &s_ovTrig.budgetTokens,
+                                          ui::kit::FieldOpts().withRange(50, 2000).withTip(
+                                              "Most tokens this pack may add to one turn.")))
+                        s_ovTrig.bodyDirty = true;
+                    if (ui::kit::fieldInt("trig_cooldown", "Cooldown (turns)",
+                                          &s_ovTrig.cooldownTurns,
+                                          ui::kit::FieldOpts().withRange(0, 32).withTip(
+                                              "Turns to wait before this rule may fire again.")))
+                        s_ovTrig.bodyDirty = true;
+                }
 
                 ImGui::TextUnformatted("Pack body (markdown injected into context)");
                 const float edH = ImMax(80.0f * S,
@@ -6015,6 +6151,9 @@ const SettingsEntry kSettingsEntries[] = {
     { "Model context window",     "Providers",    3 },
     // Benchmarks (tab 4)
     { "Benchmarks",               "AI",    2 },
+    { "Agent benchmark",          "AI",    2 },
+    { "Artifact validity",        "AI",    2 },
+    { "Show legacy results",      "AI",    2 },
     { "Model leaderboard",        "AI",    2 },
     { "Run benchmark",            "AI",    2 },
     { "Benchmark",                "AI",    2 },
@@ -6490,14 +6629,14 @@ void drawSettingsModal(AppState& st, bool busy) {
                 settingsTabBodyBegin("##tab_appearance");
                 settingsGlassSectionBegin("##app_theme", "Theme", 0.0f, /*first=*/true);
                 bool isLight = (ui::activeTheme == ui::Theme::Light);
-                if (ui::kit::checkbox("app_light", "Light theme (SolidWorks-style)", &isLight))
+                if (ui::kit::checkbox("app_light", "Light theme", &isLight))
                     applyThemeNow(st, isLight);
                 dimText("Switches the whole UI between the dark and light palettes. "
                         "Saved immediately.");
                 settingsGlassSectionEnd();
 
                 settingsGlassSectionBegin("##app_accent", "Accent colors");
-                dimText("Primary is the color a modelling operation's RESULT is drawn in \xe2\x80\x94 "
+                dimText("Primary is the color a modeling operation's result is drawn in \xe2\x80\x94 "
                         "the same role the 3D ribbon icons bake their new geometry with. Secondary "
                         "is the direction cue: arrows, axes, annotation. The ribbon retints as you "
                         "drag. Saved immediately.");
@@ -6864,7 +7003,11 @@ void drawSettingsModal(AppState& st, bool busy) {
                 settingsGlassSectionEnd();
 
                 // Configurations moved here from the left-pane strip (Graph took that slot).
-                settingsSectionHeader("Configurations");
+                // Both embedded bodies paint their own "Configurations (n)" heading, so the
+                // section gets only the section gap — a header here printed the title twice.
+                ui::kit::pushDensity(ui::kit::Density::Cozy);
+                ui::kit::gapSection();
+                ui::kit::popDensity();
                 if (st.configPanel) {
                     st.configPanel->drawEmbedded(st);
                 } else {
@@ -7390,25 +7533,60 @@ void drawSettingsModal(AppState& st, bool busy) {
                     s_lbLast = now;
                 }
 
-                settingsGlassSectionBegin("##bench_categories", "Categories");
-                drawBenchCategories(st, sc);
-                // Keep status polling alive while this tab is open.
-                pollBenchStatus(st, s_bench.running, &s_lb);
+                // The agent benchmark is the artifact_validity suite (benchmarks/
+                // artifact_validity): a CLI runner that grades the saved deliverable file of
+                // each trial. It has no in-app runner, so this card names the suite and hands
+                // over the exact command instead of an empty table.
+                settingsGlassSectionBegin("##bench_artifact", "Agent benchmark", 0.0f,
+                                          /*first=*/true);
+                static const char* kArtifactRunCmd =
+                    "python -m benchmarks.artifact_validity.runner run --tag demo "
+                    "--tasks F1,F2,F3,F4,C1,C2,C3,S1,S2,S3 --model <provider:model>";
+                if (ui::kit::emptyState(
+                        nullptr, "Artifact validity suite",
+                        "Each trial gives the agent one headless turn in a fresh workspace, "
+                        "then reopens the one file the task asks for and grades it. Tasks: "
+                        "facilities F1-F4, core C1-C3, solids S1-S3. Run it from the "
+                        "repository root with "
+                        "python -m benchmarks.artifact_validity.runner run, then "
+                        "report --tag <tag> for the scored table.",
+                        "Copy run command"))
+                    ImGui::SetClipboardText(kArtifactRunCmd);
                 settingsGlassSectionEnd();
 
-                settingsGlassSectionBegin("##bench_leaderboard", "Model Leaderboard");
-                dimText("Deterministic gym pass rates from benchmarks/leaderboard/leaderboard.json. "
-                        "MOCK badge when task_suite ends in -MOCK.");
-                if (ImGui::SmallButton("Refresh##settings_lb")) {
-                    s_lb = ui::leaderboard::load();
-                    s_lbLast = ImGui::GetTime();
-                    s_cats.lastPoll = -1e9;
-                    s_cats.loaded = false;
+                // Legacy gym leaderboard, per-tool-family categories and quick runner: kept
+                // reachable but folded away — the board is retired (often MOCK smoke data)
+                // and must not read as the current score. A legacy run in flight forces it
+                // open so its progress is never hidden.
+                static bool s_showLegacyBench = false;
+                ui::kit::checkbox("bench_show_legacy", "Show legacy results", &s_showLegacyBench,
+                                  "The retired gym leaderboard, its tool-family categories and "
+                                  "the legacy quick runner.");
+                // Keep status polling alive while this tab is open.
+                pollBenchStatus(st, s_bench.running, &s_lb);
+                if (s_showLegacyBench || s_bench.running) {
+                    pollBenchCategories(st, /*force=*/false);
+                    if (!s_cats.cats.empty()) {
+                        settingsGlassSectionBegin("##bench_categories", "Legacy categories");
+                        drawBenchCategories(st, sc);
+                        settingsGlassSectionEnd();
+                    }
+
+                    settingsGlassSectionBegin("##bench_leaderboard", "Legacy gym leaderboard");
+                    dimText("Pass rates from the retired gym suite "
+                            "(benchmarks/leaderboard/leaderboard.json). Superseded by the "
+                            "artifact validity suite above.");
+                    if (ui::kit::secondaryButton("Refresh##settings_lb")) {
+                        s_lb = ui::leaderboard::load();
+                        s_lbLast = ImGui::GetTime();
+                        s_cats.lastPoll = -1e9;
+                        s_cats.loaded = false;
+                    }
+                    ImGui::Dummy(ImVec2(0, 2 * sc));
+                    ui::leaderboard::drawCompactTable(s_lb, sc);
+                    drawBenchRunner(st, sc, s_lb, s_lbLast);
+                    settingsGlassSectionEnd();
                 }
-                ImGui::Dummy(ImVec2(0, 2 * sc));
-                ui::leaderboard::drawCompactTable(s_lb, sc);
-                drawBenchRunner(st, sc, s_lb, s_lbLast);
-                settingsGlassSectionEnd();
 
                     }
 
@@ -7428,7 +7606,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                         static std::string s_globalErr;
                         {
                             const double nowGl = ImGui::GetTime();
-                            if (!s_globalLoaded || (nowGl - s_globalLast) > 2.0) {
+                            // Never reload over unsaved edits (it clobbered them every 2 s).
+                            if (!s_globalLoaded ||
+                                (!s_globalDirty && (nowGl - s_globalLast) > 2.0)) {
                                 s_globalLast = nowGl;
                                 s_globalLoaded = true;
                                 try {
@@ -7454,56 +7634,50 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 if (s_loopGuardThreshold < 1) s_loopGuardThreshold = 1;
                             }
                         }
-                        const float gLabelW = 160.0f * sc;
-                        const float gFieldW = 90.0f * sc;
-                        auto globalFieldRow = [&](const char* label) {
-                            ImGui::AlignTextToFramePadding();
-                            ImGui::TextUnformatted(label);
-                            ImGui::SameLine(gLabelW);
-                            ImGui::SetNextItemWidth(gFieldW);
-                        };
-                        globalFieldRow("Tool timeout (s)");
-                        if (ImGui::InputInt("##global_timeout_s", &s_globalTimeout)) {
-                            if (s_globalTimeout < 0) s_globalTimeout = 0;
-                            s_globalDirty = true;
-                        }
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("0 = no timeout. Per-tool override wins.");
-                        globalFieldRow("Max calls per turn");
-                        if (ImGui::InputInt("##global_max_calls", &s_globalMaxCalls)) {
-                            if (s_globalMaxCalls < 0) s_globalMaxCalls = 0;
-                            s_globalDirty = true;
-                        }
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("0 = unlimited. Per-tool override wins.");
-                        globalFieldRow("Supervision interval");
-                        if (ImGui::InputInt("##global_supervision", &s_globalSupervision)) {
-                            if (s_globalSupervision < 0) s_globalSupervision = 0;
-                            s_globalDirty = true;
-                        }
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("Force an advisor verification pass every N tool "
-                                              "calls. 0 = never.");
-                        ImGui::AlignTextToFramePadding();
-                        ImGui::TextUnformatted("Loop guard");
-                        ImGui::SameLine(gLabelW);
-                        if (ImGui::Checkbox("##loop_guard_enabled", &s_loopGuardEnabled))
-                            s_globalDirty = true;
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("Refuse a tool call that repeats the exact same "
-                                              "tool + arguments too many times in a row instead "
-                                              "of dispatching it again (a real stuck loop, not "
-                                              "just \"used this tool a lot\").");
-                        if (s_loopGuardEnabled) {
-                            ImGui::SameLine();
-                            ImGui::SetNextItemWidth(gFieldW);
-                            if (ImGui::InputInt("##loop_guard_threshold", &s_loopGuardThreshold)) {
-                                if (s_loopGuardThreshold < 1) s_loopGuardThreshold = 1;
+                        // 0 means "off / unlimited" for these limits: shown as an empty field
+                        // with that word as the hint, never as a bare zero.
+                        auto optionalLimit = [&](const char* id, const char* label, int* v,
+                                                 const char* offHint, const char* unit,
+                                                 const char* tip) {
+                            bool on = *v > 0;
+                            int shown = on ? *v : 1;
+                            ui::kit::FieldOpts o;
+                            o.withPresent(&on).withHint(offHint).withMin(1).withTip(tip);
+                            if (unit) o.withUnit(unit);
+                            if (ui::kit::fieldInt(id, label, &shown, o)) {
+                                *v = on ? shown : 0;
                                 s_globalDirty = true;
                             }
-                            if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Consecutive identical calls before refusal "
-                                                  "(default 3).");
+                        };
+                        {
+                            ui::kit::FieldGroup limits("global_limits", "Supervision interval");
+                            optionalLimit("global_timeout_s", "Tool timeout", &s_globalTimeout,
+                                          "No timeout", ui::kit::unitText(ui::kit::Unit::s),
+                                          "Seconds before a tool call is abandoned. Empty = "
+                                          "no timeout. A per-tool override wins.");
+                            optionalLimit("global_max_calls", "Max calls per turn",
+                                          &s_globalMaxCalls, "Unlimited", nullptr,
+                                          "Calls of one tool allowed per turn. Empty = "
+                                          "unlimited. A per-tool override wins.");
+                            optionalLimit("global_supervision", "Supervision interval",
+                                          &s_globalSupervision, "Never", nullptr,
+                                          "Force an advisor verification pass every N tool "
+                                          "calls. Empty = never.");
+                            if (ui::kit::fieldCheckbox(
+                                    "loop_guard_enabled", "Loop guard", &s_loopGuardEnabled,
+                                    ui::kit::FieldOpts().withTip(
+                                        "Refuse a tool call that repeats the exact same tool + "
+                                        "arguments too many times in a row instead of "
+                                        "dispatching it again (a real stuck loop, not just "
+                                        "\"used this tool a lot\").")))
+                                s_globalDirty = true;
+                            if (s_loopGuardEnabled &&
+                                ui::kit::fieldInt("loop_guard_threshold", "Repeats before refusal",
+                                                  &s_loopGuardThreshold,
+                                                  ui::kit::FieldOpts().withMin(1).withTip(
+                                                      "Consecutive identical calls before "
+                                                      "refusal (default 3).")))
+                                s_globalDirty = true;
                         }
                         if (s_globalDirty) {
                             ImGui::Dummy(ImVec2(0, 4.0f * sc));
@@ -7869,7 +8043,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     ImGui::TableNextColumn();
                                     bool on = assigned.count(fam) > 0;
                                     ImGui::PushID(fam);
-                                    if (ImGui::Checkbox(fam, &on)) {
+                                    if (ui::kit::checkbox("fam", fam, &on)) {
                                         if (on) assigned.insert(fam);
                                         else assigned.erase(fam);
                                         s_roleToolsDirty = true;
@@ -8057,7 +8231,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     continue;
                                 ImGui::PushID(tn);
                                 bool en = s_toolEnabled.count(tn) ? s_toolEnabled[tn] : true;
-                                if (ImGui::Checkbox("##en", &en)) {
+                                if (ui::kit::checkbox("en", "", &en)) {
                                     s_toolEnabled[tn] = en;
                                     s_toolOptDirty = true;
                                 }
@@ -8081,16 +8255,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     ImGui::TextDisabled("%s", toolTooltip(tn));
                                     ImGui::PopTextWrapPos();
                                     ImGui::Separator();
-                                    ImGui::TextDisabled("0 = use built-in / global default");
-                                    const float labelW = 150.0f * sc;
-                                    const float fieldW = 90.0f * sc;
+                                    ImGui::TextDisabled("Empty = use the built-in or global "
+                                                        "default shown in the field.");
                                     const float boxW = 360.0f * sc;
-                                    auto popupFieldRow = [&](const char* label) {
-                                        ImGui::AlignTextToFramePadding();
-                                        ImGui::TextUnformatted(label);
-                                        ImGui::SameLine(labelW);
-                                        ImGui::SetNextItemWidth(fieldW);
-                                    };
                                     int to = s_toolTimeout.count(tn) ? s_toolTimeout[tn] : 0;
                                     int mc = s_toolMaxCalls.count(tn) ? s_toolMaxCalls[tn] : 0;
                                     // Built-in curated defaults (tool_guidance,
@@ -8103,35 +8270,47 @@ void drawSettingsModal(AppState& st, bool busy) {
                                         (s_liveCatOk && s_liveGuidance.contains(tn))
                                             ? s_liveGuidance[tn]
                                             : builtinGuidance(tn);
-                                    popupFieldRow("timeout_s");
-                                    if (ImGui::InputInt("##timeout_s", &to)) {
-                                        s_toolTimeout[tn] = std::max(0, to);
-                                        s_toolOptDirty = true;
-                                    }
-                                    if (to == 0) {
-                                        ImGui::SameLine();
-                                        const int curT = curated.value("timeout_s", 0);
-                                        if (curT > 0)
-                                            ImGui::TextDisabled("(default: %ds)", curT);
-                                        else if (s_globalTimeout > 0)
-                                            ImGui::TextDisabled("(global: %ds)", s_globalTimeout);
-                                        else
-                                            ImGui::TextDisabled("(global: no timeout)");
-                                    }
-                                    popupFieldRow("max_calls_per_turn");
-                                    if (ImGui::InputInt("##max_calls_per_turn", &mc)) {
-                                        s_toolMaxCalls[tn] = std::max(0, mc);
-                                        s_toolOptDirty = true;
-                                    }
-                                    if (mc == 0) {
-                                        ImGui::SameLine();
-                                        const int curM = curated.value("max_calls_per_turn", 0);
-                                        if (curM > 0)
-                                            ImGui::TextDisabled("(default: %d)", curM);
-                                        else if (s_globalMaxCalls > 0)
-                                            ImGui::TextDisabled("(global: %d)", s_globalMaxCalls);
-                                        else
-                                            ImGui::TextDisabled("(global: unlimited)");
+                                    // An unset override (0) is an empty field whose hint names
+                                    // the value it inherits, never a bare zero.
+                                    const int curT = curated.value("timeout_s", 0);
+                                    const int curM = curated.value("max_calls_per_turn", 0);
+                                    const std::string toHint =
+                                        curT > 0 ? "Default " + std::to_string(curT) + " s"
+                                        : s_globalTimeout > 0
+                                            ? "Global " + std::to_string(s_globalTimeout) + " s"
+                                            : std::string("No timeout");
+                                    const std::string mcHint =
+                                        curM > 0 ? "Default " + std::to_string(curM)
+                                        : s_globalMaxCalls > 0
+                                            ? "Global " + std::to_string(s_globalMaxCalls)
+                                            : std::string("Unlimited");
+                                    {
+                                        ui::kit::FieldGroup limits("tool_limits",
+                                                                   "Max calls per turn");
+                                        bool toSet = to > 0;
+                                        int toShown = toSet ? to : 1;
+                                        if (ui::kit::fieldInt(
+                                                "timeout_s", "Timeout", &toShown,
+                                                ui::kit::FieldOpts()
+                                                    .withPresent(&toSet)
+                                                    .withHint(toHint.c_str())
+                                                    .withMin(1)
+                                                    .withUnit(ui::kit::Unit::s))) {
+                                            s_toolTimeout[tn] = toSet ? toShown : 0;
+                                            s_toolOptDirty = true;
+                                        }
+                                        bool mcSet = mc > 0;
+                                        int mcShown = mcSet ? mc : 1;
+                                        if (ui::kit::fieldInt(
+                                                "max_calls_per_turn", "Max calls per turn",
+                                                &mcShown,
+                                                ui::kit::FieldOpts()
+                                                    .withPresent(&mcSet)
+                                                    .withHint(mcHint.c_str())
+                                                    .withMin(1))) {
+                                            s_toolMaxCalls[tn] = mcSet ? mcShown : 0;
+                                            s_toolOptDirty = true;
+                                        }
                                     }
 
                                     // AI usage parameters / included tool context
@@ -8144,21 +8323,19 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     int trimMode = s_toolSchemaTrim.count(tn)
                                                        ? s_toolSchemaTrim[tn] : -1;
                                     if (trimMode < -1 || trimMode > 1) trimMode = -1;
-                                    ImGui::AlignTextToFramePadding();
-                                    ImGui::TextUnformatted("schema_trim");
-                                    if (ImGui::IsItemHovered())
-                                        ImGui::SetTooltip(
-                                            "How much of the tool description is included in "
-                                            "the AI tools prompt. Inherit = tier default.");
-                                    ImGui::SameLine(labelW);
-                                    ImGui::SetNextItemWidth(boxW - labelW + fieldW);
                                     const char* trimLabels[] = {
                                         "Inherit tier", "Full paragraph", "First sentence"
                                     };
-                                    // Map stored -1/0/1 -> combo 0/1/2
+                                    // Map stored -1/0/1 -> items 0/1/2
                                     int trimSel = (trimMode < 0) ? 0 : (trimMode == 0 ? 1 : 2);
-                                    if (settingsPopupRowCombo("##schema_trim", &trimSel,
-                                                             trimLabels, 3)) {
+                                    if (ui::kit::fieldEnum(
+                                            "schema_trim", "Description length", &trimSel,
+                                            trimLabels, 3,
+                                            ui::kit::FieldOpts()
+                                                .withEnumStyle(ui::kit::EnumStyle::Combo)
+                                                .withTip("How much of the tool description is "
+                                                         "included in the AI tools prompt. "
+                                                         "Inherit = tier default."))) {
                                         s_toolSchemaTrim[tn] =
                                             (trimSel == 0) ? -1 : (trimSel == 1 ? 0 : 1);
                                         s_toolOptDirty = true;
@@ -8492,7 +8669,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 "nothing leaves this machine.");
                         {
                             static bool s_bugReports = loadAgentConfigBool("bug_reports", true);
-                            if (ImGui::Checkbox("Send bug reports", &s_bugReports))
+                            if (ui::kit::checkbox("bug_reports", "Send bug reports", &s_bugReports))
                                 saveAgentConfigValue("bug_reports", s_bugReports);
                             if (ImGui::IsItemHovered())
                                 ImGui::SetTooltip("Saved immediately to config.json "
@@ -8511,8 +8688,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                         dimText("Shows the system prompt a typical main-chat / general_agent "
                                 "turn would send (effective role/global override + capability "
                                 "SOFT block + harness base + catalogs + tools slot + Auto-Learn "
-                                "guidance when enabled). The coloured sample marks the user "
-                                "request slot and is not sent to a model.");
+                                "guidance when enabled), followed by an example user message "
+                                "that marks where the request goes. Nothing here is sent to a "
+                                "model.");
 
                         static std::string s_devSys;
                         static std::string s_devUser;
@@ -8557,12 +8735,27 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     s_devLoaded = true;
                                     return;
                                 }
-                                s_devSys = r.result.value("system", "");
-                                s_devUser = r.result.value("user_placeholder", "");
+                                // Fold once here, not per frame: the prompt is long and may
+                                // carry glyphs the UI font lacks.
+                                s_devSys = ui::foldToAtlasGlyphs(r.result.value("system", ""));
+                                // The worker brackets its sample request with a color-span
+                                // marker ("[[USER REQUEST - sample]] ", math brackets); the
+                                // preview shows the example request itself under its own
+                                // caption instead. Marker bytes are matched, never rendered.
+                                std::string user = r.result.value("user_placeholder", "");
+                                static const char* kMarkClose = "\xe2\x9f\xa7";  // gui-lint: allow
+                                const size_t close = user.find(kMarkClose);
+                                if (user.rfind("\xe2\x9f\xa6", 0) == 0 &&  // gui-lint: allow
+                                    close != std::string::npos) {
+                                    user.erase(0, close + std::strlen(kMarkClose));
+                                    user.erase(0, user.find_first_not_of(' '));
+                                }
+                                s_devUser = ui::foldToAtlasGlyphs(user);
                                 auto meta = r.result.value("meta", nlohmann::json::object());
                                 char buf[256];
                                 std::snprintf(buf, sizeof(buf),
-                                    "role=%s  tools~%d  chars=%d  tokens~%d  autolearn=%s",
+                                    "%s  \xc2\xb7  %d tools  \xc2\xb7  %d chars  \xc2\xb7  "
+                                    "~%d tokens  \xc2\xb7  Auto-Learn %s",
                                     meta.value("role", "general_agent").c_str(),
                                     meta.value("allowed_tool_count", 0),
                                     meta.value("system_chars", 0),
@@ -8578,7 +8771,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                             fetchDevPreview();
 
                         if (s_devFetching) ImGui::BeginDisabled();
-                        if (ImGui::Checkbox("Include tools slot", &s_includeTools)) {
+                        if (ui::kit::checkbox("dev_tools_slot", "Include tools slot", &s_includeTools)) {
                             s_devLoaded = false;
                         }
                         if (s_devFetching) ImGui::EndDisabled();
@@ -8606,7 +8799,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                             ImGui::PopStyleColor();
                         }
 
-                        // Coloured rendering: system (dim/normal) then user placeholder (accent).
+                        // System prompt (normal ink) then the example user message (accent).
                         const float prevH = ImMax(280.0f * sc,
                             ImGui::GetContentRegionAvail().y - 8.0f * sc);
                         ImGui::PushStyleColor(ImGuiCol_ChildBg,
@@ -8619,19 +8812,34 @@ void drawSettingsModal(AppState& st, bool busy) {
                         const float wrapX = ImGui::GetCursorPosX() +
                             ImGui::GetContentRegionAvail().x - 4.0f * sc;
                         ImGui::PushTextWrapPos(wrapX);
+                        // Section captions in the UI font, not mono rule lines.
+                        auto caption = [&](const char* text) {
+                            ImGui::PopFont();
+                            dimText(text);
+                            ImGui::PushFont(st.fonts.mono);
+                        };
                         if (!s_devSys.empty()) {
-                            ImGui::TextUnformatted("--- system ---");
+                            caption("System prompt");
                             ImGui::TextUnformatted(s_devSys.c_str());
-                        } else if (s_devErr.empty() && !s_devLoaded) {
-                            dimText("Loading…");
-                        }
-                        if (!s_devUser.empty()) {
-                            ImGui::Dummy(ImVec2(0, 10.0f * sc));
-                            ImGui::PushStyleColor(ImGuiCol_Text,
-                                ui::Palette::toU32(ui::palette.accent));
-                            ImGui::TextUnformatted("--- user (sample placeholder) ---");
-                            ImGui::TextWrapped("%s", s_devUser.c_str());
-                            ImGui::PopStyleColor();
+                            if (!s_devUser.empty()) {
+                                ImGui::Dummy(ImVec2(0, 10.0f * sc));
+                                caption("Example user message (not sent)");
+                                ImGui::PushStyleColor(ImGuiCol_Text,
+                                    ui::Palette::toU32(ui::palette.accent));
+                                ImGui::TextWrapped("%s", s_devUser.c_str());
+                                ImGui::PopStyleColor();
+                            }
+                        } else if (s_devFetching || (!s_devLoaded && canDev)) {
+                            caption("Assembling the prompt\xe2\x80\xa6");
+                        } else {
+                            ImGui::PopFont();
+                            ui::kit::emptyState(
+                                nullptr, "No preview yet",
+                                canDev ? "Refresh to assemble the prompt a main-chat turn "
+                                         "would send."
+                                       : "Start the engine to assemble the prompt a main-chat "
+                                         "turn would send.");
+                            ImGui::PushFont(st.fonts.mono);
                         }
                         ImGui::PopTextWrapPos();
                         ImGui::PopFont();

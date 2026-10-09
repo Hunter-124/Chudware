@@ -29,7 +29,8 @@
 #include "ui/icons.h"      // drawIconGlass — the in-field search-clear glyph
 #include "ui_theme.h"
 #include "ui/metrics.h"      // ui::metrics::U — the search input's last-resort floor
-#include "ui/widgets/kit.h"  // ui::kit::elide — the sort preview and the search hint
+#include "ui/widgets/kit.h"  // ui::kit::elide — the search hint's last-resort fit
+#include "core/async_rpc.h"  // core::RpcResult — load-failure reasons
 
 #include "parts_internal.h"
 #include "parts_widgets.h"
@@ -135,14 +136,29 @@ static std::vector<std::string> g_logoQueue;
 
 // ---- async loaders -------------------------------------------------------------
 
+// One honest sentence for a failed catalog load. The worker's raw text names internals
+// (methods, tracebacks), so the pane says WHICH side failed and the raw reason goes to the log.
+static std::string catalogFailText(AppState& st, const char* method, const core::RpcResult& r) {
+    std::string raw = r.err;
+    if (raw.empty() && r.result.is_object())
+        raw = r.result.value("reason", r.result.value("error", std::string()));
+    st.addLog(std::string("[parts] ") + method + " failed: " +
+              (raw.empty() ? std::string("no result") : raw));
+    return r.ok ? "The parts catalog could not be read."
+                : "The parts service did not respond.";
+}
+
 void loadCategories(AppState& st) {
     if (S().categoriesLoaded || S().categoriesLoading) return;
     S().categoriesLoading = true;
-    st.rpc.call("parts_list_categories", {}, [](const core::RpcResult& r) {
+    st.rpc.call("parts_list_categories", {}, [&st](const core::RpcResult& r) {
         S().categoriesLoading = false;
         S().categoriesLoaded  = true;
-        if (!r.ok || !r.result.is_object()) return;
-        if (!r.result.value("ok", false) || !r.result.contains("categories")) return;
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", false) ||
+            !r.result.contains("categories")) {
+            S().taxonomyError = catalogFailText(st, "parts_list_categories", r);
+            return;
+        }
         S().categories.clear();
         for (auto& c : r.result["categories"]) {
             Category cat;
@@ -150,6 +166,10 @@ void loadCategories(AppState& st) {
             cat.label    = c.value("label",     "");
             cat.parentId = c.value("parent_id", "");
             S().categories.push_back(std::move(cat));
+        }
+        if (!S().categories.empty()) {
+            S().taxonomyAttempts = 0;   // recovered on the flat list — stop the backoff
+            S().taxonomyError.clear();
         }
     });
 }
@@ -193,6 +213,7 @@ void loadTaxonomy(AppState& st) {
         if (!ok) {
             // Method-missing or failure → flat parts_list_categories 2-level synthesis.
             S().taxonomyIsTree = false;
+            S().taxonomyError = catalogFailText(st, "parts_taxonomy", r);
             loadCategories(st);
             return;
         }
@@ -207,6 +228,7 @@ void loadTaxonomy(AppState& st) {
         S().taxonomyRoot    = std::move(root);
         S().taxonomyIsTree  = true;
         S().taxonomyAttempts = 0;   // recovered — stop the backoff
+        S().taxonomyError.clear();
     });
 }
 
@@ -218,7 +240,12 @@ void loadVendors(AppState& st, bool force) {
         S().vendorsLoading = false;
         S().vendorsLoaded  = true;
         S().lastVendorPoll = ImGui::GetTime();
-        if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) return;
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+            S().vendorsError = r.ok ? "Vendor status could not be read."
+                                    : "The parts service did not respond.";
+            return;
+        }
+        S().vendorsError.clear();
 
         std::vector<VendorEntry> vs;
         if (r.result.contains("sources"))
@@ -1101,6 +1128,18 @@ void saveApiCreds(AppState& st, ApiProvider& a) {
 
 // ---- public entry point -------------------------------------------------------
 
+bool partsLibrarySettled(const AppState& st) {
+    using namespace parts;
+    if (!st.workerStarted) return true;   // the unavailable empty state is final
+    const bool catsSettled =
+        !S().firstFrame && S().taxonomyLoaded && !S().taxonomyLoading &&
+        !S().categoriesLoading && S().taxonomyRetryAt == 0.0 &&
+        (S().taxonomyIsTree || !S().categories.empty() ||
+         S().taxonomyAttempts >= kTaxonomyMaxAttempts);
+    const bool vendorsSettled = S().vendorsLoaded && !S().vendorsLoading;
+    return catsSettled && vendorsSettled;
+}
+
 void drawPartsLibraryWorkspace(AppState& st) {
     using namespace parts;
     const float sc = ui::uiScale;
@@ -1159,6 +1198,7 @@ void drawPartsLibraryWorkspace(AppState& st) {
         if (S().taxonomyLoading && now - S().taxonomyStartedAt > 130.0) {
             S().taxonomyLoading = false;
             S().taxonomyLoaded  = true;
+            S().taxonomyError   = "The parts service did not respond.";
             st.addLog("[parts] parts_taxonomy produced no result — treating as failed");
         }
         if (st.workerStarted && !haveData && !S().taxonomyLoading &&
@@ -1289,8 +1329,11 @@ void drawPartsLibraryWorkspace(AppState& st) {
         // per-category hues belong to the panes, not to the toolbar.
         const float barTint[3] = {palette.accent[0], palette.accent[1], palette.accent[2]};
 
+        // Short labels on purpose: the combo is sized to the WIDEST of them and shares a row
+        // with the search field in a ~430 px results column, so "Price: high to low" cost the
+        // field its readable width. Index order is persisted (settings.partsSortMode).
         static const char* kSortItems[] = {
-            "Relevance", "Price: low to high", "Price: high to low", "Name"};
+            "Relevance", "Lowest price", "Highest price", "Name"};
         const float fpX     = ImGui::GetStyle().FramePadding.x;
         const float frameH  = ImGui::GetFrameHeight();
         const float gapW    = ImGui::GetStyle().ItemSpacing.x;
@@ -1302,23 +1345,15 @@ void drawPartsLibraryWorkspace(AppState& st) {
             sortFullW = std::max(sortFullW, ImGui::CalcTextSize(it).x);
         sortFullW += fpX * 2.0f + frameH;
 
-        // Row budget, MEASURED from the widgets that actually share the line. The input is
-        // the row's reason to exist, so it is served first: it keeps a readable minimum and
-        // the sort combo pays for it — full width, then an ellipsized preview, then just its
-        // arrow (the active sort moves into its tooltip). The old fixed-width combo let the input
-        // collapse to "search f" at 1.5x and pushed the view switch off the row entirely.
-        // Search and the view switch stay whole: each is one click the row cannot lose.
-        const float inputMin = 170.0f * sc;
+        // Row budget, MEASURED from the widgets that actually share the line. The sort combo
+        // is either whole — sized to its widest label, so no option is ever cut to "Releva…"
+        // — or, when that would squeeze the input below a readable minimum, just its arrow
+        // with the active sort named in its tooltip. The input takes everything else. Search
+        // and the view switch stay whole: each is one click the row cannot lose.
+        const float inputMin = 120.0f * sc;
         const float room = ImGui::GetContentRegionAvail().x -
                            (gapW * 3.0f + searchW + segW * 2.0f);
-        // Narrowest preview still worth a frame: a couple of glyphs + the ellipsis.
-        const float sortPreviewMinW =
-            fpX * 2.0f + frameH + ImGui::CalcTextSize("Rel\xe2\x80\xa6").x;
-        float sortW = sortFullW;
-        if (room - sortFullW < inputMin) {
-            sortW = room - inputMin;
-            if (sortW < sortPreviewMinW) sortW = frameH;   // arrow only
-        }
+        const float sortW = room - sortFullW >= inputMin ? sortFullW : frameH;
         const bool  sortArrowOnly = sortW <= frameH;
         const float inputW = std::max(ui::metrics::U(4), room - sortW);
 
@@ -1346,20 +1381,29 @@ void drawPartsLibraryWorkspace(AppState& st) {
         parts::glassFieldBegin();
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(26.0f * sc, 5 * sc));
         ImGui::SetNextItemWidth(inputW);
-        // ImGui hard-clips a hint at the frame edge ("…electronics, ve"); hand it one that is
-        // already ellipsized to the text room between the magnifier inset and the frame's
-        // right padding. Re-elided only when that room (or the font) changes.
-        static constexpr const char* kSearchHint =
-            "search fasteners, bearings, sections, electronics, vendors\xe2\x80\xa6";
+        // ImGui hard-clips a hint at the frame edge ("…electronics, ve"), and an ellipsized
+        // one still reads as cut ("search fasteners, …"). Pick the longest WHOLE phrasing that
+        // fits the text room between the magnifier inset and the frame's right padding; only
+        // the last resort is elided. Re-chosen only when that room (or the font) changes.
+        static constexpr const char* kSearchHints[] = {
+            "search fasteners, bearings, sections, electronics, vendors\xe2\x80\xa6",
+            "search fasteners, bearings, electronics\xe2\x80\xa6",
+            "search parts and vendors\xe2\x80\xa6",
+            "search parts\xe2\x80\xa6",
+            "search",
+        };
         static std::string hintShown;
         static float       hintRoom = -1.0f, hintFont = -1.0f;
         const float room4Hint = inputW - 26.0f * sc - fpX;
         if (room4Hint != hintRoom || ImGui::GetFontSize() != hintFont) {
             hintRoom = room4Hint;
             hintFont = ImGui::GetFontSize();
-            hintShown = ImGui::CalcTextSize(kSearchHint).x <= room4Hint
-                            ? std::string(kSearchHint)
-                            : ui::kit::elide(kSearchHint, std::max(1.0f, room4Hint));
+            hintShown.clear();
+            for (const char* h : kSearchHints)
+                if (ImGui::CalcTextSize(h).x <= room4Hint) { hintShown = h; break; }
+            if (hintShown.empty())
+                hintShown = ui::kit::elide(kSearchHints[IM_ARRAYSIZE(kSearchHints) - 1],
+                                           std::max(1.0f, room4Hint));
         }
         bool hit = ImGui::InputTextWithHint("##parts_q", hintShown.c_str(),
                                             S().searchBuf, sizeof(S().searchBuf),
@@ -1410,24 +1454,17 @@ void drawPartsLibraryWorkspace(AppState& st) {
                         Palette::toU32(palette.text), "Search");
         }
         ImGui::SameLine();
-        // BeginCombo, not Combo: the preview is ELLIPSIZED to whatever width the budget
-        // above granted (Combo hard-clips it), and at the arrow-only floor the combo drops
-        // its preview entirely and names the active sort in its tooltip instead.
+        // Full width (widest label) or arrow-only — never an elided preview. At the arrow-only
+        // floor the combo drops its preview and names the active sort in its tooltip instead.
         const char* sortLabel = kSortItems[std::clamp(S().sortMode, 0,
                                                       (int)IM_ARRAYSIZE(kSortItems) - 1)];
-        std::string sortPreview;
-        if (!sortArrowOnly) {
-            const float previewRoom = sortW - fpX * 2.0f - frameH;
-            if (ImGui::CalcTextSize(sortLabel).x > previewRoom)
-                sortPreview = ui::kit::elide(sortLabel, std::max(1.0f, previewRoom));
-        }
         ImGui::SetNextItemWidth(sortW);
         parts::glassFieldBegin();
         const bool sortOpen = ImGui::BeginCombo(
-            "##sort", sortPreview.empty() ? sortLabel : sortPreview.c_str(),
+            "##sort", sortLabel,
             sortArrowOnly ? ImGuiComboFlags_NoPreview : ImGuiComboFlags_None);
         parts::glassFieldEnd(barTint);
-        if ((sortArrowOnly || !sortPreview.empty()) && !sortOpen && ImGui::IsItemHovered())
+        if (sortArrowOnly && !sortOpen && ImGui::IsItemHovered())
             ImGui::SetTooltip("Sort: %s", sortLabel);
         bool sortChanged = false;
         if (sortOpen) {

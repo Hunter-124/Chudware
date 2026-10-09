@@ -16,6 +16,7 @@
 #include "icons.h"
 #include "layout.h"             // setNextCommandDialogPlacement (floating dialog anchor)
 #include "metrics.h"
+#include "widgets/kit.h"        // kit::iconButton (row delete action)
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
@@ -200,10 +201,11 @@ void drawEquationsDialog(AppState& st) {
                         ImGui::TableNextRow();
                         ImGui::PushID(name.c_str());
 
-                        // col 0: name (with the SolidWorks "name" quoting for readability)
+                        // col 0: name (plain text — the quotes are equation syntax, not a label)
                         ImGui::TableSetColumnIndex(0);
+                        ImGui::AlignTextToFramePadding();
                         ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-                        ImGui::TextUnformatted(("\"" + name + "\"").c_str());
+                        ImGui::TextUnformatted(name.c_str());
                         ImGui::PopStyleColor();
 
                         // col 1: editable expr — commit on Enter
@@ -218,10 +220,9 @@ void drawEquationsDialog(AppState& st) {
 
                         // col 2: delete
                         ImGui::TableSetColumnIndex(2);
-                        if (ImGui::Button("X", ImVec2(ui::metrics::pmOkBtn(), 0)))
+                        const std::string delTip = "Delete " + name;
+                        if (kit::iconButton("del", "delete", delTip.c_str()))
                             pendingDeleteName = name;
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("Delete \"%s\"", name.c_str());
 
                         ImGui::PopID();
                     }

@@ -1,5 +1,6 @@
 #include "agent_dag.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <ctime>
 #include <deque>
@@ -1056,6 +1057,71 @@ static std::string agentDisplayStatus(const Agent& a, bool convRunning, bool fro
     return a.status.empty() ? std::string("idle") : a.status;
 }
 
+// End of an agent's elapsed span for display. A running agent counts to now. A finished one uses
+// its recorded endTs; an interrupted agent never received one (its stream died mid-run), so its
+// span ends at the last thing it did — never at "now", which grew a stopped run to days.
+// Returns 0 when nothing is known, so callers omit the elapsed figure.
+static double agentEndTs(const Agent& a, const std::string& displayStatus) {
+    if (displayStatus == "running") return chatNowEpoch();
+    if (a.endTs > 0.0) return a.endTs;
+    double last = 0.0;
+    for (const Step& s : a.steps) {
+        if (s.ts <= 0.0) continue;
+        last = std::max(last, s.ts + (s.durationMs > 0 ? s.durationMs / 1000.0 : 0.0));
+    }
+    return last;
+}
+
+// Tool reasons and argument previews arrive as prose with a JSON object appended
+// ('Collecting cancelled convergence status {"job_id":"jo…'), often cut mid-object. A step row
+// must read as text, so every flat "key": value pair becomes "key value" (underscores spaced),
+// joined with middots after the prose. Nested objects/arrays contribute their own flat pairs.
+// Text without a '{' is returned unchanged.
+static std::string humanizeInlineJson(const std::string& in) {
+    const size_t brace = in.find('{');
+    if (brace == std::string::npos) return in;
+    std::string out = in.substr(0, brace);
+    while (!out.empty() && (out.back() == ' ' || out.back() == ':' || out.back() == '-'))
+        out.pop_back();
+    const size_t n = in.size();
+    size_t i = brace;
+    int pairs = 0;
+    while (i < n && pairs < 4) {
+        const size_t kq = in.find('"', i);
+        if (kq == std::string::npos) break;
+        const size_t ke = in.find('"', kq + 1);
+        if (ke == std::string::npos) break;
+        size_t c = ke + 1;
+        while (c < n && in[c] == ' ') ++c;
+        if (c >= n || in[c] != ':') { i = ke + 1; continue; }
+        ++c;
+        while (c < n && in[c] == ' ') ++c;
+        std::string val;
+        if (c < n && in[c] == '"') {
+            size_t ve = c + 1;
+            while (ve < n && in[ve] != '"') ve += (in[ve] == '\\' && ve + 1 < n) ? 2 : 1;
+            val = in.substr(c + 1, std::min(ve, n) - c - 1);
+            i = ve + 1;
+        } else if (c < n && (in[c] == '{' || in[c] == '[')) {
+            i = c + 1;   // descend: the nested object's own pairs follow
+            continue;
+        } else {
+            size_t ve = c;
+            while (ve < n && in[ve] != ',' && in[ve] != '}' && in[ve] != ']') ++ve;
+            val = in.substr(c, ve - c);
+            while (!val.empty() && val.back() == ' ') val.pop_back();
+            i = ve;
+        }
+        std::string key = in.substr(kq + 1, ke - kq - 1);
+        for (char& ch : key) if (ch == '_') ch = ' ';
+        if (key.empty() || val.empty()) continue;
+        if (!out.empty()) out += " \xC2\xB7 ";
+        out += key + " " + val;
+        ++pairs;
+    }
+    return out.empty() ? in : out;
+}
+
 static AgentTraceStep stepView(const std::string& convId, const Agent& a, const Step& s) {
     AgentTraceStep v;
     v.uid = s.uid;
@@ -1066,7 +1132,7 @@ static AgentTraceStep stepView(const std::string& convId, const Agent& a, const 
     v.title = s.title;
     if (v.title.empty() && (s.kind == StepKind::Thinking || s.kind == StepKind::Reply))
         v.title = oneLine(s.detail, 120);
-    v.target = s.target;
+    v.target = humanizeInlineJson(s.target);   // full arguments stay raw under "Arguments"
     v.detail = foldToAtlasGlyphs(s.detail);
     v.error = foldToAtlasGlyphs(s.error);
     v.status = s.status;
@@ -1124,10 +1190,10 @@ static void drawAgentRow(AppState& st, TraceStore& t, int ai, int depth, bool co
                      agentGlyph(status), surf);
     x += lineH + gap;
 
-    const double now = chatNowEpoch();
-    const double end = (status == "running" || a.endTs <= 0.0) ? now : a.endTs;
+    const double end = agentEndTs(a, status);
     std::string meta;
-    if (a.startTs > 0.0) meta += "  \xE2\x80\xA2  " + compactElapsed(end - a.startTs);
+    if (a.startTs > 0.0 && end >= a.startTs)
+        meta += "  \xE2\x80\xA2  " + compactElapsed(end - a.startTs);
     meta += "  \xE2\x80\xA2  " + std::to_string(a.toolCount) +
             (a.toolCount == 1 ? " tool" : " tools");
     std::string failTxt;
@@ -1229,9 +1295,9 @@ static void drawStepRow(AppState& st, const std::string& convId, const Agent& a,
         if (s.open) second += " \xC2\xB7 streaming";
         if (s.kind == StepKind::User || s.kind == StepKind::Steer) second = "You \xC2\xB7 " + second;
     } else if (!s.target.empty()) {
-        second = s.target;
+        second = humanizeInlineJson(oneLine(s.target));
     } else if (!s.detail.empty()) {
-        second = oneLine(s.detail);
+        second = humanizeInlineJson(oneLine(s.detail));
     } else if (s.status == "running") {
         second = "in progress";
     }
@@ -1330,6 +1396,14 @@ void drawAgentTrace(AppState& st, const std::string& convId, AgentTraceSelectAge
             }
         }
         clip.End();
+        // Tail pad so the bottom-pinned scroll (chatLogStickToBottom clamps to ScrollMax) is a
+        // whole number of rows: ScrollMax = rows + tail + 2*padY - viewH, so tail =
+        // (viewH - 2*padY) mod pitch puts the top visible row flush under the header instead of
+        // half-cut. Only while the list actually scrolls; a list that fits needs no tail.
+        const float pitch = stepH + spacingY;
+        const float padY = ImGui::GetStyle().WindowPadding.y;
+        if (count * pitch - spacingY + padY * 2.0f > ws.y)
+            ImGui::Dummy(ImVec2(1.0f, std::fmod(std::max(ws.y - padY * 2.0f, 0.0f), pitch)));
     }
     chatLogStickToBottom(kTimelineRegion);
     drawWindowPillScrollbarV(surf);
@@ -1375,14 +1449,14 @@ void agentTraceSubagents(AppState& st, const std::string& convId,
         v.note = a.note;
         v.status = agentDisplayStatus(a, convRunning, fromTranscript);
         v.startTs = a.startTs;
-        v.endTs = a.endTs;
+        v.endTs = v.status == "running" ? a.endTs : agentEndTs(a, v.status);
         v.toolCount = a.toolCount;
         v.failCount = a.failCount;
         v.depth = std::max(1, entry.second);
         if (!a.steps.empty()) {
             const Step& s = a.steps.back();
             std::string title = s.title;
-            if (title.empty()) title = oneLine(s.detail, 120);
+            if (title.empty()) title = humanizeInlineJson(oneLine(s.detail, 120));
             v.lastStep = s.kind == StepKind::Tool ? std::string("Tool call") : kindLabel(s.kind);
             if (!title.empty()) v.lastStep += " \xC2\xB7 " + title;
             v.lastStepTs = s.ts;

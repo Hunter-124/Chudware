@@ -2007,14 +2007,33 @@ void wellField(EditCtx &c, const std::string &pointer, const char *help) {
   int removeAt = -1;
   if (n) {
     kit::chipFlowBegin("chips");
+    // Chips name the model face itself ("Face 6", as the status bar does), not the list
+    // position; the body is added only when this well spans more than one body.
+    std::uint32_t firstBody = 0;
+    bool multiBody = false;
+    for (std::size_t k = 0; k < n; ++k) {
+      std::uint32_t b = 0, t = 0;
+      if (!pickOf((*faces)[k], b, t))
+        continue;
+      if (firstBody == 0)
+        firstBody = b;
+      else if (b != firstBody)
+        multiBody = true;
+    }
     for (std::size_t k = 0; k < n; ++k) {
       ImGui::PushID(static_cast<int>(k));
       const json &sel = (*faces)[k];
       const bool pointSet = sel.is_object() && sel.contains("points");
       std::uint32_t body = 0, topo = 0;
       const bool picked = pickOf(sel, body, topo);
-      const std::string text =
-          (pointSet ? "Point set " : "Face ") + std::to_string(k + 1);
+      std::string text;
+      if (pointSet)
+        text = "Point set " + std::to_string(k + 1);
+      else if (picked)
+        text = "Face " + std::to_string(topo) +
+               (multiBody ? " of Body " + std::to_string(body) : std::string());
+      else
+        text = "Face selector " + std::to_string(k + 1);
       bool hovered = false;
       if (kit::removableChip("face", text.c_str(),
                              pointSet ? "Remove this point set."

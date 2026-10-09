@@ -311,6 +311,31 @@ std::string emWaveguideDims(int stdIdx, int shape, double a, double b, double r)
   }
   return kit::fmtValue(a) + " \xc3\x97 " + kit::fmtQuantity(b, mmU);
 }
+
+// Frequency drag aid on a LOG scale: EM ranges span 0.01-300 GHz, so a linear
+// track pins every practical value (1-40 GHz) against the left end. The value
+// moves live while dragging (same contract as kit::fieldSlider); returns true
+// when the value changed this frame. Typed entry stays on the numeric fields.
+bool emLogSlider(const char *id, const char *label, double *v, double lo,
+                 double hi, const kit::FieldOpts &options) {
+  lo = std::max(lo, 1e-6);
+  hi = std::max(hi, lo * 1.0001);
+  const float width = kit::fieldBegin(id, label, options);
+  ImGui::SetNextItemWidth(width);
+  const double before = *v;
+  double value = std::clamp(*v, lo, hi);
+  ImGui::SliderScalar("##log", ImGuiDataType_Double, &value, &lo, &hi, "%.4g",
+                      ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp |
+                          ImGuiSliderFlags_NoInput);
+  ImGuiContext &g = *GImGui;  // IMGUI_TEST_ENGINE_ITEM_INFO expands against a local `g`
+  (void)g;
+  IMGUI_TEST_ENGINE_ITEM_INFO(g.LastItemData.ID, label, g.LastItemData.StatusFlags);
+  kit::fieldEnd();
+  if (value == std::clamp(before, lo, hi))
+    return false;
+  *v = value;
+  return true;
+}
 } // namespace
 
 void SimManager::openEmForm(AppState &st, EmForm f) {
@@ -598,19 +623,20 @@ bool SimManager::configureEmParameters(const nlohmann::json &params,
 void SimManager::drawEmParameterEditor() {
   const int fi = static_cast<int>(emForm_);
   const bool expanded = kit::cardBegin(
-      "native_parameters", "Advanced (native parameters)", "study_em",
+      "native_parameters", "Advanced parameters", "study_em",
       &em_.parameterEditorOpen);
-  kit::itemTooltip("Optional exact solver settings. Typed controls above are "
-                   "the normal setup path. Apply validates and updates those "
-                   "controls atomically; Load current parameters reverts the draft.");
+  kit::itemTooltip("Optional solver settings as JSON. The controls above are the "
+                   "normal way to set up a run.");
   if (expanded) {
-    kit::dimText("Edit the native request. Apply validates supported keys "
-                 "atomically and updates the same numeric controls used by Run.");
-    kit::dimText("Walls and matched ports are fixed by the native adapters; "
-                 "arbitrary boundary/port JSON is not supported.");
-    kit::dimText("Unrecognized top-level keys are retained in setup but not sent "
-                 "to the solver. Unknown waveguide/geometry keys are refused, not discarded.");
-    kit::dimText("Optional native controls: fields (eigenmode); t_max_ns "
+    kit::dimText("The full solver request as JSON. Apply checks every setting first "
+                 "and only then updates the controls above; if anything is invalid, "
+                 "nothing changes.");
+    kit::dimText("Walls and matched ports are set by the solver and cannot be "
+                 "edited here.");
+    kit::dimText("Unrecognized top-level settings are saved with the setup but not "
+                 "sent to the solver. Unknown waveguide or geometry settings are "
+                 "rejected.");
+    kit::dimText("Extra settings you can add: fields (eigenmode); t_max_ns "
                  "(analytic time domain); cells_per_wavelength, max_timesteps, "
                  "end_criteria, geometry.priority (openEMS). Time-domain openEMS "
                  "also accepts f_start_ghz, f_stop_ghz and n_freq for spectrum sampling.");
@@ -624,7 +650,7 @@ void SimManager::drawEmParameterEditor() {
     }
     kit::fieldText("request", "Request JSON", &em_.parameterDraft[fi],
                    kit::FieldOpts().withLines(12));
-    if (kit::secondaryButton("Apply native parameters###apply")) {
+    if (kit::secondaryButton("Apply parameters###apply")) {
       auto request = nlohmann::json::parse(em_.parameterDraft[fi], nullptr, false);
       if (request.is_discarded())
         em_.parameterError[fi] = "Invalid JSON; the existing setup is unchanged.";
@@ -1115,7 +1141,7 @@ void SimManager::drawEmForm(AppState &st) {
       changed = true;
     }
     if (!em_.exactMode.empty())
-      kit::fieldReadout("exact_mode", "Native mode", em_.exactMode.c_str());
+      kit::fieldReadout("exact_mode", "Solver mode name", em_.exactMode.c_str());
     if (driven) {
       land(kEmFocusRange, anTop);
       changed |= kit::fieldNumber("f0", "Start frequency", &em_.fStartGhz,
@@ -1135,7 +1161,8 @@ void SimManager::drawEmForm(AppState &st) {
                            "Center of the Gaussian-modulated pulse."));
       changed |= kit::fieldNumber("bw", "Bandwidth", &em_.bwGhz,
                        kit::FieldOpts(ghz).withTip(
-                           "Native Gaussian bandwidth parameter bw_ghz; not a full-width measure."));
+                           "Gaussian bandwidth parameter (bw_ghz), not the full width "
+                           "of the spectrum."));
     }
     if (driven && std::isfinite(em_.fStartGhz) && std::isfinite(em_.fStopGhz) &&
         std::isfinite(em_.fStartGhz + em_.fStopGhz) &&
@@ -1145,17 +1172,17 @@ void SimManager::drawEmForm(AppState &st) {
       const double oldCenter = center;
       const double oldSpan = span;
       const double half = span * 0.5;
-      kit::fieldSlider("center_drag", "Sweep center", &center,
-                        std::min(center, half + 0.001), std::max(300.0, center + half),
-                        kit::FieldOpts().withUnit(kit::Unit::GHz));
+      emLogSlider("center_drag", "Sweep center", &center,
+                  std::min(center, half + 0.001), std::max(300.0, center + half),
+                  kit::FieldOpts().withUnit(kit::Unit::GHz));
       if (center != oldCenter) {
         em_.fStartGhz = center - half;
         em_.fStopGhz = center + half;
         changed = true;
       }
-      kit::fieldSlider("span_drag", "Sweep span", &span, std::min(span, 0.001),
-                        std::max(span, 2.0 * (center - 0.0001)),
-                        kit::FieldOpts().withUnit(kit::Unit::GHz));
+      emLogSlider("span_drag", "Sweep span", &span, std::min(span, 0.001),
+                  std::max(span, 2.0 * (center - 0.0001)),
+                  kit::FieldOpts().withUnit(kit::Unit::GHz));
       if (span != oldSpan) {
         em_.fStartGhz = center - span * 0.5;
         em_.fStopGhz = center + span * 0.5;
@@ -1166,12 +1193,12 @@ void SimManager::drawEmForm(AppState &st) {
                            std::max(1, em_.nFreq - 1),
                            kit::unitText(kit::Unit::GHz)).c_str());
     } else if (!driven) {
-      changed |= kit::fieldSlider("pulse_center_drag", "Adjust pulse center",
-                                  &em_.f0Ghz, std::min(0.01, em_.f0Ghz), std::max(300.0, em_.f0Ghz),
-                                  kit::FieldOpts().withUnit(kit::Unit::GHz));
-      changed |= kit::fieldSlider("pulse_bandwidth_drag", "Adjust bandwidth",
-                                  &em_.bwGhz, std::min(0.01, em_.bwGhz), std::max(300.0, em_.bwGhz),
-                                  kit::FieldOpts().withUnit(kit::Unit::GHz));
+      changed |= emLogSlider("pulse_center_drag", "Adjust pulse center",
+                             &em_.f0Ghz, std::min(0.01, em_.f0Ghz), std::max(300.0, em_.f0Ghz),
+                             kit::FieldOpts().withUnit(kit::Unit::GHz));
+      changed |= emLogSlider("pulse_bandwidth_drag", "Adjust bandwidth",
+                             &em_.bwGhz, std::min(0.01, em_.bwGhz), std::max(300.0, em_.bwGhz),
+                             kit::FieldOpts().withUnit(kit::Unit::GHz));
     }
     bool browse = false;
     ImGui::BeginGroup(); // Target the complete path field, not only Browse.
@@ -1553,9 +1580,9 @@ void SimManager::drawEmPanel(AppState &st) {
                         backend.empty() ? "Not reported" : human.c_str(),
                         kit::FieldOpts().withTip(backend.c_str()));
       if (raw.contains("solver_fallback"))
-        kit::inlineStatus("The worker reported fallback; inspect the native response.",
+        kit::inlineStatus("The solver reported a fallback; copy the result JSON for details.",
                            kit::Tone::Warn);
-      if (kit::secondaryButton("Copy native result JSON###copy_native_result"))
+      if (kit::secondaryButton("Copy result JSON###copy_native_result"))
         ImGui::SetClipboardText(raw.dump(2).c_str());
     }
     kit::cardEnd();

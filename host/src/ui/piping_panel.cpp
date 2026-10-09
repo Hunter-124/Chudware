@@ -21,6 +21,7 @@
 #include "engine_backend.h"  // engine::daemonMode — server-owned export paths
 #include "file_dialog.h"
 #include "legend.h"
+#include "sim_manager.h"   // SimManager::unitSys — the Simulation pane's display unit system
 #include "viewport_panel.h"
 #include "widgets/kit.h"
 #include "sim/sim_interaction.h"
@@ -33,11 +34,11 @@ namespace {
 
 using json = nlohmann::json;
 
-// Display units (one system per quantity, everywhere in this panel): pipe lengths, coordinates,
-// wall thicknesses and spool lengths in mm (the network's MMGS units — route, run rows, BOM
-// totals, line list and spools all agree); support spans in m (as the span tables give them);
-// pressures in kPa (gauge), flows in m³/h. Duct systems are their own records in HVAC units
-// (m, m³/s, Pa).
+// Display units (one unit per quantity, everywhere in this panel). The engine and every stored
+// member stay SI: pipe lengths, coordinates and walls in mm (the network's MMGS units), support
+// spans in m, pressures in kPa gauge, flows in m³/h; duct systems in HVAC units (m, m³/s, Pa).
+// The DISPLAY and INPUT unit of each quantity follow the Simulation pane's unit system
+// (PipingPanel::syncUnits): SI shows those native units, US customary converts exactly (Q below).
 
 // aicad.piping/1 SCHEDULES / MATERIALS members offered by the router form (contracts/piping_schema.md).
 const char* const kSchedules[] = {"40", "80", "10", "160", "STD", "XS", "XXS", "5S", "10S", "40S", "80S",
@@ -135,6 +136,89 @@ std::string qty(const json& o, const char* k, const char* unit, int sig = 4) {
 }
 const char* U(kit::Unit u) { return kit::unitText(u); }
 
+// One display quantity: its SI (stored) unit and its US customary unit with the exact factor
+// (display = stored * scale + offset). Lengths/coordinates mm -> in; spans and heads m -> ft;
+// pressures kPa -> psi; small pipe pressure drops Pa -> psi; duct pressures Pa -> in. w.g.
+// (conventional inch of water, 249.08891 Pa); flows m³/h -> US gpm; airflow m³/s -> cfm.
+enum class Q {
+    Len, Span, Head, Press, PressPa, DuctPa, Friction, Temp, Flow, Airflow, Vel, DuctVel,
+    Dens, Visc, Mass, MassFlow, Vol, Area, LineMass
+};
+struct Disp { const char* unit; double scale; double offset; };
+Disp disp(Q q, bool us) {
+    using kit::Unit;
+    constexpr double kPsiKpa = 6.894757293168;          // kPa per psi
+    constexpr double kFt = 0.3048;                      // m per ft
+    constexpr double kLb = 0.45359237;                  // kg per lb
+    constexpr double kGal = 3.785411784e-3;             // m³ per US gal
+    constexpr double kInWg = 249.08891;                 // Pa per inch of water
+    switch (q) {
+        case Q::Len: return us ? Disp{U(Unit::in), 1.0 / 25.4, 0} : Disp{U(Unit::mm), 1, 0};
+        case Q::Span:
+        case Q::Head: return us ? Disp{U(Unit::ft), 1.0 / kFt, 0} : Disp{U(Unit::m), 1, 0};
+        case Q::Press: return us ? Disp{U(Unit::psi), 1.0 / kPsiKpa, 0} : Disp{U(Unit::kPa), 1, 0};
+        case Q::PressPa: return us ? Disp{U(Unit::psi), 1.0 / (kPsiKpa * 1000.0), 0} : Disp{U(Unit::Pa), 1, 0};
+        case Q::DuctPa: return us ? Disp{"in. w.g.", 1.0 / kInWg, 0} : Disp{U(Unit::Pa), 1, 0};
+        case Q::Friction: return us ? Disp{"in. w.g./100 ft", 100.0 * kFt / kInWg, 0} : Disp{"Pa/m", 1, 0};
+        case Q::Temp: return us ? Disp{U(Unit::DegF), 1.8, 32.0} : Disp{U(Unit::DegC), 1, 0};
+        case Q::Flow: return us ? Disp{U(Unit::gpm), 1.0 / (3600.0 * kGal / 60.0), 0} : Disp{U(Unit::m3_h), 1, 0};
+        case Q::Airflow: return us ? Disp{"cfm", 60.0 / (kFt * kFt * kFt), 0} : Disp{U(Unit::m3_s), 1, 0};
+        case Q::Vel: return us ? Disp{"ft/s", 1.0 / kFt, 0} : Disp{U(Unit::m_s), 1, 0};
+        case Q::DuctVel: return us ? Disp{"fpm", 60.0 / kFt, 0} : Disp{U(Unit::m_s), 1, 0};
+        case Q::Dens: return us ? Disp{"lb/ft\xc2\xb3", kFt * kFt * kFt / kLb, 0} : Disp{U(Unit::kg_m3), 1, 0};
+        // US practice quotes dynamic viscosity in centipoise (1 cP = 1 mPa·s).
+        case Q::Visc: return us ? Disp{"cP", 1000.0, 0} : Disp{U(Unit::Pa_s), 1, 0};
+        case Q::Mass: return us ? Disp{U(Unit::lb), 1.0 / kLb, 0} : Disp{U(Unit::kg), 1, 0};
+        case Q::MassFlow: return us ? Disp{"lb/h", 1.0 / kLb, 0} : Disp{"kg/h", 1, 0};
+        case Q::Vol: return us ? Disp{"gal", 1.0 / kGal, 0} : Disp{U(Unit::m3), 1, 0};
+        case Q::Area: return us ? Disp{U(Unit::in2), 1.0 / 645.16, 0} : Disp{U(Unit::mm2), 1, 0};
+        case Q::LineMass: return us ? Disp{"lb/ft", kFt / kLb, 0} : Disp{"kg/m", 1, 0};
+    }
+    return {"", 1, 0};
+}
+double toDisp(double si, Q q, bool us) {
+    const Disp d = disp(q, us);
+    return si * d.scale + d.offset;
+}
+const char* unitOf(Q q, bool us) { return disp(q, us).unit; }
+// A stored SI value as display text with its unit.
+std::string fmtQ(double si, Q q, bool us, int sig = 4) { return kit::fmtQuantity(toDisp(si, q, us), unitOf(q, us), sig); }
+// Numeric member `k` (stored SI) as display text with its unit (em dash when absent).
+std::string qtyQ(const json& o, const char* k, Q q, bool us, int sig = 4) {
+    return jhas(o, k) ? fmtQ(jnum(o, k), q, us, sig) : std::string(kEmDash);
+}
+// The number alone (table cells under a "Title (unit)" header).
+std::string valQ(const json& o, const char* k, Q q, bool us, int sig = 4) {
+    return jhas(o, k) ? kit::fmtValue(toDisp(jnum(o, k), q, us), sig) : std::string(kEmDash);
+}
+// "Title (unit)" table header.
+std::string colQ(const char* title, Q q, bool us) { return std::string(title) + " (" + unitOf(q, us) + ")"; }
+// Field options that edit a stored SI value in the display unit.
+kit::FieldOpts fieldQ(Q q, bool us) {
+    const Disp d = disp(q, us);
+    return kit::FieldOpts().withUnit(d.unit).withScale(d.scale, d.offset);
+}
+// Placeholder text of an SI default, in the display unit.
+std::string hintQ(double si, Q q, bool us) { return kit::fmtValue(toDisp(si, q, us), 3); }
+
+// "NPS 2", "NPS 1-1/2", "NPS 3/4": the nominal pipe size as its standard designator, the same
+// spelling on every form (NPS is a size designator, not a measured inch dimension).
+std::string npsText(double nps) {
+    if (!(nps > 0.0)) return "NPS " + std::string(kEmDash);
+    static const struct { double v; const char* t; } kFrac[] = {
+        {0.125, "1/8"}, {0.25, "1/4"}, {0.375, "3/8"}, {0.5, "1/2"}, {0.75, "3/4"}};
+    const double whole = std::floor(nps + 1e-9);
+    const double frac = nps - whole;
+    if (frac < 1e-6) return "NPS " + std::to_string((long long)whole);
+    for (const auto& f : kFrac)
+        if (std::fabs(frac - f.v) < 1e-6)
+            return "NPS " + (whole > 0 ? std::to_string((long long)whole) + "-" : std::string()) + f.t;
+    return "NPS " + kit::fmtValue(nps, 4);
+}
+std::string npsOf(const json& o, const char* k = "nps") {
+    return jhas(o, k) ? npsText(jnum(o, k)) : "NPS " + fmtText(o, k);
+}
+
 double pathLengthMm(const json& path) {
     double len = 0.0, a[3], b[3];
     for (std::size_t i = 1; i < path.size(); ++i)
@@ -224,7 +308,7 @@ const char* recordIcon(const std::string& type) {
     return "duct";
 }
 
-std::string recordSummary(const json& rec) {
+std::string recordSummary(const json& rec, bool us) {
     const std::string type = jstr(rec, "type");
     const json& params = jobj(rec, "params");
     const json& results = jobj(rec, "results");
@@ -232,8 +316,7 @@ std::string recordSummary(const json& rec) {
         const json& runs = jarr(jobj(params, "piping"), "runs");
         double lenMm = 0.0;
         for (const auto& r : runs) lenMm += pathLengthMm(jarr(r, "path"));
-        std::string s = countNoun((long long)runs.size(), "run") + " \xc2\xb7 " +
-                        kit::fmtQuantity(lenMm, U(kit::Unit::mm), 3);
+        std::string s = countNoun((long long)runs.size(), "run") + " \xc2\xb7 " + fmtQ(lenMm, Q::Len, us, 3);
         if (results.contains("solve")) s += " \xc2\xb7 solved";
         if (results.contains("spec_check"))
             s += jbool(jobj(results, "spec_check"), "all_pass", false) ? " \xc2\xb7 B31.3 pass"
@@ -244,28 +327,28 @@ std::string recordSummary(const json& rec) {
     }
     if (type == "pipe_flow") {
         if (results.empty()) return "not run";
-        return "Pressure drop " + qty(results, "dp_pa", U(kit::Unit::Pa)) + " \xc2\xb7 Reynolds " +
+        return "Pressure drop " + qtyQ(results, "dp_pa", Q::PressPa, us) + " \xc2\xb7 Reynolds " +
                val(results, "reynolds", 3) + " \xc2\xb7 " + jstr(results, "regime", kEmDash);
     }
     if (type == "vessel") {
         if (results.empty()) return "not sized";
-        return "shell " + qty(jobj(results, "shell"), "t_nominal_mm", U(kit::Unit::mm), 3) + " \xc2\xb7 MAWP " +
-               qty(jobj(results, "shell"), "mawp_kpa", U(kit::Unit::kPa));
+        return "shell " + qtyQ(jobj(results, "shell"), "t_nominal_mm", Q::Len, us, 3) + " \xc2\xb7 MAWP " +
+               qtyQ(jobj(results, "shell"), "mawp_kpa", Q::Press, us);
     }
     if (results.empty()) return "not sized";
-    return "fan static " + qty(results, "fan_static_pa", U(kit::Unit::Pa)) + " \xc2\xb7 " +
+    return "fan static " + qtyQ(results, "fan_static_pa", Q::DuctPa, us) + " \xc2\xb7 " +
            countNoun((long long)jarr(results, "segments").size(), "segment");
 }
 
-// Default value and unit of a new boundary row of `kind`.
+// Default value (stored SI) and display quantity of a new boundary row of `kind`.
 double boundaryDefault(bool gas, int kind) {
     if (gas) return kind == 0 ? 500.0 : 50.0;
     return kind == 0 ? 300.0 : kind == 1 ? 30.0 : 10.0;
 }
-const char* boundaryUnit(bool gas, int kind) {
-    if (kind == 0) return U(kit::Unit::kPa);
-    if (gas) return "kg/h";
-    return kind == 1 ? U(kit::Unit::m) : U(kit::Unit::m3_h);
+Q boundaryQ(bool gas, int kind) {
+    if (kind == 0) return Q::Press;
+    if (gas) return Q::MassFlow;
+    return kind == 1 ? Q::Head : Q::Flow;
 }
 const char* boundaryIcon(bool gas, int kind) {
     return kind == 0 || (!gas && kind == 1) ? "load_pressure" : "flow_arrow";
@@ -290,6 +373,22 @@ bool PipingPanel::isPipingStudyType(const std::string& type) {
            type == "duct_system";
 }
 
+void PipingPanel::syncUnits(const AppState& st) {
+    const bool us = SimManager::unitSys(st).us;
+    if (us == us_) return;
+    us_ = us;
+    // Cached display text follows: study-row summaries now, run rows on their next refresh.
+    for (auto& row : studyRows_)
+        for (const json& rec : store_.records())
+            if (jstr(rec, "id") == row.id) { row.summary = recordSummary(rec, us_); break; }
+    // The drawing grid's default pitch reads as a round number in either system (50 mm / 2 in);
+    // a pitch the user typed is kept.
+    if (us_ && draw_.gridMm == 50.0) draw_.gridMm = 50.8;
+    else if (!us_ && draw_.gridMm == 50.8) draw_.gridMm = 50.0;
+}
+
+const char* PipingPanel::lengthUnit() const { return unitOf(Q::Len, us_); }
+
 void PipingPanel::setStudies(AppState& st, const std::string& docId,
                              const std::vector<nlohmann::json>& records) {
     if (mirroredDocId_ != docId) {
@@ -298,10 +397,11 @@ void PipingPanel::setStudies(AppState& st, const std::string& docId,
         mirroredDocId_ = docId;
     }
     store_.setRecords(docId, records);
+    syncUnits(st);
     studyRows_.clear();
     studyRows_.reserve(records.size());
     for (const auto& record : records)
-        studyRows_.push_back({jstr(record, "id"), jstr(record, "name", jstr(record, "type")), recordSummary(record)});
+        studyRows_.push_back({jstr(record, "id"), jstr(record, "name", jstr(record, "type")), recordSummary(record, us_)});
     store_.sync(netSlot_, "piping_network", jarr(network_, "runs").empty(),
                 [this, &st](const json& r) { adoptNetwork(st, r); });
     store_.sync(vesselSlot_, "vessel", vessel_.is_null(), [this](const json& r) { adoptVessel(r); });
@@ -549,10 +649,10 @@ void PipingPanel::persistNetwork(AppState& st) {
 }
 
 void PipingPanel::persistVessel(AppState& st) {
-    const std::string name = "Vessel " + kit::fmtValue(vesselIdMm_) + " ID" +
+    const std::string name = "Vessel " + fmtQ(vesselIdMm_, Q::Len, us_) + " ID" +
                              (vesselSizeBy_ == 0
-                                  ? " \xc3\x97 " + kit::fmtValue(vesselTtMm_) + " T/T"
-                                  : " \xc2\xb7 " + kit::fmtQuantity(vesselVolM3_, U(kit::Unit::m3), 3));
+                                  ? " \xc3\x97 " + fmtQ(vesselTtMm_, Q::Len, us_) + " T/T"
+                                  : " \xc2\xb7 " + fmtQ(vesselVolM3_, Q::Vol, us_, 3));
     store_.saveRecord(st, vesselSlot_,
                       {{"type", "vessel"}, {"name", name}, {"engine", "cpp-industrial"},
                        {"params", vesselParams_}, {"results", vessel_}});
@@ -609,6 +709,19 @@ void PipingPanel::request(AppState& st, Form f, const char* method, nlohmann::js
 void PipingPanel::say(Form f, const std::string& text, int tone) {
     statusForm_ = f;
     store_.setStatus(text, tone);
+    warnList_.clear();
+    warnStatus_.clear();
+}
+
+void PipingPanel::sayWarn(Form f, const std::string& text, const nlohmann::json& result) {
+    std::vector<std::string> warnings;
+    for (const auto& w : jarr(result, "warnings"))
+        if (w.is_string()) warnings.push_back(w.get<std::string>());
+    say(f, text, warnings.empty() ? 1 : 2);
+    if (warnings.empty()) return;
+    warnList_ = std::move(warnings);
+    warnStatus_ = text;
+    warnOpen_ = true;   // open on arrival; the chip collapses it
 }
 
 // ============================================================================================
@@ -926,14 +1039,11 @@ void PipingPanel::onRoute(AppState& st, bool ok, const nlohmann::json& r, const 
         }
         st.zoomToBBoxRequested = true;
     }
-    // ONE footer line: run · length · bends (· N warnings). The warnings themselves are spelled
-    // out inside the "Last route" card, which the Route form scrolls into view when there are any.
-    const json& warns = jarr(r, "warnings");
-    std::string msg = runName(runId) + " routed \xc2\xb7 " + qty(r, "length_mm", U(kit::Unit::mm), 3) +
-                      " \xc2\xb7 " + countNoun((long long)jnum(r, "bends"), "bend");
-    if (!warns.empty()) msg += " \xc2\xb7 " + countNoun((long long)warns.size(), "warning");
-    revealRoute_ = !warns.empty();
-    say(Form::Route, msg, warns.empty() ? 1 : 2);
+    // ONE footer line: run · length · bends; its warnings are listed right under it (sayWarn) as
+    // well as in the "Last route" card.
+    sayWarn(Form::Route, runName(runId) + " routed \xc2\xb7 " + qtyQ(r, "length_mm", Q::Len, us_, 3) +
+                             " \xc2\xb7 " + countNoun((long long)jnum(r, "bends"), "bend"),
+            r);
 }
 
 void PipingPanel::removeRun(AppState& st, int runIndex) {
@@ -1054,10 +1164,10 @@ void PipingPanel::onSolve(AppState& st, bool ok, const nlohmann::json& r, const 
     persistNetwork(st);
     page_[(int)Form::Solve] = pagesOf(Form::Solve).results;   // show what came back
     if (ok)
-        say(Form::Solve,
-            "Solved " + countNoun((long long)jarr(r, "links").size(), "link") + " in " +
-                countNoun((long long)jnum(r, "iterations"), "iteration") + ".",
-            jarr(r, "warnings").empty() ? 1 : 2);
+        sayWarn(Form::Solve,
+                "Solved " + countNoun((long long)jarr(r, "links").size(), "link") + " in " +
+                    countNoun((long long)jnum(r, "iterations"), "iteration") + ".",
+                r);
     else
         say(Form::Solve, "Not converged: " + why, 2);
 }
@@ -1127,10 +1237,7 @@ void PipingPanel::onBom(AppState& st, bool ok, const nlohmann::json& r, const st
     bom_.erase("next_actions");
     persistNetwork(st);
     // The "Bill of materials" card holds the totals (the footer hides an Ok line beside it).
-    const std::size_t nWarn = jarr(r, "warnings").size();
-    say(Form::Bom, nWarn ? "Bill of materials built \xc2\xb7 " + countNoun((long long)nWarn, "warning")
-                         : std::string("Bill of materials built."),
-        nWarn ? 2 : 1);
+    sayWarn(Form::Bom, "Bill of materials built.", r);
 }
 
 // ---- pump drive (results.pump_drive) -----------------------------------------------------------
@@ -1183,6 +1290,8 @@ nlohmann::json PipingPanel::driveDutyPoint() const {
 
 bool PipingPanel::runPumpDrive(AppState& st) {
     if (store_.inflight() > 0) return false;
+    syncUnits(st);
+    sim::defaultSupplyForUnits(driveIn_, us_);   // same regional default the form applies
     const std::string why = pumpDriveBlocker();
     if (!why.empty()) {
         say(Form::Solve, why, 3);
@@ -1214,11 +1323,7 @@ void PipingPanel::onPumpDrive(AppState& st, bool ok, const nlohmann::json& r, co
     pumpDrive_[drivePendingRun_] = entry;
     persistNetwork(st);
     // The card on this page holds the numbers; the line says what happened (and any warnings).
-    const std::size_t nWarn = jarr(r, "warnings").size();
-    say(Form::Solve,
-        "Pump drive sized \xc2\xb7 " + driveRunName(drivePendingRun_) +
-            (nWarn ? " \xc2\xb7 " + countNoun((long long)nWarn, "warning") : std::string()),
-        nWarn ? 2 : 1);
+    sayWarn(Form::Solve, "Pump drive sized \xc2\xb7 " + driveRunName(drivePendingRun_), r);
 }
 
 void PipingPanel::openHandoff(AppState& st, const nlohmann::json& pipingDoc, const nlohmann::json& boundary,
@@ -1392,7 +1497,7 @@ void PipingPanel::finishFlowJob(AppState& st, bool ok, bool cancelled, const nlo
     (void)ownerDocId;  // the store saves into the panel's document (the one that launched it)
     flowRunning_ = false;
     if (cancelled) {
-        say(Form::Flow, "Internal flow cancelled.", 2);
+        say(Form::Flow, "Internal flow canceled.", 2);
         return;
     }
     const bool answered = result.is_object() && !result.empty();
@@ -1407,7 +1512,7 @@ void PipingPanel::finishFlowJob(AppState& st, bool ok, bool cancelled, const nlo
     // One line; the Results page carries the 1-D comparison and the breakdown.
     const bool conv = jbool(result, "converged", false);
     say(Form::Flow,
-        "Pressure drop " + qty(result, "dp_pa", U(kit::Unit::Pa), 3) + " \xc2\xb7 Re " + val(result, "reynolds", 3) +
+        "Pressure drop " + qtyQ(result, "dp_pa", Q::PressPa, us_, 3) + " \xc2\xb7 Re " + val(result, "reynolds", 3) +
             " \xc2\xb7 " + jstr(result, "regime", "regime unknown") + (conv ? "" : " \xc2\xb7 not converged"),
         conv ? 1 : 2);
 }
@@ -1474,12 +1579,11 @@ void PipingPanel::onVessel(AppState& st, bool ok, const nlohmann::json& r, const
     vessel_.erase("next_actions");
     persistVessel(st);
     page_[(int)Form::Vessel] = pagesOf(Form::Vessel).results;
-    const char* mm = U(kit::Unit::mm);
-    say(Form::Vessel,
-        "Sized \xc2\xb7 shell " + qty(jobj(r, "shell"), "t_nominal_mm", mm, 3) + " \xc2\xb7 heads " +
-            qty(jobj(r, "heads"), "t_nominal_mm", mm, 3) + " \xc2\xb7 hydrotest " +
-            qty(r, "hydrotest_kpa", U(kit::Unit::kPa), 3),
-        jarr(r, "warnings").empty() ? 1 : 2);
+    sayWarn(Form::Vessel,
+            "Sized \xc2\xb7 shell " + qtyQ(jobj(r, "shell"), "t_nominal_mm", Q::Len, us_, 3) + " \xc2\xb7 heads " +
+                qtyQ(jobj(r, "heads"), "t_nominal_mm", Q::Len, us_, 3) + " \xc2\xb7 hydrotest " +
+                qtyQ(r, "hydrotest_kpa", Q::Press, us_, 3),
+            r);
 }
 
 bool PipingPanel::runDuct(AppState& st) {
@@ -1505,10 +1609,10 @@ void PipingPanel::onDuct(AppState& st, bool ok, const nlohmann::json& r, const s
     duct_.erase("next_actions");
     persistDuct(st);
     page_[(int)Form::Duct] = pagesOf(Form::Duct).results;
-    say(Form::Duct,
-        "Sized " + countNoun((long long)jarr(r, "segments").size(), "segment") + " \xc2\xb7 fan static " +
-            qty(r, "fan_static_pa", U(kit::Unit::Pa), 3),
-        jarr(r, "warnings").empty() ? 1 : 2);
+    sayWarn(Form::Duct,
+            "Sized " + countNoun((long long)jarr(r, "segments").size(), "segment") + " \xc2\xb7 fan static " +
+                qtyQ(r, "fan_static_pa", Q::DuctPa, us_, 3),
+            r);
 }
 
 // ============================================================================================
@@ -1591,22 +1695,23 @@ void PipingPanel::showPanel(AppState& st) {
 }
 
 void PipingPanel::refreshRows() const {
-    if (rowsRevision_ == networkRevision_) return;
+    if (rowsRevision_ == networkRevision_ && rowsUs_ == us_) return;
     rowsRevision_ = networkRevision_;
+    rowsUs_ = us_;
     runRows_.clear(); fittingRows_.clear(); runLabels_.clear();
     flowRunLabels_ = {"None (enter the ports)"};
     for (const auto& r : jarr(network_, "runs")) {
         const auto& path = jarr(r, "path");
         RunRow row;
         row.id = jstr(r, "id"); row.label = runLabel(r); row.native = r;
-        row.detail = "NPS " + fmtText(r, "nps") + " sch " + jstr(r, "schedule", "40") + " · " +
-                     kit::fmtQuantity(pathLengthMm(path), U(kit::Unit::mm));
+        row.detail = npsOf(r) + " sch " + jstr(r, "schedule", "40") + " \xc2\xb7 " +
+                     fmtQ(pathLengthMm(path), Q::Len, us_);
         for (int end = 0; end < 2; ++end) {
             row.portLabel[end] = row.label + (end == 0 ? " start" : " end");
             row.portButton[end] = row.portLabel[end] + "###run_port";
         }
         runLabels_.push_back(row.label);
-        flowRunLabels_.push_back(row.label + " · NPS " + fmtText(r, "nps"));
+        flowRunLabels_.push_back(row.label + " \xc2\xb7 " + npsOf(r));
         runRows_.push_back(std::move(row));
     }
     int typeCounts[countOf(kFittingTypes)] = {};
@@ -1766,7 +1871,7 @@ bool PipingPanel::submitEdit(AppState& st, json ops, const std::string& note) {
             }
             fittingDirty_ = false;
             persistNetwork(s);
-            say(originForm, note, jarr(r, "warnings").empty() ? 1 : 2);
+            sayWarn(originForm, note, r);
         }, 120000);
     return true;
 }
@@ -1911,7 +2016,7 @@ void PipingPanel::tickFittingRequests(AppState& st) {
             fittingCfdRunning_ = false;
             if (fittingCfdState_ != "done") {
                 fittingCfdError_ = fittingCfdState_ == "cancelled" ?
-                    "CFD calculation cancelled." : envelopeWhy(r.result, r.err);
+                    "CFD calculation canceled." : envelopeWhy(r.result, r.err);
                 say(Form::Fittings, fittingCfdError_, fittingCfdState_ == "cancelled" ? 2 : 3);
                 return;
             }
@@ -2017,7 +2122,8 @@ void PipingPanel::drawFittingsForm(AppState& st) {
         if (fittingPalette_ == 3)
             paletteChanged |= kit::fieldEnum("valve_type", "Valve type", &paletteValve_, kValveLabels, countOf(kValveLabels));
         if (fittingPalette_ == 4)
-            paletteChanged |= kit::fieldNumber("nps2", "Outlet NPS", &paletteNps2_, kit::FieldOpts().withUnit(kit::Unit::in).withMin(0));
+            paletteChanged |= kit::fieldNumber("nps2", "Outlet NPS", &paletteNps2_, kit::FieldOpts().withMin(0)
+                                                   .withTip("Outlet nominal pipe size (NPS designator)."));
         if (fittingPalette_ == 5)
             paletteChanged |= kit::fieldNumber("beta", "Bore / pipe ratio", &paletteBeta_, kit::FieldOpts().withMin(0.01).withMax(0.99));
         if (fittingPalette_ == 7)
@@ -2098,7 +2204,7 @@ void PipingPanel::drawFittingsForm(AppState& st) {
             changed |= kit::fieldEnum("radius", "Bend radius", &fittingRadius_, radii, 2);
         }
         if (type == "tee") changed |= kit::fieldNumber("branch_size", "Branch NPS", &fittingBranchNps_,
-            kit::FieldOpts().withUnit(kit::Unit::in).withMin(0));
+            kit::FieldOpts().withMin(0).withTip("Branch nominal pipe size (NPS designator)."));
         if (type == "flange") {
             static const char* const classes[] = {"150", "300", "400", "600", "900", "1500", "2500"};
             static const char* const faces[] = {"Raised face", "Ring joint", "Flat face"};
@@ -2109,7 +2215,7 @@ void PipingPanel::drawFittingsForm(AppState& st) {
         if (type == "orifice") changed |= kit::fieldNumber("beta", "Bore / pipe ratio", &fittingBeta_,
             kit::FieldOpts().withMin(0.01).withMax(0.99));
         if (type == "reducer") changed |= kit::fieldNumber("outlet_nps", "Outlet NPS", &fittingNps2_,
-            kit::FieldOpts().withUnit(kit::Unit::in).withMin(0));
+            kit::FieldOpts().withMin(0).withTip("Outlet nominal pipe size (NPS designator)."));
         if (type == "custom") changed |= kit::fieldText("label", "Description", &fittingLabel_);
     }
     kit::cardEnd();
@@ -2177,14 +2283,14 @@ void PipingPanel::drawFittingsForm(AppState& st) {
                             }
                         }
                     }
-                    changed |= kit::fieldVec3("point", label, point, kit::FieldOpts().withUnit(kit::Unit::mm));
+                    changed |= kit::fieldVec3("point", label, point, fieldQ(Q::Len, us_));
                     changed |= kit::fieldVec3("normal", "Normal into fluid", normal);
                     ImGui::PopID();
                 };
                 port("inlet", "Inlet point", fittingInlet_, fittingInletN_);
                 port("outlet", "Outlet point", fittingOutlet_, fittingOutletN_);
                 changed |= kit::fieldNumber("bore", "Inner diameter", &fittingBoreMm_,
-                    kit::FieldOpts().withUnit(kit::Unit::mm).withMin(0));
+                    fieldQ(Q::Len, us_).withMin(0));
                 kit::dimText("Geometry is the fluid volume, not the pipe wall. Port normals point into it.");
             }
         }
@@ -2374,6 +2480,7 @@ bool PipingPanel::setRouteFace(AppState& st, int endpoint, const json& selector,
 // ============================================================================================
 
 void PipingPanel::drawStudyRows(AppState& st) {
+    syncUnits(st);
     const std::vector<json>& recs = store_.records();
     if (recs.empty()) return;
     // Rows act after the loop: opening a record re-adopts state the loop is iterating.
@@ -2481,6 +2588,7 @@ void PipingPanel::drawNoResult(const char* icon, const char* title, const char* 
 }
 
 void PipingPanel::draw(AppState& st) {
+    syncUnits(st);
     refreshRows();
     tickFittingRequests(st);
     kit::panelBegin("piping_panel");
@@ -2664,9 +2772,9 @@ void PipingPanel::drawNetworkLegend(AppState& st) {
     const auto& nodes = jarr(solve_, "nodes");
     const void* linkIdentity = links.get_ptr<const json::array_t*>();
     const void* nodeIdentity = nodes.get_ptr<const json::array_t*>();
-    if (legendRevision_ != networkRevision_ || legendColorBy_ != colorBy_ ||
+    if (legendRevision_ != networkRevision_ || legendColorBy_ != colorBy_ || legendUs_ != us_ ||
         legendLinks_ != linkIdentity || legendNodes_ != nodeIdentity) {
-        legendRevision_ = networkRevision_; legendColorBy_ = colorBy_;
+        legendRevision_ = networkRevision_; legendColorBy_ = colorBy_; legendUs_ = us_;
         legendLinks_ = linkIdentity; legendNodes_ = nodeIdentity;
         float low = std::numeric_limits<float>::max(), high = -low;
         bool solved = false;
@@ -2710,9 +2818,12 @@ void PipingPanel::drawNetworkLegend(AppState& st) {
             }
         }
         legendRangeValid_ = solved && std::isfinite(low) && std::isfinite(high) && high >= low;
-        pipeLegendMin_ = low; pipeLegendMax_ = high;
+        // The range is found in SI (the coloring's own scale) and shown in the display unit; the
+        // conversion is linear, so the colour stops stay where they are.
+        const Q q = colorBy_ == 1 ? Q::Press : Q::Vel;
+        pipeLegendMin_ = (float)toDisp(low, q, us_); pipeLegendMax_ = (float)toDisp(high, q, us_);
         pipeLegendTitle_ = colorBy_ == 1 ? "Pressure" : "Velocity";
-        pipeLegendUnits_ = colorBy_ == 1 ? "kPa gauge" : "m/s";
+        pipeLegendUnits_ = colorBy_ == 1 ? std::string(unitOf(q, us_)) + " gauge" : std::string(unitOf(q, us_));
     }
     if (!legendRangeValid_) return;
     // Reuse the shared result legend without claiming the persistent FEA/CFD scalar state.
@@ -2748,7 +2859,19 @@ void PipingPanel::drawFooter(AppState& st) {
     const bool resultShown = (onResults && hasResult(form_)) || (form_ == Form::Bom && hasResult(Form::Bom)) ||
                              (pumpPage && pumpDrive_.is_object() && !pumpDrive_.empty());
     const int tone = store_.statusTone();
-    if (statusForm_ == form_ && !mineBusy && !(resultShown && (tone == 1 || tone == 2))) store_.drawStatus();
+    if (statusForm_ == form_ && !mineBusy && !(resultShown && (tone == 1 || tone == 2))) {
+        store_.drawStatus();
+        // The warnings that line counts, right under it: a chip that opens/closes their list.
+        if (!warnList_.empty() && store_.status() == warnStatus_) {
+            const std::string chipLabel = countNoun((long long)warnList_.size(), "warning");
+            ImGui::PushID("status_warnings");
+            kit::toggleChip(chipLabel.c_str(), &warnOpen_, kit::Tone::Warn,
+                            warnOpen_ ? "Hide these warnings." : "Show these warnings.");
+            ImGui::PopID();
+            if (warnOpen_)
+                for (const auto& w : warnList_) kit::inlineStatus(w.c_str(), kit::Tone::Warn);
+        }
+    }
 
     // The current page's one primary action and why it cannot run. On a Results page that has a
     // result the action is a secondary "Re-…" (the standard's Results-step rule).
@@ -2898,12 +3021,12 @@ void PipingPanel::drawNetworkForm(AppState& st) {
     if (kit::cardBegin("network", "Design conditions", "settings")) {
         kit::FieldGroup g("network_fields", "Design temperature");
         if (kit::fieldNumber("design_p", "Design pressure", &designPressureKpa_,
-                             kit::FieldOpts().withUnit(kit::Unit::kPa).withMin(0.0).withHint("1,000")
+                             fieldQ(Q::Press, us_).withMin(0.0).withHint(hintQ(1000.0, Q::Press, us_).c_str())
                                  .withTip("Gauge design pressure used by the B31.3 wall, MAWP and "
                                           "flange-rating checks.")))
             invalidateSetup(st, Form::Network);
         if (kit::fieldNumber("design_t", "Design temperature", &designTempC_,
-                             kit::FieldOpts().withUnit(kit::Unit::DegC).withHint("40")
+                             fieldQ(Q::Temp, us_).withHint(hintQ(40.0, Q::Temp, us_).c_str())
                                  .withTip("Design metal temperature: sets the allowable stress and "
                                           "flange rating.")))
             invalidateSetup(st, Form::Network);
@@ -2939,7 +3062,7 @@ void PipingPanel::drawNetworkForm(AppState& st) {
 }
 
 void PipingPanel::drawRouteForm(AppState& st) {
-    const char* mm = U(kit::Unit::mm);
+    const kit::FieldOpts len = fieldQ(Q::Len, us_);
     static const char* const kDirHints[] = {"X", "Y", "Z"};
     static const char* const modes[] = {"Draw", "Auto-route"};
     if (kit::segmented("route_mode", modes, 2, &routeMode_, ImGui::GetContentRegionAvail().x)) {
@@ -2955,8 +3078,8 @@ void PipingPanel::drawRouteForm(AppState& st) {
                 if (planeChoice > 0) draw_.plane = planeChoice - 1;
             }
             if (draw_.autoPlane) kit::dimText("(following the view)");
-            kit::fieldNumber("offset", "Elevation offset", &draw_.planeOffsetMm, kit::FieldOpts().withUnit(mm));
-            kit::fieldNumber("pitch", "Grid pitch", &draw_.gridMm, kit::FieldOpts().withUnit(mm).withMin(0));
+            kit::fieldNumber("offset", "Elevation offset", &draw_.planeOffsetMm, kit::FieldOpts(len));
+            kit::fieldNumber("pitch", "Grid pitch", &draw_.gridMm, kit::FieldOpts(len).withMin(0));
             kit::fieldCheckbox("grid_snap", "Snap to grid", &draw_.snapGrid);
             kit::fieldCheckbox("axis_snap", "Snap to axes", &draw_.snapAxis);
             kit::fieldCheckbox("pipe_snap", "Snap to pipes", &draw_.snapPipes);
@@ -2970,7 +3093,7 @@ void PipingPanel::drawRouteForm(AppState& st) {
     if (kit::cardBegin("endpoints", "Endpoints", "route_pipe")) {
         kit::FieldGroup g("endpoint_fields", "Start direction");
         if (kit::fieldVec3("start", "Start point", start_,
-                          kit::FieldOpts().withUnit(mm).withTip("Where the run begins (world coordinates)."))) {
+                          kit::FieldOpts(len).withTip("Where the run begins (world coordinates)."))) {
             endpointFace_[0] = json();
             setupEdited_ = true;
         }
@@ -2992,7 +3115,7 @@ void PipingPanel::drawRouteForm(AppState& st) {
             ImGui::PopID();
         };
         pickToggle("pick_start", 1, "Start from face",
-                   "Pick a face in the viewport: the run starts just off its centre, leaving along its normal.");
+                   "Pick a face in the viewport: the run starts just off its center, leaving along its normal.");
         const json& runs = jarr(network_, "runs");
         if (!runs.empty()) {
             ImGui::SameLine();
@@ -3005,7 +3128,7 @@ void PipingPanel::drawRouteForm(AppState& st) {
             kit::itemTooltip("Start where the newest run ends, continuing its direction.");
         }
         if (kit::fieldVec3("end", "End point", end_,
-                          kit::FieldOpts().withUnit(mm).withTip("Where the run ends (world coordinates)."))) {
+                          kit::FieldOpts(len).withTip("Where the run ends (world coordinates)."))) {
             endpointFace_[1] = json();
             setupEdited_ = true;
         }
@@ -3013,7 +3136,7 @@ void PipingPanel::drawRouteForm(AppState& st) {
                        kit::FieldOpts().withCellHints(kDirHints).withGroupCommit()
                            .withTip("Direction of travel arriving at the end point (0, 0, 0 = router's choice)."));
         pickToggle("pick_end", 2, "End at face",
-                   "Pick a face in the viewport: the run ends just off its centre, arriving into it.");
+                   "Pick a face in the viewport: the run ends just off its center, arriving into it.");
         if (armed_ != 0) kit::dimText("Click a face of the model in the viewport.");
     }
     kit::cardEnd();
@@ -3021,9 +3144,12 @@ void PipingPanel::drawRouteForm(AppState& st) {
 
     if (kit::cardBegin("pipe", "Pipe", "line")) {
         kit::FieldGroup g("pipe_fields", "Clearance");
+        // The designator alone ("NPS 2", like every run, spec and BOM row): NPS is a size name,
+        // not a measured inch dimension, so the field carries no unit.
         setupEdited_ |= kit::fieldNumber("nps", "NPS", &nps_,
-                         kit::FieldOpts().withUnit(kit::Unit::in).withMin(0.0).withRequired().withHint("2")
-                             .withTip("Nominal pipe size in inches (ASME B36.10M/B36.19M)."));
+                         kit::FieldOpts().withMin(0.0).withHint("2")
+                             .withTip("Nominal pipe size designator (ASME B36.10M/B36.19M): 2 for NPS 2, "
+                                      "1.5 for NPS 1-1/2."));
         setupEdited_ |= kit::fieldEnum("schedule", "Schedule", &scheduleIdx_, kSchedules, countOf(kSchedules));
         setupEdited_ |= kit::fieldEnum("material", "Material", &materialIdx_, kPipeMaterials, countOf(kPipeMaterials));
         static const char* const bends[] = {"Long radius", "Short radius"};
@@ -3032,11 +3158,11 @@ void PipingPanel::drawRouteForm(AppState& st) {
         else kit::fieldReadout("bend", "Bend radius", "Long radius");
         if (routeMode_ != 0) {
         setupEdited_ |= kit::fieldNumber("clearance", "Clearance", &clearanceMm_,
-                         kit::FieldOpts().withUnit(mm).withMin(0.0).withHint("50")
+                         kit::FieldOpts(len).withMin(0.0).withHint(hintQ(50.0, Q::Len, us_).c_str())
                              .withTip("Minimum gap kept between the pipe's outside and every body of this model."));
         bool gridSet = gridMm_ > 0.0;
         if (kit::fieldNumber("grid", "Grid pitch", &gridMm_,
-                             kit::FieldOpts().withUnit(mm).withMin(0.0).withPresent(&gridSet)
+                             kit::FieldOpts(len).withMin(0.0).withPresent(&gridSet)
                                  .withHint("Auto (about one OD)")
                                  .withTip("Routing grid pitch; leave empty for the engine default."))) {
             if (!gridSet) gridMm_ = 0.0;
@@ -3050,19 +3176,14 @@ void PipingPanel::drawRouteForm(AppState& st) {
 
     if (!route_.is_object() || route_.empty()) return;
     const bool clearOk = jnum(route_, "min_clearance_mm", 0.0) + 1e-6 >= clearanceMm_;
-    // A route with warnings scrolls its card into view once: the footer only counts them.
-    if (revealRoute_) {
-        ImGui::SetScrollHereY(0.1f);
-        revealRoute_ = false;
-    }
-    // The result card carries the route's warnings (wrapped), so nothing is cut in the footer.
+    // The result card carries the route's warnings (wrapped); the footer lists them too.
     if (kit::cardBegin("last_route", "Last route", "route_pipe")) {
         const std::string run = runName(jstr(route_, "run_id", kEmDash));
-        const std::string len = qty(route_, "length_mm", mm);
+        const std::string length = qtyQ(route_, "length_mm", Q::Len, us_);
         const std::string bends = countNoun((long long)jnum(route_, "bends"), "long-radius elbow");
-        const std::string gap = qty(route_, "min_clearance_mm", mm, 3);
+        const std::string gap = qtyQ(route_, "min_clearance_mm", Q::Len, us_, 3);
         kit::keyValueRowId("run", "Run", run.c_str());
-        kit::keyValueRowId("length", "Length", len.c_str());
+        kit::keyValueRowId("length", "Length", length.c_str());
         kit::keyValueRowId("bends", "Bends", bends.c_str());
         kit::keyValueRowId("clearance", "Min clearance", gap.c_str(), clearOk ? kit::Tone::Ok : kit::Tone::Warn);
         warningsList(route_);
@@ -3072,16 +3193,17 @@ void PipingPanel::drawRouteForm(AppState& st) {
     if (path.empty()) return;
     const std::string ptsTitle = "Path points (" + std::to_string(path.size()) + ")";
     if (kit::cardBegin("path_points", ptsTitle.c_str(), "line", &routePathOpen_)) {
+        const std::string cx = colQ("X", Q::Len, us_), cy = colQ("Y", Q::Len, us_), cz = colQ("Z", Q::Len, us_);
         if (kit::tableBegin("points", {{"#", kit::TableAlign::Right, 0.4f, true},
-                                       {"X (mm)", kit::TableAlign::Right},
-                                       {"Y (mm)", kit::TableAlign::Right},
-                                       {"Z (mm)", kit::TableAlign::Right}})) {
+                                       {cx.c_str(), kit::TableAlign::Right},
+                                       {cy.c_str(), kit::TableAlign::Right},
+                                       {cz.c_str(), kit::TableAlign::Right}})) {
             for (std::size_t i = 0; i < path.size(); ++i) {
                 double p[3];
                 if (!jvec3(path[i], p)) continue;
                 kit::tableRow();
                 kit::tableCell(std::to_string(i).c_str());
-                for (int k = 0; k < 3; ++k) kit::tableCell(kit::fmtValue(p[k], 5).c_str());
+                for (int k = 0; k < 3; ++k) kit::tableCell(kit::fmtValue(toDisp(p[k], Q::Len, us_), 5).c_str());
             }
         }
         kit::tableEnd();
@@ -3113,8 +3235,8 @@ void PipingPanel::drawSolveForm(AppState& st) {
         if (fluidOverride_.is_object()) {
             // A handed-off fluid given by its properties (e.g. the hydraulic circuit's oil).
             const std::string desc = jstr(fluidOverride_, "name", "custom") + " \xc2\xb7 " +
-                                     qty(fluidOverride_, "rho", U(kit::Unit::kg_m3)) + " \xc2\xb7 " +
-                                     qty(fluidOverride_, "mu", U(kit::Unit::Pa_s));
+                                     qtyQ(fluidOverride_, "rho", Q::Dens, us_) + " \xc2\xb7 " +
+                                     qtyQ(fluidOverride_, "mu", Q::Visc, us_);
             kit::fieldReadout("handoff", "Fluid", desc.c_str());
             if (kit::secondaryButton("Use a built-in fluid###builtin")) {
                 fluidOverride_ = json();
@@ -3143,7 +3265,7 @@ void PipingPanel::drawSolveForm(AppState& st) {
                 invalidateSetup(st, Form::Solve);
             }
             if (kit::fieldNumber("temp", "Temperature", &fluidTempC_,
-                                 kit::FieldOpts().withUnit(kit::Unit::DegC).withHint("20")
+                                 fieldQ(Q::Temp, us_).withHint(hintQ(20.0, Q::Temp, us_).c_str())
                                      .withTip("Fluid temperature for its properties."))) {
                 auto& fluid = networkParams_["fluid"];
                 if (!fluid.is_object()) fluid = {{"name", kFluidKeys[fluidIdx_ >= 0 ? fluidIdx_ : 0]}};
@@ -3191,7 +3313,7 @@ void PipingPanel::drawSolveForm(AppState& st) {
                                   : (!gas && kind == 1) ? "Hydraulic head fixed at this node."
                                                         : "Drawn out of the network (+) or fed in (-).";
                 edited |= kit::fieldNumber("value", kinds[kind], &b.value,
-                                           kit::FieldOpts().withUnit(boundaryUnit(gas, kind)).withTip(tip));
+                                           fieldQ(boundaryQ(gas, kind), us_).withTip(tip));
             }
         }
         kit::cardEnd();
@@ -3229,7 +3351,7 @@ void PipingPanel::drawSolveResults() {
     // ids only in tooltips).
     const bool conv = jbool(solve_, "converged", false);
     const json& fluid = jobj(solve_, "fluid");
-    const std::string fluidTxt = fluidName(jstr(fluid, "name")) + " \xc2\xb7 " + qty(fluid, "rho", U(kit::Unit::kg_m3));
+    const std::string fluidTxt = fluidName(jstr(fluid, "name")) + " \xc2\xb7 " + qtyQ(fluid, "rho", Q::Dens, us_);
     kit::chipFlowBegin("solve_outcome");
     kit::flowChip(conv ? "Converged" : "Not converged", conv ? kit::Tone::Ok : kit::Tone::Err, true);
     kit::flowValueChip("Iterations", fmtText(solve_, "iterations").c_str());
@@ -3237,7 +3359,7 @@ void PipingPanel::drawSolveResults() {
     kit::chipFlowEnd();
     warningsList(solve_);
     static const char* const colours[] = {"None", "Pressure", "Velocity"};
-    kit::sectionHeader("Colour pipes by", "study_piping");
+    kit::sectionHeader("Color pipes by", "study_piping");
     kit::segmented("pipe_colour", colours, countOf(colours), &colorBy_, ImGui::GetContentRegionAvail().x);
 
     const json& links = jarr(solve_, "links");
@@ -3256,26 +3378,31 @@ void PipingPanel::drawSolveResults() {
     }
     kit::sectionHeader("Runs", "route_pipe", nullptr, (int)links.size());
     // The run column is the narrow one so every numeric header keeps its unit.
+    const std::string flowCol = colQ("Flow", massFlow ? Q::MassFlow : Q::Flow, us_);
+    const std::string velCol = colQ("v", Q::Vel, us_), dpCol = colQ("dp", Q::Press, us_);
     if (kit::tableBegin("links", {{"Run", kit::TableAlign::Left, 0.8f},
-                                  {massFlow ? "Flow (kg/h)" : "Flow (m\xc2\xb3/h)", kit::TableAlign::Right, 1.3f},
-                                  {"v (m/s)", kit::TableAlign::Right, 0.95f},
-                                  {"dp (kPa)", kit::TableAlign::Right, 0.95f}})) {
+                                  {flowCol.c_str(), kit::TableAlign::Right, 1.3f},
+                                  {velCol.c_str(), kit::TableAlign::Right, 0.95f},
+                                  {dpCol.c_str(), kit::TableAlign::Right, 0.95f}})) {
         for (const auto& l : links) {
             kit::tableRow();
             const std::string id = jstr(l, "id");
             const std::string tip = "Reynolds " + val(l, "reynolds", 3) + " (engine id " + id + ")";
             kit::tableCell(runName(id).c_str(), kit::Tone::Neutral, tip.c_str());
-            kit::tableCell((jhas(l, "flow_m3h") ? val(l, "flow_m3h") : val(l, "mass_flow_kgh")).c_str());
-            kit::tableCell(val(l, "velocity_ms", 3).c_str());
-            kit::tableCell(val(l, "dp_kpa", 3).c_str());
+            kit::tableCell((jhas(l, "flow_m3h") ? valQ(l, "flow_m3h", Q::Flow, us_)
+                                                : valQ(l, "mass_flow_kgh", Q::MassFlow, us_)).c_str());
+            kit::tableCell(valQ(l, "velocity_ms", Q::Vel, us_, 3).c_str());
+            kit::tableCell(valQ(l, "dp_kpa", Q::Press, us_, 3).c_str());
         }
     }
     kit::tableEnd();
     const json& nodes = jarr(solve_, "nodes");
     kit::sectionHeader("Nodes", "flow_bc", nullptr, (int)nodes.size());
+    const std::string pCol = us_ ? std::string("P (psig)") : std::string("P (kPa g)");
+    const std::string headCol = colQ("Head", Q::Head, us_);
     if (kit::tableBegin("nodes", {{"Node", kit::TableAlign::Left, 1.4f},
-                                  {"P (kPa g)", kit::TableAlign::Right, 1.1f},
-                                  {"Head (m)", kit::TableAlign::Right},
+                                  {pCol.c_str(), kit::TableAlign::Right, 1.1f},
+                                  {headCol.c_str(), kit::TableAlign::Right},
                                   {"Role", kit::TableAlign::Left, 0.8f}})) {
         for (const auto& n : nodes) {
             kit::tableRow();
@@ -3286,8 +3413,8 @@ void PipingPanel::drawSolveResults() {
             if (name == id && id.size() >= 2 && id[0] == 'n') name = "Node " + id.substr(1);
             const std::string tip = "Engine node id " + id;
             kit::tableCell(name.c_str(), kit::Tone::Neutral, tip.c_str());
-            kit::tableCell(val(n, "pressure_kpa").c_str());
-            kit::tableCell(val(n, "head_m").c_str());
+            kit::tableCell(valQ(n, "pressure_kpa", Q::Press, us_).c_str());
+            kit::tableCell(valQ(n, "head_m", Q::Head, us_).c_str());
             const double demand = jnum(n, "demand_m3h", jnum(n, "mass_demand_kgh", 0.0));
             if (jbool(n, "fixed", false))
                 kit::tableCell("Fixed", kit::Tone::Neutral, "Pressure or head fixed by a boundary condition.");
@@ -3304,6 +3431,7 @@ void PipingPanel::drawSolveResults() {
 
 void PipingPanel::drawPumpDrive(AppState& st) {
     (void)st;
+    sim::defaultSupplyForUnits(driveIn_, us_);   // 460 V / 60 Hz in US units until the user picks
     if (gasNetwork()) {
         drawNoResult("pump_drive", "Liquid networks only",
                      "Pump drives are sized for liquid networks: pick water on Conditions.");
@@ -3331,12 +3459,13 @@ void PipingPanel::drawPumpDrive(AppState& st) {
             const json op = solvedDutyPoint();
             if (op.is_object()) {
                 kit::fieldReadout("run", "Pump on run", driveRunName(jstr(op, "run")).c_str());
-                kit::fieldReadout("flow", "Flow", val(op, "flow_m3h").c_str(),
-                                  kit::FieldOpts().withUnit(kit::Unit::m3_h));
-                kit::fieldReadout("head", "Head", val(op, "head_m").c_str(), kit::FieldOpts().withUnit(kit::Unit::m));
+                kit::fieldReadout("flow", "Flow", valQ(op, "flow_m3h", Q::Flow, us_).c_str(),
+                                  kit::FieldOpts().withUnit(unitOf(Q::Flow, us_)));
+                kit::fieldReadout("head", "Head", valQ(op, "head_m", Q::Head, us_).c_str(),
+                                  kit::FieldOpts().withUnit(unitOf(Q::Head, us_)));
                 const bool link = jstr(op, "basis") == "pump link";
-                kit::fieldReadout("basis", "Basis", link ? "Modelled pump" : "Supply node",
-                                  kit::FieldOpts().withTip(link ? "The modelled pump's head and flow on its run."
+                kit::fieldReadout("basis", "Basis", link ? "Modeled pump" : "Supply node",
+                                  kit::FieldOpts().withTip(link ? "The modeled pump's head and flow on its run."
                                                                 : "The fixed supply node delivers the total demand "
                                                                   "at its pressure head."));
             } else {
@@ -3351,9 +3480,9 @@ void PipingPanel::drawPumpDrive(AppState& st) {
                 if (kit::fieldCombo("run", "Pump on run", &run, labels)) driveRun_ = run;
             }
             kit::fieldNumber("flow", "Flow", &driveIn_.flowM3h,
-                             kit::FieldOpts().withUnit(kit::Unit::m3_h).withMin(0.0).withRequired());
+                             fieldQ(Q::Flow, us_).withMin(0.0).withRequired());
             kit::fieldNumber("head", "Head", &driveIn_.headM,
-                             kit::FieldOpts().withUnit(kit::Unit::m).withMin(0.0).withRequired());
+                             fieldQ(Q::Head, us_).withMin(0.0).withRequired());
         }
     }
     kit::cardEnd();
@@ -3366,7 +3495,7 @@ void PipingPanel::drawSpecForm(AppState& st) {
             enterForm(st, Form::Route);
         return;
     }
-    const char* mm = U(kit::Unit::mm);
+    const kit::FieldOpts len = fieldQ(Q::Len, us_);
     if (page_[(int)Form::Spec] == 1) {
         if (!hasResult(Form::Spec)) {
             drawNoResult("spec_check", "Not checked yet",
@@ -3380,12 +3509,11 @@ void PipingPanel::drawSpecForm(AppState& st) {
             kit::FieldGroup g("basis_fields", "Corrosion allowance");
             bool edited = false;
             edited |= kit::fieldNumber("design_p", "Design pressure", &designPressureKpa_,
-                                       kit::FieldOpts().withUnit(kit::Unit::kPa).withMin(0.0).withRequired()
+                                       fieldQ(Q::Press, us_).withMin(0.0).withRequired()
                                            .withTip("Gauge design pressure."));
-            edited |= kit::fieldNumber("design_t", "Design temperature", &designTempC_,
-                                       kit::FieldOpts().withUnit(kit::Unit::DegC));
+            edited |= kit::fieldNumber("design_t", "Design temperature", &designTempC_, fieldQ(Q::Temp, us_));
             edited |= kit::fieldNumber("corrosion", "Corrosion allowance", &corrosionMm_,
-                                       kit::FieldOpts().withUnit(mm).withMin(0.0).withHint("1.5"));
+                                       kit::FieldOpts(len).withMin(0.0).withHint(hintQ(1.5, Q::Len, us_).c_str()));
             edited |= kit::fieldNumber("mill_tol", "Mill tolerance", &millTol_,
                                        kit::FieldOpts().withScale(100.0).withUnit(kit::Unit::Percent)
                                            .withRange(0.0, 0.5).withHint("12.5")
@@ -3394,11 +3522,11 @@ void PipingPanel::drawSpecForm(AppState& st) {
                                        kit::FieldOpts().withRange(0.0, 1.0).withHint("1.0")
                                            .withTip("Longitudinal weld joint quality factor (1.0 seamless)."));
             edited |= kit::fieldNumber("density", "Fluid density", &fluidDensity_,
-                                       kit::FieldOpts().withUnit(kit::Unit::kg_m3).withMin(0.0)
+                                       fieldQ(Q::Dens, us_).withMin(0.0)
                                            .withTip("Contents weight for the support-span check."));
             edited |= kit::fieldNumber("insulation", "Insulation", &insulationKgm_,
-                                       kit::FieldOpts().withUnit("kg/m").withMin(0.0).withHint("0")
-                                           .withTip("Insulation weight per metre for the support-span check."));
+                                       fieldQ(Q::LineMass, us_).withMin(0.0).withHint("0")
+                                           .withTip("Insulation weight per unit length for the support-span check."));
             if (edited) invalidateSetup(st, Form::Spec);
         }
         kit::cardEnd();
@@ -3417,18 +3545,18 @@ void PipingPanel::drawSpecForm(AppState& st) {
     for (int i = 0; i < (int)specRuns.size(); ++i) {
         const json& r = specRuns[i];
         const bool pass = jbool(r, "pass", false);
-        const std::string title = runName(jstr(r, "id")) + " \xc2\xb7 NPS " + fmtText(r, "nps");
+        const std::string title = runName(jstr(r, "id")) + " \xc2\xb7 " + npsOf(r);
         std::vector<kit::KeyValueItem> rows;
         rows.push_back({"Result", pass ? "Pass" : "Fail", pass ? kit::Tone::Ok : kit::Tone::Err});
-        rows.push_back({"Wall (nominal)", qty(r, "t_nominal_mm", mm, 3)});
-        rows.push_back({"Wall (required)", qty(r, "t_required_mm", mm, 3)});
+        rows.push_back({"Wall (nominal)", qtyQ(r, "t_nominal_mm", Q::Len, us_, 3)});
+        rows.push_back({"Wall (required)", qtyQ(r, "t_required_mm", Q::Len, us_, 3)});
         if (jhas(r, "utilization")) {
             const double u = jnum(r, "utilization");
             rows.push_back({"Wall utilization", kit::fmtQuantity(u * 100.0, U(kit::Unit::Percent), 3),
                             u > 1.0 ? kit::Tone::Err : kit::Tone::Neutral});
         }
-        rows.push_back({"MAWP", qty(r, "mawp_kpa", U(kit::Unit::kPa))});
-        rows.push_back({"Support span", qty(r, "support_span_m", U(kit::Unit::m), 3)});
+        rows.push_back({"MAWP", qtyQ(r, "mawp_kpa", Q::Press, us_)});
+        rows.push_back({"Support span", qtyQ(r, "support_span_m", Q::Span, us_, 3)});
         if (!pass && fmtText(r, "suggested_schedule") != kEmDash)
             rows.push_back({"Suggested schedule", fmtText(r, "suggested_schedule"), kit::Tone::Warn});
         ImGui::PushID(i);
@@ -3439,9 +3567,10 @@ void PipingPanel::drawSpecForm(AppState& st) {
     const json& flanges = jarr(spec_, "flanges");
     if (!flanges.empty()) {
         kit::sectionHeader("Flanges", "spec_check", nullptr, (int)flanges.size());
+        const std::string ratingCol = colQ("Rating", Q::Press, us_);
         if (kit::tableBegin("flanges", {{"Flange"},
                                         {"Class", kit::TableAlign::Right},
-                                        {"Rating (kPa)", kit::TableAlign::Right},
+                                        {ratingCol.c_str(), kit::TableAlign::Right},
                                         {"Result"}})) {
             for (const auto& f : flanges) {
                 const bool pass = jbool(f, "pass", false);
@@ -3453,7 +3582,7 @@ void PipingPanel::drawSpecForm(AppState& st) {
                 const std::string tip = "Engine fitting id " + id;
                 kit::tableCell((numbered ? "Flange " + id.substr(1) : id).c_str(), kit::Tone::Neutral, tip.c_str());
                 kit::tableCell(fmtText(f, "flange_class").c_str());
-                kit::tableCell(val(f, "rating_kpa").c_str());
+                kit::tableCell(valQ(f, "rating_kpa", Q::Press, us_).c_str());
                 kit::tableCell(pass ? "Pass" : "Fail", pass ? kit::Tone::Ok : kit::Tone::Err);
             }
         }
@@ -3471,41 +3600,42 @@ void PipingPanel::drawBomForm(AppState& st) {
     if (kit::cardBegin("spools_in", "Spool breaks", "line")) {
         kit::FieldGroup g("spool_fields", "Max spool length");
         if (kit::fieldNumber("max_spool", "Max spool length", &maxSpoolMm_,
-                             kit::FieldOpts().withUnit(kit::Unit::mm).withMin(0.0).withHint("12,000")
+                             fieldQ(Q::Len, us_).withMin(0.0).withHint(hintQ(12000.0, Q::Len, us_).c_str())
                                  .withTip("Shop spools break at flanges and at this length (transport limit).")))
             invalidateSetup(st, Form::Bom);
     }
     kit::cardEnd();
 
     if (!hasResult(Form::Bom)) return;
-    // Lengths in mm like the route and the line list: the centreline matches the routed length;
-    // the cut pipe is what is left after the fittings' take-outs (elbows, tees, flanges).
+    // Lengths in the route's length unit, like the line list: the centerline matches the routed
+    // length; the cut pipe is what is left after the fittings' take-outs (elbows, tees, flanges).
     const json& t = jobj(bom_, "totals");
     long long fittings = 0;
     for (const auto& it : jarr(bom_, "items"))
         if (jstr(it, "kind") != "pipe") fittings += (long long)jnum(it, "qty", 0.0);
-    auto mmOf = [&](const char* k) {
-        return jhas(t, k) ? kit::fmtQuantity(jnum(t, k) * 1000.0, U(kit::Unit::mm)) : std::string(kEmDash);
+    auto lenOf = [&](const char* k) {   // totals are in m
+        return jhas(t, k) ? fmtQ(jnum(t, k) * 1000.0, Q::Len, us_) : std::string(kEmDash);
     };
     kit::keyValueCard("totals", "Bill of materials", "results",
-                      {{"Centreline length", mmOf("centreline_length_m")},
-                       {"Cut pipe length", mmOf("pipe_length_m")},
+                      {{"Centerline length", lenOf("centreline_length_m")},
+                       {"Cut pipe length", lenOf("pipe_length_m")},
                        {"Fittings", std::to_string(fittings)},
-                       {"Mass", qty(t, "mass_kg", U(kit::Unit::kg))},
+                       {"Mass", qtyQ(t, "mass_kg", Q::Mass, us_)},
                        {"Shop welds", fmtText(t, "shop_welds")},
                        {"Field welds", fmtText(t, "field_welds")}});
 
     const json& lines = jarr(bom_, "line_list");
     kit::sectionHeader("Line list", "line", nullptr, (int)lines.size());
-    if (kit::tableBegin("line_list", {{"Run"}, {"Size"}, {"Material"}, {"Length (mm)", kit::TableAlign::Right}})) {
+    const std::string lenCol = colQ("Length", Q::Len, us_), massCol = colQ("Mass", Q::Mass, us_);
+    if (kit::tableBegin("line_list", {{"Run"}, {"Size"}, {"Material"}, {lenCol.c_str(), kit::TableAlign::Right}})) {
         for (const auto& l : lines) {
             kit::tableRow();
             const std::string run =
                 runName(jstr(l, "run_id")) + (jstr(l, "name").empty() ? "" : " \xc2\xb7 " + jstr(l, "name"));
             kit::tableCell(run.c_str());
-            kit::tableCell(("NPS " + fmtText(l, "nps") + " sch " + fmtText(l, "schedule")).c_str());
+            kit::tableCell((npsOf(l) + " sch " + fmtText(l, "schedule")).c_str());
             kit::tableCell(fmtText(l, "material").c_str());
-            kit::tableCell(val(l, "length_mm").c_str());
+            kit::tableCell(valQ(l, "length_mm", Q::Len, us_).c_str());
         }
     }
     kit::tableEnd();
@@ -3513,29 +3643,29 @@ void PipingPanel::drawBomForm(AppState& st) {
     const json& items = jarr(bom_, "items");
     kit::sectionHeader("Material take-off", "bom", nullptr, (int)items.size());
     if (kit::tableBegin("items", {{"Item"}, {"Size"}, {"Qty", kit::TableAlign::Right},
-                                  {"Mass (kg)", kit::TableAlign::Right}})) {
+                                  {massCol.c_str(), kit::TableAlign::Right}})) {
         for (const auto& it : items) {
             std::string kind = humanToken(jstr(it, "kind"));
             if (jstr(it, "kind") == "flange" && it.contains("flange_class"))
                 kind += " class " + fmtText(it, "flange_class");
             const std::string size =
-                "NPS " + fmtText(it, "nps") + (jstr(it, "schedule").empty() ? "" : " sch " + jstr(it, "schedule"));
+                npsOf(it) + (jstr(it, "schedule").empty() ? "" : " sch " + jstr(it, "schedule"));
             const std::string count = jstr(it, "kind") == "pipe" && jhas(it, "length_mm")
-                                          ? qty(it, "length_mm", U(kit::Unit::mm))
+                                          ? qtyQ(it, "length_mm", Q::Len, us_)
                                           : fmtText(it, "qty");
-            const std::string unitMass = "Unit mass " + qty(it, "unit_mass_kg", U(kit::Unit::kg));
+            const std::string unitMass = "Unit mass " + qtyQ(it, "unit_mass_kg", Q::Mass, us_);
             kit::tableRow();
             kit::tableCell(kind.c_str());
             kit::tableCell(size.c_str());
             kit::tableCell(count.c_str());
-            kit::tableCell(val(it, "mass_kg").c_str(), kit::Tone::Neutral, unitMass.c_str());
+            kit::tableCell(valQ(it, "mass_kg", Q::Mass, us_).c_str(), kit::Tone::Neutral, unitMass.c_str());
         }
     }
     kit::tableEnd();
 
     const json& spools = jarr(bom_, "spools");
     kit::sectionHeader("Spools", "bom", nullptr, (int)spools.size());
-    if (kit::tableBegin("spools", {{"Spool"}, {"Runs"}, {"Length (mm)", kit::TableAlign::Right},
+    if (kit::tableBegin("spools", {{"Spool"}, {"Runs"}, {lenCol.c_str(), kit::TableAlign::Right},
                                    {"Shop welds", kit::TableAlign::Right}})) {
         for (const auto& s : spools) {
             std::string runsTxt;
@@ -3546,7 +3676,7 @@ void PipingPanel::drawBomForm(AppState& st) {
             kit::tableRow();
             kit::tableCell((numbered ? "Spool " + id.substr(2) : id).c_str());
             kit::tableCell(runsTxt.c_str());
-            kit::tableCell(val(s, "length_mm").c_str());
+            kit::tableCell(valQ(s, "length_mm", Q::Len, us_).c_str());
             kit::tableCell(fmtText(s, "shop_welds").c_str());
         }
     }
@@ -3556,7 +3686,6 @@ void PipingPanel::drawBomForm(AppState& st) {
 
 void PipingPanel::drawFlowForm(AppState& st) {
     (void)st;
-    const char* mm = U(kit::Unit::mm);
     if (page_[(int)Form::Flow] != 1) {
         drawFlowSetup(st);
         return;
@@ -3567,11 +3696,11 @@ void PipingPanel::drawFlowForm(AppState& st) {
                      "compares with the 1-D estimate.");
         return;
     }
-    const char* pa = U(kit::Unit::Pa);
+    auto dpQ = [&](const json& o, const char* k) { return qtyQ(o, k, Q::PressPa, us_); };
     const std::string regime = jstr(flow_, "regime");
     const std::string regimeTxt = humanToken(regime);
     const bool conv = jbool(flow_, "converged", false);
-    const std::string dp = qty(flow_, "dp_pa", pa);
+    const std::string dp = dpQ(flow_, "dp_pa");
     // The outcome chips carry convergence, regime and the pressure drop; the card the rest.
     kit::chipFlowBegin("flow_outcome");
     kit::flowChip(conv ? "Converged" : "Not converged", conv ? kit::Tone::Ok : kit::Tone::Warn, true);
@@ -3586,7 +3715,7 @@ void PipingPanel::drawFlowForm(AppState& st) {
     const json& bd = jobj(flow_, "one_d_breakdown");
     if (hasOneD) {
         // Fittings-aware 1-D comparison of the run: Darcy friction + elbow/tee/reducer K.
-        rows.push_back({"1-D estimate", qty(flow_, "one_d_estimate_pa", pa)});
+        rows.push_back({"1-D estimate", dpQ(flow_, "one_d_estimate_pa")});
         if (jhas(flow_, "cfd_over_one_d")) {
             const double ratio = jnum(flow_, "cfd_over_one_d");
             // Within the measured bend over-prediction band the gap is the model's known bias.
@@ -3597,39 +3726,40 @@ void PipingPanel::drawFlowForm(AppState& st) {
             rows.push_back({"CFD / 1-D", kit::fmtValue(ratio, 3), tone});
         }
     } else {
-        rows.push_back({"Darcy estimate", qty(flow_, "darcy_estimate_pa", pa)});
+        rows.push_back({"Darcy estimate", dpQ(flow_, "darcy_estimate_pa")});
         if (jhas(flow_, "dp_pa") && darcyPa > 0.0) {
             const double ratio = jnum(flow_, "dp_pa") / darcyPa;
             rows.push_back({"CFD / Darcy", kit::fmtValue(ratio, 3),
                             std::fabs(ratio - 1.0) <= 0.25 ? kit::Tone::Ok : kit::Tone::Warn});
         }
     }
-    rows.push_back({"Mean velocity", qty(flow_, "mean_velocity_ms", U(kit::Unit::m_s))});
+    rows.push_back({"Mean velocity", qtyQ(flow_, "mean_velocity_ms", Q::Vel, us_)});
     rows.push_back({"Reynolds", val(flow_, "reynolds")});
-    rows.push_back({"Hydraulic diameter", qty(flow_, "hydraulic_diameter_mm", mm)});
-    rows.push_back({"Inlet area", qty(flow_, "inlet_area_mm2", U(kit::Unit::mm2))});
+    rows.push_back({"Hydraulic diameter", qtyQ(flow_, "hydraulic_diameter_mm", Q::Len, us_)});
+    rows.push_back({"Inlet area", qtyQ(flow_, "inlet_area_mm2", Q::Area, us_)});
     rows.push_back({"Mass imbalance", val(flow_, "mass_imbalance", 3)});
     rows.push_back({"Solver steps", fmtText(flow_, "steps")});
     rows.push_back({"Voxels", fmtText(flow_, "voxels")});
     const json& prov = jobj(flow_, "provenance");
-    if (jhas(prov, "voxel_mm")) rows.push_back({"Voxel size", qty(prov, "voxel_mm", mm, 3)});
+    if (jhas(prov, "voxel_mm")) rows.push_back({"Voxel size", qtyQ(prov, "voxel_mm", Q::Len, us_, 3)});
     if (!jstr(prov, "engine").empty()) rows.push_back({"Engine", humanToken(jstr(prov, "engine"))});
     kit::keyValueCard("flow_result", "Internal flow", "study_flow", rows);
     const json& legs = jobj(flow_, "extended_legs");
     if (!legs.empty())
         kit::dimText(("Between the run's end planes; end legs extended for the solve (inlet +" +
-                      qty(legs, "inlet_mm", mm) + ", outlet +" + qty(legs, "outlet_mm", mm) +
-                      "), whole domain " + qty(flow_, "dp_domain_pa", pa) + ".")
+                      qtyQ(legs, "inlet_mm", Q::Len, us_) + ", outlet +" + qtyQ(legs, "outlet_mm", Q::Len, us_) +
+                      "), whole domain " + dpQ(flow_, "dp_domain_pa") + ".")
                          .c_str());
     if (hasOneD) {
         kit::sectionHeader("1-D loss breakdown", "flow_arrow", nullptr, (int)jarr(bd, "fittings").size() + 1);
+        const std::string dpCol = colQ("dp", Q::PressPa, us_);
         if (kit::tableBegin("one_d", {{"Loss"}, {"Type"}, {"K", kit::TableAlign::Right},
-                                      {"dp (Pa)", kit::TableAlign::Right}})) {
+                                      {dpCol.c_str(), kit::TableAlign::Right}})) {
             kit::tableRow();
             kit::tableCell("Straight pipe");
             kit::tableCell("Friction");
             kit::tableCell(("f " + val(bd, "friction_factor", 3)).c_str());
-            kit::tableCell(val(bd, "friction_pa").c_str());
+            kit::tableCell(valQ(bd, "friction_pa", Q::PressPa, us_).c_str());
             for (const auto& f : jarr(bd, "fittings")) {
                 kit::tableRow();
                 const std::string id = jstr(f, "id");
@@ -3639,12 +3769,12 @@ void PipingPanel::drawFlowForm(AppState& st) {
                 kit::tableCell(id.empty() ? "Corner" : numbered ? ("Fitting " + id.substr(1)).c_str() : id.c_str());
                 kit::tableCell(humanToken(jstr(f, "type")).c_str());
                 kit::tableCell(val(f, "K", 3).c_str());
-                kit::tableCell(val(f, "dp_pa").c_str());
+                kit::tableCell(valQ(f, "dp_pa", Q::PressPa, us_).c_str());
             }
         }
         kit::tableEnd();
         if (darcyPa > 0.0)
-            kit::dimText(("Darcy straight-pipe friction over the flow path: " + qty(flow_, "darcy_estimate_pa", pa) +
+            kit::dimText(("Darcy straight-pipe friction over the flow path: " + dpQ(flow_, "darcy_estimate_pa") +
                           " (no fittings).")
                              .c_str());
     } else {
@@ -3657,14 +3787,14 @@ void PipingPanel::drawFlowForm(AppState& st) {
         xs.reserve(prof.size());
         ys.reserve(prof.size());
         for (const auto& p : prof) {
-            xs.push_back(jnum(p, "s_mm", (double)xs.size()));
-            ys.push_back(jnum(p, "p_pa", 0.0));
+            xs.push_back(toDisp(jnum(p, "s_mm", (double)xs.size()), Q::Len, us_));
+            ys.push_back(toDisp(jnum(p, "p_pa", 0.0), Q::PressPa, us_));
         }
         kit::sectionHeader("Pressure profile", "plots_view");
         kit::PlotSpec spec;
         spec.x = xs;
-        spec.xAxis = {"Distance along the path", mm};
-        spec.yAxis = {"Pressure", pa};
+        spec.xAxis = {"Distance along the path", unitOf(Q::Len, us_)};
+        spec.yAxis = {"Pressure", unitOf(Q::PressPa, us_)};
         spec.series.push_back({"Pressure", ys});
         kit::linePlot("pressure_profile", spec);
     }
@@ -3674,7 +3804,7 @@ void PipingPanel::drawFlowForm(AppState& st) {
 
 void PipingPanel::drawFlowSetup(AppState& st) {
     const json& runs = jarr(network_, "runs");
-    const char* mm = U(kit::Unit::mm);
+    const kit::FieldOpts len = fieldQ(Q::Len, us_);
     static const char* const kSources[] = {"This document", "STL file"};
     static const char* const kSourceTips[] = {"The open part's solid is the fluid volume.",
                                               "A fluid-volume STL from disk."};
@@ -3721,13 +3851,13 @@ void PipingPanel::drawFlowSetup(AppState& st) {
         kit::secondaryButton("Assign inlet from run end###inlet_port");
         std::string droppedRun; int droppedEnd = 0;
         if (acceptRunPort(st, droppedRun, droppedEnd)) assignFlowPort(st, true, droppedRun, droppedEnd);
-        setupEdited_ |= kit::fieldVec3("inlet", "Inlet point", inlet_, kit::FieldOpts().withUnit(mm));
+        setupEdited_ |= kit::fieldVec3("inlet", "Inlet point", inlet_, kit::FieldOpts(len));
         setupEdited_ |= kit::fieldVec3("inlet_n", "Inlet normal", inletN_,
                        kit::FieldOpts().withCellHints(kNormHints).withGroupCommit()
                            .withTip("Points into the fluid volume."));
         kit::secondaryButton("Assign outlet from run end###outlet_port");
         if (acceptRunPort(st, droppedRun, droppedEnd)) assignFlowPort(st, false, droppedRun, droppedEnd);
-        setupEdited_ |= kit::fieldVec3("outlet", "Outlet point", outlet_, kit::FieldOpts().withUnit(mm));
+        setupEdited_ |= kit::fieldVec3("outlet", "Outlet point", outlet_, kit::FieldOpts(len));
         setupEdited_ |= kit::fieldVec3("outlet_n", "Outlet normal", outletN_,
                        kit::FieldOpts().withCellHints(kNormHints).withGroupCommit()
                            .withTip("Points into the fluid volume."));
@@ -3757,21 +3887,21 @@ void PipingPanel::drawFlowSetup(AppState& st) {
         }
         if (flowFluid_ == countOf(kFluidKeys)) {
             setupEdited_ |= kit::fieldNumber("density", "Density", &flowDensity_,
-                             kit::FieldOpts().withUnit(kit::Unit::kg_m3).withMin(0.0).withRequired());
+                             fieldQ(Q::Dens, us_).withMin(0.0).withRequired());
             setupEdited_ |= kit::fieldNumber("viscosity", "Viscosity", &flowViscosity_,
-                             kit::FieldOpts().withUnit(kit::Unit::Pa_s).withMin(0.0).withRequired()
+                             fieldQ(Q::Visc, us_).withMin(0.0).withRequired()
                                  .withTip("Dynamic viscosity."));
         }
         setupEdited_ |= kit::fieldEnum("rate_mode", "Specify", &flowRateMode_, kRates, 2);
         if (flowRateMode_ == 0)
             setupEdited_ |= kit::fieldNumber("velocity", "Mean velocity", &flowVelocity_,
-                             kit::FieldOpts().withUnit(kit::Unit::m_s).withMin(0.0).withRequired());
+                             fieldQ(Q::Vel, us_).withMin(0.0).withRequired());
         else
             setupEdited_ |= kit::fieldNumber("flow_rate", "Volume flow", &flowRateM3h_,
-                             kit::FieldOpts().withUnit(kit::Unit::m3_h).withMin(0.0).withRequired());
+                             fieldQ(Q::Flow, us_).withMin(0.0).withRequired());
         bool voxelSet = flowVoxelMm_ > 0.0;
         if (kit::fieldNumber("voxel", "Voxel size", &flowVoxelMm_,
-                             kit::FieldOpts().withUnit(mm).withMin(0.0).withPresent(&voxelSet).withHint("Auto")
+                             kit::FieldOpts(len).withMin(0.0).withPresent(&voxelSet).withHint("Auto")
                                  .withTip("Lattice spacing; leave empty to let the engine resolve the bore."))) {
             if (!voxelSet) flowVoxelMm_ = 0.0;
             setupEdited_ = true;
@@ -3789,7 +3919,7 @@ void PipingPanel::drawFlowSetup(AppState& st) {
 
 void PipingPanel::drawVesselForm(AppState& st) {
     (void)st;
-    const char* mm = U(kit::Unit::mm);
+    const kit::FieldOpts len = fieldQ(Q::Len, us_);
     static const char* const kSizeBy[] = {"Shell length", "Volume"};
     static const char* const kOrient[] = {"Vertical", "Horizontal"};
     if (page_[(int)Form::Vessel] == 1) {
@@ -3801,28 +3931,29 @@ void PipingPanel::drawVesselForm(AppState& st) {
         }
         const json& shell = jobj(vessel_, "shell");
         const json& heads = jobj(vessel_, "heads");
-        const char* kpa = U(kit::Unit::kPa);
+        auto lenQ = [&](const json& o, const char* k, int sig) { return qtyQ(o, k, Q::Len, us_, sig); };
+        auto kpaQ = [&](const json& o, const char* k) { return qtyQ(o, k, Q::Press, us_); };
         warningsList(vessel_);
         std::string headType = fmtText(heads, "type");
         for (int i = 0; i < countOf(kHeadKeys); ++i)
             if (headType == kHeadKeys[i]) headType = kHeadLabels[i];
         kit::keyValueCard("shell", "Shell (UG-27)", "vessel",
-                          {{"Thickness (required)", qty(shell, "t_required_mm", mm, 3)},
-                           {"Thickness (nominal)", qty(shell, "t_nominal_mm", mm, 3)},
-                           {"MAWP", qty(shell, "mawp_kpa", kpa)}});
+                          {{"Thickness (required)", lenQ(shell, "t_required_mm", 3)},
+                           {"Thickness (nominal)", lenQ(shell, "t_nominal_mm", 3)},
+                           {"MAWP", kpaQ(shell, "mawp_kpa")}});
         kit::keyValueCard("heads", "Heads (UG-32)", "vessel",
                           {{"Type", headType},
-                           {"Thickness (required)", qty(heads, "t_required_mm", mm, 3)},
-                           {"Thickness (nominal)", qty(heads, "t_nominal_mm", mm, 3)},
-                           {"MAWP", qty(heads, "mawp_kpa", kpa)},
-                           {"Depth", qty(heads, "depth_mm", mm)}});
+                           {"Thickness (required)", lenQ(heads, "t_required_mm", 3)},
+                           {"Thickness (nominal)", lenQ(heads, "t_nominal_mm", 3)},
+                           {"MAWP", kpaQ(heads, "mawp_kpa")},
+                           {"Depth", lenQ(heads, "depth_mm", 4)}});
         kit::keyValueCard("vessel", "Vessel", "vessel",
-                          {{"Hydrotest (UG-99b)", qty(vessel_, "hydrotest_kpa", kpa)},
-                           {"Volume", qty(vessel_, "volume_m3", U(kit::Unit::m3))},
-                           {"Shell length", qty(vessel_, "tan_tan_length_mm", mm)},
-                           {"Empty mass", qty(vessel_, "mass_empty_kg", U(kit::Unit::kg))},
-                           {"Operating mass", qty(vessel_, "mass_operating_kg", U(kit::Unit::kg))},
-                           {"Full of water", qty(vessel_, "mass_full_water_kg", U(kit::Unit::kg))}});
+                          {{"Hydrotest (UG-99b)", kpaQ(vessel_, "hydrotest_kpa")},
+                           {"Volume", qtyQ(vessel_, "volume_m3", Q::Vol, us_)},
+                           {"Shell length", lenQ(vessel_, "tan_tan_length_mm", 4)},
+                           {"Empty mass", qtyQ(vessel_, "mass_empty_kg", Q::Mass, us_)},
+                           {"Operating mass", qtyQ(vessel_, "mass_operating_kg", Q::Mass, us_)},
+                           {"Full of water", qtyQ(vessel_, "mass_full_water_kg", Q::Mass, us_)}});
         // Start another record here; Delete is the header's action.
         if (kit::secondaryButton("New vessel###new_vessel", !vesselSlot_.id.empty(), "This vessel is not saved yet.")) {
             vesselSlot_ = Slot{};
@@ -3836,15 +3967,15 @@ void PipingPanel::drawVesselForm(AppState& st) {
     if (kit::cardBegin("geometry", "Geometry", "vessel")) {
         kit::FieldGroup g("geometry_fields", "Inside diameter");
         setupEdited_ |= kit::fieldNumber("id", "Inside diameter", &vesselIdMm_,
-                         kit::FieldOpts().withUnit(mm).withMin(0.0).withRequired());
+                         kit::FieldOpts(len).withMin(0.0).withRequired());
         setupEdited_ |= kit::fieldEnum("size_by", "Size by", &vesselSizeBy_, kSizeBy, 2);
         if (vesselSizeBy_ == 0)
             setupEdited_ |= kit::fieldNumber("tt", "Shell length", &vesselTtMm_,
-                             kit::FieldOpts().withUnit(mm).withMin(0.0).withRequired()
+                             kit::FieldOpts(len).withMin(0.0).withRequired()
                                  .withTip("Tangent-to-tangent length of the cylindrical shell."));
         else
             setupEdited_ |= kit::fieldNumber("volume", "Volume", &vesselVolM3_,
-                             kit::FieldOpts().withUnit(kit::Unit::m3).withMin(0.0).withRequired());
+                             fieldQ(Q::Vol, us_).withMin(0.0).withRequired());
         setupEdited_ |= kit::fieldEnum("heads", "Heads", &vesselHead_, kHeadLabels, countOf(kHeadLabels));
         setupEdited_ |= kit::fieldEnum("orientation", "Orientation", &vesselOrient_, kOrient, 2);
     }
@@ -3853,12 +3984,12 @@ void PipingPanel::drawVesselForm(AppState& st) {
     if (kit::cardBegin("design", "Design (ASME VIII-1)", "settings")) {
         kit::FieldGroup g("design_fields", "Corrosion allowance");
         setupEdited_ |= kit::fieldNumber("p", "Design pressure", &vesselPKpa_,
-                         kit::FieldOpts().withUnit(kit::Unit::kPa).withMin(0.0).withRequired()
+                         fieldQ(Q::Press, us_).withMin(0.0).withRequired()
                              .withTip("Gauge design pressure."));
-        setupEdited_ |= kit::fieldNumber("t", "Design temperature", &vesselTC_, kit::FieldOpts().withUnit(kit::Unit::DegC));
+        setupEdited_ |= kit::fieldNumber("t", "Design temperature", &vesselTC_, fieldQ(Q::Temp, us_));
         setupEdited_ |= kit::fieldEnum("material", "Material", &vesselMaterial_, kVesselMaterials, countOf(kVesselMaterials));
         setupEdited_ |= kit::fieldNumber("ca", "Corrosion allowance", &vesselCaMm_,
-                         kit::FieldOpts().withUnit(mm).withMin(0.0).withHint("3"));
+                         kit::FieldOpts(len).withMin(0.0).withHint(hintQ(3.0, Q::Len, us_).c_str()));
         setupEdited_ |= kit::fieldNumber("e", "Joint efficiency E", &vesselE_,
                          kit::FieldOpts().withRange(0.0, 1.0).withHint("0.85")
                              .withTip("UW-12 weld joint efficiency (0.85 spot RT, 1.0 full RT)."));
@@ -3868,7 +3999,7 @@ void PipingPanel::drawVesselForm(AppState& st) {
     if (kit::cardBegin("contents", "Contents", "fluid")) {
         kit::FieldGroup g("contents_fields", "Fluid density");
         setupEdited_ |= kit::fieldNumber("rho", "Fluid density", &vesselRho_,
-                         kit::FieldOpts().withUnit(kit::Unit::kg_m3).withMin(0.0).withHint("1,000"));
+                         fieldQ(Q::Dens, us_).withMin(0.0).withHint(hintQ(1000.0, Q::Dens, us_).c_str()));
         setupEdited_ |= kit::fieldSlider("fill", "Fill", &vesselFill_, 0.0, 1.0,
                          kit::FieldOpts().withScale(100.0).withUnit(kit::Unit::Percent)
                              .withTip("Operating liquid level as a fraction of the volume."));
@@ -3891,25 +4022,28 @@ void PipingPanel::drawDuctForm(AppState& st) {
         for (const auto& id : jarr(duct_, "critical_path"))
             if (id.is_string()) path += (path.empty() ? "" : " \xc2\xb7 ") + id.get<std::string>();
         kit::keyValueCard("duct_result", "Duct system", "duct",
-                          {{"Fan static pressure", qty(duct_, "fan_static_pa", U(kit::Unit::Pa))},
+                          {{"Fan static pressure", qtyQ(duct_, "fan_static_pa", Q::DuctPa, us_)},
                            {"Critical path", path.empty() ? std::string(kEmDash) : path}});
         const json& segs = jarr(duct_, "segments");
         kit::sectionHeader("Segments", "duct", nullptr, (int)segs.size());
         // Sizes read "550 × 300" for rectangular ducts, so the size column gets the extra width.
+        const std::string sizeCol = colQ("Size", Q::Len, us_), velCol = colQ("v", Q::DuctVel, us_);
+        const std::string dpCol = colQ("dp", Q::DuctPa, us_);
         if (kit::tableBegin("duct_segments", {{"Segment", kit::TableAlign::Left, 1.1f},
-                                              {"Size (mm)", kit::TableAlign::Right, 1.5f},
-                                              {"v (m/s)", kit::TableAlign::Right, 0.8f},
-                                              {"dp (Pa)", kit::TableAlign::Right, 0.8f}})) {
+                                              {sizeCol.c_str(), kit::TableAlign::Right, 1.5f},
+                                              {velCol.c_str(), kit::TableAlign::Right, 0.8f},
+                                              {dpCol.c_str(), kit::TableAlign::Right, 0.8f}})) {
             for (const auto& s : segs) {
                 const std::string size = jhas(s, "width_mm")
-                                             ? val(s, "width_mm") + " \xc3\x97 " + val(s, "height_mm")
-                                             : "\xe2\x8c\x80 " + val(s, "diameter_mm");
+                                             ? valQ(s, "width_mm", Q::Len, us_) + " \xc3\x97 " +
+                                                   valQ(s, "height_mm", Q::Len, us_)
+                                             : "\xe2\x8c\x80 " + valQ(s, "diameter_mm", Q::Len, us_);
                 const std::string re = "Reynolds " + val(s, "reynolds", 3);
                 kit::tableRow();
                 kit::tableCell(jstr(s, "id").c_str(), kit::Tone::Neutral, re.c_str());
                 kit::tableCell(size.c_str());
-                kit::tableCell(val(s, "velocity_ms", 3).c_str());
-                kit::tableCell(val(s, "dp_total_pa").c_str());
+                kit::tableCell(valQ(s, "velocity_ms", Q::DuctVel, us_, 3).c_str());
+                kit::tableCell(valQ(s, "dp_total_pa", Q::DuctPa, us_).c_str());
             }
         }
         kit::tableEnd();
@@ -3927,14 +4061,15 @@ void PipingPanel::drawDuctForm(AppState& st) {
         if (kit::cardBegin("design", "Design (equal friction)", "settings")) {
             kit::FieldGroup g("design_fields", "Air temperature");
             setupEdited_ |= kit::fieldNumber("friction", "Friction rate", &ductFriction_,
-                             kit::FieldOpts().withUnit("Pa/m").withMin(0.0).withHint("1"));
+                             fieldQ(Q::Friction, us_).withMin(0.0).withHint(hintQ(1.0, Q::Friction, us_).c_str()));
             setupEdited_ |= kit::fieldNumber("vmax", "Max velocity", &ductVmax_,
-                             kit::FieldOpts().withUnit(kit::Unit::m_s).withMin(0.0).withHint("10"));
+                             fieldQ(Q::DuctVel, us_).withMin(0.0).withHint(hintQ(10.0, Q::DuctVel, us_).c_str()));
             setupEdited_ |= kit::fieldNumber("air_t", "Air temperature", &ductTempC_,
-                             kit::FieldOpts().withUnit(kit::Unit::DegC).withHint("20"));
+                             fieldQ(Q::Temp, us_).withHint(hintQ(20.0, Q::Temp, us_).c_str()));
+            const std::string roughTip = "Galvanized steel is about " + fmtQ(0.09, Q::Len, us_, 2) + ".";
             setupEdited_ |= kit::fieldNumber("rough", "Roughness", &ductRoughMm_,
-                             kit::FieldOpts().withUnit(kit::Unit::mm).withMin(0.0).withHint("0.09")
-                                 .withTip("Galvanized steel is about 0.09 mm."));
+                             fieldQ(Q::Len, us_).withMin(0.0).withHint(hintQ(0.09, Q::Len, us_).c_str())
+                                 .withTip(roughTip.c_str()));
         }
         kit::cardEnd();
         return;
@@ -4001,9 +4136,9 @@ void PipingPanel::drawDuctForm(AppState& st) {
                 setupEdited_ = true;
             }
             setupEdited_ |= kit::fieldNumber("airflow", "Airflow", &d.airflow,
-                             kit::FieldOpts().withUnit(kit::Unit::m3_s).withMin(0.0).withRequired());
+                             fieldQ(Q::Airflow, us_).withMin(0.0).withRequired());
             setupEdited_ |= kit::fieldNumber("length", "Length", &d.length,
-                             kit::FieldOpts().withUnit(kit::Unit::m).withMin(0.0).withRequired());
+                             fieldQ(Q::Span, us_).withMin(0.0).withRequired());
             setupEdited_ |= kit::fieldNumber("k", "Fitting loss (K)", &d.k,
                              kit::FieldOpts().withMin(0.0).withHint("0")
                                  .withTip("Sum of the loss coefficients of the segment's fittings (elbows, "

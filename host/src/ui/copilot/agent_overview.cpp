@@ -9,10 +9,10 @@
 namespace ui {
 namespace {
 
-constexpr int    kAgentRows   = 5;    // sub-agent rows shown before "… N more — expand"
-constexpr int    kTodoRows    = 6;    // todo rows shown before "… N more — expand"
-constexpr int    kScrollRows  = 12;   // an expanded list scrolls past this many rows
-constexpr size_t kInlineSteps = 6;    // recent steps shown under a clicked sub-agent
+constexpr int    kAgentRows   = 5;      // sub-agent rows shown before "… N more — expand"
+constexpr int    kTodoRows    = 6;      // todo rows shown before "… N more — expand"
+constexpr size_t kInlineSteps = 6;      // recent steps shown under a clicked sub-agent
+constexpr float  kMaxHeightFrac = 0.35f;   // block cap: share of the host column's height
 
 struct ConvUi {
     int  openOverride = -1;    // -1 follow the run (open while it runs), 0 closed, 1 open
@@ -88,13 +88,17 @@ bool stepStatus(const std::string& s, kit::Status* out) {
 
 ImU32 ink(const ImVec4& c) { return ImGui::ColorConvertFloat4ToU32(c); }
 
-// Whole-second readout so a ticking elapsed never flickers tenths.
-std::string elapsedText(double seconds) { return kit::fmtDuration(std::floor(seconds)); }
+std::string elapsedText(double seconds) { return kit::fmtDuration(seconds); }
 
+// Wall time the trace saw the agent working; < 0 when unknown. A running agent counts up to
+// now; a finished one spans start -> end (else its last step). A finished agent whose whole
+// life fell inside one event batch has no measurable span — unknown, not "0.0 s".
 double agentElapsed(const AgentTraceAgent& a, double now) {
-    if (a.startTs <= 0.0) return 0.0;
-    const double end = a.status == "running" ? now : (a.endTs > 0.0 ? a.endTs : a.lastStepTs);
-    return std::max(0.0, end - a.startTs);
+    if (a.startTs <= 0.0) return -1.0;
+    if (a.status == "running") return std::max(0.0, now - a.startTs);
+    const double end = a.endTs > 0.0 ? a.endTs : a.lastStepTs;
+    const double span = end - a.startTs;
+    return span >= 0.05 ? span : -1.0;
 }
 
 float glyphR(float lineH) { return lineH * 0.30f; }   // kit's status-mark ratio (cell * 0.30)
@@ -114,18 +118,6 @@ void moreRow(const char* id, int hidden, bool* all) {
     kit::rowEnd();
 }
 
-// A list longer than kScrollRows scrolls inside a bounded child once expanded.
-bool beginList(const char* id, int rows, float rowH, bool expanded) {
-    if (!expanded || rows <= kScrollRows) return false;
-    ImGui::BeginChild(id, ImVec2(0.0f, rowH * (float)kScrollRows), ImGuiChildFlags_None,
-                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
-    return true;
-}
-void endList(bool scrolled) {
-    if (!scrolled) return;
-    drawWindowPillScrollbarV(chatSurf());
-    ImGui::EndChild();
-}
 
 // ---- todo checklist --------------------------------------------------------------------------
 void drawTodoRow(const PlanItem& it, int idx, bool active, const ui::Fonts& fonts) {
@@ -181,10 +173,7 @@ void drawTodos(ConvUi& cu, const ui::Fonts& fonts, bool first) {
         from = std::clamp(t.active - 1, 0, total - kTodoRows);
         to = from + kTodoRows;
     }
-    const float rowH = ImGui::GetTextLineHeight() + kit::padY();
-    const bool scrolled = beginList("##todo_list", total, rowH, cu.todosAll);
     for (int i = from; i < to; ++i) drawTodoRow(*t.items[(size_t)i], i, i == t.active, fonts);
-    endList(scrolled);
     if (total > kTodoRows) moreRow("##todo_more", total - (to - from), &cu.todosAll);
 }
 
@@ -262,18 +251,27 @@ void drawAgentRow(AppState& st, const std::string& convId, ConvUi& cu,
     x += lineH + ui::metrics::U(1.5f);
     const float textX = x;
 
-    // Right-aligned numbers: tool calls, then elapsed (ticking while the agent runs).
+    // Priority on the first line: name > elapsed > tool count > brief. Right-aligned numbers
+    // first (elapsed ticks while the agent runs), then the name takes what it needs and the dim
+    // brief only gets what is left.
     float right = p0.x + w - kit::padX();
-    const std::string el = elapsedText(agentElapsed(a, now));
-    const float ew = ImGui::CalcTextSize(el.c_str()).x;
-    dl->AddText(ImVec2(right - ew, top), ink(live ? surf.textSecondary : surf.textTertiary),
-                el.c_str());
-    right -= ew + ui::metrics::U(2);
+    const float gap = ui::metrics::U(1.5f);
+    const double secs = agentElapsed(a, now);
+    if (secs >= 0.0) {
+        const std::string el = elapsedText(secs);
+        const float ew = ImGui::CalcTextSize(el.c_str()).x;
+        dl->AddText(ImVec2(right - ew, top), ink(live ? surf.textSecondary : surf.textTertiary),
+                    el.c_str());
+        right -= ew + ui::metrics::U(2);
+    }
+    ImGui::PushFont(fonts.medium);
+    const float nameW = ImGui::CalcTextSize(a.name.c_str()).x;
+    ImGui::PopFont();
     if (a.toolCount > 0) {
         char tools[32];
         std::snprintf(tools, sizeof(tools), "%d tool%s", a.toolCount, a.toolCount == 1 ? "" : "s");
         const float tw = ImGui::CalcTextSize(tools).x;
-        if (right - tw > x + lineH * 3.0f) {
+        if (right - tw - ui::metrics::U(2) >= x + nameW) {   // only when the name still fits whole
             dl->AddText(ImVec2(right - tw, top),
                         ink(a.failCount > 0 ? kit::toneOn(kit::Tone::Err, surf) : surf.textTertiary),
                         tools);
@@ -282,11 +280,11 @@ void drawAgentRow(AppState& st, const std::string& convId, ConvUi& cu,
     }
 
     ImGui::PushFont(fonts.medium);
-    const std::string name = kit::elide(a.name.c_str(), std::max((right - x) * 0.6f, lineH));
+    const std::string name = kit::elide(a.name.c_str(), std::max(right - x, lineH));
     dl->AddText(ImVec2(x, top), ink(surf.textPrimary), name.c_str());
-    x += ImGui::CalcTextSize(name.c_str()).x + ui::metrics::U(1.5f);
+    x += ImGui::CalcTextSize(name.c_str()).x + gap;
     ImGui::PopFont();
-    if (!a.brief.empty() && x < right) {
+    if (!a.brief.empty() && right - x >= lineH * 2.0f) {   // a brief stub shorter than this is noise
         const size_t nl = a.brief.find('\n');
         const std::string brief = kit::elide(
             (nl == std::string::npos ? a.brief : a.brief.substr(0, nl)).c_str(), right - x);
@@ -305,6 +303,10 @@ void drawAgentRow(AppState& st, const std::string& convId, ConvUi& cu,
     if (hovered) {
         std::string tip = a.name;
         if (!a.brief.empty()) tip += "\n" + a.brief;
+        if (a.toolCount > 0) {
+            tip += "\n" + std::to_string(a.toolCount) + (a.toolCount == 1 ? " tool call" : " tool calls");
+            if (a.failCount > 0) tip += " (" + std::to_string(a.failCount) + " failed)";
+        }
         if (!a.model.empty()) tip += "\nModel: " + a.model;
         if (!a.note.empty())  tip += "\n" + a.note;
         tip += inspecting ? "\nClick to hide its recent steps." : "\nClick to show its recent steps.";
@@ -339,12 +341,9 @@ void drawAgents(AppState& st, const std::string& convId, ConvUi& cu, const ui::F
         for (int i = 0; i < total && shown < kAgentRows; ++i)
             if (!keep[(size_t)i]) { keep[(size_t)i] = 1; ++shown; }
     }
-    const float rowH = ImGui::GetTextLineHeight() * 2.0f + kit::padY();
-    const bool scrolled = beginList("##agent_list", total, rowH, cu.agentsAll);
     const double now = chatNowEpoch();
     for (int i = 0; i < total; ++i)
         if (keep[(size_t)i]) drawAgentRow(st, convId, cu, s_agents[(size_t)i], fonts, now);
-    endList(scrolled);
     if (total > kAgentRows) moreRow("##agent_more", total - shown, &cu.agentsAll);
 }
 
@@ -407,6 +406,9 @@ void drawAgentOverview(AppState& st, float width) {
     }
 
     const ui::Fonts& fonts = st.fonts;
+    // The block never takes more than kMaxHeightFrac of the host column (the window this is
+    // drawn into): past that its body scrolls, so the composer below always stays in view.
+    const float hostH = ImGui::GetWindowHeight();
     ImGui::PushID("agent_overview");
     kit::pushDensity(kit::Density::Compact);
     ImGui::BeginChild("##agent_overview_host", ImVec2(width, 0.0f), ImGuiChildFlags_AutoResizeY,
@@ -436,12 +438,22 @@ void drawAgentOverview(AppState& st, float width) {
         ImGui::PopStyleColor();
     }
     if (body) {
-        bool first = true;
-        if (todoOpen) {
-            drawTodos(cu, fonts, first);
-            first = false;
+        // Header (title row + head gap + card padding) stays pinned; only the body scrolls.
+        const float headerBlock = lineH + kit::headGap() + kit::padY() * 2.0f + ui::metrics::U(1);
+        const float bodyMax = std::max(hostH * kMaxHeightFrac - headerBlock, lineH * 3.0f);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f), ImVec2(FLT_MAX, bodyMax));
+        if (ImGui::BeginChild("##agent_overview_body", ImVec2(0.0f, 0.0f),
+                              ImGuiChildFlags_AutoResizeY,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground)) {
+            bool first = true;
+            if (todoOpen) {
+                drawTodos(cu, fonts, first);
+                first = false;
+            }
+            if (!s_agents.empty()) drawAgents(st, convId, cu, fonts, nRun, first);
+            drawWindowPillScrollbarV(chatSurf());
         }
-        if (!s_agents.empty()) drawAgents(st, convId, cu, fonts, nRun, first);
+        ImGui::EndChild();
     }
     kit::cardEnd();
     ImGui::PopFont();

@@ -129,7 +129,7 @@ public:
     // the network study as results.pump_drive[<run id>].
     bool runPumpDrive(AppState& st);
     const nlohmann::json& pumpDrives() const { return pumpDrive_; }
-    // What a click on the current form's page switch / the "Colour pipes by" control does
+    // What a click on the current form's page switch / the "Color pipes by" control does
     // (scripted review, CHUDWARE_SHOT=demoreview). Pages: Solve 0 Conditions, 1 Results, 2 Pump
     // drive; Spec 0 Design basis, 1 Results. colorBy: 0 none, 1 pressure, 2 velocity.
     void setPage(Form f, int page);
@@ -190,6 +190,18 @@ public:
     // duct forms show no pipe legend, so their pipes draw uncoloured rather than unexplained.
     int colorBy() const { return form_ == Form::Vessel || form_ == Form::Duct ? 0 : colorBy_; }
 
+    // ---- display units ----------------------------------------------------------------------
+    // Display AND input follow the Simulation pane's unit choice (SimManager::unitSys: Follow
+    // document / SI / US customary): US shows in, ft, psi, °F, gpm, lb, ...; SI shows the
+    // network's native mm, m, kPa, °C, m³/h, kg. Engine values and every stored member stay SI.
+    // syncUnits() re-resolves the system (draw, study rows, setStudies and the viewport tool call
+    // it) and refreshes the cached row text when it changes.
+    void syncUnits(const AppState& st);
+    // Display length unit ("in" / "mm") and its size in canonical mm (25.4 / 1): a typed bare
+    // length is in this unit.
+    const char* lengthUnit() const;
+    double lengthUnitMm() const { return us_ ? 25.4 : 1.0; }
+
 private:
     using Slot = sim::StudyRecordStore::Slot;
 
@@ -247,6 +259,8 @@ private:
     void showPanel(AppState& st);
     // Status line owned by form `f` (shown only while `f` is the visible form).
     void say(Form f, const std::string& text, int tone);
+    // say() an action's outcome: Ok, or Warn with result["warnings"] listed under the line.
+    void sayWarn(Form f, const std::string& text, const nlohmann::json& result);
     void newNetwork(AppState& st);
     void deleteNetwork(AppState& st);
     // The saved record the header's Delete action removes on this form: 0 none, 1 network,
@@ -345,7 +359,12 @@ private:
     std::uint64_t endpointGeneration_[2] = {};
     bool endpointResolving_[2] = {};
     bool routePathOpen_ = false;   // "Path points" card disclosure
-    bool revealRoute_ = false;     // scroll the "Last route" card (its warnings) into view once
+    // Footer: the status line that announced warnings (sayWarn), those warnings (listed under the
+    // line behind an expandable "N warnings" chip) and whether the list is open.
+    std::string warnStatus_;
+    std::vector<std::string> warnList_;
+    bool warnOpen_ = false;
+    bool us_ = false;              // US customary display/input (see syncUnits)
 
     // ---- solve form ----
     struct Boundary {
@@ -437,6 +456,7 @@ private:
     const void* legendLinks_ = nullptr;
     const void* legendNodes_ = nullptr;
     int legendColorBy_ = -1;
+    bool legendUs_ = false;
     bool legendRangeValid_ = false;
     float pipeLegendMin_ = 0, pipeLegendMax_ = 0;
     std::string pipeLegendTitle_, pipeLegendUnits_;
@@ -447,6 +467,7 @@ private:
     };
     struct FittingRow { std::string id, label, runLabel; nlohmann::json native; };
     mutable std::uint64_t rowsRevision_ = 0;
+    mutable bool rowsUs_ = false;
     mutable std::vector<RunRow> runRows_;
     mutable std::vector<FittingRow> fittingRows_;
     mutable std::vector<std::string> runLabels_, flowRunLabels_;

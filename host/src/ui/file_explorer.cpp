@@ -123,11 +123,17 @@ struct ExplorerPlmState {
     int hubGeneration = -1;
     unsigned serial = 0;
     bool loading = false, ready = false, checkpointing = false;
+    // The branch answer is independent of the (much slower) item scan: its own in-flight flag,
+    // and `branchKnown` once any answer landed, so the chip keeps the last value while a
+    // refresh is pending instead of flipping back to a loading label.
+    bool branchLoading = false, branchKnown = false;
     bool changesOpen = true, filesOpen = true;
     double fetchedAt = -1.0e9;
     char message[256] = {};
 };
 static ExplorerPlmState s_plm;
+// Last branch seen per project this session: switching back to a project shows it at once.
+static std::unordered_map<std::string, std::string> s_branchByProject;
 static constexpr double kPlmRefreshSeconds = 15.0;
 
 static std::string plmField(const nlohmann::json& row, const char* key) {
@@ -157,7 +163,6 @@ static void pollExplorerPlm(AppState& st, const std::string& project, bool force
     if (project != P.project) {
         ++P.serial;
         P.project = project;
-        P.branch.clear();
         P.error.clear();
         P.checkpointError.clear();
         P.checkpointOk.clear();
@@ -166,30 +171,47 @@ static void pollExplorerPlm(AppState& st, const std::string& project, bool force
         P.untracked.clear();
         P.ready = false;
         P.loading = false;
+        P.branchLoading = false;
         P.checkpointing = false;
         P.fetchedAt = -1.0e9;
         P.hubGeneration = -1;
+        const auto known = s_branchByProject.find(project);
+        P.branchKnown = known != s_branchByProject.end();
+        P.branch = P.branchKnown ? known->second : std::string();
     }
     if (!st.workerStarted) {
-        if (P.loading || P.ready || P.checkpointing) ++P.serial;
+        if (P.loading || P.ready || P.checkpointing || P.branchLoading) ++P.serial;
         if (P.checkpointing)
             P.checkpointError = "Connection lost during checkpoint; refresh to confirm its result.";
         P.checkpointing = false;
         P.loading = false;
+        P.branchLoading = false;
         P.ready = false;
-        P.branch.clear();
         P.fetchedAt = -1.0e9;
         return;
     }
-    if (project.empty() || P.loading || P.checkpointing) return;
+    if (project.empty() || P.loading || P.branchLoading || P.checkpointing) return;
     const double now = ImGui::GetTime();
     if (!force && P.hubGeneration == g_plmHub.generation &&
         now - P.fetchedAt < kPlmRefreshSeconds) return;
     P.loading = true;
+    P.branchLoading = true;
     P.error.clear();
     P.hubGeneration = g_plmHub.generation;
     P.fetchedAt = now;
     const unsigned serial = ++P.serial;
+    // Branch first: it is a single ref read, while the item list scans every tracked file
+    // for changes. The RPCs run in order, so this keeps the header from waiting on the scan.
+    st.rpc.call("plm_branch_list", {{"path", project}}, [project, serial, &st](const core::RpcResult& r) {
+        auto& state = s_plm;
+        if (state.serial != serial || state.project != project ||
+            st.plmProjectPath() != project) return;
+        state.branchLoading = false;
+        state.branchKnown = true;
+        std::string err;
+        state.branch = plmOk(r, err) ? plmField(r.result, "active") : std::string();
+        if (!state.branch.empty()) s_branchByProject[project] = state.branch;
+    });
     st.rpc.call("plm_item_list", {{"path", project}}, [project, serial, &st](const core::RpcResult& r) {
         auto& state = s_plm;
         if (state.serial != serial || state.project != project ||
@@ -230,13 +252,6 @@ static void pollExplorerPlm(AppState& st, const std::string& project, bool force
         };
         index(state.items);
         index(state.untracked);
-    });
-    st.rpc.call("plm_branch_list", {{"path", project}}, [project, serial, &st](const core::RpcResult& r) {
-        auto& state = s_plm;
-        if (state.serial != serial || state.project != project ||
-            st.plmProjectPath() != project) return;
-        std::string err;
-        state.branch = plmOk(r, err) ? plmField(r.result, "active") : std::string();
     });
 }
 
@@ -1073,11 +1088,15 @@ void drawFileExplorerBody(AppState& st) {
     const std::string projectTitle = project.empty() ? "No working project" : plmProjectName(st);
     kit::sectionHeader(projectTitle.c_str(), "body_folder", nullptr, -1, true);
     if (!project.empty()) {
+        // Last known branch while a refresh is pending; no chip at all until the first answer
+        // for this project arrives (a single ref read, issued ahead of the item scan).
         const char* branch = !st.workerStarted ? "Vault offline"
-            : s_plm.branch.empty() ? (s_plm.loading ? "Loading branch" : "Branch unavailable")
-                                   : s_plm.branch.c_str();
-        kit::chip(branch, kit::Tone::Neutral, false, "Active vault branch");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", project.c_str());
+            : !s_plm.branch.empty() ? s_plm.branch.c_str()
+            : s_plm.branchKnown ? "Branch unavailable" : nullptr;
+        if (branch) {
+            kit::chip(branch, kit::Tone::Neutral, false, "Active vault branch");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", project.c_str());
+        }
         drawChanges(st, project);
     } else {
         kit::emptyState("body_folder", "No working project",

@@ -461,6 +461,7 @@ private:
     std::vector<std::string> plotKeys_;
     std::uint64_t plotResultRevision_ = 0, plotCircuitRevision_ = 0;
     int plotPick_ = -1;
+    bool plotUs_ = false;   // plotCells_ were converted to US customary units (psi, gpm, in)
 
     // ---- BOM / piping handoff ----
     nlohmann::json bom_;

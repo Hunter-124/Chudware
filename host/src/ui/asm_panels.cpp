@@ -810,7 +810,7 @@ void AsmPanels::drawInsertBody(AppState& st) {
     pushText(pal.textDim);
     ImGui::TextUnformatted(hasComps
         ? "Inserted at the origin (drag/mate to position)."
-        : "First component is fixed automatically (SolidWorks behaviour).");
+        : "The first component is fixed in place automatically.");
     ImGui::PopStyleColor();
 
     if (!insertNote_.empty()) {

@@ -404,7 +404,10 @@ struct ResultField {
 };
 inline const ResultField kStaticFields[] = {
     {"von_mises", "von Mises stress", 0},
-    {"tresca", "Tresca shear stress", 0},
+    // P1 - P3 is the Tresca stress INTENSITY (twice the max shear stress); it is
+    // the quantity the Tresca criterion compares with yield, and it is always
+    // >= von Mises, so it must never be labelled as a shear stress.
+    {"tresca", "Tresca stress intensity (P1 - P3)", 0},
     {"abs_principal", "Max normal stress", 0},
     {"p1", "Max principal stress (P1)", 0},
     {"p3", "Min principal stress (P3)", 0},
@@ -462,10 +465,10 @@ struct RoughPreset {
 inline const RoughPreset kRoughness[6] = {
     {"Smooth / polished", 0.0f},
     {"Smooth paint / gelcoat", 6.0f},
-    {"Bare aluminium / sheet metal", 30.0f},
-    {"Galvanised / rough paint", 150.0f},
+    {"Bare aluminum / sheet metal", 30.0f},
+    {"Galvanized / rough paint", 150.0f},
     {"Cast / rough composite", 500.0f},
-    {"Custom (um)", 0.0f},
+    {"Custom (\xc2\xb5m)", 0.0f},
 };
 inline const int kNRoughness = 6;
 

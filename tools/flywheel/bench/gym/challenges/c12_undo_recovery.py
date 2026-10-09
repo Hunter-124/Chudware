@@ -13,8 +13,9 @@ Ground-truth ACs the gym grades ITSELF:
   AC4  post-recovery dimension/feature event seq > recovery tool seq
   AC5  no grind (identical bad op ≥threshold after recovery opportunity)
 
-Seeds: 1=clean recovery PASS; 2=grind (identical bad extrude after recovery);
-3=missing recovery tool (AC2/3/4 fail, battery still PASS so AC1 alone).
+Seeds: 1=clean recovery PASS; 2=grind (identical bad extrude after recovery — the battery
+predates them, so AC1 fails as stale); 3=missing recovery tool (AC2/3/4 fail, battery
+still PASS so AC1 alone).
 """
 from __future__ import annotations
 

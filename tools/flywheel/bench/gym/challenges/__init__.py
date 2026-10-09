@@ -183,11 +183,75 @@ def ledger_dimension(ledger: dict, name_substr: str) -> dict | None:
     return hit
 
 
-def ledger_artifact(ledger: dict, kind: str) -> dict | None:
-    for e in ledger.get("events", []):
-        if e.get("kind") == "artifact" and (e.get("payload") or {}).get("kind") == kind:
-            return e.get("payload")
+#: Tool calls that change the model/assembly a recorded check describes. A check
+#: artifact recorded BEFORE the last of these describes a superseded revision.
+MUTATING_TOOLS: frozenset[str] = frozenset({
+    "add_features", "new_part", "new_assembly", "import_part", "undo", "redo",
+    "asm_add_component", "asm_remove_component", "asm_move_component", "asm_mate",
+    "solve_mates", "make_standard_part", "sketch_auto_constrain", "set_material",
+    "set_config_override", "set_config_suppression", "activate_configuration",
+})
+
+
+def _event_tool(e: dict) -> str | None:
+    p = e.get("payload") or {}
+    if e.get("kind") == "tool_call" or (e.get("kind") == "agent_turn"
+                                        and p.get("event") == "tool_call"):
+        return str(p.get("tool") or "") or None
     return None
+
+
+def last_mutation_index(ledger: dict) -> int:
+    """Index of the last SUCCESSFUL mutating tool call in the ledger (-1 when none)."""
+    last = -1
+    for i, e in enumerate(ledger.get("events", []) or []):
+        p = e.get("payload") or {}
+        if _event_tool(e) in MUTATING_TOOLS and p.get("ok") is not False \
+                and not p.get("error"):
+            last = i
+    return last
+
+
+def final_checks(ledger: dict, kind: str) -> list[dict]:
+    """Every successful check artifact of *kind* recorded AFTER the last mutation, in
+    ledger order. A check that errored (``ok: false`` / ``error``) is no verdict at all;
+    one recorded before a later mutation is stale. Earlier checks remain in the ledger
+    as recovery diagnostics but never decide final acceptance."""
+    cut = last_mutation_index(ledger)
+    out = []
+    for i, e in enumerate(ledger.get("events", []) or []):
+        p = e.get("payload") or {}
+        if (i > cut and e.get("kind") == "artifact" and p.get("kind") == kind
+                and p.get("ok") is not False and not p.get("error")):
+            out.append(p)
+    return out
+
+
+def ledger_artifact(ledger: dict, kind: str) -> dict | None:
+    """The FINAL check of *kind*: the last successful one after the last mutation, or None
+    (never recorded, errored, or stale — see :func:`final_check_absence`)."""
+    hits = final_checks(ledger, kind)
+    return hits[-1] if hits else None
+
+
+def final_check_absence(ledger: dict, kind: str) -> str:
+    """Why :func:`ledger_artifact` found no final check of *kind* (for FAIL details)."""
+    seen = [e for e in ledger.get("events", []) or []
+            if e.get("kind") == "artifact" and (e.get("payload") or {}).get("kind") == kind]
+    if not seen:
+        return f"no {kind} artifact recorded"
+    return (f"no successful {kind} check after the last model mutation "
+            f"({len(seen)} earlier/errored {kind} artifact(s) are stale)")
+
+
+def last_record(ledger: dict, kind: str) -> dict | None:
+    """The last artifact of *kind* regardless of later mutations — for RECORDS of what was
+    created (e.g. a standard part), not for checks of the final state."""
+    hit = None
+    for e in ledger.get("events", []) or []:
+        if e.get("kind") == "artifact" and (e.get("payload") or {}).get("kind") == kind:
+            hit = e.get("payload")
+    return hit
 
 
 def ledger_decision_value(ledger: dict, decision_id: str, key: str) -> Any:

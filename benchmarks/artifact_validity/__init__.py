@@ -1,4 +1,4 @@
-"""artifact_validity — the harness's aggregate self-measurement.
+"""artifact_validity — artifact-graded task trials of the in-app agent.
 
-See ``scoring.LIMITS`` for what this benchmark deliberately does NOT measure.
+See README.md for how to run it, what a PASS means and what it does not measure.
 """

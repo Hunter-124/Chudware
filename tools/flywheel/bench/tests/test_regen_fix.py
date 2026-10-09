@@ -77,3 +77,73 @@ def test_result_json_roundtrips(corpus):
     assert back.bench_id == "regen_fix"
     assert len(back.examples) == 10
     assert back.examples[0].structure  # held-out structure recorded
+
+
+# ---- P1-7: a live verification that cannot run is an ERROR, never a structural pass ----
+
+def _fixable():
+    """A det-fixable corruption whose deterministic fix passes every STRUCTURAL check."""
+    seed = RC.load_seed()
+    corrupted, _ = RC.mutate(seed, "suppressed_parent", __import__("random").Random(1))
+    fixed, claimed = RF.deterministic_fix({"tree": corrupted})
+    assert claimed and not RF._has_anomaly(fixed)
+    return fixed, {"tree": seed}
+
+
+def _ok_opener(doc):
+    return {"doc_id": "d", "rebuilt": True, "error": None}
+
+
+def _raising_opener(doc):
+    raise RuntimeError("core hiccup")
+
+
+def _ok_compare(a, b):
+    return 100.0
+
+
+@pytest.mark.parametrize("opener, compare, why", [
+    (_raising_opener, _ok_compare, "core hiccup"),
+    (_ok_opener, lambda a, b: None, "degraded"),
+    (_ok_opener, lambda a, b: (_ for _ in ()).throw(RuntimeError("compare died")), "compare died"),
+])
+def test_failed_live_verification_is_an_error_not_a_pass(opener, compare, why):
+    fixed, good = _fixable()
+    score, passed, detail = RF.verify_fix(fixed, True, {}, good_document=good,
+                                          opener=opener, compare_fn=compare)
+    assert (score, passed) == (0.0, False)
+    assert detail["mode"] == "live" and detail["verdict"] == "error"
+    assert why in detail["live_error"]
+
+
+def test_unrebuildable_reference_is_a_verifier_error():
+    fixed, good = _fixable()
+
+    def opener(doc):
+        if doc is good:
+            return {"doc_id": None, "rebuilt": False, "error": "reference broke"}
+        return _ok_opener(doc)
+
+    score, passed, detail = RF.verify_fix(fixed, True, {}, good_document=good,
+                                          opener=opener, compare_fn=_ok_compare)
+    assert passed is False and detail["verdict"] == "error"
+
+
+def test_candidate_that_does_not_rebuild_is_a_model_fail():
+    fixed, good = _fixable()
+    score, passed, detail = RF.verify_fix(
+        fixed, True, {}, good_document=good, compare_fn=_ok_compare,
+        opener=lambda d: {"doc_id": "x", "rebuilt": False, "error": "boom"})
+    assert passed is False and detail["verdict"] == "fail"
+
+
+def test_run_with_verifier_errors_is_degraded_and_not_promotion_evidence(corpus):
+    corpus_dir, spec = corpus
+    res = RF.run(corpus_dir, spec.hash, limit=10, opener=_raising_opener,
+                 compare_fn=_ok_compare)
+    agg = res.aggregate
+    assert agg["verifier_mode"] == "degraded"
+    assert agg["live_error_count"] == 10
+    assert agg["pct_fixed"] == 0.0           # no structural passes leak through
+    assert agg["promotion_evidence"] is False
+    assert agg["success_bar"]["no_verifier_errors"] is False

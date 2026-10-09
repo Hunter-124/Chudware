@@ -1,9 +1,0 @@
-# Stored reports ARE the product: <tag>.json is the differable baseline (it carries the
-# raw turns so `runner rescore --tag <tag>` can re-score them for free) and <tag>.txt is
-# the human report. Both are committed.
-#
-# runs-<tag>/ is the raw evidence tree for one run: per-prompt turn.jsonl, the workspace,
-# and the per-prompt autosave snapshots (megabytes of .step+ per run). Not committed —
-# regenerate it with `runner run`, and note that `rescore --reprobe` needs it while plain
-# `rescore` does not (artifacts.json inside it is the probe's cached answer).
-runs-*/

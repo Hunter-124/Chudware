@@ -83,8 +83,10 @@ def test_c12_seed2_grind_fails_ac5():
     ch = mod.CHALLENGE
     lg = _ledger_from_scripts(ch.scripts[2], seed=2)
     graded = _grade(ch, lg, seed=2)
+    # The battery PASS precedes three more add_features: it no longer describes the final
+    # geometry, so AC1 ("battery PASS on final geometry") fails as stale (P2-8).
     _assert_ids(graded, {
-        "AC1": "PASS",
+        "AC1": "FAIL",
         "AC2": "PASS",
         "AC3": "PASS",
         "AC4": "PASS",
@@ -241,14 +243,15 @@ def test_c14_matching_pattern_and_mates_contract():
         {"seq": 2, "kind": "decision", "payload": {
             "id": "bolt_pattern_mate", "pattern_mm": 28.0}},
         {"seq": 3, "kind": "tool_call", "payload": {
+            "tool": "solve_mates", "ok": True}},
+        {"seq": 4, "kind": "decision", "payload": {
+            "id": "mates_ok", "mates_ok": True}},
+        # Checks of the SOLVED assembly: recorded after the last mutation (solve_mates).
+        {"seq": 5, "kind": "tool_call", "payload": {
             "tool": "interface_check", "ok": True,
             "result": {"pass": True, "verdict": "PASS"}}},
-        {"seq": 4, "kind": "artifact", "payload": {
+        {"seq": 6, "kind": "artifact", "payload": {
             "kind": "interference", "clashes": 0}},
-        {"seq": 5, "kind": "tool_call", "payload": {
-            "tool": "solve_mates", "ok": True}},
-        {"seq": 6, "kind": "decision", "payload": {
-            "id": "mates_ok", "mates_ok": True}},
         {"seq": 7, "kind": "artifact", "payload": {
             "kind": "battery", "verdict": "PASS", "part": "bracket", "id": "b_br"}},
         {"seq": 8, "kind": "artifact", "payload": {
@@ -256,6 +259,11 @@ def test_c14_matching_pattern_and_mates_contract():
     ]
     graded = _grade(ch, {"events": events}, seed=1)
     _assert_all_pass(graded, label="C14 minimal contract")
+    # The same checks recorded BEFORE solving describe a superseded state.
+    stale = [events[0], events[1], events[4], events[5], events[2], events[3],
+             events[6], events[7]]
+    by = _by_id(_grade(ch, {"events": stale}, seed=1))
+    assert by["AC2"]["result"] == "FAIL" and by["AC3"]["result"] == "FAIL"
 
 
 # ---------------------------------------------------------------------------

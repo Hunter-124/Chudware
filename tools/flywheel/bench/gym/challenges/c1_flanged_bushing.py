@@ -5,7 +5,7 @@ A flanged bushing that press-fits nothing but must provide a SLIDING fit bore fo
 
 Ground-truth ACs the gym grades ITSELF:
   AC1  bore diameter recorded == 20 mm with an H7 hole tolerance (sliding fit basis)
-  AC2  bore fit clearance for the d20 h7 shaft is in the sliding-fit band [0, 0.041] mm
+  AC2  bore fit clearance for the d20 h7 shaft is in the sliding-fit band [0, 0.042] mm
   AC3  bolt circle: 4 holes, M4 clearance (d4.5), on the declared PCD
   AC4  verify_battery recorded PASS (no incoherent geometry)
 

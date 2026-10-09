@@ -35,7 +35,7 @@ build-stage decision cites a nonexistent DIM referencing the pattern).
 from __future__ import annotations
 
 from . import (Challenge, AcceptanceCheck, ledger_dimension, ledger_artifact,
-               ledger_decision_value)
+               ledger_decision_value, last_record)
 
 PILOT_NOM = 8.0                        # mm, NEMA-11-style pilot register
 PILOT_CLEARANCE_BAND = (0.005, 0.035)  # mm, H7/h6 register clearance band
@@ -91,7 +91,7 @@ def _grade_screw_spec(ledger: dict, ctx: dict) -> "tuple[str,str]":
         return "FAIL", f"screw thread {thread} != {SCREW_THREAD}"
     if length is None or float(length) < MIN_SCREW_LEN:
         return "FAIL", f"screw length {length} mm < required min {MIN_SCREW_LEN} mm"
-    part = ledger_artifact(ledger, "standard_part")
+    part = last_record(ledger, "standard_part")
     fam = str((part or {}).get("family", "")).lower()
     if not part or ("screw" not in fam and "bolt" not in fam):
         return "FAIL", f"no standard_part (screw/bolt) artifact recorded (family={fam or 'none'})"

@@ -14,6 +14,11 @@ Single-turn by construction. A follow-up turn is a NEW invocation that passes
 its worker for exactly one turn. Ctrl-C sends ``agent_cancel`` through the private
 control socket (``worker_control_info``) and then shuts the worker down.
 
+``--result-json <path>`` additionally writes the terminal record (driver verdict, the raw
+``agent_admin_turn`` response with ok/reason/stop_reason/turn/usage/persistence, the
+``run_finished`` event and timing) for machine consumers such as
+``benchmarks/artifact_validity/runner.py``.
+
 Example
 -------
     scripts/run_mission.py \
@@ -370,6 +375,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--session-id", default="", help="Chudware conversation id")
     parser.add_argument("--provider", default="", help="override the configured provider")
     parser.add_argument("--model", default="", help="override the configured model")
+    parser.add_argument("--reasoning-effort", default="",
+                        help="pin the thinking effort (low|medium|high|xhigh|max), as the GUI "
+                             "composer does; default: the turn policy's effort")
     parser.add_argument("--log", default="", help="JSONL event log (default: <sessions-dir>/<session>.events.jsonl)")
     parser.add_argument("--instance-key", default="")
     parser.add_argument("--hostd-bin", default="")
@@ -379,6 +387,12 @@ def main(argv: list[str] | None = None) -> int:
              "(the turn ends at its own finish, Ctrl-C, or worker death)",
     )
     parser.add_argument("--quiet-worker", action="store_true", help="hide worker stderr")
+    parser.add_argument(
+        "--result-json", default="",
+        help="also write the machine-readable terminal record (verdict, the raw "
+             "agent_admin_turn response with ok/reason/stop_reason/turn/usage/"
+             "persistence, run_finished event, timing) to this path",
+    )
     args = parser.parse_args(argv)
     if not math.isfinite(args.timeout_s) or args.timeout_s < 0:
         parser.error("--timeout-s must be a finite number >= 0 (0 = no budget)")
@@ -414,6 +428,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"prompt      {_short(prompt, 200)}")
     print("-" * 72, flush=True)
 
+    started_at = time.time()
     proc = subprocess.Popen(
         [str(WORKER_PY), "-m", "services.worker_main"],
         cwd=str(REPO_ROOT),
@@ -478,6 +493,8 @@ def main(argv: list[str] | None = None) -> int:
             params["provider"] = args.provider
         if args.model:
             params["model"] = args.model
+        if args.reasoning_effort:
+            params["reasoning_effort"] = args.reasoning_effort
         if args.resume:
             params["chudcode_session_file"] = str(
                 Path(args.resume).expanduser().resolve()
@@ -501,26 +518,35 @@ def main(argv: list[str] | None = None) -> int:
         print("-" * 72, flush=True)
         turn = result.get("turn") if isinstance(result.get("turn"), dict) else {}
         terminal = bool(turn.get("terminal"))
+        verdict, verdict_detail = "ok", ""
+        provider_detail = ""
         if failure:
+            verdict, verdict_detail = "driver_failure", failure
             print(f"FAILED: {failure}")
             tail = "\n".join(worker.stderr_tail[-15:])
             if tail:
                 print("worker stderr tail:\n" + tail)
         elif not result.get("ok"):
-            print(f"FAILED: {result.get('reason') or 'turn returned ok=false'}")
+            verdict = "not_ok"
+            verdict_detail = str(result.get("reason") or "turn returned ok=false")
+            print(f"FAILED: {verdict_detail}")
         elif not terminal:
+            verdict, verdict_detail = "not_terminal", "turn ended without a terminal agent_end"
             print("FAILED: turn ended without a terminal agent_end")
         elif turn.get("cancelled"):
+            verdict, verdict_detail = "cancelled", str(turn.get("stop_reason") or "")
             print(f"CANCELLED: stop_reason={turn.get('stop_reason')}")
         elif progress.failed:
+            verdict, verdict_detail = "run_failed", progress.failed
             print(f"FAILED: {progress.failed}")
         elif not (progress.saw_output or str(turn.get("result") or "").strip()):
             # A provider 400/auth failure can still close the run cleanly with an
             # empty assistant message; a mission that produced nothing is not a pass.
-            detail = _session_provider_error(turn.get("chudcode_session_file"))
+            provider_detail = _session_provider_error(turn.get("chudcode_session_file"))
+            verdict, verdict_detail = "no_output", "the turn produced no assistant output"
             print("FAILED: the turn produced no assistant output")
-            if detail:
-                print(f"provider error: {detail}")
+            if provider_detail:
+                print(f"provider error: {provider_detail}")
         else:
             exit_code = 0
             print("OK")
@@ -541,6 +567,28 @@ def main(argv: list[str] | None = None) -> int:
                 )
         print(f"\nevent log: {log_path}")
         worker.shutdown()
+        if args.result_json:
+            record = {
+                "schema": "chudware.run_mission.result/1",
+                "exit_code": exit_code,
+                "verdict": verdict,
+                "verdict_detail": verdict_detail,
+                "provider_error": provider_detail,
+                "run_id": run_id,
+                "session_id": session_id,
+                "request": {k: v for k, v in params.items() if k != "request"},
+                "response": result,
+                "run_finished": progress.terminal,
+                "saw_output": progress.saw_output,
+                "started_at": started_at,
+                "ended_at": time.time(),
+                "worker_returncode": proc.poll(),
+                "worker_stderr_tail": worker.stderr_tail[-40:],
+                "event_log": str(log_path),
+            }
+            out = Path(args.result_json).expanduser()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(record, indent=1, default=str), encoding="utf-8")
     return exit_code
 
 

@@ -17,8 +17,8 @@ Seeds:
 """
 from __future__ import annotations
 
-from . import (Challenge, AcceptanceCheck, ledger_artifact,
-               ledger_decision_value, coerce_number)
+from . import (Challenge, AcceptanceCheck, ledger_artifact, final_check_absence,
+                ledger_decision_value, coerce_number)
 
 _MUTATE_TOOLS = frozenset({
     "add_features", "asm_mate", "asm_add_component",
@@ -70,11 +70,11 @@ def _grade_initial_clash(ledger: dict, ctx: dict) -> "tuple[str,str]":
 
 
 def _grade_final_clean(ledger: dict, ctx: dict) -> "tuple[str,str]":
-    """AC2: latest interference artifact has clashes == 0."""
-    arts = _interference_artifacts(ledger)
-    if not arts:
-        return "FAIL", "no interference artifact recorded"
-    final = arts[-1]  # latest wins (ledger append order)
+    """AC2: the final interference check (last successful one after the last mutation)
+    has clashes == 0. The initial clash stays a recovery diagnostic (AC1)."""
+    final = ledger_artifact(ledger, "interference")
+    if final is None:
+        return "FAIL", final_check_absence(ledger, "interference")
     clashes = final.get("clashes")
     c_n = coerce_number(clashes)
     if c_n is None:

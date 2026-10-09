@@ -10,7 +10,9 @@ Runs ONE fixed mission (the bearing-mount bracket) two ways —
 
 — across model tiers and seeds, and scores the result with DETERMINISTIC checks
 only. No LLM judges anywhere: every number here comes from geometry queries,
-a tolerance calculator, or the verifier battery.
+a tolerance calculator, the verifier battery, or the agent's own persisted FEA
+study (the grader never solves on the agent's behalf). All four criteria are
+mandatory; a leg passes only when its run completed and every one passed.
 
 Two outputs, and the second is the one that pays for the run:
 
@@ -32,6 +34,7 @@ absolute utilization cap rather than spending blind.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -216,9 +219,18 @@ class EventSink:
 
 # ── Deterministic scoring ────────────────────────────────────────────────────
 #
-# Every scorer is a real query against the produced geometry. A scorer that
-# cannot run records `None` and says why — it never scores 0.0 for "unknown",
-# because a missing measurement and a failed measurement are different facts.
+# Every scorer is a real query against the produced document. Each returns
+# ``passed`` True/False for a measured verdict, or ``passed: None`` plus
+# ``error`` when the GRADER could not measure (an infrastructure fault). The
+# mandatory set below is fixed: an unmeasurable criterion is an ERROR that stays
+# in the denominator, never a criterion that silently drops out of it.
+
+MANDATORY_CRITERIA = ("bore_fit", "hole_pattern", "manifold", "fea")
+FEA_STUDY_TYPES = ("fea_static", "fea_adaptive")
+#: Aluminium alloys' Young's modulus band (MPa) — accepts a named or explicit material.
+ALUMINIUM_E_MPA = (60_000.0, 75_000.0)
+#: A "side" load on the bore acts across the bore axis, not along it.
+SIDE_LOAD_MIN_ANGLE_DEG = 80.0
 
 
 def _dispatch(tool: str, args: dict) -> Any:
@@ -290,59 +302,132 @@ def score_manifold(doc_id: str) -> dict:
     try:
         res = battery.verify(doc_id, ["is_manifold"])
     except Exception as exc:  # noqa: BLE001
-        return {"passed": None, "reason": f"{type(exc).__name__}: {exc}"}
+        return {"passed": None, "error": f"{type(exc).__name__}: {exc}"}
     score = (res.get("scores") or {}).get("is_manifold")
-    return {"passed": (score == 1.0) if score is not None else None, "score": score}
+    if score is None:
+        return {"passed": None, "error": "verify battery returned no is_manifold score"}
+    return {"passed": score == 1.0, "score": score}
+
+
+def _study_list(doc_id: str) -> list[dict]:
+    from services.mcp import core_bridge as cb
+
+    listing = cb.call("sim_study_list", {"doc_id": doc_id})
+    return [s for s in (listing or {}).get("studies") or [] if isinstance(s, dict)]
+
+
+def _load_bores(face: Any, doc_id: str) -> list[dict]:
+    """The bore (concave cylinder) faces a stored load query resolves to on this doc."""
+    res = _dispatch("query_geometry", {"doc_id": doc_id, "query": face})
+    matches = res.get("matches") if isinstance(res, dict) else None
+    return [m for m in matches or [] if isinstance(m, dict) and m.get("concavity") == "bore"
+            and isinstance(m.get("axis"), list) and len(m["axis"]) == 3]
 
 
 def score_fea(doc_id: str) -> dict:
-    """Min factor of safety under the 500 N side load.
+    """The AGENT's persisted static study: aluminium, a 500 N side load on the bore,
+    min FoS > 1.
 
-    ``"side"`` is NOT selector vocabulary — the grammar takes
-    top/bottom/left/right/front/back (or +x/-x/…). Naming a face the grammar
-    cannot parse makes every leg report ``passed: None`` and silently grades
-    the whole matrix out of 3 instead of 4.
+    The grader never solves anything here. The request makes the simulation part of
+    the deliverable, so a document without a saved study FAILS — re-running FEA on
+    the agent's behalf would credit a geometry-only answer with work it never did,
+    and on boundary conditions the grader picked rather than the ones requested.
     """
     try:
-        res = _dispatch("run_fea_static", {
-            "doc_id": doc_id,
-            "fixtures": ["bottom"],
-            "loads": [{"face": "right", "force": [SIDE_LOAD_N, 0, 0]}],
-            "material": MATERIAL,
-        })
-    except Exception as exc:  # noqa: BLE001
-        return {"passed": None, "reason": f"{type(exc).__name__}: {exc}"}
-    if not isinstance(res, dict) or res.get("ok") is False:
-        return {"passed": None,
-                "reason": str((res or {}).get("error"))[:240] if isinstance(res, dict)
-                else "no result"}
-    # The scalars are nested under "summary" — the same shape that made
-    # verify_battery grade every solve 1.0. Read there, tolerate flat.
-    summary = res.get("summary") if isinstance(res.get("summary"), dict) else {}
-    fos = summary.get("min_fos", res.get("min_fos"))
+        studies = [s for s in _study_list(doc_id) if s.get("type") in FEA_STUDY_TYPES]
+    except Exception as exc:  # noqa: BLE001 — the grader could not read the document
+        return {"passed": None, "error": f"sim_study_list: {type(exc).__name__}: {exc}"}
+    if not studies:
+        return {"passed": False,
+                "reason": "no saved static FEA study — the required simulation was not "
+                          "run (or not kept) by the agent"}
+    st = studies[-1]
+    faults: list[str] = []
+    mat = st.get("material") if isinstance(st.get("material"), dict) else {}
+    e_mpa = mat.get("E_mpa")
+    alu = "alumin" in str(mat.get("name") or "").lower() or (
+        isinstance(e_mpa, (int, float))
+        and ALUMINIUM_E_MPA[0] <= float(e_mpa) <= ALUMINIUM_E_MPA[1])
+    if not alu:
+        faults.append(f"material {mat.get('name')!r} (E={e_mpa}) is not aluminium")
+    total = [0.0, 0.0, 0.0]
+    for i, ld in enumerate(st.get("loads") or []):
+        force = ld.get("force") if isinstance(ld, dict) else None
+        if not (isinstance(force, list) and len(force) == 3
+                and all(isinstance(c, (int, float)) for c in force)):
+            faults.append(f"loads[{i}] is not a force vector")
+            continue
+        total = [t + float(c) for t, c in zip(total, force)]
+        try:
+            bores = _load_bores(ld.get("face"), doc_id)
+        except Exception as exc:  # noqa: BLE001
+            return {"passed": None, "error": f"query_geometry: {type(exc).__name__}: {exc}"}
+        if not bores:
+            faults.append(f"loads[{i}] face {ld.get('face')!r} is not a bore face")
+            continue
+        mag = math.sqrt(sum(c * c for c in force)) or 1.0
+        for b in bores:
+            ax = b["axis"]
+            an = math.sqrt(sum(float(c) * c for c in ax)) or 1.0
+            cos = abs(sum(float(f) * float(a) for f, a in zip(force, ax))) / (mag * an)
+            if math.degrees(math.acos(min(1.0, cos))) < SIDE_LOAD_MIN_ANGLE_DEG:
+                faults.append(f"loads[{i}] acts along the bore axis, not across it")
+                break
+    magnitude = math.sqrt(sum(c * c for c in total))
+    if abs(magnitude - SIDE_LOAD_N) > 0.02 * SIDE_LOAD_N:
+        faults.append(f"total load {magnitude:.1f} N != {SIDE_LOAD_N:g} N")
+    res = st.get("results") if isinstance(st.get("results"), dict) else {}
+    fos = res.get("min_fos")
+    if not isinstance(fos, (int, float)) or not math.isfinite(float(fos)):
+        faults.append(f"study has no finite min_fos ({fos!r})")
+    elif float(fos) <= 1.0:
+        faults.append(f"min_fos {fos} <= 1")
     return {
-        "passed": (float(fos) > 1.0) if isinstance(fos, (int, float)) else None,
+        "passed": not faults,
+        "study_id": st.get("id"),
         "min_fos": fos,
-        "max_von_mises_mpa": summary.get("max_von_mises_mpa",
-                                         res.get("max_von_mises_mpa")),
-        "max_disp_mm": summary.get("max_disp_mm", res.get("max_disp_mm")),
+        "max_von_mises_mpa": res.get("max_von_mises_mpa"),
+        "max_disp_mm": res.get("max_disp_mm"),
+        "load_n": round(magnitude, 3),
+        "material": mat.get("name"),
+        "faults": faults,
     }
 
 
+def rollup(scores: dict) -> dict:
+    """Fixed-denominator roll-up over :data:`MANDATORY_CRITERIA`.
+
+    status: ``error`` if any criterion could not be measured, else ``fail`` if any
+    failed, else ``pass``. ``fraction`` is a diagnostic partial score over ALL
+    mandatory criteria; acceptance is ``status == "pass"`` only."""
+    verdicts = [(scores.get(k) or {}).get("passed") for k in MANDATORY_CRITERIA]
+    passed = sum(1 for v in verdicts if v is True)
+    if any(v is None for v in verdicts):
+        status = "error"
+    elif all(verdicts):
+        status = "pass"
+    else:
+        status = "fail"
+    return {"passed_count": passed, "graded_count": len(MANDATORY_CRITERIA),
+            "fraction": passed / len(MANDATORY_CRITERIA), "status": status}
+
+
 def score_doc(doc_id: str) -> dict:
-    """Every deterministic scorer against ONE document, plus a roll-up."""
-    scores = {
+    """Every mandatory scorer against ONE document, plus the fixed-denominator roll-up."""
+    scores: dict[str, Any] = {
         "bore_fit": score_bore_fit(doc_id),
         "hole_pattern": score_hole_pattern(doc_id),
         "manifold": score_manifold(doc_id),
         "fea": score_fea(doc_id),
     }
-    graded = [v.get("passed") for v in scores.values() if v.get("passed") is not None]
-    scores["passed_count"] = sum(1 for g in graded if g)
-    scores["graded_count"] = len(graded)
-    scores["fraction"] = (scores["passed_count"] / len(graded)) if graded else 0.0
+    scores.update(rollup(scores))
     scores["doc_id"] = doc_id
     return scores
+
+
+def example_passed(leg: LegResult) -> bool:
+    """A leg passes only when its run completed AND every mandatory criterion passed."""
+    return bool(leg.ok) and leg.scores.get("status") == "pass"
 
 
 def _open_docs() -> list[dict]:
@@ -390,18 +475,19 @@ def score_mission(preferred_doc: str, before: set[tuple] | None = None) -> dict:
         if did and did not in candidates:
             candidates.append(did)
     if not candidates:
-        return {"fraction": 0.0, "graded_count": 0, "passed_count": 0,
-                "reason": "this leg left no scorable document", "doc_id": ""}
+        return {"fraction": 0.0, "graded_count": len(MANDATORY_CRITERIA), "passed_count": 0,
+                "status": "fail", "reason": "this leg left no scorable document",
+                "doc_id": ""}
 
     scored = []
     for did in candidates:
         try:
             scored.append(score_doc(did))
         except Exception as exc:  # noqa: BLE001
-            scored.append({"fraction": 0.0, "doc_id": did,
+            scored.append({"fraction": 0.0, "graded_count": len(MANDATORY_CRITERIA),
+                           "passed_count": 0, "status": "error", "doc_id": did,
                            "error": f"{type(exc).__name__}: {exc}"})
-    best = max(scored, key=lambda s: (s.get("fraction") or 0.0,
-                                      s.get("graded_count") or 0))
+    best = max(scored, key=lambda s: (s.get("status") == "pass", s.get("fraction") or 0.0))
     best["candidates_considered"] = [s.get("doc_id") for s in scored]
     best["scored_bound_doc"] = best.get("doc_id") == preferred_doc
     return best
@@ -558,7 +644,9 @@ def run_leg(
     try:
         leg.scores = score_mission(leg.doc_id, before)
     except Exception as exc:  # noqa: BLE001
-        leg.scores = {"error": f"{type(exc).__name__}: {exc}", "fraction": 0.0}
+        leg.scores = {"error": f"{type(exc).__name__}: {exc}", "fraction": 0.0,
+                      "graded_count": len(MANDATORY_CRITERIA), "passed_count": 0,
+                      "status": "error"}
     return leg
 
 
@@ -590,7 +678,7 @@ def render_markdown(legs: list[LegResult], ledger: list[dict],
 
     def _mark(d: dict) -> str:
         p = d.get("passed")
-        return "n/a" if p is None else ("PASS" if p else "FAIL")
+        return "ERROR" if p is None else ("PASS" if p else "FAIL")
 
     for l in legs:
         s = l.scores
@@ -724,7 +812,7 @@ def _run(smoke: bool, workdir: str) -> BenchResult:
         examples.append(ExampleScore(
             example_id=f"{leg.loop}/{leg.tier}/s{leg.seed}",
             score=float(leg.scores.get("fraction") or 0.0),
-            passed=bool(leg.scores.get("fraction") == 1.0),
+            passed=example_passed(leg),
             structure=leg.loop,
             detail=leg.to_dict()))
     ledger = gap_ledger(legs)
@@ -747,9 +835,11 @@ def _by_loop(legs: list[LegResult]) -> dict:
     out: dict[str, dict] = {}
     for leg in legs:
         row = out.setdefault(leg.loop, {
-            "legs": 0, "score_sum": 0.0, "tool_calls": 0, "tool_failures": 0,
-            "tokens": 0, "advisories": 0})
+            "legs": 0, "passed": 0, "grader_errors": 0, "score_sum": 0.0,
+            "tool_calls": 0, "tool_failures": 0, "tokens": 0, "advisories": 0})
         row["legs"] += 1
+        row["passed"] += int(example_passed(leg))
+        row["grader_errors"] += int(leg.scores.get("status") == "error")
         row["score_sum"] += float(leg.scores.get("fraction") or 0.0)
         row["tool_calls"] += len(leg.tool_calls)
         row["tool_failures"] += len(leg.failures)

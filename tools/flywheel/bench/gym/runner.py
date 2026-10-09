@@ -689,6 +689,18 @@ def run_cell(
         graded=graded,
         grind_threshold=grind_threshold,
     )
+    # The challenge graders read LEDGER claims (recorded dimensions, decisions, battery
+    # verdicts) — no native file or saved study is reopened. In MOCK mode that is the
+    # point (labeled scripts exercise the grader + taxonomy). In REAL mode a model's
+    # self-reported ledger is not artifact proof, so the verdict is kept as a diagnostic
+    # (`ledger_passed`) and the cell never counts as a pass. Artifact-verified real
+    # grading lives in benchmarks/artifact_validity.
+    if real_mode:
+        graded["ledger_passed"] = bool(graded["passed"])
+        graded["passed"] = False
+        graded["verification"] = "ledger_only_unverified"
+    else:
+        graded["verification"] = "scripted_replay"
 
     cell = CellResult(
         challenge=challenge.id,

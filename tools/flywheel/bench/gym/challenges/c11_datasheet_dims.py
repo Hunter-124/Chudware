@@ -150,7 +150,7 @@ Bearing: 6202 deep-groove ball bearing
   - Width: 11 mm
 Shaft: Ø15 h6
 Fasteners: M5 × 0.8 socket-head cap screws (4 places)
-Bolt circle: PCD = 2 × (seat_OD/2 + wall)  with wall ≥ 6 mm  → use PCD 48 mm
+Bolt circle: PCD = 2 × (seat_OD/2 + wall)  with wall = 6.5 mm  → PCD 48 mm
 Clearance hole for M5: close-normal ≈ 5.5 mm (band 5.3–5.8 mm)
 --- end datasheet ---
 """
@@ -226,7 +226,7 @@ def _base_turns() -> list[dict]:
          "status": "confirmed"},
         {"_kind": "dimension", "id": "DIM2", "name": "bolt_circle_pcd",
          "value": 48.0, "unit": "mm",
-         "driver": "datasheet PCD formula with wall≥6",
+         "driver": "datasheet PCD formula with wall=6.5",
          "provenance": "calc_bolt_circle from datasheet formula",
          "status": "confirmed"},
         {"_kind": "decision", "id": "bolt_circle", "stage": "plan", "for_ac": "AC3",

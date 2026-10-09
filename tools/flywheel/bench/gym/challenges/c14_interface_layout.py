@@ -15,8 +15,8 @@ Seeds: 1=clean PASS; 2=mismatched patterns + clash; 3=no interface_check / mates
 """
 from __future__ import annotations
 
-from . import (Challenge, AcceptanceCheck, ledger_artifact,
-               ledger_decision_value, coerce_number)
+from . import (Challenge, AcceptanceCheck, ledger_artifact, final_check_absence,
+               final_checks, last_mutation_index, ledger_decision_value, coerce_number)
 
 PATTERN_MM = 28.0
 PATTERN_HOLES = 4
@@ -40,12 +40,8 @@ def _tool_call_pairs(ledger: dict) -> list[tuple[dict, dict]]:
 
 
 def _all_artifacts(ledger: dict, kind: str) -> list[dict]:
-    hits = []
-    for e in _events(ledger):
-        p = e.get("payload") or {}
-        if e.get("kind") == "artifact" and p.get("kind") == kind:
-            hits.append(p)
-    return hits
+    """The final checks of *kind*: successful ones recorded after the last mutation."""
+    return final_checks(ledger, kind)
 
 
 def _grade_matching_pattern(ledger: dict, ctx: dict) -> "tuple[str,str]":
@@ -62,42 +58,38 @@ def _grade_matching_pattern(ledger: dict, ctx: dict) -> "tuple[str,str]":
 
 
 def _grade_interface_check(ledger: dict, ctx: dict) -> "tuple[str,str]":
-    # artifact kind interface with pass-ish verdict
-    for art in _all_artifacts(ledger, "interface"):
+    """The LAST successful interface check after the last mutation decides: an interface
+    artifact if one was recorded, else the last interface_check tool call."""
+    for art in reversed(_all_artifacts(ledger, "interface")):
         verdict = str(art.get("verdict") or art.get("result") or art.get("status") or "")
         if verdict.upper() in {"PASS", "OK", "TRUE", "1"} or art.get("pass") is True:
             return "PASS", f"interface artifact pass ({art.get('id') or ''})"
         if art.get("pass") is False or verdict.upper() in {"FAIL", "FALSE"}:
             return "FAIL", f"interface artifact failed: {verdict or art}"
-        # present without explicit fail counts as evidence of check when pass flag absent
-        if "pass" not in art and not verdict:
-            # require explicit pass if only bare artifact — fall through to tool
-            pass
-        elif verdict.upper() not in {"FAIL", "FALSE"}:
+        if "pass" in art or verdict:
             return "PASS", f"interface artifact {art.get('id')}"
-    # tool_call interface_check that succeeded
-    for _, p in _tool_call_pairs(ledger):
-        if str(p.get("tool") or "") != "interface_check":
-            continue
-        if p.get("ok") is False or p.get("error"):
-            continue
-        result = p.get("result") or {}
-        if isinstance(result, dict):
-            if result.get("pass") is False:
-                continue
-            if str(result.get("verdict", "PASS")).upper() in {"PASS", "OK"} or result.get(
-                    "pass") is True:
-                return "PASS", "interface_check tool_call passed"
-        # scripted success without result payload
-        if p.get("ok") is not False:
-            return "PASS", "interface_check tool_call present (ok)"
-    return "FAIL", "no passing interface artifact or interface_check tool_call"
+        # a bare artifact with no verdict decides nothing; look at an earlier one
+    cut = last_mutation_index(ledger)
+    calls = [p for i, e in enumerate(_events(ledger)) if i > cut
+             for p in [e.get("payload") or {}]
+             if (e.get("kind") == "tool_call"
+                 or (e.get("kind") == "agent_turn" and p.get("event") == "tool_call"))
+             and str(p.get("tool") or "") == "interface_check"
+             and p.get("ok") is not False and not p.get("error")]
+    if calls:
+        result = calls[-1].get("result") or {}
+        if isinstance(result, dict) and (result.get("pass") is False or str(
+                result.get("verdict", "PASS")).upper() not in {"PASS", "OK"}):
+            return "FAIL", f"final interface_check reported {result}"
+        return "PASS", "final interface_check tool_call passed"
+    return "FAIL", ("no passing interface artifact or interface_check tool_call after the "
+                    "last model mutation")
 
 
 def _grade_interference_clean(ledger: dict, ctx: dict) -> "tuple[str,str]":
     art = ledger_artifact(ledger, "interference")
     if not art:
-        return "FAIL", "no interference artifact recorded"
+        return "FAIL", final_check_absence(ledger, "interference")
     clashes = art.get("clashes")
     if clashes is None:
         return "FAIL", "interference artifact missing clashes field"

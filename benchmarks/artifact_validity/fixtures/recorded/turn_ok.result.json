@@ -1,0 +1,101 @@
+{
+ "schema": "chudware.run_mission.result/1",
+ "exit_code": 0,
+ "verdict": "ok",
+ "verdict_detail": "",
+ "provider_error": "",
+ "run_id": "mission-run-18d931da796cdaa2",
+ "session_id": "smoke6axis4",
+ "request": {
+  "role": "general_agent",
+  "mode": "agent",
+  "run_id": "mission-run-18d931da796cdaa2",
+  "session_id": "smoke6axis4",
+  "workspace_dir": "/tmp/av/work",
+  "sessions_dir": "/tmp/av/sessions",
+  "timeout": 900.0,
+  "provider": "anthropic",
+  "model": "claude-opus-5-5",
+  "reasoning_effort": "high"
+ },
+ "response": {
+  "ok": true,
+  "turn": {
+   "success": true,
+   "stop_reason": "completed",
+   "result": "Built the base and saved it as deliverable.step+ in the working directory.",
+   "role": "general_agent",
+   "allowed_tools": [
+    "add_features",
+    "new_part",
+    "save_part"
+   ],
+   "run_id": "mission-run-18d931da796cdaa2",
+   "session_id": "smoke6axis4",
+   "chudcode_session_id": "01a0e323-7046-7000-be0a-3d053c09b913",
+   "chudcode_session_file": "/tmp/av/sessions/2026-09-27T13-52-25-670Z_01a0e323-7046-7000-be0a-3d053c09b913.jsonl",
+   "terminal": {
+    "type": "agent_end",
+    "isTerminal": true
+   },
+   "cancelled": false,
+   "usage": {
+    "prompt_tokens": 52229,
+    "completion_tokens": 4110,
+    "total_tokens": 56339,
+    "calls": 3,
+    "providers": [
+     {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "prompt_tokens": 52229,
+      "completion_tokens": 4110,
+      "total_tokens": 56339,
+      "context_tokens": 52229
+     }
+    ]
+   }
+  },
+  "persistence": {
+   "saved": [
+    {
+     "doc_id": "doc-cpp00000001",
+     "path": "/tmp/av/work/deliverable.step+"
+    }
+   ],
+   "errors": [],
+   "persistence_failure": null
+  },
+  "usage": {
+   "prompt_tokens": 52229,
+   "completion_tokens": 4110,
+   "total_tokens": 56339,
+   "calls": 3,
+   "providers": [
+    {
+     "provider": "anthropic",
+     "model": "claude-opus-5-5",
+     "prompt_tokens": 52229,
+     "completion_tokens": 4110,
+     "total_tokens": 56339,
+     "context_tokens": 52229
+    }
+   ]
+  }
+ },
+ "run_finished": {
+  "node_id": "mission-run-18d931da796cdaa2",
+  "id": "rpc-c548b9d1d5aec0a3",
+  "run_id": "mission-run-18d931da796cdaa2",
+  "session_id": "smoke6axis4",
+  "actor": "general_agent",
+  "status": "done",
+  "kind": "run_finished"
+ },
+ "saw_output": true,
+ "started_at": 1790000000.0,
+ "ended_at": 1790000900.0,
+ "worker_returncode": 0,
+ "worker_stderr_tail": [],
+ "event_log": "/tmp/av/events.jsonl"
+}

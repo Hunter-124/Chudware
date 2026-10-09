@@ -11,8 +11,11 @@ Two evaluation paths (see verify_fix):
   * live mode (core present, auto-detected): the AUTHORITATIVE binary verifier — the fix is
     rebuilt through the engine and compared (compare_parts / eval_compare) against the
     known-good part; pass iff it rebuilds AND matches ≈100%. A fix that rebuilds but altered
-    geometry scores 0 (T-H11 driver note; zero tolerance for silent intent changes). Falls
-    back to fixture scoring with a recorded reason when the core is unavailable.
+    geometry scores 0 (T-H11 driver note; zero tolerance for silent intent changes). A live
+    verification that cannot run (core fault, reference not rebuilding, degraded compare) is
+    an ERROR row scored as not-fixed — never a structural pass — and marks the run
+    ``degraded`` (not promotion evidence). Fixture mode is only used when no live verifier
+    was requested or the core is unavailable.
 
 A strategy is pluggable via the ``frontier`` Baseline: the deterministic kill-switch always
 runs (its result is the reported baseline); a frontier strategy, when credentials make one
@@ -242,15 +245,28 @@ def _make_live_verifier():
 
 # ---- shared binary verifier -------------------------------------------------
 
+def _verification_error(detail: dict, why: str):
+    """The live verifier itself could not judge the fix: a grader/infra ERROR, scored as
+    not-fixed. It never falls back to the structural fixture checks — those would credit a
+    repair whose rebuild nobody observed."""
+    detail["verdict"] = "error"
+    detail["live_error"] = why[:200]
+    return 0.0, False, detail
+
+
 def verify_fix(fixed: dict, claimed: bool, intent_dims: dict, *,
                good_document: Optional[dict] = None, opener=None, compare_fn=None):
     """Score one candidate fix. Returns (score{0.0|1.0}, passed, detail).
 
     Live mode (opener + compare_fn + good_document present): binary — pass iff the fix rebuilds
-    AND compare_parts vs the known-good part >= LIVE_MATCH_THRESHOLD. Fixture mode (offline):
-    structural — pass iff the strategy CLAIMED a fix, the anomaly is cleared, and no intent
-    dimension drifted. Both are strictly binary (no partial credit): the driver note is explicit
-    that a fix altering unaffected geometry scores 0 even if the rebuild passes.
+    AND compare_parts vs the known-good part >= LIVE_MATCH_THRESHOLD. If the live verifier
+    itself fails (an opener/compare exception, the known-good reference not rebuilding, or a
+    degraded compare), the example is ``detail["verdict"] == "error"`` and NOT fixed; the
+    structural fields stay in ``detail`` as diagnostics only. Fixture mode (offline, no live
+    verifier configured): structural — pass iff the strategy CLAIMED a fix, the anomaly is
+    cleared, and no intent dimension drifted. Both are strictly binary (no partial credit): the
+    driver note is explicit that a fix altering unaffected geometry scores 0 even if the
+    rebuild passes.
     """
     intent_ok = _intent_preserved(fixed, intent_dims)
     anomaly_gone = not _has_anomaly(fixed)
@@ -261,20 +277,34 @@ def verify_fix(fixed: dict, claimed: bool, intent_dims: dict, *,
         detail["mode"] = "live"
         try:
             res = opener(fixed)
-            detail["rebuilt"] = bool(res.get("rebuilt"))
-            if res.get("error"):
-                detail["rebuild_error"] = str(res["error"])[:200]
-            if not (claimed and res.get("rebuilt") and res.get("doc_id")):
-                return 0.0, False, detail
+        except Exception as e:  # noqa: BLE001 — a core hiccup is a verifier error, not a pass
+            return _verification_error(detail, f"opener(fix) {type(e).__name__}: {e}")
+        detail["rebuilt"] = bool(res.get("rebuilt"))
+        if res.get("error"):
+            detail["rebuild_error"] = str(res["error"])[:200]
+        if not (claimed and res.get("rebuilt") and res.get("doc_id")):
+            detail["verdict"] = "fail"
+            return 0.0, False, detail
+        try:
             good_res = opener(good_document)
-            match = compare_fn(res["doc_id"], good_res["doc_id"]) if good_res.get("rebuilt") else None
-            detail["match_pct"] = match
-            passed = bool(match is not None and match >= LIVE_MATCH_THRESHOLD)
-            return (1.0 if passed else 0.0), passed, detail
-        except Exception as e:  # a core hiccup must not silently pass — record + fall back
-            detail["live_error"] = f"{type(e).__name__}: {e}"[:160]
+        except Exception as e:  # noqa: BLE001
+            return _verification_error(detail, f"opener(known-good) {type(e).__name__}: {e}")
+        if not (good_res.get("rebuilt") and good_res.get("doc_id")):
+            return _verification_error(
+                detail, f"known-good reference did not rebuild: {good_res.get('error')}")
+        try:
+            match = compare_fn(res["doc_id"], good_res["doc_id"])
+        except Exception as e:  # noqa: BLE001
+            return _verification_error(detail, f"compare {type(e).__name__}: {e}")
+        detail["match_pct"] = match
+        if match is None:
+            return _verification_error(detail, "eval_compare degraded (no match_pct)")
+        passed = bool(match >= LIVE_MATCH_THRESHOLD)
+        detail["verdict"] = "pass" if passed else "fail"
+        return (1.0 if passed else 0.0), passed, detail
 
     passed = bool(claimed and anomaly_gone and intent_ok)
+    detail["verdict"] = "pass" if passed else "fail"
     return (1.0 if passed else 0.0), passed, detail
 
 
@@ -353,18 +383,24 @@ def run(corpus_dir: str, dataset_hash: str, *, split: str = "all", limit: Option
         d["fixed"] += int(e.passed)
 
     verifier_mode = examples[0].detail.get("mode", "fixture") if examples else "fixture"
-    # An intended-live run where the core errored on any example silently fell back to fixture
-    # scoring for those (verify_fix records `live_error`). Surface it so an all-erroring "live"
-    # run can't masquerade as clean — the all-skip trap one layer down.
-    live_error_count = sum(1 for e in examples if e.detail.get("live_error"))
-    if verifier_mode == "live" and live_error_count:
+    # A live verification that could not run is an ERROR row scored as not-fixed (verify_fix
+    # never falls back to structural checks). Any such row marks the run degraded, and a
+    # degraded run is not promotion evidence: its fix-rate is bounded by verifier faults, not
+    # measured on every example.
+    live_error_count = sum(1 for e in examples if e.detail.get("verdict") == "error")
+    frontier_error_count = sum(1 for e in examples
+                               if (e.detail.get("frontier") or {}).get("verdict") == "error")
+    if verifier_mode == "live" and (live_error_count or frontier_error_count):
         verifier_mode = "degraded"
     agg = {
         "pct_fixed": det_pass, "deterministic_mean": det_mean,
         "roc_auc_det_fixable": auc, "intent_drift_count": intent_drift,
         "per_class": per_class, "verifier_mode": verifier_mode,
         "live_error_count": live_error_count,
-        "success_bar": {"pct_fixed>=0.70": det_pass >= 0.70, "intent_drift==0": intent_drift == 0},
+        "frontier_live_error_count": frontier_error_count,
+        "promotion_evidence": verifier_mode == "live",
+        "success_bar": {"pct_fixed>=0.70": det_pass >= 0.70, "intent_drift==0": intent_drift == 0,
+                        "no_verifier_errors": not (live_error_count or frontier_error_count)},
     }
 
     frontier_mean = frontier_pass = None

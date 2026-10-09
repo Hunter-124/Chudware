@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import tempfile
 import threading
 import time
 import uuid
@@ -1261,7 +1262,7 @@ def test_no_python_autosave_timer_in_daemon_mode(scratch_daemon, monkeypatch):
     assert cad_tools._PERIODIC_TIMER[0] is None
 
 
-def test_instance_key_parity_with_cpp(tmp_path, monkeypatch):
+def test_instance_key_parity_with_cpp(monkeypatch):
     """The default (no CHUDWARE_INSTANCE_KEY) rendezvous: Python must hash the hostd
     path to the SAME instance key the C++ daemon computes for itself, or the MCP
     and the GUI split into two engines and live doc mirroring silently dies.
@@ -1271,26 +1272,29 @@ def test_instance_key_parity_with_cpp(tmp_path, monkeypatch):
     from it), so the path-derived key lands on a fresh socket."""
     monkeypatch.delenv("CHUDWARE_INSTANCE_KEY", raising=False)
     monkeypatch.delenv("CHUDWARE_HOSTD_SOCKET", raising=False)
-    runtime_dir = tmp_path.parent / "hostd-runtime"
-    runtime_dir.mkdir(exist_ok=True)
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
-    monkeypatch.setenv("CHUDWARE_HOSTD_LINGER_SECS", "3")
-    c = DaemonClient()
-    try:
-        c.connect()  # spawns hostd; connect only succeeds if the keys agree
-        assert c.server_info.get("state") in ("ready", "loading")
-        sock = c._sock_path
-        assert sock and sock.startswith(str(runtime_dir)) and os.path.exists(sock), sock
-        pid = int(c.call("daemon_status", {})["pid"])
-    finally:
+    # pytest's runtime directory can exceed AF_UNIX's 108-byte path limit on
+    # CI. Use a short, private namespace without changing the derived key.
+    with tempfile.TemporaryDirectory(prefix="cw-reg-", dir="/tmp") as runtime_dir:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", runtime_dir)
+        monkeypatch.setenv("CHUDWARE_HOSTD_LINGER_SECS", "3")
+        c = DaemonClient()
+        pid = None
         try:
-            c.close()
-        except Exception:
-            pass
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, UnboundLocalError):
-        pass
+            c.connect()  # spawns hostd; connect only succeeds if the keys agree
+            pid = int(c.call("daemon_status", {})["pid"])
+            assert c.server_info.get("state") in ("ready", "loading")
+            sock = c._sock_path
+            assert sock and sock.startswith(runtime_dir) and os.path.exists(sock), sock
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+            if pid is not None:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
 
 
 # ------------------------------------- last-writer detach: the doc SURVIVES

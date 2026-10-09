@@ -6351,3 +6351,15 @@ retain full logs. A clean isolated wheel install proved the archived SDK's 0.3.0
 Focused service suites passed 1,758 tests; host CTest passed 31/31 and all nine
 source gates passed. Full remote Linux gate and production promotion remain pending
 at this handoff; no successful OpenFOAM execution or live provider turn is claimed.
+
+### Linux gate qualification follow-up
+
+The refreshed CI runtime passed core/native/WASM builds, core CTest, hostd smoke,
+manual generation, DVC and the facilities-adjacent service suites. Its remaining
+failures were a parity test's overlong Unix socket directory and an absent ngspice
+executable, not missing engine outputs. The registry test now uses a private short
+runtime directory and always tears down its owned daemon; the dedicated Linux gate
+provisions real ngspice rather than weakening backend assertions. Seven focused
+tests passed, and direct runtime smoke connected the default-key private daemon
+and computed a 6.6667 V divider through ngspice. Full remote requalification remains
+pending; the workspace/demo repair itself is already promoted and locally verified.

@@ -12,8 +12,8 @@ libchudware RPC bridge the MCP server uses:
 
 and then rendering the returned Move list (rapid/lead/cut/plunge/arc, classified
 exactly like the in-app backplot, ui_theme.cpp camRapid/camLead/camCut/camPlunge/
-camArc dark palette) over the stock silhouette in the same iso-ish camera the
-modeling tiles use (yaw 35 / pitch 26). NEVER a stylized glyph: if cam_generate
+camArc light-palette inks) over the opaque shaded stock in the same iso-ish camera
+the modeling tiles use (yaw 35 / pitch 26). NEVER a stylized glyph: if cam_generate
 yields no renderable moves for an op, that is a CAM bug to FILE, and the tile is
 reported as failed (the atlas keeps the SDF fallback glyph for that cell).
 
@@ -67,25 +67,32 @@ def _resolve_libchudware() -> None:
 _resolve_libchudware()
 
 # ---------------------------------------------------------------------------
-# Backplot palette — dark-theme values from host/src/ui_theme.cpp L90-94 so the
-# icon IS the in-app backplot look (one asset serves both themes; the dark
-# palette stays readable on the light ribbon glass).
+# Backplot palette — the in-app backplot hues (host/src/ui_theme.cpp camRapid/
+# camLead/camPlunge/camCut/camArc), taken from the LIGHT palette: one asset serves
+# both themes and the deeper light-theme inks keep their contrast over the opaque
+# grey stock as well as on the dark ribbon glass. Rapids stay thin and translucent
+# so the feed moves carry the tile.
 # ---------------------------------------------------------------------------
 COL = {
-    "rapid":  (199, 61, 51, 110),
-    "lead":   (79, 199, 120, 240),
-    "plunge": (79, 181, 219, 240),
-    "cut":    (89, 150, 240, 255),
-    "arc":    (150, 130, 240, 255),
+    "rapid":  (179, 46, 38, 170),
+    "lead":   (41, 153, 82, 255),
+    "plunge": (33, 135, 173, 255),
+    "cut":    (41, 102, 204, 255),
+    "arc":    (112, 87, 209, 255),
 }
-LW = {"rapid": 4, "lead": 8, "plunge": 9, "cut": 11, "arc": 11}  # at SS*OUT_PX canvas
-STOCK_EDGE = (150, 155, 163, 235)
-STOCK_TOP = (196, 200, 207, 78)
-STOCK_SIDE = (128, 132, 140, 64)
+LW = {"rapid": 6, "lead": 18, "plunge": 22, "cut": 26, "arc": 26}  # at SS*OUT_PX canvas
+# Stock is an opaque, Lambert-shaded steel-grey solid (same desaturated family as the
+# modeling tiles' stock, so the runtime accent remap never touches it).
+STOCK_RGB = (158, 164, 174)
+STOCK_EDGE = (58, 63, 72, 255)
+STOCK_EDGE_W = 7
 
 
 def _iso(yaw_deg: float = 35.0, pitch_deg: float = 26.0):
-    """Orthographic iso-ish projector matching the modeling-tile camera family."""
+    """Orthographic iso-ish projector matching the modeling-tile camera family.
+    Returns (proj, view) where view is the unit world vector pointing at the viewer.
+    The basis (screen-right, screen-up, view) is right-handed, so the tile is a true
+    view of the part, never its mirror image (engraved text reads the right way)."""
     ya, pa = math.radians(yaw_deg), math.radians(pitch_deg)
     cy, sy, cp, sp = math.cos(ya), math.sin(ya), math.cos(pa), math.sin(pa)
 
@@ -94,14 +101,25 @@ def _iso(yaw_deg: float = 35.0, pitch_deg: float = 26.0):
         # yaw about Z
         xr = x * cy - y * sy
         yr = x * sy + y * cy
-        # pitch about screen-X: screen up mixes world z and yr
+        # pitch about screen-X: the camera sits on -yr looking down, so far (+yr)
+        # points rise on screen
         u = xr
-        v = z * cp - yr * sp
+        v = z * cp + yr * sp
         return (u, v)
-    return proj
+    return proj, (-sy * cp, -cy * cp, sp)
 
 
-def _fit_points(pts2, px: int, margin: float = 0.10):
+def _shade(normal, view):
+    """Flat Lambert shade of the stock for a face normal: key light from above, a bit
+    toward the viewer, so top / lit side / shadow side read as three distinct greys."""
+    lx, ly, lz = view[0] * 0.55, view[1] * 0.55, 0.85
+    ln = math.sqrt(lx * lx + ly * ly + lz * lz)
+    nx, ny, nz = normal
+    k = 0.52 + 0.58 * max(0.0, (nx * lx + ny * ly + nz * lz) / ln)
+    return tuple(min(255, round(c * k)) for c in STOCK_RGB) + (255,)
+
+
+def _fit_points(pts2, px: int, margin: float = 0.03):
     xs = [p[0] for p in pts2]
     ys = [p[1] for p in pts2]
     w = max(xs) - min(xs) or 1.0
@@ -168,37 +186,54 @@ def _classify_polylines(moves):
     return polys
 
 
-def _stock_wire(stock):
-    """3D edge segments + translucent face polys for the stock silhouette."""
-    faces, edges = [], []
+def _stock_solid(stock, view):
+    """Opaque stock silhouette: (shaded face polys, closed outline polylines), both 3D.
+    Only the faces turned toward the viewer are emitted, so no hidden edge is drawn."""
+    def facing(n):
+        return n[0] * view[0] + n[1] * view[1] + n[2] * view[2] > 1e-6
+
+    faces, outlines = [], []
     if stock["type"].startswith("box"):
-        lo, hi = stock["min"], stock["max"]
-        x0, y0, z0 = lo
-        x1, y1, z1 = hi
-        top = [(x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
-        front = [(x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1)]
-        right = [(x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1)]
-        faces = [(top, STOCK_TOP), (front, STOCK_SIDE), (right, STOCK_SIDE)]
-        c = [(x, y, z) for z in (z0, z1) for y in (y0, y1) for x in (x0, x1)]
-        idx = [(0, 1), (1, 3), (3, 2), (2, 0), (4, 5), (5, 7), (7, 6), (6, 4),
-               (0, 4), (1, 5), (2, 6), (3, 7)]
-        edges = [(c[a], c[b]) for a, b in idx]
+        x0, y0, z0 = stock["min"]
+        x1, y1, z1 = stock["max"]
+        quads = [
+            ((0, 0, 1), [(x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]),
+            ((0, 0, -1), [(x0, y0, z0), (x0, y1, z0), (x1, y1, z0), (x1, y0, z0)]),
+            ((0, -1, 0), [(x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1)]),
+            ((0, 1, 0), [(x0, y1, z0), (x0, y1, z1), (x1, y1, z1), (x1, y1, z0)]),
+            ((-1, 0, 0), [(x0, y0, z0), (x0, y0, z1), (x0, y1, z1), (x0, y1, z0)]),
+            ((1, 0, 0), [(x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1)]),
+        ]
+        for n, quad in quads:
+            if facing(n):
+                faces.append((quad, _shade(n, view)))
+                outlines.append(quad + quad[:1])
     elif stock["type"].startswith("cylinder"):
         # lathe stock: axis = +Z through `base`, fields radius/height (model.h L77-80)
         r = stock["radius"]
         z0 = stock["base"][2]
         z1 = z0 + stock["height"]
-        n = 40
-        ring0 = [(r * math.cos(2 * math.pi * i / n), r * math.sin(2 * math.pi * i / n), z0)
-                 for i in range(n + 1)]
+        n = 72
+        ang = [2 * math.pi * i / n for i in range(n + 1)]
+        ring0 = [(r * math.cos(a), r * math.sin(a), z0) for a in ang]
         ring1 = [(p[0], p[1], z1) for p in ring0]
-        faces = [(ring1, STOCK_TOP)]
-        edges = list(zip(ring0[:-1], ring0[1:])) + list(zip(ring1[:-1], ring1[1:]))
-        # silhouette sides at the yaw-facing tangents
-        for a in (math.radians(125), math.radians(305)):
-            x, y = r * math.cos(a), r * math.sin(a)
-            edges.append(((x, y, z0), (x, y, z1)))
-    return faces, edges
+        front = []  # strip indices facing the viewer, in angular order
+        for i in range(n):
+            am = (ang[i] + ang[i + 1]) / 2
+            nrm = (math.cos(am), math.sin(am), 0.0)
+            if facing(nrm):
+                faces.append(([ring0[i], ring0[i + 1], ring1[i + 1], ring1[i]],
+                              _shade(nrm, view)))
+                front.append(i)
+        faces.append((ring1, _shade((0, 0, 1), view)))
+        outlines.append(ring1)
+        if front:
+            # the visible strips form one contiguous arc (possibly wrapping past 0)
+            start = next(i for i in front if (i - 1) % n not in front)
+            seq = [(start + k) % n for k in range(len(front))]
+            bottom = [ring0[seq[0]]] + [ring0[i + 1] for i in seq]
+            outlines.append([ring1[seq[0]]] + bottom + [ring1[seq[-1] + 1]])
+    return faces, outlines
 
 
 def render_toolpath_tile(name: str, moves, stock, out_dir: Path,
@@ -206,13 +241,13 @@ def render_toolpath_tile(name: str, moves, stock, out_dir: Path,
                          lw_scale: float = 1.0) -> Path:
     """Render classified toolpath moves over the stock silhouette to <name>.png."""
     px = OUT_PX * SS
-    proj = _iso(yaw, pitch)
+    proj, view = _iso(yaw, pitch)
     polys = _classify_polylines(moves)
-    faces, edges = _stock_wire(stock)
+    faces, outlines = _stock_solid(stock, view)
 
     # fit view on stock + cutting moves (rapids often tower above; exclude them
     # from the fit so the cut pattern fills the tile, but still draw them)
-    fit_pts = [proj(p) for f, _ in faces for p in f] + [proj(p) for e in edges for p in e]
+    fit_pts = [proj(p) for f, _ in faces for p in f]
     for k in ("cut", "arc", "lead", "plunge"):
         for pl in polys[k]:
             fit_pts += [proj(p) for p in pl]
@@ -223,9 +258,10 @@ def render_toolpath_tile(name: str, moves, stock, out_dir: Path,
     img = Image.new("RGBA", (px, px), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     for poly, col in faces:
-        d.polygon([to_px(proj(p)) for p in poly], fill=col)
-    for a, b in edges:
-        d.line([to_px(proj(a)), to_px(proj(b))], fill=STOCK_EDGE, width=2)
+        d.polygon([to_px(proj(p)) for p in poly], fill=col, outline=col)
+    for ol in outlines:
+        d.line([to_px(proj(p)) for p in ol], fill=STOCK_EDGE, width=STOCK_EDGE_W,
+               joint="curve")
     # rapids under the cutting art
     for kind in ("rapid", "lead", "plunge", "cut", "arc"):
         for pl in polys[kind]:
@@ -324,7 +360,8 @@ CAM_SPECS: list[dict] = [
                 [[2, 8], [2, -8], [12, -8]],                          # L
             ]}, **FEEDS}},
     # ---- Holes -----------------------------------------------------------
-    {"cell": "cam_drill", "machine": "mill3", "stock": MILL_STOCK,
+    # "lw" (optional): stroke scale for tiles whose whole toolpath is a few plunges
+    {"cell": "cam_drill", "machine": "mill3", "stock": MILL_STOCK, "lw": 1.5,
      "tool": {"number": 1, "type": "drill", "diameter": 5.0, "tip_angle": 118.0,
               "flutes": 2},
      "op": {"type": "drill", "tool_number": 1, "cycle": "peck", "peck": 6.0,
@@ -400,7 +437,7 @@ CAM_SPECS: list[dict] = [
                 [[-16, -12], [16, -12], [16, 12], [-16, 12], [-16, -12]],
                 [[-6, -4], [6, -4], [6, 4], [-6, 4], [-6, -4]],
             ]}, "feed_rate": 1800.0, "feed": 1800.0}},
-    {"cell": "cam_probe", "machine": "mill3", "stock": MILL_STOCK,
+    {"cell": "cam_probe", "machine": "mill3", "stock": MILL_STOCK, "lw": 1.5,
      "tool": {"number": 1, "type": "probe", "diameter": 6.0},
      "op": {"type": "probe", "tool_number": 1,
             "heights": {"clearance": 12, "retract": 4, "top": 0, "bottom": -4},
@@ -448,7 +485,17 @@ def _run_spec(cb, spec) -> tuple[list, dict]:
         sim = cb.call("cam_simulate", {"doc_id": doc_id})
         res = (sim.get("results") or [{}])[0]
         if not res.get("ok", False):
-            raise RuntimeError(f"cam_simulate not ok: {res.get('warnings')}")
+            # Cut heads (laser/plasma/waterjet) have no stock-removal physics model: the
+            # engine's stock twin refuses them by contract (core/cam/stock_sim.cpp) and
+            # points at vector fidelity, so their smoke check is posting the program.
+            if res.get("error") == "cut_process_physics_unmodelled_use_vector_fidelity_only":
+                post = cb.call("cam_post", {"doc_id": doc_id})
+                if not post.get("ok") or not post.get("gcode"):
+                    raise RuntimeError(f"cam_post not ok: {post.get('error')} "
+                                       f"{post.get('warnings')}")
+            else:
+                raise RuntimeError(f"cam_simulate not ok: {res.get('error')} "
+                                   f"{res.get('warnings')}")
         return moves, res
     finally:
         try:
@@ -475,7 +522,7 @@ def render_all(out_dir: Path = RENDER_DIR, only: list[str] | None = None):
             continue
         try:
             moves, res = _run_spec(cb, spec)
-            lw = 1.5 if spec["machine"] == "lathe" else 1.0
+            lw = spec.get("lw", 1.8 if spec["machine"] == "lathe" else 1.0)
             render_toolpath_tile(name, moves, spec["stock"], out_dir, lw_scale=lw)
             print(f"[cam_icons] {name}: {len(moves)} moves, "
                   f"removed {res.get('removed_volume_mm3', 0):.0f} mm3, "

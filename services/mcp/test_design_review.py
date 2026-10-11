@@ -60,7 +60,7 @@ def _raise_fn(exc_type=RuntimeError, msg="backend exploded"):
 class TestNarration:
     def test_returns_string_not_json(self):
         overrides = {
-            "interference": _ok_fn(interferences=[], clearances=[]),
+            "interference": _ok_fn(clear=True, interferences=[], clearances=[]),
         }
         result = _run_design_review(checks=["interference"],
                                     tool_fn_overrides=overrides)
@@ -73,19 +73,19 @@ class TestNarration:
             pass  # expected — narrated text is NOT JSON
 
     def test_has_header_line(self):
-        overrides = {"interference": _ok_fn(interferences=[])}
+        overrides = {"interference": _ok_fn(clear=True, interferences=[])}
         result = _run_design_review(checks=["interference"],
                                     tool_fn_overrides=overrides)
         assert "Design Review" in result
 
     def test_has_source_attribution(self):
-        overrides = {"interference": _ok_fn(interferences=[])}
+        overrides = {"interference": _ok_fn(clear=True, interferences=[])}
         result = _run_design_review(checks=["interference"],
                                     tool_fn_overrides=overrides)
         assert "(Source:" in result
 
     def test_has_overall_verdict(self):
-        overrides = {"interference": _ok_fn(interferences=[])}
+        overrides = {"interference": _ok_fn(clear=True, interferences=[])}
         result = _run_design_review(checks=["interference"],
                                     tool_fn_overrides=overrides)
         assert "Overall:" in result
@@ -97,7 +97,7 @@ class TestNarration:
 
 class TestCheckNarration:
     def test_interference_pass_narrates_zero_pairs(self):
-        overrides = {"interference": _ok_fn(interferences=[], clearances=[])}
+        overrides = {"interference": _ok_fn(clear=True, interferences=[], clearances=[])}
         result = _run_design_review(checks=["interference"],
                                     tool_fn_overrides=overrides)
         assert "✓" in result
@@ -107,7 +107,7 @@ class TestCheckNarration:
     def test_interference_fail_narrates_count(self):
         overrides = {
             "interference": _ok_fn(
-                interferences=[{"a": "body1", "b": "body2", "volume": 0.5}]
+                clear=False, interferences=[{"a": "body1", "b": "body2", "volume": 0.5}]
             )
         }
         result = _run_design_review(checks=["interference"],
@@ -205,7 +205,7 @@ class TestCheckNarration:
 class TestOverallVerdict:
     def test_overall_pass_when_all_pass(self):
         overrides = {
-            "interference": _ok_fn(interferences=[]),
+            "interference": _ok_fn(clear=True, interferences=[]),
             "erc":          _ok_fn(errors=0, warnings=0),
         }
         result = _run_design_review(
@@ -216,7 +216,7 @@ class TestOverallVerdict:
 
     def test_overall_fail_when_any_fail(self):
         overrides = {
-            "interference": _ok_fn(interferences=[{"a": "a", "b": "b"}]),
+            "interference": _ok_fn(clear=False, interferences=[{"a": "a", "b": "b"}]),
             "erc":          _ok_fn(errors=0, warnings=0),
         }
         result = _run_design_review(
@@ -227,7 +227,7 @@ class TestOverallVerdict:
 
     def test_overall_partial_when_backends_unavailable(self):
         overrides = {
-            "interference": _ok_fn(interferences=[]),
+            "interference": _ok_fn(clear=True, interferences=[]),
         }
         # "erc" has no override and its real backend is not available in test env
         # We can simulate this by using a raise fn
@@ -240,7 +240,7 @@ class TestOverallVerdict:
         assert "Overall:" in result
 
     def test_skipped_checks_not_counted_as_fail(self):
-        overrides = {"interference": _ok_fn(interferences=[])}
+        overrides = {"interference": _ok_fn(clear=True, interferences=[])}
         result = _run_design_review(
             checks=["interference"],  # only run interference
             tool_fn_overrides=overrides,
@@ -276,7 +276,7 @@ class TestUnavailableBackends:
 
 class TestHonestSkip:
     def test_unrequested_checks_appear_as_skipped(self):
-        overrides = {"interference": _ok_fn(interferences=[])}
+        overrides = {"interference": _ok_fn(clear=True, interferences=[])}
         result = _run_design_review(
             checks=["interference"],
             tool_fn_overrides=overrides,
@@ -295,7 +295,7 @@ class TestHonestSkip:
 
 class TestDocId:
     def test_doc_id_appears_in_header(self):
-        overrides = {"interference": _ok_fn(interferences=[])}
+        overrides = {"interference": _ok_fn(clear=True, interferences=[])}
         result = _run_design_review(
             doc_id="my-doc-123",
             checks=["interference"],
@@ -304,7 +304,7 @@ class TestDocId:
         assert "my-doc-123" in result
 
     def test_default_doc_label_when_no_doc_id(self):
-        overrides = {"interference": _ok_fn(interferences=[])}
+        overrides = {"interference": _ok_fn(clear=True, interferences=[])}
         result = _run_design_review(
             checks=["interference"],
             tool_fn_overrides=overrides,

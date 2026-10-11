@@ -156,7 +156,8 @@ def test_interface_check_world_placed_assembly(tmp_path, dx):
                     "query": {"of": "face", "body_id": 3}})
         result, _ = _call("interface_check",
                           {"doc_id": assembly, "components": ["k1", "k2"]})
-        assert result["ok"] is (dx == 0), result
+        assert result["ok"] is True, result  # a misalignment is a finding, not a tool failure
+        assert result["status"] == ("pass" if dx == 0 else "fail"), result
         assert len(result["pairs"]) == 1, result
         holes = result["pairs"][0]["checks"]["hole_pattern"]
         assert holes["status"] == ("pass" if dx == 0 else "fail"), holes
@@ -177,7 +178,7 @@ def test_interface_check_misaligned_bracket_plate_is_flagged():
     doc = _build_stack(dx=dx)
     r, _ = _call("interface_check", {"doc_id": doc, "components": ["f2", "f3"]})
     assert r is not None and r["tool"] == "interface_check" and r["version"] == 1, r
-    assert r["ok"] is False, r  # misaligned -> not ok
+    assert r["ok"] is True and r["status"] == "fail", r  # misaligned -> finding, check ran
     assert len(r["pairs"]) == 1, r
 
     hp = r["pairs"][0]["checks"]["hole_pattern"]
@@ -252,7 +253,7 @@ def test_interface_check_single_body_is_noop():
         cb.feat("box", "B", {"length": cb.dim(20), "width": cb.dim(20), "height": cb.dim(10)})],
         "doc_id": doc})
     r2, _ = _call("interface_check", {"doc_id": doc})
-    assert r2["ok"] is True and r2["pairs"] == [], r2
+    assert r2["ok"] is True and r2["status"] == "skip" and r2["pairs"] == [], r2
 
 
 def test_unknown_component_is_refused_not_a_silent_pass():
@@ -317,3 +318,49 @@ def test_interface_check_in_design_review_battery():
     text = _run_design_review(doc_id=doc, checks=["interface_check"])
     assert "Interface alignment" in text, text
     assert "FAIL" in text, text
+
+
+@pytest.mark.parametrize("dx", [0.0, 0.75])
+def test_partial_cylinder_coaxiality_uses_geometric_axis(tmp_path, dx):
+    """A D-shaped shaft's surface centroid must not displace its geometric axis."""
+    shaft = _fresh_doc("partial_shaft")
+    plate = _fresh_doc("partial_shaft_socket")
+    assembly = None
+    try:
+        result, _ = _call("add_features", {"doc_id": shaft, "ops": [
+            cb.feat("cylinder", "Shaft", {"radius": cb.dim(2), "height": cb.dim(10),
+                                        "axis": "+z", "centered": True}),
+            cb.feat("box", "Flat", {"length": cb.dim(4), "width": cb.dim(8),
+                                    "height": cb.dim(12), "at": [-2, 0, 0], "mode": "cut"}),
+        ]})
+        assert result["ok"], result
+        result, _ = _call("add_features", {"doc_id": plate, "ops": [
+            cb.feat("box", "Socket", {"length": cb.dim(12), "width": cb.dim(12),
+                                      "height": cb.dim(4)}),
+            cb.feat("cylinder", "Bore", {"radius": cb.dim(2.2), "height": cb.dim(6),
+                                       "axis": "+z", "centered": True, "mode": "cut"}),
+        ]})
+        assert result["ok"], result
+        paths = [str(tmp_path / "shaft.step+"), str(tmp_path / "socket.step+")]
+        for document, path in zip((shaft, plate), paths):
+            result, _ = _call("save_part", {"doc_id": document, "path": path})
+            assert result["ok"], result
+        result, _ = _call("new_assembly", {"name": f"partial_axis_{next(_STACK_SEQ)}"})
+        assert result["ok"], result
+        assembly = result["doc_id"]
+        for path, placement in zip(paths, ([0, 0, 0], [dx, 0, 4])):
+            result, _ = _call("asm_add_component",
+                              {"doc_id": assembly, "path": path, "at": placement})
+            assert result["ok"], result
+        result, _ = _call("interface_check",
+                          {"doc_id": assembly, "components": ["k1", "k2"]})
+        coax = result["pairs"][0]["checks"]["coaxiality"]
+        assert coax["status"] == ("pass" if dx == 0 else "fail"), coax
+        assert len(coax["pairs"]) == 1, coax
+        assert coax["pairs"][0]["axis_offset_mm"] == pytest.approx(dx), coax
+        assert coax["pairs"][0]["axis_angle_deg"] == pytest.approx(0), coax
+    finally:
+        if assembly is not None:
+            _call("close_part", {"doc_id": assembly})
+        _call("close_part", {"doc_id": shaft})
+        _call("close_part", {"doc_id": plate})

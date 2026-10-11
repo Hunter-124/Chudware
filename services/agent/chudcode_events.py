@@ -1257,7 +1257,11 @@ def map_rpc_frame(
         text = _str(data, "text", "message", "content", limit=_MAX_LABEL)
         if not text:
             return []
-        return [_status(link, "notice" if event == "notice" else "progress_nudge", text)]
+        if event == "notice":
+            return [_status(link, "notice", text)]
+        # reason "turn_budget" marks the pre-expiry reminder of a budgeted turn.
+        return [_status(link, "progress_nudge", text, reason=_str(data, "reason"),
+                        budget_s=data.get("budget_s"), remaining_s=data.get("remaining_s"))]
     if event == "irc_message":
         return _irc_message(data, link)
     if event == "agent_question":

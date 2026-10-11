@@ -71,7 +71,9 @@ bool force_release_doc_lock();
 // called X" (services/mcp new_part) pass true; callers that mean "another document"
 // (new_part(fresh=True), import, reverse-engineering) leave it false and keep uniquifying.
 // `project_dir`, when non-empty, limits the resume to documents without a file or whose
-// file lies inside it: another project's open document is never resumed.
+// file lies inside it: another project's open document is never resumed. It must be
+// absolute (a relative value throws OpError("invalid_op")). A new assembly also uses it as
+// the base folder for relative component sources until the document has a file.
 nlohmann::json doc_new(const std::string& kind, const std::string& name,
                        bool resume_if_open = false, const std::string& project_dir = {});
 
@@ -409,9 +411,11 @@ nlohmann::json doc_eval_model_integrity(const std::string& doc_id,
 // ("plane.top/front/right"), a {"kind":"datum","feature":<id>} selector, or an arbitrary
 // cut {"origin":[x,y,z],"normal":[nx,ny,nz]} (optional "xdir":[3]).
 // Returns {area_mm2, centroid[3], Ixx, Iyy, Ixy}: global centroid and plane-local
-// centroidal moments. A genuine empty intersection returns zero fields. Failed
-// section/loop/face/integration throws section_failed, never partial or empty success.
-// Missing geometry and invalid planes also throw OpError.
+// centroidal moments. A genuine empty intersection returns zero fields. A closed shell is
+// sectioned as the solid it bounds. A plane that cuts a body with free edges throws
+// section_failed with detail.reason "body_not_closed_solid" and body_id; a plane that
+// misses such a body skips it. Failed section/face/integration throws section_failed,
+// never partial or empty success. Missing geometry and invalid planes also throw OpError.
 nlohmann::json doc_eval_section_props(const std::string& doc_id, const nlohmann::json& plane_ref);
 
 // Evaluate — mirror-symmetry of the active body about `plane` (port of evaluate.py::
@@ -466,13 +470,14 @@ nlohmann::json doc_eval_feature_overlap(const std::string& doc_id,
 // Y = part − tool. Verdicts: "floating" (dist(X,Y) > gap tolerance — its own island),
 // "barely_touching" (touches, but its best-supported face has < max(0.25 mm²,
 // min_contact_frac × largest tool face) of backed area — an edge/point contact),
-// "overhang" (the best-supported "base" face has > overhang_frac of its area with no
+// "overhang" (the foot — the tool face with the largest SUPPORTED SHARE, ties by supported
+// area then a mirror-invariant face key — has > overhang_frac of its area with no
 // material behind it, probed along the outward normal). The first solid-producing feature
 // and authored mode:"new"/merge:false features are skipped (the latter in `independent`).
 // `params` (optional): features [ids], overhang_frac (0.05), min_contact_frac (0.02),
 // budget_s (10). Returns {ok, summary, solid_count, features:[flagged entries {feature_id,
 // name, type, instance?, verdict, detail, location[3], gap_mm, contact_area_mm2,
-// base_face_area_mm2?, supported_area_mm2, supported_frac?, overhang_frac?,
+// base_face_area_mm2?, base_face_center[3]?, base_face_normal[3]?, supported_area_mm2, supported_frac?, overhang_frac?,
 // overhang_area_mm2?, overhang_mm?, region?{min,max}, nearest_point?, nearest_point_on_part?,
 // tool_volume_mm3, kept_volume_mm3}], flagged:[ids], attached:[ids], attached_count,
 // independent:[ids], not_checked:[ids], thresholds}. `ok` is false iff anything is flagged.

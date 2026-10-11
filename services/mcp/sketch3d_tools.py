@@ -1242,6 +1242,9 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
 
         Returns {ok, t, point (on-path), tangent, plane_used, area_mm2, centroid,
         Ixx, Iyy, Ixy, summary}.  area_mm2 is 0 if the origin plane misses the solid.
+        If the section fails, the tool returns ok=false with the engine code and detail.
+        Example: code "section_failed" with detail.reason "body_not_closed_solid" when the
+        plane cuts an open body. Run check_geometry_health on that body to find the cause.
         """
         try:
             d = _doc(doc_id)
@@ -1255,10 +1258,10 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
             tx, ty, tz = tangent
             dominant = max(range(3), key=lambda i: abs(tangent[i]))
             plane_used = {0: "right", 1: "front", 2: "top"}[dominant]
-            try:
-                res = cb.call("eval_section_props", {"doc_id": d, "plane": plane_used})
-            except Exception:  # noqa: BLE001
-                res = {"area_mm2": 0.0}
+            # A genuine empty intersection returns area 0 from the engine. Any error is a
+            # real failure (e.g. section_failed / body_not_closed_solid) and reaches _err with
+            # its code and detail; it is never an area of 0.
+            res = cb.call("eval_section_props", {"doc_id": d, "plane": plane_used})
             area = res.get("area_mm2", 0.0)
             t_clamped = max(0.0, min(1.0, float(t)))
             summary = (f"Section plane='{plane_used}' (at world origin, normal from tangent "

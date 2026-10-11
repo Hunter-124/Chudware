@@ -41,6 +41,15 @@ honest SKIPs, not failures. Fast source/audit gate: `python3 scripts/check.py` â
 stdlib-only; the interpreter needs the pinned audit packages (`CHECK_PYTHON` overrides;
 see [docs/reference/CI_RUNNERS.md](docs/reference/CI_RUNNERS.md)).
 
+The gate sweeps service units, scripts, assets, tools and training with the selected
+runtime interpreter; its packaging stage covers distro artifacts,
+release signing, evidence and finalization with that same interpreter. The fast audit
+also checks the frozen shared-UI manifest and assets.
+
+The public site's `.astro/` directory is generated local state, not source. Astro
+regenerates its content metadata and types during `npm run dev` or `npm run build`;
+keep `src/content.config.ts`, authored content and the package lockfile committed.
+
 ---
 
 ## Rules

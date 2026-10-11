@@ -2949,6 +2949,75 @@ def _normalize_asm_component_pose(ops: Any, notes: list) -> Any:
     return out if changed else ops
 
 
+# The engine reads asm_add_mate ONLY as {"op":"asm_add_mate","mate":{type, align, refs, value}}
+# with refs [{component, selector}], and a selector must be an engine match
+# (core/doc/session.cpp::op_asm_add_mate). Live 2026-10-10 (six-axis arm): a flat op
+# {op, type, align, refs} failed "requires a 'mate' object", then refs [{component, query}]
+# failed "selector must be an object". asm_mate takes that exact operand, so the same
+# resolver (cad_asm_tools.resolve_mate_ref) turns it into the engine selector here.
+_MATE_REF_QUERY_KEYS = ("query", "sid")
+
+
+def _normalize_asm_mate_ops(ops: Any, doc_id: Optional[str], notes: list) -> Any:
+    """Wrap a flat asm_add_mate into `mate`; resolve {component, query|sid} refs."""
+    if not isinstance(ops, list):
+        return ops
+    out: list = []
+    changed = False
+    comps: Optional[dict] = None
+    for index, op in enumerate(ops):
+        if not isinstance(op, dict) or _slug(op.get("op")) != "asm_add_mate":
+            out.append(op)
+            continue
+        fixed = dict(op)
+        if "mate" not in fixed:
+            body = {k: v for k, v in fixed.items() if k != "op"}
+            if body:
+                fixed = {"op": fixed["op"], "mate": body}
+                notes.append(
+                    f"asm_add_mate ${index}: put {sorted(body)} into the `mate` object. "
+                    "The op reads only op.mate.")
+        mate = fixed.get("mate")
+        if isinstance(mate, dict) and _is_num(mate.get("value")):
+            # asm_mate's `value` is a number; the stored mate value is a dimension object.
+            mate = {**mate, "value": {"value": float(mate["value"]), "expr": None}}
+            fixed["mate"] = mate
+            notes.append(f"asm_add_mate ${index}: stored the number `value` as "
+                         "{value, expr}. A mate value is a dimension object.")
+        refs = mate.get("refs") if isinstance(mate, dict) else None
+        pending = [j for j, ref in enumerate(refs or ())
+                   if isinstance(ref, dict) and "selector" not in ref
+                   and isinstance(ref.get("component"), str)
+                   and any(k in ref for k in _MATE_REF_QUERY_KEYS)]
+        if pending and doc_id:
+            from .cad_asm_tools import resolve_mate_ref  # noqa: PLC0415
+            if comps is None:
+                tree = (cb.call("doc_tree", {"doc_id": doc_id}) or {}).get("tree") or {}
+                comps = {c.get("id"): c for c in tree.get("components") or []
+                         if isinstance(c, dict)}
+            new_refs = list(refs)
+            for j in pending:
+                ref = refs[j]
+                if ref["component"] not in comps:
+                    continue  # a same-batch "$N" component: the engine names it
+                resolved = resolve_mate_ref(doc_id, comps, f"asm_add_mate ${index} refs[{j}]",
+                                            ref)
+                if "error" in resolved:
+                    raise ValueError(resolved["error"] + (
+                        f" Candidates: {json.dumps(resolved['candidates'])}"
+                        if resolved.get("candidates") else ""))
+                new_refs[j] = resolved["ref"]
+            if new_refs != refs:
+                fixed["mate"] = {**mate, "refs": new_refs}
+                notes.append(
+                    f"asm_add_mate ${index}: resolved the ref query against each component's "
+                    "source part, as asm_mate does.")
+        if fixed != op:
+            changed = True
+        out.append(fixed)
+    return out if changed else ops
+
+
 def _asm_transform_edits(ops: Any) -> dict:
     """{component_id: requested row-major 4x4} for every asm_edit_component pose in a batch."""
     edits: dict = {}
@@ -4013,6 +4082,18 @@ def _vec3(v: Any) -> Optional[list]:
     return None
 
 
+def _vec3_list(v: Any) -> Optional[list]:
+    """One [x,y,z] or a non-empty list of them -> a list of float triples; else None."""
+    one = _vec3(v)
+    if one is not None:
+        return [one]
+    if isinstance(v, list) and v:
+        pts = [_vec3(p) for p in v]
+        if all(p is not None for p in pts):
+            return pts
+    return None
+
+
 def _face_word_for_axis(v: Any) -> Optional[str]:
     vec = _vec3(v)
     if vec is None:
@@ -4147,30 +4228,72 @@ def _normalize_hole_feature(feat: dict, notes: list) -> dict:
                      f'(refs.face={{"of":"face","side":"{side}"}}) — a bore is entered '
                      f"through a named planar face, not along a world vector")
 
-    # A world XYZ where the hole's FACE-LOCAL [u,v] positions belong.
-    if not refs.get("positions") and params.get("positions") is None:
-        for k in _HOLE_AT_KEYS:
-            v = peek(k)
-            vec = _vec3(v)
-            if vec is None:
-                continue
-            consume(k)
-            changed = True
-            u, w2 = vec[0], vec[1]
-            if abs(u) < 1e-9 and abs(w2) < 1e-9:
-                notes.append(f'{label}: dropped {k}={vec} — hole positions are FACE-LOCAL '
-                             f"[u,v] pairs and [0,0] is the face centre (the default)")
-            else:
-                params["positions"] = [[u, w2]]
-                notes.append(f'{label}: interpreted {k}={vec} as positions=[[{u}, {w2}]] '
-                             f"— hole positions are FACE-LOCAL [u,v] pairs on refs.face")
-            break
+    # A WORLD [x,y,z] (or a list of them) where the placement belongs. It is NOT a face-local
+    # [u,v]: positions are measured from the face's outer-boundary centroid along u = world
+    # +X projected, v = n×u (document.cpp hole_face_frame), so copying [x,y] across drilled
+    # the wrong spot on any off-centre face and dropped z on a side face. world_points
+    # carries the points as given: each names a point on the bore AXIS, which the engine
+    # projects along the face normal onto refs.face (refusing one whose axis misses it).
+    wp_now = peek("world_points")
+    if (not refs.get("positions") and not refs.get("points")
+            and (wp_now is _MISSING or wp_now is None)):
+        placed = peek("positions")
+        if placed is not _MISSING and placed is not None:
+            pts = _vec3_list(placed)
+            if pts is not None:
+                consume("positions")
+                params["world_points"] = pts
+                changed = True
+                notes.append(f"{label}: positions={placed} are [x,y,z] WORLD points, not "
+                             f"face-local [u,v] pairs — sent as params.world_points={pts}; the "
+                             f"engine projects each along refs.face's normal onto that face "
+                             f"(a point on the bore axis)")
+        else:
+            for k in _HOLE_AT_KEYS:
+                pts = _vec3_list(peek(k))
+                if pts is None:
+                    continue
+                consume(k)
+                changed = True
+                params["world_points"] = pts
+                notes.append(f"{label}: read {k}={pts if len(pts) > 1 else pts[0]} as a WORLD "
+                             f"point on the bore axis — params.world_points={pts}; the engine "
+                             f"projects it along refs.face's normal onto that face. Face-local "
+                             f"positions [[u,v]] are measured from the face centre, not the "
+                             f"world origin")
+                break
 
     if not changed:
         return feat
     out["params"] = params
     out["refs"] = refs
     return out
+
+
+def _normalize_bolt_circle_feature(feat: dict, notes: list) -> dict:
+    """A WORLD [x,y,z] ring centre -> params.world_center.
+
+    The engine centres the ring on the face centre and reads no other centre key, so a
+    `center:[x,y,z]` used to be ignored and the ring landed on the face centre. Same
+    projection rule as hole world_points (document.cpp): a point on the ring's axis,
+    projected along refs.face's normal.
+    """
+    out, params, peek, consume = _split_two_levels(feat)
+    wc = peek("world_center")
+    if wc is not _MISSING and wc is not None:
+        return feat
+    for k in _HOLE_AT_KEYS:
+        vec = _vec3(peek(k))
+        if vec is None:
+            continue
+        consume(k)
+        params["world_center"] = vec
+        notes.append(f'{_feat_label(feat, "bolt_circle")}: read {k}={vec} as the ring centre '
+                     f"WORLD point — params.world_center={vec}; the engine projects it along "
+                     f"refs.face's normal onto that face")
+        out["params"] = params
+        return out
+    return feat
 
 
 _BOOLEAN_OP_WORDS = {
@@ -4999,12 +5122,12 @@ def _normalize_feature_refs(feat: dict, ftype: str, notes: list) -> dict:
         # dict that IS a selector/query is wrapped — a dict that merely nests the list one
         # level deeper ({"sections":[…]}) means something else entirely.
         #
-        # The wrap is safe ONLY because the engine unwraps a one-element query list back to
-        # the bare query (core/doc/validate.cpp::normalize_feature_shape). Without that,
-        # {"of":"face","side":"top"} in a list reaches the topology-SELECTOR resolver instead
-        # of the QUERY resolver and dangles with "no candidates of matching kind" — which
-        # rolls the whole atomic batch back and leaves an empty document. Pinned end-to-end
-        # by test_cad_tools.py::test_one_element_query_list_still_builds_a_shell.
+        # The wrap is safe because the engine resolves a query in a face list exactly like the
+        # bare query: normalize_feature_shape unwraps a one-element query list, and
+        # resolve_face_picks routes every query ELEMENT of a longer list (shell remove top +
+        # bottom) through the query resolver. Pinned end-to-end by
+        # test_cad_tools.py::test_one_element_query_list_still_builds_a_shell and
+        # test_modeling_repertoire.py::test_a_shell_opened_top_and_bottom_is_a_tube.
         if (slot in _LIST_REF_SLOTS and isinstance(v, dict)
                 and (v.get("kind") or v.get("of") or v.get("sid") or (set(v) & _QUERY_KEYS))):
             notes.append(f"{label}: wrapped refs.{slot} {_compact(v)} in a list — "
@@ -6039,6 +6162,8 @@ def _normalize_feature_schema(feat: dict, ftype: str, notes: list) -> dict:
         out = _normalize_extrude_params(out, ftype, notes)
     elif ftype == "hole":
         out = _normalize_hole_feature(out, notes)
+    elif ftype == "bolt_circle":
+        out = _normalize_bolt_circle_feature(out, notes)
     elif ftype == "boolean":
         out = _normalize_boolean_feature(out, notes)
     elif ftype == "cylinder":
@@ -6923,9 +7048,20 @@ def _native_read_file(path: str, sections: Optional[list[str]],
             keys += ("params",)
         result["features"] = _native_read_rows(features, keys, feature_ids)
     if "components" in selected:
-        result["components"] = _native_read_rows(
+        from .cad_asm_tools import resolve_component_source  # noqa: PLC0415
+        rows = _native_read_rows(
             components, ("id", "name", "source", "transform", "fixed",
                          "suppressed", "hidden"), component_ids)
+        # A stored relative source is relative to THIS file's folder. Report the absolute
+        # file next to it, so a caller can insert the same file into another assembly
+        # (2026-10-10: `parts/redesign/...` copied into a new assembly missed the file).
+        base = os.path.dirname(path)
+        for row in rows:
+            source = row.get("source")
+            stored = source.get("path") if isinstance(source, dict) else None
+            if isinstance(stored, str) and stored:
+                row["source_resolved"] = resolve_component_source(stored, base)
+        result["components"] = rows
     if "mates" in selected:
         result["mates"] = _native_read_rows(
             mates, ("id", "type", "align", "suppressed", "refs", "value"))
@@ -6943,6 +7079,12 @@ def _native_read_file(path: str, sections: Optional[list[str]],
             for study in (document.get("studies") or []) if isinstance(study, dict)
         ]
     return _dumps(_native_read_bounded(result))
+
+
+#: get_part(summary=True): a list longer than _SUMMARY_LIST_MAX keeps its first
+#: _SUMMARY_LIST_KEEP items, and the feature records the cut in `truncated_lists`.
+_SUMMARY_LIST_MAX = 64
+_SUMMARY_LIST_KEEP = 16
 
 
 def register_cad_doc_tools(mcp: FastMCP) -> None:
@@ -7497,8 +7639,13 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     params.end defaults to "blind" when a numeric depth is present and
                     "through_all" otherwise; through/thru are mapped onto "through_all".
                     refs.face defaults to {"of":"face","side":"top"} (a bore has to be
-                    entered SOMEWHERE) — a direction vector picks the face instead. A world
-                    [x,y,z] under origin/position/at becomes FACE-LOCAL positions=[[u,v]].
+                    entered SOMEWHERE) — a direction vector picks the face instead. World
+                    [x,y,z] point(s) under origin/position/at (or [x,y,z] positions) become
+                    params.world_points — points on each bore AXIS, which the engine projects
+                    along refs.face's normal onto that face (refused when the axis misses
+                    it); positions=[[u,v]] stay FACE-LOCAL.
+          bolt_circle  a world [x,y,z] ring centre under center/at/origin becomes
+                    params.world_center (same projection rule); omitted = face centre.
           sketch    missing/noncanonical entity ids become e<N>; canonical ids are retained,
                     with constraint handles remapped. Missing construction defaults to false.
                     Creation AND edit_feature replacements use the same entity/constraint
@@ -7550,6 +7697,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
           rename relabels ONE FEATURE and needs its id: {"op":"rename","id":"f1","name":"Base"}.
             No op renames the part/document: name it at creation (new_part(name="…")) and
             name its file with save_part(path="<name>.step+").
+          sketch_edit_entity changes the fields of ONE entity. Put the id and the changed fields
+            in "entity": {"op":"sketch_edit_entity","sketch":"f1","entity":{"id":"e1","p2":[60,0]}}.
+            The type cannot change. An unknown id, an empty patch or a wrong field is refused.
           A leading {"op":"new_part","name":…} (or bare {"type":"new_part",…}) is also
             accepted as a convenience: it mints the document and the rest of the batch
             builds into it, so you can create-and-build in one call. Everywhere else
@@ -7761,6 +7911,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # dialect (asm_add_component's own signature) has to become that matrix here or
             # the op applies "ok" and moves nothing.
             ops = _normalize_asm_component_pose(ops, interpreted)
+            # asm_add_mate reads only op.mate with refs [{component, selector}]; resolve
+            # asm_mate's {component, query|sid} operand the same way asm_mate does.
+            ops = _normalize_asm_mate_ops(ops, d, interpreted)
             # A pattern decides its own type from params.mode, so it must run BEFORE the
             # alias table maps the generic word "pattern" onto linear_pattern regardless.
             ops = _normalize_pattern_ops(ops, interpreted)
@@ -8256,29 +8409,44 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
     def get_part(doc_id: Optional[str] = None, summary: bool = False) -> str:
         """Return the feature tree (features, parameters, ids) + revision for editing.
 
+        Both forms share one layout: {ok, doc_id, revision, tree:{features:[...]}}, the same
+        `tree` every engine read returns, so result["tree"]["features"] is the feature list
+        whichever form you asked for.
+
         summary=True returns a LIGHTWEIGHT tree — feature id/name/type/suppressed + parameters,
         with heavy embedded geometry (the import features' base64 BREP blobs) and any oversized
-        string value ELIDED. Use it on big assemblies/imported parts where the full tree blows
-        the tool token limit (a 600k-char part lists in a few KB). The full (default) form
-        carries the complete params verbatim for round-trip editing.
+        string value ELIDED, plus summary:true and feature_count. Use it on big
+        assemblies/imported parts where the full tree blows the tool token limit (a 600k-char
+        part lists in a few KB). Every value keeps its type. A list with more than 64 items
+        keeps only its first 16 items. Its feature then gets
+        truncated_lists:{"params.entities": {"kept": 16, "total": 312}}, keyed by the path
+        in the feature. Do not send a summary params value back in an edit. Read the full
+        form for complete lists. The full (default) form carries the complete tree verbatim
+        for round-trip editing, plus owner_map (feature id -> owned faces/edges).
         """
         try:
             d = _doc(doc_id)
             r = cb.call("doc_tree", {"doc_id": d})
             if not summary:
-                return _dumps(r)
+                return _dumps({"ok": True, "doc_id": d, **r})
 
-            def _trim(value: Any) -> Any:
+            def _trim(value: Any, path: str, truncated: dict) -> Any:
                 # Elide base64 geometry blobs / very long strings that bloat the tree but carry
-                # no design intent the caller would read in a summary.
+                # no design intent the caller would read in a summary. A long list stays a
+                # list (c243: the old "<list of N elided>" string was iterated as characters);
+                # its cut is recorded in `truncated` under the value's path in the feature.
                 if isinstance(value, str) and len(value) > 200:
                     return f"<{len(value)} chars elided>"
                 if isinstance(value, dict):
-                    return {k: ("<elided>" if k in ("embedded_brep",) else _trim(v))
+                    return {k: ("<elided>" if k == "embedded_brep"
+                                else _trim(v, f"{path}.{k}", truncated))
                             for k, v in value.items()}
                 if isinstance(value, list):
-                    return [_trim(v) for v in value] if len(value) <= 64 else \
-                        f"<list of {len(value)} elided>"
+                    if len(value) <= _SUMMARY_LIST_MAX:
+                        return [_trim(v, f"{path}[{i}]", truncated) for i, v in enumerate(value)]
+                    truncated[path] = {"kept": _SUMMARY_LIST_KEEP, "total": len(value)}
+                    return [_trim(v, f"{path}[{i}]", truncated)
+                            for i, v in enumerate(value[:_SUMMARY_LIST_KEEP])]
                 return value
 
             tree = r.get("tree") or {}
@@ -8287,18 +8455,24 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             for f in feats:
                 if not isinstance(f, dict):
                     continue
-                params = {k: ("<elided>" if k == "embedded_brep" else _trim(v))
-                          for k, v in (f.get("params") or {}).items()}
-                out_feats.append({
+                truncated: dict = {}
+                params = _trim(f.get("params") or {}, "params", truncated)
+                entry = {
                     "id": f.get("id"),
                     "name": f.get("name"),
                     "type": f.get("type"),
                     "suppressed": bool(f.get("suppressed", False)),
                     "params": params,
-                })
+                }
+                if truncated:
+                    entry["truncated_lists"] = truncated
+                out_feats.append(entry)
+            # Same nesting as the full form: a caller that read one form reads the other
+            # (2026-10-10: summary reads taught `["features"]`, then a full read raised
+            # KeyError; c237 hit the reverse with `["tree"]`).
             return _dumps({"ok": True, "doc_id": d, "revision": r.get("revision"),
                            "summary": True, "feature_count": len(out_feats),
-                           "features": out_feats})
+                           "tree": {"features": out_feats}})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -8618,6 +8792,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         features, components, mates, explode, material, body_materials, appearances,
         face_appearances, meta, equations, configurations, rollback_after, studies. Large strings
         (including embedded BREP) are omitted; the saved file is never modified.
+        Each component carries its stored `source` and `source_resolved`, the absolute file
+        path. To insert the same file into another assembly, use `source_resolved`.
         """
         return _native_read_file(path, sections, feature_ids, component_ids, include_params)
 

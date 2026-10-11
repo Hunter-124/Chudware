@@ -30,6 +30,7 @@
 #include <BRepBuilderAPI_MakeEdge.hxx>  // I1/I3: circle wires for the loft test
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepGProp.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>  // near: flange bolt holes
 #include <GProp_GProps.hxx>
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Wire.hxx>
@@ -340,7 +341,7 @@ TEST_CASE("geom query: unknown key guard mirrors the public vocabulary") {
         {"sid", "F1"}, {"centroid", json::array({0, 0, 0})},
         {"normal", json::array({0, 0, 1})}, {"axis", json::array({0, 0, 1})},
         {"radius", 2.0}, {"area_or_len", 10.0}, {"concavity", "concave"},
-        {"hint_index", 0}, {"owner_feature", "f1"},
+        {"hint_index", 0}, {"owner_feature", "f1"}, {"axis_point", json::array({0, 0, 0})},
         {"doc_id", "d1"}, {"query", json::object()},
     };
     CHECK(unknown_query_keys(all_legal).empty());
@@ -856,6 +857,44 @@ TEST_CASE("I1 surf:round broadened: matches cone/sphere/torus/loft curved faces"
     }
 }
 
+// (I1b) surf abbreviations and plurals. Live c243: {"of":"face","surf":"cyl"} was refused,
+//       and the tool docs advertise edge surf "circular"/"elliptical", which the engine also
+//       refused. Each word must select the same set as its canonical kernel name.
+TEST_CASE("I1b surf abbreviations and synonyms select the same set as the canonical name") {
+    using chudware::doc::resolve_geom_query;
+    using chudware::doc::QueryPicks;
+    auto count = [](const TopoDS_Shape& s, const char* of, const char* surf) {
+        QueryPicks p = resolve_geom_query(s, json{{"of", of}, {"surf", surf}});
+        CHECK_MESSAGE(p.error.empty(), "surf '" << surf << "' must be accepted: " << p.error);
+        return std::string(of) == "face" ? p.faces.size() : p.edges.size();
+    };
+    struct Case { TopoDS_Shape shape; const char* of; const char* canon;
+                  std::vector<const char*> words; };
+    const std::vector<Case> cases = {
+        {geom::make_cylinder_centered(8.0, 40.0), "face", "cylinder",
+         {"cyl", "CYL", "cyls", "cylinders", "Cylindrical"}},
+        {geom::make_box(20.0, 20.0, 20.0), "face", "plane", {"flat", "planar", "planes"}},
+        {geom::make_cone_centered(10.0, 4.0, 30.0), "face", "cone", {"cones", "conical"}},
+        {geom::make_sphere(12.0), "face", "sphere", {"sph", "spheres", "spherical"}},
+        {geom::make_torus(20.0, 5.0), "face", "torus", {"tori", "toroid", "toroidal"}},
+        {geom::make_cylinder_centered(8.0, 40.0), "edge", "circle",
+         {"circular", "circles", "arc", "arcs"}},
+        {geom::make_box(20.0, 20.0, 20.0), "edge", "line", {"straight", "linear", "lines"}},
+    };
+    for (const Case& c : cases) {
+        REQUIRE_FALSE(c.shape.IsNull());
+        const size_t want = count(c.shape, c.of, c.canon);
+        CHECK_MESSAGE(want >= 1, "fixture must carry a '" << c.canon << "' " << c.of);
+        for (const char* w : c.words)
+            CHECK_MESSAGE(count(c.shape, c.of, w) == want,
+                          "surf '" << w << "' must select every '" << c.canon << "' " << c.of);
+    }
+    // A word for the other topology kind, or an unknown word, is still refused.
+    TopoDS_Shape box = geom::make_box(20.0, 20.0, 20.0);
+    CHECK_FALSE(resolve_geom_query(box, json{{"of", "edge"}, {"surf", "flat"}}).error.empty());
+    CHECK_FALSE(resolve_geom_query(box, json{{"of", "face"}, {"surf", "cylx"}}).error.empty());
+}
+
 // (I2) pick:"inner"/"outer" with NO round faces/edges degrades to an EMPTY result (0
 //      matches, NO error) — consistent with surf:round on a box. Previously it THREW a
 //      teaching error, which made an honest "no bores" look like a query bug. (The
@@ -1082,7 +1121,83 @@ TEST_CASE("T-QG: geom query defaults of:face and teaches the grammar on rejectio
         QueryPicks r = resolve_geom_query(box, json{{"surf", "shiny"}});
         REQUIRE_FALSE(r.error.empty());
         CHECK(has(r.error, "shiny"));
-        CHECK(has(r.error, "faces:"));  // face branch — `of` defaulted
+        CHECK(has(r.error, "face surf words"));  // face branch — `of` defaulted
         CHECK(has(r.error, "query keys:"));
     }
+}
+
+// near: the point is ON the entity the model means, so `near` ranks by distance to the actual
+// geometry (contracts/selectors.md §7). Live gpt-6-luna H5: a Ø110×12 flange with a PCD-80
+// 8×Ø9 bolt circle (first hole at +X); near:[55,0,12] lies ON the outer rim, yet centroid
+// ranking chose the +X hole's top edge (centroid (40,0,12), 15 mm away) over the rim
+// (centroid = axis point (0,0,12), 55 mm away), so the chamfer landed on the bolt hole.
+TEST_CASE("geom query near: ranks by distance to the geometry, ties to the nearer centroid") {
+    using chudware::doc::resolve_geom_query;
+    using chudware::doc::QueryPicks;
+    auto zcyl = [](double x, double y, double z0, double r, double h) {
+        return BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(x, y, z0), gp_Dir(0, 0, 1)), r, h).Shape();
+    };
+    TopoDS_Shape flange = geom::cut(zcyl(0, 0, 0, 55.0, 12.0), zcyl(0, 0, -1, 20.0, 14.0));
+    for (int i = 0; i < 8; ++i) {
+        const double a = 2.0 * M_PI * i / 8.0;
+        flange = geom::cut(flange, zcyl(40.0 * std::cos(a), 40.0 * std::sin(a), -1, 4.5, 14.0));
+    }
+    REQUIRE_FALSE(flange.IsNull());
+    auto radius = [](const QueryPicks& p, size_t i) { return p.selectors.at(i)["radius"].get<double>(); };
+    auto cx = [](const QueryPicks& p, size_t i) { return p.selectors.at(i)["centroid"][0].get<double>(); };
+
+    const json rim_q{{"of", "edge"}, {"side", "+z"}, {"surf", "circle"},
+                     {"near", json::array({55, 0, 12})}, {"count", 1}};
+    QueryPicks rim = resolve_geom_query(flange, rim_q);
+    REQUIRE_MESSAGE(rim.error.empty(), rim.error);
+    REQUIRE(rim.edges.size() == 1);
+    CHECK(radius(rim, 0) == doctest::Approx(55.0));
+
+    // count keeps the same order: the rim, then the +X bolt hole (10.5 mm away), not the bore.
+    json two = rim_q;
+    two["count"] = 2;
+    QueryPicks both = resolve_geom_query(flange, two);
+    REQUIRE(both.edges.size() == 2);
+    CHECK(radius(both, 0) == doctest::Approx(55.0));
+    CHECK(radius(both, 1) == doctest::Approx(4.5));
+    CHECK(cx(both, 1) == doctest::Approx(40.0));
+
+    // A point ON the hole edge still picks the hole edge.
+    QueryPicks hole = resolve_geom_query(
+        flange, json{{"of", "edge"}, {"side", "+z"}, {"surf", "circle"},
+                     {"near", json::array({44.5, 0, 12})}, {"count", 1}});
+    REQUIRE(hole.edges.size() == 1);
+    CHECK(radius(hole, 0) == doctest::Approx(4.5));
+    CHECK(cx(hole, 0) == doctest::Approx(40.0));
+
+    // A point ON the shared edge of two faces scores 0 for both: the nearer centroid wins.
+    // Squat box: front face (y=0) centroid (20,0,10) is 10 mm from (20,0,20), top's 15 mm.
+    // Tall box: top centroid (20,15,60) is 15 mm from (20,0,60), front's (20,0,30) is 30 mm.
+    auto cy = [](const QueryPicks& p) { return p.selectors.at(0)["centroid"][1].get<double>(); };
+    auto cz = [](const QueryPicks& p) { return p.selectors.at(0)["centroid"][2].get<double>(); };
+    QueryPicks squat = resolve_geom_query(
+        geom::make_box(40.0, 30.0, 20.0),
+        json{{"of", "face"}, {"near", json::array({20, 0, 20})}, {"count", 1}});
+    REQUIRE(squat.faces.size() == 1);
+    CHECK(cy(squat) == doctest::Approx(0.0));
+    CHECK(cz(squat) == doctest::Approx(10.0));
+    QueryPicks tall = resolve_geom_query(
+        geom::make_box(40.0, 30.0, 60.0),
+        json{{"of", "face"}, {"near", json::array({20, 0, 60})}, {"count", 1}});
+    REQUIRE(tall.faces.size() == 1);
+    CHECK(cy(tall) == doctest::Approx(15.0));
+    CHECK(cz(tall) == doctest::Approx(60.0));
+
+    // A centroid handed back (the engine's own selector re-resolution, describe_part read-back)
+    // still resolves to that entity, even a curved face whose centroid is off its surface: the
+    // +X bolt-hole wall's centroid (40,0,6) sits on its axis, 4.5 mm from the wall.
+    QueryPicks holes = resolve_geom_query(flange, json{{"of", "face"}, {"surf", "cylinder"}});
+    size_t px = holes.selectors.size();
+    for (size_t i = 0; i < holes.selectors.size(); ++i)
+        if (std::abs(radius(holes, i) - 4.5) < 1e-6 && std::abs(cx(holes, i) - 40.0) < 1e-6) px = i;
+    REQUIRE(px < holes.selectors.size());
+    QueryPicks back = resolve_geom_query(
+        flange, json{{"of", "face"}, {"near", holes.selectors.at(px)["centroid"]}, {"count", 1}});
+    REQUIRE(back.faces.size() == 1);
+    CHECK(back.selectors.at(0)["sid"] == holes.selectors.at(px)["sid"]);
 }

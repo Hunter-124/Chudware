@@ -74,6 +74,10 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   otherwise free may a gate run use `CHUDWARE_HEADROOM_GB=2 CHUDWARE_MEM_FRAC=0.6`.
 - Mixed pytest collections: root `conftest.py` isolates non-MCP engine tests per test;
   `services/mcp/conftest.py` opts its daemon tests out at collection.
+- Gate Python coverage includes service units, scripts, assets, tools and training;
+  the packaging stage covers the entire `packaging/` suite
+  using the same selected runtime interpreter. `check.py` also runs the shared-UI
+  manifest/asset audit. Astro `.astro/` metadata is ignored local state; do not commit it.
 - **Polyhedral-FEA pin:** `CHUDWARE_POLYMESH_ROOT=<tree> ./build.sh core` builds a local
   tree, but before shipping an API change validate the public pin in
   `core/cmake/ProvisionPolymesh.cmake` with no override: the configure log must say
@@ -129,10 +133,17 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   `gui` pin; recent/in-flight RPCs still pin like other non-GUI clients. Pinned by
   `test_worker_long_run`: `backgroundQueriesDoNotBlockPrimary`, `backgroundQueryEofIsIsolated`,
   `backgroundQueryTimeoutIsIsolated`, `disconnectWakesAllBackgroundQueries`.
-- **Drains are bounded.** `Server::beginDrain(deadlineSecs)`: `daemon_drain`/`--stop`/tray
-  Quit/SIGTERM are hard stops with a deadline (`CHUDWARE_HOSTD_DRAIN_GRACE_S`, default 20 s;
-  tray Quit 5 s). The stale-binary self-drain passes `0` (soft; refuses new connects only),
-  so a rebuild never kicks a live session.
+- **Drains are bounded.** `Server::beginDrain(deadlineSecs, reason)`: `daemon_drain`/`--stop`
+  (`stop_requested`), tray Quit (`quit`, 5 s) and SIGTERM are hard stops with a deadline
+  (`CHUDWARE_HOSTD_DRAIN_GRACE_S`, default 20 s). The stale-binary self-drain passes `0`
+  (`stale_binary`; soft), so a rebuild never kicks a live session.
+- **A draining daemon refuses new clients by name.** Non-control clients get a
+  `daemon.draining` event plus a `daemon_draining` hello error (`Server::drainRefusal`);
+  `--status`/`--stop` are admitted. **No client falls back to an in-process engine** on it:
+  Python raises `CoreError(code="daemon_draining")`; the GUI stays in daemon mode, names the
+  drain on its unreachable chip (`EngineClient::helloError()`, `engine::daemonRefusal()`), and
+  reconnects or spawns the new build after the old daemon exits (`test_worker_long_run`:
+  `drainRefusalKeepsDaemonMode`; `docs/reference/HOSTD.md`).
 - **Doc-GC** (`core/hostd/doc_registry.*`): `CHUDWARE_DOC_GC_GRACE_S` (90 s); agent/mcp-origin
   docs floor at `CHUDWARE_DOC_GC_AGENT_GRACE_S` (1800 s) so mission parts stay openable while
   the GUI exists; `CHUDWARE_DOC_GC=0` disables. The grace never pins the daemon; a clean exit
@@ -155,7 +166,9 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   single-flight with the spawned pid recorded and verified (`services/browser/cef_client.py`
   `_daemon_alive`); concurrent and sequential spawners yield exactly one process. A CEF-OFF
   build claims and refuses `--cef-*` argv with the `std::fflush(nullptr); std::_Exit(n)` tail
-  (`host/src/main.cpp`), never a plain `return`.
+  (`host/src/main.cpp`), never a plain `return`. The client watches the child it spawned: a
+  missing binary fails at once as `browser_helper_missing`; a helper that exits before it
+  listens fails as `browser_helper_exited` (stderr tail from `<sock>.spawn.log`).
 - GUI reconnect: sticky unreachable chip; `engine_events` re-bootstraps tabs on
   `reconnectGeneration` (`CHUDWARE_SHOT=daemon_h2`).
 
@@ -275,6 +288,8 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   its results; `civil_load` restores); the `civil_*` tools have no GUI panel yet.
 - **Assemblies report honestly:** bbox/mass/import gather world solids (`measure_part` is the
   MCP mass tool); `check_interference` refuses an empty doc and reports `pairs_checked`;
+  a complete check is `ok:true` with the verdict in `clear` (interface_check: `status`), so
+  a found clash is a finding, not a failed tool; `ok:false` means refused or incomplete;
   `validated: true` needs every component's solids and an exact round trip; a no-op
   `doc_solve_mates` is not an edit (no revision/dirty/undo). Importing a `.step+` is a fresh
   detached doc (`resume=True` opts in). Merges use the `assembly-merge` CAD skill

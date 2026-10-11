@@ -53,11 +53,10 @@ permissions:
   contents: read
 
 concurrency:
-  # One nightly at a time. A fresh dispatch supersedes a stale one; ci/publish
-  # is idempotent by run identity and the gateway re-digests anything staged,
-  # so a cancelled leg leaves nothing trusted behind.
+  # Keep every platform leg of an in-flight release together. New scheduled or
+  # manual runs queue rather than cancelling a partially published release.
   group: nightly-release
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CHUDWARE_RELEASE_KEY_ID: release-ci-v1

@@ -57,6 +57,13 @@ values.
   Report its `method`. K overrides are `constant`, Hooper `two_k`, Darby `three_k`,
   US `cv`, or a log-Re interpolated `table`. Set/remove overrides through
   `update_fitting` (`params:{"k_model":null}` restores the correlation).
+- Tee losses are per path. A stated straight-through/branch pair goes on the
+  auto-created tee: `{"op":"update_fitting","id":<tee>,"params":{"k_model_run":
+  {"kind":"constant","K":0.38},"k_model_branch":{"kind":"constant","K":1.14}}}`.
+  The run K is charged on `run_ids[1]` and the branch K on `branch_run`, each on
+  that pipe's velocity; `params.k_model` alone sets both paths. Never add custom
+  fittings as stand-in loss records (each is a BOM item). Unknown `params` keys
+  refuse `unknown_param` with the accepted keys listed.
 - Calibrate a doubtful fitting with
   `piping_fitting_k_cfd(fitting_id=..., network="process", doc_id=...,
   quality="quick", background=True, apply=True)`. Poll this same tool with

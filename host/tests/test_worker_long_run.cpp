@@ -40,6 +40,14 @@
 //   ✓ background query EOF/timeout leaves primary liveness/generation intact and reconnects
 //     only that side connection; disconnect wakes every active background call
 //
+// engine_backend startup against a draining hostd (forked child: the backend latches once
+// per process):
+//   ✓ a `daemon_draining` hello refusal keeps daemon mode: no in-process fallback, engine
+//     calls fail with the named refusal, daemonRefusal() carries the daemon's error object,
+//     and the daemon.draining push is not queued for drainEvents()
+//   ✓ maintainConnection() reports Unreachable while the daemon refuses, then connects once
+//     it admits clients again, and the refusal clears
+//
 // Idle bursts larger than the socket buffer only finish sending while the client reads, so
 // the idle checks consume through pollAlive/drainEvents CONCURRENTLY with the sender
 // (consumeIdleBurst) instead of waiting for the send to finish first.
@@ -54,6 +62,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #include <algorithm>
 #include <atomic>
@@ -209,6 +218,11 @@ public:
         std::lock_guard<std::mutex> lk(mtx_);
         return metadataStarted_;
     }
+    // Refuse every hello like a draining hostd (Server::admitWhileDraining).
+    void refuseHellos(bool refuse) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        refuseHellos_ = refuse;
+    }
 
 private:
     bool waitCount(const int& counter, int n, int timeoutMs) {
@@ -233,6 +247,20 @@ private:
     }
     static json docChanged(int i) {
         return {{"event", "doc.changed"}, {"data", {{"doc_id", "doc-cpp00000002"}, {"i", i}}}};
+    }
+    // Server::drainRefusal for a stale-binary drain.
+    static json drainRefusal() {
+        return {{"code", "daemon_draining"},
+                {"reason", "stale_binary"},
+                {"daemon_pid", static_cast<long>(::getpid())},
+                {"clients", 1},
+                {"active_clients", 1},
+                {"children", 0},
+                {"hard_stop", false},
+                {"changed_path", "/opt/chudware/lib/libchudware.so"},
+                {"message", "The engine changed on disk (libchudware.so). This daemon runs the "
+                            "old engine and is draining."},
+                {"hint", "Restart Chudware to load the new engine."}};
     }
 
     // Scripted call body: `events` agent.event (sim.progress) pushes interleaved with
@@ -379,6 +407,18 @@ private:
                 json params = req.value("params", json::object());
                 if (!params.is_object()) params = json::object();
                 const std::string method = req.value("method", std::string());
+                bool refuse = false;
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    refuse = refuseHellos_ && method == "hello";
+                }
+                if (refuse) {
+                    // Like hostd: the event, then the refusal for the hello id, then close.
+                    push(fd, {{"event", "daemon.draining"}, {"reason", "stale_binary"}});
+                    push(fd, {{"id", req.value("id", 0)}, {"error", drainRefusal()}});
+                    closeConn(fd);
+                    return;
+                }
                 const std::optional<json> result = handle(fd, clientId, method, params);
                 if (!result) {
                     closeConn(fd);
@@ -409,6 +449,7 @@ private:
     std::vector<int> connFds_;
     std::vector<std::thread> connThreads_;
     bool stopping_ = false;
+    bool refuseHellos_ = false;
     bool releaseTurns_ = true;
     bool releaseSims_ = true;
     bool releaseMetadata_ = true;
@@ -1089,6 +1130,52 @@ static void defaultLaneStillBuffers(FakeHostd& hostd) {
     CHECK(!queued.empty() && queued.front().value("event", std::string()) == "agent.event");
 }
 
+// Runs in a forked child: engine_backend selects its backend once per process, and this test
+// must be the first to select it. A GUI that starts while an old hostd drains gets the named
+// daemon_draining refusal. It must keep daemon mode: a private in-process engine would not
+// see the documents of the agent or of any other client.
+static void drainRefusalKeepsDaemonMode(FakeHostd& hostd) {
+    hostd.refuseHellos(true);
+
+    EngineClient probe;
+    EngineClient::Options o;
+    o.hostdBin = engine::hostdBinHint();
+    std::string e;
+    CHECK(!probe.connectOrSpawn(o, e));
+    CHECK(e.find("daemon_draining") != std::string::npos);
+    const json refusal = probe.helloError();
+    CHECK(refusal.is_object() && refusal.value("code", std::string()) == "daemon_draining");
+    CHECK(refusal.value("active_clients", -1) == 1);
+    CHECK(!probe.connected());
+    CHECK(probe.drainEvents().empty());  // the daemon.draining push is not queued
+
+    CHECK(engine::daemonMode());
+    CHECK(!engine::daemonUnavailable());
+    CHECK(engine::daemonRefusal().value("reason", std::string()) == "stale_binary");
+    json r;
+    std::string ce;
+    CHECK(!engine::call("doc_list", json::object(), r, ce, 5000));
+    CHECK(ce.find("daemon_draining") != std::string::npos);
+    std::string le;
+    CHECK(!engine::ensureLoaded(le));
+    CHECK(le.find("draining") != std::string::npos);
+    CHECK(engine::maintainConnection() == engine::DaemonConnState::Unreachable);
+    CHECK(!engine::daemonRefusal().is_null());
+
+    // The old daemon exits and a daemon that admits clients takes its place. The 1 s backoff
+    // rung after the refused attempt bounds the wait.
+    hostd.refuseHellos(false);
+    bool connected = false;
+    const auto deadline = Clock::now() + std::chrono::seconds(5);
+    while (!connected && Clock::now() < deadline) {
+        connected = engine::maintainConnection() == engine::DaemonConnState::Connected;
+        if (!connected) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    CHECK(connected);
+    CHECK(engine::daemonRefusal().is_null());
+    CHECK(engine::call("doc_list", json::object(), r, ce, 5000));
+}
+
 int main() {
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() /
@@ -1103,6 +1190,24 @@ int main() {
     ::setenv("CHUDWARE_ENGINE_DAEMON_RETRY_MS", "0", 1);
     ::unsetenv("CHUDWARE_ENGINE_DAEMON");
     ::unsetenv("CHUDWARE_RPC_TRACE");
+
+    {
+        const std::string drainSock = (dir / "hostd-drain.sock").string();
+        std::fflush(stdout);
+        const pid_t child = ::fork();  // before any thread exists in this process
+        if (child == 0) {
+            ::setenv("CHUDWARE_HOSTD_SOCKET", drainSock.c_str(), 1);
+            {
+                FakeHostd hostd(drainSock);
+                drainRefusalKeepsDaemonMode(hostd);
+            }
+            std::fflush(stdout);
+            ::_exit(g_failures ? 1 : 0);
+        }
+        int status = 0;
+        CHECK(child > 0 && ::waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+              WEXITSTATUS(status) == 0);
+    }
 
     {
         FakeHostd hostd(sock);

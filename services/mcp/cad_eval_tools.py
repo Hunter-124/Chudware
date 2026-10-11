@@ -679,7 +679,9 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                          perpendicular:"z" while a vertical edge is parallel:"z".
           pick           largest/smallest (area), longest/shortest (length), inner/outer
                          (bore vs boss, for coaxial round faces/edges)
-          near/count/index   [x,y,z] nearest-first / cap the set / keep specific ordinals
+          near           [x,y,z] a point ON (or the centroid of) the face/edge you mean —
+                         ranked by distance to its actual geometry, ties to the nearer centroid
+          count/index    cap the set / keep specific ordinals
 
         Examples:
           {"of":"face","side":"top"}                                     the top face
@@ -701,12 +703,16 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         document, a feature name is reported (this tool always searches the whole document),
         and anything else is reported as unresolved instead of quietly steering the query.
 
-        Returns each matching face/edge with its shape (surf), side, centroid, size and stable
-        sid, so you can confirm "the top face" resolves before you reference it in a feature or a
-        simulation. CONVENIENCE: a short phrase built only from the words above ("top", "outer
-        cylindrical face at bottom") is normalised into those keys; anything else is rejected
-        with the vocabulary rather than silently mis-resolved. For open-ended exploration call
-        describe_part (the named face/edge roster) then hover(sid) — not this tool with a sentence.
+        Returns each matching face/edge with its shape (surf), side, signed outward normal,
+        centroid, size and stable sid (round faces add radius, concavity and axis_point — a point
+        ON the cylinder/cone axis; torus faces such as sweep bends instead add major_radius,
+        minor_radius, torus_axis and torus_center — bend radius, tube radius, bend axis and
+        bend centre), so you can confirm "the top face" resolves before you
+        reference it in a feature or a simulation. CONVENIENCE: a short phrase built only from
+        the words above ("top", "outer cylindrical face at bottom") is normalised into those
+        keys; anything else is rejected with the vocabulary rather than silently mis-resolved.
+        For open-ended exploration call describe_part (the named face/edge roster) then
+        hover(sid) — not this tool with a sentence.
         """
         d = None
         try:
@@ -1528,13 +1534,18 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         accepted as min_clearance= / clearance= / clearance_mm= / min_gap_mm=, and
         include_coincident= as coincident= / include_contacts= (echoed in `interpreted`).
 
-        Returns {ok, complete, clearance_mode, summary, pairs_checked, pairs_total,
+        Returns {ok, clear, complete, clearance_mode, summary, pairs_checked, pairs_total,
         parts:[{name,bbox,volume}], interferences:[{a,b,volume}], clearances, contacts}.
         A threshold clearance has distance_status="lower_bound" and distance_lower_bound_mm,
         or distance_status="exact" and distance; contacts carry exact distance.
-        ok is True only when the check is complete and NOTHING interferes; minimum-clearance
-        violations remain warnings. Failures mean incomplete, never collision-free. An EMPTY
-        document is refused with reason="insufficient_bodies"; a single body returns ok with
+        ok tells you if the check ran to completion. It does NOT tell you if the bodies clash.
+        clear is the verdict: true when the complete check found no interference, false
+        when it found interference or did not complete. A completed check that finds
+        interference returns ok=true, clear=false and lists the pairs: that is a finding to
+        fix, not a tool failure. Minimum-clearance violations stay warnings and do not change
+        clear. ok=false means the check is incomplete (pair_failures/geometry_failures), was
+        refused, or got bad arguments; never read it as collision-free. An EMPTY document is
+        refused with reason="insufficient_bodies"; a single body returns ok with
         pairs_checked=0, which is not pairwise verification evidence.
         """
         d = None
@@ -1570,7 +1581,17 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             # Only a complete document-wide check verifies transform placement.
             if not members and res.get("complete", False):
                 note_interference_check(d)
-            return _dumps(_interpreted({"ok": res.get("ok", True), "doc_id": d, **res}, notes))
+            # ok = the check ran to completion; clear = the complete check found no overlap.
+            # Interference is a finding, so it never makes the tool call fail.
+            complete = res.get("complete") is True
+            out = {**res, "ok": complete, "doc_id": d,
+                   "clear": complete and not res.get("interferences")}
+            if complete and res.get("interferences"):
+                out["summary"] = (f"Interference found: {res.get('summary', '')}. Move or "
+                                  "change the bodies, then run check_interference again.")
+            elif not complete and not res.get("reason"):
+                out["error"] = res.get("summary") or "Interference check incomplete."
+            return _dumps(_interpreted(out, notes))
         except Exception as e:  # noqa: BLE001
             return _err(_teach_no_bodies(e, d, "check_interference()"))
 
@@ -1781,8 +1802,12 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
           * Ixx/Iyy/Ixy — centroidal section second moments (mm^4) in the cutting-plane frame.
         A plane that misses the body (empty cut) returns area 0.
         Coplanar steps/floors belong to the exact-plane material section; tangent edges
-        or points alone have zero area. A genuinely open surface contour is an error
-        with world-space `detail.open_locations`, not a partial section or a false zero.
+        or points alone have zero area. A closed shell counts as the solid it bounds.
+        Only a closed body has a section area. If the plane cuts a body with free edges,
+        the tool refuses: code `section_failed`, `detail.reason` = "body_not_closed_solid",
+        with `detail.body_id` and `detail.free_edges` {count, crossing_plane, sids}.
+        To fix it, run check_geometry_health on that body, then repair the feature that
+        opened it. Use heal_body only for an imported body.
         """
         d = None
         try:

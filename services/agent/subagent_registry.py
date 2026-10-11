@@ -107,17 +107,27 @@ def _runner_gone(meta: dict) -> str:
 
 
 def resolve_project_dir(start: str | Path | None = None) -> str:
-    """Resolve the run's project root, preferring explicit run-scoped roots."""
-    root = (
-        os.environ.get("CHUDWARE_PROJECT_DIR")
-        or os.environ.get("CHUDWARE_FS_ROOT")
-        or start
-    )
-    if not root:
-        from services.agent.config import workspace_dir
-        root = workspace_dir()
+    """Resolve the run's project root, preferring explicit run-scoped roots.
+
+    An explicit root (``CHUDWARE_PROJECT_DIR``, then ``CHUDWARE_FS_ROOT``,
+    then *start*) is the selected workspace and is kept as given, only
+    canonicalized: climbing to a marked parent would merge distinct nested
+    projects.  Only the ambient configured workspace fallback is widened to
+    its outermost marked project root.
+    """
+    for candidate in (
+        os.environ.get("CHUDWARE_PROJECT_DIR"),
+        os.environ.get("CHUDWARE_FS_ROOT"),
+        start,
+    ):
+        explicit = str(candidate or "").strip()
+        if explicit:
+            return os.path.realpath(os.path.expanduser(explicit))
+    from services.agent.config import workspace_dir
     from services.agent.project_context import resolve_project_root
-    return os.path.realpath(os.path.expanduser(str(resolve_project_root(root))))
+    return os.path.realpath(
+        os.path.expanduser(str(resolve_project_root(workspace_dir())))
+    )
 
 
 def heartbeat(subagent_id: str) -> None:

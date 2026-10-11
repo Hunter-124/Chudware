@@ -75,7 +75,7 @@ def _make_provider_for_council(
     round1_replies: dict[str, str],
     round2_replies: dict[str, str],
     synthesis_reply: str,
-) -> "TrackingProvider":
+):
     """Build a provider that routes seat calls by persona name (sniffed from system)."""
 
     class TrackingProvider:

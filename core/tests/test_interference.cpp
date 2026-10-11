@@ -1052,3 +1052,166 @@ TEST_CASE("eval_feature_attachment: a part whose ribs all sit on the plate passe
     CHECK(res.at("solid_count") == 1);
     chudware::doc::doc_close(b.id);
 }
+
+// A later shell hollows the part under a boss: the boss's base disk now sits mostly over the
+// cavity, but that part of the boss is gone too (the shell carved the boss into a 2 mm cup).
+// Only the boss's surviving ring rests on the box's top wall, and it is fully supported —
+// removed material is not an overhang (a collar over a shelled duct read 89 % "overhang").
+TEST_CASE("eval_feature_attachment: a boss over a later shell's cavity is attached") {
+    json shell = json{{"op", "add_feature"}, {"feature",
+        json{{"type", "shell"}, {"name", "Hollow"},
+             {"params", {{"thickness", 2.0}}},
+             {"refs", {{"remove", {{"of", "face"}, {"side", "bottom"}}}}}}}};
+    const Built b = build("attach_shell", json::array({
+        box("Body", 40, 40, 20, {0, 0, 0}),
+        cyl("Boss", 8, 10, {20, 20, 20}),
+        shell,
+    }));
+    const std::string boss = fid(b, 1);
+    const json res = chudware::doc::doc_eval_feature_attachment(b.id);
+    INFO(res.dump(2));
+    CHECK(res.at("ok") == true);
+    CHECK(res.at("features").empty());
+    CHECK(std::find(res.at("attached").begin(), res.at("attached").end(), json(boss)) !=
+          res.at("attached").end());
+    chudware::doc::doc_close(b.id);
+}
+
+namespace {
+
+bool in_list(const json& arr, const std::string& id) {
+    return std::find(arr.begin(), arr.end(), json(id)) != arr.end();
+}
+
+// A sketch on plane.top at height `z` holding two concentric circles (an annulus profile).
+json annulus_sketch(const char* name, double cx, double cy, double r_out, double r_in,
+                    double z) {
+    auto circle = [&](const char* id, double r) {
+        return json{{"id", id}, {"type", "circle"}, {"construction", false},
+                    {"center", json::array({cx, cy})}, {"radius", r}};
+    };
+    return json{{"op", "add_feature"}, {"feature",
+        json{{"type", "sketch"}, {"name", name},
+             {"params", {{"entities", json::array({circle("e1", r_out), circle("e2", r_in)})},
+                         {"constraints", json::array()}, {"offset", z}}},
+             {"refs", {{"plane", "plane.top"}}}}}};
+}
+
+// A blind boss extrude of every material region of the sketch created by batch op `sketch`.
+json extrude_boss(const char* name, const char* sketch, double depth) {
+    return json{{"op", "add_feature"}, {"feature",
+        json{{"type", "extrude"}, {"name", name},
+             {"params", {{"mode", "boss"}, {"end", "blind"},
+                         {"depth", json{{"value", depth}, {"expr", nullptr}}}}},
+             {"refs", {{"profile", json::array({json{{"kind", "region"},
+                                                     {"sketch", sketch}}})}}}}}};
+}
+
+}  // namespace
+
+// Defect 5 (6-axis session, tool_flange f24). The prior solid fills z 307.5..309.2 over a
+// 7.6 mm pocket ceiling with a R1.2 bore. An annulus R3.6/R1.2 sketched at z 307.6 and
+// extruded 2.6 mm stands 1.0 mm proud of the z 309.2 top face; its foot is 100 % on solid.
+// The old base pick took the outer wall (coarse 36.75 mm^2 buried band > 36.19 mm^2 foot)
+// and reported "39 % (22.9 of 58.8 mm^2) base unsupported". The foot rule must report the
+// proud boss attached, and must still flag a floating annulus and one whose foot hangs half
+// off the plate edge.
+TEST_CASE("eval_feature_attachment: a proud boss whose foot sits on solid is attached") {
+    const Built b = build("attach_proud_boss", json::array({
+        box("Plate", 20, 20, 4.2, {-10, -10, 305}),                      // z 305..309.2
+        box("Pocket", 7.6, 7.6, 2.5, {-3.8, -3.8, 305}, json{{"mode", "cut"}}),
+        cyl("Bore", 1.2, 4.2, {0, 0, 305}, json{{"mode", "cut"}}),
+        annulus_sketch("ProudSk", 0, 0, 3.6, 1.2, 307.6),
+        extrude_boss("ProudBoss", "$3", 2.6),                            // z 307.6..310.2
+        annulus_sketch("FloatSk", -6, -6, 3.6, 1.2, 312.0),
+        extrude_boss("FloatBoss", "$5", 2.6),
+        annulus_sketch("EdgeSk", 10, 6, 3.6, 1.2, 309.2),
+        extrude_boss("EdgeBoss", "$7", 2.6),
+    }));
+    const std::string proud = fid(b, 4), floating = fid(b, 6), edge = fid(b, 8);
+    const json res = chudware::doc::doc_eval_feature_attachment(b.id);
+    INFO(res.dump(2));
+    std::map<std::string, json> by_id;
+    for (const json& e : res.at("features")) by_id[e.at("feature_id").get<std::string>()] = e;
+
+    CHECK_FALSE(by_id.count(proud));
+    CHECK(in_list(res.at("attached"), proud));
+
+    REQUIRE(by_id.count(floating));
+    CHECK(by_id[floating].at("verdict") == "floating");
+    CHECK(by_id[floating].at("gap_mm").get<double>() > 1.0);
+
+    REQUIRE(by_id.count(edge));
+    const json& o = by_id[edge];
+    CHECK(o.at("verdict") == "overhang");
+    CHECK(o.at("overhang_frac").get<double>() == doctest::Approx(0.5).epsilon(0.1));
+    // The measured face is the foot (normal -Z at z 309.2), not a side wall.
+    REQUIRE(o.contains("base_face_normal"));
+    CHECK(o.at("base_face_normal").at(2).get<double>() == doctest::Approx(-1.0).epsilon(1e-6));
+    CHECK(o.at("base_face_center").at(2).get<double>() == doctest::Approx(309.2).epsilon(1e-6));
+    CHECK(o.at("detail").get<std::string>().find("foot face") != std::string::npos);
+    chudware::doc::doc_close(b.id);
+}
+
+// Defect 5 tie-break (6-axis session, claw_base f59/f60). Two tabs are exact mirror images
+// about x = 0. Each stands in a channel: the outer wall backs its outer face over the full
+// height, the inner wall has a 2.2 mm gap that the coarse 8x8 grid misses but the 36x36 grid
+// sees (8 % of the face). The old pick took the FIRST of the two equal coarse faces, which is
+// the outer face on one tab and the inner face on the other: one tab passed and its twin
+// overhung. Both tabs must get the same verdict, from the best-supported face.
+TEST_CASE("eval_feature_attachment: mirrored twins get the same verdict") {
+    const Built b = build("attach_mirror_twins", json::array({
+        box("Plate", 24, 30, 10, {-12, -5, 0}),
+        box("OuterR", 2, 20, 5, {6, 0, 10}),
+        box("InnerR1", 2, 8.9, 5, {2, 0, 10}),
+        box("InnerR2", 2, 8.9, 5, {2, 11.1, 10}),
+        box("OuterL", 2, 20, 5, {-8, 0, 10}),
+        box("InnerL1", 2, 8.9, 5, {-4, 0, 10}),
+        box("InnerL2", 2, 8.9, 5, {-4, 11.1, 10}),
+        box("TabR", 2, 20, 7, {4, 0, 8}),
+        box("TabL", 2, 20, 7, {-6, 0, 8}),
+    }));
+    const std::string tab_r = fid(b, 7), tab_l = fid(b, 8);
+    const json res = chudware::doc::doc_eval_feature_attachment(b.id);
+    INFO(res.dump(2));
+    std::map<std::string, json> by_id;
+    for (const json& e : res.at("features")) by_id[e.at("feature_id").get<std::string>()] = e;
+    CHECK(by_id.count(tab_r) == by_id.count(tab_l));
+    CHECK_FALSE(by_id.count(tab_r));
+    CHECK_FALSE(by_id.count(tab_l));
+    CHECK(in_list(res.at("attached"), tab_r));
+    CHECK(in_list(res.at("attached"), tab_l));
+    CHECK(res.at("ok") == true);
+    chudware::doc::doc_close(b.id);
+}
+
+// Defect 6 (6-axis session, forearm f56/f66 vs f72). A boss is built on a body and a later
+// in-place `transform` lifts the whole body 30 mm. A standalone box then fills the space the
+// boss had BEFORE the move. The tool records must follow the body: no boss_overlap with the
+// box, and the moved boss still reads as attached to the moved body.
+TEST_CASE("eval_feature_overlap: tools moved by a later transform are checked as built") {
+    const Built b = build("overlap_after_transform", json::array({
+        box("Body", 20, 20, 20, {0, 0, 0}),
+        cyl("Boss", 3, 5, {10, 10, 20}),                                 // z 20..25
+        json{{"op", "add_feature"},
+             {"feature", json{{"type", "transform"}, {"name", "Lift"},
+                              {"params", {{"translate", json::array({0.0, 0.0, 30.0})}}}}}},
+        box("Filler", 10, 10, 5, {5, 5, 20}, json{{"merge", false}}),   // the boss's old place
+    }));
+    const std::string boss = fid(b, 1), filler = fid(b, 3);
+    const json ov = doc_eval_feature_overlap(b.id);
+    INFO(ov.dump(2));
+    for (const json& p : ov.at("pairs")) {
+        const bool boss_filler = (p.at("a") == boss && p.at("b") == filler) ||
+                                 (p.at("a") == filler && p.at("b") == boss);
+        CHECK_FALSE_MESSAGE(boss_filler, "stale pre-transform tool: " << p.dump());
+    }
+    CHECK(ov.at("pairs").empty());
+
+    const json at = chudware::doc::doc_eval_feature_attachment(b.id);
+    INFO(at.dump(2));
+    CHECK(in_list(at.at("attached"), boss));
+    CHECK(in_list(at.at("independent"), filler));
+    CHECK(at.at("ok") == true);
+    chudware::doc::doc_close(b.id);
+}

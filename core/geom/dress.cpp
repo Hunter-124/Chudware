@@ -1,5 +1,6 @@
 #include "geom/dress.h"
 #include "geom/op_history.h"
+#include "geom/shell_sections.h"
 #include "util/process_isolation.h"
 
 #include <algorithm>
@@ -7,10 +8,17 @@
 #include <cmath>
 #include <functional>
 #include <chrono>
+#include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <BRepAdaptor_Curve.hxx>
+#include <BRepAdaptor_Curve2d.hxx>
+#include <BRepCheck_Analyzer.hxx>
+#include <BRepLProp_SLProps.hxx>
+#include <BRepOffset_Error.hxx>
+#include <BRepOffset_MakeOffset.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRep_Tool.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
@@ -47,6 +55,7 @@
 #include <gp_Dir.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Pnt2d.hxx>
 #include <gp_Vec.hxx>
 
 namespace geom {
@@ -504,6 +513,145 @@ TopoDS_Shape chamfer_vertices(const TopoDS_Shape& shape, double d,
 
 namespace {
 
+// One rung of the join/intersection/tolerance ladder both shell paths walk. The default
+// (Arc join / no face-intersection / tight tolerance) matches dress.py's build123d offset
+// and handles prismatic solids exactly like SolidWorks; the Intersection join + the
+// face-intersection flag + a looser tolerance recovers many curved/B-spline skins whose
+// Arc-joined offset self-intersects at rounded corners (OCCT's recommended path).
+struct ShellStrat { GeomAbs_JoinType join; Standard_Boolean inter; Standard_Real tol; };
+constexpr ShellStrat kShellStrats[] = {
+    {GeomAbs_Arc,          Standard_False, 1.0e-6},
+    {GeomAbs_Intersection, Standard_True,  1.0e-6},
+    {GeomAbs_Intersection, Standard_True,  1.0e-3},
+    {GeomAbs_Arc,          Standard_True,  1.0e-3},
+};
+
+std::string shell_strat_label(const ShellStrat& s) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%s%s tol %.0e",
+                  s.join == GeomAbs_Arc ? "arc" : "intersection",
+                  s.inter ? "+face-intersection" : "", s.tol);
+    return buf;
+}
+
+std::string offset_error_text(BRepOffset_Error e) {
+    switch (e) {
+        case BRepOffset_NoError: return "no result shape";
+        case BRepOffset_BadNormalsOnGeometry:
+            return "BRepOffset_BadNormalsOnGeometry (a face normal is undefined somewhere: "
+                   "a pole or degenerate point)";
+        case BRepOffset_C0Geometry:
+            return "BRepOffset_C0Geometry (a face's surface is only C0 continuous)";
+        case BRepOffset_NullOffset: return "BRepOffset_NullOffset";
+        case BRepOffset_NotConnectedShell: return "BRepOffset_NotConnectedShell";
+        case BRepOffset_CannotTrimEdges:
+            return "BRepOffset_CannotTrimEdges (the offset faces could not be trimmed "
+                   "against each other)";
+        case BRepOffset_CannotFuseVertices: return "BRepOffset_CannotFuseVertices";
+        case BRepOffset_CannotExtentEdge: return "BRepOffset_CannotExtentEdge";
+        case BRepOffset_UserBreak: return "BRepOffset_UserBreak";
+        case BRepOffset_MixedConnectivity:
+            return "BRepOffset_MixedConnectivity (an edge whose faces meet at a crease along "
+                   "part of it and tangentially along another part — OCCT's offset refuses "
+                   "such an edge outright, for every join type and tolerance)";
+        default: return "BRepOffset_UnknownError";
+    }
+}
+
+// Locate the BRepOffset_MixedConnectivity edges: manifold edges whose dihedral angle is a
+// crease at some samples and tangent at others (a rectangle-to-circle loft's corner seams
+// run from a 90° crease at the rectangle to G1 at the circle). One "(x,y,z)->(x,y,z)
+// a°->b°" description per offending edge, so the refusal names WHERE, not just what.
+std::vector<std::string> mixed_connectivity_edges(const TopoDS_Shape& body) {
+    std::vector<std::string> out;
+    TopTools_IndexedDataMapOfShapeListOfShape ef;
+    TopExp::MapShapesAndAncestors(body, TopAbs_EDGE, TopAbs_FACE, ef);
+    for (int i = 1; i <= ef.Extent(); ++i) {
+        const TopoDS_Edge& e = TopoDS::Edge(ef.FindKey(i));
+        const TopTools_ListOfShape& fl = ef(i);
+        if (BRep_Tool::Degenerated(e) || fl.Extent() != 2) continue;
+        const TopoDS_Face f1 = TopoDS::Face(fl.First());
+        const TopoDS_Face f2 = TopoDS::Face(fl.Last());
+        if (f1.IsSame(f2)) continue;  // a seam: one face on both sides
+        try {
+            BRepAdaptor_Curve c(e);
+            BRepAdaptor_Surface s1(f1), s2(f2);
+            BRepAdaptor_Curve2d p1(e, f1), p2(e, f2);
+            constexpr int kSamples = 16;
+            double amin = 1e9, amax = -1.0, a_first = -1.0, a_last = -1.0;
+            for (int k = 0; k <= kSamples; ++k) {
+                const double u = c.FirstParameter() +
+                                 (c.LastParameter() - c.FirstParameter()) * k / kSamples;
+                const gp_Pnt2d uv1 = p1.Value(u), uv2 = p2.Value(u);
+                BRepLProp_SLProps l1(s1, uv1.X(), uv1.Y(), 1, 1e-9);
+                BRepLProp_SLProps l2(s2, uv2.X(), uv2.Y(), 1, 1e-9);
+                if (!l1.IsNormalDefined() || !l2.IsNormalDefined()) continue;
+                gp_Dir n1 = l1.Normal(), n2 = l2.Normal();
+                if (f1.Orientation() == TopAbs_REVERSED) n1.Reverse();
+                if (f2.Orientation() == TopAbs_REVERSED) n2.Reverse();
+                const double a = n1.Angle(n2) * (180.0 / 3.14159265358979323846);
+                amin = std::min(amin, a);
+                amax = std::max(amax, a);
+                if (a_first < 0.0) a_first = a;
+                a_last = a;
+            }
+            if (!(amin < 0.5 && amax > 2.0)) continue;
+            const gp_Pnt v0 = BRep_Tool::Pnt(TopExp::FirstVertex(e));
+            const gp_Pnt v1 = BRep_Tool::Pnt(TopExp::LastVertex(e));
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), "(%.4g,%.4g,%.4g)->(%.4g,%.4g,%.4g) %.0f°->%.0f°",
+                          v0.X(), v0.Y(), v0.Z(), v1.X(), v1.Y(), v1.Z(), a_first, a_last);
+            out.emplace_back(buf);
+        } catch (const Standard_Failure&) {
+        }
+    }
+    return out;
+}
+
+double solid_volume(const TopoDS_Shape& s) {
+    GProp_GProps g;
+    BRepGProp::VolumeProperties(s, g);
+    return g.Mass();
+}
+
+// Accept gate for one strategy's result: a BRepCheck-valid, watertight solid. Returns the
+// rejection reason, or "" when the B-rep is sound (the volume test is the caller's).
+std::string shell_brep_rejection(const TopoDS_Shape& out) {
+    try {
+        if (!BRepCheck_Analyzer(out).IsValid()) return "result failed BRepCheck validation";
+    } catch (const Standard_Failure&) {
+        return "result failed BRepCheck validation";
+    }
+    if (!blend_is_watertight(out)) return "result is an open (non-watertight) shell";
+    return std::string();
+}
+
+// Fold per-strategy reasons into one diag: identical reasons collapse to a single line.
+std::string shell_diag(const std::vector<std::pair<std::string, std::string>>& tried,
+                       bool mixed, const TopoDS_Shape& body) {
+    std::string d;
+    bool same = !tried.empty();
+    for (const auto& r : tried) same = same && r.second == tried.front().second;
+    if (same) {
+        d = "every offset strategy (";
+        for (std::size_t i = 0; i < tried.size(); ++i)
+            d += (i ? ", " : "") + tried[i].first;
+        d += ") failed: " + tried.front().second;
+    } else {
+        for (std::size_t i = 0; i < tried.size(); ++i)
+            d += (i ? "; " : "") + tried[i].first + ": " + tried[i].second;
+    }
+    if (mixed) {
+        const std::vector<std::string> edges = mixed_connectivity_edges(body);
+        if (!edges.empty()) {
+            d += " — " + std::to_string(edges.size()) +
+                 " edge(s) run from a crease into tangency: " + edges.front();
+            if (edges.size() > 1) d += " (and " + std::to_string(edges.size() - 1) + " more)";
+        }
+    }
+    return d;
+}
+
 // CLOSED-shell builder (no faces removed = a fully-sealed hollow part, e.g. a hollow
 // ball / a sealed enclosure). MakeThickSolidByJoin with an EMPTY ClosingFaces list
 // no-ops on a closed solid: with no mouth to open, the offset shell coincides with the
@@ -516,94 +664,121 @@ namespace {
 //   outward                     : outer = body offset by +t;  result = outer - body
 // For a 40^3 box at t=2: inner=36^3, result volume = 40^3 - 36^3 = 17344 (a sealed wall).
 // Returns a null shape on kernel failure so the caller's guards report it cleanly.
-TopoDS_Shape closed_shell_offset_cut(const TopoDS_Shape& body, double t, bool outward) {
+TopoDS_Shape closed_shell_offset_cut(const TopoDS_Shape& body, double t, bool outward,
+                                     std::string* diag) {
     const Standard_Real off = outward ? t : -t;
-    // Same join/intersection/tolerance ladder as the open path: Arc join + tight tol
-    // handles prismatic solids exactly; the Intersection join + looser tol recovers
-    // curved skins whose inward offset would otherwise self-intersect at rounded corners.
-    struct Strat { GeomAbs_JoinType join; Standard_Boolean inter; Standard_Real tol; };
-    static const Strat strats[] = {
-        {GeomAbs_Arc,          Standard_False, 1.0e-6},
-        {GeomAbs_Intersection, Standard_True,  1.0e-6},
-        {GeomAbs_Intersection, Standard_True,  1.0e-3},
-        {GeomAbs_Arc,          Standard_True,  1.0e-3},
-    };
-    for (const Strat& s : strats) {
+    std::vector<std::pair<std::string, std::string>> tried;
+    bool mixed = false;
+    for (const ShellStrat& s : kShellStrats) {
+        const std::string label = shell_strat_label(s);
         try {
             BRepOffsetAPI_MakeOffsetShape mk;
             mk.PerformByJoin(body, off, s.tol, BRepOffset_Skin, s.inter,
                              Standard_False, s.join);
             mk.Build();
-            if (!mk.IsDone()) continue;
+            if (!mk.IsDone() || mk.Shape().IsNull()) {
+                const BRepOffset_Error err = mk.MakeOffset().Error();
+                mixed = mixed || err == BRepOffset_MixedConnectivity;
+                tried.emplace_back(label, offset_error_text(err));
+                continue;
+            }
             TopoDS_Shape offset_solid = mk.Shape();
-            if (offset_solid.IsNull()) continue;
             // Wall = the larger solid minus the smaller. Inward: body - inner(smaller).
             // Outward: outer(larger) - body. The cut yields the closed wall of thickness t.
             const TopoDS_Shape& big   = outward ? offset_solid : body;
             const TopoDS_Shape& small = outward ? body         : offset_solid;
             BRepAlgoAPI_Cut cut(big, small);
             cut.Build();
-            if (!cut.IsDone()) continue;
+            if (!cut.IsDone() || cut.Shape().IsNull()) {
+                tried.emplace_back(label, "the wall boolean (cut) failed");
+                continue;
+            }
             TopoDS_Shape wall = cut.Shape();
-            if (wall.IsNull()) continue;
             // A genuine sealed wall has positive, REDUCED-from-`big` volume. Reject a
             // degenerate cut (empty / coincident offset that left the whole big solid).
-            GProp_GProps gbig, gwall;
-            BRepGProp::VolumeProperties(big, gbig);
-            BRepGProp::VolumeProperties(wall, gwall);
-            const double vbig = gbig.Mass(), vwall = gwall.Mass();
+            const double vbig = solid_volume(big), vwall = solid_volume(wall);
             const double eps = 1e-6 * std::max(1.0, std::abs(vbig));
-            if (vwall > eps && vwall < vbig - eps) return wall;
-        } catch (const Standard_Failure&) {
-            // This strategy threw inside OCCT — fall through to the next one.
+            if (!(vwall > eps && vwall < vbig - eps)) {
+                tried.emplace_back(label, "the offset left no wall (volume unchanged)");
+                continue;
+            }
+            const std::string why = shell_brep_rejection(wall);
+            if (!why.empty()) { tried.emplace_back(label, why); continue; }
+            return wall;
+        } catch (const Standard_Failure& f) {
+            tried.emplace_back(label, std::string("OCCT threw ") + f.GetMessageString());
         }
     }
+    if (diag) *diag = shell_diag(tried, mixed, body);
     return TopoDS_Shape();
 }
 
 }  // namespace
 
 TopoDS_Shape shell_solid(const TopoDS_Shape& body, double t, bool outward,
-                         const std::vector<TopoDS_Face>& remove) {
+                         const std::vector<TopoDS_Face>& remove, std::string* diag) {
+    if (diag) diag->clear();
     if (body.IsNull() || !(t > 0.0)) return TopoDS_Shape();
     // CLOSED shell (no mouth opened): MakeThickSolidByJoin no-ops with an empty face
     // list, so route to the offset-solid + boolean-cut path that builds a real sealed
-    // wall (a hollow ball / sealed box). The OPEN path below is unchanged.
-    if (remove.empty()) return closed_shell_offset_cut(body, t, outward);
+    // wall (a hollow ball / sealed box).
+    if (remove.empty()) return closed_shell_offset_cut(body, t, outward, diag);
     // SolidWorks default = inward wall (offset NEGATIVE, material kept inside the
     // original surface); `outward` flips to +t. Mode = Skin (offset the skin).
     const Standard_Real offset = outward ? t : -t;
-    // Strategy table. The default (Arc join / no face-intersection / tight tolerance)
-    // matches dress.py's build123d offset and handles prismatic solids exactly like
-    // SolidWorks. Lofted / swept / revolved bodies carry B-spline faces whose offsets
-    // self-intersect at the rounded corners → the Arc join fails ("empty shape").
-    // Re-trying with an Intersection join + the face-intersection flag + a looser
-    // tolerance recovers many freeform bodies (OCCT's recommended path for offsetting
-    // curved skins). We return on the first strategy that yields a non-null solid.
-    struct Strat { GeomAbs_JoinType join; Standard_Boolean inter; Standard_Real tol; };
-    static const Strat strats[] = {
-        {GeomAbs_Arc,          Standard_False, 1.0e-6},
-        {GeomAbs_Intersection, Standard_True,  1.0e-6},
-        {GeomAbs_Intersection, Standard_True,  1.0e-3},
-        {GeomAbs_Arc,          Standard_True,  1.0e-3},
-    };
-    for (const Strat& s : strats) {
+    const double vol_in = solid_volume(body);
+    const double eps = 1e-6 * std::max(1.0, std::abs(vol_in));
+    TopTools_ListOfShape faces_to_remove;
+    for (const TopoDS_Face& f : remove) faces_to_remove.Append(f);
+    // Walk the WHOLE ladder until a strategy's result validates. Returning the first
+    // non-null result used to ship whatever the Arc join made — on a freeform skin that
+    // could be an open or BRepCheck-invalid body while a later rung would have built a
+    // sound one — and the caller then refused the whole feature.
+    std::vector<std::pair<std::string, std::string>> tried;
+    bool mixed = false;
+    TopoDS_Shape unchanged;  // a valid no-op result (thickness too large) for the caller
+    for (const ShellStrat& s : kShellStrats) {
+        const std::string label = shell_strat_label(s);
         try {
-            TopTools_ListOfShape faces_to_remove;
-            for (const TopoDS_Face& f : remove) faces_to_remove.Append(f);
             BRepOffsetAPI_MakeThickSolid mk;
             mk.MakeThickSolidByJoin(body, faces_to_remove, offset, s.tol,
                                     BRepOffset_Skin, s.inter, Standard_False, s.join);
             mk.Build();
-            if (mk.IsDone()) {
-                TopoDS_Shape out = mk.Shape();
-                if (!out.IsNull()) return out;
+            if (!mk.IsDone() || mk.Shape().IsNull()) {
+                const BRepOffset_Error err = mk.MakeOffset().Error();
+                mixed = mixed || err == BRepOffset_MixedConnectivity;
+                tried.emplace_back(label, offset_error_text(err));
+                continue;
             }
-        } catch (const Standard_Failure&) {
-            // This strategy threw inside OCCT — fall through to the next one.
+            const TopoDS_Shape out = mk.Shape();
+            const std::string why = shell_brep_rejection(out);
+            if (!why.empty()) { tried.emplace_back(label, why); continue; }
+            const double vol_out = solid_volume(out);
+            if (std::abs(vol_out - vol_in) <= eps) {
+                if (unchanged.IsNull()) unchanged = out;
+                tried.emplace_back(label, "the offset returned the body unchanged");
+                continue;
+            }
+            if (!(vol_out > eps) || (outward ? vol_out < vol_in : vol_out > vol_in)) {
+                tried.emplace_back(label, "the result's volume moved the wrong way");
+                continue;
+            }
+            return out;
+        } catch (const Standard_Failure& f) {
+            tried.emplace_back(label, std::string("OCCT threw ") + f.GetMessageString());
         }
     }
-    return TopoDS_Shape();
+    // Every offset strategy failed. An inward shell of a tube-like body (planar opened ends
+    // across one axis) still has the sectional builder, which never offsets a face and so is
+    // immune to BRepOffset_MixedConnectivity (a rectangle-to-circle loft's corner seams).
+    if (!outward) {
+        std::string why;
+        TopoDS_Shape sect = shell_by_sections(body, t, remove, &why);
+        if (!sect.IsNull()) return sect;
+        tried.emplace_back("sectional", why);
+    }
+    if (diag) *diag = shell_diag(tried, mixed, body);
+    return unchanged;
 }
 
 // True if any face of `shape` is a freeform / non-analytic surface (B-spline or

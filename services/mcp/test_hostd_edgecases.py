@@ -1,8 +1,9 @@
 """Phase-8 edge-case hammering for chudware-hostd (the release-cut sweep).
 
 Covers the failure modes the default flip exposes to every session:
-  (a) draining daemon refuses new clients; respawn works after it exits
-  (b) stale-binary self-drain backstop (CHUDWARE_HOSTD_STALECHECK_S)
+  (a) draining daemon refuses new clients by name; respawn works after it exits
+  (b) stale-binary self-drain backstop (CHUDWARE_HOSTD_STALECHECK_S): new clients
+      get the named daemon_draining refusal and --status reports the drain
   (c) engine load FAILURE: clients get engine_failed, daemon still drains
   (d) multi-MB payloads cross the socket intact (both directions)
   (e) rapid connect/disconnect churn: no fd leak, clients table drains
@@ -13,9 +14,11 @@ installed daemon is never touched. Skips when no chudware-hostd is built
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import time
 import uuid
@@ -24,7 +27,7 @@ from pathlib import Path
 import pytest
 
 from services.mcp import daemon_bridge
-from services.mcp.daemon_bridge import DaemonClient, DaemonError
+from services.mcp.daemon_bridge import DaemonClient, DaemonDraining
 
 HOSTD = daemon_bridge.resolve_hostd_bin()
 
@@ -88,11 +91,13 @@ def test_draining_refuses_new_clients_then_respawn(scratch_daemon):
     scratch_daemon.append(pid)
     assert a.call("daemon_drain").get("ok") is True
 
-    # A NEW client during the drain window: the daemon pushes daemon.draining
-    # and closes — the connect must fail cleanly (no hang, no half-session).
+    # A NEW client during the drain window gets a named refusal to its hello and the
+    # connection closes — no hang, no half-session, no bare reset.
     b = DaemonClient()
-    with pytest.raises(DaemonError):
+    with pytest.raises(DaemonDraining) as refused:
         b.connect(spawn=False, budget_s=3.0)
+    assert refused.value.detail["reason"] == "stop_requested"
+    assert refused.value.detail["daemon_pid"] == pid
 
     # The existing client finishes and disconnects; the daemon exits...
     a.close()
@@ -136,8 +141,34 @@ def test_stale_binary_self_drain(scratch_daemon, monkeypatch, tmp_path):
         time.sleep(0.3)
     assert st.get("draining") is True, f"self-drain never fired: {st}"
 
-    # Existing client keeps working during the drain; exit happens on close.
+    # Existing client keeps working during the drain.
     assert a.call("ping").get("ok") is True
+
+    # A NEW client gets the named refusal, not a connection reset. Spawn is allowed: a
+    # refusal must not fork a second daemon or fall back to another engine.
+    b = DaemonClient()
+    with pytest.raises(DaemonDraining) as refused:
+        b.connect(budget_s=3.0)
+    detail = refused.value.detail
+    assert detail["code"] == "daemon_draining"
+    assert detail["reason"] == "stale_binary"
+    assert detail["daemon_pid"] == pid
+    assert Path(detail["changed_path"]).name == hostd_copy.name
+    assert detail["active_clients"] >= 1  # `a` is still working
+    assert daemon_bridge._pid_alive(pid)
+
+    # --status reports the running, draining daemon, not "no running instance".
+    assert a.call("ping").get("ok") is True  # keep `a` inside the pin window
+    out = subprocess.run([str(hostd_copy), "--status"], env=dict(os.environ),
+                         capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    status = json.loads(out.stdout)
+    assert status["pid"] == pid
+    assert status["draining"] is True
+    assert status["drain_reason"] == "stale_binary"
+    assert status["drain"]["active_clients"] >= 1
+
+    # The exit happens once the working client leaves.
     a.close()
     assert _wait_pid_gone(pid), "self-drained daemon must exit once idle"
 

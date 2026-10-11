@@ -310,11 +310,15 @@ def call(method: str, params: Optional[dict] = None) -> dict:
     # switching back mid-session would strand doc_ids created in the in-process
     # engine. Recovery = restart the server (the warning says so).
     if _daemon_mode() and not _DAEMON_FALLBACK_WARNED:
-        from .daemon_bridge import DaemonError, DaemonSessionLost
+        from .daemon_bridge import DaemonDraining, DaemonError, DaemonSessionLost
 
         try:
             return _call_via_daemon(method, params)
         except DaemonSessionLost as e:
+            raise CoreError(str(e), code=e.code, detail=e.detail) from e
+        except DaemonDraining as e:
+            # The shared daemon runs and refuses new clients while it drains. A private
+            # in-process engine would not share its documents, so never fall back here.
             raise CoreError(str(e), code=e.code, detail=e.detail) from e
         except DaemonError as e:
             # Initial startup failure only: no operation reached this engine.

@@ -655,6 +655,20 @@ TEST_CASE("stepplus mesh-cache exception does not admit oversized source or unkn
     check_stepplus_limit(path, "per-entry expanded byte limit");
 }
 
+TEST_CASE("stepplus opens its own save whose geometry.step snapshot exceeds the entry cap") {
+    // The interop snapshot is never inflated by doc_open; bounding it made a dense lofted
+    // part's own save unopenable ("per-entry expanded byte limit").
+    const fs::path path = tmp_path("large_geometry_snapshot.step+");
+    const json doc = {{"schema", "aicad.part/1"}, {"name", "Dense loft"}};
+    chudware::doc::stepplus_save(doc, path.string(),
+        {{"geometry.step", std::string(64ull * 1024ull * 1024ull + 1, 'S')}});
+    const auto loaded = chudware::doc::stepplus_open(path.string());
+    CHECK(loaded.doc == doc);
+    CHECK(loaded.extra.count("geometry.step") == 0);
+    std::error_code ec;
+    fs::remove(path, ec);
+}
+
 namespace {
 struct NativeFileFixture {
     fs::path root = tmp_path("native_files_" + std::to_string(

@@ -52,6 +52,7 @@ from .cad_common import (
     render_background,
     render_output_path,
     require_list,
+    resolve_agent_path,
 )
 # The FEA setup resolver stack, reused verbatim by render_study_setup so a study FIGURE
 # and the study run_fea_static would solve can never diverge (no second interpretation of
@@ -811,23 +812,20 @@ def _render_save_target(save_path, *, directory: bool = False,
                         film: bool = False) -> Optional[str]:
     """Validate a file or frame directory before rendering and resolve its destination.
 
-    A supplied path needs write permission under the active tool policy. The destination
-    and configured roots are resolved through symlinks before containment is checked.
-    PNG files gain a .png suffix when omitted; films and directories retain theirs.
+    A relative path is project-root relative (`resolve_agent_path`, the same rule as
+    save_part and asm_add_component); with no project root it is refused. A supplied path
+    needs write permission under the active tool policy. The destination and configured
+    roots are resolved through symlinks before containment is checked. PNG files gain a
+    .png suffix when omitted; films and directories retain theirs.
     """
     if save_path is None:
         return None
     if not isinstance(save_path, str) or not save_path.strip():
-        raise ValueError("save_path must be a non-empty absolute path, e.g. "
-                         "'/home/you/project/figures/fixture-setup.png'")
+        raise ValueError("save_path must be a non-empty path, absolute or relative to the "
+                         "project root, e.g. 'figures/fixture-setup.png'")
     if is_risk_denied(RISK_WRITE):
         raise ValueError("save_path is denied by the active write-risk policy")
-    expanded = os.path.expanduser(save_path.strip())
-    if not os.path.isabs(expanded):
-        raise ValueError(
-            f"save_path must be ABSOLUTE; got {save_path!r}. This server runs in its own "
-            "process (its cwd is the engine daemon's), so a relative path lands somewhere "
-            "you cannot reference. Pass the full path under your project folder.")
+    expanded = resolve_agent_path(save_path, "save_path")
     if not directory and not film and not expanded.lower().endswith(".png"):
         expanded += ".png"
     out = _sanitize_output_path(expanded)
@@ -1108,8 +1106,13 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         highlight: paint + label targets WITHOUT reframing (same vocabulary, list allowed).
         annotate=False: clean product shots (no edges, tags or scale bar). display_quality
         "draft"|"standard"|"fine" re-tessellates the display mesh (persists on the doc).
-        background: [r,g,b] or "#rrggbb". save_path: also write the exact PNG to an absolute
-        path inside the project.
+        background: [r,g,b] or "#rrggbb". save_path: also write the exact PNG to this path
+        inside the project. A relative path is project-root relative. The caption gives the
+        absolute saved path.
+
+        Result: you see the image. Eval code (write xd://render_part) gets one mapping:
+        {"ok": true, "caption": str, "images": [{"path", "mime", "width", "height"}],
+        "saved_path": str (only with save_path)}. All image tools give this shape.
 
         Check numbers first (verify_battery, measure_*); render when a number is off or a
         shape needs judging — one call already gives four angles, so do not render after
@@ -1309,12 +1312,12 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         background (optional): [r, g, b] 0-255 or "#rrggbb" — the clear colour every tile is
         rendered onto (see render_part). The inter-tile gutters are already dark.
 
-        save_path (optional): ALSO write the finished SHEET to this absolute .png path —
+        save_path (optional): ALSO write the finished SHEET to this .png path —
         the tiled multi-view image with its per-tile labels and overlays, byte-identical to
         the image returned inline (one flat RGB PNG, not one file per tile). Same rules as
-        render_part: absolute, inside the project/workspace dir unless
-        CHUDWARE_RENDER_SAVE_ANYWHERE=1, and the caption gains
-        `saved: <path> (<bytes> B, sha256 <first 12>)`.
+        render_part: a relative path is project-root relative, the file must be inside the
+        project/workspace dir unless CHUDWARE_RENDER_SAVE_ANYWHERE=1, and the caption gains
+        `saved: <absolute path> (<bytes> B, sha256 <first 12>)`.
 
         Returns [image, caption]: the tiled PNG followed by a SELF-SUFFICIENT text caption —
         what each tile shows, part name and bbox, what is highlighted and in what colour, and
@@ -1396,11 +1399,11 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         background (optional): [r, g, b] 0-255 or "#rrggbb" — the clear colour every tile is
         rendered onto (see render_part).
 
-        save_path (optional): ALSO write the finished GRID to this absolute .png path —
+        save_path (optional): ALSO write the finished GRID to this .png path —
         byte-identical to the image returned inline (one flat RGB PNG, not one file per
-        view). Same rules as render_part: absolute, inside the project/workspace dir unless
-        CHUDWARE_RENDER_SAVE_ANYWHERE=1, and the caption gains
-        `saved: <path> (<bytes> B, sha256 <first 12>)`.
+        view). Same rules as render_part: a relative path is project-root relative, the file
+        must be inside the project/workspace dir unless CHUDWARE_RENDER_SAVE_ANYWHERE=1, and
+        the caption gains `saved: <absolute path> (<bytes> B, sha256 <first 12>)`.
 
         Returns [image, caption]. The caption is self-sufficient: what each tile shows, what
         is highlighted and in what colour, and what no view could see plus the tool for it.
@@ -1537,13 +1540,14 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
           Omit it and the shot planner picks the whole-part camera that shows the most of the
           fixture + load faces legibly (measured in the engine, BC faces weighted).
 
-        save_path (optional): ALSO write this figure to your own absolute .png path. The
+        save_path (optional): ALSO write this figure to your own .png path. The
           file contains exactly the bytes returned inline — one flat RGB PNG of the shaded
           part with the fixture/load paint, glow outlines, per-face labels, the load arrows,
           the burned-in resultant band, the B-rep edge outline, feature callouts and scale
           bar already burned in (no layers, no alpha, no metadata), ready to embed in a
-          report. Same rules as render_part: absolute,
-          inside the project/workspace dir unless CHUDWARE_RENDER_SAVE_ANYWHERE=1.
+          report. Same rules as render_part: a relative path is project-root relative, and
+          the file must be inside the project/workspace dir unless
+          CHUDWARE_RENDER_SAVE_ANYWHERE=1.
 
         Returns [image, caption]. The caption carries the legend in words —
         `FIXTURE (magenta): <sids + areas>` and `LOAD (violet): <resultant N, direction,

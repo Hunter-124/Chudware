@@ -47,7 +47,16 @@ _N_MODES_SPELLINGS: dict[str, str] = {
     "numofmodes": "nmodes",
 }
 
-
+# The spellings of `max_results` (a COUNT of returned rows) that the affix heuristic cannot
+# reach. Live 2026-10-10 (6-axis run): research_web_search(limit=8) was refused. Shared ONLY by
+# tools whose sole count parameter is max_results, so no spelling can bind a different count.
+_RESULT_CAP_SPELLINGS: dict[str, str] = {
+    "limit": "maxresults",
+    "numresults": "maxresults",
+    "maxhits": "maxresults",
+    "topk": "maxresults",
+    "count": "maxresults",
+}
 
 
 # Synonyms that are only unambiguous for ONE tool. "type" is far too generic
@@ -57,6 +66,10 @@ _N_MODES_SPELLINGS: dict[str, str] = {
 # an honest refusal into a silently wrong call, which is strictly worse.
 TOOL_ARG_SYNONYMS: dict[str, dict[str, str]] = {
     "export_part": {"type": "fmt"},
+    # research_web_search(query, provider, max_results) — services/mcp/research_tools.py.
+    "research_web_search": _RESULT_CAP_SPELLINGS,
+    # design_recipe(query, max_results) — services/agent/design_recipe.py, services/mcp/server.py.
+    "design_recipe": _RESULT_CAP_SPELLINGS,
     # Live run-12211675717239: kind="part" is the unambiguous doc_type selector.
     "plm_item_add": {"kind": "doctype"},
     # run_cfd_flow(velocity, aoa, fluid, cells, n_steps, doc_id, background).

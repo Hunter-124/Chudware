@@ -50,6 +50,7 @@ from services.mcp.cad_common import (
     _project_save_stem,
     _sanitize_output_path,
 )
+from services.mcp.tool_registry import context_doc_unless
 
 _MESH_SUFFIXES = frozenset({".stl", ".3mf", ".obj", ".ply"})
 _GOALS = ("balanced", "strength", "speed", "material", "detail")
@@ -366,7 +367,8 @@ def _slice_targets(*, doc_id, path, copies, orientation, build_dir, preserve_fac
                  "build_dir": build_dir, "preserve_faces": preserve_faces,
                  "strength_dir": strength_dir, "name": None}]
     if doc_id or path:
-        raise ValueError("pass either parts=[...] or doc_id/path, not both")
+        raise ValueError("You gave parts=[...] and a top-level doc_id or path. Give one target "
+                         "form only. Put each doc_id or path in its parts entry.")
     if copies != 1 or build_dir is not None or preserve_faces or strength_dir is not None:
         raise ValueError("with parts=[...], give copies, build_dir, preserve_faces and "
                          "strength_dir inside each part entry")
@@ -630,6 +632,7 @@ def register_print_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
+    @context_doc_unless("parts")
     def slice_part(doc_id: Optional[str] = None, path: Optional[str] = None,
                    printer: Optional[str] = None, material: str = "PLA",
                    goal: str = "balanced", orientation: Any = "auto",

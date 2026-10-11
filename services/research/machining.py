@@ -10,8 +10,9 @@ The data table (``services/research/data/feeds_speeds.json``) stores per-materia
 tool-type × operation ranges (Vc surface speed in SFM/m·min, chipload-per-tooth by
 diameter bracket, stepdown/stepover fractions). The Python layer:
 
-1. Resolves material aliases through the native ``material_resolve_key`` RPC so
-   callers can pass any registry alias (``alu_6061``, ``aluminum``, ``6061-t6``, …).
+1. Resolves material aliases through the native ``material_resolve_key`` /
+   ``material_cam_id`` RPCs so callers can pass any registry alias (``alu_6061``,
+   ``aluminum``, ``6061-t6``, …).
 2. Interpolates a conservative midpoint default (range mid) clamped to
    ``machine_limits``.
 3. Returns an ``aicad.calc/1`` envelope that includes the full min/max envelope so the
@@ -117,27 +118,25 @@ def _material_row(mat_id: str) -> Optional[dict]:
     if mat_id in mats:
         return mats[mat_id]
 
-    # Try registry alias -> cam_id mapping, then look up by cam_id.
-    # engine_oracle/materials was ported to core (T-RF19); resolve via the C++ RPC.
-    try:
-        from services.mcp import core_bridge as _cb  # noqa: PLC0415
-        resolved = _cb.call("material_resolve_key", {"name": mat_id}).get("result")
-        if resolved and resolved in mats:
-            return mats[resolved]
-        # Fallback: look by cam_id field inside each material row.
-        cam_id = _reg.cam_material_id(mat_id)
-        if cam_id:
-            for rec in mats.values():
-                if rec.get("cam_id") == cam_id:
-                    return rec
-    except Exception:  # noqa: BLE001
-        pass
-
-    # Final: try matching by cam_id directly (e.g. "aluminum" -> alu_6061 row).
+    # Then a bare CuttingDB group id (e.g. "aluminum" -> alu_6061 row).
     for rec in mats.values():
         if rec.get("cam_id") == mat_id:
             return rec
 
+    # Registry id/alias through the native materials registry: the canonical key may
+    # itself be a table row ("abs plastic" -> abs); otherwise its CuttingDB group id
+    # selects the row carrying that cam_id ("6061-t6" -> aluminum -> alu_6061).
+    from services.mcp import core_bridge as _cb  # noqa: PLC0415
+    resolved = _cb.call("material_resolve_key", {"name": mat_id}).get("result")
+    if resolved is None:
+        return None
+    if resolved in mats:
+        return mats[resolved]
+    cam_id = _cb.call("material_cam_id", {"name": mat_id}).get("result")
+    if cam_id:
+        for rec in mats.values():
+            if rec.get("cam_id") == cam_id:
+                return rec
     return None
 
 

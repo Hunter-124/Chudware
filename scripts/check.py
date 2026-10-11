@@ -33,6 +33,7 @@ Gates:
   - portable_paths_audit  : every tracked path can actually be checked out on Windows and
                             macOS — no NTFS-reserved characters, no trailing dot/space, no
                             reserved device names, no case-only collisions.
+  - ui_shared_audit       : frozen UI vocabulary, icons and font assets agree with their manifest.
 
 The Python service suites are NOT run here; scripts/gate.sh runs them per unit under services/,
 tools/ and training/ with the runtime venv, e.g.:
@@ -57,6 +58,7 @@ GATES = [
     ("tool_panel_sync (Settings → AI → Tools fallback tables)", ["tools/gen_tool_panel_tables.py", "--check"]),
     ("advertised_tool_audit (named tools are reachable)", ["scripts/advertised_tool_audit.py"]),
     ("portable_paths_audit (tracked paths check out on Windows/macOS)", ["scripts/portable_paths_audit.py"]),
+    ("ui_shared_audit (shared UI manifest and assets)", ["scripts/verify-ui-shared.py"]),
 ]
 
 

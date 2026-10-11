@@ -19,8 +19,11 @@ describe_part/measure_part/inspect_part; ``browse_models`` is the thumbnail expl
 
 CONTEXT-SAFE READING (the point of fs_read): a raw file dump overflows a small model's
 context. fs_read never returns unbounded text. It emits LINE-NUMBERED output, honours an
-offset/limit window, caps total lines, per-line columns, and total bytes, and appends a
-truncation footer stating the file's real length and how to page further. A path may also
+offset/limit window, caps total lines, per-line columns, and the page's JSON-escaped bytes
+(``READ_PAGE_BYTES``, under the host-tool result cap), and appends a truncation footer
+stating the file's real length and how to page further. Raw pages carry no footer; they
+report ``byte_offset``/``bytes``/``total_bytes`` and ``next_byte_offset``, so consecutive
+raw pages join to the exact text. A path may also
 carry a trailing ``:selector`` (design ported from the oh-my-pi read tool):
     ``:50``            from line 50 to the window cap
     ``:50-200``        inclusive range
@@ -52,7 +55,9 @@ SCOPING (the "limited cases" the base tooling is deliberately narrowed for):
 """
 from __future__ import annotations
 
+import bisect
 import difflib
+import json
 import os
 import re
 import signal
@@ -301,7 +306,12 @@ def _err_not_found(raw_path: str, what: str = "path") -> dict:
 DEFAULT_MAX_LINES = 400          # lines returned by fs_read when no explicit window
 HARD_MAX_LINES = 4000            # ceiling the caller cannot exceed in one call
 MAX_LINE_COLUMNS = 2000          # per-line character cap (wide/minified lines are clipped)
-DEFAULT_MAX_BYTES = 96 * 1024    # byte ceiling on returned text
+#: Budget for the text of one fs_read page, in UTF-8 bytes of its JSON-escaped form (the
+#: form the text takes inside the tool result). The online agent's host-tool envelope caps
+#: a result's text at 46 000 bytes (``chudcode_tools._RESULT_TEXT_BYTES``) and shortens
+#: anything larger, which cut c250's raw JSON read mid-string. A page of this size plus the
+#: other result fields stays under that cap, so fs_read pages and is never cut.
+READ_PAGE_BYTES = 32 * 1024
 MAX_LIST_ENTRIES = 1000          # fs_list entry cap
 MAX_GLOB_RESULTS = 1000          # fs_glob result cap
 MAX_GREP_MATCHES = 500           # fs_grep match cap
@@ -550,6 +560,38 @@ def _clip_line(text: str) -> str:
     return text
 
 
+def _json_cost(text: str) -> int:
+    """UTF-8 bytes of *text* as the body of a JSON string (quotes excluded)."""
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8")) - 2
+
+
+def _fit_prefix(text: str, budget: int) -> int:
+    """Length of the longest prefix of *text* whose JSON cost fits *budget*."""
+    low, high = 0, min(len(text), max(budget, 0))
+    while low < high:
+        mid = (low + high + 1) // 2
+        if _json_cost(text[:mid]) <= budget:
+            low = mid
+        else:
+            high = mid - 1
+    return low
+
+
+def _line_starts(lines: list[str], final_eol: bool) -> tuple[list[int], int]:
+    """UTF-8 byte offset of each line's start, and the byte length of the whole text."""
+    starts: list[int] = []
+    pos = 0
+    last = len(lines) - 1
+    for index, line in enumerate(lines):
+        starts.append(pos)
+        pos += len(line.encode("utf-8")) + (1 if index < last or final_eol else 0)
+    return starts, pos
+
+
+class _ByteOffsetOutOfRange(ValueError):
+    """A raw read asked for a byte_offset past the end of the text."""
+
+
 def _window_lines(
     lines: list[str],
     ranges: Optional[list[tuple[int, Optional[int]]]],
@@ -557,20 +599,50 @@ def _window_lines(
     limit: int,
     raw: bool,
     final_eol: bool = False,
+    byte_offset: Optional[int] = None,
 ) -> dict:
     """Select + number the requested lines under the byte/line caps. Returns the
-    payload fields for fs_read: text, total_lines, shown_lines, truncated, next_offset.
+    payload fields for fs_read: text, offset, total_lines, shown_lines, truncated,
+    next_offset, plus byte_offset, bytes, total_bytes, next_byte_offset for raw reads.
 
     *lines* are the physical lines split on ``\\n`` (terminator removed). Raw output
     re-attaches each selected line's own ``\\n`` — every line but the last has one, the last
     only when *final_eol* — so a raw slice is the source text verbatim (CRLF keeps its
-    ``\\r`` in the line body; a file without a final newline stays without one)."""
+    ``\\r`` in the line body; a file without a final newline stays without one).
+
+    A page holds at most ``READ_PAGE_BYTES`` of JSON-escaped text. It ends at a line
+    boundary, except when the first line alone is larger than a page: then the page ends
+    inside that line, ``next_offset`` is absent and ``next_byte_offset`` continues it.
+    Raw text carries no footer, so the texts of consecutive raw pages join to the file.
+    *byte_offset* (raw only, caller-validated) starts the page at that UTF-8 byte of the
+    text, moved back to a character boundary."""
     total = len(lines)
-    max_lines = min(limit if limit > 0 else DEFAULT_MAX_LINES, HARD_MAX_LINES)
+    if limit > 0:
+        max_lines = min(limit, HARD_MAX_LINES)
+    else:
+        max_lines = HARD_MAX_LINES if byte_offset is not None else DEFAULT_MAX_LINES
+    starts, total_bytes = _line_starts(lines, final_eol) if raw else ([], 0)
+    skip_bytes = 0
+    skip_chars = 0
 
     # Build the ordered list of 1-indexed line numbers to show.
-    if ranges:
+    if byte_offset is not None:
+        if byte_offset > total_bytes:
+            raise _ByteOffsetOutOfRange(
+                f"byte_offset={byte_offset} is past the end. The text has {total_bytes} "
+                "bytes. Use a byte_offset from 0 to that size."
+            )
         wanted: list[int] = []
+        if byte_offset < total_bytes:
+            first = bisect.bisect_right(starts, byte_offset)
+            encoded = lines[first - 1].encode("utf-8")
+            skip_bytes = byte_offset - starts[first - 1]
+            while 0 < skip_bytes < len(encoded) and encoded[skip_bytes] & 0xC0 == 0x80:
+                skip_bytes -= 1
+            skip_chars = len(encoded[:skip_bytes].decode("utf-8"))
+            wanted = list(range(first, total + 1))
+    elif ranges:
+        wanted = []
         for start, end in ranges:
             stop = total if end is None else min(end, total)
             wanted.extend(range(start, stop + 1))
@@ -586,36 +658,63 @@ def _window_lines(
 
     out: list[str] = []
     used = 0
-    shown = 0
+    cut = False
     for n in wanted:
         body = lines[n - 1]
         if raw:
+            if not out and skip_chars:
+                body = body[skip_chars:]
             piece = body + ("\n" if n < total or final_eol else "")
+            cost = _json_cost(piece)
         else:
             piece = f"{n:>6}\t{_clip_line(body)}"
-        used += len(piece) + (0 if raw else 1)
-        if used > DEFAULT_MAX_BYTES and shown > 0:
+            cost = _json_cost(piece) + 2  # the escaped "\n" that joins numbered lines
+        if used + cost > READ_PAGE_BYTES:
             truncated = True
+            if not out:  # one line larger than a page: end the page inside it
+                out.append(piece[:_fit_prefix(piece, READ_PAGE_BYTES)])
+                cut = True
             break
         out.append(piece)
-        shown += 1
+        used += cost
+    shown = len(out)
 
     last_shown = wanted[shown - 1] if shown else (offset if offset > 0 else 0)
-    next_offset = last_shown + 1 if (truncated and last_shown < total) else None
+    next_offset = (
+        last_shown + 1 if (truncated and not cut and last_shown < total) else None
+    )
     text = "".join(out) if raw else "\n".join(out)
-    if truncated and next_offset is not None:
+    if not raw and truncated and next_offset is not None:
         text += (
-            ("" if raw else "\n")
-            + f"… [truncated — showed {shown} of {total} lines; "
+            f"\n… [truncated — showed {shown} of {total} lines; "
             f"continue with offset={next_offset} or path selector ':{next_offset}-']"
         )
-    return {
+    win: dict[str, Any] = {
         "text": text,
+        "offset": wanted[0] if shown else max(offset, 1),
         "total_lines": total,
         "shown_lines": shown,
         "truncated": truncated,
         **({"next_offset": next_offset} if next_offset is not None else {}),
     }
+    if not raw:
+        return win
+    page_start = starts[wanted[0] - 1] + skip_bytes if shown else total_bytes
+    page_end = (
+        starts[last_shown - 1] + (skip_bytes if shown == 1 else 0)
+        + len(out[-1].encode("utf-8"))
+        if shown else page_start
+    )
+    win.update(byte_offset=page_start, bytes=len(text.encode("utf-8")),
+               total_bytes=total_bytes)
+    if truncated and page_end < total_bytes:
+        win["next_byte_offset"] = page_end
+        win["hint"] = (
+            f"This page holds {win['bytes']} of {total_bytes} bytes. To read on, call "
+            f"fs_read with raw=true and byte_offset={page_end}. The texts of consecutive "
+            "pages join with no gap and no overlap."
+        )
+    return win
 
 
 def _kind_for(path: str) -> str:
@@ -640,7 +739,8 @@ def _has_content_lines(lines: list[str], kind: str) -> bool:
     return False
 
 
-def _read_document(path: str, ranges, offset: int, limit: int, raw: bool) -> dict:
+def _read_document(path: str, ranges, offset: int, limit: int, raw: bool,
+                   byte_offset: Optional[int] = None) -> dict:
     from services.mcp.office_tools import extract_office  # noqa: PLC0415
 
     res = extract_office(path)
@@ -649,14 +749,18 @@ def _read_document(path: str, ranges, offset: int, limit: int, raw: bool) -> dic
     kind = res.get("kind", _kind_for(path))
     text = res.get("text", "") or ""
     lines = text.split("\n")
-    win = _window_lines(lines, ranges, offset, limit, raw)
+    try:
+        win = _window_lines(lines, ranges, offset, limit, raw, byte_offset=byte_offset)
+    except _ByteOffsetOutOfRange as exc:
+        return _err("byte_offset_out_of_range", str(exc))
     if not _has_content_lines(lines, kind):
         win["hint"] = ("extracted text is empty — the document may be scanned/image-only "
                        "or have no text layer; OCR it first to get usable text")
     return _ok(path=path, kind=kind, is_document=True, **win)
 
 
-def _read_text(path: str, ranges, offset: int, limit: int, raw: bool) -> dict:
+def _read_text(path: str, ranges, offset: int, limit: int, raw: bool,
+               byte_offset: Optional[int] = None) -> dict:
     p = Path(path)
     try:
         data = p.read_bytes()
@@ -671,7 +775,10 @@ def _read_text(path: str, ranges, offset: int, limit: int, raw: bool) -> dict:
     final_eol = lines[-1] == ""
     if final_eol:
         lines.pop()  # trailing newline shouldn't count as a phantom blank line
-    win = _window_lines(lines, ranges, offset, limit, raw, final_eol)
+    try:
+        win = _window_lines(lines, ranges, offset, limit, raw, final_eol, byte_offset)
+    except _ByteOffsetOutOfRange as exc:
+        return _err("byte_offset_out_of_range", str(exc))
     return _ok(path=str(p), kind=_kind_for(path) or "text", is_document=False, **win)
 
 
@@ -721,45 +828,74 @@ def register_fs_tools(mcp) -> None:
     """Register the ``files`` family: fs_read / fs_write / fs_edit / fs_list / fs_glob / fs_grep."""
 
     @mcp.tool()
-    def fs_read(path: str, offset: int = 0, limit: int = 0, raw: bool = False) -> dict:
+    def fs_read(path: str, offset: int = 0, limit: int = 0, raw: bool = False,
+                byte_offset: Optional[int] = None) -> dict:
         """Read a text file, directory, or document with CONTEXT-SAFE, line-numbered output.
 
-        Never dumps unbounded text. Returns at most a windowed slice with a truncation
-        footer telling you the file's real length and how to page on.
+        Never dumps unbounded text. Each call returns one page of at most about 32 KB of
+        text. The page says the file's real length and how to page on.
 
-        path   : file/dir path; may carry a trailing selector — ':50' (from line 50),
-                 ':50-200' (inclusive), ':50+150' (150 lines from 50), ':5-16,960-973'
-                 (multi-range), ':raw' (verbatim, no line numbers). A directory lists its
-                 entries. A document (.pdf/.docx/.doc/.odt/.pptx/.ppt/.odp/.xlsx/.xlsm/
-                 .xls/.ods/.csv) is extracted to text (via office_extract) and paginated
-                 the same way. A CAD/geometry
-                 file (.draw+/.step+/.step/.stp/.iges/.stl/.3mf/.obj/…) is NOT dumped —
-                 you get its preview card (kind, features, bbox) and a labelled render,
-                 both read from the file; open it with import_part(path=...) and read the model via
-                 describe_part / measure_part / inspect_part (plain-text formats honour
-                 raw=True as an explicit escape).
-        offset : 1-indexed start line when no selector is given (default: from the top).
-        limit  : max lines to return (default 400, hard cap 4000).
-        raw    : omit line numbers / column clipping.
+        path        : file/dir path; may carry a trailing selector — ':50' (from line 50),
+                      ':50-200' (inclusive), ':50+150' (150 lines from 50), ':5-16,960-973'
+                      (multi-range), ':raw' (verbatim, no line numbers). A directory lists
+                      its entries. A document (.pdf/.docx/.doc/.odt/.pptx/.ppt/.odp/.xlsx/
+                      .xlsm/.xls/.ods/.csv) is extracted to text (via office_extract) and
+                      paginated the same way. A CAD/geometry
+                      file (.draw+/.step+/.step/.stp/.iges/.stl/.3mf/.obj/…) is NOT dumped —
+                      you get its preview card (kind, features, bbox) and a labelled render,
+                      both read from the file; open it with import_part(path=...) and read
+                      the model via describe_part / measure_part / inspect_part (plain-text
+                      formats honour raw=True as an explicit escape).
+        offset      : 1-indexed start line when no selector is given (default: from the top).
+        limit       : max lines to return (default 400, hard cap 4000; 4000 when
+                      byte_offset is set).
+        raw         : return the text verbatim: no line numbers, no column clip, no footer.
+        byte_offset : start a raw page at this UTF-8 byte of the text (0 = start). Sets
+                      raw=True. Do not use it with offset or a line selector.
 
-        Returns {ok, path, kind, text, total_lines, shown_lines, truncated, next_offset?}.
+        Returns {ok, path, kind, text, offset, total_lines, shown_lines, truncated,
+        next_offset?}. A raw read also returns byte_offset, bytes and total_bytes; when
+        truncated, it also returns next_byte_offset and hint. A page ends at a line end,
+        but a line longer than a page is split: then only next_byte_offset continues it.
+
+        To read a whole file (for example, to json.loads it), call with raw=True and
+        byte_offset=0. While truncated is true, call again with
+        byte_offset=next_byte_offset. Join the text of all pages. Do not parse one page
+        of a larger file.
+
+        A result that is still too large for the tool budget is shortened. Each cut string
+        then ends with a "…[cut: …]" marker, and _truncated.full_result names a JSON file
+        that holds the full result.
         """
+        if byte_offset is not None:
+            if byte_offset < 0:
+                return _err("invalid_byte_offset",
+                            f"byte_offset={byte_offset} is negative. Use 0 or more.")
+            if offset:
+                return _err("conflicting_offsets",
+                            "Use offset (lines) or byte_offset (bytes), not both.")
         clean, sel = _split_path_selector(path)
         p, blocked = _canonical_target(clean, read=True)
         if blocked:
             return blocked
         assert p is not None
         ranges = _parse_ranges(sel) if sel else None
+        if ranges and byte_offset is not None:
+            return _err("conflicting_offsets",
+                        "Use a line selector or byte_offset, not both. "
+                        "Remove the line range from the path.")
         if sel and sel.lower().find("raw") >= 0:
             raw = True
         if p.is_dir():
             return _list_dir(str(p), show_hidden=raw)
+        if byte_offset is not None:
+            raw = True
         kind = _kind_for(str(p))
         if kind in CAD_EXTS and (kind in CAD_BINARY_EXTS or not raw):
             return _cad_redirect(str(p), kind)
         if kind in DOC_EXTS:
-            return _read_document(str(p), ranges, offset, limit, raw)
-        return _read_text(str(p), ranges, offset, limit, raw)
+            return _read_document(str(p), ranges, offset, limit, raw, byte_offset)
+        return _read_text(str(p), ranges, offset, limit, raw, byte_offset)
 
     @mcp.tool()
     def fs_list(path: str = ".", show_hidden: bool = False) -> dict:

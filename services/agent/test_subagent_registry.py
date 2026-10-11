@@ -11,12 +11,13 @@ Proves, offline (mock provider, tmpdir registry — no all-skip):
     provider registers the session, streams ``agent.spawn`` to the live sink,
     executes the sub-agent, and lands its transcript,
   * the ``subagent_*`` worker RPC envelopes (list / transcript / steer / the
-    M16 confirm-guarded terminate).
+    M16 confirm-guarded terminate), including the hub's project/session scope.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import pytest
 
 from services.agent import raw_log
@@ -189,6 +190,52 @@ def test_environment_project_root_precedes_fs_root_and_fallback(tmp_path, monkey
     assert registered["project_dir"] == str(project)
     monkeypatch.delenv("CHUDWARE_PROJECT_DIR")
     assert reg.register_session("dg_fs", role="worker")["project_dir"] == str(jail)
+
+
+def test_explicit_nested_workspace_is_not_widened_to_a_marked_parent(
+    tmp_path, monkeypatch,
+):
+    from services.agent import config as agent_config
+    from services.agent.project_context import resolve_project_root
+
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    outer = tmp_path / "outer"
+    (outer / ".plm").mkdir(parents=True)
+    project_a = outer / "scratch" / "Project-A"
+    project_b = outer / "scratch" / "Project-B"
+    (project_a / ".chudware").mkdir(parents=True)
+    project_b.mkdir(parents=True)
+    # Precondition: marker discovery alone would merge both into the parent.
+    assert resolve_project_root(project_a) == outer
+    assert resolve_project_root(project_b) == outer
+
+    a = reg.register_session("dg_nested_a", role="worker", project_dir=str(project_a))
+    b = reg.register_session("dg_nested_b", role="worker",
+                             project_dir=str(project_b) + "/")
+    assert a["project_dir"] == os.path.realpath(project_a)
+    assert b["project_dir"] == os.path.realpath(project_b)
+    scoped = _rpc("subagent_list", {"project_dir": str(project_a)})
+    assert [row["id"] for row in scoped["sessions"]] == ["dg_nested_a"]
+    assert _rpc("subagent_transcript", {
+        "subagent_id": "dg_nested_b", "project_dir": str(project_a),
+    }) == {"ok": False, "reason": "Sub-agent is outside the requested scope."}
+
+    # Explicit environment roots keep their precedence and are not widened.
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(project_b))
+    assert reg.register_session("dg_nested_fs", role="worker")["project_dir"] == (
+        os.path.realpath(project_b))
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(project_a))
+    assert reg.register_session(
+        "dg_nested_env", role="worker", project_dir=str(project_b),
+    )["project_dir"] == os.path.realpath(project_a)
+
+    # Only the ambient configured workspace climbs to its marked project root.
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR")
+    monkeypatch.delenv("CHUDWARE_FS_ROOT")
+    monkeypatch.setattr(agent_config, "workspace_dir", lambda: str(project_a))
+    assert reg.resolve_project_dir() == os.path.realpath(outer)
+
 
 
 def test_bad_ids_rejected():
@@ -687,6 +734,214 @@ def test_rpc_list_filters_by_owning_conversation():
     ids = {item["id"] for item in listed["sessions"]}
     assert "dg_in_a" in ids
     assert "dg_in_b" not in ids
+
+
+# ---------------------------------------------------------------------------
+# Hub scope: project_dir / session_id on every detail and control RPC
+# ---------------------------------------------------------------------------
+
+
+_OUT_OF_SCOPE = {"ok": False, "reason": "Sub-agent is outside the requested scope."}
+
+# Every registry call that reads a transcript/steer queue or writes a record.
+_SCOPE_GUARDED_CALLS = (
+    "get_transcript", "read_raw", "pending_steers", "queue_steer",
+    "append_transcript", "request_terminate", "set_paused",
+    "set_runtime_override", "runtime_override",
+)
+
+
+def _scoped_records(tmp_path, monkeypatch) -> dict:
+    """Four records with fixed ownership and updated_ts (oldest first below).
+
+    dg_home      first project, conv_a   (oldest)
+    dg_sibling   first project, conv_b
+    dg_foreign   second project, conv_a
+    dg_unowned   no project, no session  (newest)
+    """
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(first, target_is_directory=True)
+    owners = (
+        ("dg_home", first, "conv_a"),
+        ("dg_sibling", first, "conv_b"),
+        ("dg_foreign", second, "conv_a"),
+    )
+    for sid, project, session in owners:
+        reg.register_session(sid, role="worker", status="running",
+                             session_id=session, project_dir=str(project))
+    reg._write_meta("dg_unowned", {
+        "schema": reg.SCHEMA, "id": "dg_unowned", "role": "worker",
+        "status": "done", "created_ts": "2026-01-01T00:00:04.000+00:00",
+    })
+    ordered = ("dg_home", "dg_sibling", "dg_foreign", "dg_unowned")
+    for sid in ordered:
+        reg.append_transcript(sid, "subagent", f"{sid} display")
+        reg.queue_steer(sid, f"{sid} pending", source="user")
+    for sid in ordered[:3]:
+        reg.append_raw(sid, {"kind": "message",
+                             "message": {"role": "assistant",
+                                         "content": f"{sid} raw"}})
+    # Pin the newest-first order last: transcript appends bump updated_ts.
+    for index, sid in enumerate(ordered, start=1):
+        meta = reg.get_session(sid)
+        meta["updated_ts"] = f"2026-01-01T00:00:0{index}.000+00:00"
+        reg._write_meta(sid, meta)
+    return {"first": first, "second": second, "alias": alias}
+
+
+def _guard_registry(monkeypatch) -> list:
+    calls: list = []
+    for name in _SCOPE_GUARDED_CALLS:
+        original = getattr(reg, name)
+
+        def spy(*args, _name=name, _original=original, **kwargs):
+            calls.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(reg, name, spy)
+    return calls
+
+
+def _registry_files(sid: str) -> dict:
+    paths = [reg._meta_path(sid), reg._transcript_path(sid), reg._steer_path(sid)]
+    raw = reg.raw_path(sid)
+    if raw is not None:
+        paths.append(raw)
+    return {str(p): p.read_bytes() if p.exists() else None for p in paths}
+
+
+def _hub_calls(sid: str, scope: dict) -> list:
+    return [
+        ("subagent_transcript", {"subagent_id": sid, **scope}),
+        ("subagent_transcript", {"subagent_id": sid, "raw": True, **scope}),
+        ("subagent_steer", {"subagent_id": sid, "text": "look here", **scope}),
+        ("subagent_terminate", {"subagent_id": sid, "confirm": True, **scope}),
+        ("subagent_control", {"subagent_id": sid, "op": "pause", **scope}),
+        ("subagent_control", {"subagent_id": sid, "op": "resume", **scope}),
+        ("subagent_control", {"subagent_id": sid, "op": "set_runtime",
+                              "model": "other-model", "effort": "high", **scope}),
+    ]
+
+
+def _assert_refused(calls: list, sid: str, scope: dict) -> None:
+    before = _registry_files(sid)
+    calls.clear()
+    for method, params in _hub_calls(sid, scope):
+        assert _rpc(method, params) == _OUT_OF_SCOPE, (method, params)
+    assert calls == [], (sid, scope, calls)
+    assert _registry_files(sid) == before, (sid, scope)
+
+
+def test_scoped_hub_rpcs_refuse_foreign_project_without_reading_or_writing(
+    tmp_path, monkeypatch,
+):
+    dirs = _scoped_records(tmp_path, monkeypatch)
+    calls = _guard_registry(monkeypatch)
+    _assert_refused(calls, "dg_foreign", {"project_dir": str(dirs["first"])})
+    _assert_refused(calls, "dg_foreign", {"project_dir": str(dirs["alias"])})
+    # The same chat session id does not admit a record of another project.
+    _assert_refused(calls, "dg_foreign", {"project_dir": str(dirs["first"]),
+                                          "session_id": "conv_a"})
+    foreign = reg.get_session("dg_foreign")
+    assert not foreign["paused"] and not foreign["terminate_requested"]
+    assert foreign["model_override"] == "" and foreign["effort_override"] == ""
+
+
+def test_scoped_hub_rpcs_refuse_foreign_session(tmp_path, monkeypatch):
+    dirs = _scoped_records(tmp_path, monkeypatch)
+    calls = _guard_registry(monkeypatch)
+    _assert_refused(calls, "dg_sibling", {"project_dir": str(dirs["first"]),
+                                          "session_id": "conv_a"})
+    _assert_refused(calls, "dg_sibling", {"session_id": "conv_a"})
+    assert not reg.is_paused("dg_sibling")
+    assert not reg.terminate_requested("dg_sibling")
+
+
+def test_scoped_hub_rpcs_fail_closed_on_missing_ownership_and_blank_scope(
+    tmp_path, monkeypatch,
+):
+    dirs = _scoped_records(tmp_path, monkeypatch)
+    calls = _guard_registry(monkeypatch)
+    _assert_refused(calls, "dg_unowned", {"project_dir": str(dirs["first"])})
+    _assert_refused(calls, "dg_unowned", {"session_id": "conv_a"})
+    # A blank requested value never widens to "any", even for an unowned record.
+    _assert_refused(calls, "dg_unowned", {"session_id": ""})
+    _assert_refused(calls, "dg_unowned", {"project_dir": ""})
+    _assert_refused(calls, "dg_home", {"project_dir": str(dirs["first"]),
+                                       "session_id": "  "})
+    _assert_refused(calls, "dg_home", {"project_dir": ""})
+
+
+def test_project_scope_admits_other_session_and_canonical_aliases(
+    tmp_path, monkeypatch,
+):
+    dirs = _scoped_records(tmp_path, monkeypatch)
+    scope = {"project_dir": "~/alias/"}
+
+    display = _rpc("subagent_transcript", {"subagent_id": "dg_sibling", **scope})
+    assert display["ok"] and display["session"]["id"] == "dg_sibling"
+    assert any(m.get("text") == "dg_sibling display" for m in display["messages"])
+    raw = _rpc("subagent_transcript",
+               {"subagent_id": "dg_sibling", "raw": True, **scope})
+    assert raw["ok"]
+    assert any(m.get("message", {}).get("content") == "dg_sibling raw"
+               for m in raw["messages"])
+
+    assert _rpc("subagent_steer", {"subagent_id": "dg_sibling",
+                                   "text": "tighten it", **scope})["queued"]
+    assert [s["text"] for s in reg.pending_steers("dg_sibling")] == [
+        "dg_sibling pending", "tighten it",
+    ]
+    assert _rpc("subagent_control", {"subagent_id": "dg_sibling",
+                                     "op": "pause", **scope})["paused"] is True
+    runtime = _rpc("subagent_control", {"subagent_id": "dg_sibling",
+                                        "op": "set_runtime", "effort": "high",
+                                        **scope})
+    assert runtime["ok"] and runtime["effort_override"] == "high"
+    assert _rpc("subagent_terminate", {"subagent_id": "dg_sibling",
+                                       "confirm": True, **scope})["ok"]
+    assert reg.terminate_requested("dg_sibling")
+
+    # Session-only view: the owning chat in its canonical project reads it.
+    home = _rpc("subagent_transcript", {"subagent_id": "dg_home",
+                                        "project_dir": str(dirs["alias"]),
+                                        "session_id": "conv_a"})
+    assert home["ok"] and home["session"]["id"] == "dg_home"
+
+    # Callers without scope (older external consumers) keep unscoped access;
+    # JSON null is the same as an absent key.
+    unscoped = _rpc("subagent_transcript", {"subagent_id": "dg_foreign",
+                                            "project_dir": None,
+                                            "session_id": None})
+    assert unscoped["ok"] and unscoped["session"]["id"] == "dg_foreign"
+
+
+def test_scoped_list_intersects_filters_before_the_limit(tmp_path, monkeypatch):
+    dirs = _scoped_records(tmp_path, monkeypatch)
+
+    def ids(params):
+        listed = _rpc("subagent_list", params)
+        assert listed["ok"], listed
+        return [row["id"] for row in listed["sessions"]]
+
+    assert ids({}) == ["dg_unowned", "dg_foreign", "dg_sibling", "dg_home"]
+    assert ids({"project_dir": "~/alias"}) == ["dg_sibling", "dg_home"]
+    assert ids({"session_id": "conv_a"}) == ["dg_foreign", "dg_home"]
+    # Newer records outside either filter must not consume the limit.
+    assert ids({"project_dir": str(dirs["alias"]), "session_id": "conv_a",
+                "limit": 1}) == ["dg_home"]
+    assert ids({"project_dir": str(dirs["second"]),
+                "session_id": "conv_b"}) == []
+    assert ids({"session_id": ""}) == []
+    assert ids({"project_dir": ""}) == []
 
 
 # ---------------------------------------------------------------------------

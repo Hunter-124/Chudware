@@ -158,7 +158,7 @@ jobs:
           fi
           "${ngspice_bin}" --version
 
-      # Eight check.py audits use only the standard library; advertised_tool_audit
+      # Most check.py audits use only the standard library; advertised_tool_audit
       # imports the live MCP registry and needs exactly these six packages (langgraph
       # gates every family services/mcp/server.py registers after services.dag).
       # Keep this identical to fast-gate and read pins from the product requirements.

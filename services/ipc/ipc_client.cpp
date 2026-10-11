@@ -99,6 +99,17 @@ std::string diskBuildId(const std::string& bin) {
     return out;
 #endif  // !__EMSCRIPTEN__
 }
+
+// Runs `f` when the scope ends, on every return path.
+template <class F>
+struct OnExit {
+    F f;
+    ~OnExit() { f(); }
+};
+template <class F>
+OnExit<F> onExit(F f) {
+    return OnExit<F>{std::move(f)};
+}
 }  // namespace
 
 namespace chudware_ipc {
@@ -196,7 +207,34 @@ bool EngineClient::tryConnect(std::string& err) {
     return false;
 }
 
-bool EngineClient::hello(const std::string& kind, std::string& err) {
+json EngineClient::helloError() const {
+    std::lock_guard<std::mutex> lk(helloErrMtx_);
+    return helloError_;
+}
+
+void EngineClient::setHelloError(json error) {
+    std::lock_guard<std::mutex> lk(helloErrMtx_);
+    helloError_ = std::move(error);
+}
+
+// hostd closes the connection after it refuses hello (a draining daemon refuses every
+// new non-control client: Server::admitWhileDraining), so this connection ends too. err
+// names the code, the message and the hint, in the same form as daemon_bridge.py.
+void EngineClient::refuseHello(const json& error, std::string& err) {
+    closeConnection();
+    const auto text = [&error](const char* key) {
+        const auto it = error.find(key);
+        return it != error.end() && it->is_string() ? it->get<std::string>() : std::string();
+    };
+    const std::string code = text("code");
+    const std::string message = text("message");
+    const std::string hint = text("hint");
+    err = "hostd refused hello (" + (code.empty() ? std::string("error") : code) + ")";
+    if (!message.empty()) err += ": " + message;
+    if (!hint.empty()) err += " " + hint;
+}
+
+bool EngineClient::hello(const std::string& kind, std::string& err, json& refusal) {
     json params = {{"client", kind},
                    {"pid", selfPid()},
                    {"proto", 1}};
@@ -210,7 +248,14 @@ bool EngineClient::hello(const std::string& kind, std::string& err) {
     // Browser: never block first paint forever if the gateway is slow/silent —
     // maintainConnection retries with backoff when hello fails.
     const int timeoutMs = (kind == "control") ? 2000 : 5000;
-    if (!call("hello", params, result, err, timeoutMs)) return false;
+    if (!call("hello", params, result, err, timeoutMs)) {
+        // An error object is a refusal by the daemon; anything else failed on the transport.
+        if (result.is_object()) {
+            refusal = std::move(result);
+            refuseHello(refusal, err);
+        }
+        return false;
+    }
     serverInfo_ = result;
     return true;
 }
@@ -250,6 +295,9 @@ bool EngineClient::connectOrSpawn(const Options& opts, std::string& err) {
 }
 
 bool EngineClient::connectInner(const Options& opts, std::string& err) {
+    // Publish this attempt's hello error (null unless the daemon refused) when it ends.
+    json refusal;
+    const auto publish = onExit([&] { setHelloError(std::move(refusal)); });
 #ifdef CHUDWARE_DEVELOPER_BUILD
     const std::string keyBin = opts.hostdBin;
 #else
@@ -273,7 +321,7 @@ bool EngineClient::connectInner(const Options& opts, std::string& err) {
         return false;
     }
     std::string firstErr;
-    if (tryConnect(firstErr)) return hello(opts.clientKind, err);
+    if (tryConnect(firstErr)) return hello(opts.clientKind, err, refusal);
 
     if (!opts.allowSpawn) {
         err = "hostd not running (" + firstErr + ")";
@@ -307,7 +355,7 @@ bool EngineClient::connectInner(const Options& opts, std::string& err) {
     int backoff = 50;
     for (;;) {
         std::string e;
-        if (tryConnect(e)) return hello(opts.clientKind, err);
+        if (tryConnect(e)) return hello(opts.clientKind, err, refusal);
         if (std::chrono::steady_clock::now() >= deadline) {
             err = "hostd spawn timed out: " + e;
             return false;
@@ -318,6 +366,11 @@ bool EngineClient::connectInner(const Options& opts, std::string& err) {
 }
 
 void EngineClient::retainEvent(json&& msg) {
+    // hostd sends daemon.draining only to a new connection it refuses, just before the
+    // hello error that carries the same reason (helloError()). Queueing it would only
+    // replay one stale line per refused attempt after the next connect.
+    const auto ev = msg.find("event");
+    if (ev != msg.end() && ev->is_string() && *ev == "daemon.draining") return;
     if (!discardEvents_) events_.push_back(std::move(msg));
 }
 
@@ -403,6 +456,9 @@ bool EngineClient::readResponse(int id, json& out, std::string& err, int timeout
 // hello is a daemon-level method that answers even mid-solve. C++ equivalent of
 // daemon_bridge.py DaemonClient.call's reconnect-on-EOF.
 bool EngineClient::reconnectLocked(std::string& err) {
+    // Publish this attempt's hello error (null unless the daemon refused) when it ends.
+    json refusal;
+    const auto publish = onExit([&] { setHelloError(std::move(refusal)); });
     if (sockPath_.empty()) {  // connectOrSpawn never ran (or never succeeded)
         err = "not connected to hostd";
         return false;
@@ -430,8 +486,14 @@ bool EngineClient::reconnectLocked(std::string& err) {
     json resp;
     if (!readResponse(id, resp, err, /*timeoutMs=*/5000)) return false;
     if (!resp.contains("result")) {
-        err = "hello failed on reconnect";
-        closeConnection();
+        refusal = resp.value("error", json());
+        if (refusal.is_object()) {
+            refuseHello(refusal, err);
+        } else {
+            refusal = json();
+            err = "hello failed on reconnect";
+            closeConnection();
+        }
         return false;
     }
     serverInfo_ = resp["result"];

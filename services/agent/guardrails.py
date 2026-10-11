@@ -520,7 +520,8 @@ def _interference_result_clean(res: Any) -> bool:
             return False
     if not isinstance(res, dict) or not res:
         return False
-    if res.get("ok") is False:
+    # check_interference: ok means the check completed; clear is the clash verdict.
+    if res.get("ok") is False or res.get("clear") is False:
         return False
     # Common shapes: pairs / interferences / clashes with volume > 0
     for key in ("pairs", "interferences", "clashes", "findings"):

@@ -1627,6 +1627,11 @@ def _endpoints(ent: dict) -> list[tuple[float, float]]:
     return [pl[0], pl[-1]]
 
 
+# Endpoints this close are one point: core/sketch/sketch_geom.cpp TOL (OCCT
+# Precision::Confusion), in sketch units (mm). Only a larger gap can be near-coincident.
+_COINCIDENT_TOL_MM = 1e-7
+
+
 def check_sketch_geometry(entities: list[dict],
                           *, near_tol: float = 1e-2,
                           health: Optional[dict] = None) -> list[dict]:
@@ -1700,6 +1705,9 @@ def check_sketch_geometry(entities: list[dict],
             })
 
     # --- near-coincident endpoints (distinct but within 10x near_tol, not merged) --
+    # A gap at or below the kernel's coincidence tolerance is float noise, not a gap: the
+    # 2026-10-10 6-axis run got 9 warnings per sketch for d=1e-11 mm, each one asking for
+    # sketch_auto_constrain on endpoints that were already coincident.
     eps_list: list[tuple[str, float, float]] = []
     for e in ents:
         eid = str(e.get("id") or "?")
@@ -1713,12 +1721,7 @@ def check_sketch_geometry(entities: list[dict],
             if ei == ej:
                 continue
             d = math.hypot(xi - xj, yi - yj)
-            if 1e-9 < d <= near_tol * 10 and d > near_tol:
-                # close but not snapped — near-coincident
-                pair = tuple(sorted([ei, ej]))
-                near_pairs.append((pair, d, (xi, yi), (xj, yj)))
-            elif 1e-12 < d <= near_tol:
-                # within snap tol but still distinct ids — also report
+            if _COINCIDENT_TOL_MM < d <= near_tol * 10:
                 pair = tuple(sorted([ei, ej]))
                 near_pairs.append((pair, d, (xi, yi), (xj, yj)))
     # de-dupe by entity pair

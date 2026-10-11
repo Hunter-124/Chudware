@@ -89,17 +89,160 @@ def _solve_report(rebuild: dict) -> dict:
             "worst_residual": worst_res, "tolerance": rb.get("tolerance"),
             "mates_over_defined": over, "worst": worst, "message": msg, "reason": reason}
 
+def component_source_base(doc_id: Optional[str]) -> Optional[str]:
+    """The folder the engine resolves relative component sources against.
+
+    It is the assembly file's folder, else the project folder that doc_new received
+    (core/doc/session.cpp component_source_base). None when neither exists. The engine is
+    the one authority: the worker cwd is never a base."""
+    if not doc_id:
+        return None
+    base = (cb.call("doc_tree", {"doc_id": doc_id}) or {}).get("component_source_base")
+    return base if isinstance(base, str) and base else None
+
+
+def resolve_component_source(path: str, base: Optional[str]) -> Optional[str]:
+    """Absolute path of a stored component `source.path`, resolved as compile_assembly does.
+
+    None for a relative path when `base` is None."""
+    p = str(path)
+    if os.path.isabs(p):
+        return os.path.normpath(p)
+    if not base:
+        return None
+    return os.path.normpath(os.path.join(base, p))
+
+
+# Component source docs opened for mate-query resolution, keyed by absolute path —
+# a mate query resolves against the COMPONENT's own part document, and reopening the
+# same .step+ for every mate would be wasteful.
+_ASM_QUERY_DOCS: dict = {}
+
+
+def _component_source_path(path: str, asm_doc: Optional[str]) -> str:
+    """Absolute path of a component source STORED in the assembly document.
+
+    A relative stored source is relative to the ASSEMBLY file's folder (`Parts/…`,
+    `../Frame/…`), else to the project folder of an unsaved assembly. The engine
+    reports that base (component_source_base), so this never disagrees with
+    compile_assembly. It was resolved against the worker's cwd here, so asm_mate on a
+    saved assembly failed with "no such file" for every relative component (2026-09-24)."""
+    resolved = resolve_component_source(path, component_source_base(asm_doc))
+    if resolved is None:
+        raise ValueError(
+            f"component source {path!r} is a relative path. The assembly has no file "
+            "and no project folder to resolve it. Give an absolute path, or save the "
+            "assembly first.")
+    return resolved
+
+
+def _asm_component_doc(path: str, asm_doc: Optional[str] = None) -> str:
+    """doc_id of the component's source part, opened (once) for geometry queries."""
+    p = _component_source_path(path, asm_doc)
+    d = _ASM_QUERY_DOCS.get(p)
+    if d:
+        try:  # still open?
+            cb.call("doc_tree", {"doc_id": d})
+            return d
+        except Exception:  # noqa: BLE001
+            _ASM_QUERY_DOCS.pop(p, None)
+    r = cb.call("doc_open", {"path": p})
+    d = r.get("doc_id")
+    _ASM_QUERY_DOCS[p] = d
+    return d
+
+
+def _component_sid_match(part_doc: str, asm_doc: str, comp: dict,
+                          sid: str) -> Optional[dict]:
+    """The component-part match a stable sid names, or None.
+
+    The sid is looked up with cad_common's _sid_match (the lookup query_geometry/hover
+    use) in the component's SOURCE part first. stable_sid hashes the
+    WORLD centroid (core/doc/selectors.cpp), so a sid read off this assembly — its
+    render tiles, query_geometry on the assembly — names the POSED instance instead:
+    that match is mapped back through the component's transform onto the one part face/
+    edge of the same kind+surf at that local centroid. A sid on a different component
+    maps to nothing there and stays a miss."""
+    m = _sid_match(part_doc, sid)
+    if m is not None:
+        return m
+    world = _sid_match(asm_doc, sid)
+    if world is None or world.get("centroid") is None:
+        return None
+    import numpy as np
+    try:
+        inverse = np.linalg.inv(np.asarray(comp.get("transform"), dtype=float)
+                                .reshape(4, 4))
+    except (TypeError, ValueError, np.linalg.LinAlgError):
+        return None
+    local = inverse[:3, :3] @ np.asarray(world["centroid"], dtype=float) + inverse[:3, 3]
+    kind = world.get("kind") or "face"
+    rows = (cb.call("doc_query", {"doc_id": part_doc, "query": {"of": kind}})
+            .get("matches") or [])
+    hits = [r for r in rows if isinstance(r, dict) and r.get("surf") == world.get("surf")
+            and r.get("centroid") is not None
+            and float(np.linalg.norm(np.asarray(r["centroid"], dtype=float) - local)) < 1e-3]
+    return hits[0] if len(hits) == 1 else None
+
+
+def resolve_mate_ref(asm_doc: str, comps: dict, tag: str, ref: dict) -> dict:
+    """Resolve one mate operand {component, query|sid} to {component, selector}.
+
+    The query or sid resolves against the component's SOURCE part and must name
+    exactly ONE face/edge. Returns {"ref": {component, selector}} or {"error": text}
+    (plus "candidates" when the query matched several). asm_mate and add_features'
+    asm_add_mate share this, so both accept the same operand."""
+    kid = ref.get("component")
+    if kid not in comps:
+        return {"error": f"{tag}: no component '{kid}' (have: {sorted(comps)})"}
+    src = ((comps[kid].get("source") or {}).get("path")) or ""
+    if not src:
+        return {"error": f"{tag}: component '{kid}' has no source path "
+                         "(embedded components not supported yet)"}
+    q = ref.get("query", ref.get("sid", "top"))
+    part_doc = _asm_component_doc(src, asm_doc)
+    sid = None
+    if isinstance(q, str) and _SID_RE.fullmatch(q.strip()):
+        sid = q.strip()
+    elif (isinstance(q, dict) and isinstance(q.get("sid"), str)
+          and _SID_RE.fullmatch(q["sid"].strip())):
+        sid = q["sid"].strip()
+    if sid is not None:
+        # A sid IS one element, not a query predicate — picks.cpp has no `sid`
+        # predicate, and a bare string here used to reach the engine as
+        # `side` ("geom query: bad 'side' 'F2bb10f'", live c245).
+        match = _component_sid_match(part_doc, asm_doc, comps[kid], sid)
+        if match is None:
+            return {"error": f"{tag}: no face/edge of component '{kid}' carries "
+                             f"sid {sid!r} — sids move whenever geometry does. "
+                             f"Re-read them with describe_part on its source part "
+                             f"({src}) or query_geometry on this assembly, or pass a "
+                             f"geometry query {_QVOCAB_HELP}."}
+        return {"ref": {"component": kid, "selector": match}}
+    if isinstance(q, str):
+        try:
+            q = _as_face_query(q)
+        except ValueError as e:
+            return {"error": f"{tag}: {e} A face/edge sid "
+                             "(\"F2bb10f\") is also accepted as the query."}
+    matches = (cb.call("doc_query", {"doc_id": part_doc, "query": q})
+               .get("matches") or [])
+    if len(matches) != 1:
+        brief = [{k: m.get(k) for k in ("sid", "kind", "surf", "side",
+                                        "centroid", "radius")}
+                 for m in matches[:8]]
+        return {"error": f"{tag}: query must resolve to exactly ONE face/edge of "
+                         f"'{kid}' — got {len(matches)}. Narrow with pick/near/"
+                         "count, or pass one candidate's sid as the query "
+                         "(candidates below).", "candidates": brief}
+    return {"ref": {"component": kid, "selector": matches[0]}}
+
+
 def register_cad_asm_tools(mcp: FastMCP) -> None:
     """CAD assembly + motion MCP tools (T-RF8 split of cad_tools.py): new_assembly, asm_add_component, asm_mate, solve_mates, simulate_motion, motion_fea_handoff, list_world_bodies."""
 
 
     # ---------------------------------------------------------------- assembly
-
-    # Component source docs opened for mate-query resolution, keyed by absolute path —
-    # asm_mate resolves plain-word queries against the COMPONENT's own part document, and
-    # reopening the same .step+ for every mate would be wasteful.
-    _ASM_QUERY_DOCS: dict = {}
-
 
 
     def _assembly_dir(asm_doc: Optional[str]) -> Optional[str]:
@@ -113,21 +256,6 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
             return os.path.dirname(asm_path)
         return None
 
-
-
-    def _component_source_path(path: str, asm_doc: Optional[str]) -> str:
-        """Absolute path of a component source STORED in the assembly document.
-
-        A relative stored source is relative to the ASSEMBLY file's folder (`Parts/…`,
-        `../Frame/…`) — the engine's compile_assembly resolves it that way. It
-        was resolved against the worker's cwd here, so asm_mate on a saved assembly failed
-        with "no such file" for every relative component (2026-09-24)."""
-        p = path
-        if not os.path.isabs(p):
-            asm_dir = _assembly_dir(asm_doc)
-            if asm_dir:
-                p = os.path.join(asm_dir, p)
-        return os.path.abspath(p)
 
 
 
@@ -163,55 +291,6 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
 
 
 
-    def _asm_component_doc(path: str, asm_doc: Optional[str] = None) -> str:
-        """doc_id of the component's source part, opened (once) for geometry queries."""
-        p = _component_source_path(path, asm_doc)
-        d = _ASM_QUERY_DOCS.get(p)
-        if d:
-            try:  # still open?
-                cb.call("doc_tree", {"doc_id": d})
-                return d
-            except Exception:  # noqa: BLE001
-                _ASM_QUERY_DOCS.pop(p, None)
-        r = cb.call("doc_open", {"path": p})
-        d = r.get("doc_id")
-        _ASM_QUERY_DOCS[p] = d
-        return d
-
-
-    def _component_sid_match(part_doc: str, asm_doc: str, comp: dict,
-                              sid: str) -> Optional[dict]:
-        """The component-part match a stable sid names, or None.
-
-        The sid is looked up with cad_common's _sid_match (the lookup query_geometry/hover
-        use) in the component's SOURCE part first. stable_sid hashes the
-        WORLD centroid (core/doc/selectors.cpp), so a sid read off this assembly — its
-        render tiles, query_geometry on the assembly — names the POSED instance instead:
-        that match is mapped back through the component's transform onto the one part face/
-        edge of the same kind+surf at that local centroid. A sid on a different component
-        maps to nothing there and stays a miss."""
-        m = _sid_match(part_doc, sid)
-        if m is not None:
-            return m
-        world = _sid_match(asm_doc, sid)
-        if world is None or world.get("centroid") is None:
-            return None
-        import numpy as np
-        try:
-            inverse = np.linalg.inv(np.asarray(comp.get("transform"), dtype=float)
-                                    .reshape(4, 4))
-        except (TypeError, ValueError, np.linalg.LinAlgError):
-            return None
-        local = inverse[:3, :3] @ np.asarray(world["centroid"], dtype=float) + inverse[:3, 3]
-        kind = world.get("kind") or "face"
-        rows = (cb.call("doc_query", {"doc_id": part_doc, "query": {"of": kind}})
-                .get("matches") or [])
-        hits = [r for r in rows if isinstance(r, dict) and r.get("surf") == world.get("surf")
-                and r.get("centroid") is not None
-                and float(np.linalg.norm(np.asarray(r["centroid"], dtype=float) - local)) < 1e-3]
-        return hits[0] if len(hits) == 1 else None
-
-
 
 
     def _asm_components(doc_id: str) -> list:
@@ -224,10 +303,15 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
     def _asm_revision(doc_id: str) -> int:
         return cb.call("doc_tree", {"doc_id": doc_id}).get("revision", 0)
 
+    def _components_phrase(count) -> str:
+        if isinstance(count, int):
+            return f"{count} component{'' if count == 1 else 's'}"
+        return "its existing components"
+
 
 
     @mcp.tool()
-    def new_assembly(name: str = "assembly") -> str:
+    def new_assembly(name: str = "assembly", *, fresh: bool = False) -> str:
         """Create a new, empty ASSEMBLY document and make it current. Returns its doc_id.
 
         An assembly PLACES saved part files as components and positions them with MATES —
@@ -248,27 +332,38 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         bumping the name gives the user a duplicate tab, a duplicate file, a duplicate PLM
         item and a "Recover unsaved parts?" row per round; the versions of one design live
         in its history (plm_timeline / plm_rollback). Reuse the name the reply hands back.
+        A resumed assembly reports `reused: true` and its `component_count` — it still holds
+        the components it had; add to them, don't re-add them.
+
+        `fresh=True` is the ONLY way to get a separate EMPTY assembly while one of that name
+        (or version series) is open: it skips both resumes and the engine numbers the new
+        document if the name is taken. Use it for a deliberately separate assembly, not to
+        iterate on the same design.
         """
         try:
             docs = _resumable_docs()
-            series = _pick_best_doc(_docs_in_version_series(docs, name, kind="assembly"))
+            series = (None if fresh else
+                      _pick_best_doc(_docs_in_version_series(docs, name, kind="assembly")))
             if series is not None:
                 did = series["doc_id"]
                 _CUR["doc_id"] = did
                 note_touched_doc(did)
                 actual = series.get("name") or name
+                count = series.get("component_count")
                 return _dumps({
                     "ok": True, "doc_id": did, "name": actual, "kind": "assembly",
                     "revision": series.get("revision", 0),
                     "reused": True, "resumed": True, "resumed_by": "version_series",
                     "version_series": _version_series_base(name),
                     "requested_name": name,
-                    "component_count": series.get("component_count"),
+                    "component_count": count,
                     "note": f'"{name}" is the next VERSION of the open assembly '
                             f'"{actual}" (doc_id={did}), not a separate assembly — '
-                            f"resumed it so the design stays ONE document with ONE "
-                            f"version history (plm_timeline / plm_rollback). Edit it in "
-                            f'place and keep calling it "{actual}".'})
+                            f"resumed it ({_components_phrase(count)}) so the design stays "
+                            f"ONE document with ONE version history (plm_timeline / "
+                            f'plm_rollback). Edit it in place and keep calling it "{actual}"; '
+                            f"call new_assembly(name, fresh=True) only for a deliberately "
+                            f"separate empty assembly."})
             # resume_if_open makes the engine decide check-and-mint under its mint lock,
             # so two callers racing on one name get one document (the same contract
             # new_part relies on — see cad_doc_tools.new_part and core/doc/session.cpp).
@@ -277,9 +372,9 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
             # the token would miss it and mint a duplicate (same guard as new_part).
             exact_open = [e for e in _docs_named(docs, name)
                           if (e.get("kind") or "part") == "assembly"]
-            mint_name = name if exact_open else _strip_version_suffix(name)
+            mint_name = name if (exact_open and not fresh) else _strip_version_suffix(name)
             r = cb.call("doc_new", {"kind": "assembly", "name": mint_name,
-                                    "resume_if_open": True, **_doc_new_scope()})
+                                    "resume_if_open": not fresh, **_doc_new_scope()})
             did = r.get("doc_id")
             _CUR["doc_id"] = did
             note_touched_doc(did)
@@ -294,11 +389,26 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                     f'dropped the version token from "{name}" because revisions are '
                     f'tracked in PLM (plm_checkpoint / plm_timeline); this assembly was '
                     f'minted as "{actual}", so keep calling it "{actual}" from now on')
+            if fresh:
+                out["fresh"] = True
+                if actual != name:
+                    out["requested_name"] = name
+                    out["note"] = (
+                        f'an assembly named "{name}" was already open, so the engine '
+                        f'numbered this fresh empty document "{actual}"')
             if r.get("reused"):
-                out.update(reused=True, resumed=True,
-                           component_count=r.get("component_count"),
-                           note=f'resumed the open assembly "{out["name"]}" '
-                                f"(doc_id={did}) instead of minting a duplicate document")
+                # doc_new's resume reply carries feature_count, not component_count;
+                # the doc_list row fetched above has it.
+                count = r.get("component_count")
+                if count is None:
+                    count = next((e.get("component_count") for e in docs
+                                  if e.get("doc_id") == did), None)
+                out.update(reused=True, resumed=True, component_count=count,
+                           note=f'RESUMED the existing open assembly "{out["name"]}" '
+                                f"(doc_id={did}), which already has "
+                                f"{_components_phrase(count)} — new asm_add_component calls "
+                                f"ADD to them. For a separate empty assembly call "
+                                f'new_assembly("{name}", fresh=True).')
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -481,54 +591,10 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                     ref = _normalize_mate_operand(tag, raw)
                 except ValueError as e:
                     return _dumps({"ok": False, "error": str(e)})
-                kid = ref["component"]
-                if kid not in comps:
-                    return _dumps({"ok": False, "error": f"{tag}: no component '{kid}' "
-                                   f"(have: {sorted(comps)})"})
-                src = ((comps[kid].get("source") or {}).get("path")) or ""
-                if not src:
-                    return _dumps({"ok": False, "error": f"{tag}: component '{kid}' has no "
-                                   "source path (embedded components not supported yet)"})
-                q = ref.get("query", ref.get("sid", "top"))
-                part_doc = _asm_component_doc(src, d)
-                sid = None
-                if isinstance(q, str) and _SID_RE.fullmatch(q.strip()):
-                    sid = q.strip()
-                elif (isinstance(q, dict) and isinstance(q.get("sid"), str)
-                      and _SID_RE.fullmatch(q["sid"].strip())):
-                    sid = q["sid"].strip()
-                if sid is not None:
-                    # A sid IS one element, not a query predicate — picks.cpp has no `sid`
-                    # predicate, and a bare string here used to reach the engine as
-                    # `side` ("geom query: bad 'side' 'F2bb10f'", live c245).
-                    match = _component_sid_match(part_doc, d, comps[kid], sid)
-                    if match is None:
-                        return _dumps({"ok": False, "error":
-                                       f"{tag}: no face/edge of component '{kid}' carries "
-                                       f"sid {sid!r} — sids move whenever geometry does. "
-                                       f"Re-read them with describe_part on its source part "
-                                       f"({src}) or query_geometry on this assembly, or pass a "
-                                       f"geometry query {_QVOCAB_HELP}."})
-                    refs.append({"component": kid, "selector": match})
-                    continue
-                if isinstance(q, str):
-                    try:
-                        q = _as_face_query(q)
-                    except ValueError as e:
-                        return _dumps({"ok": False, "error": f"{tag}: {e} A face/edge sid "
-                                       "(\"F2bb10f\") is also accepted as the query."})
-                matches = (cb.call("doc_query", {"doc_id": part_doc, "query": q})
-                           .get("matches") or [])
-                if len(matches) != 1:
-                    brief = [{k: m.get(k) for k in ("sid", "kind", "surf", "side",
-                                                    "centroid", "radius")}
-                             for m in matches[:8]]
-                    return _dumps({"ok": False, "error":
-                                   f"{tag}: query must resolve to exactly ONE face/edge of "
-                                   f"'{kid}' — got {len(matches)}. Narrow with pick/near/"
-                                   "count, or pass one candidate's sid as the query "
-                                   "(candidates below).", "candidates": brief})
-                refs.append({"component": kid, "selector": matches[0]})
+                resolved = resolve_mate_ref(d, comps, tag, ref)
+                if "error" in resolved:
+                    return _dumps({"ok": False, **resolved})
+                refs.append(resolved["ref"])
             mate: dict = {"type": mate_type, "align": align, "suppressed": False,
                           "refs": refs}
             if value is not None:

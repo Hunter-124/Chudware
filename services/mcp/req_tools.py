@@ -372,7 +372,8 @@ def _markdown_with_battery_evidence(doc) -> str:
                     verifier = ev.get("verifier", "?")
                     ts = ev.get("ts", "?")
                     res = ev.get("result", {})
-                    ok_str = "PASS" if res.get("ok", False) else "FAIL"
+                    # Evidence written before `passed` existed recorded the verdict as ok.
+                    ok_str = "PASS" if ev.get("passed", res.get("ok", False)) else "FAIL"
                     battery_lines.append(f"  - `{verifier}` at {ts}: {ok_str}")
             if h_evs:
                 battery_lines.append(f"**Hand-entered evidence** ({len(h_evs)} entry/entries):")

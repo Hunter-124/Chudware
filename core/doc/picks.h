@@ -115,7 +115,10 @@ FacePicks resolve_face_picks(const TopoDS_Shape& shape, const nlohmann::json& se
 //                 rim). Ties co-rank, so a symmetric body keeps the opposite pair; add
 //                 count:1 or a side to force one. When the body has NO round faces/edges,
 //                 inner/outer return an EMPTY result (0 matches) — not an error.
-//   near          [x,y,z]   keep the nearest `count` (default 1) by centroid distance
+//   near          [x,y,z]   keep the nearest `count` (default 1). Distance = min(point -> the
+//                 trimmed sub-shape geometry, point -> its centroid), so a point ON the entity
+//                 or AT its reported centroid both score 0; ties (1e-4 mm / 1e-6 rel) go to the
+//                 nearer centroid, then MapShapes order (contracts/selectors.md).
 //   count         int       cap the result size
 //   index         [i,...]   keep these ordinals of the filtered set
 //

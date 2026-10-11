@@ -470,8 +470,8 @@ def test_workspace_status_unknown_run_with_no_sessions_names_the_alternatives():
 
     assert out["ok"] is False                       # orchestrator poll contract
     assert out["known_run_ids"] == []
-    assert "describe_project()" in out["do_instead"]
-    assert "no multi-doc workspace session anywhere" in out["hint"]
+    assert "workspace_status()" in out["do_instead"]
+    assert out["reason"] == "unknown_run_id"
 
 
 def test_workspace_status_unknown_run_lists_the_live_sessions():

@@ -11,8 +11,8 @@ from typing import Any
 ENTRIES: dict[str, dict[str, Any]] = {
     "workspace_status": {
         "prompt_note": (
-            "One-call orient snapshot: open docs, owners, node statuses. Poll "
-            "this before touching docs you did not create."
+            "One-call orient snapshot: project dir and open docs. Omit run_id "
+            "in a chat turn. Call it before you touch docs you did not create."
         ),
     },
     "workspace_doc_events": {

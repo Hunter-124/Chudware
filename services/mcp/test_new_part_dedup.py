@@ -101,18 +101,14 @@ def _tool(name):
 @pytest.fixture()
 def engine(monkeypatch):
     """Install a fake engine over a caller-supplied doc list."""
-    made: list = []
-
     def _install(docs):
         fake = _FakeEngine(docs)
         monkeypatch.setattr(C.cb, "call", fake.call)
-        made.append(fake)
         return fake
 
     monkeypatch.delenv("CHUDWARE_PROJECT_SAVE_DIR", raising=False)
     monkeypatch.setitem(C._CUR, "doc_id", None)
     yield _install
-    del made
 
 
 def _new_part(**kw):
@@ -400,6 +396,21 @@ def test_new_assembly_resumes_an_open_assembly_of_the_same_name(engine):
     assert fake.new_calls == []
     assert r["doc_id"] == "doc-cpp00000031"
     assert r["resumed"] is True and r["kind"] == "assembly"
+
+
+def test_new_assembly_fresh_mints_alongside_an_open_assembly(engine):
+    fake = engine([
+        {"doc_id": "doc-cpp00000034", "name": "hinge0", "kind": "assembly",
+         "revision": 2, "component_count": 3},
+    ])
+    resumed = _new_assembly(name="hinge0")
+    assert resumed["reused"] is True and resumed["component_count"] == 3
+    assert "3 components" in resumed["note"] and "fresh=True" in resumed["note"]
+
+    r = _new_assembly(name="hinge0", fresh=True)
+    assert fake.new_calls == ["hinge0"]
+    assert r["doc_id"] != "doc-cpp00000034" and not r.get("reused")
+    assert r["fresh"] is True
 
 
 def test_new_assembly_bumped_version_resumes_the_series(engine):

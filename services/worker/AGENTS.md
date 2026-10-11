@@ -22,7 +22,8 @@ services worker. Wire contract: `contracts/worker_rpc.md`. Ongoing guidance:
   - Default: the daemon `EngineClient` over local IPC to `chudware-hostd`, with bounded
     connect retry (`CHUDWARE_ENGINE_DAEMON_RETRY_MS`).
   - Fallback: `CHUDWARE_ENGINE_DAEMON=0`, or exhausted retries, gives the in-process
-    `CppCore`.
+    `CppCore`. A `daemon_draining` hello refusal never falls back: the GUI stays in
+    daemon mode and connects when the old daemon exits.
   - `RunLane` gives agent and sim runs their own connections.
 - `cpp_core.{h,cpp}` — `CppCore`: runtime loader for `libchudware` over the flat C ABI
   (`core/api/libchudware.h`).

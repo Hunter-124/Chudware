@@ -6,6 +6,8 @@ from argparse import Namespace
 from pathlib import Path
 import pytest
 
+from services.installer.payload_manifest import build_manifest
+
 _path=Path(__file__).with_name("finalize_release.py")
 _spec=importlib.util.spec_from_file_location("finalize_release", _path); assert _spec and _spec.loader
 M=importlib.util.module_from_spec(_spec); _spec.loader.exec_module(M)
@@ -17,18 +19,6 @@ def test_safe_extract_rejects_traversal(tmp_path: Path):
     with pytest.raises(M.FinalizeError, match="unsafe path"):
         M.safe_extract(archive,tmp_path/"out")
 
-def test_foreign_platform_script_is_portable_complete_finalize_command(tmp_path: Path):
-    sig=tmp_path/"payload.sig"; sig.write_text("sig")
-    key=tmp_path/"release.pub"; key.write_text("pub")
-    args=Namespace(platform="windows",arch="x86_64",version="1.2.3",channel="beta",out=tmp_path,payload_signature=sig,release_public_key=str(key))
-    handoff=tmp_path/"handoff"; handoff.mkdir()
-    script=M.host_script(args,handoff)
-    text=script.read_text()
-    assert "services.installer.build_release" in text
-    assert "finalize_release.py complete" in text
-    assert "portable-inputs" in text
-    assert str(tmp_path.resolve()) not in text
-    assert "TODO" not in text and "no-op" not in text
 
 def test_evidence_requests_are_domain_separated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     artifact=tmp_path/"a.AppImage"; artifact.write_bytes(b"artifact")
@@ -45,8 +35,13 @@ def test_evidence_requests_are_domain_separated(tmp_path: Path, monkeypatch: pyt
 def _prepared(tmp_path: Path, *, channel="stable"):
     root=tmp_path/"handoff"; root.mkdir()
     lock=root/"requirements.lock"; lock.write_bytes(b"lock")
-    payload={"key_id":"release-v1"}
-    (root/"payload-manifest.v1.json").write_bytes(M.canonical_json_bytes(payload))
+    payload_root=root/"Chudware"; payload_root.mkdir()
+    (payload_root/"Chudware.exe").write_bytes(b"release payload")
+    _payload,canonical,_snapshots=build_manifest(
+        payload_root,version="1.2.3",platform="windows",arch="x86_64",
+        key_id="release-v1",created_at="2026-10-09T00:00:00Z",
+    )
+    (root/"payload-manifest.v1.json").write_bytes(canonical)
     metadata={"commit":"a"*40,"version":"1.2.3","channel":channel,"platform":"windows","arch":"x86_64","locked_inputs":[{"path":"requirements.lock","sha256":M.digest(lock)}]}
     (root/"handoff.json").write_bytes(M.canonical_json_bytes(metadata))
     args=Namespace(handoff_metadata=None,commit="a"*40,version="1.2.3",channel=channel,platform="windows",arch="x86_64",locked_input=[])

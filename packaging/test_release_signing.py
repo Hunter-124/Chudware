@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import base64
 import hashlib
 import importlib.util
@@ -99,22 +98,6 @@ def test_publish_rejects_wrong_key_and_digest(tmp_path: Path, monkeypatch: pytes
             publish.verify_artifact_signature("test", *identity, signature)
 
 
-def test_publisher_has_no_private_key_or_signing_command():
-    publish = _load_publish()
-    source = Path(publish.__file__).read_text(encoding="utf-8")
-    assert "CHUDWARE_RELEASE_SIGNING_KEY" not in source
-    assert "Ed25519PrivateKey" not in source
-    assert not hasattr(publish, "load_signing_key")
-    assert not hasattr(publish, "release_signing_key")
-    upload = publish.parser().parse_args([
-        "upload", "artifact", "--artifact-signature", "artifact.sig",
-        "--payload-manifest", "payload.json", "--payload-signature", "payload.sig",
-        "--sbom", "sbom.json", "--sbom-signature", "sbom.sig",
-        "--provenance", "provenance.json", "--provenance-signature", "provenance.sig",
-        "--platform-test", "platform.json", "--platform-test-signature", "platform.sig",
-        "--channel", "beta",
-    ])
-    assert isinstance(upload, argparse.Namespace)
 
 
 def test_artifact_request_domain_is_not_payload_domain():

@@ -154,6 +154,19 @@ def model_selectors(*names: str):
     return declare
 
 
+def context_doc_unless(*names: str):
+    """Declare arguments that replace the run-context document.
+
+    Apply below ``@mcp.tool()``. If the caller gives one of these arguments, the harness
+    does not inject the run-context ``doc_id``. No wrapper is introduced, and the shared
+    registry guard preserves this metadata through ``functools.wraps``.
+    """
+    def declare(fn):
+        fn._cad_context_doc_unless = frozenset(names)
+        return fn
+    return declare
+
+
 # --------------------------------------------------------------------------- catalog
 # Process-wide tag catalog: tool name -> {"family": str, "risk": str}.
 _CATALOG: dict[str, dict] = {}
@@ -645,7 +658,14 @@ class _FamilyView:
         def deco(fn):
             name = t_kwargs.get("name") or getattr(fn, "__name__", "?")
             record(name, family)
-            return inner(_guard(fn, name))
+            guarded = _guard(fn, name)
+            # A description given only as a registration kwarg must also travel on the
+            # callable: on-demand host-tool loads read inspect.getdoc(fn), and Chudcode
+            # rejects the WHOLE set_host_tools call when one tool's description is empty
+            # (a prompt that auto-loaded the inspect category died before any model call).
+            if t_kwargs.get("description") and not inspect.getdoc(guarded):
+                guarded.__doc__ = t_kwargs["description"]
+            return inner(guarded)
         return deco
 
     def __getattr__(self, item):

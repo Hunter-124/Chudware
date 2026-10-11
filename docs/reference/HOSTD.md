@@ -24,7 +24,9 @@ way the GUI's in-process path does (`services/worker/cpp_core.cpp`), so
     still fails. `CHUDWARE_ENGINE_DAEMON_RETRY_MS` overrides that wait budget
     (`0` disables outer retries). Each underlying `EngineClient::connectOrSpawn()`
     has its own **15 s** spawn/connect budget (`Options::spawnBudgetMs`); 2.85 s is
-    not a total GUI startup deadline.
+    not a total GUI startup deadline. A `daemon_draining` refusal (see
+    [New connects to a draining daemon](#new-connects-to-a-draining-daemon)) stops the
+    outer retry at once and never selects the in-process fallback.
 - **Single instance per key.** Linux: `flock` on `hostd-<key>.lock` held for the
   daemon's lifetime (evaporates on death — no stale-lock heuristics). Windows:
   named mutex `Global\chudware-hostd-<SID>-<key>`.
@@ -73,7 +75,7 @@ way the GUI's in-process path does (`services/worker/cpp_core.cpp`), so
 
 | Variable | Meaning |
 |---|---|
-| `CHUDWARE_ENGINE_DAEMON` | Unset/`1` = default daemon routing; `0` = explicit in-process opt-out. Desktop GUI startup can also fall back if daemon connection fails. |
+| `CHUDWARE_ENGINE_DAEMON` | Unset/`1` = default daemon routing; `0` = explicit in-process opt-out. Desktop GUI startup can also fall back if daemon connection fails, but never on a `daemon_draining` refusal. |
 | `CHUDWARE_HOSTD_BIN` | Explicit daemon binary to spawn. Developer MCP discovery tries `CHUDWARE_DIST`, then Linux full/slim build trees (Windows: `core/build/bin`); packaged C++ clients resolve the manifest-owned binary. Pin this explicitly in portable examples. |
 | `CHUDWARE_INSTANCE_KEY` | 12-hex instance key override. Unset → hash of the realpath of the resolved hostd binary (Windows: lowercased path). Same key = same daemon; different keys coexist. |
 | `CHUDWARE_HOSTD_SOCKET` | Explicit socket path override (Linux). |
@@ -174,7 +176,7 @@ instance; it does not attach to, stop or replace an already-open user session.
 
 | | GUI | MCP |
 |---|---|---|
-| unset/`=1` (default) | Attempts `DaemonConn` → daemon; viewport receives live `doc.changed` events. Startup failure can select in-process fallback. | `core_bridge` routes through `daemon_bridge.py`; docs are shared with daemon-mode clients. |
+| unset/`=1` (default) | Attempts `DaemonConn` → daemon; viewport receives live `doc.changed` events. Startup failure can select in-process fallback, except a `daemon_draining` refusal: the GUI stays in daemon mode and waits for the draining daemon to exit. | `core_bridge` routes through `daemon_bridge.py`; docs are shared with daemon-mode clients. A `daemon_draining` refusal raises `CoreError(code="daemon_draining")`, never an in-process fallback. |
 | `=0` (explicit opt-out) | In-process dlopen | In-process ctypes load; no shared live document registry with the GUI. |
 
 Mixing modes on the same docs is guarded: a legacy in-process load warns loudly
@@ -196,9 +198,33 @@ The daemon and engine embed a build-time git-describe id
   the old pid to exit, then respawns/reconnects the new build.
 - **Daemon-side self-drain backstop**: the accept loop stats its own binary and
   the loaded `libchudware` every `CHUDWARE_HOSTD_STALECHECK_S` (default 60 s); an
-  mtime change flips it to draining — existing clients finish, new connects get
-  a `daemon.draining` event and are refused, and the daemon exits once idle.
+  mtime change starts a soft drain (`beginDrain(0, "stale_binary", path)`). Existing
+  clients finish on the old engine, and the daemon exits when no client pins it.
   Deploys must still be temp-file + RENAME (never `cp` over a live .so).
+
+### New connects to a draining daemon
+
+Every drain refuses new clients by name: `stale_binary` (soft, above),
+`stop_requested` (`daemon_drain` / `--stop`) and `quit` (tray Quit) — see
+`Server::admitWhileDraining` / `drainRefusal` in `core/hostd/server.cpp`.
+
+- An operator `control` client (`chudware-hostd --status` / `--stop`) is admitted. It
+  reports the drain, or `--stop` turns a soft drain into a hard stop.
+- Any other client gets a `{"event":"daemon.draining","reason":…}` line, then an error
+  reply to its `hello`, then a clean close. The error object:
+  `{code:"daemon_draining", reason, daemon_pid, clients, active_clients, children,
+  hard_stop, changed_path?, message, hint}` (`changed_path` only for `stale_binary`).
+- One daemon serves each hostd binary path, so no successor can start beside a
+  draining daemon. No client falls back to an in-process engine on this refusal:
+  - Python: `daemon_bridge.DaemonDraining`; `core_bridge` raises
+    `CoreError(code="daemon_draining")`.
+  - GUI: `EngineClient::helloError()` keeps the error object;
+    `engine::daemonRefusal()` exposes it. The GUI stays in daemon mode and names the
+    drain on the sticky unreachable chip (tooltip: `message` + `hint`). The frame-loop
+    reconnect (`maintainConnection`) does not spawn while the daemon refuses. After the
+    old daemon exits, it spawns the new build and connects.
+- `daemon_status` (and `--status`) carry `drain_reason` (null while not draining)
+  and, while draining, `drain`: the refusal object without `code`.
 
 ## Installer integration
 

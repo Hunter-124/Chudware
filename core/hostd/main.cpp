@@ -10,7 +10,8 @@
 //   chudware-hostd                 run (assumes already detached by the spawner)
 //   chudware-hostd --foreground    same, explicit (dev convenience)
 //   chudware-hostd --status        product version line (stderr) + daemon_status
-//                               JSON of the running instance (stdout)
+//                               JSON of the running instance (stdout); a draining
+//                               daemon also prints its drain reason (stderr)
 //   chudware-hostd --stop          ask the running instance to drain and exit
 //                               (refused while agent children run; add --force
 //                               to stop them first). If the transport is dead but
@@ -117,7 +118,7 @@ static void trayQuitThunk(void*) {
 #endif
     if (g_server) {
         // Bounded: refuse new accepts, give current work a moment, then go regardless.
-        g_server->beginDrain(/*deadlineSecs=*/5);
+        g_server->beginDrain(/*deadlineSecs=*/5, "quit");
         g_server->stop();
     }
 }
@@ -142,8 +143,14 @@ static void trayStatusTick(hostd::Server* server) {
         ts = TrayStatus::Busy;
         // Bounded by CHUDWARE_HOSTD_DRAIN_GRACE_S for an explicit stop, and by the clients
         // actually working for the stale-binary self-drain — never open-ended.
-        std::snprintf(tip, sizeof tip, "Chudware hostd — shutting down (%d client%s)", clients,
-                      clients == 1 ? "" : "s");
+        if (server->drainReason() == "stale_binary")
+            std::snprintf(tip, sizeof tip,
+                          "Chudware hostd — engine changed; draining (%d client%s). "
+                          "Restart Chudware to load the new engine.",
+                          clients, clients == 1 ? "" : "s");
+        else
+            std::snprintf(tip, sizeof tip, "Chudware hostd — shutting down (%d client%s)",
+                          clients, clients == 1 ? "" : "s");
     } else if (eng == 0) {
         ts = TrayStatus::Busy;
         std::snprintf(tip, sizeof tip, "Chudware hostd — loading engine…");
@@ -381,9 +388,31 @@ static int stopViaPidfile(const std::string& reason) {
 }
 #endif
 
+// Pid of the live daemon that holds this instance, or 0. `--status` uses it to tell
+// "no daemon runs" from "a daemon runs but did not answer".
+static long recordedInstancePid() {
+    const std::string key = chudware_ipc::instanceKey(selfPath());
+#ifndef _WIN32
+    return readLockPid(chudware_ipc::lockPath(key));
+#else
+    long pid = 0;
+    HANDLE h = openRecordedHostd(pidFilePath(key), pid);
+    if (!h) return 0;
+    CloseHandle(h);
+    return pid;
+#endif
+}
+
+static std::string jsonString(const nlohmann::json& obj, const char* key) {
+    const auto it = obj.find(key);
+    return it != obj.end() && it->is_string() ? it->get<std::string>() : std::string();
+}
+
 // --status / --stop [--force]: attach-only client against the same instance key.
 // --stop falls back to the pidfile kill path when the socket/pipe is dead but the
-// process still holds the lock (wedged accept loop / half-dead daemon).
+// process still holds the lock (wedged accept loop / half-dead daemon). A draining
+// daemon admits control clients (Server::admitWhileDraining), so `--status` reports
+// the drain and `--stop` can turn a soft drain into a hard stop.
 static int controlCommand(const char* method,
                           const nlohmann::json& params = nlohmann::json::object(),
                           bool stopEscalation = false) {
@@ -395,6 +424,16 @@ static int controlCommand(const char* method,
     std::string err;
     if (!cli.connectOrSpawn(opts, err)) {
         if (stopEscalation) return stopViaPidfile(err);
+        if (const long pid = recordedInstancePid(); pid > 0) {
+            // An older daemon build closes every new connect while it drains, so a live
+            // pid that does not answer is not "no running instance".
+            std::fprintf(stderr,
+                         "chudware-hostd: daemon pid %ld is running but did not answer (%s). "
+                         "It can be draining after an engine rebuild. Restart Chudware to "
+                         "load the new engine.\n",
+                         pid, err.c_str());
+            return 1;
+        }
         std::fprintf(stderr, "chudware-hostd: no running instance (%s)\n", err.c_str());
         return 1;
     }
@@ -412,6 +451,14 @@ static int controlCommand(const char* method,
         return 1;
     }
     std::printf("%s\n", result.dump(2).c_str());
+    if (result.is_object() && result.value("draining", false)) {
+        const auto drain = result.find("drain");
+        const std::string message =
+            drain != result.end() && drain->is_object() ? jsonString(*drain, "message") : "";
+        std::fprintf(stderr, "chudware-hostd: daemon pid %ld is draining (%s). %s\n",
+                     result.value("pid", 0L), jsonString(result, "drain_reason").c_str(),
+                     message.c_str());
+    }
     return 0;
 }
 

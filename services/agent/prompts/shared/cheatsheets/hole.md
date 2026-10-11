@@ -6,6 +6,8 @@ refs.face is EASIEST as a plain-word geometry QUERY (no clicking, no coordinates
 
 POSITIONS without a sketch: pass params `positions`:[[u,v],...] — mm in the face's own frame, origin = face CENTRE. Omit positions entirely = ONE hole at the face centre. Use `positions_sketch` only when the points come from a real sketch.
 
+WORLD placement: pass params `world_points`:[[x,y,z],...] — world mm points on each bore's AXIS (on the face is clearest); the engine projects them along the face normal and reports how far it moved them. With a word query (`{"of":"face","side":"top"}`) each axis drills whichever face facing that way it hits first (e.g. several boss tops in one feature); with a picked/sid face the axis must hit that face. An axis that hits no such face is refused by name. Never send both `positions` and `world_points`.
+
 Example 0 (simplest) - one ⌀5 through-hole in the centre of the top face:
 [
  {"op":"add_feature","feature":{"type":"hole","name":"Bore","params":{"style":"simple","standard":"custom","diameter":{"value":5,"expr":null},"end":"through_all"},"refs":{"face":{"of":"face","side":"top"}}}}

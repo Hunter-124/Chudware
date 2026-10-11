@@ -122,8 +122,11 @@ def test_turntable_of_a_box_writes_a_gif_whose_frames_and_digest_are_reported(to
 
 
 @needs_engine
-def test_a_relative_save_path_is_refused_before_any_render(tools, tmp_path, monkeypatch):
+def test_a_relative_save_path_without_a_project_root_is_refused_before_any_render(
+        tools, tmp_path, monkeypatch):
     monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
     doc = json.loads(tools["new_part"](name="anim_relpath"))["doc_id"]
     res = tools["render_animation"](kind="turntable", doc_id=doc,
                                     save_path="films/turntable.gif", frames=4, fps=4)
@@ -681,6 +684,71 @@ def test_collision_legend_does_not_extend_a_first_hit_into_unmeasured_states():
     assert current is False
     measured["sample_collisions"] = [[], [{"a": "arm", "b": "frame"}], []]
     assert anim._collision_legend(measured, 2) == ("", False)
+
+
+def _two_tet_grid(pv):
+    import numpy as np
+    pts = np.array([[0.0, 0, 0], [10, 0, 0], [0, 10, 0], [0, 0, 10], [10, 10, 10]])
+    cells = np.hstack([[4, 0, 1, 2, 3], [4, 1, 2, 3, 4]])
+    return pv.UnstructuredGrid(cells, np.full(2, pv.CellType.TETRA), pts)
+
+
+def test_fea_cell_average_is_volume_weighted_over_retained_cells():
+    """Tet A (0,1,2,3) is 1000/6 mm3 and tet B (1,2,3,4) is 2000/6 mm3, so a shared node
+    carries (1*10 + 2*30) / 3; a cell with retained == 0 does not count."""
+    pv = pytest.importorskip("pyvista")
+    grid = _two_tet_grid(pv)
+    avg = anim._cell_to_point_average(grid, [10.0, 30.0])
+    assert avg[0] == pytest.approx(10.0) and avg[4] == pytest.approx(30.0)
+    for shared in (1, 2, 3):
+        assert avg[shared] == pytest.approx(70.0 / 3.0)
+    grid.cell_data["retained"] = [1, 0]
+    masked = anim._cell_to_point_average(grid, [10.0, 30.0])
+    assert list(masked) == pytest.approx([10.0, 10.0, 10.0, 10.0, 0.0])
+
+
+def test_fea_frames_film_a_cell_only_von_mises_warped_by_the_same_case(tmp_path):
+    """A topology reanalysis.vtu from before point stress: per-case von Mises only as cell
+    data. The film must still be built (cell-averaged, said so) and must warp LC2's stress
+    by LC2's displacement, not by the first displacement array in the file."""
+    pv = pytest.importorskip("pyvista")
+    import numpy as np
+    grid = _two_tet_grid(pv)
+    grid.point_data["displacement@LC1"] = np.tile([0.0, 0.0, 0.1], (5, 1))
+    grid.point_data["displacement@LC2"] = np.tile([0.0, 0.5, 0.0], (5, 1))
+    grid.cell_data["retained"] = np.array([1, 1], dtype=np.uint8)
+    grid.cell_data["von_mises@LC1"] = [2.0, 6.0]
+    grid.cell_data["von_mises@LC2"] = [10.0, 30.0]
+    vtu = tmp_path / "reanalysis.vtu"
+    grid.save(str(vtu))
+    out_dir = tmp_path / "frames"
+    out_dir.mkdir()
+    rec = anim._fea_frames(str(vtu), str(out_dir), 2, (160, 120), None, None,
+                           "von_mises@LC2")
+    assert rec["field"] == "von_mises@LC2"
+    assert rec["field_source"] == "cell_averaged"
+    assert "cell data" in rec["field_note"]
+    assert rec["displacement_field"] == "displacement@LC2"
+    assert rec["peak_disp_mm"] == pytest.approx(0.5)
+    assert rec["peak_field"] == pytest.approx(30.0)
+    assert len(rec["frames"]) == 2 and all(os.path.exists(p) for p in rec["frames"])
+
+
+def test_fea_field_prefers_point_data_and_refusal_names_the_fields():
+    pv = pytest.importorskip("pyvista")
+    import numpy as np
+    grid = _two_tet_grid(pv)
+    for case in ("LC1", "LC2"):
+        grid.point_data[f"von_mises@{case}"] = np.arange(5, dtype=float)
+        grid.point_data[f"displacement@{case}"] = np.zeros((5, 3))
+    assert anim._fea_field(grid, "von_mises@LC2") == \
+        ("von_mises@LC2", "displacement@LC2", "point")
+    with pytest.raises(ValueError, match=r"point fields: .*Set field to one of"):
+        anim._fea_field(grid, "von_mises")
+    bare = _two_tet_grid(pv)
+    bare.point_data["displacement"] = np.zeros((5, 3))
+    with pytest.raises(ValueError, match="run_fea_static"):
+        anim._fea_field(bare, "von_mises")
 
 
 if __name__ == "__main__":

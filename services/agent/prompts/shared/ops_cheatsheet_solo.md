@@ -47,6 +47,7 @@ hole — params {style:"simple"|"cbore"|"csink"|"tap", end:"through_all"|"blind"
         style:"tap"). For an "M3 clearance bore" just give {"standard":"M3"}.
         refs.face = {"of":"face","side":"top"}. Optional positions:[[u,v],..]; omit = centre.
         POSITIONS FRAME: origin = centroid of face outer boundary; u = +X in face; v = n×u.
+        Or world_points:[[x,y,z],..] (world mm on each bore axis; axis missing refs.face = refused).
 
 ----------------------------------------------------------------- DRESS
 fillet  params {radius} refs.edges = {"of":"edge", ...}   (omit filters = ALL edges)

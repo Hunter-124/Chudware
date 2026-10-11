@@ -15,6 +15,7 @@
 //   "ellipse", the Python's axis branch handles only GeomAbs_Line and GeomAbs_Circle,
 //   so an ellipse edge gets surf=="ellipse" but axis==nullopt. We match that exactly.
 #include "doc/selectors.h"
+#include "geom/face_normal.h"
 
 #include <algorithm>
 #include <cmath>
@@ -46,6 +47,8 @@
 #include <TopoDS_Vertex.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Ax3.hxx>
+#include <gp_Torus.hxx>
 
 namespace chudware::doc {
 
@@ -170,6 +173,25 @@ std::optional<bool> cylinder_face_concave(const TopoDS_Face& f) {
         return std::nullopt;
     }
 }
+
+std::optional<TopoInfo::Torus> face_torus(const TopoDS_Face& f) {
+    try {
+        BRepAdaptor_Surface sa(f);
+        if (sa.GetType() != GeomAbs_Torus) return std::nullopt;
+        const gp_Torus t = sa.Torus();
+        const gp_Ax3& pos = t.Position();
+        const auto axis = unit_axis(pos.Direction());
+        if (!axis) return std::nullopt;
+        TopoInfo::Torus out;
+        out.major_radius = t.MajorRadius();
+        out.minor_radius = t.MinorRadius();
+        out.axis = *axis;
+        out.center = Eigen::Vector3d(pos.Location().X(), pos.Location().Y(), pos.Location().Z());
+        return out;
+    } catch (const Standard_Failure&) {
+        return std::nullopt;
+    }
+}
 // --------------------------------------------------------------------------- describe_faces
 
 std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
@@ -191,31 +213,26 @@ std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
         Eigen::Vector3d centroid(cm.X(), cm.Y(), cm.Z());
 
         // Axis — plane normal, cylinder/cone axis only (matches the Python oracle).
-        // ORIENTATION FIX (Z2): OCCT's Plane().Axis().Direction() returns the plane's
-        // mathematical +Z direction (the surface's geometric normal) WITHOUT accounting
-        // for the face's topological orientation in the solid. A REVERSED face—like the
-        // bottom face of a box whose solid was built with outward-facing normals—has its
-        // outward material normal pointing OPPOSITE to the geometric plane normal. Without
-        // this flip, the top and bottom faces of a thin plate both store axis=[0,0,1] and
-        // the signed-normal tie-break in resolve() cannot distinguish them → "symmetric
-        // ambiguity" when trying to fixture the bottom face for FEA or query the bottom face.
-        // Flipping the stored axis so FORWARD=>geometry and REVERSED=>negated-geometry makes
-        // the axis a SIGNED outward normal: top=[0,0,+1] and bottom=[0,0,-1] for a Z-up plate.
-        // The resolution score uses |dot(sel_axis, cand_axis)| (sign-agnostic), so the
-        // flip does NOT change the score — it only arms the signed-dot tie-break that fires
+        // ORIENTATION FIX (Z2): OCCT's Plane().Axis().Direction() is the plane FRAME's Z,
+        // not the face's outward material normal: the face's topological orientation flips
+        // it (a box's REVERSED bottom face), and so does a LEFT-handed plane frame (every
+        // revolve end face — the x=0 end of a revolved shaft read +X). geom/face_normal.h
+        // applies both, so the stored axis is the SIGNED outward normal: top=[0,0,+1] and
+        // bottom=[0,0,-1] for a Z-up plate. Without it the top and bottom faces of a thin
+        // plate both stored axis=[0,0,1] and the signed-normal tie-break in resolve() could
+        // not distinguish them → "symmetric ambiguity" when fixturing the bottom face for
+        // FEA. The resolution score uses |dot(sel_axis, cand_axis)| (sign-agnostic), so the
+        // sign does NOT change the score — it only arms the signed-dot tie-break that fires
         // when two parallel faces otherwise score identically.
         std::optional<Eigen::Vector3d> axis;
         std::optional<Eigen::Vector3d> plane_axis;  // I3: signed outward plane normal
         std::optional<Eigen::Vector3d> axis_loc;    // I3: a point ON the cyl/cone axis
         std::optional<double> radius;               // GSL Stage 0: round-geometry size (mm)
         std::optional<bool> concave;
+        std::optional<Eigen::Vector3d> axis_point;  // cyl/cone: centroid's foot on the axis
         try {
             if (st == GeomAbs_Plane) {
-                gp_Dir plane_normal = adaptor.Plane().Axis().Direction();
-                // Reverse for REVERSED-orientation faces so the axis is the outward
-                // material normal (the direction the face "faces away from" the solid).
-                if (face.Orientation() == TopAbs_REVERSED) plane_normal.Reverse();
-                axis = unit_axis(plane_normal);
+                axis = unit_axis(::chudware::geom::plane_outward_normal(face, adaptor.Plane()));
                 plane_axis = axis;
             } else if (st == GeomAbs_Cylinder) {
                 gp_Ax1 ax = adaptor.Cylinder().Axis();
@@ -239,6 +256,8 @@ std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
             axis_loc = std::nullopt;
             radius = std::nullopt;
         }
+        if (axis && axis_loc)
+            axis_point = *axis_loc + *axis * (centroid - *axis_loc).dot(*axis);
 
         // I3 — representative outward direction for EVERY face (plane normal / cyl-cone
         // radial / outward-from-bbox-center). Wrapped in its own try so a kernel quirk on
@@ -267,6 +286,8 @@ std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
         info.rep_dir = rep_dir;
         info.radius = radius;
         info.concave = concave;
+        info.axis_point = axis_point;
+        info.torus = (st == GeomAbs_Torus) ? face_torus(face) : std::nullopt;
         result.push_back(std::move(info));
     }
     return result;
@@ -434,7 +455,8 @@ nlohmann::json make_selector(const TopoInfo& info) {
     // these; the scored fingerprint above is unchanged). `normal` is the SIGNED outward
     // direction (unlike unsigned `axis`, which collides on opposite faces); `side` is its
     // plain-word label; `concavity` separates a bore/hole from a boss/fillet; `radius` sizes
-    // round geometry. nulls where N/A (e.g. an oblique or non-round face).
+    // round geometry; `axis_point` is a point ON a cylinder/cone axis (the centroid's foot —
+    // `centroid` itself is off-axis on a fillet). nulls where N/A (e.g. an oblique face).
     sel["normal"] = info.rep_dir ? round_vec(*info.rep_dir) : nlohmann::json(nullptr);
     const auto sw = side_word(info.rep_dir);
     sel["side"] = sw ? nlohmann::json(*sw) : nlohmann::json(nullptr);
@@ -442,6 +464,16 @@ nlohmann::json make_selector(const TopoInfo& info) {
                                     : nlohmann::json(nullptr);
     sel["radius"] =
         info.radius ? nlohmann::json(round_clean(*info.radius)) : nlohmann::json(nullptr);
+    sel["axis_point"] =
+        info.axis_point ? round_vec(*info.axis_point) : nlohmann::json(nullptr);
+    // Torus faces only (sweep bends): the analytic surface `axis`/`radius` cannot carry
+    // without changing the scored fingerprint and the stable SID.
+    if (info.torus) {
+        sel["major_radius"] = round_clean(info.torus->major_radius);
+        sel["minor_radius"] = round_clean(info.torus->minor_radius);
+        sel["torus_axis"] = round_vec(info.torus->axis);
+        sel["torus_center"] = round_vec(info.torus->center);
+    }
     sel["sid"] = stable_sid(info);  // GSL W1 — a stable handle the LLM can refer back to
     return sel;
 }
@@ -567,9 +599,18 @@ ResolveResult resolve(const nlohmann::json& selector,
                       const std::vector<TopoInfo>& candidates, double bbox_diag) {
     const double INF = std::numeric_limits<double>::infinity();
 
-    std::string kind = selector.value("kind", std::string());
+    // A slot value that is not a measured topology selector (a bare string, a predicate-only
+    // object with no centroid) has nothing to score: name that instead of letting
+    // score_candidate's centroid read escape as a raw json exception.
+    if (!selector.is_object())
+        return ResolveResult{std::nullopt, INF, INF,
+                             "not a selector object (expected {\"kind\":…,\"centroid\":[x,y,z]} "
+                             "or a geometry query {\"of\":\"face\",…})"};
+    const auto kit = selector.find("kind");
+    std::string kind = (kit != selector.end() && kit->is_string()) ? kit->get<std::string>()
+                                                                    : std::string();
     std::optional<std::string> s_owner;
-    if (selector.contains("owner_feature") && !selector.at("owner_feature").is_null())
+    if (selector.contains("owner_feature") && selector.at("owner_feature").is_string())
         s_owner = selector.at("owner_feature").get<std::string>();
 
     // Step 1 — filter to same kind.
@@ -580,6 +621,14 @@ ResolveResult resolve(const nlohmann::json& selector,
     if (same_kind.empty()) {
         return ResolveResult{std::nullopt, INF, INF, "no candidates of matching kind"};
     }
+    const auto cit = selector.find("centroid");
+    if (cit == selector.end() || !cit->is_array() || cit->size() != 3 ||
+        !std::all_of(cit->begin(), cit->end(),
+                     [](const nlohmann::json& v) { return v.is_number(); }))
+        return ResolveResult{std::nullopt, INF, INF,
+                             "a '" + kind + "' selector without a measured centroid [x,y,z] — "
+                             "name it with a geometry query ({\"of\":\"" + kind +
+                             "\",\"side\":\"top\"}) or a query_geometry readback"};
 
     // Owner-filtered set with fallback to all same-kind (only when owner is non-null).
     std::vector<const TopoInfo*> working;

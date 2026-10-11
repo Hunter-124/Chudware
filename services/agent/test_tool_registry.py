@@ -145,3 +145,18 @@ def test_async_tool_guard():
     reg.set_policy(allow=["ecad_autoroute"])
     out = asyncio.run(stub.tools["ecad_autoroute"]())
     assert out["ran"] == "ecad_autoroute"
+
+
+def test_registration_description_reaches_the_callable_docstring():
+    """Host-tool loads read the callable's docstring; a tool described only by the
+    `description=` kwarg (the check_geometry_health aliases) advertised an empty
+    description and Chudcode refused the whole set_host_tools call, killing the turn."""
+    import inspect
+
+    stub = _StubMCP()
+
+    def alias(doc_id: str = "") -> dict:
+        return {"ok": True}
+
+    reg.view(stub, "cad").tool(name="alias", description="Alias of the health check.")(alias)
+    assert inspect.getdoc(stub.tools["alias"]) == "Alias of the health check."

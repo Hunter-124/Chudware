@@ -360,6 +360,35 @@ def test_workspace_copy_enforces_quota_without_partial_destination(
     assert (root / src).exists()
 
 
+@pytest.mark.parametrize("kind", ["file", "tree"])
+def test_workspace_copy_and_delete_preserve_source(client, kind):
+    root = _ws_user_root("alice@crimson.ua.edu")
+    root.mkdir(parents=True, exist_ok=True)
+    if kind == "file":
+        source = root / "source.bin"
+        destination = root / "copied.bin"
+        payload = source
+        copied_payload = destination
+    else:
+        source = root / "source"
+        destination = root / "copied"
+        payload = source / "nested" / "payload.bin"
+        payload.parent.mkdir(parents=True)
+        copied_payload = destination / "nested" / "payload.bin"
+    payload.write_bytes(b"workspace payload")
+
+    response = client.post(
+        "/workspace/copy", headers=A,
+        json={"src": source.name, "dst": destination.name, "recursive": True},
+    )
+    assert response.status_code == 200, response.text
+    assert copied_payload.read_bytes() == b"workspace payload"
+    response = client.post("/workspace/delete", headers=A, json={"path": destination.name})
+    assert response.status_code == 200, response.text
+    assert not destination.exists()
+    assert payload.read_bytes() == b"workspace payload"
+
+
 def test_user_slug_distinguishes_max_length_colliding_prefix_emails():
     prefix = "a" * 118
     first = f"{prefix}x@example.com"

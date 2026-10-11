@@ -805,10 +805,29 @@ vector<string> validate_geom_query(const json& q, const string& where) {
                     "(omit it to default to \"face\")"};
 }
 
-vector<string> validate_selector(const json& sel, const string& where) {
+// A stored mate ref ({component, selector}) is resolved by assembly.cpp::
+// selector_to_mategeom against that component's own topology, which reads only a face /
+// edge / vertex selector. The generic selector_forms() tail named queries, datum names,
+// f<N> ids and "$<N>" references, none of which this slot can store, so a live run (c250)
+// was taught a form that could never validate. Mate refs get this tail instead.
+const string& mate_ref_forms() {
+    static const string s =
+        " — a stored mate ref is {component, selector}. Its selector must be an engine "
+        "topology selector of that component: kind face, edge or vertex, with sid and "
+        "centroid. Do not write the selector yourself. Write "
+        "{\"component\":\"k1\",\"query\":{\"of\":\"face\",\"side\":\"top\"}} or "
+        "{\"component\":\"k1\",\"sid\":\"F2bb10f\"}. asm_mate and add_features "
+        "asm_add_mate resolve that ref to a selector. The query must match exactly one "
+        "face or edge. The component must exist before the call: a ref to a component "
+        "that the same batch adds is not resolved";
+    return s;
+}
+
+vector<string> validate_selector(const json& sel, const string& where,
+                                 const string& forms = selector_forms()) {
     vector<string> errs;
     if (!sel.is_object()) {
-        return {where + ": selector must be an object" + selector_forms()};
+        return {where + ": selector must be an object" + forms};
     }
     const json& kindj = get(sel, "kind");
     string kind = kindj.is_string() ? kindj.get<string>() : "";
@@ -817,14 +836,14 @@ vector<string> validate_selector(const json& sel, const string& where) {
             return {where + ": incomplete engine topology selector (kind must be one of " +
                     sorted_set_str(SELECTOR_KINDS) + ") — kind/sid/centroid describe real "
                     "B-rep topology and can only come from describe_part / query_geometry, "
-                    "not from a hand-written guess" + selector_forms()};
+                    "not from a hand-written guess" + forms};
         }
         // Name the offending value too — "not in [...]" alone hid a typo like plural
         // "faces" or wrong case "Face" behind an otherwise-correct-looking vocabulary list.
         string kgot = kindj.is_string() ? ("\"" + kind + "\"")
                       : kindj.is_null()  ? "absent"
                                         : "not a string";
-        return {where + ".kind: " + kgot + " not in " + sorted_set_str(SELECTOR_KINDS) + selector_forms()};
+        return {where + ".kind: " + kgot + " not in " + sorted_set_str(SELECTOR_KINDS) + forms};
     }
     if (kind == "datum") {
         const json& feat = get(sel, "feature");
@@ -849,8 +868,13 @@ vector<string> validate_selector(const json& sel, const string& where) {
             if (!is_vec(centroid, 2)) {
                 errs.push_back(where + ".centroid: region centroid must be [u,v]");
             }
-            if (!is_num(get(sel, "hint_index"))) {
-                errs.push_back(where + ".hint_index: required when a centroid is given");
+            // A centroid alone identifies a region: resolve_profile_faces takes the region
+            // whose centroid is nearest, and refuses an equidistant tie by name. hint_index
+            // is an OPTIONAL seed that breaks such a tie.
+            const json& hint = get(sel, "hint_index");
+            if (!hint.is_null() && !is_num(hint)) {
+                errs.push_back(where + ".hint_index: must be a number. Omit it to select "
+                                       "the region nearest the centroid");
             }
         }
         return errs;
@@ -870,7 +894,7 @@ vector<string> validate_selector(const json& sel, const string& where) {
                        "' selector needs centroid [x,y,z] (with its sid), which only the "
                        "engine can measure: call describe_part / query_geometry for a real "
                        "selector, or name the geometry with a query instead" +
-                       selector_forms());
+                       forms);
     }
     const json& surf = get(sel, "surf");
     if (kind == "face" && !surf.is_null()) {
@@ -898,6 +922,29 @@ vector<string> validate_selector(const json& sel, const string& where) {
         errs.push_back(where + ".owner_feature: must be a feature id or null");
     }
     return errs;
+}
+
+// mates[i].refs[j].selector. A ref that still carries the caller's `query` / `sid` reached
+// the engine unresolved (its component was added in the same batch, or the ref was not a
+// {component, query|sid} object when add_features read it); name that, not "selector
+// must be an object". A query or string in the selector slot names the operand key to use.
+vector<string> validate_mate_ref_selector(const json& ref, const string& rloc) {
+    const json& sel = get(ref, "selector");
+    const string where = rloc + ".selector";
+    if (sel.is_null()) {
+        for (const char* key : {"query", "sid"})
+            if (ref.contains(key))
+                return {rloc + ": the ref has a '" + key + "' that was not resolved to a "
+                        "selector" + mate_ref_forms()};
+        return {where + ": required" + mate_ref_forms()};
+    }
+    if (is_query_obj(sel))
+        return {where + ": a geometry query is not a stored selector. Put the query in "
+                "'query', not in 'selector'" + mate_ref_forms()};
+    if (sel.is_string())
+        return {where + ": a string is not a stored selector. Put a sid in 'sid', not in "
+                "'selector'" + mate_ref_forms()};
+    return validate_selector(sel, where, mate_ref_forms());
 }
 
 vector<string> validate_sel_or_datum(const json& v, const string& where) {
@@ -1480,6 +1527,27 @@ vector<string> validate_feature(const json& f, const string& where,
         auto se = validate_sketch3d_params(params, where + ".params", globals_names);
         errs.insert(errs.end(), se.begin(), se.end());
     }
+
+    // hole params.world_points: WORLD [x,y,z] mm points the compiler projects onto the
+    // resolved face frame (an optional param, so it is checked here, not in spec.params).
+    // It places the same holes positions/points do, so the two never travel together.
+    if (ftype == "hole" && params.contains("world_points") &&
+        !params["world_points"].is_null()) {
+        const json& wp = params["world_points"];
+        bool ok = wp.is_array() && !wp.empty();
+        if (ok) for (const json& p : wp) if (!is_vec(p, 3)) { ok = false; break; }
+        if (!ok)
+            errs.push_back(where + ".params.world_points: must be a non-empty list of world "
+                                   "points [[x, y, z], ...] in mm");
+        if (truthy(get(params, "positions")) || truthy(get(refs, "positions")) ||
+            truthy(get(refs, "points")))
+            errs.push_back(where + ".params.world_points: give positions/points (face-local "
+                                   "[u, v]) OR world_points (world [x, y, z]), not both");
+    }
+    // bolt_circle params.world_center: the ring centre as a WORLD [x,y,z] mm point.
+    if (ftype == "bolt_circle" && params.contains("world_center") &&
+        !params["world_center"].is_null() && !is_vec(params["world_center"], 3))
+        errs.push_back(where + ".params.world_center: must be a world point [x, y, z] in mm");
 
     if (ftype == "fillet" || ftype == "chamfer") {
         const json& typej = get(params, "type");
@@ -2132,12 +2200,16 @@ vector<string> validate_assembly(const json& doc) {
             for (size_t j = 0; j < refs.size(); ++j) {
                 const json& r = refs[j];
                 string rloc = loc + ".refs[" + std::to_string(j) + "]";
-                if (!r.is_object()) { errs.push_back(rloc + ": must be {component, selector}"); continue; }
+                if (!r.is_object()) {
+                    errs.push_back(rloc + ": must be an object, not a JSON " +
+                                   string(r.type_name()) + mate_ref_forms());
+                    continue;
+                }
                 const json& cj = get(r, "component");
                 if (!(cj.is_string() && comp_ids.count(cj.get<string>())))
                     errs.push_back(rloc + ".component: unknown '" +
                                    (cj.is_string() ? cj.get<string>() : cj.dump()) + "'");
-                auto se = validate_selector(get(r, "selector"), rloc + ".selector");
+                auto se = validate_mate_ref_selector(r, rloc);
                 errs.insert(errs.end(), se.begin(), se.end());
             }
             const json& valj = get(m, "value");
@@ -2233,6 +2305,88 @@ std::vector<std::string> feature_type_names() {
     for (const auto& kv : FEATURE_TYPES) out.push_back(kv.first);
     std::sort(out.begin(), out.end());
     return out;
+}
+
+// --------------------------------------------------------------------------- params
+
+// Param keys the compiler READS, per feature type. A key outside the set is inert: the
+// feature builds as if the key were absent, with ok:true. The 6-axis trace (2026-10-10)
+// sent extrude params.reverse:true on many cuts and pads; the engine reads `flip`, so
+// each one built the wrong way with no error. Only types listed here are checked.
+//
+// extrude: every key core/doc/document.cpp's extrude branch reads from the flattened
+// feature (params + refs), plus the keys the GUI Extrude form writes (host/src/ui/
+// pm_forms.cpp: offset2, end2_offset, which the Direction-2 conditions carry), plus
+// `suppressed` (compile_document reads it from the flattened feature for every type).
+// Ref-slot names are accepted in params too: normalize_feature flattens params and
+// refs into one dict, so the compiler reads them from either container.
+namespace {
+
+const std::map<string, std::set<string>> FEATURE_PARAM_KEYS = {
+    {"extrude", {"mode", "merge", "end", "depth", "mid_plane", "dir", "flip",
+                 "thin", "thin_thickness", "thin_side", "draft", "draft_outward",
+                 "start", "start_offset", "offset", "end_offset", "end2", "depth2",
+                 "offset2", "end2_offset", "suppressed"}},
+};
+
+// A short STE hint for an invented key whose intent is clear.
+string param_key_hint(const string& type, const string& key) {
+    if (type != "extrude") return {};
+    static const std::map<string, string> hints = {
+        {"reverse", "To extrude in the opposite direction, set \"flip\": true."},
+        {"reversed", "To extrude in the opposite direction, set \"flip\": true."},
+        {"reverse_direction", "To extrude in the opposite direction, set \"flip\": true."},
+        {"flip_direction", "To extrude in the opposite direction, set \"flip\": true."},
+        {"flipped", "To extrude in the opposite direction, set \"flip\": true."},
+        {"opposite", "To extrude in the opposite direction, set \"flip\": true."},
+        {"direction", "To extrude in the opposite direction, set \"flip\": true. "
+                      "To give a direction vector, use \"dir\": [x, y, z]."},
+        {"distance", "Give the extrude length in \"depth\"."},
+        {"length", "Give the extrude length in \"depth\"."},
+        {"height", "Give the extrude length in \"depth\"."},
+        {"extent", "Give the extrude length in \"depth\"."},
+        {"amount", "Give the extrude length in \"depth\"."},
+        {"thickness", "Give the extrude length in \"depth\". "
+                      "For a thin wall, use \"thin_thickness\"."},
+        {"symmetric", "To extrude on both sides of the sketch plane, set \"end\": \"mid_plane\"."},
+        {"midplane", "To extrude on both sides of the sketch plane, set \"end\": \"mid_plane\"."},
+        {"both_sides", "To extrude on both sides of the sketch plane, set \"end\": \"mid_plane\"."},
+        {"both_directions", "To extrude on both sides of the sketch plane, set \"end\": \"mid_plane\"."},
+        {"taper", "Give the draft angle in \"draft\"."},
+        {"taper_angle", "Give the draft angle in \"draft\"."},
+        {"draft_angle", "Give the draft angle in \"draft\"."},
+        {"operation", "Use \"mode\": \"boss\" or \"mode\": \"cut\"."},
+        {"boolean", "Use \"mode\": \"boss\" or \"mode\": \"cut\"."},
+        {"through_all", "Set \"end\": \"through_all\"."},
+    };
+    const auto it = hints.find(key);
+    return it == hints.end() ? string() : it->second;
+}
+
+}  // namespace
+
+std::vector<std::string> unknown_feature_params(const std::string& type,
+                                                const nlohmann::json& params) {
+    std::vector<std::string> errs;
+    const auto keys_it = FEATURE_PARAM_KEYS.find(type);
+    if (keys_it == FEATURE_PARAM_KEYS.end() || !params.is_object()) return errs;
+    std::set<string> accepted = keys_it->second;
+    const auto spec_it = FEATURE_TYPES.find(type);
+    if (spec_it != FEATURE_TYPES.end())
+        for (const RefSlot& slot : spec_it->second.refs) accepted.insert(slot.name);
+    string list;
+    for (const string& k : keys_it->second) list += (list.empty() ? "" : ", ") + k;
+    for (auto it = params.begin(); it != params.end(); ++it) {
+        // A null value sets nothing (edit_feature deletes the key with it).
+        if (it.value().is_null() || accepted.count(it.key())) continue;
+        string e = "params." + it.key() + ": " + type + " has no param \"" + it.key() +
+                   "\". The engine does not read it, so the op is refused.";
+        const string hint = param_key_hint(type, it.key());
+        if (!hint.empty()) e += " " + hint;
+        e += " " + type + " params: " + list + ".";
+        errs.push_back(std::move(e));
+    }
+    return errs;
 }
 
 // --------------------------------------------------------------------------- shape

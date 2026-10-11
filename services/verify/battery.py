@@ -74,16 +74,44 @@ _SOLID_CHECKS = frozenset({"eval_check", "is_manifold", "measure_part"})
 
 
 def _study_only_kinds(doc_id: Optional[str]) -> list[str]:
-    """Study types of a document that has studies but no features; else ``[]``."""
-    if _doc_features(doc_id):
-        return []
+    """Study types of a document that has studies and no solid geometry; else ``[]``.
+
+    Solid geometry is a feature, an assembly component, or a world solid. An assembly
+    has no features of its own: a features-only test called a 36-component arm assembly
+    with Motion studies "study-only" and skipped its solid checks (2026-10-10).
+    """
     try:
         from services.mcp import core_bridge as cb  # noqa: PLC0415
-        studies = (cb.call("sim_study_list", {"doc_id": doc_id or _cur_doc()}) or {}).get(
-            "studies") or []
+        did = doc_id or _cur_doc()
+        tree = (cb.call("doc_tree", {"doc_id": did}) or {}).get("tree") or {}
+        if tree.get("features") or tree.get("components"):
+            return []
+        if (cb.call("asm_world_bodies", {"doc_id": did, "explode": False}) or {}).get(
+                "bodies"):
+            return []
+        studies = (cb.call("sim_study_list", {"doc_id": did}) or {}).get("studies") or []
     except Exception:  # noqa: BLE001 — unreadable: score the checks as before
         return []
     return sorted({str(s.get("type") or "study") for s in studies if isinstance(s, dict)})
+
+
+def _measure_probe_chosen_by_battery(caller_kwargs: dict, call_kwargs: dict) -> bool:
+    """True when the battery, not the caller, set a measure_between endpoint.
+
+    A caller endpoint that only needed side-word normalization ("top face" -> "top")
+    stays the caller's choice.
+    """
+    return any(
+        call_kwargs.get(key) != _normalize_side_query(caller_kwargs.get(key))
+        for key in ("a_query", "b_query")
+    )
+
+
+def _is_ambiguous_ref_failure(result: dict) -> bool:
+    """True for the engine's structured "ref matched multiple elements" refusal."""
+    detail = result.get("detail")
+    return (result.get("ok") is False and isinstance(detail, dict)
+            and detail.get("reason") == "ambiguous")
 
 
 _VALID_SIDE_WORDS = frozenset({
@@ -1204,6 +1232,12 @@ GAP_FNS: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 # Score extraction from JSON return
 # ---------------------------------------------------------------------------
+# Binary checks whose `ok` means "the check ran to completion", not "the design passed".
+# The named field carries the pass verdict.
+_BINARY_VERDICT_FIELDS: dict[str, str] = {
+    "check_interference": "clear",
+}
+
 
 def _extract_score(check_name: str, reward_shape: str, result_json: str) -> tuple[float, list]:
     """Parse JSON return from a check function → (score 0..1, findings list)."""
@@ -1215,8 +1249,12 @@ def _extract_score(check_name: str, reward_shape: str, result_json: str) -> tupl
     findings: list[dict] = []
 
     if reward_shape == "binary":
-        score = 1.0 if r.get("ok", False) else 0.0
-        if not r.get("ok", False):
+        # For a check whose ok only means "the check ran", the verdict is a separate field.
+        verdict_field = _BINARY_VERDICT_FIELDS.get(check_name)
+        passed = bool(r.get("ok", False)) and (
+            verdict_field is None or r.get(verdict_field) is True)
+        score = 1.0 if passed else 0.0
+        if not passed:
             findings.append({
                 "check": check_name,
                 "ok": False,
@@ -1320,7 +1358,15 @@ def _extract_score(check_name: str, reward_shape: str, result_json: str) -> tupl
         # interface_check (T-BL49) reports a `findings` list of {severity, detail, fix, ...};
         # only severity=="fail" entries should drive the score/fail (warns are advisory). Other
         # findings-shaped checks use pairs/violations/etc. and every listed item counts.
-        if "findings" in r and isinstance(r.get("findings"), list):
+        if check_name == "interface_check" and r.get("ok") is not True:
+            # ok=false is a refusal or an error: the alignment was not checked.
+            score = 0.0
+            findings.append({
+                "check": check_name,
+                "ok": False,
+                "detail": r.get("error") or r.get("summary") or "interface_check did not run",
+            })
+        elif "findings" in r and isinstance(r.get("findings"), list):
             fails = [f for f in r["findings"]
                      if isinstance(f, dict) and f.get("severity") == "fail"]
             score = 1.0 if r.get("ok", not fails) and not fails else max(0.0, 1.0 - len(fails) * 0.1)
@@ -1415,6 +1461,7 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
             })
             continue
 
+        probe_chosen = False
         try:
             if module_key == "gap":
                 fn = GAP_FNS[fn_name]
@@ -1444,6 +1491,8 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
                     })
                     continue
                 call_kwargs = adapted or {}
+                probe_chosen = (name == "measure_between"
+                                and _measure_probe_chosen_by_battery(kwargs, call_kwargs))
                 result = fn(**call_kwargs)
         except Exception as e:
             result = json.dumps({"ok": False, "error": str(e)})
@@ -1459,6 +1508,26 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
                 "detail": parsed_early.get("skip_reason")
                 or parsed_early.get("summary")
                 or "skipped",
+            })
+            continue
+
+        # The battery chose the probe refs itself. If a ref matches more than one element,
+        # the probe has no single target: that is a battery selection problem, not a
+        # geometry failure (2026-10-10, 36-solid arm assembly). Report it, do not score it.
+        if probe_chosen and _is_ambiguous_ref_failure(parsed_early):
+            skipped.append(name)
+            findings.append({
+                "check": name,
+                "ok": True,
+                "skipped": True,
+                "not_evaluated": True,
+                "reason": "probe_ref_ambiguous",
+                "detail": (
+                    "Not evaluated. The battery selected a measure ref that matches more "
+                    "than one element. This result is not a geometry failure. To get a "
+                    "measurement, call measure_between with refs that each match one "
+                    "element. Engine message: " + str(parsed_early.get("error") or "")
+                ),
             })
             continue
 

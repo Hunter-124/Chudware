@@ -35,6 +35,7 @@
 | `side` | plain-word label of `normal` (Z-up: `top`/`bottom`/`right`/`left`/`front`/`back`); `null` for an oblique face with no dominant axis. The same vocabulary used to address geometry on input. |
 | `concavity` | round face only: `bore` (concave — a hole/void) vs `boss` (convex — a peg/fillet); `null` otherwise. Set on the query read-back; host-pick selectors leave it `null` (kernel helper is read-back-local). |
 | `radius` | radius (mm) of a cylinder/cone/sphere face or a circle edge; `null` otherwise. |
+| `axis_point` | cylinder/cone face only: the face centroid projected onto the surface axis — a point ON the axis (`centroid` is off-axis on a partial cylinder such as a fillet). `null` otherwise. |
 
 Special forms:
 - **datum**: `{"kind":"datum", "feature":"f2"}` — or a bare reserved id string (`plane.top`, …)
@@ -83,3 +84,63 @@ Same accept thresholds.
 - Pattern a cut, then edit seed → pattern children still resolve (inherited owner).
 - Two symmetric candidate faces → margin rule forces dangling rather than guessing
   (and `hint_index` rescue when owners match).
+
+## 6. Torus read-back (appended)
+
+Torus faces (sweep bends, revolved fillets) carry four additional informational fields on
+query/read-back selectors and host-pick selectors. They are emitted ONLY on torus faces
+(absent, not `null`, elsewhere); `resolve()` ignores them; `axis`/`radius` stay `null` on a
+torus, so the scored fingerprint, the `parallel`/`perpendicular` filters and the stable `sid`
+are unchanged. Like `axis_point`, they are excluded from persisted `face_appearances`
+fingerprints and are tolerated (ignored) when a match is handed back as a query.
+
+| field | meaning |
+|---|---|
+| `major_radius` | torus major radius (mm): axis to the tube centre circle — the bend's centreline radius |
+| `minor_radius` | torus minor radius (mm): the tube radius of that face (outer wall r_o, inner wall r_i) |
+| `torus_axis` | unit direction of the torus axis (the bend's rotation axis); sign as the kernel stores it |
+| `torus_center` | the torus origin: the bend centre, a point ON the torus axis |
+
+## 7. near: geometric distance (appended, 2026-10-09)
+
+A geometry query's `"near":[x,y,z]` (`core/doc/picks.cpp` `rank_near`, the ONE implementation:
+`doc_query`/`query_geometry`, feature refs, measure refs, mate/fixture faces and the engine's
+own centroid re-resolution all call `resolve_geom_query`) ranks the candidates left after
+`surf`/`parallel`/`perpendicular`/`side`/`pick`/`body_id` by
+
+    key = min( distance(point, trimmed sub-shape geometry), distance(point, centroid) )
+
+- The geometry distance is exact (BRepExtrema point→face/edge, honouring trims), so a point ON
+  the entity scores 0 even when its centroid is far away (the outer rim circle of a flange,
+  whose centroid is the axis point). Ranking by centroid alone picked a PCD bolt-hole edge.
+- The centroid term keeps the documented "hand a match back" workflow: a centroid read from
+  `describe_part`/`query_geometry` (or a resolved selector's `centroid`, which the engine
+  re-resolves this way) also scores 0, even for curved entities whose centroid is off-surface.
+- Ties: candidates whose key is within `max(1e-4 mm, 1e-6 × key)` of the best go to the one
+  with the nearer centroid, then to `TopExp::MapShapes` order. A point on the shared edge of
+  two faces therefore picks the face whose centroid is nearer; concentric circles/cylinders
+  sharing a centroid stay ambiguous — narrow them with `pick:"inner"|"outer"` or `surf`.
+- `count` (default 1) keeps that many, repeating the rule over the remaining candidates;
+  `index` then indexes this order.
+
+Changing this rule changes which entity a saved query resolves to, so it is a geometry-cache
+epoch (`contracts/stepplus.md` §12).
+
+## 8. Profile region picks (appended, 2026-10-10)
+
+This section extends §4. `resolve_profile_faces` implements it.
+
+- A `centroid` pick resolves to the region with the nearest (u,v) centroid. `hint_index` is a
+  seed. A closer region still wins.
+- `centroid` alone is a valid region selector; `hint_index` is optional. If `hint_index` is
+  present, it must be a number.
+- The pick fails the feature if the centroid is outside the bounding box of that region. The
+  box is grown by max(0.5 mm, 25% of its larger side).
+- The pick fails the feature if two picks at different centroids resolve to the same region.
+- Without `hint_index`, the pick fails the feature if two regions at different centroids are
+  at the same distance.
+- The error names `profile[i]` and the current region count.
+- A pick never moves silently to a different region.
+
+Before this rule, a pick snapped to the nearest surviving region and duplicates were dropped.
+A sketch edit that removed regions then removed cuts with `ok:true`.

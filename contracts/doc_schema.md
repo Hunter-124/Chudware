@@ -664,3 +664,10 @@ binds any missing legacy frames only in its private snapshot; it does not mutate
 the source document. A legacy file lacking this metadata cannot establish a lost
 original zero frame; first-observed binding preserves its existing interpretation,
 not an inferred design datum.
+
+## Sketch `fix` added by op (append-only, 2026-10-10)
+
+A `fix` constraint pins the entity at its authored coordinates. When `sketch_add_constraint`
+adds a `fix`, the op first moves the authored coordinates of every entity to the solved
+geometry (only if the sketch converges). Thus the fix locks the shape that the readback shows.
+A `fix` that comes in through `add_feature` or `edit_feature` keeps the authored coordinates.

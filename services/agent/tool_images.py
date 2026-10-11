@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -125,12 +127,8 @@ def image_refs(value: Any) -> list[dict[str, Any]]:
         if depth > 8:
             return
         if isinstance(node, Mapping):
-            path = node.get("path")
-            if (
-                str(node.get("kind") or "").strip().lower() == "image"
-                and isinstance(path, str)
-                and path
-            ):
+            if _is_image_ref(node):
+                path = node["path"]
                 if path not in seen:
                     seen.add(path)
                     found.append(dict(node))
@@ -143,6 +141,108 @@ def image_refs(value: Any) -> list[dict[str, Any]]:
 
     visit(value, 0)
     return found
+
+
+#: The clause ``cad_render_tools._render_save_note`` adds to a caption when the
+#: caller gave ``save_path``.
+_SAVED_CLAUSE = re.compile(r"saved: (?P<path>.+?) \(\d+ B, sha256 [0-9a-f]+\)")
+
+
+def image_result(value: Any) -> dict[str, Any] | None:
+    """The one mapping shape of a JSON-safe tool result that holds images, else None.
+
+    Render tools return ``[image, caption]``, a bare image, or images followed by text.
+    Eval code reads every CAD result as a mapping (``r.items()``, ``r["ok"]``), and a
+    list stopped it (c250: ``'list' object has no attribute 'items'`` after
+    ``render_part``). The mapping is::
+
+        {"ok": true, "caption": str,
+         "images": [{"kind": "image", "path", "mime", "width", "height"}],
+         "saved_path": str}   # saved_path only when the caption names a saved copy
+
+    A text member that is a JSON object (``review_drawing`` diagnostics) adds its keys,
+    and its ``ok`` replaces the default. The arg-note wrapper ``{"ok", "result": <image
+    result>, ...}`` becomes the same mapping plus the wrapper keys. A value with no image,
+    or with a member that is not an image, text or object, gives None: it stays as is.
+    """
+    if isinstance(value, Mapping):
+        if _is_image_ref(value):
+            return _image_mapping([value])
+        inner = value.get("result")
+        if _is_image_ref(inner):
+            inner = [inner]
+        shaped = _image_mapping(inner) if isinstance(inner, list) else None
+        if shaped is None:
+            return None
+        for key, item in value.items():
+            if key != "result" and key not in shaped:
+                shaped[key] = item
+        return shaped
+    if isinstance(value, list):
+        return _image_mapping(value)
+    return None
+
+
+def _is_image_ref(node: Any) -> bool:
+    return (
+        isinstance(node, Mapping)
+        and str(node.get("kind") or "").strip().lower() == "image"
+        and isinstance(node.get("path"), str)
+        and bool(node.get("path"))
+    )
+
+
+def _image_mapping(items: list[Any]) -> dict[str, Any] | None:
+    images: list[dict[str, Any]] = []
+    texts: list[str] = []
+    fields: dict[str, Any] = {}
+    for item in items:
+        if _is_image_ref(item):
+            images.append(_with_size(item))
+        elif isinstance(item, str):
+            obj = _json_object(item)
+            if obj is not None:
+                fields.update(obj)
+            elif item.strip():
+                texts.append(item.strip())
+        elif isinstance(item, Mapping):
+            fields.update(item)
+        else:
+            return None
+    if not images:
+        return None
+    caption = "\n".join(texts)
+    if not caption and isinstance(fields.get("caption"), str):
+        caption = fields["caption"]
+    shaped: dict[str, Any] = {"ok": True, **fields, "caption": caption, "images": images}
+    saved = _SAVED_CLAUSE.search(caption)
+    if saved is not None:
+        shaped["saved_path"] = saved.group("path")
+    return shaped
+
+
+def _json_object(text: str) -> dict[str, Any] | None:
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        obj = json.loads(stripped)
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _with_size(ref: Mapping[str, Any]) -> dict[str, Any]:
+    """*ref* plus the file's pixel ``width``/``height`` when its header can be read."""
+    described = dict(ref)
+    from PIL import Image, UnidentifiedImageError  # noqa: PLC0415
+
+    try:
+        with Image.open(described["path"]) as img:
+            described["width"], described["height"] = int(img.width), int(img.height)
+    except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError):
+        pass  # load_model_image names an unreadable image in the result
+    return described
 
 
 def load_model_image(path: str) -> ModelImage:

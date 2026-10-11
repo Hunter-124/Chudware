@@ -464,6 +464,100 @@ def test_persist_then_piping_load_round_trip_on_a_live_doc():
 
 
 @live
+def test_tee_per_path_constant_k_solves_reports_and_round_trips_the_study():
+    """F2 cooling-water shape: tee run K 0.38 / branch K 1.14 + K 5 valves, constant K.
+
+    Each fitting dP must equal K·ρ·v²/2 on the velocity of the pipe that carries it, and the
+    tee overrides must survive the persisted piping_network study (piping_load)."""
+    tools = _tools()
+    doc = cb.call("doc_new", {"kind": "part", "name": f"piping_tee_k_{uuid.uuid4().hex[:8]}"})[
+        "doc_id"]
+    spec = {"nps": 2, "schedule": "40", "material": "A106-B"}
+    try:
+        built = _live(_j(tools["piping_edit"](ops=[
+            {"op": "add_run", "path": [[0.0, 0.0, 0.0], [10_000.0, 0.0, 0.0]], **spec},
+            {"op": "add_run", "path": [[10_000.0, 0.0, 0.0], [25_000.0, 0.0, 0.0]], **spec},
+            {"op": "add_run", "path": [[10_000.0, 0.0, 0.0], [10_000.0, 20_000.0, 0.0]], **spec},
+        ], network="CW-1", doc_id=doc)))
+        assert built["ok"] is True, built
+        run_a, run_b = built["piping"]["runs"][1]["id"], built["piping"]["runs"][2]["id"]
+        (tee,) = [f for f in built["piping"]["fittings"] if f["type"] == "tee"]
+        assert tee["params"]["run_ids"][1] == run_a and tee["params"]["branch_run"] == run_b
+
+        # The benchmark model's first guesses are refused by name, listing the real keys.
+        refused = _j(tools["piping_edit"](ops=[{"op": "update_fitting", "id": tee["id"],
+                                                 "params": {"K_run": 0.38, "K_branch": 1.14}}],
+                                          network="CW-1", doc_id=doc))
+        assert refused["ok"] is False and refused["reason"] == "unknown_param", refused
+        assert "'K_run'" in refused["hint"] and "'K_branch'" in refused["hint"]
+        assert "k_model_run" in refused["hint"] and "k_model_branch" in refused["hint"]
+
+        valve = {"k_model": {"kind": "constant", "K": 5.0}}
+        edited = _live(_j(tools["piping_edit"](ops=[
+            {"op": "add_fitting", "type": "custom", "at": [24_000.0, 0.0, 0.0], "run_id": run_a,
+             "params": {**valve, "label": "BV-A"}},
+            {"op": "add_fitting", "type": "custom", "at": [10_000.0, 19_000.0, 0.0],
+             "run_id": run_b, "params": {**valve, "label": "BV-B"}},
+            {"op": "update_fitting", "id": tee["id"], "params": {
+                "k_model_run": {"kind": "constant", "K": 0.38},
+                "k_model_branch": {"kind": "constant", "K": 1.14}}},
+        ], network="CW-1", doc_id=doc)))
+        assert edited["ok"] is True and edited["saved_to_study"] is True, edited
+
+        rho, mu = 998.2, 0.001002
+        boundary = [{"at": [0.0, 0.0, 0.0], "pressure": 250.0},
+                    {"at": [25_000.0, 0.0, 0.0], "demand": 6.0},
+                    {"at": [10_000.0, 20_000.0, 0.0], "demand": 6.0}]
+        solved = _live(_j(tools["piping_solve"](doc="CW-1", boundary=boundary,
+                                                fluid={"rho": rho, "mu": mu},
+                                                network="CW-1", doc_id=doc)))
+        assert solved["ok"] is True and solved["converged"] is True, solved
+        links = {lk["id"]: lk for lk in solved["links"]}
+        assert links[run_a]["k_total"] == pytest.approx(5.38)
+        assert links[run_b]["k_total"] == pytest.approx(6.14)
+
+        bore_m = links[run_a]["id_mm"] / 1000.0
+        v = 6.0 / 3600.0 / (math.pi * bore_m ** 2 / 4.0)
+        q = 0.5 * rho * v * v                              # dynamic pressure, Pa
+        report = _live(_j(tools["piping_report"]()))
+        assert report["ok"] is True, report
+        rows = {seg["id"]: {b.get("fitting"): b for b in seg["breakdown"] if b.get("fitting")}
+                for seg in report["segments"]}
+        tee_a, tee_b = rows[run_a][tee["id"]], rows[run_b][tee["id"]]
+        assert tee_a["method"] == "k_model_run(constant)"
+        assert tee_b["method"] == "k_model_branch(constant)"
+        assert tee_a["dp_kpa"] * 1000.0 == pytest.approx(0.38 * q, rel=1e-3)
+        assert tee_b["dp_kpa"] * 1000.0 == pytest.approx(1.14 * q, rel=1e-3)
+        for run in (run_a, run_b):
+            (bv,) = [row for fid, row in rows[run].items() if fid != tee["id"]]
+            assert bv["dp_kpa"] * 1000.0 == pytest.approx(5.0 * q, rel=1e-3)
+
+        preview = _live(_j(tools["piping_fitting_k"](fitting=tee | {
+            "params": {**tee["params"], "k_model_run": {"kind": "constant", "K": 0.38},
+                       "k_model_branch": {"kind": "constant", "K": 1.14}}}, path="branch")))
+        assert preview["K"] == pytest.approx(1.14)
+        assert preview["paths"]["run"]["K"] == pytest.approx(0.38)
+
+        # save/reopen: the persisted network keeps the overrides and solves identically
+        pt._NETWORKS.clear()
+        pt._PIPING.update({"doc": None, "result": None, "network": None})
+        loaded = _j(tools["piping_load"](doc_id=doc, network="CW-1"))
+        assert loaded["ok"] is True, loaded
+        (saved_tee,) = [f for f in loaded["piping"]["fittings"] if f["id"] == tee["id"]]
+        assert saved_tee["params"]["k_model_run"] == {"kind": "constant", "K": 0.38}
+        assert saved_tee["params"]["k_model_branch"] == {"kind": "constant", "K": 1.14}
+        again = _live(_j(tools["piping_solve"](doc="CW-1", boundary=boundary,
+                                               fluid={"rho": rho, "mu": mu}, network="CW-1")))
+        assert {lk["id"]: lk["k_total"] for lk in again["links"]} == {
+            lid: lk["k_total"] for lid, lk in links.items()}
+    finally:
+        try:
+            cb.call("doc_close", {"doc_id": doc})
+        except Exception:
+            pass
+
+
+@live
 def test_vessel_size_envelope_matches_asme_viii_hand_calc():
     tools = _tools()
     res = _live(_j(tools["vessel_size"](inner_diameter_mm=1500.0, tan_tan_length_mm=3000.0,

@@ -22,9 +22,20 @@ bool aiActiveWorkPreviews();
 void setAiActiveWorkPreviews(bool on);
 
 // The AI workspace's selected nav view (0 Current Run, 1 Plan, 2 Activity, 3 Sessions,
-// 4 Insights, 5 Options), restored across restarts. Default 0.
+// 4 Insights, 5 Options, 6 Sub-agents), restored across restarts. Default 0. Append-only:
+// stored values keep their meaning.
 int  aiWorkspaceView();
 void setAiWorkspaceView(int v);
+
+// Sub-agents hub roster organization: false = flat list, true = grouped by owning session and
+// nested under parent agents. Default flat.
+bool aiSubagentHubByParent();
+void setAiSubagentHubByParent(bool on);
+
+// Sub-agents hub scope: the active project always; true additionally narrows it to the open
+// session (fails closed to an empty roster when that session is not the active project's).
+bool aiSubagentHubSessionOnly();
+void setAiSubagentHubSessionOnly(bool on);
 
 // One label set for the workspace-visibility knobs, shared by AI > Options and Settings > AI.
 namespace aiPrefCopy {

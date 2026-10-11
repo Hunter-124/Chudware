@@ -85,8 +85,10 @@ def _perp(p: Sequence[float], origin: Sequence[float], axis: Vec) -> float:
 class Cylinder:
     """One cylindrical wall of the reopened part (seam-split patches merged).
 
-    ``axis`` is canonical (largest component positive); ``point`` is the on-axis centroid
-    of the merged wall. ``length_mm`` is wall area / (2*pi*r), i.e. the axial length of a
+    ``axis`` is canonical (largest component positive); ``point`` is a point ON the axis
+    (the first patch's ``axis_point`` — the face centroid projected onto the axis; engines
+    that predate ``axis_point`` give the face centroid, which is on-axis only for a full
+    revolution). ``length_mm`` is wall area / (2*pi*r), i.e. the axial length of a
     full-revolution wall. ``ends`` are the axial coordinates (``dot(centre, axis)``) of the
     circular edges of the same radius that lie on this axis — a through hole has one at
     each face it opens on."""
@@ -151,7 +153,7 @@ def cylinders(ev: "Evidence") -> list[Cylinder]:
         kind = "bore" if f.get("concavity") in ("bore", "concave") else "boss"
         r = float(f["radius"])
         axis = canonical_axis(_v(f["axis"]))
-        c = _v(f["centroid"])
+        c = _v(f.get("axis_point") or f["centroid"])
         area = float(f.get("area_or_len") or 0.0)
         for g in groups:
             if (g["kind"] == kind and abs(g["r"] - r) < _SAME_RADIUS_MM
@@ -186,6 +188,46 @@ def spans(cyl: Cylinder, lo: float, hi: float, tol: float) -> bool:
     if s is None:
         return False
     return s[0] <= lo + tol and s[1] >= hi - tol and cyl.length_mm >= (hi - lo) - tol
+
+
+def spans_exactly(cyl: Cylinder, lo: float, hi: float, tol: float) -> bool:
+    """True when the wall runs EXACTLY [lo, hi]: end circles at both limits (none beyond)
+    and a full-revolution wall of that length — a step, counterbore or through-leg bore."""
+    s = cyl.span
+    if s is None:
+        return False
+    return (abs(s[0] - lo) <= tol and abs(s[1] - hi) <= tol
+            and abs(cyl.length_mm - (hi - lo)) <= tol)
+
+
+def circle_edges(ev: "Evidence") -> list[dict]:
+    """Every circular edge: {radius, centroid, axis (canonical)}. ``centroid`` is the circle
+    centre only for a FULL circle (a partial arc's centroid lies off its centre)."""
+    out = []
+    for e in _matches(ev, {"of": "edge", "surf": "circle"}):
+        if e.get("kind") != "edge" or e.get("radius") is None or e.get("centroid") is None:
+            continue
+        out.append({"radius": float(e["radius"]), "centroid": _v(e["centroid"]),
+                    "axis": canonical_axis(_v(e["axis"])) if e.get("axis") else None})
+    return out
+
+
+def arc_axis_point(face: dict, length: float, near: Sequence[float]) -> tuple[Vec, float]:
+    """Axis point of a PARTIAL cylindrical face (a fillet) of axial ``length``: the
+    doc_query centroid of an arc of angle t lies r*sin(t/2)/(t/2) off the axis along the
+    radial ``normal``. The normal's sign is not trusted, so of the two candidates the one
+    nearest ``near`` is returned, with the swept angle t in degrees."""
+    r = float(face["radius"])
+    c = _v(face["centroid"])
+    ax = unit(_v(face["axis"]))
+    n = _v(face["normal"])
+    t_n = _dot(n, ax)
+    n = unit((n[0] - t_n * ax[0], n[1] - t_n * ax[1], n[2] - t_n * ax[2]))
+    sweep = float(face.get("area_or_len") or 0.0) / (r * length)
+    d = r * math.sin(sweep / 2.0) / (sweep / 2.0) if sweep > 0 else r
+    cands = [(c[0] - s * d * n[0], c[1] - s * d * n[1], c[2] - s * d * n[2])
+             for s in (1.0, -1.0)]
+    return min(cands, key=lambda p: math.dist(p, near)), math.degrees(sweep)
 
 
 def along(cyls: Iterable[Cylinder], direction: Sequence[float],

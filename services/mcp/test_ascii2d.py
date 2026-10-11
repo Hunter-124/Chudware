@@ -360,6 +360,23 @@ def test_near_coincident_flagged():
     assert any(f["code"] == "near_coincident" for f in findings), findings
 
 
+def test_float_noise_endpoint_gap_is_coincident_not_near_coincident():
+    """2026-10-10 6-axis run: d=1e-11 mm endpoints gave 9 near_coincident warnings per
+    sketch. A gap at or below the kernel tolerance (1e-7 mm) is one point."""
+    def gap(d):
+        return [
+            {"id": "a", "type": "line", "p1": [0, 0], "p2": [10, 0]},
+            {"id": "b", "type": "line", "p1": [10 + d, 0.0], "p2": [10 + d, 5]},
+        ]
+
+    for noise in (1e-11, 1e-9, 5e-8):
+        findings = check_sketch_geometry(gap(noise))
+        assert not any(f["code"] == "near_coincident" for f in findings), (noise, findings)
+    findings = check_sketch_geometry(gap(1e-4))
+    near = [f for f in findings if f["code"] == "near_coincident"]
+    assert len(near) == 1 and near[0]["entities"] == ["a", "b"], findings
+
+
 # --------------------------------------------------------------------------- mutation readback
 
 

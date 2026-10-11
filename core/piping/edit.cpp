@@ -93,6 +93,25 @@ struct Editor {
         doc["fittings"].push_back(std::move(ft)); record(created,id);
         return id;
     }
+    // Refuse a params key the fitting type does not define instead of silently storing it.
+    // Null (delete) is always allowed; so is re-sending an already stored value unchanged,
+    // which keeps whole-params round trips of older documents editable.
+    static void check_param_keys(const std::string& type,const ojson& params,const ojson& current) {
+        const auto keys=fitting_param_keys(type);
+        std::string unknown;
+        for(auto it=params.begin();it!=params.end();++it) {
+            if(keys.count(it.key()) || it.value().is_null() ||
+               (current.is_object() && current.contains(it.key()) && current[it.key()]==it.value())) continue;
+            unknown+=(unknown.empty() ? "'" : ", '")+it.key()+"'";
+        }
+        if(unknown.empty()) return;
+        std::string accepted;
+        for(const auto& k:keys) accepted+=(accepted.empty() ? "" : ", ")+k;
+        std::string hint=type+" fitting has no parameter "+unknown+"; accepted keys: "+accepted;
+        if(type=="tee") hint+=". Per-path constant K: k_model_run / k_model_branch = {\"kind\":\"constant\",\"K\":<K>}";
+        else hint+=". A fixed loss coefficient is k_model = {\"kind\":\"constant\",\"K\":<K>}";
+        refuse("unknown_param",hint);
+    }
     std::string radius(const ojson& run) const {
         const auto spec=nearest_pipe(run["nps"],run.value("schedule",std::string("40")));
         const double od=spec.value("outer_dia",60.3);
@@ -308,6 +327,7 @@ struct Editor {
             const std::string type=op.at("type").get<std::string>();
             if(type!="valve" && type!="orifice" && type!="custom" && type!="reducer" && type!="flange")
                 refuse("invalid_params","add_fitting supports inline valve, orifice, custom, reducer, flange");
+            check_param_keys(type,op.value("params",ojson::object()),ojson::object());
             const V at=vec(op.at("at")); Projection nearest; std::string id;
             if(op.contains("run_id")) {
                 id=op["run_id"].get<std::string>(); nearest=project(at,doc["runs"][find("runs",id)]["path"]);
@@ -334,6 +354,7 @@ struct Editor {
             const auto previous_nps2=ft.value("nps2",ojson(nullptr));
             if(op.contains("params")) {
                 if(!op["params"].is_object()) refuse("invalid_params","params must be an object");
+                check_param_keys(ft["type"].get<std::string>(),op["params"],ft.value("params",ojson::object()));
                 for(auto it=op["params"].begin();it!=op["params"].end();++it)
                     if(it.value().is_null()) ft["params"].erase(it.key()); else ft["params"][it.key()]=it.value();
             }
@@ -419,7 +440,11 @@ struct Editor {
         for(const auto& ft:doc["fittings"]) {
             const auto p=ft.value("params",ojson::object());
             if(ft["type"]=="custom" && !p.contains("k_model")) refuse("invalid_k_model","custom fitting requires k_model");
-            if(p.contains("k_model")) {const auto errors=validate_k_model(p["k_model"]);if(!errors.empty()) refuse("invalid_k_model",errors.front());}
+            for(const char* key:{"k_model","k_model_run","k_model_branch"})
+                if(p.contains(key)) {
+                    const auto errors=validate_k_model(p[key],key);
+                    if(!errors.empty()) refuse("invalid_k_model",errors.front());
+                }
             if(ft["type"]=="orifice" && p.value("beta",ojson(nullptr)).is_null()) {
                 const auto pipe=nearest_pipe(ft["nps"],ft.value("schedule",std::string("40")));
                 if(p.value("bore_mm",ojson(nullptr)).is_number() && p["bore_mm"].get<double>()>=pipe.value("inner_dia",0.0))

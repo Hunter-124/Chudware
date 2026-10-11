@@ -16,6 +16,9 @@
 //                   hard-breaks. The retry exists because this decision is
 //                   latched for the whole process: a hostd that was merely
 //                   restarting at launch used to cost the entire session.
+//                   A `daemon_draining` hello refusal never falls back: daemon
+//                   mode stays on and maintainConnection() waits for the
+//                   draining hostd to exit (see daemonRefusal()).
 //
 // Threading: GUI document calls share their primary daemon connection and its
 // registry identity. Allowlisted document-free queries from background threads
@@ -33,8 +36,9 @@ namespace chudware_ipc { class EngineClient; }
 
 namespace engine {
 
-// True iff the daemon backend was selected AND connected at startup (resolved
-// once, thread-safe). False = legacy in-process libchudware.
+// True iff the daemon backend was selected at startup (resolved once, thread-safe):
+// connected, or refused by a draining hostd and waiting for it to exit. False = legacy
+// in-process libchudware.
 bool daemonMode();
 
 // True only when daemon mode was WANTED (no explicit CHUDWARE_ENGINE_DAEMON=0)
@@ -43,6 +47,12 @@ bool daemonMode();
 // unreachable" — the latter means this process cannot see documents owned by a
 // shared hostd, which is a user-visible defect worth surfacing.
 bool daemonUnavailable();
+
+// The `daemon_draining` hello error from the shared connection's last connect attempt
+// (Server::drainRefusal: reason, daemon_pid, active_clients, message, hint, ...), or
+// null. A draining hostd refuses every new non-control client until it exits; the GUI
+// shows this on its unreachable chip. Safe to call from any thread.
+nlohmann::json daemonRefusal();
 
 // The live daemon connection (nullptr unless daemonMode()). GUI-thread event
 // drain + daemon-only methods (attach_doc / edit_hold / subscribe) go here.
@@ -104,9 +114,10 @@ bool available();
 bool ensureLoaded(std::string& err);
 
 // GUI-thread daemon liveness: probes the socket and, when dead, attempts a
-// bounded reconnect with backoff (1s → 2s → 5s → every 10s). Connect-only —
-// never spawns; the operator (or another client) must bring hostd back.
-// InProc / non-daemon → Connected (no-op). Call once per frame from
+// bounded reconnect with backoff (1s → 2s → 5s → every 10s). After 3 failed
+// connects it spawns a new hostd, rate limited — never while a draining hostd
+// refuses this client (daemonRefusal()), because that daemon still holds the
+// instance lock. InProc / non-daemon → InProc (no-op). Call once per frame from
 // engineEventsTick before bootstrap/drain.
 enum class DaemonConnState { InProc, Connected, Unreachable };
 DaemonConnState maintainConnection();

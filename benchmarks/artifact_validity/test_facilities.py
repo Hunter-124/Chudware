@@ -543,5 +543,5 @@ def test_series_file_removed_after_save_fails(tools, tmp_path):
     path = build_f1(tools, tmp_path / "deliverable.step+")
     ev = build_evidence(path)
     st = next(s for s in ev.studies if s.get("type") == "hydraulic_circuit")
-    Path(st["results"]["simulate"]["series_path"]).unlink()
+    fac.series_file_path(ev, st["results"]["simulate"]["series_path"]).unlink()
     assert fac.f1_series_file(ev).status is Status.FAIL

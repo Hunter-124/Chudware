@@ -26,7 +26,9 @@ Reuse, not fork (binding, from the task):
 JSON CONTRACT  (interface_check return — consumed by T-BL50; keep stable)
 --------------------------------------------------------------------------------------------
 {
-  "ok": bool,                     # True iff NO finding has severity "fail"
+  "ok": bool,                     # True when the check ran; ok=false only for a refusal/error
+  "status": "pass"|"fail"|"skip", # the verdict: "fail" iff a finding has severity "fail";
+                                  # "skip" when no component pair was compared
   "doc_id": str,
   "tool": "interface_check",
   "version": 1,
@@ -206,7 +208,7 @@ def _planar_faces_for_body(cb, doc_id: str, body_id: int) -> list[dict]:
 def _cylinders_from_faces(round_faces: list[dict]) -> tuple[list[dict], list[dict]]:
     """Split cylindrical faces into (bores, bosses) — concave holes vs convex shafts/bosses.
 
-    Each record carries the axis direction, a point on the axis (centroid), radius/diameter,
+    Each record carries the axis direction, a point on the geometric axis, radius/diameter,
     and `kind` ("bore"|"boss"). Faces of the SAME cylinder split by seams are merged by
     near-collinear axis + equal radius. Bores drive hole-pattern + fastener checks; bores AND
     bosses drive coaxiality (a boss/shaft on one component seating into a bore on the other)."""
@@ -217,7 +219,10 @@ def _cylinders_from_faces(round_faces: list[dict]) -> tuple[list[dict], list[dic
         is_bore = concavity in ("bore", "concave")
         target = bores if is_bore else bosses
         axis = _unit(_v(f.get("axis", [0, 0, 1])))
-        centroid = _v(f.get("centroid", [0, 0, 0]))
+        # A partial cylindrical surface's area centroid is not on its cylinder axis.
+        # Keep the public record shape, but use the kernel's actual axis point for all
+        # axis comparisons and seam merging.
+        centroid = _v(f["axis_point"])
         radius = float(f.get("radius", 0.0))
         merged = False
         for h in target:
@@ -513,7 +518,8 @@ def run_interface_check(
         wb = cb.call("asm_world_bodies", {"doc_id": d, "explode": False})
         bodies = wb.get("bodies", [])
         if len(bodies) < 2:
-            return _dumps({"ok": True, "doc_id": d, "tool": "interface_check", "version": 1,
+            return _dumps({"ok": True, "status": "skip", "doc_id": d, "tool": "interface_check",
+                           "version": 1,
                            "components": [{"id": b.get("component") or b.get("name"),
                                            "name": b.get("name"), "bbox": b.get("bbox")}
                                           for b in bodies],
@@ -633,7 +639,8 @@ def run_interface_check(
                                  "a_name": a["name"], "b_name": b["name"], "checks": checks})
 
         fails = [f for f in all_findings if f["severity"] == "fail"]
-        ok = len(fails) == 0
+        # An alignment failure is a finding, not a tool failure: ok stays true.
+        status = "fail" if fails else ("pass" if pairs_to_check else "skip")
         # The scope the verdict covers is part of the verdict. Without it a caller who left a
         # scratch body in the document reads "All 1 interface(s) aligned" and cannot tell that
         # the tool weighed 5 bodies, nor which pairing rule produced the pairs it reports.
@@ -645,7 +652,7 @@ def run_interface_check(
             summary = ("No adjacent component pairs found within proximity_mm "
                        f"({proximity_mm} mm) among the {len(comp_meta)} bodies of this "
                        "document — name components=[a,b] to force a check.")
-        elif ok:
+        elif not fails:
             summary = (f"All {len(pairs_to_check)} interface(s) aligned "
                        f"({len(all_findings)} advisory note(s)). {scope}")
         else:
@@ -654,7 +661,7 @@ def run_interface_check(
                        + "; ".join(sorted({f['check'] for f in fails})) + f". {scope}")
 
         return _dumps({
-            "ok": ok, "doc_id": d, "tool": "interface_check", "version": 1,
+            "ok": True, "status": status, "doc_id": d, "tool": "interface_check", "version": 1,
             "components": [{"id": c["id"], "name": c["name"], "bbox": c["bbox"]} for c in comp_meta],
             "body_count": len(comp_meta), "pair_selection": pair_selection,
             "pairs": pair_results, "findings": all_findings,
@@ -703,9 +710,12 @@ def register_interface_check_tools(mcp: "FastMCP") -> None:
           proximity_mm: bbox adjacency gap for auto-pair detection (default 2.0 mm).
 
         Returns a STABLE JSON verdict (tool="interface_check", version 1) with per-pair `checks`
-        and a flat `findings` list. ok=False iff any finding is severity "fail". See `scope_note`
-        for what v1 does NOT infer. This is the ALIGNMENT complement to check_interference (clash),
-        not a replacement — run both.
+        and a flat `findings` list. `status` is the verdict: "fail" when a finding has severity
+        "fail", "pass" when every checked pair aligns, "skip" when no pair was compared. A
+        misalignment is a finding, so ok stays true. ok=false means the call was refused (bad
+        or unknown components) or could not run. See `scope_note` for what v1 does NOT infer.
+        This is the ALIGNMENT complement to check_interference (clash), not a replacement — run
+        both.
         """
         return run_interface_check(doc_id=doc_id, components=components,
                                    fastener=fastener, proximity_mm=proximity_mm)

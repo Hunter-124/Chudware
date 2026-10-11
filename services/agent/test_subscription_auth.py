@@ -172,13 +172,14 @@ def test_anthropic_billing_suffix_3hex(tmp_config):
     assert len(p._billing_suffix("hi")) == 3
 
 
-# ── Anthropic request body shape (Opus-4.8 safe, CCH patched) ───────────────
+# ── Anthropic request body shape (adaptive models, CCH patched) ──────────────
 
-def test_anthropic_body_is_opus48_safe_and_cch_patched(tmp_config, monkeypatch):
+@pytest.mark.parametrize("model", ["claude-opus-4-8", "claude-opus-5-5", "claude-haiku-5-5"])
+def test_anthropic_body_is_adaptive_safe_and_cch_patched(tmp_config, monkeypatch, model):
     from services.agent.providers.anthropic_sub_provider import AnthropicSubProvider
     from services.agent.providers import base
 
-    p = AnthropicSubProvider()
+    p = AnthropicSubProvider(model=model)
     p._cred = {"access_token": "t", "refresh_token": "r",
                "expires_at_ms": time.time() * 1000 + 10 ** 9}
 
@@ -187,13 +188,21 @@ def test_anthropic_body_is_opus48_safe_and_cch_patched(tmp_config, monkeypatch):
     def fake_post_once(body_str, cch):
         captured["body"] = body_str
         captured["cch"] = cch
-        return {"content": [{"type": "text", "text": "ok"}]}
+        return {"content": [
+            {"type": "thinking", "thinking": "", "signature": "signed"},
+            {"type": "text", "text": "ok"},
+        ]}
 
     monkeypatch.setattr(p, "_post_once", fake_post_once)
-    text, _ = p.complete_ex("sys", [base.user([base.text_part("hello")])])
+    text, thinking = p.complete_ex("sys", [base.user([base.text_part("hello")])])
     assert text == "ok"
+    assert thinking == ""
     body = captured["body"]
-    # Adaptive thinking, NOT budget_tokens (would 400 on Opus 4.8).
+    parsed = json.loads(body)
+    assert parsed["model"] == model
+    for field in ("temperature", "top_p", "top_k"):
+        assert field not in parsed
+    # Adaptive thinking, NOT budget_tokens (would 400 on modern Claude).
     assert '"thinking":{"type":"adaptive"}' in body
     assert "budget_tokens" not in body
     # Compact JSON (no delimiter whitespace) to match the reference client byte-for-byte:

@@ -999,10 +999,26 @@ class TestRenderSavePath:
         assert f"({len(saved)} B, sha256 " in caption
         assert hashlib.sha256(saved).hexdigest()[:12] in caption
 
-    def test_save_path_must_be_absolute_and_inside_the_project(self, monkeypatch, tmp_path):
+    def test_relative_save_path_is_project_root_relative(self, monkeypatch, tmp_path):
+        """A relative save_path resolves against the project root, as in save_part and
+        asm_add_component, and the caption reports the absolute file it wrote."""
+        self._seams(monkeypatch, tmp_path)
+        monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+        monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+        monkeypatch.chdir(tmp_path.parent)  # the process cwd is never the base
+        _img, caption = self._tool("render_part")(doc_id="doc-test",
+                                                  save_path="scratch/smoke/shaft.png")
+        out = tmp_path / "scratch" / "smoke" / "shaft.png"
+        assert out.exists(), caption
+        assert f"saved: {out} (" in caption
+
+    def test_save_path_needs_a_root_and_must_stay_inside_the_project(
+            self, monkeypatch, tmp_path):
         self._seams(monkeypatch, tmp_path)
         render_part = self._tool("render_part")
-        with pytest.raises(ValueError, match="ABSOLUTE"):
+        monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+        monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+        with pytest.raises(ValueError, match="no project root.*Pass an ABSOLUTE save_path"):
             render_part(doc_id="doc-test", save_path="figures/iso.png")
         outside = tmp_path.parent / "elsewhere" / "iso.png"
         with pytest.raises(ValueError, match="outside this session's project"):

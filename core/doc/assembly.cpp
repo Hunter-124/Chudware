@@ -481,10 +481,28 @@ std::string component_cache_key(const std::string& abspath) {
 
 std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
                                                      const std::string& base_dir) {
+    // A relative source needs a base folder (the assembly file's folder, else the project
+    // folder). Without one, refuse: the process cwd has no relation to the project.
+    if (std::filesystem::path(path).is_relative() && base_dir.empty())
+        throw OpError("component_source_unresolved",
+                      "component source '" + path + "' is a relative path. The assembly has "
+                      "no file and no project folder to resolve it. Give an absolute path, "
+                      "or save the assembly first.",
+                      {{"path", path}, {"reason", "no base folder"}});
     // Preserve the caller's directory when resolving a symlinked assembly's
     // relative children. Canonical identity is only for cycle detection.
     const std::string abspath = std::filesystem::absolute(
         resolve_source_path(path, base_dir)).string();
+    if (!std::filesystem::exists(abspath)) {
+        std::string message = "component source file does not exist: " + abspath + ".";
+        if (std::filesystem::path(path).is_relative())
+            message += " The stored path '" + path + "' is relative to the base folder '" +
+                       base_dir + "'.";
+        message += " Give the absolute path of an existing file.";
+        throw OpError("component_source_missing", message,
+                      {{"path", path}, {"resolved", abspath},
+                       {"base", base_dir.empty() ? json(nullptr) : json(base_dir)}});
+    }
     const std::string canonical = std::filesystem::weakly_canonical(abspath).string();
     if (std::find(loading_paths.begin(), loading_paths.end(), canonical) != loading_paths.end())
         throw OpError("import_failed", "cyclic component reference: " + canonical,
@@ -885,6 +903,35 @@ std::vector<AsmBodyOut> compile_component_patterns(
     return instances;
 }
 
+// Why mate ref `i` did not resolve, named by index and component. Mirrors the wording of
+// core/mate/mate.cpp unresolved_ref_reason, which names only refs[0] and refs[1]: an extra
+// ref (index >= 2) that dangles made the mate unresolved with no reason (generic "mate
+// references could not be resolved").
+std::string dangling_ref_reason(const json& ref, int i, bool component_loaded) {
+    const std::string at = "refs[" + std::to_string(i) + "]";
+    const std::string cid = ref.is_object() && ref.contains("component") &&
+                                    ref["component"].is_string()
+        ? ref["component"].get<std::string>() : std::string();
+    if (cid.empty()) return at + " names no component";
+    if (!component_loaded)
+        return at + " component '" + cid + "' is not in the solve. The component is "
+               "missing, suppressed, or its source did not load";
+    const json sel = ref.contains("selector") ? ref["selector"] : json(nullptr);
+    if (!sel.is_object()) return at + " on component '" + cid + "' has no selector object";
+    const std::string kind = sel.contains("kind") && sel["kind"].is_string()
+        ? sel["kind"].get<std::string>() : std::string();
+    const std::string sid = sel.contains("sid") && sel["sid"].is_string()
+        ? sel["sid"].get<std::string>() : std::string();
+    if (kind != "face" && kind != "edge" && kind != "vertex")
+        return at + " on component '" + cid + "' has selector kind '" + kind +
+               "'. A mate ref needs a face, edge or vertex selector";
+    return at + " " + kind + (sid.empty() ? "" : " '" + sid + "'") +
+           " did not resolve on component '" + cid + "'. No " + kind +
+           " of that component matches the stored selector, or its surface type changed. "
+           "This occurs when the component geometry changed after the mate was made. "
+           "Make the mate again with asm_mate and {component, query}";
+}
+
 }  // namespace
 
 AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
@@ -995,6 +1042,8 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
     // --- resolve mate refs to local-frame MateGeom ----------------------
     chudware::mate::ResolvedGeometry resolved_geometry;
     std::map<std::string, std::vector<std::string>> dangling;  // mate_id -> refs[i] strings
+    // mate_id -> (ref index, named reason) for each dangling ref
+    std::map<std::string, std::vector<std::pair<int, std::string>>> dangling_why;
     for (const json& mate : mates) {
         if (mate.value("suppressed", false)) continue;
         const std::string mid = mate.value("id", std::string());
@@ -1009,11 +1058,13 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
                                                                             : json(nullptr);
             if (lit == loaded.end() || !sel_obj.is_object()) {
                 dangling[mid].push_back("refs[" + std::to_string(i) + "]");
+                dangling_why[mid].emplace_back(i, dangling_ref_reason(ref, i, lit != loaded.end()));
                 continue;
             }
             chudware::mate::MateGeom geom;
             if (!selector_to_mategeom(sel_obj, *lit->second, geom)) {
                 dangling[mid].push_back("refs[" + std::to_string(i) + "]");
+                dangling_why[mid].emplace_back(i, dangling_ref_reason(ref, i, true));
                 continue;
             }
             resolved_geometry[{mid, i}] = geom;
@@ -1091,6 +1142,15 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
         if (rit != mate_residual.end()) st.residual = rit->second;
         auto dit = dangling.find(m.mate_id);
         if (dit != dangling.end()) {
+            // The solver names refs[0]/refs[1] when it marks the mate unresolved. A dangling
+            // extra ref (index >= 2) is known only here, so name every ref the reason lacks.
+            // A solver reason for any other status no longer applies to an unresolved mate.
+            const bool solver_named_pair = m.status == "unresolved" && !m.reason.empty();
+            if (!solver_named_pair) st.reason.clear();
+            for (const auto& [index, why] : dangling_why[m.mate_id]) {
+                if (solver_named_pair && index < 2) continue;
+                st.reason += (st.reason.empty() ? "" : "; ") + why;
+            }
             st.status = "unresolved";
             st.dangling_refs = dit->second;
         }

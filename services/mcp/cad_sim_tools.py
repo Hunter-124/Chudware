@@ -5,6 +5,7 @@ from __future__ import annotations
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
 from typing import Optional
 from typing import Union
+import copy
 import math
 import os
 import re
@@ -16,6 +17,7 @@ from .cad_common import (
     coerce_json_or_repr,
     require_list,
     require_mapping,
+    resolve_agent_path,
     _autosave_all_open,
     _canonical_material_keys,
     _default_conductivity,
@@ -41,6 +43,7 @@ from .cad_common import (
     cb,
 )
 from services.sim import jobs as simjobs
+from . import cad_common as _cad_jobs
 
 
 # ------------------------------------------------------- boundary-condition dialect (live fix)
@@ -1307,21 +1310,15 @@ def _norm_vtu_path(vtu_path) -> Optional[str]:
     """Validate an optional VTU output request before any solve starts.
 
     The engine creates the parent directories and fails the whole run on a write error
-    rather than reporting a partial success, so the only thing to check here is that the
-    caller really gave an absolute path — a relative one would land in whatever directory
-    the engine process happens to sit in, which is not a releasable artifact path.
+    rather than reporting a partial success. The engine process has its own cwd, so a
+    relative path is resolved here against the project root (`resolve_agent_path`, the
+    same rule as save_part); with no project root it is refused. The reply then names
+    the absolute file that the engine writes.
 
     Pure: an existing file at that path is protected by `_archive_existing_vtu()`, which
     a caller runs only once the whole setup has passed validation.
     """
-    if vtu_path is None:
-        return None
-    if not isinstance(vtu_path, str) or not vtu_path.strip():
-        raise ValueError("vtu_path must be a non-empty absolute filesystem path.")
-    vtu_path = vtu_path.strip()
-    if not os.path.isabs(vtu_path):
-        raise ValueError(f"vtu_path must be ABSOLUTE, got {vtu_path!r}.")
-    return vtu_path
+    return _norm_abs_out_path(vtu_path, "vtu_path")
 
 
 def _archive_existing_vtu(vtu_path: Optional[str], notes: Optional[list] = None) -> None:
@@ -1347,15 +1344,10 @@ def _archive_existing_vtu(vtu_path: Optional[str], notes: Optional[list] = None)
 
 
 def _norm_abs_out_path(path, arg_name: str) -> Optional[str]:
-    """The same absolute-path contract as _norm_vtu_path, for any solver output file."""
+    """The absolute form of an optional solver output path (relative = project-root)."""
     if path is None:
         return None
-    if not isinstance(path, str) or not path.strip():
-        raise ValueError(f"{arg_name} must be a non-empty absolute filesystem path.")
-    path = path.strip()
-    if not os.path.isabs(path):
-        raise ValueError(f"{arg_name} must be ABSOLUTE, got {path!r}.")
-    return path
+    return resolve_agent_path(path, arg_name)
 
 
 # The `mesh_fineness` default every static-shaped entry point declares. An explicit
@@ -2900,6 +2892,184 @@ def _run_solve(
     return solve_durable_or_handoff(kind, stage, payload, meta)
 
 
+# ---------------------------------------------- in-process (thread) jobs behind the sim_* tools
+#: cad_common._start_job mints ``job-<hex>`` for work that runs as a DRIVER THREAD in this
+#: server process rather than as a durable ``sim-*`` child process. Simulation tools hand
+#: those ids out too (the convergence ladder driver, the motion->FEA position sweep), so
+#: sim_results/sim_status resolve them from the same table get_job reads — an id a sim
+#: tool returned must never come back "unknown" from the sim tools.
+_THREAD_JOB_PREFIX = "job-"
+_THREAD_SIM_KINDS = frozenset({"fea_convergence", "motion_fea_sweep"})
+_THREAD_STATES = {"running": simjobs.RUNNING, "done": simjobs.DONE, "error": simjobs.FAILED}
+
+
+def _thread_job(job_id) -> Optional[dict]:
+    """A consistent copy of an in-process job's record (sim states), or None if absent."""
+    if not isinstance(job_id, str) or job_id.startswith(_cad_jobs._DURABLE_JOB_PREFIX):
+        return None
+    with _cad_jobs._JOB_LOCK:
+        job = _cad_jobs._JOBS.get(job_id)
+        if job is None:
+            return None
+        snap = dict(job)
+        # The ladder driver mutates its progress (and the leg-id list in it) in place.
+        progress = copy.deepcopy(job.get("progress") or {})
+    started = snap.get("started_at") or time.time()
+    end = snap.get("done_at") or time.time()
+    out = {
+        "job_id": job_id,
+        "kind": snap.get("kind"),
+        "state": _THREAD_STATES.get(snap.get("status"), str(snap.get("status"))),
+        "durable": False,
+        "started_at": snap.get("started_at"),
+        "done_at": snap.get("done_at"),
+        "elapsed_s": round(float(end) - float(started), 3),
+        "progress": progress,
+        "result": snap.get("result"),
+        "error": snap.get("error"),
+    }
+    out.update({key: snap[key] for key in ("code", "detail") if key in snap})
+    return out
+
+
+def _unknown_thread_job(job_id: str) -> dict:
+    """The honest miss for a ``job-*`` id: a lost in-process driver, not a sim registry row."""
+    ttl_min = _cad_jobs._JOB_DONE_TTL_S / 60.0
+    return {
+        "ok": False,
+        "job_id": job_id,
+        "state": "unknown",
+        "error": (
+            f"No background job {job_id!r} in this MCP server process. job-* ids are "
+            "in-process driver jobs (run_fea_convergence's ladder, "
+            "motion_fea_handoff_sweep, background add_features), not rows of the durable "
+            "sim registry: they exist only in the server process that started them, and a "
+            f"finished one can be dropped once it has been done for {ttl_min:.0f} min. A "
+            "restarted server loses the driver but not a ladder's legs — those are durable "
+            "sim-* jobs: sim_jobs() lists them and run_fea_convergence(job_ids=[...]) "
+            "rebuilds the table from the ones that finished."
+        ),
+    }
+
+
+def _thread_job_results(job: dict, partial: bool) -> dict:
+    """sim_results for an in-process job: the same refuse/partial/converged contract."""
+    job_id, state, progress = job["job_id"], job["state"], job["progress"]
+    if partial:
+        base = {
+            "job_id": job_id,
+            "state": state,
+            "partial": True,
+            "converged": False,
+            "elapsed_s": job["elapsed_s"],
+        }
+        if not progress:
+            base.update(
+                ok=False,
+                error=(
+                    f"no partial results exist for {job_id}: the {job['kind']} job "
+                    "published no intermediate state. This is NOT an empty result — "
+                    "nothing has been computed to report yet."
+                ),
+            )
+            return base
+        base.update(
+            ok=True,
+            progress=progress,
+            snapshot={"partial": True, **progress},
+            warning=(
+                "PARTIAL SNAPSHOT — this is the job's last progress record, NOT a "
+                "converged solution. Do not quote it as a result."
+            ),
+        )
+        if state == simjobs.DONE:
+            base["note"] = (
+                f"the job has since FINISHED — call sim_results('{job_id}') for the "
+                "converged result"
+            )
+        return base
+    if state == simjobs.DONE:
+        result = job["result"]
+        out = dict(result) if isinstance(result, dict) else {"ok": True, "value": result}
+        # The ladder reports its own convergence verdict; other kinds converge exactly
+        # when they finished ok.
+        out.setdefault("converged", bool(out.get("ok")))
+        out.update(job_id=job_id, state=simjobs.DONE, elapsed_s=job["elapsed_s"])
+        if progress:
+            out["progress"] = progress
+        return out
+    out = {
+        "ok": False,
+        "job_id": job_id,
+        "state": state,
+        "elapsed_s": job["elapsed_s"],
+        "error": f"job {job_id} is {state} — there are no converged results to return. "
+        "Refusing to answer with a partial or absent solution.",
+    }
+    if progress:
+        out["progress"] = progress
+    if state == simjobs.FAILED:
+        out["solver_error"] = job["error"]
+        out.update({key: job[key] for key in ("code", "detail") if key in job})
+        return out
+    out["hint"] = (
+        f"wait_job('{job_id}') blocks until it finishes; sim_results('{job_id}', "
+        "partial=True) returns the progress so far, clearly marked partial"
+    )
+    current = progress.get("current_job_id")
+    if current:
+        out["hint"] += (
+            f". The leg solving now is the durable job {current} (sim_status/sim_cancel "
+            "take that id)"
+        )
+    return out
+
+
+def _thread_job_status(job: dict) -> dict:
+    """sim_status for an in-process job: state, elapsed and progress, never the result."""
+    job_id, state = job["job_id"], job["state"]
+    st = {key: value for key, value in job.items() if key != "result"}
+    if st.get("error") is None:
+        st.pop("error")
+    st["ok"] = state != simjobs.FAILED
+    if state == simjobs.DONE:
+        st["next_actions"] = [f"sim_results('{job_id}')"]
+    elif state == simjobs.RUNNING:
+        st["next_actions"] = [f"wait_job('{job_id}')", f"sim_results('{job_id}', partial=True)"]
+        st["note"] = (
+            "still running in this server process (an in-process driver, not a durable "
+            "solver process) — nothing has converged yet."
+        )
+        current = job["progress"].get("current_job_id")
+        if current:
+            st["note"] += (
+                f" The leg solving now is the durable job {current}: sim_status('{current}') "
+                f"shows its solver progress and sim_cancel('{current}') kills it."
+            )
+    return st
+
+
+def _thread_job_cancel(job: dict) -> dict:
+    """sim_cancel for an in-process job: there is no solver process of its own to kill."""
+    job_id, state = job["job_id"], job["state"]
+    out = {
+        "ok": False,
+        "job_id": job_id,
+        "state": state,
+        "error": (
+            f"job {job_id} is an in-process {job['kind']} driver, not a solver process: "
+            "sim_cancel has no process of its own to kill, and nothing was cancelled."
+        ),
+    }
+    current = job["progress"].get("current_job_id")
+    if state == simjobs.RUNNING and current:
+        out["hint"] = (
+            f"sim_cancel('{current}') kills the leg solving now; a failed leg stops the "
+            "ladder unless it was started with continue_on_fail=True."
+        )
+    return out
+
+
 # ------------------------------------------------------------------ mesh convergence (ladder)
 # The simulation runbook's release gate: "Mesh at three successively finer characteristic
 # sizes. Do not accept a single-mesh peak", then "compare monitored non-singular stress and
@@ -3776,7 +3946,8 @@ def _convergence_handoff(run: _ConvergenceLadder) -> dict:
             "own durable child process, but the next one is not started until the current "
             f"one is done. Poll get_job('{jid}'): while it runs, `progress` carries "
             "legs_done / current_job_id / leg_job_ids; when it is done, `result` is the "
-            "WHOLE convergence table. sim_status/sim_cancel take the leg id in "
+            f"WHOLE convergence table (sim_results('{jid}') returns the same table). "
+            "sim_cancel kills a leg, not this driver: pass it the leg id in "
             "progress.current_job_id, and cancelling that leg stops the ladder. If this "
             "server restarts mid-ladder the driver is gone but the legs are not: "
             "sim_jobs() lists them and run_fea_convergence(job_ids=[...]) rebuilds the "
@@ -3988,18 +4159,20 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                      poll get_job(job_id). Use it for fine meshes that may exceed the call
                      timeout. The job is persisted on disk, so it survives an MCP restart
                      and can be collected in a later turn; sim_cancel(job_id) kills it.
-        vtu_path : optional ABSOLUTE path for a VTK XML UnstructuredGrid (.vtu, ASCII) the
+        vtu_path : optional path for a VTK XML UnstructuredGrid (.vtu, ASCII) the
                    solver writes after the solve — point data displacement (mm, 3-vector),
                    von_mises (MPa) and summary_node (the 1/0 mask that selected the
                    reported peak, see below) on the solved tet4/tet10 mesh, for ParaView
-                   or an independent cross-check. Echoed back as "vtu_path"; a write
+                   or an independent cross-check. A relative path is project-root
+                   relative. Echoed back as the absolute "vtu_path"; a write
                    failure fails the whole run rather than reporting a partial success.
-        export_system_path : optional ABSOLUTE path for a JSON dump of the RESOLVED
+        export_system_path : optional path for a JSON dump of the RESOLVED
                    system, written immediately before the solve: {points [[x,y,z] mm],
                    elems [[node ids]], nodes_per_elem, fixed_nodes [flat node-index list,
                    each pinning all 3 DOFs], nodal_forces [[fx,fy,fz] N per node],
                    E_mpa, nu, bond_springs, contact_springs}. For an independent
-                   cross-solve (CalculiX etc.); a write failure fails the run.
+                   cross-solve (CalculiX etc.); a write failure fails the run. A relative
+                   path is project-root relative.
 
         Returns {ok, doc_id, material, n_nodes, n_elems, mesh, summary:{...}} — the
         scalars live under "summary", NOT at the top level: summary.min_fos,
@@ -4114,9 +4287,10 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         advisor_max_dof : optional non-negative advisor budget; 0 leaves it unset.
         background : if True, return a job_id immediately; poll get_job(job_id). The job
                      runs in its own process and survives an MCP restart.
-        vtu_path : optional ABSOLUTE .vtu path for the FINAL adapted mesh (ASCII VTK XML
+        vtu_path : optional .vtu path for the FINAL adapted mesh (ASCII VTK XML
                    UnstructuredGrid; point data displacement in mm, von_mises in MPa and
-                   the summary_node 1/0 reduction mask).
+                   the summary_node 1/0 reduction mask). A relative path is project-root
+                   relative.
         The reply carries "mesh_quality", "reactions" (with equilibrium_error_pct) and
         "provenance" beside "summary", as run_fea_static does — including the reduction
         disclosure (summary.max_von_mises_reduction / max_von_mises_raw_mpa /
@@ -4231,7 +4405,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    in does not matter). The leg ids are in the ladder job's
                    progress.leg_job_ids. fixtures/loads are NOT needed on this call; they
                    are required only when starting a new ladder.
-        vtu_dir : optional ABSOLUTE directory the legs write their FIELDS into — one .vtu
+        vtu_dir : optional directory the legs write their FIELDS into (a relative path is
+                   project-root relative) — one .vtu
                    per leg, named <doc>_leg<k>_h<size>_o<order>.vtu (a fineness rung is
                    named f<fineness> instead). Each row then carries `vtu_path` and the
                    reply's `released_leg` names the finest solved leg's file, which is the
@@ -4241,8 +4416,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    (still strictly one leg at a time, so peak memory is unchanged), and a
                    .vtu already at a leg's path is ARCHIVED into
                    superseded_<date>_<hash>/ rather than overwritten — same rule as
-                   run_fea_static's vtu_path. Absolute path required; the engine creates
-                   the directory.
+                   run_fea_static's vtu_path. The engine creates the directory.
 
         THE LEGS ARE SEQUENTIAL and your studies should be too: the engine's memory
         governor grants each solve a fraction of the RAM AVAILABLE when it starts (not a
@@ -4414,7 +4588,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         advisor_max_dof : optional non-negative advisor budget; 0 leaves it unset.
         background : if True, return a job_id and solve in a separate process — poll
                      get_job(job_id). The job survives an MCP restart.
-        vtu_path : optional ABSOLUTE .vtu path; the modal write carries the mode shapes as
+        vtu_path : optional .vtu path (a relative path is project-root relative); the
+                   modal write carries the mode shapes as
                    point data. A modal reply has "mesh_quality" and "provenance" but no
                    "reactions" — there is no applied load to balance.
         """
@@ -4582,7 +4757,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def sim_status(job_id: str) -> str:
-        """State of a sim_run job: queued|running|done|failed|cancelled, elapsed, progress.
+        """State of a sim job: queued|running|done|failed|cancelled, elapsed, progress.
 
         The state is reconciled against the OPERATING SYSTEM, not just a stored flag: a
         worker that died without writing a result is reported as `failed` with its last
@@ -4593,8 +4768,15 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         lack of progress only when stalled is true, not for healthy long probes.
         A failed/cancelled run of a kind that retains them (topology) is persisted to
         its study once and returned as `detail` under `code` solve_failed|solve_cancelled.
+        In-process driver jobs (job-* ids from run_fea_convergence and
+        motion_fea_handoff_sweep) resolve too, marked durable:false.
         """
         try:
+            thread = _thread_job(job_id)
+            if thread is not None:
+                return _dumps(_thread_job_status(thread))
+            if str(job_id).startswith(_THREAD_JOB_PREFIX):
+                return _dumps(_unknown_thread_job(job_id))
             st = simjobs.status(job_id)
             if st.get("state") == "unknown":
                 return _dumps(st)
@@ -4640,6 +4822,11 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         without counter/phase advancement), not merely because a probe is long.
         """
         try:
+            thread = _thread_job(job_id)
+            if thread is not None:
+                return _dumps(_thread_job_cancel(thread))
+            if str(job_id).startswith(_THREAD_JOB_PREFIX):
+                return _dumps(_unknown_thread_job(job_id))
             return _dumps(simjobs.cancel(job_id))
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -4665,8 +4852,18 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
         The collect stage runs exactly ONCE per job however many times it is polled and from
         however many processes, so a solved study is written into the document once.
+
+        In-process driver jobs (job-* ids, e.g. a background run_fea_convergence ladder or
+        motion_fea_handoff_sweep) follow the same contract: done -> the result get_job
+        reports (the whole convergence table), running -> refused, partial=True -> their
+        progress record (legs_done / leg_job_ids / current_job_id).
         """
         try:
+            thread = _thread_job(job_id)
+            if thread is not None:
+                return _dumps(_thread_job_results(thread, partial))
+            if str(job_id).startswith(_THREAD_JOB_PREFIX):
+                return _dumps(_unknown_thread_job(job_id))
             st = simjobs.status(job_id)
             state = st.get("state")
             if state == "unknown":
@@ -4774,9 +4971,11 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def sim_jobs(limit: int = 20) -> str:
-        """List recent sim_run jobs (newest first) with their reconciled state and elapsed
-        time. Jobs persist across agent turns, so this also shows solves an earlier turn
-        started."""
+        """List recent sim jobs (newest first) with their reconciled state and elapsed
+        time. `jobs` are the durable sim-* registry rows; they persist across agent turns,
+        so this also shows solves an earlier turn started. `process_jobs` are this server
+        process's in-process simulation drivers (job-* ids: convergence ladders, motion
+        sweeps) — they do not survive a server restart, but a ladder's legs do (in `jobs`)."""
         try:
             limit = _positive_int(limit, "limit")
             rows = []
@@ -4786,11 +4985,28 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 if meta.get("label"):
                     j["label"] = meta["label"]
                 rows.append(j)
+            with _cad_jobs._JOB_LOCK:
+                thread_ids = [
+                    jid
+                    for jid, job in _cad_jobs._JOBS.items()
+                    if job.get("kind") in _THREAD_SIM_KINDS
+                ]
+            process_jobs = []
+            for jid in reversed(thread_ids):  # insertion order is start order
+                job = _thread_job(jid)
+                if job is not None:
+                    job.pop("result")
+                    if job.get("error") is None:
+                        job.pop("error")
+                    process_jobs.append(job)
+                if len(process_jobs) >= limit:
+                    break
             return _dumps(
                 {
                     "ok": True,
                     "jobs": rows,
                     "count": len(rows),
+                    "process_jobs": process_jobs,
                     "registry": str(simjobs.jobs_dir()),
                 }
             )
@@ -5535,7 +5751,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                             (falls back to a typical value for the named material).
         learned_advisor : default-off Polyhedral-FEA mesh advice; not a thermal optimizer.
         advisor_max_dof : optional non-negative advisor budget; 0 leaves it unset.
-        vtu_path : optional ABSOLUTE .vtu path with nodal temperature point data.
+        vtu_path : optional .vtu path with nodal temperature point data. A relative path
+                   is project-root relative.
         Both routes return mesh_quality and provenance beside summary. Steady
         returns temperature_max_c, temperature_min_c and flux_max_w_m2 without
         a time axis; full nodal temperatures are persisted in the doc study.
@@ -5890,7 +6107,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         material : named material or explicit elastic material dict.
         n_modes : number of positive buckling modes, lowest load factor first.
         size_mm : target quadratic-tetrahedron size in mm (default 8).
-        vtu_path : optional absolute .vtu path containing normalized mode shapes.
+        vtu_path : optional .vtu path containing normalized mode shapes. A relative path
+                   is project-root relative.
         max_load_factor : finite positive search ceiling (default 10000). A critical
                           load above this multiple of the reference load is reported
                           as no buckling mode below the specified ceiling.
@@ -6082,7 +6300,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    never updated, so past that the patch the solve spread the load over
                    is not the patch the part has.
         mesh_order : 1 = tet4 (default, fastest), 2 = tet10.
-        vtu_path : optional ABSOLUTE .vtu path for the solved fields, as for
+        vtu_path : optional .vtu path for the solved fields, as for
                    run_fea_static (displacement, von_mises and the summary_node mask).
 
         THE INTERFACE RESOLUTION REFUSAL. A contact study can converge, balance to 0.0%

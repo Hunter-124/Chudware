@@ -1148,6 +1148,39 @@ def _sanitize_output_path(path: str) -> str:
     return str(resolved)
 
 
+def resolve_agent_path(path: str, arg: str) -> str:
+    """Return the absolute path of an agent-supplied file or directory path.
+
+    A relative path is project-root relative. The project root is the one that fs_*,
+    save_part, asm_add_component and plm_* use: CHUDWARE_PROJECT_DIR, then
+    CHUDWARE_FS_ROOT, each through project_context.resolve_project_root. An absolute
+    path and ``~`` stay as the caller wrote them. This function does not apply a jail;
+    the caller keeps its own containment policy.
+
+    When no project root is known (a headless external MCP client), a relative path is
+    refused with a message that tells the caller to pass an absolute path.
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError(f"{arg} must be a non-empty path (absolute, or relative to the "
+                         "project root).")
+    expanded = os.path.expanduser(path.strip())
+    if os.path.isabs(expanded):
+        return os.path.normpath(expanded)
+    from services.agent.project_context import resolve_project_root  # noqa: PLC0415
+
+    for key in ("CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT"):
+        start = os.environ.get(key, "").strip()
+        if not start:
+            continue
+        root = resolve_project_root(start)
+        if root.is_dir():
+            return os.path.normpath(os.path.join(str(root), expanded))
+    raise ValueError(
+        f"{arg} {path!r} is relative, but this session has no project root "
+        "(CHUDWARE_PROJECT_DIR and CHUDWARE_FS_ROOT are unset), so it has no base to "
+        f"resolve against. Pass an ABSOLUTE {arg}, e.g. '/home/you/project/{path.strip()}'.")
+
+
 # --- never overwrite an artifact: archive the old set first -----------------------------
 # A released artifact is EVIDENCE, and evidence is not overwritable. On 2026-09-05 a
 # mission re-ran one load case into the folder that already held that case's packet, and
@@ -3432,14 +3465,51 @@ def _resolve_appearance(material: Union[str, dict, list, tuple]) -> dict:
         return ap
     if isinstance(material, (list, tuple)):
         return {"color": [float(c) for c in material][:3]}
-    # Product-specific looks outrank generic family tokens (e.g. black printed TPU or
-    # natural POM). These are illustrative finishes, not mechanical qualifications.
+    # A registry material (name, alias or designation) is accepted here exactly as set_material
+    # accepts it as an engineering identity. Product-specific looks outrank generic family
+    # tokens (e.g. black printed TPU or natural POM); these are illustrative finishes, not
+    # mechanical qualifications.
+    record = None
     for candidate in _material_candidates(material):
         record = _material_registry_record(candidate)
         if record is not None:
-            if isinstance(record.get("appearance"), dict):
-                return _resolve_appearance(record["appearance"])
             break
+    if record is not None and isinstance(record.get("appearance"), dict):
+        return _resolve_appearance(record["appearance"])
+    key = _appearance_family_key(material)
+    if key is None and record is not None:
+        # A registry row without its own finish: read its name/aliases for a family word,
+        # else its category's neutral look. Never a refusal for a material set_material
+        # resolves as an engineering identity.
+        for alias in [record.get("name"), *(record.get("aliases") or [])]:
+            key = _appearance_family_key(alias) if isinstance(alias, str) else None
+            if key is not None:
+                break
+        if key is None and record.get("category") in _REGISTRY_CATEGORY_LOOKS:
+            return dict(_APPEARANCE_PRESETS[_REGISTRY_CATEGORY_LOOKS[record["category"]]])
+    if key is None:
+        raise ValueError(
+            f"Unknown material {material!r}: not a name, alias or designation in the "
+            f"engineering material registry (e.g. A36, 6061-T6, ASTM A106 Grade B, A53 Gr B, "
+            f"SA-516-70, A312 TP316) and no appearance family matches. Families: "
+            f"{sorted(set(_APPEARANCE_PRESETS) | set(_APPEARANCE_ALIASES))}; "
+            f"common alloy designations (6061, A36, 304, 4140, Ti-6Al-4V, C360, …) resolve to "
+            f"their family. Or pass an explicit look: "
+            f"{{'color':[r,g,b], 'metallic':0..1, 'roughness':0..1}}."
+        )
+    return dict(_APPEARANCE_PRESETS[key])
+
+
+# Neutral look for a registry row that names no finish and no family word (Inconel 718,
+# tungsten, PEEK, concrete, ...). Illustrative only; the engineering identity is the row.
+_REGISTRY_CATEGORY_LOOKS = {
+    "metal": "steel", "plastic": "plastic", "composite": "black", "ceramic": "plastic",
+    "elastomer": "rubber", "adhesive": "plastic",
+}
+
+
+def _appearance_family_key(material: object) -> Optional[str]:
+    """The appearance preset a free-text name lands on (alias, designation, family word)."""
     key = str(material).strip().lower()
     key = _APPEARANCE_ALIASES.get(key, key)
     if key not in _APPEARANCE_PRESETS:
@@ -3481,15 +3551,7 @@ def _resolve_appearance(material: Union[str, dict, list, tuple]) -> dict:
                 best = (rank, cand)
         if best is not None:
             key = _APPEARANCE_ALIASES.get(best[1], best[1])
-    if key not in _APPEARANCE_PRESETS:
-        raise ValueError(
-            f"Unknown appearance material {material!r}. Known: "
-            f"{sorted(set(_APPEARANCE_PRESETS) | set(_APPEARANCE_ALIASES))}; "
-            f"common alloy designations (6061, A36, 304, 4140, Ti-6Al-4V, C360, …) resolve to "
-            f"their family. Or pass an explicit look: "
-            f"{{'color':[r,g,b], 'metallic':0..1, 'roughness':0..1}}."
-        )
-    return dict(_APPEARANCE_PRESETS[key])
+    return key if key in _APPEARANCE_PRESETS else None
 
 
 # ------------------------------------------------------------------ free-text geometry queries
@@ -7500,7 +7562,8 @@ GEOM_QUERY_ALIASES = {
 #: only alongside a real predicate, because on their own they select nothing.
 GEOM_QUERY_READBACK_KEYS = frozenset({
     "sid", "centroid", "normal", "axis", "radius", "area_or_len", "concavity",
-    "hint_index", "owner_feature", "body", "topo",
+    "hint_index", "owner_feature", "body", "topo", "axis_point",
+    "major_radius", "minor_radius", "torus_axis", "torus_center",
 })
 
 GEOM_QUERY_VOCAB_HELP = (
@@ -7558,10 +7621,11 @@ def normalize_geom_query(query: dict, *, where: str, defer_sid: bool = False) ->
         # rejection below rather than being handed on to a resolver that will skip it.
         return out, notes
     if readback and not (set(out) & GEOM_QUERY_NARROWING_KEYS):
+        names = ", ".join(repr(k) for k in readback)
+        what = ("is a readback field, not a query predicate" if len(readback) == 1
+                else "are readback fields, not query predicates")
         raise ValueError(
-            f"{where}: " + ", ".join(repr(k) for k in readback)
-            + " name a match in a READBACK; they are not query predicates, so this query "
-              "selects every candidate instead of the one element you meant. Narrow it "
-              f"with {GEOM_QUERY_VOCAB_HELP}, or hand back the whole selector object "
-              "query_geometry/describe_part returned.")
+            f"{where}: {names} {what}. This query selects every candidate, not the element "
+            f"you want. Narrow it with {GEOM_QUERY_VOCAB_HELP}. Or give back the full "
+            "selector object that query_geometry or describe_part returned.")
     return out, notes

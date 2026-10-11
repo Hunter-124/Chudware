@@ -26,7 +26,10 @@
 #include <Eigen/Dense>
 #include <nlohmann/json.hpp>
 
+#include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRepBuilderAPI_MakePolygon.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
+#include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Dir.hxx>
@@ -531,6 +534,50 @@ TEST_CASE("B9 describe_faces(cylinder): 1 cylinder face + 2 planar caps") {
     CHECK(n_other == 0);
     MESSAGE("B9: cylinder faces=" << n_cyl << " planar caps=" << n_plane
             << " other=" << n_other);
+}
+
+// B9b. describe_faces over a REVOLVED stepped shaft (Ø30 x 40 then Ø20 x 60 along +X).
+//   MakeRevol gives some planar faces a LEFT-handed gp_Pln frame, whose surface normal is
+//   -Axis().Direction(); the old "Axis(), flipped if REVERSED" idiom read the x=0 end as
+//   +X. Every planar face's signed axis/rep_dir must be its OUTWARD normal, in BOTH profile
+//   windings, and each cylinder's axis_point must sit on the X axis.
+TEST_CASE("B9b describe_faces(revolved shaft): outward plane normals + on-axis axis_point") {
+    const double pts[6][2] = {{0, 0}, {0, 15}, {40, 15}, {40, 10}, {100, 10}, {100, 0}};
+    for (int flip = 0; flip < 2; ++flip) {
+        BRepBuilderAPI_MakePolygon poly;
+        for (int i = 0; i < 6; ++i) {
+            const int k = flip ? 5 - i : i;
+            poly.Add(gp_Pnt(pts[k][0], 0.0, pts[k][1]));
+        }
+        poly.Close();
+        const TopoDS_Face prof = BRepBuilderAPI_MakeFace(poly.Wire(), true).Face();
+        const TopoDS_Shape shaft = geom::revolve_face(
+            prof, Eigen::Vector3d::Zero(), Eigen::Vector3d::UnitX(), 2.0 * 3.14159265358979323846);
+        REQUIRE(!shaft.IsNull());
+        int n_plane = 0, n_cyl = 0;
+        for (const TopoInfo& f : chudware::doc::describe_faces(shaft)) {
+            REQUIRE(f.surf.has_value());
+            if (*f.surf == "plane") {
+                ++n_plane;
+                REQUIRE(f.axis.has_value());
+                REQUIRE(f.rep_dir.has_value());
+                const double want = f.centroid.x() < 1e-6 ? -1.0 : 1.0;  // x=0 end faces -X
+                CHECK(f.axis->x() == doctest::Approx(want));
+                CHECK(f.rep_dir->x() == doctest::Approx(want));
+                CHECK_FALSE(f.axis_point.has_value());
+                CHECK(make_selector(f)["side"] == (want < 0 ? "left" : "right"));
+            } else if (*f.surf == "cylinder") {
+                ++n_cyl;
+                REQUIRE(f.axis_point.has_value());
+                CHECK(f.axis_point->x() == doctest::Approx(f.centroid.x()));
+                CHECK(std::abs(f.axis_point->y()) < 1e-9);
+                CHECK(std::abs(f.axis_point->z()) < 1e-9);
+                CHECK(make_selector(f)["axis_point"].is_array());
+            }
+        }
+        CHECK(n_plane == 3);
+        CHECK(n_cyl == 2);
+    }
 }
 
 // B10. END-TO-END (the point of the whole module). Describe the box faces, build a

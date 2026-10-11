@@ -19,6 +19,10 @@ change here gives CI the ability to publish a stable release: `POST
 
 Every night, and on demand from the Actions tab:
 
+Nightly runs share one concurrency group with cancellation disabled. A new scheduled
+or manual run queues rather than cancelling the platform legs of an in-flight release.
+
+
 1. **`plan`** (gateway host, `cc-linux-livingroom`; metadata and API calls
    only, it compiles nothing) reads `GET https://app.chudware.com/api/releases/base-version`
    for the stable base (highest stable patch + 1, floor `0.1.0`) and builds the
@@ -350,18 +354,20 @@ source provenance only; it never changes executable identity. Every artifact
 must report exactly `Chudcode vX.Y.Z` from `--version` (the executable's own
 identity string); engine provenance is never accepted as or appended to it.
 
-### Current pin status (2026-09-30)
+### Current pin status (2026-10-11)
 
-The lock pins `chudcode-v0.4.1` (the thin fork on upstream oh-my-pi 18.4.4,
-`engine_version` 18.4.4). Linux x86_64 and macOS x86_64 are pinned; Windows
-x86_64 is unpinned because the cross-compiled Windows CLI crashes inside Bun
-1.4.0 at startup, so Windows installer legs fail closed. `pin` requires all
-three targets, so this lock was written directly and validated with
-`verify-notices`, `verify` and `stage`. Locks written before the x64-only matrix also list
+The lock pins `chudcode-v0.4.3` (the thin fork on upstream oh-my-pi 18.4.4,
+`engine_version` 18.4.4). Linux x86_64 and macOS x86_64 are the upstream
+release assets. Windows x86_64 is the native build from
+`chudcode-runtime-windows-build.yml`, because the Linux cross-compiled Windows
+CLI crashes inside Bun 1.4.0 at startup; Chudcode releases no longer ship it.
+Until the native Windows bytes exist, the Windows row stays `null` and Windows
+installer legs fail closed. Locks written before the x64-only matrix also list
 `linux-aarch64`/`macos-arm64`; `load_lock` still accepts those so rollback can
 verify retained releases, but `pin` and `check-lock` require the exact
-supported set. No Linux ARM or macOS ARM artifact is planned; the CAD
-`macos-arm64` core-only preset is not a Chudcode-backed release target.
+supported set. ARM targets (Linux ARM, macOS ARM) are not release targets. A
+macOS ARM build happens only by hand, when the hardware is available; CI never
+blocks a release on it.
 
 The runtime repository is private. Nightly uses the CAD repository's
 `chudcode-runtime-v<lock version>` release mirror and its own ephemeral

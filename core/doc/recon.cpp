@@ -12,6 +12,7 @@
 
 #include "doc/session.h"  // OpError
 #include "geom/plane.h"   // chudware::geom::SketchPlane — face-plane frame convention
+#include "geom/face_normal.h"  // plane_outward_normal — handedness-aware planar normal
 
 #include <Bnd_Box.hxx>
 #include <BRepAdaptor_Curve.hxx>
@@ -438,8 +439,7 @@ json face_wires(const TopoDS_Face& face) {
     GProp_GProps props;
     BRepGProp::SurfaceProperties(face, props);
     const gp_Pnt centroid = props.CentreOfMass();
-    gp_Dir normal_dir = surf.Plane().Axis().Direction();
-    if (face.Orientation() == TopAbs_REVERSED) normal_dir.Reverse();
+    const gp_Dir normal_dir = ::chudware::geom::plane_outward_normal(face, surf.Plane());
 
     const chudware::geom::SketchPlane plane = chudware::geom::SketchPlane::from(
         Eigen::Vector3d(centroid.X(), centroid.Y(), centroid.Z()),

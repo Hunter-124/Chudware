@@ -102,15 +102,27 @@ TopoDS_Shape chamfer_vertices(const TopoDS_Shape& shape, double d,
 // (-t).
 //   OPEN shell (`remove` non-empty): BRepOffsetAPI_MakeThickSolid::MakeThickSolidByJoin
 //     opens the removed faces and offsets the remaining skin (Arc join first, then an
-//     Intersection join + looser tolerance for curved/B-spline skins).
+//     Intersection join + looser tolerance for curved/B-spline skins). When no offset
+//     strategy validates and the shell is inward, geom::shell_by_sections
+//     (shell_sections.h) hollows a tube-like body by lofting its exact eroded
+//     cross-sections instead — the path a rectangle-to-circle loft takes, since OCCT's
+//     offset refuses its corner seams (BRepOffset_MixedConnectivity).
 //   CLOSED shell (`remove` EMPTY = a fully-sealed hollow part, e.g. a hollow ball /
 //     sealed enclosure): MakeThickSolidByJoin no-ops with no faces to open (it hands
 //     back the original solid), so this case instead builds an offset solid
 //     (PerformByJoin by ±t) and BOOLEAN-CUTs it against the original to leave a closed
 //     wall of thickness `t` (a 40^3 box at t=2 -> 40^3-36^3 = 17344, sealed cavity).
-// Empty shape on kernel failure (after all strategies).
+// Every strategy's result is ACCEPTED only when it is a BRepCheck-valid, watertight solid
+// whose volume moved the right way (inward: smaller, outward: larger); otherwise the next
+// join/tolerance strategy is tried. When none validates, a valid result whose volume did
+// NOT move (the OCCT "thickness too large" no-op, Bug A2/A3) is returned so the caller's
+// volume guard names it; anything else returns an empty shape. `diag` (optional) receives
+// the precise kernel reason per strategy — the BRepOffset_Error name (e.g.
+// MixedConnectivity, with the offending crease-to-tangent edges located) or the
+// validation that rejected the result.
 TopoDS_Shape shell_solid(const TopoDS_Shape& body, double t, bool outward,
-                         const std::vector<TopoDS_Face>& remove);
+                         const std::vector<TopoDS_Face>& remove,
+                         std::string* diag = nullptr);
 
 // True if `shape` has any freeform (B-spline/Bezier/revolution/extrusion) face — the
 // surface types a loft/sweep/revolve makes, on which the thick-solid offset often

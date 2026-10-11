@@ -55,6 +55,7 @@ from .cad_common import (
     require_mapping,
     SUPERSEDED_PREFIX,
     _dumps,
+    resolve_agent_path,
     _err,
 )
 from .daemon_bridge import resolve_hostd_bin
@@ -86,13 +87,9 @@ def _sha256(path: Union[str, Path]) -> Optional[dict]:
     return {"path": str(p.resolve()), "sha256": h.hexdigest(), "bytes": size}
 
 
-def _require_abs_dir(path, arg: str) -> Path:
-    """An absolute directory path, created if needed. Relative output is not releasable."""
-    if not isinstance(path, str) or not path.strip():
-        raise ValueError(f"{arg} must be a non-empty absolute directory path.")
-    p = Path(path.strip())
-    if not p.is_absolute():
-        raise ValueError(f"{arg} must be ABSOLUTE, got {str(p)!r}.")
+def _require_out_dir(path, arg: str) -> Path:
+    """The absolute output directory, created if needed (relative = project-root relative)."""
+    p = Path(resolve_agent_path(path, arg))
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -841,7 +838,8 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
 
         case_id : the load-case id, e.g. "WHEEL-RADIAL-3G". Also the packet's directory name.
         requirement_id : the requirement this case closes.
-        out_dir : ABSOLUTE parent directory; the packet is written to <out_dir>/<case_id>/.
+        out_dir : parent directory; the packet is written to <out_dir>/<case_id>/. A relative
+                   path is project-root relative.
         study_result : the FULL result dict/JSON from run_fea_static / run_fea_adaptive /
                    run_fea_convergence / sim_results — pass it verbatim. Its "provenance",
                    "mesh_quality", "reactions", "vtu_path" and (for a convergence run)
@@ -850,7 +848,8 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
                    released_leg.vtu_path, and that is the .vtu this packet hashes — so a
                    ladder no longer has to be re-solved once more just to have a field to
                    release.
-        geometry_path : the exact STEP/geometry revision that was solved; sha256'd here.
+        geometry_path : the exact STEP/geometry revision that was solved; sha256'd here. A
+                   relative path is project-root relative.
         material_source : where E/nu/density/yield came from (registry row, datasheet, MMPDS
                    table) — a material with no source cannot be released.
         load_rationale : magnitude, direction, distribution and dynamic-factor justification.
@@ -898,13 +897,14 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
                 "study_result",
                 "the full result dict from a run_fea_* / sim_results call",
             )
-            packet = _require_abs_dir(out_dir, "out_dir") / case_id
+            packet = _require_out_dir(out_dir, "out_dir") / case_id
             packet.mkdir(parents=True, exist_ok=True)
 
             # Everything the packet points AT is resolved before anything moves: a
             # geometry path, a .vtu or a render that lives in this folder would otherwise
             # be hashed after the archive had already renamed it away.
-            geometry = _sha256(geometry_path) if geometry_path else None
+            geometry = (_sha256(resolve_agent_path(geometry_path, "geometry_path"))
+                        if geometry_path else None)
             # A single solve names its field at the top level; a run_fea_convergence
             # reply names the RELEASED leg's field under released_leg (the ladder as a
             # whole has no single field, and the released number came from exactly one
@@ -1046,8 +1046,9 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
         and reports whether they do — nothing is re-solved and no number is re-derived;
         the only question answered is the one a reader has before quoting the packet.
 
-        folder : ABSOLUTE path to a packet directory (the `packet_dir` sim_evidence_packet
-                   returned, i.e. <out_dir>/<case_id>/).
+        folder : path to a packet directory (the `packet_dir` sim_evidence_packet
+                   returned, i.e. <out_dir>/<case_id>/). A relative path is project-root
+                   relative.
 
         Checks, each returned as {check, ok, detail, severity}:
           core_files_readable         result/inputs/provenance present and parse
@@ -1083,11 +1084,7 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
         provenance.json says it displaced.
         """
         try:
-            if not isinstance(folder, str) or not folder.strip():
-                raise ValueError("folder must be a non-empty absolute packet directory.")
-            packet = Path(folder.strip())
-            if not packet.is_absolute():
-                raise ValueError(f"folder must be ABSOLUTE, got {str(packet)!r}.")
+            packet = Path(resolve_agent_path(folder, "folder"))
             if not packet.is_dir():
                 return _dumps(
                     {
@@ -1198,7 +1195,8 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
                  "solve"  — linear static (optionally adaptive) -> <case>_result.vtu
                  "diag"   — setup diagnostics as JSON -> <case>_diag.json (parsed back into
                             the reply's "json" field)
-        step_path : ABSOLUTE path to the exact STEP revision.
+        step_path : path to the exact STEP revision. A relative path is project-root
+                   relative.
         model_units : units the STEP file itself is written in — "mm" (default; every
                    Chudware export) or "m". With "mm" the CLI is invoked with
                    `--scale 0.001`, which converts the loaded geometry to metres BEFORE
@@ -1207,7 +1205,8 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
                    i.e. the model's mm coordinates divided by 1000. force_n is newtons;
                    E_pa is PASCALS, not MPa. Pass model_units="m" only for a STEP that
                    is already metre-based; then no scaling is applied.
-        out_dir : ABSOLUTE output directory; its own basename is the artifact prefix, so
+        out_dir : output directory (a relative path is project-root relative); its own
+                   basename is the artifact prefix, so
                    .../Simulation_Output/WHEEL-RADIAL writes WHEEL-RADIAL_mesh.vtu etc.
         h_m : characteristic element size in metres (required except for "check").
         fix_box / load_box : six numbers X0 Y0 Z0 X1 Y1 Z1 (metres, scaled frame)
@@ -1243,12 +1242,10 @@ def register_sim_evidence_tools(mcp: FastMCP) -> None:
                 raise ValueError(
                     f"action must be one of {list(_POLYMESH_ACTIONS)}, got {action!r}."
                 )
-            step = Path(step_path or "")
-            if not step.is_absolute():
-                raise ValueError("step_path must be an ABSOLUTE path to the STEP revision.")
+            step = Path(resolve_agent_path(step_path or "", "step_path"))
             if not step.is_file():
                 raise ValueError(f"step_path does not exist: {str(step)!r}")
-            out = _require_abs_dir(out_dir, "out_dir")
+            out = _require_out_dir(out_dir, "out_dir")
             prefix = out / out.name
 
             cli, searched = _resolve_polymesh_cli()

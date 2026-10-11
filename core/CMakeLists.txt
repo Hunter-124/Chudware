@@ -1284,6 +1284,7 @@ if(CHUDWARE_WITH_OCCT)
     geom/op_history.cpp
     util/process_isolation.cpp
     geom/dress.cpp
+    geom/shell_sections.cpp
     geom/transform.cpp
     geom/fit.cpp
     geom/hole.cpp
@@ -1864,6 +1865,21 @@ if(CHUDWARE_WITH_OCCT)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME sketch_trim COMMAND test_sketch_trim)
   set_tests_properties(sketch_trim PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- 6-axis session regressions (2026-10-10): fix on a solved profile, centroid-only
+  # region selectors, refused inert extrude params (sketch.cpp adopt_solved_coordinates /
+  # nonconvergence_reason, validate.cpp unknown_feature_params, session.cpp op path).
+  add_executable(test_sixaxis_regressions
+    tests/test_sixaxis_regressions.cpp)
+  target_include_directories(test_sixaxis_regressions PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_sixaxis_regressions PRIVATE
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
+  set_target_properties(test_sixaxis_regressions PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME sixaxis_regressions COMMAND test_sixaxis_regressions)
+  set_tests_properties(sixaxis_regressions PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- Simulation-study persistence + mutate RPCs (doc_sim_study_*) -----------
   # Exercises the full study lifecycle (add/edit/list/save+open/delete) on a blank

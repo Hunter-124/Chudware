@@ -56,6 +56,7 @@
 #include <BRepCheck_Result.hxx>
 #include <BRepCheck_Status.hxx>
 #include <BRepGProp.hxx>
+#include <BRepClass_FaceClassifier.hxx>  // hole world_points: does the bore axis hit the face?
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>  // thread draft-preview band tool
@@ -123,6 +124,7 @@
 #include "geom/op_history.h"
 #include "geom/hole.h"
 #include "geom/plane.h"
+#include "geom/face_normal.h"
 #include "geom/profile.h"
 #include "geom/sheetmetal.h"
 #include "geom/weldment.h"
@@ -609,6 +611,124 @@ static chudware::geom::SketchPlane hole_face_frame(const TopoDS_Face& face,
     gp_Pnt c = props.CentreOfMass();
     return chudware::geom::SketchPlane::from(Eigen::Vector3d(c.X(), c.Y(), c.Z()),
                                           outward_normal);
+}
+
+// A hole/bolt_circle WORLD point names the bore AXIS — the line through it along the
+// drilled face's normal — not necessarily a point on the face: models write the body
+// centre (origin:[0,0,0] + direction) or z=0 on a centred plate, and both mean "the bore
+// whose axis passes here". So the point is projected along the normal onto the face plane
+// (`at`) and mapped to the hole_face_frame: u = (p-origin)·uAxis, v = (p-origin)·vAxis. A
+// point more than kHoleWorldPointNoteMm off the plane carries a `note` naming that distance
+// and the projected point (the feature warning).
+//
+// Which face the axis enters: when refs.face was a WORD query ({"of":"face","side":"top"})
+// the query names a DIRECTION, and its extreme face is only one of the faces facing that
+// way — a post standing on a plate wins "top", yet a bore at the plate centre is drilled
+// through the plate's own top. So `body` is non-null for a word query, and when the axis
+// misses the resolved face every planar face of the body with the SAME outward normal
+// (within kHoleSameNormalRad) whose interior holds the axis crossing is a candidate; the
+// one furthest along the normal wins — the face the drill (along -normal) enters first —
+// and the substitution is named in the note. Several points of one feature may thus land
+// on different faces (four boss tops, at one height or several). A concrete pick (`body`
+// null) and a substitution search that finds nothing are refused by name: the axis misses,
+// so drilling it would remove nothing or cut where nobody asked.
+constexpr double kHoleWorldPointNoteMm = 0.01;
+constexpr double kHoleSameNormalRad = 1e-6;
+
+struct HoleWorldPoint {
+    Eigen::Vector3d at = Eigen::Vector3d::Zero();  // the axis' crossing of the entered face
+    std::string note;  // projection / face-substitution report; empty when neither happened
+};
+
+// `what` names the param in the refusal/note ("hole: world_points[1]"). `require_on_face`
+// is false for a bolt_circle centre, which legitimately sits in an opening (a ring around
+// an existing bore); the ring's own holes are still guarded by its removed-material check.
+// `body` (non-null only for a word-query face) enables the same-normal face substitution.
+static HoleWorldPoint hole_world_point(const TopoDS_Face& face,
+                                       const chudware::geom::SketchPlane& fr,
+                                       const json& p, const std::string& what,
+                                       const EnvMap& env, bool require_on_face,
+                                       const TopoDS_Shape* body) {
+    if (!p.is_array() || p.size() != 3)
+        throw std::runtime_error(what + " must be a world point [x, y, z] in mm (got " +
+                                 p.dump() + ")");
+    const Eigen::Vector3d w(num_or_expr(p[0], env), num_or_expr(p[1], env),
+                            num_or_expr(p[2], env));
+    const Eigen::Vector3d& n = fr.normal;
+    const double off = (w - fr.origin).dot(n);
+    HoleWorldPoint out;
+    out.at = w - off * n;  // the axis' crossing of the resolved face's plane
+    double entered_off = off;
+    auto inside = [](const TopoDS_Face& f, const Eigen::Vector3d& q, bool in_only) {
+        const TopAbs_State s =
+            BRepClass_FaceClassifier(f, gp_Pnt(q.x(), q.y(), q.z()), 1e-6).State();
+        return in_only ? s == TopAbs_IN : s != TopAbs_OUT;
+    };
+    std::string substituted;
+    if (require_on_face && !inside(face, out.at, false)) {
+        bool found = false;
+        if (body != nullptr) {
+            double best_h = -std::numeric_limits<double>::infinity();
+            TopTools_IndexedMapOfShape faces;
+            TopExp::MapShapes(*body, TopAbs_FACE, faces);
+            for (int i = 1; i <= faces.Extent(); ++i) {
+                const TopoDS_Face& cand = TopoDS::Face(faces(i));
+                if (cand.IsSame(face)) continue;
+                BRepAdaptor_Surface cs(cand);
+                if (cs.GetType() != GeomAbs_Plane) continue;
+                const gp_Pln cp = cs.Plane();
+                const gp_Dir cd = ::chudware::geom::plane_outward_normal(cand, cp);
+                const Eigen::Vector3d cn(cd.X(), cd.Y(), cd.Z());
+                if (std::atan2(cn.cross(n).norm(), cn.dot(n)) > kHoleSameNormalRad) continue;
+                const Eigen::Vector3d loc(cp.Location().X(), cp.Location().Y(),
+                                          cp.Location().Z());
+                const double h = loc.dot(n);
+                const double coff = (w - loc).dot(n);
+                const Eigen::Vector3d q = w - coff * n;
+                if (h <= best_h || !inside(cand, q, true)) continue;
+                best_h = h;
+                out.at = q;
+                entered_off = coff;
+                found = true;
+                GProp_GProps props;
+                BRepGProp::SurfaceProperties(cand, props);
+                const gp_Pnt c = props.CentreOfMass();
+                char buf[400];
+                std::snprintf(buf, sizeof(buf),
+                    "%s: its axis misses the face refs.face resolved to (centre [%.6g, %.6g, "
+                    "%.6g]), so it is drilled through the face with the same outward normal "
+                    "that the drill enters first, centre [%.6g, %.6g, %.6g].",
+                    what.c_str(), fr.origin.x(), fr.origin.y(), fr.origin.z(), c.X(), c.Y(),
+                    c.Z());
+                substituted = buf;
+            }
+        }
+        if (!found) {
+            char buf[900];
+            std::snprintf(buf, sizeof(buf),
+                "%s [%.6g, %.6g, %.6g]: the bore axis through it crosses the drilled face's "
+                "plane at [%.6g, %.6g, %.6g] (%.6g mm along the face normal), which is OUTSIDE "
+                "the face (face centre [%.6g, %.6g, %.6g], outward normal [%.6g, %.6g, %.6g])%s "
+                "— nothing there to drill. Give a point whose axis passes through refs.face, "
+                "or name the face the axis does pass through.",
+                what.c_str(), w.x(), w.y(), w.z(), out.at.x(), out.at.y(), out.at.z(),
+                std::abs(off), fr.origin.x(), fr.origin.y(), fr.origin.z(), n.x(), n.y(), n.z(),
+                body != nullptr ? " and inside no other face of the body facing the same way"
+                                : "");
+            throw std::runtime_error(buf);
+        }
+    }
+    out.note = substituted;
+    if (std::abs(entered_off) > kHoleWorldPointNoteMm) {
+        char buf[512];
+        std::snprintf(buf, sizeof(buf),
+            "%s [%.6g, %.6g, %.6g] is %.6g mm off the drilled face's plane — read as a point "
+            "on the bore axis and projected along the face normal to [%.6g, %.6g, %.6g].",
+            what.c_str(), w.x(), w.y(), w.z(), std::abs(entered_off), out.at.x(), out.at.y(),
+            out.at.z());
+        out.note += (out.note.empty() ? "" : " ") + std::string(buf);
+    }
+    return out;
 }
 
 // Read a string field, with a default for an absent key. Throws if present but not a
@@ -1275,12 +1395,13 @@ std::vector<TopoDS_Face> resolve_profile_faces(const FeatureResultMap& results,
     if (all_faces.empty())
         throw std::runtime_error("profile sketch has no closed face");
 
-    // Build (uv_centroid, area, face) rows, sorted by (u, v) — same order as
+    // Build (uv_centroid, area, face, uv bbox) rows, sorted by (u, v) — same order as
     // doc_sketch_regions (session.cpp ~10039-10048) so `index` matches the GUI.
     struct FaceRow {
         Eigen::Vector2d uv;
         double area;
         TopoDS_Face face;
+        Eigen::Vector2d lo, hi;  // (u,v) bounding box of the face
     };
     std::vector<FaceRow> rows;
     rows.reserve(all_faces.size());
@@ -1289,6 +1410,21 @@ std::vector<TopoDS_Face> resolve_profile_faces(const FeatureResultMap& results,
         r.face = f;
         r.uv = face_uv_centroid(f, src.plane);
         r.area = face_surface_area(f);
+        r.lo = r.hi = r.uv;
+        Bnd_Box box;
+        BRepBndLib::Add(f, box, Standard_False);
+        if (!box.IsVoid()) {
+            double x0, y0, z0, x1, y1, z1;
+            box.Get(x0, y0, z0, x1, y1, z1);
+            for (int k = 0; k < 8; ++k) {  // project the 3D box corners into (u,v): conservative
+                const Eigen::Vector3d d(((k & 1) ? x1 : x0) - src.plane.origin.x(),
+                                        ((k & 2) ? y1 : y0) - src.plane.origin.y(),
+                                        ((k & 4) ? z1 : z0) - src.plane.origin.z());
+                const Eigen::Vector2d p(d.dot(src.plane.uAxis), d.dot(src.plane.vAxis));
+                r.lo = r.lo.cwiseMin(p);
+                r.hi = r.hi.cwiseMax(p);
+            }
+        }
         rows.push_back(std::move(r));
     }
     std::sort(rows.begin(), rows.end(), [](const FaceRow& a, const FaceRow& b) {
@@ -1307,7 +1443,30 @@ std::vector<TopoDS_Face> resolve_profile_faces(const FeatureResultMap& results,
         out.push_back(rows[i].face);
     };
 
-    for (const json& s : sels) {
+    // A centroid pick that no longer lands on its region is an ERROR, never a silent
+    // snap to the nearest survivor. Live 2026-10-10 6-axis run (forearm_lower, sketch
+    // f63 / cut f64): an edit_feature replaced six slots' coincident relations with
+    // `fix` only, four slots reopened by their 2.9e-5 mm authored rounding gaps, and the
+    // six centroid picks snapped onto the two surviving slots (de-duplicated below) —
+    // the cut lost 4 of 6 slots with ok:true. Every centroid pick must (a) lie inside
+    // the (u,v) box of the region it resolves to (grown by a margin for hand-rounded
+    // centroids), and (b) not share its region with a pick that points elsewhere.
+    auto num = [](double v) {
+        std::ostringstream os;
+        os.precision(6);
+        os << v;
+        return os.str();
+    };
+    auto pt = [&](double u, double v) { return "[" + num(u) + ", " + num(v) + "]"; };
+    const std::string region_count =
+        "The sketch now has " + std::to_string(src.faces.size()) + " material region" +
+        (src.faces.size() == 1 ? "" : "s") + " (" + std::to_string(rows.size()) +
+        " closed loop region" + (rows.size() == 1 ? "" : "s") + ").";
+    std::vector<int> taker(rows.size(), -1);           // selector index that took the row
+    std::vector<Eigen::Vector2d> taker_at(rows.size());  // ...and the centroid it asked for
+
+    for (size_t si = 0; si < sels.size(); ++si) {
+        const json& s = sels[si];
         if (!s.is_object()) continue;
         // Prefer centroid when present (more robust than index).
         if (s.contains("centroid") && s["centroid"].is_array() && s["centroid"].size() >= 2) {
@@ -1319,10 +1478,11 @@ std::vector<TopoDS_Face> resolve_profile_faces(const FeatureResultMap& results,
             // the washer (material), not the void inner disc. An explicit index still
             // addresses the inner disc. hint_index is only a seed; a strictly closer
             // face still wins.
+            const bool has_hint = s.contains("hint_index") && s["hint_index"].is_number();
             int best = -1;
             double best_d2 = 0.0;
             double best_area = 0.0;
-            if (s.contains("hint_index") && s["hint_index"].is_number()) {
+            if (has_hint) {
                 int hi = static_cast<int>(s["hint_index"].get<double>());
                 if (hi >= 0 && hi < static_cast<int>(rows.size())) {
                     best = hi;
@@ -1343,7 +1503,49 @@ std::vector<TopoDS_Face> resolve_profile_faces(const FeatureResultMap& results,
                     best_area = rows[i].area;
                 }
             }
-            if (best >= 0) take(static_cast<size_t>(best));
+            if (best < 0) continue;
+            const FaceRow& br = rows[static_cast<size_t>(best)];
+            const std::string where = "profile[" + std::to_string(si) + "] (centroid " +
+                                      pt(cu, cv) + ") of sketch \"" + sketch_id + "\"";
+            // Without a hint_index seed, a tie between regions at DIFFERENT centroids has
+            // no correct answer: refuse instead of taking the first row.
+            if (!has_hint) {
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    if (static_cast<int>(i) == best) continue;
+                    const double du = rows[i].uv.x() - cu, dv = rows[i].uv.y() - cv;
+                    if (std::abs(du * du + dv * dv - best_d2) <= 1e-9 * std::max(1.0, best_d2) &&
+                        (rows[i].uv - br.uv).squaredNorm() > 1e-12)
+                        throw std::runtime_error(
+                            "profile: " + where + " is equidistant from the regions at " +
+                            pt(br.uv.x(), br.uv.y()) + " and " +
+                            pt(rows[i].uv.x(), rows[i].uv.y()) +
+                            ". Give the centroid of one region from the sketch readback.");
+                }
+            }
+            const Eigen::Vector2d size = br.hi - br.lo;
+            const double margin = std::max(0.5, 0.25 * std::max(size.x(), size.y()));
+            if (cu < br.lo.x() - margin || cu > br.hi.x() + margin ||
+                cv < br.lo.y() - margin || cv > br.hi.y() + margin)
+                throw std::runtime_error(
+                    "profile: " + where + " is outside the region nearest to it (centroid " +
+                    pt(br.uv.x(), br.uv.y()) + "). The selected region is not in the sketch. " +
+                    region_count +
+                    " If a loop of the sketch is open, close it with coincident relations. "
+                    "Then read the sketch regions again and update the profile.");
+            const size_t bi = static_cast<size_t>(best);
+            if (taker[bi] >= 0 && (taker_at[bi] - Eigen::Vector2d(cu, cv)).squaredNorm() > 1e-12)
+                throw std::runtime_error(
+                    "profile: " + where + " and profile[" + std::to_string(taker[bi]) +
+                    "] (centroid " + pt(taker_at[bi].x(), taker_at[bi].y()) +
+                    ") point to different locations but resolve to the same region (centroid " +
+                    pt(br.uv.x(), br.uv.y()) + "). " + region_count +
+                    " If an edit merged or removed regions, read the sketch regions again "
+                    "and update the profile.");
+            if (taker[bi] < 0) {
+                taker[bi] = static_cast<int>(si);
+                taker_at[bi] = Eigen::Vector2d(cu, cv);
+            }
+            take(bi);
             continue;
         }
         if (s.contains("index") && s["index"].is_number()) {
@@ -1780,6 +1982,12 @@ FaceSidInventory face_sid_inventory(const TopoDS_Shape& shape) {
         json selector = make_selector(descriptors.at(ordinal));
         selector.erase("hint_index");
         selector.erase("owner_feature");
+        // Derived readback (cylinder/cone axis point, torus surface); persisted finish
+        // fingerprints predate it, so keeping it out leaves every saved face_appearances
+        // record matching exactly as before.
+        for (const char* key : {"axis_point", "major_radius", "minor_radius", "torus_axis",
+                                "torus_center"})
+            selector.erase(key);
         auto& candidates = inventory[selector.at("sid").get<std::string>()];
         if (std::none_of(candidates.begin(), candidates.end(),
                          [id](const auto& candidate) { return candidate.first == id; }))
@@ -2811,7 +3019,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 sk["constraints"] = feat.value("constraints", json::array());
                 chudware::sketch::SketchSolution sol = chudware::sketch::solve_sketch(sk, env_json);
                 if (!sol.converged)
-                    throw std::runtime_error("sketch did not converge");
+                    throw std::runtime_error(chudware::sketch::nonconvergence_reason(sk, sol));
 
                 // The sketch plane: a reserved datum NAME ("plane.top"/...), a prior
                 // datum-plane feature id, OR a geometry reference to an existing planar
@@ -4532,7 +4740,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 } else {
                     depth = num_or_expr(feat.at("depth"), env);
                     if (!(depth > 0.0))
-                        throw std::runtime_error("extrude depth must be > 0");
+                        throw std::runtime_error(
+                            "extrude depth must be > 0. Depth is a length, not a direction. "
+                            "To extrude in the opposite direction, set flip to true.");
                 }
 
                 // --- second direction (end2 != "none"): a blind slab of depth2 along the
@@ -6115,6 +6325,79 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
 
                 const bool copy = feat.value("copy", false);
                 if (!copy) {
+                    // The overlap and attachment checks read result.tool_recs. A tool that
+                    // built this body was recorded at the body's OLD pose, so after the move
+                    // it no longer matches the part (seen live: f56/f66 reported as a
+                    // boss_overlap/cut_into_boss at their pre-transform z). Move every tool of
+                    // the body's lineage by the same rigid motion. Lineage = the source_of
+                    // chain plus earlier in-place transforms/heals (superseded_by). A tool whose
+                    // feature is in no live body's lineage (a secondary merge target) belongs
+                    // to this body when it touches the pre-move body. A tool shared with a
+                    // body that stays (a split piece) keeps its record and gets a moved copy.
+                    if (!zero_motion && !result.tool_recs.empty()) {
+                        std::map<std::string, std::string> supersedes;
+                        for (const auto& link : superseded_by) supersedes[link.second] = link.first;
+                        auto lineage_of = [&](const std::string& root) {
+                            std::set<std::string> seen;
+                            std::vector<std::string> stack{root};
+                            while (!stack.empty()) {
+                                const std::string x = stack.back();
+                                stack.pop_back();
+                                if (!seen.insert(x).second) continue;
+                                if (auto it = source_of.find(x); it != source_of.end())
+                                    stack.push_back(it->second);
+                                if (auto it = supersedes.find(x); it != supersedes.end())
+                                    stack.push_back(it->second);
+                            }
+                            return seen;
+                        };
+                        const std::set<std::string> moved = lineage_of(eff_id);
+                        std::set<std::string> stays;
+                        std::vector<TopoDS_Shape> stay_bodies;
+                        for (const std::string& sid : solid_order) {
+                            if (sid == eff_id || consumed.count(sid) || !results.count(sid))
+                                continue;
+                            const auto* sr = std::get_if<SolidResult>(&*results.at(sid));
+                            if (!sr || sr->shape.IsNull()) continue;
+                            stay_bodies.push_back(sr->shape);
+                            for (const std::string& f : lineage_of(sid)) stays.insert(f);
+                        }
+                        auto touches = [](const TopoDS_Shape& a, const TopoDS_Shape& b) {
+                            try {
+                                Bnd_Box ba, bb;
+                                BRepBndLib::Add(a, ba, Standard_False);
+                                BRepBndLib::Add(b, bb, Standard_False);
+                                ba.Enlarge(1e-6);
+                                if (ba.IsOut(bb)) return false;
+                                BRepExtrema_DistShapeShape dss(a, b);
+                                return dss.IsDone() && dss.NbSolution() > 0 &&
+                                       dss.Value() <= 1e-6;
+                            } catch (const Standard_Failure&) {
+                                return false;
+                            }
+                        };
+                        const double move_rad =
+                            std::abs(angle_deg) > 1e-9 ? radians(angle_deg) : 0.0;
+                        std::vector<ToolRec> moved_copies;
+                        for (ToolRec& tr : result.tool_recs) {
+                            bool mine = moved.count(tr.feature_id) > 0;
+                            bool shared = mine && stays.count(tr.feature_id) > 0;
+                            if (!mine && !stays.count(tr.feature_id) && touches(tr.tool, body)) {
+                                mine = true;
+                                for (const TopoDS_Shape& other : stay_bodies)
+                                    if (touches(tr.tool, other)) { shared = true; break; }
+                            }
+                            if (!mine) continue;
+                            TopoDS_Shape placed = ::geom::rigid_instance(
+                                tr.tool, pivot, axis_dir, move_rad, translate);
+                            if (placed.IsNull()) continue;
+                            if (shared)
+                                moved_copies.push_back(ToolRec{tr.feature_id, tr.role, placed});
+                            else
+                                tr.tool = placed;
+                        }
+                        for (ToolRec& tr : moved_copies) result.tool_recs.push_back(std::move(tr));
+                    }
                     consumed.insert(eff_id);            // move in place: source replaced
                     superseded_by[eff_id] = id;         // a later transform composes on `id`
                 }
@@ -6652,6 +6935,11 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         "hole: 'face' selector is required (the planar face to drill into)");
                 validate_selector_refs(*face_it, "hole face");  // Bug K4
                 TopoDS_Face face;
+                // A WORD query names a direction, not one face — world_points may then land
+                // on another face of the body facing the same way (hole_world_point). A sid
+                // query or a concrete pick names exactly one face and stays strict.
+                const bool word_query_face =
+                    chudware::doc::is_geom_query(*face_it) && !face_it->contains("sid");
                 if (chudware::doc::is_geom_query(*face_it)) {
                     // word query: "drill the top face" -> {"of":"face","side":"top"}.
                     chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(body, *face_it);
@@ -6689,32 +6977,61 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // out looking like Ø5), axes = the deterministic SketchPlane convention
                 // (u = world +X projected, v = n×u) instead of the kernel's arbitrary
                 // surface parameterization.
-                gp_Dir nd = pln.Axis().Direction();
-                Eigen::Vector3d normal(nd.X(), nd.Y(), nd.Z());
-                // OUTWARD-NORMAL CORRECTION: a face stored REVERSED in the solid has its
-                // geometric normal pointing INTO the material, so flip it to point OUT
-                // of the solid. drill_dir then points INTO the material (the watch-point:
-                // get this wrong and the cut removes nothing).
-                if (face.Orientation() == TopAbs_REVERSED) normal = -normal;
+                // OUTWARD normal (geom/face_normal.h: plane-frame handedness + face
+                // orientation), so drill_dir points INTO the material (the watch-point: get
+                // this wrong and the cut removes nothing — a revolved shaft's x=0 end face has
+                // a left-handed plane frame, and Axis() alone drilled it outward into air).
+                const gp_Dir nd = ::chudware::geom::plane_outward_normal(face, pln);
+                const Eigen::Vector3d normal(nd.X(), nd.Y(), nd.Z());
                 const chudware::geom::SketchPlane fframe = hole_face_frame(face, normal);
                 const Eigen::Vector3d origin = fframe.origin;
                 const Eigen::Vector3d xdir = fframe.uAxis;
                 const Eigen::Vector3d ydir = fframe.vAxis;
                 const Eigen::Vector3d drill_dir = -normal;
 
-                // --- positions: [u,v] face-local mm pairs; default = face centre ---
-                std::vector<std::pair<double, double>> uv;
+                // --- positions: [u,v] face-local mm pairs, OR world_points: [x,y,z] world
+                // mm points on each bore AXIS, projected along the face normal onto the face
+                // the drill enters (see hole_world_point: a projection more than
+                // kHoleWorldPointNoteMm or a same-normal face substitution becomes the feature
+                // warning; an axis that enters no such face is refused by name). The two are
+                // mutually exclusive. Neither = one hole at the face centre. `mouths` holds
+                // each bore's world point ON its entry face.
+                std::vector<Eigen::Vector3d> mouths;
+                std::string projection_notes;  // appended to st.warning once the cut lands
                 auto pos_it = feat.find("positions");
-                if (pos_it != feat.end() && pos_it->is_array() && !pos_it->empty()) {
+                auto wpt_it = feat.find("world_points");
+                const bool has_pos =
+                    pos_it != feat.end() && pos_it->is_array() && !pos_it->empty();
+                const bool has_wpt = wpt_it != feat.end() && !wpt_it->is_null();
+                if (has_pos && has_wpt)
+                    throw std::runtime_error(
+                        "hole: give positions (face-local [u, v]) OR world_points (world "
+                        "[x, y, z]), not both — they place the same holes two different ways");
+                if (has_wpt) {
+                    if (!wpt_it->is_array() || wpt_it->empty())
+                        throw std::runtime_error(
+                            "hole: world_points must be a non-empty list of world points "
+                            "[[x, y, z], ...] in mm (got " + wpt_it->dump() + ")");
+                    for (std::size_t k = 0; k < wpt_it->size(); ++k) {
+                        const HoleWorldPoint hp = hole_world_point(
+                            face, fframe, (*wpt_it)[k],
+                            "hole: world_points[" + std::to_string(k) + "]", env, true,
+                            word_query_face ? &body : nullptr);
+                        mouths.push_back(hp.at);
+                        if (!hp.note.empty())
+                            projection_notes += (projection_notes.empty() ? "" : " ") + hp.note;
+                    }
+                } else if (has_pos) {
                     for (std::size_t k = 0; k < pos_it->size(); ++k) {
                         const json& p = (*pos_it)[k];
                         if (!p.is_array() || p.size() < 2)
                             throw std::runtime_error(
                                 "hole: positions[" + std::to_string(k) + "] must be [u, v]");
-                        uv.emplace_back(p[0].get<double>(), p[1].get<double>());
+                        mouths.push_back(origin + p[0].get<double>() * xdir +
+                                         p[1].get<double>() * ydir);
                     }
                 } else {
-                    uv.emplace_back(0.0, 0.0);  // back-compat single hole at face centre
+                    mouths.push_back(origin);  // back-compat single hole at face centre
                 }
 
                 // --- style. "tap" is a TAPPED hole: the oracle (hole.py) drills a plain
@@ -6792,9 +7109,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // rather than folding pairwise fuse over a growing union (~O(N²) for a
                 // multi-position hole). A single position skips the boolean entirely.
                 std::vector<TopoDS_Shape> tools;
-                tools.reserve(uv.size());
-                for (const auto& p : uv) {
-                    Eigen::Vector3d world = origin + p.first * xdir + p.second * ydir;
+                tools.reserve(mouths.size());
+                for (const Eigen::Vector3d& world : mouths) {
                     Eigen::Vector3d lifted = world + lift * normal;  // just above the face
                     TopoDS_Shape t =
                         ::geom::make_hole_tool(lifted, drill_dir, style, tool_dims);
@@ -6840,9 +7156,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     TopoDS_Shape thru_union;
                     bool thru_ok = true;
                     std::vector<TopoDS_Shape> thru_tools;
-                    thru_tools.reserve(uv.size());
-                    for (const auto& p : uv) {
-                        Eigen::Vector3d world = origin + p.first * xdir + p.second * ydir;
+                    thru_tools.reserve(mouths.size());
+                    for (const Eigen::Vector3d& world : mouths) {
                         Eigen::Vector3d lifted = world + lift * normal;
                         TopoDS_Shape t =
                             ::geom::make_hole_tool(lifted, drill_dir, style, thru_dims);
@@ -6876,6 +7191,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         }
                     }
                 }
+                if (!projection_notes.empty())
+                    st.warning = st.warning.empty() ? projection_notes
+                                                    : st.warning + " " + projection_notes;
 
                 // The drilled solid REPLACES the body (SolidWorks-style): the bored
                 // solid is the body's new current state in the tree.
@@ -6933,6 +7251,18 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 Eigen::Vector3d normal = src_face_normal(face);
                 chudware::geom::SketchPlane fr = hole_face_frame(face, normal);
                 const Eigen::Vector3d drill_dir = -normal;
+                // Ring centre: the face centre, or `world_center` [x,y,z] (world mm) — a point
+                // on the ring's central axis, projected along the face normal exactly like a
+                // hole `world_points` entry (noted when projected; refused when it misses).
+                Eigen::Vector3d ring_c = fr.origin;
+                if (feat.contains("world_center") && !feat.at("world_center").is_null()) {
+                    const HoleWorldPoint hp = hole_world_point(
+                        face, fr, feat.at("world_center"), "bolt_circle: world_center", env,
+                        false, nullptr);
+                    ring_c = hp.at;
+                    if (!hp.note.empty())
+                        st.warning = st.warning.empty() ? hp.note : st.warning + " " + hp.note;
+                }
 
                 // Ring geometry.
                 const int count = static_cast<int>(std::llround(num_or_expr(feat.at("count"), env)));
@@ -7002,7 +7332,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 tools.reserve((size_t)count);
                 for (int k = 0; k < count; ++k) {
                     const double ang = a0 + 2.0 * PI * static_cast<double>(k) / static_cast<double>(count);
-                    Eigen::Vector3d world = fr.origin + (ring_r * std::cos(ang)) * fr.uAxis +
+                    Eigen::Vector3d world = ring_c + (ring_r * std::cos(ang)) * fr.uAxis +
                                                      (ring_r * std::sin(ang)) * fr.vAxis;
                     Eigen::Vector3d lifted = world + lift * normal;
                     TopoDS_Shape t = ::geom::make_hole_tool(lifted, drill_dir, style, tool_dims);
@@ -7096,20 +7426,25 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 BRepGProp::VolumeProperties(body, gp_in);
                 const double vol_in = gp_in.Mass();
 
-                TopoDS_Shape out = ::geom::shell_solid(body, t, outward, remove);
+                std::string shell_diag;
+                TopoDS_Shape out = ::geom::shell_solid(body, t, outward, remove, &shell_diag);
                 if (out.IsNull()) {
-                    // Distinguish a genuine kernel limitation (curved/B-spline skins)
-                    // from an ordinary failure so the caller gets an actionable fix
-                    // instead of an opaque "empty shape" (Bug L-1).
+                    // shell_solid walked every join/tolerance strategy and accepted none
+                    // (each result must be BRepCheck-valid and watertight there — the open-
+                    // shell commit of Bug S1/S2 can no longer reach this branch), so name the
+                    // kernel's ACTUAL reason instead of a guess (Bug L-1). A freeform skin
+                    // keeps the actionable "build it into the profile" refusal; a revolved /
+                    // swept body whose offset validates never gets here.
                     if (::geom::has_freeform_faces(body))
                         throw std::runtime_error(
-                            "shell is not supported on lofted / swept / revolved "
-                            "(B-spline / freeform) bodies — the offset self-intersects "
-                            "on curved skins. Build the wall thickness INTO the profile "
-                            "instead: sketch a thin closed wall cross-section (offset "
-                            "inner + outer curves) and loft/revolve THAT to get a hollow "
-                            "body directly, rather than shelling a solid one.");
-                    throw std::runtime_error("shell produced an empty shape");
+                            "shell is not supported on this lofted / swept / revolved "
+                            "(B-spline / freeform) body — " + shell_diag + ". Build the "
+                            "wall thickness INTO the profile instead: sketch a thin closed "
+                            "wall cross-section (offset inner + outer curves) and "
+                            "loft/revolve THAT, or loft a second set of sections inset by "
+                            "the wall and cut it, rather than shelling a solid one.");
+                    throw std::runtime_error("shell produced an empty shape — " + shell_diag +
+                                             " — reduce the thickness or open a face");
                 }
                 // A VALID inward shell ALWAYS reduces the solid volume (it carves a
                 // cavity); a valid OUTWARD shell grows it. Either way the volume must
@@ -7140,30 +7475,6 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                             "the part) — reduce the thickness", t);
                         throw std::runtime_error(buf);
                     }
-                }
-                // OPEN-SHELL guard (Bug S1/S2): the thick-solid offset on a FREEFORM skin
-                // (a spline-revolve vase = SurfaceOfRevolution faces, a swept tube, ...) can
-                // hand back a NON-NULL body that the volume guard accepts (the volume moved)
-                // but that is an OPEN shell with genuine free edges — so the shell SILENTLY
-                // committed an invalid body, vanished from a watertight rebuild, and only
-                // eval_check / STEP re-validation later flagged free_edges. It must NEVER
-                // ship an open body. Validate the result is a CLOSED solid (seam-aware, so a
-                // valid revolved/cylindrical body's seams are not mistaken for free edges).
-                // On a freeform body, emit the SAME actionable message as the null-result
-                // path (matching the loft case) instead of an opaque "open body".
-                if (!dress_is_closed_solid(out)) {
-                    if (::geom::has_freeform_faces(body))
-                        throw std::runtime_error(
-                            "shell is not supported on lofted / swept / revolved "
-                            "(B-spline / freeform) bodies — the offset produced an open "
-                            "(non-watertight) shell on the curved skin. Build the wall "
-                            "thickness INTO the profile instead: sketch a thin closed wall "
-                            "cross-section (offset inner + outer curves) and loft/revolve "
-                            "THAT to get a hollow body directly, rather than shelling a "
-                            "solid one.");
-                    throw std::runtime_error(
-                        "shell produced an open/invalid body (free edges / not a closed "
-                        "solid) — reduce the thickness or open a face to hollow it cleanly");
                 }
                 consumed.insert(body_id);
                 source_of[id] = body_id;  // owner-map: derives from the input body
@@ -7878,9 +8189,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     BRepAdaptor_Surface surf(fc);
                     if (surf.GetType() != GeomAbs_Plane)
                         throw std::runtime_error(std::string(what) + ": the picked face is not planar");
-                    gp_Dir d = surf.Plane().Axis().Direction();
+                    const gp_Dir d = ::chudware::geom::plane_outward_normal(fc, surf.Plane());
                     Eigen::Vector3d n(d.X(), d.Y(), d.Z());
-                    if (fc.Orientation() == TopAbs_REVERSED) n = -n;
                     if (n.norm() < 1e-9)
                         throw std::runtime_error(std::string(what) + ": degenerate face normal");
                     return n.normalized();
@@ -8861,8 +9171,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         "text: target_face must be a PLANAR face (emboss/engrave marks a "
                         "flat surface)");
                 gp_Pln pln = ad.Plane();
-                gp_Dir normal = pln.Axis().Direction();
-                if (tface.Orientation() == TopAbs_REVERSED) normal.Reverse();
+                gp_Dir normal = ::chudware::geom::plane_outward_normal(tface, pln);
                 gp_Dir xdir = pln.XAxis().Direction();
                 // READING DIRECTION. A planar face's parametric X axis is arbitrary — on a
                 // VERTICAL wall (a box side) OCCT's X often points along world Z, which would

@@ -2,15 +2,16 @@
 //
 // A PINNED, full-height, rounded liquid-glass column overlaid on the viewport's right edge with
 // ~12dp margins (geometry from ui::viewportBackdrop(); visible left-edge resize boundary + grip;
-// the docked task-pane layout is gone — this is the only layout). Top-down: ONE slim header row
-// (the live animated tesseract brand mark, tinted by run status — its animation style comes from
-// Settings -> Appearance -> Brand mark — then the Chat / Tasks / Artifacts / Sessions pills and a
-// right-pinned settings gear; no text wordmark, the title bar carries the brand), then the
-// conversation log with a per-turn transparent activity timeline (what the AI is doing /
-// thinking, expandable), and a bottom composer (compact
+// the docked task-pane layout is gone — this is the only layout). Top-down: a TWO-row header —
+// row 1 is navigation (the live animated tesseract brand mark, tinted by run status — its
+// animation style comes from Settings -> Appearance -> Brand mark — then the Chat / Tasks /
+// Artifacts pills and a right-pinned settings gear; no text wordmark, the title bar carries the
+// brand), row 2 is session actions (an always-labelled Sessions toggle left, + New chat right) —
+// then the conversation log with a per-turn transparent activity timeline (what the AI is
+// doing / thinking, expandable), and a bottom composer (compact
 // Agent/Plan/Swarm/Edit/Ask dropdown + context meter; transparent prompt with in-box send;
-// graduated-width segmented model/thinking/paperclip/cube/New toolbar — model biggest, icons
-// smallest). Header gear swaps the chat area for a compact AI-settings overlay (horizontal top
+// graduated-width segmented model/effort/attachment/mic/context toolbar). Header gear swaps the
+// chat area for a compact AI-settings overlay (horizontal top
 // tabs for Agents/Prompts/Skills/Context/Permissions/Providers). The full form lives in the
 // Settings modal AI tab. Bubbles/cards and the composer are painted as translucent adaptive
 // Liquid-Glass bubbles over the live viewport backdrop (host contract H5, GlassGroup::Copilot)
@@ -35,17 +36,18 @@
 
 namespace ui {
 
-// ---- header: logo row + collapse + [Chat L | Sessions C | Settings R] + status ----
+// ---- header: collapse + [brand | Chat Tasks Artifacts ... gear] / [Sessions ... + New chat] ----
 // Copilot vertical-collapse state (file scope so the header's collapse chevron and drawAIPanel's
 // height animation share it). Mirrors the FeatureManager collapse (T-G21: rolls UP to this header
 // strip instead of shrinking to a pill in both axes). Seeded from st.settings.copilotCollapsed on
 // drawAIPanel's first call (see s_cpInited there) so a collapsed column stays collapsed across
 // restarts.
 static bool s_cpCollapsed = false;
-// The header is a RADIO strip, not four independent toggles: exactly one of Chat / Tasks /
-// Artifacts / Sessions / Settings is showing, and Chat is "no overlay". AppState carries it as
-// four bools (integrator-owned), so funnel every read and write through these two so a new
-// surface can never leave two of them true — or, worse, set one without clearing the rest.
+// The header's tabs are a RADIO set, not independent toggles: exactly one of Chat / Tasks /
+// Artifacts / Sessions / Settings is showing, and Chat is "no overlay". Sessions lives on the
+// second header row but belongs to the same set. AppState carries it as four bools
+// (integrator-owned), so funnel every read and write through these two so a new surface can
+// never leave two of them true — or, worse, set one without clearing the rest.
 enum class CpTab { Chat, Tasks, Artifacts, Sessions, Settings };
 
 static CpTab cpActiveTab(const AppState& st) {
@@ -130,13 +132,15 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float minGap = style.ItemSpacing.x;
     const float topPad = 6.0f * sc;
 
-    // One slim row: [brand mark] [Chat] [Tasks n/n] [Artifacts] [Sessions] ... [gear].
+    // Row 1 (navigation): [brand mark] [Chat] [Tasks n/n] [Artifacts] ... [gear].
+    // Row 2 (session actions): [Sessions] ... [+ New chat].
     // The brand mark is a 32-edge figure, not a 12-edge cube glyph: measured against rendered
-    // filmstrips its nested-cell structure only resolves from ~26 px up, so it sets the row's
-    // height floor and every pill centres on that.
+    // filmstrips its nested-cell structure only resolves from ~26 px up, so it sets row 1's
+    // height floor and every pill centres on that. Row 2 is one frame tall.
     const float frameH = ImGui::GetFrameHeight();
     const float markSz = std::max(frameH, 26.0f * sc);
     const float rowH   = std::max(std::max(lh, frameH), markSz);
+    const float rowGap = ui::metrics::px(4.0f);
 
     auto measureBtn = [&](const char* label, const char* iconName, bool withLabel) -> float {
         const float iconSz = lh * 0.92f;
@@ -146,9 +150,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         const float tw = withLabel ? ImGui::CalcTextSize(label).x : 0.0f;
         float contentW = tw;
         if (icon.valid) contentW += iconSz + (withLabel ? iconGap : 0.0f);
-        // No column floor any more (the two-row layout needed one to keep its pills aligned):
-        // in a single strip every pill is sized by its own content, and an icon-only pill only
-        // needs to be square-ish around the glyph.
+        // Every pill is sized by its own content; an icon-only pill only needs to be
+        // square-ish around the glyph.
         const float floorW = iconSz + padX * 2.0f;
         return std::max(contentW + padX * 2.0f, floorW);
     };
@@ -160,43 +163,54 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     char tlLabel[24];
     std::snprintf(tlLabel, sizeof(tlLabel), "%d/%d", tlDone, tlTotal);
 
-    // Responsive shedding. A pinned column narrows to dockRightMin(), which is not wide enough
-    // for four labelled pills plus the gear — and the old fixed layout answered that by clamping
-    // every pill to the same overlapping x, piling "0/0" on top of the wordmark. Shed LABELS in
-    // order of value instead (icons + tooltips still identify each tab); never drop a tab.
-    // The gear is always icon-only — it reads as a gear, and its tooltip names it.
+    // Row 1 responsive shedding. A pinned column narrows to dockRightMin(), which is not wide
+    // enough for three labelled pills plus the brand mark and gear. Shed LABELS in order of
+    // value instead (icons + tooltips still identify each tab); never drop a tab. The gear is
+    // always icon-only — it reads as a gear, and its tooltip names it. rowFits(), the gap
+    // compression below and the placed hit boxes all come from measureBtn, so shedding
+    // decisions, submitted hit zones and painted pills can never disagree.
     const float markGap = 6.0f * sc;
+    // Room right of the brand mark for markGap + the four pills + their three gaps.
+    const float row1Room = colW - rightInset - contentLeftInset - markSz;
     const float gearW = measureBtn("Settings", "settings", false);
-    bool lChat = true, lTasks = true, lArts = true, lSess = true;
-    // Chat and Sessions read as one visual pair ONLY while they are in the same label state
-    // (both labelled or both icon-only): then both take the larger measurement. Once shedding
-    // drops one pill's label, each is sized by its own content — forcing an icon-only Sessions
-    // pill to Chat's labelled width painted a wide empty pill around a lone glyph. rowFits()
-    // and the placed hit boxes both come from this one function, so shedding decisions,
-    // submitted hit zones and painted pills can never disagree.
-    struct PillWidths { float chat, tasks, arts, sess; };
-    auto pillWidths = [&]() -> PillWidths {
-        PillWidths w{measureBtn("Chat", "ai_panel", lChat),
-                     measureBtn(tlLabel, "plan_board", lTasks),
-                     measureBtn("Artifacts", "artifacts", lArts),
-                     measureBtn("Sessions", "history", lSess)};
-        if (lChat == lSess) w.chat = w.sess = std::max(w.chat, w.sess);
-        return w;
-    };
+    bool lChat = true, lTasks = true, lArts = true;
     auto rowFits = [&]() -> bool {
-        const PillWidths pw = pillWidths();
-        const float w = pw.chat + pw.tasks + pw.arts + pw.sess + gearW + 4.0f * minGap;
-        return w <= (colW - rightInset - contentLeftInset - markSz - markGap);
+        const float w = measureBtn("Chat", "ai_panel", lChat) +
+                        measureBtn(tlLabel, "plan_board", lTasks) +
+                        measureBtn("Artifacts", "artifacts", lArts) + gearW + 3.0f * minGap;
+        return w <= row1Room - markGap;
     };
     if (!rowFits()) { lArts = false;
-    if (!rowFits()) { lSess = false;
     if (!rowFits()) { lTasks = false;
-    if (!rowFits()) { lChat = false; } } } }
-    const PillWidths pw = pillWidths();
-    const float chatW = pw.chat;
-    const float tlW   = pw.tasks;
-    const float artW  = pw.arts;
-    const float sessW = pw.sess;
+    if (!rowFits()) { lChat = false; } } }
+    const float chatW = measureBtn("Chat", "ai_panel", lChat);
+    const float tlW   = measureBtn(tlLabel, "plan_board", lTasks);
+    const float artW  = measureBtn("Artifacts", "artifacts", lArts);
+    // Still too tight with every label shed (dockRightMin leaves only a few px): compress the
+    // gaps to the measured leftover instead of clamping pills onto one x. The mark gap takes
+    // at most a quarter of the spare, the three pill gaps share the rest evenly, so the gear
+    // still lands flush right and no two hit boxes overlap.
+    float mGap = markGap, tabGap = minGap;
+    if (chatW + tlW + artW + gearW + 3.0f * minGap > row1Room - markGap) {
+        const float spare = std::max(0.0f, row1Room - (chatW + tlW + artW + gearW));
+        mGap   = std::min(markGap, spare * 0.25f);
+        tabGap = std::min(minGap, (spare - mGap) / 3.0f);
+    }
+
+    // Row 2. Sessions is ALWAYS labelled — it is the one way into the session list and must
+    // read as such at every width. Its left edge clears the column's left-edge resize grab
+    // strip (U(2), ui::columnResizeEdge) so it never steals a resize drag; the collapse chip
+    // above is the only header item allowed to overlap that strip. New chat sheds instead:
+    // "New chat" -> "New" -> icon-only (tooltip names it), so the two hit boxes never overlap.
+    const float usableR = colW - rightInset;
+    const float row2L = ui::metrics::U(2.0f);
+    const float sessW = measureBtn("Sessions", "history", true);
+    const float row2Avail = usableR - row2L - sessW - minGap;
+    const char* newLabel = "New chat";
+    bool lNew = true;
+    float newW = measureBtn(newLabel, "new_doc", true);
+    if (newW > row2Avail) { newLabel = "New"; newW = measureBtn(newLabel, "new_doc", true); }
+    if (newW > row2Avail) { lNew = false;     newW = measureBtn(newLabel, "new_doc", false); }
 
     // ---- Collapse chip: drawn INSIDE this window at an absolute screen position
     // (SetCursorScreenPos), exactly like the FeatureManager's ##lp_collapse — NOT a
@@ -212,9 +226,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     // it win the same-window overlap the normal "later item wins" way.
     {
         const ImVec2 winP0 = ImGui::GetWindowPos();
-        // The header is pulled to window top (drawAIPanel SetCursorPosY(0)), so the true
-        // stack is now just: topPad + the single row. Center the chip across exactly that —
-        // no content-region/padding offset.
+        // The header is pulled to window top (drawAIPanel SetCursorPosY(0)), so row 1 is just
+        // topPad down. Center the chip on row 1 only — row 2 sits below it, starting left.
         const float chipY = winP0.y + topPad + (rowH - chevSz) * 0.5f;
         const ImVec2 c0(winP0.x + leftInset, chipY);
         const ImVec2 savedCur = ImGui::GetCursorScreenPos();
@@ -251,8 +264,8 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SetCursorScreenPos(savedCur);
     }
 
-    // ---- The row itself. HIT ZONES only; every pill is painted together at the end, after
-    // this frame's click has already moved `tabOut`. ----
+    // ---- The rows themselves. HIT ZONES only; every pill is painted together at the end,
+    // after this frame's click has already moved `tabOut`. ----
     ImGui::Dummy(ImVec2(0, topPad));
     const float rowTop = ImGui::GetCursorPosY();
     auto centerY = [&](float h) { ImGui::SetCursorPosY(rowTop + (rowH - h) * 0.5f); };
@@ -283,14 +296,14 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     }
     const bool markHovered = ImGui::IsItemHovered();
 
-    // Tabs, left to right; the gear is pinned to the right edge and the four before it are
-    // clamped so they can never slide under it on an absurdly narrow column.
-    const float usableR = colW - rightInset;
+    // Tabs, left to right with the (possibly compressed) row-1 gaps; the gear is pinned to the
+    // right edge. The gaps were sized from the same measurements, so sequential placement ends
+    // at or before the gear — no clamp that could stack pills onto one x.
     const float gearX = usableR - gearW;
-    float x = contentLeftInset + markSz + markGap;
+    float x = contentLeftInset + markSz + mGap;
     auto place = [&](float w) -> float {
-        const float xi = std::min(x, std::max(contentLeftInset, gearX - minGap - w));
-        x = xi + w + minGap;
+        const float xi = x;
+        x = xi + w + tabGap;
         return xi;
     };
 
@@ -301,7 +314,9 @@ static void drawCopilotHeader(AppState& st, bool busy) {
 
     // NOTE: deliberately NOT gated on `busy` — these are read-only viewer panels (task list /
     // artifacts / chat log / session switcher), not actions that could race a running turn.
-    // Users need to check progress while a run is in motion.
+    // Users need to check progress while a run is in motion. New chat is not gated either:
+    // runs are per-conversation (st.runs) and park/restore keeps them streaming in the
+    // background, so starting a session mid-run is the multi-session workflow.
     centerY(frameH);
     ImGui::SetCursorPosX(place(tlW));
     HeaderBtnHit hTasks = headerTextButtonHit("##hdr_tasks", tlW);
@@ -313,23 +328,39 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     if (hArts.clicked) tabOut = cpTabAfterClick(tabIn, CpTab::Artifacts);
 
     centerY(frameH);
-    ImGui::SetCursorPosX(place(sessW));
-    HeaderBtnHit hSess = headerTextButtonHit("##hdr_sess", sessW);
-    if (hSess.clicked) tabOut = cpTabAfterClick(tabIn, CpTab::Sessions);
-
-    centerY(frameH);
     ImGui::SetCursorPosX(gearX);
     HeaderBtnHit hGear = headerTextButtonHit("##hdr_gear", gearW);
     if (hGear.clicked) tabOut = cpTabAfterClick(tabIn, CpTab::Settings);
 
+    // Row 2: Sessions toggles the project-scoped session list (drawSessionsPanel) and back;
+    // New chat is the dock's ONE new-session action, reachable from every overlay.
+    const float row2Top = rowTop + rowH + rowGap;
+    ImGui::SetCursorPosY(row2Top);
+    ImGui::SetCursorPosX(row2L);
+    HeaderBtnHit hSess = headerTextButtonHit("##hdr_sess", sessW);
+    if (hSess.clicked) tabOut = cpTabAfterClick(tabIn, CpTab::Sessions);
+
+    ImGui::SetCursorPosY(row2Top);
+    ImGui::SetCursorPosX(std::max(row2L + sessW + minGap, usableR - newW));
+    HeaderBtnHit hNew = headerTextButtonHit("##hdr_new", newW);
+    if (hNew.clicked) tabOut = CpTab::Chat;   // land in the new chat, not on an overlay
+
     // ---- Resolve, THEN paint. Every pill draws from the same, final selection, so the tab
     // you just picked lights up on the very frame you release the mouse. ----
     if (tabOut != tabIn) cpSetTab(st, tabOut);
+    if (hNew.clicked) {
+        newConversation(st);   // parks (or replaces, if untouched) the outgoing session
+        st.prompt[0] = 0;
+        st.pendingAttachments.clear();
+        st.pendingContextRefs.clear();
+        st.contextPickActive = false;
+    }
     headerTextButtonPaint(hChat,  "Chat",      tabOut == CpTab::Chat,      "ai_panel",  lChat);
     headerTextButtonPaint(hTasks, tlLabel,     tabOut == CpTab::Tasks,     "plan_board", lTasks);
     headerTextButtonPaint(hArts,  "Artifacts", tabOut == CpTab::Artifacts, "artifacts", lArts);
-    headerTextButtonPaint(hSess,  "Sessions",  tabOut == CpTab::Sessions,  "history",   lSess);
     headerTextButtonPaint(hGear,  "Settings",  tabOut == CpTab::Settings,  "settings",  false);
+    headerTextButtonPaint(hSess,  "Sessions",  tabOut == CpTab::Sessions,  "history",   true);
+    headerTextButtonPaint(hNew,   newLabel,    false,                      "new_doc",   lNew);
 
     // One tooltip at most; each says what the click will DO, including the click that takes
     // you back to the conversation. The brand mark's tooltip is the run status.
@@ -346,8 +377,11 @@ static void drawCopilotHeader(AppState& st, bool busy) {
                               ? kBack
                               : "Artifacts \xc2\xb7 documents, renders and files this session");
     } else if (hSess.hovered) {
-        ImGui::SetTooltip(tabOut == CpTab::Sessions ? kBack
-                                                    : "Sessions \xc2\xb7 switch between sessions");
+        ImGui::SetTooltip(tabOut == CpTab::Sessions
+                              ? kBack
+                              : "Sessions \xc2\xb7 switch between this project's sessions");
+    } else if (hNew.hovered) {
+        ImGui::SetTooltip("New chat \xc2\xb7 start a fresh session");
     } else if (hGear.hovered) {
         ImGui::SetTooltip(tabOut == CpTab::Settings
                               ? kBack
@@ -356,11 +390,11 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SetTooltip("%s", statusTip);
     }
 
-    // Leave the cursor EXACTLY below the single row (s_cpAnim.measureHeader() in drawAIPanel is
-    // cursor-driven, so collapse/expand geometry depends on this), plus breathing room before
-    // the Separator drawAIPanel emits — the two were flush, which read as the pills sitting ON
-    // the rule. ItemSpacing.y is 0 here, so this is exact.
-    ImGui::SetCursorPosY(rowTop + rowH);
+    // Leave the cursor EXACTLY below row 2 (s_cpAnim.measureHeader() in drawAIPanel is
+    // cursor-driven, so the collapsed height is the full two-row header), plus breathing room
+    // before the Separator drawAIPanel emits — the two were flush, which read as the pills
+    // sitting ON the rule. ItemSpacing.y is 0 here, so this is exact.
+    ImGui::SetCursorPosY(row2Top + frameH);
     ImGui::Dummy(ImVec2(0, ui::metrics::px(4.0f)));
 }
 
@@ -940,23 +974,10 @@ void drawSessionsPanel(AppState& st, bool busy) {
         ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
     }
 
-    // New-session is the one PRIMARY action in the copilot menus, so it uses the accent
-    // primaryButton rather than the theme's default slab (which rendered as a flat dark block
-    // that read as a disabled panel over the light glass). Return to chat via the header Chat
-    // button (Sessions stays labeled "Sessions" — no "< Chat" rename that reflows the header).
-    // New-session stays enabled while a run is active: runs are per-conversation (st.runs)
-    // and park/restore keeps them streaming in the background, so starting or switching
-    // sessions mid-run is safe — this is the multi-session workflow.
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
-    if (primaryButton("+ New session", ImVec2(-1, 0))) {
-        newConversation(st);
-        st.prompt[0] = 0;
-        cpSetTab(st, CpTab::Chat);   // land in the new chat, not stuck on the list
-    }
-    ImGui::PopStyleVar();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start a fresh session.");
-
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
+    // No new-session action here: in the dock, the pinned header's "New chat" (row 2, next to
+    // the Sessions toggle) is the one way to start a session from any overlay; the full AI
+    // workspace carries New session in its own chat header. This panel only lists, switches
+    // and manages the viewed project's sessions.
 
     const ImGuiStyle& style = ImGui::GetStyle();
     ImDrawList* dl = ImGui::GetWindowDrawList();

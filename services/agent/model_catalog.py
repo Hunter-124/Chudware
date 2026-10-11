@@ -347,6 +347,7 @@ def discover_anthropic_static() -> list[ModelRow]:
         for model, label in (
             ("claude-opus-5-5", "Claude Opus 5.5"),
             ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+            ("claude-haiku-5-5", "Claude Haiku 5.5"),
         )
     ]
 
@@ -621,12 +622,18 @@ def heuristic_row(provider: str, model_id: str) -> ModelRow:
     context = 8192
     max_output = 0
     vision = False
+    label = model_id
     if (p == "gemini" or "gemini" in m) and "1.5-pro" in m:
         context = 2097152
     elif (p == "gemini" or "gemini" in m) and any(x in m for x in ("1.5-flash", "2.0", "2.5", "flash")):
         context = 1048576
     elif any(x in m for x in ("claude", "opus", "sonnet", "haiku")):
-        context = 1000000 if re.search(r"(?:opus|sonnet)-5(?:-|$)", m) else 200000
+        if re.search(r"haiku-5[-.]5(?:$|[-:@])", m):
+            context = 1000000
+            max_output = 128000
+            label = "Claude Haiku 5.5"
+        else:
+            context = 1000000 if re.search(r"(?:opus|sonnet)-5(?:-|$)", m) else 200000
     elif "gpt-4.1" in m:
         context = 1047576
     elif any(x in m for x in ("o1", "o3", "o4", "reasoner", "r1")):
@@ -660,7 +667,7 @@ def heuristic_row(provider: str, model_id: str) -> ModelRow:
     efforts = reasoning_efforts_for(p, model_id)
     return ModelRow.make(
         id=model_id,
-        label=model_id,
+        label=label,
         context=context,
         max_output=max_output or None,
         reasoning_efforts=efforts or None,

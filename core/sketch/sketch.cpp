@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <cstdio>
 #include <set>
 #include <stdexcept>
 #include <unordered_set>
@@ -2825,6 +2826,134 @@ SketchSolution solve_sketch(const json& sketch, const json& env,
 
 SketchSolution solve_sketch(const json& sketch, const json& env) {
     return solve_sketch(sketch, env, std::nullopt);
+}
+
+namespace {
+
+// Entity id -> its fixed sub-handles ("" = the whole entity is fixed).
+std::map<std::string, std::set<std::string>> fixed_handles(const json& constraints) {
+    std::map<std::string, std::set<std::string>> out;
+    if (!constraints.is_array()) return out;
+    for (const json& c : constraints) {
+        if (!c.is_object() || c.value("type", std::string()) != "fix") continue;
+        if (!c.contains("refs") || !c["refs"].is_array() || c["refs"].empty()) continue;
+        if (!c["refs"][0].is_string()) continue;
+        const std::string h = c["refs"][0].get<std::string>();
+        const auto dot = h.find('.');
+        out[eid_of(h)].insert(dot == std::string::npos ? std::string() : h.substr(dot + 1));
+    }
+    return out;
+}
+
+bool handle_is_fixed(const std::string& handle,
+                     const std::map<std::string, std::set<std::string>>& fixed) {
+    const auto it = fixed.find(eid_of(handle));
+    if (it == fixed.end()) return false;
+    if (it->second.count(std::string())) return true;
+    const auto dot = handle.find('.');
+    return dot != std::string::npos && it->second.count(handle.substr(dot + 1)) > 0;
+}
+
+std::string fmt_mm(double v) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.4g", v);
+    return buf;
+}
+
+}  // namespace
+
+std::string nonconvergence_reason(const json& sketch, const SketchSolution& sol) {
+    const json constraints = sketch.value("constraints", json::array());
+    const json entities = sketch.value("entities", json::array());
+    std::map<std::string, std::string> ctype_of;
+    if (constraints.is_array())
+        for (const json& c : constraints)
+            if (c.is_object() && c.contains("id") && c["id"].is_string())
+                ctype_of[c["id"].get<std::string>()] = c.value("type", std::string("?"));
+
+    std::string msg = "sketch did not converge: the constraints conflict.";
+    if (!sol.conflicting.empty()) {
+        msg += " Conflicting constraints:";
+        for (std::size_t i = 0; i < sol.conflicting.size(); ++i) {
+            const std::string& id = sol.conflicting[i];
+            const auto t = ctype_of.find(id);
+            msg += std::string(i ? ", " : " ") + id + " (" +
+                   (t == ctype_of.end() ? std::string("?") : t->second) + ")";
+        }
+        msg += ".";
+    }
+
+    // The usual cause: `fix` pins the AUTHORED coordinates (the seeds), and the seeds of
+    // two fixed points that a coincident constraint joins are apart. The solved geometry
+    // the readback shows can be closed to 1e-11 mm while the seeds are 0.03 mm apart.
+    const auto fixed = fixed_handles(constraints);
+    std::vector<std::string> gaps;
+    if (!fixed.empty() && constraints.is_array()) {
+        json authored = json::object();
+        if (entities.is_array())
+            for (const json& e : entities)
+                if (!jid(e).empty()) authored[jid(e)] = e;
+        for (const json& c : constraints) {
+            if (!c.is_object() || c.value("type", std::string()) != "coincident") continue;
+            if (!c.contains("refs") || !c["refs"].is_array() || c["refs"].size() != 2) continue;
+            if (!c["refs"][0].is_string() || !c["refs"][1].is_string()) continue;
+            const std::string h0 = c["refs"][0].get<std::string>();
+            const std::string h1 = c["refs"][1].get<std::string>();
+            if (!handle_is_fixed(h0, fixed) || !handle_is_fixed(h1, fixed)) continue;
+            std::optional<Vector2d> p0, p1;
+            try {
+                p0 = handle_point(h0, authored);
+                p1 = handle_point(h1, authored);
+            } catch (const std::exception&) {
+                continue;  // malformed entity: no gap to report
+            }
+            if (!p0 || !p1) continue;
+            const double gap = (*p0 - *p1).norm();
+            if (gap <= 1e-9) continue;
+            gaps.push_back(jid(c) + " (" + h0 + ", " + h1 + ") " + fmt_mm(gap) + " mm");
+        }
+    }
+    if (!gaps.empty()) {
+        msg += " A fix holds an entity at its authored coordinates, not at its solved position."
+               " These coincident constraints join fixed points that are apart:";
+        const std::size_t shown = std::min<std::size_t>(gaps.size(), 4);
+        for (std::size_t i = 0; i < shown; ++i) msg += std::string(i ? "; " : " ") + gaps[i];
+        if (gaps.size() > shown)
+            msg += "; and " + std::to_string(gaps.size() - shown) + " more";
+        msg += ". Remove the fix, or edit the authored coordinates so that the points touch.";
+    } else if (sol.conflicting.empty()) {
+        msg += " The solver found no position that satisfies all constraints."
+               " Run sketch_health to find the constraints that disagree.";
+    }
+    return msg;
+}
+
+bool adopt_solved_coordinates(json& sketch, const json& env) {
+    if (!sketch.is_object() || !sketch.contains("entities") || !sketch["entities"].is_array())
+        return false;
+    // The compile path's solve (exact, cold): the authored seeds then equal the geometry
+    // compile_document builds, so the rewrite changes no solved position.
+    const SketchSolution sol = solve_sketch(sketch, env);
+    if (!sol.converged) return false;
+    static const std::set<std::string> kSolverTypes = {
+        "point", "line", "circle", "arc", "ellipse", "ellipse_arc", "parabola", "conic",
+        "slot", "arc_slot", "spline", "style_spline", "text"};
+    static const std::set<std::string> kKeep = {"type", "id", "construction", "ccw"};
+    for (json& e : sketch["entities"]) {
+        const std::string id = jid(e);
+        if (id.empty() || !kSolverTypes.count(e.value("type", std::string()))) continue;
+        if (!sol.entities.contains(id)) continue;
+        const json& solved = sol.entities.at(id);
+        for (auto it = solved.begin(); it != solved.end(); ++it) {
+            if (kKeep.count(it.key()) || !e.contains(it.key())) continue;
+            json& authored = e[it.key()];
+            // Same shape only: a number stays a number, an [x,y] stays an [x,y].
+            if (authored.is_array() != it.value().is_array()) continue;
+            if (authored.is_array() && authored.size() != it.value().size()) continue;
+            authored = it.value();
+        }
+    }
+    return true;
 }
 
 std::map<std::string, std::string> warm_gate_decision(const json& sketch,

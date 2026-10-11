@@ -305,7 +305,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "check_interference": {
         "prompt_note": (
             "Needs 2+ bodies — solve_mates first on an assembly so placements are real; "
-            "overlap INSIDE one part's features → check_feature_overlap."
+            "overlap INSIDE one part's features → check_feature_overlap. Read `clear` for "
+            "the verdict: ok=true only means the check completed, also when bodies clash."
         ),
     },
     "check_metadata": {
@@ -445,7 +446,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "get_part": {
         "prompt_note": (
             "summary=True on big/imported docs (elides BREP blobs); the full tree is "
-            "for round-trip param editing. Feature ids here feed edits and config overrides."
+            "for round-trip param editing. Both forms: features at result['tree']['features']. "
+            "Feature ids here feed edits and config overrides."
         ),
     },
     "import_part": {
@@ -480,7 +482,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "interface_check": {
         "prompt_note": (
             "Catches hole-pattern/coaxiality misalignment that passes check_interference "
-            "— solve_mates first, run BOTH; fastener='M6' adds a pass-through check."
+            "— solve_mates first, run BOTH; fastener='M6' adds a pass-through check. Read "
+            "`status` (pass|fail|skip) for the verdict: a misalignment keeps ok=true."
         ),
     },
     "layout_plan": {
@@ -632,7 +635,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "new_assembly": {
         "prompt_note": (
             "Components come from FILES: build parts, save_part each, then "
-            "new_assembly → asm_add_component → asm_mate → solve_mates."
+            "new_assembly → asm_add_component → asm_mate → solve_mates. An open "
+            "assembly of that name is RESUMED with its components (reused, "
+            "component_count); fresh=True makes a separate empty one."
         ),
     },
     "new_part": {

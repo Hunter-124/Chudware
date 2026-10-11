@@ -34,7 +34,8 @@ namespace {
 chudware_ipc::EngineClient* g_client = nullptr;  // non-null iff daemon mode won
 bool g_daemon = false;
 // True only when daemon mode was WANTED (no explicit CHUDWARE_ENGINE_DAEMON=0)
-// yet every connect attempt failed and we fell back to the in-process core.
+// yet every connect attempt failed and we fell back to the in-process core. Never set
+// by a daemon_draining refusal: that keeps daemon mode (see initOnce).
 bool g_daemonUnavailable = false;
 std::once_flag g_once;
 
@@ -127,6 +128,20 @@ chudware_ipc::EngineClient* runClient() {
 // The simulation connection discards unconsumed pushes and has no shared fallback.
 chudware_ipc::EngineClient* simRunClient(std::string& err) {
     return openRunClient(g_simRunClient, /*discardUnconsumedEvents=*/true, err);
+}
+
+// A draining hostd refuses every new non-control client with this hello error
+// (Server::drainRefusal). It holds the instance lock until it exits, so no successor can
+// start beside it, and a private in-process engine would not share its documents.
+bool isDrainRefusal(const json& helloError) {
+    if (!helloError.is_object()) return false;
+    const auto code = helloError.find("code");
+    return code != helloError.end() && code->is_string() && *code == "daemon_draining";
+}
+
+std::string jsonString(const json& o, const char* key) {
+    const auto it = o.is_object() ? o.find(key) : o.end();
+    return it != o.end() && it->is_string() ? it->get<std::string>() : std::string();
 }
 
 std::string selfExePath() { return chudware::platform::executablePath(); }
@@ -225,7 +240,7 @@ void initOnce() {
     // refused connect therefore stranded entire multi-hour sessions on a
     // private in-process engine — invisible to (and unable to see) every doc
     // living in the shared daemon. So retry with bounded backoff before
-    // falling back.
+    // falling back. A draining daemon is the exception: see below.
     //
     // CHUDWARE_ENGINE_DAEMON_RETRY_MS (integer, total milliseconds) overrides
     // the retry budget; 0 disables retrying entirely and restores the old
@@ -242,9 +257,13 @@ void initOnce() {
     }
 
     bool connected = false;
+    bool draining = false;
     int spentMs = 0;
     for (size_t attempt = 0;; ++attempt) {
         if (c->connectOrSpawn(opts, err)) { connected = true; break; }
+        // A draining hostd refuses by name and keeps refusing until it exits, so this
+        // short ladder cannot outlast it. maintainConnection() waits for it instead.
+        if (isDrainRefusal(c->helloError())) { draining = true; break; }
         if (attempt >= kBackoffN) break;
         const int waitMs = kBackoffMs[attempt];
         if (spentMs + waitMs > budgetMs) break;
@@ -254,6 +273,21 @@ void initOnce() {
                      err.c_str(), waitMs, attempt + 2);
         std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
         spentMs += waitMs;
+    }
+    if (draining) {
+        // Never fall back to the in-process engine on a drain refusal: this window would
+        // then edit documents that the agent and every other client cannot see, for the
+        // whole session. Keep daemon mode with a client that is not connected yet, as the
+        // browser build does. maintainConnection() shows the refusal on the unreachable
+        // chip, retries, and starts the new daemon after the old one exits.
+        g_client = c;
+        g_daemon = true;
+        std::fprintf(stderr,
+                     "[engine] %s — daemon mode stays on. Chudware connects when the "
+                     "draining daemon exits. It does not start a private in-process "
+                     "engine.\n",
+                     err.c_str());
+        return;
     }
     if (!connected) {
         // core_bridge.py-style loud warning + legacy fallback. Spell out the
@@ -423,10 +457,19 @@ bool available() {
 bool ensureLoaded(std::string& err) {
     if (daemonMode()) {
         if (g_client && g_client->connected()) return true;
-        err = "engine daemon unreachable";
+        const json refusal = daemonRefusal();
+        err = refusal.is_null()
+                  ? std::string("engine daemon unreachable")
+                  : "engine daemon is draining: " + jsonString(refusal, "message");
         return false;
     }
     return core::cpp_core().ensureLoaded(err);
+}
+
+json daemonRefusal() {
+    if (!daemonMode() || !g_client) return json();
+    json refusal = g_client->helloError();
+    return isDrainRefusal(refusal) ? refusal : json();
 }
 
 // Backoff schedule for proactive GUI reconnect: 1s, 2s, 5s, then every 10s.
@@ -515,6 +558,11 @@ DaemonConnState maintainConnection() {
     ++failedAttempts;
     int waitMs = reconnectBackoffMs(failedAttempts);
 #ifndef __EMSCRIPTEN__
+    // A draining hostd answered and refused: it is alive and holds the instance lock, so
+    // a spawn now only loses that lock and arms the respawn cooldown. The refused
+    // attempts still count: after the old daemon exits, the first failed connect spawns
+    // the new one at once.
+    const bool draining = isDrainRefusal(g_client->helloError());
     // Nothing above can ever bring back a hostd that actually DIED (crash,
     // SIGKILL, its own watchdog _Exit(70)): every reconnect path in EngineClient
     // is connect-only, and the desktop daemon has no OS supervisor on either
@@ -527,7 +575,7 @@ DaemonConnState maintainConnection() {
     // stall this frame-loop thread for its whole connect budget AND poke
     // EngineClient::conn_ from outside mtx_ (connectInner->tryConnect) while a
     // worker-thread call() may still be unwinding on the dead socket.
-    if (failedAttempts >= kRespawnAfterFailures && now >= nextRespawn) {
+    if (!draining && failedAttempts >= kRespawnAfterFailures && now >= nextRespawn) {
         ++respawns;
         const int cooldownS = respawnCooldownSecs(respawns);
         nextRespawn = now + std::chrono::seconds(cooldownS);

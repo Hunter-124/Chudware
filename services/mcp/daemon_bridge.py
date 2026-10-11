@@ -16,6 +16,10 @@ Semantics preserved vs the legacy in-process ctypes path:
     explicit call reconnects; callers must recover document identity explicitly.
   * Daemon push events (doc.changed etc., Phase 3) buffer in-process; MCP tool
     layers drain them via poll_events() to surface _foreign_edits notes.
+  * A draining hostd (engine rebuilt on disk, or a stop) refuses new clients with a
+    daemon_draining hello error -> DaemonDraining. One daemon serves each binary
+    path, so no successor can start beside it; core_bridge never falls back to an
+    in-process engine on this refusal.
 
 Discovery mirrors ipc_discovery.cpp / ipc_discovery_win.cpp — keep them in sync:
   key    = $CHUDWARE_INSTANCE_KEY or fnv1a64(realpath(hostd binary))
@@ -66,6 +70,49 @@ class DaemonSessionLost(DaemonError):
             f"{method}: engine connection lost; outcome {outcome}. {message}"
         )
         self.detail = {"method": method, "outcome": outcome, "retryable": False}
+
+
+class DaemonDraining(DaemonError):
+    """hostd refused this new client because it drains (see Server::admitWhileDraining).
+
+    One daemon serves each hostd binary path, so no successor can start until the
+    draining daemon exits. This is never a reason to start a private in-process
+    engine: core_bridge raises it as CoreError ``daemon_draining``.
+    """
+
+    code = "daemon_draining"
+
+    def __init__(self, refusal: dict):
+        detail = {k: v for k, v in refusal.items() if k not in ("_is_error", "event")}
+        detail["code"] = self.code
+        reason = str(detail.get("reason") or "")
+        pid = detail.get("daemon_pid")
+        who = f"chudware-hostd (pid {pid})" if pid else "chudware-hostd"
+        if reason == "stale_binary":
+            changed = Path(str(detail.get("changed_path") or "")).name or "an engine binary"
+            active = detail.get("active_clients")
+            sessions = f"its {active} active session(s)" if active is not None else "its open sessions"
+            text = (
+                f"{who} is draining after an engine rebuild ({changed} changed on disk). "
+                f"It refuses new clients until {sessions} end. "
+                "Restart Chudware to load the new engine. "
+                "Do not set CHUDWARE_ENGINE_DAEMON=0: an in-process engine does not share documents."
+            )
+        elif reason:
+            text = " ".join(str(part) for part in (
+                f"{who} is draining ({reason}) and refuses new clients.",
+                detail.get("message") or "",
+                detail.get("hint") or "",
+            ) if part)
+        else:
+            # The daemon.draining event alone names no reason (a daemon that closed the
+            # connection before it answered hello).
+            text = (
+                f"{who} is draining after an engine rebuild or a stop request, and refuses "
+                "new clients. Wait until it exits, or restart Chudware to load the new engine."
+            )
+        super().__init__(text)
+        self.detail = detail
 
 
 def _fnv1a64_hex(s: str) -> str:
@@ -366,6 +413,11 @@ class DaemonClient:
     def connect(self, spawn: bool = True, budget_s: float = 15.0) -> None:
         try:
             self._connect(spawn, budget_s)
+        except DaemonDraining:
+            # Nothing was dispatched and the refusal names its cause: never relabel it as
+            # a lost session or a plain transport failure (core_bridge must not fall back).
+            self._disconnect()
+            raise
         except (DaemonError, OSError) as e:
             self._disconnect()
             if self._session_established:
@@ -467,11 +519,57 @@ class DaemonClient:
         # ever guards a path reached after a connect FAILED).
         self._spawn_fail_streak = 0
         self._spawn_block_until = 0.0
-        self.server_info = self._call_raw(
-            "hello", {"client": "mcp", "pid": os.getpid(), "proto": 1}
-        )
+        self.server_info = self._hello()
         self._session_established = True
         self._drain_replace_if_stale(hostd, spawn)
+
+    def _hello(self) -> dict:
+        """Send hello; a draining daemon answers with a ``daemon_draining`` refusal.
+
+        hostd also pushes a ``daemon.draining`` event before it closes the connection,
+        so a transport failure after that event is the same refusal, not a lost daemon.
+        """
+        try:
+            info = self._call_raw("hello", {"client": "mcp", "pid": os.getpid(), "proto": 1})
+        except DaemonError:
+            event = self._draining_event()
+            if event is not None:
+                raise DaemonDraining(event) from None
+            raise
+        if info.get("_is_error"):
+            if info.get("code") == "daemon_draining":
+                raise DaemonDraining(info)
+            raise DaemonError(
+                f"hostd refused hello ({info.get('code') or 'error'}): "
+                f"{info.get('message') or info}"
+            )
+        return info
+
+    def _draining_event(self) -> Optional[dict]:
+        """The ``daemon.draining`` event a refusing hostd pushed before it closed, if any.
+
+        The send of hello can fail on the closed peer before the event was read, so
+        read what is still queued on the socket first, without blocking.
+        """
+        sock = self._sock
+        if isinstance(sock, socket.socket):
+            try:
+                while True:
+                    chunk = sock.recv(65536, socket.MSG_DONTWAIT)
+                    if not chunk:
+                        break
+                    self._buf += chunk
+            except OSError:
+                pass  # nothing queued, or the reset that follows the queued bytes
+        msgs = list(self._events)
+        for line in self._buf.split(b"\n"):
+            try:
+                msg = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if isinstance(msg, dict):
+                msgs.append(msg)
+        return next((m for m in msgs if m.get("event") == "daemon.draining"), None)
 
     def _note_spawn_failed(self) -> None:
         """Arm/extend the spawn cooldown after a spawn+connect cycle failed."""

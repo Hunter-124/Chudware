@@ -45,6 +45,7 @@ from services.agent.online_turn import (
     resolve_settings,
     resolve_workspace,
     resolve_model_and_effort,
+    turn_budget_notice,
 )
 from services.agent.chudcode_host import get_default_chudcode_host
 
@@ -3393,6 +3394,24 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         "" if resumed_session or history_already_seeded
         else _bounded_history_seed(raw_params.get("history"))
     )
+    options = {"project_dir": project_root} if project_root else {}
+    options.update({"mode": turn_preferences.mode,
+                    "advisor": turn_preferences.advisor,
+                    "max_subagent_depth": turn_preferences.delegation_depth})
+    for key in ("mode", "plan_only", "advisor", "autonomy"):
+        if key in raw_params:
+            options[key] = raw_params[key]
+    if turn_preferences.mode == "ask":
+        options["mode"] = "ask"
+    readonly_turn = bool(options.get("plan_only")) or options["mode"] in ("ask", "plan")
+    # Turn budget: only an explicit positive finite `timeout` bounds the turn
+    # (run_mission.py --timeout-s). Without one the host has no wall-clock stop and the
+    # agent is told of none.
+    budget_s: float | None = None
+    raw_timeout = raw_params.get("timeout")
+    if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool):
+        if math.isfinite(raw_timeout) and raw_timeout > 0:
+            budget_s = float(raw_timeout)
     # Rendered once: resolving picked context reads the engine, and the preflight estimate
     # must price exactly the text that is sent. A persisted conversation's first turn in this
     # process leads with the live document ids: its transcript's ids died with the old engine.
@@ -3400,6 +3419,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         _resumed_documents_block()
         if resumed_session and not history_already_seeded else "",
         _editor_context_block(raw_params),
+        turn_budget_notice(budget_s, readonly=readonly_turn),
     ) if block)
     preflight_prompt = compose_request_text(request, migration_candidate, editor_block)
     try:
@@ -3453,15 +3473,6 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             exc_info=exc,
         )
 
-    options = {"project_dir": project_root} if project_root else {}
-    options.update({"mode": turn_preferences.mode,
-                    "advisor": turn_preferences.advisor,
-                    "max_subagent_depth": turn_preferences.delegation_depth})
-    for key in ("mode", "plan_only", "advisor", "autonomy"):
-        if key in raw_params:
-            options[key] = raw_params[key]
-    if turn_preferences.mode == "ask":
-        options["mode"] = "ask"
     try:
         mission_dispatch = MissionDispatch(
             run_id=run_id,
@@ -3587,12 +3598,8 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     # (run_mission.py) omit the flag and keep the suggested-default path.
     if raw_params.get("interactive_questions") is True:
         host_params["interactive_questions"] = True
-    # Turn budget: only an explicit positive finite `timeout` bounds the turn
-    # (run_mission.py --timeout-s). Without one the host has no wall-clock stop.
-    raw_timeout = raw_params.get("timeout")
-    if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool):
-        if math.isfinite(raw_timeout) and raw_timeout > 0:
-            host_params["timeout"] = float(raw_timeout)
+    if budget_s is not None:
+        host_params["timeout"] = budget_s
 
     event_context = {
         "run_id": run_id,
@@ -3704,7 +3711,9 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             host_params["settings"].update(provider=assignment.provider, model=assignment.model)
             if remaining is not None:
                 host_params["timeout"] = remaining
-            host_params["request"] = "Continue the current request from the saved state; do not repeat completed actions."
+            host_params["request"] = compose_request_text(
+                "Continue the current request from the saved state; do not repeat "
+                "completed actions.", "", turn_budget_notice(remaining, readonly=readonly_turn))
             host_result = chudcode_agent_turn(host_params, raw_emit)
         if not host_result.get("ok"):
             response = {

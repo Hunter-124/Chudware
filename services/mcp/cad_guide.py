@@ -382,6 +382,8 @@ TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ri
     topology.result_dir) with source.step, inputs/setup/provenance JSON. checkpoint.json holds
     retained optimizer state, but sim_run_topology takes no resume input: a cancelled,
     failed or killed run starts over from the beginning; its checkpoint iteration is only reported.
+    reanalysis.vtu has a point field von_mises[@case] (MPa) and the cell field
+    element_von_mises[@case]. To animate it, use render_animation(kind='fea', vtu_path=...).
 
   Human workflow (Topology tab): New Study (needs an open part with solid geometry) → Method
     (physics, method, objective, volume budget, limits; only supported pairs) → Material →
@@ -742,7 +744,11 @@ GEOMETRY QUERY GRAMMAR (query_geometry, refs.*, at:{...}, FEA fixtures/loads, as
                    VERTICAL WALL FACE is perpendicular:"z" (its normal is horizontal) while a
                    VERTICAL EDGE is parallel:"z". "Vertical"/"horizontal" are not query words.
     pick           largest | smallest | longest | shortest | inner | outer — narrow a
-                   multi-match to the one you mean (also "near":[x,y,z]+"count", "index":[i]).
+                   multi-match to the one you mean (also "index":[i]).
+    near           [x,y,z] (+ "count") — the face/edge nearest a point ON it (or at its
+                   centroid), measured to the actual geometry: a point on a flange rim picks
+                   the rim, not a bolt hole whose centre is closer. On a shared edge of two
+                   faces the face whose centroid is nearer wins.
   Examples:
     {"of":"face","side":"top"}                                the top face
     {"of":"face","surf":"round","pick":"outer"}               the outer cylindrical wall
@@ -812,7 +818,10 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
 
 Every query_geometry/describe_part match now also carries: `side` (top/bottom/left/right/front/
 back), `normal` (SIGNED outward dir — unlike the unsigned `axis`), `concavity` (bore vs boss),
-`radius`, and a stable `sid`. add_features returns a `changes` write-diff ("added 1 cylinder; 1
+`radius`, `axis_point` (cylinder/cone: a point ON the axis — `centroid` is off-axis on a fillet),
+torus faces (sweep bends) `major_radius`/`minor_radius`/`torus_axis`/`torus_center` (bend
+radius, tube radius, bend axis, bend centre — their `radius`/`axis` stay null), and a stable
+`sid`. add_features returns a `changes` write-diff ("added 1 cylinder; 1
 new bore; volume -3927; part bbox 60x40x20 mm") so you can confirm an op did what you meant
 instead of guessing: `changes.bbox_mm` is the whole part's size (check it against what you were
 asked for rather than spending a measure_part call), a volume move too small to be real material
@@ -1428,6 +1437,16 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  dP. piping_cfd_handoff(doc, boundary) + piping_verify_cfd(solve_result,\n"
             "  cfd_result) remain the one-call bore -> run_cfd_flow chain with a 1-D vs\n"
             "  3-D verdict; piping_internal_volume(doc) gives the bore STEP + volume_mm3.\n\n"
+            "FITTINGS + MINOR LOSSES: piping_edit draws runs (tees/elbows appear at\n"
+            "  junctions/bends) and adds inline valve/orifice/custom/reducer/flange fittings.\n"
+            "  A fixed loss is params.k_model={'kind':'constant','K':k} (also two_k,\n"
+            "  three_k, cv, table). A tee's loss is per path: update_fitting(id=<tee>,\n"
+            "  params={'k_model_run':{'kind':'constant','K':kr},\n"
+            "          'k_model_branch':{'kind':'constant','K':kb}}) -- straight-through K on\n"
+            "  run_ids[1], branch K on branch_run, each on that pipe's velocity. Never add a\n"
+            "  custom fitting as a stand-in for a tee or bend loss: every fitting is a\n"
+            "  piping_bom item. Unknown params keys refuse unknown_param and list the accepted\n"
+            "  keys. piping_fitting_k previews K (tees return paths.run / paths.branch).\n\n"
             "GEOMETRY: piping_route paths are centrelines. To model a line as CAD, feed its\n"
             "  path to sketch3d_path_from_points(name, points) then sketch3d_pipe(id,\n"
             "  diameter_mm=<OD>) (cad_guide('sketch3d')).\n\n"
@@ -2107,12 +2126,14 @@ def cad_guide_text(topic: str = "overview") -> str:
             "INTERFERENCE / FITMENT LOOP\n"
             "  1. check_interference(doc_id?)  — pairwise clash/clearance over bodies\n"
             "     (assemblies: world-placed components). Response includes\n"
+            "     ok (the check completed), clear (the verdict: no interference),\n"
             "     interferences[{a,b,volume,overlap_volume_mm3,overlap_bbox,overlap_mesh}],\n"
             "     clearances[{a,b,distance}], contacts, parts[{name,bbox,volume}].\n"
+            "     A clash returns ok=true, clear=false; ok=false means incomplete.\n"
             "  2. Subset: engine eval_interference accepts optional members:[name,...]\n"
             "     to pairwise-check only selected components (absent/empty = all).\n"
             "  3. Read overlap_volume_mm3 + overlap_bbox (world mm) → fix fitment\n"
-            "     (edit mates / geometry / offsets) → re-check until interferences=[].\n"
+            "     (edit mates / geometry / offsets) → re-check until clear=true.\n"
             "  4. Intra-part feature collisions (boss swallowed by cut, etc.):\n"
             "     check_feature_overlap — not the body-level interference tool.\n\n"
             "Related: measure_between (text-only single/pair probe), measure_part\n"

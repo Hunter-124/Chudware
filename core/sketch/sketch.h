@@ -78,6 +78,21 @@ SketchSolution solve_sketch(const nlohmann::json& sketch, const nlohmann::json& 
                             std::optional<double> time_budget_ms = std::nullopt,
                             bool interactive = false);
 
+// The reason a solve did not converge, as one agent-facing error string that starts
+// with "sketch did not converge". Names the conflicting constraints (sol.conflicting,
+// with their types). If coincident constraints join points that `fix` constraints hold,
+// it also gives the gap between the AUTHORED points, because a fix pins the authored
+// coordinates and not the solved position. `sketch` is the input given to solve_sketch.
+std::string nonconvergence_reason(const nlohmann::json& sketch, const SketchSolution& sol);
+
+// Write the solved coordinates of every entity into `sketch["entities"]` (the authored
+// seeds), with the cold exact solve the compile path uses. The solved geometry does not
+// change; only the seeds move to it. Keys are overwritten only where the authored entity
+// already has the key with the same shape; id/type/construction/ccw stay. Returns false,
+// with `sketch` unchanged, when the sketch does not converge. The sketch_add_constraint
+// op calls it before it adds a `fix`, so the fix holds the shape the readback shows.
+bool adopt_solved_coordinates(nlohmann::json& sketch, const nlohmann::json& env);
+
 // Current solved measurement for a DIMENSIONAL constraint, in canonical units —
 // C++ port of sketch_solver.py's measure_constraint. distance -> mm (point-point
 // Euclidean / axis per-coordinate rim / point-line), angle -> degrees in [0, 180),

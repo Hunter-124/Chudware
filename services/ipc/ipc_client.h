@@ -50,7 +50,8 @@ public:
     };
 
     // Connect to the daemon for this instance key, spawning one if absent (and
-    // allowed). Performs the hello handshake. False + err on failure.
+    // allowed). Performs the hello handshake. False + err on failure. A daemon that
+    // refuses hello (see helloError()) is not a missing daemon: nothing is spawned.
     bool connectOrSpawn(const Options& opts, std::string& err);
 
     bool connected() const { return connected_.load(std::memory_order_acquire); }
@@ -67,6 +68,15 @@ public:
 
     // The hello response: {proto, abi, engine_path, git_rev, daemon_pid, state, id_remap}.
     const nlohmann::json& serverInfo() const { return serverInfo_; }
+
+    // The error object the daemon answered the last hello with, for example the
+    // `daemon_draining` refusal of a draining hostd (Server::drainRefusal):
+    // {code, reason, daemon_pid, clients, active_clients, children, hard_stop,
+    // changed_path?, message, hint}. Null when the last connect attempt succeeded or
+    // failed without a hello answer. Each connect attempt (connectOrSpawn, tryReconnect,
+    // the reconnect inside call()) replaces it when the attempt ends, so a reader never
+    // sees a refusal disappear while the next attempt is in flight. Safe from any thread.
+    nlohmann::json helloError() const;
 
     // Blocking JSON-RPC round trip; same contract as CppCore::call. Returns true
     // iff the daemon answered with "result"; err carries transport or RPC errors
@@ -100,8 +110,9 @@ public:
 
     // Proactive reconnect for the GUI frame loop when the socket is dead (daemon
     // crash, --stop, network drop). Same connect-only + hello path as the
-    // call()-driven reconnect; never spawns. False when the peer is still gone
-    // (caller applies its own backoff). Bumps reconnectGeneration() on success.
+    // call()-driven reconnect; never spawns. False when the peer is still gone or
+    // refuses hello (helloError() names why; caller applies its own backoff). Bumps
+    // reconnectGeneration() on success.
     bool tryReconnect(std::string& err);
 
     // Non-blocking liveness probe for the GUI frame loop. Drains any pending
@@ -131,7 +142,12 @@ public:
 private:
     bool connectInner(const Options& opts, std::string& err);
     bool tryConnect(std::string& err);
-    bool hello(const std::string& kind, std::string& err);
+    // Close the connection the daemon closes after it refuses hello, and name the
+    // refusal (code, message, hint) in err.
+    void refuseHello(const nlohmann::json& error, std::string& err);
+    void setHelloError(nlohmann::json error);
+    // `refusal` receives the daemon's hello error object, if it answered with one.
+    bool hello(const std::string& kind, std::string& err, nlohmann::json& refusal);
     // Re-establish a connection invalidated by a timeout/EOF (mtx_ held by the
     // caller). Connect-only — never spawns — plus an inline hello re-handshake.
     bool reconnectLocked(std::string& err);
@@ -152,6 +168,8 @@ private:
     std::mutex socketMtx_;               // socket replacement/close vs teardown shutdown
     std::vector<nlohmann::json> events_;
     nlohmann::json serverInfo_;
+    mutable std::mutex helloErrMtx_;     // guards helloError_ only
+    nlohmann::json helloError_;          // see helloError()
     std::string sockPath_;
     std::string clientKind_;             // saved for the reconnect re-handshake
     std::string userId_;                 // saved with clientKind_ for reconnect hello

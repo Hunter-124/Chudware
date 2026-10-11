@@ -104,8 +104,9 @@
 #include <GeomAbs_SurfaceType.hxx>
 #include <GeomAbs_CurveType.hxx>
 #include <ShapeAnalysis_Surface.hxx>
-#include <ShapeAnalysis_FreeBounds.hxx>     // section_props: group multi-loop section edges into closed wires
-#include <TopTools_HSequenceOfShape.hxx>    // ConnectEdgesToWires in/out sequences
+#include <ShapeFix_Solid.hxx>               // section_props: wrap a closed skin in an oriented solid
+#include <TopoDS_Shell.hxx>
+#include <TopoDS_Solid.hxx>
 #include <Geom_Surface.hxx>
 #include <gp_Circ.hxx>
 #include <gp_Pnt2d.hxx>
@@ -143,6 +144,7 @@
 #include "geom/booleans.h"  // fuse_many — doc_eval_compare's default whole-doc shape
 #include "geom/fit.h"       // least-squares cylinder fit (doc_fit_cylinder_axis)
 #include "geom/plane.h"
+#include "geom/face_normal.h"  // plane_outward_normal — handedness-aware planar normal
 #include "geom/profile.h"
 #include "geom/profile3d.h"   // sketch3d wires (doc_sketch3d_health chain report)
 #include "sketch/sketch3d.h"  // 3D free-space sketch solver (sketch3d_* RPCs)
@@ -276,6 +278,10 @@ struct Session {
     // Detached native imports retain their source for reproducibility and in-place
     // automatic saving without sharing the source's live session.
     std::string native_source_path;
+    // Project folder that doc_new received (absolute, normalized; empty if unknown). An
+    // unsaved assembly resolves relative component sources against it
+    // (component_source_base), never against the hostd process cwd.
+    std::string project_dir;
     std::map<std::string, std::string> extra_entries;  // unknown .step+ entries (verbatim)
     std::map<std::string, std::string> checkpoints;    // PM-cancel snapshots: id -> doc JSON
     std::optional<SketchState> active_sketch;          // C18 sketch-edit lifecycle
@@ -1110,6 +1116,18 @@ void normalize_inline_sketch_entities(json& feat, IdGen& gen, json& id_map) {
     params["constraints"] = std::move(constraints);
 }
 
+// Refuse params the compiler does not read (validate.cpp::unknown_feature_params). Op path
+// only: a saved doc with a legacy inert key still opens, compiles and accepts edits that
+// do not set that key.
+void refuse_unknown_params(const char* op_name, const json& type, const json& params) {
+    if (!type.is_string()) return;
+    const std::vector<std::string> errs = unknown_feature_params(type.get<std::string>(), params);
+    if (errs.empty()) return;
+    std::string msg = std::string(op_name) + " " + type.get<std::string>() + ": ";
+    for (std::size_t i = 0; i < errs.size(); ++i) msg += (i ? " | " : "") + errs[i];
+    throw OpError("invalid_op", msg, {{"reason", "unknown_param"}});
+}
+
 void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json feat;
     if (op.contains("feature") && op["feature"].is_object()) {
@@ -1249,6 +1267,7 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
     // start reporting itself. Param defaults live in the Python layer for the
     // same reason; see the scope note on normalize_feature_shape.
     normalize_feature_shape(env);
+    refuse_unknown_params("add_feature", env["type"], env["params"]);
     resolve_placeholders_deep(env["params"], id_map);
     resolve_placeholders_deep(env["refs"], id_map);
 
@@ -1274,6 +1293,7 @@ void op_edit_feature(json& doc, const json& op, IdGen& gen, json& id_map) {
     if (op.contains("params")) {
         json p = op["params"];
         resolve_placeholders_deep(p, id_map);
+        if (p.is_object()) refuse_unknown_params("edit_feature", f->value("type", json()), p);
         if (!f->contains("params")) (*f)["params"] = json::object();
         patch((*f)["params"], p);
     }
@@ -1807,6 +1827,8 @@ void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen
     }
 }
 
+json env_from_doc(const json& doc);  // defined below (equation globals -> solve env)
+
 void op_sketch_add_constraint(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
     json c;
@@ -1890,6 +1912,15 @@ void op_sketch_add_constraint(json& doc, const json& op, std::size_t idx, IdGen&
             }
         }
     }
+    // A `fix` pins the AUTHORED coordinates. The readback shows the SOLVED geometry,
+    // and the two can differ (seeds 0.03 mm apart that coincident constraints close to
+    // 1e-11 mm). Pinning the stale seeds made "fix every entity" unsolvable and rolled
+    // back the batch (6-axis trace 2026-10-10, sketch f61). Move the seeds to the solved
+    // geometry first, so the fix locks the current shape. A sketch that does not solve
+    // keeps its authored seeds, and the compile error then names the conflict.
+    if (c.value("type", std::string()) == "fix" && sk.contains("params") &&
+        sk["params"].is_object())
+        chudware::sketch::adopt_solved_coordinates(sk["params"], env_from_doc(doc));
     const std::string cid = gen.next("c");
     c["id"] = cid;
     sk["params"]["constraints"].push_back(c);
@@ -1995,16 +2026,137 @@ void op_sketch_break_external_ref(json& doc, const json& op, const json& id_map)
     }
 }
 
+// sketch_edit_entity: patch the fields of ONE existing sketch entity.
+// Shape: {op, sketch, id?, entity:{id?, <fields>}} (the agent form; the patch is `entity`
+// minus `id`), or {op, sketch, id, params:{<fields>}} (sketch_drag_commit + GUI form).
+// The id comes from op.id or entity.id ($N placeholders and same-batch modeler aliases
+// resolve). Every bad shape refuses by name: both patch carriers, a missing/unknown/
+// conflicting id, an empty patch, a type change, or a key that is not a field of the
+// entity. Live 2026-10-10 6-axis run: the handler read only op.params, so
+// `entity:{id,p1,p2}` failed "no entity ''" and `{id, entity:{...}}` returned ok:true with
+// a revision bump and NO change.
 void op_sketch_edit_entity(json& doc, const json& op, const json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
-    const std::string eid = op.value("id", std::string());
-    for (json& e : sk["params"]["entities"]) {
-        if (e.value("id", std::string()) == eid) {
-            if (op.contains("params")) patch(e, op["params"]);
-            return;
-        }
+    const std::string sketch_id = sk.value("id", std::string());
+    const bool has_entity = op.contains("entity");
+    const bool has_params = op.contains("params");
+    if (has_entity && has_params)
+        throw OpError("invalid_op",
+                      "sketch_edit_entity: the op has both 'entity' and 'params'. "
+                      "Put the changed fields in 'entity' only.",
+                      {{"reason", "two_patches"}});
+    const char* carrier = has_entity ? "entity" : "params";
+    json patch_obj = json::object();
+    if (has_entity || has_params) {
+        patch_obj = op[carrier];
+        if (!patch_obj.is_object())
+            throw OpError("invalid_op",
+                          std::string("sketch_edit_entity: '") + carrier +
+                              "' must be an object of entity fields, for example "
+                              "{\"id\":\"e1\",\"p2\":[60,0]}.",
+                          {{"reason", "patch_not_object"}});
     }
-    throw OpError("invalid_op", "sketch_edit_entity: no entity '" + eid + "'");
+
+    // Entity id: op.id and/or <carrier>.id. Both given and different -> refuse.
+    auto read_id = [&](const json& raw, const std::string& where) -> std::string {
+        json v = raw;
+        resolve_placeholders_deep(v, id_map);
+        if (!v.is_string() || v.get<std::string>().empty())
+            throw OpError("invalid_op",
+                          "sketch_edit_entity: " + where +
+                              " must be an entity id string such as \"e1\".",
+                          {{"reason", "bad_entity_id"}, {"got", raw}});
+        std::string s = v.get<std::string>();
+        // A modeler alias ("l5") that an earlier sketch_add_entity in this batch registered.
+        if (id_map.contains(s) && id_map[s].is_string()) s = id_map[s].get<std::string>();
+        return s;
+    };
+    std::string op_id, patch_id;
+    if (op.contains("id")) op_id = read_id(op["id"], "'id'");
+    if (patch_obj.contains("id")) patch_id = read_id(patch_obj["id"], std::string("'") + carrier + ".id'");
+    if (!op_id.empty() && !patch_id.empty() && op_id != patch_id)
+        throw OpError("invalid_op",
+                      "sketch_edit_entity: 'id' is '" + op_id + "' but '" + carrier + ".id' is '" +
+                          patch_id + "'. Give one entity id.",
+                      {{"reason", "conflicting_entity_id"}, {"id", op_id}, {"entity_id", patch_id}});
+    const std::string eid = op_id.empty() ? patch_id : op_id;
+    if (eid.empty()) {
+        auto key_list = [](const json& o) {
+            std::string s;
+            for (auto it = o.begin(); it != o.end(); ++it) s += (s.empty() ? "" : ", ") + it.key();
+            return s.empty() ? std::string("(none)") : s;
+        };
+        std::string got = "The op has the keys: " + key_list(op);
+        if (has_entity || has_params)
+            got += std::string("; '") + carrier + "' has the keys: " + key_list(patch_obj);
+        throw OpError("invalid_op",
+                      "sketch_edit_entity: no entity id. " + got +
+                          ". Put the entity id in 'id' or in 'entity.id'.",
+                      {{"reason", "missing_entity_id"}});
+    }
+
+    json* target = nullptr;
+    std::string known;
+    std::size_t n_known = 0;
+    for (json& e : sk["params"]["entities"]) {
+        const std::string id = e.value("id", std::string());
+        if (id == eid) { target = &e; break; }
+        if (n_known < 24) known += (known.empty() ? "" : ", ") + id;
+        ++n_known;
+    }
+    if (!target)
+        throw OpError("invalid_op",
+                      "sketch_edit_entity: sketch '" + sketch_id + "' has no entity '" + eid +
+                          "'. " + (known.empty() ? std::string("The sketch has no entities.")
+                                                 : "The sketch entities are: " + known +
+                                                       (n_known > 24 ? ", ..." : "") +
+                                                       ". Use one of these ids."),
+                      {{"reason", "unknown_entity"}, {"entity", eid}, {"sketch", sketch_id}});
+
+    const std::string etype = target->value("type", std::string());
+    patch_obj.erase("id");
+    if (patch_obj.contains("type")) {
+        const json& t = patch_obj["type"];
+        if (!t.is_string() || t.get<std::string>() != etype)
+            throw OpError("invalid_op",
+                          "sketch_edit_entity: entity '" + eid + "' is a " + etype +
+                              ". This op cannot change the type to " + t.dump() +
+                              ". Delete the entity and add a new one.",
+                          {{"reason", "type_change"}, {"entity", eid}, {"type", etype}});
+        patch_obj.erase("type");
+    }
+    if (patch_obj.empty())
+        throw OpError("invalid_op",
+                      "sketch_edit_entity: the patch for entity '" + eid +
+                          "' has no fields to change. Put the changed fields in 'entity', "
+                          "for example {\"id\":\"" + eid + "\",\"p1\":[0,0]}.",
+                      {{"reason", "empty_patch"}, {"entity", eid}});
+
+    // A stored entity already carries every required field of its type (validate_document
+    // gates each batch), so its own keys + construction + the optional fields of the type
+    // are the full vocabulary. Anything else is a typo or a field of another type.
+    static const std::map<std::string, std::vector<std::string>> kOptionalFields = {
+        {"text", {"font"}},
+    };
+    std::set<std::string> allowed{"construction"};
+    for (auto it = target->begin(); it != target->end(); ++it)
+        if (it.key() != "id" && it.key() != "type") allowed.insert(it.key());
+    if (auto oit = kOptionalFields.find(etype); oit != kOptionalFields.end())
+        allowed.insert(oit->second.begin(), oit->second.end());
+    std::vector<std::string> bad;
+    for (auto it = patch_obj.begin(); it != patch_obj.end(); ++it)
+        if (!allowed.count(it.key())) bad.push_back(it.key());
+    if (!bad.empty()) {
+        std::string bad_s, ok_s;
+        for (const auto& k : bad) bad_s += (bad_s.empty() ? "'" : ", '") + k + "'";
+        for (const auto& k : allowed) ok_s += (ok_s.empty() ? "" : ", ") + k;
+        throw OpError("invalid_op",
+                      "sketch_edit_entity: " + bad_s + (bad.size() == 1 ? " is" : " are") +
+                          " not a field of " + etype + " '" + eid + "'. A " + etype +
+                          " accepts: " + ok_s + ".",
+                      {{"reason", "unknown_entity_field"}, {"entity", eid}, {"fields", bad}});
+    }
+    patch(*target, patch_obj);
 }
 
 void op_sketch_delete_entity(json& doc, const json& op, const json& id_map) {
@@ -4340,12 +4492,23 @@ void push_undo(Session& s) {
 std::string config_active_name(const json& doc);  // defined below (configurations section)
 
 // ----------------------------------------------------------------- assembly rebuild
+// The folder a relative component `source.path` is relative to. A document with a file
+// uses that file's folder (the saved convention, contracts/doc_ops.md). An unsaved
+// document uses the project folder doc_new received. Never the process cwd: hostd's cwd
+// has no relation to the user's project (2026-10-10: `parts/redesign/claw_base.step+`,
+// copied from a saved assembly into a new one, opened as /home/hunter/parts/...).
+// Empty when the document has neither; compile_assembly then refuses relative sources.
+std::string component_source_base(const Session& s) {
+    if (!s.path.empty())
+        return std::filesystem::absolute(s.path).parent_path().lexically_normal().string();
+    return s.project_dir;
+}
+
 // Solve the assembly's mates, write the solved transforms back into the doc (so a save
 // captures the mated pose), and cache the AssemblyResult on the session (port of
-// session.py::_rebuild_assembly). base_dir resolves relative component source paths.
+// session.py::_rebuild_assembly). component_source_base resolves relative source paths.
 void rebuild_assembly(Session& s) {
-    std::string base_dir;
-    if (!s.path.empty()) base_dir = std::filesystem::path(s.path).parent_path().string();
+    const std::string base_dir = component_source_base(s);
     std::optional<chudware::mate::WarmMap> warm;
     if (!s.asm_warm.empty()) warm = s.asm_warm;
     bind_assembly_reference_frames(s.doc);
@@ -5258,11 +5421,10 @@ static chudware::geom::SketchPlane resolve_sketch_plane_base(const json& doc, co
                 if (!face.IsNull()) {
                     BRepAdaptor_Surface ad(face);
                     if (ad.GetType() == GeomAbs_Plane) {
-                        // origin (area centroid) + orientation-aware normal — mirrors
-                        // face_plane() in document.cpp, using session.cpp's own REVERSED
-                        // normal idiom (cf. the faceset normal in doc_face_points).
-                        gp_Dir nd = ad.Plane().Axis().Direction();
-                        if (face.Orientation() == TopAbs_REVERSED) nd.Reverse();
+                        // origin (area centroid) + outward normal — mirrors face_plane()
+                        // in document.cpp (du×dv, orientation-aware); geom/face_normal.h
+                        // also honours left-handed plane frames (revolve end faces).
+                        const gp_Dir nd = ::chudware::geom::plane_outward_normal(face, ad.Plane());
                         GProp_GProps props;
                         BRepGProp::SurfaceProperties(face, props);
                         gp_Pnt cm = props.CentreOfMass();
@@ -5742,6 +5904,11 @@ json doc_new(const std::string& kind, const std::string& name, bool resume_if_op
     if (k != "part" && k != "assembly")
         throw OpError("invalid_op", "doc kind must be part|assembly, got '" + k + "'",
                       {{"kind", kind}, {"reason", "bad kind"}});
+    if (!project_dir.empty() && !std::filesystem::path(project_dir).is_absolute())
+        throw OpError("invalid_op",
+                      "doc_new: project_dir '" + project_dir + "' is not an absolute path. "
+                      "Give the absolute path of the project folder.",
+                      {{"project_dir", project_dir}, {"reason", "relative project_dir"}});
     DocLock lk;
     const std::string requested =
         name.empty() ? (k == "assembly" ? std::string("Assembly1") : std::string("Part1")) : name;
@@ -5758,6 +5925,8 @@ json doc_new(const std::string& kind, const std::string& name, bool resume_if_op
         sp->doc_id = new_doc_id();
         sp->doc = blank_assembly(sp->doc_id, resolved);
         sp->revision = 0;
+        if (!project_dir.empty())
+            sp->project_dir = std::filesystem::path(project_dir).lexically_normal().string();
         const std::string id = sp->doc_id;
         {
             std::lock_guard<std::mutex> reg(g_registry_mtx);
@@ -5796,6 +5965,7 @@ static void seed_cached_scratch(Session& scratch, const Session& live) {
     scratch.doc = live.doc;
     scratch.revision = live.revision;
     scratch.path = live.path;
+    scratch.project_dir = live.project_dir;
     scratch.display_quality = live.display_quality;
     scratch.active_sketch = live.active_sketch;
     if (scratch.active_sketch) {
@@ -5841,7 +6011,8 @@ static void rebase_component_paths(json& doc, const std::filesystem::path& old_b
         json& source = component["source"];
         if (!source.contains("path") || !source["path"].is_string()) continue;
         const std::filesystem::path ref(source["path"].get<std::string>());
-        if (ref.empty()) continue;
+        // No base folder (unsaved, no project): keep the stored text, never guess the cwd.
+        if (ref.empty() || (ref.is_relative() && old_base.empty())) continue;
         const auto absolute = std::filesystem::absolute(
             ref.is_absolute() ? ref : old_base / ref).lexically_normal();
         const auto relative = absolute.lexically_relative(dest);
@@ -5996,6 +6167,10 @@ json doc_tree(const std::string& doc_id) {
         resp["revision"] = s.revision;
         resp["tree"] = s.doc;
         resp["owner_map"] = json::object();
+        // The folder that relative component source paths resolve against (the file's
+        // folder, else the project folder); null when neither exists.
+        const std::string base = component_source_base(s);
+        resp["component_source_base"] = base.empty() ? json(nullptr) : json(base);
         return resp;
     }
     // No revision bump / no tess, but DO carry the owner_map (host picking) — reuse the cached
@@ -6015,8 +6190,10 @@ json doc_live_source(const std::string& doc_id) {
     DocLock lk;
     if (!pin_session(doc_id)) return json(nullptr);
     Session& s = lk.acquire(doc_id);
+    const std::string base = s.is_assembly() ? component_source_base(s) : std::string();
     return json{{"tree", s.doc}, {"env", env_from_doc(s.doc)}, {"revision", s.revision},
                 {"path", s.path.empty() ? json(nullptr) : json(s.path)},
+                {"component_source_base", base.empty() ? json(nullptr) : json(base)},
                 {"schema", s.doc.is_object()
                                ? s.doc.value("schema", std::string())
                                : std::string()}};
@@ -6168,8 +6345,7 @@ json doc_solve_mates(const std::string& doc_id, const json& drag) {
     if (!s.is_assembly())
         throw OpError("invalid_op", "doc_solve_mates: document is not an assembly",
                       {{"reason", "not an assembly"}});
-    std::string base_dir;
-    if (!s.path.empty()) base_dir = std::filesystem::path(s.path).parent_path().string();
+    const std::string base_dir = component_source_base(s);
     const json before = s.doc;  // the undo entry, iff this solve changes the document
 
     std::optional<chudware::mate::WarmMap> warm;
@@ -6948,8 +7124,7 @@ json resolve_pick_assembly(Session& s, int body_id, const std::string& kind, int
     // The feature inside the component's own part that owns the picked face/edge, so the
     // host can highlight it in the component's nested feature list. The selector stays
     // component-local and owner-free (mate/PM consumers resolve it as before).
-    std::string base_dir;
-    if (!s.path.empty()) base_dir = std::filesystem::path(s.path).parent_path().string();
+    const std::string base_dir = component_source_base(s);
     const std::string owner = component_pick_owner(s.doc, base_dir, abody, kind, topo_id);
     if (!owner.empty()) reply["owner_feature"] = owner;
     return reply;
@@ -7089,36 +7264,51 @@ json eval_surface_props(const TopoDS_Shape& shape, double density_g_cm3) {
     };
 }
 
+struct EvalEdgeBoundaryUses {
+    int boundary = 0;
+    bool embedded = false;
+
+    bool is_free() const { return boundary == 1 || (boundary == 0 && !embedded); }
+};
+
+std::vector<EvalEdgeBoundaryUses> eval_edge_boundary_uses(
+    const TopoDS_Shape& shape, const TopTools_IndexedMapOfShape& edges) {
+    std::vector<EvalEdgeBoundaryUses> uses(edges.Extent() + 1);
+    // Count oriented skin uses, not ancestor faces. A seam has two boundary uses
+    // on one face; a boolean imprint can be INTERNAL to that face and have none.
+    for (TopExp_Explorer faces(shape, TopAbs_FACE); faces.More(); faces.Next()) {
+        for (TopExp_Explorer it(faces.Current(), TopAbs_EDGE); it.More(); it.Next()) {
+            const TopoDS_Shape& edge = it.Current();
+            auto& use = uses[edges.FindIndex(edge)];
+            if (edge.Orientation() == TopAbs_FORWARD || edge.Orientation() == TopAbs_REVERSED)
+                ++use.boundary;
+            else
+                use.embedded = true;
+        }
+    }
+    return uses;
+}
+
 // True only when `shape` is a watertight CLOSED solid (or compound/compsolid of such) —
 // i.e. VolumeProperties yields a TRUSTWORTHY CoM / inertia. Bug J4: an open shell that
 // slipped past eval_is_surface_shape (e.g. an unsewn import that OCCT still types SOLID, or
 // a solid with genuine free edges) makes BRepGProp::VolumeProperties return garbage (CoM at
-// z≈0 on a 20 mm-tall part, negative principal moments). We detect this via a SEAM-EXCLUDED
-// free-edge census: a closed solid has every edge shared by two faces (seam/degenerate edges
-// excepted — those legitimately bound one face). Any genuinely free edge means the volume is
-// not enclosed, so the mass props are unreliable. Pure shells/faces are already routed to the
-// surface report before this is called; this catches the SOLID-typed-but-not-closed case.
+// z≈0 on a 20 mm-tall part, negative principal moments). The free-edge rule is the one
+// check_geometry_health (doc_eval_solid_health) and doc_eval_check use: count oriented skin
+// uses per edge. A seam has two uses on one face; an INTERNAL boolean imprint has none and
+// does not open the skin; a degenerate edge (apex/pole) is ignored. An ancestor-face count
+// read an imprint edge (one ancestor face) as free, so measure called a closed body open
+// while check_geometry_health called it watertight. Pure shells/faces are already routed to
+// the surface report before this is called; this catches the SOLID-typed-but-not-closed case.
 bool eval_is_closed_solid(const TopoDS_Shape& shape) {
     try {
-        TopTools_IndexedDataMapOfShapeListOfShape anc;
-        TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, anc);
         TopTools_IndexedMapOfShape edges;
         TopExp::MapShapes(shape, TopAbs_EDGE, edges);
         if (edges.Extent() == 0) return false;  // no faces/edges -> not a solid
-        for (int ei = 1; ei <= edges.Extent(); ++ei) {
-            const TopoDS_Shape& es = edges.FindKey(ei);
-            int nf = anc.Contains(es) ? anc.FindFromKey(es).Extent() : 0;
-            if (nf >= 2) continue;
-            const TopoDS_Edge& e = TopoDS::Edge(es);
-            if (BRep_Tool::Degenerated(e)) continue;
-            bool seam = false;
-            if (anc.Contains(es)) {
-                const TopTools_ListOfShape& faces = anc.FindFromKey(es);
-                for (TopTools_ListIteratorOfListOfShape it(faces); it.More(); it.Next())
-                    if (BRep_Tool::IsClosed(e, TopoDS::Face(it.Value()))) { seam = true; break; }
-            }
-            if (!seam) return false;  // a real free edge -> open shell
-        }
+        const auto uses = eval_edge_boundary_uses(shape, edges);
+        for (int ei = 1; ei <= edges.Extent(); ++ei)
+            if (!BRep_Tool::Degenerated(TopoDS::Edge(edges(ei))) && uses[ei].is_free())
+                return false;  // a real free edge -> open shell
         return true;
     } catch (const Standard_Failure&) {
         return false;  // be conservative: an OCCT error means we can't vouch for closure
@@ -10404,9 +10594,8 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
             gp_Pnt p_corner1 = surf->Value(u1, v1);
             const double face_diag_2d = p_corner0.Distance(p_corner1);
             tol_mm = std::max(0.5, face_diag_2d * 0.5);
-            // Outward face normal (signed: REVERSED → flip so normal points away from solid).
-            gp_Dir dir = ad_face.Plane().Axis().Direction();
-            if (face.Orientation() == TopAbs_REVERSED) dir.Reverse();
+            // Outward face normal (plane-frame handedness + REVERSED orientation).
+            const gp_Dir dir = ::chudware::geom::plane_outward_normal(face, ad_face.Plane());
             face_normal = {dir.X(), dir.Y(), dir.Z()};
         }
     }
@@ -11454,31 +11643,6 @@ static std::size_t eval_shape_index(const EvalShapeSet& shapes, const std::strin
     return static_cast<std::size_t>(it - shapes.body_ids.begin());
 }
 
-struct EvalEdgeBoundaryUses {
-    int boundary = 0;
-    bool embedded = false;
-
-    bool is_free() const { return boundary == 1 || (boundary == 0 && !embedded); }
-};
-
-static std::vector<EvalEdgeBoundaryUses> eval_edge_boundary_uses(
-    const TopoDS_Shape& shape, const TopTools_IndexedMapOfShape& edges) {
-    std::vector<EvalEdgeBoundaryUses> uses(edges.Extent() + 1);
-    // Count oriented skin uses, not ancestor faces. A seam has two boundary uses
-    // on one face; a boolean imprint can be INTERNAL to that face and have none.
-    for (TopExp_Explorer faces(shape, TopAbs_FACE); faces.More(); faces.Next()) {
-        for (TopExp_Explorer it(faces.Current(), TopAbs_EDGE); it.More(); it.Next()) {
-            const TopoDS_Shape& edge = it.Current();
-            auto& use = uses[edges.FindIndex(edge)];
-            if (edge.Orientation() == TopAbs_FORWARD || edge.Orientation() == TopAbs_REVERSED)
-                ++use.boundary;
-            else
-                use.embedded = true;
-        }
-    }
-    return uses;
-}
-
 // engine/doc/evaluate.py::check via worker.py::_eval_check. BRepCheck_Analyzer +
 // free-edge / tiny-edge / sliver-face census. Returns {"issues":[{kind,severity,text}]}.
 json doc_eval_check(const std::string& doc_id, int body_id) {
@@ -12373,11 +12537,15 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
                 {"all_sound", all_sound}};
 }
 
-// Section each world-placed solid independently so an unrelated nested body never becomes
-// another body's hole. Intersect the plane face with material, letting OCCT classify
-// coplanar/tangent boundaries and holes instead of chaining a branching edge graph.
+// Section each world-placed body independently so an unrelated nested body never becomes
+// another body's hole. Only a closed body has a section area. A closed solid is cut with
+// Common(plane face, solid), so OCCT classifies coplanar/tangent boundaries and holes. A
+// closed skin without a SOLID wrapper becomes one first (ShapeFix_Solid orients it and nests
+// void shells); chaining its raw section edges branched at coplanar faces. A body with free
+// edges has no inside: Common returns plausible wrong areas and chained loops guess material,
+// so a plane that cuts it is refused by body id; a plane that misses it adds nothing.
 // Areas are additive, with area-weighted centroid and parallel-axis inertia.
-// An empty intersection is zero; failed section/loop/face construction is an OpError,
+// An empty intersection is zero; failed section/face construction is an OpError,
 // never a plausible-looking zero or a partial document result.
 json doc_eval_section_props(const std::string& doc_id, const json& plane_ref) {
     DocLock lk;
@@ -12388,177 +12556,136 @@ json doc_eval_section_props(const std::string& doc_id, const json& plane_ref) {
     const gp_Pln pln = eval_resolve_plane(plane_ref);
     const gp_Ax3& pos = pln.Position();
     const gp_Pnt o3 = pos.Location();
-    const gp_Dir ud = pos.XDirection(), vd = pos.YDirection();
-    auto to_uv = [&](const gp_Pnt& p) -> Eigen::Vector2d {
-        const gp_Vec d(o3, p);
-        return Eigen::Vector2d(d.Dot(gp_Vec(ud)), d.Dot(gp_Vec(vd)));
-    };
+    const gp_Vec plane_normal(pos.Direction());
 
     TopoDS_Compound sec_comp;
     BRep_Builder cb;
     cb.MakeCompound(sec_comp);
     bool any_face = false;
-    auto append_section = [&](const TopoDS_Shape& shape) {
-        if (shape.ShapeType() == TopAbs_SOLID) {
-            // Section() includes edges internal to coplanar patches: at a step or
-            // tangent face its graph has degree-three vertices, not closed wires.
-            // Common(face, solid) builds the actual filled regions, including holes,
-            // and discards zero-area edge/point tangencies without perturbing the plane.
-            BRepBuilderAPI_MakeFace plane_face(pln);
-            BRepAlgoAPI_Common common(shape, plane_face.Face());
-            common.Build();
-            if (!common.IsDone())
-                throw OpError("section_failed", "cutting-plane material intersection failed",
+    auto add_material = [&](const TopoDS_Shape& solid) {
+        BRepBuilderAPI_MakeFace plane_face(pln);
+        BRepAlgoAPI_Common common(solid, plane_face.Face());
+        common.Build();
+        if (!common.IsDone())
+            throw OpError("section_failed", "cutting-plane material intersection failed",
+                          {{"doc_id", doc_id}});
+        for (TopExp_Explorer face(common.Shape(), TopAbs_FACE); face.More(); face.Next()) {
+            if (!BRepCheck_Analyzer(face.Current()).IsValid())
+                throw OpError("section_failed", "section material face construction failed",
                               {{"doc_id", doc_id}});
-            for (TopExp_Explorer face(common.Shape(), TopAbs_FACE); face.More(); face.Next()) {
-                if (!BRepCheck_Analyzer(face.Current()).IsValid())
-                    throw OpError("section_failed", "section material face construction failed",
-                                  {{"doc_id", doc_id}});
-                cb.Add(sec_comp, face.Current());
-                any_face = true;
+            cb.Add(sec_comp, face.Current());
+            any_face = true;
+        }
+    };
+    auto section_body = [&](const TopoDS_Shape& body, std::size_t index) {
+        // Same free-edge rule as check_geometry_health, so its report names these edges.
+        TopTools_IndexedMapOfShape edges;
+        TopExp::MapShapes(body, TopAbs_EDGE, edges);
+        const auto uses = eval_edge_boundary_uses(body, edges);
+        std::vector<int> free_edges;
+        for (int ei = 1; ei <= edges.Extent(); ++ei)
+            if (!BRep_Tool::Degenerated(TopoDS::Edge(edges(ei))) && uses[ei].is_free())
+                free_edges.push_back(ei);
+
+        if (free_edges.empty()) {
+            TopTools_IndexedMapOfShape solids;
+            TopExp::MapShapes(body, TopAbs_SOLID, solids);
+            if (!solids.IsEmpty()) {
+                for (int si = 1; si <= solids.Extent(); ++si) add_material(solids(si));
+                return;
             }
+            TopoDS_Shell skin;
+            cb.MakeShell(skin);
+            bool any_skin_face = false;
+            for (TopExp_Explorer face(body, TopAbs_FACE); face.More(); face.Next()) {
+                cb.Add(skin, face.Current());
+                any_skin_face = true;
+            }
+            if (!any_skin_face) return;  // no faces and no free edges: nothing to cut
+            TopoDS_Solid wrapper;
+            cb.MakeSolid(wrapper);
+            cb.Add(wrapper, skin);
+            ShapeFix_Solid fix(wrapper);
+            fix.Perform();
+            bool any_solid = false;
+            for (TopExp_Explorer solid(fix.Solid(), TopAbs_SOLID); solid.More(); solid.Next()) {
+                add_material(solid.Current());
+                any_solid = true;
+            }
+            if (!any_solid)
+                throw OpError("section_failed", "closed body skin could not form a solid",
+                              {{"doc_id", doc_id}});
             return;
         }
-        BRepAlgoAPI_Section section(shape, pln, Standard_False);
+
+        BRepAlgoAPI_Section section(body, pln, Standard_False);
         section.Build();
         if (!section.IsDone())
             throw OpError("section_failed", "cutting-plane intersection failed",
                           {{"doc_id", doc_id}});
-        TopTools_IndexedMapOfShape edge_map;
-        TopExp::MapShapes(section.Shape(), TopAbs_EDGE, edge_map);
-        if (edge_map.IsEmpty()) return;  // completed, genuinely zero-area intersection
+        if (!TopExp_Explorer(section.Shape(), TopAbs_EDGE).More())
+            return;  // the plane misses this open body, so it adds no area
 
-        // Join free-edge vertices at the established body-relative tolerance.
-        const double join_tol = std::max(sim_bbox_diag(shape) * 1e-4, 1e-6);
-        Handle(TopTools_HSequenceOfShape) in_edges = new TopTools_HSequenceOfShape();
-        for (int ei = 1; ei <= edge_map.Extent(); ++ei)
-            in_edges->Append(edge_map.FindKey(ei));
-        Handle(TopTools_HSequenceOfShape) wires;
-        ShapeAnalysis_FreeBounds::ConnectEdgesToWires(in_edges, join_tol,
-                                                      Standard_False, wires);
-        if (wires.IsNull() || wires->IsEmpty())
-            throw OpError("section_failed", "section edges could not form closed contours",
-                          {{"doc_id", doc_id}});
-
-        struct Loop {
-            TopoDS_Wire wire;
-            double area;
-            std::vector<Eigen::Vector2d> poly;
-            Eigen::Vector2d cuv;
-        };
-        std::vector<Loop> loops;
-        loops.reserve(wires->Length());
-        for (int wi = 1; wi <= wires->Length(); ++wi) {
-            const TopoDS_Shape& ws = wires->Value(wi);
-            if (ws.ShapeType() != TopAbs_WIRE || !BRep_Tool::IsClosed(ws)) {
-                json locations = json::array();
-                TopTools_IndexedMapOfShape vertices;
-                TopExp::MapShapes(ws, TopAbs_VERTEX, vertices);
-                for (int vi = 1; vi <= vertices.Extent(); ++vi) {
-                    int degree = 0;
-                    for (TopExp_Explorer edge(ws, TopAbs_EDGE); edge.More(); edge.Next()) {
-                        TopoDS_Vertex first, last;
-                        TopExp::Vertices(TopoDS::Edge(edge.Current()), first, last);
-                        degree += !first.IsNull() && first.IsSame(vertices(vi));
-                        degree += !last.IsNull() && last.IsSame(vertices(vi));
-                    }
-                    if (degree == 2) continue;
-                    const gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(vertices(vi)));
-                    locations.push_back({{"point", {p.X(), p.Y(), p.Z()}}, {"degree", degree}});
-                }
-                throw OpError("section_failed", "section contains an open contour; unmatched "
-                              "or branching endpoints: " + locations.dump(),
-                              {{"doc_id", doc_id}, {"contour_index", wi},
-                               {"open_locations", locations}, {"join_tolerance_mm", join_tol}});
+        const int body_id = s.is_assembly() ? s.asm_result->bodies[index].body_id
+                                            : static_cast<int>(index + 1);
+        constexpr std::size_t MAX_SIDS = 16;
+        json crossing = json::array(), other = json::array();
+        int crossing_count = 0;
+        for (int ei : free_edges) {
+            const TopoDS_Edge& edge = TopoDS::Edge(edges(ei));
+            std::string sid;
+            try {
+                sid = make_selector(chudware::doc::edge_info(edge, ei - 1))
+                          .value("sid", std::string());
+            } catch (const Standard_Failure&) {}
+            // Sampled signed distances: an edge with samples on both sides crosses the plane.
+            BRepAdaptor_Curve curve(edge);
+            const double t0 = curve.FirstParameter(), t1 = curve.LastParameter();
+            const double tol = BRep_Tool::Tolerance(edge);
+            double lo = std::numeric_limits<double>::infinity();
+            double hi = -lo;
+            constexpr int N = 16;
+            for (int k = 0; k <= N; ++k) {
+                const double d = gp_Vec(o3, curve.Value(t0 + (t1 - t0) * k / N)).Dot(plane_normal);
+                lo = std::min(lo, d);
+                hi = std::max(hi, d);
             }
-            BRepBuilderAPI_MakeFace fm(pln, TopoDS::Wire(ws));
-            if (!fm.IsDone())
-                throw OpError("section_failed", "section contour face construction failed",
-                              {{"doc_id", doc_id}});
-            GProp_GProps wp;
-            BRepGProp::SurfaceProperties(fm.Face(), wp);
-            Loop lp;
-            // Keep MakeFace's finite-domain orientation so reversing a hole always subtracts.
-            lp.wire = BRepTools::OuterWire(fm.Face());
-            lp.area = std::abs(wp.Mass());
-            lp.cuv = to_uv(wp.CentreOfMass());
-            if (!std::isfinite(lp.area) || lp.area <= 0.0 || !lp.cuv.allFinite())
-                throw OpError("section_failed", "section contour has invalid area properties",
-                              {{"doc_id", doc_id}});
-            // Sample curves, not only vertices: a circle has just one seam vertex.
-            for (TopExp_Explorer ee(lp.wire, TopAbs_EDGE); ee.More(); ee.Next()) {
-                BRepAdaptor_Curve ca(TopoDS::Edge(ee.Current()));
-                const double t0 = ca.FirstParameter(), t1 = ca.LastParameter();
-                constexpr int N = 16;
-                for (int k = 0; k < N; ++k)
-                    lp.poly.push_back(to_uv(ca.Value(t0 + (t1 - t0) * k / N)));
-            }
-            loops.push_back(std::move(lp));
+            const bool crosses = lo <= tol && hi >= -tol;
+            crossing_count += crosses;
+            json& bucket = crosses ? crossing : other;
+            if (!sid.empty() && bucket.size() < MAX_SIDS) bucket.push_back(sid);
         }
-
-        // EVEN-ODD nesting within this solid only: depth 0/2/... is material; its
-        // immediate odd-depth children are holes. Disjoint tube-wall regions both
-        // have depth zero. Larger-area gating keeps concentric bore/outer centroids
-        // from making each loop a hole in the other.
-        const std::size_t n = loops.size();
-        std::vector<int> depth(n, 0);
-        std::vector<int> parent(n, -1);
-        auto poly_inside = [](const Eigen::Vector2d& pt,
-                              const std::vector<Eigen::Vector2d>& poly) -> bool {
-            const std::size_t m = poly.size();
-            if (m < 3) return false;
-            bool in = false;
-            for (std::size_t i = 0, j = m - 1; i < m; j = i++) {
-                const double xi = poly[i].x(), yi = poly[i].y();
-                const double xj = poly[j].x(), yj = poly[j].y();
-                if (((yi > pt.y()) != (yj > pt.y())) &&
-                    (pt.x() < (xj - xi) * (pt.y() - yi) / (yj - yi + 1e-30) + xi))
-                    in = !in;
-            }
-            return in;
-        };
-        for (std::size_t i = 0; i < n; ++i) {
-            double parent_area = std::numeric_limits<double>::infinity();
-            for (std::size_t j = 0; j < n; ++j) {
-                if (i == j || loops[j].area <= loops[i].area) continue;
-                if (poly_inside(loops[i].cuv, loops[j].poly)) {
-                    ++depth[i];
-                    if (loops[j].area < parent_area) {
-                        parent_area = loops[j].area;
-                        parent[i] = static_cast<int>(j);
-                    }
-                }
-            }
+        json sids = crossing;
+        for (const auto& sid : other)
+            if (sids.size() < MAX_SIDS) sids.push_back(sid);
+        json detail{{"doc_id", doc_id},
+                    {"reason", "body_not_closed_solid"},
+                    {"body_id", body_id},
+                    {"free_edges", {{"count", static_cast<int>(free_edges.size())},
+                                    {"crossing_plane", crossing_count},
+                                    {"sids", sids}}}};
+        std::string who = "body " + std::to_string(body_id);
+        if (s.is_assembly()) {
+            const AsmBodyOut& placed = s.asm_result->bodies[index];
+            detail["component_id"] = placed.component_id;
+            detail["component_name"] = placed.name;
+            who += " (component '" + placed.name + "')";
         }
-
-        for (std::size_t i = 0; i < n; ++i) {
-            if (depth[i] % 2 != 0) continue;
-            BRepBuilderAPI_MakeFace fm(pln, loops[i].wire);
-            for (std::size_t h = 0; h < n; ++h) {
-                if (depth[h] % 2 == 0 || parent[h] != static_cast<int>(i)) continue;
-                TopoDS_Wire hole = loops[h].wire;
-                hole.Reverse();
-                fm.Add(hole);
-            }
-            if (!fm.IsDone() || !BRepCheck_Analyzer(fm.Face()).IsValid())
-                throw OpError("section_failed", "section material face construction failed",
-                              {{"doc_id", doc_id}});
-            cb.Add(sec_comp, fm.Face());
-            any_face = true;
-        }
+        throw OpError("section_failed",
+                      who + " is not a closed solid. It has " +
+                          std::to_string(free_edges.size()) +
+                          " free edge(s), and the plane cuts it. An open body has no inside, so "
+                          "its section area is not defined. Run check_geometry_health(body_id=" +
+                          std::to_string(body_id) +
+                          ") to find the free edges. Then repair the feature that opened the "
+                          "body, or run heal_body on an imported body.",
+                      std::move(detail));
     };
 
     double area = 0.0, cx = 0.0, cy = 0.0, cz = 0.0, Ixx = 0.0, Iyy = 0.0, Ixy = 0.0;
     try {
-        for (const TopoDS_Shape& body : bodies) {
-            TopTools_IndexedMapOfShape solids;
-            TopExp::MapShapes(body, TopAbs_SOLID, solids);
-            if (solids.IsEmpty())
-                append_section(body);
-            else
-                for (int si = 1; si <= solids.Extent(); ++si)
-                    append_section(solids.FindKey(si));
-        }
+        for (std::size_t bi = 0; bi < bodies.size(); ++bi)
+            section_body(bodies[bi], bi);
         if (any_face) {
             GProp_GProps fp;
             BRepGProp::SurfaceProperties(sec_comp, fp);
@@ -13283,10 +13410,14 @@ json doc_eval_feature_overlap(const std::string& doc_id, const json& params) {
 //   floating        dist(X, Y) > gap tolerance — the feature is its own island.
 //   barely_touching X meets Y but the best-supported face of t has (near) zero contact
 //                   area: an edge or point contact.
-//   overhang        the best-supported face of t (its base) is only partly backed: its
-//                   points probed a hair outward along the face normal land outside Y.
-// The base/contact face is found by sampling every face of t on a UV grid and probing
-// p + eps*n_out against Y with a solid classifier — deterministic, no tessellation. The
+//   overhang        the foot of t is only partly backed: its points probed a hair outward
+//                   along the face normal land outside Y. The foot is the face with the
+//                   largest SUPPORTED SHARE (not area), so a proud boss's partly buried side
+//                   wall never stands in for its seated foot; near-ties resolve by supported
+//                   area, then by a mirror-invariant face key (mirrored twins agree).
+// The faces are sampled on a UV grid and p + eps*n_out is probed against Y with a solid
+// classifier — deterministic, no tessellation. Tool solids are as built: an in-place
+// `transform` re-places the tools of the body it moves (document.cpp). The
 // first solid-producing feature (the base body) and explicit mode:"new"/merge:false bodies
 // are not attachment candidates; the latter are listed under `independent`.
 json doc_eval_feature_attachment(const std::string& doc_id, const json& params) {
@@ -13407,11 +13538,23 @@ json doc_eval_feature_attachment(const std::string& doc_id, const json& params) 
 
     struct Sample { gp_Pnt p; bool supported; };
     // Sample face `f` on an n x n UV grid; `supported` = p + probe * outward normal lies
-    // INSIDE one of the rest-of-part solids.
-    auto sample_face = [&](const TopoDS_Face& f, int n,
-                           std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>>& cls,
-                           const std::vector<Bnd_Box>& boxes) {
+    // INSIDE one of the rest-of-part solids. A point whose inner side (p - probe * normal) is
+    // not in the feature's KEPT material is skipped: a later cut or shell removed the
+    // feature there, so nothing has to hold it up (a collar over a shelled duct's bore).
+    using Classifiers = std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>>;
+    auto inside_any = [](const gp_Pnt& q, Classifiers& cls, const std::vector<Bnd_Box>& boxes) {
+        for (std::size_t k = 0; k < cls.size(); ++k) {
+            if (boxes[k].IsOut(q)) continue;
+            cls[k]->Perform(q, 1e-7);
+            if (cls[k]->State() == TopAbs_IN) return true;
+        }
+        return false;
+    };
+    auto sample_face = [&](const TopoDS_Face& f, int n, Classifiers& cls,
+                           const std::vector<Bnd_Box>& boxes, Classifiers& kept_cls,
+                           const std::vector<Bnd_Box>& kept_boxes, int* in_face) {
         std::vector<Sample> pts;
+        *in_face = 0;
         try {
             double u0, u1, v0, v1;
             BRepTools::UVBounds(f, u0, u1, v0, v1);
@@ -13425,18 +13568,13 @@ json doc_eval_feature_attachment(const std::string& doc_id, const json& params) 
                     if (inside.Perform(gp_Pnt2d(u, v)) != TopAbs_IN) continue;
                     BRepLProp_SLProps props(sa, u, v, 1, 1e-7);
                     if (!props.IsNormalDefined()) continue;
+                    ++*in_face;
                     gp_Dir nrm = props.Normal();
                     if (reversed) nrm.Reverse();
                     const gp_Pnt p = props.Value();
-                    const gp_Pnt q(p.X() + probe * nrm.X(), p.Y() + probe * nrm.Y(),
-                                   p.Z() + probe * nrm.Z());
-                    bool sup = false;
-                    for (std::size_t k = 0; k < cls.size() && !sup; ++k) {
-                        if (boxes[k].IsOut(q)) continue;
-                        cls[k]->Perform(q, 1e-7);
-                        sup = cls[k]->State() == TopAbs_IN;
-                    }
-                    pts.push_back({p, sup});
+                    const gp_Vec step = gp_Vec(nrm) * probe;
+                    if (!inside_any(p.Translated(-step), kept_cls, kept_boxes)) continue;
+                    pts.push_back({p, inside_any(p.Translated(step), cls, boxes)});
                 }
         } catch (const Standard_Failure&) {
         }
@@ -13525,22 +13663,89 @@ json doc_eval_feature_attachment(const std::string& doc_id, const json& params) 
                 bb.Enlarge(probe);
                 boxes.push_back(bb);
             }
-            // Coarse pass on every face of t picks the base (best-supported) face.
-            TopoDS_Face base;
+            // The feature's material that survives downstream features.
+            Classifiers kept_cls;
+            std::vector<Bnd_Box> kept_boxes;
+            for (const TopoDS_Shape& so : solids_of(X)) {
+                kept_cls.push_back(std::make_unique<BRepClass3d_SolidClassifier>(so));
+                Bnd_Box bb;
+                BRepBndLib::Add(so, bb, Standard_False);
+                bb.Enlarge(probe);
+                kept_boxes.push_back(bb);
+            }
+            // The base is the feature's FOOT: the face that sits on the part. Rank the faces
+            // by the SHARE of their kept area that has material behind it, not by the
+            // supported area. A proud boss's side wall is only partly buried, and that
+            // buried band can equal or exceed the fully seated foot (tool_flange f24: wall
+            // 2*pi*3.6*1.6 = annulus foot 36.19 mm^2, so the wall read as a 39 % overhang).
+            // A coarse 8x8 pass sizes every face; the near-best faces get the 36x36 pass and
+            // the best fine share wins. Near-ties go to the larger supported area, then to a
+            // key that depends on neither the face order nor the sign of a coordinate, so a
+            // mirrored pair of features always gets the same verdict.
+            struct FaceSupport {
+                TopoDS_Face face;
+                double area = 0.0;      // whole face
+                double sup_area = 0.0;  // coarse supported area
+                double frac = 0.0;      // coarse supported share of the kept samples
+                int surf_type = 0;
+                double centre_dist = 0.0;  // face centroid to tool centroid (mirror-invariant)
+                gp_Pnt centre;
+                std::vector<Sample> fine;  // fine pass (chosen candidates only)
+                int fine_in_face = 0;
+                double fine_frac = 0.0, fine_sup_area = 0.0;
+            };
+            gp_Pnt tool_centre;
+            try {
+                GProp_GProps tgp;
+                BRepGProp::VolumeProperties(t, tgp);
+                tool_centre = tgp.CentreOfMass();
+            } catch (const Standard_Failure&) {
+            }
+            std::vector<FaceSupport> faces;
             double base_sup = 0.0, max_face_area = 0.0;
             for (TopExp_Explorer fx(t, TopAbs_FACE); fx.More(); fx.Next()) {
-                const TopoDS_Face f = TopoDS::Face(fx.Current());
-                const double a = area_of(f);
-                max_face_area = std::max(max_face_area, a);
-                const std::vector<Sample> pts = sample_face(f, 8, cls, boxes);
+                FaceSupport fs;
+                fs.face = TopoDS::Face(fx.Current());
+                try {
+                    GProp_GProps fgp;
+                    BRepGProp::SurfaceProperties(fs.face, fgp);
+                    fs.area = std::max(0.0, fgp.Mass());
+                    fs.centre = fgp.CentreOfMass();
+                    fs.centre_dist = fs.centre.Distance(tool_centre);
+                    fs.surf_type = int(BRepAdaptor_Surface(fs.face).GetType());
+                } catch (const Standard_Failure&) {
+                    continue;
+                }
+                max_face_area = std::max(max_face_area, fs.area);
+                int in_face = 0;
+                const std::vector<Sample> pts =
+                    sample_face(fs.face, 8, cls, boxes, kept_cls, kept_boxes, &in_face);
                 if (pts.empty()) continue;
                 std::size_t sup = 0;
                 for (const Sample& sm : pts) sup += sm.supported ? 1 : 0;
-                const double sup_area = a * double(sup) / double(pts.size());
-                if (sup_area > base_sup) { base_sup = sup_area; base = f; }
+                fs.sup_area = fs.area * double(sup) / double(in_face);
+                fs.frac = double(sup) / double(pts.size());
+                base_sup = std::max(base_sup, fs.sup_area);
+                faces.push_back(std::move(fs));
             }
             const double min_contact = std::max(0.25, min_contact_frac * max_face_area);
-            if (base.IsNull() || base_sup < min_contact) {
+            // A near-tie on the fine pass: within the grid's sampling noise (0.02 of the
+            // share), then within 1 % of the supported area.
+            constexpr double kFracTie = 0.02, kAreaTie = 0.01;
+            auto ranks_above = [&](const FaceSupport& a, const FaceSupport& b) {
+                if (std::abs(a.fine_frac - b.fine_frac) > kFracTie)
+                    return a.fine_frac > b.fine_frac;
+                const double sa = a.fine_sup_area, sb = b.fine_sup_area;
+                if (std::abs(sa - sb) > kAreaTie * std::max({sa, sb, 1e-9})) return sa > sb;
+                if (a.surf_type != b.surf_type) return a.surf_type < b.surf_type;
+                if (std::abs(a.centre_dist - b.centre_dist) > 1e-6)
+                    return a.centre_dist < b.centre_dist;
+                return false;
+            };
+            std::vector<FaceSupport*> cands;
+            for (FaceSupport& fs : faces)
+                if (fs.sup_area >= min_contact) cands.push_back(&fs);
+            if (cands.empty()) {
                 const gp_Pnt a = dist_ok ? dss.PointOnShape1(1) : gp_Pnt();
                 e["verdict"] = "barely_touching";
                 e["supported_area_mm2"] = base_sup;
@@ -13555,14 +13760,65 @@ json doc_eval_feature_attachment(const std::string& doc_id, const json& params) 
                 out["features"].push_back(e);
                 continue;
             }
-            // Fine pass on the base face measures the unsupported share and where it is.
-            const double base_area = area_of(base);
-            const std::vector<Sample> pts = sample_face(base, 36, cls, boxes);
+            // Exact keys here (a strict order for the sort); the tolerances apply only to
+            // the fine-pass choice below.
+            std::stable_sort(cands.begin(), cands.end(),
+                             [](const FaceSupport* a, const FaceSupport* b) {
+                                 if (a->frac != b->frac) return a->frac > b->frac;
+                                 if (a->sup_area != b->sup_area) return a->sup_area > b->sup_area;
+                                 if (a->surf_type != b->surf_type)
+                                     return a->surf_type < b->surf_type;
+                                 return a->centre_dist < b->centre_dist;
+                             });
+            // The coarse grid has 64 samples, so its share is noisy: fine-pass every
+            // candidate within 0.15 of the best coarse share (at most 6 faces).
+            const double coarse_floor = cands.front()->frac - 0.15;
+            FaceSupport* chosen = nullptr;
+            for (std::size_t c = 0; c < cands.size() && c < 6; ++c) {
+                FaceSupport& fs = *cands[c];
+                if (c > 0 && fs.frac < coarse_floor) break;
+                fs.fine = sample_face(fs.face, 36, cls, boxes, kept_cls, kept_boxes,
+                                      &fs.fine_in_face);
+                if (fs.fine.empty() || fs.fine_in_face <= 0) continue;
+                std::size_t sup = 0;
+                for (const Sample& sm : fs.fine) sup += sm.supported ? 1 : 0;
+                fs.fine_frac = double(sup) / double(fs.fine.size());
+                fs.fine_sup_area = fs.area * double(sup) / double(fs.fine_in_face);
+                if (!chosen || ranks_above(fs, *chosen)) chosen = &fs;
+            }
+            if (!chosen) {
+                // The fine grid found no kept sample on any candidate: use the best
+                // coarse face as it is.
+                chosen = cands.front();
+                chosen->fine_frac = chosen->frac;
+                chosen->fine_sup_area = chosen->sup_area;
+            }
+            // Only the base face's surviving share counts (a later shell or cut can remove
+            // most of it).
+            const TopoDS_Face& base = chosen->face;
+            const int in_face = chosen->fine_in_face;
+            const std::vector<Sample>& pts = chosen->fine;
+            const double base_area =
+                chosen->area * (in_face > 0 ? double(pts.size()) / double(in_face) : 1.0);
             std::vector<gp_Pnt> sup_pts, un_pts;
             for (const Sample& sm : pts) (sm.supported ? sup_pts : un_pts).push_back(sm.p);
-            const double frac = pts.empty() ? 1.0 : double(sup_pts.size()) / pts.size();
+            const double frac = pts.empty() ? chosen->fine_frac
+                                            : double(sup_pts.size()) / pts.size();
             const double over_area = base_area * (1.0 - frac);
             e["base_face_area_mm2"] = base_area;
+            e["base_face_center"] = pt_json(chosen->centre);
+            try {
+                double u0, u1, v0, v1;
+                BRepTools::UVBounds(base, u0, u1, v0, v1);
+                BRepAdaptor_Surface bsa(base);
+                BRepLProp_SLProps bp(bsa, 0.5 * (u0 + u1), 0.5 * (v0 + v1), 1, 1e-7);
+                if (bp.IsNormalDefined()) {
+                    gp_Dir bn = bp.Normal();
+                    if (base.Orientation() == TopAbs_REVERSED) bn.Reverse();
+                    e["base_face_normal"] = json::array({bn.X(), bn.Y(), bn.Z()});
+                }
+            } catch (const Standard_Failure&) {
+            }
             e["supported_area_mm2"] = base_area * frac;
             e["supported_frac"] = frac;
             e["overhang_frac"] = 1.0 - frac;
@@ -13599,9 +13855,11 @@ json doc_eval_feature_attachment(const std::string& doc_id, const json& params) 
                     std::sqrt(base_area / std::max<double>(1.0, double(pts.size()))) *
                     std::sqrt(double(stride));
                 std::snprintf(buf, sizeof(buf),
-                    "%s OVERHANGS its support: %.0f%% (%.3g of %.3g mm^2) of its base face has "
-                    "no material behind it, reaching %.3g mm past the supported edge around "
-                    "[%.2f, %.2f, %.2f].",
+                    "%s OVERHANGS its support. %.0f%% (%.3g of %.3g mm^2) of its foot face has "
+                    "no material behind it. The free area goes %.3g mm past the supported edge, "
+                    "near [%.2f, %.2f, %.2f]. The foot face is the face with the largest "
+                    "supported share. If the overhang is not intended, move the profile onto "
+                    "the part or extend the support.",
                     who.c_str(), 100.0 * (1.0 - frac), over_area, base_area, reach,
                     cx * k, cy * k, cz * k);
                 e["detail"] = buf;
@@ -14266,20 +14524,26 @@ inline void field_vertex_normal(const aicm::AicmBody& body, std::size_t vi, doub
 }
 
 // engine/doc/evaluate.py::_moller_trumbore_all — for each ray, the smallest positive t
-// (distance along a UNIT direction) to a triangle of the mesh; inf if no hit. Ported 1:1
-// (same EPS=1e-10, u/v barycentric bounds, t>EPS guard). directions are unit vectors.
+// (distance along a UNIT direction) to a triangle of the mesh; inf if no hit. Same EPS=1e-10,
+// u/v barycentric bounds and t>EPS guard as the oracle. directions are unit vectors.
 //
-// TWO-SIDED (intentional, load-bearing for wall thickness): the determinant test below is
-// `std::abs(a) <= EPS` — it rejects ONLY rays parallel to a triangle, accepting BOTH front-
-// and back-facing triangles. This is what makes the thickness cast (doc_eval_thickness) find
-// the NEAREST opposite wall: the near inner-shell wall is wound toward the cavity (back-facing
-// to an inward ray), so a one-sided / back-face-culling cast would SKIP it and cross the whole
-// cavity to the far wall (reporting the cavity span, not the wall). Do NOT add a sign-of-`a`
-// cull here without giving doc_eval_thickness its own two-sided path.
+// EXIT FACES ONLY, NEVER GRAZING (load-bearing for wall thickness). The cast starts inside
+// the material, so the wall it measures ends where the ray LEAVES the material: a triangle
+// whose outward normal N points along the ray (d.N > 0, i.e. MT determinant a < 0, since
+// a = -d.(e1 x e2) and tessellate_body winds every triangle outward). That keeps the near
+// inner-shell wall of a hollow part (its outward normal faces the cavity, along the inward
+// ray), so a shell still reads its wall, not the cavity span. It rejects two false hits:
+//  * an ENTRY face (d.N < 0): the ray was outside the material, e.g. a rim sample whose ray
+//    ran along the adjacent face and struck the foot of a boss on it (GripperGears: a Ø8
+//    pin-end rim read 0.5 mm against the Ø7 collar foot);
+//  * a GRAZING face (d.N < min_exit_cos * |N|): the ray runs nearly in the face plane, so
+//    the hit is a tessellation-chord artefact, not an opposite wall.
+// Rejected triangles are skipped; the ray continues to the next exit face.
 std::vector<double> field_moller_trumbore_all(const std::vector<float>& pos,
                                               const std::vector<uint32_t>& idx,
                                               const std::vector<std::array<double, 3>>& origins,
-                                              const std::vector<std::array<double, 3>>& dirs) {
+                                              const std::vector<std::array<double, 3>>& dirs,
+                                              double min_exit_cos) {
     constexpr double EPS = 1e-10;
     const std::size_t n_rays = origins.size();
     const std::size_t n_tris = idx.size() / 3;
@@ -14299,8 +14563,9 @@ std::vector<double> field_moller_trumbore_all(const std::vector<float>& pos,
         return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     };
 
-    // Precompute triangle edges (matches the oracle's V0/E1/E2 layout).
+    // Precompute triangle edges (matches the oracle's V0/E1/E2 layout) and |e1 x e2|.
     std::vector<std::array<double, 3>> V0(n_tris), E1(n_tris), E2(n_tris);
+    std::vector<double> N2(n_tris);
     for (std::size_t t = 0; t < n_tris; ++t) {
         double v0[3], v1[3], v2[3];
         vtx(idx[3 * t + 0], v0);
@@ -14309,6 +14574,9 @@ std::vector<double> field_moller_trumbore_all(const std::vector<float>& pos,
         V0[t] = {v0[0], v0[1], v0[2]};
         E1[t] = {v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]};
         E2[t] = {v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]};
+        double n[3];
+        cross(E1[t].data(), E2[t].data(), n);
+        N2[t] = std::sqrt(dot(n, n));
     }
 
     for (std::size_t ri = 0; ri < n_rays; ++ri) {
@@ -14321,7 +14589,8 @@ std::vector<double> field_moller_trumbore_all(const std::vector<float>& pos,
             double h[3];
             cross(d, e2, h);
             double a = dot(e1, h);
-            if (std::abs(a) <= EPS) continue;
+            // a = -d.N (unnormalized N): keep only exit faces at a steep enough angle.
+            if (-a <= std::max(EPS, min_exit_cos * N2[t])) continue;
             double inv_a = 1.0 / a;
             const double s[3] = {o[0] - V0[t][0], o[1] - V0[t][1], o[2] - V0[t][2]};
             double u = inv_a * dot(s, h);
@@ -14714,11 +14983,20 @@ json doc_eval_curvature(const std::string& doc_id, int body_id, const std::strin
 
 // engine/doc/evaluate.py::thickness_field. Per-vertex inward-raycast wall thickness: from each
 // vertex offset 1e-3 along -normal (the inward direction, since field_vertex_normal returns the
-// OUTWARD surface normal), cast -normal and take the NEAREST re-intersection distance (minus the
-// offset). The cast is TWO-SIDED (field_moller_trumbore_all accepts triangles of either winding)
-// so it stops at the FIRST opposite wall — for a hollow shell that is the thin wall, not the far
-// side across the cavity. The oracle's primary path is trimesh BVH; we port the deterministic
-// Moller-Trumbore FALLBACK (_moller_trumbore_all). chunk name "thickness". NOTE: parity here is
+// OUTWARD surface normal), cast -normal and take the NEAREST exit-face distance PLUS the
+// offset (the origin already sits OFFSET inside the surface, so the wall is d + OFFSET; the old
+// d - OFFSET counted the offset twice and read every wall 2e-3 mm thin). Only EXIT faces hit
+// at more than GRAZE_DEG to their plane count (field_moller_trumbore_all), so the cast stops
+// at the FIRST opposite wall — for a hollow shell that is the thin wall, not the far side
+// across the cavity.
+// Edge samples: tessellation vertices sit on face EDGES (every vertex of a planar face does).
+// From an edge vertex the -normal ray runs IN the plane of the adjacent face, on the solid
+// boundary, not through material; a boss standing on that face then stops it (GripperGears:
+// the Ø8 pin-end rim read 0.5 mm against the foot of the Ø7 collar, a 0.5 mm ledge). So each
+// origin also moves NUDGE into its own face, toward the centroids of its own triangles: the
+// ray then starts inside the material and the adjacent face stays out of its path.
+// The oracle's primary path is trimesh BVH; we port the deterministic Moller-Trumbore
+// FALLBACK (_moller_trumbore_all). chunk name "thickness". NOTE: parity here is
 // PHYSICAL (a tolerance band), not bit-exact — the oracle's BVH runs on a divergent mesh.
 // CAVEAT: thickness is a property of the SOLID. A solid block reports its full span (a 40 mm
 // cube -> ~40 mm), which is correct; only a body with a genuine cavity (e.g. an open shell)
@@ -14738,17 +15016,38 @@ json doc_eval_thickness(const std::string& doc_id, int body_id) {
     std::vector<float> values(n, NaNf);
 
     constexpr double OFFSET = 1e-3;
+    constexpr double NUDGE = 1e-3;
+    constexpr double GRAZE_DEG = 5.0;
+    // Sum of (triangle centroid - vertex) over each vertex's own triangles. tessellate_body
+    // gives every B-rep face its own vertices, so this points into that vertex's face.
+    std::vector<std::array<double, 3>> inward(n, {0.0, 0.0, 0.0});
+    for (std::size_t t = 0; t + 2 < body.idx.size(); t += 3) {
+        const uint32_t c[3] = {body.idx[t], body.idx[t + 1], body.idx[t + 2]};
+        double centroid[3];
+        for (int k = 0; k < 3; ++k)
+            centroid[k] = (static_cast<double>(body.pos[3 * c[0] + k]) + body.pos[3 * c[1] + k] +
+                           body.pos[3 * c[2] + k]) / 3.0;
+        for (uint32_t vi : c)
+            for (int k = 0; k < 3; ++k) inward[vi][k] += centroid[k] - body.pos[3 * vi + k];
+    }
     std::vector<std::array<double, 3>> origins(n), dirs(n);
     for (std::size_t i = 0; i < n; ++i) {
         double nrm[3];
         field_vertex_normal(body, i, nrm);
-        origins[i] = {body.pos[3 * i + 0] - nrm[0] * OFFSET,
-                      body.pos[3 * i + 1] - nrm[1] * OFFSET,
-                      body.pos[3 * i + 2] - nrm[2] * OFFSET};
+        // Tangent part of the into-face direction, scaled to NUDGE (none when it vanishes).
+        std::array<double, 3> side = inward[i];
+        const double along = side[0] * nrm[0] + side[1] * nrm[1] + side[2] * nrm[2];
+        for (int k = 0; k < 3; ++k) side[k] -= along * nrm[k];
+        const double len = std::sqrt(side[0] * side[0] + side[1] * side[1] + side[2] * side[2]);
+        const double scale = len > 1e-12 ? NUDGE / len : 0.0;
+        origins[i] = {body.pos[3 * i + 0] - nrm[0] * OFFSET + side[0] * scale,
+                      body.pos[3 * i + 1] - nrm[1] * OFFSET + side[1] * scale,
+                      body.pos[3 * i + 2] - nrm[2] * OFFSET + side[2] * scale};
         dirs[i] = {-nrm[0], -nrm[1], -nrm[2]};  // inward (unit, since normal is unit)
     }
 
-    std::vector<double> hits = field_moller_trumbore_all(body.pos, body.idx, origins, dirs);
+    std::vector<double> hits = field_moller_trumbore_all(
+        body.pos, body.idx, origins, dirs, std::sin(GRAZE_DEG * M_PI / 180.0));
 
     float vmin = 0.0f, vmax = 0.0f;
     double sum = 0.0;
@@ -14757,7 +15056,7 @@ json doc_eval_thickness(const std::string& doc_id, int body_id) {
     for (std::size_t i = 0; i < n; ++i) {
         double d = hits[i];
         if (std::isfinite(d) && d > OFFSET) {
-            float t = static_cast<float>(d - OFFSET);
+            float t = static_cast<float>(d + OFFSET);
             values[i] = t;
             sum += t;
             ++n_sampled;
@@ -15414,8 +15713,7 @@ json doc_save(const std::string& doc_id, const std::string& path, bool preserve_
                 name != "cache.brep" && name != "cache.ckpt" && name != "geometry.step" &&
                 name.rfind("drawings/", 0) != 0)
                 snapshot->extra_entries.emplace(name, data);
-        const auto base = live.path.empty() ? std::filesystem::current_path()
-            : std::filesystem::absolute(live.path).parent_path();
+        const std::filesystem::path base = component_source_base(live);
         absolutize_component_paths(snapshot->doc, base);
     }
     Session& s = snapshot ? *snapshot : live;
@@ -15437,8 +15735,7 @@ json doc_save(const std::string& doc_id, const std::string& path, bool preserve_
     json saved_doc;
     if (s.is_assembly()) {
         saved_doc = s.doc;
-        const auto old_base = s.path.empty() ? std::filesystem::current_path()
-            : std::filesystem::absolute(s.path).parent_path();
+        const std::filesystem::path old_base = component_source_base(s);
         rebase_component_paths(saved_doc, old_base,
                                std::filesystem::absolute(target).parent_path());
     }
@@ -17115,7 +17412,16 @@ std::unordered_set<std::string> touched_entity_ids(const json& ops, const json& 
             if (op.contains("id")) add_eid(op["id"]);
             continue;
         }
-        if (k == "sketch_edit_entity" || k == "sketch_delete_entity") {
+        if (k == "sketch_edit_entity") {
+            // The id lives on op.id or, in the agent form, on entity.id.
+            if (op.contains("entity") && op["entity"].is_object() && op["entity"].contains("id"))
+                add_eid(op["entity"]["id"]);
+            if (op.contains("params") && op["params"].is_object() && op["params"].contains("id"))
+                add_eid(op["params"]["id"]);
+            if (op.contains("id")) add_eid(op["id"]);
+            continue;
+        }
+        if (k == "sketch_delete_entity") {
             if (op.contains("entity")) add_eid(op["entity"]);
             if (op.contains("id")) add_eid(op["id"]);
             continue;
@@ -19081,8 +19387,7 @@ json doc_simulate_motion(const std::string& doc_id,
         if (!live.is_assembly())
             motion_invalid("document is not an assembly");
         sweep_doc = live.doc;
-        if (!live.path.empty())
-            base_dir = std::filesystem::path(live.path).parent_path().string();
+        base_dir = component_source_base(live);
         if (!live.asm_warm.empty()) warm = live.asm_warm;
     }
     // Legacy migration belongs to the private snapshot, never the live motion source.
@@ -19246,6 +19551,16 @@ json doc_simulate_motion(const std::string& doc_id,
     dyn_poses.reserve(want_dyn ? static_cast<std::size_t>(steps) : 0);
     std::optional<AssemblyResult> dyn_topology;
 
+    // Incremental mechanical mates measure motion from the solve's warm state.
+    // Pre-rotating a drive in that state erases the increment they must transmit.
+    // Let the solver move coupled drives from the previous solved pose instead.
+    const bool incremental_coupling = std::any_of(mates.begin(), mates.end(),
+        [](const json& mate) {
+            if (mate.value("suppressed", false)) return false;
+            const auto& type = mate.at("type").get_ref<const std::string&>();
+            return type == "gear" || type == "rack_pinion" || type == "screw";
+        });
+
     for (int i = 0; i < steps; ++i) {
         const double t = static_cast<double>(i) / static_cast<double>(steps - 1);
         json driver_values = json::object();
@@ -19258,9 +19573,11 @@ json doc_simulate_motion(const std::string& doc_id,
             (*driver.mate)["value"]["expr"] = nullptr;
         }
         const double value = driver_values.at(mate_id).get<double>();
-        for (std::size_t k : seed_order)
-            motion_seed_driver(drivers[k], driver_values.at(drivers[k].id).get<double>(),
-                               seed_poses, *warm);
+        if (!incremental_coupling) {
+            for (std::size_t k : seed_order)
+                motion_seed_driver(drivers[k], driver_values.at(drivers[k].id).get<double>(),
+                                   seed_poses, *warm);
+        }
         AssemblyResult solved = compile_assembly(sweep_doc, base_dir, warm);
         // Never replace the warm state with a failed solver result.
         if (solved.converged) warm = solved.warm;

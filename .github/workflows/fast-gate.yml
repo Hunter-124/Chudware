@@ -1,25 +1,19 @@
 # The cheapest gate in the repository, and the only one that runs everywhere.
 #
-# scripts/check.py is nine deterministic source-level audits — icon atlas
+# scripts/check.py is ten deterministic source-level audits — icon atlas
 # coverage, ribbon-command-to-handler routing, SW_PARITY_SPEC drift, the
 # agent event-kind and role-prompt catalogs, the services thin-client ratchet,
 # the Settings tool-panel tables, cross-platform path portability, and
-# advertised-tool reachability. Eight of them parse source and docs with
-# nothing but the standard library.
+# advertised-tool reachability plus the shared-UI manifest and assets. Nine of
+# them parse source, docs and assets with nothing but the standard library.
 #
-# advertised_tool_audit does not, and the first CI run proved it: it imports
-# services.mcp.tool_registry and warms the real catalog, which pulls in
-# services/mcp/server.py and, through it, product code that imports PyYAML, the
-# MCP SDK, NumPy and SciPy. Without them the audit does not degrade politely —
-# it reports `ModuleNotFoundError("No module named 'yaml'")`, or warms a
-# 7-tool catalog and calls 37 real tools nonexistent. So this job provisions
-# exactly those four packages, at the pins requirements.txt already declares,
-# into a job-local virtualenv under RUNNER_TEMP. The runner's own Python is
-# never modified, and RUNNER_TEMP is wiped between jobs, so nothing leaks.
-#
-# Four packages, not the whole runtime: VTK, OpenCV, PyVista and the rest are
-# never imported by any audit, and downloading them on three platforms on every
-# push would turn a three-minute gate into a twenty-minute one.
+# advertised_tool_audit imports the live MCP registry: PyYAML, the MCP SDK,
+# NumPy and SciPy, plus LangGraph and its SQLite checkpointer for DAG tool
+# registration. Missing imports either fail the audit or leave a partial tool
+# catalog. Provision these six declared requirements from requirements.txt
+# into a job-local virtualenv under RUNNER_TEMP, without modifying the runner's
+# Python. VTK, OpenCV, PyVista and the rest of the product runtime are not needed
+# by these source audits.
 #
 # NumPy and SciPy require Python >= 3.11, so that is this gate's floor, and the
 # interpreter is chosen explicitly rather than taken from whatever `python3`

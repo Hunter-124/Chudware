@@ -38,7 +38,14 @@ SPAWN_BUDGET_S = 30.0
 
 
 class CefDaemonError(RuntimeError):
-    """Transport-level failure talking to the CEF daemon (spawn/connect/protocol)."""
+    """Transport-level failure talking to the CEF daemon (spawn/connect/protocol).
+
+    ``reason`` names the failure: ``browser_helper_missing``, ``browser_helper_exited``,
+    ``spawn_timeout``, ``not_running`` or ``transport``. The message starts with it."""
+
+    def __init__(self, message: str, reason: str = "transport") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def _repo_root() -> Path:
@@ -53,20 +60,55 @@ def _fnv1a64_hex(s: str) -> str:
     return f"{h:016x}"
 
 
-def resolve_cef_bin() -> Optional[Path]:
-    """Locate the lowercase Chudware host binary that hosts CEF. env → dist → build dirs."""
+def _cef_bin_candidates() -> list[Path]:
+    """Every path resolve_cef_bin() tries, in order."""
     if p := os.environ.get("CHUDWARE_BIN"):
-        return Path(p)
+        return [Path(p)]
     exe = "chudware.exe" if sys.platform == "win32" else "chudware"
     root = _repo_root()
-    for cand in (
-        Path(os.environ.get("CHUDWARE_DIST") or "nonexistent") / exe,
+    dist = os.environ.get("CHUDWARE_DIST")
+    return [
+        *([Path(dist) / exe] if dist else []),
         root / "host" / "build-cef" / "bin" / exe,
         root / "host" / "build-linux" / "bin" / exe,
-    ):
+    ]
+
+
+def resolve_cef_bin() -> Optional[Path]:
+    """Locate the lowercase Chudware host binary that hosts CEF. env → dist → build dirs.
+
+    An explicit CHUDWARE_BIN is returned even when it does not exist, so the spawn
+    names that path instead of a different binary."""
+    if p := os.environ.get("CHUDWARE_BIN"):
+        return Path(p)
+    for cand in _cef_bin_candidates():
         if cand.exists():
             return cand
     return None
+
+
+def _helper_missing(path: Optional[Path]) -> CefDaemonError:
+    tried = [str(path)] if path else [str(p) for p in _cef_bin_candidates()]
+    return CefDaemonError(
+        "browser_helper_missing: The browser helper is not installed. "
+        f"Tried: {', '.join(tried)}. Build the host with CEF, or set CHUDWARE_BIN to the "
+        "chudware binary.", "browser_helper_missing")
+
+
+def _spawn_log_path(sock: str) -> Path:
+    return Path(sock).with_suffix(".spawn.log")
+
+
+def _spawn_log_tail(sock: str, limit: int = 400) -> str:
+    """The last ``limit`` bytes the spawned daemon wrote to stderr, or ""."""
+    try:
+        with open(_spawn_log_path(sock), "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - limit))
+            data = f.read()
+    except OSError:
+        return ""
+    return " ".join(data.decode("utf-8", "replace").split())
 
 
 def socket_path(cef_bin: Optional[Path]) -> Optional[str]:
@@ -94,7 +136,7 @@ def _daemon_alive(pid: int, sock: str) -> bool:
     return b"--cef-daemon" in argv and sock.encode() in argv
 
 
-def _spawn_daemon_detached(cef_bin: Path, sock: str, idle_s: int) -> None:
+def _spawn_daemon_detached(cef_bin: Path, sock: str, idle_s: int) -> Optional[subprocess.Popen]:
     """Launch the daemon so it outlives this client and self-manages via idle-exit.
     POSIX: start_new_session detaches; an orphaned child reparents to init.
 
@@ -108,19 +150,26 @@ def _spawn_daemon_detached(cef_bin: Path, sock: str, idle_s: int) -> None:
     re-probes a socket that will never exist. So the lock file also records the pid we
     spawned, and a spawn is refused while that process is still alive — coming up slowly
     (callers wait, correct) or wedged (its own watchdog force-exits it after idle_s, then
-    the next caller gets a fresh one). Self-healing and bounded either way."""
+    the next caller gets a fresh one). Self-healing and bounded either way.
+
+    Returns the process THIS call spawned (the caller watches it for an early exit), or
+    None when another spawner owns the daemon. A missing binary raises
+    ``browser_helper_missing`` at once: it can never open the socket, so waiting for it
+    only turned "not installed" into a 30 s "spawn timed out"."""
+    if not Path(cef_bin).is_file():
+        raise _helper_missing(Path(cef_bin))
     lock_path = Path(sock).with_suffix(".spawn.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            return  # another process is mid-spawn; the connect retry loop will reach it
+            return None  # another process is mid-spawn; the connect retry loop will reach it
         try:
             probe = socket.socket(socket.AF_UNIX)
             try:
                 probe.connect(sock)
-                return  # somebody already brought one up while we waited
+                return None  # somebody already brought one up while we waited
             except OSError:
                 pass
             finally:
@@ -131,20 +180,33 @@ def _spawn_daemon_detached(cef_bin: Path, sock: str, idle_s: int) -> None:
             except ValueError:
                 prior = 0
             if _daemon_alive(prior, sock):
-                return  # one is already up (starting, or wedged and about to self-exit)
-            proc = subprocess.Popen(
-                [str(cef_bin), "--cef-daemon", sock, str(idle_s)],
-                start_new_session=True,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+                return None  # one is already up (starting, or wedged and about to self-exit)
+            # stderr goes to a per-socket log (truncated per spawn): a helper that exits at
+            # once (a CEF-OFF build refuses --cef-daemon) says why there, and the client
+            # quotes it. A pipe would block the detached daemon once this client is gone.
+            try:
+                with open(_spawn_log_path(sock), "wb") as log:
+                    proc = subprocess.Popen(
+                        [str(cef_bin), "--cef-daemon", sock, str(idle_s)],
+                        start_new_session=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=log,
+                    )
+            except FileNotFoundError as e:
+                raise _helper_missing(Path(cef_bin)) from e
+            except OSError as e:
+                raise CefDaemonError(
+                    f"browser_helper_exited: The browser helper {cef_bin} did not start "
+                    f"({e}). Make sure that the file is an executable chudware binary.",
+                    "browser_helper_exited") from e
             lock.seek(0)
             lock.truncate()
             lock.write(str(proc.pid))
             lock.flush()
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
+    return proc
 
 
 class CefDaemon:
@@ -159,29 +221,42 @@ class CefDaemon:
         cef_bin = resolve_cef_bin()
         sock_path = socket_path(cef_bin)
         if not sock_path:
-            raise CefDaemonError("cannot resolve CEF daemon socket (set CHUDWARE_BIN or build host)")
+            raise _helper_missing(None)
         if sys.platform == "win32":  # POSIX-only for now (see module docstring)
             raise CefDaemonError("CEF daemon client is POSIX-only pending named-pipe parity")
         deadline = time.monotonic() + budget_s
         backoff = 0.05
         spawned = False
+        proc: Optional[subprocess.Popen] = None
         while True:
+            s = socket.socket(socket.AF_UNIX)
             try:
-                s = socket.socket(socket.AF_UNIX)
                 s.connect(sock_path)
                 return s
             except OSError as e:
+                s.close()
                 if not spawn:
-                    raise CefDaemonError(f"CEF daemon not running ({e})") from e
+                    raise CefDaemonError(f"not_running: CEF daemon not running ({e})",
+                                         "not_running") from e
                 if not spawned:
                     if not cef_bin:
-                        raise CefDaemonError(
-                            "chudware binary not found (set CHUDWARE_BIN or build host with CEF)"
-                        ) from e
-                    _spawn_daemon_detached(cef_bin, sock_path, self._idle_s)
+                        raise _helper_missing(None) from e
+                    proc = _spawn_daemon_detached(cef_bin, sock_path, self._idle_s)
                     spawned = True
+                code = proc.poll() if proc is not None else None
+                if code is not None:
+                    tail = _spawn_log_tail(sock_path)
+                    raise CefDaemonError(
+                        f"browser_helper_exited: The browser helper {cef_bin} stopped with "
+                        f"exit code {code} before it opened {sock_path}."
+                        + (f" Helper output: {tail}" if tail else "")
+                        + " If the build has no CEF backend, rebuild the host with "
+                          "-DCHUDWARE_ENABLE_CEF=ON.",
+                        "browser_helper_exited") from e
                 if time.monotonic() > deadline:
-                    raise CefDaemonError(f"CEF daemon spawn timed out ({e})") from e
+                    raise CefDaemonError(
+                        f"spawn_timeout: The browser helper {cef_bin} did not open "
+                        f"{sock_path} in {budget_s:.0f} s ({e}).", "spawn_timeout") from e
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 0.5)
 

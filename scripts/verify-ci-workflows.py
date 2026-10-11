@@ -69,7 +69,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence as Se
 # capability probe that tells an operator a runner has fallen off the fleet.
 REQUIRED_WORKFLOWS: Tuple[str, ...] = (
     # Cheapest gate in the repository and the only one that runs on every
-    # platform: scripts/check.py's eight stdlib sub-gates. If this stops
+    # platform: scripts/check.py's source/audit sub-gates. If this stops
     # running, source-level drift reaches master unchecked.
     "fast-gate.yml",
     # The full Linux gate (scripts/gate.sh) plus the two suites gate.sh has

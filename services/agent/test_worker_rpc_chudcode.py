@@ -520,7 +520,7 @@ def test_tools_loaded_in_one_turn_stay_loaded_for_the_next_turn_of_that_session(
     real_run_turn = online_lane.host.run_turn
 
     class Client:
-        def set_custom_tools(self, tools):
+        def set_custom_tools(self, tools, *, loadable_tools=None):
             pass
 
     def run_turn_loading(params, emit):
@@ -611,7 +611,12 @@ def test_persistent_reuse_one_time_history_seed_and_mapped_streaming(online_lane
         in online_lane.host.turns[0]["request"]
     )
     assert "Earlier question" in online_lane.host.turns[0]["request"]
-    assert online_lane.host.turns[1]["request"] == "Continue"
+    # The explicit budget is announced at turn start (online_turn.turn_budget_notice);
+    # this lane's default work style is check_with_me, i.e. read-only Plan mode.
+    assert online_lane.host.turns[1]["request"] == (
+        "Continue\n\nThis turn has a hard 240 min budget; reach your answer early, then "
+        "use the remaining time to check it."
+    )
     assert online_lane.host.turns[0]["system_prompt"] == "RESOLVED ROLE PROMPT"
     # The turn budget is the caller's (mission driver --timeout-s); an absent one means no
     # wall-clock stop rather than an invented number.
@@ -1254,9 +1259,11 @@ def test_auto_rate_limit_fallback_keeps_the_callers_budget_or_none(
 
     real_run_turn = online_lane.host.run_turn
     turn_budgets: list[object] = []
+    requests: list[str] = []
 
     def rate_limited_once(params, emit):
         turn_budgets.append(params.get("timeout", "absent"))
+        requests.append(params["request"])
         if len(turn_budgets) == 1:
             online_lane.host.turns.append(params)
             return {"ok": False, "reason": "429 rate limit exceeded after retries"}
@@ -1276,3 +1283,33 @@ def test_auto_rate_limit_fallback_keeps_the_callers_budget_or_none(
     else:
         assert turn_budgets[0] == budget
         assert 0 < turn_budgets[1] <= budget
+    # Each budgeted attempt is told its own remaining budget; an unbudgeted one never is.
+    assert all(("hard" in request and "budget" in request) == (budget is not None)
+               for request in requests)
+
+
+@pytest.mark.parametrize(("extra", "notice"), [
+    ({"timeout": 600, "mode": "agent"}, "This turn has a hard 10 min budget; save "
+                                        "deliverables as soon as they are correct, then verify."),
+    ({"timeout": 600, "plan_only": True}, "This turn has a hard 10 min budget; reach your "
+                                          "answer early, then use the remaining time to check it."),
+    ({"timeout": 600, "mode": "ask"}, "This turn has a hard 10 min budget; reach your "
+                                      "answer early, then use the remaining time to check it."),
+    ({}, None),
+    ({"timeout": None}, None),
+    ({"timeout": 0}, None),
+])
+def test_explicit_turn_budget_is_announced_in_the_assembled_prompt(online_lane, extra, notice):
+    """A benchmark trial that never knew its 20 min budget over-verified past expiry.
+    Only a caller-sent positive timeout is announced; GUI turns send none."""
+    result = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="budget-notice", **extra), lambda _event: None
+    )
+    assert result["ok"] is True, result
+    sent = online_lane.host.turns[-1]["request"]
+    if notice is None:
+        assert sent == "Do the work"
+        assert "timeout" not in online_lane.host.turns[-1]
+    else:
+        assert sent == f"Do the work\n\n{notice}"
+        assert online_lane.host.turns[-1]["timeout"] == 600.0

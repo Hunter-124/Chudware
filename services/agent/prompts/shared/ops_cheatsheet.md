@@ -198,9 +198,15 @@ for the common machining features; they take a face in plain words and need no p
           (world +Y if the face is perpendicular to X); v = n×u, right-handed around the outward
           normal. So on a top face u=+X,v=+Y; on a front (−Y) face u=+X,v=+Z; on a right (+X)
           face u=+Y,v=+Z. bolt_circle uses the same frame (start_angle measured from u).
+          WORLD placement instead: params `world_points`:[[x,y,z],..] (mm, world frame) — each
+          names a point on the bore AXIS; the engine projects it along the face normal onto
+          the face it enters (with a word query like side:"top", whichever face facing that way
+          the axis hits first — e.g. each of four boss tops; reported) and refuses one whose
+          axis enters no such face. Never both positions and world_points.
   bolt_circle — a RING of holes in one feature (no per-hole trig). params {diameter, count, pcd
-          (bolt-circle diameter), style?, end?, depth?(blind), start_angle?:<deg>}. refs.face = a
-          face query (defaults to the top face). e.g. 6×⌀5 on a 40mm circle:
+          (bolt-circle diameter), style?, end?, depth?(blind), start_angle?:<deg>,
+          world_center?:[x,y,z]}. refs.face = a face query (defaults to the top face); the ring
+          is centred on the face centre, or on world_center (a point on the ring's axis). e.g. 6×⌀5 on a 40mm circle:
           {"type":"bolt_circle","params":{"diameter":5,"count":6,"pcd":40},"refs":{"face":{"of":"face","side":"top"}}}
   rib    — a thin web from an open sketch profile. refs.profile = [region]. (See sheet if present.)
   standard_part — a catalog HARDWARE part expanded into normal editable tree features (same

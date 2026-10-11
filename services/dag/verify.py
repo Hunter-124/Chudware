@@ -63,15 +63,12 @@ EmitFn = Optional[Callable[[str, dict[str, Any]], None]]
 # ---------------------------------------------------------------------------
 
 def _check_interference_default(r: dict) -> bool:
-    """Pass when ok=True AND no interferences present.
+    """Pass when the check completed (ok=True) AND found no interference (clear=True).
 
-    check_interference returns ok=True even when interferences exist (it reports
-    the findings); ok=True only means the tool ran successfully.  The real pass
-    condition is zero interference pairs.
+    check_interference returns ok=True when the check ran to completion, also when it
+    finds interference; ``clear`` is the clash verdict. An incomplete check is ok=False.
     """
-    if not r.get("ok", False):
-        return False
-    return len(r.get("interferences", [])) == 0
+    return r.get("ok") is True and r.get("clear") is True
 
 def _check_erc_default(r: dict) -> bool:
     """Pass when error count is zero (warnings are advisory only)."""
@@ -780,6 +777,8 @@ def _run_requirement_verify(
         {
             "verifier": r["verifier"],
             "result": r.get("result", {}),
+            # The battery verdict. A tool's own `ok` can mean "the check ran", not "passed".
+            "passed": r["passed"],
             "ts": _now,
             "source": "battery",
         }

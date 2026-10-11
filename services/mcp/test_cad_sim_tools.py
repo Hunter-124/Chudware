@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
 
 import pytest
@@ -2006,6 +2007,66 @@ def test_background_ladder_is_one_job_whose_legs_still_run_in_order(
     table = snap["result"]["table"]
     assert [r["size_mm"] for r in table] == [4, 2, 1], table
     assert snap["result"]["converged"] is True, snap["result"]
+
+
+def test_sim_results_resolves_the_background_ladder_job_id(
+        ladder_setup, registry, monkeypatch, tools, get_job_tool):
+    """Benchmark C3: run_fea_convergence(background=True) handed out a job-* id that
+    get_job resolved while sim_results — "from ANY tool that returned a job_id" — called
+    it unknown. It must refuse while the ladder runs and hand back get_job's result once
+    the ladder is done."""
+    stub = _LegStub(monkeypatch, {0: 100.0, 1: 104.0, 2: 105.0})
+    release = threading.Event()
+    settle = stub._status
+    monkeypatch.setattr(simjobs, "status", lambda job_id: (
+        settle(job_id) if release.is_set() else {"state": simjobs.RUNNING, "meta": {}}))
+    reply = json.loads(tools["run_fea_convergence"](
+        fixtures=["bottom"], loads=[{"face": "top", "force": [0, 0, -200]}],
+        sizes_mm=[4, 2, 1], background=True))
+    jid = reply["job_id"]
+    assert jid.startswith("job-"), reply
+    try:
+        running = json.loads(tools["sim_results"](job_id=jid))
+        assert running["ok"] is False and running["state"] == "running", running
+        assert "no converged results" in running["error"], running
+        assert "table" not in running and "registry" not in running["error"], running
+        assert f"wait_job('{jid}')" in running["hint"], running
+
+        partial = json.loads(tools["sim_results"](job_id=jid, partial=True))
+        assert partial["ok"] is True and partial["partial"] is True, partial
+        assert partial["converged"] is False, partial
+        assert partial["snapshot"]["legs_total"] == 3, partial
+
+        status = json.loads(tools["sim_status"](job_id=jid))
+        assert status["state"] == "running" and status["durable"] is False, status
+        assert "result" not in status, status
+
+        cancel = json.loads(tools["sim_cancel"](job_id=jid))
+        assert cancel["ok"] is False and "nothing was cancelled" in cancel["error"], cancel
+
+        listed = json.loads(tools["sim_jobs"]())
+        assert jid in [j["job_id"] for j in listed["process_jobs"]], listed
+    finally:
+        release.set()
+
+    assert _await_ladder_job(jid)["status"] == "done"
+    via_get_job = json.loads(get_job_tool(job_id=jid))
+    assert via_get_job["status"] == "done", via_get_job
+    done = json.loads(tools["sim_results"](job_id=jid))
+    assert done["job_id"] == jid and done["state"] == "done", done
+    assert {key: done[key] for key in via_get_job["result"]} == via_get_job["result"]
+    assert done["converged"] is True, done
+    assert [r["size_mm"] for r in done["table"]] == [4, 2, 1], done["table"]
+    assert done["progress"]["leg_job_ids"] == ["sim-leg0", "sim-leg1", "sim-leg2"], done
+
+
+def test_sim_tools_name_a_lost_driver_job_honestly(registry, tools):
+    """A job-* id is an in-process driver, never a sim registry row: its miss says so."""
+    out = json.loads(tools["sim_results"](job_id="job-000000000000"))
+    assert out["ok"] is False and out["state"] == "unknown", out
+    assert "in-process driver" in out["error"], out
+    assert "No such simulation job in the registry" not in out["error"], out
+    assert "run_fea_convergence(job_ids=[...])" in out["error"], out
 
 
 def _await_ladder_job(job_id: str, timeout_s: float = 30.0) -> dict:

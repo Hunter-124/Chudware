@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cctype>
+#include <map>
 #include <set>
 
 namespace chudware::piping {
@@ -288,6 +289,22 @@ std::vector<std::string> validate_k_model(const ojson& model, const std::string&
     return errs;
 }
 
+std::set<std::string> fitting_param_keys(const std::string& type) {
+    // Every type: correlation override, display label, CFD fluid-volume geometry.
+    std::set<std::string> keys = {"k_model", "label", "geometry"};
+    static const std::map<std::string, std::vector<std::string>> by_type = {
+        {"elbow", {"angle", "radius", "radius_mm"}},
+        {"tee", {"run_ids", "branch_run", "branch_nps", "k_model_run", "k_model_branch"}},
+        {"reducer", {"nps2"}},
+        {"flange", {"flange_class", "flange_face"}},
+        {"valve", {"valve_type"}},
+        {"orifice", {"beta", "bore_mm"}},
+    };
+    if (const auto it = by_type.find(type); it != by_type.end())
+        keys.insert(it->second.begin(), it->second.end());
+    return keys;
+}
+
 std::vector<std::string> validate_fitting(const ojson& ft, const std::string& loc) {
     std::vector<std::string> errs;
     if (!ft.is_object()) return {loc + ": not an object"};
@@ -351,6 +368,15 @@ std::vector<std::string> validate_fitting(const ojson& ft, const std::string& lo
         errs.insert(errs.end(), km.begin(), km.end());
     } else if (ftype == "custom") {
         errs.push_back(loc + ".params.k_model: required for custom");
+    }
+    for (const char* key : {"k_model_run", "k_model_branch"}) {
+        if (!params.contains(key)) continue;
+        if (ftype != "tee") {
+            errs.push_back(loc + ".params." + key + ": only tees have per-path K; use params.k_model");
+            continue;
+        }
+        const auto km = validate_k_model(params[key], loc + ".params." + key);
+        errs.insert(errs.end(), km.begin(), km.end());
     }
     if (ftype == "valve") {
         static const std::set<std::string> valves = {"gate", "globe", "angle", "ball", "plug",

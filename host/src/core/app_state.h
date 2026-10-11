@@ -1467,6 +1467,9 @@ struct AppState {
     // chip ("Engine daemon unreachable — retrying"); cleared on reconnect. Never
     // toast-spammed — one sticky notice only (see engine_events.cpp).
     bool daemonUnreachable = false;
+    // Set while a draining hostd refuses this client (engine::daemonRefusal()): its
+    // message and hint. The chip then names the drain instead of "unreachable".
+    std::string daemonDrainNotice;
     bool autoSetupTried = false;    // guard so startup auto-heal runs once, not in a loop
     bool importRepairTried = false; // guard so per-job ModuleNotFoundError repair runs once
     bool starterTried = false;      // guard so the launch default-part creation runs once

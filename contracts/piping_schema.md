@@ -395,3 +395,26 @@ curve:[{re,K},...]}`. The curve has 24 log-spaced Reynolds points from `1e3`
 through `1e7` and uses exactly the solver's fitting evaluator. Invalid custom
 or override models refuse `invalid_k_model`; malformed fitting/size/flow inputs
 refuse `invalid_params`.
+
+### 9.4 Per-path tee K and fitting parameter keys (appended 2026-10-09)
+
+A tee may carry `params.k_model_run` and/or `params.k_model_branch`, each any §9.2
+model object; they apply only to the straight-through (`run_ids[1]`) or branch
+(`branch_run`) path respectively and only to tees (other types refuse with
+"only tees have per-path K"). Tee precedence, highest first: the path's
+`k_model_run`/`k_model_branch`; `k_model` (both paths); the Crane run/branch
+correlation (attributed tees); the legacy tee constants. Method strings are
+`k_model_run(<kind>)` / `k_model_branch(<kind>)`; existing `k_model(<kind>)` strings
+are unchanged. `piping_solve`, pressure-drop reports and `run_loss_1d` share this.
+
+`piping_fitting_k` accepts an optional top-level `path: "run"|"branch"` (tees only,
+else `invalid_params`) selecting which tee path `K`/`method`/`curve` describe.
+
+`piping_edit` `add_fitting`/`update_fitting` accept only the parameter keys of the
+fitting's type — every type: `k_model`, `label`, `geometry`; elbow `angle`, `radius`,
+`radius_mm`; tee `run_ids`, `branch_run`, `branch_nps`, `k_model_run`,
+`k_model_branch`; reducer `nps2`; flange `flange_class`, `flange_face`; valve
+`valve_type`; orifice `beta`, `bore_mm`. Any other key refuses with reason
+`unknown_param`, the hint naming every offending key and the accepted set. A `null`
+value (delete) and re-sending a value already stored are always accepted, so older
+documents round-trip through the GUI unchanged.

@@ -772,6 +772,53 @@ json field_json(const Field &f) {
           {"values", to_array(f.values)}};
 }
 
+// reanalysis.vtu fields in report units. The physics gives von Mises per
+// element (the constant-strain tet4 stress C B u of the reanalysis). FEA
+// viewers and render_animation read a POINT field von_mises[@case] in MPa, as
+// run_fea_static writes. So every element von_mises[@case] is written twice:
+//   * point von_mises[@case]: at each node, the volume-weighted average over
+//     the incident RETAINED elements (rho >= threshold); a node with no
+//     retained element has 0 MPa (no material carries stress there);
+//   * cell element_von_mises[@case]: the element values, unchanged.
+// A stress-bearing reanalysis domain is the clipped solid (every element
+// rho = 1), so there the mask keeps every element.
+constexpr const char *kReanalysisPointStress =
+    "Point von_mises[@case] is the volume-weighted average of the element von "
+    "Mises of the retained elements at each node (MPa). A node with no "
+    "retained element has 0 MPa. Cell element_von_mises[@case] has the "
+    "element values.";
+
+std::vector<Field> reanalysis_vtu_fields(const TetMesh &mesh,
+                                         const Eigen::VectorXd &rho,
+                                         double threshold,
+                                         const std::vector<Field> &si_fields) {
+  Eigen::VectorXd retained(rho.size());
+  for (Eigen::Index e = 0; e < rho.size(); ++e)
+    retained[e] = rho[e] >= threshold ? 1.0 : 0.0;
+  Eigen::VectorXd share; // nodal retained-volume share, on first use
+  std::vector<Field> out;
+  out.reserve(2 * si_fields.size());
+  for (const Field &si : si_fields) {
+    Field f = report_field(si);
+    if (base_name(f.name) == "von_mises" &&
+        f.location == FieldLocation::Element && f.components == 1) {
+      if (share.size() == 0)
+        share = nodal_average(mesh, retained, 1);
+      const Eigen::VectorXd sum =
+          nodal_average(mesh, f.values.cwiseProduct(retained), 1);
+      Field point{f.name, f.unit, FieldLocation::Node, 1,
+                  Eigen::VectorXd::Zero(sum.size())};
+      for (Eigen::Index n = 0; n < sum.size(); ++n)
+        if (share[n] > 0) // NaN (unreferenced node) and 0 keep 0
+          point.values[n] = sum[n] / share[n];
+      f.name = "element_" + f.name;
+      out.push_back(std::move(point));
+    }
+    out.push_back(std::move(f));
+  }
+  return out;
+}
+
 // ── Durable files
 // ────────────────────────────────────────────────────────────
 struct Written {
@@ -2238,13 +2285,22 @@ nlohmann::json fea_run_topology(const nlohmann::json &study) {
     }
     if (rea && rea->evaluated)
       attempt("reanalysis_vtu", [&] {
-        std::vector<Field> rf;
-        for (const Field &f : rea->evaluation.fields)
-          rf.push_back(report_field(f));
-        artifacts["reanalysis_vtu"] = artifact_json(
+        constexpr double kReanalysisRetained = 0.5;
+        const std::vector<Field> rf =
+            reanalysis_vtu_fields(*rea->mesh, rea->density, kReanalysisRetained,
+                                  rea->evaluation.fields);
+        json entry = artifact_json(
             write_density_vtu((dir->dir / "reanalysis.vtu").string(),
-                              *rea->mesh, rea->density, 0.5, rf),
-            "vtu", "Reanalysis of the reconstructed domain");
+                              *rea->mesh, rea->density, kReanalysisRetained,
+                              rf),
+            "vtu", "Reanalysis of the reconstructed domain (mm, MPa, C)");
+        for (const Field &f : rf)
+          if (f.location == FieldLocation::Node &&
+              base_name(f.name) == "von_mises") {
+            entry["point_stress"] = kReanalysisPointStress;
+            break;
+          }
+        artifacts["reanalysis_vtu"] = std::move(entry);
       });
     if (!refusals.empty())
       result["artifact_refusals"] = std::move(refusals);

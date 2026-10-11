@@ -1135,6 +1135,16 @@ def _live_catalog() -> dict[str, dict]:
         return {}
 
 
+def loadable_tool_names(advertised: Iterable[str]) -> list[str]:
+    """Every live catalog tool that is not in *advertised*, sorted.
+
+    ``enable_tools`` can load each of these names. Chudcode uses the list to answer
+    ``xd://<name>`` for an unloaded tool with the load step.
+    """
+    mounted = set(advertised)
+    return sorted(name for name in _live_catalog() if name and name not in mounted)
+
+
 def tool_menu_groups() -> list[tuple[str, str, list[str]]]:
     """``[(group, description, [tool, ...]), ...]`` over the LIVE registry.
 

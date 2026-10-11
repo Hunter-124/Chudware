@@ -1103,6 +1103,23 @@ void revengReconstructTick() {
     if (!revengStateMatchesLast(w)) revengFeed(w, w.lastKind, w.lastPct, w.lastMsg);
 }
 
+std::string refusalText(const json& refusal, const char* key) {
+    const auto it = refusal.is_object() ? refusal.find(key) : refusal.end();
+    return it != refusal.end() && it->is_string() ? it->get<std::string>() : std::string();
+}
+
+// The chip tooltip for a daemon_draining refusal: the daemon's own message and hint.
+// Empty when the daemon does not refuse this client.
+std::string drainNotice(const json& refusal) {
+    if (!refusal.is_object()) return std::string();
+    std::string notice = refusalText(refusal, "message");
+    const std::string hint = refusalText(refusal, "hint");
+    if (!hint.empty()) notice += (notice.empty() ? "" : "\n") + hint;
+    return notice.empty() ? std::string("The engine daemon is draining. It accepts no new "
+                                        "clients until it exits.")
+                          : notice;
+}
+
 }  // namespace
 
 void watchRevEngReconstruct(const std::string& runId) {
@@ -1154,17 +1171,29 @@ void engineEventsTick(AppState& st) {
     // next RPC and otherwise looks empty (no tabs, no status).
     const engine::DaemonConnState conn = engine::maintainConnection();
     if (conn == engine::DaemonConnState::Unreachable) {
+        // A draining hostd refuses this client by name: the chip shows why until it exits.
+        const json refusal = engine::daemonRefusal();
+        const std::string drain = drainNotice(refusal);
         if (!st.daemonUnreachable) {
             st.daemonUnreachable = true;
             // One sticky notice only — status-bar chip is the persistent surface;
             // a single toast names the state without storming on every retry.
-            st.toast(ui::ToastLevel::Warn, "Engine daemon unreachable — retrying");
+            st.toast(ui::ToastLevel::Warn,
+                     drain.empty() ? "Engine daemon unreachable — retrying"
+                                   : "Engine daemon is draining. Chudware connects when it exits.");
             st.addLog("[daemon] unreachable — reconnecting with backoff");
+        }
+        if (drain != st.daemonDrainNotice) {
+            if (!drain.empty())
+                st.addLog("[daemon] draining (" + refusalText(refusal, "reason") +
+                          ") — refused this client: " + refusalText(refusal, "message"));
+            st.daemonDrainNotice = drain;
         }
         // Do not bootstrap / drain while the socket is dead: subscribe would race
         // the backoff and spam reconnect attempts every 500ms.
         return;
     }
+    st.daemonDrainNotice.clear();
     if (st.daemonUnreachable) {
         const bool braked = noteReconnectAndCheckBrake();
         // Force bootstrap re-arm even if reconnectGeneration already advanced mid-call: the

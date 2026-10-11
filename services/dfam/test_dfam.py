@@ -57,20 +57,54 @@ def test_thin_vertical_plate_fails_and_reports_model_location():
     assert result["regions"][0]["built_by"] == ["extrude:1"]
 
 
-def test_knife_edge_wedge_warns_instead_of_failing_as_a_wall():
-    # A 30 mm tall prism whose 40° tip runs to zero thickness: the slicer feathers the last
-    # fraction of a millimetre, which is not a wall that is too thin to print.
+def knife_wedge(x=0.):
+    """A 30 mm tall prism whose 40° tip (at `x`) runs to zero thickness."""
     half = np.tan(np.radians(20)) * 30
-    profile = [(0, 0), (30, -half), (30, half)]
-    vertices = np.array([[x, y, z] for z in (0, 30) for x, y in profile], dtype=float)
+    profile = [(x, 0), (x + 30, -half), (x + 30, half)]
+    vertices = np.array([[px, py, z] for z in (0, 30) for px, py in profile], dtype=float)
     faces = np.array([[0, 2, 1], [3, 4, 5], [0, 1, 4], [0, 4, 3], [1, 2, 5], [1, 5, 4],
                       [2, 0, 3], [2, 3, 5]])
     wedge = trimesh.Trimesh(vertices, faces, process=False)
     wedge.fix_normals()
-    result = check(mesh_of(wedge, attributed=True), "min_wall")
+    return wedge
+
+
+def one_face_per_part(*parts):
+    """Each part is one CAD face built by its own feature, so each part is its own region."""
+    joined = trimesh.util.concatenate(parts)
+    tri_face = np.repeat(np.arange(len(parts)), [len(p.faces) for p in parts])
+    return PrintMesh(joined.vertices, joined.faces, tri_face,
+                     [FaceInfo(f"plane:{i}", 1, 0, f"extrude:{i}") for i in range(len(parts))])
+
+
+def test_knife_edge_wedge_warns_instead_of_failing_as_a_wall():
+    # The slicer feathers the last fraction of a millimetre of the tip, which is not a wall
+    # that is too thin to print.
+    result = check(mesh_of(knife_wedge(), attributed=True), "min_wall")
     assert result["status"] == "warn", result["note"]
     assert result["metrics"]["knife_edge_area_mm2"] > 0
     assert {r["classification"] for r in result["regions"]} == {"knife_edge"}
+
+
+def test_failing_wall_is_never_cut_off_by_thinner_knife_edge_warnings():
+    # 6-axis trace (2026-10-10): six knife edges (thinner, warn) sorted ahead of the one failing
+    # 0.6 mm wall, and the 5-region limit dropped the wall, so the failing row had no location.
+    wedges = [knife_wedge(40. * i) for i in range(6)]
+    m = one_face_per_part(box((.6, 20, 20), (-20, 0, 10)), *wedges)
+    result = check(m, "min_wall")
+    assert result["status"] == "fail", result["note"]
+    assert len(result["regions"]) == 5
+    wall = result["regions"][0]
+    assert wall["status"] == "fail" and wall["classification"] == "vertical_wall"
+    assert wall["thickness_mm"] == pytest.approx(.6, abs=.05)
+    assert wall["faces"] == ["plane:0"] and np.allclose(wall["centroid"], [-20, 0, 10], atol=1)
+    assert all(r["classification"] == "knife_edge" for r in result["regions"][1:])
+    assert result["regions_omitted"] == 2
+    assert "2 more regions are not shown" in result["note"]
+    full = check(m, "min_wall", detail=True)
+    assert len(full["regions"]) == 7 and full["regions_omitted"] == 0
+    assert [r["status"] for r in full["regions"]] == ["fail"] + ["warn"] * 6
+    assert "not shown" not in full["note"]
 
 
 def test_cube_passes_and_is_deterministic():
@@ -226,15 +260,18 @@ def test_diagonal_bridge_reports_short_direction_span():
     assert result["metrics"]["max_span_mm"] == pytest.approx(6,abs=.5)
 
 
+def chamber(opening):
+    """A 10 mm cube of air under a 2 mm ceiling; the only way in is a front slot `opening` wide."""
+    width=(14-opening)/2
+    center=(14+opening)/4
+    return mesh_of(box((14,14,2),(0,0,1)), box((14,14,2),(0,0,13)),
+                   box((2,10,10),(-6,0,7)),box((2,10,10),(6,0,7)),
+                   box((14,2,10),(0,6,7)),
+                   box((width,2,10),(-center,-6,7)),
+                   box((width,2,10),(center,-6,7)),attributed=True)
+
+
 def test_support_removal_access_width_and_model_landing():
-    def chamber(opening):
-        width=(14-opening)/2
-        center=(14+opening)/4
-        return mesh_of(box((14,14,2),(0,0,1)), box((14,14,2),(0,0,13)),
-                       box((2,10,10),(-6,0,7)),box((2,10,10),(6,0,7)),
-                       box((14,2,10),(0,6,7)),
-                       box((width,2,10),(-center,-6,7)),
-                       box((width,2,10),(center,-6,7)),attributed=True)
     p=PrintParams(max_bridge_mm=4,access_mm=3)
     narrow=check(chamber(1),"support",p)
     accessible=check(chamber(4),"support",p)
@@ -243,6 +280,37 @@ def test_support_removal_access_width_and_model_landing():
     assert accessible["metrics"]["enclosed_support_mm3"] == 0
     assert accessible["status"] == "warn"
     assert accessible["metrics"]["landing_on_model_mm2"] > 50
+
+
+def test_inaccessible_support_regions_locate_the_trapped_clusters():
+    # 6-axis trace (2026-10-10): "79.75 mm3 inaccessible support" came with regions that only
+    # described overall support demand, not where the support that no tool can reach is.
+    p=PrintParams(max_bridge_mm=4,access_mm=3)
+    narrow=check(chamber(1),"support",p)
+    trapped=[r for r in narrow["regions"] if r["classification"] == "inaccessible_support"]
+    assert trapped and narrow["regions"][0] is trapped[0], narrow["regions"]
+    first=trapped[0]
+    assert first["status"] == "fail" and first["cause"] == "narrow_opening"
+    # The trapped support fills the chamber air: x and y in -5..5, z in 2..12 (model frame).
+    lo,hi=np.array(first["bbox_mm"][0]),np.array(first["bbox_mm"][1])
+    assert np.all(lo >= [-5.6,-7.6,1.4]) and np.all(hi <= [5.6,5.6,12.6]), first
+    assert hi[2]-lo[2] > 8 and hi[0]-lo[0] > 6, first
+    assert np.allclose(first["centroid"],[0,0,7],atol=1.5), first
+    total=sum(r["volume_mm3"] for r in trapped)
+    assert total == pytest.approx(narrow["metrics"]["enclosed_support_mm3"],rel=.01)
+    assert "plane:1" in first["faces"]
+    demand=[r for r in narrow["regions"] if r["classification"] == "support_demand"]
+    assert demand and "status" not in demand[0]
+    accessible=check(chamber(4),"support",p)
+    assert not [r for r in accessible["regions"] if r["classification"] == "inaccessible_support"]
+    # A sealed cavity: the support under its ceiling has no way out at all.
+    inner=box((10,10,10))
+    inner.invert()
+    sealed=check(mesh_of(box((20,20,20)),inner,attributed=True),"support",p)
+    cavity=sealed["regions"][0]
+    assert cavity["classification"] == "inaccessible_support" and cavity["cause"] == "sealed_cavity"
+    assert cavity["status"] == "fail"
+    assert np.allclose(cavity["centroid"],[0,0,0],atol=1.5), cavity
 
 
 def test_horizontal_skin_layers_and_informational_gap_fill():

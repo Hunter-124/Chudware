@@ -249,9 +249,11 @@ void Server::touch() { status_.lastActivityMs = monoMs(); }
 // Stale-binary self-drain backstop (Phase 8; plan Design A "Version &
 // staleness"). Deploys are temp+RENAME (never cp over a live .so — SIGBUS), so
 // an mtime change on the hostd binary or the loaded libchudware means a NEW file
-// sits at that path: drain so existing clients finish, new connects are refused
-// with daemon.draining, and the next client respawns the fresh build. Installers
-// calling --stop are the primary path; this covers dev rebuilds.
+// sits at that path: drain so existing clients finish, while new connects get the
+// named `daemon_draining` refusal (admitWhileDraining). The instance key is the
+// hostd path, so no successor can bind beside this daemon: the new build starts
+// when the last pinning client leaves (or Chudware restarts). Installers calling
+// --stop are the primary path; this covers dev rebuilds.
 void Server::staleBinaryTick() {
     static const long long intervalMs = [] {
         if (const char* s = std::getenv("CHUDWARE_HOSTD_STALECHECK_S"); s && *s)
@@ -276,14 +278,105 @@ void Server::staleBinaryTick() {
             log().line("binary changed on disk (%s) — draining so clients respawn the "
                        "new build",
                        p.c_str());
-            beginDrain(/*deadlineSecs=*/0);  // soft: a live client finishes its session
+            beginDrain(/*deadlineSecs=*/0, "stale_binary", p);  // soft: live sessions finish
         }
     }
 }
 
-void Server::beginDrain(int deadlineSecs) {
+void Server::beginDrain(int deadlineSecs, std::string reason, std::string changedPath) {
+    {
+        std::lock_guard<std::mutex> lk(drainMtx_);
+        drainReason_ = std::move(reason);
+        if (!changedPath.empty()) drainChangedPath_ = std::move(changedPath);
+    }
     status_.draining = true;
     drainDeadlineMs_ = deadlineSecs > 0 ? monoMs() + (long long)deadlineSecs * 1000 : 0;
+}
+
+std::string Server::drainReason() const {
+    std::lock_guard<std::mutex> lk(drainMtx_);
+    return status_.draining.load() ? drainReason_ : std::string();
+}
+
+json Server::drainRefusal() {
+    std::string reason, changedPath;
+    {
+        std::lock_guard<std::mutex> lk(drainMtx_);
+        reason = drainReason_;
+        changedPath = drainChangedPath_;
+    }
+    const int active = pinningClients(guiExitGraceSecs_);
+    json r{{"code", "daemon_draining"},
+           {"reason", reason},
+           {"daemon_pid", selfPid()},
+           {"clients", status_.clients.load()},
+           {"active_clients", active},
+           {"children", children_.aliveCount()},
+           {"hard_stop", drainDeadlineMs_.load() > 0}};
+    if (reason == "stale_binary") {
+        const std::string file =
+            changedPath.empty() ? std::string("an engine binary")
+                                : std::filesystem::path(changedPath).filename().string();
+        r["changed_path"] = changedPath;
+        r["message"] = "The engine changed on disk (" + file +
+                       "). This daemon runs the old engine and is draining. Open sessions "
+                       "continue on the old engine. New clients cannot connect until " +
+                       std::to_string(active) + " active session(s) end.";
+        r["hint"] = "Restart Chudware to load the new engine. Or wait until the open sessions "
+                    "end, then connect again. Do not start a separate in-process engine: it "
+                    "does not share documents.";
+    } else {
+        r["message"] = std::string("This daemon is stopping (") +
+                       (reason.empty() ? "stop_requested" : reason) +
+                       "). It accepts no new clients.";
+        r["hint"] = "Wait until the daemon exits, then connect again. The next connection "
+                    "starts a new daemon.";
+    }
+    return r;
+}
+
+bool Server::admitWhileDraining(chudware_ipc::IpcConn& conn, std::string& firstLine) {
+    // Every client sends hello as soon as it connects, so a short bound is enough. It
+    // also bounds how long one silent connect can hold the accept loop.
+    std::string line;
+    if (!conn.readLine(line, 1000)) {
+        log().line("draining: a new connection sent no request in 1 s — closed it");
+        conn.close();
+        return false;
+    }
+    const json msg = json::parse(line, nullptr, false);
+    const bool isObj = msg.is_object();
+    const int id = isObj && msg.contains("id") && msg["id"].is_number_integer()
+                       ? msg["id"].get<int>()
+                       : -1;
+    const std::string method = isObj && msg.contains("method") && msg["method"].is_string()
+                                   ? msg["method"].get<std::string>()
+                                   : std::string();
+    std::string kind;
+    if (isObj && msg.contains("params") && msg["params"].is_object()) {
+        const json& p = msg["params"];
+        if (p.contains("client") && p["client"].is_string()) kind = p["client"].get<std::string>();
+    }
+    // An operator control client (`chudware-hostd --status` / `--stop`) is admitted: it
+    // reports the drain, or turns a soft drain into a hard stop. It holds no document, and
+    // it disconnects at once, so it never extends the drain.
+    if (method == "hello" && kind == "control") {
+        firstLine = std::move(line);
+        return true;
+    }
+    json refusal = drainRefusal();
+    log().line("draining (%s): refused new %s client (%s)",
+               refusal.value("reason", std::string()).c_str(),
+               kind.empty() ? "unknown" : kind.c_str(), method.c_str());
+    // The request was read, so closing after this reply is a clean EOF for the client,
+    // not a reset. The client reads the reply first. The daemon.draining event comes
+    // first: a client that cannot match the reply id still sees why it was refused.
+    conn.writeLine(json{{"event", "daemon.draining"},
+                        {"reason", refusal.value("reason", std::string())}}
+                       .dump());
+    conn.writeLine(json{{"id", id}, {"error", std::move(refusal)}}.dump());
+    conn.close();
+    return false;
 }
 
 int Server::pinningClients(int idleWindowSecs) {
@@ -349,11 +442,10 @@ void Server::run(int lingerSecs) {
         watchdog_ = std::thread([this] { watchdogLoop(); });
     while (!stopping_) {
         chudware_ipc::IpcConn conn = listener_.accept(500);
-        if (conn.valid()) {
-            if (status_.draining) {
-                conn.writeLine(json{{"event", "daemon.draining"}}.dump());
-                continue;  // conn closes on scope exit; client respawns the new binary
-            }
+        std::string firstLine;
+        // A refused connect (admitWhileDraining) is answered and closed there; the ticks
+        // below still run, so a client that retries fast cannot hold off the drain exit.
+        if (conn.valid() && (!status_.draining || admitWhileDraining(conn, firstLine))) {
             auto c = std::make_shared<ClientConn>();
             {
                 // Start the loop under the lock its disconnect tail takes, so that tail can
@@ -364,7 +456,9 @@ void Server::run(int lingerSecs) {
                 c->lastRpcMs = monoMs();
                 clients_[c->id] = c;
                 ++status_.clients;
-                c->thread = std::thread([this, c] { clientLoop(c); });
+                c->thread = std::thread([this, c, first = std::move(firstLine)]() mutable {
+                    clientLoop(c, std::move(first));
+                });
             }
             log().line("client #%d connected (%d total)", c->id, status_.clients.load());
         }
@@ -516,14 +610,16 @@ struct InflightTally {
 };
 }  // namespace
 
-void Server::clientLoop(std::shared_ptr<ClientConn> c) {
+void Server::clientLoop(std::shared_ptr<ClientConn> c, std::string firstLine) {
     // An exception escaping a std::thread entry function is an instant std::terminate() of the
     // WHOLE daemon — every other client's session gone, and none of the clean-shutdown tail
     // (final autosave, child shutdown, sidecar reap) runs. Nothing in this loop may propagate
     // out, and the disconnect tail below must run whatever happens in it.
     try {
-        std::string line;
-        while (!stopping_ && c->conn.readLine(line, -1)) {
+        std::string line = std::move(firstLine);
+        bool pending = !line.empty();  // a request admitWhileDraining already read
+        while (!stopping_ && (pending || c->conn.readLine(line, -1))) {
+            pending = false;
             json msg = json::parse(line, nullptr, false);
             if (msg.is_discarded()) continue;
             // The envelope is client-supplied too: msg.value("id", -1) throws on a string id
@@ -714,6 +810,15 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                 {"recovery_pending", autosave_ ? autosave_->orphanCount() : 0},
                 {"pid", selfPid()}};
         children_.statusInto(st);  // children count + mission ids
+        // A draining daemon says why, and what a new client gets (the same text as the
+        // daemon_draining refusal), so `--status` and the tray agree with the refusal.
+        const std::string reason = drainReason();
+        st["drain_reason"] = reason.empty() ? json(nullptr) : json(reason);
+        if (status_.draining.load()) {
+            json drain = drainRefusal();
+            drain.erase("code");
+            st["drain"] = std::move(drain);
+        }
         return st;
     }
     if (method == "daemon_drain") {
@@ -731,7 +836,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         int graceSecs = 20;
         if (const char* g = std::getenv("CHUDWARE_HOSTD_DRAIN_GRACE_S"); g && *g)
             graceSecs = std::max(1, std::atoi(g));
-        beginDrain(graceSecs);
+        beginDrain(graceSecs, "stop_requested");
         log().line("drain requested by client #%d (deadline %ds)", c.id, graceSecs);
         return json{{"ok", true}, {"deadline_secs", graceSecs}};
     }

@@ -129,8 +129,9 @@ class FakeClient:
     def set_auto_retry(self, enabled):
         self.calls.append(("set_auto_retry", {"enabled": enabled}))
 
-    def set_custom_tools(self, tools):
+    def set_custom_tools(self, tools, *, loadable_tools=None):
         self._custom_tools = tuple(tools)
+        self.loadable_tools = loadable_tools
         self.calls.append(("set_host_tools", {"tools": tools}))
 
     def set_host_uris(self, uris):
@@ -1347,7 +1348,7 @@ def test_missing_dependency_and_binary_are_actionable(monkeypatch, tmp_path):
         {"request": "hi", "session_id": "s", "run_id": "r"}, lambda _frame: None
     )
     assert result["ok"] is False
-    assert "chudcode-rpc==0.3.0" in result["reason"]
+    assert "chudcode-rpc==0.3.1" in result["reason"]
 
     missing_binary = ChudcodeSessionHost(
         client_factory=FakeFactory(), binary=tmp_path / "missing-chud"

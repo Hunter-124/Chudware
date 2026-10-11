@@ -951,3 +951,22 @@ def test_drawing_synonyms_still_refuse_a_genuinely_unknown_argument():
         kwargs, notes, err = _agent_reconcile(tool, doc_id="d1", bogus_xyz=1)
         assert err is not None and err["status"] == "unknown_argument", (tool, kwargs)
         assert err["unknown_params"] == ["bogus_xyz"], err
+
+
+# --------------------------------------------------------------------- live 2026-10-10, 6-axis
+# research_web_search(limit=8) was refused as an unknown argument; the real cap is max_results.
+
+@pytest.mark.parametrize("tool", ["research_web_search", "design_recipe"])
+@pytest.mark.parametrize("spelling", ["limit", "num_results", "max_hits", "top_k", "count"])
+def test_result_cap_spellings_bind_to_max_results(tool, spelling):
+    kwargs, notes, err = _agent_reconcile(tool, query="mg996r servo", **{spelling: 8})
+    assert err is None, (tool, spelling, err)
+    assert kwargs == {"query": "mg996r servo", "max_results": 8}, (tool, spelling, kwargs)
+    assert f"interpreted {spelling!r} as 'max_results'" in notes, notes
+
+
+def test_result_cap_spelling_beside_max_results_is_refused():
+    """`limit` next to an explicit max_results is two caps; neither is chosen silently."""
+    kwargs, _notes, err = _agent_reconcile("research_web_search", query="x", max_results=3,
+                                           limit=8)
+    assert err is not None and err["status"] == "unknown_argument", kwargs

@@ -78,8 +78,11 @@ def _grade_interface_check(ledger: dict, ctx: dict) -> "tuple[str,str]":
              and p.get("ok") is not False and not p.get("error")]
     if calls:
         result = calls[-1].get("result") or {}
-        if isinstance(result, dict) and (result.get("pass") is False or str(
-                result.get("verdict", "PASS")).upper() not in {"PASS", "OK"}):
+        # interface_check: ok means the check ran; status "fail" is a misalignment finding.
+        if isinstance(result, dict) and (
+                result.get("pass") is False
+                or str(result.get("status", "pass")).lower() == "fail"
+                or str(result.get("verdict", "PASS")).upper() not in {"PASS", "OK"}):
             return "FAIL", f"final interface_check reported {result}"
         return "PASS", "final interface_check tool_call passed"
     return "FAIL", ("no passing interface artifact or interface_check tool_call after the "
@@ -338,9 +341,9 @@ def _seed_scripts() -> dict[int, dict[str, list[dict]]]:
             t["verdict"] = "FAIL"
             t["pass"] = False
         if t.get("tool") == "interface_check":
-            t["result"] = {"pass": False, "verdict": "FAIL"}
-            t["ok"] = False
-            t["error"] = "pattern mismatch 28 vs 32"
+            # A misalignment is a finding: the check ran (ok) and status is "fail".
+            t["result"] = {"ok": True, "status": "fail",
+                           "summary": "1 interface alignment failure(s): hole_pattern"}
         if t.get("id") == "mates_ok":
             t["mates_ok"] = False
             t["ok"] = False

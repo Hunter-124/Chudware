@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "geom/booleans.h"
+#include "geom/face_normal.h"
 
 #include <BRep_Tool.hxx>
 #include <BRepAdaptor_Surface.hxx>
@@ -46,17 +47,15 @@ constexpr double PI = 3.14159265358979323846;
 
 inline double radians(double deg) { return deg * PI / 180.0; }
 
-// A planar face's geometric normal (unit) at its centre, via BRepAdaptor. Matches
-// build123d Face.normal_at() up to orientation (the oracle re-orients separately).
+// A planar face's outward unit normal (build123d Face.normal_at(): du×dv, flipped when the
+// face is REVERSED — geom/face_normal.h, which also honours left-handed plane frames).
 bool face_plane_normal(const TopoDS_Face& f, Eigen::Vector3d& n_out,
                        Eigen::Vector3d& c_out) {
     BRepAdaptor_Surface surf(f);
     if (surf.GetType() != GeomAbs_Plane) return false;
     gp_Pln pln = surf.Plane();
-    gp_Dir d = pln.Axis().Direction();
+    const gp_Dir d = ::chudware::geom::plane_outward_normal(f, pln);
     n_out = Eigen::Vector3d(d.X(), d.Y(), d.Z());
-    // build123d normal_at() flips the geometric normal when the face is REVERSED.
-    if (f.Orientation() == TopAbs_REVERSED) n_out = -n_out;
     gp_Pnt loc = pln.Location();
     c_out = Eigen::Vector3d(loc.X(), loc.Y(), loc.Z());
     return true;

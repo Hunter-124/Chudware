@@ -16,6 +16,8 @@ TASK_MODULES = (
     "benchmarks.artifact_validity.tasks.facilities",
     "benchmarks.artifact_validity.tasks.core",
     "benchmarks.artifact_validity.tasks.solids",
+    "benchmarks.artifact_validity.tasks.modeling",
+    "benchmarks.artifact_validity.tasks.hard",
 )
 
 _REGISTRY: dict[str, "Task"] | None = None

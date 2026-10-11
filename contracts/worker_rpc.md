@@ -2130,3 +2130,12 @@ Failure returns `{ok:false,reason}`; examples include `session_busy`,
 `branch_cancelled`. An edit must not submit a replacement turn or discard the
 visible tail until runtime rewind and any required geometry rollback complete.
 Conversation switches and failed rollback must preserve the original transcript.
+
+## Assembly component source base (append-only, 2026-10-10)
+
+`doc_tree` on an assembly also returns `component_source_base`. It is the absolute folder that
+relative component `source.path` values resolve against. It is the folder of the assembly
+file. If the assembly has no file, it is the `project_dir` that `doc_new` received. If neither
+exists, it is null. `doc_new.project_dir` must be absolute. A relative value fails with
+`invalid_op` (`relative project_dir`). `describe_assembly` returns `source_resolved` next to
+each stored `source`, and `read_native_file` does the same for native assemblies.

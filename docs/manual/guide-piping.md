@@ -98,6 +98,17 @@ WORKFLOW:
   cfd_result) remain the one-call bore -> run_cfd_flow chain with a 1-D vs
   3-D verdict; piping_internal_volume(doc) gives the bore STEP + volume_mm3.
 
+FITTINGS + MINOR LOSSES: piping_edit draws runs (tees/elbows appear at
+  junctions/bends) and adds inline valve/orifice/custom/reducer/flange fittings.
+  A fixed loss is params.k_model={'kind':'constant','K':k} (also two_k,
+  three_k, cv, table). A tee's loss is per path: update_fitting(id=<tee>,
+  params={'k_model_run':{'kind':'constant','K':kr},
+          'k_model_branch':{'kind':'constant','K':kb}}) -- straight-through K on
+  run_ids[1], branch K on branch_run, each on that pipe's velocity. Never add a
+  custom fitting as a stand-in for a tee or bend loss: every fitting is a
+  piping_bom item. Unknown params keys refuse unknown_param and list the accepted
+  keys. piping_fitting_k previews K (tees return paths.run / paths.branch).
+
 GEOMETRY: piping_route paths are centrelines. To model a line as CAD, feed its
   path to sketch3d_path_from_points(name, points) then sketch3d_pipe(id,
   diameter_mm=<OD>) (cad_guide('sketch3d')).

@@ -6,6 +6,7 @@ BEST WAY to name the open face(s) - a geometry QUERY under refs.remove:
 - {"of":"face","side":"+z"}      open the TOP face (the usual "open box")   ("-z"=bottom, etc.)
 - {"of":"face","surf":"plane","side":"+z"}  same, restricted to planar faces
 - {"of":"face","near":[x,y,z],"count":1}    open the face nearest a point
+- [{"of":"face","side":"top"},{"of":"face","side":"bottom"}]  a LIST opens several faces (top AND bottom = a tube)
 
 Example A - hollow the current body to 2mm walls, open the top:
 [
@@ -20,12 +21,15 @@ Example B - closed hollow shell (no opening), 1.5mm walls:
 3 common mistakes:
 1. Shell BEFORE adding fillets/holes usually succeeds where after fails - shell early.
 2. Thickness must be smaller than half the smallest dimension, or the build fails.
-3. The query is an OBJECT under refs.remove ({"of":"face",...}); omit refs.remove entirely for a closed shell.
+3. refs.remove takes one query OBJECT or a LIST of queries/selectors; omit refs.remove entirely for a closed shell.
 
-UNSUPPORTED on curved/freeform bodies: shell works on PRISMATIC (box-like) solids. It is NOT
-reliable on a LOFT / SWEEP / REVOLVE body (B-spline / freeform faces) - the offset self-
-intersects on curved skins and the op errors ("shell is not supported on lofted ... bodies").
-To make a hollow CURVED body, build the wall thickness INTO the profile instead of shelling
-afterward: sketch the wall cross-section as a thin closed loop (an inner curve + an outer curve
-offset from it, closed at the ends) and LOFT or REVOLVE that - you get a hollow body directly.
-See revolve.md "hollow body" for the ring-profile recipe.
+CURVED / FREEFORM bodies: a revolved or swept body usually shells fine (every result is
+validated). A rectangle-to-circle LOFT (a duct/transition, collars included) shells too when
+the opened faces are its flat ends - open top and/or bottom with the LIST form and shell
+INWARD: the kernel's offset refuses its corner seams (crease into tangency), so the shell
+hollows it section by section instead and checks the wall. What still errors ("shell is not
+supported on this lofted ... body - ...") is such a body opened on a non-end face, shelled
+OUTWARD, or with a step/ledge across the axis. For those build the wall INTO the profile
+instead: sketch the wall cross-section as a thin closed loop (an inner curve + an outer curve
+offset from it) and LOFT or REVOLVE that, or loft a second set of sections inset by the wall
+and cut it. See revolve.md "hollow body" for the ring-profile recipe.

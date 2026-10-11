@@ -161,3 +161,48 @@ Result fields (additive):
 `CHUDWARE_INC_REBUILD=0` disables writing and restoring `cache.ckpt` with the rest of the
 incremental-rebuild cache. Relocation (`native_file_operations`) invalidates `cache.ckpt`
 with the other geometry caches.
+
+## 10. Planar outward-normal cache epoch (2026-10-09)
+
+The current semantic key is `chudware-geomcache/8` plus the OCCT version. Epoch 8 takes
+every planar outward normal from the frame-handedness-aware helper
+(`core/geom/face_normal.h`): a left-handed plane frame (revolve end/shoulder faces) used to
+read inward, so holes, weld plates and text placed on such faces now build differently.
+Older caches are a cache miss (`engine_key`) and rebuild from the native source.
+
+## 11. Shell validation cache epoch (2026-10-09)
+
+The current semantic key is `chudware-geomcache/9` plus the OCCT version. Epoch 9 makes the
+shell feature accept an offset result only when it is BRepCheck-valid, watertight and moved
+the volume the right way, trying every join/tolerance strategy before refusing, and resolves
+each geometry-query element of a face-list slot (`shell.remove`, `draft.faces`, …) like the
+bare query. Shells on freeform bodies and multi-face query lists now build differently.
+Older caches are a cache miss (`engine_key`) and rebuild from the native source.
+
+## 12. Geometric `near` cache epoch (2026-10-09)
+
+The current semantic key is `chudware-geomcache/10` plus the OCCT version. Epoch 10 ranks a
+geometry query's `near` point by its distance to each candidate's trimmed geometry (or its
+centroid, whichever is smaller) instead of centroid distance alone (`contracts/selectors.md`
+§"near: geometric distance"). A saved `near` query whose point lies on a large entity whose
+centroid is far away (a flange rim) can now resolve to a different edge/face than epoch 9
+did, so dress-ups referencing it build differently. Older caches are a cache miss
+(`engine_key`) and rebuild from the native source.
+
+## 13. Sectional shell cache epoch (2026-10-10)
+
+The current semantic key is `chudware-geomcache/11` plus the OCCT version. Epoch 11 gives the
+shell feature a fallback for inward shells the offset ladder refuses: a body whose opened
+faces are parallel planar ends is hollowed by lofting its exact eroded cross-sections and
+cutting that cavity (`core/geom/shell_sections.cpp`), validated to a wall within 2% of the
+thickness. A rectangle-to-circle loft (BRepOffset_MixedConnectivity) used to fail the shell
+feature and now builds. Older caches are a cache miss (`engine_key`) and rebuild from the
+native source.
+
+## 14. Strict profile region pick cache epoch (2026-10-10)
+
+The current semantic key is `chudware-geomcache/12` plus the OCCT version. Epoch 12 applies
+`contracts/selectors.md` §8: a profile region pick never moves silently to another region.
+Before this epoch, a sketch edit that removed regions let a cut lose regions with `ok:true`.
+A cache built that way shows the damaged geometry. Thus older caches are a cache miss
+(`engine_key`). The part rebuilds from the native source, and a bad pick fails by name.

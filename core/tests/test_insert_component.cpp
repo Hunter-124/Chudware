@@ -444,3 +444,79 @@ TEST_CASE("legacy split-face caches cannot override queried component topology")
     CHECK(std::abs(moved[7]) < 1e-7);
     CHECK(std::abs(moved[11]) < 1e-7);
 }
+
+namespace {
+// The load error of the first failed component after one asm_insert_component op, or ""
+// when every component loaded. A thrown rejection counts as the error too.
+std::string insert_error(const std::string& did, const std::string& source_path) {
+    try {
+        const json r = doc::doc_apply_ops(did, -1, json::array({
+            {{"op", "asm_insert_component"}, {"source", {{"path", source_path}}}}}), false);
+        for (const json& row : r.at("rebuild").at("feature_status"))
+            if (!row.value("ok", true))
+                return row.value("error", std::string("component failed without an error"));
+        return {};
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+}
+}  // namespace
+
+// 2026-10-10 six-axis trace: sources copied from a SAVED assembly (`parts/redesign/x.step+`,
+// relative to its file) into a NEW unsaved assembly resolved against hostd's cwd and
+// failed "doc_open: no such file: /home/hunter/parts/...". An unsaved assembly resolves
+// relative sources against the project folder doc_new received, never the process cwd.
+TEST_CASE("unsaved assembly resolves relative component sources against its project folder") {
+    const fs::path project = tmp("relative_source_project");
+    fs::remove_all(project);
+    fs::create_directories(project / "parts");
+    doc::export_bodies({BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 10.0, 10.0, 10.0).Shape()},
+                       (project / "parts/box.step").string(), "step");
+    std::vector<std::string> opened;
+    struct Cleanup {
+        std::vector<std::string>& ids; fs::path dir;
+        ~Cleanup() {
+            for (const std::string& id : ids) doc::doc_close(id);
+            std::error_code ec;
+            fs::remove_all(dir, ec);
+        }
+    } cleanup{opened, project};
+
+    const std::string did = doc::doc_new("assembly", "relative_source_asm", false,
+                                         project.string()).at("doc_id").get<std::string>();
+    opened.push_back(did);
+    const json tree = doc::doc_tree(did);
+    CHECK(tree.at("component_source_base") == project.lexically_normal().string());
+
+    // The relative source builds, and the document stores it exactly as given.
+    CHECK(insert_error(did, "parts/box.step").empty());
+    const json comps = doc::doc_tree(did).at("tree").at("components");
+    REQUIRE(comps.size() == 1);
+    CHECK(comps[0].at("source").at("path") == "parts/box.step");
+    CHECK(doc::doc_bbox(did).at("max").at(0).get<double>() == doctest::Approx(10.0));
+
+    // Save keeps the existing convention: a source under the assembly folder stays relative.
+    doc::doc_save(did, (project / "relative_source_asm.step+").string());
+    const json saved = doc::stepplus_read_document((project / "relative_source_asm.step+").string());
+    REQUIRE(saved.at("components").size() == 1);
+    CHECK(saved["components"][0].at("source").at("path") == "parts/box.step");
+
+    // A missing file names the resolved absolute path and the base folder.
+    const std::string missing = insert_error(did, "parts/absent.step");
+    CHECK(missing.find((project / "parts/absent.step").lexically_normal().string()) !=
+          std::string::npos);
+    CHECK(missing.find("base folder '" + project.lexically_normal().string() + "'") !=
+          std::string::npos);
+
+    // No file and no project folder: refuse by name, never resolve against the cwd.
+    const std::string loose = doc::doc_new("assembly", "relative_source_loose")
+                                  .at("doc_id").get<std::string>();
+    opened.push_back(loose);
+    CHECK(doc::doc_tree(loose).at("component_source_base").is_null());
+    const std::string refused = insert_error(loose, "parts/box.step");
+    CHECK(refused.find("relative path") != std::string::npos);
+    CHECK(refused.find(fs::current_path().string() + "/parts") == std::string::npos);
+
+    // A relative project folder is a caller error, not a cwd guess.
+    CHECK_THROWS(doc::doc_new("assembly", "relative_source_bad", false, "relative/project"));
+}

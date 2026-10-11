@@ -55,7 +55,10 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
 
 Every query_geometry/describe_part match now also carries: `side` (top/bottom/left/right/front/
 back), `normal` (SIGNED outward dir — unlike the unsigned `axis`), `concavity` (bore vs boss),
-`radius`, and a stable `sid`. add_features returns a `changes` write-diff ("added 1 cylinder; 1
+`radius`, `axis_point` (cylinder/cone: a point ON the axis — `centroid` is off-axis on a fillet),
+torus faces (sweep bends) `major_radius`/`minor_radius`/`torus_axis`/`torus_center` (bend
+radius, tube radius, bend axis, bend centre — their `radius`/`axis` stay null), and a stable
+`sid`. add_features returns a `changes` write-diff ("added 1 cylinder; 1
 new bore; volume -3927; part bbox 60x40x20 mm") so you can confirm an op did what you meant
 instead of guessing: `changes.bbox_mm` is the whole part's size (check it against what you were
 asked for rather than spending a measure_part call), a volume move too small to be real material

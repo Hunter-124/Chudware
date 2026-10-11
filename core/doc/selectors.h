@@ -64,6 +64,22 @@ struct TopoInfo {
     // Shared by geometry queries and viewport picks; concavity participates in stable SIDs.
     std::optional<bool> concave;    // cylindrical face: true=bore, false=boss; nullopt=N/A
     std::optional<double> radius;   // cylinder/cone/sphere face or circle edge radius (mm); nullopt=N/A
+    // Cylinder/cone face: the face centroid projected onto the surface axis — a point ON the
+    // axis (the centroid of a partial cylinder such as a fillet sits off-axis). Informational:
+    // serialised as `axis_point`, never scored. nullopt for every other face/edge/vertex.
+    std::optional<Eigen::Vector3d> axis_point;
+    // Torus face (a sweep bend, a revolved fillet): the analytic surface. Informational:
+    // serialised as `major_radius`/`minor_radius`/`torus_axis`/`torus_center` on torus faces
+    // only, never scored. `axis`/`radius` stay null for a torus so resolve() scoring, the
+    // parallel/perpendicular filters and stable SIDs are unchanged. nullopt for every other
+    // face/edge/vertex.
+    struct Torus {
+        double major_radius = 0.0;
+        double minor_radius = 0.0;
+        Eigen::Vector3d axis{0, 0, 1};    // unit
+        Eigen::Vector3d center{0, 0, 0};  // the torus origin (on the axis)
+    };
+    std::optional<Torus> torus;
 };
 
 struct ResolveResult {
@@ -76,6 +92,9 @@ struct ResolveResult {
 // --- OCCT describers (enumerate sub-shapes -> descriptors) ---
 // Geometry-based bore/boss classification shared with the query candidate path.
 std::optional<bool> cylinder_face_concave(const TopoDS_Face& face);
+// Analytic torus readback (TopoInfo::torus) for a torus face; nullopt for any other surface.
+// Shared by describe_faces and the query candidate path so both report the same values.
+std::optional<TopoInfo::Torus> face_torus(const TopoDS_Face& face);
 
 // surf/curve type strings per contract: faces plane|cylinder|cone|sphere|torus|
 // bspline|other; edges line|circle|ellipse|bspline|other. axis from the adaptor

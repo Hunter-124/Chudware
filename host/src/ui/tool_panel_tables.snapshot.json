@@ -1142,10 +1142,10 @@
   "show_in_app": "Make sure the OPEN Chudware desktop app can show the part to the user.",
   "sim_cancel": "Terminate a sim_run job's solver process (SIGTERM, then SIGKILL) and prove it died.",
   "sim_evidence_packet": "Write ONE released-result evidence packet and pre-fill the runbook checklist.",
-  "sim_jobs": "List recent sim_run jobs (newest first) with their reconciled state and elapsed time. Jobs persist across agent turns, so this also shows …",
+  "sim_jobs": "List recent sim jobs (newest first) with their reconciled state and elapsed time. `jobs` are the durable sim-* registry rows; they persist …",
   "sim_results": "Collect a simulation job's results — from ANY tool that returned a job_id.",
   "sim_run": "Start an FEA solve in a SEPARATE PROCESS and return a job_id immediately.",
-  "sim_status": "State of a sim_run job: queued|running|done|failed|cancelled, elapsed, progress.",
+  "sim_status": "State of a sim job: queued|running|done|failed|cancelled, elapsed, progress.",
   "simulate_motion": "Kinematic motion study: DRIVE one or more mates over synchronized ranges, re-solve the mechanism each sample, return every body's pose + a …",
   "sketch3d_add_constraints": "Add constraints to a sketch3d and return the narrated solve results.",
   "sketch3d_add_curves": "Append curve entities to a sketch3d feature (edit_feature) and report the solve.",
@@ -1195,7 +1195,7 @@
   "wait_job": "Block until a background job (get_job id) finishes or timeout_s passes — use instead of sleep/poll loops.",
   "wall_thickness": "How THIN is the thinnest wall? Inward ray-cast wall-thickness over the whole part.",
   "workspace_doc_events": "Return per-doc event stream entries starting at *since_seq*.",
-  "workspace_status": "Return the full workspace snapshot for *run_id*."
+  "workspace_status": "Return the workspace snapshot: project directory, open documents, owners."
  },
  "guidance": {
   "activate_configuration": {
@@ -1424,7 +1424,7 @@
    "prompt_note": "Is this solid actually sound? Reports watertight/manifold plus the COUNTS AND SIDS that justify it (free edges, non-manifold edges, shells, solids, sliver faces, orientation). Run it before an expensive FEA mesh, a CAM toolpath or a STEP/STL export. `self_intersection` is a REAL kernel check now (BOPAlgo_CheckerSI, 20 s per-body budget): a body it flags is NOT sound; checked:false + a reason means it could not run. Body-vs-body overlap is still check_interference. `volume_mm3` is null for a body with no solid. repair/fill_holes/fix_normals/fix_winding are REFUSED here: for a body YOUR features made, fix the feature using the sids it just listed; for an IMPORTED body that arrived broken, call heal_body (a recorded ShapeFix repair)."
   },
   "check_interference": {
-   "prompt_note": "Needs 2+ bodies — solve_mates first on an assembly so placements are real; overlap INSIDE one part's features → check_feature_overlap."
+   "prompt_note": "Needs 2+ bodies — solve_mates first on an assembly so placements are real; overlap INSIDE one part's features → check_feature_overlap. Read `clear` for the verdict: ok=true only means the check completed, also when bodies clash."
   },
   "check_metadata": {
    "prompt_note": "Read this before verify_battery to pick check names and see cost/platform classes — it is the registry of everything the battery can run."
@@ -1887,7 +1887,7 @@
    "prompt_note": "Directories only (a file path errors) — orient here first, then fs_glob/fs_grep to go deeper; dirs sort before files; CAD rows carry a one-line card summary."
   },
   "fs_read": {
-   "prompt_note": "Windowed by design: after a fs_grep hit, jump straight there with a 'path:50-200' selector instead of paging from the top; binary files are refused, directories list entries; a CAD file returns its card plus a labelled render (preview image), not its bytes."
+   "prompt_note": "Windowed by design: after a fs_grep hit, jump straight there with a 'path:50-200' selector instead of paging from the top; binary files are refused, directories list entries; a CAD file returns its card plus a labelled render (preview image), not its bytes. To parse a large file (json.loads), read it with raw=true from byte_offset=0, follow next_byte_offset while truncated is true, and join the page texts."
   },
   "fs_write": {
    "prompt_note": "Full overwrite, no append — never use it to patch an existing file; that is fs_edit's job. Parent dirs are created for you."
@@ -1985,7 +1985,7 @@
    "prompt_note": "Poll the job_id a backgrounded heavy call returned (add_features / run_fea_* / run_cfd_flow) — never re-issue the original call."
   },
   "get_part": {
-   "prompt_note": "summary=True on big/imported docs (elides BREP blobs); the full tree is for round-trip param editing. Feature ids here feed edits and config overrides."
+   "prompt_note": "summary=True on big/imported docs (elides BREP blobs); the full tree is for round-trip param editing. Both forms: features at result['tree']['features']. Feature ids here feed edits and config overrides."
   },
   "get_reveng_coverage": {
    "prompt_note": "Check before reveng_reconstruct: capture the `missing` shot slots first, and always surface `method` — count_proxy is an estimate until a sparse model exists."
@@ -2085,7 +2085,7 @@
    "prompt_note": "Cheap orient call before any intake work: bound process, open critical-dim demands, and any pending photo request to resume."
   },
   "interface_check": {
-   "prompt_note": "Catches hole-pattern/coaxiality misalignment that passes check_interference — solve_mates first, run BOTH; fastener='M6' adds a pass-through check."
+   "prompt_note": "Catches hole-pattern/coaxiality misalignment that passes check_interference — solve_mates first, run BOTH; fastener='M6' adds a pass-through check. Read `status` (pass|fail|skip) for the verdict: a misalignment keeps ok=true."
   },
   "is_watertight": {
    "prompt_note": "Alias of check_geometry_health (same tool, trimesh's name). Returns the full report, not a bare bool — read `watertight` plus free_edges/non_manifold_edges for why."
@@ -2263,7 +2263,7 @@
    "timeout_s": 1800
   },
   "new_assembly": {
-   "prompt_note": "Components come from FILES: build parts, save_part each, then new_assembly → asm_add_component → asm_mate → solve_mates."
+   "prompt_note": "Components come from FILES: build parts, save_part each, then new_assembly → asm_add_component → asm_mate → solve_mates. An open assembly of that name is RESUMED with its components (reused, component_count); fresh=True makes a separate empty one."
   },
   "new_part": {
    "prompt_note": "Returns the new doc_id and makes it current — follow with add_features. ONE DESIGN IS ONE DOCUMENT: iterate on an existing part IN PLACE, never bump the name (holster_v2, bracket-rev4) — versions live in history (plm_timeline/plm_rollback), and a bumped name is resumed, not minted."
@@ -3002,7 +3002,7 @@
    "prompt_note": "Incremental per-doc event stream — pass the count of events you already have as since_seq."
   },
   "workspace_status": {
-   "prompt_note": "One-call orient snapshot: open docs, owners, node statuses. Poll this before touching docs you did not create."
+   "prompt_note": "One-call orient snapshot: project dir and open docs. Omit run_id in a chat turn. Call it before you touch docs you did not create."
   }
  }
 }

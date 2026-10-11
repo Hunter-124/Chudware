@@ -1,6 +1,7 @@
 // AI workspace: main conversation plus a project-scoped utility column.
 // Current Run owns the execution trace, sub-agent roster, and single docked inspector;
-// Plan, Activity, Sessions, Insights and Options occupy the other nav compartments.
+// Sub-agents (view 6) is the project-wide sub-agent hub; Plan, Activity, Sessions, Insights and
+// Options occupy the other nav compartments.
 #include "ai_workspace.h"
 
 #include <algorithm>
@@ -135,6 +136,7 @@ static void drawNavColumn(AppState& st, float navW) {
     const int live = currentRunLiveCount();
 
     if (navRow(0, "Current Run", s_ai.view == 0, live)) setView(0);
+    if (navRow(6, "Sub-agents",  s_ai.view == 6, subagentHubLiveCount())) setView(6);
     if (navRow(1, "Plan",        s_ai.view == 1))       setView(1);
     if (navRow(2, "Activity",    s_ai.view == 2))       setView(2);
     if (navRow(3, "Sessions",    s_ai.view == 3))       setView(3);
@@ -355,6 +357,9 @@ static void drawViewPane(AppState& st, bool busy) {
         case 5:  // Options: run-behavior + workspace-visibility knobs.
             drawOptionsView(st, busy);
             break;
+        case 6:  // Sub-agents: project-wide roster with docked details (current_run_view.cpp).
+            drawSubagentHubView(st);
+            break;
         default:
             setView(0);
             break;
@@ -396,15 +401,20 @@ void drawAiWorkspace(AppState& st) {
 
     // Keep the three-column arrangement only when chat, nav and a useful compartment all
     // fit. The breakpoint and bounds scale together; compact mode gives either pane the
-    // full width without changing the persisted compartment selection.
+    // full width without changing the persisted compartment selection. The Sub-agents hub
+    // takes a larger share of the utility side (side-by-side roster and details) while the
+    // chat keeps its minimum width.
     const float totalW  = ImGui::GetContentRegionAvail().x;
     const float gap     = 10.0f * S;
     const float navW    = 168.0f * S;
     const float chatMin = 360.0f * S;
     const float viewMin = 300.0f * S;
+    const bool hubView  = s_ai.view == 6;
     const bool compact = totalW < chatMin + navW + gap * 2.0f + viewMin;
+    const float chatShare = hubView ? 0.34f : 0.44f;
+    const float chatCap   = (hubView ? 640.0f : 780.0f) * S;
     const float chatW = compact ? totalW :
-        std::min(std::max(chatMin, std::min(totalW * 0.44f, 780.0f * S)),
+        std::min(std::max(chatMin, std::min(totalW * chatShare, chatCap)),
                  totalW - navW - gap * 2.0f - viewMin);
 
     if (compact) {
@@ -464,12 +474,17 @@ void drawAiWorkspace(AppState& st) {
         ImGui::PopStyleVar();
 
         if (compact) {
+            // Display order keeps Sub-agents beside Current Run; values stay the persisted ids.
             static const char* const compartments[] = {
-                "Current Run", "Plan", "Activity", "Sessions", "Insights", "Options"
+                "Current Run", "Sub-agents", "Plan", "Activity", "Sessions", "Insights", "Options"
             };
-            int view = s_ai.view;
+            static const int compartmentView[] = {0, 6, 1, 2, 3, 4, 5};
+            int pick = 0;
+            for (int i = 0; i < 7; ++i)
+                if (compartmentView[i] == s_ai.view) pick = i;
             ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::Combo("##ai_ws_compartment", &view, compartments, 6)) setView(view);
+            if (ImGui::Combo("##ai_ws_compartment", &pick, compartments, 7))
+                setView(compartmentView[pick]);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Choose a workspace compartment.");
             kit::gapRow();
         } else {

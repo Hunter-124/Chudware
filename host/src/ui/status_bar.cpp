@@ -229,10 +229,13 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     }
     // H2: sticky daemon-unreachable chip — one persistent notice while hostd is
     // down (engine_events sets st.daemonUnreachable). Not a toast storm: the chip
-    // stays until reconnect clears the flag.
+    // stays until reconnect clears the flag. A draining hostd that refuses this client
+    // (st.daemonDrainNotice) is named on the same chip, with its reason in the tooltip.
     if (st.daemonUnreachable) {
         ImGui::SameLine();
-        const char* chip = "Engine daemon unreachable \xe2\x80\x94 retrying";
+        const bool draining = !st.daemonDrainNotice.empty();
+        const char* chip = draining ? "Engine daemon draining \xe2\x80\x94 waiting"
+                                    : "Engine daemon unreachable \xe2\x80\x94 retrying";
         const float box = ImGui::GetTextLineHeight();
         const float gap = ImGui::GetStyle().ItemInnerSpacing.x;
         ImVec2 tsz = ImGui::CalcTextSize(chip);
@@ -248,11 +251,19 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
                                 ImVec4(pal.statusWarn[0], pal.statusWarn[1],
                                        pal.statusWarn[2], pulse)));
         ImGui::EndGroup();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "The engine host daemon (chudware-hostd) is not reachable.\n"
-                "Chudware will keep retrying (1s, 2s, 5s, then every 10s).\n"
-                "Agent/shared docs reappear automatically on reconnect.");
+        if (ImGui::IsItemHovered()) {
+            if (draining)
+                ImGui::SetTooltip(
+                    "%s\nChudware connects when the draining daemon exits.\n"
+                    "It does not start a private engine. Agent and shared documents\n"
+                    "appear when it connects.",
+                    st.daemonDrainNotice.c_str());
+            else
+                ImGui::SetTooltip(
+                    "The engine host daemon (chudware-hostd) is not reachable.\n"
+                    "Chudware will keep retrying (1s, 2s, 5s, then every 10s).\n"
+                    "Agent/shared docs reappear automatically on reconnect.");
+        }
     }
 #ifndef __EMSCRIPTEN__
     {

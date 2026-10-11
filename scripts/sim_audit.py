@@ -1305,6 +1305,7 @@ def _audit_contact_engine() -> None:
     if cb is None:
         _skip("fea_contact [engine]", reason)
         return
+    CoreError = cb.CoreError
     gap_mm = 0.05
     load_n = 4000.0
     points, tets = _two_box_contact_mesh(gap_mm)

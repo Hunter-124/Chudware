@@ -1056,8 +1056,13 @@ def register_piping_tools(mcp) -> None:
         add_fitting(type, at, run_id?, params?, nps2?), update_fitting(id, params),
         remove_run(id), or remove_fitting(id). Positions/tol_mm are mm. Elbows and tees
         are created at bends/junctions automatically. Valve, orifice and custom fittings
-        are inline; custom params must include k_model. Missing piping starts an empty
-        network, or edits the last/saved network. doc_id persists the updated study.
+        are inline; custom params must include k_model. Any fitting takes
+        params.k_model={kind:"constant",K} (both tee paths). A tee takes per-path
+        k_model_run (straight-through, charged on run_ids[1]) and k_model_branch
+        (charged on branch_run), each on its own pipe's velocity; update_fitting the
+        auto-created tee. Unknown params keys refuse unknown_param naming the accepted
+        keys. Missing piping starts an empty network, or edits the last/saved network.
+        doc_id persists the updated study.
         Returns piping and created/removed/changed ids; an invalid batch changes nothing.
         """
         try:
@@ -1091,12 +1096,15 @@ def register_piping_tools(mcp) -> None:
     def piping_fitting_k(fitting: Union[str, dict], nps: Optional[float] = None,
                          schedule: Optional[str] = None, reynolds: Optional[float] = None,
                          velocity_ms: Optional[float] = None,
-                         fluid: Union[str, dict, None] = None) -> str:
+                         fluid: Union[str, dict, None] = None,
+                         path: Optional[str] = None) -> str:
         """Preview a fitting's deterministic loss coefficient K and Reynolds curve without a CFD solve.
 
         fitting={type,params,nps?,nps2?}. Supports elbows, tees, reducers, valves
         (params.valve_type), orifices (params.beta/bore_mm), and custom k_model.
-        k_model overrides correlations: constant, two_k, three_k, cv, or table.
+        k_model overrides correlations: constant, two_k, three_k, cv, or table; tees also
+        take per-path k_model_run / k_model_branch. path="run"|"branch" picks the tee path;
+        tees always return paths.run/paths.branch {K, method}.
         Returns K, method, inner_dia_mm, fT, reynolds and a 24-point curve; report
         method with K. nps/schedule resolve the bore; fluid is a name or rho/mu.
         """
@@ -1107,7 +1115,7 @@ def register_piping_tools(mcp) -> None:
             return _dumps(_err("bad_input", hint=str(exc)))
         return _dumps(_rpc("piping_fitting_k", _drop_none({
             "fitting": ft, "nps": nps, "schedule": schedule, "reynolds": reynolds,
-            "velocity_ms": velocity_ms, "fluid": fl})))
+            "velocity_ms": velocity_ms, "fluid": fl, "path": path})))
 
     @mcp.tool()
     @model_selectors("fitting_id", "geometry")

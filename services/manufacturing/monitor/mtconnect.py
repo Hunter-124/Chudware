@@ -7,6 +7,7 @@ network client and exposes no machine command surface.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+import json
 import math
 import re
 from typing import Any, Iterable, Mapping

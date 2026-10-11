@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from services.sw_import.sw_feature_import import (
-    SWFeature, SWPart, SWUnsupported, extract_part)
+    SWComponent, SWFeature, SWPart, SWUnsupported, extract_part)
 
 _PRINCIPAL_PLANE = {"top": "plane.top", "front": "plane.front", "right": "plane.right"}
 # In-plane 2D basis (eU, eV) and plane normal in ENGINE coords for each principal sketch plane —

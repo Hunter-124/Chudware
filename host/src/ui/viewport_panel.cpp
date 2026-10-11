@@ -5567,7 +5567,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // documents itself as sitting ABOVE the triad, so it has to follow when an obstacle lifts
         // the triad). Value here = today's placement, used verbatim when the triad is hidden.
         float triadInfoBottom = cr1.y - 112.0f * ui::uiScale;
-        // ---- C24 / C26-C: orientation triad, bottom-left of the viewport (SolidWorks-style) ----
+        // ---- C24 / C26-C: orientation triad, pinned in the bottom-left corner of the clear
+        // region, flush against the FeatureManager column edge (SolidWorks-style) ----
         // C25 W3-J: gated by st.showTriad.
         // C26-C: each axis tip is a small invisible ImGui button. Clicking an axis goes to the
         // corresponding preset view; clicking the axis you're already looking down flips opposite.
@@ -5577,21 +5578,26 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // Hover: accentSoft circle behind the label. Tooltip: view name.
         if (st.showTriad) {
             const float ts = ui::uiScale;
-            const float reach = ui::metrics::U(50.0f);
-            const float clearM = ui::metrics::U(12.0f);
-            // Always anchor in the clear rect, even when the manager has little content. Its
-            // transparent column still occupies the full width, and content-driven easing made
-            // the triad move sideways on every sketch step and show through dark panes.
-            const float hudLeft = clr0.x;
-            const float cx = hudLeft + ui::metrics::U(52.0f);
-            float cy = clr1.y - ui::metrics::U(52.0f);
+            // Glyph geometry (logical px): axis length, label-chip offset beyond the tip, and the
+            // chip half-extent. `reach` is the screen radius the whole glyph (labels included)
+            // can occupy around the hub, so the corner anchor keeps every chip inside the clear
+            // rect. These are pixel values: metrics::U() is a 4-px grid unit and previously
+            // multiplied them by 4, floating the triad ~200 px into the canvas.
+            const float L = ui::metrics::px(22.0f);
+            const float labelOff = ui::metrics::px(10.0f);
+            const float reach = L + labelOff + ui::metrics::px(8.0f);
+            const float margin = ui::metrics::px(6.0f);
+            // clr0.x is already the FeatureManager column's edge (plus gutter); anchoring there
+            // keeps the triad stable regardless of how much content the column shows.
+            const float cx = clr0.x + margin + reach;
+            float cy = clr1.y - margin - reach;
             const ui::ViewportHudRect hud = ui::viewportHudRect();
-            if (hud.valid && cx + reach + clearM > hud.minX &&
-                cx - reach - clearM < hud.maxX &&
-                cy + reach + clearM > hud.minY && cy - reach - clearM < hud.maxY)
-                cy = std::max(hud.minY - clearM - reach, clr0.y + reach + clearM);
-            triadInfoBottom = cy - ui::metrics::U(60.0f);
-            float L = 30.0f * ts;
+            if (hud.valid && cx + reach + margin > hud.minX &&
+                cx - reach - margin < hud.maxX &&
+                cy + reach + margin > hud.minY && cy - reach - margin < hud.maxY)
+                cy = std::max(hud.minY - margin - reach, clr0.y + reach + margin);
+            // Model-info pill bottom = triadInfoBottom + 10 px; keep a small gap above the glyph.
+            triadInfoBottom = cy - reach - ui::metrics::px(16.0f);
             float yawR = st.yaw * 3.14159265f / 180.0f, pitR = st.pitch * 3.14159265f / 180.0f;
             float cyaw = std::cos(yawR), syaw = std::sin(yawR);
             float cpit = std::cos(pitR), spit = std::sin(pitR);
@@ -5638,8 +5644,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 ImU32 col = ImGui::ColorConvertFloat4ToU32(
                     ImVec4(a.col[0], a.col[1], a.col[2], fade));
                 const ImVec2 tip = tips[order[oi]];
-                vdl->AddLine(ImVec2(cx, cy), tip, axHalo, 4.4f * ts);
-                vdl->AddLine(ImVec2(cx, cy), tip, col, 2.2f * ts);
+                vdl->AddLine(ImVec2(cx, cy), tip, axHalo, 3.6f * ts);
+                vdl->AddLine(ImVec2(cx, cy), tip, col, 1.8f * ts);
                 // Arrowhead at the tip so each stroke reads as a proper axis VECTOR (the bare
                 // stubs were nearly invisible — visual-review fix). Skip near-degenerate
                 // projections (axis pointing at the camera).
@@ -5647,7 +5653,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 float alen = std::sqrt(adx * adx + ady * ady);
                 if (alen > 4.0f * ts) {
                     adx /= alen; ady /= alen;
-                    const float ah = 5.0f * ts, aw = 3.0f * ts;
+                    const float ah = 4.5f * ts, aw = 2.6f * ts;
                     ImVec2 back(tip.x - adx * ah, tip.y - ady * ah);
                     ImVec2 p1(back.x - ady * aw, back.y + adx * aw);
                     ImVec2 p2(back.x + ady * aw, back.y - adx * aw);
@@ -5656,8 +5662,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
             // Hub: canvas-stable dark ink over a light halo disc (was overlayText — near-white in
             // the dark theme, washed out on the light canvas).
-            vdl->AddCircleFilled(ImVec2(cx, cy), 3.2f * ts, axHalo);
-            vdl->AddCircleFilled(ImVec2(cx, cy), 2.4f * ts,
+            vdl->AddCircleFilled(ImVec2(cx, cy), 2.8f * ts, axHalo);
+            vdl->AddCircleFilled(ImVec2(cx, cy), 2.0f * ts,
                                  ui::Palette::toU32(ui::palette.viewportEdge));
 
             // Draw buttons + labels on top.
@@ -5674,7 +5680,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 float llen = std::sqrt(ldx * ldx + ldy * ldy);
                 if (llen > 1e-3f) { ldx /= llen; ldy /= llen; }
                 else              { ldx = 0.7071f; ldy = -0.7071f; }
-                const ImVec2 chipC(tip.x + ldx * 12.0f * ts, tip.y + ldy * 12.0f * ts);
+                const ImVec2 chipC(tip.x + ldx * labelOff, tip.y + ldy * labelOff);
 
                 // Invisible button centered on the label chip (the visible click target).
                 ImGui::SetCursorScreenPos(ImVec2(chipC.x - hitR, chipC.y - hitR));

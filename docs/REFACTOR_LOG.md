@@ -6331,6 +6331,26 @@ workspaces, Parts, PLM and multi-document state. The simulation audit covered 11
 states with zero ID conflicts or overflow findings; its declared solver/torque
 skips are not claimed as verified capabilities.
 
+## 2026-10-09 — Haiku 5.5 agent compatibility
+
+Added Claude Haiku 5.5 to the offline Anthropic catalog and shipped model rankings,
+including subscription and router capability resolution. Existing provider tests
+now cover adaptive thinking and omitted sampling parameters for Haiku 5.5.
+
+The published Chudcode 0.4.1 binary fails Haiku 5.5 registration with overlapping
+budget/adaptive thinking rules. Runtime commit
+`0300151940e68e3ecf30244d2c6abc071554683a`, tagged `chudcode-v0.4.2`, fixes that
+overlap and supplies the native seed, tokenizer, effort levels and pricing tiers.
+Its three-platform release workflow is pending; the artifact lock and installed
+runtime deliberately remain at 0.4.1 until verified artifacts are available.
+
+Verification: 135 focused runtime tests passed; the catalog lint, formatting and
+type checks passed; Chudware's focused agent suite passed 223 tests and 21
+subtests; artifact pin checks passed 15 tests. The actual source CLI discovers
+and selects Haiku 5.5. A real completion returned Anthropic HTTP 429 with a
+retry-after delay, so successful generation and compiled CAD-tool execution are
+not claimed. No existing user sessions or host daemons were stopped.
+
 ## 2026-10-09 — Working-directory authority and saved demo studies
 
 `AppState::workspaceDir` is now the sole top-left, PLM and chat project authority;
@@ -6382,3 +6402,371 @@ CI-style TMPDIR: 849 passed, 29 skipped. Workflow policy reported zero errors.
 Remote requalification remains pending; these changes do not alter the desktop
 demo binary. Its fallback now contains sixteen verified metric views and a
 64-second still-view walkthrough, with the source model and backup unchanged.
+
+## 2026-10-09 — Repository housekeeping and development-gate coverage
+
+`scripts/gate.sh` now uses its selected runtime interpreter for the entire
+packaging suite and includes script and asset regressions in the per-unit sweep.
+`scripts/check.py` also runs the existing shared-UI manifest/asset verifier.
+Removed duplicate source-text assertions in the icon and release suites; ribbon
+icon coverage remains in `gui_lint`, and release handoff identity/tamper tests
+now build a real canonical payload manifest. Six generated public-site `.astro`
+files were removed from the index while all nine local cache files, including
+the pre-existing edit, remained byte-identical. A source-only isolated site
+build regenerated its types and built 39 pages. Nightly release concurrency
+queues instead of cancelling in-flight platform legs; Linux runner provisioning
+explicitly targets `cc-linux-build`. All workflow policy checks report zero
+errors and advisories; no remote workflow was dispatched.
+
+The undefined-name audit exposed real missing imports in gateway workspace
+copy/delete and MTConnect JSON serialization, unresolved runtime annotations,
+an obsolete machining-registry call and retired assembly-verification code.
+Gateway file and directory copying reproduced `NameError` before the import
+fix; behavioral regressions now preserve source bytes through copy/delete.
+Machining aliases resolve through native material-key and CAM-id RPCs instead
+of a swallowed deleted-oracle lookup. The assembly verifier now proves native
+save/close/reopen component placements, volume, centres of mass and world bounds
+and removes its temporary files. The contact audit binds the loaded engine's
+error class, retaining honest missing-method SKIPs and real error failures.
+Malformed lint directives in three flywheel benches were also removed.
+
+Runtime proof: a live isolated gateway backed by real PostgreSQL returned
+HTTP 200 for both file and directory copy/delete with source bytes intact;
+native assembly reopening preserved its geometry and placements; native
+two-box contact carried the 4000 N load into the support with 16 active pairs
+and a 4000.000000000458 N reaction. Monitoring JSON and runtime annotations
+resolved successfully. Focused service suites passed 158 tests, workspace
+isolation passed 47, and the actual packaging gate stage passed 52 using the
+selected interpreter. The complete gateway suite passed 851 tests with 29
+existing skips, using the same LangGraph/LangSmith versions as the development
+environment; its isolated virtualenv was removed afterward. A separate sandbox
+with newer LangSmith and its HTTPX2 dependency timed out in the full websocket
+suite, although the chat module passed alone. That dependency upgrade is not
+qualified by this session, and no application dependency pins were changed.
+The machine-local compilation database is now ignored. Existing user sessions
+and unrelated changes were left intact.
+
+Integrated qualification: `CHUDWARE_GATE_STRICT=1` completed with PASS and no
+environment-level skips. Native OCCT core, host GUI/test targets and the WASM
+client built successfully; core CTest, isolated hostd lifecycle/recovery and web
+parity passed. The Python sweep passed 11,499 tests across 33 units, covering
+509/509 service test files. Packaging passed all 52 tests, and the sensor-node
+golden demo passed all 13 checks. Native GUI startup and Copilot input screenshots
+were rendered and inspected; this is startup/control smoke, not a claim of
+full interactive modeling coverage. Separately, host CTest passed 31/31.
+Heavy V&V/modeling/E2E/performance and AppImage stages remain explicit opt-ins
+and were not enabled. Obsolete historical gate failure counts were removed
+after qualification; only comments changed after the integrated gate run.
+
+## Copilot controls and project-scoped Sub-agent hub
+
+- Split the composer footer into adjacent model, effort, attachment, voice and
+  context cells with four theme-aware vertical dividers. Moved New chat to a
+  second Copilot header row beside a permanently labelled Sessions control.
+  Removed duplicate session creation in the shared Sessions panel; narrow header
+  spacing keeps task/artifact controls separate.
+- Added AI → Sub-agents with Flat / By parent organization, a project-wide roster
+  and optional persisted Current session only isolation. Registry agents and
+  stored task traces share the existing docked inspector. Selection includes the
+  owning conversation, so reused child IDs cannot alias across sessions. Inspecting
+  another session's agent does not switch the active chat.
+- Scoped transcript/steer/pause/terminate requests to project and owner session,
+  cleared selection/drafts on scope changes and fenced stale async responses.
+  Backend scope refusals precede reads or mutations. Explicit nested project roots
+  no longer expand to an enclosing repository; trace-only agents stay read-only.
+  Missing token/cost usage is not fabricated.
+
+Verification: native build succeeded; all-rule GUI lint was clean for the changed
+GUI files; the registry/RPC suite passed 44 tests. Rendered and inspected light,
+dark and minimum-width Copilot plus dark/wide and light/compact AI hub surfaces;
+ID audits reported zero conflicts. In an isolated native GUI with fixture sessions
+and real registry records, exercised project/session filtering, duplicate child
+IDs, foreign-chat isolation, explicit project switching, transcript inspection,
+steer and pause; only the selected owner received the control mutations. Top New
+chat opened a fresh chat while retaining the prior session. The projectchat
+scenario passed its root/session/run-parking checks. No provider turn was launched;
+the user's open application and sessions were not restarted or interrupted.
+
+## 2026-10-09 — Planar outward normals honour left-handed plane frames; `axis_point` read-back
+
+Root cause of revolved bodies reporting normal `[1,0,0]` for every planar face (the x=0 end
+included): `BRepPrimAPI_MakeRevol` builds some planar faces on a LEFT-handed `gp_Ax3`
+(`Position().Direct() == false`), whose surface normal is `-Axis().Direction()`. The repo-wide
+idiom "`Plane().Axis().Direction()`, flipped when REVERSED" ignored handedness. New header-only
+`core/geom/face_normal.h` (`surface_outward_sign`, `plane_outward_normal`) is now the single
+source for doc_query (`picks.cpp`), `describe_faces`/pick selectors (`selectors.cpp`), hole drill
+direction, weld and text face frames (`document.cpp` — a hole on a revolved shaft's x=0 end used
+to drill outward into air), the sketch-overlay plane and faceset normal (`session.cpp`), convert
+entities (`recon.cpp`), sheet-metal face normals and the FEA contact preflight's plane/cylinder
+normal envelopes (`fea_run.cpp`). Cache epoch `chudware-geomcache/8`. picks.cpp's CAP
+PREFERENCE block is kept (it still decides cap-vs-curved side queries); only its rationale
+changed. Cylinder/cone matches add `axis_point` (centroid projected onto the axis; contract
+selectors.md, readback-key allowlists in picks.cpp + cad_common.py). Gotcha: draft's neutral
+pull (`document.cpp`, raw unsigned plane axis) and mirror planes are sign-agnostic/unchanged.
+Also fixed: doc_query `hint_index` was the match's position in the FILTERED result, so the
+`body`/`topo` join keys derived from it pointed at the wrong face for any filtered query
+(`{"surf":"cylinder"}` reported topo 1). It is now the sub-shape's index in the whole shape's
+unique map, the meaning the topo stamping, hint fallback and measure picks already assumed.
+`face_sid_inventory` drops `axis_point` (derived from centroid+axis) so saved face-finish
+fingerprints keep matching; finishes recorded on a left-handed-frame face carry the old
+`normal`/`side` and go inert (the documented stale-record behaviour), so repaint those.
+Tests: test_selectors `B9b`, test_picks readback keys, test_cad_tools
+`test_revolved_shaft_*`, `test_hole_on_revolved_end_face_drills_into_material`,
+`test_cylinder_faces_report_axis_point_on_the_axis` (filtered-query topo via doc_resolve_pick).
+
+## 2026-10-09 — Tee per-path K, strict fitting params, ASTM pipe/vessel grades in the registry
+
+Benchmark F2 showed `update_fitting` silently storing `K_run`/`k_branch` on a tee while solve
+ignored them, and `set_material('ASTM A106 Grade B'|'SA-516-70')` refusing as an "Unknown
+appearance material". Tees now take `params.k_model_run` / `params.k_model_branch` (any
+k_model kind; straight-through charged on `run_ids[1]`, branch on `branch_run`, precedence
+path model > `k_model` > Crane/default) in `fitting_K` (`core/piping/solve.cpp`), so solve,
+report, `run_loss_1d` and `piping_fitting_k` (new `path:"run"|"branch"`, tees always return
+`paths.run/branch`) share it. `piping_edit` add/update_fitting refuse unknown params keys with
+`unknown_param`, naming every offending key and the accepted set (`fitting_param_keys`,
+`core/piping/schema.cpp`); null deletions and unchanged re-sent values pass so GUI
+whole-params updates of older docs keep working. Registry gains standard-minimum rows for
+A106-B, A53-B, SA-516-70, A312 TP304/TP316 with aliases; `_resolve_appearance` now resolves
+every registry row (own finish → family word → category look) and its refusal names the
+registry. Tests: test_piping `tee:`/`edit: unknown fitting params`/`fitting_k: tee previews`,
+test_piping_design_tools `test_tee_per_path_constant_k_*`, test_material_resolve
+`test_piping_and_vessel_grades_*`, `test_set_material_accepts_astm_*`. Pending: contract
+append to `contracts/piping_schema.md` §9 (integrator-owned); no GUI per-path K editor yet.
+
+## 2026-10-09 — Shell: query lists resolve per element; every offset strategy validated
+
+Hard-benchmark parts hit two shell defects. (1) `refs.remove:[{"of":"face","side":"top"},
+{"of":"face","side":"bottom"}]` dangled "no candidates of matching kind" (a list went to the
+topology scorer; only a one-element list was unwrapped) and, with `"kind":"face"` added,
+leaked `[json.exception.out_of_range.403] key 'centroid' not found` from `score_candidate`.
+`resolve_face_picks` (`core/doc/picks.cpp`) now resolves every centroid-less query element
+through `resolve_geom_query` (a readback carrying a centroid stays a pick; duplicate faces
+select once), and `resolve()` (`selectors.cpp`) names a non-object or centroid-less selector
+instead of throwing. (2) The "shell is not supported on lofted / swept / revolved" refusal
+was not preemptive: `geom::shell_solid` returned the FIRST non-null strategy result and the
+caller refused when it was open. It now walks the whole join/tolerance ladder, accepting a
+result only when BRepCheck-valid, watertight and volume-moved (a valid unchanged result is
+still returned so the "thickness too large" guard names it), and fills a `diag` with the
+`BRepOffset_Error` per strategy; the doc-level open-shell guard is gone (unreachable). A
+spline-revolve cup shells. A rectangle-to-circle loft duct genuinely cannot: every join type /
+tolerance fails `BRepOffset_MixedConnectivity` (its corner seams go from a 90° crease to G1),
+and `MakeOffsetShape` / `PerformBySimple` / a slab+pipe erosion boolean fallback were tried
+and failed or produced wrong volumes, so the refusal stays, now naming the error and locating
+the crease-to-tangent edges. Cache epoch `chudware-geomcache/9`. Tests:
+test_modeling_repertoire `test_a_shell_opened_top_and_bottom_is_a_tube[*]`,
+`test_a_revolved_freeform_cup_shells_when_the_offset_validates`,
+`test_a_rect_to_circle_loft_duct_refuses_shell_by_name`.
+
+## 2026-10-09 — Geometry-query `near` ranks by distance to the geometry
+
+gpt-6-luna H5 chamfered a bolt hole instead of the Ø110 rim: `{"of":"edge","side":"+z",
+"surf":"circle","near":[55,0,12],"count":1}` names a point ON the rim, but
+`resolve_geom_query` sorted by centroid distance (rim centroid = axis point, 55 mm; +X hole
+edge centroid (40,0,12), 15 mm). `rank_near` (`core/doc/picks.cpp`) now keys on
+min(BRepExtrema point→trimmed sub-shape distance, centroid distance) — the centroid term keeps
+every internal "centroid as near" re-resolution (`session.cpp` selector/measure/face-by-sid,
+`cad_asm_tools` fixture faces, recon edges) exact — with ties (max(1e-4 mm, 1e-6×key)) going to
+the nearer centroid, then MapShapes order; a bbox lower bound skips exact distances that cannot
+reach the `count`-th centroid distance. It is the only `near` implementation (selectors.cpp,
+Python and assembly code all call it). Contract `contracts/selectors.md` §7, cache epoch
+`chudware-geomcache/10` (`contracts/stepplus.md` §12). Tests: test_picks `geom query near: …`,
+test_hard_tasks `H5-5`.
+
+## 2026-10-09 — GPT-6.1-sol / GPT-6-luna artifact benchmark campaign
+
+`benchmarks/artifact_validity` gained an M tier (`tasks/modeling.py`: revolve shaft, bolt
+flange, filleted L-bracket, counterbored plate, hex standoff) and an H tier (`tasks/hard.py`:
+swept tube, loft duct, beam-sized cantilever + FEA study, hinge assembly with mates and
+interference sweep, flange redesign from fixture, filleted shelled enclosure). Baselines
+(tags `base1010-*`, `baseM-*`, `baseH-*`; confirmations `fix1`, `final-*`; runs git-ignored)
+surfaced the fixes logged above (hole world points, left-handed plane normals + `axis_point`,
+doc_query topo join keys, torus readback, eval_thickness offset, shell list/strategy ladder,
+`near`, piping per-path tee K + `unknown_param`, pipe/vessel grade materials, `sim_results`
+for `job-*` drivers, `new_assembly(fresh=True)`, turn-budget notice + pre-expiry steer) plus
+three harness defects fixed here: (1) `tool_registry._FamilyView.tool` copies a
+`description=` kwarg onto the guarded callable's `__doc__` — the `check_geometry_health`
+aliases had none, so a prompt that auto-loaded their category died in `set_host_tools`
+before any model call; (2) `hydraulic_simulate` stores `series_path` project-relative
+(`portable_series_path`, resolved by `hydraulic_load`), so a moved project keeps its
+full-resolution run (every F1 trial was false-failed by the absolute path); (3) the reply's
+`max_points` no longer decimates the persisted run (the study always keeps the ≤400-point
+compaction). To benchmark against a frozen engine while editing core, copy
+`core/build-occt-linux/bin` and run the runner with `CHUDWARE_LIBCHUDWARE=<copy>/libchudware.so
+--hostd-bin <copy>/chudware-hostd --allow-stale-engine`. Open: rectangle→circle loft ducts
+cannot be shelled by OCCT (`BRepOffset_MixedConnectivity`, refusal names the edges); the
+`spice_sweep` ctest flaked once under `-j6`.
+
+## 2026-10-10 — Sectional shell: rectangle→circle loft ducts hollow
+
+`shell` on a rectangle→circle loft (with or without collars) used to refuse: OCCT's
+`BRepOffset_Analyse` marks an edge between two B-spline faces whose dihedral crosses 0.1 rad
+along it as `ChFiDS_Mixed`, and `BRepOffset_MakeOffset` stops with `MixedConnectivity` for every
+join, tolerance, face split (tested: splitting the seams at the threshold, flagging the upper part
+G1, wrapping the faces in zero offset surfaces — all invalid or `UnknownError`). New
+`core/geom/shell_sections.{h,cpp}` (`geom::shell_by_sections`) is the inward fallback
+`geom::shell_solid` tries after the offset ladder fails. It never offsets a face: the opened faces
+fix an axis, the body splits into height bands at vertex levels, and each band's cavity is lofted
+through sections computed from point-to-skin distance (a Newton march along each slice's inward
+normal, with per-face/edge persistent `BRepExtrema_ExtPF/ExtPC`; ownership of the nearest entity
+rejects marched points that belong to a neighbouring side, and corners come from a 2-D Newton on
+the two sides' distances, or the bisector point near tangency). Bands of planes/cylinders along the
+axis get exact analytic inner planes/cylinders and go first, so junction sections are shared
+through per-body-vertex/edge caches; freeform bands keep a 4-step ruled transition at junctions
+(the true kink sits t·tan(θ/2) off the level). The cavity is sewn, cut (`cut_unify`), and the result
+must be BRepCheck-valid, one watertight solid, with every sampled inner-wall point t ± 2% from the
+kept skin; a failed exact-prism attempt retries with sampled junctions, and only the accepted cut's
+history reaches the feature scope. Loft duct (H2 geometry): 2.7 s, wall 1.978–2.000 mm at
+t = 2 (worst at the collar junction corners, ≤0.0001 mm inside the loft), max edge tolerance 1e-7.
+Outward shells, opened non-end faces and steps across the axis still refuse with the kernel
+reason plus the sectional one. Cache epoch `chudware-geomcache/11` (`contracts/stepplus.md` §13);
+cheatsheet `shell.md` updated. Tests: `test_modeling_repertoire`
+`test_a_rect_to_circle_loft_duct_shells_open_at_both_ends`,
+`test_an_outward_shell_of_the_loft_duct_still_refuses_by_name`; `test_hard_tasks` H2 cases built
+with one `shell` feature pass all eight H2 grader checks.
+Same session: `eval_feature_attachment` (`core/doc/session.cpp`) compared every additive feature's
+base face against the FINAL part, so any later shell or cut that hollowed the material under it
+read as an overhang (the luna smoke's shelled duct: "Top collar OVERHANGS its support: 89 %"; a
+box + boss + shell: 55 %). Samples whose inner side is no longer the feature's kept material
+(`common(part, tool)`) are now skipped and the base area is scaled to the surviving share.
+Test: test_interference `eval_feature_attachment: a boss over a later shell's cavity is attached`.
+
+## 2026-10-10 — 6-axis interview trace: tool defects fixed
+
+Source: the 6-axis robot-arm session (`~/Documents/Chudware/Sessions/2026-10-10T15-38-28-774Z_*`)
+and its four filed bug reports. Fixes, one per defect class:
+`sketch_edit_entity` takes the `entity:{id,…}` patch and refuses ignored, empty, type-changing or
+unknown-field patches by name (`core/doc/session.cpp`); profile region picks never snap to a
+surviving region (`resolve_profile_faces`, selectors §8, cache epoch `geomcache/12`);
+`sketch_add_constraint` `fix` adopts the solved coordinates first, and non-convergence names
+the conflicting constraints and authored gaps (`core/sketch/sketch.cpp`); `centroid` alone is
+a valid region selector; unknown extrude params (`reverse`) are refused on the op path only
+(`validate.cpp unknown_feature_params`). `feature_attachment` measures the FOOT with a
+mirror-invariant tie-break; an in-place `transform` re-places the moved body's ToolRecs
+(`document.cpp`), so overlap/attachment read the as-built pose. Relative component sources
+resolve against the assembly file folder, else the `doc_new` project folder, never the cwd
+(`assembly.cpp`, `component_source_base`; `describe_assembly`/`read_native_file` add
+`source_resolved`). `verify_battery` treats a doc with components/world solids as geometry
+and marks an ambiguous battery-chosen measure probe `not_evaluated`. DFAM ranks fail before
+warn before truncation (`regions_omitted`) and locates inaccessible-support clusters;
+`doc_eval_thickness` counts only exit faces met at > 5° (no rim grazing minima). Topology
+`reanalysis.vtu` carries point `von_mises[@case]`; `render_animation` cell-averages old files.
+`slice_part` declares `context_doc_unless("parts")`; the CEF client names a missing or exiting
+helper at once; `research_web_search` binds `limit` to `max_results`; sub-1e-7 mm endpoint gaps
+are not `near_coincident`. Deferred: the extrude-only known-key table (other feature types not
+audited); a boss sketched on a bottom plane and extruded through the plate can still read as an
+overhang (ToolRec lacks the extrude direction); `xd://` reads of unmounted tools still return
+Chudcode's "No such tool" (harness side). Gotcha: old `cache.ckpt` files keep stale ToolRecs
+until the transform recompiles; the `/12` epoch forces that on open. Tests:
+`sixaxis_regressions`, `sketch_convert`, `interference`, `insert_component`, `topopt_run`,
+`services/dfam/test_dfam.py`, `services/mcp/test_verify_battery.py`, `test_animation_tools.py`.
+
+## 2026-10-10 — Failed tool calls after the 6-axis fixes
+
+Survey of every failed tool row in conversations c213–c250 (164 of ~6,100 calls). Most
+failures were already fixed by the entry above, are modeling errors with teaching replies,
+or are external (HTTP 401/login walls). The one failure after the post-fix worker restart
+was eval `KeyError: 'features'`: `get_part(summary=True)` returned top-level `features`,
+while the full form nests it under `tree` (c237 and c243 hit the same split). Both forms now
+return `{ok, doc_id, revision, tree:{features}}`; summary adds `summary`/`feature_count`,
+full adds `owner_map` (`cad_doc_tools.get_part`, panel tables regenerated). The deferred
+unmounted-`xd://` case is mitigated only in the prompt: `general_agent.yaml` says a MORE TOOLS
+name fails "No such tool" until `enable_tools` loads it. Chudcode 0.4.1 has no host hook for
+unknown devices. Not changed: eval code that `json.loads` a shortened string field
+(`fs_read` of a >46 KB file) still sees a cut string; the result's `_truncated.full_result`
+names the complete JSON. Python edits take effect when the services worker restarts.
+
+Second pass (same run, after the restart): three `add_features` mate batches failed.
+A flat `{op:"asm_add_mate", type, align, refs, value}` failed "requires a 'mate' object".
+Refs `{component, query}` failed "selector must be an object". A number `value` failed
+"dimension must be an object". `asm_mate` accepted all three forms. Now
+`_normalize_asm_mate_ops` wraps the flat op, changes a number value to `{value, expr}`, and
+resolves each `{component, query|sid}` ref with `cad_asm_tools.resolve_mate_ref`. That
+resolver is the old `asm_mate` loop, moved to module level with its source-document
+helpers. The engine text "a selector slot accepts a geometry QUERY object" is still not
+true for mate refs (C++ not changed). Test: `test_asm_add_mate_accepts_the_live_flat_and_query_shapes`.
+
+## 2026-10-10 — preserve mechanical transmission during native motion
+
+`core/doc/session.cpp` no longer pre-poses scalar drives when active gear,
+rack-pinion or screw mates use incremental warm-start coordinates. Pre-posing
+the drive erased the increment and left the passive gear stationary despite a
+converged solve. The previous solved pose now seeds the coupled native solve.
+`core/tests/test_simulate_motion.cpp` checks actual opposite gear rotation in
+both directions from one driver. The full motion executable passed 12 cases
+and 1,927 assertions. An actual saved four-bar gripper also passed native
+opening and closing sweeps after native incremental initialization of the
+open pose. A loaded services worker retains its old library after a rebuild;
+restart the app before recomputing coupled studies. No firmware was changed.
+
+## 2026-10-10 — Failed tool calls, third pass (engine, hostd, Chudcode)
+
+Each failed-card class from c237–c250 now has a root fix. Engine: `validate.cpp` gives a
+mate-ref message (`mate_ref_forms`) in place of the generic selector grammar. `picks.cpp`
+`canon_surf` accepts `cyl`, `sph`, `arc` and similar words from one table that also builds
+the refusal text. `mate.cpp` and `assembly.cpp` name each unresolved ref (index, component,
+sid). `doc_eval_section_props` sections a closed shell as a solid. A plane that cuts a body
+with free edges is refused as `body_not_closed_solid` with the body id, not a wrong area.
+`eval_is_closed_solid` now uses the `check_geometry_health` free-edge rule, so an imprint
+edge does not mark a body open. `sketch3d_section_at` no longer turns section errors into
+area 0. hostd: a draining daemon reads the first request and answers `hello` with a
+`daemon_draining` error (reason, pid, active clients). Before, it closed the socket unread,
+and the client got ECONNRESET. `--status` reports the drain. `daemon_bridge`, `core_bridge`
+and the GUI `engine_backend` refuse by name and never fall back to an in-process engine.
+Tool contracts: `check_interference` returns `ok:true` for a complete check, and the verdict
+is `clear`. `interface_check` returns `ok:true`, and the verdict is `status`. All
+consumers moved (battery, dag verify, design review, guardrails, reviewer, req evidence).
+`get_part` summary keeps long lists as lists and records `truncated_lists`. `fs_read` pages
+by `byte_offset`/`next_byte_offset` in 32 KB pages. A host-cut string carries a
+`…[cut: …]` marker. Image tools give eval callers one mapping
+(`{ok, caption, images, saved_path}`). `workspace_status()` reports the turn workspace
+(`scope:"turn"`). `chudcode_host.publish_host_tools` sends `loadable_tools` (the catalog
+minus the mounted names). Chudcode 0.4.3 adds the `xd://<name> is not loaded. Call
+enable_tools…` error. It also pauses the eval cell budget during host-tool calls and prints
+truthful timeout text. A cell that runs on a replacement kernel gets a notice. The lock pins
+0.4.3, and `requirements.txt` pins `chudcode-rpc==0.3.1` (`LoadableHostTools`); the GUI
+worker's system Python needs that client too. The 600 s eval cap came from the user config
+(`~/.chudcode/agent/config.yml` `tools.maxTimeout: 600`), not from Chudware. Not changed:
+third-party errors in agent eval code (matplotlib `set_box_aspect` on a read-only trimesh
+array, a missing `rtree` module). Verified with ctest `picks`, `document`, `mate`,
+`mate_corpus`, `insert_component`, `export_assembly`, `test_worker_long_run`, the hostd and
+daemon_bridge pytest, `scripts/check.py`, and two headless `run_mission.py` turns on
+Chudcode HEAD.
+
+Release (2026-10-11): Chudcode `chudcode-v0.4.3` (commit 2eaba2f4) is published. Its
+release CI no longer uses Actions artifacts: the account storage quota had failed every
+upload (0.4.2 never published). Files now cross runners as assets of the tag's draft
+release (`scripts/ci-release-transport.ts`). The release ships no Windows CLI, because the
+Linux cross-compiled exe segfaults in Bun 1.4.0. The Windows lock row comes from
+`chudcode-runtime-windows-build.yml`; that workflow now installs Bun itself, because
+setup-bun failed with EPERM on the runner. The mirror `chudcode-runtime-v0.4.3` holds the
+Linux/macOS bytes and the exact-commit source archive. The deploy host's
+`CHUDWARE_CHUD_BIN` holds 0.4.3; the 0.4.1 copy is kept beside it as `chud-0.4.1.backup`.
+
+## 2026-10-10 — use geometric axes for partial-cylinder interfaces
+
+`services/mcp/interface_check_tools.py` now uses `doc_query.axis_point`, not
+the area centroid of a cylindrical surface, for bore/boss axis comparisons
+and seam merging. A semicylinder centroid is displaced from its geometric
+axis; the actual MG996R capsule mounts previously produced spurious 2.0823 mm
+shift instructions. `test_interface_check.py` adds native D-shaft/socket
+cases at zero and 0.75 mm offset. The targeted suite passed 16 tests.
+Read-only native verification of the saved arm also confirmed all twelve
+nominal M3 centers lie within capsule travel, with 0.2 mm radial clearance.
+Circular-hole matching still does not infer a complete capsule from its
+endcaps; the raw automatic findings remain separate from that exact check.
+
+The full gate's source audit, manual regeneration and host build passed.
+Its core build failed on `services/ipc/ipc_client.cpp` declaration/definition
+mismatches and two-argument `hello` calls against a three-argument header.
+The command then timed out during WASM smoke. Those IPC files were not
+edited by this repair. `graphify update .` completed AST extraction but
+timed out before a successful graph publication was confirmed.
+The active desktop/worker has not been restarted; the rebuilt native
+motion library was verified in an explicitly isolated process.
+
+After intervening working-tree changes, the inspected IPC declarations and
+definitions match. `cmake --build core/build-linux --target chudware-hostd -j 2`
+completed successfully. This target-only result does not supersede the
+failed whole-repository gate or mean the running desktop loaded the new
+library. The interview package records the unreleased runtime and physical
+fit limits separately from the isolated native verification.

@@ -58,6 +58,29 @@ def compose_request_text(request: str, migration: str, editor: str = "") -> str:
     return f"{prompt}\n\n{editor}" if editor else prompt
 
 
+def format_duration(seconds: float) -> str:
+    """Model-facing duration: whole seconds under two minutes, else minutes."""
+    if seconds < 120:
+        return f"{max(0, round(seconds))} s"
+    return f"{round(seconds / 60, 1):g} min"
+
+
+def turn_budget_notice(budget_s: float | None, *, readonly: bool) -> str:
+    """The turn-start line naming an explicit wall-clock budget; empty without one.
+
+    Only a caller-sent positive ``timeout`` is a budget (run_mission.py --timeout-s,
+    missions, benchmark trials). GUI turns send none, so they never get this line.
+    """
+    if budget_s is None or not budget_s > 0:
+        return ""
+    budget = format_duration(budget_s)
+    if readonly:
+        return (f"This turn has a hard {budget} budget; reach your answer early, "
+                "then use the remaining time to check it.")
+    return (f"This turn has a hard {budget} budget; save deliverables as soon as they "
+            "are correct, then verify.")
+
+
 def resolve_model_and_effort(
     request: str,
     raw_params: Mapping[str, Any],

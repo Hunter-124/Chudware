@@ -92,7 +92,12 @@ public:
     // daemon exits regardless. That deadline is what makes `--stop` / the tray's Quit /
     // SIGTERM terminal; a soft drain (deadlineSecs == 0, used by the stale-binary watch)
     // only refuses new connects and waits for the current work to finish on its own.
-    void beginDrain(int deadlineSecs);
+    // `reason` names the cause in every refusal and in daemon_status: "stale_binary"
+    // (`changedPath` = the file that changed), "stop_requested" (daemon_drain / --stop),
+    // "quit" (tray Quit). A later drain replaces the reason; a changed path is kept.
+    void beginDrain(int deadlineSecs, std::string reason, std::string changedPath = {});
+    // Drain cause as passed to beginDrain ("" while not draining). Any thread.
+    std::string drainReason() const;
 
     // Short idle grace used instead of lingerSecs once the last GUI client has
     // detached (CHUDWARE_HOSTD_GUI_EXIT_GRACE_S). The daemon exists to serve
@@ -113,9 +118,19 @@ public:
     bool agentWorkInFlight() const;
 
 private:
-    void clientLoop(std::shared_ptr<ClientConn> c);
+    // `firstLine` is a request already read off the socket before the loop started (the
+    // hello of a control client admitted during a drain); empty = none.
+    void clientLoop(std::shared_ptr<ClientConn> c, std::string firstLine);
     nlohmann::json dispatch(ClientConn& c, const std::string& method,
                             const nlohmann::json& params, bool& isError);
+    // A connect that arrives while the daemon drains. Reads the first request (bounded)
+    // and admits only an operator control client (`--status`, `--stop`), returning its
+    // request in `firstLine`. Every other client gets drainRefusal() as the answer to its
+    // first request, then the connection closes. The client sees a named reason, never a
+    // bare reset (ECONNRESET came from closing a socket with an unread hello).
+    bool admitWhileDraining(chudware_ipc::IpcConn& conn, std::string& firstLine);
+    // The structured `daemon_draining` error a refused client receives.
+    nlohmann::json drainRefusal();
     void touch();
     bool idleExpired(int lingerSecs);
     void staleBinaryTick();
@@ -172,6 +187,11 @@ private:
     // Monotonic ms after which a HARD drain stops waiting and drops whatever is still
     // connected. 0 = no deadline (soft drain, or not draining at all).
     std::atomic<long long> drainDeadlineMs_{0};
+    // Why the daemon drains (see beginDrain). Written from the accept loop, a client
+    // thread (daemon_drain) or the tray thread, so it has its own lock.
+    mutable std::mutex drainMtx_;
+    std::string drainReason_;
+    std::string drainChangedPath_;
     std::mutex clientsMtx_;
     std::map<int, std::shared_ptr<ClientConn>> clients_;
     int nextClientId_ = 1;

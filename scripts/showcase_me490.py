@@ -626,6 +626,8 @@ def ch02() -> dict:
 
     m_doc = reopen(merged)
     inter = ok(J(T["check_interference"](doc_id=m_doc)), "check_interference(merged)")
+    if inter.get("clear") is not True:
+        raise SystemExit(f"check_interference(merged) found interference: {inter.get('summary')}")
     m_bodies = ok(J(T["list_world_bodies"](doc_id=m_doc)), "bodies(merged)")
     c.numbers.update({
         "merged_bodies": m_bodies.get("body_count"),

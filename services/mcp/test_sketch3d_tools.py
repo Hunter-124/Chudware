@@ -686,6 +686,33 @@ class TestSketch3dDocTools:
         assert abs(r["point"][2] - 25.0) < 0.1
         assert "area_mm2" in r and "origin" in r["summary"].lower()
 
+    def test_section_at_open_body_refuses_by_name(self):
+        # An open surf_extrude wall (no end caps) crosses the 'right' plane (x = 0). The
+        # section has no area, so the tool must name the engine refusal, never report 0.
+        d = self._new_part("s3d_section_open")
+        built, _ = _call("add_features", {"doc_id": d, "ops": [
+            {"op": "add_feature", "feature": {
+                "type": "sketch", "name": "Rect", "params": {"entities": [], "constraints": []},
+                "refs": {"plane": "plane.top"}}},
+            *[{"op": "sketch_add_entity", "sketch": "$0",
+               "entity": {"type": "line", "p1": p1, "p2": p2}}
+              for p1, p2 in (([-20, -15], [20, -15]), ([20, -15], [20, 15]),
+                             ([20, 15], [-20, 15]), ([-20, 15], [-20, -15]))],
+            {"op": "add_feature", "feature": {
+                "type": "surf_extrude", "name": "Wall",
+                "params": {"end": "blind", "depth": {"value": 20, "expr": None}},
+                "refs": {"profile": [{"kind": "region", "sketch": "$0",
+                                      "centroid": [0, 0], "hint_index": 0}]}}},
+        ]})
+        assert built and built.get("ok") is True, built
+        r0, _ = _call("sketch3d_path_from_points", {
+            "name": "path", "doc_id": d, "points": [[0, 0, 5], [10, 0, 5]]})
+        r, _ = _call("sketch3d_section_at", {"sketch3d_id": r0["id"], "t": 0.5, "doc_id": d})
+        assert r and r.get("ok") is False, r
+        assert r.get("code") == "section_failed", r
+        assert r["detail"]["reason"] == "body_not_closed_solid", r
+        assert "area_mm2" not in r
+
     # ── preview ──────────────────────────────────────────────────────────────
 
     def test_preview_text_read(self):

@@ -580,6 +580,11 @@ def evaluate_pass_rule(pass_rule: str, result: dict) -> tuple[str, str]:
                 if derived == "WARN":
                     return FAIL, detail or "battery WARN (not PASS for AC)"
                 return NOT_CHECKED, detail or "battery shape not evaluable"
+            # check_interference: ok only means the check completed; clear is the verdict.
+            if isinstance(result.get("clear"), bool):
+                if result["clear"]:
+                    return PASS, "interference check clear"
+                return FAIL, result.get("summary") or "interference found"
             if "ok" in result:
                 if result.get("ok") is True:
                     return PASS, "tool ok=true"

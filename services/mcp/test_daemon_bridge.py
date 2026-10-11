@@ -7,14 +7,24 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
+import socket
+import sys
+import tempfile
+import threading
 import time
 import uuid
 
 import pytest
 
 from services.mcp import daemon_bridge
-from services.mcp.daemon_bridge import DaemonClient, DaemonError, DaemonSessionLost
+from services.mcp.daemon_bridge import (
+    DaemonClient,
+    DaemonDraining,
+    DaemonError,
+    DaemonSessionLost,
+)
 
 HOSTD = daemon_bridge.resolve_hostd_bin()
 
@@ -297,3 +307,73 @@ def test_loading_refusal_is_distinct_from_lost_mutation_reply(monkeypatch, state
             )
     assert applied == ([params] if state == "ready" else [])
     client.close()
+
+
+def _draining_peer(path: str, answer_hello: bool) -> threading.Thread:
+    """One-connection hostd stand-in that refuses the client because it drains.
+
+    answer_hello=True is the current daemon: it reads hello, pushes daemon.draining,
+    answers with the daemon_draining error, then closes. False is a daemon that pushes
+    the event and closes at once with the hello unread (c250: ECONNRESET on hello).
+    """
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(path)
+    srv.listen(1)
+
+    def serve():
+        conn, _ = srv.accept()
+        with conn:
+            if answer_hello:
+                buf = b""
+                while b"\n" not in buf:
+                    buf += conn.recv(4096)
+                hello = json.loads(buf.split(b"\n", 1)[0])
+                refusal = {"code": "daemon_draining", "reason": "stale_binary",
+                           "daemon_pid": 4242, "clients": 2, "active_clients": 1,
+                           "changed_path": "/opt/chudware/lib/libchudware.so"}
+                conn.sendall(b'{"event":"daemon.draining","reason":"stale_binary"}\n')
+                conn.sendall(json.dumps({"id": hello["id"], "error": refusal}).encode() + b"\n")
+            else:
+                conn.sendall(b'{"event":"daemon.draining"}\n')
+        srv.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return thread
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="AF_UNIX stand-in peer")
+@pytest.mark.parametrize("answer_hello", [True, False], ids=["refusal", "event_then_close"])
+def test_draining_daemon_refusal_is_named_and_never_falls_back(monkeypatch, answer_hello):
+    """A draining hostd refuses a new client. core_bridge must raise daemon_draining and
+    stay in daemon mode: a private in-process engine would not share documents."""
+    from services.mcp import core_bridge
+
+    sock_dir = tempfile.mkdtemp(prefix="cw-drain-")
+    path = os.path.join(sock_dir, "h.sock")
+    peer = _draining_peer(path, answer_hello)
+    monkeypatch.setenv("CHUDWARE_HOSTD_SOCKET", path)
+    monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
+    monkeypatch.setattr(core_bridge, "_DAEMON_FALLBACK_WARNED", False)
+    client = DaemonClient()
+    monkeypatch.setattr(daemon_bridge, "_client", client)
+
+    def private_engine():
+        pytest.fail("a draining daemon refusal reached the in-process engine")
+
+    monkeypatch.setattr(core_bridge, "_load", private_engine)
+    monkeypatch.setattr(daemon_bridge, "_spawn_hostd_detached",
+                        lambda *a: pytest.fail("a refusal must not spawn another daemon"))
+    try:
+        with pytest.raises(core_bridge.CoreError) as refused:
+            core_bridge.call("doc_list", {})
+    finally:
+        peer.join(5)
+        shutil.rmtree(sock_dir, ignore_errors=True)
+    assert refused.value.code == "daemon_draining"
+    assert isinstance(refused.value.__cause__, DaemonDraining)
+    if answer_hello:
+        assert refused.value.detail["reason"] == "stale_binary"
+        assert refused.value.detail["daemon_pid"] == 4242
+    assert core_bridge.active_daemon_mode()
+    assert not client.connected()

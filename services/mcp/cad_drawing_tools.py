@@ -1458,9 +1458,11 @@ def _hole_feature_defaults(full: dict, feature_ref: Any) -> tuple[dict, Optional
         "thru": _canon_word(params.get("end") or params.get("end_condition")) in
                 {"through", "through_all", "thru"},
     }
-    positions = params.get("positions")
-    if isinstance(positions, list) and positions:
-        defaults["count"] = len(positions)
+    for key in ("positions", "world_points"):
+        placed = params.get(key)
+        if isinstance(placed, list) and placed:
+            defaults["count"] = len(placed)
+            break
     return {key: value for key, value in defaults.items() if value is not None}, None
 
 

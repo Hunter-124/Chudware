@@ -11,12 +11,14 @@
 // incident face), so we never index the de-duplicated edge list directly; we map the
 // resolved descriptor's centroid to the nearest unique edge by centroid distance.
 #include "doc/picks.h"
+#include "geom/face_normal.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <limits>
 #include <set>
 #include <tuple>
@@ -25,6 +27,8 @@
 #include <Bnd_Box.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepAdaptor_Curve.hxx>
+#include <BRepBuilderAPI_MakeVertex.hxx>
+#include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
@@ -34,6 +38,7 @@
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopExp.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
+#include <TopoDS_Vertex.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
@@ -63,7 +68,8 @@ static const std::set<std::string> kQueryNarrowingKeys = {
 static const std::set<std::string> kQueryDomainKeys = {"of", "kind"};
 static const std::set<std::string> kQueryReadbackKeys = {
     "sid", "centroid", "normal", "axis", "radius", "area_or_len", "concavity",
-    "hint_index", "owner_feature", "body", "topo",
+    "hint_index", "owner_feature", "body", "topo", "axis_point",
+    "major_radius", "minor_radius", "torus_axis", "torus_center",
 };
 
 
@@ -357,11 +363,40 @@ FacePicks resolve_face_picks(const TopoDS_Shape& shape, const nlohmann::json& se
 
     for (std::size_t i = 0; i < sel_list.size(); ++i) {
         const nlohmann::json& sel = sel_list[i];
+        const std::string where = slot + "[" + std::to_string(i) + "]: ";
+        // A plain-English geometry QUERY element ({"of":"face","side":"top"}) resolves
+        // through the query resolver exactly like the bare single form every face slot
+        // already accepts — a LIST of queries (shell remove top + bottom = a tube) used to
+        // reach the topology scorer below and dangle "no candidates of matching kind", or,
+        // with "kind":"face" added, leak a raw json key error. An element that carries a
+        // measured centroid is a concrete pick (a query_geometry readback echoes "of"
+        // beside its centroid) and keeps the scorer path.
+        const auto& c = sel.is_object() ? sel.value("centroid", nlohmann::json()) : nlohmann::json();
+        const bool located = c.is_array() && c.size() == 3 &&
+                             std::all_of(c.begin(), c.end(),
+                                         [](const nlohmann::json& v) { return v.is_number(); });
+        if (is_geom_query(sel) && !located) {
+            QueryPicks qp = resolve_geom_query(shape, sel);
+            if (!qp.error.empty()) { out.dangling.push_back(where + qp.error); continue; }
+            if (qp.faces.empty()) {
+                out.dangling.push_back(where + (qp.edges.empty()
+                    ? std::string("the face query matched no faces")
+                    : std::string("an edge query in a face slot — use \"of\":\"face\"")));
+                continue;
+            }
+            // Two queries naming the same face (side:"top" + pick:"largest") select it once.
+            for (const TopoDS_Face& f : qp.faces) {
+                bool dup = false;
+                for (const TopoDS_Face& have : out.faces) if (have.IsSame(f)) { dup = true; break; }
+                if (!dup) out.faces.push_back(f);
+            }
+            continue;
+        }
         std::optional<int> idx = resolve_with_hint_fallback(sel, infos, diag);
         if (!idx.has_value()) {
             ResolveResult rr = resolve(sel, infos, diag);
             std::string reason = rr.dangling_reason.value_or(std::string("unresolved"));
-            out.dangling.push_back(slot + "[" + std::to_string(i) + "]: " + reason);
+            out.dangling.push_back(where + reason);
             continue;
         }
         // The resolved descriptor's centroid (face centre) -> nearest unique face.
@@ -446,6 +481,7 @@ std::optional<Eigen::Vector3d> query_rep_dir(
 // One unique sub-shape's geometric fingerprint (the same fields the describers compute).
 struct QCand {
     TopoDS_Shape shp;
+    int index = 0;  // 0-based position in the shape's UNIQUE sub-shape map (TopExp::MapShapes)
     Eigen::Vector3d centroid{0, 0, 0};
     std::optional<Eigen::Vector3d> axis;
     // I3 — representative OUTWARD direction at the face centroid, for EVERY face type
@@ -454,6 +490,10 @@ struct QCand {
     // edges and degenerate faces.
     std::optional<Eigen::Vector3d> rep_dir;
     std::optional<double> radius;  // cylinder face / circle edge radius (for inner/outer)
+    // Cylinder/cone face: the face centroid projected onto the surface axis — a point ON the
+    // axis near the face (the centroid itself sits off-axis on a partial cylinder/fillet).
+    std::optional<Eigen::Vector3d> axis_point;
+    std::optional<TopoInfo::Torus> torus;  // torus face: analytic surface (sweep bend)
     std::string surf;
     double measure = 0.0;
     // Concavity flag for cylindrical faces (C5): geometry-based (outward normal vs radial),
@@ -506,25 +546,43 @@ constexpr const char* kSurfCurvedCategory = "@curved";
 
 // Canonicalise a `surf` token into a kernel surface/curve name. Accepts the everyday
 // words a model uses ("flat"/"round"/"curved"/"straight") resolved against whether we're
-// filtering faces or edges, plus specific curved-type words (conical/spherical/toroidal/
-// cylindrical) and every canonical kernel token unchanged. Returns the kSurfCurvedCategory
-// sentinel for the "round"/"curved" CATEGORY, or "" for an unrecognised token (the caller
-// turns that into a teaching error).
+// filtering faces or edges, the specific type words (cylindrical/conical/spherical/
+// toroidal; circular/elliptical), common abbreviations and plurals ("cyl", "cylinders",
+// "sph", "tori", "arcs"), and every canonical kernel token unchanged. Returns the
+// kSurfCurvedCategory sentinel for the "round"/"curved" CATEGORY, or "" for an
+// unrecognised token (the caller turns that into a teaching error that lists
+// kSurfFaceWords / kSurfEdgeWords). A live run (c243) lost a turn on surf:"cyl".
+struct SurfWord { const char* word; const char* canon; };
+constexpr SurfWord kSurfFaceWords[] = {
+    {"flat", "plane"},        {"planar", "plane"},       {"planes", "plane"},
+    {"round", kSurfCurvedCategory}, {"rounded", kSurfCurvedCategory},
+    {"curved", kSurfCurvedCategory},
+    {"cyl", "cylinder"},      {"cyls", "cylinder"},      {"cylinders", "cylinder"},
+    {"cylindrical", "cylinder"},
+    {"cones", "cone"},        {"conical", "cone"},
+    {"sph", "sphere"},        {"spheres", "sphere"},     {"spherical", "sphere"},
+    {"tori", "torus"},        {"toruses", "torus"},      {"toroid", "torus"},
+    {"toroidal", "torus"},
+    {"spline", "bspline"},    {"b-spline", "bspline"},   {"nurbs", "bspline"},
+};
+constexpr SurfWord kSurfEdgeWords[] = {
+    {"straight", "line"},     {"lines", "line"},         {"linear", "line"},
+    {"round", kSurfCurvedCategory}, {"rounded", kSurfCurvedCategory},
+    {"curved", kSurfCurvedCategory},
+    {"circles", "circle"},    {"circular", "circle"},    {"arc", "circle"},
+    {"arcs", "circle"},
+    {"ellipses", "ellipse"},  {"elliptical", "ellipse"},
+    {"spline", "bspline"},    {"b-spline", "bspline"},   {"nurbs", "bspline"},
+};
+
 std::string canon_surf(const std::string& raw, bool want_face) {
     const std::string s = lc(raw);
     if (want_face) {
-        if (s == "flat"  || s == "planar")               return "plane";
-        // "round"/"curved" => any non-planar face (category match — see filter below).
-        if (s == "round" || s == "curved")               return kSurfCurvedCategory;
-        // Specific curved-type words let a user pick ONE kernel surface type.
-        if (s == "cylindrical")                          return "cylinder";
-        if (s == "conical")                              return "cone";
-        if (s == "spherical")                            return "sphere";
-        if (s == "toroidal")                             return "torus";
+        for (const SurfWord& w : kSurfFaceWords)
+            if (s == w.word) return w.canon;
     } else {
-        if (s == "straight")                             return "line";
-        // "round"/"curved" => any non-line edge (category match — circle/ellipse/bspline).
-        if (s == "round" || s == "curved")               return kSurfCurvedCategory;
+        for (const SurfWord& w : kSurfEdgeWords)
+            if (s == w.word) return w.canon;
     }
     // Canonical kernel tokens pass through unchanged (preserves prior behaviour).
     static const char* kKnown[] = {"line", "circle", "ellipse", "bspline", "plane",
@@ -532,6 +590,36 @@ std::string canon_surf(const std::string& raw, bool want_face) {
     for (const char* k : kKnown)
         if (s == k) return s;
     return "";
+}
+
+// The accepted `surf` words for the refusal, built from the same tables canon_surf reads,
+// so the error can never list a word the matcher refuses (or omit one it accepts).
+// Format: "plane (flat, planar, planes), cylinder (cyl, ...), ..., other; round, rounded,
+// curved = any non-planar face".
+std::string surf_vocabulary(bool want_face) {
+    static const char* kFaceCanon[] = {"plane", "cylinder", "cone", "sphere", "torus",
+                                       "bspline", "other"};
+    static const char* kEdgeCanon[] = {"line", "circle", "ellipse", "bspline", "other"};
+    const SurfWord* words = want_face ? kSurfFaceWords : kSurfEdgeWords;
+    const size_t n_words = want_face ? std::size(kSurfFaceWords) : std::size(kSurfEdgeWords);
+    const char* const* canon = want_face ? kFaceCanon : kEdgeCanon;
+    const size_t n_canon = want_face ? std::size(kFaceCanon) : std::size(kEdgeCanon);
+    std::string out;
+    for (size_t c = 0; c < n_canon; ++c) {
+        if (c) out += ", ";
+        out += canon[c];
+        std::string syn;
+        for (size_t w = 0; w < n_words; ++w)
+            if (std::string(words[w].canon) == canon[c])
+                syn += (syn.empty() ? "" : ", ") + std::string(words[w].word);
+        if (!syn.empty()) out += " (" + syn + ")";
+    }
+    std::string category;
+    for (size_t w = 0; w < n_words; ++w)
+        if (std::string(words[w].canon) == kSurfCurvedCategory)
+            category += (category.empty() ? "" : ", ") + std::string(words[w].word);
+    out += "; " + category + (want_face ? " = any non-planar face" : " = any non-line edge");
+    return out;
 }
 
 // I1 category test: does candidate surf `cs` belong to the "curved" category? For both
@@ -545,6 +633,88 @@ bool surf_is_curved(const std::string& cs) {
 std::optional<Eigen::Vector3d> json_vec3(const nlohmann::json& j) {
     if (!j.is_array() || j.size() < 3) return std::nullopt;
     return Eigen::Vector3d(j[0].get<double>(), j[1].get<double>(), j[2].get<double>());
+}
+
+// ----------------------------------------------------------------------- `near` ranking
+// contracts/selectors.md "near: geometric distance". A model writes `near` as a point ON (or at)
+// the entity it means, so ranking by CENTROID distance alone picked the wrong entity whenever
+// the meant entity's centroid sits far from its geometry: on a Ø110 flange, near:[55,0,12]
+// (a point ON the outer rim) chose the PCD-80 bolt-hole edge (centroid (40,0,12), 15 mm away)
+// over the rim (centroid = the axis point (0,0,12), 55 mm away). The primary key is therefore
+// min(distance to the trimmed sub-shape geometry, distance to its centroid): a point on the
+// entity and a point at its reported centroid (a describe_part / query match handed back as
+// `near`, which session.cpp's selector re-resolution also does internally) both score 0.
+// Candidates within the tie band of the best key go to the nearer centroid (a point on the
+// shared edge of two faces picks the face whose centroid is nearer), then MapShapes order.
+constexpr double kNearTieAbsMm = 1e-4;
+constexpr double kNearTieRel = 1e-6;
+
+double near_tie_band(double d) { return std::max(kNearTieAbsMm, kNearTieRel * d); }
+
+// Exact point -> trimmed sub-shape distance; +inf when OCCT cannot compute it (the centroid
+// term of the key still ranks the candidate).
+double point_subshape_distance(const TopoDS_Shape& s, const gp_Pnt& p) {
+    try {
+        const TopoDS_Vertex v = BRepBuilderAPI_MakeVertex(p);
+        BRepExtrema_DistShapeShape d(v, s, Extrema_ExtFlag_MIN);
+        if (d.IsDone() && d.NbSolution() > 0) return d.Value();
+    } catch (const Standard_Failure&) {}
+    return std::numeric_limits<double>::infinity();
+}
+
+// Lower bound of the point -> sub-shape distance from its exact-geometry bounding box (0 when
+// the box is void/open, i.e. no pruning).
+double point_bbox_distance(const TopoDS_Shape& s, const Eigen::Vector3d& p) {
+    Bnd_Box b;
+    try { BRepBndLib::Add(s, b, /*useTriangulation=*/false); } catch (const Standard_Failure&) { return 0.0; }
+    if (b.IsVoid() || b.IsOpen()) return 0.0;
+    double x0, y0, z0, x1, y1, z1;
+    b.Get(x0, y0, z0, x1, y1, z1);
+    const double dx = std::max({0.0, x0 - p.x(), p.x() - x1});
+    const double dy = std::max({0.0, y0 - p.y(), p.y() - y1});
+    const double dz = std::max({0.0, z0 - p.z(), p.z() - z1});
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+// The first min(n, size) candidates of `keep` in `near` order. Exact distances are computed
+// only for candidates whose bbox lower bound can still reach the n-th smallest centroid
+// distance (an upper bound of every selected key) plus its tie band.
+std::vector<const QCand*> rank_near(const std::vector<const QCand*>& keep,
+                                    const Eigen::Vector3d& pt, std::size_t n) {
+    const std::size_t m = keep.size();
+    n = std::min(n, m);
+    std::vector<double> cent(m), key(m, std::numeric_limits<double>::infinity());
+    for (std::size_t i = 0; i < m; ++i) cent[i] = (keep[i]->centroid - pt).norm();
+    double reach = std::numeric_limits<double>::infinity();
+    if (n < m && n > 0) {
+        std::vector<double> c = cent;
+        std::nth_element(c.begin(), c.begin() + static_cast<std::ptrdiff_t>(n - 1), c.end());
+        reach = c[n - 1] + near_tie_band(c[n - 1]);
+    }
+    const gp_Pnt gp(pt.x(), pt.y(), pt.z());
+    for (std::size_t i = 0; i < m; ++i) {
+        if (std::isfinite(reach) && std::min(cent[i], point_bbox_distance(keep[i]->shp, pt)) > reach)
+            continue;  // can never enter a selection band: key >= lower bound > reach
+        key[i] = std::min(cent[i], point_subshape_distance(keep[i]->shp, gp));
+    }
+    std::vector<const QCand*> out;
+    out.reserve(n);
+    std::vector<char> taken(m, 0);
+    for (std::size_t step = 0; step < n; ++step) {
+        double best = std::numeric_limits<double>::infinity();
+        for (std::size_t i = 0; i < m; ++i)
+            if (!taken[i]) best = std::min(best, key[i]);
+        const double band = best + near_tie_band(best);
+        std::size_t pick = m;
+        for (std::size_t i = 0; i < m; ++i) {
+            if (taken[i] || !(key[i] <= band || key[i] == best)) continue;
+            if (pick == m || cent[i] < cent[pick]) pick = i;  // strict: earlier index wins ties
+        }
+        if (pick == m) break;
+        taken[pick] = 1;
+        out.push_back(keep[pick]);
+    }
+    return out;
 }
 
 // Parse a `parallel`/`perpendicular` value: either an explicit [x,y,z] OR a string axis
@@ -662,6 +832,7 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
     for (int i = 1; i <= uniq.Extent(); ++i) {
         QCand c;
         c.shp = uniq(i);
+        c.index = i - 1;
         GProp_GProps props;
         // I3 — captured for the representative-direction computation (after centroid known).
         GeomAbs_SurfaceType face_st = GeomAbs_OtherSurface;
@@ -676,14 +847,15 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
             c.surf = q_surf_type(st);
             try {
                 if (st == GeomAbs_Plane) {
-                    gp_Dir pn = ad.Plane().Axis().Direction();
-                    // I3: signed outward normal (REVERSED faces face the opposite way), so
-                    // a flat cap's rep_dir distinguishes top from bottom — same convention
-                    // as describe_faces. The stored `axis` keeps the geometric (unsigned)
-                    // direction it always had, so the F5 score path is unchanged.
+                    const gp_Pln pln = ad.Plane();
+                    gp_Dir pn = pln.Axis().Direction();
+                    // I3: signed outward normal (handedness of the plane frame AND face
+                    // orientation — see geom/face_normal.h), so a flat cap's rep_dir
+                    // distinguishes top from bottom — same convention as describe_faces.
+                    // The stored `axis` keeps the geometric (unsigned) direction it always
+                    // had, so the F5 score path is unchanged.
                     c.axis = Eigen::Vector3d(pn.X(), pn.Y(), pn.Z());
-                    gp_Dir pn_signed = pn;
-                    if (f.Orientation() == TopAbs_REVERSED) pn_signed.Reverse();
+                    const gp_Dir pn_signed = ::chudware::geom::plane_outward_normal(f, pln);
                     plane_axis = Eigen::Vector3d(pn_signed.X(), pn_signed.Y(), pn_signed.Z());
                 } else if (st == GeomAbs_Cylinder) {
                     gp_Ax1 ax = ad.Cylinder().Axis();
@@ -699,6 +871,8 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
                     c.concave = cylinder_face_concave(f);
                 } else if (st == GeomAbs_Sphere) {
                     c.radius = ad.Sphere().Radius();
+                } else if (st == GeomAbs_Torus) {
+                    c.torus = face_torus(f);
                 } else if (st == GeomAbs_Cone) {
                     gp_Ax1 ax = ad.Cone().Axis();
                     c.axis = Eigen::Vector3d(ax.Direction().X(), ax.Direction().Y(),
@@ -726,6 +900,9 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
         c.measure = props.Mass();
         gp_Pnt cm = props.CentreOfMass();
         c.centroid = Eigen::Vector3d(cm.X(), cm.Y(), cm.Z());
+        // Cylinder/cone: the centroid's foot on the surface axis (c.axis is unit here).
+        if (want_face && c.axis && axis_loc)
+            c.axis_point = *axis_loc + *c.axis * (c.centroid - *axis_loc).dot(*c.axis);
         // I3 — representative outward direction for EVERY face (computed after the centroid).
         if (want_face) {
             try {
@@ -744,11 +921,8 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
         surf_f = canon_surf(q["surf"].get<std::string>(), want_face);
         if (surf_f.empty()) {
             out.error = "geom query: unknown 'surf' '" + clip_echo(q["surf"].get<std::string>()) +
-                        (want_face ? "' (faces: flat/round/curved, cylindrical/conical/spherical/"
-                                     "toroidal, or plane/cylinder/cone/sphere/torus)"
-                                   : "' (edges: straight/round/curved or line/circle/ellipse/"
-                                     "bspline)") +
-                        kQueryGrammar;
+                        "'. Use one of these " + (want_face ? "face" : "edge") +
+                        " surf words: " + surf_vocabulary(want_face) + kQueryGrammar;
             return out;
         }
     }
@@ -840,19 +1014,18 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
             }
         }
         if (!side_done) {
-        // CAP PREFERENCE (revolved-part fix): when this is a FACE query and the body has
-        // PLANAR faces whose normal is PARALLEL to the queried direction (|rep_dir·dir| ~ 1
-        // — axis-perpendicular CAPS like a flange top/bottom), restrict the set to those
-        // caps before taking the centroid-extreme. This stops a PERPENDICULAR curved face
-        // (a bore/side wall, rep_dir ⟂ dir) from out-scoring a planar cap that genuinely
-        // faces the queried side — seen on uncentred revolved tubes/flanges where the cap
-        // sits at one end and the bore centroid lies BETWEEN the ends (so the bore's
-        // centroid·dir beat the cap's, and the cap's small dir-term couldn't recover it).
-        // Cap identification uses |rep_dir·dir| (SIGN-INDEPENDENT, so a mis-signed revolved
-        // planar-face normal still counts as a cap); top-vs-bottom is then decided purely by
-        // the centroid projection below (reliable). Untouched for curved-only bodies
-        // (sphere/cone — no parallel planar cap) and slanted tops (|rep_dir·dir| < 0.9), which
-        // keep using the centroid+direction blend.
+        // CAP PREFERENCE: when this is a FACE query and the body has PLANAR faces whose
+        // normal is PARALLEL to the queried direction (|rep_dir·dir| ~ 1 — axis-perpendicular
+        // CAPS like a flange top/bottom), restrict the set to those caps before taking the
+        // centroid-extreme, so a planar cap beats any curved face (a bore/side wall, a dome)
+        // for "the top/bottom face". Originally added because revolved end faces reported a
+        // mis-signed normal (left-handed gp_Pln frames, now fixed in geom/face_normal.h) and
+        // lost to an uncentred bore; it is KEPT because it still decides the curved-vs-cap
+        // case (a dome whose centroid sits above a planar shoulder) and side-query results
+        // must not move. Cap identification uses |rep_dir·dir| (sign-independent);
+        // top-vs-bottom is then decided by the centroid projection below. Untouched for
+        // curved-only bodies (sphere/cone — no parallel planar cap) and slanted tops
+        // (|rep_dir·dir| < 0.9), which keep using the centroid+direction blend.
         if (want_face) {
             constexpr double kCapParallel = 0.9;
             std::vector<const QCand*> caps;
@@ -981,15 +1154,12 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
         }
     }
 
-    // 4) near: sort by centroid distance, keep nearest `count` (default 1).
+    // 4) near: rank by geometric distance (see rank_near), keep the nearest `count` (default 1).
     if (q.contains("near")) {
         std::optional<Eigen::Vector3d> pt = json_vec3(q["near"]);
         if (!pt) { out.error = "geom query: 'near' must be [x,y,z]"; return out; }
-        std::sort(keep.begin(), keep.end(), [&](const QCand* a, const QCand* b) {
-            return (a->centroid - *pt).squaredNorm() < (b->centroid - *pt).squaredNorm();
-        });
-        int n = q.value("count", 1);
-        if (n >= 0 && static_cast<int>(keep.size()) > n) keep.resize(n);
+        const int n = q.value("count", 1);
+        keep = rank_near(keep, *pt, static_cast<std::size_t>(std::max(n, 0)));
     }
 
     // 5) index: keep the listed ordinals of the filtered set.
@@ -1007,7 +1177,6 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
     }
 
     // 7) materialise: kernel sub-shapes + introspection selectors.
-    int ordinal = 0;
     for (const QCand* c : keep) {
         if (want_face) out.faces.push_back(TopoDS::Face(c->shp));
         else out.edges.push_back(TopoDS::Edge(c->shp));
@@ -1018,7 +1187,13 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
         ti.axis = c->axis;
         ti.measure = c->measure;
         ti.owner = std::nullopt;
-        ti.hint_index = ordinal++;
+        // The sub-shape's index in the WHOLE shape's unique map — never its position in the
+        // filtered result. doc_query derives the body/topo join keys from it, the hint
+        // fallback compares it with describe-space indices and measure picks validate it as
+        // a topology index; a filtered-list ordinal made {"surf":"cylinder"} report topo 1
+        // for whatever face happened to come first in the body.
+        ti.index = c->index;
+        ti.hint_index = c->index;
         // GSL Stage 0 — carry the semantics the scorer already computed into the LLM-facing
         // selector (make_selector emits them as normal/side/concavity/radius). Without this the
         // query_geometry read-back was raw {surf, unsigned axis, noisy centroid, area} with the
@@ -1026,6 +1201,8 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
         ti.rep_dir = c->rep_dir;
         ti.concave = c->concave;
         ti.radius = c->radius;
+        ti.axis_point = c->axis_point;
+        ti.torus = c->torus;
         out.selectors.push_back(make_selector(ti));
     }
     return out;

@@ -280,8 +280,8 @@ jobs:
 
   provision-linux:
     name: Provision Linux release runner
-    if: startsWith(inputs.runner_label, 'cc-linux-')
-    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, "${{ inputs.runner_label }}"]
+    if: inputs.runner_label == 'cc-linux-build'
+    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-build]
     timeout-minutes: 60
     env:
       # nightly-release's linux-beta job packages the verified AppDir as a .deb and an

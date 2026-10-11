@@ -14,6 +14,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <optional>
 #include <sstream>
 
 #include "piping/catalog.h"
@@ -142,6 +143,7 @@ void snap_nodes(const ojson& runs, double tol, NetCtx& ctx,
 // Default fitting K-factors (Crane TP-410 order of magnitude); the report
 // always records which method produced each K.
 constexpr double kKTeeRun = 0.6, kKTeeBranch = 1.3, kKFlange = 0.0, kKReducer = 0.10;
+constexpr int kTeeAuto = -1, kTeeRun = 0, kTeeBranch = 1;  // fitting_K tee_path
 
 // fluids.fittings.bend_rounded, Rennels method (fd given).
 double bend_rounded_rennels(double Di, double angle_deg, double fd, double bend_diameters) {
@@ -171,9 +173,50 @@ double contraction_conical_rennels(double Di1, double Di2, double l, double fd) 
     return K_fr2 + K_conv2;
 }
 
+// Evaluate one k_model override object; nullopt for an unknown kind (validated upstream).
+// `key` names the params entry it came from: "k_model" keeps the historical method
+// strings, the tee path keys (k_model_run / k_model_branch) label their method.
+std::optional<std::pair<double, std::string>> k_model_K(const ojson& km, double d_in, double Re,
+                                                         const std::string& key) {
+    const std::string kind = km.value("kind", "");
+    const std::string tag = key == "k_model" ? "" : " [" + key + "]";
+    if (kind == "constant") return std::pair{km["K"].get<double>(), key + "(constant)"};
+    if (kind == "two_k")
+        return std::pair{km["K1"].get<double>() / std::max(Re, 1e-6) +
+                             km["Kinf"].get<double>() * (1 + 1 / d_in),
+                         "Hooper(two_k)" + tag};
+    if (kind == "three_k")
+        return std::pair{km["K1"].get<double>() / std::max(Re, 1e-6) +
+                             km["Ki"].get<double>() * (1 + km["Kd"].get<double>() / std::pow(d_in, 0.3)),
+                         "Darby(three_k)" + tag};
+    if (kind == "cv")
+        return std::pair{890.3 * std::pow(d_in, 4) / std::pow(km["Cv"].get<double>(), 2),
+                         "Cv(US)" + tag};
+    if (kind == "table") {
+        const auto& points = km["points"];
+        double K = points.front()["K"].get<double>();
+        for (size_t i = 1; i < points.size(); ++i) {
+            const double lo = points[i-1]["re"].get<double>();
+            const double hi = points[i]["re"].get<double>();
+            if (Re <= lo) break;
+            const double t = std::clamp(std::log(Re / lo) / std::log(hi / lo), 0.0, 1.0);
+            K = points[i-1]["K"].get<double>() +
+                t * (points[i]["K"].get<double>() - points[i-1]["K"].get<double>());
+            if (Re <= hi) break;
+        }
+        return std::pair{K, "table(log-Re," + km.value("source", "user") + ")" + tag};
+    }
+    return std::nullopt;
+}
+
 // K-factor for a fitting on a pipe of inner-dia d_m (m) at friction fd.
+// Tees: `tee_path` forces the straight-through (kTeeRun) or branch (kTeeBranch) path;
+// kTeeAuto derives it from attribution (branch_run == run_id) or, for legacy
+// unattributed tees, from a reducing branch_nps. A tee's params.k_model_run /
+// params.k_model_branch override that path; params.k_model overrides both.
 std::pair<double, std::string> fitting_K(const ojson& ft, double d_m, double fd,
-                                         double Re, const std::string& run_id = "") {
+                                         double Re, const std::string& run_id = "",
+                                         int tee_path = kTeeAuto) {
     const std::string ftype = ft.value("type", std::string());
     const ojson params = ft.value("params", ojson::object());
     const auto getp = [&](const char* k) -> ojson {
@@ -183,33 +226,34 @@ std::pair<double, std::string> fitting_K(const ojson& ft, double d_m, double fd,
     const double d_in = d_m / 0.0254;
     const double fT = 1.0 / std::pow(-2.0 * std::log10(0.0000457 / (3.7 * d_m)), 2);
     const auto km = getp("k_model");
-    if (km.is_object()) {
-        const std::string kind = km.value("kind", "");
-        if (kind == "constant") return {km["K"].get<double>(), "k_model(constant)"};
-        if (kind == "two_k")
-            return {km["K1"].get<double>() / std::max(Re, 1e-6) +
-                    km["Kinf"].get<double>() * (1 + 1 / d_in), "Hooper(two_k)"};
-        if (kind == "three_k")
-            return {km["K1"].get<double>() / std::max(Re, 1e-6) +
-                    km["Ki"].get<double>() * (1 + km["Kd"].get<double>() / std::pow(d_in, 0.3)),
-                    "Darby(three_k)"};
-        if (kind == "cv")
-            return {890.3 * std::pow(d_in, 4) / std::pow(km["Cv"].get<double>(), 2), "Cv(US)"};
-        if (kind == "table") {
-            const auto& points = km["points"];
-            double K = points.front()["K"].get<double>();
-            for (size_t i = 1; i < points.size(); ++i) {
-                const double lo = points[i-1]["re"].get<double>();
-                const double hi = points[i]["re"].get<double>();
-                if (Re <= lo) break;
-                const double t = std::clamp(std::log(Re / lo) / std::log(hi / lo), 0.0, 1.0);
-                K = points[i-1]["K"].get<double>() +
-                    t * (points[i]["K"].get<double>() - points[i-1]["K"].get<double>());
-                if (Re <= hi) break;
+    if (ftype == "tee") {
+        const bool attributed = ft.value("run_id", ojson(nullptr)).is_string() &&
+                                getp("branch_run").is_string() && getp("run_ids").is_array();
+        bool branch = tee_path == kTeeBranch;
+        if (tee_path == kTeeAuto) {
+            if (attributed) {
+                branch = params["branch_run"] == run_id;
+            } else {
+                const ojson branch_nps = getp("branch_nps");
+                const ojson nps = ft.value("nps", ojson(nullptr));
+                const double nps_v = py_truthy(nps) ? pyutil::to_double(nps) : 0.0;
+                branch = !branch_nps.is_null() && pyutil::to_double(branch_nps) < nps_v;
             }
-            return {K, "table(log-Re," + km.value("source", "user") + ")"};
         }
+        const char* path_key = branch ? "k_model_branch" : "k_model_run";
+        const auto path_model = getp(path_key);
+        if (path_model.is_object())
+            if (auto k = k_model_K(path_model, d_in, Re, path_key)) return *k;
+        if (km.is_object())
+            if (auto k = k_model_K(km, d_in, Re, "k_model")) return *k;
+        if (attributed || tee_path != kTeeAuto)
+            return {(branch ? 60 : 20) * fT,
+                    branch ? "Crane TP-410(tee_branch)" : "Crane TP-410(tee_run)"};
+        return branch ? std::pair{kKTeeBranch, std::string("default(tee_branch)")}
+                      : std::pair{kKTeeRun, std::string("default(tee_run)")};
     }
+    if (km.is_object())
+        if (auto k = k_model_K(km, d_in, Re, "k_model")) return *k;
     if (ftype == "valve") {
         const std::string type = params.value("valve_type", "gate");
         double factor = 8;
@@ -274,21 +318,6 @@ std::pair<double, std::string> fitting_K(const ojson& ft, double d_m, double fd,
         } catch (...) {
         }
         return {kKReducer, "default(reducer)"};
-    }
-    if (ftype == "tee") {
-        if (ft.value("run_id", ojson(nullptr)).is_string() &&
-            getp("branch_run").is_string() && getp("run_ids").is_array()) {
-            const bool branch = params["branch_run"] == run_id;
-            return {(branch ? 60 : 20) * fT,
-                    branch ? "Crane TP-410(tee_branch)" : "Crane TP-410(tee_run)"};
-        }
-        const ojson branch = getp("branch_nps");
-        const ojson nps = ft.value("nps", ojson(nullptr));
-        const double nps_v = py_truthy(nps) ? pyutil::to_double(nps) : 0.0;
-        if (!branch.is_null() && pyutil::to_double(branch) < nps_v) {
-            return {kKTeeBranch, "default(tee_branch)"};
-        }
-        return {kKTeeRun, "default(tee_run)"};
     }
     if (ftype == "flange") return {kKFlange, "default(flange)"};
     if (ftype == "elbow") return {0.3, "default(elbow)"};  // fluids-absent fallback
@@ -2443,9 +2472,9 @@ ojson piping_fitting_k(const ojson& args) {
         if (input.contains("run_id")) ft["run_id"] = input["run_id"];
         const auto errors = validate_fitting(ft);
         if (!errors.empty()) {
-            const auto p = ft["params"];
-            const bool invalid_model = (ft["type"] == "custom" && !p.contains("k_model")) ||
-                (p.contains("k_model") && !validate_k_model(p["k_model"]).empty());
+            const bool invalid_model = std::any_of(errors.begin(), errors.end(), [](const auto& e) {
+                return e.find(".params.k_model") != std::string::npos;
+            });
             return fail(invalid_model ? "invalid_k_model" : "invalid_params", errors.front());
         }
         const double d = spec["inner_dia"].get<double>() / 1000;
@@ -2466,18 +2495,34 @@ ojson piping_fitting_k(const ojson& args) {
                           d * fl["rho"].get<double>() / fl["mu"].get<double>(), 1e-6);
         }
         const double fT = 1 / std::pow(-2 * std::log10(0.0000457 / (3.7*d)), 2);
-        auto evaluate = [&](double re) {
+        const bool tee = ft["type"] == "tee";
+        int tee_path = kTeeAuto;
+        if (args.contains("path")) {
+            const auto path = args["path"];
+            if (!tee || (path != "run" && path != "branch"))
+                return fail("invalid_params", "path is \"run\" or \"branch\" and applies only to tees");
+            tee_path = path == "branch" ? kTeeBranch : kTeeRun;
+        }
+        auto evaluate = [&](double re, int which) {
             return fitting_K(ft, d, re < 2100 ? 64/re : clamond(re, 0.0000457/d), re,
-                             ft.value("run_id", std::string()));
+                             ft.value("run_id", std::string()), which);
         };
-        const auto [K, method] = evaluate(Re);
+        const auto [K, method] = evaluate(Re, tee_path);
         ojson curve = ojson::array();
         for (int i = 0; i < 24; ++i) {
             const double re = std::pow(10.0, 3.0 + 4.0 * i / 23.0);
-            curve.push_back({{"re", re}, {"K", evaluate(re).first}});
+            curve.push_back({{"re", re}, {"K", evaluate(re, tee_path).first}});
         }
-        return {{"ok", true}, {"K", K}, {"method", method}, {"fT", fT},
-                {"inner_dia_mm", d*1000}, {"reynolds", Re}, {"curve", std::move(curve)}};
+        ojson out = {{"ok", true}, {"K", K}, {"method", method}, {"fT", fT},
+                     {"inner_dia_mm", d*1000}, {"reynolds", Re}, {"curve", std::move(curve)}};
+        if (tee) {
+            // Both tee loss paths, each on the velocity of the run that carries it.
+            const auto [K_run, method_run] = evaluate(Re, kTeeRun);
+            const auto [K_branch, method_branch] = evaluate(Re, kTeeBranch);
+            out["paths"] = {{"run", {{"K", K_run}, {"method", method_run}}},
+                            {"branch", {{"K", K_branch}, {"method", method_branch}}}};
+        }
+        return out;
     } catch (const nlohmann::json::exception&) {
         return fail("invalid_params", "check fitting and numeric parameter types");
     }

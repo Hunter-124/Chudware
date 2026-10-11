@@ -594,3 +594,178 @@ TEST_CASE("op: sketch_convert rejects empty refs with invalid_op") {
                                  {"refs", json::array()}}});
     CHECK_THROWS_AS(doc_apply_ops(doc_id, -1, bad, false), chudware::doc::OpError);
 }
+
+// ---------------------------------------------------------------------------
+// sketch_edit_entity shapes + profile picks that lose their region (2026-10-10 6-axis run)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Apply a batch that must refuse; return {message, detail.reason}.
+std::pair<std::string, std::string> edit_refusal(const std::string& doc_id, const json& op) {
+    try {
+        doc_apply_ops(doc_id, -1, json::array({op}), false);
+    } catch (const chudware::doc::OpError& e) {
+        return {e.what(), e.detail.value("reason", std::string())};
+    }
+    return {std::string(), std::string()};
+}
+
+json entity_of(const json& sketch_feature, const std::string& eid) {
+    for (const auto& e : sketch_feature.at("params").at("entities"))
+        if (e.value("id", std::string()) == eid) return e;
+    return json(nullptr);
+}
+
+bool at_point(const json& p, double x, double y) {
+    return p.is_array() && p.size() == 2 && std::abs(p[0].get<double>() - x) < 1e-6 &&
+           std::abs(p[1].get<double>() - y) < 1e-6;
+}
+
+// A sketch with two closed 10x10 rectangles at x0 = 0 and 20 (ids e1..e4, e5..e8) and a
+// boss extrude whose profile picks regions by (centroid, hint_index). Returns the response.
+json two_rect_boss(const std::string& doc_id,
+                   const std::vector<std::pair<json, int>>& picks) {
+    json ents = json::array();
+    int n = 0;
+    for (double x0 : {0.0, 20.0}) {
+        const double xs[5][2] = {{x0, 0}, {x0 + 10, 0}, {x0 + 10, 10}, {x0, 10}, {x0, 0}};
+        for (int k = 0; k < 4; ++k) {
+            const std::string eid = "e" + std::to_string(++n);
+            ents.push_back(line(eid.c_str(), xs[k][0], xs[k][1], xs[k + 1][0], xs[k + 1][1]));
+        }
+    }
+    json profile = json::array();
+    for (const auto& [centroid, hint] : picks)
+        profile.push_back(json{{"kind", "region"}, {"sketch", "$0"}, {"centroid", centroid},
+                               {"hint_index", hint}});
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "sketch"}, {"name", "TwoRects"},
+                 {"params", {{"entities", ents}, {"constraints", json::array()}}},
+                 {"refs", {{"plane", "plane.top"}}}}}},
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "extrude"}, {"name", "Boss"},
+                 {"params", {{"mode", "boss"}, {"end", "blind"}, {"depth", dimv(5.0)}}},
+                 {"refs", {{"profile", profile}}}}}},
+    });
+    return doc_apply_ops(doc_id, -1, ops, false);
+}
+
+}  // namespace
+
+TEST_CASE("sketch_edit_entity: the agent 'entity' form changes the coordinates") {
+    const double W = 40.0, D = 30.0, H = 20.0;
+    std::string doc_id = make_box("EditEntityForm", W, D, H);  // f1 sketch e1..e4, f2 extrude
+
+    // Live 2026-10-10 shapes: entity:{id,...} and op.id + entity:{type,...}. The first
+    // failed "no entity ''"; the second returned ok:true and changed NOTHING.
+    json ed = json::array({
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"},
+             {"entity", {{"id", "e1"}, {"p2", json::array({60.0, 0.0})}}}},
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e2"},
+             {"entity", {{"type", "line"}, {"p1", json::array({60.0, 0.0})},
+                         {"p2", json::array({60.0, D})}}}},
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e3"},
+             {"entity", {{"id", "e3"}, {"p1", json::array({60.0, D})}}}},
+    });
+    json rr = doc_apply_ops(doc_id, -1, ed, false);
+    for (const auto& st : rr.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(st.value("ok", false), "post-edit rebuild failed: " << st.dump());
+
+    const json sk = feature_of(rr.at("tree"), "f1");
+    CHECK(at_point(entity_of(sk, "e1").at("p2"), 60.0, 0.0));
+    CHECK(at_point(entity_of(sk, "e2").at("p1"), 60.0, 0.0));
+    CHECK(at_point(entity_of(sk, "e2").at("p2"), 60.0, D));
+    CHECK(entity_of(sk, "e2").at("type") == "line");
+    CHECK(at_point(entity_of(sk, "e3").at("p1"), 60.0, D));
+    CHECK(rr.value("volume", 0.0) == doctest::Approx(60.0 * D * H).epsilon(1e-6));
+}
+
+TEST_CASE("sketch_edit_entity: a bad shape refuses with a named reason and changes nothing") {
+    std::string doc_id = make_box("EditEntityBad", 40.0, 30.0, 20.0);
+    const json base{{"op", "sketch_edit_entity"}, {"sketch", "f1"}};
+    auto with = [&](json extra) {
+        json op = base;
+        for (auto it = extra.begin(); it != extra.end(); ++it) op[it.key()] = it.value();
+        return op;
+    };
+    const json p = json::array({1.0, 2.0});
+    struct Case { const char* name; json op; const char* reason; std::vector<std::string> says; };
+    const std::vector<Case> cases = {
+        {"no id", with({{"entity", {{"p1", p}}}}), "missing_entity_id", {"no entity id", "p1"}},
+        {"unknown id", with({{"entity", {{"id", "e99"}, {"p1", p}}}}), "unknown_entity",
+         {"'e99'", "e1, e2, e3, e4"}},
+        {"conflicting ids", with({{"id", "e1"}, {"entity", {{"id", "e2"}, {"p1", p}}}}),
+         "conflicting_entity_id", {"'e1'", "'e2'"}},
+        {"empty entity", with({{"entity", {{"id", "e1"}}}}), "empty_patch", {"no fields"}},
+        {"no patch at all", with({{"id", "e1"}}), "empty_patch", {"no fields"}},
+        {"type change", with({{"entity", {{"id", "e1"}, {"type", "arc"}}}}), "type_change",
+         {"is a line", "arc"}},
+        {"field of another type", with({{"entity", {{"id", "e1"}, {"radius", 5.0}}}}),
+         "unknown_entity_field", {"'radius'", "p1", "p2"}},
+        {"both carriers", with({{"id", "e1"}, {"entity", {{"p1", p}}}, {"params", {{"p1", p}}}}),
+         "two_patches", {"'entity'", "'params'"}},
+        {"entity not an object", with({{"id", "e1"}, {"entity", "e1"}}), "patch_not_object",
+         {"'entity'"}},
+    };
+    for (const Case& c : cases) {
+        const auto refusal = edit_refusal(doc_id, c.op);
+        const std::string& msg = refusal.first;
+        const std::string& reason = refusal.second;
+        INFO(c.name << ": " << msg);
+        REQUIRE_MESSAGE(!msg.empty(), c.name << " must refuse, not return ok");
+        CHECK(reason == c.reason);
+        for (const auto& s : c.says) CHECK_MESSAGE(msg.find(s) != std::string::npos, "missing " << s);
+    }
+    // Nothing changed: the rectangle is still 40 wide.
+    json tr = chudware::doc::doc_tree(doc_id);
+    CHECK(at_point(entity_of(feature_of(tr.at("tree"), "f1"), "e1").at("p2"), 40.0, 0.0));
+}
+
+TEST_CASE("profile: a centroid pick whose region disappears after an edit fails the feature") {
+    json nr = doc_new("part", "LostRegion");
+    const std::string doc_id = nr.at("doc_id").get<std::string>();
+    json built = two_rect_boss(doc_id, {{json::array({5.0, 5.0}), 0},
+                                        {json::array({25.0, 5.0}), 1}});
+    for (const auto& st : built.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(st.value("ok", false), "two-rect boss failed: " << st.dump());
+    CHECK(built.value("volume", 0.0) == doctest::Approx(2 * 10.0 * 10.0 * 5.0).epsilon(1e-6));
+    const std::string sk = built.at("id_map").at("$0").get<std::string>();
+    const long rev = built.at("revision").get<long>();
+
+    // Open the second rectangle. Before the fix the [25,5] pick snapped onto the first
+    // rectangle, was de-duplicated, and the boss silently lost half its area with ok:true.
+    json rr = doc_apply_ops(doc_id, -1, json::array({json{{"op", "sketch_delete_entity"},
+                                                          {"sketch", sk}, {"id", "e8"}}}),
+                            false);
+    const json& rows = rr.at("rebuild").at("feature_status");
+    const json& boss = rows.back();
+    const std::string err = boss.value("error", json(nullptr)).is_string()
+                                ? boss["error"].get<std::string>() : std::string();
+    MESSAGE("lost region -> " << err);
+    REQUIRE_MESSAGE(!boss.value("ok", true), "a lost region must fail the feature, not shrink it");
+    CHECK(err.find("profile[1]") != std::string::npos);
+    CHECK(err.find("outside") != std::string::npos);
+    CHECK(err.find("1 material region") != std::string::npos);
+    // The batch rolled back: same revision, e8 still in the sketch.
+    CHECK(rr.at("revision").get<long>() == rev);
+    CHECK(!entity_of(feature_of(rr.at("tree"), sk), "e8").is_null());
+}
+
+TEST_CASE("profile: two centroid picks that land on ONE region refuse (regions merged)") {
+    json nr = doc_new("part", "MergedRegion");
+    const std::string doc_id = nr.at("doc_id").get<std::string>();
+    // Both picks sit inside the first rectangle at different points: the profile claims two
+    // regions where the sketch has one.
+    json built = two_rect_boss(doc_id, {{json::array({3.0, 5.0}), 0},
+                                        {json::array({7.0, 5.0}), 0}});
+    const json& boss = built.at("rebuild").at("feature_status").back();
+    const std::string err = boss.value("error", json(nullptr)).is_string()
+                                ? boss["error"].get<std::string>() : std::string();
+    MESSAGE("merged picks -> " << err);
+    REQUIRE_MESSAGE(!boss.value("ok", true), "two picks on one region must not silently merge");
+    CHECK(err.find("same region") != std::string::npos);
+    CHECK(err.find("profile[0]") != std::string::npos);
+    CHECK(err.find("profile[1]") != std::string::npos);
+}

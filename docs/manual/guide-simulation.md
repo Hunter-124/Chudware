@@ -351,6 +351,8 @@ TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ri
     topology.result_dir) with source.step, inputs/setup/provenance JSON. checkpoint.json holds
     retained optimizer state, but sim_run_topology takes no resume input: a cancelled,
     failed or killed run starts over from the beginning; its checkpoint iteration is only reported.
+    reanalysis.vtu has a point field von_mises[@case] (MPa) and the cell field
+    element_von_mises[@case]. To animate it, use render_animation(kind='fea', vtu_path=...).
 
   Human workflow (Topology tab): New Study (needs an open part with solid geometry) → Method
     (physics, method, objective, volume budget, limits; only supported pairs) → Material →

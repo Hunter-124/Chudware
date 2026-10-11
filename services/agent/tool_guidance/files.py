@@ -9,7 +9,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Windowed by design: after a fs_grep hit, jump straight there with "
             "a 'path:50-200' selector instead of paging from the top; binary "
             "files are refused, directories list entries; a CAD file returns "
-            "its card plus a labelled render (preview image), not its bytes."
+            "its card plus a labelled render (preview image), not its bytes. "
+            "To parse a large file (json.loads), read it with raw=true from "
+            "byte_offset=0, follow next_byte_offset while truncated is true, and "
+            "join the page texts."
         ),
     },
     "fs_list": {

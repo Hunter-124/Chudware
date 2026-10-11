@@ -111,6 +111,33 @@ def test_native_part_document_kind_and_empty_sections(tools, native_file):
     assert result["features"] == result["components"] == result["mates"] == []
 
 
+def test_native_components_report_the_resolved_source_file(tools, native_file, tmp_path):
+    """Live 2026-10-10 (six-axis arm): the agent copied relative `source` objects from a
+    saved assembly into a new one and missed the files. A relative stored source is
+    relative to the native file's folder; the reply gives that absolute file next to it."""
+    folder = tmp_path / "assemblies"
+    folder.mkdir()
+    nested = folder / "nested.step+"
+    absolute = str(tmp_path / "elsewhere" / "pin.step+")
+    with zipfile.ZipFile(nested, "w") as archive:
+        archive.writestr("document.json", json.dumps({
+            "schema": "aicad.asm/1", "id": "asm-2", "name": "nested",
+            "components": [
+                {"id": "k1", "source": {"path": "parts/claw_base.step+"}},
+                {"id": "k2", "source": {"path": "../shared/servo.step+"}},
+                {"id": "k3", "source": {"path": absolute}},
+                {"id": "k4", "source": {"embedded": "brep"}},
+            ]}))
+    result = _read(tools, path=str(nested), sections=["components"])
+    rows = {row["id"]: row for row in result["components"]}
+    # The stored source is unchanged; source_resolved sits beside it.
+    assert rows["k1"]["source"] == {"path": "parts/claw_base.step+"}
+    assert rows["k1"]["source_resolved"] == str(folder / "parts" / "claw_base.step+")
+    assert rows["k2"]["source_resolved"] == str(tmp_path / "shared" / "servo.step+")
+    assert rows["k3"]["source_resolved"] == absolute
+    assert "source_resolved" not in rows["k4"]
+
+
 def test_native_invalid_sections_and_corrupt_files(tools, native_file, tmp_path):
     result = _read(tools, path=str(native_file), sections=["not_a_section"])
     assert result["ok"] is False and result["code"] == "unknown_section"

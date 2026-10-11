@@ -368,6 +368,56 @@ def test_a_canonical_hole_is_left_byte_identical():
     assert notes == []
 
 
+_CANON_HOLE = {"diameter": 5, "style": "simple", "end": "through_all"}
+
+
+@pytest.mark.parametrize("key", ["at", "origin", "position", "center"])
+def test_a_world_hole_point_becomes_world_points_not_face_local_positions(key):
+    """A world [x,y,z] is NOT [u,v] (those are measured from the face centre): it must reach
+    the engine as world_points, never as positions=[[x,y]] with z dropped."""
+    notes: list = []
+    out = M._normalize_hole_feature(
+        {"type": "hole", "name": "B", "params": {**_CANON_HOLE, key: [30, 20, 0]},
+         "refs": {"face": {"of": "face", "side": "bottom"}}}, notes)
+    assert out["params"]["world_points"] == [[30.0, 20.0, 0.0]]
+    assert "positions" not in out["params"] and key not in out["params"]
+    assert any("world_points" in n and "bore axis" in n for n in notes), notes
+
+
+def test_a_world_origin_hole_point_is_kept_not_dropped_as_the_face_centre():
+    out = M._normalize_hole_feature(
+        {"type": "hole", "name": "B", "params": {**_CANON_HOLE, "origin": [0, 0, 0]}}, [])
+    assert out["params"]["world_points"] == [[0.0, 0.0, 0.0]]
+
+
+def test_xyz_triples_under_positions_become_world_points():
+    out = M._normalize_hole_feature(
+        {"type": "hole", "name": "B",
+         "params": {**_CANON_HOLE, "positions": [[30, 20, 0], [50, 20, 0]]}}, [])
+    assert out["params"]["world_points"] == [[30.0, 20.0, 0.0], [50.0, 20.0, 0.0]]
+    assert "positions" not in out["params"]
+
+
+def test_face_local_uv_positions_and_explicit_world_points_are_left_alone():
+    for params in ({**_CANON_HOLE, "positions": [[3, 4], [5, 6]]},
+                   {**_CANON_HOLE, "world_points": [[1, 2, 3]]}):
+        feat = {"type": "hole", "name": "B", "params": params,
+                "refs": {"face": {"of": "face", "side": "top"}}}
+        notes: list = []
+        assert M._normalize_hole_feature(feat, notes) is feat
+        assert notes == []
+
+
+def test_a_world_bolt_circle_centre_becomes_world_center():
+    notes: list = []
+    out = M._normalize_bolt_circle_feature(
+        {"type": "bolt_circle", "name": "R",
+         "params": {"diameter": 3, "count": 4, "pcd": 20, "center": [40, 20, 0]}}, notes)
+    assert out["params"]["world_center"] == [40.0, 20.0, 0.0]
+    assert "center" not in out["params"]
+    assert any("world_center" in n for n in notes), notes
+
+
 # --------------------------------------------------------------------- sketch schema
 
 def test_sketch_entity_ids_are_renumbered_and_every_reference_follows():
@@ -4291,6 +4341,40 @@ def test_assembly_transform_and_suppression_use_component_ids(transform_part, tm
         for target_doc, wrong_id in ((assembly, feature), (doc, component)):
             refused = _transform_apply(target_doc, {"op": "set_suppressed", "id": wrong_id, "value": True})
             assert not refused["ok"] and wrong_id in json.dumps(refused), refused
+    finally:
+        M.cb.call("doc_close", {"doc_id": assembly})
+
+
+@pytest.mark.parametrize("shape", ["flat_op", "query_refs"])
+def test_asm_add_mate_accepts_the_live_flat_and_query_shapes(transform_part, tmp_path, shape):
+    """Live 2026-10-10 (six-axis arm): {op, type, align, refs} failed "requires a 'mate'
+    object", then refs [{component, query}] failed "selector must be an object"."""
+    doc, _feature = transform_part
+    source = str(tmp_path / "component.step")
+    M.cb.call("doc_export_step", {"doc_id": doc, "path": source})
+    assembly = M.cb.call("doc_new", {"kind": "assembly", "name": uuid.uuid4().hex})["doc_id"]
+    try:
+        ids = [M.cb.call("doc_apply_ops", {"doc_id": assembly, "ops": [{
+            "op": "asm_insert_component", "source": {"path": source}, "fixed": fixed}]}
+        )["id_map"]["$0"] for fixed in (True, False)]
+        top = M.cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "side": "top"}})
+        centroid = top["matches"][0]["centroid"]
+        query = {"of": "face", "surf": "plane", "near": centroid, "count": 1}
+        refs = [{"component": cid, "query": query} for cid in ids]
+        mate = {"type": "coincident", "align": "aligned", "refs": refs}
+        if shape == "flat_op":  # the live flat batch also sent distance values as numbers
+            mate = {**mate, "type": "distance", "value": 0}
+        op = ({"op": "asm_add_mate", **mate} if shape == "flat_op"
+              else {"op": "asm_add_mate", "mate": mate})
+        result = _transform_apply(assembly, op)
+        assert result["ok"], result
+        mates = M.cb.call("doc_tree", {"doc_id": assembly})["tree"]["mates"]
+        assert len(mates) == 1 and mates[0]["type"] == mate["type"], mates
+        if shape == "flat_op":
+            assert mates[0]["value"]["value"] == 0, mates
+        assert [r["component"] for r in mates[0]["refs"]] == ids, mates
+        assert all(r["selector"].get("centroid") == pytest.approx(centroid)
+                   for r in mates[0]["refs"]), mates
     finally:
         M.cb.call("doc_close", {"doc_id": assembly})
 

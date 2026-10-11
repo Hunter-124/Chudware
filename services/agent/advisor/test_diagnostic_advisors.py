@@ -384,12 +384,14 @@ class TestDFMAdvisor(unittest.TestCase):
 class TestInterfaceFitmentAdvisor(unittest.TestCase):
 
     def _call_ic(self, ic_findings: list[dict]) -> list[Finding]:
-        ok = not any(f.get("severity") == "fail" for f in ic_findings)
-        summary = "OK" if ok else f"{sum(1 for f in ic_findings if f.get('severity')=='fail')} fail(s)"
+        fails = sum(1 for f in ic_findings if f.get("severity") == "fail")
+        summary = f"{fails} fail(s)" if fails else "OK"
         def _call(method: str, **kwargs) -> dict:
             if method == "interface_check":
-                # Must include tool="interface_check" so the adapter processes it
-                return {"ok": ok, "doc_id": "doc-fixture", "tool": "interface_check",
+                # Must include tool="interface_check" so the adapter processes it.
+                # A misalignment is a finding: ok stays true and status carries the verdict.
+                return {"ok": True, "status": "fail" if fails else "pass",
+                        "doc_id": "doc-fixture", "tool": "interface_check",
                         "version": 1, "findings": ic_findings, "summary": summary,
                         "scope_note": "test fixture"}
             return {}  # other calls return empty → adapter skips them

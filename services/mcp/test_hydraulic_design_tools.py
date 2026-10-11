@@ -353,7 +353,7 @@ def test_hydraulic_templates_returns_native_catalog(store):
     assert store.calls == [("hydraulic_templates", {})] and store.studies == []
 
 
-def test_simulate_persists_compact_run_and_writes_full_series(store, tmp_path):
+def test_simulate_persists_compact_run_and_writes_full_series(store, tmp_path, monkeypatch):
     tools = _tools()
     circuit = _circuit()
     ht._HYD["doc"] = circuit
@@ -379,8 +379,33 @@ def test_simulate_persists_compact_run_and_writes_full_series(store, tmp_path):
     assert st["engine"] == "cpp-hydraulic" and st["params"]["circuit"] == circuit
     assert st["params"]["valve_schedule"] == sched and st["params"]["loads"] == loads
     sim = st["results"]["simulate"]
-    assert sim["summary"]["peak_pressure_bar"] == 140.0 and sim["series_path"] == path
+    assert sim["summary"]["peak_pressure_bar"] == 140.0
     assert len(sim["time_s"]) <= 400 and "hint" not in sim and "next_actions" not in sim
+    # the study names the series relative to the project, so a moved project keeps its run
+    assert not os.path.isabs(sim["series_path"])
+    moved = tmp_path.parent / (tmp_path.name + "-moved")
+    tmp_path.rename(moved)
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(moved))
+    ht._HYD["doc"] = None
+    loaded = _j(tools["hydraulic_load"](doc_id="doc-1"))
+    restored = loaded["results"]["simulate"]["series_path"]
+    assert restored == str(moved / ".chudware" / "hydraulic" / os.path.basename(path))
+    with open(restored, encoding="utf-8") as fh:
+        assert len(json.load(fh)["time_s"]) == 2001
+
+
+def test_reply_max_points_does_not_decimate_the_saved_run(store):
+    """max_points sizes the reply; the study keeps the standard ≤400-point run. A model
+    asking for a terse reply (max_points=20) saved 5 samples in a 1 s steady window."""
+    tools = _tools()
+    ht._HYD["doc"] = _circuit()
+    store.replies["hydraulic_simulate"] = _fake_sim(n=2001)
+    res = _j(tools["hydraulic_simulate"](duration_s=2.0, max_points=20, doc_id="doc-1"))
+    assert res["ok"] is True and len(res["time_s"]) <= 20, res
+    sim = store.study("hydraulic_circuit", "Press")["results"]["simulate"]
+    assert 200 < len(sim["time_s"]) <= 400
+    assert all(len(s) == len(sim["time_s"]) for c in sim["components"].values()
+               for s in c["series"].values() if isinstance(s, list))
 
 
 def test_circuit_study_merges_sizing_and_drops_stale_analyses(store):

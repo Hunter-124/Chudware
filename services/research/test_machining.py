@@ -116,6 +116,18 @@ class TestFeedsSpeedsBasic:
         assert r2.get("schema") == "aicad.calc/1"
         assert r1["answer"]["rpm"]["mid"] == r2["answer"]["rpm"]["mid"]
 
+    def test_registry_alias_resolves_table_row(self):
+        """Registry aliases outside the table vocabulary select the matching table row."""
+        from services.mcp import core_bridge
+
+        if not core_bridge.available():
+            pytest.skip("native material registry is unavailable")
+        base = feeds_speeds("alu_6061", "endmill_flat", 10.0, "roughing")["answer"]
+        alias = feeds_speeds("6061-T6", "endmill_flat", 10.0, "roughing")
+        assert alias.get("schema") == "aicad.calc/1", alias
+        assert alias["answer"]["rpm"] == base["rpm"]
+        assert alias["answer"]["feed"] == base["feed"]
+
     def test_provenance_in_answer(self):
         """answer must include a 'provenance' string identifying the table row."""
         result = feeds_speeds("alu_6061", "endmill_flat", 10.0, "roughing")

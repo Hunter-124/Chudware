@@ -71,6 +71,17 @@ older than any core source unless `--allow-stale-engine` (recorded in the manife
 | S1 | cad | 90×50×12 plate with one centred Ø10 through hole |
 | S2 | cad | 40 mm cube with a centred Ø12×15 boss on +Z |
 | S3 | cad | 50 mm box shelled to 3 mm, +Z face open (rim, floor, inner walls measured) |
+| M1 | cad | revolved stepped shaft along X, Ø30×40 + Ø20×60, 1×45° chamfer on the Ø20 end (step spans, coaxiality, chamfer cone + its bounding circles, revolve in history) |
+| M2 | cad | Ø100×12 flange, Ø40 bore, 6 × Ø9 on PCD 75 with the first hole on +X (count, PCD, 60° spacing, clocking) |
+| M3 | cad | 3 mm L-bracket 60×40×50, bend R5 inside / R8 outside, one Ø6.5 hole per leg (thickness, concentric quarter-turn bend axes, hole spans and positions) |
+| M4 | cad | 80×60×10 plate, 4 M6 counterbores at (±30, ±20): Ø6.6 through, Ø11 × 6.5 from +Z (drill/counterbore spans, flat floors, positions) |
+| M5 | cad | hex standoff 10 AF × 25 along Z, flats normal to ±Y, Ø5 coaxial bore (six sides in 60° pairs, across-flats, orientation, bore) |
+| H1 | cad | swept handrail tube Ø25/Ø21 on a planar XZ path, two 90° bends R50 (straights, analytic torus bends via `doc_face_points`, paired 2 mm wall, open annular ends, sweep in history) |
+| H2 | cad | rectangular 100×60 → Ø80 duct adapter, 2 mm wall, 10 mm collars, open ends (collar walls, end rings, meridian/ring sections, loft in history) |
+| H3 | sim | design-to-requirement 6061-T6 cantilever (σ ≤ 80 MPa, δ ≤ 0.5 mm, b ≥ 8, mass ≤ 1.25 × optimum) + Ø5.5 hole + persisted static study within 25 % of beam theory |
+| H4 | cad | hinge ASSEMBLY: two knuckled leaves + Ø4 pin as part files, angle-mate revolute driven 90° by the native solver, exact pin clearance, no interference at 0° or over the fold |
+| H5 | cad | redesign of a supplied M2 flange through its own history (OD 110, 8 × Ø9 on PCD 80, two 1 × 45° rim chamfers; original feature ids/params kept) |
+| H6 | cad | 120×80×40 enclosure: R5 corners, uniform 2.5 mm shell open top, 4 Ø6 bosses at (±50, ±30) with Ø2.5 × 25 pilots |
 
 Each task's `notes` field documents its oracle derivation and tolerances.
 
@@ -139,12 +150,16 @@ current-format worker event log and terminal record.
 
 ## Limits
 
-- Small samples: 3 replicates × 10 tasks cannot separate close models; report per-task
+- Small samples: 3 replicates × 21 tasks cannot separate close models; report per-task
   counts and paired differences, not a single headline rank. No generation seed is
   applied; replicates are independent turns, identified by index.
 - One turn per trial; continuation/recovery behaviour is not measured.
+- Assemblies are covered by one task (H4: a three-part hinge, its revolute driven by the
+  native `simulate_motion`, exact `eval_interference`). Its components are sibling part
+  files the assembly references by relative path; a component saved outside the workspace
+  is unloadable once the workspace is bundled into `work/` (FAIL, by design).
 - Not covered: drawings (no checkable drawing deliverable is declared yet), ECAD
-  schematics/PCBs (no native ECAD deliverable path), assemblies/mates/motion, CAM,
+  schematics/PCBs (no native ECAD deliverable path), dynamics/multi-joint mechanisms, CAM,
   civil/site layout, and anything requiring the agent to report a number in prose (the
   retired mass/self-intersection prompts). Add them only as new tasks with artifact
   checks.

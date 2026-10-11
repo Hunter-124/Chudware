@@ -61,15 +61,17 @@ from .cad_common import (
     coerce_json_or_repr,
     render_output_path,
     require_list,
+    resolve_agent_path,
 )
 # The one steer-pose driver. A steer film and a turning-radius study must pose the same
 # detached clone the same way, so the animation drives the motion tools' own helper
 # instead of re-deriving a rotation about a kingpin axis.
 from .cad_motion_tools import steer_pose_sweep
-# The save-path contract every render deliverable already obeys (absolute, inside a
-# configured project/workspace root, '..' collapsed first). Imported, never re-implemented:
-# an animation is a figure like any other, and a second interpretation of the same rule is
-# how a film ends up somewhere nobody can point a report at.
+# The save-path contract every render deliverable already obeys (a relative path is
+# project-root relative; the file stays inside a configured project/workspace root; '..'
+# is collapsed first). Imported, never re-implemented: an animation is a figure like any
+# other, and a second interpretation of the same rule is how a film ends up somewhere
+# nobody can point a report at.
 from .cad_render_tools import _render_save_target
 from .cad_render_tools import _render_stem
 
@@ -739,6 +741,65 @@ def _collision_legend(measured: dict, index: int) -> tuple:
 
 
 # ------------------------------------------------------------------------- FEA frames
+_GENERIC_VON_MISES = ("von_mises", "vonmises", "von_mises_mpa")
+_CELL_AVERAGED_NOTE = ("The file has this field only as cell data. The frames show, at each "
+                       "node, the volume-weighted average of the retained incident cells.")
+
+
+def _cell_to_point_average(grid, values):
+    """Volume-weighted nodal average of a cell scalar, the rule the topology engine uses
+    for reanalysis.vtu point von Mises: only cells with retained == 1 count (all cells when
+    the file has no `retained` array); a node with no counted cell gets 0."""
+    import numpy as np  # noqa: PLC0415
+    vol = np.abs(np.asarray(grid.compute_cell_sizes(length=False, area=False, volume=True)
+                            .cell_data["Volume"], dtype=float))
+    if "retained" in grid.cell_data:
+        vol = vol * (np.asarray(grid.cell_data["retained"], dtype=float) > 0)
+    offsets = np.asarray(grid.offset, dtype=np.int64)
+    conn = np.asarray(grid.cell_connectivity, dtype=np.int64)
+    owner = np.repeat(np.arange(grid.n_cells), np.diff(offsets))
+    weight = np.zeros(grid.n_points)
+    total = np.zeros(grid.n_points)
+    np.add.at(weight, conn, vol[owner])
+    np.add.at(total, conn, vol[owner] * np.asarray(values, dtype=float)[owner])
+    out = np.zeros(grid.n_points)
+    np.divide(total, weight, out=out, where=weight > 0)
+    return out
+
+
+def _fea_field(grid, field: str) -> tuple:
+    """Resolve (point field, displacement field or None, source) for an FEA film.
+
+    source is "point" for a solved point field. If the requested von Mises exists only as
+    cell data (a topology reanalysis.vtu written before point stress), it becomes a point
+    field of the same name in `grid` and source is "cell_averaged". A per-case stress
+    (von_mises@<case>) warps only by displacement@<case>; without it there is no warp."""
+    names = list(grid.point_data.keys())
+    cells = list(grid.cell_data.keys())
+    generic = field.lower() in _GENERIC_VON_MISES
+    fld = field if field in names else next(
+        (n for n in names if generic and n.lower() in _GENERIC_VON_MISES), None)
+    source = "point"
+    if fld is None:
+        cell = field if field in cells else next(
+            (n for n in cells if generic and n.lower() in _GENERIC_VON_MISES), None)
+        if cell is not None:
+            grid.point_data[cell] = _cell_to_point_average(grid, grid.cell_data[cell])
+            fld, source = cell, "cell_averaged"
+    if fld is None:
+        per_case = sorted({n for n in names + cells if n.startswith("von_mises@")})
+        hint = (f"Set field to one of {per_case}." if per_case else
+                "Solve with run_fea_static(vtu_path=...) to get one.")
+        raise ValueError(f"no von Mises field '{field}' (point fields: {names or 'none'}; "
+                         f"cell fields: {cells or 'none'}). {hint}")
+    case = fld.partition("@")[2]
+    if case:
+        disp = f"displacement@{case}" if f"displacement@{case}" in names else None
+    else:
+        disp = next((n for n in names if n.lower().startswith("disp")), None)
+    return fld, disp, source
+
+
 def _fea_frames(vtu_path: str, out_dir: str, frames: int, size: tuple, view,
                 warp_mm: Optional[float], field: str) -> dict:
     """Frames of a SOLVED field: von Mises on the warped mesh over the undeformed outline.
@@ -747,18 +808,15 @@ def _fea_frames(vtu_path: str, out_dir: str, frames: int, size: tuple, view,
     real 0.44 mm deflection on a 230 mm post is invisible at true scale); the grey wireframe
     of the UNDEFORMED grid stays behind it, which is what makes the exaggeration honest —
     the viewer sees both states. Returns the measured record (peak field value, peak
-    displacement, node/cell counts, warp factor)."""
+    displacement, node/cell counts, warp factor, field source)."""
     import numpy as np  # noqa: PLC0415
     import pyvista as pv  # noqa: PLC0415
     pv.OFF_SCREEN = True
     grid = pv.read(vtu_path)
-    names = list(grid.point_data.keys())
-    fld = field if field in names else next(
-        (n for n in names if n.lower() in ("von_mises", "vonmises", "von_mises_mpa")), None)
-    if fld is None:
-        raise ValueError(f"{vtu_path}: no von Mises point field (have {names or 'none'}). "
-                         "Solve with run_fea_static(vtu_path=...) to get one.")
-    disp = next((n for n in names if n.lower().startswith("disp")), None)
+    try:
+        fld, disp, source = _fea_field(grid, field)
+    except ValueError as exc:
+        raise ValueError(f"{vtu_path}: {exc}") from None
     vals = np.asarray(grid.point_data[fld], dtype=float)
     peak = float(np.nanmax(vals))
     peak_disp = 0.0
@@ -795,12 +853,16 @@ def _fea_frames(vtu_path: str, out_dir: str, frames: int, size: tuple, view,
         pl.screenshot(png)
         pl.close()
         written.append(png)
-    return {"frames": written, "field": fld, "peak_field": peak, "peak_disp_mm": peak_disp,
-            "warp_factor": factor, "warp_target_mm": target,
-            "n_points": int(grid.n_points), "n_cells": int(grid.n_cells),
-            "model_diag_mm": span,
-            "cell_order": ("tet10" if grid.get_cell(0).n_points == 10 else "tet4")
-            if grid.n_cells else "unknown"}
+    record = {"frames": written, "field": fld, "field_source": source,
+              "displacement_field": disp, "peak_field": peak, "peak_disp_mm": peak_disp,
+              "warp_factor": factor, "warp_target_mm": target,
+              "n_points": int(grid.n_points), "n_cells": int(grid.n_cells),
+              "model_diag_mm": span,
+              "cell_order": ("tet10" if grid.get_cell(0).n_points == 10 else "tet4")
+              if grid.n_cells else "unknown"}
+    if source == "cell_averaged":
+        record["field_note"] = _CELL_AVERAGED_NOTE
+    return record
 
 
 def _keyframe_indices(frame_count: int, count: int,
@@ -945,11 +1007,16 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                             for a pose sequence you computed yourself; no solve is run.
           "fea"       — a solved .vtu: von Mises on the displacement-warped mesh over the
                         grey undeformed outline, warp ramping in. Pass `vtu_path` (from
-                        run_fea_static(vtu_path=...)); no document is needed.
+                        run_fea_static(vtu_path=...)); no document is needed. A topology
+                        reanalysis.vtu also works. For several load cases, set
+                        field='von_mises@<case>'. If the file has the field only as
+                        cell data, the film shows its volume-weighted nodal average and
+                        the result reports field_source='cell_averaged'.
 
-        save_path : REQUIRED absolute path ending .gif or .mp4, inside the project/workspace
-                    root (same containment rule as every render deliverable). A poster PNG
-                    is written beside it as poster_<stem>.png and returned inline.
+        save_path : REQUIRED path ending .gif or .mp4, inside the project/workspace root
+                    (same containment rule as every render deliverable). A relative path is
+                    project-root relative. A poster PNG is written beside it as
+                    poster_<stem>.png and returned inline.
         frames/fps/size : frame COUNT, playback rate, [width, height] px. Duration is
                     frames/fps; a GIF over `max_bytes` (25 MB default) walks fps then width
                     and the caption reports the leg it landed on.
@@ -964,8 +1031,9 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
         display_quality : "draft"|"standard"|"fine" display tessellation for the frames.
         title/subtitle/hold_s : a dark title card held for `hold_s` seconds at the head of
                     the film (2-3 s is a readable hold).
-        frames_dir : optional ABSOLUTE directory the ordered PNG sequence (title card
-                    frames first, then the film) is also written into as f00000.png... —
+        frames_dir : optional directory the ordered PNG sequence (title card frames
+                    first, then the film) is also written into as f00000.png... A relative
+                    path is project-root relative. This is
                     how a MULTI-SEGMENT chapter is composed: render each shot with its own
                     frames_dir, concatenate the directories in order, encode once. Every
                     frame already carries its provenance footer.
@@ -1006,9 +1074,10 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                     "belong to kind='motion' — they would be silently ignored here.")
             if not save_path:
                 raise ValueError(
-                    "render_animation needs save_path — an ABSOLUTE .gif or .mp4 path under "
-                    "your project folder. A film cannot be returned inline; the poster frame "
-                    "is what comes back in the reply.")
+                    "render_animation needs save_path — a .gif or .mp4 path under your "
+                    "project folder (a relative path is project-root relative). A film "
+                    "cannot be returned inline; the poster frame is what comes back in the "
+                    "reply.")
             ext = os.path.splitext(str(save_path).strip())[1].lower()
             if ext not in (".gif", ".mp4"):
                 raise ValueError("save_path must end in .gif or .mp4; got "
@@ -1039,12 +1108,13 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
             doc_name = ""
 
             if kind == "fea":
-                if not vtu_path or not os.path.exists(str(vtu_path)):
+                vtu_file = resolve_agent_path(vtu_path, "vtu_path") if vtu_path else ""
+                if not vtu_file or not os.path.exists(vtu_file):
                     raise ValueError(
                         "render_animation(kind='fea') needs vtu_path — the .vtu a solve "
-                        "wrote (run_fea_static(vtu_path='/abs/path.vtu')). "
-                        f"{vtu_path!r} does not exist.")
-                rec = _fea_frames(str(vtu_path), work, frames, raster_size, view,
+                        "wrote (run_fea_static(vtu_path='results/part.vtu')). A relative "
+                        f"path is project-root relative. {vtu_path!r} does not exist.")
+                rec = _fea_frames(vtu_file, work, frames, raster_size, view,
                                   warp_mm, field)
                 measured = {k: v for k, v in rec.items() if k != "frames"}
                 doc_name = os.path.basename(str(vtu_path))
@@ -1052,7 +1122,10 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                 paths = rec["frames"]
                 for png in paths:
                     raster_sizes.add(_downsample(png, scene_size))
-                foot_right = (f"{measured['field']} peak {measured['peak_field']:.4g} MPa | "
+                averaged = (" (cell avg)" if measured.get("field_source") == "cell_averaged"
+                            else "")
+                foot_right = (f"{measured['field']}{averaged} peak "
+                              f"{measured['peak_field']:.4g} MPa | "
                               f"warp x{measured['warp_factor']:.0f}")
             else:
                 d = _doc(doc_id)

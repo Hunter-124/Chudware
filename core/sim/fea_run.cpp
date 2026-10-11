@@ -75,6 +75,7 @@
 #include "sim/progress.h"
 #include "sim/vtu_writer.h"
 #include "util/resource_governor.h"
+#include "geom/face_normal.h"  // surface_outward_sign — frame handedness + orientation
 #include "version_info.h"  // CMake-configured CHUDWARE_HOSTD_BUILD_ID (engine build id)
 
 using nlohmann::json;
@@ -2666,12 +2667,14 @@ struct CadPreflightFace {
 std::vector<std::array<double, 3>> cad_face_normal_envelope(const TopoDS_Face& face) {
     BRepAdaptor_Surface surface(face);
     std::vector<std::array<double, 3>> normals;
-    const double sign = face.Orientation() == TopAbs_REVERSED ? -1.0 : 1.0;
     if (surface.GetType() == GeomAbs_Plane) {
-        const auto n = surface.Plane().Axis().Direction();
+        const auto pln = surface.Plane();
+        const double sign = chudware::geom::surface_outward_sign(face, pln.Position());
+        const auto n = pln.Axis().Direction();
         normals.push_back({sign * n.X(), sign * n.Y(), sign * n.Z()});
     } else if (surface.GetType() == GeomAbs_Cylinder) {
         const auto frame = surface.Cylinder().Position();
+        const double sign = chudware::geom::surface_outward_sign(face, frame);
         const auto x = frame.XDirection(), y = frame.YDirection();
         const double u0 = surface.FirstUParameter(), u1 = surface.LastUParameter();
         if (!std::isfinite(u0) || !std::isfinite(u1)) return normals;
@@ -2699,8 +2702,16 @@ std::vector<std::array<double, 3>> cad_face_normal_envelope(const TopoDS_Face& f
 // has |n_plane . n_pin| <= (axis-to-plane distance + gap) / radius.
 int cad_face_opposition(const TopoDS_Face& a, const TopoDS_Face& b, double gap) {
     BRepAdaptor_Surface sa(a), sb(b);
-    const double orientation = (a.Orientation() == TopAbs_REVERSED ? -1.0 : 1.0) *
-                               (b.Orientation() == TopAbs_REVERSED ? -1.0 : 1.0);
+    // Outward sign of each face's frame-positive normal (plane Z / cylinder radial):
+    // REVERSED orientation AND a left-handed frame (revolve end faces) each flip it.
+    auto frame_sign = [](const TopoDS_Face& f, const BRepAdaptor_Surface& s) {
+        if (s.GetType() == GeomAbs_Plane)
+            return chudware::geom::surface_outward_sign(f, s.Plane().Position());
+        if (s.GetType() == GeomAbs_Cylinder)
+            return chudware::geom::surface_outward_sign(f, s.Cylinder().Position());
+        return f.Orientation() == TopAbs_REVERSED ? -1.0 : 1.0;
+    };
+    const double orientation = frame_sign(a, sa) * frame_sign(b, sb);
     if (sa.GetType() == GeomAbs_Plane && sb.GetType() == GeomAbs_Plane)
         return orientation * sa.Plane().Axis().Direction().Dot(sb.Plane().Axis().Direction())
                        <= -0.35 ? 1 : 0;

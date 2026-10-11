@@ -11,6 +11,7 @@
 #include "sim/topopt_reanalysis.h"
 #include "sim/topopt_run.h"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -156,6 +157,34 @@ std::size_t children(const fs::path &dir) {
   for ([[maybe_unused]] const auto &e : fs::directory_iterator(dir))
     ++n;
   return n;
+}
+
+// Values of the DataArray `name` inside the <section> (PointData | CellData)
+// of an ASCII VTU; empty when that section has no such array.
+std::vector<double> vtu_section_array(const std::string &xml,
+                                      const std::string &section,
+                                      const std::string &name) {
+  const std::size_t open = xml.find("<" + section);
+  if (open == std::string::npos)
+    return {};
+  const std::size_t close = xml.find("</" + section + ">", open);
+  const std::size_t at = xml.find("Name=\"" + name + "\"", open);
+  if (close == std::string::npos || at == std::string::npos || at > close)
+    return {};
+  const std::size_t body = xml.find('>', at) + 1;
+  const std::size_t end = xml.find("</DataArray>", body);
+  std::istringstream in(xml.substr(body, end - body));
+  std::vector<double> values;
+  for (double v; in >> v;)
+    values.push_back(v);
+  return values;
+}
+
+std::size_t vtu_count(const std::string &xml, const std::string &attribute) {
+  const std::string key = attribute + "=\"";
+  const std::size_t at = xml.find(key);
+  REQUIRE(at != std::string::npos);
+  return std::stoul(xml.substr(at + key.size()));
 }
 
 } // namespace
@@ -356,6 +385,69 @@ TEST_CASE("structural inline run: honest result, consistent evidence, owned "
   CHECK(chudware::util::sha256_hex(
             read_file((run_dir / "result.json").string())) == first_hash);
   CHECK(children(dir) == 2);
+  fs::remove_all(dir);
+}
+
+TEST_CASE("reanalysis.vtu carries a point von Mises field per load case") {
+  // render_animation(kind='fea') and the FEA viewers read a POINT field
+  // von_mises[@case] in MPa; the reanalysis wrote stress only per element.
+  const fs::path dir = scratch_dir("reanalysis_stress");
+  // Few iterations at a high volume fraction keep the thresholded design one
+  // connected solid, so the reanalysis completes (a loose piece has no support).
+  json s = cantilever(dir, 3);
+  s.erase("loads");
+  auto tip = [](const char *name, json vector) {
+    return json{{"name", name},
+                {"weight", 1.0},
+                {"loads", json::array({{{"faces", x_face(kLx)},
+                                        {"type", "force"},
+                                        {"vector", std::move(vector)}}})}};
+  };
+  s["load_cases"] = json::array({tip("LC1_down", {0.0, 0.0, -100.0}),
+                                 tip("LC2_side", {0.0, 100.0, 0.0})});
+  s["topology"]["volume_fraction"] = 0.9;
+  const json r = fea_run_topology(s);
+  INFO(r.value("error", std::string()));
+  REQUIRE(r["ok"].get<bool>());
+  const json &re = r["reconstruction"]["reanalysis"];
+  INFO(re.dump());
+  REQUIRE(re["status"] == "completed");
+  REQUIRE(re["domain"] == "clipped_solid");
+  REQUIRE(r["artifacts"].contains("reanalysis_vtu"));
+  check_artifacts(r, r["result_dir"].get<std::string>());
+  const json &art = r["artifacts"]["reanalysis_vtu"];
+  CHECK(art["point_stress"].is_string());
+  const std::string xml = read_file(art["path"].get<std::string>());
+  const std::size_t points = vtu_count(xml, "NumberOfPoints");
+  const std::size_t cells = vtu_count(xml, "NumberOfCells");
+  CHECK(art["points"].get<std::size_t>() == points);
+  for (const char *c : {"LC1_down", "LC2_side"}) {
+    const std::string name = std::string("von_mises@") + c;
+    INFO(name);
+    const std::vector<double> nodal =
+        vtu_section_array(xml, "PointData", name);
+    const std::vector<double> element =
+        vtu_section_array(xml, "CellData", "element_" + name);
+    REQUIRE(nodal.size() == points);
+    REQUIRE(element.size() == cells);
+    CHECK(vtu_section_array(xml, "PointData", std::string("displacement@") + c)
+              .size() == 3 * points);
+    CHECK(std::all_of(nodal.begin(), nodal.end(),
+                      [](double v) { return std::isfinite(v) && v >= 0.0; }));
+    const double nodal_peak = *std::max_element(nodal.begin(), nodal.end());
+    const double element_peak = *std::max_element(element.begin(), element.end());
+    CHECK(nodal_peak > 0.0);
+    // A volume-weighted nodal average never exceeds the element peak.
+    CHECK(nodal_peak <= element_peak * (1.0 + 1e-12));
+    bool listed = false;
+    for (const json &a : art["arrays"])
+      if (a["name"] == name && a["location"] == "node") {
+        listed = true;
+        CHECK(a["unit"] == "MPa");
+        CHECK(a["components"] == 1);
+      }
+    CHECK(listed);
+  }
   fs::remove_all(dir);
 }
 

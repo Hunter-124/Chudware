@@ -833,3 +833,39 @@ successful MCP `simulate_motion` records its inputs as the document's native Mot
 check_interference, min_clearance}}`, keyed by type+name, so re-sweeping the same joints
 replaces it) and returns it as `motion_study {doc_id, study_id, name, view}`. Only inputs are
 stored; the GUI re-solves them with the same engine `simulate_motion` call to play them.
+
+## 30. `sketch_edit_entity` shape and component source base (append-only, 2026-10-10)
+
+This section replaces the `sketch_edit_entity` row in the Sketch table.
+
+`{op:"sketch_edit_entity", sketch, entity:{id, <fields>}}` is the canonical form. The patch is
+`entity` without `id`. A null value deletes the key. `{sketch, id, params:{<fields>}}` stays
+valid, because `sketch_drag_commit` sends it. The id comes from `id` or from `entity.id`.
+The op refuses with a named `detail.reason` in these cases:
+
+| reason | condition |
+|---|---|
+| `two_patches` | The op has both `entity` and `params`. |
+| `patch_not_object` | The patch is not a JSON object. |
+| `bad_entity_id` | The id is not a string. |
+| `conflicting_entity_id` | `id` and `entity.id` are different. |
+| `missing_entity_id` | The op gives no id. |
+| `unknown_entity` | The sketch has no entity with that id. |
+| `empty_patch` | The patch changes no field. |
+| `type_change` | The patch changes `type`. A `type` equal to the current type is accepted. |
+| `unknown_entity_field` | A key is not a stored key of the entity, not `construction`, and not an optional field of its type. |
+
+An op never returns `ok:true` when it ignored its patch.
+
+A relative component `source.path` resolves against the folder of the assembly file. An
+unsaved assembly resolves against the absolute `project_dir` that `doc_new` received. The
+process working directory is never a base. If no base exists, compile refuses the component
+with `component_source_unresolved`. If the file does not exist, compile refuses with
+`component_source_missing` and names the resolved path and the base. Save rebases paths as
+before. If no base exists, save writes a relative path without change.
+
+`sketch_add_constraint` with `type:"fix"` first writes the solved geometry of every entity
+into its authored coordinates, if the sketch converges. Solved geometry does not change. Thus
+a fix locks the shape that the readback shows. If the sketch does not converge, the authored
+coordinates stay. A sketch that does not converge reports the conflicting constraint ids and,
+for each coincident between fixed points, the authored gap.

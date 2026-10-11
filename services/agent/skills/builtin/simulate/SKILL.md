@@ -167,7 +167,9 @@ writes to the document, so Ask/Plan cannot run it.
    `reconstruction_response` check. Treat `result.manufacturing.checks` rows by status:
    `min_member` is intent only (`not_measured`), and overhang is a heuristic, never
    support-free. Use `density.vtu`, `reanalysis.vtu` and `surface.stl` (only when the
-   geometry is valid) from `artifact_dir`.
+   geometry is valid) from `artifact_dir`. `reanalysis.vtu` has a point field
+   `von_mises[@case]` (MPa). To animate it, use
+   `render_animation(kind='fea', vtu_path=..., field='von_mises@<case>')`.
 6. **Print gate.** `print_ready` stays false. DFAM on the surface is evidence, not
    readiness, and nothing is sliced automatically. For a print claim, run
    `slice_part(path=<surface.stl>, printer=<the user's printer>)` and quote its

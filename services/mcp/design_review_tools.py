@@ -300,8 +300,7 @@ def _call_direct_check(check_name: str, doc_id: Optional[str]) -> dict[str, Any]
 
     elif check_name == "interface_check":
         # T-BL49: interface_check lives in its own module (not a private-MCP module), so call
-        # its implementation directly rather than via battery._get_fn.  Passes iff ok and no
-        # severity=="fail" finding.
+        # its implementation directly rather than via battery._get_fn.
         try:
             from services.mcp.interface_check_tools import run_interface_check as tool_fn
         except ImportError as exc:
@@ -309,13 +308,7 @@ def _call_direct_check(check_name: str, doc_id: Optional[str]) -> dict[str, Any]
         kwargs = {}
         if doc_id:
             kwargs["doc_id"] = doc_id
-
-        def default_pred(r: dict) -> bool:  # type: ignore[misc]
-            fails = [f for f in r.get("findings", [])
-                     if isinstance(f, dict) and f.get("severity") == "fail"]
-            return bool(r.get("ok", False)) and not fails
-
-        return _invoke_tool(check_name, tool_fn, kwargs, default_pred)
+        return _invoke_tool(check_name, tool_fn, kwargs, _interface_check_passed)
 
     else:
         return {"status": "unavailable", "reason": f"unknown direct check: {check_name!r}"}
@@ -326,6 +319,14 @@ def _call_direct_check(check_name: str, doc_id: Optional[str]) -> dict[str, Any]
         return {"status": "unavailable", "reason": f"backend unavailable: {exc}"}
 
     return _invoke_tool(check_name, tool_fn, kwargs, default_pred)
+
+
+def _interface_check_passed(r: dict) -> bool:
+    """interface_check: ok means the check ran; status "fail" is an alignment finding.
+
+    status "skip" (no mating pair to compare) does not fail the review.
+    """
+    return r.get("ok") is True and r.get("status") in ("pass", "skip")
 
 
 def _call_with_override(
@@ -361,6 +362,8 @@ def _call_with_override(
     elif check_name == "dfm":
         def default_pred(r: dict) -> bool:  # type: ignore[misc]
             return bool(r.get("ok", False)) and int(r.get("violations", 1)) == 0
+    elif check_name == "interface_check":
+        default_pred = _interface_check_passed
     else:
         default_pred = lambda r: bool(r.get("ok", True))  # noqa: E731
 

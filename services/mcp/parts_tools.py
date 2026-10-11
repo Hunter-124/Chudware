@@ -735,8 +735,9 @@ def fetch_cad_model_impl(url: str, name: str | None = None,
                         "browser_fetch_failed", "browser_busy", "playwright_not_installed"
                     } else page.get("reason") or "browser_unavailable")
                     return _cad_fail(reason,
-                                     f"No static CAD link at {url}; browser rendering unavailable: "
-                                     f"{page.get('hint') or page.get('detail') or reason}.", links)
+                                     f"No static CAD link at {url}. Browser rendering is unavailable: "
+                                     f"{str(page.get('hint') or page.get('detail') or reason).rstrip('.')}.",
+                                     links)
                 links, license_note = _cad_links(page.get("content") or "", final_url)
             if not links:
                 return _cad_fail("no_cad_link", f"No CAD link on rendered page {url}.", links)

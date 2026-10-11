@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -259,3 +260,152 @@ def test_user_read_only_turns_are_never_nudged(mode_opts):
     frames = [item for i in range(15) for item in tool("web_search", i, seconds=60)]
     _, calls, emitted = run(frames, FakeClock(), **mode_opts)
     assert steers(calls) == nudges(emitted) == []
+
+
+def ping(seconds, at):
+    return (seconds, {"type": "ping", "at": at})
+
+
+def budget_nudges(emitted):
+    return [frame for frame in nudges(emitted) if frame.get("reason") == "turn_budget"]
+
+
+def emitted_before(emitted, frame, at):
+    """True when ``frame`` reached the feed before the ping stamped ``at``."""
+    pings = [index for index, item in enumerate(emitted)
+             if item.get("type") == "ping" and item.get("at") == at]
+    return emitted.index(frame) < pings[0]
+
+
+def test_budgeted_turn_steers_once_three_minutes_before_expiry():
+    frames = [ping(419, 419), ping(1, 420), ping(80, 500), ping(90, 590)]
+    result, calls, emitted = run(frames, FakeClock(), timeout=600)
+    assert result["ok"]
+    assert len(steers(calls)) == len(budget_nudges(emitted)) == 1
+    nudge = budget_nudges(emitted)[0]
+    # Due at 420 s (budget − 180 s): sent with the 420 s frame, not the 419 s one.
+    assert not emitted_before(emitted, nudge, 419) and emitted_before(emitted, nudge, 420)
+    assert steers(calls)[0] == (
+        "⏱ 3 min left of this turn's budget: save every requested deliverable now "
+        "(exact requested paths), then use the remaining time to verify."
+    )
+    kind, status = map_rpc_frame(nudge)[0]
+    assert (kind, status["phase"], status["reason"]) == ("status", "progress_nudge", "turn_budget")
+    assert status["text"] == "Turn budget: 3 min left; save requested deliverables now, then verify."
+    assert (status["budget_s"], status["remaining_s"]) == (600.0, 180.0)
+
+
+def test_short_budget_steers_at_eighty_percent():
+    frames = [ping(47, 47), ping(1, 48), ping(10, 58)]
+    _, calls, emitted = run(frames, FakeClock(), timeout=60)
+    assert len(steers(calls)) == len(budget_nudges(emitted)) == 1
+    nudge = budget_nudges(emitted)[0]
+    assert not emitted_before(emitted, nudge, 47) and emitted_before(emitted, nudge, 48)
+    assert steers(calls)[0].startswith("⏱ 12 s left of this turn's budget")
+
+
+@pytest.mark.parametrize("budget", [{}, {"timeout": None}, {"timeout": 0}, {"timeout": 30}])
+def test_unbudgeted_turns_get_no_budget_steer(budget):
+    frames = [ping(600, 600), ping(9000, 9600)]
+    _, calls, emitted = run(frames, FakeClock(), **budget)
+    assert steers(calls) == budget_nudges(emitted) == []
+
+
+def test_turn_ending_early_never_sends_the_budget_steer():
+    frames = [ping(100, 100)]  # agent_end follows at 100 s
+    _, calls, emitted = run(frames, FakeClock(), timeout=600)
+    assert steers(calls) == budget_nudges(emitted) == []
+
+
+@pytest.mark.parametrize("mode_opts", [{"mode": "ask"}, {"mode": "plan"}, {"plan_only": True}])
+def test_read_only_turns_get_the_budget_steer_without_save(mode_opts):
+    frames = [ping(420, 420)]
+    _, calls, emitted = run(frames, FakeClock(), timeout=600, **mode_opts)
+    assert steers(calls) == [
+        "⏱ 3 min left of this turn's budget: give your final answer now, "
+        "then use the remaining time to check it."
+    ]
+    assert "save" not in steers(calls)[0]
+    assert "save" not in map_rpc_frame(budget_nudges(emitted)[0])[0][1]["text"]
+
+
+def test_budget_steer_does_not_spend_the_research_nudge_cap():
+    frames = [item for i in range(12) for item in tool("web_search", i)]
+    frames += tool("new_part", 50)
+    frames += [item for i in range(12, 24) for item in tool("web_search", i)]
+    frames += [ping(500, 500)]
+    _, calls, emitted = run(frames, FakeClock(), timeout=600)
+    assert len(steers(calls)) == 3
+    assert len(nudges(emitted)) - len(budget_nudges(emitted)) == 2
+    assert len(budget_nudges(emitted)) == 1
+
+
+def recording_timers():
+    timers = []
+
+    class Timer:
+        def __init__(self, interval, function):
+            self.interval, self.function = interval, function
+            self.daemon = False
+            self.started = self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            self.started = True
+
+        def cancel(self):
+            self.cancelled = True
+
+    return timers, Timer
+
+
+def realtime_host(factory, clock):
+    """A host on the real timer path, with a controlled clock and recorded timers."""
+    timers, timer = recording_timers()
+    host = ChudcodeSessionHost(client_factory=factory, clock=clock)
+    host._realtime_watchdog = True
+    host._timer_factory = timer
+    return host, timers
+
+
+def test_realtime_budget_timer_is_scheduled_once_and_cancelled_by_the_terminal():
+    clock, factory = FakeClock(), FakeFactory()
+    host, timers = realtime_host(factory, clock)
+    result = host.run_turn({"request": "Do the work", "session_id": "budget",
+                            "run_id": "budget-run", "timeout": 600}, lambda _frame: None)
+    assert result["ok"]
+    assert len(timers) == 1
+    assert timers[0].started and timers[0].cancelled
+    assert timers[0].interval == 420
+    clock.now = 420
+    timers[0].function()  # a timer racing past the end of the turn sends nothing
+    assert steers(factory.clients[0].calls) == []
+
+
+def test_realtime_budget_timer_steers_through_the_control_lane():
+    clock = FakeClock()
+
+    class FiresMidTurn(FakeClient):
+        def wait_for_idle(self, timeout=None):
+            clock.now = timers[0].interval
+            timers[0].function()
+            for _ in range(200):  # the steer runs on its own thread, as in production
+                if steers(self.calls):
+                    break
+                time.sleep(0.01)
+            return super().wait_for_idle(timeout)
+
+    class Factory(FakeFactory):
+        def __call__(self, **kwargs):
+            client = FiresMidTurn(self, **kwargs)
+            self.clients.append(client)
+            return client
+
+    factory = Factory()
+    host, timers = realtime_host(factory, clock)
+    emitted = []
+    result = host.run_turn({"request": "Do the work", "session_id": "budget",
+                            "run_id": "budget-run", "timeout": 600}, emitted.append)
+    assert result["ok"]
+    assert len(steers(factory.clients[0].calls)) == len(budget_nudges(emitted)) == 1
+    assert steers(factory.clients[0].calls)[0].startswith("⏱ 3 min left of this turn's budget")

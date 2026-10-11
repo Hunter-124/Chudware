@@ -200,7 +200,7 @@ step:
   the x64-only matrix (which also list Linux ARM/macOS ARM) still verify. The
   global `check-lock` publication gate requires exactly the three supported
   targets: Linux x86_64, macOS x86_64 and Windows x86_64. The committed lock
-  pins the `v0.4.1` runtime (Windows unpinned).
+  pins the `v0.4.3` runtime (Windows pinned from the native CAD build).
 
 Rollback restores an already-built tree and never touches PostgreSQL. A
 promotion whose schema migration is not backward compatible is therefore not

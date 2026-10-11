@@ -7,16 +7,27 @@ degrades to an ``ok: false`` envelope rather than raising.
 Methods:
 
   subagent_list       {limit?, session_id?, project_dir?} -> {ok, sessions}
-  subagent_transcript {subagent_id, limit?, raw?}        -> {ok, session,
+  subagent_transcript {subagent_id, limit?, raw?, scope?} -> {ok, session,
                                                              messages,
                                                              pending_steers}
-  subagent_steer      {subagent_id, text}                -> {ok, queued, note}
-  subagent_terminate  {subagent_id, confirm}             -> {ok,
+  subagent_steer      {subagent_id, text, scope?}        -> {ok, queued, note}
+  subagent_terminate  {subagent_id, confirm, scope?}     -> {ok,
                                                              terminate_requested}
-  subagent_control    {subagent_id, op, ...}             -> {ok, note,
+  subagent_control    {subagent_id, op, ..., scope?}     -> {ok, note,
                                                              session_status,
                                                              paused,
                                                              *_override}
+
+``scope`` is the optional ``project_dir`` and ``session_id`` pair.  Each one
+the caller sends narrows the request: ``project_dir`` must equal the record's
+owning project after ``expanduser``/``realpath``/``normcase``, and
+``session_id`` must equal the record's owning chat session.  A record without
+the requested ownership never matches, and a blank requested value matches
+nothing (it never widens to "any").  ``subagent_list`` returns the
+intersection of both filters, newest first, with ``limit`` applied after
+filtering.  The detail and control methods check scope before any transcript
+read or registry write and refuse a mismatch with ``_OUT_OF_SCOPE_REASON`` and
+no record metadata.  Callers that send neither key keep the unscoped behavior.
 
 Steering queues a message for the sub-agent's next turn boundary; it does not
 interrupt an in-flight completion.  A steer sent to a finished session remains
@@ -24,7 +35,59 @@ pending and the response includes the session status so the GUI can say so.
 """
 from __future__ import annotations
 
+import os
 from typing import Callable
+
+_OUT_OF_SCOPE_REASON = "Sub-agent is outside the requested scope."
+_UNLIMITED = 2_147_483_647
+
+
+def _canonical_project(value: object) -> str:
+    """Comparable project key (registry stores ``realpath(expanduser(dir))``)."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return os.path.normcase(os.path.realpath(os.path.expanduser(text)))
+
+
+def _requested_scope(request: dict) -> tuple[str | None, str | None]:
+    """Return ``(project, session)`` filters.
+
+    ``None`` means the caller did not scope on that key; ``""`` means it did
+    with a blank value, which matches no record.
+    """
+    project = request.get("project_dir")
+    session = request.get("session_id")
+    return (
+        None if project is None else _canonical_project(project),
+        None if session is None else str(session).strip(),
+    )
+
+
+def _in_scope(meta: dict, project: str | None, session: str | None) -> bool:
+    if project is not None:
+        owner_project = _canonical_project(meta.get("project_dir"))
+        if not project or not owner_project or owner_project != project:
+            return False
+    if session is not None:
+        owner_session = str(meta.get("session_id") or "").strip()
+        if not session or not owner_session or owner_session != session:
+            return False
+    return True
+
+
+def _scoped_session(reg, request: dict, sid: str) -> tuple[dict | None, dict | None]:
+    """Look up *sid* and enforce the request scope before any other access.
+
+    Returns ``(session, None)`` when the caller may act on it, otherwise
+    ``(None, refusal)``.
+    """
+    session = reg.get_session(sid)
+    if session is None:
+        return None, {"ok": False, "reason": f"unknown subagent {sid!r}"}
+    if not _in_scope(session, *_requested_scope(request)):
+        return None, {"ok": False, "reason": _OUT_OF_SCOPE_REASON}
+    return session, None
 
 
 def _subagent_list(params: dict, _emit: Callable) -> dict:
@@ -33,16 +96,22 @@ def _subagent_list(params: dict, _emit: Callable) -> dict:
         request = params or {}
         reg.note_controller("gui")
         limit = int(request.get("limit", 50))
-        session_id = str(request.get("session_id", "")).strip()
+        project, session_id = _requested_scope(request)
+        if project == "" or session_id == "":
+            return {"ok": True, "sessions": []}
+        # The registry prefilter skips foreign records' transcript counts; the
+        # shared predicate then applies the same rule the detail methods use.
         sessions = reg.list_sessions(
-            limit=2_147_483_647 if session_id else limit,
-            project_dir=request.get("project_dir"),
+            limit=_UNLIMITED,
+            project_dir=(
+                None if project is None
+                else str(request.get("project_dir")).strip()
+            ),
         )
-        if session_id:
-            sessions = [
-                session for session in sessions
-                if str(session.get("session_id", "")) == session_id
-            ][:max(1, limit)]
+        sessions = [
+            session for session in sessions
+            if _in_scope(session, project, session_id)
+        ][:max(1, limit)]
         return {"ok": True, "sessions": sessions}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"subagent_list failed: {exc}"}
@@ -55,9 +124,9 @@ def _subagent_transcript(params: dict, _emit: Callable) -> dict:
         sid = request.get("subagent_id", "")
         if not sid:
             return {"ok": False, "reason": "subagent_id is required"}
-        session = reg.get_session(sid)
-        if session is None:
-            return {"ok": False, "reason": f"unknown subagent {sid!r}"}
+        session, refusal = _scoped_session(reg, request, sid)
+        if refusal is not None:
+            return refusal
         limit = int(request.get("limit", 200))
         raw = bool(request.get("raw", False))
         messages = (
@@ -78,15 +147,16 @@ def _subagent_transcript(params: dict, _emit: Callable) -> dict:
 def _subagent_steer(params: dict, _emit: Callable) -> dict:
     try:
         from services.agent import subagent_registry as reg
-        sid = (params or {}).get("subagent_id", "")
-        text = (params or {}).get("text", "")
+        request = params or {}
+        sid = request.get("subagent_id", "")
+        text = request.get("text", "")
         if not sid:
             return {"ok": False, "reason": "subagent_id is required"}
         if not str(text).strip():
             return {"ok": False, "reason": "steer text must be non-empty"}
-        session = reg.get_session(sid)
-        if session is None:
-            return {"ok": False, "reason": f"unknown subagent {sid!r}"}
+        session, refusal = _scoped_session(reg, request, sid)
+        if refusal is not None:
+            return refusal
         rec = reg.queue_steer(sid, text, source="user")
         # Mirror the steer into the transcript immediately so the viewer shows it
         # (tagged queued; the runner logs consumption when it lands).
@@ -106,16 +176,17 @@ def _subagent_steer(params: dict, _emit: Callable) -> dict:
 def _subagent_terminate(params: dict, _emit: Callable) -> dict:
     try:
         from services.agent import subagent_registry as reg
-        sid = (params or {}).get("subagent_id", "")
+        request = params or {}
+        sid = request.get("subagent_id", "")
         if not sid:
             return {"ok": False, "reason": "subagent_id is required"}
-        if not bool((params or {}).get("confirm", False)):
+        if not bool(request.get("confirm", False)):
             # M16: ending a sub-agent chat must never be an easy accident.
             return {"ok": False, "reason": "terminate requires confirm=true",
                     "requires_confirm": True}
-        session = reg.get_session(sid)
-        if session is None:
-            return {"ok": False, "reason": f"unknown subagent {sid!r}"}
+        session, refusal = _scoped_session(reg, request, sid)
+        if refusal is not None:
+            return refusal
         if not reg.request_terminate(sid):
             return {"ok": False, "reason": "terminate flag could not be set"}
         reg.append_transcript(sid, "system",
@@ -143,9 +214,9 @@ def _subagent_control(params: dict, _emit: Callable) -> dict:
                 "ok": False,
                 "reason": "op must be one of: " + ", ".join(valid_ops),
             }
-        session = reg.get_session(sid)
-        if session is None:
-            return {"ok": False, "reason": f"unknown subagent {sid!r}"}
+        session, refusal = _scoped_session(reg, request, sid)
+        if refusal is not None:
+            return refusal
 
         note = ""
         if op == "pause":

@@ -341,6 +341,22 @@ class TestHeuristics(unittest.TestCase):
                          ["minimal", "low", "medium", "high"])
         self.assertEqual(mc.reasoning_efforts_for("gemini", "gemini-2.0-flash"), [])
 
+    def test_haiku55_capabilities_for_subscription_and_router_ids(self):
+        for provider, model in (
+            ("anthropic-sub", "claude-haiku-5-5"),
+            ("openrouter", "anthropic/claude-haiku-5.5"),
+        ):
+            with self.subTest(provider=provider, model=model):
+                row = mc.resolve_capabilities(provider, model, models_dev={})
+                self.assertEqual(row["id"], model)
+                self.assertEqual(row["label"], "Claude Haiku 5.5")
+                self.assertEqual(row["context"], 1000000)
+                self.assertEqual(row["max_output"], 128000)
+                self.assertTrue(row["vision"])
+                self.assertTrue(row["tools"])
+                self.assertEqual(row["reasoning_efforts"],
+                                 ["low", "medium", "high", "xhigh", "max"])
+
 
 class TestReasoningEffortLadders(unittest.TestCase):
     """The fallback ladder must not offer a rung that the active family rejects."""
@@ -426,6 +442,41 @@ class TestConfigConsumesCatalog(unittest.TestCase):
         self.assertFalse(prov.supports_vision)
         self.assertEqual(getattr(prov, "context_window", None), 64000)
         self.assertEqual(getattr(prov, "catalog_auto_source", None), "user")
+
+
+class TestAnthropicRequestCompatibility(unittest.TestCase):
+    def test_haiku55_sends_every_effort_with_adaptive_thinking_and_no_sampling(self):
+        from types import SimpleNamespace
+        from services.agent.providers import base
+        from services.agent.providers.anthropic_provider import AnthropicProvider
+
+        captured = {}
+
+        def create(**kwargs):
+            captured.clear()
+            captured.update(kwargs)
+            return SimpleNamespace(content=[
+                SimpleNamespace(type="thinking", thinking="", signature="signed"),
+                SimpleNamespace(type="text", text="first"),
+                SimpleNamespace(type="text", text=" second"),
+            ])
+
+        client = SimpleNamespace(messages=SimpleNamespace(create=create))
+        sdk = SimpleNamespace(Anthropic=lambda **kwargs: client)
+        for effort in mc.reasoning_efforts_for("anthropic", "claude-haiku-5-5"):
+            with self.subTest(effort=effort), patch.dict("sys.modules", {"anthropic": sdk}):
+                provider = AnthropicProvider(
+                    api_key="test", model="claude-haiku-5-5", reasoning_effort=effort)
+                text, thinking = provider.complete_ex(
+                    "system", [base.user([base.text_part("hello")])], max_tokens=128000)
+                self.assertEqual(text, "first second")
+                self.assertEqual(thinking, "")
+                self.assertEqual(captured["model"], "claude-haiku-5-5")
+                self.assertEqual(captured["max_tokens"], 128000)
+                self.assertEqual(captured["thinking"], {"type": "adaptive"})
+                self.assertEqual(captured["output_config"], {"effort": effort})
+                for field in ("temperature", "top_p", "top_k", "budget_tokens"):
+                    self.assertNotIn(field, captured)
 
 
 if __name__ == "__main__":

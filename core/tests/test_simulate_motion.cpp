@@ -737,3 +737,58 @@ TEST_CASE("doc_simulate_motion: classification keeps overlap and exact unsafe cl
     CHECK(after.at("tree") == before.at("tree"));
     fs::remove(path);
 }
+
+TEST_CASE("doc_simulate_motion: one drive transmits gear rotation in both directions") {
+    const auto path = make_box_step("gear_transmission");
+    const auto did = doc::doc_new("assembly", "gear_transmission").at("doc_id").get<std::string>();
+    const auto inserted = doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"fixed", true},
+         {"source", {{"path", path.string()}}}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}},
+         {"transform", {1,0,0,40, 0,1,0,0, 0,0,1,0, 0,0,0,1}}}
+    }), false);
+    const auto ids = inserted.at("id_map");
+    const auto a = ids.at("$0").get<std::string>();
+    const auto b = ids.at("$1").get<std::string>();
+    const auto c = ids.at("$2").get<std::string>();
+    const json selector = {{"kind", "face"}, {"centroid", {5,5,10}}};
+    auto ref = [&](const std::string& component) {
+        return json{{"component", component}, {"selector", selector}};
+    };
+    const auto added = doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "angle"}, {"refs", {ref(a), ref(b)}},
+            {"value", {{"value", 0}, {"axis", {0,0,1}}, {"axis_point", {5,5,10}}}}
+        }}},
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "hinge"}, {"refs", {ref(a), ref(c)}},
+            {"value", {{"axis", {0,0,1}}, {"axis_point", {45,5,10}}}}
+        }}},
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "gear"}, {"align", "aligned"}, {"refs", {ref(b), ref(c)}},
+            {"value", {{"ratio", 1}}}
+        }}}
+    }), false);
+    REQUIRE(added.at("rebuild").at("converged").get<bool>());
+    const auto drive = added.at("id_map").at("$0").get<std::string>();
+    for (const auto& range : std::array<std::array<double,2>,2>{{{{0,30}},{{30,0}}}}) {
+        const auto result = doc::doc_simulate_motion(did, drive, range[0], range[1], 7, false, 0);
+        REQUIRE(result.value("ok", false));
+        REQUIRE(result.at("trajectory").size() == 7);
+        for (const auto& frame : result.at("trajectory")) {
+            REQUIRE(frame.at("converged").get<bool>());
+            const double expected = frame.at("value").get<double>() * std::acos(-1.0) / 180.0;
+            for (const auto& body : frame.at("bodies")) {
+                const auto component = body.at("component").get<std::string>();
+                if (component != b && component != c) continue;
+                const auto& transform = body.at("transform");
+                const double angle = std::atan2(transform.at(1).get<double>(),
+                                                transform.at(0).get<double>());
+                CHECK(angle == doctest::Approx(component == b ? expected : -expected).epsilon(1e-7));
+            }
+        }
+    }
+    doc::doc_close(did);
+    fs::remove(path);
+}

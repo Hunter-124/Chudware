@@ -92,7 +92,8 @@ def test_dispatch_table_entries_are_3_tuples():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("check_type,tool_result", [
-    ("interference", _tool_ok(interferences=[], clearances=[{"a": "b1", "b": "b2", "distance": 5.0}])),
+    ("interference", _tool_ok(clear=True, interferences=[],
+                              clearances=[{"a": "b1", "b": "b2", "distance": 5.0}])),
     ("erc",          _tool_ok(errors=0, warnings=2, violations=[])),
     ("drc",          _tool_ok(errors=0, warnings=0, violations=[])),
     ("firmware",     _tool_ok(passed=True, assertions=[], elapsed_ms=120)),
@@ -115,7 +116,8 @@ def test_verify_pass(check_type, tool_result):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("check_type,tool_result", [
-    ("interference", _tool_ok(interferences=[{"a": "b1", "b": "b2", "volume": 0.5}])),
+    ("interference", _tool_ok(clear=False, interferences=[{"a": "b1", "b": "b2", "volume": 0.5}])),
+    ("interference", _tool_ok(interferences=[])),  # no clear verdict: fail closed
     ("erc",          _tool_ok(errors=2, warnings=0)),
     ("drc",          _tool_ok(errors=1, warnings=3)),
     ("firmware",     _tool_ok(passed=False, assertions=["assert GPIO_PIN == 3"])),
@@ -136,7 +138,7 @@ def test_verify_fail_with_budget_gives_retry(check_type, tool_result):
 def test_verify_fail_budget_exhausted_gives_escalate():
     node = _node("interference")
     pack = _pack(node, retry_remaining=1)
-    tool_result = _tool_ok(interferences=[{"a": "b1", "b": "b2", "volume": 0.5}])
+    tool_result = _tool_ok(clear=False, interferences=[{"a": "b1", "b": "b2", "volume": 0.5}])
     verdict, out = verify_run(node, pack, tool_fn_override=lambda **_: tool_result)
     assert verdict == VERDICT_ESCALATE
     assert out["status"] == "failed"
@@ -263,7 +265,7 @@ def test_events_emitted_on_pass():
 
     verify_run(node, pack,
                emit=emit,
-               tool_fn_override=lambda **_: _tool_ok(interferences=[]))
+               tool_fn_override=lambda **_: _tool_ok(clear=True, interferences=[]))
 
     types = [e for e, _ in events]
     assert "dag.node.started" in types

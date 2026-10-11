@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from services.agent.chudcode_events import cad_result_payload
+from services.agent.online_turn import format_duration
 from services.mcp.tool_registry import RISK_READ, catalog, classify_risk
 
 _DEFAULT_RESEARCH_CALLS = 12
@@ -238,3 +239,60 @@ class ProgressWatchdog:
                 classify_risk(name) != RISK_READ and _succeeded(inner)):
             self._mark_progress()
         return self.due()
+
+
+# The one pre-expiry reminder of an explicitly budgeted turn leaves the agent the larger
+# of 20% of the budget and three minutes to save and verify. A budget too short for that
+# gets the reminder at 80%; none fires within 30 s of the start.
+_BUDGET_REMINDER_LEAD_SECONDS = 180.0
+_BUDGET_REMINDER_FRACTION = 0.8
+_BUDGET_REMINDER_MIN_OFFSET_SECONDS = 30.0
+
+
+def budget_reminder_offset(budget_s: float | None) -> float | None:
+    """Seconds after turn start for the pre-expiry reminder, or ``None`` for no reminder."""
+    if budget_s is None or not budget_s > 0:
+        return None
+    late = _BUDGET_REMINDER_FRACTION * budget_s
+    offset = min(late, budget_s - _BUDGET_REMINDER_LEAD_SECONDS)
+    if offset <= _BUDGET_REMINDER_MIN_OFFSET_SECONDS:
+        offset = late
+    return offset if offset > _BUDGET_REMINDER_MIN_OFFSET_SECONDS else None
+
+
+class TurnBudgetReminder:
+    """The single pre-expiry steer of a turn whose caller sent a positive ``timeout``.
+
+    It is about wall-clock, not research stalls, so it is independent of
+    ``ProgressWatchdog``: it never consumes the two research nudges per turn and it also
+    fires in Ask/Plan turns, phrased without "save" because they cannot mutate. Like the
+    watchdog, ``due`` is called under the host's per-turn lock with an injectable clock.
+    """
+
+    def __init__(self, budget_s: float, clock: Callable[[], float] = time.monotonic,
+                 *, readonly: bool = False):
+        self.clock = clock
+        self.budget_s = budget_s
+        self.readonly = readonly
+        self.started = clock()
+        offset = budget_reminder_offset(budget_s)
+        self._deadline = None if offset is None else self.started + offset
+        self.fired = False
+
+    def deadline(self) -> float | None:
+        return None if self.fired else self._deadline
+
+    def remaining(self) -> float:
+        return max(0.0, self.started + self.budget_s - self.clock())
+
+    def due(self) -> str | None:
+        deadline = self.deadline()
+        if deadline is None or self.clock() < deadline:
+            return None
+        self.fired = True
+        left = format_duration(self.remaining())
+        if self.readonly:
+            return (f"⏱ {left} left of this turn's budget: give your final answer now, "
+                    "then use the remaining time to check it.")
+        return (f"⏱ {left} left of this turn's budget: save every requested deliverable "
+                "now (exact requested paths), then use the remaining time to verify.")

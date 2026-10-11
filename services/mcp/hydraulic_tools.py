@@ -421,13 +421,44 @@ def compact_simulation(res: dict, max_points: int = _SERIES_MAX_POINTS) -> dict:
     return out
 
 
+def _series_root() -> str:
+    """The bound project root series files live under ('' when no project is bound)."""
+    return os.environ.get("CHUDWARE_PROJECT_SAVE_DIR", "").strip() or _project_dir() or ""
+
+
 def _series_dir() -> str:
     """``<project>/.chudware/hydraulic`` when a project is bound, else the temp dir."""
-    root = os.environ.get("CHUDWARE_PROJECT_SAVE_DIR", "").strip() or _project_dir()
+    root = _series_root()
     base = (os.path.join(root, ".chudware", "hydraulic") if root
             else os.path.join(tempfile.gettempdir(), "chudware-hydraulic"))
     os.makedirs(base, exist_ok=True)
     return base
+
+
+def portable_series_path(path: str) -> str:
+    """The ``series_path`` a STUDY stores: project-relative (POSIX) when the file sits under
+    the bound project, so a moved or copied project keeps its full-resolution run; an
+    out-of-project (temp) file stays absolute."""
+    root = _series_root()
+    if not root or not path:
+        return path
+    try:
+        rel = os.path.relpath(os.path.realpath(path), os.path.realpath(root))
+    except ValueError:  # different drive on Windows
+        return path
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+        return path
+    return rel.replace(os.sep, "/")
+
+
+def resolve_series_path(stored: Any) -> Any:
+    """A study's stored ``series_path`` as an absolute path against the bound project root."""
+    if not isinstance(stored, str) or not stored or os.path.isabs(stored):
+        return stored
+    root = _series_root()
+    return os.path.normpath(os.path.join(root, stored)) if root else stored
+
+
 
 
 def write_series(res: dict, name: str) -> "tuple[Optional[str], Optional[str]]":
@@ -1301,8 +1332,17 @@ def register_hydraulic_tools(mcp) -> None:
             "hydraulic_bom() once every component is sourced",
         ]
         if target:
+            # max_points sizes the REPLY only; the study keeps the standard compaction so a
+            # terse call (max_points=20) never decimates the saved run below what reviewers
+            # and the GUI plot read.
+            series_keys = ("time_s", "nodes", "components", "downsampled")
+            stored = {**_body(out),
+                      **{k: v for k, v in compact_simulation(res, _SERIES_MAX_POINTS).items()
+                         if k in series_keys}}
+            if path:
+                stored["series_path"] = portable_series_path(path)
             out.update(_persist_circuit(target, name, circuit, params=setup,
-                                        results={"simulate": _body(out)}))
+                                        results={"simulate": stored}))
         return _dumps(out)
 
     @mcp.tool()
@@ -1436,7 +1476,10 @@ def register_hydraulic_tools(mcp) -> None:
                 circuits=names))
         circuit = _restore_circuit(st)
         params = st.get("params") or {}
-        results = st.get("results") or {}
+        results = dict(st.get("results") or {})
+        if isinstance(results.get("simulate"), dict) and results["simulate"].get("series_path"):
+            results["simulate"] = {**results["simulate"], "series_path":
+                                   resolve_series_path(results["simulate"]["series_path"])}
         cname = st.get("name") or _circuit_name(circuit)
         setup = {k: params.get(k) for k in ("valve_schedule", "loads", "fluid", "initial",
                                             "duration_s", "output_dt_s", "max_step_s")

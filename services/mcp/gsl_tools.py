@@ -29,6 +29,7 @@ from services.mcp import core_bridge as cb
 from services.mcp.cad_common import (_NON_BODY_FEATURE_TYPES, _face_attribution,
                                    _solid_feature_order, coerce_json_or_repr,
                                    placement_source_of, placement_warnings, require_list)
+from services.mcp.cad_asm_tools import resolve_component_source
 from services.mcp.cad_tools import _doc, _dumps, _err
 from services.mcp.fit_narration import _format_fit  # single home (T-F8); loop.py shares it
 
@@ -1143,6 +1144,30 @@ def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str
 # ================================================================ narration helpers (T-F8)
 
 
+def _component_sources(doc_id: str) -> tuple:
+    """(base, rows) for an assembly's components; rows give the stored and resolved source.
+
+    Each row is {id, name, source, source_resolved}. `source` is the stored object exactly as
+    the document persists it. `source_resolved` is the absolute file the engine opens: the
+    stored path joined to `base` (the assembly file's folder, else the project folder of an
+    unsaved assembly). It is None when a relative path has no base. A new assembly resolves
+    relative paths against its own base, so callers reuse `source_resolved` (2026-10-10:
+    `parts/redesign/claw_base.step+` copied into a new assembly opened under hostd's cwd)."""
+    tree_r = cb.call("doc_tree", {"doc_id": doc_id}) or {}
+    base = tree_r.get("component_source_base")
+    base = base if isinstance(base, str) and base else None
+    rows = []
+    for comp in (tree_r.get("tree") or {}).get("components") or []:
+        if not isinstance(comp, dict):
+            continue
+        source = comp.get("source") if isinstance(comp.get("source"), dict) else {}
+        stored = source.get("path")
+        rows.append({"id": comp.get("id"), "name": comp.get("name"), "source": source,
+                     "source_resolved": (resolve_component_source(stored, base)
+                                         if isinstance(stored, str) and stored else None)})
+    return base, rows
+
+
 def _describe_assembly_text(doc_id: str) -> str:
     """Narrate world placement, the mate-solve verdict, and collision-only fit.
 
@@ -1200,6 +1225,22 @@ def _describe_assembly_text(doc_id: str) -> str:
         psrc_txt = f", placed by {psrc}" if psrc else ""
         lines.append(f"  {name}: {size_txt}, {origin_txt}{psrc_txt}  "
                      f"(source: asm_world_bodies)")
+
+    # 2b. Component sources: the stored path and the absolute file the engine opens.
+    components: list = []
+    source_base = None
+    if not is_multi:
+        source_base, components = _component_sources(doc_id)
+        unresolved = [c for c in components
+                      if c["source_resolved"] is None and c["source"].get("path")]
+        if components:
+            lines.append(f"\nComponent sources: relative paths resolve against "
+                         f"{source_base or 'no folder (no file and no project folder)'}. "
+                         "To insert the same file into another assembly, use "
+                         "components[].source_resolved as source.path.")
+        for c in unresolved:
+            lines.append(f"  WARNING {c['name'] or c['id']}: the relative source "
+                         f"{c['source']['path']!r} has no base folder. Give an absolute path.")
 
     # 3. Solve/DOF summary, including solved-pose freedom beside mechanism mobility.
     try:
@@ -1273,6 +1314,7 @@ def _describe_assembly_text(doc_id: str) -> str:
     lines.append("\n(Source: asm_world_bodies pre-solve placement snapshot; doc_solve_mates "
                  "live solve; eval_interference live threshold classification and overlap volumes)")
     return _dumps({"ok": complete, "text": "\n".join(lines), "bodies": bodies,
+                   "components": components, "component_source_base": source_base,
                    "fit": if_r,
                    "collision_free": complete and checked > 0 and if_r.get("ok") is True
                    and not if_r.get("interferences")})
@@ -2299,6 +2341,11 @@ def register_gsl_tools(mcp: FastMCP) -> None:
         reported. Returns raw fit completeness, pair coverage and failures; no-pair or
         incomplete results cannot qualify collision-free. Works on assembly docs and
         multi-body parts. To re-seat components after edits, use solve_mates.
+
+        On an assembly, `components` lists each component with its stored `source` and
+        `source_resolved`, the absolute path of the file the engine opens. A relative stored
+        path is relative to `component_source_base`. To insert the same file into another
+        assembly, use `source_resolved` as `source.path`.
         """
         try:
             return _describe_assembly_text(_doc(doc_id))

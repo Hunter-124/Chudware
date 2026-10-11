@@ -191,13 +191,13 @@ def test_fs_read_raw_is_byte_verbatim(tmp_path, monkeypatch, source):
 
     for start in range(1, len(physical) + 1):
         win = t["fs_read"](str(p), offset=start, limit=2, raw=True)
-        assert win["text"].split("… [truncated")[0] == "".join(physical[start - 1:start + 1])
+        assert win["text"] == "".join(physical[start - 1:start + 1])
         assert t["fs_read"](f"{p}:{start}-{start}:raw")["text"] == physical[start - 1]
 
 
 def test_fs_read_raw_pages_reassemble_exact_file(tmp_path, monkeypatch):
-    """Paging a raw read with next_offset reassembles the exact file: the truncation footer
-    is appended after the last shown line's own terminator, never in place of it."""
+    """Paging a raw read with next_offset reassembles the exact file: raw text carries no
+    footer, so each page ends on the last shown line's own terminator."""
     monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
     t = _tools()
     p = tmp_path / "big.txt"
@@ -207,14 +207,54 @@ def test_fs_read_raw_pages_reassemble_exact_file(tmp_path, monkeypatch):
     while True:
         r = t["fs_read"](str(p), offset=offset, limit=7, raw=True)
         assert r["ok"] and r["total_lines"] == 30
+        got.append(r["text"])
         if "next_offset" not in r:
-            got.append(r["text"])
             break
-        body, footer = r["text"].split("… [truncated")
-        assert body.endswith("\r\n") and f"offset={r['next_offset']}" in footer
-        got.append(body)
+        assert r["text"].endswith("\r\n")
         offset = r["next_offset"]
     assert "".join(got) == source
+
+
+@pytest.mark.parametrize("pretty", [False, True])
+def test_fs_read_large_json_pages_parse_after_join(tmp_path, monkeypatch, pretty):
+    """c250: a raw read of a one-line 100+ KB result.json came back as one string cut
+    mid-JSON by the host-tool result cap, and json.loads failed. A page now fits the
+    cap as JSON, says it is a page, and byte_offset pages rejoin to the exact file."""
+    from services.agent.chudcode_tools import _RESULT_TEXT_BYTES, host_tool_result
+
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    t = _tools()
+    data = {"summary": {"ok": True}, "rows": [
+        {"i": i, "name": f"élément \"{i}\"\t", "v": [i * 0.5] * 6} for i in range(2500)]}
+    source = json.dumps(data, indent=1 if pretty else None, ensure_ascii=False)
+    p = tmp_path / "result.json"
+    p.write_text(source, encoding="utf-8")
+    total = len(source.encode("utf-8"))
+    assert total > 3 * _RESULT_TEXT_BYTES
+
+    got, at, pages = [], 0, 0
+    while True:
+        r = t["fs_read"](str(p), byte_offset=at)
+        envelope = host_tool_result(r, spill=lambda _v: pytest.fail("page was cut"))
+        assert len(envelope["content"][0]["text"].encode("utf-8")) <= _RESULT_TEXT_BYTES
+        assert "_truncated" not in envelope["details"]
+        assert r["ok"] and r["byte_offset"] == at and r["total_bytes"] == total
+        assert r["bytes"] == len(r["text"].encode("utf-8"))
+        got.append(r["text"])
+        pages += 1
+        if not r["truncated"]:
+            assert "next_byte_offset" not in r
+            break
+        assert r["next_byte_offset"] == at + r["bytes"]
+        assert pretty == ("next_offset" in r)  # one-line JSON can only page by bytes
+        at = r["next_byte_offset"]
+    assert pages > 1
+    assert json.loads("".join(got)) == data
+
+    # The c250 call shape: one raw line larger than a page is split, never dumped whole.
+    first = t["fs_read"](str(p), raw=True, limit=1)
+    assert first["truncated"] and first["next_byte_offset"] == first["bytes"] < total
+    assert t["fs_read"](str(p), byte_offset=total + 1)["reason"] == "byte_offset_out_of_range"
 
 
 def test_fs_read_offset_limit():

@@ -621,7 +621,7 @@ class HostToolDispatchTests(unittest.TestCase):
     def test_model_selectors_preserve_omission_but_ledger_keeps_run_context(self):
         from mcp.server.fastmcp import FastMCP
         from services.agent import ledger, workspace
-        from services.mcp import tool_registry
+        from services.mcp import core_bridge, tool_registry
         from services.mcp.ledger_tools import register_ledger_tools
         from services.mcp.workspace_tools import register_workspace_tools
 
@@ -639,14 +639,47 @@ class HostToolDispatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root, mock.patch.object(
             ledger, "cache_root", return_value=Path(root)
         ), mock.patch.dict(workspace._session_registry, {}, clear=True):
-            empty = call("workspace_status", {})
-            self.assertTrue(empty["ok"])
-            self.assertEqual(empty["run_id"], "")
-            self.assertEqual(empty["docs"], [])
-            unknown = call("workspace_status", {"run_id": "not-a-workspace"})
+            # c237/c239: a GUI chat turn registers no multi-doc session. The
+            # omitted run_id stays omitted and the snapshot shows the real
+            # workspace: the turn's project and the documents open in the engine.
+            project = Path(root) / "project"
+            project.mkdir()
+            rows = [
+                {"doc_id": "doc-in", "name": "arm", "path": str(project / "arm.step+")},
+                {"doc_id": "doc-out", "name": "ref", "path": str(Path(root) / "ref.step+")},
+                {"doc_id": "doc-new", "name": "Part1", "path": ""},
+            ]
+
+            def engine(method, params=None):
+                self.assertEqual(method, "doc_list")
+                return {"docs": rows}
+
+            with mock.patch.dict(
+                "os.environ", {"CHUDWARE_PROJECT_DIR": str(project)}
+            ), mock.patch.object(core_bridge, "call", engine):
+                turn = call("workspace_status", {})
+            self.assertTrue(turn["ok"], turn)
+            self.assertEqual(turn["scope"], "turn")
+            self.assertEqual(turn["run_id"], "")
+            self.assertEqual(turn["project_dir"], str(project))
+            self.assertEqual(
+                {d["doc_id"]: d["location"] for d in turn["docs"]},
+                {"doc-in": "project", "doc-out": "outside_project", "doc-new": "unsaved"},
+            )
+
+            def engine_down(method, params=None):
+                raise core_bridge.CoreError("engine_connection_lost")
+
+            with mock.patch.object(core_bridge, "call", engine_down):
+                down = call("workspace_status", {})
+            self.assertFalse(down["ok"])
+            self.assertEqual(down["reason"], "engine_unavailable")
+            self.assertNotIn("docs", down)
+
+            unknown = call("workspace_status", {"run_id": "gui-1790799388213556-0"})
             self.assertFalse(unknown["ok"])
-            self.assertEqual(unknown["run_id"], "not-a-workspace")
-            self.assertIn("describe_project()", unknown["do_instead"])
+            self.assertEqual(unknown["reason"], "unknown_run_id")
+            self.assertIn("workspace_status()", unknown["do_instead"])
 
             session = workspace.WorkspaceSession(run_id="workspace-alpha")
             session.open_assembly_doc("assembly-doc", "orchestrator")
@@ -667,6 +700,50 @@ class HostToolDispatchTests(unittest.TestCase):
             self.assertEqual(events["events"][0]["payload"], {"text": "orient"})
             self.assertEqual(events["events"][0]["actor"], "modeler")
             self.assertEqual(events["run_id"], "gui-orientation")
+
+    def test_parts_replace_the_run_context_document_in_slice_part(self):
+        """2026-10-10 6-axis trace: slice_part(parts=[...]) with no top-level doc_id was
+        refused "not both", because the run's active doc_id was injected beside parts."""
+        from mcp.server.fastmcp import FastMCP
+        from services.mcp import tool_registry
+        from services.mcp.print_tools import register_print_tools
+
+        mcp = FastMCP("slice-parts-regression")
+        with mock.patch.dict(tool_registry._CATALOG, {}, clear=True):
+            register_print_tools(tool_registry.view(mcp, "cam"))
+        entries = mcp._tool_manager._tools
+        context = _context(entries, doc_id="doc-ambient", run_id="gui-print")
+        binding = {b.name: b for b in build_host_tools(context)}["slice_part"]
+
+        def call(args):
+            result = dispatch_host_tool(binding, args, None, None)
+            return json.loads(result) if isinstance(result, str) else result
+
+        parts = [{"doc_id": "doc-a", "build_dir": [0, 1, 0]},
+                 {"doc_id": "doc-b", "build_dir": [0, 1, 0]}]
+        # No printer: target validation passes, then the tool asks for the printer.
+        for args in ({"parts": parts}, {"parts": parts, "doc_id": None, "path": None}):
+            result = call(args)
+            self.assertEqual(result.get("reason"), "printer_required", result)
+        mixed = call({"parts": parts, "doc_id": "doc-a"})
+        self.assertFalse(mixed["ok"])
+        self.assertIn("top-level doc_id or path", json.dumps(mixed))
+
+    def test_context_doc_unless_keeps_the_run_document_when_the_argument_is_absent(self):
+        from services.mcp.tool_registry import context_doc_unless
+
+        seen = []
+
+        @context_doc_unless("parts")
+        def plate(doc_id=None, parts=None):
+            seen.append(doc_id)
+            return {"ok": True}
+
+        binding = self._binding(name="plate", handler=plate, doc_id="doc-run")
+        dispatch_host_tool(binding, {}, None, None)
+        dispatch_host_tool(binding, {"parts": None}, None, None)
+        dispatch_host_tool(binding, {"parts": [{"doc_id": "doc-x"}]}, None, None)
+        self.assertEqual(seen, ["doc-run", "doc-run", None])
 
     def test_tool_error_propagates_unchanged(self):
         error = RuntimeError("CAD rejected feature")
@@ -1168,6 +1245,69 @@ class HostToolImageDeliveryTests(unittest.TestCase):
         self.assertEqual([block["type"] for block in content], ["text"])
         self.assertIn(f"[image not attached: {gone} is unreadable", content[0]["text"])
 
+    def test_eval_bridged_render_reads_as_one_mapping_and_keeps_the_image(self):
+        """c250: eval code did ``r.items()`` on render_part's ``[image, caption]``."""
+        from mcp.server.fastmcp import Image
+
+        png = _png(self.tmp / "render.png")
+        saved = str(self.tmp / "out dir" / "review.png")
+        caption = f"iso view of 'bracket' saved: {saved} (1234 B, sha256 0123456789ab)"
+        frame, records = self._frame(
+            "render_part",
+            lambda: [Image(path=png), caption],
+            toolCallId="js-render_part-7f1c",
+        )
+        self._assert_image_frame(frame, "iso view of 'bracket'", (64, 48))
+        details = frame["result"]["details"]
+        # eval code reads either details or json.loads(text): both are the mapping.
+        self.assertEqual(json.loads(frame["result"]["content"][0]["text"]), details)
+        self.assertEqual(
+            details,
+            {
+                "ok": True,
+                "caption": caption,
+                "images": [{"kind": "image", "path": png, "mime": "image/png",
+                            "width": 64, "height": 48}],
+                "saved_path": saved,
+            },
+        )
+        # Run records (artifact events, the GUI feed) keep the tool's own return.
+        self.assertEqual(records[-1]["result"][1], caption)
+
+        # review_drawing's JSON diagnostics become keys of the same mapping.
+        frame, _ = self._frame(
+            "review_drawing",
+            lambda: [Image(path=png), '{"ok": false, "views": [{"view_id": "v1"}]}'],
+            toolCallId="js-review_drawing-1",
+        )
+        details = frame["result"]["details"]
+        self.assertIs(details["ok"], False)
+        self.assertEqual(details["views"], [{"view_id": "v1"}])
+        self.assertEqual((details["caption"], details["images"][0]["path"]), ("", png))
+
+        # An arg-note wrapper around the pair flattens into the mapping.
+        frame, _ = self._frame(
+            "render_part",
+            lambda: {"ok": True, "result": [Image(path=png), "iso"],
+                     "arg_interpretation": "interpreted 'part' as 'doc_id'"},
+            toolCallId="js-render_part-2",
+        )
+        details = frame["result"]["details"]
+        self.assertEqual(details["caption"], "iso")
+        self.assertEqual(details["arg_interpretation"], "interpreted 'part' as 'doc_id'")
+        self.assertNotIn("result", details)
+
+        # An image that cannot attach is named in the mapping; the text stays JSON.
+        gone = str(self.tmp / "gone.png")
+        frame, _ = self._frame(
+            "render_part", lambda: Image(path=gone), toolCallId="js-render_part-3"
+        )
+        details = json.loads(frame["result"]["content"][0]["text"])
+        self.assertEqual((details["caption"], details["images"]), ("", [
+            {"kind": "image", "path": gone, "mime": "image/png"}
+        ]))
+        self.assertIn(f"[image not attached: {gone} is unreadable", details["image_notes"][0])
+
 
 class _CallContext:
     """The chudcode_rpc HostToolContext fields ``execute`` reads."""
@@ -1246,6 +1386,26 @@ class HostToolResultEdgeTests(unittest.TestCase):
         self.assertEqual(body["items"][0], rows[0])
         with open(body["_truncated"]["full_result"], encoding="utf-8") as handle:
             self.assertEqual(json.load(handle), rows)
+
+    def test_a_cut_string_carries_a_visible_marker_and_eval_gets_the_full_result(self):
+        """c250: eval read a 100+ KB file's text, the cap halved it to a bare prefix,
+        and json.loads failed mid-string with nothing to say the text was cut."""
+        source = json.dumps({"rows": [{"i": i, "name": f"r{i}"} for i in range(9000)]})
+        full = {"ok": True, "path": "result.json", "text": source}
+        out, _ = self._execute(lambda: full, call_id="js-write-5e7a")
+        text = out["content"][0]["text"]
+        self.assertLessEqual(len(text.encode("utf-8")), 46_000)
+        body = json.loads(text)
+        self.assertEqual(body, out["details"])
+        start, marker = body["text"].split(" …[cut: ", 1)
+        self.assertTrue(source.startswith(start))
+        self.assertEqual(
+            marker,
+            f"kept {len(start)} of {len(source)} characters; "
+            "full text in _truncated.full_result]",
+        )
+        with open(body["_truncated"]["full_result"], encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), full)
 
     def test_eval_bridged_call_defers_first_touch_skill_body_to_a_direct_call(self):
         delivered = set()

@@ -468,6 +468,13 @@ static StepPlusDoc editable_container_open_impl(const std::string& path,
         // is inadmissible is skipped (and reported) below — it never fails the open.
         if (owns_geometry_step && is_geometry_cache(st.m_filename))
             continue;
+        // geometry.step is the interop snapshot every save rewrites from the rebuild; only
+        // Relocate (which must preserve it verbatim) ever inflates it. Bounding a payload this
+        // read never allocates made a large model's own save unopenable (a 78 MB snapshot of a
+        // dense lofted duct tripped the 64 MB per-entry cap and failed doc_open).
+        if (owns_geometry_step && mode != NativeReadMode::Relocate &&
+            std::strcmp(st.m_filename, "geometry.step") == 0)
+            continue;
         if (st.m_uncomp_size > kMaxEntryExpandedBytes) {
             mz_zip_reader_end(&zip);
             archive_limit_error("per-entry expanded byte limit", format_name);
@@ -1280,7 +1287,22 @@ std::string stepplus_cache_engine_key() {
     // the faces it generates); cached display responses carry the old owner_map.
     // /7 builds closed mesh imports directly and merges coplanar triangles into planar
     // faces; older source-mesh snapshots carry per-triangle topology.
-    static constexpr const char* kCacheSchema = "chudware-geomcache/7";
+    // /8 takes planar outward normals from geom/face_normal.h (left-handed plane frames —
+    // revolve end faces — read inward before): hole drill direction, weld/text frames and
+    // selector normals on such faces change.
+    // /9 shell validates every offset strategy and walks the whole join/tolerance ladder
+    // (a freeform body can now shell where the first, invalid result used to be refused),
+    // and face-list slots resolve each geometry-query element (shell remove top+bottom).
+    // /10 ranks geometry-query `near` by min(distance to the trimmed sub-shape, distance to
+    // its centroid) instead of centroid distance alone (doc/picks.cpp rank_near): a point ON
+    // a large circle/face now picks it over a small entity whose centroid sits closer.
+    // /11 shells a tube-like body the offset ladder refuses (a rectangle-to-circle loft's
+    // crease-to-tangent seams) through geom/shell_sections.cpp's sectional builder: such a
+    // shell used to fail the feature and now builds a wall.
+    // /12 profile region picks never snap: a centroid outside its region's grown bbox, two
+    // picks on one region, or an equidistant hintless pick fails the feature (doc/document.cpp
+    // resolve_profile_faces). A cache built by a silent snap must re-resolve and report it.
+    static constexpr const char* kCacheSchema = "chudware-geomcache/12";
 #ifdef OCC_VERSION_COMPLETE
     return std::string(kCacheSchema) + ";occt=" OCC_VERSION_COMPLETE;
 #else

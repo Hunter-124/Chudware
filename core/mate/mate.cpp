@@ -17,6 +17,8 @@
 #include <stdexcept>
 #include <tuple>
 #include <utility>
+#include <array>
+#include <string>
 
 namespace chudware::mate {
 namespace {
@@ -1618,6 +1620,56 @@ Vector3d canonical_sign(const Vector3d& v) {
     return (v[k] < 0.0) ? Vector3d(-v) : v;
 }
 
+namespace {
+
+// Why the first two refs of a mate did not reach the solver, named per ref. The caller
+// (doc/assembly.cpp compile_assembly) leaves a ref without geometry when its component is
+// not loaded or its selector does not resolve on that component, and leaves a component
+// out of `components` when it is missing, suppressed or failed to load. "mate references
+// could not be resolved" named neither the ref nor the cause (c250 m13).
+std::string unresolved_ref_reason(const json& refs, const std::array<std::string, 2>& cids,
+                                  const std::array<bool, 2>& in_solve,
+                                  const std::array<bool, 2>& has_geom) {
+    std::string out;
+    for (int i = 0; i < 2; ++i) {
+        if (in_solve[i] && has_geom[i]) continue;
+        const std::string at = "refs[" + std::to_string(i) + "]";
+        std::string why;
+        if (cids[i].empty()) {
+            why = at + " names no component";
+        } else if (!in_solve[i]) {
+            why = at + " component '" + cids[i] + "' is not in the solve. The component is "
+                  "missing, suppressed, or its source did not load";
+        } else {
+            const json sel = refs[i].is_object() && refs[i].contains("selector")
+                ? refs[i]["selector"] : json(nullptr);
+            const std::string kind = sel.is_object() && sel.contains("kind") &&
+                                             sel["kind"].is_string()
+                ? sel["kind"].get<std::string>() : std::string();
+            const std::string sid = sel.is_object() && sel.contains("sid") &&
+                                            sel["sid"].is_string()
+                ? sel["sid"].get<std::string>() : std::string();
+            if (!sel.is_object()) {
+                why = at + " on component '" + cids[i] + "' has no selector object";
+            } else if (kind != "face" && kind != "edge" && kind != "vertex") {
+                why = at + " on component '" + cids[i] + "' has selector kind '" + kind +
+                      "'. A mate ref needs a face, edge or vertex selector";
+            } else {
+                why = at + " " + kind + (sid.empty() ? "" : " '" + sid + "'") +
+                      " did not resolve on component '" + cids[i] + "'. No " + kind +
+                      " of that component matches the stored selector, or its surface type "
+                      "changed. This occurs when the component geometry changed after the "
+                      "mate was made. Make the mate again with asm_mate and "
+                      "{component, query}";
+            }
+        }
+        out += (out.empty() ? "" : "; ") + why;
+    }
+    return out;
+}
+
+}  // namespace
+
 // --------------------------------------------------------------------------- public solve
 
 MateSolveResult solve_mates(const json& components, const json& mates,
@@ -1692,6 +1744,8 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         }
         json refs = mate.value("refs", json::array());
         if (refs.size() < 2) {
+            unresolved_reasons[mid] = "the mate has " + std::to_string(refs.size()) +
+                " ref(s). A mate needs at least 2 refs, each {component, selector}";
             mate_records.push_back({mid, "unresolved"});
             continue;
         }
@@ -1703,6 +1757,9 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         auto cb_it = frames.find(cid_b);
         if (ga_it == resolved_geometry.end() || gb_it == resolved_geometry.end()
             || ca_it == frames.end() || cb_it == frames.end()) {
+            unresolved_reasons[mid] = unresolved_ref_reason(
+                refs, {cid_a, cid_b}, {ca_it != frames.end(), cb_it != frames.end()},
+                {ga_it != resolved_geometry.end(), gb_it != resolved_geometry.end()});
             mate_records.push_back({mid, "unresolved"});
             continue;
         }
@@ -1919,9 +1976,9 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         else if (in_set(redundant, mid)) status = "redundant";
         else status = "ok";
         if (status == "unresolved") res_converged = false;
+        // Every "unresolved" record above stores its reason.
         out.mate_status.push_back({mid, mtype, status,
-            status == "unresolved" ? (unresolved_reasons.count(mid)
-                ? unresolved_reasons.at(mid) : "mate references could not be resolved") : ""});
+            status == "unresolved" ? unresolved_reasons[mid] : std::string()});
     }
 
     // Per-mate residual report, worst first. This is the diagnosis a caller needs when

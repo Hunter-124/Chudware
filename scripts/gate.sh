@@ -14,9 +14,9 @@
 #   web parity probe   — contracts/web_parity.md over a scratch hostd with the Python worker
 #                        bridge disabled (scripts/web_parity_probe.py).
 #   appimage smoke     — opt-in (CHUDWARE_GATE_APPIMAGE=1), advisory.
-#   linux packages     — deb/rpm packaging suite (packaging/test_linux_packages.py).
-#   pytest             — per-unit sweep of services/*, services/test_*.py, tools and training
-#                        with the service venv. Any failed test is FATAL.
+#   linux packages     — packaging suite (distro artifacts, signing, evidence, finalization).
+#   pytest             — per-unit sweep of services/*, services/test_*.py, scripts, assets,
+#                        tools and training with the service venv. Failures are FATAL.
 #   vv-bench, modeling — opt-in (CHUDWARE_RUN_VV, CHUDWARE_RUN_MODELING).
 #   fin25 golden demo  — T-FIN25 sensor-node sim/fw content smoke (scripts/demo_sensor_node.py);
 #                        default on, Renode/OpenFOAM-gated legs SKIP honestly via marker files.
@@ -134,7 +134,7 @@ gate_python_or_system() {
 
 # ---- check.py: source/audit gate ----------------------------------------------
 # CHECK_PYTHON is deliberately separate from CHUDWARE_GATE_PYTHON: linux-gate
-# provisions the audit's exact four-package import surface in a job-local venv,
+# provisions the audit's minimal runtime imports in a job-local venv,
 # while the later pytest sweep needs the much larger service runtime venv.
 stage_check() {
     echo "=== scripts/check.py (source/audit gate) ==="
@@ -448,19 +448,25 @@ stage_appimage_smoke() {
 # payload. No network, ~2s. Unlike the AppImage smoke above this needs no GUI,
 # no Xvfb and no real build tree, so it runs by default rather than opt-in.
 # rpmbuild is optional: the suite skips its rpm cases without it.
+# The same stage also covers release signing, evidence and finalization; all use
+# the selected service interpreter rather than requiring system Python's pytest.
 stage_linux_packages() {
     echo "=== Linux distro packaging ==="
     if [ ! -f packaging/test_linux_packages.py ]; then
         skip_stage env "linux packages" "packaging/test_linux_packages.py missing" "suite not present"
         return 0
     fi
-    if python3 -m pytest -q packaging/test_linux_packages.py \
+    if ! resolve_gate_python; then
+        skip_stage env "linux packages" "no venv with pytest found" "no venv with pytest available"
+        return 0
+    fi
+    if "$GATE_PY" -m pytest -q packaging \
             > ${GATE_TMP}/linux_packages.out 2>&1; then
         record "linux packages     PASS    $(tail -n 1 ${GATE_TMP}/linux_packages.out)"
         echo "  PASS ($(tail -n 1 ${GATE_TMP}/linux_packages.out))"
         return 0
     fi
-    record "linux packages     FAIL    deb/rpm packaging suite failed (see ${GATE_TMP}/linux_packages.out)"
+    record "linux packages     FAIL    packaging suite failed (see ${GATE_TMP}/linux_packages.out)"
     echo "  FAIL"; tail -n 20 ${GATE_TMP}/linux_packages.out | sed 's/^/    /'
     fail_fatal=1
 }
@@ -511,18 +517,11 @@ stage_pytest() {
     # --- per-unit sweep ---
     # One invocation per unit avoids cross-suite import-order pollution.
     #
-    # `services/` is swept one level DEEPER than the other top-level dirs: it holds
-    # ~370 test files across ~20 subpackages. Measured 2026-07-29: as ONE invocation
-    # `pytest services` recorded 15 failures; split per-subpackage it records 13, with
-    # NO loss of collected tests (6986 -> 7071 collected; a node-id diff of combined
-    # vs. split collect-only showed zero ids only in the combined set). The 2 that
-    # vanish are services/mcp/test_registration_catalog.py's two catalog assertions:
-    # they pass alone and under `pytest services/mcp`, and fail as soon as the
-    # services/agent suite is collected first (it registers hydraulic_*/ask_user tools
-    # DEFAULT_TOOL_FAMILIES doesn't know) — i.e. pure registry/import-order pollution
-    # that was masking any genuine new regression. The remaining 13 (browser 9,
-    # services/mcp 2, sim 2) reproduced in isolation: genuine defects, which this
-    # stage reports as fatal failures.
+    # `services/` is swept one level deeper than the other top-level directories.
+    # Process isolation keeps registry mutations and import ordering in one service
+    # suite from changing another suite's results. It does not relax failure
+    # handling: every collected test failure and collection crash remains fatal.
+    # The coverage guard below ensures the split does not silently lose test files.
     #
     # The unit list is DERIVED at runtime (glob), never hardcoded, so a new services
     # subpackage is picked up automatically and cannot silently go unrun. The
@@ -548,6 +547,7 @@ stage_pytest() {
         done
     fi
     dirs+=("tools" "training")
+    dirs+=("scripts" "assets")
 
     # Coverage guard: every test file under services/ must be reachable from exactly
     # one unit above. If the glob enumeration ever loses a suite (renamed subpackage,

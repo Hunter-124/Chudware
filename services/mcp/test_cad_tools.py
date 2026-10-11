@@ -1009,14 +1009,45 @@ def test_config_override_accepts_a_vector():
     assert m["mass"]["com"][2] > 40, m  # the body lifted in the Stowed config
 
 
-def test_get_part_summary_is_lightweight():
-    """Issue 8: get_part(summary=True) lists feature id/name/type/params with no tessellation."""
+def test_get_part_summary_is_lightweight_and_shares_the_full_layout():
+    """Issue 8: get_part(summary=True) lists feature id/name/type/params with no tessellation.
+    Both forms nest the list at tree.features: a summary read taught `["features"]` and the
+    next full read raised KeyError (2026-10-10)."""
     doc = _new_plate_with_hole()
     summ, _ = _call("get_part", {"doc_id": doc, "summary": True})
+    full, _ = _call("get_part", {"doc_id": doc})
     assert summ["ok"] and summ["summary"] is True, summ
-    assert summ["feature_count"] >= 1 and summ["features"], summ
-    f0 = summ["features"][0]
+    assert full["ok"] and full["doc_id"] == summ["doc_id"] == doc, full
+    assert summ["feature_count"] >= 1, summ
+    assert ([f["id"] for f in summ["tree"]["features"]]
+            == [f["id"] for f in full["tree"]["features"]]), (summ, full)
+    f0 = summ["tree"]["features"][0]
     assert set(("id", "name", "type", "params")).issubset(f0), f0
+
+
+def test_get_part_summary_keeps_a_long_list_a_list_and_names_the_cut():
+    """c243: a summary turned a 70-entity sketch into the string "<list of 70 elided>", and
+    `for e in params["entities"]` iterated characters. The list must stay a list, and the
+    feature must say how much of it the summary dropped."""
+    r, _ = _call("new_part", {"name": "summary_long_list"})
+    doc = r["doc_id"]
+    n = 70
+    pts = [[20 * math.cos(2 * math.pi * i / n), 20 * math.sin(2 * math.pi * i / n)]
+           for i in range(n)]
+    built, _ = _call("add_features", {"doc_id": doc, "ops": [{"op": "add_feature", "feature": {
+        "type": "sketch", "name": "Ring", "refs": {"plane": "plane.top"}, "params": {
+            "entities": [{"id": f"e{i + 1}", "type": "line", "construction": False,
+                          "p1": pts[i], "p2": pts[(i + 1) % n]} for i in range(n)],
+            "constraints": []}}}]})
+    assert built["ok"], built
+    summ, _ = _call("get_part", {"doc_id": doc, "summary": True})
+    sketch = summ["tree"]["features"][0]
+    entities = sketch["params"]["entities"]
+    assert isinstance(entities, list) and all(isinstance(e, dict) for e in entities), entities
+    assert sketch["truncated_lists"]["params.entities"] == {"kept": len(entities), "total": n}
+    assert 0 < len(entities) < n
+    full, _ = _call("get_part", {"doc_id": doc})
+    assert len(full["tree"]["features"][0]["params"]["entities"]) == n
 
 
 def test_measure_multibody_per_body_and_total():
@@ -1263,7 +1294,7 @@ def test_check_interference_single_part_clean():
     """A single-body part trivially reports no interference."""
     doc = _new_plate_with_hole()
     r, _ = _call("check_interference", {"doc_id": doc})
-    assert r["ok"] is True, r
+    assert r["ok"] is True and r["clear"] is True, r
     assert r["interferences"] == [], r
     assert len(r["parts"]) == 1, r
 
@@ -1278,9 +1309,36 @@ def test_check_interference_overlapping_bodies():
     _call("add_features", {"doc_id": doc, "ops": [
         cb.feat("transform", "Dup", {"translate": [10, 0, 0], "copy": True})]})
     r2, _ = _call("check_interference", {"doc_id": doc})
-    assert r2["ok"] is False, r2  # they overlap -> not ok
+    # The check completed: interference is a finding (clear=false), not a tool failure.
+    assert r2["ok"] is True and r2["complete"] is True and r2["clear"] is False, r2
+    assert r2["summary"].startswith("Interference found"), r2
     assert len(r2["interferences"]) == 1, r2
     assert r2["interferences"][0]["volume"] > 0, r2
+
+
+def test_check_interference_incomplete_check_is_a_failure_not_clear(monkeypatch):
+    """A pair that failed to evaluate makes the check incomplete: ok=false and never clear."""
+    r, _ = _call("new_part", {"name": "clash_incomplete"})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(20), "width": cb.dim(20), "height": cb.dim(20)})]})
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("transform", "Far", {"translate": [100, 0, 0], "copy": True})]})
+    native_call = cb.call
+
+    def fail_pair(method, params=None, **kwargs):
+        report = native_call(method, params, **kwargs)
+        if method == "eval_interference":
+            pair = report["clearances"].pop()
+            report.update(ok=False, complete=False, pairs_checked=0, pair_failures=[
+                {"a": pair["a"], "b": pair["b"], "reason": "boolean_failed"}],
+                summary="Interference check incomplete: 1 failed pair(s).")
+        return report
+
+    monkeypatch.setattr(cb, "call", fail_pair)
+    r2, _ = _call("check_interference", {"doc_id": doc})
+    assert r2["ok"] is False and r2["clear"] is False, r2
+    assert r2["interferences"] == [] and "incomplete" in r2["error"], r2
 
 
 def test_inspect_model_integrity_empty_document_is_not_complete_evidence():
@@ -1527,6 +1585,84 @@ def test_wall_thickness_numeric_on_shell():
     assert "wall" in w["summary"].lower(), w
 
 
+def _shelled_enclosure_ops(rounds: bool, bosses: bool = False) -> list[dict]:
+    """120x80x40 box, outer vertical edges R5 (inner R2.5 after the shell), shelled 2.5 mm
+    open-top; optionally four Ø6 bosses 30 tall on the floor with Ø2.5 x 25 pilot holes."""
+    def f(typ, name, params, **kw):
+        return {"op": "add_feature", "feature": {"type": typ, "name": name, "params": params, **kw}}
+    ops = [f("box", "Body", {"length": 120, "width": 80, "height": 40}, at=[0, 0, 0],
+             centered=False)]
+    if rounds:
+        ops.append(f("fillet", "CornerRounds", {"radius": 5},
+                     refs={"edges": {"of": "edge", "surf": "line", "parallel": "z"}}))
+    ops.append(f("shell", "Shell", {"thickness": 2.5},
+                 refs={"remove": {"of": "face", "side": "top"}}))
+    if bosses:
+        pts = [(60 + sx * 50, 40 + sy * 30) for sx in (1, -1) for sy in (1, -1)]
+        n = len(ops)
+        ops += [f("sketch", "BossSk", {"entities": [{"type": "circle", "center": [x, y],
+                                                    "radius": 3} for x, y in pts],
+                                       "offset": 2.5}, refs={"plane": "plane.top"}),
+                f("extrude", "Bosses", {"mode": "boss", "end": "blind", "depth": 30},
+                  refs={"profile": [{"kind": "region", "sketch": f"${n}"}]})]
+        ops += [f("hole", f"Pilot{i}", {"style": "simple", "diameter": 2.5, "end": "blind",
+                                        "depth": 25, "world_points": [[x, y, 32.5]]},
+                  refs={"face": {"of": "face", "surf": "flat", "near": [x, y, 32.5],
+                                 "count": 1}})
+                for i, (x, y) in enumerate(pts)]
+    return ops
+
+
+@pytest.mark.parametrize("rounds", [False, True], ids=["sharp", "R5_corners"])
+def test_wall_thickness_of_a_uniform_shell_is_the_shell_thickness(rounds):
+    """A uniform 2.5 mm shell reads 2.5 — with or without R5/R2.5 corner rounds. The ray
+    origin sits 1e-3 inside the surface, so the wall is hit distance PLUS that offset (the
+    engine once subtracted it, reading every wall 2e-3 mm thin)."""
+    r, _ = _call("new_part", {"name": f"wt_shell_{int(rounds)}"})
+    doc = r["doc_id"]
+    a, _ = _call("add_features", {"doc_id": doc, "ops": _shelled_enclosure_ops(rounds)})
+    assert a["ok"], a
+    th = cb.call("eval_thickness", {"doc_id": doc})
+    # Planar walls are exact on the tessellation; the fillet strips carry chord error.
+    assert th["min_thickness_mm"] == pytest.approx(2.5, abs=0.05 if rounds else 1e-3), th
+    _call("close_part", {"doc_id": doc})
+
+
+def test_wall_thickness_reports_a_genuine_thin_spot():
+    """The same 2.5 mm shell with a 1.5 mm deep pocket cut into the floor from below: the
+    floor there is 1.0 mm, and that is the minimum."""
+    r, _ = _call("new_part", {"name": "wt_pocket"})
+    doc = r["doc_id"]
+    ops = _shelled_enclosure_ops(False) + [
+        {"op": "add_feature", "feature": {"type": "sketch", "name": "PocketSk", "params": {
+            "entities": [{"type": "rectangle", "center": [60, 40], "width": 20,
+                          "height": 10}]}, "refs": {"plane": "plane.top"}}},
+        {"op": "add_feature", "feature": {"type": "extrude", "name": "Pocket", "params": {
+            "mode": "cut", "end": "blind", "depth": 1.5},
+            "refs": {"profile": [{"kind": "region", "sketch": "$2"}]}}}]
+    a, _ = _call("add_features", {"doc_id": doc, "ops": ops})
+    assert a["ok"], a
+    w, _ = _call("wall_thickness", {"doc_id": doc})
+    assert w["min_thickness_mm"] == pytest.approx(1.0, abs=1e-3), w
+    assert w["thinnest"][0]["built_by"]["name"] == "Pocket", w
+    _call("close_part", {"doc_id": doc})
+
+
+def test_wall_thickness_finds_the_boss_wall_around_a_pilot_hole():
+    """The H6 enclosure: its shell is 2.5 mm, but a Ø6 boss bored Ø2.5 has a (6-2.5)/2 =
+    1.75 mm radial wall — a real thinner wall than the shell, so it IS the minimum."""
+    r, _ = _call("new_part", {"name": "wt_bosses"})
+    doc = r["doc_id"]
+    a, _ = _call("add_features", {"doc_id": doc,
+                                  "ops": _shelled_enclosure_ops(True, bosses=True)})
+    assert a["ok"], a
+    w, _ = _call("wall_thickness", {"doc_id": doc})
+    assert w["min_thickness_mm"] == pytest.approx(1.75, abs=0.02), w
+    assert w["thinnest"][0]["built_by"]["name"] in {"Bosses", "Pilot0", "Pilot1", "Pilot2",
+                                                    "Pilot3"}, w
+    _call("close_part", {"doc_id": doc})
+
+
 def test_wall_thickness_says_where_the_thinnest_wall_is():
     """c219: three sub-agents got only `min_thickness_mm` and bisected the tree —
     suppressing features one by one, ~25 round trips — to find which face held it.
@@ -1579,6 +1715,28 @@ def test_wall_thickness_locates_the_thin_wall_on_a_second_body():
     assert shim["body"] == 2, w
     by_body = {b["body"]: b["min_thickness_mm"] for b in w["bodies"]}
     assert set(by_body) == {1, 2} and abs(by_body[2] - 0.8) < 0.02 and by_body[1] > 9, w
+
+
+def test_wall_thickness_ignores_a_rim_ray_that_runs_along_a_ledge():
+    """GripperGears (2026-10-10): a Ø8 pin end carrying a coaxial Ø7 collar read 0.5 mm.
+    Each vertex on the Ø8 rim cast its ray IN the plane of the 0.5 mm ledge, on the solid
+    boundary, and stopped at the collar foot (an ENTRY face). The ray origin now moves into
+    its own face and only exit faces count, so the thinnest wall is the Ø7 collar itself."""
+    r, _ = _call("new_part", {"name": "wt_pin_rim"})
+    doc = r["doc_id"]
+    a, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "add_feature", "feature": {"type": "cylinder", "name": "Pin",
+                                          "params": {"radius": 4, "height": 10}}},
+        {"op": "add_feature", "feature": {"type": "cylinder", "name": "Collar",
+                                          "params": {"radius": 3.5, "height": 5},
+                                          "at": [0, 0, 7.5]}}]})
+    assert a["ok"] and a["body_count"] == 1, a
+    w, _ = _call("wall_thickness", {"doc_id": doc})
+    # The ledge is 0.5 mm wide, never 0.5 mm thick: the thinnest wall is the Ø7 collar
+    # (7 mm across, less a small chord error).
+    assert abs(w["min_thickness_mm"] - 7.0) < 0.15, w
+    assert w["thinnest"][0]["built_by"]["name"] == "Collar", w
+    _call("close_part", {"doc_id": doc})
 
 
 def test_one_element_query_list_still_builds_a_shell():
@@ -1703,7 +1861,7 @@ def test_a_resumed_part_carrying_geometry_keeps_a_real_volume_baseline():
         cb.feat("sketch", "S", {"plane": "top", "entities": [
             {"type": "circle", "center": [10, 10], "radius": 3}]}),
         cb.feat("extrude", "Hole", {"depth": cb.dim(30), "mode": "cut",
-                                    "direction": "reverse"}, {"profile": "$0"})]})
+                                    "flip": True}, {"profile": "$0"})]})
     assert cut["ok"], cut
     # The cut REMOVED material: the delta must be negative and ~ -pi*9*10, not +47717.
     assert cut["changes"]["volume_delta_mm3"] == pytest.approx(-282.27, abs=0.5), cut["changes"]
@@ -2044,6 +2202,46 @@ def test_new_part_and_assembly_never_resume_another_projects_open_doc(tmp_path, 
         assert docs[doc]["revision"] == (1 if kind == "part" else 0), docs[doc]
         for d in (doc, fresh["doc_id"]):
             cb.call("doc_close", {"doc_id": d})
+
+
+def test_new_assembly_fresh_escapes_a_reopened_assembly_of_that_name(tmp_path, monkeypatch):
+    """Hard-benchmark build: new_assembly("hinge0") after the deliverable "hinge0" (three
+    components) was opened returned it reused and the next asm_add_component calls piled
+    onto its three. The reused reply must name the component count and the way out;
+    fresh=True must mint a separate EMPTY assembly, as new_part(fresh=True) does."""
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+    part, _ = _call("new_part", {"name": _unique_part_name("hinge_leaf")})
+    r, _ = _call("add_features", {"doc_id": part["doc_id"], "ops": [
+        cb.feat("box", "B", {"length": cb.dim(10), "width": cb.dim(10), "height": cb.dim(2)})]})
+    assert r["ok"], r
+    leaf = tmp_path / "leaf.step+"
+    cb.call("doc_save", {"doc_id": part["doc_id"], "path": str(leaf)})
+    name = _unique_part_name("hinge") + "0"
+    asm, _ = _call("new_assembly", {"name": name})
+    for i in range(3):
+        r, _ = _call("asm_add_component", {"doc_id": asm["doc_id"], "path": str(leaf),
+                                           "name": f"leaf{i}", "at": [0, 0, 4 * i]})
+        assert r.get("ok", True) and "error" not in r, r
+    asm_path = tmp_path / f"{name}.step+"
+    cb.call("doc_save", {"doc_id": asm["doc_id"], "path": str(asm_path)})
+    for d in (asm["doc_id"], part["doc_id"]):
+        cb.call("doc_close", {"doc_id": d})
+    opened = cb.call("doc_open", {"path": str(asm_path)})
+    opened_id = opened["doc_id"]
+    try:
+        same, _ = _call("new_assembly", {"name": name})
+        assert same["doc_id"] == opened_id and same.get("reused"), same
+        assert same["component_count"] == 3, same
+        assert "3 components" in same["note"] and "fresh=True" in same["note"], same
+
+        fresh, _ = _call("new_assembly", {"name": name, "fresh": True})
+        assert fresh["doc_id"] != opened_id and not fresh.get("reused"), fresh
+        docs = {e["doc_id"]: e for e in cb.call("doc_list", {})["docs"]}
+        assert docs[fresh["doc_id"]]["component_count"] == 0, docs[fresh["doc_id"]]
+        assert docs[opened_id]["component_count"] == 3, docs[opened_id]
+        cb.call("doc_close", {"doc_id": fresh["doc_id"]})
+    finally:
+        cb.call("doc_close", {"doc_id": opened_id})
 
 
 @pytest.mark.parametrize("suffix", ["", "4"])
@@ -3084,6 +3282,189 @@ def test_hole_positions_front_face_axes():
     _call("close_part", {"doc_id": doc})
 
 
+# hole world_points: a WORLD point names the bore AXIS. It used to be copied into face-local
+# positions=[[x,y]] — measured from the face centre, along u/v — so on an off-centre face
+# (L-bracket base, centre x=34) the hole landed in the wrong place, and on a side face
+# (v = -Z) the world z was dropped outright.
+
+def _l_bracket(name: str) -> str:
+    """Base 60x40x10 spanning x 4..64, y 0..40, z 0..10 (bottom-face centre (34,20,0)) with a
+    5 mm wall rising from x 6..11 — so the -X extreme face is the base end at x=4 alone."""
+    r, _ = _call("new_part", {"name": name, "fresh": True})
+    doc = r["doc_id"]
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Base", {"length": cb.dim(60), "width": cb.dim(40),
+                                "height": cb.dim(10), "at": [34, 20, 5]}),
+        cb.feat("box", "Wall", {"length": cb.dim(5), "width": cb.dim(40),
+                                "height": cb.dim(40), "at": [8.5, 20, 30]}),
+    ]})
+    assert r["ok"] and r["body_count"] == 1, r
+    return doc
+
+
+def _has_axis(axes: list, want: tuple) -> bool:
+    return any(all(abs(a - b) < 1e-4 for a, b in zip(ax, want)) for ax in axes)
+
+
+def test_hole_world_points_land_at_the_world_location_on_off_centre_and_side_faces():
+    doc = _l_bracket("world_pts_lbracket")
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        # bottom face (outward -Z, centre (34,20,0)): the bore must sit at world x=30, y=20.
+        cb.feat("hole", "Bottom", {"style": "simple", "end": "through_all",
+                                   "diameter": cb.dim(4), "world_points": [[30, 20, 0]]},
+                {"face": {"of": "face", "side": "bottom"}}),
+        # -X face (centre (4,20,5), v = -Z): z=3 must survive, not be dropped.
+        cb.feat("hole", "Side", {"style": "simple", "end": "through_all",
+                                 "diameter": cb.dim(3), "world_points": [[4, 12, 3]]},
+                {"face": {"of": "face", "side": "left"}}),
+    ]})
+    assert r["ok"], r
+    assert not any(f.get("warning") for f in r["features"]), r["features"]
+    axes = _bore_axes(doc)
+    assert _has_axis(axes, (30.0, 20.0, 5.0)), axes    # vertical bore through the 10 mm base
+    assert _has_axis(axes, (34.0, 12.0, 3.0)), axes    # horizontal bore along x 4..64
+    _call("close_part", {"doc_id": doc})
+
+
+def test_hole_world_point_off_the_face_plane_is_projected_along_the_axis_and_reported():
+    doc = _l_bracket("world_pts_axis")
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("hole", "Mid", {"style": "simple", "end": "through_all",
+                                "diameter": cb.dim(4), "world_points": [[50, 30, 7]]},
+                {"face": {"of": "face", "side": "bottom"}})]})
+    assert r["ok"], r
+    warned = [f["warning"] for f in r["features"] if f.get("warning")]
+    assert warned and "world_points[0]" in warned[0] and "7 mm off" in warned[0], warned
+    assert _has_axis(_bore_axes(doc), (50.0, 30.0, 5.0))
+    _call("close_part", {"doc_id": doc})
+
+
+@pytest.mark.parametrize("point", [[80, 20, 0], [30, 20, 6]])
+def test_hole_world_point_whose_axis_misses_the_face_is_refused_by_name(point):
+    """[80,20,0] is past the bottom face's x=64 edge; [30,20,6] projects into the bore the
+    first feature already drilled there — an opening, not face."""
+    doc = _l_bracket("world_pts_miss")
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("hole", "First", {"style": "simple", "end": "through_all",
+                                  "diameter": cb.dim(6), "world_points": [[30, 20, 0]]},
+                {"face": {"of": "face", "side": "bottom"}})]})
+    assert r["ok"], r
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("hole", "Miss", {"style": "simple", "end": "through_all",
+                                 "diameter": cb.dim(2), "world_points": [point]},
+                {"face": {"of": "face", "side": "bottom"}})]})
+    text = json.dumps(r)
+    assert r["ok"] is False, r
+    assert "world_points[0]" in text and "OUTSIDE the face" in text, text
+    _call("close_part", {"doc_id": doc})
+
+
+def test_hole_positions_and_world_points_together_are_refused():
+    doc = _l_bracket("world_pts_both")
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("hole", "Both", {"style": "simple", "end": "through_all",
+                                 "diameter": cb.dim(4), "positions": [[0, 0]],
+                                 "world_points": [[30, 20, 0]]},
+                {"face": {"of": "face", "side": "bottom"}})]})
+    text = json.dumps(r)
+    assert r["ok"] is False, r
+    assert "world_points" in text and "not both" in text, text
+    _call("close_part", {"doc_id": doc})
+
+
+def test_bolt_circle_world_center_centres_the_ring_at_the_world_point():
+    """bottom face frame: u=+X, v=-Y; ring of 4 on pcd 20 about world (40,20)."""
+    doc = _l_bracket("world_pts_ring")
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("bolt_circle", "Ring", {"diameter": cb.dim(3), "count": 4, "pcd": cb.dim(20),
+                                        "world_center": [40, 20, 0]},
+                {"face": {"of": "face", "side": "bottom"}})]})
+    assert r["ok"], r
+    axes = _bore_axes(doc)
+    for want in ((50.0, 20.0, 5.0), (30.0, 20.0, 5.0), (40.0, 10.0, 5.0), (40.0, 30.0, 5.0)):
+        assert _has_axis(axes, want), (want, axes)
+    _call("close_part", {"doc_id": doc})
+
+
+def _plate_with_posts(name: str) -> str:
+    """80x60x20 plate (z -10..10) with two Ø8 posts at (±30,20) rising to z=30 — so the
+    word query side:"top" resolves to a POST top, not the plate's own top face."""
+    r, _ = _call("new_part", {"name": name, "fresh": True})
+    doc = r["doc_id"]
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Plate", {"length": cb.dim(80), "width": cb.dim(60),
+                                 "height": cb.dim(20)}),
+        cb.feat("cylinder", "PostR", {"radius": cb.dim(4), "height": cb.dim(20),
+                                      "at": [30, 20, 20]}),
+        cb.feat("cylinder", "PostL", {"radius": cb.dim(4), "height": cb.dim(20),
+                                      "at": [-30, 20, 20]}),
+    ]})
+    assert r["ok"] and r["body_count"] == 1, r
+    return doc
+
+
+def test_word_query_world_point_drills_the_face_its_axis_enters_not_the_extreme_one():
+    """side:"top" picks a post top (the extreme +Z face), but the axis through (0,0) enters
+    the PLATE top: the bore goes through the plate at (0,0); the posts are untouched."""
+    doc = _plate_with_posts("world_pts_posts")
+    before = cb.call("eval_mass", {"doc_id": doc})
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("hole", "Centre", {"style": "simple", "end": "through_all",
+                                   "diameter": cb.dim(6), "world_points": [[0, 0, 0]]},
+                {"face": {"of": "face", "side": "top"}})]})
+    assert r["ok"], r
+    warned = " ".join(f["warning"] for f in r["features"] if f.get("warning"))
+    assert "misses the face refs.face resolved to" in warned, r["features"]
+    axes = _bore_axes(doc)
+    assert _has_axis(axes, (0.0, 0.0, 0.0)), axes          # through the 20 mm plate
+    assert _has_axis(axes, (30.0, 20.0, 20.0)), axes       # both posts intact
+    assert _has_axis(axes, (-30.0, 20.0, 20.0)), axes
+    after = cb.call("eval_mass", {"doc_id": doc})
+    removed = before["volume_mm3"] - after["volume_mm3"]
+    assert removed == pytest.approx(math.pi * 9 * 20, rel=1e-4), (before, after)
+    _call("close_part", {"doc_id": doc})
+
+
+def test_a_concrete_sid_face_stays_strict_when_the_axis_misses_it():
+    doc = _plate_with_posts("world_pts_sid")
+    m = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "side": "top"}})
+    sid = m["matches"][0]["sid"]
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("hole", "Strict", {"style": "simple", "end": "through_all",
+                                   "diameter": cb.dim(6), "world_points": [[0, 0, 0]]},
+                {"face": {"of": "face", "sid": sid}})]})
+    text = json.dumps(r)
+    assert r["ok"] is False, r
+    assert "OUTSIDE the face" in text, text
+    _call("close_part", {"doc_id": doc})
+
+
+def test_one_hole_feature_drills_four_boss_tops_at_two_heights():
+    """Four Ø12 bosses on a 100x100x10 plate (top z=5): two 10 tall (top z=15), two 20 tall
+    (top z=25). One word-query hole with four world points (z=0, on each boss axis) drills
+    each boss from its OWN top: blind 5 mm, so each bore's centroid sits 2.5 below it."""
+    r, _ = _call("new_part", {"name": "world_pts_bosses", "fresh": True})
+    doc = r["doc_id"]
+    ops = [cb.feat("box", "Plate", {"length": cb.dim(100), "width": cb.dim(100),
+                                    "height": cb.dim(10)})]
+    bosses = [((30, 30), 10), ((-30, 30), 10), ((30, -30), 20), ((-30, -30), 20)]
+    for i, ((x, y), h) in enumerate(bosses):
+        ops.append(cb.feat("cylinder", f"Boss{i}", {"radius": cb.dim(6), "height": cb.dim(h),
+                                                     "at": [x, y, 5 + h / 2]}))
+    r, _ = _call("add_features", {"doc_id": doc, "ops": ops})
+    assert r["ok"] and r["body_count"] == 1, r
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("hole", "Taps", {"style": "simple", "end": "blind", "depth": cb.dim(5),
+                                 "diameter": cb.dim(4),
+                                 "world_points": [[x, y, 0] for (x, y), _ in bosses]},
+                {"face": {"of": "face", "side": "top"}})]})
+    assert r["ok"], r
+    axes = _bore_axes(doc)
+    for (x, y), h in bosses:
+        assert _has_axis(axes, (x, y, 5 + h - 2.5)), ((x, y, h), axes)
+    _call("close_part", {"doc_id": doc})
+
+
 def test_side_plus_pick_largest_facing_face():
     """W3: {"side":"top","pick":"largest"} = the LARGEST face FACING up — not the highest.
     L-bracket regression: the extremum rule used to pick the 60x5 wall-top sliver."""
@@ -3114,6 +3495,165 @@ def test_side_plus_pick_largest_facing_face():
     m2 = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "side": "top"}})
     tops = m2.get("matches", [])
     assert len(tops) == 1 and abs(tops[0]["area_or_len"] - 300.0) < 1.0, tops
+    _call("close_part", {"doc_id": doc})
+
+
+def _revolved_shaft(name: str) -> str:
+    """Ø30 x 40 then Ø20 x 60 along +X: a closed 6-line profile on plane.front revolved 360°
+    about axis.x. Its planar faces carry LEFT-handed gp_Pln frames (MakeRevol), the case the
+    old `Axis().Direction()` + REVERSED-flip normal idiom got backwards."""
+    pts = [(0, 0), (0, 15), (40, 15), (40, 10), (100, 10), (100, 0)]
+    lines = [{"kind": "line", "p1": list(pts[i]), "p2": list(pts[(i + 1) % len(pts)])}
+             for i in range(len(pts))]
+    r, _ = _call("new_part", {"name": name})
+    doc = r["doc_id"]
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "add_feature", "feature": {"type": "sketch", "name": "Profile",
+            "params": {"entities": lines}, "refs": {"plane": "plane.front"}}},
+        {"op": "add_feature", "feature": {"type": "revolve", "name": "Shaft",
+            "params": {"angle": 360},
+            "refs": {"profile": [{"kind": "region", "sketch": "$0"}], "axis": "axis.x"}}},
+    ]})
+    assert r["ok"], r
+    return doc
+
+
+def test_revolved_shaft_planar_faces_report_outward_normals():
+    """Every planar face of a revolved stepped shaft used to read normal [1,0,0] — including
+    the x=0 end, whose outward normal is -X. Both read-backs (doc_query and the
+    describe_faces pick path) must report the true outward normal, and side queries must
+    still pick the same faces."""
+    doc = _revolved_shaft("revolve_normals")
+    faces = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face"}})["matches"]
+    planes = {round(f["centroid"][0], 6): f for f in faces if f["surf"] == "plane"}
+    assert sorted(planes) == [0.0, 40.0, 100.0], faces
+    assert planes[0.0]["normal"] == [-1.0, 0.0, 0.0], planes[0.0]
+    assert planes[0.0]["side"] == "left", planes[0.0]
+    # Ø30→Ø20 shoulder: material is on x<40, so it faces +X (toward the small end).
+    assert planes[40.0]["normal"] == [1.0, 0.0, 0.0], planes[40.0]
+    assert planes[100.0]["normal"] == [1.0, 0.0, 0.0], planes[100.0]
+    for f in planes.values():
+        pick = cb.call("doc_resolve_pick", {"doc_id": doc, "body_id": f["body"],
+                                            "kind": "face", "topo_id": f["topo"]})["selector"]
+        assert pick["normal"] == f["normal"], (pick, f)
+    lo = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "side": "-x"}})["matches"]
+    hi = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "side": "+x"}})["matches"]
+    assert [m["centroid"][0] for m in lo] == [0.0], lo
+    assert [m["centroid"][0] for m in hi] == [100.0], hi
+    _call("close_part", {"doc_id": doc})
+
+
+def test_hole_on_revolved_end_face_drills_into_material():
+    """A hole on the x=0 end of a revolved shaft drilled OUTWARD (left-handed plane frame
+    read as an inward normal): a 0.05 mm sliver bore and ~1 mm³ removed. It must cut a
+    Ø6 x 10 bore into the shaft."""
+    doc = _revolved_shaft("revolve_end_hole")
+    v0 = cb.call("eval_mass", {"doc_id": doc})["volume_mm3"]
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "add_feature", "feature": {"type": "hole", "name": "EndHole",
+            "params": {"style": "simple", "diameter": 6, "end": "blind", "depth": 10,
+                       "positions": [[0, 0]]},
+            "refs": {"face": {"of": "face", "side": "-x"}}}}]})
+    assert r["ok"], r
+    removed = v0 - cb.call("eval_mass", {"doc_id": doc})["volume_mm3"]
+    assert removed > 0.95 * math.pi * 3.0 ** 2 * 10.0, removed
+    bores = [m for m in cb.call("doc_query", {"doc_id": doc, "query": {
+        "of": "face", "surf": "cylinder"}})["matches"] if m["concavity"] == "bore"]
+    assert len(bores) == 1, bores
+    assert bores[0]["radius"] == pytest.approx(3.0), bores
+    assert 2.0 < bores[0]["centroid"][0] <= 10.0, bores  # inside the shaft, not a 0.05 mm sliver
+    assert bores[0]["area_or_len"] == pytest.approx(2 * math.pi * 3.0 * 10.0, rel=0.05), bores
+    _call("close_part", {"doc_id": doc})
+
+
+def test_cylinder_faces_report_axis_point_on_the_axis():
+    """`centroid` of a fillet (a quarter cylinder) is off-axis; `axis_point` is the
+    centroid's foot on the true axis — for doc_query and the describe_faces pick path."""
+    r, _ = _call("new_part", {"name": "fillet_axis_point"})
+    doc = r["doc_id"]
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "add_feature", "feature": {"type": "box", "name": "B",
+            "params": {"length": 40, "width": 30, "height": 20},
+            "at": [0, 0, 0], "centered": False}},
+        {"op": "add_feature", "feature": {"type": "fillet", "name": "F",
+            "params": {"radius": 5},
+            "refs": {"edges": [{"of": "edge", "surf": "line", "parallel": "y",
+                                "near": [40, 15, 20], "count": 1}]}}},
+    ]})
+    assert r["ok"], r
+    cyl = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "surf": "cylinder"}})
+    assert cyl["count"] == 1, cyl
+    m = cyl["matches"][0]
+    assert m["radius"] == pytest.approx(5.0), m
+    assert m["axis_point"] == pytest.approx([35.0, 15.0, 15.0], abs=1e-6), m
+    assert m["centroid"] != pytest.approx(m["axis_point"], abs=1.0), m  # truly off-axis
+    pick = cb.call("doc_resolve_pick", {"doc_id": doc, "body_id": m["body"],
+                                        "kind": "face", "topo_id": m["topo"]})["selector"]
+    assert pick["axis_point"] == pytest.approx([35.0, 15.0, 15.0], abs=1e-6), pick
+    planes = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "surf": "plane"}})
+    assert all(p["axis_point"] is None for p in planes["matches"]), planes
+    _call("close_part", {"doc_id": doc})
+
+
+def test_revolved_shaft_cylinders_axis_point():
+    doc = _revolved_shaft("revolve_axis_point")
+    cyl = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "surf": "cylinder"}})
+    pts = sorted(tuple(m["axis_point"]) for m in cyl["matches"])
+    assert pts == [pytest.approx((20.0, 0.0, 0.0), abs=1e-6),
+                   pytest.approx((70.0, 0.0, 0.0), abs=1e-6)], cyl
+    _call("close_part", {"doc_id": doc})
+
+
+def test_torus_faces_report_bend_radius_tube_radius_axis_and_centre():
+    """A Ø25/Ø21 tube swept along (0,0,0)->(300,0,0)->(300,0,200)->(500,0,200) with R50
+    bends: each bend is an outer (r 12.5) and an inner (r 10.5) torus quarter whose read-back
+    carries major/minor radius, axis and centre — `radius`/`axis` stay null (unscored)."""
+    r, _ = _call("new_part", {"name": "torus_readback"})
+    doc = r["doc_id"]
+    path = [
+        {"type": "line", "p1": [0, 0], "p2": [250, 0]},
+        {"type": "arc", "center": [250, 50], "radius": 50, "start": -90, "end": 0, "ccw": True},
+        {"type": "line", "p1": [300, 50], "p2": [300, 150]},
+        {"type": "arc", "center": [350, 150], "radius": 50, "start": 180, "end": 90,
+         "ccw": False},
+        {"type": "line", "p1": [350, 200], "p2": [500, 200]},
+    ]
+    section = [{"type": "circle", "center": [0, 0], "radius": 12.5},
+               {"type": "circle", "center": [0, 0], "radius": 10.5}]
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "add_feature", "feature": {"type": "sketch", "name": "Path",
+            "params": {"entities": path}, "refs": {"plane": "plane.front"}}},
+        {"op": "add_feature", "feature": {"type": "sketch", "name": "Section",
+            "params": {"entities": section}, "refs": {"plane": "plane.right"}}},
+        {"op": "add_feature", "feature": {"type": "sweep", "name": "Tube",
+            "params": {"mode": "boss"},
+            "refs": {"profile": [{"kind": "region", "sketch": "$1"}], "path": "$0"}}},
+    ]})
+    assert r["ok"], r
+    tori = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "surf": "torus"}})
+    assert tori["count"] == 4, tori
+    got = sorted((tuple(round(v, 4) for v in m["torus_center"]), m["minor_radius"])
+                 for m in tori["matches"])
+    assert got == [((250.0, 0.0, 50.0), pytest.approx(10.5)),
+                   ((250.0, 0.0, 50.0), pytest.approx(12.5)),
+                   ((350.0, 0.0, 150.0), pytest.approx(10.5)),
+                   ((350.0, 0.0, 150.0), pytest.approx(12.5))], tori
+    for m in tori["matches"]:
+        assert m["major_radius"] == pytest.approx(50.0), m
+        assert [abs(v) for v in m["torus_axis"]] == pytest.approx([0.0, 1.0, 0.0]), m
+        assert m["radius"] is None and m["axis"] is None, m
+    m = tori["matches"][0]
+    pick = cb.call("doc_resolve_pick", {"doc_id": doc, "body_id": m["body"],
+                                        "kind": "face", "topo_id": m["topo"]})["selector"]
+    for key in ("major_radius", "minor_radius", "torus_axis", "torus_center"):
+        assert pick[key] == pytest.approx(m[key]), (key, pick)
+    # A match handed back as a query keeps resolving (the torus keys are read-back keys).
+    echo = {k: v for k, v in m.items() if k != "side"}
+    again = cb.call("doc_query", {"doc_id": doc, "query": {**echo, "of": "face", "surf": "torus",
+                                                         "near": m["centroid"], "count": 1}})
+    assert again["matches"][0]["sid"] == m["sid"], again
+    cyl = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "surf": "cylinder"}})
+    assert all("major_radius" not in c for c in cyl["matches"]), cyl
     _call("close_part", {"doc_id": doc})
 
 
@@ -3295,6 +3835,56 @@ def test_asm_mate_on_a_saved_assembly_resolves_relative_component_sources(
         cb.call("doc_close", {"doc_id": reopened})
         _call("close_part", {"doc_id": pin})
         _call("close_part", {"doc_id": plate})
+
+
+def test_new_assembly_resolves_relative_sources_against_the_project(tmp_path, monkeypatch):
+    """Live 2026-10-10 (six-axis arm): the agent copied `source` objects from a SAVED
+    assembly (`parts/redesign/claw_base.step+`, relative to its file) into a NEW unsaved
+    assembly. The engine resolved them against hostd's cwd and failed
+    "doc_open: no such file: /home/hunter/parts/...". An unsaved assembly resolves a
+    relative source against the project folder; describe_assembly reports the absolute file."""
+    project = tmp_path / "project"
+    (project / "parts").mkdir(parents=True)
+    r, _ = _call("new_part", {"name": "proj_rel_box"})
+    part = r["doc_id"]
+    box = project / "parts" / "proj_rel_box.step+"
+    try:
+        added, _ = _call("add_features", {"doc_id": part, "ops": [
+            cb.feat("box", "Body", {"length": cb.dim(12), "width": cb.dim(10),
+                                    "height": cb.dim(8)})]})
+        assert added["ok"], added
+        assert _call("save_part", {"doc_id": part, "path": str(box)})[0]["ok"]
+    finally:
+        _call("close_part", {"doc_id": part})
+
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(project))
+    elsewhere = tmp_path / "hostd_cwd"  # parts/... from here is NOT the project
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    asm = _call("new_assembly", {"name": "proj_rel_asm", "fresh": True})[0]["doc_id"]
+    try:
+        inserted, _ = _call("add_features", {"doc_id": asm, "ops": [
+            {"op": "asm_insert_component", "source": {"path": "parts/proj_rel_box.step+"},
+             "name": "Box", "fixed": True}]})
+        assert inserted["ok"], inserted
+
+        described, _ = _call("describe_assembly", {"doc_id": asm})
+        assert described["component_source_base"] == str(project), described
+        comps = described["components"]
+        # The stored source is unchanged; the resolved file sits next to it.
+        assert [c["source"] for c in comps] == [{"path": "parts/proj_rel_box.step+"}], comps
+        assert comps[0]["source_resolved"] == str(box), comps
+
+        missing, _ = _call("add_features", {"doc_id": asm, "ops": [
+            {"op": "asm_insert_component", "source": {"path": "parts/absent.step+"}}]})
+        assert missing["ok"] is False, missing
+        text = json.dumps(missing)
+        assert str(project / "parts" / "absent.step+") in text, missing
+        assert f"base folder '{project}'" in text, missing
+        assert str(elsewhere) not in text, missing
+    finally:
+        cb.call("doc_close", {"doc_id": asm})
+
 
 
 def test_saved_assembly_rebases_component_sources_when_project_moves(tmp_path, monkeypatch):

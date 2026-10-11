@@ -330,9 +330,58 @@ def test_unknown_appearance_still_refuses_and_teaches(bogus):
     with pytest.raises(ValueError) as exc:
         _cc._resolve_appearance(bogus)
     msg = str(exc.value)
-    assert "Unknown appearance material" in msg
+    assert "Unknown material" in msg
+    assert "engineering material registry" in msg  # names the resolution path it tried
     assert "alloy designations" in msg          # points at the new capability
     assert "'color'" in msg                     # and the explicit escape hatch
+
+
+@pytest.mark.parametrize("spelling,key,yield_mpa,ultimate_mpa", [
+    # ASTM/ASME minimums; spellings the piping/vessel benchmark models actually sent
+    ("ASTM A106 Grade B", "steel_astm_a106_grade_b", 240, 415),
+    ("A106-B", "steel_astm_a106_grade_b", 240, 415),
+    ("SA-106-B", "steel_astm_a106_grade_b", 240, 415),
+    ("A53 Gr B", "steel_astm_a53_grade_b", 240, 415),
+    ("A53-B", "steel_astm_a53_grade_b", 240, 415),
+    ("SA-516-70", "steel_asme_sa516_grade_70", 260, 485),
+    ("SA-516 Gr 70", "steel_asme_sa516_grade_70", 260, 485),
+    ("A516-70", "steel_asme_sa516_grade_70", 260, 485),
+    ("A312 TP304", "stainless_astm_a312_tp304", 205, 515),
+    ("A312-TP316", "stainless_astm_a312_tp316", 205, 515),
+])
+def test_piping_and_vessel_grades_resolve_identity_look_and_own_minima(
+        spelling, key, yield_mpa, ultimate_mpa):
+    """set_material resolves the look and the engineering key through the SAME registry row,
+    and FEA gets that grade's own specified minima, not A36/304 by substitution."""
+    look = _cc._resolve_appearance(spelling)
+    assert len(look["color"]) == 3
+    resolved = next(r for r in (cb.call("material_resolve_key", {"name": c}).get("result")
+                                for c in _cc._material_candidates(spelling)) if r)
+    assert (resolved.get("key") if isinstance(resolved, dict) else resolved) == key
+    mat = _resolve_material(spelling)
+    assert mat["yield_mpa"] == yield_mpa and mat["ultimate_mpa"] == ultimate_mpa, mat
+
+
+@pytest.mark.parametrize("name", ["Inconel 718", "PEEK", "concrete", "tungsten",
+                                  "Cast Iron (Gray)"])
+def test_registry_rows_without_a_finish_still_get_a_look(name):
+    """A registry material is never refused as 'unknown' just because it has no finish."""
+    assert len(_cc._resolve_appearance(name)["color"]) == 3
+
+
+def test_set_material_accepts_astm_pipe_and_vessel_grades_as_engineering_identity():
+    """Benchmark F2/F3 regression: set_material refused 'ASTM A106 Grade B' and 'SA-516-70'
+    as 'Unknown appearance material' although the piping tools use exactly those grades."""
+    doc = _call("new_part", {"name": "astm_grade_identity", "fresh": True})["doc_id"]
+    built = _call("add_features", {"doc_id": doc, "ops": [
+        {"type": "box", "name": "Solid", "params": {"length": 10, "width": 10, "height": 10}}]})
+    assert built["ok"], built
+    for spelling, key in (("ASTM A106 Grade B", "steel_astm_a106_grade_b"),
+                          ("SA-516-70", "steel_asme_sa516_grade_70")):
+        assigned = _call("set_material", {"doc_id": doc, "material": spelling})
+        assert assigned["ok"], assigned
+        assert assigned["material_key"] == key, assigned
+        assert assigned["material_registry_resolved"] is True, assigned
 
 
 def test_explicit_colour_dict_still_bypasses_every_table():

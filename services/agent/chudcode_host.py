@@ -24,13 +24,14 @@ import time
 import uuid
 from urllib.parse import urlsplit
 from collections import OrderedDict, deque
-from collections.abc import Callable, Mapping, Reversible, Sequence
+from collections.abc import Callable, Iterable, Mapping, Reversible, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from services.agent.chudcode_questions import TurnQuestions
-from services.agent.progress_watchdog import ProgressWatchdog
+from services.agent.online_turn import format_duration
+from services.agent.progress_watchdog import ProgressWatchdog, TurnBudgetReminder
 
 _DEFAULT_MAX_SESSIONS = 8
 _MAX_MAX_SESSIONS = 32
@@ -108,6 +109,31 @@ class HelperCompletionError(RuntimeError):
     """A tool-free helper completion produced no usable text (cancelled, over budget,
     model rejected, provider failure or runtime error). The message is the runtime's own
     reason; callers report it rather than fabricating a model answer."""
+
+
+#: Chudcode shows this for `read`/`write xd://<name>` when <name> is in the CAD catalog
+#: but not mounted yet; `{name}` is the tool name.
+_LOADABLE_TOOL_HINT = 'Call enable_tools(tools=["{name}"]) first. Then read or write it.'
+
+
+def publish_host_tools(client: Any, tools: Sequence[Any], advertised: Iterable[str]) -> None:
+    """Register *tools* and name every catalog tool that ``enable_tools`` can still load.
+
+    With the list, Chudcode answers ``xd://<unloaded tool>`` with the enable_tools step
+    instead of a bare "No such tool".
+    """
+    from chudcode_rpc import LoadableHostTools  # type: ignore  # noqa: PLC0415
+
+    from services.agent.tool_categories import loadable_tool_names  # noqa: PLC0415
+
+    names = loadable_tool_names(advertised)
+    if not names:
+        client.set_custom_tools(tools)
+        return
+    client.set_custom_tools(
+        tools,
+        loadable_tools=LoadableHostTools(names=tuple(names), hint=_LOADABLE_TOOL_HINT),
+    )
 
 
 _BYOK_PROVIDER_ENV = {
@@ -410,6 +436,8 @@ class ChudcodeSessionHost:
     def __init__(self, client_factory=None, binary=None, *, clock=None):
         self._clock = clock or time.monotonic
         self._realtime_watchdog = clock is None
+        # Watchdog / turn-budget timers; a test may substitute a recording factory.
+        self._timer_factory: Callable[..., threading.Timer] = threading.Timer
         self._client_factory = client_factory
         self._binary_hint = os.fspath(binary) if binary is not None else None
         self._max_sessions = _session_limit_from_env()
@@ -490,6 +518,9 @@ class ChudcodeSessionHost:
         scheduled_deadline: float | None = None
         progress_closed = False
         progress_threads: list[threading.Thread] = []
+        # Set once the prompt is sent, only for a turn with an explicit budget.
+        budget_reminder: TurnBudgetReminder | None = None
+        budget_timer: threading.Timer | None = None
 
         def schedule_progress_timer() -> None:
             nonlocal progress_timer, scheduled_deadline
@@ -501,13 +532,16 @@ class ChudcodeSessionHost:
                 progress_timer = None
             scheduled_deadline = deadline
             if self._realtime_watchdog and deadline is not None:
-                progress_timer = threading.Timer(
+                progress_timer = self._timer_factory(
                     max(0.0, deadline - self._clock()), check_progress_timer
                 )
                 progress_timer.daemon = True
                 progress_timer.start()
 
-        def send_progress_nudge(text: str) -> None:
+        def send_progress_nudge(text: str, feed: dict[str, Any]) -> None:
+            if progress_closed or run.cancel_requested:
+                # The turn already ended or was stopped: a steer now lands after it.
+                return
             try:
                 outcome = self.steer(run_id, text, from_user=False)
             except Exception as exc:  # noqa: BLE001 - advisory steering never aborts a turn
@@ -518,28 +552,30 @@ class ChudcodeSessionHost:
                     emit({
                         "type": "agent.progress_nudge",
                         "message": text,
-                        "text": (
-                            "Progress nudge: "
-                            + text.split(" without building anything.", 1)[0]
-                            + ". Commit sourced dimensions; start modeling and save one part at a time."
-                        ),
+                        **feed,
                         "run_id": run_id,
                         "session_id": session_id,
                     })
                 except Exception as exc:  # noqa: BLE001 - same boundary as RPC events
                     emit_errors.append(str(exc))
 
-        def dispatch_progress_nudge(text: str) -> None:
+        def dispatch_progress_nudge(text: str, feed: dict[str, Any] | None = None) -> None:
+            if feed is None:
+                feed = {"text": (
+                    "Progress nudge: "
+                    + text.split(" without building anything.", 1)[0]
+                    + ". Commit sourced dimensions; start modeling and save one part at a time."
+                )}
             # RpcClient notifications can run on the reader thread. Steering there
             # would wait for a response only that same reader can receive.
             if self._realtime_watchdog:
                 thread = threading.Thread(
-                    target=send_progress_nudge, args=(text,), daemon=True
+                    target=send_progress_nudge, args=(text, feed), daemon=True
                 )
                 progress_threads.append(thread)
                 thread.start()
             else:
-                send_progress_nudge(text)
+                send_progress_nudge(text, feed)
 
         def check_progress_timer() -> None:
             nonlocal progress_timer, scheduled_deadline
@@ -557,6 +593,30 @@ class ChudcodeSessionHost:
                 schedule_progress_timer()
             if text is not None:
                 dispatch_progress_nudge(text)
+
+        def take_budget_reminder() -> tuple[str, dict[str, Any]] | None:
+            """The one pre-expiry reminder once due; caller holds ``progress_lock``."""
+            if progress_closed or budget_reminder is None:
+                return None
+            text = budget_reminder.due()
+            if text is None:
+                return None
+            left = budget_reminder.remaining()
+            action = ("give the final answer now, then check it" if readonly_turn
+                      else "save requested deliverables now, then verify")
+            return text, {
+                "text": f"Turn budget: {format_duration(left)} left; {action}.",
+                "reason": "turn_budget",
+                "budget_s": budget_reminder.budget_s,
+                "remaining_s": round(left, 1),
+            }
+
+        def check_budget_timer() -> None:
+            with progress_lock:
+                reminder = take_budget_reminder()
+            if reminder is not None:
+                dispatch_progress_nudge(*reminder)
+
         try:
             session = self._get_or_create_session(session_id, params, resume_file)
             with session.turn_lock:
@@ -579,7 +639,7 @@ class ChudcodeSessionHost:
                 emit_lock = threading.Lock()
 
                 def forward(event: Any) -> None:
-                    nonlocal terminal, progress_closed
+                    nonlocal terminal, progress_closed, budget_timer
                     # Keep distinct notifications when the RPC client reuses a frame's
                     # object identity.
                     frame = _json_value(event)
@@ -600,14 +660,20 @@ class ChudcodeSessionHost:
                         with progress_lock:
                             progress_closed = True
                             schedule_progress_timer()
+                            if budget_timer is not None:
+                                budget_timer.cancel()
+                                budget_timer = None
                     if kind in _RETRY_FAILED_FRAMES or kind in _ASSISTANT_OUTPUT_FRAMES:
                         provider_frames.append(frame)
                     if not progress_closed:
                         with progress_lock:
                             nudge = progress.observe(frame, session.host_tool_names)
                             schedule_progress_timer()
+                            reminder = take_budget_reminder()
                         if nudge is not None:
                             dispatch_progress_nudge(nudge)
+                        if reminder is not None:
+                            dispatch_progress_nudge(*reminder)
                     try:
                         with emit_lock:
                             emit(frame)
@@ -742,6 +808,21 @@ class ChudcodeSessionHost:
                 # the run is aborted, because a Chudcode run nobody waits for keeps
                 # editing documents unseen (live 2026-09-25: two more unseen hours).
                 budget_s = _turn_budget_seconds(params.get("timeout"))
+                if budget_s is not None:
+                    # One pre-expiry steer (TurnBudgetReminder); it is cancelled by the
+                    # terminal or the end of this call, whichever comes first.
+                    with progress_lock:
+                        if not progress_closed:
+                            budget_reminder = TurnBudgetReminder(
+                                budget_s, self._clock, readonly=readonly_turn
+                            )
+                            deadline = budget_reminder.deadline()
+                            if self._realtime_watchdog and deadline is not None:
+                                budget_timer = self._timer_factory(
+                                    max(0.0, deadline - self._clock()), check_budget_timer
+                                )
+                                budget_timer.daemon = True
+                                budget_timer.start()
                 outcome = self._await_turn_idle(run, session, budget_s)
                 if outcome == "budget" and budget_s is not None:
                     return self._stop_budget_exhausted_run(
@@ -807,6 +888,8 @@ class ChudcodeSessionHost:
                 progress_closed = True
                 if progress_timer is not None:
                     progress_timer.cancel()
+                if budget_timer is not None:
+                    budget_timer.cancel()
             for thread in progress_threads:
                 if thread.is_alive():
                     thread.join(timeout=1)
@@ -1948,7 +2031,7 @@ class ChudcodeSessionHost:
         except ImportError as exc:
             raise RuntimeError(
                 "Agent service RPC support is unavailable; install the managed "
-                "chudcode-rpc==0.3.0 runtime dependency"
+                "chudcode-rpc==0.3.1 runtime dependency"
             ) from exc
         return RpcClient
 
@@ -2205,11 +2288,11 @@ class ChudcodeSessionHost:
                         from chudcode_rpc import host_tool  # type: ignore
                     except ImportError as exc:
                         raise RuntimeError(
-                            "chudcode-rpc==0.3.0 is required to register CAD host tools"
+                            "chudcode-rpc==0.3.1 is required to register CAD host tools"
                         ) from exc
                     binding = converter(host_tool)
                 converted_tools.append(binding)
-            client.set_custom_tools(converted_tools)
+            publish_host_tools(client, converted_tools, session.host_tool_names)
         host_uris = params.get("host_uris")
         if isinstance(host_uris, Sequence) and not isinstance(host_uris, (str, bytes)):
             client.set_host_uris(host_uris)

@@ -479,6 +479,13 @@ def f1_relief(ev: Evidence) -> CheckResult:
     return c.result(cid)
 
 
+def series_file_path(ev: Evidence, raw: Any) -> Path:
+    """A saved run's ``series_path``: absolute as stored, or relative to the project root —
+    the deliverable's directory (the trial workspace)."""
+    path = Path(str(raw))
+    return path if path.is_absolute() else ev.final_path.parent / path
+
+
 @check("F1.series_file")
 def f1_series_file(ev: Evidence) -> CheckResult:
     cid = "F1.series_file"
@@ -490,7 +497,7 @@ def f1_series_file(ev: Evidence) -> CheckResult:
     raw = sim.get("series_path")
     if not raw or not ids:
         return _fail(cid, "saved simulation names no full-resolution series file")
-    path = Path(str(raw))
+    path = series_file_path(ev, raw)
     if not path.is_file() or path.stat().st_size == 0:
         return _fail(cid, f"series file missing or empty: {path}", measured=str(path))
     try:

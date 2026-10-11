@@ -138,6 +138,133 @@ def test_a_shell_leaves_the_wall_it_was_asked_for():
     assert wt.get("ok") is not False, wt
 
 
+def _count(doc: str, query: dict) -> int:
+    return len(_call("query_geometry", doc_id=doc, query=query).get("matches") or [])
+
+
+@pytest.mark.parametrize("extra", [{}, {"kind": "face"}], ids=["query", "kind_face_query"])
+def test_a_shell_opened_top_and_bottom_is_a_tube(extra):
+    """refs.remove takes a LIST: each query element resolves like the bare form.
+
+    A two-query list used to reach the topology-selector scorer ("remove[0]: no candidates
+    of matching kind"); with "kind":"face" added it leaked a raw
+    "[json.exception.out_of_range.403] key 'centroid' not found".
+    """
+    doc = _new("rep_tube")
+    _apply(doc, {"type": "box", "name": "Body",
+                 "params": {"length": 60, "width": 40, "height": 30}})
+    _apply(doc, {"type": "shell", "name": "Tube", "params": {"thickness": 2},
+                 "refs": {"remove": [{**extra, "of": "face", "side": "top"},
+                                     {**extra, "of": "face", "side": "bottom"}]}})
+    # Open both ends: 60x40 outer minus the 56x36 bore, full 30 mm height.
+    assert _volume(doc) == pytest.approx(60 * 40 * 30 - 56 * 36 * 30, rel=1e-6)
+    assert _manifold(doc) == 1.0
+    # Four walls, each an outer + an inner face; the only z-facing faces are the two rims.
+    assert _count(doc, {"of": "face", "surf": "plane", "perpendicular": "z"}) == 8
+    assert _count(doc, {"of": "face", "parallel": "z"}) == 2
+
+
+def _spline_cup(doc: str) -> None:
+    _apply(doc,
+           {"type": "sketch", "name": "Prof", "refs": {"plane": "plane.front"},
+            "params": {"entities": [
+                {"type": "line", "p1": [0, 0], "p2": [30, 0]},
+                {"type": "spline", "points": [[30, 0], [38, 20], [34, 40], [40, 60]]},
+                {"type": "line", "p1": [40, 60], "p2": [0, 60]},
+                {"type": "line", "p1": [0, 60], "p2": [0, 0]}]}},
+           {"type": "revolve", "name": "Cup", "params": {"angle": 360, "mode": "boss"},
+            "refs": {"profile": [{"kind": "region", "sketch": "$0"}], "axis": "axis.z"}})
+
+
+def test_a_revolved_freeform_cup_shells_when_the_offset_validates():
+    """A spline-revolve (SurfaceOfRevolution) body is freeform, yet its offset validates —
+    so it shells instead of hitting the freeform refusal."""
+    doc = _new("rep_cup")
+    _spline_cup(doc)
+    faces = _call("query_geometry", doc_id=doc, query={"of": "face"})["matches"]
+    assert any(m["surf"] not in ("plane", "cylinder", "cone") for m in faces), faces
+    top = _call("query_geometry", doc_id=doc, query={"of": "face", "side": "top"})["matches"]
+    kept_area = sum(m["area_or_len"] for m in faces) - sum(m["area_or_len"] for m in top)
+    _apply(doc, {"type": "shell", "name": "Hollow", "params": {"thickness": 2},
+                 "refs": {"remove": [{"of": "face", "side": "top"}]}})
+    assert _manifold(doc) == 1.0
+    # A parallel inward offset of this (mostly convex) skin: the wall volume lies between
+    # t x (inner wall area) and t x (outer kept area) — a no-op, a solid block or a
+    # lost face all land outside that bracket.
+    shelled = _call("query_geometry", doc_id=doc, query={"of": "face"})["matches"]
+    rim = _call("query_geometry", doc_id=doc, query={"of": "face", "side": "top"})["matches"]
+    inner_area = (sum(m["area_or_len"] for m in shelled)
+                  - sum(m["area_or_len"] for m in rim) - kept_area)
+    assert 0 < 2 * inner_area < _volume(doc) < 2 * kept_area, (inner_area, kept_area)
+
+
+def _loft_duct(name: str) -> str:
+    doc = _new(name)
+    _apply(doc,
+           {"type": "sketch", "name": "Rect", "refs": {"plane": "plane.top"},
+            "params": {"entities": [{"type": "rect", "center": [0, 0],
+                                     "width": 100, "height": 60}]}},
+           {"type": "extrude", "name": "Base", "params": {"distance": 10},
+            "refs": {"profile": [{"kind": "region", "sketch": "$0"}]}},
+           {"type": "sketch", "name": "RectTop", "refs": {"plane": "plane.top"},
+            "params": {"entities": [{"type": "rect", "center": [0, 0],
+                                     "width": 100, "height": 60}], "offset": 10}},
+           {"type": "sketch", "name": "Round", "refs": {"plane": "plane.top"},
+            "params": {"entities": [{"type": "circle", "center": [0, 0], "radius": 40}],
+                       "offset": 130}},
+           {"type": "loft", "name": "Duct",
+            "refs": {"sections": [{"kind": "region", "sketch": "$2"},
+                                  {"kind": "region", "sketch": "$3"}]}},
+           {"type": "extrude", "name": "Collar", "params": {"distance": 10},
+            "refs": {"profile": [{"kind": "region", "sketch": "$3"}]}})
+    return doc
+
+
+_OPEN_ENDS = [{"of": "face", "side": "top"}, {"of": "face", "side": "bottom"}]
+
+
+def test_a_rect_to_circle_loft_duct_shells_open_at_both_ends():
+    """OCCT's offset refuses this body outright: a rectangle-to-circle loft's corner seams run
+    from a 90° crease at the rectangle to G1 tangency at the circle
+    (BRepOffset_MixedConnectivity, every join type and tolerance). The shell still builds —
+    the sectional builder hollows the duct — and the wall it leaves is the requested one."""
+    doc = _loft_duct("rep_duct")
+    faces = _call("query_geometry", doc_id=doc, query={"of": "face"})["matches"]
+    ends = sum(m["area_or_len"] for q in _OPEN_ENDS
+               for m in _call("query_geometry", doc_id=doc, query=q)["matches"])
+    kept_area = sum(m["area_or_len"] for m in faces) - ends
+    _apply(doc, {"type": "shell", "name": "Hollow", "params": {"thickness": 2},
+                 "refs": {"remove": _OPEN_ENDS}})
+    assert _manifold(doc) == 1.0
+    # Both ends open: the only faces across the axis are the two 2 mm rims, 100x60 - 96x56
+    # at the bottom and the Ø80/Ø76 annulus at the top.
+    rims = sorted(m["area_or_len"] for m in _call(
+        "query_geometry", doc_id=doc, query={"of": "face", "surf": "plane", "parallel": "z"}
+    )["matches"])
+    assert rims == pytest.approx([math.pi * (40 ** 2 - 38 ** 2), 100 * 60 - 96 * 56], rel=1e-3)
+    # A 2 mm wall on (mostly convex) skin: between t x inner area and t x outer kept area.
+    shelled = _call("query_geometry", doc_id=doc, query={"of": "face"})["matches"]
+    inner_area = sum(m["area_or_len"] for m in shelled) - sum(rims) - kept_area
+    assert 0 < 2 * inner_area < _volume(doc) < 2 * kept_area, (inner_area, kept_area)
+
+
+def test_an_outward_shell_of_the_loft_duct_still_refuses_by_name():
+    """The sectional builder hollows inward only; an outward shell keeps the named kernel
+    refusal, locates the seams, and leaves the duct intact — never an invalid body."""
+    doc = _loft_duct("rep_duct_out")
+    before = _volume(doc)
+    out = _call("add_features", doc_id=doc, ops=[{"op": "add_feature", "feature":
+        {"type": "shell", "name": "Hollow", "params": {"thickness": 2, "outward": True},
+         "refs": {"remove": _OPEN_ENDS}}}])
+    assert out.get("ok") is False, out
+    err = out.get("error") or ""
+    assert "shell is not supported on this lofted" in err, err
+    assert "BRepOffset_MixedConnectivity" in err, err
+    assert "4 edge(s) run from a crease into tangency" in err, err
+    assert _volume(doc) == pytest.approx(before, rel=1e-9)
+    assert _manifold(doc) == 1.0
+
+
 def test_a_draft_tapers_the_face_it_names():
     doc = _new("rep_draft")
     _apply(doc, {"type": "box", "name": "Body",

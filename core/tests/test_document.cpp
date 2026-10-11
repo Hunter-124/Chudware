@@ -37,6 +37,8 @@
 #include <BRepPrimAPI_MakeCone.hxx>
 #include <BRepPrimAPI_MakeSphere.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
+#include <BRepAlgoAPI_BuilderAlgo.hxx>                     // closed solid: imprint an edge
+#include <BRepBuilderAPI_MakeEdge.hxx>                     // closed solid: the imprint edge
 #include <BRepAdaptor_Surface.hxx>
 #include <TopLoc_Location.hxx>
 #include <gp_Cylinder.hxx>
@@ -4304,9 +4306,9 @@ TEST_CASE("eval_section_props uses rotated nested assembly world geometry") {
     std::filesystem::remove_all(dir);
 }
 
-TEST_CASE("eval_section_props refuses an open contour instead of returning a partial section") {
+TEST_CASE("eval_section_props names an open body the plane cuts and skips one it misses") {
     using namespace chudware::doc;
-    const std::string id = doc_new("part", "SectionOpenContour").at("doc_id");
+    const std::string id = doc_new("part", "SectionOpenBody").at("doc_id");
     const auto path = std::filesystem::temp_directory_path() / (id + ".brep");
     BRepBuilderAPI_MakePolygon boundary;
     boundary.Add(gp_Pnt(30.0, -10.0, -10.0));
@@ -4319,27 +4321,102 @@ TEST_CASE("eval_section_props refuses an open contour instead of returning a par
     REQUIRE(BRepTools::Write(face.Face(), path.string().c_str()));
     const json built = doc_apply_ops(id, -1, json::array({
         {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Block"},
-            {"params", {{"length", 4.0}, {"width", 6.0}, {"height", 10.0}}}}}},
+            {"params", {{"length", 4.0}, {"width", 6.0}, {"height", 10.0},
+                        {"centered", true}}}}}},
         {{"op", "add_feature"}, {"feature", {{"type", "import"}, {"name", "OpenSurface"},
             {"params", {{"source_path", path.string()}, {"format", "brep"}, {"mode", "new"}}}}}}
     }), false);
     for (const auto& status : built.at("rebuild").at("feature_status"))
         REQUIRE_MESSAGE(status.value("ok", false), status.dump());
+    // The sheet lies at x=30, so the right plane cuts only the closed block.
+    CHECK(doc_eval_section_props(id, "plane.right").at("area_mm2").get<double>() ==
+          doctest::Approx(60.0));
     try {
         (void)doc_eval_section_props(id, "plane.top");
-        FAIL("open section contour must not produce a partial area or a successful zero");
+        FAIL("a plane through an open body must not produce a partial area or a successful zero");
     } catch (const OpError& error) {
         CHECK(error.code == "section_failed");
-        REQUIRE(error.detail.at("open_locations").size() == 2);
-        for (const auto& location : error.detail.at("open_locations")) {
-            CHECK(location.at("degree") == 1);
-            CHECK(location.at("point")[0].get<double>() == doctest::Approx(30.0));
-            CHECK(std::abs(location.at("point")[1].get<double>()) == doctest::Approx(10.0));
-            CHECK(location.at("point")[2].get<double>() == doctest::Approx(0.0).epsilon(1e-8));
-        }
+        CHECK(error.detail.at("reason") == "body_not_closed_solid");
+        CHECK(error.detail.at("body_id") == 2);
+        CHECK(error.detail.at("free_edges").at("count") == 4);
+        CHECK(error.detail.at("free_edges").at("crossing_plane") == 2);
+        CHECK(error.detail.at("free_edges").at("sids").size() == 4);
     }
     CHECK(doc_close(id));
     std::filesystem::remove(path);
+}
+
+TEST_CASE("eval_section_props sections a closed shell and refuses a solid with free edges") {
+    using namespace chudware::doc;
+    // The coplanar-step body: z=0 holds the pocket floor and x=0 holds the pocket wall.
+    BRepAlgoAPI_Cut step(
+        BRepPrimAPI_MakeBox(gp_Pnt(-5.0, -5.0, -5.0), 10.0, 10.0, 10.0).Shape(),
+        BRepPrimAPI_MakeBox(gp_Pnt(0.0, -3.0, 0.0), 5.0, 6.0, 5.0).Shape());
+    REQUIRE(step.IsDone());
+    BRepAlgoAPI_Cut bored(step.Shape(),
+        BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(-2.5, 0.0, -5.0), gp_Dir(0, 0, 1)),
+                                1.0, 10.0).Shape());
+    REQUIRE(bored.IsDone());
+    TopExp_Explorer shells(bored.Shape(), TopAbs_SHELL);
+    REQUIRE(shells.More());
+    const TopoDS_Shell closed_skin = TopoDS::Shell(shells.Current());
+
+    // Drop the bottom face (z=-5) and keep the SOLID wrapper: free edges inside a SOLID.
+    BRep_Builder builder;
+    TopoDS_Shell open_skin;
+    builder.MakeShell(open_skin);
+    for (TopExp_Explorer f(closed_skin, TopAbs_FACE); f.More(); f.Next()) {
+        GProp_GProps props;
+        BRepGProp::SurfaceProperties(f.Current(), props);
+        if (std::abs(props.CentreOfMass().Z() + 5.0) > 1e-9) builder.Add(open_skin, f.Current());
+    }
+    TopoDS_Solid open_solid;
+    builder.MakeSolid(open_solid);
+    builder.Add(open_solid, open_skin);
+
+    auto import_doc = [](const std::string& name, const TopoDS_Shape& shape,
+                         std::filesystem::path& path) {
+        const std::string doc = doc_new("part", name).at("doc_id");
+        path = std::filesystem::temp_directory_path() / (doc + ".brep");
+        REQUIRE(BRepTools::Write(shape, path.string().c_str()));
+        const json built = doc_apply_ops(doc, -1, json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "import"}, {"name", name},
+                {"params", {{"source_path", path.string()}, {"format", "brep"}}}}}}
+        }), false);
+        for (const auto& status : built.at("rebuild").at("feature_status"))
+            REQUIRE_MESSAGE(status.value("ok", false), status.dump());
+        return doc;
+    };
+    const json floor_plane = {{"origin", {0.0, 0.0, 0.0}}, {"normal", {0.0, 0.0, 1.0}}};
+    const json wall_plane = {{"origin", {0.0, 0.0, 0.0}}, {"normal", {1.0, 0.0, 0.0}}};
+
+    std::filesystem::path skin_path;
+    const std::string skin = import_doc("SectionClosedSkin", closed_skin, skin_path);
+    CHECK(doc_eval_section_props(skin, floor_plane).at("area_mm2").get<double>() ==
+          doctest::Approx(100.0 - PI));
+    CHECK(doc_eval_section_props(skin, wall_plane).at("area_mm2").get<double>() ==
+          doctest::Approx(100.0));
+    CHECK(doc_close(skin));
+    std::filesystem::remove(skin_path);
+
+    std::filesystem::path open_path;
+    const std::string open = import_doc("SectionOpenSolid", open_solid, open_path);
+    for (const json& plane : {floor_plane, wall_plane}) {
+        try {
+            (void)doc_eval_section_props(open, plane);
+            FAIL("a solid with free edges must not report a classified area");
+        } catch (const OpError& error) {
+            CHECK(error.code == "section_failed");
+            CHECK(error.detail.at("reason") == "body_not_closed_solid");
+            CHECK(error.detail.at("body_id") == 1);
+            CHECK(error.detail.at("free_edges").at("count").get<int>() > 0);
+        }
+    }
+    const json missed = doc_eval_section_props(open,
+        {{"origin", {0.0, 0.0, 20.0}}, {"normal", {0.0, 0.0, 1.0}}});
+    CHECK(missed.at("area_mm2").get<double>() == 0.0);
+    CHECK(doc_close(open));
+    std::filesystem::remove(open_path);
 }
 
 
@@ -5176,6 +5253,83 @@ TEST_CASE("validate: a rejected selector slot teaches the whole grammar, incl. q
         const std::vector<std::string> errs = chudware::doc::validate_document(canon);
         for (const auto& x : errs) MESSAGE("  " << x);
         CHECK(errs.empty());
+    }
+}
+
+// A mates[i].refs[j].selector rejection taught the generic selector grammar (queries,
+// datum names, f<N>, "$<N>"), and none of those can be stored in a mate ref: the stored ref
+// is resolved by assembly.cpp::selector_to_mategeom, which reads only a face/edge/vertex
+// topology selector. Live c250: a model followed that grammar and failed again. The mate
+// ref rejection must teach the {component, query} / {component, sid} operand that
+// asm_mate and add_features resolve, and a real engine selector must still validate.
+TEST_CASE("validate: a rejected mate ref teaches the mate operand, not the selector grammar") {
+    const json face_sel = {{"kind", "face"}, {"sid", "F2bb10f"}, {"surf", "plane"},
+                           {"centroid", {0.0, 0.0, 5.0}}, {"axis", {0.0, 0.0, 1.0}},
+                           {"hint_index", 0}, {"owner_feature", nullptr}};
+    auto asm_doc = [&](json ref0) {
+        const json ident = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        json canon;
+        canon["schema"] = "aicad.asm/1";
+        canon["id"] = "asm1";
+        canon["name"] = "Pair";
+        canon["units"] = json{{"system", "MMGS"}};
+        canon["components"] = json::array();
+        for (const char* k : {"k1", "k2"})
+            canon["components"].push_back({{"id", k}, {"name", k}, {"source", {{"path", "p.step+"}}},
+                                           {"transform", ident}, {"fixed", false},
+                                           {"suppressed", false}});
+        canon["mates"] = json::array({{{"id", "m1"}, {"type", "coincident"}, {"align", "aligned"},
+                                       {"suppressed", false}, {"value", nullptr},
+                                       {"refs", json::array({ref0, {{"component", "k2"},
+                                                                    {"selector", face_sel}}})}}});
+        canon["features"] = json::array();
+        return canon;
+    };
+    auto ref0_err = [&](json ref0) {
+        for (const auto& e : chudware::doc::validate_document(asm_doc(ref0)))
+            if (e.rfind("mates[0].refs[0]", 0) == 0) return e;
+        return std::string();
+    };
+    auto teaches_mate_operand = [](const std::string& e) {
+        CHECK(e.find("{\"component\":\"k1\",\"query\":") != std::string::npos);
+        CHECK(e.find("asm_mate") != std::string::npos);
+        // The generic grammar names forms a mate ref can never store.
+        CHECK(e.find("a selector slot accepts") == std::string::npos);
+        CHECK(e.find("same-batch") == std::string::npos);
+    };
+
+    SUBCASE("an unresolved {component, query} ref names the unresolved query") {
+        const std::string e = ref0_err(
+            {{"component", "k1"}, {"query", {{"of", "face"}, {"side", "top"}}}});
+        REQUIRE_MESSAGE(!e.empty(), "a ref without a selector must be rejected");
+        MESSAGE(e);
+        CHECK(e.find("'query'") != std::string::npos);
+        teaches_mate_operand(e);
+    }
+    SUBCASE("a query written in the selector slot names the query key") {
+        const std::string e = ref0_err(
+            {{"component", "k1"}, {"selector", {{"of", "face"}, {"side", "top"}}}});
+        REQUIRE_MESSAGE(!e.empty(), "a query in the selector slot must be rejected");
+        MESSAGE(e);
+        CHECK(e.find("Put the query in 'query'") != std::string::npos);
+        teaches_mate_operand(e);
+    }
+    SUBCASE("a ref that is a JSON string is rejected with the mate operand") {
+        const std::string e = ref0_err("{\"component\":\"k1\",\"query\":{\"of\":\"face\"}}");
+        REQUIRE_MESSAGE(!e.empty(), "a string ref must be rejected");
+        MESSAGE(e);
+        teaches_mate_operand(e);
+    }
+    SUBCASE("a half-built topology selector keeps the mate tail") {
+        const std::string e = ref0_err(
+            {{"component", "k1"}, {"selector", {{"kind", "face"}, {"sid", "F2bb10f"}}}});
+        REQUIRE_MESSAGE(!e.empty(), "a centroid-less face selector must be rejected");
+        MESSAGE(e);
+        CHECK(e.find("incomplete engine topology selector") != std::string::npos);
+        teaches_mate_operand(e);
+    }
+    SUBCASE("an engine face selector validates clean") {
+        CHECK(ref0_err({{"component", "k1"}, {"selector", face_sel}}).empty());
     }
 }
 
@@ -6202,4 +6356,95 @@ TEST_CASE("native assembly: spherical caps coincide at centers without locking r
     std::error_code ec;
     std::filesystem::remove(socket_path, ec);
     std::filesystem::remove(ball_path, ec);
+}
+
+TEST_CASE("native assembly: a dangling extra mate ref is named in the mate reason") {
+    using namespace chudware::doc;
+    const TopoDS_Shape socket = BRepPrimAPI_MakeSphere(12.0, 0.0, PI / 2.0).Shape();
+    const TopoDS_Shape ball = BRepPrimAPI_MakeSphere(9.8, 0.0, PI / 2.0).Shape();
+    const json socket_face = mate_surface_selector(socket, "sphere");
+    const json ball_face = mate_surface_selector(ball, "sphere");
+    json missing_face = ball_face;
+    missing_face["centroid"] = {1e9, 1e9, 1e9};
+
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto socket_path = dir / "chudware_mate_extra_ref_socket.brep";
+    const auto ball_path = dir / "chudware_mate_extra_ref_ball.brep";
+    REQUIRE(BRepTools::Write(socket, socket_path.string().c_str()));
+    REQUIRE(BRepTools::Write(ball, ball_path.string().c_str()));
+    const json assembly{
+        {"schema", "aicad.asm/1"},
+        {"components", json::array({
+            {{"id", "socket"}, {"source", {{"path", socket_path.string()}}}, {"fixed", true}},
+            {{"id", "ball"}, {"source", {{"path", ball_path.string()}}}, {"fixed", false}}
+        })},
+        {"mates", json::array({
+            {{"id", "ball_center"}, {"type", "coincident"},
+             {"refs", json::array({
+                 {{"component", "socket"}, {"selector", socket_face}},
+                 {{"component", "ball"}, {"selector", ball_face}},
+                 {{"component", "ball"}, {"selector", missing_face}},
+                 {{"component", "ghost"}, {"selector", ball_face}}
+             })}}
+        })}
+    };
+    const AssemblyResult result = compile_assembly(assembly);
+    CHECK_FALSE(result.converged);
+    REQUIRE(result.mate_status.size() == 1);
+    const AsmMateStatus& status = result.mate_status[0];
+    CHECK(status.status == "unresolved");
+    CHECK(status.dangling_refs == std::vector<std::string>{"refs[2]", "refs[3]"});
+    // The first two refs resolved, so the reason names only the dangling extras.
+    CHECK(status.reason.find("refs[0]") == std::string::npos);
+    CHECK(status.reason.find("refs[1]") == std::string::npos);
+    CHECK(status.reason.find("refs[2] face") != std::string::npos);
+    CHECK(status.reason.find("did not resolve on component 'ball'") != std::string::npos);
+    CHECK(status.reason.find("asm_mate") != std::string::npos);
+    CHECK(status.reason.find("refs[3] component 'ghost' is not in the solve") !=
+          std::string::npos);
+    std::error_code ec;
+    std::filesystem::remove(socket_path, ec);
+    std::filesystem::remove(ball_path, ec);
+}
+
+TEST_CASE("measure and solid health agree that an internal imprint edge keeps a body closed") {
+    using namespace chudware::doc;
+    // A general fuse of a box and an edge inside its top face imprints that edge as an
+    // INTERNAL edge of the face: one ancestor face, no skin boundary use.
+    TopTools_ListOfShape args;
+    args.Append(BRepPrimAPI_MakeBox(40.0, 30.0, 10.0).Shape());
+    args.Append(BRepBuilderAPI_MakeEdge(gp_Pnt(10, 10, 10), gp_Pnt(30, 20, 10)).Edge());
+    BRepAlgoAPI_BuilderAlgo imprint;
+    imprint.SetArguments(args);
+    imprint.Build();
+    REQUIRE(imprint.IsDone());
+    TopExp_Explorer solids(imprint.Shape(), TopAbs_SOLID);
+    REQUIRE(solids.More());
+    const TopoDS_Shape body = solids.Current();
+    int internal_uses = 0;
+    for (TopExp_Explorer f(body, TopAbs_FACE); f.More(); f.Next())
+        for (TopExp_Explorer e(f.Current(), TopAbs_EDGE); e.More(); e.Next())
+            if (e.Current().Orientation() == TopAbs_INTERNAL) ++internal_uses;
+    REQUIRE(internal_uses == 1);
+
+    const auto path = std::filesystem::temp_directory_path() / "chudware_imprint_closed_solid.brep";
+    REQUIRE(BRepTools::Write(body, path.string().c_str()));
+    const std::string id = doc_new("part", "ImprintedBox").at("doc_id").get<std::string>();
+    doc_import_file(path.string(), id, false, "brep");
+
+    const json health = doc_eval_solid_health(id, 1);
+    REQUIRE(health.at("bodies").size() == 1);
+    const json& census = health["bodies"][0];
+    CHECK(census.at("edges") == 13);  // 12 box edges + the imprint
+    CHECK(census.at("free_edges").at("count") == 0);
+    CHECK(census.at("is_watertight") == true);
+
+    // measure_part reads closed_solid from doc_eval_mass; it must not call this body open.
+    const json mass = doc_eval_mass(id, 0, 7.85);
+    CHECK_FALSE(mass.contains("closed_solid"));
+    CHECK_FALSE(mass.contains("warning"));
+    CHECK(mass.value("volume_mm3", 0.0) == doctest::Approx(12000.0).epsilon(1e-9));
+    doc_close(id);
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
 }

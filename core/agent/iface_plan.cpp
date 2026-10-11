@@ -165,11 +165,13 @@ int feature_count(const json& f) {
     if (f.contains("count")) return as_int(f["count"], 0);
     if (f.contains("params") && f["params"].is_object() && f["params"].contains("count"))
         return as_int(f["params"]["count"], 0);
-    if (f.contains("positions") && f["positions"].is_array())
-        return static_cast<int>(f["positions"].size());
-    if (f.contains("params") && f["params"].is_object() && f["params"].contains("positions") &&
-        f["params"]["positions"].is_array())
-        return static_cast<int>(f["params"]["positions"].size());
+    // hole: face-local `positions` or `world_points` — one bore per entry either way.
+    for (const char* k : {"positions", "world_points"}) {
+        if (f.contains(k) && f[k].is_array()) return static_cast<int>(f[k].size());
+        if (f.contains("params") && f["params"].is_object() && f["params"].contains(k) &&
+            f["params"][k].is_array())
+            return static_cast<int>(f["params"][k].size());
+    }
     return 0;
 }
 
@@ -580,11 +582,13 @@ MeasuredInterface measure_interface_from_tree(const std::string& part_name, cons
             if (cnt > 0) h["count"] = cnt;
             double pcd = feature_pcd(f);
             if (pcd > 0.0) h["pcd"] = pcd;
-            // positions passthrough if present
-            if (f.contains("positions")) h["positions"] = f["positions"];
-            else if (f.contains("params") && f["params"].is_object() &&
-                     f["params"].contains("positions"))
-                h["positions"] = f["params"]["positions"];
+            // placement passthrough if present (face-local positions or world points)
+            for (const char* k : {"positions", "world_points"}) {
+                if (f.contains(k)) h[k] = f[k];
+                else if (f.contains("params") && f["params"].is_object() &&
+                         f["params"].contains(k))
+                    h[k] = f["params"][k];
+            }
             m.holes.push_back(h);
         }
         if (lines < 24) {

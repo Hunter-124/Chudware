@@ -26,6 +26,8 @@ import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
+from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from services import paths
@@ -218,8 +220,6 @@ def workspace_dir(cfg: dict | None = None) -> "Path":
 
     Always returns a Path; creates the directory when missing (best-effort).
     """
-    from pathlib import Path  # noqa: PLC0415 — keep module import surface small
-
     cfg = cfg if cfg is not None else load_config()
     raw = (cfg or {}).get("workspace_dir") or ""
     if isinstance(raw, str) and raw.strip():
@@ -263,8 +263,6 @@ def list_workspace_files(root: "Path", limit: int = 200) -> list[str]:
     group lexicographic. Truncates to *limit*, appending ``"… (+N more)"`` when
     more remain. Best-effort — an unreadable tree yields ``[]``.
     """
-    from pathlib import Path  # noqa: PLC0415
-
     root = Path(root)
     prio: list[str] = []
     rest: list[str] = []

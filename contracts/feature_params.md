@@ -193,6 +193,20 @@
   the face plane (world **+Y** when the plane is ⟂X); `v` = `n×u`, right-handed around the
   **outward** normal. Top face: u=+X, v=+Y; front (−Y) face: u=+X, v=+Z. `bolt_circle` uses
   the same frame (`start_angle` measured from `u`).
+- params may instead carry `world_points: [[x,y,z], …]` (mm, WORLD frame; mutually exclusive
+  with `positions`/`points` — both refuse by name). A world point names the bore **axis**:
+  the compiler projects it along the face normal onto the face plane and maps it into the
+  [u,v] frame above (`u = (p−origin)·u`, `v = (p−origin)·v`). A point more than **0.01 mm**
+  off the plane is projected and the distance reported in the feature warning. When the axis
+  misses the resolved face and `refs.face` is a WORD query (no `sid`), the bore enters the
+  planar face of the body with the same outward normal (within 1e-6 rad) whose interior holds
+  the axis crossing and that lies furthest along the normal (the face the drill meets first);
+  the substitution is named in the warning, so one feature can drill several boss tops at one
+  or several heights. A `sid` query or a concrete pick stays strict. An axis that enters no
+  such face is refused by name (`hole: world_points[k] …: the bore axis through it crosses …
+  OUTSIDE the face`). `bolt_circle` takes `world_center: [x,y,z]` for the ring centre under
+  the same projection (omitted = the face centre; the centre may sit in an opening; no face
+  substitution).
 - compiler: `core/doc/document.cpp` → `Hole/CounterBoreHole/CounterSinkHole` at each point.
 
 ## Patterns & mirror — tool-body semantics (normative)
@@ -679,3 +693,14 @@ fail by name rather than applying neutral-plane draft.
 translator transfers fewer roots than it contains still imports the translated bodies,
 and the response names the shortfall (for example `"2 of 5 STEP roots translated"`).
 Absent `warnings` means every root translated.
+
+### `extrude` — unknown params (append-only, 2026-10-10)
+
+`add_feature` and `edit_feature` refuse an extrude param key that the compiler does not read
+(`invalid_op`, `detail.reason: "unknown_param"`). The error names the key and gives a hint,
+for example `reverse`: set `"flip": true`. It also lists the accepted params: depth, depth2,
+dir, draft, draft_outward, end, end2, end2_offset, end_offset, flip, merge, mid_plane, mode,
+offset, offset2, start, start_offset, suppressed, thin, thin_side, thin_thickness. Ref-slot
+names are also accepted. Whole-document validation does not apply this rule. Thus saved
+documents with legacy keys still open and accept edits. Depth is a magnitude (> 0). To
+reverse the direction, set `flip`.

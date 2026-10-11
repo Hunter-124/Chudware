@@ -69,7 +69,9 @@ struct CachedInt {
 CachedInt g_verbosity    {"ui_verbosity",            2, 0, 2};
 CachedInt g_follow       {"ui_follow_session",       1, 0, 1};
 CachedInt g_previews     {"ui_active_work_previews", 1, 0, 1};
-CachedInt g_aiView       {"ui_ai_view",              0, 0, 5};
+CachedInt g_aiView       {"ui_ai_view",              0, 0, 6};
+CachedInt g_hubByParent  {"ui_subagent_hub_by_parent",    0, 0, 1};
+CachedInt g_hubSession   {"ui_subagent_hub_session_only", 0, 0, 1};
 CachedInt g_toolDetail   {"ui_chat_tool_detail",   1, 0, 2};
 CachedInt g_collapseAnim {"ui_chat_collapse_anim", 1, 0, 1};
 CachedInt g_groupCalls   {"ui_chat_group_calls",   1, 0, 1};
@@ -89,6 +91,12 @@ void setAiActiveWorkPreviews(bool on)  { g_previews.set(on ? 1 : 0); }
 
 int  aiWorkspaceView()                 { return g_aiView.get(); }
 void setAiWorkspaceView(int v)         { g_aiView.set(v); }
+
+bool aiSubagentHubByParent()            { return g_hubByParent.get() != 0; }
+void setAiSubagentHubByParent(bool on)  { g_hubByParent.set(on ? 1 : 0); }
+
+bool aiSubagentHubSessionOnly()           { return g_hubSession.get() != 0; }
+void setAiSubagentHubSessionOnly(bool on) { g_hubSession.set(on ? 1 : 0); }
 
 int  chatToolDetail()                { return g_toolDetail.get(); }
 void setChatToolDetail(int v)        { g_toolDetail.set(v); }

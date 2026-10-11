@@ -22,11 +22,29 @@ CHECK_NAMES = ("min_wall", "overhang", "bridges", "support", "small_holes", "int
                "bed_adhesion", "build_volume")
 
 
-def row(check: str, status: str, note: str, metrics=None, limits=None, regions=None, fix=None) -> dict:
+def row(check: str, status: str, note: str, metrics=None, limits=None, regions=None, fix=None,
+        omitted: int = 0, detail: bool = False) -> dict:
+    if omitted:
+        note += f" {omitted} more regions are not shown."
+        if not detail:
+            note += " To show up to 50 regions, set detail=true."
     return {"check": check, "status": status,
             "ok": False if status == "fail" else True if status in ("pass", "warn") else None,
             "note": note, "metrics": metrics or {}, "limits": limits or {},
-            "regions": regions or [], "fix": fix or []}
+            "regions": regions or [], "regions_omitted": int(omitted), "fix": fix or []}
+
+
+_STATUS_RANK = {"fail": 0, "warn": 1}
+
+
+def _ranked(regions: list, limit: int, severity) -> tuple[list, int]:
+    """(shown, omitted): failing regions first, then warnings, then the rest.
+
+    Inside one status the most severe region (lowest `severity(region)`) comes first, so a
+    failing region is never cut off by warnings that measure worse (a knife edge thinner
+    than the failing wall). The sort is stable, so equal regions keep their order."""
+    order = sorted(regions, key=lambda r: (_STATUS_RANK.get(r.get("status"), 2), severity(r)))
+    return order[:limit], max(len(order) - limit, 0)
 
 
 def rounded(value):
@@ -81,6 +99,7 @@ class CheckContext:
     _holes: list | None = None
     _bridges: dict | None = None
     _enclosed: tuple[float, float] | None = None
+    _inaccessible: dict | None = None
 
     @property
     def limit(self) -> int:
@@ -217,7 +236,7 @@ def min_wall(ctx: CheckContext) -> dict:
                                   perimeters=t / p.line_width_mm if vertical[index] else None,
                                   layers=t / p.layer_height_mm if not vertical[index] else None,
                                   status="fail" if failing[mask].any() else "warn"))
-    regions.sort(key=lambda r: r["thickness_mm"])
+    shown, omitted = _ranked(regions, ctx.limit, lambda r: r["thickness_mm"])
     walls = finite & ~wedge
     value = float(thickness[walls].min()) if walls.any() else (
         float(thickness[finite].min()) if finite.any() else None)
@@ -235,8 +254,8 @@ def min_wall(ctx: CheckContext) -> dict:
                                "area_mm2": float(weights[gap].sum()),
                                "note": "Walls between 2 and 6 line widths far from an integer perimeter count require gap fill."}},
                  {"min_wall_mm": p.min_wall_mm, "nozzle_mm": p.nozzle_mm,
-                  "line_width_mm": p.line_width_mm, "minimum_skin_layers": 3}, regions[:ctx.limit],
-                 [remedy] if status != "pass" else [])
+                  "line_width_mm": p.line_width_mm, "minimum_skin_layers": 3}, shown,
+                 [remedy] if status != "pass" else [], omitted, ctx.detail)
     result.update(value_mm=value, limit_mm=p.min_wall_mm)
     return result
 
@@ -319,18 +338,22 @@ def bridges(ctx: CheckContext) -> dict:
     data, p, peel = bridge_data(ctx), ctx.params, ctx.peel
     indexes = np.flatnonzero(data["bridge"])
     value = float(data["spans"][indexes].max()) if len(indexes) else 0.0
-    status = "fail" if value > 2 * p.max_bridge_mm + 1e-6 else "warn" if value > p.max_bridge_mm + 1e-6 else "pass"
+    def tier(span: float) -> str:
+        return "fail" if span > 2 * p.max_bridge_mm + 1e-6 else "warn" if span > p.max_bridge_mm + 1e-6 else "pass"
+    status = tier(value)
     regions = []
     for group in ctx.groups(peel.tri[indexes]):
         ids = indexes[np.isin(peel.tri[indexes], group)]
-        regions.append(ctx.region(group, span_mm=float(data["spans"][ids].max()),
+        span = float(data["spans"][ids].max())
+        regions.append(ctx.region(group, span_mm=span, status=tier(span),
                                   area_mm2=len(np.unique(peel.cells[ids])) * peel.cell ** 2))
-    regions.sort(key=lambda r: -r["span_mm"])
+    shown, omitted = _ranked(regions, ctx.limit, lambda r: -r["span_mm"])
     return row("bridges", status, f"Largest two-sided bridge span {value:.3f} mm; clean bridge limit {p.max_bridge_mm:g} mm, fail above {2*p.max_bridge_mm:g} mm.",
                {"max_span_mm": value, "bridge_area_mm2": len(indexes) * peel.cell ** 2,
                 "grid_mm": peel.cell}, {"max_bridge_mm": p.max_bridge_mm, "fail_span_mm": 2*p.max_bridge_mm},
-               regions[:ctx.limit], ["slicer bridges it but expect sag; add support/sacrificial layer or shorten"] if status == "warn" else
-               ["shorten bridge span or add accessible supports"] if status == "fail" else [])
+               shown, ["slicer bridges it but expect sag; add support/sacrificial layer or shorten"] if status == "warn" else
+               ["shorten bridge span or add accessible supports"] if status == "fail" else [],
+               omitted, ctx.detail)
 
 
 def support_data(ctx: CheckContext) -> dict:
@@ -386,18 +409,24 @@ def overhang(ctx: CheckContext) -> dict:
     tids = np.flatnonzero(fraction > 0)
     area = float(np.sum(g.areas * fraction))
     ceiling_fail = False
+    fail_tids = np.zeros(0, dtype=int)
     if p.process == "fdm":
         bridge_info = bridge_data(ctx)
-        ceiling_fail = bool(np.any(data["needed"] &
-                           ((bridge_info["cantilever"] > 2*p.line_width_mm) |
-                            (bridge_info["bridge"] & ~bridge_info["accepted"]))))
+        unbridged = data["needed"] & ((bridge_info["cantilever"] > 2*p.line_width_mm) |
+                                      (bridge_info["bridge"] & ~bridge_info["accepted"]))
+        ceiling_fail = bool(np.any(unbridged))
+        fail_tids = np.unique(peel.tri[unbridged])
     regions, hints = [], []
     for group in ctx.groups(tids):
         z = float(g.triangles[group, :, 2].min())
         infos = [g.mesh.faces[f] for f in np.unique(g.mesh.tri_face[group]) if f >= 0]
         angle = float(ctx.angles[group].max())
-        regions.append(ctx.region(group, area_mm2=float(np.sum(g.areas[group] * fraction[group])),
-                                  max_angle_deg=angle, z_mm=z))
+        region_area = float(np.sum(g.areas[group] * fraction[group]))
+        # Same rule as the row status, applied to this region alone.
+        region_status = ("fail" if region_area > 1.0 or np.isin(group, fail_tids).any() else
+                         "warn" if region_area > 1e-5 else "pass")
+        regions.append(ctx.region(group, area_mm2=region_area, max_angle_deg=angle, z_mm=z,
+                                  status=region_status))
         if any(info.surf_type in (1, 4) for info in infos) and z <= np.ptp(g.triangles[group, :, 2]):
             hints.append("replace bed-edge fillet with a 45 deg chamfer")
         elif any(np.intersect1d(group, h["tids"]).size for h in ctx.holes):
@@ -406,7 +435,7 @@ def overhang(ctx: CheckContext) -> dict:
             hints.append("shorten ceiling to a bridgeable span or reorient")
         else:
             hints.append("add 45 deg chamfers or reorient")
-    regions.sort(key=lambda r: -r["area_mm2"])
+    shown, omitted = _ranked(regions, ctx.limit, lambda r: -r["area_mm2"])
     small = [ctx.region(h["tids"], diameter_mm=2*h["radius"], classification="self_supporting_horizontal_hole")
              for h in ctx.holes if abs(h["axis"][2]) < math.sin(math.radians(15)) and 2*h["radius"] <= p.teardrop_hole_mm]
     # Any downward area above 1 mm² that needs support is a design failure (dfm_check's
@@ -418,7 +447,7 @@ def overhang(ctx: CheckContext) -> dict:
                {"area_mm2": area, "face_count": len(regions),
                 "max_angle_deg": float(ctx.angles[tids].max()) if len(tids) else 0.,
                 "self_supporting_holes": small[:ctx.limit]}, {"overhang_max_deg": p.overhang_max_deg},
-               regions[:ctx.limit], sorted(set(hints)))
+               shown, sorted(set(hints)), omitted, ctx.detail)
 
 
 def _air_components(vox):
@@ -480,9 +509,53 @@ def _enclosed_support(ctx: CheckContext) -> tuple[float, float]:
     inaccessible = mask & ~reachable
     # Sealed air never becomes reachable by dilation through a thin solid wall.
     air_labels, sealed = _air_components(vox)
-    inaccessible |= mask & np.isin(air_labels, sealed)
+    in_sealed = mask & np.isin(air_labels, sealed)
+    inaccessible |= in_sealed
+    ctx._inaccessible = {"mask": inaccessible, "sealed": in_sealed}
     ctx._enclosed = (float(inaccessible.sum() * vox.cell**3), float(mask.sum() * vox.cell**3))
     return ctx._enclosed
+
+
+def _voxel_region(ctx: CheckContext, indexes: np.ndarray, **numbers) -> dict:
+    """Region for one voxel cluster: centre, model-frame bbox, volume and the faces around it."""
+    vox, g = ctx.vox, ctx.geom
+    corners = np.array([vox.origin + indexes.min(axis=0)*vox.cell,
+                        vox.origin + (indexes.max(axis=0)+1)*vox.cell])
+    # Bbox is axis-aligned in MODEL frame, not two rotated opposite corners.
+    allcorners = np.array([[x,y,z] for x in corners[:,0] for y in corners[:,1] for z in corners[:,2]])
+    model = g.model_points(allcorners)
+    tids = np.flatnonzero(np.all(g.triangles.max(axis=1) >= corners[0]-vox.cell, axis=1) &
+                          np.all(g.triangles.min(axis=1) <= corners[1]+vox.cell, axis=1))
+    return ctx.region(tids, center=vox.centers(indexes).mean(axis=0), volume_mm3=len(indexes)*vox.cell**3,
+                      bbox_mm=[model.min(axis=0), model.max(axis=0)], **numbers)
+
+
+def _inaccessible_regions(ctx: CheckContext) -> tuple[list, int]:
+    """(regions, cluster count) for the support that no tool can reach.
+
+    One region per connected cluster of inaccessible support voxels, so the row says WHERE
+    the trapped support is, not only how much support the part needs. Only the ctx.limit
+    most severe clusters (trapped first, then by volume) become regions."""
+    state, vox = ctx._inaccessible, ctx.vox
+    if state is None or not state["mask"].any():
+        return [], 0
+    labels, count = ndimage.label(state["mask"], structure=np.ones((3, 3, 3), dtype=bool))
+    sizes = np.bincount(labels.ravel(), minlength=count+1)
+    sealed = np.bincount(labels[state["sealed"]], minlength=count+1)
+
+    def trapped(label: int) -> bool:
+        return _trapped(float(sizes[label] * vox.cell**3), vox.cell)
+
+    selected = sorted(range(1, count+1), key=lambda label: (not trapped(label), -sizes[label], label))
+    boxes = ndimage.find_objects(labels)
+    regions = []
+    for label in selected[:ctx.limit]:
+        bounds = boxes[label-1]
+        indexes = np.argwhere(labels[bounds] == label) + np.array([s.start for s in bounds])
+        regions.append(_voxel_region(ctx, indexes, classification="inaccessible_support",
+                                     cause="sealed_cavity" if sealed[label] else "narrow_opening",
+                                     status="fail" if trapped(label) else "warn"))
+    return regions, count
 
 
 def _trapped(enclosed: float, voxel_mm: float) -> bool:
@@ -499,12 +572,15 @@ def support(ctx: CheckContext) -> dict:
     trapped = volume > 0 and _trapped(enclosed, ctx.vox.cell)
     status = "fail" if trapped else "warn" if data["on_model_area"] > 0 or enclosed > 0 else "pass"
     tids = np.unique(peel.tri[data["needed"]])
+    clusters, cluster_count = _inaccessible_regions(ctx) if enclosed > 0 else ([], 0)
     regions = []
     for group in ctx.groups(tids):
         ids = np.flatnonzero(data["needed"] & np.isin(peel.tri, group))
         regions.append(ctx.region(group, volume_mm3=float(np.sum(data["heights"][ids]) * peel.cell**2),
-                                  z_mm=float(peel.z[ids].max())))
-    regions.sort(key=lambda r: -r["volume_mm3"])
+                                  z_mm=float(peel.z[ids].max()), classification="support_demand"))
+    # Trapped clusters lead; demand regions only say where support is needed.
+    shown, omitted = _ranked(clusters + regions, ctx.limit, lambda r: -r["volume_mm3"])
+    omitted += cluster_count - len(clusters)
     fix = []
     if volume > 0:
         fix = ["reorient with optimize_print_orientation; add 45 deg chamfers or split part"]
@@ -517,7 +593,8 @@ def support(ctx: CheckContext) -> dict:
                {"support_volume_mm3": volume, "support_material_mm3": volume*p.support_density,
                 "landing_on_model_mm2": data["on_model_area"], "enclosed_support_mm3": enclosed,
                 "voxel_support_mm3": voxel_volume, "grid_mm": peel.cell, "voxel_mm": ctx.vox.cell if volume > 0 else None},
-               {"support_density": p.support_density, "access_mm": p.access_mm}, regions[:ctx.limit], fix)
+               {"support_density": p.support_density, "access_mm": p.access_mm}, shown, fix,
+               omitted, ctx.detail)
 
 
 def small_holes(ctx: CheckContext) -> dict:
@@ -537,7 +614,7 @@ def small_holes(ctx: CheckContext) -> dict:
         if status != "pass":
             regions.append(ctx.region(h["tids"], diameter_mm=d, axis=h["axis"],
                                       classification="vertical_hole" if vertical else "horizontal_hole", status=status))
-    regions.sort(key=lambda r: (r["status"] != "fail", r["diameter_mm"]))
+    shown, omitted = _ranked(regions, ctx.limit, lambda r: r["diameter_mm"])
     status = "fail" if any(r["status"] == "fail" for r in regions) else "warn" if regions else "pass"
     fixes = []
     if regions:
@@ -546,30 +623,32 @@ def small_holes(ctx: CheckContext) -> dict:
     return row("small_holes", status, f"{len(ctx.holes)} cylindrical holes evaluated; {len(regions)} below printability thresholds.",
                {"holes": len(ctx.holes), "problem_holes": len(regions)},
                {"min_hole_mm": p.min_hole_mm, "small_hole_warn_mm": p.small_hole_warn_mm,
-                "teardrop_hole_mm": p.teardrop_hole_mm}, regions[:ctx.limit], fixes)
+                "teardrop_hole_mm": p.teardrop_hole_mm}, shown, fixes, omitted, ctx.detail)
 
 
 def internal_voids(ctx: CheckContext) -> dict:
     vox, p, g = ctx.vox, ctx.params, ctx.geom
     labels, sealed = _air_components(vox)
-    regions = []
     sizes = np.bincount(labels.ravel())
     void_volume = float(sizes[sealed].sum() * vox.cell**3)
+    enclosed = _enclosed_support(ctx)[0] if len(sealed) and p.process == "fdm" else 0.
+    trapped = _trapped(enclosed, vox.cell)
+    # SLA/SLS trap resin or powder in every sealed cavity. FDM fails a cavity only when the
+    # support inside it cannot be removed.
+    trapped_in = np.zeros(len(sizes))
+    if p.process == "fdm" and ctx._inaccessible is not None:
+        trapped_in = np.bincount(labels[ctx._inaccessible["mask"]], minlength=len(sizes)) * vox.cell**3
+
+    def cavity_status(label: int) -> str:
+        return "fail" if p.process in ("sla", "sls") or _trapped(float(trapped_in[label]), vox.cell) else "warn"
+
     cavities = ndimage.find_objects(labels)
-    selected = sorted(sealed, key=lambda label: (-sizes[label], label))[:ctx.limit]
-    for label in selected:
+    selected = sorted(sealed, key=lambda label: (cavity_status(label) != "fail", -sizes[label], label))
+    regions = []
+    for label in selected[:ctx.limit]:
         bounds = cavities[label-1]
         indexes = np.argwhere(labels[bounds] == label) + np.array([s.start for s in bounds])
-        center = vox.centers(indexes).mean(axis=0)
-        corners = np.array([vox.origin + indexes.min(axis=0)*vox.cell,
-                            vox.origin + (indexes.max(axis=0)+1)*vox.cell])
-        # Bbox is axis-aligned in MODEL frame, not two rotated opposite corners.
-        allcorners = np.array([[x,y,z] for x in corners[:,0] for y in corners[:,1] for z in corners[:,2]])
-        model = g.model_points(allcorners)
-        tids = np.flatnonzero(np.all(g.triangles.max(axis=1) >= corners[0]-vox.cell, axis=1) &
-                              np.all(g.triangles.min(axis=1) <= corners[1]+vox.cell, axis=1))
-        regions.append(ctx.region(tids, center=center, volume_mm3=len(indexes)*vox.cell**3,
-                                  bbox_mm=[model.min(axis=0), model.max(axis=0)], classification="sealed_cavity"))
+        regions.append(_voxel_region(ctx, indexes, classification="sealed_cavity", status=cavity_status(label)))
     # Voxel components are welded by position, unlike display CAD tessellation vertices.
     bodies, _ = ndimage.label(vox.solid)
     floating = []
@@ -597,10 +676,9 @@ def internal_voids(ctx: CheckContext) -> dict:
                                   np.all(g.centroids <= high+vox.cell, axis=1))
             floating.append(ctx.region(tids, center=points.mean(axis=0),
                                        volume_mm3=len(indexes)*vox.cell**3, z_mm=lowest,
-                                       classification="floating_body"))
-    regions.sort(key=lambda r: -r["volume_mm3"])
-    enclosed = _enclosed_support(ctx)[0] if len(sealed) and p.process == "fdm" else 0.
-    trapped = _trapped(enclosed, vox.cell)
+                                       classification="floating_body", status="fail"))
+    shown, omitted = _ranked(floating + regions, ctx.limit, lambda r: -r["volume_mm3"])
+    omitted += len(sealed) - len(regions)
     status = ("fail" if floating or (len(sealed) and p.process in ("sla", "sls")) or trapped
               else "warn" if len(sealed) else "pass")
     fix = ["add >= 2 drain holes >= 3.5 mm to release trapped resin/powder"] if len(sealed) and p.process in ("sla", "sls") else []
@@ -613,7 +691,7 @@ def internal_voids(ctx: CheckContext) -> dict:
                {"sealed_cavities": len(sealed), "void_volume_mm3": void_volume,
                 "floating_bodies": len(floating), "enclosed_support_mm3": enclosed, "voxel_mm": vox.cell},
                {"access_mm": p.access_mm, "drain_holes": 2, "drain_diameter_mm": 3.5},
-               (floating + regions)[:ctx.limit], fix)
+               shown, fix, omitted, ctx.detail)
 
 
 def bed_adhesion(ctx: CheckContext) -> dict:

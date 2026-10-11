@@ -39,7 +39,7 @@ mcp==1.27.2
 #   pip install <chudcode-checkout>/python/chudcode-rpc
 # Without it every chudcode_* worker RPC refuses and Settings -> Providers reports a failed
 # service call rather than an empty provider set.
-chudcode-rpc==0.3.0       # MIT — typed RPC v2 client; compiled chud ships separately
+chudcode-rpc==0.3.1       # MIT — typed RPC v2 client; compiled chud ships separately
 # built-in agent provider adapters
 anthropic==0.107.1
 openai==2.41.0

@@ -285,7 +285,7 @@ def make_live_sim() -> Optional[LiveSim]:
 
             battery_score: Optional[float] = None
             try:
-                from services.verify.battery import verify  # noqa: local import (core-only path)
+                from services.verify.battery import verify  # Core-only path.
                 v = verify(None, ["cam_simulate"])
                 battery_score = v.get("scores", {}).get("cam_simulate")
             except Exception:

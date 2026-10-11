@@ -1461,3 +1461,163 @@ TEST_CASE("fitting_k: invalid tables and orifice ratios refuse rather than falli
     CHECK(result["ok"] == false);
     CHECK(result["reason"] == "invalid_params");
 }
+
+// ── tee per-path K + strict fitting params (F2 cooling-water benchmark shape) ──
+
+static ojson f2_network(ojson& tee_id, std::string& run_a, std::string& run_b) {
+    ojson result;
+    REQUIRE(call("piping_edit", ojson::parse(R"({"ops":[
+        {"op":"add_run","path":[[0,0,0],[10000,0,0]],"nps":2,"schedule":"40","material":"A106-B"},
+        {"op":"add_run","path":[[10000,0,0],[25000,0,0]]},
+        {"op":"add_run","path":[[10000,0,0],[10000,20000,0]]}]})"), result));
+    REQUIRE(result["ok"] == true);
+    ojson doc = result["piping"];
+    for (const auto& ft : doc["fittings"])
+        if (ft["type"] == "tee") tee_id = ft["id"];
+    REQUIRE(tee_id.is_string());
+    run_a = doc["runs"][1]["id"].get<std::string>();
+    run_b = doc["runs"][2]["id"].get<std::string>();
+    const ojson valve = ojson::parse(R"({"k_model":{"kind":"constant","K":5.0}})");
+    REQUIRE(call("piping_edit", {{"piping", doc}, {"ops", ojson::array({
+        {{"op","add_fitting"},{"type","custom"},{"at",{24000,0,0}},{"run_id",run_a},{"params",valve}},
+        {{"op","add_fitting"},{"type","custom"},{"at",{10000,19000,0}},{"run_id",run_b},{"params",valve}},
+        {{"op","update_fitting"},{"id",tee_id},{"params",{
+            {"k_model_run",{{"kind","constant"},{"K",0.38}}},
+            {"k_model_branch",{{"kind","constant"},{"K",1.14}}}}}}})}}, result));
+    REQUIRE(result["ok"] == true);
+    return result["piping"];
+}
+
+TEST_CASE("tee: constant per-path K on run and branch matches K*rho*v^2/2 in solve and report") {
+    ojson tee_id; std::string run_a, run_b;
+    const ojson doc = f2_network(tee_id, run_a, run_b);
+    REQUIRE(validate_piping(doc).empty());
+    ojson tee;
+    for (const auto& ft : doc["fittings"]) if (ft["id"] == tee_id) tee = ft;
+    REQUIRE(tee["params"]["run_ids"][1] == run_a);   // straight-through leg
+    REQUIRE(tee["params"]["branch_run"] == run_b);
+    const double rho = 998.2, mu = 0.001002;
+    const ojson boundary = ojson::parse(R"([{"at":[0,0,0],"pressure":250},
+        {"at":[25000,0,0],"demand":6},{"at":[10000,20000,0],"demand":6}])");
+    const ojson fluid = {{"rho", rho}, {"mu", mu}};
+    ojson solved;
+    REQUIRE(call("piping_solve", {{"doc", doc}, {"boundary", boundary}, {"fluid", fluid}}, solved));
+    REQUIRE(solved["ok"] == true);
+    REQUIRE(solved["converged"] == true);
+    std::map<std::string, ojson> links;
+    for (const auto& lk : solved["links"]) links[lk["id"].get<std::string>()] = lk;
+    CHECK(links[doc["runs"][0]["id"].get<std::string>()]["k_total"].get<double>() == doctest::Approx(0.0));
+    CHECK(links[run_a]["k_total"].get<double>() == doctest::Approx(5.38));
+    CHECK(links[run_b]["k_total"].get<double>() == doctest::Approx(6.14));
+
+    const double d = links[run_a]["id_mm"].get<double>() / 1000.0;  // NPS 2 sch 40 bore
+    CHECK(d == doctest::Approx(0.05248));
+    const double v = 6.0 / 3600.0 / (M_PI * d * d / 4.0);
+    const double q = 0.5 * rho * v * v;
+    ojson report;
+    REQUIRE(call("piping_report", {{"doc", doc}, {"result", solved}, {"fluid", fluid}}, report));
+    REQUIRE(report["ok"] == true);
+    std::map<std::string, std::map<std::string, ojson>> rows;  // run -> fitting -> row
+    for (const auto& seg : report["segments"])
+        for (const auto& b : seg["breakdown"])
+            if (b.contains("fitting") && b["fitting"].is_string())
+                rows[seg["id"].get<std::string>()][b["fitting"].get<std::string>()] = b;
+    const std::string tid = tee_id.get<std::string>();
+    REQUIRE(rows[run_a].count(tid));
+    REQUIRE(rows[run_b].count(tid));
+    CHECK(rows[run_a][tid]["method"] == "k_model_run(constant)");
+    CHECK(rows[run_b][tid]["method"] == "k_model_branch(constant)");
+    CHECK(rows[run_a][tid]["dp_kpa"].get<double>() * 1000 == doctest::Approx(0.38 * q).epsilon(1e-3));
+    CHECK(rows[run_b][tid]["dp_kpa"].get<double>() * 1000 == doctest::Approx(1.14 * q).epsilon(1e-3));
+    for (const auto& run : {run_a, run_b}) {
+        int valves = 0;
+        for (const auto& [fid, row] : rows[run])
+            if (fid != tid) {
+                ++valves;
+                CHECK(row["dp_kpa"].get<double>() * 1000 == doctest::Approx(5.0 * q).epsilon(1e-3));
+            }
+        CHECK(valves == 1);
+    }
+    // run_loss_1d (pipe_flow callback) shares the evaluator, unrounded.
+    const double flow = 6.0 / 3600.0;
+    const auto a = run_loss_1d(nlohmann::json(doc), run_a, rho, mu, flow, 0.046);
+    const auto b = run_loss_1d(nlohmann::json(doc), run_b, rho, mu, flow, 0.046);
+    REQUIRE(a["ok"] == true);
+    REQUIRE(b["ok"] == true);
+    CHECK(a["fittings_pa"].get<double>() == doctest::Approx(5.38 * q).epsilon(1e-3));
+    CHECK(b["fittings_pa"].get<double>() == doctest::Approx(6.14 * q).epsilon(1e-3));
+}
+
+TEST_CASE("fitting_k: tee previews both paths; path selects; non-tee path refuses") {
+    ojson result;
+    const ojson tee = ojson::parse(R"({"type":"tee","nps":2,"params":{
+        "k_model_run":{"kind":"constant","K":0.38},"k_model_branch":{"kind":"constant","K":1.14}}})");
+    REQUIRE(call("piping_fitting_k", {{"fitting", tee}}, result));
+    REQUIRE(result["ok"] == true);
+    CHECK(result["paths"]["run"]["K"].get<double>() == doctest::Approx(0.38));
+    CHECK(result["paths"]["branch"]["K"].get<double>() == doctest::Approx(1.14));
+    CHECK(result["paths"]["branch"]["method"] == "k_model_branch(constant)");
+    REQUIRE(call("piping_fitting_k", {{"fitting", tee}, {"path", "branch"}}, result));
+    CHECK(result["K"].get<double>() == doctest::Approx(1.14));
+    // k_model alone covers both paths; a path model wins over it on its own path.
+    ojson both = ojson::parse(R"({"type":"tee","nps":2,"params":{
+        "k_model":{"kind":"constant","K":0.9},"k_model_branch":{"kind":"constant","K":1.5}}})");
+    REQUIRE(call("piping_fitting_k", {{"fitting", both}}, result));
+    CHECK(result["paths"]["run"]["K"].get<double>() == doctest::Approx(0.9));
+    CHECK(result["paths"]["branch"]["K"].get<double>() == doctest::Approx(1.5));
+    // Without overrides a forced path uses the Crane 20/60 fT correlation.
+    REQUIRE(call("piping_fitting_k", ojson::parse(R"({"fitting":{"type":"tee","nps":2},"path":"run"})"), result));
+    CHECK(std::abs(result["K"].get<double>() / (20 * result["fT"].get<double>()) - 1) < 1e-9);
+    REQUIRE(call("piping_fitting_k", ojson::parse(R"({"fitting":{"type":"valve","nps":2,
+        "params":{"valve_type":"gate"}},"path":"run"})"), result));
+    CHECK(result["ok"] == false);
+    CHECK(result["reason"] == "invalid_params");
+    REQUIRE(call("piping_fitting_k", ojson::parse(R"({"fitting":{"type":"tee","nps":2,
+        "params":{"k_model_run":{"kind":"constant","K":-1}}}})"), result));
+    CHECK(result["reason"] == "invalid_k_model");
+}
+
+TEST_CASE("edit: unknown fitting params refuse by name and list accepted keys") {
+    ojson tee_id; std::string run_a, run_b;
+    const ojson doc = f2_network(tee_id, run_a, run_b);
+    ojson result;
+    REQUIRE(call("piping_edit", {{"piping", doc}, {"ops", ojson::array({
+        {{"op","update_fitting"},{"id",tee_id},{"params",{{"K_run",0.38},{"K_branch",1.14}}}}})}}, result));
+    CHECK(result["ok"] == false);
+    CHECK(result["reason"] == "unknown_param");
+    CHECK(result["op_index"] == 0);
+    const auto hint = result["hint"].get<std::string>();
+    CHECK(hint.find("'K_run'") != std::string::npos);     // every unknown key, by name
+    CHECK(hint.find("'K_branch'") != std::string::npos);
+    CHECK(hint.find("k_model_run") != std::string::npos);
+    CHECK(hint.find("k_model_branch") != std::string::npos);
+    CHECK(!result.contains("piping"));
+    // add_fitting is equally strict; per-path keys belong to tees only.
+    for (const auto& params : ojson::parse(R"([{"valve_type":"ball","Kv":3},
+                                               {"k_model_run":{"kind":"constant","K":1}}])")) {
+        REQUIRE(call("piping_edit", {{"piping", single_pipe_doc()}, {"ops", ojson::array({
+            {{"op","add_fitting"},{"type","valve"},{"at",{5000,0,0}},{"params",params}}})}}, result));
+        CHECK(result["ok"] == false);
+        CHECK(result["reason"] == "unknown_param");
+        CHECK(result["hint"].get<std::string>().find("valve_type") != std::string::npos);
+    }
+    // Deleting any key (null) and re-sending stored values unchanged stay accepted,
+    // so whole-params GUI round trips keep working.
+    ojson tee;
+    for (const auto& ft : doc["fittings"]) if (ft["id"] == tee_id) tee = ft;
+    ojson params = tee["params"];
+    params["k_model_branch"] = nullptr;
+    params["legacy_junk"] = nullptr;
+    REQUIRE(call("piping_edit", {{"piping", doc}, {"ops", ojson::array({
+        {{"op","update_fitting"},{"id",tee_id},{"params",params}}})}}, result));
+    REQUIRE(result["ok"] == true);
+    for (const auto& ft : result["piping"]["fittings"])
+        if (ft["id"] == tee_id) {
+            CHECK(!ft["params"].contains("k_model_branch"));
+            CHECK(ft["params"]["k_model_run"]["K"].get<double>() == doctest::Approx(0.38));
+        }
+    REQUIRE(call("piping_edit", {{"piping", doc}, {"ops", ojson::array({
+        {{"op","update_fitting"},{"id",tee_id},{"params",{{"k_model_run",{{"kind","constant"},{"K",-1}}}}}}})}},
+        result));
+    CHECK(result["reason"] == "invalid_k_model");
+}

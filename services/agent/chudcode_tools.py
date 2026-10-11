@@ -25,6 +25,7 @@ from services.agent.tool_images import (
     ImageUnavailable,
     image_ref,
     image_refs,
+    image_result,
     load_model_image,
 )
 
@@ -225,6 +226,12 @@ def host_tool_result(
     model asked for arrived as ``"<mcp.server.fastmcp.utilities.types.Image object at
     0x…>"`` (c205, c213, c217: the model re-rendered with ``save_path`` and ``read``
     the PNG to see anything).
+
+    An image result goes out as the mapping :func:`tool_images.image_result` makes
+    (``ok``, ``caption``, ``images``, ``saved_path``), in the text and in ``details``,
+    so eval code reads a render like every other CAD result (c250: ``r.items()`` on
+    ``render_part``'s list failed). Image notes go in its ``image_notes`` list, so
+    the text stays one JSON value for ``json.loads``.
     """
     if isinstance(result, str):
         parsed = _json_text_value(result)
@@ -237,7 +244,13 @@ def host_tool_result(
             return {"content": [{"type": "text", "text": text}], "details": safe}
         return _bounded_result(safe, [trailing], [], max_bytes, spill)
     safe = _json_safe(result)
+    shaped = image_result(safe)
+    if shaped is not None:
+        safe = shaped
     images, notes = _model_image_blocks(safe)
+    if shaped is not None and notes:
+        shaped["image_notes"] = notes
+        notes = []
     text = "\n".join((model_json(safe), *notes))
     if _fits(text, max_bytes):
         return {"content": [{"type": "text", "text": text}, *images], "details": safe}
@@ -273,9 +286,11 @@ def _bounded_result(
     branches on). Below them, whatever shrinks the text most is halved first — the
     long list, the huge string, the id-keyed map — so small records stay whole: a
     57-component list gets shorter, each component's 16-number transform does not.
-    A ``_truncated`` key records the shortened paths with their original sizes and
-    ``full_result``, a JSON file holding the complete value. ``details`` carries the
-    same shortened value, so structured consumers and the text never disagree.
+    Every cut string ends with a visible ``…[cut: …]`` marker (:func:`_cut_marker`),
+    so no reader takes a cut string for the whole text. A ``_truncated`` key records
+    the shortened paths with their original sizes and ``full_result``, a JSON file
+    holding the complete value. ``details`` carries the same shortened value, so
+    structured consumers, eval-bridged calls and the text never disagree.
     """
     full_bytes = len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
     path: str | None = None
@@ -291,29 +306,42 @@ def _bounded_result(
     ]
     holder = [json.loads(json.dumps(value, ensure_ascii=False, default=str))]
     shortened: dict[str, int] = {}
+    kept: dict[str, str] = {}
     for _round in range(_SHORTEN_ROUNDS):
         body = _with_truncation_marker(holder[0], shortened, full_bytes, max_bytes, path)
         text = "\n".join((model_json(body), *tail))
         if _fits(text, max_bytes):
             return {"content": [{"type": "text", "text": text}, *images], "details": body}
-        if not _shorten_largest(holder, shortened):
+        if not _shorten_largest(holder, shortened, kept, saved=path is not None):
             break
     body = _with_truncation_marker(None, {"$": full_bytes}, full_bytes, max_bytes, path)
     return {"content": [{"type": "text", "text": model_json(body)}, *images], "details": body}
 
 
-def _shorten_largest(holder: list[Any], shortened: dict[str, int]) -> bool:
+def _shorten_largest(
+    holder: list[Any], shortened: dict[str, int], kept: dict[str, str], *, saved: bool
+) -> bool:
     """Halve every node whose halving saves at least half the best saving; False when
     nothing can shrink. Lists keep their head (≥1 item), strings their start, and only
-    map-like objects (more than ``_MAP_KEYS`` keys, below the top level) lose keys."""
+    map-like objects (more than ``_MAP_KEYS`` keys, below the top level) lose keys.
+
+    A cut string keeps its start plus a :func:`_cut_marker` suffix. *kept* maps each
+    cut string's path to the start it kept, so a later round halves that start and
+    writes a fresh marker instead of cutting into the old one. *saved* says whether
+    ``_truncated.full_result`` names a file the marker can point to."""
     candidates: list[tuple[int, Any, Any, str, Any]] = []
 
     def size(node: Any, container: Any, key: Any, where: str, depth: int) -> int:
         if isinstance(node, str):
-            total = len(node) + 2
-            if len(node) > _MIN_STRING_CHARS:
-                candidates.append((total // 2, container, key, where, node))
-            return total
+            text = kept.get(where, node)
+            if len(text) > _MIN_STRING_CHARS:
+                start = max(_MIN_STRING_CHARS, len(text) // 2)
+                marker = _cut_marker(start, shortened.get(where, len(node)), saved)
+                if start + len(marker) < len(node):
+                    candidates.append(
+                        (len(node) - start - len(marker), container, key, where, text)
+                    )
+            return len(node) + 2
         if isinstance(node, list):
             sizes = [
                 size(item, node, index, f"{where}[{index}]", depth + 1)
@@ -341,12 +369,24 @@ def _shorten_largest(holder: list[Any], shortened: dict[str, int]) -> bool:
             continue
         shortened.setdefault(where, len(node))
         if isinstance(node, str):
-            container[key] = node[: max(_MIN_STRING_CHARS, len(node) // 2)] + " …"
+            start = node[: max(_MIN_STRING_CHARS, len(node) // 2)]
+            kept[where] = start
+            container[key] = start + _cut_marker(len(start), shortened[where], saved)
         elif isinstance(node, list):
             container[key] = node[: len(node) // 2]
         else:
             container[key] = dict(list(node.items())[: len(node) // 2])
     return True
+
+
+def _cut_marker(kept_chars: int, total_chars: int, saved: bool) -> str:
+    """Visible suffix of a cut string: what it kept, and where the full text is."""
+    where = (
+        "full text in _truncated.full_result"
+        if saved
+        else "full text not saved; narrow the call"
+    )
+    return f" …[cut: kept {kept_chars} of {total_chars} characters; {where}]"
 
 
 def _with_truncation_marker(
@@ -364,7 +404,8 @@ def _with_truncation_marker(
         "note": (
             f"This result is {full_bytes} bytes, over the {max_bytes}-byte tool-result "
             "budget, so the lists/objects/strings listed under 'shortened' (path: "
-            "original size) keep only their first entries. "
+            "original size) keep only their first entries. Each cut string ends with "
+            "a '…[cut: …]' marker. Do not parse a cut string as complete text. "
             + (
                 "The complete JSON is saved at the full_result path: load it with "
                 "json.load(open(path)) in eval, or read it with a line range."
@@ -1264,8 +1305,15 @@ def _document_args(
     if not callable(fn):
         return out
     selectors = getattr(fn, "_cad_model_selectors", ())
+    # A tool that takes its documents from another argument (slice_part's parts=[...])
+    # declares it; the run's doc_id would read as a second, conflicting target.
+    replaced = any(
+        out.get(key) is not None for key in getattr(fn, "_cad_context_doc_unless", ())
+    )
     for name in ("doc_id", "actor", "run_id", "node_id", "parent_id", "subagent_id"):
         value = _ctx(context, name, None)
+        if name == "doc_id" and replaced:
+            continue
         if (
             value is not None and name not in out and name not in selectors
             and _accepts(fn, name)

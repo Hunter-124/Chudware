@@ -15,7 +15,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from services.agent.chudcode_events import RpcFrameState, map_rpc_frame
-from services.agent.chudcode_host import get_default_chudcode_host
+from services.agent.chudcode_host import get_default_chudcode_host, publish_host_tools
 from services.agent.chudcode_tools import build_host_tools
 from services.agent.roles import RoleError, load_role
 
@@ -380,10 +380,12 @@ def _register_category_refresh(
                 from chudcode_rpc import host_tool  # type: ignore
             except ImportError as exc:
                 raise RuntimeError(
-                    "chudcode-rpc==0.3.0 is required to refresh CAD host tools"
+                    "chudcode-rpc==0.3.1 is required to refresh CAD host tools"
                 ) from exc
-            client.set_custom_tools(
-                [binding.to_host_tool(host_tool) for binding in refreshed]
+            publish_host_tools(
+                client,
+                [binding.to_host_tool(host_tool) for binding in refreshed],
+                [binding.name for binding in refreshed],
             )
             live = {binding.name for binding in refreshed}
             result: dict[str, Any] = {

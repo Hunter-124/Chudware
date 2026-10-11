@@ -9,9 +9,11 @@ Contract: contracts/advisor.md §12 (leases), §13 (buildgraph), §2.14.
 from __future__ import annotations
 
 import difflib
+import os
 import sys
 from typing import Any
 
+from services.mcp import core_bridge as cb
 from services.mcp.tool_registry import model_selectors
 
 
@@ -35,68 +37,128 @@ def _current_doc_id() -> str:
     return ""
 
 
+def _turn_project_dir() -> str:
+    """The project directory of the current turn, or "" when none is set.
+
+    The online turn sets CHUDWARE_PROJECT_DIR and CHUDWARE_FS_ROOT for its whole
+    lifetime (services/agent/online_turn.py). The project dir has priority.
+    """
+    for key in ("CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT"):
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            return os.path.normpath(os.path.abspath(os.path.expanduser(raw)))
+    return ""
+
+
+def _doc_location(path: Any, project: str) -> str:
+    """Classify an open document: "project", "outside_project" or "unsaved"."""
+    if not path:
+        return "unsaved"
+    if not project:
+        return "outside_project"
+    p = os.path.normpath(os.path.abspath(str(path)))
+    try:
+        inside = os.path.commonpath([p, project]) == project
+    except ValueError:  # different drives on Windows
+        inside = False
+    return "project" if inside else "outside_project"
+
+
+def _turn_snapshot(ts: str) -> dict:
+    """The real workspace of a turn that has no multi-doc session.
+
+    GUI chat turns and plain MCP clients never register a WorkspaceSession: only
+    a multi-doc orchestration does. Their workspace is the project directory of
+    the turn plus the documents open in the engine. Report that state, or say
+    exactly which part is unavailable. Never report an empty list as success.
+    """
+    project = _turn_project_dir()
+    out: dict[str, Any] = {
+        "schema": "aicad.workspace/1",
+        "scope": "turn",
+        "run_id": "",
+        "ts": ts,
+        "project_dir": project,
+        "current_doc_id": _current_doc_id(),
+    }
+    try:
+        listed = cb.call("doc_list", {}) or {}
+    except Exception as exc:  # noqa: BLE001 - reported to the caller, not hidden
+        out.update(
+            ok=False,
+            reason="engine_unavailable",
+            error=f"The engine did not return the open documents: {exc}",
+            hint=("Use fs_list() to see the project files. Call workspace_status() "
+                  "again when the engine is available."),
+        )
+        return out
+    docs = []
+    for row in listed.get("docs") or []:
+        if isinstance(row, dict) and row.get("doc_id"):
+            docs.append({**row, "location": _doc_location(row.get("path"), project)})
+    out.update(ok=True, docs=docs)
+    out["note"] = (
+        "No multi-doc workspace session is registered. docs lists every document "
+        "that is open in the engine."
+    )
+    if not project:
+        out["note"] += " This turn has no project directory."
+    return out
+
+
 def register_workspace_tools(mcp) -> None:
     """Register workspace tools under the ``workspace`` family."""
 
     @mcp.tool()
     @model_selectors("run_id")
     def workspace_status(run_id: str = "") -> dict:
-        """Return the full workspace snapshot for *run_id*.
+        """Return the workspace snapshot: project directory, open documents, owners.
 
-        One call gives the GUI everything it needs:
-        - Open docs with owners, status, and latest render artifact path.
-        - Buildgraph node statuses (if a session is active for this run).
-        - Timestamp.
+        Omit run_id in a chat turn. Then the snapshot shows the project directory
+        of the turn and every document open in the engine (scope "turn"). Each
+        document has a location: "project", "outside_project" or "unsaved".
+        If exactly one multi-doc session is registered, the snapshot shows that
+        session (scope "session"): document owners, status and latest render.
 
-        This is the polling target until a push channel exists (T-W17).
-        Risk: read (named in _READ_EXACT in tool_registry — no lease required).
-
-        run_id is optional: a general/orientation turn that doesn't name a run
-        gets the ambient session when exactly one is live, otherwise an
-        empty-but-OK snapshot. A fresh single-doc turn has no registered
-        multi-doc session — that's not an error, so it never paints a failure
-        card. A NAMED-but-unknown run_id stays an error (orchestrator poll
-        contract) but the error is actionable: it lists the run ids that DO
-        exist, suggests the closest spelling (suggestion only — never resolved
-        for you), and when NO multi-doc session exists anywhere it says so and
-        names the tools that answer the same question in a single-doc run.
+        Give run_id only to select a registered multi-doc session. A chat turn
+        run id does not name a session. An unknown run_id returns ok=false with
+        the registered run ids and the call to use instead.
+        Risk: read (named in _READ_EXACT in tool_registry; no lease required).
         """
         from services.agent import workspace as ws
 
         reg = ws._session_registry
         rid = (run_id or "").strip()
         if not rid:
-            # No run named: resolve the ambient session, else report empty-OK.
-            if len(reg) == 1:
-                session = next(iter(reg.values()))
-            else:
-                snap = {
-                    "ok": True,
+            if not reg:
+                return _turn_snapshot(ws._now())
+            if len(reg) > 1:
+                known = sorted(reg.keys())
+                return {
+                    "ok": False,
                     "schema": "aicad.workspace/1",
+                    "reason": "run_id_required",
                     "run_id": "",
-                    "ts": ws._now(),
-                    "docs": [],
+                    "error": f"{len(reg)} multi-doc workspace sessions are registered.",
+                    "known_run_ids": known,
+                    "hint": "Give run_id to select one session.",
+                    "do_instead": [f"workspace_status(run_id='{k}')" for k in known],
                 }
-                snap["note"] = ("no active multi-doc workspace session" if not reg
-                                else f"{len(reg)} active sessions; pass run_id to select one")
-                if reg:
-                    snap["run_ids"] = sorted(reg.keys())
-                return snap
+            session = next(iter(reg.values()))
         else:
             session = reg.get(rid)
             if session is None:
-                # ADVERTISED BUT IMPOSSIBLE (10 dead calls in the gym ledgers):
-                # every one named the mission run_id, and nothing on the live
-                # single-doc path ever calls workspace.register_session(), so the
-                # old one-line error was unactionable — the model could only
-                # retry. Say precisely what to do INSTEAD in this run.
+                # Production code registers a WorkspaceSession only for a multi-doc
+                # orchestration. A GUI chat turn ("gui-...") or a mission run id
+                # never resolves here, so the error must teach the call that works.
                 known = sorted(reg.keys())
                 close = difflib.get_close_matches(rid, known, n=1, cutoff=0.5)
                 out: dict[str, Any] = {
                     "ok": False,
                     "schema": "aicad.workspace/1",
+                    "reason": "unknown_run_id",
                     "run_id": rid,
-                    "error": f"no active workspace session for run_id={rid!r}",
+                    "error": f"no multi-doc workspace session has run_id={rid!r}",
                     "known_run_ids": known,
                     "did_you_mean": (close[0] if close else ""),
                     "docs": [],
@@ -116,25 +178,16 @@ def register_workspace_tools(mcp) -> None:
                     ]
                 else:
                     out["hint"] = (
-                        "There is no multi-doc workspace session anywhere in this "
-                        "process — this is a single-doc run, so no run_id will ever "
-                        "resolve here. Do NOT retry workspace_status with another id: "
-                        "use describe_project() for the project view, list_parts() for "
-                        "what is open, and describe_part(doc_id=...) for one document."
+                        "No multi-doc workspace session is registered. A chat turn run "
+                        "id does not name a session. Call workspace_status() with no "
+                        "run_id to get the project directory and the open documents."
                     )
-                    out["do_instead"] = [
-                        "describe_project()",
-                        "list_parts()",
-                        "describe_part(doc_id=...)",
-                    ]
+                    out["do_instead"] = ["workspace_status()", "list_parts()"]
                     cur = _current_doc_id()
                     if cur:
-                        # Real state, not a fabricated session: the document this
-                        # turn is actually pointed at.
                         out["current_doc_id"] = cur
-                        out["do_instead"].insert(0, f"describe_part(doc_id='{cur}')")
                 return out
-        return {"ok": True, **session.workspace_status()}
+        return {"ok": True, "scope": "session", **session.workspace_status()}
 
     @mcp.tool()
     @model_selectors("run_id")

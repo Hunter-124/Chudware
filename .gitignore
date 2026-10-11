@@ -19,6 +19,9 @@ core/build*/
 # Root-level CMake preset build dirs (CMakePresets linux-core / linux-app → build/linux-*)
 /build/
 
+# Machine-local clangd compilation database / convenience symlink.
+/compile_commands.json
+
 # Test caches
 .pytest_cache/
 

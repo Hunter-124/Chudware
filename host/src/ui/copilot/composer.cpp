@@ -1023,10 +1023,17 @@ static void ovSetAgentBool(const char* key, bool v) {
 }
 
 // ============================ slash autocomplete (commands + skills) ============================
-// Editor-style drop-up menu when the composer holds a single slash token (`^/[^\s]*$`).
+// Editor-style drop-up menu when the composer holds a single slash token (`^/[^\s]*$`), and an
+// options menu when it holds a command that takes enumerated arguments plus the argument being
+// typed (`^/cmd[ \t]+[^\s]*$`). Free-form arguments get an in-box hint after `/cmd `.
 // Session cmds are local; skills come from the skills_list RPC (same catalog as Settings).
 
 enum class SlashKind { Session, Skill, Meta };
+
+struct SlashArg {
+    const char* value;    // typed after the command, exactly
+    const char* detail;   // what choosing it does, in user terms
+};
 
 struct SlashItem {
     SlashKind   kind = SlashKind::Session;
@@ -1036,6 +1043,13 @@ struct SlashItem {
     const char* icon = "ai_panel";
     // Its service call shares the agent lane a running turn holds: unavailable during a run.
     bool        needsIdle = false;
+    // Free-form argument syntax: /help, usage refusals, and the hint painted after `/cmd `.
+    const char* argHint = nullptr;
+    // Enumerated arguments: `/cmd ` opens the options menu; any other value is refused.
+    std::vector<SlashArg> args;
+    // What a bare `/cmd` does (options menu header). Set = the argument is optional, so the
+    // menu opens with nothing picked and Enter alone runs the command.
+    const char* noArgDetail = nullptr;
 };
 
 struct ComposerSkillRow {
@@ -1055,14 +1069,14 @@ static ComposerSkillsCache s_composerSkills;
 
 struct SlashMenuState {
     bool open = false;
-    int  selected = 0;
-    std::string filter;                 // typed text AFTER the leading '/'
+    int  selected = 0;                  // -1: nothing picked (options of an optional argument)
+    std::string query;                  // the slash text as typed: `/cmd` or `/cmd arg`
     std::vector<SlashItem> matches;
     // Esc latch: once dismissed, stay closed while the query text is unchanged
     // (drawSlashAutocomplete recomputes `open` from the buffer every frame, so a
     // bare `open = false` reopens on the very next frame).
     bool        dismissed = false;
-    std::string dismissedFilter;
+    std::string dismissedQuery;
 };
 static SlashMenuState s_slash;
 
@@ -1162,20 +1176,29 @@ static bool tryHandleSkillsListCommand(AppState& st) {
 }
 
 // Descriptions are user copy: what the command does, in plain words. Argument syntax lives in
-// /help, never in the menu row (raw "[elide|images]" read as developer notation).
+// /help and the in-box hint, never in the menu row (raw "[elide|images]" read as developer
+// notation); enumerated arguments get their own options menu with plain-word rows.
 static const SlashItem kSessionSlashItems[] = {
     {SlashKind::Session, "/compact ", "/compact",
-     "Summarize older messages to free up context", "ai_panel", true},
+     "Summarize older messages to free up context", "ai_panel", true, nullptr,
+     {{"summary", "The model writes a summary that replaces older messages"},
+      {"snapcompact", "Archive older history as images (image-capable models only)"},
+      {"shake", "Drop recoverable heavy tool output, no model call"}},
+     "Enter alone uses your Compaction setting"},
     {SlashKind::Session, "/shake ", "/shake",
-     "Drop bulky tool output and old images to free up context", "ai_panel", true},
+     "Drop bulky tool output and old images to free up context", "ai_panel", true, nullptr,
+     {{"elide", "Replace bulky tool output with short placeholders"},
+      {"images", "Remove old images from the transcript"}},
+     "Enter alone drops bulky tool output"},
     {SlashKind::Session, "/handoff ", "/handoff",
-     "Start a new session from a handoff summary of this one", "ai_panel", true},
+     "Start a new session from a handoff summary of this one", "ai_panel", true, "[focus]"},
     {SlashKind::Session, "/btw ", "/btw",
-     "Ask a side question that stays out of the transcript", "ask"},
+     "Ask a side question that stays out of the transcript", "ask", false, "<question>"},
     {SlashKind::Session, "/prewalk", "/prewalk",
      "Walk through the project before the next run", "plan_board"},
     {SlashKind::Session, "/rule ", "/rule",
-     "Add a rule that injects context when trigger words appear", "plan_board", true},
+     "Add a rule that injects context when trigger words appear", "plan_board", true,
+     "<trigger words> -> <context>"},
     {SlashKind::Meta, "/skills", "/skills",
      "List available skills", "team"},
     {SlashKind::Meta, "/help", "/help",
@@ -1190,6 +1213,30 @@ static const SlashItem* slashCommandFor(const std::string& text) {
     return nullptr;
 }
 
+// The enumerated argument `argLower` names on `cmd`, or nullptr.
+static const SlashArg* slashArgFor(const SlashItem& cmd, const std::string& argLower) {
+    for (const SlashArg& a : cmd.args)
+        if (argLower == a.value) return &a;
+    return nullptr;
+}
+
+// One usage line per command, built from the table so /help and refusals never drift from it.
+static std::string slashUsage(const SlashItem& cmd) {
+    std::string u = cmd.label;
+    if (!cmd.args.empty()) {
+        u += cmd.noArgDetail ? " [" : " <";
+        for (size_t i = 0; i < cmd.args.size(); ++i) {
+            if (i) u += "|";
+            u += cmd.args[i].value;
+        }
+        u += cmd.noArgDetail ? "]" : ">";
+    } else if (cmd.argHint) {
+        u += " ";
+        u += cmd.argHint;
+    }
+    return u;
+}
+
 // True when the composer is still typing a single slash token (menu should stay open).
 static bool parseSlashQuery(const char* buf, std::string& outFilter) {
     outFilter.clear();
@@ -1199,6 +1246,39 @@ static bool parseSlashQuery(const char* buf, std::string& outFilter) {
     }
     outFilter.assign(buf + 1);
     return true;
+}
+
+// `/cmd <partial>` on one line where /cmd takes enumerated arguments: the command, with the
+// argument typed so far in `outArg`. A complete argument returns nullptr — there is nothing
+// left to pick, so Enter sends.
+static const SlashItem* parseSlashArgQuery(const char* buf, std::string& outArg) {
+    outArg.clear();
+    if (!buf || buf[0] != '/') return nullptr;
+    const std::string text(buf);
+    if (text.find('\n') != std::string::npos) return nullptr;
+    const size_t sp = text.find_first_of(" \t");
+    if (sp == std::string::npos) return nullptr;
+    const SlashItem* cmd = slashCommandFor(text);
+    if (!cmd || cmd->args.empty()) return nullptr;
+    const size_t argAt = text.find_first_not_of(" \t", sp);
+    if (argAt != std::string::npos) {
+        if (text.find_first_of(" \t", argAt) != std::string::npos) return nullptr;
+        outArg = text.substr(argAt);
+    }
+    if (slashArgFor(*cmd, slashLower(outArg))) return nullptr;
+    return cmd;
+}
+
+// Free-form argument hint for the box: `/cmd ` (whitespace, nothing typed yet) on a command
+// whose argument has no options menu.
+static const char* slashFreeArgHint(const char* buf) {
+    if (!buf || buf[0] != '/') return nullptr;
+    const std::string text(buf);
+    const size_t sp = text.find_first_of(" \t");
+    if (sp == std::string::npos || text.find_first_not_of(" \t", sp) != std::string::npos)
+        return nullptr;
+    const SlashItem* cmd = slashCommandFor(text);
+    return cmd && cmd->args.empty() ? cmd->argHint : nullptr;
 }
 
 static bool slashMatches(const SlashItem& it, const std::string& filterLower) {
@@ -1238,6 +1318,28 @@ static void rebuildSlashMatches(const std::string& filter) {
     if (s_slash.selected < 0) s_slash.selected = 0;
     if (s_slash.selected >= (int)s_slash.matches.size())
         s_slash.selected = s_slash.matches.empty() ? 0 : (int)s_slash.matches.size() - 1;
+}
+
+// Options menu rows for `cmd`'s enumerated arguments matching `arg` (value or description).
+// Accepting a row writes the complete `/cmd value`, which closes the menu (parseSlashArgQuery).
+static void rebuildSlashArgMatches(const SlashItem& cmd, const std::string& arg) {
+    const std::string fl = slashLower(arg);
+    s_slash.matches.clear();
+    for (const SlashArg& a : cmd.args) {
+        if (!fl.empty() && slashLower(a.value).find(fl) == std::string::npos &&
+            slashLower(a.detail).find(fl) == std::string::npos)
+            continue;
+        SlashItem it;
+        it.kind = cmd.kind;
+        it.insert = cmd.label + " " + a.value;
+        it.label = a.value;
+        it.detail = a.detail;
+        it.icon = cmd.icon;
+        it.needsIdle = cmd.needsIdle;
+        s_slash.matches.push_back(std::move(it));
+    }
+    if (s_slash.selected >= (int)s_slash.matches.size())
+        s_slash.selected = s_slash.matches.empty() ? -1 : (int)s_slash.matches.size() - 1;
 }
 
 static void applySlashInsert(std::vector<char>& buf, const std::string& text) {
@@ -1356,18 +1458,24 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
                                   float anchorTopY, bool& ateEnter) {
     ateEnter = false;
     std::string filter;
-    const bool want = parseSlashQuery(st.prompt.data(), filter);
+    const SlashItem* argCmd = nullptr;
+    bool want = parseSlashQuery(st.prompt.data(), filter);
+    if (!want) {
+        argCmd = parseSlashArgQuery(st.prompt.data(), filter);
+        want = argCmd != nullptr;
+    }
     if (!want) {
         s_slash.open = false;
         s_slash.matches.clear();
         s_slash.dismissed = false;
-        s_slash.dismissedFilter.clear();
+        s_slash.dismissedQuery.clear();
         g_slashMenuActive = false;
         return false;
     }
+    const std::string query(st.prompt.data());
 
     if (s_slash.dismissed) {
-        if (filter == s_slash.dismissedFilter) {
+        if (query == s_slash.dismissedQuery) {
             // Esc dismissed this exact query — stay closed until the text changes.
             s_slash.open = false;
             s_slash.matches.clear();
@@ -1377,21 +1485,34 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
         s_slash.dismissed = false;  // query changed — re-arm the menu
     }
 
-    pollComposerSkills(st, /*force=*/!s_composerSkills.loaded);
-    if (!s_slash.open || filter != s_slash.filter) {
-        s_slash.filter = filter;
-        s_slash.selected = 0;
-        rebuildSlashMatches(filter);
-    } else {
-        rebuildSlashMatches(filter);  // skills may arrive mid-typing
-    }
-    s_slash.open = !s_slash.matches.empty() || filter.empty();
-    if (s_slash.matches.empty()) {
-        // Keep the menu shell open on bare `/` while skills load; otherwise hide.
-        if (!filter.empty() || (!s_composerSkills.inFlight && s_composerSkills.loaded)) {
-            s_slash.open = false;
+    if (argCmd) {
+        if (!s_slash.open || query != s_slash.query) {
+            s_slash.query = query;
+            // An optional argument opens with nothing picked so Enter alone runs the bare
+            // command; once the user types, the best match is picked.
+            s_slash.selected = (argCmd->noArgDetail && filter.empty()) ? -1 : 0;
+        }
+        rebuildSlashArgMatches(*argCmd, filter);
+        s_slash.open = !s_slash.matches.empty();
+        if (!s_slash.open) {
             g_slashMenuActive = false;
             return false;
+        }
+    } else {
+        pollComposerSkills(st, /*force=*/!s_composerSkills.loaded);
+        if (!s_slash.open || query != s_slash.query) {
+            s_slash.query = query;
+            s_slash.selected = 0;
+        }
+        rebuildSlashMatches(filter);  // every frame: skills may arrive mid-typing
+        s_slash.open = !s_slash.matches.empty() || filter.empty();
+        if (s_slash.matches.empty()) {
+            // Keep the menu shell open on bare `/` while skills load; otherwise hide.
+            if (!filter.empty() || (!s_composerSkills.inFlight && s_composerSkills.loaded)) {
+                s_slash.open = false;
+                g_slashMenuActive = false;
+                return false;
+            }
         }
     }
     g_slashMenuActive = true;
@@ -1400,8 +1521,12 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
     bool scrolledByKey = false;
     if (g_slashNavDelta != 0 && !s_slash.matches.empty()) {
         const int n = (int)s_slash.matches.size();
-        s_slash.selected = (s_slash.selected + g_slashNavDelta) % n;
-        if (s_slash.selected < 0) s_slash.selected += n;
+        if (s_slash.selected < 0) {
+            s_slash.selected = g_slashNavDelta > 0 ? 0 : n - 1;
+        } else {
+            s_slash.selected = (s_slash.selected + g_slashNavDelta) % n;
+            if (s_slash.selected < 0) s_slash.selected += n;
+        }
         g_slashNavDelta = 0;
         scrolledByKey = true;
     }
@@ -1412,7 +1537,13 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
     const float popW = ImMax(inputMax.x - inputMin.x, 280.0f * sc);
     const float winPad = 6.0f * sc;
     const float rowGap = 2.0f * sc;  // ItemSpacing.y pushed below
-    const float headerH = ImGui::GetTextLineHeight() + 10.0f * sc;
+    // An optional argument's options carry a second, wrapped header line saying what Enter does.
+    const char* headerNote = argCmd ? argCmd->noArgDetail : nullptr;
+    const float headerTextW = popW - winPad * 2.0f;
+    const float headerH =
+        ImGui::GetTextLineHeight() + 10.0f * sc +
+        (headerNote ? ImGui::CalcTextSize(headerNote, nullptr, false, headerTextW).y + rowGap
+                    : 0.0f);
     const float gap = 4.0f * sc;
     // Any run (this session's or another's) holds the agent lane these commands need.
     const bool runBusy = aiTurnActive(st) || st.anyRunActive();
@@ -1464,9 +1595,21 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
         dl->ChannelsSetCurrent(1);
 
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextUnformatted(s_slash.matches.empty() ? "Loading commands\xe2\x80\xa6"
-                                                       : "Commands & skills");
+        if (argCmd) {
+            const std::string header = argCmd->label + " options";
+            ImGui::TextUnformatted(slashFitText(header.c_str(), headerTextW).c_str());
+        } else {
+            ImGui::TextUnformatted(s_slash.matches.empty() ? "Loading commands\xe2\x80\xa6"
+                                                           : "Commands & skills");
+        }
         ImGui::PopStyleColor();
+        if (headerNote) {
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + headerTextW);
+            ImGui::TextUnformatted(headerNote);
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+        }
 
         ImGui::BeginChild("##slashlist", ImVec2(-1, listH), ImGuiChildFlags_None,
                           ImGuiWindowFlags_NoBackground);
@@ -1513,12 +1656,14 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
 
     // A bare Enter (or Tab) accepts the highlighted row; the turn is not submitted. A modified
     // Enter is the user asking for a line break, so it must fall through to the input instead
-    // of silently completing a command they were done typing.
+    // of silently completing a command they were done typing. With nothing picked (an optional
+    // argument's options) Enter falls through and runs the bare command; Tab takes the first row.
     const ImGuiIO& sio = ImGui::GetIO();
+    const bool enterPick = ImGui::IsKeyPressed(ImGuiKey_Enter, false) && !sio.KeyShift &&
+                           !sio.KeyAlt && s_slash.selected >= 0;
     if (!accepted && !s_slash.matches.empty() &&
-        ((ImGui::IsKeyPressed(ImGuiKey_Enter, false) && !sio.KeyShift && !sio.KeyAlt) ||
-         ImGui::IsKeyPressed(ImGuiKey_Tab, false))) {
-        const SlashItem& pick = s_slash.matches[(size_t)s_slash.selected];
+        (enterPick || ImGui::IsKeyPressed(ImGuiKey_Tab, false))) {
+        const SlashItem& pick = s_slash.matches[(size_t)std::max(0, s_slash.selected)];
         if (rowDisabled(pick)) {
             st.toast(ui::ToastLevel::Info, std::string(pick.label) + ": " + kAvailableAfterRun);
         } else {
@@ -1618,6 +1763,14 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
         return true;
     };
 
+    // An argument outside a command's options is refused by name, never replaced by the
+    // default: a typo must not run a different compaction method than the one asked for.
+    const SlashItem* spec = slashCommandFor(cmd);
+    if (spec && !spec->args.empty() && !rest.empty() && !slashArgFor(*spec, slashLower(rest))) {
+        st.toast(ui::ToastLevel::Warn, "Usage: " + slashUsage(*spec));
+        return true;
+    }
+
     if (cmd == "/prewalk") {
         ovSetAgentBool("prewalk", true);
         st.toast(ui::ToastLevel::Success, "Prewalk armed for the next run.");
@@ -1630,10 +1783,8 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
     // Settings -> AI -> Rules so the user lands on the row they just made. Both halves are
     // required server-side: a rule with no match could never fire.
     if (cmd == "/rule") {
-        static const char* kRuleUsage =
-            "Usage: /rule <trigger words> -> <context to inject>";
         if (rest.find("->") == std::string::npos) {
-            st.toast(ui::ToastLevel::Warn, kRuleUsage);
+            st.toast(ui::ToastLevel::Warn, "Usage: " + slashUsage(*spec));
             return true;
         }
         if (!needIdle()) return true;
@@ -1670,7 +1821,7 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
 
     if (cmd == "/btw") {
         if (rest.empty()) {
-            st.toast(ui::ToastLevel::Warn, "Usage: /btw <question>");
+            st.toast(ui::ToastLevel::Warn, "Usage: " + slashUsage(*spec));
             return true;
         }
         askBtw(st, rest);
@@ -1679,20 +1830,10 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
 
     if (cmd == "/compact") {
         if (!needIdle()) return true;
-        // No argument = the Compaction setting (Settings > AI). An explicit argument is
-        // sent as-is; the worker refuses one the session cannot honour rather than
-        // compacting with a different method.
-        std::string strategy;
-        if (!rest.empty()) {
-            std::string arg = rest;
-            for (char& c : arg) c = (char)std::tolower((unsigned char)c);
-            if (arg == "shake" || arg == "snapcompact" || arg == "summary" || arg == "off")
-                strategy = arg;
-        }
-        if (strategy == "off") {
-            st.toast(ui::ToastLevel::Info, "Compaction strategy is Off — nothing to do.");
-            return true;
-        }
+        // No argument = the Compaction setting (Settings > AI). An explicit argument (one of
+        // the options, checked above) is sent as-is; the worker refuses one the session
+        // cannot honour rather than compacting with a different method.
+        const std::string strategy = slashLower(rest);
         nlohmann::json params = nlohmann::json::object();
         params["messages"] = chatMsgsToWireMessages(st.chat);
         if (!strategy.empty()) params["strategy"] = strategy;
@@ -1777,14 +1918,8 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
 
     if (cmd == "/shake") {
         if (!needIdle()) return true;
-        std::string mode = "elide";
+        const std::string mode = rest.empty() ? std::string("elide") : slashLower(rest);
         bool aggressive = true;
-        if (!rest.empty()) {
-            std::string arg = rest;
-            for (char& c : arg) c = (char)std::tolower((unsigned char)c);
-            if (arg == "images") mode = "images";
-            else if (arg == "elide") mode = "elide";
-        }
         nlohmann::json params = nlohmann::json::object();
         params["messages"] = chatMsgsToWireMessages(st.chat);
         params["mode"] = mode;
@@ -1879,10 +2014,12 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
     // Unknown /command — fall through so the user can still send "/something" as plain text
     // only when it is not one of our known commands. Known-prefix typos get a usage hint.
     if (cmd == "/help") {
-        st.toast(ui::ToastLevel::Info,
-                 "/compact [summary|snapcompact]  /shake [elide|images]  "
-                 "/handoff [focus]  /btw <q>  /prewalk  /skills  "
-                 "/rule <words> -> <context>  (type / for autocomplete)");
+        std::string help;
+        for (const auto& it : kSessionSlashItems) {
+            if (!help.empty()) help += "  ";
+            help += slashUsage(it);
+        }
+        st.toast(ui::ToastLevel::Info, help + "  (type / for autocomplete)");
         return true;
     }
     if (cmd == "/skills") {
@@ -2759,7 +2896,7 @@ static void drawComposerPrelude(AppState& st, bool busy) {
     // Refresh cached model names on the same TTL so the chip does not fall back to raw ids.
     ui::refreshBridgeModelCatalog(st, false);
 
-    // Compact frame height matching the toolbar chips (model / thinking / New).
+    // Compact frame height matching the toolbar chips (model / thinking).
     // Arrow button uses ImGuiCol_Button — keep it identical to FrameBg so the caret
     // well is not shaded differently from the combo body.
     const ImVec4 frameBg(
@@ -3224,10 +3361,11 @@ static void drawMicGlyph(ImDrawList* dl, ImVec2 c, float isz, ImU32 ink, float p
     }
 }
 
-// Toolbar row below the prompt: [model | thinking | paperclip | mic | context-cube | New]
-// Graduated widths with overlapping rounded corners (connected segmented look).
-// Model picker is the largest share; paperclip/mic/cube are icon-only minimums.
-// The send/stop control lives inside the input box (drawComposerSendStop).
+// Toolbar row below the prompt: [model | thinking | paperclip | mic | context-cube]
+// Five abutting, non-overlapping segments separated by painted vertical dividers. Model picker
+// takes the remaining width; thinking reserves its widest label; icon chips are square.
+// The send/stop control lives inside the input box (drawComposerSendStop); New chat lives in
+// the panel header.
 static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
@@ -3252,14 +3390,14 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
 
     // Compact chip height matches the Design combo above.
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * sc, 3 * sc));
-    // Negative spacing so adjacent rounded chips overlap into a segmented strip.
-    const float overlap = -2.0f * sc;
+    // Segments abut exactly (zero spacing): hitboxes never overlap and the dividers painted at
+    // each shared edge do the separating.
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                        ImVec2(overlap, ImGui::GetStyle().ItemSpacing.y));
+                        ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
-    // Borderless chips: the hairline above already separates the row from the input, and a
-    // ring of outlined cells under a rounded field read as a spreadsheet (the light theme drew
-    // every chip's frame border; the dark theme never did). Hover/press washes carry affordance.
+    // No all-around chip outlines: a ring of outlined cells under a rounded field reads as a
+    // spreadsheet. Vertical dividers (painted last, below) separate the segments; hover/press
+    // washes carry affordance.
     ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
     // Shared translucent chip fill (opaque fills fought the adaptive text).
     const ImVec4 chipBg(0, 0, 0, 0);
@@ -3281,37 +3419,40 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
     const char* effBtn = effIdx >= 0 ? effLabels[effIdx] : "Default";
 
-    // Graduated segment widths (left→right: model, thinking, paperclip, mic, cube, New).
-    // Icon chips stay near-square; New < thinking < model share the remaining row.
-    const int nSeg = 6;
+    // Segment widths (left→right: model, thinking, paperclip, mic, cube). Icon chips are square.
+    // Thinking reserves its WIDEST possible label plus padding, so "Medium"/"Default" never clip
+    // and the strip does not jump when the level changes. Model takes everything left — the
+    // brand mark + real display name is the one string this strip exists to show.
     const float segH = ImGui::GetFrameHeight();
     const float iconSz = segH;
-    const float join = -overlap;  // positive join thickness per boundary
-    const float totalW = availW + join * (float)(nSeg - 1);
-    const float iconW = segH;     // minimal — just an icon
-    const float restW = std::max(0.0f, totalW - iconW * 3.0f);
-    // Relative shares of the non-icon remainder, solved against the DEFAULT 340dp column
-    // (metrics::dockRightTarget): availW 326 -> restW 287dp at 17.5px body text. "New" needs
-    // 48dp and the widest effort label ("Medium") 76dp before either clips inside its button, so
-    // the model chip may take the remaining ~159dp — which is what a brand mark (18dp) + gap +
-    // a real name like "Claude Opus 5" (117dp) actually occupies. Dropping the model share
-    // further (the chip lost its "Provider \xc2\xb7 " prefix) would just ellipsize the ONE string
-    // this chip exists to show, so the prefix's slack goes to thinking/New instead.
-    const float kNew = 1.30f, kThink = 2.05f, kModel = 4.15f;
-    const float kSum = kNew + kThink + kModel;
-    const float newW   = restW * (kNew   / kSum);
-    const float thinkW = restW * (kThink / kSum);
-    const float modelW = restW * (kModel / kSum);
+    const float iconW = segH;
+    const float iconsW = iconW * 3.0f;
+    const float padX = ImGui::GetStyle().FramePadding.x;
 
-    // ---- 1/6 model: provider brand mark + the model's REAL display name (no provider text) ----
     const std::string modelLogo = composerProviderLogoId(s);
     const float logoSide    = ImGui::GetFontSize() * 1.05f;
     const float logoGap     = ui::metrics::px(6);
     const float logoAdvance = logoSide + logoGap;
+
+    float effTextW = std::max(ImGui::CalcTextSize("Default").x, ImGui::CalcTextSize("No dial").x);
+    for (int i = 0; i < nEff; ++i)
+        effTextW = std::max(effTextW, ImGui::CalcTextSize(effLabels[i]).x);
+    const float thinkWant = std::ceil(effTextW + padX * 2.0f + ui::metrics::px(8));
+    // Below the dock minimum the model chip keeps at least its brand mark; thinking yields first.
+    // Widths stay >= 1px: ImGui treats a 0 width as "auto-size to label", which would overflow.
+    const float minModelW = logoAdvance + padX * 2.0f;
+    const float thinkW = std::max(1.0f, std::min(thinkWant, availW - iconsW - minModelW));
+    const float modelW = std::max(1.0f, std::floor(availW - iconsW - thinkW));
+
+    // Right edges of the first four segments — where the dividers go.
+    float divX[4] = {};
+    int nDiv = 0;
+
+    // ---- 1/5 model: provider brand mark + the model's REAL display name (no provider text) ----
     std::string modelText = composerModelName(s);
     {
         // Ellipsize the NAME only — the mark is fixed-width and never clipped. No caret/arrow.
-        const float maxTextW = modelW - logoAdvance - ImGui::GetStyle().FramePadding.x * 2.0f;
+        const float maxTextW = modelW - logoAdvance - padX * 2.0f;
         if (maxTextW > 0.0f && ImGui::CalcTextSize(modelText.c_str()).x > maxTextW) {
             const float dotsW = ImGui::CalcTextSize("...").x;
             const char* b = modelText.c_str();
@@ -3329,6 +3470,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     // Capture the model chip rect so the drop-up popup can anchor fixed above it.
     const ImVec2 modelBtnMin = ImGui::GetItemRectMin();
     const ImVec2 modelBtnMax = ImGui::GetItemRectMax();
+    divX[nDiv++] = modelBtnMax.x;
     {
         ImDrawList* mdl = ImGui::GetWindowDrawList();
         const float midY = (modelBtnMin.y + modelBtnMax.y) * 0.5f;
@@ -3342,13 +3484,14 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         ImGui::SetTooltip("%s \xc2\xb7 %s\nModel — click to search and switch.",
                           composerProviderName(s.provider), s.model[0] ? s.model : "default");
 
-    // ---- 2/6 thinking effort (level only; bigger than New) ----
+    // ---- 2/5 thinking effort (level only) ----
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
     if (nEff <= 0) ImGui::BeginDisabled();
     if (ImGui::Button(nEff > 0 ? effBtn : "No dial", ImVec2(thinkW, segH)))
         ImGui::OpenPopup("##cmpeffort");
     if (nEff <= 0) ImGui::EndDisabled();
+    divX[nDiv++] = ImGui::GetItemRectMax().x;
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip(nEff > 0 ? "Thinking effort for the selected model."
@@ -3363,10 +3506,12 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         ImGui::EndPopup();
     }
 
-    // ---- 3/6 paperclip (icon-only, smallest) ----
+    // ---- 3/5 paperclip (icon-only, square) ----
     ImGui::SameLine();
     {
-        if (ImGui::Button("##attach", ImVec2(iconW, segH))) {
+        const bool attachClick = ImGui::Button("##attach", ImVec2(iconW, segH));
+        divX[nDiv++] = ImGui::GetItemRectMax().x;
+        if (attachClick) {
             if (std::getenv("CHUDWARE_NO_FILE_DIALOGS")) {
                 st.toast(ui::ToastLevel::Info,
                          "File dialogs are disabled (CHUDWARE_NO_FILE_DIALOGS).");
@@ -3420,7 +3565,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         }
     }
 
-    // ---- 4/6 mic (live Chudcode speech-to-text) ----
+    // ---- 4/5 mic (live Chudcode speech-to-text) ----
     ImGui::SameLine();
     {
         voiceProbe(st);
@@ -3450,6 +3595,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         if (disabled) ImGui::BeginDisabled();
         const bool micClick = ImGui::Button("##voice_mic", ImVec2(iconW, segH));
         if (disabled) ImGui::EndDisabled();
+        divX[nDiv++] = ImGui::GetItemRectMax().x;
         if (listening || errored) ImGui::PopStyleColor(3);
         if (micClick) {
             if (listening) voiceStop(st);
@@ -3509,7 +3655,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         }
     }
 
-    // ---- 5/6 context-cube (icon-only, smallest) ----
+    // ---- 5/5 context-cube (icon-only, square) ----
     ImGui::SameLine();
     {
         const bool armed = st.contextPickActive;
@@ -3570,23 +3716,21 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         }
     }
 
-    // ---- 6/6 New session (slightly bigger than icon chips) ----
-    ImGui::SameLine();
+    // Vertical dividers at every shared segment edge, painted AFTER all fills, glyphs and state
+    // rings so hover/active/armed/listening washes and the disabled mic never occlude them.
+    // Surface-derived ink reads on both themes and any backdrop; the vertical inset keeps them
+    // reading as separators rather than cell borders.
     {
-        if (busy) ImGui::BeginDisabled();
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-        if (ImGui::Button("New", ImVec2(newW, segH))) {
-            newConversation(st);
-            st.prompt[0] = 0;
-            st.pendingAttachments.clear();
-            st.pendingContextRefs.clear();
-            st.contextPickActive = false;
-            st.showAISettingsOverlay = false;
+        ImDrawList* ddl = ImGui::GetWindowDrawList();
+        const ImU32 divInk = ImGui::ColorConvertFloat4ToU32(ImVec4(
+            surf.textTertiary.x, surf.textTertiary.y, surf.textTertiary.z, 0.55f));
+        const float inset = std::floor(segH * 0.22f);
+        const float th = ui::metrics::stroke(1.0f);
+        for (int i = 0; i < nDiv; ++i) {
+            const float x = std::floor(divX[i]);
+            ddl->AddLine(ImVec2(x, modelBtnMin.y + inset),
+                         ImVec2(x, modelBtnMax.y - inset), divInk, th);
         }
-        ImGui::PopStyleColor();
-        if (busy) ImGui::EndDisabled();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Start a fresh conversation.");
     }
 
     ImGui::PopStyleColor(3);   // button base / hovered / active
@@ -3602,7 +3746,6 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         ImGui::SetNextWindowSizeConstraints(ImVec2(popW, 0), ImVec2(popW, FLT_MAX));
         ImGui::SetNextWindowPos(ImVec2(modelBtnMin.x, modelBtnMin.y - gap),
                                ImGuiCond_Always, ImVec2(0.0f, 1.0f));
-        (void)modelBtnMax;
     }
     if (ImGui::BeginPopup("##modeldropdown",
                           ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -4011,7 +4154,7 @@ static void drawComposerSendStop(AppState& st, const ImVec2& inMin, const ImVec2
     const float sz = ImGui::GetFrameHeight();
     const float inset = 6.0f * sc;   // clear of the composer's rounded border
     // Sit fully inside the input: keep a bottom inset so the button never intersects the
-    // toolbar's New chip below the box. Short (one-row) inputs still center vertically.
+    // toolbar strip below the box. Short (one-row) inputs still center vertically.
     const float bottomClear = 6.0f * sc;
     float y0 = inMax.y - sz - bottomClear;
     if (y0 < inMin.y + inset) y0 = (inMin.y + inMax.y - sz) * 0.5f;
@@ -4117,7 +4260,7 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
             // recomputes `open` from the buffer each frame and would reopen
             // instantly (editing the query re-arms it there).
             s_slash.dismissed = true;
-            s_slash.dismissedFilter = s_slash.filter;
+            s_slash.dismissedQuery = s_slash.query;
             s_slash.open = false;
             s_slash.matches.clear();
             g_slashMenuActive = false;
@@ -4411,7 +4554,8 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     // Slash query opens before the InputText so Up/Down history callbacks fire this frame.
     {
         std::string q;
-        g_slashMenuActive = parseSlashQuery(st.prompt.data(), q);
+        g_slashMenuActive = parseSlashQuery(st.prompt.data(), q) ||
+                            parseSlashArgQuery(st.prompt.data(), q) != nullptr;
     }
 
     // ---- Ctrl+V of an IMAGE ------------------------------------------------------------------
@@ -4457,6 +4601,16 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     s_composerInputActive = ImGui::IsItemActive();
     const ImVec2 inputMin = ImGui::GetItemRectMin();
     const ImVec2 inputMax = ImGui::GetItemRectMax();
+    // Free-form argument hint: `/btw ` reads `/btw <question>` until the user types the argument.
+    if (const char* argHint = slashFreeArgHint(st.prompt.data())) {
+        const ImVec2 pad = ImGui::GetStyle().FramePadding;
+        const float x = inputMin.x + pad.x + ImGui::CalcTextSize(st.prompt.data()).x;
+        const float room = inputMax.x - x - pad.x;
+        if (room > 1.0f)
+            ImGui::GetWindowDrawList()->AddText(ImVec2(x, inputMin.y + pad.y),
+                                                ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                                                slashFitText(argHint, room).c_str());
+    }
     // Crash-safe draft: debounce-write whatever is in the box.
     savePromptDraft(st, /*force=*/false);
     ImGui::PopStyleVar(2);
@@ -4473,8 +4627,9 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
         s_refocusComposer = true;
         submitInput = false;
         submit = false;
-    } else if (slashAteEnter || (s_slash.open && submitInput)) {
-        // Menu open with matches: Enter must not send the half-typed `/foo` token.
+    } else if (slashAteEnter || (s_slash.open && s_slash.selected >= 0 && submitInput)) {
+        // Menu open with a row picked: Enter must not send the half-typed `/foo` token. With
+        // nothing picked (an optional argument's options) Enter sends the bare command.
         submitInput = false;
         submit = false;
     }

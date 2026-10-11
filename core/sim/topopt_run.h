@@ -48,7 +48,11 @@
 // (geometry-valid only), overlay.aicm, reanalysis.vtu, result.json — every one
 // created exclusively (never overwriting), hashed (SHA-256) and listed in
 // `artifacts`. A write failure fails the run (ok:false, artifact_io); a file
-// that was not written is never listed.
+// that was not written is never listed. reanalysis.vtu carries, for every
+// stress-bearing case, a point von_mises[@case] (MPa: volume-weighted average
+// of the retained incident elements, 0 where no retained element touches the
+// node) beside the cell element_von_mises[@case], so FEA viewers and
+// render_animation read it like a run_fea_static .vtu.
 //
 // Never throws.
 #pragma once

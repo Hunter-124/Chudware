@@ -283,7 +283,6 @@ def test_verify_skips_solid_checks_on_a_study_only_doc(monkeypatch):
     import services.verify.battery as bat
     from services.mcp import core_bridge
 
-    monkeypatch.setattr(bat, "_doc_features", lambda doc_id: [])
     monkeypatch.setattr(core_bridge, "call", lambda method, params=None: {
         "studies": [{"id": "s1", "type": "hydraulic_circuit"}]}
         if method == "sim_study_list" else {})
@@ -299,6 +298,85 @@ def test_verify_skips_solid_checks_on_a_study_only_doc(monkeypatch):
     monkeypatch.setattr(core_bridge, "call", lambda method, params=None: {"studies": []})
     result = bat.verify(doc_id="d1", checks=["is_manifold"])
     assert ran == [1] and result["scores"] == {"is_manifold": 0.0}
+
+
+@pytest.mark.parametrize("engine", [
+    # 2026-10-10 six-axis arm: 36 placed components, Motion studies, no own features.
+    {"doc_tree": {"tree": {"features": [], "components": [{"id": f"k{i}"} for i in range(36)]}},
+     "asm_world_bodies": {"bodies": [{"name": f"b{i}"} for i in range(36)]}},
+    # World solids with no feature or component entries still are solid geometry.
+    {"doc_tree": {"tree": {"features": []}},
+     "asm_world_bodies": {"bodies": [{"name": "Body1"}]}},
+], ids=["assembly_components", "world_solids_only"])
+def test_verify_runs_solid_checks_on_a_doc_with_solids_and_motion_studies(monkeypatch, engine):
+    """A document with solid geometry is not study-only, even with no features and with
+    Motion studies: eval_check, is_manifold and measure_part must run."""
+    import services.verify.battery as bat
+    from services.mcp import core_bridge
+
+    replies = dict(engine, sim_study_list={"studies": [{"id": "s1", "type": "motion"}]})
+    monkeypatch.setattr(core_bridge, "call",
+                        lambda method, params=None: replies.get(method, {}))
+    ran = []
+    for gap in ("is_manifold", "eval_check_direct"):
+        monkeypatch.setitem(bat.GAP_FNS, gap,
+                            lambda _g=gap, **_: ran.append(_g) or json.dumps({"ok": True}))
+    monkeypatch.setattr(bat, "_get_fn", lambda module_key, fn_name: (
+        lambda doc_id=None: ran.append(fn_name) or json.dumps({"ok": True})))
+
+    result = bat.verify(doc_id="asm", checks=["eval_check", "is_manifold", "measure_part"])
+    assert sorted(ran) == ["eval_check_direct", "is_manifold", "measure_part"]
+    assert result["scores"] == {"eval_check": 1.0, "is_manifold": 1.0, "measure_part": 1.0}
+    assert result["skipped"] == []
+
+
+def _ambiguous_measure_between(seen):
+    def measure_between(a_query=None, b_query=None, doc_id=None):
+        seen.append((a_query, b_query))
+        return json.dumps({
+            "ok": False, "code": "invalid_op",
+            "error": "measure ref matched multiple elements; narrow it with body_id, "
+                     "pick, near or index",
+            "detail": {"reason": "ambiguous"},
+        })
+    return measure_between
+
+
+def test_ambiguous_battery_chosen_measure_probe_is_not_evaluated(monkeypatch):
+    """2026-10-10: the battery chose "top"/"bottom" on a 36-solid assembly, the engine
+    refused the ref as ambiguous, and the battery scored a geometry failure (0.0)."""
+    import services.verify.battery as bat
+
+    seen = []
+    monkeypatch.setattr(bat, "_get_fn", lambda module_key, fn_name:
+                        _ambiguous_measure_between(seen))
+    monkeypatch.setattr(bat, "_derive_measure_face_pair", lambda doc_id: ("top", "bottom"))
+
+    result = bat.verify(doc_id="asm", checks=["measure_between"])
+    assert seen == [("top", "bottom")]
+    assert result["scores"] == {}
+    assert result["skipped"] == ["measure_between"]
+    [finding] = result["findings"]
+    assert finding["ok"] is True and finding["not_evaluated"] is True
+    assert finding["reason"] == "probe_ref_ambiguous"
+    assert "not a geometry failure" in finding["detail"]
+
+
+def test_ambiguous_caller_measure_ref_still_fails(monkeypatch):
+    """Only the battery's own probe choice is exempt. A caller ref that matches more than
+    one element stays a scored failure with the engine's reason."""
+    import services.verify.battery as bat
+
+    seen = []
+    monkeypatch.setattr(bat, "_get_fn", lambda module_key, fn_name:
+                        _ambiguous_measure_between(seen))
+
+    result = bat.verify(doc_id="asm", checks=["measure_between"],
+                        a_query={"of": "face", "side": "top"}, b_query="bottom face")
+    assert seen == [({"of": "face", "side": "top"}, "bottom")]
+    assert result["scores"] == {"measure_between": 0.0}
+    assert result["skipped"] == []
+    assert "matched multiple elements" in result["findings"][0]["detail"]
 
 
 def test_verify_findings_deterministic(monkeypatch):
@@ -334,6 +412,31 @@ def test_verify_overhead_under_50ms(monkeypatch):
     bat.verify(doc_id="x", checks=checks)          # warm the signature cache path
     result = bat.verify(doc_id="x", checks=checks)
     assert result["elapsed_ms"] < 50.0
+
+
+def test_extract_score_interference_reads_clear_not_ok():
+    """check_interference ok=true means the check completed; clear is the pass verdict."""
+    from services.verify.battery import _extract_score
+    clash = {"ok": True, "complete": True, "clear": False,
+             "interferences": [{"a": "b1", "b": "b2", "volume": 12.0}],
+             "summary": "Interference found: 1 interfering pair(s)"}
+    score, findings = _extract_score("check_interference", "binary", json.dumps(clash))
+    assert score == 0.0
+    assert findings[0]["detail"].startswith("Interference found")
+    clean = {"ok": True, "complete": True, "clear": True, "interferences": []}
+    assert _extract_score("check_interference", "binary", json.dumps(clean)) == (1.0, [])
+    incomplete = {"ok": False, "complete": False, "clear": False, "interferences": []}
+    assert _extract_score("check_interference", "binary", json.dumps(incomplete))[0] == 0.0
+
+
+def test_extract_score_interface_check_refusal_is_not_a_pass():
+    """An interface_check refusal (ok=false, no findings list) must not score 1.0."""
+    from services.verify.battery import _extract_score
+    refusal = {"ok": False, "code": "unknown_component", "error": "unknown component id(s)"}
+    score, findings = _extract_score("interface_check", "findings", json.dumps(refusal))
+    assert score == 0.0
+    assert "unknown component" in findings[0]["detail"]
+
 
 
 # ── T-BL23: CAM scoring keys (machined_fraction + gouges) ───────────────────

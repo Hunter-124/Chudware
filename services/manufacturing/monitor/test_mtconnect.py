@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 from dataclasses import replace
 from pathlib import Path
 import re
@@ -63,6 +64,13 @@ def test_current_maps_rows_and_retains_raw_source_element() -> None:
     assert position.evidence_eligible is True
     assert position.raw["attributes"]["sequence"] == "3"
     assert "confidence=\"high\"" in position.raw_element
+
+    serialized = json.loads(current.to_json())
+    json_rows = {row["source_item_id"]: row for row in serialized["observations"]}
+    assert serialized["schema"]["protocol_version"] == "2.0"
+    assert json_rows["x_pos"]["v_num"] == 12.5
+    assert json_rows["x_pos"]["unit"] == "mm"
+    assert json_rows["x_pos"]["evidence_eligible"] is True
 
 
 def test_prefixed_mtconnect_namespace_is_accepted() -> None:

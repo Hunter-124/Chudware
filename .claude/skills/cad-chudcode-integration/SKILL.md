@@ -106,7 +106,12 @@ steer images travel as paths, never inline bytes.
   timeout bounds the run: expiry aborts once, waits ≤30 s for the terminal, returns
   `stop_reason:"turn_budget"` (GUI amber card, not System error). Clients add reporting slack
   (GUI +120 s, hostd +60 s). A confirmed abort keeps history for continue; an unconfirmed abort
-  disposes the connection. `run_mission.py --timeout-s 0` is unbounded.
+  disposes the connection. `run_mission.py --timeout-s 0` is unbounded. Only an explicit
+  budget is announced: `online_turn.turn_budget_notice` adds one turn-start line, and
+  `progress_watchdog.TurnBudgetReminder` sends one steer (`agent.progress_nudge`,
+  `reason:"turn_budget"`) at min(80 %, budget − 180 s), or 80 % when that is ≤30 s in, to save
+  deliverables then verify (Ask/Plan: answer, no "save"); it is outside rule 15's two-nudge
+  cap and cancelled at the terminal.
 - `agent_end` is not success: `_unrecovered_provider_failure` returns
   `ok:false, stop_reason:"provider_error"` when the last assistant record is a failed retry
   (`auto_retry_end success:false`) or a `message_end` with `stopReason:"error"`;
@@ -154,7 +159,10 @@ steer images travel as paths, never inline bytes.
 3. The main chat advertises `tool_categories.MAIN_CHAT_CORE_TOOLS` (incl. sourcing, jobs,
    `browse_models`, `print_media_inventory`/`publish_print_media`) plus a MORE TOOLS menu;
    `enable_tools(tools=|categories=)` loads the rest via
-   `chudcode_roles._register_category_refresh` and reports unknown tokens. `run_shell` stays
+   `chudcode_roles._register_category_refresh` and reports unknown tokens. Every tool
+   registration goes through `chudcode_host.publish_host_tools`, which also sends
+   `loadable_tools` (catalog minus mounted) so Chudcode ≥0.4.3 answers `xd://<unloaded>`
+   with the enable_tools step. `run_shell` stays
    menu-only; do not move the whole registry into core. `browse_models` contact sheets and
    `fs_read` of a CAD file show real renders (thumbs share the GUI PLM cache), never stand-ins.
 4. Every call crosses CAD chokepoints: policy refusal → cancellation → mission/run dispatcher →
@@ -170,8 +178,11 @@ steer images travel as paths, never inline bytes.
    `content` never resolves and hangs `write xd://` and `wait_for_idle`.
 7. Results stay parseable and bounded: JSON-text returns parse into `details`; text is capped
    at `_RESULT_TEXT_BYTES` (46 000 B) minus any skill prefix by halving the largest member
-   (`_shorten_largest`), with `_truncated{full_result,…}` naming the full JSON spilled by
-   `_spill_full_result`.
+   (`_shorten_largest`, which ends each cut string with a `…[cut: …]` marker), with
+   `_truncated{full_result,…}` naming the full JSON spilled by `_spill_full_result`.
+   `fs_read` pages (`byte_offset`/`next_byte_offset`, ~32 KB) so it never reaches the cap.
+   Image tools cross as ONE mapping (`tool_images.image_result`: `{ok, caption, images,
+   saved_path?}`) in text and details; the image blocks stay in `content`.
 8. CAD skill packs reach the model only through `cad_skill(name, path)` (in
    `MAIN_CHAT_CORE_TOOLS` and `META_TOOL_FLOOR`), never `skill://` (Chudcode's own registry);
    `mission_dispatch.role_prompt` (online: main chat, delegated roles, prompt preview/baseline)
@@ -228,6 +239,14 @@ steer images travel as paths, never inline bytes.
     `provider_blocked` from `no_results`. Neither is an `ok:true` empty result.
 17. `subagent_registry.list_sessions(project_dir=…)` returns only records stamped for that
     project; records turn `abandoned` only on owner PID/start-time or heartbeat evidence.
+    Explicit project roots (`CHUDWARE_PROJECT_DIR`, then `CHUDWARE_FS_ROOT`, then the
+    supplied project directory) are canonicalized without widening to an ancestor
+    repository marker. List filters intersect before limiting. Transcript (display
+    and raw), steer, terminate and control accept optional `project_dir` /
+    `session_id` filters and refuse out-of-scope records before reads or mutations.
+    An explicitly blank filter matches nothing; omitted/null filters preserve
+    unscoped callers. The GUI supplies project and owner-session scope for inspection
+    and controls.
 
 ## Event rules
 
@@ -273,8 +292,11 @@ steer images travel as paths, never inline bytes.
 Lookup order: constructor hint → `CHUDWARE_CHUDCODE_BIN` → `chud`/`chud.exe` beside the packaged
 Python → developer `PATH`. Production uses the signed-payload-adjacent binary. The lock
 (`chudcode-artifact-lock-v1`) records version, commit, RPC protocol 2 and URL/SHA-256 for
-`linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `macos-arm64`, `windows-x86_64`; null fields
-fail packaging closed. Pin all five atomically.
+`linux-x86_64`, `macos-x86_64`, `windows-x86_64`; null fields fail packaging closed. Pin all
+three atomically. Linux/macOS come from the Chudcode release; Windows is the native build
+from `chudcode-runtime-windows-build.yml` (the cross-compiled Windows CLI crashes in Bun
+1.4.0). Chudcode release CI moves files through the tag's draft release, never Actions
+artifacts; ARM builds are manual and never block a release.
 
 ```bash
 python3 scripts/pin_chudcode.py check-lock

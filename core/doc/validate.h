@@ -40,6 +40,15 @@ std::vector<std::string> validate_document(const nlohmann::json& doc);
 // Owned here so MCP / op_registry / tests never hand-copy the list.
 std::vector<std::string> feature_type_names();
 
+// OP-PATH ONLY (add_feature / edit_feature). One error per key in `params` that the
+// compiler does not read for a feature of `type`; each error names the key, a hint for
+// a known invented key ("reverse" -> "flip"), and the accepted params. Null values are
+// skipped (edit_feature deletes a key with null). Types without a known-key table
+// return {}. Never call it from validate_document: saved documents can carry legacy
+// inert keys, and a whole-document check would block every later edit to them.
+std::vector<std::string> unknown_feature_params(const std::string& type,
+                                                const nlohmann::json& params);
+
 // Rewrite a feature's SHAPE (not its intent) into what validate_document accepts:
 // wrap a single value handed to a list-form ref slot ("profile":"$0" -> ["$0"]).
 // Returns one human-readable note per rewrite, so the caller can echo the

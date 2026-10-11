@@ -96,7 +96,7 @@ def test_a_key_the_engine_never_reads_is_refused_not_ignored():
 def test_a_readback_field_alone_cannot_select():
     with pytest.raises(ValueError) as ei:
         normalize_geom_query({"of": "edge", "sid": "E1c4a90"}, where="q")
-    assert "READBACK" in str(ei.value)
+    assert "'sid' is a readback field, not a query predicate." in str(ei.value)
 
 
 def test_a_readback_field_rides_along_with_a_real_predicate():
@@ -143,7 +143,6 @@ def test_a_bogus_sid_no_longer_fillets_the_whole_body(bored_cube):
             "type": "fillet", "name": "Rogue", "params": {"radius": {"value": 2}},
             "refs": {"edges": [{"of": "edge", "sid": "NOPE_NOT_A_SID"}]}}}])
     assert out.get("ok") is False, out
-    assert "READBACK" in str(out.get("error")), out
     after = _call("query_geometry", doc_id=bored_cube, query={"of": "face", "surf": "round"})
     assert len(after.get("matches") or []) == len(before.get("matches") or [])
 

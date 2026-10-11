@@ -1096,6 +1096,225 @@
         "url": "https://steelnavigator.ovako.com/steel-grades/100cr6/"
       }
     },
+    "steel_astm_a106_grade_b": {
+      "name": "Carbon steel seamless pipe ASTM A106 Grade B",
+      "category": "metal",
+      "aliases": [
+        "ASTM A106 Grade B",
+        "ASTM A106 Gr B",
+        "ASTM A106B",
+        "A106 Grade B",
+        "A106 Gr B",
+        "A106-B",
+        "A106B",
+        "ASME SA-106 Grade B",
+        "SA-106 Grade B",
+        "SA-106 Gr B",
+        "SA-106-B",
+        "SA106B"
+      ],
+      "condition": "Seamless carbon-steel pipe for high-temperature service, as supplied to ASTM A106/A106M Grade B; no credit for weld-affected properties.",
+      "constitutive_model": "isotropic",
+      "mechanical": {
+        "E_mpa": 203000,
+        "nu": 0.3,
+        "density_g_cm3": 7.85,
+        "yield_mpa": 240,
+        "ultimate_mpa": 415
+      },
+      "property_basis": {
+        "E_mpa": "ASME B31.3 Appendix C modulus for carbon steel (C <= 0.30 %) at 21 C, 29.5e6 psi",
+        "nu": "Nominal carbon-steel value",
+        "density_g_cm3": "Nominal carbon-steel density, as in steel_a36",
+        "yield_mpa": "ASTM A106 Grade B specified minimum yield, 35 ksi",
+        "ultimate_mpa": "ASTM A106 Grade B specified minimum tensile, 60 ksi"
+      },
+      "selection_status": "Engineering selection; piping code allowables (B31.3 Table A-1) come from piping_spec_check, not from these minima. Require mill test reports for received stock.",
+      "appearance": {
+        "color": [0.34, 0.35, 0.36],
+        "metallic": 0.7,
+        "roughness": 0.6
+      },
+      "finish_note": "Illustrative mill-finish carbon-steel pipe; coating or insulation is a separate selection.",
+      "provenance": {
+        "source": "ASTM A106/A106M tensile requirements (Grade B); ASME B31.3 Appendix C modulus of elasticity",
+        "source_type": "standard",
+        "url": null
+      }
+    },
+    "steel_astm_a53_grade_b": {
+      "name": "Carbon steel pipe ASTM A53 Grade B",
+      "category": "metal",
+      "aliases": [
+        "ASTM A53 Grade B",
+        "ASTM A53 Gr B",
+        "ASTM A53B",
+        "A53 Grade B",
+        "A53 Gr B",
+        "A53-B",
+        "A53B",
+        "ASME SA-53 Grade B",
+        "SA-53 Grade B",
+        "SA-53-B"
+      ],
+      "condition": "Seamless or ERW carbon-steel pipe as supplied to ASTM A53/A53M Grade B; no credit for weld-affected properties.",
+      "constitutive_model": "isotropic",
+      "mechanical": {
+        "E_mpa": 203000,
+        "nu": 0.3,
+        "density_g_cm3": 7.85,
+        "yield_mpa": 240,
+        "ultimate_mpa": 415
+      },
+      "property_basis": {
+        "E_mpa": "ASME B31.3 Appendix C modulus for carbon steel (C <= 0.30 %) at 21 C, 29.5e6 psi",
+        "nu": "Nominal carbon-steel value",
+        "density_g_cm3": "Nominal carbon-steel density, as in steel_a36",
+        "yield_mpa": "ASTM A53 Grade B specified minimum yield, 35 ksi",
+        "ultimate_mpa": "ASTM A53 Grade B specified minimum tensile, 60 ksi"
+      },
+      "selection_status": "Engineering selection; piping code allowables (B31.3 Table A-1, including the ERW joint factor) come from piping_spec_check, not from these minima.",
+      "appearance": {
+        "color": [0.34, 0.35, 0.36],
+        "metallic": 0.7,
+        "roughness": 0.6
+      },
+      "finish_note": "Illustrative black (uncoated) carbon-steel pipe; galvanizing is a separate selection.",
+      "provenance": {
+        "source": "ASTM A53/A53M tensile requirements (Grade B); ASME B31.3 Appendix C modulus of elasticity",
+        "source_type": "standard",
+        "url": null
+      }
+    },
+    "steel_asme_sa516_grade_70": {
+      "name": "Pressure-vessel plate ASME SA-516 Grade 70",
+      "category": "metal",
+      "aliases": [
+        "ASME SA-516 Grade 70",
+        "SA-516 Grade 70",
+        "SA-516 Gr 70",
+        "SA-516-70",
+        "SA516-70",
+        "SA51670",
+        "ASTM A516 Grade 70",
+        "A516 Grade 70",
+        "A516 Gr 70",
+        "A516-70",
+        "A51670"
+      ],
+      "condition": "Carbon-steel pressure-vessel plate as supplied to ASTM A516/A516M (ASME SA-516) Grade 70; no credit for weld-affected or PWHT-altered properties.",
+      "constitutive_model": "isotropic",
+      "mechanical": {
+        "E_mpa": 203000,
+        "nu": 0.3,
+        "density_g_cm3": 7.85,
+        "yield_mpa": 260,
+        "ultimate_mpa": 485
+      },
+      "property_basis": {
+        "E_mpa": "ASME carbon-steel (C <= 0.30 %) modulus at 21 C, 29.5e6 psi",
+        "nu": "Nominal carbon-steel value",
+        "density_g_cm3": "Nominal carbon-steel density, as in steel_a36",
+        "yield_mpa": "ASTM A516 Grade 70 specified minimum yield, 38 ksi",
+        "ultimate_mpa": "ASTM A516 Grade 70 lower bound of the 70-90 ksi tensile range"
+      },
+      "selection_status": "Engineering selection; ASME VIII-1 allowable stress comes from vessel_size, not from these minima. Require plate mill certificates.",
+      "appearance": {
+        "color": [0.36, 0.37, 0.38],
+        "metallic": 0.7,
+        "roughness": 0.55
+      },
+      "finish_note": "Illustrative blasted carbon-steel plate; paint or lining is a separate selection.",
+      "provenance": {
+        "source": "ASTM A516/A516M tensile requirements (Grade 70); ASME carbon-steel modulus of elasticity",
+        "source_type": "standard",
+        "url": null
+      }
+    },
+    "stainless_astm_a312_tp304": {
+      "name": "Austenitic stainless pipe ASTM A312 TP304",
+      "category": "metal",
+      "aliases": [
+        "ASTM A312 TP304",
+        "A312 TP304",
+        "A312-TP304",
+        "A312 TP 304",
+        "ASME SA-312 TP304",
+        "SA-312 TP304",
+        "SA-312-TP304",
+        "TP304"
+      ],
+      "condition": "Seamless or welded austenitic stainless pipe as supplied to ASTM A312/A312M grade TP304, solution annealed.",
+      "constitutive_model": "isotropic",
+      "mechanical": {
+        "E_mpa": 195000,
+        "nu": 0.3,
+        "density_g_cm3": 8.0,
+        "yield_mpa": 205,
+        "ultimate_mpa": 515
+      },
+      "property_basis": {
+        "E_mpa": "ASME B31.3 Appendix C modulus for austenitic stainless steel at 21 C, 28.3e6 psi",
+        "nu": "Nominal austenitic stainless value",
+        "density_g_cm3": "Nominal 304 density, as in stainless_304",
+        "yield_mpa": "ASTM A312 TP304 specified minimum yield, 30 ksi",
+        "ultimate_mpa": "ASTM A312 TP304 specified minimum tensile, 75 ksi"
+      },
+      "selection_status": "Engineering selection; piping code allowables come from piping_spec_check, not from these minima.",
+      "appearance": {
+        "color": [0.69, 0.71, 0.74],
+        "metallic": 0.88,
+        "roughness": 0.3
+      },
+      "finish_note": "Illustrative pickled stainless pipe.",
+      "provenance": {
+        "source": "ASTM A312/A312M tensile requirements (TP304); ASME B31.3 Appendix C modulus of elasticity",
+        "source_type": "standard",
+        "url": null
+      }
+    },
+    "stainless_astm_a312_tp316": {
+      "name": "Austenitic stainless pipe ASTM A312 TP316",
+      "category": "metal",
+      "aliases": [
+        "ASTM A312 TP316",
+        "A312 TP316",
+        "A312-TP316",
+        "A312 TP 316",
+        "ASME SA-312 TP316",
+        "SA-312 TP316",
+        "SA-312-TP316",
+        "TP316"
+      ],
+      "condition": "Seamless or welded austenitic stainless pipe as supplied to ASTM A312/A312M grade TP316, solution annealed. Not TP316L (170 MPa minimum yield).",
+      "constitutive_model": "isotropic",
+      "mechanical": {
+        "E_mpa": 195000,
+        "nu": 0.3,
+        "density_g_cm3": 8.0,
+        "yield_mpa": 205,
+        "ultimate_mpa": 515
+      },
+      "property_basis": {
+        "E_mpa": "ASME B31.3 Appendix C modulus for austenitic stainless steel at 21 C, 28.3e6 psi",
+        "nu": "Nominal austenitic stainless value",
+        "density_g_cm3": "Nominal 316 density",
+        "yield_mpa": "ASTM A312 TP316 specified minimum yield, 30 ksi",
+        "ultimate_mpa": "ASTM A312 TP316 specified minimum tensile, 75 ksi"
+      },
+      "selection_status": "Engineering selection; piping code allowables come from piping_spec_check, not from these minima.",
+      "appearance": {
+        "color": [0.69, 0.71, 0.74],
+        "metallic": 0.88,
+        "roughness": 0.3
+      },
+      "finish_note": "Illustrative pickled stainless pipe.",
+      "provenance": {
+        "source": "ASTM A312/A312M tensile requirements (TP316); ASME B31.3 Appendix C modulus of elasticity",
+        "source_type": "standard",
+        "url": null
+      }
+    },
     "steel_a36": {
       "name": "Mild steel (A36)",
       "category": "metal",

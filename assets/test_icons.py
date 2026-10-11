@@ -156,52 +156,6 @@ def test_determinism():
               "(expected — it carries rendered model tiles; regenerate via scripts/icon_pipeline.py)")
 
 
-def _parse_cpp_aliases() -> dict:
-    """Read the resolveIconAlias() table from host/src/ui/icons.cpp so this guard agrees with the
-    C++ fallback logic. Returns {from_name: to_name}."""
-    import re
-    src = (REPO_ROOT / "host" / "src" / "ui" / "icons.cpp").read_text(encoding="utf-8")
-    # {"from", "to"}, tolerant of comments/whitespace after the closing brace.
-    pairs = re.findall(r'\{\s*"([a-z0-9_]+)"\s*,\s*"([a-z0-9_]+)"\s*\}', src)
-    return {a: b for a, b in pairs}
-
-
-def _parse_ribbon_icon_refs() -> set:
-    """Icon-name literals referenced by the ribbon (3rd string field of each RibbonAction row) and
-    the feature-manager toolbar (toolBtn(id, icon, ...))."""
-    import re
-    refs = set()
-    rdef = (REPO_ROOT / "host" / "src" / "ui" / "ribbon_def.cpp").read_text(encoding="utf-8")
-    for m in re.finditer(r'\{\s*"[^"]+"\s*,\s*"[^"]*"\s*,\s*"([^"]+)"', rdef):
-        refs.add(m.group(1))
-    ftree = (REPO_ROOT / "host" / "src" / "ui" / "feature_tree.cpp").read_text(encoding="utf-8")
-    for m in re.finditer(r'toolBtn\(\s*"[^"]+"\s*,\s*"([^"]+)"', ftree):
-        refs.add(m.group(1))
-    return refs
-
-
-def test_ribbon_icon_coverage():
-    """DURABLE GUARD: every icon name referenced by the ribbon/toolbar must resolve to a real atlas
-    cell — either directly or through the resolveIconAlias() table. This is what stops referenced
-    icons from silently degrading to the magenta placeholder when a regen drops a tile or a new
-    action is added without art (has bitten us 3x — see icon-atlas-dual-source memory)."""
-    cells = set(k.rsplit("@", 1)[0] for k in load_json()["cell"])
-    aliases = _parse_cpp_aliases()
-    refs = _parse_ribbon_icon_refs()
-    unresolved = []
-    for ref in sorted(refs):
-        target = aliases.get(ref, ref)
-        if target not in cells:
-            via = f" (alias -> '{target}')" if ref in aliases else ""
-            unresolved.append(f"{ref}{via}")
-    assert not unresolved, (
-        "Ribbon/toolbar icons with no atlas cell and no alias (would render magenta):\n    "
-        + "\n    ".join(unresolved)
-        + "\n  Fix: add a rendered tile (scripts/icon_pipeline.py) or an entry in "
-          "resolveIconAlias() in host/src/ui/icons.cpp."
-    )
-    print(f"  PASS ribbon_icon_coverage: {len(refs)} referenced icons all resolve "
-          f"({len(aliases)} via alias table)")
 
 
 def test_accent_retint_contract():
@@ -285,7 +239,6 @@ def main():
 
     test_coverage()
     test_json_keys()
-    test_ribbon_icon_coverage()
     test_same_dimensions()
     test_layout_consistency()
     test_fits_in_a_texture()

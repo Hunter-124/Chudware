@@ -241,6 +241,7 @@ std::vector<TopoDS_Shape> source_shapes(const DrawingSession& s,
     json env = s.source_env;
     long rev = s.source_revision;
     std::string ref = "inline";
+    std::string component_base;  // folder for relative component sources (live source only)
     if (!s.source_ref_id.empty()) {
         json live = doc_live_source(s.source_ref_id);
         if (live.is_object() && live.contains("tree")) {
@@ -248,6 +249,9 @@ std::vector<TopoDS_Shape> source_shapes(const DrawingSession& s,
             env = live.value("env", json::object());
             rev = live.value("revision", 0L);
             ref = s.source_ref_id;
+            if (live.contains("component_source_base") &&
+                live["component_source_base"].is_string())
+                component_base = live["component_source_base"].get<std::string>();
         }
     }
     const std::string key = ref + ":" + std::to_string(rev) + ":" +
@@ -258,7 +262,7 @@ std::vector<TopoDS_Shape> source_shapes(const DrawingSession& s,
     // body so all of them superimpose in each view (one combined projection per orientation).
     if (tree.is_object() && tree.value("schema", std::string()) == "aicad.asm/1") {
         try {
-            AssemblyResult ares = compile_assembly(tree);
+            AssemblyResult ares = compile_assembly(tree, component_base);
             out.reserve(ares.bodies.size());
             std::map<std::string, std::string> sources;
             if (components) {
@@ -1028,8 +1032,11 @@ void collect_hole_features(const json& node, json& rows) {
         const bool tapped = style == "tap" || style == "tapped" ||
                             p.contains("tap") || p.value("tapped", false);
         int count = 1;
-        if (p.contains("positions") && p["positions"].is_array() && !p["positions"].empty())
-            count = static_cast<int>(p["positions"].size());
+        for (const char* key : {"positions", "world_points"})
+            if (p.contains(key) && p[key].is_array() && !p[key].empty()) {
+                count = static_cast<int>(p[key].size());
+                break;
+            }
         double dia = 0.0;
         for (const char* key : {"diameter", "dia", "d", "hole_diameter"})
             if (p.contains(key)) {

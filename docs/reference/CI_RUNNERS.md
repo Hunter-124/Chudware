@@ -556,7 +556,8 @@ before dispatching nightly. `ensure` derives the tag from the locked version,
 so builders fetch the new digest without manual installation. Do not commit
 binaries or use metered Actions artifacts.
 
-The v0.4.1 upstream release contains no Windows binary. Build the exact locked
+Upstream Chudcode releases contain no Windows CLI: the Linux cross-compiled
+`chudcode-windows-x64.exe` segfaults at startup in Bun 1.4.0. Build the exact locked
 commit on the existing Ryzen runner using
 `.github/workflows/chudcode-runtime-windows-build.yml`. Upload an authenticated source tarball
 to the same CAD mirror as

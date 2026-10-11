@@ -358,11 +358,12 @@ identity string); engine provenance is never accepted as or appended to it.
 
 The lock pins `chudcode-v0.4.3` (the thin fork on upstream oh-my-pi 18.4.4,
 `engine_version` 18.4.4). Linux x86_64 and macOS x86_64 are the upstream
-release assets. Windows x86_64 is the native build from
-`chudcode-runtime-windows-build.yml`, because the Linux cross-compiled Windows
-CLI crashes inside Bun 1.4.0 at startup; Chudcode releases no longer ship it.
-Until the native Windows bytes exist, the Windows row stays `null` and Windows
-installer legs fail closed. Locks written before the x64-only matrix also list
+release assets. Windows x86_64 (`6627829b…`) is the native build from
+`chudcode-runtime-windows-build.yml`, published to the CAD mirror, because the
+Linux cross-compiled Windows CLI crashes inside Bun 1.4.0 at startup; Chudcode
+releases no longer ship it. Between a version bump and the native Windows
+build, the Windows row is `null` and Windows installer legs fail closed. Locks
+written before the x64-only matrix also list
 `linux-aarch64`/`macos-arm64`; `load_lock` still accepts those so rollback can
 verify retained releases, but `pin` and `check-lock` require the exact
 supported set. ARM targets (Linux ARM, macOS ARM) are not release targets. A

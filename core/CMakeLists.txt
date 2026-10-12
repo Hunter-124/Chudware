@@ -1605,6 +1605,25 @@ if(CHUDWARE_WITH_OCCT)
   set_tests_properties(import_roundtrip PROPERTIES RUN_SERIAL TRUE
     ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- AutoCAD interchange: ACIS SAT/SAB read+write, native DWG (R2013+ data storage read,
+  # R2000 write) and the R2000 DXF writer that carries ACIS solids. One executable each.
+  foreach(_acad_test dwg_write dwg_native dxf_r2000 acis_read acis_write)
+    add_executable(test_${_acad_test} tests/test_${_acad_test}.cpp)
+    target_include_directories(test_${_acad_test} PRIVATE
+      ${doctest_SOURCE_DIR}
+      ${OpenCASCADE_INCLUDE_DIR})
+    target_link_libraries(test_${_acad_test} PRIVATE
+      chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_host_aicm_loader)
+    set_target_properties(test_${_acad_test} PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    if(CHUDWARE_WITH_POLYMESH)
+      target_link_libraries(test_${_acad_test} PRIVATE chudware_mesh)
+      chudware_polymesh_stage_runtime(test_${_acad_test})
+    endif()
+    add_test(NAME ${_acad_test} COMMAND test_${_acad_test})
+    set_tests_properties(${_acad_test} PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+  endforeach()
+
   # --- Assembly export: doc_export_file/step/estimate must world-place component bodies --
   # (regression for "file exports do nothing for assemblies" — exports compiled the
   # assembly doc as a part, which has no features, so the writer got zero bodies).
@@ -1671,6 +1690,11 @@ if(CHUDWARE_WITH_OCCT)
     doc/formats.cpp
     doc/solidworks_tessellation.cpp
     doc/dxf.cpp
+    doc/dwg.cpp
+    doc/dwg_write.cpp
+    doc/dwg_native.cpp
+    doc/acis_read.cpp
+    doc/acis_write.cpp
     doc/pdfvec.cpp
     doc/svgvec.cpp
     doc/annot_draw.cpp

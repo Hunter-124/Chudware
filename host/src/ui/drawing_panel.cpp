@@ -68,8 +68,9 @@ static void exportActiveDrawing(AppState& st, const char* fmt) {
         return;
     }
     const bool isDxf = std::strcmp(fmt, "dxf") == 0;
+    const bool isDwg = std::strcmp(fmt, "dwg") == 0;
     const bool isSvg = std::strcmp(fmt, "svg") == 0;
-    const std::string ext = isDxf ? "dxf" : isSvg ? "svg" : "pdf";
+    const std::string ext = isDxf ? "dxf" : isDwg ? "dwg" : isSvg ? "svg" : "pdf";
     const std::string base = s_sanitize(tab.title.empty() ? "drawing" : tab.title) + "_drawing";
 
     std::string path;
@@ -78,11 +79,15 @@ static void exportActiveDrawing(AppState& st, const char* fmt) {
         path = base + "." + ext;
     } else {
         const char* filterDxf = "DXF (*.dxf)\0*.dxf\0All files (*.*)\0*.*\0";
+        const char* filterDwg = "AutoCAD DWG (*.dwg)\0*.dwg\0All files (*.*)\0*.*\0";
         const char* filterPdf = "PDF (*.pdf)\0*.pdf\0All files (*.*)\0*.*\0";
         const char* filterSvg = "SVG (*.svg)\0*.svg\0All files (*.*)\0*.*\0";
         std::string suggest = base + "." + ext;
-        path = ui::saveFileDialog(isDxf ? filterDxf : isSvg ? filterSvg : filterPdf, ext.c_str(),
-                                  suggest.c_str());
+        path = ui::saveFileDialog(isDxf   ? filterDxf
+                                  : isDwg ? filterDwg
+                                  : isSvg ? filterSvg
+                                          : filterPdf,
+                                  ext.c_str(), suggest.c_str());
         if (path.empty()) return;  // canceled
     }
 
@@ -585,6 +590,7 @@ bool drawingHandleCommand(AppState& st, const std::string& cmd) {
     if (cmd == "dwg_export_dxf")  { exportActiveDrawing(st, "dxf"); return true; }
     if (cmd == "dwg_export_pdf")  { exportActiveDrawing(st, "pdf"); return true; }
     if (cmd == "dwg_export_svg")  { exportActiveDrawing(st, "svg"); return true; }
+    if (cmd == "dwg_export_dwg")  { exportActiveDrawing(st, "dwg"); return true; }
     if (cmd == "dwg_arrange") {
         // Re-run the engine's professional layout (projection + scale kept from the title block).
         disarmDrawTools(tab);
@@ -1416,15 +1422,18 @@ static void renderTitleBlockPopup(AppState& st, AppState::DocTab& tab, const nlo
 
     ui::kit::sectionHeader("Export");
     const char* exportFmt = nullptr;
-    const float third = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2.0f) / 3.0f;
-    if (ui::kit::secondaryButton("PDF##drw_exp_pdf", true, nullptr, ImVec2(third, 0.0f))) exportFmt = "pdf";
+    const float quarter = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 3.0f) / 4.0f;
+    if (ui::kit::secondaryButton("PDF##drw_exp_pdf", true, nullptr, ImVec2(quarter, 0.0f))) exportFmt = "pdf";
     ui::kit::itemTooltip("Vector PDF at true paper size");
     ImGui::SameLine();
-    if (ui::kit::secondaryButton("SVG##drw_exp_svg", true, nullptr, ImVec2(third, 0.0f))) exportFmt = "svg";
+    if (ui::kit::secondaryButton("SVG##drw_exp_svg", true, nullptr, ImVec2(quarter, 0.0f))) exportFmt = "svg";
     ui::kit::itemTooltip("Scalable vector SVG at true paper size");
     ImGui::SameLine();
-    if (ui::kit::secondaryButton("DXF##drw_exp_dxf", true, nullptr, ImVec2(third, 0.0f))) exportFmt = "dxf";
+    if (ui::kit::secondaryButton("DXF##drw_exp_dxf", true, nullptr, ImVec2(quarter, 0.0f))) exportFmt = "dxf";
     ui::kit::itemTooltip("AutoCAD R12 DXF, millimetre units");
+    ImGui::SameLine();
+    if (ui::kit::secondaryButton("DWG##drw_exp_dwg", true, nullptr, ImVec2(quarter, 0.0f))) exportFmt = "dwg";
+    ui::kit::itemTooltip("AutoCAD DWG (R2000), layers, linetypes and text kept");
     if (exportFmt) ImGui::CloseCurrentPopup();
 
     glass.finish();

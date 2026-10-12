@@ -31,6 +31,7 @@
 #include "doc/document.h"
 #include "doc/drawing.h"
 #include "doc/drawing_session.h"  // drawing_get (stateful export_drawing)
+#include "doc/dwg.h"
 #include "doc/dxf.h"
 #include "doc/pdfvec.h"
 #include "doc/svgvec.h"
@@ -185,9 +186,11 @@ void ink_to_dxf(const InkSheet& s, DxfDocument& doc) {
     ink_layer_to_dxf(s.tables, "TABLES", "CONTINUOUS", nullptr, doc);
 }
 
-// Lay sheets left-to-right with a 20 mm gutter (DXF has no page concept) and write them.
+// Lay sheets left-to-right with a 20 mm gutter (DXF/DWG have no page concept) and write
+// them as `fmt` ("dxf" or "dwg").
 std::string write_drawing_dxf(const std::string& path,
-                              const std::vector<const InkSheet*>& sheets) {
+                              const std::vector<const InkSheet*>& sheets,
+                              const std::string& fmt) {
     DxfDocument doc;
     declare_drawing_layers(doc);
     double offset_x = 0.0, max_h = 0.0;
@@ -217,12 +220,12 @@ std::string write_drawing_dxf(const std::string& path,
         doc.has_limits = true;
         doc.limits = {0.0, 0.0, offset_x - 20.0, max_h};
     }
-    return write_dxf(path, doc);
+    return fmt == "dwg" ? write_dwg(path, doc) : write_dxf(path, doc);
 }
 
-// Write one sheet (or the stateless pooled views) as dxf / pdf / svg.
+// Write one sheet (or the stateless pooled views) as dxf / dwg / pdf / svg.
 std::string write_ink(const InkSheet& sheet, const std::string& path, const std::string& fmt) {
-    if (fmt == "dxf") return write_drawing_dxf(path, {&sheet});
+    if (fmt == "dxf" || fmt == "dwg") return write_drawing_dxf(path, {&sheet}, fmt);
     if (fmt == "svg") return write_svg(path, sheet);
     return write_pdf(path, sheet);
 }
@@ -371,8 +374,8 @@ json export2d_drawing(const json& doc, const json& env, const json& views,
                       const std::string& path, const std::string& fmt) {
     if (!views.is_array())
         throw OpError("invalid_op", "export2d_drawing: 'views' must be an array");
-    if (fmt != "dxf" && fmt != "pdf" && fmt != "svg")
-        throw OpError("invalid_op", "format must be 'dxf', 'pdf', or 'svg'",
+    if (fmt != "dxf" && fmt != "dwg" && fmt != "pdf" && fmt != "svg")
+        throw OpError("invalid_op", "format must be 'dxf', 'dwg', 'pdf', or 'svg'",
                       {{"format", fmt}});
     CompileResult res = compile_document(doc, env.is_null() ? json::object() : env);
     json projected = project_all(res.shapes, views);
@@ -408,8 +411,8 @@ json export2d_drawing(const json& doc, const json& env, const json& views,
 
 json export_drawing_selected(const std::string& doc_id, const std::string& path,
                              const std::string& fmt, const json& sheet_selector) {
-    if (fmt != "dxf" && fmt != "pdf" && fmt != "svg")
-        throw OpError("invalid_op", "format must be 'dxf', 'pdf', or 'svg'",
+    if (fmt != "dxf" && fmt != "dwg" && fmt != "pdf" && fmt != "svg")
+        throw OpError("invalid_op", "format must be 'dxf', 'dwg', 'pdf', or 'svg'",
                       {{"format", fmt}});
     if (!sheet_selector.is_string())
         throw OpError("invalid_op",
@@ -478,8 +481,8 @@ json export_drawing_selected(const std::string& doc_id, const std::string& path,
             }
             out_path = out_paths.front().get<std::string>();
         } else {
-            // DXF has no page concept: sheets are laid left-to-right with a 20 mm gutter.
-            out_path = write_drawing_dxf(path, inks);
+            // DXF/DWG have no page concept: sheets are laid left-to-right with a 20 mm gutter.
+            out_path = write_drawing_dxf(path, inks, fmt);
         }
     } catch (const OpError&) {
         throw;
@@ -507,8 +510,8 @@ json export_drawing(const std::string& doc_id, const std::string& path,
 }
 
 json export_flat_dxf(const std::string& doc_id, const std::string& path, const std::string& fmt) {
-    if (fmt != "dxf" && fmt != "pdf")
-        throw OpError("invalid_op", "format must be 'dxf' or 'pdf'", {{"format", fmt}});
+    if (fmt != "dxf" && fmt != "dwg" && fmt != "pdf")
+        throw OpError("invalid_op", "format must be 'dxf', 'dwg', or 'pdf'", {{"format", fmt}});
     // Fresh compile of the live source part (mirrors flat_pattern_for_session's fresh
     // cache so sm_flat_pattern repopulates the flat side-channel).
     json live = doc_live_source(doc_id);
@@ -574,7 +577,7 @@ json export_flat_dxf(const std::string& doc_id, const std::string& path, const s
     int n_ent = 1 + static_cast<int>(bend_segs.size()) + static_cast<int>(cuts.size());
     std::string out_path;
     try {
-        if (fmt == "dxf") {
+        if (fmt == "dxf" || fmt == "dwg") {
             DxfDocument dxf;
             dxf.add_layer("OUTLINE", 7, "CONTINUOUS");
             dxf.add_layer("BEND", 3, "CONTINUOUS");
@@ -582,7 +585,7 @@ json export_flat_dxf(const std::string& doc_id, const std::string& path, const s
             dxf.polylines.push_back({"OUTLINE", outline, 0.0, ""});
             for (const auto& s : bend_segs) dxf.polylines.push_back({"BEND", s, 0.0, ""});
             for (const auto& c : cuts) dxf.polylines.push_back({"CUTS", c, 0.0, ""});
-            out_path = write_dxf(path, dxf);
+            out_path = fmt == "dwg" ? write_dwg(path, dxf) : write_dxf(path, dxf);
         } else {
             // Outline + cut loops as thick outlines; bend lines thin dashed so they stay
             // visually distinct (PDF has no named layers). Page sized to the blank.

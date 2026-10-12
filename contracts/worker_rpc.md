@@ -355,10 +355,22 @@ material}` · `eval_section_props {doc_id, plane: Selector|datum-id}` · `eval_i
 plane}` → `{symmetric: bool, deviation_mm3}` · `eval_perf {doc_id}` → `{features:[{id, name, ms}]}`
 
 ### Formats (M8; minimal `doc_save`/`doc_open` for `.step+` exist from M1)
-`import_file {path, into?: doc_id}` → ops-response (adds `import` feature(s)) ·
-`export_file {doc_id, path, format: "step"|"stl"|"brep"|"iges"|"3mf"}` → `{path}`
+`import_file {path, into?: doc_id}` → ops-response (adds `import` feature(s); dxf/dwg/sat record
+the drawing units as the feature's `source_units` $INSUNITS code; per-entity ACIS problems come back
+in `warnings`) ·
+`export_file {doc_id, path, format: "step"|"iges"|"brep"|"stl"|"3mf"|"obj"|"ply"|"gltf"|"glb"|"3dm"|"dxf"|"dwg"|"sat", lin_deflection?, ang_deflection?, relative?, units?}` → `{path, bytes, units?, solid_count?, valid_solids?, validated, validation_skipped?}`
+(`doc_formats` reports the live matrix). `dxf` and `dwg` write solid/shell bodies as exact ACIS
+`3DSOLID`/`BODY` entities (SAT 4.00; DXF then switches from R12 to R2000 AC1015) and 2D/wire bodies
+as `LINE`/`ARC`/`CIRCLE`/`POLYLINE` (the tessellation options only shape free non-analytic curves);
+with 2+ bodies each body gets its own layer `BODY1..N`. `sat` writes ACIS 7.0 text, one body per
+document body. `units` (dxf/dwg/sat only; `invalid_op` elsewhere): `"mm"|"in"|"ft"|"cm"|"m"|"um"|
+"mil"|"dm"` or an $INSUNITS code; omitted = the doc's first DWG/DXF/SAT import `source_units`, else
+mm. Each dxf/dwg/sat export is re-read and must give back the same solid count, validity and volume
+(`export_failed` otherwise); a dwg re-read needs LibreDWG `dwg2dxf`, else `validation_skipped`.
+`dwg` is an AutoCAD R2000 (AC1015) file written by Chudware's own encoder
+(`core/doc/dwg_write.cpp`; see §2D export).
 
-#### 2D export — drawing sheets + sheet-metal flat patterns (W14, DXF/PDF)
+#### 2D export — drawing sheets + sheet-metal flat patterns (W14, DXF/PDF/SVG/DWG)
 
 Write the 2D geometry the engine already produces to a manufacturing file. **DXF** is a native R12
 (AC1009) ASCII file: a TABLES section declaring named layers (color + linetype) and an ENTITIES
@@ -367,15 +379,20 @@ ezdxf). **PDF** is a single-page 1:1 mm vector page (hand-written PDF 1.4; no li
 solid strokes for visible/outline, dashed for hidden/bend). Format comes from an explicit `format`
 param else the path extension; structured error envelope; contained errors (bad path/format/no
 geometry) never crash the worker. Implemented by `core/api/libchudware.cpp` → `core/doc/export2d.cpp`
-(+ `core/doc/dxf.cpp`, `core/doc/pdfvec.cpp`).
+(+ `core/doc/dxf.cpp`, `core/doc/pdfvec.cpp`, `core/doc/dwg.cpp`). **DWG** is the same layered
+drawing as an AutoCAD R2000 (AC1015) binary written natively (`core/doc/dwg_write.cpp`, no
+external tool): layers keep name, colour and linetype (HIDDEN draws DASHED, CENTER draws CENTER),
+polylines become `LWPOLYLINE` with their constant width, text keeps its alignment point. When
+LibreDWG `dwg2dxf` is installed the written file is re-read with it and must give every entity
+back before it is moved into place. libchudware infers `dwg` from a `.dwg` path extension.
 
 | method | params → result |
 |---|---|
-| `export_drawing` | `{doc_id, path, format?:"dxf"\|"pdf"}` → `{path, format, visible, hidden, entities}`. `doc_id` is a **drawing** registry id (from `drawing_new`). Flattens every sheet/view's `visible`+`hidden` polylines (already in absolute sheet-mm) to layers **VISIBLE** (solid) + **HIDDEN** (dashed) and writes the file. `export_failed` when the drawing has no view geometry. |
-| `export_flat_dxf` | `{doc_id, path, format?:"dxf"\|"pdf"}` → `{path, format, bend_lines, outline_points, flat_area, entities}`. `doc_id` is a **part** doc id. The active sheet-metal part's flat pattern: the blank boundary on layer **OUTLINE** + the bend lines on a SEPARATE layer **BEND** (the key sheet-metal split). Compiles with a FRESH cache so `sm_flat_pattern` repopulates its side-channel (same caveat as `weld_cut_list`); `invalid_op` when the part has no flat pattern (add a Flatten feature first) or is an assembly. |
+| `export_drawing` / `drawing_export` | `{doc_id, path, format?:"dxf"\|"pdf"\|"svg"\|"dwg"}` → `{path, format, visible, hidden, entities}`. `doc_id` is a **drawing** registry id (from `drawing_new`). Flattens every sheet/view's `visible`+`hidden` polylines (already in absolute sheet-mm) to layers **VISIBLE** (solid) + **HIDDEN** (dashed) and writes the file. `export_failed` when the drawing has no view geometry. |
+| `export_flat_dxf` | `{doc_id, path, format?:"dxf"\|"pdf"\|"dwg"}` → `{path, format, bend_lines, outline_points, flat_area, entities}`. `doc_id` is a **part** doc id. The active sheet-metal part's flat pattern: the blank boundary on layer **OUTLINE** + the bend lines on a SEPARATE layer **BEND** (the key sheet-metal split). Compiles with a FRESH cache so `sm_flat_pattern` repopulates its side-channel (same caveat as `weld_cut_list`); `invalid_op` when the part has no flat pattern (add a Flatten feature first) or is an assembly. |
 
-Layer→style: VISIBLE/OUTLINE = white(7)/continuous, HIDDEN = red(1)/dashed, BEND = green(3)/
-continuous. The flat-pattern geometry is surfaced on `CompileResult.sheet_metal_flat`
+Layer→style: VISIBLE/OUTLINE = white(7)/continuous, HIDDEN = red(1)/dashed (continuous in DWG),
+BEND = green(3)/continuous. The flat-pattern geometry is surfaced on `CompileResult.sheet_metal_flat`
 (`{fid: {bend_lines, outline, flat_area, n_base, …}}`) from the `sm_flat_pattern` compiler's
 `ctx.datums["_sheet_metal_flat"]` side-channel, then projected to 2D using the stored `n_base`.
 

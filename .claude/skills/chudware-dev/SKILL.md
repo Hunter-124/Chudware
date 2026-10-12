@@ -176,6 +176,12 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
 
 - **hostd is the only autosave authority in daemon mode**; the guard sits at the single write
   in `cad_common._autosave()`, not its callers. The standalone MCP server keeps snapshots.
+- **AutoCAD files are exact B-rep both ways.** DWG/DXF/SAT ACIS solids import natively
+  (`acis_read.cpp`; `dwg_native.cpp` for every DWG version) — LibreDWG `dwg2dxf` is only for
+  2D entities: it drops SAB data storage and SURFACE classes and splits inline SAT, so
+  handle-keyed native ACIS always wins. Exports write ACIS 3DSOLID/BODY (SAT 400 in R2000
+  DWG/DXF, 700 `.sat`) in the import's `source_units`, and every dxf/dwg/sat export is re-read
+  (solids, validity, volume). The ODA File Converter is a scratch validation oracle, never product code.
 - **The build state is saved with the file.** `doc_save` writes `cache.json/aicm/brep` plus
   per-feature compile checkpoints `cache.ckpt` (contracts/stepplus.md §9); `doc_open` hydrates
   `compiled` + `compile_cache` from them, so a valid cache opens warm (first op executes 0

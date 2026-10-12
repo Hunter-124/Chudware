@@ -149,6 +149,16 @@ only after the idle proof succeeds. CI leaves the existing release in place rath
 than attempting rollback. Save work, close browser workspace tabs, and retry the
 deployment once the bridges disconnect.
 
+DWG import in the browser runs inside the shared hostd, which calls LibreDWG's
+`dwg2dxf` as a subprocess (DWG export is native). LibreDWG is GPL-3.0: it stays on the
+server, is never linked into the engine, and never ships in the `/app` bundle.
+Before anything else changes, `install_webd.sh` runs `scripts/provision_libredwg.py`
+for the hostd unit's environment (`~/.local/share/Chudware/tools/libredwg/bin`, or
+`$XDG_DATA_HOME/Chudware/...` when the user manager sets it). A verified install
+returns at once; the first install downloads the SHA256-pinned source release and
+needs a C toolchain (`gcc`, `make`). A failed provision is a pre-mutation refusal
+(exit 4).
+
 ### Release retention and rollback
 
 `install_webd.sh` keeps the newest `CHUDWARE_WEBD_KEEP_RELEASES` release

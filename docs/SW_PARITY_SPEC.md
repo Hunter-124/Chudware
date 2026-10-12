@@ -527,7 +527,7 @@ Neutral-format round-trips work at the engine layer (STEP/IGES/BREP/STL/3MF) wit
 mtime-keyed caching, the .step+ native container is robust, and 2D output (DXF/PDF, flat
 DXF) plus ECAD interop (KiCad import, Gerber/BOM, board-to-STEP) are complete. The 51%
 reflects that **geometry export has no UI** (File > Export items are stub-disabled), no
-Parasolid/ACIS/DWG, and no color/unit/assembly-hierarchy round-trip on STEP.
+Parasolid, and no color/unit/assembly-hierarchy round-trip on STEP.
 
 | Capability | SW acceptance condition | Status | Evidence |
 |---|---|---|---|
@@ -544,9 +544,9 @@ Parasolid/ACIS/DWG, and no color/unit/assembly-hierarchy round-trip on STEP.
 | DXF export (drawing sheets) | Multi-layer 2D output | done | rpc `export_drawing`; `core/doc/export2d.cpp` and `core/doc/dxf.cpp`; Save As DXF dialog |
 | DXF export (sheet-metal flat) | OUTLINE + BEND layers | done | rpc `export_flat_dxf`; `core/doc/export2d.cpp` OUTLINE/BEND layers |
 | PDF export (drawing/flat) | Printable vector PDF | done | rpc `export_drawing`/`export_flat_dxf`; `core/doc/pdfvec.cpp`; format choice in panel |
-| DWG export/import | AutoCAD binary format | **missing** | no DWG reader/writer |
+| DWG export/import | AutoCAD binary format | done | rpc `export_file`/`import_file` + `export_drawing`/`export_flat_dxf` format `dwg`: native AutoCAD R2000 writer (`core/doc/dwg_write.cpp`) with solids as ACIS 3DSOLID/BODY; ACIS solids/surfaces of every version import exactly (R2013+ data storage via `core/doc/dwg_native.cpp`, `core/doc/acis_read.cpp`); 2D entities via subprocess LibreDWG `dwg2dxf` (`core/doc/dwg.cpp`, provisioned by `scripts/provision_libredwg.py`); not yet opened in AutoCAD itself (validated with ODA File Converter + re-read) |
 | Parasolid (x_t/x_b) import | Native Siemens kernel format | **missing** | no Parasolid bridge (most-requested SW exchange format) |
-| ACIS/SAT import | Inventor/Fusion kernel format | **missing** | no SAT reader |
+| ACIS/SAT import/export | Inventor/Fusion kernel format | done | rpc `import_file`/`export_file` format `sat` (.sat/.sab in, ACIS 7.0 out); `core/doc/acis_read.cpp`, `core/doc/acis_write.cpp` |
 | STEP AP242 + PMI/GD&T | MBD tolerances/datums in STEP | **missing** | only AP214; no PMI model |
 | STEP color/appearance round-trip | Per-body RGB embedded/read | **missing** | bare export_step; no XCAF color |
 | STEP assembly hierarchy export | Product/instance tree in STEP | **missing** | all bodies collapsed to one Compound |

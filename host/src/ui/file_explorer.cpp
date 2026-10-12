@@ -299,11 +299,12 @@ static std::string rowLabel(const std::string& name) {
 
 // ---- known extensions ----------------------------------------------------
 // .step+ is our native part container and .draw+ is a standalone editable drawing;
-// the rest are import/interop formats. ECAD/KiCad files open through the ECAD path.
-// Lower-cased compare.
+// the rest are import/interop formats (AutoCAD .dxf/.dwg and ACIS .sat/.sab included).
+// ECAD/KiCad files open through the ECAD path. Lower-cased compare.
 static bool isCadExt(const std::string& e) {
     return e == ".draw+" || e == ".step+" || e == ".step" || e == ".stp" ||
-           e == ".iges" || e == ".igs" || e == ".stl" || e == ".3mf";
+           e == ".iges" || e == ".igs" || e == ".stl" || e == ".3mf" ||
+           e == ".dxf" || e == ".dwg" || e == ".sat" || e == ".sab";
 }
 static bool isEcadExt(const std::string& e) {
     return e == ".ecad+" || e == ".ecad" || e == ".kicad_sch" || e == ".kicad_pcb";

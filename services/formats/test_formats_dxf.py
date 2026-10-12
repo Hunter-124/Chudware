@@ -1,6 +1,6 @@
 """Round-trip tests for the DXF importer (services.formats.formats_dxf via import_path).
 
-DXF is import-only, so "round-trip" here means: author a known DXF with ezdxf, import it through
+The Python DXF lane only imports, so "round-trip" here means: author a known DXF with ezdxf, import it through
 the public ``import_path`` surface, and assert the geometry (face areas, wire counts) matches.
 """
 import math
@@ -27,7 +27,7 @@ def test_dxf_in_format_registry():
     info = fmts["dxf"]
     assert ".dxf" in info["exts"]
     assert info["can_import"] is True
-    assert info["can_export"] is False  # import-only for v1
+    assert info["can_export"] is True  # written by the native engine's export_file
 
 
 def test_dxf_square_and_circle_become_faces(tmp_path):

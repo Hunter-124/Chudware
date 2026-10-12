@@ -240,6 +240,8 @@ See `docs/reference/HOSTD.md` for the daemon reference.
 - **The EULA is mandatory.** Inno Setup reads the repository-root `LICENSE-EULA.txt` and
   presents it before installation.
 - **GPL subprocess tools are never bundled**, per `contracts/licenses.md`: CalculiX, esptool,
-  LibreDWG `dwg2dxf` and similar are subprocess-only and PATH-discovered at runtime (the
-  pattern `services/installer/provision.py:converters_status()` uses for pandoc/LibreOffice) —
-  the Windows installer must not add a step that downloads or bundles any of those.
+  LibreDWG `dwg2dxf` and similar are subprocess-only and discovered at runtime (the
+  pattern `services/installer/provision.py:converters_status()` uses for pandoc/LibreOffice;
+  LibreDWG is also found in the per-user install the user builds with
+  `python3 scripts/provision_libredwg.py`) — the Windows installer must not add a step that
+  downloads or bundles any of those.

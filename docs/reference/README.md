@@ -67,14 +67,19 @@ referenced — lives here:
 - **`core/doc/formats.cpp`** — production format matrix (`format_registry()`) and
   import/export surface. STEP, IGES, BREP, STL, OBJ, PLY, glTF/GLB, 3MF and Rhino `.3dm`
   are wired according to build capabilities (lib3mf/openNURBS are optional at build
-  time); DXF is import-only through a hand-written ASCII parser (no ezdxf; INSERT
-  blocks skipped); DWG is import-only by running a user-installed LibreDWG `dwg2dxf`
-  as a subprocess and reusing the DXF importer.
+  time); DXF is imported and exported natively (hand-written ASCII R12, R2000 when solids are
+  written; no ezdxf; INSERT blocks expanded, 3DFACE/POLYFACE meshes become mesh bodies, ACIS
+  3DSOLID/BODY/REGION/SURFACE become exact B-rep via `core/doc/acis_read.cpp`); DWG is written
+  natively as AutoCAD R2000 with ACIS solids (`core/doc/dwg_write.cpp`, `core/doc/acis_write.cpp`),
+  its R2013+ ACIS data storage is read natively (`core/doc/dwg_native.cpp`) and its 2D
+  entities are imported through LibreDWG `dwg2dxf` run as a subprocess (`core/doc/dwg.cpp`;
+  PATH or the per-user install from `scripts/provision_libredwg.py`); ACIS `.sat`/`.sab`
+  import and `.sat` (7.0) export use the same ACIS reader/writer.
 - **`services/formats/`** — Python helpers, not the production path:
-  `formats.py` + `formats_dxf.py`/`formats_dwg.py` are the parity oracle (ezdxf,
-  build123d/OCP, trimesh, lib3mf, rhino3dm; the oracle's DWG lane also tries the ODA
-  File Converter), and `services/ecad/threed.py` uses `import_path` to load board
-  3D models.
+  `formats.py` + `formats_dxf.py`/`formats_dwg.py` are the import-only parity oracle
+  (ezdxf, build123d/OCP, trimesh, lib3mf, rhino3dm; the oracle's DWG lane also tries the
+  ODA File Converter), `libredwg.py` resolves the LibreDWG tools, and
+  `services/ecad/threed.py` uses `import_path` to load board 3D models.
 - **SolidWorks `.sldprt`/`.sldasm`** are import-only. On Windows, installed SolidWorks
   COM is preferred for an exact STEP/B-rep conversion. On every platform, modern
   SolidWorks 2015+ saved-display triangle strips import as explicitly labelled

@@ -1666,6 +1666,374 @@ bool demoReviewEndFrame(AppState& st, int dw, int dh, const char* screenshotPath
     return true;
 }
 
+// ---------- CAD-file open scenario (CHUDWARE_SHOT=dwgopen) ----------
+// Runtime smoke for any CAD import lane (here AutoCAD DWG/DXF ACIS solids). $CHUDWARE_SHOT_DOC is
+// copied (extension kept) next to the --ui-screenshot path and the COPY opens through the File >
+// Open request pump (st.requestOpenPath). Once the copy's tab is active and meshed and the async
+// lane is idle, the report records every toast and [warn]/[err] log line the GUI received for the
+// open (doc_open `warnings` arrive as Warn toasts + "[warn] [open]" lines; toasts stay visible in
+// this shot), the world body list (asm_world_bodies names/bboxes joined with eval_mass volumes) and
+// rendered-pixel evidence at the body centres. Captures: the fitted iso viewport + FeatureManager,
+// then the document section and every collapsed FeatureManager row opened by real pointer clicks
+// (a pointer shot: app.cpp ticks it after the platform backend). Fails by name when the document
+// has no bodies or fewer than two solid bodies. Nothing is saved. Captures + dwgopen_report.json
+// land beside the --ui-screenshot path (the last capture is mirrored to it); failure exits non-zero.
+struct DwgOpenShot {
+    bool init = false, want = false, done = false, failed = false;
+    int step = 0, settle = 0, captureWait = 0, shotNo = 0, auditStage = 0;
+    int clickPhase = 0, clicks = 0, quiet = 0;
+    bool docSection = false;  // the document section header was clicked open
+    double started = 0.0, stepStart = 0.0;
+    std::string dir, copy, capture, shotName;
+    ImVec2 clickAt;
+    std::vector<ImGuiID> clicked;
+    std::vector<std::string> seenToasts, seenLog;
+    nlohmann::json report;
+};
+DwgOpenShot g_dwg;
+
+void dwgFail(const std::string& code, const nlohmann::json& evidence) {
+    auto& D = g_dwg;
+    std::printf("dwgopen: FAILED [%s] %s\n", code.c_str(), evidence.dump().c_str());
+    std::fflush(stdout);
+    D.report["ok"] = false;
+    D.report["failure"] = {{"code", code}, {"evidence", evidence}, {"step", D.step}};
+    D.failed = D.done = true;
+    ImGui::GetIO().AddMouseButtonEvent(0, false);
+    D.capture = D.dir + "/dwgopen_FAILED.png";
+}
+
+bool dwgCheck(const std::string& name, bool ok, const nlohmann::json& evidence) {
+    g_dwg.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    std::printf("dwgopen: %s %s\n", ok ? "PASS" : "FAIL", name.c_str());
+    std::fflush(stdout);
+    if (!ok) dwgFail(name, evidence);
+    return ok;
+}
+
+// Every toast and every [warn]/[err] log line the GUI received since the open was requested.
+// Toasts expire after a few seconds, so they are collected every frame, not at capture time.
+void dwgCollectMessages(AppState& st) {
+    auto& D = g_dwg;
+    static const char* kLevel[] = {"info", "success", "warn", "error"};
+    {
+        std::lock_guard<std::mutex> lk(st.toastsMtx);
+        for (const auto& t : st.toasts) {
+            const std::string key = std::string(kLevel[(int)t.level]) + "|" + t.msg;
+            if (std::find(D.seenToasts.begin(), D.seenToasts.end(), key) != D.seenToasts.end()) continue;
+            D.seenToasts.push_back(key);
+            D.report["toasts"].push_back({{"level", kLevel[(int)t.level]}, {"msg", t.msg}});
+        }
+    }
+    std::lock_guard<std::mutex> lk(st.logMtx);
+    for (const auto& line : st.log) {
+        if (line.rfind("[warn]", 0) != 0 && line.rfind("[err]", 0) != 0) continue;
+        if (std::find(D.seenLog.begin(), D.seenLog.end(), line) != D.seenLog.end()) continue;
+        D.seenLog.push_back(line);
+        D.report["log_warnings"].push_back(line);
+        if (line.rfind("[warn] [open] ", 0) == 0) D.report["open_warnings"].push_back(line.substr(14));
+    }
+}
+
+// The FeatureManager rows the capture's audit saw: label + open state, visible rows only.
+nlohmann::json dwgTreeRows() {
+    nlohmann::json rows = nlohmann::json::array();
+    for (const auto& item : ui::audit::observedItems()) {
+        if (!item.value("visible", false) ||
+            item["window"].get_ref<const std::string&>().find("FeatureManager##LeftPane") == std::string::npos)
+            continue;
+        const std::string& label = item["label"].get_ref<const std::string&>();
+        if (label.empty()) continue;
+        rows.push_back({{"label", label}, {"text_only", item.value("text_only", false)}, {"rect", item["rect"]},
+                        {"window", item["window"]}, {"openable", item.value("openable", false)},
+                        {"opened", item.value("opened", false)}});
+    }
+    return rows;
+}
+
+constexpr int kDwgFinalStep = 9;
+
+void dwgOpenTick(AppState& st) {
+    auto& D = g_dwg;
+    if (!D.init) {
+        D.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        D.want = st.shot && mode && std::strcmp(mode, "dwgopen") == 0;
+        if (!D.want) return;
+        // The open's warnings are toasts: this shot records and shows them (shot mode hides
+        // toasts by default for capture hygiene).
+        st.suppressToasts = false;
+        D.started = D.stepStart = pipingNow();
+        D.report = {{"scenario", "dwgopen"}, {"ok", false}, {"checks", nlohmann::json::array()},
+                    {"toasts", nlohmann::json::array()}, {"log_warnings", nlohmann::json::array()},
+                    {"open_warnings", nlohmann::json::array()}, {"audits", nlohmann::json::array()},
+                    {"captures", nlohmann::json::array()}};
+    }
+    if (!D.want || D.done || D.dir.empty()) return;  // dir comes from --ui-screenshot (end frame)
+    ui::audit::observedItems();  // keeps per-frame item observation on (pointer shot)
+    if (D.step >= 1) dwgCollectMessages(st);
+    if (pipingNow() - D.started > 900 || pipingNow() - D.stepStart > 600) {
+        dwgFail("timeout", {{"seconds", pipingNow() - D.started}}); return;
+    }
+    if (!st.workerStarted || st.frame < 5 || !D.capture.empty()) return;
+    if (D.settle > 0) { --D.settle; return; }
+    if (D.auditStage == 1) {
+        ui::audit::AuditOptions o;
+        o.regions = ui::audit::RegionLeftPane | ui::audit::RegionViewport | ui::audit::RegionFloating;
+        if (!ui::audit::begin(std::filesystem::path(D.shotName).stem().string(), o)) {
+            dwgFail("audit", {{"detail", "ui::audit::begin refused"}}); return;
+        }
+        D.auditStage = 2;
+        return;
+    }
+    if (D.auditStage == 2) {
+        if (ui::audit::active()) return;  // the audit is recording; keep the state still
+        D.auditStage = 0;
+        const nlohmann::json& res = ui::audit::lastResult();
+        D.report["audits"].push_back({{"capture", D.shotName},
+                                      {"conflicts", res.value("conflicts", nlohmann::json::array()).size()},
+                                      {"overflows", res.value("overflows", nlohmann::json::array()).size()},
+                                      {"tree_rows", dwgTreeRows()}});
+        if (D.step == kDwgFinalStep) {  // the last capture ends the run (mirrored to --ui-screenshot)
+            // Evidence (not a gate): the Solid Bodies folder and its body rows as the tree drew them.
+            nlohmann::json folder = nullptr, rows = nlohmann::json::array();
+            for (const auto& row : D.report["audits"].back()["tree_rows"]) {
+                const std::string& label = row["label"].get_ref<const std::string&>();
+                if (label.rfind("Solid Bodies (", 0) == 0) folder = label.substr(0, label.find("##"));
+                else if (label.rfind("Body", 0) == 0 && label.find("##body") != std::string::npos)
+                    rows.push_back(label.substr(0, label.find("##")));
+            }
+            D.report["tree_solid_bodies_folder"] = folder;
+            D.report["tree_body_rows"] = rows;
+            D.report["ok"] = true;
+            D.done = true;
+        }
+        D.capture = D.shotName;
+        return;
+    }
+
+    auto next = [&](int step) { D.step = step; D.stepStart = pipingNow(); };
+    auto shoot = [&](const std::string& name) {
+        char prefix[24];
+        std::snprintf(prefix, sizeof prefix, "dwgopen_%02d_", ++D.shotNo);
+        D.shotName = D.dir + "/" + prefix + name + ".png";
+        D.settle = 20;
+        D.auditStage = 1;
+    };
+    auto idle = [&] { return !st.rpc.busy() && st.rebuildsInFlight == 0 && !ui::cameraAnimating(); };
+
+    switch (D.step) {
+    case 0: {  // copy the source file; open the COPY through the File > Open pump
+        const char* doc = std::getenv("CHUDWARE_SHOT_DOC");
+        if (!doc || !*doc) { dwgFail("no_doc", {{"detail", "CHUDWARE_SHOT_DOC is not set"}}); return; }
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(doc, ec)) { dwgFail("doc_missing", {{"path", doc}}); return; }
+        const std::filesystem::path src(doc);
+        D.copy = D.dir + "/" + src.stem().string() + "_copy" + src.extension().string();
+        std::filesystem::copy_file(src, D.copy, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) { dwgFail("copy", {{"detail", ec.message()}}); return; }
+        D.report["source_doc"] = doc;
+        D.report["opened_copy"] = D.copy;
+        st.requestOpenPath = D.copy;
+        std::printf("dwgopen: opening copy %s\n", D.copy.c_str());
+        std::fflush(stdout);
+        next(1);
+        return;
+    }
+    case 1: {  // the copy is the active, meshed document and the async lane is idle
+        const std::string want = std::filesystem::path(D.copy).filename().string();
+        const bool tabOk = st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+            std::filesystem::path(st.docTabs[st.activeTab].path).filename() == want;
+        if (!tabOk || !st.docMirror.hasDoc() || !st.hasDocMesh || !idle()) return;
+        const std::string docId = st.docMirror.docId();
+        D.report["doc_id"] = docId;
+        D.report["open_seconds"] = pipingNow() - D.stepStart;
+        D.report["tab_title"] = st.docTabs[st.activeTab].title;
+        D.report["renderer_bodies"] = (int)st.bodyVisible.size();
+        nlohmann::json world, mass;
+        std::string err;
+        if (!st.worker.call("asm_world_bodies", {{"doc_id", docId}, {"explode", false}}, world, err, 60000) ||
+            !world.is_object()) {
+            dwgFail("world_bodies", {{"error", err}}); return;
+        }
+        std::string massErr;
+        const bool massOk = st.worker.call("eval_mass", {{"doc_id", docId}}, mass, massErr, 60000) &&
+                            mass.is_object();
+        D.report["eval_mass"] = massOk ? mass : nlohmann::json{{"error", massErr}};
+        // eval_mass explodes every compiled body into its solids (a solid-less body is one entry), in
+        // the same compile order asm_world_bodies walks; join volumes onto the world list that way.
+        nlohmann::json massBodies = nlohmann::json::array();
+        if (massOk) {
+            if (mass.contains("bodies") && mass["bodies"].is_array()) massBodies = mass["bodies"];
+            else massBodies.push_back(mass);
+        }
+        size_t mi = 0;
+        int solidBodies = 0, solids = 0;
+        nlohmann::json bodies = nlohmann::json::array();
+        std::vector<std::array<float, 3>> centres;
+        for (const auto& b : world.value("bodies", nlohmann::json::array())) {
+            if (!b.is_object()) continue;
+            const auto ordinals = b.value("source_ordinals", nlohmann::json::array());
+            const size_t n = ordinals.size();
+            nlohmann::json row = {{"name", b.value("name", std::string())}, {"solids", n},
+                                  {"bbox_size_mm", b.contains("bbox") && b["bbox"].is_object()
+                                                       ? b["bbox"].value("size", nlohmann::json())
+                                                       : nlohmann::json()}};
+            double volume = 0.0, area = 0.0;
+            bool surface = false, open = false;
+            for (size_t k = 0; k < std::max<size_t>(n, 1) && mi < massBodies.size(); ++k, ++mi) {
+                const auto& m = massBodies[mi];
+                volume += m.value("volume_mm3", 0.0);
+                area += m.value("area_mm2", 0.0);
+                surface = surface || m.value("surface", false);
+                open = open || !m.value("closed_solid", true);
+            }
+            row["volume_mm3"] = volume;
+            if (area > 0.0) row["area_mm2"] = area;
+            if (surface) row["surface"] = true;
+            if (open) row["closed_solid"] = false;
+            if (n > 0) { ++solidBodies; solids += (int)n; }
+            if (b.contains("bbox") && b["bbox"].is_object()) {
+                const auto lo = b["bbox"].value("min", nlohmann::json::array());
+                const auto hi = b["bbox"].value("max", nlohmann::json::array());
+                if (lo.size() == 3 && hi.size() == 3)
+                    centres.push_back({(float)(0.5 * (lo[0].get<double>() + hi[0].get<double>())),
+                                       (float)(0.5 * (lo[1].get<double>() + hi[1].get<double>())),
+                                       (float)(0.5 * (lo[2].get<double>() + hi[2].get<double>()))});
+            }
+            bodies.push_back(std::move(row));
+        }
+        D.report["world_bodies"] = bodies;
+        D.report["solid_bodies"] = solidBodies;
+        D.report["solids"] = solids;
+        D.report["body_centres"] = centres;
+        std::printf("dwgopen: %zu world bodies (%d solid bodies, %d solids)\n", bodies.size(), solidBodies,
+                    solids);
+        std::fflush(stdout);
+        if (!dwgCheck("bodies_present", !bodies.empty(), {{"world", world}})) return;
+        if (!dwgCheck("at_least_two_solids", solidBodies >= 2, {{"world_bodies", bodies}})) return;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.leftPaneTab = AppState::LP_FeatureManager;
+        static const float kZeroPan[3] = {0, 0, 0};
+        ui::requestCameraAnimation(st, 35.0f, 30.0f, 1.0f, kZeroPan);  // fitted iso, eased like the HUD
+        next(2);
+        return;
+    }
+    case 2: {
+        if (!idle()) return;
+        std::vector<std::array<float, 3>> centres;
+        for (const auto& c : D.report["body_centres"])
+            centres.push_back({c[0].get<float>(), c[1].get<float>(), c[2].get<float>()});
+        D.report["viewport_pixels"] = sceneShotPixels(st, centres);
+        shoot("iso");
+        next(3);
+        return;
+    }
+    case 3: {  // expand the document section, then every collapsed FeatureManager row, by real clicks
+        ImGuiIO& io = ImGui::GetIO();
+        // Hover for two frames first: the section header's toggle allows overlap, and such an item
+        // only takes a press once it was already the hovered item on the previous frame.
+        if (D.clickPhase >= 1 && D.clickPhase <= 4) {
+            io.AddMousePosEvent(D.clickAt.x, D.clickAt.y);
+            if (D.clickPhase == 3) io.AddMouseButtonEvent(0, true);
+            if (D.clickPhase == 4) io.AddMouseButtonEvent(0, false);
+            ++D.clickPhase;
+            return;
+        }
+        if (D.clickPhase >= 5 && D.clickPhase < 10) { ++D.clickPhase; return; }  // let the row open
+        D.clickPhase = 0;
+        if (!idle()) return;
+        const nlohmann::json* target = nullptr;
+        bool section = false;
+        for (const auto& item : ui::audit::observedItems()) {
+            if (!item.value("visible", false) || !item.value("enabled", true) ||
+                item["window"].get_ref<const std::string&>().find("FeatureManager##LeftPane") == std::string::npos)
+                continue;
+            // The first section header is the document's (Solid Bodies folder, material...): a part
+            // that opens with geometry seeds it collapsed. Its whole row is the toggle.
+            if (!D.docSection && item["label"].get_ref<const std::string&>() == "##sec_toggle") {
+                target = &item;
+                section = true;
+                break;
+            }
+            if (!D.docSection || !item.value("openable", false) || item.value("opened", false)) continue;
+            const ImGuiID id = item.value("id", 0u);
+            if (std::find(D.clicked.begin(), D.clicked.end(), id) != D.clicked.end()) continue;
+            target = &item;
+            break;
+        }
+        if (!target || D.clicks >= 32) {
+            if (++D.quiet < 10) return;  // a just-opened row may reveal more collapsed rows
+            D.report["expand_clicks"] = D.clicks;
+            next(4);
+            return;
+        }
+        D.quiet = 0;
+        D.clicked.push_back(target->value("id", 0u));
+        const auto& r = (*target)["rect"];
+        // A tree row opens on its arrow at the row's left edge (a label click selects it).
+        D.clickAt = section ? shotPoint(*target)
+                            : ImVec2(r[0].get<float>() + ImGui::GetStyle().FramePadding.x + ImGui::GetFontSize() * 0.5f,
+                                     0.5f * (r[1].get<float>() + r[3].get<float>()));
+        D.report["expanded_rows"].push_back(
+            {{"row", section ? nlohmann::json("document section") : (*target)["label"]},
+             {"click", {D.clickAt.x, D.clickAt.y}}, {"rect", r}, {"window", (*target)["window"]}});
+        D.docSection = true;
+        io.AddMousePosEvent(D.clickAt.x, D.clickAt.y);
+        ++D.clicks;
+        D.clickPhase = 1;
+        return;
+    }
+    case 4:
+        if (!idle()) return;
+        ImGui::GetIO().AddMousePosEvent(-FLT_MAX, -FLT_MAX);  // no hover highlight in the capture
+        shoot("tree_expanded");
+        next(kDwgFinalStep);  // the audit branch above finishes the run with this capture
+        return;
+    default:
+        return;
+    }
+}
+
+bool dwgOpenEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& breakLoop) {
+    auto& D = g_dwg;
+    if (!D.want) return false;
+    ++st.frame;
+    if (D.dir.empty()) {
+        const std::filesystem::path shot = screenshotPath && *screenshotPath ? screenshotPath : "";
+        const char* repo = std::getenv("CHUDWARE_REPO");
+        D.dir = shot.has_parent_path() ? shot.parent_path().string()
+                                       : std::string(repo ? repo : ".") + "/scratch/dwgopen_shots";
+        std::error_code ec;
+        std::filesystem::create_directories(D.dir, ec);
+    }
+    if (!D.capture.empty() && (!st.rpc.busy() || ++D.captureWait > 600)) {
+        writeBackbufferPng(D.capture.c_str(), dw, dh, D.done ? screenshotPath : nullptr);
+        std::printf("dwgopen: screenshot -> %s (%dx%d)\n", D.capture.c_str(), dw, dh);
+        std::fflush(stdout);
+        D.report["captures"].push_back(D.capture);
+        D.capture.clear();
+        D.captureWait = 0;
+    }
+    glfwSwapBuffers(st.win);
+    breakLoop = false;
+    if (D.done && D.capture.empty()) {
+        const std::string path = D.dir + "/dwgopen_report.json";
+        D.report["seconds"] = pipingNow() - D.started;
+        std::ofstream out(path, std::ios::trunc);
+        out << D.report.dump(2) << '\n';
+        out.close();
+        std::printf("dwgopen: report -> %s ok=%d\n", path.c_str(), (int)D.report.value("ok", false));
+        std::fflush(stdout);
+        if (D.failed || !out) {
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+        breakLoop = true;
+    }
+    return true;
+}
+
 // ---------- project-scoped chat scenario (CHUDWARE_SHOT=projectchat) ----------
 // The selected root (st.workspaceDir) is the sole chat authority. Seeds the shot's PRIVATE session
 // store with an ME-490 session and a Demo-SpaceX session plus an index whose global `active` and
@@ -7012,6 +7380,9 @@ void ScenarioRunner::tick(AppState& st) {
     // ---------- saved-demo review (CHUDWARE_SHOT=demoreview) ----------
     demoReviewTick(st);
 
+    // ---------- CAD-file open smoke (CHUDWARE_SHOT=dwgopen) ----------
+    dwgOpenTick(st);
+
     // ---------- root-scoped chat sessions (CHUDWARE_SHOT=projectchat) ----------
     projectChatTick(st);
 
@@ -8373,6 +8744,11 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
     bool demoBreak = false;
     if (demoReviewEndFrame(st, dw, dh, screenshotPath, demoBreak))
         return demoBreak ? FrameAction::Break : FrameAction::Continue;
+
+    // dwgopen: CAD-file open captures + report; exits non-zero on failure.
+    bool dwgBreak = false;
+    if (dwgOpenEndFrame(st, dw, dh, screenshotPath, dwgBreak))
+        return dwgBreak ? FrameAction::Break : FrameAction::Continue;
 
     // projectchat: root/session reconciliation checks + report; exits non-zero on failure.
     bool projectChatBreak = false;

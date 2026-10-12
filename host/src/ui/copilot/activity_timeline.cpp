@@ -1166,10 +1166,11 @@ static std::string chatLowerExt(const std::string& p) {
 }
 
 // Extensions the app itself opens (mirrors file_explorer.cpp isKnownExt: native
-// .draw+/.step+ containers, CAD import formats, ECAD/KiCad).
+// .draw+/.step+ containers, CAD import formats incl. AutoCAD DXF/DWG and ACIS, ECAD/KiCad).
 static bool chatAppOpenableExt(const std::string& e) {
     return e == ".draw+" || e == ".step+" || e == ".step" || e == ".stp" ||
            e == ".iges" || e == ".igs" || e == ".stl" || e == ".3mf" ||
+           e == ".dxf" || e == ".dwg" || e == ".sat" || e == ".sab" ||
            e == ".ecad+" || e == ".ecad" || e == ".kicad_sch" || e == ".kicad_pcb";
 }
 

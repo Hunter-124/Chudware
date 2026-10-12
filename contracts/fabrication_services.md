@@ -169,14 +169,11 @@ Geometry is exported from the doc via the **existing** primitive
 | process class | export format | status of the export primitive |
 |---|---|---|
 | `cnc_mill` · `cnc_turn` · all `print_*` | **STEP** | ✅ EXISTS — `export_document(fmt="step")` → `build123d.export_step` (`formats.py` FormatInfo "step", `can_export=True`) |
-| `laser_cut` · `waterjet` · `plasma_cut` · `cnc_bend` | **DXF** (2D flat pattern) | ⚠️ **GAP** — `formats.py` marks DXF `can_export=False` (import-only; line ~110/253: "2D-projection-to-DXF is a planned follow-up"). |
+| `laser_cut` · `waterjet` · `plasma_cut` · `cnc_bend` | **DXF / DWG** (2D flat pattern) | ✅ EXISTS — native `export_flat_dxf {doc_id, path, format:"dxf"\|"dwg"\|"pdf"}` writes the blank on OUTLINE, bends on BEND and holes on CUTS (contracts/worker_rpc.md §2D export); `export_file` also writes whole parts as `dxf`/`dwg`. The Python `export_document` helper itself still refuses DXF/DWG. |
 
-**Consequence for v1 (load-bearing, do not paper over):** DXF export does not exist yet.
-So for laser/waterjet, v1 must EITHER (a) export **STEP** and rely on the fact that most cut
-services (SendCutSend, OSH Cut, Xometry) accept STEP/flat-pattern uploads, OR (b) treat "DXF
-flat-pattern export in `formats.py`" as an explicit **prerequisite dependency** that must land
-first. A real DXF export path (2D projection of the flat face → `ezdxf`) is the natural
-follow-up. This contract does not assume it exists.
+**Consequence for v1:** laser/waterjet jobs take the flat pattern from `export_flat_dxf`
+(DWG needs LibreDWG, provisioned by `scripts/provision_libredwg.py`); a part without a
+Flatten feature has no flat pattern and must fall back to STEP upload.
 
 ## 3. Taxonomy placement — a `custom_fab` category ALONGSIDE stock catalogs
 

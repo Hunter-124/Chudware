@@ -1350,9 +1350,9 @@ def _drawing_rpc(tool: str, method: str, params: dict) -> tuple[Optional[dict], 
     except Exception as exc:  # noqa: BLE001 — classify only missing-RPC errors
         unsupported = _engine_unsupported(tool, method, exc)
         folded = str(exc).lower()
-        # Older cores know drawing_export but reject the newly added SVG token. That is the
+        # Older cores know drawing_export but reject the newer SVG/DWG tokens. That is the
         # same capability mismatch as a missing RPC, not a malformed current-client request.
-        if (not unsupported and params.get("fmt") == "svg" and "format" in folded
+        if (not unsupported and params.get("fmt") in ("svg", "dwg") and "format" in folded
                 and "pdf" in folded and "dxf" in folded):
             unsupported = {
                 "ok": False,
@@ -2295,6 +2295,8 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
     # call the file" cannot be misrouted HERE. `out_path` / `file_path` already reach `path`
     # through the shared affix rule; `filename` — the universal spelling, and the one the live
     # call wrote — does not: it is neither a prefix nor a suffix of "path".
+    _DRAWING_FORMATS = ("pdf", "dxf", "dwg", "svg")
+    _DRAWING_COMPANIONS = ("dxf", "dwg", "svg")
 
     def _drawing_out_path(path: str, fmt: str) -> tuple[Optional[str], Optional[dict]]:
         """Return an absolute matching output path, or an honest extension refusal."""
@@ -2302,7 +2304,7 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
         ext = os.path.splitext(out)[1].lower().lstrip(".")
         if ext == fmt:
             return out, None
-        if ext in {"pdf", "dxf", "svg"}:
+        if ext in _DRAWING_FORMATS:
             return None, {
                 "ok": False,
                 "error": f"export_drawing: fmt={fmt!r} contradicts the {ext!r} extension on "
@@ -2321,16 +2323,18 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                        companions: Optional[list] = None) -> str:
         """Export a 2D DRAWING document to editable vector deliverables.
 
-        fmt    : "pdf" (fixed-size engineering sheet), "dxf" (CAD interchange), or "svg"
-                 (editable paths and real text). Omitted, it is taken from the output extension,
-                 else pdf. Pass the drawing_doc_id from make_drawing as doc_id. Call
+        fmt    : "pdf" (fixed-size engineering sheet), "dxf" (CAD interchange), "dwg" (AutoCAD
+                 R2000 binary written natively; same layers/colors/text as DXF, hidden lines
+                 on HIDDEN with the DASHED linetype, centre lines CENTER), or "svg" (editable
+                 paths and real text). Omitted, it is taken from the output extension, else
+                 pdf. Pass the drawing_doc_id from make_drawing as doc_id. Call
                  review_drawing after the final sheet mutation first.
         path   : the file to write (also accepted as filename= / out_path= / file_path=). An
                  extension is appended when missing and never doubled. A path whose extension
                  contradicts fmt is refused rather than written.
         sheet  : omitted uses the active sheet; "all" exports every sheet; otherwise pass an
                  exact stable sheet id such as "s2". Numeric indices are refused as ambiguous.
-        companions: only with fmt="pdf", pass ["dxf", "svg"] (or either one) to write editable
+        companions: only with fmt="pdf", pass any of ["dxf", "dwg", "svg"] to write editable
                  siblings beside the PDF in the same call. The result's paths lists every file.
         Returns every output path, entity/annotation counts and the fixed paper size. export_part
         is for 3D B-rep/mesh only; a drawing is 2D and uses this exporter.
@@ -2346,14 +2350,14 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             if fmt is None:
                 # No format given: the extension the caller wrote IS the format they meant.
                 ext = os.path.splitext(str(path or ""))[1].lower().lstrip(".")
-                fmt = ext if ext in ("pdf", "dxf", "svg") else "pdf"
-                if ext in ("pdf", "dxf", "svg"):
+                fmt = ext if ext in _DRAWING_FORMATS else "pdf"
+                if ext in _DRAWING_FORMATS:
                     notes.append(f"read the format {fmt!r} from the output extension")
             fmt = str(fmt).lower().lstrip(".")
-            if fmt not in ("pdf", "dxf", "svg"):
+            if fmt not in _DRAWING_FORMATS:
                 return _dumps({
                     "ok": False,
-                    "error": f"fmt must be 'pdf', 'dxf', or 'svg', got {fmt!r}",
+                    "error": f"fmt must be 'pdf', 'dxf', 'dwg', or 'svg', got {fmt!r}",
                 })
 
             if companions is None:
@@ -2361,18 +2365,18 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             elif not isinstance(companions, list):
                 return _dumps({
                     "ok": False,
-                    "error": "export_drawing: companions must be a list containing 'dxf' "
-                             "and/or 'svg'. Nothing was exported.",
+                    "error": "export_drawing: companions must be a list containing 'dxf', "
+                             "'dwg' and/or 'svg'. Nothing was exported.",
                 })
             else:
                 companion_formats = []
                 for item in companions:
                     token = str(item).lower().lstrip(".")
-                    if token not in ("dxf", "svg"):
+                    if token not in _DRAWING_COMPANIONS:
                         return _dumps({
                             "ok": False,
-                            "error": "export_drawing: companions entries must be 'dxf' or "
-                                     f"'svg', got {item!r}. Nothing was exported.",
+                            "error": "export_drawing: companions entries must be 'dxf', 'dwg' "
+                                     f"or 'svg', got {item!r}. Nothing was exported.",
                         })
                     if token not in companion_formats:
                         companion_formats.append(token)

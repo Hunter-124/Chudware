@@ -111,7 +111,9 @@ class FakeDaemon:
                     result = {"proto": 1, "state": "ready"}
                 elif method == "ping":
                     result = {"pong": True}
-                elif method in {"doc_new", "doc_open", "doc_import", "doc_import_file"}:
+                elif method == "import_file" and params.get("into"):
+                    result = {"ok": True, "doc_id": params["into"], "revision": 1}
+                elif method in {"doc_new", "doc_open", "import_file", "doc_import", "doc_import_file"}:
                     doc_id = f"d{self._next_doc}"
                     self._next_doc += 1
                     path = params.get("path")
@@ -312,6 +314,30 @@ class TestEngineBridge:
             assert _rpc(alice, 21, "doc_tree", {"doc_id": alice_id})["result"]["ok"]
             assert _rpc(alice, 22, "doc_close", {"doc_id": alice_id})["result"]["closed"]
             assert _rpc(alice, 23, "doc_tree", {"doc_id": alice_id})["error"]["code"] == -32004
+
+    def test_import_file_grants_minted_doc_and_guards_into(self, daemon, tmp_path, monkeypatch):
+        # import_file (no `into`) is how the shared daemon imports DWG/DXF/SAT/STEP as a
+        # new document; the importing socket must be able to edit what it imported, and
+        # nobody may import INTO another account's document.
+        workspace_root = tmp_path / "workspace"
+        monkeypatch.setattr(settings, "workspace_root", workspace_root)
+        monkeypatch.setattr(settings, "bucket_root", tmp_path / "bucket")
+        alice_root = settings.user_workspace_root(user_slug("demo@example.com"))
+        bob_root = settings.user_workspace_root(user_slug("admin@example.com"))
+        alice_root.mkdir(parents=True)
+        bob_root.mkdir(parents=True)
+
+        with TestClient(app_mod.app).websocket_connect("/engine", headers=DEV_HEADERS) as alice:
+            imported = _rpc(alice, 1, "import_file", {"path": str(alice_root / "Widget.dwg")})
+            doc_id = imported["result"]["doc_id"]
+            assert _rpc(alice, 2, "doc_tree", {"doc_id": doc_id})["result"]["ok"]
+            into = _rpc(alice, 3, "import_file",
+                        {"path": str(alice_root / "Body.sat"), "into": doc_id})
+            assert into["result"]["doc_id"] == doc_id
+            with TestClient(app_mod.app).websocket_connect("/engine", headers=ADMIN_HEADERS) as bob:
+                stolen = _rpc(bob, 10, "import_file",
+                              {"path": str(bob_root / "Body.sat"), "into": doc_id})
+                assert stolen["error"]["code"] == -32004
 
     def test_doc_list_fails_closed_for_pathless_foreign_docs(self, daemon, client):
         daemon.docs["foreign"] = {

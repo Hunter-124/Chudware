@@ -2,25 +2,30 @@
 
 DWG is a proprietary binary format with **no free in-process reader** (native DWG fidelity is the
 Open Design Alliance's whole business). Rather than parse it ourselves, we mirror the
-``formats_solidworks`` strategy: convert DWG→DXF with an external converter **the user provides**
-(never bundled, never linked — subprocess / mere aggregation only), then reuse the DXF importer's
-entity→geometry pipeline (:func:`services.formats.formats_dxf.bodies_from_doc`). Every entry point
-degrades cleanly with an actionable error when no converter is present.
+``formats_solidworks`` strategy: convert DWG→DXF with an external converter (never bundled, never
+linked — subprocess / mere aggregation only), then reuse the DXF importer's entity→geometry
+pipeline (:func:`services.formats.formats_dxf.bodies_from_doc`). Every entry point degrades
+cleanly with an actionable error when no converter is present.
 
-Converters, in priority order (subprocess only, PATH/registry-discovered, never bundled):
-  1. **ODA File Converter** (free, cross-platform) — wrapped by ``ezdxf.addons.odafc``.
+Converters, in priority order (subprocess only, never bundled):
+  1. **ODA File Converter** (free, cross-platform) — wrapped by ``ezdxf.addons.odafc``; preferred
+     when installed.
   2. **LibreDWG ``dwg2dxf``** — GPL-3.0, so **subprocess-only** per the CONTRIBUTING license
-     guardrails (never linked into libchudware, never redistributed). Found on ``$PATH``.
+     guardrails (never linked into libchudware, never redistributed). Resolved by
+     :func:`services.formats.libredwg.tool`: ``$PATH`` first, then the per-user managed install
+     that ``python3 scripts/provision_libredwg.py`` builds from the pinned upstream release.
+
+DWG *writing* is not done here: the native engine ``export_file`` (format ``dwg``) writes
+R2000 DWG with Chudware's own encoder (``core/doc/dwg_write.cpp``), without LibreDWG.
 
 License posture: identical to the pandoc / LibreOffice converters already in
-``contracts/licenses.md`` — optional, PATH-discovered, subprocess-only, never bundled; absence is
-not an error, it degrades to a clear "install a converter" message.
+``contracts/licenses.md`` — optional, subprocess-only, never bundled; absence is not an error, it
+degrades to a clear "install or provision a converter" message.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -44,8 +49,9 @@ def _odafc_available() -> bool:
 
 
 def _dwg2dxf_path() -> Optional[str]:
-    """Path to LibreDWG's ``dwg2dxf`` on PATH, or None."""
-    return shutil.which("dwg2dxf")
+    """Path to LibreDWG's ``dwg2dxf`` (PATH, then the provisioned managed install), or None."""
+    from services.formats.libredwg import tool
+    return tool("dwg2dxf")
 
 
 def converter_available() -> bool:
@@ -124,7 +130,8 @@ def _read_dwg_via_dwg2dxf(path: Path):
 
     exe = _dwg2dxf_path()
     if not exe:
-        raise RuntimeError("dwg2dxf not on PATH")
+        raise RuntimeError(
+            "dwg2dxf not found (run `python3 scripts/provision_libredwg.py`)")
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / (path.stem + ".dxf")
         # dwg2dxf writes DXF to -o <out>; keep it a plain subprocess (mere aggregation, GPL-safe).
@@ -159,10 +166,12 @@ def _select_converter() -> Optional[Callable[[Path], Any]]:
 # ---------------------------------------------------------------------------
 
 _NO_CONVERTER_HINT = (
-    "DWG import needs an external DWG→DXF converter (none found). Install ONE of:\n"
-    "  • ODA File Converter (free): https://www.opendesign.com/guestfiles/oda_file_converter "
-    "(ezdxf.addons.odafc finds it automatically), or\n"
-    "  • LibreDWG's `dwg2dxf` on your PATH.\n"
+    "DWG import needs an external DWG→DXF converter (none found). Provide ONE of:\n"
+    "  • LibreDWG `dwg2dxf`: run `python3 scripts/provision_libredwg.py` to build the pinned "
+    "release into Chudware's per-user tools folder, or put `dwg2dxf` on your PATH, or\n"
+    "  • ODA File Converter (free, preferred when installed): "
+    "https://www.opendesign.com/guestfiles/oda_file_converter "
+    "(ezdxf.addons.odafc finds it automatically).\n"
     "Alternatively, open the file in a CAD app and Save As DXF, then import the .dxf directly."
 )
 

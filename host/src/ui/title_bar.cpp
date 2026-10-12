@@ -798,6 +798,7 @@ struct FilMenuDrawer {
             if (ImGui::MenuItem("STEP (.step)...")) st.requestExportFormat = "step";
             if (ImGui::MenuItem("IGES (.iges)...")) st.requestExportFormat = "iges";
             if (ImGui::MenuItem("BREP (.brep)...")) st.requestExportFormat = "brep";
+            if (ImGui::MenuItem("ACIS SAT (.sat)...")) st.requestExportFormat = "sat";
             ImGui::Separator();
             if (ImGui::MenuItem("STL (.stl)..."))   openMeshExport("stl");
             if (ImGui::MenuItem("OBJ (.obj)..."))   openMeshExport("obj");
@@ -805,6 +806,9 @@ struct FilMenuDrawer {
             if (ImGui::MenuItem("3MF (.3mf)..."))   openMeshExport("3mf");
             if (ImGui::MenuItem("glTF (.gltf)...")) openMeshExport("gltf");
             if (ImGui::MenuItem("GLB (.glb)..."))   openMeshExport("glb");
+            ImGui::Separator();
+            if (ImGui::MenuItem("DXF (.dxf)..."))   openMeshExport("dxf");
+            if (ImGui::MenuItem("DWG (.dwg)..."))   openMeshExport("dwg");
             ImGui::EndMenu();
         }
         ImGui::Separator();

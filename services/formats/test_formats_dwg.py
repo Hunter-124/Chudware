@@ -30,7 +30,7 @@ def test_dwg_in_format_registry():
     info = fmts["dwg"]
     assert ".dwg" in info["exts"]
     assert info["can_import"] is True
-    assert info["can_export"] is False
+    assert info["can_export"] is True  # native export_file writes DWG with its own encoder
 
 
 def test_dwg_no_converter_raises_actionable(monkeypatch, tmp_path):

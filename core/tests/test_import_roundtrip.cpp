@@ -30,7 +30,11 @@
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepCheck_Analyzer.hxx>
+#include <BRepBndLib.hxx>
 #include <BRepGProp.hxx>
+#include <Bnd_Box.hxx>
+#include <gp_Ax2.hxx>
+#include <gp_Circ.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRep_Builder.hxx>
@@ -54,6 +58,7 @@
 #include <gp_Pln.hxx>
 #include <gp_Vec.hxx>
 
+#include "doc/dwg.h"
 #include "doc/formats.h"
 #include "doc/session.h"
 #ifdef CHUDWARE_WITH_POLYMESH
@@ -62,6 +67,7 @@
 
 using nlohmann::json;
 namespace fs = std::filesystem;
+constexpr double kPiTest = 3.14159265358979323846;
 
 namespace {
 double vol(const TopoDS_Shape& s) {
@@ -249,9 +255,10 @@ TEST_CASE("DWG converter receives hostile path literally without shell execution
     {
         std::ofstream script(converter);
         script << "#!/bin/sh\n"
-                  "test \"$1\" = -o || exit 2\n"
-                  "printf '0\\nSECTION\\n2\\nENTITIES\\n0\\nLINE\\n8\\n0\\n10\\n0\\n20\\n0\\n11\\n1\\n21\\n1\\n0\\nENDSEC\\n0\\nEOF\\n' > \"$2\"\n"
-                  "printf '%s' \"$3\" > \"$2.argv\"\n";
+                  "test \"$1\" = -y || exit 2\n"
+                  "test \"$2\" = -o || exit 2\n"
+                  "printf '0\\nSECTION\\n2\\nENTITIES\\n0\\nLINE\\n8\\n0\\n10\\n0\\n20\\n0\\n11\\n1\\n21\\n1\\n0\\nENDSEC\\n0\\nEOF\\n' > \"$3\"\n"
+                  "printf '%s' \"$4\" > \"$3.argv\"\n";
     }
     REQUIRE(::chmod(converter.c_str(), 0700) == 0);
     PathGuard path_guard(dir);
@@ -273,6 +280,168 @@ TEST_CASE("DWG converter receives hostile path literally without shell execution
 }
 #endif
 
+namespace {
+Bnd_Box bounds(const TopoDS_Shape& s) {
+    Bnd_Box box;
+    BRepBndLib::Add(s, box);
+    return box;
+}
+
+double face_area(const TopoDS_Shape& s) {
+    GProp_GProps g;
+    BRepGProp::SurfaceProperties(s, g);
+    return g.Mass();
+}
+
+// A 10 mm cube plus a planar r=3 disc profile, the two kinds of body DXF/DWG export writes.
+std::vector<TopoDS_Shape> cube_and_disc() {
+    const TopoDS_Edge rim = BRepBuilderAPI_MakeEdge(
+        gp_Circ(gp_Ax2(gp_Pnt(30, 0, 0), gp_Dir(0, 0, 1)), 3.0)).Edge();
+    const TopoDS_Face disc = BRepBuilderAPI_MakeFace(BRepBuilderAPI_MakeWire(rim).Wire()).Face();
+    return {BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape(), disc};
+}
+
+// Export → import keeps the cube an exact solid (ACIS 3DSOLID: six planar faces, not a
+// triangle mesh) and the disc a circular profile, each on its own layer.
+void check_cube_and_disc_round_trip(const std::string& fmt) {
+    const fs::path path = tmp("cube_disc." + fmt);
+    chudware::doc::export_bodies(cube_and_disc(), path.string(), fmt);
+    const auto bodies = chudware::doc::import_bodies(path.string(), fmt);
+    REQUIRE(bodies.size() == 2);
+    CHECK(bodies[0].first == "chudware_imp_cube_disc");  // profile: BODY2's circle
+    CHECK(face_area(bodies[0].second) == doctest::Approx(kPiTest * 9.0).epsilon(1e-6));
+    CHECK(bodies[1].first == "chudware_imp_cube_disc_solid1");
+    CHECK(vol(bodies[1].second) == doctest::Approx(1000.0).epsilon(1e-9));
+    int faces = 0;
+    for (TopExp_Explorer ex(bodies[1].second, TopAbs_FACE); ex.More(); ex.Next()) ++faces;
+    CHECK(faces == 6);
+    fs::remove(path);
+}
+}  // namespace
+
+TEST_CASE("DXF part export round-trips solids as ACIS and profiles as curves") {
+    check_cube_and_disc_round_trip("dxf");
+}
+
+TEST_CASE("DWG part export round-trips solids as ACIS") {
+    if (chudware::doc::libredwg_tool("dwg2dxf").empty()) {
+        MESSAGE("LibreDWG dwg2dxf not installed (scripts/provision_libredwg.py); skipped");
+        return;
+    }
+    check_cube_and_disc_round_trip("dwg");
+}
+
+TEST_CASE("Inch export writes inch coordinates that re-import at the same size") {
+    using namespace chudware::doc;
+    const fs::path path = tmp("cube_inch.sat");
+    TessOptions tess;
+    tess.units = parse_units("in");
+    export_bodies({BRepPrimAPI_MakeBox(25.4, 50.8, 12.7).Shape()}, path.string(), "sat", tess);
+    std::ifstream in(path);
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    CHECK(text.find("25.4") != std::string::npos);  // header: millimetres per unit
+    int units = 0;
+    const auto bodies = import_bodies(path.string(), "sat", nullptr, &units);
+    CHECK(units == 1);
+    REQUIRE(bodies.size() == 1);
+    CHECK(vol(bodies[0].second) == doctest::Approx(25.4 * 50.8 * 12.7).epsilon(1e-9));
+    const Bnd_Box box = bounds(bodies[0].second);
+    double x0, y0, z0, x1, y1, z1;
+    box.Get(x0, y0, z0, x1, y1, z1);
+    CHECK(x1 - x0 == doctest::Approx(25.4).epsilon(1e-5));  // bbox includes vertex tolerance
+    fs::remove(path);
+}
+
+TEST_CASE("DWG drawing text keeps a usable width and polylines stay closed") {
+    using namespace chudware::doc;
+    if (libredwg_tool("dwg2dxf").empty()) {
+        MESSAGE("LibreDWG dwg2dxf not installed (scripts/provision_libredwg.py); skipped");
+        return;
+    }
+    DxfDocument doc;
+    doc.add_layer("VISIBLE", 7);
+    doc.polylines.push_back({"VISIBLE", {{0, 0}, {10, 0}, {10, 5}, {0, 5}, {0, 0}}, 0.5, ""});
+    doc.texts.push_back({"VISIBLE", {5.0, 2.0}, 3.5, "SCALE 1:1", 1, 2});
+    const fs::path dwg = tmp("sheet_bits.dwg"), back = tmp("sheet_bits_back.dxf");
+    write_dwg(dwg.string(), doc);
+    REQUIRE(run_libredwg("dwg2dxf", {"-y", "-o", back.string(), dwg.string()}));
+    // Walk the (code, value) pairs of the read-back entities.
+    std::ifstream in(back);
+    std::string code, value, entity;
+    std::map<std::string, std::map<int, std::string>> seen;
+    while (std::getline(in, code) && std::getline(in, value)) {
+        auto trim = [](std::string s) {
+            s.erase(0, s.find_first_not_of(" \r"));
+            s.erase(s.find_last_not_of(" \r") + 1);
+            return s;
+        };
+        const int c = std::stoi(trim(code));
+        if (c == 0) entity = trim(value);
+        else if (entity == "TEXT" || entity == "LWPOLYLINE") seen[entity].emplace(c, trim(value));
+    }
+    REQUIRE(seen.count("TEXT") == 1);
+    // Width factor 41 defaults to 1 when absent (0 would draw zero-width glyphs).
+    CHECK((seen["TEXT"].count(41) == 0 || std::stod(seen["TEXT"][41]) == 1.0));
+    CHECK(seen["TEXT"][1] == "SCALE 1:1");
+    // Centre/middle alignment keeps (5, 2) as the alignment point; the insertion point is
+    // the derived left baseline, left of and below it.
+    CHECK(seen["TEXT"][72] == "1");
+    CHECK(seen["TEXT"][73] == "2");
+    CHECK(std::stod(seen["TEXT"][11]) == doctest::Approx(5.0));
+    CHECK(std::stod(seen["TEXT"][21]) == doctest::Approx(2.0));
+    CHECK(std::stod(seen["TEXT"][10]) < 5.0);
+    CHECK(std::stod(seen["TEXT"][20]) == doctest::Approx(2.0 - 3.5 * 0.5));
+    REQUIRE(seen.count("LWPOLYLINE") == 1);
+    CHECK((std::stoi(seen["LWPOLYLINE"][70]) & 1) == 1);  // closed
+    CHECK(std::stod(seen["LWPOLYLINE"][43]) == doctest::Approx(0.5));
+    CHECK(seen["LWPOLYLINE"][8] == "VISIBLE");
+    fs::remove(dwg);
+    fs::remove(back);
+}
+
+TEST_CASE("DXF import places INSERT blocks, honours OCS and keeps 3D meshes") {
+    const fs::path path = tmp("blocks_ocs.dxf");
+    {
+        std::ofstream dxf(path);
+        dxf << "0\nSECTION\n2\nBLOCKS\n"
+               // Block B, base (1,0): a 2 mm line and an r=1 circle.
+               "0\nBLOCK\n2\nB\n10\n1\n20\n0\n30\n0\n"
+               "0\nLINE\n8\n0\n10\n1\n20\n0\n30\n0\n11\n3\n21\n0\n31\n0\n"
+               "0\nCIRCLE\n8\n0\n10\n2\n20\n2\n30\n0\n40\n1\n"
+               "0\nENDBLK\n0\nENDSEC\n"
+               "0\nSECTION\n2\nENTITIES\n"
+               // Placed at (10,0), scale 2, rotated 90 deg: line -> (10,0)-(10,4),
+               // circle -> centre (6,2) r=2.
+               "0\nINSERT\n8\nPARTS\n2\nB\n10\n10\n20\n0\n30\n0\n41\n2\n42\n2\n43\n2\n50\n90\n"
+               // Extrusion -Z flips the OCS X axis: centre (5,0) is world (-5,0), and the
+               // 0..90 deg arc runs from (-6,0) to (-5,1).
+               "0\nARC\n8\n0\n10\n5\n20\n0\n30\n0\n40\n1\n50\n0\n51\n90\n210\n0\n220\n0\n230\n-1\n"
+               // A closed tetrahedron of 3DFACEs on layer MESH.
+               "0\n3DFACE\n8\nMESH\n10\n0\n20\n0\n30\n20\n11\n0\n21\n10\n31\n20\n12\n10\n22\n0\n32\n20\n13\n10\n23\n0\n33\n20\n"
+               "0\n3DFACE\n8\nMESH\n10\n0\n20\n0\n30\n20\n11\n10\n21\n0\n31\n20\n12\n0\n22\n0\n32\n30\n13\n0\n23\n0\n33\n30\n"
+               "0\n3DFACE\n8\nMESH\n10\n10\n20\n0\n30\n20\n11\n0\n21\n10\n31\n20\n12\n0\n22\n0\n32\n30\n13\n0\n23\n0\n33\n30\n"
+               "0\n3DFACE\n8\nMESH\n10\n0\n20\n10\n30\n20\n11\n0\n21\n0\n31\n20\n12\n0\n22\n0\n32\n30\n13\n0\n23\n0\n33\n30\n"
+               "0\n3DSOLID\n8\n0\n"
+               "0\nENDSEC\n0\nEOF\n";
+    }
+    std::vector<std::string> warnings;
+    const auto bodies = chudware::doc::import_bodies(path.string(), "dxf", &warnings);
+    REQUIRE(bodies.size() == 2);
+    const Bnd_Box box = bounds(bodies[0].second);
+    double x0, y0, z0, x1, y1, z1;
+    box.Get(x0, y0, z0, x1, y1, z1);
+    CHECK(x0 == doctest::Approx(-6.0).epsilon(1e-6));
+    CHECK(x1 == doctest::Approx(10.0).epsilon(1e-6));
+    CHECK(y0 == doctest::Approx(0.0).epsilon(1e-6));
+    CHECK(y1 == doctest::Approx(4.0).epsilon(1e-6));
+    CHECK(bodies[1].first == "chudware_imp_blocks_ocs_MESH");
+    CHECK(vol(bodies[1].second) == doctest::Approx(1000.0 / 6.0).epsilon(1e-6));
+    // A data-less 3DSOLID is named, never silently dropped.
+    REQUIRE(warnings.size() == 1);
+    CHECK(warnings[0].find("3DSOLID carries no ACIS data") != std::string::npos);
+    fs::remove(path);
+}
+
 // --- N-5: a two-solid STEP imports as TWO separate bodies. -----------------------------
 TEST_CASE("multi-solid STEP imports as separate bodies") {
     using chudware::doc::doc_import_file;
@@ -284,6 +453,23 @@ TEST_CASE("multi-solid STEP imports as separate bodies") {
 
     json r = doc_import_file(step.string(), "", false, "");
     CHECK(body_count(r) == 2);  // the bug merged them into one compound body
+    fs::remove(step);
+}
+
+// A STEP that carries construction wires beside a solid (e.g. an AutoCAD drawing exported
+// with its profile lines) must open: the free wire is reference geometry, not an empty body.
+TEST_CASE("STEP with free construction wires opens with every body") {
+    using chudware::doc::doc_import_file;
+    const fs::path step = tmp("solid_and_wire.step");
+    const TopoDS_Shape wire = BRepBuilderAPI_MakeWire(
+        BRepBuilderAPI_MakeEdge(gp_Pnt(40, 0, 0), gp_Pnt(60, 0, 0)).Edge()).Shape();
+    chudware::doc::export_bodies({compound({BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape(), wire})},
+                                 step.string(), "step");
+    const json r = doc_import_file(step.string(), "", false, "");
+    REQUIRE(r.contains("rebuild"));
+    for (const json& st : r["rebuild"]["feature_status"])
+        CHECK_MESSAGE(st.value("ok", false), st.dump());
+    CHECK(r.value("volume", 0.0) == doctest::Approx(1000.0).epsilon(1e-6));
     fs::remove(step);
 }
 

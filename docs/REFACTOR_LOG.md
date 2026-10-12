@@ -1587,7 +1587,6 @@ index and their own measurement; `node_runner.py` and `delegation.py` cannot reu
 cache until it can key on a resolved allowlist rather than role+capability; `zonefill.cpp` keeps
 its own net-class scan.
 
-
 ## 2026-08-30 — profile control, path containment, and bounded failure cleanup
 
 Completed T-X5's `browser_profiles` list/refresh/delete seam across
@@ -5774,7 +5773,6 @@ Limits: no live-provider/login, Windows/macOS, AppImage, openEMS, physical hardw
 download, GPU-training or real-power-loss proof. Graphify refresh was AST-incremental, not a
 new semantic extraction. No user daemon was restarted and no unrelated work was discarded.
 
-
 ## 2026-10-05 — bounded STM32F4 bus cutover and exercised flight mission
 
 Implemented I2C, TTL UART, master SPI and classical bxCAN in one shared Renode runtime,
@@ -6075,7 +6073,6 @@ The actual stage was exercised with real pytest: the original hid an assertion
 failure's identity, the revised stage emitted its name/source/assertion details,
 collection errors remained fatal with diagnostics, and all-passing units stayed
 green without failure blocks. Temporary smoke fixtures were removed.
-
 
 ## 2026-10-06 — Simulation GUI overhaul onto one standard
 
@@ -6770,3 +6767,81 @@ completed successfully. This target-only result does not supersede the
 failed whole-repository gate or mean the running desktop loaded the new
 library. The interview package records the unreleased runtime and physical
 fit limits separately from the isolated native verification.
+
+## 2026-10-11 — DWG import hardening + DWG/DXF export
+
+Native DWG import never worked with a real LibreDWG: `dwg_to_temp_dxf` reserves the output
+file and `dwg2dxf` refuses to overwrite without `-y` (the argv test used a fake converter).
+Fixed, and the shared DXF reader (`core/doc/formats.cpp`) now expands BLOCKS/INSERT (incl.
+MINSERT, mirrored/non-uniform scale), honours entity OCS (ARC/CIRCLE/LWPOLYLINE/2D POLYLINE/
+INSERT/ELLIPSE), imports 3DFACE/POLYFACE/polygon meshes as one mesh body per layer, and
+reports ACIS 3DSOLID/BODY/REGION/SURFACE by name (warning, or the import error when nothing
+else remains). Export: `export_file` writes `dxf` (R12, solids as 3DFACE with hidden interior
+edges, 2D bodies as LINE/ARC/CIRCLE) and `dwg`; `export_drawing`/`export_flat_dxf` take
+`dwg`. New `core/doc/dwg.{h,cpp}`: LibreDWG tool lookup (PATH, then
+`<appdata>/Chudware/tools/libredwg/bin`, mirrored by `services/formats/libredwg.py`), a
+timed literal-argv runner, and `write_dwg`, which drives `dwgadd` and refuses unless the
+file re-reads with every entity. `scripts/provision_libredwg.py` builds the SHA-pinned
+LibreDWG 0.14 locally (Windows: upstream win64 zip, untested here). Gotchas, all measured on
+0.14: `dxf2dwg` writes handle-0 garbage (unused); `dwgadd` exits 0 without writing on >5000
+points per command, sscanf-rescans the whole script (NUL-terminate each line), segfaults in
+`polyline_pface`/`polyline_3d` past ~1000 objects (stale object pointer after realloc — only
+single-object entities are emitted), cannot set linetypes, 3DFACE edge flags, TEXT alignment
+points or a new layer's linetype (layers carry no linetype; AutoCAD acceptance unverified),
+and leaves TEXT width factor 0 (set to 1). GUI: File > Export DXF/DWG (tessellation dialog),
+import/insert filters list DXF/DWG, Drawing ribbon `dwg_export_dwg`, flat-pattern DWG.
+`.sto` was asked about and is not implemented (no CAD-standard format).
+
+## 2026-10-11 — Native AutoCAD R2000 DWG writer replaces LibreDWG `dwgadd`
+
+`write_dwg` no longer drives `dwgadd` (exit-0-without-writing, crashes past ~1000 objects,
+no linetypes / 3DFACE edge flags / TEXT alignment). `core/doc/dwg_write.{h,cpp}` encodes the
+whole AC1015 file from the public ODA specification: file header with six section locators,
+AuxHeader, preview, header variables (INSUNITS from the document, EXTMIN/EXTMAX computed incl.
+SAT vertices, limits, HANDSEED), classes (DICTIONARYWDFLT, PLACEHOLDER, LAYOUT), every table
+control and the records AutoCAD expects (layer 0 + document layers, style Standard, linetypes
+ByBlock/ByLayer/Continuous/DASHED/CENTER, VPORT *Active, APPID ACAD, DIMSTYLE Standard,
+*Model_Space/*Paper_Space with BLOCK/ENDBLK), the named object dictionary (ACAD_GROUP,
+ACAD_LAYOUT Model/Layout1, ACAD_MLINESTYLE Standard, ACAD_PLOTSETTINGS, ACAD_PLOTSTYLENAME
+Normal), per-object CRCs, the paged object map, ObjFreeSpace, second header and template.
+Entities: LWPOLYLINE (closed, constant width, per-entity linetype; split at 20000 vertices,
+LibreDWG's reader limit), ARC/CIRCLE, LINE, 3DFACE with edge visibility, SOLID, TEXT with its
+alignment point, and 3DSOLID/BODY carrying the document's SAT 4.00 text inline (version-1
+modeler data, CR LF lines, 4096-byte blocks). Writing needs no LibreDWG; `dwg2dxf`, when
+installed, still re-reads the staged file and must return every entity before the rename.
+`scripts/provision_libredwg.py` now provisions `dwg2dxf` only. Verified with the ODA File
+Converter (audit on) to ACAD2018 DXF and ACAD2018 DWG→DXF: all entities by type, layers,
+colours and linetypes back, handles preserved; the 3DSOLID SAT text is byte-identical through
+LibreDWG and differs through ODA only where ODA re-serialises every body (save-date header,
+last-digit floats — the same lines it changes re-exporting its own R2000 DWG). Not verified in
+AutoCAD itself. Tests: `core/tests/test_dwg_write.cpp`.
+
+## 2026-10-11 — AutoCAD solids: ACIS read/write, native DWG data storage, R2000 DXF
+
+AutoCAD 2013+ DWGs (the user's AC1032 `SteelTubeWidget.dwg`) imported only their construction
+lines: their 3DSOLID/SURFACE geometry is SAB in the `AcDb:AcDsPrototype_1b` data storage, which
+LibreDWG drops (it also drops SURFACE classes, and its DXF output splits inline SAT at every
+4096-byte DWG block and 255 characters, corrupting R2000–R2010 solids). New native pieces:
+`core/doc/acis_read.cpp` (SAT 1.x–2xxxx and SAB/ASM → OCCT: analytic, NURBS and procedural
+surfaces via stored approximations or rebuilt rolling-ball blends, ASM `exact_int_cur`),
+`core/doc/acis_write.cpp` (SAT 400/700, analytic records whenever geometry is exactly analytic,
+self-checked parameters), `core/doc/dwg_native.cpp` (AC1012–AC1032 containers incl. R2007,
+AcDs records by handle, object map + per-version entity headers for type/owner/layer, inline
+SAT/SAB), and an R2000 branch in `core/doc/dxf.cpp` used only when a document carries ACIS.
+`core/doc/formats.cpp`: DXF/DWG import builds one exact body per ACIS entity (inline SAT, DXF
+ACDSDATA, or native DWG data by handle — the handle-keyed data always wins), places block
+instances, applies $INSUNITS and records it as the import's `source_units`; entities dwg2dxf
+dropped are re-created from the native owner/layer; without dwg2dxf a DWG still imports its
+model-space solids. `sat` is a new import/export format. `export_file` dxf/dwg write solids as
+ACIS 3DSOLID/BODY, tilted arcs keep an OCS extrusion, `units` defaults to `source_units`, and
+dxf/dwg/sat exports are re-read (solid count, validity, volume). The STEP round-trip check now
+compares solids (a profile's remnants split into many bodies), and an import body made only of
+curves/points is accepted as reference geometry instead of tripping the empty-body backstop (a
+STEP with construction wires reopened empty). Embedded DXF/DWG/SAT imports keep their baked body
+grouping; cache epoch `geomcache/13`. Verified: brother's DWG → 4 bodies (solids 1.541e6 and
+2.784e5 mm³) in-process, in the GUI (`CHUDWARE_SHOT=dwgopen`) and over a private web stack; the
+DWG/DXF/SAT revisions re-read identically, and ODA File Converter (validation oracle only)
+re-saves them as AutoCAD 2018 DWG/DXF that re-import with identical solids. Not opened in
+AutoCAD itself. Web: gateway grants docs minted by `import_file`, deploy provisions dwg2dxf.
+Tests: `test_acis_read`, `test_acis_write`, `test_dwg_native`, `test_dxf_r2000`, `test_dwg_write`,
+`test_import_roundtrip` (ACIS round trips, inch export, STEP with free wires).

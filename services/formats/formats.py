@@ -9,9 +9,12 @@ Formats supported
 * **STL** — via ``build123d.export_stl`` / ``import_stl`` (mesh only; no parametrics).
 * **3MF** — via ``build123d.Mesher`` / ``lib3mf`` (mesh only).
 * **DXF** — via ``ezdxf`` (``services.formats.formats_dxf``); 2D vector drawings → planar B-rep
-  wires/faces (import only). See that module for the entity coverage matrix.
-* **DWG** — via an external DWG→DXF converter + the DXF pipeline (``services.formats.formats_dwg``);
-  import only, needs a user-provided converter (ODA File Converter / LibreDWG).
+  wires/faces. See that module for the entity coverage matrix. This helper only reads DXF;
+  DXF writing is the native engine's ``export_file`` (format ``dxf``).
+* **DWG** — via an external DWG→DXF converter + the DXF pipeline (``services.formats.formats_dwg``;
+  ODA File Converter, or LibreDWG ``dwg2dxf`` on PATH / provisioned by
+  ``scripts/provision_libredwg.py``). This helper only reads DWG; DWG writing is the native
+  engine's ``export_file`` (format ``dwg``, Chudware's own R2000 encoder).
 
 Public API
 ----------
@@ -222,15 +225,11 @@ def export_document(
     if fmt == "3dm":
         return _export_3dm(session_bodies, path)
 
-    if fmt == "dxf":
+    if fmt in ("dxf", "dwg"):
         raise ValueError(
-            "writing DXF is not supported yet (import-only). Export STEP/IGES for B-rep or a mesh "
-            "format for tessellated geometry; 2D-projection-to-DXF is a planned follow-up.")
-
-    if fmt == "dwg":
-        raise ValueError(
-            "writing DWG is not supported (import-only, proprietary binary format). Export STEP/IGES "
-            "or a mesh format instead — DWG-consuming CAD tools import those.")
+            f"this Python helper does not write {fmt.upper()}. {fmt.upper()} export runs in the "
+            f"native engine: the export_file RPC with format '{fmt}' (MCP export_part "
+            f"fmt=\"{fmt}\"; File > Export in the app).")
 
     if fmt in ("sldprt", "sldasm", "x_t", "x_b"):
         raise ValueError(

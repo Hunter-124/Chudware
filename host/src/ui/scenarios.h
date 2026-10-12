@@ -50,6 +50,11 @@
 // lists every saved study unclipped, then captures every saved hydraulic / piping / vessel / duct
 // study the way its Simulation-tree row opens it, auditing each capture; report + captures in
 // scratch/demoreview_shots.
+// CHUDWARE_SHOT=dwgopen opens a COPY of $CHUDWARE_SHOT_DOC (any CAD file, e.g. a .dwg) through the
+// File > Open pump, records the open's warnings/toasts and the world bodies (names + volumes), then
+// captures the fitted iso viewport + FeatureManager and the tree with every collapsed row expanded;
+// fails by name with no bodies or fewer than two solid bodies. Captures + dwgopen_report.json land
+// beside the --ui-screenshot path.
 // CHUDWARE_SHOT=projectchat reloads a seeded PRIVATE session store under a different root and checks
 // that the active chat and Sessions follow the selected root (startup, A/B/empty-root switches with a
 // parked run, outside-root document open/tab selection, explicit other-project pick) with no

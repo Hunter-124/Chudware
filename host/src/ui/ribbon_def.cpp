@@ -966,6 +966,14 @@ static const RibbonCmd kCmds[] = {
     // --- Topology tab ---
     { "sim_topology_setup",      "Settings",    "settings",          "Topology", "Setup",      true,  nullptr, false },
     { "sim_material",            "Material",    "material",          "Topology", "Setup",      true,  nullptr, false },
+
+    // =========================================================================
+    // DWG export (2026-10): Drawing > View Layout > Sheet gains Export DWG (the native R2000 DWG
+    // writer behind export_drawing format "dwg"). dwg_arrange is re-appended after it (a later row wins, see the
+    // header) so the four Export rows stay adjacent and Auto Arrange keeps its place at the end.
+    // =========================================================================
+    { "dwg_export_dwg",   "Export DWG",    "file_doc",      "View Layout", "Sheet", false, nullptr, false, CommandCapability::Export },
+    { "dwg_arrange",      "Auto Arrange",  "view_cube",     "View Layout", "Sheet", false, nullptr, false },
 };
 // clang-format on
 #undef SIM_NEW_STUDY_ROWS

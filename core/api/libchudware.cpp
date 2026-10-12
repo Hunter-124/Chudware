@@ -3669,7 +3669,12 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.value("format", std::string()),
                                 params.value("lin_deflection", 0.05),
                                 params.value("ang_deflection", 0.35),
-                                params.value("relative", false), params.value("ascii", false)),
+                                params.value("relative", false), params.value("ascii", false),
+                                // dxf/dwg/sat: "mm" | "in" | ... or an $INSUNITS code; empty =
+                                // the drawing units of the doc's DWG/DXF/SAT import, else mm.
+                                params.contains("units") && params["units"].is_number_integer()
+                                    ? std::to_string(params["units"].get<int>())
+                                    : params.value("units", std::string())),
                             out_json, 0);
             // Live triangle/vertex estimate for the export dialog — tessellates in memory
             // at the requested quality and returns counts without writing a file.
@@ -3689,7 +3694,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     auto dot = path.find_last_of('.');
                     std::string ext = dot == std::string::npos ? "" : path.substr(dot + 1);
                     for (char& c : ext) c = (char)std::tolower((unsigned char)c);
-                    if (ext == "dxf" || ext == "pdf" || ext == "svg") fmt = ext;
+                    if (ext == "dxf" || ext == "dwg" || ext == "pdf" || ext == "svg") fmt = ext;
                 }
                 const std::string doc_id = params.value("doc_id", std::string());
                 if (m == "export_drawing" || m == "drawing_export")

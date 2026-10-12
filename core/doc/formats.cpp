@@ -71,6 +71,11 @@
 #endif
 
 #include "doc/formats.h"
+#include "doc/acis_read.h"
+#include "doc/acis_write.h"
+#include "doc/dwg.h"
+#include "doc/dwg_native.h"
+#include "doc/dxf.h"
 #include "doc/solidworks_tessellation.h"
 
 #include <algorithm>
@@ -83,16 +88,16 @@
 #include <sstream>
 #include <random>
 
-#ifdef _WIN32
-#include <process.h>
-#else
-#include <cerrno>
-#include <fcntl.h>
-#include <sys/wait.h>
+#ifndef _WIN32
+#include <fcntl.h>  // O_EXCL reservation of the dwg2dxf output
 #include <unistd.h>
 #endif
+#include <map>
+#include <set>
 #include <unordered_map>
 
+#include <BRepAdaptor_Curve.hxx>
+#include <BRepBuilderAPI_GTransform.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeSolid.hxx>
@@ -111,6 +116,9 @@
 #include <BRepTools.hxx>
 #include <BRepTools_ReShape.hxx>
 #include <GC_MakeArcOfCircle.hxx>
+#include <GCPnts_AbscissaPoint.hxx>
+#include <GCPnts_TangentialDeflection.hxx>
+#include <GeomAbs_CurveType.hxx>
 #include <Geom_BSplineCurve.hxx>
 #include <TColgp_Array1OfPnt.hxx>
 #include <TColStd_Array1OfReal.hxx>
@@ -143,6 +151,7 @@
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopLoc_Location.hxx>
+#include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopTools_FormatVersion.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <TopTools_HSequenceOfShape.hxx>
@@ -166,6 +175,9 @@
 #include <gp_Pnt.hxx>
 #include <gp_Vec.hxx>
 #include <gp_Trsf.hxx>
+#include <gp_GTrsf.hxx>
+#include <gp_Mat.hxx>
+#include <gp_XYZ.hxx>
 
 #include "doc/session.h"  // OpError
 
@@ -505,38 +517,43 @@ std::vector<Tag> read_tags(const std::string& path) {
         }
         Tag t;
         t.code = code;
-        t.value = trim(value_line);
+        // Text groups 1/3 keep their spaces: an ACIS SAT line (and its continuation) is
+        // space-delimited, so trimming would fuse the tokens on either side of a split.
+        if (code == 1 || code == 3) {
+            if (!value_line.empty() && value_line.back() == '\r') value_line.pop_back();
+            t.value = value_line;
+        } else {
+            t.value = trim(value_line);
+        }
         tags.push_back(std::move(t));
     }
     return tags;
 }
 
-// Pull every ENTITIES-section entity out of the tag stream. Only code-0 tags whose value
-// names a known/unknown entity type start a new entity; everything up to the next code-0
-// (or ENDSEC) belongs to it. HEADER variables are handled separately by insunits_scale().
-std::vector<Entity> parse_entities(const std::vector<Tag>& tags) {
+// Pull every code-0 entity of `section` ("ENTITIES" or "BLOCKS") out of the tag stream, in
+// file order. Everything up to the next code-0 (or ENDSEC) belongs to it. HEADER variables
+// are handled separately by insunits_scale().
+std::vector<Entity> parse_section(const std::vector<Tag>& tags, const std::string& section) {
     std::vector<Entity> out;
-    bool in_entities = false;
-    std::string pending_section;
+    bool in_section = false;
     bool expect_section_name = false;
     Entity* cur = nullptr;
 
     for (const Tag& t : tags) {
         if (t.code == 0) {
             if (t.value == "SECTION") {
-                pending_section.clear();
                 expect_section_name = true;
-                in_entities = false;
+                in_section = false;
                 cur = nullptr;
                 continue;
             }
             if (t.value == "ENDSEC") {
-                in_entities = false;
+                in_section = false;
                 cur = nullptr;
                 continue;
             }
             if (t.value == "EOF") break;
-            if (in_entities) {
+            if (in_section) {
                 out.emplace_back();
                 out.back().type = t.value;
                 cur = &out.back();
@@ -546,14 +563,49 @@ std::vector<Entity> parse_entities(const std::vector<Tag>& tags) {
             continue;
         }
         if (expect_section_name && t.code == 2) {
-            pending_section = t.value;
-            in_entities = (pending_section == "ENTITIES");
+            in_section = (t.value == section);
             expect_section_name = false;
             continue;
         }
         if (cur != nullptr) cur->tags.push_back(t);
     }
     return out;
+}
+
+std::vector<Entity> parse_entities(const std::vector<Tag>& tags) {
+    return parse_section(tags, "ENTITIES");
+}
+
+// Millimetres per unit of $INSUNITS `code`; false for an unknown code. 0 (unitless) counts
+// as millimetres: the coordinates already have the caller's intended scale.
+bool units_mm(int code, double* mm) {
+    switch (code) {
+        case 0: case 4: *mm = 1.0; return true;
+        case 1: *mm = 25.4; return true;           // inches
+        case 2: *mm = 304.8; return true;          // feet
+        case 3: *mm = 1609344.0; return true;      // miles
+        case 5: *mm = 10.0; return true;           // centimeters
+        case 6: *mm = 1000.0; return true;         // meters
+        case 7: *mm = 1000000.0; return true;      // kilometers
+        case 8: *mm = 0.0000254; return true;      // microinches
+        case 9: *mm = 0.0254; return true;         // mils
+        case 10: *mm = 914.4; return true;         // yards
+        case 11: *mm = 1e-7; return true;          // angstroms
+        case 12: *mm = 1e-6; return true;          // nanometers
+        case 13: *mm = 0.001; return true;         // microns
+        case 14: *mm = 100.0; return true;         // decimeters
+        case 15: *mm = 10000.0; return true;       // decameters
+        case 16: *mm = 100000.0; return true;      // hectometers
+        case 17: *mm = 1e12; return true;          // gigameters
+        case 18: *mm = 149597870700000.0; return true; // astronomical units
+        case 19: *mm = 9.4607304725808e18; return true; // light years
+        case 20: *mm = 3.085677581491367e19; return true; // parsecs
+        case 21: *mm = 1200.0 / 3937.0 * 1000.0; return true; // US survey feet
+        case 22: *mm = 100.0 / 3937.0 * 1000.0; return true;  // US survey inches
+        case 23: *mm = 3600.0 / 3937.0 * 1000.0; return true; // US survey yards
+        case 24: *mm = 6336000.0 / 3937.0 * 1000.0; return true; // US survey miles
+        default: return false;
+    }
 }
 
 // HEADER $INSUNITS is a code-9 variable followed by a code-70 integer. Zero (or
@@ -588,35 +640,11 @@ double insunits_scale(const std::vector<Tag>& tags, const std::string& path) {
             expect_units = false;
         }
     }
-    switch (units) {
-        case 0: case 4: return 1.0;
-        case 1: return 25.4;           // inches
-        case 2: return 304.8;          // feet
-        case 3: return 1609344.0;      // miles
-        case 5: return 10.0;           // centimeters
-        case 6: return 1000.0;         // meters
-        case 7: return 1000000.0;      // kilometers
-        case 8: return 0.0000254;      // microinches
-        case 9: return 0.0254;         // mils
-        case 10: return 914.4;         // yards
-        case 11: return 1e-7;          // angstroms
-        case 12: return 1e-6;          // nanometers
-        case 13: return 0.001;         // microns
-        case 14: return 100.0;         // decimeters
-        case 15: return 10000.0;       // decameters
-        case 16: return 100000.0;      // hectometers
-        case 17: return 1e12;          // gigameters
-        case 18: return 149597870700000.0; // astronomical units
-        case 19: return 9.4607304725808e18; // light years
-        case 20: return 3.085677581491367e19; // parsecs
-        case 21: return 1200.0 / 3937.0 * 1000.0; // US survey feet
-        case 22: return 100.0 / 3937.0 * 1000.0;  // US survey inches
-        case 23: return 3600.0 / 3937.0 * 1000.0; // US survey yards
-        case 24: return 6336000.0 / 3937.0 * 1000.0; // US survey miles
-        default:
-            throw OpError("import_failed", "DXF: unsupported $INSUNITS " +
-                          std::to_string(units), {{"path", path}, {"units", units}});
-    }
+    double mm = 1.0;
+    if (!units_mm(units, &mm))
+        throw OpError("import_failed", "DXF: unsupported $INSUNITS " + std::to_string(units),
+                      {{"path", path}, {"units", units}});
+    return mm;
 }
 
 // Fetch the first value for `code`, or `def_val` when absent.
@@ -645,6 +673,70 @@ std::vector<double> get_all_d(const Entity& e, int code) {
             try { out.push_back(std::stod(t.value)); } catch (const std::exception&) {}
         }
     return out;
+}
+
+std::string get_s(const Entity& e, int code, const std::string& def_val = std::string()) {
+    for (const Tag& t : e.tags)
+        if (t.code == code) return t.value;
+    return def_val;
+}
+
+// A BLOCKS-section definition: its base point and member entities (BLOCK .. ENDBLK).
+// `record` is the owning BLOCK_RECORD handle (BLOCK group 330; empty in R12 files), which
+// is how a DWG entity names the block it belongs to.
+struct Block {
+    gp_XYZ base{0.0, 0.0, 0.0};
+    std::string record;
+    std::vector<Entity> entities;
+};
+using Blocks = std::unordered_map<std::string, Block>;
+
+Blocks parse_blocks(const std::vector<Tag>& tags) {
+    Blocks out;
+    Block* cur = nullptr;
+    for (Entity& e : parse_section(tags, "BLOCKS")) {
+        if (e.type == "BLOCK") {
+            cur = &out[get_s(e, 2)];
+            cur->base = gp_XYZ(get_d(e, 10), get_d(e, 20), get_d(e, 30));
+            cur->record = get_s(e, 330);
+            cur->entities.clear();
+        } else if (e.type == "ENDBLK") {
+            cur = nullptr;
+        } else if (cur != nullptr) {
+            cur->entities.push_back(std::move(e));
+        }
+    }
+    return out;
+}
+
+// Entity extrusion direction (210/220/230), the Z axis of its object coordinate system.
+gp_Dir extrusion(const Entity& e) {
+    const double x = get_d(e, 210, 0.0), y = get_d(e, 220, 0.0), z = get_d(e, 230, 1.0);
+    const double n = std::sqrt(x * x + y * y + z * z);
+    if (n < 1e-12) return gp_Dir(0.0, 0.0, 1.0);
+    return gp_Dir(x / n, y / n, z / n);
+}
+
+bool is_world_z(const gp_Dir& n) { return n.Z() > 1.0 - 1e-12; }
+
+// OCS -> WCS rotation by the DXF Arbitrary Axis Algorithm; identity for extrusion +Z.
+gp_Mat ocs_matrix(const gp_Dir& n) {
+    const gp_XYZ N = n.XYZ();
+    gp_XYZ ax = (std::abs(N.X()) < 1.0 / 64.0 && std::abs(N.Y()) < 1.0 / 64.0)
+                    ? gp_XYZ(0.0, 1.0, 0.0).Crossed(N)
+                    : gp_XYZ(0.0, 0.0, 1.0).Crossed(N);
+    ax.Normalize();
+    gp_XYZ ay = N.Crossed(ax);
+    ay.Normalize();
+    return gp_Mat(ax, ay, N);  // columns: OCS X, Y, Z in world coordinates
+}
+
+gp_Trsf ocs_trsf(const gp_Dir& n) {
+    const gp_Mat m = ocs_matrix(n);
+    gp_Trsf t;
+    t.SetValues(m(1, 1), m(1, 2), m(1, 3), 0.0, m(2, 1), m(2, 2), m(2, 3), 0.0,
+                m(3, 1), m(3, 2), m(3, 3), 0.0);
+    return t;
 }
 
 // DXF SPLINE → OCCT B-spline edge. Control-point + knot form (the common machine-DXF case — e.g.
@@ -700,7 +792,8 @@ TopoDS_Edge ellipse_edge(const Entity& e) {
     double u0 = get_d(e, 41, 0.0), u1 = get_d(e, 42, 2.0 * kPi);
     const double major = std::sqrt(mx * mx + my * my + mz * mz);
     if (major < 1e-12) return TopoDS_Edge();
-    gp_Ax2 ax(gp_Pnt(cx, cy, cz), gp_Dir(0.0, 0.0, 1.0), gp_Dir(mx, my, mz));
+    // Center and major axis are WCS; the extrusion is the ellipse normal.
+    gp_Ax2 ax(gp_Pnt(cx, cy, cz), extrusion(e), gp_Dir(mx, my, mz));
     gp_Elips el(ax, major, major * ratio);
     if (u1 <= u0) u1 += 2.0 * kPi;
     return BRepBuilderAPI_MakeEdge(el, u0, u1);
@@ -794,81 +887,344 @@ void lwpolyline_to_edges(const Entity& e, std::vector<TopoDS_Edge>& out) {
 
 }  // namespace dxf
 
-// POLYLINE (old-style) + its trailing VERTEX/SEQEND entities → line/bulge-arc edges.
-// `i` indexes the POLYLINE entity in `entities`; advances `i` past the VERTEX/SEQEND run it
-// consumes so the caller's loop continues after SEQEND.
-void polyline_old_style_to_edges(const std::vector<dxf::Entity>& entities, std::size_t& i,
-                                 std::vector<TopoDS_Edge>& out) {
+// An ACIS solid/sheet carried by a 3DSOLID / BODY / REGION / *SURFACE entity.
+struct DxfAcisBody {
+    std::string layer;
+    TopoDS_Shape shape;
+    bool solid = false;
+};
+
+// Everything a DXF drawing contributes: curve edges for the 2D/3D profile body, triangle
+// soups per effective layer (3DFACE / POLYFACE / polygon mesh), ACIS bodies, and what was
+// not imported.
+struct DxfGeometry {
+    std::vector<TopoDS_Edge> edges;
+    std::map<std::string, MeshData> meshes;  // effective layer -> triangle soup
+    std::vector<DxfAcisBody> acis_bodies;
+    std::size_t triangles = 0;
+    int skipped = 0;  // entities that produced nothing (text, dimensions, hatches, failures)
+    int acis = 0;     // ACIS-backed entities that could NOT be imported (named in acis_notes)
+    std::vector<std::string> acis_notes;
+};
+
+bool is_acis_entity(const std::string& type) {
+    return type == "3DSOLID" || type == "BODY" || type == "REGION" || type == "SURFACE" ||
+           type == "PLANESURFACE" || type == "EXTRUDEDSURFACE" || type == "LOFTEDSURFACE" ||
+           type == "REVOLVEDSURFACE" || type == "SWEPTSURFACE" || type == "NURBSURFACE";
+}
+
+// DWG/DXF handles are hex strings; compare them upper-case without leading zeros.
+std::string handle_key(const std::string& h) {
+    std::string k;
+    for (char c : h) {
+        if (std::isspace(static_cast<unsigned char>(c))) continue;
+        if (k.empty() && c == '0') continue;
+        k.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    }
+    return k.empty() ? std::string("0") : k;
+}
+
+// ACIS data kept outside the entity text, by entity handle: the DXF R2013+ ACDSDATA section,
+// or the native DWG reader (dwg_native.h) for a DWG of any version. SAB bytes or SAT text.
+using AcisPayloads = std::unordered_map<std::string, std::string>;
+
+// The ACIS payload of `e`: the data keyed by its handle (group 5) when there is one, else its
+// inline SAT (groups 1 + 3 continuations; DXF up to R2010). For a DWG the handle-keyed data
+// always wins: LibreDWG dwg2dxf re-emits inline SAT one group 1 per 4096-byte DWG block and
+// per 255 characters, splitting tokens, so its SAT lines are not trustworthy.
+std::string acis_payload(const dxf::Entity& e, const AcisPayloads& payloads) {
+    const auto it = payloads.find(handle_key(dxf::get_s(e, 5)));
+    if (it != payloads.end()) return it->second;
+    std::vector<std::string> lines;
+    for (const dxf::Tag& t : e.tags) {
+        if (t.code == 1) lines.push_back(t.value);
+        else if (t.code == 3 && !lines.empty()) lines.back() += t.value;
+    }
+    return lines.empty() ? std::string() : decrypt_dxf_sat(lines);
+}
+
+void add_acis_entity(const dxf::Entity& e, const std::string& layer, const AcisPayloads& payloads,
+                     DxfGeometry& out) {
+    const std::string handle = dxf::get_s(e, 5);
+    const std::string who = e.type + (handle.empty() ? std::string() : " " + handle);
+    const std::string data = acis_payload(e, payloads);
+    if (data.empty()) {
+        ++out.acis;
+        out.acis_notes.push_back(who + " carries no ACIS data");
+        return;
+    }
+    try {
+        AcisReadResult r = read_acis(data);
+        for (const std::string& w : r.warnings) out.acis_notes.push_back(who + ": " + w);
+        if (r.bodies.empty()) {
+            ++out.acis;
+            out.acis_notes.push_back(who + ": the ACIS data holds no body");
+        }
+        for (AcisBody& b : r.bodies)
+            if (!b.shape.IsNull()) out.acis_bodies.push_back({layer, std::move(b.shape), b.solid});
+    } catch (const std::exception& ex) {
+        ++out.acis;
+        out.acis_notes.push_back(who + ": " + ex.what());
+    }
+}
+
+// Block members on layer "0" take the layer of the INSERT that places them.
+std::string effective_layer(const dxf::Entity& e, const std::string& parent) {
+    std::string layer = dxf::get_s(e, 8, "0");
+    if (layer.empty()) layer = "0";
+    return (layer == "0" && !parent.empty()) ? parent : layer;
+}
+
+void add_triangle(DxfGeometry& g, const std::string& layer, const gp_Pnt& a, const gp_Pnt& b,
+                  const gp_Pnt& c) {
+    if (a.Distance(b) < 1e-12 || b.Distance(c) < 1e-12 || a.Distance(c) < 1e-12) return;
+    MeshData& m = g.meshes[layer];
+    const auto base = static_cast<uint32_t>(m.vertex_count());
+    for (const gp_Pnt* p : {&a, &b, &c}) {
+        m.verts.push_back(p->X());
+        m.verts.push_back(p->Y());
+        m.verts.push_back(p->Z());
+    }
+    m.tris.insert(m.tris.end(), {base, base + 1, base + 2});
+    ++g.triangles;
+}
+
+// A quad (or triangle when the last corner repeats) split into triangles.
+void add_polygon(DxfGeometry& g, const std::string& layer, const std::vector<gp_Pnt>& c) {
+    if (c.size() < 3) return;
+    add_triangle(g, layer, c[0], c[1], c[2]);
+    if (c.size() == 4 && c[3].Distance(c[2]) > 1e-12) add_triangle(g, layer, c[0], c[2], c[3]);
+}
+
+void transform_edges(std::vector<TopoDS_Edge>& edges, std::size_t from, const gp_Trsf& t) {
+    for (std::size_t k = from; k < edges.size(); ++k)
+        edges[k] = TopoDS::Edge(BRepBuilderAPI_Transform(edges[k], t, Standard_True).Shape());
+}
+
+gp_Pnt vertex_point(const dxf::Entity& v) {
+    return gp_Pnt(dxf::get_d(v, 10), dxf::get_d(v, 20), dxf::get_d(v, 30));
+}
+
+// POLYLINE (old-style) + its trailing VERTEX/SEQEND entities. 2D polylines are OCS at the
+// header elevation, 3D polylines (flag 8) are WCS, polyface meshes (64) and M x N polygon
+// meshes (16) become triangles. `i` indexes the POLYLINE; it is advanced past SEQEND so the
+// caller's loop continues after it.
+void polyline_old_style(const std::vector<dxf::Entity>& entities, std::size_t& i,
+                        const std::string& layer, DxfGeometry& out) {
     const dxf::Entity& head = entities[i];
     const long flags = dxf::get_i(head, 70, 0);
-    const bool closed = (flags & 0x1) != 0;
-    std::vector<dxf::PolyVertex> pts;
+    std::vector<const dxf::Entity*> verts;
     std::size_t j = i + 1;
     for (; j < entities.size(); ++j) {
         const dxf::Entity& e = entities[j];
         if (e.type == "SEQEND") { ++j; break; }
-        if (e.type != "VERTEX") continue;  // tolerate stray entities before SEQEND
-        dxf::PolyVertex v;
-        v.x = dxf::get_d(e, 10, 0.0);
-        v.y = dxf::get_d(e, 20, 0.0);
-        v.z = dxf::get_d(e, 30, 0.0);
-        v.bulge = dxf::get_d(e, 42, 0.0);
-        pts.push_back(v);
+        if (e.type == "VERTEX") verts.push_back(&e);  // tolerate stray entities before SEQEND
     }
-    dxf::polyline_vertices_to_edges(pts, closed, out);
     i = j - 1;  // caller's for-loop does ++i
+
+    if (flags & 64) {
+        // Polyface: position vertices (flags 128|64), then face records (128) whose 71..74
+        // hold 1-based vertex indices (negative = hidden edge).
+        std::vector<gp_Pnt> pos;
+        for (const dxf::Entity* v : verts) {
+            const long vf = dxf::get_i(*v, 70, 0);
+            if ((vf & 128) && (vf & 64)) pos.push_back(vertex_point(*v));
+        }
+        for (const dxf::Entity* v : verts) {
+            const long vf = dxf::get_i(*v, 70, 0);
+            if (!(vf & 128) || (vf & 64)) continue;
+            std::vector<gp_Pnt> corners;
+            for (int code = 71; code <= 74; ++code) {
+                const long idx = std::labs(dxf::get_i(*v, code, 0));
+                if (idx >= 1 && static_cast<std::size_t>(idx) <= pos.size())
+                    corners.push_back(pos[static_cast<std::size_t>(idx) - 1]);
+            }
+            add_polygon(out, layer, corners);
+        }
+        return;
+    }
+    if (flags & 16) {
+        const long m = dxf::get_i(head, 71, 0), n = dxf::get_i(head, 72, 0);
+        if (m < 2 || n < 2 || verts.size() < static_cast<std::size_t>(m * n)) return;
+        const bool close_m = (flags & 1) != 0, close_n = (flags & 32) != 0;
+        auto at = [&](long r, long c) { return vertex_point(*verts[(r % m) * n + (c % n)]); };
+        for (long r = 0; r < (close_m ? m : m - 1); ++r)
+            for (long c = 0; c < (close_n ? n : n - 1); ++c)
+                add_polygon(out, layer, {at(r, c), at(r, c + 1), at(r + 1, c + 1), at(r + 1, c)});
+        return;
+    }
+    const bool is3d = (flags & 8) != 0;
+    const double elevation = dxf::get_d(head, 30, 0.0);
+    std::vector<dxf::PolyVertex> pts;
+    for (const dxf::Entity* v : verts) {
+        if (dxf::get_i(*v, 70, 0) & 16) continue;  // spline frame control point, not on curve
+        dxf::PolyVertex p;
+        p.x = dxf::get_d(*v, 10, 0.0);
+        p.y = dxf::get_d(*v, 20, 0.0);
+        p.z = is3d ? dxf::get_d(*v, 30, 0.0) : elevation;
+        p.bulge = is3d ? 0.0 : dxf::get_d(*v, 42, 0.0);
+        pts.push_back(p);
+    }
+    const std::size_t from = out.edges.size();
+    dxf::polyline_vertices_to_edges(pts, (flags & 0x1) != 0, out.edges);
+    const gp_Dir n = dxf::extrusion(head);
+    if (!is3d && !dxf::is_world_z(n)) transform_edges(out.edges, from, dxf::ocs_trsf(n));
 }
 
-// Entities → OCCT edges (port of _entities_to_edges' core-entity subset). Each malformed
-// entity is wrapped so one bad entity cannot abort the whole import; `skipped` counts every
-// entity that produced no edge (unsupported type, or a construction failure).
-std::vector<TopoDS_Edge> dxf_entities_to_edges(const std::vector<dxf::Entity>& entities,
-                                               int& skipped) {
-    std::vector<TopoDS_Edge> edges;
+constexpr int kMaxBlockDepth = 16;  // nesting bound; also stops self-referencing blocks
+
+void collect_entities(const std::vector<dxf::Entity>& entities, const dxf::Blocks& blocks,
+                      const AcisPayloads& payloads, const std::string& parent_layer, int depth,
+                      DxfGeometry& out);
+
+// INSERT / MINSERT: collect the block once, then place each array instance with
+// world = OCS(ins + Rz(rot) * (S * (p - base) + grid offset)).
+void place_insert(const dxf::Entity& e, const dxf::Blocks& blocks, const AcisPayloads& payloads,
+                  const std::string& layer, int depth, DxfGeometry& out) {
+    const auto found = blocks.find(dxf::get_s(e, 2));
+    if (found == blocks.end() || depth >= kMaxBlockDepth) return;
+    DxfGeometry sub;
+    collect_entities(found->second.entities, blocks, payloads, layer, depth + 1, sub);
+    out.skipped += sub.skipped;
+    out.acis += sub.acis;
+    out.acis_notes.insert(out.acis_notes.end(), sub.acis_notes.begin(), sub.acis_notes.end());
+
+    const double sx = dxf::get_d(e, 41, 1.0), sy = dxf::get_d(e, 42, 1.0), sz = dxf::get_d(e, 43, 1.0);
+    const double rot = dxf::get_d(e, 50, 0.0) * kPi / 180.0;
+    const long cols = std::max(1L, dxf::get_i(e, 70, 1)), rows = std::max(1L, dxf::get_i(e, 71, 1));
+    const double col_step = dxf::get_d(e, 44, 0.0), row_step = dxf::get_d(e, 45, 0.0);
+    const gp_XYZ ins(dxf::get_d(e, 10), dxf::get_d(e, 20), dxf::get_d(e, 30));
+    const gp_Mat ocs = dxf::ocs_matrix(dxf::extrusion(e));
+    const gp_Mat rz(std::cos(rot), -std::sin(rot), 0.0, std::sin(rot), std::cos(rot), 0.0,
+                    0.0, 0.0, 1.0);
+    gp_Mat scale;
+    scale.SetDiagonal(sx, sy, sz);
+    const gp_Mat m = ocs * rz * scale;
+    const bool mirrored = m.Determinant() < 0.0;
+    const bool uniform = std::abs(std::abs(sx) - std::abs(sy)) < 1e-12 * std::abs(sx) &&
+                         std::abs(std::abs(sx) - std::abs(sz)) < 1e-12 * std::abs(sx);
+    TopoDS_Compound block_edges;
+    BRep_Builder bb;
+    bb.MakeCompound(block_edges);
+    for (const TopoDS_Edge& edge : sub.edges) bb.Add(block_edges, edge);
+
+    for (long r = 0; r < rows; ++r) {
+        for (long c = 0; c < cols; ++c) {
+            const gp_XYZ offset = rz * gp_XYZ(c * col_step, r * row_step, 0.0);
+            const gp_XYZ t = ocs * (ins + offset) - m * found->second.base;
+            // Uniform placements move B-rep exactly; a non-uniform scale needs GTransform
+            // (which converts the geometry to NURBS).
+            auto place = [&](const TopoDS_Shape& shape) -> TopoDS_Shape {
+                try {
+                    if (!uniform) throw Standard_Failure("non-uniform block scale");
+                    gp_Trsf tr;
+                    tr.SetValues(m(1, 1), m(1, 2), m(1, 3), t.X(), m(2, 1), m(2, 2), m(2, 3),
+                                 t.Y(), m(3, 1), m(3, 2), m(3, 3), t.Z());
+                    return BRepBuilderAPI_Transform(shape, tr, Standard_True).Shape();
+                } catch (const Standard_Failure&) {
+                    return BRepBuilderAPI_GTransform(shape, gp_GTrsf(m, t), Standard_True).Shape();
+                }
+            };
+            if (!sub.edges.empty()) {
+                const TopoDS_Shape placed = place(block_edges);
+                for (TopExp_Explorer ex(placed, TopAbs_EDGE); ex.More(); ex.Next())
+                    out.edges.push_back(TopoDS::Edge(ex.Current()));
+            }
+            for (const DxfAcisBody& body : sub.acis_bodies) {
+                try {
+                    out.acis_bodies.push_back({body.layer, place(body.shape), body.solid});
+                } catch (const Standard_Failure& ex) {
+                    ++out.acis;
+                    out.acis_notes.push_back("block '" + dxf::get_s(e, 2) +
+                                             "': an ACIS body could not be placed (" +
+                                             ex.GetMessageString() + ")");
+                }
+            }
+            for (const auto& [mesh_layer, mesh] : sub.meshes) {
+                MeshData& dst = out.meshes[mesh_layer];
+                const auto base = static_cast<uint32_t>(dst.vertex_count());
+                for (std::size_t k = 0; k + 2 < mesh.verts.size(); k += 3) {
+                    const gp_XYZ p = m * gp_XYZ(mesh.verts[k], mesh.verts[k + 1], mesh.verts[k + 2]) + t;
+                    dst.verts.insert(dst.verts.end(), {p.X(), p.Y(), p.Z()});
+                }
+                for (std::size_t k = 0; k + 2 < mesh.tris.size(); k += 3) {
+                    // A mirrored placement flips handedness; keep the outward winding.
+                    dst.tris.push_back(base + mesh.tris[k]);
+                    dst.tris.push_back(base + mesh.tris[k + (mirrored ? 2 : 1)]);
+                    dst.tris.push_back(base + mesh.tris[k + (mirrored ? 1 : 2)]);
+                }
+                out.triangles += mesh.triangle_count();
+            }
+        }
+    }
+}
+
+// Entities -> edges / meshes / ACIS bodies (port of _entities_to_edges plus blocks, OCS, mesh
+// and ACIS entities). Each malformed entity is wrapped so one bad entity cannot abort the
+// whole import.
+void collect_entities(const std::vector<dxf::Entity>& entities, const dxf::Blocks& blocks,
+                      const AcisPayloads& payloads, const std::string& parent_layer, int depth,
+                      DxfGeometry& out) {
     for (std::size_t i = 0; i < entities.size(); ++i) {
         const dxf::Entity& e = entities[i];
-        const std::size_t before = edges.size();
+        const std::string layer = effective_layer(e, parent_layer);
+        if (is_acis_entity(e.type)) {
+            add_acis_entity(e, layer, payloads, out);
+            continue;
+        }
+        const std::size_t edges_before = out.edges.size();
+        const std::size_t tris_before = out.triangles;
+        const std::size_t acis_before = out.acis_bodies.size();
         try {
             if (e.type == "LINE") {
-                const double x1 = dxf::get_d(e, 10), y1 = dxf::get_d(e, 20), z1 = dxf::get_d(e, 30);
-                const double x2 = dxf::get_d(e, 11), y2 = dxf::get_d(e, 21), z2 = dxf::get_d(e, 31);
-                gp_Pnt p1(x1, y1, z1), p2(x2, y2, z2);
-                if (p1.Distance(p2) > 1e-9) edges.push_back(BRepBuilderAPI_MakeEdge(p1, p2));
-            } else if (e.type == "CIRCLE") {
-                const double cx = dxf::get_d(e, 10), cy = dxf::get_d(e, 20), cz = dxf::get_d(e, 30);
-                const double r = dxf::get_d(e, 40);
-                gp_Circ c(gp_Ax2(gp_Pnt(cx, cy, cz), gp_Dir(0, 0, 1)), r);
-                edges.push_back(BRepBuilderAPI_MakeEdge(c));
-            } else if (e.type == "ARC") {
-                const double cx = dxf::get_d(e, 10), cy = dxf::get_d(e, 20), cz = dxf::get_d(e, 30);
-                const double r = dxf::get_d(e, 40);
-                double a1 = dxf::get_d(e, 50) * kPi / 180.0;
-                double a2 = dxf::get_d(e, 51) * kPi / 180.0;
-                if (a2 <= a1) a2 += 2.0 * kPi;
-                gp_Circ c(gp_Ax2(gp_Pnt(cx, cy, cz), gp_Dir(0, 0, 1)), r);
-                edges.push_back(BRepBuilderAPI_MakeEdge(c, a1, a2));
+                const gp_Pnt p1(dxf::get_d(e, 10), dxf::get_d(e, 20), dxf::get_d(e, 30));
+                const gp_Pnt p2(dxf::get_d(e, 11), dxf::get_d(e, 21), dxf::get_d(e, 31));
+                if (p1.Distance(p2) > 1e-9) out.edges.push_back(BRepBuilderAPI_MakeEdge(p1, p2));
+            } else if (e.type == "CIRCLE" || e.type == "ARC") {
+                // Center is in the entity's OCS; angles run CCW about its extrusion.
+                const gp_Pnt c(dxf::get_d(e, 10), dxf::get_d(e, 20), dxf::get_d(e, 30));
+                const gp_Circ circ(gp_Ax2(c, gp_Dir(0, 0, 1)), dxf::get_d(e, 40));
+                if (e.type == "CIRCLE") {
+                    out.edges.push_back(BRepBuilderAPI_MakeEdge(circ));
+                } else {
+                    const double a1 = dxf::get_d(e, 50) * kPi / 180.0;
+                    double a2 = dxf::get_d(e, 51) * kPi / 180.0;
+                    while (a2 <= a1) a2 += 2.0 * kPi;
+                    out.edges.push_back(BRepBuilderAPI_MakeEdge(circ, a1, a2));
+                }
+                const gp_Dir n = dxf::extrusion(e);
+                if (!dxf::is_world_z(n)) transform_edges(out.edges, edges_before, dxf::ocs_trsf(n));
             } else if (e.type == "LWPOLYLINE") {
-                dxf::lwpolyline_to_edges(e, edges);
+                dxf::lwpolyline_to_edges(e, out.edges);
+                const gp_Dir n = dxf::extrusion(e);
+                if (!dxf::is_world_z(n)) transform_edges(out.edges, edges_before, dxf::ocs_trsf(n));
             } else if (e.type == "POLYLINE") {
-                polyline_old_style_to_edges(entities, i, edges);
+                polyline_old_style(entities, i, layer, out);
             } else if (e.type == "SPLINE") {
                 TopoDS_Edge se = dxf::spline_edge(e);
-                if (!se.IsNull()) edges.push_back(se);
+                if (!se.IsNull()) out.edges.push_back(se);
             } else if (e.type == "ELLIPSE") {
                 TopoDS_Edge ee = dxf::ellipse_edge(e);
-                if (!ee.IsNull()) edges.push_back(ee);
-            } else {
-                // INSERT / TEXT / DIMENSION / HATCH / … — out of scope for this increment
-                // (see the file-level comment); counted as skipped by the size check below.
+                if (!ee.IsNull()) out.edges.push_back(ee);
+            } else if (e.type == "3DFACE") {
+                std::vector<gp_Pnt> corners;
+                for (int k = 0; k < 4; ++k)
+                    corners.emplace_back(dxf::get_d(e, 10 + k), dxf::get_d(e, 20 + k),
+                                         dxf::get_d(e, 30 + k));
+                add_polygon(out, layer, corners);
+            } else if (e.type == "INSERT") {
+                place_insert(e, blocks, payloads, layer, depth, out);
             }
+            // TEXT / DIMENSION / HATCH / … produce nothing and count as skipped below.
         } catch (const Standard_Failure&) {
             // one bad entity must not abort the whole import
         } catch (const std::exception&) {
             // ditto for any non-OCCT exception (e.g. a malformed numeric tag)
         }
-        if (edges.size() == before) ++skipped;
+        if (out.edges.size() == edges_before && out.triangles == tris_before &&
+            out.acis_bodies.size() == acis_before)
+            ++out.skipped;
     }
-    return edges;
 }
 
 // Stitch loose edges into connected wires; closed wires → Faces (kept as a Wire when the
@@ -902,63 +1258,292 @@ void dxf_assemble_wires(const std::vector<TopoDS_Edge>& edges, TopoDS_Compound& 
     }
 }
 
-// Parse an ASCII DXF file and return ONE Compound of faces (closed regions) + free wires
-// (open) — one file, one body, mirroring the mesh importers and formats_dxf.py::
-// bodies_from_doc. Throws OpError("import_failed") when the file carries no importable
-// core-entity geometry (LINE/CIRCLE/ARC/LWPOLYLINE/POLYLINE) — ELLIPSE/SPLINE/INSERT/text/
-// dimensions/hatches count toward the "skipped" total in that message but are not
-// themselves imported yet.
-TopoDS_Shape read_dxf_shape(const std::string& path) {
-    std::vector<dxf::Tag> tags = dxf::read_tags(path);
-    const double unit_to_mm = dxf::insunits_scale(tags, path);
-    std::vector<dxf::Entity> entities = dxf::parse_entities(tags);
+// A parsed DXF: one profile compound of faces (closed regions) + free wires (open), mirroring
+// formats_dxf.py::bodies_from_doc, one mesh-built body per layer, and every ACIS body.
+// Millimetres. `insunits` is the drawing's $INSUNITS code (0 when absent).
+struct DxfImport {
+    TopoDS_Shape profile;
+    std::vector<std::pair<std::string, TopoDS_Shape>> meshes;  // (layer, body)
+    std::vector<DxfAcisBody> acis_bodies;
     int skipped = 0;
-    std::vector<TopoDS_Edge> edges = dxf_entities_to_edges(entities, skipped);
-    if (edges.empty())
-        throw OpError("import_failed",
-                      "DXF '" + path + "' has no importable 2D geometry (" +
-                          std::to_string(skipped) +
-                          " unsupported/empty entity(ies) skipped — text, dimensions, "
-                          "hatches, ELLIPSE/SPLINE/INSERT and 3D mesh entities are not "
-                          "imported by this importer).",
-                      {{"path", path}, {"format", "dxf"}});
-    TopoDS_Compound comp;
-    dxf_assemble_wires(edges, comp);
-    if (unit_to_mm == 1.0) return comp;
-    gp_Trsf scale;
-    scale.SetScale(gp_Pnt(0, 0, 0), unit_to_mm);
-    return BRepBuilderAPI_Transform(comp, scale, Standard_True).Shape();
+    int acis = 0;
+    std::vector<std::string> acis_notes;
+    int insunits = 0;
+};
+
+int insunits_code(const std::vector<dxf::Tag>& tags) {
+    for (std::size_t i = 0; i + 1 < tags.size(); ++i)
+        if (tags[i].code == 9 && tags[i].value == "$INSUNITS" && tags[i + 1].code == 70) {
+            try { return std::stoi(tags[i + 1].value); } catch (const std::exception&) { return 0; }
+        }
+    return 0;
 }
 
-// --------------------------------------------------------------------------- DWG import
-//
-// DWG is a proprietary binary format; we do NOT parse it in-process (license/complexity
-// isolation, same spirit as the SolidWorks COM lane). LibreDWG's GPL `dwg2dxf` remains
-// fully out-of-process. Arguments are passed as an argv vector, never through a shell.
-bool run_dwg2dxf(const std::string& output, const std::string& input) {
-#ifdef _WIN32
-    const char* argv[] = {"dwg2dxf", "-o", output.c_str(), input.c_str(), nullptr};
-    return ::_spawnvp(_P_WAIT, argv[0], argv) == 0;
-#else
-    const pid_t pid = ::fork();
-    if (pid < 0) return false;
-    if (pid == 0) {
-        const int null_fd = ::open("/dev/null", O_WRONLY);
-        if (null_fd >= 0) {
-            (void)::dup2(null_fd, STDOUT_FILENO);
-            (void)::dup2(null_fd, STDERR_FILENO);
-            ::close(null_fd);
+// DXF R2013+ keeps ACIS bodies as SAB in the ACDSDATA section: each ACDSRECORD names its
+// entity (AcDbDs::ID -> 320 handle) and carries the bytes as 310 hex chunks after ASM_Data
+// (94 = byte count).
+AcisPayloads parse_acdsdata(const std::vector<dxf::Tag>& tags) {
+    AcisPayloads out;
+    auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (const dxf::Entity& rec : dxf::parse_section(tags, "ACDSDATA")) {
+        if (rec.type != "ACDSRECORD") continue;
+        std::string handle, bytes;
+        long size = -1;
+        enum { kNone, kId, kAsm } field = kNone;
+        for (const dxf::Tag& t : rec.tags) {
+            if (t.code == 2) {
+                field = t.value == "AcDbDs::ID" ? kId : t.value == "ASM_Data" ? kAsm : kNone;
+            } else if (field == kId && t.code == 320) {
+                handle = t.value;
+            } else if (field == kAsm && t.code == 94) {
+                try { size = std::stol(t.value); } catch (const std::exception&) { size = -1; }
+            } else if (field == kAsm && t.code == 310) {
+                for (std::size_t k = 0; k + 1 < t.value.size(); k += 2) {
+                    const int hi = hex(t.value[k]), lo = hex(t.value[k + 1]);
+                    if (hi < 0 || lo < 0) break;
+                    bytes.push_back(static_cast<char>(hi * 16 + lo));
+                }
+            }
         }
-        const char* argv[] = {"dwg2dxf", "-o", output.c_str(), input.c_str(), nullptr};
-        ::execvp(argv[0], const_cast<char* const*>(argv));
-        ::_exit(127);
+        if (size >= 0 && static_cast<std::size_t>(size) < bytes.size()) bytes.resize(size);
+        if (!handle.empty() && !bytes.empty()) out[handle_key(handle)] = std::move(bytes);
     }
-    int status = 0;
-    while (::waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) return false;
+    return out;
+}
+
+// Fold the native DWG reader's ACIS entities into the converted DXF: payloads by handle, and
+// any entity dwg2dxf dropped (LibreDWG skips SURFACE classes) is re-created as a stub entity
+// in the model space or block that owns it, on its layer.
+void merge_native_acis(const DwgNativeInfo& native, const std::vector<dxf::Tag>& tags,
+                       std::vector<dxf::Entity>& entities, dxf::Blocks& blocks,
+                       AcisPayloads& payloads, std::vector<std::string>& notes) {
+    std::set<std::string> present;
+    auto note_handles = [&present](const std::vector<dxf::Entity>& list) {
+        for (const dxf::Entity& e : list) present.insert(handle_key(dxf::get_s(e, 5)));
+    };
+    note_handles(entities);
+    for (const auto& [name, block] : blocks) note_handles(block.entities);
+
+    std::unordered_map<std::string, std::string> layer_names;   // LAYER handle -> name
+    std::unordered_map<std::string, std::string> record_names;  // BLOCK_RECORD handle -> name
+    for (const dxf::Entity& t : dxf::parse_section(tags, "TABLES")) {
+        if (t.type == "LAYER") layer_names[handle_key(dxf::get_s(t, 5))] = dxf::get_s(t, 2);
+        if (t.type == "BLOCK_RECORD") record_names[handle_key(dxf::get_s(t, 5))] = dxf::get_s(t, 2);
     }
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
-#endif
+    auto hex_handle = [](std::uint64_t h) {
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "%llX", static_cast<unsigned long long>(h));
+        return std::string(buf);
+    };
+    for (const DwgAcisEntity& a : native.acis) {
+        const std::string key = hex_handle(a.handle);
+        if (!a.data.empty()) payloads[key] = a.data;
+        if (present.count(key)) continue;
+        dxf::Entity stub;
+        stub.type = a.type;
+        stub.tags.push_back({5, key});
+        const auto layer = layer_names.find(hex_handle(a.layer));
+        stub.tags.push_back({8, layer == layer_names.end() ? std::string("0") : layer->second});
+        const auto record = record_names.find(hex_handle(a.owner));
+        const std::string owner = record == record_names.end() ? std::string() : record->second;
+        std::string upper = owner;
+        for (char& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (upper == "*MODEL_SPACE") {
+            entities.push_back(std::move(stub));
+        } else if (upper.rfind("*PAPER_SPACE", 0) == 0) {
+            notes.push_back(a.type + " " + key + " is in paper space and was not imported");
+        } else if (auto b = blocks.find(owner); b != blocks.end()) {
+            b->second.entities.push_back(std::move(stub));
+        } else {
+            notes.push_back(a.type + " " + key + " has an unknown owner " + hex_handle(a.owner) +
+                            " and was not imported");
+        }
+    }
+    notes.insert(notes.end(), native.warnings.begin(), native.warnings.end());
+}
+
+DxfImport read_dxf(const std::string& path, const DwgNativeInfo* native = nullptr) {
+    const std::vector<dxf::Tag> tags = dxf::read_tags(path);
+    const double unit_to_mm = dxf::insunits_scale(tags, path);
+    std::vector<dxf::Entity> entities = dxf::parse_entities(tags);
+    dxf::Blocks blocks = dxf::parse_blocks(tags);
+    AcisPayloads payloads = parse_acdsdata(tags);
+    DxfGeometry g;
+    if (native) merge_native_acis(*native, tags, entities, blocks, payloads, g.acis_notes);
+    collect_entities(entities, blocks, payloads, std::string(), 0, g);
+    DxfImport r;
+    r.skipped = g.skipped;
+    r.acis = g.acis;
+    r.acis_notes = std::move(g.acis_notes);
+    r.insunits = insunits_code(tags);
+    gp_Trsf scale;
+    if (unit_to_mm != 1.0) scale.SetScale(gp_Pnt(0, 0, 0), unit_to_mm);
+    if (!g.edges.empty()) {
+        TopoDS_Compound comp;
+        dxf_assemble_wires(g.edges, comp);
+        r.profile = comp;
+        if (unit_to_mm != 1.0)
+            r.profile = BRepBuilderAPI_Transform(comp, scale, Standard_True).Shape();
+    }
+    for (auto& [layer, mesh] : g.meshes) {
+        if (mesh.triangle_count() == 0) continue;
+        if (unit_to_mm != 1.0)
+            for (double& v : mesh.verts) v *= unit_to_mm;
+        TopoDS_Shape body = mesh_to_shape(mesh);
+        if (!body.IsNull()) r.meshes.emplace_back(layer, body);
+    }
+    for (DxfAcisBody& b : g.acis_bodies) {
+        if (unit_to_mm != 1.0) b.shape = BRepBuilderAPI_Transform(b.shape, scale, Standard_True).Shape();
+        r.acis_bodies.push_back(std::move(b));
+    }
+    return r;
+}
+
+// DXF (or a DWG converted to `dxf_path`, with its natively read ACIS data) -> named bodies:
+// the profile is named after the source file; each mesh body after the file and its layer;
+// ACIS solids/surfaces `<stem>_solidN` / `<stem>_surfaceN` (bare stem when a body is alone).
+// Refuses by name when nothing importable remains; every ACIS entity that could not be read
+// is reported by type and handle, never dropped silently.
+std::vector<std::pair<std::string, TopoDS_Shape>> dxf_bodies(
+    const std::string& dxf_path, const std::string& source_path, const std::string& fmt,
+    std::vector<std::string>* warnings, int* source_units,
+    const DwgNativeInfo* native = nullptr) {
+    const DxfImport r = read_dxf(dxf_path, native);
+    if (source_units) *source_units = r.insunits;
+    std::string stem = std::filesystem::path(source_path).stem().string();
+    if (stem.empty()) stem = fmt;
+    std::vector<std::pair<std::string, TopoDS_Shape>> out;
+    const std::size_t total = (r.profile.IsNull() ? 0 : 1) + r.meshes.size() + r.acis_bodies.size();
+    if (!r.profile.IsNull()) out.emplace_back(stem, r.profile);
+    for (const auto& [layer, body] : r.meshes)
+        out.emplace_back(total == 1 ? stem : stem + "_" + layer, body);
+    int solids = 0, surfaces = 0;
+    for (const DxfAcisBody& b : r.acis_bodies) {
+        const std::string kind = b.solid ? "_solid" + std::to_string(++solids)
+                                         : "_surface" + std::to_string(++surfaces);
+        out.emplace_back(total == 1 ? stem : stem + kind, b.shape);
+    }
+    std::string label = fmt;
+    for (char& c : label) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    std::string acis_note;
+    for (const std::string& n : r.acis_notes) acis_note += (acis_note.empty() ? "" : "; ") + n;
+    if (out.empty())
+        throw OpError("import_failed",
+                      label + " '" + source_path + "' has no importable geometry (" +
+                          std::to_string(r.skipped) +
+                          " unsupported/empty entity(ies) skipped — text, dimensions and "
+                          "hatches are not imported" +
+                          (acis_note.empty() ? std::string() : "; ACIS: " + acis_note) + ").",
+                      {{"path", source_path}, {"format", fmt}, {"skipped", r.skipped},
+                       {"acis_entities", r.acis}});
+    if (warnings)
+        for (const std::string& n : r.acis_notes) warnings->push_back(label + " ACIS: " + n);
+    return out;
+}
+
+// $INSUNITS code for an ACIS header's millimetres-per-unit (0 = none of the DXF units).
+int insunits_for_mm_per_unit(double mm) {
+    struct Unit { int code; double mm; };
+    static const Unit kUnits[] = {{4, 1.0},    {1, 25.4}, {2, 304.8}, {5, 10.0},
+                                  {6, 1000.0}, {13, 0.001}, {9, 0.0254}, {14, 100.0}};
+    for (const Unit& u : kUnits)
+        if (mm > 0.0 && std::abs(mm - u.mm) <= 1e-9 * u.mm) return u.code;
+    return 0;
+}
+
+// ACIS bodies -> named import bodies scaled to millimetres (`<stem>`, or `<stem>_solidN` /
+// `<stem>_surfaceN` when there are several).
+std::vector<std::pair<std::string, TopoDS_Shape>> name_acis_bodies(
+    std::vector<AcisBody>& bodies, double mm_per_unit, const std::string& stem) {
+    gp_Trsf scale;
+    if (mm_per_unit > 0.0 && mm_per_unit != 1.0) scale.SetScale(gp_Pnt(0, 0, 0), mm_per_unit);
+    std::vector<std::pair<std::string, TopoDS_Shape>> out;
+    int solids = 0, surfaces = 0;
+    for (AcisBody& b : bodies) {
+        if (b.shape.IsNull()) continue;
+        TopoDS_Shape shape = scale.Form() == gp_Identity
+                                 ? b.shape
+                                 : BRepBuilderAPI_Transform(b.shape, scale, Standard_True).Shape();
+        const std::string suffix = b.solid ? "_solid" + std::to_string(++solids)
+                                           : "_surface" + std::to_string(++surfaces);
+        out.emplace_back(bodies.size() == 1 ? stem : stem + suffix, std::move(shape));
+    }
+    return out;
+}
+
+// Standalone ACIS file (.sat text, .sab binary), as AutoCAD ACISOUT and most modelers write.
+std::vector<std::pair<std::string, TopoDS_Shape>> sat_bodies(const std::string& path,
+                                                             std::vector<std::string>* warnings,
+                                                             int* source_units) {
+    std::ifstream is(path, std::ios::binary);
+    if (!is) throw OpError("import_failed", "SAT: cannot open input", {{"path", path}});
+    const std::string data((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
+    AcisReadResult r;
+    try {
+        r = read_acis(data);
+    } catch (const std::exception& e) {
+        throw OpError("import_failed", std::string("ACIS: ") + e.what(),
+                      {{"path", path}, {"format", "sat"}});
+    }
+    if (warnings)
+        for (const std::string& w : r.warnings) warnings->push_back("ACIS: " + w);
+    if (source_units) *source_units = insunits_for_mm_per_unit(r.mm_per_unit);
+    auto out = name_acis_bodies(r.bodies, r.mm_per_unit, std::filesystem::path(path).stem().string());
+    if (out.empty())
+        throw OpError("import_failed", "ACIS file '" + path + "' holds no body",
+                      {{"path", path}, {"format", "sat"}});
+    return out;
+}
+
+// A DWG whose 2D entities cannot be converted (no LibreDWG dwg2dxf) still yields its model
+// space ACIS solids/surfaces from the native reader, in ACIS header units.
+std::vector<std::pair<std::string, TopoDS_Shape>> dwg_native_only_bodies(
+    const DwgNativeInfo& native, const std::string& path, std::vector<std::string>* warnings,
+    int* source_units) {
+    std::vector<AcisBody> bodies;
+    double mm_per_unit = 0.0;
+    std::vector<std::string> notes = native.warnings;
+    for (const DwgAcisEntity& a : native.acis) {
+        char key[24];
+        std::snprintf(key, sizeof(key), "%llX", static_cast<unsigned long long>(a.handle));
+        if (a.owner != native.model_space) {
+            notes.push_back(a.type + " " + key +
+                            " lies outside model space (block or paper space) and needs LibreDWG "
+                            "dwg2dxf to be placed");
+            continue;
+        }
+        if (a.data.empty()) {
+            notes.push_back(a.type + " " + key + " carries no ACIS data");
+            continue;
+        }
+        try {
+            AcisReadResult r = read_acis(a.data);
+            if (mm_per_unit <= 0.0) mm_per_unit = r.mm_per_unit;
+            for (const std::string& w : r.warnings) notes.push_back(a.type + " " + key + ": " + w);
+            for (AcisBody& b : r.bodies) bodies.push_back(std::move(b));
+        } catch (const std::exception& e) {
+            notes.push_back(a.type + " " + key + ": " + e.what());
+        }
+    }
+    if (source_units) *source_units = insunits_for_mm_per_unit(mm_per_unit);
+    auto out = name_acis_bodies(bodies, mm_per_unit, std::filesystem::path(path).stem().string());
+    if (out.empty())
+        throw OpError("import_failed",
+                      std::string("DWG import needs LibreDWG's `dwg2dxf` for this file's 2D "
+                                  "entities, which was not found. ") + kLibredwgInstallHint,
+                      {{"path", path}, {"format", "dwg"}});
+    if (warnings) {
+        warnings->push_back("DWG: only the 3D solids/surfaces were imported; lines, arcs, "
+                            "text and blocks need LibreDWG's `dwg2dxf`. " +
+                            std::string(kLibredwgInstallHint));
+        for (const std::string& n : notes) warnings->push_back("DWG ACIS: " + n);
+    }
+    return out;
 }
 
 }  // namespace
@@ -1027,16 +1612,24 @@ std::string dwg_to_temp_dxf(const std::string& path) {
         throw OpError("import_failed", "DWG import could not reserve a private temporary output.",
                       {{"path", path}, {"format", "dwg"}});
 
-    const bool converted = run_dwg2dxf(out_dxf.string(), path);
+    // -y: dwg2dxf refuses to overwrite the reserved (already existing) output without it.
+    const bool converted =
+        run_libredwg("dwg2dxf", {"-y", "-o", out_dxf.string(), path});
     if (converted && std::filesystem::exists(out_dxf, ec) &&
         std::filesystem::file_size(out_dxf, ec) > 0 && !ec)
         return out_dxf.string();
 
     std::filesystem::remove(out_dxf, ec);
-    throw OpError("import_failed",
-                  "DWG import needs a DWG->DXF converter (LibreDWG dwg2dxf) on PATH; none "
-                  "found or conversion failed. Or convert to DXF/STEP first.",
-                  {{"path", path}, {"format", "dwg"}});
+    const std::string reason = libredwg_tool("dwg2dxf").empty()
+                                   ? std::string("DWG import needs LibreDWG's `dwg2dxf`, which was "
+                                                 "not found. ") + kLibredwgInstallHint
+                                   : std::string("LibreDWG dwg2dxf could not convert this DWG; "
+                                                 "save it as DXF or STEP from the source CAD.");
+    throw OpError("import_failed", reason, {{"path", path}, {"format", "dwg"}});
+}
+
+std::size_t dxf_entity_count(const std::string& path) {
+    return dxf::parse_entities(dxf::read_tags(path)).size();
 }
 
 namespace {
@@ -1203,12 +1796,40 @@ std::string detect_format(const std::string& path) {
         {".brep", "brep"}, {".stl", "stl"},  {".3mf", "3mf"},  {".obj", "obj"},
         {".ply", "ply"},   {".gltf", "gltf"},{".glb", "glb"},  {".3dm", "3dm"},
         {".sldprt", "sldprt"}, {".sldasm", "sldasm"}, {".x_t", "x_t"}, {".x_b", "x_b"},
-        {".dxf", "dxf"}, {".dwg", "dwg"},
+        {".dxf", "dxf"}, {".dwg", "dwg"}, {".sat", "sat"}, {".sab", "sat"},
     };
     for (const auto& [e, f] : kMap)
         if (ext == e) return f;
     throw OpError("invalid_op", "cannot detect format from extension '" + ext + "'",
                   {{"reason", "unknown extension"}, {"path", path}});
+}
+
+double insunits_mm(int code) {
+    double mm = 1.0;
+    if (!dxf::units_mm(code, &mm))
+        throw OpError("invalid_op", "unknown $INSUNITS code " + std::to_string(code),
+                      {{"units", code}});
+    return mm;
+}
+
+int parse_units(const std::string& units) {
+    static const std::pair<const char*, int> kNames[] = {
+        {"mm", 4}, {"millimeters", 4}, {"in", 1}, {"inch", 1}, {"inches", 1}, {"ft", 2},
+        {"feet", 2}, {"cm", 5}, {"m", 6}, {"meters", 6}, {"um", 13}, {"microns", 13},
+        {"mil", 9}, {"mils", 9}, {"dm", 14}};
+    const std::string u = lower(dxf::trim(units));
+    for (const auto& [name, code] : kNames)
+        if (u == name) return code;
+    if (!u.empty() && u.size() <= 3 &&
+        std::all_of(u.begin(), u.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+        const int code = std::stoi(u);
+        double mm = 0.0;
+        if (code != 0 && dxf::units_mm(code, &mm)) return code;
+    }
+    throw OpError("invalid_op",
+                  "units '" + units + "' is not one of mm, in, ft, cm, m, um, mil, dm or a "
+                  "nonzero $INSUNITS code",
+                  {{"units", units}});
 }
 
 // --------------------------------------------------------------- format registry (D4)
@@ -1229,12 +1850,16 @@ const std::vector<FormatInfo>& format_registry() {
         {"gltf",   "glTF",                {".gltf"},         "mesh",        true,  true},
         {"glb",    "glTF binary",         {".glb"},          "mesh",        true,  true},
         {"3dm",    "Rhino",               {".3dm"},          "rhino",       true,  true},
-        // DXF (2D vector drawings) — import-only; 2D-projection-from-3D DXF export is
-        // a separate follow-up, so can_export is false (oracle comment carried over).
-        {"dxf",    "AutoCAD DXF",         {".dxf"},          "brep",        true,  false},
-        // DWG (AutoCAD binary) — import-only via an external DWG->DXF converter; never
-        // written.
-        {"dwg",    "AutoCAD DWG",         {".dwg"},          "brep",        true,  false},
+        // DXF / DWG: profiles import as faces + wires, 3D mesh entities as mesh bodies and
+        // ACIS 3DSOLID/BODY/REGION/SURFACE entities as exact B-rep (acis_read.h; R2013+ DWG
+        // data storage via dwg_native.h). Export writes solids/shells as ACIS 3DSOLID/BODY
+        // (DXF R2000, native DWG R2000 writer) and 2D bodies as lines/arcs
+        // (bodies_to_dxf_document). DWG 2D-entity import needs LibreDWG dwg2dxf (dwg.h).
+        {"dxf",    "AutoCAD DXF",         {".dxf"},          "brep",        true,  true},
+        {"dwg",    "AutoCAD DWG",         {".dwg"},          "brep",        true,  true},
+        // ACIS solids (AutoCAD ACISIN/ACISOUT, Inventor, SpaceClaim...): .sat text / .sab
+        // binary in; ACIS 7.0 .sat out.
+        {"sat",    "ACIS SAT",            {".sat", ".sab"},  "brep",        true,  true},
         // Proprietary — import is experimental (SolidWorks COM -> STEP); we never write
         // these, so can_export is false (export STEP instead).
         {"sldprt", "SolidWorks part",     {".sldprt"},       "proprietary", true,  false},
@@ -2431,6 +3056,153 @@ TopoDS_Shape mesh_to_shape(const MeshData& mesh) {
 
 // --------------------------------------------------------------------------- export
 
+namespace {
+
+// ---- DXF / DWG / SAT part export -------------------------------------------------------
+// Bodies become one DxfDocument shared by the DXF and DWG writers. Shell/solid geometry is
+// written as exact ACIS (3DSOLID for solids, BODY for open shells) that AutoCAD opens as
+// editable solids; curves that belong to no face — and every edge of a body without shells,
+// e.g. an imported 2D profile — as LINE, ARC/CIRCLE (planes parallel to XY) or tessellated
+// 3D line runs. Coordinates are written in `tess.units`.
+
+// `body` (mm) uniformly scaled into $INSUNITS `units`.
+TopoDS_Shape to_units(const TopoDS_Shape& body, int units) {
+    const double mm = insunits_mm(units);
+    if (mm == 1.0) return body;
+    gp_Trsf scale;
+    scale.SetScale(gp_Pnt(0, 0, 0), 1.0 / mm);
+    return BRepBuilderAPI_Transform(body, scale, Standard_True).Shape();
+}
+
+// The solids and shells of `body` (everything an ACIS body can hold) as one compound, and
+// whether it is closed (no shell outside a solid).
+TopoDS_Shape acis_part(const TopoDS_Shape& body, bool* solid) {
+    TopoDS_Compound comp;
+    BRep_Builder bb;
+    bb.MakeCompound(comp);
+    bool any = false;
+    *solid = true;
+    for (TopExp_Explorer ex(body, TopAbs_SOLID); ex.More(); ex.Next()) {
+        bb.Add(comp, ex.Current());
+        any = true;
+    }
+    for (TopExp_Explorer ex(body, TopAbs_SHELL, TopAbs_SOLID); ex.More(); ex.Next()) {
+        bb.Add(comp, ex.Current());
+        any = true;
+        *solid = false;
+    }
+    return any ? TopoDS_Shape(comp) : TopoDS_Shape();
+}
+
+void edge_to_dxf(const TopoDS_Edge& edge, const std::string& layer, const TessOptions& tess,
+                 DxfDocument& doc) {
+    if (BRep_Tool::Degenerated(edge)) return;
+    BRepAdaptor_Curve c(edge);
+    const double u0 = c.FirstParameter(), u1 = c.LastParameter();
+    auto xyz = [](const gp_Pnt& p) { return std::array<double, 3>{p.X(), p.Y(), p.Z()}; };
+    if (c.GetType() == GeomAbs_Line) {
+        const gp_Pnt a = c.Value(u0), b = c.Value(u1);
+        if (a.Distance(b) > 1e-9) doc.lines3.push_back({layer, xyz(a), xyz(b)});
+        return;
+    }
+    if (c.GetType() == GeomAbs_Circle) {
+        const gp_Circ circ = c.Circle();
+        const gp_Dir n = circ.Axis().Direction();
+        if (std::abs(n.Z()) > 1.0 - 1e-9) {
+            const gp_Pnt ctr = circ.Location();
+            DxfArc a;
+            a.layer = layer;
+            a.center = {ctr.X(), ctr.Y()};
+            a.z = ctr.Z();
+            a.radius = circ.Radius();
+            if (std::abs(u1 - u0 - 2.0 * kPi) < 1e-9) {
+                a.circle = true;
+            } else {
+                const gp_Pnt p0 = c.Value(u0), p1 = c.Value(u1);
+                const double d0 = std::atan2(p0.Y() - ctr.Y(), p0.X() - ctr.X()) * 180.0 / kPi;
+                const double d1 = std::atan2(p1.Y() - ctr.Y(), p1.X() - ctr.X()) * 180.0 / kPi;
+                // The parameter runs CCW about the circle axis: about -Z that is clockwise,
+                // so the CCW arc DXF expects goes the other way round.
+                a.start_deg = n.Z() > 0.0 ? d0 : d1;
+                a.end_deg = n.Z() > 0.0 ? d1 : d0;
+            }
+            doc.arcs.push_back(a);
+            return;
+        }
+        // Any other plane: the circle's axis is the entity extrusion, so the arc keeps its
+        // exact geometry; centre and angles are in that extrusion's Arbitrary Axis OCS, where
+        // the parameter runs CCW like DXF angles.
+        const gp_Mat to_ocs = dxf::ocs_matrix(n).Transposed();
+        const gp_XYZ ctr = to_ocs * circ.Location().XYZ();
+        DxfArc a;
+        a.layer = layer;
+        a.center = {ctr.X(), ctr.Y()};
+        a.z = ctr.Z();
+        a.radius = circ.Radius();
+        a.normal = {n.X(), n.Y(), n.Z()};
+        if (std::abs(u1 - u0 - 2.0 * kPi) < 1e-9) {
+            a.circle = true;
+        } else {
+            const gp_XYZ p0 = to_ocs * c.Value(u0).XYZ(), p1 = to_ocs * c.Value(u1).XYZ();
+            a.start_deg = std::atan2(p0.Y() - ctr.Y(), p0.X() - ctr.X()) * 180.0 / kPi;
+            a.end_deg = std::atan2(p1.Y() - ctr.Y(), p1.X() - ctr.X()) * 180.0 / kPi;
+        }
+        doc.arcs.push_back(a);
+        return;
+    }
+    double deflection = tess.lin_deflection;
+    if (tess.relative) deflection *= std::max(1e-6, GCPnts_AbscissaPoint::Length(c, u0, u1));
+    GCPnts_TangentialDeflection pts(c, u0, u1, tess.ang_deflection, deflection);
+    for (int k = 1; k < pts.NbPoints(); ++k) {
+        const gp_Pnt a = pts.Value(k), b = pts.Value(k + 1);
+        if (a.Distance(b) > 1e-9) doc.lines3.push_back({layer, xyz(a), xyz(b)});
+    }
+}
+
+DxfDocument bodies_to_dxf_document(const std::vector<TopoDS_Shape>& bodies,
+                                   const TessOptions& tess) {
+    DxfDocument doc;
+    doc.insunits = tess.units;
+    // Chord tolerances are millimetres; the written curves are in `units`.
+    TessOptions curve_tess = tess;
+    if (!tess.relative) curve_tess.lin_deflection /= insunits_mm(tess.units);
+    SatWriteOptions sat;
+    sat.version = 400;  // the ACIS version AutoCAD embeds in R2000 DWG/DXF
+    sat.mm_per_unit = insunits_mm(tess.units);
+    std::size_t live = 0;
+    for (const TopoDS_Shape& b : bodies) live += b.IsNull() ? 0 : 1;
+    std::size_t index = 0;
+    for (const TopoDS_Shape& source : bodies) {
+        if (source.IsNull()) continue;
+        const TopoDS_Shape body = to_units(source, tess.units);
+        const std::string layer = live > 1 ? "BODY" + std::to_string(++index) : std::string("0");
+        if (live > 1) doc.add_layer(layer, 7);
+        bool solid = false;
+        const TopoDS_Shape part = acis_part(body, &solid);
+        if (!part.IsNull()) {
+            try {
+                doc.acis.push_back({layer, write_sat(part, sat), solid, sat.version});
+            } catch (const std::exception& e) {
+                throw OpError("export_failed",
+                              "body " + std::to_string(index == 0 ? 1 : index) +
+                                  " cannot be written as ACIS: " + e.what(),
+                              {{"reason", "acis_write"}});
+            }
+        }
+        // Every edge the ACIS body does not carry (free curves, loose 2D profile faces).
+        TopTools_IndexedMapOfShape carried;
+        if (!part.IsNull()) TopExp::MapShapes(part, TopAbs_EDGE, carried);
+        TopTools_IndexedMapOfShape edges;
+        TopExp::MapShapes(body, TopAbs_EDGE, edges);
+        for (int i = 1; i <= edges.Extent(); ++i)
+            if (!carried.Contains(edges(i)))
+                edge_to_dxf(TopoDS::Edge(edges(i)), layer, curve_tess, doc);
+    }
+    return doc;
+}
+
+}  // namespace
+
 std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::string& path,
                           const std::string& fmt, const TessOptions& tess) {
     if (bodies.empty())
@@ -2628,6 +3400,53 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
                           {{"format", fmt}, {"reason", "openNURBS not provisioned"}});
 #endif
         }
+        if (fmt == "sat") {
+            // ACIS 7.0 text, one ACIS body per body with faces (AutoCAD ACISIN / IMPORT makes
+            // one 3DSOLID each). Face-less bodies (2D profiles) have no ACIS form here.
+            std::vector<TopoDS_Shape> parts;
+            for (const TopoDS_Shape& b : bodies) {
+                if (b.IsNull()) continue;
+                bool solid = false;
+                const TopoDS_Shape part = acis_part(to_units(b, tess.units), &solid);
+                if (!part.IsNull()) parts.push_back(part);
+            }
+            if (parts.empty())
+                throw OpError("export_failed",
+                              "SAT export: no body has faces (2D profiles go to DXF/DWG)",
+                              {{"path", out}, {"format", fmt}});
+            SatWriteOptions opt;
+            opt.version = 700;
+            opt.mm_per_unit = insunits_mm(tess.units);
+            std::string text;
+            try {
+                text = write_sat_bodies(parts, opt);
+            } catch (const std::exception& e) {
+                throw OpError("export_failed", std::string("SAT export: ") + e.what(),
+                              {{"path", out}, {"format", fmt}});
+            }
+            const std::filesystem::path staged = out + ".partial";
+            {
+                std::ofstream os(staged, std::ios::binary | std::ios::trunc);
+                os.write(text.data(), static_cast<std::streamsize>(text.size()));
+                if (!os.flush())
+                    throw OpError("export_failed", "SAT export: write failed",
+                                  {{"path", out}, {"format", fmt}});
+            }
+            std::error_code ec;
+            std::filesystem::rename(staged, out, ec);
+            if (ec)
+                throw OpError("export_failed", "SAT export: cannot move into place: " + ec.message(),
+                              {{"path", out}, {"format", fmt}});
+            return out;
+        }
+        if (fmt == "dxf" || fmt == "dwg") {
+            const DxfDocument doc = bodies_to_dxf_document(bodies, tess);
+            try {
+                return fmt == "dxf" ? write_dxf(out, doc) : write_dwg(out, doc);
+            } catch (const std::runtime_error& e) {
+                throw OpError("export_failed", e.what(), {{"format", fmt}, {"path", out}});
+            }
+        }
     } catch (const OpError&) {
         throw;
     } catch (const std::exception& e) {
@@ -2695,7 +3514,9 @@ TopoDS_Shape place_solidworks_body(const TopoDS_Shape& shape,
 }  // namespace
 
 std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(
-    const std::string& path, const std::string& fmt, std::vector<std::string>* warnings) {
+    const std::string& path, const std::string& fmt, std::vector<std::string>* warnings,
+    int* source_units) {
+    if (source_units) *source_units = 0;
     if (!std::filesystem::exists(path))
         throw OpError("import_failed", "import: file not found: " + path, {{"path", path}});
     try {
@@ -2882,15 +3703,27 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(
 #endif
         }
         if (fmt == "dxf") {
-            // 2D lane: one Compound body (faces + free wires), no split_import_bodies — a DXF
-            // profile has no solids, and splitting would silently drop the free wires.
-            TopoDS_Shape shape = read_dxf_shape(path);
-            std::string stem = std::filesystem::path(path).stem().string();
-            return {{stem.empty() ? std::string("dxf") : stem, shape}};
+            // The 2D profile stays one Compound body (faces + free wires; splitting would drop
+            // the free wires); 3D mesh entities add one body per layer; each ACIS entity
+            // (inline SAT, or SAB in the R2013+ ACDSDATA section) is its own body.
+            return dxf_bodies(path, path, "dxf", warnings, source_units);
         }
+        if (fmt == "sat") return sat_bodies(path, warnings, source_units);
         if (fmt == "dwg") {
-            // DWG has no in-process reader here (proprietary binary) — run LibreDWG's
-            // dwg2dxf with literal argv, then reuse the DXF lane above.
+            // 2D entities: LibreDWG dwg2dxf (literal argv), then the DXF lane. ACIS bodies of
+            // R2013+ files live in the DWG data storage, which dwg2dxf drops; the native reader
+            // supplies them by entity handle. A data storage it cannot read leaves the 2D
+            // import intact and names the loss.
+            DwgNativeInfo native;
+            try {
+                native = read_dwg_native(path);
+            } catch (const std::exception& e) {
+                native.warnings.push_back(std::string("the DWG ACIS data storage could not be "
+                                                      "read (") + e.what() +
+                                          "); 3D solids may be missing");
+            }
+            if (libredwg_tool("dwg2dxf").empty() && !native.acis.empty())
+                return dwg_native_only_bodies(native, path, warnings, source_units);
             std::string tmp_dxf = dwg_to_temp_dxf(path);
             struct TempDxfCleanup {
                 const std::string& path;
@@ -2899,9 +3732,7 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(
                     std::filesystem::remove(path, ec);
                 }
             } cleanup{tmp_dxf};
-            TopoDS_Shape shape = read_dxf_shape(tmp_dxf);
-            std::string stem = std::filesystem::path(path).stem().string();
-            return {{stem.empty() ? std::string("dwg") : stem, shape}};
+            return dxf_bodies(tmp_dxf, path, "dwg", warnings, source_units, &native);
         }
     } catch (const OpError&) {
         throw;

@@ -592,7 +592,12 @@ def _rpc_result(line: str, result: Mapping[str, Any]) -> str:
 # address only documents it minted/opened itself, or documents whose canonical
 # saved path proves they belong to the authenticated account.
 _DOC_ID_KEYS = frozenset({"doc_id", "document_id", "source_doc_id", "target_doc_id"})
-_DOC_MINT_METHODS = frozenset({"doc_new", "doc_open", "doc_import", "doc_import_file"})
+# `import_file` is the daemon wire name of doc_import_file: without `into` it mints
+# a new document (the import lane for STEP/IGES/DWG/DXF/SAT/mesh files), so the
+# caller must be granted the doc it gets back exactly like doc_open.
+_DOC_MINT_METHODS = frozenset(
+    {"doc_new", "doc_open", "import_file", "doc_import", "doc_import_file"}
+)
 
 
 def _collect_doc_ids(node: Any, found: list[str]) -> None:
@@ -614,7 +619,13 @@ def _request_doc_ids(line: str) -> set[str]:
         return set()
     found: list[str] = []
     if isinstance(message, dict):
-        _collect_doc_ids(message.get("params"), found)
+        params = message.get("params")
+        _collect_doc_ids(params, found)
+        # A top-level `into` names the TARGET document of import_file and
+        # vendor_part_insert; importing into another account's doc is a write to it.
+        into = params.get("into") if isinstance(params, dict) else None
+        if isinstance(into, str) and into:
+            found.append(into)
     return set(found)
 
 

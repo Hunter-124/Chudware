@@ -1949,17 +1949,19 @@ struct AppState {
     bool requestSaveAs     = false;   // File > Save As... / Ctrl+Shift+S
     std::string requestOpenPath;      // File > Recent <path> (open this exact path next pump)
     // Wave-5-fill: File > Export <fmt> sets requestExportFormat to one of the export_file format
-    // strings ("step"|"iges"|"stl"|"3mf"|"brep"); the GL-thread pump drains it (native Save-As +
-    // DocMirror::exportFile) so the dialog never re-enters the ImGui menu walk. File > Save All sets
-    // requestSaveAll; the pump iterates docTabs and saves each saveable doc.
+    // strings ("step"|"iges"|"brep"|"stl"|"obj"|"ply"|"3mf"|"gltf"|"glb"|"dxf"|"dwg"); the
+    // GL-thread pump drains it (native Save-As + DocMirror::exportFile) so the dialog never
+    // re-enters the ImGui menu walk. File > Save All sets requestSaveAll; the pump iterates
+    // docTabs and saves each saveable doc.
     std::string requestExportFormat;  // File > Export <fmt> (export the active doc next pump)
     bool requestSaveAll = false;      // File > Save All (save every saveable doc next pump)
 
-    // Mesh-export tessellation dialog. File > Export of a MESH format (stl/obj/ply/3mf/
-    // gltf/glb) opens this modal first (instead of going straight to requestExportFormat)
-    // so the user picks a quality preset / fine-tunes deflection before the Save-As. On
-    // confirm, the chosen options are stashed here and requestExportFormat is set for the
-    // GL-thread pump to consume. B-rep formats (step/iges/brep) bypass the dialog.
+    // Mesh-export tessellation dialog. File > Export of a TESSELLATED format (stl/obj/ply/3mf/
+    // gltf/glb, and dxf/dwg whose free non-analytic curves are tessellated) opens this modal first
+    // (instead of going straight to requestExportFormat) so the user picks a quality preset /
+    // fine-tunes deflection before the Save-As. On confirm, the chosen options are stashed here and
+    // requestExportFormat is set for the GL-thread pump to consume. B-rep formats (step/iges/brep)
+    // bypass the dialog.
     struct ExportTessDialog {
         bool open = false;            // modal visible this frame
         std::string fmt;              // pending mesh format

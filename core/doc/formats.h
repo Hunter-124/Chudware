@@ -62,9 +62,13 @@ bool solidworks_available();
 // "Save As STEP" message when SolidWorks/COM is unavailable or the automation fails.
 std::string sw_export_step(const std::string& src_path);
 
-// Convert a DWG through the external LibreDWG converter. Public only so the focused native
+// Convert a DWG through LibreDWG's `dwg2dxf` (dwg.h). Public only so the focused native
 // boundary test can verify literal argv handling; callers normally use import_bodies.
 std::string dwg_to_temp_dxf(const std::string& path);
+
+// Number of ENTITIES-section entities in an ASCII DXF (block definitions excluded). The DWG
+// writer uses it to prove a written file re-reads completely.
+std::size_t dxf_entity_count(const std::string& path);
 
 // A raw triangle-soup mesh (the C++ analogue of engine/doc/mesh_body.py::MeshBody used
 // only internally by the mesh readers/writers — the public body model stays TopoDS).
@@ -89,7 +93,16 @@ struct TessOptions {
     double ang_deflection = 0.35;  // max normal deviation, radians
     bool relative = false;         // scale linear deflection by each edge size (size-robust)
     bool ascii = false;            // STL only: ASCII vs binary container
+    int units = 4;                 // dxf/dwg/sat: $INSUNITS code of the written coordinates
 };
+
+// Millimetres per unit of a DXF $INSUNITS code (0 = unitless counts as mm). Throws
+// OpError("invalid_op") on an unknown code.
+double insunits_mm(int code);
+
+// "mm" | "in" | "ft" | "cm" | "m" | "um" | "mil" | "dm" (or a numeric code) -> $INSUNITS code.
+// Throws OpError("invalid_op") naming the accepted values.
+int parse_units(const std::string& units);
 
 // Tessellate a TopoDS_Shape (solid or shell) into a triangle soup at the given
 // tessellation quality (defaults to 0.05mm linear / 0.35rad angular). Used by the mesh
@@ -122,7 +135,10 @@ std::vector<std::pair<std::string, MeshData>> read_mesh_raw(const std::string& p
 TopoDS_Shape mesh_to_shape(const MeshData& mesh);
 
 // Write surviving solid and non-solid bodies to `path` in `fmt`. Supported: step, iges,
-// brep, stl, obj, ply, gltf, glb (mesh formats tessellate at the Python defaults).
+// brep, stl, obj, ply, gltf, glb, 3mf, 3dm, dxf, dwg, sat (mesh formats tessellate at `tess`).
+// DXF/DWG write solid/shell bodies as editable ACIS 3DSOLID/BODY entities (DXF R2000, DWG
+// R2000) and 2D/wire bodies as LINE/ARC/CIRCLE/polylines, one layer per body when there are
+// several; SAT writes ACIS 7.0 text. These three write coordinates in `tess.units`.
 // Bodies are merged into one compound for the B-rep writers (mirrors formats.py::
 // _shapes_to_export_list). Throws OpError("export_failed") on an unsupported format or
 // a writer failure. Returns the absolute path written.
@@ -131,16 +147,21 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies,
                           const TessOptions& tess = TessOptions{});
 
 // Read solid and non-solid bodies from `path`. Supported: step (multi-body), iges (sewn+healed),
-// brep, mesh formats stl/obj/ply/gltf/glb/3mf/3dm (sewn into a shell/solid), and
+// brep, mesh formats stl/obj/ply/gltf/glb/3mf/3dm (sewn into a shell/solid),
+// dxf/dwg (one 2D profile body of faces + wires, one mesh body per layer of
+// 3DFACE/POLYFACE/mesh entities, and one exact B-rep body per ACIS 3DSOLID/BODY/REGION/
+// SURFACE entity; INSERT blocks expanded), sat (ACIS .sat/.sab) and
 // modern sldprt/sldasm saved-display tessellations. Returns (name, shape) pairs in file
 // order; SolidWorks assemblies retain flattened hierarchy/instance path names and world
 // transforms. Partial STEP/IGES transfer returns surviving bodies only when `warnings`
 // is supplied; otherwise it refuses rather than silently losing source roots.
+// `source_units` (optional) receives the file's drawing units as a DXF $INSUNITS code
+// (1 inch, 4 mm, ...) for dxf/dwg/sat, 0 when unknown or another format.
 // Throws OpError("import_failed") on an unsupported format, malformed stream,
 // unavailable optional dependency, or empty result. x_t/x_b must route through COM -> STEP.
 std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(
     const std::string& path, const std::string& fmt,
-    std::vector<std::string>* warnings = nullptr);
+    std::vector<std::string>* warnings = nullptr, int* source_units = nullptr);
 
 // Keep solid body ordinals stable, then append uncovered non-solid remnants.
 // Shapes without solids retain their existing whole-shape grouping.

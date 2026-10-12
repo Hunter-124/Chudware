@@ -205,6 +205,7 @@ SOURCE_EXTENSIONS: Final = (
     ".x_t",
     ".x_b",
     ".sat",
+    ".sab",
     ".dwg",
     ".dxf",
     ".pdf",

@@ -132,6 +132,7 @@
 #include "doc/document.h"
 #include "doc/recon.h"    // C1/C2 WS-C reverse-engineering kernel primitives
 #include "doc/formats.h"
+#include "doc/dwg.h"     // libredwg_tool: a written DWG is re-read through dwg2dxf
 #include "doc/picks.h"
 #include "doc/selectors.h"
 #include "doc/sketch_geom.h"
@@ -15183,14 +15184,36 @@ json doc_push_pull(const std::string& doc_id, int body_id, int topo_id, double d
     return out;
 }
 
+// The unit an AutoCAD-format export writes when the caller names none: the drawing units of
+// the document's first DWG/DXF/SAT import (so a revision goes back in its author's units),
+// else millimetres.
+static int default_export_units(const Session& s) {
+    if (s.doc.contains("features") && s.doc["features"].is_array())
+        for (const json& f : s.doc["features"]) {
+            if (!f.is_object() || f.value("type", std::string()) != "import") continue;
+            const json params = f.value("params", json::object());
+            if (params.is_object() && params.contains("source_units") &&
+                params["source_units"].is_number_integer())
+                return params["source_units"].get<int>();
+        }
+    return 4;
+}
+
 json doc_export_file(const std::string& doc_id, const std::string& path, const std::string& fmt,
-                     double lin_deflection, double ang_deflection, bool relative, bool ascii) {
+                     double lin_deflection, double ang_deflection, bool relative, bool ascii,
+                     const std::string& units) {
     DocLock lk;
     Session& s = require_session(doc_id);
     if (path.empty())
         throw OpError("invalid_op", "export_file: 'path' is required", {{"reason", "missing path"}});
     if (fmt.empty())
         throw OpError("invalid_op", "export_file: 'format' is required", {{"reason", "missing format"}});
+    const bool acis_fmt = fmt == "dxf" || fmt == "dwg" || fmt == "sat";
+    if (!units.empty() && !acis_fmt)
+        throw OpError("invalid_op",
+                      "export_file: 'units' applies to dxf/dwg/sat only (" + fmt +
+                          " is written in millimetres)",
+                      {{"format", fmt}, {"units", units}});
     json components;
     std::vector<TopoDS_Shape> shapes = gather_export_shapes(s, &components);
     if (shapes.empty())
@@ -15201,6 +15224,7 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
     if (ang_deflection > 0.0) tess.ang_deflection = ang_deflection;
     tess.relative = relative;
     tess.ascii = ascii;
+    tess.units = units.empty() ? default_export_units(s) : parse_units(units);
     // Count the ACTUAL solids handed to the writer (Issue 3). A single body can be a COMPOUND
     // of disjoint lumps (a boolean result), so the body count understates how many solids a
     // re-read recovers — which made the round-trip check report a misleading "3/1 solids" for
@@ -15227,7 +15251,62 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
 
     json meta{{"path", out}, {"format", fmt}, {"bytes", static_cast<double>(bytes)},
               {"expected_solids", static_cast<int>(expected_solids)}};
+    if (acis_fmt) meta["units"] = tess.units;
     if (s.is_assembly()) meta["components"] = std::move(components);
+
+    // DXF / DWG / SAT carry exact ACIS solids: re-read them with the ACIS reader and require
+    // the same solids (count, validity, volume) back, so a writer defect fails here rather
+    // than in the recipient's AutoCAD. A DWG's solids are re-read natively; a 2D-only DWG
+    // needs LibreDWG dwg2dxf, without which the check is reported as skipped.
+    if (acis_fmt) {
+        auto solid_stats = [](const TopoDS_Shape& shape, std::size_t* n, std::size_t* valid,
+                              double* volume) {
+            for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next()) {
+                ++*n;
+                if (BRepCheck_Analyzer(ex.Current()).IsValid()) ++*valid;
+                GProp_GProps props;
+                BRepGProp::VolumeProperties(ex.Current(), props);
+                *volume += std::abs(props.Mass());
+            }
+        };
+        std::size_t want = 0, want_valid = 0;
+        double want_volume = 0.0;
+        for (const TopoDS_Shape& b : shapes)
+            if (!b.IsNull()) solid_stats(b, &want, &want_valid, &want_volume);
+        // Without dwg2dxf a DWG re-read yields its ACIS solids natively (dwg_native.h), so only a
+        // solid-free (2D) DWG cannot be re-read here.
+        if (fmt == "dwg" && want == 0 && libredwg_tool("dwg2dxf").empty()) {
+            meta["validated"] = false;
+            meta["validation_skipped"] = "re-reading a 2D-only DWG needs LibreDWG dwg2dxf";
+        } else {
+            std::size_t got = 0, got_valid = 0;
+            double got_volume = 0.0;
+            try {
+                for (const auto& nb : import_bodies(out, fmt))
+                    if (!nb.second.IsNull()) solid_stats(nb.second, &got, &got_valid, &got_volume);
+            } catch (const std::exception& e) {
+                throw OpError("export_failed",
+                              "export_file: " + out + " failed ACIS round-trip validation: " +
+                                  e.what(),
+                              {{"path", out}, {"format", fmt}});
+            }
+            const double tol = 1e-6 * std::max(1.0, want_volume);
+            meta["solid_count"] = static_cast<int>(got);
+            meta["valid_solids"] = static_cast<int>(got_valid);
+            // An already-invalid source solid may stay invalid; never lose validity.
+            meta["validated"] = got == want && got_valid >= want_valid &&
+                                std::abs(got_volume - want_volume) <= tol;
+            if (!meta["validated"].get<bool>())
+                throw OpError("export_failed",
+                              "export_file: wrote " + out + " but re-reading it recovered " +
+                                  std::to_string(got) + "/" + std::to_string(want) + " solids (" +
+                                  std::to_string(got_valid) + " valid, volume " +
+                                  std::to_string(got_volume) + " vs " + std::to_string(want_volume) +
+                                  " mm^3) — the ACIS data is malformed",
+                              {{"path", out}, {"format", fmt}});
+        }
+        return meta;
+    }
 
     // Round-trip B-rep formats: re-read with the SAME kernel and confirm the solids survived and
     // are topologically valid BEFORE returning success. This catches the "STEP/IGES won't open"
@@ -15239,18 +15318,34 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
     if (is_brep_fmt) {
         try {
             auto reread = import_bodies(out, (f == "stp") ? "step" : (f == "igs") ? "iges" : f);
-            std::size_t valid = 0;
-            for (const auto& nb : reread)
-                if (!nb.second.IsNull() && BRepCheck_Analyzer(nb.second).IsValid()) ++valid;
-            meta["solid_count"] = static_cast<int>(reread.size());
+            // With solids in the export, compare SOLIDS: the re-read splits non-solid remnants
+            // (a drawing profile's faces and construction wires) into several bodies, so a
+            // body count would reject a correct file. Without solids, compare bodies.
+            std::size_t src_solids = 0;
+            for (const TopoDS_Shape& b : shapes)
+                if (!b.IsNull())
+                    for (TopExp_Explorer ex(b, TopAbs_SOLID); ex.More(); ex.Next()) ++src_solids;
+            std::size_t got = 0, valid = 0;
+            if (src_solids > 0) {
+                for (const auto& nb : reread)
+                    if (!nb.second.IsNull())
+                        for (TopExp_Explorer ex(nb.second, TopAbs_SOLID); ex.More(); ex.Next()) {
+                            ++got;
+                            if (BRepCheck_Analyzer(ex.Current()).IsValid()) ++valid;
+                        }
+            } else {
+                got = reread.size();
+                for (const auto& nb : reread)
+                    if (!nb.second.IsNull() && BRepCheck_Analyzer(nb.second).IsValid()) ++valid;
+            }
+            const std::size_t want = src_solids > 0 ? src_solids : expected_solids;
+            meta["solid_count"] = static_cast<int>(got);
             meta["valid_solids"] = static_cast<int>(valid);
-            const bool count_ok = reread.size() == expected_solids;
-            meta["validated"] = (count_ok && valid == reread.size() && !reread.empty());
+            meta["validated"] = got == want && valid == got && got > 0;
             if (!meta["validated"].get<bool>())
                 throw OpError("export_failed",
                               "export_file: wrote " + out + " but re-reading it recovered " +
-                                  std::to_string(reread.size()) + "/" +
-                                  std::to_string(expected_solids) + " solids (" +
+                                  std::to_string(got) + "/" + std::to_string(want) + " solids (" +
                                   std::to_string(valid) + " valid) — the file is incomplete or "
                                   "malformed and would not open elsewhere",
                               {{"path", out}, {"format", fmt}});
@@ -15423,7 +15518,11 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
     // feature path-only (the compiler will then read the source as before).
     std::vector<std::string> import_warnings;
     try {
-        auto bodies = import_bodies(import_path_, f, &import_warnings);
+        int source_units = 0;
+        auto bodies = import_bodies(import_path_, f, &import_warnings, &source_units);
+        // DWG/DXF/SAT drawing units: exports back to those formats default to them, so a
+        // revision returns to its author in the unit system they drew in.
+        if (source_units > 0) params["source_units"] = source_units;
         TopoDS_Compound comp;
         BRep_Builder bb;
         bb.MakeCompound(comp);

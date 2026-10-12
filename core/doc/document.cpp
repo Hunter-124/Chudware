@@ -4237,7 +4237,25 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     if (cit != import_cache.end()) {
                         solids = cit->second;  // SHARE the cached TShape(s) across identical imports
                     } else {
-                        solids = split_import_bodies(brep_b64_to_shape(embedded));
+                        // DXF/DWG/SAT imports bake one compound child per imported body
+                        // (`embedded_bodies` of them): keep that grouping, as the source
+                        // re-read below does, so a drawing's 2D profile (faces + construction
+                        // wires) stays one body beside its ACIS solids instead of splitting
+                        // into face-less wire bodies. Other formats split into solids +
+                        // remnants as before.
+                        const TopoDS_Shape baked = brep_b64_to_shape(embedded);
+                        const std::string bfmt = str_field(feat, "format", "");
+                        const auto nit = feat.find("embedded_bodies");
+                        const long long baked_n =
+                            nit != feat.end() && nit->is_number_integer() ? nit->get<long long>() : -1;
+                        std::vector<TopoDS_Shape> children;
+                        if ((bfmt == "dxf" || bfmt == "dwg" || bfmt == "sat") && !baked.IsNull() &&
+                            baked.ShapeType() == TopAbs_COMPOUND)
+                            for (TopoDS_Iterator it(baked); it.More(); it.Next())
+                                children.push_back(it.Value());
+                        solids = baked_n > 0 && static_cast<long long>(children.size()) == baked_n
+                                     ? children
+                                     : split_import_bodies(baked);
                         import_cache.emplace(emb_key, solids);
                     }
                 }
@@ -9280,7 +9298,13 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         !std::holds_alternative<SolidResult>(*rit->second))
                         continue;
                     const TopoDS_Shape& sh = std::get<SolidResult>(*rit->second).shape;
-                    if (sh.IsNull() || ::geom::shape_face_count(sh) == 0)
+                    // An import may legitimately carry reference curves/points (a STEP's
+                    // construction wires, a DXF of open lines): face-less but not empty.
+                    const bool imported_reference =
+                        type == "import" && !sh.IsNull() &&
+                        (TopExp_Explorer(sh, TopAbs_EDGE).More() ||
+                         TopExp_Explorer(sh, TopAbs_VERTEX).More());
+                    if (sh.IsNull() || (::geom::shape_face_count(sh) == 0 && !imported_reference))
                         fail_backstop(
                             type + " produced an empty/degenerate body (no geometry) — "
                             "refusing to commit a null result that would leave the "

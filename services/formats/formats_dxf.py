@@ -22,8 +22,8 @@ Pipeline
 4. Return a single ``(stem, Compound)`` body containing all faces + free wires (one file = one
    body, mirroring the mesh importers).
 
-Scope (v1): **import only** — DXF is not written back (2D-projection-from-3D export is a separate
-follow-up). Curves are flattened, not preserved as exact NURBS. ``$INSUNITS`` scales geometry
+Scope: this Python module **imports only**; DXF writing is the native engine's ``export_file``
+(format ``dxf``). Curves are flattened, not preserved as exact NURBS. ``$INSUNITS`` scales geometry
 into millimetres; unset/unitless drawings retain their coordinates. rhino3dm/OCCT NURBS fidelity
 is out of scope here.
 

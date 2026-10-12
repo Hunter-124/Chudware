@@ -1095,6 +1095,7 @@ static const char* ribbon_tipFor(const char* cmd_id) {
         {"dwg_fit",           "Fit the sheet to the window."},
         {"dwg_export_dxf",    "Export the drawing sheet to DXF."},
         {"dwg_export_pdf",    "Export the drawing sheet to PDF."},
+        {"dwg_export_dwg",    "Export the drawing sheet to AutoCAD DWG."},
         {"dwg_section_half",  "Create a half-section view."},
         {"dwg_section_reverse","Flip the section cut direction."},
         {"dwg_scale_1_1",     "Set the selected view scale to 1:1."},

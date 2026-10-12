@@ -1650,11 +1650,12 @@ static void applyFlatPattern(AppState &st) {
       });
 }
 
-// W14: export the ACTIVE sheet-metal part's flat pattern to DXF (outline on
-// layer OUTLINE, bend lines on layer BEND). One-click Sheet Metal command (no
-// PM form) — picks a path (native Save-As, or cwd fallback when dialogs are
-// disabled) then calls export_flat_dxf via DocMirror. The engine computes the
-// flat (fresh compile) and errors cleanly if the part has no flat pattern.
+// W14: export the ACTIVE sheet-metal part's flat pattern to DXF/DWG/PDF
+// (outline on layer OUTLINE, bend lines on layer BEND). One-click Sheet Metal
+// command (no PM form) — picks a path (native Save-As, or cwd fallback when
+// dialogs are disabled) then calls export_flat_dxf via DocMirror. The engine
+// computes the flat (fresh compile) and errors cleanly if the part has no flat
+// pattern.
 static void exportFlatDxf(AppState &st) {
   if (!st.docMirror.hasDoc()) {
     st.toast(ui::ToastLevel::Info, "Open a sheet metal part first");
@@ -1681,13 +1682,13 @@ static void exportFlatDxf(AppState &st) {
   if (dialogsDisabled) {
     path = (std::filesystem::current_path() / (base + ".dxf")).string();
   } else {
-    const char *filter =
-        "DXF (*.dxf)\0*.dxf\0PDF (*.pdf)\0*.pdf\0All files (*.*)\0*.*\0";
+    const char *filter = "DXF (*.dxf)\0*.dxf\0AutoCAD DWG (*.dwg)\0*.dwg\0PDF "
+                         "(*.pdf)\0*.pdf\0All files (*.*)\0*.*\0";
     path = ui::saveFileDialog(filter, "dxf", (base + ".dxf").c_str());
     if (path.empty())
       return; // canceled
   }
-  // Format follows the chosen extension (export_flat_dxf accepts dxf|pdf;
+  // Format follows the chosen extension (export_flat_dxf accepts dxf|dwg|pdf;
   // defaults to the ext).
   std::string fmt = "dxf";
   if (path.size() >= 4) {
@@ -1696,6 +1697,8 @@ static void exportFlatDxf(AppState &st) {
       ch = (char)std::tolower((unsigned char)ch);
     if (tail == ".pdf")
       fmt = "pdf";
+    else if (tail == ".dwg")
+      fmt = "dwg";
   }
 
   std::string err;
@@ -1843,13 +1846,13 @@ static bool cmdFlatDxf(AppState &st, const std::string &cmd) {
 }
 
 // Wave-5-fill / F4: File > Export <fmt> — export the ACTIVE part/assembly's
-// bodies to a 3D format engine.doc.formats.export_document accepts
-// ("step"|"iges"|"stl"|"3mf"|"brep"|"obj"|"ply"|"gltf"| "glb"; see
-// engine/doc/formats.py FORMAT_REGISTRY / doc_formats RPC). Picks a path
-// (native Save-As, or a cwd fallback when dialogs are disabled) then calls
-// export_file via DocMirror. Mirrors exportFlatDxf's shape. Called only from
-// the GL-thread request pump (the menu sets st.requestExportFormat) so the
-// native dialog never re-enters an ImGui menu walk.
+// bodies to a format export_file accepts ("step"|"iges"|"brep"|"sat"|"stl"|"obj"|
+// "ply"|"3mf"|"gltf"|"glb"|"dxf"|"dwg"; the registry is core/doc/formats.cpp
+// format_registry(), reported by the doc_formats RPC). Picks a path (native
+// Save-As, or a cwd fallback when dialogs are disabled) then calls export_file
+// via DocMirror. Mirrors exportFlatDxf's shape. Called only from the GL-thread
+// request pump (the menu sets st.requestExportFormat) so the native dialog
+// never re-enters an ImGui menu walk.
 static void exportFile3d(AppState &st, const std::string &fmt) {
   if (!st.docMirror.hasDoc()) {
     st.toast(ui::ToastLevel::Info, "Open a part or assembly first");
@@ -1870,6 +1873,9 @@ static void exportFile3d(AppState &st, const std::string &fmt) {
   } else if (fmt == "brep") {
     ext = "brep";
     filter = "BREP (*.brep)\0*.brep\0All files (*.*)\0*.*\0";
+  } else if (fmt == "sat") {
+    ext = "sat";
+    filter = "ACIS SAT (*.sat)\0*.sat\0All files (*.*)\0*.*\0";
   } else if (fmt == "obj") {
     ext = "obj";
     filter = "OBJ (*.obj)\0*.obj\0All files (*.*)\0*.*\0";
@@ -1882,6 +1888,12 @@ static void exportFile3d(AppState &st, const std::string &fmt) {
   } else if (fmt == "glb") {
     ext = "glb";
     filter = "glTF binary (*.glb)\0*.glb\0All files (*.*)\0*.*\0";
+  } else if (fmt == "dxf") {
+    ext = "dxf";
+    filter = "AutoCAD DXF (*.dxf)\0*.dxf\0All files (*.*)\0*.*\0";
+  } else if (fmt == "dwg") {
+    ext = "dwg";
+    filter = "AutoCAD DWG (*.dwg)\0*.dwg\0All files (*.*)\0*.*\0";
   }
 
   // Suggested base name from the doc title (alnum/_/-, spaces -> _).
@@ -1909,16 +1921,18 @@ static void exportFile3d(AppState &st, const std::string &fmt) {
       return; // canceled
   }
 
-  // Mesh formats carry the dialog's tessellation choice; B-rep formats ignore
-  // it.
+  // Tessellated formats carry the dialog's tessellation choice (DXF/DWG write
+  // solids as ACIS and use it only for curves ACIS cannot express); B-rep
+  // formats (incl. SAT) ignore it. ASCII is STL-only.
   const bool meshFmt = (fmt == "stl" || fmt == "obj" || fmt == "ply" ||
-                        fmt == "3mf" || fmt == "gltf" || fmt == "glb");
+                        fmt == "3mf" || fmt == "gltf" || fmt == "glb" ||
+                        fmt == "dxf" || fmt == "dwg");
   const double linDef = meshFmt ? (double)st.exportTess.linDeflection : 0.05;
   const double angDef = meshFmt ? (double)st.exportTess.angDeflectionDeg *
                                       3.14159265358979 / 180.0
                                 : 0.35;
   const bool relDef = meshFmt && st.exportTess.relative;
-  const bool asciiStl = meshFmt && st.exportTess.ascii;
+  const bool asciiStl = fmt == "stl" && st.exportTess.ascii;
 
   std::string err;
   std::string written =
@@ -1957,14 +1971,15 @@ static bool dropPathHasKnownExt(const std::string &path) {
   std::string ext = std::filesystem::path(path).extension().string();
   std::transform(ext.begin(), ext.end(), ext.begin(),
                  [](unsigned char c) { return (char)std::tolower(c); });
-  // F4: every importable 3D format (see engine/doc/formats.py FORMAT_REGISTRY /
-  // doc_formats RPC) plus the ECAD/KiCad family and the 2D DXF/DWG lane. The
-  // GL-thread pump branches CAD vs ECAD by extension.
+  // F4: every importable 3D format (see core/doc/formats.cpp format_registry()
+  // / doc_formats RPC) plus the ECAD/KiCad family, the AutoCAD DXF/DWG lane and
+  // ACIS .sat/.sab. The GL-thread pump branches CAD vs ECAD by extension.
   return ext == ".draw+" || ext == ".step+" || ext == ".step" ||
          ext == ".stp" || ext == ".iges" || ext == ".igs" ||
          ext == ".brep" || ext == ".stl" || ext == ".3mf" ||
          ext == ".obj" || ext == ".ply" || ext == ".gltf" || ext == ".glb" ||
-         ext == ".3dm" || ext == ".dxf" || ext == ".dwg" || ext == ".sldprt" ||
+         ext == ".3dm" || ext == ".dxf" || ext == ".dwg" || ext == ".sat" ||
+         ext == ".sab" || ext == ".sldprt" ||
          ext == ".sldasm" || ext == ".x_t" ||
          ext == ".x_b" || // experimental (SW COM)
          ext == ".ecad+" || ext == ".ecad" || ext == ".kicad_sch" ||
@@ -6603,7 +6618,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         (std::strcmp(shotMode, "siminteractive") == 0 ||
          std::strcmp(shotMode, "simaudit") == 0 ||
          std::strcmp(shotMode, "pipedraw") == 0 ||
-         std::strcmp(shotMode, "hydraulics3d") == 0);
+         std::strcmp(shotMode, "hydraulics3d") == 0 ||
+         std::strcmp(shotMode, "dwgopen") == 0);
     if (!pointerShot)
       scenarios.tick(st);
 
@@ -8092,6 +8108,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         for (char &c : fmtUpper)
           c = (char)std::toupper((unsigned char)c);
         ImGui::Text("Tessellation quality for %s", fmtUpper.c_str());
+        if (d.fmt == "dxf" || d.fmt == "dwg")
+          ImGui::TextDisabled("Solids and surfaces are written as ACIS 3D solids "
+                              "AutoCAD can edit; 2D profiles keep their lines and arcs.");
         ImGui::Separator();
         ImGui::Spacing();
 

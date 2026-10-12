@@ -397,10 +397,13 @@ std::string insertLowerExt(const std::string& path) {
 }
 
 // Component source extensions for the Insert Workspace browser (mirrors kInsertFilter /
-// file_explorer isCadExt plus .brep/.obj/.ply which Browse already accepts).
+// file_explorer isCadExt plus .obj/.ply which Browse already accepts, the AutoCAD
+// .dxf/.dwg lane and ACIS .sat/.sab, which the engine's component loader imports like any
+// neutral format).
 bool insertIsCadExt(const std::string& e) {
     return e == ".step+" || e == ".step" || e == ".stp" || e == ".iges" || e == ".igs" ||
-           e == ".brep"  || e == ".stl"  || e == ".3mf" || e == ".obj"  || e == ".ply";
+           e == ".brep"  || e == ".stl"  || e == ".3mf" || e == ".obj"  || e == ".ply" ||
+           e == ".dxf"   || e == ".dwg"  || e == ".sat" || e == ".sab";
 }
 
 // Non-recursive CAD files under dir. Errors → empty list (caller shows dim text).
@@ -491,9 +494,11 @@ std::vector<InsertCandidate> buildInsertCandidates(AppState& st) {
 
 // Filter for Browse… (component source files the engine can load).
 static const char* kInsertFilter =
-    "All CAD & mesh files\0*.step+;*.step;*.stp;*.iges;*.igs;*.brep;*.stl;*.3mf;*.obj;*.ply\0"
+    "All CAD & mesh files\0*.step+;*.step;*.stp;*.iges;*.igs;*.brep;*.sat;*.sab;*.dxf;*.dwg;*.stl;*.3mf;*.obj;*.ply\0"
     "Chudware part (*.step+)\0*.step+\0"
     "STEP (*.step;*.stp)\0*.step;*.stp\0"
+    "ACIS (*.sat;*.sab)\0*.sat;*.sab\0"
+    "AutoCAD (*.dwg;*.dxf)\0*.dwg;*.dxf\0"
     "All files (*.*)\0*.*\0";
 }  // namespace
 

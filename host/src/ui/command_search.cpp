@@ -114,7 +114,7 @@ void drawCommandSearch(AppState& st) {
 
         for (int i = 0; i < nCmds; ++i) {
             const RibbonCmd& c = cmds[i];
-            if (c.stretch) continue;
+            if (c.stretch || !ui::ribbonRowActive(i)) continue;  // superseded/retired rows
             if (icontains(c.label, s_buf) || icontains(c.tab, s_buf) ||
                 icontains(c.group, s_buf))
                 ribIdx.push_back(i);

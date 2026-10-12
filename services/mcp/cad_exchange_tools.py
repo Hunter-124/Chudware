@@ -30,14 +30,24 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def export_part(fmt: str = "step", path: Optional[str] = None,
-                    doc_id: Optional[str] = None, allow_empty: bool = False) -> str:
+                    doc_id: Optional[str] = None, allow_empty: bool = False,
+                    units: Optional[str] = None) -> str:
         """Export the current part to an interchange/mesh file; returns the written path.
 
         fmt: "draw+" (standalone native drawing) | "step+" (native part) | "step" | "stl" |
-             "3mf" | "iges" | "brep" | "obj" | "ply" | "gltf" | "glb" | "3dm". If `path`
-             is omitted, the file is named from the document in CHUDWARE_PROJECT_SAVE_DIR;
-             only clients with no configured project folder fall back to a temp file.
+             "3mf" | "iges" | "brep" | "obj" | "ply" | "gltf" | "glb" | "3dm" | "dxf" |
+             "dwg" | "sat". If `path` is omitted, the file is named from the document in
+             CHUDWARE_PROJECT_SAVE_DIR; only clients with no configured project folder fall
+             back to a temp file.
              STEP/IGES/BREP are exact B-rep; STL/OBJ/PLY/glTF are tessellated meshes.
+             DXF/DWG (AutoCAD R2000): solids/shells become exact, editable ACIS 3DSOLID/BODY
+             entities, 2D/wire bodies become LINE/ARC/CIRCLE/polylines, one layer per body
+             (BODY1..N) when there are 2+. SAT: ACIS 7.0 solids (AutoCAD ACISIN/IMPORT).
+             Use dwg to send a revision back to an AutoCAD user.
+             For a 2D drawing sheet use export_drawing instead.
+        units (dxf/dwg/sat only): "mm" | "in" | "ft" | "cm" | "m" | ... Omitted = the drawing
+             units of the part's DWG/DXF/SAT import (an inch drawing goes back in inches),
+             else mm. The reply echoes the $INSUNITS code written (`units`).
 
         NOTE: plain STEP/STL/etc. carry geometry only — NO editable feature tree or simulation
         studies. To hand the user a part they can keep editing, use save_part() (native .step+).
@@ -118,7 +128,10 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
             # truncated/malformed, so a returned ok:True means it actually re-opens. It echoes real
             # metadata (solid_count, valid_solids, bytes, validated) — surface it so the caller can
             # trust the export instead of a bare exists flag.
-            r = cb.call("export_file", {"doc_id": d, "path": out, "format": fmt})
+            call = {"doc_id": d, "path": out, "format": fmt}
+            if units:
+                call["units"] = units
+            r = cb.call("export_file", call)
             written = r.get("path", out)
             if os.path.exists(written):
                 rev = _doc_revision(d)
@@ -128,7 +141,7 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                    "exists": os.path.exists(written)}
             res["content"] = f"Exported {fmt} geometry to {written}."
             for k in ("bytes", "solid_count", "valid_solids", "expected_solids", "validated",
-                      "components"):
+                      "validation_skipped", "units", "components"):
                 if k in r:
                     res[k] = r[k]
             # Non-blocking placement provenance: a transform-placed component nobody
@@ -160,9 +173,16 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         the project root at turn end. Native saves and automatic saves after edits use
         that source path; pass save_part(path=...) to choose a different destination.
 
-        DXF/DWG are 2D vector drawings: they import as planar wires + faces (closed loops become
-        faces) — reference/profile geometry to extrude or dimension, not a solid. DWG needs a
-        DWG→DXF converter (LibreDWG `dwg2dxf`) on PATH; without one it errors with a hint.
+        DXF/DWG (AutoCAD, any version incl. 2013-2018+ files): ACIS 3DSOLID/BODY/REGION/SURFACE
+        entities import as exact B-rep bodies (`<stem>_solidN` / `<stem>_surfaceN`), including
+        R2013+ files whose ACIS lives in the DWG/DXF data storage. 2D entities import as planar
+        wires + faces (closed loops become faces) — reference/profile geometry to extrude or
+        dimension. INSERT block references are expanded, entity extrusion (OCS) is honored,
+        3DFACE/POLYFACE meshes import as mesh bodies (grouped per layer), and $INSUNITS is
+        applied (the drawing units are remembered for export). Any ACIS entity that cannot be
+        read is named in `warnings` by type and handle. DWG 2D entities are converted by LibreDWG
+        `dwg2dxf` (PATH or `python3 scripts/provision_libredwg.py`); without it only the 3D
+        solids/surfaces import, with that hint as a warning. SAT/SAB (ACIS) files import too.
 
         SOLIDWORKS (.sldprt/.sldasm): with `resolve_features=True` (default), Chudware first
         asks an installed SolidWorks COM server to reconstruct sketches/features into a fully

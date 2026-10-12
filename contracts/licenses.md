@@ -39,7 +39,7 @@
 | rhino3dm | MIT | Rhino .3dm import/export (mesh-level) | ok |
 | ezdxf | MIT | DXF (2D vector) import → planar B-rep wires/faces (engine.doc.formats_dxf) | ok (in-process; MIT permissive) |
 | ODA File Converter (optional) | proprietary (free EULA) | DWG→DXF conversion for `engine.doc.formats_dwg` (via `ezdxf.addons.odafc`) | **subprocess-only**, user-installed, PATH/registry-discovered, never bundled (mere aggregation) — absence degrades to an actionable error |
-| LibreDWG `dwg2dxf` (optional) | GPL-3.0 | alternative DWG→DXF converter for `engine.doc.formats_dwg` | **subprocess-only**, PATH-discovered, never linked or bundled (GPL isolation, same policy as pandoc/ngspice) |
+| LibreDWG `dwg2dxf` (optional) | GPL-3.0 | DWG read (`dwg2dxf` DWG→DXF of a DWG's 2D entities for the native importer and `services.formats.formats_dwg`; also re-reads a just-written DWG as an independent check when present). DWG **writing** is Chudware's own R2000 encoder (`core/doc/dwg_write.cpp`) and uses no LibreDWG code or tool | **subprocess-only**; found on PATH, else in the per-user managed install (`<appdata>/Chudware/tools/libredwg`) that `scripts/provision_libredwg.py` builds on the user's machine from the SHA-256-pinned upstream release (0.14). Never linked, bundled or redistributed by Chudware (GPL isolation, same policy as pandoc/ngspice); absence degrades to an error naming the provisioning script |
 | olefile | BSD-2 | OLE2 probe for legacy SolidWorks .sldprt preview (experimental) | ok |
 | pywin32 | PSF-2.0 | optional SolidWorks COM automation (Windows-only, feature-detected) | ok |
 | numpy / scipy | BSD-3 | math, solvers | ok |

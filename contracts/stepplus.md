@@ -206,3 +206,11 @@ The current semantic key is `chudware-geomcache/12` plus the OCCT version. Epoch
 Before this epoch, a sketch edit that removed regions let a cut lose regions with `ok:true`.
 A cache built that way shows the damaged geometry. Thus older caches are a cache miss
 (`engine_key`). The part rebuilds from the native source, and a bad pick fails by name.
+
+## 15. AutoCAD/ACIS import cache epoch (2026-10-11)
+
+The current semantic key is `chudware-geomcache/13` plus the OCCT version. Epoch 13 imports the
+ACIS 3DSOLID/BODY/REGION/SURFACE entities of DXF/DWG files (and `.sat`/`.sab`) as exact bodies,
+and an embedded DXF/DWG/SAT import keeps one body per baked compound child (`embedded_bodies`), so
+a drawing profile with construction wires stays one body. Older caches lack those solids and are a
+cache miss (`engine_key`); the import rebuilds from its embedded geometry.

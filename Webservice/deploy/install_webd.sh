@@ -63,6 +63,23 @@ if [ ! -d "$WORKSPACE_ROOT" ]; then
   echo "[webd] created workspace root $WORKSPACE_ROOT"
 fi
 
+# DWG import on the website runs inside the shared hostd: it shells out to LibreDWG's
+# `dwg2dxf` for the 2D entities (DWG export is a native writer and needs no LibreDWG).
+# LibreDWG is GPL-3.0, so it is a server-side subprocess only — never linked into the
+# engine and never part of the browser bundle. hostd looks on its own PATH, then in
+# <XDG_DATA_HOME|~/.local/share>/Chudware/tools/libredwg/bin (core/doc/dwg.cpp
+# libredwg_tool). Provision that managed copy for the environment the hostd unit
+# actually runs with; a verified install returns at once with no network access, a
+# first install fetches the SHA256-pinned source release and needs a C toolchain.
+UNIT_XDG_DATA_HOME="$(systemctl --user show-environment 2>/dev/null |
+  sed -n 's/^XDG_DATA_HOME=//p')"
+if ! LIBREDWG_LOG="$(env -u APPDATA XDG_DATA_HOME="$UNIT_XDG_DATA_HOME" \
+    "$PYTHON" "$ROOT/scripts/provision_libredwg.py" 2>&1)"; then
+  printf '%s\n' "$LIBREDWG_LOG" >&2
+  refuse "LibreDWG provisioning failed; web DWG import would be unavailable (scripts/provision_libredwg.py)"
+fi
+echo "[webd] ${LIBREDWG_LOG##*$'\n'}"
+
 # update.sh passes the tree it just built. Direct/sync installs use the same
 # authoritative full-engine output; never fall back to a stale slim/dist tree.
 SRC="${CHUDWARE_WEBD_ARTIFACT_DIR:-$ROOT/core/build-occt-linux/bin}"

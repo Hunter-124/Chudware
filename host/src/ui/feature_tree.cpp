@@ -3368,18 +3368,20 @@ void fmPaneHeaderChip(AppState& st, const char* title, const char* titleIcon, fl
 // silently wrote .step+ anyway).
 static const char* kStepPlusFilter = "Chudware part (*.step+)\0*.step+\0All files (*.*)\0*.*\0";
 
-// F4: Open/Import filter — every format the engine can import (see engine/doc/formats.py
-// FORMAT_REGISTRY / doc_formats RPC, the future dynamic source). A leading aggregate entry lets
+// F4: Open/Import filter — every format the engine can import (see core/doc/formats.cpp
+// format_registry() / doc_formats RPC, the future dynamic source). A leading aggregate entry lets
 // the user see all CAD+mesh files at once, then grouped entries narrow by family, then All files.
 // Win32 common-dialog layout: NUL-separated "label\0patterns\0"... pairs, double-NUL terminated
 // (the C string literal's own trailing NUL supplies the final one).
 static const char* kImportFilter =
-    "All CAD, drawing & mesh files\0*.draw+;*.step+;*.step;*.stp;*.iges;*.igs;*.brep;*.stl;*.3mf;*.obj;*.ply;*.gltf;*.glb;*.3dm;*.sldprt;*.sldasm;*.x_t;*.x_b\0"
+    "All CAD, drawing & mesh files\0*.draw+;*.step+;*.step;*.stp;*.iges;*.igs;*.brep;*.sat;*.sab;*.dxf;*.dwg;*.stl;*.3mf;*.obj;*.ply;*.gltf;*.glb;*.3dm;*.sldprt;*.sldasm;*.x_t;*.x_b\0"
     "Chudware drawing (*.draw+)\0*.draw+\0"
     "Chudware part (*.step+)\0*.step+\0"
     "STEP (*.step;*.stp)\0*.step;*.stp\0"
     "IGES (*.iges;*.igs)\0*.iges;*.igs\0"
     "BREP (*.brep)\0*.brep\0"
+    "ACIS (*.sat;*.sab)\0*.sat;*.sab\0"
+    "AutoCAD (*.dwg;*.dxf)\0*.dwg;*.dxf\0"
     "Mesh (*.stl;*.obj;*.ply;*.3mf;*.gltf;*.glb;*.3dm)\0*.stl;*.obj;*.ply;*.3mf;*.gltf;*.glb;*.3dm\0"
     // SolidWorks/Parasolid import is experimental (engine routes via SolidWorks COM -> STEP).
     "SolidWorks/Parasolid (*.sldprt;*.sldasm;*.x_t;*.x_b)\0*.sldprt;*.sldasm;*.x_t;*.x_b\0"
@@ -3774,6 +3776,15 @@ static void startAsyncOpen(AppState& st, const std::string& path, bool asSolid) 
                         return;
                     }
                     applyOpenedDoc(st, path, ticket);
+                    // Import lanes (DWG/DXF/SAT/STEP...) name every item they could not bring in;
+                    // show each one so a partial import never looks complete.
+                    const auto warnings = r.result.find("warnings");
+                    if (warnings != r.result.end() && warnings->is_array())
+                        for (const auto& w : *warnings) {
+                            const std::string text = w.is_string() ? w.get<std::string>() : w.dump();
+                            st.toast(ui::ToastLevel::Warn, pathBaseName(path) + ": " + text);
+                            st.addLog("[warn] [open] " + pathBaseName(path) + ": " + text);
+                        }
                 }, core::kLongEngineCallTimeoutMs);
 }
 

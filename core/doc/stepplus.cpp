@@ -1302,7 +1302,9 @@ std::string stepplus_cache_engine_key() {
     // /12 profile region picks never snap: a centroid outside its region's grown bbox, two
     // picks on one region, or an equidistant hintless pick fails the feature (doc/document.cpp
     // resolve_profile_faces). A cache built by a silent snap must re-resolve and report it.
-    static constexpr const char* kCacheSchema = "chudware-geomcache/12";
+    // /13 DXF/DWG/SAT imports carry exact ACIS solids/surfaces and keep their baked body
+    // grouping (a drawing profile stays one body); older snapshots lack those bodies.
+    static constexpr const char* kCacheSchema = "chudware-geomcache/13";
 #ifdef OCC_VERSION_COMPLETE
     return std::string(kCacheSchema) + ";occt=" OCC_VERSION_COMPLETE;
 #else

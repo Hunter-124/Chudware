@@ -555,15 +555,18 @@ nlohmann::json doc_eval_curvature(const std::string& doc_id, int body_id,
 nlohmann::json doc_eval_thickness(const std::string& doc_id, int body_id);
 
 // Export the document's surviving solid bodies to `path` in `fmt` (step/iges/brep/stl/
-// obj/ply/3mf/gltf/glb) via OCCT. For mesh formats, the tessellation quality is
-// controlled by lin_deflection (mm, or a fraction when `relative`), ang_deflection
+// obj/ply/3mf/gltf/glb/3dm/dxf/dwg/sat) via OCCT. For mesh formats, the tessellation quality
+// is controlled by lin_deflection (mm, or a fraction when `relative`), ang_deflection
 // (radians), and `ascii` (STL container); the defaults reproduce the historical
-// behaviour. Returns {"path": <abs>}. Throws OpError("export_failed") on no bodies / an
-// unsupported format / a writer failure.
+// behaviour. dxf/dwg/sat write exact ACIS solids in `units` ("mm"/"in"/... or an $INSUNITS
+// code; empty = the drawing units recorded by the doc's DWG/DXF/SAT import, else mm) and
+// are re-read to prove the solids survive. Returns {"path": <abs>, ...}. Throws
+// OpError("export_failed") on no bodies / an unsupported format / a writer failure, and
+// OpError("invalid_op") on `units` for another format.
 nlohmann::json doc_export_file(const std::string& doc_id, const std::string& path,
                                const std::string& fmt, double lin_deflection = 0.05,
                                double ang_deflection = 0.35, bool relative = false,
-                               bool ascii = false);
+                               bool ascii = false, const std::string& units = std::string());
 
 // Count the triangles/vertices a mesh export of this document would produce at the given
 // tessellation quality, without writing a file. Returns {triangles, vertices, bodies}.

@@ -18,24 +18,30 @@ in this repo that check is `contracts/licenses.md`, not this file.
 - **DXF (start here):** implement directly from Autodesk's public **DXF
   Reference**. It's a tagged (group-code, value) format — a weekend to a basic
   reader, and it teaches the whole data model (see `cad-data-model.md`).
-  **This repo already did this step**: production DXF import is a hand-written
-  ASCII DXF parser in `core/doc/formats.cpp` (no ezdxf, no third-party DXF library;
-  INSERT block references are skipped). The Python helper
-  `services/formats/formats_dxf.py` (ezdxf, MIT) is the parity oracle.
+  **This repo already did this step**: production DXF import and export are hand-written
+  in `core/doc/` (no ezdxf, no third-party DXF library; INSERT block references are
+  expanded, 3DFACE/POLYFACE meshes import as mesh bodies, ACIS solids import as exact
+  B-rep, and `export_file` writes R12 ASCII, or R2000 with ACIS 3DSOLIDs when there are
+  solids). The Python helper `services/formats/formats_dxf.py` (ezdxf, MIT) is the
+  import-only parity oracle.
 - **DWG:** implement from the **ODA Open Design Specification for .dwg files**
   (public). Or use open-source:
   - **LibreDWG** (GPL-3.0 per its `contracts/licenses.md` row — copyleft, so
     subprocess-only here) — reads/writes DWG.
   - **libdxfrw** (GPL-2.0-or-later — copyleft; no ledger row) — DXF + basic DWG.
 - **Reality check:** full DWG fidelity is a large effort (that's the ODA's whole
-  business). This repo does not parse DWG in-process: production import
-  (`core/doc/formats.cpp`) runs a user-installed LibreDWG `dwg2dxf` from `PATH` as a
-  subprocess and reuses the DXF importer — LibreDWG is GPL-3.0, so it is
-  subprocess-only, never linked or bundled (`contracts/licenses.md`). Whether to pursue
-  an ODA membership for higher-fidelity DWG is an open decision in
-  `work/backlog/T-BL02.md`. If production DWG fidelity is needed beyond that, the
-  legitimate shortcut is licensing the ODA commercially — not decompiling anyone's
-  DWG code.
+  business). Export (`export_file`, `export_drawing`, `export_flat_dxf` with format
+  `dwg`) is Chudware's own AutoCAD R2000 (AC1015) encoder written from the public ODA
+  specification (`core/doc/dwg_write.cpp`, no external tool). The 3D solids of R2013+ files
+  are read natively from the DWG data storage (`core/doc/dwg_native.cpp`); import of a DWG's 2D
+  entities runs LibreDWG `dwg2dxf` and reuses the DXF importer; it is found on `PATH`,
+  else in the per-user install that
+  `python3 scripts/provision_libredwg.py` builds from the SHA-pinned upstream release.
+  LibreDWG is GPL-3.0, so it is subprocess-only, never linked or bundled
+  (`contracts/licenses.md`). Whether to pursue an ODA membership for higher-fidelity DWG
+  is an open decision in `work/backlog/T-BL02.md`. If production DWG fidelity is needed
+  beyond that, the legitimate shortcut is licensing the ODA commercially — not
+  decompiling anyone's DWG code.
 
 ## Goal: read/write DGN
 

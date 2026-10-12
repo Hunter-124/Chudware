@@ -24,6 +24,8 @@
 #include <vector>
 #include <miniz.h>
 
+#include <BRepAdaptor_Curve.hxx>
+#include <GCPnts_AbscissaPoint.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
@@ -293,28 +295,39 @@ double face_area(const TopoDS_Shape& s) {
     return g.Mass();
 }
 
-// A 10 mm cube plus a planar r=3 disc profile, the two kinds of body DXF/DWG export writes.
+// A 10 mm cube, a planar r=3 disc face and a free r=5 construction circle: the three kinds of
+// body a DXF/DWG part export writes.
 std::vector<TopoDS_Shape> cube_and_disc() {
     const TopoDS_Edge rim = BRepBuilderAPI_MakeEdge(
         gp_Circ(gp_Ax2(gp_Pnt(30, 0, 0), gp_Dir(0, 0, 1)), 3.0)).Edge();
     const TopoDS_Face disc = BRepBuilderAPI_MakeFace(BRepBuilderAPI_MakeWire(rim).Wire()).Face();
-    return {BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape(), disc};
+    const TopoDS_Edge circle = BRepBuilderAPI_MakeEdge(
+        gp_Circ(gp_Ax2(gp_Pnt(60, 0, 0), gp_Dir(0, 1, 0)), 5.0)).Edge();
+    return {BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape(), disc, circle};
 }
 
 // Export → import keeps the cube an exact solid (ACIS 3DSOLID: six planar faces, not a
-// triangle mesh) and the disc a circular profile, each on its own layer.
+// triangle mesh), the disc a face (an ACIS sheet), and the construction circle a curve: in a
+// drawing with 3D content a closed circle must not come back as a filled disc (an AutoCAD
+// tube's edge circles used to import as lids).
 void check_cube_and_disc_round_trip(const std::string& fmt) {
     const fs::path path = tmp("cube_disc." + fmt);
     chudware::doc::export_bodies(cube_and_disc(), path.string(), fmt);
     const auto bodies = chudware::doc::import_bodies(path.string(), fmt);
-    REQUIRE(bodies.size() == 2);
-    CHECK(bodies[0].first == "chudware_imp_cube_disc");  // profile: BODY2's circle
-    CHECK(face_area(bodies[0].second) == doctest::Approx(kPiTest * 9.0).epsilon(1e-6));
+    REQUIRE(bodies.size() == 3);
+    CHECK(bodies[0].first == "chudware_imp_cube_disc");  // the construction circle
+    CHECK_FALSE(TopExp_Explorer(bodies[0].second, TopAbs_FACE).More());
+    REQUIRE(TopExp_Explorer(bodies[0].second, TopAbs_EDGE).More());
+    CHECK(GCPnts_AbscissaPoint::Length(BRepAdaptor_Curve(TopoDS::Edge(
+              TopExp_Explorer(bodies[0].second, TopAbs_EDGE).Current()))) ==
+          doctest::Approx(2.0 * kPiTest * 5.0).epsilon(1e-9));
     CHECK(bodies[1].first == "chudware_imp_cube_disc_solid1");
     CHECK(vol(bodies[1].second) == doctest::Approx(1000.0).epsilon(1e-9));
     int faces = 0;
     for (TopExp_Explorer ex(bodies[1].second, TopAbs_FACE); ex.More(); ex.Next()) ++faces;
     CHECK(faces == 6);
+    CHECK(bodies[2].first == "chudware_imp_cube_disc_surface1");
+    CHECK(face_area(bodies[2].second) == doctest::Approx(kPiTest * 9.0).epsilon(1e-6));
     fs::remove(path);
 }
 }  // namespace

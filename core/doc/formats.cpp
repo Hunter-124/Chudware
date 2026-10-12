@@ -1227,10 +1227,11 @@ void collect_entities(const std::vector<dxf::Entity>& entities, const dxf::Block
     }
 }
 
-// Stitch loose edges into connected wires; closed wires → Faces (kept as a Wire when the
-// face build fails, e.g. non-planar/self-intersecting), open wires stay as reference wires.
-// Port of _assemble_wires.
-void dxf_assemble_wires(const std::vector<TopoDS_Edge>& edges, TopoDS_Compound& out) {
+// Stitch loose edges into connected wires; with `make_faces`, closed wires → Faces (kept as a
+// Wire when the face build fails, e.g. non-planar/self-intersecting); open wires always stay
+// reference wires. Port of _assemble_wires.
+void dxf_assemble_wires(const std::vector<TopoDS_Edge>& edges, bool make_faces,
+                        TopoDS_Compound& out) {
     BRep_Builder bb;
     bb.MakeCompound(out);
     if (edges.empty()) return;
@@ -1243,7 +1244,7 @@ void dxf_assemble_wires(const std::vector<TopoDS_Edge>& edges, TopoDS_Compound& 
     for (int i = 1; i <= wires->Length(); ++i) {
         TopoDS_Wire w = TopoDS::Wire(wires->Value(i));
         bool added_face = false;
-        if (w.Closed()) {
+        if (make_faces && w.Closed()) {
             try {
                 BRepBuilderAPI_MakeFace mf(w, Standard_True);
                 if (mf.IsDone()) {
@@ -1384,8 +1385,13 @@ DxfImport read_dxf(const std::string& path, const DwgNativeInfo* native = nullpt
     gp_Trsf scale;
     if (unit_to_mm != 1.0) scale.SetScale(gp_Pnt(0, 0, 0), unit_to_mm);
     if (!g.edges.empty()) {
+        // A 2D drawing's closed loops become profile faces (to extrude or measure). Beside 3D
+        // model content (ACIS solids/surfaces, meshes) the lines and circles are the author's
+        // construction curves — AutoCAD shows them as curves, so filling them would put lids
+        // on open tubes and discs inside parts. They stay wires there.
+        const bool has_3d = !g.acis_bodies.empty() || !g.meshes.empty() || g.acis > 0;
         TopoDS_Compound comp;
-        dxf_assemble_wires(g.edges, comp);
+        dxf_assemble_wires(g.edges, !has_3d, comp);
         r.profile = comp;
         if (unit_to_mm != 1.0)
             r.profile = BRepBuilderAPI_Transform(comp, scale, Standard_True).Shape();
@@ -3075,8 +3081,11 @@ TopoDS_Shape to_units(const TopoDS_Shape& body, int units) {
 }
 
 // The solids and shells of `body` (everything an ACIS body can hold) as one compound, and
-// whether it is closed (no shell outside a solid).
-TopoDS_Shape acis_part(const TopoDS_Shape& body, bool* solid) {
+// whether it is closed (no shell outside a solid). With `free_faces`, faces in no shell (a 2D
+// profile's regions) join as one-face sheets, so a document that already writes ACIS keeps
+// them as faces: its re-import (formats.cpp read_dxf) reads plain curves beside 3D content as
+// construction wires, never as regions.
+TopoDS_Shape acis_part(const TopoDS_Shape& body, bool free_faces, bool* solid) {
     TopoDS_Compound comp;
     BRep_Builder bb;
     bb.MakeCompound(comp);
@@ -3091,7 +3100,23 @@ TopoDS_Shape acis_part(const TopoDS_Shape& body, bool* solid) {
         any = true;
         *solid = false;
     }
+    if (free_faces)
+        for (TopExp_Explorer ex(body, TopAbs_FACE, TopAbs_SHELL); ex.More(); ex.Next()) {
+            TopoDS_Shell sheet;
+            bb.MakeShell(sheet);
+            bb.Add(sheet, ex.Current());
+            bb.Add(comp, sheet);
+            any = true;
+            *solid = false;
+        }
     return any ? TopoDS_Shape(comp) : TopoDS_Shape();
+}
+
+// True when any body has shell/solid geometry, i.e. the export writes ACIS.
+bool has_shells(const std::vector<TopoDS_Shape>& bodies) {
+    for (const TopoDS_Shape& b : bodies)
+        if (!b.IsNull() && TopExp_Explorer(b, TopAbs_SHELL).More()) return true;
+    return false;
 }
 
 void edge_to_dxf(const TopoDS_Edge& edge, const std::string& layer, const TessOptions& tess,
@@ -3171,6 +3196,7 @@ DxfDocument bodies_to_dxf_document(const std::vector<TopoDS_Shape>& bodies,
     sat.mm_per_unit = insunits_mm(tess.units);
     std::size_t live = 0;
     for (const TopoDS_Shape& b : bodies) live += b.IsNull() ? 0 : 1;
+    const bool doc_3d = has_shells(bodies);
     std::size_t index = 0;
     for (const TopoDS_Shape& source : bodies) {
         if (source.IsNull()) continue;
@@ -3178,7 +3204,7 @@ DxfDocument bodies_to_dxf_document(const std::vector<TopoDS_Shape>& bodies,
         const std::string layer = live > 1 ? "BODY" + std::to_string(++index) : std::string("0");
         if (live > 1) doc.add_layer(layer, 7);
         bool solid = false;
-        const TopoDS_Shape part = acis_part(body, &solid);
+        const TopoDS_Shape part = acis_part(body, doc_3d, &solid);
         if (!part.IsNull()) {
             try {
                 doc.acis.push_back({layer, write_sat(part, sat), solid, sat.version});
@@ -3407,7 +3433,7 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
             for (const TopoDS_Shape& b : bodies) {
                 if (b.IsNull()) continue;
                 bool solid = false;
-                const TopoDS_Shape part = acis_part(to_units(b, tess.units), &solid);
+                const TopoDS_Shape part = acis_part(to_units(b, tess.units), true, &solid);
                 if (!part.IsNull()) parts.push_back(part);
             }
             if (parts.empty())

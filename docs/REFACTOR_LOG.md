@@ -6845,3 +6845,14 @@ re-saves them as AutoCAD 2018 DWG/DXF that re-import with identical solids. Not 
 AutoCAD itself. Web: gateway grants docs minted by `import_file`, deploy provisions dwg2dxf.
 Tests: `test_acis_read`, `test_acis_write`, `test_dwg_native`, `test_dxf_r2000`, `test_dwg_write`,
 `test_import_roundtrip` (ACIS round trips, inch export, STEP with free wires).
+
+## 2026-10-12 — AutoCAD drawings: construction curves stay curves beside 3D content
+
+Opening `SteelTubeWidget.dwg` showed a lid on an open tube: the DXF lane turned every closed
+2D loop into a planar face, so the AutoCAD edge CIRCLEs of the tube (and its revolve profile)
+imported as filled discs over the opening. `read_dxf` (`core/doc/formats.cpp`) now keeps all
+curves as wires when the drawing has 3D content (ACIS bodies, meshes or ACIS entities); purely
+2D drawings keep the closed-loop profile faces. Export writes loose faces as one-face ACIS BODY
+sheets when the document has solids/shells, so they still re-import as faces. The ACIS surface
+itself was already right (outer wall, bottom, rim annulus, inner wall; open top). Test:
+`test_import_roundtrip` cube/disc/circle round trip for DXF and DWG.

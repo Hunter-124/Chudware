@@ -176,8 +176,9 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         DXF/DWG (AutoCAD, any version incl. 2013-2018+ files): ACIS 3DSOLID/BODY/REGION/SURFACE
         entities import as exact B-rep bodies (`<stem>_solidN` / `<stem>_surfaceN`), including
         R2013+ files whose ACIS lives in the DWG/DXF data storage. 2D entities import as planar
-        wires + faces (closed loops become faces) — reference/profile geometry to extrude or
-        dimension. INSERT block references are expanded, entity extrusion (OCS) is honored,
+        wires; in a purely 2D drawing closed loops also become faces (profile geometry to
+        extrude or dimension), while beside 3D content they stay construction curves exactly
+        as AutoCAD shows them. INSERT block references are expanded, entity extrusion (OCS) is honored,
         3DFACE/POLYFACE meshes import as mesh bodies (grouped per layer), and $INSUNITS is
         applied (the drawing units are remembered for export). Any ACIS entity that cannot be
         read is named in `warnings` by type and handle. DWG 2D entities are converted by LibreDWG

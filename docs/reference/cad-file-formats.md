@@ -66,7 +66,9 @@ short structural summary drawn from that public spec.
   library; `core/doc/`). Import: a hand-written ASCII tag parser plus OCCT edge
   builders; honours `$INSUNITS` (scaled to mm) and entity extrusion (OCS), expands INSERT
   block references, converts LINE / CIRCLE / ARC / LWPOLYLINE / POLYLINE (bulges → arcs) /
-  SPLINE / ELLIPSE to edges (closed wires become planar faces, open wires stay reference
+  SPLINE / ELLIPSE to edges (in a purely 2D drawing closed wires become planar faces; beside
+  3D content — ACIS bodies or meshes — every curve stays a construction wire, as AutoCAD shows
+  it, so a tube's edge circles never import as lids; open wires stay reference
   wires), imports 3DFACE / POLYFACE meshes as mesh bodies grouped per layer, and imports
   ACIS 3DSOLID / BODY / REGION / SURFACE entities as exact B-rep bodies — inline SAT (R2000–
   R2010, decrypted 1/3 groups) or SAB in the R2013+ `ACDSDATA` section — through the native
@@ -77,8 +79,10 @@ short structural summary drawn from that public spec.
   (`source_units`), and `export_file` dxf/dwg/sat default back to them.
   Export: `export_file` format `dxf` writes R12 ASCII for 2D-only content and AutoCAD R2000
   (AC1015, full tables/blocks/objects) when there are solids — solids as 3DSOLID and open
-  shells as BODY with ACIS 4.00 SAT (`core/doc/acis_write.cpp`), 2D bodies as LINE / ARC /
-  CIRCLE / POLYLINE; every export is re-read and must give back the same solids and volume.
+  shells as BODY with ACIS 4.00 SAT (`core/doc/acis_write.cpp`), 2D curves as LINE / ARC /
+  CIRCLE / POLYLINE; loose faces join the ACIS as one-face BODY sheets when the document has
+  solids/shells (so they re-import as faces, not as curves), and stay outlines otherwise.
+  Every export is re-read and must give back the same solids and volume.
   The 2D drawing / flat-pattern exporters write layered R12 sheets. The Python helper
   `services/formats/formats_dxf.py` (ezdxf, MIT) is an import-only parity oracle.
 - **ACIS SAT / SAB** (`.sat`, `.sab`): imported with the same reader (header units applied);

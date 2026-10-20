@@ -25,9 +25,11 @@ from urllib.parse import urlparse
 import boto3
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from fastapi import APIRouter, File, HTTPException, Request, Response, UploadFile
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
+from fastapi.exceptions import RequestValidationError
+from starlette.datastructures import UploadFile
 
 try:
     from . import accounts, entitlement
@@ -36,7 +38,7 @@ try:
     from .auth import get_current_user
     from .config import settings
     from .db import tx
-    from .limits import RateLimiter
+    from .limits import RateLimiter, RELEASE_UPLOAD_BYTES, SMALL_REQUEST_BYTES, bounded_form, read_bounded_body, request_network
 except ImportError:  # uvicorn app:app from package dir
     import accounts  # type: ignore
     import entitlement  # type: ignore
@@ -45,7 +47,7 @@ except ImportError:  # uvicorn app:app from package dir
     from auth import get_current_user  # type: ignore
     from config import settings  # type: ignore
     from db import tx  # type: ignore
-    from limits import RateLimiter  # type: ignore
+    from limits import RateLimiter, RELEASE_UPLOAD_BYTES, SMALL_REQUEST_BYTES, bounded_form, read_bounded_body, request_network
 
 router = APIRouter(tags=["releases"])
 
@@ -446,6 +448,17 @@ def _require_publish_token(request: Request) -> None:
         raise HTTPException(401, "invalid release publishing token")
 
 
+async def _publication_body(request: Request, model: type[BaseModel]) -> Any:
+    """Parse only after the publishing token is checked, including without app middleware."""
+    raw = await read_bounded_body(request, SMALL_REQUEST_BYTES, "release metadata too large")
+    try:
+        return model.model_validate_json(raw)
+    except ValidationError as exc:
+        raise RequestValidationError([
+            dict(error, loc=("body", *error["loc"])) for error in exc.errors()
+        ]) from exc
+
+
 def _fetch_latest(
     channel: str, platform: str, arch: str, fmt: str = DEFAULT_FORMAT
 ) -> dict[str, Any] | None:
@@ -731,7 +744,7 @@ async def latest_release(
     # would 422 every installed client's update check.
     format: Format = DEFAULT_FORMAT,
 ) -> dict[str, Any]:
-    client = request.client.host if request.client else "unknown"
+    client = request_network(request)
     _manifest_by_ip.enforce(client, "release manifest checks")
     row = _fetch_latest(channel, platform, arch, format)
     if row is None:
@@ -826,7 +839,7 @@ async def available_releases(
     macos/arm64 has never published, and inventing a placeholder row here would
     put a download button in front of bytes that do not exist.
     """
-    client = request.client.host if request.client else "unknown"
+    client = request_network(request)
     _available_by_ip.enforce(client, "release catalogue reads")
     builds = [
         {
@@ -939,10 +952,10 @@ def _upsert_release(value: PublishRelease) -> None:
 
 
 @router.post("/api/releases/latest/publish")
-async def publish_release(value: PublishRelease, request: Request) -> dict[str, Any]:
-    client = request.client.host if request.client else "unknown"
-    _publish_by_ip.enforce(client, "release publications")
+async def publish_release(request: Request) -> dict[str, Any]:
+    _publish_by_ip.enforce(request_network(request), "release publications")
     _require_publish_token(request)
+    value = await _publication_body(request, PublishRelease)
     _upsert_release(value)
     return {
         "ok": True,
@@ -1049,7 +1062,7 @@ def _release_exists(
 
 
 @router.post("/api/releases/ci/publish")
-async def ci_publish_release(value: CiPublish, request: Request) -> dict[str, Any]:
+async def ci_publish_release(request: Request) -> dict[str, Any]:
     """Register a nightly beta whose bytes CI already staged in ``incoming/``.
 
     Order matters: the request is validated, then the artifact is re-digested
@@ -1058,9 +1071,9 @@ async def ci_publish_release(value: CiPublish, request: Request) -> dict[str, An
     client's own sha256 would authenticate nothing, and inserting before the
     move could publish a manifest pointing at bytes that never arrived.
     """
-    client = request.client.host if request.client else "unknown"
-    _ci_by_ip.enforce(client, "ci release calls")
+    _ci_by_ip.enforce(request_network(request), "ci release calls")
     _require_publish_token(request)
+    value = await _publication_body(request, CiPublish)
     signature, stable_signature = _validate_ci_publish(value)
     with _publication_lock():
         return _publish_ci_bundle(value, signature, stable_signature)
@@ -1138,7 +1151,6 @@ def _publish_ci_bundle(value: CiPublish, signature: bytes, stable_signature: byt
     }
 
 
-_ARTIFACT_CEILING = 2 * 1024**3
 
 
 async def _receive_chunk(
@@ -1157,7 +1169,7 @@ async def _receive_chunk(
         out.seek(current)
         async for chunk in request.stream():
             size += len(chunk)
-            if size > _ARTIFACT_CEILING:
+            if size > RELEASE_UPLOAD_BYTES:
                 raise HTTPException(413, "release artifact exceeds the 2 GiB ceiling")
             out.write(chunk)
         out.flush()
@@ -1198,7 +1210,7 @@ async def ci_upload_artifact(
     equal the current ``.part`` size, so a retried or interleaved chunk cannot
     silently corrupt an artifact, and only the finalizing call reports a digest.
     """
-    client = request.client.host if request.client else "unknown"
+    client = request_network(request)
     _ci_by_ip.enforce(client, "ci release calls")
     _require_publish_token(request)
     safe = _safe_name(name)
@@ -1212,7 +1224,7 @@ async def ci_upload_artifact(
         with target.open("wb") as out:
             async for chunk in request.stream():
                 size += len(chunk)
-                if size > _ARTIFACT_CEILING:
+                if size > RELEASE_UPLOAD_BYTES:
                     raise HTTPException(413, "release artifact exceeds the 2 GiB ceiling")
                 digest.update(chunk)
                 out.write(chunk)
@@ -1227,10 +1239,10 @@ async def ci_upload_artifact(
 
 
 @router.post("/api/releases/ci/status")
-async def ci_report_status(value: CiStatus, request: Request) -> dict[str, Any]:
-    client = request.client.host if request.client else "unknown"
-    _ci_by_ip.enforce(client, "ci release calls")
+async def ci_report_status(request: Request) -> dict[str, Any]:
+    _ci_by_ip.enforce(request_network(request), "ci release calls")
     _require_publish_token(request)
+    value = await _publication_body(request, CiStatus)
     if value.status not in _CI_STATUSES:
         raise HTTPException(422, "status must be one of " + ", ".join(sorted(_CI_STATUSES)))
     if not _COMMIT_SHA_RE.fullmatch(value.commit_sha):
@@ -1300,7 +1312,7 @@ async def ci_list_builds(
     """Build ledger for the workflow itself, on the publish token rather than an
     admin session: the nightly planner runs on a runner that has neither a
     browser session nor any business holding database credentials."""
-    client = request.client.host if request.client else "unknown"
+    client = request_network(request)
     _ci_by_ip.enforce(client, "ci release calls")
     _require_publish_token(request)
     return {"builds": _recent_ci_builds(limit, commit_sha, status)}
@@ -1310,7 +1322,7 @@ async def ci_list_builds(
 async def release_base_version(request: Request) -> dict[str, str]:
     """Version the next nightly beta derives from: highest published stable
     patch + 1, floored at 0.1.0 before the first stable ever ships."""
-    client = request.client.host if request.client else "unknown"
+    client = request_network(request)
     _base_version_by_ip.enforce(client, "release base version checks")
     with tx() as cur:
         cur.execute("SELECT version FROM releases WHERE channel = 'stable'")
@@ -1341,7 +1353,7 @@ async def download_release_artifact(
     from being a read primitive over ``store/`` — an unpublished or deleted key
     is a 404 even when the file happens to still be on disk.
     """
-    client = request.client.host if request.client else "unknown"
+    client = request_network(request)
     _artifact_by_ip.enforce(client, "release artifact downloads")
     if not _may_download(request):
         raise HTTPException(403, "an active entitlement is required to download releases")
@@ -1829,8 +1841,17 @@ async def download_release(name: str, request: Request) -> FileResponse:
 
 
 @router.post("/api/admin/releases/upload")
-async def upload_release(request: Request, file: UploadFile = File(...)) -> dict[str, Any]:
+async def upload_release(request: Request) -> dict[str, Any]:
     _require_admin(request)
+    # A role failure must not spool a multipart body to the gateway disk.
+    async with bounded_form(request, RELEASE_UPLOAD_BYTES + SMALL_REQUEST_BYTES) as form:
+        file = form.get("file")
+        if not isinstance(file, UploadFile):
+            raise HTTPException(422, "file required")
+        return await _store_admin_upload(file)
+
+
+async def _store_admin_upload(file: UploadFile) -> dict[str, Any]:
     safe = _safe_name(file.filename or "")
     directory = _releases_dir()
     directory.mkdir(parents=True, exist_ok=True)
@@ -1842,6 +1863,8 @@ async def upload_release(request: Request, file: UploadFile = File(...)) -> dict
                 chunk = await file.read(1024 * 1024)
                 if not chunk:
                     break
+                if out.tell() + len(chunk) > RELEASE_UPLOAD_BYTES:
+                    raise HTTPException(413, "release artifact exceeds the 2 GiB ceiling")
                 out.write(chunk)
     except Exception:
         tmp.unlink(missing_ok=True)

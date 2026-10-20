@@ -38,6 +38,10 @@ def client(pg, monkeypatch):
     fresh = limits.RateLimiter(shipped.limit, shipped.window)
     monkeypatch.setattr(authn, "login_by_ip", fresh)
     monkeypatch.setattr(mailer, "outbound", limits.RateLimiter(5, 3600.0))
+    monkeypatch.setattr(
+        mailer, "outbound_global",
+        limits.RateLimiter(settings.mail_global_per_hour, 3600.0, max_keys=1),
+    )
 
     app = FastAPI()
     app.include_router(authn.router)
@@ -78,9 +82,11 @@ def test_access_provisioned_account_can_resend_and_redeem_verification(client):
     verify_url = mailer.decrypt_context(email, mail["template"], mail["ctx_json"])["verify_url"]
     token = parse_qs(urlparse(verify_url).query)["token"][0]
 
-    redeemed = client.get(
-        f"/api/auth/verify?token={token}", follow_redirects=False
-    )
+    opened = client.get(f"/api/auth/verify?token={token}", follow_redirects=False)
+    assert opened.status_code == 200
+    assert accounts.get_account(email).status == "pending"
+    assert _counts(email) == (1, 1)
+    redeemed = client.post(f"/api/auth/verify?token={token}", follow_redirects=False)
     assert redeemed.status_code == 303
     assert "set-cookie" not in redeemed.headers
     assert authn.SESSION_COOKIE not in client.cookies

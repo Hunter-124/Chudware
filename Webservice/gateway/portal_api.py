@@ -80,14 +80,23 @@ async def change_password(request: Request, body: dict[str, Any]) -> dict[str, b
     user, _ = _account(request)
     current = str(body.get("current_password") or "")
     replacement = str(body.get("new_password") or "")
+    credential = authn.get_credential(user.email)
+    if credential is None or not await authn._password_work(
+        authn.verify_password, credential["password_hash"], current
+    ):
+        raise HTTPException(401, "current password is incorrect")
+    authn._check_password_policy(replacement)
+    api_writes.enforce(user.email, "portal password changes")
+    digest = await authn._password_work(authn.hash_password, replacement)
+    # No thread-local DB transaction spans either KDF await. Reauthorize the
+    # credential under the account lock so OAuth-only grants or another reset
+    # cannot be undone by an in-flight password change.
     with tx():
         authn._lock_account(user.email)
-        credential = authn.get_credential(user.email)
-        if credential is None or not authn.verify_password(credential["password_hash"], current):
+        latest = authn.get_credential(user.email)
+        if latest is None or latest["password_hash"] != credential["password_hash"]:
             raise HTTPException(401, "current password is incorrect")
-        authn._check_password_policy(replacement)
-        api_writes.enforce(user.email, "portal password changes")
-        authn.set_password(user.email, replacement, verified=True)
+        authn._store_password(user.email, digest, verified=True)
     return {"ok": True}
 
 

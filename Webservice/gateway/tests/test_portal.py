@@ -236,7 +236,7 @@ def test_password_change_and_signout_everywhere_delete_all_sessions(pg, monkeypa
 
 
 def test_oauth_only_admin_grant_cannot_race_a_portal_password_change(pg, monkeypatch):
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+    from concurrent.futures import ThreadPoolExecutor
     from threading import Event
 
     email = "portal-security@example.com"
@@ -276,11 +276,12 @@ def test_oauth_only_admin_grant_cannot_race_a_portal_password_change(pg, monkeyp
                 authn._cli, ["grant-admin", "--email", email, "--oauth-only"]
             )
             assert admin_lock_entered.wait(10), "admin grant did not reach the account lock"
-            with pytest.raises(FutureTimeout):
-                granting.result(timeout=0.1)
+            # Password verification must not hold a DB transaction or account
+            # lock while its bounded KDF worker runs.
+            assert granting.result(timeout=10) == 0
         finally:
             release.set()
-        assert changing.result(timeout=10).status_code == 200
+        assert changing.result(timeout=10).status_code == 401
         assert granting.result(timeout=10) == 0
     assert authn.get_credential(email) is None
     assert accounts.get_account(email).role == "admin"

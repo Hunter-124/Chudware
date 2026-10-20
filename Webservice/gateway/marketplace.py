@@ -14,12 +14,13 @@ from typing import Any
 
 import psycopg
 
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
+from starlette.datastructures import UploadFile
 
 from config import settings
 from db import tx
-from limits import api_writes, uploads
+from limits import SMALL_REQUEST_BYTES, api_writes, bounded_form, uploads
 from marketplace_authz import (
     MarketplaceError,
     marketplace_enabled_or_404,
@@ -2314,19 +2315,36 @@ def _cleanup_upload(target: Path) -> None:
 
 
 @studio_router.post("/listings/{listing_id}/assets")
-async def studio_upload_asset(
-    request: Request,
-    listing_id: str,
-    file: UploadFile = File(...),
-    kind: str = Form(...),
-    role: str = Form(""),
-    gated: bool = Form(True),
-    version_id: str = Form(""),
-) -> dict[str, Any]:
+async def studio_upload_asset(request: Request, listing_id: str) -> dict[str, Any]:
+    # Feature, seller and listing authorization precede multipart parsing/spooling.
     marketplace_enabled_or_404()
     user, _ = _seller_for(request)
     api_writes.enforce(user.email, "marketplace writes")
     uploads.enforce(user.email, "marketplace asset uploads")
+    listing = await asyncio.to_thread(_owned_listing, listing_id, user.email)
+    cap = settings.marketplace_max_asset_bytes + SMALL_REQUEST_BYTES
+    async with bounded_form(request, cap, max_fields=5) as form:
+        file = form.get("file")
+        kind = form.get("kind")
+        role = form.get("role", "")
+        gated = form.get("gated", "true")
+        version_id = form.get("version_id", "")
+        if (not isinstance(file, UploadFile)
+                or any(not isinstance(value, str) for value in (kind, role, gated, version_id))):
+            raise HTTPException(422, "file and asset fields required")
+        boolean = gated.lower()
+        if boolean not in {"true", "1", "yes", "on", "t", "y", "false", "0", "no", "off", "f", "n"}:
+            raise HTTPException(422, "gated must be a boolean")
+        return await _store_studio_asset(
+            user, listing_id, listing, file, kind, role,
+            boolean in {"true", "1", "yes", "on", "t", "y"}, version_id,
+        )
+
+
+async def _store_studio_asset(
+    user: Any, listing_id: str, listing: dict[str, Any], file: UploadFile,
+    kind: str, role: str, gated: bool, version_id: str,
+) -> dict[str, Any]:
     kind = kind.strip().lower()
     role = role.strip().lower()
     if kind not in ASSET_KINDS or kind == "render":
@@ -2357,7 +2375,6 @@ async def studio_upload_asset(
     )
     content_type = safe_media_type(filename)
     # No listing/seller locks are held while the upload yields or touches disk.
-    listing = await asyncio.to_thread(_owned_listing, listing_id, user.email)
     target = asset_path(str(listing["id"]), rel_path)
     committed = False
     staged = ""

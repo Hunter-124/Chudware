@@ -46,14 +46,14 @@ try:
     from .auth import JWKSCache
     from .config import settings
     from .db import tx
-    from .limits import login_by_ip
+    from .limits import login_by_ip, request_network
 except ImportError:  # uvicorn app:app from the package dir
     import accounts  # type: ignore
     import authn  # type: ignore
     from auth import JWKSCache  # type: ignore
     from config import settings  # type: ignore
     from db import tx  # type: ignore
-    from limits import login_by_ip  # type: ignore
+    from limits import login_by_ip, request_network  # type: ignore
 
 import jwt
 
@@ -83,6 +83,9 @@ MICROSOFT_CONSUMERS_TID = "9188040d-6c67-4c5b-b112-36a304b66dad"
 _HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 OAUTH_TRANSACTION_COOKIE = "chudware_oauth_transaction"
 OAUTH_TRANSACTION_MAX_AGE = 10 * 60
+# Outstanding states, shared across providers, are bounded in PostgreSQL rather
+# than trusting a process limiter whose network keys can be evicted by churn.
+OAUTH_STATES_PER_NETWORK = 10
 
 
 @dataclass(frozen=True)
@@ -207,12 +210,42 @@ def _sign_state(provider: str, nonce: str, verifier: str, next_path: str) -> str
     ).hexdigest()
 
 
-def mint_state(provider: str, next_path: str = DEFAULT_NEXT) -> tuple[str, str]:
+def mint_state(
+    provider: str, next_path: str = DEFAULT_NEXT, *, network: str = "unknown"
+) -> tuple[str, str]:
     nonce = secrets.token_urlsafe(24)
     verifier = secrets.token_urlsafe(32)
     state = f"{nonce}.{_sign_state(provider, nonce, verifier, next_path)}"
-    # store_token, not mint_token: the value is ours, signature and all.
-    authn.store_token(state, "", authn.PURPOSE_OAUTH_STATE, authn.OAUTH_STATE_TTL)
+    # OAuth has no account yet. Reuse the token table's non-FK email key as a
+    # namespaced network bucket; never pass that key to account/token helpers.
+    key = f"oauth-network:{network}"
+    lock = int.from_bytes(sha256(key.encode()).digest()[:8], "big", signed=True)
+    with tx() as cur:
+        # A transaction-scoped lock makes the count/insert bound hold across
+        # concurrent requests and gateway processes, not just this event loop.
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock,))
+        cur.execute(
+            "DELETE FROM email_tokens WHERE purpose = %s"
+            " AND (used_at IS NOT NULL OR expires_at <= now())",
+            (authn.PURPOSE_OAUTH_STATE,),
+        )
+        cur.execute(
+            "SELECT count(*) AS n FROM email_tokens"
+            " WHERE email = %s AND purpose = %s AND used_at IS NULL",
+            (key, authn.PURPOSE_OAUTH_STATE),
+        )
+        if cur.fetchone()["n"] >= OAUTH_STATES_PER_NETWORK:
+            raise HTTPException(
+                status_code=429,
+                detail="too many pending sign-ins — complete one or try again later",
+                headers={"Retry-After": str(OAUTH_TRANSACTION_MAX_AGE)},
+            )
+        cur.execute(
+            "INSERT INTO email_tokens (token_hash, email, purpose, expires_at)"
+            " VALUES (%s, %s, %s, now() + make_interval(secs => %s))",
+            (authn.token_hash(state), key, authn.PURPOSE_OAUTH_STATE,
+             authn.OAUTH_STATE_TTL.total_seconds()),
+        )
     return state, verifier
 
 
@@ -227,9 +260,17 @@ def check_state(
         signature, _sign_state(provider, nonce, verifier, next_path)
     ):
         return False
-    # consume_token returns the (empty) email it was minted against, so success
-    # is "not None" rather than truthiness.
-    return authn.consume_token(state, authn.PURPOSE_OAUTH_STATE) is not None
+    # Delete atomically instead of retaining used rows. The network bucket is
+    # not an account email, and callbacks may legitimately change networks.
+    # Signature, browser verifier and destination must all match before this
+    # deletion, including for states minted before network buckets existed.
+    with tx() as cur:
+        cur.execute(
+            "DELETE FROM email_tokens WHERE token_hash = %s AND purpose = %s"
+            " AND used_at IS NULL AND expires_at > now() RETURNING token_hash",
+            (authn.token_hash(state), authn.PURPOSE_OAUTH_STATE),
+        )
+        return cur.fetchone() is not None
 
 
 def _transaction_value(verifier: str, next_path: str) -> str:
@@ -545,13 +586,14 @@ def _error_page(message: str) -> Response:
 
 @router.get("/api/auth/oauth/{provider}/start", response_model=None)
 async def oauth_start(provider: str, request: Request, next: str = "") -> Response:
-    login_by_ip.enforce(authn.client_ip(request), "authentication attempts")
+    network = request_network(request)
+    login_by_ip.enforce(network, "authentication attempts")
     try:
         entry = _provider_or_error(provider)
     except OAuthError as exc:
         return _error_page(exc.message)
     next_path = _safe_next(next)
-    state, verifier = mint_state(entry.name, next_path)
+    state, verifier = mint_state(entry.name, next_path, network=network)
     query = urlencode(
         {
             "client_id": _credentials(entry.name)[0],
@@ -580,7 +622,7 @@ async def oauth_start(provider: str, request: Request, next: str = "") -> Respon
 async def oauth_callback(
     provider: str, request: Request, code: str = "", state: str = "", error: str = ""
 ) -> Response:
-    login_by_ip.enforce(authn.client_ip(request), "authentication attempts")
+    login_by_ip.enforce(request_network(request), "authentication attempts")
     verifier, next_path = _split_transaction(
         request.cookies.get(OAUTH_TRANSACTION_COOKIE, "")
     )

@@ -14,6 +14,7 @@ from __future__ import annotations
 import html
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -26,7 +27,9 @@ from fastapi.testclient import TestClient
 import accounts  # noqa: E402
 import auth  # noqa: E402
 import authn  # noqa: E402
+import db  # noqa: E402
 import entitlement  # noqa: E402
+import limits  # noqa: E402
 import oauth  # noqa: E402
 from config import settings  # noqa: E402
 
@@ -70,6 +73,7 @@ def client(pg, signing_key, monkeypatch):
     monkeypatch.setattr(settings, "google_client_id", "client-id")
     monkeypatch.setattr(settings, "google_client_secret", "client-secret")
     monkeypatch.setattr(oauth, "resolve_identity", _identity)
+    monkeypatch.setattr(oauth, "login_by_ip", limits.RateLimiter(20, 900.0))
     app = FastAPI()
     app.include_router(oauth.router)
     app.include_router(entitlement.router)
@@ -228,3 +232,189 @@ def test_desktop_signin_refuses_an_account_without_a_desktop_window(client):
     assert entitlement._AUTH_CSS in refused.text
     assert "#pricing" in refused.text
     assert authn.oauth_providers_for(EMAIL) == ["google"]
+
+
+@pytest.mark.parametrize("address,network", [
+    ("198.51.100.44", "198.51.100.44"),
+    ("2001:db8:1234::1", "2001:db8:1234::/64"),
+])
+def test_oauth_start_bounds_database_states_despite_network_lru_churn(
+    client, monkeypatch, address, network
+):
+    monkeypatch.setattr(settings, "github_client_id", "github-id")
+    monkeypatch.setattr(settings, "github_client_secret", "github-secret")
+    limiter = limits.RateLimiter(10_000, 900.0, max_keys=2)
+    monkeypatch.setattr(oauth, "login_by_ip", limiter)
+    key = f"oauth-network:{network}"
+    with TestClient(
+        client.app, client=("127.0.0.1", 51000), base_url="https://testserver"
+    ) as browser:
+        for i in range(oauth.OAUTH_STATES_PER_NETWORK):
+            # Rotate IPv6 addresses within one /64, and alternate providers.
+            ip = f"2001:db8:1234::{i + 1:x}" if ":" in address else address
+            provider = "google" if i % 2 == 0 else "github"
+            start = browser.get(
+                f"/api/auth/oauth/{provider}/start",
+                headers={"CF-Connecting-IP": ip}, follow_redirects=False,
+            )
+            assert start.status_code == 302
+            if i == 0:
+                first_state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+                first_cookie = browser.cookies.get(oauth.OAUTH_TRANSACTION_COOKIE)
+            # Evict this network from the process limiter between every start.
+            for other in (f"192.0.2.{2 * i + 1}", f"192.0.2.{2 * i + 2}"):
+                churn = browser.get(
+                    "/api/auth/oauth/google/start",
+                    headers={"CF-Connecting-IP": other}, follow_redirects=False,
+                )
+                assert churn.status_code == 302
+            assert network not in limiter._hits
+
+        denied = browser.get(
+            "/api/auth/oauth/google/start",
+            headers={"CF-Connecting-IP": address}, follow_redirects=False,
+        )
+        assert denied.status_code == 429
+        assert int(denied.headers["retry-after"]) > 0
+        with db.tx() as cur:
+            cur.execute(
+                "SELECT count(*) AS n FROM email_tokens WHERE email = %s AND purpose = %s",
+                (key, authn.PURPOSE_OAUTH_STATE),
+            )
+            assert cur.fetchone()["n"] == oauth.OAUTH_STATES_PER_NETWORK
+
+        # A full bucket must not evict a browser's already-issued capability.
+        browser.cookies.clear()
+        browser.cookies.set(oauth.OAUTH_TRANSACTION_COOKIE, first_cookie)
+        callback = browser.get(
+            f"/api/auth/oauth/google/callback?code=abc&state={first_state}",
+            headers={"CF-Connecting-IP": address}, follow_redirects=False,
+        )
+        assert callback.status_code == 303
+        resumed = browser.get(
+            "/api/auth/oauth/google/start",
+            headers={"CF-Connecting-IP": address}, follow_redirects=False,
+        )
+        assert resumed.status_code == 302, "a consumed state must free its database slot"
+        with db.tx() as cur:
+            cur.execute(
+                "SELECT count(*) AS n FROM email_tokens WHERE email = %s AND purpose = %s",
+                (key, authn.PURPOSE_OAUTH_STATE),
+            )
+            assert cur.fetchone()["n"] == oauth.OAUTH_STATES_PER_NETWORK
+
+
+def test_oauth_start_prunes_expired_and_used_states_not_email_capabilities(client):
+    for _ in range(oauth.OAUTH_STATES_PER_NETWORK):
+        start = client.get("/api/auth/oauth/google/start", follow_redirects=False)
+        assert start.status_code == 302
+    # Include a legacy state row (empty email) and a different token purpose.
+    authn.store_token("used-legacy-state", "", authn.PURPOSE_OAUTH_STATE, authn.OAUTH_STATE_TTL)
+    with db.tx() as cur:
+        cur.execute(
+            "UPDATE email_tokens SET expires_at = now() - interval '1 second'"
+            " WHERE purpose = %s", (authn.PURPOSE_OAUTH_STATE,),
+        )
+        cur.execute(
+            "UPDATE email_tokens SET used_at = now(), expires_at = now() + interval '1 hour'"
+            " WHERE token_hash = %s", (authn.token_hash("used-legacy-state"),),
+        )
+        cur.execute(
+            "INSERT INTO email_tokens (token_hash, email, purpose, expires_at)"
+            " VALUES (%s, %s, %s, now() - interval '1 second')",
+            ("unrelated-email-capability", "ada@example.com", authn.PURPOSE_VERIFY),
+        )
+    restarted = client.get("/api/auth/oauth/google/start", follow_redirects=False)
+    assert restarted.status_code == 302
+    with db.tx() as cur:
+        cur.execute(
+            "SELECT email, EXTRACT(EPOCH FROM expires_at - now()) AS remaining"
+            " FROM email_tokens WHERE purpose = %s", (authn.PURPOSE_OAUTH_STATE,),
+        )
+        (row,) = cur.fetchall()
+        assert row["email"] == f"oauth-network:{CLIENT[0]}"
+        assert 0 < row["remaining"] <= authn.OAUTH_STATE_TTL.total_seconds()
+        cur.execute(
+            "SELECT count(*) AS n FROM email_tokens WHERE purpose = %s",
+            (authn.PURPOSE_VERIFY,),
+        )
+        assert cur.fetchone()["n"] == 1
+
+
+def test_concurrent_oauth_start_consumers_cannot_exceed_database_cap(client, monkeypatch):
+    monkeypatch.setattr(oauth, "login_by_ip", limits.RateLimiter(10_000, 900.0))
+
+    def start(i):
+        with TestClient(
+            client.app, client=("127.0.0.1", 51000 + i), base_url="https://testserver"
+        ) as browser:
+            return browser.get(
+                "/api/auth/oauth/google/start",
+                headers={"CF-Connecting-IP": f"2001:db8:5678::{i + 1:x}"},
+                follow_redirects=False,
+            ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        statuses = list(workers.map(start, range(oauth.OAUTH_STATES_PER_NETWORK + 6)))
+    assert statuses.count(302) == oauth.OAUTH_STATES_PER_NETWORK
+    assert statuses.count(429) == 6
+    with db.tx() as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM email_tokens WHERE purpose = %s",
+            (authn.PURPOSE_OAUTH_STATE,),
+        )
+        assert cur.fetchone()["n"] == oauth.OAUTH_STATES_PER_NETWORK
+
+
+@pytest.mark.parametrize("tamper", ["verifier", "destination"])
+def test_bounded_oauth_state_preserves_cookie_and_destination_binding(client, tamper):
+    start = client.get("/api/auth/oauth/google/start?next=%2Fapp", follow_redirects=False)
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    transaction = client.cookies.get(oauth.OAUTH_TRANSACTION_COOKIE)
+    verifier, next_path = oauth._split_transaction(transaction)
+    forged = oauth._transaction_value(
+        "another-browser" if tamper == "verifier" else verifier,
+        "/different" if tamper == "destination" else next_path,
+    )
+    client.cookies.clear()
+    client.cookies.set(oauth.OAUTH_TRANSACTION_COOKIE, forged)
+    rejected = client.get(
+        f"/api/auth/oauth/google/callback?code=abc&state={state}", follow_redirects=False,
+    )
+    assert rejected.status_code == 400
+    with db.tx() as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM email_tokens WHERE token_hash = %s",
+            (authn.token_hash(state),),
+        )
+        assert cur.fetchone()["n"] == 1, "a forged cookie must not consume the state"
+    client.cookies.clear()
+    client.cookies.set(oauth.OAUTH_TRANSACTION_COOKIE, transaction)
+    accepted = client.get(
+        f"/api/auth/oauth/google/callback?code=abc&state={state}", follow_redirects=False,
+    )
+    assert accepted.status_code == 303
+    assert accepted.headers["location"] == "/app"
+    assert oauth.check_state("google", state, verifier, next_path) is False
+
+
+def test_oauth_start_and_callback_share_the_canonical_network_rate_key(client, monkeypatch):
+    monkeypatch.setattr(oauth, "login_by_ip", limits.RateLimiter(2, 900.0))
+    with TestClient(
+        client.app, client=("127.0.0.1", 51000), base_url="https://testserver"
+    ) as browser:
+        start = browser.get(
+            "/api/auth/oauth/google/start",
+            headers={"CF-Connecting-IP": "2001:db8:9999::1"}, follow_redirects=False,
+        )
+        assert start.status_code == 302
+        cancelled = browser.get(
+            "/api/auth/oauth/google/callback?error=cancelled",
+            headers={"CF-Connecting-IP": "2001:db8:9999::2"}, follow_redirects=False,
+        )
+        assert cancelled.status_code == 400
+        denied = browser.get(
+            "/api/auth/oauth/google/callback?error=cancelled",
+            headers={"CF-Connecting-IP": "2001:db8:9999::3"}, follow_redirects=False,
+        )
+        assert denied.status_code == 429

@@ -19,11 +19,13 @@ them:
   without a revocation table, at which point it is just a worse version of this.
 * **Tokens are stored hashed.** ``email_tokens`` holds only SHA-256 digests;
   queued bearer URLs are authenticated ciphertext under an external mail key.
-  Verification navigation never establishes or changes the browser's login.
+  Verification GETs are inert: inbox ownership requires an explicit confirm POST,
+  and neither step establishes or changes the browser's login.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import logging
@@ -31,9 +33,13 @@ import re
 import secrets
 import sys
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import BoundedSemaphore
 from typing import Any
+from urllib.parse import quote
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
@@ -44,14 +50,14 @@ try:
     from . import accounts, mailer
     from .config import settings
     from .db import tx
-    from .limits import login_by_email, login_by_ip
+    from .limits import login_by_email, login_by_ip, request_network
     from .mailer import send as send_mail
 except ImportError:  # uvicorn app:app from the package dir
     import accounts  # type: ignore
     import mailer  # type: ignore
     from config import settings  # type: ignore
     from db import tx  # type: ignore
-    from limits import login_by_email, login_by_ip  # type: ignore
+    from limits import login_by_email, login_by_ip, request_network  # type: ignore
     from mailer import send as send_mail  # type: ignore
 
 log = logging.getLogger("chudware-web.authn")
@@ -87,6 +93,15 @@ _HASHER = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4)
 # "wrong password" cost the same. Hashing a random secret at import means the
 # value is not a known-plaintext target either.
 _DUMMY_HASH = _HASHER.hash(secrets.token_urlsafe(32))
+
+# Two 64 MiB Argon2 jobs at most, shared by registration, login and recovery.
+# Admission never waits and counts queued + running work, not awaiting requests.
+# Do not use asyncio.to_thread: its shared executor has an unbounded work queue.
+_PASSWORD_WORKERS = 2
+_PASSWORD_POOL = ThreadPoolExecutor(
+    max_workers=_PASSWORD_WORKERS, thread_name_prefix="authn-password"
+)
+_PASSWORD_SLOTS = BoundedSemaphore(_PASSWORD_WORKERS)
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s.]+(?:\.[^@\s.]+)+$")
 
@@ -126,20 +141,20 @@ _LOOPBACK = {"127.0.0.1", "::1"}
 
 
 def client_ip(request: Request) -> str:
-    """Best-known client address, used only as a rate-limit key.
+    """Best-known exact client address for session and audit metadata.
 
     In production cloudflared terminates the tunnel on loopback, so the socket
-    peer is always 127.0.0.1 and keying on it would put the entire internet in
-    one bucket. ``CF-Connecting-IP`` is therefore honoured — but ONLY when the
-    peer really is loopback, so a direct caller cannot rotate the header to
-    escape its own budget.
+    peer is always 127.0.0.1. Honour ``CF-Connecting-IP`` only from that hop and
+    only when it contains a valid address; direct callers cannot forge session
+    metadata. Abuse-control keys use limits.request_network(), not this helper.
     """
     peer = (request.client.host if request.client else "") or "unknown"
     if peer in _LOOPBACK:
         forwarded = (request.headers.get("cf-connecting-ip") or "").strip()
-        if forwarded:
-            return forwarded
-    return peer
+        validated = _inet_or_none(forwarded)
+        if validated is not None:
+            return validated
+    return _inet_or_none(peer) or "unknown"
 
 
 def _inet_or_none(raw: str) -> str | None:
@@ -186,6 +201,42 @@ def burn_dummy_verification(password: str) -> None:
         _HASHER.verify(_DUMMY_HASH, password)
     except (VerifyMismatchError, VerificationError, InvalidHashError):
         pass
+
+
+async def _password_work(function: Callable[..., Any], *args: Any) -> Any:
+    """Admit bounded KDF work without blocking the event loop or queuing callers.
+
+    Release on the concurrent future's completion, never in the awaiter's
+    finally: cancellation cannot stop a running Argon2 job. Pending work may be
+    cancelled, but a running job retains its slot until it actually finishes.
+    Workers receive only hash/password values, never a db.tx() context or cursor.
+    """
+    loop = asyncio.get_running_loop()
+    slots = _PASSWORD_SLOTS
+    if not slots.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail="password authentication is busy — try again shortly",
+            headers={"Retry-After": "1"},
+        )
+    try:
+        future = _PASSWORD_POOL.submit(function, *args)
+    except BaseException:
+        slots.release()
+        raise
+    future.add_done_callback(lambda _done: slots.release())
+    return await asyncio.wrap_future(future, loop=loop)
+
+
+def _verify_login_password(stored_hash: str | None, password: str) -> tuple[bool, str | None]:
+    """One worker admission covers comparison and any parameter upgrade."""
+    if stored_hash is None:
+        burn_dummy_verification(password)
+        return False, None
+    if not verify_password(stored_hash, password):
+        return False, None
+    digest = hash_password(password) if _HASHER.check_needs_rehash(stored_hash) else None
+    return True, digest
 
 
 # ---------------------------------------------------------------------------
@@ -241,18 +292,6 @@ def _store_password(email: str, digest: str, *, verified: bool) -> None:
                         updated_at     = now()
             """,
             (email, digest, verified, verified),
-        )
-
-
-def _rehash_if_needed(email: str, stored_hash: str, password: str) -> None:
-    """Upgrade a credential in place when the cost parameters have moved on."""
-    if not _HASHER.check_needs_rehash(stored_hash):
-        return
-    with tx() as cur:
-        cur.execute(
-            "UPDATE credentials SET password_hash = %s, updated_at = now()"
-            " WHERE email = %s AND password_hash = %s",
-            (hash_password(password), email, stored_hash),
         )
 
 
@@ -403,12 +442,9 @@ def delete_sessions(email: str) -> int:
 def store_token(token: str, email: str, purpose: str, ttl: timedelta) -> None:
     """Record the SHA-256 of an ALREADY-CHOSEN token.
 
-    ``oauth.py`` needs this: its state parameter carries an HMAC signature it
-    builds itself, so the value cannot be generated here. Storing invalidates
-    any outstanding token of the same purpose for the same address, so
-    "resend verification" cannot leave a fan of live links behind. Skipped for
-    an empty address, which is what an OAuth state row has before the callback
-    resolves who is signing in.
+    Storing invalidates any outstanding token of the same purpose for the same
+    address, so resending verification cannot leave multiple live links behind.
+    Account-free OAuth state and its network buckets are managed in oauth.py.
     """
     with tx() as cur:
         if email:
@@ -430,6 +466,21 @@ def mint_token(email: str, purpose: str, ttl: timedelta) -> str:
     token = secrets.token_urlsafe(32)
     store_token(token, email, purpose, ttl)
     return token
+
+
+def _live_token_email(token: str, purpose: str) -> str | None:
+    """Inspect a capability without consuming it or holding a lock for a browser."""
+    if not token:
+        return None
+    with tx() as cur:
+        cur.execute(
+            "SELECT email FROM email_tokens"
+            " WHERE token_hash = %s AND purpose = %s"
+            " AND used_at IS NULL AND expires_at > now()",
+            (token_hash(token), purpose),
+        )
+        row = cur.fetchone()
+    return row["email"] if row else None
 
 
 def consume_token(token: str, purpose: str) -> str | None:
@@ -783,26 +834,35 @@ async def register(request: Request, body: dict[str, Any]) -> dict[str, str]:
     "someone tried to register your address" mail. Returning 409 here would turn
     the endpoint into a free account-existence scanner.
     """
-    login_by_ip.enforce(client_ip(request), "authentication attempts")
+    login_by_ip.enforce(request_network(request), "authentication attempts")
     email = normalize_email(body.get("email"))
     password = str(body.get("password") or "")
     if not valid_email(email):
         raise HTTPException(status_code=400, detail="enter a valid email address")
     _check_password_policy(password)
     # Exactly one Argon2 hash for every valid, admitted registration outcome.
-    digest = hash_password(password)
+    digest = await _password_work(hash_password, password)
 
-    with tx():
-        accounts.ensure_account(email, display=email.split("@")[0])
-        _lock_account(email)
-        # OAuth-only bootstrap can precede the operator's first provider link.
-        # Do not let anonymous registration add a password to that admin.
-        account = accounts.get_account(email)
-        taken = (
-            get_credential(email) is not None
-            or bool(oauth_providers_for(email))
-            or (account is not None and account.role == "admin")
+    with tx() as cur:
+        # A row lock cannot serialize a first registration: the account does not
+        # exist yet. Lock the normalized address BEFORE lookup/creation instead.
+        cur.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (f"authn.register:{email}",),
         )
+        taken = accounts.get_account(email) is not None
+        if not taken:
+            # Other creators (OAuth/Access/admin) need not use our advisory lock.
+            # Only the INSERT winner owns this new row; never attach a password
+            # to the pending account returned by a losing ensure_account call.
+            cur.execute(
+                "INSERT INTO accounts"
+                " (email, display, status, plan, role, created_at, decided_at, decided_by)"
+                " VALUES (%s, %s, 'pending', 'trial', 'user', %s, NULL, '')"
+                " ON CONFLICT (email) DO NOTHING RETURNING email",
+                (email, email.split("@")[0], time.time()),
+            )
+            taken = cur.fetchone() is None
         if taken:
             send_mail(
                 email,
@@ -821,29 +881,49 @@ async def register(request: Request, body: dict[str, Any]) -> dict[str, str]:
 async def login(request: Request, body: dict[str, Any]) -> JSONResponse:
     """Verify a password and open a session.
 
-    Both limiters are enforced BEFORE any hashing: an attacker must not be able
-    to spend the server's argon2 budget for free, and the per-email budget is
-    what actually stops a targeted guess.
+    The network budget counts all requests; the email+network budget counts only
+    wrong passwords. Both are checked before Argon2. Someone on another network
+    cannot lock the owner out, and successful sign-ins do not spend a guess.
     """
-    login_by_ip.enforce(client_ip(request), "sign-in attempts from this address")
+    network = request_network(request)
+    login_by_ip.enforce(network, "sign-in attempts from this network")
     email = normalize_email(body.get("email"))
     password = str(body.get("password") or "")
-    login_by_email.enforce(email, "sign-in attempts for this account")
+    failure_key = f"{network}|{email}"
+    if not login_by_email.allowed(failure_key):
+        raise HTTPException(
+            status_code=429,
+            detail="too many sign-in attempts for this account from this network — slow down",
+            headers={"Retry-After": str(login_by_email.retry_after(failure_key))},
+        )
 
-    with tx():
+    # db.tx() joins by ContextVar. Snapshot first, do CPU work with no transaction
+    # open, then lock and recheck: reset/OAuth/admin may retire this credential
+    # while Argon2 runs, and a stale password must never mint a session.
+    credential = get_credential(email)
+    stored_hash = credential["password_hash"] if credential else None
+    valid, upgraded = await _password_work(_verify_login_password, stored_hash, password)
+    if not valid:
+        login_by_email.check(failure_key)
+        raise HTTPException(status_code=401, detail=_LOGIN_FAILED)
+
+    with tx() as cur:
         _lock_account(email)
-        credential = get_credential(email)
-        if credential is None:
-            burn_dummy_verification(password)
+        current = get_credential(email)
+        if current is None or current["password_hash"] != stored_hash:
+            login_by_email.check(failure_key)
             raise HTTPException(status_code=401, detail=_LOGIN_FAILED)
-        if not verify_password(credential["password_hash"], password):
-            raise HTTPException(status_code=401, detail=_LOGIN_FAILED)
-        _rehash_if_needed(email, credential["password_hash"], password)
-
-        if not credential["email_verified"]:
+        login_by_email.clear(failure_key)
+        if not current["email_verified"]:
             # Only reachable with the CORRECT password, so this is not an oracle:
             # the caller already knows the account exists.
             raise HTTPException(status_code=403, detail="email address not verified")
+        if upgraded is not None:
+            cur.execute(
+                "UPDATE credentials SET password_hash = %s, updated_at = now()"
+                " WHERE email = %s AND password_hash = %s",
+                (upgraded, email, stored_hash),
+            )
 
         log.info("authn: login for %s", email)
         return begin_session_response(request, email)
@@ -859,7 +939,32 @@ async def logout(request: Request) -> JSONResponse:
 
 @router.get("/api/auth/verify", response_model=None)
 async def verify(request: Request, token: str = "") -> Response:
-    """Redeem email ownership only; signing in requires an explicit auth flow."""
+    """Show an inert confirmation page, safe for email scanners and prefetchers.
+
+    Mail security products routinely GET links without the recipient's consent.
+    A GET must never consume the token, verify an attacker-chosen password, or
+    activate the trial. Only the recipient's explicit form POST does that.
+    """
+    if _live_token_email(token, PURPOSE_VERIFY) is None:
+        return _token_page("verification")
+    action = f"/api/auth/verify?token={quote(token, safe='')}"
+    return HTMLResponse(
+        page_html(
+            "Confirm email",
+            "Confirm your email address",
+            "    <p>Continue only if you requested this Chudware account."
+            " This confirms its email address and password registration.</p>\n"
+            f'    <form method="post" action="{action}">\n'
+            '      <button type="submit">Confirm email address</button>\n'
+            "    </form>",
+        ),
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
+
+
+@router.post("/api/auth/verify", response_model=None)
+async def confirm_verification(request: Request, token: str = "") -> Response:
+    """Explicitly redeem inbox ownership without opening a browser session."""
     with tx():
         email = consume_token(token, PURPOSE_VERIFY)
         if email is None:
@@ -872,7 +977,7 @@ async def verify(request: Request, token: str = "") -> Response:
 @router.post("/api/auth/resend-verification", status_code=202)
 async def resend_verification(request: Request, body: dict[str, Any]) -> dict[str, str]:
     """Re-send a verification link. Always 202, whatever the address is."""
-    login_by_ip.enforce(client_ip(request), "authentication attempts")
+    login_by_ip.enforce(request_network(request), "authentication attempts")
     email = normalize_email(body.get("email"))
     if not valid_email(email):
         return _ACCEPTED
@@ -895,7 +1000,7 @@ async def forgot(request: Request, body: dict[str, Any]) -> dict[str, str]:
     reset, and must not be convertible into one without re-proving ownership —
     so it gets a "you signed in with Google" mail instead of a reset link.
     """
-    login_by_ip.enforce(client_ip(request), "authentication attempts")
+    login_by_ip.enforce(request_network(request), "authentication attempts")
     email = normalize_email(body.get("email"))
     if not valid_email(email):
         return _ACCEPTED
@@ -923,14 +1028,18 @@ async def reset(request: Request, body: dict[str, Any]) -> JSONResponse:
     not stuck. Every other session for the account is revoked: a password change
     has to evict whoever prompted it.
     """
-    login_by_ip.enforce(client_ip(request), "authentication attempts")
+    login_by_ip.enforce(request_network(request), "authentication attempts")
     password = str(body.get("password") or "")
     _check_password_policy(password)
+    token = str(body.get("token") or "")
+    if _live_token_email(token, PURPOSE_RESET) is None:
+        raise HTTPException(status_code=400, detail="that reset link is no longer valid")
+    digest = await _password_work(hash_password, password)
     with tx():
-        email = consume_token(str(body.get("token") or ""), PURPOSE_RESET)
+        email = consume_token(token, PURPOSE_RESET)
         if email is None:
             raise HTTPException(status_code=400, detail="that reset link is no longer valid")
-        set_password(email, password, verified=True)
+        _store_password(email, digest, verified=True)
         start_trial(email)
         revoke_sessions(email)
         log.info("authn: password reset for %s", email)

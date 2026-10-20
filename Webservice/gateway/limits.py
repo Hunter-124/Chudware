@@ -9,12 +9,13 @@ across workers to keep coherent.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 import secrets
 import threading
 import time
 import stat
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Deque
@@ -23,7 +24,8 @@ from urllib.parse import quote
 from fastapi import HTTPException, Request
 from starlette.formparsers import MultiPartException
 from starlette.background import BackgroundTask
-from starlette.responses import StreamingResponse
+from starlette.responses import JSONResponse, StreamingResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 try:
     from .config import settings
@@ -36,9 +38,9 @@ except ImportError:  # uvicorn app:app from the package dir
 class RateLimiter:
     """Sliding-window request counter keyed by an arbitrary string.
 
-    Buckets are pruned lazily on access and swept wholesale once the table
-    grows past ``max_keys``, so an attacker cycling keys cannot grow it without
-    bound (the gateway runs under ``MemoryMax=1G``).
+    Buckets are pruned lazily, with a strict LRU key cap. Even fresh keys are
+    evicted under churn, so rotating submitted identities cannot exhaust memory
+    or trigger a full-table sweep on every request.
     """
 
     __slots__ = ("limit", "window", "max_keys", "_hits", "_lock")
@@ -46,8 +48,8 @@ class RateLimiter:
     def __init__(self, limit: int, window_sec: float, max_keys: int = 4096) -> None:
         self.limit = limit
         self.window = window_sec
-        self.max_keys = max_keys
-        self._hits: dict[str, Deque[float]] = {}
+        self.max_keys = max(1, max_keys)
+        self._hits: OrderedDict[str, Deque[float]] = OrderedDict()
         self._lock = threading.Lock()
 
     def _prune(self, bucket: Deque[float], now: float) -> None:
@@ -62,8 +64,11 @@ class RateLimiter:
             bucket = self._hits.get(key)
             if bucket is None:
                 if len(self._hits) >= self.max_keys:
-                    self._sweep(now)
-                bucket = self._hits.setdefault(key, deque())
+                    self._hits.popitem(last=False)
+                bucket = deque()
+                self._hits[key] = bucket
+            else:
+                self._hits.move_to_end(key)
             self._prune(bucket, now)
             if len(bucket) >= self.limit:
                 return False
@@ -78,9 +83,18 @@ class RateLimiter:
                 return 0
             return max(1, int(self.window - (time.monotonic() - bucket[0])) + 1)
 
-    def _sweep(self, now: float) -> None:
-        cutoff = now - self.window
-        for key in [k for k, b in self._hits.items() if not b or b[-1] < cutoff]:
+    def allowed(self, key: str) -> bool:
+        """Inspect remaining budget without charging a successful login."""
+        with self._lock:
+            bucket = self._hits.get(key)
+            if bucket is None:
+                return self.limit > 0
+            self._prune(bucket, time.monotonic())
+            self._hits.move_to_end(key)
+            return len(bucket) < self.limit
+
+    def clear(self, key: str) -> None:
+        with self._lock:
             self._hits.pop(key, None)
 
     def enforce(self, key: str, what: str = "requests") -> None:
@@ -99,18 +113,132 @@ api_writes = RateLimiter(settings.rate_writes_per_min, 60.0)
 uploads = RateLimiter(settings.rate_uploads_per_min, 60.0)
 chat_messages = RateLimiter(settings.rate_chat_per_min, 60.0)
 
-# Pre-authentication limiters. Every other limiter above keys on the
-# AUTHENTICATED email, which is exactly what an unauthenticated endpoint does
-# not have — so these two key on the SUBMITTED email and on the client address
-# instead, and are deliberately far tighter as a result.
-#
-# Both are enforced before any password hashing: argon2 at 64 MiB a go is a
-# denial-of-service amplifier if an attacker can spend it for free, and the
-# per-email budget is what actually caps a targeted guess at 5 tries per
-# 15 minutes. The per-address budget is 4x looser so that a shared NAT, an
-# office, or a university does not lock itself out over one forgetful user.
+# Pre-authentication IP budgets use request_network: exact IPv4 and IPv6 /64.
+# The email budget records only failed logins and includes the client network;
+# a caller elsewhere cannot spend an account owner's sign-in budget.
 login_by_email = RateLimiter(5, 900.0)
 login_by_ip = RateLimiter(20, 900.0)
+
+
+def client_network(address: str) -> str:
+    """A stable abuse-control key; rotating IPv6 interface IDs gains no budget."""
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return "unknown"
+    if isinstance(ip, ipaddress.IPv4Address):
+        return str(ip)
+    return str(ipaddress.ip_network((ip, 64), strict=False))
+
+
+def request_network(request: Request) -> str:
+    """Trust Cloudflare's client address only over the loopback tunnel hop."""
+    peer = request.client.host if request.client else ""
+    if peer in {"127.0.0.1", "::1"}:
+        forwarded = request.headers.get("cf-connecting-ip", "").strip()
+        try:
+            ipaddress.ip_address(forwarded)
+        except ValueError:
+            pass
+        else:
+            return client_network(forwarded)
+    return client_network(peer)
+
+
+# Wire-byte ceilings apply before FastAPI parses JSON or multipart data.
+# Security events keep their separate 512 KiB *expanded* gzip cap in security.py.
+SMALL_REQUEST_BYTES = 64 * 1024
+BILLING_WEBHOOK_BYTES = 1024 * 1024
+RELEASE_UPLOAD_BYTES = 2 * 1024**3
+WORKSPACE_CHAT_BYTES = 5 * 1024 * 1024
+
+
+def request_body_cap(path: str) -> int:
+    if path == "/api/billing/webhook":
+        return BILLING_WEBHOOK_BYTES
+    if path in {"/workspace/upload", "/api/bucket/upload"}:
+        return settings.max_upload_bytes
+    if path.startswith("/api/releases/ci/upload/"):
+        return RELEASE_UPLOAD_BYTES
+    if path == "/api/admin/releases/upload":
+        return RELEASE_UPLOAD_BYTES + SMALL_REQUEST_BYTES
+    if (path.startswith("/api/studio/listings/") and path.endswith("/assets")
+            and len(path.split("/")) == 6):
+        return settings.marketplace_max_asset_bytes + SMALL_REQUEST_BYTES
+    if path == "/workspace/chat":
+        return WORKSPACE_CHAT_BYTES
+    return SMALL_REQUEST_BYTES
+
+
+class _RequestBodyTooLarge(HTTPException, MultiPartException):
+    """Also trigger Starlette's multipart temporary-file cleanup."""
+
+    def __init__(self) -> None:
+        HTTPException.__init__(self, 413, "request body too large")
+        self.message = self.detail
+
+
+class RequestBodyLimitMiddleware:
+    """Outermost pure ASGI guard, including Content-Length-free/chunked input.
+
+    No body is prebuffered here: authenticated uploads still authorize before
+    reading. Oversized chunks never reach a parser. Multipart parsing translates
+    MultiPartException to 400, so send also preserves the authoritative 413.
+    WebSocket and lifespan scopes are deliberately untouched.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        cap = request_body_cap(scope["path"])
+        lengths = []
+        for key, value in scope.get("headers", ()):
+            if key.lower() == b"content-length":
+                try:
+                    length = int(value)
+                except ValueError:
+                    length = -1
+                lengths.append(length)
+        if lengths and (min(lengths) < 0 or len(set(lengths)) != 1):
+            await JSONResponse({"detail": "invalid content-length"}, 400)(scope, receive, send)
+            return
+        if lengths and lengths[0] > cap:
+            await JSONResponse({"detail": "request body too large"}, 413)(scope, receive, send)
+            return
+        total = 0
+        exceeded = False
+        replied = False
+
+        async def bounded_receive() -> Message:
+            nonlocal total, exceeded
+            if exceeded:
+                raise _RequestBodyTooLarge()
+            message = await receive()
+            if message["type"] == "http.request":
+                total += len(message.get("body", b""))
+                if total > cap:
+                    exceeded = True
+                    raise _RequestBodyTooLarge()
+            return message
+
+        async def bounded_send(message: Message) -> None:
+            nonlocal replied
+            if exceeded:
+                if not replied:
+                    replied = True
+                    await JSONResponse({"detail": "request body too large"}, 413)(scope, receive, send)
+                return
+            await send(message)
+
+        try:
+            await self.app(scope, bounded_receive, bounded_send)
+        except _RequestBodyTooLarge:
+            if not replied:
+                await JSONResponse({"detail": "request body too large"}, 413)(scope, receive, send)
 
 
 def user_slug(email: str) -> str:
@@ -168,7 +296,7 @@ async def read_bounded_body(request: Request, cap: int, detail: str) -> bytes:
 
 
 @asynccontextmanager
-async def bounded_form(request: Request, cap: int, *, max_files: int = 1):
+async def bounded_form(request: Request, cap: int, *, max_files: int = 1, max_fields: int = 1):
     """Cap multipart bytes before Starlette buffers/spools each incoming chunk.
 
     MultiPartException triggers the parser's temporary-file cleanup. Translate
@@ -189,7 +317,7 @@ async def bounded_form(request: Request, cap: int, *, max_files: int = 1):
 
     bounded = Request(request.scope, receive=receive)
     try:
-        async with bounded.form(max_files=max_files, max_fields=1) as form:
+        async with bounded.form(max_files=max_files, max_fields=max_fields) as form:
             yield form
     except Exception:
         if oversized:
@@ -389,6 +517,14 @@ def store_upload(root: Path, relative: str, upload, *, cap: int, email: str,
 
 __all__ = [
     "RateLimiter",
+    "RequestBodyLimitMiddleware",
+    "SMALL_REQUEST_BYTES",
+    "BILLING_WEBHOOK_BYTES",
+    "RELEASE_UPLOAD_BYTES",
+    "WORKSPACE_CHAT_BYTES",
+    "client_network",
+    "request_network",
+    "request_body_cap",
     "storage_write_lock",
     "api_writes",
     "uploads",

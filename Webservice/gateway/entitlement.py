@@ -36,13 +36,13 @@ try:
     from . import accounts
     from .auth import get_current_user
     from .db import tx
-    from .limits import RateLimiter
+    from .limits import RateLimiter, read_bounded_body, request_network
     from .plans import PLANS, limits_for
 except ImportError:  # uvicorn app:app from package dir
     import accounts  # type: ignore
     from auth import get_current_user  # type: ignore
     from db import tx  # type: ignore
-    from limits import RateLimiter  # type: ignore
+    from limits import RateLimiter, read_bounded_body, request_network  # type: ignore
     from plans import PLANS, limits_for  # type: ignore
 
 router = APIRouter(tags=["entitlement"])
@@ -647,16 +647,7 @@ async def desktop_authorize_confirm(request: Request) -> HTMLResponse:
 
 @router.post("/api/entitlement/refresh")
 async def refresh_entitlement(request: Request) -> JSONResponse:
-    length = request.headers.get("content-length")
-    if length:
-        try:
-            if int(length) > MAX_REFRESH_BYTES:
-                raise HTTPException(413, "refresh request too large")
-        except ValueError as exc:
-            raise HTTPException(400, "invalid content length") from exc
-    body = await request.body()
-    if len(body) > MAX_REFRESH_BYTES:
-        raise HTTPException(413, "refresh request too large")
+    body = await read_bounded_body(request, MAX_REFRESH_BYTES, "refresh request too large")
     refresh_nonce = request.headers.get("x-chudware-refresh-nonce", "")
     if not _STATE_RE.fullmatch(refresh_nonce):
         raise HTTPException(400, "invalid refresh nonce")
@@ -669,7 +660,7 @@ async def refresh_entitlement(request: Request) -> JSONResponse:
         try:
             legacy = verify_compact(body.decode("ascii"))
         except (HTTPException, UnicodeDecodeError):
-            key = request.client.host if request.client else "unknown"
+            key = request_network(request)
             _refresh_by_ip.enforce(key, "entitlement refreshes")
             raise HTTPException(401, "invalid entitlement token")
         _refresh_by_subject.enforce(legacy["sub"], "entitlement refreshes")

@@ -70,6 +70,8 @@ def _isolate(pg, tmp_path, monkeypatch):
     # whichever test file happened to run first.
     monkeypatch.setattr(orgs, "api_writes", RateLimiter(10_000, 60.0))
     monkeypatch.setattr(mailer, "outbound", RateLimiter(10_000, 3600.0))
+    monkeypatch.setattr(settings, "mail_global_per_hour", 10_000)
+    monkeypatch.setattr(mailer, "outbound_global", RateLimiter(10_000, 3600.0, max_keys=1))
 
     _seed(OWNER, plan="studio")
     _seed(ADMIN, plan="trial")

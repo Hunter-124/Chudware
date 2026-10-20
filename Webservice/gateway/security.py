@@ -17,12 +17,12 @@ from fastapi.responses import JSONResponse
 try:
     from .db import tx
     from .entitlement import _enforcement_state, _sign_object, _verify_device_object
-    from .limits import RateLimiter
+    from .limits import RateLimiter, request_network
     from .metrics import registry
 except ImportError:
     from db import tx  # type: ignore
     from entitlement import _enforcement_state, _sign_object, _verify_device_object  # type: ignore
-    from limits import RateLimiter  # type: ignore
+    from limits import RateLimiter, request_network  # type: ignore
     from metrics import registry  # type: ignore
 
 router = APIRouter(tags=["security"])
@@ -111,7 +111,7 @@ def _response(status: str, batch_id: str, subject: str, sequence: int, policy_id
 @router.post("/api/security/events")
 async def ingest_security_events(request: Request) -> JSONResponse:
     # Charge rejected bodies as well, before buffering or parsing attacker input.
-    _by_ip.enforce(request.client.host if request.client else "unknown", "security event batches")
+    _by_ip.enforce(request_network(request), "security event batches")
     length = request.headers.get("content-length")
     if length:
         try:

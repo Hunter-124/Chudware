@@ -25,6 +25,7 @@ try:
     from .auth import get_current_user
     from .config import settings
     from .db import tx
+    from .limits import BILLING_WEBHOOK_BYTES, read_bounded_body
     from .plans import PLANS, is_purchasable, limits_for
 except ImportError:  # uvicorn app:app from the package dir
     import accounts as _accounts_mod
@@ -33,11 +34,12 @@ except ImportError:  # uvicorn app:app from the package dir
     from auth import get_current_user
     from config import settings
     from db import tx
+    from limits import BILLING_WEBHOOK_BYTES, read_bounded_body
     from plans import PLANS, is_purchasable, limits_for
 
 log = logging.getLogger("chudware-web.billing")
 
-MAX_WEBHOOK_BYTES = 64 * 1024
+MAX_WEBHOOK_BYTES = BILLING_WEBHOOK_BYTES
 _DOWNGRADE_STATUSES = {"past_due", "unpaid", "canceled", "incomplete_expired"}
 
 
@@ -711,12 +713,7 @@ async def stripe_webhook(request: Request) -> dict[str, str]:
     _require_configured(cfg)
     if not cfg.webhook_secret:
         raise HTTPException(503, "billing not configured: webhook secret missing")
-    declared = request.headers.get("content-length")
-    if declared and declared.isdigit() and int(declared) > MAX_WEBHOOK_BYTES:
-        raise HTTPException(413, "webhook payload too large")
-    body = await request.body()
-    if len(body) > MAX_WEBHOOK_BYTES:
-        raise HTTPException(413, "webhook payload too large")
+    body = await read_bounded_body(request, MAX_WEBHOOK_BYTES, "webhook payload too large")
     signature = request.headers.get("stripe-signature") or ""
     if not signature:
         raise HTTPException(400, "missing Stripe-Signature header")

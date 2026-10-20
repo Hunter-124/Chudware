@@ -15,9 +15,11 @@ import json
 import socket
 import ssl
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from string import Template
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -29,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config  # noqa: E402
 import db  # noqa: E402
+import limits  # noqa: E402
 import mailer  # noqa: E402
 
 VERIFY_CTX = {
@@ -63,6 +66,8 @@ def _lease_seconds(row: dict) -> float:
 def mail(pg, monkeypatch):
     """mailer on a virgin schema, console backend, fresh rate-limit budget."""
     monkeypatch.setattr(mailer, "outbound", mailer.RateLimiter(5, 3600.0))
+    monkeypatch.setattr(mailer.settings, "mail_global_per_hour", 20)
+    monkeypatch.setattr(mailer, "outbound_global", mailer.RateLimiter(20, 3600.0, max_keys=1))
     monkeypatch.setattr(mailer.settings, "mail_backend", "console")
     return mailer
 
@@ -93,6 +98,23 @@ def dead_smtp(monkeypatch):
 def test_console_is_the_default_backend(monkeypatch):
     monkeypatch.delenv("CHUDWARE_MAIL_BACKEND", raising=False)
     assert config.Settings().mail_backend == "console"
+
+
+def test_global_mail_budget_has_a_sane_default(monkeypatch):
+    monkeypatch.delenv("CHUDWARE_MAIL_GLOBAL_PER_HOUR", raising=False)
+    assert config.Settings().mail_global_per_hour == 20
+
+
+def test_global_mail_budget_reads_the_environment(monkeypatch):
+    monkeypatch.setenv("CHUDWARE_MAIL_GLOBAL_PER_HOUR", "7")
+    assert config.Settings().mail_global_per_hour == 7
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_nonpositive_global_mail_budget_refuses_to_boot(monkeypatch, value):
+    monkeypatch.setenv("CHUDWARE_MAIL_GLOBAL_PER_HOUR", value)
+    with pytest.raises(ValueError, match="CHUDWARE_MAIL_GLOBAL_PER_HOUR"):
+        config.Settings()
 
 
 def test_unknown_backend_refuses_to_boot(monkeypatch):
@@ -330,6 +352,8 @@ def test_unrenderable_mail_is_dropped_without_burning_budget(mail):
     for _ in range(5):
         mailer.send("ada@example.com", "verify_email", VERIFY_CTX)
     assert len(_rows()) == 5
+    assert mailer.outbound_global.allowed("all")
+    assert len(mailer.outbound_global._hits["all"]) == 5
 
 
 def test_outbound_rate_limit_is_per_recipient(mail):
@@ -341,6 +365,75 @@ def test_outbound_rate_limit_is_per_recipient(mail):
     queued = [row["to_addr"] for row in _rows()]
     assert queued.count("ada@example.com") == 5
     assert queued.count("grace@example.com") == 1
+
+
+@pytest.mark.parametrize("aliases", [
+    ["Ada@example.com", "ada+signup@example.com", "ADA+reset@EXAMPLE.COM"],
+    ["ada.lovelace@gmail.com", "adalovelace+signup@googlemail.com",
+     "A.D.A.L.O.V.E.L.A.C.E+reset@GMAIL.COM"],
+])
+def test_recipient_aliases_share_budget_without_rewriting_delivery(mail, aliases):
+    destinations = [aliases[i % len(aliases)] for i in range(5)]
+    for address in destinations:
+        mailer.send(f"  {address}  ", "verify_email", VERIFY_CTX)
+    mailer.send(aliases[-1], "verify_email", VERIFY_CTX)
+
+    rows = _rows()
+    assert [row["to_addr"] for row in rows] == destinations
+    for row in rows:
+        assert mailer.decrypt_context(
+            row["to_addr"], row["template"], row["ctx_json"]
+        ) == VERIFY_CTX
+
+
+def test_dots_in_non_gmail_recipients_do_not_merge_mailboxes(mail):
+    for _ in range(5):
+        mailer.send("ada.lovelace@example.com", "verify_email", VERIFY_CTX)
+    mailer.send("adalovelace@example.com", "verify_email", VERIFY_CTX)
+    assert len(_rows()) == 6
+
+
+def test_recipient_denials_do_not_spend_global_budget(mail, monkeypatch):
+    monkeypatch.setattr(mailer.settings, "mail_global_per_hour", 6)
+    for i in range(15):
+        mailer.send(f"a.d.a+{i}@googlemail.com", "verify_email", VERIFY_CTX)
+    mailer.send("grace@example.com", "verify_email", VERIFY_CTX)
+    assert len(_rows()) == 6
+    assert _rows()[-1]["to_addr"] == "grace@example.com"
+
+
+def test_global_mail_budget_is_configurable_and_survives_recipient_lru_churn(
+    mail, monkeypatch
+):
+    monkeypatch.setenv("CHUDWARE_MAIL_GLOBAL_PER_HOUR", "3")
+    monkeypatch.setattr(
+        mailer.settings, "mail_global_per_hour", config.Settings().mail_global_per_hour
+    )
+    monkeypatch.setattr(mailer, "outbound", mailer.RateLimiter(5, 3600.0, max_keys=2))
+    now = [1000.0]
+    monkeypatch.setattr(limits, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    for i in range(8):
+        mailer.send(f"person{i}@example.com", "verify_email", VERIFY_CTX)
+    assert len(_rows()) == 3
+    assert mailer.outbound_global.window == 3600.0
+    # Global refusals have not spent the new recipient's budget.
+    for _ in range(5):
+        assert mailer.outbound.check("person7@example.com")
+
+    now[0] += 3601.0
+    mailer.send("another@example.com", "verify_email", VERIFY_CTX)
+    assert len(_rows()) == 4
+
+
+def test_global_mail_reservations_are_atomic_across_preparing_threads(mail, monkeypatch):
+    monkeypatch.setattr(mailer.settings, "mail_global_per_hour", 3)
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        prepared = list(workers.map(
+            lambda i: mailer.prepare(f"person{i}@example.com", "verify_email", VERIFY_CTX),
+            range(20),
+        ))
+    assert sum(message is not None for message in prepared) == 3
+    assert _rows() == [], "preparing must not enqueue outside the token transaction"
 
 
 # ---------------------------------------------------------------------------

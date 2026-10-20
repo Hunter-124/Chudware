@@ -14,17 +14,21 @@ from typing import Any
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 try:
     from . import db, provider_broker, deployment_drain
     from .auth import AuthMiddleware, User, get_current_user
     from .config import settings
+    from .limits import RequestBodyLimitMiddleware
     from .chat import Presence, presence, router as chat_router, _scope_key  # noqa: F401
     from .bucket import router as bucket_router
 except ImportError:  # uvicorn app:app from package dir
     import db, provider_broker, deployment_drain  # type: ignore
     from auth import AuthMiddleware, User, get_current_user
     from config import settings
+    from limits import RequestBodyLimitMiddleware
     from chat import Presence, presence, router as chat_router, _scope_key  # noqa: F401
     from bucket import router as bucket_router
 
@@ -140,29 +144,41 @@ _CSP = (
 )
 
 
-@app.middleware("http")
-async def _security_headers(request: Request, call_next):
-    resp = await call_next(request)
-    h = resp.headers
-    h.setdefault("X-Content-Type-Options", "nosniff")
-    h.setdefault("Referrer-Policy", "same-origin")
-    # Stream iframe and popout are same-origin; nothing embeds us cross-site.
-    h.setdefault("X-Frame-Options", "SAMEORIGIN")
-    h.setdefault("Content-Security-Policy", _CSP)
-    h.setdefault(
-        "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
-    )
-    h.setdefault(
-        "Permissions-Policy", "geolocation=(), microphone=(), camera=()"
-    )
-    # setdefault: appserve already sets COOP/COEP for /app — never fight it.
-    h.setdefault("Cross-Origin-Opener-Policy", "same-origin")
-    return resp
+class _SecurityHeadersMiddleware:
+    """Keep receive exceptions intact for bounded multipart parser cleanup.
+
+    BaseHTTPMiddleware groups receive failures in an ExceptionGroup, obscuring
+    the size exception that Starlette must catch to close its spooled files.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async def with_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                h = MutableHeaders(scope=message)
+                h.setdefault("X-Content-Type-Options", "nosniff")
+                h.setdefault("Referrer-Policy", "same-origin")
+                h.setdefault("X-Frame-Options", "SAMEORIGIN")
+                h.setdefault("Content-Security-Policy", _CSP)
+                h.setdefault("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+                h.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+                # appserve already sets COOP/COEP for /app; never fight it.
+                h.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+            await send(message)
+
+        await self.app(scope, receive, with_headers)
 
 
-# Keep admission outside BaseHTTPMiddleware: its in-memory response stream may
-# finish before the final body reaches the actual ASGI send boundary.
+app.add_middleware(_SecurityHeadersMiddleware)
+
+
+# Admission observes the actual ASGI send boundary, including streaming bodies.
 app.add_middleware(deployment_drain.AdmissionMiddleware)
+# Last registered is outermost: enforce wire limits before auth, admission, or
+# FastAPI's automatic body parsing, without buffering authenticated uploads.
+app.add_middleware(RequestBodyLimitMiddleware)
 
 
 admin_router = APIRouter(prefix="/api/admin", tags=["admin"])

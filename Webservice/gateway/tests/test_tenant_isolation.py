@@ -72,6 +72,8 @@ def _isolate(pg, tmp_path, monkeypatch):
     # earlier test file; the org/team cases below make many small writes.
     monkeypatch.setattr(orgs, "api_writes", RateLimiter(10_000, 60.0))
     monkeypatch.setattr(mailer, "outbound", RateLimiter(10_000, 3600.0))
+    monkeypatch.setattr(settings, "mail_global_per_hour", 10_000)
+    monkeypatch.setattr(mailer, "outbound_global", RateLimiter(10_000, 3600.0, max_keys=1))
 
     _seed("alice@crimson.ua.edu", "Alice")
     _seed("bob@crimson.ua.edu", "Bob")

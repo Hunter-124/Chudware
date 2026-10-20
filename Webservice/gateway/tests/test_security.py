@@ -218,7 +218,7 @@ def test_chunked_security_body_stops_at_compressed_limit_without_reading_tail(mo
 
 def test_ingress_rate_limit_precedes_body_reads(monkeypatch):
     limiter = security.RateLimiter(1, 60.0)
-    limiter.enforce("blocked-fixture", "security event batches")
+    limiter.enforce("unknown", "security event batches")
     monkeypatch.setattr(security, "_by_ip", limiter)
 
     async def receive():

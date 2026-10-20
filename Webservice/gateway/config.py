@@ -137,6 +137,10 @@ class Settings:
         default_factory=lambda: _env("CHUDWARE_MAIL_FROM", DEFAULT_MAIL_FROM)
         or DEFAULT_MAIL_FROM
     )
+    mail_global_per_hour: int = field(
+        # Reservations, not transport attempts: retries reuse their outbox row.
+        default_factory=lambda: _env_int("CHUDWARE_MAIL_GLOBAL_PER_HOUR", 20)
+    )
     resend_api_key: str = field(
         default_factory=lambda: _env("CHUDWARE_RESEND_API_KEY", "") or ""
     )
@@ -474,6 +478,8 @@ class Settings:
                 "CHUDWARE_MAIL_BACKEND must be one of "
                 f"{', '.join(sorted(MAIL_BACKENDS))} — got {self.mail_backend!r}"
             )
+        if self.mail_global_per_hour < 1:
+            raise ValueError("CHUDWARE_MAIL_GLOBAL_PER_HOUR must be at least 1")
         # Fail at boot, not on the first password-reset request: a backend
         # selected without its credential can never deliver anything.
         if self.mail_backend == "resend" and not self.resend_api_key:

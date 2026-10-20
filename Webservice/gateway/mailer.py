@@ -26,6 +26,7 @@ import logging
 import os
 import smtplib
 import ssl
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -85,10 +86,12 @@ DRAIN_INTERVAL_SEC = 10.0
 HTTP_TIMEOUT_SEC = 15.0
 SMTP_TIMEOUT_SEC = 20.0
 
-# Five messages per hour per recipient, using the same sliding-window limiter
-# the API routes use. A resend-button masher would otherwise burn the whole
-# 100/day Resend free-tier allowance in well under a minute.
+# Aliases share the five-per-hour recipient budget. A separate, single-key
+# budget bounds reservations across recipients even if their LRU entries churn.
+# Retrying a queued message never makes another reservation.
 outbound = RateLimiter(5, 3600.0)
+outbound_global = RateLimiter(settings.mail_global_per_hour, 3600.0, max_keys=1)
+_reservation_lock = threading.Lock()
 
 
 class MailDeliveryError(RuntimeError):
@@ -157,6 +160,16 @@ class Prepared:
     expires_at: datetime
 
 
+def _recipient_key(address: str) -> str:
+    """Mailbox aliases share abuse budget without rewriting delivery addresses."""
+    local, domain = address.strip().lower().rsplit("@", 1)
+    local = local.split("+", 1)[0]
+    if domain in {"gmail.com", "googlemail.com"}:
+        domain = "gmail.com"
+        local = local.replace(".", "")
+    return f"{local}@{domain}"
+
+
 def prepare(to: str, template: str, ctx: Mapping[str, Any], *,
             expires_at: datetime | None = None) -> Prepared | None:
     """Validate/encrypt and reserve mail budget BEFORE replacing any capability."""
@@ -174,9 +187,19 @@ def prepare(to: str, template: str, ctx: Mapping[str, Any], *,
         # Context and rendered bodies may contain bearer capabilities.
         log.warning("mail: cannot prepare template=%s", template)
         return None
-    if not outbound.check(addr.lower()):
-        log.warning("mail: rate limited %s template=%s", addr, template)
-        return None
+    key = _recipient_key(addr)
+    # Both decisions are one reservation even when callers prepare in threads.
+    # Check the recipient without recording first: rejected aliases must not
+    # consume the service-wide allowance, nor vice versa.
+    with _reservation_lock:
+        if not outbound.allowed(key):
+            log.warning("mail: rate limited %s template=%s", addr, template)
+            return None
+        outbound_global.limit = settings.mail_global_per_hour
+        if not outbound_global.check("all"):
+            log.warning("mail: global reservation limit template=%s", template)
+            return None
+        outbound.check(key)
     if expires_at is None:
         hours = 1 if template == "password_reset" else 24
         expires_at = datetime.now(timezone.utc) + timedelta(hours=hours)

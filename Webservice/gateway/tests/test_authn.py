@@ -4,7 +4,7 @@ Every test here defends a property that, if it broke, would be exploitable
 rather than merely annoying:
 
 * the login endpoint is not an account-existence oracle,
-* brute force is capped per-account and per-address,
+* wrong passwords are capped per-account and client network, never successes,
 * suspending an account ends its live sessions on the next request,
 * verification tokens are single-use and never stored in plaintext,
 * the session cookie carries HttpOnly / Secure / SameSite=Lax / Path=/,
@@ -24,14 +24,15 @@ import json
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from html.parser import HTMLParser
 from pathlib import Path
-from threading import Event
+from threading import Barrier, BoundedSemaphore, Event, Lock
 from urllib.parse import parse_qs, quote, urlparse
 
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
 GATEWAY_DIR = Path(__file__).resolve().parents[1]
@@ -93,6 +94,10 @@ def client(pg, monkeypatch):
     limits.login_by_email._hits.clear()
     limits.login_by_ip._hits.clear()
     monkeypatch.setattr(mailer, "outbound", limits.RateLimiter(5, 3600.0))
+    monkeypatch.setattr(
+        mailer, "outbound_global",
+        limits.RateLimiter(settings.mail_global_per_hour, 3600.0, max_keys=1),
+    )
     _DELIVERED_MESSAGES.clear()
     monkeypatch.setattr(mailer, "_deliver", lambda _to, _message: None)
     monkeypatch.setattr(settings, "dev_mode", False)
@@ -101,6 +106,15 @@ def client(pg, monkeypatch):
     app = _protected_app()
     with TestClient(app, client=CLIENT, base_url="https://testserver") as c:
         yield c
+
+
+@pytest.fixture()
+def password_workers(monkeypatch):
+    """Isolate bounded worker admission for blocking/cancellation regressions."""
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        monkeypatch.setattr(authn, "_PASSWORD_POOL", pool)
+        monkeypatch.setattr(authn, "_PASSWORD_SLOTS", BoundedSemaphore(2))
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +153,40 @@ def _token_from(url: str) -> str:
     return parse_qs(urlparse(url).query)["token"][0]
 
 
+def _confirm_verification(client: TestClient, token: str):
+    """Follow the mail link, then submit the actual server-rendered browser form."""
+    class ConfirmationForm(HTMLParser):
+        forms: list[dict[str, str]]
+
+        def __init__(self):
+            super().__init__()
+            self.forms = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "form":
+                self.forms.append(dict(attrs))
+
+    page = client.get(f"/api/auth/verify?token={quote(token, safe='')}", follow_redirects=False)
+    assert page.status_code == 200
+    assert "set-cookie" not in page.headers
+    assert page.headers["cache-control"] == "no-store"
+    assert page.headers["referrer-policy"] == "no-referrer"
+    parser = ConfirmationForm()
+    parser.feed(page.text)
+    assert len(parser.forms) == 1
+    form = parser.forms[0]
+    assert form["method"].lower() == "post"
+    return client.post(form["action"], follow_redirects=False)
+
+
+def _request(path: str, address: str = CLIENT[0]) -> Request:
+    return Request({
+        "type": "http", "scheme": "https", "method": "POST",
+        "path": path, "headers": [], "client": (address, CLIENT[1]),
+        "server": ("testserver", 443), "query_string": b"",
+    })
+
+
 def register(client: TestClient, email: str, password: str = GOOD_PASSWORD):
     return client.post(
         "/api/auth/register", json={"email": email, "password": password}
@@ -146,13 +194,11 @@ def register(client: TestClient, email: str, password: str = GOOD_PASSWORD):
 
 
 def register_and_verify(client: TestClient, email: str, password: str = GOOD_PASSWORD):
-    """Walk the whole customer path: register, drain the mail, click the link."""
+    """Walk the customer path: register, read mail, open link, confirm, sign in."""
     assert register(client, email, password).status_code == 202
     assert _drain() == 1
     verify_url = _delivered("verify_email")["ctx"]["verify_url"]
-    response = client.get(
-        f"/api/auth/verify?token={_token_from(verify_url)}", follow_redirects=False
-    )
+    response = _confirm_verification(client, _token_from(verify_url))
     assert response.status_code == 303
     assert "set-cookie" not in response.headers
     assert login(client, email, password).status_code == 200
@@ -188,10 +234,17 @@ def test_registration_pends_then_verification_activates_a_trial(client):
     rendered = mailer.render("verify_email", mail["ctx"])
     assert mail["ctx"]["verify_url"] in rendered.text
 
-    client.get(
-        f"/api/auth/verify?token={_token_from(mail['ctx']['verify_url'])}",
-        follow_redirects=False,
-    )
+    token = _token_from(mail["ctx"]["verify_url"])
+    for _ in range(2):
+        preview = client.get(f"/api/auth/verify?token={token}", follow_redirects=False)
+        assert preview.status_code == 200
+        assert "set-cookie" not in preview.headers
+        assert accounts.get_account("new@example.com").status == "pending"
+        assert authn.get_credential("new@example.com")["email_verified"] is False
+        with db.tx() as cur:
+            cur.execute("SELECT used_at FROM email_tokens WHERE token_hash = %s", (authn.token_hash(token),))
+            assert cur.fetchone()["used_at"] is None
+    assert _confirm_verification(client, token).status_code == 303
 
     account = accounts.get_account("new@example.com")
     assert account.status == "active"
@@ -281,10 +334,15 @@ def test_unknown_email_path_still_spends_an_argon2_verification(client):
     assert calls == [WRONG_PASSWORD]
 
 
-def test_registering_a_taken_address_returns_the_same_202_not_a_409(client):
+@pytest.mark.parametrize("verified", [False, True])
+def test_registering_a_taken_address_returns_the_same_202_not_a_409(client, verified):
     fresh = register(client, "first@example.com")
     _drain()
-    repeat = register(client, "first@example.com")
+    if verified:
+        token = _token_from(_delivered("verify_email")["ctx"]["verify_url"])
+        assert _confirm_verification(client, token).status_code == 303
+    original = authn.get_credential("first@example.com")
+    repeat = register(client, "first@example.com", WRONG_PASSWORD)
 
     assert repeat.status_code == fresh.status_code == 202
     assert repeat.content == fresh.content
@@ -294,6 +352,98 @@ def test_registering_a_taken_address_returns_the_same_202_not_a_409(client):
     assert warning["to_addr"] == "first@example.com"
     # And the second attempt did NOT overwrite the first password.
     assert len([r for r in _outbox() if r["template"] == "verify_email"]) == 1
+    assert authn.get_credential("first@example.com") == original
+    assert authn.verify_password(original["password_hash"], GOOD_PASSWORD)
+    assert not authn.verify_password(original["password_hash"], WRONG_PASSWORD)
+
+
+@pytest.mark.parametrize("peer,forwarded,expected", [
+    ("127.0.0.1", "not-an-address", "127.0.0.1"),
+    ("::1", "198.51.100.1, 198.51.100.2", "::1"),
+    ("127.0.0.1", " 2001:0db8::0001 ", "2001:db8::1"),
+    ("203.0.113.9", "198.51.100.1", "203.0.113.9"),
+])
+def test_session_metadata_uses_only_valid_trusted_forwarded_addresses(peer, forwarded, expected):
+    request = _request("/api/auth/login", peer)
+    request.scope["headers"] = [(b"cf-connecting-ip", forwarded.encode())]
+    assert authn.client_ip(request) == expected
+
+
+@pytest.mark.parametrize("status", ["pending", "active", "denied", "suspended"])
+def test_registration_never_adds_a_password_to_an_existing_passwordless_account(
+    client, status,
+):
+    email = "passwordless@example.com"
+    accounts.ensure_account(email)
+    if status != "pending":
+        accounts.set_status(email, status)
+    original = accounts.get_account(email)
+    prior_token = authn.mint_token(email, authn.PURPOSE_VERIFY, authn.VERIFY_TTL)
+
+    response = register(client, f"  {email.upper()}  ", WRONG_PASSWORD)
+    assert response.status_code == 202
+    assert response.json() == {"status": "accepted"}
+    assert authn.get_credential(email) is None
+    assert accounts.get_account(email) == original
+    assert [row["template"] for row in _outbox()] == ["register_exists"]
+    assert authn._live_token_email(prior_token, authn.PURPOSE_VERIFY) == email
+    with db.tx() as cur:
+        cur.execute("SELECT count(*) AS n FROM accounts")
+        assert cur.fetchone()["n"] == 1
+        cur.execute("SELECT count(*) AS n FROM email_tokens")
+        assert cur.fetchone()["n"] == 1
+    assert login(client, email, WRONG_PASSWORD).status_code == 401
+
+
+def test_registration_losing_account_insert_race_cannot_attach_its_password(client, monkeypatch):
+    email = "other-creator@example.com"
+    real_lookup = accounts.get_account
+    created = []
+
+    def racing_lookup(address):
+        account = real_lookup(address)
+        if address == email and account is None and not created:
+            # A non-registration creator does not share the advisory lock. It
+            # commits a passwordless account after our precheck but before INSERT.
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                created.append(pool.submit(accounts.ensure_account, email).result(timeout=10))
+        return account
+
+    monkeypatch.setattr(accounts, "get_account", racing_lookup)
+    assert register(client, email, WRONG_PASSWORD).status_code == 202
+    assert accounts.get_account(email) == created[0]
+    assert authn.get_credential(email) is None
+    assert [row["template"] for row in _outbox()] == ["register_exists"]
+    with db.tx() as cur:
+        cur.execute("SELECT count(*) AS n FROM email_tokens")
+        assert cur.fetchone()["n"] == 0
+
+
+def test_racing_registrations_create_one_credential_and_one_verification(client, monkeypatch):
+    email = "registration-race@example.com"
+    hashed = Barrier(2)
+    real_hash = authn.hash_password
+
+    def concurrent_hash(password):
+        digest = real_hash(password)
+        hashed.wait(timeout=10)
+        return digest
+
+    monkeypatch.setattr(authn, "hash_password", concurrent_hash)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(register, client, email, GOOD_PASSWORD)
+        second = pool.submit(register, client, email.upper(), WRONG_PASSWORD)
+        responses = [first.result(timeout=15), second.result(timeout=15)]
+    assert all(response.status_code == 202 for response in responses)
+    assert responses[0].content == responses[1].content
+    digest = authn.get_credential(email)["password_hash"]
+    assert sum(authn.verify_password(digest, password) for password in [GOOD_PASSWORD, WRONG_PASSWORD]) == 1
+    assert sorted(row["template"] for row in _outbox()) == ["register_exists", "verify_email"]
+    with db.tx() as cur:
+        cur.execute("SELECT count(*) AS n FROM accounts")
+        assert cur.fetchone()["n"] == 1
+        cur.execute("SELECT count(*) AS n FROM email_tokens WHERE used_at IS NULL")
+        assert cur.fetchone()["n"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +454,6 @@ def test_registering_a_taken_address_returns_the_same_202_not_a_409(client):
 def test_sixth_wrong_password_for_one_email_is_throttled(client):
     register_and_verify(client, "target@example.com")
     client.post("/api/auth/logout")
-    limits.login_by_email._hits.pop("target@example.com", None)
 
     per_email = limits.login_by_email.limit
     for attempt in range(per_email):
@@ -315,8 +464,8 @@ def test_sixth_wrong_password_for_one_email_is_throttled(client):
     assert throttled.status_code == 429
     assert int(throttled.headers["Retry-After"]) >= 1
 
-    # Even the CORRECT password is refused while the account is throttled —
-    # otherwise the limiter is a speed bump, not a lock.
+    # Only this account+network is locked. Correct passwords are refused here
+    # until its failed-guess budget recovers, without affecting other networks.
     assert login(client, "target@example.com", GOOD_PASSWORD).status_code == 429
 
 
@@ -350,7 +499,6 @@ def test_login_limiters_are_enforced_before_any_hashing(client):
     """
     register_and_verify(client, "costly@example.com")
     client.post("/api/auth/logout")
-    limits.login_by_email._hits.pop("costly@example.com", None)
 
     for _ in range(limits.login_by_email.limit):
         login(client, "costly@example.com", WRONG_PASSWORD)
@@ -363,6 +511,244 @@ def test_login_limiters_are_enforced_before_any_hashing(client):
     finally:
         authn.verify_password = original
     assert calls == [], "argon2 ran for a request that was already over budget"
+
+
+def test_successful_logins_never_consume_the_failed_password_budget(client):
+    email = "frequent@example.com"
+    register_and_verify(client, email)
+    for _ in range(limits.login_by_email.limit + 1):
+        assert login(client, email.upper(), GOOD_PASSWORD).status_code == 200
+    key = f"{limits.client_network(CLIENT[0])}|{email}"
+    assert limits.login_by_email.allowed(key)
+    assert key not in limits.login_by_email._hits
+    # Successes also do not shorten the number of subsequent failed guesses.
+    for _ in range(limits.login_by_email.limit):
+        assert login(client, email, WRONG_PASSWORD).status_code == 401
+    assert login(client, email, WRONG_PASSWORD).status_code == 429
+
+
+def test_correct_unverified_password_is_not_counted_as_a_failed_guess(client):
+    email = "still-pending@example.com"
+    assert register(client, email).status_code == 202
+    for _ in range(limits.login_by_email.limit + 1):
+        assert login(client, email, GOOD_PASSWORD).status_code == 403
+    for _ in range(limits.login_by_email.limit):
+        assert login(client, email, WRONG_PASSWORD).status_code == 401
+    assert login(client, email, WRONG_PASSWORD).status_code == 429
+
+
+def test_failed_login_budget_is_normalized_and_isolated_by_network(client):
+    email = "owner-network@example.com"
+    register_and_verify(client, email)
+    with TestClient(client.app, client=("198.51.100.44", 44_322), base_url="https://testserver") as attacker:
+        for n in range(limits.login_by_email.limit):
+            submitted = email.upper() if n % 2 else f" {email} "
+            assert login(attacker, submitted, WRONG_PASSWORD).status_code == 401
+        assert login(attacker, email, GOOD_PASSWORD).status_code == 429
+        assert login(client, email, GOOD_PASSWORD).status_code == 200
+
+
+def test_rotating_ipv6_addresses_share_the_failed_login_budget(client):
+    email = "ipv6-owner@example.com"
+    register_and_verify(client, email)
+    for n in range(limits.login_by_email.limit):
+        address = f"2001:db8:1234:5678::{n + 1}"
+        with TestClient(client.app, client=(address, 44_322), base_url="https://testserver") as attacker:
+            assert login(attacker, email, WRONG_PASSWORD).status_code == 401
+    with TestClient(client.app, client=("2001:db8:1234:5678::ffff", 44_322), base_url="https://testserver") as attacker:
+        assert login(attacker, email, GOOD_PASSWORD).status_code == 429
+    with TestClient(client.app, client=("2001:db8:1234:5679::1", 44_322), base_url="https://testserver") as owner:
+        assert login(owner, email, GOOD_PASSWORD).status_code == 200
+
+
+def test_all_request_argon2_work_is_off_loop_and_outside_database_transactions(client, monkeypatch):
+    real_hasher = authn._HASHER
+    real_work = authn._password_work
+    calls = []
+
+    class GuardedHasher:
+        def _off_loop(self):
+            with pytest.raises(RuntimeError):
+                asyncio.get_running_loop()
+            assert db._active.get() is None
+
+        def hash(self, password):
+            self._off_loop()
+            calls.append("hash")
+            return real_hasher.hash(password)
+
+        def verify(self, digest, password):
+            self._off_loop()
+            calls.append("verify")
+            return real_hasher.verify(digest, password)
+
+        def check_needs_rehash(self, digest):
+            self._off_loop()
+            return True  # Exercise the successful-login parameter upgrade too.
+
+    async def checked_work(function, *args):
+        assert db._active.get() is None, "request held a transaction across password work"
+        return await real_work(function, *args)
+
+    monkeypatch.setattr(authn, "_HASHER", GuardedHasher())
+    monkeypatch.setattr(authn, "_password_work", checked_work)
+    email = "off-loop@example.com"
+    assert register(client, email).status_code == 202
+    assert _drain() == 1
+    token = _token_from(_delivered("verify_email")["ctx"]["verify_url"])
+    assert _confirm_verification(client, token).status_code == 303
+    assert login(client, email, GOOD_PASSWORD).status_code == 200
+    assert login(client, "off-loop-unknown@example.com", WRONG_PASSWORD).status_code == 401
+    assert client.post("/api/auth/forgot", json={"email": email}).status_code == 202
+    assert _drain() == 1
+    reset_token = _token_from(_delivered("password_reset")["ctx"]["reset_url"])
+    assert client.post(
+        "/api/auth/reset", json={"token": reset_token, "password": WRONG_PASSWORD},
+    ).status_code == 200
+    assert calls.count("hash") == 3
+    assert calls.count("verify") == 2
+
+
+def test_password_pool_saturation_rejects_all_flows_without_queueing(
+    client, monkeypatch, password_workers,
+):
+    release = Event()
+    started = Event()
+    count_lock = Lock()
+    calls = []
+    real_hash = authn.hash_password
+    recovery_email = "busy-recovery@example.com"
+    accounts.ensure_account(recovery_email)
+    reset_token = authn.mint_token(recovery_email, authn.PURPOSE_RESET, authn.RESET_TTL)
+
+    def blocked_hash(password):
+        with count_lock:
+            calls.append(password)
+            if len(calls) == 2:
+                started.set()
+        assert release.wait(10), "password jobs were not released"
+        return real_hash(password)
+
+    monkeypatch.setattr(authn, "hash_password", blocked_hash)
+
+    async def exercise():
+        registering = [
+            asyncio.create_task(authn.register(
+                _request("/api/auth/register"),
+                {"email": f"busy-{n}@example.com", "password": GOOD_PASSWORD},
+            ))
+            for n in range(2)
+        ]
+        try:
+            assert await asyncio.wait_for(asyncio.to_thread(started.wait, 5), timeout=6)
+            # The event loop still services unrelated work while KDFs are busy.
+            response = await asyncio.wait_for(authn.logout(_request("/api/auth/logout")), timeout=1)
+            assert response.status_code == 200
+            assert not any(task.done() for task in registering)
+            for handler, path, body in [
+                (authn.register, "/api/auth/register", {"email": "overflow@example.com", "password": GOOD_PASSWORD}),
+                (authn.login, "/api/auth/login", {"email": "unknown@example.com", "password": GOOD_PASSWORD}),
+                (authn.reset, "/api/auth/reset", {"token": reset_token, "password": GOOD_PASSWORD}),
+            ]:
+                with pytest.raises(HTTPException) as caught:
+                    await asyncio.wait_for(handler(_request(path), body), timeout=1)
+                assert caught.value.status_code == 429
+                assert caught.value.headers["Retry-After"] == "1"
+            assert calls == [GOOD_PASSWORD, GOOD_PASSWORD]
+            assert authn._live_token_email(reset_token, authn.PURPOSE_RESET) == recovery_email
+            assert accounts.get_account("overflow@example.com") is None
+        finally:
+            release.set()
+            await asyncio.gather(*registering)
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_password_request_holds_slot_until_worker_actually_finishes(client, monkeypatch):
+    started = Event()
+    release = Event()
+    calls = []
+    slots = BoundedSemaphore(1)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(authn, "_PASSWORD_POOL", pool)
+        monkeypatch.setattr(authn, "_PASSWORD_SLOTS", slots)
+
+        def blocked_hash(password):
+            calls.append(password)
+            started.set()
+            assert release.wait(10), "cancelled job was not released"
+            return "unused-cancelled-digest"
+
+        monkeypatch.setattr(authn, "hash_password", blocked_hash)
+
+        async def exercise():
+            task = asyncio.create_task(authn.register(
+                _request("/api/auth/register"),
+                {"email": "cancelled@example.com", "password": GOOD_PASSWORD},
+            ))
+            try:
+                assert await asyncio.wait_for(asyncio.to_thread(started.wait, 5), timeout=6)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                with pytest.raises(HTTPException) as caught:
+                    await authn.register(
+                        _request("/api/auth/register"),
+                        {"email": "not-queued@example.com", "password": GOOD_PASSWORD},
+                    )
+                assert caught.value.status_code == 429
+                assert calls == [GOOD_PASSWORD]
+                assert not slots.acquire(blocking=False)
+            finally:
+                release.set()
+                if not task.done():
+                    await task
+
+        asyncio.run(exercise())
+    # Executor shutdown waited for the actual job, not the cancelled awaiter.
+    assert slots.acquire(blocking=False)
+    slots.release()
+    assert accounts.get_account("cancelled@example.com") is None
+    assert accounts.get_account("not-queued@example.com") is None
+
+
+def test_inflight_password_login_cannot_survive_oauth_only_admin_cutover(client, monkeypatch):
+    email = "retired-login@example.com"
+    accounts.ensure_account(email)
+    accounts.set_status(email, "active")
+    authn.set_password(email, GOOD_PASSWORD, verified=True)
+    started = Event()
+    release = Event()
+    real_verify = authn.verify_password
+
+    def blocked_verify(digest, password):
+        started.set()
+        assert release.wait(10), "login comparison was not released"
+        return real_verify(digest, password)
+
+    monkeypatch.setattr(authn, "verify_password", blocked_verify)
+
+    async def exercise():
+        signing_in = asyncio.create_task(authn.login(
+            _request("/api/auth/login"), {"email": email, "password": GOOD_PASSWORD},
+        ))
+        try:
+            assert await asyncio.wait_for(asyncio.to_thread(started.wait, 5), timeout=6)
+            assert await asyncio.wait_for(
+                asyncio.to_thread(authn._cli, ["grant-admin", "--email", email, "--oauth-only"]),
+                timeout=3,
+            ) == 0
+        finally:
+            release.set()
+        with pytest.raises(HTTPException) as caught:
+            await signing_in
+        assert caught.value.status_code == 401
+
+    asyncio.run(exercise())
+    assert authn.get_credential(email) is None
+    with db.tx() as cur:
+        cur.execute("SELECT count(*) AS n FROM sessions WHERE email = %s", (email,))
+        assert cur.fetchone()["n"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -504,12 +890,13 @@ def test_a_verify_token_is_single_use_and_never_stored_in_plaintext(client):
     # column — a database dump is the threat this defends against.
     assert token not in json.dumps(rows[0], default=str)
 
-    first = client.get(f"/api/auth/verify?token={token}", follow_redirects=False)
+    first = _confirm_verification(client, token)
     assert first.status_code == 303
 
     second = client.get(f"/api/auth/verify?token={token}", follow_redirects=False)
     assert second.status_code == 400
     assert "no longer valid" in second.text
+    assert client.post(f"/api/auth/verify?token={token}", follow_redirects=False).status_code == 400
 
 
 def test_a_verify_token_is_not_redeemable_as_a_password_reset(client):
@@ -593,9 +980,7 @@ def test_resend_verification_invalidates_the_previous_link(client):
     assert client.get(
         f"/api/auth/verify?token={first}", follow_redirects=False
     ).status_code == 400
-    assert client.get(
-        f"/api/auth/verify?token={second}", follow_redirects=False
-    ).status_code == 303
+    assert _confirm_verification(client, second).status_code == 303
 
 
 # ---------------------------------------------------------------------------
@@ -1536,7 +1921,11 @@ def test_verification_navigation_never_creates_or_replaces_session(client, exist
     with db.tx() as cur:
         cur.execute("SELECT count(*) AS n FROM sessions")
         count = cur.fetchone()["n"]
-    response = client.get(f"/api/auth/verify?token={token}", follow_redirects=False)
+    preview = client.get(f"/api/auth/verify?token={token}", follow_redirects=False)
+    assert preview.status_code == 200
+    assert authn.get_credential("attacker@example.com")["email_verified"] is False
+    assert client.cookies.get(authn.SESSION_COOKIE) == before
+    response = _confirm_verification(client, token)
     assert response.status_code == 303
     assert response.headers["location"] == "/signin?verified=1"
     assert "set-cookie" not in response.headers
@@ -1574,7 +1963,7 @@ def test_recipient_throttle_preserves_last_deliverable_token(client, purpose, en
     assert all(token not in json.dumps(rows, default=str) for token in tokens)
     assert _drain() == 5
     if purpose == authn.PURPOSE_VERIFY:
-        assert client.get(f"/api/auth/verify?token={tokens[-1]}", follow_redirects=False).status_code == 303
+        assert _confirm_verification(client, tokens[-1]).status_code == 303
     else:
         assert client.post("/api/auth/reset", json={"token": tokens[-1], "password": WRONG_PASSWORD}).status_code == 200
     assert authn.consume_token(tokens[-1], purpose) is None
@@ -1659,12 +2048,16 @@ def test_register_first_token_budget_refusal_preserves_previous_capability(clien
     if prior_link:
         accounts.ensure_account(email)
         previous = authn.mint_token(email, authn.PURPOSE_VERIFY, authn.VERIFY_TTL)
-    # Reserve the real shared recipient budget before first password registration.
+    # Reserve the recipient budget before registration. An existing passwordless
+    # account remains untouched, including its independently issued capability.
     # No transport or prepare stub: the actual reservation contract must refuse.
     for _ in range(mailer.outbound.limit):
         assert mailer.outbound.check(email)
     assert register(client, email).status_code == 202
-    assert authn.get_credential(email)["email_verified"] is False
+    if prior_link:
+        assert authn.get_credential(email) is None
+    else:
+        assert authn.get_credential(email)["email_verified"] is False
     assert _outbox() == []
     with db.tx() as cur:
         cur.execute("SELECT token_hash FROM email_tokens WHERE email=%s AND used_at IS NULL", (email,))
@@ -1672,8 +2065,8 @@ def test_register_first_token_budget_refusal_preserves_previous_capability(clien
             [authn.token_hash(previous)] if previous else []
         )
     if previous:
-        assert client.get(f"/api/auth/verify?token={previous}", follow_redirects=False).status_code == 303
-        assert authn.get_credential(email)["email_verified"] is True
+        assert _confirm_verification(client, previous).status_code == 303
+        assert authn.get_credential(email) is None
     else:
         # A budget-refused first registration has no link, but a later admitted
         # resend recovers normally without another registration/password change.
@@ -1681,7 +2074,7 @@ def test_register_first_token_budget_refusal_preserves_previous_capability(clien
         assert client.post("/api/auth/resend-verification", json={"email": email}).status_code == 202
         assert _drain() == 1
         token = _token_from(_delivered(authn.PURPOSE_VERIFY)["ctx"]["verify_url"])
-        assert client.get(f"/api/auth/verify?token={token}", follow_redirects=False).status_code == 303
+        assert _confirm_verification(client, token).status_code == 303
 
 
 @pytest.mark.parametrize("purpose,endpoint,url_key", [

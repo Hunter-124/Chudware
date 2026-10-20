@@ -46,8 +46,21 @@ def absolute_path(raw: str | Path) -> Path:
     return path
 
 
+def _overflow_uid() -> int:
+    """Owner shown for unmapped IDs inside a user namespace (systemd user units
+    with ProtectHome/PrivateUsers see root-owned ancestors as this UID)."""
+    try:
+        return int(Path("/proc/sys/kernel/overflowuid").read_text().strip())
+    except (OSError, ValueError):
+        return 65534
+
+
 def open_parent(path: Path, *, protected: bool = True) -> int:
-    """Pin every ancestor, refusing links; root-owned sticky /tmp is permitted."""
+    """Pin every ancestor, refusing links; root-owned sticky /tmp is permitted.
+
+    Root and the namespace overflow UID are equivalent here: an unmapped owner
+    is by construction not this service identity, and write bits still refuse."""
+    trusted = {0, _overflow_uid(), os.getuid()}
     fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         for part in path.parts[1:-1]:
@@ -55,8 +68,8 @@ def open_parent(path: Path, *, protected: bool = True) -> int:
             os.close(fd)
             fd = child
             info = os.fstat(fd)
-            sticky_root = info.st_uid == 0 and info.st_mode & stat.S_ISVTX
-            if protected and (info.st_uid not in {0, os.getuid()} or (info.st_mode & 0o022 and not sticky_root)):
+            sticky_root = info.st_uid in trusted - {os.getuid()} and info.st_mode & stat.S_ISVTX
+            if protected and (info.st_uid not in trusted or (info.st_mode & 0o022 and not sticky_root)):
                 raise ConfigurationError("unprotected_environment_ancestor")
         return fd
     except BaseException:

@@ -7,7 +7,6 @@ import contextlib
 import hashlib
 import hmac
 import inspect
-import ipaddress
 import json
 import os
 import re
@@ -18,6 +17,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit
 
 from services.plm import manifest as manifest_mod
 from services.plm.vault import Vault, VaultError
@@ -172,13 +172,6 @@ def _identity(value: Any) -> dict[str, Any]:
     return {"id": participant_id, "display": display, "account_id": account_id}
 
 
-def _loopback_host(host: str) -> bool:
-    if host.lower() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
 
 
 class ProductionEngine:
@@ -310,6 +303,7 @@ class LivePlmServer:
         engine_factory: Callable[[Path], Any] | None = None,
         host: str = "127.0.0.1",
         port: int = 0,
+        allowed_origins: tuple[str, ...] = (),
     ) -> None:
         self.project_dir = Path(project_dir).resolve()
         if not self.project_dir.is_dir():
@@ -328,9 +322,21 @@ class LivePlmServer:
             raise TypeError("token must be text, bytes, or None")
         if len(token_bytes) > 4096:
             raise ValueError("token is too large")
-        if not _loopback_host(host) and not token_bytes:
-            raise ValueError("a bearer token is required for a non-loopback listener")
+        if not token_bytes or not token_bytes.strip():
+            raise ValueError("a nonempty bearer token is required for every listener")
         self._token = token_bytes
+        # Native desktop clients send no Origin; browser origins must be
+        # explicitly configured, never inferred from loopback or wildcarded.
+        for origin in allowed_origins:
+            if not isinstance(origin, str):
+                raise ValueError("allowed origins must be explicit HTTP(S) origins")
+            parsed = urlsplit(origin)
+            if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                    or parsed.username is not None or parsed.password is not None
+                    or parsed.path or parsed.query or parsed.fragment or "*" in origin):
+                raise ValueError("allowed origins must be explicit HTTP(S) origins")
+            _ = parsed.port
+        self._origins = (None, *allowed_origins)
         self._engine_factory = engine_factory or ProductionEngine
         self.host = host
         self.port = port
@@ -356,6 +362,7 @@ class LivePlmServer:
                 self.host,
                 self.port,
                 compression=None,
+                origins=self._origins,
                 max_size=MAX_MESSAGE_BYTES,
                 max_queue=16,
                 ping_interval=20,
@@ -408,8 +415,6 @@ class LivePlmServer:
                 await websocket.close(4400, fault.reason[:80])
 
     def _authorized(self, supplied: Any) -> bool:
-        if not self._token:
-            return True
         raw = supplied.encode("utf-8") if isinstance(supplied, str) else b""
         return hmac.compare_digest(self._token, raw)
 
@@ -969,7 +974,8 @@ def _read_token_file(path: Path) -> str:
 async def _run_cli(args: argparse.Namespace) -> None:
     host, port = _parse_listen(args.listen)
     token = _read_token_file(Path(args.token_file)) if args.token_file else os.environ.get("CHUDWARE_PLM_LIVE_TOKEN")
-    server = LivePlmServer(args.project, token, host=host, port=port)
+    server = LivePlmServer(args.project, token, host=host, port=port,
+                           allowed_origins=tuple(args.origin))
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     installed: list[signal.Signals] = []
@@ -994,6 +1000,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", required=True, help="Vault project folder")
     parser.add_argument("--listen", default="127.0.0.1:8765", help="HOST:PORT (default: 127.0.0.1:8765)")
     parser.add_argument("--token-file", help="0600 UTF-8 bearer-token file")
+    parser.add_argument("--origin", action="append", default=[],
+                        help="Exact allowed browser Origin; repeat for multiple origins (native clients need none)")
     args = parser.parse_args(argv)
     try:
         asyncio.run(_run_cli(args))

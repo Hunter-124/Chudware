@@ -39,6 +39,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Callable
+from contextvars import copy_context
 
 from services.research.common import fail, now_ts
 
@@ -196,7 +197,8 @@ def _off_loop(fn: Callable[..., dict], *args: Any, **kwargs: Any) -> dict:
     except RuntimeError:
         return fn(*args, **kwargs)  # no loop on this thread — safe to run inline
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(fn, *args, **kwargs).result()
+        context = copy_context()
+        return pool.submit(context.run, fn, *args, **kwargs).result()
 
 
 def browser_login(site: str, *, timeout: float = DEFAULT_LOGIN_TIMEOUT_S,
@@ -214,6 +216,9 @@ def browser_login(site: str, *, timeout: float = DEFAULT_LOGIN_TIMEOUT_S,
     failed" even with valid credentials (proven live 2026-07-10). Cookies are
     exported after success/close and pushed into the CEF warm profile.
     """
+    from services.agent.request_context import in_cell
+    if in_cell():
+        return fail("cell_refused", "Headed browsing is unavailable in tenant cells.")
     lock = profiles.profile_lock(site)
     if not lock.acquire(blocking=False):
         return _busy(site)
@@ -405,9 +410,10 @@ def _finalize_login_cookies(site: str, profile_path: Path, *,
                 import_session_cookies(site, exported_cookies, verified=login_verified)
             except Exception:  # noqa: BLE001
                 pass
-            import threading
-            threading.Thread(target=_push_cookies_to_cef_warm, args=(exported_cookies,),
-                             daemon=True).start()
+            from services.worker_activity import start_background_thread
+
+            start_background_thread(_push_cookies_to_cef_warm, args=(exported_cookies,),
+                                    name="browser-cookie-forward")
     except Exception:  # noqa: BLE001
         pass
     meta = profiles.save_meta(site, **fields)
@@ -735,9 +741,10 @@ def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callabl
                 import_session_cookies(site, exported_cookies, verified=login_verified)
             except Exception:  # noqa: BLE001
                 pass
-            import threading
-            threading.Thread(target=_push_cookies_to_cef_warm, args=(exported_cookies,),
-                             daemon=True).start()
+            from services.worker_activity import start_background_thread
+
+            start_background_thread(_push_cookies_to_cef_warm, args=(exported_cookies,),
+                                    name="browser-cookie-forward")
     except Exception:  # noqa: BLE001 — verification / carry is best-effort, never fatal
         pass
     meta = profiles.save_meta(site, **fields)
@@ -770,6 +777,9 @@ def browser_fetch(url: str, site: str, *,
     (anonymous browsing of public catalogs is allowed; login-gated content
     still degrades to login_required via adapters).
     """
+    from services.agent.request_context import in_cell
+    if in_cell():
+        return fail("cell_refused", "Rendered browsing is unavailable in tenant cells.")
     started = time.perf_counter() if _TIMING else 0.0
     timing: dict[str, float] | None = {} if _TIMING else None
     if not no_cache:
@@ -899,6 +909,9 @@ def browser_interact(url: str, site: str, script: str, *,
     download URL is generated client-side (an adapter runs page JS to fetch a
     same-origin config endpoint / drive a control, then reads the sentinel out of the
     returned ``content``)."""
+    from services.agent.request_context import in_cell
+    if in_cell():
+        return fail("cell_refused", "Rendered browsing is unavailable in tenant cells.")
     profiles.ensure_profile(site)
     lock = profiles.profile_lock(site)
     if not lock.acquire(blocking=False):
@@ -946,13 +959,13 @@ def browser_interact(url: str, site: str, script: str, *,
 
 def browser_download(url: str, site: str, dest: Path, *,
                      min_interval: float = ratelimit.DEFAULT_MIN_INTERVAL_S,
-                     _cef: Any | None = None) -> dict:
+                     _cef: Any | None = None, public_only: bool = False) -> dict:
     """Download raw bytes under ``site``'s saved session into ``dest``.
 
-    Linux and Windows use CEF's direct ``CefURLRequest``. Darwin uses
-    Playwright's context request API with the same persistent profile cookies.
-    A missing profile is auto-created; gated files fail naturally and surface
-    login_required upstream.
+    Desktop Linux and Windows retain CEF's bounded authenticated URLRequest path;
+    Darwin and ``public_only`` use cookie-authenticated, connection-pinned streaming
+    HTTP. Tenant cells refuse profile-backed downloads and use public acquisition.
+    A missing desktop profile is auto-created; gated files surface login_required.
 
     A site whose 429/403 backoff cooldown is still armed is REFUSED immediately
     (``reason: "cooldown_active"`` plus ``retry_after_s``) instead of being slept
@@ -960,18 +973,29 @@ def browser_download(url: str, site: str, dest: Path, *,
     (``services.reveng.worker_rpc``) use that to bail out of the site and keep
     their partial results.
     """
+    from services.agent.request_context import in_cell
+    if in_cell():
+        return fail("cell_refused", "Authenticated browser downloads are unavailable in tenant cells; "
+                    "use public acquisition.")
+    from services.net.safe_http import safe_download_path
+    try:
+        safe_download_path(Path(dest).parent, url)
+    except ValueError as exc:
+        return fail("unsafe_filename", str(exc))
     profiles.ensure_profile(site)
     lock = profiles.profile_lock(site)
     if not lock.acquire(blocking=False):
         return _busy(site)
     try:
-        return _browser_download_locked(url, site, dest, min_interval=min_interval, cef=_cef)
+        return _browser_download_locked(url, site, dest, min_interval=min_interval, cef=_cef,
+                                        public_only=public_only)
     finally:
         lock.release()
 
 
 def _browser_download_locked(url: str, site: str, dest: Path, *,
-                             min_interval: float, cef: Any | None = None) -> dict:
+                             min_interval: float, cef: Any | None = None,
+                             public_only: bool = False) -> dict:
     ceiling = ratelimit.reserve_request(site)
     if ceiling is not None:
         return fail(ceiling, f"{site}: per-session request ceiling reached — this run has "
@@ -986,7 +1010,11 @@ def _browser_download_locked(url: str, site: str, dest: Path, *,
     try:
         try:
             from . import driver  # lazy import
-            backend = cef or driver.headless_client(profile=site)
+            if public_only:
+                from .pw_client import PlaywrightClient
+                backend = PlaywrightClient(profile=site, max_download_bytes=32 * 1024 * 1024)
+            else:
+                backend = cef or driver.headless_client(profile=site)
             r = backend.download(url, str(dest))
             status = r.get("status") or None
             if not r.get("ok"):

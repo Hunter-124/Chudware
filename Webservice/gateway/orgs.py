@@ -10,6 +10,8 @@ Two distinct entities, deliberately:
 * a **team** is a collaboration boundary inside one organization and owns
   exactly one shared bucket tree. Org owner/admin reach every team; an ordinary
   org member reaches only the teams it actually belongs to.
+  Team ``viewer`` membership grants read access only; explicit membership never
+  reduces the organization owner/admin's manager authority.
 
 Authorization is opaque by default: an org or team id that the caller may not
 see answers 404, never 403, so the UUIDs cannot be probed to learn which
@@ -22,10 +24,10 @@ The operator-configured university team additionally requires active, verified
 institutional identity even for an org manager. Domain admission enrolls
 eligible accounts as ordinary members; it never changes account entitlements.
 
-Storage is PostgreSQL via ``db.tx()`` (schema in
-``migrations/0015_organizations.sql``). Every mutation authorizes and acts in
-ONE transaction, so a concurrent removal cannot be raced by a request that
-already passed its permission check.
+Storage is PostgreSQL via ``db.tx()`` (schema in migrations 0015 and 0022).
+Every related mutation locks its organization row BEFORE checking permissions
+and acts in that transaction, serializing ownership transfers, role changes,
+removals, and deletions. Changes also revoke idle engine principals immediately.
 """
 
 from __future__ import annotations
@@ -67,7 +69,7 @@ ORG_MANAGER_ROLES = frozenset({"owner", "admin"})
 # Roles an invitation may carry. Nobody is ever invited straight to 'owner';
 # ownership only moves through an explicit transfer by the incumbent.
 INVITABLE_ROLES = frozenset({"admin", "member"})
-TEAM_ROLES = frozenset({"manager", "member"})
+TEAM_ROLES = frozenset({"manager", "member", "viewer"})
 
 # Plans that may own an organization and therefore fund its shared storage.
 # Trial and single-seat desktop are personal products; letting one own a team
@@ -163,6 +165,22 @@ def _chat_hub():
         from chat import hub  # type: ignore
     return hub
 
+
+def _cells():
+    try:
+        from . import cells
+    except ImportError:
+        import cells  # type: ignore
+    return cells
+
+
+def _lock_org(cur, org_id: str) -> None:
+    # Every membership mutation locks the parent before reading permissions.
+    # READ COMMITTED then observes transfers/removals that completed while waiting.
+    cur.execute("SELECT id FROM organizations WHERE id = %s FOR UPDATE", (org_id,))
+    if cur.fetchone() is None:
+        raise HTTPException(status_code=404, detail="organization not found")
+
 # ---------------------------------------------------------------------------
 # Authorization primitives (cursor-level: they run inside the caller's own
 # transaction, so nothing they assert can go stale before the write lands)
@@ -191,8 +209,11 @@ def _org_and_role(cur, org_id: str, email: str) -> tuple[dict[str, Any], str]:
 
 
 def _require_org(
-    cur, org_id: str, email: str, *, manage: bool = False, owner: bool = False
+    cur, org_id: str, email: str, *, manage: bool = False, owner: bool = False,
+    lock: bool = False,
 ) -> tuple[dict[str, Any], str]:
+    if lock:
+        _lock_org(cur, org_id)
     row, role = _org_and_role(cur, org_id, email)
     if owner and role != "owner":
         raise HTTPException(status_code=403, detail="organization owner only")
@@ -380,6 +401,10 @@ def university_team(email: str) -> str:
     org_id = canonical_uuid(settings.university_org_id)
     team_id = canonical_uuid(settings.university_team_id)
     with tx() as cur:
+        try:
+            _lock_org(cur, org_id)
+        except HTTPException:
+            raise HTTPException(503, "university workspace is not provisioned") from None
         cur.execute("SELECT 1 FROM teams WHERE id = %s AND org_id = %s", (team_id, org_id))
         if cur.fetchone() is None:
             raise HTTPException(503, "university workspace is not provisioned")
@@ -409,7 +434,7 @@ def university_root() -> Path:
     # Fail closed when FUSE disappears: never write a disconnected local shadow.
     if not root.is_absolute() or not root.is_mount():
         raise HTTPException(503, "university Box workspace mount is unavailable")
-    return root.resolve()
+    return root.absolute()
 
 # Shared bucket resolution (consumed by bucket.py)
 # ---------------------------------------------------------------------------
@@ -483,6 +508,8 @@ def resolve_team_bucket(email: str, team_id: str, *, write: bool) -> TeamBucket:
     team_role = row["team_role"]
     if org_role not in ORG_MANAGER_ROLES and team_role is None:
         raise HTTPException(status_code=404, detail="team not found")
+    if write and org_role not in ORG_MANAGER_ROLES and team_role == "viewer":
+        raise HTTPException(status_code=403, detail="forbidden_right")
 
     owner_email = row["owner_email"] or ""
     owner = accounts.get_account(owner_email) if owner_email else None
@@ -692,6 +719,16 @@ async def accept_invitation(request: Request, body: dict[str, Any]) -> dict[str,
         raise HTTPException(status_code=400, detail="token or invitation_id is required")
 
     with tx() as cur:
+        # Resolve without locking the invitation first: all writers take the
+        # organization lock before invitation/member locks, including deletion.
+        cur.execute(
+            f"SELECT org_id FROM org_invitations WHERE {predicate} AND lower(email) = %(email)s",
+            {"key": key, "email": email},
+        )
+        invitation = cur.fetchone()
+        if invitation is None:
+            raise HTTPException(status_code=404, detail="invitation not found or no longer valid")
+        _lock_org(cur, str(invitation["org_id"]))
         cur.execute(
             f"""
             UPDATE org_invitations
@@ -735,7 +772,11 @@ async def accept_invitation(request: Request, body: dict[str, Any]) -> dict[str,
             (email, org_id),
         )
         org = cur.fetchone() or {}
+        cur.execute("SELECT id FROM teams WHERE org_id = %s", (org_id,))
+        team_ids = [str(row["id"]) for row in cur.fetchall()]
     log.info("org invite accepted: org=%s by %s", org_id, email)
+    for team_id in team_ids:
+        _cells().revoke(email, team_id)
     team = (
         None
         if general is None
@@ -830,7 +871,7 @@ async def rename_organization(
     name = _clean_name(_body(body).get("name"), "organization name")
     api_writes.enforce(email, "organization changes")
     with tx() as cur:
-        _require_org(cur, org_uuid, email, manage=True)
+        _require_org(cur, org_uuid, email, manage=True, lock=True)
         cur.execute("UPDATE organizations SET name = %s WHERE id = %s", (name, org_uuid))
     return {"ok": True, "id": org_uuid, "name": name}
 
@@ -848,12 +889,13 @@ async def delete_organization(org_id: str, request: Request) -> dict[str, bool]:
     org_uuid = canonical_uuid(org_id)
     api_writes.enforce(email, "organization changes")
     with tx() as cur:
-        _require_org(cur, org_uuid, email, owner=True)
+        _require_org(cur, org_uuid, email, owner=True, lock=True)
         cur.execute("SELECT id FROM teams WHERE org_id = %s", (org_uuid,))
         team_ids = [str(row["id"]) for row in cur.fetchall()]
         cur.execute("DELETE FROM organizations WHERE id = %s", (org_uuid,))
     for team_id in team_ids:
         _chat_hub().revoke_team(team_id)
+        _cells().revoke_team(team_id)
     log.warning(
         "org deleted: %s by %s — shared files under %s were left in place",
         org_uuid,
@@ -881,7 +923,7 @@ async def transfer_ownership(
     target = _clean_email(_body(body).get("email"))
     api_writes.enforce(email, "organization changes")
     with tx() as cur:
-        _require_org(cur, org_uuid, email, owner=True)
+        _require_org(cur, org_uuid, email, owner=True, lock=True)
         if target == email:
             raise HTTPException(status_code=400, detail="you already own this organization")
         account = accounts.get_account(target)
@@ -907,7 +949,11 @@ async def transfer_ownership(
             "UPDATE org_members SET role = 'owner' WHERE org_id = %s AND email = %s",
             (org_uuid, target),
         )
+        cur.execute("SELECT id FROM teams WHERE org_id = %s", (org_uuid,))
+        team_ids = [str(row["id"]) for row in cur.fetchall()]
     log.info("org ownership transferred: %s %s -> %s", org_uuid, email, target)
+    for team_id in team_ids:
+        _cells().revoke_team(team_id)
     return {"ok": True, "owner_email": target}
 
 
@@ -934,7 +980,7 @@ async def invite_member(
     expires = _now() + _invite_ttl()
     invitation_id = str(uuid.uuid4())
     with tx() as cur:
-        org, caller_role = _require_org(cur, org_uuid, email, manage=True)
+        org, caller_role = _require_org(cur, org_uuid, email, manage=True, lock=True)
         if role == "admin" and caller_role != "owner":
             raise HTTPException(
                 status_code=403,
@@ -999,7 +1045,7 @@ async def revoke_invitation(
     invite_uuid = canonical_uuid(invitation_id)
     api_writes.enforce(email, "organization invitations")
     with tx() as cur:
-        _require_org(cur, org_uuid, email, manage=True)
+        _require_org(cur, org_uuid, email, manage=True, lock=True)
         cur.execute(
             "UPDATE org_invitations SET revoked_at = now()"
             " WHERE id = %s AND org_id = %s"
@@ -1039,7 +1085,7 @@ async def set_member_role(
     if role not in INVITABLE_ROLES:
         raise HTTPException(status_code=400, detail="role must be admin or member")
     with tx() as cur:
-        _require_org(cur, org_uuid, email, owner=True)
+        _require_org(cur, org_uuid, email, owner=True, lock=True)
         cur.execute(
             "SELECT role FROM org_members WHERE org_id = %s AND email = %s",
             (org_uuid, target),
@@ -1052,9 +1098,8 @@ async def set_member_role(
                 status_code=400,
                 detail="the owner's role cannot be changed; transfer ownership instead",
             )
-        if role == "member" and current["role"] == "admin":
-            cur.execute("SELECT id FROM teams WHERE org_id = %s", (org_uuid,))
-            team_ids = [str(row["id"]) for row in cur.fetchall()]
+        cur.execute("SELECT id FROM teams WHERE org_id = %s", (org_uuid,))
+        team_ids = [str(row["id"]) for row in cur.fetchall()]
         cur.execute(
             "UPDATE org_members SET role = %s WHERE org_id = %s AND email = %s",
             (role, org_uuid, target),
@@ -1064,6 +1109,8 @@ async def set_member_role(
         # Snapshot the affected teams in the same transaction as the demotion.
         for team_id in team_ids:
             _chat_hub().revoke(target, team_id)
+    for team_id in team_ids:
+        _cells().revoke(target, team_id)
     log.info("org member role: %s %s -> %s by %s", org_uuid, target, role, email)
     return {"ok": True, "email": target, "role": role}
 
@@ -1084,7 +1131,7 @@ async def remove_member(org_id: str, member_email: str, request: Request) -> dic
     target = _clean_email(member_email)
     api_writes.enforce(email, "organization membership changes")
     with tx() as cur:
-        _, caller_role = _require_org(cur, org_uuid, email)
+        _, caller_role = _require_org(cur, org_uuid, email, lock=True)
         cur.execute(
             "SELECT role FROM org_members WHERE org_id = %s AND email = %s",
             (org_uuid, target),
@@ -1119,6 +1166,7 @@ async def remove_member(org_id: str, member_email: str, request: Request) -> dic
         )
     for team_id in team_ids:
         _chat_hub().revoke(target, team_id)
+        _cells().revoke(target, team_id)
     log.info("org member removed: %s %s by %s", org_uuid, target, email)
     return {"ok": True}
 
@@ -1137,7 +1185,7 @@ async def create_team(org_id: str, request: Request, body: dict[str, Any]) -> di
     api_writes.enforce(email, "team changes")
     team_id = str(uuid.uuid4())
     with tx() as cur:
-        _require_org(cur, org_uuid, email, manage=True)
+        _require_org(cur, org_uuid, email, manage=True, lock=True)
         cur.execute("SELECT count(*) AS n FROM teams WHERE org_id = %s", (org_uuid,))
         if int((cur.fetchone() or {}).get("n") or 0) >= MAX_TEAMS_PER_ORG:
             raise HTTPException(
@@ -1224,7 +1272,7 @@ async def rename_team(
     api_writes.enforce(email, "team changes")
     try:
         with tx() as cur:
-            _, org_role = _require_org(cur, org_uuid, email)
+            _, org_role = _require_org(cur, org_uuid, email, lock=True)
             _require_team(cur, org_uuid, team_uuid, email, org_role, manage=True)
             cur.execute(
                 "UPDATE teams SET name = %s WHERE id = %s AND org_id = %s",
@@ -1253,7 +1301,7 @@ async def delete_team(org_id: str, team_id: str, request: Request) -> dict[str, 
     team_uuid = canonical_uuid(team_id)
     api_writes.enforce(email, "team changes")
     with tx() as cur:
-        _require_org(cur, org_uuid, email, manage=True)
+        _require_org(cur, org_uuid, email, manage=True, lock=True)
         cur.execute(
             "SELECT is_general FROM teams WHERE id = %s AND org_id = %s",
             (team_uuid, org_uuid),
@@ -1265,6 +1313,7 @@ async def delete_team(org_id: str, team_id: str, request: Request) -> dict[str, 
             raise HTTPException(status_code=400, detail="the General team cannot be deleted")
         cur.execute("DELETE FROM teams WHERE id = %s AND org_id = %s", (team_uuid, org_uuid))
     _chat_hub().revoke_team(team_uuid)
+    _cells().revoke_team(team_uuid)
     log.warning(
         "team deleted: %s in org %s by %s — shared files under %s were left in place",
         team_uuid,
@@ -1292,10 +1341,10 @@ async def add_team_member(
     target = _clean_email(payload.get("email"))
     role = str(payload.get("role") or "member").strip().lower()
     if role not in TEAM_ROLES:
-        raise HTTPException(status_code=400, detail="role must be manager or member")
+        raise HTTPException(status_code=400, detail="role must be manager, member or viewer")
     api_writes.enforce(email, "team membership changes")
     with tx() as cur:
-        _, org_role = _require_org(cur, org_uuid, email)
+        _, org_role = _require_org(cur, org_uuid, email, lock=True)
         _require_team(cur, org_uuid, team_uuid, email, org_role, manage=True)
         cur.execute(
             "SELECT 1 FROM org_members WHERE org_id = %s AND email = %s",
@@ -1315,6 +1364,7 @@ async def add_team_member(
         )
         if cur.fetchone() is None:
             raise HTTPException(status_code=409, detail="already on this team")
+    _cells().revoke(target, team_uuid)
     log.info("team member added: %s %s role=%s by %s", team_uuid, target, role, email)
     return {"ok": True, "email": target, "role": role}
 
@@ -1330,10 +1380,10 @@ async def set_team_member_role(
     target = _clean_email(member_email)
     role = str(_body(body).get("role") or "").strip().lower()
     if role not in TEAM_ROLES:
-        raise HTTPException(status_code=400, detail="role must be manager or member")
+        raise HTTPException(status_code=400, detail="role must be manager, member or viewer")
     api_writes.enforce(email, "team membership changes")
     with tx() as cur:
-        _, org_role = _require_org(cur, org_uuid, email)
+        _, org_role = _require_org(cur, org_uuid, email, lock=True)
         _require_team(cur, org_uuid, team_uuid, email, org_role, manage=True)
         cur.execute(
             "UPDATE team_members SET role = %s WHERE team_id = %s AND email = %s"
@@ -1342,6 +1392,8 @@ async def set_team_member_role(
         )
         if cur.fetchone() is None:
             raise HTTPException(status_code=404, detail="team member not found")
+    _chat_hub().revoke(target, team_uuid)
+    _cells().revoke(target, team_uuid)
     return {"ok": True, "email": target, "role": role}
 
 
@@ -1357,7 +1409,7 @@ async def remove_team_member(
     target = _clean_email(member_email)
     api_writes.enforce(email, "team membership changes")
     with tx() as cur:
-        _, org_role = _require_org(cur, org_uuid, email)
+        _, org_role = _require_org(cur, org_uuid, email, lock=True)
         _require_team(cur, org_uuid, team_uuid, email, org_role, manage=target != email)
         cur.execute(
             "DELETE FROM team_members WHERE team_id = %s AND email = %s RETURNING email",
@@ -1366,6 +1418,7 @@ async def remove_team_member(
         if cur.fetchone() is None:
             raise HTTPException(status_code=404, detail="team member not found")
     _chat_hub().revoke(target, team_uuid)
+    _cells().revoke(target, team_uuid)
     log.info("team member removed: %s %s by %s", team_uuid, target, email)
     return {"ok": True}
 

@@ -26,7 +26,7 @@ import json
 import re
 
 from .. import session as _session
-from . import download_dir, provenance_envelope, register
+from . import download_path, provenance_envelope, register
 
 SITE = "freecadlibrary"
 REPO = "FreeCAD/FreeCAD-library"
@@ -127,8 +127,9 @@ class FreeCadLibraryAdapter:
             return {"ok": False, "reason": "bad_result",
                     "hint": "result has no 'raw_url' (or a /blob/ 'url' to derive it from)"}
 
-        filename = raw_url.rsplit("/", 1)[-1].split("?", 1)[0] or "part.stp"
-        dest = download_dir(SITE) / filename
+        dest, refusal = download_path(SITE, raw_url, default="part.stp")
+        if refusal is not None:
+            return refusal
         outcome = _session.browser_download(raw_url, SITE, dest)
         if not outcome.get("ok"):
             return outcome
@@ -138,7 +139,7 @@ class FreeCadLibraryAdapter:
             session_profile_used=outcome.get("session_profile_used", SITE),
             license_note=LICENSE_NOTE,
             artifact_path=outcome["dest"],
-            title=result.get("title", filename),
+            title=result.get("title", dest.name),
             raw_url=raw_url,
         )
 

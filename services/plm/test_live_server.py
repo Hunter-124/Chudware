@@ -115,6 +115,8 @@ def _participant(participant_id: str) -> dict[str, Any]:
 
 
 def _wire(**fields: Any) -> str:
+    if fields.get("type") == "join":
+        fields.setdefault("token", "test-session-token")
     return json.dumps({"schema": SCHEMA, **fields}, separators=(",", ":"))
 
 
@@ -124,7 +126,7 @@ async def _connect(url: str):
 
 
 async def _join(url: str, project_id: str, item_id: str, participant_id: str,
-                *, token: str | None = None, last_seq: int | None = None):
+                *, token: str | None = "test-session-token", last_seq: int | None = None):
     websocket = await _connect(url)
     message: dict[str, Any] = {
         "schema": SCHEMA, "type": "join", "project_id": project_id, "item_id": item_id,
@@ -167,6 +169,9 @@ def test_non_loopback_and_authentication_fail_closed(tmp_path: Path) -> None:
     project_id, item_id, _path = _project(tmp_path)
     with pytest.raises(ValueError, match="token"):
         LivePlmServer(tmp_path, None, engine_factory=_Factory(), host="0.0.0.0")
+    for token in (None, "", "   "):
+        with pytest.raises(ValueError, match="token"):
+            LivePlmServer(tmp_path, token, engine_factory=_Factory())
 
     async def scenario() -> None:
         server = LivePlmServer(tmp_path, "correct-token", engine_factory=_Factory())
@@ -189,7 +194,7 @@ def test_schema_identity_scope_and_message_limits_are_plain_refusals(tmp_path: P
     project_id, item_id, _path = _project(tmp_path)
 
     async def scenario() -> None:
-        server = LivePlmServer(tmp_path, None, engine_factory=_Factory())
+        server = LivePlmServer(tmp_path, "test-session-token", engine_factory=_Factory())
         await server.start()
         try:
             websocket = await _connect(server.url)
@@ -241,7 +246,7 @@ def test_operation_limits_reject_before_engine_and_are_idempotent(tmp_path: Path
     factory = _Factory()
 
     async def scenario() -> None:
-        server = LivePlmServer(tmp_path, None, engine_factory=factory)
+        server = LivePlmServer(tmp_path, "test-session-token", engine_factory=factory)
         await server.start()
         try:
             websocket, joined = await _join(server.url, project_id, item_id, "u1")
@@ -266,7 +271,7 @@ def test_interleaved_clients_receive_identical_total_order(tmp_path: Path) -> No
     project_id, item_id, _path = _project(tmp_path)
 
     async def scenario() -> None:
-        server = LivePlmServer(tmp_path, None, engine_factory=_Factory())
+        server = LivePlmServer(tmp_path, "test-session-token", engine_factory=_Factory())
         await server.start()
         try:
             first, joined_a = await _join(server.url, project_id, item_id, "alice")
@@ -300,7 +305,7 @@ def test_duplicate_proposal_replays_original_without_second_apply(tmp_path: Path
     factory = _Factory()
 
     async def scenario() -> None:
-        server = LivePlmServer(tmp_path, None, engine_factory=factory)
+        server = LivePlmServer(tmp_path, "test-session-token", engine_factory=factory)
         await server.start()
         try:
             websocket, joined = await _join(server.url, project_id, item_id, "alice")
@@ -324,7 +329,7 @@ def test_late_join_and_atomic_reconnect_catch_up_contiguously(tmp_path: Path) ->
     project_id, item_id, _path = _project(tmp_path)
 
     async def scenario() -> None:
-        server = LivePlmServer(tmp_path, None, engine_factory=_Factory())
+        server = LivePlmServer(tmp_path, "test-session-token", engine_factory=_Factory())
         await server.start()
         try:
             alice_old, joined = await _join(server.url, project_id, item_id, "alice")
@@ -361,7 +366,7 @@ def test_presence_leave_and_no_partial_snapshot(tmp_path: Path) -> None:
     project_id, item_id, _path = _project(tmp_path)
 
     async def scenario() -> None:
-        server = LivePlmServer(tmp_path, None, engine_factory=_Factory())
+        server = LivePlmServer(tmp_path, "test-session-token", engine_factory=_Factory())
         await server.start()
         try:
             alice, joined = await _join(server.url, project_id, item_id, "alice")
@@ -400,7 +405,7 @@ def test_concurrent_last_leave_writes_one_attributed_checkpoint(tmp_path: Path) 
     project_id, item_id, _path = _project(tmp_path)
 
     async def scenario() -> None:
-        server = LivePlmServer(tmp_path, None, engine_factory=_Factory())
+        server = LivePlmServer(tmp_path, "test-session-token", engine_factory=_Factory())
         await server.start()
         try:
             alice, joined = await _join(server.url, project_id, item_id, "alice")
@@ -433,7 +438,7 @@ def test_empty_session_writes_no_checkpoint(tmp_path: Path) -> None:
     project_id, item_id, _path = _project(tmp_path)
 
     async def scenario() -> None:
-        server = LivePlmServer(tmp_path, None, engine_factory=_Factory())
+        server = LivePlmServer(tmp_path, "test-session-token", engine_factory=_Factory())
         await server.start()
         websocket, joined = await _join(server.url, project_id, item_id, "observer")
         await _leave(websocket, joined["session_id"])
@@ -470,7 +475,7 @@ def test_real_engine_op_log_rebuilds_to_identical_geometry(tmp_path: Path) -> No
                 "params": {"length": {"value": 30.0, "expr": None},
                            "width": {"value": 20.0, "expr": None},
                            "height": {"value": 10.0, "expr": None}}, "refs": {}}}]
-        server = LivePlmServer(tmp_path, None)
+        server = LivePlmServer(tmp_path, "test-session-token")
         await server.start()
         try:
             websocket, joined = await _join(server.url, project_id, item_id, "engine-user")
@@ -497,5 +502,36 @@ def test_real_engine_op_log_rebuilds_to_identical_geometry(tmp_path: Path) -> No
             for doc_id in rebuilt:
                 with contextlib.suppress(Exception):
                     cb.call("doc_close", {"doc_id": doc_id})
+
+    asyncio.run(scenario())
+
+
+def test_loopback_origin_policy_applies_before_join(tmp_path: Path) -> None:
+    project_id, item_id, _path = _project(tmp_path)
+
+    async def scenario() -> None:
+        from websockets.asyncio.client import connect
+        from websockets.exceptions import InvalidStatus, ConnectionClosed
+        server = LivePlmServer(tmp_path, "test-session-token", engine_factory=_Factory(),
+                               allowed_origins=("https://cad.example.invalid",))
+        await server.start()
+        try:
+            for origin in ("https://attacker.invalid", "null", "http://localhost:9999"):
+                with pytest.raises(InvalidStatus) as refused:
+                    async with connect(server.url, origin=origin):
+                        pass
+                assert refused.value.response.status_code == 403
+            async with connect(server.url, origin="https://cad.example.invalid") as websocket:
+                await websocket.send(_wire(type="join", project_id=project_id, item_id=item_id,
+                                           participant=_participant("intruder"), token=""))
+                with pytest.raises(ConnectionClosed) as refused:
+                    await websocket.recv()
+                assert refused.value.code == 4401
+            async with connect(server.url, origin="https://cad.example.invalid") as websocket:
+                await websocket.send(_wire(type="join", project_id=project_id, item_id=item_id,
+                                           participant=_participant("approved")))
+                assert json.loads(await websocket.recv())["type"] == "joined"
+        finally:
+            await server.stop()
 
     asyncio.run(scenario())

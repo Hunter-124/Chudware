@@ -26,7 +26,7 @@ ReverseEng and Firmware have their own shots.
 | **Assembly** | `host/src/ui/asm_panels.cpp/.h` | Mates, component insertion, BOM, exploded view |
 | **CAM** | `host/src/ui/cam/cam_panel.cpp/.h`, `cam_mirror.cpp/.h` | Integrated Explorer / Job Manager / NC Output left rail; all stock, toolpath, tool and removal previews render in the native viewport |
 | **ECAD** | `host/src/ui/ecad/ecad_panel.cpp/.h`, `ecad_canvas.cpp/.h`, `ecad_mirror.cpp/.h` | Schematic/PCB 2D canvas editor; schemas in `contracts/ecad/` |
-| **PLM** | `host/src/ui/plm/plm_workspace.cpp`, `plm_pages.cpp`, `plm_hub.h`, `plm_state.cpp`, `plm_quickbar.cpp`; Explorer integration: `host/src/ui/file_explorer.cpp` | Versioning, releases, document control; `contracts/plm.md`. The separate left-rail PLM tab and `plm_overview.cpp` are retired: Explorer's Changes/Files cards handle vault status (M/A/D/U), project-wide named checkpoints, rev/lifecycle labels and links into the full PLM workspace. Explicit revision-named siblings are visually grouped but remain individually openable physical files/items, never auto-merged. Shared item/status caches serve the hub; Files requests basic Git status/log, Git/Planning request full details. All hub pages enter `plmEnsureOverview` for one-shot outside-change recording; do not duplicate it in project selection. |
+| **PLM** | `host/src/ui/plm/plm_workspace.cpp`, `plm_pages.cpp`, `plm_hub.h`, `plm_state.cpp`, `plm_quickbar.cpp`; Explorer integration: `host/src/ui/file_explorer.cpp` | Versioning, releases, document control; `contracts/plm.md`. The separate left-rail PLM tab and `plm_overview.cpp` are retired: Explorer's bottom Changes strip (count badge, M/A/D/U rows, project-wide named checkpoint, PLM link) and its file-row badges (change code + rev; lifecycle in the tooltip) handle vault status and links into the full PLM workspace. Explicit revision-named siblings are visually grouped but remain individually openable physical files/items, never auto-merged. Shared item/status caches serve the hub; Files requests basic Git status/log, Git/Planning request full details. All hub pages enter `plmEnsureOverview` for one-shot outside-change recording; do not duplicate it in project selection. |
 | **Reverse Eng.** | `host/src/ui/reveng/`: `reveng_workspace.cpp` (shell), `reveng_widgets.h/.cpp` (shared visual kit), `sources_panel.cpp`, `webcam_capture.cpp`, `stage_panels.cpp`, `dim_review.cpp`, `image_gallery.cpp`, `img_tex.cpp` | Native live/video Gaussian reconstruction plus the separate six-stage measured-CAD wizard (`contracts/reveng.md` §13). **Every panel draws with `ui::reveng::kit`** and uses `ui::metrics::re*()`. Camera seam: `host/src/platform/camera.h` v2. Native splat/point rendering reads `kit::previewSlotRect` and `previewSlotClip`. Full breakdown below. |
 | **AI / Activity** | `host/src/ui/ai/ai_workspace.cpp/.h` shell/nav + `ai/agent_dag.cpp/.h` execution graph, `ai/current_run_view.cpp/.h` Current Run/Sub-agents rosters and docked inspector, `ai/{plan_board,docs_panel,active_work,metrics_view,activity_view,insights_view}.cpp`, plus `host/src/ui/copilot/` chat modules (reuse hooks in `copilot.h`) | Current Run / Sub-agents / Plan / Activity / Sessions / Insights / Options, project chip; project scoping via `convProjectDir(st)`; events per `contracts/agent_events.md` |
 | **Drawing** | `host/src/ui/drawing_panel.cpp/.h` (+ `AppState::makeDrawing` in `core/doc_tabs.cpp` → one `drawing_make`) | Renders ONLY the core-compiled v2 draw contract (`sheet.frame`, view geometry, `view.draw`, annotation `draw`) via `SheetPen` with ISO 128 paper-space weights — never host-drawn borders/title blocks/markers; sheet-properties popup (paper/portrait/projection/scale/units/title block → `drawing_set_sheet`/`drawing_arrange`/`drawing_set_units`/`drawing_set_titleblock`); PDF/SVG/DXF export; `drawDrawingEmptyState` for the no-drawing workspace |
@@ -108,11 +108,31 @@ ReverseEng and Firmware have their own shots.
   sole authority, not the active document's folder. History load/reload validates
   `active_by_project` ownership before restoring the selected root's chat. The
   `projectchat` shot checks startup, root switches, parked runs and external documents.
-- The Copilot dock has a second header row with labelled Sessions and New chat
-  controls, including during a run; New chat uses existing conversation parking.
-  Sessions retains its project switcher and no longer duplicates the creation button.
-  Composer footer controls are adjacent cells separated by adaptive-theme vertical
-  borders; New chat is not a composer footer control.
+- The Copilot header is compact, flat navigation: run-tinted tesseract, Chat / Tasks /
+  Artifacts, settings and collapse. Measured text/icon widths keep hit boxes and paint aligned.
+  Header glyphs use the existing SDF-crisp `drawIconGlass` path, not stretched 20px atlas cells.
+  Counts accompany "Tasks" only when real tasks exist; never display an idle "0/0".
+  Labelled Sessions / New chat share the row when everything fits, otherwise move onto a
+  second row together. New chat parks the outgoing conversation, including during a run.
+  Composer footer controls remain adjacent cells; New chat is a header action.
+  `CHUDWARE_COPILOT_WIDTH` (shot-only, logical px) exercises resized headers without dragging.
+- Question choices in `cards.cpp` are native full-width selectable rows with wrapped labels
+  and compact selection glyphs; question/option IDs distinguish duplicate labels. Other's
+  input is full-width below its selector. Dimension/unit and path/Browse pairs stack when
+  measured space is insufficient; picked-geometry labels and actions wrap/stack. Pending
+  and resolved status headers wrap as well. The source is enabled for test-engine semantic
+  item annotations in `host/CMakeLists.txt`, including the native dimension combo.
+- Jump to latest is a layout footer, never an overlay over question inputs. All three hosts
+  (dock chat, AI workspace chat, agent trace timeline) reserve `chatJumpToLatestFooterHeight()`;
+  the slot stays constant while the action hides at the tail, preserving scroll offsets.
+  Short-window layouts budget the composer/footer first rather than enforcing a 120dp log.
+  Smoke: `CHUDWARE_SHOT=copilot_ui`, isolated HOME/XDG paths, `CHUDWARE_ENGINE_DAEMON=0`;
+  optional `CHUDWARE_COPILOT_UI_WORKSPACE=1`, `CHUDWARE_COPILOT_UI_OUT=<capture-directory>`,
+  `CHUDWARE_SCALE` and `CHUDWARE_THEME`. Exercises real clicks/text, every question kind,
+  header actions, and unclipped short-window layout; report/captures default to
+  `scratch/copilot_ui_shots`.
+  Parallel matrix runs MUST give each process a distinct `CHUDWARE_SESSIONS_DIR` and display:
+  the default shot store is shared by scenario name and is cleared on startup.
 - During a run every agent-lane worker call returns `worker_lane_busy`; UI detects it with
   `core::workerLaneBusy` and phrases refusals via `ui::userFacingRpcError` /
   `ui::kAvailableAfterRun`. Never show raw worker/lane/RPC text.
@@ -122,10 +142,39 @@ ReverseEng and Firmware have their own shots.
   saved docs instead use their file path to establish project ownership. The first
   agent mirror may take focus from a pristine, empty active CAD tab
   (`activeOwnDocIsPristine`), not from user work.
-- Sent image thumbnails use `ChatMsg::imagePaths`, copied from the exact model attachment
-  payload on send/steer and persisted by `conversations.cpp` (`images` in compact messages,
-  `imagePaths` in raw archives). Never resolve a marker's basename across paste-cache days:
-  names repeat daily. Legacy records lacking paths keep their marker without a guessed image.
+- Image paste inserts `[Image #N]` at the live composer caret (replacing selection).
+  `inline_image_refs.h` indexes exact paths; `pendingInlineImagePaths` keeps stable draft slots
+  (`inline_images` in prompt drafts), while `consumeComposerAttachments` omits deleted refs,
+  orders model images by first reference and compacts sent numbering. Queued prompts freeze
+  attachment/context snapshots; staged edit/cancel restores the matching roster.
+- Sent images render at their reference positions, not in a trailing gallery.
+  `ChatMsg::imagePaths` is copied from the exact send/steer payload and persisted by
+  `conversations.cpp` (`images` in compact messages, `imagePaths` in raw archives).
+  `chat_log.cpp` caches text/image segmentation; `attachmentImagePreview` shares the bounded
+  thumbnail cache and full-size viewer. Legacy attached-image markers consume recorded paths
+  in order; missing paths stay text. Never resolve basenames across paste-cache days.
+  Smoke: `CHUDWARE_SHOT=chat_inline`, `CHUDWARE_ENGINE_DAEMON=0`, isolated HOME/XDG paths,
+  an isolated `XDG_RUNTIME_DIR`/invalid `WAYLAND_DISPLAY` under Xvfb and `xclip` on PATH.
+  Supply portrait.png/landscape.png in `scratch/chat_inline_shots`; captures/report land there.
+- Tool-returned visual evidence belongs at the tool's completion position in chat, outside
+  its disclosure drawer. `activity_timeline.cpp` renders actual image paths at every tool
+  detail level and preserves grouped-call order; expanding details never repeats thumbnails.
+  `feed.cpp` stores the returned caption in the `CAP` trailer before `ART`; clipboard copy
+  includes it, and compact tool rows retain complete bounded trailers. Restored Session files
+  rows render only unmatched/legacy images. Respect the explicit Show renders inline preference.
+  Smoke: `CHUDWARE_SHOT=chat_evidence CHUDWARE_CHAT_EVIDENCE=<mapped-event-array.json>`,
+  optionally `CHUDWARE_CHAT_EVIDENCE_EXPANDED=1`; use an isolated, short HOME/appdata path
+  (worker Unix-socket paths must fit AF_UNIX) and a tall Xvfb screen.
+- Desktop chat autosave (`conversations.cpp`, `chat_persistence.h`) uses exact immutable
+  message/session snapshots and one ordered, coalescing writer. Unchanged session files
+  are not rewritten. Explicit save/reload calls remain barriers; routine debounce never
+  waits for fsync. Failed writes retain pending state; index publication follows transcript
+  durability, then owned-session pruning. Shutdown drains agent control jobs before
+  `flushChatPersistence`, while AppState and its worker remain alive.
+- Tool-row layout (`activity_timeline.cpp`) caches exact parsed inputs and stable measured
+  heights, windowing settled offscreen rows and group members. Invalidate on row edits,
+  grouping, width, theme/font/detail preferences and session/anchor changes. Never clip an
+  animating row using a stale height or retain an unbounded trace cache.
 - **Copilot chat conventions.** Magic keywords (Chudcode's `ultrathink`,
   `orchestrate`, `workflowz`, `jevify`, `ultragoon`, `autobot`, `tokenmaxxing`; table mirrors
   `omp/packages/coding-agent/src/modes/magic-keywords.ts`) are matched ONLY by
@@ -440,11 +489,22 @@ and `hint`, never a bare "failed".
 - **Results honesty.** Show `ok`/`converged`/`feasible`/`termination` separately. Surface
   exports (stl/3mf/obj) are offered only when `manufacturing.geometry_valid`. Runs on other
   geometry are `source_stale`; model-tool runs without the editor's geometry digest are
-  `source_unverified`. The panel reports recorded DFAM checks (GUI runs report "not run"),
-  but never promotes topology output to print-ready, including legacy records claiming it:
-  only `slice_part`'s passing G-code check establishes that. It never rewrites a retained run.
+  `source_unverified`. A finished geometry-valid GUI run queues ONE async `topology_dfam`
+  worker call (gui-background socket) and merges its `dfam` into that run record only;
+  agent-run records and invalid geometry are never queued, and an unavailable check reads
+  "DFAM check could not run", never passed. The panel never promotes topology output to
+  print-ready, including legacy records claiming it: only `slice_part`'s passing G-code
+  check establishes that. It never rewrites a retained run otherwise.
+- **3D printing setup.** The Additive manufacturing card (Mfg. Rules focuses it) applies a
+  `services/sim/topology_print_processes.json` preset (Apply overwrites offered keys; null
+  erases; sets `print_process`) and holds the Bed face well (`build_plate`, preview in the
+  preserve colour, forwarded by `buildRunEnvelope`). Overhang settings need a build
+  direction OR a bed face; the solver derives the direction from the face. The print
+  surface (`surface_print_stl`) is listed first and preferred by Continue in CAD; the
+  overlay field `overhang` is labelled "Needs support".
 - **Return to editable CAD.** Results → Result geometry and export → Continue in CAD
-  asynchronously imports the valid, available, non-stale `surface_stl` as a separate
+  asynchronously imports the valid, available, non-stale `surface_print_stl` (else
+  `surface_stl`) as a separate
   solid, activates its document tab, clears the result overlay/legend, and enters Model /
   Feature Manager. Source geometry and retained studies are not mutated. Save the new
   part as `.step+`; the base remains faceted, not reconstructed sketch/NURBS history.
@@ -452,13 +512,15 @@ and `hint`, never a bare "failed".
   can be selected as whole faces instead of individual cap triangles. Invalid geometry
   blocks continuation independently of convergence/feasibility; DFAM is not a CAD gate.
 - **Shot:** `CHUDWARE_SHOT=topology` (`scenarios.cpp` `runTopology`) builds a 120×40×40 mm
-  domain and runs the study for real, writing `scratch/topology_shots/topology_report.json`
-  plus captures.
+  domain (PLA, `fdm_0.4`, min-Z bed face) and runs the study for real, asserting the print
+  surface, the `overhang` overlay field and a checked DFAM for geometry-valid runs, writing
+  `scratch/topology_shots/topology_report.json` plus captures (`topology_06b_print_simp.png`
+  is a tall results capture with the DFAM rows).
 
 ## Auxiliary panels
 
-`host/src/ui/doc_tabs.cpp` (multi-document tab strip) · `file_explorer.cpp` (workspace
-browser, recents, project vault changes/checkpoint) · `console_panel.cpp` (worker/debug log) · `status_bar.cpp` (job status,
+`host/src/ui/doc_tabs.cpp` (multi-document tab strip) · `file_explorer.cpp` (working-folder
+browser with filter, recents and vault changes/checkpoint strips) · `console_panel.cpp` (worker/debug log) · `status_bar.cpp` (job status,
 spinner, sticky "Engine daemon unreachable — retrying" chip while `AppState::daemonUnreachable`;
 tabs re-bootstrap via `engine_events` after hostd reconnect) · `title_bar.cpp` (window chrome + File/Edit/View/Help menus) · `config_panel.cpp`,
 `design_table_panel.cpp`, `cutlist_panel.cpp` (configurations & tables) · `toast.cpp`
@@ -470,6 +532,18 @@ blocking `list/stat/defaultRoot` or `mkdir` on the web. Snapshot state distingui
 loading, errors, and confirmed absence. Directory requests coalesce; mutation and
 workspace invalidation fence old callbacks. Keep filtered rows alive across nested
 mutations, which can invalidate the browser cache during tree traversal.
+
+Explorer layout, top to bottom: one header line (working-folder name, tooltip = full path,
+right-click = folder actions; branch chip inline), a filter field (Ctrl+F; Esc clears) beside
+New folder / Refresh / Collapse all / Reveal active document, the tree (all remaining height;
+the workspace's children at top level, folders first, natural numeric-aware order, every
+non-dot file with non-documents dimmed), then collapsible Recent and Changes strips pinned at
+the bottom, both collapsed by default. Expansion lives in the Explorer's own set (Collapse
+all / Reveal edit it); a click anywhere on a folder row toggles it. A non-empty filter shows a
+flat result list from a bounded incremental `pollDirectory` BFS (4000 entries, depth 12).
+Rows carry an open-in-tab dot, the active document's accent highlight, and change code + rev
+at the right. Shot: `CHUDWARE_SHOT=explorer` with optional `CHUDWARE_EXPLORER_SHOT_EXPAND`,
+`_SELECT`, `_QUERY`, `_STRIPS` (see `applyShotStateOnce`).
 
 ## Shared patterns
 

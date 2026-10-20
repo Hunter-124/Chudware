@@ -97,6 +97,20 @@ Cross-domain phases. Gateway-internal wave ids (`W1.1` …) are `10_gateway.md` 
 Phase status above records the cross-domain phase closing; it does not mean every artifact a design
 document proposed was built. The landed subset per document is below.
 
+## Migrating obsolete serial allowlists
+
+A serial entry requires `usb_vid`, `usb_pid`, and `usb_serial` together. A
+tupleless entry invalidates the whole allowlist; a stable `/dev/serial/by-id`
+path alone is not device identity. The refusal names the file and line and
+reports `serial USB identity requires vid, pid, and serial together`.
+
+With the equipment idle, remove an obsolete entry or recommission it using the
+device's observed complete USB identity. Do not invent identifiers or weaken the
+allowlist to retain an old claim. An initialized lane reloads the corrected file
+on its next request and applies normal claim invalidation. A lane disabled by an
+invalid allowlist at startup requires a planned idle restart after correction;
+never restart active manufacturing merely to clear this diagnostic.
+
 ## As-built map
 
 Verified against the tree on 2026-10-04. "Not built" lists proposed artifacts the design documents

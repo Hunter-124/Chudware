@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import tempfile
 import time
+import pytest
 from pathlib import Path
 
 import importlib
@@ -15,6 +16,7 @@ import importlib
 from services import research
 from services.research import common
 from services.research.cache import Cache
+from services.net import safe_http
 
 # Submodules (the package re-exports fetch_page/web_search as *functions*, shadowing the
 # module attributes — import_module returns the real module objects for monkeypatching).
@@ -133,17 +135,17 @@ def test_web_search_zero_results_reports_provider_and_never_claims_success():
 
 
 def test_ddg_challenge_does_not_retry_or_claim_empty_results(monkeypatch):
-    import httpx
+    from urllib.parse import parse_qs
     from services.research.providers import DDGProvider
 
     calls = []
 
     def challenge(*args, **kwargs):
-        calls.append(kwargs["data"]["q"])
-        return httpx.Response(202, text="<title>DuckDuckGo</title>"
-                             "<p>Unfortunately, bots use DuckDuckGo too.</p>")
+        calls.append(parse_qs(kwargs["body"].decode())["q"][0])
+        return safe_http.Response(202, {}, args[0],
+                                 b"<title>DuckDuckGo</title><p>Unfortunately, bots use DuckDuckGo too.</p>")
 
-    monkeypatch.setattr(httpx, "post", challenge)
+    monkeypatch.setattr(safe_http, "request", challenge)
     with _OfflineToggle(False):
         out = research.web_search("MG90S servo", provider=DDGProvider())
     assert out["ok"] is False and out["reason"] == "provider_blocked"
@@ -272,7 +274,7 @@ def test_fetch_page_names_http_denial_and_missing_page():
 
 def test_fetch_page_rejects_private_targets_before_fetch(monkeypatch):
     calls = []
-    monkeypatch.setattr(fp_mod.socket, "getaddrinfo", lambda *a, **k: calls.append(a) or [])
+    monkeypatch.setattr(safe_http.socket, "getaddrinfo", lambda *a, **k: calls.append(a) or [])
     for url in ("https://127.0.0.1/x", "https://[::1]/x",
                 "https://[::ffff:127.0.0.1]/x", "http://example.com/x"):
         out = research.fetch_page(url)
@@ -281,8 +283,8 @@ def test_fetch_page_rejects_private_targets_before_fetch(monkeypatch):
 
 
 def test_public_https_policy_accepts_public_dns(monkeypatch):
-    monkeypatch.setattr(fp_mod.socket, "getaddrinfo", lambda *a, **k: [
-        (fp_mod.socket.AF_INET, fp_mod.socket.SOCK_STREAM, fp_mod.socket.IPPROTO_TCP,
+    monkeypatch.setattr(safe_http.socket, "getaddrinfo", lambda *a, **k: [
+        (safe_http.socket.AF_INET, safe_http.socket.SOCK_STREAM, safe_http.socket.IPPROTO_TCP,
          "", ("93.184.216.34", 443))
     ])
     fp_mod._validate_public_url("https://example.com/path")
@@ -292,26 +294,24 @@ def test_http_get_revalidates_private_redirect_before_next_connection(monkeypatc
     requested = []
 
     class _Response:
-        is_redirect = True
-        headers = {"location": "https://127.0.0.1/metadata"}
+        status = 302
+        def getheader(self, name):
+            return "https://127.0.0.1/metadata" if name == "Location" else None
+        def getheaders(self):
+            return [("Location", "https://127.0.0.1/metadata")]
 
-    class _Client:
-        def __init__(self, **kwargs):
-            assert kwargs["follow_redirects"] is False
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            return None
-        def get(self, url):
-            requested.append(url)
+    class _Connection:
+        def __init__(self, *args):
+            pass
+        def request(self, method, path, **kwargs):
+            requested.append("https://example.com" + path)
+        def getresponse(self):
             return _Response()
+        def close(self):
+            pass
 
-    monkeypatch.setattr(fp_mod.socket, "getaddrinfo", lambda *a, **k: [
-        (fp_mod.socket.AF_INET, fp_mod.socket.SOCK_STREAM, fp_mod.socket.IPPROTO_TCP,
-         "", ("93.184.216.34", 443))
-    ])
-    import httpx
-    monkeypatch.setattr(httpx, "Client", _Client)
+    _stub_public_dns(monkeypatch)
+    monkeypatch.setattr(safe_http, "_PinnedConnection", _Connection)
     try:
         fp_mod._http_get("https://example.com/start")
         assert False, "private redirect should be refused"
@@ -339,42 +339,35 @@ class _FakeClock:
 
 
 def _stub_public_dns(monkeypatch) -> None:
-    monkeypatch.setattr(fp_mod.socket, "getaddrinfo", lambda *a, **k: [
-        (fp_mod.socket.AF_INET, fp_mod.socket.SOCK_STREAM, fp_mod.socket.IPPROTO_TCP,
+    monkeypatch.setattr(safe_http.socket, "getaddrinfo", lambda *a, **k: [
+        (safe_http.socket.AF_INET, safe_http.socket.SOCK_STREAM, safe_http.socket.IPPROTO_TCP,
          "", ("93.184.216.34", 443))
     ])
 
 
 def _stub_slow_redirect_chain(monkeypatch, clock, *, hop_cost: float) -> list:
-    """httpx stub whose every hop is an eligible public redirect that burns
-    ``hop_cost`` seconds — the pathological vendor/catalog chain. Returns the
-    growing list of requested URLs."""
+    """Pinned transport fixture: each redirect spends the supplied idle cost."""
     requested: list = []
 
     class _Redirect:
-        is_redirect = True
+        status = 302
+        def getheaders(self):
+            return [("Location", f"https://example.com/hop{len(requested)}")]
+        def getheader(self, name):
+            return f"https://example.com/hop{len(requested)}" if name == "Location" else None
 
-        def __init__(self, hop: int):
-            self.headers = {"location": f"https://example.com/hop{hop + 1}"}
+    class _Connection:
+        def __init__(self, *args):
+            pass
+        def request(self, method, path, **kwargs):
+            requested.append("https://example.com" + path)
+            clock.t += hop_cost
+        def getresponse(self):
+            return _Redirect()
+        def close(self):
+            pass
 
-    class _Client:
-        def __init__(self, **kwargs):
-            assert kwargs["follow_redirects"] is False
-            assert kwargs["timeout"] == fp_mod._HOP_TIMEOUT_S
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
-
-        def get(self, url):
-            requested.append(url)
-            clock.t += hop_cost            # this hop ran to its own deadline
-            return _Redirect(len(requested))
-
-    import httpx
-    monkeypatch.setattr(httpx, "Client", _Client)
+    monkeypatch.setattr(safe_http, "_PinnedConnection", _Connection)
     return requested
 
 
@@ -455,44 +448,20 @@ def test_html_to_markdown_strips_script_style():
     assert "# Head" in md and "276 MPa" in md
 
 
-def test_grabcad_shell_uses_rendered_browser_and_caches_content(monkeypatch):
+def test_js_shell_refuses_unrestricted_rendering_before_browser_call(monkeypatch):
     from services.browser import session
-
-    shell = (
-        '<html><head><title>GrabCAD Community Library</title>'
-        '<meta name="description" content="Find CAD models"></head>'
-        '<body><header>Explore CAD Models</header><div id="root"></div>'
-        '<noscript>Please enable JavaScript to use this site</noscript>'
-        '<script src="/assets/main.js"></script></body></html>'
-    )
-    rendered = (
-        '<html><head><title>MG90S Servo CAD Model</title></head><body>'
-        '<nav>Login Search Popular Downloads</nav><main><article>'
-        '<h1>MG90S servo housing</h1><p>MG90S micro servo STEP geometry includes '
-        'mounting ears, the output shaft, and the 23 mm tall housing. This model '
-        'allows the shoulder mount to be dimensioned from the shaft datum and '
-        'the mounting holes, and includes a description of the assembly and its '
-        'source so the engineer can verify the fit before reuse.</p>'
-        '</article></main></body></html>'
-    )
-    calls = []
-    monkeypatch.setattr(session, "browser_fetch", lambda url, site, no_cache: (
-        calls.append((url, site, no_cache)) or {
-            "ok": True, "final_url": url, "content": rendered}))
+    shell = ('<html><head><title>GrabCAD</title></head><body>'
+             '<div id="root"></div><script src="/app.js"></script></body></html>')
+    monkeypatch.setattr(session, "browser_fetch",
+                        lambda *a, **k: pytest.fail("unrestricted browser must not navigate"))
+    monkeypatch.setattr(fp_mod, "_firecrawl_page", lambda url: None)
     _stub_public_dns(monkeypatch)
     with tempfile.TemporaryDirectory() as td, _OfflineToggle(False):
         cache = _tmp_cache(td)
-        first = fp_mod.fetch_page("https://grabcad.com/library/mg90s-1", cache=cache,
-                                  _fetcher=lambda url: (shell, url, "ignored"))
-        second = fp_mod.fetch_page("https://grabcad.com/library/mg90s-1", cache=cache,
-                                   _fetcher=lambda url: (shell, url, "ignored"))
-    assert first["ok"] and first["cached"] is False
-    assert first["title"] == "MG90S Servo CAD Model"
-    assert first["content"].startswith("# MG90S servo housing")
-    assert "shaft datum" in first["content"]
-    assert "Login Search" not in first["content"]
-    assert second["ok"] and second["cached"] is True
-    assert calls == [("https://grabcad.com/library/mg90s-1", "grabcad.com", True)]
+        out = fp_mod.fetch_page("https://grabcad.com/library/model", cache=cache,
+                                _fetcher=lambda url: (shell, url, "ignored"))
+        assert out["ok"] is False and out["reason"] == "js_shell"
+        assert cache.get("https://grabcad.com/library/model") is None
 
 
 def test_js_shell_remaining_after_rendering_is_not_cached(monkeypatch):
@@ -515,7 +484,7 @@ def test_js_shell_remaining_after_rendering_is_not_cached(monkeypatch):
             assert out["ok"] is False and out["reason"] == "js_shell"
             assert "makerworld.com/en/models/42" in out["hint"]
             assert "fetch_cad_model" in out["hint"]
-    assert len(calls) == 2
+    assert calls == []
 
 
 def test_js_shell_uses_firecrawl_only_after_rendered_page_fails(monkeypatch):

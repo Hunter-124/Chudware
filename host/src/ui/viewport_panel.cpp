@@ -695,6 +695,7 @@ static int s_sectionDragIdx = -1;
 // px→mm at the face depth, then fed to doc_push_pull through the checkpoint/revert envelope.
 struct PushPullDrag {
     bool      active     = false;     // a push-pull drag is in flight (owns the mouse, no orbit)
+    std::string docId;                // document owning this drag's checkpoint
     uint32_t  bodyId     = 0;         // PickHit body (1-based) of the dragged face
     uint32_t  topoId     = 0;         // picked FACE topo_id (1-based)
     std::string checkpoint;           // doc_checkpoint id taken on press (for revert/cancel)
@@ -715,7 +716,7 @@ struct PushPullDrag {
     bool      wantCommit  = false;    // next kick uses commit=true
     bool      finishing   = false;    // mouse-up seen; don't re-queue every frame
     // Persists across the frame so the readout chip can draw even on a no-op sample.
-    void reset() { *this = PushPullDrag{}; }
+    void reset() { const auto nextGen = gen + 1; *this = PushPullDrag{}; gen = nextGen; }
 };
 static PushPullDrag s_pp;
 
@@ -738,6 +739,7 @@ static PushPullDrag s_pp;
 // body/edge pick, or a multi-face selection). This keeps the two gestures from ever overlapping.
 struct DimDrag {
     bool        active   = false;     // a dimension drag is in flight (owns the mouse, no orbit)
+    std::string docId;                // document owning the PM field being dragged
     std::string featureId;            // the feature being edited
     std::string param;                // the param key being driven ("depth"/"radius"/"angle"/…)
     bool        angle    = false;     // true => value is degrees (drag maps px->deg)
@@ -785,6 +787,7 @@ static DimDrag s_dim;
 // release (so the drag is a SINGLE undo step), revert on Esc/cancel. Owns the mouse while active.
 struct AsmDrag {
     bool        active   = false;     // a move-component drag is in flight (owns the mouse)
+    std::string docId;                // assembly owning this drag's checkpoint
     std::string component;            // the component k-id being dragged
     std::string checkpoint;           // doc_checkpoint id taken on press (for the single-undo commit)
     ImVec2      pressPos = {0, 0};    // screen pos at press (drag origin)
@@ -799,7 +802,7 @@ struct AsmDrag {
     bool        pending  = false;
     bool        wantCommit = false;
     bool        finishing  = false;   // mouse-up seen; don't re-queue every frame
-    void reset() { *this = AsmDrag{}; }
+    void reset() { const auto nextGen = gen + 1; *this = AsmDrag{}; gen = nextGen; }
 };
 static AsmDrag s_asmDrag;
 
@@ -1492,10 +1495,33 @@ static void normalToSelectionOrNearestAxis(AppState& st, bool inSketch) {
 // runs inside the Viewport window after rendering, touching no tree-iteration state. This mirrors
 // feature_tree's applyTreeOpsNow: apply -> loadDocMesh(resp.aicm_path) repaints the body with its
 // new color on the next frame.
-static void applyAppearanceFromViewport(AppState& st, const std::string& bodyKey,
+static bool refuseViewportEdit(AppState& st, const std::string& docId) {
+    if (!st.docLockedByAgent(docId)) return false;
+    st.toast(ui::ToastLevel::Warn, st.agentLockReason(docId));
+    return true;
+}
+
+static void toastViewportEditKept(AppState& st, const std::string& docId) {
+    std::string part = docId;
+    for (const auto& tab : st.docTabs)
+        if (tab.docId == docId && !tab.title.empty()) { part = tab.title; break; }
+    st.toast(ui::ToastLevel::Warn,
+             "Agent started editing " + part + " — your edit was kept and closed.");
+}
+
+static bool viewportEditMenuItem(const char* label, const std::string& disabledReason) {
+    const bool clicked = ImGui::MenuItem(label, nullptr, false, disabledReason.empty());
+    if (!disabledReason.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", disabledReason.c_str());
+    return clicked;
+}
+
+static void applyAppearanceFromViewport(AppState& st, const std::string& docId,
+                                        const std::string& bodyKey,
                                         const float* color /* nullptr = clear */,
                                         float metallic = 0.0f, float roughness = 0.5f) {
-    if (!st.docMirror.hasDoc() || !st.workerStarted) return;
+    if (refuseViewportEdit(st, docId)) return;
+    if (!st.docMirror.hasDoc() || !st.workerStarted || st.docMirror.docId() != docId) return;
     nlohmann::json op = {{"op", "set_appearance"}, {"id", bodyKey}};
     if (color) {
         op["color"] = {color[0], color[1], color[2]};
@@ -1824,8 +1850,18 @@ static bool ppHandleGeometry(AppState& st, const Renderer& renderer, const ImVec
 // back-to-back on AsyncRpc FIFO so the checkpoint envelope stays paired without blocking GL.
 static void ppKickAsync(AppState& st);
 
+// Keep the last applied geometry when an agent takes over; never consume the checkpoint.
+static void ppAbandon(AppState& st) {
+    if (st.docLockedByAgent(s_pp.docId)) toastViewportEditKept(st, s_pp.docId);
+    s_pp.reset();  // invalidates queued completions as well as pending samples
+}
+
 static void ppQueueSample(AppState& st, double cumulative, bool commit) {
     if (!st.docMirror.hasDoc()) return;
+    if (st.docLockedByAgent(s_pp.docId) || st.docMirror.docId() != s_pp.docId) {
+        ppAbandon(st);
+        return;
+    }
     if (s_pp.finishing && !commit) return;  // no more previews after mouse-up
     s_pp.curDist = cumulative;
     if (commit) {
@@ -1838,6 +1874,10 @@ static void ppQueueSample(AppState& st, double cumulative, bool commit) {
 }
 
 static void ppKickAsync(AppState& st) {
+    if (st.docLockedByAgent(s_pp.docId) || st.docMirror.docId() != s_pp.docId) {
+        ppAbandon(st);
+        return;
+    }
     if (s_pp.inFlight || !s_pp.pending) return;
     if (!st.docMirror.hasDoc() || s_pp.checkpoint.empty()) return;
     s_pp.pending = false;
@@ -1846,7 +1886,7 @@ static void ppKickAsync(AppState& st) {
     const double dist = s_pp.curDist;
     const bool commit = s_pp.wantCommit;
     if (commit) s_pp.wantCommit = false;
-    const std::string docId = st.docMirror.docId();
+    const std::string docId = s_pp.docId;
     const std::string cp = s_pp.checkpoint;
     const int bodyId = (int)s_pp.bodyId;
     const int topoId = (int)s_pp.topoId;
@@ -1854,8 +1894,12 @@ static void ppKickAsync(AppState& st) {
     // Pair: revert then push_pull. Only the push_pull drain callback clears inFlight / re-kicks.
     st.rpc.call("doc_revert",
                 nlohmann::json{{"doc_id", docId}, {"checkpoint", cp}},
-                [gen, &st](const core::RpcResult& r) {
+                [gen, docId, &st](const core::RpcResult& r) {
                     if (gen != s_pp.gen) return;  // cancelled
+                    if (st.docLockedByAgent(docId) || st.docMirror.docId() != docId) {
+                        ppAbandon(st);
+                        return;
+                    }
                     if (r.ok && r.result.is_object() && !r.result.contains("code"))
                         st.docMirror.ingestOpsResponse(r.result);
                     // Mesh refresh deferred to the push_pull result (same sample).
@@ -1869,13 +1913,13 @@ static void ppKickAsync(AppState& st) {
         {"commit", commit}
     };
     st.rpc.call("doc_push_pull", std::move(ppParams),
-                [gen, dist, commit, &st](const core::RpcResult& r) {
-                    s_pp.inFlight = false;
-                    if (gen != s_pp.gen) {
-                        // Cancelled mid-flight — re-kick only if a live drag still wants work.
-                        if (s_pp.pending && s_pp.active) ppKickAsync(st);
+                [gen, docId, dist, commit, &st](const core::RpcResult& r) {
+                    if (gen != s_pp.gen) return;
+                    if (st.docLockedByAgent(docId) || st.docMirror.docId() != docId) {
+                        ppAbandon(st);
                         return;
                     }
+                    s_pp.inFlight = false;
                     if (!r.ok) {
                         st.toast(ui::ToastLevel::Error, "Push-pull failed: " + r.err);
                     } else {
@@ -1913,6 +1957,10 @@ static void ppKickAsync(AppState& st) {
 // call when no drag is active (no-op). Leaves NO zombie checkpoint/flag behind.
 static void ppCancel(AppState& st) {
     if (!s_pp.active && s_pp.checkpoint.empty()) { s_pp.reset(); return; }
+    if (st.docLockedByAgent(s_pp.docId) || st.docMirror.docId() != s_pp.docId) {
+        ppAbandon(st);
+        return;
+    }
     ++s_pp.gen;  // drop in-flight async completions
     s_pp.inFlight = false;
     s_pp.pending = false;
@@ -2029,8 +2077,17 @@ static void addComponentContextRef(AppState& st, const std::string& cid,
 // T-PERF2: latest-wins async move-component (revert + doc_solve_mates pair on AsyncRpc FIFO).
 static void asmDragKickAsync(AppState& st);
 
+static void asmDragAbandon(AppState& st) {
+    if (st.docLockedByAgent(s_asmDrag.docId)) toastViewportEditKept(st, s_asmDrag.docId);
+    s_asmDrag.reset();
+}
+
 static void asmDragQueue(AppState& st, const ImVec2& cur, bool commit) {
     if (!st.docMirror.hasDoc() || s_asmDrag.component.empty()) return;
+    if (st.docLockedByAgent(s_asmDrag.docId) || st.docMirror.docId() != s_asmDrag.docId) {
+        asmDragAbandon(st);
+        return;
+    }
     if (s_asmDrag.finishing && !commit) return;
     s_asmDrag.curPos = cur;
     if (commit) {
@@ -2043,6 +2100,10 @@ static void asmDragQueue(AppState& st, const ImVec2& cur, bool commit) {
 }
 
 static void asmDragKickAsync(AppState& st) {
+    if (st.docLockedByAgent(s_asmDrag.docId) || st.docMirror.docId() != s_asmDrag.docId) {
+        asmDragAbandon(st);
+        return;
+    }
     if (s_asmDrag.inFlight || !s_asmDrag.pending) return;
     if (!st.docMirror.hasDoc() || s_asmDrag.checkpoint.empty()) return;
     s_asmDrag.pending = false;
@@ -2051,7 +2112,7 @@ static void asmDragKickAsync(AppState& st) {
     const ImVec2 cur = s_asmDrag.curPos;
     const bool commit = s_asmDrag.wantCommit;
     if (commit) s_asmDrag.wantCommit = false;
-    const std::string docId = st.docMirror.docId();
+    const std::string docId = s_asmDrag.docId;
     const std::string cp = s_asmDrag.checkpoint;
     const std::string component = s_asmDrag.component;
 
@@ -2065,8 +2126,12 @@ static void asmDragKickAsync(AppState& st) {
 
     st.rpc.call("doc_revert",
                 nlohmann::json{{"doc_id", docId}, {"checkpoint", cp}},
-                [gen, &st](const core::RpcResult& r) {
+                [gen, docId, &st](const core::RpcResult& r) {
                     if (gen != s_asmDrag.gen) return;
+                    if (st.docLockedByAgent(docId) || st.docMirror.docId() != docId) {
+                        asmDragAbandon(st);
+                        return;
+                    }
                     if (r.ok && r.result.is_object() && !r.result.contains("code"))
                         st.docMirror.ingestOpsResponse(r.result);
                 }, /*timeoutMs=*/60000);
@@ -2076,12 +2141,13 @@ static void asmDragKickAsync(AppState& st) {
         {"drag", {{"component", component},
                   {"target", {target.x, target.y, target.z}}}}};
     st.rpc.call("doc_solve_mates", std::move(params),
-                [gen, cur, commit, &st](const core::RpcResult& r) {
-                    s_asmDrag.inFlight = false;
-                    if (gen != s_asmDrag.gen) {
-                        if (s_asmDrag.pending && s_asmDrag.active) asmDragKickAsync(st);
+                [gen, docId, cur, commit, &st](const core::RpcResult& r) {
+                    if (gen != s_asmDrag.gen) return;
+                    if (st.docLockedByAgent(docId) || st.docMirror.docId() != docId) {
+                        asmDragAbandon(st);
                         return;
                     }
+                    s_asmDrag.inFlight = false;
                     if (!r.ok) {
                         st.toast(ui::ToastLevel::Error, "Move component failed: " + r.err);
                     } else if (r.result.is_object() && r.result.contains("code")) {
@@ -2116,6 +2182,10 @@ static void asmDragKickAsync(AppState& st) {
 // drag is active.
 static void asmDragCancel(AppState& st) {
     if (!s_asmDrag.active && s_asmDrag.checkpoint.empty()) { s_asmDrag.reset(); return; }
+    if (st.docLockedByAgent(s_asmDrag.docId) || st.docMirror.docId() != s_asmDrag.docId) {
+        asmDragAbandon(st);
+        return;
+    }
     ++s_asmDrag.gen;
     s_asmDrag.inFlight = false;
     s_asmDrag.pending = false;
@@ -2183,6 +2253,16 @@ static bool dimHandleGeometry(AppState& st, const Renderer& renderer, const ImVe
 // owns the live preview and the single OK/Cancel commit, so there is no separate doc op to manage.)
 
 void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
+    // Check the session's document before any input, cancel, or outside-viewport commit path.
+    if ((s_pp.active || !s_pp.checkpoint.empty()) &&
+        (st.docLockedByAgent(s_pp.docId) || st.docMirror.docId() != s_pp.docId))
+        ppAbandon(st);
+    if ((s_asmDrag.active || !s_asmDrag.checkpoint.empty()) &&
+        (st.docLockedByAgent(s_asmDrag.docId) || st.docMirror.docId() != s_asmDrag.docId))
+        asmDragAbandon(st);
+    if (s_dim.active &&
+        (st.docLockedByAgent(s_dim.docId) || st.docMirror.docId() != s_dim.docId))
+        s_dim.reset();  // PM owns keep-close; do not restore the old value or re-preview.
     // Valid only for an explicit pick demand serviced by this invocation.
     st.pickReady = false;
     if (!st.renderer) return;
@@ -3528,7 +3608,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                             bool pressOnSel = st.hover.valid() && st.hover.body_id == h.body_id;
                             std::string cid = comp->value("id", std::string());
                             bool fixed = comp->value("fixed", false);
-                            if (pressOnSel && !cid.empty()) {
+                            if (pressOnSel && !cid.empty() &&
+                                !refuseViewportEdit(st, st.docMirror.docId())) {
                                 if (fixed) {
                                     st.toast(ui::ToastLevel::Warn,
                                              "This component is fixed — float it to move (right-click "
@@ -3541,6 +3622,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                                                          : std::string();
                                     s_asmDrag.reset();
                                     s_asmDrag.active     = true;
+                                    s_asmDrag.docId      = st.docMirror.docId();
                                     s_asmDrag.component  = cid;
                                     s_asmDrag.checkpoint = cp;
                                     s_asmDrag.pressPos   = io.MousePos;
@@ -3615,7 +3697,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                             float ddx = mp.x - t.x, ddy = mp.y - t.y;
                             return std::sqrt(ddx*ddx + ddy*ddy) <= hitR * 1.6f;
                         };
-                        if (onAxis || nearTip(tipP) || nearTip(tipN)) {
+                        if ((onAxis || nearTip(tipP) || nearTip(tipN)) &&
+                            !refuseViewportEdit(st, st.docMirror.docId())) {
                             // Validate draggability + take a checkpoint BEFORE mutating anything.
                             std::string cp = st.docMirror.hasDoc()
                                                  ? st.docMirror.checkpoint(st.worker) : std::string();
@@ -3623,15 +3706,18 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                             if (!probe.ok) {
                                 st.toast(ui::ToastLevel::Error,
                                          "Push-pull failed: " + probe.error_message);
-                                if (!cp.empty()) st.docMirror.revert(st.worker, cp);
+                                if (!cp.empty() && !st.activeDocLockedByAgent())
+                                    st.docMirror.revert(st.worker, cp);
                             } else if (!probe.draggable) {
                                 st.toast(ui::ToastLevel::Warn,
                                          "This face can't be dragged — " + probe.reason);
-                                if (!cp.empty()) st.docMirror.revert(st.worker, cp);
+                                if (!cp.empty() && !st.activeDocLockedByAgent())
+                                    st.docMirror.revert(st.worker, cp);
                             } else {
                                 // Begin the drag. The zero-distance probe left geometry unchanged.
                                 s_pp.reset();
                                 s_pp.active     = true;
+                                s_pp.docId      = st.docMirror.docId();
                                 s_pp.bodyId     = bId;
                                 s_pp.topoId     = tId;
                                 s_pp.checkpoint = cp;
@@ -3712,10 +3798,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                             return std::sqrt(ddx*ddx + ddy*ddy) <= hitR * 1.6f;
                         };
                         if (!(onAxis || nearTip(tipP) || nearTip(tipN))) continue;
+                        if (refuseViewportEdit(st, st.docMirror.docId())) break;
                         // Grab this handle. The drag feeds the PM field — no doc op / checkpoint here;
                         // the PM owns the live preview and the single OK/Cancel commit.
                         s_dim.reset();
                         s_dim.active      = true;
+                        s_dim.docId       = st.docMirror.docId();
                         s_dim.featureId   = dimFid;
                         s_dim.param       = c.param;
                         s_dim.angle       = c.angle;
@@ -4118,6 +4206,15 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // While the glass-box View Selector is open over a sketch, it owns the cursor — tell the
             // sketch overlay it's not hovered so a click on a box face switches the view instead of
             // dropping a sketch entity.
+            // Convert, Smart Dimension and relation reference picking read the model ID buffer
+            // inside drawOverlay, even while their tool owns all sketch input. A committed sketch
+            // edit reloads the mesh and invalidates that buffer; refresh BEFORE those reads rather
+            // than relying on the ordinary fallback below (which armed tools deliberately skip).
+            // IdPass::render caches the complete draw key, so a stationary tool hover does not
+            // re-render the model every frame.
+            if (picking && imgHovered && !s_viewSelector.active() &&
+                !s_lmbDragActive && sketch->needsModelPicks())
+                ensurePickFresh();
             sketch->drawOverlay(st, io, vr0, vr1, vw, vh,
                                 imgHovered && !s_viewSelector.active());
         } else if (st.sketchPlanePickActive && sketch != nullptr) {
@@ -4313,16 +4410,15 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // C25 W2-E: suppressed while the glass-box View Selector is up (it owns the click).
         // C37-C item 5: also suppressed while sketchPlanePickActive (the overlay owns the mouse).
         //
-        // GUI-picking overhaul: model geometry (face/edge/vertex) picking now ALSO runs while a 2D
-        // or 3D sketch is active, as a fallback behind the sketch's own entity/handle picking —
-        // sketch entities keep priority (SketchMode::inSketchEntityHot() / Sketch3DMode's), model
-        // picking only fires when the cursor is over neither. This replaces the old flat dead zone
-        // (model picking fully suppressed for the whole sketch session).
+        // Model geometry is a fallback behind sketch handles, except when Add Relation explicitly
+        // asks to select model geometry: that mode must reach an edge/vertex even if a sketch
+        // entity lies on top of it. Armed drawing tools still own their own clicks.
         const bool sketchEntityHot = (inSketch && sketch && sketch->inSketchEntityHot()) ||
                                      (inSketch3d && sketch3d && sketch3d->inSketchEntityHot());
         const bool inAnySketch = inSketch || inSketch3d;
-        if (picking && (!inAnySketch || !sketchEntityHot) && !s_viewSelector.active() &&
-            !st.sketchPlanePickActive) {
+        const bool relationModelPick = inSketch && sketch && sketch->modelSelectionAllowed();
+        if (picking && (!inAnySketch || !sketchEntityHot || relationModelPick) &&
+            !s_viewSelector.active() && !st.sketchPlanePickActive) {
             // Instant3D: while a push-pull OR dimension drag owns the mouse, freeze hover and swallow
             // the click so the press that grabbed the handle doesn't also re-select / clear. (Both
             // are non-sketch features, so their guards are always false while in a sketch.)
@@ -4385,7 +4481,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 else if (s_dim.active) {
                     // Cancel the in-progress dim drag: restore the field to its press-time value
                     // (the PM re-previews) and end the drag. The PM itself stays open.
-                    if (st.propertyManager) {
+                    if (st.propertyManager && !st.docLockedByAgent(s_dim.docId) &&
+                        st.docMirror.docId() == s_dim.docId) {
                         st.propertyManager->dragSetDim(s_dim.param, s_dim.oldValue);
                         if (s_dim.autoFlip)
                             st.propertyManager->dragSetCheck("flip", s_dim.flipAtPress);
@@ -4454,6 +4551,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         static float s_vpColor[3]   = {0.71f, 0.76f, 0.82f};
         static float s_vpMetallic = 0.0f, s_vpRoughness = 0.5f;  // C32-A material
         static std::string s_vpKey;          // "b<ordinal>" of the body to recolor
+        static std::string s_vpDocId;        // appearance popup's source document
         static bool  s_openVpPicker = false;
         // The picked body's stable appearance key (part bodies: "b<ordinal>", matching the engine).
         // Appearance is offered for part docs only. Assembly component actions are handled below
@@ -4518,6 +4616,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
 
         ui::pushContextMenuStyle();
         if (ImGui::BeginPopup("##vp_ctx")) {
+            const std::string vpEditReason = st.agentLockReason(st.docMirror.docId());
             // ---- ITEM 8: selection-dependent entries ----
             if (vpHasComp) {
                 ImGui::PushStyleColor(ImGuiCol_Text,
@@ -4535,17 +4634,34 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
                 if (haveOsFileManager() && ImGui::MenuItem("Open Part Location"))
                     revealInFileManager(vpCompAbsPath);
-                if (ImGui::MenuItem("Edit Model"))
+                std::string modelEditReason = vpEditReason;
+                if (pathOk && modelEditReason.empty()) {
+                    namespace fs = std::filesystem;
+                    std::error_code ec;
+                    fs::path wanted = fs::weakly_canonical(vpCompAbsPath, ec);
+                    if (ec) wanted = fs::path(vpCompAbsPath).lexically_normal();
+                    for (const auto& tab : st.docTabs) {
+                        if (tab.path.empty() || !st.docLockedByAgent(tab.docId)) continue;
+                        std::error_code tabEc;
+                        fs::path have = fs::weakly_canonical(tab.path, tabEc);
+                        if (tabEc) have = fs::path(tab.path).lexically_normal();
+                        if (have == wanted) { modelEditReason = st.agentLockReason(tab.docId); break; }
+                    }
+                }
+                if (viewportEditMenuItem("Edit Model", modelEditReason) &&
+                    !refuseViewportEdit(st, st.docMirror.docId()))
                     st.enterComponentEdit(vpCompId, vpCompAbsPath);
                 if (!pathOk) ImGui::EndDisabled();
-                if (ImGui::MenuItem("Edit Mates"))
+                if (viewportEditMenuItem("Edit Mates", vpEditReason))
                     st.requestEditComponentMates = vpCompId;
                 if (ImGui::MenuItem("Add to AI context")) addComponentContextRef(st, vpCompId, vpCompName);
                 if (vpHasTopoSel && (vpHasFace || vpHasEdge) &&
                     ImGui::MenuItem(vpHasFace ? "Add Face to AI context" : "Add Edge to AI context"))
                     addPickContextRef(st, st.selection.items().back().hit);
-                if (ImGui::MenuItem(vpCompHidden ? "Show Component" : "Hide Component")) {
-                    if (st.docMirror.hasDoc() && st.workerStarted) {
+                if (viewportEditMenuItem(vpCompHidden ? "Show Component" : "Hide Component",
+                                         vpEditReason)) {
+                    if (st.docMirror.hasDoc() && st.workerStarted &&
+                        !refuseViewportEdit(st, st.docMirror.docId())) {
                         nlohmann::json op = {{"op", "asm_edit_component"},
                                              {"id", vpCompId},
                                              {"hidden", !vpCompHidden}};
@@ -4618,14 +4734,15 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 if (ImGui::MenuItem("Clear Selection")) st.selection.clear();
                 // C26: recolor the selected body.
                 if (!vpBodyKey.empty()) {
-                    if (ImGui::MenuItem("Appearance...")) {
+                    if (viewportEditMenuItem("Appearance...", vpEditReason)) {
                         s_vpKey = vpBodyKey;
+                        s_vpDocId = st.docMirror.docId();
                         s_vpColor[0] = 0.71f; s_vpColor[1] = 0.76f; s_vpColor[2] = 0.82f;
                         s_vpMetallic = 0.0f; s_vpRoughness = 0.5f;
                         s_openVpPicker = true;
                     }
-                    if (ImGui::MenuItem("Clear Appearance"))
-                        applyAppearanceFromViewport(st, vpBodyKey, nullptr);
+                    if (viewportEditMenuItem("Clear Appearance", vpEditReason))
+                        applyAppearanceFromViewport(st, st.docMirror.docId(), vpBodyKey, nullptr);
                 }
                 ImGui::Separator();
             } else if (!vpHasComp && !st.pickStatus.empty()) {
@@ -4718,16 +4835,26 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // nested-popup ordering issues. Direct-applies on commit (safe outside tree iteration).
         // Appearance ribbon "Appearance..." -> arm this picker for the whole model (body "b1").
         if (st.requestAppearanceEditor) {
-            s_vpKey = "b1";
-            s_vpColor[0] = 0.71f; s_vpColor[1] = 0.76f; s_vpColor[2] = 0.82f;
-            s_vpMetallic = 0.0f; s_vpRoughness = 0.5f;
-            s_openVpPicker = true;
             st.requestAppearanceEditor = false;
+            if (!refuseViewportEdit(st, st.docMirror.docId())) {
+                s_vpKey = "b1";
+                s_vpDocId = st.docMirror.docId();
+                s_vpColor[0] = 0.71f; s_vpColor[1] = 0.76f; s_vpColor[2] = 0.82f;
+                s_vpMetallic = 0.0f; s_vpRoughness = 0.5f;
+                s_openVpPicker = true;
+            }
         }
         if (s_openVpPicker) { ImGui::OpenPopup("##appearance_vp"); s_openVpPicker = false; }
-        if (appearanceColorPicker("##appearance_vp", s_vpColor, &s_vpMetallic, &s_vpRoughness)
+        const std::string appearanceDisabledReason = !ImGui::IsPopupOpen("##appearance_vp")
+            ? std::string()
+            : st.docMirror.docId() != s_vpDocId
+                ? "Switch back to the part that opened this appearance editor."
+                : st.agentLockReason(s_vpDocId);
+        if (appearanceColorPicker("##appearance_vp", s_vpColor, &s_vpMetallic, &s_vpRoughness,
+                                  appearanceDisabledReason.c_str())
             && !s_vpKey.empty())
-            applyAppearanceFromViewport(st, s_vpKey, s_vpColor, s_vpMetallic, s_vpRoughness);
+            applyAppearanceFromViewport(st, s_vpDocId, s_vpKey, s_vpColor,
+                                        s_vpMetallic, s_vpRoughness);
 
         // ---- in-context component-edit banner (SolidWorks "Edit Component") ----
         // Drawn as a true viewport HUD on the visible 3D surface — right of the FeatureManager

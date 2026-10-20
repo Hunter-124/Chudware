@@ -37,6 +37,7 @@ const char* const kDocOpKinds[] = {
     "sketch_set_dim",
     "sketch_toggle_construction",
     "sketch_convert",
+    "sketch_fully_define",
     "sketch_break_external_ref",
     "sketch_trim",
     "sketch_extend",

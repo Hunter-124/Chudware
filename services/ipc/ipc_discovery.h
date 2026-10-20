@@ -6,7 +6,7 @@
 // hostd and ignores those overrides.
 //
 // The key is 16 hex chars of FNV-1a 64. It is namespacing, not authentication;
-// the per-user runtime directory or Windows SID namespace supplies isolation.
+// the owner-private runtime/state directory or pipe ACL supplies isolation.
 
 #include <string>
 
@@ -25,15 +25,15 @@ std::string lockPath(const std::string& key);
 // Single-instance lock name for the DESKTOP GUI, keyed the same way (instanceKey of the
 // GUI binary). A sibling of lockPath() that can never collide with it: the daemon and the
 // window are independent singletons — one daemon may legitimately outlive/precede its GUI.
-// POSIX -> a lock file next to the daemon's in the runtime dir; Windows -> a named-mutex
-// name. Same shape as lockPath(), so SingleInstance takes either one verbatim.
+// POSIX -> a sibling runtime lock file; Windows -> a session-scoped private state
+// lock file. Both are handle-lifetime claims, never public named mutex objects.
 std::string guiLockPath(const std::string& key);
 
 // Runtime dir ($XDG_RUNTIME_DIR/chudware or /tmp/chudware-<uid>), created 0700 with
 // ownership verified (refuses a dir owned by someone else). "" on failure.
 std::string runtimeDir();
 
-// State dir for logs/autosaves: ~/.local/share/Chudware (or $XDG_DATA_HOME/Chudware).
+// State dir for logs/autosaves, created/validated owner-private; "" on failure.
 std::string stateDir();
 
 // Resolve the hostd binary. Developer builds honor $CHUDWARE_HOSTD_BIN then `hint`.
@@ -41,10 +41,9 @@ std::string stateDir();
 // signed payload-manifest row is authenticated; otherwise returns "".
 std::string resolveHostdBin(const std::string& hint);
 
-// Single-instance guard: flock on POSIX, named mutex on Windows (lockPath()
-// returns a file path / a Global\ mutex name respectively). Held for the
-// daemon's lifetime; evaporates on process death, so there is never a stale
-// lock to clean up.
+// Single-instance guard: flock on POSIX, restricted-sharing private file handle
+// on Windows. Held for process lifetime; death releases the claim even though
+// the harmless diagnostic lock file remains.
 class SingleInstance {
 public:
     ~SingleInstance() { release(); }
@@ -62,7 +61,7 @@ public:
 
 private:
 #ifdef _WIN32
-    void* h_ = nullptr;  // mutex HANDLE
+    void* h_ = nullptr;  // private lock FILE* (owns its restricted-sharing HANDLE)
 #else
     int fd_ = -1;
 #endif

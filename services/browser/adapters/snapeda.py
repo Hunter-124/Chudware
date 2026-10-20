@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 
 from .. import session as _session
-from . import download_dir, is_login_wall, login_required, provenance_envelope, register
+from . import download_path, is_login_wall, login_required, provenance_envelope, register
 
 SITE = "snapeda"
 BASE_URL = "https://www.snapeda.com"
@@ -88,8 +88,9 @@ class SnapEdaAdapter:
         if download_url.startswith("/"):
             download_url = BASE_URL + download_url
 
-        filename = download_url.rsplit("/", 1)[-1].split("?", 1)[0] or "download.zip"
-        dest = download_dir(SITE) / filename
+        dest, refusal = download_path(SITE, download_url, default="download.zip")
+        if refusal is not None:
+            return refusal
         outcome = _session.browser_download(download_url, SITE, dest)
         if not outcome.get("ok"):
             return outcome

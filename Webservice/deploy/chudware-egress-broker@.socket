@@ -1,0 +1,13 @@
+[Unit]
+Description=Chudware tenant CONNECT egress listener %i
+
+[Socket]
+ListenStream=@WEB_HOME@/cells/%i/egress.sock
+SocketMode=0600
+DirectoryMode=0700
+Accept=no
+RemoveOnStop=yes
+Service=chudware-egress-broker@%i.service
+
+[Install]
+WantedBy=sockets.target

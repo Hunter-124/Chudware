@@ -2,16 +2,21 @@
 // Mirrors the CPU float32 arithmetic in lbm.cpp as closely as practical on GPU.
 // Voxelization stays on the host; this TU only owns the lattice loop.
 #include "sim/lbm_cuda.h"
+#include "prof/phases.h"
+#include "util/resource_governor.h"
 
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <array>
 
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <limits>
 #include <cstring>
+#include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace chudware::sim {
@@ -73,8 +78,23 @@ __device__ inline size_t cidx(int x, int y, int z, int ny, int nz) {
     return (static_cast<size_t>(x) * ny + y) * nz + z;
 }
 
+__global__ void initialize_kernel(float* f, const uint8_t* solid, const float* inlet,
+                                  int ncell) {
+    const size_t c = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c >= static_cast<size_t>(ncell)) return;
+    for (int q = 0; q < NQ; ++q) f[c * NQ + q] = solid[c] ? 0.0f : inlet[q];
+}
+
+// Slots are grouped by q, then by the CPU's C-order fluid-boundary traversal.
+// Keep the float32 pairwise reduction on the host, not an unordered device sum.
+__global__ void gather_links_kernel(const float* f, const uint64_t* slots, float* values,
+                                    size_t count) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) values[i] = f[slots[i]];
+}
+
 __global__ void collide_kernel(float* f, const uint8_t* solid, int nx, int ny, int nz,
-                               float omega_s, float nu0, int use_smag) {
+                               float omega_s, float tau_floor, float nu0, int use_smag) {
     const int ncell = nx * ny * nz;
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= ncell) return;
@@ -111,7 +131,7 @@ __global__ void collide_kernel(float* f, const uint8_t* solid, int nx, int ny, i
         const float pi_mag = sqrtf(pairwise_sum19(sq));
         const float nu_eff = nu0 + d_SMAG_C * pi_mag;
         float tau_eff = nu_eff / d_CS2 + 0.5f;
-        if (tau_eff < (1.0f / omega_s)) tau_eff = 1.0f / omega_s;
+        if (tau_eff < tau_floor) tau_eff = tau_floor;
         if (tau_eff > 2.0f) tau_eff = 2.0f;
         omega = 1.0f / tau_eff;
     }
@@ -209,12 +229,18 @@ __global__ void zero_solid_kernel(float* f, const uint8_t* solid, int ncell) {
 }
 
 __global__ void macros_kernel(const float* f, float* rho, float* ux, float* uy, float* uz,
-                              int ncell) {
+                              int ncell, int* invalid_populations = nullptr) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= ncell) return;
     const size_t base = static_cast<size_t>(c) * NQ;
     float loc[NQ];
-    for (int q = 0; q < NQ; ++q) loc[q] = f[base + q];
+    bool invalid = false;
+    for (int q = 0; q < NQ; ++q) {
+        loc[q] = f[base + q];
+        if (invalid_populations && (!isfinite(loc[q]) || fabsf(loc[q]) > 1.0e6f))
+            invalid = true;
+    }
+    if (invalid) atomicExch(invalid_populations, 1);
     float prod[NQ];
     const float sr = pairwise_sum19(loc);
     for (int q = 0; q < NQ; ++q) prod[q] = loc[q] * static_cast<float>(d_EQ[q][0]);
@@ -230,14 +256,6 @@ __global__ void macros_kernel(const float* f, float* rho, float* ux, float* uy, 
     uz[c] = sz / rho_safe;
 }
 
-#define CUDA_OK(call, reason)                                                          \
-    do {                                                                               \
-        cudaError_t _e = (call);                                                       \
-        if (_e != cudaSuccess) {                                                       \
-            reason = std::string("CUDA error: ") + cudaGetErrorString(_e);             \
-            return false;                                                              \
-        }                                                                              \
-    } while (0)
 
 }  // namespace
 
@@ -298,86 +316,37 @@ LbmResult lbm_run_cuda(const std::vector<uint8_t>& solid, int nx, int ny, int nz
         return R;
     }
 
-    float *d_f = nullptr, *d_g = nullptr, *d_inlet = nullptr;
-    float *d_rho = nullptr, *d_ux = nullptr, *d_uy = nullptr, *d_uz = nullptr;
-    uint8_t* d_solid = nullptr;
-    auto cleanup = [&]() {
-        if (d_f) cudaFree(d_f);
-        if (d_g) cudaFree(d_g);
-        if (d_inlet) cudaFree(d_inlet);
-        if (d_rho) cudaFree(d_rho);
-        if (d_ux) cudaFree(d_ux);
-        if (d_uy) cudaFree(d_uy);
-        if (d_uz) cudaFree(d_uz);
-        if (d_solid) cudaFree(d_solid);
-    };
-
-    std::string why;
+    // Every return (including allocation/callback exceptions) releases device storage.
+    struct DeviceStorage {
+        float *f = nullptr, *g = nullptr, *inlet = nullptr;
+        float *rho = nullptr, *ux = nullptr, *uy = nullptr, *uz = nullptr;
+        float* gather = nullptr;
+        uint8_t* solid = nullptr;
+        uint64_t* slots = nullptr;
+        int* invalid = nullptr;
+        ~DeviceStorage() {
+            if (f) cudaFree(f);
+            if (g) cudaFree(g);
+            if (inlet) cudaFree(inlet);
+            if (rho) cudaFree(rho);
+            if (ux) cudaFree(ux);
+            if (uy) cudaFree(uy);
+            if (uz) cudaFree(uz);
+            if (gather) cudaFree(gather);
+            if (solid) cudaFree(solid);
+            if (slots) cudaFree(slots);
+            if (invalid) cudaFree(invalid);
+        }
+    } d;
     auto fail = [&](const std::string& msg) {
         fallback_reason = msg;
+        R.ok = false;
         R.error = msg;
-        cleanup();
-        return R;
+        return std::move(R);
     };
-
-    if (cudaMalloc(&d_f, ncell * NQ * sizeof(float)) != cudaSuccess)
-        return fail("cudaMalloc f failed");
-    if (cudaMalloc(&d_g, ncell * NQ * sizeof(float)) != cudaSuccess)
-        return fail("cudaMalloc g failed");
-    if (cudaMalloc(&d_solid, ncell * sizeof(uint8_t)) != cudaSuccess)
-        return fail("cudaMalloc solid failed");
-    if (cudaMalloc(&d_rho, ncell * sizeof(float)) != cudaSuccess)
-        return fail("cudaMalloc rho failed");
-    if (cudaMalloc(&d_ux, ncell * sizeof(float)) != cudaSuccess)
-        return fail("cudaMalloc ux failed");
-    if (cudaMalloc(&d_uy, ncell * sizeof(float)) != cudaSuccess)
-        return fail("cudaMalloc uy failed");
-    if (cudaMalloc(&d_uz, ncell * sizeof(float)) != cudaSuccess)
-        return fail("cudaMalloc uz failed");
-    if (cudaMalloc(&d_inlet, NQ * sizeof(float)) != cudaSuccess)
-        return fail("cudaMalloc inlet failed");
-
-    if (cudaMemcpy(d_solid, solid.data(), ncell, cudaMemcpyHostToDevice) != cudaSuccess)
-        return fail("H2D solid failed");
-
-    // Initialise f = feq(1, u_lat, 0, 0); zero solid cells — host-side then upload.
-    const float u_lat = static_cast<float>(p.u_lat);
-    std::vector<float> h_f(ncell * NQ, 0.0f);
-    float inlet_feq[NQ];
-    {
-        const float u2 = u_lat * u_lat;
-        const float CS2 = 1.0f / 3.0f;
-        const float W[NQ] = {
-            1.0f / 3.0f, 1.0f / 18.0f, 1.0f / 18.0f, 1.0f / 18.0f, 1.0f / 18.0f, 1.0f / 18.0f,
-            1.0f / 18.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f,
-            1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f,
-            1.0f / 36.0f};
-        const int EQ[NQ][3] = {
-            {0, 0, 0}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1},
-            {1, 1, 0}, {-1, -1, 0}, {1, -1, 0}, {-1, 1, 0}, {1, 0, 1}, {-1, 0, -1},
-            {1, 0, -1}, {-1, 0, 1}, {0, 1, 1}, {0, -1, -1}, {0, 1, -1}, {0, -1, 1}};
-        for (int q = 0; q < NQ; ++q) {
-            float eu = u_lat * static_cast<float>(EQ[q][0]);
-            float term = 1.0f + eu / CS2 + (eu * eu) / (2.0f * CS2 * CS2) - u2 / (2.0f * CS2);
-            inlet_feq[q] = W[q] * 1.0f * term;
-        }
-        for (size_t c = 0; c < ncell; ++c) {
-            if (solid[c]) continue;
-            for (int q = 0; q < NQ; ++q) h_f[c * NQ + q] = inlet_feq[q];
-        }
-    }
-    if (cudaMemcpy(d_f, h_f.data(), h_f.size() * sizeof(float), cudaMemcpyHostToDevice) !=
-        cudaSuccess)
-        return fail("H2D f failed");
-    if (cudaMemcpy(d_inlet, inlet_feq, NQ * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
-        return fail("H2D inlet failed");
-
-    const double tau_current = p.tau0;
-    const bool use_smag = true;  // Match CPU: preserve tau0 and add LES viscosity at high Re.
-    const float omega_s = static_cast<float>(1.0 / tau_current);
-    const float CS2 = 1.0f / 3.0f;
-    const float nu0 = CS2 * static_cast<float>(tau_current - 0.5);
-
+    try {
+    chudware::prof::phases::StudyScope study("lbm_cuda");
+    const auto t_init = std::chrono::steady_clock::now();
     const int EQ[NQ][3] = {
         {0, 0, 0}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1},
         {1, 1, 0}, {-1, -1, 0}, {1, -1, 0}, {-1, 1, 0}, {1, 0, 1}, {-1, 0, -1},
@@ -385,129 +354,254 @@ LbmResult lbm_run_cuda(const std::vector<uint8_t>& solid, int nx, int ny, int nz
     auto cidx_h = [ny, nz](int x, int y, int z) {
         return (static_cast<size_t>(x) * ny + y) * nz + z;
     };
-    auto momentum_exchange_host = [&](const std::vector<float>& hf, double& drag_lat,
-                                      double& lift_lat, double& side_lat) {
-        drag_lat = 0.0;
-        lift_lat = 0.0;
-        side_lat = 0.0;
-        std::vector<float> gather;
-        for (int q = 1; q < NQ; ++q) {
-            gather.clear();
-            for (int x = 0; x < nx; ++x) {
-                int nbx = (x + EQ[q][0]) % nx;
-                if (nbx < 0) nbx += nx;
-                for (int y = 0; y < ny; ++y) {
-                    int nby = (y + EQ[q][1]) % ny;
-                    if (nby < 0) nby += ny;
-                    for (int z = 0; z < nz; ++z) {
-                        int nbz = (z + EQ[q][2]) % nz;
-                        if (nbz < 0) nbz += nz;
-                        const size_t c = cidx_h(x, y, z);
-                        const size_t nb = cidx_h(nbx, nby, nbz);
-                        if (solid[nb] && !solid[c]) gather.push_back(hf[c * NQ + q]);
-                    }
+    std::array<size_t, NQ + 1> offsets{};
+    std::vector<uint64_t> slots;
+    for (int q = 1; q < NQ; ++q) {
+        offsets[q] = slots.size();
+        // Exactly the CPU's q, x, y, z order, including periodic neighbours.
+        for (int x = 0; x < nx; ++x) {
+            int nbx = (x + EQ[q][0]) % nx;
+            if (nbx < 0) nbx += nx;
+            for (int y = 0; y < ny; ++y) {
+                int nby = (y + EQ[q][1]) % ny;
+                if (nby < 0) nby += ny;
+                for (int z = 0; z < nz; ++z) {
+                    int nbz = (z + EQ[q][2]) % nz;
+                    if (nbz < 0) nbz += nz;
+                    const size_t c = cidx_h(x, y, z);
+                    const size_t nb = cidx_h(nbx, nby, nbz);
+                    if (solid[nb] && !solid[c])
+                        slots.push_back(static_cast<uint64_t>(nb) * NQ + q);
                 }
             }
-            const float s32 = pairwise_sum_f32_host(gather.data(), gather.size());
-            const double contrib = static_cast<double>(s32) * 2.0;
-            drag_lat += contrib * static_cast<double>(EQ[q][0]);
-            lift_lat += contrib * static_cast<double>(EQ[q][1]);
-            side_lat += contrib * static_cast<double>(EQ[q][2]);
         }
-    };
+    }
+    offsets[NQ] = slots.size();
+    std::vector<float> gathered(slots.size());
+    const size_t plane = static_cast<size_t>(ny) * nz;
+    std::vector<float> flux_planes(plane * 4);
+
+    if (cudaMalloc(&d.f, ncell * NQ * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&d.g, ncell * NQ * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&d.solid, ncell) != cudaSuccess ||
+        cudaMalloc(&d.rho, ncell * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&d.ux, ncell * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&d.uy, ncell * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&d.uz, ncell * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&d.inlet, NQ * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&d.invalid, sizeof(int)) != cudaSuccess)
+        return fail("CUDA lattice allocation failed");
+    if (!slots.empty() &&
+        (cudaMalloc(&d.slots, slots.size() * sizeof(uint64_t)) != cudaSuccess ||
+         cudaMalloc(&d.gather, gathered.size() * sizeof(float)) != cudaSuccess))
+        return fail("CUDA boundary-link allocation failed");
+
+    const float u_lat = static_cast<float>(p.u_lat);
+    const float CS2 = 1.0f / 3.0f;
+    const float W[NQ] = {
+        1.0f / 3.0f, 1.0f / 18.0f, 1.0f / 18.0f, 1.0f / 18.0f, 1.0f / 18.0f, 1.0f / 18.0f,
+        1.0f / 18.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f,
+        1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f,
+        1.0f / 36.0f};
+    float inlet_feq[NQ];
+    const float u2 = u_lat * u_lat;
+    for (int q = 0; q < NQ; ++q) {
+        float eu = u_lat * static_cast<float>(EQ[q][0]);
+        float term = 1.0f + eu / CS2 + (eu * eu) / (2.0f * CS2 * CS2) - u2 / (2.0f * CS2);
+        inlet_feq[q] = W[q] * 1.0f * term;
+    }
+    if (cudaMemcpy(d.solid, solid.data(), ncell, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d.inlet, inlet_feq, sizeof(inlet_feq), cudaMemcpyHostToDevice) != cudaSuccess)
+        return fail("H2D lattice inputs failed");
+    if (!slots.empty() &&
+        cudaMemcpy(d.slots, slots.data(), slots.size() * sizeof(uint64_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess)
+        return fail("H2D boundary links failed");
+
+    const float omega_s = static_cast<float>(1.0 / p.tau0);
+    const float tau_floor = static_cast<float>(p.tau0);
+    const float nu0 = CS2 * static_cast<float>(p.tau0 - 0.5);
     const int threads = 256;
     const int blocks = static_cast<int>((ncell + threads - 1) / threads);
+    const unsigned int link_blocks =
+        static_cast<unsigned int>((slots.size() + threads - 1) / threads);
     dim3 thr2(16, 16);
     dim3 blk_yz((ny + 15) / 16, (nz + 15) / 16);
     dim3 blk_xz((nx + 15) / 16, (nz + 15) / 16);
     dim3 blk_xy((nx + 15) / 16, (ny + 15) / 16);
+    initialize_kernel<<<blocks, threads>>>(d.f, d.solid, d.inlet, static_cast<int>(ncell));
+    if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess)
+        return fail(std::string("CUDA initialization launch failed: ") + cudaGetErrorString(error));
 
-    const int sample_every = std::max(1, n_steps / 50);
-    std::vector<double> drag_hist;
+    const int convergence_window = std::max(50, n_steps / 5);
+    const int force_window_samples = std::max(5, (convergence_window + 9) / 10);
+    std::vector<std::array<double, 3>> force_hist;
+    force_hist.reserve(static_cast<size_t>(force_window_samples) + 1);
+    std::array<double, 3> mean_force_lat{0.0, 0.0, 0.0};
+    double force_drift = std::numeric_limits<double>::infinity();
+    bool converged_in_loop = false;
+    double convergence_ms = 0.0;
+    unsigned long long sample_count = 0;
+    chudware::prof::phases::add("init", std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_init).count());
     auto last_progress = std::chrono::steady_clock::now();
     if (on_progress) on_progress(0, n_steps);
-
-    for (int step = 1; step <= n_steps; ++step) {
-        collide_kernel<<<blocks, threads>>>(d_f, d_solid, nx, ny, nz, omega_s, nu0,
-                                            use_smag ? 1 : 0);
-        stream_kernel<<<blocks, threads>>>(d_f, d_g, nx, ny, nz);
-        std::swap(d_f, d_g);
-        inlet_kernel<<<blk_yz, thr2>>>(d_f, nx, ny, nz, d_inlet);
-        outlet_kernel<<<blk_yz, thr2>>>(d_f, nx, ny, nz);
-        slip_y_kernel<<<blk_xz, thr2>>>(d_f, nx, ny, nz);
-        slip_z_kernel<<<blk_xy, thr2>>>(d_f, nx, ny, nz);
-        bounce_back_kernel<<<blocks, threads>>>(d_f, d_solid, nx, ny, nz);
-        zero_solid_kernel<<<blocks, threads>>>(d_f, d_solid, static_cast<int>(ncell));
-        if (const cudaError_t launch_error = cudaGetLastError();
-            launch_error != cudaSuccess) {
-            return fail(std::string("kernel launch failed: ") +
-                        cudaGetErrorString(launch_error));
+    int step = 0;
+    {
+    chudware::prof::phases::PhaseScope loop("loop");
+    for (step = 1; step <= n_steps; ++step) {
+        collide_kernel<<<blocks, threads>>>(d.f, d.solid, nx, ny, nz, omega_s, tau_floor,
+                                            nu0, 1);
+        stream_kernel<<<blocks, threads>>>(d.f, d.g, nx, ny, nz);
+        std::swap(d.f, d.g);
+        inlet_kernel<<<blk_yz, thr2>>>(d.f, nx, ny, nz, d.inlet);
+        outlet_kernel<<<blk_yz, thr2>>>(d.f, nx, ny, nz);
+        slip_y_kernel<<<blk_xz, thr2>>>(d.f, nx, ny, nz);
+        slip_z_kernel<<<blk_xy, thr2>>>(d.f, nx, ny, nz);
+        const bool sampled_force = step % 10 == 0 || step == n_steps;
+        if (sampled_force) {
+            const auto t_cv = std::chrono::steady_clock::now();
+            if (!slots.empty()) {
+                gather_links_kernel<<<link_blocks, threads>>>(d.f, d.slots, d.gather,
+                                                              slots.size());
+                if (cudaMemcpy(gathered.data(), d.gather, gathered.size() * sizeof(float),
+                               cudaMemcpyDeviceToHost) != cudaSuccess)
+                    return fail("D2H boundary force sample failed");
+            }
+            std::array<double, 3> sample{0.0, 0.0, 0.0};
+            for (int q = 1; q < NQ; ++q) {
+                const size_t count = offsets[q + 1] - offsets[q];
+                if (!count) continue;
+                const double contrib = 2.0 * static_cast<double>(
+                    pairwise_sum_f32_host(gathered.data() + offsets[q], count));
+                for (int c = 0; c < 3; ++c) sample[c] += contrib * static_cast<double>(EQ[q][c]);
+            }
+            force_hist.push_back(sample);
+            if (static_cast<int>(force_hist.size()) > force_window_samples)
+                force_hist.erase(force_hist.begin());
+            mean_force_lat = {0.0, 0.0, 0.0};
+            for (const auto& value : force_hist)
+                for (int c = 0; c < 3; ++c) mean_force_lat[c] += value[c];
+            for (double& component : mean_force_lat)
+                component /= static_cast<double>(force_hist.size());
+            const size_t half = force_hist.size() / 2;
+            if (half >= 2) {
+                double early_drag = 0.0, late_drag = 0.0;
+                for (size_t i = 0; i < half; ++i) {
+                    early_drag += force_hist[i][0];
+                    late_drag += force_hist[force_hist.size() - half + i][0];
+                }
+                early_drag /= static_cast<double>(half);
+                late_drag /= static_cast<double>(half);
+                force_drift = std::abs(late_drag - early_drag) /
+                              std::max(std::abs(mean_force_lat[0]), 1e-30);
+            }
+            ++sample_count;
+            convergence_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_cv).count();
+            R.steps_run = step;
+            if (should_cancel && should_cancel()) {
+                // The empty-mask path has no blocking gather copy to drain work.
+                const cudaError_t completion = cudaDeviceSynchronize();
+                R.error = "cancelled by sim_cancel at step " + std::to_string(step) +
+                          " of " + std::to_string(n_steps);
+                if (completion != cudaSuccess)
+                    R.error += std::string("; CUDA completion failed: ") +
+                               cudaGetErrorString(completion);
+                return R;
+            }
+            if (chudware::governor::low_memory_now()) {
+                const cudaError_t completion = cudaDeviceSynchronize();
+                R.error = "CFD run stopped at step " + std::to_string(step) +
+                          ": host memory critically low (governor) — close other "
+                          "applications and re-run";
+                if (completion != cudaSuccess)
+                    R.error += std::string("; CUDA completion failed: ") +
+                               cudaGetErrorString(completion);
+                return R;
+            }
         }
-        if (on_progress && step % sample_every != 0 && step != n_steps &&
+        bounce_back_kernel<<<blocks, threads>>>(d.f, d.solid, nx, ny, nz);
+        zero_solid_kernel<<<blocks, threads>>>(d.f, d.solid, static_cast<int>(ncell));
+        if (const cudaError_t error = cudaGetLastError(); error != cudaSuccess)
+            return fail(std::string("kernel launch failed: ") + cudaGetErrorString(error));
+        if (on_progress && (step == n_steps ||
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                           last_progress).count() >= 1.0) {
-            // Do not call queued kernel launches completed work. A heartbeat-only
-            // sync changes neither the lattice nor convergence sampling.
+                                           last_progress).count() >= 1.0)) {
+            // Heartbeats describe completed work, never queued launches.
             if (cudaDeviceSynchronize() != cudaSuccess)
                 return fail("progress heartbeat sync failed");
             on_progress(step, n_steps);
             last_progress = std::chrono::steady_clock::now();
         }
-        if (step % sample_every == 0 || step == n_steps) {
-            // Cooperative cancel (sim_cancel): drain the queued kernels, free, and report a
-            // terminal cancel (NOT a fallback — the caller checks should_cancel before the
-            // CPU fallback). Takes effect at the next checkpoint, like the CPU path.
-            if (should_cancel && should_cancel()) {
-                cudaDeviceSynchronize();
-                cleanup();
-                R.ok = false;
-                R.steps_run = step;
-                R.error = "cancelled by sim_cancel at step " + std::to_string(step) +
-                          " of " + std::to_string(n_steps);
-                return R;
-            }
-            if (cudaMemcpy(h_f.data(), d_f, h_f.size() * sizeof(float),
+        if (sampled_force &&
+            static_cast<int>(force_hist.size()) >= force_window_samples &&
+            step > n_steps / 5 && force_drift < 0.01 &&
+            (slots.empty() || mean_force_lat[0] > 0.0)) {
+            const auto t_cv = std::chrono::steady_clock::now();
+            macros_kernel<<<blocks, threads>>>(d.f, d.rho, d.ux, d.uy, d.uz,
+                                               static_cast<int>(ncell));
+            const size_t bytes = plane * sizeof(float);
+            const size_t last = (static_cast<size_t>(nx) - 1) * plane;
+            if (cudaMemcpy(flux_planes.data(), d.rho, bytes, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                cudaMemcpy(flux_planes.data() + plane, d.rho + last, bytes,
+                           cudaMemcpyDeviceToHost) != cudaSuccess ||
+                cudaMemcpy(flux_planes.data() + 2 * plane, d.ux, bytes,
+                           cudaMemcpyDeviceToHost) != cudaSuccess ||
+                cudaMemcpy(flux_planes.data() + 3 * plane, d.ux + last, bytes,
                            cudaMemcpyDeviceToHost) != cudaSuccess)
-                return fail("D2H convergence sample failed");
-            double drag_sample = 0.0, lift_sample = 0.0, side_sample = 0.0;
-            momentum_exchange_host(h_f, drag_sample, lift_sample, side_sample);
-            drag_hist.push_back(drag_sample);
-            if (on_progress) {
-                on_progress(step, n_steps);
-                last_progress = std::chrono::steady_clock::now();
+                return fail("D2H continuity planes failed");
+            double inlet = 0.0, outlet = 0.0;
+            for (size_t i = 0; i < plane; ++i) {
+                if (!solid[i])
+                    inlet += static_cast<double>(flux_planes[i]) * flux_planes[2 * plane + i];
+                if (!solid[last + i])
+                    outlet += static_cast<double>(flux_planes[plane + i]) * flux_planes[3 * plane + i];
+            }
+            const double scale = std::max({std::abs(inlet), std::abs(outlet), 1e-30});
+            const double continuity = std::abs(inlet - outlet) / scale;
+            convergence_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_cv).count();
+            if (std::isfinite(continuity) && continuity < 0.02) {
+                converged_in_loop = true;
+                break;
             }
         }
     }
+    if (step > n_steps) step = n_steps;
+    R.steps_run = step;
+    // Include all necessary completions in loop wall time; no timer-only per-step sync.
     if (cudaDeviceSynchronize() != cudaSuccess)
-        return fail("cudaDeviceSynchronize failed");
-
-    macros_kernel<<<blocks, threads>>>(d_f, d_rho, d_ux, d_uy, d_uz, static_cast<int>(ncell));
-    if (cudaDeviceSynchronize() != cudaSuccess)
-        return fail("macros sync failed");
-
+        return fail("CUDA loop completion failed");
+    }
+    chudware::prof::phases::add("convergence", convergence_ms, sample_count);
+    chudware::prof::phases::PhaseScope output("output");
+    if (cudaMemset(d.invalid, 0, sizeof(int)) != cudaSuccess)
+        return fail("CUDA validation initialization failed");
+    macros_kernel<<<blocks, threads>>>(d.f, d.rho, d.ux, d.uy, d.uz,
+                                       static_cast<int>(ncell), d.invalid);
+    int invalid_populations = 0;
+    if (cudaMemcpy(&invalid_populations, d.invalid, sizeof(int),
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+        return fail("D2H population validity failed");
+    if (invalid_populations) {
+        R.diverged = true;
+        R.residual = 1.0;
+        R.error = "lbm_run_cuda: non-finite or unbounded lattice population";
+        return R;
+    }
     R.rho.resize(ncell);
     R.ux.resize(ncell);
     R.uy.resize(ncell);
     R.uz.resize(ncell);
-    if (cudaMemcpy(R.rho.data(), d_rho, ncell * sizeof(float), cudaMemcpyDeviceToHost) !=
-            cudaSuccess ||
-        cudaMemcpy(R.ux.data(), d_ux, ncell * sizeof(float), cudaMemcpyDeviceToHost) !=
-            cudaSuccess ||
-        cudaMemcpy(R.uy.data(), d_uy, ncell * sizeof(float), cudaMemcpyDeviceToHost) !=
-            cudaSuccess ||
-        cudaMemcpy(R.uz.data(), d_uz, ncell * sizeof(float), cudaMemcpyDeviceToHost) !=
-            cudaSuccess)
+    if (cudaMemcpy(R.rho.data(), d.rho, ncell * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(R.ux.data(), d.ux, ncell * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(R.uy.data(), d.uy, ncell * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(R.uz.data(), d.uz, ncell * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
         return fail("D2H macros failed");
-
-    // Download f for host-side momentum exchange (float64 accum, float32 pairwise sum
-    // order matches CPU path).
-    if (cudaMemcpy(h_f.data(), d_f, h_f.size() * sizeof(float), cudaMemcpyDeviceToHost) !=
-        cudaSuccess)
-        return fail("D2H f failed");
-
-    // Host-side momentum exchange preserves the CPU path's deterministic direction order.
-    double drag_lat = 0.0, lift_lat = 0.0, side_lat = 0.0;
-    momentum_exchange_host(h_f, drag_lat, lift_lat, side_lat);
+    const double drag_lat = mean_force_lat[0];
+    const double lift_lat = mean_force_lat[1];
+    const double side_lat = mean_force_lat[2];
 
     const double force_factor = p.rho_air * std::pow(p.dx_m, 4.0) / (p.dt_s * p.dt_s);
     R.drag_n = drag_lat * force_factor;
@@ -550,29 +644,26 @@ LbmResult lbm_run_cuda(const std::vector<uint8_t>& solid, int nx, int ny, int nz
     }
     const double flux_scale = std::max({std::abs(inlet_flux), std::abs(outlet_flux), 1e-30});
     R.mass_imbalance = std::abs(inlet_flux - outlet_flux) / flux_scale;
-    R.steps_run = n_steps;
+    R.steps_run = step;
     R.diverged = !finite_fields || !std::isfinite(R.drag_n) || !std::isfinite(R.lift_n) ||
                  !std::isfinite(R.side_n) || !std::isfinite(R.cd) ||
                  !std::isfinite(R.mass_imbalance);
-    R.residual = -1.0;
-    R.converged = false;
-    if (!R.diverged && drag_hist.size() >= 4) {
-        const size_t tail = std::max<size_t>(3, drag_hist.size() / 5);
-        const size_t start = drag_hist.size() - tail;
-        double mean = 0.0;
-        for (size_t i = start; i < drag_hist.size(); ++i) mean += drag_hist[i];
-        mean /= static_cast<double>(tail);
-        double var = 0.0;
-        for (size_t i = start; i < drag_hist.size(); ++i)
-            var += (drag_hist[i] - mean) * (drag_hist[i] - mean);
-        var /= static_cast<double>(tail);
-        R.residual = std::sqrt(var) / std::max(std::abs(mean), 1e-30);
-        R.converged = R.residual < 0.01 && R.mass_imbalance < 0.02;
-    }
+    const bool force_convergence_available =
+        static_cast<int>(force_hist.size()) >= force_window_samples &&
+        std::isfinite(force_drift);
+    R.residual = R.diverged ? 1.0 : (force_convergence_available ? force_drift : 1.0);
+    R.converged = !R.diverged &&
+        (converged_in_loop ||
+         (force_convergence_available && R.residual < 0.01 && R.mass_imbalance < 0.02));
     R.ok = !R.diverged;
     if (R.diverged) R.error = "lbm_run_cuda: non-finite/invalid final flow field";
-    cleanup();
+    if (R.ok && on_progress && step < n_steps) on_progress(n_steps, n_steps);
     return R;
+    } catch (const std::bad_alloc&) {
+        return fail("lbm_run_cuda: allocation failed for requested lattice");
+    } catch (const std::exception& e) {
+        return fail(std::string("lbm_run_cuda: solver failed: ") + e.what());
+    }
 }
 
 }  // namespace chudware::sim

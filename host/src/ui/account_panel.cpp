@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -78,43 +79,60 @@ constexpr double kRetryBaseSeconds = 5.0 * 60.0;
 constexpr const char* kUnconfirmedStatus =
     "Your subscription couldn't be confirmed — check your connection or sign in again";
 constexpr const char* kReauthorizeStatus = "Sign in again to keep editing on this device";
-struct PendingResult {
-    enum class Kind { None, Fresh, Refused, Unreachable, Invalid } kind = Kind::None;
-    std::string token;
-    std::string detail;
-    std::string securityPolicy;
-    std::string enforcementState;
-    // Stamped by setPending from Controller::generation. Sign-out bumps that counter, so a
-    // refresh or loopback login that was already in flight cannot silently sign the user
-    // back in when its result lands (the thread is still joined, only its result is dropped).
-    std::uint64_t generation = 0;
+using account_detail::PendingResult;
+using account_detail::Operation;
+
+struct AccountWorker {
+    std::thread thread;
+    std::atomic<bool> done{false};
 };
 
 struct Controller {
-    std::mutex mutex;
-    std::thread worker;
+    account_detail::ResultMailbox results;
+    // Only the UI thread owns jobs and session state. Workers only publish immutable
+    // responses to results; no worker writes credentials, queue state or AppState.
+    std::vector<std::unique_ptr<AccountWorker>> workers;
     std::atomic<bool> stopping{false};
-    PendingResult pending;
     chudware::entitlement::TokenPayload payload;
     chudware::entitlement::CheckinStamp stamp;
     double lastAttemptMonotonic = -1.0;
     bool initialized = false;
-    bool refreshRunning = false;
-    bool loginRunning = false;
     std::string securityPolicyId;
     bool authoritativeRefused = false;
     int failedAttempts = 0;  // consecutive unreachable checks; drives the retry backoff
-    std::uint64_t generation = 0;
 
     ~Controller() {
         stopping.store(true);
-        if (worker.joinable()) worker.join();
+        for (const auto& worker : workers)
+            if (worker->thread.joinable()) worker->thread.join();
     }
 };
 
 Controller& controller() {
     static Controller value;
     return value;
+}
+
+template <typename Work>
+void launchAccountWorker(Controller& c, Work work) {
+    auto worker = std::make_unique<AccountWorker>();
+    AccountWorker* job = worker.get();
+    job->thread = std::thread([job, work = std::move(work)]() mutable {
+        work();
+        job->done.store(true, std::memory_order_release);
+    });
+    c.workers.push_back(std::move(worker));
+}
+
+void reapAccountWorkers(Controller& c) {
+    for (auto it = c.workers.begin(); it != c.workers.end();) {
+        if (!(*it)->done.load(std::memory_order_acquire)) {
+            ++it;
+            continue;
+        }
+        (*it)->thread.join();
+        it = c.workers.erase(it);
+    }
 }
 
 double monotonicNow() {
@@ -400,18 +418,19 @@ struct SecurityBatchResult {
     bool accepted = false;
     bool reauthorize = false;  // signed gateway verdict: this device must sign in again
     json customerReceipt = nullptr;
+    std::string enforcementState;
+    std::string batchId;
+    std::uint64_t batchSequence = 0;
 };
 
 SecurityBatchResult sendSecurityBatch(std::string_view subject,
                                       const chudware::entitlement::SecurityPolicy& policy,
+                                      const chudware::security::SecurityBatch& batch,
+                                      const std::string& compressed,
                                       std::uint64_t refreshSequence,
                                       std::string_view requestNonce) {
     SecurityBatchResult result;
-    chudware::security::EventQueue queue(appdataAppDir()); std::string error;
-    auto batch=queue.prepareBatch(subject,policy.id,CHUDWARE_VERSION,platformName(),wallNow(),&error);
-    if(!batch)return result;
-    std::string compressed;
-    if(!chudware::security::gzipSecurityPayload(batch.body,compressed))return result;
+    std::string error;
     const std::string endpoint = policy.id == "customer_endpoint"
         ? policy.customerEndpoint : securityEventsUrl();
     if (policy.id == "customer_endpoint" && endpoint.rfind("https://", 0) != 0) return result;
@@ -446,9 +465,13 @@ SecurityBatchResult sendSecurityBatch(std::string_view subject,
     const auto decision=chudware::security::verifyEmbeddedEnforcementState(enforcement,subject,wallNow());
     if(decision.status==chudware::security::EnforcementStatus::Malformed||
        decision.status==chudware::security::EnforcementStatus::InvalidSignature||
-       decision.status==chudware::security::EnforcementStatus::SubjectMismatch||
-       !chudware::security::persistEnforcementState(enforcement,appdataAppDir()))return result;
-    result.accepted = queue.accept(batch.batchId,batch.sequence,&error);
+       decision.status==chudware::security::EnforcementStatus::SubjectMismatch)return result;
+    // Applying the acknowledgement belongs to the UI's current-generation commit,
+    // never the network worker. A delayed acknowledgement cannot drain a new queue.
+    result.enforcementState = std::move(enforcement);
+    result.batchId = batch.batchId;
+    result.batchSequence = batch.sequence;
+    result.accepted = true;
     return result;
 }
 
@@ -480,13 +503,9 @@ std::string refreshUrl() {
     return "https://app.chudware.com/api/entitlement/refresh";
 }
 
-void setPending(PendingResult result) {
-    Controller& c = controller();
-    std::lock_guard<std::mutex> lock(c.mutex);
-    result.generation = c.generation;
-    c.pending = std::move(result);
-    c.refreshRunning = false;
-    c.loginRunning = false;
+bool setPending(std::uint64_t generation, PendingResult result) {
+    result.generation = generation;  // the immutable launch generation, not current state
+    return controller().results.complete(std::move(result));
 }
 
 std::string randomState();
@@ -523,43 +542,67 @@ std::string integrityDigest() {
 
 void startRefresh(const std::string& token) {
     Controller& c = controller();
-    if (c.refreshRunning || c.loginRunning || c.worker.joinable()) return;
+    const std::uint64_t generation = c.results.begin(Operation::Refresh);
+    if (generation == 0) return;
+    c.lastAttemptMonotonic = monotonicNow();
     const auto identity = chudware::device_identity::load(appdataAppDir());
     if (identity.status != chudware::device_identity::KeyStatus::Ready) {
-        setPending({PendingResult::Kind::Invalid, {},
-                    "Device identity is missing or damaged; sign in again to reauthorize this device"});
+        setPending(generation, {PendingResult::Kind::Invalid, {},
+                   "Device identity is missing or damaged; sign in again to reauthorize this device"});
         return;
     }
-    c.refreshRunning = true;
-    c.lastAttemptMonotonic = monotonicNow();
-    // Everything below does file and network I/O (two HTTPS round trips of up to 8 s each),
-    // so it runs on the worker, never the GUI thread.
-    c.worker = std::thread([token]() {
-        std::string securitySubject;
-        json signedPolicy;
-        chudware::entitlement::SecurityPolicy securityPolicy;
-        const bool havePolicy = loadSecurityPolicy(securitySubject, signedPolicy, securityPolicy);
-        const std::string challenge = randomState();
-        const std::uint64_t sequence = chudware::device_identity::nextRefreshSequence(appdataAppDir());
+    // Session-bound writes are UI-owned and happen before the worker is launched.
+    // In particular prepareBatch changes queue counters: doing it on an obsolete
+    // worker would reset the next account's queue. No mailbox lock is held for I/O.
+    std::string securitySubject;
+    json signedPolicy;
+    chudware::entitlement::SecurityPolicy securityPolicy;
+    const bool havePolicy = loadSecurityPolicy(securitySubject, signedPolicy, securityPolicy);
+    const std::string challenge = randomState();
+    const std::uint64_t sequence = chudware::device_identity::nextRefreshSequence(appdataAppDir());
+    chudware::security::EventQueue queue(appdataAppDir());
+    const std::uint64_t lastAcknowledged = queue.acceptedThrough(securitySubject);
+    chudware::security::SecurityBatch securityBatch;
+    std::string compressed;
+    if (havePolicy) {
+        std::string error;
+        securityBatch = queue.prepareBatch(
+            securitySubject, securityPolicy.id, CHUDWARE_VERSION, platformName(), wallNow(), &error);
+        if (securityBatch && !chudware::security::gzipSecurityPayload(securityBatch.body, compressed))
+            securityBatch = {};
+    }
+    // HTTPS and response verification remain on the worker. Responses contain
+    // proposed side effects only; the current UI generation commits them in tick.
+    launchAccountWorker(c, [token, generation, securitySubject = std::move(securitySubject),
+                           securityPolicy = std::move(securityPolicy), havePolicy,
+                           challenge, sequence, lastAcknowledged,
+                           securityBatch = std::move(securityBatch),
+                           compressed = std::move(compressed)]() {
+        SecurityBatchResult batch;
+        auto finish = [&](PendingResult result) {
+            result.acknowledgedEnforcement = std::move(batch.enforcementState);
+            result.batchId = std::move(batch.batchId);
+            result.batchSequence = batch.batchSequence;
+            setPending(generation, std::move(result));
+        };
+        if (!controller().results.current(generation)) return;
         json customerReceipt = nullptr;
-        if (havePolicy) {
-            const SecurityBatchResult batch = sendSecurityBatch(
-                securitySubject, securityPolicy, sequence, challenge);
+        if (havePolicy && securityBatch) {
+            batch = sendSecurityBatch(
+                securitySubject, securityPolicy, securityBatch, compressed, sequence, challenge);
+            if (!controller().results.current(generation)) return;
             if (batch.reauthorize) {
-                setPending({PendingResult::Kind::Refused, {}, kReauthorizeStatus});
+                finish({PendingResult::Kind::Refused, {}, kReauthorizeStatus});
                 return;
             }
-            if (securityPolicy.id == "customer_endpoint") {
-                if (!batch.accepted || batch.customerReceipt.is_null()) {
-                    setPending({PendingResult::Kind::Unreachable, {}, {}});
-                    return;
-                }
-                customerReceipt = batch.customerReceipt;
-            }
         }
-        // The acknowledgement is read AFTER the batch: the gateway compares it with the
-        // sequence it just accepted. Reading it first sent the previous batch's number, so
-        // every refresh that followed an accepted batch was rejected.
+        if (havePolicy && securityPolicy.id == "customer_endpoint") {
+            if (!batch.accepted || batch.customerReceipt.is_null()) {
+                finish({PendingResult::Kind::Unreachable, {}, {}});
+                return;
+            }
+            customerReceipt = std::move(batch.customerReceipt);
+        }
         json envelope = {
             {"token", token},
             {"request_nonce", challenge},
@@ -567,20 +610,24 @@ void startRefresh(const std::string& token) {
             {"app_version", CHUDWARE_VERSION},
             {"platform", platformName()},
             {"integrity_digest", integrityDigest()},
+            // The gateway has accepted this sequence even though local acknowledgement
+            // persistence is deferred until the result's current-generation commit.
             {"last_acked_event_sequence",
-             chudware::security::EventQueue(appdataAppDir()).acceptedThrough(securitySubject)},
+             batch.batchSequence != 0 ? batch.batchSequence : lastAcknowledged},
             {"customer_receipt", std::move(customerReceipt)},
         };
         std::string signingError;
         if (sequence == 0 ||
             !chudware::device_identity::signRefreshEnvelope(envelope, appdataAppDir(), &signingError)) {
-            setPending({PendingResult::Kind::Invalid, {},
-                        "Device identity could not sign the refresh; sign in again to reauthorize this device"});
+            finish({PendingResult::Kind::Invalid, {},
+                    "Device identity could not sign the refresh; sign in again to reauthorize this device"});
             return;
         }
+        if (!controller().results.current(generation)) return;
         const auto response = chudware::agent::http_post(
             refreshUrl(), {{"Content-Type", "application/json"},
                            {"X-Chudware-Refresh-Nonce", challenge}}, envelope.dump(), 8000);
+        if (!controller().results.current(generation)) return;
         if (response.status == 200) {
             try {
                 const json body = json::parse(response.body);
@@ -589,17 +636,15 @@ void startRefresh(const std::string& token) {
                     std::string error;
                     const std::string freshToken = body["token"].get<std::string>();
                     if (chudware::entitlement::verifyEmbeddedToken(freshToken, fresh, &error)) {
+                        chudware::entitlement::SecurityPolicy verifiedPolicy;
                         if (!body.contains("security_policy") || !body["security_policy"].is_object() ||
-                            !persistSecurityPolicy(fresh.subject, body["security_policy"])) {
-                            setPending({PendingResult::Kind::Invalid, {}, "Gateway security policy failed verification"});
-                            return;
-                        }
-                        if (!persistSubject(fresh.subject)) {
-                            setPending({PendingResult::Kind::Invalid, {}, "Gateway subject could not be stored securely"});
+                            !chudware::entitlement::verifyEmbeddedSecurityPolicy(
+                                body["security_policy"].dump(), fresh.subject, verifiedPolicy, &error)) {
+                            finish({PendingResult::Kind::Invalid, {}, "Gateway security policy failed verification"});
                             return;
                         }
                         if (!body.contains("enforcement_state") || !body["enforcement_state"].is_object()) {
-                            setPending({PendingResult::Kind::Invalid, {}, "Gateway omitted signed enforcement state"});
+                            finish({PendingResult::Kind::Invalid, {}, "Gateway omitted signed enforcement state"});
                             return;
                         }
                         const std::string enforcement = body["enforcement_state"].dump();
@@ -607,15 +652,15 @@ void startRefresh(const std::string& token) {
                             enforcement, fresh.subject, wallNow());
                         if (decision.status == chudware::security::EnforcementStatus::InvalidSignature ||
                             decision.status == chudware::security::EnforcementStatus::SubjectMismatch ||
-                            decision.status == chudware::security::EnforcementStatus::Malformed ||
-                            !chudware::security::persistEnforcementState(enforcement, appdataAppDir())) {
-                            setPending({PendingResult::Kind::Invalid, {}, "Gateway enforcement state failed verification"});
+                            decision.status == chudware::security::EnforcementStatus::Malformed) {
+                            finish({PendingResult::Kind::Invalid, {}, "Gateway enforcement state failed verification"});
                             return;
                         }
-                        setPending({PendingResult::Kind::Fresh, freshToken, {}});
+                        finish({PendingResult::Kind::Fresh, freshToken, {},
+                                body["security_policy"].dump(), enforcement});
                         return;
                     }
-                    setPending({PendingResult::Kind::Invalid, {}, "Gateway returned an invalid entitlement"});
+                    finish({PendingResult::Kind::Invalid, {}, "Gateway returned an invalid entitlement"});
                     return;
                 }
             } catch (const std::exception&) {
@@ -626,14 +671,23 @@ void startRefresh(const std::string& token) {
             if (chudware::entitlement::verifyRefusal(
                     response.body, chudware::entitlement::kEmbeddedPublicKey,
                     challenge, wallNow(), &reason, &error)) {
-                setPending({PendingResult::Kind::Refused, {}, reason});
+                finish({PendingResult::Kind::Refused, {}, reason});
                 return;
             }
         }
-        // No verified answer (offline, 5xx, or an unsigned 4xx that cannot be trusted as a
-        // refusal): keep the current state and retry on the backoff.
-        setPending({PendingResult::Kind::Unreachable, {}, {}});
+        finish({PendingResult::Kind::Unreachable, {}, {}});
     });
+}
+
+void setSocketReceiveTimeout(Socket socket) {
+#if defined(_WIN32)
+    DWORD timeout = 1000;
+    setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+#else
+    timeval timeout{1, 0};
+    setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+#endif
 }
 
 Socket makeListener(unsigned short& port) {
@@ -658,14 +712,7 @@ Socket makeListener(unsigned short& port) {
         return kInvalidSocket;
     }
     port = ntohs(address.sin_port);
-#if defined(_WIN32)
-    DWORD timeout = 1000;
-    setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,
-               reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-#else
-    timeval timeout{1, 0};
-    setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-#endif
+    setSocketReceiveTimeout(socket);
     return socket;
 }
 
@@ -804,7 +851,7 @@ void initializeAccountPanel(AppState& state) {
 
 bool beginDesktopAccountLogin(AppState& state) {
     Controller& c = controller();
-    if (c.loginRunning || c.refreshRunning || c.worker.joinable()) return false;
+    if (c.results.running() == Operation::Login) return false;
     unsigned short port = 0;
     Socket listener = makeListener(port);
     if (listener == kInvalidSocket) {
@@ -831,15 +878,19 @@ bool beginDesktopAccountLogin(AppState& state) {
         state.entitlementStatus = "Could not open the system browser";
         return false;
     }
-    c.loginRunning = true;
+    const std::uint64_t generation = c.results.begin(Operation::Login);
     state.entitlementStatus = "Waiting for browser authorization";
-    c.worker = std::thread([listener, stateValue]() {
+    launchAccountWorker(c, [listener, stateValue, generation]() {
         const double deadline = monotonicNow() + 300.0;
-        while (!controller().stopping.load() && monotonicNow() < deadline) {
+        while (!controller().stopping.load() && controller().results.current(generation) &&
+               monotonicNow() < deadline) {
             sockaddr_in peer{};
             socklen_t peerLength = sizeof(peer);
             Socket client = ::accept(listener, reinterpret_cast<sockaddr*>(&peer), &peerLength);
             if (client == kInvalidSocket) continue;
+            // Accepted sockets do not inherit SO_RCVTIMEO on every platform. Keep
+            // cancelled generations reapable even if a callback connects then stalls.
+            setSocketReceiveTimeout(client);
             std::array<char, 16384> buffer{};
             const int count = static_cast<int>(::recv(client, buffer.data(), buffer.size() - 1, 0));
             bool ok = false;
@@ -862,13 +913,14 @@ bool beginDesktopAccountLogin(AppState& state) {
                             const json enforcement = json::parse(queryValue(target, "enforcement_state"));
                             const auto decision = chudware::security::verifyEmbeddedEnforcementState(
                                 enforcement.dump(), payload.subject, wallNow());
+                            chudware::entitlement::SecurityPolicy verifiedPolicy;
                             ok = policy.is_object() && policy.value("subject", "") == payload.subject &&
-                                 policy.value("request_nonce", "") == stateValue && decision.active();
-                            if (ok) {
-                                ok = chudware::device_identity::finalizeAuthorizationKey(appdataAppDir());
-                                if (ok) setPending({PendingResult::Kind::Fresh, token, {},
-                                                    policy.dump(), enforcement.dump()});
-                            }
+                                 policy.value("request_nonce", "") == stateValue && decision.active() &&
+                                 chudware::entitlement::verifyEmbeddedSecurityPolicy(
+                                     policy.dump(), payload.subject, verifiedPolicy, &error);
+                            if (ok)
+                                ok = setPending(generation, {PendingResult::Kind::Fresh, token, {},
+                                                            policy.dump(), enforcement.dump()});
                         } catch (...) { ok = false; }
                     }
                 }
@@ -878,41 +930,43 @@ bool beginDesktopAccountLogin(AppState& state) {
             if (ok) { closeSocket(listener); return; }
         }
         closeSocket(listener);
-        chudware::device_identity::discardAuthorizationKey(appdataAppDir());
-        setPending({PendingResult::Kind::Unreachable, {}, "Browser authorization timed out"});
+        setPending(generation, {PendingResult::Kind::Unreachable, {}, "Browser authorization timed out"});
     });
     return true;
 }
 
+bool desktopAccountRequestsIdle() {
+    const Controller& c = controller();
+    return c.workers.empty() && c.results.running() == Operation::None;
+}
+
 void tickAccountPanel(AppState& state) {
     Controller& c = controller();
-    if (c.worker.joinable()) {
-        PendingResult result;
-        {
-            std::lock_guard<std::mutex> lock(c.mutex);
-            if (c.pending.kind == PendingResult::Kind::None) {
-                if (state.entitlementSignedIn) {
-                    const auto decision = chudware::entitlement::offlineAccess(
-                        c.payload, c.stamp, wallNow(), monotonicNow(), bootIdentifier());
-                    if (decision.access == chudware::entitlement::OfflineAccess::ClockRollback)
-                        state.entitlementReadOnly = true;
-                }
+    reapAccountWorkers(c);  // only done workers; never wait for HTTPS or loopback on the UI
+    bool resultError = false;
+    c.results.consume([&](PendingResult result) {
+        // consume is UI-owned, serialized with launch and explicit sign-out. All
+        // effects below belong to the captured generation, including queue acceptance.
+        if (result.operation == Operation::Login && result.kind != PendingResult::Kind::Fresh)
+            chudware::device_identity::discardAuthorizationKey(appdataAppDir());
+        if (!result.acknowledgedEnforcement.empty()) {
+            std::string error;
+            if (!chudware::security::persistEnforcementState(result.acknowledgedEnforcement, appdataAppDir()) ||
+                !chudware::security::EventQueue(appdataAppDir()).accept(
+                    result.batchId, result.batchSequence, &error)) {
+                state.entitlementReadOnly = true;
+                state.entitlementStatus = "Account update could not be stored securely";
+                resultError = true;
                 return;
             }
-            result = std::move(c.pending);
-            c.pending = {};
         }
-        c.worker.join();
-        // Signed out while this thread was in flight: the thread is joined above (never
-        // detached), but its verdict is void — applying it would resurrect the session the
-        // user just ended.
-        if (result.generation != c.generation) return;
         if (result.kind == PendingResult::Kind::Fresh) {
             chudware::entitlement::TokenPayload fresh;
             std::string error;
             if (!chudware::entitlement::verifyEmbeddedToken(result.token, fresh, &error)) {
                 state.entitlementReadOnly = true;
                 state.entitlementStatus = "Received entitlement failed verification";
+                resultError = true;
                 return;
             }
             if (!result.securityPolicy.empty()) {
@@ -925,11 +979,13 @@ void tickAccountPanel(AppState& state) {
                         !persistSecurityPolicy(fresh.subject, policy)) {
                         state.entitlementReadOnly = true;
                         state.entitlementStatus = "Security policy could not be stored securely";
+                        resultError = true;
                         return;
                     }
                 } catch (...) {
                     state.entitlementReadOnly = true;
                     state.entitlementStatus = "Security policy was malformed";
+                    resultError = true;
                     return;
                 }
             }
@@ -937,6 +993,14 @@ void tickAccountPanel(AppState& state) {
                 !chudware::security::persistEnforcementState(result.enforcementState, appdataAppDir())) {
                 state.entitlementReadOnly = true;
                 state.entitlementStatus = "Enforcement state could not be stored securely";
+                resultError = true;
+                return;
+            }
+            if (result.operation == Operation::Login &&
+                !chudware::device_identity::finalizeAuthorizationKey(appdataAppDir())) {
+                state.entitlementReadOnly = true;
+                state.entitlementStatus = "Device authorization could not be stored securely";
+                resultError = true;
                 return;
             }
             c.payload = std::move(fresh);
@@ -948,6 +1012,7 @@ void tickAccountPanel(AppState& state) {
             if (!persistSubject(c.payload.subject)) {
                 state.entitlementReadOnly = true;
                 state.entitlementStatus = "Entitlement subject could not be stored securely";
+                resultError = true;
                 return;
             }
             c.authoritativeRefused = false;
@@ -979,6 +1044,16 @@ void tickAccountPanel(AppState& state) {
             state.entitlementStatus = result.detail.empty()
                 ? "Sign-in service is unreachable" : result.detail;
         }
+    });
+    if (resultError) return;
+    if (c.results.running() != Operation::None) {
+        if (state.entitlementSignedIn) {
+            const auto decision = chudware::entitlement::offlineAccess(
+                c.payload, c.stamp, wallNow(), monotonicNow(), bootIdentifier());
+            if (decision.access == chudware::entitlement::OfflineAccess::ClockRollback)
+                state.entitlementReadOnly = true;
+        }
+        return;  // preserve the current operation's progress/status
     }
 
     bool forceClockCheck = false;
@@ -994,8 +1069,7 @@ void tickAccountPanel(AppState& state) {
     else if (c.failedAttempts > 0)
         retryAfter = std::min(kRefreshIntervalSeconds,
                               kRetryBaseSeconds * std::ldexp(1.0, std::min(c.failedAttempts - 1, 16)));
-    if (state.entitlementSignedIn && !c.refreshRunning && !c.loginRunning &&
-        !c.worker.joinable() &&
+    if (state.entitlementSignedIn && c.results.running() == Operation::None &&
         (c.lastAttemptMonotonic < 0.0 ||
          monotonicNow() - c.lastAttemptMonotonic >= retryAfter))
         startRefresh(state.entitlementToken);
@@ -1003,13 +1077,10 @@ void tickAccountPanel(AppState& state) {
 
 void signOutDesktopAccount(AppState& state) {
     Controller& c = controller();
-    // Bump FIRST: any refresh/login thread already running keeps its own copies, and its
-    // result is dropped by the generation check in tickAccountPanel.
-    {
-        std::lock_guard<std::mutex> lock(c.mutex);
-        ++c.generation;
-        c.pending = {};
-    }
+    // Invalidate FIRST. Workers can only publish responses, never recreate erased
+    // credentials or acknowledge security events after this UI-owned boundary.
+    c.results.invalidate();
+    chudware::device_identity::discardAuthorizationKey(appdataAppDir());
     // Everything device-bound about the session: the sealed token, the subject, and the
     // signed security policy. The device authorization key stays — it is device identity,
     // not session state, and the next sign-in re-attests with it.

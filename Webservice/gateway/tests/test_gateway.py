@@ -268,27 +268,38 @@ def test_admin_refuse_new_toggle(client):
 # ------------------------------------------------------ shared admin terminal
 @pytest.fixture
 def _tmux_env(monkeypatch):
-    """Isolated tmux socket + no-op Chudcode command; skip when tmux is unavailable."""
+    """Inert session backend: terminal route tests never launch shells/tmux."""
+    import queue
     import gateway.terminal as term
 
-    if term._TMUX is None:
-        pytest.skip("tmux not installed on host")
-    # The terminal is opt-in (default off); this lifecycle test exercises the
-    # enabled deployment.
+    sessions = {}
+    markers = queue.Queue()
     monkeypatch.setattr(settings, "terminal_enabled", True)
-    monkeypatch.setattr(term, "_SOCKET", "chudware-pytest")
-    monkeypatch.setenv("CHUDWARE_CHUD_CMD", "true")
-    # Start the tmux server directly (no systemd user scope) so the test is
-    # hermetic on boxes without a user systemd bus.
-    real_which = term.shutil.which
-    monkeypatch.setattr(
-        term.shutil,
-        "which",
-        lambda n: None if n == "systemd-run" else real_which(n),
-    )
-    term._run_tmux("kill-server")
+    monkeypatch.setattr(term, "_TMUX", "fixture-tmux")
+    monkeypatch.setattr(term, "_list_sessions", lambda: list(sessions.values()))
+    monkeypatch.setattr(term, "_session_exists", lambda name: name in sessions)
+
+    def create(name, cols, rows, repo, owner="", label="", shared=False):
+        sessions[name] = {
+            "id": term._display(name), "name": label, "label": label,
+            "owner": owner, "shared": shared, "clients": 0,
+        }
+
+    def kill(name):
+        return sessions.pop(name, None) is not None
+
+    async def detach(pid, fd):
+        markers.put(b"")
+        return 0
+
+    monkeypatch.setattr(term, "_create_session", create)
+    monkeypatch.setattr(term, "_kill_session", kill)
+    monkeypatch.setattr(term, "_ensure_scroll_defaults", lambda: None)
+    monkeypatch.setattr(term, "_spawn_attach", lambda *args: (987654, 987654))
+    monkeypatch.setattr(term, "_read_pty", lambda fd: markers.get(timeout=5))
+    monkeypatch.setattr(term, "_kill_child", detach)
+    monkeypatch.setattr(term, "_reap", lambda pid: 0)
     yield term
-    term._run_tmux("kill-server")
 
 
 def test_terminal_sessions_shared_lifecycle(client, _tmux_env):

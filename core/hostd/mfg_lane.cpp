@@ -9,7 +9,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <limits>
-#include <sstream>
 #include <stdexcept>
 #include <set>
 
@@ -158,15 +157,6 @@ json leaseJson(const CommandLease& lease) {
             {"exclusive_endpoint", lease.exclusive_endpoint}};
 }
 
-std::vector<std::string> linesFromText(std::string_view text) {
-    std::vector<std::string> lines;
-    std::istringstream input{std::string(text)};
-    for (std::string line; std::getline(input, line);) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!line.empty()) lines.push_back(std::move(line));
-    }
-    return lines;
-}
 
 json initiatorJson(const InitiatorProvenance& value) {
     json out{{"kind", value.kind == gates::InitiatorKind::Human ? "human" : "agent"},
@@ -190,7 +180,8 @@ uint64_t ManufacturingLane::SteadyClock::mono_ns() const {
 
 ManufacturingLane::ManufacturingLane(std::filesystem::path state_directory,
                                      bool emulator_endpoint_is_physical,
-                                     std::function<uint64_t()> monotonic_clock)
+                                     std::function<uint64_t()> monotonic_clock,
+                                     ArtifactLimits artifact_limits)
     : epoch_(device::LaneEpoch::mint("manufacturing")),
       journal_((std::filesystem::create_directories(state_directory), state_directory), epoch_),
       allowlist_(state_directory / "device_allowlist.tsv"),
@@ -203,7 +194,17 @@ ManufacturingLane::ManufacturingLane(std::filesystem::path state_directory,
       current_identity_(emulator_identity_),
       current_machine_fingerprint_(emulator_fingerprint_),
       device_id_(device::DeviceId::mint(device::MachineClass::Emulated, emulator_fingerprint_)),
-      endpoint_{"mfg-emulator", "inproc://mfg-emulator", emulator_endpoint_is_physical} {
+      endpoint_{"mfg-emulator", "inproc://mfg-emulator", emulator_endpoint_is_physical},
+      artifact_limits_(artifact_limits) {
+    const ArtifactLimits ceiling;
+    if (!artifact_limits_.max_objects || artifact_limits_.max_objects > ceiling.max_objects ||
+        !artifact_limits_.max_retained_bytes ||
+        artifact_limits_.max_retained_bytes > ceiling.max_retained_bytes ||
+        !artifact_limits_.max_artifact_bytes ||
+        artifact_limits_.max_artifact_bytes > ceiling.max_artifact_bytes ||
+        !artifact_limits_.max_artifact_lines ||
+        artifact_limits_.max_artifact_lines > ceiling.max_artifact_lines)
+        throw std::invalid_argument("artifact limits must be positive and within server ceilings");
     DeviceCandidate emulator{device_id_.str(), device::MachineClass::Emulated,
                              device::TransportKind::Emulator, endpoint_, true, std::nullopt};
     selectTransport(emulator);
@@ -326,8 +327,10 @@ std::optional<ManufacturingLane::DeviceCandidate> ManufacturingLane::findCandida
 
 void ManufacturingLane::selectTransport(const DeviceCandidate& candidate) {
     const std::string previous_device_id = device_id_.str();
-    if (!previous_device_id.empty() && previous_device_id != candidate.device_id)
+    if (!previous_device_id.empty() && previous_device_id != candidate.device_id) {
         invalidateSelectedDeviceRecords(previous_device_id);
+        reclaimUnreferencedArtifacts(previous_device_id);
+    }
     if (adapter_) adapter_->close();
     else if (transport_) transport_->close();
     adapter_.reset();
@@ -374,6 +377,17 @@ void ManufacturingLane::selectTransport(const DeviceCandidate& candidate) {
         adapter_ = std::make_unique<device::GrblAdapter>(
             *transport_, [this] { return clock_.mono_ns(); }, std::move(config),
             "manufacturing");
+    }
+}
+
+void ManufacturingLane::reclaimUnreferencedArtifacts(std::string_view device_id) {
+    for (auto it = artifacts_.begin(); it != artifacts_.end();) {
+        if (it->second.device_id == device_id && it->second.run_references == 0) {
+            retained_artifact_bytes_ -= it->second.retained_bytes;
+            it = artifacts_.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
@@ -493,6 +507,7 @@ void ManufacturingLane::failExpiredClaimSafely() {
     notice.at_seq = appendEvent("mfg.result.falsified", expired.lease_id, notice);
     invalidations_.push_back(std::move(notice));
     active_claim_.reset();
+    reclaimUnreferencedArtifacts(device_id_.str());
 }
 
 MachinePolicy ManufacturingLane::lanePolicy() const {
@@ -522,6 +537,7 @@ json ManufacturingLane::workerParams() const {
     json result{{"adapter_id", device_id_.str()}};
     std::string adapter_kind = "moonraker";
     json auth{{"mode", "trusted_host"}};
+    std::string address_class;
     std::string base_url = endpoint_.address;
     if (base_url.rfind("ws://", 0) == 0) base_url.replace(0, 5, "http://");
     else if (base_url.rfind("wss://", 0) == 0) base_url.replace(0, 6, "https://");
@@ -539,12 +555,16 @@ json ManufacturingLane::workerParams() const {
             auth["username"] = field->second;
         if ((field = connection.find("password")) != connection.end())
             auth["password"] = field->second;
+        if ((field = connection.find("address_class")) != connection.end())
+            address_class = field->second;
     }
     result["kind"] = std::move(adapter_kind);
     result["endpoint"] = {{"base_url", base_url},
                           {"expected_base_url", std::move(base_url)},
                           {"endpoint_is_physical", endpoint_.endpoint_is_physical},
                           {"origin", endpoint_.endpoint_is_physical ? "live" : "virtual"}};
+    if (!address_class.empty())
+        result["endpoint"]["address_class"] = std::move(address_class);
     result["auth"] = std::move(auth);
     return result;
 }
@@ -621,36 +641,58 @@ void ManufacturingLane::applyAttention(const JournalRecord& record) {
     const std::string action = record.body.value("action", std::string{});
     const std::string id = record.body.value("id", record.subject);
     if (id.empty()) return;
+    auto found = attention_.find(id);
+    if (found != attention_.end() &&
+        record.seq <= found->second.value("last_event_seq", device::Seq{0})) return;
     if (action == "raised" || action == "occurred") {
-        if (attention_.find(id) == attention_.end() && attention_.size() >= 1024)
-            return;
+        if (found == attention_.end() && attention_.size() >= 1024)
+            throw std::length_error("attention store capacity exceeded");
         json item = record.body.contains("attention")
             ? record.body.at("attention") : record.body;
         item.erase("action");
         item["id"] = id;
-        if (!item.contains("raised_seq")) item["raised_seq"] = record.seq;
-        if (!item.contains("occurrence_count")) item["occurrence_count"] = 1;
-        if (!item.contains("deliveries")) item["deliveries"] = json::array();
-        attention_[id] = std::move(item);
-    } else {
-        const auto found = attention_.find(id);
-        if (found == attention_.end()) return;
-        if (action == "acknowledged") {
-            found->second["acknowledged_by"] = record.body.value("by", std::string{});
-            found->second["acknowledged_seq"] = record.seq;
-        } else if (action == "resolved") {
-            found->second["resolved_seq"] = record.seq;
-        } else if (action == "delivery") {
-            if (found->second["deliveries"].size() < 64)
-                found->second["deliveries"].push_back(
-                    record.body.value("delivery", json::object()));
+        if (found != attention_.end()) {
+            const auto count = found->second.value("occurrence_count", 1U);
+            if (count >= 1024) throw std::length_error("attention occurrence capacity exceeded");
+            item["raised_seq"] = found->second.at("raised_seq");
+            item["occurrence_count"] = count + 1;
+            item["deliveries"] = found->second.at("deliveries");
+        } else {
+            item["raised_seq"] = record.seq;
+            item["occurrence_count"] = 1;
+            item["deliveries"] = json::array();
         }
+        item["delivery_count"] = item.at("deliveries").size();
+        item["last_event_seq"] = record.seq;
+        attention_[id] = std::move(item);
+    } else if (found != attention_.end()) {
+        if (action == "acknowledged") {
+            if (!found->second.contains("acknowledged_seq")) {
+                found->second["acknowledged_by"] = record.body.value("by", std::string{});
+                found->second["acknowledged_seq"] = record.seq;
+            }
+        } else if (action == "resolved") {
+            if (!found->second.contains("resolved_seq"))
+                found->second["resolved_seq"] = record.seq;
+        } else if (action == "delivery") {
+            auto& deliveries = found->second["deliveries"];
+            if (deliveries.size() >= 64)
+                throw std::length_error("attention delivery capacity exceeded");
+            json delivery = record.body.at("delivery");
+            delivery["seq"] = record.seq;
+            deliveries.push_back(std::move(delivery));
+            found->second["delivery_count"] = deliveries.size();
+        }
+        found->second["last_event_seq"] = record.seq;
     }
 }
 
 void ManufacturingLane::restoreAttention() {
     attention_.clear();
-    for (const auto& record : journal_.replay()) applyAttention(record);
+    journal_.visit(1, [&](const JournalRecord& record) {
+        applyAttention(record);
+        return true;
+    });
 }
 
 bool ManufacturingLane::validDevice(const json& params, LaneRpcResult& refusal) const {
@@ -704,6 +746,28 @@ void ManufacturingLane::publishEvent(std::string_view kind, std::string_view sub
 
 device::Seq ManufacturingLane::appendEvent(std::string kind, std::string subject,
                                             json body, json raw) {
+    if (kind == "mfg.attention" && body.is_object()) {
+        const auto action = body.value("action", std::string{});
+        if (action == "raised" || action == "occurred") {
+            const auto id = body.value("id", subject);
+            const auto existing = attention_.find(id);
+            if (existing == attention_.end()) {
+                if (attention_.size() >= 1024)
+                    throw std::length_error("attention store capacity exceeded");
+                body["occurrence_count"] = 1;
+                body["raised_seq"] = journal_.head() + 1;
+                body["deliveries"] = json::array();
+            } else {
+                const auto count = existing->second.value("occurrence_count", 1U);
+                if (count >= 1024)
+                    throw std::length_error("attention occurrence capacity exceeded");
+                body["occurrence_count"] = count + 1;
+                body["raised_seq"] = existing->second.at("raised_seq");
+                body["deliveries"] = existing->second.at("deliveries");
+            }
+            body["delivery_count"] = body.at("deliveries").size();
+        }
+    }
     const auto seq = journal_.append(kind, subject, body, std::move(raw));
     publishEvent(kind, subject, seq, body);
     return seq;
@@ -1369,6 +1433,7 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         const auto released = leases_.release(active->lease_id, caller, clock_.mono_ns());
         if (!released.ok) return refuse(released.code, released.why);
         active_claim_.reset();
+        reclaimUnreferencedArtifacts(device_id_.str());
         const auto seq = journal_.head();
         json public_lease = leaseJson(*active);
         public_lease.erase("lease_id");
@@ -1476,6 +1541,7 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         appendEvent("mfg.device.state", device_id_.str(),
                     {{"device_id", device_id_.str()}, {"state", deviceState()},
                      {"raw", "transport closed"}});
+        reclaimUnreferencedArtifacts(device_id_.str());
         return ok({{"disconnected", true}});
     }
     if (method == "mfg_telemetry_snapshot") {
@@ -1651,23 +1717,100 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         if (!params.contains("artifact") || !params.at("artifact").is_object())
             return refuse("mfg_artifact_invalid", "artifact object is required");
         const auto& input = params.at("artifact");
-        ArtifactRecord artifact;
-        artifact.artifact_id = device::ResultRef::mint("artifact").str();
-        artifact.device_id = device_id_.str();
-        artifact.kind = parseArtifactKind(input.value("kind", std::string{}));
-        std::string content;
+        uint64_t bytes = 0;
+        size_t line_count = 0;
+        size_t stored_lines = 0;
+        std::string_view text;
+        const auto byteRefusal = [&] {
+            return refuse("mfg_artifact_byte_limit", "artifact exceeds the per-artifact byte limit",
+                          {{"max_bytes", artifact_limits_.max_artifact_bytes}});
+        };
+        const auto lineRefusal = [&] {
+            return refuse("mfg_artifact_line_limit", "artifact exceeds the per-artifact line limit",
+                          {{"max_lines", artifact_limits_.max_artifact_lines}});
+        };
         if (input.contains("lines")) {
-            artifact.program_lines = input.at("lines").get<std::vector<std::string>>();
-            for (const auto& line : artifact.program_lines) content += line + "\n";
+            const auto& lines = input.at("lines");
+            if (!lines.is_array())
+                return refuse("mfg_artifact_invalid", "artifact lines must be an array of strings");
+            line_count = stored_lines = lines.size();
+            if (line_count > artifact_limits_.max_artifact_lines) return lineRefusal();
+            for (const auto& line : lines) {
+                if (!line.is_string())
+                    return refuse("mfg_artifact_invalid", "artifact lines must be strings");
+                const auto size = line.get_ref<const std::string&>().size();
+                if (size >= artifact_limits_.max_artifact_bytes - bytes) return byteRefusal();
+                bytes += size + 1;  // Canonical bytes include one newline per array element.
+            }
         } else if (input.contains("content")) {
-            content = input.at("content").get<std::string>();
-            artifact.program_lines = linesFromText(content);
+            if (!input.at("content").is_string())
+                return refuse("mfg_artifact_invalid", "artifact content must be a string");
+            text = input.at("content").get_ref<const std::string&>();
+            bytes = text.size();
+            if (bytes > artifact_limits_.max_artifact_bytes) return byteRefusal();
+            for (size_t start = 0; start < text.size();) {
+                const auto end = text.find('\n', start);
+                auto line = text.substr(start, end == std::string_view::npos
+                                                  ? text.size() - start : end - start);
+                if (++line_count > artifact_limits_.max_artifact_lines) return lineRefusal();
+                if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+                if (!line.empty()) ++stored_lines;
+                start = end == std::string_view::npos ? text.size() : end + 1;
+            }
         } else {
             return refuse("mfg_artifact_content_missing", "artifact requires content or lines");
         }
-        if (content.empty()) return refuse("mfg_artifact_empty", "artifact content is empty");
-        artifact.bytes = content.size();
-        artifact.hash_sha256 = util::sha256_hex(content);
+        if (!bytes) return refuse("mfg_artifact_empty", "artifact content is empty");
+        uint64_t metadata_bytes = 80;  // Default profile ID and SHA-256.
+        for (const auto* field : {"post_profile_id", "post_profile_hash", "slicer_profile_hash"}) {
+            if (!input.contains(field)) continue;
+            const auto& value = input.at(field);
+            if (!value.is_string() || value.get_ref<const std::string&>().size() > 4096)
+                return refuse("mfg_artifact_metadata_limit", "artifact profile fields must be strings of at most 4096 bytes");
+            metadata_bytes += value.get_ref<const std::string&>().size();
+        }
+        // Charge line object storage and map/identity overhead, not just program characters.
+        const uint64_t retained_bytes = bytes + metadata_bytes + sizeof(ArtifactRecord) + 512 +
+                                        stored_lines * (sizeof(std::string) + 1);
+        if (artifacts_.size() >= artifact_limits_.max_objects ||
+            retained_bytes > artifact_limits_.max_retained_bytes - retained_artifact_bytes_)
+            return refuse("mfg_artifact_quota_exceeded", "retained artifact quota is exhausted",
+                          {{"max_objects", artifact_limits_.max_objects},
+                           {"retained_objects", artifacts_.size()},
+                           {"max_retained_bytes", artifact_limits_.max_retained_bytes},
+                           {"retained_bytes", retained_artifact_bytes_},
+                           {"requested_bytes", retained_bytes}});
+        ArtifactRecord artifact;
+        artifact.artifact_id = device::ResultRef::mint("artifact").str();
+        artifact.device_id = device_id_.str();
+        if (input.contains("kind") && !input.at("kind").is_string())
+            return refuse("mfg_artifact_invalid", "artifact kind must be a string");
+        artifact.kind = parseArtifactKind(input.contains("kind")
+            ? std::string_view(input.at("kind").get_ref<const std::string&>()) : std::string_view{});
+        artifact.bytes = bytes;
+        artifact.retained_bytes = retained_bytes;
+        artifact.program_lines.reserve(stored_lines);
+        util::Sha256 hash;
+        if (input.contains("lines")) {
+            for (const auto& line : input.at("lines")) {
+                const auto& value = line.get_ref<const std::string&>();
+                artifact.program_lines.push_back(value);
+                hash.update(reinterpret_cast<const uint8_t*>(value.data()), value.size());
+                const uint8_t newline = '\n';
+                hash.update(&newline, 1);
+            }
+        } else {
+            hash.update(reinterpret_cast<const uint8_t*>(text.data()), text.size());
+            for (size_t start = 0; start < text.size();) {
+                const auto end = text.find('\n', start);
+                auto line = text.substr(start, end == std::string_view::npos
+                                                  ? text.size() - start : end - start);
+                if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+                if (!line.empty()) artifact.program_lines.emplace_back(line);
+                start = end == std::string_view::npos ? text.size() : end + 1;
+            }
+        }
+        artifact.hash_sha256 = hash.finish_hex();
         if (input.contains("hash_sha256") && input.at("hash_sha256") != artifact.hash_sha256)
             return refuse("mfg_artifact_hash_mismatch", "caller hash does not match artifact bytes");
         artifact.post_profile_id = input.value("post_profile_id", "emulator-default");
@@ -1679,8 +1822,9 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         const auto seq = appendEvent("mfg.artifact.registered", artifact.artifact_id,
                                      artifactJson(artifact));
         artifact.seq = seq;
-        artifacts_.emplace(artifact.artifact_id, artifact);
-        return ok({{"artifact", artifactJson(artifact)}});
+        auto [stored, inserted] = artifacts_.try_emplace(artifact.artifact_id, std::move(artifact));
+        if (inserted) retained_artifact_bytes_ += retained_bytes;
+        return ok({{"artifact", artifactJson(stored->second)}});
     }
     if (method == "mfg_preflight_run") {
         if (!requireLease(params, caller, failure)) return failure;
@@ -1728,6 +1872,7 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
             created.created_at_seq = appendEvent("mfg.run.state", created.run_id,
                 {{"run_id", created.run_id}, {"state", "draft"}, {"cause", "preflight_created"}});
             auto [it, inserted] = runs_.emplace(created.run_id, std::move(created));
+            if (inserted) ++artifact_it->second.run_references;
             run = &it->second;
         }
         tier0::Context tier;
@@ -2166,13 +2311,19 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
             "id", "attention:" + device::detail::mint_ulid());
         if (id.empty() || id.size() > 128)
             return refuse("mfg_attention_invalid", "attention id must be 1..128 bytes");
+        for (const auto* field : {"device", "run"}) {
+            if (params.contains(field) &&
+                (!params.at(field).is_string() ||
+                 params.at(field).get_ref<const std::string&>().size() > 128))
+                return refuse("mfg_attention_invalid", "attention device/run must be bounded strings");
+        }
         if (attention_.find(id) == attention_.end() && attention_.size() >= 1024)
             return refuse("mfg_attention_capacity",
                           "attention store reached its 1024-item bound");
         auto existing = attention_.find(id);
         const bool occurrence = existing != attention_.end() &&
                                 !existing->second.contains("resolved_seq");
-        if (occurrence &&
+        if (existing != attention_.end() &&
             existing->second.value("occurrence_count", 1U) >= 1024)
             return refuse("mfg_attention_capacity",
                           "attention occurrence count reached its 1024-entry bound");
@@ -2180,7 +2331,7 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
                   {"severity", severity}, {"device", params.value("device", device_id_.str())},
                   {"run", params.value("run", std::string{})}, {"reason", reason},
                   {"why", why}, {"deliveries", json::array()}};
-        if (occurrence) {
+        if (existing != attention_.end()) {
             body["raised_seq"] = existing->second.at("raised_seq");
             body["occurrence_count"] =
                 existing->second.value("occurrence_count", 1U) + 1U;
@@ -2218,10 +2369,13 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         if (by.empty())
             return refuse("mfg_attention_acknowledger_required",
                           "attention acknowledgement requires by");
+        if (found->second.contains("acknowledged_seq"))
+            return ok({{"attention", found->second}});
         const auto seq = appendEvent("mfg.attention", id,
                                      {{"action", "acknowledged"}, {"id", id}, {"by", by}});
         found->second["acknowledged_by"] = by;
         found->second["acknowledged_seq"] = seq;
+        found->second["last_event_seq"] = seq;
         return ok({{"attention", found->second}});
     }
     if (method == "mfg_attention_delivery") {
@@ -2231,28 +2385,47 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         if (found == attention_.end())
             return refuse("mfg_attention_not_found", "attention id is not registered",
                           {{"id", id}});
-        if (found->second.value("deliveries", json::array()).size() >= 64)
+        if (!params.contains("delivery") || !params.at("delivery").is_object())
+            return refuse("mfg_attention_delivery_invalid", "delivery must be an object");
+        const auto& supplied = params.at("delivery");
+        for (const auto& [key, value] : supplied.items()) {
+            if (key == "attempt") {
+                if (!value.is_number_integer() || value < 1 || value > 1024)
+                    return refuse("mfg_attention_delivery_invalid", "delivery attempt must be 1..1024");
+            } else if (key == "channel" || key == "status" || key == "error") {
+                const size_t bound = key == "error" ? 512 : 64;
+                if (!value.is_string() || value.get_ref<const std::string&>().size() > bound)
+                    return refuse("mfg_attention_delivery_invalid", "delivery text exceeds its bound");
+            } else {
+                return refuse("mfg_attention_delivery_invalid", "unknown delivery field");
+            }
+        }
+        if (!supplied.contains("channel") || !supplied.contains("status") ||
+            supplied.at("channel").get_ref<const std::string&>().empty() ||
+            supplied.at("status").get_ref<const std::string&>().empty())
+            return refuse("mfg_attention_delivery_invalid", "delivery channel and status are required");
+        json delivery = supplied;
+        delivery["attempt"] = delivery.value("attempt", 1U);
+        delivery["error"] = delivery.value("error", std::string{});
+        for (const auto& prior : found->second.at("deliveries")) {
+            if (prior.at("channel") == delivery.at("channel") &&
+                prior.at("attempt") == delivery.at("attempt") &&
+                prior.at("status") == delivery.at("status") &&
+                prior.value("error", std::string{}) ==
+                    delivery.at("error").get_ref<const std::string&>())
+                return ok({{"attention", found->second}});
+        }
+        if (found->second.at("deliveries").size() >= 64)
             return refuse("mfg_attention_delivery_capacity",
                           "attention delivery history reached its 64-record bound");
-        json delivery = params.value("delivery", json::object());
-        const std::string channel = delivery.value("channel", std::string{});
-        const std::string status = delivery.value("status", std::string{});
-        if (channel.size() > 64 || status.size() > 64 ||
-            delivery.value("error", std::string{}).size() > 512)
-            return refuse("mfg_attention_delivery_invalid",
-                          "delivery channel/status/error exceed bounded lengths");
-        if (channel.empty() || status.empty())
-            return refuse("mfg_attention_delivery_invalid",
-                          "delivery channel and status are required");
-        delivery.erase("seq");
-        delivery.erase("at_seq");
-        delivery["attempt"] = delivery.value("attempt", 1U);
         delivery["seq"] = journal_.head() + 1;
         const auto seq = appendEvent(
             "mfg.attention", id,
             {{"action", "delivery"}, {"id", id}, {"delivery", delivery}});
         delivery["seq"] = seq;
         found->second["deliveries"].push_back(std::move(delivery));
+        found->second["delivery_count"] = found->second.at("deliveries").size();
+        found->second["last_event_seq"] = seq;
         return ok({{"attention", found->second}});
     }
     if (method == "mfg_attention_resolve") {
@@ -2262,9 +2435,12 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         if (found == attention_.end())
             return refuse("mfg_attention_not_found", "attention id is not registered",
                           {{"id", id}});
+        if (found->second.contains("resolved_seq"))
+            return ok({{"attention", found->second}});
         const auto seq = appendEvent("mfg.attention", id,
                                      {{"action", "resolved"}, {"id", id}});
         found->second["resolved_seq"] = seq;
+        found->second["last_event_seq"] = seq;
         return ok({{"attention", found->second}});
     }
     if (method == "mfg_journal_query") {
@@ -2274,32 +2450,60 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         const auto kinds = params.value("kinds", std::vector<std::string>{});
         const size_t limit = std::min(params.value("limit", size_t{1000}), size_t{1000});
         json records = json::array();
-        for (const auto& record : journal_.replay(from)) {
-            if (!subject.empty() && record.subject != subject) continue;
-            if (!kinds.empty() && std::find(kinds.begin(), kinds.end(), record.kind) == kinds.end()) continue;
+        size_t bytes = 0;
+        device::Seq next = from;
+        bool more = false;
+        if (limit != 0) journal_.visit(from, [&](const JournalRecord& record) {
+            next = record.seq == std::numeric_limits<device::Seq>::max()
+                ? record.seq : record.seq + 1;
+            if (!subject.empty() && record.subject != subject) return true;
+            if (!kinds.empty() && std::find(kinds.begin(), kinds.end(), record.kind) == kinds.end())
+                return true;
+            const auto size = json(record).dump().size();
+            if (records.size() >= limit || size > journal_.limits().replay_bytes - bytes) {
+                next = record.seq;
+                more = true;
+                return false;
+            }
+            bytes += size;
             records.push_back(record);
-            if (records.size() >= limit) break;
-        }
+            return true;
+        });
         return ok({{"records", std::move(records)}, {"head_seq", journal_.head()},
+                   {"next_seq", next}, {"has_more", more},
                    {"waiver_rates", json::object()}});
     }
     if (method == "mfg_result_invalidations") {
         const auto from = params.value("from_seq", device::Seq{1});
         const std::string affected = params.value("affected", std::string{});
-        const size_t limit = params.value("limit", size_t{1000});
+        const size_t limit = std::min(params.value("limit", size_t{1000}), size_t{1000});
         json notices = json::array();
-        for (const auto& record : journal_.replay(from)) {
-            if (record.kind != "mfg.result.falsified" && record.kind != "mfg.result.superseded") continue;
+        size_t bytes = 0;
+        device::Seq next = from;
+        bool more = false;
+        if (limit != 0) journal_.visit(from, [&](const JournalRecord& record) {
+            next = record.seq == std::numeric_limits<device::Seq>::max()
+                ? record.seq : record.seq + 1;
+            if (record.kind != "mfg.result.falsified" && record.kind != "mfg.result.superseded")
+                return true;
             json notice = record.body;
             notice["at_seq"] = record.seq;
             if (!affected.empty()) {
                 const auto rows = notice.value("affected", std::vector<std::string>{});
-                if (std::find(rows.begin(), rows.end(), affected) == rows.end()) continue;
+                if (std::find(rows.begin(), rows.end(), affected) == rows.end()) return true;
             }
+            const auto size = notice.dump().size();
+            if (notices.size() >= limit || size > journal_.limits().replay_bytes - bytes) {
+                next = record.seq;
+                more = true;
+                return false;
+            }
+            bytes += size;
             notices.push_back(std::move(notice));
-            if (notices.size() >= limit) break;
-        }
-        return ok({{"invalidations", std::move(notices)}, {"head_seq", journal_.head()}});
+            return true;
+        });
+        return ok({{"invalidations", std::move(notices)}, {"head_seq", journal_.head()},
+                   {"next_seq", next}, {"has_more", more}});
     }
     if (method == "mfg_emulator_fault_inject") {
         if (!requireLease(params, caller, failure)) return failure;

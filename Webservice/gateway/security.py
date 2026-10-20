@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import gzip
+import io
 import json
 import re
 import time
 import uuid
+import zlib
 from datetime import datetime, timezone
 from typing import Any
 
@@ -25,6 +27,7 @@ except ImportError:
 
 router = APIRouter(tags=["security"])
 MAX_COMPRESSED_BYTES = 64 * 1024
+MAX_EXPANDED_BYTES = 512 * 1024
 MAX_EVENTS = 100
 _BATCH_FIELDS = frozenset({"batch_id", "subject", "sequence", "policy_id", "app_version", "platform", "events", "signature"})
 _EVENT_FIELDS = frozenset({"reason", "occurred_at"})
@@ -48,14 +51,17 @@ def _decode(body: bytes, encoding: str | None) -> dict[str, Any]:
     if (encoding or "").lower().strip() != "gzip":
         raise HTTPException(415, "security event batch must be gzip encoded")
     try:
-        raw = gzip.decompress(body)
-    except (gzip.BadGzipFile, EOFError, OSError) as exc:
+        # GzipFile.read bounds expansion across concatenated gzip members too.
+        # Never materialize the complete expanded input before applying the cap.
+        with gzip.GzipFile(fileobj=io.BytesIO(body)) as compressed:
+            raw = compressed.read(MAX_EXPANDED_BYTES + 1)
+    except (gzip.BadGzipFile, EOFError, OSError, zlib.error) as exc:
         raise HTTPException(400, "invalid gzip body") from exc
-    if len(raw) > 512 * 1024:
+    if len(raw) > MAX_EXPANDED_BYTES:
         raise HTTPException(413, "security event batch expands too large")
     try:
         value = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
         raise HTTPException(400, "invalid security event JSON") from exc
     if not isinstance(value, dict):
         raise HTTPException(400, "invalid security event batch")
@@ -104,6 +110,8 @@ def _response(status: str, batch_id: str, subject: str, sequence: int, policy_id
 
 @router.post("/api/security/events")
 async def ingest_security_events(request: Request) -> JSONResponse:
+    # Charge rejected bodies as well, before buffering or parsing attacker input.
+    _by_ip.enforce(request.client.host if request.client else "unknown", "security event batches")
     length = request.headers.get("content-length")
     if length:
         try:
@@ -111,10 +119,14 @@ async def ingest_security_events(request: Request) -> JSONResponse:
                 raise HTTPException(413, "security event batch too large")
         except ValueError as exc:
             raise HTTPException(400, "invalid content length") from exc
-    batch = _decode(await request.body(), request.headers.get("content-encoding"))
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(chunk) > MAX_COMPRESSED_BYTES - len(body):
+            raise HTTPException(413, "security event batch too large")
+        body.extend(chunk)
+    batch = _decode(bytes(body), request.headers.get("content-encoding"))
     batch_id, subject_uuid, clean_events = _validate(batch)
     subject = str(subject_uuid)
-    _by_ip.enforce(request.client.host if request.client else "unknown", "security event batches")
     _by_subject.enforce(subject, "security event batches")
     with tx() as cur:
         cur.execute("SELECT email, device_public_key, last_event_sequence, policy_id, revoked_at FROM desktop_entitlements WHERE subject = %s FOR UPDATE", (subject_uuid,))

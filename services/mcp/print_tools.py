@@ -19,8 +19,8 @@ Family ``cam`` (additive CAM). Seven tools:
   file, its sha256, which ones the printer can select, duplicates, managed status, and a
   whole-drive token (``services/manufacturing/print_media.py``).
 * ``publish_print_media`` — the managed delivery of a project's COMPLETE verified job set to
-  that media: revision-prefixed names under ``PRINT/<project>/``, readback-verified, old
-  managed toolpaths retired into a non-printable archive, unmanaged printables reported.
+  that media: raw filenames at the drive root (or one project folder), readback-verified,
+  deprecated managed toolpaths deleted, unmanaged printables reported.
 
 Why this exists: an agent once sliced a 17-part arm by downloading a PrusaSlicer RPM into
 /tmp and hand-writing ~100 slicer keys from memory (flimsy sheathless snug supports, tall parts
@@ -335,20 +335,190 @@ def _slice_mesh_arrays(source: dict, work_dir: Path, raw_name: str = "model_fram
     return mesh.vertices, mesh.triangles
 
 
+def _float32_exact_shift(points, target):
+    """``target`` rounded to the coarsest float32 step any coordinate of ``points`` sits on.
+
+    Subtracting it moves every coordinate by a whole number of its own float32 steps, so a
+    coordinate that does not grow into a coarser binade is written to the STL exactly.
+    Subtracting the raw bbox centre instead can put two vertices one step apart on the same
+    rounding tie and merge them (a 1.9e-6 mm pair in the 6-axis wrist did)."""
+    import numpy as np  # noqa: PLC0415
+
+    target = np.asarray(target, dtype=np.float64)
+    peak = float(np.abs(points).max())
+    if peak == 0.0:
+        return target
+    step = float(np.spacing(np.float32(peak)))
+    return np.round(target / step) * step
+
+
 def _oriented_arrays(source: dict, orient: dict, work_dir: Path, raw_name: str):
-    """(vertices, triangles) in the chosen build pose, XY-centred on the origin, resting on z=0.
+    """(model_vertices, posed, triangles): the slicing mesh and its chosen build pose,
+    bounding-box-centred on the origin in all three axes.
 
     Origin-centred because PrusaSlicer's --duplicate arrange fails with "No outline can be
-    derived" on a mesh that sits far from the origin."""
+    derived" on a mesh that sits far from the origin, and because STL coordinates are float32:
+    the centred pose has the smallest coordinates, so the finest float32 steps. Resting the
+    part on z=0 here doubled the step over its upper half and merged real vertices;
+    PrusaSlicer's --ensure-on-bed lifts the centred part in double precision instead."""
     import numpy as np  # noqa: PLC0415
     from services.dfam import frame_for_build_dir  # noqa: PLC0415
 
     vertices, triangles = _slice_mesh_arrays(source, work_dir, raw_name)
     rotation = frame_for_build_dir(orient["build_dir"], orient["yaw_deg"])
-    oriented = np.asarray(vertices, dtype=np.float64) @ np.asarray(rotation).T
-    low, high = oriented.min(axis=0), oriented.max(axis=0)
-    oriented = oriented - np.array([(low[0] + high[0]) / 2, (low[1] + high[1]) / 2, low[2]])
-    return oriented, triangles
+    model = np.asarray(vertices, dtype=np.float64)
+    rotated = model @ np.asarray(rotation).T
+    low, high = rotated.min(axis=0), rotated.max(axis=0)
+    return model, rotated - _float32_exact_shift(rotated, (low + high) / 2), triangles
+
+
+class SlicerMeshRefusal(Exception):
+    """The float32 STL handed to the slicer would not keep the slicing mesh's topology."""
+
+    def __init__(self, part: str, where: str, evidence: dict):
+        super().__init__(part)
+        self.part, self.where, self.evidence = part, where, evidence
+
+    def to_dict(self) -> dict:
+        if self.where == "plate":
+            fix = (f"slice {self.part} on its own (slice_part without parts=): a single part is "
+                   f"written centred on the origin, where float32 steps are finest; or remove "
+                   f"the sub-micron feature in CAD (check_geometry_health lists tiny edges)")
+        else:
+            fix = ("remove the sub-micron feature in CAD (check_geometry_health lists tiny "
+                   "edges), then slice again")
+        merged, flat = self.evidence["merged_vertex_groups"], self.evidence["collapsed_triangles"]
+        found = []
+        if merged:
+            closest = self.evidence["groups"][0]["model_separation_mm"]
+            found.append(f"merges {merged} group(s) of distinct vertices (closest "
+                         f"{closest:.3g} mm apart in the model)")
+        if flat:
+            smallest = self.evidence["collapsed"][0]["model_area_mm2"]
+            found.append(f"gives {flat} triangle(s) of nonzero model area (smallest "
+                         f"{smallest:.3g} mm^2) exactly zero area")
+        return {"ok": False, "reason": "slicer_mesh_precision_loss", "part": self.part,
+                "placement": self.where, **self.evidence,
+                "content": (f"{self.part}: writing the slicing mesh as float32 STL at its "
+                            f"{self.where} position {' and '.join(found)}; the slicer would "
+                            f"delete those facets, so this mesh was not sliced. Fix: {fix}.")}
+
+
+def _zero_area(points, triangles):
+    """Bool per triangle: its corners are exactly collinear (or repeated).
+
+    The float64 cross product only screens: a triangle is decided in exact rational
+    arithmetic whenever its computed cross product is within a bound that covers every
+    float64 rounding of the edge differences and products, so no tolerance decides."""
+    import numpy as np  # noqa: PLC0415
+    from fractions import Fraction  # noqa: PLC0415
+
+    corners = np.asarray(points, dtype=np.float64)[np.asarray(triangles, dtype=np.int64)]
+    d1, d2 = corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]
+    cross = np.cross(d1, d2)
+    bound = 16 * np.finfo(np.float64).eps * (np.abs(d1[:, [1, 2, 0]] * d2[:, [2, 0, 1]])
+                                             + np.abs(d1[:, [2, 0, 1]] * d2[:, [1, 2, 0]]))
+    flat = np.zeros(len(corners), dtype=bool)
+    for index in np.flatnonzero(np.all(np.abs(cross) <= bound, axis=1)):
+        a, b, c = ([Fraction(float(v)) for v in corner] for corner in corners[index])
+        e1 = [b[k] - a[k] for k in range(3)]
+        e2 = [c[k] - a[k] for k in range(3)]
+        flat[index] = (e1[1] * e2[2] == e1[2] * e2[1] and e1[2] * e2[0] == e1[0] * e2[2]
+                       and e1[0] * e2[1] == e1[1] * e2[0])
+    return flat
+
+
+def _float32_collapse(model_vertices, placed, triangles) -> Optional[dict]:
+    """None when the float32 copy of ``placed`` keeps every distinct vertex distinct and no
+    triangle of nonzero model area becomes exactly zero-area (repeated or collinear corners),
+    else the evidence in model-frame coordinates."""
+    import numpy as np  # noqa: PLC0415
+
+    tri = np.asarray(triangles, dtype=np.int64)
+    model = np.asarray(model_vertices, dtype=np.float64)
+    written = np.asarray(placed, dtype=np.float32)
+    _, source_ids = np.unique(model, axis=0, return_inverse=True)
+    _, written_ids = np.unique(written, axis=0, return_inverse=True)
+    source_ids, written_ids = source_ids.reshape(-1), written_ids.reshape(-1)
+    used = np.unique(tri)
+    pairs = np.unique(np.stack([written_ids[used], source_ids[used]], axis=1), axis=0)
+    points, counts = np.unique(pairs[:, 0], return_counts=True)
+    merged = points[counts > 1]
+    collapsed = np.flatnonzero(_zero_area(written, tri) & ~_zero_area(model, tri))
+    if not len(merged) and not len(collapsed):
+        return None
+    groups = []
+    for point in merged:
+        members = used[written_ids[used] == point]
+        coords = model[members]
+        separation = float(np.max(np.linalg.norm(coords[:, None] - coords[None], axis=2)))
+        groups.append({"model_mm": coords.tolist(), "model_separation_mm": separation,
+                       "written_mm": written[members[0]].astype(np.float64).tolist(),
+                       "float32_step_mm": np.spacing(np.abs(written[members[0]]))
+                       .astype(np.float64).tolist()})
+    groups.sort(key=lambda g: g["model_separation_mm"])
+    flats = []
+    for index in collapsed:
+        corners = model[tri[index]]
+        area = 0.5 * float(np.linalg.norm(np.cross(corners[1] - corners[0],
+                                                   corners[2] - corners[0])))
+        flats.append({"triangle": int(index), "model_mm": corners.tolist(),
+                      "model_area_mm2": area,
+                      "written_mm": written[tri[index]].astype(np.float64).tolist()})
+    flats.sort(key=lambda t: t["model_area_mm2"])
+    return {"merged_vertex_groups": len(merged), "collapsed_triangles": len(collapsed),
+            "triangles": len(tri), "groups": groups[:5], "collapsed": flats[:5]}
+
+
+def _write_slicer_stl(path: Path, part: str, where: str, model_vertices, placed,
+                      triangles) -> None:
+    """Write the slicer's input STL, or raise SlicerMeshRefusal if float32 would change it."""
+    evidence = _float32_collapse(model_vertices, placed, triangles)
+    if evidence is not None:
+        raise SlicerMeshRefusal(part, where, evidence)
+    _write_binary_stl(path, placed, triangles)
+
+
+_REPAIR_KEYS = ("edges_fixed", "degenerate_facets", "facets_removed", "facets_reversed",
+                "backwards_edges")
+
+
+def _slicer_mesh_repairs(project_3mf: Optional[Path], volumes: int) -> dict:
+    """PrusaSlicer's load-time repair record from the review 3MF.
+
+    The 3MF export re-loads the same input files as the G-code run, so its per-volume
+    ``<mesh edges_fixed=… degenerate_facets=… facets_removed=… facets_reversed=…
+    backwards_edges=…/>`` (``Metadata/Slic3r_PE_model.config``) is what the slicer did to
+    them. ``{"available": True, "volumes", "counts"}`` only when every one of the
+    ``volumes`` input meshes has a complete integer record; otherwise
+    ``{"available": False, "reason"}`` — a missing record is never read as "no repairs"."""
+    import zipfile  # noqa: PLC0415
+    from xml.etree import ElementTree  # noqa: PLC0415
+
+    def unavailable(reason: str) -> dict:
+        return {"available": False, "reason": reason}
+
+    if project_3mf is None or not Path(project_3mf).is_file():
+        return unavailable("no review 3MF was written")
+    try:
+        with zipfile.ZipFile(project_3mf) as archive:
+            root = ElementTree.fromstring(archive.read("Metadata/Slic3r_PE_model.config"))
+    except (zipfile.BadZipFile, KeyError, ElementTree.ParseError) as exc:
+        return unavailable(f"Slic3r_PE_model.config unreadable: {exc}")
+    found = root.findall("./object/volume")
+    if len(found) != volumes:
+        return unavailable(f"{len(found)} volume record(s) for {volumes} input mesh(es)")
+    counts = dict.fromkeys(_REPAIR_KEYS, 0)
+    for number, volume in enumerate(found):
+        meshes = volume.findall("mesh")
+        if len(meshes) != 1:
+            return unavailable(f"volume {number} has {len(meshes)} <mesh> repair records")
+        for key in _REPAIR_KEYS:
+            value = meshes[0].get(key)
+            if value is None or not value.isdigit():
+                return unavailable(f"volume {number} <mesh> {key}={value!r}")
+            counts[key] += int(value)
+    return {"available": True, "volumes": volumes, "counts": counts}
 
 
 _PART_KEYS = ("doc_id", "path", "copies", "orientation", "build_dir", "name", "preserve_faces",
@@ -467,11 +637,11 @@ def _layout_plate(prepared: list[dict], config: dict, resolved, work_dir: Path,
 
     items, arrays = [], {}
     for index, part in enumerate(prepared):
-        oriented, triangles = _oriented_arrays(part["source"], part["orient"], work_dir,
-                                               f"model_frame_{index:02d}.stl")
-        arrays[part["label"]] = (oriented, triangles)
-        hull = footprint_hull(oriented[:, :2])
-        height = float(oriented[:, 2].max())
+        model, posed, triangles = _oriented_arrays(part["source"], part["orient"], work_dir,
+                                                   f"model_frame_{index:02d}.stl")
+        arrays[part["label"]] = (model, posed, triangles)
+        hull = footprint_hull(posed[:, :2])
+        height = float(posed[:, 2].max() - posed[:, 2].min())
         for copy in range(1, part["copies"] + 1):
             items.append(PlateItem(f"{part['label']}#{copy}", part["label"], copy, hull, height))
     brim_mm = _num(config.get("brim_width"), 0.0) or 0.0
@@ -485,10 +655,11 @@ def _layout_plate(prepared: list[dict], config: dict, resolved, work_dir: Path,
                       brim_mm=brim_mm, skirt_mm=skirt_mm)
     paths = []
     for obj in plan["objects"]:
-        oriented, triangles = arrays[obj["part"]]
-        placed = oriented + np.array([obj["offset_mm"][0], obj["offset_mm"][1], 0.0])
+        model, posed, triangles = arrays[obj["part"]]
+        target = [-obj["offset_mm"][0], -obj["offset_mm"][1], float(posed[:, 2].min())]
+        placed = posed - _float32_exact_shift(posed, target)
         stl = work_dir / f"{obj['print_order']:02d}_{_slug(obj['part'])}_{obj['copy']}.stl"
-        _write_binary_stl(stl, placed, triangles)
+        _write_slicer_stl(stl, obj["part"], "plate", model, placed, triangles)
         obj["gcode_label"] = stl.name
         obj["mesh_sha256"] = _sha256_file(stl)
         paths.append(stl)
@@ -499,7 +670,8 @@ def _output_dir(output_dir: Optional[str], stem: str, printer_slug: str) -> Path
     if output_dir:
         directory = Path(_sanitize_output_path(os.path.expanduser(output_dir)))
     else:
-        root = os.environ.get("CHUDWARE_PROJECT_SAVE_DIR")
+        from services.agent.request_context import root_value
+        root = root_value("CHUDWARE_PROJECT_SAVE_DIR")
         if root:
             directory = Path(os.path.abspath(os.path.expanduser(root))) / "print" / printer_slug
         else:
@@ -650,7 +822,9 @@ def register_print_tools(mcp: FastMCP) -> None:
         """Slice one part, or several parts on one plate, to printer-ready G-code with STOCK PrusaSlicer and prove the result.
 
         This is the ONLY supported way to make G-code. Never download a slicer, never write a
-        slicer .ini by hand, never pass a design-time build_dir you did not measure.
+        slicer .ini by hand, never pass a design-time build_dir you did not measure; a topology
+        run's reported print_handoff.build_dir is a measured design direction and should be passed
+        (unless its build_dir_source is "assumed").
 
         Target: doc_id (open part; default current) or path (.stl/.3mf/.obj/.ply).
         printer (required): the user's printer as free text, resolved against the installed
@@ -691,7 +865,11 @@ def register_print_tools(mcp: FastMCP) -> None:
         layers, support share), printability issues (dfm-style rows) and gcode_check
         (verify_gcode); a plate also returns plate.objects (print order, position, height)
         and per-part orientation/printability. print_ready is true only when the G-code
-        verification passes and the printability analysis has no failure. Report
+        verification passes, the printability analysis has no failure and, when export_3mf
+        is on (default), the review 3MF proves PrusaSlicer did not repair the input mesh
+        (slicer_mesh_repairs; a missing or malformed record is not ready either). A mesh
+        whose float32 STL would merge distinct vertices or flatten a triangle is refused
+        before slicing (reason slicer_mesh_precision_loss, with model-frame coordinates). Report
         print_ready=false honestly and fix the design (dfm_check lists the faces) or
         settings, then slice again. The manifest_path of a print-ready result is what
         publish_print_media takes to put it on printer media (one job per plate;
@@ -798,24 +976,28 @@ def register_print_tools(mcp: FastMCP) -> None:
             work_dir.mkdir(parents=True, exist_ok=True)
             config = {**resolved.config, **settings}
             plan = None
-            if plate_mode:
-                try:
-                    plan, mesh_paths, objects = _layout_plate(prepared, config, resolved,
-                                                              work_dir, sequential)
-                except PlateRefusal as refusal:
-                    return _dumps({**refusal.to_dict(), "printer": printer_name,
-                                   "complete_individual_objects": sequential})
-                center_xy, instance_copies = None, 1
-                mesh_sha = hashlib.sha256("".join(
-                    o["mesh_sha256"] for o in objects).encode()).hexdigest()
-            else:
-                oriented, triangles = _oriented_arrays(first["source"], first["orient"],
-                                                       work_dir, "model_frame.stl")
-                oriented_stl = work_dir / f"{stem}.oriented.stl"
-                _write_binary_stl(oriented_stl, oriented, triangles)
-                mesh_paths, center_xy = [oriented_stl], resolved.bed_center()
-                instance_copies = first["copies"]
-                mesh_sha = _sha256_file(oriented_stl)
+            try:
+                if plate_mode:
+                    try:
+                        plan, mesh_paths, objects = _layout_plate(prepared, config, resolved,
+                                                                  work_dir, sequential)
+                    except PlateRefusal as refusal:
+                        return _dumps({**refusal.to_dict(), "printer": printer_name,
+                                       "complete_individual_objects": sequential})
+                    center_xy, instance_copies = None, 1
+                    mesh_sha = hashlib.sha256("".join(
+                        o["mesh_sha256"] for o in objects).encode()).hexdigest()
+                else:
+                    model, posed, triangles = _oriented_arrays(first["source"], first["orient"],
+                                                               work_dir, "model_frame.stl")
+                    oriented_stl = work_dir / f"{stem}.oriented.stl"
+                    _write_slicer_stl(oriented_stl, first["label"], "origin-centred", model,
+                                      posed, triangles)
+                    mesh_paths, center_xy = [oriented_stl], resolved.bed_center()
+                    instance_copies = first["copies"]
+                    mesh_sha = _sha256_file(oriented_stl)
+            except SlicerMeshRefusal as refusal:
+                return _dumps({**refusal.to_dict(), "printer": printer_name})
 
             gcode_path = out_dir / f"{stem}.gcode"
             project = out_dir / f"{stem}.3mf" if export_3mf else None
@@ -845,7 +1027,15 @@ def register_print_tools(mcp: FastMCP) -> None:
             printability_fail = [{**r, "part": p["label"]} for p in prepared
                                  for r in p["analysis"]["checks"]
                                  if r.get("status") == "fail" and r.get("check") not in solved]
-            print_ready = bool(check.get("ok")) and not printability_fail
+            # PrusaSlicer deletes degenerate facets and flips/stitches bad ones on load; the
+            # G-code is then of a different mesh than the one analysed, so it is not ready.
+            # Without export_3mf there is no record to read (None), not a clean one.
+            repairs = (_slicer_mesh_repairs(run.project_3mf, volumes=len(mesh_paths))
+                       if export_3mf else None)
+            slicer_unproven = repairs is not None and (
+                not repairs["available"] or any(repairs["counts"].values()))
+            print_ready = (bool(check.get("ok")) and not printability_fail
+                           and not slicer_unproven)
             stats = check.get("stats") or {}
             effective = {k: config.get(k) for k in (
                 "layer_height", "first_layer_height", "perimeters", "fill_density",
@@ -908,7 +1098,8 @@ def register_print_tools(mcp: FastMCP) -> None:
                 "stats": stats, "estimate": estimate,
                 "printability": printability,
                 "gcode_check": {"status": check.get("status"), "issues": gcode_issues},
-                "slicer_warnings": run.warnings, "print_ready": print_ready,
+                "slicer_warnings": run.warnings, "slicer_mesh_repairs": repairs,
+                "print_ready": print_ready,
             }
             manifest_path = out_dir / f"{stem}.print.json"
             manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -919,6 +1110,15 @@ def register_print_tools(mcp: FastMCP) -> None:
             if not check.get("ok"):
                 next_steps.append("G-code verification failed: read gcode_check.issues; "
                                   "change orientation/supports or the design before printing")
+            if repairs is not None and not repairs["available"]:
+                next_steps.append(f"PrusaSlicer's mesh repair record could not be read "
+                                  f"({repairs['reason']}), so the slicer's input is not proven "
+                                  f"unchanged: check slicer_status (a PrusaSlicer upgrade may "
+                                  f"have changed the 3MF) before printing")
+            elif slicer_unproven:
+                next_steps.append("PrusaSlicer repaired the input mesh on load (see "
+                                  "slicer_mesh_repairs), so the G-code is not of the analysed "
+                                  "part: run check_geometry_health on the source and fix it")
             if any(row.get("check") == "sequential_clearance" and row.get("status") == "fail"
                    for row in gcode_issues):
                 next_steps.append("sequential_clearance failed: the hotend or gantry would hit "
@@ -933,8 +1133,14 @@ def register_print_tools(mcp: FastMCP) -> None:
                     f"{manifest_path}], expected_inventory="
                     f"<inventory_token>, media_idle=True only after the user confirms no "
                     f"printer is using the media). Never cp/fs_write G-code onto media; "
-                    f"report the returned PRINT/<project>/ filenames and leftover unmanaged "
-                    f"printables")
+                    f"report the returned root-level filenames and leftover unmanaged "
+                    f"printables; layout='project' allows one top-level project folder")
+            else:
+                next_steps.append(
+                    "if the user wants this file on printer media anyway, that is their call: "
+                    "on their explicit yes, publish_print_media with this job's "
+                    "user_override=<their words> (never a hand copy) and report the failed "
+                    "checks")
             hours = f"{(stats.get('print_time_s') or 0) / 3600:.2f} h"
             if plate_mode:
                 mode_text = ("printed one at a time (Complete individual objects)" if sequential
@@ -963,7 +1169,8 @@ def register_print_tools(mcp: FastMCP) -> None:
             result.update({
                 "stats": stats, "estimate": estimate, "printability": printability,
                 "gcode_check": {"status": check.get("status"), "issues": gcode_issues},
-                "slicer_warnings": run.warnings, "next_steps": next_steps,
+                "slicer_warnings": run.warnings, "slicer_mesh_repairs": repairs,
+                "next_steps": next_steps,
                 "elapsed_s": round(time.monotonic() - started, 1),
                 "content": (f"{'PRINT-READY' if print_ready else 'NOT print-ready'}: "
                             f"{headline}{hours}, "
@@ -1023,7 +1230,7 @@ def register_print_tools(mcp: FastMCP) -> None:
         already exist — a missing mount is reported, never created. Walks the whole real file
         tree without following symlinks and returns rows {path (relative to root), size,
         sha256, printable (.gcode/.gco/.g/.bgcode, any case), managed status current |
-        superseded | modified}, duplicate groups, the managed revision per PRINT/<project>/,
+        superseded | modified}, duplicate groups, the managed revision per project,
         and inventory_token — a digest of the WHOLE drive, identical on every page.
         offset/limit page the rows (total, truncated). Compare the printable rows against the
         complete job set you intend to deliver: the printer shows names only, no timestamps, so
@@ -1040,7 +1247,8 @@ def register_print_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def publish_print_media(root: str, project: str, jobs: list[dict],
                             expected_inventory: str, media_idle: bool = False,
-                            retire_paths: Optional[list[str]] = None) -> str:
+                            retire_paths: Optional[list[str]] = None,
+                            layout: str = "root") -> str:
         """Publish a project's COMPLETE verified print set to printer media; retire its old managed G-code.
 
         The one supported way to put G-code on a printer stick — never cp/rsync/fs_write
@@ -1051,33 +1259,44 @@ def register_print_tools(mcp: FastMCP) -> None:
         expected_inventory: the inventory_token from print_media_inventory on this root; any
         change since then refuses, so inventory, compare, then publish.
 
-        project: the canonical folder name — files land in PRINT/<project>/.
+        project: the canonical project identifier used to track and replace its complete set.
+        layout: root (default) writes raw print files directly at the drive root; project
+          writes into ONE top-level <PROJECT>/ folder. No PRINT/, nested job folders,
+          CAD files or review packets are delivered.
         jobs: the COMPLETE desired set for the project, one {part_id, manifest_path,
-          gcode_path?} per part: part_id a stable identifier (same part, same id across
-          revisions), manifest_path the slice_part .print.json, gcode_path only when the
-          saved G-code moved since slicing. Each needs print_ready true and the G-code
-          sha256 equal to the manifest's gcode_sha256 — nothing is resliced or relaxed. A
-          part omitted from jobs is retired, not kept.
+          gcode_path?, user_override?} per part: part_id a stable identifier (same part, same
+          id across revisions), manifest_path the slice_part .print.json, gcode_path only
+          when the saved G-code moved since slicing. The G-code sha256 must equal the
+          manifest's gcode_sha256 — nothing is resliced or relaxed. Each job needs
+          print_ready true, unless the user explicitly told you to put that file on the media
+          anyway: then pass user_override with their instruction (quoted), and the job
+          publishes with its failed checks recorded on the media and in warnings
+          (published_not_print_ready). Never refuse such an instruction or route around it
+          with a copy. A part omitted from jobs is deleted, not kept or archived.
         retire_paths: extra relative paths (e.g. old hand-copied G-code from the
           inventory's unmanaged printables) the user reviewed and approved for removal;
           nothing else unrecognised is touched.
 
-        Files are named R<rev:03><part:02>_<PART>.gcode (e.g. R00101_UPPER_ARM.gcode): the
-        first six characters encode release + part, so they stay unique and ordered even on
-        a printer that truncates FAT short names. The same content set is idempotent (no new
-        revision). Every file is staged and read back by sha256 before anything is retired;
-        previous managed revisions of this project go into a non-printable ZIP archive; a
-        sidecar manifest maps part_id -> filename with source hashes and warnings. Returns
-        the exact current printable files, what was archived/replaced, unmanaged printables
-        still on the media and warnings; a failure says what state the media is in. Report
-        those filenames and the PRINT/<project>/ path verbatim, plus any remaining
-        unmanaged printables — do not call the media clean while they exist."""
+        Files use stable raw names such as upper_arm.gcode; revisions live in hidden flat
+        metadata, not the printer menu. The same content set and layout are idempotent (no
+        new revision). Every new file is staged and read back by sha256 before replacing
+        the current set. Deprecated G-code is held temporarily only for rollback, then
+        permanently deleted after a verified commit; no toolpath archives are created.
+        Hidden sidecar metadata maps part_id -> filename with source hashes and warnings,
+        without adding directory trees. Existing nested managed sets migrate to the
+        selected layout and obsolete managed archives are deleted. Unrelated files are
+        never overwritten or silently retired. Returns the exact current printable files,
+        what was deleted/replaced, unmanaged
+        printables still on the media and warnings; a failure says what state the media is
+        in. Report the returned folder and filenames verbatim, plus remaining unmanaged
+        printables — do not call the media clean while they exist."""
         try:
             from services.manufacturing.print_media import (  # noqa: PLC0415
                 publish_print_media as publish,
             )
 
             return _dumps(publish(root, project, jobs, expected_inventory,
-                                  media_idle=media_idle, retire_paths=retire_paths))
+                                  media_idle=media_idle, retire_paths=retire_paths,
+                                  layout=layout))
         except Exception as e:  # noqa: BLE001
             return _err(e)

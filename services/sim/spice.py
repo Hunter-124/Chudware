@@ -622,8 +622,219 @@ def parse_spice(text: str) -> dict:
 # PUBLIC: write_spice
 # ---------------------------------------------------------------------------
 
+_IDENTIFIER_TOKEN = r"[A-Za-z0-9_:/+-][A-Za-z0-9_:/+.-]*"
+_IDENTIFIER = re.compile(_IDENTIFIER_TOKEN, re.ASCII)
+_PROBE = re.compile(rf"[VvIi]\(({_IDENTIFIER_TOKEN})(?:,({_IDENTIFIER_TOKEN}))?\)", re.ASCII)
+_EXPRESSION_TOKEN = re.compile(
+    r"([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?:meg|mil|[gkmunpf])?"
+    r"|[A-Za-z_][A-Za-z0-9_]*|&&|\|\||[()+*/^<>=!?:,-])", re.IGNORECASE | re.ASCII)
+
+
+def spice_identifier(value: Any) -> str:
+    """A single data token, never a command, comment, quoted string or new line."""
+    if (not isinstance(value, str) or not _IDENTIFIER.fullmatch(value)
+            or value.lower() == "shell"):
+        raise ValueError(f"invalid SPICE identifier: {value!r}")
+    return value
+
+
+def spice_number(value: Any) -> float:
+    if isinstance(value, bool):
+        raise ValueError("SPICE numbers cannot be booleans")
+    try:
+        if isinstance(value, str) and not _SUFFIX_RE.fullmatch(value):
+            raise ValueError("SPICE numbers must be single numeric tokens")
+        number = _parse_value(value) if isinstance(value, str) else float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"invalid SPICE number: {value!r}") from exc
+    if not math.isfinite(number):
+        raise ValueError("SPICE numbers must be finite")
+    return number
+
+
+def spice_probe(value: Any) -> str:
+    match = _PROBE.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        raise ValueError(f"invalid SPICE probe: {value!r}")
+    for node in match.groups():
+        if node is not None:
+            spice_identifier(node)
+    return value
+
+
+def _spice_expression(value: Any) -> None:
+    """Arithmetic/probe expression tokens only; no command/string syntax."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("empty SPICE behavioral expression")
+    offset = 0
+    while offset < len(value):
+        if value[offset] == " ":
+            offset += 1
+            continue
+        token = _EXPRESSION_TOKEN.match(value, offset)
+        if token is None or token.group().lower() == "shell":
+            raise ValueError("invalid SPICE behavioral expression")
+        offset = token.end()
+
+
+def _validate_spice_data(circuit: dict, study: dict | None) -> None:
+    for node in circuit.get("nodes", []):
+        spice_identifier(node)
+    for name, model in circuit.get("models", {}).items():
+        spice_identifier(name)
+        if str(model.get("type", "")).upper() not in {"D", "NPN", "PNP", "NMOS", "PMOS", "SW", "CSW", "NJF", "PJF"}:
+            raise ValueError("invalid SPICE model type")
+        for key, value in model.items():
+            if key != "type":
+                spice_identifier(key)
+                spice_number(value)
+    for dev in circuit.get("devices", []):
+        kind = spice_identifier(dev["kind"])
+        name = spice_identifier(dev["name"])
+        if not name.upper().startswith(kind.upper()[0]):
+            raise ValueError("SPICE device name must begin with its device kind")
+        for node in dev["nodes"]:
+            spice_identifier(node)
+        if dev.get("model"):
+            spice_identifier(dev["model"])
+        if dev.get("value") is not None:
+            spice_number(dev["value"])
+        for key, value in dev.get("params", {}).items():
+            spice_identifier(key)
+            if key in {"ctrl", "type", "btype"}:
+                spice_identifier(value)
+                if key == "btype" and value.upper() not in {"V", "I"}:
+                    raise ValueError("invalid behavioral source type")
+            elif key == "expr":
+                _spice_expression(value)
+            elif key == "inductors":
+                for inductor in value:
+                    spice_identifier(inductor)
+            elif key == "waveform":
+                if value.get("type", "DC").upper() not in {"DC", "PULSE", "SIN", "PWL"}:
+                    raise ValueError("invalid source waveform")
+                for field, scalar in value.items():
+                    if field == "type":
+                        continue
+                    if field == "points":
+                        for pair in scalar:
+                            for number in pair:
+                                spice_number(number)
+                    else:
+                        spice_identifier(field)
+                        spice_number(scalar)
+            elif key == "ac":
+                for field, number in value.items():
+                    spice_identifier(field)
+                    spice_number(number)
+            else:
+                spice_number(value)
+    if study:
+        for analysis in study.get("analyses", []):
+            # The shared analysis emitter validates every interpolation.
+            from services.installer.ngspice_backend import _analysis_card
+            _analysis_card(analysis)
+        for probe in study.get("probes", []):
+            spice_probe(probe)
+        for key, value in study.get("options", {}).items():
+            spice_identifier(key)
+            spice_number(value)
+
+
+def _encode_spice_names(circuit: dict, study: dict | None = None):
+    """Bijectively encode display labels as solver tokens; never emit a label."""
+    from copy import deepcopy
+    data = deepcopy(circuit)
+    request = deepcopy(study) if study is not None else None
+    nodes: dict[str, str] = {}
+    devices: dict[str, str] = {}
+
+    def label(value):
+        if (not isinstance(value, str) or not value or value.startswith(".")
+                or re.search(r"(?:^|\s)shell(?:$|\s)", value, re.IGNORECASE)
+                or any(ord(c) < 32 or ord(c) == 127 for c in value)):
+            raise ValueError(f"invalid SPICE label: {value!r}")
+        return value
+
+    def node(value):
+        value = label(value)
+        if value not in nodes:
+            nodes[value] = "0" if value.lower() in {"0", "gnd"} else f"cw_node_{len(nodes)}"
+        return nodes[value]
+
+    def device(value, kind=None):
+        value = label(value)
+        if value not in devices:
+            prefix = spice_identifier(kind or value[0])[0].upper()
+            if not prefix.isalpha():
+                raise ValueError("invalid device kind")
+            devices[value] = f"{prefix}cw_device_{len(devices)}"
+        return devices[value]
+
+    data["nodes"] = [node(value) for value in data.get("nodes", [])]
+    for dev in data.get("devices", []):
+        dev["name"] = device(dev["name"], dev["kind"])
+        dev["nodes"] = [node(value) for value in dev["nodes"]]
+    for dev in data.get("xdevices", []):
+        if not label(dev["name"]).upper().startswith("X"):
+            raise ValueError("subcircuit instance must begin with X")
+        dev["name"] = device(dev["name"], "X")
+        dev["nodes"] = [node(value) for value in dev["nodes"]]
+
+    def probe(value):
+        label(value)
+        match = re.fullmatch(r"([VvIi])\((.+)\)", value)
+        if match is None:
+            raise ValueError("invalid SPICE probe")
+        kind, argument = match.groups()
+        if kind.upper() == "I":
+            return f"I({device(argument)})"
+        # Exact lookup first permits EDA net labels containing parentheses/commas.
+        if argument in nodes:
+            return f"V({nodes[argument]})"
+        arguments = argument.split(",")
+        if len(arguments) not in {1, 2}:
+            raise ValueError("invalid voltage probe")
+        return f"V({','.join(node(arg) for arg in arguments)})"
+
+    for dev in data.get("devices", []):
+        params = dev.get("params", {})
+        if "ctrl" in params:
+            params["ctrl"] = device(params["ctrl"])
+        if "inductors" in params:
+            params["inductors"] = [device(value, "L") for value in params["inductors"]]
+        if "expr" in params:
+            expression = params["expr"]
+            if not isinstance(expression, str):
+                raise ValueError("invalid behavioral expression")
+            for kind, names in (("V", nodes), ("I", devices)):
+                if names:
+                    alternatives = "|".join(re.escape(name) for name in sorted(names, key=len, reverse=True))
+                    expression = re.sub(
+                        rf"[{kind}{kind.lower()}]\(({alternatives})\)",
+                        lambda match, names=names, k=kind: f"{k}({names[match.group(1)]})",
+                        expression)
+            params["expr"] = expression
+    probes = {}
+    if request:
+        for analysis in request.get("analyses", []):
+            if analysis.get("type") in {"dc", "tf"}:
+                analysis["source"] = device(analysis.get("source", "V1"))
+            if analysis.get("type") == "tf":
+                analysis["output"] = probe(analysis.get("output", "V(OUT)"))
+        probes = {value: probe(value) for value in request.get("probes", [])}
+        request["probes"] = list(probes.values())
+    return data, request, probes
+
+
 def write_spice(circuit: dict, study: dict | None = None) -> str:
-    """Serialize a Circuit (and optional study) to a SPICE deck string."""
+    """Serialize data with generated solver identifiers, never display labels."""
+    circuit, study, _ = _encode_spice_names(circuit, study)
+    return _write_spice_tokens(circuit, study)
+
+
+def _write_spice_tokens(circuit: dict, study: dict | None = None) -> str:
+    _validate_spice_data(circuit, study)
     lines: list[str] = ["* Generated by engine.sim.spice", ""]
 
     # .model cards

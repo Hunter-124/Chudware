@@ -6,7 +6,8 @@ roots and ``CHUDWARE_RENODE`` / ``RENODE_ROOT`` are also accepted.
 
 Usage:
     python -m tools.provision_renode            # report what's detected
-    python -m tools.provision_renode --install  # fetch portable release (Linux/macOS/Windows)
+    python -m tools.provision_renode --install --release TAG --sha256 HEX
+                                               # fetch a digest-pinned portable release
 
 Install layout (``--install``, user-space, no sudo):
     Linux:   ~/.local/opt/renode  + symlink ~/.local/bin/renode
@@ -17,11 +18,14 @@ Install layout (``--install``, user-space, no sudo):
 Manual options (all auto-detected afterwards):
     * unpack a Renode portable tarball/zip anywhere and put ``renode`` on PATH
     * set CHUDWARE_RENODE or RENODE_ROOT to the install root (dir containing the binary)
+    * automatic downloads require a release tag and an independently obtained SHA256;
+      no authoritative archive digest is currently shipped in this repository
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -31,12 +35,13 @@ import sys
 import tarfile
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Optional
 
-GITHUB_API = "https://api.github.com/repos/renode/renode/releases/latest"
+GITHUB_RELEASES_API = "https://api.github.com/repos/renode/renode/releases/tags/"
 GITHUB_UA = "chudware-provision-renode/1.0"
 
 # Well-known roots probed when PATH does not have `renode`.
@@ -140,7 +145,7 @@ def status() -> dict:
             "version": None,
             "hint": (
                 "Install Renode portable from https://renode.io/#downloads "
-                "(or run: python -m tools.provision_renode --install)"
+                "(or run: python -m tools.provision_renode --install --release TAG --sha256 HEX)"
             ),
         }
     return {
@@ -208,15 +213,14 @@ def _platform_asset_name(assets: list[dict]) -> Optional[dict]:
     return None
 
 
-def _latest_release_asset() -> tuple[str, dict]:
-    """Return (tag, asset_dict) for the latest Renode release portable for this host."""
+def _release_asset(tag: str) -> dict:
+    """Return the portable asset for this host from an explicitly selected release."""
     req = urllib.request.Request(
-        GITHUB_API,
+        GITHUB_RELEASES_API + urllib.parse.quote(tag, safe=""),
         headers={"User-Agent": GITHUB_UA, "Accept": "application/vnd.github+json"},
     )
     with urllib.request.urlopen(req, timeout=60) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-    tag = data.get("tag_name") or data.get("name") or "unknown"
     assets = data.get("assets") or []
     asset = _platform_asset_name(assets)
     if asset is None:
@@ -224,13 +228,26 @@ def _latest_release_asset() -> tuple[str, dict]:
             f"no portable Renode asset for {platform.system()}/{platform.machine()} "
             f"in release {tag}; see https://github.com/renode/renode/releases"
         )
-    return tag, asset
+    return asset
 
 
 def _download(url: str, dest: Path) -> None:
     req = urllib.request.Request(url, headers={"User-Agent": GITHUB_UA})
     with urllib.request.urlopen(req, timeout=600) as resp, open(dest, "wb") as fh:
         shutil.copyfileobj(resp, fh)
+
+
+def _verify_archive(archive: Path, expected_sha256: str) -> None:
+    """Refuse an archive unless its bytes match the independently supplied pin."""
+    digest = hashlib.sha256()
+    with archive.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual != expected_sha256:
+        raise RuntimeError(
+            f"Renode archive SHA256 mismatch: expected {expected_sha256}, got {actual}"
+        )
 
 
 def _extract_archive(archive: Path, dest_dir: Path) -> Path:
@@ -291,8 +308,8 @@ def _ensure_path_symlink(binary: Path) -> None:
         link.chmod(0o755)
 
 
-def install() -> bool:
-    """Download + extract the latest portable Renode release. Returns True on success."""
+def install(release: Optional[str] = None, sha256: Optional[str] = None) -> bool:
+    """Download and verify a digest-pinned portable release. Returns True on success."""
     existing = find_renode()
     if existing is not None:
         ver = probe_version(existing) or "unknown"
@@ -300,9 +317,25 @@ def install() -> bool:
         _ensure_path_symlink(existing)
         return True
 
-    print("[provision] resolving latest Renode release via GitHub API...")
+    if not release or release.lower() == "latest":
+        print(
+            "[provision] missing explicit Renode release pin; "
+            "supply --release TAG (not latest) and --sha256 HEX for the selected host archive. "
+            "No authoritative release/archive digest pair is shipped in this repository."
+        )
+        return False
+    if not sha256 or len(sha256) != 64 or any(c not in "0123456789abcdefABCDEF" for c in sha256):
+        print(
+            "[provision] missing or invalid Renode archive SHA256 pin; "
+            "supply --sha256 HEX (64 hexadecimal characters) for the selected host asset. "
+            "No authoritative digest is shipped in this repository."
+        )
+        return False
+    sha256 = sha256.lower()
+
+    print(f"[provision] resolving pinned Renode release {release} via GitHub API...")
     try:
-        tag, asset = _latest_release_asset()
+        asset = _release_asset(release)
     except (urllib.error.URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"[provision] failed to resolve release: {exc}")
         print("            Manual: download portable from https://renode.io/#downloads")
@@ -315,12 +348,13 @@ def install() -> bool:
         return False
 
     root = _install_root()
-    print(f"[provision] installing Renode {tag} ({name}) -> {root}")
+    print(f"[provision] installing Renode {release} ({name}) -> {root}")
     try:
         with tempfile.TemporaryDirectory(prefix="renode-prov-") as tmp:
             archive = Path(tmp) / name
             print(f"[provision] downloading {url} ...")
             _download(url, archive)
+            _verify_archive(archive, sha256)
             # Stage into a temp dir, then swap into root for atomic-ish replace.
             stage = Path(tmp) / "stage"
             stage.mkdir()
@@ -378,11 +412,11 @@ def report() -> int:
         return 0
     print("[provision] No Renode detected on this host.")
     if os.name == "posix":
-        print("            Run with --install for a user-space portable tarball (no sudo),")
+        print("            Run --install --release TAG --sha256 HEX for a pinned user-space archive,")
         print("            or unpack a release under ~/.local/opt/renode and put renode on PATH,")
         print("            or set CHUDWARE_RENODE to an install root.")
     else:
-        print("            Run with --install for the Windows portable zip,")
+        print("            Run --install --release TAG --sha256 HEX for a pinned Windows portable zip,")
         print("            or install from https://renode.io/#downloads and put renode.exe on PATH,")
         print("            or set %CHUDWARE_RENODE% to the install root.")
     print(f"            hint: {st['hint']}")
@@ -396,7 +430,15 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--install",
         action="store_true",
-        help="download portable Renode release into a user-space prefix if not already present",
+        help="download a SHA256-pinned portable Renode release if not already present",
+    )
+    ap.add_argument(
+        "--release",
+        help="explicit Renode release tag to install (no mutable latest selection)",
+    )
+    ap.add_argument(
+        "--sha256",
+        help="independently obtained SHA256 digest of the portable archive for this host",
     )
     ap.add_argument(
         "--json",
@@ -408,8 +450,8 @@ def main(argv=None) -> int:
     if args.install:
         if find_renode() is not None:
             print("[provision] Renode already available — nothing to do.")
-        else:
-            install()
+        elif not install(release=args.release, sha256=args.sha256):
+            return 1
 
     if args.json:
         st = status()

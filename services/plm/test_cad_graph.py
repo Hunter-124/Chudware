@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import io
 import json
+import hashlib
 import gzip
 import os
+import struct
 import time
 import zipfile
 from pathlib import Path
@@ -19,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from services.plm import cad_graph
+from services.plm import snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +41,151 @@ def _container(doc: dict) -> bytes:
 
 def _write(project: Path, name: str, doc: dict) -> None:
     (project / name).write_bytes(_container(doc))
+
+
+def _graph_zip(entries: list[tuple[str, bytes]], compression=zipfile.ZIP_DEFLATED) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression) as zf:
+        for name, data in entries:
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def _graph_zip_u32(raw: bytes, field: int, value: int) -> bytes:
+    """Patch document.json's central-directory field, without expanding a bomb."""
+    data = bytearray(raw)
+    central = data.index(b"PK\x01\x02")
+    struct.pack_into("<I", data, central + field, value)
+    return bytes(data)
+
+
+@pytest.mark.parametrize("boundary", ["member", "ratio", "count"])
+def test_container_admission_refuses_before_opening_members(tmp_path, monkeypatch, boundary):
+    raw = _graph_zip([("document.json", b"{}")])
+    if boundary == "member":
+        raw = _graph_zip_u32(raw, 24, snapshot._MAX_MEMBER_BYTES + 1)
+    elif boundary == "ratio":
+        monkeypatch.setattr(snapshot, "_MAX_COMPRESSION_RATIO", 8)
+        raw = _graph_zip([("document.json", b"{" + b" " * 4096 + b"}")])
+    else:
+        monkeypatch.setattr(snapshot, "_MAX_ZIP_ENTRIES", 3)
+        raw = _graph_zip([("document.json", b"{}"), ("a", b""), ("b", b""), ("c", b"")])
+    path = tmp_path / "hostile.step+"
+    path.write_bytes(raw)
+    opened = []
+
+    def forbidden_open(self, member, *args, **kwargs):
+        opened.append(member)
+        raise AssertionError("member must not be inflated before admission")
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", forbidden_open)
+    assert cad_graph._read_container(path) == (None, [], None)
+    assert opened == []
+
+
+@pytest.mark.parametrize("names", [
+    ["DOCUMENT.JSON"],
+    ["document.json", "DOCUMENT.JSON"],
+    ["document.json", "document.json"],
+])
+def test_container_exact_document_name_and_unique_members(tmp_path, names):
+    entries = [(name, b"{}") for name in names]
+    if names == ["document.json", "document.json"]:
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            raw = _graph_zip(entries)
+    else:
+        raw = _graph_zip(entries)
+    path = tmp_path / "alias.step+"
+    path.write_bytes(raw)
+    assert cad_graph._read_container(path) == (None, [], None)
+
+
+@pytest.mark.parametrize("corruption", ["understated", "crc", "truncated"])
+def test_container_corrupt_streams_keep_invalid_result_semantics(tmp_path, corruption):
+    raw = _graph_zip([("document.json", b'{"name":"' + b"a" * 4096 + b'"}')])
+    if corruption == "understated":
+        raw = _graph_zip_u32(raw, 24, 1)
+    elif corruption == "crc":
+        raw = _graph_zip_u32(raw, 16, 0)
+    else:
+        raw = raw[:-12]
+    path = tmp_path / "corrupt.ecad+"
+    path.write_bytes(raw)
+    assert cad_graph._read_container(path) == (None, [], None)
+
+
+def test_container_streaming_preserves_document_hash_studies_and_graph(tmp_path, monkeypatch):
+    doc = _part_a()
+    doc_bytes = json.dumps(doc, indent=2).encode("utf-8")
+    path = tmp_path / "Bracket.step+"
+    path.write_bytes(_graph_zip([
+        ("document.json", doc_bytes),
+        ("geometry.step", b" " * 65536),
+        ("cache.brep", b" " * 65536),
+        ("studies/static.json", b"{}"),
+        ("studies/nested/result.json", b"{}"),
+        ("studies/thermal.json", b"{}"),
+    ]))
+    monkeypatch.setattr(snapshot, "_MAX_MEMBER_BYTES", len(doc_bytes))
+    monkeypatch.setattr(snapshot, "_READ_CHUNK_BYTES", 64)
+    requests = []
+    opened = []
+    real_read = zipfile.ZipExtFile.read
+    real_open = zipfile.ZipFile.open
+
+    def bounded_read(self, n=-1):
+        requests.append(n)
+        assert 0 < n <= 64
+        return real_read(self, n)
+
+    def recipe_only_open(self, member, *args, **kwargs):
+        name = member.filename if isinstance(member, zipfile.ZipInfo) else member
+        opened.append(name)
+        assert name == "document.json"
+        return real_open(self, member, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile.ZipExtFile, "read", bounded_read)
+    monkeypatch.setattr(zipfile.ZipFile, "open", recipe_only_open)
+    parsed, studies, content_hash = cad_graph._read_container(path)
+    assert parsed == doc
+    assert studies == ["static", "thermal"]
+    assert content_hash == hashlib.blake2b(doc_bytes, digest_size=8).hexdigest()
+    assert len(requests) > 1
+    assert opened == ["document.json"]
+    graph = cad_graph.build_graph(tmp_path, force=True)
+    assert graph["ok"] is True
+    assert "Bracket" in {node["label"] for node in graph["nodes"]}
+    assert any(node["kind"] == "feature" and node["label"] == "Base" for node in graph["nodes"])
+
+
+def test_container_actual_stream_budget_refuses_without_partial_graph(tmp_path, monkeypatch):
+    doc = _part_a()
+    _write(tmp_path, "Bracket.step+", doc)
+    budget = max(2048, len(json.dumps(doc, indent=2).encode("utf-8")))
+    raw = _graph_zip([("document.json", b'{"name":"' + b"b" * (2 * budget) + b'"}')])
+    # The claimed size fits, but the real compressed member does not. Keep the
+    # CRC honest so zipfile must refuse the dishonest stream rather than parse it.
+    raw = _graph_zip_u32(raw, 24, budget // 2)
+    (tmp_path / "Bomb.step+").write_bytes(raw)
+    monkeypatch.setattr(snapshot, "_MAX_MEMBER_BYTES", budget)
+    monkeypatch.setattr(snapshot, "_READ_CHUNK_BYTES", 128)
+    requests = []
+    real_read = zipfile.ZipExtFile.read
+
+    def bounded_read(self, n=-1):
+        requests.append(n)
+        assert 0 < n <= 128
+        return real_read(self, n)
+
+    monkeypatch.setattr(zipfile.ZipExtFile, "read", bounded_read)
+    assert cad_graph._read_container(tmp_path / "Bomb.step+") == (None, [], None)
+    assert requests
+    graph = cad_graph.build_graph(tmp_path, force=True)
+    assert graph["ok"] is True
+    labels = {node["label"] for node in graph["nodes"]}
+    assert "Bracket" in labels
+    assert "Bomb" not in labels
+    assert not any(node.get("path") == "Bomb.step+" for node in graph["nodes"])
 
 
 def _part_a() -> dict:

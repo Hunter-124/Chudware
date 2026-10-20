@@ -70,8 +70,8 @@ public:
     bool eof() const { return eof_.load(std::memory_order_acquire); }
 #endif
     void close();
-    // Wake a peer thread blocked in readLine()'s poll/read WITHOUT closing the fd:
-    // half-closes the connection (POSIX shutdown / Windows CancelIoEx) so a blocking
+    // Wake a peer thread blocked in readLine() WITHOUT closing the handle:
+    // POSIX shutdown / Windows sticky cancellation plus CancelIoEx ensure a blocking
     // readLine returns promptly. The daemon shutdown path calls this before join()ing
     // the per-client threads — close() alone does NOT interrupt a thread already parked
     // in poll() on Linux, which hung ~Server to the systemd stop timeout (SIGABRT).
@@ -83,7 +83,9 @@ public:
 private:
 #ifdef _WIN32
     void* h_ = nullptr;   // pipe HANDLE (nullptr = invalid; INVALID_HANDLE_VALUE normalized away)
-    void* ev_ = nullptr;  // manual-reset event backing this conn's OVERLAPPED reads/writes
+    void* ev_ = nullptr;  // read completion; reads and writes may run concurrently
+    void* writeEvent_ = nullptr;
+    void* shutdownEvent_ = nullptr;  // sticky cancellation, including before I/O starts
 #elif defined(__EMSCRIPTEN__)
     std::shared_ptr<WasmState> ws_;
 #else
@@ -116,6 +118,10 @@ public:
     // with FILE_FLAG_FIRST_PIPE_INSTANCE (anti-squat: fails if the name exists)
     // and a same-user-SID + SYSTEM DACL, PIPE_REJECT_REMOTE_CLIENTS.
     bool listen(const std::string& path, std::string& err);
+
+    // Takes ownership of an inherited AF_UNIX SOCK_STREAM listening fd, including
+    // on failure. Never owns/unlinks its filesystem endpoint. POSIX only.
+    bool adoptListeningFd(int fd, std::string& err);
 
     // Accept one connection. timeoutMs < 0 blocks forever. Returns an invalid
     // conn on timeout/error/closed listener. (Windows: an overlapped

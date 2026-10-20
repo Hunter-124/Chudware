@@ -41,6 +41,8 @@
 #include <string>
 #include <vector>
 
+extern "C" void randombytes(unsigned char*, unsigned long long);
+
 #include <nlohmann/json.hpp>
 
 #ifdef _WIN32
@@ -55,6 +57,7 @@
 #include "agent/ask.h"
 #include "agent/clarify.h"
 #include "agent/config.h"
+#include "agent/copilot_modes.h"
 #include "agent/events.h"
 #include "agent/machine.h"
 #include "agent/micro.h"
@@ -164,6 +167,10 @@ std::string jstr(const JsonT& j, const char* key, const std::string& d = std::st
 // Emit `j` into *out_json (heap) and return `rc`. On allocation failure returns 1
 // with an {"error":"out of memory"} payload (or nullptr if even that fails).
 int emit(json&& j, char** out_json, int rc) {
+    if (chudware::sim::cell_request_revoked()) {
+        j = json{{"code", "revoked"}, {"message", "principal revoked"}};
+        rc = 1;
+    }
     if (!out_json) return rc;
     char* p = dup_cstr(j.dump());
     if (p) {
@@ -176,6 +183,105 @@ int emit(json&& j, char** out_json, int rc) {
 
 int emit_error(const std::string& msg, char** out_json) {
     return emit(json{{"error", msg}}, out_json, 1);
+}
+
+struct NativeRunOwner {
+    std::string workspace;
+    std::string actor;
+    std::int64_t epoch = 0;
+    bool active = true;
+};
+std::mutex nativeRunOwnersMutex;
+std::map<std::string, NativeRunOwner> nativeRunOwners;
+std::map<std::string, std::map<std::string, std::int64_t>> nativeRevokeThrough;
+
+bool safeRunComponent(const std::string& id) {
+    if (id.empty() || id.size() > 192 || id == "." || id == "..") return false;
+    return std::all_of(id.begin(), id.end(), [](unsigned char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+    });
+}
+
+bool nativeRunOwned(const std::string& id, bool allowManager) {
+    const auto* principal = chudware::sim::current_cell_principal();
+    if (!principal) return true;
+    std::lock_guard<std::mutex> lk(nativeRunOwnersMutex);
+    for (const auto& [root, owner] : nativeRunOwners) {
+        if (id != root && !(id.size() > root.size() &&
+            id.compare(0, root.size(), root) == 0 && id[root.size()] == '-')) continue;
+        return owner.workspace == principal->workspaceKey &&
+            (owner.actor == principal->actorKey || (allowManager && principal->manager));
+    }
+    return false;
+}
+
+class NativeRunOwnerScope {
+public:
+    NativeRunOwnerScope(const std::string& method, json& params) {
+        const auto* principal = chudware::sim::current_cell_principal();
+        if (!principal || (method != "agent_run" && method != "agent_run_design" &&
+            method != "agent_run_micro" && method != "agent_mission_v1")) return;
+        std::lock_guard<std::mutex> lk(nativeRunOwnersMutex);
+        auto workspace = nativeRevokeThrough.find(principal->workspaceKey);
+        if (workspace != nativeRevokeThrough.end()) {
+            auto actor = workspace->second.find(principal->actorKey);
+            if (actor != workspace->second.end() && principal->epoch <= actor->second)
+                throw chudware::sim::CellRevokedError();
+        }
+        // Tenant IDs are opaque server-minted handles, never caller-selected paths.
+        unsigned char bytes[16];
+        randombytes(bytes, sizeof(bytes));
+        static constexpr char hex[] = "0123456789abcdef";
+        id_ = "run-";
+        for (unsigned char b : bytes) {
+            id_.push_back(hex[b >> 4]);
+            id_.push_back(hex[b & 15]);
+        }
+        if (!params.contains("options") || !params["options"].is_object())
+            params["options"] = json::object();
+        params["options"]["run_id"] = id_;
+        // Register the actual shared control under the ownership lock. A revoke
+        // before run_design/run_mission starts flips the flag they later adopt.
+        chudware::agent::RunControl control;
+        chudware::agent::register_run_control(id_, control);
+        try {
+            nativeRunOwners.emplace(id_, NativeRunOwner{
+                principal->workspaceKey, principal->actorKey, principal->epoch});
+        } catch (...) {
+            chudware::agent::unregister_run_control(id_);
+            throw;
+        }
+    }
+    ~NativeRunOwnerScope() {
+        if (id_.empty()) return;
+        std::lock_guard<std::mutex> lk(nativeRunOwnersMutex);
+        chudware::agent::unregister_run_control(id_);
+        nativeRunOwners.at(id_).active = false;
+    }
+private:
+    std::string id_;
+};
+
+json cancelOwnNativeRuns(std::optional<std::int64_t> revokeThrough = std::nullopt) {
+    const auto& principal = *chudware::sim::current_cell_principal();
+    std::vector<std::string> ids;
+    {
+        std::lock_guard<std::mutex> lk(nativeRunOwnersMutex);
+        if (revokeThrough) {
+            auto& actors = nativeRevokeThrough[principal.workspaceKey];
+            auto [it, inserted] = actors.emplace(principal.actorKey, *revokeThrough);
+            if (!inserted) it->second = std::max(it->second, *revokeThrough);
+        }
+        for (const auto& [id, owner] : nativeRunOwners)
+            if (owner.active && owner.workspace == principal.workspaceKey &&
+                owner.actor == principal.actorKey &&
+                (!revokeThrough || owner.epoch <= *revokeThrough)) ids.push_back(id);
+    }
+    int count = 0;
+    for (const auto& id : ids)
+        if (chudware::agent::cancel_run(id).value("cancelled", false)) ++count;
+    return json{{"ok", true}, {"cancelled", count != 0}, {"count", count}};
 }
 
 
@@ -614,6 +720,31 @@ CHUDWARE_API void chudware_set_doc_publish_sink(
     } catch (...) {
         // A void C setter cannot report allocation failures across the ABI.
     }
+}
+
+CHUDWARE_API void chudware_set_cache_refresh_sink(
+    void (*cb)(const char* doc_id, const char* response_json, void* ud), void* ud) {
+    try {
+        if (cb) chudware::doc::set_cache_refresh_sink(
+            [cb, ud](const std::string& id, const nlohmann::json& response) {
+                const std::string bytes = response.dump();
+                cb(id.c_str(), bytes.c_str(), ud);
+            });
+        else chudware::doc::set_cache_refresh_sink({});
+    } catch (...) {}
+}
+
+CHUDWARE_API int chudware_activity(uint64_t counts[3]) {
+    if (!counts) return 1;
+    counts[0] = counts[1] = counts[2] = 0;
+    try {
+        bool complete = chudware::doc::activity_counts(counts[0], counts[2]);
+        complete = chudware::ecad::dirty_document_count(counts[2]) && complete;
+        complete = chudware::cam::dirty_document_count(counts[2]) && complete;
+        complete = chudware::doc::dirty_drawing_count(counts[2]) && complete;
+        counts[1] = chudware::prof::active() ? 1 : 0;
+        return complete ? 0 : 1;
+    } catch (...) { return 1; }
 }
 
 // ---- CAM program recipe (deterministic, request-aware, no LLM) ------------------
@@ -1125,6 +1256,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             json wrapped = json::object();
             wrapped["params"] = params;
             wrapped["doc_id"] = jstr(params, "doc_id");
+            if (params.contains("_cell_ctx")) wrapped["_cell_ctx"] = params["_cell_ctx"];
             params = std::move(wrapped);
         }
         m = "agent_pm_assist";
@@ -1147,6 +1279,37 @@ static int chudware_call_inner(const char* method, const char* params_json, char
     } _rpc_method_scope(m.c_str());
 
     try {
+        std::optional<chudware::sim::CellPrincipal> cellPrincipal;
+        if (params.contains("_cell_ctx")) {
+            const json& ctx = params["_cell_ctx"];
+            if (!ctx.is_object() || !ctx.value("cell", false) ||
+                ctx.value("workspace_key", std::string()).empty() ||
+                ctx.value("actor_key", std::string()).empty())
+                return emit(json{{"code", "cell_refused"}, {"message", "invalid native principal"}},
+                            out_json, 1);
+            cellPrincipal = chudware::sim::CellPrincipal{
+                ctx["workspace_key"].get<std::string>(), ctx["actor_key"].get<std::string>(),
+                ctx.value("right", std::string()) == "manager",
+                ctx.value("epoch", std::int64_t{0})};
+            params.erase("_cell_ctx");
+        }
+        chudware::sim::CellRequestScope cellScope(cellPrincipal ? &*cellPrincipal :
+            chudware::sim::current_cell_principal());
+        std::optional<std::int64_t> revokeThrough;
+        if (chudware::sim::current_cell_principal() &&
+            (m == "agent_cancel" || m == "sim_cancel") &&
+            params.contains("_cell_revoke_through"))
+            revokeThrough = params["_cell_revoke_through"].get<std::int64_t>();
+        params.erase("_cell_revoke_through");
+        NativeRunOwnerScope nativeRunScope(m, params);
+        if (m == "agent_run_event" || m == "agent_run_events_batch" ||
+            m == "agent_run_events_read" || m == "agent_steer" ||
+            (m == "agent_cancel" && !jstr(params, "run_id").empty())) {
+            const std::string id = jstr(params, "run_id");
+            if (!safeRunComponent(id) || !nativeRunOwned(id, m == "agent_cancel"))
+                return emit(json{{"code", "not_found"}, {"message", "run not found"}},
+                            out_json, 1);
+        }
         if (m == "ping") {
             return emit(json{{"ok", true},
                              {"abi", chudware_abi_version()},
@@ -1961,6 +2124,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             // {run_id} -> {ok, cancelled:bool}. Empty/missing run_id cancels ALL live
             // runs so Stop still works when run_started has not landed yet.
             const std::string run_id = jstr(params, "run_id");
+            if (run_id.empty() && chudware::sim::current_cell_principal())
+                return emit(cancelOwnNativeRuns(revokeThrough), out_json, 0);
             if (run_id.empty())
                 return emit(chudware::agent::cancel_all_runs(), out_json, 0);
             return emit(chudware::agent::cancel_run(run_id), out_json, 0);
@@ -1996,19 +2161,33 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 params["attachments"].is_array() && !params["attachments"].empty())
                 options["attachments"] = params["attachments"];
             if (!options.contains("advisor")) options["advisor"] = true;  // default ON
-            // mode ∈ agent|plan|swarm|edit|ask — leave absent when unset (legacy).
-            // plan mode implies plan_only unless an approved_plan is already attached.
-            if (options.value("mode", std::string()) == "plan" &&
-                !options.value("plan_only", false) &&
-                !(options.contains("approved_plan") && !options["approved_plan"].is_null() &&
-                  !(options["approved_plan"].is_string() &&
-                    options["approved_plan"].get<std::string>().empty()))) {
+            // Normalize explicit modes once, before either deterministic mutating shortcut.
+            // Keep absent mode absent for the legacy modeling path.
+            std::string mode;
+            if (options.contains("mode")) {
+                const auto modes = chudware::agent::CopilotModes::load();
+                if (!modes)
+                    return emit(json{{"ok", false}, {"status", "failed"},
+                                     {"stop_reason", "mode_policy_unavailable"},
+                                     {"error", "Copilot mode policy is unavailable."}}, out_json, 0);
+                mode = chudware::agent::copilot_normalize_mode(*modes, jstr(options, "mode"));
+                options["mode"] = mode;
+            }
+            const bool approved_plan_attached =
+                options.contains("approved_plan") && !options["approved_plan"].is_null() &&
+                !(options["approved_plan"].is_string() &&
+                  options["approved_plan"].get_ref<const std::string&>().empty());
+            // Plan implies plan_only unless an explicit approved plan resumes execution.
+            if (mode == "plan" && !options.value("plan_only", false) &&
+                !approved_plan_attached) {
                 options["plan_only"] = true;
             }
             // swarm mode implies corporate_force for the Python mission path.
-            if (options.value("mode", std::string()) == "swarm" &&
+            if (mode == "swarm" &&
                 !options.value("corporate_force", false))
                 options["corporate_force"] = true;
+            const bool read_only = mode == "ask" || mode == "plan" ||
+                                   options.value("plan_only", false);
 
             // Resolve and reject before any fast path so an online provider can never be
             // accepted by native agent_run, even when the request itself is deterministic.
@@ -2056,6 +2235,32 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                             out_json, 0);
             }
 
+            // Ask never enters the modeling drivers, even with a stale approved_plan.
+            // Reuse the native question implementation with a read-only tree snapshot;
+            // assist hydration would rebuild the document to obtain feature statuses.
+            if (mode == "ask") {
+                using ojson = nlohmann::ordered_json;
+                ojson doc = nullptr;
+                long revision = 0;
+                if (!doc_id.empty()) {
+                    const json tree = chudware::doc::doc_tree(doc_id);
+                    doc = tree.at("tree");
+                    revision = tree.value("revision", 0L);
+                }
+                auto complete = chudware::agent::make_assist_provider(provider);
+                const std::string answer = chudware::agent::answer_question(
+                    request, doc, doc_id, revision, ojson::array(),
+                    [&](const std::string& system, const std::string& body) {
+                        std::string error;
+                        return complete(system, body, &error);
+                    });
+                return emit(json{{"status", "done"}, {"stop_reason", "ask"},
+                                 {"run_id", options.value("run_id", std::string("ask"))},
+                                 {"doc_id", doc_id}, {"revision", revision}, {"mode", mode},
+                                 {"answer", answer}, {"engaged", "ask"},
+                                 {"events", json::array()}}, out_json, 0);
+            }
+
             // ---- W17 drawing-intent fast-path ----
             // "make a drawing / blueprint of this part" doesn't need the modeler: build the 2D
             // sheet directly from the current part (deterministic standard views + auto-dims +
@@ -2069,7 +2274,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 bool wants_drawing = lc.find("blueprint") != std::string::npos ||
                                      lc.find("drafting") != std::string::npos ||
                                      lc.find("drawing") != std::string::npos;
-                if (wants_drawing && !doc_id.empty()) {
+                if (!read_only && !approved_plan_attached && wants_drawing && !doc_id.empty()) {
                     json t = chudware::doc::doc_tree(doc_id);
                     bool has_geom = t.is_object() && t.contains("tree") && t["tree"].is_object() &&
                                     t["tree"].contains("features") && t["tree"]["features"].is_array() &&
@@ -2133,7 +2338,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     has("program") || has("toolpath") || has("g-code") || has("gcode") ||
                     has("g code") || has("cnc") || has("post") || has("machining") ||
                     has("mill") || has("router") || has("lathe") || has("nc ");
-                if ((cam_words || (wants_cam && cam_noun)) && !doc_id.empty()) {
+                if (!read_only && !approved_plan_attached &&
+                    (cam_words || (wants_cam && cam_noun)) && !doc_id.empty()) {
                     json t = chudware::doc::doc_tree(doc_id);
                     bool has_geom = t.is_object() && t.contains("tree") && t["tree"].is_object() &&
                                     t["tree"].contains("features") &&
@@ -2188,14 +2394,9 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             // should_engage reads provider.{name,base_url,context_tokens} + cfg
             // .{micro_mode,context_tokens}. The resolved descriptor carries name/
             // base_url; cfg is the ambient config.json (so micro_mode is honored).
-            // Plan gate: plan_only / mode=plan / approved_plan MUST use run_design
-            // (not micro) so plan_ready / approved_plan skip-replan semantics hold.
-            bool force_design_path =
-                options.value("plan_only", false) ||
-                options.value("mode", std::string()) == "plan" ||
-                (options.contains("approved_plan") && !options["approved_plan"].is_null() &&
-                 !(options["approved_plan"].is_string() &&
-                   options["approved_plan"].get<std::string>().empty()));
+            // Read-only plans and explicit approval resumes use run_design, never micro
+            // or deterministic shortcuts, so planning and approved-plan semantics hold.
+            bool force_design_path = read_only || approved_plan_attached;
             bool micro = !force_design_path && chudware::agent::should_engage(provider, cfg);
 
             auto captured = std::make_shared<json>(json::array());
@@ -3064,7 +3265,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             if (m == "doc_dry_run_ops")
                 return emit(chudware::doc::doc_dry_run_ops(
                                 params.value("doc_id", std::string()),
-                                params.contains("ops") ? params["ops"] : json::array()),
+                                params.contains("ops") ? params["ops"] : json::array(),
+                                params.value("budget_ms", 0)),
                             out_json, 0);
             if (m == "doc_undo")
                 return emit(chudware::doc::doc_undo(params.value("doc_id", std::string())), out_json, 0);
@@ -3140,7 +3342,9 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(chudware::doc::doc_checkpoint(params.value("doc_id", std::string())), out_json, 0);
             if (m == "doc_revert")
                 return emit(chudware::doc::doc_revert(params.value("doc_id", std::string()),
-                                                   params.value("checkpoint", std::string())),
+                                                   params.value("checkpoint", std::string()),
+                                                   params.contains("expect_revision") && params["expect_revision"].is_number_integer()
+                                                       ? params["expect_revision"].get<long>() : -1),
                             out_json, 0);
             if (m == "doc_refresh_derived")
                 return emit(chudware::doc::doc_refresh_derived(params.value("doc_id", std::string()),
@@ -3412,8 +3616,10 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             if (m == "sim_cancel") {
                 // T-RF16: cancel a registered sim job (core/sim/sim_cancel.cpp — same
                 // registry semantics as agent cancel: idempotent, miss = cancelled:false).
-                return emit(chudware::sim::sim_cancel(params.value("job_id", std::string())),
-                            out_json, 0);
+                json result = chudware::sim::sim_cancel(params.value("job_id", std::string()),
+                                                      revokeThrough);
+                const int rc = result.value("ok", true) ? 0 : 1;
+                return emit(std::move(result), out_json, rc);
             }
             if (m == "agent_simulate_v1") {
                 // "AI runs CFD": {doc_id, request} (+ optional explicit velocity/aoa/fluid) ->
@@ -3550,7 +3756,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.contains("body") && params["body"].is_number()
                                     ? params["body"].get<int>() : 0,
                                 params.contains("density_g_cm3") && params["density_g_cm3"].is_number()
-                                    ? params["density_g_cm3"].get<double>() : 7.85),
+                                    ? std::optional<double>(params["density_g_cm3"].get<double>())
+                                    : std::nullopt),
                             out_json, 0);
             if (m == "eval_fit_cylinder") {
                 // Least-squares cylinder axis of the body's surface near a world point —
@@ -4468,6 +4675,10 @@ static int chudware_call_inner(const char* method, const char* params_json, char
         }
         // Unknown to the C++ core -> nonzero so the host falls back to Python.
         return emit(json{{"error", "unknown method: " + m}}, out_json, 2);
+    } catch (const chudware::sim::CellRevokedError&) {
+        return emit(json{{"code", "revoked"}, {"message", "principal revoked"}}, out_json, 1);
+    } catch (const chudware::sim::CellOwnershipError&) {
+        return emit(json{{"code", "not_found"}, {"message", "job not found"}}, out_json, 1);
     } catch (const std::exception& e) {
         return emit_error(std::string("chudware_call(") + m + ") threw: " + e.what(), out_json);
     } catch (...) {

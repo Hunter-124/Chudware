@@ -47,21 +47,18 @@ def test_reference_to_prior_batch_declaration():
 def test_parameter_dimensions(params, expected):
     checks = preflight._check_params_sane([
         {"op": "add_feature", "feature": {"type": "box", "params": params}},
-    ], "live", MagicMock())
+    ])
     assert checks[0]["result"] == expected
 
 
-def test_parameter_checks_use_available_wall_and_extent():
-    cb = MagicMock()
-    cb.call.return_value = {"min_thickness": 3.0, "extents": {"x": 10, "y": 10, "z": 5}}
-    for feature in [
-        {"type": "fillet", "params": {"radius": 5}},
-        {"type": "hole", "params": {"depth": 50}},
-    ]:
-        checks = preflight._check_params_sane([
-            {"op": "add_feature", "feature": feature},
-        ], "live", cb)
-        assert checks[0]["result"] == "fail"
+@pytest.mark.parametrize("feature", [
+    {"type": "fillet", "params": {"radius": -1}},
+    {"type": "chamfer", "params": {"thickness": 0}},
+    {"type": "hole", "params": {"depth": 0}},
+])
+def test_local_dimension_refusal_does_not_require_live_measurement(feature):
+    checks = preflight._check_params_sane([{"op": "add_feature", "feature": feature}])
+    assert checks[0]["result"] == "fail"
 
 
 @pytest.mark.parametrize("response, expected", [
@@ -73,6 +70,8 @@ def test_parameter_checks_use_available_wall_and_extent():
         {"id": "f1", "ok": True, "warning": "tiny edge"}]}}, "warn"),
     ({"ok": True}, "warn"),  # missing diagnostics must never mean a clean rebuild
     ({}, "warn"),
+    ({"ok": False, "skipped": "budget_exceeded"}, "skipped"),
+    ({"ok": False, "skipped": "isolation_unavailable"}, "skipped"),
 ])
 def test_prediction_decision(response, expected):
     cb = MagicMock()
@@ -123,6 +122,78 @@ def test_native_refusal_becomes_advisory_not_a_blocker(monkeypatch):
     assert result["verdict"] == "fail"
     assert {item["severity"] for item in result["advisory_items"]} == {"action"}
 
+
+
+def test_complete_native_prediction_still_passes(monkeypatch):
+    monkeypatch.setattr(core_bridge, "call", _engine({
+        "ok": True, "source_revision": 7,
+        "rebuild": {"feature_status": [{"id": "f1", "ok": True}]},
+    }))
+    result = preflight.run_preflight("live", "add_features", [])
+    assert result["verdict"] == "pass"
+    assert result["predicted"]["feature_status"] == [
+        {"id": "f1", "ok": True, "error": None, "warning": None},
+    ]
+
+
+@pytest.mark.parametrize("reason", ["budget_exceeded", "isolation_unavailable", "isolation_failed"])
+def test_incomplete_native_prediction_skips_without_geometry_blame(monkeypatch, reason):
+    calls = []
+    normal = _engine({"ok": False, "skipped": reason, "still_running": False,
+                      "error": "candidate did not finish"})
+
+    def call(method, params):
+        calls.append((method, params))
+        return normal(method, params)
+
+    monkeypatch.setattr(core_bridge, "call", call)
+    result = preflight.run_preflight("live", "add_features", [{
+        "op": "add_feature", "feature": {
+            "type": "fillet", "params": {"radius": 1.5},
+            "refs": {"edges": [{"of": "edge", "near": [-15, 9.5, 184.8], "count": 1},
+                               {"of": "edge", "near": [-15, -9.5, 184.8], "count": 1}]},
+        },
+    }])
+    assert result["verdict"] == "skipped"
+    assert result["skipped"] == reason
+    assert result["still_running"] is False
+    assert not result["predicted"]
+    assert not result["advisory_items"]
+    assert calls[-1][0] == "doc_dry_run_ops"
+    assert 0 < calls[-1][1]["budget_ms"] <= preflight._REBUILD_BUDGET_MS
+    assert all(method in ("doc_tree", "doc_dry_run_ops") for method, _ in calls)
+
+
+def test_native_budget_is_remaining_cumulative_time(monkeypatch):
+    monkeypatch.setattr(preflight.time, "monotonic", iter([100.0, 103.25]).__next__)
+    seen = []
+    normal = _engine({"ok": False, "skipped": "budget_exceeded"})
+
+    def call(method, params):
+        if method == "doc_dry_run_ops":
+            seen.append(params["budget_ms"])
+        return normal(method, params)
+
+    monkeypatch.setattr(core_bridge, "call", call)
+    assert preflight.run_preflight("live", "add_features", [])["verdict"] == "skipped"
+    assert seen == [6750]
+
+
+def test_expired_budget_never_starts_native_rebuild(monkeypatch):
+    monkeypatch.setattr(preflight.time, "monotonic", iter([100.0, 111.0]).__next__)
+    normal = _engine({})
+    calls = []
+
+    def call(method, params):
+        calls.append(method)
+        return normal(method, params)
+
+    monkeypatch.setattr(core_bridge, "call", call)
+    result = preflight.run_preflight("live", "add_features", [])
+    assert result["verdict"] == "skipped"
+    assert result["skipped"] == "budget_exceeded"
+    assert result["still_running"] is False
+    assert set(calls) == {"doc_tree"}
 
 @pytest.mark.parametrize("source_revision, revision_after", [(8, 7), (7, 8)])
 def test_concurrent_revision_change_invalidates_clean_prediction(monkeypatch, source_revision, revision_after):

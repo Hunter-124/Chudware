@@ -16,13 +16,13 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 try:
-    from . import db
+    from . import db, provider_broker, deployment_drain
     from .auth import AuthMiddleware, User, get_current_user
     from .config import settings
     from .chat import Presence, presence, router as chat_router, _scope_key  # noqa: F401
     from .bucket import router as bucket_router
 except ImportError:  # uvicorn app:app from package dir
-    import db  # type: ignore
+    import db, provider_broker, deployment_drain  # type: ignore
     from auth import AuthMiddleware, User, get_current_user
     from config import settings
     from chat import Presence, presence, router as chat_router, _scope_key  # noqa: F401
@@ -158,6 +158,11 @@ async def _security_headers(request: Request, call_next):
     # setdefault: appserve already sets COOP/COEP for /app — never fight it.
     h.setdefault("Cross-Origin-Opener-Policy", "same-origin")
     return resp
+
+
+# Keep admission outside BaseHTTPMiddleware: its in-memory response stream may
+# finish before the final body reaches the actual ASGI send boundary.
+app.add_middleware(deployment_drain.AdmissionMiddleware)
 
 
 admin_router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -370,7 +375,7 @@ async def admin_logs(request: Request, lines: int = 200) -> PlainTextResponse:
     lines = max(10, min(int(lines), 2000))
     try:
         out = subprocess.run(
-            ["journalctl", "--user", "-u", "chudware-gateway", "-n", str(lines),
+            ["journalctl", "--user", "-u", settings.gateway_unit, "-n", str(lines),
              "--no-pager", "-o", "short-iso"],
             capture_output=True, text=True, timeout=10,
         ).stdout
@@ -388,6 +393,7 @@ async def admin_page(request: Request) -> HTMLResponse:
 @app.on_event("startup")
 async def _startup() -> None:
     settings.ensure_data_dirs()
+    deployment_drain.startup()
     # The online signing key is a systemd credential, never generated or read
     # from an EnvironmentFile. Validate it before opening any serving resource.
     load_entitlement_private_key()
@@ -396,6 +402,7 @@ async def _startup() -> None:
     # — a gateway serving requests against a missing or half-migrated schema
     # looks healthy and answers wrongly.
     db.init()
+    await provider_broker.startup()
     # Outbound mail is queued into mail_outbox by mailer.send() and delivered
     # only by this task. Without it every verification and reset link ever
     # generated sits in the table unsent, and registration silently dead-ends.
@@ -405,9 +412,17 @@ async def _startup() -> None:
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    # Before anything else: the drain marks rows sent through db.tx(), so
-    # tearing the pool down first would only produce spurious failures.
+    deployment_drain.controller().stop_admission()
+    try:
+        from .marketplace_render import wait_pending
+    except ImportError:
+        from marketplace_render import wait_pending
+    await wait_pending()
+    # Mail marks rows sent through db.tx(); retain the pool until delivery has
+    # actually finished, not merely until its asyncio wrapper was canceled.
     await mailer.stop_drain()
+    await deployment_drain.controller().wait_work()
+    await provider_broker.shutdown()
     db.close_pool()
 
 
@@ -472,7 +487,7 @@ async def healthz(request: Request) -> dict[str, Any]:
     # driver previously made every /healthz take ~5s and stalled concurrent
     # portal traffic on the same worker.
     vram = await asyncio.to_thread(_nvidia_vram)
-    return {
+    result = {
         "ok": True,
         "mem_available_bytes": mem_b,
         "mem_available_gib": round(mem_g, 2) if mem_g is not None else None,
@@ -480,11 +495,15 @@ async def healthz(request: Request) -> dict[str, Any]:
         "vram": vram,
         "presence": presence_n,
         "dev_mode": settings.dev_mode,
-        "engine_bridges": active_bridge_count(),
     }
+    if user.role == "admin":
+        result["engine_bridges"] = active_bridge_count()
+        result["provider_streams"] = provider_broker.active_request_count()
+    return result
 
 
 app.include_router(chat_router)
+app.include_router(deployment_drain.router)
 app.include_router(authn_router)
 app.include_router(oauth_router)
 app.include_router(admin_router)

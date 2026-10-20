@@ -30,11 +30,28 @@ import threading
 import time
 from pathlib import Path
 from typing import Iterator
+from contextvars import copy_context
+from services.agent.request_context import owner_key
 
 from .registry import ProviderRegistry
 from .index import PartsIndex
 
 log = logging.getLogger(__name__)
+
+_LIVE_THREADS: dict[threading.Thread, tuple[str, str] | None] = {}
+_LIVE_LOCK = threading.Lock()
+
+
+def worker_activity() -> dict:
+    from services.worker_activity import registry_lock
+
+    owner = owner_key()
+    with registry_lock(_LIVE_LOCK):
+        for thread in list(_LIVE_THREADS):
+            if thread.ident is not None and not thread.is_alive():
+                _LIVE_THREADS.pop(thread)
+        count = sum(stored_owner == owner for stored_owner in _LIVE_THREADS.values())
+    return {"by_kind": {"parts_hub_search": count}}
 
 # Overall wall-clock budget for the synchronous live-vendor fan-out (seconds).
 # Override with CHUDWARE_PARTS_LIVE_BUDGET_S. Per-site budget defaults to the same
@@ -418,13 +435,24 @@ class PartsHub:
         for p in providers:
             site = str(getattr(p, "site", None)
                        or getattr(p, "provider_id", "x") or "x")
+            context = copy_context()
             t = threading.Thread(
-                target=_worker, args=(p,),
+                target=context.run, args=(_worker, p),
                 name=f"parts-live-{site}",
                 daemon=True,
             )
             threads.append(t)
-            t.start()
+            with _LIVE_LOCK:
+                for finished in list(_LIVE_THREADS):
+                    if finished.ident is not None and not finished.is_alive():
+                        _LIVE_THREADS.pop(finished)
+                _LIVE_THREADS[t] = owner_key()
+            try:
+                t.start()
+            except BaseException:
+                with _LIVE_LOCK:
+                    _LIVE_THREADS.pop(t, None)
+                raise
 
         deadline = time.monotonic() + budget
         live_results: list[dict] = []

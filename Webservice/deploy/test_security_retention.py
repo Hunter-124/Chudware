@@ -87,3 +87,10 @@ def test_main_surfaces_failure_without_dsn(monkeypatch, capsys):
     monkeypatch.delenv("CHUDWARE_DB_URL", raising=False)
     assert retention.main() == 2
     assert "CHUDWARE_DB_URL is required" in capsys.readouterr().err
+
+def test_staging_retention_rejects_foreign_database_before_connecting(monkeypatch, capsys):
+    monkeypatch.setenv("CHUDWARE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("CHUDWARE_DB_URL", "postgresql://chudware_prod:fixture@localhost/chudware_prod")
+    monkeypatch.setattr(retention.psycopg, "connect", lambda *_: pytest.fail("foreign database must not be contacted"))
+    assert retention.main() == 1
+    assert "fixture" not in capsys.readouterr().err

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstring>
 #include <vector>
+#include <memory>
 
 #include <fcntl.h>
 #include <signal.h>
@@ -15,6 +16,7 @@
 #include <unistd.h>
 
 #include "hostd_log.h"
+#include "../../services/ipc/ipc_private.h"
 #include "security/integrity.h"
 #include "security/runtime_guard.h"
 #include "util/platform_paths.h"
@@ -47,6 +49,7 @@ static bool cloexecPipe(int fds[2]) {
         if (fl < 0 || ::fcntl(fds[i], F_SETFD, fl | FD_CLOEXEC) != 0) {
             ::close(fds[0]);
             ::close(fds[1]);
+            fds[0] = fds[1] = -1;
             return false;
         }
     }
@@ -101,16 +104,18 @@ void ChildSupervisor::emitExited(const Child& c, int status) {
     int sig = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
     log().line("child %s (pid %ld) exited: code=%d signal=%d mission=%s",
                c.childId.c_str(), (long)c.pid, exitCode, sig, c.missionId.c_str());
-    if (!broadcast_) return;
-    json evt = {{"event", "mission.exited"},
-                {"data",
-                 {{"child_id", c.childId},
-                  {"pid", (long)c.pid},
-                  {"exit_code", exitCode},
-                  {"signal", sig},
-                  {"mission_id", c.missionId},
-                  {"doc_id", c.docId}}}};
-    broadcast_(evt.dump());
+    try {
+        if (!broadcast_) return;
+        json evt = {{"event", "mission.exited"},
+                    {"data",
+                     {{"child_id", c.childId},
+                      {"pid", (long)c.pid},
+                      {"exit_code", exitCode},
+                      {"signal", sig},
+                      {"mission_id", c.missionId},
+                      {"doc_id", c.docId}}}};
+        broadcast_(evt.dump());
+    } catch (...) { log().line("child exit event delivery failed"); }
 }
 
 bool ChildSupervisor::reapLocked(std::map<std::string, Child>::iterator it, int waitFlags) {
@@ -134,8 +139,7 @@ void ChildSupervisor::reaperLoop() {
             SpawnReq* req = pendingSpawns_.front();
             pendingSpawns_.pop_front();
             lk.unlock();
-            doSpawn(*req);
-            req->done.set_value();
+            completeSpawn(*req);
             lk.lock();
         }
         const long long now = monoMs();
@@ -167,9 +171,7 @@ void ChildSupervisor::reaperLoop() {
     while (!pendingSpawns_.empty()) {
         SpawnReq* req = pendingSpawns_.front();
         pendingSpawns_.pop_front();
-        req->isError = true;
-        req->result = json{{"code", "draining"}, {"message", "daemon is shutting down"}};
-        req->done.set_value();
+        completeSpawn(*req, true);
     }
 }
 
@@ -248,6 +250,10 @@ bool ChildSupervisor::handleMethod(int clientId, const std::string& method,
     }
 
     if (method != "agent_spawn") return false;
+    if (!validateSpawn(params, result)) {
+        isError = true;
+        return true;
+    }
 
     // ---- agent_spawn: hand off to the reaper thread (PDEATHSIG, see SpawnReq)
     SpawnReq req;
@@ -264,7 +270,7 @@ bool ChildSupervisor::handleMethod(int clientId, const std::string& method,
         pendingSpawns_.push_back(&req);
     }
     cv_.notify_all();
-    fut.wait();
+    fut.get();
     result = std::move(req.result);
     isError = req.isError;
     return true;
@@ -294,13 +300,8 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
         return;
     }
 
-    if (!params.contains("argv") || !params["argv"].is_array() || params["argv"].empty()) {
-        isError = true;
-        result = json{{"code", "bad_params"}, {"message", "agent_spawn needs a non-empty argv array"}};
-        return;
-    }
     std::vector<std::string> argvS;
-    for (auto& a : params["argv"]) argvS.push_back(a.is_string() ? a.get<std::string>() : a.dump());
+    for (const auto& a : params["argv"]) argvS.push_back(a.get<std::string>());
 
     // Child environment = daemon env + caller overrides (built BEFORE fork —
     // setenv after fork in a threaded process is not async-signal-safe).
@@ -311,7 +312,7 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
     }
     if (params.contains("env") && params["env"].is_object())
         for (auto& [k, v] : params["env"].items())
-            env[k] = v.is_string() ? v.get<std::string>() : v.dump();
+            env[k] = v.get<std::string>();
     std::vector<std::string> envS;
     for (auto& [k, v] : env) envS.push_back(k + "=" + v);
 
@@ -321,9 +322,41 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
         childId = "agent-" + std::to_string((long)::getpid()) + "-" + std::to_string(nextId_++);
     }
     if (!logDir_.empty()) {
-        ::mkdir(logDir_.c_str(), 0700);  // stateDir()/logs usually exists already
+        if (!chudware_ipc::privateDir(logDir_)) {
+            isError = true;
+            result = {{"code", "spawn_failed"}, {"message", "cannot create private child log directory"}};
+            return;
+        }
         logPath = logDir_ + "/" + childId + ".log";
     }
+    std::unique_ptr<FILE, decltype(&std::fclose)> logStream(
+        logPath.empty() ? nullptr : chudware_ipc::privateFile(logPath, true, true), &std::fclose);
+    if (!logPath.empty() && !logStream) {
+        isError = true;
+        result = {{"code", "spawn_failed"}, {"message", "cannot create private child log"}};
+        return;
+    }
+    const int logfd = logStream ? ::fileno(logStream.get()) : -1;
+    Child c;
+    c.childId = childId;
+    c.missionId = params.value("mission_id", "");
+    c.docId = params.value("doc_id", "");
+    c.logPath = logPath;
+    c.spawnerClient = clientId;
+    c.spawnedMs = monoMs();
+
+    struct SpawnGuard {
+        int ep[2] = {-1, -1};
+        pid_t pid = -1;
+        ~SpawnGuard() {
+            for (int fd : ep) if (fd >= 0) ::close(fd);
+            if (pid > 0) {
+                ::kill(-pid, SIGKILL);
+                ::kill(pid, SIGKILL);
+                while (::waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+            }
+        }
+    } guard;
 
     std::vector<char*> argv, envp;
     for (auto& s : argvS) argv.push_back(const_cast<char*>(s.c_str()));
@@ -333,7 +366,7 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
 
     // CLOEXEC pipe: a successful exec closes it silently; a failed exec writes
     // errno so the caller gets a synchronous clean error (and no table entry).
-    int ep[2];
+    int* ep = guard.ep;
     if (!cloexecPipe(ep)) {
         isError = true;
         result = json{{"code", "spawn_failed"}, {"message", "pipe failed"}};
@@ -343,8 +376,8 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
     const pid_t parentPid = ::getpid();
     const pid_t pid = ::fork();
     if (pid < 0) {
-        ::close(ep[0]);
-        ::close(ep[1]);
+        ::close(ep[0]); ep[0] = -1;
+        ::close(ep[1]); ep[1] = -1;
         isError = true;
         result = json{{"code", "spawn_failed"}, {"message", "fork failed"}};
         return;
@@ -356,13 +389,14 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
         // Darwin. Never returns if the daemon already died.
         chudware::platform::guardParentDeath(parentPid);
         int devnull = ::open("/dev/null", O_RDONLY);
-        if (devnull >= 0) ::dup2(devnull, 0);
-        int logfd = logPath.empty() ? -1
-                                    : ::open(logPath.c_str(),
-                                             O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (devnull >= 0) {
+            ::dup2(devnull, 0);
+            if (devnull > 2) ::close(devnull);
+        }
         if (logfd >= 0) {
             ::dup2(logfd, 1);
             ::dup2(logfd, 2);
+            if (logfd > 2) ::close(logfd);
         }
 #if defined(__linux__)
         ::execvpe(argv[0], argv.data(), envp.data());
@@ -381,39 +415,36 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
     }
 
     // Parent. Mirror the child's setpgid (whoever runs first wins; both same).
+    guard.pid = pid;
     ::setpgid(pid, pid);
-    ::close(ep[1]);
+    ::close(ep[1]); ep[1] = -1;
     int execErrno = 0;
-    ssize_t n = ::read(ep[0], &execErrno, sizeof execErrno);  // EOF = exec succeeded
-    ::close(ep[0]);
-    if (n > 0) {
-        ::waitpid(pid, nullptr, 0);  // reap the stillborn child — no zombie
+    ssize_t n;
+    do { n = ::read(ep[0], &execErrno, sizeof execErrno); } while (n < 0 && errno == EINTR);
+    ::close(ep[0]); ep[0] = -1;
+    if (n != 0) {
         isError = true;
         result = json{{"code", "spawn_failed"},
-                      {"message", std::string("exec failed: ") + strerror(execErrno) +
-                                      " (" + argvS[0] + ")"}};
+                      {"message", n < 0 ? "cannot read exec status" :
+                          std::string("exec failed: ") + strerror(execErrno) +
+                              " (" + argvS[0] + ")"}};
         return;
     }
 
-    Child c;
-    c.childId = childId;
     c.pid = pid;
     c.pgid = pid;
-    c.missionId = params.value("mission_id", "");
-    c.docId = params.value("doc_id", "");
-    c.logPath = logPath;
-    c.spawnerClient = clientId;
-    c.spawnedMs = monoMs();
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        children_[childId] = c;
-    }
-    cv_.notify_all();
-    log().line("spawned child %s pid=%ld argv0=%s mission=%s (client #%d)",
-               childId.c_str(), (long)pid, argvS[0].c_str(), c.missionId.c_str(),
-               clientId);
     result = json{{"child_id", childId}, {"pid", (long)pid}, {"pgid", (long)pid},
                   {"log", logPath}};
+    const std::string missionId = c.missionId;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        children_.emplace(childId, std::move(c));
+    }
+    guard.pid = -1;  // table owns the child only after all throwing work succeeds
+    cv_.notify_all();
+    log().line("spawned child %s pid=%ld argv0=%s mission=%s (client #%d)",
+               childId.c_str(), (long)pid, argvS[0].c_str(), missionId.c_str(),
+               clientId);
 
 }
 

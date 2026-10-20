@@ -10,11 +10,27 @@ import copy
 import threading
 import time
 import uuid
+from contextvars import copy_context
 
+from services.agent.request_context import owner_key
 from services.piping import fitting_cfd
 
 _LOCK = threading.Lock()
 _JOBS: dict[str, dict] = {}
+_THREADS: dict[str, threading.Thread] = {}
+
+
+def worker_activity() -> dict:
+    from services.worker_activity import registry_lock
+
+    with registry_lock(_LOCK):
+        for job_id, thread in list(_THREADS.items()):
+            if thread.ident is not None and not thread.is_alive():
+                _THREADS.pop(job_id)
+        owner = owner_key()
+        return {"by_kind": {"piping_cfd": sum(
+            (entry["state"] == "running" or job_id in _THREADS)
+            and entry.get("_owner") == owner for job_id, entry in _JOBS.items())}}
 
 
 def _snapshot(job_id: str) -> dict:
@@ -22,7 +38,8 @@ def _snapshot(job_id: str) -> dict:
         entry = _JOBS.get(job_id)
         if entry is None:
             return {"ok": False, "reason": "unknown_job", "hint": "CFD-K job not found in this worker", "job_id": job_id}
-        return copy.deepcopy({k: v for k, v in entry.items() if k != "cancel_event"})
+        return copy.deepcopy({k: v for k, v in entry.items()
+                              if k not in {"cancel_event", "_owner"}})
 
 
 def _run(job_id: str, params: dict, event: threading.Event) -> None:
@@ -77,9 +94,24 @@ def start(params: dict, _emit_event=None) -> dict:
     event = threading.Event()
     with _LOCK:
         _JOBS[job_id] = {"ok": True, "job_id": job_id, "state": "running", "pct": 0,
-                         "stage": "Preparing fitting CFD", "started_at": time.time(), "cancel_event": event}
-    threading.Thread(target=_run, args=(job_id, copy.deepcopy(params), event),
-                     name=job_id, daemon=True).start()
+                         "stage": "Preparing fitting CFD", "started_at": time.time(),
+                         "cancel_event": event, "_owner": owner_key()}
+    context = copy_context()
+    thread = threading.Thread(target=context.run,
+                              args=(_run, job_id, copy.deepcopy(params), event),
+                              name=job_id, daemon=True)
+    with _LOCK:
+        for finished_id, finished in list(_THREADS.items()):
+            if finished.ident is not None and not finished.is_alive():
+                _THREADS.pop(finished_id)
+        _THREADS[job_id] = thread
+    try:
+        thread.start()
+    except BaseException:
+        with _LOCK:
+            _THREADS.pop(job_id, None)
+            _JOBS[job_id].update(state="failed", stage="failed", reason="cfd_job_failed")
+        raise
     return {"ok": True, "job_id": job_id}
 
 

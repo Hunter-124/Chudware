@@ -542,3 +542,70 @@ class TestMCPTools:
         result2 = tools["workspace_doc_events"](run_id=run_id, doc_id="doc1", since_seq=1)
         assert result2["count"] == 1
         assert result2["events"][0]["event"] == "doc.rebuilt"
+
+
+def test_cell_leases_sessions_and_events_are_actor_private(tmp_path, monkeypatch):
+    import hashlib
+    from services.agent import request_context as ctx
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "state"))
+    from services.mcp.workspace_tools import register_workspace_tools
+    stub, tools = TestMCPTools()._make_mcp_stub()
+    register_workspace_tools(stub)
+
+    def principal(actor):
+        return {"cell": True, "workspace_key": "team:shared", "actor_key": actor,
+                "actor_hex": hashlib.sha256(actor.encode()).hexdigest()[:32],
+                "right": "editor", "epoch": 1}
+
+    run_id, doc_id = "../same-run", "/same-doc"
+    with ctx.bind_context(principal("alice")):
+        alice = WorkspaceSession(run_id)
+        register_session(alice)
+        alice.open_assembly_doc(doc_id, "alice-agent")
+        bind_mutation_guard(alice.registry, "alice-agent")
+        assert check_write_lease(doc_id, "edit") is None
+        assert _session_registry[run_id] is alice
+        assert read_doc_events(run_id, doc_id)
+
+    with ctx.bind_context(principal("bob")):
+        assert list(_session_registry) == []
+        refusal = {"ok": False, "error": "not_found", "reason": "not_found"}
+        assert tools["workspace_status"](run_id=run_id) == refusal
+        assert tools["workspace_status"](run_id="absent") == refusal
+        assert tools["workspace_doc_events"](run_id=run_id, doc_id=doc_id) == refusal
+        assert tools["workspace_doc_events"](run_id="absent", doc_id=doc_id) == refusal
+        with pytest.raises(KeyError, match="not_found"):
+            _session_registry[run_id]
+        with pytest.raises(KeyError, match="not_found"):
+            read_doc_events(run_id, doc_id)
+        for operation in (
+            lambda: alice.workspace_status(),
+            lambda: alice.registry.open_doc("new-doc", "bob-agent"),
+            lambda: alice.registry.write_owner(doc_id),
+            lambda: alice.registry.is_reader(doc_id, "alice-agent"),
+            lambda: alice.registry.acquire_write(doc_id, "bob-agent"),
+            lambda: alice.registry.steal(doc_id, "bob-agent"),
+            lambda: alice.registry.release(doc_id, "alice-agent"),
+            lambda: alice.registry.close_doc(doc_id, "alice-agent"),
+            lambda: alice.record_render(doc_id, "/foreign-image"),
+            lambda: bind_mutation_guard(alice.registry, "bob-agent"),
+        ):
+            with pytest.raises(KeyError, match="not_found"):
+                operation()
+        bob = WorkspaceSession(run_id)
+        register_session(bob)
+        bob.open_assembly_doc(doc_id, "bob-agent")
+        assert _session_registry[run_id] is bob
+        assert [d["write_owner"] for d in bob.workspace_status()["docs"]] == ["bob-agent"]
+        assert tools["workspace_status"](run_id=run_id)["docs"][0]["write_owner"] == "bob-agent"
+        assert tools["workspace_doc_events"](run_id=run_id, doc_id=doc_id)["ok"]
+        assert all(e["tenant_owner"][1] == "bob" for e in read_doc_events(run_id, doc_id))
+        unregister_session(run_id)
+
+    with ctx.bind_context(principal("alice")):
+        assert _session_registry[run_id] is alice
+        assert alice.registry.write_owner(doc_id) == "alice-agent"
+        assert all(e["tenant_owner"][1] == "alice" for e in read_doc_events(run_id, doc_id))
+        unbind_mutation_guard()
+        unregister_session(run_id)
+    assert not (tmp_path / "same-run").exists()

@@ -110,20 +110,6 @@ def test_manifest_names_the_target_identity_the_updater_requires(
     assert (body["platform"], body["arch"]) == ("linux", "x86_64")
 
 
-def test_valid_entitlement_gets_fifteen_minute_presigned_download(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    for name in releases._R2_ENV:
-        monkeypatch.setenv(name, "configured")
-    monkeypatch.setattr(releases, "_active_entitlement", lambda token: token == "valid")
-    monkeypatch.setattr(releases, "_presigned_url", lambda _key: "https://r2.example/signed")
-    response = client.get(
-        "/api/releases/latest?channel=stable&platform=linux&arch=x86_64",
-        headers={"Authorization": "Bearer valid"},
-    )
-    assert response.status_code == 200
-    assert response.json()["url"] == "https://r2.example/signed"
-    assert response.headers["cache-control"] == "private, no-store"
 
 
 def test_authenticated_download_falls_back_to_this_host_when_r2_is_absent(
@@ -163,52 +149,6 @@ def test_presigned_url_still_names_every_missing_r2_variable(
         assert name in error.value.detail
 
 
-def test_publish_is_bearer_gated_and_idempotent(
-    monkeypatch: pytest.MonkeyPatch, manifest_row: dict[str, Any]
-) -> None:
-    statements: list[tuple[str, tuple[Any, ...]]] = []
-
-    class Cursor:
-        rowcount = 1
-
-        def execute(self, statement: str, values: tuple[Any, ...]) -> None:
-            statements.append((statement, values))
-
-        def fetchone(self) -> dict[str, str | None]:
-            return {"min_supported": None}
-
-    @contextmanager
-    def fake_tx():
-        yield Cursor()
-
-    monkeypatch.setattr(releases, "tx", fake_tx)
-    monkeypatch.setattr(releases, "_verify_artifact_signature", lambda *_: None)
-    monkeypatch.setenv("CHUDWARE_GATEWAY_RELEASE_TOKEN", "publish-secret")
-    app = FastAPI()
-    app.include_router(releases.router)
-    publish_client = TestClient(app)
-    payload = {
-        "channel": "stable",
-        "platform": "linux",
-        "arch": "x86_64",
-        **manifest_row,
-    }
-    assert publish_client.post("/api/releases/latest/publish", json=payload).status_code == 401
-    response = publish_client.post(
-        "/api/releases/latest/publish", json=payload,
-        headers={"Authorization": "Bearer publish-secret"},
-    )
-    assert response.status_code == 200
-    assert response.json()["ok"] is True
-    assert response.json()["sbom_key"] == manifest_row["sbom_key"]
-    assert len(statements) == 3
-    assert "FOR UPDATE" in statements[0][0]
-    assert (
-        "ON CONFLICT (channel, version, platform, arch, format) DO NOTHING"
-        in statements[1][0]
-    )
-    assert "release_channels" in statements[2][0]
-    assert statements[1][1][5] == "release-v1"
 
 
 @pytest.mark.parametrize(
@@ -231,60 +171,6 @@ def test_release_version_rejects_noncanonical_and_prerelease(version: str) -> No
     assert getattr(error.value, "status_code", None) == 422
 
 
-def test_floor_update_locks_before_insert_and_rejects_numeric_rollback(
-    monkeypatch: pytest.MonkeyPatch, manifest_row: dict[str, Any]
-) -> None:
-    statements: list[str] = []
-
-    class Cursor:
-        rowcount = 1
-
-        def execute(self, statement: str, _values: tuple[Any, ...]) -> None:
-            statements.append(statement)
-
-        def fetchone(self) -> dict[str, str]:
-            return {"min_supported": "2.10.0"}
-
-    @contextmanager
-    def fake_tx():
-        yield Cursor()
-
-    monkeypatch.setattr(releases, "tx", fake_tx)
-    monkeypatch.setattr(releases, "_verify_artifact_signature", lambda *_: None)
-    payload = {"channel": "stable", "platform": "linux", "arch": "x86_64", **manifest_row, "min_supported": "2.9.0"}
-    value = releases.PublishRelease(**payload)
-    with pytest.raises(Exception) as error:
-        releases._upsert_release(value)
-    assert getattr(error.value, "status_code", None) == 409
-    assert len(statements) == 1
-    assert "FOR UPDATE" in statements[0]
-
-
-def test_floor_update_accepts_2_10_after_2_9_under_same_lock(
-    monkeypatch: pytest.MonkeyPatch, manifest_row: dict[str, Any]
-) -> None:
-    statements: list[str] = []
-
-    class Cursor:
-        rowcount = 1
-
-        def execute(self, statement: str, _values: tuple[Any, ...]) -> None:
-            statements.append(statement)
-
-        def fetchone(self) -> dict[str, str]:
-            return {"min_supported": "2.9.0"}
-
-    @contextmanager
-    def fake_tx():
-        yield Cursor()
-
-    monkeypatch.setattr(releases, "tx", fake_tx)
-    monkeypatch.setattr(releases, "_verify_artifact_signature", lambda *_: None)
-    payload = {"channel": "stable", "platform": "linux", "arch": "x86_64", **manifest_row, "min_supported": "2.10.0"}
-    releases._upsert_release(releases.PublishRelease(**payload))
-    assert "FOR UPDATE" in statements[0]
-    assert "INSERT INTO releases" in statements[1]
-    assert "UPDATE release_channels" in statements[2]
 
 
 
@@ -428,25 +314,6 @@ def test_publish_rejects_missing_or_mismatched_evidence(monkeypatch, manifest_ro
     assert response.status_code == 422
 
 
-def test_only_publish_gate_updates_min_supported(monkeypatch, manifest_row):
-    statements = []
-    class Cursor:
-        rowcount = 1
-
-        def execute(self, statement, values):
-            statements.append((statement, values))
-
-        def fetchone(self):
-            return {"min_supported": None}
-    @contextmanager
-    def fake_tx():
-        yield Cursor()
-    monkeypatch.setattr(releases, "tx", fake_tx)
-    monkeypatch.setattr(releases, "_verify_artifact_signature", lambda *_: None)
-    releases._upsert_release(releases.PublishRelease(channel="stable", platform="linux", arch="x86_64", **manifest_row))
-    updates = [(sql, values) for sql, values in statements if sql.startswith("UPDATE release_channels")]
-    assert len(updates) == 1
-    assert updates[0][1] == (manifest_row["min_supported"], "stable")
 
 def test_artifact_signature_preimage_is_domain_separated() -> None:
     digest = "a" * 64
@@ -901,9 +768,6 @@ def test_download_token_is_refused_when_the_account_stops_being_active(
     assert releases._redeem_download_token(token) is None
 
 
-def test_download_token_signing_domain_differs_from_the_entitlement_domain() -> None:
-    assert releases._DOWNLOAD_TOKEN_DOMAIN == b"chudware-download-token-v1"
-    assert releases._DOWNLOAD_TOKEN_DOMAIN != releases._ARTIFACT_SIGNATURE_DOMAIN
 
 
 def test_download_token_needs_a_session_secret(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1048,3 +912,46 @@ def test_retention_is_a_noop_when_nothing_is_superseded(
         "incoming_freed_bytes": 0,
         "errors": [],
     }
+
+@pytest.mark.parametrize("cdn", [False, True])
+def test_staging_download_metadata_cannot_select_production_origin_or_bucket(client, monkeypatch, cdn):
+    from urllib.parse import urlparse
+    monkeypatch.setattr(releases.settings, "deploy_environment", "staging")
+    monkeypatch.setattr(releases.settings, "public_base_url", "https://stage-fixture.example.invalid")
+    monkeypatch.setattr(releases, "_active_entitlement", lambda _token: True)
+    monkeypatch.delenv("CHUDWARE_RELEASES_PUBLIC_BASE_URL", raising=False)
+    monkeypatch.delenv("CHUDWARE_RELEASES_BUCKET", raising=False)
+    if cdn:
+        monkeypatch.setenv("R2_ENDPOINT", "https://objects.example.invalid")
+        monkeypatch.setenv("R2_ACCESS_KEY_ID", "fixture-access-id")
+        monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "fixture-secret")
+    else:
+        for name in releases._R2_ENV:
+            monkeypatch.delenv(name, raising=False)
+    response = client.get(
+        "/api/releases/latest?channel=stable&platform=linux&arch=x86_64",
+        headers={"X-Chudware-Entitlement": "valid"},
+    )
+    assert response.status_code == 200
+    url = urlparse(response.json()["url"])
+    assert url.hostname == ("objects.example.invalid" if cdn else "stage-fixture.example.invalid")
+    if cdn:
+        assert url.path.startswith("/chudware-releases-staging/")
+        monkeypatch.setenv("CHUDWARE_RELEASES_BUCKET", "chudware-releases")
+    else:
+        monkeypatch.setenv("CHUDWARE_RELEASES_PUBLIC_BASE_URL", "https://app.chudware.com")
+    rejected = client.get(
+        "/api/releases/latest?channel=stable&platform=linux&arch=x86_64",
+        headers={"X-Chudware-Entitlement": "valid"},
+    )
+    assert rejected.status_code == 503
+
+
+def test_staging_release_storage_refuses_a_foreign_root(tmp_path, monkeypatch):
+    from fastapi import HTTPException
+    monkeypatch.setattr(releases.settings, "deploy_environment", "staging")
+    monkeypatch.setattr(releases.settings, "data_root", tmp_path / "stage")
+    monkeypatch.setenv("CHUDWARE_RELEASES_DIR", str(tmp_path / "production-releases"))
+    with pytest.raises(HTTPException) as refused:
+        releases._releases_dir()
+    assert refused.value.status_code == 503

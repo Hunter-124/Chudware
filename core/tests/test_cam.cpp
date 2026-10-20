@@ -6,6 +6,9 @@
 
 #include <cmath>
 #include <cctype>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <filesystem>
@@ -19,6 +22,7 @@
 #include "cam/session.h"
 #include "cam/model.h"
 
+#include <miniz.h>
 using namespace chudware::cam;
 
 namespace {
@@ -1187,6 +1191,218 @@ TEST_CASE("session: new / apply_ops / generate / post / undo / save+open") {
     CHECK(cam_close(doc2));
 }
 
+namespace {
+struct CamArchiveFixture {
+    std::filesystem::path directory = std::filesystem::temp_directory_path() /
+        ("chudware-cam-archive-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::path path = directory / "fixture.cam+";
+
+    CamArchiveFixture() { REQUIRE(std::filesystem::create_directory(directory)); }
+    ~CamArchiveFixture() {
+        std::error_code ignored;
+        std::filesystem::remove_all(directory, ignored);
+    }
+    void write(const std::string& bytes) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        REQUIRE(out.good());
+    }
+};
+
+std::string cam_fixture_zip(const std::vector<std::pair<std::string, std::string>>& entries,
+                            mz_uint level = MZ_DEFAULT_COMPRESSION) {
+    mz_zip_archive zip{};
+    REQUIRE(mz_zip_writer_init_heap(&zip, 0, 0));
+    for (const auto& [name, bytes] : entries)
+        REQUIRE(mz_zip_writer_add_mem(&zip, name.c_str(), bytes.data(), bytes.size(), level));
+    void* bytes = nullptr;
+    std::size_t size = 0;
+    REQUIRE(mz_zip_writer_finalize_heap_archive(&zip, &bytes, &size));
+    std::string result(static_cast<const char*>(bytes), size);
+    mz_free(bytes);
+    mz_zip_writer_end(&zip);
+    return result;
+}
+
+std::size_t cam_zip_directory(const std::string& bytes) {
+    const auto pos = bytes.find(std::string("PK\x01\x02", 4));
+    REQUIRE(pos != std::string::npos);
+    return pos;
+}
+
+void cam_zip_u32(std::string& bytes, std::size_t at, std::uint32_t value) {
+    REQUIRE(at + 4 <= bytes.size());
+    for (unsigned i = 0; i < 4; ++i)
+        bytes[at + i] = static_cast<char>((value >> (8 * i)) & 0xff);
+}
+}  // namespace
+
+TEST_CASE("session: CAM archives admit metadata and bound actual inflate before publication") {
+    CamArchiveFixture fixture;
+    const json original = cam_new({{"name", "still open"}});
+    const std::string doc = original.at("doc_id").get<std::string>();
+    const long next_seq = std::stol(doc.substr(3)) + 1;
+    const std::string next_id = "cam" + std::to_string(next_seq);
+    auto refused = [&](const char* message) {
+        bool rejected = false;
+        try {
+            cam_open(fixture.path.string());
+        } catch (const OpError& error) {
+            rejected = error.code == "io_error" &&
+                std::string(error.what()).find(message) != std::string::npos;
+        }
+        CHECK(rejected);
+        CHECK(cam_tree(doc).at("tree") == original.at("tree"));
+        CHECK_FALSE(cam_close(next_id));
+    };
+    auto refuse_bytes = [&](const std::string& bytes, const char* message) {
+        fixture.write(bytes);
+        refused(message);
+    };
+
+    std::string bytes = cam_fixture_zip({{"job.json", R"({"name":"budget"})"}});
+    cam_zip_u32(bytes, cam_zip_directory(bytes) + 24, 64 * 1024 * 1024 + 1);
+    refuse_bytes(bytes, "entry byte limit");
+    refuse_bytes(cam_fixture_zip({{"job.json", std::string(1024 * 1024, ' ')}}),
+                 "compression ratio");
+    refuse_bytes(cam_fixture_zip({{"JOB.JSON", "{}"}}), "no job.json");
+    refuse_bytes(cam_fixture_zip({{"job.json", "{}"}, {"job.json", "{}"}}), "duplicate");
+    refuse_bytes(cam_fixture_zip({{"job.json", "{}"}, {"JOB.JSON", "{}"}}), "case-aliased");
+    refuse_bytes(cam_fixture_zip({{"job.json", "{}"}}).substr(0, 20), "invalid");
+
+    bytes = cam_fixture_zip({{"job.json", "{\"name\":\"" + std::string(4096, 'a') + "\"}"}});
+    cam_zip_u32(bytes, cam_zip_directory(bytes) + 24, 1);
+    refuse_bytes(bytes, "cannot inflate");
+    bytes = cam_fixture_zip({{"job.json", "{\"name\":\"crc\"}"}});
+    bytes[cam_zip_directory(bytes) + 16] ^= 1;
+    refuse_bytes(bytes, "cannot inflate");
+    bytes = cam_fixture_zip({{"job.json", "{\"name\":\"truncated\"}"}});
+    const auto central = cam_zip_directory(bytes);
+    const auto compressed = static_cast<unsigned char>(bytes[central + 20]);
+    REQUIRE(compressed > 1);
+    cam_zip_u32(bytes, central + 20, compressed - 1);
+    refuse_bytes(bytes, "cannot inflate");
+
+    std::vector<std::pair<std::string, std::string>> many{{"job.json", "{}"}};
+    for (int i = 0; i < 4096; ++i) many.emplace_back("entry-" + std::to_string(i), "");
+    refuse_bytes(cam_fixture_zip(many), "entry count");
+
+    // Aggregate claims need no aggregate payload. Pad the archive sparsely so
+    // each claimed compressed span is in-bounds and below the ratio ceiling.
+    bytes = cam_fixture_zip({{"job.json", R"({"name":"budget"})"},
+                             {"a", std::string(128, 'a')}, {"b", std::string(128, 'b')},
+                             {"c", std::string(128, 'c')}, {"d", std::string(128, 'd')}});
+    std::size_t pos = 0;
+    while ((pos = bytes.find(std::string("PK\x01\x02", 4), pos)) != std::string::npos) {
+        cam_zip_u32(bytes, pos + 20, 350000);
+        cam_zip_u32(bytes, pos + 24, 64 * 1024 * 1024);
+        pos += 46;
+    }
+    const auto aggregate_end = bytes.find(std::string("PK\x05\x06", 4));
+    REQUIRE(aggregate_end != std::string::npos);
+    {
+        std::ofstream out(fixture.path, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), static_cast<std::streamsize>(aggregate_end));
+        out.seekp(1024 * 1024);
+        out.write(bytes.data() + aggregate_end,
+                  static_cast<std::streamsize>(bytes.size() - aggregate_end));
+        REQUIRE(out.good());
+    }
+    refused("aggregate byte limit");
+
+    // Sparse hostile directory: a tiny real directory, then a declared 8 MiB
+    // span. The allocator refuses before miniz copies or scans that span.
+    bytes = cam_fixture_zip({{"job.json", "{}"}});
+    const auto directory = cam_zip_directory(bytes);
+    const auto end = bytes.find(std::string("PK\x05\x06", 4));
+    REQUIRE(end != std::string::npos);
+    cam_zip_u32(bytes, end + 12, 8 * 1024 * 1024 + 1);
+    {
+        std::ofstream out(fixture.path, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), static_cast<std::streamsize>(end));
+        out.seekp(static_cast<std::streamoff>(directory + 8 * 1024 * 1024 + 1));
+        out.write(bytes.data() + end, static_cast<std::streamsize>(bytes.size() - end));
+        REQUIRE(out.good());
+    }
+    refused("central-directory");
+    {
+        std::ofstream out(fixture.path, std::ios::binary | std::ios::trunc);
+        out.seekp(256 * 1024 * 1024);
+        out.put('\0');
+        REQUIRE(out.good());
+    }
+    refused("archive byte limit");
+
+    // Failed opens neither mint session ids nor alter an existing live job.
+    const std::string after = cam_new({{"name", "after refusals"}}).at("doc_id");
+    CHECK(after == next_id);
+    CHECK(cam_close(after));
+    CHECK(cam_close(doc));
+}
+
+TEST_CASE("session: CAM archive JSON work is bounded and saved recipes remain editable") {
+    CamArchiveFixture fixture;
+    const std::string sentinel = cam_new({{"name", "parse sentinel"}}).at("doc_id");
+    const std::string next_id = "cam" + std::to_string(std::stol(sentinel.substr(3)) + 1);
+    auto refused_parse = [&](const std::string& data) {
+        fixture.write(cam_fixture_zip({{"job.json", data}}, MZ_NO_COMPRESSION));
+        bool rejected = false;
+        try {
+            cam_open(fixture.path.string());
+        } catch (const OpError& error) {
+            rejected = error.code == "parse_error" &&
+                std::string(error.what()).find("parse work limit") != std::string::npos;
+        }
+        CHECK(rejected);
+        CHECK_FALSE(cam_close(next_id));
+        CHECK(cam_tree(sentinel).at("tree").at("name") == "parse sentinel");
+    };
+    refused_parse("{\"post_options\":" + std::string(256, '[') + "0" +
+                  std::string(256, ']') + "}");
+    std::string many_values = "{\"post_options\":{\"values\":[";
+    for (int i = 0; i < 1000000; ++i) many_values += "0,";
+    many_values += "0]}}";
+    refused_parse(many_values);
+    const std::string after = cam_new({{"name", "after parse refusal"}}).at("doc_id");
+    CHECK(after == next_id);
+    CHECK(cam_close(after));
+    CHECK(cam_close(sentinel));
+
+    Job job;
+    job.id = "persistent-job";
+    job.name = "Editable";
+    job.post_options = {{"program_name", "Bracket"}, {"notes", "human recipe"}};
+    Setup setup;
+    setup.id = "setup1";
+    Operation operation;
+    operation.id = "contour1";
+    operation.geometry = {{"regions", json::array({to_json(square(0, 0, 10))})}};
+    setup.operations.push_back(operation);
+    job.setups.push_back(setup);
+    fixture.write(cam_fixture_zip({{"job.json", job.to_json().dump()}}));
+    const std::string doc = cam_open(fixture.path.string()).at("doc_id");
+    cam_apply_ops(doc, -1, json::array({{{"op", "set_job"}, {"name", "Human edit"}}}));
+    cam_save(doc, fixture.path.string());
+    mz_zip_archive saved{};
+    REQUIRE(mz_zip_reader_init_file(&saved, fixture.path.string().c_str(), 0));
+    const int index = mz_zip_reader_locate_file(&saved, "job.json", nullptr,
+                                               MZ_ZIP_FLAG_CASE_SENSITIVE);
+    REQUIRE(index >= 0);
+    mz_zip_archive_file_stat stat{};
+    REQUIRE(mz_zip_reader_file_stat(&saved, static_cast<mz_uint>(index), &stat));
+    std::string data(static_cast<std::size_t>(stat.m_uncomp_size), '\0');
+    REQUIRE(mz_zip_reader_extract_to_mem(&saved, static_cast<mz_uint>(index),
+                                         data.data(), data.size(), 0));
+    mz_zip_reader_end(&saved);
+    job.name = "Human edit";
+    CHECK(json::parse(data) == job.to_json());
+    const std::string reopened = cam_open(fixture.path.string()).at("doc_id");
+    CHECK(cam_tree(reopened).at("tree").at("name") == "Human edit");
+    CHECK(cam_close(reopened));
+    CHECK(cam_close(doc));
+}
+
 TEST_CASE("session: stale-doc + reference data RPCs") {
     bool threw = false;
     try { cam_tree("nonexistent_doc"); } catch (const OpError& e) { threw = (e.code == "unknown_doc"); }
@@ -1706,4 +1922,52 @@ TEST_CASE("post: tool re-change warning when T1 ops are separated (wave 5)") {
         }
     }
     CHECK(found);
+}
+
+TEST_CASE("CAM lifecycle dirty count follows save edit undo redo and close") {
+    std::uint64_t before = 0, count = 0;
+    REQUIRE(dirty_document_count(before));
+    const auto id = cam_new(nlohmann::json{{"name", "Activity"}})["doc_id"].get<std::string>();
+    const auto path = std::filesystem::temp_directory_path() / (id + "-activity.cam+");
+    struct RemoveFile {
+        std::filesystem::path path;
+        ~RemoveFile() { std::error_code ec; std::filesystem::remove(path, ec); }
+    } remove{path};
+    REQUIRE(dirty_document_count(count));
+    CHECK(count == before + 1);
+    cam_save(id, path.string());
+    count = 0; REQUIRE(dirty_document_count(count)); CHECK(count == before);
+    cam_apply_ops(id, -1, nlohmann::json::array());
+    count = 0; REQUIRE(dirty_document_count(count)); CHECK(count == before + 1);
+    cam_save(id, path.string());
+    cam_undo(id);
+    count = 0; REQUIRE(dirty_document_count(count)); CHECK(count == before + 1);
+    cam_save(id, path.string());
+    cam_redo(id);
+    count = 0; REQUIRE(dirty_document_count(count)); CHECK(count == before + 1);
+    REQUIRE(cam_close(id));
+    count = 0; REQUIRE(dirty_document_count(count)); CHECK(count == before);
+    const auto opened = cam_open(path.string())["doc_id"].get<std::string>();
+    count = 0; REQUIRE(dirty_document_count(count)); CHECK(count == before);
+    REQUIRE(cam_close(opened));
+}
+
+TEST_CASE("CAM lifecycle retains an applied edit when a later batch op refuses") {
+    std::uint64_t before = 0, count = 0;
+    REQUIRE(dirty_document_count(before));
+    const auto id = cam_new(nlohmann::json{{"name", "Before"}})["doc_id"].get<std::string>();
+    const auto path = std::filesystem::temp_directory_path() / (id + "-partial-activity.cam+");
+    struct RemoveFile {
+        std::filesystem::path path;
+        ~RemoveFile() { std::error_code ec; std::filesystem::remove(path, ec); }
+    } remove{path};
+    cam_save(id, path.string());
+    CHECK_THROWS(cam_apply_ops(id, -1, nlohmann::json::array({
+        {{"op", "set_job"}, {"name", "Unsaved edit"}},
+        {{"op", "not_a_cam_operation"}},
+    })));
+    CHECK(cam_tree(id)["tree"]["name"] == "Unsaved edit");
+    REQUIRE(dirty_document_count(count));
+    CHECK(count == before + 1);
+    REQUIRE(cam_close(id));
 }

@@ -23,7 +23,7 @@
 //      the matrix does not list as supported.
 //   2. Settings. Each frame the setup form is visible:
 //          bool commit = drawTopologySettings(st, study["topology"], caps,
-//          settingsView, locked, groups);
+//          settingsView, locked, groups, study, additiveControls);
 //      `groups` (SettingsGroup bits) picks the sections: kGroupsSolver on the
 //      Study page, kGroupsManufacturing on the Regions/Manufacturing page.
 //      `topology` is edited IN PLACE. Only `method`, `physics`, `objective` and
@@ -36,7 +36,7 @@
 //      the study then. Keystrokes in an active field are not committed. `locked` (nullptr
 //      = editable) renders the form read-only with that reason, e.g. while a
 //      run owns the study.
-//   3. Run gating. Before starting a run call validateTopology(topology, caps)
+//   3. Run gating. Before starting a run call validateTopology(topology, caps, study)
 //   and refuse while
 //      hasBlocking(issues); show the issue messages. drawTopologySettings lists
 //      the same issues.
@@ -191,7 +191,8 @@ struct Issue {
 // Keys outside scalarKeys() are not judged (the service boundary validates
 // them).
 std::vector<Issue> validateTopology(const nlohmann::json &topology,
-                                    const Capabilities &caps);
+                                    const Capabilities &caps,
+                                    const nlohmann::json &study = nlohmann::json());
 bool hasBlocking(const std::vector<Issue> &issues);
 
 // A minimal new config for `physics`: {physics, method, objective} using the
@@ -199,6 +200,16 @@ bool hasBlocking(const std::vector<Issue> &issues);
 // Empty object when no method supports `physics`. Writes no numeric value.
 nlohmann::json newTopologyConfig(const Capabilities &caps,
                                  const std::string &physics);
+
+// Explicit preset application: overwrite offered topology keys, erase nulls,
+// and retain the preset id on the canonical study.
+bool applyPrintProcess(nlohmann::json &study, const nlohmann::json &preset,
+                       const Capabilities &caps);
+// Merge a completed worker DFAM reply without replacing existing evidence.
+bool mergeDfamResult(nlohmann::json &run, const nlohmann::json &reply,
+                     const std::string &error = {});
+// Prefer a current print surface; otherwise use the raw reconstructed surface.
+std::string surfaceArtifactKey(const nlohmann::json &result);
 
 struct SwitchResult {
   bool applied = false;
@@ -289,10 +300,9 @@ struct SettingsView {
   // while the stored vector equals a preset (or nothing has been typed yet).
   bool customDirection = false;
   std::string switchNote; // last method/physics switch consequence
-  // One-shot: the next draw that includes the manufacturing groups (symmetry,
-  // extrusion, additive) scrolls them to the top of the caller's scrolling
-  // child, then clears.
+  // One-shot: scroll the Additive manufacturing card to the top of the body.
   bool focusManufacturing = false;
+  int printProcessIndex = -1;
   // Disclosure of the collapsed "Formulation" card under Problem (the solver's
   // formulation and validity text; collapsed so Objective stays above the fold).
   bool formulationOpen = false;
@@ -349,10 +359,14 @@ struct ResultsAction {
 // ---------------------
 // `groups` (SettingsGroup bits) selects the sections drawn; the locked banner
 // and whole-setup issues are drawn with the Problem group.
+// `study` supplies the bed-face context; `additiveControls` draws the owner's
+// print-process and bed-face controls inside the Additive manufacturing card.
 bool drawTopologySettings(AppState &st, nlohmann::json &topology,
                           const Capabilities &caps, SettingsView &view,
                           const char *lockedReason = nullptr,
-                          unsigned groups = kGroupsAll);
+                          unsigned groups = kGroupsAll,
+                          const nlohmann::json &study = nlohmann::json(),
+                          const std::function<void()> &additiveControls = {});
 // Results order (standard §5): outcome card, key metrics, then the caller's
 // `displayControls` (viewport field selector; may be empty), the runs list
 // (+ "Compare runs" with two or more), then the details (constraints, history,

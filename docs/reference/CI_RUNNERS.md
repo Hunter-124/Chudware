@@ -35,18 +35,209 @@ runs it on every change to `.github/workflows/**`. The verifier carries
 negative-control fixtures that prove each rule still fires; a rule that has
 never fired is not a rule.
 
-## The fleet
+## Execution trust boundary (SupplyChain RS-2)
 
-Runners register to a *repository*, an organization, or an enterprise. `Hunter-124`
-is a personal account with no organization tier, so the CloudCastle fleet cannot
-serve this repository as registered. Most machines therefore run a separate
-CAD-scoped runner instance beside the CloudCastle one, in its own directory with
-its own service name. The GitHub runner explicitly supports this. On
-GarrisonGamingPC each product goes further: separate identities and storage, so
-CloudCastle, Chudware and Chudcode tests can never collide (see
-[Per-product isolation on GarrisonGamingPC](#per-product-isolation-on-garrisongamingpc)).
+**Signing is blocked operationally until the evidence below is supplied.**
+These workflows specify the required routing; they do not prove that runner
+groups, disposable images, protected environments, or clean signing machines
+have been provisioned. No live runner/configuration/credential check was made
+for this cutover. The historical fleet inventory below is not approval to reuse
+that fleet's existing writable state.
 
-Labels as registered after the private-lane migration:
+All minutes remain self-hosted: there is no paid GitHub-hosted fallback. A
+`runs-on: {group: ..., labels: [self-hosted, ...]}` selects a self-hosted group
+and narrows its membership by labels; it does **not** request a larger runner.
+Missing groups/images intentionally leave jobs unschedulable, rather than
+silently running branch code on the legacy signing account.
+
+| Execution class | Group | Workflows/jobs | Mutable state and secrets |
+|---|---|---|---|
+| Branch/PR execution | `chudware-untrusted-ephemeral` | `fast-gate`, `ci-workflow-policy`, `linux-gate`, every `native-build` row (including tagged and manually selected branch builds) | One job per fresh OS/VM; no protected environments, signing keys, release transport credentials, production access, or write-capable repository token |
+| Protected release/control/maintenance | `chudware-trusted-protected` | `nightly-release`, reusable `release-prepare`, `chudcode-runtime-windows-build`, `runner-provision`, `runner-smoke`, `deploy-prod`, reusable/direct `stripe-sandbox`, `site-build`, `prod-external-watch` | Separately administered, freshly provisioned or externally integrity-attested machines; environment-scoped credentials and protected source refs only |
+
+The groups are disjoint. A runner belongs to one group; provisioning and smoke
+jobs operate on the protected fleet, not on the branch workers. Within the
+protected group, existing endpoint labels still distinguish builders from
+production/control hosts. Its three separate environments are
+`chudware-release-protected`, `chudware-control-protected`, and
+`chudware-maintenance-protected`; they scope approval and credential delivery,
+not OS isolation.
+
+Disposable labels are `cc-linux-disposable`, `cc-win-disposable`,
+`cc-mac-disposable-gate-intel` and `cc-mac-disposable-intel`. Mac images retain
+the gate/native account identities and resource caps checked by the workflows,
+but those accounts and their tool directories live **inside the disposable
+guest**, not beside the signer on its OS. Native CPU architecture is still
+required; a disposable Mac VM is supported, Rosetta is not. The complete
+native/ARM configure/build/test matrix and the release packaging legs remain.
+
+### Scheduling authorization cannot live in PR-editable YAML
+
+Repository-scoped runners and labels alone cannot enforce this boundary: a PR
+can edit its workflow to request a signing label or remove a job guard.
+The personal-account repository configuration recorded below does not provide
+the required organization/enterprise runner-group authorization. Before
+enabling release execution, migrate the registration/repository ownership to
+an organization/enterprise arrangement that actually supports **restricted
+workflow access**, and provide the authenticated configuration export. GitHub
+documents additional organization groups on Team and workflow restrictions in
+Enterprise Cloud; verify the selected account's capability rather than assume
+a free personal account supports them. This is an infrastructure/plan
+prerequisite, not a change to the zero-paid-hosted-minutes convention.
+
+Configure selected-repository access (this private repository only) for both
+groups. On `chudware-trusted-protected`, set `restricted_to_workflows: true`
+and allow only the defining workflow paths in the protected-class row above,
+each fully qualified as `ORG/REPO/.github/workflows/NAME.yml@refs/heads/master`.
+Do **not** authorize `fast-gate`, `ci-workflow-policy`, `linux-gate`,
+`native-build`, a wildcard ref, arbitrary branches, or all workflows. Remove
+legacy repository/default-group registrations capable of servicing those
+labels; group-less or alternate-workflow requests must have no protected
+capacity. Protect master and version tags against unreviewed creation/update,
+and include workflow/script/lock/image changes in the protected review policy.
+
+GitHub authorizes only jobs **directly defined** in an allowed workflow.
+The tagged `release.yml` entry point therefore calls `release-prepare.yml`;
+allowlist the reusable builder and its nested `stripe-sandbox.yml`, not just
+the caller. For each approved `vX.Y.Z` tag, explicitly authorize both defining
+reusable workflows at `@refs/tags/vX.Y.Z` (or an approved immutable SHA when
+using a pinned call). Non-reusable protected workflows are authorized on
+master only. Do not pretend `@refs/tags/v*` is an exact ref. A missing approved
+tag entry must deny/queue the release, not fall back to a persistent PR lane.
+Revoke obsolete tag authorizations when they are no longer needed.
+
+Every persistent job also checks `github.ref_protected`, permits only master
+or version-tag refs and push/dispatch/schedule events, and selects a protected
+environment. Reusable callers pass only named sandbox credentials, never
+`secrets: inherit`; the callee independently checks the original caller's
+context and obtains its environment approval. These guards are defense in
+depth, not a substitute for the server-side group restrictions.
+
+Configure each protected environment with exact allowed protected refs,
+required authorized reviewers, prevention of self-review/bypass as supported,
+and least-privilege credentials. **Remove release/signing/publication/provider
+and runner-administration secrets from repository/organization scopes visible
+to branch workflows**; otherwise a modified branch can request them on its
+disposable runner. Put release keys/identities/R2/gateway transport credentials
+in the release environment, control/site/Stripe/alert credentials in the
+control environment, and only required maintenance credentials in maintenance.
+Keep the offline owner key out of Actions entirely.
+
+### Required image and host evidence
+
+An operator must provide dated, authenticated evidence for all of:
+
+1. Group IDs, memberships, selected repository IDs, restricted workflow/ref
+   entries (including nested reusable definitions), protected master/tag rules
+   and environment protections. Record account/plan capabilities and show
+   that a modified branch cannot schedule a protected member or read a dummy
+   environment secret. Never include actual secret values in the packet.
+2. Image IDs/digests and the external controller configuration registering
+   workers with `--ephemeral` (one job), deleting their complete VM/OS disk,
+   deregistering them after success/failure/cancellation, and quarantining
+   failed destruction. Runner deregistration alone does not erase state.
+3. No shared writable HOME/USERPROFILE, interpreter/venv/site-packages
+   (including `.pth` hooks), PATH tools, Homebrew prefix, cargo/rustup,
+   npm/pip caches, SDK/tool cache, workspace/temp, mount, keychain, certificate
+   store or signing-agent socket between groups. A read-only, digest-qualified
+   image seed is acceptable; mutable PR caches and PR-built images are not.
+   Containers or separate users sharing the signer's OS are not the boundary.
+   Guests must not reach host admin sockets, credentials or production networks.
+4. Rebuild/quarantine evidence for every previously shared signing host before
+   credentials are re-enabled. Merely relabeling the Windows primary/package
+   service or Linux account preserves the audited persistence route. Attest
+   the OS/image, interpreter startup inputs and native tool/SDK identities
+   **before** job dispatch/secret release, from outside the writable checkout.
+   `runner-provision`/`runner-smoke` run approved source; they do not themselves
+   attest that a formerly compromised persistent interpreter is safe.
+5. Exact protected commit/locked build inputs for every signed output. Protected
+   jobs rebuild from the guarded event commit; they do not download Actions
+   artifacts/caches produced by PR jobs or checkout a PR-supplied ref. Verify
+   that release Python, native SDKs and mirrored runtime inputs match reviewed
+   locks. The Linux gate uses `CHUDWARE_WHEELHOUSE` from its isolated image and
+   `RUNNER_TEMP/gate-runtime`; a missing reviewed `RUNTIME_WHEELS.lock`/wheel
+   set is a hard prerequisite, never permission to download private source.
+   Its target snapshot must also include reviewed pytest, DVC 3.67.1 and
+   their complete wheel dependency closure. They are additional authenticated
+   lock entries, not direct product requirements. The workflow never performs
+   a second pip install into the identity-checked runtime.
+   Protected image services must export `CHUDWARE_CI_BASE_PYTHON` (an absolute
+   executable path whose base interpreter/startup payload is externally
+   qualified) and `CHUDWARE_WHEELHOUSE` (the approved complete offline wheel
+   directory). Nightly and reusable release builders create their authenticated
+   interpreter in `RUNNER_TEMP/release-python`. Only the separately trusted
+   base runs `services.installer.provision --check-inputs --venv-dir ...`
+   to inspect executable/launcher/pyvenv.cfg and installed wheel bytes offline
+   before the candidate interpreter is ever launched. Bootstrap clears
+   inherited `PYTHON*`, `LD_*` and `DYLD_*` injection variables first.
+   The selected target must also cover every applicable declaration in
+   `packaging/requirements-release.txt` and its full wheel closure. There is no
+   public pip sync, mutable-home interpreter fallback, private source download,
+   or build-backend execution. Protected `runner-provision` may prepare its
+   persistent HOME-local release runtime through the same lock checks; an
+   existing unverified runtime is refused rather than silently trusted or
+   replaced. This wheel identity check supplements, not replaces, the external
+   clean-machine/OS/native-tool evidence.
+6. Real native test/evidence retention. Both CTest suites must execute tests,
+   not only register disabled cases; `--no-tests=error` and JUnit counts/log
+   digests are retained in canonical `test-results.json`. Prepared metadata
+   hash-binds all five result/JUnit/log files. Finalization independently
+   verifies counts and bytes; command strings and a passed flag are not proof.
+   Every native format gets separate artifact/commit-bound signed evidence.
+   Missing evidence or failed native commands stop signing/publication even
+   when a builder leaves installer/AppImage bytes behind.
+
+### Offline validation and routing smoke
+
+After all source slices land, the integrator can run, without CI credentials:
+
+```bash
+python3 scripts/verify-ci-workflows.py --scope-all --no-annotations
+python3 scripts/test_verify_ci_workflows.py
+python3 scripts/test_run_release_ctest.py
+python3 scripts/test_release_workflow_behavior.py
+python3 -m pytest scripts/test_native_input_pins.py services/installer/test_wheelhouse.py
+actionlint -shellcheck= -pyflakes= -ignore 'label .+ is unknown'
+```
+
+The dependency-free regression suite invokes the real policy CLI on disposable
+fixture repositories: PR/branch positive cases, legacy/computed-group denial,
+guard bypasses, secret/write-token denial, protected artifact/cache/ref denial,
+and reusable caller/callee/secret checks, including incompatible Windows shell
+routing. Windows jobs execute genuine PowerShell, never the no-op Bash shim.
+Passing this is source-policy evidence
+only; it cannot attest GitHub scheduling or machine destruction.
+The native-input and wheelhouse fixture suites additionally cover missing image
+inputs, refusal to execute a stale interpreter, offline wheel identity/closure,
+and authenticated compiler prerequisites; they still do not exercise real CI.
+
+For an offline machine smoke, use two local disposable OS images with no real
+credentials: an untrusted fixture writes bounded sentinels into its home,
+Python startup-hook directory and tool cache. Destroy that guest. Start a fresh
+untrusted guest and a separately provisioned protected fixture guest and prove
+that none of the sentinels exists or executes, including on abnormal shutdown.
+Use only a dummy key/secret in the protected fixture and verify that it is
+unreachable from the untrusted guest. Match a frozen, sanitized group-policy
+export against normal PR/branch, edited-PR-to-protected-label, manual branch,
+approved master/tag and nested-reusable scenarios: unauthorized cases must
+have no eligible protected member; approved cases must retain all platform
+rows. Later authenticated scheduling evidence is still required; never run
+these smoke scenarios on customer sessions or real signing infrastructure.
+
+References: [self-hosted runner groups and account prerequisites](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access),
+[exact workflow/ref authorization](https://docs.github.com/enterprise-cloud@latest/actions/how-tos/manage-runners/self-hosted-runners/manage-access),
+[runner-group API](https://docs.github.com/en/rest/actions/self-hosted-runner-groups).
+
+## Historical fleet inventory (not RS-2 qualification)
+
+The following inventory records the former personal-account/repository-scoped
+registrations and capability notes. It is retained for operator migration,
+not evidence that these machines are isolated or authorized for signing.
+Do not attach disposable labels to these persistent services. Protected
+registrations must be rebuilt/attested and moved to the enforced protected
+group before use; branch workers are separate disposable guests.
+
+Legacy labels and install directories:
 
 | Runner | OS / Arch | Labels | CAD install dir |
 |---|---|---|---|
@@ -61,27 +252,22 @@ Labels as registered after the private-lane migration:
 | `macbook-air-m2` | macOS ARM64 | offline, not currently registered; ordinary checks do not route here | `~/actions-runner-cad` (operator lane: GUI account, Homebrew owner) |
 | `macbook-air-m2-chudware-test` | macOS ARM64 | **not registered yet** — will register with only `cc-mac-chudware-arm-bootstrap`; `cloudcastle-ci` and `cc-mac-chudware-arm` only after qualification. No ordinary workflow routes at it (see [ARM coverage without ARM hardware](#arm-coverage-without-arm-hardware)) | `/Library/CloudCastleCI/ccci-chudware/actions-runner` on the M2 (system LaunchDaemon `com.cloudcastle.ci.runner.chudware` as the hidden `ccci-chudware` account) |
 
-The ordinary native-build matrix uses product-specific labels, rather than
-requiring another product's generic runner label.
-
-**`cc-linux-build` is on the qualified `chudware-ryzen-linux` utility VM.**
-It used to be carried by `livingroom-pc`, which is also the production gateway
-host; it was removed there so build legs stop landing on production. Jobs
-routed at `cc-linux-build` (fast-gate's Linux row, linux-gate, site-build,
-stripe-sandbox, release prep, nightly-release's `linux-beta`) now use the
-private Chudware guest. Native-build uses `cc-linux-chudware` directly. The legacy shared
-`cc-linux-ryzen`/`cc-nvme-bootstrap` guest is drained and offline and is not
-part of the fleet.
+Native builds now require disposable capacity labels in the untrusted group.
+`cc-linux-build`, `cc-win-package`/`cc-win-ryzen` and `cc-mac-intel` are
+protected capability labels only; they no longer service fast-gate,
+ci-workflow-policy, linux-gate or native-build. A formerly qualified private
+account/WSL guest is not automatically a qualified RS-2 signing machine.
 
 **nightly-release splits serving from building.** `plan` is metadata/API work
 only and routes at `cc-linux-livingroom`: it reads the release token from
 `/home/liveuser/chudware-web-data/gateway.env` (custody stays with `liveuser`
 on the serving host) to ask loopback `http://127.0.0.1:8300` whether `HEAD`
 already published and to record the queued rows; it compiles nothing.
-`linux-beta` builds on `cc-linux-build` (the private NVMe guest) and needs no
+`linux-beta` builds on the protected `cc-linux-build` endpoint and needs no
 production file, NAS release path or production SSH credential: like the
-Windows and macOS legs it holds the `CHUDWARE_GATEWAY_RELEASE_TOKEN` secret in a
-run-scoped 0600 curl config and publishes over TLS to `https://app.chudware.com`.
+Windows and macOS legs it obtains `CHUDWARE_GATEWAY_RELEASE_TOKEN` from its
+protected release environment, keeps it in a run-scoped 0600 curl config and
+publishes over TLS to `https://app.chudware.com`.
 Every signed byte stays in its `RUNNER_TEMP`; the artifact and each payload
 manifest/signature/evidence sidecar go up under its canonical name through
 `PUT /api/releases/ci/upload/<name>` (streamed up to 64 MiB, otherwise 64 MiB
@@ -91,7 +277,9 @@ every staged file against the signed body. The bash client is
 `packaging/ci_gateway.sh` (`gw_open`, `gw_post`, `gw_upload`,
 `gw_upload_verified`, `gw_upload_release`, `ci_status`), shared with
 `macos-beta`; Windows uses `packaging/windows/publish_release.ps1`.
-Neither gateway.env nor any production secret is ever copied into a build guest.
+Neither gateway.env nor production service configuration is copied into a build
+guest; approved release credentials are delivered separately by its protected
+environment.
 
 ### Roles: builder vs control
 
@@ -155,29 +343,14 @@ leg at the generic `cloudcastle-ci` pool without also pinning a builder label.
   `macos-x86_64` CMake presets set `CMAKE_PREFIX_PATH` to. Homebrew is not on
   CMake's default search path. The prefix is owned by the operator account;
   the private test account reads it and never writes it.
-- **Ordinary Mac tests run on the private test accounts.** fast-gate's macOS
-  row routes at `[self-hosted, macOS, X64, cloudcastle-ci, cc-mac-chudware-gate-intel]`
-  as `ccci-chudware-gate` (hidden UID 423) with its own 0700 home
-  `/Library/CloudCastleCI/ccci-chudware-gate`, runner root
-  `actions-runner-gate`, and private work/temp/cache state. This separate
-  lightweight slot prevents a long native/ARM qualification build from
-  holding the source gate in the runner queue. It shares only read-only
-  host tooling; no other product or operator/signer account is borrowed.
-  Native-build's `macOS x86_64` and compile-only `macOS arm64` rows use
-  `[self-hosted, macOS, X64, cc-mac-chudware-intel]`.
-  Before anything compiles native-build fails unless it runs as `ccci-chudware` with the
-  `CC_CI_PRODUCT=Chudware`, `CC_CI_LANE=test` identity its LaunchDaemon
-  exports; native-build additionally requires the runner architecture to be
-  the machine's native one (`X64`/`x86_64`, never Rosetta translation or a
-  VM), a uid in 420-499 and the 0700 home
-  `/Library/CloudCastleCI/ccci-chudware`. That daemon also exports
-  `CMAKE_BUILD_PARALLEL_LEVEL` (CPU/RAM-derived, shared across the three
-  product lanes on each Mac) and `CTEST_PARALLEL_LEVEL=1`, which
-  `cmake --build`/`ctest` inherit; native-build refuses to start without the
-  cap. The accounts have no login keychain, signing identity, sudo or GUI
-  session, so signed packaging (`release.yml`, nightly-release's `macos-beta`)
-  and `runner-provision.yml` stay on the operator lanes (`cc-mac-intel`,
-  `cc-mac-arm`).
+- **Ordinary Mac tests run inside disposable OS images.** The gate image uses
+  `ccci-chudware-gate`; native/ARM images use `ccci-chudware`. The account name,
+  0700 home, `CC_CI_PRODUCT=Chudware`, `CC_CI_LANE=test`, native architecture
+  and compiler/test concurrency caps remain checked. They do not establish
+  isolation on their own. The whole guest, including image-local Homebrew,
+  Python, home and caches, must be fresh and destroyed after one job.
+  Signed packaging (`release-prepare.yml`, nightly-release's `macos-beta`)
+  and `runner-provision.yml` run only on the separate protected fleet.
 - **The ARM private test account does not exist yet.** It is created only by
   running CloudCastle's `provision-macos-test-runner.sh` (product `Chudware`)
   natively on the physical M2, which is offline; there is no runtime proof of
@@ -431,12 +604,11 @@ service takes its environment as a snapshot at start, so even a successful
   old `NETWORK SERVICE` profile, so provisioning reinstalls any distribution
   whose launchers name another interpreter, and the probe fails on any stale
   launcher that remains. Workflows still call `python -m pip`, never a launcher.
-- Every Windows job puts that directory on `PATH` **itself**, in its first step:
-  `$env:PATH` for the current step and `$GITHUB_PATH` for the ones after it.
-  `fast-gate.yml`, `native-build.yml`, `nightly-release.yml` and
-  `runner-smoke.yml` all carry the same six-line block. This is the whole
-  mechanism; there is no machine `PATH` entry to find and nothing survives
-  outside that directory.
+- Windows jobs prepend their **own image/account's** tools directory to PATH.
+  Identical path strings in two separate VM disks are not shared state;
+  mounting the persistent release profile into a disposable job is forbidden.
+  `runner-smoke` provisioning targets only the approved protected fleet.
+  Untrusted images are prepared offline and independently qualified.
 
 ### Per-product isolation on GarrisonGamingPC
 

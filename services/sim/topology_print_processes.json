@@ -1,0 +1,61 @@
+{
+  "schema": "chudware.topology_print_processes/1",
+  "processes": [
+    {
+      "id": "fdm_0.4",
+      "label": "FDM, 0.4 mm nozzle",
+      "process": "fdm",
+      "nozzle_mm": 0.4,
+      "line_width_mm": 0.45,
+      "layer_height_mm": 0.2,
+      "description": "Fused-filament printing with a 0.4 mm nozzle and a 1.2 mm minimum member target.",
+      "topology": {
+        "min_member_mm": 1.2,
+        "overhang_angle_deg": 45,
+        "overhang_penalty": 2.0,
+        "no_enclosed_voids": false
+      }
+    },
+    {
+      "id": "fdm_0.6",
+      "label": "FDM, 0.6 mm nozzle",
+      "process": "fdm",
+      "nozzle_mm": 0.6,
+      "line_width_mm": 0.68,
+      "layer_height_mm": 0.3,
+      "description": "Fused-filament printing with a 0.6 mm nozzle and a 1.8 mm minimum member target.",
+      "topology": {
+        "min_member_mm": 1.8,
+        "overhang_angle_deg": 45,
+        "overhang_penalty": 2.0,
+        "no_enclosed_voids": false
+      }
+    },
+    {
+      "id": "resin",
+      "label": "Resin (SLA / MSLA)",
+      "process": "sla",
+      "layer_height_mm": 0.05,
+      "description": "Resin printing with a 0.6 mm minimum member target and enclosed-void control.",
+      "topology": {
+        "min_member_mm": 0.6,
+        "overhang_angle_deg": 45,
+        "overhang_penalty": 2.0,
+        "no_enclosed_voids": true
+      }
+    },
+    {
+      "id": "powder",
+      "label": "Powder bed (SLS / MJF)",
+      "process": "sls",
+      "layer_height_mm": 0.1,
+      "description": "Powder-bed printing with a 1.0 mm minimum member target and enclosed-void control.",
+      "topology": {
+        "min_member_mm": 1.0,
+        "overhang_angle_deg": null,
+        "overhang_penalty": null,
+        "no_enclosed_voids": true
+      }
+    }
+  ]
+}

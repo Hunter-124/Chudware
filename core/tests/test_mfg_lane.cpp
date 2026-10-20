@@ -1,8 +1,14 @@
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#define DOCTEST_CONFIG_IMPLEMENT
 #include <doctest/doctest.h>
 
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <map>
 #include <vector>
 
@@ -33,7 +39,7 @@ chudware::mfg::gateway::AllowlistEntry commissioned(
     entry.operator_note = "test commissioning";
     if (kind == device::TransportKind::Serial) {
         entry.endpoint = mfg::gateway::EndpointIdentity::serial(
-            "/tmp/chudware-test-serial" + suffix);
+            "/tmp/chudware-test-serial" + suffix, "1a86", "7523", "test-controller");
         entry.connection["baud"] = "115200";
     } else {
         entry.endpoint = mfg::gateway::EndpointIdentity::network(
@@ -72,11 +78,13 @@ json call(ManufacturingLane& lane, std::string_view method, json params = json::
 
 struct LaneRig {
     TempDirectory temp;
-    ManufacturingLane lane{temp.path};
+    ManufacturingLane lane;
     std::string device_id;
     std::string lease_id;
 
-    LaneRig() {
+    explicit LaneRig(chudware::mfg::ArtifactLimits limits = {},
+                     std::function<uint64_t()> clock = {})
+        : lane(temp.path, false, std::move(clock), limits) {
         const auto list = call(lane, "mfg_device_list");
         device_id = list.at("devices").at(0).at("device_id").get<std::string>();
     }
@@ -137,6 +145,68 @@ struct LaneRig {
     }
 };
 
+// Python drives only this test executable, consumes the lane's actual worker
+// requests with the real printer handlers, and returns their real API results.
+int printerWorkerFixture() {
+    std::string line;
+    if (!std::getline(std::cin, line)) throw std::runtime_error("missing fixture endpoint");
+    const auto input = json::parse(line);
+    const std::string host = input.at("host").get<std::string>();
+    if (host != "127.0.0.1" && host != "printer.fixture.invalid")
+        throw std::runtime_error("fixture requires a disposable loopback endpoint");
+    const auto port = input.at("port").get<unsigned>();
+    if (port == 0 || port > 65535) throw std::runtime_error("invalid fixture port");
+    TempDirectory temp;
+    auto entry = commissioned(chudware::device::TransportKind::Tcp,
+                              chudware::device::MachineClass::FdmPrinterEnclosed);
+    entry.endpoint = chudware::mfg::gateway::EndpointIdentity::network(
+        chudware::device::TransportKind::Tcp, host, static_cast<std::uint16_t>(port));
+    entry.connection["adapter_kind"] = "moonraker";
+    entry.connection["auth_mode"] = "trusted_host";
+    if (input.contains("address_class"))
+        entry.connection["address_class"] = input.at("address_class").get<std::string>();
+    {
+        chudware::mfg::gateway::DeviceAllowlist allowlist(temp.path / "device_allowlist.tsv");
+        std::string why;
+        if (!allowlist.upsert(entry, &why)) throw std::runtime_error(why);
+    }
+    ManufacturingLane lane(temp.path);
+    lane.setWorkerCall([](const std::string& method, const json& params) {
+        std::cout << json{{"worker_method", method}, {"params", params}}.dump() << std::endl;
+        std::string response;
+        if (!std::getline(std::cin, response))
+            throw std::runtime_error("printer fixture consumer disconnected");
+        return json::parse(response);
+    });
+    const chudware::mfg::LeaseOwner owner{"human", "fixture-seat", "fixture-session"};
+    const auto dispatch = [&](std::string_view method, const json& params) {
+        auto result = lane.handle(method, params, owner);
+        if (!result) throw std::runtime_error("fixture method was not handled");
+        std::cout << json{{"lane_method", method}, {"is_error", result->is_error},
+                          {"body", result->body}}.dump() << std::endl;
+        return std::move(*result);
+    };
+    const auto listed = dispatch("mfg_device_list", json::object());
+    std::string device_id;
+    for (const auto& candidate : listed.body.at("devices")) {
+        if (candidate.at("transport").at("kind") == "tcp")
+            device_id = candidate.at("device_id").get<std::string>();
+    }
+    if (device_id.empty()) throw std::runtime_error("commissioned fixture printer was not listed");
+    const auto claimed = dispatch("mfg_device_claim", {{"device_id", device_id}});
+    if (claimed.is_error) throw std::runtime_error("fixture printer claim failed");
+    const json leased{{"device_id", device_id},
+                      {"lease_id", claimed.body.at("lease").at("lease_id")}};
+    const auto connected = dispatch("mfg_device_connect", leased);
+    if (!connected.is_error) {
+        dispatch("mfg_telemetry_snapshot", {{"device_id", device_id}});
+        dispatch("mfg_telemetry_snapshot", {{"device_id", device_id}});
+        dispatch("mfg_device_disconnect", leased);
+    }
+    dispatch("mfg_device_release", leased);
+    return 0;
+}
+
 
 
 }  // namespace
@@ -150,6 +220,45 @@ TEST_CASE("manufacturing lane does not intercept non manufacturing methods") {
     REQUIRE(unknown.has_value());
     CHECK(unknown->is_error);
     CHECK(unknown->body.at("code") == "mfg_unknown_method");
+}
+
+TEST_CASE("tupleless allowlist migration names the invalid line and remains fail closed") {
+    TempDirectory temp;
+    ManufacturingLane lane(temp.path);
+    const auto file = temp.path / "device_allowlist.tsv";
+    const auto network = commissioned(chudware::device::TransportKind::Tcp,
+                                     chudware::device::MachineClass::OpenFrameMill);
+    const auto writeAllowlist = [&](std::string_view serial) {
+        std::ofstream output(file);
+        REQUIRE(output.is_open());
+        output << "# disposable migration fixture\n" << serial << "\n"
+               << chudware::mfg::gateway::DeviceAllowlist::formatLine(network) << "\n";
+        output.close();
+        REQUIRE_FALSE(output.fail());
+    };
+    writeAllowlist("serial\taddress=/dev/serial/by-id/legacy-fixture"
+                   "\tmachine_class=open_frame_mill\tbaud=115200\tnote=obsolete fixture");
+    const std::string diagnosis = file.string() +
+        ":2: serial USB identity requires vid, pid, and serial together";
+    TempDirectory startup;
+    const auto startup_file = startup.path / "device_allowlist.tsv";
+    std::filesystem::copy_file(file, startup_file);
+    const std::string startup_diagnosis = "unable to load device allowlist: " +
+        startup_file.string() + ":2: serial USB identity requires vid, pid, and serial together";
+    CHECK_THROWS_WITH(ManufacturingLane(startup.path), startup_diagnosis.c_str());
+    for (const auto method : {"mfg_device_list", "mfg_device_describe", "mfg_device_claim"}) {
+        const auto refused = call(lane, method, json::object(), true);
+        CHECK(refused.at("code") == "mfg_device_allowlist_invalid");
+        CHECK(refused.at("message") == diagnosis);
+    }
+    // Commissioning uses a complete observed tuple, never infers one from the
+    // legacy path. Only this disposable fixture supplies synthetic identity data.
+    const auto serial = commissioned(chudware::device::TransportKind::Serial,
+                                    chudware::device::MachineClass::OpenFrameMill);
+    writeAllowlist(chudware::mfg::gateway::DeviceAllowlist::formatLine(serial));
+    const auto listed = call(lane, "mfg_device_list");
+    CHECK(findTransport(listed, "serial").at("machine_class") == "open_frame_mill");
+    CHECK(findTransport(listed, "tcp").at("machine_class") == "open_frame_mill");
 }
 
 TEST_CASE("commander claim is exclusive and every write requires the lease") {
@@ -257,6 +366,168 @@ TEST_CASE("lease bearer value is caller-bound and redacted from observers") {
     const auto journal_read =
         call(lane, "mfg_journal_query", json::object(), true, attacker);
     CHECK(journal_read.at("code") == "lease.commander_held_by_caller");
+}
+
+TEST_CASE("artifact admission bounds bytes and physical lines before retaining a program") {
+    chudware::mfg::ArtifactLimits limits;
+    limits.max_artifact_bytes = 8;
+    limits.max_artifact_lines = 3;
+    LaneRig rig(limits);
+    rig.claim();
+    const auto registerInput = [&](json artifact, bool refused = false) {
+        artifact["kind"] = "nc";
+        return call(rig.lane, "mfg_artifact_register",
+                    {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+                     {"artifact", std::move(artifact)}}, refused);
+    };
+    CHECK(registerInput({{"content", std::string(8, 'x')}}).at("artifact").at("bytes") == 8);
+    CHECK(registerInput({{"content", std::string(9, 'x')}}, true).at("code") ==
+          "mfg_artifact_byte_limit");
+    CHECK(registerInput({{"lines", json::array({std::string(7, 'x')})}})
+              .at("artifact").at("bytes") == 8);
+    CHECK(registerInput({{"lines", json::array({std::string(8, 'x')})}}, true).at("code") ==
+          "mfg_artifact_byte_limit");
+    CHECK(registerInput({{"lines", json::array({"", "", ""})}})
+              .at("artifact").at("program_lines") == 3);
+    CHECK(registerInput({{"lines", json::array({"", "", "", ""})}}, true).at("code") ==
+          "mfg_artifact_line_limit");
+    CHECK(registerInput({{"content", "\n\n\n\n"}}, true).at("code") ==
+          "mfg_artifact_line_limit");
+    const auto text = registerInput({{"content", "G90\n"}});
+    const auto array = registerInput({{"lines", json::array({"G90"})}});
+    CHECK(text.at("artifact").at("hash_sha256") == array.at("artifact").at("hash_sha256"));
+    CHECK(registerInput({{"content", "\r\nG90\r\n"}}).at("artifact").at("program_lines") == 1);
+    CHECK(registerInput({{"content", "G90"}, {"post_profile_id", std::string(4097, 'x')}},
+                        true).at("code") == "mfg_artifact_metadata_limit");
+}
+
+TEST_CASE("repeated small artifact registrations stop at the cumulative object quota") {
+    chudware::mfg::ArtifactLimits limits;
+    limits.max_objects = 3;
+    LaneRig rig(limits);
+    rig.claim();
+    for (size_t index = 0; index < limits.max_objects; ++index) rig.registerArtifact();
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        const auto refused = call(
+            rig.lane, "mfg_artifact_register",
+            {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+             {"artifact", {{"content", "G90\n"}}}}, true);
+        CHECK(refused.at("code") == "mfg_artifact_quota_exceeded");
+        CHECK(refused.at("detail").at("retained_objects") == limits.max_objects);
+    }
+    call(rig.lane, "mfg_device_release",
+         {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}});
+    rig.claim();
+    for (size_t index = 0; index < limits.max_objects; ++index) rig.registerArtifact();
+}
+
+TEST_CASE("cumulative artifact byte quota includes storage and is reclaimed on lease release") {
+    chudware::mfg::ArtifactLimits limits;
+    limits.max_objects = 64;
+    limits.max_retained_bytes = 2048;
+    limits.max_artifact_bytes = 128;
+    LaneRig rig(limits);
+    rig.claim();
+    const json payload{{"kind", "nc"}, {"content", std::string(128, 'x')}};
+    size_t admitted = 0;
+    json refusal;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const auto result = rig.lane.handle(
+            "mfg_artifact_register",
+            {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}, {"artifact", payload}},
+            {"human", "test-seat", "test-session"});
+        REQUIRE(result.has_value());
+        if (result->is_error) {
+            refusal = result->body;
+            break;
+        }
+        ++admitted;
+    }
+    REQUIRE_FALSE(refusal.is_null());
+    CHECK(admitted > 0);
+    CHECK(admitted < limits.max_objects);
+    CHECK(refusal.at("code") == "mfg_artifact_quota_exceeded");
+    const auto& detail = refusal.at("detail");
+    CHECK(detail.at("retained_objects") == admitted);
+    CHECK(detail.at("retained_bytes").get<uint64_t>() +
+          detail.at("requested_bytes").get<uint64_t>() > limits.max_retained_bytes);
+    call(rig.lane, "mfg_device_release",
+         {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}});
+    rig.claim();
+    for (size_t index = 0; index < admitted; ++index)
+        call(rig.lane, "mfg_artifact_register",
+             {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}, {"artifact", payload}});
+    CHECK(call(rig.lane, "mfg_artifact_register",
+               {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}, {"artifact", payload}},
+               true).at("code") == "mfg_artifact_quota_exceeded");
+}
+
+TEST_CASE("device release and disconnect reclaim only artifacts with no run references") {
+    chudware::mfg::ArtifactLimits limits;
+    limits.max_objects = 2;
+    LaneRig rig(limits);
+    rig.claim();
+    rig.connect();
+    const auto linked = rig.registerArtifact();
+    const auto unreferenced = rig.registerArtifact();
+    const auto preflight = rig.preflight(linked);
+    const std::string run_id = preflight.at("run_id");
+    const auto before = call(rig.lane, "mfg_run_describe", {{"run_id", run_id}});
+    SUBCASE("commander release") {
+        call(rig.lane, "mfg_device_release",
+             {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}});
+        rig.claim();
+    }
+    SUBCASE("transport disconnect") {
+        call(rig.lane, "mfg_device_disconnect",
+             {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}});
+    }
+    rig.connect();
+    const auto missing = call(
+        rig.lane, "mfg_preflight_run",
+        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+         {"artifact_id", unreferenced}}, true);
+    CHECK(missing.at("code") == "mfg_artifact_not_found");
+    CHECK(rig.preflight(linked, run_id).at("run_id") == run_id);
+    const auto after = call(rig.lane, "mfg_run_describe", {{"run_id", run_id}});
+    CHECK(after.at("run").at("artifact_hash") == before.at("run").at("artifact_hash"));
+    rig.registerArtifact();
+    CHECK(call(rig.lane, "mfg_artifact_register",
+               {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+                {"artifact", {{"content", "G90\n"}}}}, true).at("code") ==
+          "mfg_artifact_quota_exceeded");
+}
+
+TEST_CASE("expired commander reclaims unused artifacts without losing active run evidence") {
+    uint64_t now_ns = 1'000'000'000ULL;
+    chudware::mfg::ArtifactLimits limits;
+    limits.max_objects = 2;
+    LaneRig rig(limits, [&] { return now_ns; });
+    rig.claim();
+    rig.connect();
+    const auto linked = rig.registerArtifact();
+    const auto unreferenced = rig.registerArtifact();
+    const std::string run_id = rig.preflight(linked).at("run_id");
+    const auto approval_id = rig.approval(run_id, "human_only");
+    CHECK(rig.start(run_id, approval_id, "human").at("state") == "running");
+    now_ns += 16'000'000'000ULL;
+    CHECK(call(rig.lane, "mfg_device_heartbeat",
+               {{"device_id", rig.device_id}, {"lease_id", rig.lease_id}}, true).at("code") ==
+          "lease.not_found_or_expired");
+    const auto faulted = call(rig.lane, "mfg_run_describe", {{"run_id", run_id}});
+    CHECK(faulted.at("run").at("state") == "faulted");
+    CHECK(faulted.at("run").at("artifact_id") == linked);
+    CHECK(faulted.at("run").at("artifact_hash").get<std::string>().size() == 64);
+    rig.claim();
+    rig.connect();
+    CHECK(call(rig.lane, "mfg_preflight_run",
+               {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+                {"artifact_id", unreferenced}}, true).at("code") == "mfg_artifact_not_found");
+    rig.registerArtifact();
+    CHECK(call(rig.lane, "mfg_artifact_register",
+               {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+                {"artifact", {{"content", "G90\n"}}}}, true).at("code") ==
+          "mfg_artifact_quota_exceeded");
 }
 
 TEST_CASE("artifact registration rejects filesystem path sources") {
@@ -931,6 +1202,7 @@ TEST_CASE("physical printer worker cannot promote execute authority") {
               "expected_base_url"));
     CHECK(arguments.at("mfg_printer_adapter_open").at("endpoint").at("base_url") ==
           "http://127.0.0.1:39007");
+    CHECK_FALSE(arguments.at("mfg_printer_adapter_open").at("endpoint").contains("address_class"));
     const auto capability = call(lane, "mfg_device_capability",
                                  {{"device_id", device_id}});
     CHECK(candidate.at("transport").at("endpoint_is_physical"));
@@ -1135,6 +1407,23 @@ TEST_CASE("attention mutations enforce text and delivery history bounds") {
                        {"status", "delivered"}}}},
         true);
     CHECK(overflow.at("code") == "mfg_attention_delivery_capacity");
+    call(rig.lane, "mfg_attention_resolve", {{"id", "attention:bounded"}});
+    const auto reraised = call(rig.lane, "mfg_attention_raise",
+        {{"id", "attention:bounded"}, {"reason", "delivery_test"}, {"why", "still inspect"}});
+    CHECK(reraised.at("attention").at("occurrence_count") == 2);
+    CHECK(reraised.at("attention").at("delivery_count") == 64);
+    REQUIRE(reraised.at("attention").at("deliveries").size() == 64);
+    const auto head = call(rig.lane, "mfg_journal_query").at("head_seq");
+    const auto bytes = std::filesystem::file_size(rig.temp.path / "journal.jsonl");
+    call(rig.lane, "mfg_attention_delivery",
+         {{"id", "attention:bounded"},
+          {"delivery", {{"channel", "desktop"}, {"attempt", 64}, {"status", "delivered"}}}});
+    CHECK(call(rig.lane, "mfg_attention_delivery",
+         {{"id", "attention:bounded"},
+          {"delivery", {{"channel", "desktop"}, {"attempt", 65}, {"status", "delivered"}}}},
+         true).at("code") == "mfg_attention_delivery_capacity");
+    CHECK(call(rig.lane, "mfg_journal_query").at("head_seq") == head);
+    CHECK(std::filesystem::file_size(rig.temp.path / "journal.jsonl") == bytes);
 }
 TEST_CASE("attention lifecycle is durable and published on the lane stream") {
 
@@ -1158,9 +1447,9 @@ TEST_CASE("attention lifecycle is durable and published on the lane stream") {
         lane, "mfg_attention_delivery",
         {{"id", "attention:test"},
          {"delivery", {{"channel", "desktop"}, {"attempt", 1},
-                       {"status", "delivered"}, {"seq", 999}}}});
+                       {"status", "delivered"}}}});
     REQUIRE(delivered.at("attention").at("deliveries").size() == 1);
-    CHECK(delivered.at("attention").at("deliveries").at(0).at("seq") != 999);
+    CHECK(delivered.at("attention").at("deliveries").at(0).at("seq").get<uint64_t>() > 0);
     const auto acknowledged = call(
         lane, "mfg_attention_ack", {{"id", "attention:test"}, {"by", "operator"}});
     CHECK(acknowledged.at("attention").at("acknowledged_by") == "test-seat");
@@ -1186,4 +1475,90 @@ TEST_CASE("attention lifecycle is durable and published on the lane stream") {
     CHECK(events.at(1).at("data").at("action") == "delivery");
     CHECK(events.at(2).at("data").at("action") == "acknowledged");
     CHECK(events.at(3).at("data").at("action") == "resolved");
+}
+
+TEST_CASE("attention retries do not append and re-raise retains cumulative accounting") {
+    TempDirectory temp;
+    json final_item;
+    {
+        ManufacturingLane lane(temp.path);
+        const auto device = call(lane, "mfg_device_list").at("devices").at(0).at("device_id");
+        call(lane, "mfg_device_claim", {{"device_id", device}});
+        const json raise{{"id", "attention:retry"}, {"reason", "fault"}, {"why", "inspect"}};
+        call(lane, "mfg_attention_raise", raise);
+        const json request{{"id", "attention:retry"},
+                           {"delivery", {{"channel", "desktop"}, {"attempt", 1},
+                                         {"status", "delivered"}}}};
+        const auto delivery = call(lane, "mfg_attention_delivery", request);
+        const auto ack = call(lane, "mfg_attention_ack", {{"id", "attention:retry"}});
+        const auto resolved = call(lane, "mfg_attention_resolve", {{"id", "attention:retry"}});
+        const auto before = call(lane, "mfg_journal_query");
+        const auto file_bytes = std::filesystem::file_size(temp.path / "journal.jsonl");
+        CHECK(call(lane, "mfg_attention_delivery", request).at("attention") ==
+              resolved.at("attention"));
+        CHECK(call(lane, "mfg_attention_ack", {{"id", "attention:retry"}})
+                  .at("attention").at("acknowledged_seq") ==
+              ack.at("attention").at("acknowledged_seq"));
+        CHECK(call(lane, "mfg_attention_resolve", {{"id", "attention:retry"}})
+                  .at("attention").at("resolved_seq") ==
+              resolved.at("attention").at("resolved_seq"));
+        CHECK(call(lane, "mfg_journal_query").at("head_seq") == before.at("head_seq"));
+        CHECK(std::filesystem::file_size(temp.path / "journal.jsonl") == file_bytes);
+        final_item = call(lane, "mfg_attention_raise", raise).at("attention");
+        CHECK(final_item.at("occurrence_count") == 2);
+        CHECK(final_item.at("delivery_count") == 1);
+        CHECK(final_item.at("deliveries") == delivery.at("attention").at("deliveries"));
+        CHECK_FALSE(final_item.contains("resolved_seq"));
+        CHECK_FALSE(final_item.contains("acknowledged_seq"));
+    }
+    {
+        ManufacturingLane reopened(temp.path);
+        const auto items = call(reopened, "mfg_attention_list").at("attention");
+        REQUIRE(items.size() == 1);
+        CHECK(items.at(0) == final_item);
+    }
+}
+
+TEST_CASE("attention delivery schema rejects hostile fields before journal writes") {
+    LaneRig rig;
+    rig.claim();
+    call(rig.lane, "mfg_attention_raise",
+         {{"id", "attention:schema"}, {"reason", "fault"}, {"why", "inspect"}});
+    const auto head = call(rig.lane, "mfg_journal_query").at("head_seq");
+    const auto bytes = std::filesystem::file_size(rig.temp.path / "journal.jsonl");
+    for (const auto& hostile : std::vector<json>{
+             {{"channel", "desktop"}, {"status", "delivered"}, {"unknown", json::array({1})}},
+             {{"channel", "desktop"}, {"status", "delivered"}, {"seq", 999}},
+             {{"channel", "desktop"}, {"status", "delivered"}, {"error", std::string(513, 'e')}},
+             {{"channel", std::string(65, 'c')}, {"status", "delivered"}},
+             {{"channel", "desktop"}, {"status", json::object()}},
+             {{"channel", "desktop"}, {"status", "delivered"}, {"attempt", -1}},
+             {{"channel", "desktop"}, {"status", "delivered"}, {"attempt", 1025}},
+             json::array({1})}) {
+        const auto refused = call(rig.lane, "mfg_attention_delivery",
+            {{"id", "attention:schema"}, {"delivery", hostile}}, true);
+        CHECK(refused.at("code") == "mfg_attention_delivery_invalid");
+    }
+    CHECK(call(rig.lane, "mfg_journal_query").at("head_seq") == head);
+    CHECK(std::filesystem::file_size(rig.temp.path / "journal.jsonl") == bytes);
+    CHECK(call(rig.lane, "mfg_journal_query", {{"limit", 0}}).at("records").empty());
+    const auto page = call(rig.lane, "mfg_journal_query", {{"limit", 1}});
+    REQUIRE(page.at("records").size() == 1);
+    CHECK(page.at("has_more") == true);
+    const auto next = call(rig.lane, "mfg_journal_query", {{"from_seq", page.at("next_seq")}});
+    REQUIRE_FALSE(next.at("records").empty());
+    CHECK(next.at("records").at(0).at("seq") > page.at("records").at(0).at("seq"));
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--printer-worker-fixture") {
+        try {
+            return printerWorkerFixture();
+        } catch (const std::exception& error) {
+            std::cerr << error.what() << '\n';
+            return 2;
+        }
+    }
+    doctest::Context context(argc, argv);
+    return context.run();
 }

@@ -23,6 +23,7 @@ from services.mcp import cad_common
 from services.mcp import topology_tools as tt
 from services.sim import jobs as J
 from services.sim import topology as topo
+from services.sim.topology_worker_rpc import WORKER_METHODS
 
 LEFT = {"points": [[0.0, y, z] for y in (0.0, 10.0) for z in (0.0, 10.0)],
         "tol_mm": 0.5, "face_normal": [-1.0, 0.0, 0.0], "perp_tol_mm": 1.5}
@@ -82,6 +83,7 @@ class FakeDocument:
         self.edits = 0
         self.caps = copy.deepcopy(CAPS)
         self.at_start: list = []
+        self.calls: list = []
         self.queries = {"-x": [LEFT], "+x": [RIGHT], "bottom": [BOTTOM],
                         "ends": [LEFT, RIGHT]}
 
@@ -92,6 +94,7 @@ class FakeDocument:
 
     def call(self, method, params=None):
         params = params or {}
+        self.calls.append(method)
         if method == "sim_study_list":
             return {"studies": copy.deepcopy(self.studies), "revision": self.edits}
         if method == "sim_study_add":
@@ -828,3 +831,304 @@ def test_run_dirs_are_unique_and_never_reused(h):
     assert first["path"] != second["path"]
     assert json.loads(Path(first["path"]).read_text()) == {"v": 1}
     assert os.path.basename(second["path"]) == "result.1.json"
+
+
+# ---------------------------------------------------------------- printing
+
+
+def test_print_presets_are_shared_and_discoverable(h):
+    processes = topo.print_processes()
+    assert topo.print_processes() is processes
+    assert [p["id"] for p in processes] == ["fdm_0.4", "fdm_0.6", "resin", "powder"]
+    assert topo.print_process("powder")["topology"]["overhang_angle_deg"] is None
+    caps = h.caps()
+    assert caps["print_processes"] == [
+        {k: p[k] for k in ("id", "label", "process", "description", "topology")}
+        for p in processes]
+    assert all("build_plate" in sections for sections in caps["boundaries"].values())
+
+
+def test_print_preset_fills_persisted_offered_keys_and_explicit_values_win(h):
+    h.doc.studies.append(_gui_study())
+    out = h.run(study_id="study-00000001", study={
+        "print_process": "fdm_0.4", "build_plate": {"faces": ["bottom"], "label": "print bed"},
+        "topology": {"min_member_mm": 2.4}})
+    assert out["ok"] is True, out
+    saved = h.doc.stored(out["study_id"])
+    assert saved["print_process"] == "fdm_0.4"
+    assert saved["topology"]["min_member_mm"] == 2.4
+    assert saved["topology"]["overhang_angle_deg"] == 45
+    assert "overhang_penalty" not in saved["topology"], "not offered by this pair"
+    assert "no_enclosed_voids" not in saved["topology"], "not offered by this pair"
+    assert any("overhang_angle_deg=45" in note for note in out["notes"])
+    assert not any("min_member_mm=" in note for note in out["notes"])
+    envelope = h.starts[-1]["payload"]["params"]["study"]
+    assert envelope["build_plate"]["label"] == "print bed"
+    assert envelope["build_plate"]["faces"]["points"] == BOTTOM["points"]
+    assert envelope["build_plate"]["faces"]["face_normal"] == [0.0, 0.0, -1.0]
+    assert saved["build_plate"] == {"faces": ["bottom"], "label": "print bed"}
+
+
+def test_print_preset_writes_all_and_only_offered_parameters(h):
+    h.doc.caps["combinations"][0]["parameters"] += ["overhang_penalty", "no_enclosed_voids"]
+    base = _gui_study()
+    base.pop("id")
+    base.update(print_process="fdm_0.6", build_plate={"faces": ["bottom"]})
+    out = h.run(study=base)
+    assert out["ok"] is True, out
+    topology = h.doc.stored(out["study_id"])["topology"]
+    for key, value in topo.print_process("fdm_0.6")["topology"].items():
+        assert topology[key] == value
+    assert any("no_enclosed_voids=false" in note for note in out["notes"])
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_powder_null_preset_keys_do_not_insert_or_erase_settings(h, explicit):
+    h.doc.caps["combinations"][0]["parameters"] += ["overhang_penalty", "no_enclosed_voids"]
+    base = _gui_study()
+    base.pop("id")
+    base["print_process"] = "powder"
+    if explicit:
+        base["topology"].update(overhang_angle_deg=60, overhang_penalty=0.25,
+                                build_direction=[0, 0, 1])
+    out = h.run(study=base)
+    assert out["ok"] is True, out
+    settings = h.doc.stored(out["study_id"])["topology"]
+    if explicit:
+        assert settings["overhang_angle_deg"] == 60
+        assert settings["overhang_penalty"] == 0.25
+    else:
+        assert "overhang_angle_deg" not in settings
+        assert "overhang_penalty" not in settings
+    assert settings["no_enclosed_voids"] is True
+
+
+def test_unknown_print_preset_refuses_before_save_or_export(h):
+    base = {k: v for k, v in _gui_study().items() if k != "id"}
+    out = h.run(study={**base, "print_process": "unknown"})
+    assert out["ok"] is False and out["code"] == "unknown_print_process", out
+    assert out["field"] == "study.print_process"
+    assert all(p["id"] in out["error"] for p in topo.print_processes())
+    assert not {"sim_study_add", "sim_study_edit", "doc_export_step"} & set(h.doc.calls)
+    assert not h.starts and not (h.project / "simulation").exists()
+
+
+@pytest.mark.parametrize(("changes", "code", "field"), [
+    ({"volume_fraction": None}, "missing_volume_fraction", "volume_fraction"),
+    ({"volume_fraction": 0}, "out_of_range", "volume_fraction"),
+    ({"volume_fraction": -0.1}, "out_of_range", "volume_fraction"),
+    ({"volume_fraction": 1.1}, "out_of_range", "volume_fraction"),
+    ({"overhang_angle_deg": 45}, "build_direction_required", "build_direction"),
+    ({"overhang_penalty": 1}, "build_direction_required", "build_direction"),
+    ({"objective": "mass"}, "mass_needs_limit", "objective"),
+])
+@pytest.mark.parametrize("stored", [False, True])
+def test_topology_intent_refuses_before_any_study_write_or_export(
+        h, changes, code, field, stored):
+    base = _gui_study()
+    base["topology"].update(changes)
+    if changes.get("volume_fraction", False) is None:
+        base["topology"].pop("volume_fraction")
+    h.doc.caps["combinations"][0]["parameters"].append("overhang_penalty")
+    if stored:
+        h.doc.studies.append(base)
+        out = h.run(study_id=base["id"])
+    else:
+        base.pop("id")
+        out = h.run(study=base)
+    assert out["ok"] is False and out["code"] == code, out
+    assert out["field"] == f"study.topology.{field}"
+    if code == "build_direction_required":
+        assert out["error"] == (
+            "Overhang control needs a build direction or a bed face (build_plate).")
+    assert not {"sim_study_add", "sim_study_edit", "doc_export_step"} & set(h.doc.calls)
+    assert not h.starts and not (h.project / "simulation").exists()
+
+
+def test_overhang_penalty_uses_native_45_degree_default_with_a_bed_face(h):
+    h.doc.caps["combinations"][0]["parameters"].append("overhang_penalty")
+    base = _gui_study()
+    base.pop("id")
+    base["build_plate"] = {"faces": ["bottom"]}
+    base["topology"]["overhang_penalty"] = 1.0
+    out = h.run(study=base)
+    assert out["ok"] is True, out
+    settings = h.starts[-1]["meta"]["settings"]
+    assert "overhang_angle_deg" not in settings
+    raw = _native_result(Path(out["artifact_dir"]))
+    raw["manufacturing"]["enforcement"] = {
+        "overhang": {"build_direction": [0, 0, 1], "build_direction_source": "build_plate"}}
+    _finish(h.starts[-1]["meta"], raw, out["job_id"])
+    collected = cad_common.collect_durable(out["job_id"])
+    assert collected["result"]["manufacturing"]["dfam"]["overhang_max_deg"] == 45
+
+
+@pytest.mark.parametrize("process_id", ["fdm_0.6", "resin"])
+def test_dfam_prefers_print_surface_and_uses_process_dimensions(tmp_path, monkeypatch, process_id):
+    import services.dfam as dfam_pkg
+
+    raw = _native_result(tmp_path)
+    print_path = tmp_path / "surface_print.stl"
+    _cube_stl(print_path)
+    raw["artifacts"]["surface_stl"] = raw["artifacts"].pop("surface")
+    raw["artifacts"]["surface_print_stl"] = {
+        **topo.file_record(print_path), "format": "stl"}
+    raw["manufacturing"]["enforcement"] = {
+        "overhang": {"build_direction": [1, 0, 0], "build_direction_source": "build_plate"}}
+    calls = []
+    analyze = dfam_pkg.analyze_printability
+
+    def capture(mesh, params, build_dir):
+        calls.append((params, build_dir))
+        return analyze(mesh, params, build_dir)
+
+    monkeypatch.setattr(dfam_pkg, "analyze_printability", capture)
+    process = topo.print_process(process_id)
+    manufacturing = topo.dfam_report(
+        raw, raw["artifacts"], {"build_direction": [0, 1, 0]}, process)
+    report = manufacturing["dfam"]
+    assert report["checked"] is True, report
+    assert report["artifact"] == "surface_print_stl"
+    assert report["process"] == process["process"]
+    assert calls[0][0].process == process["process"]
+    assert calls[0][0].layer_height_mm == process["layer_height_mm"]
+    if "nozzle_mm" in process:
+        assert calls[0][0].nozzle_mm == process["nozzle_mm"]
+        assert calls[0][0].line_width_mm == process["line_width_mm"]
+        assert report["nozzle_mm"] == process["nozzle_mm"]
+    assert report["build_dir"] == [1, 0, 0]
+    assert "build_dir_assumed" not in report
+    assert f"{process['process'].upper()} rules" in report["summary"]
+    assert manufacturing["print_ready"] is False
+
+
+@pytest.mark.parametrize(("settings", "source", "direction"), [
+    ({}, "assumed", [0, 0, 1]),
+    ({"build_direction": [0, 1, 0]}, "build_direction", [0, 1, 0]),
+])
+def test_dfam_reports_direction_fallback_truthfully(tmp_path, settings, source, direction):
+    result = _native_result(tmp_path)
+    manufacturing = topo.dfam_report(result, result["artifacts"], settings)
+    dfam = manufacturing["dfam"]
+    assert dfam["checked"] is True, dfam
+    assert dfam["build_dir"] == direction
+    assert dfam.get("build_dir_assumed", False) is (source == "assumed")
+
+
+@pytest.mark.parametrize("mismatch", ["hash", "missing", "outside", "no_hash"])
+def test_topology_dfam_worker_refuses_unverified_preferred_surface(tmp_path, mismatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    result = _native_result(run_dir)
+    result["topology"] = {"physics": "structural", "method": "simp", "volume_fraction": 0.4}
+    print_path = run_dir / "surface_print.stl"
+    _cube_stl(print_path)
+    entry = {**topo.file_record(print_path), "format": "stl"}
+    if mismatch == "hash":
+        print_path.write_text("modified", encoding="utf-8")
+    elif mismatch == "missing":
+        print_path.unlink()
+    elif mismatch == "outside":
+        outside = tmp_path / "outside.stl"
+        _cube_stl(outside)
+        entry = {**topo.file_record(outside), "format": "stl"}
+    else:
+        entry.pop("sha256")
+    result["artifacts"]["surface_print_stl"] = entry
+    (run_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    out = WORKER_METHODS["topology_dfam"]({"run_dir": str(run_dir)}, lambda *_: None)
+    assert out["ok"] is False and out["code"] == "artifact_mismatch", out
+    assert "surface_print_stl" in out["error"]
+
+
+def test_topology_dfam_worker_checks_fixture_run_and_matches_shared_report(tmp_path):
+    result = _native_result(tmp_path)
+    result["topology"] = {"physics": "structural", "method": "simp", "volume_fraction": 0.4,
+                          "min_member_mm": 1.8, "build_direction": [0, 0, 1]}
+    result["artifacts"]["surface_stl"] = result["artifacts"].pop("surface")
+    (tmp_path / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    out = WORKER_METHODS["topology_dfam"](
+        {"run_dir": str(tmp_path), "print_process": "fdm_0.6"}, lambda *_: None)
+    expected = topo.dfam_report(result, result["artifacts"], result["topology"],
+                                topo.print_process("fdm_0.6"))
+    assert out == {"ok": True, "dfam": expected["dfam"], "print_ready": False,
+                   "print_ready_reason": expected["print_ready_reason"]}
+    assert out["dfam"]["checked"] is True
+    assert out["dfam"]["nozzle_mm"] == 0.6
+
+
+@pytest.mark.parametrize(("material", "slicer_material"), [
+    ("pla", "PLA"), ({"key": "petg"}, "PETG"), ("abs", "ABS"), ("asa", "ASA"),
+    ("tpu", "TPU"), ("6061-T6", None), ({"name": "PLA plastic"}, None),
+])
+def test_print_handoff_prefers_print_surface_and_only_maps_library_materials(
+        h, material, slicer_material):
+    h.doc.studies.append(_gui_study())
+    out = h.run(study_id="study-00000001", study={
+        "print_process": "fdm_0.4", "build_plate": {"faces": ["bottom"]}})
+    assert out["ok"] is True, out
+    meta = h.starts[-1]["meta"]
+    meta["material_key"] = material if isinstance(material, str) else material.get("key")
+    run_dir = Path(out["artifact_dir"])
+    result = _native_result(run_dir)
+    print_path = run_dir / "surface_print.stl"
+    _cube_stl(print_path)
+    result["artifacts"]["surface_stl"] = result["artifacts"].pop("surface")
+    result["artifacts"]["surface_print_stl"] = {
+        **topo.file_record(print_path), "format": "stl"}
+    result["manufacturing"]["enforcement"] = {
+        "overhang": {"build_direction": [0, 0, 1], "build_direction_source": "build_plate"}}
+    _finish(meta, result, out["job_id"])
+    collected = cad_common.collect_durable(out["job_id"])
+    expected = {
+        "surface_path": str(print_path), "surface_artifact": "surface_print_stl",
+        "build_dir": [0, 0, 1], "build_dir_source": "build_plate", "print_process": "fdm_0.4",
+        "slice_part": {"path": str(print_path), "build_dir": [0, 0, 1]},
+        "import_part": {"path": str(print_path), "as_solid": True}}
+    if slicer_material:
+        expected["material"] = slicer_material
+        expected["slice_part"]["material"] = slicer_material
+    assert collected["print_handoff"] == expected
+    assert collected["result"]["print_handoff"] == expected
+    assert "printer" not in collected["print_handoff"]["slice_part"]
+    assert collected["result"]["manufacturing"]["dfam"]["process"] == "fdm"
+    assert collected["result"]["topology"]["min_member_mm"] == 1.2
+
+
+def test_resolved_bed_faceset_is_validated_before_job_submission(h, tmp_path):
+    step = tmp_path / "source.step"
+    step.write_text("ISO-10303-21;", encoding="utf-8")
+    study = topo.normalize_study(_gui_study(), [])
+    study["build_plate"] = {"faces": ["bottom"]}
+    envelope = topo.build_envelope(
+        study, settings=study["topology"], material=study["material"],
+        resolve=lambda selector: h.doc.query("doc-1", selector) if isinstance(
+            selector, str) else [LEFT if selector["topo"] == 1 else RIGHT],
+        step_path=str(step), result_dir=str(tmp_path), notes=[])
+    topo.validate_run_envelope(envelope)
+    envelope["build_plate"]["faces"] = {"selector": "bottom"}
+    with pytest.raises(ValueError, match="build_plate.*points"):
+        topo.validate_run_envelope(envelope)
+
+
+@pytest.mark.parametrize(("params", "code"), [
+    ({}, "invalid_input"), ({"run_dir": "relative"}, "invalid_input"),
+    (None, "invalid_input"),
+])
+def test_topology_dfam_worker_refuses_invalid_run_parameters(params, code):
+    out = WORKER_METHODS["topology_dfam"](params, lambda *_: None)
+    assert out["ok"] is False and out["code"] == code
+
+
+def test_topology_dfam_worker_refuses_non_topology_results_and_unknown_presets(tmp_path):
+    path = tmp_path / "result.json"
+    path.write_text('{"ok":true}', encoding="utf-8")
+    params = {"run_dir": str(tmp_path)}
+    out = WORKER_METHODS["topology_dfam"](params, lambda *_: None)
+    assert out["code"] == "invalid_result"
+    result = _native_result(tmp_path)
+    result["topology"] = {}
+    path.write_text(json.dumps(result), encoding="utf-8")
+    out = WORKER_METHODS["topology_dfam"](
+        {**params, "print_process": "unknown"}, lambda *_: None)
+    assert out["code"] == "unknown_print_process"

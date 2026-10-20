@@ -84,8 +84,8 @@ echo 'REAL SIGN-IN WITH THE OWNER PASSWORD (over the public internet)'
 JAR=$(mktemp)
 login=$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" --max-time 25 -c "$JAR" \
   -H 'Content-Type: application/json' \
-  --data "{\"email\":\"haedmonds69@gmail.com\",\"password\":\"$OWNER_PASSWORD\"}" \
-  https://app.chudware.com/api/auth/login)
+  --data-binary @- https://app.chudware.com/api/auth/login < <(
+    python3 -c 'import json, os; print(json.dumps({"email": "haedmonds69@gmail.com", "password": os.environ["OWNER_PASSWORD"]}))'))
 if [ "$login" = "200" ] && grep -q chudware_sid "$JAR"; then
   echo '  ok   login returned 200 and set a chudware_sid cookie'; PASS_COUNT=$((PASS_COUNT + 1))
 else

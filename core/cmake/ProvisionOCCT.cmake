@@ -1,9 +1,9 @@
 # ProvisionOCCT.cmake — make the OCCT (Open CASCADE) 3D B-rep kernel available.
 #
-# Windows: mirrors the app's runtime-provisioning philosophy (services/installer/provision.py
-# for the Python runtime): if the kernel isn't already at the expected location,
-# DOWNLOAD and extract the official prebuilt VC14 binary — no manual install step.
-# Then find_package() it and expose a helper to deploy its DLLs next to an exe.
+# Windows: authenticate the official pinned VC14 archive (including cache reuse),
+# then reconstruct the managed SDK on every configure before find_package().
+# Extracted-only caches are not trusted. OCCT_ROOT stores archive bytes;
+# OCCT_LOCAL_SOURCE_DIR is the explicit reviewed development-only override.
 #
 # Linux/macOS: there is no official prebuilt to download, so use the SYSTEM OCCT
 # (e.g. Fedora `opencascade-devel`, Debian `libocct-*-dev`, Homebrew `opencascade`)
@@ -18,36 +18,38 @@
 # OCCT 8.0 changed BRepMesh_IncrementalMesh's API that our tessellation path depends
 # on. On Linux we accept the distro's 7.9.x (Fedora 44 ships 7.9.3).
 
-set(OCCT_VERSION "7.9.3" CACHE STRING "OCCT version to provision (Windows download)")
+set(OCCT_VERSION "7.9.3")
+include("${CMAKE_CURRENT_LIST_DIR}/AuthenticatedArchive.cmake")
+if(NOT DEFINED OCCT_LOCAL_SOURCE_DIR)
+  set(OCCT_LOCAL_SOURCE_DIR "" CACHE PATH "Explicit reviewed local OCCT SDK (development only)")
+endif()
 
 if(WIN32)
-  set(OCCT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/occt"
-      CACHE PATH "OCCT install root (auto-provisioned if missing)")
+  if(NOT DEFINED OCCT_ROOT)
+    set(OCCT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/occt"
+        CACHE PATH "OCCT install root (auto-provisioned if missing)")
+  endif()
   file(TO_CMAKE_PATH "${OCCT_ROOT}" OCCT_ROOT)
 
-  set(_occt_home "${OCCT_ROOT}/opencascade-${OCCT_VERSION}-vc14-64")
-  set(_occt_3p   "${OCCT_ROOT}/3rdparty-vc14-64")
-  set(_occt_cfg  "${_occt_home}/cmake/OpenCASCADEConfig.cmake")
-
-  # --- auto-provision if the kernel isn't present ----------------------------
-  if(NOT EXISTS "${_occt_cfg}")
-    set(_zip "${OCCT_ROOT}/occt-combined.zip")
-    # The git tag uses underscores (V7_9_3) but the asset filename uses dots.
-    string(REPLACE "." "_" _tag "V${OCCT_VERSION}")
-    set(_url "https://github.com/Open-Cascade-SAS/OCCT/releases/download/${_tag}/opencascade-${OCCT_VERSION}-vc14-64-combined.zip")
-    file(MAKE_DIRECTORY "${OCCT_ROOT}")
-    if(NOT EXISTS "${_zip}")
-      message(STATUS "[occt] kernel not detected — downloading prebuilt ${OCCT_VERSION} (~250 MB)…")
-      file(DOWNLOAD "${_url}" "${_zip}" SHOW_PROGRESS STATUS _st)
-      list(GET _st 0 _code)
-      if(NOT _code EQUAL 0)
-        file(REMOVE "${_zip}")
-        message(FATAL_ERROR "[occt] download failed: ${_st}\n  url: ${_url}")
-      endif()
+  if(OCCT_LOCAL_SOURCE_DIR)
+    if(NOT CHUDWARE_DEVELOPER_BUILD OR DEFINED ENV{CI} OR DEFINED ENV{CHUDWARE_RELEASE_CHANNEL})
+      message(FATAL_ERROR "[occt] local SDK overrides are development-only")
     endif()
-    message(STATUS "[occt] extracting ${_zip} → ${OCCT_ROOT} …")
-    file(ARCHIVE_EXTRACT INPUT "${_zip}" DESTINATION "${OCCT_ROOT}")
+    set(_occt_install "${OCCT_LOCAL_SOURCE_DIR}")
+    message(WARNING "[occt] LOCAL SOURCE: ${_occt_install}; not an authenticated release SDK")
+  else()
+    # Primary upstream release asset digest:
+    # https://api.github.com/repos/Open-Cascade-SAS/OCCT/releases/tags/V7_9_3
+    set(_occt_install "${CMAKE_BINARY_DIR}/authenticated-sdk/occt")
+    chudware_authenticated_archive(
+      "https://github.com/Open-Cascade-SAS/OCCT/releases/download/V7_9_3/opencascade-7.9.3-vc14-64-combined.zip"
+      "${OCCT_ROOT}/occt-combined.zip"
+      "afbef3457fbc4a2bdca0608e0fe284392f51e4c2c42ccbfb9df7168d8e4eb9b3"
+      "${_occt_install}")
   endif()
+  set(_occt_home "${_occt_install}/opencascade-${OCCT_VERSION}-vc14-64")
+  set(_occt_3p   "${_occt_install}/3rdparty-vc14-64")
+  set(_occt_cfg  "${_occt_home}/cmake/OpenCASCADEConfig.cmake")
   if(NOT EXISTS "${_occt_cfg}")
     message(FATAL_ERROR "[occt] expected ${_occt_cfg} after provisioning — layout changed?")
   endif()

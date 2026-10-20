@@ -1,8 +1,9 @@
 """Transactional email: render, queue, drain.
 
-One entry point, :func:`send`. It renders ``templates/email/<template>.{subject,txt,html}``
-with :class:`string.Template` (stdlib — six templates do not justify a Jinja
-dependency) and writes a row to ``mail_outbox``. It does **not** talk to a mail
+Ordinary mail uses :func:`send`; credential transitions reserve eligibility with
+:func:`prepare` and persist with :func:`enqueue` in their token transaction.
+Templates use :class:`string.Template`; queued context is AES-256-GCM ciphertext
+bound to recipient/template with a key outside PostgreSQL. It does not talk to a mail
 server. A single asyncio task started by :func:`start_drain` claims due rows and
 delivers them through the backend named by ``CHUDWARE_MAIL_BACKEND``.
 
@@ -12,17 +13,21 @@ must never turn a signup into a 500. Everything :func:`send` can go wrong at is
 logged and swallowed; everything the *transport* can go wrong at is retried
 with exponential backoff and abandoned after ``MAX_ATTEMPTS`` with the failure
 recorded in ``mail_outbox.last_error`` for an operator to read.
+Context is erased immediately on successful delivery or final failure, and the
+drain erases expired or abandoned envelopes before claiming any due messages.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import os
 import smtplib
 import ssl
-from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import parseaddr
 from html import escape
@@ -31,13 +36,16 @@ from string import Template
 from typing import Any, Mapping
 
 import httpx
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 try:
     from .config import settings
+    from . import deployment_drain
     from .db import tx
     from .limits import RateLimiter
 except ImportError:  # uvicorn app:app from the package dir
     from config import settings
+    import deployment_drain
     from db import tx
     from limits import RateLimiter
 
@@ -120,37 +128,80 @@ def _template(template: str, ext: str) -> Template:
     return Template((TEMPLATE_DIR / f"{template}.{ext}").read_text(encoding="utf-8"))
 
 
-def send(to: str, template: str, ctx: dict[str, Any]) -> None:
-    """Queue one message for ``to``. Never raises, never touches the network.
+def _context_key() -> bytes:
+    key = settings.mail_context_encryption_key
+    if len(key) != 32:
+        raise RuntimeError("CHUDWARE_MAIL_CONTEXT_ENCRYPTION_KEY must encode 32 bytes")
+    return key
 
-    Callers are HTTP handlers; the contract they need is that mail is
-    best-effort and cannot fail their request. A bad address, an unrenderable
-    template, an over-budget recipient or an unreachable database all end the
-    same way — logged, and nothing queued.
-    """
+
+def _context_aad(to: str, template: str) -> bytes:
+    return json.dumps(["chudware-mail-context-v1", to, template]).encode()
+
+
+def decrypt_context(to: str, template: str, envelope: str) -> dict[str, Any]:
+    """Open an authenticated envelope; legacy plaintext is never accepted."""
+    encoded = json.loads(envelope)["encrypted_v1"]
+    raw = base64.b64decode(encoded, altchars=b"-_", validate=True)
+    plaintext = AESGCM(_context_key()).decrypt(
+        raw[:12], raw[12:], _context_aad(to, template)
+    )
+    return json.loads(plaintext)
+
+
+@dataclass(frozen=True, slots=True)
+class Prepared:
+    to: str
+    template: str
+    envelope: str
+    expires_at: datetime
+
+
+def prepare(to: str, template: str, ctx: Mapping[str, Any], *,
+            expires_at: datetime | None = None) -> Prepared | None:
+    """Validate/encrypt and reserve mail budget BEFORE replacing any capability."""
     addr = parseaddr(to)[1].strip()
     if "@" not in addr:
-        log.warning("mail: refusing template=%s — %r is not an address", template, to)
-        return
+        return None
     try:
         render(template, ctx)
-    except Exception:  # noqa: BLE001 — a copy bug must not 500 a signup
-        log.exception("mail: cannot render template=%s for %s — dropped", template, addr)
-        return
+        nonce = os.urandom(12)
+        encrypted = AESGCM(_context_key()).encrypt(
+            nonce, json.dumps(dict(ctx), default=str).encode(), _context_aad(addr, template)
+        )
+        envelope = json.dumps({"encrypted_v1": base64.urlsafe_b64encode(nonce + encrypted).decode()})
+    except Exception:
+        # Context and rendered bodies may contain bearer capabilities.
+        log.warning("mail: cannot prepare template=%s", template)
+        return None
     if not outbound.check(addr.lower()):
-        log.warning("mail: rate limited %s template=%s — dropped", addr, template)
+        log.warning("mail: rate limited %s template=%s", addr, template)
+        return None
+    if expires_at is None:
+        hours = 1 if template == "password_reset" else 24
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=hours)
+    return Prepared(addr, template, envelope, expires_at)
+
+
+def enqueue(message: Prepared) -> None:
+    """Persist accepted mail in the caller's transaction; failures MUST unwind it."""
+    with tx() as cur:
+        cur.execute(
+            "INSERT INTO mail_outbox (to_addr, template, ctx_json, next_attempt_at, context_expires_at)"
+            " VALUES (%s, %s, %s, now(), %s)",
+            (message.to, message.template, message.envelope, message.expires_at),
+        )
+
+
+def send(to: str, template: str, ctx: dict[str, Any]) -> None:
+    """Best-effort queueing for mail without a coupled credential transition."""
+    message = prepare(to, template, ctx)
+    if message is None:
         return
     try:
-        with tx() as cur:
-            cur.execute(
-                "INSERT INTO mail_outbox (to_addr, template, ctx_json, next_attempt_at) "
-                "VALUES (%s, %s, %s, now())",
-                (addr, template, json.dumps(ctx, default=str)),
-            )
-    except Exception:  # noqa: BLE001 — a dead database must not 500 a signup
-        log.exception("mail: enqueue failed template=%s for %s", template, addr)
-        return
-    log.info("mail: queued template=%s to=%s", template, addr)
+        enqueue(message)
+    except Exception:
+        log.warning("mail: enqueue failed template=%s", template)
 
 
 # Claim and schedule in one statement so a worker that dies mid-delivery still
@@ -168,6 +219,8 @@ UPDATE mail_outbox
             WHERE sent_at IS NULL
               AND attempts < %s
               AND next_attempt_at <= now()
+              AND ctx_json <> '{}'
+              AND context_expires_at > now()
             ORDER BY id
             LIMIT %s
        )
@@ -226,26 +279,31 @@ def backlog() -> Backlog:
 def _record_sent(row_id: int) -> None:
     with tx() as cur:
         cur.execute(
-            "UPDATE mail_outbox SET sent_at = now(), last_error = NULL WHERE id = %s",
+            "UPDATE mail_outbox SET sent_at = now(), last_error = NULL, ctx_json = '{}' WHERE id = %s",
             (row_id,),
         )
 
 
 def scrub_expired_context() -> int:
-    """Erase bearer-bearing context once queued links can no longer be valid."""
+    """Erase sent, expired, and abandoned envelopes before claiming due mail."""
     with tx() as cur:
         cur.execute(
             "UPDATE mail_outbox SET ctx_json = '{}'"
-            " WHERE ctx_json <> '{}' AND created_at < now() - interval '24 hours'"
+            " WHERE ctx_json <> '{}' AND (sent_at IS NOT NULL OR attempts >= %s"
+            " OR context_expires_at <= now())",
+            (MAX_ATTEMPTS,),
         )
         return cur.rowcount
 
 
 def _record_failure(row_id: int, attempts: int, exc: BaseException) -> None:
-    detail = f"{type(exc).__name__}: {exc}"[:500]
+    # Transport exceptions can contain a message body or provider response.
+    detail = f"{type(exc).__name__}: delivery failed"
     with tx() as cur:
         cur.execute(
-            "UPDATE mail_outbox SET last_error = %s WHERE id = %s", (detail, row_id)
+            "UPDATE mail_outbox SET last_error = %s,"
+            " ctx_json = CASE WHEN %s >= %s THEN '{}' ELSE ctx_json END WHERE id = %s",
+            (detail, attempts, MAX_ATTEMPTS, row_id),
         )
     if attempts >= MAX_ATTEMPTS:
         log.error(
@@ -367,6 +425,29 @@ def _deliver_smtp(to: str, message: Rendered) -> None:
 
 
 async def drain_once() -> int:
+    # Reserve before claiming rows. Closed maintenance leaves the durable
+    # outbox untouched, while a previously accepted batch finishes normally.
+    try:
+        admission = deployment_drain.controller().acquire(inherit=False)
+    except deployment_drain.HTTPException as exc:
+        if exc.status_code != 503:
+            raise
+        return 0
+    try:
+        with admission.bind():
+            task = asyncio.create_task(_drain_once_accepted())
+    except BaseException:
+        admission.close()
+        raise
+    task.add_done_callback(lambda done: admission.close() if not done.cancelled() else None)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.shield(task)
+        raise
+
+
+async def _drain_once_accepted() -> int:
     """Attempt every message that is due. Returns how many were delivered.
 
     Blocking work — psycopg calls and the transports themselves — runs in a
@@ -377,7 +458,9 @@ async def drain_once() -> int:
     delivered = 0
     for row in claimed:
         try:
-            message = render(row["template"], json.loads(row["ctx_json"]))
+            message = render(row["template"], decrypt_context(
+                row["to_addr"], row["template"], row["ctx_json"]
+            ))
             await asyncio.to_thread(_deliver, row["to_addr"], message)
         except Exception as exc:  # noqa: BLE001 — every failure is retriable
             await asyncio.to_thread(_record_failure, row["id"], row["attempts"], exc)
@@ -388,9 +471,10 @@ async def drain_once() -> int:
 
 
 _drain_task: asyncio.Task[None] | None = None
+_drain_stop: asyncio.Event | None = None
 
 
-async def _drain_loop() -> None:
+async def _drain_loop(stop: asyncio.Event) -> None:
     try:
         depth = await asyncio.to_thread(backlog)
     except Exception:  # noqa: BLE001 — a boot-time read must not kill the loop
@@ -403,34 +487,39 @@ async def _drain_loop() -> None:
             depth.abandoned,
             depth.oldest_age_sec,
         )
-    while True:
+    while not stop.is_set():
         try:
             await drain_once()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — the loop outlives any single pass
             log.exception("mail: drain pass failed")
-        await asyncio.sleep(DRAIN_INTERVAL_SEC)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=DRAIN_INTERVAL_SEC)
+        except TimeoutError:
+            pass
 
 
 def start_drain() -> None:
     """Start the one outbox drain task. Idempotent; call from app startup."""
-    global _drain_task
+    global _drain_task, _drain_stop
     if _drain_task is not None and not _drain_task.done():
         return
-    _drain_task = asyncio.create_task(_drain_loop(), name="mail-drain")
+    _drain_stop = asyncio.Event()
+    _drain_task = asyncio.create_task(_drain_loop(_drain_stop), name="mail-drain")
     log.info("mail: drain started backend=%s", settings.mail_backend)
 
 
 async def stop_drain() -> None:
-    """Cancel the drain task and wait for it. Call from app shutdown."""
-    global _drain_task
-    task, _drain_task = _drain_task, None
+    """Stop new passes and wait for accepted deliveries, including their threads."""
+    global _drain_task, _drain_stop
+    task, stop = _drain_task, _drain_stop
     if task is None:
         return
-    task.cancel()
-    with suppress(asyncio.CancelledError):
-        await task
+    stop.set()
+    await task
+    if _drain_task is task:
+        _drain_task = _drain_stop = None
 
 
 __all__ = [
@@ -441,6 +530,9 @@ __all__ = [
     "TEMPLATES",
     "backlog",
     "drain_once",
+    "decrypt_context",
+    "enqueue",
+    "prepare",
     "outbound",
     "render",
     "send",

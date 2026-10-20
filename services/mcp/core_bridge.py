@@ -21,11 +21,13 @@ Public surface:
 """
 from __future__ import annotations
 
+from contextvars import ContextVar
 import ctypes
 import json
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -271,27 +273,79 @@ def reset_daemon_fallback() -> None:
 # strip it off the engine result here (tool code never expects the key) and
 # buffer it; cad_tools._dumps appends a human-readable note to the next tool
 # output. Legacy mode never buffers anything, so this is purely additive.
-_FOREIGN_EDITS_PENDING: list = []
+# None is the standalone MCP/process slot. Host dispatch binds a (turn, agent)
+# key so task names reused by another session cannot share documents or notes.
+CURRENT_AGENT: ContextVar[object] = ContextVar("cad_current_agent", default=None)
+_FOREIGN_EDITS_PENDING: dict[object, list] = {}
+_FOREIGN_EDITS_LOCK = threading.Lock()
+_BUSY_PREVIEW_BUDGET_S = 30.0
 
 
 def consume_foreign_edits() -> list:
-    """Drain buffered foreign-edit records ({doc_id, revision, source_kind, method})."""
-    out, _FOREIGN_EDITS_PENDING[:] = _FOREIGN_EDITS_PENDING[:], []
-    return out
+    """Drain only the calling agent's buffered foreign-edit records."""
+    with _FOREIGN_EDITS_LOCK:
+        return _FOREIGN_EDITS_PENDING.pop(CURRENT_AGENT.get(), [])
 
 
 def _call_via_daemon(method: str, params: Optional[dict]) -> dict:
     from . import daemon_bridge  # local import: zero cost on the legacy path
 
-    result = daemon_bridge.client().call(method, params)
-    if isinstance(result, dict):
-        fe = result.pop("_foreign_edits", None)
-        if isinstance(fe, list):
-            _FOREIGN_EDITS_PENDING.extend(fe)
-    if isinstance(result, dict) and result.pop("_is_error", False):
+    connection = daemon_bridge.client()
+    original = dict(params or {})
+    # Implicit agent batches are serialized and geometry-validated under DocLock.
+    # Disable hostd's last-seen CAS injection; explicit CAS remains opt-in.
+    if method == "doc_apply_ops" and "base_revision" not in original:
+        original["base_revision"] = -1
+    busy_deadline = None
+    while True:
+        result = connection.call(method, original)
+        if isinstance(result, dict):
+            fe = result.pop("_foreign_edits", None)
+            if isinstance(fe, list) and fe:
+                with _FOREIGN_EDITS_LOCK:
+                    _FOREIGN_EDITS_PENDING.setdefault(CURRENT_AGENT.get(), []).extend(fe)
+        if not (isinstance(result, dict) and result.pop("_is_error", False)):
+            return result if isinstance(result, dict) else {"result": result}
+        code = str(result.get("code", ""))
+        if code == "busy_preview":
+            # hostd emits this only before dispatch, for mutators/edit_hold.
+            # Unlike a transport failure, the operation cannot have applied.
+            now = time.monotonic()
+            if busy_deadline is None:
+                busy_deadline = now + _BUSY_PREVIEW_BUDGET_S
+            left = busy_deadline - now
+            if left <= 0:
+                doc = original.get("doc_id") or "this document"
+                raise CoreError(
+                    f"The user is editing {doc} in the app right now; "
+                    "work on something else and retry.",
+                    code=code, detail=result,
+                )
+            retry_ms = result.get("retry_ms", (result.get("detail") or {}).get("retry_ms", 500))
+            time.sleep(min(max(float(retry_ms) / 1000.0, 0.001), left))
+            continue
         msg = result.get("message") or result.get("error") or json.dumps(result)[:400]
-        raise CoreError(msg, code=str(result.get("code", "")), detail=result.get("detail"))
-    return result if isinstance(result, dict) else {"result": result}
+        raise CoreError(msg, code=code, detail=result.get("detail"))
+
+
+def revert_own_batch(doc_id, checkpoint: dict | None, applied_revision) -> bool:
+    """Revert only our sole batch since the snapshot, with a live revision guard."""
+    if not isinstance(checkpoint, dict):
+        return False
+    checkpoint_revision = checkpoint.get("revision")
+    if (type(checkpoint_revision) is not int
+            or type(applied_revision) is not int
+            or applied_revision != checkpoint_revision + 1
+            or not checkpoint.get("checkpoint")):
+        return False
+    try:
+        call("doc_revert", {"doc_id": doc_id, "checkpoint": checkpoint["checkpoint"],
+                            "expect_revision": applied_revision})
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "code", None) == "engine_connection_lost":
+            raise
+        return False
+    return True
 
 
 def call(method: str, params: Optional[dict] = None) -> dict:

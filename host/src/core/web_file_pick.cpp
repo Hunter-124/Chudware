@@ -1,5 +1,6 @@
 // Browser file picker + workspace browser — see web_file_pick.h.
 #include "web_file_pick.h"
+#include "fs_backend.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -69,9 +70,13 @@ extern "C" EMSCRIPTEN_KEEPALIVE void chudware_file_pick_done(
 
 // Called from JS when the workspace browser finishes (ok=1 + path, or cancel).
 extern "C" EMSCRIPTEN_KEEPALIVE void chudware_ws_browse_done(int ok, const char* path) {
-    if (ok && path && path[0]) {
-        std::strncpy(g_browse.path, path, sizeof(g_browse.path) - 1);
-        g_browse.path[sizeof(g_browse.path) - 1] = '\0';
+    std::string relative, err;
+    if (ok && path && (std::strcmp(path, "__UPLOAD__") == 0 ||
+                      workspaceRelativePath(path, relative, err)) &&
+        std::strlen(path) < sizeof(g_browse.path)) {
+        const std::string result = std::strcmp(path, "__UPLOAD__") == 0
+                                       ? "__UPLOAD__" : (relative.empty() ? "." : relative);
+        std::memcpy(g_browse.path, result.c_str(), result.size() + 1);
         g_browse.done = 1;
     } else {
         g_browse.path[0] = '\0';

@@ -1,808 +1,175 @@
-# Continuous deployment of master to production.
-#
-# This is the actuator the pipeline was missing. Full CI already ran on every
-# master push -- linux-gate runs scripts/gate.sh --strict, native-build compiles
-# and ctests every platform -- but nothing promoted a green commit, so
-# production served a bundle linked 2026-08-07 until 2026-08-22. Fifteen days
-# of stale assets behind a fully green tree, because "green" and "shipped" were
-# never connected by anything but a human remembering to run update.sh.
-#
-# POLICY CHANGE, stated rather than hidden: production now tracks master
-# automatically. Webservice/deploy/DEPLOYMENT.md previously specified prod as a
-# workflow_dispatch with an explicit v* tag. Hunter asked for continuous
-# deployment and that supersedes the tag gate. The tradeoff is real and is
-# accepted deliberately: a bad master commit reaches customers in one build
-# cycle instead of waiting for a human to cut a tag. What buys that back is the
-# blocking Stripe/source gates below, the
-# post-deploy verification step, and the automatic rollback -- which is why
-# Webservice/deploy/rollback.sh and retained releases had to exist before this
-# file could.
-#
-# No v* tag is created anywhere in here. release.yml triggers on `push: tags:
-# 'v*'` and builds desktop installers; a tag from this pipeline would spuriously
-# fire a multi-hour installer build on every deploy.
-#
-# Nothing is uploaded. Actions artifact storage is metered above the 500 MB free
-# allowance and accrues hourly; job logs and $GITHUB_STEP_SUMMARY are not
-# metered, so every diagnostic in here goes to one of those two.
+# Automatic master activation is suspended while independent release prerequisites
+# remain unqualified. Source policy is not evidence of installed/live authority.
+# A protected manual dispatch still requires exact-SHA qualification, all CI gates,
+# protected configuration and independent rollback authority. No force bypass.
 name: deploy-prod
 on:
-  # Master pushes drive production directly. CI fan-out is reported but does
-  # not block it: native-build runs only for release tags and its Linux rows
-  # queue on one builder (the emulated aarch64 row alone is bounded at 90
-  # minutes), and linux-gate can take hours. The fast-gate now uses the online
-  # Intel Mac, but its queued runs can still lag; the source audits run inline
-  # before promotion instead.
-  push:
-    branches: [master]
   workflow_dispatch:
     inputs:
-      force:
-        description: 'Deploy even when a gate is not green, master has advanced, or the commit already shipped'
-        type: boolean
-        default: false
+      first_cutover_ack:
+        description: 'Optional explicit root registry ack path binding this exact commit and verified manual recovery prerequisites; never auto-created'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
-  # Required to LIST workflow runs for the target sha. Without it `gh api
-  # .../actions/workflows/<f>/runs` 403s, which is exactly how the first
-  # push-triggered deploy died -- reading advisory CI state it does not act on.
   actions: read
-  # Failure alerting files and later closes one deduplicated GitHub issue, the
-  # same recovery shape prod-external-watch uses. Nothing else here writes.
   issues: write
 
-# Never cancel a deploy mid-flight. update.sh takes a pg_dump backup, rebuilds
-# the engine, relinks WASM and swaps a symlink; a cancellation between the
-# backup and the swap leaves the box in a state no later run reasons about.
-# GitHub retains one running and one pending run, not a FIFO queue. Only
-# master pushes and explicit manual requests may replace the pending request;
-# old CI-completion events must not displace a newer master deployment.
 concurrency:
   group: deploy-prod
   cancel-in-progress: false
 
 jobs:
-  # Live Stripe verification runs in a separate reusable job before promotion.
-  # It resolves sandbox credentials independently; never source production's
-  # gateway.env into this job. The reusable workflow enforces test-only keys.
-  #
-  # This IS a blocking gate, unlike the advisory CI workflow states read in
-  # preflight. It runs on the available cc-linux-build endpoint and reaches a
-  # verdict before promotion.
-  #
-  # Until secrets.STRIPE_SANDBOX_ENV exists it reports NOT RUN with a warning
-  # annotation and does not block. require_credentials is left at its default
-  # false on purpose: flipping it on before the secret is added would wedge every
-  # deploy on a credential nobody has entered yet. Flip it to true once the
-  # secret is in place, and the gate becomes enforcing.
   stripe-gate:
     name: Gate — live Stripe sandbox
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref_protected && github.ref == 'refs/heads/master' }}
     uses: ./.github/workflows/stripe-sandbox.yml
-    # Required. Without it the called workflow cannot see STRIPE_SANDBOX_ENV and
-    # would silently report the gate as not run on every single deploy.
-    secrets: inherit
+    with:
+      require_credentials: true
+    secrets:
+      STRIPE_SANDBOX_ENV: ${{ secrets.STRIPE_SANDBOX_ENV }}
 
   deploy:
-    name: Promote master to production
-    # A failed Stripe gate skips the promotion. This is the one place in this
-    # file where a CI job genuinely blocks a deploy, and it earns that because it
-    # concludes: it runs on cc-linux-build, the runner linux-gate already reaches
-    # verdicts on, and it finishes in well under a minute. If the live catalog has
-    # drifted, a price id points at the wrong object, or a webhook endpoint has
-    # stopped being subscribed to an event we settle money on, shipping is the
-    # wrong move.
+    name: Explicit qualified production promotion
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref_protected && github.ref == 'refs/heads/master' }}
     needs: stripe-gate
-    # Only this repository's master pushes and authorized manual dispatches
-    # trigger the workflow. There is no external workflow_run payload to trust.
-    # livingroom-pc: the production box. This is not spare build capacity being
-    # abused -- update.sh only works here. It reads gateway.env and the
-    # entitlement credential, drives `systemctl --user` units, and swaps the
-    # web root that this same host serves. cc-linux-livingroom is the label that
-    # pins it to exactly that endpoint.
-    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-livingroom]
-    # The updater does a full core+host build, a `./build.sh daemon`, a WASM
-    # relink, and then waits for engine_bridges to drain to 0 before restarting.
-    # linux-gate budgets 120 minutes for a comparable Linux build plus every
-    # test suite; native-build budgets 180 for configure+build+ctest. 180 here
-    # is the same order and leaves room for the drain wait on a busy box, while
-    # still bounding a wedged build well short of the six-hour default that
-    # would hold the production host hostage.
+    environment: chudware-control-protected
+    runs-on:
+      group: chudware-trusted-protected
+      labels: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-livingroom]
     timeout-minutes: 180
     env:
       CANONICAL: /home/liveuser/Repositories/CAD
       WEB_ROOT: /home/liveuser/chudware-web
-      # install_webd.sh namespaces the daemon under this instance key; a
-      # --status without it queries a different (nonexistent) instance and
-      # always reports down.
-      CHUDWARE_INSTANCE_KEY: chudwareweb
-      # update.sh's prod arm now assigns GATEWAY_PORT=8300 itself, so this is no
-      # longer load-bearing -- but it is honored, and it pins the health
-      # assertion to the port this workflow believes in rather than to whatever
-      # a future edit of that case statement defaults to.
-      CHUDWARE_DEPLOY_HEALTH_BASE_URL: http://127.0.0.1:8300
-      # install_webd.sh stages the Chudcode runtime from this local file and
-      # verifies it against vendor/chudcode/CHUDCODE_ARTIFACT.lock (sha256 +
-      # `--version`). It lives outside the checkout, next to gateway.env, and
-      # must match the pinned linux-x64 release asset. Deployment never fetches.
-      CHUDWARE_CHUD_BIN: /home/liveuser/chudware-web-data/chud
-      # The commit whose gates are being checked and which must still be
-      # master's tip at deploy time. A manual dispatch uses its selected ref.
       TARGET_SHA: ${{ github.sha }}
-      TRIGGERED_BY: ${{ github.event_name }}
-      FORCE_DEPLOY: ${{ inputs.force || false }}
-      ALERT_TITLE: "[deploy-prod] Continuous deployment to production failed"
+      QUALIFIED_SHA: ${{ vars.CHUDWARE_PRODUCTION_QUALIFIED_SHA }}
+      FIRST_CUTOVER_ACK: ${{ inputs.first_cutover_ack }}
       GH_TOKEN: ${{ github.token }}
+      CHUDWARE_DEPLOY_TARGET_SHA: ${{ github.sha }}
+      CHUDWARE_DEPLOY_HEALTH_BASE_URL: http://127.0.0.1:8300
+      CHUDWARE_CHUD_BIN: /home/liveuser/chudware-web-data/chud
+      CHUDWARE_BASE_PYTHON: /usr/bin/python3
+      CHUDWARE_WHEELHOUSE: /var/lib/chudware-release/wheelhouse
     steps:
-      # There is deliberately no actions/checkout in this job. update.sh,
-      # install_webd.sh and rollback.sh all operate on the canonical checkout at
-      # /home/liveuser/Repositories/CAD, never on $GITHUB_WORKSPACE, so a
-      # checkout here would be a second multi-gigabyte clone on the production
-      # box that nothing reads. The post-deploy parity gate runs from the
-      # canonical tree for the same reason: it must compare the deployed bundle
-      # against the exact commit that produced it, and a second clone sitting at
-      # a different SHA would make that gate lie in both directions.
-
-      - name: Assert the production host and the service account
+      # No checkout or pre-gate sync on the production host. The canonical source
+      # must already be the independently prepared, clean qualified snapshot.
+      - name: Enforce independent qualification and protected host identity
         shell: bash
         run: |
           set -euo pipefail
-
-          # A GitHub Actions step runs as whatever user the runner service runs
-          # as, which is a property of how the runner was installed and not of
-          # anything in this file. That makes this assertion load-bearing rather
-          # than decorative: only liveuser can read gateway.env and the
-          # entitlement credential, and `systemctl --user` addresses liveuser's
-          # own session bus. A runner re-registered under any other account
-          # would fail deep inside the updater, after the pg_dump backup, with a
-          # permission error that reads like a corrupted install.
-          host="$(hostname -s)"
-          user="$(id -un)"
-          echo "host=${host} user=${user} runner=${RUNNER_NAME:-unknown} os=${RUNNER_OS:-unknown}"
-
-          if [ "${host}" != livingroom-pc ]; then
-            echo "::error title=Wrong deploy host::deploy-prod must run on livingroom-pc; this runner reports ${host}. update.sh swaps the web root this host serves and drives its user units, so it cannot deploy a box it is not on."
-            exit 1
-          fi
-          if [ "${RUNNER_OS:-}" != Linux ]; then
-            echo "::error title=Wrong runner OS::RUNNER_OS is ${RUNNER_OS:-unset}; the deploy path is Linux-only"
-            exit 1
-          fi
-          if [ "${user}" != liveuser ]; then
-            echo "::error title=Wrong service account::this runner executes as ${user}, not liveuser. Only liveuser can read ${WEB_ROOT}/webd.env and gateway.env, and only liveuser's session bus owns the chudware-hostd and chudware-gateway units. Re-register the runner service as liveuser rather than letting the updater fail half-way."
-            exit 1
-          fi
-
-          # install_webd.sh and rollback.sh drive `systemctl --user`, which needs
-          # a user session bus. A runner service is NOT a login session: it
-          # inherits no XDG_RUNTIME_DIR and no DBUS_SESSION_BUS_ADDRESS, so
-          # `systemctl --user daemon-reload` fails with a message that names
-          # neither. That is exactly how the first real automated deploy died --
-          # after the swap, leaving rollback to fail the same way one line later
-          # and report "ROLLBACK ITSELF FAILED" for a missing environment
-          # variable. Deploying by hand over ssh worked precisely because ssh
-          # DOES create a session.
-          #
-          # Exported through $GITHUB_ENV so every later step inherits it, and
-          # derived from `id -u` rather than hardcoding 1000. Mirrors the
-          # user_systemctl helper in Webservice/deploy/harden_host.sh.
+          [[ "${QUALIFIED_SHA}" = "${TARGET_SHA}" && "${TARGET_SHA}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo '::error::Independent release prerequisites are not qualified for this exact SHA. Protected environment approval and CHUDWARE_PRODUCTION_QUALIFIED_SHA must follow the external release evidence review.'
+            exit 4
+          }
+          [[ "$(hostname -s)" = livingroom-pc && "$(id -un)" = liveuser && "${RUNNER_OS}" = Linux ]] || exit 4
           runtime_dir="/run/user/$(id -u)"
-          if [ ! -d "${runtime_dir}" ]; then
-            echo "::error title=No user runtime directory::${runtime_dir} does not exist, so systemctl --user cannot reach liveuser's session bus and the updater would fail after promoting. Enable lingering: sudo loginctl enable-linger ${user}"
-            exit 1
-          fi
-          if [ ! -S "${runtime_dir}/bus" ]; then
-            echo "::error title=No user session bus::${runtime_dir}/bus is missing. systemctl --user needs it. Enable lingering: sudo loginctl enable-linger ${user}"
-            exit 1
-          fi
+          [[ -d "${runtime_dir}" && -S "${runtime_dir}/bus" && -d "${RUNNER_TEMP}" && -w "${RUNNER_TEMP}" ]] || exit 4
           {
             echo "XDG_RUNTIME_DIR=${runtime_dir}"
             echo "DBUS_SESSION_BUS_ADDRESS=unix:path=${runtime_dir}/bus"
-          } >> "$GITHUB_ENV"
-          # The shared /tmp has an exhausted per-user quota from old simulation
-          # caches. Keep mktemp, Python scratch, and the WASM linker log in the
-          # job's disk-backed temporary directory instead of failing mid-deploy.
-          if [ ! -d "${RUNNER_TEMP}" ] || [ ! -w "${RUNNER_TEMP}" ]; then
-            echo "::error title=No writable runner temp::${RUNNER_TEMP:-unset} is unavailable"
-            exit 1
-          fi
-          {
             echo "TMPDIR=${RUNNER_TEMP}"
             echo "CHUDWARE_WEBD_WASM_LOG=${RUNNER_TEMP}/webd-wasm.log"
           } >> "$GITHUB_ENV"
-          echo "user session bus: ${runtime_dir}/bus"
-
-          # The deploy tooling is NOT asserted here. It cannot be: update.sh,
-          # rollback.sh and the retention flag arrive in the canonical checkout
-          # only when something pulls, and the only thing that pulls is a
-          # deploy. Asserting their presence before the sync deadlocks the very
-          # first run -- the tooling is missing, so the deploy aborts, so the
-          # tooling stays missing, forever. The sync step below fast-forwards
-          # the checkout to the gated commit and asserts the tooling there,
-          # where the assert can actually be satisfied.
-          for tool in git gh python3; do
-            command -v "${tool}" >/dev/null 2>&1 || {
-              echo "::error::runner ${RUNNER_NAME:-unknown} is missing ${tool}"; exit 1; }
-          done
-
-      - name: Confirm master has not advanced and this commit has not shipped
-        id: preflight
-        shell: bash
-        run: |
-          # ---------------------------------------------------------------
-          # THE GATE.
-          #
-          # CI fan-out is reported, not a deploy prerequisite. native-build
-          # runs only for release tags, its Linux rows queue on one builder
-          # (the emulated aarch64 row alone is bounded at 90 minutes), and
-          # linux-gate can take hours and covers many non-web suites.
-          # fast-gate now runs on the online Intel Mac but can queue behind
-          # older runs; its source audits also run inline here at the commit
-          # being promoted.
-          #
-          # Waiting for every unrelated CI job would leave production stale;
-          # these three states are read and REPORTED below, not silently
-          # assumed green. The actual promotion gate runs on this host.
-          #
-          # What gates instead is real, fast, and actually runs:
-          #
-          #   1. scripts/check.py, inline, in the step after this one. Nine
-          #      deterministic source audits including icon-atlas coverage and
-          #      ribbon-command routing -- the exact surfaces a bad asset or
-          #      ribbon change breaks. ~17s on this host. HARD FAIL.
-          #   2. install_webd.sh, which builds core, host and the WASM relink,
-          #      validates the prompt payload, and asserts the linked bundle is
-          #      byte-identical to the repo BEFORE it swaps `current`. A broken
-          #      build cannot reach production: the swap never happens.
-          #   3. post-deploy verification, then automatic rollback to the
-          #      previous retained release, and a filed issue, if any of it
-          #      fails.
-          #
-          # A repeated manual request is safe: promotions are serialized and
-          # a later run skips a commit already recorded as deployed.
-          #
-          # workflow_dispatch with force=true still overrides the drift guard
-          # and the already-deployed check, and says so loudly in both the log
-          # and the run summary.
-          # ---------------------------------------------------------------
-
-          state_dir="${HOME}/.local/state/chudware-deploy-prod"
-          mkdir -p "${state_dir}"
-
-          target="${TARGET_SHA:-}"
-          if [ -z "${target}" ]; then
-            echo "::error title=No target commit::github.sha did not resolve"
-            exit 1
-          fi
-          echo "trigger: ${TRIGGERED_BY}"
-          echo "target commit: ${target}"
-          echo "force: ${FORCE_DEPLOY}"
-
-          emit() {  # emit <proceed> <single-line reason>
-            {
-              echo "proceed=$1"
-              echo "sha=${target}"
-              echo "reason=$2"
-            } >> "$GITHUB_OUTPUT"
-            echo "$2"
+          [[ "$(git -C "${CANONICAL}" rev-parse HEAD)" = "${TARGET_SHA}" ]] || {
+            echo '::error::Canonical gateway checkout is not the qualified snapshot; prepare and review it independently. Native rollback cannot restore this checkout.'
+            exit 4
           }
+          [[ -z "$(git -C "${CANONICAL}" status --porcelain)" ]] || exit 4
+          for command in git gh python3; do command -v "$command" >/dev/null || exit 4; done
 
-          # One workflow's verdict at this sha: success when any run of it
-          # concluded success, pending when any run has not concluded, otherwise
-          # the newest non-success conclusion, or absent when it never ran.
-          # "Any success" is deliberate: a re-run in flight beside an earlier
-          # green does not un-gate the commit.
-          gate_state() {  # gate_state <workflow file name>
-            local runs status conclusion verdict=absent
-            # Captured into a variable rather than expanded straight into the
-            # heredoc: a command substitution inside a heredoc body swallows its
-            # exit status, so a gh outage would read as "that gate never ran".
-            #
-            # This used to `return 1` and, under `set -e`, abort the deploy. That
-            # was right when these states BLOCKED the promotion; it is wrong now
-            # that they are advisory. It also failed closed for the wrong reason:
-            # listing workflow runs needs `actions: read`, which this job's
-            # permissions block did not grant, so the first push-triggered deploy
-            # died reading a signal it does not even act on. The permission is
-            # granted now; this degrades to `unreadable` regardless, because a
-            # value nothing branches on must never be able to stop a release.
-            if ! runs="$(gh api \
-                  "repos/${GITHUB_REPOSITORY}/actions/workflows/$1/runs?head_sha=${target}&per_page=100" \
-                  --jq '.workflow_runs[] | "\(.status) \(.conclusion)"' 2>/dev/null)"; then
-              echo "::notice title=Gate state unreadable::could not list $1 runs for ${target}; reporting it as unreadable. This does not block the deploy -- the blocking gate is scripts/check.py." >&2
-              echo unreadable
-              return 0
-            fi
-            while read -r status conclusion; do
-              [ -n "${status}" ] || continue
-              if [ "${status}" != completed ]; then
-                verdict=pending
-              elif [ "${conclusion}" = success ]; then
-                echo success
-                return 0
-              elif [ "${verdict}" = absent ]; then
-                verdict="${conclusion}"
-              fi
-            done <<EOF
-          ${runs}
-          EOF
-            echo "${verdict}"
-          }
-
-          linux_gate="$(gate_state linux-gate.yml)"
-          native_build="$(gate_state native-build.yml)"
-          fast_gate="$(gate_state fast-gate.yml)"
-          echo "linux-gate:   ${linux_gate}"
-          echo "native-build: ${native_build}"
-          echo "fast-gate:    ${fast_gate}"
-          {
-            echo "linux_gate=${linux_gate}"
-            echo "native_build=${native_build}"
-            echo "fast_gate=${fast_gate}"
-          } >> "$GITHUB_OUTPUT"
-
-          # Reported, never blocking. The real gate is scripts/check.py in the
-          # next step plus install_webd.sh's pre-swap asserts.
-          for pair in "linux-gate:${linux_gate}" "native-build:${native_build}" "fast-gate:${fast_gate}"; do
-            name="${pair%%:*}"; state="${pair#*:}"
-            [ "${state}" = success ] && continue
-            echo "::notice title=${name} not green::${name}=${state} for ${target}. Not blocking; the deploy is gated by scripts/check.py and by install_webd.sh refusing to swap a bundle that does not match the repo."
-          done
-
-          # Kept so the summary can still say a force override happened, even
-          # though no CI state blocks any more.
-          override=""
-
-          # ---------------------------------------------------------------
-          # SHA DRIFT.
-          #
-          # update.sh does `git pull --ff-only origin master` inside the
-          # canonical checkout, so it deploys whatever master's tip is at the
-          # moment it runs -- not the commit whose gates were just checked.
-          # Master can advance between a gate finishing and this job claiming
-          # the runner, and promoting an ungated tip is exactly what the
-          # AND-gate above exists to prevent.
-          #
-          # A fetch is read-only against the working tree (it moves refs the
-          # updater is about to move anyway), so this is safe to do first.
-          # Checking out the gated commit instead is NOT the fix: production
-          # must run master's tip, and the updater's ff-only pull enforces that.
-          # If the tip moved, the newer commit has its own gate runs, and their
-          # completion re-triggers this workflow for that commit.
-          # ---------------------------------------------------------------
-          git -C "${CANONICAL}" fetch --quiet origin master
-          tip="$(git -C "${CANONICAL}" rev-parse FETCH_HEAD)"
-          echo "origin/master tip: ${tip}"
-          if [ "${tip}" != "${target}" ]; then
-            if [ "${FORCE_DEPLOY}" = true ]; then
-              echo "::warning title=Drift override::forced deploy will promote ${tip}, not the dispatched ${target}"
-              override="${override} master is at ${tip}, not the dispatched ${target};"
-            else
-              emit false "SKIP: master advanced from ${target} to ${tip} while the gates ran; that commit's own gate run will deploy it."
-              exit 0
-            fi
-          fi
-
-          last="$(cat "${state_dir}/last-deployed-sha" 2>/dev/null || true)"
-          if [ "${last}" = "${target}" ]; then
-            if [ "${FORCE_DEPLOY}" != true ]; then
-              emit false "SKIP: ${target} is already the deployed commit; nothing has changed since the last successful promotion."
-              exit 0
-            fi
-            override="${override} ${target} was already recorded as deployed;"
-          fi
-
-          if [ -n "${override}" ]; then
-            emit true "FORCED DEPLOY of ${target}, overriding:${override%;}"
-          else
-            emit true "DEPLOY: ${target} is master's tip and both gates are green"
-          fi
-
-      - name: Sync the canonical checkout to the gated commit
-        if: steps.preflight.outputs.proceed == 'true'
+      - name: Require successful CI and unchanged protected master
         shell: bash
         run: |
           set -euo pipefail
-
-          # WHY THIS STEP EXISTS.
-          #
-          # Every script this workflow runs -- update.sh, install_webd.sh,
-          # rollback.sh, check_web_parity.py -- is read off the canonical
-          # checkout on this host, not off an actions/checkout. update.sh does
-          # pull master itself, but that pull happens INSIDE the already-running
-          # script, so the version that parses the command line is whatever was
-          # on disk beforehand. On the first continuous deploy that copy predates
-          # `--continuous`, does not ship rollback.sh, and has no release
-          # retention: the run would either reject its own flag or, worse, deploy
-          # with the old delete-the-previous-release behaviour and leave nothing
-          # to roll back to.
-          #
-          # So the checkout is fast-forwarded to the gated commit FIRST, and the
-          # tooling is asserted afterwards, against the tree that will actually
-          # run.
-          target="${{ steps.preflight.outputs.sha }}"
-          echo "syncing ${CANONICAL} to ${target}"
-          git -C "${CANONICAL}" fetch --quiet origin master
-
-          # --ff-only, never reset --hard. This is a real working tree on a box
-          # people log into; a hard reset would silently discard whatever is
-          # uncommitted there. If the fast-forward is refused, that is a human
-          # problem on the deploy host and the deploy must stop rather than
-          # paper over it.
-          if ! git -C "${CANONICAL}" merge --ff-only "${target}" 2>&1; then
-            echo "::error title=Deploy checkout will not fast-forward::${CANONICAL} cannot fast-forward to ${target}. It has diverged or has local changes. Resolve it on livingroom-pc; this deploy is not touching a tree it does not understand."
-            git -C "${CANONICAL}" status --short | head -20
-            exit 1
-          fi
-
-          head="$(git -C "${CANONICAL}" rev-parse HEAD)"
-          if [ "${head}" != "${target}" ]; then
-            echo "::error title=Deploy checkout is not at the gated commit::expected ${target}, got ${head}"
-            exit 1
-          fi
-          echo "checkout HEAD: ${head}"
-
-          # Presence is not enough -- a file can exist and still be the version
-          # that does not understand the flag it is about to be handed. Each
-          # assert names the capability, so a failure says what is stale instead
-          # of dying later inside the updater.
-          for path in "${CANONICAL}/Webservice/deploy/update.sh" \
-                      "${CANONICAL}/Webservice/deploy/rollback.sh" \
-                      "${CANONICAL}/Webservice/deploy/install_webd.sh" \
-                      "${CANONICAL}/scripts/check_web_parity.py"; do
-            test -r "${path}" || {
-              echo "::error title=Canonical checkout incomplete::${path} is missing or unreadable at ${head}"
-              exit 1
+          for workflow in linux-gate.yml native-build.yml fast-gate.yml; do
+            # Only the newest run for this exact commit counts. Missing, skipped,
+            # cancelled, queued, failed and unreadable results all refuse.
+            verdict="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/runs?head_sha=${TARGET_SHA}&per_page=1" --jq '.workflow_runs[0] | if .status == "completed" then .conclusion else .status end')"
+            [[ "$verdict" = success ]] || {
+              echo "::error::${workflow} is not successful for the qualified SHA"
+              exit 4
             }
           done
-          grep -q -- '--continuous' "${CANONICAL}/Webservice/deploy/update.sh" || {
-            echo "::error title=Updater too old::update.sh at ${head} does not support --continuous"
-            exit 1
-          }
-          grep -q 'CHUDWARE_WEBD_KEEP_RELEASES' "${CANONICAL}/Webservice/deploy/install_webd.sh" || {
-            echo "::error title=No release retention::install_webd.sh at ${head} still deletes the previous release on success, so a rollback would have no target. Refusing to deploy without a safety net."
-            exit 1
-          }
-          test -x "${CANONICAL}/Webservice/deploy/rollback.sh" || {
-            echo "::error title=rollback.sh not executable::${CANONICAL}/Webservice/deploy/rollback.sh lacks the execute bit"
-            exit 1
-          }
-          echo "deploy tooling verified at ${head}"
-
-      - name: Gate — nine deterministic source audits (scripts/check.py)
-        id: audits
-        if: steps.preflight.outputs.proceed == 'true'
-        working-directory: /home/liveuser/Repositories/CAD
-        shell: bash
-        run: |
-          set -uo pipefail
-
-          # THE actual pre-deploy gate. Nine source-level audits, seconds to
-          # run, and two of them cover exactly what is most likely to be wrong
-          # in a release like this one: icon-atlas coverage and
-          # ribbon-command-to-handler routing. Also SW_PARITY_SPEC drift, the
-          # agent event-kind and role-prompt catalogs, the services thin-client
-          # ratchet, the Settings tool-panel tables, path portability, and
-          # advertised-tool reachability.
-          #
-          # It MUST run under the runtime venv. advertised_tool_audit imports
-          # services.mcp.tool_registry and warms the real catalog, which needs
-          # PyYAML, the MCP SDK, NumPy and SciPy. Under the system interpreter
-          # it does not degrade politely -- it warms a 7-tool catalog and calls
-          # 400+ real tools unreachable, i.e. it fails for a reason that has
-          # nothing to do with the commit. fast-gate provisions a job-local venv
-          # for the same reason; this host already has the full runtime one.
-          VENV_PY="${HOME}/.local/share/Chudware/mcp-venv/bin/python"
-          if [ ! -x "${VENV_PY}" ]; then
-            echo "::error title=Runtime venv missing::${VENV_PY} is not executable. advertised_tool_audit cannot warm the tool registry without it and would fail for the wrong reason. Provision it with: python3 -m venv ${HOME}/.local/share/Chudware/mcp-venv && ${VENV_PY} -m pip install -r requirements.txt"
-            exit 1
-          fi
-          echo "interpreter: $(${VENV_PY} -V 2>&1)"
-
-          rc=0
-          timeout 600 "${VENV_PY}" scripts/check.py 2>&1 | tail -40 || rc=$?
-          if [ "${rc}" -ne 0 ]; then
-            echo "::error title=Source audits failed::scripts/check.py exited ${rc} at $(git rev-parse --short HEAD). Not deploying. This is the gate that replaced the unreachable CI workflows, so a failure here is a real stop, not an infrastructure hiccup."
-            exit 1
-          fi
-          echo "all nine source audits pass"
-
-      - name: Record the pre-deploy state
-        if: steps.preflight.outputs.proceed == 'true'
-        shell: bash
-        run: |
-          set -uo pipefail
-
-          # Written into the log so this run is self-contained: after a rollback
-          # the only record of what was live beforehand is right here.
-          current="$(readlink -f "${WEB_ROOT}/current" 2>/dev/null || echo none)"
-          joint="$(cat "${WEB_ROOT}/.webd-running-joint" 2>/dev/null || echo none)"
-          head="$(git -C "${CANONICAL}" rev-parse HEAD)"
-          echo "pre-deploy current release: ${current##*/}"
-          echo "pre-deploy current path:    ${current}"
-          echo "pre-deploy running joint:   ${joint}"
-          echo "pre-deploy checkout HEAD:   ${head}"
-          echo "retained releases (newest first):"
-          ls -1t "${WEB_ROOT}/releases" 2>/dev/null || echo "  (none)"
-          if "${WEB_ROOT}/bin/chudware-hostd" --status >/dev/null 2>&1; then
-            echo "pre-deploy daemon: chudware-hostd running"
-          else
-            echo "pre-deploy daemon: chudware-hostd NOT running"
-          fi
-
-      - name: Deploy master to production
-        id: deploy
-        if: steps.preflight.outputs.proceed == 'true'
-        # Absolute working directory AND a path-qualified invocation: a
-        # self-hosted runner starts a step in _work/<repo>/<repo>, and several
-        # scripts under Webservice/deploy resolve paths relative to the tree
-        # they are run from.
-        working-directory: /home/liveuser/Repositories/CAD
-        shell: bash
-        run: |
-          # No `set -e`: the updater's exit code is the whole signal here, and
-          # exit 3 is not a failure.
-          set -uo pipefail
-
-          rc=0
-          /home/liveuser/Repositories/CAD/Webservice/deploy/update.sh prod --continuous || rc=$?
-          echo "update.sh exit: ${rc}"
-
-          if [ "${rc}" -eq 3 ]; then
-            # update.sh takes a host-wide flock so prod and staging cannot pull
-            # or migrate the one checkout in parallel. Holding it means another
-            # deploy is already shipping this commit or a newer one, which is
-            # the correct outcome and not an error: this run has nothing left to
-            # do, and must not roll back or alert on someone else's in-flight
-            # promotion. Clean skip, step succeeds, run stays green.
-            {
-              echo "deployed=false"
-              echo "skip_reason=another deploy holds the host-wide flock; it is shipping this or a newer commit"
-            } >> "$GITHUB_OUTPUT"
-            echo "::notice title=Deploy skipped::CHUDWARE_DEPLOY_LOCK is held by a concurrent deploy; leaving it to finish"
-            exit 0
-          fi
-
-          if [ "${rc}" -eq 4 ]; then
-            # Refused BEFORE any mutation (dirty checkout, missing gateway.env,
-            # CHUDWARE_WEB_DEV left on, prod HEAD not a v* tag). Production is
-            # byte-for-byte what it was, so a rollback is not mitigation, it is
-            # damage: it would swap a healthy release out and, when the retained
-            # release turns out to be unrestorable, report "ROLLBACK ITSELF
-            # FAILED ... Production needs hands-on recovery now". That is exactly
-            # what happened for four days from 2026-08-31 while the real cause
-            # was one dirty file in the canonical checkout. Alert with the true
-            # reason, keep the run red, roll back NOTHING.
-            {
-              echo "deployed=false"
-              echo "refused=true"
-            } >> "$GITHUB_OUTPUT"
-            echo "::error title=Deploy refused::update.sh refused before touching production (exit 4); see the REFUSED line above. Production still serves the previous release untouched."
+          git -C "${CANONICAL}" fetch --quiet origin master
+          [[ "$(git -C "${CANONICAL}" rev-parse FETCH_HEAD)" = "${TARGET_SHA}" ]] || {
+            echo '::error::Master advanced; qualify and explicitly dispatch the new exact commit instead.'
             exit 4
-          fi
-
-          # Every other nonzero exit is a real failure: 1 is a part-way deploy
-          # failure that may have mutated production and 2 is a usage error (a
-          # wrong flag reaching this file).
-          if [ "${rc}" -ne 0 ]; then
-            echo "deployed=false" >> "$GITHUB_OUTPUT"
-            echo "::error title=Deploy failed::update.sh prod --continuous exited ${rc}; rolling back"
-            exit "${rc}"
-          fi
-
-          deployed_sha="$(git -C "${CANONICAL}" rev-parse HEAD)"
-          echo "deployed commit: ${deployed_sha}"
-          {
-            echo "deployed=true"
-            echo "deployed_sha=${deployed_sha}"
-          } >> "$GITHUB_OUTPUT"
-
-          # Residual race, reported rather than hidden: the drift guard fetched
-          # before the updater took the lock and pulled, so master can in
-          # principle have advanced in between. The commit that actually landed
-          # is what this line names, and update.sh logs the same sha under
-          # "production commit:".
-          if [ "${deployed_sha}" != "${TARGET_SHA}" ]; then
-            echo "::warning title=Deployed a newer commit::master advanced between the drift check and the updater's pull; production now runs ${deployed_sha}, not the gated ${TARGET_SHA}. That commit's own gate run will re-verify it."
-          fi
-
-      - name: Verify the promoted bundle and the running daemon
-        id: verify
-        # A separate step on purpose: "the deploy failed" and "the deploy
-        # succeeded but shipped the wrong bytes" are different incidents, and
-        # collapsing them into one step makes the run log unable to say which.
-        if: success() && steps.deploy.outputs.deployed == 'true'
-        working-directory: /home/liveuser/Repositories/CAD
-        shell: bash
-        run: |
-          set -uo pipefail
-
-          # Run from the canonical checkout so the comparison is against the
-          # exact commit that was just promoted.
-          rc=0
-          python3 scripts/check_web_parity.py --bundle "${WEB_ROOT}/app" || rc=$?
-          echo "check_web_parity exit: ${rc}"
-          if [ "${rc}" -ne 0 ]; then
-            # Unlike the off-box watcher, exit 2 is a failure here. That code
-            # means "cannot evaluate", which for a remote fetch is a normal
-            # network outcome -- but this gate reads a local directory the
-            # promotion just wrote, so being unable to evaluate it means the
-            # promotion produced something unreadable. Passing on 2 would turn
-            # the one check that would have caught the fifteen-day stale bundle
-            # into a no-op.
-            echo "::error title=Bundle parity failed::check_web_parity.py --bundle exited ${rc}; the promoted bundle does not match the deployed commit, or could not be read. Rolling back."
-            exit 1
-          fi
-
-          rc=0
-          "${WEB_ROOT}/bin/chudware-hostd" --status > "${RUNNER_TEMP}/hostd-status.json" || rc=$?
-          if [ "${rc}" -ne 0 ]; then
-            echo "::error title=Daemon not running::chudware-hostd --status exited ${rc} after the restart; the promoted release is installed but not serving. Rolling back."
-            exit 1
-          fi
-          if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
-               "${RUNNER_TEMP}/hostd-status.json"; then
-            echo "::error title=Daemon status unreadable::chudware-hostd --status exited 0 but did not print daemon_status JSON. Rolling back."
-            exit 1
-          fi
-          echo "chudware-hostd is running and reporting status"
-
-          # Only now is this commit recorded as shipped: a promotion that failed
-          # verification and was rolled back must stay deployable.
-          state_dir="${HOME}/.local/state/chudware-deploy-prod"
-          mkdir -p "${state_dir}"
-          printf '%s\n' "${{ steps.deploy.outputs.deployed_sha }}" \
-            > "${state_dir}/last-deployed-sha"
-
-      - name: Roll back and alert
-        # Scoped to the two steps that can leave production changed. A preflight
-        # or host-assertion failure changed nothing, so it must not roll back a
-        # healthy release.
-        if: failure() && (steps.deploy.conclusion == 'failure' || steps.verify.conclusion == 'failure')
-        shell: bash
-        run: |
-          set -uo pipefail
-
-          failed_stage=deploy
-          if [ "${{ steps.verify.conclusion }}" = failure ]; then
-            failed_stage=verification
-          fi
-
-          # A refusal (update.sh exit 4) never mutated production, so there is
-          # nothing to restore and rollback.sh must not run: swapping a healthy
-          # release out is the opposite of mitigation, and when the retained
-          # release cannot be restored the alert claims a production emergency
-          # that does not exist.
-          if [ "${{ steps.deploy.outputs.refused }}" = true ]; then
-            failed_stage="preflight"
-            rollback_rc=0
-            rollback_mode=skipped
-          else
-          # Polite first. Bare rollback.sh mints an authenticated ops session and
-          # waits for engine_bridges to drain to 0 before swapping, exactly like
-          # install_webd.sh --restart, so no live modelling session is dropped.
-          rollback_rc=0
-          rollback_mode=drained
-          /home/liveuser/Repositories/CAD/Webservice/deploy/rollback.sh || rollback_rc=$?
-
-          # Exit 2 means there is nothing to roll back to; retrying changes
-          # nothing. Any OTHER failure is retried with --force, because the most
-          # likely cause is the one this step exists for: the failed promotion
-          # left the gateway unreachable, so the drain cannot be PROVEN and
-          # rollback fails closed even though the swap itself would work.
-          # --force skips only the drain wait and still does the full swap, unit
-          # restore, restart, readiness proof and .webd-running-joint rewrite.
-          # Dropping live bridges is the correct trade here: production is
-          # already failing verification, and there is by definition no proven
-          # healthy session to protect.
-          if [ "${rollback_rc}" -ne 0 ] && [ "${rollback_rc}" -ne 2 ]; then
-            echo "polite rollback failed (exit ${rollback_rc}); retrying with --force"
-            rollback_mode=forced
-            rollback_rc=0
-            /home/liveuser/Repositories/CAD/Webservice/deploy/rollback.sh --force || rollback_rc=$?
-          fi   # end: retry with --force
-          fi   # end: rollback attempted at all (skipped for a refusal)
-
-          case "${rollback_rc}:${rollback_mode}" in
-            0:skipped) rollback_result="NOT ATTEMPTED — the updater refused before changing anything, so production still serves the release it was already serving. Fix the refusal reason named in the run log (a dirty canonical checkout at /home/liveuser/Repositories/CAD is the usual one) and push again; nothing on the box needs restoring." ;;
-            0:drained) rollback_result="restored the previous retained release after a clean bridge drain" ;;
-            0:forced) rollback_result="restored the previous retained release with --force, because the drain could not be proven (the gateway was unreachable). Any live engine bridges were dropped." ;;
-            2:*) rollback_result="COULD NOT ROLL BACK: no retained release to fall back to (exit 2). Production is still running whatever the failed promotion left behind." ;;
-            # --force is still gated on the readiness proof, so a non-zero exit
-            # here has a known shape rather than being "unknown state": `current`
-            # may already point at the previous release while
-            # .webd-running-joint still names the old one, deliberately. Saying
-            # so is the difference between an actionable page and a mystery --
-            # and it is why a later `install_webd.sh --restart` sees the
-            # mismatch and performs a real restart instead of skipping one.
-            *) rollback_result="ROLLBACK ITSELF FAILED (exit ${rollback_rc}, even with --force). The swap may have completed while the daemon failed its readiness proof: check whether ${WEB_ROOT}/current already points at the previous release while .webd-running-joint still names the old joint. Production needs hands-on recovery now; \`install_webd.sh --restart\` will see that mismatch and force a real restart." ;;
-          esac
-          echo "rollback: ${rollback_result}"
-
-          current="$(readlink -f "${WEB_ROOT}/current" 2>/dev/null || echo none)"
-          joint="$(cat "${WEB_ROOT}/.webd-running-joint" 2>/dev/null || echo none)"
-
-          # Same dedupe shape as prod-external-watch: match an open issue by
-          # exact title. Without it a wedged build files one issue per master
-          # push; with it a repeat comments on the single open issue, which
-          # stays the incident record until a deploy succeeds and closes it.
-          find_open_issue() {
-            gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
-              --json number,title \
-              --jq '.[] | select(.title == env.ALERT_TITLE) | .number' | sed -n '1p'
           }
 
-          detected_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          body_file="${RUNNER_TEMP}/deploy-prod-issue.md"
-          {
-            printf '%s\n' "Continuous deployment of \`${TARGET_SHA}\` to production failed at the ${failed_stage} stage. Detected ${detected_at} by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
-            printf '\n%s\n' "Rollback: ${rollback_result}"
-            printf '\n%s\n' "Release serving now: \`${current##*/}\` (joint \`${joint}\`)."
-            printf '\n%s\n' "Master is not being promoted while this persists: every later push re-enters the same path and comments here rather than filing a new issue. Investigate with \`Webservice/deploy/rollback.sh --list\` and \`~/chudware-web-data/logs/update.log\` on livingroom-pc. Recovery is automatic: the next successful deploy comments on and closes this issue."
-          } > "${body_file}"
-
-          issue="$(find_open_issue)"
-          if [ -n "${issue}" ]; then
-            gh issue comment "${issue}" --repo "$GITHUB_REPOSITORY" --body-file "${body_file}"
-            echo "ALREADY ALERTED: commented on open issue #${issue}"
-          else
-            issue_url="$(gh issue create --repo "$GITHUB_REPOSITORY" \
-              --title "$ALERT_TITLE" --body-file "${body_file}")"
-            echo "OPENED: ${issue_url}"
-          fi
-
-          echo "::error title=Production deploy failed::${failed_stage} stage failed for ${TARGET_SHA}; ${rollback_result}"
-
-          # A rollback is mitigation, not a pass. Without this the step's last
-          # command is a successful `echo` and the step goes green, which reads
-          # in the run list as "the deploy recovered" -- it did not, it reverted.
-          # The run must stay red so the failed promotion is visible.
-          exit 1
-
-      - name: Close the deploy alert after a successful promotion
-        if: success() && steps.deploy.outputs.deployed == 'true'
+      - name: Run source and protected-configuration gates
+        working-directory: /home/liveuser/Repositories/CAD
         shell: bash
         run: |
           set -euo pipefail
+          runtime="${HOME}/.local/share/Chudware/mcp-venv/bin/python"
+          [[ -x "$runtime" ]] || exit 4
+          "$runtime" scripts/check.py
+          Webservice/gateway/.venv/bin/python Webservice/deploy/gateway_preflight.py validate --env-file "${HOME}/chudware-web-data/gateway.env" --environment prod
+          # First cutover is allowed only with an explicitly selected independent
+          # root record for this exact SHA and each manual-recovery prerequisite.
+          authority=(promotion-preflight --web-home "${WEB_ROOT}" --environment prod --target-commit "${TARGET_SHA}")
+          [[ -z "${FIRST_CUTOVER_ACK}" ]] || authority+=(--first-cutover-ack "${FIRST_CUTOVER_ACK}")
+          env -i PATH=/usr/bin:/bin /usr/bin/python3 -I -S Webservice/deploy/deployment_release.py "${authority[@]}"
 
-          find_open_issue() {
-            gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
-              --json number,title \
-              --jq '.[] | select(.title == env.ALERT_TITLE) | .number' | sed -n '1p'
-          }
+      - name: Promote the exact qualified snapshot
+        id: deploy
+        working-directory: /home/liveuser/Repositories/CAD
+        shell: bash
+        run: |
+          set -uo pipefail
+          rc=0
+          args=(prod --continuous --no-pull)
+          [[ -z "${FIRST_CUTOVER_ACK}" ]] || args+=(--first-cutover-ack "${FIRST_CUTOVER_ACK}")
+          bash Webservice/deploy/update.sh "${args[@]}" || rc=$?
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
+          case "$rc" in
+            0) echo 'deployed=true' >> "$GITHUB_OUTPUT" ;;
+            2) echo '::error::Updater usage refusal before live mutation; no rollback will run.'; exit 2 ;;
+            3) echo '::notice::Another deployment holds the lock; no operation attempted.' ;;
+            4) echo '::error::Precondition refusal before live mutation; no rollback will run.'; exit 4 ;;
+            *) echo '::error::Deployment may have changed gateway/dependencies/schema; operator recovery is required, not blind database restore.'; exit 1 ;;
+          esac
 
-          issue="$(find_open_issue)"
-          if [ -z "${issue}" ]; then
-            exit 0
-          fi
-          recovered_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          gh issue comment "${issue}" --repo "$GITHUB_REPOSITORY" \
-            --body "Recovered at ${recovered_at}. Commit \`${{ steps.deploy.outputs.deployed_sha }}\` deployed cleanly, the promoted bundle is at parity with the repository, and chudware-hostd is serving."
-          gh issue close "${issue}" --repo "$GITHUB_REPOSITORY" --reason completed
-          echo "RECOVERED: commented on and closed issue #${issue}"
+      - name: Verify promoted bundle
+        id: verify
+        if: steps.deploy.outputs.deployed == 'true'
+        working-directory: /home/liveuser/Repositories/CAD
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" = "${TARGET_SHA}" ]]
+          Webservice/gateway/.venv/bin/python scripts/check_web_parity.py --bundle "${WEB_ROOT}/app"
+          curl --fail --silent --show-error --max-time 10 http://127.0.0.1:8300/healthz >/dev/null
 
-      - name: Run summary
+      - name: Classify recovery without bypassing drain or schema safety
+        if: failure() && ((steps.deploy.outcome == 'failure' && steps.deploy.outputs.rc != '4' && steps.deploy.outputs.rc != '2') || steps.verify.outcome == 'failure')
+        working-directory: /home/liveuser/Repositories/CAD
+        shell: bash
+        run: |
+          set -uo pipefail
+          rc=0
+          bash Webservice/deploy/rollback.sh --automatic || rc=$?
+          case "$rc" in
+            0) result='Only the retained native/cell payload was restored. Gateway checkout/dependencies and database schema/data were NOT restored.' ;;
+            5) result='Automatic rollback refused: gateway/dependencies/schema are changed or unknown. Operator must preserve current customer data, reconcile schema/source compatibility and use the independently drilled manual recovery plan. Never blindly restore an old database.' ;;
+            *) result="Native/cell rollback refused or failed (exit ${rc}); operator recovery is required. No force retry, gateway-source rollback or database restore was attempted." ;;
+          esac
+          printf '%s\n' "$result"
+          printf '### Production recovery required\n\n%s\n' "$result" >> "$GITHUB_STEP_SUMMARY"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title '[deploy-prod] Explicit production promotion needs operator recovery' --body "Qualified commit ${TARGET_SHA}. ${result} Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" || true
+          exit 1
+
+      - name: Record source-policy scope
         if: always()
         shell: bash
         run: |
-          set -uo pipefail
-
-          current="$(readlink -f "${WEB_ROOT}/current" 2>/dev/null || echo none)"
-          joint="$(cat "${WEB_ROOT}/.webd-running-joint" 2>/dev/null || echo none)"
-          skipped="${{ steps.deploy.outputs.skip_reason || '' }}"
           {
-            echo '## deploy-prod'
-            echo ''
-            echo "* trigger: \`${TRIGGERED_BY}\`"
-            echo "* target commit: \`${TARGET_SHA}\`"
-            echo "* CI (reported, non-blocking): linux-gate \`${{ steps.preflight.outputs.linux_gate || 'not evaluated' }}\`, native-build \`${{ steps.preflight.outputs.native_build || 'not evaluated' }}\`, fast-gate \`${{ steps.preflight.outputs.fast_gate || 'not evaluated' }}\`"
-            echo "* gate (blocking): source audits \`${{ steps.audits.conclusion || 'did not run' }}\`"
-            echo "* preflight: ${{ steps.preflight.outputs.reason || 'did not run' }}"
-            echo "* deployed: \`${{ steps.deploy.outputs.deployed || 'no' }}\`"
-            if [ -n "${skipped}" ]; then
-              echo "* skipped: ${skipped}"
-            fi
-            echo "* verification: \`${{ steps.verify.conclusion || 'did not run' }}\`"
-            echo "* release serving now: \`${current##*/}\`"
-            echo "* running joint: \`${joint}\`"
+            echo '### Explicit production promotion'
+            echo "* Target: ${TARGET_SHA}"
+            echo "* Updater exit: ${{ steps.deploy.outputs.rc || 'not run' }}"
+            echo '* Master pushes do not activate production. There is no force gate bypass.'
+            echo '* Workflow/configuration source is not live authority, deliverability or installed-host attestation.'
+            echo '* Retained rollback covers native/cell payloads only; gateway checkout/dependencies and database recovery require the operator plan.'
           } >> "$GITHUB_STEP_SUMMARY"

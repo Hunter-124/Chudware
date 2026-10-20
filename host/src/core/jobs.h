@@ -32,11 +32,32 @@ struct AgentJobRpcRoute {
     std::string method;
     nlohmann::json params = nlohmann::json::object();
     bool online = true;
+    bool cell = false;
+    std::string error;
 };
 
+#ifdef __EMSCRIPTEN__
+constexpr bool kBrowserCellClient = true;
+#else
+constexpr bool kBrowserCellClient = false;
+#endif
 AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::string& docId,
                                       const std::string& convId, bool cam,
-                                      const nlohmann::json& extra, bool mission);
+                                      const nlohmann::json& extra, bool mission,
+                                      bool cell = kBrowserCellClient);
+// Local conversation IDs never identify server sessions. These bindings contain
+// only opaque cell-issued handles and are persisted beside local chat metadata.
+std::string cellAgentSessionHandle(const std::string& convId);
+std::string cellAgentSessionProvider(const std::string& convId);
+void bindCellAgentSessionHandle(const std::string& convId, const std::string& handle,
+                                const std::string& provider = {});
+void clearCellAgentSessionHandles();
+bool applyCellAgentHandles(AgentJobRpcRoute& route, const nlohmann::json& reply,
+                           std::string& err);
+// Web Stop is remembered even before mint completes. Publishing a handle
+// returns that exact handle when its own job has a pending cancellation.
+std::string requestCellAgentStop(JobState& job);
+std::string publishCellAgentRunHandle(JobState& job, const std::string& handle);
 // Client-side wait for a launched route (WorkerClient::call timeoutMs). An online turn with
 // an explicit positive `timeout` budget waits that budget plus slack; one without a budget
 // waits for its response (-1: ends on the terminal reply, Stop, worker/daemon loss or app

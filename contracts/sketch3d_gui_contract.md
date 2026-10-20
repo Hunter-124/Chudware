@@ -295,3 +295,41 @@ How the desktop 3D sketcher places free-space points (documented here per the GU
   snapping to model (B-rep) vertices, in-viewport wire picking for sweep wells (sketch3d wires
   are picked from the FEATURE TREE into path/guide wells; multi-chain `{feature,wire:k}` refs
   need the tree->health wire index flow, not yet surfaced).
+
+## 9. Amendment 2026-10-16 — v2 relation set, skipped report, GUI vertex references
+
+Supersedes the "Deferred to v2" paragraph of §3, items 2 and 7 (vertex part) of §7 and the
+"snapping to model (B-rep) vertices" gate of §8.
+
+**New constraint types** (validator `validate_sketch3d_params` and solver `sketch3d.cpp`):
+
+| type | refs | extra field | meaning |
+|---|---|---|---|
+| `tangent` | `[lineE|arcE|splineEnd, arcE|splineEnd]` | — | tangent directions parallel at the shared (coincident) end; line↔spline uses the spline end |
+| `equal` | `[lineE, lineE]` or `[arcE, arcE]` | — | equal lengths / equal radii |
+| `midpoint` | `[pointH, lineE|arcE]` | — | point at the line middle / arc mid-sweep |
+| `collinear` | `[lineE, lineE]` | — | one infinite 3D line |
+| `concentric` | `[arcE, arcE]` | — | coincident centers |
+| `coradial` | `[arcE, arcE]` | — | same center and radius |
+| `on_plane` | `[pointH|lineE|arcE]` | `plane` | lies in the plane |
+| `parallel_plane` | `[lineE]` | `plane` | direction ⟂ plane normal |
+| `normal_plane` | `[lineE]` | `plane` | direction along the plane normal |
+| `symmetric` | `[pointH, pointH]` | `plane` | mirror images about the plane |
+
+`point_on` also accepts a spline (`[pointH, splineE]`). `plane` is `"front"` (XZ, normal −Y),
+`"top"` (XY, +Z), `"right"` (YZ, +X) — the same frames as `eval_resolve_plane` — or
+`{"origin":[x,y,z],"normal":[x,y,z]}`.
+
+Spline evaluation: the 3D solver evaluates `spline` exactly like `GeomAPI_Interpolate`
+(chord parametrisation; 2 points linear, 3 quadratic, ≥4 C2 cubic with Lagrange end
+derivatives), so solved, compiled and displayed curves agree.
+
+**Skipped report:** `Sketch3DSolution::skipped` lists `(constraint id, reason)` for every
+constraint the solver could not apply; health/solve results surface it as
+`skipped_constraints: [{id, type, reason}]`.
+
+**GUI vertex references:** while a sketch3d is edited, "Reference Model Vertex" picks a solid
+vertex, resolves its selector (`doc_resolve_pick`) and appends `{id:"x<N>", source:{kind:"vertex",
+selector}}` to `params.external_refs` through `edit_feature` (§1b). The `x<N>` point is drawn as a
+labelled diamond and is a valid point handle for coincident / distance / point_on / midpoint /
+symmetric. Edge/face sources remain gated (§7 item 7).

@@ -10,9 +10,11 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "a 'path:50-200' selector instead of paging from the top; binary "
             "files are refused, directories list entries; a CAD file returns "
             "its card plus a labelled render (preview image), not its bytes. "
-            "To parse a large file (json.loads), read it with raw=true from "
+            "Text scans are chunked and bounded to 64 MiB; larger/changing inputs "
+            "refuse with read_budget_exceeded/file_changed, not a partial success. "
+            "To parse a large supported file (json.loads), read raw=true from "
             "byte_offset=0, follow next_byte_offset while truncated is true, and "
-            "join the page texts."
+            "join the page texts; do not parse a single truncated page."
         ),
     },
     "fs_list": {
@@ -34,7 +36,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Matches come back newest-first, so recently generated outputs "
             "surface at the top; '**' recurses — anchor it under a "
-            "subdirectory to stay under the 1000-result cap."
+            "subdirectory to stay under the scan and 32 KiB response budgets. "
+            "Budget/deadline refusals are not empty or complete search results."
         ),
         # limit=0 falls back to the internal 1000-path cap — a '**' sweep on
         # a big tree dumps ~1000 paths into context; 200 newest-first matches
@@ -43,8 +46,11 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "fs_grep": {
         "prompt_note": (
-            "Python regex, line-oriented; skips files >8 MiB and stops after "
-            "5000 files, so narrow big trees with path+glob; follow hits up "
+            "Python regex, line-oriented, in a killable readonly child with a "
+            "two-second per-tool deadline. Skips files initially >8 MiB; bounds "
+            "input to 64 MiB, 5000 files and responses to 32 KiB. A deadline or "
+            "budget exhaustion is a typed refusal, not partial success; simplify "
+            "the regex or narrow path+glob/lower max_matches. Follow hits up "
             "with fs_read's line selector."
         ),
         # max_matches=0 falls back to the internal 500-match cap — 500 clipped

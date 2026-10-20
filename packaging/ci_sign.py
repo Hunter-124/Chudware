@@ -130,7 +130,7 @@ def parser() -> argparse.ArgumentParser:
     modes = ap.add_subparsers(dest="mode", required=True)
 
     sign = modes.add_parser("sign", help="sign an existing domain-separated request file")
-    sign.add_argument("kind", choices=tuple(DOMAINS))
+    sign.add_argument("kind", choices=tuple(kind for kind in DOMAINS if kind != "platform-publishers"))
     sign.add_argument("request", type=Path)
 
     artifact = modes.add_parser("artifact", help="build and sign an artifact identity preimage")

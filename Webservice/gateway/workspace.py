@@ -6,37 +6,30 @@ configured live Box-backed team; all others keep their isolated personal tree.
 Team membership, institutional verification and owner funding are rechecked by
 orgs.resolve_team_bucket. Chats remain per-account even in a shared workspace;
 file recents belong to the selected tree. Rate limits remain per-account.
-An admin may explicitly select the legacy shared tree with ?scope=shared.
-
-The daemon reads and writes the SAME paths directly (doc_open/doc_save take
-server-side paths) — bytes only cross the wire for import/export.
-Blocking filesystem handlers are synchronous FastAPI routes so mounted I/O and
-recursive quota checks run in the threadpool, never on the ASGI event loop.
-
-/files/aicm serves daemon-published tessellation from document-scoped scratch
-handoffs or the caller's own workspace; shared scratch is never a general file
-allowlist.
-Enforcement is server-side; the client clamp is only UX.
+Client paths are workspace-relative; the gateway never exposes host mount paths.
+Mesh fetches use cell-local document grants, revalidated against live membership
+and epoch. Upload admission runs before multipart parsing and bounds the stream.
 """
 
 from __future__ import annotations
 import json
+import os
 
 import logging
-import re
+import secrets
+import stat
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import APIRouter, HTTPException, Request
+from starlette.datastructures import UploadFile
+from starlette.concurrency import run_in_threadpool
+from fastapi.responses import StreamingResponse, JSONResponse
 
 try:
-    from . import orgs
-    from .engine_bridge import mesh_doc_id, mesh_document_authorized, mesh_file_dirs
+    from . import cells, engine_bridge, orgs
     from .auth import User, get_current_user
-    from .accounts import get_account
     from .config import settings
     from .limits import (
         api_writes,
@@ -45,13 +38,17 @@ try:
         dir_size_bytes,
         enforce_upload_size,
         uploads,
-        user_slug,
+        bounded_form,
+        read_bounded_body,
+        stream_open_file,
+        store_upload,
+        list_open_directory,
     )
 except ImportError:  # uvicorn app:app from package dir
-    import orgs
+    import cells
+    import engine_bridge
     from auth import User, get_current_user
-    from engine_bridge import mesh_doc_id, mesh_document_authorized, mesh_file_dirs
-    from accounts import get_account
+    import orgs
     from config import settings
     from limits import (
         api_writes,
@@ -60,26 +57,16 @@ except ImportError:  # uvicorn app:app from package dir
         dir_size_bytes,
         enforce_upload_size,
         uploads,
-        user_slug,
+        bounded_form,
+        read_bounded_body,
+        stream_open_file,
+        store_upload,
+        list_open_directory,
     )
 
 log = logging.getLogger("chudware-web.workspace")
 
 router = APIRouter()
-
-# POSIX shm objects published by aicm_handoff (shm_object_name: "chudware_" + sanitized key).
-_SHM_NAME_RE = re.compile(r"^chudware_[A-Za-z0-9_.\-]{1,200}$")
-# Revision-stable AICM keys end in _r<digits> (aicm_handoff::key_for). Immutable for a year.
-_AICM_REVID_RE = re.compile(r"_r\d+")
-
-
-def _aicm_cache_headers(name: str) -> dict[str, str]:
-    """Revisioned doc meshes are content-addressed; non-revisioned stay no-store."""
-    if name and _AICM_REVID_RE.search(name):
-        return {"Cache-Control": "private, max-age=31536000, immutable"}
-    return {"Cache-Control": "no-store"}
-
-_SHM_URI_PREFIX = "aicm-shm://"
 
 # Durable recent-files list for the WASM client (config.json lives in /tmp there).
 _RECENTS_NAME = ".chudware_recents.json"
@@ -92,35 +79,33 @@ _CHAT_MAX_SESSIONS = 1000
 _CHAT_MAX_SESSION_ID = 256
 
 
-def _ws_root() -> Path:
-    """Legacy single-tenant shared tree. Only reachable via admin scope=shared."""
-    root = settings.workspace_root
-    if not root or not Path(root).is_dir():
-        raise HTTPException(status_code=503, detail="workspace root not configured")
-    return Path(root).resolve()
+def _quota_target(request: Request, user: User) -> tuple[str, str]:
+    team = getattr(request.state, "workspace_team", None)
+    if team:
+        return team.owner_email, team.owner_plan
+    return user.email, request.state.workspace_principal.plan
 
 
 def _caller_root(request: Request, scope: str = "") -> tuple[User, Path]:
-    """Resolve the selected authorized CAD tree, defaulting to institutional storage."""
+    """Revalidate the selected principal and its funding before every file access."""
     user = get_current_user(request)
     if scope == "shared":
-        if user.role != "admin":
-            raise HTTPException(status_code=403, detail="scope=shared requires admin")
-        return user, _ws_root()
+        raise HTTPException(status_code=403, detail="shared scope unavailable")
     if scope and scope != "personal":
         raise HTTPException(status_code=400, detail="unknown scope")
     team = orgs.selected_workspace_team(request, user.email, scope)
-    if team:
-        bucket = orgs.resolve_team_bucket(
-            user.email, team, write=request.method not in {"GET", "HEAD"}
-        )
-        request.state.workspace_team = bucket
-        bucket.root.mkdir(parents=True, exist_ok=True)
-        return user, bucket.root.resolve()
-    _ws_root()  # base must still be configured (503 on misconfig)
-    root = settings.user_workspace_root(user_slug(user.email))
+    principal = cells.resolve_workspace(user.email, team or "")
+    if request.method not in {"GET", "HEAD"}:
+        if principal.right not in {"owner", "manager", "editor"}:
+            raise HTTPException(status_code=403, detail="forbidden_right")
+        if team:
+            request.state.workspace_team = orgs.resolve_team_bucket(user.email, team, write=True)
+    elif team:
+        request.state.workspace_team = orgs.resolve_team_bucket(user.email, team, write=False)
+    request.state.workspace_principal = principal
+    root = principal.root if team else cells.personal_root(user.email)
     root.mkdir(parents=True, exist_ok=True)
-    return user, root.resolve()
+    return user, root.absolute()
 
 
 @router.post("/workspace/selection")
@@ -143,6 +128,8 @@ def _resolve(root: Path, rel: str, *, must_exist: bool = True) -> Path:
     used to escape it (e.g. upload through link -> /etc, or rename over one).
     """
     rel = (rel or "").strip().replace("\\", "/")
+    if any(ord(char) < 32 or ord(char) == 127 for char in rel):
+        raise HTTPException(status_code=400, detail="bad path")
     if rel.startswith("/") or (len(rel) > 1 and rel[1] == ":"):
         raise HTTPException(status_code=400, detail="absolute paths not allowed")
     if any(part in {"..", ""} for part in rel.split("/")) and rel != "":
@@ -174,99 +161,58 @@ def _content_length(request: Request) -> int | None:
 @router.get("/workspace/list")
 def workspace_list(request: Request, dir: str = "", scope: str = "") -> dict[str, Any]:
     _, root = _caller_root(request, scope)
-    base = _resolve(root, dir)
-    if not base.is_dir():
-        raise HTTPException(status_code=400, detail="not a directory")
-    dirs: list[dict[str, Any]] = []
-    files: list[dict[str, Any]] = []
-    for p in sorted(base.iterdir(), key=lambda p: p.name.lower()):
-        if p.name.startswith("."):
-            continue
-        rel = str(p.relative_to(root))
-        try:
-            st = p.stat()
-        except OSError:
-            continue
-        if p.is_dir():
-            dirs.append({"name": p.name, "path": rel})
-        else:
-            files.append({"name": p.name, "path": rel, "size": st.st_size,
-                          "mtime": int(st.st_mtime)})
-    # "root" is the caller's OWN absolute jail root. The WASM client contract
-    # (host/src/core/fs_backend.h) builds daemon doc_open/doc_save paths as
-    # `root + entry path`, so blanking it silently breaks opening any file on
-    # the web client. Telling a user their own directory is not the security
-    # boundary — engine_bridge.py is, and it rejects any daemon RPC whose path
-    # falls outside this same root.
-    return {"root": str(root), "dir": str(base.relative_to(root)) if base != root else "",
-            "dirs": dirs[:2000], "files": files[:2000]}
+    directory = dir.strip().replace("\\", "/").removeprefix("./")
+    if directory == ".":
+        directory = ""
+    dirs, files = list_open_directory(cells.directory_beneath(root, directory), directory, 4000)
+    return {"root": ".", "workspace_key": request.state.workspace_principal.workspace_key,
+            "dir": directory, "dirs": dirs[:2000], "files": files[:2000]}
 
 
 @router.get("/workspace/download")
-def workspace_download(request: Request, path: str, scope: str = "") -> FileResponse:
+def workspace_download(request: Request, path: str, scope: str = "") -> StreamingResponse:
     _, root = _caller_root(request, scope)
-    target = _resolve(root, path)
-    if not target.is_file():
-        raise HTTPException(status_code=400, detail="not a file")
-    return FileResponse(str(target), filename=target.name,
-                        headers={"Cache-Control": "no-store"})
+    fd, st = cells.open_beneath(root, path, max_bytes=settings.max_upload_bytes)
+    return stream_open_file(fd, st, filename=Path(path).name, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/workspace/upload")
-def workspace_upload(request: Request,
-file: UploadFile = File(...),
-dir: str = Form(""),
-scope: str = "",) -> dict[str, Any]:
-    
-    user, root = _caller_root(request, scope)
-    with storage_write_lock(root):
-        api_writes.enforce(user.email, "writes")
-        uploads.enforce(user.email, "uploads")
-        declared = _content_length(request)
-        cap = enforce_upload_size(declared)
-        account = get_account(user.email)
-        team = getattr(request.state, "workspace_team", None)
-        plan = team.owner_plan if team else getattr(account, "plan", "trial")
-        enforce_disk_quota(
-            user.email,
-            plan,
-            root,
-            incoming_bytes=declared or 0,
+async def workspace_upload(request: Request) -> dict[str, Any]:
+    """Admit and bound multipart input before the parser buffers any bytes."""
+    user, root = await run_in_threadpool(_caller_root, request, request.query_params.get("scope", ""))
+    api_writes.enforce(user.email, "writes")
+    uploads.enforce(user.email, "uploads")
+    cap = enforce_upload_size(_content_length(request))
+    quota_email, plan = _quota_target(request, user)
+    # The destination is multipart data, so replacement credit is known only
+    # after parsing. Check current storage before accepting any input; exact
+    # replacement-delta admission is repeated under the write lock.
+    await run_in_threadpool(enforce_disk_quota, quota_email, plan, root)
+    async with bounded_form(request, cap) as form:
+        file = form.get("file")
+        directory = form.get("dir", "")
+        if not isinstance(file, UploadFile) or not isinstance(directory, str):
+            raise HTTPException(status_code=422, detail="file and directory required")
+        if len(directory) > 4096:
+            raise HTTPException(status_code=400, detail="directory too long")
+        return await run_in_threadpool(
+            _store_upload, request, user, root, file, directory, cap, quota_email, plan
         )
-        base = _resolve(root, dir)
+
+
+def _store_upload(request: Request, user: User, root: Path, file: UploadFile,
+                  directory: str, cap: int, quota_email: str, plan: str) -> dict[str, Any]:
+    with storage_write_lock(root):
+        base = _resolve(root, directory)
         if not base.is_dir():
             raise HTTPException(status_code=400, detail="not a directory")
-        name = Path(file.filename or "upload.bin").name  # strip any client dirs
+        name = Path((file.filename or "upload.bin").replace("\\", "/")).name
         if name.startswith(".") or not name:
             raise HTTPException(status_code=400, detail="bad filename")
-        target = base / name
-        if target.is_symlink():
-            raise HTTPException(status_code=400, detail="symlink not allowed")
-        size = 0
-        try:
-            with target.open("wb") as out:
-                while chunk := file.file.read(1 << 20):
-                    size += len(chunk)
-                    # Chunked uploads have no Content-Length — enforce the cap
-                    # DURING streaming and leave no partial file behind.
-                    if size > cap:
-                        raise HTTPException(
-                            status_code=413,
-                            detail=f"upload too large — {cap // (1024 * 1024)} MiB max",
-                        )
-                    out.write(chunk)
-            # Content-Length can be absent or dishonest. The completed file is
-            # inside root now, so this final check binds the quota to actual bytes.
-            enforce_disk_quota(user.email, plan, root)
-        except BaseException:
-            target.unlink(missing_ok=True)
-            raise
-        log.info("workspace upload: %s (%d bytes) by %s", target, size, user.email)
-        # abs_path is part of the WASM client contract (fs_backend.h): the client
-        # feeds it straight to the daemon's doc_open. It can only ever name a file
-        # inside this caller's own root.
-        return {"ok": True, "path": str(target.relative_to(root)),
-                "abs_path": str(target), "bytes": size}
+        relative = str((base / name).relative_to(root))
+        size = store_upload(root, relative, file, cap=cap, email=quota_email, plan=plan)
+        return {"ok": True, "path": relative,
+                "workspace_key": request.state.workspace_principal.workspace_key, "bytes": size}
 
 
 @router.post("/workspace/mkdir")
@@ -338,10 +284,8 @@ def workspace_copy(request: Request, body: dict[str, Any], scope: str = "") -> d
                 raise HTTPException(status_code=409, detail="destination exists")
             incoming = src.stat().st_size
     
-        account = get_account(user.email)
-        team = getattr(request.state, "workspace_team", None)
-        plan = team.owner_plan if team else getattr(account, "plan", "trial")
-        enforce_disk_quota(user.email, plan, root, incoming_bytes=incoming)
+        quota_email, plan = _quota_target(request, user)
+        enforce_disk_quota(quota_email, plan, root, incoming_bytes=incoming)
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
             if src.is_dir():
@@ -350,7 +294,7 @@ def workspace_copy(request: Request, body: dict[str, Any], scope: str = "") -> d
                 shutil.copy2(src, dst)
             # Bind enforcement to actual copied bytes if the source changed during
             # the copy. Rejection removes the whole destination before returning.
-            enforce_disk_quota(user.email, plan, root)
+            enforce_disk_quota(quota_email, plan, root)
         except BaseException:
             if dst.is_dir() and not dst.is_symlink():
                 shutil.rmtree(dst, ignore_errors=True)
@@ -365,11 +309,10 @@ def workspace_copy(request: Request, body: dict[str, Any], scope: str = "") -> d
 def workspace_recents_get(request: Request, scope: str = "") -> dict[str, Any]:
     """Load the caller's durable recent-files list (<root>/.chudware_recents.json)."""
     _, root = _caller_root(request, scope)
-    path = root / _RECENTS_NAME
-    if not path.is_file():
-        return {"files": []}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        fd, _ = cells.open_beneath(root, _RECENTS_NAME, max_bytes=256 * 1024)
+        with os.fdopen(fd, "rb") as file:
+            data = json.loads(file.read(256 * 1024))
     except Exception as e:
         log.warning("recents read failed: %s", e)
         return {"files": []}
@@ -378,11 +321,24 @@ def workspace_recents_get(request: Request, scope: str = "") -> dict[str, Any]:
     if isinstance(raw, list):
         for e in raw:
             if isinstance(e, str) and e.strip():
-                files.append(e.strip())
+                try:
+                    files.append(_recent_path(root, e))
+                except HTTPException:
+                    continue
             if len(files) >= _RECENTS_MAX:
                 break
     return {"files": files}
 
+
+
+def _recent_path(root: Path, value: str) -> str:
+    value = value.strip().replace("\\", "/")
+    if not value or len(value) > 4096 or value.startswith("aicm-shm:"):
+        raise HTTPException(status_code=400, detail="invalid recent path")
+    target = _resolve(root, value, must_exist=False)
+    if target == root:
+        raise HTTPException(status_code=400, detail="recent path must name a file")
+    return str(target.relative_to(root))
 
 @router.put("/workspace/recents")
 def workspace_recents_put(request: Request, body: dict[str, Any], scope: str = "") -> dict[str, Any]:
@@ -397,7 +353,7 @@ def workspace_recents_put(request: Request, body: dict[str, Any], scope: str = "
             for e in raw:
                 if not isinstance(e, str):
                     continue
-                p = e.strip()
+                p = _recent_path(root, e)
                 if not p or p in seen:
                     continue
                 seen.add(p)
@@ -405,7 +361,8 @@ def workspace_recents_put(request: Request, body: dict[str, Any], scope: str = "
                 if len(files) >= _RECENTS_MAX:
                     break
         path = root / _RECENTS_NAME
-        path.write_text(json.dumps({"files": files}, indent=2), encoding="utf-8")
+        quota_email, plan = _quota_target(request, user)
+        _store_json(root, path, {"files": files}, quota_email, plan)
         log.info("workspace recents: wrote %d entries for %s", len(files), user.email)
         return {"ok": True, "files": files}
 
@@ -416,11 +373,10 @@ def _chat_path(root: Path) -> Path:
 
 def _load_chat_store(root: Path) -> dict[str, Any]:
     """Load the caller's own chat store; missing/corrupt → empty object."""
-    path = _chat_path(root)
-    if not path.is_file():
-        return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        fd, _ = cells.open_beneath(root, _CHAT_NAME, max_bytes=_CHAT_MAX_BODY * 3 + 1)
+        with os.fdopen(fd, "rb") as file:
+            data = json.loads(file.read(_CHAT_MAX_BODY * 3 + 1))
     except Exception as e:
         log.warning("chat store read failed: %s", e)
         return {}
@@ -483,26 +439,41 @@ def _validate_chat_envelope(body: dict[str, Any]) -> dict[str, Any]:
     return body
 
 
-def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    """Replace one JSON file atomically, using a unique same-directory temporary."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: Path | None = None
+def _store_json(root: Path, path: Path, data: dict[str, Any], email: str, plan: str) -> None:
+    with storage_write_lock(root):
+        parent = cells.directory_beneath(root)
+        try:
+            try:
+                previous_info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                previous = 0
+            else:
+                if not stat.S_ISREG(previous_info.st_mode):
+                    raise HTTPException(status_code=400, detail="not a regular file")
+                previous = previous_info.st_size
+            # Compact JSON keeps storage bounded (ASCII escaping can expand UTF-8
+            # by at most 3x), preserving every v2 session/message field.
+            encoded = (json.dumps(data, separators=(",", ":")) + "\n").encode("utf-8")
+            enforce_disk_quota(email, plan, root, incoming_bytes=len(encoded), replaced_bytes=previous)
+            _atomic_write_json(parent, path.name, encoded)
+        finally:
+            os.close(parent)
+
+
+def _atomic_write_json(parent: int, name: str, encoded: bytes) -> None:
+    """Publish JSON using a pinned directory fd; never reopen a tenant path."""
+    temporary = "." + name + "." + secrets.token_hex(16) + ".tmp"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                 0o600, dir_fd=parent)
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=path.name + ".",
-            suffix=".tmp",
-            delete=False,
-        ) as tmp:
-            json.dump(data, tmp, indent=2)
-            tmp.write("\n")
-            tmp_path = Path(tmp.name)
-        tmp_path.replace(path)
+        with os.fdopen(fd, "wb") as file:
+            file.write(encoded)
+        os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
     finally:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
+        try:
+            os.unlink(temporary, dir_fd=parent)
+        except FileNotFoundError:
+            pass
 
 
 @router.get("/workspace/chat")
@@ -516,14 +487,9 @@ def workspace_chat_get(request: Request, scope: str = "") -> dict[str, Any]:
 @router.put("/workspace/chat")
 async def workspace_chat_put(request: Request, scope: str = "") -> dict[str, Any]:
     """Atomically replace the caller's complete flat v2 chat store."""
-    user, root = _caller_root(request, "personal")
+    user, root = await run_in_threadpool(_caller_root, request, "personal")
     api_writes.enforce(user.email, "writes")
-    declared = _content_length(request)
-    if declared is not None and declared > _CHAT_MAX_BODY:
-        raise HTTPException(status_code=413, detail="chat body too large (max 5MB)")
-    raw = await request.body()
-    if len(raw) > _CHAT_MAX_BODY:
-        raise HTTPException(status_code=413, detail="chat body too large (max 5MB)")
+    raw = await read_bounded_body(request, _CHAT_MAX_BODY, "chat body too large (max 5MB)")
     if not raw:
         raise HTTPException(status_code=400, detail="empty body")
     try:
@@ -534,7 +500,8 @@ async def workspace_chat_put(request: Request, scope: str = "") -> dict[str, Any
         raise HTTPException(status_code=400, detail="body must be a JSON object")
 
     store = _validate_chat_envelope(body)
-    _atomic_write_json(_chat_path(root), store)
+    quota_email, plan = _quota_target(request, user)
+    await run_in_threadpool(_store_json, root, _chat_path(root), store, quota_email, plan)
     log.info(
         "workspace chat: replaced v2 store with %d session(s) for %s",
         len(store["sessions"]),
@@ -543,39 +510,42 @@ async def workspace_chat_put(request: Request, scope: str = "") -> dict[str, Any
     return {"ok": True, "sessions": len(store["sessions"])}
 
 @router.get("/files/aicm")
-def files_aicm(request: Request, path: str = "", shm: str = "", scope: str = "") -> FileResponse:
-    """Serve a caller-owned file or an authorized document's mesh handoff."""
+def files_aicm(request: Request, workspace_key: str, doc_id: str = "",
+               path: str = "", scope: str = "") -> StreamingResponse:
+    """Serve only cell-granted meshes or relative files in a live workspace."""
+    if request.query_params.get("shm") or path.startswith("aicm-shm:"):
+        raise HTTPException(status_code=400, detail="shared mesh handoffs not allowed")
+    if path:
+        # Validate even with a grant: no obsolete absolute client path accepted.
+        if path.startswith("/") or "\\" in path or (len(path) > 1 and path[1] == ":"):
+            raise HTTPException(status_code=400, detail="absolute paths not allowed")
+    if workspace_key.startswith("team:"):
+        parts = workspace_key[5:].split("/")
+        if len(parts) != 2 or not all(parts):
+            raise HTTPException(status_code=400, detail="bad workspace key")
+        team_id = parts[1]
+    elif workspace_key.startswith("user:"):
+        team_id = ""
+    else:
+        raise HTTPException(status_code=400, detail="bad workspace key")
     user = get_current_user(request)
     try:
-        _, caller_root = _caller_root(request, scope)
+        principal = cells.resolve_workspace(user.email, team_id)
     except HTTPException as exc:
-        if exc.status_code != 503:
-            raise
-        caller_root = None  # daemon handoffs remain available without a workspace mount
-    if path.startswith(_SHM_URI_PREFIX):
-        shm, path = path[len(_SHM_URI_PREFIX):], ""
-    if shm:
-        if not _SHM_NAME_RE.fullmatch(shm):
-            raise HTTPException(status_code=400, detail="bad shm name")
-        doc_id = mesh_doc_id(shm, shm=True)
-        if doc_id is None or not mesh_document_authorized(user.email, doc_id):
+        if exc.status_code in {403, 404}:
+            raise HTTPException(status_code=403, detail="document not authorized") from None
+        raise
+    if principal.workspace_key != workspace_key:
+        raise HTTPException(status_code=403, detail="document not authorized")
+    if doc_id:
+        opened = engine_bridge.mesh_document_open(
+            principal.account_uid, workspace_key, doc_id, max_bytes=settings.max_upload_bytes
+        )
+        if opened is None:
             raise HTTPException(status_code=403, detail="document not authorized")
-        target = Path("/dev/shm") / shm
-        if target.is_symlink() or not target.is_file():
-            raise HTTPException(status_code=404, detail="shm object gone")
-        return FileResponse(str(target), media_type="application/octet-stream",
-                            headers=_aicm_cache_headers(shm))
-    if not path:
-        raise HTTPException(status_code=400, detail="path or shm required")
-    try:
-        target = Path(path).resolve(strict=True)
-    except OSError:
-        raise HTTPException(status_code=404, detail="not found")
-    if caller_root is None or (target != caller_root and caller_root not in target.parents):
-        doc_id = mesh_doc_id(target.name) if target.parent in mesh_file_dirs() else None
-        if doc_id is None or not mesh_document_authorized(user.email, doc_id):
-            raise HTTPException(status_code=403, detail="document not authorized")
-    if not target.is_file():
-        raise HTTPException(status_code=400, detail="not a file")
-    return FileResponse(str(target), media_type="application/octet-stream",
-                        headers=_aicm_cache_headers(target.name))
+        fd, st = opened
+    elif path:
+        fd, st = cells.open_beneath(principal.root, path, max_bytes=settings.max_upload_bytes)
+    else:
+        raise HTTPException(status_code=400, detail="doc_id or relative path required")
+    return stream_open_file(fd, st, headers={"Cache-Control": "no-store"})

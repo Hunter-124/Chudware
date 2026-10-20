@@ -1,6 +1,10 @@
 // Chudcode session recovery actions — see chudcode_session_actions.h. GL-free on purpose:
 // host/tests/test_chudcode_session_actions.cpp links this exact TU.
 #include "chudcode_session_actions.h"
+#ifdef __EMSCRIPTEN__
+#include "core/jobs.h"
+#include "core/fs_backend.h"
+#endif
 
 #include <unordered_map>
 #include <utility>
@@ -77,13 +81,27 @@ ChudcodeSessionLink& chudcodeSessionLinkEnsure(const std::string& convId) {
 }
 
 void chudcodeSessionLinkSet(const std::string& convId, ChudcodeSessionLink link) {
+#ifdef __EMSCRIPTEN__
+    link.sessionFile.clear();
+    if (!link.sessionId.empty()) bindCellAgentSessionHandle(convId, link.sessionId);
+#endif
     linkRegistry()[convId] = std::move(link);
 }
 
-void chudcodeSessionLinkErase(const std::string& convId) { linkRegistry().erase(convId); }
+void chudcodeSessionLinkErase(const std::string& convId) {
+#ifdef __EMSCRIPTEN__
+    bindCellAgentSessionHandle(convId, {});
+#endif
+    linkRegistry().erase(convId);
+}
 
 void chudcodeSessionLinkRekey(const std::string& oldId, const std::string& newId) {
     if (oldId == newId) return;
+#ifdef __EMSCRIPTEN__
+    const std::string handle = cellAgentSessionHandle(oldId);
+    bindCellAgentSessionHandle(newId, handle, cellAgentSessionProvider(oldId));
+    bindCellAgentSessionHandle(oldId, {});
+#endif
     auto& reg = linkRegistry();
     const auto it = reg.find(oldId);
     if (it == reg.end()) return;
@@ -91,7 +109,12 @@ void chudcodeSessionLinkRekey(const std::string& oldId, const std::string& newId
     reg.erase(oldId);
 }
 
-void chudcodeSessionLinksClear() { linkRegistry().clear(); }
+void chudcodeSessionLinksClear() {
+#ifdef __EMSCRIPTEN__
+    clearCellAgentSessionHandles();
+#endif
+    linkRegistry().clear();
+}
 
 void chudcodeLinkPersist(const std::string& convId, nlohmann::json& convObj) {
     const ChudcodeSessionLink* link = chudcodeSessionLink(convId);
@@ -102,43 +125,87 @@ void chudcodeLinkPersist(const std::string& convId, nlohmann::json& convObj) {
 
 void chudcodeLinkRestore(const std::string& convId, const nlohmann::json& convObj) {
     if (!convObj.is_object()) return;
+#ifdef __EMSCRIPTEN__
+    // Only explicit cell provenance may resume a browser session. Old native
+    // runtime ids and JSONL paths are not handles and must never be reinterpreted.
+    const auto handle = convObj.find("cell_session_id");
+    if (handle == convObj.end() || !handle->is_string() || handle->get_ref<const std::string&>().empty())
+        return;
+    ChudcodeSessionLink link;
+    const auto it = convObj.find("chudcode");
+    if (it != convObj.end()) chudcodeSessionLinkFromJson(*it, link);
+    link.sessionId = handle->get<std::string>();
+    link.sessionFile.clear();
+    const auto provider = convObj.find("cell_session_provider");
+    if (provider != convObj.end() && provider->is_string())
+        bindCellAgentSessionHandle(convId, link.sessionId, provider->get<std::string>());
+    chudcodeSessionLinkSet(convId, std::move(link));
+#else
     const auto it = convObj.find("chudcode");
     if (it == convObj.end()) return;
     ChudcodeSessionLink link;
     if (chudcodeSessionLinkFromJson(*it, link)) chudcodeSessionLinkSet(convId, std::move(link));
+#endif
 }
 
 // ---- request params ---------------------------------------------------------------------------
 
 nlohmann::json chudcodeExportSessionParams(const std::string& sessionId,
                                            const std::string& outputPath) {
+#ifdef __EMSCRIPTEN__
+    nlohmann::json p = {{"session_id", cellAgentSessionHandle(sessionId)}};
+#else
     nlohmann::json p = {{"session_id", sessionId}};
+#endif
     if (!outputPath.empty()) p["output_path"] = outputPath;
     return p;
 }
 
 nlohmann::json chudcodeBranchSessionParams(const std::string& sessionId,
                                            const std::string& entryId) {
+#ifdef __EMSCRIPTEN__
+    return {{"session_id", cellAgentSessionHandle(sessionId)}, {"entry_id", entryId}};
+#else
     return {{"session_id", sessionId}, {"entry_id", entryId}};
+#endif
 }
 
 nlohmann::json chudcodeRepairSessionParams(const std::string& sessionId, bool repair) {
+#ifdef __EMSCRIPTEN__
+    return {{"session_id", cellAgentSessionHandle(sessionId)}, {"repair", repair}};
+#else
     return {{"session_id", sessionId}, {"repair", repair}};
+#endif
 }
 
 nlohmann::json chudcodeCloseSessionParams(const std::string& sessionId) {
+#ifdef __EMSCRIPTEN__
+    return {{"session_id", cellAgentSessionHandle(sessionId)},
+            {"provider", cellAgentSessionProvider(sessionId)}};
+#else
     return {{"session_id", sessionId}};
+#endif
 }
 
 nlohmann::json chudcodeRewindSessionParams(const std::string& sessionId,
                                            const std::string& userText, int occurrence,
                                            const std::string& sessionFile,
                                            const std::string& workspaceDir) {
+#ifdef __EMSCRIPTEN__
+    (void)sessionFile;
+    nlohmann::json p = {{"session_id", cellAgentSessionHandle(sessionId)},
+                        {"user_text", userText},
+                        {"occurrence", occurrence < 0 ? 0 : occurrence}};
+    std::string relative, err;
+    if (chudware::workspaceRelativePath(workspaceDir, relative, err))
+        p["workspace_dir"] = relative.empty() ? "." : relative;
+#else
     nlohmann::json p = {{"session_id", sessionId},
                         {"user_text", userText},
                         {"occurrence", occurrence < 0 ? 0 : occurrence}};
     if (!sessionFile.empty()) p["session_file"] = sessionFile;
     if (!workspaceDir.empty()) p["workspace_dir"] = workspaceDir;
+#endif
     return p;
 }
 
@@ -231,8 +298,13 @@ bool parseChudcodeBranchResult(const nlohmann::json& r, ChudcodeBranchResult& ou
     ChudcodeBranchResult parsed;
     parsed.sessionId = jsonStr2(r, "chudcode_session_id", "sessionId");
     parsed.sessionFile = jsonStr2(r, "chudcode_session_file", "sessionFile");
-    // A branch without a resume file is unusable — refuse rather than mint a dead fork.
+#ifdef __EMSCRIPTEN__
+    // A browser branch resumes by its cell-owned handle, never a runtime file.
+    parsed.sessionFile.clear();
+    if (parsed.sessionId.empty()) return false;
+#else
     if (parsed.sessionId.empty() || parsed.sessionFile.empty()) return false;
+#endif
     out = std::move(parsed);
     return true;
 }
@@ -292,7 +364,11 @@ const char* chudcodeHealthLabel(const std::string& health) {
 void applyChudcodeDoctor(ChudcodeSessionLink& link, const ChudcodeDoctorSummary& s) {
     if (!s.status.empty()) link.health = s.status;
     if (!s.sessionId.empty()) link.sessionId = s.sessionId;
+#ifdef __EMSCRIPTEN__
+    link.sessionFile.clear();
+#else
     if (!s.sessionFile.empty()) link.sessionFile = s.sessionFile;
+#endif
 }
 
 }  // namespace ui

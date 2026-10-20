@@ -141,6 +141,8 @@ struct ManufacturingReport {
   bool overhang_evaluated = false;
   bool overhang_in_objective = false; // overhang_penalty > 0
   Eigen::Vector3d build_direction = Eigen::Vector3d::Zero();
+  std::string build_direction_source;
+  std::optional<BuildPlate> build_plate;
   double overhang_angle_deg = 0;
   double overhang_penalty = 0;
   double overhang_measure = 0;            // relaxed O(rho) at the final design
@@ -158,6 +160,7 @@ struct ManufacturingReport {
   std::optional<double> min_member_m;
   double filter_radius_m = 0;
   std::string filter_radius_source;
+  std::optional<double> min_member_filter_radius_mm, mesh_floor_radius_mm;
   std::string min_member_regularization; // how the method used the radius
   // Variable ties.
   std::array<bool, 3> symmetry_axes{false, false, false};

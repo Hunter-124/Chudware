@@ -1,0 +1,29 @@
+#!/usr/bin/python3 -IS
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cell_forwarder import start
+from cell_runtime import close_extra_fds
+
+if __name__ == "__main__":
+    try:
+        if len(sys.argv) < 3 or sys.argv[1] != "--" or not sys.argv[2].startswith("/"):
+            raise ValueError("absolute actor argv required")
+        close_extra_fds()
+        listeners = start()  # both lanes bind before any child; no unproxied fallback
+        child = subprocess.Popen(sys.argv[2:], close_fds=True)
+        def stop(signum, frame):
+            if child.poll() is None:
+                child.send_signal(signum)
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        status = child.wait()  # no turn wall-clock cap
+        for listener in listeners:
+            listener.close()
+        sys.exit(status if status >= 0 else 128 - status)
+    except Exception as exc:
+        print("cell_refused: " + str(exc), file=sys.stderr)
+        sys.exit(1)

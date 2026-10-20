@@ -28,6 +28,7 @@
 #include "environment_test_support.h"
 #include "doc/session.h"
 #include "doc/stepplus.h"
+#include "doc/native_policy.h"
 #include "sim/fea_run.h"
 #include "sim/flow_run.h"
 #include "sim/numpy_rng.h"
@@ -613,6 +614,45 @@ TEST_CASE("stepplus reopens editable data without an oversized optional mesh cac
     fs::remove(path, ec);
 }
 
+#if !defined(_WIN32)
+TEST_CASE("stepplus ordinary save never follows a predictable staging alias") {
+    const fs::path dir = tmp_path("staging_alias");
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    REQUIRE(fs::create_directories(dir));
+    const fs::path path = dir / "part.step+";
+    const fs::path sentinel = dir / "sibling-sentinel";
+    { std::ofstream(sentinel, std::ios::binary) << "untouched sibling fixture"; }
+    fs::create_symlink(sentinel, fs::path(path.string() + ".tmp"));
+    const json doc = {{"schema", "aicad.part/1"}, {"name", "Staging"}, {"features", json::array()}};
+    chudware::doc::stepplus_save(doc, path.string(), {});
+    std::ifstream in(sentinel, std::ios::binary);
+    CHECK(std::string(std::istreambuf_iterator<char>(in), {}) == "untouched sibling fixture");
+    CHECK(chudware::doc::stepplus_open(path.string()).doc == doc);
+    std::size_t entries = 0;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        (void)entry;
+        ++entries;
+    }
+    CHECK(entries == 3);  // published archive, sentinel and the untouched alias only
+    fs::remove_all(dir, ec);
+}
+#endif
+
+TEST_CASE("native metadata inspection extracts only the entry it admitted") {
+    const fs::path path = fs::absolute(tmp_path("uppercase_metadata.step+"));
+    write_zip(path, {{"meta.json", R"({"container":"aicad.step+/1"})"},
+                     {"DOCUMENT.JSON", std::string(65536, ' ') +
+                                       R"({"schema":"aicad.part/1","features":[]})"}},
+              MZ_BEST_COMPRESSION);
+    const json inspected = chudware::doc::native_file_operations(
+        {{"action", "inspect"}, {"paths", json::array({path.string()})}});
+    REQUIRE(inspected.at("files").size() == 1);
+    CHECK(inspected.at("files")[0].value("ok", true) == false);
+    std::error_code ec;
+    fs::remove(path, ec);
+}
+
 TEST_CASE("stepplus retains large STORED mesh caches within the archive budget") {
     const fs::path path = tmp_path("large_stored_mesh_cache.step+");
     const json doc = {{"schema", "aicad.part/1"}, {"name", "Cached model"}};
@@ -830,6 +870,51 @@ TEST_CASE("stepplus native relocation preserves models and rebases mapped and re
     }
     // A STORED highly-compressible unknown entry remains admissible to normal open.
     CHECK(chudware::doc::stepplus_open(new_assembly.string()).extra.at("future/payload.bin") == unknown);
+}
+
+TEST_CASE("stepplus relocation preserves Unicode paths despite unrelated Unicode siblings") {
+    using namespace chudware::doc;
+    using native_policy::path_utf8;
+    NativeFileFixture fixture;
+    const auto source = fixture.root / fs::u8path(u8"原本-日本.step+");
+    const auto dependency = fixture.root / fs::u8path(u8"部品-λ.step+");
+    const auto destination = fixture.root / "organized" / fs::u8path(u8"組立-é.step+");
+    REQUIRE(fs::create_directory(fixture.root / fs::u8path(u8"無関係-資料")));
+#if defined(_WIN32)
+    std::wstring unrelated = L"unrelated-invalid-utf16-";
+    unrelated.push_back(static_cast<wchar_t>(0xd800));
+    REQUIRE(fs::create_directory(fixture.root / unrelated));
+#endif
+    const json part{{"schema", "aicad.part/1"}, {"id", "unicode-part"},
+                    {"name", "Dependency"}, {"features", json::array()}};
+    json assembly{{"schema", "aicad.asm/1"}, {"id", "unicode-assembly"},
+        {"name", "Before overwrite"},
+        {"components", json::array({{{"id", "p1"},
+            {"source", {{"path", path_utf8(dependency.filename())}}},
+            {"transform", json::array({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1})},
+            {"fixed", true}}})}};
+    stepplus_save(part, path_utf8(dependency), {});
+    // Exercise Win32 handle-based publication with mixed native/forward separators.
+    const auto mixed_path = path_utf8(source.parent_path()) + "/" + path_utf8(source.filename());
+    stepplus_save(assembly, mixed_path, {});
+    REQUIRE(fs::is_regular_file(source));
+    assembly["name"] = "After overwrite";
+    stepplus_save(assembly, mixed_path, {});
+    CHECK(stepplus_open(path_utf8(source)).doc == assembly);
+    const auto source_bytes = native_file_bytes(source);
+    const auto inspected = native_file_operations({{"action", "inspect"},
+        {"paths", json::array({path_utf8(source)})}});
+    REQUIRE_MESSAGE(inspected.value("ok", false), inspected.dump());
+    const auto relocated = native_file_operations({{"action", "relocate"},
+        {"entries", json::array({{{"path", path_utf8(source)},
+                                  {"destination", path_utf8(destination)}}})}});
+    REQUIRE_MESSAGE(relocated.value("ok", false), relocated.dump());
+    REQUIRE(fs::is_regular_file(destination));
+    const auto reopened = stepplus_open(path_utf8(destination));
+    assembly["components"][0]["source"]["path"] = "../" + path_utf8(dependency.filename());
+    CHECK(reopened.doc == assembly);
+    CHECK(stepplus_open(path_utf8(dependency)).doc == part);
+    CHECK(native_file_bytes(source) == source_bytes);
 }
 
 TEST_CASE("stepplus native relocation accepts an existing directory's alternate identity spelling") {
@@ -1157,4 +1242,132 @@ TEST_CASE("solver_threads: configured requests remain within the hard host cap")
     const int overflowed = chudware::sim::governed_solver_threads();
     CHECK(overflowed >= 1);
     CHECK(overflowed <= 8);
+}
+
+#include "doc/native_policy.h"
+#include "piping/solve.h"
+
+namespace {
+struct NumericalRootPolicyGuard {
+    std::string root;
+    std::string state;
+    bool configured = false;
+    explicit NumericalRootPolicyGuard(const std::string& workspace) {
+        auto& config = chudware::doc::native_policy::configuration();
+        {
+            std::lock_guard<std::mutex> lock(config.mutex);
+            root = config.root;
+            state = config.state;
+            configured = config.configured;
+        }
+        chudware::doc::native_policy::configure(workspace, "");
+    }
+    ~NumericalRootPolicyGuard() {
+        auto& config = chudware::doc::native_policy::configuration();
+        std::lock_guard<std::mutex> lock(config.mutex);
+        config.root = root;
+        config.state = state;
+        config.configured = configured;
+    }
+};
+}
+
+TEST_CASE("pump curve rooted file sources refuse escapes while inline CSV remains usable") {
+    NativeFileFixture fixture;
+    const fs::path work = fixture.root / "work";
+    REQUIRE(fs::create_directory(work));
+    NumericalRootPolicyGuard policy(work.string());
+    const std::string csv = "flow,head\n0,20\n10,10\n";
+    const auto curve_file = work / "curve.csv";
+    const auto outside = fixture.root / "outside.csv";
+    for (const auto& path : {curve_file, outside}) {
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << csv;
+    }
+    const auto inline_curve = chudware::piping::load_pump_curve(csv);
+    REQUIRE(inline_curve.value("ok", false));
+    const auto file_curve = chudware::piping::load_pump_curve("curve.csv");
+    REQUIRE(file_curve.value("ok", false));
+    CHECK(file_curve == inline_curve);
+
+    // A CSV header that also names a real file is still text, not a file source.
+    {
+        std::ofstream out(work / "flow,head");
+        REQUIRE(out.good());
+        out << csv;
+    }
+    const auto header_only = chudware::piping::load_pump_curve("flow,head");
+    CHECK_FALSE(header_only.value("ok", true));
+    CHECK(header_only.value("reason", "") == "pump curve needs >= 2 valid points");
+
+    std::vector<std::string> refused{
+        "../outside.csv", "nested/../../outside.csv", outside.string(), curve_file.string(),
+        std::string("curve.csv\0suffix", 16)
+    };
+#ifndef _WIN32
+    fs::create_symlink(outside, work / "escape.csv");
+    refused.push_back("escape.csv");
+#endif
+    for (const auto& source : refused) {
+        CAPTURE(source);
+        const auto result = chudware::piping::load_pump_curve(source);
+        CHECK_FALSE(result.value("ok", true));
+        CHECK(result.value("reason", "").find("cannot read pump curve: ") == 0);
+    }
+}
+
+TEST_CASE("FEA system exports enforce root references before warm result-cache returns") {
+    NativeFileFixture fixture;
+    const fs::path work = fixture.root / "work";
+    REQUIRE(fs::create_directory(work));
+    NumericalRootPolicyGuard policy("");
+    CacheSidecarGuard sidecars(fixture.root / "cache");
+    const fs::path desktop_export = work / "desktop.json";
+    json study = cube_static_study();
+    study["export_system_path"] = desktop_export.string();
+    const auto desktop = chudware::sim::fea_run_static(study);
+    REQUIRE_MESSAGE(desktop.value("ok", false), desktop.dump());
+    const std::string desktop_bytes = native_file_bytes(desktop_export);
+    REQUIRE(chudware::sim::fea_run_static(study).value("cache_hit", false));
+
+    chudware::doc::native_policy::configure(work.string(), "");
+    const auto denied_cached = chudware::sim::fea_run_static(study);
+    CHECK_FALSE(denied_cached.value("ok", true));
+    CHECK(denied_cached.value("error", "").find("export_system_path refused: ") !=
+          std::string::npos);
+    CHECK(native_file_bytes(desktop_export) == desktop_bytes);
+
+    const fs::path outside = fixture.root / "outside.json";
+    const fs::path nul_target = work / "nul.json";
+    for (const auto& path : {outside, nul_target}) {
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << "must remain untouched";
+    }
+    std::vector<std::string> refused{
+        "../outside.json", "nested/../../outside.json", outside.string(),
+        std::string("nul.json\0suffix", 15)
+    };
+#ifndef _WIN32
+    fs::create_symlink(outside, work / "escape.json");
+    refused.push_back("escape.json");
+#endif
+    for (const auto& path : refused) {
+        CAPTURE(path);
+        study["export_system_path"] = path;
+        const auto result = chudware::sim::fea_run_static(study);
+        CHECK_FALSE(result.value("ok", true));
+        CHECK(result.value("error", "").find("export_system_path refused: ") !=
+              std::string::npos);
+        CHECK(native_file_bytes(outside) == "must remain untouched");
+        CHECK(native_file_bytes(nul_target) == "must remain untouched");
+    }
+    study["export_system_path"] = "exports/system.json";
+    const auto accepted = chudware::sim::fea_run_static(study);
+    REQUIRE_MESSAGE(accepted.value("ok", false), accepted.dump());
+    const json system = json::parse(native_file_bytes(work / "exports" / "system.json"));
+    CHECK(system.at("points").size() == 8);
+    CHECK(system.at("elems").size() == 6);
+    CHECK(system.contains("fixed_nodes"));
 }

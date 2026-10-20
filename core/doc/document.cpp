@@ -17,6 +17,7 @@
 // error status, never a crash — the compile_document never-raises contract.
 
 #include "doc/document.h"
+#include "doc/native_policy.h"
 
 #include <algorithm>
 #include <array>
@@ -55,6 +56,12 @@
 #include <BRepCheck_ListOfStatus.hxx>  // heal: name the statuses ShapeFix cleared
 #include <BRepCheck_Result.hxx>
 #include <BRepCheck_Status.hxx>
+#include <BOPAlgo_CheckerSI.hxx>
+#include <BOPDS_DS.hxx>
+#include <BOPDS_MapOfPair.hxx>
+#include <BOPDS_Pair.hxx>
+#include <Message_ProgressIndicator.hxx>
+#include <Message_ProgressScope.hxx>
 #include <BRepGProp.hxx>
 #include <BRepClass_FaceClassifier.hxx>  // hole world_points: does the bore axis hit the face?
 #include <BRepExtrema_DistShapeShape.hxx>
@@ -939,6 +946,22 @@ int heal_bad_edge_count(const TopoDS_Shape& shape) {
     } catch (const Standard_Failure&) {
         return 0;
     }
+}
+
+// A subtractive op can only remove material. An exact volume that GROWS means the kernel
+// returned a broken solid (c259: a slot cut came back as 3 shells, +44 cm^3, BRepCheck
+// invalid, reported ok:true). Refuse it so the feature fails and the prior body stands.
+void require_cut_removed_material(const std::string& what, double before_mm3,
+                                  double after_mm3) {
+    const double tol = 1e-6 * std::max(1.0, std::abs(before_mm3));
+    if (after_mm3 <= before_mm3 + tol) return;
+    std::ostringstream os;
+    os.precision(6);
+    os << what << " produced a body LARGER than its target (" << before_mm3 << " -> "
+       << after_mm3 << " mm^3): the kernel boolean returned an invalid solid. Nothing was "
+       "changed. Move the tool off coincident/tangent faces (offset it by ~0.05 mm), or "
+       "split the cut into two features that each cross fewer existing faces.";
+    throw std::runtime_error(os.str());
 }
 
 // Wrap closed shells as a solid, orienting each shell OUTWARD (positive enclosed
@@ -1880,6 +1903,87 @@ bool dress_is_closed_solid(const TopoDS_Shape& shape) {
     }
 }
 
+// Closure alone cannot detect a blend whose trimmed faces overlap or collapse.
+// Match eval_solid_health's non-destructive, per-solid CheckerSI policy, but run
+// it only for an actual dress result, before consuming the preceding body.
+class DressValidityBudget : public Message_ProgressIndicator {
+public:
+    DressValidityBudget()
+        : deadline_(std::chrono::steady_clock::now() + std::chrono::seconds(20)) {}
+    bool broke() const { return broke_.load(std::memory_order_relaxed); }
+protected:
+    Standard_Boolean UserBreak() override {
+        if (std::chrono::steady_clock::now() < deadline_) return Standard_False;
+        broke_.store(true, std::memory_order_relaxed);
+        return Standard_True;
+    }
+    void Show(const Message_ProgressScope&, const Standard_Boolean) override {}
+private:
+    std::chrono::steady_clock::time_point deadline_;
+    std::atomic<bool> broke_{false};
+};
+
+std::string dress_geometry_rejection(const TopoDS_Shape& shape) {
+    const std::vector<std::string> issues = heal_brep_issues(shape);
+    if (!issues.empty()) {
+        std::string reason = "BRepCheck failed: ";
+        for (const std::string& issue : issues)
+            reason += (reason.back() == ' ' ? "" : ", ") + issue;
+        return reason;
+    }
+    try {
+        TopTools_IndexedMapOfShape faces;
+        TopExp::MapShapes(shape, TopAbs_FACE, faces);
+        for (int fi = 1; fi <= faces.Extent(); ++fi) {
+            GProp_GProps area;
+            BRepGProp::SurfaceProperties(faces(fi), area);
+            if (!std::isfinite(area.Mass()) || area.Mass() <= Precision::SquareConfusion())
+                return "zero-area face at face index " + std::to_string(fi - 1);
+        }
+        TopTools_IndexedMapOfShape solids;
+        TopExp::MapShapes(shape, TopAbs_SOLID, solids);
+        if (solids.IsEmpty()) return "result contains no solid";
+        Handle(DressValidityBudget) budget = new DressValidityBudget;
+        for (int si = 1; si <= solids.Extent(); ++si) {
+            BOPAlgo_CheckerSI checker;
+            TopTools_ListOfShape one;
+            one.Append(solids(si));
+            checker.SetArguments(one);
+            checker.SetLevelOfCheck(9);
+            checker.SetNonDestructive(Standard_True);
+            checker.SetRunParallel(Standard_False);
+            checker.Perform(budget->Start());
+            if (budget->broke())
+                return "self-intersection validation incomplete (20 s budget exceeded)";
+            if (checker.HasErrors()) {
+                std::ostringstream errors;
+                checker.DumpErrors(errors);
+                return "self-intersection validation failed: " + errors.str();
+            }
+            if (checker.PDS() == nullptr)
+                return "self-intersection validation returned no data structure";
+            const BOPDS_DS& ds = *checker.PDS();
+            for (BOPDS_MapOfPair::Iterator it(ds.Interferences()); it.More(); it.Next()) {
+                Standard_Integer a = 0, b = 0;
+                it.Value().Indices(a, b);
+                if (ds.IsNewShape(a) || ds.IsNewShape(b)) continue;
+                std::ostringstream reason;
+                reason << "self-intersection between ";
+                TopAbs::Print(ds.Shape(a).ShapeType(), reason);
+                reason << " sub-shape index " << a << " and ";
+                TopAbs::Print(ds.Shape(b).ShapeType(), reason);
+                reason << " sub-shape index " << b;
+                return reason.str();
+            }
+        }
+    } catch (const Standard_Failure& failure) {
+        const char* message = failure.GetMessageString();
+        return std::string("geometry validation failed: ") +
+               (message && *message ? message : failure.DynamicType()->Name());
+    }
+    return {};
+}
+
 }  // namespace
 
 // ----------------------------------------------------------------- compile_document
@@ -1968,6 +2072,22 @@ void apply_doc_appearance(const json& doc, uint32_t body_num,
         if (v.contains("roughness") && v.at("roughness").is_number())
             roughness = c01(v.at("roughness").get<double>());
     }
+}
+
+std::string doc_body_material_key(const json& doc, uint32_t body_num) {
+    auto key_of = [](const json& m) {
+        return m.is_object() && m.contains("key") && m.at("key").is_string()
+                   ? m.at("key").get<std::string>() : std::string();
+    };
+    if (doc.contains("body_materials") && doc.at("body_materials").is_object()) {
+        const json& bm = doc.at("body_materials");
+        const std::string id = "b" + std::to_string(body_num);
+        if (bm.contains(id)) {
+            const std::string k = key_of(bm.at(id));
+            if (!k.empty()) return k;
+        }
+    }
+    return doc.contains("material") ? key_of(doc.at("material")) : std::string();
 }
 
 FaceSidInventory face_sid_inventory(const TopoDS_Shape& shape) {
@@ -3913,6 +4033,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         BRepGProp::VolumeProperties(out, after);
                         if (std::abs(before.Mass() - after.Mass()) < 1e-9)
                             throw std::runtime_error("loft cut removed no material");
+                        require_cut_removed_material("loft cut", before.Mass(), after.Mass());
                     }
                     consumed.insert(targets.ids.begin(), targets.ids.end());
                     source_of[id] = targets.ids.front();
@@ -4182,6 +4303,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                 "the tool long enough to pass through. Move the tool "
                                 "before changing its size.");
                         }
+                        require_cut_removed_material(type + " cut", gb.Mass(), ga.Mass());
                     } else {
                         // Symmetric buried-boss guard: a primitive boss merged into a body
                         // that adds NO volume lies entirely inside it. Report the
@@ -4228,6 +4350,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // compiler at all.
                 std::vector<std::string> body_names;
                 std::string src_desc;
+                const std::string source_reference = str_field(feat, "source_path", "");
+                if (native_policy::rooted() && !source_reference.empty())
+                    native_policy::resolve_reference(source_reference);
                 const std::string embedded = str_field(feat, "embedded_brep", "");
                 if (!embedded.empty()) {
                     src_desc = "embedded geometry";
@@ -4261,7 +4386,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 }
                 if (solids.empty()) {
                     // No usable embedded blob — read the source file (legacy path).
-                    const std::string src_path = str_field(feat, "source_path", "");
+                    const std::string src_path = native_policy::resolve_reference(
+                        str_field(feat, "source_path", ""));
                     if (src_path.empty())
                         throw std::runtime_error(
                             "import feature has neither embedded geometry nor 'source_path'");
@@ -4895,6 +5021,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     }
                     if (std::abs(cut_mass - base_mass) < 1e-9)
                         throw std::runtime_error("extrude cut removed no material");
+                    require_cut_removed_material("extrude cut", base_mass, cut_mass);
                     consumed.insert(tgt_id);
                     source_of[id] = tgt_id;  // owner-map: cut derives from the target body
                     results[id] = SolidResult{out};
@@ -5172,6 +5299,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         BRepGProp::VolumeProperties(out, ga);
                         if (std::abs(ga.Mass() - gb.Mass()) < 1e-9)
                             throw std::runtime_error("revolve cut removed no material");
+                        require_cut_removed_material("revolve cut", gb.Mass(), ga.Mass());
                     }
                     consumed.insert(targets.ids.begin(), targets.ids.end());
                     source_of[id] = rtgt;  // owner-map: result derives from the target body
@@ -5413,6 +5541,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         BRepGProp::VolumeProperties(out, gsa);
                         if (std::abs(gsa.Mass() - gsb.Mass()) < 1e-9)
                             throw std::runtime_error("sweep cut removed no material");
+                        require_cut_removed_material("sweep cut", gsb.Mass(), gsa.Mass());
                     }
                     consumed.insert(targets.ids.begin(), targets.ids.end());
                     source_of[id] = stgt;  // owner-map: result derives from the body
@@ -5720,6 +5849,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
 
                 TopoDS_Shape out;
                 int n_dropped = 0;      // explicit picks that couldn't be blended at this size
+                std::string contact_why;  // why a fillet could not join bodies at a shared edge
                 double blend_size = 0.0;  // radius / distance, for the warning text
                 // Read the requested size first so a SUB-TOLERANCE blend can be detected
                 // BEFORE OCCT runs (Bug K6): a positive radius/distance below the modelling
@@ -5798,7 +5928,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     if (variable)
                         out = ::geom::fillet_edges_variable(body, radius, radius2, *picked, &n_dropped);
                     else
-                        out = picked ? ::geom::fillet_edges(body, radius, *picked, &n_dropped)
+                        out = picked ? ::geom::fillet_edges(body, radius, *picked, &n_dropped,
+                                                            &contact_why)
                                      : ::geom::fillet_edges(body, radius, dir);
                 } else {
                     const double distance = blend_size;
@@ -5830,12 +5961,18 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                      : ::geom::chamfer_edges(body, distance, dir);
                 }
                 if (out.IsNull()) {
-                    // Nothing could be rounded/beveled — almost always the size exceeds the local
-                    // geometry. Give the actionable message instead of the bare "empty shape".
+                    // A shared edge between two bodies the joining fillet can't serve:
+                    // name the reason rather than calling the radius too large.
+                    if (!contact_why.empty())
+                        throw std::runtime_error(type + ": " + contact_why);
+                    // A null kernel result does not establish radius feasibility:
+                    // unsupported edge topology and failed corner construction also land here.
                     if (picked && !picked->empty()) {
-                        char buf[160];
+                        char buf[256];
                         std::snprintf(buf, sizeof(buf),
-                            "%s: %.4g mm is too large for the selected edge(s) - reduce the %s",
+                            "%s: could not construct a valid closed blend at %.4g mm on the "
+                            "selected edge(s); size feasibility is undetermined. Inspect edge "
+                            "continuity and supporting faces, or change the selection or %s",
                             type.c_str(), blend_size,
                             type == "fillet" ? "radius" : "distance");
                         throw std::runtime_error(buf);
@@ -5851,6 +5988,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // still handles the genuine "round 149 of 190, skip 41" case, where only a small
                 // fraction drops, by committing the closed partial with a warning.
                 if (!sub_tolerance && picked && n_dropped * 2 > static_cast<int>(picked->size())) {
+                    if (!contact_why.empty())
+                        throw std::runtime_error(type + ": " + contact_why);
                     char tbuf[224];
                     std::snprintf(tbuf, sizeof(tbuf),
                         "%s: %.4g mm is too large for this body — %d of %d selected edge(s) "
@@ -5884,7 +6023,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                             "rounded %d of %d edge(s); %d selector(s) couldn't be located - re-pick "
                             "those edge(s)",
                             rounded, requested, n_dangling);
-                    st.warning = buf;
+                    st.warning = contact_why.empty() ? std::string(buf)
+                                                     : std::string(buf) + " (" + contact_why + ")";
                 }
 
                 // OPEN-SHELL guard (Bug S2): the drop-failing blender rounds the FEASIBLE
@@ -5912,6 +6052,15 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                             type.c_str(), blend_size,
                             type == "fillet" ? "radius" : "distance");
                         throw std::runtime_error(obuf);
+                    }
+                    if (!src_is_surface && !sub_tolerance) {
+                        const std::string rejection = dress_geometry_rejection(out);
+                        if (!rejection.empty())
+                            throw std::runtime_error(
+                                type + " at " + std::to_string(blend_size) +
+                                " mm produced invalid geometry: " + rejection +
+                                ". Reduce the " + (type == "fillet" ? "radius" : "distance") +
+                                " or revise the selected edges; the preceding body is unchanged.");
                     }
                 }
 
@@ -7156,6 +7305,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (std::abs(gp_after.Mass() - gp_before.Mass()) < 1e-9)
                     throw std::runtime_error(
                         "hole removed no material (positions may fall outside the face/body)");
+                require_cut_removed_material("hole", gp_before.Mass(), gp_after.Mass());
 
                 // BLIND-DEPTH-EXCEEDS-STOCK warning (Bug B1): a blind hole whose requested
                 // depth runs PAST the far face of the stock is silently clamped by the
@@ -7369,6 +7519,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (std::abs(gp_after.Mass() - gp_before.Mass()) < 1e-9)
                     throw std::runtime_error(
                         "bolt_circle removed no material (the ring may fall outside the face)");
+                require_cut_removed_material("bolt_circle", gp_before.Mass(), gp_after.Mass());
                 consumed.insert(body_id);
                 source_of[id] = body_id;
                 results[id] = SolidResult{out};

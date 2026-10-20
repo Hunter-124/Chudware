@@ -38,6 +38,7 @@ SKETCH_MUTATION_OPS: frozenset[str] = frozenset({
     "sketch_add_constraint",
     "sketch_delete_constraint",
     "sketch_set_dim",
+    "sketch_fully_define",
     "sketch_mirror_entities",
     "sketch_pattern_entities",
     "sketch_convert",
@@ -1632,9 +1633,138 @@ def _endpoints(ent: dict) -> list[tuple[float, float]]:
 _COINCIDENT_TOL_MM = 1e-7
 
 
+SKETCH_DIMENSION_TYPES = frozenset({
+    "distance", "length", "angle", "radius", "diameter", "arc_length",
+    "horizontal_distance", "vertical_distance",
+})
+
+
+def sketch_feeds_feature(features: list[dict], sketch_id: str) -> bool:
+    """Whether another feature consumes this sketch (including nested profile refs)."""
+    def references(value: Any) -> bool:
+        if isinstance(value, dict):
+            return value.get("sketch") == sketch_id or any(
+                references(item) for item in value.values())
+        if isinstance(value, list):
+            return any(references(item) for item in value)
+        return isinstance(value, str) and value == sketch_id
+
+    return any(isinstance(feature, dict) and feature.get("id") != sketch_id
+               and not feature.get("suppressed") and not feature.get("deleted")
+               and (references(feature.get("refs")) or
+                    (feature.get("params") or {}).get("sketch") == sketch_id)
+               for feature in features)
+
+
+def sketch_design_intent(entities: list[dict], constraints: list[dict], *,
+                         health: Optional[dict] = None,
+                         feeds_feature: bool = False) -> dict:
+    """Grade authored intent without mistaking fixed external references for pinned profiles."""
+    health = health or {}
+    external = {str(eid) for row in health.get("external_refs") or []
+                if isinstance(row, dict) for eid in row.get("entity_ids") or []}
+    external.update(str(e["id"]) for e in entities if isinstance(e, dict)
+                    and e.get("id") and (e.get("external") or e.get("source")))
+    authored_ids = {str(e["id"]) for e in entities if isinstance(e, dict) and e.get("id")} - external
+    profile = {str(e["id"]) for e in entities if isinstance(e, dict) and e.get("id")
+               and not e.get("construction") and str(e["id"]) not in external}
+    graph: dict[str, set[str]] = {}
+    pinned: set[str] = set()
+    dimensions = 0
+    skipped = {row.get("id") for row in health.get("skipped_constraints") or []
+               if isinstance(row, dict)}
+    for constraint in constraints:
+        if not isinstance(constraint, dict) or constraint.get("id") in skipped:
+            continue
+        kind = constraint.get("type")
+        refs = [ref if ref in ("axis.h", "axis.v") else ref.partition(".")[0]
+                for ref in constraint.get("refs") or [] if isinstance(ref, str)]
+        if kind == "fix":
+            pinned.update(ref for ref in refs if ref in authored_ids)
+            continue
+        if constraint.get("driven"):
+            continue
+        if kind in SKETCH_DIMENSION_TYPES and any(ref in profile for ref in refs):
+            dimensions += 1
+        for ref in refs:
+            graph.setdefault(ref, set()).update(other for other in refs if other != ref)
+
+    def reachable(roots: set[str]) -> set[str]:
+        reached = set(roots)
+        queue = list(roots)
+        while queue:
+            for other in graph.get(queue.pop(), ()):
+                if other not in reached:
+                    reached.add(other)
+                    queue.append(other)
+        return reached
+
+    anchored = not profile or profile <= reachable(external | {"origin", "axis.h", "axis.v"})
+    # "Pinned only" means the sketch reaches DOF 0 because of fix pins and carries no driving
+    # dimension; an anchored-but-under-defined sketch is reported as under-dimensioned instead.
+    pinned_only = bool(profile and pinned and not dimensions and health.get("dof") == 0)
+    findings = []
+
+    def finding(code: str, message: str, ids: Optional[set[str]] = None) -> None:
+        row = {"code": code, "kind": code, "severity": "warning", "message": message}
+        if ids:
+            row["entities"] = sorted(ids)
+        findings.append(row)
+
+    if pinned:
+        finding("pinned_instead_of_constrained",
+                "Authored geometry is pinned instead of constrained: remove its fix relations; "
+                "use horizontal/vertical, coincident, tangent or equal relations and driving "
+                "length/radius dimensions, then sketch_fully_define for the remaining DOF.", pinned)
+    if profile and feeds_feature and not dimensions:
+        finding("no_driving_dimensions",
+                "This sketch feeds a feature but has no driving dimensions. Add length "
+                'refs:["e1"] or radius refs:["e2"] with value:{"value":N,"expr":null}, '
+                "then sketch_fully_define; driven:true dimensions only measure.")
+    if not anchored:
+        finding("unreferenced_profile",
+                "Profile is not referenced to origin/model geometry. Add coincident "
+                'refs:["e1.p1","origin"], symmetric refs:["e1","e2","axis.v"], or '
+                "point_on to a converted construction edge; sketch_fully_define(anchor='origin') "
+                "can dimension the remaining offsets.")
+    dof = health.get("dof")
+    if isinstance(dof, (int, float)) and dof > 0:
+        finding("under_dimensioned",
+                f"Sketch has {dof} remaining DOF. Add design-intent relations and driving "
+                "dimensions, then sketch_fully_define and check_sketch: dof 0, not pinned_only.")
+    return {"pinned_only": pinned_only, "driving_dimensions": dimensions,
+            "pinned_entities": sorted(pinned), "anchored": anchored, "findings": findings}
+
+
+def sketch_define_additions(id_map: dict, op_index: int, constraints: list[dict]) -> dict:
+    """Count precisely the constraints minted by one fully-define op, not all sketch intent."""
+    key = f"${op_index}"
+    ids = [value for name, value in id_map.items()
+           if name == key or name.startswith(key + "#")]
+    types = {constraint.get("id"): constraint.get("type") for constraint in constraints
+             if isinstance(constraint, dict)}
+    dimensions = sum(types.get(cid) in SKETCH_DIMENSION_TYPES for cid in ids)
+    return {"constraint_ids": ids, "relations_added": len(ids) - dimensions,
+            "dimensions_added": dimensions}
+
+
+def live_sketch_design_intent(doc_id: str, sketch_id: str, health: dict) -> dict:
+    """Enrich native solver health with authored constraints and feature-consumer context."""
+    from services.mcp import core_bridge as cb
+
+    features = (cb.call("doc_tree", {"doc_id": doc_id}).get("tree") or {}).get("features") or []
+    feature = next((row for row in features if row.get("id") == sketch_id), {})
+    params = feature.get("params") or {}
+    return sketch_design_intent(params.get("entities") or [], params.get("constraints") or [],
+                                health=health,
+                                feeds_feature=sketch_feeds_feature(features, sketch_id))
+
+
 def check_sketch_geometry(entities: list[dict],
                           *, near_tol: float = 1e-2,
-                          health: Optional[dict] = None) -> list[dict]:
+                          health: Optional[dict] = None,
+                          constraints: Optional[list[dict]] = None,
+                          feeds_feature: bool = False) -> list[dict]:
     """Open profiles, near-coincident endpoints, under-dimensioned entities.
 
     When *health* (sketch_health result) is provided, open-profile and under-
@@ -1763,8 +1893,8 @@ def check_sketch_geometry(entities: list[dict],
                 "status": status,
                 "entities": under_ents,
                 "message": (f"Sketch under-dimensioned: dof={dof}, status={status!r}.{who}"
-                            " Add driving dimensions / relations (or sketch_auto_constrain)"
-                            " until dof is 0."),
+                            " Add horizontal/vertical/coincident relations and driving dimensions,"
+                            " then sketch_fully_define until dof is 0 and not pinned_only."),
                 "source": "sketch_health",
             })
         elif under_ents:
@@ -1792,6 +1922,11 @@ def check_sketch_geometry(entities: list[dict],
                             "pass health or call sketch_health for DOF"),
                 "source": "heuristic",
             })
+    if constraints is not None:
+        intent = sketch_design_intent(entities, constraints, health=health,
+                                      feeds_feature=feeds_feature)
+        existing = {row.get("code") for row in findings}
+        findings.extend(row for row in intent["findings"] if row["code"] not in existing)
 
     findings.sort(key=lambda f: (f.get("code", ""), f.get("message", "")))
     return findings
@@ -1875,8 +2010,7 @@ def summarize_sketch(entities: list[dict], constraints: list[dict],
         if not isinstance(c, dict):
             continue
         ct = c.get("type") or "?"
-        if ct in ("distance", "angle", "radius", "diameter", "horizontal_distance",
-                  "vertical_distance", "length"):
+        if ct in SKETCH_DIMENSION_TYPES:
             dims.append(_constraint_nl(c))
         else:
             rel_counts[ct] = rel_counts.get(ct, 0) + 1
@@ -2039,7 +2173,9 @@ def sketch_mutation_readback(sketch: dict, *, pitch: float = 1.0,
     ascii_txt, h, w, truncated = _cap_ascii(rendered["ascii"], max_h=max_h, max_w=max_w)
     grid, index, clipped = _clip_grid_index_to_picture(
         rendered.get("grid") or {}, rendered.get("index") or {}, w=w, h=h)
-    findings = check_sketch_geometry(entities, near_tol=near_tol, health=health)
+    findings = check_sketch_geometry(
+        entities, near_tol=near_tol, health=health, constraints=constraints,
+        feeds_feature=bool(sketch.get("feeds_feature")))
     summary = summarize_sketch(entities, constraints, findings, health=health)
     # compact findings payload
     compact_findings = [
@@ -2071,6 +2207,10 @@ def sketch_mutation_readback(sketch: dict, *, pitch: float = 1.0,
         "truncated": truncated,
         "caps": {"max_h": max_h, "max_w": max_w},
     }
+    intent = sketch_design_intent(entities, constraints, health=health,
+                                  feeds_feature=bool(sketch.get("feeds_feature")))
+    out.update({key: value for key, value in intent.items() if key != "findings"})
+    out["dof"] = (health or {}).get("dof")
     if clipped:
         out["clipped_entities"] = sorted(set(clipped))
         hint = (f"PICTURE IS CROPPED to {w}x{h} cells — grid/index describe only what "
@@ -2313,7 +2453,9 @@ def sketch_ascii_report(sketch: dict, *, pitch: float = 0.5,
         health = sketch["health"]
     hl = HighlightPlan(highlight)
     rendered = render_sketch_ascii(entities, pitch=pitch, plan=hl)
-    findings = check_sketch_geometry(entities, near_tol=near_tol, health=health)
+    findings = check_sketch_geometry(
+        entities, near_tol=near_tol, health=health, constraints=constraints,
+        feeds_feature=bool(sketch.get("feeds_feature")))
     summary = summarize_sketch(entities, constraints, findings, health=health)
     scale_lines = rendered["scale"]["lines"]
     legend = rendered["legend"]
@@ -4164,16 +4306,20 @@ def _load_sketch(sketch: str, doc_id: Optional[str]) -> tuple[dict, Optional[dic
     import services.mcp.core_bridge as cb  # noqa: PLC0415
     d = _doc(doc_id)
     overview = cb.call("doc_sketch_overview", {"doc_id": d, "sketch": sketch})
-    # merge authored params if present
-    entities = list(overview.get("entities") or [])
-    constraints = list(overview.get("constraints") or [])
+    tree = cb.call("doc_tree", {"doc_id": d}).get("tree") or {}
+    features = tree.get("features") or []
+    feature = next((row for row in features if row.get("id") == sketch), {})
+    params = feature.get("params") or {}
+    entities = list(overview.get("entities") or params.get("entities") or [])
+    constraints = list(params.get("constraints") or overview.get("constraints") or [])
     # prefer solved entity coords already on overview entities
     health = None
     try:
         health = cb.call("sketch_health", {"doc_id": d, "sketch": sketch})
     except Exception:
         health = None
-    return {"id": sketch, "entities": entities, "constraints": constraints}, health
+    return {"id": sketch, "entities": entities, "constraints": constraints,
+            "feeds_feature": sketch_feeds_feature(features, sketch)}, health
 
 
 def register_ascii2d_tools(mcp: FastMCP) -> None:

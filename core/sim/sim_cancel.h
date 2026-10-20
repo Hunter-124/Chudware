@@ -10,6 +10,9 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <stdexcept>
+#include <optional>
+#include <cstdint>
 
 #include <nlohmann/json.hpp>
 
@@ -19,9 +22,39 @@ namespace sim {
 // Shared cancel flag a running sim job polls between steps.
 using SimCancelToken = std::shared_ptr<std::atomic<bool>>;
 
-// Register a running generation and return the flag it polls. Reusing an id first
-// cancels the previous generation, then installs the new token, so at most one
-// uncancelled generation owns an id. Empty ids are anonymous and return nullptr.
+// Trusted native dispatch context. Missing context retains desktop behavior.
+// Nested in-process calls inherit the caller; scopes restore it on every exit.
+struct CellPrincipal {
+    std::string workspaceKey;
+    std::string actorKey;
+    bool manager = false;
+    std::int64_t epoch = 0;
+};
+class CellOwnershipError : public std::runtime_error {
+public:
+    CellOwnershipError() : std::runtime_error("not_found") {}
+};
+class CellRevokedError : public std::runtime_error {
+public:
+    CellRevokedError() : std::runtime_error("revoked") {}
+};
+const CellPrincipal* current_cell_principal();
+// Preserve the canonical denial when a solver catches a registry exception.
+bool cell_request_revoked();
+class CellRequestScope {
+public:
+    explicit CellRequestScope(const CellPrincipal* principal);
+    ~CellRequestScope();
+    CellRequestScope(const CellRequestScope&) = delete;
+    CellRequestScope& operator=(const CellRequestScope&) = delete;
+private:
+    const CellPrincipal* previous_;
+    bool previousRevoked_;
+};
+
+// Register a running generation, stamping the current cell principal. Reusing
+// an owned id cancels its previous generation; foreign id reuse throws not_found.
+// Desktop empty ids remain anonymous/null; cell anonymous jobs get owned tokens.
 SimCancelToken sim_job_register(const std::string& job_id);
 
 // Remove only the generation identified by `token`. This identity check is required:
@@ -29,10 +62,11 @@ SimCancelToken sim_job_register(const std::string& job_id);
 // newer run. Empty ids/tokens and stale generations are harmless no-ops.
 void sim_job_unregister(const std::string& job_id, const SimCancelToken& token);
 
-// The sim_cancel RPC body: {job_id} -> {ok, cancelled, job_id}. Mirrors agent::cancel_run:
-// an unknown or already-finished job is NOT an error — it returns ok:true, cancelled:false
-// (cancel-after-finish stays idempotent).
-nlohmann::json sim_cancel(const std::string& job_id);
+// The sim_cancel RPC body: {job_id} -> {ok, cancelled, job_id}. Desktop misses
+// stay idempotent and empty ids are a no-op. Cell misses/foreign jobs return
+// not_found; a manager can cancel named workspace jobs; empty means own jobs only.
+nlohmann::json sim_cancel(const std::string& job_id,
+                          std::optional<std::int64_t> revokeThrough = std::nullopt);
 
 }  // namespace sim
 }  // namespace chudware

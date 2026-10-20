@@ -1,10 +1,9 @@
 # ProvisionLib3mf.cmake — make the lib3mf 3MF library available.
 #
-# Mirrors ProvisionGmsh.cmake's auto-provisioning philosophy: if the SDK isn't
-# already extracted at the expected location, DOWNLOAD and extract the official
-# prebuilt Windows SDK — no manual install step. Then expose the include dir
-# (the header-only C++ binding) and the runtime DLL, plus a helper to deploy the
-# DLL next to an exe/dll.
+# Authenticate the official pinned platform SDK archive, including cache reuse,
+# and reconstruct its managed extraction before exposing headers/runtime paths.
+# LIB3MF_ROOT stores archive bytes; LIB3MF_LOCAL_SOURCE_DIR explicitly selects a
+# reviewed development-only SDK. Existing extracted directories are not provenance.
 #
 # Pinned to lib3mf 2.5.0 — the EXACT version the Python oracle in
 # engine/doc/formats.py imports via the `lib3mf==2.5.0` wheel. Both sides wrap
@@ -23,9 +22,15 @@
 # LICENSE NOTE: lib3mf is BSD-2-Clause — clean to vendor + link/distribute
 # (unlike gmsh's GPL). No copyleft obligation on libchudware.dll.
 
-set(LIB3MF_VERSION "2.5.0" CACHE STRING "lib3mf version to provision")
-set(LIB3MF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/lib3mf"
-    CACHE PATH "lib3mf SDK root (auto-provisioned if missing)")
+set(LIB3MF_VERSION "2.5.0")
+include("${CMAKE_CURRENT_LIST_DIR}/AuthenticatedArchive.cmake")
+if(NOT DEFINED LIB3MF_LOCAL_SOURCE_DIR)
+  set(LIB3MF_LOCAL_SOURCE_DIR "" CACHE PATH "Explicit reviewed local lib3mf SDK (development only)")
+endif()
+if(NOT DEFINED LIB3MF_ROOT)
+  set(LIB3MF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/lib3mf"
+      CACHE PATH "lib3mf SDK root (auto-provisioned if missing)")
+endif()
 file(TO_CMAKE_PATH "${LIB3MF_ROOT}" LIB3MF_ROOT)
 
 # lib3mf ships a per-platform SDK zip (same CppDynamic binding headers; the runtime is a
@@ -33,34 +38,34 @@ file(TO_CMAKE_PATH "${LIB3MF_ROOT}" LIB3MF_ROOT)
 if(WIN32)
   set(_l3mf_plat "Windows")
   set(_l3mf_libpat "lib3mf*.dll")
+  set(_l3mf_sha256 "8e185bc19e5d544c3c1e489fd8f8fcecfb0530def36e5c8bcc81bebf2ac96aa1")
 elseif(APPLE)
   set(_l3mf_plat "Darwin")
   set(_l3mf_libpat "lib3mf*.dylib")
+  set(_l3mf_sha256 "29e45884051e7f7d38dcc8922c0996dc8c60a3d6136d33d01976b3522e7d14eb")
 else()
   set(_l3mf_plat "Linux")
   set(_l3mf_libpat "lib3mf*.so*")
+  set(_l3mf_sha256 "658b40f83201dd172c8b3fe6bb4f21a047aa7e4125061399b6da9ea635ebda48")
 endif()
 
-set(_l3mf_sdk "${LIB3MF_ROOT}/lib3mf-${LIB3MF_VERSION}-${_l3mf_plat}")
-set(_l3mf_hdr "${_l3mf_sdk}/include/Bindings/CppDynamic/lib3mf_dynamic.hpp")
-
-# --- auto-provision if the SDK isn't present ---------------------------------
-if(NOT EXISTS "${_l3mf_hdr}")
-  set(_zip "${LIB3MF_ROOT}/lib3mf-${LIB3MF_VERSION}-${_l3mf_plat}.zip")
-  set(_url "https://github.com/3MFConsortium/lib3mf/releases/download/v${LIB3MF_VERSION}/lib3mf-${LIB3MF_VERSION}-${_l3mf_plat}.zip")
-  file(MAKE_DIRECTORY "${LIB3MF_ROOT}")
-  if(NOT EXISTS "${_zip}")
-    message(STATUS "[lib3mf] SDK not detected — downloading prebuilt ${LIB3MF_VERSION} (~5 MB)…")
-    file(DOWNLOAD "${_url}" "${_zip}" SHOW_PROGRESS STATUS _st)
-    list(GET _st 0 _code)
-    if(NOT _code EQUAL 0)
-      file(REMOVE "${_zip}")
-      message(FATAL_ERROR "[lib3mf] download failed: ${_st}\n  url: ${_url}")
-    endif()
+if(LIB3MF_LOCAL_SOURCE_DIR)
+  if(NOT CHUDWARE_DEVELOPER_BUILD OR DEFINED ENV{CI} OR DEFINED ENV{CHUDWARE_RELEASE_CHANNEL})
+    message(FATAL_ERROR "[lib3mf] local SDK overrides are development-only")
   endif()
-  message(STATUS "[lib3mf] extracting ${_zip} → ${LIB3MF_ROOT} …")
-  file(ARCHIVE_EXTRACT INPUT "${_zip}" DESTINATION "${LIB3MF_ROOT}")
+  set(_l3mf_install "${LIB3MF_LOCAL_SOURCE_DIR}")
+  message(WARNING "[lib3mf] LOCAL SOURCE: ${_l3mf_install}; not an authenticated release SDK")
+else()
+  # Primary upstream release asset digests:
+  # https://api.github.com/repos/3MFConsortium/lib3mf/releases/tags/v2.5.0
+  set(_l3mf_install "${CMAKE_BINARY_DIR}/authenticated-sdk/lib3mf-${_l3mf_plat}")
+  chudware_authenticated_archive(
+    "https://github.com/3MFConsortium/lib3mf/releases/download/v2.5.0/lib3mf-2.5.0-${_l3mf_plat}.zip"
+    "${LIB3MF_ROOT}/lib3mf-2.5.0-${_l3mf_plat}.zip"
+    "${_l3mf_sha256}" "${_l3mf_install}")
 endif()
+set(_l3mf_sdk "${_l3mf_install}/lib3mf-${LIB3MF_VERSION}-${_l3mf_plat}")
+set(_l3mf_hdr "${_l3mf_sdk}/include/Bindings/CppDynamic/lib3mf_dynamic.hpp")
 if(NOT EXISTS "${_l3mf_hdr}")
   message(FATAL_ERROR "[lib3mf] expected ${_l3mf_hdr} after provisioning — layout changed?")
 endif()

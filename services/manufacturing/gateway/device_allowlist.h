@@ -13,9 +13,9 @@
 
 namespace chudware::mfg::gateway {
 
-// A stable identity used for commissioning. Serial endpoints use address plus,
-// on Windows, the USB identity tuple. Network endpoints use kind/address/port;
-// DNS resolution is deliberately outside this type and happens only after authorization.
+// A stable identity used for commissioning. Serial endpoints require address
+// plus a complete USB VID/PID/serial tuple on every platform. Network endpoints
+// use kind/address/port; DNS resolution happens only after authorization.
 struct EndpointIdentity {
     device::TransportKind transport = device::TransportKind::Serial;
     std::string address;

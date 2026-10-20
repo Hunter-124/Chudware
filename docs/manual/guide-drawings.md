@@ -40,6 +40,8 @@ DELIVERABLES (export_drawing)
   - PDF: vector, true paper size, ISO line weights, filled arrows, searchable Helvetica text.
   - DXF R12: layers VISIBLE, HIDDEN (DASHED), CENTER, DIMENSIONS, HATCH, BORDER, TABLES; opens in
     any CAD package.
+  - DWG (AutoCAD R2000, written natively): the same layers/colors/text, DASHED/CENTER
+    linetypes and aligned text.
   - SVG: editable paths and real text. PNG review raster via review_drawing.
   - Drawings save inside the part's .step+ and reopen associatively; a standalone .draw+ embeds
     its source.

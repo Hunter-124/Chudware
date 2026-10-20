@@ -14,8 +14,8 @@ Contract:
   * Supported analyses: op, dc, tran, ac, tf. Everything else (four/mc/temp/
     noise/step wrappers) stays on the MNA solver.
   * Vendor models: a Circuit may carry two ADDITIVE optional keys —
-        circuit["includes"]  : list[str]  — .lib/.subckt file paths to .include
-        circuit["xdevices"]  : list[{"name","nodes","subckt"}] — X instances
+        circuit["includes"]  : list[str]  — data-only .lib/.subckt files read and inlined
+        circuit["xdevices"]  : list[{"name","nodes","subckt"}] — validated X instances
     These come from netlist_to_spice_circuit when a component's sim dict
     attaches a vendor library (``sim={"model":"SUBCKT","subckt":"UA741",
     "lib":"/path/ua741.lib", "pin_order":[...]}``). The MNA solver cannot run
@@ -147,17 +147,46 @@ def resolve_backend(requested: str, circuit: dict, study: dict) -> tuple[str, st
 # --------------------------------------------------------------------------- deck emission
 
 def emit_deck(circuit: dict, study: dict) -> str:
-    """SPICE deck for ngspice batch mode: elements (via write_spice) + vendor
-    ``.include``/X cards + analysis cards + an ascii-rawfile ``.control`` block."""
-    from services.sim.spice import write_spice  # T-RF20: pure deck serializer, STAYS services-side
+    from services.sim.spice import _encode_spice_names
+    circuit, study, _ = _encode_spice_names(circuit, study)
+    return _emit_deck_tokens(circuit, study)
 
-    body = write_spice(circuit, None)
+
+def _emit_deck_tokens(circuit: dict, study: dict) -> str:
+    """Emit only circuit data and renderer-owned analysis directives.
+
+    Vendor libraries are read once and inlined after a data-directive allowlist
+    check: ngspice never reopens an unchecked include or nested include.
+    """
+    from services.sim.spice import _write_spice_tokens, spice_identifier
+
+    body = _write_spice_tokens(circuit, None)
     lines = [ln for ln in body.splitlines() if ln.strip().lower() != ".end"]
 
     for inc in circuit.get("includes", []) or []:
-        lines.append(f".include {inc}")
+        if not isinstance(inc, str) or not inc or any(ord(c) < 32 for c in inc):
+            raise ValueError("invalid vendor library path")
+        with open(inc, "r", encoding="utf-8") as library:
+            text = library.read(8 * 1024 * 1024 + 1)
+        if len(text) > 8 * 1024 * 1024:
+            raise ValueError("vendor library exceeds 8 MiB")
+        for line in text.splitlines():
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("*"):
+                continue
+            if stripped.startswith("."):
+                directive = stripped.split(None, 1)[0].lower()
+                if directive not in {".subckt", ".ends", ".model", ".param", ".func", ".global"}:
+                    raise ValueError(f"vendor library directive not permitted: {directive}")
+            if "\x00" in line:
+                raise ValueError("invalid vendor library data")
+        lines.extend(text.splitlines())
     for xd in circuit.get("xdevices", []) or []:
-        lines.append(f"{xd['name']} {' '.join(xd['nodes'])} {xd['subckt']}")
+        name = spice_identifier(xd["name"])
+        if not name.upper().startswith("X"):
+            raise ValueError("subcircuit instance must begin with X")
+        nodes = " ".join(spice_identifier(node) for node in xd["nodes"])
+        lines.append(f"{name} {nodes} {spice_identifier(xd['subckt'])}")
 
     lines.append("")
     for an in study.get("analyses", []):
@@ -168,28 +197,33 @@ def emit_deck(circuit: dict, study: dict) -> str:
 
 
 def _fmt(v: Any) -> str:
-    try:
-        return f"{float(v):.9g}"
-    except (TypeError, ValueError):
-        return str(v)
+    from services.sim.spice import spice_number
+    return f"{spice_number(v):.9g}"
 
 
 def _analysis_card(an: dict) -> str:
     t = an.get("type")
+    from services.sim.spice import spice_identifier, spice_probe
     if t == "op":
         return ".op"
     if t == "dc":
-        return (f".dc {an.get('source', 'V1')} {_fmt(an.get('start', 0.0))} "
+        return (f".dc {spice_identifier(an.get('source', 'V1'))} {_fmt(an.get('start', 0.0))} "
                 f"{_fmt(an.get('stop', 1.0))} {_fmt(an.get('step', 0.01))}")
     if t == "tran":
         uic = " uic" if an.get("uic") else ""
         return (f".tran {_fmt(an.get('tstep', 1e-6))} {_fmt(an.get('tstop', 1e-3))} "
                 f"{_fmt(an.get('tstart', 0.0))}{uic}")
     if t == "ac":
-        return (f".ac {an.get('sweep', 'dec')} {int(an.get('points', 10))} "
+        sweep = an.get("sweep", "dec")
+        if sweep not in {"dec", "oct", "lin"}:
+            raise ValueError("invalid AC sweep")
+        points = an.get("points", 10)
+        if isinstance(points, bool) or not isinstance(points, int) or points <= 0:
+            raise ValueError("AC points must be a positive integer")
+        return (f".ac {sweep} {points} "
                 f"{_fmt(an.get('fstart', 1.0))} {_fmt(an.get('fstop', 1e6))}")
     if t == "tf":
-        return f".tf {an.get('output', 'V(OUT)')} {an.get('source', 'V1')}"
+        return f".tf {spice_probe(an.get('output', 'V(OUT)'))} {spice_identifier(an.get('source', 'V1'))}"
     raise ValueError(f"ngspice backend cannot emit analysis {t!r}")
 
 
@@ -326,15 +360,15 @@ def _run_ngspice(deck: str, want_raw: bool) -> tuple[str, str]:
         rawp = os.path.join(td, "out.raw")
         with open(cir, "w", encoding="utf-8") as f:
             f.write(deck)
-        cmd = [exe, "-b"]
+        cmd = [exe, "-n", "-b"]  # do not load a user's .spiceinit command file
         if want_raw:
             cmd += ["-r", rawp]
         cmd.append(cir)
-        env = dict(os.environ)
-        env["SPICE_ASCIIRAWFILE"] = "1"  # force ASCII rawfile output
+        env = {key: os.environ[key] for key in ("PATH", "SystemRoot") if key in os.environ}
+        env.update({"HOME": td, "SPICE_ASCIIRAWFILE": "1"})
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=_TIMEOUT_S, env=env)
+                                  timeout=_TIMEOUT_S, env=env, cwd=td)
         except subprocess.TimeoutExpired as e:
             raise NgspiceError(f"ngspice timed out after {_TIMEOUT_S:.0f}s") from e
         except OSError as e:
@@ -372,11 +406,14 @@ def simulate_ngspice(circuit: dict, study: dict) -> dict:
             log.append(f"probes: none specified — defaulting to all {len(probes)} "
                        "node/source outputs")
 
-    for an in study.get("analyses", []):
+    from services.sim.spice import _encode_spice_names
+    mapped_circuit, mapped_study, mapped_probes = _encode_spice_names(
+        circuit, {**study, "probes": probes})
+    for an, mapped_analysis in zip(study.get("analyses", []), mapped_study["analyses"]):
         atype = an.get("type")
         if atype not in SUPPORTED_ANALYSES:
             raise NgspiceError(f"unsupported analysis {atype!r}")
-        deck = emit_deck(circuit, {"analyses": [an]})
+        deck = _emit_deck_tokens(mapped_circuit, {"analyses": [mapped_analysis]})
         want_raw = atype != "tf"
         raw_text, stdout = _run_ngspice(deck, want_raw)
 
@@ -403,7 +440,7 @@ def simulate_ngspice(circuit: dict, study: dict) -> dict:
         if atype == "op":
             op: dict = {}
             for p in probes:
-                vec = _lookup(raw, p)
+                vec = _lookup(raw, mapped_probes[p])
                 v = vec[0] if vec else float("nan")
                 op[p] = float(v.real) if isinstance(v, complex) else float(v)
                 if vec is None:
@@ -417,7 +454,7 @@ def simulate_ngspice(circuit: dict, study: dict) -> dict:
                   for v in _scale_vec(raw)]
             traces = {}
             for p in probes:
-                vec = _lookup(raw, p)
+                vec = _lookup(raw, mapped_probes[p])
                 traces[p] = ([float(v.real) if isinstance(v, complex) else float(v)
                               for v in vec] if vec else [float("nan")] * len(xs))
             result["dc"] = {"sweep": an.get("source", "V1"), "x": xs, "traces": traces}
@@ -429,7 +466,7 @@ def simulate_ngspice(circuit: dict, study: dict) -> dict:
                   for v in _scale_vec(raw)]
             traces = {}
             for p in probes:
-                vec = _lookup(raw, p)
+                vec = _lookup(raw, mapped_probes[p])
                 traces[p] = ([float(v.real) if isinstance(v, complex) else float(v)
                               for v in vec] if vec else [float("nan")] * len(ts))
             result["tran"] = {"x_t": ts, "traces": traces}
@@ -442,7 +479,7 @@ def simulate_ngspice(circuit: dict, study: dict) -> dict:
             mag: dict = {}
             phase: dict = {}
             for p in probes:
-                vec = _lookup(raw, p)
+                vec = _lookup(raw, mapped_probes[p])
                 if vec is None:
                     mag[p] = [float("nan")] * len(freqs)
                     phase[p] = [float("nan")] * len(freqs)

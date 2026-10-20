@@ -186,20 +186,19 @@ static void drawSessionHeader(AppState& st) {
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
 }
 
-static void drawChatCenter(AppState& st, bool busy, bool canRun, bool compact) {
-    const float S = ui::uiScale;
-
+static void drawChatCenter(AppState& st, bool busy, bool canRun) {
     // Both layouts use the same session, transcript and draft state.
     drawSessionHeader(st);
 
     // Reserve the composer height measured last frame so the log fills the rest
     // (same one-frame-lag trick as the docked Copilot).
     static float s_composerH = 0.0f;
-    float reserve = (s_composerH > 0.0f ? s_composerH
-                                        : ImGui::GetFrameHeightWithSpacing() * 4.0f) +
-                    14.0f * S;
-    float logH = ImGui::GetContentRegionAvail().y - reserve;
-    logH = std::max(compact ? 1.0f : 120.0f * S, logH);
+    const float composerGap = ui::metrics::cpMenuRowGap();
+    const float reserve = (s_composerH > 0.0f ? s_composerH
+                                            : ImGui::GetFrameHeightWithSpacing() * 4.0f) +
+                          composerGap + ImGui::GetStyle().ItemSpacing.y * 2.0f;
+    const float logH = std::max(ui::metrics::stroke(1.0f),
+        ImGui::GetContentRegionAvail().y - reserve - chatJumpToLatestFooterHeight());
 
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
@@ -210,7 +209,6 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun, bool compact) {
     // The chat column's slab is drawn by the host child; resolve the same surface id here so
     // the pill scrollbar picks up matching tones.
     const ImVec2 lw0 = ImGui::GetWindowPos();
-    const ImVec2 lwSize = ImGui::GetWindowSize();
     const AdaptiveSurface& logSurf = adaptivePanel(
         panelId("ai_ws_conv_glass"),
         ImRect(lw0, ImVec2(lw0.x + ImGui::GetWindowSize().x,
@@ -227,16 +225,14 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun, bool compact) {
     drawWindowPillScrollbarV(logSurf);
     ImGui::EndChild();
     ImGui::PopStyleColor();
-    // Floating jump-to-latest arrow over the chat viewport's bottom-right corner; hidden while
-    // pinned to the tail. Region id matches the stick call above.
-    chatDrawJumpToLatest("aiws.chatlog", lw0,
-                         ImVec2(lw0.x + lwSize.x, lw0.y + lwSize.y));
+    // A stable parent-layout gutter, outside the transcript and its pill-scrollbar lane.
+    chatDrawJumpToLatest("aiws.chatlog");
 
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    ImGui::Dummy(ImVec2(0, composerGap));
     ImGui::BeginGroup();
     chatDrawComposer(st, busy, canRun);   // the docked Copilot's real composer + send path
     ImGui::EndGroup();
-    s_composerH = ImGui::GetItemRectSize().y + 6.0f * S;
+    s_composerH = ImGui::GetItemRectSize().y;
 }
 
 // ---- Options view (v3): run-behavior + workspace-visibility knobs -------------------
@@ -455,7 +451,7 @@ void drawAiWorkspace(AppState& st) {
         const AdaptiveSurface& convSurf =
             adaptivePanel(panelId("ai_ws_conv_glass"), cRect, GlassGroup::Global);
         glassPanel(ImGui::GetWindowDrawList(), cRect, GlassLevel::Thin, rowRoundDp(), convSurf);
-        drawChatCenter(st, busy, canRun, compact);  // same state/send path as the dock
+        drawChatCenter(st, busy, canRun);  // same state/send path as the dock
         if (padR > padL) ImGui::Unindent(padL - padR);  // undo before the scrollbar geometry read
         drawWindowPillScrollbarV(convSurf, ui::kChatScrollbar);  // same 9px right-edge bar as the dock
         ImGui::EndChild();

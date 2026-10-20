@@ -79,7 +79,9 @@ struct LoadedComponent {
     mutable std::vector<TopoDS_Shape> face_shapes;
     mutable std::vector<TopoDS_Shape> edge_shapes;
     std::vector<aicm::AppearanceRegion> appearance_regions;  // compound face IDs, not bodies
+    std::vector<std::string> body_material_keys;  // per body; "" = no material assigned
     std::string error;                          // incomplete source; surviving geometry retained
+    nlohmann::json build_state;                 // write-back report when compiled from features
 };
 
 // Keyed by resolved path + exact file identity (+ current descendants for native files).
@@ -123,6 +125,7 @@ void trim_load_cache(const std::string& path) {
 }
 
 std::string resolve_source_path(const std::string& path, const std::string& base_dir) {
+    if (native_policy::rooted()) return native_policy::resolve_reference(path, base_dir);
     std::filesystem::path p(path);
     if (p.is_absolute()) return p.string();
     if (!base_dir.empty())
@@ -209,7 +212,8 @@ void append_load_error(std::string& error, const std::string& detail) {
 // Load local-frame solids for a component file (port of assembly.py::_load_bodies).
 std::vector<TopoDS_Shape> load_bodies(
     const std::string& abspath,
-    std::vector<std::vector<aicm::AppearanceRegion>>& appearances, std::string& error) {
+    std::vector<std::vector<aicm::AppearanceRegion>>& appearances,
+    std::vector<std::string>& material_keys, std::string& error, json& build_state) {
     const std::string canonical = std::filesystem::weakly_canonical(abspath).string();
     if (std::find(loading_paths.begin(), loading_paths.end(), canonical) != loading_paths.end())
         throw OpError("import_failed", "cyclic component reference: " + canonical,
@@ -218,6 +222,8 @@ std::vector<TopoDS_Shape> load_bodies(
     struct PopPath { ~PopPath() { loading_paths.pop_back(); } } pop_path;
     const std::string low = lower(abspath);
     if (ends_with(low, ".step+") || ends_with(low, ".stepplus")) {
+        // Stamped before the read: a write-back of this compile must find the file unchanged.
+        const NativeFileStamp stamp = stepplus_file_stamp(abspath);
         StepPlusDoc loaded = stepplus_open_component(abspath);  // throws on a bad file
         if (loaded.doc.value("schema", std::string()) == "aicad.asm/1") {
             AssemblyResult ar = compile_assembly(
@@ -251,6 +257,13 @@ std::vector<TopoDS_Shape> load_bodies(
                     if (world.IsNull()) continue;
                 }
                 appearances.push_back(body.appearance_regions);
+                // A nested component is one body here: it keeps a material only when every
+                // body inside it shares one.
+                std::string key = body.body_material_keys.empty()
+                                      ? std::string() : body.body_material_keys.front();
+                for (const std::string& k : body.body_material_keys)
+                    if (k != key) key.clear();
+                material_keys.push_back(key);
                 bodies.push_back(std::move(world));
             }
             if (bodies.empty())
@@ -262,8 +275,10 @@ std::vector<TopoDS_Shape> load_bodies(
         auto resolve_appearances = [&](const std::vector<TopoDS_Shape>& bodies) {
             appearances.clear();
             appearances.reserve(bodies.size());
+            material_keys.clear();
             uint32_t ordinal = 0;
             for (const auto& shape : bodies) {
+                material_keys.push_back(doc_body_material_key(loaded.doc, ordinal + 1));
                 TopTools_IndexedMapOfShape faces;
                 TopExp::MapShapes(shape, TopAbs_FACE, faces);
                 aicm::AppearanceRegion appearance;
@@ -285,10 +300,13 @@ std::vector<TopoDS_Shape> load_bodies(
         // header. When the engine key + doc hash still match, those bodies ARE the exact
         // compile_document output — load them directly and skip the rebuild AND the re-mesh.
         // Any mismatch/corruption falls through to the full compile.
-        if (external_import_paths(loaded.doc).empty()) {
+        const bool self_contained = external_import_paths(loaded.doc).empty();
+        if (self_contained) {
+            const bool verified = stepplus_cache_verified(loaded.doc, loaded.extra, true);
             auto cj = loaded.extra.find("cache.json");
             auto cb = loaded.extra.find("cache.brep");
-            if (cj != loaded.extra.end() && cb != loaded.extra.end()) {
+            if (cj != loaded.extra.end() && cb != loaded.extra.end() &&
+                (verified || !native_policy::recomputing_cache)) {
                 try {
                     json header = json::parse(cj->second);
                     if (header.value("engine", std::string()) == stepplus_cache_engine_key() &&
@@ -297,6 +315,7 @@ std::vector<TopoDS_Shape> load_bodies(
                         header.value("solved", false)) {
                         std::vector<TopoDS_Shape> bodies = brep_cache_decode(cb->second);
                         if (!bodies.empty()) {
+                            build_state = {{"cache_trust", verified ? "verified" : "unverified"}};
                             resolve_appearances(bodies);
                             return bodies;
                         }
@@ -304,8 +323,13 @@ std::vector<TopoDS_Shape> load_bodies(
                 } catch (...) { /* stale/corrupt cache -> full compile below */ }
             }
         }
-        CompileResult r = compile_document(loaded.doc, env_from_doc(loaded.doc), nullptr,
-                                           ::geom::DisplayQuality::Fine, false);
+        // A self-contained part compiles like a part session and saves the build into its
+        // file (stepplus.md §17): the saved state was stale, and every later load would pay
+        // this rebuild again. Legacy file-backed imports never serve from saved state.
+        CompileResult r = self_contained
+            ? compile_component_with_build_state(abspath, loaded.doc, stamp, build_state)
+            : compile_document(loaded.doc, env_from_doc(loaded.doc), nullptr,
+                               ::geom::DisplayQuality::Fine, false);
         for (const FeatureStatus& st : r.statuses)
             if (!st.ok)
                 append_load_error(error, "feature '" + st.id + "' in '" + abspath +
@@ -326,6 +350,7 @@ std::vector<TopoDS_Shape> load_bodies(
     if (bodies.empty())
         throw OpError("import_failed", "component '" + abspath + "' produced no solid bodies",
                       {{"path", abspath}});
+    material_keys.assign(bodies.size(), std::string());
     return bodies;
 }
 
@@ -335,11 +360,15 @@ TopoDS_Shape compound_of(const std::vector<TopoDS_Shape>& bodies);  // defined b
 // descriptions are deferred until a mate selector needs them.
 std::shared_ptr<const LoadedComponent> describe_component(
     std::vector<TopoDS_Shape> bodies,
-    const std::vector<std::vector<aicm::AppearanceRegion>>& appearances, std::string error) {
+    const std::vector<std::vector<aicm::AppearanceRegion>>& appearances,
+    std::vector<std::string> material_keys, std::string error, json build_state) {
     auto result = std::make_shared<LoadedComponent>();
     LoadedComponent& lc = *result;
     lc.bodies = std::move(bodies);
+    lc.body_material_keys = std::move(material_keys);
+    lc.body_material_keys.resize(lc.bodies.size());
     lc.error = std::move(error);
+    lc.build_state = std::move(build_state);
     lc.compound = compound_of(lc.bodies);
     // Use the tessellator's unique face map, not explorer counts: shared topology must
     // retain exactly the same IDs whether a component is styled, repeated or nested.
@@ -466,8 +495,29 @@ std::shared_ptr<const json> component_document(const std::string& path) {
     return doc;
 }
 
+// stepplus_doc_hash of a component's document, memoized per file stamp: fingerprints
+// carry it so a rewrite that keeps the document (a build-state refresh) still matches.
+std::string component_document_hash(const std::string& path, const json& doc) {
+    struct Entry { std::string stamp, hash; };
+    static std::map<std::string, Entry> cache;  // protected by g_cache_mtx
+    const std::string stamp = component_file_stamp(path);
+    {
+        std::lock_guard<std::mutex> lock(g_cache_mtx);
+        auto it = cache.find(path);
+        if (it != cache.end() && it->second.stamp == stamp) return it->second.hash;
+    }
+    std::string hash = stepplus_doc_hash(doc);
+    if (component_file_stamp(path) == stamp) {
+        std::lock_guard<std::mutex> lock(g_cache_mtx);
+        if (cache.size() >= kComponentCacheLimit) cache.erase(cache.begin());
+        cache[path] = {stamp, hash};
+    }
+    return hash;
+}
+
 std::string component_cache_key(const std::string& abspath) {
     std::string key = abspath + ":" + component_file_stamp(abspath);
+    if (native_policy::recomputing_cache) key += ":verified-rebuild";
     const std::string low = lower(abspath);
     if (ends_with(low, ".step+") || ends_with(low, ".stepplus")) {
         const auto doc = component_document(abspath);
@@ -481,9 +531,9 @@ std::string component_cache_key(const std::string& abspath) {
 
 std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
                                                      const std::string& base_dir) {
-    // A relative source needs a base folder (the assembly file's folder, else the project
-    // folder). Without one, refuse: the process cwd has no relation to the project.
-    if (std::filesystem::path(path).is_relative() && base_dir.empty())
+    // A relative desktop source needs a document/project base. In a rooted cell
+    // the configured workspace supplies that base without consulting process cwd.
+    if (std::filesystem::path(path).is_relative() && base_dir.empty() && !native_policy::rooted())
         throw OpError("component_source_unresolved",
                       "component source '" + path + "' is a relative path. The assembly has "
                       "no file and no project folder to resolve it. Give an absolute path, "
@@ -527,9 +577,12 @@ std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
     }
     auto load = [&] {
         std::vector<std::vector<aicm::AppearanceRegion>> appearances;
+        std::vector<std::string> material_keys;
         std::string error;
-        auto bodies = load_bodies(abspath, appearances, error);
-        return describe_component(std::move(bodies), appearances, std::move(error));
+        json build_state;
+        auto bodies = load_bodies(abspath, appearances, material_keys, error, build_state);
+        return describe_component(std::move(bodies), appearances, std::move(material_keys),
+                                  std::move(error), std::move(build_state));
     };
     // A→B and B→A can be owned by different prefetch workers. An unfinished
     // recursive hit must load locally (the path stack reports the eventual cycle),
@@ -1031,6 +1084,7 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
             loaded[cid] = ready->second;
             st.ok = loaded[cid]->error.empty();
             if (!st.ok) st.error = loaded[cid]->error;
+            st.build_state = loaded[cid]->build_state;
         } catch (const std::exception& exc) {
             st.ok = false;
             st.error = std::string(exc.what());
@@ -1108,6 +1162,7 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
         body.shape_local = lit->second->compound;
         body.transform = xform;
         body.appearance_regions = lit->second->appearance_regions;
+        body.body_material_keys = lit->second->body_material_keys;
         for (auto& appearance : body.appearance_regions)
             apply_doc_appearance(doc, static_cast<uint32_t>(ordinal), appearance.color,
                                  appearance.metallic, appearance.roughness);
@@ -1226,11 +1281,14 @@ json asm_component_fingerprints(const json& doc, const std::string& base_dir) {
         const std::string identity = ec ? path : canonical.string();
         const auto parent = std::filesystem::weakly_canonical(
             std::filesystem::path(path).parent_path(), ec);
-        if (!visited.emplace(identity, ec ? std::filesystem::path(path).parent_path().string()
-                                          : parent.string()).second) continue;
+        const bool first_visit =
+            visited.emplace(identity, ec ? std::filesystem::path(path).parent_path().string()
+                                         : parent.string()).second;
         try {
             const auto child = component_document(identity);
-            append_components(*child, std::filesystem::path(path).parent_path().string());
+            fp[i]["doc_hash"] = component_document_hash(identity, *child);
+            if (first_visit)
+                append_components(*child, std::filesystem::path(path).parent_path().string());
         } catch (...) {
             // Missing/unreadable sources retain their direct row (including zero size/mtime).
             // Compilation reports their component error; fingerprinting never hides them.
@@ -1241,7 +1299,25 @@ json asm_component_fingerprints(const json& doc, const std::string& base_dir) {
 
 bool asm_fingerprints_match(const json& doc, const std::string& base_dir, const json& fp) {
     try {
-        return fp.is_array() && asm_component_fingerprints(doc, base_dir) == fp;
+        if (!fp.is_array()) return false;
+        const json now = asm_component_fingerprints(doc, base_dir);
+        if (now.size() != fp.size()) return false;
+        for (std::size_t i = 0; i < now.size(); ++i) {
+            const json& cur = now[i];
+            const json& saved = fp[i];
+            if (!saved.is_object() || cur.at("path") != saved.value("path", json())) return false;
+            if (cur.at("size") == saved.value("size", json()) &&
+                cur.at("mtime") == saved.value("mtime", json()))
+                continue;
+            // A rewrite that kept the document — its build state refreshed after a rebuild
+            // (contracts/stepplus.md §17) — is the same source.
+            const auto now_hash = cur.find("doc_hash");
+            const auto saved_hash = saved.find("doc_hash");
+            if (now_hash != cur.end() && saved_hash != saved.end() && *now_hash == *saved_hash)
+                continue;
+            return false;
+        }
+        return true;
     } catch (...) {
         return false;
     }

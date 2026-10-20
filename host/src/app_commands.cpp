@@ -173,6 +173,14 @@ bool runtimeAllowsMutation(AppState& st) {
 }  // namespace
 bool CommandRouter::authorize(AppState& st, const char* cmdId) const {
     if (ui::ribbonCommandCapability(cmdId) != ui::CommandCapability::Mutate) return true;
+    const std::string_view cmd = cmdId ? cmdId : "";
+    if (st.activeDocLockedByAgent()) {
+        // Cancel is routed to the session's keep-exit fallback while an agent owns the doc.
+        if (cmd == "sketch_exit" || cmd == "sketch3d_exit" ||
+            cmd == "sketch_cancel" || cmd == "sketch3d_cancel") return true;
+        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
+        return false;
+    }
     if (!runtimeAllowsMutation(st)) return false;
     if (st.entitlementReadOnly) {
         st.toast(ui::ToastLevel::Warn,

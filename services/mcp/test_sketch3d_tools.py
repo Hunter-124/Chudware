@@ -377,7 +377,7 @@ class TestSketch3dDocTools:
         fid = r0["id"]
         r, _ = _call("sketch3d_add_constraints", {
             "sketch3d_id": fid, "doc_id": d,
-            "constraints": [{"type": "tangent", "refs": ["e1", "e1"]}]})  # v2-only type
+            "constraints": [{"type": "tangent", "refs": ["e1"]}]})  # tangent needs 2 refs
         assert r and r.get("ok") is False
         # The doc keeps solving cleanly afterwards (rollback worked).
         rc, _ = _call("check_sketch3d", {"sketch3d_id": fid, "doc_id": d})

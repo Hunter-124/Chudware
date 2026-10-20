@@ -17,6 +17,7 @@ import pytest
 from services import research
 from services.research.eng_calc import check_stress
 from services.research.unit_convert import normalizer_source
+from services.net import safe_http
 
 # Submodule object (not the package-level re-export) so we can monkeypatch its
 # module-bound ``is_offline`` name — same pattern as test_research.py's _OfflineToggle.
@@ -281,9 +282,9 @@ def fake_pdf_extractor(monkeypatch):
 
 def test_datasheet_fetch_plain_success_never_calls_browser_fallback(monkeypatch, fake_pdf_extractor):
     """DoD case 1: plain fetch succeeds -> browser path never invoked, zero behavior change."""
-    import httpx
+    from services.net import safe_http
 
-    monkeypatch.setattr(httpx, "get", lambda *a, **k: _FakeHttpResponse(200, b"%PDF-1.4 ..."))
+    monkeypatch.setattr(safe_http, "get", lambda *a, **k: _FakeHttpResponse(200, b"%PDF-1.4 ..."))
 
     def _boom(url):
         raise AssertionError("browser fallback must not be invoked when the plain fetch succeeds")
@@ -297,11 +298,11 @@ def test_datasheet_fetch_plain_success_never_calls_browser_fallback(monkeypatch,
 
 def test_datasheet_fetch_403_with_profile_falls_back_to_browser(monkeypatch, fake_pdf_extractor):
     """DoD case 2: 403 + an existing matching profile -> browser fallback succeeds."""
-    import httpx
+    from services.net import safe_http
     from services.browser import profiles as browser_profiles
     from services.browser import session as browser_session
 
-    monkeypatch.setattr(httpx, "get", lambda *a, **k: _FakeHttpResponse(403))
+    monkeypatch.setattr(safe_http, "get", lambda *a, **k: _FakeHttpResponse(403))
     monkeypatch.setattr(browser_profiles, "has_profile", lambda site: site == "example-vendor.com")
 
     downloaded: dict = {}
@@ -322,11 +323,11 @@ def test_datasheet_fetch_403_with_profile_falls_back_to_browser(monkeypatch, fak
 def test_datasheet_fetch_403_without_profile_degrades_unchanged(monkeypatch, fake_pdf_extractor):
     """DoD case 3: 403 + no saved profile -> existing degradation, unchanged (no login
     ever triggered from this path)."""
-    import httpx
+    from services.net import safe_http
     from services.browser import profiles as browser_profiles
     from services.browser import session as browser_session
 
-    monkeypatch.setattr(httpx, "get", lambda *a, **k: _FakeHttpResponse(403))
+    monkeypatch.setattr(safe_http, "get", lambda *a, **k: _FakeHttpResponse(403))
     monkeypatch.setattr(browser_profiles, "has_profile", lambda site: False)
 
     def _boom(*a, **k):
@@ -348,10 +349,10 @@ def test_datasheet_fetch_propagates_a_browser_cooldown_refusal(monkeypatch, fake
     900 s while this tool's harness budget is 180 s, so the only useful answer is the
     refusal itself plus ``retry_after_s``.
     """
-    import httpx
+    from services.net import safe_http
     from services.browser import session as browser_session
 
-    monkeypatch.setattr(httpx, "get", lambda *a, **k: _FakeHttpResponse(403))
+    monkeypatch.setattr(safe_http, "get", lambda *a, **k: _FakeHttpResponse(403))
 
     def _cooling(url, site, dest, **kwargs):
         return {"ok": False, "reason": "cooldown_active", "retry_after_s": 873.4,
@@ -372,10 +373,10 @@ def test_datasheet_fetch_other_browser_failures_still_degrade_as_network(
         monkeypatch, fake_pdf_extractor):
     """Only the actionable reasons are propagated; an ordinary browser failure keeps
     the pre-existing ``network`` degradation so nothing else changes shape."""
-    import httpx
+    from services.net import safe_http
     from services.browser import session as browser_session
 
-    monkeypatch.setattr(httpx, "get", lambda *a, **k: _FakeHttpResponse(403))
+    monkeypatch.setattr(safe_http, "get", lambda *a, **k: _FakeHttpResponse(403))
     monkeypatch.setattr(browser_session, "browser_download",
                         lambda url, site, dest, **k: {"ok": False,
                                                       "reason": "browser_download_failed",

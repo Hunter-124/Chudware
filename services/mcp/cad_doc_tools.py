@@ -121,7 +121,7 @@ _CID_RE = re.compile(r"^c\d+$")
 _EID_RE = re.compile(r"^e\d+$")
 _FID_RE = re.compile(r"^f\d+$")
 _BATCH_REF_RE = re.compile(r"^\$\d+$")
-_DIM_CTYPES = frozenset({"distance", "length", "angle", "radius", "diameter"})
+_DIM_CTYPES = frozenset({"distance", "length", "angle", "radius", "diameter", "arc_length"})
 
 
 def _xy(v: Any) -> Any:
@@ -602,7 +602,8 @@ _CONSTRAINT_ARITY = {
     "coincident": 2, "parallel": 2, "perpendicular": 2, "tangent": 2, "collinear": 2,
     "equal": 2, "concentric": 2, "coradial": 2, "midpoint": 2, "point_on": 2, "angle": 2,
     "symmetric": 3, "horizontal": 1, "vertical": 1, "fix": 1, "length": 1,
-    "radius": 1, "diameter": 1, "distance": 2,
+    "radius": 1, "diameter": 1, "distance": 2, "arc_length": 1,
+    "intersection": 3, "smooth": 2, "equal_curve_length": 2,
 }
 
 #: What a model calls the axis a `distance` dimension projects onto. The engine takes only
@@ -874,7 +875,7 @@ def _normalize_one_constraint(c: dict, remap, etypes: Optional[dict], label: str
         if not roster_known:
             continue
         base = h.partition(".")[0]
-        if base in ("origin",) or base in etypes or base in (expanded or {}):
+        if h in ("axis.h", "axis.v") or base == "origin" or base in etypes or base in (expanded or {}):
             continue
         hint = ""
         if _BATCH_REF_RE.match(base):
@@ -3341,7 +3342,7 @@ def _normalize_feature_types(ops: Any, notes: list) -> Any:
 _OP_TARGET_ALIASES = ("feature_id", "featureId", "feature", "target", "target_id", "fid")
 _OP_TARGET_OPS = frozenset({
     "delete_feature", "set_suppressed", "reorder_feature", "rename", "set_folder",
-    "copy_feature", "edit_feature", "set_rollback",
+    "copy_feature", "edit_feature",
 })
 
 
@@ -3658,6 +3659,21 @@ def _normalize_op_elements(ops: list, notes: list) -> list:
 
 def _normalize_op_target(op: dict, kind: str, notes: list) -> dict:
     """`{"op":"delete_feature","feature_id":"f2"}` -> the canonical `id` key."""
+    if kind == "set_rollback":
+        # The rollback bar is addressed by `after` (the feature it sits after), not `id`.
+        # Every other spelling used to reach the engine as an ignored key and come back
+        # ok:true with no change (c259 tried after/id/feature/feature_id in turn).
+        if "after" in op:
+            return op
+        for alias in ("id",) + _OP_TARGET_ALIASES:
+            v = op.get(alias)
+            if isinstance(v, str) and v.strip():
+                out = {k: x for k, x in op.items() if k != alias}
+                out["after"] = v.strip()
+                notes.append(f'set_rollback: interpreted {alias}="{v}" as after="{v}" '
+                             f"— the bar is placed with `after` (null = at the end)")
+                return out
+        return op
     if kind not in _OP_TARGET_OPS or op.get("id") is not None:
         return op
     # The target (and its params) nested inside a `feature` wrapper — the shape a model
@@ -3889,12 +3905,92 @@ def _face_pocket_pair(el: dict, kind: str, notes: list, prior: list) -> Optional
 def _shift_batch_placeholders(v: Any, table: dict) -> Any:
     """Renumber "$N" same-batch placeholders after ops were inserted ahead of them."""
     if isinstance(v, str):
-        return table.get(v.strip(), v) if _BATCH_REF_RE.match(v.strip()) else v
+        match = re.fullmatch(r"(\$\d+)((?:#\d+)?(?:\.[A-Za-z0-9_]+)?)", v.strip())
+        return table.get(match[1], match[1]) + match[2] if match else v
     if isinstance(v, list):
         return [_shift_batch_placeholders(x, table) for x in v]
     if isinstance(v, dict):
         return {k: _shift_batch_placeholders(x, table) for k, x in v.items()}
     return v
+
+
+def _append_sketch_auto_define(ops: list, *, auto_define: bool = True,
+                               doc_id: Optional[str] = None,
+                               notes: Optional[list] = None,
+                               index_map: Optional[dict] = None) -> list:
+    """Finish sketch-authoring runs in the same transaction, after explicit intent ops.
+
+    Flush before the next feature consumes the sketch, not before caller-authored
+    relations/dimensions. Renumber every downstream placeholder when inserting ops.
+    Feature params retain auto_define:false so later sketch_add_entity batches respect it.
+    """
+    policies: dict[str, bool] = {}
+    if auto_define and doc_id and any(
+            isinstance(op, dict) and op.get("op") == "sketch_add_entity"
+            and not str(op.get("sketch", "")).startswith("$") for op in ops):
+        tree = cb.call("doc_tree", {"doc_id": doc_id}).get("tree") or {}
+        policies.update({feature["id"]: (feature.get("params") or {}).get("auto_define") is not False
+                         for feature in tree.get("features") or []
+                         if isinstance(feature, dict) and feature.get("type") == "sketch"})
+    pending: dict[str, bool] = {}
+    out: list = []
+    shifts: dict[str, str] = {}
+    additions = 0
+
+    def flush() -> None:
+        nonlocal additions
+        for sketch, enabled in pending.items():
+            if enabled:
+                out.append({"op": "sketch_fully_define", "sketch": sketch})
+                additions += 1
+        pending.clear()
+
+    for index, original in enumerate(ops):
+        if not isinstance(original, dict):
+            flush()
+            shifts[f"${index}"] = f"${len(out)}"
+            out.append(original)
+            continue
+        op = {key: value for key, value in original.items() if key != "auto_define"}
+        kind = op.get("op", "")
+        if not kind.startswith("sketch_"):
+            flush()
+        shifts[f"${index}"] = f"${len(out)}"
+        out.append(op)
+        feature = op.get("feature") or {}
+        if kind == "add_feature" and feature.get("type") == "sketch":
+            sketch = f"${index}"
+            enabled = (auto_define and original.get("auto_define") is not False
+                       and feature.get("auto_define") is not False
+                       and (feature.get("params") or {}).get("auto_define") is not False)
+            policies[sketch] = enabled
+            pending[sketch] = enabled
+        elif kind == "sketch_add_entity":
+            sketch = op.get("sketch")
+            if isinstance(sketch, str):
+                enabled = (auto_define and policies.get(sketch, True)
+                           and original.get("auto_define") is not False)
+                pending[sketch] = pending.get(sketch, True) and enabled
+        elif kind == "sketch_fully_define":
+            pending.pop(op.get("sketch"), None)
+    flush()
+    if additions and notes is not None:
+        notes.append(f"appended sketch_fully_define for {additions} sketch-authoring run(s) "
+                     "in this same revision; auto_define:false opts out")
+    if index_map is not None:
+        index_map.update(shifts)
+    return _shift_batch_placeholders(out, shifts)
+
+
+def _authored_batch_id_map(id_map: dict, index_map: dict) -> dict:
+    """Keep caller op handles stable; automatic definition ops are implementation details."""
+    original = {final: authored for authored, final in index_map.items()}
+    out = {}
+    for key, value in id_map.items():
+        base, marker, suffix = key.partition("#")
+        if base in original:
+            out[original[base] + marker + suffix] = value
+    return out
 
 
 def _expand_face_pockets(ops: Any, notes: list) -> Any:
@@ -7359,7 +7455,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         document backed by one is never discarded by the orphan sweep."""
         if not path or not isinstance(path, str) or not path.strip():
             return True
-        root = os.environ.get("CHUDWARE_PROJECT_SAVE_DIR")
+        from services.agent.request_context import root_value
+        root = root_value("CHUDWARE_PROJECT_SAVE_DIR")
         if not root:
             return False
         try:
@@ -7571,7 +7668,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def add_features(ops: Optional[list] = None, doc_id: Optional[str] = None,
-                     background: bool = False,
+                     background: bool = False, auto_define: bool = True,
                      **extra: Annotated[Any, Field(default=None)]) -> str:
         """Apply a list of document ops to build/edit the part (the core modeling tool).
 
@@ -7652,6 +7749,11 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     dialect normalizer; omitted edit fields keep their current values.
                     params.constraints defaults to [] on creation only. refs.plane accepts
                     XY/XZ/YZ/top/front/right -> plane.top/plane.front/plane.right.
+                    NEW sketches and sketch_add_entity batches finish with sketch_fully_define
+                    in this SAME atomic ops batch (one revision). Author relations/dimensions
+                    first; it defines remaining DOF without blanket fix pins. Pass call-level
+                    auto_define=False, op.auto_define:false, or feature.params.auto_define:false
+                    to opt out (the feature option persists for later entity batches).
                     A fix on a rectangle/polygon/polyline pins every expanded segment;
                     other relations on a whole expanded shape are ambiguous and refuse.
                     reorder_feature accepts same-batch "$N" in both id and before.
@@ -7684,6 +7786,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             sketch_edit_entity, sketch_delete_entity, sketch_delete_constraint, sketch_set_dim,
             sketch_toggle_construction, sketch_convert, sketch_break_external_ref, sketch_trim,
             sketch_extend, sketch_offset, sketch_fillet, sketch_chamfer, sketch_mirror_entities,
+            sketch_fully_define,
             sketch_pattern_entities, sketch_move, sketch_rotate, asm_insert_component,
             asm_edit_component, asm_delete_component, asm_add_mate, asm_edit_mate,
             asm_delete_mate, asm_set_explode, copy_feature, paste_feature,
@@ -7969,6 +8072,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # …and the same problem for operands built by an EARLIER batch, which
             # merge:false on a new feature cannot reach — that needs an edit_feature.
             ops = _repair_merged_boolean_operands(ops, d, interpreted)
+            auto_define_indices: dict = {}
+            ops = _append_sketch_auto_define(
+                ops, auto_define=auto_define, doc_id=d, notes=interpreted,
+                index_map=auto_define_indices)
             interpreted = _interpreted_notes(interpreted)
             # A transform edit on a component the mate solver owns is a guaranteed no-op
             # (the rebuild re-solves and writes the solved pose back). Refuse before
@@ -7980,11 +8087,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 return _dumps(_repose_refusal)
 
             def _apply() -> dict:
-                # Transactional batch: snapshot first so a partial failure rolls the WHOLE batch
-                # back (the engine otherwise leaves failed features in the tree). All-or-nothing.
+                # Assemblies may retain failed features; rollback must preserve other writers.
                 ckpt = None
                 try:
-                    ckpt = cb.call("doc_checkpoint", {"doc_id": d}).get("checkpoint")
+                    ckpt = cb.call("doc_checkpoint", {"doc_id": d})
                 except Exception as exc:  # noqa: BLE001
                     if getattr(exc, "code", None) == "engine_connection_lost":
                         raise
@@ -8017,7 +8123,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 # doc_apply_ops already returns the rebuilt tree.  Match each status against
                 # that authoritative tree instead of paying for a second doc_tree RPC just to
                 # tell callers which feature their batch created or changed.
-                tree = r.get("tree") if isinstance(r.get("tree"), dict) else {}
+                tree = r.get("rejected_tree") or r.get("tree")
+                tree = tree if isinstance(tree, dict) else {}
                 feature_meta = {
                     feature.get("id"): {
                         "name": feature.get("name"),
@@ -8072,16 +8179,11 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                                 "discarded again."),
                         }
 
-                if not ok and ckpt:
-                    # Roll the tree back to the pre-batch revision; report WHY each feature failed.
-                    reverted = False
-                    try:
-                        cb.call("doc_revert", {"doc_id": d, "checkpoint": ckpt})
-                        reverted = True
-                    except Exception as exc:  # noqa: BLE001
-                        if getattr(exc, "code", None) == "engine_connection_lost":
-                            raise
-                        reverted = False
+                if not ok:
+                    # PART compile rejection is atomic; other failures need a guarded rollback.
+                    reverted = bool(r.get("rejected_tree"))
+                    if not reverted:
+                        reverted = cb.revert_own_batch(d, ckpt, r.get("revision"))
                     fail = [{"id": s.get("id"), "error": s.get("error")} for s in fs
                             if not s.get("ok")]
                     _publish_current(d)  # mirror the rolled-back (or current) state to the app
@@ -8103,7 +8205,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         nm = fnames.get(f.get("id"))
                         parts.append(f"{fid} ({nm}): {why}" if nm else f"{fid}: {why}")
                     head = ("batch rejected, nothing was kept" if reverted
-                            else "batch failed and rollback failed")
+                            else "batch failed; failed features were left in the tree")
                     fail_result = {
                         "ok": False,
                         "doc_id": d,
@@ -8131,14 +8233,14 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     # the failure response for the copilot/caller to surface. Best-effort:
                     # any error (no provider, no tree) degrades to the plain failure dict.
                     try:
-                        failed_tree = r.get("tree") or (r.get("rebuild") or {}).get("tree")
+                        failed_tree = r.get("rejected_tree")
                         if failed_tree:
                             from services.mcp.regen_tools import diagnose_failed_document
-                            engine_err = "; ".join(
-                                str(f.get("error")) for f in fail if f.get("error")) or None
+                            engine_err = "; ".join(parts) or None
                             diag = diagnose_failed_document(
                                 {"revision": r.get("revision", 0), "tree": failed_tree,
-                                 "owner_map": r.get("owner_map") or {}},
+                                 "owner_map": r.get("owner_map") or {},
+                                 "rebuild": {"feature_status": fs}},
                                 engine_error=engine_err)
                             if diag.get("ok"):
                                 card = dict(diag["card"])
@@ -8146,6 +8248,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                                 card.pop("_corrupted_document", None)
                                 card.pop("_fixed_document", None)
                                 fail_result["regen_diagnosis"] = card
+                            else:
+                                fail_result["regen_diagnosis"] = diag
                     except Exception:  # noqa: BLE001 — diagnosis must never mask the failure
                         pass
                     return fail_result
@@ -8157,7 +8261,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     "body_count": len(bodies),
                     "volume_mm3": r.get("volume"),
                     "features": feats,
-                    "id_map": (r.get("id_map") if isinstance(r.get("id_map"), dict) else {}),
+                    "id_map": _authored_batch_id_map(r.get("id_map") or {}, auto_define_indices),
                 }
                 if interpreted:
                     out["interpreted"] = interpreted
@@ -8283,7 +8387,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 if ok:
                     try:
                         from services.mcp.ascii2d import (  # noqa: PLC0415
-                            sketch_ids_from_ops, live_sketch_readback,
+                            sketch_ids_from_ops, live_sketch_readback, sketch_define_additions,
                         )
                         sids = sketch_ids_from_ops(ops)
                         # Also pick up newly-created sketch features referenced as $N
@@ -8321,6 +8425,25 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                                     "(ascii_ruled), the constraint summary, grid/index for "
                                     "cell-addressed edits, and findings. "
                                     + str(readbacks[0].get("hint") or ""))
+                            by_sketch = {rb["sketch_id"]: rb for rb in readbacks}
+                            definitions = []
+                            for index, op in enumerate(ops):
+                                if op.get("op") != "sketch_fully_define":
+                                    continue
+                                sid = id_map.get(op.get("sketch"), op.get("sketch"))
+                                feature = next((row for row in tree.get("features") or []
+                                                if row.get("id") == sid), {})
+                                constraints = (feature.get("params") or {}).get("constraints") or []
+                                added = sketch_define_additions(id_map, index, constraints)
+                                rb = by_sketch.get(sid)
+                                health = rb if rb is not None else cb.call(
+                                    "sketch_health", {"doc_id": d, "sketch": sid})
+                                definition = {"sketch": sid, **added, "dof": health.get("dof")}
+                                definitions.append(definition)
+                                if rb is not None:
+                                    rb.setdefault("definition", []).append(definition)
+                            if definitions:
+                                out["sketch_definitions"] = definitions
                     except Exception as exc:  # noqa: BLE001
                         if getattr(exc, "code", None) == "engine_connection_lost":
                             raise
@@ -8497,7 +8620,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         material: registry name/designation (A36, 4140, 6061-T6, PETG, ...) or an explicit
                   appearance {"color":[r,g,b], "metallic"?:0..1, "roughness"?:0..1}.
         body: "b1", "b2", ... or ordinal; default all bodies.
-        Mass/FEA calls still take their own material/density input for the solve.
+        measure_part (and the Mass Properties panel) weigh each body with its applied
+        material; FEA calls still take their own material input for the solve.
         The native tree exposes both the document default and body_materials overrides.
 
         faces: nonempty face SID strings (e.g. "F123abc") or complete face selector
@@ -8886,13 +9010,17 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         this to deliver a part the user will keep working on. (export_part writes flat interchange
         or mesh files: a plain STEP/STL has geometry only, no feature history or studies.)
 
-        path : where to write. If omitted, writes to CHUDWARE_PROJECT_SAVE_DIR using the
-               document name; only external/headless clients with no configured project folder
-               fall back to a temp .step+. A ".step+" extension is added when the name carries
-               none; a DIFFERENT CAD extension (".step", ".stl", …) is REPLACED, so
-               save_part("bracket.step") writes "bracket.step+" and never
-               "bracket.step.step+". Returns the written path and bytes so you can confirm a
-               real save, plus a note whenever the extension was rewritten.
+        path : where to write. With a configured project, omitting it saves an established
+               native file in place;
+               a detached native import retains that behavior after authored design edits,
+               but study-only scratch receives an unused project filename. Other new docs
+               use CHUDWARE_PROJECT_SAVE_DIR and the document name; only external/headless
+               clients without a project folder fall back to a temp .step+.
+               A ".step+" extension is added when absent; another CAD extension is REPLACED,
+               so save_part("bracket.step") writes "bracket.step+", never
+               "bracket.step.step+". Returns the written path and bytes, plus a note when
+               the requested extension was rewritten. An explicit path may save a scratch
+               import back to its source, subject to the user-tab protection below.
 
         Explicit paths are destinations, not design names: save_part(path="arm_revD_final5.step+")
         writes that exact requested filename (subject only to path canonicalization and the
@@ -9055,11 +9183,13 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def wait_job(job_id: str, timeout_s: float = 120.0, poll_s: float = 2.0,
-                 cancel=None) -> str:
+                 cancel=None, wake=None) -> str:
         """Block until a background job (get_job id) finishes or timeout_s passes — use instead of sleep/poll loops.
 
         Waiting does not cancel the underlying job. A host-supplied cancel callable
         interrupts only this wait; call wait_job again to retrieve its eventual result.
+        A host-supplied wake callable (the user sent a message) ends the wait early with
+        woken_by set: read the message first, then decide whether the job still matters.
         timeout_s is clamped to 0..900 s; still_running:true means the job is still going.
 
         Call wait_job as its OWN tool call, not from eval code. An eval cell's timeout counts
@@ -9083,6 +9213,18 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 snapshot = json.loads(get_job(job_id))
                 return _dumps({**snapshot, "waited_s": time.monotonic() - start,
                                "cancelled_wait": True})
+            woken_by = wake() if wake is not None else None
+            if woken_by:
+                snapshot = json.loads(get_job(job_id))
+                result = {**snapshot, "waited_s": time.monotonic() - start,
+                          "woken_by": woken_by}
+                if snapshot.get("status") == "running":
+                    result.update(
+                        still_running=True,
+                        hint=(f"Wait ended early because the user sent a message; the job "
+                              f"keeps running. Read the message, then call "
+                              f"wait_job('{job_id}') again only if its result still matters."))
+                return _dumps(result)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 snapshot = json.loads(get_job(job_id))

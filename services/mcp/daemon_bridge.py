@@ -2,7 +2,8 @@
 
 The Python mirror of services/ipc/ipc_client.cpp: connect-or-spawn against the
 instance-key socket, newline-delimited JSON-RPC, one outstanding request per
-connection (Lock-serialized — FastMCP runs sync tools off-thread). core_bridge
+connection (Lock-serialized). Calling threads own separate lazy connections, all
+sharing one process writer identity. core_bridge
 routes through here BY DEFAULT since the Phase-8 flip (unset or
 CHUDWARE_ENGINE_DAEMON=1; only an explicit =0 selects the legacy in-process
 path), keeping its call() signature so the ~200 tool call sites never change.
@@ -44,6 +45,7 @@ ERROR_PIPE_BUSY storms) that open() cannot express.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import socket
@@ -51,9 +53,11 @@ import stat
 import subprocess
 import sys
 import threading
+from services.agent.request_context import current_context, in_cell, owner_key
 import time
+import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 
 class DaemonError(RuntimeError):
@@ -127,41 +131,6 @@ def _fnv1a64_hex(s: str) -> str:
     for b in s.encode():
         h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     return f"{h:016x}"
-
-
-def _windows_user_sid() -> str:
-    """Current user's SID string ("S-1-5-21-..."), matching the SID the C++ side
-    (ipc_discovery_win.cpp currentUserSid) embeds in the pipe name. ctypes only —
-    no pywin32 dependency."""
-    import ctypes
-    from ctypes import wintypes
-
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    TOKEN_QUERY, TOKEN_USER_CLASS = 0x0008, 1
-    token = wintypes.HANDLE()
-    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY,
-                                     ctypes.byref(token)):
-        raise DaemonError("OpenProcessToken failed")
-    try:
-        need = wintypes.DWORD()
-        advapi32.GetTokenInformation(token, TOKEN_USER_CLASS, None, 0,
-                                     ctypes.byref(need))
-        buf = ctypes.create_string_buffer(need.value)
-        if not advapi32.GetTokenInformation(token, TOKEN_USER_CLASS, buf, need,
-                                            ctypes.byref(need)):
-            raise DaemonError("GetTokenInformation failed")
-        # TOKEN_USER starts with SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes; }
-        sid_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p)).contents
-        str_sid = wintypes.LPWSTR()
-        if not advapi32.ConvertSidToStringSidW(sid_ptr, ctypes.byref(str_sid)):
-            raise DaemonError("ConvertSidToStringSidW failed")
-        try:
-            return str_sid.value or "S-unknown"
-        finally:
-            kernel32.LocalFree(str_sid)
-    finally:
-        kernel32.CloseHandle(token)
 
 
 class _PipeIO:
@@ -238,7 +207,12 @@ def socket_path(hostd_bin: Optional[Path]) -> Optional[str]:
             resolved = resolved.lower()  # NTFS case-insensitive; C++ side lowercases too
         key = _fnv1a64_hex(resolved)
     if sys.platform == "win32":
-        return f"\\\\.\\pipe\\chudware-hostd-{_windows_user_sid()}-{key}"
+        from services.ipc.windows_pipe import current_user_sid
+        try:
+            sid = current_user_sid()
+        except OSError as exc:
+            raise DaemonError(f"Windows user identity unavailable: {exc}") from exc
+        return f"\\\\.\\pipe\\chudware-hostd-{sid}-{key}"
     if xdg := os.environ.get("XDG_RUNTIME_DIR"):
         return f"{xdg}/chudware/hostd-{key}.sock"
     # No XDG_RUNTIME_DIR (common for agent-spawned processes): fall back to the
@@ -394,11 +368,15 @@ class DaemonClient:
     SPAWN_COOLDOWN_S = 5.0
     SPAWN_COOLDOWN_MAX_S = 60.0
 
-    def __init__(self) -> None:
+    def __init__(self, *, writer_group: str = "") -> None:
+        self.writer_group = writer_group
+        self.owner = owner_key()
         self._lock = threading.Lock()
         # AF_UNIX socket on POSIX, _PipeIO on win32 (same sendall/recv/close shape).
         self._sock: Optional[object] = None
-        self._buf = b""
+        self._buf = bytearray()
+        self._buf_start = 0  # first unconsumed byte
+        self._buf_scan = 0  # first byte not yet searched for a newline
         self._next_id = 1
         self._events: list[dict] = []
         self.server_info: dict = {}
@@ -420,11 +398,16 @@ class DaemonClient:
             raise
         except (DaemonError, OSError) as e:
             self._disconnect()
-            if self._session_established:
+            if self._session_established or (
+                self.writer_group == _WRITER_GROUP and _group_session_established.is_set()
+            ):
                 raise DaemonSessionLost(str(e), "connect", "not_dispatched") from e
             raise DaemonError(str(e)) from e
 
     def _connect(self, spawn: bool, budget_s: float) -> None:
+        if in_cell():
+            owner_key()
+            spawn = False  # an actor may connect only to its admitted hostd
         _reap_spawned()
         hostd = resolve_hostd_bin()
         self._sock_path = socket_path(hostd)
@@ -452,7 +435,8 @@ class DaemonClient:
                         s = socket.socket(socket.AF_UNIX)
                         s.connect(self._sock_path)
                         self._sock = s
-                    self._buf = b""
+                    self._buf.clear()
+                    self._buf_start = self._buf_scan = 0
                     break
                 except OSError as e:
                     if not spawn:
@@ -521,6 +505,8 @@ class DaemonClient:
         self._spawn_block_until = 0.0
         self.server_info = self._hello()
         self._session_established = True
+        if self.writer_group == _WRITER_GROUP:
+            _group_session_established.set()
         self._drain_replace_if_stale(hostd, spawn)
 
     def _hello(self) -> dict:
@@ -530,7 +516,15 @@ class DaemonClient:
         so a transport failure after that event is the same refusal, not a lost daemon.
         """
         try:
-            info = self._call_raw("hello", {"client": "mcp", "pid": os.getpid(), "proto": 1})
+            params = {"client": "mcp", "pid": os.getpid(), "proto": 1}
+            ctx = current_context()
+            if ctx.get("cell"):
+                params["user"] = {"id": ctx["actor_key"]}
+                params["actor_key"] = ctx["actor_key"]
+                params["writer_group"] = repr(owner_key())
+            if self.writer_group and not ctx.get("cell"):
+                params["writer_group"] = self.writer_group
+            info = self._call_raw("hello", params)
         except DaemonError:
             event = self._draining_event()
             if event is not None:
@@ -558,18 +552,17 @@ class DaemonClient:
                     chunk = sock.recv(65536, socket.MSG_DONTWAIT)
                     if not chunk:
                         break
-                    self._buf += chunk
+                    self._buf.extend(chunk)
             except OSError:
                 pass  # nothing queued, or the reset that follows the queued bytes
-        msgs = list(self._events)
-        for line in self._buf.split(b"\n"):
-            try:
-                msg = json.loads(line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            if isinstance(msg, dict):
-                msgs.append(msg)
-        return next((m for m in msgs if m.get("event") == "daemon.draining"), None)
+        for msg in self._events:
+            if msg.get("event") == "daemon.draining":
+                return msg
+        return next(
+            (msg for msg in self._buffered_messages()
+             if msg.get("event") == "daemon.draining"),
+            None,
+        )
 
     def _note_spawn_failed(self) -> None:
         """Arm/extend the spawn cooldown after a spawn+connect cycle failed."""
@@ -642,21 +635,53 @@ class DaemonClient:
             except OSError:
                 pass
             self._sock = None
-        self._buf = b""
+        self._buf.clear()
+        self._buf_start = self._buf_scan = 0
         self._events.clear()
 
     # ---------------------------------------------------------------- wire I/O
 
+    def _buffered_messages(self) -> Iterator[dict]:
+        """Inspect unread lines without consuming them, including an EOF tail."""
+        start = self._buf_start
+        while start < len(self._buf):
+            nl = self._buf.find(b"\n", start)
+            end = nl if nl >= 0 else len(self._buf)
+            try:
+                msg = json.loads(self._buf[start:end])
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
+            else:
+                if isinstance(msg, dict):
+                    yield msg
+            start = end + 1
+
     def _read_msg(self) -> dict:
         assert self._sock is not None
         while True:
-            nl = self._buf.find(b"\n")
+            nl = self._buf.find(b"\n", self._buf_scan)
             if nl >= 0:
-                line, self._buf = self._buf[:nl], self._buf[nl + 1:]
+                if self._buf_start == 0 and nl == len(self._buf) - 1:
+                    # JSON accepts the framing newline as trailing whitespace:
+                    # hand off a whole reply without copying its byte array.
+                    line, self._buf = self._buf, bytearray()
+                    self._buf_start = self._buf_scan = 0
+                else:
+                    line = self._buf[self._buf_start:nl]
+                    self._buf_start = self._buf_scan = nl + 1
+                    if self._buf_start == len(self._buf):
+                        self._buf.clear()
+                        self._buf_start = self._buf_scan = 0
+                    elif self._buf_start >= 65536 and self._buf_start >= len(self._buf) // 2:
+                        # Compact geometrically, not once per line. Replacing the
+                        # array releases the capacity of a large consumed reply.
+                        self._buf = self._buf[self._buf_start:]
+                        self._buf_start = self._buf_scan = 0
                 try:
                     return json.loads(line)
                 except json.JSONDecodeError:
                     continue  # tolerate stray lines
+            self._buf_scan = len(self._buf)
             try:
                 chunk = self._sock.recv(65536)
             except OSError as e:
@@ -664,7 +689,7 @@ class DaemonClient:
                 raise DaemonError(f"daemon connection lost ({e})") from e
             if not chunk:
                 raise DaemonError("daemon connection closed")
-            self._buf += chunk
+            self._buf.extend(chunk)
 
     def _call_raw(self, method: str, params: dict) -> dict:
         """One round trip, lock held by caller-or-self. Raises DaemonError on
@@ -716,27 +741,45 @@ class DaemonClient:
                 if not chunk:
                     closed = True
                     break
-                self._buf += chunk
+                self._buf.extend(chunk)
         except (BlockingIOError, InterruptedError):
             return False
         except OSError:
             closed = True
         if not closed:
             return False
-        for line in self._buf.split(b"\n"):
-            try:
-                msg = json.loads(line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            if (isinstance(msg, dict) and msg.get("event") == "daemon.exiting"
+        for msg in self._buffered_messages():
+            if (msg.get("event") == "daemon.exiting"
                     and msg.get("reason") in ("idle", "drained")):
                 return True
         return False
 
     # ---------------------------------------------------------------- public
 
+    def refresh_server_info(self) -> dict:
+        """Refresh hello metadata without changing this connection's admitted identity."""
+        if self.owner != owner_key():
+            raise DaemonError("not_found")
+        with self._lock:
+            if self._sock is not None and self._peer_closed_idle():
+                self._disconnect()
+            if self._sock is None:
+                self.connect()
+                return self.server_info
+            try:
+                self.server_info = self._hello()
+                return self.server_info
+            except DaemonDraining:
+                self._disconnect()
+                raise
+            except (DaemonError, OSError) as e:
+                self._disconnect()
+                raise DaemonSessionLost(str(e), "hello", "unknown") from e
+
     def call(self, method: str, params: Optional[dict] = None) -> dict:
         """Blocking RPC; only an explicit loading refusal permits redispatch."""
+        if self.owner != owner_key():
+            raise DaemonError("not_found")
         with self._lock:
             if self._sock is not None and self._peer_closed_idle():
                 # hostd idle-exited (or drained) while this connection sat between
@@ -824,15 +867,91 @@ def spawn_agent_worker(argv: list, mission_id: str = "", doc_id: str = "",
     })
 
 
-_client: Optional[DaemonClient] = None
-_client_lock = threading.Lock()
+_WRITER_GROUP = f"py-{os.getpid()}-{uuid.uuid4().hex}"
+_group_session_established = threading.Event()
+_clients = threading.local()
+_call_connections = threading.local()
+
+
+class TurnConnections:
+    """Lease independent sockets to concurrent tools for one agent turn.
+
+    RPC host-call threads are short-lived. Their exit must not detach documents
+    between every pair of tools; the turn, not the thread, owns these sockets.
+    Idle sockets are reused, so storage is bounded by peak concurrent CAD calls.
+    """
+
+    def __init__(self) -> None:
+        self.owner = owner_key()
+        self._lock = threading.Lock()
+        self._idle: list[DaemonClient] = []
+        self._closed = False
+
+    def acquire(self) -> DaemonClient:
+        if self.owner != owner_key():
+            raise DaemonError("not_found")
+        with self._lock:
+            if self._closed:
+                raise DaemonSessionLost("agent turn has ended", "connect", "not_dispatched")
+            if self._idle:
+                return self._idle.pop()
+        return DaemonClient(writer_group=_WRITER_GROUP)
+
+    def release(self, connection: DaemonClient) -> None:
+        with self._lock:
+            if not self._closed:
+                self._idle.append(connection)
+                return
+        connection.close()
+
+    def close(self) -> None:
+        # Never interrupt an in-flight mutation. Active leases close when their
+        # calls unwind; new calls on this finished turn refuse before dispatch.
+        with self._lock:
+            self._closed = True
+            idle, self._idle = self._idle, []
+        for connection in idle:
+            connection.close()
+
+
+@contextlib.contextmanager
+def turn_connection_scope(pool: TurnConnections | None):
+    """Install a lazy call lease, preserving nested dispatch on this thread."""
+    previous = getattr(_call_connections, "lease", None)
+    if pool is None or (previous is not None and previous[0] is pool):
+        yield
+        return
+    lease = [pool, None]
+    _call_connections.lease = lease
+    try:
+        yield
+    finally:
+        _call_connections.lease = previous
+        if lease[1] is not None:
+            pool.release(lease[1])
+
+
+class _ThreadClient:
+    """Thread-local owner: release its socket when the calling thread exits."""
+
+    def __init__(self) -> None:
+        self.owner = owner_key()
+        self.value = DaemonClient(writer_group=_WRITER_GROUP)
+
+    def __del__(self) -> None:
+        self.value.close()
 
 
 def client() -> DaemonClient:
-    """Process singleton; its first call connects under the connection lock."""
-    global _client
-    if _client is None:
-        with _client_lock:
-            if _client is None:
-                _client = DaemonClient()
-    return _client
+    """Current tool's leased connection, or a thread-owned standalone connection."""
+    lease = getattr(_call_connections, "lease", None)
+    if lease is not None:
+        if lease[1] is None:
+            lease[1] = lease[0].acquire()
+        return lease[1]
+    holder = getattr(_clients, "holder", None)
+    if holder is None or holder.owner != owner_key():
+        if holder is not None:
+            holder.value.close()
+        holder = _clients.holder = _ThreadClient()
+    return holder.value

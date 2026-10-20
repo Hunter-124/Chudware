@@ -7,6 +7,7 @@
 #include <system_error>
 
 #include "util/time_local.h"
+#include "../../services/ipc/ipc_private.h"
 
 namespace hostd {
 
@@ -18,21 +19,13 @@ Log& log() {
     return l;
 }
 
-// std::filesystem for portability (Windows parity): handles both separators and
-// drive-letter roots; permissions stay platform-default (the parent state dir
-// is per-user on both platforms).
-static bool mkdirs(const std::string& dir) {
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return std::filesystem::is_directory(dir, ec);
-}
 
 bool Log::open(const std::string& dir) {
     std::lock_guard<std::mutex> lk(mtx_);
-    if (!mkdirs(dir)) return false;
+    if (!chudware_ipc::privateDir(dir)) return false;
     path_ = dir + "/hostd.log";
     rotateIfNeeded();
-    f_ = std::fopen(path_.c_str(), "a");
+    f_ = chudware_ipc::privateFile(path_, true);
     return f_ != nullptr;
 }
 
@@ -52,7 +45,7 @@ void Log::rotateIfNeeded() {
         (void)ec;
     }
     std::filesystem::rename(path_, path_ + ".1", ec);
-    if (wasOpen) f_ = std::fopen(path_.c_str(), "a");  // keep logging after rotation
+    if (wasOpen) f_ = chudware_ipc::privateFile(path_, true);
 }
 
 void Log::line(const char* fmt, ...) {

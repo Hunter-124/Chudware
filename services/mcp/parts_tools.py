@@ -688,7 +688,6 @@ def fetch_cad_model_impl(url: str, name: str | None = None,
                          import_part: bool = True, *, importer=None) -> dict:
     """Acquire a CAD file from a direct HTTPS URL or a model page into this project."""
     from services.browser import adapters
-    from services.browser.session import browser_fetch
 
     parsed = urlparse(url.strip())
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
@@ -718,8 +717,8 @@ def fetch_cad_model_impl(url: str, name: str | None = None,
             license_note = acquired.get("license_note")
             download_url = acquired.get("raw_url") or acquired.get("download_url") or url
         else:
-            # Research's static HTTP path is independent of CEF. A visible CAD
-            # href on an ordinary page needs no browser.
+            # Unknown sites use only the pinned public HTTPS path, never browser
+            # rendering with unrestricted scripts, subresources, or shared profiles.
             from services.research.fetch_page import _http_get
             try:
                 _text, final_url, _title, raw_html = _http_get(url)
@@ -729,18 +728,12 @@ def fetch_cad_model_impl(url: str, name: str | None = None,
                 return _cad_fail(reason, f"Could not fetch {url}: {exc}", [url])
             links, license_note = _cad_links(raw_html, final_url)
             if not links:
-                page = browser_fetch(final_url, site)
-                if not page.get("ok"):
-                    reason = ("browser_unavailable" if page.get("reason") in {
-                        "browser_fetch_failed", "browser_busy", "playwright_not_installed"
-                    } else page.get("reason") or "browser_unavailable")
-                    return _cad_fail(reason,
-                                     f"No static CAD link at {url}. Browser rendering is unavailable: "
-                                     f"{str(page.get('hint') or page.get('detail') or reason).rstrip('.')}.",
-                                     links)
-                links, license_note = _cad_links(page.get("content") or "", final_url)
-            if not links:
-                return _cad_fail("no_cad_link", f"No CAD link on rendered page {url}.", links)
+                return _cad_fail(
+                    "no_cad_link",
+                    f"No static CAD download link at {final_url}. Automatic rendering of "
+                    "unrecognized sites is not supported. Download the CAD file manually "
+                    "from that page and drop it in your project, or provide a direct public HTTPS CAD URL.",
+                    [final_url])
             download_url = links[0]
             site = _cad_site(download_url) if _cad_site(download_url) != "web" else site
     label = name or (Path(unquote(parsed.path)).stem if _cad_format(url)

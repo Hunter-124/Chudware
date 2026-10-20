@@ -5,16 +5,14 @@
 # WHY FROM SOURCE (unlike lib3mf/gmsh which are prebuilt downloads): openNURBS
 # ships no official prebuilt Windows static lib; it lives as a CMake-able
 # submodule of mcneel/rhino3dm at src/lib/opennurbs with a clean static-lib
-# target (`opennurbsStatic`). We FetchContent the rhino3dm repo (with submodules,
-# so opennurbs + its bundled zlib are present) and add_subdirectory ONLY the
-# opennurbs dir — never the python/wasm bindings. That builds opennurbsStatic
-# (+ its sibling SHARED `OpenNURBS` and the bundled `zlib` target, which we leave
-# unlinked).
+# target (`opennurbsStatic`). Fetch the exact rhino3dm and opennurbs commits,
+# validate cached source against authenticated objects, then add_subdirectory
+# ONLY a freshly reconstructed opennurbs tree — never python/wasm bindings.
+# This builds opennurbsStatic plus its bundled zlib dependency.
 #
-# VERSION: pinned to rhino3dm v8.17.0 — the EXACT tag matching the `rhino3dm
-# 8.17.0` wheel in the dev venv. At 8.17.0 opennurbs is the submodule commit
-# 6c91d229 (mcneel/opennurbs). Reading STORED mesh data (ON_Mesh m_V/m_F) is
-# archive-version-stable, but we pin anyway for faithfulness.
+# VERSION: rhino3dm 8.17.0 and its exact opennurbs submodule commit are pinned
+# below, including on cache reuse. A reviewed local development tree must be
+# selected explicitly through OPENNURBS_LOCAL_SOURCE_DIR.
 #
 # LICENSE NOTE: openNURBS is MIT-ish — McNeel's permissive "provided AS IS"
 # toolkit license (+ bundled zlib's permissive license). No copyleft obligation
@@ -24,43 +22,62 @@
 # opennurbs source dir) and OPENNURBS_INCLUDE_DIR. The consumer (doc/formats.cpp,
 # guarded by CHUDWARE_WITH_OPENNURBS) is the ONLY TU that includes opennurbs.h.
 
-set(OPENNURBS_RHINO3DM_TAG "8.17.0" CACHE STRING "rhino3dm git tag to provision opennurbs from")
-set(OPENNURBS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rhino3dm-src"
-    CACHE PATH "rhino3dm source checkout (auto-cloned if missing)")
+# Primary identities: https://api.github.com/repos/mcneel/rhino3dm/commits/8.17.0
+# and /contents/src/lib/opennurbs?ref=1e0c80e6b9cf7ff3c1579d287e178b21634a2a6d
+set(OPENNURBS_RHINO3DM_COMMIT "1e0c80e6b9cf7ff3c1579d287e178b21634a2a6d")
+set(OPENNURBS_COMMIT "6c91d229ab561fe21c92ffdd97934c77ff945e0a")
+if(NOT DEFINED OPENNURBS_LOCAL_SOURCE_DIR)
+  set(OPENNURBS_LOCAL_SOURCE_DIR "" CACHE PATH "Reviewed local openNURBS source (development only)")
+endif()
+include("${CMAKE_CURRENT_LIST_DIR}/PinnedGitSource.cmake")
+if(NOT DEFINED OPENNURBS_ROOT)
+  set(OPENNURBS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rhino3dm-src"
+      CACHE PATH "rhino3dm source checkout (auto-cloned if missing)")
+endif()
 file(TO_CMAKE_PATH "${OPENNURBS_ROOT}" OPENNURBS_ROOT)
 
-set(_on_dir "${OPENNURBS_ROOT}/src/lib/opennurbs")
-set(_on_hdr "${_on_dir}/opennurbs.h")
-set(_on_cml "${_on_dir}/CMakeLists.txt")
-
-# --- auto-provision the source if absent -------------------------------------
-# Shallow clone the pinned tag, then init ONLY the src/lib/opennurbs submodule (its
-# bundled zlib is plain files inside it). A recursive clone also pulled draco's Eigen
-# from GitLab, and a GitLab outage failed the Windows release build for a dependency
-# opennurbs never uses. A partial checkout (e.g. an interrupted clone) takes the
-# submodule-update branch.
-if(NOT EXISTS "${_on_hdr}" OR NOT EXISTS "${_on_cml}")
-  find_package(Git REQUIRED)
+if(OPENNURBS_LOCAL_SOURCE_DIR)
+  if(NOT CHUDWARE_DEVELOPER_BUILD OR DEFINED ENV{CI} OR DEFINED ENV{CHUDWARE_RELEASE_CHANNEL})
+    message(FATAL_ERROR "[opennurbs] local source overrides are development-only")
+  endif()
+  set(_on_dir "${OPENNURBS_LOCAL_SOURCE_DIR}")
+  message(WARNING "[opennurbs] LOCAL SOURCE: ${_on_dir}; not authenticated release source")
+else()
+  # A managed checkout is never accepted merely because the headers exist.
   if(NOT EXISTS "${OPENNURBS_ROOT}/.git")
-    message(STATUS "[opennurbs] cloning rhino3dm ${OPENNURBS_RHINO3DM_TAG} …")
-    execute_process(
-      COMMAND ${GIT_EXECUTABLE} clone --depth 1 --branch ${OPENNURBS_RHINO3DM_TAG}
-              https://github.com/mcneel/rhino3dm.git "${OPENNURBS_ROOT}"
-      RESULT_VARIABLE _git_rc)
+    if(EXISTS "${OPENNURBS_ROOT}/CMakeLists.txt")
+      message(FATAL_ERROR "[opennurbs] unmanaged cached source rejected: ${OPENNURBS_ROOT}")
+    endif()
+    execute_process(COMMAND "${GIT_EXECUTABLE}" init "${OPENNURBS_ROOT}" RESULT_VARIABLE _git_rc)
+    if(_git_rc EQUAL 0)
+      execute_process(COMMAND "${GIT_EXECUTABLE}" --no-replace-objects -C "${OPENNURBS_ROOT}" -c http.sslVerify=true -c credential.helper= -c core.hooksPath= fetch --depth 1
+        https://github.com/mcneel/rhino3dm.git "${OPENNURBS_RHINO3DM_COMMIT}" RESULT_VARIABLE _git_rc)
+    endif()
+    if(_git_rc EQUAL 0)
+      execute_process(COMMAND "${GIT_EXECUTABLE}" --no-replace-objects -C "${OPENNURBS_ROOT}" -c core.hooksPath= checkout --detach
+        "${OPENNURBS_RHINO3DM_COMMIT}" RESULT_VARIABLE _git_rc)
+    endif()
     if(NOT _git_rc EQUAL 0)
-      message(FATAL_ERROR "[opennurbs] git clone of rhino3dm ${OPENNURBS_RHINO3DM_TAG} failed (rc=${_git_rc})")
+      message(FATAL_ERROR "[opennurbs] pinned rhino3dm fetch failed: ${_git_rc}")
     endif()
   endif()
-  message(STATUS "[opennurbs] ensuring the opennurbs submodule …")
-  execute_process(
-    COMMAND ${GIT_EXECUTABLE} -C "${OPENNURBS_ROOT}" submodule update --init --depth 1 src/lib/opennurbs
-    RESULT_VARIABLE _git_rc)
-  if(NOT _git_rc EQUAL 0)
-    message(FATAL_ERROR "[opennurbs] submodule update for src/lib/opennurbs failed (rc=${_git_rc})")
+  chudware_require_pinned_git("${OPENNURBS_ROOT}" "${OPENNURBS_RHINO3DM_COMMIT}")
+  set(_on_cached "${OPENNURBS_ROOT}/src/lib/opennurbs")
+  if(NOT EXISTS "${_on_cached}/.git")
+    # Repository URL is fixed here, not read from untrusted local Git configuration.
+    execute_process(COMMAND "${GIT_EXECUTABLE}" --no-replace-objects -C "${OPENNURBS_ROOT}"
+      -c http.sslVerify=true -c credential.helper= -c core.hooksPath=
+      -c submodule.src/lib/opennurbs.url=https://github.com/mcneel/opennurbs.git
+      submodule update --init --checkout --depth 1 src/lib/opennurbs RESULT_VARIABLE _git_rc)
+    if(NOT _git_rc EQUAL 0)
+      message(FATAL_ERROR "[opennurbs] pinned submodule fetch failed: ${_git_rc}")
+    endif()
   endif()
+  set(_on_dir "${CMAKE_BINARY_DIR}/authenticated-source/opennurbs")
+  chudware_materialize_pinned_git("${_on_cached}" "${OPENNURBS_COMMIT}" "${_on_dir}")
 endif()
-if(NOT EXISTS "${_on_hdr}" OR NOT EXISTS "${_on_cml}")
-  message(FATAL_ERROR "[opennurbs] expected ${_on_hdr} + ${_on_cml} after provisioning — layout changed?")
+if(NOT EXISTS "${_on_dir}/opennurbs.h" OR NOT EXISTS "${_on_dir}/CMakeLists.txt")
+  message(FATAL_ERROR "[opennurbs] expected source headers and CMakeLists.txt under ${_on_dir}")
 endif()
 
 # --- build ONLY the opennurbs static lib -------------------------------------
@@ -91,5 +108,5 @@ foreach(_tgt opennurbsStatic OpenNURBS zlib)
 endforeach()
 
 set(OPENNURBS_INCLUDE_DIR "${_on_dir}" CACHE PATH "opennurbs include dir" FORCE)
-message(STATUS "[opennurbs] from rhino3dm ${OPENNURBS_RHINO3DM_TAG}  static target=opennurbsStatic")
+message(STATUS "[opennurbs] pinned ${OPENNURBS_COMMIT}  static target=opennurbsStatic")
 message(STATUS "[opennurbs]   include=${OPENNURBS_INCLUDE_DIR}")

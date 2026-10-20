@@ -349,6 +349,100 @@ TEST_CASE("solid feature modes preserve independent bodies and merge only contac
     CHECK(volume(invalid.shapes.front()) == doctest::Approx(1000));
 }
 
+// Bodies that meet only along an edge are joined by a fillet on that edge: every concave
+// corner around it gets rolling-ball material and the result is one solid. The volume added
+// per corner is r^2 (1 - pi/4) times the swept length.
+TEST_CASE("a fillet on an edge shared by two bodies joins them into one solid") {
+    auto volume = [](const TopoDS_Shape& shape) {
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(shape, props);
+        return props.Mass();
+    };
+    auto solids = [](const TopoDS_Shape& shape) {
+        int n = 0;
+        for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next()) ++n;
+        return n;
+    };
+    const double corner = 1.0 - M_PI / 4.0;
+    auto edge = [](double x, double y, double z) {
+        return json{{"kind", "edge"}, {"centroid", json::array({x, y, z})}};
+    };
+
+    SUBCASE("straight shared edge, with an ordinary edge in the same fillet") {
+        // Box b sits diagonally on box a: they share the edge x=5, z=5, y in [-5, 5].
+        auto features = [&](double r, json edges) {
+            return json{{"features", json::array({
+                json{{"id", "a"}, {"type", "box"}, {"length", 10.0}, {"width", 10.0},
+                     {"height", 10.0}, {"mode", "new"}},
+                json{{"id", "b"}, {"type", "box"}, {"length", 10.0}, {"width", 10.0},
+                     {"height", 10.0}, {"at", {10.0, 0.0, 10.0}}, {"mode", "add"}},
+                json{{"id", "fl"}, {"type", "fillet"}, {"radius", r}, {"edges", edges}}})}};
+        };
+        CompileResult joined = compile_document(features(2.0, json::array({edge(5, 0, 5)})),
+                                                json::object());
+        REQUIRE(joined.ok);
+        REQUIRE(joined.body_count == 1);
+        CHECK(solids(joined.shapes.front()) == 1);
+        CHECK(BRepCheck_Analyzer(joined.shapes.front()).IsValid());
+        CHECK(volume(joined.shapes.front()) == doctest::Approx(2000 + 2 * 4 * corner * 10));
+
+        // The far bottom edge of a is convex: rounding it removes one corner's worth.
+        CompileResult mixed = compile_document(
+            features(2.0, json::array({edge(5, 0, 5), edge(-5, 0, -5)})), json::object());
+        REQUIRE(mixed.ok);
+        CHECK(mixed.statuses.back().warning.empty());
+        CHECK(solids(mixed.shapes.front()) == 1);
+        CHECK(volume(mixed.shapes.front()) == doctest::Approx(2000 + 4 * corner * 10));
+
+        // A radius wider than the boxes cannot fit; the error names the shared edge.
+        CompileResult wide = compile_document(features(11.0, json::array({edge(5, 0, 5)})),
+                                              json::object());
+        REQUIRE_FALSE(wide.statuses.back().ok);
+        CHECK(wide.statuses.back().error.find("too large for the faces at the shared edge") !=
+              std::string::npos);
+    }
+
+    SUBCASE("circular shared edge: a ring sector resting on a tube rim") {
+        const double Ri = 20, R = 30, Ro = 40, a0 = 200, a1 = 340;
+        auto at = [](double r, double deg) {
+            return json::array({r * std::cos(deg * M_PI / 180), r * std::sin(deg * M_PI / 180)});
+        };
+        json tube_sketch{{"id", "s1"}, {"type", "sketch"}, {"refs", {{"plane", "plane.top"}}},
+                         {"params", {{"entities", json::array({
+                             json{{"id", "e1"}, {"type", "circle"}, {"center", {0.0, 0.0}}, {"radius", Ri}},
+                             json{{"id", "e2"}, {"type", "circle"}, {"center", {0.0, 0.0}}, {"radius", R}}})}}}};
+        json ring_sketch{{"id", "s2"}, {"type", "sketch"}, {"refs", {{"plane", "plane.top"}}},
+                         {"params", {{"entities", json::array({
+                             json{{"id", "e3"}, {"type", "arc"}, {"center", {0.0, 0.0}}, {"radius", R},
+                                  {"start", a0}, {"end", a1}, {"ccw", true}},
+                             json{{"id", "e4"}, {"type", "arc"}, {"center", {0.0, 0.0}}, {"radius", Ro},
+                                  {"start", a0}, {"end", a1}, {"ccw", true}},
+                             json{{"id", "e5"}, {"type", "line"}, {"p1", at(R, a1)}, {"p2", at(Ro, a1)}},
+                             json{{"id", "e6"}, {"type", "line"}, {"p1", at(R, a0)}, {"p2", at(Ro, a0)}}})}}}};
+        const double mid = 0.5 * (a0 + a1) * M_PI / 180, half = 0.5 * (a1 - a0) * M_PI / 180;
+        const double chord = R * std::sin(half) / half;  // arc centroid distance from the axis
+        json doc{{"features", json::array({
+            tube_sketch,
+            json{{"id", "tube"}, {"type", "extrude"}, {"mode", "boss"}, {"flip", true},
+                 {"depth", 30.0}, {"refs", {{"profile", json::array({json{{"kind", "region"}, {"sketch", "s1"}}})}}}},
+            ring_sketch,
+            json{{"id", "ring"}, {"type", "extrude"}, {"mode", "boss"}, {"depth", 5.0},
+                 {"refs", {{"profile", json::array({json{{"kind", "region"}, {"sketch", "s2"}}})}}}},
+            json{{"id", "fl"}, {"type", "fillet"}, {"radius", 3.0},
+                 {"edges", json::array({edge(chord * std::cos(mid), chord * std::sin(mid), 0)})}}})}};
+        CompileResult r = compile_document(doc, json::object());
+        REQUIRE(r.ok);
+        REQUIRE(r.body_count == 1);
+        CHECK(solids(r.shapes.front()) == 1);
+        CHECK(BRepCheck_Analyzer(r.shapes.front()).IsValid());
+        const double tube = M_PI * (R * R - Ri * Ri) * 30;
+        const double ring = 0.5 * (Ro * Ro - R * R) * (a1 - a0) * M_PI / 180 * 5;
+        // Mirror-image corners on either side of radius R: their centroid offsets cancel.
+        const double fillets = 2 * 9 * corner * R * (a1 - a0) * M_PI / 180;
+        CHECK(volume(r.shapes.front()) == doctest::Approx(tube + ring + fillets));
+    }
+}
+
 // 1b. REVOLVE AUTO-CLOSE: an OPEN profile — just the outer-wall line, offset from the
 //     axis — is closed back to the revolve axis so it still makes a solid. Weak local
 //     models routinely sketch the wall but forget the line back down the axis; without
@@ -464,6 +558,91 @@ TEST_CASE("add_feature hoists a top-level option into params -> cut is not dropp
     const double vol = resp.value("volume", 0.0);
     MESSAGE("tube volume (top-level mode:cut) = " << vol);
     CHECK(vol == doctest::Approx(40212.0).epsilon(0.02));  // real tube, not a fused stub
+}
+
+// c259: a batch deleting a sketch and the extrude that uses it, sketch first, refused the
+// sketch as "referenced by other features" although the same batch deleted the extrude;
+// the agent's cleanup silently failed and left the extra features in the tree.
+TEST_CASE("a delete batch naming a sketch before its extrude deletes both") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    json nr = doc_new("part", "DeleteSet");
+    const std::string id = nr.at("doc_id").get<std::string>();
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    json build = json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Block"},
+             {"params", {{"length", dimv(40)}, {"width", dimv(30)}, {"height", dimv(20)}}}}}},
+        json{{"op", "add_feature"}, {"feature", {{"type", "sketch"}, {"name", "Pocket"},
+             {"params", {{"entities", json::array({json{{"type", "rectangle"},
+                                                        {"corner1", {-5.0, -5.0}},
+                                                        {"corner2", {5.0, 5.0}}}})},
+                         {"constraints", json::array()}}},
+             {"refs", {{"plane", "plane.top"}}}}}},
+        json{{"op", "add_feature"}, {"feature", {{"type", "extrude"}, {"name", "Cut"},
+             {"params", {{"mode", "cut"}, {"end", "through_all"}}},
+             {"refs", {{"profile", json::array({"$1"})}}}}}},
+    });
+    json br = doc_apply_ops(id, -1, build, false);
+    const std::string sk = br.at("id_map").at("$1").get<std::string>();
+    const std::string ex = br.at("id_map").at("$2").get<std::string>();
+    const double block = 40.0 * 30.0 * 20.0;
+    REQUIRE(br.value("volume", 0.0) < block - 1.0);
+
+    json del = json::array({json{{"op", "delete_feature"}, {"id", sk}},
+                            json{{"op", "delete_feature"}, {"id", ex}}});
+    json dr = doc_apply_ops(id, -1, del, false);
+    REQUIRE_MESSAGE(dr.at("tree").at("features").size() == 1, dr.dump().substr(0, 600));
+    CHECK(dr.value("volume", 0.0) == doctest::Approx(block).epsilon(1e-3));
+
+    // A lone sketch delete with a surviving dependent still refuses by name.
+    const std::string id2 = doc_new("part", "DeleteLone").at("doc_id").get<std::string>();
+    json again = doc_apply_ops(id2, -1, build, false);
+    const std::string sk2 = again.at("id_map").at("$1").get<std::string>();
+    CHECK_THROWS_WITH(doc_apply_ops(id2, -1,
+                                    json::array({json{{"op", "delete_feature"}, {"id", sk2}}}),
+                                    false),
+                      doctest::Contains("referenced by other features"));
+}
+
+// Mass uses the material applied to the model: a body_materials override, else the document
+// material, steel only where nothing resolves; an explicit density overrides every body.
+TEST_CASE("eval_mass weighs each body with its applied material") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    using chudware::doc::doc_eval_mass;
+    const std::string id = doc_new("part", "MassMaterials").at("doc_id").get<std::string>();
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    auto box = [&](const char* name, double x) {
+        return json{{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", name},
+            {"params", {{"length", dimv(10)}, {"width", dimv(10)}, {"height", dimv(10)},
+                        {"at", {x, 0.0, 5.0}}, {"mode", "new"}}}}}};
+    };
+    doc_apply_ops(id, -1, json::array({box("A", 0.0), box("B", 50.0),
+                                       json{{"op", "set_material"}, {"key", "pla"}},
+                                       json{{"op", "set_material"}, {"id", "b2"},
+                                            {"key", "steel_1045"}}}), false);
+    const double v = 1000.0;  // mm^3 per body
+
+    json m = doc_eval_mass(id, 0);
+    REQUIRE(m.at("bodies").size() == 2);
+    CHECK(m["bodies"][0]["material"]["source"] == "document_material");
+    CHECK(m["bodies"][0]["mass_g"].get<double>() == doctest::Approx(v * 1.24e-3));
+    CHECK(m["bodies"][1]["material"]["source"] == "body_material");
+    CHECK(m["bodies"][1]["mass_g"].get<double>() == doctest::Approx(v * 7.85e-3));
+    CHECK(m["mass_g"].get<double>() == doctest::Approx(v * (1.24 + 7.85) * 1e-3));
+    CHECK(m["material"]["mixed"] == true);
+    // Mass-weighted centre of mass: the steel body pulls it toward x = 50.
+    CHECK(m["com"][0].get<double>() ==
+          doctest::Approx(50.0 * 7.85 / (1.24 + 7.85)).epsilon(1e-6));
+
+    json explicit_density = doc_eval_mass(id, 0, 2.0);
+    CHECK(explicit_density["material"]["source"] == "explicit");
+    CHECK(explicit_density["mass_g"].get<double>() == doctest::Approx(2 * v * 2.0e-3));
+
+    doc_apply_ops(id, -1, json::array({json{{"op", "set_material"}, {"key", nullptr}}}), false);
+    json bare = doc_eval_mass(id, 0);
+    CHECK(bare["material"]["source"] == "default");
+    CHECK(bare["mass_g"].get<double>() == doctest::Approx(2 * v * 7.85e-3));
 }
 
 // 1e. LIST OF EDGE QUERIES: "chamfer both ends" is naturally expressed as a LIST of two
@@ -2075,6 +2254,77 @@ TEST_CASE("S2: a fillet never commits an open (free-edge) body") {
     }
 }
 
+TEST_CASE("dress validity: matching carrier/apron rounds reject atomically") {
+    using namespace chudware::doc;
+    const std::string id = doc_new("part", "WristApronBlendValidity").at("doc_id");
+    auto add = [](const char* type, const char* name, const json& params,
+                  const json& refs = json::object()) {
+        return json{{"op", "add_feature"}, {"feature",
+            {{"type", type}, {"name", name}, {"params", params}, {"refs", refs}}}};
+    };
+    json carrier = add("box", "Carrier",
+                       {{"length", 30}, {"width", 17}, {"height", 20.1}});
+    carrier["feature"]["at"] = {-8, 0, 279.05};
+    json apron = add("box", "Apron", {{"length", 15}, {"width", 17}, {"height", 3}});
+    apron["feature"]["at"] = {-15.5, 0, 267.5};
+    // Reduction of WristRepair174/178: the upper R4 carrier meets a square
+    // apron at z269. Rounding the apron R4 collapses the two ledge faces and
+    // yields a closed, positive-volume solid with intersecting edges.
+    const json base = doc_apply_ops(id, -1, json::array({
+        carrier,
+        add("fillet", "Carrier plan corners", {{"radius", 4}},
+            {{"edges", {{"of", "edge"}, {"parallel", "z"}}}}),
+        apron,
+    }), false);
+    REQUIRE_MESSAGE(std::all_of(base.at("rebuild").at("feature_status").begin(),
+        base.at("rebuild").at("feature_status").end(),
+        [](const json& row) { return row.value("ok", false); }), base.dump());
+    const json before_tree = doc_tree(id);
+    const json before_health = doc_eval_solid_health(id, 0);
+    REQUIRE_MESSAGE(before_health.at("all_sound").get<bool>(), before_health.dump());
+    const json edges = json::array({
+        {{"of", "edge"}, {"surf", "line"}, {"parallel", "z"},
+         {"near", {-23, 8.5, 267.5}}, {"count", 1}},
+        {{"of", "edge"}, {"surf", "line"}, {"parallel", "z"},
+         {"near", {-23, -8.5, 267.5}}, {"count", 1}},
+    });
+    const json rejected = doc_apply_ops(id, -1, json::array({
+        add("fillet", "Ramp apron plan corners", {{"radius", 4}}, {{"edges", edges}}),
+    }), false);
+    REQUIRE_FALSE(rejected.at("rebuild").at("feature_status").back().at("ok").get<bool>());
+    const json& failed = rejected.at("rebuild").at("feature_status").back();
+    CHECK_FALSE(failed.at("ok").get<bool>());
+    const std::string diagnosis = status_err(failed);
+    CHECK(diagnosis.find("invalid geometry") != std::string::npos);
+    CHECK(diagnosis.find("preceding body is unchanged") != std::string::npos);
+    CHECK(doc_tree(id) == before_tree);
+    const json after_health = doc_eval_solid_health(id, 0);
+    CHECK(after_health.at("all_sound").get<bool>());
+    CHECK(after_health.at("bodies")[0].at("volume_mm3") ==
+          before_health.at("bodies")[0].at("volume_mm3"));
+    doc_close(id);
+}
+
+TEST_CASE("dress validity: normal fillets and chamfers remain sound") {
+    using namespace chudware::doc;
+    for (const std::string type : {"fillet", "chamfer"}) {
+        const std::string id = doc_new("part", "ValidBlend" + type).at("doc_id");
+        const json result = doc_apply_ops(id, -1, json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Block"},
+                {"params", {{"length", 40}, {"width", 30}, {"height", 20}}}}}},
+            {{"op", "add_feature"}, {"feature", {{"type", type}, {"name", "Blend"},
+                {"params", {{type == "fillet" ? "radius" : "length", 2}}},
+                {"refs", {{"edges", {{"of", "edge"}, {"parallel", "z"}}}}}}}},
+        }), false);
+        REQUIRE_MESSAGE(result.at("rebuild").at("feature_status").back().at("ok").get<bool>(),
+                        result.dump());
+        const json health = doc_eval_solid_health(id, 0);
+        CHECK_MESSAGE(health.at("all_sound").get<bool>(), health.dump());
+        CHECK(health.at("bodies")[0].at("volume_mm3").get<double>() < 24000);
+        doc_close(id);
+    }
+}
+
 // A4. FILLET/CHAMFER on an edge query that matches NO edges must report a "no edges
 //     matched" error, NOT the misleading "N mm is too large for the selected edge(s)".
 //     A box has only straight edges, so {"of":"edge","surf":"round"} matches nothing.
@@ -2384,6 +2634,42 @@ TEST_CASE("C2/C3/C4: a compile-rejected batch leaves the doc and undo stacks unt
     CHECK(undone.at("tree").at("features").size() == 0);
 }
 
+TEST_CASE("doc_revert revision guard restores only the expected committed state") {
+    using namespace chudware::doc;
+    const std::string id = doc_new("part", "GuardedRevert").at("doc_id");
+    const json ops = json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Block"},
+            {"params", {{"length", 10}, {"width", 10}, {"height", 10}}}}}}
+    });
+    const json checkpoint = doc_checkpoint(id);
+    REQUIRE(checkpoint.at("revision") == 0);
+    const json applied = doc_apply_ops(id, -1, ops, false);
+    REQUIRE(applied.at("revision") == 1);
+    const json restored = doc_revert(id, checkpoint.at("checkpoint"), 1);
+    CHECK(restored.at("tree").at("features").empty());
+    CHECK(restored.at("revision") == 2);
+
+    const json stale_checkpoint = doc_checkpoint(id);
+    REQUIRE(stale_checkpoint.at("revision") == 2);
+    const json committed = doc_apply_ops(id, -1, ops, false);
+    const json before = doc_tree(id);
+    REQUIRE(before.at("revision") == committed.at("revision"));
+    try {
+        doc_revert(id, stale_checkpoint.at("checkpoint"), stale_checkpoint.at("revision").get<long>());
+        FAIL("stale revert must throw");
+    } catch (const OpError& error) {
+        CHECK(error.code == "stale_revision");
+        CHECK(error.detail.at("current_revision") == before.at("revision"));
+        CHECK(std::string(error.what()) == "expect_revision 2 != current 3");
+    }
+    const json after = doc_tree(id);
+    CHECK(after.at("tree") == before.at("tree"));
+    CHECK(after.at("revision") == before.at("revision"));
+    CHECK_THROWS_WITH(doc_revert(id, stale_checkpoint.at("checkpoint")),
+                      ("no such checkpoint '" + stale_checkpoint.at("checkpoint").get<std::string>() + "'").c_str());
+    doc_close(id);
+}
+
 TEST_CASE("doc_apply_ops mesh response opt-out preserves edits and subsequent display") {
     using namespace chudware::doc;
     const std::string id = doc_new("part", "NoTessEdit").at("doc_id");
@@ -2585,6 +2871,157 @@ TEST_CASE("P0: a rejected batch never deadlocks subsequent calls on any doc") {
     // Doc A is unchanged (the rejected batch was a no-op) and still editable afterwards.
     CHECK(doc_tree(a).at("tree").at("features").size() == 0);
     CHECK_NOTHROW(doc_apply_ops(a, -1, okops, false));
+}
+
+#include <chrono>
+#include <exception>
+
+TEST_CASE("doc_list and document minting stay responsive while another document is busy") {
+    using namespace chudware::doc;
+    using Clock = std::chrono::steady_clock;
+    const json created = doc_new("part", "BusySummary");
+    const std::string a = created.at("doc_id");
+    const std::string name = created.at("name");
+    const std::string b = doc_new("part", "BusySummaryOther").at("doc_id");
+    json expected;
+    const json initially_listed = doc_list();
+    for (const json& entry : initially_listed.at("docs"))
+        if (entry.at("doc_id") == a) expected = entry;
+    REQUIRE(expected.is_object());
+
+    // Refresh must happen at mutation exit, not just when doc_list gets a free lock.
+    const json added = doc_apply_ops(a, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Block"},
+             {"params", {{"length", 10.0}, {"width", 8.0}, {"height", 6.0}}}}}}
+    }), false);
+    expected["revision"] = added.at("revision");
+    expected["dirty"] = true;
+    expected["feature_count"] = 1;
+    expected["empty"] = false;
+
+    struct Barrier {
+        std::atomic<bool> held{false};
+        std::atomic<bool> release{false};
+    } barrier;
+    std::exception_ptr worker_error;
+    std::thread writer([&] {
+        try {
+            with_doc_lock_for_testing(a, [](void* context) {
+                auto& state = *static_cast<Barrier*>(context);
+                const auto deadline = Clock::now() + std::chrono::seconds(3);
+                state.held.store(true, std::memory_order_release);
+                while (!state.release.load(std::memory_order_acquire) && Clock::now() < deadline)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }, &barrier);
+        } catch (...) {
+            worker_error = std::current_exception();
+        }
+    });
+    // Guarantees release/join even if a response-shape assertion throws.
+    struct Join {
+        Barrier& barrier;
+        std::thread& writer;
+        ~Join() {
+            barrier.release.store(true, std::memory_order_release);
+            if (writer.joinable()) writer.join();
+        }
+    } join{barrier, writer};
+    const auto ready_deadline = Clock::now() + std::chrono::seconds(1);
+    while (!barrier.held.load(std::memory_order_acquire) && Clock::now() < ready_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    REQUIRE(barrier.held.load(std::memory_order_acquire));
+
+    const auto listed_at = Clock::now();
+    const json listed = doc_list();
+    CHECK(Clock::now() - listed_at < std::chrono::seconds(1));
+    json busy;
+    for (const json& entry : listed.at("docs"))
+        if (entry.at("doc_id") == a) busy = entry;
+    REQUIRE(busy.is_object());
+    CHECK(busy.value("busy", false));
+    busy.erase("busy");
+    CHECK(busy == expected);  // every existing response field survives the busy path
+
+    const auto minted_at = Clock::now();
+    const json minted = doc_new("part", name);
+    CHECK(Clock::now() - minted_at < std::chrono::seconds(1));
+    CHECK(minted.at("name") != name);  // busy document still reserves its display name
+
+    const auto resumed_at = Clock::now();
+    const json fresh = doc_new("part", "BusySummaryResume", true);
+    const json resumed = doc_new("part", fresh.at("name").get<std::string>(), true);
+    CHECK(Clock::now() - resumed_at < std::chrono::seconds(1));
+    CHECK(resumed.at("doc_id") == fresh.at("doc_id"));
+    CHECK(resumed.value("reused", false));
+
+    const auto edited_at = Clock::now();
+    const json other = doc_apply_ops(b, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Other"},
+             {"params", {{"length", 2.0}, {"width", 3.0}, {"height", 4.0}}}}}}
+    }), false);
+    CHECK(Clock::now() - edited_at < std::chrono::seconds(1));
+    CHECK(other.at("volume").get<double>() == doctest::Approx(24.0));
+    barrier.release.store(true, std::memory_order_release);
+    writer.join();
+    CHECK(worker_error == nullptr);
+    const json finally_listed = doc_list();
+    for (const json& entry : finally_listed.at("docs"))
+        if (entry.at("doc_id") == a) {
+            CHECK_FALSE(entry.contains("busy"));
+            CHECK(entry == expected);
+        }
+    CHECK(doc_close(a));
+    CHECK(doc_close(b));
+    CHECK(doc_close(minted.at("doc_id").get<std::string>()));
+    CHECK(doc_close(fresh.at("doc_id").get<std::string>()));
+}
+
+TEST_CASE("doc_apply_ops rejection preserves the committed revision AICM") {
+    using namespace chudware::doc;
+    bool with_tess = true;
+    SUBCASE("display response") {}
+    SUBCASE("mesh response opt-out") { with_tess = false; }
+    const std::string id = doc_new("part", "RejectedMesh").at("doc_id");
+    const json committed = doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Block"},
+             {"params", {{"length", 10.0}, {"width", 8.0}, {"height", 6.0}}}}}}
+    }), false);
+    const auto bytes_at = [](const std::string& uri) {
+        chudware::aicm_handoff::Mapping mapping;
+        std::string error;
+        REQUIRE_MESSAGE(chudware::aicm_handoff::map(uri, mapping, error), error);
+        const std::vector<uint8_t> bytes(mapping.data, mapping.data + mapping.size);
+        chudware::aicm_handoff::unmap(mapping);
+        return bytes;
+    };
+    const std::string uri = committed.at("tess").at("aicm_path");
+    REQUIRE_FALSE(uri.empty());
+    const auto before = bytes_at(uri);
+    const std::string box = committed.at("tree").at("features")[0].at("id");
+    // Change surviving geometry BEFORE the failing feature, so the rejected
+    // compile's mesh is observably different from the committed one.
+    const json rejected = doc_apply_ops(id, -1, json::array({
+        {{"op", "edit_feature"}, {"id", box}, {"params", {{"length", 25.0}}}},
+        {{"op", "add_feature"}, {"feature", {{"type", "fillet"}, {"name", "BadFillet"},
+             {"params", {{"radius", 3.0}}},
+             {"refs", {{"edges", json{{"of", "edge"}, {"surf", "round"}}}}}}}}
+    }), false, with_tess);
+    REQUIRE(rejected.contains("rejected_tree"));
+    CHECK(rejected.at("revision") == committed.at("revision"));
+    CHECK(rejected.at("tree") == committed.at("tree"));
+    CHECK(rejected.contains("tess") == with_tess);
+    bool failed = false;
+    for (const json& status : rejected.at("rebuild").at("feature_status"))
+        failed = failed || !status.value("ok", true);
+    CHECK(failed);
+    // Check before a fresh query could repair an accidentally overwritten key.
+    CHECK(bytes_at(uri) == before);
+    if (with_tess) CHECK(rejected.at("tess") == committed.at("tess"));
+    const json fresh = doc_activate(id);
+    CHECK(fresh.at("revision") == committed.at("revision"));
+    CHECK(fresh.at("tess") == committed.at("tess"));
+    CHECK(bytes_at(fresh.at("tess").at("aicm_path").get<std::string>()) == before);
+    CHECK(doc_close(id));
 }
 
 // N2. NO COMMITTED SOLID MAY HAVE NEGATIVE VOLUME. A deep feature tree (the bug's
@@ -6447,4 +6884,222 @@ TEST_CASE("measure and solid health agree that an internal imprint edge keeps a 
     doc_close(id);
     std::error_code ec;
     std::filesystem::remove(path, ec);
+}
+
+#include "doc/native_policy.h"
+#include "ecad/ops.h"
+#include "ecad/schplot.h"
+#include <chrono>
+
+namespace {
+struct DocumentRootPolicyFixture {
+    std::filesystem::path dir = std::filesystem::temp_directory_path() /
+        ("chudware_document_root_" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::path root = dir / "work";
+    std::string previous_root;
+    std::string previous_state;
+    bool previous_configured = false;
+
+    DocumentRootPolicyFixture() {
+        auto& config = chudware::doc::native_policy::configuration();
+        {
+            std::lock_guard<std::mutex> lock(config.mutex);
+            previous_root = config.root;
+            previous_state = config.state;
+            previous_configured = config.configured;
+        }
+        REQUIRE(std::filesystem::create_directories(root));
+        chudware::doc::native_policy::configure(root.string(), (dir / "state").string());
+    }
+    ~DocumentRootPolicyFixture() {
+        auto& config = chudware::doc::native_policy::configuration();
+        {
+            std::lock_guard<std::mutex> lock(config.mutex);
+            config.root = previous_root;
+            config.state = previous_state;
+            config.configured = previous_configured;
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+};
+}
+
+TEST_CASE("native root references admit workspace files and refuse escapes") {
+    DocumentRootPolicyFixture fixture;
+    namespace policy = chudware::doc::native_policy;
+    CHECK(policy::rooted());
+    CHECK(policy::resolve_reference("nested/part.brep") ==
+          (fixture.root / "nested" / "part.brep").string());
+    CHECK(policy::resolve_reference("part.brep", (fixture.root / "nested").string()) ==
+          (fixture.root / "nested" / "part.brep").string());
+
+    for (const std::string& reference : std::vector<std::string>{
+             "../part.brep", "nested/../../part.brep", (fixture.root / "part.brep").string(),
+             std::string("part.brep\0suffix", 16), "nested\\part.brep", "C:part.brep"}) {
+        CAPTURE(reference);
+        CHECK_THROWS_AS(policy::resolve_reference(reference), std::invalid_argument);
+    }
+    CHECK_THROWS_AS(policy::resolve_reference("part.brep", fixture.dir.string()),
+                    std::invalid_argument);
+#ifndef _WIN32
+    std::filesystem::create_directory_symlink(fixture.dir, fixture.root / "outside");
+    CHECK_THROWS_AS(policy::resolve_reference("outside/part.brep"), std::invalid_argument);
+#endif
+}
+
+TEST_CASE("native rooted assembly loads relative geometry and refuses escaped sources") {
+    DocumentRootPolicyFixture fixture;
+    const auto part = fixture.root / "part.brep";
+    const TopoDS_Shape box = BRepPrimAPI_MakeBox(4.0, 5.0, 6.0).Shape();
+    REQUIRE(BRepTools::Write(box, part.string().c_str()));
+    const auto outside = fixture.dir / "outside.brep";
+    REQUIRE(BRepTools::Write(box, outside.string().c_str()));
+    json assembly{
+        {"schema", "aicad.asm/1"},
+        {"components", json::array({
+            {{"id", "box"}, {"source", {{"path", "part.brep"}}}, {"fixed", true}}
+        })},
+        {"mates", json::array()}
+    };
+    const auto accepted = chudware::doc::compile_assembly(assembly);
+    REQUIRE(accepted.component_status.size() == 1);
+    REQUIRE(accepted.component_status[0].ok);
+    REQUIRE(accepted.bodies.size() == 1);
+
+    std::vector<std::string> refused{
+        "../outside.brep", outside.string(), part.string(),
+        std::string("part.brep\0suffix", 16)
+    };
+#ifndef _WIN32
+    std::filesystem::create_symlink(outside, fixture.root / "escape.brep");
+    refused.push_back("escape.brep");
+#endif
+    for (const auto& source : refused) {
+        CAPTURE(source);
+        assembly["components"][0]["source"]["path"] = source;
+        const auto result = chudware::doc::compile_assembly(assembly);
+        REQUIRE(result.component_status.size() == 1);
+        CHECK_FALSE(result.component_status[0].ok);
+        CHECK(result.component_status[0].error.has_value());
+        CHECK(result.bodies.empty());
+    }
+}
+
+TEST_CASE("SVG plot entrypoints reject unsafe sheet ids without a configured root") {
+    DocumentRootPolicyFixture fixture;
+    chudware::doc::native_policy::configure("", "");
+    CHECK_FALSE(chudware::doc::native_policy::rooted());
+    const std::vector<std::string> unsafe{
+        "..", ".", "../escape", "/tmp/escape", "nested/sheet", "nested\\sheet",
+        "C:sheet", std::string("sh1\0escape", 10), "sheet.", "sheet ", "sheet\n"
+    };
+    const json safe{{"sheets", json::array({{{"id", "sh1"}, {"name", "Main"}}})}};
+    for (const auto& id : unsafe) {
+        CAPTURE(id);
+        chudware::ecad::plot::PlotOpts opts;
+        opts.sheet = id;
+        CHECK_THROWS_AS(chudware::ecad::plot::schematic_svg_pages(safe, opts),
+                        chudware::ecad::OpError);
+        CHECK_THROWS_AS(chudware::ecad::plot::schematic_svg(safe, opts),
+                        chudware::ecad::OpError);
+
+        json poisoned = safe;
+        poisoned["sheets"].push_back({{"id", id}, {"name", "Unsafe"}});
+        opts.sheet = "sh1";  // Even a safe selection cannot hide a poisoned page ID.
+        CHECK_THROWS_AS(chudware::ecad::plot::schematic_svg_pages(poisoned, opts),
+                        chudware::ecad::OpError);
+        CHECK_THROWS_AS(chudware::ecad::plot::schematic_svg(poisoned, opts),
+                        chudware::ecad::OpError);
+    }
+    const auto pages = chudware::ecad::plot::schematic_svg_pages(
+        safe, chudware::ecad::plot::PlotOpts{});
+    REQUIRE(pages.size() == 1);
+    CHECK(pages[0].first == "sh1");
+    CHECK(pages[0].second.find("<svg") != std::string::npos);
+    CHECK_FALSE(chudware::ecad::plot::schematic_svg(
+        json::object(), chudware::ecad::plot::PlotOpts{}).empty());
+}
+
+TEST_CASE("rooted baked imports retain relative provenance and reopen warm") {
+    using namespace chudware::doc;
+    DocumentRootPolicyFixture fixture;
+    const auto source = fixture.root / "source.brep";
+    REQUIRE(BRepTools::Write(BRepPrimAPI_MakeBox(4.0, 5.0, 6.0).Shape(),
+                            source.string().c_str()));
+    const json imported = doc_import_file(source.string(), "", false, "brep");
+    const std::string id = imported.at("doc_id");
+    CHECK(doc_tree(id).at("tree").at("features")[0].at("params").at("source_path") ==
+          "source.brep");
+    const auto saved = fixture.root / "nested" / "import.step+";
+    std::filesystem::create_directories(saved.parent_path());
+    doc_save(id, saved.string());
+    REQUIRE(doc_close(id));
+    const json opened = doc_open(saved.string());
+    CHECK(opened.at("cache_trust") == "verified");
+    CHECK(opened.at("cache").at("features_executed") == 0);
+    CHECK(opened.at("volume").get<double>() == doctest::Approx(120.0));
+    REQUIRE(doc_close(opened.at("doc_id").get<std::string>()));
+    const auto key = fixture.dir / "state" / "cache-provenance.key";
+    REQUIRE(std::filesystem::file_size(key) == 32);
+#ifndef _WIN32
+    CHECK((std::filesystem::status(key).permissions() & std::filesystem::perms::mask) ==
+          (std::filesystem::perms::owner_read | std::filesystem::perms::owner_write));
+#endif
+
+    for (const std::string& refused : std::vector<std::string>{
+             "../source.brep", source.string(), std::string("source.brep\0suffix", 18)}) {
+        auto stored = stepplus_open(saved.string());
+        stored.doc["features"][0]["params"]["source_path"] = refused;
+        const auto poison = fixture.root / "poison.step+";
+        stepplus_save(stored.doc, poison.string(), stored.extra);
+        CHECK_THROWS(doc_open(poison.string()));
+    }
+}
+
+TEST_CASE("rooted native ops reject unsafe references atomically before storing them") {
+    using namespace chudware::doc;
+    DocumentRootPolicyFixture fixture;
+    const auto source = fixture.root / "own.brep";
+    REQUIRE(BRepTools::Write(BRepPrimAPI_MakeBox(4.0, 5.0, 6.0).Shape(),
+                            source.string().c_str()));
+    const std::string assembly = doc_new("assembly", "RootedAdmission").at("doc_id");
+    const auto accepted = doc_apply_ops(assembly, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", "own.brep"}}}, {"fixed", true}},
+    }), false);
+    REQUIRE(accepted.at("tree").at("components").size() == 1);
+    CHECK(accepted.at("rebuild").at("converged") == true);
+    const std::string component = accepted.at("tree").at("components")[0].at("id");
+    const auto before = doc_tree(assembly);
+    std::vector<std::string> unsafe{
+        "../own.brep", source.string(), std::string("own.brep\0suffix", 15)};
+#ifndef _WIN32
+    std::filesystem::create_directory_symlink(fixture.dir / "absent", fixture.root / "foreign-link");
+    std::filesystem::create_symlink(fixture.dir / "absent.brep", fixture.root / "dangling.brep");
+    unsafe.push_back("foreign-link/same.step+");
+    unsafe.push_back("dangling.brep");
+#endif
+    for (const auto& path : unsafe) {
+        CAPTURE(path);
+        CHECK_THROWS_AS(doc_apply_ops(assembly, -1, json::array({
+            {{"op", "asm_insert_component"}, {"source", {{"path", path}}}},
+        }), false), OpError);
+        CHECK(doc_tree(assembly) == before);
+        CHECK_THROWS_AS(doc_apply_ops(assembly, -1, json::array({
+            {{"op", "asm_edit_component"}, {"id", component}, {"source", {{"path", path}}}},
+        }), false), OpError);
+        CHECK(doc_tree(assembly) == before);
+    }
+    REQUIRE(doc_close(assembly));
+    const std::string part = doc_import_file(source.string(), "", false, "brep").at("doc_id");
+    const auto initial_part = doc_tree(part);
+    const std::string feature = initial_part.at("tree").at("features")[0].at("id");
+    for (const auto& path : unsafe) {
+        CHECK_THROWS_AS(doc_apply_ops(part, -1, json::array({
+            {{"op", "edit_feature"}, {"id", feature}, {"params", {{"source_path", path}}}},
+        }), false), OpError);
+        CHECK(doc_tree(part) == initial_part);
+    }
+    REQUIRE(doc_close(part));
 }

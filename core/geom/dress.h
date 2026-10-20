@@ -60,8 +60,16 @@ TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
 // are dropped and `*n_dropped` (when given) reports how many — the caller surfaces that as a
 // non-fatal warning rather than failing the whole feature. Empty shape only when NOTHING could
 // be rounded OR `edges` is empty.
+//
+// CONTACT EDGES: an edge shared by two solids of one body (two bodies that meet only along a
+// line, e.g. a ring resting on a tube's rim) has four faces, which BRepFilletAPI cannot blend.
+// fillet_edges fills every concave corner around such an edge with rolling-ball fillet
+// material and fuses it in, so the two solids become one. Supported for straight or circular
+// shared edges whose adjoining faces run straight away from the edge (planes, cylinders,
+// cones). `*why` (when given) names the reason a contact edge could not be joined.
 TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
-                          const std::vector<TopoDS_Edge>& edges, int* n_dropped = nullptr);
+                          const std::vector<TopoDS_Edge>& edges, int* n_dropped = nullptr,
+                          std::string* why = nullptr);
 TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
                            const std::vector<TopoDS_Edge>& edges, int* n_dropped = nullptr);
 

@@ -2,6 +2,7 @@
 #include "sim/fea_run.h"
 
 #include "prof/phases.h"
+#include "doc/native_policy.h"
 #include "util/time_local.h"
 
 #include <algorithm>
@@ -3033,6 +3034,25 @@ static nlohmann::json fea_run_static_impl(
     if (job.cancelled())
         return json{{"ok", false}, {"error", "fea_static: cancelled"}};
 
+    // Refuse unsafe exports before a warm solve-cache return can hide the request.
+    std::string export_system_path;
+    if (study.contains("export_system_path") && !study["export_system_path"].is_null()) {
+        const auto& reference = study["export_system_path"];
+        if (!reference.is_string() || reference.get_ref<const std::string&>().empty())
+            return json{{"ok", false},
+                        {"error", "fea_static: export_system_path must be a non-empty string path"},
+                        {"notes", json::array()}};
+        try {
+            export_system_path = doc::native_policy::resolve_reference(
+                reference.get_ref<const std::string&>());
+        } catch (const std::exception& exc) {
+            return json{{"ok", false},
+                        {"error", "fea_static: export_system_path refused: " +
+                                      std::string(exc.what())},
+                        {"notes", json::array()}};
+        }
+    }
+
     const json material_input = study.value("material", json::object());
     const bool per_body_material = material_input.is_object() && material_input.contains("per_body");
     auto valid_material = [](const json& m) {
@@ -4227,14 +4247,8 @@ static nlohmann::json fea_run_static_impl(
     // node-index list because that is the solver's only Dirichlet form: each entry pins
     // all three translational DOFs to zero. A write failure fails the RUN — a V&V export
     // that silently did not happen is worse than no export.
-    if (study.contains("export_system_path") && !study["export_system_path"].is_null()) {
-        if (!study["export_system_path"].is_string() ||
-            study["export_system_path"].get<std::string>().empty())
-            return json{{"ok", false},
-                        {"error", "fea_static: export_system_path must be a non-empty "
-                                  "string path"},
-                        {"notes", notes}};
-        const std::string path = study["export_system_path"].get<std::string>();
+    if (!export_system_path.empty()) {
+        const std::string& path = export_system_path;
         const int n_nodes_out = static_cast<int>(points.size() / 3);
         json dump;
         dump["nodes_per_elem"] = nodes_per_elem;

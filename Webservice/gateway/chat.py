@@ -22,11 +22,11 @@ from fastapi.responses import JSONResponse
 
 try:
     from .auth import AuthError, revalidate_websocket_user
-    from . import orgs
+    from . import orgs, deployment_drain
     from .auth import get_current_user
 except ImportError:
     from auth import AuthError, revalidate_websocket_user  # type: ignore
-    import orgs
+    import orgs, deployment_drain
     from auth import get_current_user
 
 try:
@@ -157,7 +157,7 @@ async def save_message(
     email = (email or "").strip().lower()
     display = (display or email or "user").strip() or "user"
     text = (text or "").strip()
-    row_id = await asyncio.to_thread(_insert_message, ts, scope_key, email, display, text)
+    row_id = await deployment_drain.run_blocking(_insert_message, ts, scope_key, email, display, text)
     return {
         "type": "message",
         "id": row_id,

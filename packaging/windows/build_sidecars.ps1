@@ -6,6 +6,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$OutputDir,
     [string]$Python = $env:CHUDWARE_RELEASE_PYTHON,
+    [string]$BasePython = $env:CHUDWARE_BASE_PYTHON,
     [string]$HostBinary = "",
     [string]$HostdBinary = "",
     # Engine library whose advisor closure is carried into the GUI runtime root. Defaults to
@@ -29,21 +30,43 @@ if (-not (Test-Path -LiteralPath $Entry -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $OutputDir -PathType Container)) {
     New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 }
-if (-not $Python) {
-    $venvPython = Join-Path $Root ".venv\Scripts\python.exe"
-    if (Test-Path -LiteralPath $venvPython -PathType Leaf) {
-        $Python = $venvPython
-    } else {
-        $Python = (Get-Command python.exe -ErrorAction Stop).Source
-    }
+if (-not $BasePython) { $BasePython = $env:CHUDWARE_CI_BASE_PYTHON }
+if (-not $BasePython -or -not [IO.Path]::IsPathRooted($BasePython)) {
+    throw "CHUDWARE_BASE_PYTHON must identify a separately authenticated absolute base Python"
 }
+if (-not $Python) { $Python = Join-Path $Root ".venv\Scripts\python.exe" }
+$Python = [IO.Path]::GetFullPath($Python)
 
 function Invoke-Checked([string]$Program, [string[]]$Arguments) {
-    & $Program @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Program failed with exit code $LASTEXITCODE"
+    $removed = @{}
+    foreach ($variable in @(Get-ChildItem Env: | Where-Object {
+        $_.Name -match '^(PYTHON|LD_|DYLD_)|^(__PYVENV_LAUNCHER__|VIRTUAL_ENV)$'
+    })) {
+        $removed[$variable.Name] = $variable.Value
+        Remove-Item ("Env:" + $variable.Name)
     }
+    try {
+        & $Program @Arguments
+        $code = $LASTEXITCODE
+    } finally {
+        foreach ($name in $removed.Keys) { Set-Item ("Env:" + $name) $removed[$name] }
+    }
+    if ($code -ne 0) { throw "$Program failed with exit code $code" }
 }
+function Invoke-ReleasePython([string[]]$Arguments) {
+    Invoke-Checked $Python (@("-I", "-c",
+        "import sys;sys.path.insert(0,sys.argv[1]);from services.installer.provision import run_python_entry;run_python_entry(sys.argv[1],sys.argv[2],sys.argv[3:])",
+        $Root, (Join-Path $ProtectedAssetsOut "python")) + $Arguments)
+}
+
+# The trusted base inspects candidate executable/config/platform libraries and
+# complete package bytes before ANY candidate startup, including asset generation.
+$compilerVenv = Split-Path -Parent (Split-Path -Parent $Python)
+$wheelhouse = if ($env:CHUDWARE_WHEELHOUSE) { $env:CHUDWARE_WHEELHOUSE } else { Join-Path $Root "wheelhouse" }
+Invoke-Checked $BasePython @("-I", "-S", "-c",
+    "import sys;sys.path.insert(0,sys.argv[1]);from services.installer.provision import main;sys.exit(main(sys.argv[2:]))",
+    $Root, "--check-inputs", "--base-python", $BasePython, "--venv-dir", $compilerVenv, "--wheelhouse", $wheelhouse)
+
 
 function Assert-ProductionCache([string]$BuildDir, [string]$Label) {
     $resolved = [IO.Path]::GetFullPath($BuildDir)
@@ -71,7 +94,7 @@ function Stage-Chudcode([string]$Destination) {
     if (-not $ChudBinary) {
         throw "CHUDWARE_CHUD_BIN or -ChudBinary is required"
     }
-    Invoke-Checked $Python @(
+    Invoke-ReleasePython @(
         (Join-Path $Root "scripts\pin_chudcode.py"),
         "stage",
         "--target", "windows-x86_64",
@@ -79,7 +102,7 @@ function Stage-Chudcode([string]$Destination) {
         "--output", $Destination
     )
     $destinationDir = Split-Path -Parent $Destination
-    Invoke-Checked $Python @(
+    Invoke-ReleasePython @(
         (Join-Path $Root "scripts\pin_chudcode.py"),
         "stage-notices",
         "--output-dir", $destinationDir
@@ -90,7 +113,7 @@ function Stage-Chudcode([string]$Destination) {
 
 function Generate-ProtectedAssets {
     Write-Host "==> generating protected prompt and role tables"
-    Invoke-Checked $Python @(
+    Invoke-ReleasePython @(
         (Join-Path $Root "packaging\embed_protected_assets.py"),
         "--source-root", $Root,
         "--output-dir", $ProtectedAssetsOut
@@ -106,7 +129,7 @@ function Generate-ProtectedAssets {
 }
 
 function Build-PythonSidecar([string]$Module, [string]$Name) {
-    Invoke-Checked $Python @("-c", "import nuitka")
+    Invoke-ReleasePython @("-c", "import nuitka")
     $work = Join-Path $Root "build\release-sidecars\windows\$Name"
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $work | Out-Null
@@ -117,6 +140,7 @@ function Build-PythonSidecar([string]$Module, [string]$Name) {
     # for background simulation jobs (services\sim\jobs.py), and the topology tool/study
     # modules back those jobs; forcing them fails the build if any is missing.
     $includes = @("--include-module=chudware_protected_assets", "--include-module=services.$Module",
+                  "--include-package=chudcode_rpc",
                   "--include-package=pycolmap",
                   "--include-module=services.sim.job_worker",
                   "--include-module=services.sim.topology",
@@ -147,15 +171,12 @@ function Build-PythonSidecar([string]$Module, [string]$Name) {
         "--output-dir=$work", "--output-filename=$Name.exe",
         "--nofollow-import-to=*.tests", "--nofollow-import-to=*.test_*"
     ) + $includes + @($Entry)
-    $oldPythonPath = $env:PYTHONPATH
-    $env:PYTHONPATH = (Join-Path $ProtectedAssetsOut "python") + $(if ($oldPythonPath) { ";$oldPythonPath" } else { "" })
     Push-Location $Root
     try {
         Write-Host "==> compiling $Name.exe"
-        Invoke-Checked $Python $arguments
+        Invoke-ReleasePython $arguments
     } finally {
         Pop-Location
-        $env:PYTHONPATH = $oldPythonPath
     }
 
     $built = Join-Path $work "$Name.exe"

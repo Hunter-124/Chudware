@@ -54,6 +54,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include "ipc_windows_local.h"
 #include <dbghelp.h>
 #include <ctime>
 #endif
@@ -327,7 +328,7 @@ int buildAndRender(const std::string& src, const std::string& out) {
 
 // ---- single-instance guard (desktop GUI) -----------------------------------------------------
 // One install, one window. This reuses the daemon's own primitive — chudware_ipc::SingleInstance
-// (flock on POSIX, named mutex on Windows) — keyed on THIS binary's path, exactly the way
+// (flock on POSIX, owner-private file handle on Windows) — keyed on THIS binary's path, exactly the way
 // chudware-hostd guards itself (core/hostd/main.cpp). Keying on the binary keeps a dev tree and
 // an installed build independent singletons, matching how they already get separate daemons.
 //
@@ -409,20 +410,21 @@ bool claimSingleInstance(int argc, char** argv) {
     if (const std::string dir = chudware_ipc::runtimeDir(); !dir.empty())
         g_activationDoc = dir + "/gui-" + key + ".open";
 
-#ifdef _WIN32
-    // Create the wake event BEFORE claiming the mutex so "mutex taken" always implies "event
-    // exists". CreateEventA on an existing name just opens it, so winner and loser end up holding
-    // the same object and the loser needs no second lookup.
-    g_activateEvent = CreateEventA(nullptr, /*manual reset*/ FALSE, /*initially set*/ FALSE,
-                                   (lock + "-activate").c_str());
-#endif
 
     // Process-lifetime claim. Every GUI exit path ends in std::_Exit, so this is never released
-    // explicitly — which is the point: flock/mutex die with the process, so a crashed instance
-    // leaves nothing to clean up and the next launch simply wins the lock.
+    // explicitly — which is the point: the live lock handle dies with the process, so a crashed
+    // instance leaves nothing to clean up and the next launch simply wins the lock.
     static chudware_ipc::SingleInstance instance;
     std::string err;
     if (instance.acquire(lock, err)) {
+#ifdef _WIN32
+        // Wake is availability-only. A squatted/foreign event cannot defeat the
+        // private file lock, and must not receive document handoff or activation.
+        const std::string name = "Local\\chudware-gui-activate-" + chudware_ipc::fnv1aHex(lock);
+        g_activateEvent = chudware_ipc::privateActivationEvent(
+            std::wstring(name.begin(), name.end()), true);
+        g_activationDoc = lock + ".open";
+#endif
         // A fresh incumbent owns no hand-off: discard anything a previous, dead instance left.
         if (!g_activationDoc.empty()) {
             std::error_code ec;
@@ -442,9 +444,7 @@ bool claimSingleInstance(int argc, char** argv) {
 
     // Confirm a LIVE incumbent before standing down — see "fails open" above.
 #ifdef _WIN32
-    const HANDLE held = OpenMutexA(SYNCHRONIZE, FALSE, lock.c_str());
-    const bool incumbent = held != nullptr;
-    if (held) CloseHandle(held);
+    const bool incumbent = chudware_ipc::privateLockHeld(lock);
 #else
     const long pid = readGuiLockPid(lock);
     const bool incumbent = pid > 1;
@@ -455,15 +455,30 @@ bool claimSingleInstance(int argc, char** argv) {
                      err.c_str());
         return true;
     }
+#ifdef _WIN32
+    const std::string eventName = "Local\\chudware-gui-activate-" + chudware_ipc::fnv1aHex(lock);
+    // The file claim precedes event creation. Retry the availability channel
+    // briefly without ever turning event existence into authority.
+    for (int attempt = 0; attempt < 20 && !g_activateEvent; ++attempt) {
+        g_activateEvent = chudware_ipc::privateActivationEvent(
+            std::wstring(eventName.begin(), eventName.end()), false);
+        if (!g_activateEvent) Sleep(10);
+    }
+    g_activationDoc = g_activateEvent ? lock + ".open" : std::string();
+#endif
 
     // Hand the document over BEFORE the poke, so the incumbent's activation branch always sees
     // both in the same frame. Absolute: the incumbent's cwd is not ours.
     if (const char* doc = documentArg(argc, argv); doc && !g_activationDoc.empty()) {
         std::error_code ec;
+#ifdef _WIN32
+        chudware_ipc::privateWrite(g_activationDoc, std::filesystem::absolute(doc, ec).u8string() + "\n");
+#else
         std::filesystem::create_directories(
             std::filesystem::path(g_activationDoc).parent_path(), ec);
         std::ofstream f(g_activationDoc, std::ios::binary | std::ios::trunc);
         if (f) f << std::filesystem::absolute(doc, ec).string() << "\n";
+#endif
     }
 
 #ifdef _WIN32

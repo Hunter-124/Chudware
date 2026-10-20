@@ -20,6 +20,7 @@ import tempfile
 import re
 import threading
 import subprocess
+import sqlite3
 import time
 import uuid
 from urllib.parse import urlsplit
@@ -32,6 +33,7 @@ from typing import Any
 from services.agent.chudcode_questions import TurnQuestions
 from services.agent.online_turn import format_duration
 from services.agent.progress_watchdog import ProgressWatchdog, TurnBudgetReminder
+from services.agent import request_context as tenancy
 
 _DEFAULT_MAX_SESSIONS = 8
 _MAX_MAX_SESSIONS = 32
@@ -152,9 +154,40 @@ _BYOK_PROVIDER_ENV = {
 def byok_provider_env(provider: str) -> str | None:
     return _BYOK_PROVIDER_ENV.get(provider.strip().lower())
 
+
+_CELL_PROVIDER_BASES = {
+    "anthropic": "http://127.0.0.1:18081/anthropic/v1",
+    "openai": "http://127.0.0.1:18081/openai/v1",
+    "xai": "http://127.0.0.1:18081/xai/v1",
+    "openrouter": "http://127.0.0.1:18081/openrouter/v1",
+    "gemini": "http://127.0.0.1:18081/gemini",
+}
+_CELL_GRANT_ENV = "CHUDWARE_PROVIDER_GRANT"
+
+
+def _cell_provider_grant(params: Mapping[str, Any]) -> str:
+    if any(key in params for key in ("api_key", "web_credential", "byok_key")):
+        raise ValueError("credential_isolation_unsupported")
+    grant = params.get("web_provider_grant")
+    if (not isinstance(grant, str) or len(grant) > 4096
+            or re.fullmatch(r"cpg1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", grant) is None):
+        raise ValueError("provider_grant_missing")
+    return grant
+
 def _credential_scope(params: Mapping[str, Any]) -> tuple[str, str, str, str, str] | None:
     """Return source, tenant, provider, secret, and Chudcode's credential env name."""
     source = _nonempty_string(params.get("web_key_source"))
+    if tenancy.in_cell():
+        grant = _cell_provider_grant(params)
+        if source != "byok":
+            raise ValueError("credential_isolation_unsupported")
+        tenant = _nonempty_string(params.get("web_tenant"))
+        provider = (_nonempty_string(params.get("web_provider")) or "").lower()
+        if tenant != tenancy.current_context()["actor_key"]:
+            raise ValueError("provider_grant_scope_mismatch")
+        if provider not in _CELL_PROVIDER_BASES:
+            raise ValueError("byok_unsupported_online")
+        return source, tenant, provider, grant, _CELL_GRANT_ENV
     if source is not None:
         if source not in {"byok", "subscription", "pool"}:
             raise ValueError("web_credential_source_invalid")
@@ -174,13 +207,17 @@ def _credential_scope(params: Mapping[str, Any]) -> tuple[str, str, str, str, st
                 raise ValueError(f"{source}_unsupported_online")
         return source, tenant, provider, secret, env_name
     if params.get("web_actor"):
-        raise ValueError("web_credential_source_invalid")
+        raise ValueError("web_credential_missing" if tenancy.in_cell() else "web_credential_source_invalid")
     key = _nonempty_string(params.get("byok_key"))
     if key is None:
+        if tenancy.in_cell():
+            raise ValueError("web_credential_missing")
         if params.get("byok_key") is not None:
             raise ValueError("byok_unsupported_online")
         return None
-    tenant = _nonempty_string(params.get("byok_tenant")) or "desktop"
+    tenant = _nonempty_string(params.get("byok_tenant")) or (
+        tenancy.owner_key()[1] if tenancy.in_cell() else "desktop"
+    )
     provider = (_nonempty_string(params.get("byok_provider")) or "").lower()
     env_name = byok_provider_env(provider)
     if env_name is None:
@@ -193,8 +230,10 @@ def _credential_identity(params: Mapping[str, Any]) -> str | None:
     if scope is None:
         return None
     source, tenant, provider, secret, _ = scope
+    identity_scope = ([*tenancy.owner_key(), provider] if tenancy.in_cell()
+                      else [source, tenant, provider, secret])
     return hashlib.sha256(
-        json.dumps([source, tenant, provider, secret], separators=(",", ":")).encode()
+        json.dumps(identity_scope, separators=(",", ":")).encode()
     ).hexdigest()
 
 
@@ -206,10 +245,12 @@ def _credential_client_scope(
     scope = _credential_scope(params)
     if scope is None:
         raise ValueError("web_credential_missing")
-    source, _, _, secret, env_name = scope
+    source, _, provider, secret, env_name = scope
     identity = _credential_identity(params)
-    root = Path(session_dir) if session_dir else paths.ROOT / "Sessions"
-    if resume_file and session_dir is None:
+    root = tenancy.actor_state_root() / "Sessions" if tenancy.in_cell() else (
+        Path(session_dir) if session_dir else paths.ROOT / "Sessions"
+    )
+    if resume_file and session_dir is None and not tenancy.in_cell():
         root = Path(resume_file).expanduser().parent.parent
     scoped = root.expanduser() / f"{source}-{identity}"
     if scoped.is_symlink():
@@ -218,7 +259,10 @@ def _credential_client_scope(
         raise RuntimeError("session file belongs to another credential scope")
     scoped.mkdir(mode=0o700, parents=True, exist_ok=True)
     scoped.chmod(0o700)
-    tempdir = tempfile.TemporaryDirectory(prefix=f"chudware-{source}-")
+    tempdir = tempfile.TemporaryDirectory(
+        prefix=f"chudware-{source}-",
+        dir=tenancy.actor_state_root() if tenancy.in_cell() else None,
+    )
     home = Path(tempdir.name)
     agent, xdg = home / "agent", home / "xdg"
     agent.mkdir(mode=0o700)
@@ -237,6 +281,42 @@ def _credential_client_scope(
         "PI_CODING_AGENT_DIR": str(agent),
         env_name: secret,
     })
+    if tenancy.in_cell():
+        ctx = tenancy.current_context()
+        native_provider = "google" if provider == "gemini" else provider
+        override: dict[str, Any] = {
+            "baseUrl": _CELL_PROVIDER_BASES[provider],
+            "apiKey": _CELL_GRANT_ENV,
+        }
+        if provider == "anthropic":
+            override["compat"] = {
+                "supportsEagerToolInputStreaming": True,
+                "replayUnsignedThinking": False,
+            }
+            clean["ANTHROPIC_BASE_URL"] = _CELL_PROVIDER_BASES[provider]
+            clean["ANTHROPIC_SEARCH_BASE_URL"] = _CELL_PROVIDER_BASES[provider]
+        # JSON is YAML: provider overrides retain the pinned runtime's native
+        # catalog, signed-thinking replay and prompt-cache wire implementation.
+        model_config = agent / "models.yml"
+        model_config.write_text(
+            json.dumps({"providers": {native_provider: override}}), encoding="utf-8"
+        )
+        model_config.chmod(0o600)
+        clean["NO_PROXY"] = clean["no_proxy"] = "127.0.0.1,localhost,::1"
+        clean.update({
+            "CHUDWARE_CELL": "1",
+            "CHUDWARE_ACTOR_HEX": tenancy.actor_hex(),
+            "CHUDWARE_ACTOR_STATE": "/actor",
+            "CHUDWARE_ACTOR_KEY": ctx["actor_key"],
+            "CHUDWARE_WORKSPACE_KEY": ctx["workspace_key"],
+            "CHUDWARE_CELL_RIGHT": ctx["right"],
+            "CHUDWARE_CELL_EPOCH": str(ctx["epoch"]),
+        })
+        if os.environ.get("CHUDWARE_ACTOR_SANDBOX") == "1":
+            clean["CHUDWARE_ACTOR_SANDBOX"] = "1"
+        for name in ("CHUDWARE_HOSTD_WORKER_LANE", "CHUDWARE_WRITER_GROUP"):
+            if name in os.environ:
+                clean[name] = os.environ[name]
     return tempdir, str(scoped), clean
 
 
@@ -401,12 +481,38 @@ class _Session:
     auto_compaction: bool | None = None
     auto_retry: bool | None = None
     launch_params: dict[str, Any] = field(default_factory=dict, repr=False)
+    owner: tuple[str, str] | None = field(default_factory=tenancy.owner_key)
+    registry_key: str = ""
+    sandbox_class: str = "rw"
 
 
 @dataclass
 class _CreationGuard:
     lock: threading.Lock = field(default_factory=threading.Lock)
     users: int = 0
+
+@dataclass
+class _ActivityProbe:
+    done: threading.Event = field(default_factory=threading.Event)
+    result: dict[str, int] | None = None
+    complete: bool = False
+
+
+
+@dataclass
+class _Steer:
+    """One steer handed to Chudcode: its text, images and the GUI's correlation id."""
+
+    text: str
+    images: list[dict[str, Any]]
+    steer_id: str = ""
+    from_user: bool = True
+    owner: tuple[str, str] | None = field(default_factory=tenancy.owner_key)
+
+    @property
+    def key(self) -> tuple[str, str]:
+        """Deduplicate the whole payload, never text shared by distinct images."""
+        return self.text, json.dumps(self.images, sort_keys=True)
 
 
 @dataclass
@@ -416,13 +522,24 @@ class _Run:
     client: Any | None = None
     started: bool = False
     cancel_requested: bool = False
+    cancel_reason: str = ""
+    control_delegate: dict[str, str] | None = None
     cancel_sent: bool = False
-    steers: set[str] = field(default_factory=set)
+    steers: set[tuple[str, str]] = field(default_factory=set)
     control_lock: threading.Lock = field(default_factory=threading.Lock)
-    # (message, images) queued before prompt() returned; images are Chudcode ImageContent.
-    pending_steers: list[tuple[str, list[dict[str, Any]]]] = field(default_factory=list)
+    # Steers queued before prompt() returned; images are Chudcode ImageContent.
+    pending_steers: list[_Steer] = field(default_factory=list)
+    # User steers Chudcode holds in its queue until the next tool boundary. A user
+    # message frame carrying the text means the model has it; until then a pure wait
+    # (wait_job) is woken and Stop withdraws them instead of letting Chudcode's
+    # post-abort drain start a turn nobody observes.
+    undelivered: list[_Steer] = field(default_factory=list)
     # Pending ask_user batches of an interactive (GUI) turn; None for headless turns.
     questions: TurnQuestions | None = None
+    owner: tuple[str, str] | None = field(default_factory=tenancy.owner_key)
+    credential_identity: str | None = None
+    registry_key: str = ""
+    session_key: str = ""
 
 
 class ChudcodeSessionHost:
@@ -443,9 +560,14 @@ class ChudcodeSessionHost:
         self._max_sessions = _session_limit_from_env()
         self._sessions: OrderedDict[str, _Session] = OrderedDict()
         self._creating: dict[str, _CreationGuard] = {}
-        self._reserved_creations = 0
+        self._reserved_creations: dict[tuple[str, str] | None, int] = {}
         self._runs: dict[str, _Run] = {}
         self._completed_runs: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        # User steers Stop withdrew before Chudcode delivered them, keyed by Chudware
+        # session id: the transcript already shows them, so they ride with that
+        # conversation's next prompt.
+        self._carried_steers: dict[str, list[_Steer]] = {}
+        self._prestart_cancels: dict[str, dict[str, str] | None] = {}
         self._lock = threading.RLock()
         # ONE long-lived no-session process serves every transient (auth / catalog /
         # memory / login) command. Spawning `chud --mode rpc` costs ~1.1 s before the
@@ -459,6 +581,7 @@ class ChudcodeSessionHost:
         # Live tool-free helper processes (``complete_text``): disposable per call,
         # tracked only so shutdown() stops them with everything else this worker owns.
         self._helper_clients: set[Any] = set()
+        self._activity_probes: dict[Any, _ActivityProbe] = {}
         self._shutdown = False
         self._catalog_refresh_lock = threading.Lock()
         self._catalog_refreshing = False
@@ -474,10 +597,13 @@ class ChudcodeSessionHost:
 
     def run_turn(self, params, emit) -> dict:
         """Schedule a prompt and block until a terminal ``agent_end`` is observed."""
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
         if not isinstance(params, Mapping):
             return {"ok": False, "reason": "chudcode turn params must be an object"}
         if not callable(emit):
             return {"ok": False, "reason": "chudcode turn emit callback is required"}
+        emit = _context_callback(emit)
 
         prompt = params.get("request", params.get("prompt", params.get("message")))
         if not isinstance(prompt, str) or not prompt.strip():
@@ -485,23 +611,44 @@ class ChudcodeSessionHost:
         session_id = _nonempty_string(params.get("session_id")) or "default"
         run_id = _nonempty_string(params.get("run_id")) or uuid.uuid4().hex
         resume_file = _nonempty_string(params.get("chudcode_session_file"))
+        session_key, run_key = tenancy.scoped_key(session_id), tenancy.scoped_key(run_id)
+        if tenancy.in_cell() and resume_file is not None:
+            return {"ok": False, "reason": "cell_refused", "code": "cell_refused"}
+        try:
+            credential_identity = _credential_identity(params)
+            if tenancy.in_cell():
+                resume_file = _session_link(session_id, credential_identity)
+        except KeyError:
+            return _not_found()
+        except ValueError as exc:
+            return {"ok": False, "reason": str(exc), "code": str(exc)}
 
         with self._lock:
             if self._shutdown:
                 return {"ok": False, "reason": "chudcode session host is shut down"}
-            if run_id in self._runs:
+            if run_key in self._runs:
                 return {
                     "ok": False,
                     "run_id": run_id,
                     "reason": "chudcode run_id is already active",
                 }
-            self._completed_runs.pop(run_id, None)
-            run = _Run(run_id=run_id, session_id=session_id)
-            self._runs[run_id] = run
+            self._completed_runs.pop(run_key, None)
+            run = _Run(
+                run_id=run_id, session_id=session_id,
+                credential_identity=credential_identity,
+                registry_key=run_key, session_key=session_key,
+                cancel_requested=run_key in self._prestart_cancels,
+                control_delegate=self._prestart_cancels.get(run_key),
+                cancel_reason="manager_stop" if self._prestart_cancels.get(run_key) else "",
+            )
+            self._runs[run_key] = run
+            self._prestart_cancels.pop(run_key, None)
 
         session: _Session | None = None
         unsubscribe: Callable[[], None] | None = None
         observed_contexts: list[dict[str, Any]] = []
+        tool_recoveries: dict[int, Any] = {}
+        daemon_connections = None
         emit_errors: list[str] = []
         provider_frames: deque[dict[str, Any]] = deque(maxlen=256)
         terminal: dict[str, Any] | None = None
@@ -533,7 +680,7 @@ class ChudcodeSessionHost:
             scheduled_deadline = deadline
             if self._realtime_watchdog and deadline is not None:
                 progress_timer = self._timer_factory(
-                    max(0.0, deadline - self._clock()), check_progress_timer
+                    max(0.0, deadline - self._clock()), _context_callback(check_progress_timer)
                 )
                 progress_timer.daemon = True
                 progress_timer.start()
@@ -570,7 +717,7 @@ class ChudcodeSessionHost:
             # would wait for a response only that same reader can receive.
             if self._realtime_watchdog:
                 thread = threading.Thread(
-                    target=send_progress_nudge, args=(text, feed), daemon=True
+                    target=_context_callback(send_progress_nudge), args=(text, feed), daemon=True
                 )
                 progress_threads.append(thread)
                 thread.start()
@@ -625,7 +772,7 @@ class ChudcodeSessionHost:
                     if session.closed:
                         raise RuntimeError("chudcode RPC session was closed")
                     run.client = session.client
-                    self._sessions.move_to_end(session_id)
+                    self._sessions.move_to_end(session_key)
 
                 # Emitted right after agent_start (the GUI resets its meter on run_started):
                 # the resume key first, then get_state's contextUsage — the resumed session's
@@ -635,6 +782,8 @@ class ChudcodeSessionHost:
                 # under one of these ids IS that visible call (`write xd://add_features`);
                 # any other id was made from inside a tool, e.g. `tool.write(...)` in eval.
                 open_calls: dict[str, str] = {}
+                # The prompt text actually sent: its own user frame is not a steer delivery.
+                sent_prompt: list[str] = []
                 # Host-tool threads report nested calls concurrently with the reader thread.
                 emit_lock = threading.Lock()
 
@@ -656,6 +805,13 @@ class ChudcodeSessionHost:
                     if kind == "agent_end" and frame.get(
                         "isTerminal", frame.get("is_terminal")
                     ) is not False:
+                        frame.pop("control_delegate", None)
+                        for key in ("reason", "stopReason", "stop_reason"):
+                            if frame.get(key) == "manager_stop":
+                                frame.pop(key)
+                        frame.update(_stop_audit(run))
+                        if run.cancel_reason == "manager_stop":
+                            frame["stopReason"] = "manager_stop"
                         terminal = frame
                         with progress_lock:
                             progress_closed = True
@@ -674,9 +830,16 @@ class ChudcodeSessionHost:
                             dispatch_progress_nudge(nudge)
                         if reminder is not None:
                             dispatch_progress_nudge(*reminder)
+                    delivered = (
+                        self._take_delivered_steers(run, frame, sent_prompt)
+                        if kind == "message_start"
+                        else []
+                    )
                     try:
                         with emit_lock:
                             emit(frame)
+                            for steer in delivered:
+                                emit(_steer_status_frame(run, steer, "delivered"))
                             if kind == "agent_start":
                                 while opening:
                                     emit(opening.pop(0))
@@ -699,10 +862,14 @@ class ChudcodeSessionHost:
                         frame["parentToolCallId"] = outer[0]
                     forward(frame)
 
-                unsubscribe = _register_listener(session.client, forward)
+                unsubscribe = _register_listener(session.client, _context_callback(forward))
+                _collect_host_tool_recoveries(params.get("host_tools"), tool_recoveries)
                 observed_contexts = _bind_host_call_observer(
                     params.get("host_tools"), observe_host_call
                 )
+                from services.mcp.daemon_bridge import TurnConnections
+
+                daemon_connections = TurnConnections()
                 from services.agent.providers.chudcode_provider import ChudcodeProvider
 
                 helper_params = _client_launch_params(params)
@@ -735,7 +902,9 @@ class ChudcodeSessionHost:
                     )
 
                 for context in observed_contexts:
+                    context["daemon_connections"] = daemon_connections
                     context["helper_runtime"] = helper_runtime
+                    context["user_steer_pending"] = lambda: bool(run.undelivered)
                 if params.get("interactive_questions"):
 
                     def emit_question_frame(frame: dict[str, Any]) -> None:
@@ -767,6 +936,8 @@ class ChudcodeSessionHost:
                     "session_file"
                 )
                 if isinstance(bound_file, str) and bound_file:
+                    if tenancy.in_cell():
+                        _session_link(session_id, session.credential_identity, bound_file)
                     opening.append(
                         {
                             "type": "session_bound",
@@ -790,18 +961,49 @@ class ChudcodeSessionHost:
                             "session_id": session_id,
                             "cancelled": True,
                             "terminal": None,
+                            **_stop_audit(run),
                         }
                         return result
-                    session.client.prompt(message, images=images or None)
+                    # Messages a Stop withdrew before delivery are already in the user's
+                    # transcript, ahead of this one: they open this prompt, in order.
+                    carried = self._carried_steers.pop(session_key, [])
+                    if carried:
+                        message = "\n\n".join([*(s.text for s in carried), message])
+                        images = [*(i for s in carried for i in s.images), *(images or [])]
+                        opening.extend(
+                            _steer_status_frame(run, s, "delivered")
+                            for s in carried
+                            if s.steer_id
+                        )
+                    # Set before prompt(): the reader thread may forward its user frame first.
+                    sent_prompt.append(message)
+                    try:
+                        session.client.prompt(message, images=images or None)
+                    except Exception:
+                        if carried:
+                            self._carried_steers[session_key] = [
+                                *carried, *self._carried_steers.get(session_key, [])
+                            ]
+                        raise
                     run.started = True
                     pending_steers = tuple(run.pending_steers)
 
-                for text, steer_images in pending_steers:
+                for steer in pending_steers:
                     with run.control_lock:
-                        session.client.steer(text, images=steer_images or None)
+                        # Tracked before the send: its user frame may be forwarded first.
                         with self._lock:
-                            run.steers.add(text)
-                            run.pending_steers.remove((text, steer_images))
+                            if steer.from_user:
+                                run.undelivered.append(steer)
+                        try:
+                            session.client.steer(steer.text, images=steer.images or None)
+                        except Exception:
+                            with self._lock:
+                                if steer in run.undelivered:
+                                    run.undelivered.remove(steer)
+                            raise
+                        with self._lock:
+                            run.steers.add(steer.key)
+                            run.pending_steers.remove(steer)
                 # The caller owns the budget (`timeout`, seconds): run_mission.py sends
                 # --timeout-s, an explicit GUI/RPC caller may send one. Absent, zero or
                 # non-finite means no wall-clock stop. When an explicit budget expires
@@ -819,7 +1021,7 @@ class ChudcodeSessionHost:
                             deadline = budget_reminder.deadline()
                             if self._realtime_watchdog and deadline is not None:
                                 budget_timer = self._timer_factory(
-                                    max(0.0, deadline - self._clock()), check_budget_timer
+                                    max(0.0, deadline - self._clock()), _context_callback(check_budget_timer)
                                 )
                                 budget_timer.daemon = True
                                 budget_timer.start()
@@ -837,8 +1039,23 @@ class ChudcodeSessionHost:
                     raise RuntimeError(
                         "chudcode RPC turn ended without a terminal agent_end"
                     )
+                # A steer that reached Chudcode after the loop's last boundary poll is
+                # still queued, and Chudcode's settle drain would answer it in a turn no
+                # one observes. Withdraw it; it opens this conversation's next prompt.
+                if not run.cancel_requested:
+                    for steer in self._withdraw_undelivered(run, session.client):
+                        if steer.steer_id:
+                            try:
+                                with emit_lock:
+                                    emit(_steer_status_frame(run, steer, "carried"))
+                            except Exception as exc:  # noqa: BLE001 - injected boundary
+                                emit_errors.append(str(exc))
 
                 state = _safe_client_state(session.client)
+                if tenancy.in_cell():
+                    bound = state.get("sessionFile") or state.get("session_file")
+                    if bound:
+                        _session_link(session_id, session.credential_identity, bound)
                 # Chudcode's own figure (anchored provider usage + unbilled tail), the
                 # same number its footer shows; the per-message usage was provisional.
                 closing_frame = _context_frame(state)
@@ -849,6 +1066,7 @@ class ChudcodeSessionHost:
                         emit_errors.append(str(exc))
                 provider_failure = _unrecovered_provider_failure(provider_frames)
                 result = {
+                    **_stop_audit(run),
                     "ok": not emit_errors and provider_failure is None,
                     "run_id": run_id,
                     "session_id": session_id,
@@ -876,6 +1094,8 @@ class ChudcodeSessionHost:
                         f"chudcode event forwarding failed: {emit_errors[0]}"
                     )
                 return result
+        except KeyError:
+            return _not_found()
         except Exception as exc:  # noqa: BLE001 - worker RPC boundary returns failures
             return {
                 "ok": False,
@@ -903,24 +1123,42 @@ class ChudcodeSessionHost:
                     )
             if run.questions is not None:
                 run.questions.close()
+            # Metadata-backed immutable contexts cannot carry the observer. Their
+            # recovery ownership is independent of that optional callback wiring.
+            # Rescan for recoveries lazily created by direct bindings during the run.
+            _collect_host_tool_recoveries(
+                params.get("host_tools"), tool_recoveries, contexts=observed_contexts,
+            )
+            for recovery in tool_recoveries.values():
+                recovery.close()  # Forget results, never cancel/join native work.
             for context in observed_contexts:
+                context.pop("tool_call_recovery", None)
                 context.pop("host_call_observer", None)
                 context.pop("ask_human", None)
                 context.pop("helper_runtime", None)
+                context.pop("user_steer_pending", None)
+                context.pop("daemon_connections", None)
+            if daemon_connections is not None:
+                daemon_connections.close()
             dispose = False
             with self._lock:
                 if session is not None:
                     dispose = self._release_session_locked(session)
-                self._runs.pop(run_id, None)
+                self._runs.pop(run_key, None)
                 completed = {
                     "run_id": run_id,
                     "session_id": session_id,
                     "cancelled": run.cancel_requested,
                     "started": run.started,
+                    "_owner": run.owner,
+                    "_credential_identity": run.credential_identity,
                 }
-                self._completed_runs[run_id] = completed
-                while len(self._completed_runs) > self._max_sessions * 8:
-                    self._completed_runs.popitem(last=False)
+                completed.update(_stop_audit(run))
+                self._completed_runs[run_key] = completed
+                owned_completed = [key for key, value in self._completed_runs.items()
+                                   if value["_owner"] == run.owner]
+                for key in owned_completed[:-self._max_sessions * 8]:
+                    self._completed_runs.pop(key)
             if dispose:
                 _stop_client(session.client)
 
@@ -983,6 +1221,7 @@ class ChudcodeSessionHost:
             "terminal": None,
             "result": _safe_last_assistant_text(session.client),
         }
+        result.update(_stop_audit(run))
         state = _safe_client_state(session.client)
         if state:
             result["chudcode_session_id"] = state.get("sessionId") or state.get("session_id")
@@ -1044,33 +1283,77 @@ class ChudcodeSessionHost:
             )
         return result
 
-    def cancel(self, run_id) -> dict:
-        run_key = _nonempty_string(run_id)
-        if run_key is None:
-            return {"ok": False, "reason": "run_id is required"}
+    def cancel(self, run_id, *, credential_params=None) -> dict:
+        try:
+            delegate = tenancy.control_delegate("cancel")
+        except ValueError:
+            return _forbidden_right()
+        if delegate is not None:
+            if _nonempty_string(run_id) is None:
+                return _forbidden_right()
+            credential_params = None
+        run_id = _nonempty_string(run_id)
         with self._lock:
-            run = self._runs.get(run_key)
-            if run is None:
-                completed = self._completed_runs.get(run_key)
-                return {
-                    "ok": True,
-                    "run_id": run_key,
-                    "cancelled": bool(completed and completed.get("cancelled")),
-                    "active": False,
-                }
-        return self._cancel_run(run)
+            if run_id is None:
+                if not tenancy.in_cell():
+                    return {"ok": False, "reason": "run_id is required"}
+                runs = [run for run in self._runs.values()
+                        if _control_allowed(run, credential_params)]
+            else:
+                key = tenancy.scoped_key(run_id)
+                run = self._runs.get(key)
+                completed = self._completed_runs.get(key)
+                if run is None:
+                    if completed is None and tenancy.in_cell():
+                        try:
+                            tenancy.require_handle(run_id, "run")
+                        except KeyError:
+                            return _not_found()
+                        self._prestart_cancels.setdefault(key, delegate)
+                        return {
+                            "ok": True, "run_id": run_id, "cancelled": True, "active": False,
+                            **({"reason": "manager_stop", "control_delegate": delegate} if delegate else {}),
+                        }
+                    if not _control_allowed(completed, credential_params):
+                        return _not_found() if tenancy.in_cell() or completed else {
+                            "ok": True, "run_id": run_id, "cancelled": False, "active": False,
+                        }
+                    return {"ok": True, "run_id": run_id, "active": False,
+                            "cancelled": bool(completed.get("cancelled"))}
+                if not _control_allowed(run, credential_params):
+                    return _not_found()
+                runs = [run]
+        results = [self._cancel_run(run) for run in runs]
+        if delegate is not None:
+            for result in results:
+                result.pop("carried_steer_ids", None)
+                result.setdefault("reason", "manager_stop")
+                result["control_delegate"] = delegate
+                result["stop_reason"] = "manager_stop"
+        if run_id is not None:
+            return results[0]
+        return {"ok": all(result["ok"] for result in results), "cancelled_runs": results}
 
     def _cancel_run(self, run: _Run) -> dict:
         run_key = run.run_id
         with run.control_lock:
             with self._lock:
+                delegate = tenancy.control_delegate("cancel")
+                if delegate is not None and not run.cancel_requested:
+                    run.control_delegate = dict(delegate)
+                    run.cancel_reason = "manager_stop"
                 run.cancel_requested = True
                 client = run.client
                 should_abort = client is not None and run.started and not run.cancel_sent
                 questions = run.questions
             if questions is not None:
                 questions.close()
+            carried: list[_Steer] = []
             if should_abort:
+                # Chudcode's abort keeps queued user steers and its settle drain then
+                # answers them in a fresh turn nobody observes (c252: a steer queued
+                # behind wait_job started a model call 0.2 s after Stop). Withdraw first.
+                carried = self._withdraw_undelivered(run, client)
                 try:
                     client.abort()
                 except Exception as exc:  # noqa: BLE001 - RPC transport failures are retryable
@@ -1080,18 +1363,80 @@ class ChudcodeSessionHost:
                         "cancelled": True,
                         "active": True,
                         "reason": str(exc),
+                        "carried_steer_ids": [s.steer_id for s in carried if s.steer_id],
                     }
                 with self._lock:
                     run.cancel_sent = True
-        return {"ok": True, "run_id": run_key, "cancelled": True, "active": True}
+        return {
+            "ok": True,
+            "run_id": run_key,
+            "cancelled": True,
+            "active": True,
+            "carried_steer_ids": [s.steer_id for s in carried if s.steer_id],
+        }
 
-    def answer(self, run_id, batch_id, answers=None, declined=False) -> dict:
+    def _withdraw_undelivered(self, run: _Run, client: Any) -> list[_Steer]:
+        """Pull the run's undelivered user steers out of Chudcode's queue.
+
+        Withdrawn steers are carried to the session's next prompt and returned.
+        ``removed: false`` does not prove consumption (the original send may have
+        failed); only a streamed user frame acknowledges delivery.
+        """
+        with self._lock:
+            pending = list(run.undelivered)
+            run.undelivered.clear()
+        carried: list[_Steer] = []
+        for steer in pending:
+            try:
+                outcome = client.remove_queued_message(steer.text, "steering")
+            except Exception as exc:  # noqa: BLE001 - a failed withdrawal leaves it queued
+                _LOG.warning("Withdrawing a queued steer failed (%s)", type(exc).__name__)
+                continue
+            if getattr(outcome, "removed", False) is True:
+                carried.append(steer)
+        if carried:
+            with self._lock:
+                self._carried_steers.setdefault(run.session_key, []).extend(carried)
+        return carried
+
+    def _take_delivered_steers(
+        self, run: _Run, frame: Mapping[str, Any], sent_prompt: Sequence[str]
+    ) -> list[_Steer]:
+        """Undelivered user steers a ``message_start`` user frame just delivered.
+
+        Correlate exact sent text only: an unrelated or transformed user frame is
+        not evidence that any tracked steer was consumed.
+        """
+        text = _user_frame_text(frame)
+        if text is None or text in sent_prompt:
+            return []
+        with self._lock:
+            if not run.undelivered:
+                return []
+            message = frame.get("message", {})
+            content = message.get("content")
+            images = [
+                part for part in content
+                if isinstance(part, Mapping) and part.get("type") == "image"
+            ] if isinstance(content, list) else []
+            taken = [
+                s for s in run.undelivered if s.text == text and s.images == images
+            ][:1]
+            for steer in taken:
+                run.undelivered.remove(steer)
+        return [s for s in taken if s.steer_id]
+
+    def answer(self, run_id, batch_id, answers=None, declined=False, *, credential_params=None) -> dict:
         """Resolve a pending ask_user batch from the GUI's question card."""
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
         run_key = _nonempty_string(run_id)
         if run_key is None:
             return {"ok": False, "reason": "run_id is required"}
         with self._lock:
-            run = self._runs.get(run_key)
+            run = self._runs.get(tenancy.scoped_key(run_key))
+            if not _control_allowed(run, credential_params) and (run is not None or tenancy.in_cell()):
+                return _not_found()
             questions = run.questions if run is not None else None
         if questions is None:
             return {
@@ -1105,7 +1450,25 @@ class ChudcodeSessionHost:
         result["run_id"] = run_key
         return result
 
-    def steer(self, run_id, text, attachments=None, *, from_user: bool = True) -> dict:
+    def steer(
+        self,
+        run_id,
+        text,
+        attachments=None,
+        *,
+        from_user: bool = True,
+        steer_id: str | None = None,
+        credential_params=None,
+    ) -> dict:
+        """Queue ``text`` into a live run; the response echoes the GUI's ``steer_id``.
+
+        A user steer stays tracked until its user frame streams (an ``agent_steer``
+        ``delivered`` frame names it), wakes pure waits meanwhile, and a Stop before
+        delivery carries it to the conversation's next prompt.
+        """
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
+        steer_key = _nonempty_string(steer_id) or ""
         run_key = _nonempty_string(run_id)
         message = _nonempty_string(text)
         if run_key is None or message is None:
@@ -1113,21 +1476,27 @@ class ChudcodeSessionHost:
                 "ok": False,
                 "reason": "run_id and non-empty steering text are required",
             }
+        with self._lock:
+            run = self._runs.get(tenancy.scoped_key(run_key))
+            if not _control_allowed(run, credential_params) and (run is not None or tenancy.in_cell()):
+                return _not_found()
         try:
             message, images = _prompt_payload(message, attachments, None)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             return {
                 "ok": False,
                 "run_id": run_key,
                 "steered": False,
                 "reason": f"steer attachment unreadable: {exc}",
             }
+        steer = _Steer(message, list(images or []), steer_key, from_user)
         with self._lock:
-            run = self._runs.get(run_key)
+            run = self._runs.get(tenancy.scoped_key(run_key))
             if run is None:
                 return {
                     "ok": True,
                     "run_id": run_key,
+                    "steer_id": steer_key,
                     "steered": False,
                     "active": False,
                 }
@@ -1135,27 +1504,30 @@ class ChudcodeSessionHost:
         # steering it instead would queue behind the blocked ask_user call forever.
         questions = run.questions if from_user else None
         if questions is not None and questions.has_pending():
-            answered = questions.reply(message)
+            # A text-only reply is consumed by ask_user itself; its answer frame
+            # acknowledges the bubble even if the control response is lost. Images
+            # still need their own streamed user frame before claiming delivery.
+            answered = questions.reply(message, steer_id=steer_key if not images else "")
             if answered is not None and not images:
                 with self._lock:
-                    run.steers.add(message)
+                    run.steers.add(steer.key)
                 return {
                     "ok": True,
                     "run_id": run_key,
+                    "steer_id": steer_key,
                     "steered": True,
                     "active": True,
                     "answered_question": answered,
                 }
-            if answered is not None:
-                message = "(Images attached to my reply to your questions.)"
         with run.control_lock:
             with self._lock:
-                if message in run.steers or any(
-                    queued == message for queued, _ in run.pending_steers
+                if steer.key in run.steers or any(
+                    queued.key == steer.key for queued in run.pending_steers
                 ):
                     return {
                         "ok": True,
                         "run_id": run_key,
+                        "steer_id": steer_key,
                         "steered": True,
                         "active": True,
                         "duplicate": True,
@@ -1163,93 +1535,164 @@ class ChudcodeSessionHost:
                 client = run.client
                 send_now = client is not None and run.started and not run.cancel_requested
                 if not send_now:
-                    run.pending_steers.append((message, images))
+                    run.pending_steers.append(steer)
+                elif from_user:
+                    # Tracked before the send: its user frame may be forwarded first.
+                    run.undelivered.append(steer)
             if send_now:
                 try:
                     client.steer(message, images=images or None)
                 except Exception as exc:  # noqa: BLE001 - RPC transport failures are retryable
+                    # The runtime may have accepted the message before its control
+                    # response failed. Keep correlation for a later user frame;
+                    # absent that evidence the GUI still reports this call failed.
                     return {
                         "ok": False,
                         "run_id": run_key,
+                        "steer_id": steer_key,
                         "steered": False,
                         "active": True,
                         "reason": str(exc),
                     }
                 with self._lock:
-                    run.steers.add(message)
+                    run.steers.add(steer.key)
         return {
             "ok": True,
             "run_id": run_key,
+            "steer_id": steer_key,
             "steered": True,
             "active": True,
             "queued": not send_now,
         }
 
-    def status(self, run_id=None, session_id=None) -> dict:
-        """Return a sanitized, mutation-free control-plane snapshot."""
-        run_key = _nonempty_string(run_id)
-        session_key = _nonempty_string(session_id)
+    def status(self, run_id=None, session_id=None, *, credential_params=None) -> dict:
+        """Return only the authenticated actor's control-plane snapshot."""
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
+        run_id = _nonempty_string(run_id)
+        session_id = _nonempty_string(session_id)
         with self._lock:
-            if run_key is not None:
-                active = self._runs.get(run_key)
-                if active is not None:
-                    return {
-                        "ok": True,
-                        "run_id": run_key,
-                        "active": True,
-                        "cancelled": active.cancel_requested,
-                        "started": active.started,
-                        "session_id": active.session_id,
-                    }
-                completed = self._completed_runs.get(run_key)
-                if completed is not None:
-                    return {
-                        "ok": True,
-                        "run_id": run_key,
-                        "active": False,
-                        "cancelled": bool(completed.get("cancelled")),
-                        "started": bool(completed.get("started")),
-                        "session_id": completed["session_id"],
-                    }
+            if run_id is not None:
+                key = tenancy.scoped_key(run_id)
+                active = self._runs.get(key)
+                completed = self._completed_runs.get(key)
+                record = active if active is not None else completed
+                if not _control_allowed(record, credential_params):
+                    if tenancy.in_cell() or record is not None:
+                        return _not_found()
+                    return {"ok": True, "run_id": run_id, "active": False,
+                            "cancelled": False, "started": False}
                 return {
-                    "ok": True,
-                    "run_id": run_key,
-                    "active": False,
-                    "cancelled": False,
-                    "started": False,
+                    "ok": True, "run_id": run_id, "active": active is not None,
+                    "cancelled": active.cancel_requested if active else bool(completed.get("cancelled")),
+                    "started": active.started if active else bool(completed.get("started")),
+                    "session_id": active.session_id if active else completed["session_id"],
                 }
-            if session_key is not None:
-                session = self._sessions.get(session_key)
-                active_runs = sorted(
-                    run.run_id
-                    for run in self._runs.values()
-                    if run.session_id == session_key
-                )
-                return {
-                    "ok": True,
-                    "session_id": session_key,
-                    "live_session": session is not None and not session.closed,
-                    "active_runs": active_runs,
-                }
+            if session_id is not None:
+                session = self._sessions.get(tenancy.scoped_key(session_id))
+                if not _control_allowed(session, credential_params):
+                    if tenancy.in_cell() or session is not None:
+                        return _not_found()
+                runs = sorted(run.run_id for run in self._runs.values()
+                              if run.session_id == session_id and _control_allowed(run, credential_params))
+                return {"ok": True, "session_id": session_id,
+                        "live_session": session is not None and not session.closed,
+                        "active_runs": runs}
             return {
                 "ok": True,
-                "sessions": len(self._sessions),
-                "active_runs": len(self._runs),
-                "max_sessions": self._max_sessions,
-                "shutdown": self._shutdown,
+                "sessions": sum(_control_allowed(s, credential_params) for s in self._sessions.values()),
+                "active_runs": sum(_control_allowed(r, credential_params) for r in self._runs.values()),
+                "max_sessions": self._max_sessions, "shutdown": self._shutdown,
             }
 
-    def close_session(self, session_id) -> dict[str, Any]:
+    def worker_activity(self) -> dict:
+        """Inspect existing ownership; idle SDKs require live settle/STT evidence."""
+        from services.worker_activity import registry_lock
+
+        owner = tenancy.owner_key()
+        with registry_lock(self._lock):
+            sessions = [s for s in self._sessions.values() if s.owner == owner]
+            runs = sum(r.owner == owner for r in self._runs.values())
+            clients = {s.client for s in sessions}
+            helpers = [c for c in self._helper_clients
+                       if getattr(c, "_chudware_activity_owner", None) == owner]
+            clients.update(helpers)
+            service = self._service_client
+            if service is not None and getattr(service, "_chudware_activity_owner", None) == owner:
+                clients.add(service)
+            counts = {"agent_runs": runs,
+                      "sdk_session_calls": sum(s.active_turns for s in sessions),
+                      "sdk_reservations": self._reserved_creations.get(owner, 0),
+                      "sdk_helpers": len(helpers),
+                      "sdk_service_calls": int(self._service_lock.locked())}
+            for client, probe in list(self._activity_probes.items()):
+                if probe.done.is_set():
+                    self._activity_probes.pop(client)
+            probes = {}
+            for client in clients:
+                process = getattr(client, "_process", None)
+                if process is not None and process.poll() is not None:
+                    continue
+                probe = self._activity_probes.get(client)
+                if probe is None:
+                    probe = _ActivityProbe()
+                    self._activity_probes[client] = probe
+                    thread = threading.Thread(
+                        target=_context_callback(_probe_sdk_activity),
+                        args=(client, probe), name="chudware-sdk-census", daemon=True)
+                    try:
+                        thread.start()
+                    except BaseException:
+                        self._activity_probes.pop(client, None)
+                        raise
+                probes[client] = probe
+        with registry_lock(self._catalog_refresh_lock):
+            counts["sdk_catalog_refresh"] = int(self._catalog_refreshing)
+            catalog = self._catalog_process
+        processes = [catalog] if catalog is not None and catalog.poll() is None else []
+        idle_clients = []
+        complete = True
+        # SDK requests retain their own response IDs and ordinary timeout. Only
+        # waiting for this census is bounded: do not change client timeouts, abort,
+        # close or consume another request's response when it takes longer.
+        deadline = time.monotonic() + 0.65
+        for client, probe in probes.items():
+            probe.done.wait(max(0.0, deadline - time.monotonic()))
+            if not probe.done.is_set():
+                complete = False
+            evidence = probe.result.copy() if probe.result is not None else None
+            if evidence is None:
+                complete = False
+                continue
+            if not probe.complete:
+                complete = False
+            for kind, count in evidence.items():
+                counts[kind] = counts.get(kind, 0) + count
+            process = getattr(client, "_process", None)
+            if any(evidence.values()):
+                if process is not None and process.poll() is None:
+                    processes.append(process)
+            elif process is not None and probe.complete:
+                idle_clients.append(client)
+        return {"by_kind": counts, "processes": processes,
+                "idle_clients": idle_clients, "complete": complete}
+
+    def close_session(self, session_id, *, credential_params=None) -> dict[str, Any]:
         """Dispose a live process without deleting or rewriting its session file."""
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
         key = _nonempty_string(session_id)
         if key is None:
             return {"ok": True}
         with self._lock:
-            session = self._sessions.get(key)
+            session = self._sessions.get(tenancy.scoped_key(key))
+            if not _control_allowed(session, credential_params) and (session is not None or tenancy.in_cell()):
+                return _not_found()
             if session is None or session.closed:
                 return {"ok": True}
             session.closed = True
-            runs = [run for run in self._runs.values() if run.session_id == key]
+            runs = [run for run in self._runs.values()
+                    if run.session_key == (session.registry_key or key)]
             for run in runs:
                 run.cancel_requested = True
             dispose = self._dispose_if_idle_locked(session)
@@ -1261,16 +1704,40 @@ class ChudcodeSessionHost:
             _stop_client(session.client)
         return {"ok": True}
 
+    def release_session(self, session_id, *, credential_params=None) -> dict[str, Any]:
+        """Stop an idle runtime before another worker resumes its persisted history."""
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
+        key = _nonempty_string(session_id)
+        with self._lock:
+            session = self._sessions.get(tenancy.scoped_key(key)) if key is not None else None
+            if not _control_allowed(session, credential_params) and (session is not None or tenancy.in_cell()):
+                return _not_found()
+            if session is None or session.closed:
+                return {"ok": True, "released": False}
+            if session.active_turns > 0 or any(
+                run.session_key == (session.registry_key or key) for run in self._runs.values()
+            ):
+                return {"ok": False, "reason": "session_busy"}
+            session.closed = True
+            session.dispose_started = True
+            self._sessions.pop(session.registry_key or key)
+        # Shutdown writes session_exit; the next owner must resume only after it lands.
+        _stop_client(session.client)
+        return {"ok": True, "released": True}
+
     def export_session(self, session_id, output_path=None) -> dict[str, Any]:
         """Export one live transcript through Chudcode and atomically publish it."""
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
         session = self._claim_live_session(session_id)
         if session is None:
-            return {"ok": False, "reason": "session_not_live"}
+            return _missing_session()
         temporary: Path | None = None
         try:
             with session.turn_lock:
                 if session.closed:
-                    return {"ok": False, "reason": "session_not_live"}
+                    return _missing_session()
                 try:
                     target = _project_export_path(
                         session.workspace_dir, session.session_id, output_path
@@ -1325,20 +1792,22 @@ class ChudcodeSessionHost:
 
     def branch_session(self, session_id, entry_id) -> dict[str, Any]:
         """Create a persisted child, capture its identity, then retire the mutated process."""
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
         key = _nonempty_string(session_id)
         branch_entry = _nonempty_string(entry_id)
         if key is None:
-            return {"ok": False, "reason": "session_not_live"}
+            return _missing_session()
         if branch_entry is None:
             return {"ok": False, "reason": "entry_id is required"}
         session = self._claim_live_session(key)
         if session is None:
-            return {"ok": False, "reason": "session_not_live"}
+            return _missing_session()
         dispose = False
         try:
             with session.turn_lock:
                 if session.closed:
-                    return {"ok": False, "reason": "session_not_live"}
+                    return _missing_session()
                 raw = _invoke_session_canonical(
                     session.client, "branch", {"entryId": branch_entry}
                 )
@@ -1360,6 +1829,8 @@ class ChudcodeSessionHost:
                     raise RuntimeError(
                         "Agent session branch returned no child session metadata"
                     )
+                if tenancy.in_cell():
+                    _session_link(key, session.credential_identity, child_file)
                 return {
                     "ok": True,
                     "chudcode_session_id": child_id,
@@ -1374,15 +1845,17 @@ class ChudcodeSessionHost:
 
     def repair_session(self, session_id, repair=False) -> dict[str, Any]:
         """Run Chudcode's local-only session doctor in an existing RPC process."""
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
         if not isinstance(repair, bool):
             return {"ok": False, "reason": "repair must be a boolean"}
         session = self._claim_live_session(session_id)
         if session is None:
-            return {"ok": False, "reason": "session_not_live"}
+            return _missing_session()
         try:
             with session.turn_lock:
                 if session.closed:
-                    return {"ok": False, "reason": "session_not_live"}
+                    return _missing_session()
                 try:
                     summary = _run_session_doctor(session.client, repair)
                 except (OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -1416,6 +1889,8 @@ class ChudcodeSessionHost:
         call); that process is always retired afterwards because it was spawned without
         the turn's prompt, tools, and credentials.
         """
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
         key = _nonempty_string(session_id)
         typed = user_text.strip() if isinstance(user_text, str) else ""
         if key is None:
@@ -1435,13 +1910,13 @@ class ChudcodeSessionHost:
         with self._lock:
             if self._shutdown:
                 return {"ok": False, "reason": "chudcode session host is shut down"}
-            if any(run.session_id == key for run in self._runs.values()):
+            if any(run.session_key == tenancy.scoped_key(key) for run in self._runs.values()):
                 return {"ok": False, "reason": "session_busy"}
         session = self._claim_live_session(key)
         spawned = False
         if session is None:
-            if resume_file is None:
-                return {"ok": False, "reason": "session_not_live"}
+            if resume_file is None or tenancy.in_cell():
+                return _missing_session()
             try:
                 session = self._get_or_create_session(
                     key, {"workspace_dir": workspace_dir}, resume_file
@@ -1456,8 +1931,8 @@ class ChudcodeSessionHost:
             try:
                 with self._lock:
                     if session.closed:
-                        return {"ok": False, "reason": "session_not_live"}
-                    if any(run.session_id == key for run in self._runs.values()):
+                        return _missing_session()
+                    if any(run.session_key == tenancy.scoped_key(key) for run in self._runs.values()):
                         return {"ok": False, "reason": "session_busy"}
                 client = session.client
                 state = _json_value(client.get_state())
@@ -1513,6 +1988,8 @@ class ChudcodeSessionHost:
                     )
                 if not Path(parent_file).expanduser().is_file():
                     raise RuntimeError("Agent session branch lost the parent session file")
+                if tenancy.in_cell():
+                    _session_link(key, session.credential_identity, child_file)
                 return {
                     "ok": True,
                     "chudcode_session_id": child_id,
@@ -1535,6 +2012,8 @@ class ChudcodeSessionHost:
             self._release_live_session(session)
 
     def shutdown(self):
+        if _delegate_refusal() is not None:
+            raise ValueError("forbidden_right")
         with self._lock:
             if self._shutdown:
                 return
@@ -1567,6 +2046,8 @@ class ChudcodeSessionHost:
 
     def transient_call(self, command, params=None, emit=None) -> dict[str, Any]:
         """Run a bounded service-level command without creating a saved session."""
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
         command_name = _nonempty_string(command)
         if command_name not in _TRANSIENT_SHAPES:
             raise ValueError(
@@ -1583,12 +2064,16 @@ class ChudcodeSessionHost:
         return self._transient_call(command_name, payload, emit=emit)
 
     def auth_call(self, command, params):
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
         command_name = _nonempty_string(command)
         if command_name not in _AUTH_SHAPES:
             raise ValueError(f"unsupported agent-service auth command: {command_name!r}")
         return self.transient_call(command_name, params)
 
     def memory_call(self, command, params):
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
         command_name = _nonempty_string(command)
         if command_name not in _MEMORY_SHAPES:
             raise ValueError(f"unsupported agent-service memory command: {command_name!r}")
@@ -1615,6 +2100,8 @@ class ChudcodeSessionHost:
         RPC startup/stop have their own bounded transport grace. No conversation is
         created or capped; RPC v2 exposes no per-request output-token limit.
         """
+        if _delegate_refusal() is not None:
+            raise HelperCompletionError("forbidden_right")
         message = _nonempty_string(prompt)
         if message is None:
             raise ValueError("helper completion prompt is empty")
@@ -1647,11 +2134,18 @@ class ChudcodeSessionHost:
         try:
             factory = self._rpc_factory()
             binary = self._resolve_binary(required=self._client_factory is None)
+            scoped_params = runtime_params or {}
             if compaction_settings is None:
-                from services.agent.config import online_compaction_settings
-
-                _, compaction_settings = online_compaction_settings()
-            workdir = tempfile.TemporaryDirectory(prefix="chudware-helper-")
+                inherited_compaction = _turn_compaction_settings(scoped_params)
+                if inherited_compaction:
+                    compaction_settings = inherited_compaction
+                else:
+                    from services.agent.config import online_compaction_settings
+                    _, compaction_settings = online_compaction_settings()
+            workdir = tempfile.TemporaryDirectory(
+                prefix="chudware-helper-",
+                dir=tenancy.actor_state_root() if tenancy.in_cell() else None,
+            )
             kwargs: dict[str, Any] = {
                 "tools": [],
                 "no_session": True,
@@ -1662,11 +2156,15 @@ class ChudcodeSessionHost:
                 "request_timeout": min(30.0, budget),
                 "cwd": workdir.name,
             }
-            scoped_params = runtime_params or {}
             provider_session_id = _nonempty_string(scoped_params.get("provider_session_id"))
             if provider_session_id is not None:
                 kwargs["provider_session_id"] = provider_session_id
             if _credential_scope(scoped_params) is not None:
+                if tenancy.in_cell():
+                    selected = _credential_scope(scoped_params)[2]
+                    expected = "google" if selected == "gemini" else selected
+                    if provider_id != expected or not model_id:
+                        raise HelperCompletionError("provider_grant_scope_mismatch")
                 credential_dir, _, clean_env = _credential_client_scope(
                     scoped_params, workdir.name, None)
                 kwargs["env"] = clean_env
@@ -1684,6 +2182,7 @@ class ChudcodeSessionHost:
                 if _binary_supports_flag(binary, "--no-mcp"):
                     extra += ("--no-mcp",)
                 kwargs["extra_args"] = extra
+            _sandbox_client_kwargs(kwargs, {**scoped_params, "mode": "ask"})
             client = factory(**kwargs)
             client._chudware_tempdir = credential_dir or workdir
             # Serialize startup against shutdown: no client may spawn after shutdown
@@ -1705,7 +2204,7 @@ class ChudcodeSessionHost:
                 ):
                     frames.append(frame)
 
-            unsubscribe = _register_listener(client, record)
+            unsubscribe = _register_listener(client, _context_callback(record))
 
             def complete() -> None:
                 try:
@@ -1741,7 +2240,7 @@ class ChudcodeSessionHost:
                 finally:
                     done.set()
 
-            worker = threading.Thread(target=complete, name="chudware-helper", daemon=True)
+            worker = threading.Thread(target=_context_callback(complete), name="chudware-helper", daemon=True)
             worker.start()
             while True:
                 with self._lock:
@@ -1785,6 +2284,8 @@ class ChudcodeSessionHost:
 
     def session_call(self, session_id, command, params=None, *, compaction_settings=None) -> dict[str, Any]:
         """Call one named live session; these calls never create or resume sessions."""
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
         command_name = _nonempty_string(command)
         if command_name not in _SESSION_SHAPES:
             raise ValueError(f"unsupported agent-session command: {command_name!r}")
@@ -1819,13 +2320,13 @@ class ChudcodeSessionHost:
 
         session = self._claim_live_session(session_id)
         if session is None:
-            return {"ok": False, "reason": "session_not_live"}
+            return _missing_session()
         try:
             if not session.turn_lock.acquire(blocking=command_name != "compact"):
                 return {"ok": False, "reason": "session_busy"}
             try:
                 if session.closed:
-                    return {"ok": False, "reason": "session_not_live"}
+                    return _missing_session()
                 if command_name == "compact" and compaction_settings is not None:
                     self._refresh_compaction(session, {
                         **session.launch_params,
@@ -1870,16 +2371,27 @@ class ChudcodeSessionHost:
         finally:
             self._release_live_session(session)
 
+    def session_launch_params(self, session_id) -> dict[str, Any]:
+        """Private child-call inheritance; never expose credential bytes over RPC."""
+        if _delegate_refusal() is not None:
+            raise ValueError("forbidden_right")
+        key = _nonempty_string(session_id)
+        with self._lock:
+            session = self._sessions.get(tenancy.scoped_key(key)) if key else None
+            if not _control_allowed(session) or session.closed:
+                raise KeyError("not_found")
+            return dict(session.launch_params)
+
     def _claim_live_session(self, session_id) -> _Session | None:
         key = _nonempty_string(session_id)
         if key is None:
             return None
         with self._lock:
-            session = self._sessions.get(key)
-            if session is None or session.closed:
+            session = self._sessions.get(tenancy.scoped_key(key))
+            if session is None or session.closed or not _control_allowed(session):
                 return None
             session.active_turns += 1
-            self._sessions.move_to_end(key)
+            self._sessions.move_to_end(tenancy.scoped_key(key))
             return session
 
     def _release_session_locked(self, session: _Session) -> bool:
@@ -1889,8 +2401,8 @@ class ChudcodeSessionHost:
     def _dispose_if_idle_locked(self, session: _Session) -> bool:
         if session.closed and session.active_turns == 0 and not session.dispose_started:
             session.dispose_started = True
-            if self._sessions.get(session.session_id) is session:
-                self._sessions.pop(session.session_id)
+            if self._sessions.get(session.registry_key or session.session_id) is session:
+                self._sessions.pop(session.registry_key or session.session_id)
             return True
         return False
 
@@ -1910,6 +2422,8 @@ class ChudcodeSessionHost:
             else None
         )
         credential_identity = _credential_identity(params)
+        session_key = tenancy.scoped_key(session_id)
+        owner = tenancy.owner_key()
         with self._lock:
             if self._shutdown:
                 raise RuntimeError("chudcode session host is shut down")
@@ -1918,7 +2432,7 @@ class ChudcodeSessionHost:
             )
             if existing is not None:
                 return existing
-            guard = self._creating.setdefault(session_id, _CreationGuard())
+            guard = self._creating.setdefault(session_key, _CreationGuard())
             guard.users += 1
         try:
             with guard.lock:
@@ -1933,7 +2447,7 @@ class ChudcodeSessionHost:
                         if existing is not None:
                             return existing
                         victim = self._evict_for_new_session()
-                        self._reserved_creations += 1
+                        self._reserved_creations[owner] = self._reserved_creations.get(owner, 0) + 1
                         reserved = True
                     if victim is not None:
                         _stop_client(victim.client)
@@ -1961,9 +2475,11 @@ class ChudcodeSessionHost:
                                 active_turns=1,
                                 compaction_settings=_turn_compaction_settings(params),
                                 launch_params=_client_launch_params(params),
+                                registry_key=session_key,
+                                sandbox_class=_sandbox_class(params),
                             )
-                            self._sessions[session_id] = session
-                            self._reserved_creations -= 1
+                            self._sessions[session_key] = session
+                            self._reserved_creations[owner] -= 1
                             reserved = False
                         return session
                     except Exception:  # noqa: BLE001 - even RPC-specific errors need teardown
@@ -1972,24 +2488,25 @@ class ChudcodeSessionHost:
                 finally:
                     if reserved:
                         with self._lock:
-                            self._reserved_creations -= 1
+                            self._reserved_creations[owner] -= 1
         finally:
             with self._lock:
                 guard.users -= 1
                 if not guard.users:
-                    self._creating.pop(session_id, None)
+                    self._creating.pop(session_key, None)
 
     def _claim_existing_session_locked(
         self, session_id: str, resume_file: str | None, workspace_dir: str | None,
         credential_identity: str | None,
     ) -> _Session | None:
-        existing = self._sessions.get(session_id)
+        session_key = tenancy.scoped_key(session_id)
+        existing = self._sessions.get(session_key)
         if existing is None:
             return None
         if existing.closed:
             raise RuntimeError("agent RPC session is closing")
-        if existing.credential_identity != credential_identity:
-            raise RuntimeError("cannot change agent credential identity on a live session")
+        if not tenancy.owns(existing.owner) or existing.credential_identity != credential_identity:
+            raise KeyError("not_found")
         if (
             resume_file
             and existing.resume_file
@@ -2000,18 +2517,19 @@ class ChudcodeSessionHost:
             )
         if existing.workspace_dir is None and workspace_dir is not None:
             existing.workspace_dir = workspace_dir
-        self._sessions.move_to_end(session_id)
+        self._sessions.move_to_end(session_key)
         existing.active_turns += 1
         return existing
 
     def _evict_for_new_session(self) -> _Session | None:
-        if len(self._sessions) + self._reserved_creations < self._max_sessions:
+        owned = sum(tenancy.owns(session.owner) for session in self._sessions.values())
+        if owned + self._reserved_creations.get(tenancy.owner_key(), 0) < self._max_sessions:
             return None
         victim_key = next(
             (
                 key
                 for key, value in self._sessions.items()
-                if value.active_turns == 0 and not value.closed
+                if tenancy.owns(value.owner) and value.active_turns == 0 and not value.closed
             ),
             None,
         )
@@ -2041,6 +2559,7 @@ class ChudcodeSessionHost:
         *,
         no_session: bool,
         resume_file: str | None = None,
+        metadata_only: bool = False,
     ) -> Any:
         factory = self._rpc_factory()
 
@@ -2065,13 +2584,20 @@ class ChudcodeSessionHost:
         if no_session:
             from services.agent.config import memory_backend
 
-            memory = memory_backend()
-            if binary is not None and not _binary_has_memory_backend(binary, memory):
+            memory = "off" if metadata_only else memory_backend()
+            if not metadata_only and binary is not None and not _binary_has_memory_backend(binary, memory):
                 memory = "mnemo"
             if binary is not None and _binary_supports_flag(binary, "--config"):
                 overlay = _cad_session_overlay(memory)
                 if overlay is not None:
                     kwargs["extra_args"] = ("--config", overlay)
+        if metadata_only:
+            if tempdir is None or "--config" not in kwargs.get("extra_args", ()):
+                if tempdir is not None:
+                    tempdir.cleanup()
+                raise ValueError("credential_isolation_unsupported")
+            kwargs.update(tools=[], no_skills=True, no_rules=True, cwd=tempdir.name)
+            kwargs["extra_args"] = ("--no-lsp", "--no-mcp", *kwargs["extra_args"])
         if clean_env is not None:
             kwargs["env"] = clean_env
         if binary is not None:
@@ -2108,6 +2634,8 @@ class ChudcodeSessionHost:
                 if binary is not None and _binary_supports_flag(binary, "--config")
                 else None
             )
+            if tenancy.in_cell() and overlay is None:
+                raise RuntimeError("cell_refused")
             if overlay is None and _turn_compaction_settings(params) and self._client_factory is None:
                 raise RuntimeError("Cannot apply the selected compaction settings: runtime --config support is required")
             tools = list(CAD_SESSION_TOOLS)
@@ -2119,7 +2647,13 @@ class ChudcodeSessionHost:
             kwargs["tools"] = tools
             kwargs["extra_args"] = extra
         try:
+            _sandbox_client_kwargs(kwargs, params)
             client = factory(**kwargs)
+            client._chudware_activity_owner = tenancy.owner_key()
+            client._chudware_activity_sandboxed = tenancy.in_cell()
+            client._chudware_activity_sdk_argv = (
+                tuple(kwargs["command"][4:]) if tenancy.in_cell()
+                else tuple(getattr(client, "command", ())))
             if tempdir is not None:
                 client._chudware_tempdir = tempdir
             return client
@@ -2169,7 +2703,10 @@ class ChudcodeSessionHost:
         a new connection avoid racing its config watcher or changing another run.
         """
         settings = _turn_compaction_settings(params)
-        if settings == session.compaction_settings:
+        sandbox_class = _sandbox_class(params)
+        # Upstream-key rotation is broker-owned and leaves this client intact.
+        if (settings == session.compaction_settings
+                and sandbox_class == session.sandbox_class):
             return
         state = _safe_client_state(session.client)
         if state.get("isStreaming") or state.get("hasPendingAsyncWork"):
@@ -2191,12 +2728,14 @@ class ChudcodeSessionHost:
             session.client = replacement
         _stop_client(old_client)
         try:
-            replacement.switch_session(resume_file)
+            if resume_file is not None:
+                replacement.switch_session(resume_file)
             if settings.get("enabled", True) and session.auto_compaction is not None:
                 replacement.set_auto_compaction(session.auto_compaction)
             if session.auto_retry is not None:
                 replacement.set_auto_retry(session.auto_retry)
             session.compaction_settings = settings
+            session.sandbox_class = sandbox_class
             session.launch_params = _client_launch_params(params)
         except Exception:
             with self._lock:
@@ -2233,6 +2772,11 @@ class ChudcodeSessionHost:
             provider, model = model.split("/", 1)
         if provider:
             provider = _CHUDCODE_PROVIDER_ALIASES.get(provider, provider)
+        if tenancy.in_cell():
+            selected = _credential_scope(params)[2]
+            expected = "google" if selected == "gemini" else selected
+            if provider != expected or not model:
+                raise ValueError("provider_grant_scope_mismatch")
         if provider and model:
             try:
                 client.set_model(provider, model)
@@ -2299,6 +2843,31 @@ class ChudcodeSessionHost:
         registrar = params.get("register_callbacks")
         if callable(registrar):
             registrar(client)
+        session.launch_params = _client_launch_params(params)
+
+    def cell_catalog_models(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        """Read the native catalog with one actor/provider broker capability."""
+        if not tenancy.in_cell() or _delegate_refusal() is not None:
+            raise ValueError("cell_refused")
+        client = self._make_client({**params, "mode": "ask"}, no_session=True, metadata_only=True)
+        registered = False
+        try:
+            with self._lock:
+                if self._shutdown:
+                    raise RuntimeError("chudcode session host is shut down")
+                self._helper_clients.add(client)
+                registered = True
+                _start_client(client)
+            result = _json_value(_invoke_canonical(client, "get_available_models", {}))
+            if not isinstance(result, dict) or not isinstance(result.get("models"), list):
+                raise TypeError("native catalog returned an invalid model list")
+            return result
+        finally:
+            with self._lock:
+                owned = client in self._helper_clients
+                self._helper_clients.discard(client)
+                if owned or not registered:
+                    _stop_client(client)
 
     def _service_client_locked(self) -> Any:
         """Return the shared no-session process for the current GUI memory backend.
@@ -2307,6 +2876,8 @@ class ChudcodeSessionHost:
         memory commands and conversations use the same selected backend; auth/catalog
         calls continue to share this single service process.
         """
+        if tenancy.in_cell():
+            raise ValueError("credential_isolation_unsupported")
         from services.agent.config import memory_backend
 
         backend = memory_backend()
@@ -2336,6 +2907,8 @@ class ChudcodeSessionHost:
         Only the no-session service is recycled; conversation processes and active
         turns are never stopped. A fresh catalog reaches the GUI on its next poll.
         """
+        if tenancy.in_cell():
+            return False
         with self._catalog_refresh_lock:
             if self._shutdown:
                 return False
@@ -2460,7 +3033,8 @@ def _project_export_path(
     if not root.is_dir():
         raise ValueError("project_root_unavailable")
     if output_path is None:
-        basename = re.sub(r"[^A-Za-z0-9._-]+", "-", session_id).strip(".-")
+        basename = (uuid.uuid4().hex if tenancy.in_cell()
+                    else re.sub(r"[^A-Za-z0-9._-]+", "-", session_id).strip(".-"))
         requested = root / "chat-exports" / f"{basename or 'session'}.html"
     else:
         if not isinstance(output_path, (str, os.PathLike)):
@@ -2812,6 +3386,27 @@ def _tool_execution_phase(frame: Mapping[str, Any]) -> tuple[str, str, str]:
     return call_id, phase, _nonempty_string(body.get("toolName")) or ""
 
 
+def _collect_host_tool_recoveries(
+    host_tools: Any, recoveries: dict[int, Any], *,
+    contexts: Sequence[dict[str, Any]] = (),
+) -> None:
+    """Retain each run-owned recovery, including metadata-only bindings."""
+    sources = list(contexts)
+    if isinstance(host_tools, Sequence) and not isinstance(host_tools, (str, bytes)):
+        for binding in host_tools:
+            sources.extend((getattr(binding, "context", None),
+                            getattr(binding, "metadata", None)))
+    if not sources:
+        return
+    from services.agent.agent_turn import _ToolCallRecovery
+    from services.agent.chudcode_tools import _ctx
+
+    for source in sources:
+        recovery = _ctx(source, "tool_call_recovery", None)
+        if isinstance(recovery, _ToolCallRecovery):
+            recoveries[id(recovery)] = recovery
+
+
 def _bind_host_call_observer(
     host_tools: Any, observer: Callable[[dict[str, Any]], None]
 ) -> list[dict[str, Any]]:
@@ -3053,11 +3648,19 @@ def _session_memory_backend(params: Mapping[str, Any], workspace: str | None) ->
 
 def _client_launch_params(params: Mapping[str, Any]) -> dict[str, Any]:
     # Retain process identity, not a turn's prompt, callbacks, or CAD tool bindings.
-    return {key: params[key] for key in (
+    launch = {key: params[key] for key in (
         "workspace_dir", "chudcode_session_dir", "system_prompt", "memory_backend",
         "web_actor", "web_key_source", "web_tenant", "web_provider", "web_credential",
+        "web_provider_grant",
         "byok_key", "byok_tenant", "byok_provider",
+        "mode", "plan_only", "turn_preferences",
     ) if key in params}
+    settings = params.get("settings")
+    if isinstance(settings, Mapping):
+        launch["settings"] = {key: settings[key] for key in (
+            "provider", "model", "compaction_strategy", "compaction_settings",
+        ) if key in settings}
+    return launch
 
 
 def _turn_compaction_settings(params: Mapping[str, Any]) -> dict[str, Any]:
@@ -3071,10 +3674,14 @@ def _cad_session_overlay(memory: str, compaction: Mapping[str, Any] | None = Non
     from services import paths
 
     content = _CAD_SESSION_SETTINGS + _CAD_MEMORY_SETTINGS[memory]
+    if tenancy.in_cell():
+        content = content.replace("browser.enabled: true", "browser.enabled: false")
+        content = content.replace("computer.enabled: true", "computer.enabled: false")
     if compaction:
         content += "compaction: " + json.dumps(dict(compaction), sort_keys=True) + "\n"
     digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
-    target = Path(paths.ROOT) / "chudcode" / f"cad-session-{memory}-{digest}.yml"
+    root = tenancy.actor_state_root() if tenancy.in_cell() else Path(paths.ROOT)
+    target = root / "chudcode" / f"cad-session-{memory}-{digest}.yml"
     try:
         if target.is_file() and target.read_text(encoding="utf-8") == content:
             return str(target)
@@ -3084,7 +3691,7 @@ def _cad_session_overlay(memory: str, compaction: Mapping[str, Any] | None = Non
             handle.write(content)
         os.replace(tmp, target)
     except OSError as exc:
-        if compaction:
+        if compaction or tenancy.in_cell():
             raise RuntimeError("Cannot write the selected compaction settings") from exc
         _LOG.warning("CAD session settings overlay unavailable: %s", exc)
         return None
@@ -3149,7 +3756,23 @@ def _nonempty_string(value: Any) -> str | None:
 
 
 def _start_client(client: Any) -> None:
+    if type(client).__module__.startswith("chudcode_rpc."):
+        from services.worker_activity import note_sdk_launch
+
+        note_sdk_launch(sandboxed=bool(getattr(client, "_chudware_activity_sandboxed", False)))
     client.start()
+    process = getattr(client, "_process", None)
+    if process is not None:
+        from services.worker_activity import capture_sdk_identity, process_identity
+
+        try:
+            client._chudware_activity_identity = process_identity(process)
+            client._chudware_activity_sdk_identity = capture_sdk_identity(client)
+        except (OSError, ValueError, RuntimeError):
+            # Missing process-census capability must not prevent ordinary jobs
+            # from starting; their later maintenance census remains unknown.
+            client._chudware_activity_identity = None
+            client._chudware_activity_sdk_identity = None
     protocol_version = getattr(
         client, "protocol_version", getattr(client, "_protocol_version", None)
     )
@@ -3190,36 +3813,61 @@ def _validate_service_payload(command: str, payload: Mapping[str, Any]) -> None:
         raise TypeError(f"{command} accountId must be a non-empty string")
 
 
+_PROMPT_MAX_IMAGES = 8
+_PROMPT_MAX_SOURCE_BYTES = 20 * 1024 * 1024
+_PROMPT_MAX_ATTACHMENTS = 32
+
+
 def _prompt_payload(
     prompt: str, attachments_value: Any, images_value: Any
 ) -> tuple[str, list[dict[str, Any]]]:
+    from services.agent.tool_images import ImageUnavailable, read_image_bytes
+
     images: list[dict[str, Any]] = []
     file_refs: list[str] = []
-    if isinstance(images_value, Sequence) and not isinstance(
-        images_value, (str, bytes)
-    ):
+    remaining = _PROMPT_MAX_SOURCE_BYTES
+
+    def add_inline(image: Mapping[str, Any]) -> None:
+        nonlocal remaining
+        data = image.get("data")
+        if len(images) >= _PROMPT_MAX_IMAGES:
+            raise ValueError("attachment_image_count_exceeded")
+        if not isinstance(data, str) or len(data) > 4 * ((remaining + 2) // 3):
+            raise ValueError("attachment_image_bytes_exceeded")
+        # Bound before any encoding/copying; the runtime owns image decoding.
+        source_bytes = (len(data) // 4) * 3 + (3 if len(data) % 4 else 0)
+        if len(data) % 4 == 0:
+            source_bytes -= 2 if data.endswith("==") else int(data.endswith("="))
+        if source_bytes > remaining:
+            raise ValueError("attachment_image_bytes_exceeded")
+        if not data or not data.isascii():
+            raise ValueError("attachment_image_data_invalid")
+        remaining -= source_bytes
+        images.append({
+            "type": "image",
+            "mimeType": image.get("mimeType") or image.get("mime") or "application/octet-stream",
+            "data": data,
+        })
+
+    if isinstance(images_value, Sequence) and not isinstance(images_value, (str, bytes)):
+        if len(images_value) > _PROMPT_MAX_IMAGES:
+            raise ValueError("attachment_image_count_exceeded")
         for image in images_value:
             if isinstance(image, Mapping):
-                images.append(dict(image))
+                add_inline(image)
     attachments = (
         attachments_value
         if isinstance(attachments_value, Sequence)
         and not isinstance(attachments_value, (str, bytes))
         else ()
     )
+    if len(attachments) > _PROMPT_MAX_ATTACHMENTS:
+        raise ValueError("attachment_count_exceeded")
     for attachment in attachments:
         if not isinstance(attachment, Mapping):
             continue
         if "data" in attachment:
-            images.append(
-                {
-                    "type": "image",
-                    "mimeType": attachment.get("mimeType")
-                    or attachment.get("mime")
-                    or "application/octet-stream",
-                    "data": attachment["data"],
-                }
-            )
+            add_inline(attachment)
             continue
         path_value = _nonempty_string(attachment.get("path"))
         kind = _nonempty_string(attachment.get("kind"))
@@ -3227,23 +3875,26 @@ def _prompt_payload(
             attachment.get("mimeType")
         )
         if path_value and (kind == "image" or (mime and mime.startswith("image/"))):
+            if len(images) >= _PROMPT_MAX_IMAGES:
+                raise ValueError("attachment_image_count_exceeded")
             path = Path(path_value).expanduser()
-            images.append(
-                {
-                    "type": "image",
-                    "mimeType": mime
-                    or mimetypes.guess_type(path.name)[0]
-                    or "application/octet-stream",
-                    "data": base64.b64encode(path.read_bytes()).decode("ascii"),
-                }
-            )
+            try:
+                raw = read_image_bytes(str(path), max_bytes=remaining)
+            except ImageUnavailable as exc:
+                raise ValueError(f"attachment_image_unavailable: {exc}") from exc
+            if not raw:
+                raise ValueError("attachment_image_data_invalid")
+            remaining -= len(raw)
+            images.append({
+                "type": "image",
+                "mimeType": mime or mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+                "data": base64.b64encode(raw).decode("ascii"),
+            })
         elif path_value:
             name = _nonempty_string(attachment.get("name")) or Path(path_value).name
             file_refs.append(f"- {name}: {path_value}")
     if file_refs:
-        prompt = (
-            prompt.rstrip() + "\n\nAttached workspace files:\n" + "\n".join(file_refs)
-        )
+        prompt = prompt.rstrip() + "\n\nAttached workspace files:\n" + "\n".join(file_refs)
     return prompt, images
 
 
@@ -3262,6 +3913,36 @@ def _camel(name: str) -> str:
         return override
     head, *tail = name.split("_")
     return head + "".join(piece[:1].upper() + piece[1:] for piece in tail)
+
+
+def _steer_status_frame(run: _Run, steer: _Steer, status: str) -> dict[str, Any]:
+    """``agent_steer`` frame: ``delivered`` (the model has it) or ``carried``
+    (withdrawn before delivery; it opens the conversation's next prompt)."""
+    return {
+        "type": "agent_steer",
+        "run_id": run.run_id,
+        "session_id": run.session_id,
+        "steer_id": steer.steer_id,
+        "status": status,
+    }
+
+
+def _user_frame_text(frame: Mapping[str, Any]) -> str | None:
+    """Text of a streamed user message frame; None for any other role."""
+    message = frame.get("message")
+    if not isinstance(message, Mapping) or message.get("role") != "user":
+        return None
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    return "".join(
+        part.get("text", "")
+        for part in content
+        if isinstance(part, Mapping) and part.get("type") == "text"
+        and isinstance(part.get("text"), str)
+    )
 
 
 def _json_value(value: Any) -> Any:
@@ -3421,6 +4102,45 @@ def _safe_last_assistant_text(client: Any) -> str | None:
 _DEFAULT_CHUDCODE_HOST: ChudcodeSessionHost | None = None
 _DEFAULT_CHUDCODE_HOST_LOCK = threading.Lock()
 
+def worker_activity() -> dict:
+    host = _DEFAULT_CHUDCODE_HOST
+    return host.worker_activity() if host is not None else {"by_kind": {}}
+
+
+def _probe_sdk_activity(client: Any, probe: _ActivityProbe) -> None:
+    try:
+        # Inspect raw fields: the pinned SDK's typed parser supplies false defaults
+        # for absent fields, which cannot establish a truthful idle attestation.
+        state = client._request("get_state")
+        flags = ("isStreaming", "isCompacting", "hasPendingAsyncWork", "isSettled")
+        if (not isinstance(state, dict) or any(type(state.get(k)) is not bool for k in flags)
+                or type(state.get("queuedMessageCount")) is not int
+                or state["queuedMessageCount"] < 0):
+            return
+        with client._state_lock:
+            pending = len(client._pending)
+        with client._event_condition:
+            prompts = len(client._pending_prompt_ids)
+        host_calls = len(client._pending_host_tool_calls) + len(client._pending_host_uri_requests)
+        probe.result = {
+            "sdk_runtime": int(state["isStreaming"] or state["isCompacting"]
+                               or state["hasPendingAsyncWork"] or not state["isSettled"]),
+            "sdk_queued_messages": state["queuedMessageCount"],
+            "sdk_pending_calls": pending + prompts + host_calls,
+        }
+        stt = client._request("stt_status")
+        if not isinstance(stt, dict) or stt.get("state") not in {"idle", "recording", "transcribing"}:
+            return
+        probe.result["sdk_stt"] = int(stt["state"] != "idle")
+        probe.complete = True
+    except Exception:
+        # Missing capability, death, malformed state and a transport failure are
+        # unknown; never infer idle from an empty persistent session registry.
+        pass
+    finally:
+        probe.done.set()
+
+
 
 def get_default_chudcode_host() -> ChudcodeSessionHost:
     """Return the worker process's single lazily-created Chudcode session pool."""
@@ -3443,3 +4163,104 @@ def _set_default_chudcode_host_for_tests(
         previous = _DEFAULT_CHUDCODE_HOST
         _DEFAULT_CHUDCODE_HOST = host
         return previous
+
+def _sandbox_class(params: Mapping[str, Any]) -> str:
+    preferences = params.get("turn_preferences")
+    readonly = (params.get("plan_only") or params.get("mode") in ("ask", "plan")
+                or getattr(preferences, "mode", None) in ("ask", "plan"))
+    return "ro" if tenancy.in_cell() and readonly else "rw"
+
+
+def _context_callback(callback):
+    """RPC readers and timers never inherit contextvars from the request thread."""
+    ctx = tenancy.current_context()
+    project = tenancy.root_value("CHUDWARE_PROJECT_DIR")
+    save = tenancy.root_value("CHUDWARE_PROJECT_SAVE_DIR")
+
+    def bound(*args, **kwargs):
+        with tenancy.bind_context(ctx), tenancy.bind_roots(project, save):
+            return callback(*args, **kwargs)
+
+    return bound
+
+
+def _not_found() -> dict[str, Any]:
+    return {"ok": False, "reason": "not_found", "code": "not_found"}
+
+
+def _control_allowed(record, credential_params=None) -> bool:
+    if record is None:
+        return False
+    owner = record.get("_owner") if isinstance(record, Mapping) else record.owner
+    identity = (record.get("_credential_identity") if isinstance(record, Mapping)
+                else record.credential_identity)
+    if not tenancy.owns(owner):
+        return False
+    if credential_params is not None and any(
+        key in credential_params for key in ("web_key_source", "web_actor", "byok_key")
+    ):
+        try:
+            return identity == _credential_identity(credential_params)
+        except ValueError:
+            return False
+    # Desktop has one local principal; cell controls use the trusted actor lane.
+    return True
+
+
+def _sandbox_client_kwargs(kwargs: dict[str, Any], params: Mapping[str, Any]) -> None:
+    if not tenancy.in_cell():
+        return
+    if not kwargs.get("executable"):
+        raise ValueError("cell_refused")
+    # Public SDK seam: construct an unstarted client solely to obtain the exact CLI.
+    # Passing command back through the constructor leaves all flags SDK-owned.
+    from chudcode_rpc import RpcClient
+
+    argv = list(RpcClient(**kwargs).command)
+    kwargs["command"] = tenancy.sandbox_argv(argv, _sandbox_class(params))
+
+
+def _session_link(session_id: str, identity: str | None, path: str | None = None) -> str | None:
+    """Persist opaque conversation → history bindings, never handles in filenames."""
+    root = tenancy.actor_state_root()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    database = root / "chudcode-session-links.sqlite"
+    if database.is_symlink():
+        raise ValueError("cell_refused")
+    with sqlite3.connect(database) as db:
+        database.chmod(0o600)
+        db.execute("CREATE TABLE IF NOT EXISTS links "
+                   "(handle TEXT PRIMARY KEY, credential TEXT NOT NULL, file TEXT NOT NULL)")
+        key = tenancy.scoped_key(session_id)
+        row = db.execute("SELECT credential, file FROM links WHERE handle=?", (key,)).fetchone()
+        if row is not None and row[0] != identity:
+            raise KeyError("not_found")
+        if path is not None:
+            target = Path(path).resolve()
+            if not target.is_relative_to(root.resolve()):
+                raise ValueError("cell_refused")
+            db.execute("INSERT INTO links(handle,credential,file) VALUES(?,?,?) "
+                       "ON CONFLICT(handle) DO UPDATE SET file=excluded.file",
+                       (key, identity, str(target)))
+            return str(target)
+        return row[1] if row is not None else None
+
+
+def _missing_session() -> dict[str, Any]:
+    return _not_found() if tenancy.in_cell() else {"ok": False, "reason": "session_not_live"}
+
+
+def _forbidden_right() -> dict[str, Any]:
+    return {"ok": False, "reason": "forbidden_right", "code": "forbidden_right"}
+
+
+def _delegate_refusal() -> dict[str, Any] | None:
+    return _forbidden_right() if "control_delegate" in tenancy.current_context() else None
+
+
+
+def _stop_audit(run: _Run) -> dict[str, Any]:
+    if run.cancel_reason != "manager_stop" or run.control_delegate is None:
+        return {}
+    return {"reason": "manager_stop", "stop_reason": "manager_stop",
+            "control_delegate": dict(run.control_delegate)}

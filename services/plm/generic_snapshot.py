@@ -30,7 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from services.plm import doctypes, snapshot
@@ -50,6 +50,16 @@ _EXCLUDE_DIR_PREFIXES = ("build",)  # build, build-linux, build-occt, …
 # default floor.
 DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024
 
+_RESERVED_CONTROL_PATHS = frozenset({
+    ".aicadvault", ".git", ".svn", ".hg", ".chudware", ".gitmodules", ".gitattributes",
+})
+
+
+def _reserved_control_part(part: str) -> bool:
+    # NTFS normalizes trailing dots/spaces and interprets ':' as an ADS suffix.
+    # Apply only to reserved names so benign POSIX colon filenames remain valid.
+    return part.split(":", 1)[0].rstrip(". ").casefold() in _RESERVED_CONTROL_PATHS
+
 
 def _sha(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()  # noqa: S324 — content id, not security
@@ -59,15 +69,30 @@ def _raise_walk_error(error: OSError) -> None:
     raise error
 
 def contained_path(root: Path, rel: str) -> Path:
-    """Resolve a manifest path without allowing traversal or symlink escape."""
+    """Reject traversal, reserved control paths and symlink escapes."""
     from services.plm.vault import VaultError
 
     root = root.resolve()
-    if not rel or Path(rel).is_absolute():
+    if (not isinstance(rel, str) or not rel or Path(rel).is_absolute()
+            or PureWindowsPath(rel).is_absolute() or PureWindowsPath(rel).drive):
         raise VaultError("invalid_mode", f"item path is outside the project: {rel}")
+    rel = rel.replace("\\", "/")
+    parts = rel.split("/")
+    if ".." in parts:
+        raise VaultError("invalid_mode", f"item path is outside the project: {rel}")
+    if any(p in ("", ".") or _reserved_control_part(p) for p in parts):
+        raise VaultError("invalid_mode", f"item path targets a reserved or invalid path: {rel}")
     candidate = (root / rel).resolve()
     if candidate == root or not candidate.is_relative_to(root):
         raise VaultError("invalid_mode", f"item path is outside the project: {rel}")
+    resolved_parts = candidate.relative_to(root).parts
+    if any(_reserved_control_part(p) for p in resolved_parts):
+        raise VaultError("invalid_mode", f"item path targets reserved project control data: {rel}")
+    for parent in candidate.parents:
+        if parent == root:
+            break
+        if parent.exists() and not parent.is_dir():
+            raise VaultError("invalid_mode", f"item path parent is not a directory: {rel}")
     return candidate
 
 
@@ -160,6 +185,9 @@ LINK_SCHEMA = "aicad.plm.link/1"
 
 def new_link_doc(url: str, name: str) -> bytes:
     """The initial ``link.json`` for a linked external repository."""
+    from services.plm.git_security import reject_location_credentials
+
+    reject_location_credentials(url)
     doc = {"schema": LINK_SCHEMA, "url": url, "name": name, "pins": []}
     return json.dumps(doc, indent=2, sort_keys=True).encode("utf-8")
 

@@ -673,8 +673,8 @@ def _calibrate_face_frame(doc_id: str, face_query: dict, origin) -> Optional[dic
     """Recover the hole-position frame of a planar face EMPIRICALLY: hole `positions` are
     [u,v] mm in the face's OCCT surface-parameter axes (gp_Pln XAxis/YAxis) about the area
     centroid — axes that are not analytically derivable from the query face card. So: drill a
-    tiny 2-position probe hole (checkpointed), locate the two probe bores, derive the u/v unit
-    directions, and revert. Deterministic and self-verifying; returns {"o", "xhat", "yhat"}
+    tiny 2-position probe hole, locate the two probe bores, derive the u/v unit directions,
+    and delete only the probe. Deterministic and self-verifying; returns {"o", "xhat", "yhat"}
     or None when the probe can't run (the caller then degrades those holes to candidates)."""
     try:
         fw = cb.call("doc_face_wires", {"doc_id": doc_id, "face": face_query})
@@ -689,7 +689,7 @@ def _calibrate_face_frame(doc_id: str, face_query: dict, origin) -> Optional[dic
         if d2 < 1.0:
             return None
         before = {f.get("sid") for f in _query_faces(doc_id)}
-        ck = cb.call("doc_checkpoint", {"doc_id": doc_id}).get("checkpoint")
+        probe_id = None
         probe_r = 0.4
         try:
             r = cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": [{
@@ -699,6 +699,8 @@ def _calibrate_face_frame(doc_id: str, face_query: dict, origin) -> Optional[dic
                                "diameter": _dim(2 * probe_r), "end": "through_all",
                                "positions": [[d1, 0.0], [0.0, d2]]},
                     "refs": {"face": face_query}}}]})
+            if not r.get("rejected_tree"):
+                probe_id = (r.get("id_map") or {}).get("$0")
             ok, _bad = _feature_ok(r)
             if not ok:
                 return None
@@ -717,8 +719,9 @@ def _calibrate_face_frame(doc_id: str, face_query: dict, origin) -> Optional[dic
                 return None
             return {"o": origin, "xhat": got["x"], "yhat": got["y"]}
         finally:
-            if ck:
-                cb.call("doc_revert", {"doc_id": doc_id, "checkpoint": ck})
+            if probe_id:
+                cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": [
+                    {"op": "delete_feature", "id": probe_id}]})
     except Exception:  # noqa: BLE001
         return None
 
@@ -1839,7 +1842,7 @@ def register_recon_tools(mcp: FastMCP) -> None:
         return out
 
     @mcp.tool()
-    def project_into_sketch(sketch: str, refs: Union[list, dict],
+    def project_into_sketch(sketch: str, refs: Union[list, dict, str],
                             doc_id: Optional[str] = None,
                             construction: bool = False,
                             associative: bool = True) -> str:
@@ -1881,6 +1884,16 @@ def register_recon_tools(mcp: FastMCP) -> None:
                         A face ref projects ALL its boundary wires (outer + hole loops).
           Edge:         "E<sid>"  (an edge sid from describe_part, e.g. "E4a7c9")
                         OR  {"kind": "edge", "selector": {"sid": "E4a7c9"}}
+          Vertex:       "V<sid>" OR {"kind":"vertex","selector":{"sid":"V..."}}
+                        -> a projected point.
+          Pierce:       {"kind":"edge","selector":{"sid":"E..."},"mode":"pierce",
+                         "near":[u,v]} -> the curve/plane crossing nearest near (optional).
+                        A curve with no crossing fails, rather than projecting a fake point.
+          Datum axis:   {"datum":"axis.x"|"axis.y"|"axis.z"} (or that string);
+                        {"datum":"origin"} -> projected model origin.
+          Other sketch: {"kind":"sketch_entity","sketch":"f1","entity":"e2"}.
+        Use construction=True for references, then coincident/point_on/tangent/distance
+        relations from your profile to the returned entity_ids; external fix pins are legitimate.
 
         Examples:
           project_into_sketch("s2", "front")
@@ -1905,7 +1918,7 @@ def register_recon_tools(mcp: FastMCP) -> None:
             raw = refs if isinstance(refs, list) else [refs]
             norm_refs: list = []
 
-            _DATUMS = {"front", "top", "right"}
+            _DATUMS = {"front", "top", "right", "axis.x", "axis.y", "axis.z", "origin"}
             _SIDES = {"top", "bottom", "left", "right", "front", "back"}
 
             for ref in raw:
@@ -1939,6 +1952,14 @@ def register_recon_tools(mcp: FastMCP) -> None:
                                        f"no edge with sid {s!r} (call describe_part or "
                                        f"query_geometry to list edge sids)"})
                     norm_refs.append({"kind": "edge", "selector": match})
+                elif s.startswith("V"):
+                    got = cb.call("doc_query", {"doc_id": d,
+                                                "query": {"of": "vertex"}}).get("matches", [])
+                    match = next((m for m in got if m.get("sid") == s), None)
+                    if match is None:
+                        return _dumps({"ok": False, "error":
+                                       f"no vertex with sid {s!r}; use query_geometry(of='vertex')"})
+                    norm_refs.append({"kind": "vertex", "selector": match})
                 elif s in _SIDES:
                     # Side word for a face — resolve via doc_query
                     got = cb.call("doc_query", {"doc_id": d,
@@ -1951,9 +1972,9 @@ def register_recon_tools(mcp: FastMCP) -> None:
                     norm_refs.append({"kind": "face", "selector": got[0]})
                 else:
                     return _dumps({"ok": False, "error":
-                                   f"unrecognised ref {s!r} — expected a datum string "
-                                   f"('front'/'top'/'right'), a face sid ('F…'), an edge sid "
-                                   f"('E…'), a side word, or a ref dict"})
+                                   f"unrecognised ref {s!r} — expected a datum plane/axis/origin, "
+                                   f"face/edge/vertex sid, side word, or a ref dict "
+                                   f"(including edge mode:'pierce' and kind:'sketch_entity')"})
 
             op = {"op": "sketch_convert", "sketch": sketch, "refs": norm_refs,
                   "construction": construction, "associative": associative}

@@ -951,6 +951,10 @@ std::string chatActivityCopyText(const ActivityItem& a) {
             if (!out.empty()) out += "\n";
             out += parts.err;
         }
+        if (!parts.cap.empty()) {
+            if (!out.empty()) out += "\n";
+            out += parts.cap;
+        }
         if (!parts.arts.empty()) {
             // "kind\tpath" lines — copy as a clean path list, one per line.
             std::istringstream iss(parts.arts);

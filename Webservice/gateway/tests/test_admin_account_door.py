@@ -231,7 +231,7 @@ def test_suspending_an_admin_ends_its_session_even_with_an_assertion(client):
         cookies={_session_cookie(): sid, "CF_Authorization": STALE_CF_TOKEN},
     )
 
-    assert r.status_code == 403
+    assert r.status_code == 401
     assert authn.lookup_session(sid) is None
 
 

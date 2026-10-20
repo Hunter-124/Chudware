@@ -300,9 +300,6 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
 
 
 
-    def _asm_revision(doc_id: str) -> int:
-        return cb.call("doc_tree", {"doc_id": doc_id}).get("revision", 0)
-
     def _components_phrase(count) -> str:
         if isinstance(count, int):
             return f"{count} component{'' if count == 1 else 's'}"
@@ -471,7 +468,7 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                 # Same helper add_features' asm_edit_component re-pose path uses, so an
                 # insert pose and a later re-pose can never disagree on the convention.
                 op["transform"] = pose_to_transform16(at, rotate, angle)
-            r = cb.call("doc_apply_ops", {"doc_id": d, "base_revision": _asm_revision(d),
+            r = cb.call("doc_apply_ops", {"doc_id": d,
                                           "with_tess": False, "ops": [op]})
             kid = (r.get("id_map") or {}).get("$0")
             comps = _asm_components(d)
@@ -615,7 +612,7 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                         raise ValueError("angle hinge line needs finite 3-vectors and a nonzero axis")
                     mate["value"]["axis_point"] = (inverse[:3, :3] @ point + inverse[:3, 3]).tolist()
                     mate["value"][axis_key] = (inverse[:3, :3] @ axis).tolist()
-            r = cb.call("doc_apply_ops", {"doc_id": d, "base_revision": _asm_revision(d),
+            r = cb.call("doc_apply_ops", {"doc_id": d,
                                           "with_tess": False,
                                           "ops": [{"op": "asm_add_mate", "mate": mate}]})
             mate_id = (r.get("id_map") or {}).get("$0")
@@ -754,8 +751,23 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                         loop: bool = False, dynamics: Optional[dict] = None,
                         doc_id: Optional[str] = None,
                         drivers: Optional[list[dict]] = None) -> str:
-        """Kinematic motion study: DRIVE one or more mates over synchronized ranges, re-solve
-        the mechanism each sample, return every body's pose + a swept interference check.
+        """Sweep synchronized mate drivers; return sampled body poses and per-frame clash evidence.
+
+        EVIDENCE / COST — read before calling:
+        `ok:true` means completed, NOT collision-free. Guard `ok:false` before reading
+        `trajectory`; refusals/timeouts need not contain it. Never invent missing frames.
+        Inspect EVERY computed frame's collision_detail/collisions and completeness.
+        Top-level interference.detail is FIRST HIT ONLY, never a union of swept pairs.
+        Baseline overlaps are findings, not automatically permitted joints: justify any
+        accepted pair separately. Sampled clear poses do not prove continuous path clearance.
+        min_clearance_mm=0 checks overlaps only, NOT positive clearance. A positive value
+        requests expensive exact distances for candidate pairs below the threshold, not a
+        cheap tolerance change or a complete minimum-distance table; start with a short
+        overlap sweep, then budget clearance checks deliberately.
+        Print the existing result before rerunning slow work. A timeout marked
+        status="still_running"/in_flight=true is not cancellation: an identical call in
+        the same run joins the original work rather than restarting it.
+        Procedure: cad_skill(name="simulate"), section "Mechanism proof".
 
         Uses the same native engine as the GUI Motion tab, not a separate Python solver.
         Each driver changes an angle/distance mate's scalar value at the same sample fraction;
@@ -806,23 +818,39 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                   for playback only. No additional pose or interference check is computed;
                   neither frames_checked nor the dynamics timeline includes this copy.
         check_interference : evaluate every valid sample for solid overlap or
-                  below-minimum-clearance pairs. min_clearance_mm is in mm.
+                  below-minimum-clearance pairs. min_clearance_mm is in mm; exact
+                  distances may be expensive even with unchanged-relative-pair reuse.
 
         Returns {ok, doc_id, mate_id, driver:{type,unit,start,stop,steps,samples},
                  drivers:[{mate_id,type,unit,start,stop,steps}],
-                 trajectory:[{i,value,driver_values:{mate_id:value},dof,converged,
-                              bodies:[{component,name,transform}]}],
+                 trajectory:[{i,value,driver_values:{mate_id:value},dof,residual_dof,
+                              converged,max_residual,worst_mate,tolerance,pose_check,
+                              bodies:[{component,name,transform}],collisions,
+                              collision_detail,interference,interference_complete,
+                              pairs_checked,pairs_reused,pair_failures,geometry_failures}],
                  interference:{checked,complete,frames_checked,pair_failures,
-                               first_collision_step,first_collision_value,detail},
-                 summary, pose_check}. mate_id, driver and frame.value describe the first
-        driver for compatibility. Every body transform is world 4x4 (row-major 16);
-        reference_transforms are already row-major and are not transposed. pose_check checks
-        each driven body's relative motion against its hinge line. Failed pose checks make
-        ok=false and skip interference for that invalid frame. Per-frame collisions retain
-        known hits and stable component IDs even if some pairs fail; interference is null
-        when unchecked/incomplete. Never claim swept clearance unless interference.complete
-        is true, all computed samples were checked, and no collisions were reported.
-        Missing/failed geometry is incomplete evidence, not a collision-free sweep.
+                               geometry_failures,first_collision_step,
+                               first_collision_value,detail},
+                 summary, pose_check, reference_bodies, reference_transforms}.
+        mate_id, driver and frame.value describe the first driver for compatibility.
+        Every body transform is world 4x4 (row-major 16); reference_transforms are
+        already row-major and are not transposed. Frame pose_check validates each
+        driven body's relative motion against its hinge line; top-level pose_check
+        aggregates those frames. Failed poses make ok=false and skip that frame's check.
+        collision_detail contains all known overlap/unsafe-clearance pairs for that
+        frame, with stable component_a/component_b, overlap_volume_mm3 for overlaps,
+        or distance (mm) and warning="below min clearance" for clearance hits.
+        collisions contains the same hits with overlap_volume_mm3 defaulted to zero,
+        so a zero-volume entry can still violate clearance. A pair's reused=true and
+        pairs_reused count indicate cached results at an unchanged relative pose;
+        pairs_checked includes these classified pairs, not just newly computed ones.
+        Frame interference is true for known hits, false for a complete clear check,
+        or null when unchecked/incomplete without a known hit. Known hits survive an
+        incomplete check. interference_complete, pair_failures and geometry_failures
+        expose gaps; check field presence on unchecked frames before indexing counts.
+        A sampled-clear claim requires check_interference=true, interference.complete
+        true, frames_checked==steps, all computed frames converged/pose-valid, and no
+        hits in any frame. The loop playback copy is not another computed frame.
         The engine solves an immutable snapshot; live poses, mates and history never change.
         A successful sweep is recorded as the document's native Motion study (`motion_study`
         {doc_id, study_id, name, view}; re-sweeping the same joints replaces it). When you

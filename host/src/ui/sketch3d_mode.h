@@ -5,8 +5,8 @@
 // but no plane lock — the camera stays free (MMB orbit) and points are placed on a movable
 // WORKING PLANE with snapping to existing sketch points / the origin / axis directions.
 //
-// v1 surface (engine contract): point / line / 3-pt arc / spline entities; coincident, fix,
-// distance, length, parallel, perpendicular, angle, along_axis, point_on constraints.
+// Surface: point / line / 3-pt arc / spline entities; 3D geometric relations, dimensions,
+// datum/working-plane relations and associative model-vertex reference points.
 // All edits are plain doc ops (add_feature / edit_feature params patches); the two read-only
 // RPCs are sketch3d_health (solve snapshot) and sketch3d_drag (transient constrained drag,
 // committed on mouse-up as one edit_feature = one undo step).
@@ -34,6 +34,7 @@ struct Sk3Entity {
     std::string status = "under";
     bool construction = false;
     std::vector<Vec3> pts;       // world mm, solved coords
+    std::vector<Vec3> samples;   // engine-sampled interpolating spline, shared with solver geometry
 };
 
 class Sketch3DMode {
@@ -85,6 +86,11 @@ private:
     std::string addEntity(AppState& st, nlohmann::json entity, nlohmann::json constraints);
     void addConstraint(AppState& st, nlohmann::json con, const char* label);
     std::string nextId(const char* prefix) const;     // "e<N>"/"c<N>" unique in cached params
+    void setModelVertexPicking(AppState& st, bool enabled);
+    void consumeModelVertexPick(AppState& st);
+    bool isExternalHandle(const std::string& handle) const;
+    bool modelVertexPicking_ = false;
+    bool savedPickFaces_ = true, savedPickEdges_ = true, savedPickVertices_ = true;
 
     // ---- working plane ----
     // Presets 0=XY(z-up top) 1=XZ 2=YZ 3=view-aligned. Anchored at wpO_ (origin, or the last
@@ -107,7 +113,7 @@ private:
     // Nearest whole entity polyline under the screen point; returns id or "".
     std::string hitTestEntity(AppState& st, const ImVec2& s, const ImVec2& imgMin,
                               int vw, int vh) const;
-    // Sample an entity to a world polyline (line: 2 pts, arc: circumcircle arc, spline: CR fit).
+    // Sample an entity to a world polyline (arc circumcircle / engine-sampled spline).
     static void samplePolyline(const Sk3Entity& e, std::vector<Vec3>& out);
     const Sk3Entity* entById(const std::string& id) const;
     Vec3 handleWorld(const std::string& handle) const;   // solved coords of a point handle
@@ -131,6 +137,9 @@ private:
     double dimValue_ = 0.0;
     bool dimFocus_ = false;
     void drawDimPopup(AppState& st);
+    void drawPlanePopup(AppState& st);
+    bool planePopupOpen_ = false;
+    nlohmann::json planePendingCon_;
 
     // ---- drag ----
     void updateDrag(AppState& st, const ImVec2& mouse, const ImVec2& imgMin, int vw, int vh);
@@ -145,6 +154,7 @@ private:
     // cached persisted params (source of truth for edits; refreshed from the doc tree)
     nlohmann::json entJson_ = nlohmann::json::array();
     nlohmann::json conJson_ = nlohmann::json::array();
+    nlohmann::json externalRefs_ = nlohmann::json::array();
     void reloadParamsFromTree(AppState& st);
 
     std::vector<Sk3Entity> ents_;       // solved display coords (health / last drag response)
@@ -152,6 +162,7 @@ private:
     std::string status_ = "under";
     bool converged_ = true;
     int nWires_ = 0;
+    std::string warning_;
 
     Sk3Tool tool_ = Sk3Tool::None;
     std::vector<Vec3> toolPts_;

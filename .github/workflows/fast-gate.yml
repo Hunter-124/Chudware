@@ -45,10 +45,11 @@ concurrency:
 jobs:
   check:
     name: check.py (${{ matrix.label }})
-    # Self-hosted only. Hosted minutes are billed on this private repository
-    # and the whole CI budget is $0; the capacity label keeps a leg off the
-    # production gateway host and off whichever endpoint is already busy.
-    runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", cloudcastle-ci, "${{ matrix.runner_label }}"]
+    # Every branch and PR runs inside a one-job disposable OS/VM. The group
+    # is an enforced scheduling boundary, not an alias for the signing fleet.
+    runs-on:
+      group: chudware-untrusted-ephemeral
+      labels: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", "${{ matrix.runner_label }}"]
     timeout-minutes: 20
     env:
       # scripts/check.py prints non-ASCII in audit names and findings. On
@@ -68,18 +69,17 @@ jobs:
           - label: Linux
             runner_os: Linux
             runner_arch: X64
-            runner_label: cc-linux-build
+            runner_label: cc-linux-disposable
           - label: Windows
             runner_os: Windows
             runner_arch: X64
-            runner_label: cc-win-primary
-          # The private lightweight gate account has its own runner slot,
-          # home and mutable state. Native/ARM qualification on the same Mac
-          # cannot hold these source audits; the signer lane stays separate.
+            runner_label: cc-win-disposable
+          # A separate disposable image preserves the gate-account identity;
+          # no writable Homebrew, interpreter, home or cache is signer-owned.
           - label: macOS
             runner_os: macOS
             runner_arch: X64
-            runner_label: cc-mac-chudware-gate-intel
+            runner_label: cc-mac-disposable-gate-intel
             ci_user: ccci-chudware-gate
     steps:
       # Before checkout: a missing or too-old Python otherwise surfaces as a
@@ -118,7 +118,7 @@ jobs:
           done
 
           if [ -z "${gate_python}" ]; then
-            echo "::error::runner ${RUNNER_NAME:-unknown} has no Python >= 3.11 on PATH; scripts/check.py needs one because the pinned NumPy and SciPy require it. Fix on macOS from the operator lane: dispatch runner-provision.yml with runner_label=cc-mac-intel (installs python@3.13)"
+            echo "::error::disposable image has no Python >= 3.11; rebuild and qualify the untrusted image, never provision or borrow the signer lane"
             exit 1
           fi
 
@@ -136,14 +136,8 @@ jobs:
           Write-Host "runner=$env:RUNNER_NAME os=$env:RUNNER_OS arch=$env:RUNNER_ARCH host=$env:COMPUTERNAME"
           Write-Host "powershell=$($PSVersionTable.PSVersion)"
 
-          # The Windows runner service is its own non-administrator virtual
-          # account whose USERPROFILE is a private D:\ChudwareCI\Windows\profile.
-          # It cannot write Program Files, cannot edit the machine PATH, and
-          # cannot restart itself to pick a new one up, so runner-smoke's
-          # provisioning job installs Python and ninja into a profile-local
-          # directory and every Windows job puts that directory on PATH here --
-          # $env:PATH for this step, $GITHUB_PATH for the ones after it.
-          # See docs/reference/CI_RUNNERS.md.
+          # This profile and tools tree belong to the disposable VM image.
+          # They must never be mounted from a persistent release runner.
           $tools = Join-Path $env:USERPROFILE 'chudware-ci-tools'
           foreach ($dir in @((Join-Path $tools 'bin'), (Join-Path $tools 'python'), (Join-Path $tools 'python\Scripts'))) {
             if (Test-Path $dir) {
@@ -164,7 +158,7 @@ jobs:
           }
 
           if (-not $gatePython) {
-            Write-Host "::error::runner $env:RUNNER_NAME has no Python >= 3.11 on PATH; scripts/check.py needs one because the pinned NumPy and SciPy require it. Provision it by dispatching runner-smoke.yml, whose provision job installs it unelevated"
+            Write-Host "::error::disposable image has no Python >= 3.11; rebuild and qualify the untrusted image"
             exit 1
           }
 

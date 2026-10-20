@@ -351,6 +351,11 @@ inline bool applyPartMaterialNow(AppState &st, Study &s, const std::string &key,
     error = "Cannot update the part material without an open engine document.";
     return false;
   }
+  if (st.docLockedByAgent(st.docMirror.docId())) {
+    error = st.agentLockReason(st.docMirror.docId());
+    st.toast(ui::ToastLevel::Warn, error);
+    return false;
+  }
   const auto response = st.docMirror.applyOps(st.worker, partMaterialOps(st, key));
   if (!response.ok) {
     error = "Could not update the part material: " +
@@ -364,9 +369,13 @@ inline bool applyPartMaterialNow(AppState &st, Study &s, const std::string &key,
 }
 
 // Normal material-combo edits stay non-blocking; canonical Apply uses the completed path above.
-inline void applyPartMaterial(AppState &st, Study &s, const std::string &key) {
+inline bool applyPartMaterial(AppState &st, Study &s, const std::string &key) {
+  if (st.docLockedByAgent(st.docMirror.docId())) {
+    st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
+    return false;
+  }
   s.materialKey = key;
-  if (!st.docMirror.hasDoc() || !st.workerStarted) return;
+  if (!st.docMirror.hasDoc() || !st.workerStarted) return true;
   ++st.rebuildsInFlight;
   st.docMirror.applyOpsAsync(
       st.rpc, st.worker, partMaterialOps(st, key),
@@ -387,6 +396,7 @@ inline void applyPartMaterial(AppState &st, Study &s, const std::string &key) {
         if (resp.ok)
           st.markActiveTabDirty();
       });
+  return true;
 }
 
 // ---------------------------------------------------------------- result
@@ -910,6 +920,15 @@ inline std::string topoRunIdOf(const nlohmann::json &run, std::size_t index) {
 }
 
 inline const nlohmann::json *topoFindRun(const nlohmann::json &runs, const std::string &runId) {
+  if (!runs.is_array())
+    return nullptr;
+  for (std::size_t i = 0; i < runs.size(); ++i)
+    if (topoRunIdOf(runs[i], i) == runId)
+      return &runs[i];
+  return nullptr;
+}
+
+inline nlohmann::json *topoFindRun(nlohmann::json &runs, const std::string &runId) {
   if (!runs.is_array())
     return nullptr;
   for (std::size_t i = 0; i < runs.size(); ++i)

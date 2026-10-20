@@ -15,15 +15,29 @@ if ($lock.repository -ne 'https://github.com/Hunter-124/chudcode.git' -or
     $lock.repository_commit -notmatch '^[0-9a-f]{40}$') { throw 'Unexpected locked source identity' }
 $tools = Join-Path $env:USERPROFILE 'chudware-ci-tools'
 foreach ($dir in @((Join-Path $tools 'bin'), (Join-Path $tools 'python'),
-                   (Join-Path $tools 'python\Scripts'), (Join-Path $env:USERPROFILE '.cargo\bin'))) {
+                   (Join-Path $tools 'python\Scripts'))) {
     if (Test-Path $dir) { $env:PATH = "$dir;$env:PATH" }
 }
-# setup-bun installs the pinned Bun under ~\.bun\bin; the CI tool dirs above may
-# carry an older bun, so the pinned one must win.
-$pinnedBun = Join-Path $env:USERPROFILE '.bun\bin'
-if (Test-Path (Join-Path $pinnedBun 'bun.exe')) { $env:PATH = "$pinnedBun;$env:PATH" }
+if ($env:GITHUB_ACTIONS -eq 'true' -and
+    (-not $env:CHUDWARE_BOOTSTRAP_BIN -or -not $env:CARGO_HOME -or -not $env:RUSTUP_HOME)) {
+    throw 'CI requires authenticated workflow Bun and isolated Rust homes'
+}
+if ($env:CARGO_HOME) { $env:PATH = "$(Join-Path $env:CARGO_HOME 'bin');$env:PATH" }
+if ($env:CHUDWARE_BOOTSTRAP_BIN) { $env:PATH = "$env:CHUDWARE_BOOTSTRAP_BIN;$env:PATH" }
 foreach ($tool in @('bun', 'rustup', 'cargo', 'python', 'tar.exe')) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "Required build dependency missing: $tool" }
+}
+if ($env:GITHUB_ACTIONS -eq 'true') {
+    if ($env:CHUDWARE_BUN_BINARY_SHA256 -notmatch '^[0-9a-f]{64}$' -or
+        (Get-FileHash -Algorithm SHA256 (Get-Command bun).Source).Hash.ToLowerInvariant() -ne $env:CHUDWARE_BUN_BINARY_SHA256) {
+        throw 'Bun binary changed after authenticated bootstrap'
+    }
+    foreach ($proxy in @('rustup', 'cargo')) {
+        if ((Get-FileHash -Algorithm SHA256 (Get-Command $proxy).Source).Hash.ToLowerInvariant() -ne
+            '88d8258dcf6ae4f7a80c7d1088e1f36fa7025a1cfd1343731b4ee6f385121fc0') {
+            throw "Rust bootstrap proxy changed after authentication: $proxy"
+        }
+    }
 }
 & python -c 'import sys; assert sys.version_info >= (3, 11)'
 if ($LASTEXITCODE -ne 0) { throw 'Python 3.11+ is required' }

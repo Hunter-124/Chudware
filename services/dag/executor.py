@@ -24,6 +24,8 @@ from langgraph.types import Command
 from .graph_loader import DagState, EmitFn, build_state_graph, validate_graph
 from .event_journal import EventJournal
 from .run_ids import validate_run_id
+from services.agent.request_context import in_cell
+from .storage import create_run, private_runs_dir, resolve_run
 
 # ---------------------------------------------------------------------------
 # Runs directory resolution
@@ -39,6 +41,8 @@ def default_runs_dir() -> Path:
     for T-A1).  This function is the authoritative runs-dir resolver for services/dag.
     Override via the runs_dir parameter to run() for hermetic tests.
     """
+    if in_cell():
+        return private_runs_dir()
     if platform.system() == "Windows":
         appdata = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
         return Path(appdata) / "Chudware" / "runs"
@@ -88,20 +92,29 @@ def run(
           interrupted     : list of interrupt payload dicts (aicad.interaction/1 shape)
         The caller (or UI) persists graph_json beside the .db for resume().
     """
-    if run_id is None:
-        run_id = str(uuid.uuid4())
-    run_id = validate_run_id(run_id)
     validate_graph(graph_json)
+    if in_cell():
+        record = None
+        if run_id is not None:
+            try:
+                record = resolve_run(run_id)
+            except KeyError:
+                pass
+        if record is None:
+            record = create_run(run_id, autonomy_default)
+        elif record.db.exists() or record.graph.exists():
+            raise ValueError("run already exists")
+        run_id = record.run_id
+        autonomy_default = record.autonomy
+        db_path, graph_json_path = record.db, record.graph
+    else:
+        run_id = validate_run_id(str(uuid.uuid4()) if run_id is None else run_id)
+        base_dir = Path(runs_dir) if runs_dir is not None else default_runs_dir()
+        base_dir.mkdir(parents=True, exist_ok=True)
+        db_path = base_dir / f"{run_id}.db"
+        graph_json_path = base_dir / f"{run_id}.graph.json"
     graph_id = graph_json.get("id", "unknown")
     node_count = len(graph_json["nodes"])
-
-    base_dir: Path = runs_dir if runs_dir is not None else default_runs_dir()
-    base_dir.mkdir(parents=True, exist_ok=True)
-    db_path = base_dir / f"{run_id}.db"
-
-    # Persist graph_json beside the .db so resume() can reconstruct the topology
-    # across an app restart without the caller re-supplying it.
-    graph_json_path = base_dir / f"{run_id}.graph.json"
     if not graph_json_path.exists():
         graph_json_path.write_text(json.dumps(graph_json), encoding="utf-8")
 
@@ -129,11 +142,13 @@ def run(
     # NOTE: emit is passed via closure into node handlers by build_state_graph(),
     # NOT carried in state — the LangGraph checkpointer cannot serialise callables.
     initial: DagState = {
+        **(initial_state or {}),
         "run_id": run_id,
         "run_status": "running",
         "node_states": {},
-        **(initial_state or {}),
     }
+    if not in_cell():
+        initial.update(initial_state or {})
 
     config = {"configurable": {"thread_id": run_id}}
 
@@ -224,11 +239,22 @@ def resume(
         Same shape as run() — {run_id, status, nodes, checkpoint_db, …}.
         May be "paused" again if another gate fires downstream.
     """
-    run_id = validate_run_id(run_id)
-    base_dir: Path = runs_dir if runs_dir is not None else default_runs_dir()
-    db_path = base_dir / f"{run_id}.db"
+    if in_cell():
+        record = resolve_run(run_id)
+        run_id = record.run_id
+        db_path, graph_json_path = record.db, record.graph
+        # An ordinary approval cannot replace topology or lower the stored gate floor.
+        graph_json = None
+        autonomy_default = record.autonomy
+    else:
+        run_id = validate_run_id(run_id)
+        base_dir = Path(runs_dir) if runs_dir is not None else default_runs_dir()
+        db_path = base_dir / f"{run_id}.db"
+        graph_json_path = base_dir / f"{run_id}.graph.json"
 
     if not db_path.exists():
+        if in_cell():
+            raise KeyError("not_found")
         raise FileNotFoundError(
             f"Checkpoint DB not found: {db_path}. "
             "Pass the same runs_dir used in executor.run()."
@@ -236,8 +262,9 @@ def resume(
 
     # Load graph_json from sidecar if not supplied (app-restart path).
     if graph_json is None:
-        graph_json_path = base_dir / f"{run_id}.graph.json"
         if not graph_json_path.exists():
+            if in_cell():
+                raise KeyError("not_found")
             raise FileNotFoundError(
                 f"Graph sidecar not found: {graph_json_path}. "
                 "Supply graph_json explicitly or ensure run() wrote the sidecar."

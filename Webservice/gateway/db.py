@@ -63,7 +63,20 @@ class DatabaseUnavailable(RuntimeError):
 def dsn() -> str:
     """Connection string. Read from the environment rather than ``config.py``
     because the pool has to exist before anything else is wired up."""
-    return (os.environ.get("CHUDWARE_DB_URL") or "").strip() or DEFAULT_DSN
+    environment = os.environ.get("CHUDWARE_DEPLOY_ENV", "prod")
+    if environment not in {"prod", "staging"}:
+        raise DatabaseUnavailable("unknown deployment environment")
+    raw = (os.environ.get("CHUDWARE_DB_URL") or "").strip()
+    if environment == "staging":
+        if not raw:
+            raise DatabaseUnavailable("staging requires an explicit database credential")
+        try:
+            fields = psycopg.conninfo.conninfo_to_dict(raw)
+        except psycopg.Error as exc:
+            raise DatabaseUnavailable("invalid staging database credential") from exc
+        if fields.get("dbname") != "chudware_staging" or fields.get("user") != "chudware_staging":
+            raise DatabaseUnavailable("staging requires its own database and login role")
+    return raw or DEFAULT_DSN
 
 
 def pool() -> ConnectionPool:

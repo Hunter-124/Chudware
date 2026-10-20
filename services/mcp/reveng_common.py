@@ -14,11 +14,24 @@ import threading as _threading
 import time as _time
 from pathlib import Path as _Path
 from typing import Any, Optional
+import sqlite3 as _sqlite3
+import tempfile as _tempfile
+
+from services.agent import request_context as _rc
 
 from mcp.server.fastmcp import FastMCP
 
 # ── helpers from cad_tools (already loaded) ────────────────────────────────
-from services.mcp.cad_tools import _dumps, _err  # type: ignore[attr-defined]
+from services.mcp.cad_tools import _dumps, _err as _cad_err  # type: ignore[attr-defined]
+
+
+def _err(exc: Exception) -> str:
+    if isinstance(exc, KeyError) and exc.args == ("not_found",):
+        out = {"ok": False, "error": "not_found", "reason": "not_found"}
+        if _rc.in_cell():
+            out["code"] = "not_found"
+        return _dumps(out)
+    return _cad_err(exc)
 
 # ── RE-29: research ingest orchestrator ────────────────────────────────────
 try:
@@ -112,6 +125,8 @@ def _ingest_pdf(path: str, out_dir: str) -> dict:
 # ── session store ───────────────────────────────────────────────────────────
 
 def _reveng_dir() -> _Path:
+    if _rc.in_cell():
+        return _rc.actor_state_root() / "reveng"
     base = _os.environ.get("CHUDWARE_REVENG_DIR")
     if base:
         return _Path(base).expanduser()
@@ -119,8 +134,68 @@ def _reveng_dir() -> _Path:
     return _Path(xdg) / "Chudware" / "reveng"
 
 
-def _session_path(session_id: str) -> _Path:
-    return _reveng_dir() / session_id
+def _validate_handle(handle: str) -> None:
+    if (not isinstance(handle, str) or not handle or handle in (".", "..")
+            or "/" in handle or "\\" in handle or "\x00" in handle):
+        raise KeyError("not_found")
+
+
+def _require_record_owner(record: dict) -> None:
+    owner = record.get("_owner")
+    _rc.require_owner(tuple(owner) if isinstance(owner, (list, tuple)) else owner)
+
+
+def _session_path(session_id: str, *, create: bool = False) -> _Path:
+    """Resolve a handle, never interpolate a cell handle into a filesystem path."""
+    _validate_handle(session_id)
+    base = _reveng_dir()
+    if not _rc.in_cell():
+        path = base / session_id
+        if path.resolve().parent != base.resolve():
+            raise KeyError("not_found")
+        return path
+    base.mkdir(parents=True, exist_ok=True)
+    with _sqlite3.connect(base / "handles.sqlite", timeout=15) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS handles (scope TEXT PRIMARY KEY, directory TEXT NOT NULL)")
+        key = _rc.scoped_key(session_id)
+        row = conn.execute("SELECT directory FROM handles WHERE scope=?", (key,)).fetchone()
+        if row is None:
+            if not create:
+                raise KeyError("not_found")
+            # Directory identity is independent of the client/server session handle.
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT directory FROM handles WHERE scope=?", (key,)).fetchone()
+            if row is None:
+                directory = _tempfile.mkdtemp(prefix="session-", dir=base)
+                conn.execute("INSERT INTO handles VALUES (?, ?)", (key, directory))
+                row = (directory,)
+    path = _Path(row[0])
+    if path.resolve().parent != base.resolve():
+        raise KeyError("not_found")
+    manifest = path / "session.json"
+    if manifest.is_file():
+        try:
+            _require_record_owner(_json.loads(manifest.read_text()))
+        except (OSError, ValueError, TypeError, AttributeError):
+            raise KeyError("not_found") from None
+    return path
+
+
+def _list_sessions() -> list[dict]:
+    base = _reveng_dir()
+    if not base.is_dir():
+        return []
+    sessions = []
+    for path in sorted(base.glob("*/session.json")):
+        try:
+            manifest = _json.loads(path.read_text())
+            _require_record_owner(manifest)
+            session = _load_session(manifest["session_id"])
+            if session is not None:
+                sessions.append(session)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return sessions
 
 
 def _session_json_path(session_id: str) -> _Path:
@@ -128,7 +203,7 @@ def _session_json_path(session_id: str) -> _Path:
 
 
 def _new_session_id() -> str:
-    return "re_" + _secrets.token_hex(4)
+    return "re_" + _secrets.token_hex(16 if _rc.in_cell() else 4)
 
 
 def _now_iso() -> str:
@@ -137,10 +212,12 @@ def _now_iso() -> str:
 
 
 def _make_session(session_id: str, name: str, part_ref: Optional[str]) -> dict:
+    _validate_handle(session_id)
     now = _now_iso()
     return {
         "schema": "aicad.reveng_session/1",
         "session_id": session_id,
+        "_owner": _rc.owner_key(),
         "name": name,
         "created_at": now,
         "updated_at": now,
@@ -177,13 +254,12 @@ def _make_session(session_id: str, name: str, part_ref: Optional[str]) -> dict:
 
 
 def _load_session(session_id: str, *, merge_gaussian: bool = True) -> Optional[dict]:
-    p = _session_json_path(session_id)
-    if not p.exists():
-        return None
     try:
+        p = _session_json_path(session_id)
         session = _json.loads(p.read_text())
-        if not isinstance(session, dict):
-            return None
+        if not isinstance(session, dict) or session.get("session_id") != session_id:
+            raise KeyError("not_found")
+        _require_record_owner(session)
         from services.reveng.gaussian_jobs import status as splat_status
         gaussian = splat_status(session_id) if merge_gaussian else {}
         if gaussian.get("run_id"):
@@ -194,13 +270,16 @@ def _load_session(session_id: str, *, merge_gaussian: bool = True) -> Optional[d
                 if value:
                     artifacts[key] = str(_Path(value).resolve())
         return session
-    except Exception:
+    except (OSError, ValueError, KeyError, TypeError):
+        if _rc.in_cell():
+            raise KeyError("not_found") from None
         return None
 
 
 def _save_session(session: dict) -> None:
+    _require_record_owner(session)
     sid = session["session_id"]
-    root = _session_path(sid)
+    root = _session_path(sid, create=True)
     root.mkdir(parents=True, exist_ok=True)
     session["updated_at"] = _now_iso()
     from services.reveng.gaussian_jobs import _atomic, _read
@@ -321,6 +400,8 @@ def _load_template(name: str) -> dict:
 
 def _reveng_runs_dir() -> Optional[_Path]:
     """Optional runs-dir override for hermetic tests (CHUDWARE_REVENG_RUNS_DIR)."""
+    if _rc.in_cell():
+        return _rc.actor_state_root() / "runs"
     d = _os.environ.get("CHUDWARE_REVENG_RUNS_DIR")
     return _Path(d).expanduser() if d else None
 
@@ -336,11 +417,13 @@ def make_reveng_emit(run_id: str, session_id: str, stage_map: dict):
     raw dag.* events. Never raises (progress emission must not break a run).
     """
     from services.dag.event_journal import EventJournal
+    owner = _rc.owner_key()
 
     journal = EventJournal(run_id)
 
     def _emit(event_type: str, payload: dict) -> None:
         try:
+            _rc.require_owner(owner)
             if event_type not in ("dag.node.started", "dag.node.done", "dag.node.paused"):
                 return
             node_id = payload.get("node_id", "")
@@ -395,11 +478,13 @@ def make_reveng_stage_emitter(run_id: str, session_id: str):
     human-readable detail belongs in ``msg``.  Never raises: progress is best-effort.
     """
     from services.dag.event_journal import EventJournal
+    owner = _rc.owner_key()
 
     journal = EventJournal(run_id)
 
     def _progress(stage: str, pct: int, msg: str, artifact: Any = None) -> None:
         try:
+            _rc.require_owner(owner)
             journal.emit("aicad.reveng_events/1", {
                 "schema": "aicad.reveng_events/1",
                 "session_id": session_id,
@@ -1147,6 +1232,16 @@ _MISSION_THREADS: dict[str, tuple[str, Any]] = {}
 _MISSION_LOCK = _threading.Lock()
 
 
+def worker_activity() -> dict:
+    from services.worker_activity import registry_lock
+
+    with registry_lock(_MISSION_LOCK):
+        # Keys are opaque scoped registry keys, not handles to resolve on disk.
+        active = sum(_slot_busy(entry) for key, entry in _MISSION_THREADS.items()
+                     if _rc.owns_registry_key(key))
+    return {"by_kind": {"reveng_missions": active}}
+
+
 def _runs_base_dir() -> _Path:
     """Directory holding <run_id>.db / .graph.json / .reveng.json for reveng runs."""
     override = _reveng_runs_dir()
@@ -1166,28 +1261,38 @@ def _runs_base_dir() -> _Path:
 
 
 def _run_record_path(run_id: str) -> _Path:
+    _validate_handle(run_id)
+    if _rc.in_cell():
+        from services.dag.storage import resolve_run
+        return resolve_run(run_id).root / "reveng.json"
     return _runs_base_dir() / f"{run_id}.reveng.json"
 
 
 def _write_run_record(rec: dict) -> None:
     """Persist the aicad.reveng_run/1 sidecar (best-effort; never breaks a run)."""
+    _require_record_owner(rec)
     try:
         path = _run_record_path(rec["run_id"])
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(_json.dumps(rec, indent=2))
     except Exception:  # noqa: BLE001
+        if _rc.in_cell():
+            raise
         return
 
 
 def _read_run_record(run_id: str) -> Optional[dict]:
-    path = _run_record_path(run_id)
-    if not path.is_file():
-        return None
     try:
+        path = _run_record_path(run_id)
         rec = _json.loads(path.read_text())
-    except Exception:  # noqa: BLE001
+        if not isinstance(rec, dict):
+            raise KeyError("not_found")
+        _require_record_owner(rec)
+        return rec
+    except (OSError, ValueError, KeyError, TypeError):
+        if _rc.in_cell():
+            raise KeyError("not_found") from None
         return None
-    return rec if isinstance(rec, dict) else None
 
 
 def _run_summary(rec: dict) -> dict:
@@ -1254,11 +1359,14 @@ def _slot_busy(entry: Optional[tuple]) -> bool:
     if entry is None:
         return False
     thread = entry[1]
-    return thread is None or thread.is_alive()
+    return thread is None or getattr(thread, "ident", 0) is None or thread.is_alive()
 
 
 def _mission_running(session_id: str) -> Optional[str]:
     """The run_id of the mission in flight for *session_id*, else None."""
+    if _rc.in_cell():
+        _load_session(session_id, merge_gaussian=False)
+    session_id = _rc.scoped_key(session_id)
     with _MISSION_LOCK:
         entry = _MISSION_THREADS.get(session_id)
         if _slot_busy(entry):
@@ -1271,14 +1379,17 @@ def _mission_running(session_id: str) -> Optional[str]:
 def _reserve_mission(session_id: str, run_id: str) -> Optional[str]:
     """Atomically claim the session's mission slot; return the busy run_id on refusal."""
     with _MISSION_LOCK:
-        entry = _MISSION_THREADS.get(session_id)
+        if _rc.in_cell():
+            _load_session(session_id, merge_gaussian=False)
+        key = _rc.scoped_key(session_id)
+        entry = _MISSION_THREADS.get(key)
         if _slot_busy(entry):
             return entry[0]
         from services.reveng.gaussian_jobs import active_run
         splat_run = active_run(_session_path(session_id))
         if splat_run:
             return splat_run
-        _MISSION_THREADS[session_id] = (run_id, None)
+        _MISSION_THREADS[key] = (run_id, None)
     return None
 
 
@@ -1289,6 +1400,7 @@ def _release_mission(session_id: str, run_id: str) -> None:
 
 def _drop_slot(session_id: str, run_id: str) -> None:
     """Free *session_id*'s mission slot if *run_id* still owns it. Caller holds the lock."""
+    session_id = _rc.scoped_key(session_id)
     entry = _MISSION_THREADS.get(session_id)
     if entry is not None and entry[0] == run_id:
         _MISSION_THREADS.pop(session_id, None)
@@ -1307,6 +1419,9 @@ def _busy_envelope(session_id: str, run_id: str) -> dict:
 
 def _spawn_mission(session_id: str, run_id: str, invoke, rec: dict, graph: dict) -> None:
     """Run *invoke* on a daemon thread, folding its result into the run record."""
+    ctx = _rc.current_context()
+    project = _rc.root_value("CHUDWARE_PROJECT_DIR")
+    save = _rc.root_value("CHUDWARE_PROJECT_SAVE_DIR")
     def _body() -> None:
         try:
             result = invoke()
@@ -1326,10 +1441,21 @@ def _spawn_mission(session_id: str, run_id: str, invoke, rec: dict, graph: dict)
             finally:
                 _drop_slot(session_id, run_id)
 
-    thread = _threading.Thread(target=_body, name=f"reveng-{run_id}", daemon=True)
+    def _bound_body() -> None:
+        with _rc.bind_context(ctx), _rc.bind_roots(project, save):
+            _body()
+
+    thread = _threading.Thread(target=_bound_body, name=f"reveng-{run_id}", daemon=True)
     with _MISSION_LOCK:
-        _MISSION_THREADS[session_id] = (run_id, thread)
-    thread.start()
+        _MISSION_THREADS[_rc.scoped_key(session_id)] = (run_id, thread)
+    try:
+        from services.worker_activity import start_registered_thread
+
+        start_registered_thread(thread)
+    except BaseException:
+        with _MISSION_LOCK:
+            _drop_slot(session_id, run_id)
+        raise
 
 
 def _launch_reveng_mission(
@@ -1366,9 +1492,14 @@ def _launch_reveng_mission(
 
     graph = _load_template(template_name)
     run_id = "run_" + _secrets.token_hex(4)
+    if _rc.in_cell():
+        _load_session(session_id, merge_gaussian=False)
+        from services.dag.storage import create_run
+        run_id = create_run(handle=run_id, autonomy=autonomy_default).run_id
     rec = {
         "schema": "aicad.reveng_run/1",
         "run_id": run_id,
+        "_owner": _rc.owner_key(),
         "session_id": session_id,
         "template": template_name,
         "strategy": strategy,
@@ -1442,6 +1573,8 @@ def _find_session_run(session_id: str) -> Optional[dict]:
         rec = _read_run_record(str(run_id))
         if rec is not None:
             return rec
+    if _rc.in_cell():
+        return None
     base = _runs_base_dir()
     if not base.is_dir():
         return None

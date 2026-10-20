@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import os
 from typing import Callable
+from services.agent import request_context
 
 _OUT_OF_SCOPE_REASON = "Sub-agent is outside the requested scope."
 _UNLIMITED = 2_147_483_647
@@ -76,6 +77,13 @@ def _in_scope(meta: dict, project: str | None, session: str | None) -> bool:
     return True
 
 
+def _not_found() -> dict:
+    result = {"ok": False, "error": "not_found", "reason": "not_found"}
+    if request_context.in_cell():
+        result["code"] = "not_found"
+    return result
+
+
 def _scoped_session(reg, request: dict, sid: str) -> tuple[dict | None, dict | None]:
     """Look up *sid* and enforce the request scope before any other access.
 
@@ -84,9 +92,17 @@ def _scoped_session(reg, request: dict, sid: str) -> tuple[dict | None, dict | N
     """
     session = reg.get_session(sid)
     if session is None:
-        return None, {"ok": False, "reason": f"unknown subagent {sid!r}"}
+        return None, (
+            _not_found()
+            if request_context.in_cell()
+            else {"ok": False, "reason": f"unknown subagent {sid!r}"}
+        )
     if not _in_scope(session, *_requested_scope(request)):
-        return None, {"ok": False, "reason": _OUT_OF_SCOPE_REASON}
+        return None, (
+            _not_found()
+            if request_context.in_cell()
+            else {"ok": False, "reason": _OUT_OF_SCOPE_REASON}
+        )
     return session, None
 
 
@@ -113,6 +129,8 @@ def _subagent_list(params: dict, _emit: Callable) -> dict:
             if _in_scope(session, project, session_id)
         ][:max(1, limit)]
         return {"ok": True, "sessions": sessions}
+    except KeyError:
+        return _not_found()
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"subagent_list failed: {exc}"}
 
@@ -122,7 +140,7 @@ def _subagent_transcript(params: dict, _emit: Callable) -> dict:
         from services.agent import subagent_registry as reg
         request = params or {}
         sid = request.get("subagent_id", "")
-        if not sid:
+        if not sid and not request_context.in_cell():
             return {"ok": False, "reason": "subagent_id is required"}
         session, refusal = _scoped_session(reg, request, sid)
         if refusal is not None:
@@ -140,6 +158,8 @@ def _subagent_transcript(params: dict, _emit: Callable) -> dict:
             "messages": messages,
             "pending_steers": reg.pending_steers(sid),
         }
+    except KeyError:
+        return _not_found()
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"subagent_transcript failed: {exc}"}
 
@@ -150,11 +170,16 @@ def _subagent_steer(params: dict, _emit: Callable) -> dict:
         request = params or {}
         sid = request.get("subagent_id", "")
         text = request.get("text", "")
-        if not sid:
+        if not sid and not request_context.in_cell():
             return {"ok": False, "reason": "subagent_id is required"}
+        if request_context.in_cell():
+            session, refusal = _scoped_session(reg, request, sid)
+            if refusal is not None:
+                return refusal
         if not str(text).strip():
             return {"ok": False, "reason": "steer text must be non-empty"}
-        session, refusal = _scoped_session(reg, request, sid)
+        if not request_context.in_cell():
+            session, refusal = _scoped_session(reg, request, sid)
         if refusal is not None:
             return refusal
         rec = reg.queue_steer(sid, text, source="user")
@@ -169,6 +194,8 @@ def _subagent_steer(params: dict, _emit: Callable) -> dict:
                      "it will only be read if the session resumes")
         return {"ok": True, "queued": True, "steer_id": rec["steer_id"],
                 "session_status": status, "note": note}
+    except KeyError:
+        return _not_found()
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"subagent_steer failed: {exc}"}
 
@@ -178,13 +205,18 @@ def _subagent_terminate(params: dict, _emit: Callable) -> dict:
         from services.agent import subagent_registry as reg
         request = params or {}
         sid = request.get("subagent_id", "")
-        if not sid:
+        if not sid and not request_context.in_cell():
             return {"ok": False, "reason": "subagent_id is required"}
+        if request_context.in_cell():
+            session, refusal = _scoped_session(reg, request, sid)
+            if refusal is not None:
+                return refusal
         if not bool(request.get("confirm", False)):
             # M16: ending a sub-agent chat must never be an easy accident.
             return {"ok": False, "reason": "terminate requires confirm=true",
                     "requires_confirm": True}
-        session, refusal = _scoped_session(reg, request, sid)
+        if not request_context.in_cell():
+            session, refusal = _scoped_session(reg, request, sid)
         if refusal is not None:
             return refusal
         if not reg.request_terminate(sid):
@@ -195,6 +227,8 @@ def _subagent_terminate(params: dict, _emit: Callable) -> dict:
         return {"ok": True, "terminate_requested": True,
                 "session_status": session.get("status", ""),
                 "note": "honored at the sub-agent's next turn boundary (not a hard kill)"}
+    except KeyError:
+        return _not_found()
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"subagent_terminate failed: {exc}"}
 
@@ -204,8 +238,12 @@ def _subagent_control(params: dict, _emit: Callable) -> dict:
         from services.agent import subagent_registry as reg
         request = params or {}
         sid = request.get("subagent_id", "")
-        if not sid:
+        if not sid and not request_context.in_cell():
             return {"ok": False, "reason": "subagent_id is required"}
+        if request_context.in_cell():
+            session, refusal = _scoped_session(reg, request, sid)
+            if refusal is not None:
+                return refusal
 
         op = str(request.get("op", "")).strip().lower()
         valid_ops = ("pause", "resume", "set_runtime")
@@ -214,7 +252,8 @@ def _subagent_control(params: dict, _emit: Callable) -> dict:
                 "ok": False,
                 "reason": "op must be one of: " + ", ".join(valid_ops),
             }
-        session, refusal = _scoped_session(reg, request, sid)
+        if not request_context.in_cell():
+            session, refusal = _scoped_session(reg, request, sid)
         if refusal is not None:
             return refusal
 
@@ -266,6 +305,8 @@ def _subagent_control(params: dict, _emit: Callable) -> dict:
             "provider_override": overrides["provider"],
             "effort_override": overrides["effort"],
         }
+    except KeyError:
+        return _not_found()
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"subagent_control failed: {exc}"}
 

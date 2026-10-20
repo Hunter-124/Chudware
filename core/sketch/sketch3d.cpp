@@ -7,6 +7,8 @@
 #include "solver/nsolve.h"
 #include "util/expr.h"
 
+#include <algorithm>
+#include <limits>
 #include <cmath>
 #include <set>
 #include <stdexcept>
@@ -21,6 +23,7 @@ using Eigen::VectorXd;
 using nlohmann::json;
 
 namespace {
+constexpr double kPi = 3.14159265358979323846;
 
 using EntMap = std::map<std::string, json>;
 using VarMap = std::map<std::string, std::vector<int>>;
@@ -257,7 +260,7 @@ void add_coincident(System& sys, const std::string& cid, const std::string& h0,
 void add_fix(System& sys, const std::string& cid, const std::string& h,
              const EntMap& entities, const VarMap& vm) {
     Handle3 hd = resolve_handle(h, entities, vm);
-    if (hd.idx.empty()) return;
+    if (hd.idx.empty()) throw std::runtime_error("fix: entity has no coordinates");
     VectorXd init = sys.init_vector();
     std::vector<double> targets;
     for (int i : hd.idx) targets.push_back(init(i));
@@ -522,6 +525,14 @@ void circumcircle(const Vector3d& A, const Vector3d& M, const Vector3d& B,
 // numeric (h = 1e-6) — precedent: the 2D solver's numeric conic projections.
 void add_point_on_arc(System& sys, const std::string& cid, const std::vector<int>& ip,
                       const std::vector<int>& iarc) {
+    if (iarc.size() != 9) throw std::runtime_error("point_on: arc has no coordinates");
+    const VectorXd init = sys.init_vector();
+    Vector3d a, m, b, center, normal;
+    for (int k = 0; k < 3; ++k) {
+        a(k) = init(iarc[k]); m(k) = init(iarc[k + 3]); b(k) = init(iarc[k + 6]);
+    }
+    double radius;
+    circumcircle(a, m, b, center, radius, normal);
     std::vector<int> idx = ip;
     idx.insert(idx.end(), iarc.begin(), iarc.end());
     auto rfunc = [](const VectorXd& x) {
@@ -555,6 +566,306 @@ void add_point_on_arc(System& sys, const std::string& cid, const std::vector<int
             return J;
         },
         cid);
+}
+
+// Numeric Jacobians are reserved for derived circle/spline geometry; linear plane
+// relations below use constant analytic rows. Preflight catches unusable geometry
+// before registering a block, so it appears in skipped rather than going inert.
+template <typename F>
+void add_numeric(System& sys, const std::string& cid, const std::vector<int>& idx, F f) {
+    const VectorXd init = sys.init_vector();
+    VectorXd local(idx.size());
+    for (size_t i = 0; i < idx.size(); ++i) local(i) = init(idx[i]);
+    f(local);
+    sys.add_residual(f, idx, [f](const VectorXd& x) {
+        VectorXd xp = x, xm = x;
+        MatrixXd J(f(x).size(), x.size());
+        for (int k = 0; k < x.size(); ++k) {
+            const double h = 1e-6 * std::max(1.0, std::abs(x(k)));
+            xp(k) += h;
+            xm(k) -= h;
+            J.col(k) = (f(xp) - f(xm)) / (2.0 * h);
+            xp(k) = xm(k) = x(k);
+        }
+        return J;
+    }, cid);
+}
+
+struct Circle3 {
+    Vector3d c, n;
+    double r;
+    explicit Circle3(const VectorXd& x) {
+        circumcircle(x.segment<3>(0), x.segment<3>(3), x.segment<3>(6), c, r, n);
+    }
+    Vector3d midpoint(const Vector3d& a, const Vector3d& m, const Vector3d& b) const {
+        const Vector3d u = (a - c) / r, v = n.cross(u);
+        auto angle = [&](const Vector3d& p) {
+            double t = std::atan2((p - c).dot(v), (p - c).dot(u));
+            return t < 0 ? t + 2 * kPi : t;
+        };
+        double sweep = angle(b);
+        if (angle(m) > sweep) sweep -= 2 * kPi;
+        return c + r * (u * std::cos(sweep / 2) + v * std::sin(sweep / 2));
+    }
+};
+
+// Same non-periodic interpolation as profile3d's GeomAPI_Interpolate:
+// chord-length parameters; 2 points linear, 3 quadratic, otherwise C2 cubic with
+// endpoint derivatives from the first/last four-point Lagrange interpolants.
+// Keeping this solver-only avoids pulling OCCT into interactive solver builds.
+struct Spline3 {
+    std::vector<Vector3d> p, second;
+    std::vector<double> t;
+    explicit Spline3(const VectorXd& x) {
+        const int n = static_cast<int>(x.size()) / 3;
+        if (n < 2) throw std::runtime_error("spline needs >= 2 points");
+        p.reserve(n);
+        t.resize(n, 0);
+        for (int i = 0; i < n; ++i) {
+            p.emplace_back(x.segment<3>(3 * i));
+            if (i) {
+                double h = (p[i] - p[i - 1]).norm();
+                if (h < 1e-7) throw std::runtime_error("spline has coincident adjacent points");
+                t[i] = t[i - 1] + h;
+            }
+        }
+        if (n < 4) return;
+        second.resize(n);
+        std::vector<double> diagonal(n), upper(n);
+        auto derivative = [&](int first, int at) {
+            Vector3d d = Vector3d::Zero();
+            for (int j = first; j < first + 4; ++j) {
+                double coefficient = 0;
+                for (int k = first; k < first + 4; ++k) {
+                    if (k == j) continue;
+                    double term = 1 / (t[j] - t[k]);
+                    for (int l = first; l < first + 4; ++l)
+                        if (l != j && l != k) term *= (t[at] - t[l]) / (t[j] - t[l]);
+                    coefficient += term;
+                }
+                d += coefficient * p[j];
+            }
+            return d;
+        };
+        double h = t[1] - t[0];
+        diagonal[0] = 2 * h;
+        upper[0] = h;
+        second[0] = 6 * ((p[1] - p[0]) / h - derivative(0, 0));
+        for (int i = 1; i < n; ++i) {
+            const double prev = t[i] - t[i - 1];
+            double lower = prev;
+            if (i == n - 1) {
+                diagonal[i] = 2 * prev;
+                second[i] = 6 * (derivative(n - 4, n - 1) - (p[i] - p[i - 1]) / prev);
+            } else {
+                const double next = t[i + 1] - t[i];
+                diagonal[i] = 2 * (prev + next);
+                upper[i] = next;
+                second[i] = 6 * ((p[i + 1] - p[i]) / next - (p[i] - p[i - 1]) / prev);
+            }
+            const double factor = lower / diagonal[i - 1];
+            diagonal[i] -= factor * upper[i - 1];
+            second[i] -= factor * second[i - 1];
+        }
+        second.back() /= diagonal.back();
+        for (int i = n - 2; i >= 0; --i)
+            second[i] = (second[i] - upper[i] * second[i + 1]) / diagonal[i];
+    }
+    std::pair<Vector3d, Vector3d> eval(double u) const {
+        const int n = static_cast<int>(p.size());
+        if (n < 4) {
+            Vector3d q = Vector3d::Zero(), d = Vector3d::Zero();
+            for (int j = 0; j < n; ++j) {
+                double value = 1, derivative = 0;
+                for (int k = 0; k < n; ++k)
+                    if (k != j) value *= (u - t[k]) / (t[j] - t[k]);
+                for (int k = 0; k < n; ++k) {
+                    if (k == j) continue;
+                    double term = 1 / (t[j] - t[k]);
+                    for (int l = 0; l < n; ++l)
+                        if (l != j && l != k) term *= (u - t[l]) / (t[j] - t[l]);
+                    derivative += term;
+                }
+                q += value * p[j];
+                d += derivative * p[j];
+            }
+            return {q, d};
+        }
+        int i = std::clamp(static_cast<int>(std::upper_bound(t.begin(), t.end(), u) - t.begin()) - 1,
+                           0, n - 2);
+        double h = t[i + 1] - t[i], a = (t[i + 1] - u) / h, b = (u - t[i]) / h;
+        Vector3d q = a * p[i] + b * p[i + 1] +
+            ((a * a * a - a) * second[i] + (b * b * b - b) * second[i + 1]) * h * h / 6;
+        Vector3d d = (p[i + 1] - p[i]) / h +
+            ((1 - 3 * a * a) * second[i] + (3 * b * b - 1) * second[i + 1]) * h / 6;
+        return {q, d};
+    }
+    double closest_parameter(const Vector3d& point) const {
+        double best = (point - p[0]).squaredNorm(), parameter = 0, left = 0, right = t[1];
+        // Scan every span; then minimize in the best sample's neighboring bracket.
+        for (size_t i = 0; i + 1 < t.size(); ++i) {
+            double step = (t[i + 1] - t[i]) / 12;
+            for (int k = 0; k <= 12; ++k) {
+                double u = t[i] + k * step, d = (eval(u).first - point).squaredNorm();
+                if (d <= best) {
+                    best = d; parameter = u;
+                    left = std::max(0.0, u - step);
+                    right = std::min(t.back(), u + step);
+                }
+            }
+        }
+        for (int i = 0; i < 80; ++i) {
+            double a = left + (right - left) * 0.3819660112501051;
+            double b = left + (right - left) * 0.6180339887498949;
+            if ((eval(a).first - point).squaredNorm() < (eval(b).first - point).squaredNorm())
+                right = b;
+            else left = a;
+        }
+        double u = (left + right) / 2;
+        return (eval(u).first - point).squaredNorm() < best ? u : parameter;
+    }
+};
+
+struct Plane3 { Vector3d origin, normal; };
+Plane3 constraint_plane(const json& c) {
+    if (!c.contains("plane")) throw std::runtime_error("plane is required");
+    const json& p = c["plane"];
+    if (p.is_string()) {
+        const std::string name = p.get<std::string>();
+        // Match eval_resolve_plane / SketchPlane factories, including front's sign.
+        if (name == "front") return {Vector3d::Zero(), Vector3d(0, -1, 0)};
+        if (name == "top") return {Vector3d::Zero(), Vector3d(0, 0, 1)};
+        if (name == "right") return {Vector3d::Zero(), Vector3d(1, 0, 0)};
+        throw std::runtime_error("unknown datum plane '" + name + "'");
+    }
+    Vector3d origin = pt3(p.at("origin")), normal = pt3(p.at("normal"));
+    if (!origin.allFinite() || !normal.allFinite() || normal.norm() < 1e-12)
+        throw std::runtime_error("plane needs finite origin and nonzero normal");
+    return {origin, normal.normalized()};
+}
+
+void add_plane_constraint(System& sys, const std::string& cid, const std::string& type,
+                          const std::vector<std::string>& refs, const Plane3& plane,
+                          const EntMap& entities, const VarMap& vm) {
+    const Vector3d n = plane.normal, o = plane.origin;
+    if (type == "normal_plane") {
+        add_along_axis(sys, cid, line_vars(refs[0], entities, vm), n);
+        return;
+    }
+    if (type == "parallel_plane") {
+        const auto idx = line_vars(refs[0], entities, vm);
+        sys.add_residual([n](const VectorXd& x) {
+            VectorXd r(1); r(0) = n.dot(x.segment<3>(3) - x.segment<3>(0)); return r;
+        }, idx, [n](const VectorXd&) {
+            MatrixXd J(1, 6); J << -n.transpose(), n.transpose(); return J;
+        }, cid);
+        return;
+    }
+    if (type == "symmetric") {
+        auto idx = resolve_point_handle(refs[0], entities, vm).idx;
+        auto other = resolve_point_handle(refs[1], entities, vm).idx;
+        idx.insert(idx.end(), other.begin(), other.end());
+        const Matrix3d mirror = Matrix3d::Identity() - 2 * n * n.transpose();
+        sys.add_residual([mirror, o](const VectorXd& x) {
+            VectorXd r = x.segment<3>(3) - o - mirror * (x.segment<3>(0) - o); return r;
+        }, idx, [mirror](const VectorXd&) {
+            MatrixXd J(3, 6); J << -mirror, Matrix3d::Identity(); return J;
+        }, cid);
+        return;
+    }
+    Handle3 h = resolve_handle(refs[0], entities, vm);
+    const std::string t = entities.at(eid_of(refs[0])).value("type", std::string());
+    if (h.whole && t != "line" && t != "arc")
+        throw std::runtime_error("on_plane expects a point, line or arc");
+    const int count = static_cast<int>(h.idx.size()) / 3;
+    if (!count) throw std::runtime_error("on_plane has no point coordinates");
+    sys.add_residual([n, o, count](const VectorXd& x) {
+        VectorXd r(count);
+        for (int i = 0; i < count; ++i) r(i) = n.dot(x.segment<3>(i * 3) - o);
+        return r;
+    }, h.idx, [n, count](const VectorXd&) {
+        MatrixXd J = MatrixXd::Zero(count, count * 3);
+        for (int i = 0; i < count; ++i) J.block<1, 3>(i, i * 3) = n.transpose();
+        return J;
+    }, cid);
+}
+
+void add_curve_relation(System& sys, const std::string& cid, const std::string& type,
+                         const std::vector<std::string>& refs, const EntMap& entities,
+                         const VarMap& vm) {
+    const std::string a = eid_of(refs[0]), b = eid_of(refs[1]);
+    const std::string ta = entities.at(a).value("type", std::string());
+    const std::string tb = entities.at(b).value("type", std::string());
+    if ((ta == "line" && vm.at(a).size() != 6) || (tb == "line" && vm.at(b).size() != 6) ||
+        (ta == "arc" && vm.at(a).size() != 9) || (tb == "arc" && vm.at(b).size() != 9))
+        throw std::runtime_error(type + ": missing curve coordinates");
+    auto idx = vm.at(a);
+    const int split = static_cast<int>(idx.size());
+    idx.insert(idx.end(), vm.at(b).begin(), vm.at(b).end());
+    if (type == "equal" && ta == "line" && tb == "line") {
+        add_numeric(sys, cid, idx, [](const VectorXd& x) {
+            VectorXd r(1);
+            r(0) = (x.segment<3>(3) - x.segment<3>(0)).norm() -
+                   (x.segment<3>(9) - x.segment<3>(6)).norm();
+            return r;
+        });
+    } else if ((type == "equal" || type == "concentric" || type == "coradial") &&
+               ta == "arc" && tb == "arc") {
+        add_numeric(sys, cid, idx, [type](const VectorXd& x) {
+            Circle3 a(x.head(9)), b(x.tail(9));
+            VectorXd r(type == "equal" ? 1 : type == "coradial" ? 4 : 3);
+            if (type != "equal") r.head<3>() = a.c - b.c;
+            if (type != "concentric") r(r.size() - 1) = a.r - b.r;
+            return r;
+        });
+    } else if (type == "tangent" &&
+               ((ta == "line" && (tb == "arc" || tb == "spline")) ||
+                (tb == "line" && (ta == "arc" || ta == "spline")) ||
+                (ta == "arc" && tb == "arc"))) {
+        // A supplied endpoint selects that end; bare curves choose their nearest
+        // authored endpoint pair, and keep that branch through the solve.
+        const VectorXd init = sys.init_vector();
+        auto ends = [&](const std::string& ref, const std::string& t, const std::vector<int>& v) {
+            if (ref.find('.') != std::string::npos) {
+                auto h = resolve_point_handle(ref, entities, vm);
+                if (h.idx[0] != v.front() && h.idx[0] != v[v.size() - 3])
+                    throw std::runtime_error("tangent requires a curve endpoint");
+                return std::vector<int>{h.idx[0] == v.front() ? 0 : static_cast<int>(v.size()) - 3};
+            }
+            return std::vector<int>{0, t == "line" ? 3 : static_cast<int>(v.size()) - 3};
+        };
+        auto ea = ends(refs[0], ta, vm.at(a)), eb = ends(refs[1], tb, vm.at(b));
+        int ka = 0, kb = 0;
+        double best = std::numeric_limits<double>::infinity();
+        for (int i : ea) for (int j : eb) {
+            Vector3d pa, pb;
+            for (int k = 0; k < 3; ++k) { pa(k) = init(vm.at(a)[i + k]); pb(k) = init(vm.at(b)[j + k]); }
+            if ((pa - pb).squaredNorm() < best) { best = (pa - pb).squaredNorm(); ka = i; kb = j; }
+        }
+        add_numeric(sys, cid, idx, [ta, tb, split, ka, kb](const VectorXd& x) {
+            auto tangent = [](const VectorXd& v, const std::string& type, int end) -> Vector3d {
+                if (type == "line") return v.segment<3>(3) - v.segment<3>(0);
+                if (type == "arc") {
+                    Circle3 circle(v);
+                    return circle.n.cross(v.segment<3>(end) - circle.c);
+                }
+                Spline3 spline(v);
+                return spline.eval(end == 0 ? 0 : spline.t.back()).second;
+            };
+            Vector3d da = tangent(x.head(split), ta, ka), db = tangent(x.tail(x.size() - split), tb, kb);
+            if (da.norm() < 1e-12 || db.norm() < 1e-12)
+                throw std::runtime_error("tangent has a degenerate direction");
+            da.normalize(); db.normalize();
+            Vector3d e1, e2;
+            perp_basis(da, e1, e2);
+            const Vector3d cross = da.cross(db);
+            VectorXd r(2);
+            r << cross.dot(e1), cross.dot(e2);
+            return r;
+        });
+    } else {
+        throw std::runtime_error(type + ": unsupported entity pair '" + ta + "', '" + tb + "'");
+    }
 }
 
 // ------------------------------------------------------------ constraint wiring
@@ -631,6 +942,40 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
         need(2);
         add_parallel(sys, cid, line_vars(refs[0], entities, vm),
                      line_vars(refs[1], entities, vm));
+    } else if (ctype == "on_plane" || ctype == "parallel_plane" ||
+               ctype == "normal_plane" || ctype == "symmetric") {
+        need(ctype == "symmetric" ? 2 : 1);
+        add_plane_constraint(sys, cid, ctype, refs, constraint_plane(c), entities, vm);
+    } else if (ctype == "equal" || ctype == "tangent" || ctype == "concentric" ||
+               ctype == "coradial") {
+        need(2);
+        add_curve_relation(sys, cid, ctype, refs, entities, vm);
+    } else if (ctype == "collinear") {
+        need(2);
+        const auto a = line_vars(refs[0], entities, vm), b = line_vars(refs[1], entities, vm);
+        add_parallel(sys, cid, a, b);
+        add_point_on_line(sys, cid, {b[0], b[1], b[2]}, a);
+    } else if (ctype == "midpoint") {
+        need(2);
+        auto idx = resolve_point_handle(refs[0], entities, vm).idx;
+        const std::string eid = eid_of(refs[1]);
+        const std::string type = entities.at(eid).value("type", std::string());
+        if (type != "line" && type != "arc")
+            throw std::runtime_error("midpoint expects a point and a line or arc");
+        const auto& curve = vm.at(eid);
+        if (curve.size() != (type == "line" ? 6u : 9u))
+            throw std::runtime_error("midpoint: missing curve coordinates");
+        idx.insert(idx.end(), curve.begin(), curve.end());
+        add_numeric(sys, cid, idx, [type](const VectorXd& x) {
+            Vector3d mid;
+            if (type == "line") mid = (x.segment<3>(3) + x.segment<3>(6)) / 2;
+            else {
+                Circle3 circle(x.tail(9));
+                mid = circle.midpoint(x.segment<3>(3), x.segment<3>(6), x.segment<3>(9));
+            }
+            VectorXd r = x.head<3>() - mid;
+            return r;
+        });
     } else if (ctype == "perpendicular") {
         need(2);
         add_perpendicular(sys, cid, line_vars(refs[0], entities, vm),
@@ -664,8 +1009,24 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
             add_point_on_line(sys, cid, p.idx, line_vars(eid, entities, vm));
         else if (t == "arc")
             add_point_on_arc(sys, cid, p.idx, vm.at(eid));
-        else
-            // point_on(spline) is deferred to v2 — skip forward-tolerantly.
+        else if (t == "spline") {
+            auto idx = p.idx;
+            const auto& curve = vm.at(eid);
+            idx.insert(idx.end(), curve.begin(), curve.end());
+            add_numeric(sys, cid, idx, [](const VectorXd& x) {
+                Spline3 spline(x.tail(x.size() - 3));
+                const double parameter = spline.closest_parameter(x.head<3>());
+                auto curve = spline.eval(parameter);
+                Vector3d e1, e2;
+                perp_basis(curve.second, e1, e2);
+                const Vector3d delta = x.head<3>() - curve.first;
+                VectorXd r(3);
+                r << delta.dot(e1), delta.dot(e2),
+                    parameter == 0 || parameter == spline.t.back()
+                        ? delta.dot(curve.second.normalized()) : 0.0;
+                return r;
+            });
+        } else
             throw std::runtime_error("point_on: unsupported target '" + t + "'");
     } else {
         throw std::runtime_error("unknown constraint '" + ctype + "'");
@@ -715,6 +1076,22 @@ json extract_entities(const VectorXd& x, const json& entities_list, const VarMap
             json pts = json::array();
             for (size_t k = 0; k * 3 + 2 < v.size(); ++k) pts.push_back(arr3(v, (int)k));
             rec["points"] = pts;
+            json samples = json::array();
+            try {
+                Spline3 spline(x.segment(v.front(), v.size()));
+                constexpr int steps = 12;
+                for (size_t span = 0; span + 1 < spline.t.size(); ++span)
+                    for (int k = span == 0 ? 0 : 1; k <= steps; ++k) {
+                        const double u = spline.t[span] +
+                            (spline.t[span + 1] - spline.t[span]) * k / steps;
+                        const Vector3d p = spline.eval(u).first;
+                        samples.push_back(json::array({p.x(), p.y(), p.z()}));
+                    }
+            } catch (const std::runtime_error&) {
+                // Coincident interpolation points cannot produce a compiled wire.
+                // Keep their handles, but do not draw an invented substitute curve.
+            }
+            rec["samples"] = std::move(samples);
         } else {
             rec = e;  // unknown type: echo authored params
             rec.erase("id");
@@ -801,7 +1178,8 @@ std::map<std::string, std::vector<int>> build_tag_vars(const json& constraints_l
 
 // Build the System (allocate entities + register constraints, forward-tolerant).
 void build_system(const json& entities_list, const json& constraints_list,
-                  const json& env, System& sys, EntMap& entities, VarMap& var_map) {
+                  const json& env, System& sys, EntMap& entities, VarMap& var_map,
+                  std::vector<std::pair<std::string, std::string>>* skipped = nullptr) {
     for (const auto& e : entities_list) entities[e.value("id", std::string())] = e;
     for (const auto& e : entities_list) {
         try {
@@ -836,8 +1214,12 @@ void build_system(const json& entities_list, const json& constraints_list,
     for (const auto& c : constraints_list) {
         try {
             add_constraint(sys, c, entities, var_map, env);
+        } catch (const std::exception& error) {
+            if (skipped) skipped->emplace_back(c.is_object() ? c.value("id", std::string()) : "",
+                                              error.what());
         } catch (...) {
-            // forward-tolerant: skip malformed/unsupported constraints
+            if (skipped) skipped->emplace_back(c.is_object() ? c.value("id", std::string()) : "",
+                                              "unusable constraint");
         }
     }
 }
@@ -852,7 +1234,8 @@ Sketch3DSolution solve_sketch3d(const json& sketch, const json& env,
     System sys;
     EntMap entities;
     VarMap var_map;
-    build_system(entities_list, constraints_list, env, sys, entities, var_map);
+    Sketch3DSolution sol;
+    build_system(entities_list, constraints_list, env, sys, entities, var_map, &sol.skipped);
 
     std::map<std::string, std::string> cur_sig;
     for (const auto& e : entities_list) cur_sig[e.value("id", std::string())] = e.dump();
@@ -880,7 +1263,6 @@ Sketch3DSolution solve_sketch3d(const json& sketch, const json& env,
         }
     }
 
-    Sketch3DSolution sol;
     auto res = sys.solve(x0, 1e-10, 50);
     sol.converged = res.converged;
 

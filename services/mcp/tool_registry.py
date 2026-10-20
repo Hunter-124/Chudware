@@ -20,6 +20,7 @@ import inspect
 import logging
 import os
 from functools import wraps
+from services.agent.request_context import current_context, in_cell, owner_key
 
 _LOG = logging.getLogger(__name__)
 
@@ -406,6 +407,10 @@ def deny_reason(name: str) -> str | None:
     A Settings or family policy that raises refuses the call (fail closed): a broken
     config read must never re-enable a tool the user switched off.
     """
+    if in_cell():
+        owner_key()
+        if current_context().get("right") == "viewer" and classify_risk(name) != RISK_READ:
+            return "forbidden_right"
     # Meta-tools are always permitted (request more surface / list packs / recipes).
     if name in ("enable_tools", "list_tool_categories", "design_recipe"):
         return None

@@ -8,18 +8,26 @@
 #include <doctest/doctest.h>
 
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
+#include <future>
+#include <thread>
 
+#include <miniz.h>
 #include <nlohmann/json.hpp>
 #include <Standard_Version.hxx>
 
 #include "doc/session.h"
+#include "doc/drawing_session.h"
 #include "doc/stepplus.h"
 #include "doc/document.h"
 #include "aicm_loader.h"  // host loader (host/src/render on the include path)
 #include "geom/aicm.h"
+#include "environment_test_support.h"
 
 using json = nlohmann::json;
 using doctest::Approx;
@@ -81,6 +89,79 @@ void check_face_appearance(const aicm::AicmBody& body, uint32_t face_id,
     CHECK(appearance.roughness == Approx(expected.roughness));
 }
 }  // namespace
+
+TEST_CASE("view metrics preserve every camera and visual measurement within the solver thread budget") {
+    using namespace chudware::doc;
+    struct ThreadBudgetGuard {
+        const char* previous = std::getenv("CHUDWARE_SIM_THREADS");
+        const bool had_previous = previous != nullptr;
+        const std::string saved = previous ? previous : "";
+        ~ThreadBudgetGuard() {
+            chudware::test::setOrUnsetEnvironment(
+                "CHUDWARE_SIM_THREADS", had_previous ? saved.c_str() : nullptr);
+        }
+    } thread_budget;
+    const auto id = make_box_doc();
+    struct DocumentGuard {
+        const std::string& id;
+        ~DocumentGuard() { doc_close(id); }
+    } document{id};
+    json cameras = json::array();
+    for (int i = 0; i < 24; ++i) {
+        const double angle = 2.0 * std::acos(-1.0) * i / 24;
+        cameras.push_back({
+            {"projection", "perspective"},
+            {"position", {120.0 * std::cos(angle), 120.0 * std::sin(angle), 100.0}},
+            {"target", {0.0, 0.0, 0.0}}, {"up", {0.0, 0.0, 1.0}},
+            {"vertical_fov_deg", 30.0}, {"near", 1.0}, {"far", 1000.0}});
+    }
+    const json request{{"doc_id", id}, {"cameras", cameras}, {"width", 128}, {"height", 96}};
+    REQUIRE(chudware::test::setEnvironment("CHUDWARE_SIM_THREADS", "1") == 0);
+    const auto serial = doc_view_metrics(request);
+    REQUIRE_MESSAGE(serial.value("ok", false), serial.dump());
+    REQUIRE(serial.at("views").size() == cameras.size());
+    for (const auto& view : serial.at("views")) {
+        CHECK(view.at("fg_px").get<int>() > 0);
+        CHECK_FALSE(view.at("face_vis").empty());
+        CHECK_FALSE(view.at("edge_vis").empty());
+    }
+    REQUIRE(chudware::test::setEnvironment("CHUDWARE_SIM_THREADS", "4") == 0);
+    const auto parallel = doc_view_metrics(request);
+    REQUIRE_MESSAGE(parallel.value("ok", false), parallel.dump());
+    CHECK(parallel.at("faces") == serial.at("faces"));
+    CHECK(parallel.at("edges") == serial.at("edges"));
+    CHECK(parallel.at("views") == serial.at("views"));
+    // With a disposable TasksMax=20 service this demand runs out of launch slots
+    // after some workers start. On an unconstrained host it may legitimately finish.
+    // Either outcome must leave the native document usable, never abort or return
+    // partially populated measurements as a successful response.
+    REQUIRE(chudware::test::setEnvironment("CHUDWARE_SIM_THREADS", "64") == 0);
+    json demand = request;
+    demand["width"] = 1024;
+    demand["height"] = 1024;
+    const auto constrained = doc_view_metrics(demand);
+    INFO(constrained.dump());
+    if (constrained.value("ok", false)) {
+        REQUIRE(constrained.at("views").size() == cameras.size());
+        for (const auto& view : constrained.at("views")) {
+            CHECK(view.at("fg_px").get<int>() > 0);
+            CHECK_FALSE(view.at("face_vis").empty());
+            CHECK_FALSE(view.at("edge_vis").empty());
+        }
+    } else {
+        CHECK(constrained.at("code") == "metrics_failed");
+        CHECK_FALSE(constrained.at("reason").get<std::string>().empty());
+        CHECK_FALSE(constrained.contains("views"));
+    }
+    std::printf("[view_metrics] constrained launch outcome=%s\n",
+                constrained.value("ok", false) ? "complete" : "metrics_failed");
+    REQUIRE(chudware::test::setEnvironment("CHUDWARE_SIM_THREADS", "1") == 0);
+    const auto recovered = doc_view_metrics(request);
+    REQUIRE_MESSAGE(recovered.value("ok", false), recovered.dump());
+    CHECK(recovered.at("faces") == serial.at("faces"));
+    CHECK(recovered.at("edges") == serial.at("edges"));
+    CHECK(recovered.at("views") == serial.at("views"));
+}
 
 TEST_CASE("selected face finish: body defaults, physics, caches and native nesting survive set and clear") {
     using namespace chudware::doc;
@@ -637,6 +718,25 @@ bool has_entry(const json& cache, const std::string& name) {
     return false;
 }
 
+// Every member of a ZIP container, decompressed, by name.
+std::map<std::string, std::string> zip_members(const std::filesystem::path& path) {
+    mz_zip_archive zip;
+    std::memset(&zip, 0, sizeof(zip));
+    REQUIRE(mz_zip_reader_init_file(&zip, path.string().c_str(), 0));
+    std::map<std::string, std::string> members;
+    for (mz_uint i = 0; i < mz_zip_reader_get_num_files(&zip); ++i) {
+        mz_zip_archive_file_stat st;
+        REQUIRE(mz_zip_reader_file_stat(&zip, i, &st));
+        std::size_t size = 0;
+        void* data = mz_zip_reader_extract_to_heap(&zip, i, &size, 0);
+        REQUIRE((data || size == 0));
+        members[st.m_filename] = std::string(static_cast<const char*>(data), size);
+        mz_free(data);
+    }
+    mz_zip_reader_end(&zip);
+    return members;
+}
+
 // Rewrite a saved container with `edit` applied to its document/extra entries.
 template <typename Edit>
 void rewrite_container(const std::filesystem::path& path, Edit edit) {
@@ -868,4 +968,425 @@ TEST_CASE("persisted build state: over-budget checkpoints drop oldest first, the
     CHECK(none_report.at("written") == false);
     CHECK(none_report.at("reason") == "budget");
     CHECK(none_report.at("checkpoints_dropped") == 3);
+}
+
+TEST_CASE("persisted build state: an open that rebuilds a stale cache saves the build into its file") {
+    using namespace chudware::doc;
+    const std::string id = make_three_box_part();
+    AppearanceFiles files(id);
+    const auto path = files.dir / "stale.step+";
+    doc_save(id, path.string());
+    REQUIRE(doc_close(id));
+    // An older engine epoch built this state: neither the display nor checkpoints serve.
+    rewrite_container(path, [](StepPlusDoc& stored) {
+        json header = json::parse(stored.extra.at("cache.json"));
+        header["engine"] = "chudware-geomcache/0;occt=stale";
+        stored.extra["cache.json"] = header.dump();
+        stored.extra.erase("cache.ckpt");
+        stored.extra["notes/readme.txt"] = "kept verbatim";
+    });
+    const auto authored = zip_members(path);
+
+    const json before = compile_cache_stats();
+    const json opened = doc_open(path.string());
+    INFO(opened.at("cache").dump());
+    CHECK(opened.at("cache_miss_reason") == "engine_key");
+    CHECK(executed_since(before) == 3);
+    CHECK(opened.at("cache").at("writeback").at("written") == true);
+    REQUIRE(doc_close(opened.at("doc_id").get<std::string>()));
+
+    // Only build state changed: the document, its metadata and every other member keep
+    // their authored bytes.
+    const auto rewritten = zip_members(path);
+    for (const char* name : {"document.json", "meta.json", "thumbnail.png", "notes/readme.txt"})
+        CHECK(rewritten.at(name) == authored.at(name));
+    CHECK(rewritten.count("cache.ckpt") == 1);
+    CHECK(json::parse(rewritten.at("cache.json")).at("engine") == stepplus_cache_engine_key());
+
+    const json warm_before = compile_cache_stats();
+    const json reopened = doc_open(path.string());
+    INFO(reopened.at("cache").dump());
+    CHECK(reopened.at("cache_hit") == true);
+    CHECK(reopened.at("cache").at("hydrated_from") == "cache.ckpt");
+    CHECK_FALSE(reopened.at("cache").contains("writeback"));
+    CHECK(executed_since(warm_before) == 0);
+    REQUIRE(doc_close(reopened.at("doc_id").get<std::string>()));
+}
+
+TEST_CASE("persisted build state: a write-back never replaces a file that changed after its read") {
+    using namespace chudware::doc;
+    namespace fs = std::filesystem;
+    const std::string id = make_box_doc();
+    AppearanceFiles files(id);
+    const auto path = files.dir / "guarded.step+";
+    doc_save(id, path.string());
+    REQUIRE(doc_close(id));
+    const auto authored = zip_members(path);
+    const std::string hash = stepplus_doc_hash(stepplus_open(path.string()).doc);
+    const std::map<std::string, std::string> entries = {{"cache.json", "{}"}};
+    const NativeFileStamp stamp = stepplus_file_stamp(path.string());
+    REQUIRE(stamp.valid);
+
+    // The build was for another tree (an edit that kept size and mtime).
+    BuildStateWriteback refused =
+        stepplus_write_build_state(path.string(), stamp, "another-document", entries);
+    CHECK_FALSE(refused.written);
+    CHECK(refused.reason == "document_changed");
+    // A save landed after the read.
+    fs::last_write_time(path, fs::last_write_time(path) + std::chrono::seconds(2));
+    refused = stepplus_write_build_state(path.string(), stamp, hash, entries);
+    CHECK_FALSE(refused.written);
+    CHECK(refused.reason == "file_changed");
+
+    CHECK(zip_members(path) == authored);
+    for (const auto& entry : fs::directory_iterator(files.dir))
+        CHECK(entry.path().filename() == path.filename());
+}
+
+TEST_CASE("persisted assembly cache: a rebuilt component saves its build and the assembly stays warm") {
+    using namespace chudware::doc;
+    namespace fs = std::filesystem;
+    const std::string part = make_box_doc();
+    AppearanceFiles files(part);
+    const auto part_path = files.dir / "leaf.step+";
+    doc_save(part, part_path.string());
+    REQUIRE(doc_close(part));
+    const std::string assembly = doc_new("assembly", "WriteBackAssembly").at("doc_id");
+    doc_apply_ops(assembly, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", part_path.string()}}},
+         {"fixed", true}},
+    }), false);
+    const auto path = files.dir / "assembly.step+";
+    doc_save(assembly, path.string());
+    REQUIRE(doc_close(assembly));
+    // Both files carry state from an older engine epoch.
+    auto stale = [](StepPlusDoc& stored) {
+        json header = json::parse(stored.extra.at("cache.json"));
+        header["engine"] = "chudware-geomcache/0;occt=stale";
+        stored.extra["cache.json"] = header.dump();
+        stored.extra.erase("cache.ckpt");
+    };
+    rewrite_container(part_path, stale);
+    rewrite_container(path, stale);
+
+    const json opened = doc_open(path.string());
+    INFO(opened.at("cache").dump());
+    CHECK(opened.at("cache_miss_reason") == "engine_key");
+    const json& wb = opened.at("cache").at("writeback");
+    CHECK(wb.at("written") == true);
+    REQUIRE(wb.at("components").size() == 1);
+    CHECK(wb.at("components")[0].at("build_state").at("written") == true);
+    REQUIRE(doc_close(opened.at("doc_id").get<std::string>()));
+
+    // The component now opens warm on its own.
+    const json leaf = doc_open(part_path.string());
+    CHECK(leaf.at("cache_hit") == true);
+    REQUIRE(doc_close(leaf.at("doc_id").get<std::string>()));
+    // A rewrite of the component that keeps its document (here: only its mtime moves) does
+    // not invalidate the assembly's saved display.
+    fs::last_write_time(part_path, fs::last_write_time(part_path) + std::chrono::seconds(2));
+    const json reopened = doc_open(path.string());
+    INFO(reopened.at("cache").dump());
+    CHECK(reopened.at("cache_hit") == true);
+    REQUIRE(doc_close(reopened.at("doc_id").get<std::string>()));
+}
+
+TEST_CASE("persisted assembly cache: detached imports retain warm display and detect changes") {
+    using namespace chudware::doc;
+    const std::string part = make_box_doc();
+    AppearanceFiles files(part);
+    const auto part_path = files.dir / "leaf.step+";
+    set_appearance(part, {{"color", {0.9, 0.05, 0.05}}});
+    doc_save(part, part_path.string());
+    const auto old_time = std::filesystem::last_write_time(part_path);
+    const std::string assembly = doc_new("assembly", "DetachedCachedAssembly").at("doc_id");
+    doc_apply_ops(assembly, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", part_path.string()}}},
+         {"fixed", true}},
+    }), false);
+    const auto path = files.dir / "assembly.step+";
+    doc_save(assembly, path.string());
+    const auto stored = stepplus_open(path.string());
+    REQUIRE(stored.doc["components"][0]["source"]["path"] == "leaf.step+");
+
+    // Keep the original open: detaching must also give the imported copy a unique
+    // display name, neither invalidating the saved display nor changing its source.
+    const json opened = doc_open(path.string(), false, true);
+    REQUIRE_MESSAGE(opened.value("cache_hit", false), opened.dump());
+    CHECK(opened["tree"]["name"] != stored.doc["name"]);
+    CHECK(opened["tree"]["components"][0]["source"]["path"] == part_path.string());
+    CHECK(opened["tess"]["bodies"][0]["color"][0].get<float>() == Approx(0.9f));
+    REQUIRE(doc_close(opened.at("doc_id").get<std::string>()));
+
+    SUBCASE("changed dependency still invalidates the display") {
+        set_appearance(part, {{"color", {0.05, 0.05, 0.9}}});
+        doc_save(part, part_path.string());
+        std::filesystem::last_write_time(part_path, old_time + std::chrono::seconds(2));
+        const json changed = doc_open(path.string(), false, true);
+        CHECK_FALSE(changed.value("cache_hit", false));
+        CHECK(changed["cache_miss_reason"] == "components_changed");
+        CHECK(changed["tess"]["bodies"][0]["color"][2].get<float>() == Approx(0.9f));
+        REQUIRE(doc_close(changed.at("doc_id").get<std::string>()));
+    }
+    SUBCASE("changed authored tree still invalidates the display") {
+        rewrite_container(path, [](StepPlusDoc& document) {
+            document.doc["components"][0]["transform"][3] = 12.0;
+        });
+        const json changed = doc_open(path.string(), false, true);
+        CHECK_FALSE(changed.value("cache_hit", false));
+        CHECK(changed["cache_miss_reason"] == "doc_hash");
+        REQUIRE(doc_close(changed.at("doc_id").get<std::string>()));
+    }
+    REQUIRE(doc_close(assembly));
+    REQUIRE(doc_close(part));
+}
+
+TEST_CASE("cache provenance: local saved parts reopen verified with zero executed features") {
+    using namespace chudware::doc;
+    const auto id = make_three_box_part();
+    AppearanceFiles files(id);
+    const auto path = files.dir / "authenticated.step+";
+    doc_save(id, path.string());
+    const auto saved = stepplus_open(path.string());
+    REQUIRE(saved.extra.count("cache.provenance") == 1);
+    CHECK(stepplus_cache_verified(saved.doc, saved.extra));
+    REQUIRE(doc_close(id));
+    const auto before = compile_cache_stats();
+    const auto opened = doc_open(path.string());
+    CHECK(opened.at("cache_trust") == "verified");
+    CHECK(opened.at("warm") == true);
+    CHECK(opened.at("cache").at("features_executed") == 0);
+    CHECK(executed_since(before) == 0);
+    CHECK(doc_activate(opened.at("doc_id")).at("rebuild").at("doc_status").at("features_executed") == 0);
+    REQUIRE(doc_close(opened.at("doc_id")));
+}
+
+TEST_CASE("cache provenance: a foreign hybrid displays immediately then replaces and authenticates") {
+    using namespace chudware::doc;
+    const auto source = make_box_doc();
+    const auto donor = make_box_doc();
+    AppearanceFiles files(source);
+    const auto target = files.dir / "hybrid.step+";
+    const auto donor_path = files.dir / "donor.step+";
+    const std::string feature = doc_tree(donor).at("tree").at("features").at(0).at("id");
+    const auto donor_response = doc_apply_ops(donor, -1, json::array({
+        {{"op", "edit_feature"}, {"id", feature}, {"params", {{"length", 80.0}}}},
+    }), false);
+    doc_save(source, target.string());
+    doc_save(donor, donor_path.string());
+    REQUIRE(doc_close(source));
+    REQUIRE(doc_close(donor));
+    auto hybrid = zip_members(target);
+    const auto foreign = zip_members(donor_path);
+    hybrid["cache.aicm"] = foreign.at("cache.aicm");
+    hybrid["cache.brep"] = foreign.at("cache.brep");
+    hybrid.erase("cache.ckpt");
+    json header = json::parse(foreign.at("cache.json"));
+    header["doc_hash"] = stepplus_doc_hash(json::parse(hybrid.at("document.json")));
+    hybrid["cache.json"] = header.dump();
+    // Deliberately retain the original MAC: raw ZIP assembly must not re-sign the hybrid.
+    mz_zip_archive archive{};
+    REQUIRE(mz_zip_writer_init_file(&archive, target.string().c_str(), 0));
+    for (const auto& [name, bytes] : hybrid)
+        REQUIRE(mz_zip_writer_add_mem(&archive, name.c_str(), bytes.data(), bytes.size(), MZ_NO_COMPRESSION));
+    REQUIRE(mz_zip_writer_finalize_archive(&archive));
+    mz_zip_writer_end(&archive);
+    const auto imported = stepplus_open(target.string());
+    CHECK_FALSE(stepplus_cache_verified(imported.doc, imported.extra));
+
+    struct RefreshSinkGuard {
+        std::shared_ptr<std::promise<void>> release = std::make_shared<std::promise<void>>();
+        ~RefreshSinkGuard() {
+            try { release->set_value(); } catch (...) {}
+            set_cache_refresh_sink({});
+        }
+    } guard;
+    auto promise = std::make_shared<std::promise<json>>();
+    auto refreshed = promise->get_future();
+    const auto release = guard.release->get_future().share();
+    set_cache_refresh_sink([promise, release](const std::string&, const json& result) {
+        promise->set_value(result);
+        release.wait();  // publication itself remains lifecycle work
+    });
+    const json opened = doc_open(target.string());
+    CHECK(opened.at("cache_hit") == true);
+    CHECK(opened.at("cache_trust") == "unverified");
+    CHECK(opened.at("cache_verification_pending") == true);
+    CHECK(opened.at("cache").at("features_executed") == 0);
+    CHECK(opened.at("volume") == donor_response.at("volume"));
+    REQUIRE(refreshed.wait_for(std::chrono::seconds(60)) == std::future_status::ready);
+    const json replacement = refreshed.get();
+    INFO(replacement.dump());
+    std::uint64_t cache_active = 0, dirty = 0;
+    const auto activity_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (!activity_counts(cache_active, dirty)) {
+        REQUIRE(std::chrono::steady_clock::now() < activity_deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(cache_active >= 1);
+    guard.release->set_value();
+    CHECK(replacement.at("cache_trust") == "verified");
+    CHECK(replacement.at("mismatch") == true);
+    CHECK(replacement.at("volume").get<double>() == Approx(40.0 * 24.0 * 12.0));
+    REQUIRE(!replacement.at("warnings").empty());
+    CHECK(replacement.at("cache_verification").at("writeback").at("written") == true);
+    const auto rebuilt = stepplus_open(target.string());
+    CHECK(stepplus_cache_verified(rebuilt.doc, rebuilt.extra));
+    const std::string id = opened.at("doc_id");
+    CHECK(doc_activate(id).at("volume") == replacement.at("volume"));
+    REQUIRE(doc_close(id));
+    const auto warm = doc_open(target.string());
+    CHECK(warm.at("cache_trust") == "verified");
+    CHECK(warm.at("cache").at("features_executed") == 0);
+    REQUIRE(doc_close(warm.at("doc_id")));
+}
+
+TEST_CASE("cache provenance: foreign assembly display stays warm until its background refresh") {
+    using namespace chudware::doc;
+    const auto part = make_box_doc();
+    AppearanceFiles files(part);
+    const auto leaf = files.dir / "leaf.step+";
+    doc_save(part, leaf.string());
+    REQUIRE(doc_close(part));
+    const auto component = stepplus_open_component(leaf.string());
+    CHECK(component.extra.count("cache.aicm") == 0);
+    CHECK(component.extra.count("cache.ckpt") == 0);
+    CHECK(stepplus_cache_verified(component.doc, component.extra, true));
+    auto changed_member = component.extra;
+    changed_member["cache.brep"].back() ^= 1;
+    CHECK_FALSE(stepplus_cache_verified(component.doc, changed_member, true));
+    const std::string assembly = doc_new("assembly", "AuthenticatedAssembly").at("doc_id");
+    doc_apply_ops(assembly, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", leaf.string()}}}, {"fixed", true}},
+    }), false);
+    const auto path = files.dir / "assembly.step+";
+    doc_save(assembly, path.string());
+    REQUIRE(doc_close(assembly));
+    auto members = zip_members(path);
+    members.erase("cache.provenance");
+    mz_zip_archive archive{};
+    REQUIRE(mz_zip_writer_init_file(&archive, path.string().c_str(), 0));
+    for (const auto& [name, bytes] : members)
+        REQUIRE(mz_zip_writer_add_mem(&archive, name.c_str(), bytes.data(), bytes.size(),
+                                     MZ_NO_COMPRESSION));
+    REQUIRE(mz_zip_writer_finalize_archive(&archive));
+    mz_zip_writer_end(&archive);
+    struct RefreshSinkGuard { ~RefreshSinkGuard() { set_cache_refresh_sink({}); } } guard;
+    auto promise = std::make_shared<std::promise<json>>();
+    auto refreshed = promise->get_future();
+    set_cache_refresh_sink([promise](const std::string&, const json& result) {
+        promise->set_value(result);
+    });
+    const auto before = compile_cache_stats();
+    const auto opened = doc_open(path.string());
+    CHECK(opened.at("cache_hit") == true);
+    CHECK(opened.at("warm") == true);
+    CHECK(opened.at("cache_trust") == "unverified");
+    REQUIRE(opened.at("tess").at("bodies").size() == 1);
+    REQUIRE(refreshed.wait_for(std::chrono::seconds(60)) == std::future_status::ready);
+    const auto replacement = refreshed.get();
+    INFO(replacement.dump());
+    CHECK(replacement.at("cache_trust") == "verified");
+    CHECK(replacement.at("cache_verification").at("completed") == true);
+    CHECK(replacement.at("cache_verification").at("writeback").at("written") == true);
+    CHECK(executed_since(before) == 0);
+    const auto authenticated = stepplus_open(path.string());
+    CHECK(stepplus_cache_verified(authenticated.doc, authenticated.extra));
+    REQUIRE(doc_close(opened.at("doc_id").get<std::string>()));
+    const auto warm = doc_open(path.string());
+    CHECK(warm.at("cache_trust") == "verified");
+    CHECK(warm.at("cache_hit") == true);
+    REQUIRE(doc_close(warm.at("doc_id").get<std::string>()));
+}
+
+TEST_CASE("foreign admitted checkpoints reopen warm when an unrelated display header is skipped") {
+    using namespace chudware::doc;
+    const auto id = make_three_box_part();
+    AppearanceFiles files(id);
+    const auto path = files.dir / "foreign-checkpoints.step+";
+    doc_save(id, path.string());
+    REQUIRE(doc_close(id));
+    auto members = zip_members(path);
+    auto header = json::parse(members.at("cache.json"));
+    header["padding"] = std::string(8u * 1024u * 1024u, ' ');
+    members["cache.json"] = header.dump();
+    members.erase("cache.provenance");
+    mz_zip_archive archive{};
+    REQUIRE(mz_zip_writer_init_file(&archive, path.string().c_str(), 0));
+    for (const auto& [name, bytes] : members)
+        REQUIRE(mz_zip_writer_add_mem(&archive, name.c_str(), bytes.data(), bytes.size(),
+            name == "cache.json" ? MZ_BEST_COMPRESSION : MZ_NO_COMPRESSION));
+    REQUIRE(mz_zip_writer_finalize_archive(&archive));
+    mz_zip_writer_end(&archive);
+    const auto loaded = stepplus_open(path.string());
+    REQUIRE(loaded.skipped.at("cache.json") == "compression_ratio");
+    CHECK_FALSE(stepplus_cache_verified(loaded.doc, loaded.extra));
+    struct RefreshSinkGuard { ~RefreshSinkGuard() { set_cache_refresh_sink({}); } } guard;
+    auto promise = std::make_shared<std::promise<json>>();
+    auto refreshed = promise->get_future();
+    set_cache_refresh_sink([promise](const std::string&, const json& result) {
+        promise->set_value(result);
+    });
+    const auto opened = doc_open(path.string());
+    CHECK(opened.at("cache_hit") == false);
+    CHECK(opened.at("warm") == true);
+    CHECK(opened.at("cache_trust") == "unverified");
+    CHECK(opened.at("cache_verification_pending") == true);
+    CHECK(opened.at("cache").at("features_executed") == 0);
+    CHECK(opened.at("volume").get<double>() == Approx(kThreeBoxVolume));
+    REQUIRE(refreshed.wait_for(std::chrono::seconds(60)) == std::future_status::ready);
+    const auto replacement = refreshed.get();
+    CHECK(replacement.at("cache_trust") == "verified");
+    CHECK(replacement.at("cache_verification").at("writeback").at("written") == true);
+    REQUIRE(doc_close(opened.at("doc_id").get<std::string>()));
+}
+
+TEST_CASE("native activity counts dirty documents until successful save or close") {
+    using namespace chudware::doc;
+    std::uint64_t cache = 0, before = 0, dirty = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (!activity_counts(cache, before) || cache != 0) {
+        REQUIRE(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const auto id = make_box_doc();
+    AppearanceFiles files(id);
+    REQUIRE(activity_counts(cache, dirty));
+    CHECK(dirty == before + 1);
+    doc_save(id, (files.dir / "activity.step+").string());
+    REQUIRE(activity_counts(cache, dirty));
+    CHECK(dirty == before);
+    doc_set_name(id, "changed");
+    REQUIRE(activity_counts(cache, dirty));
+    CHECK(dirty == before + 1);
+    REQUIRE(doc_close(id));
+    REQUIRE(activity_counts(cache, dirty));
+    CHECK(dirty == before);
+}
+
+TEST_CASE("drawing activity clears only for its successfully saved exact revision") {
+    using namespace chudware::doc;
+    std::uint64_t before = 0, dirty = 0;
+    REQUIRE(dirty_drawing_count(before));
+    const auto source = make_box_doc();
+    AppearanceFiles files(source);
+    const auto drawing = drawing_new(json::object(), json::object(), "ActivityDrawing", source)
+                             .at("doc_id").get<std::string>();
+    REQUIRE(dirty_drawing_count(dirty));
+    CHECK(dirty == before + 1);
+    const auto path = (files.dir / "drawing-activity.step+").string();
+    doc_save(source, path);
+    dirty = 0; REQUIRE(dirty_drawing_count(dirty)); CHECK(dirty == before);
+    drawing_set_units(drawing, "IPS");
+    doc_save(source, (files.dir / "snapshot.step+").string(), true);
+    dirty = 0; REQUIRE(dirty_drawing_count(dirty)); CHECK(dirty == before + 1);
+    DrawingSaveRevisions captured;
+    drawings_for_source(source, captured);
+    drawing_set_units(drawing, "MMGS");  // races an earlier save snapshot
+    drawings_saved(captured);
+    dirty = 0; REQUIRE(dirty_drawing_count(dirty)); CHECK(dirty == before + 1);
+    doc_save(source, path);
+    dirty = 0; REQUIRE(dirty_drawing_count(dirty)); CHECK(dirty == before);
+    REQUIRE(drawing_close(drawing));
+    REQUIRE(doc_close(source));
 }

@@ -20,6 +20,7 @@
 #include "firmware/scenario.h"
 #include "firmware/sim_sensor_bridge.h"
 #include "firmware/toolchains.h"
+#include "firmware/private_storage.h"
 
 namespace chudware::firmware {
 namespace {
@@ -110,6 +111,16 @@ nlohmann::json rpc_sources(const nlohmann::json& params) {
         for (const auto& p : params["remove"])
             if (p.is_string()) remove.push_back(p.get<std::string>());
     bool changed = false;
+    for (const auto& rel : add) {
+        const fs::path path(rel);
+        if (path.empty() || path.is_absolute() || path.has_root_path() ||
+            rel.find('\\') != std::string::npos || rel.find(':') != std::string::npos ||
+            rel.find('\0') != std::string::npos ||
+            std::any_of(path.begin(), path.end(), [](const auto& component) {
+                return component == ".." || component == ".";
+            }))
+            return err_env("invalid_request", "firmware source must be a contained relative path");
+    }
 
     for (const auto& rel : remove) {
         auto it = std::find(project.src_paths.begin(), project.src_paths.end(), rel);
@@ -124,16 +135,11 @@ nlohmann::json rpc_sources(const nlohmann::json& params) {
             project.src_paths.push_back(rel);
             changed = true;
         }
-        // Materialise an empty stub so a subsequent build can compile it.
-        try {
-            fs::path abs_path = project.root_dir() / rel;
-            std::error_code ec;
-            if (!fs::exists(abs_path, ec)) {
-                fs::create_directories(abs_path.parent_path(), ec);
-                std::ofstream(abs_path, std::ios::binary | std::ios::trunc);
-            }
-        } catch (...) {
-        }
+        // New sources are intentionally empty until supplied by the editor.
+        const fs::path abs_path = project.root_dir() / rel;
+        std::string existing;
+        if (!private_storage_detail::read_file(abs_path, existing))
+            private_storage_detail::atomic_write(abs_path, "");
     }
     if (changed) {
         std::sort(project.src_paths.begin(), project.src_paths.end());

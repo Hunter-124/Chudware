@@ -9,6 +9,7 @@ JWT surviving admin_logs, or a quote surviving _safe_name).
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -28,7 +29,7 @@ os.environ.setdefault(
 from fastapi import HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from gateway import accounts, app as app_mod, db  # noqa: E402
+from gateway import accounts, app as app_mod, authn, db  # noqa: E402
 from gateway.app import _redact_secrets, _valid_project  # noqa: E402
 from gateway.config import settings  # noqa: E402
 from gateway.releases import _safe_name  # noqa: E402
@@ -308,3 +309,101 @@ def test_safe_name_rejects_header_and_path_tricks():
 
 def test_safe_name_accepts_normal_release():
     assert _safe_name("Chudware-1.2.3.tar.gz") == "Chudware-1.2.3.tar.gz"
+
+
+@pytest.fixture
+def deployment_browser(client, monkeypatch):
+    """Use a persisted browser session, not dev headers or replaced authorization."""
+    monkeypatch.setattr(settings, "dev_mode", False)
+    client.cookies.set(authn.SESSION_COOKIE, authn.create_session(ADMIN_EMAIL))
+    identity = client.get("/api/me")
+    assert identity.status_code == 200, identity.text
+    assert identity.json()["role"] == "admin"
+    return client
+
+
+@pytest.mark.parametrize("environment", ["prod", "staging"])
+@pytest.mark.parametrize("role", ["admin", "user"])
+@pytest.mark.parametrize("endpoint", ["rebuild", "redeploy"])
+def test_browser_sessions_cannot_launch_deployment(
+        deployment_browser, monkeypatch, tmp_path, environment, role, endpoint):
+    monkeypatch.setattr(settings, "deploy_environment", environment)
+    # If a launch route regresses, it must fail this test without finding a live checkout.
+    monkeypatch.setenv("CHUDWARE_REPO_DIR", str(tmp_path / "absent-checkout"))
+    accounts.set_role(ADMIN_EMAIL, role)
+    identity = deployment_browser.get("/api/me")
+    assert identity.status_code == 200, identity.text
+    assert identity.json()["role"] == role
+    response = deployment_browser.post(
+        f"/api/admin/deploy/{endpoint}", json={"targets": ["wasm", "engine"]})
+    assert response.status_code == 404, response.text
+    assert not (settings.logs_dir / "deploy-status.json").exists()
+    assert not (settings.logs_dir / "deploy.lock").exists()
+    assert not (settings.logs_dir / "deploy-launch.log").exists()
+
+
+def test_deployment_monitoring_reads_operator_snapshot_and_update_log_without_mutation(
+        deployment_browser):
+    logs = settings.logs_dir
+    logs.mkdir(parents=True, exist_ok=True)
+    # An old running snapshot is historical evidence, never authority for a GET to heal it.
+    snapshot = {"running": True, "kind": "deploy-prod", "started_at": 1,
+                "last": {"kind": "deploy-prod", "rc": 0, "finished_at": 1, "release": "v9.8.7"}}
+    (logs / "deploy-status.json").write_text(json.dumps(snapshot) + "\n")
+    lines = [f"operator deployment line {index}" for index in range(30)]
+    (logs / "update.log").write_text("\n".join(lines) + "\n")
+    before = {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in logs.iterdir()}
+
+    status = deployment_browser.get("/api/admin/deploy/status")
+    assert status.status_code == 200, status.text
+    assert status.json() == {"ok": True, **snapshot}
+    log = deployment_browser.get("/api/admin/deploy/log", params={"lines": 10})
+    assert log.status_code == 200, log.text
+    assert log.text == "\n".join(lines[-10:]) + "\n"
+    for endpoint in ("status", "log"):
+        response = deployment_browser.post(f"/api/admin/deploy/{endpoint}", json={})
+        assert response.status_code == 405, response.text
+    assert {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in logs.iterdir()} == before
+
+
+def test_deployment_monitoring_does_not_create_operator_state(
+        deployment_browser, monkeypatch, tmp_path):
+    root = tmp_path / "absent-operator-data"
+    monkeypatch.setattr(settings, "data_root", root)
+    status = deployment_browser.get("/api/admin/deploy/status")
+    assert status.status_code == 200, status.text
+    assert status.json() == {"ok": True, "running": False, "kind": None,
+                             "started_at": None, "last": None}
+    log = deployment_browser.get("/api/admin/deploy/log")
+    assert log.status_code == 200 and log.text == ""
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("endpoint", ["status", "log"])
+def test_deployment_monitoring_requires_a_current_admin_session(deployment_browser, endpoint):
+    accounts.set_role(ADMIN_EMAIL, "user")
+    assert deployment_browser.get(f"/api/admin/deploy/{endpoint}").status_code == 403
+    authn.revoke_session(deployment_browser.cookies[authn.SESSION_COOKIE])
+    assert deployment_browser.get(f"/api/admin/deploy/{endpoint}").status_code == 401
+
+
+def test_staging_admin_receives_only_staging_journal(client, monkeypatch, tmp_path):
+    import sys
+    logs = tmp_path / "journals"
+    logs.mkdir()
+    (logs / "chudware-gateway").write_text("private production journal marker")
+    (logs / "chudware-gateway-staging").write_text("staging journal marker")
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    journal = binary / "journalctl"
+    journal.write_text(
+        f"#!{sys.executable}\nimport sys\nfrom pathlib import Path\n"
+        f"print((Path({str(logs)!r}) / sys.argv[sys.argv.index('-u') + 1]).read_text())\n"
+    )
+    journal.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{binary}:{os.defpath}")
+    monkeypatch.setattr(settings, "deploy_environment", "staging")
+    response = client.get("/api/admin/logs", headers=ADMIN)
+    assert response.status_code == 200
+    assert "staging journal marker" in response.text
+    assert "private production journal marker" not in response.text

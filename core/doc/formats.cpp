@@ -80,8 +80,12 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -109,6 +113,13 @@
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
+#include <BRepMesh_Context.hxx>
+#include <BRepMesh_EdgeParameterProvider.hxx>
+#include <IMeshData_Edge.hxx>
+#include <IMeshData_Face.hxx>
+#include <IMeshData_Model.hxx>
+#include <IMeshData_ParametersListArrayAdaptor.hxx>
+#include <IMeshData_Wire.hxx>
 #include <BRep_Builder.hxx>
 #include <Bnd_Box.hxx>
 #include <Geom_Plane.hxx>
@@ -133,6 +144,8 @@
 #include <Interface_Static.hxx>
 #include <Message_ProgressRange.hxx>
 #include <Precision.hxx>
+#include <OSD_Path.hxx>
+#include <Poly_PolygonOnTriangulation.hxx>
 #include <Poly_Triangulation.hxx>
 #include <RWGltf_CafReader.hxx>
 #include <RWGltf_CafWriter.hxx>
@@ -143,7 +156,7 @@
 #include <ShapeAnalysis_FreeBounds.hxx>
 #include <ShapeFix_Shape.hxx>
 #include <ShapeFix_Solid.hxx>
-#include <StlAPI_Writer.hxx>
+#include <Poly_Triangle.hxx>
 #include <TColStd_IndexedDataMapOfStringString.hxx>
 #include <TDF_LabelSequence.hxx>
 #include <TDocStd_Document.hxx>
@@ -152,6 +165,7 @@
 #include <TopExp_Explorer.hxx>
 #include <TopLoc_Location.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
 #include <TopTools_FormatVersion.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <TopTools_HSequenceOfShape.hxx>
@@ -292,15 +306,124 @@ bool iges_reread_has_closed_solid(const TopoDS_Shape& shape) {
     return any;
 }
 
+// A zero-angle cusp between distinct tangent boundary curves can have overlapping
+// first chords when OCCT gives both curves the same angular sampling. The face
+// triangulator then loses the strip between them, although the B-rep is valid.
+// Refine the longer overlapping chord ON ITS EXACT CURVE before triangulating any
+// faces; all incident pcurves receive the same extra sample. This changes only the
+// discrete boundary, never the topology, surface, or requested deflection bounds.
+class ExportMeshContext final : public BRepMesh_Context {
+public:
+    Standard_Boolean HealModel() override {
+        if (!BRepMesh_Context::HealModel()) return Standard_False;
+        const auto& model = GetModel();
+        for (int fi = 0; fi < model->FacesNb(); ++fi) {
+            const auto& face = model->GetFace(fi);
+            for (int wi = 0; wi < face->WiresNb(); ++wi) {
+                const auto& wire = face->GetWire(wi);
+                for (int ei = 0; ei < wire->EdgesNb(); ++ei) {
+                    const int next = (ei + 1) % wire->EdgesNb();
+                    const IMeshData::IEdgeHandle a = wire->GetEdge(ei);
+                    const IMeshData::IEdgeHandle b = wire->GetEdge(next);
+                    if (a == b || a->GetDegenerated() || b->GetDegenerated()) continue;
+                    const auto& pa = a->GetPCurve(face.get(), wire->GetEdgeOrientation(ei));
+                    const auto& pb = b->GetPCurve(face.get(), wire->GetEdgeOrientation(next));
+                    if (pa->ParametersNb() < 2 || pb->ParametersNb() < 2) continue;
+                    for (;;) {
+                        const int la = pa->ParametersNb() - 1, lb = pb->ParametersNb() - 1;
+                        int ia = 0, ib = 0;
+                        double distance = std::numeric_limits<double>::max();
+                        for (int x : {0, la}) for (int y : {0, lb}) {
+                            const double d = pa->GetPoint(x).SquareDistance(pb->GetPoint(y));
+                            if (d < distance) { distance = d; ia = x; ib = y; }
+                        }
+                        if (distance > Precision::PConfusion() * Precision::PConfusion()) break;
+                        const int ja = ia == 0 ? 1 : la - 1;
+                        const int jb = ib == 0 ? 1 : lb - 1;
+                        const gp_XY da = pa->GetPoint(ja).XY() - pa->GetPoint(ia).XY();
+                        const gp_XY db = pb->GetPoint(jb).XY() - pb->GetPoint(ib).XY();
+                        const double length = std::max(da.Modulus(), db.Modulus());
+                        // Opposite chords are an ordinary smooth junction, not a cusp.
+                        if (da.Dot(db) <= 0.0 ||
+                            std::abs(da.Crossed(db)) > Precision::PConfusion() * length) break;
+                        const bool split_a = da.SquareModulus() >= db.SquareModulus();
+                        split_boundary_chord(split_a ? a : b, split_a ? ia : ib,
+                                             split_a ? ja : jb);
+                    }
+                }
+            }
+        }
+        return Standard_True;
+    }
+
+private:
+    void split_boundary_chord(const IMeshData::IEdgeHandle& edge, int end, int other) {
+        const auto& curve = edge->GetCurve();
+        const double t0 = curve->GetParameter(end), t1 = curve->GetParameter(other);
+        const double t = t0 + (t1 - t0) * 0.5;
+        BRepAdaptor_Curve exact(edge->GetEdge());
+        const gp_Pnt point = exact.Value(t);
+        const gp_Vec chord(curve->GetPoint(end), curve->GetPoint(other));
+        const gp_Vec half(curve->GetPoint(end), point);
+        if (t == t0 || t == t1 ||
+            chord.Crossed(half).Magnitude() <= Precision::Confusion() * chord.Magnitude())
+            throw OpError("export_failed", "Mesh boundary cusp cannot be resolved on its exact curve");
+        // Located copies of one native face share its TShape triangulation.
+        // Their corresponding edges are IsPartner, even though IsSame is false.
+        // Keep the exact parameter samples identical across these instances;
+        // otherwise whichever face meshes last leaves its neighbour with a
+        // different boundary polygon. Identity comes from topology, not proximity.
+        const auto& model = GetModel();
+        for (int i = 0; i < model->EdgesNb(); ++i) {
+            const auto& partner = model->GetEdge(i);
+            if (edge->GetEdge().IsPartner(partner->GetEdge()))
+                insert_boundary_sample(partner, t);
+        }
+    }
+
+    static void insert_boundary_sample(const IMeshData::IEdgeHandle& edge, double t) {
+        const auto& curve = edge->GetCurve();
+        int insert = -1;
+        for (int i = 0; i < curve->ParametersNb(); ++i) {
+            if (curve->GetParameter(i) == t) return;
+            if (i == 0) continue;
+            const double a = curve->GetParameter(i - 1), b = curve->GetParameter(i);
+            if ((a < t && t < b) || (b < t && t < a)) insert = i;
+        }
+        if (insert < 0)
+            throw OpError("export_failed", "Located mesh edge has an incompatible parameter range");
+        const gp_Pnt point = BRepAdaptor_Curve(edge->GetEdge()).Value(t);
+        curve->InsertPoint(insert, point, t);
+        for (int pi = 0; pi < edge->PCurvesNb(); ++pi) {
+            const auto& pc = edge->GetPCurve(pi);
+            const IMeshData::IFaceHandle face = pc->GetFace();
+            IMeshData::ICurveArrayAdaptorHandle params(new IMeshData::ICurveArrayAdaptor(curve));
+            BRepMesh_EdgeParameterProvider<IMeshData::ICurveArrayAdaptorHandle> provider(
+                edge, pc->GetOrientation(), face, params);
+            double parameter = 0.0;
+            // Non-SameParameter projection is sequential, just as in Tessellate2d.
+            for (int i = 0; i <= insert; ++i)
+                parameter = provider.Parameter(i, curve->GetPoint(i));
+            gp_Pnt2d uv;
+            provider.GetPCurve()->D0(parameter, uv);
+            pc->InsertPoint(insert, uv, parameter);
+        }
+    }
+};
+
 // Tessellate a shape in place at the requested quality so a mesh writer has a
 // triangulation to emit. The prior triangulation is cleared first so the exact
 // requested deflection is honored even if the shape was already meshed at another
 // quality (e.g. a finer dialog "estimate" preceding a coarser export).
 void mesh_shape(const TopoDS_Shape& shape, const TessOptions& tess = TessOptions{}) {
     BRepTools::Clean(shape);
-    BRepMesh_IncrementalMesh m(shape, tess.lin_deflection, tess.relative ? Standard_True : Standard_False,
-                               tess.ang_deflection, Standard_True);
-    m.Perform();
+    BRepMesh_IncrementalMesh m;
+    m.SetShape(shape);
+    m.ChangeParameters().Deflection = tess.lin_deflection;
+    m.ChangeParameters().Relative = tess.relative;
+    m.ChangeParameters().Angle = tess.ang_deflection;
+    m.ChangeParameters().InParallel = Standard_True;
+    m.Perform(new ExportMeshContext);
 }
 
 std::string abs_path(const std::string& path) {
@@ -1073,25 +1196,112 @@ void polyline_old_style(const std::vector<dxf::Entity>& entities, std::size_t& i
 
 constexpr int kMaxBlockDepth = 16;  // nesting bound; also stops self-referencing blocks
 
+// One budget spans root entities, every nested block and the temporary block geometry.
+// Count logical expansion before constructing it; charge exact geometry before copying.
+struct DxfExpansionBudget {
+    std::size_t instances = 0, work = 0, edges = 0, vertices = 0, triangles = 0, bodies = 0;
+    static constexpr std::size_t kInstances = 100000, kGeometry = 1000000, kWork = 4000000;
+
+    static void charge(std::size_t& used, std::size_t amount, std::size_t copies,
+                       std::size_t limit, const char* kind) {
+        if (amount != 0 && copies > (limit - used) / amount)
+            throw OpError("import_failed", std::string("DXF expansion budget exceeded: ") + kind,
+                          {{"limit", limit}});
+        used += amount * copies;
+    }
+};
+
+long insert_dimension(const dxf::Entity& e, int code) {
+    for (const auto& tag : e.tags) {
+        if (tag.code != code) continue;
+        try {
+            std::size_t consumed = 0;
+            const long value = std::stol(tag.value, &consumed);
+            if (consumed == tag.value.size() && value >= 1 &&
+                static_cast<unsigned long>(value) <= DxfExpansionBudget::kInstances)
+                return value;
+        } catch (const std::exception&) {
+            // Convert malformed/overflowing tags to the same controlled import error.
+        }
+        throw OpError("import_failed", "DXF INSERT has invalid or over-budget array dimensions");
+    }
+    return 1;
+}
+
+std::size_t insert_instances(const dxf::Entity& e) {
+    const long cols = insert_dimension(e, 70), rows = insert_dimension(e, 71);
+    if (cols < 1 || rows < 1)
+        throw OpError("import_failed", "DXF INSERT rows and columns must be positive");
+    const auto c = static_cast<std::size_t>(cols), r = static_cast<std::size_t>(rows);
+    if (c > DxfExpansionBudget::kInstances || r > DxfExpansionBudget::kInstances / c)
+        throw OpError("import_failed", "DXF INSERT array exceeds instance budget");
+    return c * r;
+}
+
+void admit_dxf_expansion(const std::vector<dxf::Entity>& entities, const dxf::Blocks& blocks,
+                         int depth, std::size_t copies, DxfExpansionBudget& budget) {
+    for (const auto& e : entities) {
+        DxfExpansionBudget::charge(budget.work, 1, copies, DxfExpansionBudget::kWork, "entities");
+        DxfExpansionBudget::charge(budget.work, e.tags.size(), copies,
+                                   DxfExpansionBudget::kWork, "entity tags");
+        if (e.type != "INSERT") continue;
+        const auto found = blocks.find(dxf::get_s(e, 2));
+        if (found == blocks.end() || depth >= kMaxBlockDepth) continue;
+        const auto instances = insert_instances(e);
+        DxfExpansionBudget::charge(budget.instances, instances, copies,
+                                   DxfExpansionBudget::kInstances, "instances");
+        // The instance admission above proves this product fits before recursion.
+        admit_dxf_expansion(found->second.entities, blocks, depth + 1, copies * instances, budget);
+    }
+}
+
+void charge_acis_geometry(const DxfAcisBody& body, std::size_t copies,
+                          DxfExpansionBudget& budget) {
+    DxfExpansionBudget::charge(budget.bodies, 1, copies, 10000, "ACIS bodies");
+    for (TopExp_Explorer ex(body.shape, TopAbs_EDGE); ex.More(); ex.Next())
+        DxfExpansionBudget::charge(budget.edges, 1, copies, DxfExpansionBudget::kGeometry, "edges");
+    for (TopExp_Explorer ex(body.shape, TopAbs_VERTEX); ex.More(); ex.Next())
+        DxfExpansionBudget::charge(budget.vertices, 1, copies,
+                                   DxfExpansionBudget::kGeometry * 3, "vertices");
+}
+
+void charge_copied_geometry(const DxfGeometry& geometry, std::size_t copies,
+                            DxfExpansionBudget& budget) {
+    DxfExpansionBudget::charge(budget.edges, geometry.edges.size(), copies,
+                               DxfExpansionBudget::kGeometry, "edges");
+    DxfExpansionBudget::charge(budget.vertices, geometry.edges.size(), copies * 2,
+                               DxfExpansionBudget::kGeometry * 3, "edge vertices");
+    for (const auto& [layer, mesh] : geometry.meshes) {
+        (void)layer;
+        DxfExpansionBudget::charge(budget.vertices, mesh.vertex_count(), copies,
+                                   DxfExpansionBudget::kGeometry * 3, "vertices");
+        DxfExpansionBudget::charge(budget.triangles, mesh.triangle_count(), copies,
+                                   DxfExpansionBudget::kGeometry, "triangles");
+    }
+    for (const auto& body : geometry.acis_bodies) charge_acis_geometry(body, copies, budget);
+}
+
 void collect_entities(const std::vector<dxf::Entity>& entities, const dxf::Blocks& blocks,
                       const AcisPayloads& payloads, const std::string& parent_layer, int depth,
-                      DxfGeometry& out);
+                      DxfGeometry& out, DxfExpansionBudget& budget);
 
 // INSERT / MINSERT: collect the block once, then place each array instance with
 // world = OCS(ins + Rz(rot) * (S * (p - base) + grid offset)).
 void place_insert(const dxf::Entity& e, const dxf::Blocks& blocks, const AcisPayloads& payloads,
-                  const std::string& layer, int depth, DxfGeometry& out) {
+                  const std::string& layer, int depth, DxfGeometry& out, DxfExpansionBudget& budget) {
     const auto found = blocks.find(dxf::get_s(e, 2));
     if (found == blocks.end() || depth >= kMaxBlockDepth) return;
+    const std::size_t instances = insert_instances(e);
     DxfGeometry sub;
-    collect_entities(found->second.entities, blocks, payloads, layer, depth + 1, sub);
+    collect_entities(found->second.entities, blocks, payloads, layer, depth + 1, sub, budget);
+    charge_copied_geometry(sub, instances, budget);
     out.skipped += sub.skipped;
     out.acis += sub.acis;
     out.acis_notes.insert(out.acis_notes.end(), sub.acis_notes.begin(), sub.acis_notes.end());
 
     const double sx = dxf::get_d(e, 41, 1.0), sy = dxf::get_d(e, 42, 1.0), sz = dxf::get_d(e, 43, 1.0);
     const double rot = dxf::get_d(e, 50, 0.0) * kPi / 180.0;
-    const long cols = std::max(1L, dxf::get_i(e, 70, 1)), rows = std::max(1L, dxf::get_i(e, 71, 1));
+    const long cols = insert_dimension(e, 70), rows = insert_dimension(e, 71);
     const double col_step = dxf::get_d(e, 44, 0.0), row_step = dxf::get_d(e, 45, 0.0);
     const gp_XYZ ins(dxf::get_d(e, 10), dxf::get_d(e, 20), dxf::get_d(e, 30));
     const gp_Mat ocs = dxf::ocs_matrix(dxf::extrusion(e));
@@ -1160,16 +1370,19 @@ void place_insert(const dxf::Entity& e, const dxf::Blocks& blocks, const AcisPay
 }
 
 // Entities -> edges / meshes / ACIS bodies (port of _entities_to_edges plus blocks, OCS, mesh
-// and ACIS entities). Each malformed entity is wrapped so one bad entity cannot abort the
-// whole import.
+// and ACIS entities). OCCT failures in individual entities remain skippable; admission
+// failures reject the entire drawing and must never be swallowed as an empty entity.
 void collect_entities(const std::vector<dxf::Entity>& entities, const dxf::Blocks& blocks,
                       const AcisPayloads& payloads, const std::string& parent_layer, int depth,
-                      DxfGeometry& out) {
+                      DxfGeometry& out, DxfExpansionBudget& budget) {
     for (std::size_t i = 0; i < entities.size(); ++i) {
         const dxf::Entity& e = entities[i];
         const std::string layer = effective_layer(e, parent_layer);
         if (is_acis_entity(e.type)) {
+            const std::size_t before = out.acis_bodies.size();
             add_acis_entity(e, layer, payloads, out);
+            for (std::size_t k = before; k < out.acis_bodies.size(); ++k)
+                charge_acis_geometry(out.acis_bodies[k], 1, budget);
             continue;
         }
         const std::size_t edges_before = out.edges.size();
@@ -1213,13 +1426,25 @@ void collect_entities(const std::vector<dxf::Entity>& entities, const dxf::Block
                                          dxf::get_d(e, 30 + k));
                 add_polygon(out, layer, corners);
             } else if (e.type == "INSERT") {
-                place_insert(e, blocks, payloads, layer, depth, out);
+                place_insert(e, blocks, payloads, layer, depth, out, budget);
             }
             // TEXT / DIMENSION / HATCH / … produce nothing and count as skipped below.
         } catch (const Standard_Failure&) {
             // one bad entity must not abort the whole import
+        } catch (const OpError&) {
+            throw;
         } catch (const std::exception&) {
             // ditto for any non-OCCT exception (e.g. a malformed numeric tag)
+        }
+        if (e.type != "INSERT") {
+            DxfExpansionBudget::charge(budget.edges, out.edges.size() - edges_before, 1,
+                                       DxfExpansionBudget::kGeometry, "edges");
+            DxfExpansionBudget::charge(budget.vertices, out.edges.size() - edges_before, 2,
+                                       DxfExpansionBudget::kGeometry * 3, "edge vertices");
+            DxfExpansionBudget::charge(budget.triangles, out.triangles - tris_before, 1,
+                                       DxfExpansionBudget::kGeometry, "triangles");
+            DxfExpansionBudget::charge(budget.vertices, out.triangles - tris_before, 3,
+                                       DxfExpansionBudget::kGeometry * 3, "vertices");
         }
         if (out.edges.size() == edges_before && out.triangles == tris_before &&
             out.acis_bodies.size() == acis_before)
@@ -1376,7 +1601,9 @@ DxfImport read_dxf(const std::string& path, const DwgNativeInfo* native = nullpt
     AcisPayloads payloads = parse_acdsdata(tags);
     DxfGeometry g;
     if (native) merge_native_acis(*native, tags, entities, blocks, payloads, g.acis_notes);
-    collect_entities(entities, blocks, payloads, std::string(), 0, g);
+    DxfExpansionBudget budget;
+    admit_dxf_expansion(entities, blocks, 0, 1, budget);
+    collect_entities(entities, blocks, payloads, std::string(), 0, g, budget);
     DxfImport r;
     r.skipped = g.skipped;
     r.acis = g.acis;
@@ -2070,6 +2297,189 @@ MeshData shape_to_mesh(const TopoDS_Shape& shape, const TessOptions& tess) {
 
 // Pull the triangle soup out of a single Poly_Triangulation (the readers return one).
 namespace {
+// The facets of one face triangulation that STL serializes, in the triangulation's
+// own winding (each caller applies its face occurrence's orientation). A pole has
+// distinct UV nodes at one exact 3D point. Omitted facets are identified by native
+// topology, never by proximity, and have zero oriented boundary and no net surface,
+// so omitting them welds and heals nothing:
+//  * Pole facet: two corners are nodes on the SAME native degenerate edge, so its
+//    oriented boundary is A->B + B->B + B->A = 0.
+//  * Folded pole fin pair: BRepMesh can link BOTH UV ends of a pole to one interior
+//    UV edge X-Y (a node column inserted toward the pole), giving (P1,X,Y) and
+//    (P2,Y,X) with P1, P2 on the same degenerate edge at one exact point. In 3D that
+//    is one facet plus its reverse, a double-covered spike: the pair sums to zero.
+// Collinear facets, short edges, and float32 collapse are NOT filtered.
+std::vector<Poly_Triangle> stl_face_facets(const TopoDS_Face& face) {
+    TopLoc_Location loc;
+    const auto& tri = BRep_Tool::Triangulation(face, loc);
+    if (tri.IsNull() || tri->NbTriangles() == 0)
+        throw OpError("export_failed", "STL source face has no triangulation");
+    // pole[d][node]: the node lies on the polygon of degenerate edge d.
+    std::vector<std::vector<bool>> pole;
+    for (TopExp_Explorer ex(face, TopAbs_EDGE); ex.More(); ex.Next()) {
+        const TopoDS_Edge edge = TopoDS::Edge(ex.Current());
+        if (!BRep_Tool::Degenerated(edge)) continue;
+        const auto& polygon = BRep_Tool::PolygonOnTriangulation(edge, tri, loc);
+        if (polygon.IsNull()) continue;
+        auto& on = pole.emplace_back(static_cast<std::size_t>(tri->NbNodes()) + 1, false);
+        for (int i = polygon->Nodes().Lower(); i <= polygon->Nodes().Upper(); ++i)
+            on[polygon->Nodes()(i)] = true;
+    }
+    std::vector<Poly_Triangle> facets;
+    facets.reserve(static_cast<std::size_t>(tri->NbTriangles()));
+    for (int i = 1; i <= tri->NbTriangles(); ++i) {
+        const Poly_Triangle facet = tri->Triangle(i);
+        int n[3];
+        facet.Get(n[0], n[1], n[2]);
+        bool omit = false;
+        for (int k = 0; k < 3 && !omit; ++k) {
+            const int a = n[k], b = n[(k + 1) % 3];
+            if (tri->Node(a).SquareDistance(tri->Node(b)) != 0.0) continue;
+            for (const auto& on : pole) omit |= on[a] && on[b];
+            if (!omit)
+                throw OpError("export_failed",
+                              "STL contains coincident facet corners outside a native pole");
+        }
+        if (!omit) facets.push_back(facet);
+    }
+    std::vector<bool> fin(facets.size(), false);
+    for (const auto& on : pole) {
+        // Facets with exactly one corner on this pole, keyed by their opposite UV
+        // edge X-Y. A valid triangulation has at most two facets on one edge.
+        std::map<std::pair<int, int>, std::vector<std::size_t>> by_edge;
+        for (std::size_t f = 0; f < facets.size(); ++f) {
+            int n[3];
+            facets[f].Get(n[0], n[1], n[2]);
+            if (on[n[0]] + on[n[1]] + on[n[2]] != 1) continue;
+            const int p = on[n[0]] ? 0 : on[n[1]] ? 1 : 2;
+            const int x = n[(p + 1) % 3], y = n[(p + 2) % 3];
+            by_edge[{std::min(x, y), std::max(x, y)}].push_back(f);
+        }
+        for (const auto& [xy, ids] : by_edge) {
+            if (ids.size() != 2) continue;
+            int a[3], b[3];
+            facets[ids[0]].Get(a[0], a[1], a[2]);
+            facets[ids[1]].Get(b[0], b[1], b[2]);
+            const int pa = on[a[0]] ? 0 : on[a[1]] ? 1 : 2;
+            const int pb = on[b[0]] ? 0 : on[b[1]] ? 1 : 2;
+            if (a[pa] != b[pb] && tri->Node(a[pa]).SquareDistance(tri->Node(b[pb])) == 0.0 &&
+                a[(pa + 1) % 3] == b[(pb + 2) % 3] && a[(pa + 2) % 3] == b[(pb + 1) % 3])
+                fin[ids[0]] = fin[ids[1]] = true;
+        }
+    }
+    std::size_t kept = 0;
+    for (std::size_t f = 0; f < facets.size(); ++f)
+        if (!fin[f]) facets[kept++] = facets[f];
+    facets.resize(kept);
+    return facets;
+}
+
+std::array<double, 3> stl_position(const gp_Pnt& p, bool ascii) {
+    std::array<double, 3> key{p.X(), p.Y(), p.Z()};
+    for (double& v : key) {
+        // Match RWStl's emitted representation, not a tolerance weld. ASCII uses
+        // %e (six decimals); binary stores IEEE float32. Never move source nodes.
+        if (ascii) {
+            char text[64];
+            std::snprintf(text, sizeof(text), "%.6e", v);
+            v = std::strtod(text, nullptr);
+        } else {
+            v = static_cast<float>(v);
+        }
+        if (!std::isfinite(v))
+            throw OpError("export_failed", "STL coordinate is not finite in the output representation");
+    }
+    return key;
+}
+
+// Validate each source solid independently, so an assembly can still contain
+// separate touching solids. No repair or tolerance-welding is performed: every
+// serialized edge must appear twice, once in each direction. `facets[i - 1]` are
+// the serialized facets of `faces(i)`, exactly what stl_triangulation writes.
+void validate_stl_solid(const TopoDS_Shape& solid, const TopTools_IndexedMapOfShape& faces,
+                        const std::vector<std::vector<Poly_Triangle>>& facets, bool ascii) {
+    std::map<std::array<double, 3>, std::uint32_t> positions;
+    struct Incidence { int count = 0, balance = 0; };
+    std::unordered_map<std::uint64_t, Incidence> edges;
+    for (TopExp_Explorer ex(solid, TopAbs_FACE); ex.More(); ex.Next()) {
+        const TopoDS_Face face = TopoDS::Face(ex.Current());
+        TopLoc_Location loc;
+        const auto& tri = BRep_Tool::Triangulation(face, loc);
+        std::vector<std::uint32_t> ids(static_cast<std::size_t>(tri->NbNodes()) + 1);
+        for (int i = 1; i <= tri->NbNodes(); ++i) {
+            const auto key = stl_position(tri->Node(i).Transformed(loc.Transformation()), ascii);
+            const auto inserted = positions.emplace(key, static_cast<std::uint32_t>(positions.size()));
+            ids[i] = inserted.first->second;
+        }
+        for (const auto& facet : facets[static_cast<std::size_t>(faces.FindIndex(face)) - 1]) {
+            int n[3];
+            facet.Get(n[0], n[1], n[2]);
+            if (face.Orientation() == TopAbs_REVERSED) std::swap(n[1], n[2]);
+            for (int k = 0; k < 3; ++k) {
+                const auto a = ids[n[k]], b = ids[n[(k + 1) % 3]];
+                const auto key = (static_cast<std::uint64_t>(std::min(a, b)) << 32) | std::max(a, b);
+                auto& use = edges[key];
+                ++use.count;
+                use.balance += a < b ? 1 : -1;
+            }
+        }
+    }
+    if (edges.empty())
+        throw OpError("export_failed", "STL source solid has no facets");
+    for (const auto& edge : edges)
+        if (edge.second.count != 2 || edge.second.balance != 0)
+            throw OpError("export_failed",
+                          "STL tessellation is not a closed consistently oriented source solid");
+}
+
+Handle(Poly_Triangulation) stl_triangulation(const TopoDS_Shape& shape, bool ascii) {
+    TopTools_IndexedMapOfShape faces;
+    TopExp::MapShapes(shape, TopAbs_FACE, faces);
+    std::vector<std::vector<Poly_Triangle>> facets(static_cast<std::size_t>(faces.Extent()));
+    for (int i = 1; i <= faces.Extent(); ++i)
+        facets[static_cast<std::size_t>(i) - 1] = stl_face_facets(TopoDS::Face(faces(i)));
+    int nodes = 0, count = 0;
+    for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
+        const TopoDS_Face face = TopoDS::Face(ex.Current());
+        TopLoc_Location loc;
+        const auto& tri = BRep_Tool::Triangulation(face, loc);
+        const auto& kept = facets[static_cast<std::size_t>(faces.FindIndex(face)) - 1];
+        if (nodes > std::numeric_limits<int>::max() - tri->NbNodes() ||
+            kept.size() > static_cast<std::size_t>(std::numeric_limits<int>::max() - count))
+            throw OpError("export_failed", "STL triangulation exceeds native index limits");
+        nodes += tri->NbNodes();
+        count += static_cast<int>(kept.size());
+    }
+    if (count == 0) throw OpError("export_failed", "STL has no facets to write");
+    Handle(Poly_Triangulation) mesh = new Poly_Triangulation(nodes, count, Standard_False);
+    int offset = 0, written = 0;
+    for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
+        const TopoDS_Face face = TopoDS::Face(ex.Current());
+        TopLoc_Location loc;
+        const auto& tri = BRep_Tool::Triangulation(face, loc);
+        for (int i = 1; i <= tri->NbNodes(); ++i)
+            mesh->SetNode(offset + i, tri->Node(i).Transformed(loc.Transformation()));
+        for (const auto& facet : facets[static_cast<std::size_t>(faces.FindIndex(face)) - 1]) {
+            int n[3];
+            facet.Get(n[0], n[1], n[2]);
+            if (face.Orientation() == TopAbs_REVERSED) std::swap(n[1], n[2]);
+            gp_Pnt p[3];
+            for (int k = 0; k < 3; ++k) {
+                n[k] += offset;
+                const auto key = stl_position(mesh->Node(n[k]), ascii);
+                p[k].SetCoord(key[0], key[1], key[2]);
+            }
+            if (gp_Vec(p[0], p[1]).Crossed(gp_Vec(p[0], p[2])).SquareMagnitude() == 0.0)
+                throw OpError("export_failed", "STL facet collapses in the output representation");
+            mesh->SetTriangle(++written, Poly_Triangle(n[0], n[1], n[2]));
+        }
+        offset += tri->NbNodes();
+    }
+    for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next())
+        validate_stl_solid(ex.Current(), faces, facets, ascii);
+    return mesh;
+}
+
 MeshData triangulation_to_mesh(const Handle(Poly_Triangulation)& tri) {
     MeshData mesh;
     if (tri.IsNull() || tri->NbNodes() == 0 || tri->NbTriangles() == 0) return mesh;
@@ -2163,192 +2573,7 @@ void write_ply(const MeshData& mesh, const std::string& path) {
     if (!os) throw OpError("export_failed", "PLY: write error", {{"path", path}});
 }
 
-// ---- PLY reader: ASCII + binary_little_endian (trimesh's default writer) -----
-// OCCT 7.9.3 has no PLY *reader* (TKDESTL ships only RWPly_CafWriter). The oracle
-// (trimesh) writes binary_little_endian PLY by default, so the C++ reader must handle
-// both encodings. We parse the standard layout: a `vertex` element with float x/y/z
-// (plus possible extra per-vertex props we skip by byte-size) and a `face` element with
-// a `list <countT> <idxT> vertex_indices` property. Big-endian + non-standard layouts
-// are deferred (raise import_failed) — trimesh never emits them for our meshes.
-namespace ply {
-
-struct Prop {
-    std::string name;
-    std::string type;      // scalar type (or list-value type for a list prop)
-    bool is_list = false;
-    std::string count_type;  // list count scalar type
-};
-
-// Read one scalar of the given PLY type from a little-endian byte stream.
-double read_le_scalar(const unsigned char*& p, const std::string& t) {
-    auto rd = [&](int n) {
-        uint64_t v = 0;
-        for (int i = 0; i < n; ++i) v |= static_cast<uint64_t>(p[i]) << (8 * i);
-        p += n;
-        return v;
-    };
-    if (t == "char" || t == "int8") return static_cast<double>(static_cast<int8_t>(rd(1)));
-    if (t == "uchar" || t == "uint8") return static_cast<double>(static_cast<uint8_t>(rd(1)));
-    if (t == "short" || t == "int16") return static_cast<double>(static_cast<int16_t>(rd(2)));
-    if (t == "ushort" || t == "uint16") return static_cast<double>(static_cast<uint16_t>(rd(2)));
-    if (t == "int" || t == "int32") return static_cast<double>(static_cast<int32_t>(rd(4)));
-    if (t == "uint" || t == "uint32") return static_cast<double>(static_cast<uint32_t>(rd(4)));
-    if (t == "float" || t == "float32") {
-        uint32_t b = static_cast<uint32_t>(rd(4));
-        float f;
-        std::memcpy(&f, &b, 4);
-        return static_cast<double>(f);
-    }
-    if (t == "double" || t == "float64") {
-        uint64_t b = rd(8);
-        double d;
-        std::memcpy(&d, &b, 8);
-        return d;
-    }
-    if (t == "int64" || t == "uint64") return static_cast<double>(rd(8));
-    return 0.0;
-}
-
-}  // namespace ply
-
-MeshData read_ply(const std::string& path) {
-    std::ifstream is(path, std::ios::in | std::ios::binary);
-    if (!is) throw OpError("import_failed", "PLY: cannot open input", {{"path", path}});
-    std::string line;
-    std::getline(is, line);
-    if (line.rfind("ply", 0) != 0)
-        throw OpError("import_failed", "PLY: missing magic header", {{"path", path}});
-    enum Enc { ASCII, BIN_LE } enc = ASCII;
-    bool have_format = false;
-    std::size_t n_vert = 0, n_face = 0;
-    std::vector<ply::Prop> vprops, fprops;
-    enum { NONE, VERTEX, FACE } cur = NONE;
-    std::size_t header_end = 0;
-    while (std::getline(is, line)) {
-        std::istringstream ls(line);
-        std::string tok;
-        ls >> tok;
-        if (tok == "format") {
-            std::string f;
-            ls >> f;
-            have_format = true;
-            if (f == "ascii") enc = ASCII;
-            else if (f == "binary_little_endian") enc = BIN_LE;
-            else
-                throw OpError("import_failed",
-                              "PLY: unsupported encoding '" + f +
-                                  "' (ascii / binary_little_endian only)",
-                              {{"path", path}});
-        } else if (tok == "element") {
-            std::string e;
-            std::size_t n;
-            ls >> e >> n;
-            if (e == "vertex") { n_vert = n; cur = VERTEX; }
-            else if (e == "face") { n_face = n; cur = FACE; }
-            else { cur = NONE; }
-        } else if (tok == "property" && cur != NONE) {
-            ply::Prop pr;
-            std::string t;
-            ls >> t;
-            if (t == "list") {
-                pr.is_list = true;
-                ls >> pr.count_type >> pr.type >> pr.name;
-            } else {
-                pr.type = t;
-                ls >> pr.name;
-            }
-            (cur == VERTEX ? vprops : fprops).push_back(pr);
-        } else if (tok == "end_header") {
-            header_end = static_cast<std::size_t>(is.tellg());
-            break;
-        }
-    }
-    (void)have_format;
-    int vx = -1, vy = -1, vz = -1;
-    for (std::size_t i = 0; i < vprops.size(); ++i) {
-        if (vprops[i].name == "x") vx = static_cast<int>(i);
-        else if (vprops[i].name == "y") vy = static_cast<int>(i);
-        else if (vprops[i].name == "z") vz = static_cast<int>(i);
-    }
-    if (vx < 0 || vy < 0 || vz < 0)
-        throw OpError("import_failed", "PLY: missing x/y/z vertex properties", {{"path", path}});
-
-    MeshData mesh;
-    mesh.verts.reserve(n_vert * 3);
-    mesh.tris.reserve(n_face * 3);
-
-    auto emit_face = [&](const std::vector<int>& idx) {
-        for (std::size_t j = 1; j + 1 < idx.size(); ++j) {  // fan-triangulate (matches trimesh)
-            mesh.tris.push_back(static_cast<uint32_t>(idx[0]));
-            mesh.tris.push_back(static_cast<uint32_t>(idx[j]));
-            mesh.tris.push_back(static_cast<uint32_t>(idx[j + 1]));
-        }
-    };
-
-    if (enc == ASCII) {
-        for (std::size_t i = 0; i < n_vert; ++i) {
-            if (!std::getline(is, line))
-                throw OpError("import_failed", "PLY: truncated vertex block", {{"path", path}});
-            std::istringstream ls(line);
-            std::vector<double> vals;
-            double d;
-            while (ls >> d) vals.push_back(d);
-            if (static_cast<int>(vals.size()) <= std::max({vx, vy, vz}))
-                throw OpError("import_failed", "PLY: short vertex line", {{"path", path}});
-            mesh.verts.push_back(vals[vx]);
-            mesh.verts.push_back(vals[vy]);
-            mesh.verts.push_back(vals[vz]);
-        }
-        for (std::size_t i = 0; i < n_face; ++i) {
-            if (!std::getline(is, line))
-                throw OpError("import_failed", "PLY: truncated face block", {{"path", path}});
-            std::istringstream ls(line);
-            int k = 0;
-            ls >> k;
-            std::vector<int> idx(k);
-            for (int j = 0; j < k; ++j) ls >> idx[j];
-            emit_face(idx);
-        }
-    } else {  // BIN_LE — slurp the body and walk it with the per-property layout.
-        is.clear();
-        is.seekg(static_cast<std::streamoff>(header_end), std::ios::beg);
-        std::vector<unsigned char> buf((std::istreambuf_iterator<char>(is)),
-                                       std::istreambuf_iterator<char>());
-        const unsigned char* p = buf.data();
-        const unsigned char* end = p + buf.size();
-        for (std::size_t i = 0; i < n_vert; ++i) {
-            double vxv = 0, vyv = 0, vzv = 0;
-            for (std::size_t k = 0; k < vprops.size(); ++k) {
-                if (p >= end) throw OpError("import_failed", "PLY: truncated binary vertex data",
-                                            {{"path", path}});
-                double val = ply::read_le_scalar(p, vprops[k].type);
-                if (static_cast<int>(k) == vx) vxv = val;
-                else if (static_cast<int>(k) == vy) vyv = val;
-                else if (static_cast<int>(k) == vz) vzv = val;
-            }
-            mesh.verts.push_back(vxv);
-            mesh.verts.push_back(vyv);
-            mesh.verts.push_back(vzv);
-        }
-        for (std::size_t i = 0; i < n_face; ++i) {
-            std::vector<int> idx;
-            for (const ply::Prop& pr : fprops) {
-                if (p >= end) throw OpError("import_failed", "PLY: truncated binary face data",
-                                            {{"path", path}});
-                if (pr.is_list) {
-                    int k = static_cast<int>(ply::read_le_scalar(p, pr.count_type));
-                    idx.resize(k);
-                    for (int j = 0; j < k; ++j) idx[j] = static_cast<int>(
-                        ply::read_le_scalar(p, pr.type));
-                } else {
-                    ply::read_le_scalar(p, pr.type);  // skip a scalar face prop
-                }
-            }
-            emit_face(idx);
-        }
-    }
-    return mesh;
-}
+#include "doc/ply_read.inc"
 
 // ---- glTF / GLB via OCCT's XCAF-backed reader/writer ------------------------
 Handle(TDocStd_Document) new_xcaf_doc() {
@@ -2986,6 +3211,15 @@ TopoDS_Shape closed_mesh_solid(const MeshData& mesh, const MeshSmoothNormals& sn
 }  // namespace
 
 TopoDS_Shape mesh_to_shape(const MeshData& mesh) {
+    if (mesh.verts.size() % 3 != 0 || mesh.tris.size() % 3 != 0)
+        throw OpError("import_failed", "Mesh has an incomplete vertex or triangle");
+    if (!std::all_of(mesh.verts.begin(), mesh.verts.end(),
+                     [](double v) { return std::isfinite(v); }))
+        throw OpError("import_failed", "Mesh has non-finite vertex coordinates");
+    const std::size_t vertex_count = mesh.vertex_count();
+    for (uint32_t index : mesh.tris)
+        if (index >= vertex_count)
+            throw OpError("import_failed", "Mesh triangle index is outside the vertex array");
     if (mesh.triangle_count() == 0) return TopoDS_Shape();
     const MeshSmoothNormals sn = compute_mesh_smooth_normals(mesh);
     // A clean closed mesh takes the direct lane (closed_mesh_solid). Its result must pass
@@ -3348,9 +3582,10 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
         }
         if (fmt == "stl") {
             mesh_shape(shape, tess);
-            StlAPI_Writer w;
-            w.ASCIIMode() = tess.ascii ? Standard_True : Standard_False;
-            if (!w.Write(shape, out.c_str()))
+            const auto mesh = stl_triangulation(shape, tess.ascii);
+            const OSD_Path destination(out.c_str());
+            if (!(tess.ascii ? RWStl::WriteAscii(mesh, destination)
+                             : RWStl::WriteBinary(mesh, destination)))
                 throw OpError("export_failed", "STL writer returned failure", {{"path", out}});
             return out;
         }

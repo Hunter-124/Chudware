@@ -53,6 +53,9 @@ struct AsmBodyOut {
     float metallic = 0.0f;
     float roughness = 0.5f;
     std::vector<aicm::AppearanceRegion> appearance_regions;  // local compound face IDs
+    // Material registry key per source body, aligned with shape_local's bodies (the shape
+    // itself for one body, else its compound children); "" = no material assigned.
+    std::vector<std::string> body_material_keys;
 };
 
 // Per-component build status. ok requires the ENTIRE source to rebuild successfully,
@@ -64,6 +67,9 @@ struct AsmComponentStatus {
     double ms = 0.0;
     std::optional<std::string> error;        // nullopt == ok
     std::vector<std::string> dangling_refs;  // refs[i] strings (none here; mate-level)
+    // Write-back report of a component this rebuild compiled from its features
+    // (compile_component_with_build_state); null when its saved build state served.
+    nlohmann::json build_state;
 };
 
 // Per-mate status (id, type, status, dangling_refs).
@@ -117,7 +123,8 @@ AssemblyResult compile_assembly(const nlohmann::json& doc,
                                 const std::optional<chudware::mate::Drag>& drag = std::nullopt);
 
 // Fingerprints of every non-suppressed component's resolved source file, followed by
-// nested descendants and legacy file-backed imports ([{path, size, mtime}]).
+// nested descendants and legacy file-backed imports ([{path, size, mtime, doc_hash?}];
+// native .step+ rows carry their document's stepplus_doc_hash).
 // Written into persisted-geometry cache headers so doc_open detects child appearance
 // and geometry changes even when the containing assembly file has not changed.
 // Missing files fingerprint as size/mtime 0; repeated/cyclic sources are traversed once.
@@ -125,10 +132,23 @@ AssemblyResult compile_assembly(const nlohmann::json& doc,
 nlohmann::json asm_component_fingerprints(const nlohmann::json& doc,
                                           const std::string& base_dir);
 
-// True iff asm_component_fingerprints(doc, base_dir) == fp (order-sensitive — component
-// order is part of the identity). Any parse mismatch returns false (cache miss).
+// True iff asm_component_fingerprints(doc, base_dir) matches fp row for row (order-
+// sensitive — component order is part of the identity): same path, and the same
+// size+mtime or, for a rewritten native file, the same doc_hash (a build-state
+// write-back keeps the document). Any parse mismatch returns false (cache miss).
 bool asm_fingerprints_match(const nlohmann::json& doc, const std::string& base_dir,
                             const nlohmann::json& fp);
+
+// A component part whose saved build state is stale: compile it as a part session would
+// and save that build into its file (contracts/stepplus.md §17), so the next assembly
+// rebuild and a direct open of the part are both warm. `stamp` is the file's
+// stepplus_file_stamp taken before `doc` was read. Implemented in session.cpp. Returns
+// the compile (bodies for the assembly); `build_state` receives the write-back report.
+struct NativeFileStamp;
+CompileResult compile_component_with_build_state(const std::string& path,
+                                                 const nlohmann::json& doc,
+                                                 const NativeFileStamp& stamp,
+                                                 nlohmann::json& build_state);
 
 // Per-component explode offset vector (mm) from the doc's ``explode`` steps, scaled by
 // factor (port of assembly.py::explode_offsets).

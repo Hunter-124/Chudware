@@ -394,3 +394,25 @@ def test_ensure_an_explicit_wrong_target_never_falls_back_to_the_cache(
             tmp_path / "cache", "linux-x86_64",
             source=binaries["windows-x86_64"], lock_path=lock_path,
         )
+
+@pytest.mark.parametrize("stage", [False, True])
+def test_replaced_input_is_never_executed_or_published(tmp_path, monkeypatch, stage):
+    lock, binaries = _lock(tmp_path)
+    source = binaries["linux-x86_64"]
+    approved = source.read_bytes()
+    observed = []
+    def verify_private_snapshot(snapshot, _target, _lock):
+        source.write_bytes(b"substituted inert input")
+        observed.append(snapshot)
+        assert snapshot != source
+        assert snapshot.read_bytes() == approved
+        assert snapshot.parent.stat().st_mode & 0o077 == 0
+        return "Chudcode v0.2.0"
+    monkeypatch.setattr(pin, "_verify_executable_version", verify_private_snapshot)
+    if stage:
+        destination = tmp_path / "payload" / "chud"
+        pin.stage_binary(source, destination, "linux-x86_64", lock_path=lock)
+        assert destination.read_bytes() == approved
+    else:
+        pin.verify_binary(source, "linux-x86_64", lock_path=lock)
+    assert not observed[0].exists()

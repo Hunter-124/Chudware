@@ -22,6 +22,14 @@ try:
     from packaging.release_json import canonical_json_bytes, parse_canonical_json_bytes
 except ImportError:  # direct execution from packaging/
     from release_json import canonical_json_bytes, parse_canonical_json_bytes
+try:
+    from packaging.platform_publishers import (
+        POLICY_DOMAIN, PublisherPolicyError, require_owner_signing_key, validate_policy_document,
+    )
+except ImportError:
+    from platform_publishers import (
+        POLICY_DOMAIN, PublisherPolicyError, require_owner_signing_key, validate_policy_document,
+    )
 
 DOMAINS = {
     "payload": b"chudware-payload-v1\0",
@@ -29,6 +37,7 @@ DOMAINS = {
     "sbom": b"chudware-sbom-v1\0",
     "provenance": b"chudware-provenance-v1\0",
     "platform-test": b"chudware-platform-test-v1\0",
+    "platform-publishers": POLICY_DOMAIN,
 }
 
 class SigningError(RuntimeError):
@@ -99,6 +108,11 @@ def validate_request(kind: str, request: bytes) -> None:
             raise SigningError("artifact digest is not lowercase SHA-256")
         if any(ch in "\r\n" for ch in identity):
             raise SigningError("artifact request identity contains a line break")
+    elif kind == "platform-publishers":
+        try:
+            validate_policy_document(request[len(domain):])
+        except PublisherPolicyError as exc:
+            raise SigningError(str(exc)) from exc
     elif kind in {"sbom", "provenance", "platform-test"}:
         body = request[len(domain):]
         try:
@@ -117,6 +131,11 @@ def sign_request_with_key(kind: str, request: bytes, key: Any) -> str:
     the CI secret. Neither reimplements validation or crypto.
     """
     validate_request(kind, request)
+    if kind == "platform-publishers":
+        try:
+            require_owner_signing_key(key)
+        except PublisherPolicyError as exc:
+            raise SigningError(str(exc)) from exc
     return base64.b64encode(key.sign(request)).decode("ascii")
 
 

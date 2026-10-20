@@ -28,12 +28,21 @@
 #include "../model_registry.h"  // ui::ModelInfo — providerPickerModels() rows
 
 struct AppState;
+struct ChatMsg;
 
 namespace ui {
 
 // Draw the AI Copilot pane (header + conversation + bottom composer). `busy` whether a job is
 // running, `canRun` whether new jobs can be launched.
 void drawAIPanel(AppState& state, bool busy, bool canRun);
+
+// Stop a named conversation without selecting it. Dispatches on the non-blocking control lane;
+// the run remains live until the worker unwinds. Used by document-lock takeover chrome.
+void requestStopRunFor(AppState& state, const std::string& convId);
+
+// Recover legacy text-only steer delivery from an exact, unambiguous resolved ask reply
+// in the same transcript turn. Never infer delivery for missing/ambiguous replies or images.
+bool reconcileResolvedAskReplies(std::vector<ChatMsg>& msgs);
 
 // Shared AI settings fields (provider/model/auth, generation). Rendered by the Settings modal's
 // Providers tab as glass-grouped sections — one call per section, each inside its own glass
@@ -53,10 +62,10 @@ bool drawAiSettingsSection(AppState& state, bool busy, AiSettingsSection section
 // (dormant-slot edits + the switch button persist immediately either way).
 bool drawFreeAiProviderCard(AppState& state);
 
-// Probe model availability (agent_list_models) into state.providerModels: always the LOCAL
-// endpoint, plus the ACTIVE provider when it is a cloud one (so a newly released cloud model
-// shows up without a catalog edit). Throttled PER PROVIDER; pass force=true to skip the
-// cooldown (base-URL edit, provider switch). Never blocks — one async probe at a time.
+// Refresh model discovery without blocking: desktop probes the LOCAL endpoint and
+// ACTIVE cloud provider via agent_list_models, throttled per provider; the browser
+// uses the tenant's credential-free chudcode_models_list catalog instead. force=true
+// skips the cooldown after a base-URL edit or provider switch.
 void refreshModelAvailability(AppState& state, bool force);
 
 // True when the provider has a key, signed-in subscription, host-shared account (web),
@@ -135,9 +144,15 @@ void saveMaxSubagentDepth(int depth);
 int  loadSubagentToolCallBudget();
 void saveSubagentToolCallBudget(int budget);
 
-// Persist the active document's conversations (the active one synced from state.chat) to
-// %APPDATA%/Chudware/chat_history.json. Safe to call any time; no-op if nothing to save.
+// Durably persist resident conversations to the Sessions store. Explicit callers wait for
+// pending writes; the per-frame debounce below snapshots to an ordered background writer.
 void persistChatHistory(AppState& state);
+
+// Save the latest transcript and composer draft, then drain pending writes before teardown.
+void flushChatPersistence(AppState& state);
+
+// Drain accepted answer/steer jobs while AppState and its worker are still alive.
+void shutdownAgentControl(AppState& state);
 
 // Debounced mid-turn flush of the active session's chat history (resume-safe: streaming
 // assistant text is written to disk ~1/s WHILE a turn runs, not only at completion).
@@ -164,12 +179,13 @@ bool chatLogAtBottom(const char* regionId);
 // Re-engage stick and snap to the tail on the region's next chatLogStickToBottom call (the
 // scroll offset can only be set from INSIDE the scrolling child, so the jump is deferred).
 void chatLogJumpToBottom(const char* regionId);
-// Floating circular down-arrow "jump to latest" button, drawn OVER a chat viewport's
-// bottom-right corner. Call AFTER the scrolling child's EndChild() with the child's screen
-// rect: it submits its own tiny sibling child window, which sorts above the log so it owns
-// hover/clicks and never scrolls with the content. Hidden while chatLogAtBottom(regionId);
-// clicking re-engages stick-to-bottom.
-void chatDrawJumpToLatest(const char* regionId, const ImVec2& viewMin, const ImVec2& viewMax);
+// Reserved parent-layout gutter height, INCLUDING the item's trailing spacing. Reserve this
+// before sizing the scrolling child, even while pinned, so showing the action never resizes it.
+float chatJumpToLatestFooterHeight();
+// Draw the layout-participating footer AFTER EndChild(), at the parent's current cursor.
+// It consumes chatJumpToLatestFooterHeight(), never overlaps the transcript or its scrollbar,
+// and hides the action while pinned. Clicking defers the region-scoped snap until the next log.
+void chatDrawJumpToLatest(const char* regionId);
 void chatDrawComposer(AppState& st, bool busy, bool canRun);  // prelude + input + toolbar (real send path)
 void chatDrawSessionsList(AppState& st, bool busy);           // session rows + "+ New session"
 // The ONE empty-state for a session with no messages yet — both chat hosts (docked Copilot and

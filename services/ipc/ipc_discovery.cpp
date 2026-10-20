@@ -1,8 +1,9 @@
-// POSIX implementation of daemon discovery/lifecycle. Windows lands in the
-// Windows-parity phase (named mutex + \\.\pipe names).
+// POSIX discovery/lifecycle. Windows private file locks and named-pipe discovery
+// live in ipc_discovery_win.cpp.
 #ifndef _WIN32
 
 #include "ipc_discovery.h"
+#include "ipc_private.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -86,7 +87,8 @@ std::string stateDir() {
     if (const char* x = std::getenv("XDG_DATA_HOME"); x && *x) base = x;
     else if (const char* h = std::getenv("HOME"); h && *h) base = std::string(h) + "/.local/share";
     else base = ".";
-    return base + "/Chudware";
+    const std::string dir = base + "/Chudware";
+    return privateDir(dir) ? dir : std::string();
 }
 
 std::string socketPath(const std::string& key) {

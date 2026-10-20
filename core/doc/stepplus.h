@@ -7,6 +7,7 @@
 //   save(doc, path, extra)  -> writes thumbnail.png (STORED), meta.json,
 //                              document.json + any preserved unknown entries. Atomic.
 //   open(path)              -> {doc, warnings, extra_entries}.
+// Path arguments and returned path strings are UTF-8 on every platform.
 //
 // compile_document is deterministic, so a JSON-only round-trip is FAITHFUL: open =
 // unzip + read document.json + rebuild. `geometry.step` (the AP214 snapshot of the last
@@ -15,12 +16,14 @@
 // still tolerates its absence (a document that has never rebuilt has none).
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 #include <TopoDS_Shape.hxx>
+#include "doc/native_policy.h"
 
 namespace chudware::doc {
 
@@ -36,7 +39,7 @@ struct StepPlusDoc {
 };
 
 // Write `doc` to `path` as a .step+ container. `extra` carries unknown entries to
-// preserve verbatim (forward-compat). Atomic: writes "<path>.tmp" then replaces.
+// preserve verbatim (forward-compat). Atomic: private exclusive staging, then replacement.
 // Returns the final path. Throws OpError("io_error", ...) on any failure. Optional
 // caches (cache.aicm, cache.ckpt) that do not fit the archive budget left by every
 // other entry are not written; their names are appended to `dropped` when given.
@@ -97,6 +100,46 @@ std::string stepplus_doc_hash(const nlohmann::json& doc);
 // change to the geometry compiler that could alter output MUST bump the schema constant so
 // stale caches from older engines are rejected. Mismatch on open -> full rebuild.
 std::string stepplus_cache_engine_key();
+
+// Cache authority is process/cell state, never document-controlled.
+void configure_native_policy(const std::string& root, const std::string& state_dir);
+// Component loads authenticate the signed manifest and only hash the BREP/header
+// members they consume, without allocating unrelated mesh/checkpoint payloads.
+bool stepplus_cache_verified(const nlohmann::json& doc,
+                            const std::map<std::string, std::string>& entries,
+                            bool component_only = false);
+
+// --- build-state write-back (contracts/stepplus.md §17) -------------------------------
+// Identity of a container file on disk: size + modification time (nanoseconds since the
+// filesystem clock epoch). `valid` is false when the path is not a regular file.
+struct NativeFileStamp {
+    std::uintmax_t size = 0;
+    long long mtime_ns = 0;
+    bool valid = false;
+    bool operator==(const NativeFileStamp& o) const {
+        return valid && o.valid && size == o.size && mtime_ns == o.mtime_ns;
+    }
+};
+NativeFileStamp stepplus_file_stamp(const std::string& path);
+
+struct BuildStateWriteback {
+    bool written = false;
+    std::string reason;                 // why nothing was written (empty when written)
+    std::vector<std::string> entries;   // build-state members now in the file
+    std::vector<std::string> dropped;   // optional caches left out by the archive budget
+};
+// Replace ONLY the derived build-state members (cache.json/.aicm/.brep/.ckpt and
+// geometry.step) of the .step+ at `path` with `entries`. Every other member —
+// document.json, meta.json, thumbnail.png, drawings, studies, unknown entries — is copied
+// as its compressed stream, byte for byte, so the document and its metadata stay exactly
+// as authored. Refuses (written=false, reason) unless the file still carries `expected`
+// and its document.json hashes (stepplus_doc_hash) to `doc_hash`: `file_changed`,
+// `document_changed`, `not_a_container`, `io_error: ...`. Atomic (private temp + rename);
+// never throws.
+BuildStateWriteback stepplus_write_build_state(const std::string& path,
+                                               const NativeFileStamp& expected,
+                                               const std::string& doc_hash,
+                                               const std::map<std::string, std::string>& entries);
 
 // --- studies/<id>/results.npz (durable FEA solve-state cache) -------------------------
 // Contract: contracts/stepplus.md §1 `studies/<id>/results.npz`, cap 20 MB/study.

@@ -4,8 +4,9 @@
 // B-rep lanes (P20): STEP / IGES / BREP read+write.
 // Mesh lanes (P27, this increment): STL / OBJ / PLY / glTF / GLB read+write.
 //   * EXPORT: surviving solids are tessellated (BRepMesh, Python defaults) and written
-//     out as triangle meshes — STL via StlAPI_Writer, OBJ/PLY via deterministic hand
-//     writers, glTF/GLB via OCCT's RWGltf_CafWriter (XCAF doc carrier).
+//     out as triangle meshes — STL via RWStl with native-pole exclusion and exact
+//     serialized solid-closure checks, OBJ/PLY via deterministic hand writers,
+//     glTF/GLB via OCCT's RWGltf_CafWriter (XCAF doc carrier).
 //   * IMPORT: the triangle soup is read (RWStl/RWObj/RWGltf reader or the hand PLY
 //     reader) into a Poly_Triangulation, then SEWN into a shell and (when closed)
 //     promoted to a SOLID — the C++ analogue of the Python oracle's "as_solid"
@@ -108,6 +109,9 @@ int parse_units(const std::string& units);
 // tessellation quality (defaults to 0.05mm linear / 0.35rad angular). Used by the mesh
 // writers. The existing triangulation is cleared first so the requested deflection is
 // honored exactly even if the shape was previously meshed at a different quality.
+// Tangent boundary cusps are sampled on their exact curves before face meshing;
+// located instances of shared native edges use synchronized parameter samples.
+// This prevents overlapping chords without modifying the source B-rep.
 MeshData shape_to_mesh(const TopoDS_Shape& shape, const TessOptions& tess = TessOptions{});
 
 // Count the triangles/vertices a mesh export would produce at the given quality, without

@@ -5,9 +5,13 @@
 
 #include "copilot_internal.h"
 #include "agent_text.h"
-#include "image_lightbox.h"       // attachmentThumbnail / openImageLightbox
+#include "image_lightbox.h"       // attachmentImagePreview / openImageLightbox
+#include "inline_image_refs.h"
 #include "util/time_local.h"
 #include "ui/copilot/context_chips.h"  // context-picker chips on the sent bubble
+#include "ui/ai/ai_prefs.h"
+
+#include <unordered_map>
 
 namespace ui {
 
@@ -149,53 +153,141 @@ static void drawMsgMetaRow(const ui::Fonts& fonts, const char* name, const ImVec
     }
 }
 
-// ---- images that rode along with a SENT user message --------------------------
-// ChatMsg::imagePaths holds the exact absolute path of each image attachment, recorded at
-// send time from the RPC attachment — the only source of truth. Nothing is ever resolved
-// from the "[attached image: NAME]" marker text: basenames repeat across day buckets, so
-// guessing could show the wrong picture. Legacy messages with no recorded paths keep their
-// text marker and draw no thumbnail. A missing/unreadable file is handled by
-// attachmentThumbnail itself.
+// ---- ordered text / images in a SENT user message -----------------------------
+// imagePaths is the exact send-time roster. Numbered refs index it; legacy markers consume
+// that roster in order, never resolve their names across paste-cache day buckets. Without a
+// recorded path the marker stays prose. Only unreferenced historical attachments trail the body.
+namespace {
+struct SentBodySegment {
+    std::string text;
+    std::vector<ui::copilot::KeywordRange> keywords;
+    size_t image = std::string::npos;
+};
 
-// Wrapping strip of clickable thumbnails under the sent message's text. Drawn inside the
-// user bubble's child window, so it inherits the bubble inset and needs no extra indent.
-static void drawSentImageStrip(const ChatMsg& m) {
-    const std::vector<std::string>& paths = m.imagePaths;
-    if (paths.empty()) return;   // legacy / text-only message -> renders exactly as before
+struct SentBody {
+    std::string source;
+    std::vector<std::string> paths;
+    std::vector<SentBodySegment> segments;
+    int lastFrame = 0;
+};
 
-    constexpr size_t kMaxThumbs = 6;
-    const float lineH = ImGui::GetTextLineHeight();
-    const float thumb = lineH * 3.0f;
-    const float gap   = ui::metrics::px(6.0f);
-    const float avail = ImGui::GetContentRegionAvail().x;
-    const size_t shown = std::min(paths.size(), kMaxThumbs);
-
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
-    ImGui::PushID("##umsg_imgs");
-    float rowUsed = 0.0f;
-    for (size_t i = 0; i < shown; ++i) {
-        const bool wrap = (i > 0) && (rowUsed + gap + thumb > avail);
-        if (wrap) { ImGui::Dummy(ImVec2(0, gap)); rowUsed = 0.0f; }
-        else if (i > 0) { ImGui::SameLine(0.0f, gap); rowUsed += gap; }
-        ImGui::PushID((int)i);
-        if (ui::attachmentThumbnail(paths[i], thumb)) ui::openImageLightbox(paths[i]);
-        ImGui::PopID();
-        rowUsed += thumb;
-    }
-    if (paths.size() > shown) {
-        const float moreW = ImGui::CalcTextSize("+00 more").x;
-        if (rowUsed + gap + moreW <= avail) {
-            ImGui::SameLine(0.0f, gap);
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (thumb - lineH) * 0.5f);
-        } else {
-            ImGui::Dummy(ImVec2(0, gap));
+// Sent messages are immutable in the usual draw path. Cache the split and keyword remapping
+// rather than copying/stripping every segment every frame; compare inputs for edits/session reuse.
+static const SentBody& sentBody(const ChatMsg& m) {
+    static std::unordered_map<ImGuiID, SentBody> cache;
+    const ImGuiID id = ImGui::GetID("##sent_body");
+    auto it = cache.find(id);
+    if (it == cache.end()) {
+        constexpr size_t kBodyCacheCap = 128;
+        if (cache.size() >= kBodyCacheCap) {
+            auto oldest = cache.begin();
+            for (auto entry = cache.begin(); entry != cache.end(); ++entry)
+                if (entry->second.lastFrame < oldest->second.lastFrame) oldest = entry;
+            cache.erase(oldest);
         }
-        ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textTertiary);
-        ImGui::Text("+%d more", (int)(paths.size() - shown));
-        ImGui::PopStyleColor();
+        it = cache.emplace(id, SentBody{}).first;
+    }
+    SentBody& body = it->second;
+    body.lastFrame = ImGui::GetFrameCount();
+    if (body.source == m.text && body.paths == m.imagePaths) return body;
+    body.source = m.text;
+    body.paths = m.imagePaths;
+    body.segments.clear();
+
+    auto refs = ui::copilot::inlineImageRefs(m.text, m.imagePaths.size());
+    constexpr std::string_view legacyPrefix = "[attached image: ";
+    size_t legacyImage = 0;
+    for (size_t pos = 0; (pos = m.text.find(legacyPrefix, pos)) != std::string::npos;) {
+        const size_t end = m.text.find(']', pos + legacyPrefix.size());
+        if (end == std::string::npos) break;
+        if (legacyImage < m.imagePaths.size())
+            refs.push_back({pos, end + 1, legacyImage});
+        ++legacyImage;
+        pos = end + 1;
+    }
+    std::sort(refs.begin(), refs.end(), [](const auto& a, const auto& b) {
+        return a.begin < b.begin;
+    });
+
+    // Match keywords before stripping markdown so keywords inside code remain ordinary prose.
+    std::vector<size_t> srcOf;
+    std::string plain = stripMdMarks(m.text, &srcOf);
+    auto keywords = ui::copilot::magicKeywordRanges(m.text);
+    const auto plainOffset = [&](size_t raw) {
+        return static_cast<size_t>(std::lower_bound(srcOf.begin(), srcOf.end(), raw) - srcOf.begin());
+    };
+    for (auto& r : keywords) {
+        r.begin = plainOffset(r.begin);
+        r.end = plainOffset(r.end);
+    }
+    const auto addProse = [&](size_t begin, size_t end) {
+        if (end <= begin) return;
+        SentBodySegment segment;
+        segment.text = plain.substr(begin, end - begin);
+        for (const auto& r : keywords) {
+            if (r.begin >= end) break;
+            if (r.begin >= begin && r.end <= end) {
+                auto local = r;
+                local.begin -= begin;
+                local.end -= begin;
+                segment.keywords.push_back(local);
+            }
+        }
+        body.segments.push_back(std::move(segment));
+    };
+    std::vector<bool> referenced(m.imagePaths.size(), false);
+    size_t cursor = 0;
+    for (const auto& ref : refs) {
+        if (m.imagePaths[ref.image].empty()) continue;
+        const size_t begin = plainOffset(ref.begin);
+        const size_t end = plainOffset(ref.end);
+        if (begin < cursor) continue;
+        addProse(cursor, begin);
+        SentBodySegment image;
+        image.image = ref.image;
+        body.segments.push_back(std::move(image));
+        referenced[ref.image] = true;
+        cursor = end;
+    }
+    addProse(cursor, plain.size());
+    for (size_t image = 0; image < referenced.size(); ++image) {
+        if (referenced[image] || m.imagePaths[image].empty()) continue;
+        SentBodySegment segment;
+        segment.image = image;
+        body.segments.push_back(std::move(segment));
+    }
+    return body;
+}
+
+// Keep the owning text widget's selection, not just the final prose segment's selection.
+// ImGui has one InputTextState; querying each segment immediately preserves its plain-text map.
+static std::string drawSentBody(const SentBody& body) {
+    std::string selection;
+    const float previewW = std::min(ImGui::GetContentRegionAvail().x, ui::metrics::px(480.0f));
+    const float previewH = ui::metrics::px(320.0f);
+    ImGui::PushID("##sent_segments");
+    for (size_t i = 0; i < body.segments.size(); ++i) {
+        const SentBodySegment& segment = body.segments[i];
+        ImGui::PushID(static_cast<int>(i));
+        if (segment.image == std::string::npos) {
+            const ImGuiID textId = chatDrawSelectableText("##prose", segment.text,
+                                                         chatSurf().textPrimary, &segment.keywords);
+            std::string selected = chatInputSelection(textId);
+            if (!selected.empty()) selection = std::move(selected);
+        } else {
+            if (i > 0) ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
+            ImGui::TextColored(chatSurf().textTertiary, "#%zu", segment.image + 1);
+            if (ui::attachmentImagePreview(body.paths[segment.image], previewW, previewH))
+                ui::openImageLightbox(body.paths[segment.image]);
+            if (i + 1 < body.segments.size())
+                ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
+        }
+        ImGui::PopID();
     }
     ImGui::PopID();
+    return selection;
 }
+}  // namespace
 
 // The model entities this message carried (composer context picker): one chip per item, same
 // painter as the pending chips above the composer. Clicking one shows it in the viewport.
@@ -233,15 +325,7 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     const float avail = std::min(panelW, ImGui::GetContentRegionAvail().x);
     const float rowX = ImGui::GetCursorPosX();
 
-    // Magic keywords are matched on the RAW text — stripMdMarks drops the backticks that mark
-    // a code span, and a keyword inside one must stay plain — then carried across the strip.
-    std::vector<size_t> srcOf;
-    const std::string userBody = stripMdMarks(m.text, &srcOf);
-    std::vector<ui::copilot::KeywordRange> keywords = ui::copilot::magicKeywordRanges(m.text);
-    for (ui::copilot::KeywordRange& r : keywords) {
-        r.begin = (size_t)(std::lower_bound(srcOf.begin(), srcOf.end(), r.begin) - srcOf.begin());
-        r.end = (size_t)(std::lower_bound(srcOf.begin(), srcOf.end(), r.end) - srcOf.begin());
-    }
+    const SentBody& body = sentBody(m);
 
     // Shrink-to-fit: a one-liner gets a small bubble, long text wraps at ~80% of the column
     // (a little more on the narrow docked column, where 80% would starve the line length).
@@ -250,12 +334,14 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     const float maxW = std::max(avail * (avail < ui::metrics::px(420.0f) ? 0.90f : 0.80f),
                                 ui::metrics::px(120.0f));
     const bool hasExtras = !m.imagePaths.empty() || !m.contextRefs.empty();
-    // The selectable body wraps at (its width - 2 * FramePadding.x); +2 px keeps an exactly
-    // fitting line from wrapping on float rounding.
-    const float textW = chatSoftWrapNaturalWidth(userBody) +
-                        ImGui::GetStyle().FramePadding.x * 2.0f + ui::metrics::px(2.0f);
-    const float bw = hasExtras ? maxW
-                               : std::clamp(textW + padX * 2.0f, ui::metrics::px(48.0f), maxW);
+    // Text-only messages shrink to fit; images/context use the full bubble width.
+    float bw = maxW;
+    if (!hasExtras) {
+        const float textW = body.segments.empty() ? 0.0f
+            : chatSoftWrapNaturalWidth(body.segments.front().text) +
+              ImGui::GetStyle().FramePadding.x * 2.0f + ui::metrics::px(2.0f);
+        bw = std::clamp(textW + padX * 2.0f, ui::metrics::px(48.0f), maxW);
+    }
     ImGui::SetCursorPosX(rowX + avail - bw);
 
     GlassBubble gb = beginGlassBubble(bw, ui::GlassLevel::Regular,
@@ -265,12 +351,8 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize |
                           ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
-    // Same selectable read-only InputText treatment as assistant prose (soft-wrap +
-    // click-drag + Ctrl+C toast + right-click Copy), plus the keywords' static gradient.
-    const ImGuiID textId = chatDrawSelectableText("##umsg_sel", userBody, surf.textPrimary,
-                                                  &keywords);
-    // Pasted images this message carried: clickable thumbnails, click = full-size viewer.
-    drawSentImageStrip(m);
+    // Selectable prose and clickable image previews follow the reference order in the body.
+    const std::string selection = drawSentBody(body);
     // Model context the message carried: chips (click = show it in the model).
     drawSentContextChips(st, m);
     ImGui::PopStyleVar();   // ItemSpacing -- pushed after BeginChild, must pop before EndChild
@@ -281,7 +363,7 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     {
         const ImVec2 wp = ImGui::GetWindowPos();
         const ImVec2 ws = ImGui::GetWindowSize();
-        chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), userBody);
+        chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), m.text);
     }
     ImGui::EndChild();
     ImGui::PopStyleVar();   // ##umsg WindowPadding -- pushed before BeginChild, pops after
@@ -290,8 +372,7 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     // A soft pill: the tint carries "you", so the same-hue edge stays a whisper, not an outline.
     const ImRect bubble = endTintBubble(gb, tint, surf.darkText ? 0.16f : 0.24f,
                                         surf.darkText ? 0.16f : 0.18f);
-    const std::string sel = chatInputSelection(textId);
-    chatCopyContext(bubble, "##umsg_copy", userBody, userBody, sel);
+    chatCopyContext(bubble, "##umsg_copy", m.text, m.text, selection);
 
     // ---- meta row under the bubble, right-aligned: [rewind] [edit]  age ----
     const double now = ImGui::GetTime();
@@ -311,15 +392,55 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     const float rowH = showBtns ? std::max(lineH, btnSz) : lineH;
     const std::string age = chatStampLabel(m.ts);
     const float ageW = age.empty() ? 0.0f : ImGui::CalcTextSize(age.c_str()).x;
-    const float rowW = (showBtns ? btnSz * 2.0f + gap : 0.0f) +
+    // A message sent mid-run says whether the agent has read it: always visible (not hover-
+    // gated), since "queued behind a long step" otherwise looks exactly like a frozen app.
+    const char* steerLabel = nullptr;
+    const char* steerTip = nullptr;
+    ImVec4 steerInk = surf.textTertiary;
+    switch (m.steerState) {
+    case STEER_SENDING:
+        steerLabel = "Sending\xe2\x80\xa6";
+        steerTip = "Handing your message to the running agent.";
+        break;
+    case STEER_QUEUED:
+        steerLabel = "Queued \xc2\xb7 after this step";
+        steerTip = "The agent reads it when its current tool call returns. A wait on a job "
+                   "ends at once; real work (a solve, a build) finishes first. Stop withdraws "
+                   "it unread and sends it with your next message.";
+        steerInk = semanticOnGlass(ui::palette.statusWarn, surf);
+        break;
+    case STEER_DELIVERED:
+        steerLabel = "Read by agent";
+        steerTip = "The agent has this message in its context.";
+        steerInk = semanticOnGlass(ui::palette.statusOk, surf);
+        break;
+    case STEER_CARRIED:
+        steerLabel = "Unread \xc2\xb7 sends next time";
+        steerTip = "You stopped the run before the agent read this message. It is sent ahead "
+                   "of the next message you send in this chat.";
+        steerInk = semanticOnGlass(ui::palette.statusWarn, surf);
+        break;
+    case STEER_FAILED:
+        steerLabel = "Not delivered \xc2\xb7 resend";
+        steerTip = "The run ended before the agent read this message.";
+        steerInk = semanticOnGlass(ui::palette.statusErr, surf);
+        break;
+    default:
+        break;
+    }
+    const float steerW = steerLabel ? ImGui::CalcTextSize(steerLabel).x : 0.0f;
+    const float rowW = (steerLabel ? steerW + gap * 2.0f : 0.0f) +
+                       (showBtns ? btnSz * 2.0f + gap : 0.0f) +
                        (showBtns && !age.empty() ? gap * 2.0f : 0.0f) + ageW;
     if (rowW <= 0.0f) {
         ImGui::Dummy(ImVec2(0, ui::metrics::cpChatMsgGap()));
         return;
     }
     // Anchored to the bubble's bottom edge (not the layout cursor, which already carries the
-    // item spacing) so the row reads as the bubble's caption.
-    const ImVec2 rowMin(bubble.Max.x - ui::metrics::px(4.0f) - rowW,
+    // item spacing) so the row reads as the bubble's caption; never left of the column, where
+    // a delivery caption on the narrow docked chat would otherwise be clipped.
+    const ImVec2 rowMin(std::max(bubble.Max.x - ui::metrics::px(4.0f) - rowW,
+                                 ImGui::GetWindowPos().x + rowX),
                         bubble.Max.y + ui::metrics::cpChatMetaGap());
     ImDrawList* dl = ImGui::GetWindowDrawList();
     // The row is quiet until the message is hovered (or a rewind is waiting on its confirm).
@@ -334,6 +455,14 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                      inkIdle.z + (inkHot.z - inkIdle.z) * rowA,
                      inkIdle.w * (0.70f + 0.30f * rowA));
     float x = rowMin.x;
+    if (steerLabel) {
+        ImGui::SetCursorScreenPos(ImVec2(x, rowMin.y + (rowH - lineH) * 0.5f));
+        ImGui::PushStyleColor(ImGuiCol_Text, steerInk);
+        ImGui::TextUnformatted(steerLabel);
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", steerTip);
+        x += steerW + gap * 2.0f;
+    }
     if (showBtns) {
         // Rewind glyph button
         ImGui::SetCursorScreenPos(ImVec2(x, rowMin.y + (rowH - btnSz) * 0.5f));
@@ -1022,8 +1151,53 @@ void chatDrawEmptyState() {
                         "plans, models and verifies it.");
 }
 
+// The outer message spacers must not hide a timeline's layout invalidation. Width alone is
+// insufficient when font scaling or the tool detail/grouping/render preferences change while
+// an older turn is offscreen. Keep this render-only state bounded and separate for each surface.
+struct ChatLogLayout {
+    ImGuiStyle style{};
+    ImFont* font = nullptr;
+    ImFont* mono = nullptr;
+    ImFont* medium = nullptr;
+    float size = -1.0f, monoSize = -1.0f, mediumSize = -1.0f;
+    int detail = -1;
+    bool thinking = false, renders = false, grouping = false, humanize = false;
+    std::string conversation;
+};
+
+static void invalidateChatLogLayout(AppState& st) {
+    static std::unordered_map<ImGuiID, ChatLogLayout> layouts;
+    const ImGuiID id = ImGui::GetID("##chat_log_layout");
+    if (layouts.find(id) == layouts.end() && layouts.size() >= 8) layouts.clear();
+    ChatLogLayout& old = layouts[id];
+    ChatLogLayout now;
+    now.style = ImGui::GetStyle();
+    now.font = ImGui::GetFont();
+    now.mono = st.fonts.mono;
+    now.medium = st.fonts.medium;
+    now.size = ImGui::GetFontSize();
+    now.monoSize = now.mono ? now.mono->FontSize * now.mono->Scale : 0.0f;
+    now.mediumSize = now.medium ? now.medium->FontSize * now.medium->Scale : 0.0f;
+    now.detail = ui::chatToolDetail();
+    now.thinking = gShowThinking;
+    now.renders = ui::chatShowRenders();
+    now.grouping = ui::chatGroupToolCalls();
+    now.humanize = ui::chatHumanizeDocIds();
+    now.conversation = st.activeConvId();
+    if (old.font != now.font || old.mono != now.mono || old.medium != now.medium ||
+        old.size != now.size || old.monoSize != now.monoSize || old.mediumSize != now.mediumSize ||
+        old.detail != now.detail || old.thinking != now.thinking || old.renders != now.renders ||
+        old.grouping != now.grouping || old.humanize != now.humanize ||
+        old.conversation != now.conversation ||
+        std::memcmp(&old.style, &now.style, sizeof(ImGuiStyle)) != 0) {
+        for (auto& message : st.chat) message.uiCachedH = -1.0f;
+        old = std::move(now);
+    }
+}
+
 void drawChatLogWindowed(AppState& st) {
     ui::Fonts& fonts = st.fonts;
+    invalidateChatLogLayout(st);
     drawAiVcRollbackConfirm(st);   // pre-rollback confirmation modal (warning ladder)
     const float logW    = ImGui::GetContentRegionAvail().x;
     // A staged edit HIDES the tail it would replace — the messages stay in st.chat (and on
@@ -1162,59 +1336,26 @@ void chatLogJumpToBottom(const char* regionId) {
     s.prevScrollY = -1.0f;   // the deferred snap must not read as a user scroll-up
 }
 
-void chatDrawJumpToLatest(const char* regionId, const ImVec2& viewMin, const ImVec2& viewMax) {
-    (void)viewMin;
-    if (chatLogAtBottom(regionId)) return;
-    const float r = ui::metrics::px(13.0f);
-    // 18dp x-inset keeps the disc clear of the pill-scrollbar lane on the child's right edge.
-    const ImVec2 c(viewMax.x - ui::metrics::px(18.0f) - r, viewMax.y - ui::metrics::px(10.0f) - r);
+float chatJumpToLatestFooterHeight() {
+    // Keep the gutter even while pinned: showing the action must not resize the viewport and
+    // turn a layout-induced scroll adjustment into a user scroll-up.
+    return ImGui::GetFrameHeightWithSpacing();
+}
 
-    // The button lives in its OWN tiny child window submitted after the log child. It used to be
-    // an InvisibleButton in the PARENT window, but the log child covers that rect, so ImGui's
-    // g.HoveredWindow was always the log child: the parent-window item could never be hovered or
-    // clicked (and its disc, on the parent drawlist, rendered UNDER the log). A later-submitted
-    // sibling child sorts above the log in display order, so it owns hover, the click, and
-    // paints on top. The margin keeps the anti-aliased rim inside the child's clip rect.
-    const float  pad = ui::metrics::px(2.0f);
-    const ImVec2 boxMin(c.x - r - pad, c.y - r - pad);
-    const ImVec2 boxSize(2.0f * (r + pad), 2.0f * (r + pad));
-    const ImVec2 keep = ImGui::GetCursorPos();
-    ImGui::SetCursorScreenPos(boxMin);
-    ImGui::PushID(regionId ? regionId : "chat");
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::BeginChild("##jump_latest_host", boxSize, ImGuiChildFlags_None,
-                      ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
-                      ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoNav |
-                      ImGuiWindowFlags_NoSavedSettings);
-    ImGui::SetCursorScreenPos(ImVec2(c.x - r, c.y - r));
-    const bool clicked = ImGui::InvisibleButton("##jump_latest", ImVec2(r * 2.0f, r * 2.0f));
-    const bool hov     = ImGui::IsItemHovered();
-    if (hov) {
-        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        ImGui::SetTooltip("Jump to the latest reply");
+void chatDrawJumpToLatest(const char* regionId) {
+    const float height = ImGui::GetFrameHeight();
+    if (chatLogAtBottom(regionId)) {
+        ImGui::Dummy(ImVec2(0, height));
+        return;
     }
-
-    const ui::AdaptiveSurface& surf = chatSurf();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec4 fill = surf.tint;
-    fill.w = hov ? 0.98f : 0.85f;
-    dl->AddCircleFilled(c, r, ImGui::ColorConvertFloat4ToU32(fill));
-    dl->AddCircle(c, r,
-                  ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
-                                                        surf.textPrimary.z, hov ? 0.55f : 0.28f)),
-                  0, ui::metrics::stroke(1.0f));
-    // Down chevron.
-    const ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
-    const float hw = r * 0.42f, hh = r * 0.24f, th = ui::metrics::stroke(2.0f);
-    const ImVec2 mid(c.x, c.y + hh * 0.6f);
-    dl->AddLine(ImVec2(c.x - hw, c.y - hh), mid, ink, th);
-    dl->AddLine(ImVec2(c.x + hw, c.y - hh), mid, ink, th);
-    ImGui::EndChild();
-    ImGui::PopStyleVar();
+    // This is a normal parent item AFTER EndChild, entirely outside the log's hit-test rectangle.
+    // A full-width action also stays reachable in the minimum-width Copilot column.
+    ImGui::PushID(regionId ? regionId : "chat");
+    if (ui::kit::secondaryButton("Jump to latest###chat_jump_latest", true, nullptr,
+                                ImVec2(std::max(ImGui::GetContentRegionAvail().x,
+                                               ui::metrics::stroke(1.0f)), height)))
+        chatLogJumpToBottom(regionId);
     ImGui::PopID();
-    ImGui::SetCursorPos(keep);
-
-    if (clicked) chatLogJumpToBottom(regionId);
 }
 
 // Re-engage stick-to-bottom on every chat surface (conversation switch). Dropping the entries

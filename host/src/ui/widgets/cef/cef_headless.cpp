@@ -32,6 +32,16 @@
 namespace ui::cef {
 namespace {
 
+constexpr size_t kMaxHtmlBytes = 8 * 1024 * 1024;
+constexpr size_t kMaxDownloadBytes = 200 * 1024 * 1024;
+
+// Chromium's URLRequest path cannot bind a connection to our public-address
+// snapshot. Tenant requests must use the broker-backed Python public HTTP client.
+bool tenant_cell() {
+    const char* value = std::getenv("CHUDWARE_CELL");
+    return value && std::string(value) == "1";
+}
+
 // A per-site cookie jar for `profile_dir`, or the global context when empty. The
 // cache_path must live under CefSettings.root_cache_path (CEF 149) — callers pass
 // a dir under cef_platform::cache_root(), the same convention CefWebView uses.
@@ -68,7 +78,13 @@ void pump(int ms) {
 // Collects CefFrame::GetSource's async result.
 class SourceVisitor : public CefStringVisitor {
 public:
-    void Visit(const CefString& s) override { html_ = s.ToString(); done_ = true; }
+    void Visit(const CefString& s) override {
+        if (s.length() <= kMaxHtmlBytes / sizeof(char16_t)) {
+            std::string html = s.ToString();
+            if (html.size() <= kMaxHtmlBytes) html_ = std::move(html);
+        }
+        done_ = true;
+    }
     bool done() const { return done_; }
     const std::string& html() const { return html_; }
 private:
@@ -149,14 +165,32 @@ class DownloadClient : public CefURLRequestClient {
 public:
     bool done() const { return done_; }
     const std::vector<unsigned char>& bytes() const { return bytes_; }
+    bool too_large() const { return too_large_; }
+    bool idle() const {
+        return std::chrono::steady_clock::now() - last_data_ > std::chrono::seconds(30);
+    }
 
     void OnRequestComplete(CefRefPtr<CefURLRequest>) override { done_ = true; }
-    void OnDownloadData(CefRefPtr<CefURLRequest>, const void* data, size_t n) override {
+    void OnDownloadData(CefRefPtr<CefURLRequest> request, const void* data, size_t n) override {
+        if (too_large_) return;
+        last_data_ = std::chrono::steady_clock::now();
+        if (n > kMaxDownloadBytes - bytes_.size()) {
+            too_large_ = true;
+            bytes_.clear();
+            request->Cancel();
+            return;
+        }
         const auto* p = static_cast<const unsigned char*>(data);
         bytes_.insert(bytes_.end(), p, p + n);
     }
     void OnUploadProgress(CefRefPtr<CefURLRequest>, int64_t, int64_t) override {}
-    void OnDownloadProgress(CefRefPtr<CefURLRequest>, int64_t, int64_t) override {}
+    void OnDownloadProgress(CefRefPtr<CefURLRequest> request, int64_t, int64_t total) override {
+        if (total > static_cast<int64_t>(kMaxDownloadBytes)) {
+            too_large_ = true;
+            bytes_.clear();
+            request->Cancel();
+        }
+    }
     bool GetAuthCredentials(bool, const CefString&, int, const CefString&,
                             const CefString&, CefRefPtr<CefAuthCallback>) override {
         return false;  // never auto-answer HTTP auth
@@ -164,6 +198,8 @@ public:
 
 private:
     bool done_ = false;
+    bool too_large_ = false;
+    std::chrono::steady_clock::time_point last_data_ = std::chrono::steady_clock::now();
     std::vector<unsigned char> bytes_;
     IMPLEMENT_REFCOUNTING(DownloadClient);
 };
@@ -489,7 +525,7 @@ private:
 
 FetchJobPtr headless_fetch_start(const std::string& url, int settle_ms,
                                  const std::string& profile_dir) {
-    if (!initialized()) return nullptr;
+    if (tenant_cell() || !initialized()) return nullptr;
     const int slot = acquire_slot(profile_dir);
     if (slot < 0) return nullptr;
     FetchJobPtr job = std::make_shared<FetchJob>(
@@ -517,7 +553,7 @@ FetchResult headless_login_probe(const std::string& url, const std::string& fill
                                  int settle_ms, int post_wait_ms,
                                  const std::string& profile_dir) {
     FetchResult out;
-    if (!initialized()) return out;
+    if (tenant_cell() || !initialized()) return out;
 
     // Exclusive browser for the whole probe — it runs caller JS and synthetic
     // input, so it must never share a browser with an in-flight fetch job.
@@ -594,7 +630,7 @@ FetchResult headless_interact(const std::string& url, const std::string& script,
                               const std::string& sentinel_id, int settle_ms,
                               int timeout_ms, const std::string& profile_dir) {
     FetchResult out;
-    if (!initialized()) return out;
+    if (tenant_cell() || !initialized()) return out;
 
     // Exclusive browser for the whole interaction — it runs caller JS, so it must
     // never share a browser with an in-flight fetch job.
@@ -653,7 +689,7 @@ void headless_close_all() {
 
 bool headless_download(const std::string& url, const std::string& dest_path,
                        const std::string& profile_dir) {
-    if (!initialized()) return false;
+    if (tenant_cell() || !initialized()) return false;
 
     CefRefPtr<CefRequest> request = CefRequest::Create();
     request->SetURL(url);
@@ -666,8 +702,10 @@ bool headless_download(const std::string& url, const std::string& dest_path,
     CefRefPtr<CefURLRequest> req =
         CefURLRequest::Create(request, client, make_context(profile_dir));
 
-    for (int i = 0; i < 3000 && !client->done(); ++i) pump(10);  // up to ~30s
-    if (!client->done()) return false;
+    if (!req) return false;
+    while (!client->done() && !client->idle()) pump(10);
+    if (!client->done()) { req->Cancel(); return false; }
+    if (client->too_large() || req->GetRequestStatus() != UR_SUCCESS) return false;
 
     int status = 0;
     if (CefRefPtr<CefResponse> resp = req->GetResponse()) status = resp->GetStatus();
@@ -705,7 +743,7 @@ private:
 
 int headless_import_cookies(const std::string& profile_dir,
                             const std::vector<ImportCookie>& cookies) {
-    if (!initialized() || cookies.empty()) return 0;
+    if (tenant_cell() || !initialized() || cookies.empty()) return 0;
     CefRefPtr<CefRequestContext> ctx = make_context(profile_dir);
     CefRefPtr<CefCookieManager> mgr = ctx ? ctx->GetCookieManager(nullptr) : nullptr;
     if (!mgr) return 0;

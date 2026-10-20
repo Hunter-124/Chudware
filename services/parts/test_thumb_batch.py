@@ -28,7 +28,16 @@ import time
 
 import pytest
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"stub-image-bytes"
+def _png(color=0):
+    import struct
+    import zlib
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes([0, color]))) + chunk(b"IEND", b""))
+
+
+PNG = _png()
 
 
 def _noop_emit(_):
@@ -337,32 +346,16 @@ class TestFetchTuning:
 
     @staticmethod
     def _route(monkeypatch, table):
-        """Serve urlopen from ``{url: (status, body)}``; a 200 yields a response object and
-        anything else raises a real HTTPError WITH that body attached, exactly as Google's
-        favicon endpoints do. Returns the list of urls requested, in order."""
-        import io
-        import urllib.error
-        import urllib.request
+        """Serve bounded public HTTP response envelopes without network access."""
+        from services.net import safe_http
         asked: list[str] = []
 
-        class _Resp(io.BytesIO):
-            status = 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-        def _open(req, timeout=None):
-            url = req.full_url
+        def _get(url, **kwargs):
             asked.append(url)
             status, body = table.get(url, (599, b""))
-            if status == 200:
-                return _Resp(body)
-            raise urllib.error.HTTPError(url, status, "err", {}, io.BytesIO(body))
+            return safe_http.Response(status, {}, url, body)
 
-        monkeypatch.setattr(urllib.request, "urlopen", _open)
+        monkeypatch.setattr(safe_http, "get", _get)
         return asked
 
 
@@ -373,16 +366,16 @@ class TestFetchTuning:
         assert raw._thumb_fetch_timeout_s() == pytest.approx(4.0), \
             "the default must stay at 4 s, not the old 8 s"
 
-    def test_urlopen_is_called_with_the_tuned_timeout(self, raw, monkeypatch):
-        import urllib.request
+    def test_public_client_is_called_with_the_tuned_idle_timeout(self, raw, monkeypatch):
+        from services.net import safe_http
         monkeypatch.setenv("CHUDWARE_THUMB_FETCH_TIMEOUT_S", "2.25")
         seen: list[float] = []
 
-        def _capture(req, timeout=None):
-            seen.append(timeout)
+        def _capture(url, **kwargs):
+            seen.append(kwargs["idle_timeout"])
             raise OSError("connection refused")
 
-        monkeypatch.setattr(urllib.request, "urlopen", _capture)
+        monkeypatch.setattr(safe_http, "get", _capture)
         self._recording_cef(monkeypatch)
         raw._fetch_image_bytes("https://cdn.example.com/a.png", "catalog:x::p")
         assert seen == [pytest.approx(2.25)]
@@ -424,10 +417,10 @@ class TestFetchTuning:
         b"GIF89a" + b"gif-payload",
         b"RIFF\x10\x00\x00\x00WEBPVP8 payload",
     ])
-    def test_other_image_magics_are_salvaged_too(self, raw, monkeypatch, body):
+    def test_invalid_image_magics_are_refused(self, raw, monkeypatch, body):
         url = "https://cdn.example.com/x.img"
         self._route(monkeypatch, {url: (404, body)})
-        assert raw._fetch_image_bytes(url, "catalog:x::p") == body
+        assert raw._fetch_image_bytes(url, "catalog:x::p") is None
 
     def test_error_body_salvage_reaches_the_gui_as_ok_true(self, raw, monkeypatch):
         """End to end through the batch RPC: the salvaged body must arrive as a real image,
@@ -451,7 +444,7 @@ class TestFetchTuning:
         alt = raw._gstatic_favicon_url(s2)
         assert alt.startswith("https://t3.gstatic.com/faviconV2?")
         assert "url=https://traceparts.com" in alt and "size=64" in alt
-        real_icon = b"\xff\xd8\xff\xe0" + b"the-real-traceparts-jpeg"
+        real_icon = _png(255)
         asked = self._route(monkeypatch, {s2: (404, PNG), alt: (200, real_icon)})
         assert raw._fetch_image_bytes(s2, "vendorlogo:traceparts") == real_icon
         assert asked == [s2, alt], "exactly one alternate attempt, in order"
@@ -487,81 +480,24 @@ class TestFetchTuning:
         assert raw._fetch_image_bytes(url, "catalog:x::p") is None
         assert asked == [url]
 
-    def test_non_404_still_falls_through_to_cef(self, raw, monkeypatch):
-        """A 403 is the hotlink guard — the cookie-carrying CEF session is exactly the fix,
-        so that fallback must survive the 404 short-circuit."""
-        import urllib.error
-        import urllib.request
-
-        def _403(req, timeout=None):
-            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, None)
-
-        monkeypatch.setattr(urllib.request, "urlopen", _403)
+    def test_http_failure_never_falls_through_to_unrestricted_cef(self, raw, monkeypatch):
+        url = "https://cdn.example.com/hot.png"
+        self._route(monkeypatch, {url: (403, b"Forbidden")})
         seen = self._recording_cef(monkeypatch)
-        assert raw._fetch_image_bytes("https://cdn.example.com/hot.png",
-                                      "catalog:x::p") is None
-        assert seen == ["https://cdn.example.com/hot.png"], "403 must still try CEF"
-
-    @pytest.mark.parametrize(("failure", "expected"), [
-        ("construct", None),
-        ("download", None),
-        ("read", None),
-        ("success", PNG),
-    ])
-    def test_cef_temp_image_is_removed_on_every_exit(
-            self, raw, monkeypatch, tmp_path, failure, expected):
-        import pathlib
-        import tempfile
-
-        monkeypatch.setattr(raw, "_http_image_get", lambda *_: (None, 503))
-        created = []
-        real_named_temp = tempfile.NamedTemporaryFile
-
-        def _named_temp(*args, **kwargs):
-            kwargs["dir"] = tmp_path
-            temp = real_named_temp(*args, **kwargs)
-            created.append(pathlib.Path(temp.name))
-            return temp
-
-        class _Client:
-            def download(self, url, dest, profile=""):
-                if failure == "download":
-                    raise RuntimeError("download failed")
-                pathlib.Path(dest).write_bytes(PNG)
-                return {"ok": True}
-
-        def _client():
-            if failure == "construct":
-                raise RuntimeError("client construction failed")
-            return _Client()
-
-        monkeypatch.setattr(tempfile, "NamedTemporaryFile", _named_temp)
-        monkeypatch.setattr("services.browser.cef_client.client", _client)
-        if failure == "read":
-            def _read_failure(_path):
-                raise OSError("read failed")
-
-            monkeypatch.setattr(pathlib.Path, "read_bytes", _read_failure)
-
-        result = raw._fetch_image_bytes(
-            "https://cdn.example.com/hot.png", "catalog:x::p")
-
-        assert result == expected
-        assert created and not any(path.exists() for path in created)
+        assert raw._fetch_image_bytes(url, "catalog:x::p") is None
+        assert seen == []
 
     def test_hotlink_headers_are_preserved(self, raw, monkeypatch):
         """The Referer/User-Agent hotlink defeat is what makes vendor CDNs serve at all."""
-        import urllib.request
+        from services.net import safe_http
         captured: list = []
 
-        def _capture(req, timeout=None):
-            captured.append(req)
+        def _capture(url, **kwargs):
+            captured.append(kwargs["headers"])
             raise OSError("nope")
 
-        monkeypatch.setattr(urllib.request, "urlopen", _capture)
-        self._recording_cef(monkeypatch)
+        monkeypatch.setattr(safe_http, "get", _capture)
         raw._fetch_image_bytes("https://cdn.example.com/a.png",
                                "catalog:mcmaster::https://mcmaster.com/91290A115/")
-        req = captured[0]
-        assert req.get_header("User-agent", "").startswith("Mozilla/5.0")
-        assert req.get_header("Referer") == "https://mcmaster.com/91290A115/"
+        assert captured[0]["User-Agent"].startswith("Mozilla/5.0")
+        assert captured[0]["Referer"] == "https://mcmaster.com/91290A115/"

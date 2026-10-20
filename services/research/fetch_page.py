@@ -1,17 +1,16 @@
-"""Fetch public research pages as readable Markdown, with rendered-page recovery.
+"""Fetch public research pages through the pinned, bounded HTTP client.
 
-Static HTML is preferred. A JavaScript shell is retried in the existing rendered
-browser, then with Firecrawl if a key is configured. Only usable content is cached.
+Static HTML is preferred. Local rendering is refused because browser subresources
+are not connection-pinned. A configured external Firecrawl service may recover a
+JavaScript shell; only usable content is cached.
 """
 from __future__ import annotations
 
-import ipaddress
 import re
-import socket
 import time
 from html.parser import HTMLParser
 from typing import Callable, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
 # Redirect-walk budget: this tool's own worst case MUST fit its harness ceiling.
@@ -19,7 +18,7 @@ from urllib.parse import urljoin, urlparse
 # research_fetch_page runs under ONE outer deadline — its curated ``timeout_s``
 # (services/agent/tool_guidance/research.py, 120 s) enforced by
 # agent_turn._dispatch_tool's ThreadPoolExecutor. ``_http_get`` opens a FRESH
-# httpx request per redirect hop, so a PER-HOP timeout MULTIPLIES: 10 redirects
+# pinned HTTP connection per redirect hop, so a PER-HOP timeout MULTIPLIES: 10 redirects
 # at 30 s/hop was a (10 + 1) * 30 = 330 s worst case, 2.75x the tool's own
 # ceiling. A slow chain could therefore only ever end as the harness's useless
 # "abandoned in the background, may still be running" payload, and a realistic
@@ -50,8 +49,8 @@ _DNS_STALL_RESERVE_S = 15.0
 FETCH_WORST_CASE_S = _WALK_BUDGET_S + _HOP_TIMEOUT_S + _DNS_STALL_RESERVE_S
 
 
-class OutboundPolicyError(ValueError):
-    """The requested URL is not an eligible public research destination."""
+from services.net.safe_http import OutboundPolicyError
+from services.net.safe_http import validate_public_url, get as public_get
 
 
 class RedirectBudgetError(RuntimeError):
@@ -64,44 +63,8 @@ class RedirectBudgetError(RuntimeError):
     """
 
 
-def _public_address(value: str) -> bool:
-    """Return true only for globally routable IPv4/IPv6, including mapped forms."""
-    try:
-        address = ipaddress.ip_address(value.split("%", 1)[0])
-    except ValueError:
-        return False
-    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
-        address = address.ipv4_mapped
-    return address.is_global
-
-
 def _validate_public_url(url: str) -> None:
-    """Reject malformed, credential-bearing, non-HTTPS, or non-public destinations."""
-    try:
-        parsed = urlparse(str(url))
-        port = parsed.port
-    except (TypeError, ValueError) as exc:
-        raise OutboundPolicyError("invalid URL") from exc
-    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-        raise OutboundPolicyError("research fetch requires a public HTTPS URL")
-    port = port or 443
-    try:
-        literal = ipaddress.ip_address(parsed.hostname.split("%", 1)[0])
-    except ValueError:
-        literal = None
-    if literal is not None:
-        if not _public_address(str(literal)):
-            raise OutboundPolicyError("destination address is not public")
-        return
-    try:
-        answers = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM,
-                                     proto=socket.IPPROTO_TCP)
-    except socket.gaierror as exc:
-        raise OutboundPolicyError("destination DNS resolution failed") from exc
-    addresses = [str(sockaddr[0]) for family, _type, _proto, _canon, sockaddr in answers
-                 if family in (socket.AF_INET, socket.AF_INET6)]
-    if not addresses or any(not _public_address(address) for address in addresses):
-        raise OutboundPolicyError("destination DNS includes a non-public address")
+    validate_public_url(url, schemes=("https",))
 
 from .cache import Cache, DEFAULT_TIER
 from .common import HIGH, MEDIUM, OFFLINE, envelope, fail, is_offline, now_ts
@@ -210,19 +173,9 @@ def _is_js_shell(html_text: str, markdown: str, title: str) -> bool:
 
 
 def _render_page(url: str) -> tuple[str, str, str] | None:
-    """Use the existing rate-limited browser/session path, not a second CEF client."""
-    from services.browser.session import browser_fetch
-
-    site = urlparse(url).hostname or "research"
-    result = browser_fetch(url, site=site, no_cache=True)
-    if not result.get("ok"):
-        return None
-    final_url = result.get("final_url") or url
-    _validate_public_url(final_url)
-    markdown, title = html_to_markdown(result.get("content") or "")
-    if _is_js_shell(result.get("content") or "", markdown, title):
-        return None
-    return markdown, final_url, title
+    """Refuse local rendering: neither backend binds every subresource to public IPs."""
+    _validate_public_url(url)
+    return None
 
 
 def _firecrawl_page(url: str) -> tuple[str, str, str] | None:
@@ -266,37 +219,22 @@ def _http_get(url: str) -> tuple[str, str, str, str]:
     raises :class:`RedirectBudgetError` naming that hop, instead of letting
     per-hop timeouts multiply past this tool's harness deadline.
     """
-    import httpx
-
-    current = url
     started = time.monotonic()
-    with httpx.Client(headers={"User-Agent": _UA}, timeout=_HOP_TIMEOUT_S,
-                      follow_redirects=False) as client:
-        for hop in range(_MAX_REDIRECTS + 1):
-            elapsed = time.monotonic() - started
-            if hop and elapsed >= _WALK_BUDGET_S:
-                raise RedirectBudgetError(
-                    f"gave up at redirect hop {hop} ({current}) after "
-                    f"{elapsed:.1f}s of the {_WALK_BUDGET_S:.0f}s redirect budget")
-            # One DNS revalidation per hop, at the top, before any connection is
-            # opened to `current`. The redirect target used to be validated a
-            # second time right after urljoin below; that was a strict duplicate
-            # of this check on the next iteration (nothing is fetched in between),
-            # so dropping it halves the uncancellable getaddrinfo work per hop
-            # without weakening the policy.
-            _validate_public_url(current)
-            resp = client.get(current)
-            if resp.is_redirect:
-                location = resp.headers.get("location")
-                if not location:
-                    raise OutboundPolicyError("redirect omitted Location")
-                current = urljoin(current, location)
-                continue
-            resp.raise_for_status()
-            html_text = resp.text
-            md, title = html_to_markdown(html_text)
-            return md, current, title, html_text
-    raise OutboundPolicyError("too many redirects")
+
+    def before_hop(hop: int, current: str) -> None:
+        elapsed = time.monotonic() - started
+        if hop and elapsed >= _WALK_BUDGET_S:
+            raise RedirectBudgetError(
+                f"gave up at redirect hop {hop} ({current}) after "
+                f"{elapsed:.1f}s of the {_WALK_BUDGET_S:.0f}s redirect budget")
+
+    resp = public_get(url, headers={"User-Agent": _UA}, max_bytes=8 * 1024 * 1024,
+                      idle_timeout=_HOP_TIMEOUT_S, max_redirects=_MAX_REDIRECTS,
+                      schemes=("https",), before_hop=before_hop)
+    resp.raise_for_status()
+    html_text = resp.text
+    md, title = html_to_markdown(html_text)
+    return md, resp.url, title, html_text
 
 
 def _from_cache(rec: dict, *, offline: bool) -> dict:
@@ -359,8 +297,8 @@ def fetch_page(
         if _is_js_shell(html_text, content, title):
             if _fetcher is None:
                 _validate_public_url(final_url)
-            # A static bootstrap is not success. Try the rendered DOM and only
-            # then a configured external scraper; never put the shell in cache.
+            # A static bootstrap is not success. Local rendering refuses before
+            # navigation; a configured external scraper may recover the content.
             try:
                 rendered = _render_page(final_url)
             except Exception:  # noqa: BLE001 — unavailable CEF/browser
@@ -378,7 +316,7 @@ def fetch_page(
                             if any(site in (urlparse(final_url).hostname or "").lower()
                                    for site in ("grabcad", "makerworld")) else "")
                 return fail("js_shell", f"{final_url} only returned a JavaScript app shell; "
-                            f"no page content was available after rendering.{cad_hint}")
+                            f"local rendering is refused without a subresource egress policy.{cad_hint}")
             content, final_url, title = rendered
     except Exception as exc:  # noqa: BLE001
         stale = store.get(url, tier=tier, allow_stale=True)

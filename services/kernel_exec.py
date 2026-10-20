@@ -24,6 +24,7 @@ import contextlib
 import io
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -31,6 +32,9 @@ import traceback
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Optional
+from services.agent.request_context import (
+    bind_context, cell_path, current_context, in_cell, sandbox_argv,
+)
 
 # build123d logs verbosely at INFO. The MCP stdio transport uses stdout for protocol
 # JSON, so any stray logging must be kept out of the way: quiet the logger and make sure
@@ -356,6 +360,8 @@ def _exec_model(code: str) -> tuple[dict, str, Optional[str]]:
     Returns ``(namespace, captured_stdout, error_or_None)``. Shared by the single-part
     (``run_code``) and multi-part (``run_code_multi``) entry points so they exec identically.
     """
+    if in_cell() and os.environ.get("CHUDWARE_ACTOR_SANDBOX") != "1":
+        raise ValueError("cell_refused")
     # The full namespace is injected below; drop a redundant `from build123d import *` so it
     # can't re-bind (and clobber) our forgiving wrappers/aliases like extrude/rect.
     code = _STAR_IMPORT_RE.sub("", code)
@@ -555,6 +561,8 @@ def run_code_multi(code: str, out_dir: Path, name: str = "model") -> AssemblyRes
     single-part path and yields the same geometry/props as ``run_code`` — wrapped in an
     AssemblyResult with ``is_assembly=False`` and a single entry in ``parts``.
     """
+    if in_cell() and "--exec" not in sys.argv:
+        return _run_cell_model(code, out_dir, name)
     warnings: list = []
     g, stdout, err = _exec_model(code)
     if err is not None:
@@ -628,14 +636,32 @@ def _model_result_from_payload(data: dict) -> ModelResult:
     return ModelResult(**{k: v for k, v in data.items() if k in names})
 
 
+def _run_cell_model(code: str, out_dir: Path, name: str) -> AssemblyResult:
+    out_dir = cell_path(str(out_dir), private=True)
+    payload = json.dumps({"code": code, "out_dir": str(out_dir), "name": name,
+                          "ctx": current_context()})
+    try:
+        proc = subprocess.run(
+            sandbox_argv([sys.executable, "-m", "services.kernel_exec", "--exec"]),
+            input=payload, capture_output=True, text=True, cwd="/work",
+        )
+        if proc.returncode != 0:
+            return AssemblyResult(ok=False, error=f"Model worker exited ({proc.returncode}): {proc.stderr}")
+        data = json.loads(proc.stdout.strip().splitlines()[-1])
+        return AssemblyResult(**data)
+    except (OSError, ValueError, IndexError, TypeError) as exc:
+        return AssemblyResult(ok=False, error=f"Model sandbox failed: {type(exc).__name__}: {exc}")
+
+
 def run_code_isolated(code: str, out_dir: Path, name: str = "model",
                       timeout: float = 60.0) -> ModelResult:
     """Run ``code`` in a fresh subprocess; isolates OCCT crashes/hangs."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps({"code": code, "out_dir": str(out_dir), "name": name})
+    payload = json.dumps({"code": code, "out_dir": str(out_dir), "name": name,
+                          "ctx": current_context()})
     try:
         proc = subprocess.run(
-            [sys.executable, "-m", "services.kernel_exec", "--exec"],
+            sandbox_argv([sys.executable, "-m", "services.kernel_exec", "--exec"]),
             input=payload, capture_output=True, text=True, timeout=timeout,
             cwd=str(Path(__file__).resolve().parent.parent),
         )
@@ -653,7 +679,8 @@ def run_code_isolated(code: str, out_dir: Path, name: str = "model",
 def _main_exec() -> None:
     req = json.loads(sys.stdin.read())
     # Match the worker path: multi-part scripts export per-part + assembly meshes.
-    res = run_code_multi(req["code"], Path(req["out_dir"]), req.get("name", "model"))
+    with bind_context(req.get("ctx")):
+        res = run_code_multi(req["code"], Path(req["out_dir"]), req.get("name", "model"))
     sys.stdout.write(res.to_json().replace("\n", " "))
     sys.stdout.write("\n")
 

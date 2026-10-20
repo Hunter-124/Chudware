@@ -1,5 +1,6 @@
 #include "ecad/schplot.h"
 
+#include "ecad/ops.h"
 #include "ecad/schema.h"
 
 #include <algorithm>
@@ -22,6 +23,16 @@ using json = nlohmann::json;
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kPtPerMm = 72.0 / 25.4;
+
+void require_svg_sheet(const std::string& name, bool allow_empty = false) {
+    if (name.empty() && allow_empty) return;
+    if (name.empty() || name == "." || name == ".." ||
+        name.find_first_of("/\\:*?\"<>|") != std::string::npos ||
+        name.back() == '.' || name.back() == ' ' ||
+        std::any_of(name.begin(), name.end(), [](unsigned char c) { return c < 32 || c == 127; }))
+        throw OpError("invalid_op", "ecad_export: SVG sheet must be a safe filename leaf",
+                      {{"reason", "unsafe SVG leaf"}});
+}
 
 struct Pt {
     double x = 0.0;
@@ -1190,9 +1201,11 @@ std::pair<double, double> paper_size_mm(const std::string& paper) {
 
 std::vector<std::pair<std::string, std::string>> schematic_svg_pages(const json& sch,
                                                                       const PlotOpts& o) {
+    require_svg_sheet(o.sheet, true);
+    const std::vector<SheetPage> all = selected_sheets(sch, PlotOpts{});
+    for (const SheetPage& page : all) require_svg_sheet(page.id);
     const auto [width, height] = paper_size_mm(o.paper);
     const std::vector<SheetPage> pages = selected_sheets(sch, o);
-    const std::vector<SheetPage> all = selected_sheets(sch, PlotOpts{});
     const std::string first_sheet = all.empty() ? "sh1" : all.front().id;
     std::vector<std::pair<std::string, std::string>> out;
     out.reserve(pages.size());

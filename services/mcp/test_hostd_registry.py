@@ -123,6 +123,44 @@ def test_second_rw_attach_warns(scratch_daemon):
     assert "another writer" in (r.get("warning") or "")
 
 
+
+def test_doc_list_other_writer_distinguishes_writer_groups(scratch_daemon):
+    owner = DaemonClient(writer_group="group-a")
+    sibling = DaemonClient(writer_group="group-a")
+    outsider = DaemonClient(writer_group="group-b")
+    plain = DaemonClient(writer_group="")
+    owner.connect()
+    scratch_daemon.append(_pid(owner))
+    for client in (sibling, outsider, plain):
+        client.connect()
+    try:
+        doc = owner.call("doc_new", {"name": "other-writer"})["doc_id"]
+
+        def other_writer(client):
+            row = next(
+                row for row in client.call("doc_list")["docs"] if row["doc_id"] == doc
+            )
+            return row["other_writer"]
+
+        assert other_writer(owner) is False
+        assert other_writer(sibling) is False
+        assert other_writer(outsider) is True
+        assert other_writer(plain) is True
+        assert sibling.call("attach_doc", {"doc_id": doc, "mode": "rw"})["ok"]
+        assert other_writer(owner) is False
+        assert other_writer(sibling) is False
+        for client in (outsider, plain):
+            assert client.call("attach_doc", {"doc_id": doc, "mode": "rw"})["ok"]
+            assert other_writer(owner) is True
+            assert other_writer(sibling) is True
+            assert other_writer(client) is True
+            assert client.call("detach_doc", {"doc_id": doc})["ok"]
+            assert other_writer(owner) is False
+            assert other_writer(sibling) is False
+    finally:
+        for client in (owner, sibling, outsider, plain):
+            client.close()
+
 # -------------------------------------------------------------- overlap CAS
 
 
@@ -160,6 +198,110 @@ def test_single_writer_no_cas_injection(scratch_daemon):
     for i in range(3):
         r = a.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops(f"s{i}")})
         assert r.get("_is_error") is None, r
+
+
+def test_writer_group_parallel_edits_do_not_race_overlap_cas(scratch_daemon):
+    """A process's parallel connections are one writer, so overlapping calls on
+    a group-only doc must not both inject the same stale base_revision."""
+    a = DaemonClient(writer_group="g1")
+    b = DaemonClient(writer_group="g1")
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    b.connect()
+    doc = a.call("doc_new", {"name": "group-parallel"})["doc_id"]
+    b.call("attach_doc", {"doc_id": doc, "mode": "rw"})
+    for batch in range(3):
+        ready = threading.Barrier(2)
+        results = [None, None]
+        failures = []
+
+        def edit(index, client, ops):
+            try:
+                ready.wait(timeout=5)
+                results[index] = client.call("doc_apply_ops", {"doc_id": doc, "ops": ops})
+            except Exception as exc:
+                failures.append(exc)
+
+        threads = [
+            threading.Thread(
+                target=edit,
+                args=(index, client, _box_ops(f"parallel-{batch}-{index}")),
+                daemon=True,
+            )
+            for index, client in enumerate((a, b))
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        assert not any(thread.is_alive() for thread in threads), "parallel edits did not finish"
+        assert not failures, failures
+        assert all(result and result.get("_is_error") is None for result in results), results
+        assert sorted(result["revision"] for result in results) == [2 * batch + 1, 2 * batch + 2]
+        assert all("_foreign_edits" not in result for result in results), results
+
+
+def test_writer_group_is_one_writer_and_keeps_connection_fanout(scratch_daemon):
+    """Group peers need neither overlap CAS nor foreign-edit warnings, but each
+    subscribed connection still receives the other member's live doc.changed."""
+    a = DaemonClient(writer_group="g1")
+    b = DaemonClient(writer_group="g1")
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    b.connect()
+    doc = a.call("doc_new", {"name": "group-solo"})["doc_id"]
+    attached = b.call("attach_doc", {"doc_id": doc, "mode": "rw"})
+    assert attached.get("ok") is True, attached
+    assert "warning" not in attached, attached
+    a.call("subscribe", {"doc_ids": [doc]})
+    b.call("subscribe", {"doc_ids": [doc]})
+    assert a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})["revision"] == 1
+    changed = _events(b, "doc.changed")
+    assert [e["data"]["revision"] for e in changed] == [1], changed
+    assert not _events(a, "doc.changed")
+
+    # B has not read a revision-bearing response since revision 0. The shared
+    # writer's own edits still land and are never labelled foreign.
+    edited = b.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("group-b")})
+    assert edited.get("_is_error") is None, edited
+    assert edited["revision"] == 2
+    assert "_foreign_edits" not in edited, edited
+    assert [e["data"]["revision"] for e in _events(a, "doc.changed")] == [2]
+    assert not _events(b, "doc.changed")
+
+
+def test_writer_group_shares_cas_revision_but_not_with_outsider(scratch_daemon):
+    a = DaemonClient(writer_group="g1")
+    b = DaemonClient(writer_group="g1")
+    c = DaemonClient(writer_group="")
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    b.connect()
+    c.connect()
+    doc = a.call("doc_new", {"name": "group-cas"})["doc_id"]
+    assert b.call("attach_doc", {"doc_id": doc, "mode": "rw"}).get("ok") is True
+    outsider = c.call("attach_doc", {"doc_id": doc, "mode": "rw"})
+    assert "another writer" in (outsider.get("warning") or ""), outsider
+    assert a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})["revision"] == 1
+    # With TWO logical writers, CAS is enabled, but B shares A's latest revision.
+    edited = b.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("group-cas-b")})
+    assert edited.get("_is_error") is None, edited
+    assert edited["revision"] == 2
+    assert "_foreign_edits" not in edited, edited
+    stale = c.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("group-cas-c")})
+    assert stale.get("_is_error") is True, stale
+    assert stale.get("code") == "stale_revision", stale
+    foreign = c.call("doc_tree", {"doc_id": doc})
+    assert foreign["_foreign_edits"][0]["revision"] == 2, foreign
+    assert c.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("outsider")})[
+        "revision"
+    ] == 3
+
+    # One group member's READ catches up the entire group for the next CAS write.
+    assert a.call("doc_tree", {"doc_id": doc})["_foreign_edits"][0]["revision"] == 3
+    caught_up = b.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("group-retry")})
+    assert caught_up.get("_is_error") is None, caught_up
+    assert caught_up["revision"] == 4
 
 
 # --------------------------------------------------------------- edit holds
@@ -201,6 +343,100 @@ def test_edit_release_and_holder_passthrough(scratch_daemon):
     # Released: B may edit immediately.
     r = b.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("b")})
     assert r.get("_is_error") is None, r
+
+
+def test_writer_group_hold_allows_members_and_blocks_outsider(scratch_daemon, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_HOSTD_HOLD_SECS", "30")
+    a = DaemonClient(writer_group="g1")
+    b = DaemonClient(writer_group="g1")
+    c = DaemonClient(writer_group="")
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    b.connect()
+    c.connect()
+    doc = a.call("doc_new", {"name": "group-hold"})["doc_id"]
+    b.call("attach_doc", {"doc_id": doc, "mode": "rw"})
+    assert a.call("edit_hold", {"doc_id": doc}).get("ok") is True
+    assert b.call("edit_hold", {"doc_id": doc}).get("ok") is True
+    edited = b.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    assert edited.get("_is_error") is None, edited
+    for method, params in (
+        ("edit_hold", {"doc_id": doc}),
+        ("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("blocked")}),
+    ):
+        blocked = c.call(method, params)
+        assert blocked.get("_is_error") is True, blocked
+        assert blocked.get("code") == "busy_preview", blocked
+    # A's lease is group-owned for editing/releasing, connection-owned for lifetime.
+    assert b.call("edit_release", {"doc_id": doc}).get("ok") is True
+    assert c.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("released")}).get(
+        "_is_error"
+    ) is None
+
+
+@pytest.mark.parametrize("disconnect", [False, True], ids=["detach", "disconnect"])
+@pytest.mark.parametrize("holder_leaves", [False, True], ids=["peer-leaves", "holder-leaves"])
+def test_writer_group_member_leaving_preserves_remaining_state(
+    scratch_daemon, monkeypatch, disconnect, holder_leaves
+):
+    monkeypatch.setenv("CHUDWARE_HOSTD_HOLD_SECS", "30")
+    a = DaemonClient(writer_group="g1")
+    b = DaemonClient(writer_group="g1")
+    c = DaemonClient(writer_group="")
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    b.connect()
+    c.connect()
+    doc = a.call("doc_new", {"name": "group-leaving"})["doc_id"]
+    b.call("attach_doc", {"doc_id": doc, "mode": "rw"})
+    c.call("attach_doc", {"doc_id": doc, "mode": "rw"})
+    c.call("subscribe", {"doc_ids": [doc]})
+    assert a.call("edit_hold", {"doc_id": doc}).get("ok") is True
+    # Refresh from B must not transfer the lifetime owner away from A.
+    assert b.call("edit_hold", {"doc_id": doc}).get("ok") is True
+    assert a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})["revision"] == 1
+    leaving, remaining = (a, b) if holder_leaves else (b, a)
+    if disconnect:
+        leaving.close()
+        time.sleep(0.4)
+    else:
+        assert leaving.call("detach_doc", {"doc_id": doc}).get("ok") is True
+    c.call("ping")
+    events = c.poll_events()
+    assert not [e for e in events if e.get("event") == "doc.closed"], (
+        "a remaining group member is still a writer"
+    )
+    if disconnect and not holder_leaves:
+        assert not [
+            e for e in events
+            if e.get("event") == "doc.lease_change"
+            and e["data"].get("state") == "disconnected"
+        ], "a non-holder disconnect must not announce the group's lease as released"
+    # In both cases the remaining connection retains the group's seen revision.
+    edited = remaining.call(
+        "doc_apply_ops", {"doc_id": doc, "ops": _box_ops("remaining-member")}
+    )
+    assert edited.get("_is_error") is None, edited
+    assert edited["revision"] == 2
+    blocked = c.call("edit_hold", {"doc_id": doc})
+    if holder_leaves:
+        assert blocked.get("ok") is True, blocked
+    else:
+        assert blocked.get("code") == "busy_preview", blocked
+        assert remaining.call("edit_release", {"doc_id": doc}).get("ok") is True
+
+
+def test_writer_group_doc_close_preserves_other_member(scratch_daemon):
+    a = DaemonClient(writer_group="g1")
+    b = DaemonClient(writer_group="g1")
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    b.connect()
+    doc = a.call("doc_new", {"name": "group-close"})["doc_id"]
+    b.call("attach_doc", {"doc_id": doc, "mode": "rw"})
+    closed = a.call("doc_close", {"doc_id": doc})
+    assert closed.get("detached") is True, closed
+    assert b.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS}).get("revision") == 1
 
 
 # ---------------------------------------------------------------- event bus
@@ -878,7 +1114,8 @@ def test_foreign_edits_surface_in_tool_note(scratch_daemon, monkeypatch):
     """core_bridge strips _foreign_edits into a buffer; cad_tools._dumps appends
     the human-readable note."""
     monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
-    monkeypatch.setattr(daemon_bridge, "_client", None)
+    monkeypatch.setattr(daemon_bridge, "_clients", threading.local())
+    monkeypatch.setattr(daemon_bridge, "_group_session_established", threading.Event())
     from services.mcp import cad_tools, core_bridge
 
     a = DaemonClient()
@@ -954,7 +1191,8 @@ def test_recover_autosaved_uses_daemon_remap(scratch_daemon, monkeypatch):
     survivor from the orphan tier (recovery_open) and aliases the agent's old
     handle to the freshly-minted id."""
     monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
-    monkeypatch.setattr(daemon_bridge, "_client", None)
+    monkeypatch.setattr(daemon_bridge, "_clients", threading.local())
+    monkeypatch.setattr(daemon_bridge, "_group_session_established", threading.Event())
     from services.mcp import cad_tools, core_bridge
 
     doc = core_bridge.call("doc_new", {"name": "alias-me"})["doc_id"]
@@ -964,7 +1202,8 @@ def test_recover_autosaved_uses_daemon_remap(scratch_daemon, monkeypatch):
     os.kill(pid, signal.SIGKILL)
     time.sleep(0.3)
 
-    monkeypatch.setattr(daemon_bridge, "_client", None)  # fresh connection
+    monkeypatch.setattr(daemon_bridge, "_clients", threading.local())  # fresh connection
+    monkeypatch.setattr(daemon_bridge, "_group_session_established", threading.Event())
     # include_orphaned=True == the explicit recover_parts path; startup would NOT
     # auto-open the tier (that is what recover_parts is for).
     recovered = cad_tools.recover_autosaved(include_orphaned=True)

@@ -53,12 +53,13 @@ def _wait_ready(spawn_result: dict, timeout_s: float = 5.0) -> None:
 
 
 @pytest.fixture()
-def scratch_daemon(monkeypatch):
+def scratch_daemon(monkeypatch, tmp_path):
     """Fresh instance key + fast linger; kills any daemon we started on teardown."""
     key = "pytest-sup-" + uuid.uuid4().hex[:8]
     monkeypatch.setenv("CHUDWARE_INSTANCE_KEY", key)
     monkeypatch.setenv("CHUDWARE_HOSTD_LINGER_SECS", "2")
     monkeypatch.setenv("CHUDWARE_AUTOSAVE_INTERVAL_S", "0")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "state"))
     monkeypatch.delenv("CHUDWARE_HOSTD_SOCKET", raising=False)
     pids: list = []
     yield pids
@@ -327,7 +328,46 @@ def test_bad_argv_clean_error_no_zombie(scratch_daemon):
     assert zombies == []
     # Empty / missing argv is a clean error too.
     r2 = c.call("agent_spawn", {"argv": []})
-    assert r2.get("_is_error") is True and r2.get("code") == "bad_params"
+    assert r2.get("_is_error") is True and r2.get("code") == "invalid_params"
+
+
+@pytest.mark.parametrize("metadata", [
+    {"mission_id": 0}, {"mission_id": []}, {"mission_id": {}}, {"mission_id": None},
+    {"doc_id": 0}, {"doc_id": []}, {"doc_id": {}}, {"doc_id": None},
+    {"env": []}, {"env": {"KEY": 4}}, {"env": {"A=B": "value"}},
+    {"env": {"KEY": "bad\0value"}}, {"mission_id": "bad\0value"},
+])
+def test_bad_spawn_metadata_never_launches_child(scratch_daemon, tmp_path, metadata):
+    c = DaemonClient()
+    c.connect()
+    daemon_pid = _pid(c)
+    scratch_daemon.append(daemon_pid)
+    marker = tmp_path / "must-not-launch"
+    before = c.call("agent_list")["children"]
+    r = c.call("agent_spawn", {
+        "argv": [PY, "-c", "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(marker)],
+        **metadata,
+    })
+    assert r.get("_is_error") is True and r.get("code") == "invalid_params", r
+    assert c.call("ping").get("ok") is True
+    assert _pid(c) == daemon_pid
+    assert c.call("agent_list")["children"] == before
+    assert not list((tmp_path / "state").rglob("agent-*.log"))
+    time.sleep(0.15)
+    assert not marker.exists()
+    c.close()
+
+
+@pytest.mark.parametrize("argv", [[""], [0], [["nested"]], ["python3", "bad\0arg"]])
+def test_invalid_argv_returns_parameter_error(scratch_daemon, argv):
+    c = DaemonClient()
+    c.connect()
+    scratch_daemon.append(_pid(c))
+    r = c.call("agent_spawn", {"argv": argv})
+    assert r.get("_is_error") is True and r.get("code") == "invalid_params", r
+    assert c.call("agent_list")["children"] == []
+    assert c.call("ping").get("ok") is True
+    c.close()
 
 
 def _ppid_stat(pid: int):

@@ -21,6 +21,7 @@ from string import Template
 
 import httpx
 import pytest
+from cryptography.exceptions import InvalidTag
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -117,6 +118,27 @@ def test_unknown_tls_mode_refuses_to_boot(monkeypatch):
     monkeypatch.setenv("CHUDWARE_SMTP_HOST", "mx.example.com")
     monkeypatch.setenv("CHUDWARE_SMTP_TLS", "plaintext")
     with pytest.raises(ValueError, match="CHUDWARE_SMTP_TLS"):
+        config.Settings()
+
+
+@pytest.mark.parametrize("name", [
+    "CHUDWARE_MAIL_CONTEXT_ENCRYPTION_KEY", "CHUDWARE_WEB_PROVIDER_KEY_ENCRYPTION_KEY",
+])
+def test_settings_rejects_malformed_encryption_keys_without_echoing_values(monkeypatch, name):
+    raw = "fixture-not-base64-key-secret%"
+    monkeypatch.setenv(name, raw)
+    with pytest.raises(ValueError, match=name) as refused:
+        config.Settings()
+    assert raw not in str(refused.value)
+
+
+def test_settings_refuses_reusing_the_same_key_for_mail_and_provider_context(monkeypatch):
+    import base64
+
+    encoded = base64.urlsafe_b64encode(b"same-fixture-key-material-32bytes!"[:32]).decode()
+    monkeypatch.setenv("CHUDWARE_MAIL_CONTEXT_ENCRYPTION_KEY", encoded)
+    monkeypatch.setenv("CHUDWARE_WEB_PROVIDER_KEY_ENCRYPTION_KEY", encoded)
+    with pytest.raises(ValueError, match="independent"):
         config.Settings()
 
 
@@ -260,7 +282,9 @@ def test_send_queues_instead_of_delivering(mail):
     (row,) = _rows()
     assert row["to_addr"] == "ada@example.com"
     assert row["template"] == "verify_email"
-    assert json.loads(row["ctx_json"])["verify_url"] == VERIFY_CTX["verify_url"]
+    assert mailer.decrypt_context(row["to_addr"], row["template"], row["ctx_json"])["verify_url"] == VERIFY_CTX["verify_url"]
+    assert VERIFY_CTX["verify_url"] not in row["ctx_json"]
+    assert "abc123" not in row["ctx_json"]
     assert row["attempts"] == 0
     assert row["sent_at"] is None
     assert row["last_error"] is None
@@ -281,6 +305,7 @@ def test_drain_delivers_and_marks_sent(mail):
     assert row["sent_at"] is not None
     assert row["attempts"] == 1
     assert row["last_error"] is None
+    assert row["ctx_json"] == "{}"
     # A delivered row is never claimed again.
     assert asyncio.run(mailer.drain_once()) == 0
     assert _rows()[0]["attempts"] == 1
@@ -343,7 +368,7 @@ def test_dead_transport_never_turns_a_request_into_a_500(mail, dead_smtp):
 
     # The drain absorbs the refused connection; still no exception anywhere.
     assert asyncio.run(mailer.drain_once()) == 0
-    assert "smtp delivery failed" in _rows()[0]["last_error"]
+    assert "MailDeliveryError: delivery failed" == _rows()[0]["last_error"]
 
 
 def test_dead_database_never_turns_a_request_into_a_500(mail, monkeypatch):
@@ -362,7 +387,7 @@ def test_failed_delivery_records_the_error_and_backs_off(mail, dead_smtp):
     (row,) = _rows()
     assert row["attempts"] == 1
     assert row["sent_at"] is None
-    assert "smtp delivery failed" in row["last_error"]
+    assert row["last_error"] == "MailDeliveryError: delivery failed"
     # The first retry is a minute out, so an immediate second pass is a no-op
     # rather than a hot loop against a dead host.
     assert _lease_seconds(row) == pytest.approx(mailer.BASE_BACKOFF_SEC, abs=5.0)
@@ -386,7 +411,8 @@ def test_backoff_doubles_and_delivery_stops_at_five_attempts(mail, dead_smtp):
     (row,) = _rows()
     assert row["attempts"] == mailer.MAX_ATTEMPTS == 5
     assert row["sent_at"] is None
-    assert "smtp delivery failed" in row["last_error"]
+    assert row["last_error"] == "MailDeliveryError: delivery failed"
+    assert row["ctx_json"] == "{}"
 
 
 def test_a_recovered_transport_delivers_a_previously_failed_message(
@@ -428,8 +454,7 @@ def test_resend_rejection_is_recorded_not_raised(mail, monkeypatch):
     assert captured["json"]["html"].lstrip().startswith("<!doctype html>")
 
     last_error = _rows()[0]["last_error"]
-    assert "422" in last_error
-    assert "domain is not verified" in last_error
+    assert last_error == "MailDeliveryError: delivery failed"
 
 
 def test_resend_without_an_api_key_says_what_to_set(mail, monkeypatch):
@@ -447,8 +472,7 @@ def test_resend_without_an_api_key_says_what_to_set(mail, monkeypatch):
     assert asyncio.run(mailer.drain_once()) == 0
 
     last_error = _rows()[0]["last_error"]
-    assert "CHUDWARE_RESEND_API_KEY is unset" in last_error
-    assert "CHUDWARE_MAIL_BACKEND" in last_error
+    assert last_error == "MailDeliveryError: delivery failed"
 
 
 # ---------------------------------------------------------------------------
@@ -476,3 +500,207 @@ def test_backlog_ignores_delivered_mail(mail):
     mailer.send("ada@example.com", "verify_email", VERIFY_CTX)
     assert asyncio.run(mailer.drain_once()) == 1
     assert mailer.backlog() == mailer.Backlog(0, 0, 0.0)
+
+
+def test_context_envelope_is_authenticated_and_requires_external_key(mail, monkeypatch):
+    mailer.send("ada@example.com", "verify_email", VERIFY_CTX)
+    row = _rows()[0]
+    assert set(json.loads(row["ctx_json"])) == {"encrypted_v1"}
+    assert "token=" not in row["ctx_json"]
+    assert mailer.decrypt_context(row["to_addr"], row["template"], row["ctx_json"]) == VERIFY_CTX
+    with pytest.raises(InvalidTag):
+        mailer.decrypt_context("other@example.com", row["template"], row["ctx_json"])
+    with pytest.raises(InvalidTag):
+        mailer.decrypt_context(row["to_addr"], "password_reset", row["ctx_json"])
+    monkeypatch.setattr(mailer.settings, "mail_context_encryption_key", b"x" * 32)
+    with pytest.raises(InvalidTag):
+        mailer.decrypt_context(row["to_addr"], row["template"], row["ctx_json"])
+    with pytest.raises(KeyError):
+        mailer.decrypt_context(row["to_addr"], row["template"], json.dumps(VERIFY_CTX))
+
+
+@pytest.mark.parametrize("terminal", ["sent", "expired", "abandoned"])
+def test_terminal_context_is_erased_before_claim(mail, monkeypatch, terminal):
+    mailer.send("ada@example.com", "verify_email", VERIFY_CTX)
+    with db.tx() as cur:
+        if terminal == "sent":
+            cur.execute("UPDATE mail_outbox SET sent_at = now()")
+        elif terminal == "expired":
+            cur.execute("UPDATE mail_outbox SET context_expires_at = now() - interval '1 second'")
+        else:
+            cur.execute("UPDATE mail_outbox SET attempts = %s", (mailer.MAX_ATTEMPTS,))
+    def no_delivery(*args):
+        raise AssertionError("terminal context must never be delivered")
+    monkeypatch.setattr(mailer, "_deliver", no_delivery)
+    assert asyncio.run(mailer.drain_once()) == 0
+    assert _rows()[0]["ctx_json"] == "{}"
+
+
+def test_failure_never_retains_or_logs_bearer_exception_text(mail, monkeypatch, caplog):
+    secret = "fixture-bearer-capability"
+    mailer.send("ada@example.com", "verify_email", dict(VERIFY_CTX, verify_url=f"https://example.test/?token={secret}"))
+    def unsafe_transport(*args):
+        raise mailer.MailDeliveryError(secret)
+    monkeypatch.setattr(mailer, "_deliver", unsafe_transport)
+    with caplog.at_level("WARNING"):
+        assert asyncio.run(mailer.drain_once()) == 0
+    assert secret not in caplog.text
+    assert secret not in json.dumps(_rows(), default=str)
+
+
+@pytest.fixture
+def disposable_tls_smtp(tmp_path, monkeypatch):
+    """Real loopback TLS/auth SMTP capture; no external DNS/provider or credentials."""
+    import base64
+    import ipaddress
+    import socketserver
+    import threading
+    from datetime import timedelta
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "disposable SMTP fixture")])
+    certificate = (
+        x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc) - timedelta(minutes=1))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(hours=1))
+        .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False,
+                                    key_encipherment=True, data_encipherment=False,
+                                    key_agreement=False, key_cert_sign=True, crl_sign=True,
+                                    encipher_only=False, decipher_only=False), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(key.public_key()), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_file, key_file = tmp_path / "smtp-cert.pem", tmp_path / "smtp-key.pem"
+    cert_file.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_file.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    key_file.chmod(0o600)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_file, key_file)
+    mailbox = []
+    credentials = ("fixture-user", "fixture-smtp-password")
+
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self):
+            self.connection.settimeout(5)
+            self.wfile.write(b"220 fixture.local ESMTP\r\n")
+            authenticated = False
+            while True:
+                line = self.rfile.readline(8193)
+                if not line or len(line) > 8192:
+                    return
+                command, _, arguments = line.strip().partition(b" ")
+                command = command.upper()
+                if command == b"EHLO":
+                    self.wfile.write(b"250-fixture.local\r\n250 AUTH PLAIN\r\n")
+                elif command == b"AUTH":
+                    mechanism, _, response = arguments.partition(b" ")
+                    expected = b"\0" + credentials[0].encode() + b"\0" + credentials[1].encode()
+                    authenticated = mechanism.upper() == b"PLAIN" and base64.b64decode(response, validate=True) == expected
+                    self.wfile.write(b"235 2.7.0 authenticated\r\n" if authenticated else b"535 5.7.8 refused\r\n")
+                elif command in {b"MAIL", b"RCPT"}:
+                    self.wfile.write(b"250 2.1.0 accepted\r\n" if authenticated else b"530 authentication required\r\n")
+                elif command == b"DATA" and authenticated:
+                    self.wfile.write(b"354 send message\r\n")
+                    message = bytearray()
+                    while True:
+                        row = self.rfile.readline(8193)
+                        if not row or len(row) > 8192 or len(message) + len(row) > 262144:
+                            return
+                        if row == b".\r\n":
+                            break
+                        message.extend(row[1:] if row.startswith(b"..") else row)
+                    mailbox.append(bytes(message))
+                    self.wfile.write(b"250 2.0.0 fixture receipt\r\n")
+                elif command == b"QUIT":
+                    self.wfile.write(b"221 2.0.0 bye\r\n")
+                    return
+                else:
+                    self.wfile.write(b"502 unsupported fixture command\r\n")
+
+    class Server(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+
+        def get_request(self):
+            connection, address = super().get_request()
+            connection.settimeout(5)
+            try:
+                return context.wrap_socket(connection, server_side=True), address
+            except BaseException:
+                connection.close()
+                raise
+
+    server = Server(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("SSL_CERT_FILE", str(cert_file))
+    try:
+        yield server.server_address[1], credentials, mailbox
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+
+def test_disposable_pg_tls_smtp_receipt_does_not_turn_offline_readiness_into_deliverability(
+    mail, pg, tmp_path, monkeypatch, disposable_tls_smtp,
+):
+    import base64
+    import os
+    import subprocess
+    from email import policy
+    from email.parser import BytesParser
+
+    port, credentials, mailbox = disposable_tls_smtp
+    monkeypatch.setattr(mailer.settings, "mail_backend", "smtp")
+    monkeypatch.setattr(mailer.settings, "smtp_host", "127.0.0.1")
+    monkeypatch.setattr(mailer.settings, "smtp_port", port)
+    monkeypatch.setattr(mailer.settings, "smtp_tls", "implicit")
+    monkeypatch.setattr(mailer.settings, "smtp_user", credentials[0])
+    monkeypatch.setattr(mailer.settings, "smtp_pass", credentials[1])
+    values = {
+        "CHUDWARE_DEPLOY_ENV": "prod", "CHUDWARE_DB_URL": pg,
+        "CHUDWARE_MAIL_CONTEXT_ENCRYPTION_KEY": base64.urlsafe_b64encode(b"m" * 32).decode(),
+        "CHUDWARE_WEB_PROVIDER_KEY_ENCRYPTION_KEY": base64.urlsafe_b64encode(b"p" * 32).decode(),
+        "CHUDWARE_MAIL_BACKEND": "smtp", "CHUDWARE_SMTP_HOST": "127.0.0.1",
+        "CHUDWARE_SMTP_PORT": str(port), "CHUDWARE_SMTP_TLS": "implicit",
+        "CHUDWARE_SMTP_USER": credentials[0], "CHUDWARE_SMTP_PASS": credentials[1],
+    }
+    for label, name in (("data", "CHUDWARE_WEB_DATA_ROOT"), ("workspace", "CHUDWARE_WORKSPACE_ROOT"),
+                        ("bucket", "CHUDWARE_WEB_BUCKET_ROOT"), ("cells", "CHUDWARE_CELLS_ROOT")):
+        values[name] = str(tmp_path / label)
+        Path(values[name]).mkdir()
+    path = tmp_path / "gateway.env"
+    path.write_text("".join(name + "=" + value + "\n" for name, value in values.items()))
+    path.chmod(0o600)
+    helper = Path(__file__).resolve().parents[2] / "deploy/gateway_preflight.py"
+    def validate():
+        result = subprocess.run([sys.executable, "-I", str(helper), "validate", "--env-file", str(path),
+                                 "--environment", "prod"], env={"PATH": os.defpath},
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        report = json.loads(result.stdout)
+        assert report["configuration"]["status"] == "PASS"
+        assert report["deliverability"]["status"] == "UNKNOWN"
+        assert credentials[1] not in result.stdout + result.stderr
+    validate()
+    mailer.send("ada@example.com", "verify_email", VERIFY_CTX)
+    assert asyncio.run(mailer.drain_once()) == 1
+    assert len(mailbox) == 1
+    message = BytesParser(policy=policy.default).parsebytes(mailbox[0])
+    assert message["To"] == "ada@example.com"
+    assert VERIFY_CTX["verify_url"] in message.get_body(preferencelist=("plain",)).get_content()
+    row = _rows()[0]
+    assert row["sent_at"] is not None and row["ctx_json"] == "{}"
+    # A disposable SMTP receipt proves only this fixture path; it cannot attest
+    # external DNS/SPF/DKIM or customer/provider delivery, even after a sent row.
+    validate()

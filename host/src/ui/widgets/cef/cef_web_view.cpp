@@ -62,27 +62,17 @@ namespace ui {
 
 namespace {
 
-// Lifecycle tracing → stderr. Diagnoses "stuck on Loading" / freeze-on-open by
-// showing exactly which CEF lifecycle step fired (or didn't). Currently ON BY
-// DEFAULT while we chase the OSR open crash; set CHUDWARE_CEF_TRACE=0 to silence.
-// CEF's own [FATAL:…] DCHECK/CHECK aborts also print to this same stderr, so a
-// run captured with `2>&1 | tee` shows both our trace and any CEF fatal line.
+// Lifecycle events share the opt-in, bounded, metadata-only persistent sink.
 bool cefTrace() {
-    static const bool on = [] {
-        const char* v = std::getenv("CHUDWARE_CEF_TRACE");
-        return !(v && v[0] == '0');   // default on; only "0" disables
-    }();
-    return on;
+    return cef::trace_enabled();
 }
-#define CEF_TRACE(...)                                                    \
-    do {                                                                 \
-        char _tb[512];                                                   \
-        std::snprintf(_tb, sizeof(_tb), "[cef-trace] " __VA_ARGS__);     \
-        ::ui::cef::trace_file_line(_tb);                                 \
-        if (::ui::cefTrace()) {                                           \
-            std::fprintf(stderr, "%s\n", _tb);                          \
-            std::fflush(stderr);                                         \
-        }                                                                \
+#define CEF_TRACE(...)                                                       \
+    do {                                                                    \
+        if (::ui::cef::trace_enabled()) {                                    \
+            char _tb[512];                                                  \
+            std::snprintf(_tb, sizeof(_tb), "[cef-trace] " __VA_ARGS__);       \
+            ::ui::cef::trace_file_line(_tb);                                 \
+        }                                                                   \
     } while (0)
 
 // Run a closure on the CEF browser-process UI thread. CefBrowserHost::CreateBrowser
@@ -112,9 +102,9 @@ inline void post_to_ui(std::function<void()> fn) {
 bool cefNetLog() {
     static const bool on = [] {
         const char* v = std::getenv("CHUDWARE_CEF_NETLOG");
-        return v && v[0] && v[0] != '0';   // default OFF; opt-in only
+        return v && std::strcmp(v, "1") == 0;
     }();
-    return on;
+    return on && cefTrace();
 }
 
 // --- ImGui → CEF modifier / key mapping ---------------------------------------
@@ -360,8 +350,8 @@ public:
     // (OnResourceLoadComplete) — a diagnostic that was silently breaking every
     // challenge-gated vendor login. So default to nullptr (challenges work) and
     // only opt back into the proxy under an EXPLICIT, dedicated env var. Do NOT
-    // gate this on cefTrace() — that flag is default-ON, which would silently
-    // reinstate the breakage for every normal run. CHUDWARE_CEF_RESOURCE_HANDLER=1
+    // gate this on cefTrace(): tracing must not change request routing.
+    // CHUDWARE_CEF_RESOURCE_HANDLER=1
     // re-enables the sub-resource failure logging when we're deliberately
     // diagnosing (and knowingly accept that challenge scripts break in that run).
     CefRefPtr<CefResourceRequestHandler> GetResourceRequestHandler(
@@ -562,40 +552,24 @@ public:
         if (frame->IsMain()) refreshLoginState(url);
     }
 
-    // DIAGNOSTICS (unconditional to stderr — one user run must yield the data;
-    // NOT gated on CHUDWARE_CEF_TRACE). "Security verification failed to load" is a
-    // functional failure of the challenge widget, and its cause shows up as
-    // either a page console error or a failed sub-resource fetch. Capture both so
-    // we can tell detection (resources 200 then the widget bails) from a load
-    // failure (4xx / blocked / net error on the recaptcha/turnstile/hcaptcha
-    // domain) without guessing.
-    bool OnConsoleMessage(CefRefPtr<CefBrowser>, cef_log_severity_t level,
-                          const CefString& message, const CefString& source,
-                          int line) override {
-        const std::string msg = message.ToString();
-        // Injected diagnostics (the reCAPTCHA-flow logger in cef_stealth) tag their
-        // lines "[RC] …". Persist those to the trace FILE unconditionally so a panel
-        // login attempt leaves a readable root-cause trail (stderr is invisible in the
-        // GUI). Everything else stays stderr-only under the trace gate.
-        if (msg.rfind("[RC]", 0) == 0)
-            ::ui::cef::trace_file_line(msg.c_str());
-        if (cefTrace())
-            std::fprintf(stderr, "[cef-console] sev=%d %s (%s:%d)\n", (int)level,
-                         msg.c_str(), source.ToString().c_str(), line);
-        return false;   // do not suppress default handling
+    // Console messages and source URLs are page-controlled, including "[RC]".
+    // Record only that a console event occurred, never its payload/provenance.
+    bool OnConsoleMessage(CefRefPtr<CefBrowser>, cef_log_severity_t,
+                          const CefString&, const CefString&, int) override {
+        CEF_TRACE("ConsoleMessage");
+        return true; // Prevent CEF's default handler from retaining the raw text.
     }
     // CefResourceRequestHandler
     void OnResourceLoadComplete(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>,
-                                CefRefPtr<CefRequest> request,
+                                CefRefPtr<CefRequest>,
                                 CefRefPtr<CefResponse> response,
                                 URLRequestStatus status,
                                 int64_t /*received_content_length*/) override {
         if (!cefTrace()) return;
         const int http = response ? response->GetStatus() : -1;
         if (status == UR_SUCCESS && http < 400) return;   // only log failures
-        std::fprintf(stderr, "[cef-net] FAIL status=%d http=%d err=%d %s\n", (int)status,
-                     http, response ? (int)response->GetError() : 0,
-                     request ? request->GetURL().ToString().c_str() : "?");
+        CEF_TRACE("ResourceLoadFailed status=%d http=%d err=%d", (int)status,
+                  http, response ? (int)response->GetError() : 0);
     }
     // CefDevToolsMessageObserver — copy-out reply: pull window.getSelection()
     // out of the Runtime.evaluate result and hand it to the GL thread.
@@ -617,13 +591,8 @@ public:
         if (!text.empty()) s_->pendingClipboardOut = text;
     }
 
-    // DIAGNOSTIC (opt-in CHUDWARE_CEF_NETLOG=1): surface the real bot-wall verdict.
-    // With the Network domain enabled in OnAfterCreated, this fires for every
-    // response; we log only the reCAPTCHA token exchange + the login endpoint so a
-    // failed sign-in shows whether a token was issued and scored-low (recaptcha
-    // /userverify + /reload return 200, then the vendor login POST comes back 200
-    // with an error page) vs. blocked outright (recaptcha or login returns 4xx/5xx).
-    // Metadata only (URL/status/mime) — no response bodies, no credentials.
+    // Opt-in network diagnostics use the same fixed retention cap. Neither
+    // response bodies nor URL/query/userinfo/mime strings are retained.
     void OnDevToolsEvent(CefRefPtr<CefBrowser>, const CefString& method,
                          const void* params, size_t params_size) override {
         if (!cefNetLog() || method != "Network.responseReceived" || !params || !params_size)
@@ -637,18 +606,13 @@ public:
         if (!resp) return;
         const std::string url = resp->GetString("url").ToString();
         const int status = resp->HasKey("status") ? resp->GetInt("status") : 0;
-        const std::string mime = resp->GetString("mimeType").ToString();
+        // Use the URL only to classify this event; never publish it.
         auto has = [&](const char* s) { return url.find(s) != std::string::npos; };
         const bool interesting = has("recaptcha") || has("/login") ||
                                  has("customer/account") || has("/userverify") ||
                                  has("gstatic.com/recaptcha") || status >= 400;
         if (!interesting) return;
-        char tb[900];
-        std::snprintf(tb, sizeof(tb), "[cef-netlog] status=%d mime=%s %s",
-                      status, mime.c_str(), url.c_str());
-        ::ui::cef::trace_file_line(tb);
-        std::fprintf(stderr, "%s\n", tb);
-        std::fflush(stderr);
+        CEF_TRACE("NetworkResponse status=%d", status);
     }
 
 private:

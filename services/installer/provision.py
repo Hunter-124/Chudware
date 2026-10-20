@@ -5,24 +5,58 @@ of the app's canonical Python packages under ``services`` so the MCP server and 
 can run independent of the source tree. Idempotent and version-stamped: a ready
 runtime is detected and reused without re-installing.
 
-In the shipped product the C++ launcher extracts an embedded payload (portable Python +
-offline wheelhouse) here; this module is that setup logic and also works from source.
+Development/source payloads use a reviewed, complete offline wheelhouse. Customer
+releases use compiled sidecars and do not ship this source provisioner.
 
     python -m services.installer.provision [--check] [--force]
-                                  [--base-python <exe>] [--wheelhouse <dir>]
+          [--base-python <exe>] [--wheelhouse <dir>] [--venv-dir <dir>]
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 from services import paths
+from services.installer.wheelhouse import (
+    WheelhouseError, _packaging, install_command, pip_environment, verified_wheelhouse,
+)
+
+def run_python_entry(source_root: str, generated_root: str, arguments: list[str]) -> None:
+    """Run a builder command after its independent full runtime proof.
+
+    Caller launches this authenticated interpreter with -I and a scrubbed loader
+    environment. Only authored/generated builder paths are added, never ambient
+    PYTHONPATH. The builder must prove the runtime before its first invocation.
+    """
+    import runpy
+    root = Path(source_root).resolve(strict=True)
+    explicit = [str(root)]
+    if generated_root and Path(generated_root).is_dir():
+        explicit.insert(0, str(Path(generated_root).resolve(strict=True)))
+    if not arguments:
+        raise ValueError("a Python builder command is required")
+    if arguments[0] not in ("-c", "-m"):
+        script = Path(arguments[0]).resolve(strict=True)
+        if not script.is_relative_to(root):
+            raise ValueError("builder scripts must belong to the trusted source root")
+        explicit.append(str(script.parent))
+    sys.path[:0] = explicit
+    if arguments[0] == "-c":
+        sys.argv = ["-c", *arguments[2:]]
+        exec(compile(arguments[1], "<builder command>", "exec", dont_inherit=True),
+             {"__name__": "__main__", "__file__": "<builder command>"})
+    elif arguments[0] == "-m":
+        sys.argv = [arguments[1], *arguments[2:]]
+        runpy.run_module(arguments[1], run_name="__main__", alter_sys=True)
+    else:
+        sys.argv = arguments
+        runpy.run_path(arguments[0], run_name="__main__")
+
 
 def _find_repo() -> Path:
     """Locate the repo root (the directory holding requirements.txt).
@@ -39,6 +73,8 @@ def _find_repo() -> Path:
 
 REPO = _find_repo()
 REQUIREMENTS = REPO / "requirements.txt"
+WHEEL_LOCK = REPO / "vendor" / "python" / "RUNTIME_WHEELS.lock"
+CHUDCODE_LOCK = REPO / "vendor" / "chudcode" / "CHUDCODE_ARTIFACT.lock"
 # Top-level packages under the staged app/ directory.
 APP_PACKAGES = ("engine",)
 # Canonical ``services.X`` packages used by the worker and packaged tools.
@@ -78,8 +114,9 @@ def _imports_ok(py: Path) -> bool:
     probe = ("import build123d, pyvista, mcp, anthropic, openai; "
              "import pptx, docx, openpyxl, matplotlib, reportlab, pypdfium2, pypdf; "
              "import office_oxide; "
-             "import playwright, dulwich")
-    r = subprocess.run([str(py), "-c", probe], capture_output=True, text=True)
+             "import playwright, dulwich, chudcode_rpc")
+    r = subprocess.run([str(py), "-I", "-c", probe], capture_output=True, text=True,
+                       env=pip_environment())
     return r.returncode == 0
 
 
@@ -228,25 +265,105 @@ def ensure_optional_sim_tools(*, install: bool = False) -> dict:
     return out
 
 
-def is_ready() -> bool:
-    if not STAMP.exists():
+def _trusted_base_path(base_python: str | None = None, candidate_dir: Path | None = None) -> str:
+    base = Path(base_python or sys._base_executable)
+    if not base.is_absolute() or not base.is_file():
+        raise WheelhouseError("select an operator-authenticated absolute base Python executable")
+    resolved = base.resolve(strict=True)
+    if ((base.parent.parent / "pyvenv.cfg").exists()
+            or (resolved.parent.parent / "pyvenv.cfg").exists()):
+        raise WheelhouseError("the inspection base must not be a candidate/venv interpreter")
+    if candidate_dir is not None and (
+            base.absolute().is_relative_to(candidate_dir.absolute())
+            or resolved.is_relative_to(candidate_dir.resolve())):
+        raise WheelhouseError("a candidate interpreter cannot authenticate itself as the base")
+    return str(base)
+
+
+def _target_context(base: str) -> dict:
+    base = _trusted_base_path(base)
+    # Only the explicitly selected system/portable interpreter runs here. No
+    # wheel/backend or installed product module is executed to discover a target.
+    code = (
+        "import sys,json;sys.path.insert(0,sys.argv[1]); "
+        "from services.installer.wheelhouse import _packaging; "
+        "markers,_,_,_,_,tags=_packaging(); "
+        "print(json.dumps({'environment':markers.default_environment(),"
+        "'tags':[str(tag) for tag in tags.sys_tags()]}))"
+    )
+    if str(Path(base).resolve()) == str(Path(sys.executable).resolve()):
+        markers, _, _, _, _, tags = _packaging()
+        return {"environment": markers.default_environment(), "tags": [str(tag) for tag in tags.sys_tags()]}
+    result = subprocess.run([base, "-I", "-S", "-c", code, str(REPO)],
+                            check=True, capture_output=True, text=True, env=pip_environment())
+    return json.loads(result.stdout)
+
+
+def _installed_identity_ok(py: Path, identity: dict, base_python: str | None = None) -> bool:
+    if not py.exists():
         return False
+    # Inspect using only the separately trusted base. -S is not authentication
+    # of an executable; candidate exe/config/loader identities are checked first.
+    probe = """
+import json, sys
+from pathlib import Path
+expected = json.loads(sys.stdin.read())
+sys.path.insert(0, expected['source_root'])
+from services.installer.wheelhouse import verify_venv_interpreter, verify_installed_runtime
+verify_venv_interpreter(Path(expected['venv']))
+verify_installed_runtime(Path(expected['venv']), expected)
+"""
+    expected = {key: identity[key] for key in ("packages", "hashes", "files")}
+    expected["venv"] = str(py.absolute().parent.parent)
+    expected["source_root"] = str(REPO)
     try:
-        stamp = json.loads(STAMP.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
+        base = _trusted_base_path(base_python, py.absolute().parent.parent)
+    except WheelhouseError:
         return False
-    if not (stamp.get("req_hash") == _req_hash() and _venv_python().exists()):
-        return False
-    # Verify that the key packages are actually importable — catches a partial venv that
-    # has python.exe but is missing a module (e.g. pyvista/vtk failed to install).
-    return _imports_ok(_venv_python())
+    result = subprocess.run([str(base), "-I", "-S", "-c", probe], input=json.dumps(expected),
+                            capture_output=True, text=True, env=pip_environment())
+    return result.returncode == 0
 
 
-def _write_stamp() -> None:
-    STAMP.parent.mkdir(parents=True, exist_ok=True)
-    STAMP.write_text(json.dumps({
+def _stamp_matches(stamp_path: Path, identity: dict) -> bool:
+    try:
+        stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (stamp.get("req_hash") == _req_hash()
+            and stamp.get("wheel_lock_sha256") == identity["lock_sha256"]
+            and stamp.get("wheel_target") == identity["target"])
+
+
+def _runtime_location(venv_dir: Path | None) -> tuple[Path, Path, Path]:
+    directory = Path(venv_dir) if venv_dir is not None else paths.RUNTIME / "venv"
+    py = directory / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    stamp = STAMP if directory.resolve() == (paths.RUNTIME / "venv").resolve() else directory / ".ready.json"
+    return directory, py, stamp
+
+
+def is_ready(wheelhouse: Path | None = None, venv_dir: Path | None = None,
+             base_python: str | None = None) -> bool:
+    _, py, stamp = _runtime_location(venv_dir)
+    try:
+        base = _trusted_base_path(base_python, py.absolute().parent.parent)
+        context = _target_context(base)
+        with verified_wheelhouse(wheelhouse or REPO / "wheelhouse", REQUIREMENTS,
+                                 WHEEL_LOCK, CHUDCODE_LOCK, context["environment"],
+                                 set(context["tags"])) as identity:
+            return (_stamp_matches(stamp, identity)
+                    and _installed_identity_ok(py, identity, base) and _imports_ok(py))
+    except (WheelhouseError, OSError, ValueError, subprocess.CalledProcessError):
+        return False
+
+
+def _write_stamp(stamp_path: Path, py: Path, identity: dict) -> None:
+    stamp_path.parent.mkdir(parents=True, exist_ok=True)
+    stamp_path.write_text(json.dumps({
         "req_hash": _req_hash(),
-        "python": str(_venv_python()),
+        "wheel_lock_sha256": identity["lock_sha256"],
+        "wheel_target": identity["target"],
+        "python": str(py),
     }, indent=2), encoding="utf-8")
 
 
@@ -280,98 +397,108 @@ def ensure_app_code(src: Path = REPO) -> Path:
                 shutil.copy2(s, services_dst / mod)
     if REQUIREMENTS.exists():
         shutil.copy2(REQUIREMENTS, app / "requirements.txt")
+    for identity in (WHEEL_LOCK, CHUDCODE_LOCK):
+        if identity.is_file():
+            destination = app / identity.relative_to(REPO)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(identity, destination)
     return app
 
 
 def ensure_runtime(base_python: str | None = None, wheelhouse: Path | None = None,
-                   force: bool = False) -> dict:
-    if is_ready() and not force:
-        return {"status": "ready", "reused": True, "python": str(_venv_python())}
-
-    py = _venv_python()
-    # Reuse an existing, working venv (e.g. created during development).
-    if py.exists() and _imports_ok(py) and not force:
-        _write_stamp()
-        return {"status": "ready", "reused": True, "python": str(py)}
-
-    base = base_python or _find_base_python()
-    paths.RUNTIME.mkdir(parents=True, exist_ok=True)
-    venv_dir = paths.RUNTIME / "venv"
-    if force and venv_dir.exists():
-        # A repair: tear down the broken/partial venv so it is rebuilt cleanly.
-        shutil.rmtree(venv_dir, ignore_errors=True)
-    subprocess.run([base, "-m", "venv", str(venv_dir)], check=True)
-    subprocess.run([str(py), "-m", "pip", "install", "--upgrade", "pip", "--quiet"], check=True)
-
-    install = [str(py), "-m", "pip", "install", "-r", str(REQUIREMENTS)]
-    if wheelhouse and Path(wheelhouse).exists():
-        # Prefer bundled wheels (fast, deterministic, works offline) but still allow PyPI
-        # for any transitive dependency not captured in the wheelhouse.
-        install = [str(py), "-m", "pip", "install",
-                   "--find-links", str(wheelhouse), "--prefer-binary",
-                   "-r", str(REQUIREMENTS)]
-    subprocess.run(install, check=True)
-
-    # Install Playwright's Chromium browser binary (separate from the pip package).
-    # The browser is ~300 MB and needs network; a failure here is non-fatal — every
-    # Playwright call in services/browser/ degrades gracefully with a
-    # "playwright not installed" error envelope.
-    subprocess.run(
-        [str(py), "-m", "playwright", "install", "chromium", "--with-deps"],
-        check=False,
-    )
-
-    if not _imports_ok(py):
-        return {"status": "error", "reason": "imports failed after install"}
-    # Optional local-AI payload. This is a no-op unless the release/source tree includes a
-    # `llamacpp` folder with llama-server.exe; status remains visible via services.installer.llamacpp.
-    try:
-        from services.installer import llamacpp
-        llamacpp.install_from_bundle()
-    except Exception:  # noqa: BLE001 - runtime provisioning must not fail because optional AI is absent
-        pass
-
-    # Optional sim/firmware backends (Renode, openEMS). Best-effort, non-fatal,
-    # idempotent. Controlled by CHUDWARE_PROVISION_OPTIONAL_SIM (default: "1" = try).
-    # Set to "0"/"false" to skip network/source builds during a minimal install.
-    opt_flag = os.environ.get("CHUDWARE_PROVISION_OPTIONAL_SIM", "1").strip().lower()
-    if opt_flag not in ("0", "false", "no", "off"):
-        try:
-            ensure_optional_sim_tools(install=True)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[provision] optional sim tools skipped: {exc}")
-
-    _write_stamp()
-    return {"status": "ready", "reused": False, "python": str(py)}
+                   force: bool = False, venv_dir: Path | None = None) -> dict:
+    """Install only an authenticated, complete snapshot; never resolve online."""
+    if not WHEEL_LOCK.is_file():
+        raise WheelhouseError(
+            f"reviewed complete runtime wheel identity unavailable: {WHEEL_LOCK}; "
+            "authenticate chudcode-rpc==0.3.1 and every target dependency wheel "
+            "before committing the lock (no source-build/index fallback)"
+        )
+    directory, py, stamp = _runtime_location(venv_dir)
+    base = _trusted_base_path(base_python, directory)
+    context = _target_context(base)
+    with verified_wheelhouse(wheelhouse or REPO / "wheelhouse", REQUIREMENTS,
+                             WHEEL_LOCK, CHUDCODE_LOCK, context["environment"],
+                             set(context["tags"])) as identity:
+        if (not force and _stamp_matches(stamp, identity)
+                and _installed_identity_ok(py, identity, base) and _imports_ok(py)):
+            return {"status": "ready", "reused": True, "python": str(py)}
+        if directory.exists() and not force:
+            raise WheelhouseError(
+                "existing venv lacks authenticated runtime identity; leave it unchanged "
+                "and explicitly request --force with approved inputs to replace it"
+            )
+        # Validate ALL managed inputs above before removing/creating a venv or
+        # executing pip. No upgrade of pip, editable install or build isolation.
+        stamp.unlink(missing_ok=True)
+        if force and directory.exists():
+            shutil.rmtree(directory)
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([base, "-I", "-S", "-m", "venv", "--without-pip", str(directory)],
+                       check=True, env=pip_environment())
+        # The base process proves the generated interpreter before even ensurepip
+        # may launch it. No candidate startup or provenance self-attestation.
+        proof = (
+            "import sys;from pathlib import Path;sys.path.insert(0,sys.argv[1]);"
+            "from services.installer.wheelhouse import verify_venv_interpreter;"
+            "verify_venv_interpreter(Path(sys.argv[2]))"
+        )
+        subprocess.run([base, "-I", "-S", "-c", proof, str(REPO), str(directory)],
+                       check=True, env=pip_environment())
+        subprocess.run([str(py), "-I", "-m", "ensurepip", "--default-pip"],
+                       check=True, env=pip_environment())
+        bootstrap_identity = {"packages": {}, "hashes": {}, "files": {}}
+        if not _installed_identity_ok(py, bootstrap_identity, base):
+            raise WheelhouseError("new runtime bootstrap differs from the trusted base payload")
+        subprocess.run(install_command(py, identity["requirements"]), check=True, env=pip_environment())
+        if not _installed_identity_ok(py, identity, base) or not _imports_ok(py):
+            return {"status": "error", "reason": "identity/import checks failed after offline install"}
+        # Browser binaries and optional sim/AI tools have independent provisioning
+        # interfaces; managed dependency setup must not silently download them.
+        _write_stamp(stamp, py, identity)
+        return {"status": "ready", "reused": False, "python": str(py)}
 
 
-def _find_base_python() -> str:
-    # The pinned requirements.txt wheels (build123d et al.) target Python 3.11 specifically;
-    # sys.executable may be a newer interpreter the OS ships as the default `python3` (verified
-    # live: a box with python3 -> 3.14 as default but python3.11 also installed failed to
-    # resolve any pinned wheel until python3.11 was tried explicitly). Prefer 3.11 if present,
-    # falling back to whatever is running this script.
-    candidates = ["py", sys.executable] if sys.platform == "win32" else ["python3.11", sys.executable]
-    for exe in candidates:
-        if shutil.which(exe) or Path(exe).exists():
-            return exe
-    return sys.executable
 
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="Provision the Chudware runtime.")
     ap.add_argument("--check", action="store_true", help="report readiness only")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--check-ready", action="store_true",
+                    help="return success only for an authenticated ready managed runtime")
+    ap.add_argument("--check-inputs", action="store_true",
+                    help="authenticate installed runtime wheels before compiling release sidecars")
     ap.add_argument("--base-python", default=None)
     ap.add_argument("--wheelhouse", type=Path, default=None)
+    ap.add_argument("--venv-dir", type=Path, default=None,
+                    help="provision a source-development venv rather than the managed runtime")
     ap.add_argument("--with-app-code", action="store_true",
                     help="also copy app packages into %%APPDATA%%/Chudware/app")
     args = ap.parse_args(argv)
+    if args.check_ready:
+        return 0 if is_ready(args.wheelhouse, args.venv_dir, args.base_python) else 1
+    if args.check_inputs:
+        try:
+            if args.venv_dir is None:
+                raise WheelhouseError("--check-inputs requires --venv-dir for the candidate; run from a separate trusted base")
+            base = _trusted_base_path(args.base_python, args.venv_dir)
+            context = _target_context(base)
+            with verified_wheelhouse(args.wheelhouse or REPO / "wheelhouse", REQUIREMENTS,
+                                     WHEEL_LOCK, CHUDCODE_LOCK, context["environment"], set(context["tags"]),
+                                     additional_requirements=REPO / "packaging/requirements-release.txt") as identity:
+                _, py, stamp = _runtime_location(args.venv_dir)
+                if not _stamp_matches(stamp, identity) or not _installed_identity_ok(py, identity, base):
+                    raise WheelhouseError("compiler runtime executable/wheels do not match authenticated base/provisioning identity")
+            return 0
+        except (WheelhouseError, OSError, ValueError) as exc:
+            print(json.dumps({"status": "error", "reason": str(exc)}))
+            return 1
 
     if args.check:
-        print(json.dumps({"ready": is_ready(), "python": str(_venv_python()),
-                          "exists": _venv_python().exists(),
-                          "imports_ok": _imports_ok(_venv_python()),
+        _, py, _ = _runtime_location(args.venv_dir)
+        print(json.dumps({"ready": is_ready(args.wheelhouse, args.venv_dir, args.base_python), "python": str(py),
+                          "exists": py.exists(),
                           "converters": converters_status(),
                           "ngspice": ngspice_provisioning_status(),
                           "reveng": reveng_provisioning_status(),
@@ -379,8 +506,12 @@ def main(argv: list[str]) -> int:
                           "openems": openems_provisioning_status()}, indent=2))
         return 0
 
-    res = ensure_runtime(args.base_python, args.wheelhouse, args.force)
-    if args.with_app_code:
+    try:
+        res = ensure_runtime(args.base_python, args.wheelhouse, args.force, args.venv_dir)
+    except (WheelhouseError, OSError, ValueError, subprocess.CalledProcessError) as exc:
+        print(json.dumps({"status": "error", "reason": str(exc)}, indent=2))
+        return 1
+    if args.with_app_code and res.get("status") == "ready":
         res["app_code"] = str(ensure_app_code())
     print(json.dumps(res, indent=2))
     return 0 if res.get("status") == "ready" else 1

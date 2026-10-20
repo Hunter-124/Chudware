@@ -620,7 +620,7 @@ class HostToolDispatchTests(unittest.TestCase):
 
     def test_model_selectors_preserve_omission_but_ledger_keeps_run_context(self):
         from mcp.server.fastmcp import FastMCP
-        from services.agent import ledger, workspace
+        from services.agent import ledger, request_context as tenancy, workspace
         from services.mcp import core_bridge, tool_registry
         from services.mcp.ledger_tools import register_ledger_tools
         from services.mcp.workspace_tools import register_workspace_tools
@@ -654,9 +654,7 @@ class HostToolDispatchTests(unittest.TestCase):
                 self.assertEqual(method, "doc_list")
                 return {"docs": rows}
 
-            with mock.patch.dict(
-                "os.environ", {"CHUDWARE_PROJECT_DIR": str(project)}
-            ), mock.patch.object(core_bridge, "call", engine):
+            with tenancy.bind_roots(str(project)), mock.patch.object(core_bridge, "call", engine):
                 turn = call("workspace_status", {})
             self.assertTrue(turn["ok"], turn)
             self.assertEqual(turn["scope"], "turn")
@@ -957,6 +955,123 @@ class SubagentHostToolDispatchTests(unittest.TestCase):
         execute({"size": 1}, _SubagentCall())
         self.assertNotIn("agent_id", records[-1])
 
+    def test_parallel_new_parts_keep_agent_current_docs_across_call_threads(self):
+        from services.mcp import cad_common, cad_doc_tools
+
+        class Registry:
+            def __init__(self):
+                self.tools = {}
+
+            def tool(self, *args, **kwargs):
+                def register(fn):
+                    self.tools[fn.__name__] = fn
+                    return fn
+                return register
+
+        registry = Registry()
+        cad_doc_tools.register_cad_doc_tools(registry)
+        docs = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(2, timeout=5)
+        results, errors = {}, []
+
+        def engine(method, params=None):
+            with lock:
+                if method == "doc_new":
+                    doc = {
+                        "doc_id": f"doc-cpp{len(docs) + 1:08x}",
+                        "name": params["name"],
+                        "origin_kind": "mcp",
+                    }
+                    docs.append(doc)
+                    return dict(doc)
+                if method == "doc_list":
+                    return {"docs": list(docs)}
+            raise AssertionError(f"unexpected engine call {method}")
+
+        def inspect(doc_id=None):
+            return {"ok": True, "doc_id": cad_common._doc(doc_id)}
+
+        context = {"run_id": "isolated-turn", "doc_id": "turn-part"}
+        create = self._tool("new_part", registry.tools["new_part"], **context)
+        read = self._tool("get_part", inspect, **context)
+
+        def make(agent):
+            try:
+                result = create({"name": agent, "fresh": True}, _SubagentCall(agent, "Main"))
+                results[agent] = json.loads(result["details"]) if isinstance(
+                    result["details"], str
+                ) else result["details"]
+                barrier.wait()
+            except Exception as exc:
+                errors.append(exc)
+
+        def check(agent):
+            try:
+                result = read({}, _SubagentCall(agent, "Main"))["details"]
+                self.assertEqual(result["doc_id"], results[agent]["doc_id"])
+            except Exception as exc:
+                errors.append(exc)
+
+        with mock.patch.object(cad_common._CUR, "_slots", {None: {"doc_id": "process-doc"}}), \
+                mock.patch.object(cad_common.cb, "call", side_effect=engine), \
+                mock.patch.object(cad_common, "_PROCESS_DOCS", set()), \
+                mock.patch.object(cad_common, "_TOUCHED_DOCS", []), \
+                mock.patch.object(cad_doc_tools, "_project_save", return_value=None), \
+                mock.patch("services.agent.config.get_tool_options", return_value=_NEUTRAL_TOOL_OPTIONS):
+            # The second tool calls use NEW threads: identity follows the agent, not
+            # the RPC worker thread used for its previous call.
+            for target in (make, check):
+                workers = [threading.Thread(target=target, args=(agent,)) for agent in ("A", "B")]
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join(timeout=10)
+                self.assertFalse(any(worker.is_alive() for worker in workers))
+            self.assertEqual(errors, [])
+            self.assertNotEqual(results["A"]["doc_id"], results["B"]["doc_id"])
+            self.assertEqual(cad_common._CUR["doc_id"], "process-doc")
+
+    def test_subagent_document_injection_uses_own_part_then_turn_fallback(self):
+        from services.agent.chudcode_tools import _document_args
+        from services.mcp import cad_common
+
+        def inspect(doc_id=None):
+            return {"doc_id": doc_id}
+
+        with mock.patch.object(cad_common._CUR, "_slots", {None: {"doc_id": "process-doc"}}):
+            with cad_common.agent_doc_context("Builder", scope="turn"):
+                context = {"doc_id": "turn-doc"}
+                self.assertEqual(
+                    _document_args(inspect, {}, context, agent_id="Builder"),
+                    {"doc_id": "turn-doc"},
+                )
+                cad_common._CUR["doc_id"] = "own-doc"
+                self.assertEqual(
+                    _document_args(inspect, {}, context, agent_id="Builder"),
+                    {"doc_id": "own-doc"},
+                )
+                self.assertEqual(
+                    _document_args(inspect, {"doc_id": "explicit-doc"}, context, agent_id="Builder"),
+                    {"doc_id": "explicit-doc"},
+                )
+                # Root calls preserve the existing explicit turn-doc injection.
+                self.assertEqual(_document_args(inspect, {}, context), {"doc_id": "turn-doc"})
+
+    def test_agent_context_restores_after_tool_exception(self):
+        from services.mcp import cad_common
+
+        previous = cad_common.cb.CURRENT_AGENT.get()
+
+        def fail():
+            self.assertEqual(cad_common.cb.CURRENT_AGENT.get(), ("turn", "Builder"))
+            raise RuntimeError("tool failed")
+
+        execute = self._tool("new_part", fail, run_id="turn")
+        with self.assertRaisesRegex(RuntimeError, "tool failed"):
+            execute({}, _SubagentCall("Builder", "Main"))
+        self.assertEqual(cad_common.cb.CURRENT_AGENT.get(), previous)
+
     def test_call_cap_holds_across_concurrent_subagent_calls(self):
         release = threading.Event()
         ran = []
@@ -1115,6 +1230,19 @@ class HostToolImageDeliveryTests(unittest.TestCase):
         self.assertEqual(out["type"], "host_tool_result")
         self.assertNotIn("isError", out, out)
         return out, binding.context["tool_calls"]
+
+    def test_text_guidance_rpc_frame_keeps_details_for_eval(self):
+        for name in ("cad_guide", "cad_skill"):
+            with self.subTest(name=name):
+                text = "# Guide\nKeep the shaft Ø6 and the case centered — 🔧."
+                frame, records = self._frame(
+                    name, lambda: text, toolCallId=f"js-{name}-text"
+                )
+                self.assertEqual(frame["result"]["details"], text)
+                self.assertEqual(
+                    frame["result"]["content"], [{"type": "text", "text": text}]
+                )
+                self.assertEqual(records[-1]["result"], text)
 
     def _assert_image_frame(self, frame, caption, size):
         content = frame["result"]["content"]
@@ -1342,6 +1470,96 @@ class HostToolResultEdgeTests(unittest.TestCase):
         tool = binding.to_host_tool(lambda **kw: kw)
         return tool["execute"](params or {}, _CallContext(call_id)), binding.context
 
+    def test_plain_text_details_preserve_unicode_and_non_json_without_fake_success(self):
+        for text in ("", "CAD guide text", "轴 Ø6 — 🔧\nKeep this line.", "[not json"):
+            with self.subTest(text=text):
+                out = host_tool_result(text)
+                self.assertEqual(out["content"], [{"type": "text", "text": text}])
+                self.assertEqual(out["details"], text)
+
+    def test_real_guides_and_skills_reach_eval_as_text_details(self):
+        from services.agent.skills import skill_reference_text
+        from services.mcp.cad_guide import cad_guide_text
+
+        for name, handler, params in (
+            ("cad_guide", cad_guide_text, {}),
+            ("cad_guide", cad_guide_text, {"topic": "fillet"}),
+            ("cad_skill", skill_reference_text, {"name": "edit-part"}),
+        ):
+            with self.subTest(name=name, params=params):
+                expected = handler(**params)
+                self.assertTrue(expected)
+                out, _ = self._execute(
+                    handler, params, name=name, call_id=f"js-{name}-text"
+                )
+                self.assertLessEqual(len(out["content"][0]["text"].encode("utf-8")), 46_000)
+                value = out["details"]
+                if isinstance(value, dict):
+                    self.assertNotIn("ok", value)
+                    self.assertIsInstance(value["items"], str)
+                    with open(value["_truncated"]["full_result"], encoding="utf-8") as handle:
+                        value = json.load(handle)
+                else:
+                    self.assertEqual(out["content"][0]["text"], expected)
+                self.assertEqual(value, expected)
+
+    def test_oversized_plain_unicode_text_is_bounded_and_spills_the_complete_string(self):
+        source = "🔧轴Ø\n" * 9000
+        # Character count fits the cap; UTF-8 byte count does not.
+        self.assertLess(len(source), 46_000)
+        self.assertGreater(len(source.encode("utf-8")), 46_000)
+        out, _ = self._execute(
+            lambda: source, name="cad_skill", call_id="js-cad_skill-large"
+        )
+        text = out["content"][0]["text"]
+        self.assertLessEqual(len(text.encode("utf-8")), 46_000)
+        body = json.loads(text)
+        self.assertEqual(body, out["details"])
+        self.assertNotIn("ok", body)
+        start, marker = body["items"].split(" …[cut: ", 1)
+        self.assertTrue(source.startswith(start))
+        self.assertIn(f"of {len(source)} characters;", marker)
+        self.assertEqual(body["_truncated"]["shortened"], {"$": len(source)})
+        with open(body["_truncated"]["full_result"], encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), source)
+
+    def test_plain_text_budget_reserves_the_unicode_skill_prefix(self):
+        source = "Guide line 🔧轴\n" * 8000
+        prefix = "[SKILL: probe]\n" + "轴🔧" * 2000 + "\n"
+        with mock.patch("services.agent.chudcode_tools._skill_prefix", return_value=prefix):
+            out, _ = self._execute(lambda: source, name="cad_guide")
+        text = out["content"][0]["text"]
+        self.assertTrue(text.startswith(prefix))
+        self.assertLessEqual(len(text.encode("utf-8")), 46_000)
+        body = out["details"]
+        self.assertNotIn("ok", body)
+        with open(body["_truncated"]["full_result"], encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), source)
+
+    def test_plain_text_spill_failure_stays_bounded_without_claiming_a_saved_file(self):
+        source = "大型指南 🔧\n" * 12000
+        with mock.patch(
+            "services.agent.chudcode_tools._spill_full_result",
+            side_effect=OSError("cache is read-only"),
+        ):
+            out, _ = self._execute(lambda: source, call_id="js-cad_guide-no-spill")
+        self.assertLessEqual(len(out["content"][0]["text"].encode("utf-8")), 46_000)
+        body = out["details"]
+        self.assertEqual(json.loads(out["content"][0]["text"]), body)
+        self.assertIsNone(body["_truncated"]["full_result"])
+        self.assertNotIn("ok", body)
+        self.assertIn("full text not saved", body["items"])
+
+    def test_host_envelope_does_not_turn_handler_exceptions_into_success(self):
+        error = RuntimeError("CAD guide unavailable")
+
+        def fail():
+            raise error
+
+        with self.assertRaises(RuntimeError) as caught:
+            self._execute(fail, name="cad_guide", call_id="js-cad_guide-error")
+        self.assertIs(caught.exception, error)
+
     def test_json_text_result_carries_structured_details_and_its_failure(self):
         records = []
         out, _ = self._execute(
@@ -1498,6 +1716,30 @@ class HostToolResultEdgeTests(unittest.TestCase):
         self.assertIs(seen["cancel"], stop)
         self.assertIs(result["stopped"], True)
 
+    def test_a_pure_wait_is_woken_by_the_runs_unread_user_message(self):
+        seen = []
+
+        def wait_job(job_id: str, timeout_s: float = 1.0, cancel=None, wake=None):
+            seen.append(wake() if wake else "no-probe")
+            return {"ok": True}
+
+        entries = {"wait_job": _entry(wait_job, "wait", {
+            "type": "object",
+            "properties": {"job_id": {"type": "string"},
+                           "wake": {"default": None, "title": "Wake"}},
+            "required": ["job_id"],
+        })}
+        context = _context(entries)
+        [binding] = [b for b in build_host_tools(context) if b.name == "wait_job"]
+        self.assertNotIn("wake", binding.input_schema["properties"])
+        dispatch_host_tool(binding, {"job_id": "j"}, None, None)   # outside a live turn
+        unread = []
+        binding.context["user_steer_pending"] = lambda: bool(unread)
+        dispatch_host_tool(binding, {"job_id": "j", "wake": "model junk"}, None, None)
+        unread.append("add a roof")
+        dispatch_host_tool(binding, {"job_id": "j"}, None, None)
+        self.assertEqual(seen, ["no-probe", None, "user_message"])
+
 
 class HelperRuntimeScopeTests(unittest.TestCase):
     def test_model_cannot_replace_hidden_helper_factory_or_leak_it_into_records(self):
@@ -1525,7 +1767,7 @@ class HelperRuntimeScopeTests(unittest.TestCase):
         self.assertNotIn("helper_runtime", json.dumps(records))
 
     def test_helper_runtime_is_thread_local_and_restored_after_failure(self):
-        from services.agent.online_turn import current_helper_runtime
+        from services.agent.online_turn import current_helper_runtime, current_tool_session_id
 
         barrier = threading.Barrier(2)
         observed = {}
@@ -1533,16 +1775,19 @@ class HelperRuntimeScopeTests(unittest.TestCase):
         def execute(actor):
             def repair():
                 barrier.wait(timeout=2)
-                observed[actor] = current_helper_runtime()()
+                observed[actor] = (current_helper_runtime()(), current_tool_session_id())
                 raise RuntimeError("diagnosis failed")
 
             binding = HostToolBinding(
                 "repair", "repair", {"type": "object", "properties": {}}, handler=repair,
-                context={"policy_registry": _Policy(), "helper_runtime": lambda: actor})
+                context={"policy_registry": _Policy(), "helper_runtime": lambda: actor,
+                         "session_id": f"session-{actor}"})
             try:
                 dispatch_host_tool(binding, {}, None, None)
             except RuntimeError:
-                observed[actor + "-cleared"] = current_helper_runtime() is None
+                observed[actor + "-cleared"] = (
+                    current_helper_runtime() is None and current_tool_session_id() is None
+                )
 
         threads = [threading.Thread(target=execute, args=(actor,)) for actor in ("a", "b")]
         for thread in threads:
@@ -1550,8 +1795,376 @@ class HelperRuntimeScopeTests(unittest.TestCase):
         for thread in threads:
             thread.join(3)
         self.assertTrue(all(not thread.is_alive() for thread in threads))
-        self.assertEqual(observed, {"a": "a", "b": "b", "a-cleared": True, "b-cleared": True})
+        self.assertEqual(observed, {
+            "a": ("a", "session-a"), "b": ("b", "session-b"),
+            "a-cleared": True, "b-cleared": True,
+        })
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_cell_sdk_tool_threads_rebind_trusted_owner_and_explicit_roots(monkeypatch):
+    import hashlib
+    from types import SimpleNamespace
+    from services.agent import request_context as tenancy
+
+    actor = "tool-owner"
+    ctx = {
+        "cell": True, "workspace_key": "team:tools/work", "actor_key": actor,
+        "actor_hex": hashlib.sha256(actor.encode()).hexdigest()[:32],
+        "right": "editor", "epoch": 7,
+    }
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", "/work/ambient")
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", "/work/ambient-save")
+
+    def probe():
+        return {
+            "owner": list(tenancy.owner_key()),
+            "project": tenancy.root_value("CHUDWARE_PROJECT_DIR"),
+            "save": tenancy.root_value("CHUDWARE_PROJECT_SAVE_DIR"),
+            "epoch": tenancy.current_context()["epoch"],
+        }
+
+    with tenancy.bind_context(ctx), tenancy.bind_roots("/work/selected", "/work/selected/save"):
+        binding = HostToolBinding(
+            "probe", "Inspect the trusted request scope", {"type": "object"},
+            handler=probe, context=_context({"probe": _entry(probe, "Inspect scope")}),
+        )
+        tool = binding.to_host_tool(lambda **kwargs: kwargs)
+    results, failures = [], []
+
+    def sdk_thread():
+        try:
+            # No contextvars are inherited into this new thread.
+            assert tenancy.current_context() == {}
+            results.append(tool["execute"]({}, SimpleNamespace(cancelled=False)))
+            assert tenancy.current_context() == {}
+            assert tenancy.root_value("CHUDWARE_PROJECT_DIR") == "/work/ambient"
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=sdk_thread)
+    thread.start()
+    thread.join(2)
+    assert not thread.is_alive()
+    assert not failures
+    assert results[0]["details"] == {
+        "owner": ["team:tools/work", actor], "project": "/work/selected",
+        "save": "/work/selected/save", "epoch": 7,
+    }
+
+
+def test_timeout_worker_preserves_full_host_context_and_turn_pool(monkeypatch):
+    import hashlib
+    from contextvars import ContextVar
+    from services.agent import config, request_context as tenancy
+    from services.agent.online_turn import current_helper_runtime, current_tool_session_id
+    from services.mcp import core_bridge, daemon_bridge
+
+    # Bound arbitrary caller state must cross the timeout thread along with the
+    # known authority fields; a tenancy-only rebind would still lose this marker.
+    marker = ContextVar("timeout_caller_marker", default=None)
+    ctx = {"cell": True, "workspace_key": "team:tools/work", "actor_key": "alice",
+           "actor_hex": hashlib.sha256(b"alice").hexdigest()[:32], "right": "editor", "epoch": 1}
+    caller_thread = threading.get_ident()
+    connections = []
+
+    class Connection:
+        def __init__(self, *, writer_group):
+            self.owner = tenancy.owner_key()
+            self.writer_group = writer_group
+            self.closed = False
+            connections.append(self)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(daemon_bridge, "DaemonClient", Connection)
+    monkeypatch.setattr(config, "get_tool_options", lambda *args: {"timeout_s": 10})
+    helper = object()
+    observed = []
+
+    def probe():
+        connection = daemon_bridge.client()
+        observed.append({
+            "context": tenancy.current_context(),
+            "roots": (tenancy.root_value("CHUDWARE_PROJECT_DIR"),
+                      tenancy.root_value("CHUDWARE_PROJECT_SAVE_DIR")),
+            "session": current_tool_session_id(),
+            "helper": current_helper_runtime(),
+            "document_owner": core_bridge.CURRENT_AGENT.get(),
+            "marker": marker.get(),
+            "thread": threading.get_ident(),
+            "connection": connection,
+        })
+        marker.set("worker-local")
+        return {"ok": True}
+
+    with tenancy.bind_context(ctx), tenancy.bind_roots("/work/selected", "/work/save"):
+        pool = daemon_bridge.TurnConnections()
+        binding = HostToolBinding(
+            "scope_probe", "Inspect owning context", {"type": "object"},
+            handler=probe, context=_context(
+                {"scope_probe": _entry(probe, "Inspect owning context")},
+                helper_runtime=helper, session_id="parent-session",
+                run_id="owning-run", agent_id="child", daemon_connections=pool,
+            ),
+        )
+        token = marker.set("caller-owned")
+        try:
+            for _ in range(2):
+                assert dispatch_host_tool(binding, {}, None, None) == {"ok": True}
+                assert marker.get() == "caller-owned"
+                assert tenancy.current_context() == ctx
+                assert current_helper_runtime() is None and current_tool_session_id() is None
+            assert len(connections) == 1
+            for scope in observed:
+                assert scope["context"] == ctx
+                assert scope["roots"] == ("/work/selected", "/work/save")
+                assert scope["session"] == "parent-session"
+                assert scope["helper"] is helper
+                assert scope["document_owner"] == ("owning-run", "child")
+                assert scope["marker"] == "caller-owned"
+                assert scope["thread"] != caller_thread
+                assert scope["connection"] is connections[0]
+            assert connections[0].owner == ("team:tools/work", "alice")
+            assert not connections[0].closed
+        finally:
+            marker.reset(token)
+            pool.close()
+        assert connections[0].closed
+
+
+def _root_tool_entries():
+    from mcp.server.fastmcp import FastMCP
+    from services.mcp import tool_registry
+    from services.mcp.fs_tools import register_fs_tools
+    from services.mcp.workspace_tools import register_workspace_tools
+
+    mcp = FastMCP("fresh-thread-root-regression")
+    with mock.patch.dict(tool_registry._CATALOG, {}, clear=True):
+        register_fs_tools(tool_registry.view(mcp, "files"))
+        register_workspace_tools(tool_registry.view(mcp, "workspace"))
+    return mcp._tool_manager._tools
+
+
+def test_initial_and_refreshed_sdk_threads_use_each_tenants_nested_roots(tmp_path, monkeypatch):
+    import hashlib
+    from types import SimpleNamespace
+    from services.agent import chudcode_roles, config, request_context as tenancy, workspace
+    from services.mcp import core_bridge
+
+    entries = _root_tool_entries()
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / ".git").mkdir()
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(repository))
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(repository))
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(repository / "ambient-save"))
+    monkeypatch.setattr(config, "get_tool_options", lambda *_: dict(_NEUTRAL_TOOL_OPTIONS))
+    monkeypatch.setattr(config, "tool_timeout_s_default", lambda: 0)
+    monkeypatch.setitem(
+        sys.modules, "chudcode_rpc", SimpleNamespace(host_tool=lambda **kwargs: kwargs),
+    )
+    monkeypatch.setattr(
+        chudcode_roles, "publish_host_tools",
+        lambda client, tools, advertised: client.set_custom_tools(tools),
+    )
+    monkeypatch.setattr(workspace, "_session_registry", {})
+    tenants = {}
+    for actor in ("alice", "bob"):
+        root = repository / actor / "selected"
+        root.mkdir(parents=True)
+        (root / f"{actor}.stl").write_text(f"solid {actor}\nendsolid {actor}\n")
+        save = root / "saved"
+        ctx = {
+            "cell": True, "workspace_key": f"team:{actor}/workspace", "actor_key": actor,
+            "actor_hex": hashlib.sha256(actor.encode()).hexdigest()[:32],
+            "right": "editor", "epoch": 1,
+        }
+        context = _context(
+            entries, project_dir=str(root / ".." / "selected"), save_dir=str(save),
+            run_id=f"run-{actor}", session_id=f"session-{actor}", categories=[],
+            allowed_tools=["workspace_status", "browse_models", "fs_list"],
+        )
+
+        class Client:
+            def set_custom_tools(self, tools):
+                self.tools = {tool["name"]: tool for tool in tools}
+
+        client = Client()
+        # The real worker builds its initial tools before activate_turn_env.
+        # In particular, there is no bind_roots around this assembly.
+        with tenancy.bind_context(ctx):
+            bindings = build_host_tools(context)
+            client.set_custom_tools([
+                binding.to_host_tool(lambda **kwargs: kwargs) for binding in bindings
+            ])
+            chudcode_roles._register_category_refresh(context, bindings)(client)
+        tenants[actor] = (root, save, ctx, context, client)
+
+    engine_scopes = []
+
+    def engine(method, params=None):
+        assert method == "doc_list"
+        actor = tenancy.owner_key()[1]
+        root, save, _, _, _ = tenants[actor]
+        engine_scopes.append((actor, tenancy.root_value("CHUDWARE_PROJECT_SAVE_DIR")))
+        return {"docs": [{"doc_id": actor, "path": str(root / f"{actor}.stl")}]}
+
+    monkeypatch.setattr(core_bridge, "call", engine)
+    failures = []
+    seen = {}
+
+    def callback(actor, phase):
+        try:
+            assert tenancy.current_context() == {}
+            root, save, _, _, client = tenants[actor]
+            host_context = SimpleNamespace(
+                cancelled=False, tool_call_id=f"js-write-{actor}-{phase}",
+                agent_id="ArmBuilder", parent_agent_id="Main",
+            )
+            results = {}
+            for name, args in (
+                ("workspace_status", {}),
+                ("browse_models", {"sheets": False, "pattern": "*.stl"}),
+                ("fs_list", {}),
+            ):
+                out = client.tools[name]["execute"](args, host_context)
+                results[name] = json.loads(out["content"][0]["text"])
+                assert results[name] == out["details"]
+            seen[actor, phase] = results
+            if phase == 0:
+                loaded = client.tools["enable_tools"]["execute"](
+                    {"tools": ["fs_read"]}, host_context,
+                )["details"]
+                assert loaded["ok"], loaded
+                assert "fs_read" in client.tools
+            assert tenancy.current_context() == {}
+            assert tenancy.root_value("CHUDWARE_FS_ROOT") == str(repository)
+        except BaseException as exc:
+            failures.append(exc)
+
+    for phase in range(2):
+        threads = [threading.Thread(target=callback, args=(actor, phase)) for actor in tenants]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        assert all(not thread.is_alive() for thread in threads)
+    assert not failures
+    for (actor, phase), results in seen.items():
+        root, save, _, _, _ = tenants[actor]
+        status = results["workspace_status"]
+        assert status["ok"], status
+        assert status["project_dir"] == str(root)
+        assert status["docs"] == [{
+            "doc_id": actor, "path": str(root / f"{actor}.stl"), "location": "project",
+        }]
+        browse = results["browse_models"]
+        assert browse["ok"], browse
+        assert browse["root"] == str(root)
+        assert [row["file"] for row in browse["models"]] == [f"{actor}.stl"]
+        listing = results["fs_list"]
+        assert listing["ok"], listing
+        assert listing["path"] == str(root)
+        assert [row["name"] for row in listing["entries"]] == [f"{actor}.stl"]
+    assert len(seen) == 4
+    assert sorted(engine_scopes) == sorted(
+        (actor, str(tenants[actor][1])) for actor in tenants for _ in range(2)
+    )
+    alice = tenants["alice"]
+    bob = tenants["bob"]
+    with tenancy.bind_context(bob[2]):
+        refused = alice[4].tools["fs_list"]["execute"](
+            {}, SimpleNamespace(cancelled=False),
+        )["details"]
+    assert refused["reason"] == "not_found"
+
+
+def test_explicit_blank_tenant_root_never_uses_ambient_workspace(tmp_path, monkeypatch):
+    import hashlib
+    from types import SimpleNamespace
+    from services.agent import config, request_context as tenancy
+
+    entries = _root_tool_entries()
+    (tmp_path / "private.txt").write_text("ambient tenant data")
+    for name in ("CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT", "CHUDWARE_PROJECT_SAVE_DIR"):
+        monkeypatch.setenv(name, str(tmp_path))
+    monkeypatch.setattr(config, "get_tool_options", lambda *_: dict(_NEUTRAL_TOOL_OPTIONS))
+    ctx = {
+        "cell": True, "workspace_key": "team:blank/workspace", "actor_key": "blank",
+        "actor_hex": hashlib.sha256(b"blank").hexdigest()[:32],
+        "right": "editor", "epoch": 1,
+    }
+    with tenancy.bind_context(ctx):
+        bindings = build_host_tools(_context(
+            entries, project_dir="", workspace_dir=str(tmp_path), save_dir="",
+            allowed_tools=["fs_list", "browse_models", "workspace_status"],
+        ))
+    results = []
+
+    def callback():
+        with tenancy.bind_roots(str(tmp_path)):
+            for binding in bindings:
+                tool = binding.to_host_tool(lambda **kwargs: kwargs)
+                results.append(tool["execute"]({}, SimpleNamespace(cancelled=False))["details"])
+
+    thread = threading.Thread(target=callback)
+    thread.start()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert len(results) == len(bindings)
+    assert all(result["ok"] is False for result in results)
+    assert all(result["reason"] == "workspace_root_unavailable" for result in results)
+
+
+def test_refreshed_binding_recovers_the_original_wait_with_context_roots(tmp_path, monkeypatch):
+    from services.agent import config, request_context as tenancy
+
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    invocations = []
+    options = dict(_NEUTRAL_TOOL_OPTIONS, timeout_s=0.02)
+    monkeypatch.setattr(config, "get_tool_options", lambda *_: dict(options))
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path.parent))
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path.parent))
+
+    def pending(value=1):
+        invocations.append(value)
+        entered.set()
+        try:
+            assert release.wait(5)
+            return {"ok": True, "value": value,
+                    "project": tenancy.root_value("CHUDWARE_PROJECT_DIR")}
+        finally:
+            completed.set()
+
+    context = _context(
+        {"pending": _entry(pending, "Compute a value")},
+        project_dir=str(tmp_path), save_dir=str(tmp_path / "save"),
+        run_id="same-run", session_id="same-session", allowed_tools=["pending"],
+    )
+    binding = next(tool for tool in build_host_tools(context) if tool.name == "pending")
+    try:
+        first = dispatch_host_tool(binding, {"value": 7}, None, None, agent_id="Builder")
+        assert entered.wait(1)
+        assert first["status"] == "still_running"
+        # Refresh under the active turn roots used to change recovery identity.
+        with tenancy.bind_roots(str(tmp_path), str(tmp_path / "save")):
+            refreshed = next(tool for tool in build_host_tools(context) if tool.name == "pending")
+        retry = dispatch_host_tool(refreshed, {"value": 7}, None, None, agent_id="Builder")
+        assert retry["status"] == "still_running"
+        assert retry["started_new"] is False
+        assert invocations == [7]
+        release.set()
+        options["timeout_s"] = 1
+        result = dispatch_host_tool(refreshed, {"value": 7}, None, None, agent_id="Builder")
+        assert result == {"ok": True, "value": 7, "project": str(tmp_path)}
+        assert invocations == [7]
+    finally:
+        release.set()
+        assert completed.wait(5)

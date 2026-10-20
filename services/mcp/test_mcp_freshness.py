@@ -170,7 +170,7 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
         "describe_part", "query_adjacency", "hover", "describe_sketch",
         "describe_scene", "describe_toolpaths", "describe_results",
         "describe_assembly", "describe_board", "describe_project",
-        "sketch_health", "sketch_auto_constrain",
+        "sketch_health", "sketch_auto_constrain", "sketch_fully_define",
     },
     "recon": {
         "reverse_engineer", "compare_parts", "convert_face_to_sketch",

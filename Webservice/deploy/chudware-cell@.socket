@@ -1,0 +1,13 @@
+[Unit]
+Description=Chudware tenant cell gateway listener %i
+
+[Socket]
+ListenStream=@WEB_HOME@/cells/%i/gw.sock
+SocketMode=0600
+DirectoryMode=0700
+Accept=no
+RemoveOnStop=yes
+Service=chudware-cell@%i.service
+
+[Install]
+WantedBy=sockets.target

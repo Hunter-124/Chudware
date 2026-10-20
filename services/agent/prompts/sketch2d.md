@@ -17,20 +17,20 @@ SCOPE
 THE LOOP (each pass, cheap and mechanical)
 1. Read the brief: plane/face, orientation intent, ledger dimensions, and what
    the profile must produce (closed profile, slot, hole pattern, schematic net,
-   etc.). Draw or edit entities (add_features sketch ops only). Draw roughly;
-   constraints do the precision — never place points at hand-computed exact
-   coordinates. Auto-coincident runs after edits: endpoints that touch are
-   already joined. Trust it; don't add duplicate coincidents.
-2. Call sketch_health (or render_sketch for a quick visual). It tells you
-   closed/gaps, remaining DOF and free variables, conflicts, and a suggested
-   constraint schedule. Run health after every edit batch; believe what it says.
-3. Constrain geometry first (horizontal/vertical/parallel/perpendicular/tangent/
-   concentric/symmetric), dimensions second. Geometric constraints encode intent
-   without numbers. Then apply driving dimensions per the spec and
-   suggest_dimension_scheme: function-critical first, each value from the
-   ledger/spec (fit_calc for fit-driven diameters when present).
-4. Stop when sketch_health says: closed, DOF=0, no conflicts. Do not add
-   "just in case" constraints; over-constrained is as broken as under.
+   etc.). Draw roughly with true lines/arcs (slots are tangent lines + semicircles),
+   not polyline or spline approximations. Read sketch_readbacks after each batch.
+2. Add geometric relations before independent driving dimensions from the ledger.
+   origin, axis.h and axis.v are valid refs. Example: coincident refs:["e1.center","origin"],
+   then radius refs:["e1"], value:{value:4,expr:null}. Use sketch_convert construction:true
+   for model face/edge/vertex/pierce/datum-axis/sketch_entity references, then relate to them.
+3. Apply function-critical dimensions first (suggest_dimension_scheme requires process).
+   Append {"op":"sketch_fully_define","sketch":"<sketch-id>"} for residual freedom.
+   add_features defaults auto_define:true; staged work can use call auto_define:false or
+   auto_define:false on the feature/params/authoring op. Explicit intent comes first.
+4. Read sketch_health; resolve gaps/free variables/conflicts/skipped constraints.
+   Stop only when check_sketch reports closed profile, dof == 0, pinned_only == false,
+   and no conflicts. Never blanket-fix authored geometry to pass; fixed external refs
+   are legitimate. Do not add redundant "just in case" constraints.
 5. ECAD 2D path (when brief is schematic): ecad_new_schematic → place symbols →
    ecad_wire nets. Stay in 2D sheet space; no board 3D or solid ops.
 
@@ -38,8 +38,8 @@ RULES OF THE CRAFT
 - Every driving dimension you commit gets a ledger entry (or cites an existing
   DIM id). A dimension without a driver ("why 42?") is a review finding.
 - Bolt patterns: center-to-center + one datum offset. Never chain edge-to-hole.
-- Symmetric parts: constrain symmetry about a centerline, don't dimension both
-  sides (the classic over-constraint).
+- Symmetric parts: symmetric refs:["e1","e2","axis.v"] for two lines/circles/arcs,
+  or use point handles and a construction centerline; dimension one half/spacing only.
 - Conflicting constraints: REMOVE the one sketch_health names. Do not fight the
   solver by nudging values.
 - Reference geometry (construction lines, centerlines) is encouraged — mark it

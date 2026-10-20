@@ -12,7 +12,9 @@ import struct
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
-from .model import ProtocolError, Redactor
+
+from .http_client import _connect_authorized
+from .model import ProtocolError, Redactor, _commissioned_address_class
 
 _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _MAX_MESSAGE = 4 * 1024 * 1024
@@ -20,10 +22,12 @@ _MAX_FRAMES_PER_MESSAGE = 256
 
 
 class JsonWebSocket:
-    def __init__(self, base_url: str, path: str, headers: Mapping[str, str], timeout_s: float, redactor: Redactor) -> None:
+    def __init__(self, base_url: str, path: str, headers: Mapping[str, str], timeout_s: float,
+                 redactor: Redactor, *, address_class: str | None = None) -> None:
         parsed = urlsplit(base_url)
         self._secure = parsed.scheme == "https"
         self._host = parsed.hostname or ""
+        self._address_class = _commissioned_address_class(self._host, address_class)
         self._port = parsed.port or (443 if self._secure else 80)
         prefix = parsed.path.rstrip("/")
         self._path = prefix + "/" + path.lstrip("/")
@@ -34,7 +38,7 @@ class JsonWebSocket:
         self._receive_buffer = bytearray()
 
     def __enter__(self) -> "JsonWebSocket":
-        raw = socket.create_connection((self._host, self._port), timeout=self._timeout_s)
+        raw = _connect_authorized(self._host, self._port, self._timeout_s, self._address_class)
         if self._secure:
             raw = ssl.create_default_context().wrap_socket(raw, server_hostname=self._host)
         raw.settimeout(self._timeout_s)

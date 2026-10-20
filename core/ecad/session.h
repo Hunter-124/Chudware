@@ -10,12 +10,15 @@
 #pragma once
 
 #include <string>
+#include <cstdint>
 
 #include <nlohmann/json.hpp>
 
 #include "ecad/ops.h"  // OpError
 
 namespace chudware::ecad {
+
+bool dirty_document_count(std::uint64_t& count);  // nonblocking, false = unknown
 
 // ecad_new {kind: "sch"|"pcb", name?} -> ops-response + "doc_id".
 nlohmann::json ecad_new(const std::string& kind, const std::string& name);

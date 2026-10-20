@@ -22,22 +22,6 @@ from unittest.mock import MagicMock
 _REPO = Path(__file__).resolve().parents[2]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
-# Also probe the main checkout for libchudware: a git worktree is a sibling of the main
-# checkout and only the main checkout carries a build tree. A worktree's `.git` is a FILE
-# reading `gitdir: <main>/.git/worktrees/<name>`, so the main checkout is derivable from
-# it. Never hardcode an absolute developer path here — that makes the suite pass on
-# exactly one machine and silently degrade everywhere else, CI included.
-# CHUDWARE_LIBCHUDWARE / CHUDWARE_DIST env vars work too.
-_CHECKOUT_ROOTS = [_REPO]
-_git_entry = _REPO / ".git"
-if _git_entry.is_file():
-    _gitdir = Path(_git_entry.read_text(encoding="utf-8").partition("gitdir:")[2].strip())
-    if _gitdir.parent.name == "worktrees" and _gitdir.parent.parent.name == ".git":
-        _main_checkout = _gitdir.parents[2]
-        if _main_checkout.exists():
-            _CHECKOUT_ROOTS.append(_main_checkout)
-            if str(_main_checkout) not in sys.path:
-                sys.path.insert(0, str(_main_checkout))
 
 _TMP_CACHE = tempfile.mkdtemp(prefix="test_derivation_cache_")
 os.environ.setdefault("CHUDWARE_CACHE_ROOT", _TMP_CACHE)
@@ -477,26 +461,16 @@ class TestExprParser(unittest.TestCase):
 # §8  link_dimension round-trip
 # ---------------------------------------------------------------------------
 
-# Detect libchudware availability. A worktree shares the core build tree with the main
-# checkout, so probe this checkout first and then the main checkout resolved above.
-# Point CHUDWARE_LIBCHUDWARE at the artifact if not already set so that
-# core_bridge._load() can find the .so regardless of which sys.path entry wins.
-_LIBCHUDWARE_AVAILABLE = False
-if not os.environ.get("CHUDWARE_LIBCHUDWARE"):
-    for _root in _CHECKOUT_ROOTS:
-        _known_so = _root / "core" / "build-linux" / "bin" / "libchudware.so"
-        if _known_so.exists():
-            os.environ["CHUDWARE_LIBCHUDWARE"] = str(_known_so)
-            break
+# Use the production resolver without an RPC or process-global library override.
+# Collection must not load a stale slim engine or attach to a running daemon.
+from services.mcp import core_bridge as _core_bridge
+
 try:
-    from services.mcp.core_bridge import call as _core_call, CoreError
-    # Read-only probe to confirm availability: doc_list mints NOTHING. (The old
-    # probe called doc_new, which leaked a real never-closed "link_dim_probe"
-    # document into the user's live shared daemon on every suite import.)
-    _core_call("doc_list")
+    _core_bridge._resolve_lib()
+except _core_bridge.CoreError:
+    _LIBCHUDWARE_AVAILABLE = False
+else:
     _LIBCHUDWARE_AVAILABLE = True
-except Exception:
-    pass
 
 
 class TestLinkDimensionRoundTrip(unittest.TestCase):

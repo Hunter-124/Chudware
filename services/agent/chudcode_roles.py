@@ -18,6 +18,7 @@ from services.agent.chudcode_events import RpcFrameState, map_rpc_frame
 from services.agent.chudcode_host import get_default_chudcode_host, publish_host_tools
 from services.agent.chudcode_tools import build_host_tools
 from services.agent.roles import RoleError, load_role
+from services.agent import request_context as tenancy
 
 _HISTORY_MAX_CHARS = 24_000
 _HISTORY_MAX_MESSAGES = 24
@@ -157,6 +158,7 @@ def _bounded_history(history: Any) -> str:
 
 
 def _claim_history(session_id: str, history: Any, *, resumed: bool) -> str:
+    session_id = tenancy.scoped_key(session_id)
     with _HISTORY_LOCK:
         if session_id in _HISTORY_SEEDED_SESSIONS:
             return ""
@@ -165,6 +167,7 @@ def _claim_history(session_id: str, history: Any, *, resumed: bool) -> str:
 
 
 def _release_history(session_id: str) -> None:
+    session_id = tenancy.scoped_key(session_id)
     with _HISTORY_LOCK:
         _HISTORY_SEEDED_SESSIONS.discard(session_id)
 
@@ -317,6 +320,7 @@ def _assemble_role_runtime(
         "chudware_actor": actor,
         "ledger": options.get("ledger", getattr(mission_dispatch, "ledger", None)),
         "run_id": run_id,
+        "session_id": options.get("session_id"),
         "node_id": options.get("node_id"),
         "parent_id": parent_id,
         "subagent_id": options.get("subagent_id"),
@@ -635,9 +639,7 @@ def _run_offline(
             options=dict(options),
             history=list(history) if isinstance(history, list) else None,
             attachments=(
-                [dict(item) for item in attachments if isinstance(item, Mapping)][
-                    :_ATTACHMENT_MAX
-                ]
+                [dict(item) for item in attachments if isinstance(item, Mapping)]
                 if isinstance(attachments, list)
                 else None
             ),
@@ -718,13 +720,52 @@ def run_role_turn(
         )
     if on_event is not None and not callable(on_event):
         return _failure(role_name, "invalid_event_sink", "on_event must be callable")
+    if isinstance(attachments, list) and len(attachments) > _ATTACHMENT_MAX:
+        return _failure(role_name, "attachment_count_exceeded", "attachment_count_exceeded")
 
     opts = dict(options) if isinstance(options, Mapping) else {}
+    if tenancy.in_cell() and opts.get("offline"):
+        return _failure(role_name, "credential_isolation_unsupported", "credential_isolation_unsupported")
+    if tenancy.in_cell() and any(key in opts for key in ("api_key", "web_credential", "byok_key")):
+        return _failure(role_name, "credential_isolation_unsupported", "credential_isolation_unsupported")
+    if opts.get("offline") is not True and (
+        tenancy.in_cell() or not any(key in opts for key in ("web_key_source", "byok_key"))
+    ):
+        host = get_default_chudcode_host()
+        inherit = getattr(host, "session_launch_params", None)
+        if callable(inherit):
+            try:
+                inherited = inherit(parent_session)
+                opts = {**inherited, **opts}
+                if tenancy.in_cell():
+                    for key in ("workspace_dir", "web_actor", "web_key_source", "web_tenant",
+                                "web_provider", "web_provider_grant"):
+                        if key in inherited:
+                            opts[key] = inherited[key]
+                    if inherited.get("plan_only") or inherited.get("mode") in ("ask", "plan"):
+                        if inherited.get("mode") == "ask" or opts.get("mode") not in ("ask", "plan"):
+                            opts["mode"] = inherited.get("mode") or "plan"
+                        opts["plan_only"] = inherited.get("plan_only")
+                    settings = dict(opts.get("settings") or {})
+                    for key, value in (inherited.get("settings") or {}).items():
+                        if key in ("provider", "model", "compaction_strategy", "compaction_settings"):
+                            settings[key] = value
+                            # _settings_for_role reads top-level overrides last.
+                            # A child cannot replace the parent's authorized model.
+                            opts.pop(key, None)
+                    opts["settings"] = settings
+            except KeyError:
+                if tenancy.in_cell():
+                    return _failure(role_name, "not_found", "not_found")
+        elif tenancy.in_cell():
+            return _failure(role_name, "not_found", "not_found")
     effective_run_id = _effective_run_id(parent_session, role_name, run_id, parent_id)
     lineage_parent = _text(parent_id) or parent_session
     child_session = _child_session_id(
         parent_session, effective_run_id, role_name, lineage_parent
     )
+    # Descendants resolve this actual live child session, never its run id.
+    opts["session_id"] = child_session
     try:
         card = load_role(role_name)
     except RoleError:
@@ -805,9 +846,7 @@ def run_role_turn(
         else request_text
     )
     bounded_attachments = (
-        [dict(item) for item in attachments if isinstance(item, Mapping)][
-            :_ATTACHMENT_MAX
-        ]
+        [dict(item) for item in attachments if isinstance(item, Mapping)]
         if isinstance(attachments, list)
         else None
     )
@@ -831,6 +870,10 @@ def run_role_turn(
         "chudcode_session_file",
         "host_uris",
         "images",
+        "mode", "plan_only", "turn_preferences",
+        "web_actor", "web_key_source", "web_tenant", "web_provider", "web_credential",
+        "web_provider_grant",
+        "byok_key", "byok_tenant", "byok_provider",
     ):
         if key in opts and opts[key] is not None:
             host_params[key] = opts[key]
@@ -858,6 +901,8 @@ def run_role_turn(
             payload = (
                 dict(mapped) if isinstance(mapped, Mapping) else {"payload": mapped}
             )
+            if raw.get("type") == "agent_end" and raw.get("reason") == "manager_stop":
+                payload["control_delegate"] = dict(raw["control_delegate"])
             if kind == "agent.provider_usage":
                 _add_usage(usage, payload)
                 _record_provider_usage(payload, actor)
@@ -891,7 +936,8 @@ def run_role_turn(
         calls, tool_calls = _bounded_tool_calls(tool_context.get("tool_calls"))
         result = {
             "success": not cancelled,
-            "stop_reason": "cancelled" if cancelled else "completed",
+            "stop_reason": ("manager_stop" if host_result.get("reason") == "manager_stop"
+                            else "cancelled" if cancelled else "completed"),
             "result": _terminal_text(host_result),
             "role": role_name,
             "allowed_tools": [
@@ -913,6 +959,8 @@ def run_role_turn(
             "tool_calls": tool_calls,
             "offline": False,
         }
+        if host_result.get("reason") == "manager_stop":
+            result["control_delegate"] = dict(host_result["control_delegate"])
         return result
     except Exception as exc:  # noqa: BLE001 - nested role turns return failures
         return _failure(
@@ -928,7 +976,10 @@ def run_role_turn(
         if close_session:
             try:
                 if host is not None:
-                    host.close_session(child_session)
+                    if any(key in host_params for key in ("web_key_source", "byok_key")):
+                        host.close_session(child_session, credential_params=host_params)
+                    else:
+                        host.close_session(child_session)
             finally:
                 _release_history(child_session)
 

@@ -537,6 +537,7 @@ public:
     // scalars replace, null erases a key; id/type ignored), then persist it. False when the
     // selected study is not a topology study or the patch is not an object.
     bool configureActiveTopology(AppState& st, const nlohmann::json& patch);
+    bool applyActiveTopologyPrintProcess(AppState& st, const std::string& id);
     // Canonical JSON of the selected topology study (null otherwise).
     nlohmann::json activeTopologyStudy() const;
     // Latest retained run record {run_id,label,started_utc,settings,source,result} of the
@@ -995,6 +996,8 @@ private:
     void drawTopologyRunArea(AppState& st, Study& s);
     void drawTopologyLiveStatus(AppState& st, Study& s); // topology body top: status line + live convergence sparklines (defined in sim/sim_manager_topology.cpp)
     void finishTopologyRun(AppState& st, Study& s, const std::string& ownerDocId, bool uiActive);
+    void checkTopologyDfam(AppState& st, Study& s, const std::string& ownerDocId,
+                           const std::string& runId, const std::string& printProcess);
     void processTopologyActions(AppState& st);
     void refreshTopologyRunsView(AppState& st, Study& s, bool force = false);
     bool showTopologyRun(AppState& st, Study& s, const std::string& runId);
@@ -1014,7 +1017,7 @@ private:
     std::string topoGeomDocId_, topoGeomKey_;
     // Run identity carried from prep to completion (the reservation serializes runs).
     struct TopoRunMeta {
-        std::string studyId, runId, setupKey, geometryKey, label;
+        std::string studyId, runId, setupKey, geometryKey, label, printProcess;
         double startedUtc = 0.0;
         nlohmann::json settings;
     };

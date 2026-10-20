@@ -197,7 +197,8 @@ struct BsSurf {
     const char* vsing = "none";
 };
 
-KnotVec acis_knots(int nk, int deg, auto&& knot, auto&& mult, const char* what) {
+template<class Knot, class Multiplicity>
+KnotVec acis_knots(int nk, int deg, Knot&& knot, Multiplicity&& mult, const char* what) {
     KnotVec kv;
     for (int i = 1; i <= nk; ++i) {
         kv.k.push_back(knot(i));

@@ -1,0 +1,234 @@
+{
+  "executed_at": "2026-10-13",
+  "scope": "Disposable local PostgreSQL, production-mode actual gateway ASGI routes and existing isolated native hostd; fake provider sentinel, local OAuth provider-identity fixture, actual Stripe HMAC verification; no customer systems or credentials.",
+  "engine_build_id": "chudcode-runtime-v0.4.3-5-g92a4ebb71-dirty",
+  "observations": [
+    {
+      "scenario": "anonymous API rejected",
+      "actual": 401,
+      "expected": 401,
+      "pass": true
+    },
+    {
+      "scenario": "anonymous health minimal",
+      "actual": {
+        "ok": true
+      },
+      "expected": {
+        "ok": true
+      },
+      "pass": true
+    },
+    {
+      "scenario": "anonymous preregistration accepted",
+      "actual": 202,
+      "expected": 202,
+      "pass": true
+    },
+    {
+      "scenario": "OAuth start creates genuine state/cookie",
+      "actual": 302,
+      "expected": 302,
+      "pass": true
+    },
+    {
+      "scenario": "OAuth callback succeeds",
+      "actual": 303,
+      "expected": 303,
+      "pass": true
+    },
+    {
+      "scenario": "OAuth session authorized",
+      "actual": "victim@p0.invalid",
+      "expected": "victim@p0.invalid",
+      "pass": true
+    },
+    {
+      "scenario": "preregistered password remains unusable",
+      "actual": 401,
+      "expected": 401,
+      "pass": true
+    },
+    {
+      "scenario": "stale verification link rejected",
+      "actual": 400,
+      "expected": 400,
+      "pass": true
+    },
+    {
+      "scenario": "stale recovery link rejected",
+      "actual": 400,
+      "expected": 400,
+      "pass": true
+    },
+    {
+      "scenario": "native handshake returns contained contract",
+      "actual": [
+        "hello",
+        "ping"
+      ],
+      "expected": [
+        "hello",
+        "ping"
+      ],
+      "pass": true
+    },
+    {
+      "scenario": "native handshake hides global recovery",
+      "actual": true,
+      "expected": true,
+      "pass": true
+    },
+    {
+      "scenario": "native ping succeeds",
+      "actual": {
+        "ok": true
+      },
+      "expected": {
+        "ok": true
+      },
+      "pass": true
+    },
+    {
+      "scenario": "process spawn denied",
+      "actual": -32601,
+      "expected": -32601,
+      "pass": true
+    },
+    {
+      "scenario": "provider credential resolution denied",
+      "actual": -32601,
+      "expected": -32601,
+      "pass": true
+    },
+    {
+      "scenario": "ambient sentinel not disclosed",
+      "actual": true,
+      "expected": true,
+      "pass": true
+    },
+    {
+      "scenario": "model code execution denied",
+      "actual": -32601,
+      "expected": -32601,
+      "pass": true
+    },
+    {
+      "scenario": "NUL path rejected before daemon",
+      "actual": -32700,
+      "expected": -32700,
+      "pass": true
+    },
+    {
+      "scenario": "multiline injection rejected",
+      "actual": -32700,
+      "expected": -32700,
+      "pass": true
+    },
+    {
+      "scenario": "liveness after rejected requests",
+      "actual": {
+        "ok": true
+      },
+      "expected": {
+        "ok": true
+      },
+      "pass": true
+    },
+    {
+      "scenario": "no process or model marker created",
+      "actual": false,
+      "expected": false,
+      "pass": true
+    },
+    {
+      "scenario": "browser performance probe uses contained contract",
+      "actual": [
+        "hello",
+        "ping"
+      ],
+      "expected": [
+        "hello",
+        "ping"
+      ],
+      "pass": true
+    },
+    {
+      "scenario": "normal verified-password login",
+      "actual": 200,
+      "expected": 200,
+      "pass": true
+    },
+    {
+      "scenario": "dormant session cannot revive after reinstatement",
+      "actual": 401,
+      "expected": 401,
+      "pass": true
+    },
+    {
+      "scenario": "real HMAC-validated checkout webhook",
+      "actual": 200,
+      "expected": 200,
+      "pass": true
+    },
+    {
+      "scenario": "billing leaves suspended status authoritative",
+      "actual": "suspended",
+      "expected": "suspended",
+      "pass": true
+    },
+    {
+      "scenario": "billing preserves operator decision",
+      "actual": [
+        "fixture-operator",
+        "fixture decision",
+        1791900857.586021
+      ],
+      "expected": [
+        "fixture-operator",
+        "fixture decision",
+        1791900857.586021
+      ],
+      "pass": true
+    },
+    {
+      "scenario": "billing updates purchased plan",
+      "actual": "studio",
+      "expected": "studio",
+      "pass": true
+    },
+    {
+      "scenario": "billing updates subscription",
+      "actual": "sub_fixture",
+      "expected": "sub_fixture",
+      "pass": true
+    }
+  ],
+  "result": "pass",
+  "limits": [
+    "Browser CAD and agent RPCs deliberately unavailable under the P0 containment contract.",
+    "Existing dirty hostd binary, not a clean build attestation.",
+    "Operational/staging/signing/tenant-worker gates remain open."
+  ],
+  "verification": {
+    "gateway_suite": {
+      "command": "env -u CHUDWARE_TEST_DB_URL Webservice/gateway/.venv/bin/python -m pytest Webservice/gateway/tests -q --disable-warnings --maxfail=8",
+      "passed": 814,
+      "skipped": 29,
+      "warnings": 19
+    },
+    "post_cleanup_regressions": {
+      "command": "env -u CHUDWARE_TEST_DB_URL Webservice/gateway/.venv/bin/python -m pytest Webservice/gateway/tests/test_engine_bridge.py Webservice/gateway/tests/test_provider_keys.py -q --disable-warnings",
+      "passed": 55,
+      "warnings": 5
+    },
+    "runtime_smoke": {
+      "observations_passed": 28,
+      "gateway_transport": "Actual production-mode FastAPI ASGI routes through TestClient; no Uvicorn/edge/browser verification",
+      "daemon_binary": "core/build-occt-linux/bin/chudware-hostd",
+      "engine_library": "core/build-occt-linux/bin/libchudware.so",
+      "temporary_script_removed": true,
+      "isolated_processes_and_data_cleaned": true
+    }
+  }
+}

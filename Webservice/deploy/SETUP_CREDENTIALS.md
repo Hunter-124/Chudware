@@ -25,7 +25,8 @@ customers into a static page. Use the `app.` host everywhere below.
 Local development instead uses `http://127.0.0.1:8300`, and every URI below
 changes to match.
 
-All values live in one gitignored, mode-600 file:
+Gateway environment values (not the entitlement signing key) live in one
+gitignored, mode-600 file:
 
 | Deployment | File |
 |---|---|
@@ -42,6 +43,24 @@ unquoted `CHUDWARE_MAIL_FROM=Chudware <noreply@chudware.com>` is a shell
 redirection: the source aborts on a syntax error and **every variable after that
 line silently goes unset**. Verify with `bash -c 'set -a; . gateway.env'` after
 editing.
+
+### Online entitlement signing credential
+
+Run `Webservice/deploy/provision_entitlement_credential.sh prod` as the production
+service account, supplying exactly 32 raw bytes on stdin from the owner's secure
+key source. Staging must use its dedicated `chudware-staging` account and
+`/var/lib/chudware-staging` home with the `staging` argument; it cannot provision
+production credentials. Do not put key bytes in argv, shell variables, or env
+files. Use `--replace` only for an intentional rotation.
+
+The helper validates the bounded input in memory, then streams it to
+`systemd-creds encrypt` on stdin. It never creates a plaintext temporary file;
+only the encrypted output is staged in the user-owned mode-700
+`~/.config/credstore.encrypted` directory before atomic mode-600 placement.
+Failed encryption leaves the previous encrypted credential intact and removes
+the encrypted temporary output. The gateway's existing startup checks still
+require a private, correctly owned signing credential whose public half matches
+the shipped entitlement root; provisioning does not bypass those checks.
 
 ## 1. Session secret — REQUIRED
 

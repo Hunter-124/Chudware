@@ -79,7 +79,7 @@ std::string build_resc(const std::string& elf_path, const std::string& platform_
                        const std::vector<std::pair<double, std::string>>& scenario_timeline);
 
 // Top-level entry (emulator.py::run_simulation): pick Renode (with matching
-// platform) or the QEMU semihosting fallback; graceful when neither exists.
+// platform) or the QEMU UART fallback, without semihosting host services.
 // `scenario` is a validated aicad.fwscenario/1 dict or null.
 SimResult run_simulation(const std::string& elf_path, const std::string& mcu_family,
                          const std::vector<std::string>& assertions, double timeout_s = 30.0,

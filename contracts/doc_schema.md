@@ -671,3 +671,75 @@ A `fix` constraint pins the entity at its authored coordinates. When `sketch_add
 adds a `fix`, the op first moves the authored coordinates of every entity to the solved
 geometry (only if the sketch converges). Thus the fix locks the shape that the readback shows.
 A `fix` that comes in through `add_feature` or `edit_feature` keeps the authored coordinates.
+
+## Fillet on an edge shared by two bodies (append-only, 2026-10-12)
+
+Bodies that meet only along a line (zero clearance under the contact rule of "Solid feature
+modes") share that edge; an `add`/`boss` keeps them in one result as two solids. A `fillet`
+whose explicit `edges` include such an edge fills every concave corner around it (each corner
+under 180°) with rolling-ball fillet material of the feature's radius, and fuses that material
+in, so the two solids become one solid. Ordinary edges in the same feature round as usual.
+The shared edge must be straight or circular, and its four faces must run straight away from
+it (planes, cylinders, cones). Otherwise the feature fails with that reason. It also fails by
+name when the radius does not fit those faces. A positive clearance is not a shared edge;
+such bodies stay separate.
+
+## Sketch relation set v2, virtual axes and external reference kinds (append-only, 2026-10-16)
+
+Extends §3.2/§3.3/§3.5. Earlier rows stay valid; where they disagree, this section wins.
+
+**Virtual handles.** Besides `origin` (fixed point at the sketch origin), `axis.h` and `axis.v` are
+fixed lines through the origin along the sketch +u / +v axes. They carry no variables and are
+valid wherever a line ref is (parallel, perpendicular, collinear, angle, symmetric axis,
+point_on, distance).
+
+**Relations** (`refs` arity and kinds; the validator rejects other entity types by name):
+
+| type | refs | meaning |
+|---|---|---|
+| `intersection` | point, curve, curve | the point lies on both curves (line infinite; circle/arc/ellipse/ellipse_arc/parabola/conic/spline full curve) |
+| `midpoint` | point, line \| arc | arc: the mid-sweep point |
+| `concentric` | 2 × circle/arc/ellipse/ellipse_arc/arc_slot or point handle | a point handle sits at the other's center; lines are rejected |
+| `equal` | same family | adds ellipse/ellipse_arc (rx and ry), slot (length and width), arc_slot (radius and width) |
+| `equal_curve_length` | line \| arc, line \| arc | equal curve length (arc length = r·\|sweep\|) |
+| `tangent` | 2 curves | adds full `ellipse`; a spline/style_spline endpoint handle (`start`/`end`/first-last `pK`) or an arc `start`/`end` gives endpoint (G1) tangency |
+| `smooth` | spline endpoint handle, line/circle/arc or spline endpoint handle | G1 + equal curvature (G2) at that end; does not add the coincidence |
+| `point_on` | point, entity | adds spline/style_spline |
+| `symmetric` | A, B, axis | A/B two point handles, two lines (endpoints mirrored) or two circles/arcs (centers mirrored + equal radius); axis = line or `axis.h`/`axis.v` |
+| `parallel`, `perpendicular`, `collinear`, `angle` | lines | line, slot spine, `axis.h`/`axis.v` |
+| `distance` | `[line, line]` | perpendicular distance from the second line's midpoint to the first (parallel-line dimension) |
+| `arc_length` | 1 arc | dimension: r·\|sweep\| = value (mm) |
+
+`collinear` is two normalized endpoint-to-line distances against the reference line (a fixed,
+external or virtual line when one side has one), so a free line never satisfies it by
+collapsing; `parallel`/`perpendicular` use angular residuals for the same reason.
+
+A `tangent` between two curves whose endpoints are joined by `coincident` (directly or through
+other coincident points) uses the junction (endpoint-direction) form; only unjoined curves use
+the distance form. A classic slot (2 lines + 2 arcs, joined, tangent) therefore reports DOF 0
+when dimensioned.
+
+**Skipped constraints.** Solve results carry `skipped_constraints: [{id, type, reason}]` for every
+stored constraint the solver could not apply (it never aborts the solve and never applies a
+wrong-type residual).
+
+**`params.auto_define`** (optional bool on a sketch feature) records an agent/user opt-out of
+the automatic `sketch_fully_define` the MCP `add_features` path appends (doc_ops §31).
+
+**External reference kinds** (`params.external_refs[].source`, `sketch_convert` refs,
+`sketch_project_ref`/`sketch_project_entities`):
+
+| source | projects to |
+|---|---|
+| `{datum:"front"\|"top"\|"right"}` | intersection line with the sketch plane (unchanged) |
+| `{datum:"axis.x"\|"axis.y"\|"axis.z"}` | the world axis projected along the sketch normal (a point when perpendicular) |
+| `{datum:"origin"}` | the projected world origin (point) |
+| `{kind:"face", selector}` | every boundary edge of the face (unchanged) |
+| `{kind:"edge", selector}` | the edge projected along the sketch normal; oblique straight edges stay one analytic line |
+| `{kind:"edge", selector, mode:"pierce", near?:[u,v]}` | one point where the edge's 3D curve crosses the sketch plane (the isolated crossing nearest `near`, else nearest the edge midpoint); no crossing → `convert_failed`, reason `no plane crossing` |
+| `{kind:"vertex", selector}` | the projected vertex (point) |
+| `{kind:"sketch_entity", sketch, entity}` | another 2D sketch's solved entity, lifted to world and projected |
+
+Every kind is associative: each mutating rebuild strictly re-resolves it (scored selector match
+over all bodies, selectors.md thresholds) and marks it `stale` with last-good geometry when it no
+longer resolves. `mode`/`near` persist in `source`.

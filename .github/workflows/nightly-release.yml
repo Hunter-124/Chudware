@@ -90,10 +90,14 @@ env:
 jobs:
   plan:
     name: Plan nightly version
+    if: ${{ github.ref_protected && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+    environment: chudware-control-protected
     # The gateway host (serving SSD): this job reads gateway.env and talks to
     # loopback. Metadata and API calls only; it never compiles anything, and
     # no other nightly job may route here.
-    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-livingroom]
+    runs-on:
+      group: chudware-trusted-protected
+      labels: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-livingroom]
     timeout-minutes: 10
     env:
       # Scoped to this job: no build leg sees the gateway's loopback or env file.
@@ -217,12 +221,13 @@ jobs:
   linux-beta:
     name: Linux beta AppImage
     needs: plan
-    if: needs.plan.outputs.skip != 'true'
-    # The qualified Linux build pool: the private NVMe guest
-    # (`chudware-ryzen-linux`), never the serving host. It holds no production
-    # file or credential beyond the release-token secret and publishes over TLS
-    # like the other legs.
-    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-build]
+    if: ${{ (github.ref_protected && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')) && (needs.plan.outputs.skip != 'true') }}
+    environment: chudware-release-protected
+    # Clean protected infrastructure only; never a recycled PR worker or its
+    # home/interpreter/cache. Provisioning evidence is required before signing.
+    runs-on:
+      group: chudware-trusted-protected
+      labels: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-build]
     timeout-minutes: 300
     env:
       RELEASE_VERSION: ${{ needs.plan.outputs.version }}
@@ -251,24 +256,32 @@ jobs:
           for tool in cmake ninja ctest python3 curl tar file ldd sha256sum strip rsync xvfb-run patchelf; do
             command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
           done
-          # The AppImage compiles the Python sidecars with Nuitka, which the
-          # system interpreter does not carry (PEP 668). runner-provision's
-          # provision-linux job creates this venv.
-          release_python="${HOME}/chudware-ci-tools/release-python/bin/python3"
-          # Sync the pinned release set on every run, as the Windows leg does: a new
-          # pin (a runtime package the sidecars must bundle, e.g. pycolmap) reaches
-          # this runner without a re-provision, and a failed sync stops the job here
-          # instead of 30 minutes later in Nuitka. Near-instant when already satisfied.
-          if [ -x "${release_python}" ] && ! "${release_python}" -m pip install --quiet \
-              --disable-pip-version-check -r packaging/requirements-release.txt; then
-            missing+=("release-python-sync-of-packaging/requirements-release.txt")
-          fi
-          if [ -x "${release_python}" ] && "${release_python}" -c 'import nuitka, cryptography, yaml' >/dev/null 2>&1; then
-            echo "CHUDWARE_RELEASE_PYTHON=${release_python}" >> "$GITHUB_ENV"
-            echo "release python: $("${release_python}" --version) with nuitka"
-          else
-            missing+=("release-python-with-packaging/requirements-release.txt")
-          fi
+          # Only an image-qualified base interpreter may create the signing/
+          # compiler runtime. Authenticate every wheel and compiler tool before
+          # use; never sync public pip packages into persistent release Python.
+          : "${CHUDWARE_CI_BASE_PYTHON:?qualify and export the protected image base Python}"
+          : "${CHUDWARE_WHEELHOUSE:?provide the reviewed complete offline release wheelhouse}"
+          case "${CHUDWARE_CI_BASE_PYTHON}" in
+            /*) ;; *) echo '::error::base Python must be an absolute image-qualified path'; exit 1 ;;
+          esac
+          case "${CHUDWARE_WHEELHOUSE}" in
+            /*) ;; *) echo '::error::wheelhouse must be an absolute reviewed path'; exit 1 ;;
+          esac
+          test -x "${CHUDWARE_CI_BASE_PYTHON}"
+          for variable in $(compgen -e); do
+            case "${variable}" in PYTHON*|LD_*|DYLD_*) unset "${variable}" ;; esac
+          done
+          venv="${RUNNER_TEMP}/release-python"
+          VENV_DIR="${venv}" PYTHON="${CHUDWARE_CI_BASE_PYTHON}" \
+            CHUDWARE_WHEELHOUSE="${CHUDWARE_WHEELHOUSE}" bash scripts/provision_venv.sh
+          release_python="${venv}/bin/python3"
+          "${CHUDWARE_CI_BASE_PYTHON}" -I -S -c \
+            'import sys; sys.path.insert(0, sys.argv[1]); from services.installer.provision import main; sys.exit(main(sys.argv[2:]))' \
+            "${PWD}" --check-inputs --venv-dir "${venv}" --base-python "${CHUDWARE_CI_BASE_PYTHON}" \
+            --wheelhouse "${CHUDWARE_WHEELHOUSE}"
+          "${release_python}" -c 'import nuitka, cryptography, yaml'
+          echo "CHUDWARE_RELEASE_PYTHON=${release_python}" >> "$GITHUB_ENV"
+          echo "${venv}/bin" >> "$GITHUB_PATH"
           set -- ensure --target linux-x86_64 \
             --cache-dir "${HOME}/chudware-ci-tools/chudcode" \
             --github-token-env CHUDWARE_RUNTIME_RELEASE_TOKEN \
@@ -314,11 +327,10 @@ jobs:
             -DCHUDWARE_PROTECTED_ASSETS_DIR="${GITHUB_WORKSPACE}/${protected_assets}"
           cmake --build --preset "${CORE_PRESET}"
 
-          # The shipped build has the CEF webview on; the SDK is provisioned on
-          # the runner outside the repo (fresh checkouts carry no extern/cef).
-          cef_root="$(ls -d "${HOME}"/chudware-cef-sdk/cef_binary_* 2>/dev/null | sort | tail -1 || true)"
-          [ -n "${cef_root}" ] || {
-            echo "::error::no CEF SDK under ${HOME}/chudware-cef-sdk — the release build needs CHUDWARE_ENABLE_CEF=ON and cef.cmake only searches extern/cef without CEF_ROOT"; exit 1; }
+          # Reauthenticate the exact pinned SDK immediately before CMake;
+          # never select the newest unchecked extracted cache directory.
+          cef_root="$(bash scripts/fetch_cef_posix.sh \
+            --destination-root "${RUNNER_TEMP}/cef-authenticated-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")"
 
           cmake -S host -B "${HOST_BUILD_DIR}" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -347,19 +359,10 @@ jobs:
           . "${RUNNER_TEMP}/gw.sh"
           ci_status testing "ctest core + host"
 
-          log="${RUNNER_TEMP}/ctest.log"
-          ctest --test-dir "build/${CORE_PRESET}/core" --timeout 900 --output-on-failure 2>&1 | tee "${log}"
-          ctest --test-dir "${HOST_BUILD_DIR}" --timeout 900 --output-on-failure 2>&1 | tee -a "${log}"
-          if grep -qE 'No tests were found' "${log}"; then
-            echo "::error::a configure registered no tests; the platform-test evidence would be a lie"
-            exit 1
-          fi
-          {
-            echo '## ctest -- linux beta'
-            echo '```text'
-            tail -n 30 "${log}"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          "${CHUDWARE_RELEASE_PYTHON}" scripts/run_release_ctest.py \
+            --core-dir "build/${CORE_PRESET}/core" --host-dir "${HOST_BUILD_DIR}" \
+            --out "${RUNNER_TEMP}/test-results"
+          cat "${RUNNER_TEMP}/test-results/test-results.json" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Headless GUI smoke capture (advisory)
         shell: bash
@@ -413,9 +416,9 @@ jobs:
             --libchudware-bin "build/${CORE_PRESET}/bin/libchudware.so" \
             --chud-bin "${CHUDWARE_CHUD_BIN}"
 
-          # The finalizer re-verifies the prepared tree against exactly these
-          # locked inputs and commands, so record them the way release.yml does.
-          printf '%s\n' 'ctest core' 'ctest host' > "${out}/test-commands.txt"
+          # Retain actual process results, JUnit counts and logs for independent
+          # finalizer verification; command labels alone are not test evidence.
+          cp "${RUNNER_TEMP}/test-results/"* "${out}/"
           mkdir -p "${out}/packaging" "${out}/vendor/chudcode"
           cp CMakePresets.json "${out}/CMakePresets.json"
           cp packaging/requirements-release.txt "${out}/packaging/requirements-release.txt"
@@ -423,7 +426,8 @@ jobs:
           python3 - "${out}" <<'PY'
           import hashlib, json, os, pathlib, sys
           root = pathlib.Path(sys.argv[1])
-          names = ('CMakePresets.json', 'packaging/requirements-release.txt', 'vendor/chudcode/CHUDCODE_ARTIFACT.lock')
+          names = ('CMakePresets.json', 'packaging/requirements-release.txt', 'vendor/chudcode/CHUDCODE_ARTIFACT.lock',
+                   'test-results.json', 'core-junit.xml', 'host-junit.xml', 'core-ctest.log', 'host-ctest.log')
           handoff = {
               'schema': 'chudware-offline-handoff-v1',
               'commit': os.environ['RELEASE_COMMIT'],
@@ -450,9 +454,7 @@ jobs:
             sign payload "${request}" > /dev/null
           echo "payload manifest signed with ${CHUDWARE_RELEASE_KEY_ID}"
 
-      - name: Finalize the AppImage and sign the artifact and evidence
-        env:
-          CHUDWARE_RELEASE_CI_KEY: ${{ secrets.CHUDWARE_RELEASE_CI_KEY }}
+      - name: Finalize the AppImage with complete retained test evidence
         shell: bash
         run: |
           set -euo pipefail
@@ -463,11 +465,8 @@ jobs:
           rm -rf "${final}"
 
           # finalize_release.py embeds the payload signature, builds the AppImage,
-          # then generates SBOM/provenance/platform-test evidence and every
-          # remaining signing request. Evidence generation is the LAST stage, so a
-          # failure there still leaves a complete, signed AppImage: a beta may ship
-          # without an evidence bundle (promotion to stable may not), and that is a
-          # loud warning rather than a silent omission.
+          # Any native packaging, verification or evidence failure stops signing
+          # and publication, even if the builder left an AppImage behind.
           # Captured to a file and echoed back, because GitHub's log storage has dropped
           # this step's blob twice (BlobNotFound on download, and the runner's own page
           # log holds only the command template) -- leaving a 45-minute build with an
@@ -480,77 +479,29 @@ jobs:
             --release-public-key "${public_key_b64}" \
             --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" \
             --version "${RELEASE_VERSION}" --commit "${RELEASE_COMMIT}" --channel beta \
-            --locked-input CMakePresets.json \
-            --locked-input packaging/requirements-release.txt \
-            --locked-input vendor/chudcode/CHUDCODE_ARTIFACT.lock \
-            --command 'ctest core' --command 'ctest host' \
+            --handoff-metadata "${RUNNER_TEMP}/prepared/handoff.json" \
             --out "${final}" > "${finalize_log}" 2>&1 || status=$?
           cat "${finalize_log}"
 
-          artifact="$(find "${final}" -type f -name "Chudware-${RELEASE_VERSION}-linux-x86_64.AppImage" -print -quit || true)"
-          if [ -z "${artifact}" ]; then
-            echo "::group::finalize_release.py output (last 200 lines)"
-            tail -n 200 "${finalize_log}" || true
-            echo "::endgroup::"
-            # Step summaries are stored separately from job logs and have survived every
-            # blob loss so far, so the reason lands there too.
+          if [ "${status}" -ne 0 ]; then
             {
               echo "### finalize_release.py failed (exit ${status})"
               echo '```'
-              tail -n 60 "${finalize_log}" || true
+              tail -n 60 "${finalize_log}"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::finalize_release.py failed before producing the AppImage (exit ${status}): $(tail -n 1 "${finalize_log}" 2>/dev/null)"
-            exit 1
+            echo "::error::finalize_release.py failed (exit ${status}); retained output is not signable"
+            exit "${status}"
           fi
-          evidence=1
-          if [ "${status}" -ne 0 ]; then
-            echo "::warning::release evidence generation failed (finalize exit ${status}); publishing this beta WITHOUT an evidence bundle, so it cannot be promoted to stable until a later build succeeds"
-            evidence=0
-          fi
+          artifact="$(find "${final}" -type f -name "Chudware-${RELEASE_VERSION}-linux-x86_64.AppImage" -print -quit)"
+          test -s "${artifact}" || { echo '::error::successful finalization did not produce the AppImage'; exit 1; }
+          dir="${final}/evidence"
+          for name in sbom.cdx.json provenance.slsa.json platform-test.v1.json; do
+            test -s "${dir}/${name}" && test -s "${dir}/${name}.signing-request.bin" || {
+              echo "::error::successful finalization omitted ${name} or its signing request"; exit 1; }
+          done
           echo "ARTIFACT=${artifact}" >> "$GITHUB_ENV"
-          echo "HAS_EVIDENCE=${evidence}" >> "$GITHUB_ENV"
 
-          # Sign the artifact identity twice over the same bytes: the beta version
-          # published now, and the stable version /admin will promote to.
-          "${CHUDWARE_RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
-            --output "${RUNNER_TEMP}/artifact.sig" \
-            artifact --key-id "${CHUDWARE_RELEASE_KEY_ID}" --version "${RELEASE_VERSION}" \
-            --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --artifact "${artifact}" \
-            --request-out "${RUNNER_TEMP}/artifact-request.bin" > /dev/null
-          "${CHUDWARE_RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
-            --output "${RUNNER_TEMP}/artifact-stable.sig" \
-            artifact --key-id "${CHUDWARE_RELEASE_KEY_ID}" --version "${RELEASE_STABLE_VERSION}" \
-            --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --artifact "${artifact}" > /dev/null
-
-          # The finalizer bound its own copy of the beta preimage; if the two ever
-          # disagreed the gateway would reject one of them, so compare them here.
-          emitted="${artifact}.artifact-signing-request.bin"
-          if [ -f "${emitted}" ]; then
-            cmp -s "${emitted}" "${RUNNER_TEMP}/artifact-request.bin" || {
-              echo '::error::finalizer and ci_sign disagree about the artifact preimage'; exit 1; }
-          fi
-
-          if [ "${evidence}" = 1 ]; then
-            dir="${final}/evidence"
-            for pair in 'sbom.cdx.json:sbom' 'provenance.slsa.json:provenance' 'platform-test.v1.json:platform-test'; do
-              name="${pair%%:*}"
-              kind="${pair##*:}"
-              "${CHUDWARE_RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
-                --output "${dir}/${name}.sig" \
-                sign "${kind}" "${dir}/${name}.signing-request.bin" > /dev/null
-            done
-            # The platform-test document is only honest if it names the suites that
-            # actually ran in this job.
-            python3 - "${dir}/platform-test.v1.json" <<'PY'
-          import json, sys
-          document = json.load(open(sys.argv[1], encoding="utf-8"))
-          missing = {"ctest core", "ctest host"} - set(document.get("commands", []))
-          if missing or document.get("passed") is not True:
-              raise SystemExit("platform-test evidence does not record the executed suites: %s" % sorted(missing))
-          PY
-            echo "evidence signed: sbom, provenance, platform-test"
-          fi
 
       - name: Verify the built AppImage before it is offered to anyone
         shell: bash
@@ -614,6 +565,35 @@ jobs:
           cp "${root}/payload-manifest.v1.json" "${work}/payload-manifest.v1.json"
           cp "${root}/payload-manifest.v1.sig" "${work}/payload-manifest.v1.sig"
 
+      - name: Sign the verified AppImage artifact pair and evidence
+        env:
+          CHUDWARE_RELEASE_CI_KEY: ${{ secrets.CHUDWARE_RELEASE_CI_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact="${ARTIFACT}"
+          dir="${RUNNER_TEMP}/final/evidence"
+          "${CHUDWARE_RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
+            --output "${RUNNER_TEMP}/artifact.sig" \
+            artifact --key-id "${CHUDWARE_RELEASE_KEY_ID}" --version "${RELEASE_VERSION}" \
+            --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --artifact "${artifact}" \
+            --request-out "${RUNNER_TEMP}/artifact-request.bin" > /dev/null
+          "${CHUDWARE_RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
+            --output "${RUNNER_TEMP}/artifact-stable.sig" \
+            artifact --key-id "${CHUDWARE_RELEASE_KEY_ID}" --version "${RELEASE_STABLE_VERSION}" \
+            --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --artifact "${artifact}" > /dev/null
+          emitted="${artifact}.artifact-signing-request.bin"
+          test -s "${emitted}" || { echo '::error::finalizer omitted the artifact preimage'; exit 1; }
+          cmp -s "${emitted}" "${RUNNER_TEMP}/artifact-request.bin" || {
+            echo '::error::finalizer and ci_sign disagree about the artifact preimage'; exit 1; }
+          for pair in 'sbom.cdx.json:sbom' 'provenance.slsa.json:provenance' 'platform-test.v1.json:platform-test'; do
+            name="${pair%%:*}"
+            kind="${pair##*:}"
+            "${CHUDWARE_RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
+              --output "${dir}/${name}.sig" \
+              sign "${kind}" "${dir}/${name}.signing-request.bin" > /dev/null
+          done
+
       - name: Package the verified tree as .deb and .rpm
         env:
           CHUDWARE_RELEASE_CI_KEY: ${{ secrets.CHUDWARE_RELEASE_CI_KEY }}
@@ -660,18 +640,16 @@ jobs:
               "notes_url": os.environ["CHUDWARE_RELEASE_NOTES_URL"],
               "commit_sha": os.environ["RELEASE_COMMIT"],
           }
-          if os.environ.get("HAS_EVIDENCE") == "1":
-              # The same local files gw_upload_release sent beside the artifact.
-              directory = pathlib.Path(sys.argv[5])
-              evidence = {}
-              for field, name in (
-                  ("sbom", "sbom.cdx.json"),
-                  ("provenance", "provenance.slsa.json"),
-                  ("platform_test", "platform-test.v1.json"),
-              ):
-                  evidence[field + "_sha256"] = digest(directory / name)
-                  evidence[field + "_signature_sha256"] = digest(directory / (name + ".sig"))
-              body["evidence"] = evidence
+          directory = pathlib.Path(sys.argv[5])
+          evidence = {}
+          for field, name in (
+              ("sbom", "sbom.cdx.json"),
+              ("provenance", "provenance.slsa.json"),
+              ("platform_test", "platform-test.v1.json"),
+          ):
+              evidence[field + "_sha256"] = digest(directory / name)
+              evidence[field + "_signature_sha256"] = digest(directory / (name + ".sig"))
+          body["evidence"] = evidence
           json.dump(body, sys.stdout)
           PY
 
@@ -720,11 +698,13 @@ jobs:
           # format would be reported "published" from an upload that never happened.
           publish_release_file() {
             local source="$1" name="$2" format="$3" prefix="$4" evidence=""
+            case "${format}" in
+              default) evidence="${RUNNER_TEMP}/final/evidence" ;;
+              deb|rpm) evidence="${RUNNER_TEMP}/evidence-${format}" ;;
+              *) echo "::error::unsupported release format ${format}"; return 1 ;;
+            esac
             local body="${RUNNER_TEMP}/publish-${format}.json"
             local response="${RUNNER_TEMP}/publish-response-${format}.json"
-            if [ "${HAS_EVIDENCE}" = 1 ]; then
-              evidence="${RUNNER_TEMP}/final/evidence"
-            fi
             gw_upload_release "${source}" "${name}" "${RUNNER_TEMP}/verify" "${evidence}" \
               || return 1
             python3 "${RUNNER_TEMP}/publish_body.py" "${source}" "${prefix}.sig" \
@@ -738,57 +718,47 @@ jobs:
           . "${RUNNER_TEMP}/gw.sh"
           . "${RUNNER_TEMP}/pkg.sh"
 
-          # ------------------------------------------------------------------
-          # The packages themselves. Everything below is best-effort ON PURPOSE:
-          # the AppImage is the release, .deb/.rpm are additive routing formats,
-          # and a runner without rpmbuild or a packaging regression must not cost
-          # the nightly its AppImage. Failures are ::warning:: annotations plus a
-          # named-formats line in the step summary and in the ci/status detail,
-          # so a silently missing package is still visible in /admin.
-          # ------------------------------------------------------------------
-          missing=""
-          # Only what the deb and rpm legs actually invoke: xz compresses data.tar.xz,
-          # rpmbuild builds the rpm (its zstd payload is internal to librpm). The
-          # tar.zst format is not published by the nightly, so `zstd` is not required.
+          # All supported native formats and their artifact-specific evidence
+          # must succeed before this job publishes anything.
           for tool in rpmbuild xz; do
-            command -v "${tool}" >/dev/null 2>&1 || missing="${missing} ${tool}"
+            command -v "${tool}" >/dev/null 2>&1 || {
+              echo "::error::required native package tool missing: ${tool}"; exit 1; }
           done
-          published_formats=""
-          if [ -n "${missing}" ]; then
-            echo "::warning::runner ${RUNNER_NAME:-unknown} is missing${missing}; the Linux .deb/.rpm packages are skipped for this build (the AppImage is unaffected). Run runner-provision against this label to add them."
-          else
-            ci_status packaging "building .deb and .rpm from the verified tree"
-            root="${RUNNER_TEMP}/verify/squashfs-root"
-            out="${RUNNER_TEMP}/packages"
-            rm -rf "${out}"
-            mkdir -p "${out}"
-            # One invocation per format so a failure in one leaves the other
-            # publishable, and so each format's stage+publish stays independently
-            # retryable. The deb run also re-verifies the signed payload manifest
-            # from inside the built archive, which covers the shared staging code.
-            for format in deb rpm; do
-              name="$(canonical_name "${format}")"
-              if ! packaging/linux/build_linux_packages.sh --appdir "${root}" \
-                     --version "${RELEASE_VERSION}" --out "${out}" --format "${format}"; then
-                echo "::warning::building ${name} failed; this format will not be published"
-                continue
-              fi
-              if [ ! -s "${out}/${name}" ]; then
-                echo "::warning::${name} was not produced; this format will not be published"
-                continue
-              fi
-              # Guarded, not bare: this step runs under `set -e`, so an unguarded
-              # signing failure would abort it BEFORE the AppImage is staged and
-              # published, losing the release over an additive format.
-              if ! sign_identities "${out}/${name}" "${RUNNER_TEMP}/artifact-${format}"; then
-                echo "::warning::signing ${name} failed; this format will not be published"
-                continue
-              fi
-              published_formats="${published_formats}${published_formats:+ }${format}"
-              echo "packaged and signed ${name} ($(stat -c %s "${out}/${name}") bytes)"
+          ci_status packaging "building .deb and .rpm from the verified tree"
+          root="${RUNNER_TEMP}/verify/squashfs-root"
+          out="${RUNNER_TEMP}/packages"
+          mkdir -p "${out}"
+          for format in deb rpm; do
+            name="$(canonical_name "${format}")"
+            packaging/linux/build_linux_packages.sh --appdir "${root}" \
+              --version "${RELEASE_VERSION}" --out "${out}" --format "${format}"
+            test -s "${out}/${name}" || { echo "::error::native package output missing: ${name}"; exit 1; }
+          done
+          for format in deb rpm; do
+            name="$(canonical_name "${format}")"
+            artifact="${out}/${name}"
+            evidence="${RUNNER_TEMP}/evidence-${format}"
+            sha="$(sha256sum "${artifact}" | cut -d ' ' -f 1)"
+            "${CHUDWARE_RELEASE_PYTHON}" packaging/generate_release_evidence.py "${artifact}" \
+              --artifact-sha256 "${sha}" --version "${RELEASE_VERSION}" \
+              --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --commit "${RELEASE_COMMIT}" \
+              --locked-input CMakePresets.json --locked-input packaging/requirements-release.txt \
+              --locked-input vendor/chudcode/CHUDCODE_ARTIFACT.lock \
+              --test-results "${RUNNER_TEMP}/test-results/test-results.json" --out "${evidence}"
+            "${CHUDWARE_RELEASE_PYTHON}" packaging/windows/prepare_evidence_requests.py "${evidence}"
+          done
+          for format in deb rpm; do
+            name="$(canonical_name "${format}")"
+            evidence="${RUNNER_TEMP}/evidence-${format}"
+            sign_identities "${out}/${name}" "${RUNNER_TEMP}/artifact-${format}"
+            for pair in 'sbom.cdx.json:sbom' 'provenance.slsa.json:provenance' 'platform-test.v1.json:platform-test'; do
+              entry="${pair%%:*}"
+              kind="${pair##*:}"
+              "${CHUDWARE_RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
+                --output "${evidence}/${entry}.sig" \
+                sign "${kind}" "${evidence}/${entry}.signing-request.bin" > /dev/null
             done
-          fi
-          echo "PACKAGE_FORMATS=${published_formats}" >> "$GITHUB_ENV"
+          done
 
       - name: Upload and publish the beta release over the gateway API
         shell: bash
@@ -810,56 +780,27 @@ jobs:
             echo ''
             echo "* artifact: \`${name}\`"
             echo "* stable pair signed for: \`${RELEASE_STABLE_VERSION}\`"
-            echo "* evidence bundle: \`${HAS_EVIDENCE}\`"
+            echo '* evidence bundle: complete and signed'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload and publish the Linux packages
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
           . "${RUNNER_TEMP}/gw.sh"
           . "${RUNNER_TEMP}/pkg.sh"
 
-          # Runs AFTER the AppImage publish on purpose: the release has already
-          # shipped by the time these formats are attempted, so no packaging
-          # problem can cost the nightly its AppImage. Each format uploads
-          # immediately before it publishes, because a 422 deletes the staged
-          # artifact and the next attempt has to start from a fresh upload.
-          published=""
-          failed=""
-          for format in ${PACKAGE_FORMATS:-}; do
+          # Each upload immediately precedes publication because failed gateway
+          # validation can remove that staged artifact. Failure is a failed job,
+          # never a successful row with an omitted native format.
+          for format in deb rpm; do
             name="$(canonical_name "${format}")"
             source="${RUNNER_TEMP}/packages/${name}"
-            if [ ! -s "${source}" ]; then
-              echo "::warning::${name} is missing from the packaging output; skipping"
-              failed="${failed}${failed:+ }${format}"
-              continue
-            fi
-            if publish_release_file "${source}" "${name}" "${format}" \
-                 "${RUNNER_TEMP}/artifact-${format}"; then
-              published="${published}${published:+ }${format}"
-              echo "published ${name} as format ${format}"
-            else
-              echo "::warning::publishing ${name} (format ${format}) failed; the AppImage release is unaffected and this format can be retried by re-dispatching"
-              failed="${failed}${failed:+ }${format}"
-            fi
+            test -s "${source}" || { echo "::error::native package disappeared: ${name}"; exit 1; }
+            publish_release_file "${source}" "${name}" "${format}" "${RUNNER_TEMP}/artifact-${format}"
           done
-
-          # The ci_builds row is keyed by (run, platform, arch) and has no format
-          # dimension, so the detail string is the only place the per-format
-          # outcome can show up in /admin. Name both sets explicitly rather than
-          # letting a missing package look like a package nobody asked for.
-          detail="${ARTIFACT_NAME} published to beta; formats: default"
-          [ -n "${published}" ] && detail="${detail} ${published}"
-          [ -n "${failed}" ] && detail="${detail}; NOT published: ${failed}"
-          ci_status published "${detail}"
-          {
-            echo ''
-            echo "* package formats published: \`default${published:+ ${published}}\`"
-            if [ -n "${failed}" ]; then
-              echo "* package formats NOT published: \`${failed}\`"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          ci_status published "${ARTIFACT_NAME} published to beta; formats: default deb rpm"
+          echo '* package formats published: default deb rpm' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Report failure to the gateway
         if: always() && job.status != 'success'
@@ -904,8 +845,11 @@ jobs:
   windows-beta:
     name: Windows beta installer
     needs: plan
-    if: needs.plan.outputs.skip != 'true'
-    runs-on: [self-hosted, Windows, X64, cloudcastle-ci, cc-win-package]
+    if: ${{ (github.ref_protected && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')) && (needs.plan.outputs.skip != 'true') }}
+    environment: chudware-release-protected
+    runs-on:
+      group: chudware-trusted-protected
+      labels: [self-hosted, Windows, X64, cloudcastle-ci, cc-win-package]
     timeout-minutes: 360
     env:
       RELEASE_VERSION: ${{ needs.plan.outputs.version }}
@@ -915,6 +859,7 @@ jobs:
       RELEASE_ARCH: x86_64
       CORE_PRESET: windows-occt
       HOST_BUILD_DIR: host/build-win
+      CHUDWARE_SIGN_IDENTITY: ${{ secrets.CHUDWARE_SIGN_IDENTITY }}
       # This runner cannot route to the gateway host's LAN address, so it holds
       # the release token itself and publishes over TLS to the public origin.
       GATEWAY_TOKEN: ${{ secrets.CHUDWARE_GATEWAY_RELEASE_TOKEN }}
@@ -1011,13 +956,10 @@ jobs:
             }
           }
           if (-not $wix -or -not (Test-Path $wix)) {
-            Write-Host "::warning::wix (modern WiX Toolset) is not installed on $env:RUNNER_NAME; format msi will be skipped, format default remains publishable. Install the WiX .NET tool or set WIX."
-            "WIX_AVAILABLE=0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          } else {
-            "WIX=$wix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            "WIX_AVAILABLE=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            Write-Host "wix=$wix"
+            throw "Modern WiX Toolset is required for the complete Windows native release; qualify the image or set WIX"
           }
+          "WIX=$wix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "wix=$wix"
 
           $vsPath = $null
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -1088,16 +1030,33 @@ jobs:
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
 
-      - name: Install the release Python requirements
-        # The chudware-ci-tools python ships bare; embed_protected_assets and the
-        # sidecar compilers need pyyaml/Nuitka and friends. pip is near-instant
-        # when the pinned set is already satisfied.
+      - name: Provision authenticated release Python from offline wheels
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          python -m pip install --quiet --disable-pip-version-check -r packaging\requirements-release.txt
-          python -c "import yaml" 2>$null
-          if ($LASTEXITCODE -ne 0) { Write-Host '::error::release requirements did not install (pyyaml still missing)'; exit 1 }
+          if (-not $env:CHUDWARE_CI_BASE_PYTHON -or -not (Test-Path -LiteralPath $env:CHUDWARE_CI_BASE_PYTHON)) {
+            throw 'Qualify and export the protected image CHUDWARE_CI_BASE_PYTHON executable'
+          }
+          if (-not $env:CHUDWARE_WHEELHOUSE) { throw 'Reviewed complete offline release wheelhouse required' }
+          foreach ($inputPath in @($env:CHUDWARE_CI_BASE_PYTHON, $env:CHUDWARE_WHEELHOUSE)) {
+            if ($inputPath -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+(?:\\|$))') {
+              throw 'Base Python and wheelhouse must be absolute image-qualified paths'
+            }
+          }
+          Get-ChildItem Env: | Where-Object { $_.Name -like 'PYTHON*' -or $_.Name -like 'LD_*' -or $_.Name -like 'DYLD_*' } |
+            ForEach-Object { Remove-Item -LiteralPath ("Env:" + $_.Name) }
+          $venv = Join-Path $env:RUNNER_TEMP 'release-python'
+          & $env:CHUDWARE_CI_BASE_PYTHON -I -S -c "import sys; sys.path.insert(0, sys.argv[1]); from services.installer.provision import main; sys.exit(main(sys.argv[2:]))" `
+            $env:GITHUB_WORKSPACE --base-python $env:CHUDWARE_CI_BASE_PYTHON --venv-dir $venv --wheelhouse $env:CHUDWARE_WHEELHOUSE
+          if ($LASTEXITCODE -ne 0) { throw 'Authenticated release runtime provisioning failed' }
+          $releasePython = Join-Path $venv 'Scripts\python.exe'
+          & $env:CHUDWARE_CI_BASE_PYTHON -I -S -c "import sys; sys.path.insert(0, sys.argv[1]); from services.installer.provision import main; sys.exit(main(sys.argv[2:]))" `
+            $env:GITHUB_WORKSPACE --check-inputs --venv-dir $venv --base-python $env:CHUDWARE_CI_BASE_PYTHON --wheelhouse $env:CHUDWARE_WHEELHOUSE
+          if ($LASTEXITCODE -ne 0) { throw 'Compiler wheels do not match the approved release target' }
+          & $releasePython -c "import yaml, nuitka, cryptography"
+          if ($LASTEXITCODE -ne 0) { throw 'Reviewed compiler runtime is incomplete' }
+          "CHUDWARE_RELEASE_PYTHON=$releasePython" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          (Join-Path $venv 'Scripts') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Open the authenticated channel to the gateway
         shell: powershell
@@ -1192,18 +1151,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # CEF is NOT disabled here, unlike scripts/build_windows.ps1 and the
-          # native-build compile gate: this job produces the installer customers
-          # run, and it must carry the same feature set release.yml ships. A runner
-          # without the provisioned CEF SDK fails this configure loudly instead of
-          # quietly shipping a Chudware with no web view. Fresh checkouts carry no
-          # extern/cef, so fetch the pinned SDK first (idempotent).
-          & powershell -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File scripts\fetch_cef_windows.ps1
+          # native-build compile gate: this installer must carry the shipping
+          # webview feature set rather than silently disabling CEF.
+          # Reconstruct the authenticated pinned SDK in this run's private
+          # directory; never let an older extern/cef candidate win discovery.
+          $cefDestination = Join-Path $env:RUNNER_TEMP "cef-authenticated-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          & powershell -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File scripts\fetch_cef_windows.ps1 -DestinationRoot $cefDestination
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $cefRoot = Join-Path $cefDestination 'cef_binary_149.0.6+g0d0eeb6+chromium-149.0.7827.201_windows64_minimal'
           & cmake -S host -B $env:HOST_BUILD_DIR -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DCHUDWARE_DEVELOPER_BUILD=OFF `
             -DCHUDWARE_LTO=ON `
             "-DCHUDWARE_VERSION_OVERRIDE=$env:RELEASE_VERSION" `
-            "-DCHUDWARE_PROTECTED_ASSETS_DIR=$env:GITHUB_WORKSPACE/$protected"
+            "-DCHUDWARE_PROTECTED_ASSETS_DIR=$env:GITHUB_WORKSPACE/$protected" `
+            "-DCEF_ROOT=$cefRoot"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & cmake --build $env:HOST_BUILD_DIR --parallel $env:CMAKE_BUILD_PARALLEL_LEVEL
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -1226,23 +1187,14 @@ jobs:
       - name: Run the core and host test suites
         shell: powershell
         run: |
-          $ErrorActionPreference = 'Continue'
+          $ErrorActionPreference = 'Stop'
           & (Join-Path $env:RUNNER_TEMP 'ci_status.ps1') -Status 'testing' -Detail 'ctest core + host'
-
-          $log = Join-Path $env:RUNNER_TEMP 'ctest.log'
-          ctest --test-dir "build/$env:CORE_PRESET/core" --timeout 900 --output-on-failure 2>&1 | Tee-Object -FilePath $log
-          $core = $LASTEXITCODE
-          ctest --test-dir $env:HOST_BUILD_DIR --timeout 900 --output-on-failure 2>&1 | Tee-Object -FilePath $log -Append
-          $host_status = $LASTEXITCODE
-          if (Select-String -Path $log -Pattern 'No tests were found' -Quiet) {
-            Write-Host '::error::a configure registered no tests; the platform-test evidence would be a lie'
-            exit 1
-          }
-          $tail = (Get-Content $log -Tail 30) -join "`n"
-          @('## ctest -- windows beta', '```text', $tail, '```') |
+          $results = Join-Path $env:RUNNER_TEMP 'test-results'
+          & $env:CHUDWARE_RELEASE_PYTHON scripts\run_release_ctest.py `
+            --core-dir "build/$env:CORE_PRESET/core" --host-dir $env:HOST_BUILD_DIR --out $results
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Content (Join-Path $results 'test-results.json') |
             Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-          if ($core -ne 0) { exit $core }
-          if ($host_status -ne 0) { exit $host_status }
 
       - name: Build sidecars, sign the payload, and compile the Inno installer
         env:
@@ -1312,30 +1264,20 @@ jobs:
           # The MSI harvests THIS finalized directory. It never stages or
           # rewrites payload bytes; the builder snapshots the complete tree
           # before and after WiX and deletes the MSI on any mutation.
-          $msiBuilt = $false
-          if ($env:WIX_AVAILABLE -eq '1') {
-            $msiOut = Join-Path $env:RUNNER_TEMP 'msi'
-            if (Test-Path $msiOut) { Remove-Item -Recurse -Force $msiOut }
-            & python -m services.installer.build_msi `
-              --payload (Join-Path $out 'Chudware') --out $msiOut `
-              --version $env:RELEASE_VERSION --release-public-key $publicKeyB64 `
-              --wix $env:WIX
-            if ($LASTEXITCODE -eq 0) {
-              $msiName = "Chudware-$env:RELEASE_VERSION-x86_64.msi"
-              $msi = Join-Path $msiOut $msiName
-              if (Test-Path $msi) {
-                $msiBuilt = $true
-                "MSI_ARTIFACT=$msi" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-                "MSI_ARTIFACT_NAME=$msiName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-                Write-Host "msi=$msi ($((Get-Item $msi).Length) bytes)"
-              }
-            }
-            if (-not $msiBuilt) {
-              Write-Host "::warning::building format msi failed; format default remains publishable"
-            }
+          $msiOut = Join-Path $env:RUNNER_TEMP 'msi'
+          if (Test-Path $msiOut) { Remove-Item -Recurse -Force $msiOut }
+          & python -m services.installer.build_msi `
+            --payload (Join-Path $out 'Chudware') --out $msiOut `
+            --version $env:RELEASE_VERSION --release-public-key $publicKeyB64 `
+            --wix $env:WIX
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $msiName = "Chudware-$env:RELEASE_VERSION-x86_64.msi"
+          $msi = Join-Path $msiOut $msiName
+          if (-not (Test-Path -LiteralPath $msi) -or (Get-Item -LiteralPath $msi).Length -eq 0) {
+            throw 'Native MSI build did not produce its required output'
           }
-          "MSI_BUILT=$(if ($msiBuilt) { '1' } else { '0' })" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "MSI_ARTIFACT=$msi" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "MSI_ARTIFACT_NAME=$msiName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Sign the artifact pair and generate evidence
         env:
@@ -1344,108 +1286,68 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
 
-          # Beta identity now, stable identity for the one-click promote later.
-          & python packaging\ci_sign.py --expect-public-key $env:CHUDWARE_RELEASE_CI_PUBLIC_KEY `
-            --output (Join-Path $env:RUNNER_TEMP 'artifact.sig') `
-            artifact --key-id $env:CHUDWARE_RELEASE_KEY_ID --version $env:RELEASE_VERSION `
-            --platform windows --arch x86_64 --artifact $env:ARTIFACT | Out-Null
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & python packaging\ci_sign.py --expect-public-key $env:CHUDWARE_RELEASE_CI_PUBLIC_KEY `
-            --output (Join-Path $env:RUNNER_TEMP 'artifact-stable.sig') `
-            artifact --key-id $env:CHUDWARE_RELEASE_KEY_ID --version $env:RELEASE_STABLE_VERSION `
-            --platform windows --arch x86_64 --artifact $env:ARTIFACT | Out-Null
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          # Evidence is required for promotion to stable but not for a beta publish.
-          # A failure here is a loud warning and an evidence-less beta, never a
-          # silently incomplete bundle.
-          $evidence = Join-Path $env:RUNNER_TEMP 'evidence'
-          $env:EVIDENCE_DIR = $evidence
-          $sha = (& python -c "import hashlib,os;h=hashlib.sha256();f=open(os.environ['ARTIFACT'],'rb');[h.update(c) for c in iter(lambda: f.read(1048576), b'')];print(h.hexdigest())")
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          "ARTIFACT_SHA256=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-          $ok = $true
-          & python packaging\generate_release_evidence.py $env:ARTIFACT --artifact-sha256 $sha `
-            --version $env:RELEASE_VERSION --platform windows --arch x86_64 --commit $env:RELEASE_COMMIT `
-            --locked-input CMakePresets.json --locked-input packaging/requirements-release.txt `
-            --locked-input vendor/chudcode/CHUDCODE_ARTIFACT.lock --command 'ctest core' --command 'ctest host' `
-            --passed --out $evidence
-          if ($LASTEXITCODE -ne 0) { $ok = $false }
-
-          if ($ok) {
-            # Shared by default and msi evidence; the helper imports the one
-            # authoritative signing-domain table instead of retyping domains.
-            & python packaging\windows\prepare_evidence_requests.py $evidence
-            if ($LASTEXITCODE -ne 0) { $ok = $false }
+          function Invoke-Checked([string]$Program, [string[]]$Arguments) {
+            & $Program @Arguments
+            if ($LASTEXITCODE -ne 0) { throw "$Program failed with exit code $LASTEXITCODE" }
           }
-          if ($ok) {
+          $results = Join-Path $env:RUNNER_TEMP 'test-results\test-results.json'
+          $variants = @(
+            @{ Artifact = $env:ARTIFACT; Prefix = 'artifact'; Evidence = 'evidence' },
+            @{ Artifact = $env:MSI_ARTIFACT; Prefix = 'artifact-msi'; Evidence = 'evidence-msi' }
+          )
+          $hasPublisherPolicy = $env:CHUDWARE_PLATFORM_PUBLISHER_POLICY -and $env:CHUDWARE_PLATFORM_PUBLISHER_POLICY_SIGNATURE
+          if (($env:CHUDWARE_PLATFORM_PUBLISHER_POLICY -or $env:CHUDWARE_PLATFORM_PUBLISHER_POLICY_SIGNATURE) -and -not $hasPublisherPolicy) {
+            throw 'Native publisher policy and detached signature must be paired'
+          }
+          # Validate complete native test/evidence inputs for BOTH artifacts
+          # before creating any beta/stable artifact identity signature.
+          foreach ($variant in $variants) {
+            $evidence = Join-Path $env:RUNNER_TEMP $variant.Evidence
+            $sha = (Get-FileHash -LiteralPath $variant.Artifact -Algorithm SHA256).Hash.ToLower()
+            $nativeArguments = @()
+            if ($hasPublisherPolicy -and $env:CHUDWARE_SIGN_IDENTITY) {
+              $nativeReport = Join-Path $env:RUNNER_TEMP ($variant.Evidence + '-platform-signing.v1.json')
+              Invoke-Checked $env:CHUDWARE_RELEASE_PYTHON @(
+                'packaging\finalize_release.py', 'platform-evidence', $variant.Artifact,
+                '--platform', 'windows', '--kind', 'authenticode',
+                '--platform-publisher-policy', $env:CHUDWARE_PLATFORM_PUBLISHER_POLICY,
+                '--platform-publisher-policy-signature', $env:CHUDWARE_PLATFORM_PUBLISHER_POLICY_SIGNATURE,
+                '--out', $nativeReport
+              )
+              $nativeArguments = @('--platform-signing-evidence', $nativeReport,
+                '--platform-publisher-policy', $env:CHUDWARE_PLATFORM_PUBLISHER_POLICY,
+                '--platform-publisher-policy-signature', $env:CHUDWARE_PLATFORM_PUBLISHER_POLICY_SIGNATURE)
+            }
+            $generateArguments = @(
+              'packaging\generate_release_evidence.py', $variant.Artifact,
+              '--artifact-sha256', $sha, '--version', $env:RELEASE_VERSION,
+              '--platform', 'windows', '--arch', 'x86_64', '--commit', $env:RELEASE_COMMIT,
+              '--locked-input', 'CMakePresets.json',
+              '--locked-input', 'packaging/requirements-release.txt',
+              '--locked-input', 'vendor/chudcode/CHUDCODE_ARTIFACT.lock',
+              '--test-results', $results, '--out', $evidence
+            ) + $nativeArguments
+            Invoke-Checked $env:CHUDWARE_RELEASE_PYTHON $generateArguments
+            Invoke-Checked $env:CHUDWARE_RELEASE_PYTHON @('packaging\windows\prepare_evidence_requests.py', $evidence)
+          }
+          foreach ($variant in $variants) {
+            foreach ($identity in @(@($env:RELEASE_VERSION, '.sig'), @($env:RELEASE_STABLE_VERSION, '-stable.sig'))) {
+              Invoke-Checked $env:CHUDWARE_RELEASE_PYTHON @(
+                'packaging\ci_sign.py', '--expect-public-key', $env:CHUDWARE_RELEASE_CI_PUBLIC_KEY,
+                '--output', (Join-Path $env:RUNNER_TEMP ($variant.Prefix + $identity[1])),
+                'artifact', '--key-id', $env:CHUDWARE_RELEASE_KEY_ID, '--version', $identity[0],
+                '--platform', 'windows', '--arch', 'x86_64', '--artifact', $variant.Artifact
+              )
+            }
+            $evidence = Join-Path $env:RUNNER_TEMP $variant.Evidence
             foreach ($pair in @(@('sbom.cdx.json', 'sbom'), @('provenance.slsa.json', 'provenance'), @('platform-test.v1.json', 'platform-test'))) {
-              & python packaging\ci_sign.py --expect-public-key $env:CHUDWARE_RELEASE_CI_PUBLIC_KEY `
-                --output (Join-Path $evidence ($pair[0] + '.sig')) `
-                sign $pair[1] (Join-Path $evidence ($pair[0] + '.signing-request.bin')) | Out-Null
-              if ($LASTEXITCODE -ne 0) { $ok = $false; break }
+              Invoke-Checked $env:CHUDWARE_RELEASE_PYTHON @(
+                'packaging\ci_sign.py', '--expect-public-key', $env:CHUDWARE_RELEASE_CI_PUBLIC_KEY,
+                '--output', (Join-Path $evidence ($pair[0] + '.sig')),
+                'sign', $pair[1], (Join-Path $evidence ($pair[0] + '.signing-request.bin'))
+              )
             }
           }
-          if (-not $ok) {
-            Write-Host '::warning::release evidence generation or signing failed; publishing this beta WITHOUT an evidence bundle, so it cannot be promoted to stable until a later build succeeds'
-          }
-          "HAS_EVIDENCE=$(if ($ok) { '1' } else { '0' })" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-          # MSI is an additive format. Its Ed25519 identities and evidence bind
-          # the MSI's own bytes; reusing the .exe evidence would make a false
-          # provenance claim even though the installed payload is identical.
-          $msiReady = $false
-          $msiEvidenceOk = $false
-          if ($env:MSI_BUILT -eq '1') {
-            $msiSig = Join-Path $env:RUNNER_TEMP 'artifact-msi.sig'
-            $msiStableSig = Join-Path $env:RUNNER_TEMP 'artifact-msi-stable.sig'
-            & python packaging\ci_sign.py --expect-public-key $env:CHUDWARE_RELEASE_CI_PUBLIC_KEY `
-              --output $msiSig artifact --key-id $env:CHUDWARE_RELEASE_KEY_ID `
-              --version $env:RELEASE_VERSION --platform windows --arch x86_64 `
-              --artifact $env:MSI_ARTIFACT | Out-Null
-            $betaSigned = $LASTEXITCODE -eq 0
-            if ($betaSigned) {
-              & python packaging\ci_sign.py --expect-public-key $env:CHUDWARE_RELEASE_CI_PUBLIC_KEY `
-                --output $msiStableSig artifact --key-id $env:CHUDWARE_RELEASE_KEY_ID `
-                --version $env:RELEASE_STABLE_VERSION --platform windows --arch x86_64 `
-                --artifact $env:MSI_ARTIFACT | Out-Null
-              $msiReady = $LASTEXITCODE -eq 0
-            }
-            if (-not $msiReady) {
-              Write-Host '::warning::signing format msi failed; format default remains publishable'
-            } else {
-              $msiEvidence = Join-Path $env:RUNNER_TEMP 'evidence-msi'
-              $msiSha = (Get-FileHash -LiteralPath $env:MSI_ARTIFACT -Algorithm SHA256).Hash.ToLower()
-              & python packaging\generate_release_evidence.py $env:MSI_ARTIFACT `
-                --artifact-sha256 $msiSha --version $env:RELEASE_VERSION `
-                --platform windows --arch x86_64 --commit $env:RELEASE_COMMIT `
-                --locked-input CMakePresets.json `
-                --locked-input packaging/requirements-release.txt `
-                --locked-input vendor/chudcode/CHUDCODE_ARTIFACT.lock `
-                --command 'ctest core' --command 'ctest host' --passed --out $msiEvidence
-              $msiEvidenceOk = $LASTEXITCODE -eq 0
-              if ($msiEvidenceOk) {
-                & python packaging\windows\prepare_evidence_requests.py $msiEvidence
-                $msiEvidenceOk = $LASTEXITCODE -eq 0
-              }
-              if ($msiEvidenceOk) {
-                foreach ($pair in @(@('sbom.cdx.json', 'sbom'), @('provenance.slsa.json', 'provenance'), @('platform-test.v1.json', 'platform-test'))) {
-                  & python packaging\ci_sign.py --expect-public-key $env:CHUDWARE_RELEASE_CI_PUBLIC_KEY `
-                    --output (Join-Path $msiEvidence ($pair[0] + '.sig')) `
-                    sign $pair[1] (Join-Path $msiEvidence ($pair[0] + '.signing-request.bin')) | Out-Null
-                  if ($LASTEXITCODE -ne 0) { $msiEvidenceOk = $false; break }
-                }
-              }
-              if (-not $msiEvidenceOk) {
-                Write-Host '::warning::format msi evidence generation or signing failed; publishing this beta WITHOUT an evidence bundle, so it cannot be promoted to stable'
-              }
-            }
-          }
-          "MSI_READY=$(if ($msiReady) { '1' } else { '0' })" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "MSI_HAS_EVIDENCE=$(if ($msiEvidenceOk) { '1' } else { '0' })" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Stage and publish the Windows release formats
         shell: powershell
@@ -1460,42 +1362,26 @@ jobs:
             Signature = (Join-Path $env:RUNNER_TEMP 'artifact.sig')
             StableSignature = (Join-Path $env:RUNNER_TEMP 'artifact-stable.sig')
             PayloadDir = $env:PAYLOAD_DIR
-          }
-          if ($env:HAS_EVIDENCE -eq '1') {
-            $default.EvidenceDir = Join-Path $env:RUNNER_TEMP 'evidence'
+            EvidenceDir = (Join-Path $env:RUNNER_TEMP 'evidence')
           }
           $defaultName = & packaging\windows\publish_release.ps1 @default
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $publishedFormats = @('default')
-          $failedFormats = @()
 
-          # Independently stage+publish the additive MSI. A 422 deletes only
-          # this staged artifact; retrying this helper uploads it again without
-          # touching or misreporting the already-published .exe.
-          if ($env:MSI_READY -eq '1') {
-            $msi = @{
-              Artifact = $env:MSI_ARTIFACT
-              Format = 'msi'
-              Signature = (Join-Path $env:RUNNER_TEMP 'artifact-msi.sig')
-              StableSignature = (Join-Path $env:RUNNER_TEMP 'artifact-msi-stable.sig')
-              PayloadDir = $env:PAYLOAD_DIR
-            }
-            if ($env:MSI_HAS_EVIDENCE -eq '1') {
-              $msi.EvidenceDir = Join-Path $env:RUNNER_TEMP 'evidence-msi'
-            }
-            try {
-              $msiName = & packaging\windows\publish_release.ps1 @msi
-              $publishedFormats += 'msi'
-            } catch {
-              Write-Host ('::warning::format msi stage/publish failed; format default is already published: ' + $_.Exception.Message)
-              $failedFormats += 'msi'
-            }
+          $msi = @{
+            Artifact = $env:MSI_ARTIFACT
+            Format = 'msi'
+            Signature = (Join-Path $env:RUNNER_TEMP 'artifact-msi.sig')
+            StableSignature = (Join-Path $env:RUNNER_TEMP 'artifact-msi-stable.sig')
+            PayloadDir = $env:PAYLOAD_DIR
+            EvidenceDir = (Join-Path $env:RUNNER_TEMP 'evidence-msi')
           }
-          if ($env:MSI_READY -ne '1') { $failedFormats += 'msi' }
+          $msiName = & packaging\windows\publish_release.ps1 @msi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $publishedFormats += 'msi'
 
           $namedFormats = (@('msi', 'default') | Where-Object { $publishedFormats -contains $_ }) -join ' '
-          $namedFailures = $failedFormats -join ' '
           $detail = "Windows formats published: $namedFormats"
-          if ($namedFailures) { $detail += "; NOT published: $namedFailures" }
           Write-Host $detail
           & (Join-Path $env:RUNNER_TEMP 'ci_status.ps1') -Status 'published' `
             -Detail $detail
@@ -1503,12 +1389,12 @@ jobs:
             '## Windows beta published',
             '',
             "* formats: ``$namedFormats``",
-            $(if ($namedFailures) { "* formats NOT published: ``$namedFailures``" } else { "* formats NOT published: ``none``" }),
+            '* formats NOT published: none',
             "* setup artifact: ``$($defaultName | Select-Object -Last 1)``",
-            "* MSI requested: ``$env:MSI_BUILT``",
+            '* MSI: built and signed',
             "* stable pair signed for: ``$env:RELEASE_STABLE_VERSION``",
-            "* setup evidence bundle: ``$env:HAS_EVIDENCE``",
-            "* MSI evidence bundle: ``$env:MSI_HAS_EVIDENCE``"
+            '* setup evidence bundle: complete and signed',
+            '* MSI evidence bundle: complete and signed'
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
       - name: Report failure to the gateway
@@ -1550,8 +1436,11 @@ jobs:
   macos-beta:
     name: macOS x86_64 beta app
     needs: plan
-    if: needs.plan.outputs.skip != 'true'
-    runs-on: [self-hosted, macOS, X64, cloudcastle-ci, cc-mac-intel]
+    if: ${{ (github.ref_protected && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')) && (needs.plan.outputs.skip != 'true') }}
+    environment: chudware-release-protected
+    runs-on:
+      group: chudware-trusted-protected
+      labels: [self-hosted, macOS, X64, cloudcastle-ci, cc-mac-intel]
     # The macOS core carries OCCT/Polyhedral-FEA, and the two Nuitka
     # sidecars are compiled on the Intel runner.
     timeout-minutes: 420
@@ -1563,6 +1452,8 @@ jobs:
       RELEASE_ARCH: x86_64
       CORE_PRESET: macos-x86_64
       HOST_BUILD_DIR: host/build-macos-x86_64
+      CHUDWARE_SIGN_IDENTITY: ${{ secrets.CHUDWARE_SIGN_IDENTITY }}
+      CHUDWARE_NOTARIZE_PROFILE: ${{ secrets.CHUDWARE_NOTARIZE_PROFILE }}
       # The Mac cannot route to the gateway host's LAN address, so it holds
       # the release token itself and publishes over TLS to the public origin.
       GATEWAY_TOKEN: ${{ secrets.CHUDWARE_GATEWAY_RELEASE_TOKEN }}
@@ -1626,30 +1517,30 @@ jobs:
             missing="${missing} brew"
           fi
 
-          # macOS ships python 3.9.6, which cannot even install the pinned
-          # Nuitka. packaging/macos/build_app.sh compiles the worker and MCP
-          # sidecars with Nuitka and every signature here needs cryptography, so
-          # the interpreter is chosen by capability rather than by name.
-          release_python=""
-          for candidate in "${HOME}/chudware-ci-tools/release-python/bin/python3" \
-            python3.14 python3.13 python3.12 python3.11 python3; do
-            resolved=""
-            case "${candidate}" in
-              /*) if [ -x "${candidate}" ]; then resolved="${candidate}"; fi ;;
-              *) resolved="$(command -v "${candidate}" 2>/dev/null || true)" ;;
-            esac
-            [ -n "${resolved}" ] || continue
-            "${resolved}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
-              >/dev/null 2>&1 || continue
-            "${resolved}" -c 'import cryptography, nuitka' >/dev/null 2>&1 || continue
-            release_python="${resolved}"
-            break
+          # The protected image supplies a qualified base interpreter and
+          # reviewed complete wheelhouse, never a capability-based PATH guess.
+          : "${CHUDWARE_CI_BASE_PYTHON:?qualify and export the protected image base Python}"
+          : "${CHUDWARE_WHEELHOUSE:?provide the reviewed complete offline release wheelhouse}"
+          case "${CHUDWARE_CI_BASE_PYTHON}" in
+            /*) ;; *) echo '::error::base Python must be an absolute image-qualified path'; exit 1 ;;
+          esac
+          case "${CHUDWARE_WHEELHOUSE}" in
+            /*) ;; *) echo '::error::wheelhouse must be an absolute reviewed path'; exit 1 ;;
+          esac
+          test -x "${CHUDWARE_CI_BASE_PYTHON}"
+          for variable in $(compgen -e); do
+            case "${variable}" in PYTHON*|LD_*|DYLD_*) unset "${variable}" ;; esac
           done
-          if [ -n "${release_python}" ]; then
-            echo "release-python=${release_python} ($("${release_python}" --version 2>&1))"
-          else
-            missing="${missing} python>=3.11-with-packaging/requirements-release.txt"
-          fi
+          venv="${RUNNER_TEMP}/release-python"
+          VENV_DIR="${venv}" PYTHON="${CHUDWARE_CI_BASE_PYTHON}" \
+            CHUDWARE_WHEELHOUSE="${CHUDWARE_WHEELHOUSE}" bash scripts/provision_venv.sh
+          release_python="${venv}/bin/python3"
+          "${CHUDWARE_CI_BASE_PYTHON}" -I -S -c \
+            'import sys; sys.path.insert(0, sys.argv[1]); from services.installer.provision import main; sys.exit(main(sys.argv[2:]))' \
+            "${PWD}" --check-inputs --venv-dir "${venv}" --base-python "${CHUDWARE_CI_BASE_PYTHON}" \
+            --wheelhouse "${CHUDWARE_WHEELHOUSE}"
+          "${release_python}" -c 'import cryptography, nuitka, yaml'
+          echo "${venv}/bin" >> "$GITHUB_PATH"
 
           if [ -n "${missing}" ]; then
             echo "::error::runner ${RUNNER_NAME:-unknown} is missing required tools:${missing}. Run the runner-provision workflow against this runner label (provision-macos) and re-dispatch."
@@ -1660,12 +1551,6 @@ jobs:
           # build_app.sh names the zip from `uname -m`.
           if [ "$(uname -m)" != "${RELEASE_ARCH}" ]; then
             echo "::error::this runner is $(uname -m) but the release requires ${RELEASE_ARCH}; check cc-mac-intel runner labels"
-            exit 1
-          fi
-          # Same sync as the Linux and Windows legs; see packaging/requirements-release.txt.
-          if ! "${release_python}" -m pip install --quiet --disable-pip-version-check \
-              -r packaging/requirements-release.txt; then
-            echo "::error::could not sync packaging/requirements-release.txt into ${release_python}; re-run runner-provision with runner_label=cc-mac-intel"
             exit 1
           fi
           set -- ensure --target "macos-${RELEASE_ARCH}" \
@@ -1714,11 +1599,10 @@ jobs:
             -DCHUDWARE_PROTECTED_ASSETS_DIR="${GITHUB_WORKSPACE}/${protected_assets}"
           cmake --build --preset "${CORE_PRESET}"
 
-          # The shipped build has the CEF webview on; the SDK is provisioned on
-          # the runner outside the repo (fresh checkouts carry no extern/cef).
-          cef_root="$(ls -d "${HOME}"/chudware-cef-sdk/cef_binary_* 2>/dev/null | sort | tail -1 || true)"
-          [ -n "${cef_root}" ] || {
-            echo "::error::no CEF SDK under ${HOME}/chudware-cef-sdk — the release build needs CHUDWARE_ENABLE_CEF=ON and cef.cmake only searches extern/cef without CEF_ROOT"; exit 1; }
+          # Reauthenticate the exact pinned SDK immediately before CMake;
+          # never select the newest unchecked extracted cache directory.
+          cef_root="$(bash scripts/fetch_cef_posix.sh \
+            --destination-root "${RUNNER_TEMP}/cef-authenticated-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")"
 
           cmake -S host -B "${HOST_BUILD_DIR}" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -1749,27 +1633,15 @@ jobs:
           . "${RUNNER_TEMP}/gw.sh"
           ci_status testing "ctest core + host"
 
-          log="${RUNNER_TEMP}/ctest.log"
           # mesher_advanced asserts a mesh+solve wall-clock ceiling meant to catch
           # an -O0 or DOF-blowup regression. The 2017 Intel iMac needs 114s for the
           # boss+pocket part with identical element counts and physics, so scale the
           # ceiling on this runner instead of raising it for every developer.
           export CHUDWARE_TEST_WALL_SCALE=3
-          # --timeout per test: a stalled test used to sit here until the job's
-          # own 6-hour budget expired (and, with cancel-in-progress, blocked
-          # every later nightly). 900s is ~20x the slowest suite on this Mac.
-          ctest --test-dir "build/${CORE_PRESET}/core" --timeout 900 --output-on-failure 2>&1 | tee "${log}"
-          ctest --test-dir "${HOST_BUILD_DIR}" --timeout 900 --output-on-failure 2>&1 | tee -a "${log}"
-          if grep -qE 'No tests were found' "${log}"; then
-            echo "::error::a configure registered no tests; the platform-test evidence would be a lie"
-            exit 1
-          fi
-          {
-            echo "## ctest -- macOS ${RELEASE_ARCH} beta"
-            echo '```text'
-            tail -n 30 "${log}"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          "${RELEASE_PYTHON}" scripts/run_release_ctest.py \
+            --core-dir "build/${CORE_PRESET}/core" --host-dir "${HOST_BUILD_DIR}" \
+            --out "${RUNNER_TEMP}/test-results"
+          cat "${RUNNER_TEMP}/test-results/test-results.json" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stage the immutable Chudware.app and sign its payload manifest
         env:
@@ -1797,9 +1669,7 @@ jobs:
             sign payload "${request}" > /dev/null
           echo "payload manifest signed with ${CHUDWARE_RELEASE_KEY_ID}"
 
-      - name: Seal the app into a zip, then sign the artifact pair and evidence
-        env:
-          CHUDWARE_RELEASE_CI_KEY: ${{ secrets.CHUDWARE_RELEASE_CI_KEY }}
+      - name: Seal the immutable app into its native zip
         shell: bash
         run: |
           set -euo pipefail
@@ -1829,90 +1699,6 @@ jobs:
           echo "ARTIFACT_SHA256=${sha}" >> "$GITHUB_ENV"
           echo "artifact=${artifact} sha256=${sha}"
 
-          # Sign the artifact identity twice over the same bytes: the beta
-          # version published now, and the stable version /admin will promote to.
-          "${RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
-            --output "${RUNNER_TEMP}/artifact.sig" \
-            artifact --key-id "${CHUDWARE_RELEASE_KEY_ID}" --version "${RELEASE_VERSION}" \
-            --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --artifact "${artifact}" \
-            --request-out "${RUNNER_TEMP}/artifact-request.bin" > /dev/null
-          "${RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
-            --output "${RUNNER_TEMP}/artifact-stable.sig" \
-            artifact --key-id "${CHUDWARE_RELEASE_KEY_ID}" --version "${RELEASE_STABLE_VERSION}" \
-            --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --artifact "${artifact}" > /dev/null
-
-          # build_app.sh bound its own copy of the beta preimage; if the two ever
-          # disagreed the gateway would reject one of them.
-          emitted="${artifact}.artifact-signing-request.bin"
-          if [ -f "${emitted}" ]; then
-            cmp -s "${emitted}" "${RUNNER_TEMP}/artifact-request.bin" || {
-              echo '::error::build_app.sh and ci_sign disagree about the artifact preimage'; exit 1; }
-          fi
-
-          # Evidence is required for promotion to stable but not for a beta
-          # publish. A failure here is a loud warning and an evidence-less beta,
-          # never a silently incomplete bundle.
-          evidence="${RUNNER_TEMP}/evidence"
-          rm -rf "${evidence}"
-          status=0
-          "${RELEASE_PYTHON}" packaging/generate_release_evidence.py "${artifact}" \
-            --artifact-sha256 "${sha}" --version "${RELEASE_VERSION}" \
-            --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --commit "${RELEASE_COMMIT}" \
-            --locked-input CMakePresets.json --locked-input packaging/requirements-release.txt \
-            --locked-input vendor/chudcode/CHUDCODE_ARTIFACT.lock --command 'ctest core' --command 'ctest host' \
-            --passed --out "${evidence}" || status=$?
-
-          if [ "${status}" -eq 0 ]; then
-            # A request is the evidence domain plus the exact canonical bytes.
-            # The domain table lives in packaging/sign_release.py and is
-            # imported, never retyped. The same script proves the platform-test
-            # document names the suites this job actually ran.
-            EVIDENCE_DIR="${evidence}" "${RELEASE_PYTHON}" - <<'PY' || status=$?
-          import json
-          import os
-          import pathlib
-          import sys
-
-          sys.path.insert(0, os.getcwd())
-          try:
-              from packaging.sign_release import DOMAINS
-          except ImportError:
-              # An installed distribution named `packaging` shadows the repository
-              # directory, which has no __init__.py. Import the module directly.
-              sys.path.insert(0, os.path.join(os.getcwd(), "packaging"))
-              from sign_release import DOMAINS
-
-          directory = pathlib.Path(os.environ["EVIDENCE_DIR"])
-          for name, kind in (("sbom.cdx.json", "sbom"),
-                             ("provenance.slsa.json", "provenance"),
-                             ("platform-test.v1.json", "platform-test")):
-              body = (directory / name).read_bytes()
-              (directory / (name + ".signing-request.bin")).write_bytes(DOMAINS[kind] + body)
-
-          document = json.loads((directory / "platform-test.v1.json").read_text(encoding="utf-8"))
-          missing = {"ctest core", "ctest host"} - set(document.get("commands", []))
-          if missing or document.get("passed") is not True:
-              raise SystemExit("platform-test evidence does not record the executed suites: %s" % sorted(missing))
-          PY
-          fi
-
-          if [ "${status}" -eq 0 ]; then
-            for pair in 'sbom.cdx.json:sbom' 'provenance.slsa.json:provenance' 'platform-test.v1.json:platform-test'; do
-              name="${pair%%:*}"
-              kind="${pair##*:}"
-              "${RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
-                --output "${evidence}/${name}.sig" \
-                sign "${kind}" "${evidence}/${name}.signing-request.bin" > /dev/null || { status=1; break; }
-            done
-          fi
-
-          if [ "${status}" -eq 0 ]; then
-            echo 'HAS_EVIDENCE=1' >> "$GITHUB_ENV"
-            echo "evidence signed: sbom, provenance, platform-test"
-          else
-            echo "::warning::release evidence generation or signing failed (exit ${status}); publishing this beta WITHOUT an evidence bundle, so it cannot be promoted to stable until a later build succeeds"
-            echo 'HAS_EVIDENCE=0' >> "$GITHUB_ENV"
-          fi
 
       - name: Verify the built app before it is offered to anyone
         shell: bash
@@ -1995,6 +1781,57 @@ jobs:
           cp "${app}/payload-manifest.v1.json" "${work}/payload-manifest.v1.json"
           cp "${app}/payload-manifest.v1.sig" "${work}/payload-manifest.v1.sig"
 
+      - name: Sign the verified app artifact pair and complete evidence
+        env:
+          CHUDWARE_RELEASE_CI_KEY: ${{ secrets.CHUDWARE_RELEASE_CI_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact="${ARTIFACT}"
+          evidence="${RUNNER_TEMP}/evidence"
+          set -- "${artifact}" --artifact-sha256 "${ARTIFACT_SHA256}" --version "${RELEASE_VERSION}" \
+            --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --commit "${RELEASE_COMMIT}" \
+            --locked-input CMakePresets.json --locked-input packaging/requirements-release.txt \
+            --locked-input vendor/chudcode/CHUDCODE_ARTIFACT.lock \
+            --test-results "${RUNNER_TEMP}/test-results/test-results.json" --out "${evidence}"
+          if [ -n "${CHUDWARE_PLATFORM_PUBLISHER_POLICY:-}" ] || [ -n "${CHUDWARE_PLATFORM_PUBLISHER_POLICY_SIGNATURE:-}" ]; then
+            [ -n "${CHUDWARE_PLATFORM_PUBLISHER_POLICY:-}" ] && [ -n "${CHUDWARE_PLATFORM_PUBLISHER_POLICY_SIGNATURE:-}" ] || {
+              echo '::error::native publisher policy and detached signature must be paired'; exit 1; }
+            if [ -n "${CHUDWARE_SIGN_IDENTITY:-}" ] && [ -n "${CHUDWARE_NOTARIZE_PROFILE:-}" ]; then
+              native_report="${RUNNER_TEMP}/platform-signing.v1.json"
+              "${RELEASE_PYTHON}" packaging/finalize_release.py platform-evidence "${artifact}" \
+                --platform macos --kind notarization \
+                --platform-publisher-policy "${CHUDWARE_PLATFORM_PUBLISHER_POLICY}" \
+                --platform-publisher-policy-signature "${CHUDWARE_PLATFORM_PUBLISHER_POLICY_SIGNATURE}" \
+                --out "${native_report}"
+              set -- "$@" --platform-signing-evidence "${native_report}" \
+                --platform-publisher-policy "${CHUDWARE_PLATFORM_PUBLISHER_POLICY}" \
+                --platform-publisher-policy-signature "${CHUDWARE_PLATFORM_PUBLISHER_POLICY_SIGNATURE}"
+            fi
+          fi
+          "${RELEASE_PYTHON}" packaging/generate_release_evidence.py "$@"
+          "${RELEASE_PYTHON}" packaging/windows/prepare_evidence_requests.py "${evidence}"
+          "${RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
+            --output "${RUNNER_TEMP}/artifact.sig" \
+            artifact --key-id "${CHUDWARE_RELEASE_KEY_ID}" --version "${RELEASE_VERSION}" \
+            --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --artifact "${artifact}" \
+            --request-out "${RUNNER_TEMP}/artifact-request.bin" > /dev/null
+          "${RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
+            --output "${RUNNER_TEMP}/artifact-stable.sig" \
+            artifact --key-id "${CHUDWARE_RELEASE_KEY_ID}" --version "${RELEASE_STABLE_VERSION}" \
+            --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --artifact "${artifact}" > /dev/null
+          emitted="${artifact}.artifact-signing-request.bin"
+          test -s "${emitted}" || { echo '::error::native app builder omitted the artifact preimage'; exit 1; }
+          cmp -s "${emitted}" "${RUNNER_TEMP}/artifact-request.bin" || {
+            echo '::error::build_app.sh and ci_sign disagree about the artifact preimage'; exit 1; }
+          for pair in 'sbom.cdx.json:sbom' 'provenance.slsa.json:provenance' 'platform-test.v1.json:platform-test'; do
+            name="${pair%%:*}"
+            kind="${pair##*:}"
+            "${RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_CI_PUBLIC_KEY}" \
+              --output "${evidence}/${name}.sig" \
+              sign "${kind}" "${evidence}/${name}.signing-request.bin" > /dev/null
+          done
+
       - name: Upload the app and publish over the gateway API
         shell: bash
         run: |
@@ -2002,10 +1839,7 @@ jobs:
           . "${RUNNER_TEMP}/gw.sh"
           name="Chudware-${RELEASE_VERSION}-macos-${RELEASE_ARCH}.zip"
 
-          evidence=""
-          if [ "${HAS_EVIDENCE}" = 1 ]; then
-            evidence="${RUNNER_TEMP}/evidence"
-          fi
+          evidence="${RUNNER_TEMP}/evidence"
           gw_upload_release "${ARTIFACT}" "${name}" "${RUNNER_TEMP}/verify" "${evidence}"
           echo "ARTIFACT_NAME=${name}" >> "$GITHUB_ENV"
 
@@ -2042,15 +1876,14 @@ jobs:
               "notes_url": os.environ["CHUDWARE_RELEASE_NOTES_URL"],
               "commit_sha": os.environ["RELEASE_COMMIT"],
           }
-          if os.environ.get("HAS_EVIDENCE") == "1":
-              directory = pathlib.Path(os.environ["EVIDENCE_DIR"])
-              evidence = {}
-              for field, name in (("sbom", "sbom.cdx.json"),
-                                  ("provenance", "provenance.slsa.json"),
-                                  ("platform_test", "platform-test.v1.json")):
-                  evidence[field + "_sha256"] = digest(directory / name)
-                  evidence[field + "_signature_sha256"] = digest(directory / (name + ".sig"))
-              body["evidence"] = evidence
+          directory = pathlib.Path(os.environ["EVIDENCE_DIR"])
+          evidence = {}
+          for field, name in (("sbom", "sbom.cdx.json"),
+                              ("provenance", "provenance.slsa.json"),
+                              ("platform_test", "platform-test.v1.json")):
+              evidence[field + "_sha256"] = digest(directory / name)
+              evidence[field + "_signature_sha256"] = digest(directory / (name + ".sig"))
+          body["evidence"] = evidence
           json.dump(body, sys.stdout)
           PY
 
@@ -2070,7 +1903,7 @@ jobs:
             echo ''
             echo "* artifact: \`${name}\`"
             echo "* stable pair signed for: \`${RELEASE_STABLE_VERSION}\`"
-            echo "* evidence bundle: \`${HAS_EVIDENCE}\`"
+            echo '* evidence bundle: complete and signed'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Report failure to the gateway

@@ -52,6 +52,8 @@ from typing import Any, Optional
 from .executor import default_runs_dir as _default_runs_dir
 from .graph_loader import GraphValidationError, validate_graph
 from .run_ids import validate_run_id
+from services.agent.request_context import in_cell
+from .storage import resolve_run
 
 # ---------------------------------------------------------------------------
 # Error
@@ -241,11 +243,17 @@ def dag_replan(
                            missing retry back-edge, id collision, etc.).
         GraphValidationError: if the merged graph fails aicad.dag/1 validation.
     """
-    run_id = validate_run_id(run_id)
-    base_dir: Path = runs_dir if runs_dir is not None else _default_runs_dir()
-    graph_path = base_dir / f"{run_id}.graph.json"
+    if in_cell():
+        record = resolve_run(run_id)
+        graph_path = record.graph
+    else:
+        run_id = validate_run_id(run_id)
+        base_dir = Path(runs_dir) if runs_dir is not None else _default_runs_dir()
+        graph_path = base_dir / f"{run_id}.graph.json"
 
     if not graph_path.exists():
+        if in_cell():
+            raise KeyError("not_found")
         raise FileNotFoundError(
             f"Graph sidecar not found: {graph_path}. "
             "Ensure executor.run() was called with this run_id first."

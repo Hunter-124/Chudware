@@ -6,7 +6,7 @@ import re
 import subprocess
 from urllib.parse import urlparse
 
-from . import download_dir, download_public_cad, provenance_envelope, register
+from . import download_path, download_public_cad, provenance_envelope, register
 
 SITE = "printables"
 _API = "https://api.printables.com/graphql/"
@@ -101,7 +101,10 @@ class PrintablesAdapter:
         if urlparse(direct).scheme != "https" or urlparse(direct).hostname != "files.printables.com":
             return {"ok": False, "reason": "unsupported_format", "detail": "Unexpected Printables download host.",
                     "candidates": [direct]}
-        dest = download_dir(SITE) / f"{model_id}-{chosen['id']}-{re.sub(r'[^a-zA-Z0-9._-]', '_', chosen['name'])}"
+        dest, refusal = download_path(
+            SITE, direct, filename=f"{model_id}-{chosen['id']}-{chosen['name']}")
+        if refusal is not None:
+            return refusal
         outcome = download_public_cad(direct, dest)
         if not outcome.get("ok"):
             return outcome

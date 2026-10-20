@@ -185,49 +185,24 @@ def download_public_cad(url: str, dest: Path, *, max_bytes: int = 200 * 1024 * 1
     Follow only validated public HTTPS redirects (the research HTTP policy);
     never issue a request to a private or credential-bearing endpoint.
     """
-    import httpx
-    from urllib.parse import urljoin
-    from services.research.fetch_page import OutboundPolicyError, _validate_public_url
+    from services.net.safe_http import download, OutboundPolicyError, ResponseTooLarge
 
-    current = url
-    dest.parent.mkdir(parents=True, exist_ok=True)
     saved = False
     try:
-        with httpx.Client(timeout=30.0, follow_redirects=False) as client:
-            for hop in range(7):
-                _validate_public_url(current)
-                with client.stream("GET", current) as response:
-                    if response.is_redirect:
-                        location = response.headers.get("location")
-                        if not location:
-                            return {"ok": False, "reason": "no_cad_link",
-                                    "detail": f"Redirect at {current} has no destination."}
-                        current = urljoin(current, location)
-                        continue
-                    if response.status_code >= 400:
-                        return {"ok": False, "reason": f"http_{response.status_code}",
-                                "status": response.status_code,
-                                "detail": f"HTTP {response.status_code} at {current}."}
-                    declared = response.headers.get("content-length")
-                    if declared and int(declared) > max_bytes:
-                        return {"ok": False, "reason": "too_large",
-                                "detail": f"CAD download exceeds {max_bytes} bytes."}
-                    size = 0
-                    with dest.open("wb") as output:
-                        for chunk in response.iter_bytes(chunk_size=65536):
-                            size += len(chunk)
-                            if size > max_bytes:
-                                return {"ok": False, "reason": "too_large",
-                                        "detail": f"CAD download exceeds {max_bytes} bytes."}
-                            output.write(chunk)
-                    saved = True
-                    return {"ok": True, "dest": str(dest), "url": current,
-                            "status": response.status_code, "bytes": size}
-        return {"ok": False, "reason": "no_cad_link", "detail": "Too many HTTPS redirects."}
-    except (OutboundPolicyError, ValueError) as exc:
+        response = download(url, dest, max_bytes=max_bytes, idle_timeout=30.0,
+                            max_redirects=6, schemes=("https",))
+        if response.status_code >= 400:
+            return {"ok": False, "reason": f"http_{response.status_code}",
+                    "status": response.status_code}
+        saved = True
+        return {"ok": True, "dest": str(dest), "url": response.url,
+                "status": response.status_code, "bytes": response.bytes_written}
+    except ResponseTooLarge as exc:
+        return {"ok": False, "reason": "too_large", "detail": str(exc)}
+    except OutboundPolicyError as exc:
         return {"ok": False, "reason": "unsupported_format", "detail": str(exc)}
-    except (httpx.HTTPError, OSError) as exc:
-        return {"ok": False, "reason": "no_cad_link", "detail": f"HTTPS download failed: {exc}"}
+    except (OSError, RuntimeError) as exc:
+        return {"ok": False, "reason": "no_cad_link", "detail": str(exc)}
     finally:
         if not saved:
             dest.unlink(missing_ok=True)
@@ -242,6 +217,18 @@ def download_dir(site: str) -> Path:
     d = paths.BROWSER_DOWNLOADS / slug(site)
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def download_path(site: str, url: str, *, default="download.bin",
+                  filename: str | None = None) -> tuple[Path | None, dict | None]:
+    """Return a canonical destination or the adapters' unsafe-filename refusal."""
+    from services.net.safe_http import OutboundPolicyError, safe_download_path
+
+    try:
+        return safe_download_path(download_dir(site), url, default=default,
+                                  filename=filename), None
+    except OutboundPolicyError as exc:
+        return None, {"ok": False, "reason": "unsafe_filename", "hint": str(exc)}
 
 
 # Side-effecting: each site module calls register(...) at import time. Imported here

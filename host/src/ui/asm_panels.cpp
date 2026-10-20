@@ -245,6 +245,12 @@ void AsmPanels::draw(AppState& st) {
 void AsmPanels::insertComponentWhenReady(
     AppState& st, const std::string& path, const std::string& targetDocId,
     std::function<void(bool, const std::string&)> onComplete) {
+    if (st.docLockedByAgent(targetDocId)) {
+        insertNote_ = st.agentLockReason(targetDocId);
+        st.toast(ui::ToastLevel::Warn, insertNote_);
+        if (onComplete) onComplete(false, insertNote_);
+        return;
+    }
     pendingLibraryInsert_ = {path, targetDocId, std::move(onComplete),
                              ImGui::GetTime() + 45.0, false};
     st.addLog("[asm] queued library component: " + path);
@@ -292,7 +298,7 @@ void AsmPanels::openPmGuest(AppState& st, const char* which) {
 
     // Capture `this` + which tool; body draws only while the matching flag is still open.
     st.propertyManager->openGuest(
-        title, icon,
+        st, title, icon,
         /*body=*/[this, which](AppState& s) {
             if (std::strcmp(which, "mate") == 0)              drawMateFormBody(s);
             else if (std::strcmp(which, "insert") == 0)       drawInsertBody(s);
@@ -360,7 +366,7 @@ void AsmPanels::openPmGuest(AppState& st, const char* which) {
             else if (std::strcmp(which, "explode") == 0) explodeOpen_ = false;
             else if (std::strcmp(which, "interference") == 0) interferenceOpen_ = false;
             if (s.propertyManager) s.propertyManager->closeGuest();
-        });
+        }, wantInterf || wantExplode);
 
     // Auto-front FeatureManager tab so the guest form is visible (pm->active() is true).
     st.leftPaneTab = AppState::LP_FeatureManager;
@@ -528,6 +534,11 @@ bool AsmPanels::insertComponent(
         st.addLog("[err] insert: no target assembly");
         return false;
     }
+    if (st.docLockedByAgent(targetDoc)) {
+        insertNote_ = st.agentLockReason(targetDoc);
+        st.toast(ui::ToastLevel::Warn, insertNote_);
+        return false;
+    }
 
     // If the live mirror is pointing at a different doc (user switched tabs), re-activate the
     // intended assembly so the op lands on the right document — never a part or another asm.
@@ -554,6 +565,11 @@ bool AsmPanels::insertComponent(
         insertNote_ = "Active document is not the target assembly.";
         st.addLog("[err] insert: active doc is not the target assembly (" +
                   st.docMirror.docId() + " vs " + targetDoc + ")");
+        return false;
+    }
+    if (st.docLockedByAgent(targetDoc)) {
+        insertNote_ = st.agentLockReason(targetDoc);
+        st.toast(ui::ToastLevel::Warn, insertNote_);
         return false;
     }
 
@@ -921,6 +937,11 @@ bool AsmPanels::addMate(AppState& st, const std::string& type, const std::string
                         const nlohmann::json& refs, std::string& aicmOut) {
     aicmOut.clear();
     if (!st.docMirror.hasDoc()) return false;
+    if (st.docLockedByAgent(st.docMirror.docId())) {
+        mateError_ = st.agentLockReason(st.docMirror.docId());
+        st.toast(ui::ToastLevel::Warn, mateError_);
+        return false;
+    }
     nlohmann::json mate = {
         {"type", type}, {"align", align}, {"suppressed", false}, {"value", nullptr}, {"refs", refs}};
     // ---- value object per the engine contract (schema.py MATE_VALUE_TYPES / MATE_COUPLING_SPEC) ----
@@ -1193,6 +1214,11 @@ bool AsmPanels::addPattern(AppState& st, std::string& aicmOut, std::string& erro
     aicmOut.clear();
     errorOut.clear();
     if (!st.docMirror.hasDoc()) { errorOut = "No assembly open."; return false; }
+    if (st.docLockedByAgent(st.docMirror.docId())) {
+        errorOut = st.agentLockReason(st.docMirror.docId());
+        st.toast(ui::ToastLevel::Warn, errorOut);
+        return false;
+    }
     if (patternComps_.empty()) { errorOut = "Pick at least one seed component."; return false; }
 
     const char* dirRef = kAsmDirOpts[patternDir_].ref;

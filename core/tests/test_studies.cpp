@@ -15,12 +15,15 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include <filesystem>
 #include <string>
+#include <set>
 
 #include <nlohmann/json.hpp>
 
 #include "doc/session.h"
+#include "doc/stepplus.h"
 
 using json = nlohmann::json;
 namespace doc = chudware::doc;
@@ -46,6 +49,25 @@ json sample_study() {
         {"flow", json{{"dir", 0}, {"speed", 10.0}, {"preset", 0}}},
         {"result_summary", ""},
     };
+}
+
+std::filesystem::path temporary_study_path(const std::string& label) {
+    const auto stamp = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    return std::filesystem::temp_directory_path() /
+           ("chudware_studies_" + label + "_" + std::to_string(stamp) + ".step+");
+}
+
+json summary(const std::string& doc_id) {
+    const json listed = doc::doc_list();
+    for (const json& row : listed.at("docs"))
+        if (row.value("doc_id", std::string()) == doc_id) return row;
+    return json::object();
+}
+
+std::string study_token(unsigned long long n) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "study-%08llx", n);
+    return std::string(buf);
 }
 
 }  // namespace
@@ -131,4 +153,129 @@ TEST_CASE("sim study add/edit/list/save+open/delete round-trip") {
     fs::remove(tmp, ec);
     doc::doc_close(doc_id);
     doc::doc_close(opened_id);
+}
+
+TEST_CASE("loaded study id collisions never create new duplicates or edit another analysis") {
+    const std::string seed = doc::doc_new("part", "LegacyStudyIds").at("doc_id");
+    const std::string probe = doc::doc_sim_study_add(seed, sample_study()).at("study_id");
+    const unsigned long long next = std::stoull(probe.substr(6), nullptr, 16) + 1;
+    const std::string collision = study_token(next);
+    const std::string occupied = study_token(next + 1);
+    json tree = doc::doc_tree(seed).at("tree");
+    tree["studies"] = json::array({
+        {{"id", collision}, {"type", "fea_static"}, {"name", "Static"}},
+        {{"id", collision}, {"type", "motion"}, {"name", "Motion: m75"}, {"stop", 10}},
+        {{"id", collision}, {"type", "motion"}, {"name", "Motion: m84"}, {"stop", 20}},
+        {{"id", collision}, {"type", "motion"}, {"name", "Motion: m75"}, {"stop", 15}},
+        {{"id", occupied}, {"type", "fea_modal"}, {"name", "Modal"}},
+    });
+    const auto path = temporary_study_path("legacy_ids");
+    doc::stepplus_save(tree, path.string(), {});
+    doc::doc_close(seed);
+    const std::string id = doc::doc_open(path.string(), false, true).at("doc_id");
+
+    const json added = doc::doc_sim_study_add(id, sample_study());
+    const std::string added_id = added.at("study_id");
+    CHECK(added_id != collision);
+    CHECK(added_id != occupied);
+    const json explicit_added = doc::doc_sim_study_add(id, {
+        {"id", collision}, {"type", "motion"}, {"name", "Motion: m66"}});
+    const std::string explicit_id = explicit_added.at("study_id");
+    CHECK(explicit_id != collision);
+    CHECK(explicit_id != occupied);
+    CHECK(explicit_id != added_id);
+
+    const json updated = doc::doc_sim_study_edit(id, collision, {
+        {"type", "motion"}, {"name", "Motion: m75"}, {"stop", 80}});
+    const std::string updated_id = updated.at("study_id");
+    CHECK(updated_id != collision);
+    CHECK(updated["studies"][0] == tree["studies"][0]);
+    CHECK(updated["studies"][2] == tree["studies"][2]);
+    CHECK(updated["studies"][3] == tree["studies"][3]);
+    CHECK(updated["studies"][1]["stop"] == 80);
+    CHECK(updated["studies"][1]["id"] == updated_id);
+    const std::set<std::string> new_ids = {added_id, explicit_id, updated_id, occupied};
+    CHECK(new_ids.size() == 4);
+
+    const json repeated = doc::doc_sim_study_edit(id, updated_id, {
+        {"type", "motion"}, {"name", "Renamed motion"}, {"stop", 40}});
+    CHECK(repeated.at("study_id") == updated_id);
+    CHECK(repeated["studies"][1]["stop"] == 40);
+    CHECK(repeated["studies"].size() == 7);
+    const json before_refusal = doc::doc_sim_study_list(id);
+    CHECK_THROWS_AS(doc::doc_sim_study_edit(id, collision, {
+        {"type", "motion"}, {"name", "Missing study"}}), doc::OpError);
+    CHECK(doc::doc_sim_study_list(id) == before_refusal);
+
+    doc::doc_save(id, path.string());
+    doc::doc_close(id);
+    const std::string reopened = doc::doc_open(path.string()).at("doc_id");
+    CHECK(doc::doc_sim_study_list(reopened)["studies"] == repeated["studies"]);
+    doc::doc_close(reopened);
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("detached native source authority excludes study revisions but includes authored edits") {
+    const auto source = temporary_study_path("source_authority");
+    const auto destination = temporary_study_path("explicit_save");
+    const std::string seed = doc::doc_new("part", "SourceAuthority").at("doc_id");
+    doc::doc_save(seed, source.string());
+    doc::doc_close(seed);
+    const std::string id = doc::doc_open(source.string(), false, true).at("doc_id");
+    CHECK(summary(id)["native_source_edited"] == false);
+    CHECK(summary(id)["path"].is_null());
+    const std::string sid = doc::doc_sim_study_add(id, sample_study()).at("study_id");
+    CHECK(summary(id)["native_source_edited"] == false);
+    doc::doc_sim_study_edit(id, sid, sample_study());
+    CHECK(summary(id)["native_source_edited"] == false);
+    doc::doc_sim_study_delete(id, sid);
+    CHECK(summary(id)["native_source_edited"] == false);
+
+    const auto dim = [](double value) { return json{{"value", value}, {"expr", nullptr}}; };
+    const json authored_feature = {
+        {"type", "box"}, {"name", "Authored block"},
+        {"params", {{"length", dim(10)}, {"width", dim(10)}, {"height", dim(10)}}},
+    };
+    doc::doc_apply_ops(id, -1, json::array({
+        json{{"op", "add_feature"}, {"feature", authored_feature}},
+        json{{"op", "set_material"}, {"key", "pla"}}}), false);
+    CHECK(summary(id)["native_source_edited"] == true);
+    const std::string after = doc::doc_sim_study_add(id, sample_study()).at("study_id");
+    doc::doc_sim_study_edit(id, after, sample_study());
+    CHECK(summary(id)["native_source_edited"] == true);
+    doc::doc_save(id, destination.string());
+    CHECK(summary(id)["path"] == destination.string());
+    doc::doc_close(id);
+
+    const std::string reopened = doc::doc_open(destination.string()).at("doc_id");
+    CHECK(summary(reopened)["native_source_path"].is_null());
+    CHECK(summary(reopened)["native_source_edited"] == false);
+    CHECK(summary(reopened)["path"] == destination.string());
+    CHECK(doc::doc_sim_study_list(reopened)["studies"].size() == 1);
+    doc::doc_close(reopened);
+    std::error_code ec;
+    std::filesystem::remove(source, ec);
+    std::filesystem::remove(destination, ec);
+}
+
+TEST_CASE("explicit history operations are not mistaken for scratch study revisions") {
+    const auto source = temporary_study_path("history_authority");
+    const std::string seed = doc::doc_new("part", "HistoryAuthority").at("doc_id");
+    doc::doc_save(seed, source.string());
+    doc::doc_close(seed);
+    const std::string id = doc::doc_open(source.string(), false, true).at("doc_id");
+    const json checkpoint = doc::doc_checkpoint(id);
+    doc::doc_sim_study_add(id, sample_study());
+    CHECK(summary(id)["native_source_edited"] == false);
+    SUBCASE("undo advances non-study authoring history") {
+        doc::doc_undo(id);
+    }
+    SUBCASE("revert advances non-study authoring history") {
+        doc::doc_revert(id, checkpoint.at("checkpoint"));
+    }
+    CHECK(summary(id)["native_source_edited"] == true);
+    doc::doc_close(id);
+    std::error_code ec;
+    std::filesystem::remove(source, ec);
 }

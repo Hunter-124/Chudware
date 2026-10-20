@@ -7,10 +7,10 @@ path), ``ssh``, and ``https`` — shares one fetch/CAS-push implementation built
 on ``dulwich.client.get_transport_and_path``: dulwich already dispatches the
 wire protocol (local, git+ssh, smart-http) purely from the URL string, so the
 manifest's ``kind`` field is a user-facing label only, never a transport
-switch (see ``_fetch_folder``/``_cas_push`` below). Auth is ambient
-(ssh-agent/keys for ssh; URL-embedded or netrc credentials for https, both
-dulwich defaults) — there is no credential store here (YAGNI). Auth failures
-surface as ``{ok:false, reason:"remote_auth"}``, never a traceback.
+switch (see ``_fetch_folder``/``_cas_push`` below). Destinations require explicit
+local approval via ``add_remote``; fetched manifest edits never authorize a new
+destination. URLs are credential-free; auth uses local transport credentials.
+Auth failures surface as ``{ok:false, reason:"remote_auth"}``, never a traceback.
 ``chudware-cloud`` stays reserved/config-only (contract §6.1): every sync/lock
 call against it returns ``{ok:false, reason:"reserved_remote"}``.
 
@@ -37,14 +37,15 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from dulwich import porcelain
 from dulwich.objects import Blob, Commit, Tree
 from dulwich.repo import Repo
 
-from services.plm import generic_snapshot, gitbind, history as hist, manifest, snapshot
+from services.plm import doctypes, generic_snapshot, gitbind, history as hist, manifest, snapshot
 from services.plm.vault import Vault, VaultError, _user_author
+from services.plm.git_security import SECRET_FIELDS, reject_location_credentials, valid_name, validate_location
 
 _LOG = logging.getLogger(__name__)
 
@@ -263,7 +264,11 @@ def _materialize_working_tree(project_dir: Path, repo: Repo, commit_id: bytes) -
     # Reject the entire incoming manifest before touching any working file.
     for it in m.get("items", []):
         if it.get("path"):
-            generic_snapshot.contained_path(project_dir, it["path"])
+            dest = generic_snapshot.contained_path(project_dir, it["path"])
+            if dest.exists():
+                expects_directory = doctypes.storage_form(it.get("doc_type")) == "tree"
+                if (expects_directory and not dest.is_dir()) or (not expects_directory and not dest.is_file()):
+                    raise VaultError("invalid_mode", f"item destination has incompatible type: {it['path']}")
     for it in m.get("items", []):
         iid = it["item_id"]
         path = it.get("path") or ""
@@ -284,6 +289,32 @@ def _remote_entry_by_name(m: dict[str, Any], name: str) -> dict[str, Any] | None
         if r.get("name") == name or r.get("id") == name:
             return r
     return None
+
+
+def approved_remote_url(project_dir: str | os.PathLike, entry: dict[str, Any]) -> str:
+    """Only a local add_remote call can approve a versioned destination."""
+    if entry.get("credential_repair_required"):
+        raise VaultError(
+            "remote_destination_unapproved",
+            "This remote contains legacy credentials. Replace it explicitly before sharing; "
+            "rotate exposed credentials and handle old history separately.",
+        )
+    v = Vault.open(project_dir)
+    try:
+        approvals = v.get_local_config().get("approved_remotes") or {}
+    finally:
+        v.close()
+    name = entry.get("name")
+    expected = {"kind": entry.get("kind"), "url": entry.get("url")}
+    if not valid_name(name) or approvals.get(name) != expected:
+        raise VaultError("remote_destination_unapproved",
+                         "This remote destination needs local approval. Configure it explicitly before syncing.")
+    try:
+        if entry.get("kind") == "plm-server":
+            return _normalize_live_url(entry["url"])
+        return validate_location(entry["url"])
+    except (ValueError, TypeError, KeyError) as exc:
+        raise VaultError("invalid_mode", str(exc)) from exc
 
 
 def _resolve_remote(
@@ -308,11 +339,17 @@ def _resolve_remote(
             if r.get("kind") == "folder":
                 entry = r
                 break
-    return m, (entry or {}).get("url") if entry else None, entry
+    return m, approved_remote_url(project_dir, entry) if entry else None, entry
 
 
 def _ensure_dulwich_remote(repo: Repo, name: str, url: str) -> None:
     """Idempotently register a dulwich remote in the vault config."""
+    if not valid_name(name):
+        raise VaultError("invalid_mode", "invalid remote name")
+    try:
+        validate_location(url)
+    except ValueError as exc:
+        raise VaultError("invalid_mode", str(exc)) from exc
     try:
         porcelain.remote_add(repo, name, url)
     except Exception:
@@ -376,6 +413,10 @@ def _fetch_folder(repo: Repo, remote_url: str, remote_name: str = "origin") -> d
     Also imports tracking refs under ``refs/remotes/<name>/`` and ensures
     ``refs/heads/*`` + HEAD are present after the fetch (advisor Q3.3).
     """
+    try:
+        validate_location(remote_url)
+    except ValueError as exc:
+        raise VaultError("invalid_mode", str(exc)) from exc
     _ensure_dulwich_remote(repo, remote_name, remote_url)
     try:
         result = porcelain.fetch(
@@ -458,6 +499,7 @@ def _cas_push(
         repo.refs[ref] = local_sha
 
     try:
+        validate_location(remote_url)
         client, path = get_transport_and_path(str(remote_url))
         path_b = path.encode("utf-8") if isinstance(path, str) else path
     except Exception as e:
@@ -499,6 +541,10 @@ def _cas_push(
 
 
 def _ls_remote(remote_url: str) -> dict[bytes, bytes]:
+    try:
+        validate_location(remote_url)
+    except ValueError as exc:
+        raise VaultError("invalid_mode", str(exc)) from exc
     try:
         from dulwich.client import get_transport_and_path
         client, path = get_transport_and_path(remote_url)
@@ -704,6 +750,7 @@ def _normalize_live_url(value: str) -> str:
             or authority.startswith("[::1]")
         )
         raw = ("ws://" if local else "wss://") + raw
+    reject_location_credentials(raw)
     parsed = urlsplit(raw)
     scheme = parsed.scheme.lower()
     if scheme == "http":
@@ -712,8 +759,6 @@ def _normalize_live_url(value: str) -> str:
         scheme = "wss"
     if scheme not in ("ws", "wss"):
         raise ValueError("a PLM server location must use ws:// or wss://")
-    if parsed.username is not None or parsed.password is not None:
-        raise ValueError("credentials must not be stored in a PLM server URL")
     host = parsed.hostname
     if not host:
         raise ValueError("a PLM server URL needs a host")
@@ -723,9 +768,6 @@ def _normalize_live_url(value: str) -> str:
         is_loopback = host.lower() == "localhost"
     if scheme == "ws" and not is_loopback:
         raise ValueError("ws:// is only allowed for a local PLM server; use wss://")
-    sensitive = {"token", "access_token", "bearer", "authorization"}
-    if any(key.lower() in sensitive for key, _ in parse_qsl(parsed.query, keep_blank_values=True)):
-        raise ValueError("authentication tokens must not be stored in a PLM server URL")
     lowered_host = host.lower()
     authority = f"[{lowered_host}]" if ":" in lowered_host else lowered_host
     if parsed.port is not None:
@@ -753,6 +795,8 @@ def add_remote(
         if kind not in manifest.REMOTE_KINDS:
             return _err("invalid_mode", f"unknown remote kind: {kind}")
         name = (name or "").strip() or "origin"
+        if not valid_name(name):
+            return _err("invalid_mode", "remote name must not be an option or invalid ref")
         remote_url = url if url is not None else (str(path) if path is not None else None)
 
         if kind == "chudware-cloud":
@@ -760,7 +804,10 @@ def add_remote(
         elif kind == "folder":
             if not remote_url:
                 return _err("invalid_mode", "a folder remote needs a path")
-            remote_url = str(Path(remote_url))
+            try:
+                remote_url = validate_location(str(remote_url))
+            except ValueError as exc:
+                return _err("invalid_mode", str(exc))
         elif kind == "plm-server":
             if not remote_url:
                 return _err("invalid_mode", "a PLM server remote needs a WebSocket URL")
@@ -774,6 +821,10 @@ def add_remote(
             # the wire protocol purely from the URL string — see _fetch_folder).
             if not remote_url:
                 return _err("invalid_mode", "this remote needs a location")
+            try:
+                remote_url = validate_location(str(remote_url))
+            except ValueError as exc:
+                return _err("invalid_mode", str(exc))
 
         v = Vault.open(project_dir)
         try:
@@ -810,10 +861,10 @@ def add_remote(
                 entry["reserved"] = True
             if existing is not None:
                 existing.update(entry)
-                for secret_key in (
-                    "token", "access_token", "bearer", "authorization", "password"
-                ):
-                    existing.pop(secret_key, None)
+                for secret_key in list(existing):
+                    if secret_key.casefold() in SECRET_FIELDS:
+                        existing.pop(secret_key, None)
+                existing.pop("credential_repair_required", None)
                 if kind != "chudware-cloud":
                     existing.pop("reserved", None)
                 entry = existing
@@ -822,7 +873,10 @@ def add_remote(
             m["remotes"] = remotes
             if not m.get("lock_ref"):
                 m["lock_ref"] = "refs/aicad/locks"
-            v._commit_manifest_change(m)
+            v._commit_manifest_change(m, remote_repair=True)
+            v.set_local_config({"approved_remotes": {
+                name: {"kind": kind, "url": remote_url},
+            }})
 
             if kind in ("folder", "ssh", "https") and remote_url:
                 repo = _open_vault_repo(project_dir)
@@ -876,7 +930,7 @@ def sync(project_dir: str | os.PathLike, remote: str = "origin") -> dict[str, An
             )
         if remote_kind not in ("folder", "ssh", "https"):
             return _err("invalid_mode", f"unknown remote kind: {remote_kind}")
-        remote_url = entry.get("url")
+        remote_url = approved_remote_url(project_dir, entry)
         if not remote_url:
             return _err("remote_unreachable", "this remote has no location")
         remote_name = entry.get("name") or "origin"
@@ -1240,7 +1294,7 @@ def list_locks(
             )
         if kind not in ("folder", "ssh", "https"):
             return _err("invalid_mode", "This remote type cannot provide shared locks.")
-        remote_url = entry.get("url")
+        remote_url = approved_remote_url(project_dir, entry)
         if not remote_url:
             return _err("remote_unreachable", "This remote has no shared location.")
         lock_ref = str(m.get("lock_ref") or "refs/aicad/locks").encode("utf-8")
@@ -1319,7 +1373,7 @@ def _lock_mutate(
                 )
             if remote_kind not in ("folder", "ssh", "https"):
                 return _err("invalid_mode", "This remote type cannot provide shared locks.")
-            remote_url = entry.get("url")
+            remote_url = approved_remote_url(project_dir, entry)
             if not remote_url:
                 return _err("remote_unreachable", "This remote has no shared location.")
             lock_ref = str(m.get("lock_ref") or "refs/aicad/locks").encode("utf-8")

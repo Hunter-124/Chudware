@@ -127,12 +127,14 @@ def assemble(
     }
     # Promote difficulty routing fields so node_runner._resolve_role_settings
     # and role_models see them without digging.
-    for key in ("task_class", "depth", "risk", "role", "domain_tags", "run_id"):
+    for key in ("task_class", "depth", "risk", "role", "domain_tags", "run_id", "session_id"):
         if key in node_inputs and node_inputs[key] is not None:
             pack[key] = node_inputs[key]
     # node_state may carry run_id on resume / re-entry.
     if "run_id" in node_state and node_state["run_id"] and "run_id" not in pack:
         pack["run_id"] = node_state["run_id"]
+    if node_state.get("session_id") and "session_id" not in pack:
+        pack["session_id"] = node_state["session_id"]
     if "role" in node_inputs and "role_id" not in pack:
         pack["role_id"] = node_inputs["role"]
     return pack

@@ -38,6 +38,7 @@ import hashlib
 import json
 import os
 import time
+import zipfile
 import zlib
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -184,14 +185,43 @@ def content_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _authored_container_hash(path: Path) -> str | None:
+    """sha256 over a ZIP container's authored members (name + bytes, name order).
+
+    Derived build state (cache.*, geometry.step, study results — see
+    :func:`services.plm.snapshot.is_derived_entry`) is excluded: the engine
+    rewrites it after a rebuild without touching the document, so it is not a
+    modification. ``None`` for a file that is not a readable ZIP container.
+    """
+    from services.plm.snapshot import is_derived_entry  # noqa: PLC0415 (light module)
+
+    try:
+        with zipfile.ZipFile(path) as zf:
+            h = hashlib.sha256()
+            for name in sorted(zf.namelist()):
+                if is_derived_entry(name):
+                    continue
+                h.update(name.encode("utf-8") + b"\0")
+                with zf.open(name) as member:
+                    for chunk in iter(lambda: member.read(1 << 20), b""):
+                        h.update(chunk)
+                h.update(b"\0")
+            return h.hexdigest()
+    except (OSError, zipfile.BadZipFile, RuntimeError, ValueError):
+        return None
+
+
 def file_fingerprint(path: str | os.PathLike | None) -> dict[str, Any] | None:
     """Content hash + mtime + size of a backing file on disk.
 
     Hash is primary (mtime alone gives false positives from touch/sync and
     false negatives from same-second writes); mtime/size ride along as
-    secondary signals for display. Returns ``None`` when the path is empty,
-    missing, not a regular file, or unreadable — callers treat that as
-    \"provenance unknown\", never as \"unmodified\".
+    secondary signals for display. A ZIP container (``.step+``/``.ecad+``/
+    ``.draw+``) also carries ``authored_sha256`` over its authored members only,
+    so a rewrite of derived build state alone does not read as a modification.
+    Returns ``None`` when the path is empty, missing, not a regular file, or
+    unreadable — callers treat that as \"provenance unknown\", never as
+    \"unmodified\".
     """
     if not path:
         return None
@@ -204,8 +234,12 @@ def file_fingerprint(path: str | os.PathLike | None) -> dict[str, Any] | None:
         with p.open("rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
-        return {"path": str(p), "sha256": h.hexdigest(),
-                "mtime": st.st_mtime, "size": st.st_size}
+        rec: dict[str, Any] = {"path": str(p), "sha256": h.hexdigest(),
+                               "mtime": st.st_mtime, "size": st.st_size}
+        authored = _authored_container_hash(p)
+        if authored:
+            rec["authored_sha256"] = authored
+        return rec
     except OSError:
         return None
 
@@ -1031,8 +1065,14 @@ class AiVcStore:
         recorded_mtime = (frec or {}).get("mtime")
         path = (frec or {}).get("path") or file_path or None
         cur = file_fingerprint(path) if path else None
+        recorded_authored = (frec or {}).get("authored_sha256")
         if recorded_sha and cur and cur.get("sha256"):
-            externally_modified: bool | None = cur["sha256"] != recorded_sha
+            # Containers recorded with an authored hash compare authored members only:
+            # a rewrite of derived build state (open-time cache refresh) is no edit.
+            if recorded_authored and cur.get("authored_sha256"):
+                externally_modified: bool | None = cur["authored_sha256"] != recorded_authored
+            else:
+                externally_modified = cur["sha256"] != recorded_sha
             provenance_known = True
         elif recorded_sha:
             # File unreadable/absent now — cannot verify, say so honestly.
@@ -1149,8 +1189,9 @@ def resolve_store(
     """
     candidate = str(project_dir or "").strip()
     if not candidate:
-        candidate = (os.environ.get("CHUDWARE_PROJECT_DIR", "").strip()
-                     or os.environ.get("CHUDWARE_FS_ROOT", "").strip())
+        from services.agent.request_context import root_value
+        candidate = (root_value("CHUDWARE_PROJECT_DIR").strip()
+                     or root_value("CHUDWARE_FS_ROOT").strip())
     if not candidate:
         return get_store(cfg=cfg)
     try:

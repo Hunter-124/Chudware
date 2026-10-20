@@ -185,7 +185,8 @@ def _rect_sketch(name, w, h, with_dims=True):
 def _add_rect_sketch(doc, w, h, with_dims=True, name="s1"):
     """Add a rectangle sketch and return the engine-assigned feature id (e.g. "f1")."""
     r, _ = _call("add_features",
-                 {"ops": [_rect_sketch(name, w, h, with_dims=with_dims)], "doc_id": doc})
+                 {"ops": [_rect_sketch(name, w, h, with_dims=with_dims)], "doc_id": doc,
+                  "auto_define": False})
     assert r["ok"], r
     return r["features"][0]["id"]
 
@@ -1645,6 +1646,13 @@ def test_wall_thickness_reports_a_genuine_thin_spot():
     w, _ = _call("wall_thickness", {"doc_id": doc})
     assert w["min_thickness_mm"] == pytest.approx(1.0, abs=1e-3), w
     assert w["thinnest"][0]["built_by"]["name"] == "Pocket", w
+    sample = w["minimum_sample"]
+    basis = w["measurement_basis"]
+    # Boundary vertices on a real thin pocket still measure its floor. Boundary evidence
+    # must not become a reason to drop this minimum or replace it with a percentile.
+    assert math.dist(sample["ray_origin"], sample["exit_at"]) + basis["surface_offset_mm"] \
+        == pytest.approx(1.0, abs=1e-3), w
+    assert sample["face"] == w["thinnest"][0]["face"], w
     _call("close_part", {"doc_id": doc})
 
 
@@ -1715,6 +1723,12 @@ def test_wall_thickness_locates_the_thin_wall_on_a_second_body():
     assert shim["body"] == 2, w
     by_body = {b["body"]: b["min_thickness_mm"] for b in w["bodies"]}
     assert set(by_body) == {1, 2} and abs(by_body[2] - 0.8) < 0.02 and by_body[1] > 9, w
+    sample = w["minimum_sample"]
+    assert sample["body"] == 2 and sample["at"][0] > 80, w
+    basis = w["measurement_basis"]
+    assert math.dist(sample["ray_origin"], sample["exit_at"]) + basis["surface_offset_mm"] \
+        == pytest.approx(0.8, abs=0.02), w
+    assert basis["n_vertices"] == w["n_sampled"] + basis["n_unmeasured"], w
 
 
 def test_wall_thickness_ignores_a_rim_ray_that_runs_along_a_ledge():
@@ -1736,6 +1750,55 @@ def test_wall_thickness_ignores_a_rim_ray_that_runs_along_a_ledge():
     # (7 mm across, less a small chord error).
     assert abs(w["min_thickness_mm"] - 7.0) < 0.15, w
     assert w["thinnest"][0]["built_by"]["name"] == "Collar", w
+    _call("close_part", {"doc_id": doc})
+
+
+@pytest.mark.parametrize("angle_deg", [65, 77])
+def test_wall_thickness_retains_an_acute_edge_span_with_its_actual_ray(angle_deg):
+    """A moderate acute edge has a genuine micron-scale EXIT, not a source-face self-hit.
+
+    The triangular prism is millimetres thick away from its tapered edge. Keep that edge
+    minimum, but expose enough evidence to distinguish it from an interior wall claim.
+    """
+    r, _ = _call("new_part", {"name": f"wt_edge_{angle_deg}"})
+    doc = r["doc_id"]
+    slope = math.tan(math.radians(angle_deg))
+    points = [[0, 0], [100, 0], [100, 100 * slope]]
+    entities = [_line(f"e{i + 1}", *points[i], *points[(i + 1) % 3]) for i in range(3)]
+    a, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "add_feature", "feature": {"type": "sketch", "name": "Triangle",
+            "params": {"entities": entities,
+                       "constraints": [_rel(f"c{i + 1}", "fix", [f"e{i + 1}"])
+                                       for i in range(3)]},
+            "refs": {"plane": "plane.top"}}},
+        {"op": "add_feature", "feature": {"type": "extrude", "name": "Wedge",
+            "params": {"mode": "boss", "end": "blind", "depth": 4},
+            "refs": {"profile": [{"kind": "region", "sketch": "$0"}]}}}]})
+    assert a["ok"] and a["body_count"] == 1, a
+    w, _ = _call("wall_thickness", {"doc_id": doc})
+    assert w["ok"] and 0.002 < w["min_thickness_mm"] < 0.005, w
+    sample, basis = w["minimum_sample"], w["measurement_basis"]
+    assert sample["sample_location"] == "face_mesh_boundary", w
+    assert sample["face"] == w["thinnest"][0]["face"], w
+    assert math.hypot(*sample["at"][:2]) < 1e-5, w
+    origin, exit_at, direction = (sample[key] for key in
+                                  ("ray_origin", "exit_at", "inward_direction"))
+    assert math.dist([0, 0, 0], direction) == pytest.approx(1), w
+    distance = math.dist(origin, exit_at)
+    assert distance + basis["surface_offset_mm"] \
+        == pytest.approx(w["min_thickness_mm"], abs=1e-8), w
+    assert [exit_at[k] - origin[k] for k in range(3)] \
+        == pytest.approx([distance * direction[k] for k in range(3)], abs=1e-8), w
+    # Origin and midpoint are strictly in the triangular material; exit lands on the
+    # OTHER wedge face. A self-hit on the starting face cannot satisfy these inequalities.
+    for fraction in (0, 0.5):
+        x, y = [origin[k] + fraction * (exit_at[k] - origin[k]) for k in (0, 1)]
+        assert 0 < x < 100 and 0 < y < slope * x, w
+    x, y = exit_at[:2]
+    assert min(abs(y), abs(slope * x - y)) < 1e-7, w
+    assert abs(direction[2]) < 1e-8, w
+    assert math.dist([0, 0, 0], sample["tangent_nudge"]) \
+        == pytest.approx(basis["tangent_nudge_mm"], abs=1e-8), w
     _call("close_part", {"doc_id": doc})
 
 

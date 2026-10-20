@@ -21,6 +21,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Union, get_args, get_origin
 
+from services.agent import request_context as tenancy
 from services.agent.tool_images import (
     ImageUnavailable,
     image_ref,
@@ -96,6 +97,15 @@ class HostToolBinding:
     handler: Callable[..., Any] | None = field(default=None, repr=False, compare=False)
     context: Any = field(default=None, repr=False, compare=False)
     metadata: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    trusted_context: dict[str, Any] = field(
+        default_factory=tenancy.current_context, repr=False, compare=False,
+    )
+    project_root: str = field(
+        default_factory=lambda: tenancy.root_value("CHUDWARE_PROJECT_DIR"), repr=False, compare=False,
+    )
+    save_root: str = field(
+        default_factory=lambda: tenancy.root_value("CHUDWARE_PROJECT_SAVE_DIR"), repr=False, compare=False,
+    )
 
     def as_dict(self) -> dict[str, Any]:
         """Return the dependency-free binding definition."""
@@ -111,7 +121,7 @@ class HostToolBinding:
         if not callable(factory):
             raise TypeError("host-tool factory must be callable")
 
-        def execute(params: Mapping[str, Any] | None, host_context: Any) -> Any:
+        def execute_bound(params: Mapping[str, Any] | None, host_context: Any) -> Any:
             send_update = getattr(host_context, "send_update", None)
             progress = (
                 (lambda payload: send_update(host_tool_result(payload)))
@@ -153,6 +163,15 @@ class HostToolBinding:
                 raise
             report(result, None)
             return _prefixed(self, result, prefix)
+
+        def execute(params: Mapping[str, Any] | None, host_context: Any) -> Any:
+            refusal = _binding_context_refusal(self)
+            if refusal is not None:
+                return host_tool_result(refusal)
+            with tenancy.bind_context(self.trusted_context), tenancy.bind_roots(
+                self.project_root, self.save_root,
+            ):
+                return execute_bound(params, host_context)
 
         return factory(
             name=self.name,
@@ -206,17 +225,20 @@ def host_tool_result(
     ``wait_for_idle`` waits with it, and the GUI shows "Thinking..." until the 2-hour
     cap (verified live with ``chud --mode rpc`` 0.3.0 for ``{"ok": false, ...}``,
     ``{"ok": true, ...}`` and ``{"docs": [...]}``; a bare string or a
-    ``{"content": [...]}`` mapping completes immediately).  Every CAD tool returns a
-    JSON object or JSON text, so this is the single place the envelope is applied:
-    the model reads the JSON as text and ``details`` keeps the structured result for
-    the event mapper, the progress watchdog and eval code. Most MCP tools return
-    ``json.dumps(...)`` strings; those are parsed for ``details`` too, or a failed
-    ``{"ok": false}`` looked like a success to every structured consumer.
+    ``{"content": [...]}`` mapping completes immediately). CAD tools return
+    JSON values, JSON text or plain guidance text. This is the single place the
+    envelope is applied: ``details`` keeps the result for the event mapper,
+    progress watchdog and eval code. Plain text stays a string in ``details``;
+    JSON-text objects/arrays are parsed, so a failed ``{"ok": false}`` stays a
+    failure for structured consumers.
 
     The text is the one copy the model pays for, on every later request of the
     conversation, so JSON goes out in :func:`model_json` form, and a result over
     *max_bytes* (UTF-8) is shortened to fit (see :func:`_bounded_result`), the
     complete value going to ``spill``'s file.
+    Over-budget plain text uses the same bounded JSON envelope: its shortened
+    string is in ``details.items``, with ``_truncated.full_result`` naming the
+    complete JSON string. No success flag is invented for guidance text.
 
     Images a tool returned (render tools' ``[Image, caption]``) follow the text as
     ``{"type": "image", "mimeType", "data"}`` blocks — Chudcode passes result content
@@ -236,7 +258,9 @@ def host_tool_result(
     if isinstance(result, str):
         parsed = _json_text_value(result)
         if parsed is None:
-            return {"content": [{"type": "text", "text": result}]}
+            if _fits(result, max_bytes):
+                return {"content": [{"type": "text", "text": result}], "details": result}
+            return _bounded_result(result, [], [], max_bytes, spill)
         value, trailing = parsed
         safe = _json_safe(value)
         text = _compact_json_text(result)
@@ -435,7 +459,11 @@ def _spill_full_result(binding: HostToolBinding, value: Any) -> str | None:
     safe_conversation = "".join(
         ch if ch.isalnum() or ch in "._-" else "_" for ch in conversation
     )[:80] or "adhoc"
-    folder = Path(paths.ROOT) / "cache" / "tool_results" / safe_conversation
+    folder = (
+        tenancy.actor_state_root() / "cache" / "tool_results"
+        if tenancy.in_cell()
+        else Path(paths.ROOT) / "cache" / "tool_results" / safe_conversation
+    )
     folder.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%dT%H%M%S")
     target = folder / f"{stamp}-{binding.name}-{uuid.uuid4().hex[:8]}.json"
@@ -612,7 +640,7 @@ def _skill_prefix(binding: HostToolBinding, *, agent_id: str | None = None) -> s
         bodies = skills.activate_for_prompt(
             "",
             session_id=conversation or None,
-            project_root=_ctx(binding.context, "project_dir", None),
+            project_root=binding.project_root or None,
             tools_about_to_run=[binding.name],
             role=_ctx(binding.context, "actor", None),
             _aggregate_char_limit=skills.SKILL_BODY_CHAR_LIMIT,
@@ -660,6 +688,35 @@ def _ctx_present(context: Any, name: str) -> bool:
     if isinstance(context, Mapping):
         return name in context
     return hasattr(context, name)
+
+
+def _context_roots(context: Any) -> tuple[str, str]:
+    """Capture the exact selected roots before the turn ContextVars are bound."""
+    raw_project = _ctx(context, "project_dir", None)
+    if raw_project is None:
+        raw_project = _ctx(context, "workspace_dir", None)
+    explicit_project = raw_project is not None
+    if not explicit_project:
+        raw_project = (
+            tenancy.root_value("CHUDWARE_PROJECT_DIR")
+            or tenancy.root_value("CHUDWARE_FS_ROOT")
+        )
+    raw_project = str(raw_project or "").strip()
+    if not raw_project:
+        return "", ""
+    project = str(Path(raw_project).expanduser().resolve())
+    raw_save = _ctx(context, "save_dir", None)
+    if raw_save is None:
+        raw_save = _ctx(_ctx(context, "options", None), "save_dir", None)
+    if raw_save is None:
+        raw_save = (
+            project if explicit_project
+            else tenancy.root_value("CHUDWARE_PROJECT_SAVE_DIR")
+        )
+    save = Path(str(raw_save or project)).expanduser()
+    if not save.is_absolute():
+        save = Path(project) / save
+    return project, str(save.resolve())
 
 
 def _ordered_unique(values: Sequence[Any] | None) -> list[str]:
@@ -972,7 +1029,7 @@ def _schema_from_callable(fn: Any) -> dict[str, Any]:
     properties: dict[str, Any] = {}
     required: list[str] = []
     for parameter in signature.parameters.values():
-        if parameter.name in {"self", "cls", "ctx", "context", "progress", "cancel"}:
+        if parameter.name in {"self", "cls", "ctx", "context", *_HOST_INJECTED_PARAMS}:
             continue
         if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
             continue
@@ -1007,9 +1064,8 @@ def _var_param_names(fn: Any) -> frozenset[str]:
     )
 
 
-#: Parameters dispatch supplies itself (the host's progress sink and Stop probe, and the
-#: interactive turn's question transport).
-_HOST_INJECTED_PARAMS = ("progress", "cancel", "ask_human")
+#: Callback parameters supplied only by the host, never model arguments.
+_HOST_INJECTED_PARAMS = ("progress", "cancel", "ask_human", "wake")
 
 
 def _without_catch_alls(schema: dict[str, Any], fn: Any) -> dict[str, Any]:
@@ -1024,7 +1080,7 @@ def _without_catch_alls(schema: dict[str, Any], fn: Any) -> dict[str, Any]:
     the live plan panel therefore never published a single item. Thirty-four
     further tools advertised the same phantom argument as optional, inviting the
     model to fill it with junk that lands in the tool's user-intent channel.
-    A declared ``progress``/``cancel`` is the host's callable, never model input.
+    A declared ``progress``/``cancel``/``wake`` is the host's callable, never model input.
     """
     names = _var_param_names(fn) | {
         name for name in _HOST_INJECTED_PARAMS if callable(fn) and _accepts(fn, name)
@@ -1092,6 +1148,57 @@ def _entry_description(entry: Any, fn: Any) -> str:
     if not description and callable(fn):
         description = inspect.getdoc(fn) or ""
     return str(description or "").strip()
+
+
+def _auto_skill_tools(project_root: str, role: str | None) -> dict[str, list[str]]:
+    """Derive description pointers from the selected project's live skill catalog."""
+    if not project_root:
+        return {}
+    try:
+        from services.agent import skills
+
+        by_tool: dict[str, list[str]] = {}
+        for skill in skills.discover_skills(project_root=project_root):
+            if skill.inject != "auto" or (skill.roles and role not in skill.roles):
+                continue
+            for tool in skill.triggers.tools:
+                by_tool.setdefault(tool, []).append(skill.name)
+        return by_tool
+    except Exception as exc:  # noqa: BLE001 — optional skills never hide CAD tools
+        _debug_fallback("skill description pointers", exc)
+        return {}
+
+
+def _description_guidance(name: str, description: str, skill_names: Sequence[str]) -> str:
+    """Keep the registry summary first, then expose the effective dispatch guidance."""
+    from services.agent.config import get_tool_options, tool_timeout_s_default
+
+    options = get_tool_options(None, name) or {}
+    sections = [description]
+    note = str(options.get("prompt_note") or "").strip()
+    if note:
+        sections.append(f"Note: {note}")
+    timeout = options.get("timeout_s")
+    if timeout is None:
+        timeout = tool_timeout_s_default()
+    try:
+        timeout_s = float(timeout or 0)
+    except (TypeError, ValueError):
+        timeout_s = 0
+    if math.isfinite(timeout_s) and timeout_s > 0:
+        sections.append(
+            f"Wait timeout: {timeout_s:g} s per invocation. Expiry returns ok:false "
+            "with timed_out:true and status:still_running; native work may still "
+            "complete or mutate state and is not cancelled. Repeat the exact same "
+            "invocation (arguments, document and agent) in this run to wait up to "
+            "the same bound again or retrieve its original result, without starting "
+            "duplicate work. Recovery does not survive the end of the run."
+        )
+    if skill_names:
+        sections.append("Skill packs: " + "; ".join(
+            f"cad_skill(name={json.dumps(skill_name)})" for skill_name in skill_names
+        ))
+    return "\n\n".join(sections)
 
 
 def _entry_load_mode(name: str, entry: Any) -> str:
@@ -1174,16 +1281,33 @@ def build_host_tools(context: Any) -> list[HostToolBinding]:
     entries = _load_registry_entries(context)
     available = _ordered_unique([*entries.keys(), *_mission_names(context)])
     names = _effective_names(context, available)
+    project_root, save_root = _context_roots(context)
+    skill_tools = _auto_skill_tools(project_root, _ctx(context, "actor", None))
+    from services.agent.tool_categories import AGENT_DENIED_TOOLS
     resolve = _resolver(context)
     call_counts = _ctx(context, "tool_call_counts", None)
     if call_counts is None:
         call_counts = {}
+    from services.agent.agent_turn import _ToolCallRecovery
+
+    recovery = _ctx(context, "tool_call_recovery", None)
+    if recovery is None:
+        recovery = _ToolCallRecovery()
+        if isinstance(context, dict):
+            recovery = context.setdefault("tool_call_recovery", recovery)
+        elif context is not None:
+            try:
+                setattr(context, "tool_call_recovery", recovery)
+            except (AttributeError, TypeError):
+                pass  # Immutable contexts retain the run-owned metadata reference.
     call_records = _ctx(context, "tool_calls", _ctx(context, "calls", None))
     if call_records is None:
         call_records = []
     out: list[HostToolBinding] = []
     for name in names:
         entry = entries.get(name)
+        if name in AGENT_DENIED_TOOLS:
+            continue
         if not _collision_allowed(name, entry, context):
             continue
         refusal = _policy_refusal(name, context)
@@ -1228,6 +1352,7 @@ def build_host_tools(context: Any) -> list[HostToolBinding]:
             from services.agent.tool_schemas import _description_line
 
             description = _description_line(description, trim=True)
+        description = _description_guidance(name, description, skill_tools.get(name, ()))
         out.append(
             HostToolBinding(
                 name=name,
@@ -1236,9 +1361,12 @@ def build_host_tools(context: Any) -> list[HostToolBinding]:
                 load_mode=_entry_load_mode(name, entry),
                 handler=fn,
                 context=context,
+                project_root=project_root,
+                save_root=save_root,
                 metadata={
                     "registry_entry": entry,
                     "tool_call_counts": call_counts,
+                    "tool_call_recovery": recovery,
                     "tool_calls": call_records,
                 },
             )
@@ -1299,7 +1427,8 @@ def _accepts(fn: Callable[..., Any], name: str) -> bool:
 
 
 def _document_args(
-    fn: Callable[..., Any] | None, args: dict[str, Any], context: Any
+    fn: Callable[..., Any] | None, args: dict[str, Any], context: Any,
+    *, agent_id: str | None = None,
 ) -> dict[str, Any]:
     out = dict(args)
     if not callable(fn):
@@ -1312,6 +1441,10 @@ def _document_args(
     )
     for name in ("doc_id", "actor", "run_id", "node_id", "parent_id", "subagent_id"):
         value = _ctx(context, name, None)
+        if name == "doc_id" and agent_id is not None:
+            from services.mcp.cad_common import current_doc_id
+
+            value = current_doc_id() or value
         if name == "doc_id" and replaced:
             continue
         if (
@@ -1508,7 +1641,47 @@ def _mode_refusal(name: str, context: Any) -> dict[str, Any] | None:
     }
 
 
+def _binding_context_refusal(binding: HostToolBinding) -> dict[str, Any] | None:
+    """A captured binding may restore a cell owner, never replace an active one."""
+    active = tenancy.current_context()
+    trusted = binding.trusted_context
+    if tenancy.in_cell() and (
+        not trusted.get("cell") or (active.get("cell") and active != trusted)
+    ):
+        return {"ok": False, "reason": "not_found", "code": "not_found"}
+    if trusted.get("cell") and not binding.project_root:
+        return {
+            "ok": False, "reason": "workspace_root_unavailable",
+            "error": "The owning turn has no project root; ambient roots are not available.",
+        }
+    return None
+
+
 def dispatch_host_tool(
+    binding: HostToolBinding,
+    args: Mapping[str, Any] | None,
+    progress: Any,
+    cancel: Any,
+    *,
+    agent_id: str | None = None,
+    parent_agent_id: str | None = None,
+) -> Any:
+    """Rebind the trusted owner and explicit roots on SDK host-call threads."""
+    if not isinstance(binding, HostToolBinding):
+        raise TypeError("binding must be a HostToolBinding")
+    refusal = _binding_context_refusal(binding)
+    if refusal is not None:
+        return refusal
+    with tenancy.bind_context(binding.trusted_context), tenancy.bind_roots(
+        binding.project_root, binding.save_root,
+    ):
+        return _dispatch_host_tool(
+            binding, args, progress, cancel,
+            agent_id=agent_id, parent_agent_id=parent_agent_id,
+        )
+
+
+def _dispatch_host_tool(
     binding: HostToolBinding,
     args: Mapping[str, Any] | None,
     progress: Any,
@@ -1550,115 +1723,175 @@ def dispatch_host_tool(
             "executed": False,
         }
 
-    refusal = _policy_refusal(binding.name, binding.context) or _mode_refusal(
-        binding.name, binding.context
-    )
-    if refusal is not None:
-        return refusal
+    from services.mcp.cad_common import agent_doc_context
+    from services.mcp.daemon_bridge import turn_connection_scope
 
-    meta = _dispatch_meta(binding, supplied)
-    if meta is not _MISSING:
-        return _json_safe(meta)
-
-    mission = _ctx(binding.context, "mission_dispatch", None)
-    mission_resolve = getattr(mission, "resolve", None)
-    mission_fn = mission_resolve(binding.name) if callable(mission_resolve) else None
-    dispatcher = _ctx(
-        binding.context, "tool_dispatch", _ctx(binding.context, "dispatcher", None)
-    )
-    target = mission_fn if callable(mission_fn) else binding.handler
-    call_args = _document_args(target, supplied, binding.context)
-
-    blocked = _guardrail_block(binding, call_args)
-    if blocked is not None:
-        return {
-            "ok": False,
-            "status": "guardrail_blocked",
-            "policy_refusal": True,
-            "executed": False,
-            "error": blocked,
-        }
-
-    def inner(name: str, merged: dict[str, Any]) -> Any:
-        actual = _document_args(target, merged, binding.context)
-        if not callable(mission_fn) and callable(dispatcher):
-            return _call_run_dispatcher(
-                dispatcher, name, actual, binding.context, progress, cancel
-            )
-        if not callable(target):
-            raise TypeError(f"tool {name!r} is no longer bound in this run")
-        # The offline resolver path reconciles keyword arguments against the
-        # tool's real signature (synonyms, dropped labels, teaching errors); this
-        # path used to call straight through, so a model's `plm_save(message=…)`
-        # surfaced as "register_plm_tools.<locals>.plm_save() got an unexpected
-        # keyword argument 'message'" — a raised error that also charged the cap.
-        model_args = {k: v for k, v in actual.items() if k not in _HOST_INJECTED_PARAMS}
-        kwargs, notes, arg_error = _reconcile_kwargs(name, target, model_args)
-        if arg_error is not None:
-            return arg_error
-        # Host callables, never a model-supplied value (`"cancel": true` would be
-        # called as a function).
-        if _accepts(target, "progress"):
-            kwargs["progress"] = progress
-        if _accepts(target, "cancel"):
-            kwargs["cancel"] = cancel
-        asker = _ctx(binding.context, "ask_human", None)
-        if callable(asker) and _accepts(target, "ask_human"):
-
-            def ask_human(batch: Mapping[str, Any]) -> Any:
-                return asker(batch, agent_id=agent_id, cancel=cancel)
-
-            kwargs["ask_human"] = ask_human
-        result = target(**kwargs)
-        return _attach_arg_notes(result, notes) if notes else result
-
-    from services.agent.agent_turn import (
-        _attach_arg_notes,
-        _dispatch_tool,
-        _reconcile_kwargs,
-    )
-
-    call_counts = _ctx(binding.context, "tool_call_counts", None)
-    if call_counts is None and isinstance(binding.context, dict):
-        call_counts = binding.context.setdefault("tool_call_counts", {})
-    if call_counts is None:
-        call_counts = binding.metadata.get("tool_call_counts")
-    from services.agent.online_turn import bind_helper_runtime
-
-    with bind_helper_runtime(_ctx(binding.context, "helper_runtime", None)):
-        result = _dispatch_tool(
-            binding.name,
-            call_args,
-            _call_counts=call_counts,
-            _inner=inner,
-            _loop_guard=_ctx(binding.context, "tool_loop_guard", None),
+    owner = agent_id or _ctx(binding.context, "agent_id", None)
+    scope = _ctx(binding.context, "run_id", None) or _ctx(binding.context, "session_id", None)
+    with agent_doc_context(owner, scope=scope), turn_connection_scope(
+        _ctx(binding.context, "daemon_connections", None)
+    ):
+        refusal = _policy_refusal(binding.name, binding.context) or _mode_refusal(
+            binding.name, binding.context
         )
-    if binding.name == "cad_skill":
-        result = _mount_skill_tools(binding, supplied, result)
-    safe_result = _json_safe(result)
-    records = _ctx(binding.context, "tool_calls", _ctx(binding.context, "calls", None))
-    if records is None:
-        records = binding.metadata.get("tool_calls")
-    if isinstance(records, list):
-        structured = safe_result
-        if isinstance(safe_result, str):
-            parsed = _json_text_value(safe_result)
-            structured = parsed[0] if parsed is not None else None
-        ok = not (isinstance(structured, Mapping) and structured.get("ok") is False)
-        record = {
-            "tool": binding.name,
-            "args": _json_safe(call_args),
-            "ok": ok,
-            "result": safe_result,
+        if refusal is not None:
+            return refusal
+
+        meta = _dispatch_meta(binding, supplied)
+        if meta is not _MISSING:
+            return _json_safe(meta)
+
+        mission = _ctx(binding.context, "mission_dispatch", None)
+        mission_resolve = getattr(mission, "resolve", None)
+        mission_fn = mission_resolve(binding.name) if callable(mission_resolve) else None
+        dispatcher = _ctx(
+            binding.context, "tool_dispatch", _ctx(binding.context, "dispatcher", None)
+        )
+        target = mission_fn if callable(mission_fn) else binding.handler
+        call_args = _document_args(target, supplied, binding.context, agent_id=agent_id)
+
+        blocked = _guardrail_block(binding, call_args)
+        if blocked is not None:
+            return {
+                "ok": False,
+                "status": "guardrail_blocked",
+                "policy_refusal": True,
+                "executed": False,
+                "error": blocked,
+            }
+        # Retain the original owning pool even after terminal cleanup removes it
+        # from the mutable run context. Active leases drain when the worker ends.
+        connections = _ctx(binding.context, "daemon_connections", None)
+
+        def inner(name: str, merged: dict[str, Any]) -> Any:
+            # Tool timeouts can move the body to another thread. Socket leases
+            # are thread-local, so install the owning turn's pool there too.
+            with turn_connection_scope(connections):
+                return invoke(name, merged)
+
+        def invoke(name: str, merged: dict[str, Any]) -> Any:
+            actual = _document_args(target, merged, binding.context, agent_id=agent_id)
+            if not callable(mission_fn) and callable(dispatcher):
+                return _call_run_dispatcher(
+                    dispatcher, name, actual, binding.context, progress, cancel
+                )
+            if not callable(target):
+                raise TypeError(f"tool {name!r} is no longer bound in this run")
+            # The offline resolver path reconciles keyword arguments against the
+            # tool's real signature (synonyms, dropped labels, teaching errors); this
+            # path used to call straight through, so a model's `plm_save(message=…)`
+            # surfaced as "register_plm_tools.<locals>.plm_save() got an unexpected
+            # keyword argument 'message'" — a raised error that also charged the cap.
+            model_args = {k: v for k, v in actual.items() if k not in _HOST_INJECTED_PARAMS}
+            kwargs, notes, arg_error = _reconcile_kwargs(name, target, model_args)
+            if arg_error is not None:
+                return arg_error
+            # Host callables, never a model-supplied value (`"cancel": true` would be
+            # called as a function).
+            if _accepts(target, "progress"):
+                kwargs["progress"] = progress
+            if _accepts(target, "cancel"):
+                kwargs["cancel"] = cancel
+            asker = _ctx(binding.context, "ask_human", None)
+            if callable(asker) and _accepts(target, "ask_human"):
+
+                def ask_human(batch: Mapping[str, Any]) -> Any:
+                    return asker(batch, agent_id=agent_id, cancel=cancel)
+
+                kwargs["ask_human"] = ask_human
+            # A pure wait (wait_job) is the one tool a queued user message may cut short:
+            # the steer only reaches the model at the next tool boundary, so a 15-minute
+            # wait otherwise holds the user's message for 15 minutes. Real work is never
+            # woken — `cancel` stays the Stop probe.
+            steer_pending = _ctx(binding.context, "user_steer_pending", None)
+            if callable(steer_pending) and _accepts(target, "wake"):
+                kwargs["wake"] = lambda: "user_message" if steer_pending() else None
+            result = target(**kwargs)
+            return _attach_arg_notes(result, notes) if notes else result
+
+        from services.agent.agent_turn import (
+            _attach_arg_notes,
+            _dispatch_tool,
+            _reconcile_kwargs,
+            _ToolCallRecovery,
+        )
+
+        call_counts = _ctx(binding.context, "tool_call_counts", None)
+        if call_counts is None and isinstance(binding.context, dict):
+            call_counts = binding.context.setdefault("tool_call_counts", {})
+        if call_counts is None:
+            call_counts = binding.metadata.get("tool_call_counts")
+        recovery = _ctx(
+            binding.context, "tool_call_recovery",
+            binding.metadata.get("tool_call_recovery"),
+        )
+        if recovery is None and isinstance(binding.context, dict):
+            recovery = binding.context.setdefault("tool_call_recovery", _ToolCallRecovery())
+        if recovery is not None and isinstance(binding.metadata, dict):
+            binding.metadata.setdefault("tool_call_recovery", recovery)
+        from services.mcp.cad_common import current_doc_id
+
+        recovery_scope = {
+            name: _ctx(binding.context, name, None)
+            for name in ("run_id", "session_id", "actor", "node_id", "subagent_id")
         }
-        if agent_id:
-            record["agent_id"] = agent_id
-            if parent_agent_id:
-                record["parent_agent_id"] = parent_agent_id
-        with _RECORDS_LOCK:
-            records.append(record)
-            del records[:-64]
-    return safe_result
+        # Only document-scoped signatures depend on the ambient current document.
+        # Creating/opening tools can change it before returning (including saving),
+        # and their exact retries must still identify the original invocation.
+        document_target = call_args.get("doc_id")
+        if (
+            not document_target and callable(target) and _accepts(target, "doc_id")
+            and not any(
+                call_args.get(name) is not None
+                for name in getattr(target, "_cad_context_doc_unless", ())
+            )
+        ):
+            document_target = current_doc_id() or _ctx(binding.context, "doc_id", None)
+        recovery_scope.update(
+            agent_id=owner, parent_agent_id=parent_agent_id, doc_id=document_target,
+        )
+        from services.agent.online_turn import bind_helper_runtime
+
+        with bind_helper_runtime(
+            _ctx(binding.context, "helper_runtime", None),
+            session_id=_ctx(binding.context, "session_id", None),
+        ):
+            result = _dispatch_tool(
+                binding.name,
+                call_args,
+                _call_counts=call_counts,
+                _inner=inner,
+                _loop_guard=_ctx(binding.context, "tool_loop_guard", None),
+                _recovery=recovery,
+                _recovery_scope=recovery_scope,
+                _cancel=lambda: _cancelled(cancel),
+            )
+        if binding.name == "cad_skill":
+            result = _mount_skill_tools(binding, supplied, result)
+        safe_result = _json_safe(result)
+        records = _ctx(binding.context, "tool_calls", _ctx(binding.context, "calls", None))
+        if records is None:
+            records = binding.metadata.get("tool_calls")
+        if isinstance(records, list):
+            structured = safe_result
+            if isinstance(safe_result, str):
+                parsed = _json_text_value(safe_result)
+                structured = parsed[0] if parsed is not None else None
+            ok = not (isinstance(structured, Mapping) and structured.get("ok") is False)
+            record = {
+                "tool": binding.name,
+                "args": _json_safe(call_args),
+                "ok": ok,
+                "result": safe_result,
+            }
+            if agent_id:
+                record["agent_id"] = agent_id
+                if parent_agent_id:
+                    record["parent_agent_id"] = parent_agent_id
+            with _RECORDS_LOCK:
+                records.append(record)
+                del records[:-64]
+        return safe_result
 
 
 # --------------------------------------------------------------------------- JSON boundary

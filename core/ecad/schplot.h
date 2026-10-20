@@ -18,6 +18,7 @@ struct PlotOpts {
     double margin_mm = 10.0;
 };
 
+// SVG entrypoints refuse unsafe filename-leaf sheet IDs/options with ecad::OpError.
 std::vector<std::pair<std::string, std::string>> schematic_svg_pages(
     const nlohmann::json& sch, const PlotOpts& o);
 std::string schematic_svg(const nlohmann::json& sch, const PlotOpts& o);

@@ -23,11 +23,27 @@ from pathlib import Path
 
 import pytest
 
+# Fixture-only queue key, configured before any gateway Settings import.
+os.environ["CHUDWARE_MAIL_CONTEXT_ENCRYPTION_KEY"] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
 GATEWAY_DIR = Path(__file__).resolve().parents[1]
 if str(GATEWAY_DIR) not in sys.path:
     sys.path.insert(0, str(GATEWAY_DIR))
 if str(GATEWAY_DIR.parent) not in sys.path:
     sys.path.insert(0, str(GATEWAY_DIR.parent))
+
+
+
+
+@pytest.fixture(autouse=True)
+def protected_admission_state(tmp_path, monkeypatch):
+    """Direct module tests must never read/write a real deployment lease."""
+    import deployment_drain
+    import gateway.deployment_drain
+    root = tmp_path / "gateway-admission"
+    root.mkdir(mode=0o700)
+    for module in (deployment_drain, gateway.deployment_drain):
+        monkeypatch.setattr(module, "_controller", module.AdmissionController(root))
 
 
 @pytest.fixture

@@ -1036,3 +1036,133 @@ def test_concurrent_writers_in_two_processes_never_lose_an_update(tmp_path):
     assert meta["model_override"] == f"model-{rounds - 1}"
     assert meta["status_note"] == f"turn {rounds - 1}"
     assert len(reg.get_transcript(sid, limit=10_000)) == rounds
+
+
+def test_cell_subagent_surfaces_are_actor_private(tmp_path, monkeypatch):
+    import hashlib
+    from services.agent import request_context as ctx
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", "/wrong-ambient-root")
+
+    def principal(actor):
+        return {"cell": True, "workspace_key": "team:shared", "actor_key": actor,
+                "actor_hex": hashlib.sha256(actor.encode()).hexdigest()[:32],
+                "right": "editor", "epoch": 1}
+
+    def call(method, sid="default", **extra):
+        if sid == "default":
+            sid = current_sid
+        return subagent_rpc.WORKER_METHODS[method](
+            {"subagent_id": sid, **extra}, lambda *_: None)
+
+    with ctx.bind_context(principal("alice")), ctx.bind_roots(str(tmp_path / "work")):
+        reg.bind_session("alice-chat", "/untrusted/transcript/path")
+        a = reg.register_session("shared", role="alice", status="running")
+        alice_sid = current_sid = a["id"]
+        alice_only = reg.register_session("alice-only", role="secret")["id"]
+        assert alice_sid != "shared"
+        assert reg.get_session("shared") is None
+        reg.append_transcript(alice_sid, "subagent", "alice transcript")
+        reg.append_raw(alice_sid, {"kind": "message", "text": "alice raw"})
+        assert a["project_dir"] == str(tmp_path / "work")
+        assert a["session_id"] == "alice-chat"
+        assert alice_sid not in reg._meta_path(alice_sid).name
+        assert reg.raw_path(alice_sid).is_relative_to(tmp_path / "state")
+        alice_path = reg._meta_path(alice_sid)
+
+    with ctx.bind_context(principal("bob")), ctx.bind_roots(str(tmp_path / "work")):
+        assert call("subagent_list")["sessions"] == []
+        for method, args in (
+            ("subagent_transcript", {}),
+            ("subagent_transcript", {"raw": True}),
+            ("subagent_steer", {"text": "foreign steer"}),
+            ("subagent_terminate", {"confirm": True}),
+            ("subagent_control", {"op": "pause"}),
+        ):
+            foreign = call(method, alice_only, project_dir=str(tmp_path / "work"),
+                           session_id="alice-chat", **args)
+            absent = call(method, "absent", **args)
+            assert foreign == absent == {"ok": False, "error": "not_found",
+                                        "reason": "not_found", "code": "not_found"}
+            for handle in ("../escape", "/absolute", r"a\b", "", None, False, 7,
+                           [], {}, "bad\x00id", " shared "):
+                assert call(method, handle, **args) == absent
+        for method in ("subagent_steer", "subagent_terminate", "subagent_control"):
+            assert call(method, alice_only) == call(method, "absent") == {
+                "ok": False, "error": "not_found", "reason": "not_found",
+                "code": "not_found",
+            }
+        for op in (lambda: reg.append_transcript(alice_only, "user", "attack"),
+                   lambda: reg.queue_steer(alice_only, "attack"),
+                   lambda: reg.request_terminate(alice_only),
+                   lambda: reg.read_raw(alice_only)):
+            with pytest.raises(KeyError, match="not_found"):
+                op()
+        reg.bind_session("bob-chat", "")
+        current_sid = reg.register_session("shared", role="bob", status="running")["id"]
+        assert current_sid != alice_sid
+        assert current_sid.startswith("dg_") and len(current_sid) == 35
+        reg.append_transcript(current_sid, "subagent", "bob transcript")
+        assert reg._meta_path(current_sid) != alice_path
+        assert [s["role"] for s in call("subagent_list")["sessions"]] == ["bob"]
+        assert call("subagent_transcript")["messages"][0]["text"] == "bob transcript"
+        assert call("subagent_steer", text="bob steer")["ok"]
+        assert call("subagent_terminate", confirm=True)["ok"]
+        assert call("subagent_list", project_dir="/other")["sessions"] == []
+        for sid in ("../escape", "/absolute", r"a\b"):
+            assert call("subagent_transcript", sid)["error"] == "not_found"
+
+    with ctx.bind_context(principal("alice")), ctx.bind_roots(str(tmp_path / "work")):
+        assert reg.get_transcript(alice_sid)[0]["text"] == "alice transcript"
+        assert reg.pending_steers(alice_sid) == []
+        assert not reg.terminate_requested(alice_sid)
+        assert reg.read_raw(alice_sid)[-1]["text"] == "alice raw"
+
+
+@pytest.mark.parametrize("requested", ["same-child", "../escape", "", None, 7, {}, []])
+def test_cell_registry_mints_ids_and_never_refreshes_a_requested_handle(
+    requested, tmp_path, monkeypatch,
+):
+    import hashlib
+    from services.agent import request_context as ctx
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "state"))
+    principal = {"cell": True, "workspace_key": "team:shared", "actor_key": "alice",
+                 "actor_hex": hashlib.sha256(b"alice").hexdigest()[:32],
+                 "right": "editor", "epoch": 1}
+    with ctx.bind_context(principal):
+        first = reg.register_session(requested, role="first")
+        second = reg.register_session(requested, role="second")
+        third = reg.register_session(first["id"], role="third")
+        identifiers = {first["id"], second["id"], third["id"]}
+        assert len(identifiers) == 3
+        assert all(sid.startswith("dg_") and len(sid) == 35 for sid in identifiers)
+        assert reg.get_session(first["id"])["role"] == "first"
+        assert {meta["id"] for meta in reg.list_sessions()} == identifiers
+        assert all(sid not in reg._meta_path(sid).name for sid in identifiers)
+
+
+def test_cell_delegation_uses_registry_minted_id_for_nodes_controls_and_spawn(
+    tmp_path, monkeypatch,
+):
+    import hashlib
+    from services.agent import delegation, request_context as ctx
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(delegation, "_fresh_id", lambda: "caller-chosen")
+    principal = {"cell": True, "workspace_key": "team:shared", "actor_key": "alice",
+                 "actor_hex": hashlib.sha256(b"alice").hexdigest()[:32],
+                 "right": "editor", "epoch": 1}
+    events = []
+    with ctx.bind_context(principal):
+        tree = delegation.DelegationTree(
+            run_id="owned-run", orchestrator_budget=100_000, max_subagent_depth=4,
+            on_event=lambda kind, payload: events.append((kind, payload)),
+        )
+        child = tree.request_delegation("sketcher", "Sketch the bracket", 5_000)
+        assert child.id.startswith("dg_") and child.id != "caller-chosen"
+        assert tree.get_node(child.id) is child
+        assert reg.get_session(child.id)["status"] == child.status == "approved"
+        spawn = [payload for kind, payload in events if kind == "agent.spawn"]
+        assert len(spawn) == 1 and spawn[0]["subagent_id"] == child.id
+        assert reg.request_terminate(child.id)
+        assert reg.terminate_requested(child.id)
+        assert reg.get_session("caller-chosen") is None

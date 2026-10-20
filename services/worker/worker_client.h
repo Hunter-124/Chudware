@@ -16,7 +16,7 @@ constexpr std::size_t kControlRequestLimit = 64 * 1024;
 constexpr std::size_t kControlResponseLimit = 256 * 1024;
 constexpr int kControlTimeoutMs = 2500;
 
-enum class ControlTransport { None, Unix, Tcp };
+enum class ControlTransport { None, Unix, NamedPipe };
 struct ControlInfo {
     ControlTransport transport = ControlTransport::None;
     std::string endpoint;
@@ -71,30 +71,29 @@ inline bool parseControlInfo(nlohmann::json& value, bool windows,
     }
     ControlInfo parsed;
     if (windows) {
-        constexpr const char* prefix = "127.0.0.1:";
-        if (transport != "tcp" || endpoint.rfind(prefix, 0) != 0 ||
-            endpoint.size() <= 10) {
-            err = "worker control TCP endpoint is invalid";
+        constexpr const char* prefix = "\\\\.\\pipe\\chudware-control-S-";
+        const std::size_t prefixSize = std::char_traits<char>::length(prefix);
+        const std::size_t separator = endpoint.rfind('-');
+        if (transport != "named_pipe" || endpoint.rfind(prefix, 0) != 0 ||
+            endpoint.size() > 240 || separator == std::string::npos ||
+            separator <= prefixSize || endpoint.size() - separator - 1 != 64) {
+            err = "worker control named pipe endpoint is invalid";
             return false;
         }
-        unsigned int port = 0;
-        for (std::size_t i = 10; i < endpoint.size(); ++i) {
+        for (std::size_t i = prefixSize; i < separator; ++i) {
+            if ((endpoint[i] < '0' || endpoint[i] > '9') && endpoint[i] != '-') {
+                err = "worker control pipe owner SID is invalid";
+                return false;
+            }
+        }
+        for (std::size_t i = separator + 1; i < endpoint.size(); ++i) {
             const char ch = endpoint[i];
-            if (ch < '0' || ch > '9') {
-                err = "worker control TCP endpoint is invalid";
-                return false;
-            }
-            port = port * 10U + static_cast<unsigned int>(ch - '0');
-            if (port > 65535U) {
-                err = "worker control TCP endpoint is invalid";
+            if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) {
+                err = "worker control pipe nonce is invalid";
                 return false;
             }
         }
-        if (port == 0) {
-            err = "worker control TCP endpoint is invalid";
-            return false;
-        }
-        parsed.transport = ControlTransport::Tcp;
+        parsed.transport = ControlTransport::NamedPipe;
     } else {
         // 103 bytes fits the smallest sockaddr_un::sun_path supported by the
         // desktop targets, including its terminating NUL.
@@ -171,6 +170,10 @@ inline bool parseControlResponse(const std::string& frame,
                                  nlohmann::json& result, std::string& err) {
     if (frame.size() > kControlResponseLimit) {
         err = "worker control response exceeded limit";
+        return false;
+    }
+    if (!token.empty() && frame.find(token) != std::string::npos) {
+        err = "worker control response exposed authentication material";
         return false;
     }
     nlohmann::json response;
@@ -254,17 +257,22 @@ public:
               nlohmann::json& result, std::string& err, int timeoutMs = 120000,
               const EventFn& onEvent = {});
 
-    // Best-effort agent_cancel {run_id} → {ok, cancelled}. Bypasses the call mutex /
-    // uses a side-channel socket in daemon mode so Stop lands while a run is blocked.
-    bool callAgentCancel(const std::string& runId, nlohmann::json& result, std::string& err);
+    // Best-effort agent_cancel {run_id, provider?} → {ok, cancelled, carried_steer_ids?}.
+    // Native controls bypass the call mutex / use a daemon side socket. Browser controls
+    // use cell admission and the provider captured at launch, never the current picker.
+    // carried_steer_ids: steers Stop withdrew before the agent read them.
+    bool callAgentCancel(const std::string& runId, nlohmann::json& result, std::string& err,
+                         const std::string& provider = {});
 
-    // Mid-run steering: agent_steer {run_id, text, attachments?} → {ok, steered}. Same
-    // mutex-bypass / side-channel transport as cancel — a steer that queued behind the in-flight
-    // run would only land after the run finished, i.e. never. `attachments` is the composer's
-    // attachment array (images ride to Chudcode as image parts); empty = text-only.
+    // Mid-run steering: agent_steer {run_id, text, attachments?, steer_id?} → {ok, steered,
+    // steer_id}. Same mutex-bypass / side-channel transport as cancel — a steer that queued
+    // behind the in-flight run would only land after the run finished, i.e. never.
+    // `attachments` is the composer's attachment array (images ride to Chudcode as image
+    // parts); empty = text-only. `steerId` correlates the agent.steer delivery events.
     bool callAgentSteer(const std::string& runId, const std::string& text,
-                        const nlohmann::json& attachments, nlohmann::json& result,
-                        std::string& err);
+                        const nlohmann::json& attachments, const std::string& steerId,
+                        nlohmann::json& result, std::string& err,
+                        const std::string& provider = {});
 
     // Interactive ask_user answer: agent_answer {run_id, batch_id, answers} or
     // {run_id, batch_id, declined:true} → {ok, run_id, batch_id, answered} | {ok:false, reason}.
@@ -273,7 +281,8 @@ public:
     // typed value (contracts/interaction.md); ignored when `declined`.
     bool callAgentAnswer(const std::string& runId, const std::string& batchId,
                          const nlohmann::json& answers, bool declined,
-                         nlohmann::json& result, std::string& err);
+                         nlohmann::json& result, std::string& err,
+                         const std::string& provider = {});
 
     // C39: one-way teardown abort — makes a blocked (and any future) call() fail fast with
     // err "aborted" instead of running out its timeout. Set at app exit (AsyncRpc::shutdown)
@@ -347,11 +356,10 @@ private:
     // Local stdio and primary document calls serialize here. Allowlisted GUI
     // background queries bypass it and use EngineClient's private per-thread sockets.
     std::mutex callMtx_;
-    // Daemon-mode long runs (agent_admin_turn / agent_run_v2 / agent_mission_v1)
-    // serialize on THIS mutex instead of callMtx_: they stream on engine_backend's
-    // dedicated run connection, so holding callMtx_ for an hours-long turn only
-    // parked every other call on this client (the GUI's single-FIFO st.rpc lane)
-    // behind it. Two long runs still never overlap. Pipe mode keeps callMtx_.
+    // Native daemon agent runs serialize here, off callMtx_, so worker-routed
+    // GUI requests stay responsive. Online daemon turns take neither mutex:
+    // hostd gives each its own worker and engine_backend leases a connection.
+    // Pipe mode keeps callMtx_ for its single local worker.
     std::mutex longRunMtx_;
     ErrorSink errorSink_;            // W1-B: transport-error notification (optional)
     std::atomic<bool> abort_{false}; // C39: teardown abort (one-way; see abortPending)

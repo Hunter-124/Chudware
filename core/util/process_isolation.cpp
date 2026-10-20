@@ -7,13 +7,16 @@
 // the parent maps a signal, a non-zero exit or a timeout onto the same "this edge set is
 // unbuildable" answer the drop-failing path already handles.
 #include "util/process_isolation.h"
+#include "util/parent_death.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <thread>
 
 #include <BinTools.hxx>
 
@@ -21,6 +24,7 @@
 #include <cerrno>
 #include <csignal>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -47,11 +51,14 @@ namespace {
 // rest of the process. A SIGNAL still means the geometry killed OCCT and is still contained -
 // which is the case T-BL61 exists for, and it is reported immediately, with no timeout.
 bool g_fork_unusable = false;
+// Private to the forked advisory child. Its outer boundary already contains all
+// nested geometry and must never inherit the ordinary blend fallback policy.
+bool g_bounded_task = false;
 }  // namespace
 
 bool shape_isolation_active() {
 #if defined(__unix__) || defined(__APPLE__)
-    return !g_fork_unusable && shape_isolation_enabled();
+    return !g_bounded_task && !g_fork_unusable && shape_isolation_enabled();
 #else
     return false;
 #endif
@@ -64,12 +71,20 @@ IsolatedShapeResult isolate_shape_build(const std::function<TopoDS_Shape()>& bui
     // In-process build: the lambda fills *sidecar itself; a failed build leaves it empty.
     auto in_process = [&]() -> IsolatedShapeResult {
         if (sidecar) sidecar->clear();
+        // Deterministic native-stall injection, confined to an expendable advisory
+        // child. It exercises the same watchdog as a non-returning OCCT builder.
+        if (g_bounded_task) {
+            if (const char* delay = std::getenv("CHUDWARE_TEST_BLEND_DELAY_MS")) {
+                const long ms = std::strtol(delay, nullptr, 10);
+                if (ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            }
+        }
         TopoDS_Shape s = build();
         if (s.IsNull() && sidecar) sidecar->clear();
         return {!s.IsNull(), s};
     };
 #if defined(__unix__) || defined(__APPLE__)
-    if (g_fork_unusable || !shape_isolation_enabled()) return in_process();
+    if (g_bounded_task || g_fork_unusable || !shape_isolation_enabled()) return in_process();
 
     // Honour TMPDIR: /tmp can be a tiny tmpfs, and a large blended shape is megabytes.
     std::string tmpl;
@@ -182,6 +197,115 @@ IsolatedShapeResult isolate_shape_build(const std::function<TopoDS_Shape()>& bui
 #else
     (void)timeout;
     return in_process();
+#endif
+}
+
+IsolatedTaskResult isolate_task(const std::function<std::string()>& run,
+                               std::chrono::steady_clock::time_point deadline) {
+#if defined(__unix__) || defined(__APPLE__)
+    using Status = IsolatedTaskStatus;
+    if (std::chrono::steady_clock::now() >= deadline) return {Status::timed_out, {}};
+    int output[2];
+#if defined(__linux__)
+    if (::pipe2(output, O_CLOEXEC) != 0) return {};
+#else
+    if (::pipe(output) != 0) return {};
+#endif
+    if (::fcntl(output[0], F_SETFL, O_NONBLOCK) < 0 ||
+        ::fcntl(output[0], F_SETFD, FD_CLOEXEC) < 0 ||
+        ::fcntl(output[1], F_SETFD, FD_CLOEXEC) < 0) {
+        ::close(output[0]);
+        ::close(output[1]);
+        return {};
+    }
+    const pid_t parent = ::getpid();
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        ::close(output[0]);
+        ::close(output[1]);
+        return {};
+    }
+    if (pid == 0) {
+        // Never retain a daemon listener, worker control socket, or GUI stream.
+        // fd 3 is the sole result channel; normal native diagnostics go to null.
+        if (::setpgid(0, 0) != 0) ::_exit(1);
+        ::close(output[0]);
+        if (output[1] != 3 && ::dup2(output[1], 3) < 0) ::_exit(1);
+        if (::fcntl(3, F_SETFD, FD_CLOEXEC) < 0) ::_exit(1);
+        const int nullfd = ::open("/dev/null", O_RDWR);
+        if (nullfd < 0) ::_exit(1);
+        for (int fd = 0; fd < 3; ++fd)
+            if (::dup2(nullfd, fd) < 0) ::_exit(1);
+        chudware::platform::closeInheritedFds(4);
+        chudware::platform::guardParentDeath(parent);
+        for (const int sig : {SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT, SIGTRAP, SIGPIPE})
+            ::signal(sig, SIG_DFL);
+        g_bounded_task = true;
+        try {
+            const std::string payload = run();
+            std::size_t sent = 0;
+            while (sent < payload.size()) {
+                const ssize_t n = ::write(3, payload.data() + sent, payload.size() - sent);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) ::_exit(1);
+                sent += static_cast<std::size_t>(n);
+            }
+            ::_exit(0);
+        } catch (...) {
+            ::_exit(1);
+        }
+    }
+    ::setpgid(pid, pid);  // mirror the child; either side may win the race
+    ::close(output[1]);
+    int status = 0;
+    bool reaped = false;
+    auto finish = [&](Status result) -> IsolatedTaskResult {
+        // Include unexpected descendants, not just the immediate rebuild process.
+        ::kill(-pid, SIGKILL);
+        if (!reaped) {
+            ::kill(pid, SIGKILL);
+            while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        }
+        ::close(output[0]);
+        return {result, {}};
+    };
+    std::string payload;
+    bool eof = false;
+    constexpr std::size_t max_payload = 16 * 1024 * 1024;
+    for (;;) {
+        if (std::chrono::steady_clock::now() >= deadline) return finish(Status::timed_out);
+        char chunk[16384];
+        const ssize_t n = ::read(output[0], chunk, sizeof(chunk));
+        if (n > 0) {
+            if (payload.size() + static_cast<std::size_t>(n) > max_payload)
+                return finish(Status::failed);
+            payload.append(chunk, static_cast<std::size_t>(n));
+            continue;
+        }
+        if (n == 0) eof = true;
+        else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            return finish(Status::failed);
+        if (!reaped) {
+            const pid_t got = ::waitpid(pid, &status, WNOHANG);
+            if (got == pid) reaped = true;
+            else if (got < 0 && errno != EINTR) return finish(Status::failed);
+        }
+        if (reaped && eof) {
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return finish(Status::failed);
+            finish(Status::completed);
+            return {Status::completed, std::move(payload)};
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        struct pollfd pfd = {output[0], POLLIN, 0};
+        if (::poll(&pfd, 1, static_cast<int>(std::clamp<long long>(remaining, 1, 10))) < 0 &&
+            errno != EINTR)
+            return finish(Status::failed);
+    }
+#else
+    (void)run;
+    (void)deadline;
+    return {};
 #endif
 }
 

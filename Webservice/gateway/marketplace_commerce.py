@@ -629,7 +629,7 @@ def _create_cash_checkout(
 
 
 @router.post("/listings/{listing_id}/checkout")
-async def checkout_listing(
+def checkout_listing(
     listing_id: str, body: CheckoutBody, request: Request
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -652,7 +652,7 @@ async def checkout_listing(
 
 
 @router.post("/listings/{listing_id}/tip")
-async def tip_listing(
+def tip_listing(
     listing_id: str, body: TipBody, request: Request
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -686,7 +686,7 @@ def _order_payload(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 @router.get("/orders")
-async def buyer_orders(request: Request, cursor: str = "") -> dict[str, Any]:
+def buyer_orders(request: Request, cursor: str = "") -> dict[str, Any]:
     marketplace_enabled_or_404()
     user = require_user(request)
     email = user.email.strip().lower()
@@ -736,7 +736,7 @@ async def buyer_orders(request: Request, cursor: str = "") -> dict[str, Any]:
 
 
 @studio_router.get("/connect")
-async def studio_connect(request: Request) -> dict[str, Any]:
+def studio_connect(request: Request) -> dict[str, Any]:
     marketplace_enabled_or_404()
     user, seller = _require_studio_user(request)
     if seller["connect_account_id"]:
@@ -745,7 +745,7 @@ async def studio_connect(request: Request) -> dict[str, Any]:
 
 
 @studio_router.post("/connect/onboard")
-async def onboard_connect(request: Request) -> dict[str, str]:
+def onboard_connect(request: Request) -> dict[str, str]:
     marketplace_enabled_or_404()
     user, seller = _require_studio_user(request)
     email = user.email.strip().lower()
@@ -884,7 +884,7 @@ _EARNINGS_SUM_SQL = """
 
 
 @studio_router.get("/earnings")
-async def studio_earnings(
+def studio_earnings(
     request: Request, days: int = 30
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -979,7 +979,7 @@ async def studio_earnings(
 
 
 @studio_router.post("/payouts")
-async def request_payout(
+def request_payout(
     body: PayoutBody, request: Request
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -1678,7 +1678,15 @@ def _settle_checkout(
                     event_id,
                 )
                 return
-            if order["status"] != "pending":
+            session_id = _text_id(obj)
+            if (
+                not session_id
+                or session_id != str(order["stripe_checkout_session"] or "")
+                or order["currency"] != "usd"
+            ):
+                log.error("marketplace settlement refused: Checkout/order binding mismatch")
+                return
+            if order["status"] not in {"pending", "failed"}:
                 return
             if str(_field(obj, "payment_status", "") or "") != "paid":
                 log.info(
@@ -1738,6 +1746,12 @@ def _settle_checkout(
                     ("paid session carried no payment intent", order["id"]),
                 )
                 return
+            if (
+                order["stripe_payment_intent"]
+                and str(order["stripe_payment_intent"]) != payment_intent
+            ):
+                log.error("marketplace settlement refused: payment binding mismatch")
+                return
             cur.execute(
                 """
                 UPDATE mk_orders
@@ -1746,7 +1760,7 @@ def _settle_checkout(
                     stripe_payment_intent = %s,
                     stripe_event_id = %s,
                     failure_reason = ''
-                WHERE id = %s AND status = 'pending'
+                WHERE id = %s AND status IN ('pending', 'failed')
                 """,
                 (payment_intent, event_id, order["id"]),
             )
@@ -1810,7 +1824,7 @@ def _fail_payment(
             cur.execute(
                 """
                 UPDATE mk_orders
-                SET status = 'failed', failure_reason = %s
+                SET failure_reason = %s
                 WHERE id = %s
                 """,
                 (reason, order["id"]),
@@ -1831,7 +1845,10 @@ def _fail_async_checkout(
                 event_id,
             )
             return
-        if order["status"] in ("pending", "paid"):
+        if (
+            order["status"] == "pending"
+            and _text_id(obj) == str(order["stripe_checkout_session"] or "")
+        ):
             cur.execute(
                 """
                 UPDATE mk_orders
@@ -1843,10 +1860,6 @@ def _fail_async_checkout(
                 """,
                 (reason, order["id"]),
             )
-        cur.execute(
-            "DELETE FROM mk_entitlements WHERE order_id = %s",
-            (order["id"],),
-        )
 
 
 def _record_charge_refund(

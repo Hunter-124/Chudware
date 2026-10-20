@@ -1,27 +1,20 @@
-# chudware-hostd — the SHARED Chudware engine daemon serving web + local + agent
-# clients (one live session for everyone). Installed/templated by
-# install_webd.sh (@BIN@ -> ~/chudware-web/bin); do not edit the installed copy.
+# Optional local/native daemon template. Browser workspaces use isolated cells
+# whose hostd comes from the retained cell payload, not this shared instance.
+# install_webd.sh retains this template but never enables or restarts it.
 [Unit]
-Description=Chudware shared web engine daemon (chudware-webd)
+Description=Chudware optional local/native engine daemon
 After=default.target
+ConditionUser=@SERVICE_USER@
 
 [Service]
 Type=simple
 ExecStart=@BIN@/chudware-hostd --foreground
-# Verbatim instance key: socket = $XDG_RUNTIME_DIR/chudware/hostd-chudwareweb.sock,
-# never shared with dev daemons (those key on binary realpath).
-Environment=CHUDWARE_INSTANCE_KEY=chudwareweb
-# A systemd-managed shared daemon must use the same long idle policy whether
-# it has never seen a GUI or the last web/desktop GUI has detached. Otherwise
-# GUI_EXIT_GRACE's 10-second default defeats LINGER and causes restart flapping.
+# The environment has a dedicated instance and Unix user/socket namespace.
+Environment=CHUDWARE_INSTANCE_KEY=@INSTANCE_KEY@
+# Local/native sessions retain the established idle policy; no agent run cap.
 Environment=CHUDWARE_HOSTD_LINGER_SECS=86400
 Environment=CHUDWARE_HOSTD_GUI_EXIT_GRACE_S=86400
-# This is a HEADLESS server-tier daemon, but a systemd --user unit inherits the
-# desktop session's imported DISPLAY/WAYLAND_DISPLAY, so tray_icon.cpp's
-# hasDisplay() gate passes and it draws its own AppIndicator — visually identical
-# to the desktop daemon's, hence the "two Chudware tray icons" report. Nobody can
-# act on a tray icon for a shared team daemon anyway (its Quit would cut every web
-# user off), so turn it off explicitly. Mechanism: core/hostd/tray_icon.cpp:53.
+# A headless optional local/native instance must not add a second desktop tray.
 Environment=CHUDWARE_HOSTD_TRAY=0
 # The C++ agent (agent_run_v2) reads its role prompts (intake/decomposer/executor/...)
 # from CHUDWARE_PROMPTS_DIR; without it the daemon resolves the relative "services/agent/prompts"
@@ -35,13 +28,16 @@ Environment=CHUDWARE_REPO=@REPO@
 # Online agent/provider/auth/STT execution is the adjacent, artifact-locked
 # Chudcode binary staged by install_webd.sh. There is no source-runtime fallback.
 Environment=CHUDWARE_CHUDCODE_BIN=@BIN@/chud
-# always — shared webd must come back after clean exits too (binary replace
-# during install_webd without --restart, unexpected idle-exit, etc.). systemctl
-# stop still stays down; only unexpected death auto-recovers.
+# Recover an explicitly enabled local/native instance without changing user sessions.
 Restart=always
 RestartSec=2
 # Final autosave on stop needs a moment on big docs.
 TimeoutStopSec=30
+# Cgroup ceilings bound the optional daemon and worker descendants, not wall time
+# or virtual address space. Cell services retain their independent tighter budget.
+MemoryHigh=7G
+MemoryMax=8G
+TasksMax=512
 
 [Install]
 WantedBy=default.target

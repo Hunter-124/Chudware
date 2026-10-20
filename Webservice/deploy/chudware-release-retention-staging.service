@@ -1,6 +1,7 @@
 [Unit]
 Description=chudware-web staging superseded release artifact retention
 After=network-online.target
+ConditionUser=chudware-staging
 
 [Service]
 Type=oneshot
@@ -9,6 +10,6 @@ Environment=CHUDWARE_WEB_DATA=%h/chudware-web-staging
 Environment=CHUDWARE_WEB_DATA_ROOT=%h/chudware-web-staging
 Environment=CHUDWARE_DEPLOY_ENV=staging
 WorkingDirectory=%h/Repositories/CAD/Webservice/gateway
-ExecStart=%h/Repositories/CAD/Webservice/gateway/.venv/bin/python %h/Repositories/CAD/Webservice/deploy/release_retention.py
+ExecStart=/usr/bin/env CHUDWARE_DEPLOY_ENV=staging %h/Repositories/CAD/Webservice/gateway/.venv/bin/python %h/Repositories/CAD/Webservice/deploy/release_retention.py
 Nice=15
 IOSchedulingClass=idle

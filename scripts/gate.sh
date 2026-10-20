@@ -514,6 +514,15 @@ stage_pytest() {
         echo "  CHUDWARE_LIBCHUDWARE not set and no libchudware.so under core/build-{occt-,}linux/bin; core-calling tests will skip/deselect"
     fi
 
+    if [ "${CORE_BUILD_OK:-0}" = 1 ] && [ -z "${CHUDWARE_MFG_LANE_TEST_BINARY:-}" ]; then
+        export CHUDWARE_MFG_LANE_TEST_BINARY="$REPO/core/build-linux/bin/test_mfg_lane"
+        if [ ! -x "$CHUDWARE_MFG_LANE_TEST_BINARY" ]; then
+            record "pytest             FAIL    freshly built manufacturing lane fixture is missing"
+            fail_fatal=1
+            return 1
+        fi
+    fi
+
     # --- per-unit sweep ---
     # One invocation per unit avoids cross-suite import-order pollution.
     #
@@ -773,12 +782,13 @@ stage_bench() {
 }
 
 # ---- perf-regression: modeling perf (tools/perf_regression.py) ----------------
-# Times the geometry kernel against tools/perf_baseline.json and flags median slowdowns.
+# Times the kernel against CHUDWARE_PERF_BASELINE (default tools/perf_baseline.json).
 # Env-gated (perf timings are machine + load sensitive, so this is NOT a hard blocker by
 # default): set CHUDWARE_RUN_PERF=1 to run. A regression is RECORDED (non-fatal) unless
 # CHUDWARE_PERF_FATAL=1. Needs a loadable .so — prefers this gate's core/build-linux
 # engine; falls back to whatever core_bridge
-# resolves. Update the baseline deliberately with `python tools/perf_regression.py --update`.
+# resolves. Capture a baseline on the same machine/thread environment with
+# `python tools/perf_regression.py --baseline <path> --update`; legacy records are rejected.
 stage_perf() {
     echo "=== modeling perf-regression ==="
     if [ "${CHUDWARE_RUN_PERF:-0}" != "1" ]; then
@@ -795,7 +805,8 @@ stage_perf() {
         export CHUDWARE_LIBCHUDWARE="$REPO/core/build-linux/bin/libchudware.so"
     fi
     local rc=0
-    "$perf_py" "$REPO/tools/perf_regression.py" --iters "${CHUDWARE_PERF_ITERS:-5}" \
+    CHUDWARE_ENGINE_DAEMON=0 "$perf_py" "$REPO/tools/perf_regression.py" --iters "${CHUDWARE_PERF_ITERS:-5}" \
+        --baseline "${CHUDWARE_PERF_BASELINE:-$REPO/tools/perf_baseline.json}" \
         --json ${GATE_TMP}/perf.json > ${GATE_TMP}/perf.out 2>&1 || rc=$?
     tail -n 16 ${GATE_TMP}/perf.out | sed 's/^/    /'
     if [ "$rc" -eq 0 ]; then
@@ -805,8 +816,11 @@ stage_perf() {
         record "perf-regression     $([ "${CHUDWARE_PERF_FATAL:-0}" = 1 ] && echo FAIL || echo WARN)    median regression vs baseline (see ${GATE_TMP}/perf.out)"
         echo "  REGRESSION detected"
         [ "${CHUDWARE_PERF_FATAL:-0}" = 1 ] && fail_fatal=1
+    elif [ "$rc" -eq 2 ]; then
+        skip_stage env "perf-regression" "engine unavailable (rc=$rc)" "engine unavailable"
     else
-        skip_stage env "perf-regression" "harness could not run (rc=$rc; likely no loadable .so)" "harness rc=$rc"
+        record "perf-regression     FAIL    invalid measurement or harness failure (rc=$rc; see ${GATE_TMP}/perf.out)"
+        fail_fatal=1
     fi
 }
 

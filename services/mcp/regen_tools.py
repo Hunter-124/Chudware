@@ -25,7 +25,7 @@ from typing import Callable, Optional
 
 from services.agent.chudcode_host import HelperCompletionError
 from services.agent.providers.base import ProviderUnreachable
-from services.agent.regen_diagnosis import detect_failures
+from services.agent.regen_diagnosis import detect_failures, diagnostic_failures
 
 
 def _journal_sink() -> Callable[[dict], None]:
@@ -58,7 +58,7 @@ def _verify(document: dict, diagnosis, reference_document: Optional[dict]):
       * core + reference doc  -> binary rebuild AND compare_parts vs the last-good revision;
       * core, no reference    -> does the fix rebuild? (no known-good to compare an in-the-wild
                                  failure against);
-      * no core               -> structural: is the anomaly cleared?
+      * no core               -> structural only; native-only failures remain unverified
     Returns (score|None, detail)."""
     claimed = diagnosis.n_applied > 0
     try:
@@ -68,6 +68,8 @@ def _verify(document: dict, diagnosis, reference_document: Optional[dict]):
         opener = compare_fn = None
 
     if opener is None:
+        if any(f.kind == "native_rebuild" for f in diagnostic_failures(document)):
+            return None, {"mode": "unavailable", "reason": "native rebuild verification unavailable"}
         cleared = not detect_failures(diagnosis.fixed_document)
         return (1.0 if (claimed and cleared) else 0.0), {"mode": "fixture", "anomaly_gone": cleared}
 
@@ -78,8 +80,13 @@ def _verify(document: dict, diagnosis, reference_document: Optional[dict]):
         return score, detail
 
     res = opener(diagnosis.fixed_document)
-    return (1.0 if (claimed and res["rebuilt"]) else 0.0), {
-        "mode": "live-rebuild-only", "rebuilt": res["rebuilt"], "rebuild_error": res.get("error")}
+    try:
+        return (1.0 if (claimed and res["rebuilt"]) else 0.0), {
+            "mode": "live-rebuild-only", "rebuilt": res["rebuilt"], "rebuild_error": res.get("error")}
+    finally:
+        closer = getattr(opener, "close", None)
+        if closer and res.get("doc_id"):
+            closer(res["doc_id"])
 
 
 def _no_llm_result(document: dict, reason: str) -> dict:
@@ -92,7 +99,7 @@ def _no_llm_result(document: dict, reason: str) -> dict:
     return {
         "ok": False,
         "reason": reason,
-        "failures": [f.to_dict() for f in detect_failures(document)],
+        "failures": [f.to_dict() for f in diagnostic_failures(document)],
     }
 
 

@@ -70,6 +70,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from services.agent import request_context as _rc
+
 # ---------------------------------------------------------------- states
 
 QUEUED = "queued"
@@ -90,24 +92,65 @@ _STALL_S = 120.0
 _TTL_S = float(os.environ.get("CHUDWARE_SIM_JOB_TTL_S", "86400") or 86400)
 
 
-def jobs_dir() -> Path:
+def jobs_dir(*, create: bool = True) -> Path:
     """Spool root: ``$CHUDWARE_SIM_JOBS_DIR`` or ``<appdata root>/sim_jobs``."""
-    override = os.environ.get("CHUDWARE_SIM_JOBS_DIR")
-    if override:
-        d = Path(override)
+    if _rc.in_cell():
+        d = _rc.actor_state_root() / "sim_jobs"
+    elif os.environ.get("CHUDWARE_SIM_JOBS_DIR"):
+        d = Path(os.environ["CHUDWARE_SIM_JOBS_DIR"])
     else:
         try:
-            from services.paths import appdata_root  # noqa: PLC0415
+            if create:
+                from services.paths import appdata_root  # noqa: PLC0415
+            else:
+                # A census may use the worker's already-loaded path authority,
+                # never import it (or trigger its legacy-root migration).
+                appdata_root = sys.modules["services.paths"].appdata_root
             d = appdata_root() / "sim_jobs"
         except Exception:  # noqa: BLE001 — never let a path helper break job start
+            if not create:
+                raise
             import tempfile
             d = Path(tempfile.gettempdir()) / "Chudware" / "sim_jobs"
-    d.mkdir(parents=True, exist_ok=True)
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
     return d
 
 
+def _owner_text() -> Optional[str]:
+    owner = _rc.owner_key()
+    return json.dumps(owner) if owner is not None else None
+
+
+def _desktop_directory(job_id: str) -> Path:
+    if (not isinstance(job_id, str) or not job_id or job_id in (".", "..")
+            or "/" in job_id or "\\" in job_id or "\x00" in job_id):
+        raise KeyError("not_found")
+    root = jobs_dir()
+    path = root / job_id
+    if path.resolve().parent != root.resolve():
+        raise KeyError("not_found")
+    return path
+
+
+def _directory(row: sqlite3.Row) -> Path:
+    if row["owner"] != _owner_text():
+        raise KeyError("not_found")
+    if not _rc.in_cell():
+        return _desktop_directory(row["job_id"])
+    path = Path(row["storage_dir"] or "")
+    if not path.is_absolute() or path.resolve().parent != jobs_dir().resolve():
+        raise KeyError("not_found")
+    return path
+
+
 def job_dir(job_id: str) -> Path:
-    return jobs_dir() / job_id
+    if not _rc.in_cell():
+        return _desktop_directory(job_id)
+    row = _row(job_id)
+    if row is None:
+        raise KeyError("not_found")
+    return _directory(row)
 
 
 def _db_path() -> Path:
@@ -124,22 +167,38 @@ def _db() -> sqlite3.Connection:
         " job_id TEXT PRIMARY KEY, kind TEXT NOT NULL, stage TEXT NOT NULL,"
         " state TEXT NOT NULL, pid INTEGER, pgid INTEGER, proc_key TEXT,"
         " created_at REAL, started_at REAL, done_at REAL,"
-        " cancel_requested INTEGER DEFAULT 0, error TEXT, meta TEXT)")
+        " cancel_requested INTEGER DEFAULT 0, error TEXT, meta TEXT,"
+        " owner TEXT, storage_dir TEXT)")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if not {"owner", "storage_dir"} <= columns:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+            for name in ("owner", "storage_dir"):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")
     return conn
 
 
 def _set(job_id: str, **cols: Any) -> None:
     if not cols:
         return
+    if _rc.in_cell() and _row(job_id) is None:
+        raise KeyError("not_found")
     sets = ", ".join(f"{k}=?" for k in cols)
     with _db() as conn:
-        conn.execute(f"UPDATE jobs SET {sets} WHERE job_id=?",
-                     (*cols.values(), job_id))
+        conn.execute(f"UPDATE jobs SET {sets} WHERE job_id=? AND owner IS ?",
+                     (*cols.values(), job_id, _owner_text()))
 
 
 def _row(job_id: str) -> Optional[sqlite3.Row]:
+    if _rc.in_cell() and (
+            not isinstance(job_id, str) or not job_id or job_id in (".", "..")
+            or "/" in job_id or "\\" in job_id or "\x00" in job_id):
+        return None
     with _db() as conn:
-        cur = conn.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,))
+        cur = conn.execute("SELECT * FROM jobs WHERE job_id=? AND owner IS ?",
+                           (job_id, _owner_text()))
         return cur.fetchone()
 
 
@@ -841,10 +900,11 @@ def _prune(conn: sqlite3.Connection) -> None:
     """Drop rows + spool dirs of TERMINAL jobs older than the TTL. Running jobs never."""
     cutoff = time.time() - _TTL_S
     rows = conn.execute(
-        "SELECT job_id FROM jobs WHERE state IN (?,?,?) AND done_at IS NOT NULL "
-        "AND done_at < ?", (DONE, FAILED, CANCELLED, cutoff)).fetchall()
+        "SELECT * FROM jobs WHERE state IN (?,?,?) AND done_at IS NOT NULL "
+        "AND done_at < ? AND owner IS ?",
+        (DONE, FAILED, CANCELLED, cutoff, _owner_text())).fetchall()
     for r in rows:
-        shutil.rmtree(job_dir(r["job_id"]), ignore_errors=True)
+        shutil.rmtree(_directory(r), ignore_errors=True)
         conn.execute("DELETE FROM jobs WHERE job_id=?", (r["job_id"],))
 
 
@@ -858,12 +918,20 @@ def _module_command(module: str) -> list[str]:
 
 def start(kind: str, stage: str, payload: dict, meta: Optional[dict] = None) -> dict:
     """Validate setup, spawn one stage process, and return its durable job id."""
-    job_id = "sim-" + uuid.uuid4().hex[:12]
-    d = job_dir(job_id)
+    token = uuid.uuid4().hex
+    job_id = "sim-" + (token if _rc.in_cell() else token[:12])
+    d = (jobs_dir() / ("spool-" + uuid.uuid4().hex) if _rc.in_cell()
+         else job_dir(job_id))
     # The job id has to exist BEFORE validation so a payload can address the job's own
     # spool (PROGRESS_TOKEN) and be validated against the paths the child will really see.
     payload = _resolve_tokens(payload, str(d / "progress.json"))
     payload_json, meta_json = _validate_start(kind, stage, payload, meta)
+    if _rc.in_cell():
+        spec = json.loads(payload_json)
+        spec["ctx"] = _rc.current_context()
+        spec["roots"] = {"project": _rc.root_value("CHUDWARE_PROJECT_DIR", "/work"),
+                         "save": _rc.root_value("CHUDWARE_PROJECT_SAVE_DIR", "/work")}
+        payload_json = _json_text(spec, "job payload")
     d.mkdir(parents=True, exist_ok=True)
     try:
         (d / "payload.json").write_text(payload_json, encoding="utf-8")
@@ -871,9 +939,9 @@ def start(kind: str, stage: str, payload: dict, meta: Optional[dict] = None) -> 
         with _db() as conn:
             _prune(conn)
             conn.execute(
-                "INSERT INTO jobs(job_id,kind,stage,state,created_at,started_at,meta)"
-                " VALUES(?,?,?,?,?,?,?)",
-                (job_id, kind, stage, QUEUED, now, now, meta_json))
+                "INSERT INTO jobs(job_id,kind,stage,state,created_at,started_at,meta,owner,storage_dir)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                (job_id, kind, stage, QUEUED, now, now, meta_json, _owner_text(), str(d)))
     except Exception:
         shutil.rmtree(d, ignore_errors=True)
         raise
@@ -881,6 +949,8 @@ def start(kind: str, stage: str, payload: dict, meta: Optional[dict] = None) -> 
     env = dict(os.environ)
     env["CHUDWARE_ENGINE_DAEMON"] = "0"
     env["PYTHONUNBUFFERED"] = "1"
+    if _rc.in_cell():
+        env["CHUDWARE_CELL"] = "1"
     repo_root = Path(__file__).resolve().parents[2]
     env["PYTHONPATH"] = os.pathsep.join(
         [str(repo_root), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
@@ -888,8 +958,10 @@ def start(kind: str, stage: str, payload: dict, meta: Optional[dict] = None) -> 
         log = open(d / "worker.log", "wb")
         try:
             proc = subprocess.Popen(
-                [*_module_command("services.sim.job_worker"), job_id],
-                cwd=str(repo_root), env=env, stdout=log, stderr=subprocess.STDOUT,
+                _rc.sandbox_argv([*_module_command("services.sim.job_worker"), job_id,
+                                  *(["--job-dir", str(d)] if _rc.in_cell() else [])]),
+                cwd="/work" if _rc.in_cell() else str(repo_root),
+                env=env, stdout=log, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, start_new_session=True)
         finally:
             log.close()
@@ -900,7 +972,7 @@ def start(kind: str, stage: str, payload: dict, meta: Optional[dict] = None) -> 
         raise
     _set(job_id, state=RUNNING, pid=proc.pid, pgid=proc.pid,
          proc_key=_proc_key(proc.pid))
-    _LOCAL_PROCS[job_id] = proc
+    _LOCAL_PROCS[_rc.scoped_key(job_id)] = proc
     return {"job_id": job_id, "state": RUNNING, "pid": proc.pid, "kind": kind,
             "stage": stage, "started_at": now}
 
@@ -908,6 +980,38 @@ def start(kind: str, stage: str, payload: dict, meta: Optional[dict] = None) -> 
 # Popen handles for jobs THIS process started, so we can reap them and never leave a
 # zombie that would make pid_alive() lie about a killed worker.
 _LOCAL_PROCS: dict[str, subprocess.Popen] = {}
+
+
+def worker_activity() -> dict:
+    """Read the existing registry without creating, reconciling or cancelling it."""
+    children = [proc for key, proc in list(_LOCAL_PROCS.items())
+                if _rc.owns_registry_key(key) and proc.poll() is None]
+    database = jobs_dir(create=False) / "jobs.sqlite"
+    if not database.exists():
+        if children:
+            raise RuntimeError("simulation_registry_missing")
+        return {"by_kind": {"simulation_jobs": 0}, "processes": []}
+    if database.is_symlink():
+        raise RuntimeError("simulation_registry_unsafe")
+    with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=0.1) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT state,pid,pgid,proc_key FROM jobs WHERE owner IS ?",
+            (_owner_text(),)).fetchmany(65537)
+    if len(rows) > 65536:
+        raise RuntimeError("simulation_registry_oversized")
+    from services.worker_activity import _process_snapshot
+
+    records = _process_snapshot()
+    groups = {record.group for record in records.values()}
+    active = 0
+    for row in rows:
+        record = records.get(row["pid"])
+        alive = record is not None and (not row["proc_key"] or record.start == row["proc_key"])
+        if ((row["state"] == QUEUED and not row["pid"]) or alive
+                or (row["state"] not in TERMINAL and row["pgid"] in groups)):
+            active += 1
+    return {"by_kind": {"simulation_jobs": active}, "processes": children}
 
 
 # ---------------------------------------------------------------- read
@@ -932,6 +1036,9 @@ UNKNOWN_JOB_HELP = (
 
 
 def unknown(job_id: str) -> dict:
+    if _rc.in_cell():
+        return {"ok": False, "state": "unknown", "error": "not_found",
+                "reason": "not_found", "code": "not_found"}
     return {"ok": False, "job_id": job_id, "state": "unknown",
             "error": UNKNOWN_JOB_HELP.format(dir=jobs_dir(), ttl=_TTL_S / 3600.0)}
 
@@ -940,7 +1047,7 @@ def _reconcile(row: sqlite3.Row) -> dict:
     """Adopt terminal verdicts from both spool data and live process truth."""
     job_id = row["job_id"]
     state = row["state"]
-    d = job_dir(job_id)
+    d = _directory(row)
     out: dict = {"job_id": job_id, "kind": row["kind"], "stage": row["stage"],
                  "state": state, "pid": row["pid"],
                  "started_at": row["started_at"], "done_at": row["done_at"],
@@ -1031,7 +1138,7 @@ def _log_tail(job_id: str, limit: int = 400) -> str:
 
 
 def _reap(job_id: str) -> None:
-    proc = _LOCAL_PROCS.pop(job_id, None)
+    proc = _LOCAL_PROCS.pop(_rc.scoped_key(job_id), None)
     if proc is not None:
         try:
             proc.wait(timeout=2.0)
@@ -1071,6 +1178,8 @@ def partial(job_id: str) -> Optional[dict]:
 def raw_result(job_id: str) -> Optional[dict]:
     """The stage result only when the durable state is successfully done."""
     row = _row(job_id)
+    if row is None and _rc.in_cell():
+        raise KeyError("not_found")
     if row is None or _reconcile(row).get("state") != DONE:
         return None
     finished = _read_json(job_dir(job_id) / "result.json")
@@ -1083,6 +1192,8 @@ def raw_result(job_id: str) -> Optional[dict]:
 def refusal_result(job_id: str) -> Optional[dict]:
     """A failed stage's diagnostic packet, never a converged/collectable result."""
     row = _row(job_id)
+    if row is None and _rc.in_cell():
+        raise KeyError("not_found")
     if row is None or _reconcile(row).get("state") != FAILED:
         return None
     finished = _read_json(job_dir(job_id) / "result.json")
@@ -1098,6 +1209,8 @@ def terminal_result(job_id: str) -> Optional[dict]:
     raced a finished stage keeps that stage's own reply; the job is still CANCELLED.
     """
     row = _row(job_id)
+    if row is None and _rc.in_cell():
+        raise KeyError("not_found")
     if row is None or _reconcile(row).get("state") not in (FAILED, CANCELLED):
         return None
     finished = _read_json(job_dir(job_id) / "result.json")
@@ -1195,7 +1308,8 @@ def save_collect_evidence(job_id: str, value: dict) -> bool:
 def list_jobs(limit: int = 20) -> list:
     with _db() as conn:
         rows = conn.execute(
-            "SELECT * FROM jobs ORDER BY started_at DESC LIMIT ?", (int(limit),)).fetchall()
+            "SELECT * FROM jobs WHERE owner IS ? ORDER BY started_at DESC LIMIT ?",
+            (_owner_text(), int(limit))).fetchall()
     return [status(r["job_id"]) for r in rows]
 
 
@@ -1203,6 +1317,7 @@ def list_jobs(limit: int = 20) -> list:
 
 def cancel(job_id: str, timeout_s: float = 5.0) -> dict:
     """Terminate the entire process group and prove no solver child survived."""
+    delegate = _rc.control_delegate("cancel")
     row = _row(job_id)
     if row is None:
         return unknown(job_id)
@@ -1248,6 +1363,16 @@ def cancel(job_id: str, timeout_s: float = 5.0) -> dict:
     now = time.time()
     state = RUNNING if still_alive else CANCELLED
     error = None if still_alive else "cancelled by sim_cancel"
+    if delegate and not still_alive:
+        error = "manager_stop"
+        meta = _read_json_str(row["meta"])
+        meta["last_control_stop"] = {"reason": "manager_stop", "control_delegate": delegate}
+        _set(job_id, meta=json.dumps(meta))
+        event = {"kind": "run_stopped", "job_id": job_id, "reason": "manager_stop",
+                 "control_delegate": delegate, "ts": now}
+        with (job_dir(job_id) / "control-events.jsonl").open("a") as audit:
+            audit.write(json.dumps(event) + "\n")
+            audit.flush()
     _set(job_id, state=state, error=error, done_at=None if still_alive else now)
     out = {"ok": not still_alive, "job_id": job_id, "state": state, "pid": pid,
            "signals": signals, "pid_alive_after": pid_still_alive,
@@ -1255,13 +1380,22 @@ def cancel(job_id: str, timeout_s: float = 5.0) -> dict:
     if still_alive:
         out["error"] = (f"solver process group is STILL ALIVE after "
                         f"{signals or ['no signal']} — do not treat this job as cancelled")
+    if delegate:
+        result = {"ok": out["ok"], "job_id": job_id, "state": state,
+                  "terminated": out["terminated"]}
+        if still_alive:
+            result["error"] = "solver process group is still alive"
+        else:
+            result.update(reason="manager_stop", control_delegate=delegate)
+        return result
     return out
 
 
 def _reap_nb(job_id: str) -> None:
-    proc = _LOCAL_PROCS.get(job_id)
+    key = _rc.scoped_key(job_id)
+    proc = _LOCAL_PROCS.get(key)
     if proc is not None and proc.poll() is not None:
-        _LOCAL_PROCS.pop(job_id, None)
+        _LOCAL_PROCS.pop(key, None)
 
 
 def _group_alive(pgid) -> bool:

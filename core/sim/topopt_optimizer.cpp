@@ -1985,6 +1985,8 @@ private:
       mr.overhang_evaluated = true;
       mr.overhang_in_objective = overhang_w_ > 0;
       mr.build_direction = overhang_.settings().build_direction;
+      mr.build_direction_source = P_.build_plate ? "build_plate" : "build_direction";
+      mr.build_plate = P_.build_plate;
       mr.overhang_angle_deg = S_.overhang_angle_deg;
       mr.overhang_penalty = overhang_w_;
       mr.overhang_measure = overhang_.measure(rho_eval_, nullptr);
@@ -1998,6 +2000,13 @@ private:
     mr.min_member_m = P_.min_member_m;
     mr.filter_radius_m = P_.filter_radius_m;
     mr.filter_radius_source = P_.filter_radius_source;
+    if (P_.evidence.contains("filter") &&
+        P_.evidence["filter"].contains("min_member_filter_radius_mm")) {
+      mr.min_member_filter_radius_mm =
+          P_.evidence["filter"]["min_member_filter_radius_mm"].get<double>();
+      mr.mesh_floor_radius_mm =
+          P_.evidence["filter"]["mesh_floor_radius_mm"].get<double>();
+    }
     switch (S_.method) {
     case Method::Simp:
     case Method::Ramp:

@@ -685,8 +685,29 @@ void fmDrawEyeGlyph(ImVec2 mn, ImVec2 mx, bool shown, bool hovered) {
 struct PendingTreeOps { nlohmann::json ops; std::string what; };
 static std::vector<PendingTreeOps> s_pendingTreeOps;
 
+
+static bool refuseAgentLockedTreeDoc(AppState& st, const std::string& docId) {
+    if (!st.docLockedByAgent(docId)) return false;
+    st.toast(ui::ToastLevel::Warn, st.agentLockReason(docId));
+    return true;
+}
+
+// Nested edits can target a different, already-open part as well as the active assembly.
+static std::string nestedAgentLockReason(AppState& st, const std::string& sourcePath) {
+    if (st.activeDocLockedByAgent()) return st.agentLockReason(st.docMirror.docId());
+    if (sourcePath.empty()) return {};
+    for (const auto& tab : st.docTabs) {
+        if (tab.path.empty() || !st.docLockedByAgent(tab.docId)) continue;
+        if (tab.path == sourcePath ||
+            std::filesystem::path(tab.path).lexically_normal() ==
+                std::filesystem::path(sourcePath).lexically_normal())
+            return st.agentLockReason(tab.docId);
+    }
+    return {};
+}
 static void applyTreeOpsNow(AppState& st, const nlohmann::json& ops, const char* what) {
     if (!st.docMirror.hasDoc() || !st.workerStarted) return;
+    if (refuseAgentLockedTreeDoc(st, st.docMirror.docId())) return;
     // T-PERF1: async apply so suppress/reorder/delete never freezes the GL thread. Batch
     // multiple pending ops from one flush into a single doc_apply_ops (see flushPendingTreeOps).
     const std::string whatStr = what ? what : "tree op";
@@ -716,7 +737,7 @@ static void applyTreeOpsNow(AppState& st, const nlohmann::json& ops, const char*
 }
 
 static void applyTreeOps(AppState& st, const nlohmann::json& ops, const char* what) {
-    (void)st;
+    if (refuseAgentLockedTreeDoc(st, st.docMirror.docId())) return;
     s_pendingTreeOps.push_back({ops, what});
 }
 
@@ -835,6 +856,7 @@ static std::vector<uint32_t> bodyIdsFromWorkerEnvelope(const nlohmann::json& res
 // NestedDocument re-reads on next save/exit (mtime-keyed cache).
 static void applyNestedMaterialOnActiveMirror(AppState& st, const std::string& key, bool remove) {
     if (!st.docMirror.hasDoc() || !st.workerStarted) return;
+    if (refuseAgentLockedTreeDoc(st, st.docMirror.docId())) return;
     std::vector<uint32_t> bodies = st.docBodyIds;
     if (bodies.empty()) bodies.push_back(1);
     applyTreeOpsNow(st, nestedMaterialOps(key, remove, bodies), "set_material");
@@ -845,6 +867,8 @@ static void applyNestedMaterialOnActiveMirror(AppState& st, const std::string& k
 static void applyNestedMaterialOnDisk(AppState& st, const std::string& absPath,
                                       const std::string& key, bool remove) {
     if (!st.workerStarted || absPath.empty()) return;
+    const std::string lockReason = nestedAgentLockReason(st, absPath);
+    if (!lockReason.empty()) { st.toast(ui::ToastLevel::Warn, lockReason); return; }
     nlohmann::json openRes;
     std::string err;
     if (!st.worker.call("doc_open", nlohmann::json{{"path", absPath}}, openRes, err)) {
@@ -863,6 +887,8 @@ static void applyNestedMaterialOnDisk(AppState& st, const std::string& absPath,
         st.toast(ui::ToastLevel::Error, "Assign Material: open returned no doc_id");
         return;
     }
+    // The open may bind an agent's doc not represented by a GUI tab. Do not close it on refusal.
+    if (refuseAgentLockedTreeDoc(st, did)) return;
     // Never steal the assembly's active doc_id — if open re-bound an already-open tab doc, bail
     // without applying (the live-mirror path should have caught this). Close only when the id is
     // distinct from every open tab AND the active mirror.
@@ -1034,6 +1060,7 @@ static std::string s_docPath;
 // Returns true if at least one feature's bundle was captured into st.clipboard.
 static bool copyFeatureToClipboard(AppState& st, const std::vector<std::string>& fids) {
     if (fids.empty() || !st.docMirror.hasDoc() || !st.workerStarted) return false;
+    if (refuseAgentLockedTreeDoc(st, st.docMirror.docId())) return false;
     if (st.anyRunActive()) return false;   // same canDoc gate the tree mutations use
     std::vector<nlohmann::json> bundles;
     bool prevSuppress = st.suppressTabDirty;
@@ -1107,6 +1134,7 @@ bool featurePasteSelection(AppState& st) {
     if (st.clipboard.kind != AppState::Clipboard::Kind::Feature ||
         st.clipboard.payloads.empty())
         return false;
+    if (refuseAgentLockedTreeDoc(st, st.docMirror.docId())) return false;
     if (!st.docMirror.hasDoc() || !st.workerStarted || st.anyRunActive()) return false;
     nlohmann::json ops = nlohmann::json::array();
     for (const auto& bundle : st.clipboard.payloads)
@@ -1123,6 +1151,7 @@ bool featurePasteSelection(AppState& st) {
 // surfaces an engine block (a downstream feature depends on this one) as a warning toast and leaves
 // the tree unchanged. No-op (false) without a live, idle doc or an eligible selection.
 bool featureDeleteSelection(AppState& st) {
+    if (refuseAgentLockedTreeDoc(st, st.docMirror.docId())) return false;
     if (!st.docMirror.hasDoc() || !st.workerStarted || st.anyRunActive()) return false;
     auto fids = featureCopySet(st);   // full multi-select if the primary is in it, else the primary
     if (fids.empty()) return false;
@@ -1783,12 +1812,8 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
             }
         }
         ImGui::Separator();
-        if (!c.canDoc) ImGui::BeginDisabled();   // gate mutating items while an agent run is busy
-
-        // ---- type-specific edit / open (selection-dependent; item 8 FM RMB) ----
-        if (multi) {
-            // Multi-select: no Edit / Open / Rename — only bulk ops below.
-        } else if (isImportComponent) {
+        // Read-only referenced-file navigation stays available during an agent edit.
+        if (!multi && isImportComponent) {
             // Imported component: Open Part is the primary action (item 11).
             const bool canOpen = !importSrcPath.empty();
             if (!canOpen) ImGui::BeginDisabled();
@@ -1797,6 +1822,16 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
             if (haveOsFileManager() && ImGui::MenuItem("Open Part Location"))
                 revealInFileManager(importSrcPath);
             if (!canOpen) ImGui::EndDisabled();
+        }
+        if (!multi && ImGui::MenuItem("Zoom to Feature")) zoomToFeature(st, fid);
+        if (st.activeDocLockedByAgent())
+            ImGui::TextWrapped("%s", st.agentLockReason(st.docMirror.docId()).c_str());
+        if (!c.canDoc) ImGui::BeginDisabled();   // gate mutating items while an agent run is busy
+
+        // ---- type-specific edit / open (selection-dependent; item 8 FM RMB) ----
+        if (multi) {
+            // Multi-select: no Edit / Open / Rename — only bulk ops below.
+        } else if (isImportComponent) {
             if (ImGui::MenuItem("Rename")) {
                 s_renamingId = fid;
                 std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", c.name.c_str());
@@ -1905,7 +1940,6 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         // View / history tools (single-row only).
         if (!multi) {
             ImGui::Separator();
-            if (ImGui::MenuItem("Zoom to Feature")) zoomToFeature(st, fid);
             if (ImGui::MenuItem("Rollback to Here")) {
                 applyTreeOps(st, nlohmann::json::array({
                     {{"op", "set_rollback"}, {"after", fid}}}), "rollback");
@@ -2407,12 +2441,20 @@ static void beginNestedFeatureEdit(AppState& st, const std::string& componentId,
                                    const std::string& sourcePath,
                                    const ui::NestedFeature& feature) {
     if (sourcePath.empty() || feature.id.empty() || st.inComponentEdit()) return;
+    const std::string lockReason = nestedAgentLockReason(st, sourcePath);
+    if (!lockReason.empty()) { st.toast(ui::ToastLevel::Warn, lockReason); return; }
     s_pendingNestedEdit = {componentId, sourcePath, feature.id, 0};
     st.enterComponentEdit(componentId, sourcePath);
 }
 
 static void servicePendingNestedEdit(AppState& st) {
     if (s_pendingNestedEdit.featureId.empty()) return;
+    const std::string lockReason = nestedAgentLockReason(st, s_pendingNestedEdit.sourcePath);
+    if (!lockReason.empty()) {
+        st.toast(ui::ToastLevel::Warn, lockReason);
+        s_pendingNestedEdit = {};
+        return;
+    }
     if (++s_pendingNestedEdit.waitFrames > 900) {
         st.toast(ui::ToastLevel::Warn, "Referenced feature did not become editable");
         s_pendingNestedEdit = {};
@@ -2502,10 +2544,13 @@ static bool drawComponentFeatureRow(AppState& st, const std::string& idSuffix,
     }
     if (!expandable) treeIconInArrowSlot(rowPos, icon, "[f]");
     fmRowPillEnd(rect, picked);
+    const std::string lockReason = nestedAgentLockReason(st, sourcePath);
+    editable = editable && lockReason.empty();
     const bool activate = editable && ImGui::IsItemHovered() &&
                           ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
     ui::pushContextMenuStyle();
     if (ImGui::BeginPopupContextItem(("##nested_feature_" + idSuffix).c_str())) {
+        if (!lockReason.empty()) ImGui::TextWrapped("%s", lockReason.c_str());
         if (!editable) ImGui::BeginDisabled();
         if (ImGui::MenuItem("Edit in Assembly"))
             beginNestedFeatureEdit(st, topComponentId, sourcePath, feature);
@@ -2721,6 +2766,9 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
             if (ImGui::BeginPopupContextItem(("##nmat_ctx_" + rowId).c_str())) {
                 ImGui::TextDisabled("Assign Material");
                 ImGui::Separator();
+                const std::string lockReason = nestedAgentLockReason(st, componentPath);
+                if (!lockReason.empty()) ImGui::TextWrapped("%s", lockReason.c_str());
+                ImGui::BeginDisabled(!lockReason.empty());
                 for (int i = 0; i < kPhysicalMaterialsCount; ++i) {
                     const auto& pm = kPhysicalMaterials[i];
                     const bool cur = (matKey == pm.key);
@@ -2732,6 +2780,7 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
                     if (ImGui::MenuItem("Remove Material"))
                         queueNestedMaterial(componentPath, {}, /*remove=*/true);
                 }
+                ImGui::EndDisabled();
                 ImGui::EndPopup();
             }
             ui::popContextMenuStyle();
@@ -3051,11 +3100,14 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
         bool   overCompEye = ImGui::IsMouseHoveringRect(cEyeMin, cEyeMax);
         drawEyeGlyph(ImGui::GetWindowDrawList(), cEyeMin, cEyeMax, !hidden, overCompEye, fmSurf());
         auto toggleCompHidden = [&](bool newHidden) {
+            if (refuseAgentLockedTreeDoc(st, st.docMirror.docId())) return;
             applyTreeOps(st, nlohmann::json::array({
                 {{"op","asm_edit_component"},{"id",cid},{"hidden",newHidden}}}), "component");
         };
         if (overCompEye) {
-            ImGui::SetTooltip(hidden ? "Show Component" : "Hide Component");
+            const std::string reason = st.agentLockReason(st.docMirror.docId());
+            ImGui::SetTooltip("%s", reason.empty() ? (hidden ? "Show Component" : "Hide Component")
+                                                   : reason.c_str());
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) toggleCompHidden(!hidden);
         }
         // Wave4: armed cube — LMB on component (not the eye) toggles chat context ref.
@@ -3063,15 +3115,20 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             pushComponentContextRef(st, cid, cname);
         ui::pushContextMenuStyle();
         if (ImGui::BeginPopupContextItem(("##cctx_" + cid).c_str())) {
+            const std::string lockReason = nestedAgentLockReason(st, absPath);
+            if (!lockReason.empty()) ImGui::TextWrapped("%s", lockReason.c_str());
+            ImGui::BeginDisabled(st.activeDocLockedByAgent());
             // "Edit" = edit this component's PLACEMENT / mates in the assembly (the common action):
             // route through the request seam AsmPanels::draw() consumes to open + focus the Mate
             // panel for this component. Placed first (above "Edit Model") as the default edit.
             if (ImGui::MenuItem("Edit"))
                 st.requestEditComponentMates = cid;
+            ImGui::EndDisabled();
             // Whole-model editing remains available, while an individual nested feature's
             // Edit in Assembly action opens the real parameter form directly.
             const bool editableModel =
-                !unavailable && nestedDoc.state == ui::NestedDocumentState::Ready;
+                !unavailable && nestedDoc.state == ui::NestedDocumentState::Ready &&
+                lockReason.empty();
             if (!editableModel) ImGui::BeginDisabled();
             if (ImGui::MenuItem("Edit Model"))
                 st.enterComponentEdit(cid, absPath);
@@ -3085,7 +3142,8 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             if (unavailable) ImGui::EndDisabled();
             ImGui::Separator();
             if (ImGui::MenuItem("Add to AI context")) pushComponentContextRef(st, cid, cname);
-            if (ImGui::MenuItem(hidden ? "Show Component" : "Hide Component"))
+            if (ImGui::MenuItem(hidden ? "Show Component" : "Hide Component", nullptr, false,
+                                !st.activeDocLockedByAgent()))
                 toggleCompHidden(!hidden);
             ImGui::EndPopup();
         }
@@ -3218,6 +3276,9 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
 
                 ui::pushContextMenuStyle();
                 if (ImGui::BeginPopupContextItem(("##mctx_" + mid).c_str())) {
+                    const std::string lockReason = st.agentLockReason(st.docMirror.docId());
+                    if (!lockReason.empty()) ImGui::TextWrapped("%s", lockReason.c_str());
+                    ImGui::BeginDisabled(st.activeDocLockedByAgent());
                     // C25: deferred via applyTreeOps — applying here would invalidate the
                     // tree json this loop iterates (same UAF as feature reorder).
                     if (ImGui::MenuItem(msup ? "Unsuppress" : "Suppress")) {
@@ -3229,6 +3290,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                         applyTreeOps(st, nlohmann::json::array({
                             {{"op","asm_delete_mate"},{"id",mid}}}), "mate");
                     }
+                    ImGui::EndDisabled();
                     ImGui::EndPopup();
                 }
                 ui::popContextMenuStyle();
@@ -3562,9 +3624,20 @@ static std::string openCacheNote(const core::DocMirror& m) {
     if (!m.lastOpenedCacheReported()) return {};
     if (m.lastOpenedCacheHit()) return "loaded from saved build cache";
     std::string why = m.lastOpenedCacheMissReason();
-    if (why.empty()) return "rebuilt from features";
-    std::replace(why.begin(), why.end(), '_', ' ');
-    return "rebuilt from features \xe2\x80\x94 saved cache not used: " + why;
+    std::string note = "rebuilt from features";
+    if (!why.empty()) {
+        std::replace(why.begin(), why.end(), '_', ' ');
+        note += " \xe2\x80\x94 saved cache not used: " + why;
+    }
+    // contracts/stepplus.md §17: the rebuild is saved into the file, so the next open is warm.
+    if (m.lastOpenedWriteback() > 0) {
+        note += "; build saved to the file";
+    } else if (m.lastOpenedWriteback() < 0) {
+        std::string refused = m.lastOpenedWritebackReason();
+        std::replace(refused.begin(), refused.end(), '_', ' ');
+        note += "; build not saved to the file (" + refused + ")";
+    }
+    return note;
 }
 
 // The open finished (mesh on screen or nothing to load): end the ticket and say how long it took
@@ -3823,7 +3896,7 @@ static void doOpenDoc(AppState& st) {
 // slot at the far left (Hunter red-pen placement); the left hairline starts just right of it.
 // Returns the (possibly toggled) open state; sets *addFolder on the frame its button is clicked.
 // addEn grays the button out (it still swallows its own clicks so a miss never collapses the list).
-static bool fmFeaturesHeader(bool* open, bool addEn, bool* addFolder) {
+static bool fmFeaturesHeader(bool* open, bool addEn, bool* addFolder, const char* disabledReason) {
     const float S = ui::uiScale;
     const float btn = 18.0f * S;
     bool addClicked = false;
@@ -3843,9 +3916,13 @@ static bool fmFeaturesHeader(bool* open, bool addEn, bool* addFolder) {
         const ImU32 col = addEn ? ImGui::ColorConvertFloat4ToU32(fmSurf().textPrimary)
                                 : ImGui::ColorConvertFloat4ToU32(ImVec4(dis[0], dis[1], dis[2], 0.5f));
         ui::drawIconGlass(dl, "folder_new", bc, btn * 0.72f, col, fmHalo(fmSurf()));
-        if (hov)
-            ImGui::SetTooltip("Add Folder\n(groups the selected features, or drops an empty folder "
-                              "to drag features into)");
+        if (ImGui::IsItemHovered()) {
+            if (!addEn && disabledReason && *disabledReason)
+                ImGui::SetTooltip("%s", disabledReason);
+            else if (hov)
+                ImGui::SetTooltip("Add Folder\n(groups the selected features, or drops an empty folder "
+                                  "to drag features into)");
+        }
     }, 0.0f, [](ImVec2, float) {});
     if (addFolder) *addFolder = addClicked;
     return *open;
@@ -3985,7 +4062,9 @@ static bool fm_icontains(const char* hay, const char* needle) {
 // Open / Save / Undo / Redo) that replaces the old wide text-button strip at the panel bottom.
 static void drawFeatureManagerTopStrip(AppState& st) {
     const auto& pal = fmPalette();
-    bool canDoc = st.workerStarted && !st.anyRunActive();
+    const bool canNavigate = st.workerStarted && !st.anyRunActive();
+    bool canDoc = canNavigate && !st.activeDocLockedByAgent();
+    const std::string lockReason = st.agentLockReason(st.docMirror.docId());
     const float S = ui::uiScale;
 
     // W5C: the old tree/Properties/Configurations stub tabs were removed here — they were visual
@@ -4008,12 +4087,12 @@ static void drawFeatureManagerTopStrip(AppState& st) {
     const float by = toolRowMin.y;
     auto toolBtn = [&](const char* id, const char* icon, const char* tip, bool en) -> bool {
         ImGui::SetCursorScreenPos(ImVec2(bx, by));
-        bool hit = toolbarIconBtn(id, icon, tip, en);
+        bool hit = toolbarIconBtn(id, icon, !en && !lockReason.empty() ? lockReason.c_str() : tip, en);
         bx += bw + gap;
         return hit;
     };
     ImGui::PushID("fm_toolbar");
-    if (toolBtn("fm_new", "new_doc", "New Part", canDoc) && canDoc) {
+    if (toolBtn("fm_new", "new_doc", "New Part", canNavigate) && canNavigate) {
         std::string err;
         // Multi-document: New Part opens a NEW tab (it does not replace the current doc). The
         // worker registry keeps the previous doc alive; addDocTab records this one and activates it.
@@ -4027,7 +4106,7 @@ static void drawFeatureManagerTopStrip(AppState& st) {
         }
         else st.addLog("[err] new part: " + err);
     }
-    if (toolBtn("fm_newasm", "assembly", "New Assembly", canDoc) && canDoc) {
+    if (toolBtn("fm_newasm", "assembly", "New Assembly", canNavigate) && canNavigate) {
         std::string err;
         st.suppressTabDirty = true;
         bool ok = st.docMirror.newAssembly(st.worker, err);
@@ -4039,9 +4118,9 @@ static void drawFeatureManagerTopStrip(AppState& st) {
             st.showRibbon = true; st.ribbonTab = AppState::RT_Features;
         } else st.addLog("[err] new assembly: " + err);
     }
-    if (toolBtn("fm_open", "open", "Open...", canDoc) && canDoc)
+    if (toolBtn("fm_open", "open", "Open...", canNavigate) && canNavigate)
         doOpenDoc(st);   // C41: native dialog -> DocMirror::open -> viewport refresh
-    bool canSave = canDoc && st.docMirror.hasDoc();
+    bool canSave = canNavigate && st.docMirror.hasDoc();
     if (toolBtn("fm_save", "save", "Save  (Shift-click: Save As...)", canSave) && canSave)
         doSaveDoc(st, /*forceDialog=*/ImGui::GetIO().KeyShift);   // C41
     // W1-B (item 4): route through the shared AppState helper so the toolbar buttons and the global
@@ -4136,7 +4215,8 @@ void drawFeatureTreeBody(AppState& st,
     // C37-E (item 2): the SAME guard the top toolbar uses (st.workerStarted && !st.anyRunActive()).
     // Every mutating tree interaction — context menu, drag-reorder, Ctrl+Up/Down, rollback drag —
     // is gated on this so no op fires while an agent run is in flight.
-    bool canDocTree = st.workerStarted && !st.anyRunActive();
+    bool canDocTree = st.workerStarted && !st.anyRunActive() && !st.activeDocLockedByAgent();
+    const std::string agentLockReason = st.agentLockReason(st.docMirror.docId());
 
     {
         // Filename / References / Features are three INDEPENDENT collapsible sections (Hunter):
@@ -4251,6 +4331,8 @@ void drawFeatureTreeBody(AppState& st,
                 if (fileRightClicked) ImGui::OpenPopup("##root_ctx");
                 ui::pushContextMenuStyle();
                 if (ImGui::BeginPopup("##root_ctx")) {
+                    if (!agentLockReason.empty()) ImGui::TextWrapped("%s", agentLockReason.c_str());
+                    ImGui::BeginDisabled(st.activeDocLockedByAgent());
                     if (ImGui::MenuItem("Appearance...")) {
                         s_rootColor[0] = 0.71f; s_rootColor[1] = 0.76f; s_rootColor[2] = 0.82f;
                         s_rootMetallic = 0.0f; s_rootRoughness = 0.5f;
@@ -4261,6 +4343,7 @@ void drawFeatureTreeBody(AppState& st,
                             {{"op", "set_appearance"}, {"id", "b1"}, {"color", nullptr}}}),
                             "set_appearance");
                     }
+                    ImGui::EndDisabled();
                     ImGui::EndPopup();
                 }
                 ui::popContextMenuStyle();
@@ -4268,7 +4351,8 @@ void drawFeatureTreeBody(AppState& st,
                 // ordering pitfalls; it is opened by the menu item via s_openRootPicker.
                 if (s_openRootPicker) { ImGui::OpenPopup("##appearance_root"); s_openRootPicker = false; }
                 if (appearanceColorPicker("##appearance_root", s_rootColor,
-                                          &s_rootMetallic, &s_rootRoughness)) {
+                                          &s_rootMetallic, &s_rootRoughness,
+                                          agentLockReason.empty() ? nullptr : agentLockReason.c_str())) {
                     applyTreeOps(st, nlohmann::json::array({
                         {{"op", "set_appearance"}, {"id", "b1"},
                          {"color", {s_rootColor[0], s_rootColor[1], s_rootColor[2]}},
@@ -4341,6 +4425,9 @@ void drawFeatureTreeBody(AppState& st,
                         if (ImGui::BeginPopupContextItem("##mat_ctx")) {
                             ImGui::TextDisabled("Assign Material");
                             ImGui::Separator();
+                            if (!agentLockReason.empty())
+                                ImGui::TextWrapped("%s", agentLockReason.c_str());
+                            ImGui::BeginDisabled(st.activeDocLockedByAgent());
                             // The set_appearance keys are AICM body ordinals ("b<n>"); recolour every
                             // body so a multi-body part takes the material wholesale. Empty body list
                             // (mesh not loaded yet) falls back to "b1", the common single-body case.
@@ -4370,6 +4457,7 @@ void drawFeatureTreeBody(AppState& st,
                                         "set_material");
                                 }
                             }
+                            ImGui::EndDisabled();
                             ImGui::EndPopup();
                         }
                         ui::popContextMenuStyle();
@@ -5127,7 +5215,7 @@ void drawFeatureTreeBody(AppState& st,
             // nothing selected it drops a blank folder at the bottom to drag features into (Hunter).
             const bool addEn = canDocTree && isPartDoc;
             bool addClicked = false;
-            fmFeaturesHeader(&s_featSecOpen, addEn, &addClicked);
+            fmFeaturesHeader(&s_featSecOpen, addEn, &addClicked, agentLockReason.c_str());
             if (addClicked) createFolderFromSelection(st);
         }
         if (s_featSecOpen) {
@@ -5582,7 +5670,11 @@ void drawFeatureTreeBody(AppState& st,
                         // planes do — start a new sketch on it during plane-pick, or fill an armed
                         // plane well (SolidWorks lets you pick a reference plane from the tree). The
                         // sketch plane is the bare feature-id string; a plane well takes id + name.
-                        if (rr.clicked && ftype == "plane" && st.sketchPlanePickActive && st.sketchMode) {
+                        if (rr.clicked && ftype == "plane" && st.sketchPlanePickActive &&
+                            st.activeDocLockedByAgent()) {
+                            st.toast(ui::ToastLevel::Warn, agentLockReason);
+                        } else if (rr.clicked && canDocTree && ftype == "plane" &&
+                                   st.sketchPlanePickActive && st.sketchMode) {
                             st.sketchPlanePickActive = false;
                             st.sketchMode->createSketchOnPlane(st, nlohmann::json(fid));
                             selectedFeatureId = fid;
@@ -5611,7 +5703,9 @@ void drawFeatureTreeBody(AppState& st,
                             selectedFeatureId = fid;
                             s_multiSel.clear();
                             selectFeatureInViewport(st, fid);
-                            if (ftype == "sketch") {
+                            if (st.activeDocLockedByAgent() && ftype != "import") {
+                                st.toast(ui::ToastLevel::Warn, agentLockReason);
+                            } else if (ftype == "sketch") {
                                 if (st.sketchMode) st.sketchMode->enterForFeature(st, fid);
                             } else if (ftype == "sketch3d") {
                                 if (st.sketch3dMode) st.sketch3dMode->enterForFeature(st, fid);
@@ -5620,7 +5714,9 @@ void drawFeatureTreeBody(AppState& st,
                                 // (same action as RMB Open Part).
                                 const std::string src = importFeatureSourceAbs(f);
                                 if (!src.empty()) openComponentPart(st, src);
-                                else if (editCallback) editCallback(fid);
+                                else if (editCallback &&
+                                         !refuseAgentLockedTreeDoc(st, st.docMirror.docId()))
+                                    editCallback(fid);
                             } else if (editCallback) {
                                 editCallback(fid);
                             }
@@ -5649,7 +5745,9 @@ void drawFeatureTreeBody(AppState& st,
                                               s_lastClickTime > 0 &&
                                               (now - s_lastClickTime) > 0.4 &&
                                               (now - s_lastClickTime) < 2.0);
-                            if (armRename) {
+                            if (armRename && st.activeDocLockedByAgent()) {
+                                st.toast(ui::ToastLevel::Warn, agentLockReason);
+                            } else if (armRename && canDocTree) {
                                 s_renamingId = fid;
                                 std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", fname.c_str());
                                 s_lastClickTime = -1.0;
@@ -6008,7 +6106,8 @@ void drawFeatureTreeBody(AppState& st,
     if (s_apprOpen && !s_apprBody.empty()) { ImGui::OpenPopup("##appearance_feat"); s_apprOpen = false; }
     if (!s_apprBody.empty()) {
         if (appearanceColorPicker("##appearance_feat", s_apprColor,
-                                  &s_apprMetallic, &s_apprRoughness)) {
+                                  &s_apprMetallic, &s_apprRoughness,
+                                  agentLockReason.empty() ? nullptr : agentLockReason.c_str())) {
             applyTreeOps(st, nlohmann::json::array({
                 {{"op", "set_appearance"}, {"id", s_apprBody},
                  {"color", {s_apprColor[0], s_apprColor[1], s_apprColor[2]}},
@@ -6113,19 +6212,16 @@ bool featureTreeOpenPath(AppState& st, const std::string& path, bool asSolid) {
     {
         namespace fs = std::filesystem;
         std::error_code ec;
-        fs::path want = fs::weakly_canonical(fs::path(path), ec);
-        if (ec) want = fs::path(path).lexically_normal();
-        // Normalize separators for a stable web/server-path compare.
-        std::string wantStr = want.string();
-        for (char& c : wantStr) if (c == '\\') c = '/';
+        fs::path want = fs::weakly_canonical(fs::u8path(path), ec);
+        if (ec) want = fs::u8path(path).lexically_normal();
+        const std::string wantStr = want.generic_u8string();
         for (int i = 0; i < static_cast<int>(st.docTabs.size()); ++i) {
             const AppState::DocTab& tab = st.docTabs[i];
             if (tab.aiHandoff || tab.path.empty()) continue;
             std::error_code tabEc;
-            fs::path have = fs::weakly_canonical(fs::path(tab.path), tabEc);
-            if (tabEc) have = fs::path(tab.path).lexically_normal();
-            std::string haveStr = have.string();
-            for (char& c : haveStr) if (c == '\\') c = '/';
+            fs::path have = fs::weakly_canonical(fs::u8path(tab.path), tabEc);
+            if (tabEc) have = fs::u8path(tab.path).lexically_normal();
+            const std::string haveStr = have.generic_u8string();
             if (haveStr == wantStr || tab.path == path) {
                 st.switchToTab(i);
                 return true;

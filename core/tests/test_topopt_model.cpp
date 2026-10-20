@@ -1317,3 +1317,22 @@ TEST_CASE("mirror and extrusion ties survive filter and Heaviside projection "
               .epsilon(1e-6));
   }
 }
+
+TEST_CASE("minimum member filter respects the two-element mesh radius floor") {
+  Cantilever c;
+  const auto p = prepare_problem(c.mesh, c.spec({{"min_member_mm", 1.2}}));
+  const double floor = 2.0 * c.mesh->quality.median_element_size_m;
+  CHECK(p->filter_radius_m == doctest::Approx(floor));
+  CHECK(p->filter_radius_source == "auto_2x_median_element_size");
+  CHECK(p->evidence["filter"]["min_member_filter_radius_mm"].get<double>() ==
+        doctest::Approx(0.6));
+  CHECK(p->evidence["filter"]["mesh_floor_radius_mm"].get<double>() ==
+        doctest::Approx(floor * 1e3));
+  const auto large = prepare_problem(c.mesh, c.spec({{"min_member_mm", 80.0}}));
+  CHECK(large->filter_radius_m == doctest::Approx(0.04));
+  CHECK(large->filter_radius_source == "min_member_mm");
+  const auto explicit_radius = prepare_problem(
+      c.mesh, c.spec({{"min_member_mm", 1.2}, {"filter_radius_mm", 0.2}}));
+  CHECK(explicit_radius->filter_radius_m == doctest::Approx(0.0002));
+  CHECK(explicit_radius->filter_radius_source == "explicit");
+}

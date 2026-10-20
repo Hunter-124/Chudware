@@ -20,7 +20,7 @@ from typing import Any
 from urllib.parse import quote, urljoin
 
 from .. import session as _session
-from . import download_dir, is_login_wall, login_required, provenance_envelope
+from . import download_path, is_login_wall, login_required, provenance_envelope
 
 # ---------------------------------------------------------------------------
 # generic HTML/JSON parsing helpers (unit-tested directly)
@@ -385,8 +385,9 @@ class RetailAdapter:
         datasheet_url = find_datasheet_url(content, self.base_url)
         datasheet_path: str | None = None
         if datasheet_url:
-            filename = datasheet_url.rsplit("/", 1)[-1].split("?", 1)[0] or "document.pdf"
-            dest = download_dir(self.key) / filename
+            dest, refusal = download_path(self.key, datasheet_url, default="document.pdf")
+            if refusal is not None:
+                return refusal
             outcome = _session.browser_download(datasheet_url, self.key, dest)
             # A failed datasheet download must not fail the structured record.
             if outcome.get("ok"):

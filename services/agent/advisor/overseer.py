@@ -865,7 +865,7 @@ class Overseer:
             turn = run_role_turn(
                 user_msg,
                 "overseer",
-                session_id=self.session_id or scope.run_id or "overseer",
+                session_id=self.session_id or str(self.options.get("session_id") or ""),
                 run_id=turn_run_id,
                 parent_id=f"{scope.run_id}:{turn_node_id}",
                 on_event=self.on_event,

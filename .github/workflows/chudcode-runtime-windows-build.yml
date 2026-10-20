@@ -30,7 +30,11 @@ concurrency:
 jobs:
   build:
     name: Build locked Chudcode Windows x86_64
-    runs-on: [self-hosted, Windows, X64, cloudcastle-ci, cc-win-ryzen]
+    if: ${{ github.ref_protected && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+    environment: chudware-release-protected
+    runs-on:
+      group: chudware-trusted-protected
+      labels: [self-hosted, Windows, X64, cloudcastle-ci, cc-win-ryzen]
     timeout-minutes: 180
     outputs:
       directory: ${{ steps.binary.outputs.directory }}
@@ -99,45 +103,69 @@ jobs:
             throw 'Source archive has no pinned Rust toolchain'
           }
           "toolchain=$($Matches[1])" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
-      # setup-bun fails here with EPERM creating its bunx.exe symlink (the runner
-      # account cannot make symlinks). Install the pinned Bun natively into
-      # ~\.bun\bin, the directory build_chudcode_windows.ps1 puts first on PATH.
-      - name: Install pinned Bun 1.4.0
+      # Never run a cached Bun to ask it whether it is trusted.
+      - name: Authenticate and install pinned Bun 1.4.0
         run: |
           $ErrorActionPreference = 'Stop'
-          $bin = Join-Path $env:USERPROFILE '.bun\bin'
-          $bun = Join-Path $bin 'bun.exe'
-          $current = if (Test-Path $bun) { ((& $bun --version) | Select-Object -First 1).ToString().Trim() } else { '' }
-          if ($current -ne '1.4.0') {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            $archive = Join-Path $env:RUNNER_TEMP 'bun-windows-x64.zip'
-            $unpack = Join-Path $env:RUNNER_TEMP 'bun-unpack'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $archive = Join-Path $env:RUNNER_TEMP 'bun-windows-x64.zip'
+          # Primary digest: https://api.github.com/repos/oven-sh/bun/releases/tags/bun-v1.4.0
+          $sha256 = 'e6f093d39da486b20262ca8cdd5ed6a9e8bc9c2f275b78e6d3a0c5b28cc95901'
+          if (-not (Test-Path $archive)) {
             Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-windows-x64.zip' -OutFile $archive
-            Expand-Archive -Force -LiteralPath $archive -DestinationPath $unpack
-            New-Item -ItemType Directory -Force -Path $bin | Out-Null
-            Copy-Item -Force (Join-Path $unpack 'bun-windows-x64\bun.exe') $bun
           }
-          $version = ((& $bun --version) | Select-Object -First 1).ToString().Trim()
+          if ((Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant() -ne $sha256) {
+            throw 'Bun archive SHA-256 mismatch; refusing extraction/execution'
+          }
+          $unpack = Join-Path $env:RUNNER_TEMP ("bun-authenticated-" + [Guid]::NewGuid().ToString('N'))
+          Expand-Archive -LiteralPath $archive -DestinationPath $unpack
+          $bin = Join-Path $unpack 'bun-windows-x64'
+          "CHUDWARE_BOOTSTRAP_BIN=$bin" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          # Derived before execution from the authenticated archive; rechecked
+          # by the build script rather than trusting a writable extracted cache.
+          $binaryHash = (Get-FileHash -Algorithm SHA256 (Join-Path $bin 'bun.exe')).Hash.ToLowerInvariant()
+          "CHUDWARE_BUN_BINARY_SHA256=$binaryHash" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          $version = ((& (Join-Path $bin 'bun.exe') --version) | Select-Object -First 1).ToString().Trim()
           if ($version -ne '1.4.0') { throw "Pinned Bun install failed (found '$version')" }
           $bin | Out-File $env:GITHUB_PATH -Encoding ascii -Append
       # dtolnay/rust-toolchain is a bash composite action, and `bash` on this
       # runner is an empty WSL shim ("bash: command not found"). Bootstrap
       # rustup natively instead; the toolchain is pinned by the source archive.
-      - name: Install locked Rust toolchain and bootstrap rustup when absent
+      - name: Authenticate rustup and install locked Rust toolchain
         env:
           RUST_TOOLCHAIN: ${{ steps.source.outputs.toolchain }}
         run: |
           $ErrorActionPreference = 'Stop'
           if ($env:RUST_TOOLCHAIN -notmatch '^nightly-\d{4}-\d{2}-\d{2}$') { throw 'Invalid pinned Rust toolchain' }
-          $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
-          $rustup = Join-Path $cargoBin 'rustup.exe'
-          if (-not (Test-Path $rustup)) {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            $init = Join-Path $env:RUNNER_TEMP 'rustup-init.exe'
-            Invoke-WebRequest -UseBasicParsing -Uri 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe' -OutFile $init
-            & $init -y --no-modify-path --profile minimal --default-toolchain none
-            if ($LASTEXITCODE -ne 0) { throw "rustup-init failed ($LASTEXITCODE)" }
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $init = Join-Path $env:RUNNER_TEMP 'rustup-init-1.28.2.exe'
+          # Primary checksum: https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-pc-windows-msvc/rustup-init.exe.sha256
+          $sha256 = '88d8258dcf6ae4f7a80c7d1088e1f36fa7025a1cfd1343731b4ee6f385121fc0'
+          if (-not (Test-Path $init)) {
+            Invoke-WebRequest -UseBasicParsing -Uri 'https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-pc-windows-msvc/rustup-init.exe' -OutFile $init
           }
+          if ((Get-FileHash -Algorithm SHA256 $init).Hash.ToLowerInvariant() -ne $sha256) {
+            throw 'rustup bootstrap SHA-256 mismatch; refusing execution'
+          }
+          $home = Join-Path $env:RUNNER_TEMP ("rust-authenticated-" + [Guid]::NewGuid().ToString('N'))
+          $env:CARGO_HOME = Join-Path $home 'cargo'
+          $env:RUSTUP_HOME = Join-Path $home 'rustup'
+          $env:RUSTUP_UPDATE_ROOT = 'https://static.rust-lang.org/rustup'
+          $env:RUSTUP_DIST_SERVER = 'https://static.rust-lang.org'
+          $env:RUSTUP_AUTO_INSTALL = '0'
+          & $init -y --no-modify-path --profile minimal --default-toolchain none --no-update-default-toolchain
+          if ($LASTEXITCODE -ne 0) { throw "rustup-init failed ($LASTEXITCODE)" }
+          $cargoBin = Join-Path $env:CARGO_HOME 'bin'
+          $rustup = Join-Path $cargoBin 'rustup.exe'
+          if ((Get-FileHash -Algorithm SHA256 $rustup).Hash.ToLowerInvariant() -ne $sha256) {
+            throw 'Installed rustup differs from authenticated bootstrap bytes'
+          }
+          & $rustup set auto-self-update disable
+          if ($LASTEXITCODE -ne 0) { throw 'Could not disable mutable rustup self-update' }
+          "CARGO_HOME=$env:CARGO_HOME" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "RUSTUP_HOME=$env:RUSTUP_HOME" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "RUSTUP_DIST_SERVER=$env:RUSTUP_DIST_SERVER" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "RUSTUP_AUTO_INSTALL=0" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
           & $rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed ($LASTEXITCODE)" }
           & $rustup default $env:RUST_TOOLCHAIN
@@ -156,10 +184,13 @@ jobs:
   publish:
     name: Explicitly publish Windows runtime to CAD mirror
     needs: build
-    if: ${{ inputs.publish }}
+    if: ${{ (github.ref_protected && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')) && (inputs.publish) }}
+    environment: chudware-release-protected
     permissions:
       contents: write
-    runs-on: [self-hosted, Windows, X64, cloudcastle-ci, cc-win-ryzen]
+    runs-on:
+      group: chudware-trusted-protected
+      labels: [self-hosted, Windows, X64, cloudcastle-ci, cc-win-ryzen]
     timeout-minutes: 15
     steps:
       - name: Upload verified retained executable only

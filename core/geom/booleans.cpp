@@ -1,6 +1,8 @@
 #include "geom/booleans.h"
 
 #include <BRepAlgoAPI_Common.hxx>
+#include <BRepBuilderAPI_Copy.hxx>
+#include <BRepTools_History.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <ShapeUpgrade_UnifySameDomain.hxx>
@@ -185,9 +187,27 @@ TopoDS_Shape common(const TopoDS_Shape& a, const TopoDS_Shape& b) {
 TopoDS_Shape unify_same_domain(const TopoDS_Shape& s) {
     if (s.IsNull()) return s;
     try {
+        // UnifySameDomain edits sub-shapes of its INPUT in place even in its default "safe
+        // input" mode: it hangs temporary pcurves on the existing edges of the faces it
+        // merges and re-ranges them (BRep_Builder::UpdateEdge/Range), and can re-seat a
+        // reference face's surface. A NonDestructive boolean shares every untouched
+        // face/edge TShape with its argument, i.e. with the compiler's cached checkpoints,
+        // so unifying a boolean's output in place rewrote cached prefix shapes. c259
+        // (6-axis base_revD, 2026-10-12): a slot cut, then deleting it, restored a
+        // BRepCheck-invalid prefix 9 cm^3 larger, which the agent then saved. Unify a
+        // topology copy; geometry handles stay shared (the algorithm copies curves before
+        // transforming them).
+        BRepBuilderAPI_Copy copier(s, Standard_False, Standard_False);
+        const TopoDS_Shape work = copier.Shape();
+        if (work.IsNull()) return s;
+        if (op_history_recording()) {
+            TopTools_ListOfShape args;
+            args.Append(s);
+            op_history_record(new BRepTools_History(args, copier));
+        }
         // Unify faces AND edges sharing a domain (concatBSplines=false): the seam between
         // two flush coplanar faces collapses to one face, matching build123d's clean().
-        ShapeUpgrade_UnifySameDomain up(s, Standard_True, Standard_True, Standard_False);
+        ShapeUpgrade_UnifySameDomain up(work, Standard_True, Standard_True, Standard_False);
         up.Build();
         TopoDS_Shape r = up.Shape();
         if (r.IsNull()) return s;

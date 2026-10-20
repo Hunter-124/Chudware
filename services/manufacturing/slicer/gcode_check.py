@@ -32,6 +32,38 @@ _FLOATING_CLASSES = {
 _RES = 0.2
 # Deepest gap a support-base line may hang over and still be backed (organic branch splits).
 _SUPPORT_DROP_MM = 1.5
+_MAX_WIDTH_MM = 10.0
+_MAX_KERNEL_SAMPLES = 4_096
+_MAX_PATH_SAMPLES = 4_000_000
+
+
+class _AnalysisRefused(ValueError):
+    """Input cannot be safely verified within the analysis budget."""
+
+
+def _valid_width(width):
+    if not math.isfinite(width) or not 0 < width <= _MAX_WIDTH_MM:
+        raise _AnalysisRefused(f'Extrusion WIDTH must be finite and in (0, {_MAX_WIDTH_MM:g}] mm.')
+    return width
+
+
+def _disk(radius_squared):
+    if not math.isfinite(radius_squared) or radius_squared < 0:
+        raise _AnalysisRefused('Invalid morphology kernel radius.')
+    n = math.ceil(math.sqrt(radius_squared))
+    if (2*n + 1)**2 > _MAX_KERNEL_SAMPLES:
+        raise _AnalysisRefused(f'Morphology kernel exceeds {_MAX_KERNEL_SAMPLES} samples.')
+    y, x = np.ogrid[-n:n+1, -n:n+1]
+    return x*x + y*y <= radius_squared
+
+
+def _refusal(error):
+    return dict(ok=False, status='fail',
+                checks=[_row('analysis_budget', 'fail', str(error),
+                             limits={'max_width_mm': _MAX_WIDTH_MM,
+                                     'max_kernel_samples': _MAX_KERNEL_SAMPLES,
+                                     'max_path_samples': _MAX_PATH_SAMPLES})],
+                stats={})
 
 
 @dataclass
@@ -133,8 +165,10 @@ def parse_gcode(path, *, track_objects: bool = False) -> GcodeModel:
                     role = line[6:].strip()
                     after_z = False
                 elif line.startswith(';WIDTH:'):
-                    try: width = float(line[7:])
-                    except ValueError: pass
+                    try:
+                        width = _valid_width(float(line[7:]))
+                    except ValueError as exc:
+                        raise _AnalysisRefused(f'Invalid extrusion WIDTH: {line[7:]!r}') from exc
                 elif line.startswith(';LAYER_CHANGE'):
                     layer_number += 1
                 elif line.startswith(';Z:'):
@@ -283,7 +317,13 @@ def _samples(segments, origin, shape):
     """Vectorize all samples in a layer; avoid Python loops over extrusion moves."""
     if len(segments) == 0:
         return np.array([], dtype=np.int64), np.array([], dtype=np.int64), np.array([], dtype=np.int64)
-    counts = np.maximum(2, np.ceil(segments[:, 6] / (_RES * 0.75)).astype(np.int64) + 1)
+    lengths = segments[:, 6].astype(np.float64)
+    if (not np.isfinite(lengths).all() or np.any(lengths < 0)
+            or np.any(lengths > _MAX_PATH_SAMPLES * (_RES * 0.75))):
+        raise _AnalysisRefused('Extrusion path exceeds sampling budget.')
+    counts = np.maximum(2, np.ceil(lengths / (_RES * 0.75)).astype(np.int64) + 1)
+    if sum(int(count) for count in counts) > _MAX_PATH_SAMPLES:
+        raise _AnalysisRefused(f'Extrusion path exceeds {_MAX_PATH_SAMPLES} samples.')
     starts = np.cumsum(counts) - counts
     owners = np.repeat(np.arange(len(segments)), counts)
     fraction = (np.arange(int(counts.sum())) - np.repeat(starts, counts)) / (counts[owners] - 1)
@@ -306,9 +346,7 @@ def _raster(segments, origin, shape):
         selected = sample_radii == radius_squared
         center = np.zeros(shape, dtype=bool)
         center[iy[selected], ix[selected]] = True
-        n = int(math.ceil(math.sqrt(int(radius_squared))))
-        y, x = np.ogrid[-n:n+1, -n:n+1]
-        disk = x*x + y*y <= radius_squared
+        disk = _disk(int(radius_squared))
         raster |= ndimage.binary_dilation(center, structure=disk)
     return raster
 
@@ -358,7 +396,6 @@ def _geometry(model):
     }
     floating_metrics['anchored']['backed_bridge_spans'] = {
         'count':0, 'total_span_mm':0.0, 'max_span_mm':0.0, 'worst_span':None}
-    evaluated = True
     for index, layer in enumerate(model.layers):
         segments = layer.segments
         ids = segments[:, 7].astype(int)
@@ -380,10 +417,7 @@ def _geometry(model):
         size = np.ceil((combined.max(axis=0) + 2.0 - origin) / _RES).astype(int) + 1
         shape = (int(size[1]), int(size[0]))
         if math.prod(shape) > 16_000_000 or np.any(size > 12000):
-            evaluated = False
-            if len(physical): lower_planes.append((layer.z,physical))
-            if len(support): last_support_z = layer.z
-            continue
+            raise _AnalysisRefused('Extrusion raster exceeds analysis grid budget.')
         if index == 0:
             first_area = float(_raster(coverage, origin, shape).sum()) * _RES**2
         else:
@@ -449,9 +483,7 @@ def _geometry(model):
                         centers = np.zeros(shape, dtype=bool)
                         points = selected & (sample_radii == radius_squared)
                         centers[iy[points], ix[points]] = True
-                        n = int(math.ceil(math.sqrt(int(radius_squared))))
-                        gy, gx = np.ogrid[-n:n+1, -n:n+1]
-                        mask |= ndimage.binary_dilation(centers, structure=gx*gx+gy*gy <= radius_squared)
+                        mask |= ndimage.binary_dilation(centers, structure=_disk(int(radius_squared)))
                     area = float(mask.sum()) * _RES**2
                     if category not in class_masks:
                         class_masks[category] = mask
@@ -536,7 +568,7 @@ def _geometry(model):
     for row in sorted(towers, key=lambda r: -r['slenderness']):
         if not any(np.linalg.norm(np.array(row['centroid'][:2])-old['centroid'][:2]) < 3 for old in unique_towers):
             unique_towers.append(row)
-    return floating, unique_towers, first_area, evaluated, floating_metrics
+    return floating, unique_towers, first_area, floating_metrics
 
 
 # Extrusion centerlines sit half a line inside the printed edge.
@@ -691,9 +723,12 @@ def verify_gcode(path, *, bed_polygon=None, max_height_mm=None, material=None, n
         raise ValueError('Floating-extrusion limits must be positive; warning fraction must be in (0,1].')
     # Complete individual objects (``complete_objects = 1``) needs per-object attribution;
     # the flag sits in the trailing config block, so peek at it before the single pass.
-    model = parse_gcode(path, track_objects=_tail_flag(path, 'complete_objects'))
-    if model.config.get('complete_objects') == '1' and model.moves is None:
-        model = parse_gcode(path, track_objects=True)
+    try:
+        model = parse_gcode(path, track_objects=_tail_flag(path, 'complete_objects'))
+        if model.config.get('complete_objects') == '1' and model.moves is None:
+            model = parse_gcode(path, track_objects=True)
+    except _AnalysisRefused as exc:
+        return _refusal(exc)
     checks = []
     all_segments = [layer.segments for layer in model.layers]
     height = max((layer.z for layer in model.layers), default=0.0)
@@ -740,7 +775,10 @@ def verify_gcode(path, *, bed_polygon=None, max_height_mm=None, material=None, n
                        '; '.join(errors) or f'{material or "unknown material"}: nozzle {sorted(set(active["nozzle"]))}, bed {sorted(set(active["bed"]))} C',
                        {'nozzle_c':sorted(set(active['nozzle'])), 'bed_c':sorted(set(active['bed']))},
                        {'material_window_c':window,'expect_nozzle_c':expect_nozzle_c,'expect_bed_c':expect_bed_c}, fix=['Select a stock filament preset and confirm spool temperature limits.'] if errors else []))
-    floating, towers, first_area, evaluated, floating_metrics = _geometry(model)
+    try:
+        floating, towers, first_area, floating_metrics = _geometry(model)
+    except _AnalysisRefused as exc:
+        return _refusal(exc)
     first_z = model.layers[0].z if model.layers else None
     first_bad = first_z is None or first_z <= 0 or (nozzle_mm is not None and first_z > nozzle_mm*0.8+0.001) or first_area < 2
     checks.append(_row('first_layer','fail' if first_bad else 'warn' if first_area < 20 else 'pass',
@@ -790,7 +828,7 @@ def verify_gcode(path, *, bed_polygon=None, max_height_mm=None, material=None, n
     floating_warn = (anchored['max_unanchored_run_mm'] > anchored_warn_fraction * max_unanchored_mm
                      or hard['worst_layer_area_mm2'] > max_hard_area_mm2
                      or long_bridge)
-    floating_status = ('fail' if floating_bad else 'not_evaluated' if not evaluated or model.unknown_motion
+    floating_status = ('fail' if floating_bad else 'not_evaluated' if model.unknown_motion
                        else 'warn' if floating_warn else 'pass')
     for category in floating_metrics.values():
         for key in ('total_floating_area_mm2', 'worst_layer_area_mm2'):

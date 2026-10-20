@@ -21,6 +21,7 @@
 #include <nlohmann/json.hpp>
 
 #include "imgui.h"
+#include "sketch_relations_panel.h"
 
 struct AppState;
 class Renderer;
@@ -90,7 +91,8 @@ struct SketchConstraint {
     double measured = 0.0;            // solved measurement (mm/deg)
     std::string axis;                 // distance only: "h"|"v"|"" (aligned)
     bool isDimensional() const {
-        return type == "distance" || type == "angle" || type == "radius" || type == "diameter";
+        return type == "distance" || type == "angle" || type == "radius" ||
+               type == "diameter" || type == "length" || type == "arc_length";
     }
 };
 
@@ -104,6 +106,7 @@ struct SketchEntity {
     // stale = the source no longer resolves (dashed + warning color, last-good geometry).
     bool external = false;
     bool externalStale = false;
+    bool externalPierce = false;
     // Coordinate payload (sketch-plane u,v). Only the fields for `type` are populated.
     float p1[2] = {0, 0}, p2[2] = {0, 0};   // line/slot endpoints; point reuses p1 for "p"
     float center[2] = {0, 0};               // circle/arc/ellipse/arc_slot
@@ -229,6 +232,15 @@ public:
     // drawOverlay() has run this frame (defaults to true/safe before the first call).
     bool inSketchEntityHot() const { return entityHoverHot_; }
 
+    // Refresh the model ID buffer for tool-owned external picks and explicit relation picking.
+    bool needsModelPicks() const {
+        return active_ && (tool_ == SketchTool::Convert || tool_ == SketchTool::SmartDim ||
+                           relModelPicking_);
+    }
+    bool modelSelectionAllowed() const {
+        return active_ && tool_ == SketchTool::None && relModelPicking_;
+    }
+
     // Origin-plane index (0/1/2, -1 none) hovered by the PM plane picker last frame — fed to
     // Renderer::setPlanes as the emphasis so the hovered datum plane brightens (mirrors planeHover
     // for the new-sketch flow).
@@ -244,6 +256,10 @@ public:
     // Clear in-sketch entity + relation selection WITHOUT changing the active tool (unlike
     // resetTool, which also exits the tool). Used by AppState::clearSelection for global deselect.
     void clearEntitySelection();
+    // Replace the in-sketch entity selection with these handles ("e3", "e3.p1", "origin", ...);
+    // unknown entity ids are dropped. Used by scripted scenarios to drive selection-based
+    // commands (Add Relation, Fully Define on a subset) without synthetic viewport clicks.
+    void selectEntities(const std::vector<std::string>& handles);
 
     // The plane-normal camera angles (so the caller can hard-lock the orbit while active).
     bool cameraLock(float& yaw, float& pitch) const;
@@ -348,6 +364,8 @@ private:
     // Compute a sensible default placement (u,v) for a constraint that has none yet.
     bool defaultPlacement(const SketchConstraint& c, float& pu, float& pv) const;
     const SketchEntity* entById(const std::string& id) const;
+    bool relationPointUV(const std::string& handle, float& u, float& v) const;
+    bool relationLineUV(const std::string& handle, ImVec2& a, ImVec2& b) const;
 
     // ---- projection (camera locked fronto-parallel to the plane) ----
     // Build the affine screen<->(u,v) basis for this frame from three projected plane points.
@@ -359,7 +377,9 @@ private:
     void resetTool();
     void cancelTool();
     // C49: per-frame alignment-inference result filled by snapPoint (dashed lines to the source
-    // points; positional only — no constraint emitted, matching SolidWorks inference lines).
+    // points). Set only when no point snap fired, or riding a "rim:" snap (rim point inline with
+    // the origin / the curve's own center). Placement writes it as vertical/horizontal relations
+    // when autoAlignRelations_ is on.
     struct SnapInfer {
         bool alignU = false, alignV = false;   // cursor u / v pulled to a source point's u / v
         ImVec2 srcU{0, 0}, srcV{0, 0};         // (u,v) of the alignment source point(s)
@@ -368,7 +388,9 @@ private:
     // Snap a free (u,v) to nearby sketch geometry. *snapHandle encodes what fired:
     //   "e3.p2" / "e4.center" / "e5.p"  point snap -> coincident candidate (existing behavior)
     //   "mid:e3"                        line-midpoint snap -> midpoint-constraint candidate
-    //   "rim:e5"                        circle/arc rim snap -> point_on (+ maybe tangent) candidate
+    //   "rim:e5"                        circle/arc rim snap -> point_on (+ maybe tangent) candidate;
+    //                                   with infer, also pulled along the rim to the spot inline
+    //                                   with the origin or e5's center (infer->align*)
     //   ""                              nothing within range
     // Midpoint/rim/alignment fire only while inferenceOn_; plain point snap is always on.
     void snapPoint(float& u, float& v, std::string& snapHandle, SnapInfer* infer = nullptr,
@@ -426,10 +448,12 @@ private:
     bool active_ = false;
     bool isNewEmpty_ = false;        // entered a freshly-created sketch (delete on cancel-exit)
     std::string fid_;
+    std::string docId_;             // session owner, independent of the selected document
     int dof_ = 0;
     std::string status_;             // under|full|over
     std::vector<std::string> conflicting_;   // C50: constraint ids the solver flagged conflicting
     std::vector<std::string> redundant_;     // C50: constraint ids that remove no DOF (over-define)
+    std::unordered_map<std::string, std::string> skipped_;
 
     // C50f: SolidWorks over-define pre-flight prompt for a NEW dimension. sketch_probe flagged the
     // pending add as over-defining BEFORE it was committed; this modal offers three choices —
@@ -473,6 +497,10 @@ private:
     float prevPan_[3] = {0, 0, 0};
 
     std::vector<SketchEntity> ents_;
+    std::unordered_map<std::string, size_t> entIndex_;
+    size_t entitiesRevision_ = 0;
+    nlohmann::json entitiesSnapshot_;
+    bool regionsDirty_ = true;
     std::vector<SketchConstraint> cons_;   // C37-D: every constraint (drives dim annotations)
     // C37-D: locally-remembered placements for dims whose engine placement is null, so a freshly
     // auto-placed dim keeps its spot frame-to-frame until the user drags it (which persists it).
@@ -562,11 +590,27 @@ private:
     int   polyStarPoints_ = 5;    // number of tips (clamped 3..12)
     float polyStarRatio_  = 0.45f; // inner/outer radius ratio
 
-    // C42: minimal "Add Relation" popup (ribbon sk_relations with 1-2 entities selected). The
-    // selection is snapshotted into relIds_ when the popup opens (selIds_ may churn).
+    // Add Relation snapshots sketch handles, then optionally collects model selections.
     bool relPopupOpen_ = false;
     ImVec2 relPopupPos_{0, 0};
     std::vector<std::string> relIds_;
+    bool relModelPicking_ = false;
+    struct RelationModelRef {
+        nlohmann::json source;
+        std::vector<SketchEntity> entities;
+        std::vector<std::string> labels;
+        int selectedEntity = 0;
+        bool canPierce = false;
+    };
+    std::vector<RelationModelRef> relModelRefs_;
+    std::string relModelKey_;
+    void beginRelations(AppState& st);
+    void refreshRelationModelRefs(AppState& st);
+    void drawAddRelations(AppState& st, bool& escHandled);
+    void fullyDefine(AppState& st);
+    RelationsPanelState relationsPanel_;
+    std::string panelHoverRel_;
+    void drawRelationList(AppState& st, const ImVec2& lo, const ImVec2& hi);
 
     // drag state
     std::string dragHandle_;
@@ -668,6 +712,7 @@ private:
         bool isCircle = false;          // true for single-entity full circle (radius containment)
         float circleCenter[2] = {0, 0};
         float circleRadius = 0.0f;
+        std::vector<ImVec2> triangles;   // UV triangulation, rebuilt only when geometry changes
     };
     std::vector<SketchRegion> regions_;
     void rebuildRegions();                            // refill regions_ from ents_
@@ -696,6 +741,13 @@ private:
     struct RelHit { std::string cid; ImVec2 lo, hi; };
     std::vector<RelHit> relHits_;
     std::string hoverRelCid_;
+    struct RelationBadge {
+        std::string cid, type;
+        ImVec2 pos, anchor;
+    };
+    std::vector<RelationBadge> relationBadges_;
+    size_t badgesRevision_ = size_t(-1);
+    std::array<float, 7> badgesCamera_{};
     // GUI-picking overhaul: set each frame by drawOverlay's hover pass; see inSketchEntityHot().
     // Defaults true so a stale/pre-first-frame read never opens the model-pick fallback by mistake.
     bool entityHoverHot_ = true;
@@ -782,8 +834,8 @@ private:
     bool moveCopy_ = false;            // copy mode (Ctrl held at the apply click), persisted as hint
     // Apply the built sketch_move op (delta + copy flag) over mpSel_ + refresh (toast on error).
     void applyMoveOp(AppState& st, float dx, float dy, bool copy);
-    // Apply one sketch_convert op for a model edge/face ref (already resolved to a selector JSON).
-    void applyConvertRef(AppState& st, const nlohmann::json& ref);
+    // One conversion operation for all resolved refs (one compile/reload/undo).
+    void applyConvertRefs(AppState& st, const nlohmann::json& refs);
 
     // ---- Gizmo-driven Move/Rotate Entities (engine ops sketch_move / sketch_rotate) ----
     // Stage 0 reuses mpSel_ (click line/circle/arc to toggle). Advancing (Enter or first drag)

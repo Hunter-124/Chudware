@@ -39,6 +39,8 @@ from pydantic import Field
 from services.dag import session
 from services.dag.executor import default_runs_dir as _runs_dir
 from services.dag.run_ids import validate_run_id
+from services.agent.request_context import in_cell
+from .storage import list_run_ids, resolve_run
 from services.mcp.tool_registry import model_selectors
 
 # Var-keyword parameters below are annotated ``Annotated[Any, Field(default=None)]``
@@ -60,11 +62,23 @@ def _dumps(payload: dict) -> str:
 
 
 def _err(reason: str, hint: str = "", **extra: Any) -> str:
+    if in_cell() and reason == "not_found":
+        return _dumps({"ok": False, "reason": "not_found", "code": "not_found"})
     out: dict[str, Any] = {"ok": False, "reason": reason}
     if hint:
         out["hint"] = hint
     out.update(extra)
     return _dumps(out)
+
+
+def _cell_control_run(run_id: Any, kwargs: dict) -> str:
+    """Resolve explicit handles before desktop coercion, aliases or validation."""
+    if run_id is None:
+        run_id, _ = _pop_alias(kwargs, "run_id", "runid", "run", "id", "run_uuid",
+                             "mission_id", "job_id")
+        if run_id is None:
+            run_id = session.last_run()
+    return resolve_run(run_id).run_id
 
 
 def _load_run_status(run_id: str, runs_dir: Path) -> dict[str, Any] | None:
@@ -81,9 +95,13 @@ def _load_run_status(run_id: str, runs_dir: Path) -> dict[str, Any] | None:
     topology is restart-safe; per-node verdicts are in-session only unless
     T-F17 adds a narration DB.  dag_status documents this limitation.
     """
-    run_id = validate_run_id(run_id)
-    db_path = runs_dir / f"{run_id}.db"
-    graph_path = runs_dir / f"{run_id}.graph.json"
+    if in_cell():
+        record = resolve_run(run_id)
+        run_id, db_path, graph_path = record.run_id, record.db, record.graph
+    else:
+        run_id = validate_run_id(run_id)
+        db_path = runs_dir / f"{run_id}.db"
+        graph_path = runs_dir / f"{run_id}.graph.json"
     if not db_path.exists():
         return None
     graph_json: dict = {}
@@ -299,7 +317,7 @@ def _resolve_run_id(kwargs: dict, tool: str, notes: list) -> tuple[str, str]:
     if val is not None:
         return "", (f"run_id must be the UUID4 string from dag_run's response, got "
                     f"{type(val).__name__}")
-    last = _LAST["run_id"]
+    last = session.last_run()
     if last:
         notes.append(
             f"run_id was not supplied — used {last!r}, the most recent run started in "
@@ -321,6 +339,8 @@ def _resolve_run_id(kwargs: dict, tool: str, notes: list) -> tuple[str, str]:
 
 def _known_run_ids(base: Path, limit: int = 5) -> list[str]:
     """Run ids that actually exist on disk — so a 'not found' error can name them."""
+    if in_cell():
+        return list_run_ids(limit)
     try:
         dbs = sorted(base.glob("*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
     except OSError:
@@ -336,6 +356,11 @@ def _prep_resume(tool: str, run_id: Any, graph_json: Any, autonomy_default: str,
     ``error_json`` is a ready-to-return _err() payload, or None when good to go.
     """
     notes: list = []
+    if in_cell():
+        try:
+            run_id = _cell_control_run(run_id, kwargs)
+        except KeyError:
+            return "", graph_json, autonomy_default, notes, _err("not_found")
     if kwargs:
         if graph_json is None:
             alt, spelling = _pop_alias(kwargs, "graph_json", "graph", "plan", "json",
@@ -718,7 +743,13 @@ def register_dag_tools(mcp) -> None:
         # a chosen id, not a resume of something missing.  mission_start returns
         # run_id="mission" for a freshly compiled graph, so routing that to
         # executor.resume() answered the documented sequence with "Run not found".
-        starting_named = bool(run_id) and not (_runs_dir() / f"{run_id}.db").exists()
+        if in_cell():
+            try:
+                starting_named = bool(run_id) and not resolve_run(run_id).db.exists()
+            except KeyError:
+                starting_named = bool(run_id)
+        else:
+            starting_named = bool(run_id) and not (_runs_dir() / f"{run_id}.db").exists()
         if starting_named:
             notes.append(
                 f"run_id={run_id!r} has no checkpoint yet — started a NEW run under that "
@@ -727,6 +758,16 @@ def register_dag_tools(mcp) -> None:
             )
 
         try:
+            from services.agent.online_turn import current_tool_session_id
+            parent_session_id = current_tool_session_id()
+            if in_cell():
+                from services.agent.chudcode_host import get_default_chudcode_host
+                if not parent_session_id:
+                    raise KeyError("not_found")
+                get_default_chudcode_host().session_launch_params(parent_session_id)
+            state = dict(initial_state or {})
+            if parent_session_id:
+                state["session_id"] = parent_session_id
             if run_id and not starting_named:
                 result = executor.resume(
                     run_id,
@@ -736,10 +777,12 @@ def register_dag_tools(mcp) -> None:
             else:
                 result = executor.run(
                     graph_json,
-                    initial_state=initial_state or {},
+                    initial_state=state,
                     run_id=run_id or None,
                     autonomy_default=autonomy_default,
                 )
+        except KeyError:
+            return _err("not_found", code="not_found")
         except FileNotFoundError as exc:
             return _err(f"Run not found: {exc}",
                         hint="Omit run_id to start a new run, or verify the run_id is correct.")
@@ -817,6 +860,11 @@ def register_dag_tools(mcp) -> None:
             On unknown run: {ok: false, reason, hint, known_run_ids}.
         """
         kwargs.pop("kwargs", None)   # FastMCP var-kw placeholder
+        if in_cell():
+            try:
+                run_id = _cell_control_run(run_id, kwargs)
+            except KeyError:
+                return _err("not_found")
         notes: list[str] = []
         if kwargs:
             dir_alt, dir_spelling = _pop_alias(kwargs, "runs_dir", "run_dir", "dir", "path")
@@ -845,8 +893,13 @@ def register_dag_tools(mcp) -> None:
         except ValueError as exc:
             return _err(str(exc), hint="Use the run_id exactly as returned by dag_run.")
 
-        base = Path(runs_dir) if runs_dir else _runs_dir()
-        info = _load_run_status(run_id, base)
+        base = _runs_dir() if in_cell() else Path(runs_dir) if runs_dir else _runs_dir()
+        try:
+            info = _load_run_status(run_id, base)
+        except KeyError:
+            return _err("not_found", code="not_found")
+        if in_cell() and info is None:
+            return _err("not_found", code="not_found")
         if info is None:
             known = _known_run_ids(base)
             planned = session.planned_graph()
@@ -877,6 +930,7 @@ def register_dag_tools(mcp) -> None:
                 known_run_ids=known,
             )
 
+        run_id = info["run_id"]
         graph = info.get("graph_json", {})
         nodes = graph.get("nodes", [])
         node_ids = [n["id"] for n in nodes]
@@ -980,6 +1034,8 @@ def register_dag_tools(mcp) -> None:
                 decision="approve",
                 autonomy_default=autonomy_default,
             )
+        except KeyError:
+            return _err("not_found", code="not_found")
         except FileNotFoundError as exc:
             known = _known_run_ids(_runs_dir())
             return _err(
@@ -1069,6 +1125,8 @@ def register_dag_tools(mcp) -> None:
                 decision="reject",
                 autonomy_default=autonomy_default,
             )
+        except KeyError:
+            return _err("not_found", code="not_found")
         except FileNotFoundError as exc:
             known = _known_run_ids(_runs_dir())
             return _err(
@@ -1155,6 +1213,11 @@ def register_dag_replan_tools(mcp) -> None:
             On validation failure: {ok: false, reason, hint}.
         """
         kwargs.pop("kwargs", None)   # FastMCP var-kw placeholder
+        if in_cell():
+            try:
+                run_id = _cell_control_run(run_id, kwargs)
+            except KeyError:
+                return _err("not_found")
         try:
             from services.dag.replan import dag_replan as _replan, ReplannError
             from services.dag.graph_loader import GraphValidationError
@@ -1247,6 +1310,8 @@ def register_dag_replan_tools(mcp) -> None:
                 splice_edges=splice_edges,
                 after_node_id=after_node_id,
             )
+        except KeyError:
+            return _err("not_found", code="not_found")
         except FileNotFoundError as exc:
             return _err(str(exc),
                         hint="Verify run_id matches an existing run (from dag_run).")
@@ -1272,6 +1337,8 @@ def register_dag_replan_tools(mcp) -> None:
                 decision=decision,
                 autonomy_default=autonomy_default,
             )
+        except KeyError:
+            return _err("not_found", code="not_found")
         except FileNotFoundError as exc:
             return _err(str(exc),
                         hint="Checkpoint DB missing — the run may have already completed.")

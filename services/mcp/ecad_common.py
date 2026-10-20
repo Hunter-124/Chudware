@@ -1103,8 +1103,9 @@ def _run_with_budget(fn, budget_s: Optional[float] = None):
         finished.set()
 
     try:
-        _threading.Thread(
-            target=_worker, name=f"ecad-heavy-{jid[-6:]}", daemon=True).start()
+        from services.worker_activity import start_background_thread
+
+        start_background_thread(_worker, name=f"ecad-heavy-{jid[-6:]}")
     except Exception as exc:  # noqa: BLE001
         with _cad_jobs._JOB_LOCK:
             _cad_jobs._JOBS.pop(jid, None)

@@ -21,14 +21,14 @@ import os
 import sqlite3
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import tempfile
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout, as_completed
 from pathlib import Path
 from typing import Any, Callable
+from contextvars import copy_context
+from services.agent.request_context import owner_key
 
 # ---- vocabulary ------------------------------------------------------------------
 
@@ -721,6 +721,38 @@ def _parts_search(params: dict, _emit: Callable) -> dict:
 
 _live_jobs: dict[str, dict] = {}
 _live_lock = threading.Lock()
+_live_threads: dict[threading.Thread, tuple[str, str] | None] = {}
+_thumb_futures: dict[Any, tuple[str, str] | None] = {}
+
+
+def _thumbnail_finished(future) -> None:
+    with _live_lock:
+        _thumb_futures.pop(future, None)
+
+
+def worker_activity() -> dict:
+    from services.worker_activity import registry_lock
+
+    owner = owner_key()
+    with registry_lock(_live_lock):
+        for thread in list(_live_threads):
+            if thread.ident is not None and not thread.is_alive():
+                _live_threads.pop(thread)
+        live = sum(stored_owner == owner for stored_owner in _live_threads.values())
+        reserved = sum(not job["done"] and job.get("_owner") == owner
+                       for job in _live_jobs.values())
+        for future in list(_thumb_futures):
+            if future.done():
+                _thumb_futures.pop(future)
+        thumbnails = sum(stored_owner == owner for stored_owner in _thumb_futures.values())
+    with registry_lock(_login_lock):
+        login = sum(t.is_alive() or t.ident is None for t in _login_threads.values())
+    with registry_lock(_health_lock):
+        health = int(_health_thread is not None
+                     and (_health_thread.is_alive() or _health_thread.ident is None))
+    return {"by_kind": {"parts_search": reserved, "parts_search_threads": live,
+                        "vendor_login": login, "vendor_health": health,
+                        "parts_thumbnails": thumbnails}}
 _LIVE_JOB_CAP = 8  # keep the most-recent N jobs; drop stale tokens
 # Six simultaneous CEF navigations regularly miss the native 10 s navigation
 # deadline on ordinary supplier pages. Three completed every probe in the live
@@ -1036,7 +1068,7 @@ def _parts_search_live_start(params: dict, _emit: Callable) -> dict:
                        "status": "queued"} for s in sites}
         job = {"results": [], "notices": [], "seen_ids": set(), "seen_notices": set(),
                "pending": len(sites), "done": not sites, "cancelled": False,
-               "vendors": vendors}
+               "vendors": vendors, "_owner": owner_key()}
         if skipped:
             job["notices"].append({
                 "site": "browser", "reason": "cef_unavailable",
@@ -1057,8 +1089,22 @@ def _parts_search_live_start(params: dict, _emit: Callable) -> dict:
                 evicted = _live_jobs.pop(next(iter(_live_jobs)))
                 evicted["cancelled"] = True  # stop its workers, not just the token
         for s in sites:
-            threading.Thread(target=_run_live_site, args=(s, rt, limit, p, job),
-                             name=f"parts-live-{s}", daemon=True).start()
+            context = copy_context()
+            thread = threading.Thread(target=context.run,
+                                      args=(_run_live_site, s, rt, limit, p, job),
+                                      name=f"parts-live-{s}", daemon=True)
+            with _live_lock:
+                for finished in list(_live_threads):
+                    if finished.ident is not None and not finished.is_alive():
+                        _live_threads.pop(finished)
+                _live_threads[thread] = job["_owner"]
+            try:
+                thread.start()
+            except BaseException:
+                with _live_lock:
+                    _live_threads.pop(thread, None)
+                    job["done"] = True  # Failed starts release only the reservation.
+                raise
         return {"ok": True, "token": token, "sites": sites,
                 "vendors": list(vendors.values()), "notices": list(job["notices"]),
                 "done": job["done"]}
@@ -1130,6 +1176,8 @@ def _parts_import_artifact(params: dict, _emit: Callable) -> dict:
         path = str((params or {}).get("artifact_path", "")).strip()
         if not path:
             return {"ok": False, "reason": "artifact_path required"}
+        from services.agent.request_context import cell_path
+        path = str(cell_path(path))
         suffix = Path(path).suffix.lower()
         supported = {".step", ".stp", ".iges", ".igs", ".stl", ".3mf", ".obj"}
         if suffix == ".zip":
@@ -1181,11 +1229,15 @@ def _parts_prepare_for_assembly(params: dict, emit: Callable) -> dict:
     The host applies asm_insert_component itself so it uses the same mirror, undo and
     tessellation path as Insert Component. Do not leave an unadopted part doc open.
     """
+    from services.agent.request_context import root_value, cell_path
     project_dir = str((params or {}).get("project_dir") or
-                      os.environ.get("CHUDWARE_PROJECT_SAVE_DIR") or "").strip()
+                      root_value("CHUDWARE_PROJECT_SAVE_DIR") or "").strip()
     if not project_dir:
         return {"ok": False, "reason": "No project folder is available for the component."}
-    directory = Path(os.path.abspath(os.path.expanduser(project_dir)))
+    try:
+        directory = cell_path(project_dir)
+    except ValueError:
+        return {"ok": False, "reason": "cell_refused", "code": "cell_refused"}
     try:
         directory.mkdir(parents=True, exist_ok=True)
         if not directory.is_dir():
@@ -1299,6 +1351,9 @@ def _vendor_login(params: dict, _emit: Callable) -> dict:
     flow; blocking the single worker RPC dispatch thread for up to 300 s here
     would freeze every other panel's calls (see memory: GL-thread RPC freeze).
     """
+    from services.agent.request_context import in_cell
+    if in_cell():
+        return {"ok": False, "reason": "cell_refused", "code": "cell_refused"}
     try:
         site = str((params or {}).get("vendor", "") or (params or {}).get("site", "")).strip().lower()
         if not site:
@@ -1314,9 +1369,15 @@ def _vendor_login(params: dict, _emit: Callable) -> dict:
                 except Exception as exc:  # noqa: BLE001
                     _login_results[site] = {"ok": False, "reason": str(exc)}
 
-            t = threading.Thread(target=_run, name=f"vendor-login-{site}", daemon=True)
+            context = copy_context()
+            t = threading.Thread(target=context.run, args=(_run,),
+                                 name=f"vendor-login-{site}", daemon=True)
             _login_threads[site] = t
-            t.start()
+            try:
+                t.start()
+            except BaseException:
+                _login_threads.pop(site, None)
+                raise
         return {"ok": True, "site": site, "in_progress": True}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"vendor_login failed: {exc}"}
@@ -1324,6 +1385,10 @@ def _vendor_login(params: dict, _emit: Callable) -> dict:
 
 def _vendor_creds_set(params: dict, _emit: Callable) -> dict:
     """Persist API-provider credentials to the app config (never logged, never committed)."""
+    from services.agent.request_context import in_cell
+    if in_cell():
+        return {"ok": False, "reason": "credential_isolation_unsupported",
+                "code": "credential_isolation_unsupported"}
     try:
         p = params or {}
         pid = str(p.get("provider", "")).strip()
@@ -1440,9 +1505,15 @@ def _vendors_health_check(params: dict, _emit: Callable) -> dict:
                     with _health_lock:
                         _health_state["finished_ts"] = _time.time()
 
-            t = threading.Thread(target=_run, name="vendors-health-check", daemon=True)
+            context = copy_context()
+            t = threading.Thread(target=context.run, args=(_run,),
+                                 name="vendors-health-check", daemon=True)
             _health_thread = t
-            t.start()
+            try:
+                t.start()
+            except BaseException:
+                _health_thread = None
+                raise
         return {"ok": True, "started": True}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"vendors_health_check failed: {exc}"}
@@ -1540,16 +1611,19 @@ def _thumb_cache_paths(part_id: str):
 
 
 def _thumb_cached(part_id: str) -> dict | None:
-    """The on-disk answer for a part: a positive hit, a fresh negative marker, or None
-    for a genuine miss. Two stat()s at worst — this is why the batch handler can resolve
-    every cached entry SYNCHRONOUSLY before it even builds a thread pool."""
+    """Return a verified positive raster hit, a fresh negative marker, or a miss.
+    Old caches may contain arbitrary successful HTTP bodies; they are not trusted."""
     try:
         img, miss = _thumb_cache_paths(part_id)
     except Exception:  # noqa: BLE001 — unwritable cache dir → behave as a miss
         return None
     try:
         if img.exists():
-            return {"ok": True, "image_b64": base64.b64encode(img.read_bytes()).decode()}
+            with img.open("rb") as source:
+                data = source.read(4 * 1024 * 1024 + 1)
+            if len(data) <= 4 * 1024 * 1024 and _decodable_image(data):
+                return {"ok": True, "image_b64": base64.b64encode(data).decode()}
+            img.unlink(missing_ok=True)
     except Exception:  # noqa: BLE001 — truncated / racing write → re-produce below
         pass
     try:
@@ -1633,34 +1707,37 @@ def _looks_like_image(body: bytes) -> bool:
     return body[:4] == b"RIFF" and body[8:12] == b"WEBP"
 
 
+def _decodable_image(body: bytes) -> bool:
+    if not _looks_like_image(body):
+        return False
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(body)) as image:
+            if image.width * image.height > 16_000_000:
+                return False
+            image.verify()
+        with Image.open(io.BytesIO(body)) as image:
+            image.load()
+        return True
+    except Exception:
+        return False
+
+
 def _http_image_get(url: str, headers: dict) -> tuple[bytes | None, int]:
     """One bounded HTTP GET for an image → ``(bytes|None, http_status)``; status 0 means
     the request never produced a response (DNS/TCP/TLS/timeout).
 
-    The subtle part is the ERROR path. Google's s2 favicon service answers **HTTP 404 with
-    a perfectly valid 726-byte generic-globe PNG in the body** (measured: thk.com,
-    3dcontentcentral.com, traceparts.com all 404 + a decodable PNG; mcmaster.com 200).
-    ``urlopen`` turns any 4xx/5xx into an HTTPError and the old code dropped the exception
-    on the floor, throwing that usable image away — which is precisely why those three
-    vendors fell back to a lettered tile. So on an error status we still READ the body
-    (same 4 MiB cap) and hand it back when it carries an image magic. A non-image error
-    body (an HTML 404 page, an empty response) yields None and the caller decides.
+    Successful and error responses alike require a verified, bounded raster image.
+    Some favicon providers return useful images with 404; those remain supported.
     """
+    from services.net.safe_http import get
     try:
-        req = urllib.request.Request(url, headers=headers)
-        # Short timeout ON PURPOSE: the old 8 s burned the GUI's whole patience budget on a
-        # dead CDN before the CEF fallback even started, so the card sat empty for 8+ s.
-        with urllib.request.urlopen(req, timeout=_thumb_fetch_timeout_s()) as resp:  # noqa: S310
-            body = resp.read(4 * 1024 * 1024)
-            return (body or None), int(getattr(resp, "status", 200) or 200)
-    except urllib.error.HTTPError as exc:
-        code = int(getattr(exc, "code", 0) or 0)
-        try:
-            body = exc.read(4 * 1024 * 1024) or b""
-        except Exception:  # noqa: BLE001 — error carried no readable body
-            body = b""
-        return (body if _looks_like_image(body) else None), code
-    except Exception:  # noqa: BLE001 — DNS/TCP/TLS/timeout; the caller may try CEF
+        response = get(url, headers=headers, max_bytes=4 * 1024 * 1024,
+                       idle_timeout=_thumb_fetch_timeout_s())
+        body = response.content
+        return (body if _decodable_image(body) else None), response.status_code
+    except Exception:  # noqa: BLE001 — never bypass policy with a browser retry
         return None, 0
 
 
@@ -1707,10 +1784,8 @@ def _fetch_image_bytes(image_url: str, part_id: str) -> bytes | None:
       2. For an s2 favicon url that 404'd, ONE retry against gstatic's faviconV2, which
          measurably still has the real icon for some of those domains. A 200 there beats
          the globe; otherwise the globe stands, because any icon beats a lettered tile.
-      3. The CEF session (real browser fingerprint + saved cookies) — the thing that
-         defeats CDNs which 403 a plain hotlink. Skipped when we already have bytes, and
-         skipped on a bodyless 404: that asset is simply gone and CEF would spend seconds
-         collecting the same 404.
+      Browser retries are intentionally excluded: their connections do not implement
+      the pinned public-destination policy.
     """
     import urllib.parse
 
@@ -1741,36 +1816,6 @@ def _fetch_image_bytes(image_url: str, part_id: str) -> bytes | None:
             data = data or alt_data      # both generic: keep whichever globe we got
     if data:
         return data   # an image body that came with an error status — still an image
-    if status == 404:
-        # Genuinely nothing there. CEF would re-request the SAME url from the SAME CDN and
-        # collect the same 404 seconds later. Every OTHER failure (403 hotlink guard, 5xx,
-        # timeout) still falls through — those are exactly what the CEF session fixes.
-        return None
-    # Fallback: pull the image through the CEF session, which carries the vendor's
-    # real browser fingerprint + saved cookies — this is what defeats the CDNs that
-    # 403 a plain hotlink. site = the catalog part_id's vendor segment.
-    site = ""
-    if part_id.startswith("catalog:"):
-        site = part_id[len("catalog:"):].split("::", 1)[0]
-    dest: str | None = None
-    try:
-        import tempfile
-        from pathlib import Path as _Path
-        from services.browser.cef_client import client as _cef_client
-        with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as tf:
-            dest = tf.name
-        r = _cef_client().download(image_url, dest, profile=site)
-        if isinstance(r, dict) and r.get("ok"):
-            data = _Path(dest).read_bytes()
-            return data or None
-    except Exception:  # noqa: BLE001 — CEF unavailable / download failed; GUI shows a glyph
-        pass
-    finally:
-        if dest is not None:
-            try:
-                _Path(dest).unlink(missing_ok=True)
-            except Exception:  # noqa: BLE001 — cleanup must not change fallback semantics
-                pass
     return None
 
 
@@ -2029,8 +2074,15 @@ def _parts_thumbnails(params: dict, _emit: Callable) -> dict:
             ex = ThreadPoolExecutor(max_workers=max(1, min(_thumb_workers(), len(pending))),
                                     thread_name_prefix="parts-thumb")
             try:
-                futs = {ex.submit(_thumb_produce, reqs[i][0], reqs[i][1], deadline): i
-                        for i in pending}
+                futs = {}
+                for i in pending:
+                    context = copy_context()
+                    future = ex.submit(context.run, _thumb_produce,
+                                       reqs[i][0], reqs[i][1], deadline)
+                    with _live_lock:
+                        _thumb_futures[future] = owner_key()
+                    future.add_done_callback(_thumbnail_finished)
+                    futs[future] = i
                 try:
                     for fut in as_completed(futs, timeout=budget):
                         i = futs[fut]

@@ -151,6 +151,7 @@ public:
         if (hidden_ == bodyIds) return;
         hidden_ = bodyIds;
         haveCachedFrame_ = false;
+        pickMemo_.valid = false;
     }
 
     // Keep picking in lock-step with Section View. A fragment is pickable only inside every
@@ -179,6 +180,7 @@ private:
     // shaders: id shader reused for faces (tris), edges (lines), verts (points). The packed topo
     // id travels as a per-vertex INTEGER attribute (location 1) so a whole body draws in one call.
     unsigned int prog_ = 0;
+    int mvpLoc_ = -1, clipCountLoc_ = -1, clipNormalsLoc_ = -1, clipOffsetsLoc_ = -1;
 
     // One batched draw covering all of a body's faces (indexed tris), edges (line list), or verts
     // (points). Each vertex carries its encoded id in vboId.
@@ -202,6 +204,24 @@ private:
     IdPassFrameKey lastKey_;
     bool haveCachedFrame_ = false;
     uint64_t docGen_ = 0;  // monotonically bumped by each topology upload in setDoc()
+    uint64_t renderGen_ = 0;  // advances only when a new ID frame has actually been rendered
+
+    // One lookup shared by exact and radius picks (radius zero denotes pickFinal). A cached
+    // render does not advance renderGen_, so unchanged hover needs neither a draw nor a readback.
+    struct PickMemo {
+        uint64_t generation = 0;
+        int px = 0, py = 0, finalW = 0, finalH = 0, radius = 0;
+        PickHit hit;
+        bool valid = false;
+
+        bool matches(uint64_t gen, int x, int y, int w, int h, int r) const {
+            return valid && generation == gen && px == x && py == y &&
+                   finalW == w && finalH == h && radius == r;
+        }
+    };
+    PickMemo pickMemo_;
+    std::vector<uint32_t> readbackIds_;
+    std::vector<unsigned char> readbackRgba_;
 };
 
 }  // namespace render

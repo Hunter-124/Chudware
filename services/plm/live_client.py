@@ -16,6 +16,7 @@ import os
 import tempfile
 import threading
 import uuid
+from contextvars import copy_context
 from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -672,6 +673,8 @@ class LiveClientManager:
         self._lock = threading.Lock()
         self._clients: dict[tuple[str, str, str], LiveClient] = {}
         self._local_docs: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._submissions = 0
+        self._stopping = False
 
     @property
     def running(self) -> bool:
@@ -682,7 +685,10 @@ class LiveClientManager:
             if self.running:
                 return
             self._started.clear()
-            self._thread = threading.Thread(target=self._run_loop, name="plm-live-loop", daemon=True)
+            self._stopping = False
+            context = copy_context()
+            self._thread = threading.Thread(target=context.run, args=(self._run_loop,),
+                                            name="plm-live-loop", daemon=True)
             self._thread.start()
         self._started.wait(timeout=5)
         if self._loop is None:
@@ -704,7 +710,26 @@ class LiveClientManager:
     def _submit(self, awaitable: Awaitable, timeout: float = 60.0) -> Any:
         self._start()
         assert self._loop is not None
-        future = asyncio.run_coroutine_threadsafe(awaitable, self._loop)
+        with self._lock:
+            self._submissions += 1
+
+        async def invoke():
+            try:
+                return await awaitable
+            finally:
+                with self._lock:
+                    self._submissions -= 1
+
+        invocation = invoke()
+        try:
+            future = asyncio.run_coroutine_threadsafe(invocation, self._loop)
+        except BaseException:
+            invocation.close()
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            with self._lock:
+                self._submissions -= 1
+            raise
         try:
             return future.result(timeout=timeout)
         except LiveClientError:
@@ -743,7 +768,12 @@ class LiveClientManager:
         item = manifest.find_item(project_manifest, item_id)
         if item is None:
             raise LiveClientError("invalid_item", "The requested live item is not in this project.")
-        url = profile.get("url")
+        from services.plm.remote import approved_remote_url
+        from services.plm.vault import VaultError
+        try:
+            url = approved_remote_url(path, profile)
+        except VaultError as exc:
+            raise LiveClientError(exc.reason, exc.hint) from exc
         if not isinstance(url, str) or not url:
             raise LiveClientError("remote_unreachable", "This live remote has no WebSocket location.")
         return project_manifest, profile, url
@@ -990,6 +1020,8 @@ class LiveClientManager:
         thread = self._thread
         if loop is None or thread is None:
             return
+        with self._lock:
+            self._stopping = True
         if thread.is_alive():
             future = asyncio.run_coroutine_threadsafe(self._leave_all(), loop)
             try:
@@ -998,6 +1030,8 @@ class LiveClientManager:
                 pass
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=10)
+        if thread.is_alive():
+            return  # Keep ownership while cancelled writers still actually live.
         self._loop = None
         self._thread = None
         self._started.clear()
@@ -1005,6 +1039,21 @@ class LiveClientManager:
 
 _MANAGER: LiveClientManager | None = None
 _MANAGER_LOCK = threading.Lock()
+
+
+def worker_activity() -> dict:
+    from services.worker_activity import registry_lock
+
+    with registry_lock(_MANAGER_LOCK):
+        manager = _MANAGER
+    # Registered receivers can write without another worker RPC. Count queued
+    # submissions until the coroutine really ends, even if its caller timed out.
+    if manager is None:
+        return {"by_kind": {"plm_live": 0}}
+    with registry_lock(manager._lock):
+        active = (len(manager._clients) + manager._submissions
+                  + int(manager._stopping and manager.running))
+    return {"by_kind": {"plm_live": active}}
 
 
 def get_live_manager() -> LiveClientManager:
@@ -1018,9 +1067,13 @@ def get_live_manager() -> LiveClientManager:
 def stop_live_manager() -> None:
     global _MANAGER
     with _MANAGER_LOCK:
-        manager, _MANAGER = _MANAGER, None
+        manager = _MANAGER
     if manager is not None:
         manager.stop()
+        if not manager.running:
+            with _MANAGER_LOCK:
+                if _MANAGER is manager:
+                    _MANAGER = None
 
 
 atexit.register(stop_live_manager)

@@ -314,3 +314,85 @@ def test_selector_list_profile_is_not_mistaken_for_geometry():
     feat = {"type": "revolve", "name": "Rev", "axis": "z",
             "profile": [{"kind": "region", "sketch": "f1", "hint_index": 0}]}
     _normalize_profile_feature(feat, "revolve", [])  # must not raise
+
+
+def test_agent_slots_do_not_fall_back_to_process_current(monkeypatch):
+    monkeypatch.setattr(cad_common._CUR, "_slots", {None: {"doc_id": "process-part"}})
+    with cad_common.agent_doc_context("A", scope="turn"):
+        assert cad_common.current_doc_id() is None
+        cad_common._CUR["doc_id"] = "a-part"
+    with cad_common.agent_doc_context("B", scope="turn"):
+        assert cad_common.current_doc_id() is None
+        cad_common._CUR["doc_id"] = "b-part"
+    with cad_common.agent_doc_context("A", scope="turn"):
+        assert cad_common.current_doc_id() == "a-part"
+    assert cad_common.current_doc_id() == "process-part"
+
+
+def test_agent_current_resolution_and_doc_scope_restore_own_slot(open_docs, monkeypatch):
+    monkeypatch.setattr(cad_common._CUR, "_slots", {None: {"doc_id": None}})
+    open_docs += [
+        {"doc_id": "doc-cpp00000001", "name": "A"},
+        {"doc_id": "doc-cpp00000002", "name": "B"},
+    ]
+    with cad_common.agent_doc_context("A", scope="turn"):
+        cad_common._CUR["doc_id"] = "doc-cpp00000001"
+        with cad_common.doc_scope():
+            cad_common._CUR["doc_id"] = "doc-cpp00000002"
+            with cad_common.agent_doc_context("B", scope="turn"):
+                assert cad_common.current_doc_id() is None
+                cad_common._CUR["doc_id"] = "doc-cpp00000002"
+        assert cad_common._doc(None) == "doc-cpp00000001"
+    with cad_common.agent_doc_context("B", scope="turn"):
+        assert cad_common._doc(None) == "doc-cpp00000002"
+    assert cad_common._CUR["doc_id"] is None
+
+
+def test_root_agent_slot_is_distinct_from_standalone_mcp(monkeypatch):
+    monkeypatch.setattr(cad_common._CUR, "_slots", {None: {"doc_id": "mcp-part"}})
+    with cad_common.agent_doc_context(None, scope="turn"):
+        assert cad_common.current_doc_id() is None
+        cad_common._CUR["doc_id"] = "root-part"
+    assert cad_common.current_doc_id() == "mcp-part"
+    with cad_common.agent_doc_context(None, scope="turn"):
+        assert cad_common.current_doc_id() == "root-part"
+
+
+def test_same_agent_name_in_separate_turns_has_separate_current_part(monkeypatch):
+    monkeypatch.setattr(cad_common._CUR, "_slots", {None: {"doc_id": None}})
+    with cad_common.agent_doc_context("Builder", scope="turn-one"):
+        cad_common._CUR["doc_id"] = "first-part"
+    with cad_common.agent_doc_context("Builder", scope="turn-two"):
+        assert cad_common.current_doc_id() is None
+
+
+def test_foreign_edit_notes_are_consumed_only_by_receiving_agent(monkeypatch):
+    from services.mcp import daemon_bridge
+
+    bridge = cad_common.cb
+    monkeypatch.setattr(bridge, "_FOREIGN_EDITS_PENDING", {})
+
+    class FakeClient:
+        def call(self, method, params):
+            return {
+                "ok": True,
+                "_foreign_edits": [{
+                    "doc_id": params["doc_id"], "revision": 8,
+                    "source_kind": "gui", "method": "doc_apply_ops",
+                }],
+            }
+
+    monkeypatch.setattr(daemon_bridge, "client", lambda: FakeClient())
+    with cad_common.agent_doc_context("A", scope="turn"):
+        result = bridge._call_via_daemon("doc_tree", {"doc_id": "a-part"})
+        assert result == {"ok": True}
+    with cad_common.agent_doc_context("B", scope="turn"):
+        assert "\nnote:" not in cad_common._dumps({"ok": True})
+        bridge._call_via_daemon("doc_tree", {"doc_id": "b-part"})
+        note = cad_common._dumps({"ok": True})
+        assert "b-part" in note and "a-part" not in note
+    with cad_common.agent_doc_context("A", scope="turn"):
+        note = cad_common._dumps({"ok": True})
+        assert "a-part" in note and "b-part" not in note
+        assert "\nnote:" not in cad_common._dumps({"ok": True})
+    assert bridge.consume_foreign_edits() == []

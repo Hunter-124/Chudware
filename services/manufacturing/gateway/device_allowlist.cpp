@@ -271,9 +271,15 @@ bool EndpointIdentity::valid(std::string* why) const {
     if (address.empty()) return fail(why, "allowlist endpoint address is empty");
     if (transport == device::TransportKind::Serial) {
         if (port != 0) return fail(why, "serial allowlist endpoint must not have a network port");
-        const int usb_fields = !usb_vid.empty() + !usb_pid.empty() + !usb_serial.empty();
-        if (usb_fields != 0 && usb_fields != 3)
+        if (usb_vid.empty() || usb_pid.empty() || usb_serial.empty())
             return fail(why, "serial USB identity requires vid, pid, and serial together");
+        const auto valid_hex = [](std::string_view value) {
+            if (value.starts_with("0x") || value.starts_with("0X")) value.remove_prefix(2);
+            return value.size() == 4 && std::all_of(value.begin(), value.end(),
+                [](unsigned char ch) { return std::isxdigit(ch); });
+        };
+        if (!valid_hex(usb_vid) || !valid_hex(usb_pid))
+            return fail(why, "serial USB vid and pid must be four hexadecimal digits");
     } else if (isNetwork(transport)) {
         if (port == 0) return fail(why, "network allowlist endpoint requires a port");
         if (!usb_vid.empty() || !usb_pid.empty() || !usb_serial.empty())

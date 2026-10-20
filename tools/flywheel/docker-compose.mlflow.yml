@@ -4,8 +4,8 @@
 #
 # Usage:
 #   docker compose -f tools/flywheel/docker-compose.mlflow.yml up -d
-#   # UI: http://localhost:5000
-#   # Tracking URI: http://localhost:5000 (set MLFLOW_TRACKING_URI in runner env)
+# No host port is published: tracking is container-network-only.
+# Shared/host access requires an explicitly configured authenticated TLS ingress.
 #
 # MLflow server license: Apache-2.0 (subprocess/Docker isolation).
 # MLflow client: Apache-2.0 (in-process; see contracts/licenses.md).
@@ -16,8 +16,6 @@ services:
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.13.0
     restart: unless-stopped
-    ports:
-      - "5000:5000"
     environment:
       MLFLOW_BACKEND_STORE_URI: "sqlite:///mlflow/mlflow.db"
       MLFLOW_DEFAULT_ARTIFACT_ROOT: "/mlflow/artifacts"

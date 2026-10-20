@@ -56,6 +56,7 @@ struct Agent {
     double startTs = 0.0, endTs = 0.0;
     int toolCount = 0, failCount = 0;
     long long dropped = 0;
+    bool named = false;   // `name` is the spawner-assigned task name; role/purpose never replace it
     std::deque<Step> steps;
 };
 
@@ -105,6 +106,23 @@ static std::string jstr(const nlohmann::json& d, const char* k) {
     auto it = d.find(k);
     return (it != d.end() && it->is_string()) ? it->get<std::string>() : std::string();
 }
+
+static bool genericAgentName(const std::string& s) {
+    return s.empty() || s == "task" || s == "scout" || s == "worker" ||
+           s == "reviewer" || s == "security-reviewer" || s == "sonic" ||
+           s == "Subagent" || s == "Sub-agent" || s == "sub-agent";
+}
+
+static bool readableTaskId(const std::string& id) {
+    // Chudcode's task handles are readable identifiers, including dotted nesting.
+    // Never replace a human label with an opaque legacy span id.
+    return !id.empty() && id[0] >= 'A' && id[0] <= 'Z' &&
+        std::all_of(id.begin(), id.end(), [](unsigned char c) {
+            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                   (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        });
+}
+
 static int jint(const nlohmann::json& d, const char* k, int def = 0) {
     auto it = d.find(k);
     if (it == d.end() || !it->is_number()) return def;
@@ -290,12 +308,32 @@ static void subagentLifecycle(TraceStore& t, const nlohmann::json& d, const std:
     const int ai = ensureAgent(t, sub, parentIdx, now);
     if (ai == 0) return;   // agent table full
     const std::string purpose = foldToAtlasGlyphs(jstr(d, "purpose"));
+    const std::string assigned = foldToAtlasGlyphs(jstr(d, "name"));
+    const std::string description = foldToAtlasGlyphs(jstr(d, "description"));
     const std::string detail = jstr(d, "detail");
     const std::string st = agentStatusFrom(raw);
     {
         Agent& a = t.agents[(size_t)ai];
-        if (a.name.empty() && !purpose.empty()) a.name = purpose;
-        if (a.brief.empty() && !purpose.empty()) a.brief = purpose;
+        if (!assigned.empty()) {
+            a.name = assigned;
+            a.named = true;
+        } else if (!a.named && !genericAgentName(purpose)) {
+            a.name = purpose;
+        }
+        // The label lands late (after the start frame) and is the agent's one-line task.
+        if (!description.empty()) a.brief = description;
+        else if (a.brief.empty() && !purpose.empty() && purpose != a.name &&
+                 !genericAgentName(purpose)) a.brief = purpose;
+        if (!parentSpan.empty() && parentIdx != ai) {
+            const std::string& pid = t.agents[(size_t)parentIdx].id;
+            if (a.parent != pid && !isAncestor(t, sub, pid)) a.parent = pid;
+        }
+        const int pi = std::max(findAgent(t, a.parent), 0);
+        if (Step* sp = findSpanStep(t.agents[(size_t)pi], sub, StepKind::Spawn)) {
+            sp->title = "Spawned " + a.name;
+            sp->target = a.brief;
+            ++sp->rev;
+        }
         if (!detail.empty()) a.note = detail;
         if (!terminalStatus(st)) {
             a.status = st;
@@ -522,10 +560,15 @@ void feedAgentDagEvent(const std::string& convId, const std::string& kind,
         if (ci == 0) return;
         const std::string role = foldToAtlasGlyphs(jstr(data, "role"));
         const std::string brief = foldToAtlasGlyphs(jstr(data, "brief"));
+        const std::string assigned = foldToAtlasGlyphs(jstr(data, "name"));
         {
             Agent& c = t.agents[(size_t)ci];
-            if (!role.empty()) c.name = role;
-            if (!brief.empty()) c.brief = brief;
+            if (!assigned.empty()) { c.name = assigned; c.named = true; }
+            else if (!c.named && genericAgentName(c.name)) {
+                if (!brief.empty() && !genericAgentName(brief)) c.name = brief;
+                else if (c.name.empty() && !role.empty()) c.name = role;
+            }
+            if (!brief.empty() && !genericAgentName(brief)) c.brief = brief;
             if (c.status.empty() || c.status == "idle") c.status = "running";
             if (c.startTs <= 0.0) c.startTs = now;
             // A frame that arrived before the spawn parented it under main; the spawn knows better.
@@ -535,8 +578,9 @@ void feedAgentDagEvent(const std::string& convId, const std::string& kind,
         if (findSpanStep(t.agents[(size_t)pi], child, StepKind::Spawn)) return;
         Step& s = pushStep(t, pi, StepKind::Spawn, now);
         s.spanId = child;
-        s.title = "Spawned " + (role.empty() ? std::string("sub-agent") : role);
-        s.target = brief;
+        const Agent& childAgent = t.agents[(size_t)ci];
+        s.title = "Spawned " + (childAgent.name.empty() ? std::string("sub-agent") : childAgent.name);
+        s.target = childAgent.brief;
         s.detail = jstr(data, "brief");
         s.status = "running";
         indexSpan(t, jstr(data, "id"), pi);
@@ -676,7 +720,7 @@ nlohmann::json agentDagToJson(const std::string& convId) {
         const Agent& a = t.agents[ai];
         const size_t skip = a.steps.size() > kPersistStepsPerAgent
             ? a.steps.size() - kPersistStepsPerAgent : 0;
-        agents.push_back({{"id", a.id}, {"parent", a.parent}, {"name", a.name},
+        agents.push_back({{"id", a.id}, {"parent", a.parent}, {"name", a.name}, {"named", a.named},
                           {"brief", capText(a.brief, kPersistText)}, {"status", a.status},
                           {"model", a.model}, {"note", capText(a.note, kPersistText)},
                           {"startTs", a.startTs}, {"endTs", a.endTs},
@@ -715,6 +759,13 @@ void agentDagFromJson(const std::string& convId, const nlohmann::json& j) {
         a.parent = x.value("parent", std::string());
         a.name = x.value("name", std::string());
         a.brief = x.value("brief", std::string());
+        a.named = x.value("named", false);
+        if (!x.contains("named") && a.id != "main" && genericAgentName(a.name) &&
+            readableTaskId(a.id)) {
+            if (genericAgentName(a.brief)) a.brief.clear();
+            a.name = a.id;
+            a.named = true;
+        }
         a.status = x.value("status", std::string());
         a.model = x.value("model", std::string());
         a.note = x.value("note", std::string());
@@ -739,6 +790,11 @@ void agentDagFromJson(const std::string& convId, const nlohmann::json& j) {
             s.uid = x.value("u", (unsigned long long)0);
             s.spanId = x.value("sp", std::string());
             s.title = x.value("t", std::string());
+            if (s.kind == StepKind::Spawn) {
+                const int child = findAgent(t, jstr(x, "sp"));
+                if (child > 0 && t.agents[(size_t)child].named)
+                    s.title = "Spawned " + t.agents[(size_t)child].name;
+            }
             s.target = x.value("g", std::string());
             s.detail = x.value("d", std::string());
             s.error = x.value("e", std::string());
@@ -937,8 +993,12 @@ static void buildFallback(const std::vector<ChatMsg>& msgs, TraceStore& t) {
                     const int ci = ensureAgent(t, id, 0, m.ts);
                     if (ci == 0) break;
                     Agent& c = t.agents[(size_t)ci];
-                    c.name = jstr(dlg, "role");
+                    c.name = jstr(dlg, "name");
+                    if (c.name.empty()) c.name = jstr(dlg, "title");
+                    c.named = !c.name.empty();
                     c.brief = jstr(dlg, "brief");
+                    if (c.name.empty()) c.name = !c.brief.empty() && !genericAgentName(c.brief)
+                        ? c.brief : jstr(dlg, "role");
                     // Dispatch is not proof of completion. Only a terminal lifecycle event can
                     // say "done"; an ended transcript without one is an interrupted delegate.
                     c.status = m.running ? "running" : "stopped";
@@ -1408,12 +1468,21 @@ void drawAgentTrace(AppState& st, const std::string& convId, AgentTraceSelectAge
     const float pitch = agentRowH + spacingY;
     const float padding = ImGui::GetStyle().WindowPadding.y * 2.0f;
     const float treeContent = order.size() * pitch - spacingY + padding;
-    // Small trees should fit in full. Larger trees scroll in whole-row viewports, not through
-    // a percentage-height cut across a name. Leave at least two step rows below the tree.
-    const float treeBudget = order.size() <= 5 ? treeContent
-        : std::max(pitch * 2.0f + padding, std::min(avail * 0.5f, treeContent));
-    const int visibleRows = std::max(2, (int)std::floor((treeBudget - padding + spacingY) / pitch));
-    const float treeH = std::min(treeContent, visibleRows * pitch - spacingY + padding);
+    // Account for the steps header, both child gaps and navigation footer before spending
+    // height on the tree. Small trees used to bypass the budget entirely; the two-row minimum
+    // on larger trees could also push the timeline/footer out of a short inspector.
+    const float stepH = ImGui::GetTextLineHeight() * 2.0f + ui::metrics::U(0.5f) +
+                        kit::padY() * 2.0f;
+    const float stepsHeaderH = kit::sectionGap() + ImGui::GetTextLineHeight() +
+                              kit::headGap() + spacingY * 3.0f;
+    const float timelineMinH = stepH * 2.0f + spacingY + padding;
+    const float treeLimit = std::max(ui::metrics::stroke(1.0f),
+        avail - stepsHeaderH - chatJumpToLatestFooterHeight() - spacingY * 2.0f - timelineMinH);
+    const float treeBudget = std::min(treeLimit, order.size() <= 5 ? treeContent
+        : std::max(pitch * 2.0f + padding, std::min(avail * 0.5f, treeContent)));
+    const int visibleRows = std::max(1, (int)std::floor((treeBudget - padding + spacingY) / pitch));
+    const float treeH = std::min(treeBudget,
+        std::min(treeContent, visibleRows * pitch - spacingY + padding));
     ImGui::BeginChild("##trace_tree", ImVec2(0, treeH), ImGuiChildFlags_AlwaysUseWindowPadding,
                       ImGuiWindowFlags_NoScrollbar);
     {
@@ -1433,13 +1502,14 @@ void drawAgentTrace(AppState& st, const std::string& convId, AgentTraceSelectAge
     kit::sectionHeader(header.c_str(), nullptr,
                        fromTranscript ? "from saved transcript" : nullptr,
                        (int)std::min<long long>(a.dropped + (long long)a.steps.size(), 1 << 30));
-    ImGui::BeginChild("##trace_timeline", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding,
+    const float timelineH = std::max(ui::metrics::stroke(1.0f),
+        ImGui::GetContentRegionAvail().y - chatJumpToLatestFooterHeight() - spacingY);
+    ImGui::BeginChild("##trace_timeline", ImVec2(0, timelineH), ImGuiChildFlags_AlwaysUseWindowPadding,
                       ImGuiWindowFlags_NoScrollbar);
     const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
     const AdaptiveSurface& surf = adaptivePanel(panelId("ai_ws_trace_timeline"),
         ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), GlassGroup::Global);
     const float lineH = ImGui::GetTextLineHeight();
-    const float stepH = lineH * 2.0f + ui::metrics::U(0.5f) + kit::padY() * 2.0f;
     const int offset = a.dropped > 0 ? 1 : 0;
     const int count = (int)a.steps.size() + offset;
     if (count == 0) {
@@ -1478,7 +1548,7 @@ void drawAgentTrace(AppState& st, const std::string& convId, AgentTraceSelectAge
     chatLogStickToBottom(kTimelineRegion);
     drawWindowPillScrollbarV(surf);
     ImGui::EndChild();
-    chatDrawJumpToLatest(kTimelineRegion, wp, ImVec2(wp.x + ws.x, wp.y + ws.y));
+    chatDrawJumpToLatest(kTimelineRegion);
 }
 
 bool agentTraceRefreshStep(AppState& st, AgentTraceStep& io) {

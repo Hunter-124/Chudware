@@ -260,6 +260,18 @@ never data loss.
   human gate** (plan §3.3, non-goal §6). The seam exists so the config surface is
   stable; the behavior is deliberately absent.
 
+Credential-bearing remote URLs are rejected before a link or remote can enter
+new history. A destination carried by versioned metadata is not network
+authorization: sync requires explicit local approval and otherwise returns
+`remote_destination_unapproved`.
+
+Opening a legacy project with unsafe remote metadata exposes redacted,
+read-only diagnostics; it does not silently repair or commit. Use
+`plm_add_remote` to explicitly approve a clean replacement. Repair appends a
+forward entry, preserves the original historical bytes, and permits ordinary
+checkpoint/sync afterward. It does not revoke credentials or close an exposure
+incident; those require separate owner action.
+
 ### 6.2 The lock manifest
 
 Locks are **advisory** (they warn; they do not hard-block a determined offline

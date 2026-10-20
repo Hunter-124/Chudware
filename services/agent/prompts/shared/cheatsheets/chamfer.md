@@ -29,3 +29,8 @@ Example C - asymmetric 2mm / 0.5mm chamfer on the top rim:
 1. Chamfer uses `length` (the setback), NOT `radius`. Using radius is rejected.
 2. The query goes under refs.edges (an OBJECT with "of"), not at the feature top level.
 3. Keep length smaller than the adjacent wall/face, or OCCT fails.
+
+The final solid must pass native B-rep, zero-area-face and self-intersection checks
+before it replaces the preceding body. Invalid geometry rejects atomically and
+preserves the preceding body; the native error names the defect. Inspect adjacent
+material and selected edges before revising length or construction.

@@ -5,6 +5,10 @@
 #include <cerrno>
 #include <cstring>
 #include <string>
+#ifdef __EMSCRIPTEN__
+#include "engine_backend.h"
+#include "ipc_client.h"
+#endif
 
 #if defined(__EMSCRIPTEN__)
 #include <emscripten/emscripten.h>
@@ -40,14 +44,8 @@ constexpr WebGap kWebGaps[] = {
      "Vendor sign-in is desktop-only: it drives an embedded browser session the web "
      "app cannot host. Sign in from the desktop app."},
     {"account_signin",
-     "Subscription sign-in is desktop-only. The web app's engine is one server process shared by "
-     "every account, so a subscription grant stored there would belong to the operator and to "
-     "everyone else at once. Paste your own provider API key instead \xe2\x80\x94 it is validated, "
-     "encrypted and used only for your account."},
-    // Python-worker-only methods (contracts/web_parity.md web_unsupported).
-    {"ecad_ai_design",
-     "AI circuit design is desktop-only until the ECAD design orchestrator is ported "
-     "into the C++ core (T-RF20)."},
+     "Provider subscription sign-in is unavailable in the web app. "
+     "Add your own provider API key in your account settings."},
 };
 
 bool allowedExternalHttpUrl(const std::string& url) {
@@ -81,6 +79,11 @@ bool allowedExternalHttpUrl(const std::string& url) {
 
 const char* webGapReason(const char* surfaceId) {
     if (!webBuild() || !surfaceId) return nullptr;
+#ifdef __EMSCRIPTEN__
+    const auto* connection = engine::client();
+    if (!connection || !engine::webCellProtocolReady(connection->serverInfo()))
+        return "CAD and AI are unavailable for this workspace connection.";
+#endif
     for (const WebGap& g : kWebGaps)
         if (std::strcmp(g.id, surfaceId) == 0) return g.reason;
     return nullptr;

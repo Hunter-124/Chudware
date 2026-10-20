@@ -133,3 +133,98 @@ def test_scrub_text_keeps_the_whitespace_a_description_needs():
     assert scrub_text("line1\nline2\ttabbed\r\n") == "line1\nline2\ttabbed\r\n"
     assert scrub_text(None) == ""
     assert scrub_text(123) == "123"
+
+
+def test_description_link_cannot_spend_credits_but_trusted_buy_button_can(
+    client, activate, as_user, grant_credits, marketplace_env, monkeypatch
+):
+    """Run the shipped renderer/CSP against real PostgreSQL purchase consumers.
+
+    Chromium requests are fulfilled exclusively through TestClient. No request
+    (including the description's external link) reaches an external server.
+    """
+    from urllib.parse import urlsplit
+
+    from playwright.sync_api import expect, sync_playwright
+    from db import tx
+
+    seller, buyer = "description-seller@test.invalid", "description-buyer@test.invalid"
+    activate(seller)
+    activate(buyer)
+    grant_credits(buyer, 1000)
+    monkeypatch.setattr(marketplace_env, "marketplace_review_first_paid", False)
+    seller_headers, buyer_headers = as_user(seller), as_user(buyer)
+    assert client.post("/api/studio/seller", headers=seller_headers, json={
+        "handle": "description-seller", "display_name": "Description Seller",
+    }).status_code == 200
+    description = '[Read drawing](https://example.invalid/"data-buy="credits)'
+    created = client.post("/api/studio/listings", headers=seller_headers, json={
+        "title": "Description purchase boundary", "description": description,
+        "license_id": "chud-standard-1.0", "pricing_kind": "credits",
+        "price_credits": 500, "origin": "ai_assisted",
+    })
+    assert created.status_code == 200, created.text
+    listing_id = created.json()["listing"]["id"]
+    assert client.post(f"/api/studio/listings/{listing_id}/submit", headers=seller_headers).status_code == 200
+    listing = client.get(f"/api/marketplace/listings/{listing_id}", headers=buyer_headers).json()
+    assert listing["description"] == description
+    assert not listing["preview_urls"]
+    checkouts = []
+
+    def balance():
+        with tx() as cur:
+            cur.execute("SELECT credit_balance FROM accounts WHERE email=%s", (buyer,))
+            return cur.fetchone()["credit_balance"]
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            context = browser.new_context()
+
+            def route_fixture(route):
+                request = route.request
+                parsed = urlsplit(request.url)
+                if parsed.hostname != "marketplace-fixture.test":
+                    route.abort()
+                    return
+                path = parsed.path + (("?" + parsed.query) if parsed.query else "")
+                if parsed.path.endswith("/checkout"):
+                    checkouts.append(json.loads(request.post_data))
+                response = client.request(
+                    request.method, path, content=request.post_data_buffer,
+                    headers={**buyer_headers, "Content-Type": "application/json"},
+                )
+                # TestClient has already decoded compression; preserve CSP.
+                headers = {
+                    key: value for key, value in response.headers.items()
+                    if key.lower() not in {"content-length", "content-encoding", "transfer-encoding"}
+                }
+                route.fulfill(status=response.status_code, body=response.content, headers=headers)
+
+            context.route("**/*", route_fixture)
+            page = context.new_page()
+            page.goto(f"http://marketplace-fixture.test/marketplace#/m/{listing_id}")
+            link = page.locator("#mk-description a")
+            link.wait_for()
+            assert link.get_attribute("data-buy") is None
+            assert page.locator("#mk-description [data-buy]").count() == 0
+            with page.expect_popup() as popup:
+                link.click()
+            popup.value.close()
+            assert checkouts == []
+            assert balance() == 1000
+            with tx() as cur:
+                cur.execute("SELECT count(*) AS n FROM mk_orders WHERE buyer_email=%s", (buyer,))
+                assert cur.fetchone()["n"] == 0
+            page.locator('#mk-buy-actions > button[data-buy="credits"]').click()
+            expect(page.locator("#mk-buy-message")).to_contain_text("Purchased.")
+            assert checkouts == [{"currency": "credits"}]
+            assert balance() == 500
+            with tx() as cur:
+                cur.execute(
+                    "SELECT count(*) AS n FROM mk_entitlements WHERE listing_id=%s AND email=%s",
+                    (listing_id, buyer),
+                )
+                assert cur.fetchone()["n"] == 1
+        finally:
+            browser.close()

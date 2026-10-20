@@ -121,16 +121,29 @@ def _polymesh_commit_from_build() -> tuple:
 def _engine_build_id() -> tuple:
     """(build id, source) for the engine actually serving this process.
 
-    Daemon mode answers ``hello`` with its own ``engine_build_id``; in-process mode the
-    library exports ``chudware_build_id``. Either way the value comes from the running
+    Daemon mode's negotiated ``hello`` contains its own ``engine_build_id``; in-process
+    mode the library exports ``chudware_build_id``. Either way the value comes from the running
     binary, not from a file this module guessed at."""
-    try:
-        r = cb.call("hello", {"client": "mcp-animation"})
-        bid = str(r.get("engine_build_id") or "").strip()
-        if bid:
-            return bid, "hostd hello.engine_build_id"
-    except Exception:  # noqa: BLE001
-        pass
+    if cb.active_daemon_mode():
+        try:
+            from . import daemon_bridge  # noqa: PLC0415
+            connection = daemon_bridge.client()
+            info = connection.server_info
+            source = "hostd hello.engine_build_id"
+            if not info.get("engine_build_id"):
+                if daemon_bridge.in_cell():
+                    return None, "hostd hello.engine_build_id unavailable during admission"
+                # An admission accepted while the engine loads has no build id yet.
+                info = connection.call("daemon_status", {})
+                source = "hostd daemon_status.engine_build_id"
+            # Repeating hello changes the shared connection's writer identity. Provenance
+            # must observe its negotiated metadata, not re-register the client.
+            bid = str(info.get("engine_build_id") or "").strip()
+            if bid:
+                return bid, source
+            return None, source + " unavailable"
+        except Exception:  # noqa: BLE001
+            return None, "hostd engine_build_id unavailable"
     try:
         import ctypes  # noqa: PLC0415
         from . import core_bridge as _cbmod  # noqa: PLC0415

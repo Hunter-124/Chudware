@@ -1,11 +1,15 @@
 #include "firmware/hardware.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <stdexcept>
 
+#include "firmware/private_storage.h"
 #include "firmware/subprocess.h"
 
 #include <cerrno>
@@ -17,6 +21,9 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #include <termios.h>
 #include <unistd.h>
 #endif
@@ -46,6 +53,22 @@ FlashResult not_found(const std::string& tool, const std::vector<std::string>& c
     return r;
 }
 
+struct EmulatorWorkspace {
+    std::filesystem::path directory = private_temp_directory("firmware-emulator");
+
+    ~EmulatorWorkspace() {
+        std::error_code ignored;
+        std::filesystem::remove_all(directory, ignored);
+    }
+
+    std::string copy_input(const std::string& source, const char* name, size_t budget) {
+        const auto destination = directory / name;
+        private_storage_detail::atomic_write(
+            destination, private_storage_detail::read_file(source, budget));
+        return destination.string();
+    }
+};
+
 // hardware._run equivalent: returns (returncode, combined capped output).
 FlashResult run_flash(const std::vector<std::string>& cmd, double timeout_s,
                       std::chrono::steady_clock::time_point t0) {
@@ -70,15 +93,20 @@ FlashResult run_flash(const std::vector<std::string>& cmd, double timeout_s,
 
 // Bounded free-run of an emulator that never self-exits (simavr/renode): a wall-clock
 // timeout at `run_s` is the EXPECTED stop, not a failure.
-FlashResult run_bounded_emulate(const std::vector<std::string>& cmd, double run_s,
-                                std::chrono::steady_clock::time_point t0) {
+FlashResult run_bounded_emulate(const std::vector<std::string>& cmd, const std::string& cwd,
+                                double run_s, std::chrono::steady_clock::time_point t0) {
     FlashResult r;
     r.cmd = cmd;
-    RunResult rr = run_capture(cmd, "", run_s);
+    RunResult rr = run_capture(cmd, cwd, run_s, true, kOutputCap);
     if (rr.not_found) {
         r.returncode = -1;
         r.success = false;
         r.output = "tool_not_found: executable '" + cmd[0] + "' not on PATH";
+    } else if (rr.output_limit_exceeded) {
+        r.returncode = -1;
+        r.success = false;
+        r.output = "output_limit_exceeded: emulator output exceeded its capture budget\n" +
+                   cap(rr.stdout_text + rr.stderr_text);
     } else if (rr.timed_out) {
         r.returncode = 0;
         r.success = true;
@@ -97,23 +125,48 @@ FlashResult run_bounded_emulate(const std::vector<std::string>& cmd, double run_
 // Launches `argv` as a detached background child (stdio -> /dev/null, own session), never
 // waited on by the parent except via stop_background(). Returns the child pid, or -1 on a
 // fork() failure.
-pid_t spawn_background(const std::vector<std::string>& argv) {
+pid_t spawn_background(const std::vector<std::string>& argv, const std::string& cwd,
+                       bool minimal_env) {
+    const std::string executable = std::filesystem::absolute(which(argv[0])).string();
+    std::vector<char*> cargv;
+    cargv.reserve(argv.size() + 1);
+    for (const auto& s : argv) cargv.push_back(const_cast<char*>(s.c_str()));
+    cargv.push_back(nullptr);
+    std::vector<std::string> environment;
+    std::vector<char*> envp;
+    if (minimal_env) {
+        const char* path = std::getenv("PATH");
+        environment = {"PATH=" + std::string(path ? path : ""),
+                       "HOME=" + cwd, "TMPDIR=" + cwd};
+        for (auto& value : environment) envp.push_back(value.data());
+        envp.push_back(nullptr);
+    }
+    const long descriptor_limit = minimal_env ? ::sysconf(_SC_OPEN_MAX) : 0;
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
         int devnull = ::open("/dev/null", O_RDWR);
-        if (devnull >= 0) {
-            ::dup2(devnull, STDIN_FILENO);
-            ::dup2(devnull, STDOUT_FILENO);
-            ::dup2(devnull, STDERR_FILENO);
-            if (devnull > STDERR_FILENO) ::close(devnull);
+        if (devnull < 0) _exit(127);
+        if (::dup2(devnull, STDIN_FILENO) < 0 ||
+            ::dup2(devnull, STDOUT_FILENO) < 0 ||
+            ::dup2(devnull, STDERR_FILENO) < 0) _exit(127);
+        if (devnull > STDERR_FILENO) ::close(devnull);
+        if (minimal_env) {
+            bool descriptors_closed = false;
+#if defined(__linux__) && defined(SYS_close_range)
+            descriptors_closed = (::syscall(SYS_close_range, 3u, ~0u, 0u) == 0);
+#endif
+            if (!descriptors_closed) {
+                if (descriptor_limit < 0) _exit(127);
+                for (long fd = 3; fd < descriptor_limit; ++fd) ::close(static_cast<int>(fd));
+            }
         }
-        ::setsid();
-        std::vector<char*> cargv;
-        cargv.reserve(argv.size() + 1);
-        for (auto& s : argv) cargv.push_back(const_cast<char*>(s.c_str()));
-        cargv.push_back(nullptr);
-        ::execvp(cargv[0], cargv.data());
+        if (!cwd.empty() && ::chdir(cwd.c_str()) != 0) _exit(127);
+        if (::setsid() < 0) _exit(127);
+        if (minimal_env)
+            ::execve(executable.c_str(), cargv.data(), envp.data());
+        else
+            ::execvp(cargv[0], cargv.data());
         _exit(127);
     }
     return pid;
@@ -123,14 +176,25 @@ pid_t spawn_background(const std::vector<std::string>& argv) {
 void stop_background(pid_t pid) {
     if (pid <= 0) return;
     ::kill(pid, SIGTERM);
+    ::kill(-pid, SIGTERM);
     int status = 0;
     for (int i = 0; i < 20; ++i) {
-        if (::waitpid(pid, &status, WNOHANG) != 0) return;
+        const pid_t waited = ::waitpid(pid, &status, WNOHANG);
+        if (waited == pid || (waited < 0 && errno == ECHILD)) {
+            ::kill(-pid, SIGKILL);
+            return;
+        }
         ::usleep(50000);
     }
     ::kill(pid, SIGKILL);
-    ::waitpid(pid, &status, 0);
+    ::kill(-pid, SIGKILL);
+    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
 }
+
+struct BackgroundChild {
+    pid_t pid = -1;
+    ~BackgroundChild() { stop_background(pid); }
+};
 
 speed_t baud_to_speed(int baud) {
     switch (baud) {
@@ -280,8 +344,10 @@ FlashResult avrdude_flash(const std::string& hex_path, const std::string& mcu,
 
 #if defined(_WIN32)
 
-FlashResult gdb_mi_session(const std::vector<std::string>&, const std::string&,
-                           const std::vector<std::string>&, double, const std::string&, double) {
+static FlashResult gdb_mi_session_in_directory(
+    const std::vector<std::string>&, const std::string&,
+    const std::vector<std::string>&, double, const std::string&, double,
+    const std::string&, bool) {
     FlashResult r;
     r.success = false;
     r.returncode = -1;
@@ -303,19 +369,22 @@ bool serial_close(int) { return false; }
 
 #else  // POSIX
 
-FlashResult gdb_mi_session(const std::vector<std::string>& server_argv, const std::string& remote_target,
-                           const std::vector<std::string>& mi_commands, double timeout_s,
-                           const std::string& gdb_binary, double startup_delay_s) {
+static FlashResult gdb_mi_session_in_directory(
+    const std::vector<std::string>& server_argv, const std::string& remote_target,
+    const std::vector<std::string>& mi_commands, double timeout_s,
+    const std::string& gdb_binary, double startup_delay_s,
+    const std::string& cwd, bool minimal_env) {
     auto t0 = std::chrono::steady_clock::now();
     if (!server_argv.empty() && which(server_argv[0]).empty())
         return not_found(server_argv[0], server_argv, t0);
-    if (which(gdb_binary).empty())
+    const auto gdb_executable = which(gdb_binary);
+    if (gdb_executable.empty())
         return not_found(gdb_binary, {gdb_binary, "--batch", "--interpreter=mi2"}, t0);
 
-    pid_t server_pid = -1;
+    BackgroundChild server;
     if (!server_argv.empty()) {
-        server_pid = spawn_background(server_argv);
-        if (server_pid < 0) {
+        server.pid = spawn_background(server_argv, cwd, minimal_env);
+        if (server.pid < 0) {
             FlashResult r;
             r.success = false;
             r.returncode = -1;
@@ -327,8 +396,12 @@ FlashResult gdb_mi_session(const std::vector<std::string>& server_argv, const st
         ::usleep(static_cast<useconds_t>(std::max(0.0, startup_delay_s) * 1e6));
     }
 
-    std::vector<std::string> gdb_argv = {gdb_binary, "--batch", "--interpreter=mi2",
-                                         "-ex", "target remote " + remote_target};
+    std::vector<std::string> gdb_argv = {
+        minimal_env ? std::filesystem::absolute(gdb_executable).string() : gdb_binary,
+        "--batch", "--interpreter=mi2"};
+    if (minimal_env) gdb_argv.push_back("--nx");
+    gdb_argv.push_back("-ex");
+    gdb_argv.push_back("target remote " + remote_target);
     for (const auto& c : mi_commands) {
         gdb_argv.push_back("-ex");
         gdb_argv.push_back(c);
@@ -338,14 +411,17 @@ FlashResult gdb_mi_session(const std::vector<std::string>& server_argv, const st
     gdb_argv.push_back("-ex");
     gdb_argv.push_back("quit");
 
-    RunResult rr = run_capture(gdb_argv, "", timeout_s);
-    stop_background(server_pid);
+    RunResult rr = run_capture(gdb_argv, cwd, timeout_s, minimal_env, kOutputCap);
 
     FlashResult r;
     r.cmd = gdb_argv;
     if (rr.not_found) {
         r.returncode = -1;
         r.output = "tool_not_found: executable '" + gdb_argv[0] + "' not on PATH";
+    } else if (rr.output_limit_exceeded) {
+        r.returncode = -1;
+        r.output = "output_limit_exceeded: GDB output exceeded its capture budget\n" +
+                   cap(rr.stdout_text + rr.stderr_text);
     } else if (rr.timed_out) {
         r.returncode = -1;
         r.output = "timeout: '" + gdb_argv[0] + "' exceeded " +
@@ -442,6 +518,14 @@ bool serial_close(int handle) {
 
 #endif  // !_WIN32
 
+FlashResult gdb_mi_session(const std::vector<std::string>& server_argv,
+                           const std::string& remote_target,
+                           const std::vector<std::string>& mi_commands, double timeout_s,
+                           const std::string& gdb_binary, double startup_delay_s) {
+    return gdb_mi_session_in_directory(server_argv, remote_target, mi_commands, timeout_s,
+                                       gdb_binary, startup_delay_s, "", false);
+}
+
 FlashResult openocd_gdb_mi(const std::string& openocd_cfg, const std::vector<std::string>& mi_commands,
                            double timeout_s, const std::string& gdb_binary) {
     return gdb_mi_session({"openocd", "-f", openocd_cfg}, "localhost:3333", mi_commands, timeout_s,
@@ -476,29 +560,56 @@ FlashResult openocd_gdb_read_mem(const std::string& openocd_cfg, const std::stri
 FlashResult simavr_run(const std::string& elf_path, const std::string& mcu, double run_s,
                        int gdb_port, const std::vector<std::string>& gdb_commands, double timeout_s,
                        const std::string& gdb_binary) {
-    if (!gdb_commands.empty()) {
-        std::vector<std::string> server_argv = {"simavr", "-m", mcu, "-g", elf_path};
-        return gdb_mi_session(server_argv, "localhost:" + std::to_string(gdb_port), gdb_commands,
-                              timeout_s, gdb_binary, 0.4);
-    }
     auto t0 = std::chrono::steady_clock::now();
     std::vector<std::string> cmd = {"simavr", "-m", mcu, elf_path};
-    if (which("simavr").empty()) return not_found("simavr", cmd, t0);
-    return run_bounded_emulate(cmd, run_s, t0);
+    const auto executable = which("simavr");
+    if (executable.empty()) return not_found("simavr", cmd, t0);
+    try {
+        EmulatorWorkspace workspace;
+        cmd[0] = std::filesystem::absolute(executable).string();
+        cmd.back() = workspace.copy_input(elf_path, "firmware.elf", 64 * 1024 * 1024);
+        if (!gdb_commands.empty()) {
+            cmd.insert(cmd.end() - 1, "-g");
+            return gdb_mi_session_in_directory(
+                cmd, "localhost:" + std::to_string(gdb_port), gdb_commands,
+                timeout_s, gdb_binary, 0.4, workspace.directory.string(), true);
+        }
+        return run_bounded_emulate(cmd, workspace.directory.string(), run_s, t0);
+    } catch (const std::exception& exc) {
+        FlashResult result;
+        result.returncode = -1;
+        result.cmd = cmd;
+        result.output = "emulator_input_refused: " + std::string(exc.what());
+        result.ms = elapsed_ms(t0);
+        return result;
+    }
 }
 
 FlashResult renode_run(const std::string& resc_path, double run_s, int gdb_port,
                        const std::vector<std::string>& gdb_commands, double timeout_s,
                        const std::string& gdb_binary) {
-    if (!gdb_commands.empty()) {
-        std::vector<std::string> server_argv = {"renode", "--disable-xwt", "--console", resc_path};
-        return gdb_mi_session(server_argv, "localhost:" + std::to_string(gdb_port), gdb_commands,
-                              timeout_s, gdb_binary, 1.5);
-    }
     auto t0 = std::chrono::steady_clock::now();
     std::vector<std::string> cmd = {"renode", "--disable-xwt", "--console", resc_path};
-    if (which("renode").empty()) return not_found("renode", cmd, t0);
-    return run_bounded_emulate(cmd, run_s, t0);
+    const auto executable = which("renode");
+    if (executable.empty()) return not_found("renode", cmd, t0);
+    try {
+        EmulatorWorkspace workspace;
+        cmd[0] = std::filesystem::absolute(executable).string();
+        cmd.back() = workspace.copy_input(resc_path, "scenario.resc", 4 * 1024 * 1024);
+        if (!gdb_commands.empty()) {
+            return gdb_mi_session_in_directory(
+                cmd, "localhost:" + std::to_string(gdb_port), gdb_commands,
+                timeout_s, gdb_binary, 1.5, workspace.directory.string(), true);
+        }
+        return run_bounded_emulate(cmd, workspace.directory.string(), run_s, t0);
+    } catch (const std::exception& exc) {
+        FlashResult result;
+        result.returncode = -1;
+        result.cmd = cmd;
+        result.output = "emulator_input_refused: " + std::string(exc.what());
+        result.ms = elapsed_ms(t0);
+        return result;
+    }
 }
 
 }  // namespace chudware::firmware

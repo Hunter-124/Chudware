@@ -59,6 +59,29 @@
 // that the active chat and Sessions follow the selected root (startup, A/B/empty-root switches with a
 // parked run, outside-root document open/tab selection, explicit other-project pick) with no
 // cross-project active_by_project entry; report + captures in scratch/projectchat_shots.
+// CHUDWARE_SHOT=agentlock writes through a second MCP connection during a human sketch and
+// checks keep-exit, reserved lock chrome, mutation refusal, background-run Stop and unlock;
+// JSON report and external/in-app/stopping/unlocked captures land in scratch/agentlock_shots.
+// CHUDWARE_SHOT=featurestate creates a canonical numeric 40/30/20 box, saves/reopens its build
+// cache, and checks real PM labels/readouts in MMGS/IPS, unchanged resync/activation/snapshot
+// cleanliness, actual drag-preview dirtiness, out-of-band native edits followed by local edits,
+// undo/redo preservation, saved wrapped dimensions and expression hydration.
+// Use private HOME/XDG/CHUDWARE_SESSIONS_DIR paths and CHUDWARE_ENGINE_DAEMON=0; override
+// CHUDWARE_FEATURESTATE_OUT for a private output root (default scratch/featurestate_shots).
+// Captures and report.json use that root; failures exit non-zero. No provider is involved.
+// CHUDWARE_SHOT=chat_inline exercises real Ctrl+V/selection/caret input, ordered image payloads,
+// reference deletion/reorder, draft/history restore, edit/cancel, and full-size viewer clicks.
+// Requires xclip plus portrait.png/landscape.png in scratch/chat_inline_shots. Use isolated
+// HOME/XDG paths, CHUDWARE_ENGINE_DAEMON=0, and an isolated XDG_RUNTIME_DIR/invalid
+// WAYLAND_DISPLAY under Xvfb so wl-paste cannot read the user's desktop clipboard.
+// Captures and report.json land in scratch/chat_inline_shots; failure exits non-zero.
+// CHUDWARE_SHOT=copilot_ui exercises wrapped choices, Other typing, unit selection, file input,
+// geometry/approval transitions, footer non-overlap/jump, short-window composer, and header actions.
+// Use private HOME/XDG paths and CHUDWARE_ENGINE_DAEMON=0. Optional CHUDWARE_COPILOT_WIDTH
+// (logical px), CHUDWARE_SCALE, CHUDWARE_THEME, CHUDWARE_COPILOT_UI_WORKSPACE=1 and
+// CHUDWARE_COPILOT_UI_OUT customize the surface; default captures/report: scratch/copilot_ui_shots.
+// Parallel runs need distinct CHUDWARE_SESSIONS_DIR and display instances; the default shot
+// session store is shared by scenario name and cleared at startup.
 #pragma once
 
 #include <memory>
@@ -123,6 +146,10 @@ private:
     int skStep = 0, skSettle = 0;
     std::string skSavePath, skFid;
     std::string skL0, skL1, skL2, skL3, skWidthCid;
+    // Relation / model-reference / Fully Define / Convert steps (3+) on a mid-height sketch.
+    std::string skRelFid, skRelLine, skRelPierce, skRelVertex;
+    std::string skTopEdgeSel, skVertEdgeSel, skVertexSel, skTopFaceSel;
+    int skTopEdgeTid = 0, skTopFaceTid = 0;
     bool skDirReady = false;
     std::string sketchCapture;  // same per-step capture mechanism, separate path slot
 

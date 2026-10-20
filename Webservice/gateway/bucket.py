@@ -1,8 +1,8 @@
 """File-drop bucket API (/api/bucket/*) — personal and shared team trees.
 
-Three roots, and a request addresses exactly one of them:
+Two roots, and a request addresses exactly one of them:
 
-* **personal** (``?scope=personal``) — ``settings.user_bucket_root(user_slug(email))``,
+* **personal** (``?scope=personal``) — ``cells.personal_bucket_root(email)``,
   created on demand, reachable only by that account.
 * **team** (``?team=<uuid>``) — ``bucket_root/orgs/<org>/teams/<team>``, shared
   by the team's members plus the organization's owner/admin. Membership is
@@ -10,8 +10,7 @@ Three roots, and a request addresses exactly one of them:
   so a removal, a downgrade, or a suspension takes effect immediately; the
   quota that governs it belongs to the organization's owner, while rate limits
   stay keyed on the acting account.
-* **legacy shared** (``?scope=shared``) — the pre-tenant single-tenant tree,
-  admin-only, never moved or deleted.
+Legacy shared trees are not exposed; every request has a personal/team identity.
 
 Every path is clamped under whichever of those roots was resolved, and the two
 uuid components of a team root are validated as canonical UUID text before they
@@ -28,15 +27,18 @@ from __future__ import annotations
 
 import logging
 import shutil
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, HTTPException, Request
+from starlette.datastructures import UploadFile
+from starlette.concurrency import run_in_threadpool
+from fastapi.responses import StreamingResponse
 
 try:
-    from . import orgs
+    from . import cells, orgs
     from .config import settings
     from .auth import User, get_current_user
     from .accounts import get_account
@@ -46,9 +48,13 @@ try:
         storage_write_lock,
         enforce_upload_size,
         uploads,
-        user_slug,
+        bounded_form,
+        stream_open_file,
+        store_upload,
+        list_open_directory,
     )
 except ImportError:  # uvicorn app:app from package dir
+    import cells
     import orgs  # type: ignore
     from config import settings
     from auth import User, get_current_user
@@ -59,7 +65,10 @@ except ImportError:  # uvicorn app:app from package dir
         storage_write_lock,
         enforce_upload_size,
         uploads,
-        user_slug,
+        bounded_form,
+        stream_open_file,
+        store_upload,
+        list_open_directory,
     )
 
 log = logging.getLogger("chudware-web.bucket")
@@ -95,7 +104,7 @@ class _Scope:
 
 
 def _bucket_root() -> Path:
-    """Legacy single-tenant shared tree. Only reachable via admin scope=shared."""
+    """Require the configured base for personal/team bucket storage."""
     root = settings.bucket_root
     if not root or not Path(root).is_dir():
         raise HTTPException(status_code=503, detail="bucket root not configured")
@@ -107,32 +116,32 @@ def _caller_scope(
 ) -> _Scope:
     """Resolve the one root this caller is allowed to address.
 
-    Default is the account's own tree, created on demand. ``team=<uuid>``
-    selects a shared team tree the caller is currently entitled to, and
-    ``scope=shared`` is the admin-only escape hatch onto the legacy tree. The
-    two selectors are mutually exclusive and any other scope value is rejected,
-    so neither a typo nor a combination can silently widen access.
+    Default is the account's personal tree; team selections are revalidated.
+    The selectors are mutually exclusive; legacy shared storage is not exposed.
     """
     user = get_current_user(request)
     team = (team or "").strip()
     if scope and team:
         raise HTTPException(status_code=400, detail="scope and team are exclusive")
     if scope == "shared":
-        if user.role != "admin":
-            raise HTTPException(status_code=403, detail="scope=shared requires admin")
-        return _Scope(user=user, root=_bucket_root(), kind="shared", team=None)
+        raise HTTPException(status_code=403, detail="shared scope unavailable")
     if scope and scope != "personal":
         raise HTTPException(status_code=400, detail="unknown scope")
     team = orgs.selected_workspace_team(request, user.email, scope, team)
     _bucket_root()  # base must still be configured (503 on misconfig)
     if team:
         bucket = orgs.resolve_team_bucket(user.email, team, write=write)
-        root = bucket.root
+        principal = cells.resolve_workspace(user.email, team)
+        if write and principal.right not in {"owner", "manager", "editor"}:
+            raise HTTPException(status_code=403, detail="forbidden_right")
+        root = principal.root
         root.mkdir(parents=True, exist_ok=True)
-        return _Scope(user=user, root=root.resolve(), kind="team", team=bucket)
-    root = settings.user_bucket_root(user_slug(user.email))
+        return _Scope(user=user, root=root.absolute(), kind="team", team=bucket)
+    root = cells.personal_bucket_root(user.email)
     root.mkdir(parents=True, exist_ok=True)
-    return _Scope(user=user, root=root.resolve(), kind="personal", team=None)
+    fd = cells.directory_beneath(root)
+    os.close(fd)
+    return _Scope(user=user, root=root.absolute(), kind="personal", team=None)
 
 
 def _resolve(root: Path, rel: str, *, must_exist: bool = True) -> Path:
@@ -143,6 +152,8 @@ def _resolve(root: Path, rel: str, *, must_exist: bool = True) -> Path:
     used to escape it.
     """
     rel = (rel or "").strip().replace("\\", "/")
+    if any(ord(char) < 32 or ord(char) == 127 for char in rel):
+        raise HTTPException(status_code=400, detail="bad path")
     if rel.startswith("/") or (len(rel) > 1 and rel[1] == ":"):
         raise HTTPException(status_code=400, detail="absolute paths not allowed")
     if any(part in {"..", ""} for part in rel.split("/")) and rel != "":
@@ -177,116 +188,70 @@ def bucket_list(
 ) -> dict[str, Any]:
     resolved = _caller_scope(request, scope, team)
     root = resolved.root
-    base = _resolve(root, dir)
-    if not base.is_dir():
-        raise HTTPException(status_code=400, detail="not a directory")
-    dirs: list[dict[str, Any]] = []
-    files: list[dict[str, Any]] = []
-    for p in sorted(base.iterdir(), key=lambda p: p.name.lower()):
-        if p.name.startswith("."):
-            continue
-        rel = str(p.relative_to(root))
-        try:
-            st = p.stat()
-        except OSError:
-            continue
-        if p.is_dir():
-            dirs.append({"name": p.name, "path": rel})
-        else:
-            files.append({"name": p.name, "path": rel, "size": st.st_size,
-                          "mtime": int(st.st_mtime)})
-    # Caller's OWN absolute jail root — same WASM client contract as
-    # /workspace/list (host/src/core/fs_backend.h). The scope block is
-    # additive: existing consumers keep reading root/dir/dirs/files.
-    return {"root": str(root), "dir": str(base.relative_to(root)) if base != root else "",
+    directory = dir.strip().replace("\\", "/").removeprefix("./")
+    if directory == ".":
+        directory = ""
+    dirs, files = list_open_directory(cells.directory_beneath(root, directory), directory, 10000)
+    return {"root": ".", "dir": directory,
             "dirs": dirs[:5000], "files": files[:5000], **resolved.context()}
 
 
 @router.get("/api/bucket/download")
 def bucket_download(
     request: Request, path: str, scope: str = "", team: str = ""
-) -> FileResponse:
+) -> StreamingResponse:
     resolved = _caller_scope(request, scope, team)
-    target = _resolve(resolved.root, path)
-    if not target.is_file():
-        raise HTTPException(status_code=400, detail="not a file")
-    return FileResponse(str(target), filename=target.name,
-                        headers={"Cache-Control": "no-store"})
+    fd, st = cells.open_beneath(resolved.root, path, max_bytes=settings.max_upload_bytes)
+    return stream_open_file(fd, st, filename=Path(path).name, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/api/bucket/upload")
-def bucket_upload(request: Request,
-files: list[UploadFile] = File(...),
-dir: str = Form(""),
-scope: str = "",
-team: str = "",) -> dict[str, Any]:
-    """Accept flat files or a whole dropped/selected folder tree.
+async def bucket_upload(request: Request) -> dict[str, Any]:
+    """Admit and bound the complete multipart stream before parser buffering."""
+    resolved = await run_in_threadpool(
+        _caller_scope, request, request.query_params.get("scope", ""),
+        request.query_params.get("team", ""), write=True
+    )
+    api_writes.enforce(resolved.user.email, "writes")
+    uploads.enforce(resolved.user.email, "uploads")
+    cap = enforce_upload_size(_content_length(request))
+    quota_email, quota_plan = resolved.quota_target()
+    await run_in_threadpool(enforce_disk_quota, quota_email, quota_plan, resolved.root)
+    async with bounded_form(request, cap, max_files=1000) as form:
+        files = form.getlist("files")
+        directory = form.get("dir", "")
+        if not files or any(not isinstance(file, UploadFile) for file in files):
+            raise HTTPException(status_code=422, detail="files required")
+        if not isinstance(directory, str) or len(directory) > 4096:
+            raise HTTPException(status_code=400, detail="bad directory")
+        return await run_in_threadpool(_store_uploads, resolved, files, directory, cap)
 
-    Each UploadFile's filename may be a nested relative path
-    (``sub/dir/name.ext``, forward-slashed) when the client uploaded a
-    folder — the browser File API and our frontend both preserve that via
-    ``File.webkitRelativePath`` / ``FormData.append(name, file, path)``.
-    Path segments are clamped under the target dir the same way ``_resolve``
-    clamps client dir paths; anything that tries to escape is skipped rather
-    than aborting the whole batch, so one bad entry in a big folder drop
-    doesn't lose everything else.
-    """
-    resolved = _caller_scope(request, scope, team, write=True)
+
+def _store_uploads(resolved: _Scope, files: list[UploadFile], dir: str, cap: int) -> dict[str, Any]:
     with storage_write_lock(resolved.root):
         user, root = resolved.user, resolved.root
-        # Rate limits stay per acting account even on a shared tree: one member
-        # must not be able to spend the whole team's request budget.
-        api_writes.enforce(user.email, "writes")
-        uploads.enforce(user.email, "uploads")
-        declared = _content_length(request)
-        cap = enforce_upload_size(declared)
         quota_email, quota_plan = resolved.quota_target()
-        enforce_disk_quota(
-            quota_email,
-            quota_plan,
-            root,
-            incoming_bytes=declared or 0,
-        )
         base = _resolve(root, dir, must_exist=False)
-        base.mkdir(parents=True, exist_ok=True)
         uploaded: list[dict[str, Any]] = []
         skipped: list[str] = []
         total = 0
         for file in files:
-            raw = (file.filename or "").strip().replace("\\", "/").lstrip("/")
+            raw = (file.filename or "").strip().replace("\\", "/")
             parts = [p for p in raw.split("/") if p not in ("", ".")]
-            if not parts or any(p == ".." for p in parts):
+            if not parts or raw.startswith("/") or (len(raw) > 1 and raw[1] == ":") or any(p == ".." for p in parts):
                 skipped.append(file.filename or "")
                 continue
-            candidate = base.joinpath(*parts)
-            if candidate.is_symlink():
-                skipped.append(raw)
-                continue
-            target = candidate.resolve()
-            if target != root and root not in target.parents:
-                skipped.append(raw)
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            size = 0
+            relative = str(base.joinpath(*parts).relative_to(root))
             try:
-                with target.open("wb") as out:
-                    while chunk := file.file.read(1 << 20):
-                        size += len(chunk)
-                        total += len(chunk)
-                        # Chunked uploads have no Content-Length — enforce the cap
-                        # DURING streaming and leave no partial file behind.
-                        if size > cap or total > cap:
-                            raise HTTPException(
-                                status_code=413,
-                                detail=f"upload too large — {cap // (1024 * 1024)} MiB max",
-                            )
-                        out.write(chunk)
-                enforce_disk_quota(quota_email, quota_plan, root)
-            except BaseException:
-                target.unlink(missing_ok=True)
+                size = store_upload(root, relative, file, cap=cap, email=quota_email,
+                                    plan=quota_plan, total=total, create_parents=True)
+            except HTTPException as exc:
+                if exc.status_code in {400, 403}:
+                    skipped.append(raw)
+                    continue
                 raise
-            log.info("bucket upload: %s (%d bytes) by %s", target, size, user.email)
-            uploaded.append({"path": str(target.relative_to(root)), "bytes": size})
+            total += size
+            uploaded.append({"path": relative, "bytes": size})
         if not uploaded and skipped:
             raise HTTPException(status_code=400, detail=f"no valid files (skipped: {', '.join(skipped[:5])})")
         return {"ok": True, "uploaded": uploaded, "skipped": skipped}

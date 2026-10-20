@@ -7,6 +7,19 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+try:
+    from .deployment_config import (
+        DEFAULT_MAIL_FROM, DEFAULT_PUBLIC_BASE_URL, MAIL_BACKENDS, SMTP_TLS_MODES,
+        MAIL_KEY, PROVIDER_KEY, decode_encryption_key,
+    )
+    from .storage_config import configured_storage, data_root as storage_data_root, expand_path as _expand_path
+except ImportError:
+    from deployment_config import (
+        DEFAULT_MAIL_FROM, DEFAULT_PUBLIC_BASE_URL, MAIL_BACKENDS, SMTP_TLS_MODES,
+        MAIL_KEY, PROVIDER_KEY, decode_encryption_key,
+    )
+    from storage_config import configured_storage, data_root as storage_data_root, expand_path as _expand_path
+
 
 def _env(name: str, default: str | None = None) -> str | None:
     return os.environ.get(name, default)
@@ -33,8 +46,6 @@ def _env_float(name: str, default: float) -> float:
     return float(raw)
 
 
-def _expand_path(raw: str) -> Path:
-    return Path(raw).expanduser().resolve()
 
 
 def _canonical_uuid(value: str) -> str:
@@ -59,47 +70,18 @@ def _normalize_team_domain(raw: str) -> str:
         raw = "https://" + raw
     return raw
 
-def _load_webd_env() -> dict[str, str]:
-    """KEY=VALUE defaults written by deploy/install_webd.sh (~/chudware-web/webd.env)."""
-    path = Path(_env("CHUDWARE_WEBD_ENV", "~/chudware-web/webd.env") or "").expanduser()
-    try:
-        text = path.read_text()
-    except OSError:
-        return {}
-    out: dict[str, str] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        out[k.strip()] = v.strip()
-    return out
-
-
-# Outbound mail backends. "console" logs the rendered message and is what a
-# dev box and the test suite run on; the two real ones are Resend's HTTPS API
-# and any SMTP relay (Amazon SES is the documented fallback above 100 mail/day).
-MAIL_BACKENDS = frozenset({"console", "resend", "smtp"})
-# How the SMTP submission session is encrypted. "starttls" upgrades a plaintext
-# connection (port 587); "implicit" is TLS from the first byte (port 465, which
-# is all Stalwart's submission listener offers). Both verify the peer chain.
-SMTP_TLS_MODES = frozenset({"starttls", "implicit"})
-DEFAULT_MAIL_FROM = "Chudware <noreply@chudware.com>"
-
-# Origin the gateway is reached at. Verification links, password-reset links,
-# and OAuth redirect_uri values are all built from it, so it is configuration
-# rather than something derived from a request header.
-DEFAULT_PUBLIC_BASE_URL = "https://chudware.com"
 
 
 @dataclass
 class Settings:
     """Runtime settings loaded once from the process environment."""
 
+    deploy_environment: str = field(
+        default_factory=lambda: _env("CHUDWARE_DEPLOY_ENV", "prod") or "prod"
+    )
+
     data_root: Path = field(
-        default_factory=lambda: _expand_path(
-            _env("CHUDWARE_WEB_DATA_ROOT", "~/chudware-web-data") or "~/chudware-web-data"
-        )
+        default_factory=lambda: storage_data_root(_env("CHUDWARE_DEPLOY_ENV", "prod") or "prod")
     )
     host: str = field(default_factory=lambda: _env("CHUDWARE_WEB_HOST", "127.0.0.1") or "127.0.0.1")
     port: int = field(default_factory=lambda: _env_int("CHUDWARE_WEB_PORT", 8300))
@@ -126,7 +108,7 @@ class Settings:
     max_engine_bridges_per_user: int = field(
         # Concurrent /engine websockets per account. The browser client opens
         # one and reconnects on drop, so a small number is plenty; this only
-        # exists to stop one account fanning out across the shared daemon.
+        # exists to stop one account exhausting its cell and gateway bridges.
         # Not 1: a reconnect can briefly overlap the socket it replaces, and a
         # user may legitimately have two tabs open. Zero is rejected during
         # initialization rather than silently taking the web-native client offline.
@@ -194,10 +176,9 @@ class Settings:
     project_roots_raw: str = field(
         default_factory=lambda: _env("CHUDWARE_WEB_PROJECT_ROOTS", "") or ""
     )
-    # Web-native client: shared engine daemon socket + per-account workspace root.
-    # Env overrides win; else webd.env (install_webd.sh); else deterministic
-    # defaults (instance key "chudwareweb" is verbatim => socket name is stable).
-    webd_socket: Path = field(default_factory=Path)
+    # OS-isolated cell directory and retained workspace discovery roots.
+    # webd.env supplies legacy workspace storage only, never an engine endpoint.
+    cells_root: Path = field(default_factory=Path)
     workspace_root: Path = field(default_factory=Path)
     # File bucket storage: the default scope is private to one account; explicit
     # team scopes live under organizations/<org UUID>/teams/<team UUID> and are
@@ -220,6 +201,7 @@ class Settings:
     session_secret: str = field(
         default_factory=lambda: _env("CHUDWARE_WEB_SESSION_SECRET", "") or ""
     )
+    mail_context_encryption_key: bytes = field(default=b"", repr=False)
     # URL-safe base64 encoding of 32 random bytes used only for AES-256-GCM
     # provider-key envelopes. It is deliberately independent of session_secret
     # so either secret can rotate without invalidating the other subsystem.
@@ -434,6 +416,18 @@ class Settings:
 
 
     def __post_init__(self) -> None:
+        if self.deploy_environment not in {"prod", "staging"}:
+            raise ValueError("CHUDWARE_DEPLOY_ENV must be prod or staging")
+        if not self.mail_context_encryption_key:
+            self.mail_context_encryption_key = decode_encryption_key(
+                _env(MAIL_KEY, "") or "", MAIL_KEY,
+            )
+        if not isinstance(self.mail_context_encryption_key, bytes) or len(self.mail_context_encryption_key) != 32:
+            raise ValueError("CHUDWARE_MAIL_CONTEXT_ENCRYPTION_KEY must encode 32 bytes")
+        if self.provider_key_encryption_key:
+            provider_key = decode_encryption_key(self.provider_key_encryption_key.strip(), PROVIDER_KEY)
+            if provider_key == self.mail_context_encryption_key:
+                raise ValueError("mail and provider encryption keys must be independent")
         if self.max_engine_bridges_per_user < 1:
             raise ValueError(
                 "CHUDWARE_WEB_MAX_ENGINE_BRIDGES_PER_USER must be at least 1"
@@ -524,25 +518,18 @@ class Settings:
             raise ValueError(
                 "Stripe billing is partially configured; missing " + missing
             )
-        webd_env = _load_webd_env()
-        if not self.webd_socket or str(self.webd_socket) in {".", ""}:
-            raw = _env("CHUDWARE_WEBD_SOCKET") or webd_env.get("CHUDWARE_WEBD_SOCKET")
-            if not raw:
-                run = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/chudware-{os.getuid()}"
-                raw = f"{run}/chudware/hostd-chudwareweb.sock"
-            self.webd_socket = _expand_path(raw)
-        if not self.workspace_root or str(self.workspace_root) in {".", ""}:
-            raw = (
-                _env("CHUDWARE_WORKSPACE_ROOT")
-                or webd_env.get("CHUDWARE_WORKSPACE_ROOT")
-                or "~/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build"
-            )
-            self.workspace_root = _expand_path(raw)
-        if not self.bucket_root or str(self.bucket_root) in {".", ""}:
-            raw = _env("CHUDWARE_WEB_BUCKET_ROOT") or "~/ME489"
-            self.bucket_root = _expand_path(raw)
+        staging = self.deploy_environment == "staging"
+        storage = configured_storage(
+            self.deploy_environment, data=self.data_root, workspace=self.workspace_root,
+            bucket=self.bucket_root, cells=self.cells_root, university=self.university_workspace_root,
+        )
+        self.workspace_root = storage.roots["workspace"]
+        self.bucket_root = storage.roots["bucket"]
+        self.cells_root = storage.roots["cells"]
         if not self.app_dir or str(self.app_dir) in {".", ""}:
-            raw = _env("CHUDWARE_WEB_APP_DIR") or "~/chudware-web/app"
+            raw = _env("CHUDWARE_WEB_APP_DIR") or (
+                str(self.data_root / "app") if staging else "~/chudware-web/app"
+            )
             self.app_dir = _expand_path(raw)
         if not self.perf_traces_dir or str(self.perf_traces_dir) in {".", ""}:
             raw = _env("CHUDWARE_WEB_PERF_TRACES_DIR")
@@ -553,6 +540,14 @@ class Settings:
                 self.perf_traces_dir = (
                     Path(__file__).resolve().parents[1] / "perf" / "traces"
                 )
+
+    @property
+    def gateway_unit(self) -> str:
+        if self.deploy_environment == "staging":
+            return "chudware-gateway-staging"
+        if self.deploy_environment == "prod":
+            return "chudware-gateway"
+        raise ValueError("unknown deployment environment")
 
     @property
     def plm_dir(self) -> Path:
@@ -574,6 +569,8 @@ class Settings:
         rejected, so a mistyped or malicious project path cannot expose /etc
         or another user's home.
         """
+        if self.deploy_environment == "staging":
+            return [self.workspace_root.resolve(), self.bucket_root.resolve()]
         raw = [p for p in self.project_roots_raw.split(":") if p.strip()]
         roots: list[Path] = []
         for entry in raw:

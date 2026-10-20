@@ -621,3 +621,30 @@ TEST_CASE("unsupported geometry is named in the error, not dropped silently") {
     }
     CHECK_THROWS_AS(read_acis("not acis at all"), std::runtime_error);
 }
+
+TEST_CASE("native input boundary: SAT counted strings reject overflow and truncation") {
+    for (const std::string& token : {
+             std::string("@18446744073709551594 x"),
+             std::string("@184467440737095516160 x"),
+             std::string("@99 x"),
+             std::string("@1x")}) {
+        const std::string sat = "700 0 1 0\n1 1e-6 1e-10\nbody " + token + " #\n";
+        try {
+            (void)read_acis(sat);
+            FAIL("malformed counted string was accepted");
+        } catch (const std::runtime_error& error) {
+            CHECK(std::string(error.what()).find("SAT counted string") != std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("native input boundary: SAT counted string retains embedded record markers") {
+    std::string sat = kCubeHole700;
+    const auto at = sat.find("@7 unknown");
+    REQUIRE(at != std::string::npos);
+    sat.replace(at, std::strlen("@7 unknown"), "@8 un#known");
+    const auto result = read_acis(sat);
+    REQUIRE(result.bodies.size() == 1);
+    CHECK(BRepCheck_Analyzer(result.bodies[0].shape).IsValid());
+    CHECK(volume(result.bodies[0].shape) == doctest::Approx(1000.0 - 40.0 * kPi));
+}

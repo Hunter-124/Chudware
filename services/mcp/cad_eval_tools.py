@@ -253,10 +253,17 @@ def _eval_thickness_all_bodies(doc_id: str) -> tuple[dict, list]:
            for b in range(1, count + 1)]
     measured = [(b, r) for b, r in per if r.get("min_thickness_mm") is not None]
     n_total = sum(int(r.get("n_sampled") or 0) for _, r in per)
-    thinnest = min(measured, key=lambda br: br[1]["min_thickness_mm"], default=per[-1])[1]
+    min_body, thinnest = min(measured, key=lambda br: br[1]["min_thickness_mm"],
+                             default=per[-1])
     weighted = sum(float(r.get("mean_thickness_mm") or 0) * int(r.get("n_sampled") or 0)
                    for _, r in measured)
     n_measured = sum(int(r.get("n_sampled") or 0) for _, r in measured)
+    basis = dict(thinnest.get("measurement_basis") or {})
+    if basis:
+        for key in ("n_vertices", "n_unmeasured"):
+            basis[key] = sum(int((r.get("measurement_basis") or {}).get(key) or 0)
+                             for _, r in per)
+    minimum_sample = thinnest.get("minimum_sample")
     merged = {
         "aicm_path": thinnest.get("aicm_path"),
         "max_thickness_mm": max((r["max_thickness_mm"] for _, r in measured
@@ -264,6 +271,9 @@ def _eval_thickness_all_bodies(doc_id: str) -> tuple[dict, list]:
         "mean_thickness_mm": (weighted / n_measured) if n_measured else None,
         "min_thickness_mm": thinnest.get("min_thickness_mm") if measured else None,
         "n_sampled": n_total,
+        "measurement_basis": basis,
+        "minimum_sample": ({**minimum_sample, "body": min_body}
+                           if isinstance(minimum_sample, dict) else None),
         "bodies": [{"body": b, "min_thickness_mm": r.get("min_thickness_mm")} for b, r in per],
     }
     return merged, [(b, str(r["aicm_path"])) for b, r in measured if r.get("aicm_path")]
@@ -275,20 +285,36 @@ def _wall_thickness_result(doc_id: str) -> dict:
     mn = res.get("min_thickness_mm")
     if mn is not None:
         mean = res.get("mean_thickness_mm")
-        summary = (f"thinnest wall = {mn:.4g} mm"
-                   + (f" (mean {mean:.4g} mm)" if mean is not None else ""))
+        summary = (f"minimum sampled local wall span = {mn:.4g} mm"
+                   + (f" (mean {mean:.4g} mm)" if mean is not None else "")
+                   + "; includes edge tapers, not a verified structural wall minimum")
     else:
-        summary = ("no through-wall thickness could be measured (open/sheet body, or no "
-                   "opposite wall in line of sight) — every inward ray left the material "
-                   f"without hitting a far wall. Confirm {doc_id} really holds a closed solid "
-                   "with measure_part (a valid solid reports a volume), and if the part "
-                   "is meant to be hollow, shell it first (add_features with a shell op) "
-                   "so there ARE two walls to measure between.")
+        summary = ("no accepted inward-ray wall span — rays can miss an exit, graze a face, "
+                   "or fall below the sampling cutoff; this does not establish wall thickness "
+                   "or safety")
     # Keep this insertion order identical to the long-standing wall_thickness response.
     out = {"ok": True, "doc_id": doc_id, "summary": summary, **res}
+    out["measurement_caveat"] = (
+        "Tessellated surface-normal ray spans include real local taper at acute convex edges. "
+        "A boundary minimum is neither a verified structural wall thickness nor evidence that "
+        "the part is safe; a dihedral angle alone cannot dismiss it. Inspect sections at and "
+        "near the reported location and the relevant load path. Unsampled regions and spans "
+        "below the acceptance cutoff remain unresolved.")
     if mn is not None and fields:
         try:
             out["thinnest"] = _thinnest_wall_faces(doc_id, fields)
+            minimum_sample = out.get("minimum_sample")
+            if isinstance(minimum_sample, dict):
+                minimum_sample = {**minimum_sample,
+                                  "body": minimum_sample.get("body", 1)}
+                for spot in out["thinnest"]:
+                    if (spot["body"] == minimum_sample["body"]
+                            and spot["vertex_index"] == minimum_sample["vertex_index"]):
+                        minimum_sample.update({key: spot[key] for key in
+                                               ("sample_location", "face", "surf", "built_by")
+                                               if key in spot})
+                        break
+                out["minimum_sample"] = minimum_sample
         except Exception as exc:  # noqa: BLE001 — the measurement itself still stands
             out["thinnest_unavailable"] = f"{type(exc).__name__}: {exc}"
     return out
@@ -331,13 +357,19 @@ def _thinnest_wall_faces(doc_id: str, fields: list) -> list:
                     face["face_id"]
             vert_face = np.zeros(body["n_verts"], dtype=np.int64)
             vert_face[body["idx"].reshape(-1)] = np.repeat(tri_face, 3)
-            order = np.argsort(values)
+            order = np.argsort(values, kind="stable")
             order = order[np.isfinite(values[order])]
             # First occurrence of each face in ascending-thickness order = its minimum.
             _, first = np.unique(vert_face[order], return_index=True)
+            triangles = body["idx"].reshape(-1, 3)
             for vi in order[np.sort(first)][:_THINNEST_FACES]:
+                incident = triangles[np.any(triangles == vi, axis=1)]
+                _, edge_counts = np.unique(incident[incident != vi], return_counts=True)
+                location = ("face_mesh_boundary" if np.any(edge_counts == 1)
+                            else "face_mesh_interior")
                 candidates.append((float(values[vi]), int(body_no), int(vert_face[vi]),
-                                   [round(float(c), 3) for c in body["pos"][vi]]))
+                                   int(vi), [round(float(c), 3) for c in body["pos"][vi]],
+                                   location))
     ranked = sorted(candidates)[:_THINNEST_FACES]
     if not ranked:
         return []
@@ -355,8 +387,9 @@ def _thinnest_wall_faces(doc_id: str, fields: list) -> list:
                 for pair in (om.get("faces") or [])
                 if isinstance(pair, list) and len(pair) == 2}
     spots = []
-    for thickness, body_id, face_id, point in ranked:
-        spot = {"thickness_mm": round(thickness, 4), "at": point, "body": body_id}
+    for thickness, body_id, face_id, vertex_index, point, location in ranked:
+        spot = {"thickness_mm": round(thickness, 4), "at": point, "body": body_id,
+                "vertex_index": vertex_index, "sample_location": location}
         match = by_key.get((body_id, face_id))
         if match is not None:
             spot["face"] = match.get("sid")
@@ -891,7 +924,9 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             # call never dispatched — wrong method + key — so check_sketch silently errored.)
             r = cb.call("sketch_health", {"doc_id": d, "sketch": sketch})
             status = r.get("status", "")
-            dof = r.get("dof", 0)
+            dof = r.get("dof")
+            from services.mcp.ascii2d import live_sketch_design_intent
+            intent = live_sketch_design_intent(d, sketch, r)
 
             def _ids(items):
                 out = []
@@ -905,11 +940,19 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             conflicting = _ids(r.get("conflicting"))
             redundant = _ids(r.get("redundant"))
             narration = r.get("dof_narration")
+            fully_defined = (dof == 0 and status != "over" and not conflicting
+                             and not intent["pinned_only"] and not r.get("skipped_constraints"))
             if conflicting:
                 summary = (f"Over-defined: {len(conflicting)} conflicting constraint(s) "
                            f"{conflicting} — remove one to resolve the contradiction.")
-            elif status == "full" or dof == 0:
-                summary = "Fully defined (dof 0) — every entity is pinned by relations + dimensions."
+            elif intent["pinned_only"]:
+                summary = ("Pinned instead of constrained (pinned_only): remove profile fix "
+                           "relations, add design-intent relations/driving dimensions, then "
+                           "sketch_fully_define. DOF 0 from blanket pins is not fully defined.")
+            elif fully_defined:
+                summary = "Fully defined (dof 0) — constrained parametrically, not fix-pinned."
+            elif r.get("skipped_constraints"):
+                summary = "Constraints were skipped — correct their refs/type before declaring fully defined."
             else:
                 summary = (f"Under-defined: {dof} degree(s) of freedom remain — add geometric "
                            f"relations and/or driving dimensions until dof reaches 0.")
@@ -918,12 +961,14 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                 if redundant:
                     summary += f" (Also {len(redundant)} redundant: {redundant}.)"
             out = {"ok": True, "doc_id": d, "sketch": sketch, "status": status,
-                   "dof": dof, "fully_defined": (status == "full" or dof == 0),
+                   "dof": dof, "fully_defined": fully_defined,
                    "conflicting": conflicting, "redundant": redundant, "summary": summary,
                    # narrated enrichment straight from sketch_health (the advisor source).
                    "open_endpoints": (r.get("closure") or {}).get("open_endpoints"),
                    "dof_narration": narration, "schedule": r.get("schedule"),
                    "advisory": r.get("advisory")}
+            out.update(intent)
+            out["skipped_constraints"] = r.get("skipped_constraints") or []
             return _dumps(_interpreted(out, notes))
         except Exception as e:  # noqa: BLE001
             return _err(_teach_unknown_sketch(_teach_no_bodies(
@@ -1138,14 +1183,15 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                      **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Mass properties of the current part: volume (mm^3), mass (g), centre of mass, inertia.
 
-        density_g_cm3 sets the material density used for mass (default 7.85 = steel). Also
-        accepted as density= / density_g_cc= / material_density= / rho=, or as a NAME —
-        material="aluminum" resolves its density from the material registry, including
-        density-only/orthotropic records without isotropic FEA data. The density it picked
-        comes back in `interpreted`. set_material stores document
-        identity and appearance, but it deliberately does NOT choose this calculation's
-        density; pass material= or density_g_cm3= here. Also runs a geometry sanity check
-        (closed/valid solid).
+        Mass uses the material applied to the model: each body's set_material override, else
+        the part material (assembly components use their source parts' materials). Only a body
+        with no material falls back to 7.85 g/cm^3 steel. `mass.material` names the density
+        and its `source` (body_material | document_material | component_material | default |
+        explicit; `per_body` with `mixed:true` when bodies differ). density_g_cm3 overrides
+        every body for this readout. It is also accepted as density= / density_g_cc= /
+        material_density= / rho=, or as a NAME: material="aluminum" resolves its registry
+        density, including density-only and orthotropic records. Also runs a geometry sanity
+        check (closed/valid solid).
 
         Multi-body docs: the top-level volume/mass/com/inertia are the COMBINED total of ALL
         bodies, and `mass.bodies[]` lists each body's own properties (with `mass.body_count`).
@@ -1168,27 +1214,22 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                                  ("density", "density_g_cc", "density_gcm3", "material_density",
                                   "rho"), density_g_cm3, notes)
             # A material NAME is the spelling a model reaches for once it has decided the
-            # part is aluminium. set_material stores that document identity + appearance,
-            # while this calculation deliberately owns its density argument. Resolve the
-            # name against the density registry and echo the exact density used.
+            # part is aluminium: resolve it against the density registry and echo the exact
+            # density used. With neither, the engine applies the model's own materials.
             named = extra.pop("material", None)
             named = _one_alias("measure_part", "material", extra,
                                ("material_name", "mat"), named, notes)
             if named is not None and density is None:
                 resolved = _resolve_material_density(named)
                 density = resolved
-                notes.append(f"material={named!r} resolved to density_g_cm3={resolved} — mass "
-                             f"is computed from this explicit density; stored document material "
-                             f"does not silently choose analysis inputs")
+                notes.append(f"material={named!r} resolved to density_g_cm3={resolved} — this "
+                             f"readout uses it instead of the material applied to the model")
             elif named is not None:
                 notes.append(f"ignored material={named!r} — density_g_cm3={density} was given "
                              f"explicitly and wins")
-            # Steel is the documented default, applied only when nothing else said otherwise.
-            if density is None:
-                density_g_cm3 = 7.85
-            else:
+            if density is not None:
                 try:
-                    density_g_cm3 = float(density)
+                    density = float(density)
                 except (TypeError, ValueError):
                     raise ValueError(
                         f"measure_part(density_g_cm3={density!r}): density is a NUMBER in g/cm^3 "
@@ -1242,7 +1283,10 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             d = _doc(doc_id)
             if route_wall_thickness:
                 return _dumps(_interpreted(_wall_thickness_result(d), notes))
-            mass = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": density_g_cm3})
+            params = {"doc_id": d}
+            if density is not None:
+                params["density_g_cm3"] = density
+            mass = cb.call("eval_mass", params)
             out = {"ok": True, "doc_id": d, "mass": mass}
             try:
                 out["check"] = cb.call("eval_check", {"doc_id": d})
@@ -1924,28 +1968,37 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def wall_thickness(doc_id: Optional[str] = None) -> str:
-        """How THIN is the thinnest wall? Inward ray-cast wall-thickness over the whole part.
+        """Sample local wall spans by inward normal rays; NOT a structural-wall safety verdict.
 
-        From every surface sample it casts a ray straight into the material and measures the
-        distance to the far wall — the local wall thickness. The headline value is the MINIMUM
-        ("the thinnest wall is X mm"), the number that governs whether a part can be molded,
-        machined, or 3D-printed, and where it's likely to be weak or warp.
+        The minimum includes real local taper at acute convex edges, where a normal-ray span
+        tends to zero even when the adjacent wall is thick. A micron value is not automatically
+        a self-hit, and a moderate dihedral angle does not prove the part safe. Inspect sections
+        at AND near its location and the relevant load path before accepting or redesigning it.
+        No edge samples or low percentiles are removed.
+
+        Rays start at each face-local tessellation vertex, shifted tangentially 0.001 mm into
+        its face and normally 0.001 mm into the material. Only outward EXIT hits more than 5°
+        from the exit plane count; the reported span adds back the inward offset. Accepted
+        spans must exceed 0.002 mm. These are mesh-based samples, not an exact B-rep minimum,
+        a precision guarantee, or coverage of unsampled/sub-cutoff thin regions.
 
         Returns {ok, min_thickness_mm, mean_thickness_mm, max_thickness_mm, n_sampled,
-        aicm_path, summary, thinnest}:
-          * min_thickness_mm — the thinnest wall found (the key value). null if no sample got a
-            through-wall hit (e.g. an open sheet body with no opposite wall).
-          * mean/max — the average and thickest sampled wall.
-          * thinnest — WHERE: the (up to) 3 faces holding the thinnest samples, thinnest first,
-            each {thickness_mm, at:[x,y,z], body, face:<sid>, surf, built_by:{id,name}} —
-            built_by is the feature whose rebuild produced that face (a cut is credited with
-            the faces it pierced). Go straight there (inspect_section at `at`,
-            query_geometry on the sid) instead of suppressing features to find it. Samples
-            sit on tessellation vertices (face corners and edges), so confirm a surprising
-            reading with a section at `at` before redesigning.
-          * aicm_path — a temp field file for the in-app thickness colour-map viewer.
-        Compare min_thickness_mm against your process minimum (e.g. ~1 mm injection wall,
-        ~0.8 mm FDM) to flag thin spots before manufacturing.
+        aicm_path, summary, thinnest, minimum_sample, measurement_basis, measurement_caveat}:
+          * min/mean/max — sampled local normal-ray spans; null if no accepted span.
+          * minimum_sample — unrounded tessellation `at`, vertex_index, body, actual ray_origin,
+            inward_direction, exit_at, and tangent_nudge vector. The span is the distance
+            from ray_origin to exit_at PLUS measurement_basis.surface_offset_mm.
+          * measurement_basis — method, sampling locations, vertex/unmeasured counts, offsets,
+            exit-angle filter, and minimum_accepted_span_exclusive_mm. Missing rays and
+            sub-cutoff spans are unresolved, not proof of adequate thickness.
+          * thinnest — up to 3 face minima, each {thickness_mm, at:[x,y,z], body, vertex_index,
+            sample_location, face:<sid>, surf, built_by:{id,name}}. `at` is the mesh vertex,
+            not the nudged ray origin. sample_location is face_mesh_boundary (which can also
+            be a face seam) or face_mesh_interior; neither label alone classifies structural
+            safety. built_by names the feature that last rebuilt the face. Locate it with
+            inspect_section/query_geometry instead of suppressing features to find it.
+          * aicm_path — field file for the in-app thickness colour-map viewer.
+        Process minimum comparisons are screening findings, not manufacturing approval.
         """
         d = None
         try:

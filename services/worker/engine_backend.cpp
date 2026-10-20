@@ -1,6 +1,8 @@
 #include "engine_backend.h"
 
+#include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -39,45 +41,23 @@ bool g_daemon = false;
 bool g_daemonUnavailable = false;
 std::once_flag g_once;
 
-chudware_ipc::EngineClient* g_runClient = nullptr;     // dedicated conn for long agent runs
-chudware_ipc::EngineClient* g_simRunClient = nullptr;  // dedicated conn for long sim solves
-std::mutex g_runClientMtx;                             // guards both run clients' creation
+struct AgentRunSlot {
+    chudware_ipc::EngineClient* client = nullptr;
+    bool busy = false;
+};
+std::array<AgentRunSlot, 8> g_agentRunClients{};
+std::condition_variable g_agentRunCv;
+size_t g_agentRunAbortGeneration = 0;
+chudware_ipc::EngineClient* g_simRunClient = nullptr;
+std::mutex g_runClientMtx;
 
-// The long streaming agent methods stream for minutes and EngineClient::call holds that
-// connection's mutex for the whole call. Running them on the shared g_client starved the
-// GL thread — openMirrorTab's synchronous attach_doc, doc_discard on close, the
-// Recover/Discard buttons all call g_client directly and block on its mutex until the run
-// unwinds. That is the "freeze after Stop" hang: Stop cancels cooperatively but the run
-// keeps holding g_client until it actually returns, so the UI stays wedged. Give the long
-// run its OWN connection instead; hostd serves each connection on its own thread and its
-// doc registry gates multi-writer overlap (same rationale as the cancel/steer side
-// sockets), so concurrent edits are safe. Agent and simulation runs take separate lanes
-// (engine::runLane); WorkerClient serializes each lane's runs among themselves instead of
-// starving the GUI connection.
-//
-// Both naming variants must match: the host RPC names (agent_run_v2 / agent_mission_v1)
-// reach engine::call directly when the C++ agent is OFF, but with it ON WorkerClient's
-// routeAgentToCpp translates them to the CORE names (agent_run / agent_mission_v1) before
-// engine::call — miss either and the run silently falls back to the shared client.
-// agent_admin_turn is the ONLINE lane every chat send takes (there is no other since
-// 2026-08-31) and it streams for as long as the model works, so it belongs here too:
-// WorkerClient::callImpl already classifies it as a long run for its own long-run mutex, and
-// omitting it here put multi-minute turns back on the shared GUI connection — exactly the
-// starvation this dedicated connection exists to prevent.
-//
-// Long simulation solves get a SECOND reserved connection rather than sharing the agent one.
-// EngineClient serializes a connection for the whole call, so on a shared run connection a
-// chat turn that streams for hours would hold a Run click (a topology optimization, which is
-// itself long) until the turn ended, and a running optimization would hold the next chat turn
-// the same way. SimClient runs one solve at a time, so one simulation connection suffices; a
-// sim_mesh preview borrows it only while no solve holds it (WorkerClient sends a preview that
-// would queue behind a solve over a short-lived side connection instead).
-// Nothing drains that connection's push queue (the GUI drains only g_client), so it discards
-// every push its caller does not consume live (EngineClient::Options::discardUnconsumedEvents):
-// a topology solve streaming progress for hours, plus hostd's broadcasts to every connection,
-// would otherwise accumulate there for the whole solve. Unlike the agent lane, a simulation
-// solve never falls back to g_client: holding the GUI connection for the length of a solve is
-// exactly the starvation this connection prevents, so the call fails instead.
+// Streaming calls hold an EngineClient's mutex until they finish, so they stay off
+// the GUI document connection. Each agent call leases a private connection: hostd
+// runs online turns in separate workers and DocLock serializes same-doc batches.
+// WorkerClient still serializes native agent runs and simulation solves.
+// Both host and translated core method names must select the same lane.
+// The simulation connection discards pushes not consumed live and never falls back
+// to g_client, since a long solve would otherwise freeze GUI document calls.
 bool isAgentLongRunMethod(const std::string& method) {
     return method == "agent_run" || method == "agent_run_v2" ||
            method == "agent_mission" || method == "agent_mission_v1" ||
@@ -93,12 +73,9 @@ bool isSimLongRunMethod(const std::string& method) {
            method == "sim_run_topology";
 }
 
-// Lazily open (and reuse) a dedicated long-run connection. nullptr + err on connect failure.
-// EngineClient reconnects itself on EOF, so one connect is reused forever.
-chudware_ipc::EngineClient* openRunClient(chudware_ipc::EngineClient*& slot,
-                                          bool discardUnconsumedEvents, std::string& err) {
-    std::lock_guard<std::mutex> lk(g_runClientMtx);
-    if (slot) return slot;
+// Called with g_runClientMtx held. EngineClient reconnects itself after EOF.
+chudware_ipc::EngineClient* createRunClient(bool discardUnconsumedEvents,
+                                           std::string& err) {
     auto* c = new chudware_ipc::EngineClient();
     chudware_ipc::EngineClient::Options opts;
     opts.hostdBin = hostdBinHint();
@@ -108,22 +85,87 @@ chudware_ipc::EngineClient* openRunClient(chudware_ipc::EngineClient*& slot,
         delete c;
         return nullptr;
     }
-    return slot = c;
-}
-
-// The agent run connection buffers like g_client; on connect failure long agent runs fall
-// back to the shared GUI connection (correctness over the anti-freeze optimization) and
-// WorkerClient keeps its call mutex for them (runConnectionReady(RunLane::Agent)).
-chudware_ipc::EngineClient* runClient() {
-    std::string err;
-    auto* c = openRunClient(g_runClient, /*discardUnconsumedEvents=*/false, err);
-    if (!c)
-        std::fprintf(stderr,
-                     "[engine] agent run-connection connect failed (%s) — long runs share the "
-                     "GUI connection\n",
-                     err.c_str());
     return c;
 }
+
+chudware_ipc::EngineClient* openRunClient(chudware_ipc::EngineClient*& slot,
+                                          bool discardUnconsumedEvents, std::string& err) {
+    std::lock_guard<std::mutex> lk(g_runClientMtx);
+    if (!slot) slot = createRunClient(discardUnconsumedEvents, err);
+    return slot;
+}
+
+bool agentRunConnectionReady() {
+    std::lock_guard<std::mutex> lk(g_runClientMtx);
+    for (const auto& slot : g_agentRunClients)
+        if (slot.client) return true;
+    std::string err;
+    g_agentRunClients.front().client = createRunClient(false, err);
+    return g_agentRunClients.front().client != nullptr;
+}
+
+class AgentRunLease {
+public:
+    explicit AgentRunLease(bool acquire) {
+        if (!acquire) return;
+        std::unique_lock<std::mutex> lk(g_runClientMtx);
+        const size_t generation = g_agentRunAbortGeneration;
+        for (;;) {
+            if (generation != g_agentRunAbortGeneration) {
+                aborted_ = true;
+                return;
+            }
+            AgentRunSlot* empty = nullptr;
+            bool anyClient = false;
+            for (auto& slot : g_agentRunClients) {
+                if (!slot.client) {
+                    if (!empty) empty = &slot;
+                    continue;
+                }
+                anyClient = true;
+                if (!slot.busy) {
+                    slot.busy = true;
+                    slot_ = &slot;
+                    return;
+                }
+            }
+            if (empty) {
+                std::string err;
+                empty->client = createRunClient(false, err);
+                if (empty->client) {
+                    empty->busy = true;
+                    slot_ = empty;
+                    return;
+                }
+                if (!anyClient) {
+                    std::fprintf(stderr,
+                                 "[engine] agent run-connection connect failed (%s) — long runs "
+                                 "share the GUI connection\n", err.c_str());
+                    return;
+                }
+            }
+            g_agentRunCv.wait(lk);
+        }
+    }
+
+    ~AgentRunLease() {
+        if (!slot_) return;
+        {
+            std::lock_guard<std::mutex> lk(g_runClientMtx);
+            slot_->busy = false;
+        }
+        g_agentRunCv.notify_one();
+    }
+
+    AgentRunLease(const AgentRunLease&) = delete;
+    AgentRunLease& operator=(const AgentRunLease&) = delete;
+    chudware_ipc::EngineClient* client() const { return slot_ ? slot_->client : nullptr; }
+    bool aborted() const { return aborted_; }
+
+private:
+    AgentRunSlot* slot_ = nullptr;
+    bool aborted_ = false;
+};
 
 // The simulation connection discards unconsumed pushes and has no shared fallback.
 chudware_ipc::EngineClient* simRunClient(std::string& err) {
@@ -353,10 +395,26 @@ chudware_ipc::EngineClient* client() {
 static bool callDispatch(chudware_ipc::EngineClient* cl, const std::string& method,
                          const json& params, json& result, std::string& err, int timeoutMs,
                          const std::function<void(const json&)>& onEvent) {
+#ifdef __EMSCRIPTEN__
+    if (method != "hello" && method != "ping" &&
+        (!cl || !webCellMethodAllowed(cl->serverInfo(), method))) {
+        result = {{"code", "cell_refused"}, {"message", "Browser CAD and AI are unavailable"}};
+        err = "Browser CAD and AI are unavailable";
+        return false;
+    }
+    if (!cl) {
+        result = {{"code", "cell_refused"}, {"message", "Browser cell is unavailable"}};
+        err = "Browser cell is unavailable";
+        return false;
+    }
+#endif
     // timeoutMs only bounds the daemon round trip; the in-process DLL call is
     // synchronous and can't be interrupted (matches the pre-daemon behavior).
+#ifndef __EMSCRIPTEN__
     if (!daemonMode()) return core::cpp_core().call(method, params, result, err);
+#endif
     bool ok = cl->call(method, params, result, err, timeoutMs, onEvent);
+#ifndef __EMSCRIPTEN__
     if (!ok && result.is_object()) {
         const auto code = result.find("code");
         if (code != result.end() && *code == "loading") {
@@ -377,6 +435,7 @@ static bool callDispatch(chudware_ipc::EngineClient* cl, const std::string& meth
                 ok = cl->call(method, params, result, err, timeoutMs);
         }
     }
+#endif
     return ok;
 }
 
@@ -392,9 +451,20 @@ bool call(const std::string& method, const json& params, json& result, std::stri
     // solve fails instead (see isSimLongRunMethod).
     const bool useDaemon = daemonMode();
     chudware_ipc::EngineClient* cl = useDaemon ? g_client : nullptr;
+#ifdef __EMSCRIPTEN__
+    // Refuse before acquiring a streaming lane: an unadvertised call must not
+    // wait for another run or establish an extra connection.
+    if (!cl || !webCellMethodAllowed(cl->serverInfo(), method))
+        return callDispatch(cl, method, params, result, err, timeoutMs, onEvent);
+#endif
     const RunLane lane = useDaemon ? runLane(method) : RunLane::None;
+    AgentRunLease agentLease(lane == RunLane::Agent);
+    if (agentLease.aborted()) {
+        err = "aborted";
+        return false;
+    }
     if (lane == RunLane::Agent) {
-        if (auto* rc = runClient()) cl = rc;
+        if (auto* rc = agentLease.client()) cl = rc;
     } else if (lane == RunLane::Sim) {
         std::string cerr;
         cl = simRunClient(cerr);
@@ -404,6 +474,7 @@ bool call(const std::string& method, const json& params, json& result, std::stri
         }
     }
     bool ok = callDispatch(cl, method, params, result, err, timeoutMs, onEvent);
+#ifndef __EMSCRIPTEN__
     // Compat shim: doc_activate (cheap tab-switch activation, cached-serve) is served by
     // this tree's engine, but a long-lived hostd daemon may predate it. On "unknown
     // method" fall back ONCE to the historical forced doc_rebuild — identical response
@@ -418,6 +489,7 @@ bool call(const std::string& method, const json& params, json& result, std::stri
             ok = callDispatch(g_client, "doc_rebuild", params, result, err, timeoutMs, {});
         }
     }
+#endif
     return ok;
 }
 
@@ -427,7 +499,10 @@ bool call(const std::string& method, const json& params, json& result, std::stri
 // never opened. Safe from any thread.
 void abortRunClient() {
     std::lock_guard<std::mutex> lk(g_runClientMtx);
-    if (g_runClient) g_runClient->abortPending();
+    ++g_agentRunAbortGeneration;
+    for (const auto& slot : g_agentRunClients)
+        if (slot.client) slot.client->abortPending();
+    g_agentRunCv.notify_all();
     if (g_simRunClient) g_simRunClient->abortPending();
 }
 
@@ -435,7 +510,7 @@ bool runConnectionReady(RunLane lane) {
     if (!daemonMode()) return false;
     switch (lane) {
         case RunLane::Agent:
-            return runClient() != nullptr;
+            return agentRunConnectionReady();
         case RunLane::Sim: {
             std::string err;
             return simRunClient(err) != nullptr;

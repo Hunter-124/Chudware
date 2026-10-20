@@ -630,9 +630,11 @@ class OrgChart:
         director_review: bool | None = None,
         max_subagent_depth: int | None = None,
         on_event: Callable[..., None] | None = None,
+        session_id: str = "",
         runs_dir: Path | None = None,
     ) -> None:
         self.run_id = run_id or f"r_{uuid.uuid4().hex[:8]}"
+        self.session_id = session_id
         self._cfg = cfg
         corp = get_corporate_config(cfg)
         self.max_departments = (
@@ -1589,7 +1591,7 @@ class OrgChart:
             turn = run_role_turn(
                 request,
                 "advisor",
-                session_id=self.run_id,
+                session_id=self.session_id,
                 run_id=self.run_id,
                 parent_id=(
                     f"{self.director_id}:meeting:{len(self.digests)}:{digest.dept_id}"
@@ -2058,6 +2060,7 @@ def get_org_chart(
     board: Any | None = None,
     mission_goals: list[str] | None = None,
     on_event: Callable[..., None] | None = None,
+    session_id: str = "",
     runs_dir: Path | None = None,
 ) -> OrgChart | None:
     """Return the shared OrgChart for *run_id* (create on demand)."""
@@ -2077,6 +2080,10 @@ def get_org_chart(
                 chart.on_event = on_event
             if runs_dir is not None and chart._runs_dir is None:
                 chart._runs_dir = runs_dir
+            if session_id:
+                if chart.session_id and chart.session_id != session_id:
+                    raise CorporateError("corporate parent session cannot change")
+                chart.session_id = session_id
             return chart
         if not create:
             return None
@@ -2086,6 +2093,7 @@ def get_org_chart(
             board=board,
             mission_goals=mission_goals,
             on_event=on_event,
+            session_id=session_id,
             runs_dir=runs_dir,
         )
         _CHARTS[rid] = chart
@@ -2113,6 +2121,7 @@ def build_corporate_org(
     mission_goals: list[str] | None = None,
     force: bool | None = None,
     on_event: Callable[..., None] | None = None,
+    session_id: str = "",
     runs_dir: Path | None = None,
     seat_heads: bool = False,
     delegate_fn: Callable[..., Any] | None = None,
@@ -2153,6 +2162,7 @@ def build_corporate_org(
         board=board,
         mission_goals=mission_goals,
         on_event=on_event,
+        session_id=session_id,
         runs_dir=runs_dir,
     )
     assert chart is not None
@@ -2178,6 +2188,7 @@ def auto_activate_corporate(
     board: Any | None = None,
     mission_goals: list[str] | None = None,
     on_event: Callable[..., None] | None = None,
+    session_id: str = "",
     runs_dir: Path | None = None,
     delegate_fn: Callable[..., Any] | None = None,
     seat_heads: bool = True,
@@ -2198,6 +2209,7 @@ def auto_activate_corporate(
         mission_goals=mission_goals,
         force=force,  # None → respect corporate_mode; True → swarm force
         on_event=on_event,
+        session_id=session_id,
         runs_dir=runs_dir,
         seat_heads=seat_heads,
         delegate_fn=delegate_fn,

@@ -1431,6 +1431,31 @@ bool AppState::convRunning(const std::string& convId) const {
     return it != runs.end() && it->second && it->second->running.load();
 }
 
+bool AppState::docLockedByAgent(const std::string& docId) const {
+    if (docId.empty()) return false;
+    for (const DocTab& t : docTabs) {
+        if (t.docId != docId) continue;
+        if (t.lastForeignWriteAt == std::chrono::steady_clock::time_point{}) return false;
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - t.lastForeignWriteAt).count() < kAgentLockGraceS)
+            return true;
+        return anyRunActive() && t.lastForeignWriteAt >= runsIdleAt;
+    }
+    return false;
+}
+
+bool AppState::activeDocLockedByAgent() const {
+    return docLockedByAgent(docMirror.docId());
+}
+
+std::string AppState::agentLockReason(const std::string& docId) const {
+    if (!docLockedByAgent(docId)) return std::string();
+    return anyRunActive()
+               ? "An agent is editing this part. Editing is locked until it finishes (Stop it to "
+                 "take over)."
+               : "An agent just edited this part. Editing unlocks in a few seconds.";
+}
+
 std::string AppState::activeConvId() const {
     if (activeConv < 0 || activeConv >= (int)conversations.size()) return std::string();
     return conversations[activeConv].id;
@@ -1576,6 +1601,13 @@ core::OpsResponse AppState::docUndo() {
         r.error_message = "no active CAD document";
         return r;
     }
+    if (docLockedByAgent(docMirror.docId())) {
+        core::OpsResponse r;
+        r.error_code = "agent_edit_locked";
+        r.error_message = agentLockReason(docMirror.docId());
+        toast(ui::ToastLevel::Warn, r.error_message);
+        return r;
+    }
     core::OpsResponse r = docMirror.undo(worker);
     if (r.ok) {
         addLog("[doc] undo  rev=" + std::to_string(r.revision));
@@ -1601,6 +1633,13 @@ core::OpsResponse AppState::docRedo() {
         core::OpsResponse r;
         r.error_code = "no_doc";
         r.error_message = "no active CAD document";
+        return r;
+    }
+    if (docLockedByAgent(docMirror.docId())) {
+        core::OpsResponse r;
+        r.error_code = "agent_edit_locked";
+        r.error_message = agentLockReason(docMirror.docId());
+        toast(ui::ToastLevel::Warn, r.error_message);
         return r;
     }
     core::OpsResponse r = docMirror.redo(worker);

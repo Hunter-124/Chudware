@@ -16,8 +16,10 @@ Freedom rule: ``verdict: "fail"`` NEVER blocks the caller.  Applying a
 failed-preflight mutation without a dispute is a ``preflight_overridden`` ledger
 event (audit trigger per §11).
 
-The feature-count admission guard emits an explicit budget skip. There is no
-wall-clock guarantee: cache misses and genuinely edited geometry can be expensive.
+The feature-count guard and a cumulative 10 s native candidate budget emit explicit
+skips. POSIX kills/reaps the private rebuild child at expiry; unsupported platforms
+skip rather than run an unbounded fallback. Metadata/lock/transport waits and OS
+scheduling/cleanup are not a hard end-to-end deadline.
 """
 from __future__ import annotations
 
@@ -25,11 +27,13 @@ import hashlib
 import json
 import os
 import uuid
+import time
 from typing import Any
 
 # ------------------------------------------------------------------ constants
 
 _FEATURE_COUNT_LIMIT: int = int(os.environ.get("CHUDWARE_PREFLIGHT_FEATURE_LIMIT", "200"))
+_REBUILD_BUDGET_MS = 10_000
 
 # ------------------------------------------------------------------ ledger shim
 #
@@ -138,6 +142,7 @@ def _run(doc_id: str, tool: str, ops: list[dict]) -> dict:
     from services.mcp import core_bridge as cb
     from services.mcp.core_bridge import CoreError
 
+    deadline = time.monotonic() + _REBUILD_BUDGET_MS / 1000
     # 1. Read live doc state (read-only — live doc_id never used for mutation).
     live_tree_resp = cb.call("doc_tree", {"doc_id": doc_id})
     live_revision_before = live_tree_resp.get("revision", -1)
@@ -152,9 +157,17 @@ def _run(doc_id: str, tool: str, ops: list[dict]) -> dict:
     checks: list[dict] = []
     predicted: dict = {}
     checks.extend(_check_refs_resolve(ops, doc_id, cb))
-    checks.extend(_check_params_sane(ops, doc_id, cb))
+    checks.extend(_check_params_sane(ops))
     downstream = _check_downstream_impact(ops, doc_id, cb)
-    checks.extend(_check_rebuild_predict(ops, doc_id, cb, CoreError, predicted))
+    remaining_ms = int((deadline - time.monotonic()) * 1000)
+    if remaining_ms <= 0:
+        return _skipped_envelope(doc_id, tool, ops, reason="budget_exceeded",
+                                 detail="preflight budget exhausted before native rebuild")
+    checks.extend(_check_rebuild_predict(ops, doc_id, cb, CoreError, predicted,
+                                         budget_ms=remaining_ms))
+    if predicted.get("skipped"):
+        return _skipped_envelope(doc_id, tool, ops, reason=predicted["skipped"],
+                                 detail=checks[-1]["detail"])
     checks.append({
         "check": "downstream_impact",
         "result": "warn" if downstream else "pass",
@@ -261,17 +274,16 @@ def _check_refs_resolve(ops: list[dict], doc_id: str, cb: Any) -> list[dict]:
 
 
 
-def _check_params_sane(ops: list[dict], doc_id: str, cb: Any) -> list[dict]:
-    """Check parameters for obvious invalidity (negative dims, fillet vs wall, hole depth vs extent)."""
+def _check_params_sane(ops: list[dict]) -> list[dict]:
+    """Check local positive dimensions; native rebuild checks geometry feasibility."""
     issues: list[str] = []
 
     for op in ops:
         if not isinstance(op, dict) or op.get("op") != "add_feature":
             continue
         feat = op.get("feature") or {}
-        ftype = feat.get("type", "")
         params = feat.get("params") or {}
-        fname = feat.get("name", ftype)
+        fname = feat.get("name", feat.get("type", "feature"))
 
         # Positive dimension checks.
         for pname, pval in params.items():
@@ -281,44 +293,6 @@ def _check_params_sane(ops: list[dict], doc_id: str, cb: Any) -> list[dict]:
             ):
                 issues.append(f"{fname}.{pname}={v} must be positive")
 
-        # Fillet / chamfer: radius should not exceed adjacent wall (best-effort via measure).
-        if ftype in ("fillet", "chamfer"):
-            r_val = params.get("radius") or params.get("size")
-            radius = (r_val.get("value") if isinstance(r_val, dict) else r_val) if r_val else None
-            if radius and isinstance(radius, (int, float)) and radius > 0:
-                try:
-                    meas = cb.call("doc_eval_measure", {"doc_id": doc_id,
-                                                         "target": {"of": "wall", "adjacent": True}})
-                    wall = meas.get("min_thickness") or meas.get("thickness")
-                    if wall and isinstance(wall, (int, float)) and radius >= wall:
-                        issues.append(
-                            f"{fname}: radius {radius} >= adjacent live wall {wall:.3f}"
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    if getattr(exc, "code", None) == "engine_connection_lost":
-                        raise
-                    pass  # measure may not apply — skip, not a hard fail
-
-        # Hole: depth should not exceed body extent (best-effort).
-        if ftype in ("hole", "counterbore", "countersink"):
-            d_val = params.get("depth")
-            depth = (d_val.get("value") if isinstance(d_val, dict) else d_val) if d_val else None
-            if depth and isinstance(depth, (int, float)) and depth > 0:
-                try:
-                    meas = cb.call("doc_eval_measure", {"doc_id": doc_id,
-                                                         "target": {"of": "body", "axis": "all"}})
-                    extents = meas.get("extents") or {}
-                    max_extent = max(
-                        (extents.get(k) or 0) for k in ("x", "y", "z")
-                    )
-                    if max_extent > 0 and depth > max_extent:
-                        issues.append(
-                            f"{fname}: hole depth {depth} > body max extent {max_extent:.3f}"
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    if getattr(exc, "code", None) == "engine_connection_lost":
-                        raise
-                    pass
 
     if issues:
         return [{
@@ -330,7 +304,7 @@ def _check_params_sane(ops: list[dict], doc_id: str, cb: Any) -> list[dict]:
     return [{
         "check": "params_sane",
         "result": "pass",
-        "detail": "parameters look sane",
+        "detail": "local dimension values look sane; geometry feasibility is checked by rebuild_predict",
         "refs": {},
     }]
 
@@ -341,10 +315,13 @@ def _check_rebuild_predict(
     cb: Any,
     CoreError: type,
     predicted: dict,
+    *,
+    budget_ms: int = _REBUILD_BUDGET_MS,
 ) -> list[dict]:
     """Run candidate ops in native scratch state and retain rebuild diagnostics."""
     try:
-        resp = cb.call("doc_dry_run_ops", {"doc_id": doc_id, "ops": ops})
+        resp = cb.call("doc_dry_run_ops", {"doc_id": doc_id, "ops": ops,
+                                          "budget_ms": budget_ms})
     except CoreError as exc:
         if getattr(exc, "code", None) == "engine_connection_lost":
             raise
@@ -363,6 +340,14 @@ def _check_rebuild_predict(
             "check": "rebuild_predict",
             "result": "warn",
             "detail": f"unexpected error during native dry-run: {exc}",
+            "refs": {},
+        }]
+
+    if resp.get("skipped"):
+        predicted["skipped"] = resp["skipped"]
+        return [{
+            "check": "rebuild_predict", "result": "skipped",
+            "detail": str(resp.get("error") or "native rebuild was not completed"),
             "refs": {},
         }]
 
@@ -543,6 +528,9 @@ def _skipped_envelope(doc_id: str, tool: str, ops: list, reason: str, detail: st
         "verdict": "skipped",
         "skipped": reason,
         "skipped_detail": detail,
+        **({"budget_ms": _REBUILD_BUDGET_MS, "timed_out": reason == "budget_exceeded",
+            "still_running": False} if reason in
+           ("budget_exceeded", "isolation_unavailable", "isolation_failed") else {}),
         "checks": [],
         "predicted": {},
         "downstream": [],

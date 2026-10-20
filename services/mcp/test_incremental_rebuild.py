@@ -17,7 +17,9 @@ Run: .venv-mcp/bin/pytest services/mcp/test_incremental_rebuild.py -v
 from __future__ import annotations
 
 import importlib
+import os
 import sys
+import time
 
 import pytest
 
@@ -32,6 +34,14 @@ if _cb_mod is not None and not getattr(_cb_mod, "__file__", None):
         if _stub is not None and not getattr(_stub, "__file__", None):
             del sys.modules[_name]
 cb = importlib.import_module("services.mcp.core_bridge")
+
+
+@pytest.fixture(autouse=True)
+def native_engine_mode(monkeypatch):
+    """Test native CompileCache and human undo, not the MCP agent undo policy."""
+    monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "0")
+    assert not cb.active_daemon_mode()
+
 
 def _apply(doc_id, ops):
     return cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": ops})
@@ -202,7 +212,8 @@ def test_dry_run_reuses_large_cached_source_without_replay():
 
 
 @pytest.mark.parametrize("outcome", ["success", "compile_failure", "structural_failure"])
-def test_dry_run_preserves_geometry_cache_and_undo(part, outcome):
+@pytest.mark.parametrize("budget_ms", [0, 10_000])
+def test_dry_run_preserves_geometry_cache_and_undo(part, outcome, budget_ms):
     did, fids = part
     original = cb.call("doc_tree", {"doc_id": did})["tree"]
     original_mass = _mass(did)
@@ -217,7 +228,13 @@ def test_dry_run_preserves_geometry_cache_and_undo(part, outcome):
         }})
     elif outcome == "structural_failure":
         candidate.append({"op": "edit_feature", "id": "missing", "params": {"length": 1}})
-    dry = cb.call("doc_dry_run_ops", {"doc_id": did, "ops": candidate})
+    dry = cb.call("doc_dry_run_ops", {"doc_id": did, "ops": candidate, "budget_ms": budget_ms})
+    if budget_ms and os.name != "posix":
+        assert dry["skipped"] == "isolation_unavailable"
+        assert dry["still_running"] is False
+        assert cb.call("doc_tree", {"doc_id": did}) == before
+        assert _mass(did) == mass_before
+        return
     assert dry["ok"] is (outcome == "success")
     if outcome == "compile_failure":
         assert any(not s["ok"] for s in _fs(dry))
@@ -233,6 +250,65 @@ def test_dry_run_preserves_geometry_cache_and_undo(part, outcome):
     cb.call("doc_undo", {"doc_id": did})
     assert cb.call("doc_tree", {"doc_id": did})["tree"] == original
     assert _mass(did) == original_mass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bounded native preflight requires POSIX")
+def test_preflight_timeout_stops_rebuild_and_preserves_source(part, monkeypatch):
+    from services.agent.advisor import preflight
+
+    did, fids = part
+    original = cb.call("doc_tree", {"doc_id": did})["tree"]
+    original_mass = _mass(did)
+    _apply(did, [{"op": "edit_feature", "id": fids[0], "params": {"length": 60}}])
+    before = cb.call("doc_tree", {"doc_id": did})
+    mass_before = _mass(did)
+    # Stall an actual native blend after the private candidate has already changed
+    # its box. Disabling ordinary blend isolation must not disable the outer budget.
+    monkeypatch.setenv("CHUDWARE_BLEND_ISOLATION", "0")
+    monkeypatch.setenv("CHUDWARE_TEST_BLEND_DELAY_MS", "5000")
+    monkeypatch.setattr(preflight, "_REBUILD_BUDGET_MS", 150)
+    started = time.monotonic()
+    result = preflight.run_preflight(did, "add_features", [{
+        "op": "edit_feature", "id": fids[0], "params": {"length": 45},
+    }])
+    assert result["verdict"] == "skipped", result
+    assert result["skipped"] == "budget_exceeded"
+    assert result["timed_out"] is True
+    assert result["still_running"] is False
+    assert not result["predicted"]
+    assert not result["advisory_items"]
+    assert time.monotonic() - started < 3.0
+    assert cb.call("doc_tree", {"doc_id": did}) == before
+    assert _mass(did) == mass_before
+    # The source cache and undo history survive even an interrupted native edit.
+    counters_before = cb.call("prof_contention", {})["compile_cache"]
+    unchanged = cb.call("doc_dry_run_ops", {"doc_id": did, "ops": []})
+    counters_after = cb.call("prof_contention", {})["compile_cache"]
+    assert unchanged["ok"]
+    assert _counters(unchanged) == (len(fids), 0)
+    assert counters_after["full_hits"] - counters_before["full_hits"] == 1
+    cb.call("doc_undo", {"doc_id": did})
+    assert cb.call("doc_tree", {"doc_id": did})["tree"] == original
+    assert _mass(did) == original_mass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bounded native preflight requires POSIX")
+@pytest.mark.parametrize("radius, expected", [(3, "pass"), (1e6, "fail")])
+def test_bounded_preflight_retains_real_geometry_verdict(part, monkeypatch, radius, expected):
+    from services.agent.advisor.preflight import run_preflight
+
+    did, fids = part
+    before = cb.call("doc_tree", {"doc_id": did})
+    mass_before = _mass(did)
+    monkeypatch.setenv("CHUDWARE_BLEND_ISOLATION", "0")
+    result = run_preflight(did, "add_features", [{
+        "op": "edit_feature", "id": fids[1], "params": {"radius": radius},
+    }])
+    assert result["verdict"] == expected, result
+    statuses = result["predicted"]["feature_status"]
+    assert all(status["ok"] for status in statuses) is (expected == "pass")
+    assert cb.call("doc_tree", {"doc_id": did}) == before
+    assert _mass(did) == mass_before
 
 
 def test_profiler_reports_cache_section():

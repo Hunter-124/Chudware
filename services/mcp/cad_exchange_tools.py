@@ -86,9 +86,8 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                                "doc_id": d, "content": "Export refused: document has 0 bodies."})
             # The native editable container is written by doc_save, not the interchange writer.
             if fmt in ("step+", "stepplus", "stp+", "native"):
-                # K3: canonicalise caller-supplied path before passing to the engine — expanduser
-                # first so "~/…" doesn't collapse to "<cwd>/~/…" under abspath, and abspath so a
-                # relative destination lands in THIS cwd, not the engine daemon's.
+                # Resolve against the selected workspace, not either process's cwd,
+                # before forwarding the guarded absolute destination to the engine.
                 out = (_sanitize_output_path(os.path.expanduser(path)) if path
                        else _default_deliverable_path(d, ".step+"))
                 if not out.lower().endswith(".step+"):
@@ -120,8 +119,7 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                 if warnings:
                     res["warnings"] = warnings
                 return _dumps(res)
-            # K3: canonicalise caller-supplied path before passing to the engine (expanduser +
-            # abspath — same reasoning as the step+ branch above).
+            # The same workspace-relative destination rule applies to interchange files.
             out = (_sanitize_output_path(os.path.expanduser(path)) if path
                    else _default_deliverable_path(d, "." + fmt))
             # The engine round-trips B-rep formats (re-reads + BRepCheck) and THROWS if the file is
@@ -170,8 +168,10 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         `resume=True` explicitly reuses the open document at that path (reply `reused:true`).
         `into=<doc_id>` adds geometry to that document instead of opening or resuming one.
         A pristine native import is reproducible from its source and is not copied into
-        the project root at turn end. Native saves and automatic saves after edits use
-        that source path; pass save_part(path=...) to choose a different destination.
+        the project root at turn end. Authored design edits retain source-save behavior;
+        study-only scratch is saved separately. Automatic saves never replace a source
+        held by another user-opened document. Pass save_part(path=...) for an explicit
+        destination, or resume=True to edit the document the user already has open.
 
         DXF/DWG (AutoCAD, any version incl. 2013-2018+ files): ACIS 3DSOLID/BODY/REGION/SURFACE
         entities import as exact B-rep bodies (`<stem>_solidN` / `<stem>_surfaceN`), including

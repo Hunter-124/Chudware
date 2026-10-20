@@ -204,3 +204,63 @@ def test_ci_signer_refuses_a_seed_that_is_not_the_expected_release_key(
     monkeypatch.delenv("CHUDWARE_RELEASE_CI_KEY")
     assert ci_sign.main(["sign", "payload", str(request)]) == 2
     assert "CHUDWARE_RELEASE_CI_KEY is not set" in capsys.readouterr().err
+
+
+def _publisher_policy_request():
+    return sign_release.DOMAINS["platform-publishers"] + sign_release.canonical_json_bytes({
+        "schema": "chudware-platform-publishers-v1", "key_id": "release-v1",
+        "windows": {"certificate_sha256": ["1" * 64]},
+        "macos": {"team_ids": ["TESTTEAM01"], "bundle_id": "com.chudware.Chudware"},
+    })
+
+
+def test_invalid_publisher_policy_never_decrypts_owner_key(tmp_path, monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("malformed policy must not decrypt an owner key")
+    monkeypatch.setattr(sign_release, "decrypt_key", forbidden)
+    for body in (
+        b"{}\\n", b'{"key_id":"release-ci-v1"}\\n',
+        sign_release.canonical_json_bytes({"schema": "chudware-platform-publishers-v1"}),
+    ):
+        with pytest.raises(sign_release.SigningError):
+            sign_release.sign_request(
+                "platform-publishers", sign_release.DOMAINS["platform-publishers"] + body,
+                tmp_path / "owner.age", tmp_path / "identity",
+            )
+
+
+def test_ci_or_caller_key_cannot_authorize_publishers():
+    key = Ed25519PrivateKey.generate()
+    with pytest.raises(sign_release.SigningError, match="offline release-v1 owner key"):
+        sign_release.sign_request_with_key("platform-publishers", _publisher_policy_request(), key)
+
+
+def test_owner_policy_signing_and_authentication_share_exact_domain(tmp_path, monkeypatch):
+    import sys
+    policy_module = sys.modules[sign_release.require_owner_signing_key.__module__]
+    # Disposable test authority only; never replace or exercise the product key.
+    owner = Ed25519PrivateKey.generate()
+    public = owner.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    monkeypatch.setattr(policy_module, "_OWNER_PUBLIC_KEY", public)
+    request = _publisher_policy_request()
+    signature = sign_release.sign_request_with_key("platform-publishers", request, owner)
+    policy = tmp_path / "policy.json"
+    detached = tmp_path / "policy.sig"
+    policy.write_bytes(request[len(sign_release.DOMAINS["platform-publishers"]):])
+    detached.write_text(signature + "\n", encoding="ascii")
+    authenticated = policy_module.load_policy(policy, detached)
+    assert authenticated.sha256 == hashlib.sha256(policy.read_bytes()).hexdigest()
+    assert authenticated.certificate_sha256 == ("1" * 64,)
+    owner.public_key().verify(base64.b64decode(signature), request)
+
+
+def test_ci_cli_excludes_owner_policy_purpose_before_loading_seed(tmp_path, monkeypatch):
+    ci_sign = _load_ci_signer()
+    def forbidden():
+        raise AssertionError("CI must not load a key for owner-only publisher policy")
+    monkeypatch.setattr(ci_sign, "_load_ci_key", forbidden)
+    request = tmp_path / "policy-request.bin"
+    request.write_bytes(_publisher_policy_request())
+    with pytest.raises(SystemExit) as error:
+        ci_sign.main(["sign", "platform-publishers", str(request)])
+    assert error.value.code == 2

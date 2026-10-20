@@ -21,9 +21,11 @@ from fastapi import APIRouter, HTTPException, Request
 
 try:
     from .db import tx
+    from . import deployment_drain
     from .limits import api_writes
 except ImportError:  # uvicorn app:app from package dir
     from db import tx  # type: ignore
+    import deployment_drain
     from limits import api_writes  # type: ignore
 
 log = logging.getLogger("chudware.gateway.credits")
@@ -561,13 +563,22 @@ def grant_purchased(
     stripe_event_id: str,
     metadata: Mapping[str, str] | None = None,
 ) -> bool:
-    """Apply a Stripe credit purchase once. Returns false for a replay."""
+    """Apply a confirmed paid purchase once per delivery.
+
+    Billing additionally claims the Checkout/payment settlement in the same
+    transaction, so distinct provider event types cannot grant it again.
+    """
     normalized = _email(email)
     credits = int(amount)
     event_id = str(stripe_event_id or "").strip()
     if not normalized or credits <= 0 or not event_id:
         raise ValueError("purchase requires email, positive credits, and stripe event id")
     with tx() as cur:
+        # Establish the account before inserting its FK-bound ledger entry, and
+        # retain the lock through both mutations so deletion cannot race grant.
+        cur.execute("SELECT email FROM accounts WHERE email = %s FOR UPDATE", (normalized,))
+        if cur.fetchone() is None:
+            raise LookupError(f"account not found: {normalized}")
         cur.execute(
             """
             INSERT INTO credit_ledger
@@ -745,11 +756,24 @@ def reconcile_balances() -> list[dict[str, Any]]:
 async def _nightly_reconcile() -> None:
     while True:
         try:
-            await asyncio.to_thread(mark_stale_reservations)
-            await asyncio.to_thread(reconcile_balances)
+            try:
+                admission = deployment_drain.controller().acquire(inherit=False)
+            except HTTPException:
+                await asyncio.sleep(10)
+                continue
+            try:
+                with admission.bind():
+                    await deployment_drain.run_blocking(_reconcile_once)
+            finally:
+                admission.close()
         except Exception:
             log.exception("nightly credit reconciliation failed")
         await asyncio.sleep(_RECONCILE_SECONDS)
+
+
+def _reconcile_once():
+    mark_stale_reservations()
+    reconcile_balances()
 
 
 

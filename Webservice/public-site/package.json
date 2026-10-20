@@ -11,13 +11,23 @@
   },
   "dependencies": {
     "@astrojs/mdx": "7.0.5",
-    "astro": "7.2.0"
+    "astro": "7.3.8"
   },
   "devDependencies": {
     "pagefind": "1.5.2",
-    "wrangler": "4.120.1"
+    "wrangler": "4.149.0"
+  },
+  "overrides": {
+    "devalue": "5.9.4",
+    "http-cache-semantics": "4.3.0",
+    "js-yaml": "4.3.2",
+    "sharp": "0.35.5",
+    "smol-toml": "1.9.0",
+    "source-map-js": "1.2.2",
+    "svgo": "4.1.0",
+    "undici": "7.29.1"
   },
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.12.0"
   }
 }

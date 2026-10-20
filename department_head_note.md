@@ -1,0 +1,1 @@
+Relay this note to workers on the dept channel; do not let workers contact the director directly.

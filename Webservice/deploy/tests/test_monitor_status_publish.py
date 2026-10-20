@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -125,3 +126,71 @@ def test_dry_run_still_prints_the_sample_without_touching_r2(monitor, capsys):
     assert record["dry_run"] is True
     assert record["status_publish"]["dry_run"] is True
     assert not monitor.LOG_PATH.exists()
+
+
+@pytest.mark.parametrize("fail_grafana", [False, True])
+def test_observability_password_reaches_private_env_file_not_child_argv_or_logs(
+        monitor, monkeypatch, tmp_path, capsys, fail_grafana):
+    """Execute inert child binaries through the real installer and process runner."""
+    password = 'fixture-grafana-password-"\\-$-not-an-argument'
+    token = "fixture-metrics-token-not-an-argument"
+    monitor.GATEWAY_ENV.write_text(
+        f"CHUDWARE_METRICS_ADMIN_TOKEN={token}\n"
+        f"CHUDWARE_GRAFANA_ADMIN_PASSWORD='{password}'\n", encoding="utf-8")
+    monitor.GATEWAY_ENV.chmod(0o600)
+    monitor.OBS_ROOT.mkdir()
+    retained = monitor.OBS_ROOT / "grafana.env"
+    retained.write_text("GF_SECURITY_ADMIN_PASSWORD=prior-protected-configuration\n", encoding="utf-8")
+    retained.chmod(0o600)
+    for name in ("CHUDWARE_METRICS_ADMIN_TOKEN", "CHUDWARE_GRAFANA_ADMIN_PASSWORD"):
+        monkeypatch.delenv(name, raising=False)
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    trace = tmp_path / "children.jsonl"
+    child = f"""#!{sys.executable}
+import json, os, pathlib, stat, sys
+args = sys.argv[1:]
+record = {{"program": pathlib.Path(sys.argv[0]).name, "argv": args}}
+if "--env-file" in args:
+    path = pathlib.Path(args[args.index("--env-file") + 1])
+    record.update(private_path=str(path), private_mode=stat.S_IMODE(path.stat().st_mode),
+                  private_value=path.read_text())
+with open(os.environ["FIXTURE_CHILD_TRACE"], "a") as out:
+    out.write(json.dumps(record) + "\\n")
+if os.environ["FIXTURE_FAIL_GRAFANA"] == "1" and "chudware-grafana" in args:
+    print("fixture container refused", file=sys.stderr)
+    sys.exit(17)
+print("fixture-ok")
+"""
+    for name in ("podman", "systemctl"):
+        executable = binaries / name
+        executable.write_text(child, encoding="utf-8")
+        executable.chmod(0o700)
+    monkeypatch.setenv("PATH", str(binaries) + os.pathsep + os.defpath)
+    monkeypatch.setenv("FIXTURE_CHILD_TRACE", str(trace))
+    monkeypatch.setenv("FIXTURE_FAIL_GRAFANA", str(int(fail_grafana)))
+
+    assert monitor.main(["--install-observability"]) == (2 if fail_grafana else 0)
+
+    records = [json.loads(line) for line in trace.read_text().splitlines()]
+    consumed = [record for record in records if "private_value" in record]
+    assert len(consumed) == 1
+    assert consumed[0]["private_value"] == f"GF_SECURITY_ADMIN_PASSWORD={password}\n"
+    assert consumed[0]["private_mode"] == 0o600
+    assert Path(consumed[0]["private_path"]).parent != monitor.OBS_ROOT
+    assert not Path(consumed[0]["private_path"]).exists()
+    assert not list(monitor.OBS_ROOT.rglob("*.tmp"))
+    assert not list(monitor.OBS_ROOT.glob(".grafana-*"))
+    assert retained.read_text() == "GF_SECURITY_ADMIN_PASSWORD=prior-protected-configuration\n"
+    assert retained.stat().st_mode & 0o777 == 0o600
+    for record in records:
+        assert all(password not in arg and token not in arg for arg in record["argv"])
+    captured = capsys.readouterr()
+    assert password not in captured.out + captured.err
+    assert token not in captured.out + captured.err
+    if fail_grafana:
+        assert "fixture container refused" in captured.err
+        assert not any(record["program"] == "systemctl" for record in records)
+    else:
+        assert json.loads(captured.out)["ok"] is True
+        assert records[-1]["program"] == "systemctl"

@@ -838,6 +838,7 @@ class TestLlmSteering:
         monkeypatch.setattr(corporate_module, "run_role_turn", fake_role_turn)
         chart = OrgChart(
             "r_llm",
+            session_id="actual-parent-session",
             cfg=_cfg_on(director_review=True),
             mission_goals=["bracket FEA pass"],
             director_review=True,
@@ -876,7 +877,7 @@ class TestLlmSteering:
         assert len(calls) == 1
         call = calls[0]
         assert call["role"] == "advisor"
-        assert call["session_id"] == "r_llm"
+        assert call["session_id"] == "actual-parent-session"
         assert call["run_id"] == "r_llm"
         assert call["parent_id"].startswith("director_r_llm:meeting:")
         assert call["close_session"] is True

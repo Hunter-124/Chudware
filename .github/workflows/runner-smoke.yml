@@ -117,7 +117,11 @@ concurrency:
 jobs:
   runner-inventory:
     name: Resolve online fleet capacity
-    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-livingroom]
+    if: ${{ github.ref_protected && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+    environment: chudware-control-protected
+    runs-on:
+      group: chudware-trusted-protected
+      labels: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-livingroom]
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.inventory.outputs.matrix }}
@@ -280,8 +284,11 @@ jobs:
     # configuration-management system. Rows come from the inventory, so an
     # offline endpoint or one outside the dispatch target is never queued.
     needs: runner-inventory
-    if: github.event_name == 'workflow_dispatch' && needs.runner-inventory.outputs.provision_count != '0'
-    runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", "${{ matrix.pool_label }}", "${{ matrix.runner_label }}"]
+    if: ${{ (github.ref_protected && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')) && (github.event_name == 'workflow_dispatch' && needs.runner-inventory.outputs.provision_count != '0') }}
+    environment: chudware-maintenance-protected
+    runs-on:
+      group: chudware-trusted-protected
+      labels: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", "${{ matrix.pool_label }}", "${{ matrix.runner_label }}"]
     timeout-minutes: 90
     strategy:
       # One endpoint that cannot be repaired must not stop the others being
@@ -500,11 +507,13 @@ jobs:
     # not. The inventory, by contrast, is a hard prerequisite: without a matrix
     # there is nothing to probe.
     needs: [runner-inventory, provision]
-    if: always() && needs.runner-inventory.result == 'success'
-    # Literal self-hosted: the computed elements only choose which endpoint
-    # inside the free fleet claims the row, never whether the row lands on
-    # metered GitHub-hosted capacity.
-    runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", "${{ matrix.pool_label }}", "${{ matrix.runner_label }}"]
+    if: ${{ (github.ref_protected && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')) && (always() && needs.runner-inventory.result == 'success') }}
+    environment: chudware-maintenance-protected
+    # Inventory labels only narrow this protected group; they cannot reach
+    # disposable workers or enlarge server-side workflow/ref authorization.
+    runs-on:
+      group: chudware-trusted-protected
+      labels: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", "${{ matrix.pool_label }}", "${{ matrix.runner_label }}"]
     timeout-minutes: 15
     strategy:
       # One dead endpoint must not cancel the probe of the others — that

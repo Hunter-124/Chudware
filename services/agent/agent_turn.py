@@ -24,6 +24,7 @@ import threading
 import time
 import traceback
 import uuid
+from contextlib import closing
 from typing import Any, Callable
 
 _log_mod = logging.getLogger("chudware.agent_turn")
@@ -1880,41 +1881,43 @@ def run_turn(
     ``plan_state`` events) for the duration of the turn.
     """
     if on_event is None:
-        return _run_turn_impl(
-            request,
-            provider,
-            name=name,
-            allowed_tools=allowed_tools,
-            system_prompt=system_prompt,
-            max_tool_calls=max_tool_calls,
-            max_tokens=max_tokens,
-            max_total_tokens=max_total_tokens,
-            ledger=ledger,
-            actor=actor,
-            credit_actor=credit_actor,
-            tool_dispatch=tool_dispatch,
-            mission_dispatch=mission_dispatch,
-            tools_text=tools_text,
-            on_event=on_event,
-            run_id=run_id,
-            node_id=node_id,
-            parent_id=parent_id,
-            subagent_id=subagent_id,
-            capability=capability,
-            tier=tier,
-            model_id=model_id,
-            phase=phase,
-            task_class=task_class,
-            msg_idx=msg_idx,
-            doc_id=doc_id,
-            context_refs=context_refs,
-            mode=mode,
-            plan_only=plan_only,
-            options=options,
-            history=history,
-            attachments=attachments,
-            auto_enable_packs=auto_enable_packs,
-        )
+        with closing(_ToolCallRecovery()) as recovery:
+            return _run_turn_impl(
+                request,
+                provider,
+                name=name,
+                allowed_tools=allowed_tools,
+                system_prompt=system_prompt,
+                max_tool_calls=max_tool_calls,
+                max_tokens=max_tokens,
+                max_total_tokens=max_total_tokens,
+                ledger=ledger,
+                actor=actor,
+                credit_actor=credit_actor,
+                tool_dispatch=tool_dispatch,
+                mission_dispatch=mission_dispatch,
+                tools_text=tools_text,
+                on_event=on_event,
+                run_id=run_id,
+                node_id=node_id,
+                parent_id=parent_id,
+                subagent_id=subagent_id,
+                capability=capability,
+                tier=tier,
+                model_id=model_id,
+                phase=phase,
+                task_class=task_class,
+                msg_idx=msg_idx,
+                doc_id=doc_id,
+                context_refs=context_refs,
+                mode=mode,
+                plan_only=plan_only,
+                options=options,
+                history=history,
+                attachments=attachments,
+                auto_enable_packs=auto_enable_packs,
+                _tool_call_recovery=recovery,
+            )
 
     from services.agent import agent_events as _ae  # noqa: PLC0415
     from services.agent.providers import base as _pbase  # noqa: PLC0415
@@ -1946,7 +1949,7 @@ def run_turn(
     except Exception:  # noqa: BLE001
         _tl = None
     try:
-        with _pbase.ProviderDeltaGuard(coalescer):
+        with closing(_ToolCallRecovery()) as recovery, _pbase.ProviderDeltaGuard(coalescer):
             return _run_turn_impl(
                 request,
                 provider,
@@ -1981,6 +1984,7 @@ def run_turn(
                 history=history,
                 attachments=attachments,
                 auto_enable_packs=auto_enable_packs,
+                _tool_call_recovery=recovery,
             )
     finally:
         # Flush the buffered tail on EVERY exit, including the provider-error
@@ -2036,6 +2040,7 @@ def _run_turn_impl(
     history: list[dict] | None = None,
     attachments: list[dict] | None = None,
     auto_enable_packs: bool = False,
+    _tool_call_recovery: _ToolCallRecovery | None = None,
 ) -> TurnResult:
     """Run a bounded tool-executing turn and return a :class:`TurnResult`.
 
@@ -2125,6 +2130,11 @@ def _run_turn_impl(
     except (TypeError, ValueError):
         total_token_budget = 0
     _tool_call_counts: dict[str, int] = {}
+    _tool_call_recovery = _tool_call_recovery or _ToolCallRecovery()
+    _tool_recovery_scope = {
+        "run_id": run_id, "actor": actor, "node_id": node_id,
+        "subagent_id": subagent_id, "doc_id": doc_id,
+    }
     # WI-10 refine cap. A "refine round" is geometry re-worked AFTER the model itself
     # declared the build finished — it verified it (verify_battery) or delivered it
     # (save_part / export_part). A first build is therefore NEVER counted, however many
@@ -2159,6 +2169,8 @@ def _run_turn_impl(
                 _call_counts=_tool_call_counts,
                 _inner=_inner_dispatch,
                 _loop_guard=_loop_guard,
+                _recovery=_tool_call_recovery,
+                _recovery_scope=_tool_recovery_scope,
             )
     elif mission_dispatch is not None:
 
@@ -2173,15 +2185,19 @@ def _run_turn_impl(
                     _call_counts=_tool_call_counts,
                     _inner=lambda _name, merged: fn(**(merged or {})),
                     _loop_guard=_loop_guard,
+                    _recovery=_tool_call_recovery,
+                    _recovery_scope=_tool_recovery_scope,
                 )
             return _dispatch_tool(
-                tool, args, _call_counts=_tool_call_counts, _loop_guard=_loop_guard
+                tool, args, _call_counts=_tool_call_counts, _loop_guard=_loop_guard,
+                _recovery=_tool_call_recovery, _recovery_scope=_tool_recovery_scope,
             )
     else:
 
         def dispatch(tool: str, args: dict) -> Any:
             return _dispatch_tool(
-                tool, args, _call_counts=_tool_call_counts, _loop_guard=_loop_guard
+                tool, args, _call_counts=_tool_call_counts, _loop_guard=_loop_guard,
+                _recovery=_tool_call_recovery, _recovery_scope=_tool_recovery_scope,
             )
 
     restricted_tools = allowed_tools is not None
@@ -2351,7 +2367,8 @@ def _run_turn_impl(
     # on the request, so it is built here and spliced at its named slot.
     import os as _os  # noqa: PLC0415
 
-    _pc_root = _os.environ.get("CHUDWARE_PROJECT_DIR") or None
+    from services.agent.request_context import root_value
+    _pc_root = root_value("CHUDWARE_PROJECT_DIR") or None
     if not _pc_root and isinstance(options, dict):
         _pc_root = (
             options.get("project_dir")
@@ -7232,6 +7249,85 @@ def _internal_fault_result(exc: BaseException, tool: str) -> dict:
 _CALL_ACCOUNTING_LOCK = threading.Lock()
 
 
+class _ToolCallRecovery:
+    """Own unfinished tool futures for ONE run, not a reusable result cache.
+
+    Existing sim jobs run allowlisted, document-free child stages; CAD thread jobs
+    have actor-wide TTLs and stringify exceptions. Neither can own this original
+    live-document invocation. Only an unobserved future is retained here. Delivering
+    its result (including an exception) consumes it, so a later intentional call
+    with the same inputs executes afresh. The run/context owns this object; there
+    is no process-global result registry or cross-turn lookup.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.pending: dict[str, Any] = {}
+        self.closed = False
+
+    def close(self) -> None:
+        """Release this run's results, without claiming native work was cancelled."""
+        with self.lock:
+            self.closed = True
+            self.pending.clear()
+
+    def wait(
+        self, key: str, future: Any, *, tool: str, timeout_s: float,
+        cancel: Callable[[], bool] | None, started_new: bool,
+    ) -> Any:
+        from concurrent.futures import wait  # noqa: PLC0415
+
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while not future.done():
+            if self.closed:
+                return self.ended_result()
+            cancelled = bool(cancel and cancel())
+            remaining = deadline - time.monotonic()
+            if cancelled or remaining <= 0:
+                return {
+                    "ok": False,
+                    "status": "cancelled" if cancelled else "still_running",
+                    "in_flight": True,
+                    "completed": False,
+                    "started_new": started_new,
+                    "cancelled": cancelled,
+                    "timed_out": not cancelled,
+                    "timeout_s": timeout_s,
+                    "error": (
+                        f"tool '{tool}' has not returned; its original call is STILL "
+                        "RUNNING and may complete or mutate state. "
+                        + ("The wait was cancelled; this does not prove native work stopped. "
+                           if cancelled else
+                           f"The configured timeout_s={timeout_s:g} bounds this wait, "
+                           "not the worker's lifetime. ")
+                        + "Repeat this exact tool call with the same arguments, document "
+                        "and agent in this run to wait for or retrieve its ORIGINAL "
+                        "result without starting duplicate work. Do not launch a "
+                        "replacement operation while this one is unresolved. Recovery "
+                        "belongs to this run and does not survive its end."
+                    ),
+                }
+            wait((future,), timeout=min(remaining, 0.1))
+        with self.lock:
+            if self.closed:
+                return self.ended_result()
+            if self.pending.get(key) is future:
+                self.pending.pop(key)
+        # A tool-raised TimeoutError is an actual failure, not a wait expiry.
+        return future.result()
+
+    @staticmethod
+    def ended_result() -> dict:
+        return {
+            "ok": False, "status": "run_ended", "executed": False,
+            "error": (
+                "The owning run ended; it no longer retains tool results or accepts "
+                "new work. Previously started native work may still finish: ending "
+                "the run does not prove it was cancelled."
+            ),
+        }
+
+
 def _dispatch_tool(
     tool: str,
     args: dict,
@@ -7239,6 +7335,9 @@ def _dispatch_tool(
     _call_counts: dict | None = None,
     _inner: Any | None = None,
     _loop_guard: Any | None = None,
+    _recovery: _ToolCallRecovery | None = None,
+    _recovery_scope: Any = None,
+    _cancel: Callable[[], bool] | None = None,
 ) -> Any:
     """Dispatch a tool call against the live MCP registry (battery singleton).
 
@@ -7278,25 +7377,12 @@ def _dispatch_tool(
     called with {} got exactly this "bad_arguments" teaching payload twice,
     and the guard refused the model's third attempt before it could act on
     the "do NOT retry" instruction the payload itself already carried). A raised
-    exception (the tool body actually ran and threw) never gets this slack."""
+    exception (the tool body actually ran and threw) never gets this slack.
 
-    if _loop_guard is not None:
-        detection = _loop_guard.check(tool, args)
-        if detection is not None:
-            from services.agent.tool_loop_guard import ToolCallLoopGuard  # noqa: PLC0415
-
-            # A refusal, not a crash: nothing ran, so it must not charge the
-            # execution budget, file a bug report, halt the queued batch, or
-            # render as a red "failed" card. The message itself is unchanged —
-            # ToolCallLoopGuard.message stays the single source of that wording.
-            return {
-                "ok": False,
-                "status": "loop_guard_refused",
-                "policy_refusal": True,
-                "executed": False,
-                "error": ToolCallLoopGuard.message(detection),
-            }
-
+    A run-owned *_recovery* retains unfinished calls across bounded waits. Exact
+    retries with the same effective arguments and *_recovery_scope* recover the
+    original outcome without another execution or budget charge. A terminal
+    delivery consumes that future; it is never a same-input result cache."""
     # Per-tool options (Settings → AI → Tools).
     opts: dict = {}
     try:
@@ -7305,45 +7391,6 @@ def _dispatch_tool(
         opts = get_tool_options(None, tool) or {}
     except Exception:  # noqa: BLE001
         opts = {}
-
-    if opts.get("enabled") is False:
-        return _disabled_tool_error(tool)
-
-    # ONE resolver shared with the tools-slot renderer: per-tool option first,
-    # then the global default (Settings → AI → Tools "Advanced"). The cap the
-    # model was SHOWN is therefore the cap that is enforced.
-    max_calls = None
-    try:
-        from services.agent.config import effective_tool_call_cap  # noqa: PLC0415
-
-        max_calls = effective_tool_call_cap(tool, opts=opts)
-    except Exception:  # noqa: BLE001
-        max_calls = None
-    # Reserve this call's slot atomically: concurrent host-tool calls (parallel
-    # Chudcode sub-agents share one run's counts) must neither both slip under
-    # the cap nor lose an increment. A call that never reaches the tool body
-    # hands its slot back in _charge_call below — a call refused by argument
-    # validation or tool binding never ran, and charging it let three malformed
-    # calls retire a tool the model had never once used.
-    reserved = False
-    if max_calls is not None and _call_counts is not None:
-        with _CALL_ACCOUNTING_LOCK:
-            at_cap = int(_call_counts.get(tool, 0)) >= int(max_calls)
-            if not at_cap:
-                _call_counts[tool] = int(_call_counts.get(tool, 0)) + 1
-                reserved = True
-        if at_cap:
-            if _loop_guard is not None:
-                # The refusal is final — never hand the streak the extra
-                # validation-retry slack, which exists for arguments the model
-                # can still fix.
-                try:
-                    _loop_guard.note_outcome(tool, args, failed_before_body=False)
-                except Exception:  # noqa: BLE001
-                    pass
-            return _call_cap_error(
-                tool, int(max_calls), str(opts.get("prompt_note") or "")
-            )
 
     merged = dict(opts.get("param_defaults") or {})
     # Names the MODEL did not supply — a bad one here is a Settings bug, and the
@@ -7408,57 +7455,94 @@ def _dispatch_tool(
         notes = renamed + notes
         return _attach_arg_notes(result, notes) if notes else result
 
-    def _call_with_timeout() -> Any:
-        """Run ``_call`` on a worker thread and give up after *timeout_f*.
+    recovery = _recovery or _ToolCallRecovery()
+    from services.agent import request_context as _request_context  # noqa: PLC0415
 
-        A hung tool must not wedge the whole turn (agent.tool_options timeout_s,
-        Settings → AI → Tools). Python cannot force-kill the worker, so an expiry
-        becomes a FAILURE RESULT fed back to the model as data (same shape as the
-        dispatch-error path below) while the abandoned call keeps running — the
-        message says exactly that instead of pretending it was cancelled.
-        The orphan is still a normal executor thread, so a clean interpreter exit
-        joins it (SIGTERM/SIGKILL does not) — the turn itself never waits.
-        """
-        from concurrent.futures import (  # noqa: PLC0415
-            ThreadPoolExecutor,
-            TimeoutError as _FutureTimeout,
-        )
+    # Effective defaults, injected document/task identity, authority and workspace
+    # all participate. Never stringify unknown objects into colliding cache keys.
+    recovery_key = json.dumps(
+        [tool, merged, _recovery_scope, _request_context.current_context(),
+         [_request_context.root_value(name) for name in (
+             "CHUDWARE_PROJECT_DIR", "CHUDWARE_PROJECT_SAVE_DIR", "CHUDWARE_FS_ROOT",
+         )]],
+        sort_keys=True, ensure_ascii=False, allow_nan=False,
+    )
+    reserved = False
+    max_calls = None
+    reused = False
 
-        ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{tool}")
-        try:
-            fut = ex.submit(_call)
-            try:
-                return fut.result(timeout=timeout_f)
-            except _FutureTimeout:
+    def _admit() -> Any:
+        nonlocal reserved, max_calls
+        if _loop_guard is not None:
+            detection = _loop_guard.check(tool, args)
+            if detection is not None:
+                from services.agent.tool_loop_guard import ToolCallLoopGuard  # noqa: PLC0415
+
                 return {
                     "ok": False,
-                    "error": (
-                        f"tool '{tool}' exceeded its configured "
-                        f"timeout_s={timeout_f:g} and was abandoned. The call is "
-                        f"STILL RUNNING in the background (a tool thread cannot be "
-                        f"killed) and may still complete or mutate state — do not "
-                        f"assume it failed. Continue with a cheaper/narrower call, "
-                        f"or ask the user to raise the timeout in "
-                        f"Settings → AI → Tools."
-                    ),
-                    "timed_out": True,
-                    "timeout_s": timeout_f,
+                    "status": "loop_guard_refused",
+                    "policy_refusal": True,
+                    "executed": False,
+                    "error": ToolCallLoopGuard.message(detection),
                 }
-        finally:
-            # Never wait — handing control back to the turn is the whole point.
-            ex.shutdown(wait=False)
+        if opts.get("enabled") is False:
+            return _disabled_tool_error(tool)
+        try:
+            from services.agent.config import effective_tool_call_cap  # noqa: PLC0415
+
+            max_calls = effective_tool_call_cap(tool, opts=opts)
+        except Exception:  # noqa: BLE001
+            max_calls = None
+        if max_calls is not None and _call_counts is not None:
+            with _CALL_ACCOUNTING_LOCK:
+                at_cap = int(_call_counts.get(tool, 0)) >= int(max_calls)
+                if not at_cap:
+                    _call_counts[tool] = int(_call_counts.get(tool, 0)) + 1
+                    reserved = True
+            if at_cap:
+                if _loop_guard is not None:
+                    try:
+                        _loop_guard.note_outcome(tool, args, failed_before_body=False)
+                    except Exception:  # noqa: BLE001
+                        pass
+                return _call_cap_error(
+                    tool, int(max_calls), str(opts.get("prompt_note") or "")
+                )
+        return None
+
+    def _start() -> Any:
+        from concurrent.futures import Future  # noqa: PLC0415
+        from services.worker_activity import start_background_thread  # noqa: PLC0415
+
+        future = Future()
+
+        def worker() -> None:
+            try:
+                future.set_result(_execute())
+            except BaseException as exc:
+                future.set_exception(exc)
+
+        # This framework helper copies every ContextVar and registers the actual
+        # thread lifetime with the worker census. No idle executor thread survives
+        # completion, and turn teardown never joins an unkillable native call.
+        start_background_thread(worker, name=f"tool-{tool}")
+        return future
 
     def _charge_call(*, did_work: bool) -> int | None:
         """Settle this call's reserved slot, returning the resulting count.
 
         ``did_work`` is False only when the call never reached the tool body
         (see ``_failed_before_tool_body``); its reservation is refunded. A
-        timeout DOES count: that call is still running and may still mutate
-        state.
+        pending wait keeps its reservation until the worker returns, so a late
+        validation refusal can still refund it exactly once.
         """
+        nonlocal reserved
         if not reserved or _call_counts is None:
             return None
         with _CALL_ACCOUNTING_LOCK:
+            if not reserved:
+                return None
+            reserved = False
             if not did_work:
                 refunded = int(_call_counts.get(tool, 0)) - 1
                 if refunded > 0:
@@ -7467,18 +7551,64 @@ def _dispatch_tool(
                     _call_counts.pop(tool, None)
             return int(_call_counts.get(tool, 0))
 
-    try:
-        result = _call_with_timeout() if timeout_f > 0 else _call()
-    except Exception as exc:  # noqa: BLE001
-        # The tool body ran and threw: real work, real spend — it counts.
-        _charge_call(did_work=True)
+    def _execute() -> Any:
+        # Settle execution accounting once, before publishing the terminal future.
+        # Waiters observe that result; timeouts and parallel recoveries are not
+        # separate executions and must neither spend nor refund additional slots.
+        try:
+            result = _call()
+        except Exception:
+            _charge_call(did_work=True)
+            if _loop_guard is not None:
+                try:
+                    _loop_guard.note_outcome(tool, args, failed_before_body=False)
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
+        failed_before_body = _failed_before_tool_body(result)
         if _loop_guard is not None:
-            # Raised out of fn(**kwargs) (or _inner) — the tool body ran and
-            # threw; a genuine tool-side failure, not an arg-validation miss.
             try:
-                _loop_guard.note_outcome(tool, args, failed_before_body=False)
+                _loop_guard.note_outcome(tool, args, failed_before_body=failed_before_body)
             except Exception:  # noqa: BLE001
                 pass
+        used = _charge_call(did_work=not failed_before_body)
+        if used is not None and max_calls is not None and used >= int(max_calls):
+            result = _attach_arg_notes(
+                result, [_call_cap_last_call_note(tool, used, int(max_calls))]
+            )
+        return result
+
+    # Lookup, admission and publication are one short atomic step. Recoveries bypass
+    # execution caps/loop detection because they do not invoke the tool again.
+    with recovery.lock:
+        if recovery.closed:
+            return recovery.ended_result()
+        future = recovery.pending.get(recovery_key)
+        reused = future is not None
+        if not reused:
+            refusal = _admit()
+            if refusal is not None:
+                return refusal
+            if timeout_f > 0:
+                try:
+                    future = _start()
+                except BaseException:
+                    _charge_call(did_work=False)
+                    raise
+                recovery.pending[recovery_key] = future
+    try:
+        result = (
+            recovery.wait(
+                recovery_key, future, tool=tool, timeout_s=timeout_f,
+                cancel=_cancel, started_new=not reused,
+            )
+            if future is not None else _execute()
+        )
+    except Exception as exc:  # noqa: BLE001
+        if reused:
+            # Recovery must preserve the original exception instance, including
+            # structured engine code/detail and its traceback.
+            raise
         hint = None
         try:
             from services.agent.tool_hints import hint_for  # noqa: PLC0415
@@ -7489,18 +7619,6 @@ def _dispatch_tool(
         if hint:
             raise type(exc)(f"{exc} Hint: {hint}") from exc
         raise
-    failed_before_body = _failed_before_tool_body(result)
-    if _loop_guard is not None:
-        try:
-            _loop_guard.note_outcome(tool, args, failed_before_body=failed_before_body)
-        except Exception:  # noqa: BLE001
-            pass
-    used = _charge_call(did_work=not failed_before_body)
-    if used is not None and max_calls is not None and used >= int(max_calls):
-        # Warn ON the last allowed call, not one call too late.
-        result = _attach_arg_notes(
-            result, [_call_cap_last_call_note(tool, used, int(max_calls))]
-        )
     return result
 
 

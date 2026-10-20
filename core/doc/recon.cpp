@@ -7,11 +7,13 @@
 #include <cmath>
 #include <cstdio>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <vector>
 
 #include "doc/session.h"  // OpError
 #include "geom/plane.h"   // chudware::geom::SketchPlane — face-plane frame convention
+#include "geom/profile.h"
 #include "geom/face_normal.h"  // plane_outward_normal — handedness-aware planar normal
 
 #include <Bnd_Box.hxx>
@@ -27,6 +29,12 @@
 #include <BRep_Tool.hxx>
 #include <GProp_GProps.hxx>
 #include <GeomAbs_CurveType.hxx>
+#include <GeomAPI_IntCS.hxx>
+#include <Geom_BezierCurve.hxx>
+#include <Geom_BSplineCurve.hxx>
+#include <TColgp_Array1OfPnt.hxx>
+#include <TColStd_Array1OfReal.hxx>
+#include <TColStd_Array1OfInteger.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <Geom_Curve.hxx>
 #include <Geom_Plane.hxx>
@@ -530,6 +538,17 @@ std::vector<std::string> emit_projected_edge(json& entities, const TopoDS_Edge& 
                                  {"p", {pt[0], pt[1]}}});
         return {id};
     }
+    // Orthographic projection of a line is analytic. GeomProjLib can wrap an
+    // oblique line in a degree-one BSpline, which otherwise expands to 24 segments.
+    BRepAdaptor_Curve source_curve(src_edge);
+    if (source_curve.GetType() == GeomAbs_Line) {
+        const auto a = project2(plane, source_curve.Value(source_curve.FirstParameter()));
+        const auto b = project2(plane, source_curve.Value(source_curve.LastParameter()));
+        const std::string id = "e" + std::to_string(next_id++);
+        entities.push_back(json{{"id", id}, {"type", "line"}, {"construction", true},
+                               {"p1", {a[0], a[1]}}, {"p2", {b[0], b[1]}}});
+        return {id};
+    }
 
     Standard_Real f = 0.0, l = 0.0;
     Handle(Geom_Curve) c3d = BRep_Tool::Curve(src_edge, f, l);
@@ -593,6 +612,156 @@ std::vector<ProjectedEntity> project_edges_to_plane(const std::vector<TopoDS_Edg
         }
     }
     return out;
+}
+
+std::optional<json> pierce_edge_to_plane(const TopoDS_Edge& edge,
+                                        const chudware::geom::SketchPlane& plane,
+                                        const std::optional<Eigen::Vector2d>& near) {
+    Standard_Real first, last;
+    Handle(Geom_Curve) curve = BRep_Tool::Curve(edge, first, last);
+    if (curve.IsNull()) return std::nullopt;
+    GeomAPI_IntCS intersections(new Geom_TrimmedCurve(curve, first, last), geom_plane_of(plane));
+    if (!intersections.IsDone() || intersections.NbPoints() == 0) return std::nullopt;
+    const auto midpoint = project2(plane, curve->Value(0.5 * (first + last)));
+    const Eigen::Vector2d target = near.value_or(Eigen::Vector2d(midpoint[0], midpoint[1]));
+    double best = std::numeric_limits<double>::infinity();
+    std::array<double, 2> selected{};
+    for (int i = 1; i <= intersections.NbPoints(); ++i) {
+        const auto uv = project2(plane, intersections.Point(i));
+        const double distance = (Eigen::Vector2d(uv[0], uv[1]) - target).squaredNorm();
+        if (distance < best) { best = distance; selected = uv; }
+    }
+    return json{{"type", "point"}, {"construction", true}, {"p", {selected[0], selected[1]}}};
+}
+
+std::vector<ProjectedEntity> project_sketch_entity_to_plane(
+    const json& entity, const chudware::geom::SketchPlane& source,
+    const chudware::geom::SketchPlane& target, bool& any_approx) {
+    const std::string type = entity.value("type", std::string());
+    auto xy = [](const json& point) {
+        return Eigen::Vector2d(point.at(0).get<double>(), point.at(1).get<double>());
+    };
+    auto lift = [&](const Eigen::Vector2d& point) {
+        const Eigen::Vector3d world = source.lift(point);
+        return gp_Pnt(world.x(), world.y(), world.z());
+    };
+    if (type == "point") {
+        const auto uv = project2(target, lift(xy(entity.at("p"))));
+        any_approx = false;
+        return {{json{{"type", "point"}, {"construction", true}, {"p", {uv[0], uv[1]}}}}};
+    }
+    std::vector<TopoDS_Edge> edges;
+    auto bezier = [&](const std::vector<Eigen::Vector2d>& points,
+                      const std::vector<double>& weights = {}) {
+        TColgp_Array1OfPnt poles(1, static_cast<int>(points.size()));
+        for (int i = 1; i <= poles.Length(); ++i) poles.SetValue(i, lift(points[i - 1]));
+        Handle(Geom_BezierCurve) curve;
+        if (weights.empty()) curve = new Geom_BezierCurve(poles);
+        else {
+            TColStd_Array1OfReal ws(1, poles.Length());
+            for (int i = 1; i <= ws.Length(); ++i) ws.SetValue(i, weights[i - 1]);
+            curve = new Geom_BezierCurve(poles, ws);
+        }
+        edges.push_back(BRepBuilderAPI_MakeEdge(curve).Edge());
+    };
+    auto component = [&](const json& part) {
+        const TopoDS_Wire wire = chudware::geom::wire_from_solved_sketch(
+            json{{"entity", part}}, source);
+        for (TopExp_Explorer ex(wire, TopAbs_EDGE); ex.More(); ex.Next())
+            edges.push_back(TopoDS::Edge(ex.Current()));
+    };
+    if (type == "ellipse" || type == "ellipse_arc") {
+        double rx = entity.at("rx"), ry = entity.at("ry");
+        double rotation = entity.value("rot", 0.0) * M_PI / 180.0;
+        double shift = 0.0;
+        if (rx < ry) { std::swap(rx, ry); rotation += M_PI / 2.0; shift = -M_PI / 2.0; }
+        const Eigen::Vector3d xdir = source.uAxis * std::cos(rotation)
+                                   + source.vAxis * std::sin(rotation);
+        gp_Elips ellipse(gp_Ax2(lift(xy(entity.at("center"))),
+            gp_Dir(source.normal.x(), source.normal.y(), source.normal.z()),
+            gp_Dir(xdir.x(), xdir.y(), xdir.z())), rx, ry);
+        if (type == "ellipse") edges.push_back(BRepBuilderAPI_MakeEdge(ellipse).Edge());
+        else {
+            const double a0 = entity.at("a0").get<double>() * M_PI / 180.0 + shift;
+            double a1 = entity.at("a1").get<double>() * M_PI / 180.0 + shift;
+            while (a1 <= a0) a1 += 2.0 * M_PI;
+            edges.push_back(BRepBuilderAPI_MakeEdge(ellipse, a0, a1).Edge());
+        }
+    } else if (type == "conic") {
+        const double rho = std::clamp(entity.value("rho", 0.5), 1e-6, 1.0 - 1e-6);
+        bezier({xy(entity.at("p0")), xy(entity.at("apex")), xy(entity.at("p1"))},
+               {1.0, rho / (1.0 - rho), 1.0});
+    } else if (type == "parabola") {
+        const Eigen::Vector2d vertex = xy(entity.at("vertex"));
+        const Eigen::Vector2d axis = xy(entity.at("focus")) - vertex;
+        const double focal = axis.norm();
+        if (focal <= 1e-12) throw OpError("convert_failed", "degenerate parabola");
+        const Eigen::Vector2d u = axis / focal, v(-u.y(), u.x());
+        const double t0 = entity.at("t0"), t1 = entity.at("t1");
+        const Eigen::Vector2d a = vertex + u * (t0 * t0 / (4 * focal)) + v * t0;
+        const Eigen::Vector2d b = vertex + u * (t1 * t1 / (4 * focal)) + v * t1;
+        bezier({a, a + (t1 - t0) * 0.5 * (u * (t0 / (2 * focal)) + v), b});
+    } else if (type == "spline" || type == "style_spline") {
+        std::vector<Eigen::Vector2d> points;
+        for (const json& p : entity.at("points")) points.push_back(xy(p));
+        if (points.size() < 2) throw OpError("convert_failed", "spline needs two points");
+        const int n = static_cast<int>(points.size());
+        if (type == "spline") {
+            for (int i = 0; i + 1 < n; ++i) {
+                const Eigen::Vector2d p0 = i ? points[i - 1] : 2 * points[0] - points[1];
+                const Eigen::Vector2d p3 = i + 2 < n ? points[i + 2] : 2 * points[n - 1] - points[n - 2];
+                bezier({points[i], points[i] + (points[i + 1] - p0) / 6,
+                        points[i + 1] - (p3 - points[i]) / 6, points[i + 1]});
+            }
+        } else {
+            const int degree = std::min(3, n - 1), internal = n - degree - 1;
+            TColgp_Array1OfPnt poles(1, n);
+            for (int i = 1; i <= n; ++i) poles.SetValue(i, lift(points[i - 1]));
+            TColStd_Array1OfReal knots(1, internal + 2);
+            TColStd_Array1OfInteger mults(1, internal + 2);
+            for (int i = 1; i <= internal + 2; ++i) {
+                knots.SetValue(i, double(i - 1) / (internal + 1));
+                mults.SetValue(i, i == 1 || i == internal + 2 ? degree + 1 : 1);
+            }
+            edges.push_back(BRepBuilderAPI_MakeEdge(
+                new Geom_BSplineCurve(poles, knots, mults, degree)).Edge());
+        }
+    } else if (type == "slot") {
+        const Eigen::Vector2d a = xy(entity.at("p1")), b = xy(entity.at("p2"));
+        const double radius = entity.at("width").get<double>() / 2.0;
+        const Eigen::Vector2d direction = (b - a).normalized();
+        const Eigen::Vector2d offset(-direction.y() * radius, direction.x() * radius);
+        const double angle = std::atan2(direction.y(), direction.x()) * 180.0 / M_PI;
+        auto point = [](const Eigen::Vector2d& p) { return json::array({p.x(), p.y()}); };
+        component(json{{"type", "line"}, {"p1", point(a + offset)}, {"p2", point(b + offset)}});
+        component(json{{"type", "line"}, {"p1", point(b - offset)}, {"p2", point(a - offset)}});
+        component(json{{"type", "arc"}, {"center", point(a)}, {"radius", radius},
+                       {"start", angle + 90}, {"end", angle + 270}});
+        component(json{{"type", "arc"}, {"center", point(b)}, {"radius", radius},
+                       {"start", angle - 90}, {"end", angle + 90}});
+    } else if (type == "arc_slot") {
+        const Eigen::Vector2d center = xy(entity.at("center"));
+        const double radius = entity.at("radius"), half = entity.at("width").get<double>() / 2;
+        const double a0 = entity.at("a0"), a1 = entity.at("a1");
+        auto point = [](const Eigen::Vector2d& p) { return json::array({p.x(), p.y()}); };
+        for (double r : {radius - half, radius + half})
+            component(json{{"type", "arc"}, {"center", point(center)}, {"radius", r},
+                           {"start", a0}, {"end", a1}});
+        for (int end = 0; end < 2; ++end) {
+            const double angle = end ? a1 : a0, radians = angle * M_PI / 180;
+            const Eigen::Vector2d c = center + radius * Eigen::Vector2d(std::cos(radians), std::sin(radians));
+            component(json{{"type", "arc"}, {"center", point(c)}, {"radius", half},
+                           {"start", end ? angle : angle + 180},
+                           {"end", end ? angle + 180 : angle + 360}});
+        }
+    } else {
+        json part = entity;
+        part["construction"] = false;
+        component(part);
+    }
+    if (edges.empty())
+        throw OpError("convert_failed", "sketch entity '" + type + "' has no projectable geometry");
+    return project_edges_to_plane(edges, target, any_approx);
 }
 
 std::vector<TopoDS_Edge> face_boundary_edges(const TopoDS_Face& face) {

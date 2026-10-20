@@ -131,6 +131,7 @@ static int s_workspace = 0;
 // ui/web_capabilities.cpp — no per-command state here).
 static std::string s_disabledPrefix;
 static std::string s_disabledReason;
+static std::string s_agentLockReason;
 
 // Simulate study context (setRibbonStudyContext): the selected study's type key, refreshed every
 // frame by SimManager::tick. It expires one frame after the last refresh, so a stale study never
@@ -143,6 +144,13 @@ static const char* ribbon_studyCtx() {
 
 static const char* ribbon_dynDisabledReason(const char* cmd_id) {
     if (!cmd_id) return nullptr;
+    if (!s_agentLockReason.empty() &&
+        ui::ribbonCommandCapability(cmd_id) == ui::CommandCapability::Mutate &&
+        std::strcmp(cmd_id, "sketch_exit") != 0 &&
+        std::strcmp(cmd_id, "sketch3d_exit") != 0 &&
+        std::strcmp(cmd_id, "sketch_cancel") != 0 &&
+        std::strcmp(cmd_id, "sketch3d_cancel") != 0)
+        return s_agentLockReason.c_str();
     if (!s_disabledPrefix.empty() &&
         std::strncmp(cmd_id, s_disabledPrefix.c_str(), s_disabledPrefix.size()) == 0)
         return s_disabledReason.c_str();
@@ -2021,6 +2029,10 @@ void setRibbonWorkspace(int workspace) {
 void setRibbonDisabledPrefix(const char* prefix, const char* reason) {
     s_disabledPrefix = prefix ? prefix : "";
     s_disabledReason = (reason && *reason) ? reason : "Unavailable";
+}
+
+void setRibbonAgentLockReason(const char* reason) {
+    s_agentLockReason = reason ? reason : "";
 }
 
 void setRibbonStudyContext(const char* studyTypeKey) {

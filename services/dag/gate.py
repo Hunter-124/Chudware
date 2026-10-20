@@ -143,6 +143,11 @@ def _gate_ledger(run_id: str, ledger=None):
     storage failure never blocks the gate, and cross-run contamination is avoided.
     Pass a ledger directly in tests for hermeticity.
     """
+    from services.agent.request_context import in_cell
+    if in_cell():
+        from .storage import resolve_run
+        record = resolve_run(run_id)
+        return FileLedger(record.run_id, path=record.root / "interaction.jsonl")
     if ledger is not None:
         return ledger
     if not run_id or run_id == _UNKNOWN_RUN_ID:

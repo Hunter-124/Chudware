@@ -9,6 +9,7 @@
 #pragma once
 
 #include <string>
+#include <cstdint>
 
 #include <nlohmann/json.hpp>
 
@@ -29,6 +30,8 @@ struct OpError : std::runtime_error {
         return json{{"code", code}, {"message", what()}, {"detail", detail}};
     }
 };
+
+bool dirty_document_count(std::uint64_t& count);  // nonblocking, false = unknown
 
 // cam_new {name?, units?, post?} -> {doc_id, revision, tree}.
 json cam_new(const json& params);

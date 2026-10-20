@@ -40,6 +40,7 @@ CONTRACT_NAMES: list[str] = [
     "ellipse", "point_ent", "text_ent", "trim", "extend", "offset_ent",
     "convert_ent", "mirror_ent", "pattern_lin_ent", "pattern_circ_ent",
     "move_ent", "construction", "relations", "fix",
+    "display_relations", "fully_define",
     # Assembly tab
     "insert_component", "mate", "move_component", "rotate_component",
     "pattern_component", "smart_fasteners", "exploded_view", "bom",
@@ -1574,6 +1575,36 @@ def draw_fix(d, cell, p):
                          fill=_rgba(p.stroke, 18), outline=p.stroke, width=lw)
     filled_circle(d, s*0.5, s*0.64, lw, p.accent)
     d.line([(s*0.25, s*0.86), (s*0.75, s*0.86)], fill=p.accent, width=lw)
+
+@icon("display_relations")
+def draw_display_relations(d, cell, p):
+    """Relation badge above a compact list of inspectable constraints."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    a, b = (s*0.20, s*0.32), (s*0.80, s*0.32)
+    d.line([a, b], fill=_rgba(p.stroke, 150), width=max(1, lw//2))
+    filled_circle(d, *a, lw*1.1, p.stroke)
+    filled_circle(d, *b, lw*1.1, p.stroke)
+    d.rounded_rectangle([s*0.40, s*0.17, s*0.60, s*0.47],
+                        radius=int(s*0.04), fill=_rgba(p.accent, 40),
+                        outline=p.accent, width=lw)
+    for y in (0.62, 0.80):
+        filled_circle(d, s*0.25, s*y, lw*0.65, p.accent)
+        d.line([(s*0.40, s*y), (s*0.78, s*y)], fill=p.stroke, width=lw)
+
+@icon("fully_define")
+def draw_fully_define(d, cell, p):
+    """Closed sketch profile with constrained vertices and an approval check."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    profile = [(s*0.19, s*0.70), (s*0.19, s*0.24),
+               (s*0.52, s*0.24), (s*0.70, s*0.43),
+               (s*0.70, s*0.70)]
+    d.line(profile + [profile[0]], fill=p.stroke, width=lw, joint="curve")
+    for x, y in profile:
+        filled_circle(d, x, y, lw*0.8, p.accent)
+    d.line([(s*0.48, s*0.70), (s*0.62, s*0.84), (s*0.86, s*0.56)],
+           fill=p.accent, width=lw*2, joint="curve")
 
 # ---- Assembly tab ----
 
@@ -5346,6 +5377,7 @@ RENDERED_RECIPE_NAMES: set[str] = {
     "trim", "extend", "offset_ent", "convert_ent", "mirror_ent",
     "pattern_lin_ent", "pattern_circ_ent", "move_ent", "rotate_ent",
     "construction", "relations", "fix", "smart_dim", "point_ent", "text_ent",
+    "display_relations", "fully_define",
     "study_static", "study_modal", "study_flow", "study_thermal",
     "study_fatigue", "fixture", "load_force", "load_pressure",
     "mesh", "mesh_tet", "mesh_hex", "mesh_auto", "run_study", "results",

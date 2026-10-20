@@ -40,8 +40,8 @@ enum class WorkspaceBrowseMode {
     SaveAs = 2,      // pick a folder + type a filename
 };
 
-// Blocking workspace tree browser (web only). Returns a server-absolute path
-// (gateway list's root + relative entry) or "" on cancel. `accept` is a comma
+// Blocking workspace tree browser (web only). Returns a workspace-relative path
+// ("." for root) or "" on cancel. `accept` is a comma
 // list of extensions (".step+,.step") used to filter files in OpenFile mode;
 // empty = show all files. `suggestedName` prefills the SaveAs name box.
 // Desktop stub always returns "".

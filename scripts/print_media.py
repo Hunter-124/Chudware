@@ -5,7 +5,11 @@ Inspect first: python scripts/print_media.py inventory /mounted/drive
 Publish only idle media, using that inventory_token and a JSON list of complete jobs:
   python scripts/print_media.py publish /mounted/drive --project ROBARM \
       --jobs-file jobs.json --expected-inventory TOKEN --media-idle
-Explicit --retire-path values archive reviewed legacy files; unknown files stay untouched.
+Each job is {"part_id", "manifest_path", "gcode_path"?, "user_override"?}; a job that is
+not print_ready publishes only with "user_override" naming why it goes on anyway.
+Explicit --retire-path values delete reviewed legacy files; unknown files stay untouched.
+Raw print files go to the drive root by default; --layout project uses one top-level
+project folder. Neither layout creates nested delivery directories.
 """
 from __future__ import annotations
 
@@ -31,10 +35,12 @@ def main() -> int:
     publish.add_argument("--project", required=True)
     publish.add_argument("--jobs-file", type=Path, required=True)
     publish.add_argument("--expected-inventory", required=True)
+    publish.add_argument("--layout", choices=("root", "project"), default="root",
+                         help="Raw files at drive root (default), or one top-level project folder")
     publish.add_argument("--media-idle", action="store_true",
                          help="Confirm media is not being used by any printer; never infer this")
     publish.add_argument("--retire-path", action="append", default=[],
-                         help="Reviewed relative legacy printable path to archive; repeat as needed")
+                         help="Reviewed relative legacy printable path to delete; repeat as needed")
     args = parser.parse_args()
     try:
         if args.command == "inventory":
@@ -43,7 +49,7 @@ def main() -> int:
             jobs = json.loads(args.jobs_file.read_text(encoding="utf-8"))
             result = publish_print_media(args.root, args.project, jobs,
                                          args.expected_inventory, media_idle=args.media_idle,
-                                         retire_paths=args.retire_path)
+                                         retire_paths=args.retire_path, layout=args.layout)
     except (OSError, ValueError) as exc:
         result = {"ok": False, "reason": str(exc)}
     print(json.dumps(result, indent=2, ensure_ascii=False))

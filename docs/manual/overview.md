@@ -22,6 +22,11 @@ WORKFLOW
                                             A suppressed run (trivial batch, CHUDWARE_PREFLIGHT=0,
                                             or a preflight error) returns verdict "skipped" with
                                             the reason in skipped/skipped_detail.
+                                            An invalid fillet/chamfer solid is rejected even if
+                                            OCCT reports construction success. Atomic failure keeps
+                                            the prior live tree/revision; regen_diagnosis uses the
+                                            rejected candidate and native feature error. Provider
+                                            unavailability does not erase that native evidence.
   3. render_part()                          SEE it — ONE call returns a 2x2 grid of the four
                                             most useful complementary shots (the planner
                                             measures ~200 cameras in the engine and picks the
@@ -68,6 +73,17 @@ DOC OWNERSHIP & SAVE DISCIPLINE
   An unsaved AI doc that's just abandoned is retired to a crash-recovery tier — a safety
   net, NOT a delivery mechanism, and never surfaced to the user as a warning. If the user
   edits your doc they ADOPT it (it becomes theirs); you keep co-editing the same live doc.
+  Explicit save_part/export_part relative paths (e.g. "parts/redesign/base.step+") use
+  the selected workspace: CHUDWARE_PROJECT_DIR, then CHUDWARE_FS_ROOT, independent of
+  worker cwd or continuation. A selected nested workspace is not widened to a parent
+  project/repository. Without a valid project root, pass an absolute path. Absolute
+  and "~" destinations may be outside the workspace, but credential/key locations
+  are refused after resolving symlinks. Pathless saves keep an existing native file
+  in place, otherwise use CHUDWARE_PROJECT_SAVE_DIR (temp only with no project).
+  Native STL export refuses collapsed facets or a source-solid mesh that is not closed
+  and consistently oriented in the serialized output. It does not heal geometry or
+  weld nearby points. Keep the native error and inspect the source/export conditions
+  rather than deleting triangles or claiming an unchecked mesh is print-ready.
 
 PRIMITIVE PLACEMENT & ORIENTATION (box / cylinder / sphere / cone / torus)
   A primitive is built CENTRED ON THE ORIGIN and then placed. These are the placement keys,

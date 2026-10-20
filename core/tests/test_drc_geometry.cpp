@@ -87,6 +87,31 @@ bool has_rule(const json& violations, const std::string& rule) {
     return false;
 }
 
+
+// Sample the returned copper, including keyholed voids, rather than inspecting
+// broad-phase ranges. Test samples sit at cell centres, never on traced edges.
+bool filled_at(const json& polys, double x, double y) {
+    for (const auto& poly : polys) {
+        bool inside = false;
+        for (size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++) {
+            const double xi = poly[i][0].get<double>(), yi = poly[i][1].get<double>();
+            const double xj = poly[j][0].get<double>(), yj = poly[j][1].get<double>();
+            if ((yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi)
+                inside = !inside;
+        }
+        if (inside) return true;
+    }
+    return false;
+}
+
+void check_fill_cells(const json& polys, const std::vector<std::string>& expected) {
+    for (size_t r = 0; r < expected.size(); ++r)
+        for (size_t c = 0; c < expected[r].size(); ++c) {
+            CAPTURE(r);
+            CAPTURE(c);
+            CHECK(filled_at(polys, -3.5 + c, -3.5 + r) == (expected[r][c] == '#'));
+        }
+}
 }  // namespace
 
 TEST_CASE("footprint-local pad ids and via ids do not collapse disconnected terminals") {
@@ -168,6 +193,145 @@ TEST_CASE("final zone fill survives response compilation, session state and Gerb
     CHECK(exported["files"]["F.Cu"] !=
           fab::write_gerber_layer(fill_zones(b, 0.25), "F.Cu"));
     ecad_close(id);
+}
+
+TEST_CASE("zone clearance preserves strict cell boundaries for circles boxes and segments") {
+    json b = board();
+    b["rules"]["clearance"] = 0.5;
+    b["net_classes"]["default"]["clearance"] = 0.5;
+    json z = zone("z1", "GND", -4.0, -4.0, 4.0, 4.0);
+
+    SUBCASE("circle at a negative-origin cell centre") {
+        add_pad(b, pad("p1", "VCC", -0.5, -0.5, 1.0));
+        check_fill_cells(fill_zone(b, z, 1.0),
+                         {"########", "########", "########", "###.####",
+                          "########", "########", "########", "########"});
+    }
+    SUBCASE("box includes its full unequal half extents") {
+        json p = pad("p1", "VCC", -0.5, -0.5);
+        p["shape"] = "rect";
+        p["size"] = json::array({1.0, 3.0});
+        add_pad(b, p);
+        check_fill_cells(fill_zone(b, z, 1.0),
+                         {"########", "########", "###.####", "###.####",
+                          "###.####", "########", "########", "########"});
+    }
+    SUBCASE("diagonal capsule includes endpoint and off-centreline cells") {
+        b["tracks"].push_back(json{{"id", "t1"}, {"net", "VCC"}, {"layer", "F.Cu"},
+                                   {"kind", "segment"}, {"width", 0.5},
+                                   {"p1", json::array({-2.5, -1.5})},
+                                   {"p2", json::array({0.5, 1.5})}});
+        check_fill_cells(fill_zone(b, z, 1.0),
+                         {"########", "########", "#..#####", "#...####",
+                          "##...###", "###..###", "########", "########"});
+    }
+    SUBCASE("an obstacle outside the zone still clears boundary cells") {
+        add_pad(b, pad("p1", "VCC", -4.5, -0.5, 1.5));
+        check_fill_cells(fill_zone(b, z, 1.0),
+                         {"########", "########", "########", ".#######",
+                          "########", "########", "########", "########"});
+    }
+    SUBCASE("a degenerate segment uses its first endpoint") {
+        b["tracks"].push_back(json{{"id", "t1"}, {"net", "VCC"}, {"layer", "F.Cu"},
+                                   {"kind", "segment"}, {"width", 1.0},
+                                   {"p1", json::array({-0.5, -0.5})},
+                                   {"p2", json::array({-0.5, -0.5})}});
+        check_fill_cells(fill_zone(b, z, 1.0),
+                         {"########", "########", "########", "###.####",
+                          "########", "########", "########", "########"});
+    }
+}
+
+TEST_CASE("zone thermal clipping retains pad copper and all four spokes") {
+    json b = board();
+    json p = pad("p1", "GND", -0.5, -0.5, 1.0);
+    p["type"] = "tht";
+    p["drill"] = 0.4;
+    add_pad(b, p);
+    json z = zone("z1", "GND", -4.0, -4.0, 4.0, 4.0);
+    z["thermal"] = json{{"gap", 2.0}, {"spoke_width", 1.0}};
+    check_fill_cells(fill_zone(b, z, 1.0),
+                     {"########", "##.#.###", "#..#..##", "########",
+                      "#..#..##", "##.#.###", "########", "########"});
+
+    // Zero gap must not carve copper, even with no spokes.
+    z["thermal"] = json{{"gap", 0.0}, {"spoke_width", 0.0}};
+    check_fill_cells(fill_zone(b, z, 1.0), std::vector<std::string>(8, "########"));
+}
+
+TEST_CASE("zone clipping includes sub-cell obstacles and excludes partial-grid centres outside the zone") {
+    json b = board();
+    b["rules"]["clearance"] = 0.0625;
+    b["net_classes"]["default"]["clearance"] = 0.0625;
+    add_pad(b, pad("p1", "VCC", -1.0, -0.5, 0.125));
+    json z = zone("z1", "GND", -1.25, -0.75, 2.0, 1.0);
+    z["clearance"] = 0.0625;
+    const json polys = fill_zone(b, z, 0.5);
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 7; ++c) {
+            CAPTURE(r);
+            CAPTURE(c);
+            const bool expected = r < 3 && c < 6 && (r != 0 || c != 0);
+            CHECK(filled_at(polys, -1.0 + c * 0.5, -0.5 + r * 0.5) == expected);
+        }
+
+    // Zero required clearance intentionally does not carve even overlapping
+    // copper: the final predicate is strictly distance < required.
+    b["rules"]["clearance"] = 0.0;
+    b["net_classes"]["default"]["clearance"] = 0.0;
+    z["clearance"] = 0.0;
+    CHECK(filled_at(fill_zone(b, z, 0.5), -1.0, -0.5));
+}
+
+TEST_CASE("thermal spoke boundaries remain copper at inclusive half width") {
+    json b = board();
+    json p = pad("p1", "GND", -1.0, -1.0, 0.5);
+    p["type"] = "tht";
+    p["drill"] = 0.2;
+    add_pad(b, p);
+    json z = zone("z1", "GND", -4.0, -4.0, 4.0, 4.0);
+    z["thermal"] = json{{"gap", 2.0}, {"spoke_width", 1.0}};
+    check_fill_cells(fill_zone(b, z, 1.0),
+                     {"########", "#.##.###", "########", "########",
+                      "#.##.###", "########", "########", "########"});
+}
+
+TEST_CASE("zone clipping treats huge and nonfinite obstacle bounds conservatively") {
+    const double inf = std::numeric_limits<double>::infinity();
+    json z = zone("z1", "GND", -4.0, -4.0, 4.0, 4.0);
+    for (const double size : {std::numeric_limits<double>::max(), inf}) {
+        CAPTURE(size);
+        json b = board();
+        add_pad(b, pad("p1", "VCC", 0.0, 0.0, size));
+        CHECK(fill_zone(b, z, 1.0).empty());
+    }
+
+    json b = board();
+    add_pad(b, pad("p1", "VCC", 1e300, -1e300, 1.0));
+    check_fill_cells(fill_zone(b, z, 1.0), std::vector<std::string>(8, "########"));
+    b["footprints"].clear();
+    add_pad(b, pad("p1", "VCC", 0.0, 0.0, 1.0));
+    z["clearance"] = inf;
+    CHECK(fill_zone(b, z, 1.0).empty());
+
+    b["footprints"].clear();
+    json p = pad("p1", "GND", -0.5, -0.5, 1.0);
+    p["type"] = "tht";
+    p["drill"] = 0.4;
+    add_pad(b, p);
+    z["clearance"] = 0.2;
+    z["thermal"] = json{{"gap", inf}, {"spoke_width", 0.0}};
+    check_fill_cells(fill_zone(b, z, 1.0),
+                     {"...#....", "...#....", "...#....", "########",
+                      "...#....", "...#....", "...#....", "...#...."});
+
+    // Preserve the original nonfinite thermal predicate, not just the ordinary
+    // finite annulus: hypot(NaN, dy) does not reject distant rows by r_gap.
+    b["footprints"][0]["pos"][0] = std::numeric_limits<double>::quiet_NaN();
+    z["thermal"] = json{{"gap", 0.25}, {"spoke_width", 0.0}};
+    check_fill_cells(fill_zone(b, z, 1.0),
+                     {"........", "........", "........", "########",
+                      "........", "........", "........", "........"});
 }
 
 TEST_CASE("arc-track copper participates in clearance DRC") {

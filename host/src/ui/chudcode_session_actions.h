@@ -35,8 +35,8 @@ inline constexpr char kChudcodeRewindSessionMethod[] = "chudcode_rewind_session"
 // deliberately NEVER persisted — after a restart every session is inactive until its next turn
 // resumes it via chudcode_session_file.
 struct ChudcodeSessionLink {
-    std::string sessionId;    // chudcode_session_id
-    std::string sessionFile;  // chudcode_session_file (resume key for agent_admin_turn)
+    std::string sessionId;    // desktop runtime id; web opaque cell session handle
+    std::string sessionFile;  // desktop-only runtime resume file (never sent by web)
     std::string health;       // last doctor status: healthy|issues|repaired|repaired_with_issues
     bool runtimeLive = false; // process-local; not serialized
     bool empty() const { return sessionId.empty() && sessionFile.empty() && health.empty(); }
@@ -122,9 +122,8 @@ bool parseChudcodeExportResult(const nlohmann::json& r, ChudcodeExportResult& ou
 // inactive runtime). Callers drop runtimeLive and show the resume hint instead of an error.
 bool chudcodeSessionNotLive(const nlohmann::json& r);
 
-// chudcode_branch_session -> {ok, chudcode_session_id, chudcode_session_file}. False when
-// not an ok envelope or either key is missing/empty — a branch without a resume file is
-// unusable and must not silently produce a dead fork.
+// chudcode_branch_session -> {ok, chudcode_session_id, chudcode_session_file}.
+// Desktop requires both resume fields; web requires only the opaque cell handle.
 struct ChudcodeBranchResult {
     std::string sessionId;
     std::string sessionFile;

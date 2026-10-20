@@ -37,3 +37,10 @@ Example D - taper edge from 3mm to 1mm (variable):
 1. The query goes under refs.edges (an OBJECT with "of"), not at the feature top level.
 2. Radius must be SMALLER than the thinnest wall it touches or the build fails (auto-clamp may shrink it).
 3. To discover what edges exist on a part you did not build, call the `doc_query` tool with {"of":"edge",...} first - it returns each edge's surf/centroid/axis.
+
+The final solid must pass native B-rep, zero-area-face and self-intersection checks
+before it replaces the preceding body. A kernel build alone is not success.
+An invalid result rejects the edit atomically with its native reason; inspect the
+selected edges and adjacent material before changing the radius or construction.
+Do not repeat the mutation after a result-reporting exception without reading its
+recorded reply and current tree.

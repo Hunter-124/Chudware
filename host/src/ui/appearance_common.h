@@ -66,8 +66,10 @@ float materialYoungsEMpa(const std::string& key);
 std::string materialDisplayName(const std::string& key);
 
 
-// The appearance editor popup. Returns true once on commit. See header note.
+// The appearance editor popup. Returns true once on commit. A nonempty disabledReason disables
+// Apply and immediate-apply presets without discarding the working color; Cancel remains available.
 bool appearanceColorPicker(const char* popupId, float outColor[3],
-                           float* outMetallic, float* outRoughness);
+                           float* outMetallic, float* outRoughness,
+                           const char* disabledReason = nullptr);
 
 }  // namespace ui

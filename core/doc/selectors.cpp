@@ -96,7 +96,7 @@ std::optional<Eigen::Vector3d> unit_vec(const Eigen::Vector3d& v) {
 }
 
 // I3 — the body's axis-aligned bbox CENTER (used as the outward-direction origin for
-// sphere/torus/bspline faces that have no kernel axis). Computed once per describe_faces.
+// sphere/torus/bspline faces that have no kernel axis). Computed lazily per describe/pick.
 Eigen::Vector3d bbox_center(const TopoDS_Shape& shape) {
     Bnd_Box box;
     BRepBndLib::Add(shape, box);
@@ -119,7 +119,7 @@ std::optional<Eigen::Vector3d> representative_dir(
     const std::optional<Eigen::Vector3d>& plane_axis,
     const std::optional<Eigen::Vector3d>& surf_axis,
     const std::optional<Eigen::Vector3d>& axis_loc,
-    const Eigen::Vector3d& body_center) {
+    const std::optional<Eigen::Vector3d>& body_center) {
     if (st == GeomAbs_Plane) return plane_axis;  // already the signed outward normal
     if ((st == GeomAbs_Cylinder || st == GeomAbs_Cone) && surf_axis && axis_loc) {
         const Eigen::Vector3d& d = *surf_axis;       // unit axis direction
@@ -128,8 +128,8 @@ std::optional<Eigen::Vector3d> representative_dir(
         if (auto r = unit_vec(radial)) return r;
         return surf_axis;  // centroid on the axis (degenerate) -> fall back to the axis
     }
-    // sphere / torus / bspline / other: outward from the body center.
-    return unit_vec(centroid - body_center);
+    // sphere / torus / bspline / other: outward from the lazily computed body center.
+    return unit_vec(centroid - *body_center);
 }
 
 }  // namespace
@@ -192,102 +192,114 @@ std::optional<TopoInfo::Torus> face_torus(const TopoDS_Face& f) {
         return std::nullopt;
     }
 }
+namespace {
+
+// Exact one-face descriptor shared by full-body enumeration and viewport picks.
+// The body center is cached only when a face needs the curved-surface fallback.
+TopoInfo face_info(const TopoDS_Face& face, int idx, const TopoDS_Shape& shape,
+                   std::optional<Eigen::Vector3d>& body_center) {
+    BRepAdaptor_Surface adaptor(face);
+    GeomAbs_SurfaceType st = adaptor.GetType();
+
+    // Centroid + area via surface mass properties (props.CentreOfMass()).
+    GProp_GProps props;
+    BRepGProp::SurfaceProperties(face, props);
+    double area = props.Mass();
+    gp_Pnt cm = props.CentreOfMass();
+    Eigen::Vector3d centroid(cm.X(), cm.Y(), cm.Z());
+
+    // Axis — plane normal, cylinder/cone axis only (matches the Python oracle).
+    // ORIENTATION FIX (Z2): OCCT's Plane().Axis().Direction() is the plane FRAME's Z,
+    // not the face's outward material normal: the face's topological orientation flips
+    // it (a box's REVERSED bottom face), and so does a LEFT-handed plane frame (every
+    // revolve end face — the x=0 end of a revolved shaft read +X). geom/face_normal.h
+    // applies both, so the stored axis is the SIGNED outward normal: top=[0,0,+1] and
+    // bottom=[0,0,-1] for a Z-up plate. Without it the top and bottom faces of a thin
+    // plate both stored axis=[0,0,1] and the signed-normal tie-break in resolve() could
+    // not distinguish them → "symmetric ambiguity" when fixturing the bottom face for
+    // FEA. The resolution score uses |dot(sel_axis, cand_axis)| (sign-agnostic), so the
+    // sign does NOT change the score — it only arms the signed-dot tie-break that fires
+    // when two parallel faces otherwise score identically.
+    std::optional<Eigen::Vector3d> axis;
+    std::optional<Eigen::Vector3d> plane_axis;  // I3: signed outward plane normal
+    std::optional<Eigen::Vector3d> axis_loc;    // I3: a point ON the cyl/cone axis
+    std::optional<double> radius;               // GSL Stage 0: round-geometry size (mm)
+    std::optional<bool> concave;
+    std::optional<Eigen::Vector3d> axis_point;  // cyl/cone: centroid's foot on the axis
+    try {
+        if (st == GeomAbs_Plane) {
+            axis = unit_axis(::chudware::geom::plane_outward_normal(face, adaptor.Plane()));
+            plane_axis = axis;
+        } else if (st == GeomAbs_Cylinder) {
+            gp_Ax1 ax = adaptor.Cylinder().Axis();
+            axis = unit_axis(ax.Direction());
+            axis_loc = Eigen::Vector3d(ax.Location().X(), ax.Location().Y(),
+                                       ax.Location().Z());
+            radius = adaptor.Cylinder().Radius();
+            concave = cylinder_face_concave(face);
+        } else if (st == GeomAbs_Cone) {
+            gp_Ax1 ax = adaptor.Cone().Axis();
+            axis = unit_axis(ax.Direction());
+            axis_loc = Eigen::Vector3d(ax.Location().X(), ax.Location().Y(),
+                                       ax.Location().Z());
+            radius = adaptor.Cone().RefRadius();
+        } else if (st == GeomAbs_Sphere) {
+            radius = adaptor.Sphere().Radius();
+        }
+    } catch (const Standard_Failure&) {
+        axis = std::nullopt;
+        plane_axis = std::nullopt;
+        axis_loc = std::nullopt;
+        radius = std::nullopt;
+    }
+    if (axis && axis_loc)
+        axis_point = *axis_loc + *axis * (centroid - *axis_loc).dot(*axis);
+
+    // Only the final representative_dir fallback reads the whole-body bounds.
+    if (st != GeomAbs_Plane &&
+        !((st == GeomAbs_Cylinder || st == GeomAbs_Cone) && axis && axis_loc) &&
+        !body_center)
+        body_center = bbox_center(shape);
+
+    // I3 — representative outward direction for EVERY face (plane normal / cyl-cone
+    // radial / outward-from-bbox-center). Wrapped in its own try so a kernel quirk on
+    // an exotic surface can't drop the whole descriptor.
+    std::optional<Eigen::Vector3d> rep_dir;
+    try {
+        rep_dir = representative_dir(st, centroid, plane_axis, axis, axis_loc, body_center);
+    } catch (const Standard_Failure&) {
+        rep_dir = std::nullopt;
+    }
+
+    TopoInfo info;
+    info.kind = "face";
+    info.index = idx;
+    info.surf = surf_type_string(st);
+    info.centroid = centroid;
+    info.axis = axis;
+    info.measure = area;
+    info.hint_index = idx;
+    info.rep_dir = rep_dir;
+    info.radius = radius;
+    info.concave = concave;
+    info.axis_point = axis_point;
+    info.torus = (st == GeomAbs_Torus) ? face_torus(face) : std::nullopt;
+    return info;
+}
+
+}  // namespace
+
 // --------------------------------------------------------------------------- describe_faces
 
 std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
                                      const std::map<int, std::string>& owners) {
     std::vector<TopoInfo> result;
-    // I3 — outward-direction origin for sphere/torus/bspline faces (no kernel axis).
-    const Eigen::Vector3d body_center = bbox_center(shape);
+    std::optional<Eigen::Vector3d> body_center;
     int idx = 0;
     for (TopExp_Explorer exp(shape, TopAbs_FACE); exp.More(); exp.Next(), ++idx) {
-        TopoDS_Face face = TopoDS::Face(exp.Current());
-        BRepAdaptor_Surface adaptor(face);
-        GeomAbs_SurfaceType st = adaptor.GetType();
-
-        // Centroid + area via surface mass properties (props.CentreOfMass()).
-        GProp_GProps props;
-        BRepGProp::SurfaceProperties(face, props);
-        double area = props.Mass();
-        gp_Pnt cm = props.CentreOfMass();
-        Eigen::Vector3d centroid(cm.X(), cm.Y(), cm.Z());
-
-        // Axis — plane normal, cylinder/cone axis only (matches the Python oracle).
-        // ORIENTATION FIX (Z2): OCCT's Plane().Axis().Direction() is the plane FRAME's Z,
-        // not the face's outward material normal: the face's topological orientation flips
-        // it (a box's REVERSED bottom face), and so does a LEFT-handed plane frame (every
-        // revolve end face — the x=0 end of a revolved shaft read +X). geom/face_normal.h
-        // applies both, so the stored axis is the SIGNED outward normal: top=[0,0,+1] and
-        // bottom=[0,0,-1] for a Z-up plate. Without it the top and bottom faces of a thin
-        // plate both stored axis=[0,0,1] and the signed-normal tie-break in resolve() could
-        // not distinguish them → "symmetric ambiguity" when fixturing the bottom face for
-        // FEA. The resolution score uses |dot(sel_axis, cand_axis)| (sign-agnostic), so the
-        // sign does NOT change the score — it only arms the signed-dot tie-break that fires
-        // when two parallel faces otherwise score identically.
-        std::optional<Eigen::Vector3d> axis;
-        std::optional<Eigen::Vector3d> plane_axis;  // I3: signed outward plane normal
-        std::optional<Eigen::Vector3d> axis_loc;    // I3: a point ON the cyl/cone axis
-        std::optional<double> radius;               // GSL Stage 0: round-geometry size (mm)
-        std::optional<bool> concave;
-        std::optional<Eigen::Vector3d> axis_point;  // cyl/cone: centroid's foot on the axis
-        try {
-            if (st == GeomAbs_Plane) {
-                axis = unit_axis(::chudware::geom::plane_outward_normal(face, adaptor.Plane()));
-                plane_axis = axis;
-            } else if (st == GeomAbs_Cylinder) {
-                gp_Ax1 ax = adaptor.Cylinder().Axis();
-                axis = unit_axis(ax.Direction());
-                axis_loc = Eigen::Vector3d(ax.Location().X(), ax.Location().Y(),
-                                           ax.Location().Z());
-                radius = adaptor.Cylinder().Radius();
-                concave = cylinder_face_concave(face);
-            } else if (st == GeomAbs_Cone) {
-                gp_Ax1 ax = adaptor.Cone().Axis();
-                axis = unit_axis(ax.Direction());
-                axis_loc = Eigen::Vector3d(ax.Location().X(), ax.Location().Y(),
-                                           ax.Location().Z());
-                radius = adaptor.Cone().RefRadius();
-            } else if (st == GeomAbs_Sphere) {
-                radius = adaptor.Sphere().Radius();
-            }
-        } catch (const Standard_Failure&) {
-            axis = std::nullopt;
-            plane_axis = std::nullopt;
-            axis_loc = std::nullopt;
-            radius = std::nullopt;
-        }
-        if (axis && axis_loc)
-            axis_point = *axis_loc + *axis * (centroid - *axis_loc).dot(*axis);
-
-        // I3 — representative outward direction for EVERY face (plane normal / cyl-cone
-        // radial / outward-from-bbox-center). Wrapped in its own try so a kernel quirk on
-        // an exotic surface can't drop the whole descriptor.
-        std::optional<Eigen::Vector3d> rep_dir;
-        try {
-            rep_dir = representative_dir(st, centroid, plane_axis, axis, axis_loc,
-                                         body_center);
-        } catch (const Standard_Failure&) {
-            rep_dir = std::nullopt;
-        }
-
-        std::optional<std::string> owner;
+        TopoInfo info = face_info(TopoDS::Face(exp.Current()), idx, shape, body_center);
         auto it = owners.find(idx);
-        if (it != owners.end()) owner = it->second;
-
-        TopoInfo info;
-        info.kind = "face";
-        info.index = idx;
-        info.surf = surf_type_string(st);
-        info.centroid = centroid;
-        info.axis = axis;
-        info.measure = area;
-        info.owner = owner;
-        info.hint_index = idx;
-        info.rep_dir = rep_dir;
-        info.radius = radius;
-        info.concave = concave;
-        info.axis_point = axis_point;
-        info.torus = (st == GeomAbs_Torus) ? face_torus(face) : std::nullopt;
+        if (it != owners.end()) info.owner = it->second;
         result.push_back(std::move(info));
     }
     return result;
@@ -491,7 +503,7 @@ nlohmann::json make_pick_selector(const TopoDS_Shape& shape, const std::string& 
     // centroid), so the 1-to-1 resolver dropped the colliding one: the "N selectors couldn't be
     // located" / "3-way corner only rounds 2/3" / "added edge not applied" bug. Build the
     // descriptor from the unique sub-shape at the SAME MapShapes index the tessellator used.
-    // Faces are NOT shared (Explorer order == MapShapes order), so they keep describe_faces.
+    // Faces keep their TopExp_Explorer order, but only the requested face is described.
     TopoInfo info;
     if (kind == "edge") {
         TopTools_IndexedMapOfShape m;
@@ -508,10 +520,12 @@ nlohmann::json make_pick_selector(const TopoDS_Shape& shape, const std::string& 
         info.centroid = Eigen::Vector3d(p.X(), p.Y(), p.Z());
         info.hint_index = topo_id - 1;
     } else if (kind == "face") {
-        std::vector<TopoInfo> infos = describe_faces(shape);
-        if (topo_id < 1 || topo_id > static_cast<int>(infos.size()))
-            return nlohmann::json(nullptr);
-        info = infos[topo_id - 1];
+        if (topo_id < 1) return nlohmann::json(nullptr);
+        TopExp_Explorer exp(shape, TopAbs_FACE);
+        for (int idx = 1; exp.More() && idx < topo_id; ++idx) exp.Next();
+        if (!exp.More()) return nlohmann::json(nullptr);
+        std::optional<Eigen::Vector3d> body_center;
+        info = face_info(TopoDS::Face(exp.Current()), topo_id - 1, shape, body_center);
     } else {
         return nlohmann::json(nullptr);
     }

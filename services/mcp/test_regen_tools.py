@@ -16,7 +16,7 @@ from services.agent.chudcode_host import (
     ChudcodeSessionHost,
     _set_default_chudcode_host_for_tests,
 )
-from services.agent.providers.base import ProviderUnreachable
+from services.agent.providers.base import Provider, ProviderUnreachable
 from services.agent.providers.mock_provider import MockProvider
 from services.mcp import regen_tools as RT
 from tools.flywheel.bench.corpus import regen_corpus as RC
@@ -238,3 +238,212 @@ def test_incomplete_selected_model_fails_without_runtime_default_substitution(ru
     out = RT.diagnose_failed_document(doc)
     assert not out["ok"] and "needs both provider and model" in out["reason"]
     assert not clients
+
+
+def _failed_candidate():
+    return {"revision": 7, "tree": {"schema": "aicad.part/1", "name": "Wrist",
+            "features": [
+                {"id": "f25", "type": "box", "name": "Base",
+                 "params": {"length": 10, "width": 10, "height": 10}, "refs": {}},
+                {"id": "f61", "type": "fillet", "name": "Ramp apron end cove",
+                 "params": {"radius": {"value": 1, "expr": None}},
+                 "refs": {"edges": [{"of": "edge", "surf": "line", "parallel": "y",
+                                    "near": [-19, 0, 268], "count": 1}]}}],
+            "equations": {"globals": []}},
+            "rebuild": {"feature_status": [{"id": "f61", "ok": False,
+                         "error": "fillet: radius exceeds local clearance"}]}}
+
+
+@pytest.mark.parametrize("model_state", ["available", "unavailable", "unreachable"])
+def test_rejected_candidate_preview_keeps_native_feature_and_error(monkeypatch, model_state):
+    from services.mcp import cad_doc_tools as CT
+    from services.mcp import core_bridge as cb
+    from services.mcp import preflight_tools
+    import copy
+
+    class Tools:
+        def __init__(self):
+            self.functions = {}
+
+        def tool(self, *args, **kwargs):
+            def register(fn):
+                self.functions[fn.__name__] = fn
+                return fn
+            return register
+
+    tools = Tools()
+    CT.register_cad_doc_tools(tools)
+    candidate = _failed_candidate()
+    rollback = {"revision": 6, "tree": copy.deepcopy(candidate["tree"])}
+    rollback["tree"]["features"].pop()
+    original = copy.deepcopy(rollback)
+    calls = []
+    prompts = []
+
+    def engine(method, params):
+        calls.append(method)
+        if method == "doc_checkpoint":
+            return {"checkpoint": "before"}
+        if method == "doc_apply_ops":
+            return {**copy.deepcopy(rollback), "rejected_tree": candidate["tree"],
+                    "rebuild": candidate["rebuild"], "id_map": {"$0": "f61"}}
+        if method == "doc_revert":
+            pytest.fail("native atomic rejection must not mutate the restored document")
+        return {}
+
+    class EvidenceProvider(Provider):
+        def complete(self, system, messages, max_tokens=8000):
+            if model_state == "unreachable":
+                raise ProviderUnreachable("diagnostic provider unreachable")
+            prompts.append(json.loads(messages[-1]["content"][0]["text"].split("\n", 1)[1]))
+            return json.dumps({"diagnosis": "Native fillet failure; no inferred fix", "fix_ops": []})
+
+    def resolve_provider(*args):
+        if model_state == "unavailable":
+            raise ProviderUnreachable("diagnostic provider unavailable")
+        return EvidenceProvider()
+
+    monkeypatch.setattr(cb, "call", engine)
+    monkeypatch.setattr(CT, "_doc", lambda doc_id: doc_id)
+    monkeypatch.setattr(CT, "_face_hist", lambda doc_id: {})
+    monkeypatch.setattr(CT, "_publish_current", lambda doc_id: None)
+    monkeypatch.setattr(CT, "_solve_sync_or_handoff", lambda name, fn: fn())
+    monkeypatch.setattr(preflight_tools, "run_auto_preflight", lambda *args: {})
+    monkeypatch.setattr(RT, "_resolve_provider", resolve_provider)
+    monkeypatch.setattr(RT, "_journal_sink", lambda: lambda event: None)
+    monkeypatch.setattr(RT, "_verify", lambda *args: (None, {}))
+    result = json.loads(tools.functions["add_features"](
+        doc_id="live", ops=[{"op": "add_feature", "feature": candidate["tree"]["features"][-1]}]))
+    assert result["ok"] is False and result["rolled_back"] is True
+    assert rollback == original
+    assert "doc_revert" not in calls
+    failure = result["regen_diagnosis"]["failures"][-1]
+    assert failure["feature"] == "f61"
+    assert failure["detail"] == candidate["rebuild"]["feature_status"][0]["error"]
+    assert failure["options"]["name"] == "Ramp apron end cove"
+    if model_state == "available":
+        assert result["regen_diagnosis"]["kind"] == "fix_preview_card"
+        assert prompts[0]["features"][-1] == candidate["tree"]["features"][-1] | {"suppressed": False}
+        assert "f61 (Ramp apron end cove)" in prompts[0]["engine_error"]
+    else:
+        assert result["regen_diagnosis"]["ok"] is False
+        assert model_state in result["regen_diagnosis"]["reason"]
+        assert not prompts
+
+
+def test_native_failure_survives_unavailable_model_and_verifier(monkeypatch):
+    doc = _failed_candidate()
+    monkeypatch.setattr(RT, "_resolve_provider", lambda *args: (_ for _ in ()).throw(
+        ProviderUnreachable("no model")))
+    out = RT.diagnose_failed_document(doc)
+    assert out["ok"] is False and out["failures"][-1]["feature"] == "f61"
+    from tools.flywheel.bench.benches import regen_fix as RF
+    monkeypatch.setattr(RF, "_make_live_verifier", lambda: (None, None))
+    score, detail = RT._verify(doc, SimpleNamespace(n_applied=1, fixed_document=doc), None)
+    assert score is None and detail["mode"] == "unavailable"
+
+
+@pytest.mark.parametrize("outcome", ["success", "native_failure", "validation_failure"])
+def test_live_verifier_supported_ops_sparse_ids_and_cleanup(monkeypatch, outcome):
+    import copy
+    from services.mcp import core_bridge as cb
+    from tools.flywheel.bench.benches import regen_fix as RF
+    doc = _failed_candidate()
+    doc["tree"]["features"][0]["readback_only"] = True
+    doc["tree"]["features"][1]["refs"]["edges"][0]["owner_feature"] = "f25"
+    original = copy.deepcopy(doc)
+    calls = []
+
+    def engine(method, params):
+        calls.append((method, params))
+        if method == "doc_new":
+            assert params["internal"] is True
+            return {"doc_id": "scratch"}
+        if method == "doc_apply_ops":
+            assert params["doc_id"] == "scratch"
+            assert params["with_tess"] is False
+            features = [op["feature"] for op in params["ops"] if op["op"] == "add_feature"]
+            assert set(features[0]) == {"type", "name", "params", "refs"}
+            assert features[1]["refs"]["edges"][0]["owner_feature"] == "$0"
+            if outcome == "validation_failure":
+                raise cb.CoreError("invalid candidate", code="invalid_op")
+            return {"id_map": {"$0": "f1", "$1": "f2"}, "rebuild": {"feature_status": [
+                {"id": "f2", "ok": outcome == "success", "error": "native fillet error"}]}}
+        if method == "doc_close":
+            assert params == {"doc_id": "scratch"}
+            return {"closed": True}
+        pytest.fail(f"unsupported verifier method {method}")
+
+    monkeypatch.setattr(cb, "available", lambda: True)
+    monkeypatch.setattr(cb, "call", engine)
+    opener, _compare = RF._make_live_verifier()
+    result = opener(doc)
+    if outcome == "success":
+        opener.close(result["doc_id"])
+    else:
+        assert result["rebuilt"] is False and result["doc_id"] is None
+        if outcome == "native_failure":
+            assert result["error"] == "f61: native fillet error"
+    assert calls[-1][0] == "doc_close"
+    assert sum(method == "doc_close" for method, _ in calls) == 1
+    assert doc == original
+
+
+def test_live_verifier_compare_cleanup(monkeypatch):
+    from tools.flywheel.bench.benches import regen_fix as RF
+    closed = []
+    opened = []
+
+    def opener(document):
+        doc_id = f"scratch-{len(opened)}"
+        opened.append(doc_id)
+        return {"doc_id": doc_id, "rebuilt": True}
+
+    opener.close = closed.append
+    RF.verify_fix(_failed_candidate(), True, {}, good_document=_failed_candidate(),
+                  opener=opener, compare_fn=lambda *args: None)
+    assert closed == opened and len(closed) == 2
+
+
+def test_live_rejected_candidate_and_verifier_smoke(monkeypatch):
+    """Provider-independent runtime repro; only test-owned hidden documents are touched."""
+    from services.mcp import core_bridge as cb
+    from tools.flywheel.bench.benches import regen_fix as RF
+    if not cb.available():
+        pytest.skip("native engine unavailable")
+    doc_id = cb.call("doc_new", {"kind": "part", "name": "regen_smoke", "internal": True})["doc_id"]
+    try:
+        cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": [{"op": "add_feature", "feature": {
+            "type": "box", "name": "Block", "params": {"length": 10, "width": 10, "height": 10}}}]})
+        before = cb.call("doc_tree", {"doc_id": doc_id})
+        failed = cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": [{"op": "add_feature", "feature": {
+            "type": "fillet", "name": "Rejected cove", "params": {"radius": {"value": 1000, "expr": None}},
+            "refs": {"edges": [{"of": "edge", "surf": "line", "count": 1,
+                               "near": [5, 5, 0]}]}}}], "with_tess": False})
+        statuses = failed["rebuild"]["feature_status"]
+        native = next(status for status in statuses if not status["ok"])
+        candidate = {"tree": failed["rejected_tree"], "rebuild": failed["rebuild"]}
+        assert candidate["tree"]["features"][-1]["id"] == native["id"]
+        assert candidate["tree"]["features"][-1]["name"] == "Rejected cove"
+        assert cb.call("doc_tree", {"doc_id": doc_id}) == before
+        monkeypatch.setattr(RT, "_resolve_provider", lambda *args: (_ for _ in ()).throw(
+            ProviderUnreachable("smoke deliberately has no provider")))
+        diagnostic = RT.diagnose_failed_document(candidate)
+        assert any(f["feature"] == native["id"] and f["detail"] == native["error"]
+                   for f in diagnostic["failures"])
+        opener, compare = RF._make_live_verifier()
+        temporary_before = {row["doc_id"] for row in cb.call("doc_list", {})["docs"]}
+        reopened = opener(candidate)
+        try:
+            assert reopened["rebuilt"] is False and "unknown_param" not in reopened["error"]
+            assert native["id"] in reopened["error"]
+        finally:
+            if reopened.get("doc_id"):
+                opener.close(reopened["doc_id"])
+        score, passed, detail = RF.verify_fix(
+            before, True, {}, good_document=before, opener=opener, compare_fn=compare)
+        assert score == 1 and passed and detail["rebuilt"] is True
+        assert cb.call("doc_tree", {"doc_id": doc_id}) == before
+        assert {row["doc_id"] for row in cb.call("doc_list", {})["docs"]} == temporary_before
+    finally:
+        cb.call("doc_close", {"doc_id": doc_id})

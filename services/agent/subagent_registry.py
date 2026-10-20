@@ -45,11 +45,13 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
-from services.agent import raw_log
+from services.agent import raw_log, request_context
+from services import paths
 
 SCHEMA = "aicad.subagent_session/1"
 RAW_SCHEMA = "chudware.subagent.raw/1"
@@ -116,13 +118,15 @@ def resolve_project_dir(start: str | Path | None = None) -> str:
     its outermost marked project root.
     """
     for candidate in (
-        os.environ.get("CHUDWARE_PROJECT_DIR"),
-        os.environ.get("CHUDWARE_FS_ROOT"),
-        start,
+        request_context.root_value("CHUDWARE_PROJECT_DIR"),
+        request_context.root_value("CHUDWARE_FS_ROOT"),
+        None if request_context.in_cell() else start,
     ):
         explicit = str(candidate or "").strip()
         if explicit:
             return os.path.realpath(os.path.expanduser(explicit))
+    if request_context.in_cell():
+        return "/work"
     from services.agent.config import workspace_dir
     from services.agent.project_context import resolve_project_root
     return os.path.realpath(
@@ -148,6 +152,9 @@ _CONTROL_DEFAULTS = {
 
 _BOUND_SESSION_ID = ""
 _BOUND_TRANSCRIPT_DIR = ""
+_CELL_BINDING: ContextVar[tuple[object, str, str] | None] = ContextVar(
+    "subagent_session_binding", default=None
+)
 
 
 def _default_control_state(meta: dict) -> dict:
@@ -163,6 +170,10 @@ def _default_control_state(meta: dict) -> dict:
 
 def subagents_dir() -> Path:
     """The registry directory (created on demand).  Env-overridable for tests."""
+    if request_context.in_cell():
+        p = paths.actor_root() / "subagents"
+        p.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return p
     env = os.environ.get("CHUDWARE_SUBAGENTS_DIR")
     if env:
         p = Path(env)
@@ -181,6 +192,9 @@ def bind_session(session_id: str, transcript_dir: str) -> None:
 
     Passing empty strings clears the binding.
     """
+    if request_context.in_cell():
+        _CELL_BINDING.set((request_context.owner_key(), str(session_id or "").strip(), ""))
+        return
     global _BOUND_SESSION_ID, _BOUND_TRANSCRIPT_DIR
     _BOUND_SESSION_ID = str(session_id or "").strip()
     directory = str(transcript_dir or "").strip()
@@ -191,19 +205,30 @@ def bind_session(session_id: str, transcript_dir: str) -> None:
 
 def bound_session() -> tuple[str, Path | None]:
     """Return the process-bound owning session and sub-agent transcript dir."""
+    if request_context.in_cell():
+        binding = _CELL_BINDING.get()
+        if binding is None or not request_context.owns(binding[0]):
+            return "", None
+        return binding[1], None
     directory = Path(_BOUND_TRANSCRIPT_DIR) if _BOUND_TRANSCRIPT_DIR else None
     return _BOUND_SESSION_ID, directory
 
 
 def _meta_path(subagent_id: str) -> Path:
+    if request_context.in_cell():
+        return paths.private_path("subagents", subagent_id).with_suffix(".json")
     return subagents_dir() / f"{subagent_id}.json"
 
 
 def _transcript_path(subagent_id: str) -> Path:
+    if request_context.in_cell():
+        return _meta_path(subagent_id).with_suffix(".transcript.jsonl")
     return subagents_dir() / f"{subagent_id}.transcript.jsonl"
 
 
 def _steer_path(subagent_id: str) -> Path:
+    if request_context.in_cell():
+        return _meta_path(subagent_id).with_suffix(".steer.jsonl")
     return subagents_dir() / f"{subagent_id}.steer.jsonl"
 
 
@@ -213,8 +238,14 @@ def _now() -> str:
 
 def _safe_id(subagent_id: str) -> str:
     """Reject path-traversal-shaped ids (registry files are keyed by id)."""
+    if request_context.in_cell() and (
+            not isinstance(subagent_id, str) or "\x00" in subagent_id
+            or subagent_id != subagent_id.strip()):
+        raise KeyError("not_found")
     sid = str(subagent_id or "").strip()
     if not sid or "/" in sid or "\\" in sid or ".." in sid:
+        if request_context.in_cell():
+            raise KeyError("not_found")
         raise ValueError(f"invalid subagent_id: {subagent_id!r}")
     return sid
 
@@ -225,6 +256,8 @@ def _write_meta(subagent_id: str, meta: dict) -> None:
     Callers that derive *meta* from the stored record must hold ``_meta_lock``
     (use ``_update_meta``); a bare call is only for a record nobody else writes.
     """
+    if request_context.in_cell() and meta.get("tenant_owner") != list(request_context.owner_key()):
+        raise KeyError("not_found")
     path = _meta_path(subagent_id)
     tmp = path.with_suffix(f".tmp{os.getpid()}")
     tmp.write_text(json.dumps(meta, indent=1, default=str), encoding="utf-8")
@@ -243,7 +276,7 @@ def _meta_lock(subagent_id: str) -> Iterator[None]:
     plus a process-local lock so this process's threads queue before the file.
     Not re-entrant — never acquire it while already holding it.
     """
-    path = subagents_dir() / f"{subagent_id}.lock"
+    path = _meta_path(subagent_id).with_suffix(".lock")
     with _META_THREAD_LOCK:
         with open(path, "a+b") as lock:
             if os.name == "nt":
@@ -277,6 +310,8 @@ def _update_meta(subagent_id: str, mutate: Callable[[dict], Any]) -> Optional[di
         return None
     with _meta_lock(sid):
         meta = get_session(sid)
+        if meta is None and request_context.in_cell():
+            raise KeyError("not_found")
         if meta is None or mutate(meta) is False:
             return None
         _write_meta(sid, meta)
@@ -315,7 +350,7 @@ def _read_lines(path: Path) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def register_session(
-    subagent_id: str,
+    subagent_id: str | None = None,
     *,
     role: str,
     brief: str = "",
@@ -330,8 +365,8 @@ def register_session(
     transcript_dir: str = "",
     project_dir: str | Path | None = None,
 ) -> dict:
-    """Create (or refresh) a session record.  Returns the stored metadata dict."""
-    sid = _safe_id(subagent_id)
+    """Mint a new cell session; desktop retains caller-keyed create/refresh."""
+    sid = f"dg_{uuid.uuid4().hex}" if request_context.in_cell() else _safe_id(subagent_id)
     with _meta_lock(sid):
         return _register_locked(
             sid, role=role, brief=brief, spawn_kind=spawn_kind,
@@ -346,9 +381,12 @@ def _register_locked(sid: str, *, role, brief, spawn_kind, parent_run_id,
                      parent_node_id, requested_by, model, budget_tokens, status,
                      session_id, transcript_dir, project_dir) -> dict:
     existing = get_session(sid) or {}
-    owner_session_id = str(session_id or _BOUND_SESSION_ID).strip()
-    owner_dir = str(transcript_dir or _BOUND_TRANSCRIPT_DIR).strip()
-    if owner_dir:
+    bound_id, bound_dir = bound_session()
+    owner_session_id = str(session_id or bound_id).strip()
+    owner_dir = str(transcript_dir or bound_dir or "").strip()
+    if request_context.in_cell():
+        raw_transcript_path = _meta_path(sid).with_suffix(".raw.jsonl")
+    elif owner_dir:
         raw_transcript_path = (
             Path(owner_dir).expanduser().resolve() / f"{sid}.jsonl"
         )
@@ -356,6 +394,7 @@ def _register_locked(sid: str, *, role, brief, spawn_kind, parent_run_id,
         raw_transcript_path = (subagents_dir() / f"{sid}.raw.jsonl").resolve()
     meta = {
         "schema": SCHEMA,
+        **({"tenant_owner": list(request_context.owner_key())} if request_context.in_cell() else {}),
         "id": sid,
         "role": role,
         "brief": str(brief)[:500],
@@ -394,9 +433,13 @@ def get_session(subagent_id: str) -> Optional[dict]:
         return None
     try:
         meta = json.loads(path.read_text(encoding="utf-8"))
-        return _default_control_state(meta) if isinstance(meta, dict) else None
     except Exception:  # noqa: BLE001
         return None
+    if not isinstance(meta, dict):
+        return None
+    if request_context.in_cell() and meta.get("tenant_owner") != list(request_context.owner_key()):
+        return None
+    return _default_control_state(meta)
 
 
 def set_status(subagent_id: str, status: str, *, note: str = "") -> bool:
@@ -420,7 +463,8 @@ def list_sessions(limit: int = 50, *, project_dir: str | None = None) -> list[di
     )
     sessions: list[dict] = []
     try:
-        for p in subagents_dir().glob("*.json"):
+        directory = paths.actor_root() / "subagents" if request_context.in_cell() else subagents_dir()
+        for p in directory.glob("*.json"):
             if p.suffixes[-2:-1] == [".tmp"]:
                 continue
             try:
@@ -428,6 +472,8 @@ def list_sessions(limit: int = 50, *, project_dir: str | None = None) -> list[di
             except Exception:  # noqa: BLE001
                 continue
             if not isinstance(meta, dict) or meta.get("schema") != SCHEMA:
+                continue
+            if request_context.in_cell() and meta.get("tenant_owner") != list(request_context.owner_key()):
                 continue
             sid = meta.get("id", "")
             _default_control_state(meta)
@@ -467,6 +513,8 @@ def list_sessions(limit: int = 50, *, project_dir: str | None = None) -> list[di
 def append_transcript(subagent_id: str, who: str, text: str, **meta: Any) -> None:
     """Append one transcript record.  *who* ∈ {"user","subagent","system"}."""
     sid = _safe_id(subagent_id)
+    if request_context.in_cell() and get_session(sid) is None:
+        raise KeyError("not_found")
     rec = {"ts": _now(), "who": who, "text": str(text)}
     if meta:
         rec.update(meta)
@@ -480,6 +528,8 @@ def get_transcript(subagent_id: str, limit: int = 200) -> list[dict]:
         sid = _safe_id(subagent_id)
     except ValueError:
         return []
+    if request_context.in_cell() and get_session(sid) is None:
+        raise KeyError("not_found")
     recs = _read_lines(_transcript_path(sid))
     return recs[-max(1, int(limit)):]
 
@@ -488,8 +538,12 @@ def raw_path(subagent_id: str) -> Path | None:
     """Return the absolute lossless-log path for a registered sub-agent."""
     meta = get_session(subagent_id)
     if meta is None:
+        if request_context.in_cell():
+            raise KeyError("not_found")
         return None
     value = str(meta.get("raw_transcript_path", "")).strip()
+    if request_context.in_cell():
+        return _meta_path(subagent_id).with_suffix(".raw.jsonl")
     return Path(value) if value else None
 
 
@@ -511,6 +565,8 @@ def append_raw(subagent_id: str, record: dict) -> None:
             "run_id": str(meta.get("parent_run_id", "")),
             "created_ts": time.time(),
         })
+    except KeyError:
+        raise
     except Exception:  # noqa: BLE001 — raw persistence must not break the turn
         return
 
@@ -524,6 +580,8 @@ def read_raw(
     try:
         path = raw_path(subagent_id)
         return raw_log.read(path, limit=limit, offset=offset) if path else []
+    except KeyError:
+        raise
     except Exception:  # noqa: BLE001 — registry reads are best-effort
         return []
 
@@ -539,6 +597,8 @@ def queue_steer(subagent_id: str, text: str, *, source: str = "user") -> dict:
     (``consume_steers`` inside ``agent_turn.run_turn``) — nothing is interrupted.
     """
     sid = _safe_id(subagent_id)
+    if request_context.in_cell() and get_session(sid) is None:
+        raise KeyError("not_found")
     if not str(text).strip():
         raise ValueError("steer text must be non-empty")
     rec = {
@@ -558,6 +618,8 @@ def pending_steers(subagent_id: str) -> list[dict]:
         sid = _safe_id(subagent_id)
     except ValueError:
         return []
+    if request_context.in_cell() and get_session(sid) is None:
+        raise KeyError("not_found")
     consumed: set[str] = set()
     steers: list[dict] = []
     for rec in _read_lines(_steer_path(sid)):
@@ -650,6 +712,8 @@ def request_terminate(subagent_id: str) -> bool:
 
 def terminate_requested(subagent_id: str) -> bool:
     meta = get_session(subagent_id)
+    if meta is None and request_context.in_cell():
+        raise KeyError("not_found")
     return bool(meta and meta.get("terminate_requested"))
 
 
@@ -663,6 +727,8 @@ def set_paused(subagent_id: str, paused: bool) -> bool:
 
 def is_paused(subagent_id: str) -> bool:
     meta = get_session(subagent_id)
+    if meta is None and request_context.in_cell():
+        raise KeyError("not_found")
     return bool(meta and meta.get("paused"))
 
 
@@ -698,6 +764,8 @@ def set_runtime_override(
 
 def runtime_override(subagent_id: str) -> dict:
     meta = get_session(subagent_id) or {}
+    if not meta and request_context.in_cell():
+        raise KeyError("not_found")
     return {
         "model": str(meta.get("model_override", "")),
         "provider": str(meta.get("provider_override", "")),

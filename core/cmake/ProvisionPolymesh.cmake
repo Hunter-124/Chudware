@@ -76,7 +76,7 @@ if(NOT _pm_root_is_override)
   set(_pm_need_checkout TRUE)
   if(EXISTS "${_pm_src}/CMakeLists.txt" AND EXISTS "${_pm_src}/.git")
     execute_process(
-      COMMAND "${GIT_EXECUTABLE}" -C "${_pm_src}" rev-parse HEAD
+      COMMAND "${GIT_EXECUTABLE}" --no-replace-objects -C "${_pm_src}" rev-parse HEAD
       RESULT_VARIABLE _pm_head_rc
       OUTPUT_VARIABLE _pm_head
       OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -104,7 +104,7 @@ if(NOT _pm_root_is_override)
     if(_pm_rc EQUAL 0)
       foreach(_pm_patched IN LISTS _pm_managed_patch_files)
         execute_process(
-          COMMAND "${GIT_EXECUTABLE}" -C "${_pm_src}" checkout -q -- "${_pm_patched}"
+          COMMAND "${GIT_EXECUTABLE}" --no-replace-objects -C "${_pm_src}" -c core.hooksPath= checkout -q -- "${_pm_patched}"
           RESULT_VARIABLE _pm_restore_rc OUTPUT_QUIET ERROR_QUIET)
       endforeach()
     endif()
@@ -114,15 +114,16 @@ if(NOT _pm_root_is_override)
       # intact while the advisor's small ONNX/JSON artifacts check out normally.
       execute_process(
         COMMAND "${CMAKE_COMMAND}" -E env GIT_LFS_SKIP_SMUDGE=1
-                "${GIT_EXECUTABLE}" -C "${_pm_src}" fetch --depth 1
+                "${GIT_EXECUTABLE}" --no-replace-objects -C "${_pm_src}" -c http.sslVerify=true
+                -c credential.helper= -c core.hooksPath= fetch --depth 1
                 "${POLYMESH_REPOSITORY}" "${POLYMESH_COMMIT}"
         RESULT_VARIABLE _pm_rc)
     endif()
     if(_pm_rc EQUAL 0)
       execute_process(
         COMMAND "${CMAKE_COMMAND}" -E env GIT_LFS_SKIP_SMUDGE=1
-                "${GIT_EXECUTABLE}" -C "${_pm_src}" -c filter.lfs.smudge=
-                -c filter.lfs.required=false checkout -q --detach FETCH_HEAD
+                "${GIT_EXECUTABLE}" --no-replace-objects -C "${_pm_src}" -c core.hooksPath=
+                -c filter.lfs.smudge= -c filter.lfs.required=false checkout -q --detach FETCH_HEAD
         RESULT_VARIABLE _pm_rc)
     endif()
     if(NOT _pm_rc EQUAL 0)
@@ -130,6 +131,19 @@ if(NOT _pm_root_is_override)
         "[polymesh] fetch/checkout of ${POLYMESH_COMMIT} from "
         "${POLYMESH_REPOSITORY} failed (${_pm_rc}); local changes were not removed")
     endif()
+  endif()
+  # Replacement refs can make a pinned commit name resolve to other objects, and
+  # unmanaged worktree edits are not the pinned source. Only the module's own
+  # managed patch may differ from authenticated HEAD.
+  chudware_require_pinned_git("${_pm_src}" "${POLYMESH_COMMIT}")
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" --no-replace-objects -C "${_pm_src}" status --porcelain=v1
+            --untracked-files=all
+    RESULT_VARIABLE _pm_status_rc OUTPUT_VARIABLE _pm_status OUTPUT_STRIP_TRAILING_WHITESPACE)
+  string(REPLACE " M src/advisor/CMakeLists.txt" "" _pm_status "${_pm_status}")
+  string(STRIP "${_pm_status}" _pm_status)
+  if(NOT _pm_status_rc EQUAL 0 OR _pm_status)
+    message(FATAL_ERROR "[polymesh] managed checkout differs from pinned source: ${_pm_status}")
   endif()
   message(STATUS
     "Polyhedral-FEA: PINNED FETCH ${POLYMESH_REPOSITORY} @ ${POLYMESH_COMMIT}")

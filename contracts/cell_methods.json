@@ -1,0 +1,3322 @@
+{
+  "__hostd_test_stall": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "agent_admin_turn": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_answer": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_answer_question": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_ask_v2": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_b64_file": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_build_ask_prompt": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_build_context": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_build_doc_context": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_build_request": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_cancel": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_cap_raw": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_clarify": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_clarify_v1": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_complete": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_digest_params": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_digest_tree": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_err_sig": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_est_tokens": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_extract_ops": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_extract_revert": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_extract_script": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_feature_status_errors": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_first_balanced": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_get_prompts_v2": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_handles_new": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_host_is_loopback": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_list": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "actor"
+  },
+  "agent_list_models": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_load_cheatsheet": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_load_prompt": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_looks_like_edit": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_micro_normalize_steps": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_micro_summarize_doc": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_micro_verify_step": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_mission_v1": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_normalize_base_url": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_offline_safe": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_parse_response": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_pm_assist": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_pm_assist_v1": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_pm_build_prompt": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_pm_coerce": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_pm_extract_json": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_pm_heuristic_plan": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_pm_validate_plan": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_prompt_hash": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_resolve_provider": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_role_of": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_run": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_run_design": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_run_event": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "agent_run_events_batch": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "agent_run_events_read": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_run_machine": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "actor"
+  },
+  "agent_run_micro": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_run_v2": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_script_escape_op": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_should_engage": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "agent_simulate_v1": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_spawn": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "actor"
+  },
+  "agent_steer": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "agent_stop": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "actor"
+  },
+  "agent_test_stall": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "actor"
+  },
+  "ai_prompt_baseline": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "ai_prompt_preview": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "ai_prompt_warm": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "ai_roles_get": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "ai_roles_set": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "ai_tool_catalog": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "ai_tool_preview": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "aicm_disp_chunk": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "aicm_scalar_chunk": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "asm_world_bodies": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "attach_doc": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "bearing_life": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "bench_categories": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "bench_run": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "bench_status": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "bom_price": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "bom_rollup": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "box_notify_save": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "box_oauth_login": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "box_status": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "box_sync": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "browser_session_import": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "browser_start_url": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "cad_graph_assembly_tree": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cad_graph_blast": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cad_graph_changes": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cad_graph_config_get": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "cad_graph_config_set": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cad_graph_get": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cad_graph_keyword_add": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cad_graph_keyword_list": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "cad_graph_keyword_remove": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cad_graph_link_add": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cad_graph_link_list": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "cad_graph_link_remove": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cad_graph_neighbors": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cad_graph_path": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cad_graph_search": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cad_graph_watch_add": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cad_graph_watch_list": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "cad_graph_watch_remove": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cam_apply_ops": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cam_audit": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "cam_close": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cam_describe": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "cam_extract": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "cam_extract_from_doc": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "cam_feeds": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "cam_generate": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cam_generate_inline": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cam_machines": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "cam_materials": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "cam_new": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cam_op_types": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "cam_open": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cam_post": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cam_post_dialects": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "cam_post_inline": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cam_program": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cam_redo": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cam_save": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cam_setup_sheet": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cam_simulate": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "workspace"
+  },
+  "cam_tool_types": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "cam_tree": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "cam_undo": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "cell_census": {
+    "cell": "refuse",
+    "right": "manage",
+    "scope": "workspace"
+  },
+  "cell_drain": {
+    "cell": "refuse",
+    "right": "manage",
+    "scope": "workspace"
+  },
+  "chudcode_auth_state": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "chudcode_branch_session": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "chudcode_close_session": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "chudcode_compact": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "chudcode_export_session": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "chudcode_login": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "chudcode_logout": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "chudcode_models_list": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "chudcode_provider_list": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "chudcode_remove_key": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "chudcode_repair_session": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "chudcode_rewind_session": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "chudcode_session_stats": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "chudcode_set_auto_compaction": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "chudcode_set_auto_retry": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "chudcode_set_key": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "chudcode_stt_cancel": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "chudcode_stt_start": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "chudcode_stt_status": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "chudcode_stt_stop": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "chudcode_tool_state": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "chudcode_validate_key": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "config_activate": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "config_add": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "config_delete": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "config_list": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "config_set_override": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "config_set_suppression": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "daemon_drain": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "daemon_status": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "dag_abort": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "dag_approve": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "dag_status": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "describe_reveng_result": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "detach_doc": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "dfm_fit_clearance": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "dfm_get_profile": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "dfm_known_processes": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "dfm_modeled_dim": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "dfm_process_block_text": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "dfm_resolve_process": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_activate": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_adjacency": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_apply_ops": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_bbox": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_checkpoint": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_clear_history": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_close": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_compile_cpp": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "workspace"
+  },
+  "doc_dep_notify": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_dep_query": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_dep_register": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_dep_unregister": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_discard": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_drawing_views": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_dry_run_ops": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_export_step": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_face_edges": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_face_points": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_face_wires": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_file_operations": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_formats": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_get_meta": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_list": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_list_ops": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_new": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_open": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_push_pull": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_query": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_rebuild": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_redo": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_refresh_derived": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_render_contact_sheet": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_render_diff": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_render_png": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_render_view": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_resolve_pick": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_revert": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_save": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_set_display_quality": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_set_explode_state": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_set_meta": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_set_name": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_sketch_overview": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_sketch_regions": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_snapshot": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_solve_mates": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_tree": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_undo": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "doc_validate": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_view_metrics": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "drawing_add_callout": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_add_chamfer_dimension": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_add_datum": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_add_datum_target": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_add_detail": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_add_dim": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_add_gdt": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_add_ordinate_dimensions": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_add_section": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_add_sheet": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_add_surface_finish": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_add_table": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_add_view": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_add_weld": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_arrange": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_auto_balloon": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_bom": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "drawing_close": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_export": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_get": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "drawing_list_sheets": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "drawing_make": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_model_items": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "drawing_new": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_open_standalone": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_remove_annotation": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_remove_view": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_render_png": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "drawing_save_standalone": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_set_active_sheet": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_set_annotation": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_set_sheet": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_set_source": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_set_titleblock": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_set_units": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "drawing_set_view": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "duct_size": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "ecad_apply_ops": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "ecad_autoroute": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "ecad_close": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "ecad_closest_recipe": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "ecad_describe": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "ecad_design": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "workspace"
+  },
+  "ecad_dfm": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "ecad_export": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "ecad_fill_zones": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "ecad_impedance": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "ecad_list_ops": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "ecad_load_symbol_library": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "ecad_new": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "ecad_open": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "ecad_rebuild": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "ecad_recipe": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "ecad_redo": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "ecad_resolve_pick": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "ecad_route_diff_pair": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "ecad_save": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "ecad_schema": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "ecad_simulate": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "ecad_swap_doc": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "ecad_symbols": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "ecad_thermal_handoff": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "workspace"
+  },
+  "ecad_to_3d": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "ecad_tree": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "ecad_undo": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "ecad_update_from_sch": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "edit_hold": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "edit_release": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "em_driven": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "em_eigenmode": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "em_status": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "em_timedomain": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "estimate_made_cost": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "eval_check": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "eval_compare": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "eval_curvature": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "eval_draft": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "eval_feature_attachment": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "eval_feature_overlap": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "eval_fit_cylinder": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "eval_geometry_analysis": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "eval_interference": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "eval_mass": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "eval_measure": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "eval_model_integrity": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "eval_section_props": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "eval_solid_health": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "eval_symmetry": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "eval_thickness": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "export2d_drawing": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "export_drawing": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "export_file": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "export_flat_dxf": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "export_reveng_bundle": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "export_tess_estimate": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "fw_avr_flash": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_build": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_debug_gdb_halt": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_debug_gdb_read_mem": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_debug_gdb_reset": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_debug_gdb_set_breakpoint": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_debug_gdb_step": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_debug_halt": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_debug_read_mem": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_debug_start": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_emulate_renode": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_emulate_simavr": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_flash": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_new_project": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_power_profile": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_projects": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_sensor_scenario": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_serial_close": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_serial_open": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_serial_read": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_serial_write": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_sim_run": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_sources": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_status": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "fw_verify_board": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "gear_check": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "get_prompts_v2": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "get_reveng_coverage": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "get_reveng_deviation": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "get_reveng_session": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "git_branch_create": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "git_branches": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "git_checkout": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "git_commit": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "git_diff": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "git_fetch": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "git_gh_auth_login": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "git_gh_auth_status": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "git_init": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "git_is_repo": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "git_issue_list": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "git_log": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "git_pr_list": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "git_pull": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "git_push": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "git_remotes": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "git_repo_info": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "git_show": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "git_stage": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "git_status": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "git_tree": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "git_unstage": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "heatsink_select": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "hello": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "hydraulic_add_component": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "hydraulic_add_hose": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "hydraulic_bom": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "hydraulic_fea_handoff": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "hydraulic_new": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "hydraulic_piping_handoff": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "hydraulic_simulate": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "workspace"
+  },
+  "hydraulic_size_accumulator": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "hydraulic_size_cylinder": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "hydraulic_size_motor": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "hydraulic_size_pump": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "hydraulic_templates": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "hydraulic_valve_flow": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "hydraulic_verify_fea": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "hydraulic_verify_piping": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "import_file": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "import_scan_mesh": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "list_artifacts": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "list_editable_prompts": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "list_reveng_dims": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "list_reveng_sessions": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "list_spec_templates": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "login_wizard_next": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "login_wizard_start": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "login_wizard_status": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "login_wizard_stop": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "match_part_number": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "material_all": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "material_cam_data": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "material_cam_id": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "material_cam_materials": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "material_density": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "material_fea_aliases": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "material_fea_table": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "material_get": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "material_resolve_key": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "memory_recall": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "memory_remember": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "memory_stats": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "mesh_read_raw": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "mfg_approval_create": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_approval_inspect": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_approval_propose": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_approval_revoke": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_artifact_register": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_attention_ack": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_attention_delivery": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_attention_list": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_attention_raise": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_attention_resolve": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_device_capability": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_device_claim": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_device_connect": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_device_describe": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_device_disconnect": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_device_heartbeat": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_device_list": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_device_release": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_emulator_fault_inject": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_gate_report": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_journal_query": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_preflight_run": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_printer_adapter_cancel": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_printer_adapter_close": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_printer_adapter_open": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_printer_adapter_pause": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_printer_adapter_probe": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_printer_adapter_resume": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_printer_adapter_snapshot": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_printer_adapter_start": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_printer_adapter_upload": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_result_invalidations": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_run_abort": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_run_describe": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_run_hold": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_run_list": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_run_resume": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_run_start": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "mfg_telemetry_snapshot": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "normalize_mpn": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "office_extract": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "packs_save": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "part_get": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "part_import_file": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "part_place": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "part_search": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "parts_catalog_list": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "parts_download": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "parts_import_artifact": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "parts_index_status": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "parts_insert_into_doc": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "parts_list_categories": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "parts_make": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "parts_match_model": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "parts_prepare_for_assembly": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "parts_queue_status": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "parts_search": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "parts_search_live_poll": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "parts_search_live_start": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "parts_taxonomy": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "parts_thumbnail": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "parts_thumbnails": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "ping": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "piping_bom": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "piping_cfd_boundary": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "piping_edit": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "piping_fitting_k": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "piping_fitting_k_cfd_cancel": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "piping_fitting_k_cfd_start": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "piping_fitting_k_cfd_status": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "piping_fluid": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "piping_operating_point": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "piping_report": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "piping_route": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "piping_solve": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "workspace"
+  },
+  "piping_spec_check": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "piping_verify_cfd": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "workspace"
+  },
+  "plm_add_remote": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_branch_create": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_branch_list": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_branch_merge": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_branch_switch": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_checkpoint": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_compare": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_discard_draft": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_draft": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_history": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_item_add": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_item_list": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_item_set": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_item_untrack": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_link_repo": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_live_join": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_live_leave": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_live_poll": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_live_presence": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_live_propose": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_lock": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_open": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_overview": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_plan": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_record_outside": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_release": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_restore": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_rollback": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_rollback_check": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "plm_save": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_scheme_set": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_set_ai_mode": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_settings_get": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_settings_set": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_status": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_sync": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_timeline": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_unlock": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_version_graph": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_version_list": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_version_tag": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "plm_where_used": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "principal_revoke": {
+    "cell": "refuse",
+    "right": "manage",
+    "scope": "actor"
+  },
+  "principal_update": {
+    "cell": "refuse",
+    "right": "manage",
+    "scope": "actor"
+  },
+  "prof_contention": {
+    "cell": "allow",
+    "right": "manage",
+    "scope": "workspace"
+  },
+  "prof_phases": {
+    "cell": "allow",
+    "right": "manage",
+    "scope": "workspace"
+  },
+  "prof_phases_tree": {
+    "cell": "allow",
+    "right": "manage",
+    "scope": "workspace"
+  },
+  "prof_report": {
+    "cell": "allow",
+    "right": "manage",
+    "scope": "workspace"
+  },
+  "prof_start": {
+    "cell": "allow",
+    "right": "manage",
+    "scope": "workspace"
+  },
+  "prof_status": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "prof_stop": {
+    "cell": "allow",
+    "right": "manage",
+    "scope": "workspace"
+  },
+  "prof_target_pop": {
+    "cell": "allow",
+    "right": "manage",
+    "scope": "workspace"
+  },
+  "prof_target_push": {
+    "cell": "allow",
+    "right": "manage",
+    "scope": "workspace"
+  },
+  "prof_tree": {
+    "cell": "allow",
+    "right": "manage",
+    "scope": "workspace"
+  },
+  "pump_drive_size": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "recovery_discard": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "recovery_list": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "recovery_open": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "render_document": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "request_quote": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "reveng_add_images": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "reveng_add_video": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "reveng_attach_result": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "reveng_build_parametric": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "reveng_cancel_splat": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "reveng_crop_splat": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "reveng_finish_splat": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "reveng_fit_primitives": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "reveng_gate_status": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "reveng_ingest_datasheet": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "reveng_make_part_from_library": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "reveng_print_scale_mat": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "reveng_reconstruct": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "reveng_research_source": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "reveng_resolve_gate": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "reveng_set_scale": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "reveng_single_photo": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "reveng_splat_status": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "reveng_start_from_product": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "reveng_start_session": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "reveng_start_splat": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "reveng_status": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "rule_create": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "run_model": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "session_btw": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "session_compact": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "session_handoff": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "session_shake": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_cancel": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_caps": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "sim_fea_modal": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_fea_static": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_freq_response": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_lbm": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_map_to_surface": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "sim_mesh": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_modal_overlay": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_netlist_parse": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "sim_netlist_to_circuit": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "sim_numpy_normal": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "sim_run_adaptive": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_run_buckling": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_run_contact": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_run_fatigue": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_run_flow": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_run_modal": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_run_pipe_flow": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_run_static": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_run_thermal": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_run_topology": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_spice": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_static_overlay": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sim_study_add": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "sim_study_delete": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "sim_study_edit": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "sim_study_list": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "simulate_motion": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "sketch3d_drag": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "sketch3d_health": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "sketch_auto_constrain": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "sketch_drag": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "sketch_drag_commit": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "sketch_enter": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "sketch_exit": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "sketch_health": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "sketch_probe": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "sketch_project_entities": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "sketch_project_ref": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "sketch_solve": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "skills_delete": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "skills_get": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "skills_list": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "skills_save": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "spec_sheet_match": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "stackup_analyze": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "start_capture_session": {
+    "cell": "refuse",
+    "right": "run",
+    "scope": "actor"
+  },
+  "stop_capture_session": {
+    "cell": "refuse",
+    "right": "run",
+    "scope": "actor"
+  },
+  "struct_analyze": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "workspace"
+  },
+  "struct_check": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "struct_estimate": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "subagent_control": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "subagent_list": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "subagent_steer": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "subagent_terminate": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "subagent_transcript": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "subscribe": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "subscription_accounts": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "actor"
+  },
+  "subscription_login": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "actor"
+  },
+  "subscription_logout": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "actor"
+  },
+  "subscription_status": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "actor"
+  },
+  "subscription_switch": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "actor"
+  },
+  "subscription_usage": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "actor"
+  },
+  "topology_capabilities": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "topology_dfam": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "triggers_delete": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "triggers_get": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "triggers_list": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "triggers_save": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "vendor_creds_set": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "vendor_login": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "vendor_part_context": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "vendor_part_fetch": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "vendor_part_insert": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "vendor_part_list": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "vendor_part_register": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "vendor_part_register_local_cad": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "vendor_part_scan_library": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "vendor_status": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "vendors_health_check": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
+  "vendors_health_status": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "vessel_size": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "weld_cut_list": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "worker_activity": {
+    "cell": "refuse",
+    "right": "manage",
+    "scope": "workspace"
+  },
+  "worker_control_info": {
+    "cell": "refuse",
+    "right": "write",
+    "scope": "workspace"
+  },
+  "worker_normalize_face_query": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  }
+}

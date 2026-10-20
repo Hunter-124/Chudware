@@ -6,6 +6,6 @@ After=network-online.target
 Type=oneshot
 EnvironmentFile=%h/chudware-web-data/gateway.env
 WorkingDirectory=%h/Repositories/CAD/Webservice/gateway
-ExecStart=%h/Repositories/CAD/Webservice/gateway/.venv/bin/python %h/Repositories/CAD/Webservice/deploy/security_retention.py
+ExecStart=/usr/bin/env CHUDWARE_DEPLOY_ENV=prod %h/Repositories/CAD/Webservice/gateway/.venv/bin/python %h/Repositories/CAD/Webservice/deploy/security_retention.py
 Nice=15
 IOSchedulingClass=idle

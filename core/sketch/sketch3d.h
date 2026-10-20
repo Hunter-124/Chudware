@@ -22,16 +22,13 @@
 // HANDLES: "e3" whole entity; "e3.p" (point); "e3.p1"/"e3.p2" (line + arc
 // endpoints); "e3.pm" (arc through-point); "e3.p0"…"e3.pN" (spline points).
 //
-// CONSTRAINTS (v1): coincident (point-point, 3 residuals), fix (handle or whole
-// entity), distance (point-point / point-line-entity, dimension value mm),
-// length (line, mm), parallel (line-line, 2 residuals via perpendicular-basis
-// cross projection — the mate solver's two_indep_cross pattern), perpendicular
-// (line-line, dot), angle (line-line, deg in [0,180]), along_axis (line parallel
-// to "x"|"y"|"z" or an explicit dir:[x,y,z]), point_on (point on line — analytic;
-// point on arc — numeric-Jacobian circumcircle residual, same precedent as the 2D
-// solver's numeric conic projections). point_on(spline) is DEFERRED to v2 (the
-// closest-param projection needs a stable spline basis under moving interpolation
-// points); it is skipped forward-tolerantly like every unknown constraint.
+// CONSTRAINTS: coincident, fix, distance, length, parallel, perpendicular, angle,
+// along_axis, point_on (line / arc circumcircle / interpolating spline), tangent
+// (line-arc, arc-arc, line-spline endpoint), equal (line lengths / arc radii),
+// midpoint (line / arc mid-sweep), collinear, concentric, coradial, on_plane,
+// parallel_plane, normal_plane and symmetric (two points mirrored about a plane).
+// Plane = front (XZ, -Y), top (XY, +Z), right (YZ, +X), or {origin,normal}.
+// Unsupported or unresolvable constraints are reported in Sketch3DSolution::skipped.
 #pragma once
 
 #include <nlohmann/json.hpp>
@@ -60,6 +57,7 @@ struct Sketch3DSolution {
     int dof = 0;
     std::vector<std::string> redundant;    // constraint ids
     std::vector<std::string> conflicting;  // constraint ids
+    std::vector<std::pair<std::string, std::string>> skipped; // (constraint id, reason)
     bool converged = false;
     SolveState3 state;  // warm-start state for the next solve / drag
 };

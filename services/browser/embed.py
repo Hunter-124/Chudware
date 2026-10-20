@@ -42,6 +42,7 @@ import threading
 import time
 import uuid
 from typing import Any, Callable
+from contextvars import copy_context
 from urllib.parse import urlparse
 
 from services.research.common import fail
@@ -372,6 +373,8 @@ class EmbedManager:
         self._pw: Any = None  # started async_playwright driver (loop thread only)
         self._reaper_task: asyncio.Task | None = None
         self._atexit_registered = False
+        self._activity_lock = threading.Lock()
+        self._activity_calls = 0
 
         # login-wizard state (guarded by _wizard_lock; pure bookkeeping)
         self._wizard_lock = threading.Lock()
@@ -407,7 +410,9 @@ class EmbedManager:
                 loop.close()
 
             self._thread_ready.clear()
-            self._thread = threading.Thread(target=_run, name="browser-embed", daemon=True)
+            context = copy_context()
+            self._thread = threading.Thread(target=context.run, args=(_run,),
+                                            name="browser-embed", daemon=True)
             self._thread.start()
             self._thread_ready.wait(timeout=10)
             if self._loop is None:
@@ -420,7 +425,26 @@ class EmbedManager:
     def _call(self, coro, timeout: float = _CALL_TIMEOUT_S):
         """Hop a coroutine onto the browser loop and wait for its result."""
         loop = self._ensure_thread()
-        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout)
+        with self._activity_lock:
+            self._activity_calls += 1
+
+        async def invoke():
+            try:
+                return await coro
+            finally:
+                with self._activity_lock:
+                    self._activity_calls -= 1
+
+        invocation = invoke()
+        try:
+            future = asyncio.run_coroutine_threadsafe(invocation, loop)
+        except BaseException:
+            invocation.close()
+            coro.close()
+            with self._activity_lock:
+                self._activity_calls -= 1
+            raise
+        return future.result(timeout)
 
     async def _ensure_pw(self):
         if self._pw is None:
@@ -928,6 +952,20 @@ class EmbedManager:
 
 _MANAGER: EmbedManager | None = None
 _MANAGER_GUARD = threading.Lock()
+
+
+def worker_activity() -> dict:
+    from services.worker_activity import registry_lock
+
+    with registry_lock(_MANAGER_GUARD):
+        manager = _MANAGER
+    if manager is None:
+        return {"by_kind": {"browser_sessions": 0, "browser_calls": 0}}
+    with registry_lock(manager._sessions_lock):
+        sessions = len(manager._sessions)
+    with registry_lock(manager._activity_lock):
+        calls = manager._activity_calls
+    return {"by_kind": {"browser_sessions": sessions, "browser_calls": calls}}
 
 
 def get_manager() -> EmbedManager:

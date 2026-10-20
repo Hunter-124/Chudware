@@ -25,9 +25,18 @@ import tempfile
 import time
 import uuid
 
+from services.agent import request_context as _rc
+
 TERMINAL = {"done", "cancelled", "failed", "interrupted"}
 _CHILDREN: dict[str, tuple[Path, subprocess.Popen]] = {}
 _STOP = False
+
+
+def worker_activity() -> dict:
+    # Snapshot existing Popen ownership only: no session files, locks or imports.
+    children = [child for key, (_, child) in list(_CHILDREN.items())
+                if _rc.owns_registry_key(key) and child.poll() is None]
+    return {"by_kind": {"gaussian_jobs": len(children)}, "processes": children}
 
 
 def _module_command(module: str) -> list[str]:
@@ -108,7 +117,12 @@ def _signal_group(rec: dict, sig: int) -> int | None:
 
 
 def _reconcile(root: Path, rec: dict) -> dict:
+    from services.mcp.reveng_common import _require_record_owner
+    if rec:
+        _require_record_owner(rec)
     for run_id, (_, child) in list(_CHILDREN.items()):
+        if _CHILDREN[run_id][0] != root:
+            continue
         if child.poll() is not None:
             _CHILDREN.pop(run_id, None)
     if rec and rec.get("status") not in TERMINAL and not _alive(rec.get("process") or {}):
@@ -132,16 +146,16 @@ def active_run(root: Path) -> str | None:
 
 
 def _root(session_id: str) -> Path:
-    from services.mcp.reveng_common import _session_path
-    if not session_id or Path(session_id).name != session_id or session_id in (".", ".."):
-        raise ValueError("invalid session_id")
+    from services.mcp.reveng_common import _session_path, _load_session
+    if _load_session(session_id, merge_gaussian=False) is None:
+        raise KeyError("not_found")
     root = _session_path(session_id).resolve()
-    if not (root / "session.json").is_file():
-        raise ValueError("session not found")
     return root
 
 
 def _error(reason: str, hint: str = "") -> dict:
+    if _rc.in_cell() and reason == "not_found":
+        return {"ok": False, "reason": reason, "error": reason, "code": reason}
     return {"ok": False, "reason": reason, "error": reason, "hint": hint}
 
 
@@ -160,7 +174,7 @@ def _bounds(bounds) -> list[float] | None:
 
 def _public(rec: dict) -> dict:
     return {k: v for k, v in rec.items()
-            if k not in {"process", "pipeline_process", "owner", "pgid"}}
+            if k not in {"process", "pipeline_process", "owner", "pgid", "_owner", "_ctx", "_roots"}}
 
 
 def status(session_id: str) -> dict:
@@ -169,8 +183,8 @@ def status(session_id: str) -> dict:
         with _locked(root):
             rec = _reconcile(root, _read(root / "splat_job.json"))
         return _public(rec) if rec else _error("no_splat_job")
-    except (OSError, ValueError) as exc:
-        return _error(str(exc))
+    except (OSError, ValueError, KeyError) as exc:
+        return _error("not_found" if isinstance(exc, KeyError) else str(exc))
 
 
 def start(session_id: str, mode: str = "environment", live: bool = False,
@@ -193,15 +207,18 @@ def start(session_id: str, mode: str = "environment", live: bool = False,
         mission = common._find_session_run(session_id)
         # Same mutex/order as _reserve_mission: neither path can race the other's claim.
         with common._MISSION_LOCK, _locked(root):
-            entry = common._MISSION_THREADS.get(session_id)
+            entry = common._MISSION_THREADS.get(_rc.scoped_key(session_id))
             if common._slot_busy(entry) or (mission and mission.get("status") in ("running", "paused")):
                 return common._busy_envelope(session_id, entry[0] if entry else mission["run_id"])
             previous = _reconcile(root, _read(root / "splat_job.json"))
             if previous and previous.get("status") not in TERMINAL:
                 return {**_public(previous), **_error("splat_already_running")}
             run_id = "splat_" + uuid.uuid4().hex
-            work = root / "gaussian" / run_id
-            work.mkdir(parents=True)
+            if _rc.in_cell():
+                work = Path(tempfile.mkdtemp(prefix="training-", dir=root))
+            else:
+                work = root / "gaussian" / run_id
+                work.mkdir(parents=True)
             rec = dict(ok=True, session_id=session_id, run_id=run_id, status="waiting",
                        stage="waiting", msg="Waiting for accepted frames and the local GPU slot",
                        mode=mode, live=bool(live), quality=quality, iterations=iterations,
@@ -214,25 +231,33 @@ def start(session_id: str, mode: str = "environment", live: bool = False,
                        artifact_revision=previous.get("artifact_revision", 0),
                        error="", reason="", hint="", owner=_identity(os.getpid()),
                        started_at=time.time(), updated_at=time.time(), work_dir=str(work))
+            rec["_owner"] = _rc.owner_key()
+            rec["_ctx"] = _rc.current_context()
+            rec["_roots"] = {"project": _rc.root_value("CHUDWARE_PROJECT_DIR", "/work"),
+                             "save": _rc.root_value("CHUDWARE_PROJECT_SAVE_DIR", "/work")}
             if "view_camera" in previous:
                 rec["view_camera"] = previous["view_camera"]
             _atomic(root / "splat_job.json", rec)
             try:
+                env = dict(os.environ)
+                if _rc.in_cell():
+                    env["CHUDWARE_CELL"] = "1"
                 with (work / "supervisor.log").open("ab") as log:
                     child = subprocess.Popen(
-                        [*_module_command("services.reveng.gaussian_jobs"),
-                         "--session-dir", str(root), "--run-id", run_id],
-                        cwd=Path(__file__).resolve().parents[2], stdin=subprocess.DEVNULL,
-                        stdout=log, stderr=log, start_new_session=True)
+                        _rc.sandbox_argv([*_module_command("services.reveng.gaussian_jobs"),
+                                         "--session-dir", str(root), "--run-id", run_id]),
+                        cwd="/work" if _rc.in_cell() else Path(__file__).resolve().parents[2],
+                        stdin=subprocess.DEVNULL,
+                        env=env, stdout=log, stderr=log, start_new_session=True)
                 rec.update(process=_identity(child.pid), pgid=child.pid)
-                _CHILDREN[run_id] = (root, child)
+                _CHILDREN[_rc.scoped_key(run_id)] = (root, child)
                 _atomic(root / "splat_job.json", rec)
             except Exception as exc:
                 rec.update(ok=False, status="failed", stage="failed", reason="launch_failed", error=str(exc))
                 _atomic(root / "splat_job.json", rec)
             return _public(rec)
-    except (OSError, ValueError) as exc:
-        return _error(str(exc))
+    except (OSError, ValueError, KeyError) as exc:
+        return _error("not_found" if isinstance(exc, KeyError) else str(exc))
 
 
 def finish(session_id: str) -> dict:
@@ -247,8 +272,8 @@ def finish(session_id: str) -> dict:
                            updated_at=time.time())
                 _atomic(root / "splat_job.json", rec)
             return _public(rec)
-    except (OSError, ValueError) as exc:
-        return _error(str(exc))
+    except (OSError, ValueError, KeyError) as exc:
+        return _error("not_found" if isinstance(exc, KeyError) else str(exc))
 
 
 def cancel(session_id: str) -> dict:
@@ -279,15 +304,16 @@ def cancel(session_id: str) -> dict:
                     os.killpg(group, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-        owned = _CHILDREN.pop(rec["run_id"], None)
+        child_key = _rc.scoped_key(rec["run_id"])
+        owned = _CHILDREN.pop(child_key, None)
         if owned is not None:
             try:
                 owned[1].wait(timeout=0.3)
             except subprocess.TimeoutExpired:
-                _CHILDREN[rec["run_id"]] = owned
+                _CHILDREN[child_key] = owned
         return _public(rec)
-    except (OSError, ValueError) as exc:
-        return _error(str(exc))
+    except (OSError, ValueError, KeyError) as exc:
+        return _error("not_found" if isinstance(exc, KeyError) else str(exc))
 
 
 def crop(session_id: str, bounds) -> dict:
@@ -315,13 +341,16 @@ def crop(session_id: str, bounds) -> dict:
                        updated_at=time.time())
             _atomic(root / "splat_job.json", rec)
             return {**_public(rec), "ok": True}
-    except (OSError, ValueError) as exc:
-        return _error(str(exc))
+    except (OSError, ValueError, KeyError) as exc:
+        return _error("not_found" if isinstance(exc, KeyError) else str(exc))
 
 
 def _update(root: Path, run_id: str, **changes) -> dict | None:
     with _locked(root):
         rec = _read(root / "splat_job.json")
+        from services.mcp.reveng_common import _require_record_owner
+        if rec:
+            _require_record_owner(rec)
         if rec.get("run_id") != run_id or rec.get("status") in TERMINAL:
             return None
         rec.update(changes, updated_at=time.time())
@@ -345,6 +374,9 @@ def _publish(root: Path, run_id: str, payload: dict, finalizing: bool) -> dict |
     changes["status"] = "finalizing" if finalizing else ("training" if stage in ("training", "splat", "export", "done") else "sparse")
     with _locked(root):
         rec = _read(root / "splat_job.json")
+        from services.mcp.reveng_common import _require_record_owner
+        if rec:
+            _require_record_owner(rec)
         if rec.get("run_id") != run_id or rec.get("status") in TERMINAL:
             return None
         artifact = payload.get("splat_path")
@@ -368,6 +400,9 @@ def _publish(root: Path, run_id: str, payload: dict, finalizing: bool) -> dict |
 
 def _stop_requested(root: Path, run_id: str) -> bool:
     rec = _read(root / "splat_job.json")
+    from services.mcp.reveng_common import _require_record_owner
+    if rec:
+        _require_record_owner(rec)
     return (_STOP or rec.get("run_id") != run_id or rec.get("status") in TERMINAL
             or not _alive(rec.get("owner") or {}))
 
@@ -485,7 +520,21 @@ def shutdown() -> None:
     that flock here would deadlock. Leave the durable record for reconciliation;
     killing the verified group prevents any subsequent artifact publication.
     """
-    owned = list(_CHILDREN.items())
+    if _rc.in_cell():
+        from services.mcp.reveng_common import _require_record_owner
+        owned = []
+        for key, (root, child) in list(_CHILDREN.items()):
+            try:
+                _require_record_owner(_read(root / "splat_job.json"))
+            except KeyError:
+                continue
+            owned.append((key, (root, child)))
+    else:
+        owned = list(_CHILDREN.items())
+    _shutdown_children(owned)
+
+
+def _shutdown_children(owned) -> None:
     for _, (_, child) in owned:
         if child.poll() is None:
             _signal_group({"process": _identity(child.pid), "pgid": child.pid}, signal.SIGKILL)
@@ -498,14 +547,27 @@ def shutdown() -> None:
             pass
 
 
-atexit.register(shutdown)
+atexit.register(lambda: _shutdown_children(list(_CHILDREN.items())))
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--session-dir", required=True)
     parser.add_argument("--run-id", required=True)
     args = parser.parse_args(argv)
-    _supervise(Path(args.session_dir), args.run_id)
+    root = Path(args.session_dir).resolve()
+    if _rc.in_cell():
+        base = Path(os.environ.get("XDG_DATA_HOME", "/actor/data")).resolve()
+        if base not in root.parents:
+            raise ValueError("cell_refused")
+        rec = _read(root / "splat_job.json")
+        roots = rec.get("_roots") or {}
+        with _rc.bind_context(rec.get("_ctx")), _rc.bind_roots(
+                roots.get("project", "/work"), roots.get("save", "/work")):
+            if _root(rec.get("session_id", "")) != root or rec.get("run_id") != args.run_id:
+                raise KeyError("not_found")
+            _supervise(root, args.run_id)
+    else:
+        _supervise(root, args.run_id)
 
 
 if __name__ == "__main__":

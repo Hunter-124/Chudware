@@ -338,12 +338,12 @@ def _default_agent_fn(
         or "dag-node"
     )
     run_id = str(context_pack.get("run_id") or node_inputs.get("run_id") or "")
-    session_root = str(
-        context_pack.get("session_id")
-        or context_pack.get("parent_session_id")
-        or run_id
-        or f"dag:{node_id}"
-    )
+    session_root = str(context_pack.get("session_id") or "")
+    if mission_dispatch is not None and session_root:
+        current = mission_dispatch.execution_options.get("session_id")
+        if current and current != session_root:
+            raise ValueError("not_found")
+        mission_dispatch.execution_options["session_id"] = session_root
     parent_id = str(
         context_pack.get("parent_id") or f"{run_id or session_root}:{node_id}"
     )
@@ -369,6 +369,7 @@ def _default_agent_fn(
     )
     options: dict[str, Any] = {
         "ledger": ledger,
+        "session_id": session_root,
         "mission_dispatch": mission_dispatch,
         "allowed_tools": context_pack.get("allowed_tools"),
         "autonomy": context_pack.get("autonomy") or node_inputs.get("autonomy"),
@@ -1154,7 +1155,7 @@ def _run_overseer_stage_exit(
             },
             trigger="stage_exit",
             providers=context_pack.get("overseer_providers") if offline else None,
-            session_id=str(context_pack.get("session_id") or run_id),
+            session_id=str(context_pack.get("session_id") or ""),
             on_event=context_pack.get("_event_sink"),
             options={
                 "workspace_dir": context_pack.get("workspace_dir"),

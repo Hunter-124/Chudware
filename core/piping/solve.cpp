@@ -17,6 +17,7 @@
 #include <optional>
 #include <sstream>
 
+#include "doc/native_policy.h"
 #include "piping/catalog.h"
 #include "piping/schema.h"
 
@@ -693,16 +694,24 @@ ojson load_pump_curve(const std::string& csv_source, double speed_ratio,
     if (!std::isfinite(speed_ratio) || speed_ratio <= 0) {
         return jerr("pump curve speed_ratio must be finite and > 0");
     }
+    // Inline CSV must be classified before any path lookup, including in cells.
     std::string text;
-    {
-        std::ifstream fh(csv_source);
-        if (fh.good()) {
-            std::ostringstream ss;
-            ss << fh.rdbuf();
-            text = ss.str();
-        } else {
-            text = csv_source;
+    if (csv_source.find_first_of(",\r\n") == std::string::npos) {
+        try {
+            const std::string path = doc::native_policy::resolve_reference(csv_source);
+            std::ifstream fh(path);
+            if (fh.good()) {
+                std::ostringstream ss;
+                ss << fh.rdbuf();
+                text = ss.str();
+            } else {
+                text = csv_source;
+            }
+        } catch (const std::exception& exc) {
+            return jerr("cannot read pump curve: " + std::string(exc.what()));
         }
+    } else {
+        text = csv_source;
     }
 
     std::vector<std::string> lines;

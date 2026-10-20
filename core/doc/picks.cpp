@@ -402,15 +402,15 @@ FacePicks resolve_face_picks(const TopoDS_Shape& shape, const nlohmann::json& se
         // The resolved descriptor's centroid (face centre) -> nearest unique face.
         const Eigen::Vector3d& target = infos[*idx].centroid;
         double dist = std::numeric_limits<double>::infinity();
-        TopoDS_Shape near = nearest_unique_subshape(shape, TopAbs_FACE, target, tol, dist);
-        if (near.IsNull()) {
+        TopoDS_Shape nearest_face = nearest_unique_subshape(shape, TopAbs_FACE, target, tol, dist);
+        if (nearest_face.IsNull()) {
             out.dangling.push_back(
                 slot + "[" + std::to_string(i) + "]: no unique face within " +
                 fmt4g(tol) + " mm of the resolved descriptor (nearest " +
                 fmt4g(dist) + " mm)");
             continue;
         }
-        out.faces.push_back(TopoDS::Face(near));
+        out.faces.push_back(TopoDS::Face(nearest_face));
     }
 
     return out;

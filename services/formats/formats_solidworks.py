@@ -160,6 +160,60 @@ _CHUNK_MARKER = b"\x14\x00\x06\x00\x08\x00"
 _STRIP_MARKER = struct.pack("<III", 4, 8, 2)
 _ARRAY_MARKER = struct.pack("<III", 12, 100, 2)
 
+# In lockstep with the native Limits: retain the existing 512 MiB stream ceiling
+# as an aggregate ceiling, rather than simplifying engineering geometry. Logical
+# placed geometry is charged at the native 24-byte vertex / 12-byte triangle cost
+# in both ports, including meshes which the native reader shares between instances.
+_MAX_FILE_BYTES = 512 * 1024 * 1024
+_MAX_STREAM_BYTES = 512 * 1024 * 1024
+_MAX_STREAMS = 4096
+_MAX_INSTANCES = 65536
+_MAX_WORK = 1024 * 1024
+_MAX_VERTICES = 16 * 1024 * 1024
+_MAX_TRIANGLES = 16 * 1024 * 1024
+_MAX_MESH_BYTES = 512 * 1024 * 1024
+
+
+def _charge(used: int, amount: int, limit: int, kind: str) -> int:
+    if used > limit or amount > limit - used:
+        raise ValueError(f"SolidWorks {kind} budget exceeded")
+    return used + amount
+
+
+class _MeshBudget:
+    def __init__(self) -> None:
+        self.vertices = 0
+        self.triangles = 0
+        self.bytes = 0
+
+    def add(self, vertices: int, triangles: int) -> None:
+        self.vertices = _charge(self.vertices, vertices, _MAX_VERTICES, "aggregate vertex")
+        self.triangles = _charge(self.triangles, triangles, _MAX_TRIANGLES, "aggregate triangle")
+        self.bytes = _charge(self.bytes, vertices * 24 + triangles * 12,
+                             _MAX_MESH_BYTES, "aggregate mesh byte")
+
+
+def _inflate_raw(data: memoryview, expanded: int, name: str) -> bytes:
+    # Never let a false small claim first allocate the real (potentially enormous)
+    # output. One surplus byte proves a mismatch; each inflater call is also bounded.
+    decoder = zlib.decompressobj(-15)
+    raw = bytearray()
+    for offset in range(0, len(data), 64 * 1024):
+        pending = data[offset:offset + 64 * 1024]
+        while pending:
+            piece = decoder.decompress(pending, min(64 * 1024, expanded - len(raw) + 1))
+            if len(piece) > expanded - len(raw):
+                raise ValueError(f"SolidWorks stream {name!r} exceeds its claimed expanded size")
+            raw.extend(piece)
+            pending = decoder.unconsumed_tail
+            if decoder.eof:
+                break
+        if decoder.eof:
+            break
+    if not decoder.eof or len(raw) != expanded:
+        raise ValueError(f"SolidWorks stream {name!r} failed raw-deflate decoding")
+    return bytes(raw)
+
 
 def _rol(value: int, shift: int) -> int:
     shift &= 7
@@ -167,7 +221,13 @@ def _rol(value: int, shift: int) -> int:
 
 
 def _modern_streams(path: str | os.PathLike, assembly: bool) -> dict[str, bytes]:
-    data = Path(path).read_bytes()
+    with open(path, "rb") as source:
+        size = os.fstat(source.fileno()).st_size
+        if size > _MAX_FILE_BYTES:
+            raise ValueError("SolidWorks input file byte budget exceeded")
+        data = source.read(size + 1)
+        if len(data) != size:
+            raise ValueError("SolidWorks input file changed while reading")
     if len(data) < 22:
         raise ValueError("SolidWorks file is too short to contain a modern document")
     if data.startswith(b"\xd0\xcf\x11\xe0"):
@@ -185,6 +245,7 @@ def _modern_streams(path: str | os.PathLike, assembly: bool) -> dict[str, bytes]
                  name != "FaceTessellations/Directory"))
 
     streams: dict[str, bytes] = {}
+    expanded_bytes = 0
     key = data[7]
     pos = 0
     while True:
@@ -221,15 +282,15 @@ def _modern_streams(path: str | os.PathLike, assembly: bool) -> dict[str, bytes]
             pos = marker + 1
             continue
         if wanted(name) and name not in streams:
+            _charge(len(streams), 1, _MAX_STREAMS, "stream count")
             if compressed == 0:
                 streams[name] = b""
             else:
                 if expanded <= 0 or expanded > 512 * 1024 * 1024:
                     raise ValueError(f"SolidWorks stream {name!r} has an invalid expanded size")
-                raw = zlib.decompress(data[payload_at:end], -15)
-                if len(raw) != expanded:
-                    raise ValueError(
-                        f"SolidWorks stream {name!r} expanded to {len(raw)}, expected {expanded}")
+                expanded_bytes = _charge(expanded_bytes, expanded, _MAX_STREAM_BYTES,
+                                         "aggregate expanded byte")
+                raw = _inflate_raw(memoryview(data)[payload_at:end], expanded, name)
                 streams[name] = raw
         pos = end
     return streams
@@ -276,7 +337,8 @@ def _strip_headers(data: bytes) -> dict[int, int]:
     return headers
 
 
-def _mesh_from_face_stream(data: bytes, expected_faces: int | None = None):
+def _mesh_from_face_stream(data: bytes, expected_faces: int | None = None,
+                           budget: _MeshBudget | None = None):
     import numpy as np
     from services.formats.mesh_body import MeshBody
 
@@ -288,6 +350,9 @@ def _mesh_from_face_stream(data: bytes, expected_faces: int | None = None):
         raise ValueError(
             f"SolidWorks tessellation face-count mismatch: {expected_faces} vs {face_count}")
     headers = _strip_headers(data)
+    if budget is None:
+        budget = _MeshBudget()
+    budget.add(sum(arrays[face * 4][1] for face in range(face_count)), 0)
     verts: list[list[float]] = []
     tris: list[tuple[int, int, int]] = []
     # The second array of each group is SolidWorks' per-vertex NORMAL array. It is
@@ -318,6 +383,7 @@ def _mesh_from_face_stream(data: bytes, expected_faces: int | None = None):
                     ia, ib = ib, ia
                 a, b, c = points[cursor + j:cursor + j + 3]
                 if float(np.dot(np.cross(b - a, c - a), np.cross(b - a, c - a))) > 1e-20:
+                    budget.add(0, 1)
                     tris.append((ia, ib, ic))
             cursor += length
     if not tris:
@@ -356,12 +422,14 @@ def _portable_tessellations(path: str | os.PathLike) -> list[tuple[str, Any]]:
     source = Path(path)
     assembly = source.suffix.lower() == ".sldasm"
     streams = _modern_streams(source, assembly)
+    source_budget = _MeshBudget()
     if not assembly:
         display = streams.get("Contents/DisplayLists")
         if not display:
             raise ValueError(
                 "SolidWorks part has no saved display tessellation; rebuild/save it or export STEP")
-        mesh = _mesh_from_face_stream(display)
+        _charge(0, 1, _MAX_INSTANCES, "instance count")
+        mesh = _mesh_from_face_stream(display, budget=source_budget)
         mesh.name = source.stem
         return [(source.stem, mesh)]
 
@@ -384,9 +452,10 @@ def _portable_tessellations(path: str | os.PathLike) -> list[tuple[str, Any]]:
         if not ranges:
             raise ValueError(f"SolidWorks assembly face stream {name!r} has no component blocks")
         for start, end in ranges:
+            _charge(len(block_meshes), 1, _MAX_INSTANCES, "source mesh count")
             block = data[start:end]
             block_meshes.append(_mesh_from_face_stream(
-                block, struct.unpack_from("<I", block, 12)[0]))
+                block, struct.unpack_from("<I", block, 12)[0], source_budget))
     if len(block_meshes) != len(part_models):
         active = {r.attrib.get("swModelRef")
                   for owner in models for r in owner
@@ -405,16 +474,64 @@ def _portable_tessellations(path: str | os.PathLike) -> list[tuple[str, Any]]:
     if recent is None or recent.attrib.get("swModelRef") not in model_by_id:
         raise ValueError("SolidWorks assembly has no resolvable root configuration")
 
+    # A memoized preflight counts DAG paths, not unique models. Charge geometry
+    # before constructing any homogeneous coordinates or copying triangle arrays.
+    costs: dict[str, tuple[int, int, int, int, int]] = {}
+    counting: set[str] = set()
+
+    def count(model_id: str, depth: int) -> tuple[int, int, int, int, int]:
+        if depth > 64 or model_id in counting:
+            raise ValueError("SolidWorks assembly component graph is cyclic or too deep")
+        if model_id in costs:
+            cost = costs[model_id]
+            if depth + cost[4] > 64:
+                raise ValueError("SolidWorks assembly component graph is cyclic or too deep")
+            return cost
+        if model_id not in model_by_id:
+            raise ValueError(f"SolidWorks assembly references unknown model {model_id!r}")
+        counting.add(model_id)
+        instances = work = height = 0
+        geometry = _MeshBudget()
+        for ref in model_by_id[model_id]:
+            if _tag(ref) != "swReference":
+                continue
+            work = _charge(work, 1, _MAX_WORK, "instance work")
+            if ref.attrib.get("swSuppressed") == "YES":
+                continue
+            ref_id = ref.attrib.get("swModelRef", "")
+            if ref_id in mesh_by_model:
+                mesh = mesh_by_model[ref_id]
+                instances = _charge(instances, 1, _MAX_INSTANCES, "instance count")
+                geometry.add(len(mesh.verts), len(mesh.tris))
+            else:
+                child = count(ref_id, depth + 1)
+                instances = _charge(instances, child[0], _MAX_INSTANCES, "instance count")
+                work = _charge(work, child[1], _MAX_WORK, "instance work")
+                geometry.add(child[2], child[3])
+                height = max(height, child[4] + 1)
+        counting.remove(model_id)
+        cost = (instances, work, geometry.vertices, geometry.triangles, height)
+        costs[model_id] = cost
+        return cost
+
+    count(recent.attrib["swModelRef"], 0)
+
     out: list[tuple[str, Any]] = []
     used: dict[str, int] = {}
     stack: set[str] = set()
+    placed_budget = _MeshBudget()
+    instance_count = work_count = 0
 
     def expand(model_id: str, parent: np.ndarray, prefix: str, depth: int) -> None:
+        nonlocal instance_count, work_count
         if depth > 64 or model_id in stack:
             raise ValueError("SolidWorks assembly component graph is cyclic or too deep")
         stack.add(model_id)
         for ref in model_by_id[model_id]:
-            if _tag(ref) != "swReference" or ref.attrib.get("swSuppressed") == "YES":
+            if _tag(ref) != "swReference":
+                continue
+            work_count = _charge(work_count, 1, _MAX_WORK, "instance work")
+            if ref.attrib.get("swSuppressed") == "YES":
                 continue
             values = [float(x) for x in ref.attrib.get("swTransform", "").split()]
             if len(values) != 16:
@@ -428,6 +545,8 @@ def _portable_tessellations(path: str | os.PathLike) -> list[tuple[str, Any]]:
             full = f"{prefix}/{local}" if prefix else local
             if ref_id in mesh_by_model:
                 base: MeshBody = mesh_by_model[ref_id]
+                instance_count = _charge(instance_count, 1, _MAX_INSTANCES, "instance count")
+                placed_budget.add(len(base.verts), len(base.tris))
                 hom = np.column_stack((base.verts.astype(np.float64) / 1000.0,
                                        np.ones(len(base.verts))))
                 placed = hom @ world

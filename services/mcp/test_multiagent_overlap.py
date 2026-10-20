@@ -352,3 +352,156 @@ def test_autosave_skips_unchanged_docs(tmp_path, monkeypatch):
     finally:
         _close(did)
         ct._AUTOSAVE_LAST_REV.pop(did, None)
+
+
+def test_thread_clients_overlap_share_writer_group_and_close_on_exit(monkeypatch):
+    """Two host-call threads reach the engine concurrently, not one socket lock."""
+    from services.mcp import daemon_bridge
+
+    barrier = threading.Barrier(2, timeout=5)
+    connections = []
+    results, errors = [], []
+
+    class FakeClient:
+        def __init__(self, *, writer_group):
+            self.writer_group = writer_group
+            self.closed = False
+            self._lock = threading.Lock()
+            connections.append(self)
+
+        def call(self, method, params=None):
+            with self._lock:
+                barrier.wait()
+                return {"doc_id": params["doc_id"]}
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(daemon_bridge, "DaemonClient", FakeClient)
+    monkeypatch.setattr(daemon_bridge, "_clients", threading.local())
+
+    def worker(doc):
+        try:
+            connection = daemon_bridge.client()
+            assert daemon_bridge.client() is connection
+            results.append(cb._call_via_daemon("doc_tree", {"doc_id": doc}))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(doc,)) for doc in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads)
+    assert not errors
+    assert sorted(result["doc_id"] for result in results) == ["a", "b"]
+    assert len(connections) == 2
+    assert {c.writer_group for c in connections} == {daemon_bridge._WRITER_GROUP}
+    assert all(c.closed for c in connections)
+
+
+def test_writer_group_hello_is_opt_in(monkeypatch):
+    from services.mcp.daemon_bridge import DaemonClient
+
+    for group in ("", "py-worker"):
+        connection = DaemonClient(writer_group=group)
+        calls = []
+        monkeypatch.setattr(
+            connection, "_call_raw",
+            lambda method, params: calls.append((method, params)) or {"ok": True},
+        )
+        assert connection._hello() == {"ok": True}
+        assert calls[0][0] == "hello"
+        assert calls[0][1].get("writer_group", "") == group
+        assert ("writer_group" in calls[0][1]) == bool(group)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_apply_ops_disables_implicit_cas_and_preserves_explicit_cas(monkeypatch, explicit):
+    from services.mcp import daemon_bridge
+
+    calls = []
+    original = {"doc_id": "part", "ops": []}
+    if explicit:
+        original["base_revision"] = 4
+
+    class FakeClient:
+        def call(self, name, params):
+            calls.append((name, dict(params)))
+            if params["base_revision"] >= 0:
+                return {"_is_error": True, "code": "stale_revision", "message": "stale"}
+            return {"ok": True}
+
+    monkeypatch.setattr(daemon_bridge, "client", lambda: FakeClient())
+    if explicit:
+        with pytest.raises(cb.CoreError) as error:
+            cb._call_via_daemon("doc_apply_ops", original)
+        assert error.value.code == "stale_revision"
+    else:
+        assert cb._call_via_daemon("doc_apply_ops", original) == {"ok": True}
+    assert calls == [("doc_apply_ops", {**original, "base_revision": 4 if explicit else -1})]
+    assert ("base_revision" in original) == explicit
+
+
+def test_busy_preview_uses_server_backoff_then_succeeds(monkeypatch):
+    from services.mcp import daemon_bridge
+
+    replies = iter([
+        {"_is_error": True, "code": "busy_preview", "retry_ms": 123},
+        {"ok": True},
+    ])
+    slept = []
+
+    class FakeClient:
+        def call(self, _method, _params):
+            return next(replies)
+
+    monkeypatch.setattr(daemon_bridge, "client", lambda: FakeClient())
+    monkeypatch.setattr(cb.time, "sleep", slept.append)
+    assert cb._call_via_daemon("doc_apply_ops", {"doc_id": "part"}) == {"ok": True}
+    assert slept == [0.123]
+
+
+def test_busy_preview_gives_up_after_bounded_wait_with_teaching_error(monkeypatch):
+    from services.mcp import daemon_bridge
+
+    now = [0.0]
+    slept = []
+
+    def sleep(seconds):
+        slept.append(seconds)
+        now[0] += seconds
+
+    class FakeClient:
+        def call(self, _method, _params):
+            return {"_is_error": True, "code": "busy_preview", "retry_ms": 7000}
+
+    monkeypatch.setattr(daemon_bridge, "client", lambda: FakeClient())
+    monkeypatch.setattr(cb.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(cb.time, "sleep", sleep)
+    with pytest.raises(cb.CoreError) as error:
+        cb._call_via_daemon("doc_apply_ops", {"doc_id": "bracket"})
+    assert error.value.code == "busy_preview"
+    assert "user is editing bracket in the app right now" in str(error.value)
+    assert "work on something else and retry" in str(error.value)
+    assert slept == [7.0, 7.0, 7.0, 7.0, 2.0]
+    assert now[0] == 30.0
+
+
+@pytest.mark.parametrize("code", ["read_only", "invalid_params", "engine_failed"])
+def test_other_engine_errors_never_retry(monkeypatch, code):
+    from services.mcp import daemon_bridge
+
+    calls = []
+
+    class FakeClient:
+        def call(self, method, params):
+            calls.append(method)
+            return {"_is_error": True, "code": code, "message": "refused"}
+
+    monkeypatch.setattr(daemon_bridge, "client", lambda: FakeClient())
+    with pytest.raises(cb.CoreError) as error:
+        cb._call_via_daemon("doc_apply_ops", {"doc_id": "part"})
+    assert error.value.code == code
+    assert calls == ["doc_apply_ops"]

@@ -38,19 +38,21 @@ from typing import Any
 from urllib.parse import quote, unquote, urlencode
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 try:
     from . import accounts, authn
     from .auth import JWKSCache
     from .config import settings
+    from .db import tx
     from .limits import login_by_ip
 except ImportError:  # uvicorn app:app from the package dir
     import accounts  # type: ignore
     import authn  # type: ignore
     from auth import JWKSCache  # type: ignore
     from config import settings  # type: ignore
+    from db import tx  # type: ignore
     from limits import login_by_ip  # type: ignore
 
 import jwt
@@ -508,16 +510,20 @@ def link_account(provider: str, subject: str, email: str) -> str:
     user's documents and billing in half the first time they clicked the other
     button.
     """
-    existing = authn.oauth_email(provider, subject)
-    if existing:
-        # Already linked. The provider-side email may have changed since; the
-        # account it points at deliberately does not follow, because the subject
-        # is the stable identity and the account owns the data.
-        return existing
-    accounts.ensure_account(email, display=email.split("@")[0])
-    authn.link_oauth_identity(provider, subject, email)
-    log.info("oauth: linked %s identity %s to %s", provider, subject, email)
-    return email
+    with tx():
+        existing = authn.oauth_email(provider, subject)
+        if existing:
+            # The stable subject owns the account even if its email changed.
+            return existing
+        accounts.ensure_account(email, display=email.split("@")[0])
+        authn._lock_account(email)
+        authn.link_oauth_identity(provider, subject, email)
+        # Concurrent callbacks can first link the same subject. The immutable
+        # binding wins; never return the loser's provider email as its account.
+        linked = authn.oauth_email(provider, subject)
+        assert linked is not None
+    log.info("oauth: linked %s identity %s to %s", provider, subject, linked)
+    return linked
 
 
 # ---------------------------------------------------------------------------
@@ -592,11 +598,15 @@ async def oauth_callback(
         _clear_transaction_cookie(response, request)
         return response
 
-    account_email = link_account(entry.name, subject, email)
-    # The provider just proved control of the address, so this is a full
-    # verification: it marks any password credential verified and promotes a
-    # pending account onto the trial, exactly as clicking a verify link would.
-    sid = authn.complete_verification(request, account_email)
+    try:
+        with tx():
+            account_email = link_account(entry.name, subject, email)
+            sid = authn.complete_oauth(request, account_email)
+    except HTTPException as exc:
+        response = _error_page(str(exc.detail))
+        response.status_code = exc.status_code
+        _clear_transaction_cookie(response, request)
+        return response
     log.info("oauth: %s sign-in for %s", entry.name, account_email)
     response = RedirectResponse(next_path, status_code=303)
     authn.attach_session_cookie(response, request, sid)

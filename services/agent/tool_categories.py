@@ -18,6 +18,10 @@ from typing import Iterable
 # Soft cap on tools expanded from a single enable_tools call (and overall expansion).
 CATEGORY_EXPAND_CAP = 64
 
+# Human history APIs remain registered, but agent writers are always refused.
+# Keep them out of every agent discovery/loading path, including family expansion.
+AGENT_DENIED_TOOLS: frozenset[str] = frozenset({"undo", "redo"})
+
 # Meta-tools the model uses to request more surface area. Always allowed.
 META_TOOLS: frozenset[str] = frozenset({
     "enable_tools",
@@ -45,8 +49,6 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "read_native_file",
         "browse_models",
         "relocate_native_files",
-        "undo",
-        "redo",
         "set_material",
         "set_process",
         "make_standard_part",
@@ -72,6 +74,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "check_sketch",
         "sketch_health",
         "sketch_auto_constrain",
+        "sketch_fully_define",
         "sketch_preview_text",
         "render_sketch",
         "render_sketch_ascii",
@@ -264,8 +267,8 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "list_print_profiles",
         "slicer_status",
         # Printer media delivery: read-only inventory first, then the managed publish
-        # (revision-prefixed PRINT/<project>/ set, readback-verified, old managed G-code
-        # archived non-printable). Mutating publish is denied in Ask/Plan by the contract.
+        # (raw root-level files or one project folder, readback-verified, old managed G-code
+        # deleted after verified commit). Mutating publish is denied in Ask/Plan by the contract.
         "print_media_inventory",
         "publish_print_media",
         "wall_thickness",
@@ -826,9 +829,10 @@ def _expand_token(token: str) -> set[str]:
             return set()
         return {
             name for name, tags in cat.items()
-            if isinstance(tags, dict) and tags.get("family") == fam
+            if name not in AGENT_DENIED_TOOLS
+            and isinstance(tags, dict) and tags.get("family") == fam
         }
-    return {t}
+    return {t} if t not in AGENT_DENIED_TOOLS else set()
 
 
 def resolve_categories(
@@ -931,8 +935,6 @@ MAIN_CHAT_CORE_TOOLS: tuple[str, ...] = (
     "close_part",
     "import_part",
     "set_material",
-    "undo",
-    "redo",
     # Saved .step+ files read without opening them. c211-c233 agents shelled out to
     # `unzip -p X.step+ document.json | jq` ~40 times for features/import params/
     # components/mates/materials; inspect_native_files was enable_tools-loaded in 5
@@ -1101,7 +1103,7 @@ _MENU_GROUPS: tuple[_MenuGroup, ...] = (
                "Vault items, checkpoints/rollback, release, product graph, live collab, Box"),
     _MenuGroup("plm", ("plm",), (), ""),
     _MenuGroup("modeling", ("cad",), (),
-               "Part geometry beyond add_features: configurations, standard parts, regen repair, undo/redo"),
+               "Part geometry beyond add_features: configurations, standard parts, regen repair"),
     _MenuGroup("coordination", ("mission", "ledger", "org", "advisor"), (),
                "Missions/DAG, ledger, org requests, advisory checks"),
     _MenuGroup("intake", ("intake",), (),
@@ -1130,7 +1132,10 @@ def _live_catalog() -> dict[str, dict]:
     try:
         from services.mcp import tool_registry as _tr  # noqa: PLC0415 — lazy
         _tr.warm_catalog()
-        return dict(_tr.catalog() or {})
+        return {
+            name: meta for name, meta in (_tr.catalog() or {}).items()
+            if name not in AGENT_DENIED_TOOLS
+        }
     except Exception:  # noqa: BLE001 — catalog optional at import/test time
         return {}
 

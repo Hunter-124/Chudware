@@ -81,6 +81,9 @@ public:
     // Blocking JSON-RPC round trip; same contract as CppCore::call. Returns true
     // iff the daemon answered with "result"; err carries transport or RPC errors
     // ("error" payloads are also copied into result for callers that inspect them).
+    // An id:null JSON-RPC protocol error also surfaces its error payload and retires
+    // the socket: it cannot be correlated safely with any later request. Malformed
+    // reply ids fail the call explicitly; neither path converts an id to an integer.
     // timeoutMs < 0 waits as long as the response takes: silence (a solver factorizing
     // for minutes) never fails it; only abortPending() or peer EOF ends it. >= 0 bounds
     // the WHOLE wait (pushes on the way do not extend it). A timeout is a transport

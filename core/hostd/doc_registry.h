@@ -4,24 +4,25 @@
 // Server::dispatch.
 //
 // Responsibilities:
-//   * DocAccessTable: per doc_id -> {mode per client (rw|ro), last_seen_rev per
-//     client, one optional edit-hold, subscribers}.
+//   * DocAccessTable: per doc_id -> {mode per connection (rw|ro), last_seen_rev
+//     per writer (a non-empty hello.writer_group shares one), edit-hold, subscribers}.
 //   * Daemon methods: attach_doc / detach_doc / edit_hold / edit_release /
 //     subscribe (dispatched via handleMethod).
 //   * Access enforcement (preCall): mutating call from an ro attach -> hard
-//     {"code":"read_only"}; from an unattached client -> implicit rw attach
-//     (compat with existing single-client flows); mutating call while another
-//     client holds an edit-hold -> retriable {"code":"busy_preview"}.
-//   * Overlap CAS (preCall): when a doc has >1 rw attachment, inject the
-//     caller's last_seen_rev as base_revision into doc_apply_ops/doc_undo/
+//     {"code":"read_only"}; desktop unattached clients implicitly attach rw.
+//     Cell viewers are pinned ro by trusted principal, including mint-time and
+//     manual attaches; mutations fail forbidden_right. Holds yield busy_preview.
+//   * Overlap CAS (preCall): when a doc has >1 distinct rw writer, inject the
+//     writer's last_seen_rev as base_revision into doc_apply_ops/doc_undo/
 //     doc_redo so the engine's existing stale_revision CAS fires on races.
 //     Single-writer docs are byte-identical passthrough.
 //   * Revision sniff + event fanout (postCall): mutating responses already
 //     carry top-level "revision" (ops_response, core/doc/session.cpp) plus
 //     tess.aicm_path / rebuild.feature_status; when a doc's revision advances
 //     the registry pushes {"event":"doc.changed",...} to every OTHER
-//     subscribed client, doc.opened on mint, doc.closed on doc_close/last-rw
-//     detach, doc.lease_change on hold grant/release/expiry.
+//     subscribed client (cell subscribers must also be attached). Cell writes
+//     include trusted actor_key in snapshots, changes and lastWriter attribution.
+//     doc.opened / doc.closed / doc.lease_change follow the same visibility gate.
 //     EXCEPTION — internal docs: a doc minted with {"internal":true} (the agent
 //     preflight advisor's shadow clone) is registered like any other but NEVER
 //     produces a single event, so no mirror ever opens a tab for it. See
@@ -30,14 +31,10 @@
 //     another client advanced since this client's last touch, the registry
 //     appends "_foreign_edits":[...] into the RESULT object.
 //
-// MUTATING-METHOD CLASSIFICATION (the documented choice): enforcement applies
-// to any engine method whose params carry a "doc_id" and whose name is NOT in
-// the read-only allowlist below (exact names + prefixes). The allowlist covers
-// every pure-read family in core/api/libchudware.cpp dispatch: doc_tree/doc_query/
-// doc_bbox/doc_get_meta/render/describe/eval_*/sim_* solves (read geometry,
-// write no doc state)/doc_export/prof_*/sketch probes. Anything new therefore
-// FAILS SAFE as mutating — a false positive costs an ro client an error, never
-// a silent shared-doc write.
+// MUTATING-METHOD CLASSIFICATION: desktop retains its document-only allowlist,
+// including geometry-only sim/agent families. Cell authorization uses an exact
+// fail-closed native read list plus the server's trusted cell_methods read policy;
+// broad agent_/sim_ prefixes never confer cell read privileges.
 #pragma once
 
 #include <functional>
@@ -59,6 +56,14 @@ public:
 
     void setEventSender(EventSender s) { send_ = std::move(s); }
 
+    // Register hello's optional process-wide writer identity. Attachments and event
+    // subscriptions remain connection-local; edit/CAS ownership is group-wide.
+    void setWriterGroup(int clientId, const std::string& writerGroup);
+
+    // Trusted gateway/listener identity, never client-declared. Viewers stay ro
+    // across explicit attaches, implicit reads and mint-time registration.
+    void setCellPrincipal(int clientId, const std::string& actorKey, bool readOnly);
+
     // Daemon-level methods (attach_doc/detach_doc/edit_hold/edit_release/
     // subscribe). Returns true if `method` was one of ours; result/isError as
     // in Server::dispatch.
@@ -71,10 +76,12 @@ public:
     // `userId`/`userDisplay` are the connection's optional multi-user identity
     // (from hello params.user); empty when unset. `warning` (when set) is appended
     // to the successful result by the caller — the implicit-attach "doc has
-    // another writer" path.
+    // another writer" path. cellPolicyRead is a trusted server policy decision,
+    // never taken from client params; ignored for desktop connections.
     bool preCall(int clientId, const std::string& kind, const std::string& userId,
                  const std::string& userDisplay, const std::string& method,
-                 nlohmann::json& params, nlohmann::json& err, std::string& warning);
+                 nlohmann::json& params, nlohmann::json& err, std::string& warning,
+                 bool cellPolicyRead = false);
 
     // Response post-processing after a SUCCESSFUL engine call: revision sniff,
     // implicit attach of minted docs, event fanout, _foreign_edits injection.
@@ -91,7 +98,8 @@ public:
     // Stamp each doc_list entry with "origin_kind" (the kind of the client that
     // MINTED the doc: gui|mcp|agent|test, or "unknown"). Lets a GUI that connected
     // AFTER a doc was created recover its user-vs-AI ownership on bootstrap.
-    void annotateDocList(nlohmann::json& result);
+    // other_writer reports rw attachments outside the caller's writer group.
+    void annotateDocList(nlohmann::json& result, int clientId);
 
     // True if a client OTHER than `clientId` currently holds an rw attach on
     // `docId`. Server uses this to degrade a doc_close into a plain detach so one
@@ -118,6 +126,11 @@ public:
     // NEVER the engine or the doc's per-doc mutex — so a GUI can populate a mirror
     // tab for a doc another client is mid-write on without queueing behind it.
     nlohmann::json lastPushFor(const std::string& docId);
+
+    // Background verification refreshes an existing revision without inventing a
+    // writer or attachment. Raced revisions/internal docs are ignored; recipients
+    // must be both attached and subscribed, including the original source.
+    void publishCacheRefresh(const std::string& docId, const nlohmann::json& response);
 
     // Client disconnected: drop its attachments/holds/subscriptions and notify
     // remaining subscribers (doc.lease_change). Docs left with NO attached
@@ -162,6 +175,8 @@ public:
     // Shared fail-closed classification used by daemon containment. Methods not
     // listed here are treated as protected even when the engine does not know them.
     static bool isReadOnlyMethod(const std::string& method);
+    // Original document-only predicate for desktop entitlement and edit policy.
+    static bool isDesktopReadOnlyMethod(const std::string& method);
 
 
 private:
@@ -180,12 +195,16 @@ private:
         Hold hold;
         long revision = -1;  // last revision the daemon observed for this doc
         int lastWriterClient = -1;
+        // Preserve group attribution even after the source connection disconnects.
+        std::string lastWriterGroup;
+        std::map<std::string, long> groupLastSeenRev;
         std::string lastWriterKind;
         std::string lastWriterMethod;
         // Multi-user identity of the last writer (from hello params.user). Empty
         // strings when the writer did not declare a user (local single-seat).
         std::string lastWriterUserId;
         std::string lastWriterUserDisplay;
+        std::string lastWriterActorKey;
         // Kind of the client that minted this doc (gui|mcp|agent|test). Immutable
         // once set — the origin of ownership (user vs AI). Empty = unknown.
         std::string originKind;
@@ -236,6 +255,10 @@ private:
     // No-op when doc-GC is disabled.
     static void updateOrphanDeadlineLocked(DocState& d);
     int rwCountLocked(const DocState& d) const;
+    const std::string& writerGroupLocked(int clientId) const;
+    bool sameWriterLocked(int a, int b) const;
+    long& lastSeenRevLocked(DocState& d, int clientId);
+    void forgetDetachedGroupLocked(DocState& d, int clientId);
     // Queue an event for every subscriber of `docId` except `exceptClient`. Drops the
     // event outright when the doc is internal (see DocState::internal).
     void fanoutLocked(const std::string& docId, const nlohmann::json& evt, int exceptClient,
@@ -247,6 +270,12 @@ private:
 
     std::mutex mtx_;
     std::map<std::string, DocState> docs_;
+    std::map<int, std::string> writerGroups_;
+    struct CellPrincipal {
+        std::string actorKey;
+        bool readOnly = false;
+    };
+    std::map<int, CellPrincipal> cellPrincipals_;
     // client_id -> subscribed doc ids; the "*" entry means everything.
     std::map<int, std::set<std::string>> subs_;
     EventSender send_;

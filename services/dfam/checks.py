@@ -64,28 +64,94 @@ def rounded(value):
     return value
 
 
-def _smooth_groups(g, tids):
-    """Weld display vertices by position, then split at sharp normal creases."""
-    if len(tids) < 6:
-        return []
-    vertices = g.triangles[tids].reshape(-1, 3)
-    _, welded = np.unique(np.round(vertices / 1e-4).astype(np.int64), axis=0, return_inverse=True)
+def _edge_pairs(g, tids):
+    """(left, right, unit shared-edge direction, edge length) for edge-adjacent triangles.
+
+    Display and STL vertices are welded by position first; left/right index into `tids`."""
+    corners = g.triangles[tids]
+    _, welded = np.unique(np.round(corners.reshape(-1, 3) / 1e-4).astype(np.int64), axis=0,
+                          return_inverse=True)
     faces = welded.reshape(-1, 3)
     edges = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    vectors = np.concatenate([corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 1],
+                              corners[:, 0] - corners[:, 2]])
     edges.sort(axis=1)
     owners = np.tile(np.arange(len(tids)), 3)
     order = np.lexsort((edges[:, 1], edges[:, 0]))
     adjacent = np.all(edges[order[1:]] == edges[order[:-1]], axis=1)
-    left, right = owners[order[:-1]][adjacent], owners[order[1:]][adjacent]
-    smooth = np.einsum("ij,ij->i", g.normals[tids[left]], g.normals[tids[right]]) > math.cos(math.radians(20))
-    left, right = left[smooth], right[smooth]
+    first = order[:-1][adjacent]
+    lengths = np.linalg.norm(vectors[first], axis=1)
+    direction = vectors[first] / np.maximum(lengths, 1e-30)[:, None]
+    return owners[first], owners[order[1:][adjacent]], direction, lengths
+
+
+def _labels(count: int, left, right) -> np.ndarray:
+    """Connected-component label per node of the undirected (left, right) graph."""
     graph = csr_matrix((np.ones(2*len(left), dtype=np.int8),
                         (np.concatenate([left, right]), np.concatenate([right, left]))),
-                       shape=(len(tids), len(tids)))
-    count, labels = connected_components(graph, directed=False)
+                       shape=(count, count))
+    return connected_components(graph, directed=False)[1]
+
+
+def _components(tids, labels) -> list:
+    """Groups of `tids` (6+ triangles) sharing a label."""
     order = np.argsort(labels, kind="stable")
-    offsets = np.searchsorted(labels[order], np.arange(count+1))
+    offsets = np.searchsorted(labels[order], np.arange(labels.max(initial=-1)+2))
     return [tids[order[a:b]] for a, b in zip(offsets[:-1], offsets[1:]) if b-a >= 6]
+
+
+def _smooth_groups(g, tids):
+    """Weld display vertices by position, then split at sharp normal creases."""
+    if len(tids) < 6:
+        return []
+    left, right, _, _ = _edge_pairs(g, tids)
+    smooth = np.einsum("ij,ij->i", g.normals[tids[left]], g.normals[tids[right]]) > math.cos(math.radians(20))
+    return _components(tids, _labels(len(tids), left[smooth], right[smooth]))
+
+
+_PARALLEL_COS = math.cos(math.radians(1))
+
+
+def _axial_patches(g, tids):
+    """Cylinder patches inside one smooth raw-mesh group that is not a cylinder as a whole.
+
+    A crease-angle smooth group welds a bore to the countersink, fillet or wall it meets
+    tangentially (6-axis wrist STL: two 1.8 mm bores, their countersinks and every filleted
+    face were one 5599-triangle group), so the group never fits a cylinder and the hole goes
+    unseen. Every facet crease of a tessellated cylinder runs parallel to its axis, and that
+    axial edge is each facet's longest crease. Triangles are joined only across a crease that
+    is the longest crease of both, or across a flat edge (the other half of a facet quad)
+    when both longest creases are parallel; a patch whose internal creases are not all
+    parallel is not a cylinder and is dropped (torus and cone bands)."""
+    left, right, direction, lengths = _edge_pairs(g, tids)
+    dot = np.einsum("ij,ij->i", g.normals[tids[left]], g.normals[tids[right]])
+    flat = dot >= math.cos(math.radians(.5))
+    crease = ~flat & (dot > math.cos(math.radians(20)))
+    if crease.sum() < 3:
+        return []
+    # Longest crease edge per triangle; a triangle without a crease joins no patch.
+    edge = np.tile(np.flatnonzero(crease), 2)
+    owner = np.concatenate([left[crease], right[crease]])
+    order = np.lexsort((-lengths[edge], owner))
+    owner, edge = owner[order], edge[order]
+    first = np.flatnonzero(np.r_[True, owner[1:] != owner[:-1]])
+    longest = np.full(len(tids), -1)
+    longest[owner[first]] = edge[first]
+    defined = longest >= 0
+    axis = np.zeros((len(tids), 3))
+    axis[defined] = direction[longest[defined]]
+    index = np.arange(len(left))
+    join = ((crease & (longest[left] == index) & (longest[right] == index)) |
+            (flat & defined[left] & defined[right] &
+             (np.abs(np.einsum("ij,ij->i", axis[left], axis[right])) >= _PARALLEL_COS)))
+    labels = _labels(len(tids), left[join], right[join])
+    labels[~defined] = -1
+    # Every crease inside one patch must run along that patch's axis.
+    inside = crease & (labels[left] == labels[right]) & (labels[left] >= 0)
+    skew = inside & (np.abs(np.einsum("ij,ij->i", direction, axis[left])) < _PARALLEL_COS)
+    labels[np.isin(labels, labels[left[skew]])] = -1
+    keep = labels >= 0
+    return _components(tids[keep], labels[keep])
 
 
 @dataclass
@@ -154,17 +220,26 @@ class CheckContext:
             return self._holes
         candidates = []
         g = self.geom
-        groups = []
+        groups = []  # (triangle ids, raw smooth group that may hide cylinders)
         for fid, info in enumerate(g.mesh.faces):
             tids = np.flatnonzero(g.mesh.tri_face == fid)
             if info.surf_type in (1, 4, 5) and len(tids) >= 6:
-                groups.append(tids)
+                groups.append((tids, False))
             elif info.surf_type == 6:
-                groups.extend(_smooth_groups(g, tids))
-        groups.extend(_smooth_groups(g, np.flatnonzero(g.mesh.tri_face < 0)))
-        for tids in groups:
+                groups.extend((group, True) for group in _smooth_groups(g, tids))
+        groups.extend((group, True) for group in _smooth_groups(g, np.flatnonzero(g.mesh.tri_face < 0)))
+        fits = []
+        for tids, raw in groups:
             fit = fit_cylinder(g.triangles[tids].reshape(-1, 3), np.repeat(g.normals[tids], 3, axis=0))
-            if fit is not None and fit["concave"]:
+            if fit is not None:
+                fits.append((tids, fit))
+            elif raw:
+                for patch in _axial_patches(g, tids):
+                    fit = fit_cylinder(g.triangles[patch].reshape(-1, 3), np.repeat(g.normals[patch], 3, axis=0))
+                    if fit is not None:
+                        fits.append((patch, fit))
+        for tids, fit in fits:
+            if fit["concave"]:
                 fit = dict(fit, tids=tids)
                 # CAD kernels can split a single cylindrical wall into multiple faces.
                 duplicate = None
@@ -502,8 +577,17 @@ def _enclosed_support(ctx: CheckContext) -> tuple[float, float]:
     exterior_ids = exterior_ids[exterior_ids != 0]
     exterior = np.isin(labels, exterior_ids)
     if exterior.any():
-        reachable = ndimage.binary_dilation(exterior, mask=air,
-                    iterations=math.ceil(ctx.params.access_mm / (2 * vox.cell)) + 1)
+        # The tool reaches every air cell within one tool radius plus one voxel of an
+        # exterior centre, through air. A Euclidean ball, not an iterated 6-neighbour
+        # dilation: that is an octahedron reaching only 2/sqrt(3) mm along a 3D diagonal,
+        # so every concave wall/ceiling corner of the support envelope read as unreachable
+        # (6-axis upper arm: all 84 inaccessible voxels sat 1.5-1.73 mm from a tool centre,
+        # 0.5 mm from a wall). Components keep the reach from jumping through a wall.
+        steps = math.ceil(ctx.params.access_mm / (2 * vox.cell)) + 1
+        near = air & (ndimage.distance_transform_edt(~exterior) <= steps)
+        near_labels, _ = ndimage.label(near)
+        touched = np.unique(near_labels[exterior])
+        reachable = np.isin(near_labels, touched[touched != 0])
     else:
         reachable = np.zeros_like(air)
     inaccessible = mask & ~reachable
@@ -530,15 +614,15 @@ def _voxel_region(ctx: CheckContext, indexes: np.ndarray, **numbers) -> dict:
                       bbox_mm=[model.min(axis=0), model.max(axis=0)], **numbers)
 
 
-def _inaccessible_regions(ctx: CheckContext) -> tuple[list, int]:
-    """(regions, cluster count) for the support that no tool can reach.
+def _inaccessible_regions(ctx: CheckContext) -> tuple[list, int, bool]:
+    """(regions, cluster count, any cluster trapped) for the support that no tool can reach.
 
     One region per connected cluster of inaccessible support voxels, so the row says WHERE
     the trapped support is, not only how much support the part needs. Only the ctx.limit
     most severe clusters (trapped first, then by volume) become regions."""
     state, vox = ctx._inaccessible, ctx.vox
     if state is None or not state["mask"].any():
-        return [], 0
+        return [], 0, False
     labels, count = ndimage.label(state["mask"], structure=np.ones((3, 3, 3), dtype=bool))
     sizes = np.bincount(labels.ravel(), minlength=count+1)
     sealed = np.bincount(labels[state["sealed"]], minlength=count+1)
@@ -555,13 +639,15 @@ def _inaccessible_regions(ctx: CheckContext) -> tuple[list, int]:
         regions.append(_voxel_region(ctx, indexes, classification="inaccessible_support",
                                      cause="sealed_cavity" if sealed[label] else "narrow_opening",
                                      status="fail" if trapped(label) else "warn"))
-    return regions, count
+    return regions, count, bool(selected) and trapped(selected[0])
 
 
 def _trapped(enclosed: float, voxel_mm: float) -> bool:
-    """Enclosed support worth failing a part for: at least 8 voxels and 10 mm³ (a ~2 mm
-    cube of support no tool can reach). Smaller islands are raster noise at a cavity mouth
-    or a crumb that falls out; they stay a warning."""
+    """One connected body of enclosed support worth failing a part for: at least 8 voxels
+    and 10 mm³ (a ~2 mm cube of support no tool can reach). Smaller islands are raster
+    noise at a cavity mouth or a crumb that falls out; they stay a warning, and separate
+    crumbs do not add up to a trapped body (6-axis turntable: 50 wall-corner crumbs of at
+    most 1.125 mm³, every region a warning, summed to a 12.4 mm³ row failure)."""
     return enclosed >= max(8 * voxel_mm ** 3, 10.0)
 
 
@@ -569,10 +655,9 @@ def support(ctx: CheckContext) -> dict:
     data, p, peel = support_data(ctx), ctx.params, ctx.peel
     volume = data["volume"]
     enclosed, voxel_volume = _enclosed_support(ctx) if volume > 0 else (0., 0.)
-    trapped = volume > 0 and _trapped(enclosed, ctx.vox.cell)
+    clusters, cluster_count, trapped = _inaccessible_regions(ctx) if enclosed > 0 else ([], 0, False)
     status = "fail" if trapped else "warn" if data["on_model_area"] > 0 or enclosed > 0 else "pass"
     tids = np.unique(peel.tri[data["needed"]])
-    clusters, cluster_count = _inaccessible_regions(ctx) if enclosed > 0 else ([], 0)
     regions = []
     for group in ctx.groups(tids):
         ids = np.flatnonzero(data["needed"] & np.isin(peel.tri, group))
@@ -632,7 +717,6 @@ def internal_voids(ctx: CheckContext) -> dict:
     sizes = np.bincount(labels.ravel())
     void_volume = float(sizes[sealed].sum() * vox.cell**3)
     enclosed = _enclosed_support(ctx)[0] if len(sealed) and p.process == "fdm" else 0.
-    trapped = _trapped(enclosed, vox.cell)
     # SLA/SLS trap resin or powder in every sealed cavity. FDM fails a cavity only when the
     # support inside it cannot be removed.
     trapped_in = np.zeros(len(sizes))
@@ -642,6 +726,8 @@ def internal_voids(ctx: CheckContext) -> dict:
     def cavity_status(label: int) -> str:
         return "fail" if p.process in ("sla", "sls") or _trapped(float(trapped_in[label]), vox.cell) else "warn"
 
+    # The row fails on a cavity that traps support, not on crumbs summed across the part.
+    trapped = any(cavity_status(label) == "fail" for label in sealed)
     cavities = ndimage.find_objects(labels)
     selected = sorted(sealed, key=lambda label: (cavity_status(label) != "fail", -sizes[label], label))
     regions = []

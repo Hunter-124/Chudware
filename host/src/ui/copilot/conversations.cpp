@@ -5,15 +5,23 @@
 // with the send path in composer.cpp.
 
 #include "copilot_internal.h"
+#include "ui/clipboard_image.h"
+#include "ui/copilot/inline_image_refs.h"
 
 #include "ui/ai/agent_dag.h"  // ui::agentDagToJson / agentDagFromJson — persist the live
                               // agent-execution DAG with the active session's artifacts.
 
 #include "conv_ids.h"  // session-id allocation (GL-free TU, unit-tested in host/tests)
 #include "ui/chudcode_session_actions.h"  // per-conversation Chudcode session link (GL-free TU)
+#include "core/jobs.h"
+#include "core/fs_backend.h"
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <cerrno>
+#include <map>
+#include <memory>
+#include "chat_message_snapshot.h"
 
 // Resolve the live message vector for a conversation id — see core/app_state.h for the
 // contract. Global scope (not ui::) to match its app_state.h declaration.
@@ -44,21 +52,26 @@ namespace ui {
 // zero-length chat_history.json — every session gone. fsync the tmp file before the rename and
 // fsync the containing directory after it, so the visible file always has complete contents.
 // No-op on Windows/WASM (previous behavior preserved there).
-static void fsyncPath(const std::string& p, bool isDir) {
+static bool fsyncPath(const std::string& p, bool isDir) {
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
     const int fd = ::open(p.c_str(), isDir ? (O_RDONLY | O_DIRECTORY) : O_RDONLY);
-    if (fd < 0) return;
-    ::fsync(fd);
+    if (fd < 0) return false;
+    int rc;
+    do { rc = ::fsync(fd); } while (rc < 0 && errno == EINTR);
     ::close(fd);
+    return rc == 0;
 #else
     (void)p;
     (void)isDir;
+    return true;
 #endif
 }
 
-// Write `data` to `path` atomically and durably. Returns false if nothing was written (callers
-// treat that as "still dirty" so the next tick retries instead of silently losing the state).
-bool atomicWriteFileDurable(const std::string& path, const std::string& data) {
+// A rename may succeed even when its directory flush fails. Keep that distinction private:
+// the writer must still own the visible file so a later deletion can prune it on retry.
+static bool atomicWriteFileDurableImpl(const std::string& path, const std::string& data,
+                                       bool* replaced) {
+    if (replaced) *replaced = false;
     namespace fs = std::filesystem;
     const std::string tmp = path + ".tmp";
     try {
@@ -69,23 +82,49 @@ bool atomicWriteFileDurable(const std::string& path, const std::string& data) {
             out.flush();
             if (!out) return false;
         }
-        fsyncPath(tmp, /*isDir=*/false);
+        if (!fsyncPath(tmp, /*isDir=*/false)) return false;
         std::error_code ec;
         fs::rename(tmp, path, ec);
         if (ec) {
+#if defined(_WIN32)
             // Windows sometimes needs remove-then-rename; last-resort non-atomic.
             fs::remove(path, ec);
             ec.clear();
             fs::rename(tmp, path, ec);
+#endif
             if (ec) return false;
         }
+        if (replaced) *replaced = true;
         const fs::path parent = fs::path(path).parent_path();
-        if (!parent.empty()) fsyncPath(parent.string(), /*isDir=*/true);
+        if (!parent.empty() && !fsyncPath(parent.string(), /*isDir=*/true)) return false;
         return true;
     } catch (...) {
         return false;
     }
 }
+
+bool atomicWriteFileDurable(const std::string& path, const std::string& data) {
+    return atomicWriteFileDurableImpl(path, data, nullptr);
+}
+
+}  // namespace ui
+#ifndef __EMSCRIPTEN__
+#include "chat_persistence.h"
+#endif
+namespace ui {
+#ifndef __EMSCRIPTEN__
+static chat_persistence::Writer& chatWriter() {
+    static chat_persistence::Writer writer;
+    return writer;
+}
+static void reportChatSaveFailure(AppState& st) {
+    const std::string error = chatWriter().takeError();
+    if (!error.empty()) {
+        st.addLog(error);
+        markChatHistoryDirty();
+    }
+}
+#endif
 
 #ifdef __EMSCRIPTEN__
 // Shared workspace chat (GET/PUT /workspace/chat). IDBFS remains local cache/fallback.
@@ -190,6 +229,7 @@ static nlohmann::json promptDraftObject(const AppState& st) {
     nlohmann::json o = nlohmann::json::object();
     o["text"] = composerText(st);
     o["attachments"] = st.pendingAttachments;
+    o["inline_images"] = st.pendingInlineImagePaths;
     o["context_refs"] = serializePendingContextRefs(st);
     return o;
 }
@@ -205,10 +245,12 @@ static bool promptDraftIsEmpty(const nlohmann::json& o) {
     return true;
 }
 
+#ifdef __EMSCRIPTEN__
 // Stable fingerprint for debounce (text + paths + ref ids).
 static std::string promptDraftFingerprint(const AppState& st) {
     return promptDraftObject(st).dump();
 }
+#endif
 
 static void applyPromptDraftObject(AppState& st, const nlohmann::json& d) {
     std::string text;
@@ -224,8 +266,10 @@ static void applyPromptDraftObject(AppState& st, const nlohmann::json& d) {
     const size_t n = std::min(text.size(), st.prompt.size() - 1);
     if (n) std::memcpy(st.prompt.data(), text.data(), n);
     st.prompt[n] = 0;
+    composerResetInputState(st);
 
     st.pendingAttachments.clear();
+    st.pendingInlineImagePaths.clear();
     st.pendingContextRefs.clear();
     if (!d.is_object()) return;
 
@@ -239,11 +283,73 @@ static void applyPromptDraftObject(AppState& st, const nlohmann::json& d) {
                 st.pendingAttachments.push_back(std::move(path));
         }
     }
+    if (d.contains("inline_images") && d["inline_images"].is_array()) {
+        // Keep order, duplicates and empty detached slots: #N indexes this exact roster.
+        for (const auto& image : d["inline_images"])
+            st.pendingInlineImagePaths.push_back(image.is_string()
+                ? image.get<std::string>() : std::string());
+    }
+    if (!d.contains("inline_images")) {
+        // Pre-numbered drafts stored pasted images among ordinary attachments. Promote once;
+        // a modern draft with zero surviving references must NOT resurrect its deleted images.
+        for (auto it = st.pendingAttachments.begin(); it != st.pendingAttachments.end();) {
+            if (!ui::isImageAttachment(*it)) { ++it; continue; }
+            if (!text.empty()) text += "\n";
+            text += ui::copilot::inlineImageMarker(st.pendingInlineImagePaths.size());
+            st.pendingInlineImagePaths.push_back(*it);
+            it = st.pendingAttachments.erase(it);
+        }
+        if (st.prompt.size() < text.size() + 1) st.prompt.resize(text.size() + 64, 0);
+        std::memset(st.prompt.data(), 0, st.prompt.size());
+        std::memcpy(st.prompt.data(), text.data(), text.size());
+        composerResetInputState(st);
+    }
     if (d.contains("context_refs"))
         st.pendingContextRefs = core::contextRefsFromJson(d["context_refs"]);
 }
 
+#ifndef __EMSCRIPTEN__
+static nlohmann::json& residentPromptDrafts() {
+    static nlohmann::json root = [] {
+        nlohmann::json loaded = nlohmann::json::object();
+        std::ifstream in(promptDraftsPath());
+        if (in) { try { in >> loaded; } catch (...) {} }
+        return loaded.is_object() ? loaded : nlohmann::json::object();
+    }();
+    return root;
+}
+static void persistPromptDrafts(AppState& st, bool immediate) {
+    chat_persistence::Snapshot snapshot;
+    snapshot.files[promptDraftsPath()] =
+        std::make_shared<const std::string>(residentPromptDrafts().dump(1));
+    chatWriter().submit(std::move(snapshot));
+    if (immediate && !chatWriter().flush()) markChatHistoryDirty();
+    reportChatSaveFailure(st);
+}
+#endif
+
 void savePromptDraft(AppState& st, bool force) {
+#ifndef __EMSCRIPTEN__
+    static std::string lastKey;
+    static double lastWrite = -1e9;
+    const std::string key = promptDraftKey(st);
+    const nlohmann::json draft = promptDraftObject(st);
+    const double now = ImGui::GetTime();
+    if (!force && key == lastKey && now - lastWrite < 0.40) return;
+    auto& root = residentPromptDrafts();
+    bool changed = false;
+    if (promptDraftIsEmpty(draft)) changed = root.erase(key) != 0;
+    else {
+        auto old = root.find(key);
+        changed = old == root.end() || *old != draft;
+        if (changed) root[key] = draft;
+    }
+    lastKey = key;
+    lastWrite = now;
+    if (changed) persistPromptDrafts(st, force);
+    else if (force && !chatWriter().flush()) markChatHistoryDirty();
+    reportChatSaveFailure(st);
+#else
     // Per-key debounce so switching conversations never confuses last-write state.
     static std::string s_lastKey;
     static std::string s_lastSaved;
@@ -273,12 +379,23 @@ void savePromptDraft(AppState& st, bool force) {
         if (promptDraftIsEmpty(draft)) root.erase(key);
         else root[key] = draft;
         fs::create_directories(appdataAppDir());
-        atomicWriteFileDurable(path, root.dump(1));
+        if (!atomicWriteFileDurable(path, root.dump(1))) {
+            s_lastKey.clear();
+            s_lastSaved.clear();
+            st.addLog("[chat] draft save failed; pending composer will be retried");
+        }
     } catch (...) {
+        s_lastKey.clear();
+        s_lastSaved.clear();
+        st.addLog("[chat] draft save failed; pending composer will be retried");
     }
+#endif
 }
 
 void clearPromptDraft(AppState& st) {
+#ifndef __EMSCRIPTEN__
+    if (residentPromptDrafts().erase(promptDraftKey(st))) persistPromptDrafts(st, true);
+#else
     try {
         namespace fs = std::filesystem;
         const std::string path = promptDraftsPath();
@@ -295,18 +412,24 @@ void clearPromptDraft(AppState& st) {
         // Reset debounce fingerprint so a subsequent empty composer doesn't rewrite.
     } catch (...) {
     }
+#endif
 }
 
 static void restorePromptDraft(AppState& st) {
     // Don't clobber a non-empty composer (user already typing) — session switch clears first.
     if (st.prompt.data() && st.prompt.data()[0] != '\0') return;
     // Also skip if chips already present (e.g. mid-frame attach) unless both empty.
-    if (!st.pendingAttachments.empty() || !st.pendingContextRefs.empty()) return;
+    if (!st.pendingAttachments.empty() || !st.pendingInlineImagePaths.empty() ||
+        !st.pendingContextRefs.empty()) return;
     try {
+#ifndef __EMSCRIPTEN__
+        const auto& root = residentPromptDrafts();
+#else
         std::ifstream in(promptDraftsPath());
         if (!in) return;
         nlohmann::json root;
         in >> root;
+#endif
         if (!root.is_object()) return;
         auto it = root.find(promptDraftKey(st));
         if (it == root.end()) return;
@@ -362,7 +485,13 @@ std::string comparablePath(const std::filesystem::path& path) {
 
 std::string convProjectKey(std::string_view rawDir) {
     if (rawDir.empty()) return std::string();
+#ifdef __EMSCRIPTEN__
+    std::string relative, err;
+    if (!chudware::workspaceRelativePath(std::string(rawDir), relative, err)) return {};
+    return relative.empty() ? "." : relative;
+#else
     return comparablePath(lexicalPath(rawDir));
+#endif
 }
 
 // The project folder chat belongs to: the selected working directory (Explorer root), and
@@ -1004,10 +1133,13 @@ void appendChatRawMessage(AppState& st, const ChatMsg& message) noexcept {
 }
 
 static void archiveChangedChatMessages(const std::string& conversationId,
-                                       const std::vector<ChatMsg>& messages) noexcept {
+                                       const std::vector<ChatMsg>& messages,
+                                       const std::vector<chat_persistence::MessageSnapshot>& previous) noexcept {
     try {
         bindChatRawOwners(conversationId, messages);
         for (size_t i = 0; i < messages.size(); ++i) {
+            if (i < previous.size() &&
+                chat_persistence::sameMessage(previous[i].source, messages[i], false)) continue;
             const nlohmann::json payload = rawMessageToJson(messages[i]);
             const std::string snapshot = payload.dump();
             bool changed = false;
@@ -1081,28 +1213,38 @@ ChatRawActivityCapture::~ChatRawActivityCapture() {
 // Defined near the lifecycle functions below.
 static bool conversationIsFresh(const AppState& st, int idx);
 
-// Persist EVERY resident session as ONE flat list (schema v2) — sessions are
-// document-independent, so the store is a simple {"version":2,"active","sessions":[…]}
-// object fully described by the resident state (no load-modify-merge per document key;
-// every session is resident by design). Fresh sessions (no messages, no queue, no run) are
-// never written — same rule as empty parts never autosaving.
-void persistChatHistory(AppState& st) {
-    if (st.conversations.empty()) return;
+// Reuse exact immutable session snapshots; only changed messages are serialized. Desktop
+// debounce submits to the ordered durable writer, while explicit callers retain a barrier.
+static std::map<std::string, chat_persistence::SessionSnapshot> s_sessionSnapshots;
+static void snapshotChatHistory(AppState& st, bool immediate) {
+#ifndef __EMSCRIPTEN__
+    chat_persistence::Snapshot snapshot;
+    snapshot.history = true;
+    snapshot.directory = chatSessionsDir();
+    snapshot.indexPath = chatSessionsIndexPath();
+    snapshot.owned = s_pruneableSessionStems;
+#else
+    (void)immediate;
     namespace fs = std::filesystem;
     std::error_code dirEc;
     fs::create_directories(chatSessionsDir(), dirEc);
-    nlohmann::json sessions = nlohmann::json::array();  // WASM shared push only
+    nlohmann::json sessions = nlohmann::json::array();
+#endif
     nlohmann::json order = nlohmann::json::array();
     std::set<std::string> writtenIds;  // defensive: never write an id twice in one snapshot
     std::string activeId;
     // A PARKED session whose only content is an unsent composer draft (saved under its
     // docKey/id key in prompt_drafts.json) is not "fresh" — the session is the draft's only
     // anchor; dropping it strands the user's typed text in an unreachable drafts entry.
+#ifndef __EMSCRIPTEN__
+    const auto& drafts = residentPromptDrafts();
+#else
     nlohmann::json drafts = nlohmann::json::object();
     {
         std::ifstream in(promptDraftsPath());
         if (in) { try { in >> drafts; } catch (...) { drafts = nlohmann::json::object(); } }
     }
+#endif
     auto sessionHasDraft = [&](const std::string& id) {
         if (!drafts.is_object() || id.empty()) return false;
         const std::string suffix = "/" + id;  // "/" anchor: c1 must not match c12
@@ -1133,12 +1275,85 @@ void persistChatHistory(AppState& st) {
             chudcodeSessionLinkRekey(clashed, st.conversations[i].id);
         }
         if (i == st.activeConv) activeId = st.conversations[i].id;
+        auto& cached = s_sessionSnapshots[st.conversations[i].id];
+        const auto& liveMsgs = i == st.activeConv ? st.chat : st.conversations[i].msgs;
+        nlohmann::json convObj = {{"id", st.conversations[i].id},
+                                 {"title", st.conversations[i].title}};
+        if (s_userTitled.count(st.conversations[i].id)) convObj["title_user"] = true;
+        // Optional document LINK (reference only — never an ownership key).
+        if (!st.conversations[i].docLink.empty())
+            convObj["doc"] = st.conversations[i].docLink;
+        // Project scope follows the workspace of the last launched turn.
+        if (!st.conversations[i].projectDir.empty())
+            convObj["project"] = st.conversations[i].projectDir;
+        if (st.conversations[i].archived) convObj["archived"] = true;
+        // Chudcode runtime link (id/file/health) — metadata only, never a second transcript.
+        chudcodeLinkPersist(st.conversations[i].id, convObj);
+#ifdef __EMSCRIPTEN__
+        const auto cellSession = cellAgentSessionHandle(st.conversations[i].id);
+        if (!cellSession.empty()) convObj["cell_session_id"] = cellSession;
+        const auto cellProvider = cellAgentSessionProvider(st.conversations[i].id);
+        if (!cellProvider.empty()) convObj["cell_session_provider"] = cellProvider;
+#endif
+        // Every session owns its agent-execution DAG (the live store is conversation-keyed) —
+        // save each one as a session artifact so the workflow trace survives a reopen.
+        nlohmann::json dag = ui::agentDagToJson(st.conversations[i].id);
+        if (dag.is_object() && dag.contains("nodes") && !dag["nodes"].empty())
+            convObj["agent_dag"] = std::move(dag);
+        const int lct = (i == st.activeConv) ? st.lastContextTokens
+                                             : st.conversations[i].lastContextTokens;
+        if (lct > 0) convObj["last_context_tokens"] = lct;
+        const auto& qp = (i == st.activeConv) ? st.queuedPrompts
+                                              : st.conversations[i].queuedPrompts;
+        if (!qp.empty()) convObj["queued_prompts"] = qp;
+        const auto& qd = (i == st.activeConv) ? st.queuedPromptDrafts
+                                              : st.conversations[i].queuedPromptDrafts;
+        if (!qd.empty()) convObj["queued_prompt_drafts"] = qd;
+        if (!st.conversations[i].branches.empty()) {
+            convObj["branches"] = nlohmann::json::array();
+            for (const auto& b : st.conversations[i].branches)
+                convObj["branches"].push_back({{"id", b.id}, {"label", b.label},
+                                              {"when", b.when}, {"from", b.fromMsgIdx}});
+        }
+        auto unchanged = [&](const std::vector<ChatMsg>& msgs, const std::string& key) {
+            const auto old = cached.messages.find(key);
+            if (old == cached.messages.end() || old->second.size() != msgs.size()) return false;
+            for (size_t mi = 0; mi < msgs.size(); ++mi)
+                if (!chat_persistence::sameMessage(old->second[mi].source, msgs[mi])) return false;
+            return true;
+        };
+        bool same = cached.bytes && cached.metadata == convObj && unchanged(liveMsgs, "");
+        for (const auto& b : st.conversations[i].branches)
+            if (same && !unchanged(b.msgs, b.id)) same = false;
+        if (same) {
+#ifdef __EMSCRIPTEN__
+            sessions.push_back(cached.wire);
+            if (!cached.durable) {
+                cached.durable = atomicWriteFileDurable(chatSessionFilePath(st.conversations[i].id),
+                                                        *cached.bytes);
+                if (!cached.durable) markChatHistoryDirty();
+                else s_pruneableSessionStems.insert(chatSessionFileStem(st.conversations[i].id));
+            }
+#else
+            snapshot.files[chatSessionFilePath(st.conversations[i].id)] = cached.bytes;
+            snapshot.keep.insert(chatSessionFileStem(st.conversations[i].id));
+#endif
+            order.push_back(st.conversations[i].id);
+            continue;
+        }
+        cached.metadata = convObj;
         // One serializer, used for the live transcript AND for any revert branches parked
         // on this session — a branch is real conversation history and must round-trip
         // through exactly the same shape, not a lossy summary of it.
-        auto serializeMsgs = [&](const std::vector<ChatMsg>& msgs) {
+        auto serializeMsgs = [&](const std::vector<ChatMsg>& msgs, const std::string& key) {
+        auto& previous = cached.messages[key];
         nlohmann::json jm = nlohmann::json::array();
-        for (const auto& m : msgs) {
+        for (size_t mi = 0; mi < msgs.size(); ++mi) {
+            const auto& m = msgs[mi];
+            if (mi < previous.size() && chat_persistence::sameMessage(previous[mi].source, m)) {
+                jm.push_back(previous[mi].wire);
+                continue;
+            }
             std::string body = m.text;
             if (body.empty() && !m.fromUser && !m.activity.empty() && !m.steerSplit) {
                 // Design/build turns put their result in the activity timeline, not
@@ -1170,6 +1385,10 @@ void persistChatHistory(AppState& st) {
             nlohmann::json entry = {{"u", m.fromUser}, {"t", body}, {"e", m.errKind}};
             if (emptyTurn) entry["empty"] = true;
             if (m.steerSplit) entry["split"] = true;
+            if (m.fromUser && m.steerState != STEER_NONE) {
+                entry["steer"] = m.steerState;
+                if (!m.steerId.empty()) entry["sid"] = m.steerId;
+            }
             // In-flight marker: this turn was still streaming when the snapshot was taken. On
             // reload it means the app died (or was killed) mid-run — see parseChatSessionJson.
             if (!m.fromUser && m.running) entry["run"] = true;
@@ -1204,7 +1423,7 @@ void persistChatHistory(AppState& st) {
             if (!m.fromUser && !m.activity.empty()) {
                 nlohmann::json act = nlohmann::json::array();
                 const int nAct = (int)m.activity.size();
-                // Keep all thought/tool/plan rows (rk 1/2/3/18) + last N stage rows so
+                // Keep all thought/tool/plan/question rows (rk 1/2/3/18/20) + last N stage rows so
                 // mid-turn kill/restart still has planning + tools visible.
                 std::vector<int> keepIdx;
                 keepIdx.reserve((size_t)nAct);
@@ -1213,7 +1432,7 @@ void persistChatHistory(AppState& st) {
                 for (int ai = nAct - 1; ai >= 0; --ai) {
                     const auto& a = m.activity[(size_t)ai];
                     const bool priority = (a.rowKind == 2 || a.rowKind == 3 ||
-                                           a.rowKind == 1 || a.rowKind == 18 ||
+                                           a.rowKind == 1 || a.rowKind == 18 || a.rowKind == 20 ||
                                            a.stage == "__stop_meta__");
                     if (priority) {
                         keepIdx.push_back(ai);
@@ -1236,7 +1455,10 @@ void persistChatHistory(AppState& st) {
                     const bool isOps = (a.stage == "stream:out" && a.opsCount > 0) ||
                                        (a.title.find("Building ops") != std::string::npos);
                     const size_t cap = isOps ? 2000u : 8000u;
-                    if (det.size() > cap) det = det.substr(0, cap - 1) + "\xe2\x80\xa6";
+                    // Tool fields are bounded at ingest; keep their caption/artifact trailers
+                    // intact so restored evidence stays on its originating timeline row.
+                    if (a.rowKind != 3 && det.size() > cap)
+                        det = det.substr(0, cap - 1) + "\xe2\x80\xa6";
                     if (!det.empty()) row["detail"] = det;
                     act.push_back(std::move(row));
                 }
@@ -1268,54 +1490,48 @@ void persistChatHistory(AppState& st) {
                 }
                 if (!arts.empty()) entry["artifacts"] = std::move(arts);
             }
+            chat_persistence::MessageSnapshot saved{m, entry};
+            if (mi < previous.size()) previous[mi] = std::move(saved);
+            else previous.push_back(std::move(saved));
             jm.push_back(std::move(entry));
         }
+        previous.resize(msgs.size());
         return jm;
         };
-        const std::vector<ChatMsg>& liveMsgs =
-            (i == st.activeConv) ? st.chat : st.conversations[i].msgs;
         // Archive the uncapped in-memory state before serializeMsgs applies the bounded
         // <id>.json representation. This also records terminal message mutations (full error,
         // final prose, plan/step state) after the creation record.
-        archiveChangedChatMessages(st.conversations[i].id, liveMsgs);
-        nlohmann::json convObj = {{"id", st.conversations[i].id},
-                                 {"title", st.conversations[i].title},
-                                 {"msgs", serializeMsgs(liveMsgs)}};
-        if (s_userTitled.count(st.conversations[i].id)) convObj["title_user"] = true;
+        archiveChangedChatMessages(st.conversations[i].id, liveMsgs, cached.messages[""]);
+        convObj["msgs"] = serializeMsgs(liveMsgs, "");
         // Revert branches: tails a rollback moved aside. Persisted so a revert stays
         // undoable after a restart.
         if (!st.conversations[i].branches.empty()) {
             nlohmann::json jb = nlohmann::json::array();
             for (const auto& b : st.conversations[i].branches)
                 jb.push_back({{"id", b.id}, {"label", b.label}, {"when", b.when},
-                              {"from", b.fromMsgIdx}, {"msgs", serializeMsgs(b.msgs)}});
+                              {"from", b.fromMsgIdx}, {"msgs", serializeMsgs(b.msgs, b.id)}});
             convObj["branches"] = std::move(jb);
         }
-        // Optional document LINK (reference only — never an ownership key).
-        if (!st.conversations[i].docLink.empty())
-            convObj["doc"] = st.conversations[i].docLink;
-        // Project scope follows the workspace of the last launched turn.
-        if (!st.conversations[i].projectDir.empty())
-            convObj["project"] = st.conversations[i].projectDir;
-        if (st.conversations[i].archived) convObj["archived"] = true;
-        // Chudcode runtime link (id/file/health) — metadata only, never a second transcript.
-        chudcodeLinkPersist(st.conversations[i].id, convObj);
-        // Every session owns its agent-execution DAG (the live store is conversation-keyed) —
-        // save each one as a session artifact so the workflow trace survives a reopen.
-        nlohmann::json dag = ui::agentDagToJson(st.conversations[i].id);
-        if (dag.is_object() && dag.contains("nodes") && !dag["nodes"].empty())
-            convObj["agent_dag"] = std::move(dag);
-        const int lct = (i == st.activeConv) ? st.lastContextTokens
-                                             : st.conversations[i].lastContextTokens;
-        if (lct > 0) convObj["last_context_tokens"] = lct;
-        const auto& qp = (i == st.activeConv) ? st.queuedPrompts
-                                              : st.conversations[i].queuedPrompts;
-        if (!qp.empty()) convObj["queued_prompts"] = qp;
-        sessions.push_back(convObj);
+        for (auto it = cached.messages.begin(); it != cached.messages.end();) {
+            const bool keep = it->first.empty() ||
+                std::any_of(st.conversations[i].branches.begin(), st.conversations[i].branches.end(),
+                            [&](const ChatBranch& b) { return b.id == it->first; });
+            if (keep) ++it;
+            else it = cached.messages.erase(it);
+        }
+        cached.wire = std::move(convObj);
+        cached.bytes = std::make_shared<const std::string>(cached.wire.dump(1));
+#ifdef __EMSCRIPTEN__
+        sessions.push_back(cached.wire);
+        cached.durable = atomicWriteFileDurable(chatSessionFilePath(st.conversations[i].id),
+                                              *cached.bytes);
+        if (!cached.durable) markChatHistoryDirty();
+        else s_pruneableSessionStems.insert(chatSessionFileStem(st.conversations[i].id));
+#else
+        snapshot.files[chatSessionFilePath(st.conversations[i].id)] = cached.bytes;
+        snapshot.keep.insert(chatSessionFileStem(st.conversations[i].id));
+#endif
         order.push_back(st.conversations[i].id);
-        // One transcript file per session — durable atomic write per file.
-        if (atomicWriteFileDurable(chatSessionFilePath(st.conversations[i].id), convObj.dump(1)))
-            s_pruneableSessionStems.insert(chatSessionFileStem(st.conversations[i].id));
     }
     // Index v3: `order` + the global `active` (fallback when no root is resolvable) +
     // `active_by_project`, so relaunching under a root lands on THAT root's last chat. The
@@ -1334,10 +1550,24 @@ void persistChatHistory(AppState& st) {
                             {"active_by_project", std::move(activeByProject)},
                             {"order", order},
                             {"session_seq", s_sessionSeq}};
+#ifndef __EMSCRIPTEN__
+    snapshot.files[snapshot.indexPath] = std::make_shared<const std::string>(index.dump(1));
+    for (auto it = s_pruneableSessionStems.begin(); it != s_pruneableSessionStems.end();) {
+        if (!snapshot.keep.count(*it)) it = s_pruneableSessionStems.erase(it);
+        else ++it;
+    }
+    chatWriter().submit(std::move(snapshot));
+    if (immediate && !chatWriter().flush()) markChatHistoryDirty();
+    reportChatSaveFailure(st);
+#else
     try {
         // Durable atomic write (tmp + fsync + rename + dir fsync) — a hard crash mid-run must
         // never be able to leave a truncated/empty transcript behind.
-        if (!atomicWriteFileDurable(chatSessionsIndexPath(), index.dump(1))) return;
+        if (!atomicWriteFileDurable(chatSessionsIndexPath(), index.dump(1))) {
+            markChatHistoryDirty();
+            st.addLog("[chat] session index save failed; pending history will be retried");
+            return;
+        }
         // Prune transcripts of sessions that no longer exist — but ONLY stems this process
         // has verifiably held live (loaded successfully or written by us: see
         // s_pruneableSessionStems). A file we cannot vouch for — crash-orphaned, corrupt at
@@ -1381,11 +1611,34 @@ void persistChatHistory(AppState& st) {
         wasmPutSharedChat(root);
 #endif
     } catch (...) {
+        markChatHistoryDirty();
+        st.addLog("[chat] session save failed; pending history will be retried");
     }
+#endif
+    for (auto it = s_sessionSnapshots.begin(); it != s_sessionSnapshots.end();) {
+        if (!writtenIds.count(it->first)) it = s_sessionSnapshots.erase(it);
+        else ++it;
+    }
+}
+
+void persistChatHistory(AppState& st) {
+    snapshotChatHistory(st, true);
+}
+
+void flushChatPersistence(AppState& st) {
+    savePromptDraft(st, true);
+    snapshotChatHistory(st, true);
+#ifndef __EMSCRIPTEN__
+    if (!chatWriter().flush()) markChatHistoryDirty();
+    reportChatSaveFailure(st);
+#endif
 }
 
 // Debounced flush while a turn is running (min 1.0s). Force bypasses the timer.
 void maybePersistChatHistoryDebounced(AppState& st, bool force) {
+#ifndef __EMSCRIPTEN__
+    reportChatSaveFailure(st);
+#endif
     if (!force && !s_chatHistoryDirty.load(std::memory_order_relaxed)) return;
     const double now = ImGui::GetTime();
     if (!force && (now - s_chatHistoryLastPersist) < 1.0) return;
@@ -1398,7 +1651,7 @@ void maybePersistChatHistoryDebounced(AppState& st, bool force) {
         return;
     s_chatHistoryDirty.store(false, std::memory_order_relaxed);
     s_chatHistoryLastPersist = now;
-    persistChatHistory(st);
+    snapshotChatHistory(st, force);
 }
 
 // A transcript restored from disk or forked into a new session owns no live stream. Keep
@@ -1439,6 +1692,12 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
         // Project scope. Legacy sessions (written before the field existed) recover one
         // below, once, after the transcript and the Chudcode link are known.
         c.projectDir = jc.value("project", std::string());
+#ifdef __EMSCRIPTEN__
+        std::string relativeProject, projectError;
+        c.projectDir = chudware::workspaceRelativePath(c.projectDir, relativeProject, projectError)
+                           ? (relativeProject.empty() ? "." : relativeProject)
+                           : ".";
+#endif
         // This session's own saved execution trace, straight into its conversation-keyed store
         // (no active/parked special case — switching sessions just reads the other tree).
         if (jc.contains("agent_dag")) ui::agentDagFromJson(c.id, jc["agent_dag"]);
@@ -1522,6 +1781,15 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
                     cm.text += std::string("\n\n") + note;
             }
             cm.steerSplit = !cm.fromUser && m.value("split", false);
+            if (cm.fromUser) {
+                cm.steerId = m.value("sid", std::string());
+                cm.steerState = m.value("steer", (int)STEER_NONE);
+                // Like an open question batch: the run that held it is gone after a reload.
+                if (cm.steerState == STEER_SENDING || cm.steerState == STEER_QUEUED)
+                    cm.steerState = STEER_FAILED;
+                if (cm.steerState < STEER_NONE || cm.steerState > STEER_FAILED)
+                    cm.steerState = STEER_NONE;
+            }
             if (cm.fromUser && m.contains("ctx"))
                 cm.contextRefs = core::contextRefsFromJson(m["ctx"]);
             if (cm.fromUser && m.contains("images") && m["images"].is_array()) {
@@ -1534,6 +1802,7 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
             if (m.contains("asks") && m["asks"].is_array())
                 for (const auto& jb : m["asks"])
                     if (jb.is_object()) cm.asks.push_back(askBatchFromJson(jb));
+            if (!cm.asks.empty()) anchorLegacyAsks(cm);
             closeDetachedTurn(cm);
             // Placeholder for a turn that produced no visible output (persisted as
             // "empty" so message ORDINALS survive the round trip — AI-VC msg_idx
@@ -1542,6 +1811,7 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
                 cm.text = "(Turn produced no visible output \xe2\x80\x94 kept to preserve chat positions.)";
             out.push_back(std::move(cm));
         }
+        ui::reconcileResolvedAskReplies(out);
         return out;
         };
         c.msgs = parseMsgs(jc.value("msgs", nlohmann::json::array()));
@@ -1564,6 +1834,11 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
             for (const auto& q : jc["queued_prompts"])
                 if (q.is_string()) c.queuedPrompts.push_back(q.get<std::string>());
         }
+        if (jc.contains("queued_prompt_drafts") && jc["queued_prompt_drafts"].is_array()) {
+            for (const auto& d : jc["queued_prompt_drafts"])
+                c.queuedPromptDrafts.push_back(d.is_object() ? d : nlohmann::json::object());
+        }
+        c.queuedPromptDrafts.resize(c.queuedPrompts.size(), nlohmann::json::object());
         // Fresh sessions are never kept (same rule as persist) — drop legacy empty entries
         // left on disk by older builds instead of resurrecting them.
         // A session reverted all the way back still holds its branches — that is user
@@ -1576,6 +1851,7 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
         // Chudcode runtime link (id/file/health): restore into the conversation-keyed
         // registry only for sessions that are actually kept.
         chudcodeLinkRestore(c.id, jc);
+#ifndef __EMSCRIPTEN__
         // Legacy project-scope recovery — ONCE, at load time, in priority order:
         //   1) the Chudcode session JSONL's own `cwd` (exactly where that run worked), then
         //   2) the old artifact heuristic against the CURRENT project root (a session that
@@ -1594,6 +1870,7 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
             }
             if (!c.projectDir.empty()) markChatHistoryDirty();
         }
+#endif
         st.conversations.push_back(std::move(c));
     }
     return true;
@@ -1710,16 +1987,27 @@ static void restoreActiveConversation(AppState& st);
 // so there is no per-document load path anymore; the WASM shared-store merge is the only
 // re-entry.
 void loadChatHistory(AppState& st) {
+#ifndef __EMSCRIPTEN__
+    // Reload is a read-after-write barrier. Never replace newer resident history with stale
+    // disk state when storage failed; the writer retains that state for its next attempt.
+    if (!chatWriter().flush()) { reportChatSaveFailure(st); return; }
+    chatWriter().forgetDurable();
+#endif
+    s_sessionSnapshots.clear();
     // Park + drop everything resident — this runs before any session work has happened
     // (or from the WASM merge, which accepts a rebuild).
     parkActiveConversation(st);
     st.chat.clear();
     st.lastContextTokens = 0;
     st.queuedPrompts.clear();
+    st.queuedPromptDrafts.clear();
     st.conversations.clear();
     st.activeConv = -1;
     // The Chudcode link registry mirrors the resident set — rebuild it with the store.
     chudcodeSessionLinksClear();
+#ifdef __EMSCRIPTEN__
+    clearCellAgentSessionHandles();
+#endif
 
     bool migratedLegacy = false;
     bool recoveredOrphan = false;
@@ -1834,6 +2122,7 @@ void loadChatHistory(AppState& st) {
             }
         }
     }
+#ifndef __EMSCRIPTEN__
     // Headless-mission sweep: Chudcode session JSONLs in the Sessions dir that NO resident
     // conversation links to (see adoptChudcodeSessionJsonl). Runs after the legacy import so
     // adopting one can never suppress that migration. Bounded and never throwing: oversized
@@ -1869,6 +2158,7 @@ void loadChatHistory(AppState& st) {
             }
         }
     }
+#endif
     // A remembered pointer is valid only for a session stored under that same project. Older
     // builds keyed whatever session was on screen under the current root, so another project's
     // chat could claim it; drop such entries (the next persist rewrites a clean index).
@@ -2094,29 +2384,8 @@ static void relinkSavedDocSessions(AppState& st) {
         relinked = true;
     }
 
-    // 2) On-disk transcripts: rewrite "doc" fields (a legacy single-file store is left
-    //    alone — loadChatHistory imports it and the next persist writes through).
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    for (const auto& de : fs::directory_iterator(chatSessionsDir(), ec)) {
-        if (!de.is_regular_file(ec)) continue;
-        const std::string name = de.path().filename().string();
-        if (name == "index.json" || name.size() < 6 ||
-            name.compare(name.size() - 5, 5, ".json") != 0)
-            continue;
-        nlohmann::json js;
-        {
-            std::ifstream in(de.path());
-            if (in) { try { in >> js; } catch (...) { continue; } }
-        }
-        if (!js.is_object()) continue;
-        const std::string doc = js.value("doc", std::string());
-        if (doc.rfind("doc:", 0) != 0) continue;
-        auto it = savedDocs.find(doc.substr(4));
-        if (it == savedDocs.end()) continue;
-        js["doc"] = "file:" + it->second;
-        atomicWriteFileDurable(de.path().string(), js.dump(1));
-    }
+    // All parseable transcripts are resident after startup. Serialize their relinked state
+    // through the same ordered writer; a second disk-rewrite path could race a pending save.
     if (relinked) markChatHistoryDirty();
 }
 
@@ -2170,6 +2439,9 @@ static void pollChudcodeSessionHealth(AppState& st) {
         // at commit); a dry-run of the session being rewound must not stamp the old file back.
         if (editStageHoldsConversation(convId)) return;
         applyChudcodeDoctor(chudcodeSessionLinkEnsure(convId), summary);
+#ifdef __EMSCRIPTEN__
+        chudcodeSessionLinkSet(convId, chudcodeSessionLinkEnsure(convId));
+#endif
         markChatHistoryDirty();   // resume key + health reach disk on the debounced flush
     }, 30000);
 }
@@ -2238,7 +2510,6 @@ static void followProjectActiveConversation(AppState& st) {
 // st.chatDocKey (the current document's key, for run launches + prompt drafts), runs the
 // relink sweep, and kicks the one-time startup load.
 void syncChatToDoc(AppState& st) {
-    relinkSavedDocSessions(st);
 #ifdef __EMSCRIPTEN__
     wasmKickSharedChatFetch();       // once: async GET full shared store
     wasmApplySharedChatPending(st);  // merge when the GET lands
@@ -2248,9 +2519,23 @@ void syncChatToDoc(AppState& st) {
         s_historyLoaded = true;
         loadChatHistory(st);
     }
+    relinkSavedDocSessions(st);
     st.chatDocKey = convDocKey(st);
     ensureConversations(st);
     followProjectActiveConversation(st);
+#ifdef __EMSCRIPTEN__
+    // Mint replies can arrive on a job thread; copy only opaque metadata on the
+    // UI thread, for both active and parked chats, so restart resumes the cell.
+    for (const auto& conversation : st.conversations) {
+        const auto handle = cellAgentSessionHandle(conversation.id);
+        auto& link = chudcodeSessionLinkEnsure(conversation.id);
+        if (!handle.empty() && handle != link.sessionId) {
+            link.sessionId = handle;
+            link.sessionFile.clear();
+            markChatHistoryDirty();
+        }
+    }
+#endif
     pollChudcodeSessionHealth(st);
 }
 
@@ -2260,8 +2545,10 @@ static void clearComposerState(AppState& st) {
         st.prompt[0] = 0;
     }
     st.pendingAttachments.clear();
+    st.pendingInlineImagePaths.clear();
     st.pendingContextRefs.clear();
     st.contextPickActive = false;
+    composerResetInputState(st);
 }
 
 // A session with nothing in it: no messages, no queued prompts, no live run. Mirrors the
@@ -2287,6 +2574,7 @@ static bool discardActiveConversationIfFresh(AppState& st) {
     st.chat.clear();
     st.lastContextTokens = 0;
     st.queuedPrompts.clear();
+    st.queuedPromptDrafts.clear();
     st.conversations.erase(st.conversations.begin() + st.activeConv);
     st.activeConv = -1;  // callers set the new active index right after
     return true;
@@ -2304,9 +2592,11 @@ void parkActiveConversation(AppState& st) {
     c.msgs = std::move(st.chat);
     c.lastContextTokens = st.lastContextTokens;
     c.queuedPrompts = std::move(st.queuedPrompts);
+    c.queuedPromptDrafts = std::move(st.queuedPromptDrafts);
     st.chat.clear();
     st.lastContextTokens = 0;
     st.queuedPrompts.clear();
+    st.queuedPromptDrafts.clear();
 }
 
 static void restoreActiveConversation(AppState& st) {
@@ -2315,8 +2605,10 @@ static void restoreActiveConversation(AppState& st) {
     st.chat = std::move(c.msgs);
     st.lastContextTokens = c.lastContextTokens;
     st.queuedPrompts = std::move(c.queuedPrompts);
+    st.queuedPromptDrafts = std::move(c.queuedPromptDrafts);
     c.msgs.clear();
     c.queuedPrompts.clear();
+    c.queuedPromptDrafts.clear();
     // Composer is session-scoped: wipe then restore this session's draft.
     clearComposerState(st);
     restorePromptDraft(st);
@@ -2393,12 +2685,27 @@ void closeConversation(AppState& st, int idx) {
         st.chat.clear();
         st.lastContextTokens = 0;
         st.queuedPrompts.clear();
+        st.queuedPromptDrafts.clear();
         clearComposerState(st);
     }
     // Drop draft key for the closed conversation.
     {
         const std::string closedId = st.conversations[idx].id;
         s_userTitled.erase(closedId);
+#ifndef __EMSCRIPTEN__
+        auto& root = residentPromptDrafts();
+        const std::string suffix = "/" + closedId;
+        bool removed = false;
+        for (auto it = root.begin(); it != root.end();) {
+            const auto& key = it.key();
+            if (key.size() >= suffix.size() &&
+                key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                it = root.erase(it);
+                removed = true;
+            } else ++it;
+        }
+        if (removed) persistPromptDrafts(st, true);
+#else
         try {
             namespace fs = std::filesystem;
             const std::string path = promptDraftsPath();
@@ -2417,6 +2724,7 @@ void closeConversation(AppState& st, int idx) {
             }
         } catch (...) {
         }
+#endif
     }
     // Hard delete disposes the Chudcode runtime too (idempotent, best-effort) and drops the
     // link — unlike archive and unlike "Close runtime", which both keep it. The persisted

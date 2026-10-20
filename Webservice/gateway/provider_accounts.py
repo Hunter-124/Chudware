@@ -29,7 +29,6 @@ uses its device-code endpoint, which needs no redirect at all.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import binascii
 import hashlib
@@ -50,6 +49,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 try:
     from .auth import get_current_user
+    from . import deployment_drain
     from .db import tx
     from .credits import is_trial_domain
     from .limits import RateLimiter
@@ -60,6 +60,7 @@ try:
     from .provider_keys import _key_bytes
 except ImportError:  # uvicorn app:app from the package directory
     from auth import get_current_user  # type: ignore
+    import deployment_drain
     from credits import is_trial_domain  # type: ignore
     from db import tx  # type: ignore
     from limits import RateLimiter  # type: ignore
@@ -990,7 +991,7 @@ async def api_delete_account(
 
 async def _run(fn: Any, *args: Any) -> Any:
     """Run one blocking vendor call without stalling the event loop."""
-    return await asyncio.to_thread(fn, *args)
+    return await deployment_drain.run_blocking(fn, *args)
 
 
 __all__ = [

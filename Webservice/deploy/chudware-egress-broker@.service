@@ -1,0 +1,19 @@
+[Unit]
+Description=Chudware pinned public CONNECT broker %i
+Requires=chudware-egress-broker@%i.socket
+
+[Service]
+Type=simple
+Sockets=chudware-egress-broker@%i.socket
+Environment=CHUDWARE_CELL_CONFIG=%h/.config/chudware/cell-runtime.json
+ExecStart=@WEB_HOME@/current/cell/bin/chudware-egress-broker %i
+MemoryMax=256M
+MemorySwapMax=0
+CPUQuota=50%
+TasksMax=64
+IOWeight=25
+NoNewPrivileges=yes
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=10
+Restart=no

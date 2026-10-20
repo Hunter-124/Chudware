@@ -28,11 +28,15 @@ import json
 import threading
 import time
 import uuid
+from collections.abc import MutableMapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from services.agent.interaction import cache_root
+from services.agent import request_context
+from services import paths
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -68,6 +72,10 @@ def _now() -> str:
 
 def _doc_stream_dir(run_id: str, doc_id: str) -> Path:
     """Return (creating) the per-doc event stream directory."""
+    if request_context.in_cell():
+        d = paths.private_path("workspace_events", json.dumps([run_id, doc_id]))
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return d
     d = cache_root() / "runs" / run_id / "docs" / doc_id
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -111,6 +119,7 @@ class LeaseRegistry:
 
     def __init__(self, run_id: str, emit: Optional[Callable] = None) -> None:
         self.run_id = run_id
+        self.tenant_owner = request_context.owner_key()
         self._emit = emit          # callback(event_type, payload) or None
         self._lock = threading.Lock()
         self._docs: dict[str, _DocRecord] = {}
@@ -120,6 +129,7 @@ class LeaseRegistry:
     def open_doc(self, doc_id: str, owner: str, lease: str = LEASE_WRITE) -> None:
         """Register a new doc and immediately grant the opening agent a lease."""
         with self._lock:
+            request_context.require_owner(self.tenant_owner)
             if doc_id in self._docs:
                 raise WorkspaceError(f"doc {doc_id!r} is already open")
             rec = _DocRecord(doc_id=doc_id)
@@ -134,6 +144,7 @@ class LeaseRegistry:
     def close_doc(self, doc_id: str, agent_id: str) -> None:
         """Mark a doc closed; release any leases held by agent_id."""
         with self._lock:
+            request_context.require_owner(self.tenant_owner)
             rec = self._require_doc(doc_id)
             rec.status = "closed"
             rec.write_owner = None
@@ -146,6 +157,7 @@ class LeaseRegistry:
     def acquire_write(self, doc_id: str, agent_id: str) -> None:
         """Acquire a write lease.  Raises WorkspaceError naming the current holder."""
         with self._lock:
+            request_context.require_owner(self.tenant_owner)
             rec = self._require_doc(doc_id)
             if rec.write_owner and rec.write_owner != agent_id:
                 raise WorkspaceError(
@@ -161,6 +173,7 @@ class LeaseRegistry:
     def acquire_read(self, doc_id: str, agent_id: str) -> None:
         """Acquire a read lease (unlimited holders)."""
         with self._lock:
+            request_context.require_owner(self.tenant_owner)
             rec = self._require_doc(doc_id)
             rec.read_owners.add(agent_id)
         self._emit_lease_event(doc_id, "read_acquired", agent_id, None)
@@ -168,6 +181,7 @@ class LeaseRegistry:
     def release(self, doc_id: str, agent_id: str) -> None:
         """Release write or read lease for agent_id."""
         with self._lock:
+            request_context.require_owner(self.tenant_owner)
             rec = self._require_doc(doc_id)
             released_write = False
             if rec.write_owner == agent_id:
@@ -184,6 +198,7 @@ class LeaseRegistry:
         by model roles.  Emits a "write_stolen" lease event for audit trail.
         """
         with self._lock:
+            request_context.require_owner(self.tenant_owner)
             rec = self._require_doc(doc_id)
             old_owner = rec.write_owner
             rec.write_owner = new_owner
@@ -196,22 +211,26 @@ class LeaseRegistry:
     def write_owner(self, doc_id: str) -> Optional[str]:
         """Return the current write owner or None."""
         with self._lock:
-            rec = self._docs.get(doc_id)
+            request_context.require_owner(self.tenant_owner)
+            rec = self._require_doc(doc_id) if request_context.in_cell() else self._docs.get(doc_id)
             return rec.write_owner if rec else None
 
     def is_writer(self, doc_id: str, agent_id: str) -> bool:
         with self._lock:
-            rec = self._docs.get(doc_id)
+            request_context.require_owner(self.tenant_owner)
+            rec = self._require_doc(doc_id) if request_context.in_cell() else self._docs.get(doc_id)
             return bool(rec and rec.write_owner == agent_id)
 
     def is_reader(self, doc_id: str, agent_id: str) -> bool:
         with self._lock:
-            rec = self._docs.get(doc_id)
+            request_context.require_owner(self.tenant_owner)
+            rec = self._require_doc(doc_id) if request_context.in_cell() else self._docs.get(doc_id)
             return bool(rec and agent_id in rec.read_owners)
 
     def list_docs(self) -> list[dict]:
         """Snapshot of all doc records (for workspace_status)."""
         with self._lock:
+            request_context.require_owner(self.tenant_owner)
             return [
                 {
                     "doc_id": r.doc_id,
@@ -226,7 +245,8 @@ class LeaseRegistry:
     def set_latest_render(self, doc_id: str, artifact_path: str) -> None:
         """Record the latest render artifact path (contact sheet etc.)."""
         with self._lock:
-            rec = self._docs.get(doc_id)
+            request_context.require_owner(self.tenant_owner)
+            rec = self._require_doc(doc_id) if request_context.in_cell() else self._docs.get(doc_id)
             if rec:
                 rec.latest_render = artifact_path
 
@@ -236,6 +256,8 @@ class LeaseRegistry:
         """Return doc record; caller MUST hold self._lock."""
         rec = self._docs.get(doc_id)
         if rec is None:
+            if request_context.in_cell():
+                raise KeyError("not_found")
             raise WorkspaceError(f"doc {doc_id!r} is not registered in this workspace")
         return rec
 
@@ -259,10 +281,12 @@ class LeaseRegistry:
         self._emit_doc_event(doc_id, EVENT_LEASE_CHANGE, payload)
 
     def _emit_doc_event(self, doc_id: str, event_type: str, payload: dict) -> None:
+        request_context.require_owner(self.tenant_owner)
         event = {
             "ts": _now(),
             "event": event_type,
             **payload,
+            **({"tenant_owner": list(self.tenant_owner)} if self.tenant_owner else {}),
         }
         # Append to per-doc JSONL stream
         try:
@@ -302,6 +326,7 @@ def append_doc_event(
         "event": event_type,
         "doc_id": doc_id,
         **payload,
+        **({"tenant_owner": list(request_context.owner_key())} if request_context.in_cell() else {}),
     }
     if render_path:
         event["render_path"] = render_path
@@ -319,8 +344,16 @@ def read_doc_events(run_id: str, doc_id: str, since_seq: int = 0) -> list[dict]:
     Events are 0-indexed lines in the JSONL file.  Returns a list of parsed
     event dicts.  Returns [] if the stream doesn't exist yet.
     """
-    path = _doc_stream_path(run_id, doc_id)
+    if request_context.in_cell():
+        directory = paths.private_path("workspace_events", json.dumps([run_id, doc_id]), create=False)
+        if directory is None:
+            raise KeyError("not_found")
+        path = directory / "events.jsonl"
+    else:
+        path = _doc_stream_path(run_id, doc_id)
     if not path.exists():
+        if request_context.in_cell():
+            raise KeyError("not_found")
         return []
     events: list[dict] = []
     try:
@@ -331,7 +364,10 @@ def read_doc_events(run_id: str, doc_id: str, since_seq: int = 0) -> list[dict]:
                 line = line.strip()
                 if line:
                     try:
-                        events.append(json.loads(line))
+                        event = json.loads(line)
+                        if request_context.in_cell() and event.get("tenant_owner") != list(request_context.owner_key()):
+                            raise KeyError("not_found")
+                        events.append(event)
                     except json.JSONDecodeError:
                         pass
     except OSError:
@@ -346,6 +382,7 @@ def read_doc_events(run_id: str, doc_id: str, since_seq: int = 0) -> list[dict]:
 # Module-level registry reference — set by WorkspaceSession.bind_to_registry()
 _active_registry: Optional["LeaseRegistry"] = None
 _active_agent_id: Optional[str] = None
+_cell_guard: ContextVar[tuple[object, object] | None] = ContextVar("workspace_guard", default=None)
 
 # Mutating tool families (anything not read-only needs a write lease)
 _MUTATING_RISK_CLASSES = {"write", "spend", "external"}
@@ -357,6 +394,10 @@ def bind_mutation_guard(registry: "LeaseRegistry", agent_id: str) -> None:
     Called once per agent turn setup.  After this, check_write_lease() gates
     all mutating tool calls dispatched through tool_registry._guard.
     """
+    request_context.require_owner(registry.tenant_owner)
+    if request_context.in_cell():
+        _cell_guard.set((registry, agent_id))
+        return
     global _active_registry, _active_agent_id
     _active_registry = registry
     _active_agent_id = agent_id
@@ -364,6 +405,9 @@ def bind_mutation_guard(registry: "LeaseRegistry", agent_id: str) -> None:
 
 def unbind_mutation_guard() -> None:
     """Unbind the mutation guard (end of turn / session cleanup)."""
+    if request_context.in_cell():
+        _cell_guard.set(None)
+        return
     global _active_registry, _active_agent_id
     _active_registry = None
     _active_agent_id = None
@@ -381,8 +425,7 @@ def check_write_lease(doc_id: str, tool_name: str) -> Optional[dict]:
     This function is called from the _guard() seam in tool_registry.py for
     tools that carry a doc_id argument.
     """
-    reg = _active_registry
-    agent = _active_agent_id
+    reg, agent = (_cell_guard.get() or (None, None)) if request_context.in_cell() else (_active_registry, _active_agent_id)
     if reg is None or agent is None:
         return None  # guard disabled — allow
     owner = reg.write_owner(doc_id)
@@ -453,6 +496,7 @@ def fanout_ready_nodes(
     Contract (§13): failed nodes block their dependents via executor internals;
     this function does NOT retry.
     """
+    request_context.require_owner(registry.tenant_owner)
     if spawn_modeler is None:
         spawn_modeler = _default_spawn_modeler
 
@@ -586,8 +630,37 @@ class WorkspaceSession:
 # Process-wide session registry (for workspace_status MCP tool lookup)
 # ---------------------------------------------------------------------------
 
-# run_id -> WorkspaceSession
-_session_registry: dict[str, "WorkspaceSession"] = {}
+class _SessionRegistry(MutableMapping):
+    """Compatibility mapping whose entire visible keyspace belongs to the caller."""
+
+    def __init__(self) -> None:
+        self._items: dict[str, WorkspaceSession] = {}
+
+    def __getitem__(self, key: str) -> WorkspaceSession:
+        session = self._items.get(request_context.scoped_key(key))
+        if session is None:
+            raise KeyError("not_found")
+        request_context.require_owner(session.registry.tenant_owner)
+        return session
+
+    def __setitem__(self, key: str, session: WorkspaceSession) -> None:
+        request_context.require_owner(session.registry.tenant_owner)
+        self._items[request_context.scoped_key(key)] = session
+
+    def __delitem__(self, key: str) -> None:
+        self[key]
+        del self._items[request_context.scoped_key(key)]
+
+    def __iter__(self):
+        owner = request_context.owner_key()
+        return iter([session.run_id for session in self._items.copy().values()
+                     if session.registry.tenant_owner == owner])
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+
+_session_registry = _SessionRegistry()
 
 
 def register_session(session: "WorkspaceSession") -> None:

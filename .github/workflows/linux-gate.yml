@@ -46,10 +46,11 @@ concurrency:
 jobs:
   gate:
     name: Full Linux gate (strict)
-    # Named capacity label, not the bare pool: gate.sh saturates the machine for
-    # tens of minutes and must never land on the production gateway host. Hosted
-    # runners are billed on this private repository; the fleet is free.
-    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-build]
+    # Manual dispatch may select branch code: this gate always uses a one-job
+    # disposable VM, including its HOME, Python and RUNNER_TOOL_CACHE.
+    runs-on:
+      group: chudware-untrusted-ephemeral
+      labels: [self-hosted, Linux, X64, cc-linux-disposable]
     # The strict gate alone now takes ~2 h on livingroom-pc (host test binaries are built and
     # run since 2026-10-01); 120 min cancelled the trailing Webservice pytest step.
     timeout-minutes: 180
@@ -79,17 +80,12 @@ jobs:
             exit 1
           fi
 
-          # The SDK is runner provisioning, not repository content. Resolve it
-          # outside _work and export the absolute directory; gate.sh passes it
-          # to CMake explicitly, so a fresh checkout cannot remove the SDK path.
-          shopt -s nullglob
-          cef_candidates=("$HOME"/chudware-cef-sdk/cef_binary_*_linux64*)
-          if [ "${#cef_candidates[@]}" -ne 1 ]; then
-            echo "::error::expected exactly one Linux CEF SDK under $HOME/chudware-cef-sdk, found ${#cef_candidates[@]}"
-            exit 1
-          fi
-          echo "CEF_ROOT=${cef_candidates[0]}" >> "$GITHUB_ENV"
-          echo "cef-root=${cef_candidates[0]}"
+          # Reconstruct authenticated bytes immediately before trusted use;
+          # extracted-only caches and alternate SDK directories are not identities.
+          cef_root="$(bash scripts/fetch_cef_posix.sh \
+            --destination-root "${RUNNER_TEMP}/cef-authenticated-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")"
+          echo "CEF_ROOT=${cef_root}" >> "$GITHUB_ENV"
+          echo "cef-root=${cef_root}"
 
           echo "runner=${RUNNER_NAME:-unknown} host=$(hostname -s)"
           uname -a
@@ -190,35 +186,21 @@ jobs:
 
       - name: Refresh the service runtime and gate dependencies
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          # A persistent runner's venv is not a dependency lock. Refresh it from
-          # the product manifest before sweeping every service (including civil).
-          venv="$HOME/.local/share/Chudware/mcp-venv"
-          # The typed SDK is private, not on PyPI. Its pinned source is already
-          # published with Chudware's runtime release, accessible to this repo token.
-          read -r release source_commit <<< "$(python3 -c 'import json; p=json.load(open("vendor/chudcode/CHUDCODE_ARTIFACT.lock")); print("chudcode-runtime-v" + p["version"], p["repository_commit"])')"
-          source_dir="$(mktemp -d "${RUNNER_TEMP}/gate-rpc.XXXXXX")"
-          archive="chudcode-source-${source_commit}.tar.gz"
-          python3 - "${source_dir}/${archive}" "${release}" <<'PY'
-          import os, shutil, sys
-          from pathlib import Path
-          from scripts.pin_chudcode import _github_asset_response
-          destination = Path(sys.argv[1])
-          url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{sys.argv[2]}/{destination.name}"
-          with _github_asset_response(url, os.environ["GH_TOKEN"]) as response, destination.open("wb") as output:
-              shutil.copyfileobj(response, output)
-          PY
-          mkdir "${source_dir}/sdk"
-          tar -xzf "${source_dir}/${archive}" -C "${source_dir}/sdk" \
-            --strip-components=3 --wildcards '*/python/chudcode-rpc/*'
-          VENV_DIR="${venv}" CHUDCODE_RPC_SRC="${source_dir}/sdk" bash scripts/provision_venv.sh
-          # DVC is a subprocess-only training-data tool, not a shipped runtime import.
-          "${venv}/bin/python" -m pip install --quiet --disable-pip-version-check pytest dvc==3.67.1
-          "${venv}/bin/python" -c 'import pyproj, dvc, pytest; print("gate runtime imports OK")'
+          # The image carries a reviewed offline wheelhouse, not private source
+          # credentials. All installed state dies with this one-job VM.
+          : "${CHUDWARE_WHEELHOUSE:?qualify the disposable image with an offline locked wheelhouse}"
+          venv="${RUNNER_TEMP}/gate-runtime"
+          VENV_DIR="${venv}" CHUDWARE_WHEELHOUSE="${CHUDWARE_WHEELHOUSE}" \
+            PYTHON="$(command -v python3)" bash scripts/provision_venv.sh
+          # CI's reviewed target snapshot includes pytest and DVC plus their
+          # complete wheel closure. Never mutate the authenticated runtime with
+          # a second pip install after its identity/stamp has been verified.
+          "${venv}/bin/python" -c 'from importlib.metadata import version; import pyproj, dvc, pytest; assert version("dvc") == "3.67.1", "CI requires reviewed DVC 3.67.1 wheels"; print("locked gate runtime imports OK")'
+          test -x "${venv}/bin/dvc"
+          echo "${venv}/bin" >> "$GITHUB_PATH"
           echo "CHUDWARE_GATE_PYTHON=${venv}/bin/python" >> "$GITHUB_ENV"
 
       - name: Run scripts/gate.sh (CHUDWARE_GATE_STRICT=1)

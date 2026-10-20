@@ -36,8 +36,8 @@ struct Project {
     static Project from_dict(const nlohmann::json& d, const std::filesystem::path& root);
 };
 
-// Base directory holding every firmware project: CHUDWARE_FIRMWARE_DIR override,
-// else %APPDATA%/Chudware/firmware (temp dir fallback). Created if absent.
+// Private per-user firmware directory: CHUDWARE_FIRMWARE_DIR override, otherwise
+// APPDATA on Windows or XDG_DATA_HOME/HOME on POSIX. No shared temp fallback.
 std::filesystem::path firmware_root();
 
 // Atomically write project.json (tmp + rename). Returns the final path.

@@ -16,6 +16,9 @@ from . import node_runner as nr
 from . import autonomy as av
 from . import gate as gt
 from . import verify as vr
+from services.agent.request_context import (
+    bind_context, bind_roots, current_context, in_cell, root_value,
+)
 
 # ---------------------------------------------------------------------------
 # Schema constants
@@ -67,6 +70,7 @@ class DagState(TypedDict, total=False):
     ``INVALID_CONCURRENT_GRAPH_UPDATE`` on the shared channel (mega-1 stop_reason).
     """
     run_id: Annotated[str, _last_value]
+    session_id: Annotated[str, _last_value]
     run_status: Annotated[str, _last_value]
     node_states: Annotated[dict[str, Any], _merge_dicts]
     open_questions: Annotated[list[Any], operator.add]
@@ -287,6 +291,8 @@ def _make_node_handler(
             if rid_v and not pack_v.get("run_id"):
                 pack_v = dict(pack_v)
                 pack_v["run_id"] = rid_v
+            if state.get("session_id"):
+                pack_v["session_id"] = state["session_id"]
             verdict_v, output_v = vr.run(node, pack_v, emit=_emit)
             node_entry_v: dict[str, Any] = {
                 "status": output_v.get("status", "done"),
@@ -323,6 +329,8 @@ def _make_node_handler(
         if rid and not pack.get("run_id"):
             pack = dict(pack)
             pack["run_id"] = rid
+        if state.get("session_id"):
+            pack["session_id"] = state["session_id"]
 
         # --- Dispatch via node_runner ----------------------------------------
         verdict, output_state = nr.run(
@@ -369,6 +377,17 @@ def _make_node_handler(
 
         return {"node_states": new_node_states, **extra}
 
+    if in_cell():
+        context = current_context()
+        project = root_value("CHUDWARE_PROJECT_DIR", "/work")
+        save = root_value("CHUDWARE_PROJECT_SAVE_DIR", project)
+
+        def _owned_handle(state: DagState) -> DagState:
+            with bind_context(context), bind_roots(project, save):
+                return _handle(state)
+
+        _owned_handle.__name__ = node_id
+        return _owned_handle
     _handle.__name__ = node_id
     return _handle
 

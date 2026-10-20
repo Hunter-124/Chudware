@@ -116,12 +116,18 @@ def test_a_chat_reply_answers_the_pending_form_instead_of_steering(tmp_path, mon
     asked, thread = _ask_async(dispatch, binding, "Which motor will you use?")
     assert _wait_for(lambda: _frames(emitted, "agent_question"))
 
-    steered = host.steer("run-q", "An Estes E12-4")
+    steered = host.steer("run-q", "An Estes E12-4", steer_id="s-reply")
     assert steered["answered_question"] == _frames(emitted, "agent_question")[0]["batch_id"]
     thread.join(2.0)
     assert asked["result"]["user_reply"] == "An Estes E12-4"
     assert asked["result"]["answers"] == {}
     assert not [c for c in factory.clients[0].calls if c[0] == "steer"]
+    answer = _frames(emitted, "agent_answer")[0]
+    assert answer["steer_id"] == "s-reply"
+    mapped = map_rpc_frame(answer, {"run_id": "run-q"})
+    assert [kind for kind, _ in mapped] == ["agent.answer", "agent.steer"]
+    assert mapped[1][1]["steer_id"] == "s-reply"
+    assert mapped[1][1]["status"] == "delivered"
 
     # With nothing pending, the same path steers again.
     assert host.steer("run-q", "Also keep it light")["steered"] is True
@@ -170,3 +176,61 @@ def test_a_later_batch_reusing_an_id_is_asked_not_replayed(tmp_path, monkeypatch
     assert len(seen) == 2
     assert first["answers"]["q1"]["value"] == "answer 1"
     assert second["answers"]["q1"]["value"] == "answer 2"
+
+
+def test_reply_images_keep_exact_payload_and_wait_for_streamed_delivery(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    factory = FakeFactory(block=True)
+    host = ChudcodeSessionHost(client_factory=factory)
+    binding, emitted, _, turn = _start_turn(host, factory, interactive_questions=True)
+    asked, question_thread = _ask_async(MissionDispatch(run_id="run-q"), binding, "Which mount?")
+    assert _wait_for(lambda: _frames(emitted, "agent_question"))
+    attachments = [{"data": "aW1hZ2U=", "mime": "image/png"}]
+    result = host.steer("run-q", "Use the four holes [Image #1]", attachments, steer_id="s-image")
+    question_thread.join(2.0)
+    assert result["steered"] and "answered_question" not in result
+    assert asked["result"]["user_reply"] == "Use the four holes [Image #1]"
+    answer = _frames(emitted, "agent_answer")[0]
+    assert "steer_id" not in answer
+    assert [kind for kind, _ in map_rpc_frame(answer)] == ["agent.answer"]
+    client = factory.clients[0]
+    sent = next(payload for name, payload in client.calls if name == "steer")
+    assert sent["message"] == "Use the four holes [Image #1]"
+    assert not _frames(emitted, "agent_steer")
+    for listener in tuple(client.listeners):
+        listener({"type": "message_start", "message": {"role": "user", "content": [
+            {"type": "text", "text": sent["message"]},
+        ]}})
+    assert not _frames(emitted, "agent_steer"), "text alone does not acknowledge the image"
+    for listener in tuple(client.listeners):
+        listener({"type": "message_start", "message": {"role": "user", "content": [
+            {"type": "text", "text": sent["message"]}, *sent["images"],
+        ]}})
+    assert [(f["steer_id"], f["status"]) for f in _frames(emitted, "agent_steer")] == [
+        ("s-image", "delivered")]
+    client.release.set()
+    turn.join(2.0)
+
+
+def test_failed_reply_image_send_does_not_claim_attachment_delivery(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    factory = FakeFactory(block=True)
+    host = ChudcodeSessionHost(client_factory=factory)
+    binding, emitted, _, turn = _start_turn(host, factory, interactive_questions=True)
+    asked, question_thread = _ask_async(MissionDispatch(run_id="run-q"), binding, "Which mount?")
+    assert _wait_for(lambda: _frames(emitted, "agent_question"))
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("lost control response")
+
+    client = factory.clients[0]
+    client.steer = fail
+    result = host.steer("run-q", "Use this mount", [{"data": "aW1hZ2U=", "mime": "image/png"}],
+                        steer_id="s-failed-image")
+    question_thread.join(2.0)
+    assert result["steered"] is False
+    assert asked["result"]["user_reply"] == "Use this mount"
+    assert all("steer_id" not in f for f in _frames(emitted, "agent_answer"))
+    assert not _frames(emitted, "agent_steer")
+    client.release.set()
+    turn.join(2.0)

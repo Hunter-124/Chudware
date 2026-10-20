@@ -542,7 +542,7 @@ Interpolation interpolation_for(const Settings &s) {
 
 // ── Settings
 // ────────────────────────────────────────────────────────────────────────
-Settings parse_settings(const json &t) {
+Settings parse_settings(const json &t, bool has_build_plate) {
   const std::string ctx = "topology";
   check_keys(t,
              {"physics",
@@ -741,9 +741,9 @@ Settings parse_settings(const json &t) {
     s.overhang_angle_deg = range("overhang_angle_deg", *v, 0, true, 90, true);
   if (auto v = opt_number(t, "overhang_penalty", ctx))
     s.overhang_penalty = range("overhang_penalty", *v, 0, false, inf, true);
-  if (s.overhang_penalty > 0 && !s.build_direction)
+  if (s.overhang_penalty > 0 && !s.build_direction && !has_build_plate)
     fail("build_direction_required",
-         "topology.overhang_penalty > 0 needs build_direction");
+         "Overhang control needs a build direction or a bed face");
   if (t.contains("no_enclosed_voids")) {
     if (!t["no_enclosed_voids"].is_boolean())
       fail("invalid_input", "topology.no_enclosed_voids must be a boolean");
@@ -1683,12 +1683,12 @@ void DensityFilter::apply_transpose(const Eigen::VectorXd &g,
 ProblemSpec parse_problem_spec(const json &j) {
   check_keys(j,
              {"topology", "material", "fixtures", "load_cases", "thermal",
-              "flow", "preserve", "exclude"},
+              "flow", "preserve", "exclude", "build_plate"},
              "problem");
   ProblemSpec s;
   if (!j.contains("topology"))
     fail("missing_key", "problem.topology is required");
-  s.settings = parse_settings(j["topology"]);
+  s.settings = parse_settings(j["topology"], j.contains("build_plate"));
   s.material =
       parse_material(j.contains("material") ? j["material"] : json::object());
   if (j.contains("fixtures"))
@@ -1836,6 +1836,14 @@ ProblemSpec parse_problem_spec(const json &j) {
     }
     s.flow = std::move(fs);
   }
+  if (j.contains("build_plate")) {
+    const json &b = j["build_plate"];
+    check_keys(b, {"label", "nodes"}, "build_plate");
+    if (!b.contains("nodes"))
+      fail("missing_key", "build_plate.nodes is required");
+    s.build_plate = NodeSet{opt_string(b, "label", "build_plate"),
+                           as_nodes(b["nodes"], "build_plate.nodes")};
+  }
   if (j.contains("preserve"))
     s.preserve = parse_regions(j["preserve"], "preserve");
   if (j.contains("exclude"))
@@ -1944,6 +1952,58 @@ prepare_problem(std::shared_ptr<const TetMesh> mesh_ptr,
   Problem &p = *P;
   p.mesh = mesh_ptr;
   p.settings = spec.settings;
+  if (spec.build_plate) {
+    const NodeSet &selection = *spec.build_plate;
+    const std::string label = name_or(selection.label, "Build plate");
+    auto plate_fail = [&](const char *code, const std::string &message) {
+      fail(code, label + ": " + message);
+    };
+    for (int n : selection.nodes)
+      if (n < 0 || n >= N)
+        plate_fail("build_plate_empty", "selection has no valid boundary face");
+    const auto faces = surface_faces_with_nodes(m, selection.nodes);
+    if (faces.empty())
+      plate_fail("build_plate_empty", "no boundary triangle matched");
+    BuildPlate plate;
+    plate.triangles = static_cast<int>(faces.size());
+    Eigen::Vector3d center = Eigen::Vector3d::Zero();
+    for (int f : faces) {
+      const double area = m.surface_area_m2[f];
+      plate.area_m2 += area;
+      plate.normal += area * m.surface_normal.col(f);
+      for (int k = 0; k < 3; ++k)
+        center += (area / 3.0) * m.nodes_m.col(m.surface_nodes(k, f));
+    }
+    if (!(plate.normal.norm() > 0))
+      plate_fail("build_plate_not_planar", "selected faces are not planar");
+    plate.normal.normalize();
+    constexpr double cos_two_degrees = 0.9993908270190958;
+    for (int f : faces)
+      if (m.surface_normal.col(f).dot(plate.normal) < cos_two_degrees)
+        plate_fail("build_plate_not_planar",
+                   "selected face normals differ by more than 2 degrees");
+    const Eigen::Vector3d direction = -plate.normal;
+    if (p.settings.build_direction &&
+        p.settings.build_direction->dot(direction) < cos_two_degrees)
+      plate_fail("build_plate_direction_conflict",
+                 "explicit build direction differs from the bed face by more "
+                 "than 2 degrees");
+    const double height = (center / plate.area_m2).dot(direction);
+    double lowest = height;
+    for (int n = 0; n < N; ++n)
+      if (m.node_referenced[n])
+        lowest = std::min(lowest, m.nodes_m.col(n).dot(direction));
+    const double tolerance =
+        std::max(1e-3 * m.quality.median_element_size_m,
+                 1e-6 * (m.bbox_max_m - m.bbox_min_m).norm());
+    if (height - lowest > tolerance)
+      plate_fail("build_plate_not_lowest",
+                 "the part extends " + fmt(units::m_to_mm(height - lowest)) +
+                     " mm below the chosen bed face; pick the face that rests "
+                     "on the bed");
+    p.build_plate = plate;
+    p.settings.build_direction = direction;
+  }
   const Settings &s = p.settings;
   const PhysicsKind phys = s.physics;
   p.material = convert_material(spec.material);
@@ -2554,8 +2614,11 @@ prepare_problem(std::shared_ptr<const TetMesh> mesh_ptr,
     p.filter_radius_m = units::mm_to_m(*s.filter_radius_mm);
     p.filter_radius_source = "explicit";
   } else if (s.min_member_mm) {
-    p.filter_radius_m = 0.5 * units::mm_to_m(*s.min_member_mm);
-    p.filter_radius_source = "min_member_mm";
+    const double intended = 0.5 * units::mm_to_m(*s.min_member_mm);
+    const double floor = 2.0 * m.quality.median_element_size_m;
+    p.filter_radius_m = std::max(intended, floor);
+    p.filter_radius_source =
+        floor > intended ? "auto_2x_median_element_size" : "min_member_mm";
   } else {
     p.filter_radius_m = 2.0 * m.quality.median_element_size_m;
     p.filter_radius_source = "auto_2x_median_element_size";
@@ -2574,6 +2637,11 @@ prepare_problem(std::shared_ptr<const TetMesh> mesh_ptr,
       {"radius_m", p.filter_radius_m},
       {"source", p.filter_radius_source},
       {"mean_neighbors", static_cast<double>(p.filter.weights.nonZeros()) / E}};
+  if (!s.filter_radius_mm && s.min_member_mm) {
+    ev["filter"]["min_member_filter_radius_mm"] = 0.5 * *s.min_member_mm;
+    ev["filter"]["mesh_floor_radius_mm"] =
+        units::m_to_mm(2.0 * m.quality.median_element_size_m);
+  }
   ev["interpolation"] = {
       {"kind",
        p.interpolation.kind == Interpolation::Kind::Simp ? "simp" : "ramp"},

@@ -15,8 +15,10 @@ import re
 import shutil
 import tempfile
 import time
+from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
+from services.agent.request_context import owner_key, root_value
 
 from mcp.server.fastmcp import FastMCP, Image
 
@@ -24,9 +26,51 @@ from . import core_bridge as cb
 from . import simhandoff as sh
 from .core_bridge import CoreError
 
-# The "current part" so single-argument calls just work (every tool also takes an explicit
-# doc_id). Mirrors the old server's _STATE, but the doc lives in the C++ core, not here.
-_CUR: dict = {"doc_id": None}
+# Current parts are agent-scoped for host calls, process-scoped for standalone MCP.
+# Keep the mapping surface used by the tool families; all imported _CUR references
+# resolve the slot at access time, including open/recovery helpers.
+class _CurrentPart(MutableMapping):
+    def __init__(self):
+        self._slots = {None: {"doc_id": None}}
+
+    def _slot(self):
+        owner = owner_key()
+        agent = cb.CURRENT_AGENT.get()
+        return self._slots.setdefault((owner, agent) if owner is not None else agent, {"doc_id": None})
+
+    def __getitem__(self, key):
+        return self._slot()[key]
+
+    def __setitem__(self, key, value):
+        self._slot()[key] = value
+
+    def __delitem__(self, key):
+        del self._slot()[key]
+
+    def __iter__(self):
+        return iter(self._slot())
+
+    def __len__(self):
+        return len(self._slot())
+
+
+_CUR: MutableMapping = _CurrentPart()
+
+
+def current_doc_id() -> Optional[str]:
+    """Calling agent's current handle, without adopting an engine-global document."""
+    value = _CUR.get("doc_id")
+    return _resolve_alias(value) if value else None
+
+
+@contextlib.contextmanager
+def agent_doc_context(agent_id, *, scope=None):
+    """Bind host calls to their own persistent slot; restore nested callers safely."""
+    token = cb.CURRENT_AGENT.set((scope, agent_id))
+    try:
+        yield
+    finally:
+        cb.CURRENT_AGENT.reset(token)
 
 
 @contextlib.contextmanager
@@ -518,7 +562,7 @@ def _docs_named(docs: list, value: str) -> list:
 
 def _project_dir() -> str:
     """The turn's project directory (CHUDWARE_PROJECT_DIR), absolute and normalized; "" if unset."""
-    raw = os.environ.get("CHUDWARE_PROJECT_DIR", "").strip()
+    raw = root_value("CHUDWARE_PROJECT_DIR").strip()
     return os.path.normpath(os.path.abspath(os.path.expanduser(raw))) if raw else ""
 
 
@@ -741,8 +785,8 @@ def _foreign_sole_doc(entry: dict) -> "DocRefError":
 
 
 def _doc(doc_id: Optional[str]) -> str:
-    # `_CUR` is a single PROCESS-WIDE "current part", and it is only ever set by a doc THIS
-    # process created or opened. A part the human already had open in the GUI — or one another
+    # `_CUR` is the calling agent's current part (standalone MCP uses the process
+    # slot). A part the human already had open in the GUI — or one another
     # client made — never touches it, so trusting `_CUR` alone reports "no current part" while
     # the part sits right there in the viewport. Always ask the engine what is actually open and
     # reconcile against it. The same listing is what resolves an imperfect supplied handle and
@@ -864,12 +908,10 @@ def _doc(doc_id: Optional[str]) -> str:
                   f'"{near[0].get("name")}")?' if len(near) == 1 else
                   "pass one of the ids above, or the exact name of an open part."))
 
-    # The current part is whatever THIS process last created or opened, and that claim is
-    # authoritative however many other documents happen to be open. The app's untitled
-    # "Part1" and another agent's part in another process are not ours: an omitted doc_id
-    # cannot have meant either, so counting them was only ever a way to reject a call we
-    # could already answer. A sub-agent sharing this process is scoped by `doc_scope()`,
-    # so its part never becomes its parent's.
+    # The current part is whatever THIS agent last created or opened, and that claim is
+    # authoritative however many other documents happen to be open. Host dispatch binds
+    # each agent's slot; standalone MCP and nested doc_scope work retain their usual
+    # process-local behavior.
     live = {e.get("doc_id") for e in docs} if listed else set()
     if listed:
         # Drop claims on documents that are GONE. Engine doc_ids are a per-daemon counter and
@@ -1134,15 +1176,15 @@ def _captioned_render(png: str, doc_id: str, views: list,
 def _sanitize_output_path(path: str) -> str:
     """Resolve an output destination and refuse credential/key locations.
 
-    Relative paths resolve against this process's cwd; ``~``, ``..``, and symlinks
-    are resolved before the denylist check. CAD deliverables deliberately have no
-    workspace-root jail, unlike fs_* tools.
+    Relative paths use ``resolve_agent_path`` and the selected project root, never
+    process cwd. ``~``, ``..``, and symlinks are resolved before the denylist check.
+    CAD deliverables deliberately have no workspace-root jail, unlike fs_* tools.
     """
     if not isinstance(path, str) or not path.strip():
         raise ValueError("output path must be a non-empty string")
     from .fs_tools import _is_sensitive_path
 
-    resolved = Path(os.path.realpath(os.path.expanduser(path)))
+    resolved = Path(os.path.realpath(resolve_agent_path(path, "output path")))
     if _is_sensitive_path(resolved):
         raise ValueError(f"output path {path!r} resolves into a credential/key location")
     return str(resolved)
@@ -1151,11 +1193,10 @@ def _sanitize_output_path(path: str) -> str:
 def resolve_agent_path(path: str, arg: str) -> str:
     """Return the absolute path of an agent-supplied file or directory path.
 
-    A relative path is project-root relative. The project root is the one that fs_*,
-    save_part, asm_add_component and plm_* use: CHUDWARE_PROJECT_DIR, then
-    CHUDWARE_FS_ROOT, each through project_context.resolve_project_root. An absolute
-    path and ``~`` stay as the caller wrote them. This function does not apply a jail;
-    the caller keeps its own containment policy.
+    A relative path is project-root relative: CHUDWARE_PROJECT_DIR, then
+    CHUDWARE_FS_ROOT. An explicit root is authoritative and canonicalized without
+    widening to a marked ancestor. Absolute paths and ``~`` need no project root.
+    This function does not apply a jail; the caller keeps its own containment policy.
 
     When no project root is known (a headless external MCP client), a relative path is
     refused with a message that tells the caller to pass an absolute path.
@@ -1166,15 +1207,16 @@ def resolve_agent_path(path: str, arg: str) -> str:
     expanded = os.path.expanduser(path.strip())
     if os.path.isabs(expanded):
         return os.path.normpath(expanded)
-    from services.agent.project_context import resolve_project_root  # noqa: PLC0415
-
     for key in ("CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT"):
         start = os.environ.get(key, "").strip()
         if not start:
             continue
-        root = resolve_project_root(start)
-        if root.is_dir():
-            return os.path.normpath(os.path.join(str(root), expanded))
+        root = Path(start).expanduser().resolve()
+        if not root.is_dir():
+            raise ValueError(
+                f"{arg} {path!r} is relative, but the configured project root "
+                f"{key}={start!r} is not an existing directory. Pass an ABSOLUTE {arg}.")
+        return os.path.normpath(os.path.join(str(root), expanded))
     raise ValueError(
         f"{arg} {path!r} is relative, but this session has no project root "
         "(CHUDWARE_PROJECT_DIR and CHUDWARE_FS_ROOT are unset), so it has no base to "
@@ -1895,6 +1937,31 @@ def retire_harness_copy(doc_id: Optional[str], new_path: Optional[str],
     return None
 
 
+def _new_project_deliverable_path(root: str, name: Optional[str], doc_id: str,
+                                  suffix: str, open_docs: Sequence[dict] = ()) -> str:
+    """Choose a first destination without replacing any file the document did not own."""
+    directory = Path(os.path.abspath(os.path.expanduser(root)))
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = _project_save_stem(name, doc_id)
+    path = directory / f"{stem}{suffix}"
+    index = 2
+    while os.path.lexists(path) or user_doc_open_at(open_docs, str(path), doc_id):
+        path = directory / f"{stem}_{index}{suffix}"
+        index += 1
+    return str(path)
+
+
+def _native_deliverable_path(entry: dict) -> Optional[str]:
+    """Use an established file or authored native edit, never study-only provenance."""
+    current = entry.get("path")
+    if not current and entry.get("native_source_edited") is True:
+        current = entry.get("native_source_path")
+    if (isinstance(current, str) and current.lower().endswith(".step+")
+            and not _is_recovery_path(current)):
+        return current
+    return None
+
+
 def _default_deliverable_path(doc_id: str, suffix: str) -> str:
     """Choose the destination for a save/export whose caller omitted ``path``.
 
@@ -1905,27 +1972,29 @@ def _default_deliverable_path(doc_id: str, suffix: str) -> str:
     headless MCP clients do not configure a project folder, so only that case keeps the
     historical temp-file fallback.
 
-    A native save of a document that already lives in a real ``.step+`` file saves IN
-    PLACE (the same rule `_project_save` follows). Writing `<root>/<Stem>.step+` instead
-    duplicated an opened `CAD/Wheels/Wheel Hub ….step+` into the project root (2026-09-24).
+    An editable document already backed by a real ``.step+`` saves IN PLACE.
+    Detached imports retain source-save behavior after design edits, but study-only
+    scratch gets its own unused filename; provenance alone never authorizes overwrite.
     """
-    root = os.environ.get("CHUDWARE_PROJECT_SAVE_DIR")
+    root = root_value("CHUDWARE_PROJECT_SAVE_DIR")
     if not root:
         return _tmp(suffix)
 
     name = None
-    current = None
+    entry = {}
+    open_docs = []
     try:
-        for entry in (cb.call("doc_list", {}) or {}).get("docs", []):
-            if isinstance(entry, dict) and entry.get("doc_id") == doc_id:
-                name = entry.get("name") or ""
-                current = entry.get("path") or entry.get("native_source_path")
-                break
+        open_docs = (cb.call("doc_list", {}) or {}).get("docs", [])
+        entry = next((e for e in open_docs
+                      if isinstance(e, dict) and e.get("doc_id") == doc_id), {})
+        name = entry.get("name")
     except Exception:  # noqa: BLE001 — the doc_id remains a stable filename fallback
         pass
-    if (suffix == ".step+" and isinstance(current, str)
-            and current.lower().endswith(".step+") and not _is_recovery_path(current)):
-        return current
+    if suffix == ".step+":
+        current = _native_deliverable_path(entry)
+        if current:
+            return current
+        return _new_project_deliverable_path(root, name, doc_id, suffix, open_docs)
     directory = Path(os.path.abspath(os.path.expanduser(root)))
     directory.mkdir(parents=True, exist_ok=True)
     return str(directory / f"{_project_save_stem(name, doc_id)}{suffix}")
@@ -1952,34 +2021,36 @@ def _project_save(doc_id: Optional[str], name: Optional[str] = None) -> Optional
     An established native destination owns the assembly's relative-source base directory;
     automatic saves must not relocate it to <CHUDWARE_PROJECT_SAVE_DIR>/<safe_stem>.step+.
     Only new/detached documents and recovery snapshots receive that default destination.
+    A document the user opened (hostd origin_kind "gui") is never written here: the agent
+    edits it live in the user's tab, and only an explicit save (the user's, or the agent's
+    save_part) writes the user's file. hostd's autosave snapshots it meanwhile.
     Unset project configuration remains a no-op. Save errors are best-effort, except
     engine connection loss: callers must not claim durable success."""
     if not doc_id:
         return None
     try:
-        root = os.environ.get("CHUDWARE_PROJECT_SAVE_DIR")
+        root = root_value("CHUDWARE_PROJECT_SAVE_DIR")
         if not root:
             return None
         # Always inspect live metadata, even when a caller supplied the name. A failed
         # lookup must fail the best-effort save, not guess a path and move the document.
-        entry = next((e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+        open_docs = (cb.call("doc_list", {}) or {}).get("docs", [])
+        entry = next((e for e in open_docs
                       if isinstance(e, dict) and e.get("doc_id") == doc_id), {})
-        current = entry.get("path")
-        if not current:
-            # A detached native import is an independent session, not a new design.
-            # Preserve the source destination even if authored edits invalidate its
-            # reproducibility; recovery snapshots must still get a real project path.
-            current = entry.get("native_source_path")
+        if entry.get("origin_kind") == "gui":
+            # c259: every add_features batch rewrote the user's open base.step+ (cache.*
+            # included) and cleared its dirty flag, so a broken intermediate state became
+            # the file on disk with no unsaved marker and no hostd crash snapshot.
+            return None
+        # Non-study authored edits preserve source-save behavior, but another GUI
+        # document owns its file. Preserve our work separately instead of replacing it.
+        current = _native_deliverable_path(entry)
         chosen_by_harness = False
-        if (isinstance(current, str) and current.lower().endswith(".step+")
-                and not _is_recovery_path(current)):
+        if current and user_doc_open_at(open_docs, current, doc_id) is None:
             path = Path(current)
         else:
-            d = Path(os.path.abspath(os.path.expanduser(root)))
-            d.mkdir(parents=True, exist_ok=True)
-            if not d.is_dir():
-                return None
-            path = d / f"{_project_save_stem(name or entry.get('name'), doc_id)}.step+"
+            path = Path(_new_project_deliverable_path(
+                root, name or entry.get("name"), doc_id, ".step+", open_docs))
             chosen_by_harness = True
         r = cb.call("doc_save", {"doc_id": doc_id, "path": str(path)})
         written = r.get("path", str(path)) if isinstance(r, dict) else str(path)
@@ -2134,7 +2205,8 @@ def save_touched_docs() -> dict:
     """Save every doc this run built that has no real user file yet. Never raises.
 
     Scope is deliberately narrow: docs this process created/resumed (`_TOUCHED_DOCS`)
-    plus open docs the engine attributes to an agent/mcp client. A doc whose
+    plus open agent/mcp docs with no writer outside this worker's writer group. An
+    untouched doc held by another writer may belong to another workspace. A doc whose
     `origin_kind` is `gui` is the USER's own and is never touched, however unsaved it
     looks — that is exactly the work the recovery prompt exists to protect.
 
@@ -2160,7 +2232,9 @@ def save_touched_docs() -> dict:
     for e in rows:
         did = e["doc_id"]
         origin = e.get("origin_kind")
-        ours = did in _TOUCHED_DOCS or origin in ("mcp", "agent")
+        ours = did in _TOUCHED_DOCS or (
+            origin in ("mcp", "agent") and not e.get("other_writer")
+        )
         if not ours or origin == "gui":
             continue
         if did in _DISCARDED_DOCS and _DISCARDED_DOCS[did] == e.get("path"):
@@ -2179,7 +2253,7 @@ def save_touched_docs() -> dict:
             continue
         pending.append(e)
 
-    if not os.environ.get("CHUDWARE_PROJECT_SAVE_DIR"):
+    if not root_value("CHUDWARE_PROJECT_SAVE_DIR"):
         if pending:
             out["persistence_failure"] = {
                 "reason": "no_project_save_dir",
@@ -2512,9 +2586,7 @@ def _recover_via_daemon() -> list:
             if st.get("recovery") in ("done", "off") or st.get("state") == "failed":
                 break
             time.sleep(0.2)
-        info = c.call("hello", {"client": "mcp", "pid": os.getpid(), "proto": 1})
-        if isinstance(info, dict) and not info.get("_is_error"):
-            c.server_info = info
+        c.refresh_server_info()
         remap = (c.server_info or {}).get("id_remap") or {}
         names = {}
         try:
@@ -2704,8 +2776,41 @@ _DURABLE_JOB_PREFIX = "sim-"
 #: resolved by ``get_job`` only after it releases ``_JOB_LOCK``; registry reads and DONE
 #: collection may wait, call the engine, and persist a study, so they must never hide behind
 #: this process-local bookkeeping lock.
-_JOBS: dict = {}
+class _OwnedJobs(MutableMapping):
+    """Shared bookkeeping with mandatory owner-filtered lookup for every caller."""
+    def __init__(self):
+        self._records = {}
+
+    def __getitem__(self, key):
+        return self._records[(owner_key(), key)]
+
+    def __setitem__(self, key, value):
+        self._records[(owner_key(), key)] = value
+
+    def __delitem__(self, key):
+        del self._records[(owner_key(), key)]
+
+    def __iter__(self):
+        owner = owner_key()
+        return iter([key for (stored_owner, key) in self._records if stored_owner == owner])
+
+    def __len__(self):
+        return sum(1 for _ in self)
+
+
+_JOBS: MutableMapping = _OwnedJobs()
 _JOB_LOCK = _threading.Lock()
+
+
+def worker_activity() -> dict:
+    from services.worker_activity import registry_lock
+
+    owner = owner_key()
+    with registry_lock(_JOB_LOCK):
+        active = sum(job["status"] == "running"
+                     for (stored_owner, _), job in _JOBS._records.items()
+                     if stored_owner == owner)
+    return {"by_kind": {"cad_thread_jobs": active}}
 
 # G2/G5: completed jobs must stay retrievable for a generous window so a poll after a
 # long OpenFOAM run (which may take minutes) never returns "unknown job_id".  We keep:
@@ -2750,7 +2855,14 @@ def _start_job(kind: str, fn, progress: Optional[dict] = None) -> str:
                     _JOBS[jid].update(code=e.code, detail=e.detail)
 
     # Daemon thread: a long OpenFOAM/FEA solve must never block server (or test) shutdown.
-    _threading.Thread(target=_run, name=f"chudware-job-{kind}", daemon=True).start()
+    from services.worker_activity import start_background_thread
+
+    try:
+        start_background_thread(_run, name=f"chudware-job-{kind}")
+    except BaseException:
+        with _JOB_LOCK:
+            _JOBS.pop(jid, None)
+        raise
     return jid
 
 
@@ -7469,7 +7581,11 @@ def _persist_study(doc_id: str, record: dict) -> Optional[str]:
                 break
         if rid:
             record["id"] = rid
-            cb.call("sim_study_edit", {"doc_id": doc_id, "study_id": rid, "study": record})
+            res = cb.call("sim_study_edit", {
+                "doc_id": doc_id, "study_id": rid, "study": record})
+            # Editing a legacy colliding ID may assign this entry its own stable ID.
+            rid = res.get("study_id", rid) if isinstance(res, dict) else rid
+            record["id"] = rid
             return rid
         res = cb.call("sim_study_add", {"doc_id": doc_id, "study": record})
         return res.get("study_id") if isinstance(res, dict) else None

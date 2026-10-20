@@ -77,6 +77,26 @@ def control_client(conn):
             return
         action = request.get("action")
         params = request.get("params") or {}
+        failure = params.get("_test_control_failure")
+        if failure == "held":
+            marker = control_dir / ("held-" + params["run_id"])
+            marker.write_text("accepted", encoding="utf-8")
+            release = control_dir / ("release-" + params["run_id"])
+            while not release.exists() and not stopping.wait(0.01):
+                pass
+            failure = "closed"
+        if failure == "closed":
+            return
+        if failure == "malformed":
+            conn.sendall(b"not-json\n")
+            return
+        if failure == "refused":
+            send(conn, {"ok": False, "error": {
+                "code": "steer_failed", "message": "steer refused"}})
+            return
+        if failure == "oversized":
+            conn.sendall(b"x" * (256 * 1024 + 1) + b"\n")
+            return
         with condition:
             matched = bool(active) and params.get("run_id") == active.get("run_id")
             if action == "cancel":
@@ -91,6 +111,18 @@ def control_client(conn):
                 result = {"steered": matched}
             elif action == "status":
                 result = {"active": matched}
+            elif action == "answer":
+                if matched:
+                    active["answer"] = params.get("answers")
+                    condition.notify_all()
+                result = {"ok": matched, "accepted": matched}
+            elif action == "release":
+                if os.environ.get("CHUDWARE_TEST_RELEASE") == "refuse":
+                    result = {"ok": False, "reason": "session_busy"}
+                else:
+                    with (control_dir / ("released-%d" % os.getpid())).open("a") as log:
+                        log.write("%s %f\n" % (params.get("session_id"), time.monotonic()))
+                    result = {"ok": True, "released": True}
             else:
                 send(conn, {"ok": False, "error": {"code": "invalid_action", "message": "unsupported"}})
                 return
@@ -132,10 +164,21 @@ for raw in sys.stdin:
             active["run_id"] = run_id
         active_path = Path(os.environ["CHUDWARE_TEST_ACTIVE_PATH"])
         active_path.write_text(run_id, encoding="utf-8")
+        started = time.monotonic()
+        turn_info = {
+            "pid": os.getpid(),
+            "lane": os.environ.get("CHUDWARE_HOSTD_WORKER_LANE"),
+            "started": started,
+            "run_id": run_id,
+        }
+        run_path = control_dir / ("run-" + run_id + ".json")
+        temp_path = run_path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(turn_info), encoding="utf-8")
+        temp_path.replace(run_path)
         send(sys.stdout.buffer, {"id": rid + 999, "event": "wrong", "data": {
             "kind": "wrong_request", "run_id": run_id}})
         send(sys.stdout.buffer, {"id": rid, "event": "run_started", "data": {
-            "kind": "run_started", "run_id": run_id, "source": "fake-worker"}})
+            "kind": "run_started", "source": "fake-worker", **turn_info}})
         send(sys.stdout.buffer, {"id": rid, "event": "agent.tool_call", "data": {
             "kind": "agent.tool_call", "run_id": run_id, "tool_name": "fake_tool"}})
         if mode == "die":
@@ -144,13 +187,15 @@ for raw in sys.stdin:
             time.sleep(600)  # a wedged turn: ignores cancel entirely
         with condition:
             condition.wait_for(
-                lambda: active.get("cancelled") or "steer" in active,
+                lambda: active.get("cancelled") or "steer" in active or "answer" in active,
                 timeout=10.0,
             )
             if active.get("cancelled"):
                 landed = "cancel"
             elif "steer" in active:
                 landed = "steer:" + active["steer"]
+            elif "answer" in active:
+                landed = "answer:" + json.dumps(active["answer"], sort_keys=True)
             else:
                 landed = "timeout"
             active.clear()
@@ -158,6 +203,8 @@ for raw in sys.stdin:
         send(sys.stdout.buffer, {"id": rid, "ok": True, "result": {
             "done": True,
             "control": landed,
+            **turn_info,
+            "finished": time.monotonic(),
             "events": [{"kind": "must_not_replay"}],
         }})
         continue
@@ -212,6 +259,7 @@ def worker_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CHUDWARE_TEST_INFO_COUNTER", str(info_counter))
     monkeypatch.setenv("CHUDWARE_TEST_ACTIVE_PATH", str(active))
     monkeypatch.setenv("CHUDWARE_HOSTD_LINGER_SECS", "10")
+    monkeypatch.setenv("CHUDWARE_AGENT_WORKERS", "4")
     monkeypatch.delenv("CHUDWARE_HOSTD_SOCKET", raising=False)
     pids: list[int] = []
     yield {
@@ -220,6 +268,7 @@ def worker_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "info_counter": info_counter,
         "active": active,
         "log_path": log_path,
+        "turn_dir": control_dir,
     }
     for pid in pids:
         try:
@@ -246,6 +295,276 @@ def _worker_count(path: Path) -> int:
     if not path.exists():
         return 0
     return len(path.read_text(encoding="utf-8").splitlines())
+
+
+def test_different_conversations_run_concurrently_and_cancel_independently(worker_daemon):
+    first, second, controller = DaemonClient(), DaemonClient(), DaemonClient()
+    first.connect()
+    worker_daemon["pids"].append(_pid(first))
+    second.connect()
+    controller.connect()
+    outcomes: dict = {}
+
+    def turn(client, sid, run_id):
+        outcomes[run_id] = client.call(
+            "agent_admin_turn", {"session_id": sid, "run_id": run_id, "request": "work"}
+        )
+
+    threads = [
+        threading.Thread(target=turn, args=(first, "chat-a", "parallel-a"), daemon=True),
+        threading.Thread(target=turn, args=(second, "chat-b", "parallel-b"), daemon=True),
+    ]
+    threads[0].start()
+    first_record = worker_daemon["turn_dir"] / "run-parallel-a.json"
+    _wait_for(first_record)
+    threads[1].start()
+    second_record = worker_daemon["turn_dir"] / "run-parallel-b.json"
+    _wait_for(second_record)
+    assert all(thread.is_alive() for thread in threads)
+    a, b = [json.loads(path.read_text()) for path in (first_record, second_record)]
+    assert a["pid"] != b["pid"]
+    assert (a["lane"], b["lane"]) == ("agent", "agent-turn")
+    assert _worker_count(worker_daemon["counter"]) == 2
+
+    assert controller.call("agent_cancel", {"run_id": "parallel-b"})["cancelled"]
+    threads[1].join(timeout=5.0)
+    assert not threads[1].is_alive()
+    assert outcomes["parallel-b"]["control"] == "cancel"
+    assert threads[0].is_alive()
+    assert "parallel-a" not in outcomes
+    # Session-scoped calls follow the extra even while the primary remains occupied.
+    stats = controller.call("chudcode_session_stats", {"session_id": "chat-b"})
+    assert stats["pid"] == b["pid"]
+    assert stats["lane"] == "agent-turn"
+    assert controller.call("subscription_status")["code"] == "worker_lane_busy"
+    assert controller.call("agent_cancel", {"run_id": "parallel-a"})["cancelled"]
+    threads[0].join(timeout=5.0)
+    assert not threads[0].is_alive()
+    assert outcomes["parallel-a"]["control"] == "cancel"
+    assert max(a["started"], b["started"]) < min(
+        outcomes["parallel-a"]["finished"], outcomes["parallel-b"]["finished"]
+    )
+    assert controller.call("rule_create", {"session_id": "chat-b"})["pid"] == a["pid"]
+    info = controller.call("worker_control_info", {"session_id": "chat-b"})
+    assert info["endpoint"] == str(worker_daemon["turn_dir"] / f"control-{a['pid']}.sock")
+    assert controller.call("daemon_drain")["ok"]
+    for client in (first, second, controller):
+        client.close()
+    deadline = time.monotonic() + 8.0
+    while any(Path(f"/proc/{pid}").exists() for pid in (a["pid"], b["pid"])):
+        assert time.monotonic() < deadline, "agent pool child outlived hostd shutdown"
+        time.sleep(0.02)
+
+
+def test_same_conversation_turns_wait_for_the_owning_worker(worker_daemon):
+    first, second, controller = DaemonClient(), DaemonClient(), DaemonClient()
+    first.connect()
+    worker_daemon["pids"].append(_pid(first))
+    second.connect()
+    controller.connect()
+    outcomes: dict = {}
+
+    def turn(client, run_id):
+        outcomes[run_id] = client.call(
+            "agent_admin_turn",
+            {"session_id": "same-chat", "run_id": run_id, "request": "work"},
+        )
+
+    threads = [
+        threading.Thread(target=turn, args=(first, "serial-a"), daemon=True),
+        threading.Thread(target=turn, args=(second, "serial-b"), daemon=True),
+    ]
+    first_record = worker_daemon["turn_dir"] / "run-serial-a.json"
+    second_record = worker_daemon["turn_dir"] / "run-serial-b.json"
+    threads[0].start()
+    _wait_for(first_record)
+    threads[1].start()
+    deadline = time.monotonic() + 5.0
+    while controller.call("daemon_status").get("inflight", 0) < 3:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    time.sleep(0.2)
+    assert not second_record.exists()
+    assert all(thread.is_alive() for thread in threads)
+    assert controller.call("agent_cancel", {"run_id": "serial-a"})["cancelled"]
+    threads[0].join(timeout=5.0)
+    assert not threads[0].is_alive()
+    _wait_for(second_record)
+    assert threads[1].is_alive()
+    assert controller.call("agent_cancel", {"run_id": "serial-b"})["cancelled"]
+    threads[1].join(timeout=5.0)
+    assert not threads[1].is_alive()
+    a, b = outcomes["serial-a"], outcomes["serial-b"]
+    assert a["control"] == b["control"] == "cancel"
+    assert a["pid"] == b["pid"]
+    assert a["lane"] == b["lane"] == "agent"
+    assert b["started"] >= a["finished"]
+    assert _worker_count(worker_daemon["counter"]) == 1
+    for client in (first, second, controller):
+        client.close()
+
+
+def _run_turn(client, sid, run_id, outcomes):
+    outcomes[run_id] = client.call(
+        "agent_admin_turn", {"session_id": sid, "run_id": run_id, "request": "work"}
+    )
+
+
+@pytest.mark.parametrize("release", ["accept", "refuse"])
+def test_busy_owner_releases_a_conversation_before_another_worker_resumes_it(
+    worker_daemon, monkeypatch, release
+):
+    """chat-a's live runtime sits in the primary, now busy with chat-b. chat-a's next turn
+    moves to another worker only after the primary disposed chat-a's runtime; a worker
+    that cannot release it keeps the conversation (the turn waits for it)."""
+    if release == "refuse":
+        monkeypatch.setenv("CHUDWARE_TEST_RELEASE", "refuse")
+    clients = [DaemonClient() for _ in range(4)]
+    for client in clients:
+        client.connect()
+    worker_daemon["pids"].append(_pid(clients[0]))
+    controller = clients[3]
+    turn_dir = worker_daemon["turn_dir"]
+    outcomes: dict = {}
+
+    first = threading.Thread(target=_run_turn, args=(clients[0], "chat-a", "a1", outcomes))
+    first.start()
+    _wait_for(turn_dir / "run-a1.json")
+    assert controller.call("agent_cancel", {"run_id": "a1"})["cancelled"]
+    first.join(timeout=5.0)
+    primary_pid = outcomes["a1"]["pid"]
+
+    busy = threading.Thread(target=_run_turn, args=(clients[1], "chat-b", "b1", outcomes))
+    busy.start()
+    _wait_for(turn_dir / "run-b1.json")
+    assert json.loads((turn_dir / "run-b1.json").read_text())["pid"] == primary_pid
+    moved = threading.Thread(target=_run_turn, args=(clients[2], "chat-a", "a2", outcomes))
+    moved.start()
+    if release == "accept":
+        _wait_for(turn_dir / "run-a2.json")
+        a2 = json.loads((turn_dir / "run-a2.json").read_text())
+        assert a2["pid"] != primary_pid and a2["lane"] == "agent-turn"
+        released = (turn_dir / f"released-{primary_pid}").read_text().split()
+        assert released[0] == "chat-a"
+        assert float(released[1]) < a2["started"]
+        assert controller.call("agent_cancel", {"run_id": "a2"})["cancelled"]
+        assert controller.call("agent_cancel", {"run_id": "b1"})["cancelled"]
+    else:
+        time.sleep(0.5)
+        assert not (turn_dir / "run-a2.json").exists()
+        assert controller.call("agent_cancel", {"run_id": "b1"})["cancelled"]
+        _wait_for(turn_dir / "run-a2.json")
+        assert json.loads((turn_dir / "run-a2.json").read_text())["pid"] == primary_pid
+        assert controller.call("agent_cancel", {"run_id": "a2"})["cancelled"]
+    for thread in (busy, moved):
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+    if release == "refuse":
+        assert outcomes["a2"]["started"] >= outcomes["b1"]["finished"]
+        assert not (turn_dir / f"released-{primary_pid}").exists()
+    for client in clients:
+        client.close()
+
+
+@pytest.mark.parametrize("failure", ["refused", "malformed", "closed", "oversized", "held"])
+@pytest.mark.parametrize("method", ["agent_steer", "agent_answer"])
+def test_failed_private_request_preserves_endpoint_for_question_answer(
+    worker_daemon, failure, method
+):
+    """A failed steer/answer must not poison the endpoint known during a long turn."""
+    requester, controller = DaemonClient(), DaemonClient()
+    requester.connect()
+    worker_daemon["pids"].append(_pid(requester))
+    controller.connect()
+    run_id = "endpoint-" + failure + "-" + method
+    outcomes: dict = {}
+    thread = threading.Thread(
+        target=_run_turn, args=(requester, "question-chat", run_id, outcomes),
+        daemon=True,
+    )
+    thread.start()
+    _wait_for(worker_daemon["turn_dir"] / f"run-{run_id}.json")
+    try:
+        failed = controller.call(method, {
+            "run_id": run_id, "text": "not accepted",
+            "_test_control_failure": failure,
+        })
+        assert failed["code"] == "worker_control_error"
+        assert TOKEN not in json.dumps(failed)
+        assert thread.is_alive()
+        answers = {"mount": "under an eave", "material": "PETG"}
+        answer = controller.call("agent_answer", {
+            "run_id": run_id, "batch_id": "pending-question", "answers": answers,
+        })
+        assert answer["accepted"] is True
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+        assert outcomes[run_id]["control"] == "answer:" + json.dumps(answers, sort_keys=True)
+        assert _worker_count(worker_daemon["info_counter"]) == 1
+        assert _worker_count(worker_daemon["counter"]) == 1
+        assert TOKEN not in json.dumps({"answer": answer, "outcomes": outcomes})
+    finally:
+        (worker_daemon["turn_dir"] / f"release-{run_id}").touch()
+        if thread.is_alive():
+            controller.call("agent_cancel", {"run_id": run_id})
+            thread.join(timeout=5.0)
+        requester.close()
+        controller.close()
+
+
+def test_slow_private_connection_does_not_block_controls_or_turn_terminals(worker_daemon):
+    """One stalled steer cannot hold the state lock while another control lands."""
+    clients = [DaemonClient() for _ in range(5)]
+    for client in clients:
+        client.connect()
+    worker_daemon["pids"].append(_pid(clients[0]))
+    outcomes: dict = {}
+    turns = [
+        threading.Thread(target=_run_turn, args=(clients[0], "chat-a", "held-a", outcomes),
+                         daemon=True),
+        threading.Thread(target=_run_turn, args=(clients[1], "chat-b", "held-b", outcomes),
+                         daemon=True),
+    ]
+    slow_result: dict = {}
+    slow = threading.Thread(
+        target=lambda: slow_result.update(clients[2].call("agent_steer", {
+            "run_id": "held-a", "text": "stalled",
+            "_test_control_failure": "held",
+        })),
+        daemon=True,
+    )
+    try:
+        for run_id, turn in zip(("held-a", "held-b"), turns):
+            turn.start()
+            _wait_for(worker_daemon["turn_dir"] / f"run-{run_id}.json")
+        slow.start()
+        _wait_for(worker_daemon["turn_dir"] / "held-held-a")
+        started = time.monotonic()
+        assert clients[3].call("agent_cancel", {"run_id": "held-b"})["cancelled"]
+        assert clients[4].call("agent_answer", {
+            "run_id": "held-a", "batch_id": "pending", "answers": {"q": "PETG"},
+        })["accepted"]
+        for turn in turns:
+            turn.join(timeout=1.0)
+            assert not turn.is_alive()
+        assert time.monotonic() - started < 2.0
+        assert slow.is_alive()
+        assert outcomes["held-b"]["control"] == "cancel"
+        assert outcomes["held-a"]["control"] == 'answer:{"q": "PETG"}'
+        assert _worker_count(worker_daemon["info_counter"]) == 2
+    finally:
+        (worker_daemon["turn_dir"] / "release-held-a").touch()
+        if slow.ident is not None:
+            slow.join(timeout=5.0)
+        for run_id, turn in zip(("held-a", "held-b"), turns):
+            if turn.is_alive():
+                clients[3].call("agent_cancel", {"run_id": run_id})
+                turn.join(timeout=5.0)
+        for client in clients:
+            client.close()
+    assert slow_result["code"] == "worker_control_error"
+    assert TOKEN not in json.dumps(slow_result)
+
 
 
 @pytest.mark.parametrize(

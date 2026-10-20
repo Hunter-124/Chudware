@@ -903,3 +903,224 @@ def test_collection_round_trip(client, published_free, activate, as_user, email)
         ).status_code
         == 404
     )
+
+
+def test_fork_write_authorization_and_read_visibility_follow_upstream(
+    client, seller, activate, as_user, email
+):
+    _, owner_headers = seller
+    upstream = create_listing(client, owner_headers, title="PRIVATE CANARY").json()["listing"]["id"]
+    stranger = email("forker")
+    activate(stranger)
+    headers = as_user(stranger)
+    assert client.post("/api/studio/seller", headers=headers, json={
+        "handle": "forker", "display_name": "Forker",
+    }).status_code == 200
+    assert client.get(f"/api/marketplace/listings/{upstream}", headers=headers).status_code == 404
+    denied = create_listing(client, headers, forked_from=upstream)
+    assert denied.status_code == 400
+    assert code_of(denied) == "invalid_fork"
+    child = create_listing(client, headers, title="Child Listing").json()["listing"]["id"]
+    assert client.patch(f"/api/studio/listings/{child}", headers=headers, json={
+        "forked_from": upstream,
+    }).status_code == 400
+    assert client.post(f"/api/studio/listings/{upstream}/submit", headers=owner_headers).status_code == 200
+    assert client.patch(f"/api/studio/listings/{child}", headers=headers, json={
+        "forked_from": upstream,
+    }).status_code == 200
+    assert client.post(f"/api/studio/listings/{child}/submit", headers=headers).status_code == 200
+    assert client.get(f"/api/marketplace/listings/{child}").json()["forked_from"]["title"] == "PRIVATE CANARY"
+    assert client.post(f"/api/studio/listings/{upstream}/unlist", headers=owner_headers).status_code == 200
+    for viewer_headers in ({}, headers):
+        detail = client.get(f"/api/marketplace/listings/{child}", headers=viewer_headers)
+        assert detail.status_code == 200
+        assert detail.json()["forked_from"] is None
+        assert "PRIVATE CANARY" not in detail.text
+    owner_detail = client.get(f"/api/marketplace/listings/{child}", headers=owner_headers)
+    assert owner_detail.json()["forked_from"]["id"] == upstream
+
+
+def test_upload_yields_without_listing_lock_and_concurrent_patch_progresses(
+    client, seller, monkeypatch
+):
+    import asyncio
+    from contextlib import contextmanager
+    import httpx
+    import marketplace
+    from starlette.datastructures import UploadFile
+
+    _, headers = seller
+    listing_id = create_listing(client, headers).json()["listing"]["id"]
+    original_tx = marketplace.tx
+
+    @contextmanager
+    def bounded_tx():
+        with original_tx() as cur:
+            cur.execute("SET LOCAL lock_timeout='250ms'")
+            cur.execute("SET LOCAL statement_timeout='1s'")
+            yield cur
+
+    monkeypatch.setattr(marketplace, "tx", bounded_tx)
+    original_read = UploadFile.read
+
+    async def exercise():
+        reading, release = asyncio.Event(), asyncio.Event()
+        ticks = []
+        stop = False
+
+        async def heartbeat():
+            while not stop:
+                ticks.append(asyncio.get_running_loop().time())
+                await asyncio.sleep(0.01)
+
+        async def barrier_read(file, size=-1):
+            if file.filename == "barrier.step" and not reading.is_set():
+                reading.set()
+                await asyncio.wait_for(release.wait(), 2)
+            return await original_read(file, size)
+
+        monkeypatch.setattr(UploadFile, "read", barrier_read)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app), base_url="http://testserver") as http:
+            beat = asyncio.create_task(heartbeat())
+            upload = asyncio.create_task(http.post(
+                f"/api/studio/listings/{listing_id}/assets", headers=headers,
+                files={"file": ("barrier.step", STEP)}, data={"kind": "source", "role": "primary"},
+            ))
+            try:
+                await asyncio.wait_for(reading.wait(), 2)
+                # Upload remains suspended while another request commits an edit.
+                patched = await asyncio.wait_for(http.patch(
+                    f"/api/studio/listings/{listing_id}", headers=headers,
+                    json={"summary": "Concurrent patch committed"},
+                ), 2)
+                assert patched.status_code == 200, patched.text
+                assert not upload.done()
+                await asyncio.sleep(0.06)
+                release.set()
+                uploaded = await asyncio.wait_for(upload, 2)
+                assert uploaded.status_code == 200, uploaded.text
+            finally:
+                release.set()
+                if not upload.done():
+                    upload.cancel()
+                await asyncio.gather(upload, return_exceptions=True)
+                stop = True
+                await beat
+        assert len(ticks) >= 5
+        assert max(b - a for a, b in zip(ticks, ticks[1:])) < 0.2
+
+    asyncio.run(exercise())
+    assert listing_row(listing_id)["summary"] == "Concurrent patch committed"
+    assert len(asset_ids(listing_id, "source")) == 1
+
+
+def test_listing_lock_wait_does_not_block_gateway_heartbeat(client, seller, monkeypatch):
+    import asyncio
+    from contextlib import contextmanager
+    import threading
+    import httpx
+    import marketplace
+
+    _, headers = seller
+    listing_id = create_listing(client, headers).json()["listing"]["id"]
+    locked, release = threading.Event(), threading.Event()
+    errors = []
+    original_tx = marketplace.tx
+
+    @contextmanager
+    def bounded_tx():
+        with original_tx() as cur:
+            cur.execute("SET LOCAL lock_timeout='1s'")
+            cur.execute("SET LOCAL statement_timeout='2s'")
+            yield cur
+
+    monkeypatch.setattr(marketplace, "tx", bounded_tx)
+
+    def hold_listing():
+        try:
+            with bounded_tx() as cur:
+                cur.execute("SELECT id FROM mk_listings WHERE id=%s FOR UPDATE", (listing_id,))
+                locked.set()
+                assert release.wait(3), "fixture lock release timed out"
+        except BaseException as exc:
+            errors.append(exc)
+
+    holder = threading.Thread(target=hold_listing)
+    holder.start()
+    timer = None
+    try:
+        assert locked.wait(2), errors
+
+        async def exercise():
+            ticks = []
+            stop = False
+
+            async def heartbeat():
+                while not stop:
+                    ticks.append(asyncio.get_running_loop().time())
+                    await asyncio.sleep(0.01)
+
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app), base_url="http://testserver") as http:
+                beat = asyncio.create_task(heartbeat())
+                try:
+                    patched = await asyncio.wait_for(http.patch(
+                        f"/api/studio/listings/{listing_id}", headers=headers,
+                        json={"summary": "Patched after row lock"},
+                    ), 2)
+                    assert patched.status_code == 200, patched.text
+                finally:
+                    stop = True
+                    await beat
+            assert len(ticks) >= 10
+            assert max(b - a for a, b in zip(ticks, ticks[1:])) < 0.2
+
+        # Independent wall-clock release bounds even an old blocked event loop.
+        timer = threading.Timer(0.3, release.set)
+        timer.start()
+        asyncio.run(exercise())
+    finally:
+        release.set()
+        if timer is not None:
+            timer.cancel()
+            timer.join(2)
+        holder.join(3)
+    assert not holder.is_alive()
+    assert errors == []
+
+
+def test_concurrent_upload_commit_serializes_seller_quota(client, seller, marketplace_env, monkeypatch):
+    import asyncio
+    import httpx
+
+    _, headers = seller
+    listing_ids = [
+        create_listing(client, headers, title=f"Quota Listing {index}").json()["listing"]["id"]
+        for index in range(2)
+    ]
+    monkeypatch.setattr(marketplace_env, "marketplace_seller_quota_bytes", len(STEP) + 1)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app), base_url="http://testserver") as http:
+            return await asyncio.wait_for(asyncio.gather(*(
+                http.post(
+                    f"/api/studio/listings/{listing_id}/assets", headers=headers,
+                    files={"file": ("quota.step", STEP)}, data={"kind": "source", "role": "primary"},
+                ) for listing_id in listing_ids
+            )), 3)
+
+    responses = asyncio.run(exercise())
+    assert sorted(response.status_code for response in responses) == [200, 413]
+    rejected = next(response for response in responses if response.status_code == 413)
+    assert code_of(rejected) == "quota_exceeded"
+    with tx() as cur:
+        cur.execute(
+            "SELECT count(*) AS n, sum(bytes) AS used FROM mk_assets WHERE listing_id=ANY(%s::uuid[])",
+            (listing_ids,),
+        )
+        row = cur.fetchone()
+        assert (row["n"], row["used"]) == (1, len(STEP))
+    stored = [
+        path for path in marketplace_env.marketplace_root.rglob("quota.step")
+        if path.is_file()
+    ]
+    assert len(stored) == 1

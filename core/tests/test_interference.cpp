@@ -26,13 +26,25 @@
 
 #include "doc/session.h"
 #include "doc/formats.h"
+#include <BRepAlgoAPI_Cut.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRepBuilderAPI_MakePolygon.hxx>
+#include <BRepBuilderAPI_Transform.hxx>
+#include <BRepBuilderAPI_GTransform.hxx>
+#include <BRepPrimAPI_MakePrism.hxx>
 #include <BRep_Builder.hxx>
 #include <BRepTools.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS_Shell.hxx>
 #include <TopoDS_Solid.hxx>
+#include <TopoDS_Compound.hxx>
+#include <TopLoc_Location.hxx>
+#include <gp_Ax1.hxx>
+#include <gp_Dir.hxx>
+#include <gp_GTrsf.hxx>
+#include <gp_Trsf.hxx>
+#include <gp_Vec.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
 
@@ -112,6 +124,30 @@ struct IntegrityFixtureFile {
     std::filesystem::path path;
     ~IntegrityFixtureFile() { std::error_code ec; std::filesystem::remove(path, ec); }
 };
+
+json imported_shape_health(const TopoDS_Shape& shape) {
+    const std::string id = doc_new("part", "PlacedHealthFixture").at("doc_id").get<std::string>();
+    IntegrityFixtureFile fixture{
+        std::filesystem::temp_directory_path() / ("placed_health_" + id + ".brep")};
+    REQUIRE(BRepTools::Write(shape, fixture.path.string().c_str()));
+    chudware::doc::doc_import_file(fixture.path.string(), id, false, "brep");
+    const json health = chudware::doc::doc_eval_solid_health(id, 1);
+    chudware::doc::doc_close(id);
+    REQUIRE(health["bodies"].size() == 1);
+    return health["bodies"][0];
+}
+
+TopoDS_Shape folded_health_prism() {
+    // Unequal lobes keep the signed volume positive despite two crossing side faces.
+    BRepBuilderAPI_MakePolygon polygon;
+    polygon.Add(gp_Pnt(0, 0, 0));
+    polygon.Add(gp_Pnt(40, 20, 0));
+    polygon.Add(gp_Pnt(40, 0, 0));
+    polygon.Add(gp_Pnt(0, 5, 0));
+    polygon.Close();
+    return BRepPrimAPI_MakePrism(
+        BRepBuilderAPI_MakeFace(polygon.Wire()).Face(), gp_Vec(0, 0, 10)).Shape();
+}
 
 }  // namespace
 
@@ -452,6 +488,122 @@ TEST_CASE("eval_interference: inconclusive threshold bounds require exact positi
     CHECK(pair.at("distance").get<double>() == doctest::Approx(1.2132034356).epsilon(1e-6));
     CHECK_FALSE(pair.contains("distance_lower_bound_mm"));
     CHECK((pair.value("warning", std::string()) == "below min clearance") == below_minimum);
+}
+
+TEST_CASE("eval_interference: proven-disjoint boundary distance agrees with full-solid extrema") {
+    TopoDS_Shape a = BRepPrimAPI_MakeBox(10, 10, 10).Shape();
+    TopoDS_Shape b = BRepPrimAPI_MakeBox(gp_Pnt(10.25, 0, 0), 1, 1, 1).Shape();
+    double expected_distance = 0.25;
+    double expected_overlap = 0.0;
+    bool tolerance_case = false;
+    SUBCASE("separated boxes") {}
+    SUBCASE("touching boxes retain exact contact") {
+        b = BRepPrimAPI_MakeBox(gp_Pnt(10, 0, 0), 1, 1, 1).Shape();
+        expected_distance = 0;
+    }
+    SUBCASE("geometric-tolerance-scale separation matches the original algorithm") {
+        b = BRepPrimAPI_MakeBox(gp_Pnt(10 + 5e-8, 0, 0), 1, 1, 1).Shape();
+        tolerance_case = true;
+    }
+    SUBCASE("hollow solid retains the inner cavity boundary") {
+        a = BRepAlgoAPI_Cut(a,
+            BRepPrimAPI_MakeBox(gp_Pnt(2, 2, 2), 6, 6, 6).Shape()).Shape();
+        b = BRepPrimAPI_MakeBox(gp_Pnt(2.25, 4, 4), 1, 1, 1).Shape();
+    }
+    SUBCASE("contained solid remains volumetric interference") {
+        b = BRepPrimAPI_MakeBox(gp_Pnt(4, 4, 4), 1, 1, 1).Shape();
+        expected_overlap = 1;
+    }
+    SUBCASE("tiny contained solid below the volume epsilon still has zero distance") {
+        // Its boundaries are almost 4 mm apart: boundary-only extrema would
+        // invent a positive gap even though the common mass is below 1e-3.
+        b = BRepPrimAPI_MakeBox(gp_Pnt(4, 4, 4), 0.05, 0.05, 0.05).Shape();
+        expected_distance = 0;
+    }
+    SUBCASE("tiny crossing overlap below the volume epsilon remains contact") {
+        b = BRepPrimAPI_MakeBox(gp_Pnt(9.98, 4, 4), 0.05, 0.05, 0.05).Shape();
+        expected_distance = 0;
+    }
+    SUBCASE("multi-solid member uses every solid boundary") {
+        BRep_Builder builder;
+        TopoDS_Compound compound;
+        builder.MakeCompound(compound);
+        builder.Add(compound, a);
+        builder.Add(compound,
+            BRepPrimAPI_MakeBox(gp_Pnt(30, 0, 0), 10, 10, 10).Shape());
+        a = compound;  // B lies within A's aggregate AABB, but outside both solids.
+    }
+    SUBCASE("overlapping solids within a member do not hide its external boundary") {
+        BRep_Builder builder;
+        TopoDS_Compound compound;
+        builder.MakeCompound(compound);
+        builder.Add(compound, a);
+        builder.Add(compound,
+            BRepPrimAPI_MakeBox(gp_Pnt(5, 0, 0), 10, 10, 10).Shape());
+        a = compound;
+        b = BRepPrimAPI_MakeBox(gp_Pnt(15.25, 0, 0), 1, 1, 1).Shape();
+    }
+    SUBCASE("multi-solid member with a tiny contained solid keeps full-solid treatment") {
+        BRep_Builder builder;
+        TopoDS_Compound compound;
+        builder.MakeCompound(compound);
+        builder.Add(compound, b);
+        builder.Add(compound,
+            BRepPrimAPI_MakeBox(gp_Pnt(4, 4, 4), 0.05, 0.05, 0.05).Shape());
+        b = compound;
+        expected_distance = 0;
+    }
+
+    const auto did = doc_new("assembly", "BoundaryDistance").at("doc_id").get<std::string>();
+    IntegrityFixtureFile file_a{
+        std::filesystem::temp_directory_path() / ("boundary_a_" + did + ".brep")};
+    IntegrityFixtureFile file_b{
+        std::filesystem::temp_directory_path() / ("boundary_b_" + did + ".brep")};
+    REQUIRE(BRepTools::Write(a, file_a.path.string().c_str()));
+    REQUIRE(BRepTools::Write(b, file_b.path.string().c_str()));
+    doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", file_a.path.string()}}}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", file_b.path.string()}}}}
+    }), false);
+
+    const json exact = doc_eval_interference(did,
+        {{"include_coincident", true}, {"min_clearance_mm", 20}});
+    const json threshold = doc_eval_interference(did,
+        {{"include_coincident", true}, {"min_clearance_mm", 20}, {"clearance_mode", "threshold"}});
+    INFO(exact.dump(2));
+    INFO(threshold.dump(2));
+    for (const auto* report : {&exact, &threshold}) {
+        REQUIRE(report->at("complete") == true);
+        CHECK(report->at("pairs_total") == 1);
+        CHECK(report->at("pairs_checked") == 1);
+        CHECK(report->at("pairs_reused") == 0);
+        CHECK(report->at("pair_failures").empty());
+        CHECK(report->at("geometry_failures").empty());
+    }
+    for (const char* kind : {"interferences", "contacts", "clearances"})
+        CHECK(threshold.at(kind).size() == exact.at(kind).size());
+    if (expected_overlap > 0) {
+        REQUIRE(exact.at("interferences").size() == 1);
+        CHECK(exact.at("interferences").front().at("volume").get<double>() ==
+              doctest::Approx(expected_overlap));
+        CHECK(threshold.at("interferences").front().at("volume") ==
+              exact.at("interferences").front().at("volume"));
+    } else {
+        REQUIRE(exact.at("interferences").empty());
+        const char* kind = exact.at("contacts").empty() ? "clearances" : "contacts";
+        REQUIRE(exact.at(kind).size() == 1);
+        REQUIRE(threshold.at(kind).size() == 1);
+        const auto& reference = exact.at(kind).front();
+        const auto& measured = threshold.at(kind).front();
+        CHECK(measured.at("distance_status") == "exact");
+        CHECK_FALSE(measured.contains("distance_lower_bound_mm"));
+        CHECK(measured.at("distance").get<double>() ==
+              doctest::Approx(reference.at("distance").get<double>()).epsilon(1e-10));
+        CHECK(measured.value("warning", std::string()) == reference.value("warning", std::string()));
+        if (!tolerance_case)
+            CHECK(measured.at("distance").get<double>() == doctest::Approx(expected_distance));
+    }
+    chudware::doc::doc_close(did);
 }
 
 TEST_CASE("model integrity: positive gap is proximity, not touching, and nearest is exact") {
@@ -798,6 +950,105 @@ TEST_CASE("assembly health: mating surfaces are not self-piercing solid skins") 
     CHECK(census["pairs"][0]["distance_mm"].get<double>() == doctest::Approx(0.0));
     CHECK(census["pairs"][0]["overlap_volume_mm3"].get<double>() == doctest::Approx(0.0));
     CHECK(census["islands"].size() == 1);
+}
+
+TEST_CASE("solid health: adjacent fillet skins are invariant under rigid placement") {
+    // Mechanically reduced from a valid 51-face native solid to its two adjacent
+    // radius-0.7 cylindrical fillet faces. Original curves/pcurves and tolerances
+    // are retained; there is no healing or project-file dependency. OCCT's world
+    // CheckerSI reports a face-face interference after a 4e-9-radian Y rotation
+    // and -6mm Z shift, but not in the identical TShape's authoring coordinates.
+    TopoDS_Shape skin;
+    BRep_Builder builder;
+    const auto fixture = std::filesystem::path(__FILE__).parent_path() /
+                         "fixtures/placed_fillet_skin.brep";
+    REQUIRE(BRepTools::Read(skin, fixture.string().c_str(), builder));
+    const json local = imported_shape_health(skin);
+    REQUIRE(local["faces"] == 2);
+    REQUIRE(local["self_intersection"]["checked"] == true);
+    CHECK(local["self_intersection"]["interference_count"] == 0);
+    gp_Trsf placement;
+    placement.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0)), 4e-9);
+    placement.SetTranslationPart(gp_Vec(0, 0, -6));
+    const TopoDS_Shape world = skin.Moved(TopLoc_Location(placement));
+    REQUIRE(world.IsPartner(skin));  // placement did not reconstruct geometry
+    REQUIRE(world.Located(skin.Location()).IsSame(skin));
+    const json placed = imported_shape_health(world);
+    CHECK(placed["self_intersection"]["checked"] == true);
+    CHECK(placed["self_intersection"]["self_intersecting"] == false);
+    CHECK(placed["self_intersection"]["interference_count"] == 0);
+    CHECK(placed["self_intersection"]["scope"] == "surface_body");
+    CHECK(placed["area_mm2"].get<double>() ==
+          doctest::Approx(local["area_mm2"].get<double>()));
+
+    const std::string did = doc_new("assembly", "PlacedFilletHealth").at("doc_id").get<std::string>();
+    doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"name", "FilletSkin"},
+         {"source", {{"path", std::filesystem::absolute(fixture).string()}}},
+         {"transform", {placement.Value(1, 1), placement.Value(1, 2), placement.Value(1, 3), 0,
+                        placement.Value(2, 1), placement.Value(2, 2), placement.Value(2, 3), 0,
+                        placement.Value(3, 1), placement.Value(3, 2), placement.Value(3, 3), -6,
+                        0, 0, 0, 1}}}
+    }), false);
+    const json assembly = chudware::doc::doc_eval_solid_health(did, 0);
+    REQUIRE(assembly["bodies"].size() == 1);
+    CHECK(assembly["bodies"][0]["self_intersection"]["checked"] == true);
+    CHECK(assembly["bodies"][0]["self_intersection"]["interference_count"] == 0);
+    CHECK(assembly["bodies"][0]["area_mm2"].get<double>() ==
+          doctest::Approx(local["area_mm2"].get<double>()));
+    chudware::doc::doc_close(did);
+}
+
+TEST_CASE("solid health: proper rigid placement preserves full self-intersection checks") {
+    const TopoDS_Shape valid = BRepPrimAPI_MakeBox(10, 10, 10).Shape();
+    const TopoDS_Shape invalid = folded_health_prism();
+    std::vector<gp_Trsf> placements(3);
+    placements[1].SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0)), 4e-9);
+    placements[1].SetTranslationPart(gp_Vec(0, 0, -6));
+    placements[2].SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(.23, .71, .48)), .73);
+    placements[2].SetTranslationPart(gp_Vec(100, -200, 300));
+    for (const gp_Trsf& placement : placements) {
+        const json good = imported_shape_health(valid.Moved(TopLoc_Location(placement)));
+        CHECK(good["self_intersection"]["checked"] == true);
+        CHECK(good["self_intersection"]["self_intersecting"] == false);
+        CHECK(good["self_intersection"]["interference_count"] == 0);
+        CHECK(good["self_intersection"]["constituents_checked"] == 1);
+        CHECK(good["volume_mm3"].get<double>() == doctest::Approx(1000));
+        CHECK(good["sound"] == true);
+
+        const json bad = imported_shape_health(invalid.Moved(TopLoc_Location(placement)));
+        CHECK(bad["self_intersection"]["checked"] == true);
+        CHECK(bad["self_intersection"]["self_intersecting"] == true);
+        CHECK(bad["self_intersection"]["interference_count"].get<int>() > 0);
+        CHECK(bad["self_intersection"]["constituents_checked"] == 1);
+        CHECK(bad["self_intersection"]["scope"] == "within_each_solid");
+        CHECK(bad["free_edges"]["count"] == 0);
+        CHECK(bad["non_manifold_edges"]["count"] == 0);
+        CHECK(bad["volume_positive"] == true);
+        CHECK(bad["watertight"] == true);
+        CHECK(bad["sound"] == false);
+    }
+}
+
+TEST_CASE("solid health: scaled and sheared geometry retains genuine intersections") {
+    const TopoDS_Shape invalid = folded_health_prism();
+    gp_Trsf scale;
+    scale.SetScale(gp_Pnt(0, 0, 0), 2);
+    const TopoDS_Shape scaled = BRepBuilderAPI_Transform(invalid, scale, true).Shape();
+    gp_GTrsf shear;
+    shear.SetValue(1, 1, 2);
+    shear.SetValue(1, 2, .4);
+    const TopoDS_Shape sheared = BRepBuilderAPI_GTransform(invalid, shear, true).Shape();
+    gp_Trsf placement;
+    placement.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1, 2, 3)), .43);
+    placement.SetTranslationPart(gp_Vec(-80, 40, 120));
+    for (const TopoDS_Shape& shape : {scaled, sheared}) {
+        const json body = imported_shape_health(shape.Moved(TopLoc_Location(placement)));
+        CHECK(body["self_intersection"]["checked"] == true);
+        CHECK(body["self_intersection"]["self_intersecting"] == true);
+        CHECK(body["self_intersection"]["interference_count"].get<int>() > 0);
+        CHECK(body["sound"] == false);
+    }
 }
 
 TEST_CASE("solid health: tangent fused stock imprints do not open the skin") {

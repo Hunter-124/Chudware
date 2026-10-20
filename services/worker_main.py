@@ -41,6 +41,7 @@ _STDOUT_LOCK = threading.Lock()
 _CONTROL_SERVER = None
 
 from services import paths  # type: ignore  # re-homed from engine_oracle/paths.py
+from services.agent.request_context import bind_context, cell_path, control_delegate, in_cell
 
 
 def _ping(_params: dict, _emit_event: EmitFn) -> dict:
@@ -82,6 +83,12 @@ def _worker_control_info(_params: dict, _emit_event: EmitFn) -> dict:
     return server.info()
 
 
+def _worker_activity(_params: dict, _emit_event: EmitFn) -> dict:
+    from services.worker_activity import snapshot
+
+    return snapshot()
+
+
 def _normalize_face_query(params: dict, _emit_event: EmitFn) -> dict:
     """Pure shared grammar normalization; document resolution stays in the caller's engine."""
     from services.mcp.cad_common import _SID_RE, _as_face_query, _parse_inspect_target
@@ -97,6 +104,7 @@ _METHODS = {
     "run_model": _run_model,
     "list_editable_prompts": _list_editable_prompts,
     "worker_control_info": _worker_control_info,
+    "worker_activity": _worker_activity,
     "worker_normalize_face_query": _normalize_face_query,
 }
 
@@ -160,6 +168,7 @@ _register("em", "services.sim.em.worker_rpc", "WORKER_METHODS")
 
 # ---- Multi-physics seam ----
 _register("multiphysics", "services.sim.multiphysics_rpc", "WORKER_METHODS")
+_register("topology", "services.sim.topology_worker_rpc", "WORKER_METHODS")
 _register("piping_fitting_cfd", "services.piping.worker_rpc", "WORKER_METHODS")
 
 # ---- Manufacturing printer adapters (Moonraker / OctoPrint / PrusaLink) ----
@@ -244,6 +253,22 @@ def _invoke_chudcode_control(action: str, params: dict) -> dict:
     return chudcode_control(action, params)
 
 
+def dispatch_request(req: dict, emit_event: EmitFn) -> object:
+    """Bind only the hostd envelope, never caller-provided identity parameters."""
+    with bind_context(req.get("ctx")):
+        method = req["method"]
+        control_delegate("cancel" if method in {
+            "agent_cancel", "reveng_cancel_splat"} else method)
+        params = dict(req.get("params") or {})
+        if in_cell() and ("control_delegate" in req or "control_delegate" in params):
+            raise ValueError("forbidden_right")
+        if in_cell() and method in {"vendor_part_register_local_cad", "vendor_part_scan_library"}:
+            for key in ("cad_path", "folder", "artifact_path"):
+                if params.get(key):
+                    params[key] = str(cell_path(params[key]))
+        return _METHODS[method](params, emit_event)
+
+
 def _shutdown_chudcode() -> None:
     try:
         from services.agent.worker_rpc import chudcode_shutdown
@@ -275,9 +300,13 @@ def serve() -> None:
     # Hostd gives each worker one process-local role. Unflagged desktop,
     # standalone and compiled launches retain the original full lifecycle.
     lane = os.environ.get("CHUDWARE_HOSTD_WORKER_LANE", "")
-    if lane not in ("", "agent", "general"):
+    if lane not in ("", "agent", "agent-turn", "general"):
         raise ValueError("invalid hostd worker lane")
     agent_services = lane != "general"
+    bench_services = lane in ("", "agent") and not in_cell()
+    if in_cell():
+        from services.agent.request_context import process_owner_key
+        process_owner_key()
     global _CONTROL_SERVER
     if agent_services:
         from services.agent.chudcode_control import ControlServer
@@ -299,7 +328,7 @@ def serve() -> None:
             if control is not None:
                 control.stop()
         finally:
-            if agent_services:
+            if bench_services:
                 _shutdown_bench()
             try:
                 from services.reveng.gaussian_jobs import shutdown as shutdown_gaussian_jobs
@@ -330,9 +359,11 @@ def serve() -> None:
     try:
         log.info("worker ready (runtime=%s, lane=%s)", paths.RUNTIME, lane or "standalone")
         if agent_services:
-            _reconcile_bench()
+            if bench_services:
+                _reconcile_bench()
             _warm_prompt_cache()
-            _warm_chudcode_service()
+            if lane != "agent-turn" and not in_cell():
+                _warm_chudcode_service()
         for line in sys.stdin:
             line = line.strip()
             if not line:
@@ -358,9 +389,13 @@ def serve() -> None:
                 _emit({"id": _rid, "event": data.get("kind", "event"), "data": data})
 
             try:
-                result = fn(req.get("params") or {}, emit_event)
+                result = dispatch_request(req, emit_event)
                 _emit({"id": rid, "ok": True, "result": result})
             except Exception as e:  # noqa: BLE001
+                if str(e).strip("'") in {"not_found", "cell_refused", "forbidden_right", "credential_isolation_unsupported"}:
+                    code = str(e).strip("'")
+                    _emit({"id": rid, "ok": False, "error": {"code": code, "message": code}})
+                    continue
                 log.error("method %s failed: %s\n%s", method, e, traceback.format_exc())
                 if method in _STRUCTURED_ERROR_METHODS:
                     to_env = getattr(e, "to_envelope", None)

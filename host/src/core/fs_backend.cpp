@@ -221,13 +221,10 @@ std::string urlEncode(const std::string& s) {
     return out;
 }
 
-// Convert a server abs path (or relative-to-root) into a workspace-relative path for
-// gateway query/body params. list() returns root as abs; entries return rel under root.
-// We keep the abs form for daemon RPCs and strip the known root for gateway calls.
+// All browser paths remain workspace-relative. The OS-enforced cell owns /work;
+// no gateway filesystem root is discovered, stripped, or sent back over RPC.
 class WebFsBackend final : public FsBackend {
 public:
-    std::string rootAbs_;   // cached from last list() {"root": ...}
-    bool        rootKnown_ = false;
 
     struct BrowseEntry {
         FsDirectorySnapshot snapshot;
@@ -243,13 +240,9 @@ public:
         uint64_t epoch;
     };
 
-    void invalidateBrowseCache(bool workspaceChanged = false) override {
+    void invalidateBrowseCache(bool /*workspaceChanged*/ = false) override {
         ++browseEpoch_;
         directories_.clear();
-        if (workspaceChanged) {
-            rootAbs_.clear();
-            rootKnown_ = false;
-        }
     }
 
     static void browseComplete(emscripten_fetch_t* fetch) {
@@ -276,11 +269,9 @@ public:
                         if (!fetch->data || fetch->numBytes == 0)
                             throw std::runtime_error("Empty workspace listing");
                         auto json = nlohmann::json::parse(fetch->data, fetch->data + fetch->numBytes);
-                        const auto root = json.at("root").get<std::string>();
-                        if (root.empty() || !json.at("dirs").is_array() || !json.at("files").is_array())
+                        if (json.at("root") != "." || !json.at("dirs").is_array() ||
+                            !json.at("files").is_array())
                             throw std::runtime_error("Invalid workspace listing");
-                        if (backend.rootKnown_ && backend.rootAbs_ != root)
-                            throw std::runtime_error("Workspace changed; reload the workspace");
                         std::vector<FsEntry> entries;
                         auto take = [&](const nlohmann::json& array, bool isDir) {
                             for (const auto& item : array) {
@@ -290,15 +281,14 @@ public:
                                 entry.size = item.value("size", uint64_t{0});
                                 entry.mtime = item.value("mtime", int64_t{0});
                                 if (entry.name.empty() || entry.name == "." || entry.name == ".." ||
-                                    entry.name.find_first_of("/\\") != std::string::npos)
+                                    entry.name.find_first_of("/\\:") != std::string::npos ||
+                                    entry.name.find('\0') != std::string::npos)
                                     throw std::runtime_error("Invalid workspace entry name");
                                 entries.push_back(std::move(entry));
                             }
                         };
                         take(json.at("dirs"), true);
                         take(json.at("files"), false);
-                        backend.rootAbs_ = root;
-                        backend.rootKnown_ = true;
                         snapshot.entries = std::move(entries);
                         snapshot.state = FsReadState::Ready;
                     } catch (const std::exception& e) {
@@ -339,47 +329,30 @@ public:
         return snapshot;
     }
 
-    bool isWorkspacePath(const std::string& path) const {
-        return path.empty() || path == "/" || path.front() != '/' ||
-               path == rootAbs_ || path.compare(0, rootAbs_.size() + 1, rootAbs_ + "/") == 0;
-    }
-
     const FsDirectorySnapshot& pollDirectory(const std::string& dir) override {
-        if (!rootKnown_) return pollRelative("");
-        // Do not turn a recent absolute path from another team into a relative
-        // path under this team's root (nor probe it every frame).
-        if (!isWorkspacePath(dir)) {
+        std::string relative, err;
+        if (!workspaceRelativePath(dir, relative, err)) {
             static const FsDirectorySnapshot outside{
-                FsReadState::Error, false, 0, {}, "Path is outside the current workspace"};
+                FsReadState::Error, false, 0, {}, "Invalid workspace-relative path"};
             return outside;
         }
-        return pollRelative(toRel(dir));
+        return pollRelative(relative);
     }
 
     std::string pollDefaultRoot(std::string& err) override {
         err.clear();
-        if (!rootKnown_) {
-            const auto& root = pollRelative("");
-            err = root.error;
-        }
-        return rootKnown_ ? rootAbs_ : std::string();
+        return ".";
     }
 
     FsStatSnapshot pollStat(const std::string& path) override {
         FsStatSnapshot result;
-        if (!rootKnown_) {
-            const auto& root = pollRelative("");
-            result.state = root.state == FsReadState::Error ? FsReadState::Error : FsReadState::Loading;
-            result.error = root.error;
-            return result;
-        }
-        if (!isWorkspacePath(path)) {
+        std::string relative;
+        if (!workspaceRelativePath(path, relative, result.error)) {
             result.state = FsReadState::Error;
-            result.error = "Path is outside the current workspace";
             return result;
         }
-        const bool isRoot = path.empty() || path == rootAbs_ || path == rootAbs_ + "/" || path == "/";
-        const auto& directory = pollDirectory(isRoot ? rootAbs_ : pathParent(path));
+        const bool isRoot = relative.empty();
+        const auto& directory = pollDirectory(isRoot ? "." : pathParent(relative));
         result.state = directory.state;
         result.error = directory.error;
         if (directory.state == FsReadState::Missing) {
@@ -388,7 +361,7 @@ public:
             if (isRoot) {
                 result.value.exists = result.value.isDir = true;
             } else {
-                const auto name = pathFilename(path);
+                const auto name = pathFilename(relative);
                 for (const auto& entry : directory.entries) {
                     if (entry.name != name) continue;
                     result.value = {true, entry.isDir, !entry.isDir, entry.size, entry.mtime};
@@ -399,45 +372,6 @@ public:
         return result;
     }
 
-    // Ensure we know the server workspace abs root (one list of "").
-    bool ensureRoot(std::string& err) {
-        if (rootKnown_ && !rootAbs_.empty()) return true;
-        auto entries = listImpl("", /*wantRoot=*/true, err);
-        (void)entries;
-        return rootKnown_ && !rootAbs_.empty();
-    }
-
-    // Map an abs path (or already-relative) to a gateway-relative path.
-    std::string toRel(const std::string& path) {
-        if (path.empty() || path == "/") return "";
-        if (!rootKnown_ || rootAbs_.empty()) {
-            // Strip leading slash only.
-            if (!path.empty() && path[0] == '/') return path.substr(1);
-            return path;
-        }
-        // Exact root.
-        if (path == rootAbs_ || path == rootAbs_ + "/") return "";
-        // Prefix match.
-        if (path.size() > rootAbs_.size() &&
-            path.compare(0, rootAbs_.size(), rootAbs_) == 0 &&
-            (path[rootAbs_.size()] == '/' || path[rootAbs_.size()] == '\\')) {
-            return path.substr(rootAbs_.size() + 1);
-        }
-        // Already relative (no leading slash, or starts with something else).
-        if (!path.empty() && path[0] == '/') return path.substr(1);
-        return path;
-    }
-
-    // Map gateway relative path -> abs (for returning to callers / daemon).
-    std::string toAbs(const std::string& rel) const {
-        if (!rootKnown_ || rootAbs_.empty()) {
-            if (rel.empty()) return "/";
-            return rel[0] == '/' ? rel : ("/" + rel);
-        }
-        if (rel.empty()) return rootAbs_;
-        if (rel[0] == '/') return rootAbs_ + rel;
-        return rootAbs_ + "/" + rel;
-    }
 
     // ---- ASYNCIFY-yielding fetch helpers -----------------------------------
     // Main-thread ImGui + ASYNCIFY (no PROXY_TO_PTHREAD): a SYNCHRONOUS
@@ -610,7 +544,7 @@ public:
         return true;
     }
 
-    std::vector<FsEntry> listImpl(const std::string& dirRel, bool wantRoot, std::string& err,
+    std::vector<FsEntry> listImpl(const std::string& dirRel, std::string& err,
                                   int* status = nullptr) {
         err.clear();
         const std::string url = std::string("/workspace/list?dir=") + urlEncode(dirRel);
@@ -627,12 +561,10 @@ public:
             err = std::string("list JSON: ") + e.what();
             return {};
         }
-        if (j.contains("root") && j["root"].is_string()) {
-            rootAbs_ = j["root"].get<std::string>();
-            rootKnown_ = true;
-        }
-        if (wantRoot && !rootKnown_) {
-            err = "list: missing root";
+        if (!j.is_object() || j.value("root", std::string()) != "." ||
+            !j.contains("dirs") || !j["dirs"].is_array() ||
+            !j.contains("files") || !j["files"].is_array()) {
+            err = "Invalid workspace listing";
             return {};
         }
         std::vector<FsEntry> out;
@@ -647,45 +579,53 @@ public:
                     e.size  = it.value("size", static_cast<uint64_t>(0));
                     e.mtime = it.value("mtime", static_cast<int64_t>(0));
                 }
-                if (!e.name.empty()) out.push_back(std::move(e));
+                if (e.name.empty() || e.name == "." || e.name == ".." ||
+                    e.name.find_first_of("/\\:") != std::string::npos ||
+                    e.name.find('\0') != std::string::npos) {
+                    err = "Invalid workspace entry name";
+                    return;
+                }
+                out.push_back(std::move(e));
             }
         };
         take(j.value("dirs", nlohmann::json::array()), true);
         take(j.value("files", nlohmann::json::array()), false);
-        return out;
+        return err.empty() ? out : std::vector<FsEntry>{};
     }
 
     std::vector<FsEntry> list(const std::string& dir, std::string& err) override {
-        if (!ensureRoot(err)) return {};
-        return listImpl(toRel(dir), /*wantRoot=*/false, err);
+        std::string relative;
+        if (!workspaceRelativePath(dir, relative, err)) return {};
+        return listImpl(relative, err);
     }
 
     bool mkdir(const std::string& path, std::string& err) override {
-        if (!ensureRoot(err)) return false;
+        std::string relative;
+        if (!workspaceRelativePath(path, relative, err)) return false;
         nlohmann::json out;
-        return postJson("/workspace/mkdir",
-                        nlohmann::json{{"path", toRel(path)}}, out, err);
+        return postJson("/workspace/mkdir", {{"path", relative}}, out, err);
     }
 
     bool rename(const std::string& src, const std::string& dst, std::string& err) override {
-        if (!ensureRoot(err)) return false;
+        std::string source, destination;
+        if (!workspaceRelativePath(src, source, err) ||
+            !workspaceRelativePath(dst, destination, err)) return false;
         nlohmann::json out;
-        return postJson("/workspace/rename",
-                        nlohmann::json{{"src", toRel(src)}, {"dst", toRel(dst)}}, out, err);
+        return postJson("/workspace/rename", {{"src", source}, {"dst", destination}}, out, err);
     }
 
     bool remove(const std::string& path, std::string& err) override {
-        if (!ensureRoot(err)) return false;
+        std::string relative;
+        if (!workspaceRelativePath(path, relative, err)) return false;
         nlohmann::json out;
-        return postJson("/workspace/delete",
-                        nlohmann::json{{"path", toRel(path)}}, out, err);
+        return postJson("/workspace/delete", {{"path", relative}}, out, err);
     }
 
     FsStat stat(const std::string& path, std::string& err) override {
         err.clear();
         FsStat s;
-        if (!ensureRoot(err)) return s;
-        const std::string rel = toRel(path);
+        std::string rel;
+        if (!workspaceRelativePath(path, rel, err)) return s;
         if (rel.empty()) {
             // Workspace root always exists as a directory once known (or by convention).
             s.exists = true;
@@ -697,7 +637,7 @@ public:
         const std::string name   = pathFilename(rel);
         std::string listErr;
         int listStatus = 0;
-        auto entries = listImpl(parent, /*wantRoot=*/false, listErr, &listStatus);
+        auto entries = listImpl(parent, listErr, &listStatus);
         if (listStatus == 404) return s;
         if (!listErr.empty()) {
             err = listErr;
@@ -716,26 +656,19 @@ public:
         return s;  // exists=false
     }
 
-    std::string defaultRoot() override {
-        std::string err;
-        if (!ensureRoot(err) || rootAbs_.empty()) {
-            // Before first successful list, report "/" as the logical workspace root.
-            // Callers that pass paths to the daemon must use abs paths from list/upload;
-            // ensureWorkspaceDir will re-resolve once list succeeds.
-            return rootAbs_.empty() ? std::string("/") : rootAbs_;
-        }
-        return rootAbs_;
-    }
+    std::string defaultRoot() override { return "."; }
 
     bool copy(const std::string& src, const std::string& dst, bool recursive,
               std::string& err) override {
-        if (!ensureRoot(err)) return false;
+        std::string source, destination;
+        if (!workspaceRelativePath(src, source, err) ||
+            !workspaceRelativePath(dst, destination, err)) return false;
         nlohmann::json out;
         // Never retry a failed mutation with download/upload: an ambiguous
         // response may already have copied it, and upload could overwrite dst.
         return postJson("/workspace/copy",
-                        nlohmann::json{{"src", toRel(src)},
-                                       {"dst", toRel(dst)},
+                        nlohmann::json{{"src", source},
+                                       {"dst", destination},
                                        {"recursive", recursive}}, out, err);
     }
 
@@ -752,7 +685,10 @@ public:
             std::vector<std::string> out;
             if (j.contains("files") && j["files"].is_array()) {
                 for (const auto& e : j["files"]) {
-                    if (e.is_string()) out.push_back(e.get<std::string>());
+                    std::string relative, pathError;
+                    if (e.is_string() &&
+                        workspaceRelativePath(e.get<std::string>(), relative, pathError) &&
+                        !relative.empty()) out.push_back(std::move(relative));
                 }
             }
             return out;
@@ -772,6 +708,10 @@ public:
         // Recents persistence is best-effort, so post the write and return immediately;
         // the payload is heap-owned until the fetch's success/error callback frees it.
         err.clear();
+        for (const auto& file : files) {
+            std::string relative;
+            if (!workspaceRelativePath(file, relative, err)) return false;
+        }
         nlohmann::json body = {{"files", files}};
         const std::string payload = body.dump();
         char* buf = static_cast<char*>(std::malloc(payload.size()));
@@ -854,6 +794,15 @@ std::string fsUpload(const std::string& dir, const std::string& filename,
                      const uint8_t* data, size_t len, std::string& err) {
     err.clear();
 #ifdef __EMSCRIPTEN__
+    std::string relative;
+    if (!workspaceRelativePath(dir, relative, err)) return {};
+    std::string safeName;
+    if (!workspaceRelativePath(filename, safeName, err) || safeName.empty() ||
+        safeName != filename || filename.find('/') != std::string::npos ||
+        filename.find_first_of("\"\r\n") != std::string::npos) {
+        err = "Invalid upload filename";
+        return {};
+    }
     webInstance().invalidateBrowseCache();
     struct UploadFence {
         ~UploadFence() { webInstance().invalidateBrowseCache(); }
@@ -868,7 +817,7 @@ std::string fsUpload(const std::string& dir, const std::string& filename,
     // dir field
     append("--" + boundary + "\r\n");
     append("Content-Disposition: form-data; name=\"dir\"\r\n\r\n");
-    append(dir);
+    append(relative);
     append("\r\n");
 
     // file field
@@ -940,13 +889,14 @@ std::string fsUpload(const std::string& dir, const std::string& filename,
     }
     try {
         auto j = nlohmann::json::parse(wait.text.empty() ? "{}" : wait.text);
-        if (j.contains("abs_path") && j["abs_path"].is_string())
-            return j["abs_path"].get<std::string>();
         if (j.contains("path") && j["path"].is_string()) {
-            std::string rel = j["path"].get<std::string>();
-            return webInstance().toAbs(rel);
+            std::string result;
+            if (workspaceRelativePath(j["path"].get<std::string>(), result, err) &&
+                !result.empty()) return result;
+            err = "upload: invalid workspace path";
+            return {};
         }
-        err = "upload: missing abs_path";
+        err = "upload: missing path";
         return {};
     } catch (const std::exception& e) {
         err = std::string("upload JSON: ") + e.what();
@@ -964,14 +914,8 @@ std::string fsUpload(const std::string& dir, const std::string& filename,
 
 void fsTriggerDownload(const std::string& path) {
 #ifdef __EMSCRIPTEN__
-    // Use gateway-relative path when we know the root.
-    std::string rel = path;
-    {
-        auto& w = webInstance();
-        std::string e;
-        w.ensureRoot(e);
-        rel = w.toRel(path);
-    }
+    std::string rel, err;
+    if (!workspaceRelativePath(path, rel, err) || rel.empty()) return;
     // window.open('/workspace/download?path=' + encodeURIComponent(p))
     EM_ASM({
         var p = UTF8ToString($0);

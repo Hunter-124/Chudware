@@ -656,6 +656,9 @@ void EvaluateDialogs::runMassEval(AppState& st, const nlohmann::json& extra) {
     }
     nlohmann::json params = {{"doc_id", st.docMirror.docId()}};
     for (auto it = extra.begin(); it != extra.end(); ++it) params[it.key()] = it.value();
+    // Without a custom override the engine applies each body's own material (per-body
+    // overrides included); the dialog's seeded density would flatten them to one value.
+    if (!massCustomDensity_) params.erase("density_g_cm3");
     massPending_ = true;
     const std::string docId = st.docMirror.docId();
     const int revision = st.docMirror.revision();
@@ -683,6 +686,10 @@ void EvaluateDialogs::runMassEval(AppState& st, const nlohmann::json& extra) {
             return;
         }
         massResult_ = r.result;
+        if (!massCustomDensity_ && r.result.contains("material") &&
+            r.result["material"].is_object() &&
+            r.result["material"].value("density_g_cm3", 0.0) > 0.0)
+            massDensity_ = (float)r.result["material"]["density_g_cm3"].get<double>();
         if (massOpen_) {
             designSectionsDirty_ = true;
             rebuildMassOverlays(st);
@@ -1876,6 +1883,10 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
         // explicit advanced density override below.
         auto applyMassMaterial = [&](const std::string& key) {
             if (!st.docMirror.hasDoc() || !st.workerStarted) return;
+            if (st.docLockedByAgent(st.docMirror.docId())) {
+                st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
+                return;
+            }
             std::vector<uint32_t> bodies = st.docBodyIds;
             if (bodies.empty()) bodies.push_back(1);
             float col[3]; float mtl = 0.0f, rgh = 0.5f;

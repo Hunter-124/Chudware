@@ -139,7 +139,9 @@ def test_healthz_authenticated_gets_detail(client):
     body = r.json()
     assert body["dev_mode"] is True
     assert "mem_available_bytes" in body
-    assert "engine_bridges" in body
+    assert "engine_bridges" not in body
+    assert "provider_streams" not in body
+    assert "cell_jobs" not in body
 
 
 # ---------------------------------------------------------------------------

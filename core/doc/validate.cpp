@@ -106,6 +106,9 @@ const std::map<string, ConstraintSpec> CONSTRAINT_SPECS = {
     {"parallel", {2, 2, false}},
     {"perpendicular", {2, 2, false}},
     {"tangent", {2, 2, false}},
+    {"smooth", {2, 2, false}},
+    {"intersection", {3, 3, false}},
+    {"equal_curve_length", {2, 2, false}},
     {"collinear", {2, 2, false}},
     {"equal", {2, 2, false}},
     {"concentric", {2, 2, false}},
@@ -118,6 +121,7 @@ const std::map<string, ConstraintSpec> CONSTRAINT_SPECS = {
     // (modeler Smart-Dimension shorthand). "length" is the explicit 1-ref form.
     {"distance", {1, 2, true}},
     {"length", {1, 1, true}},
+    {"arc_length", {1, 1, true}},
     {"angle", {2, 2, true}},
     {"radius", {1, 1, true}},
     {"diameter", {1, 1, true}},
@@ -1108,7 +1112,7 @@ vector<string> validate_constraint(const json& c, const string& where,
     }
     for (size_t i = 0; i < refs.size(); ++i) {
         const json& h = refs[i];
-        if (h.is_string() && (h.get<string>() == "origin" || h.get<string>() == "origin.p")) {
+        if (h.is_string() && (h == "origin" || h == "origin.p" || h == "axis.h" || h == "axis.v")) {
             continue;
         }
         if (!h.is_string() || !std::regex_match(h.get<string>(), HANDLE_RE)) {
@@ -1146,6 +1150,8 @@ vector<string> validate_constraint(const json& c, const string& where,
     auto ent_type_of = [&](const json& h) -> std::pair<bool, string> {
         if (!h.is_string()) return {false, "<<noent>>"};
         string hs = h.get<string>();
+        if (hs == "axis.h" || hs == "axis.v") return {false, "line"};
+        if (hs == "origin" || hs == "origin.p") return {false, "point"};
         bool has_dot = hs.find('.') != string::npos;
         string base = has_dot ? hs.substr(0, hs.find('.')) : hs;
         auto it = entities_by_id.find(base);
@@ -1162,23 +1168,87 @@ vector<string> validate_constraint(const json& c, const string& where,
         return {has_dot, et};
     };
 
-    if (ctype == "angle") {
-        for (size_t i = 0; i < refs.size() && i < 2; ++i) {
-            auto [has_dot, et] = ent_type_of(refs[i]);
-            bool ent_present = (et != "<<noent>>");
-            if (has_dot || (ent_present && et != "line")) {
-                errs.push_back(where + ".refs[" + std::to_string(i) + "]: angle takes two line entity ids");
-            }
+    auto bad_ref = [&](size_t i, const string& expected) {
+        errs.push_back(where + ".refs[" + std::to_string(i) + "]: '" +
+                       (refs[i].is_string() ? refs[i].get<string>() : refs[i].dump()) +
+                       "' " + ctype + " needs " + expected);
+    };
+    auto point_ref = [&](size_t i) {
+        if (i >= refs.size() || !refs[i].is_string()) return false;
+        const string h = refs[i].get<string>();
+        if (h == "axis.h" || h == "axis.v") return false;
+        auto [sub, t] = ent_type_of(refs[i]);
+        return (sub && handle_targets_entity(h, entities_by_id).empty()) || t == "point";
+    };
+    auto entity_ref = [&](size_t i, const std::set<string>& types) {
+        if (i >= refs.size()) return false;
+        auto [sub, t] = ent_type_of(refs[i]);
+        return !sub && types.count(t);
+    };
+    auto spline_endpoint_ref = [&](size_t i) {
+        if (i >= refs.size() || !refs[i].is_string()) return false;
+        const string h = refs[i].get<string>();
+        auto dot = h.find('.');
+        if (dot == string::npos) return false;
+        auto it = entities_by_id.find(h.substr(0, dot));
+        if (it == entities_by_id.end()) return false;
+        string t = get(it->second, "type").is_string() ? it->second["type"].get<string>() : "";
+        if (t != "spline" && t != "style_spline") return false;
+        string sub = h.substr(dot + 1);
+        const json& pts = get(it->second, "points");
+        return sub == "start" || sub == "end" || sub == "p0" ||
+               (pts.is_array() && !pts.empty() && sub == "p" + std::to_string(pts.size() - 1));
+    };
+    if (ctype == "parallel" || ctype == "perpendicular" || ctype == "collinear" || ctype == "angle") {
+        for (size_t i = 0; i < refs.size(); ++i)
+            if (!entity_ref(i, {"line", "slot"})) bad_ref(i, "a line/slot/axis ref");
+    }
+    if (ctype == "concentric") {
+        for (size_t i = 0; i < refs.size(); ++i)
+            if (!point_ref(i) && !entity_ref(i, {"circle", "arc", "ellipse", "ellipse_arc", "arc_slot"}))
+                bad_ref(i, "a center-bearing curve or point handle (not a line)");
+    }
+    if (ctype == "midpoint" && refs.size() == 2) {
+        if (!point_ref(0)) bad_ref(0, "a point handle first");
+        if (!entity_ref(1, {"line", "arc"})) bad_ref(1, "a line/arc ref second");
+    }
+    if (ctype == "intersection" && refs.size() == 3) {
+        if (!point_ref(0)) bad_ref(0, "a point handle first");
+        for (size_t i = 1; i < 3; ++i)
+            if (!entity_ref(i, {"line", "circle", "arc", "ellipse", "ellipse_arc", "parabola",
+                                "conic", "spline", "style_spline"}))
+                bad_ref(i, "a curve entity ref");
+    }
+    if (ctype == "smooth" && refs.size() == 2) {
+        if (!spline_endpoint_ref(0)) bad_ref(0, "a spline endpoint handle first");
+        if (!spline_endpoint_ref(1) && !entity_ref(1, {"line", "circle", "arc"}))
+            bad_ref(1, "a line/circle/arc or spline endpoint");
+    }
+    if (ctype == "equal_curve_length") {
+        for (size_t i = 0; i < refs.size(); ++i)
+            if (!entity_ref(i, {"line", "arc"}) || refs[i] == "axis.h" || refs[i] == "axis.v")
+                bad_ref(i, "a line/arc entity ref");
+    }
+    if (ctype == "arc_length" && !refs.empty() && !entity_ref(0, {"arc"}))
+        bad_ref(0, "an arc entity ref");
+    if (ctype == "equal" && refs.size() == 2) {
+        auto family = [&](size_t i) {
+            if (entity_ref(i, {"ellipse", "ellipse_arc"})) return string("ellipse");
+            if (entity_ref(i, {"circle", "arc"})) return string("circle");
+            if (entity_ref(i, {"line", "slot", "arc_slot"})) return ent_type_of(refs[i]).second;
+            return string();
+        };
+        if (family(0).empty() || family(0) != family(1)) {
+            bad_ref(0, "two entities from the same supported family");
+            bad_ref(1, "two entities from the same supported family");
         }
     }
-    if (ctype == "collinear") {
-        for (size_t i = 0; i < refs.size() && i < 2; ++i) {
-            auto [has_dot, et] = ent_type_of(refs[i]);
-            bool ent_present = (et != "<<noent>>");
-            if (has_dot || (ent_present && et != "line")) {
-                errs.push_back(where + ".refs[" + std::to_string(i) + "]: collinear takes two line entity ids");
-            }
-        }
+    if (ctype == "symmetric" && refs.size() == 3) {
+        bool pair = (point_ref(0) && point_ref(1)) ||
+                    (entity_ref(0, {"line"}) && entity_ref(1, {"line"})) ||
+                    (entity_ref(0, {"circle", "arc"}) && entity_ref(1, {"circle", "arc"}));
+        if (!pair) { bad_ref(0, "matching point, line, or circle/arc refs"); bad_ref(1, "matching point, line, or circle/arc refs"); }
+        if (!entity_ref(2, {"line"})) bad_ref(2, "a line/axis symmetry axis");
     }
     if (ctype == "coradial") {
         for (size_t i = 0; i < refs.size() && i < 2; ++i) {
@@ -1237,6 +1307,8 @@ vector<string> validate_sketch_params(const json& params, const string& where,
     vector<string> errs;
     const json& entities = get(params, "entities");
     const json& constraints = get(params, "constraints");
+    if (has(params, "auto_define") && !get(params, "auto_define").is_boolean())
+        errs.push_back(where + ".auto_define: must be bool");
     if (!entities.is_array()) {
         return {where + ".entities: must be a list"};
     }
@@ -1375,6 +1447,10 @@ vector<string> validate_sketch3d_params(const json& params, const string& where,
         {"coincident", {2, 2, 0}}, {"fix", {1, 1, 0}},      {"distance", {2, 2, 1}},
         {"length", {1, 1, 1}},     {"parallel", {2, 2, 0}}, {"perpendicular", {2, 2, 0}},
         {"angle", {2, 2, 1}},      {"along_axis", {1, 1, 0}}, {"point_on", {2, 2, 0}},
+        {"tangent", {2, 2, 0}}, {"equal", {2, 2, 0}}, {"midpoint", {2, 2, 0}},
+        {"collinear", {2, 2, 0}}, {"concentric", {2, 2, 0}}, {"coradial", {2, 2, 0}},
+        {"on_plane", {1, 1, 0}}, {"parallel_plane", {1, 1, 0}}, {"normal_plane", {1, 1, 0}},
+        {"symmetric", {2, 2, 0}},
     };
     std::set<string> con_ids;
     for (size_t i = 0; i < constraints.size(); ++i) {
@@ -1425,6 +1501,23 @@ vector<string> validate_sketch3d_params(const json& params, const string& where,
         if (has_value && c["value"].is_object()) {
             auto de = validate_dim(c["value"], cw + ".value", globals_names);
             errs.insert(errs.end(), de.begin(), de.end());
+        }
+        bool needs_plane = t == "on_plane" || t == "parallel_plane" ||
+                           t == "normal_plane" || t == "symmetric";
+        if (needs_plane) {
+            const json& plane = get(c, "plane");
+            bool valid = plane.is_string() && (plane == "front" || plane == "top" || plane == "right");
+            if (plane.is_object()) {
+                const json& normal = get(plane, "normal");
+                valid = is_vec(get(plane, "origin"), 3) && is_vec(normal, 3);
+                if (valid) valid = normal[0].get<double>() * normal[0].get<double>() +
+                                   normal[1].get<double>() * normal[1].get<double>() +
+                                   normal[2].get<double>() * normal[2].get<double>() > 1e-24;
+            }
+            if (!valid) errs.push_back(cw + ".plane: " + t +
+                " requires front|top|right or {origin:[x,y,z],normal:[x,y,z]} with nonzero normal");
+        } else if (!get(c, "plane").is_null()) {
+            errs.push_back(cw + ".plane: not allowed for " + t);
         }
         if (t == "along_axis") {
             const json& ax = get(c, "axis");

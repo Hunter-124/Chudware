@@ -3,10 +3,12 @@
 Browser-native Chudware: the ImGui GUI (`host/`) compiled to WASM/Emscripten, served by the
 FastAPI gateway (`gateway/`, uvicorn on 127.0.0.1:8300 behind the `chudware-cloudflared`
 tunnel), talking newline JSON-RPC over `WS /engine` to the ONE shared `chudware-hostd`
-daemon (`chudware-hostd.service`, instance key `chudwareweb`). Local desktop GUI, MCP agents,
-and web users all attach to that daemon and the shared workspace — edits fan out live,
-undo/redo is per-document and shared, `doc.changed` events carry `user{id,display}`
-attribution.
+daemon (`chudware-hostd.service`, instance key `chudwareweb`). Local desktop GUI
+and MCP agents retain their daemon workflows. The browser bridge is currently
+contained to `hello` and `ping` only, for all account roles; CAD/AI RPCs and global
+events are unavailable until tenant ownership and isolated workers are implemented.
+External multi-tenant release remains blocked; see
+[`SECURITY_AUDIT.md`](../reports/security/2026-10-12/SECURITY_AUDIT.md).
 
 - Deploy: `deploy/install_webd.sh` (atomic cp+mv, never over a live mmap) builds the
   WASM bundle and promotes the engine as one joint release, restarting the daemon only

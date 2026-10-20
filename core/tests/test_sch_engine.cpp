@@ -32,6 +32,7 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <iterator>
 #include <string>
 
 #include <doctest/doctest.h>
@@ -564,6 +565,69 @@ TEST_CASE("ecad_export without a path writes nothing and says so") {
     ecad_close(id);
 }
 
+TEST_CASE("SVG sheet identifiers cannot escape the selected export directory") {
+    const fs::path root = fs::temp_directory_path() / "chudware_svg_leaf_security";
+    fs::remove_all(root);
+    const fs::path alice = root / "alice";
+    const fs::path marker = root / "bob" / "proof.svg";
+    fs::create_directories(alice / "Schematic-x");
+    fs::create_directories(marker.parent_path());
+    { std::ofstream out(marker); out << "sibling marker"; }
+    auto marker_text = [&]() {
+        std::ifstream in(marker, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    };
+    const json doc{{"schema", "aicad.sch/1"}, {"name", "Schematic"}};
+    for (const std::string sheet : {"x/../../bob/proof", "..", ".", "../proof",
+                                    "x\\..\\..\\bob\\proof", "C:proof"}) {
+        CHECK_THROWS_AS(ecad_export(json{{"doc", doc}, {"kind", "svg"}, {"path", alice.string()},
+                                         {"opts", {{"sheet", sheet}}}}), OpError);
+        CHECK(marker_text() == "sibling marker");
+    }
+    json hostile_doc = doc;
+    hostile_doc["sheets"] = json::array({json{{"id", "x/../../bob/proof"}}});
+    CHECK_THROWS_AS(ecad_export(json{{"doc", hostile_doc}, {"kind", "svg"},
+                                     {"path", alice.string()}}), OpError);
+    CHECK(marker_text() == "sibling marker");
+
+    const json exported = ecad_export(json{{"doc", doc}, {"kind", "svg"},
+                                          {"path", alice.string()}, {"opts", {{"sheet", "sh1"}}}});
+    REQUIRE(exported["paths"].size() == 1);
+    const fs::path output = exported["paths"][0].get<std::string>();
+    CHECK(fs::canonical(output.parent_path()) == fs::canonical(alice));
+    std::ifstream in(output);
+    const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    in.close();
+    CHECK(text.find("<svg") != std::string::npos);
+    CHECK(marker_text() == "sibling marker");
+    fs::remove_all(root);
+}
+
+TEST_CASE("SVG export never follows an existing output symlink") {
+    const fs::path root = fs::temp_directory_path() / "chudware_svg_nofollow_security";
+    fs::remove_all(root);
+    fs::create_directories(root / "alice");
+    fs::create_directories(root / "bob");
+    const fs::path marker = root / "bob" / "proof.svg";
+    { std::ofstream out(marker); out << "sibling marker"; }
+    const fs::path output = root / "alice" / "Schematic-sh1.svg";
+    std::error_code ec;
+    fs::create_symlink(marker, output, ec);
+    if (!ec) {
+        const json doc{{"schema", "aicad.sch/1"}, {"name", "Schematic"}};
+        CHECK_THROWS_AS(ecad_export(json{{"doc", doc}, {"kind", "svg"},
+                                         {"path", (root / "alice").string()}}), OpError);
+        CHECK_THROWS_AS(ecad_export(json{{"doc", doc}, {"kind", "svg"},
+                                         {"path", output.string()}}), OpError);
+        std::ifstream in(marker);
+        const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+        CHECK(text == "sibling marker");
+    } else {
+        INFO("Platform does not permit creating a fixture symlink: ", ec.message());
+    }
+    fs::remove_all(root);
+}
+
 // --------------------------------------------------------------- save safety
 
 TEST_CASE("saving an imported KiCad schematic never overwrites the source") {
@@ -696,4 +760,26 @@ TEST_CASE("describe reports honestly and covers every entity kind") {
     CHECK(d["erc"].value("available", false) == true);
 
     ecad_close(id);
+}
+
+TEST_CASE("ECAD lifecycle dirty count follows edit save undo redo and close") {
+    std::uint64_t before = 0, count = 0;
+    REQUIRE(dirty_document_count(before));
+    const auto id = ecad_new("sch", "Activity").at("doc_id").get<std::string>();
+    const auto path = fs::temp_directory_path() / (id + "-activity.ecad+");
+    struct RemoveFile {
+        fs::path path;
+        ~RemoveFile() { std::error_code ec; fs::remove(path, ec); }
+    } remove{path};
+    ecad_apply_ops(id, -1, json::array());
+    REQUIRE(dirty_document_count(count)); CHECK(count == before + 1);
+    ecad_save(id, path.string());
+    count = 0; REQUIRE(dirty_document_count(count)); CHECK(count == before);
+    ecad_undo(id);
+    count = 0; REQUIRE(dirty_document_count(count)); CHECK(count == before + 1);
+    ecad_save(id, path.string());
+    ecad_redo(id);
+    count = 0; REQUIRE(dirty_document_count(count)); CHECK(count == before + 1);
+    REQUIRE(ecad_close(id));
+    count = 0; REQUIRE(dirty_document_count(count)); CHECK(count == before);
 }

@@ -1,7 +1,7 @@
 """Account-scoped provider catalogue for the web model picker.
 
-Only sources that a customer turn can authenticate are advertised: validated
-BYOK keys, usable personal OAuth links, and a configured metered pool. Neither
+Only supported tenant-broker BYOK sources are advertised. Pooled credits and
+subscription links do not authenticate this release's cell transport; neither
 hostd's config nor its desktop subscription store is a web credential.
 """
 
@@ -22,14 +22,14 @@ from fastapi import APIRouter, Request
 
 try:
     from .auth import get_current_user
-    from .credits import actor_for
-    from .provider_accounts import resolve_subscription_token
+    from . import deployment_drain
     from .provider_keys import list_keys
+    from .provider_broker import SUPPORTED_PROVIDERS
 except ImportError:  # uvicorn app:app from package dir
     from auth import get_current_user
-    from credits import actor_for
-    from provider_accounts import resolve_subscription_token
+    import deployment_drain
     from provider_keys import list_keys
+    from provider_broker import SUPPORTED_PROVIDERS
 
 log = logging.getLogger("chudware-web.providers")
 
@@ -61,14 +61,6 @@ _MODEL_PRESETS: dict[str, list[dict[str, str]]] = {
         {"id": "claude-fable-5", "label": "Claude Fable 5"},
         {"id": "claude-haiku-4-5", "label": "Claude Haiku 4.5"},
     ],
-    "anthropic-sub": [
-        {"id": "claude-opus-5-5", "label": "Claude Opus 5.5"},
-        {"id": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5"},
-        {"id": "claude-opus-5", "label": "Claude Opus 5"},
-        {"id": "claude-sonnet-5", "label": "Claude Sonnet 5"},
-        {"id": "claude-fable-5", "label": "Claude Fable 5"},
-        {"id": "claude-haiku-4-5", "label": "Claude Haiku 4.5"},
-    ],
     "openai": [
         {"id": "gpt-6-sol", "label": "GPT-6 Sol"},
         {"id": "gpt-6-luna", "label": "GPT-6 Luna"},
@@ -90,8 +82,6 @@ _MODEL_PRESETS: dict[str, list[dict[str, str]]] = {
     ],
 }
 
-# Only Claude OAuth has supported isolated Chudcode injection; Codex is absent.
-_SUB_LABELS = {"anthropic-sub": "Anthropic Claude (Pro/Max)"}
 
 # Secret-bearing keys that must never appear in a response payload.
 _SECRET_KEYS = frozenset({
@@ -188,8 +178,6 @@ def _live_catalog_rows(cli: dict[str, Any], public: dict[str, Any]) -> dict[str,
                 for mid in sorted(visible, key=_version_key)[:80]]
         if rows:
             result[provider] = rows
-    if "anthropic" in result:
-        result["anthropic-sub"] = result["anthropic"]
     return result
 
 
@@ -225,9 +213,23 @@ def _presets(provider: str) -> list[dict[str, str]]:
     if now >= _catalog_next_refresh and _catalog_lock.acquire(blocking=False):
         try:
             if now >= _catalog_next_refresh:
-                _catalog_next_refresh = now + _CATALOG_TTL
-                threading.Thread(target=_refresh_live_catalog, daemon=True,
-                                 name="web-model-catalog").start()
+                try:
+                    admission = deployment_drain.controller().acquire()
+                except deployment_drain.HTTPException:
+                    return list(_catalog_rows.get(provider) or _MODEL_PRESETS.get(provider, []))
+                def accepted_refresh():
+                    try:
+                        with admission.bind():
+                            _refresh_live_catalog()
+                    finally:
+                        admission.close()
+                try:
+                    threading.Thread(target=accepted_refresh, daemon=True,
+                                     name="web-model-catalog").start()
+                    _catalog_next_refresh = now + _CATALOG_TTL
+                except BaseException:
+                    admission.close()
+                    raise
         finally:
             _catalog_lock.release()
     return list(_catalog_rows.get(provider) or _MODEL_PRESETS.get(provider, []))
@@ -236,16 +238,6 @@ def default_model_for(provider: str) -> str | None:
     """Current catalog default with a static offline fallback."""
     rows = _presets(provider)
     return rows[0]["id"] if rows else None
-
-
-def _account_subscriptions(email: str) -> dict[str, dict[str, Any]]:
-    """Only links supported by isolated Chudcode auth enter the picker."""
-    try:
-        grant = resolve_subscription_token(email, "anthropic")
-    except Exception as exc:  # noqa: BLE001 - catalogue degrades if a link is unreadable
-        log.warning("account subscription lookup failed: %s", type(exc).__name__)
-        return {}
-    return {"anthropic-sub": grant} if grant is not None else {}
 
 
 def _scrub(obj: Any) -> Any:
@@ -275,7 +267,6 @@ def list_available_providers(*, email: str | None = None) -> dict[str, Any]:
                 "default_model": None, "shared_host_accounts": False}
 
     entries: list[dict[str, Any]] = []
-    seen: set[str] = set()
     try:
         own_keys = list_keys(normalized)
     except Exception as exc:  # noqa: BLE001 - a broken store must not expose host keys
@@ -283,44 +274,12 @@ def list_available_providers(*, email: str | None = None) -> dict[str, Any]:
         own_keys = []
     for row in own_keys:
         provider = str(row.get("provider") or "")
-        if row.get("state") != "validated" or provider not in _KEY_PROVIDERS:
+        if row.get("state") != "validated" or provider not in _KEY_PROVIDERS or provider not in SUPPORTED_PROVIDERS:
             continue
-        seen.add(provider)
         entries.append({
             "id": provider, "name": provider,
             "label": _KEY_PROVIDERS[provider], "auth": "api_key",
-            "models": _presets(provider),
-        })
-
-    # Linked Codex OAuth cannot be isolated. Admin Claude links are advertised
-    # only to active verified trial-domain accounts by the resolver.
-    for wire, grant in _account_subscriptions(normalized).items():
-        if wire in seen:
-            continue
-        seen.add(wire)
-        entries.append({
-            "id": wire, "name": wire,
-            "label": "Claude (sponsored)" if grant.get("sponsored") else _SUB_LABELS[wire],
-            "auth": "subscription", "models": _presets(wire),
-        })
-
-    try:
-        pool_granted = actor_for(normalized)["key_source"] == "pool"
-    except Exception as exc:  # noqa: BLE001 - catalogue degrades if billing DB is down
-        log.warning("pool entitlement unavailable: %s", type(exc).__name__)
-        pool_granted = False
-    pool_key = os.environ.get("CHUDWARE_WEB_POOL_API_KEY", "").strip()
-    pool_provider = os.environ.get("CHUDWARE_WEB_POOL_PROVIDER", "openrouter").strip().lower()
-    pool_model = os.environ.get("CHUDWARE_WEB_POOL_MODEL", "").strip()
-    if pool_granted and pool_key and pool_provider in _KEY_PROVIDERS and pool_provider not in seen:
-        models = (
-            [{"id": pool_model, "label": pool_model}]
-            if pool_model else _presets(pool_provider)
-        )
-        entries.append({
-            "id": pool_provider, "name": pool_provider,
-            "label": _KEY_PROVIDERS[pool_provider], "auth": "pool",
-            "models": models,
+            "models": _presets(provider), "metering": "provider_billed_byok",
         })
 
     default = entries[0] if entries else None

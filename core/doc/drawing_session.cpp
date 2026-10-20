@@ -146,6 +146,7 @@ struct DrawingSession {
     json source_env;      // equation env for the source compile
     long revision = 0;
     long source_revision = 0;
+    long saved_revision = -1, saved_source_revision = -1;
     // Per-view HLR is expensive: only Auto Balloon fills this cache. Geometry is
     // stored relative to the view origin so moving the view never invalidates it.
     std::map<std::string, ComponentViewCache> component_views;
@@ -2273,12 +2274,37 @@ json drawing_auto_balloon(const std::string& doc_id, const std::string& view_id)
                 {"placements", std::move(placements)}, {"drawing", std::move(full)}};
 }
 
-std::map<std::string, std::string> drawings_for_source(const std::string& source_doc_id) {
+bool dirty_drawing_count(std::uint64_t& count) {
+    std::unique_lock<std::mutex> lock(g_mtx, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    for (const auto& [id, session] : g_drawings)
+        if (session.revision != session.saved_revision ||
+            session.source_revision != session.saved_source_revision) ++count;
+    return true;
+}
+
+void drawings_saved(const DrawingSaveRevisions& revisions) {
+    DrawingLock lock;
+    for (const auto& [id, revision] : revisions) {
+        const auto found = g_drawings.find(id);
+        if (found == g_drawings.end()) continue;
+        auto& session = found->second;
+        // An edit racing the source save remains dirty, not falsely certified.
+        if (session.revision != revision.first || session.source_revision != revision.second) continue;
+        session.saved_revision = revision.first;
+        session.saved_source_revision = revision.second;
+    }
+}
+
+std::map<std::string, std::string> drawings_for_source(
+    const std::string& source_doc_id, DrawingSaveRevisions& revisions) {
     DrawingLock lk;
     std::map<std::string, std::string> out;
     for (const auto& [id, s] : g_drawings)
-        if (s.source_ref_id == source_doc_id)
+        if (s.source_ref_id == source_doc_id) {
             out["drawings/" + id + ".json"] = s.doc.dump();
+            revisions[id] = {s.revision, s.source_revision};
+        }
     return out;
 }
 // doc_close calls this only AFTER dropping both its registry and per-doc locks.
@@ -2339,6 +2365,8 @@ json register_restored_drawing(const json& drawing_doc, const std::string& sourc
     s.source_env = json::object();
     s.revision = 0;
     s.source_revision = 0;
+    s.saved_revision = s.revision;
+    s.saved_source_revision = s.source_revision;
     g_drawings[doc_id] = std::move(s);
     return json{{"doc_id", doc_id},
                 {"name", g_drawings[doc_id].doc.value("name", std::string("Drawing"))},
@@ -2395,6 +2423,8 @@ json drawing_save_standalone(const std::string& drawing_id, const std::string& p
         editable_container_save(s.doc, path, extra, "aicad.draw+/1", "drawing", ".draw+");
     s.standalone_path = written;
     s.standalone_extra = std::move(extra);
+    s.saved_revision = s.revision;
+    s.saved_source_revision = s.source_revision;
     return json{{"drawing_id", drawing_id},
                 {"doc_id", drawing_id},
                 {"path", written},

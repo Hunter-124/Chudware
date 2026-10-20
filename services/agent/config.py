@@ -31,6 +31,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from services import paths
+from services.agent.request_context import in_cell
 
 from . import model_catalog
 from .providers.base import Provider
@@ -48,9 +49,15 @@ from .providers.base import Provider
 _cfg_cache: dict | None = None
 _cfg_cache_path: str | None = None
 _cfg_cache_mtime_ns: int | None = None
+_cfg_cache_lock = threading.RLock()
 
 
 def load_config() -> dict:
+    with _cfg_cache_lock:
+        return _load_config_locked()
+
+
+def _load_config_locked() -> dict:
     global _cfg_cache, _cfg_cache_path, _cfg_cache_mtime_ns
     path = paths.CONFIG
     path_key = str(path)
@@ -1675,6 +1682,8 @@ def bind_subscription_grant(value: object) -> dict[str, str]:
     returning, so a bad grant refuses the turn rather than silently falling through to
     the desktop user's own subscription credentials.
     """
+    if in_cell():
+        raise ValueError("credential_isolation_unsupported")
     if not isinstance(value, dict):
         raise ValueError("subscription grant must be an object")
     provider = str(value.get("provider") or "").strip().lower()
@@ -1700,6 +1709,8 @@ def _subscription_provider_config(
     ("anthropic"), while the grant names the subscription adapter ("anthropic-sub"),
     and the grant is the authority. Never reads ambient credentials.
     """
+    if in_cell() and actor.key_source == "subscription":
+        raise ValueError("credential_isolation_unsupported")
     if actor.key_source != "subscription":
         return name, cfg
     grant = _subscription_grant.get() or {}
@@ -1715,6 +1726,8 @@ def _subscription_provider_config(
 
 def _byok_provider_config(name: str | None, cfg: dict, actor: Actor) -> dict:
     """Replace ambient credentials with this run's gateway-supplied BYOK key."""
+    if in_cell():
+        raise ValueError("provider_broker_route_required: use the owning Chudcode session")
     if actor.key_source != "byok":
         return cfg
     provider_name = str(name or cfg.get("provider") or "").strip().lower()
@@ -1748,6 +1761,8 @@ def _pooled_provider_config(name: str | None, cfg: dict, actor: Actor) -> dict:
     slot makes the trust boundary explicit: a pooled turn never falls through to
     a desktop user's config.json key.
     """
+    if in_cell() and actor.key_source == "pool":
+        raise ValueError("credential_isolation_unsupported")
     if actor.key_source != "pool":
         return cfg
     provider_name = str(name or cfg.get("provider") or "").strip().lower()
@@ -1812,6 +1827,10 @@ def get_provider(
     inbound replies rehydrated. ``local_only`` (and legacy ``offline_mode``) refuse every
     non-loopback provider before the wrap.
     """
+    if in_cell():
+        # Python vendor SDKs cannot inherit the session's native models.yml
+        # transport. Refuse before loading desktop config or constructing one.
+        raise ValueError("provider_broker_route_required: use the owning Chudcode session")
     cfg = cfg if cfg is not None else load_config()
     if actor is None or actor.key_source != "pool":
         _pooled_keys.set({})

@@ -313,6 +313,89 @@ def test_inaccessible_support_regions_locate_the_trapped_clusters():
     assert np.allclose(cavity["centroid"],[0,0,0],atol=1.5), cavity
 
 
+def countersunk_bore():
+    """Raw mesh: a 12 mm round block lying on its side with a 1.8 mm blind bore whose mouth
+    flares through a tangent 1 mm round into the end face, so the bore, the flare and the end
+    face are one crease-free surface (the 6-axis wrist STL's screw bores)."""
+    arc=[(1.9+np.cos(a),8+np.sin(a)) for a in np.radians(np.linspace(90,180,10))]
+    profile=np.array([(0,0),(6,0),(6,9)]+arc+[(.9,1),(0,1)])
+    solid=trimesh.creation.revolve(profile,sections=48)
+    if solid.volume < 0:
+        solid.invert()
+    solid.apply_transform(trimesh.transformations.rotation_matrix(np.pi/2,[1,0,0]))
+    return PrintMesh.from_arrays(solid.vertices,solid.faces)
+
+
+def test_raw_mesh_bore_behind_a_tangent_flare_is_a_self_supporting_hole():
+    # 6-axis wrist (2026-10-12): the raw-STL route reported 35.8 mm3 of inaccessible support
+    # (fail) inside two 1.8 mm horizontal screw bores. The smooth group welded each bore to
+    # its countersink and the filleted faces, never fit a cylinder, so the bore crown was
+    # counted as support demand; the CAD-document route saw the cylinder face (5.1 mm3, warn)
+    # and PrusaSlicer emitted support only at the bore mouths.
+    m=countersunk_bore()
+    assert all(face.surf_type == 6 for face in m.faces)
+    p=PrintParams(max_bridge_mm=4,access_mm=3)
+    holes=check(m,"overhang",p)["metrics"]["self_supporting_holes"]
+    assert [round(h["diameter_mm"],1) for h in holes] == [1.8], holes
+    row=check(m,"support",p,detail=True)
+    assert row["status"] != "fail", row["note"]
+    # The straight bore runs along -Y from -1 to -8; its flared mouth is -8..-9.
+    trapped=[r for r in row["regions"] if r["classification"] == "inaccessible_support"]
+    inside=[r for r in trapped if -8 < r["centroid"][1] < -1
+            and abs(r["centroid"][0]) < .9 and abs(r["centroid"][2]) < .9]
+    assert not inside, inside
+    assert trapped and all(r["status"] == "warn" for r in trapped), trapped
+
+
+def test_tool_reach_is_a_ball_into_off_grid_ceiling_corners():
+    # 6-axis upper arm (2026-10-12): every inaccessible support voxel sat 0.5 mm from a wall
+    # and 1.5-1.73 mm from a tool centre. The 6-neighbour dilation reaches only 2/sqrt(3) mm
+    # along a 3D diagonal, so wall/ceiling corners of a wide-open support region read as
+    # enclosed (this open corner turned 45 deg to the grid reported 13.25 mm3 and failed).
+    table=mesh_of(box((2,20,10),(1,10,5)),box((20,2,10),(10,1,5)),box((20,20,2),(10,10,11)))
+    p=PrintParams(max_bridge_mm=4,access_mm=3)
+    for yaw in (0,30,45):
+        row=check(table,"support",p,yaw_deg=yaw)
+        assert row["metrics"]["support_volume_mm3"] > 1000
+        assert row["metrics"]["enclosed_support_mm3"] == 0, (yaw,row["note"])
+        assert row["status"] != "fail"
+    # A ball still does not pass a slot narrower than the tool, in any yaw.
+    for opening in (1,2):
+        for yaw in (0,45):
+            narrow=check(chamber(opening),"support",p,yaw_deg=yaw)
+            assert narrow["status"] == "fail" and narrow["metrics"]["enclosed_support_mm3"] > 300
+    assert check(chamber(4),"support",p,yaw_deg=45)["metrics"]["enclosed_support_mm3"] == 0
+
+
+def pocketed_ceiling(width):
+    """A ceiling carried by two end walls; its underside has eight isolated `width` square
+    blind pockets 3 mm deep."""
+    parts=[box((30,20,2),(15,10,13)),box((2,20,14),(1,10,7)),box((2,20,14),(29,10,7))]
+    xs=[0]+[v for x in (5,11,17,23) for v in (x,x+width)]+[30]
+    ys=[0]+[v for y in (6,13) for v in (y,y+width)]+[20]
+    parts += [box((b-a,20,3),((a+b)/2,10,10.5)) for a,b in zip(xs[::2],xs[1::2])]
+    parts += [box((30,b-a,3),(15,(a+b)/2,10.5)) for a,b in zip(ys[::2],ys[1::2])]
+    return mesh_of(*parts)
+
+
+def test_separate_support_crumbs_do_not_add_up_to_a_trapped_body():
+    # 6-axis turntable (2026-10-12): 50 separate crumbs of at most 1.125 mm3, every region a
+    # warning, summed to 12.4 mm3 and failed the row. One body of 10 mm3 still fails.
+    p=PrintParams(max_bridge_mm=.5,access_mm=3)
+    row=check(pocketed_ceiling(1.5),"support",p,detail=True)
+    crumbs=[r for r in row["regions"] if r["classification"] == "inaccessible_support"]
+    assert len(crumbs) == 8 and all(r["status"] == "warn" and r["volume_mm3"] < 10 for r in crumbs), crumbs
+    assert row["metrics"]["enclosed_support_mm3"] > 10
+    assert row["status"] == "warn", row["note"]
+    assert check(chamber(1),"support",PrintParams(max_bridge_mm=4,access_mm=3))["status"] == "fail"
+    # Sealed cavities keep failing both rows.
+    inner=box((10,10,10))
+    inner.invert()
+    sealed=mesh_of(box((20,20,20)),inner,attributed=True)
+    assert check(sealed,"support",PrintParams(max_bridge_mm=4))["status"] == "fail"
+    assert check(sealed,"internal_voids",PrintParams(max_bridge_mm=4))["status"] == "fail"
+
+
 def test_horizontal_skin_layers_and_informational_gap_fill():
     skin=check(mesh_of(box((20,20,.5))),"min_wall",
                PrintParams(min_wall_mm=.4,nozzle_mm=.3,layer_height_mm=.2))

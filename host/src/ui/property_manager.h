@@ -228,11 +228,11 @@ public:
     // still need to occupy the FeatureManager/PM column like Extrude. openGuest() makes active()
     // true so layout.cpp auto-fronts the left pane and calls drawBody(); the body is a free-form
     // callback (AsmPanels draws its own fields + standard selection wells). OK/Cancel chrome
-    // buttons call onOk/onCancel. Mutual exclusion: openGuest closes a live feature form (cancel),
+    // buttons call onOk/onCancel. Mutual exclusion: guest entry keeps and closes any feature form,
     // and openForCommand/openForEdit close any guest.
     using GuestFn = std::function<void(AppState&)>;
-    void openGuest(const char* title, const char* icon,
-                   GuestFn body, GuestFn onOk, GuestFn onCancel);
+    void openGuest(AppState& st, const char* title, const char* icon,
+                   GuestFn body, GuestFn onOk, GuestFn onCancel, bool readOnly = false);
     void closeGuest();
     bool guestActive() const { return guestActive_; }
 
@@ -446,6 +446,7 @@ public:
 
 private:
     void close();
+    bool closeForAgentLock(AppState& st);
     void commit(AppState& st);     // OK
     void buildOpFeature(nlohmann::json& feature) const;   // assemble {type,name,params,refs}
     bool applyPreview(AppState& st);  // add (first) or edit_feature; debounced
@@ -496,6 +497,7 @@ private:
     // the other side's hold guard actual conflicts (documented Phase 4 choice). Empty = no hold
     // (legacy mode / hold rejected).
     std::string holdDocId_;
+    std::string sessionDocId_;   // retained even when edit_hold is unavailable
     double lastHoldTime_ = 0.0;   // ImGui::GetTime() of the last edit_hold call
 
     // C37-F: true when the first field in the form has received SetKeyboardFocusHere.
@@ -539,6 +541,7 @@ private:
     // guest header + body callback instead of a feature form; drawChromeButtons routes OK/Cancel
     // to guestOnOk_/guestOnCancel_.
     bool guestActive_ = false;
+    bool guestReadOnly_ = false;
     std::string guestTitle_;
     std::string guestIcon_;
     GuestFn guestBody_;

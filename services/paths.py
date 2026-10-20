@@ -17,6 +17,10 @@ import os
 import re
 import shutil
 from pathlib import Path
+import sqlite3
+import uuid
+
+from services.agent import request_context
 
 APP_NAME = "Chudware"
 # Legacy data-dir names, newest first. Used by the one-time migration in
@@ -51,7 +55,54 @@ def appdata_root() -> Path:
     New data is written here. For reading existing data, use :func:`data_roots` so the
     legacy Chudware directory is also checked.
     """
+    if request_context.in_cell():
+        return actor_root()
     return _base_dir() / APP_NAME
+
+
+def actor_root() -> Path:
+    """Private actor storage in the nested worker sandbox, never desktop state."""
+    if not request_context.in_cell():
+        return globals().get("ROOT") or __getattr__("ROOT")
+    return request_context.actor_state_root()
+
+
+def private_path(kind: str, handle: str, *, create: bool = True) -> Path | None:
+    """Persistently map a public handle to a server-minted storage name."""
+    if not re.fullmatch(r"[a-z_]+", kind):
+        raise ValueError("invalid storage kind")
+    root = actor_root()
+    directory = root / kind
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with sqlite3.connect(root / "handles.sqlite3", timeout=30) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS handles "
+                   "(kind TEXT, handle TEXT, token TEXT, owner TEXT, PRIMARY KEY(kind, handle))")
+        owner = repr(request_context.owner_key())
+        if create:
+            db.execute("INSERT OR IGNORE INTO handles VALUES (?, ?, ?, ?)",
+                       (kind, str(handle), uuid.uuid4().hex, owner))
+        row = db.execute("SELECT token, owner FROM handles WHERE kind=? AND handle=?",
+                         (kind, str(handle))).fetchone()
+    if row is None:
+        return None
+    if row[1] != owner:
+        raise KeyError("not_found")
+    token = row[0]
+    if not isinstance(token, str) or not re.fullmatch(r"[a-f0-9]{32}", token):
+        raise KeyError("not_found")
+    return directory / token
+
+
+def artifact_dir(handle: str, *, create: bool = False) -> Path:
+    """Resolve only this actor's artifact handle; foreign and absent are identical."""
+    if not request_context.in_cell():
+        return model_dir(handle)
+    p = private_path("artifacts", handle, create=create)
+    if p is None or (not create and not p.is_dir()):
+        raise KeyError("not_found")
+    if create:
+        p.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return p
 
 
 def _legacy_roots() -> list[Path]:
@@ -102,6 +153,8 @@ def data_roots() -> list[Path]:
     Use when scanning for existing user data (config, models, parts library) so both
     the new Chudware directory and the legacy directories are checked.
     """
+    if request_context.in_cell():
+        return [actor_root()]
     return [appdata_root(), *_legacy_roots()]
 
 
@@ -114,6 +167,8 @@ def active_root() -> Path:
     root in use for this boot, so a read-only disk strands nothing.
     """
     new = appdata_root()
+    if request_context.in_cell():
+        return actor_root()
     if (new / "config.json").exists():
         return new
     for d in _legacy_roots():
@@ -123,22 +178,37 @@ def active_root() -> Path:
     return new
 
 
-ROOT = active_root()
-RUNTIME = ROOT / "runtime"          # isolated python + wheels
-CACHE = ROOT / "cache"              # per-model outputs (stl/step/png)
-CONFIG = ROOT / "config.json"       # provider keys + settings
-LLAMACPP = ROOT / "llamacpp"        # optional managed llama.cpp server payload
-MODELS = ROOT / "models"            # user / bundled GGUF models
-VENDOR_PARTS = ROOT / "vendor_parts"  # approved/manual supplier CAD + metadata cache
-PARTS_LIBRARY = ROOT / "parts_library"  # watched folder of user-dropped CAD files (auto-registered)
-BROWSER_PROFILES = ROOT / "browser_profiles"  # T-X1: local-only per-site browser login profiles
-BROWSER_DOWNLOADS = ROOT / "browser_downloads"  # T-X2: artifacts landed by browser source adapters
+_DESKTOP_ROOT = active_root() if not request_context.in_cell() else None
+_PATH_SUFFIXES = {
+    "ROOT": "", "RUNTIME": "runtime", "CACHE": "cache", "CONFIG": "config.json",
+    "LLAMACPP": "llamacpp", "MODELS": "models", "VENDOR_PARTS": "vendor_parts",
+    "PARTS_LIBRARY": "parts_library", "BROWSER_PROFILES": "browser_profiles",
+    "BROWSER_DOWNLOADS": "browser_downloads",
+}
+
+# Reloading replaces any materialized legacy constants or test overrides with
+# request-time lookup, so none can shadow actor-private paths after reload.
+for _path_name in _PATH_SUFFIXES:
+    globals().pop(_path_name, None)
+
+
+def __getattr__(name: str) -> Path:
+    if name not in _PATH_SUFFIXES:
+        raise AttributeError(name)
+    if name == "RUNTIME" and os.environ.get("CHUDWARE_CELL") == "1":
+        return request_context.process_runtime_root()
+    root = actor_root() if request_context.in_cell() else _DESKTOP_ROOT
+    if root is None:
+        root = active_root()
+    return root / _PATH_SUFFIXES[name]
 
 
 def parts_library_dir() -> Path:
     """Return the watched parts-library folder, creating it on first access."""
-    PARTS_LIBRARY.mkdir(parents=True, exist_ok=True)
-    return PARTS_LIBRARY
+    directory = (actor_root() / "parts_library" if request_context.in_cell()
+                 else globals().get("PARTS_LIBRARY") or __getattr__("PARTS_LIBRARY"))
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
 
 
 def model_dir(name: str) -> Path:
@@ -147,9 +217,11 @@ def model_dir(name: str) -> Path:
     Sanitizes ``name`` so a hostile ``run_model`` / worker caller cannot escape the cache
     root via ``..`` path segments.
     """
+    if request_context.in_cell():
+        return artifact_dir(name, create=True)
     safe = re.sub(r"[^\w.-]+", "_", str(name)).strip("._") or "model"
-    d = (CACHE / safe).resolve()
-    root = CACHE.resolve()
+    root = (globals().get("CACHE") or __getattr__("CACHE")).resolve()
+    d = (root / safe).resolve()
     if d != root and root not in d.parents:
         safe = "model"
         d = root / safe
@@ -160,7 +232,9 @@ def model_dir(name: str) -> Path:
 def find_config() -> Path:
     """Return the config.json path — the Chudware location, with a legacy-root read
     fallback for the rare boot where the one-time migration could not complete."""
-    new_cfg = ROOT / "config.json"
+    if request_context.in_cell():
+        return actor_root() / "config.json"
+    new_cfg = (globals().get("ROOT") or __getattr__("ROOT")) / "config.json"
     if new_cfg.exists():
         return new_cfg
     for d in _legacy_roots():

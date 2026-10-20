@@ -8,7 +8,9 @@ hardcoded into cf_provision.py, or live secrets pasted into DEPLOYMENT.md.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import re
 import stat
 import subprocess
 from pathlib import Path
@@ -84,11 +86,19 @@ def test_no_personal_operator_email_is_hardcoded() -> None:
     assert "haedmonds" not in CF_PROVISION.read_text(), "personal email default restored"
 
 
+# SHA-256 digests of the R2 credential pair leaked in 84963165. The literals
+# themselves must never be committed again, not even inside a negative test.
+_LEAKED_SECRET_DIGESTS = frozenset({
+    "225da8b6711121ba8763f28bf86be249d68f0f1f3fd27d9a122fcb7acbdb147b",
+    "2b6cc2f2e5626110fa49f602d59058811ca6c1678e9ea381d0dbb1c454bac863",
+})
+
+
 def test_deployment_md_contains_no_live_secrets() -> None:
     text = (DEPLOY / "DEPLOYMENT.md").read_text()
     assert "cfat_" not in text
-    assert "8f71299e969f2831f8ce9c6f159a19da" not in text  # R2 Access Key ID
-    assert "673599c85567a3f265f84d6ed945b77cb5e6ccb5af3b015837582504914ed367" not in text
+    for token in re.findall(r"\b[0-9a-f]{32,64}\b", text):
+        assert hashlib.sha256(token.encode()).hexdigest() not in _LEAKED_SECRET_DIGESTS
 
 
 def test_gitignore_covers_secret_paths() -> None:

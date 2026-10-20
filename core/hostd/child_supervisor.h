@@ -11,6 +11,8 @@
 // Daemon methods (dispatched via handleMethod):
 //   agent_spawn{argv:[...], env:{...}, mission_id?, doc_id?}
 //       -> {child_id, pid, pgid, log}
+//     argv/env values and mission_id/doc_id must be NUL-free strings; invalid
+//     metadata returns invalid_params before any child or child log is created.
 //     fork(); child: setpgid(0,0) + guardParentDeath(daemon pid), which is
 //     PR_SET_PDEATHSIG(SIGKILL) plus the getppid() exec-vs-parent-death race
 //     guard on Linux and a kqueue/NOTE_EXIT babysitter on Darwin (see
@@ -28,16 +30,14 @@
 // and broadcasts {"event":"mission.exited","data":{child_id,pid,exit_code,
 // signal,mission_id}} to clients on exit.
 //
-// SECURITY: agent_spawn executes arbitrary argv as the daemon's user. This is
-// the SAME trust domain as every existing client of the daemon — the unix
-// socket lives in a 0700 per-user runtime dir, so anyone who can reach
-// agent_spawn can already run arbitrary engine ops (and arbitrary code) as
-// that user. No additional authentication is warranted at this layer.
+// SECURITY: local desktop agent_spawn executes arbitrary argv as the same OS
+// account. Cell/tenant connections must refuse this method in Server policy.
 #pragma once
 
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <future>
 #include <map>
@@ -126,6 +126,60 @@ private:
     void reaperLoop();
     // Runs on the reaper thread. Fills req.result/req.isError.
     void doSpawn(SpawnReq& req);
+    // Validate before ANY child/process/artifact creation on either backend.
+    static bool validateSpawn(const nlohmann::json& params, nlohmann::json& error) {
+        const auto fail = [&](const char* message) {
+            error = {{"code", "invalid_params"}, {"message", message}};
+            return false;
+        };
+        const auto string = [](const nlohmann::json& value) {
+            return value.is_string() &&
+                value.get_ref<const std::string&>().find('\0') == std::string::npos;
+        };
+        if (!params.is_object()) return fail("agent_spawn params must be an object");
+        if (!params.contains("argv") || !params["argv"].is_array() || params["argv"].empty())
+            return fail("agent_spawn needs a non-empty argv array");
+        for (const auto& value : params["argv"])
+            if (!string(value)) return fail("argv entries must be strings without NUL bytes");
+        if (params["argv"][0].get_ref<const std::string&>().empty())
+            return fail("argv executable must not be empty");
+        for (const char* key : {"mission_id", "doc_id"})
+            if (params.contains(key) && !string(params[key]))
+                return fail("mission_id and doc_id must be strings without NUL bytes");
+        if (params.contains("env")) {
+            if (!params["env"].is_object()) return fail("env must be an object");
+            for (const auto& entry : params["env"].items())
+                if (entry.key().empty() || entry.key().find_first_of("=\0", 0, 2) !=
+                        std::string::npos || !string(entry.value()))
+                    return fail("env requires non-empty names and string values without NUL bytes");
+        }
+        return true;
+    }
+
+    // Never let a request exception escape the daemon-lifetime supervisor thread.
+    // If constructing an error itself throws, complete the future exceptionally
+    // so the client dispatch boundary, not std::terminate, handles it.
+    void completeSpawn(SpawnReq& req, bool draining = false) noexcept {
+        try {
+            try {
+                if (draining) {
+                    req.isError = true;
+                    req.result = {{"code", "draining"}, {"message", "daemon is shutting down"}};
+                } else {
+                    doSpawn(req);
+                }
+            } catch (const nlohmann::json::exception&) {
+                req.isError = true;
+                req.result = {{"code", "invalid_params"}, {"message", "invalid agent_spawn parameters"}};
+            } catch (...) {
+                req.isError = true;
+                req.result = {{"code", "spawn_failed"}, {"message", "child spawn failed"}};
+            }
+            req.done.set_value();
+        } catch (...) {
+            try { req.done.set_exception(std::current_exception()); } catch (...) {}
+        }
+    }
     // Reap one pid (WNOHANG); on exit broadcast mission.exited + erase. Caller
     // holds mtx_. Returns true if the child was reaped.
     bool reapLocked(std::map<std::string, Child>::iterator it, int waitFlags);

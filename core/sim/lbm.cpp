@@ -247,16 +247,21 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
                 if (!why.empty()) cr.backend_fallback = why;
                 return cr;
             }
-            // A cancel on the CUDA path is terminal: report it instead of restarting the
-            // whole lattice on the CPU fallback.
-            if (should_cancel && should_cancel()) return cr;
+            // Cooperative stops are terminal, even if a one-shot cancel hook has
+            // already reset; never restart a cancelled or memory-starved solve.
+            if (cr.error.rfind("cancelled by sim_cancel", 0) == 0 ||
+                cr.error.find("host memory critically low (governor)") != std::string::npos)
+                return cr;
+            if (should_cancel && should_cancel()) {
+                cr.error = "cancelled by sim_cancel";
+                return cr;
+            }
             R.backend_fallback = why.empty()
                 ? (cr.error.empty() ? "CUDA path failed; using CPU" : cr.error)
                 : why;
             // fall through to CPU reference
         }
-    } else if (want == "cpu") {
-        // explicit CPU
+    }
 #else
     if (want == "cuda") {
         R.backend_fallback = "CUDA not built into this libchudware (CHUDWARE_WITH_CUDA=OFF)";
@@ -671,6 +676,7 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
             }
             if (chudware::governor::low_memory_now()) {
                 R.ok = false;
+                R.steps_run = step;
                 R.error = "CFD run stopped at step " + std::to_string(step) +
                           ": host memory critically low (governor) — close other "
                           "applications and re-run";

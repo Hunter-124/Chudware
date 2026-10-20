@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cerrno>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -16,6 +17,17 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -208,6 +220,13 @@ json ops_response(Session& s, const json& id_map, const json& warnings,
 }
 
 }  // namespace
+
+bool dirty_document_count(std::uint64_t& count) {
+    std::unique_lock<std::mutex> lock(g_mtx, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    for (const auto& [id, session] : g_sessions) if (session.dirty) ++count;
+    return true;
+}
 
 json ecad_new(const std::string& kind, const std::string& name) {
     EcadLock lk;
@@ -517,6 +536,79 @@ json ecad_dfm_board(const json& board, const json& rules) {
 
 namespace {
 
+void require_svg_leaf(const std::string& name, bool allow_empty = false) {
+    if (name.empty() && allow_empty) return;
+    if (name.empty() || name == "." || name == ".." ||
+        name.find_first_of("/\\:*?\"<>|") != std::string::npos ||
+        name.back() == '.' || name.back() == ' ' ||
+        std::any_of(name.begin(), name.end(), [](unsigned char c) { return c < 32 || c == 127; }))
+        throw OpError("invalid_op", "ecad_export: SVG sheet must be a safe filename leaf",
+                      {{"reason", "unsafe SVG leaf"}});
+}
+
+// SVG outputs have a checked parent and a non-following final open. In particular,
+// a pre-existing symlink must not be truncated between the containment check and
+// the write. POSIX opens relative to the pinned destination directory descriptor.
+void write_svg_file(const fs::path& target, const fs::path& directory,
+                    const std::string& text) {
+    require_svg_leaf(target.filename().string());
+    std::error_code ec;
+    const fs::path root = fs::canonical(directory, ec);
+    if (ec) throw OpError("io_error", "ecad_export: cannot resolve SVG destination");
+    const fs::path resolved = fs::weakly_canonical(target, ec);
+    if (ec || resolved.parent_path() != root)
+        throw OpError("io_error", "ecad_export: SVG output escapes destination",
+                      {{"path", target.string()}});
+    auto fail = [&]() {
+        throw OpError("io_error", "ecad_export: cannot write SVG '" + target.string() + "'",
+                      {{"path", target.string()}, {"kind", "svg"}});
+    };
+#ifdef _WIN32
+    struct HandleGuard {
+        HANDLE value;
+        ~HandleGuard() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+    };
+    HandleGuard file{CreateFileW((root / target.filename()).wstring().c_str(), GENERIC_WRITE,
+                                0, nullptr, OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT, nullptr)};
+    if (file.value == INVALID_HANDLE_VALUE) fail();
+    BY_HANDLE_FILE_INFORMATION st{};
+    if (!GetFileInformationByHandle(file.value, &st) ||
+        (st.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)))
+        fail();
+    LARGE_INTEGER zero{};
+    if (!SetFilePointerEx(file.value, zero, nullptr, FILE_BEGIN) || !SetEndOfFile(file.value))
+        fail();
+    std::size_t written = 0;
+    while (written < text.size()) {
+        DWORD n = 0;
+        const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(text.size() - written,
+                                                                    1024 * 1024 * 1024));
+        if (!WriteFile(file.value, text.data() + written, chunk, &n, nullptr) || !n) fail();
+        written += n;
+    }
+#else
+    struct FdGuard {
+        int value;
+        ~FdGuard() { if (value >= 0) ::close(value); }
+    };
+    FdGuard dir{::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
+    if (dir.value < 0) fail();
+    FdGuard file{::openat(dir.value, target.filename().c_str(),
+                         O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0666)};
+    if (file.value < 0) fail();
+    struct stat st{};
+    if (::fstat(file.value, &st) || !S_ISREG(st.st_mode) || ::ftruncate(file.value, 0)) fail();
+    std::size_t written = 0;
+    while (written < text.size()) {
+        const ssize_t n = ::write(file.value, text.data() + written,
+                                 std::min<std::size_t>(text.size() - written, 1024 * 1024 * 1024));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) fail();
+        written += static_cast<std::size_t>(n);
+    }
+#endif
+}
+
 // Conventional on-disk filename for one exported logical key. Gerber keys are layer
 // ids and map to the RS-274X extensions fabricators expect; everything else is a
 // single well-known artifact.
@@ -552,7 +644,10 @@ std::string export_filename(const std::string& kind, const std::string& key,
     if (kind == "spice") return plain(".cir");
     if (kind == "kicad") return plain(".kicad_sch");
     if (kind == "pdf") return plain(".pdf");
-    if (kind == "svg") return key.empty() ? plain(".svg") : stem + "-" + key + ".svg";
+    if (kind == "svg") {
+        require_svg_leaf(key, true);
+        return key.empty() ? plain(".svg") : stem + "-" + key + ".svg";
+    }
     return stem + "-" + key;
 }
 
@@ -577,6 +672,12 @@ json write_export_files(const json& files, const std::string& kind, const std::s
     if (path.empty() || !files.is_object() || files.empty()) return paths;
 
     const bool as_dir = files.size() > 1 || looks_like_directory(path);
+    // Validate every sheet before creating directories or writing any page.
+    if (kind == "svg")
+        for (auto it = files.begin(); it != files.end(); ++it) {
+            require_svg_leaf(it.key(), true);
+            require_svg_leaf(export_filename(kind, it.key(), stem, opts));
+        }
     std::error_code ec;
     if (as_dir) fs::create_directories(fs::path(path), ec);
     else if (fs::path(path).has_parent_path())
@@ -586,6 +687,14 @@ json write_export_files(const json& files, const std::string& kind, const std::s
         if (!it.value().is_string()) continue;
         const fs::path target =
             as_dir ? fs::path(path) / export_filename(kind, it.key(), stem, opts) : fs::path(path);
+        if (kind == "svg") {
+            const fs::path directory = as_dir ? fs::path(path)
+                                              : (target.has_parent_path() ? target.parent_path()
+                                                                          : fs::path("."));
+            write_svg_file(target, directory, it.value().get_ref<const std::string&>());
+            paths.push_back(target.string());
+            continue;
+        }
         std::ofstream fh(target, std::ios::binary | std::ios::trunc);
         if (!fh)
             throw OpError("io_error", "ecad_export: cannot write '" + target.string() + "'",
@@ -701,8 +810,11 @@ json ecad_export(const json& params) {
         warnings.push_back(
             "kicad export is best-effort: chudware-only fields are written as properties");
     } else if (kind == "svg") {
-        for (const auto& page : plot::schematic_svg_pages(doc, plot_opts_from(opts)))
+        require_svg_leaf(opts.value("sheet", std::string()), true);
+        for (const auto& page : plot::schematic_svg_pages(doc, plot_opts_from(opts))) {
+            require_svg_leaf(page.first, true);
             files[page.first] = page.second;
+        }
     } else if (kind == "pdf") {
         files["pdf"] = plot::schematic_pdf(doc, plot_opts_from(opts));
     }

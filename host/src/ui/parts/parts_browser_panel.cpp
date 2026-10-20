@@ -26,15 +26,14 @@
 #include "parts_internal.h"
 #include "parts_widgets.h"
 
-// Route [wizard] diagnostics to both stderr and the CEF trace file (stderr lands
-// on a socket after the GUI re-execs, so the file is what survives a live repro).
-#define WIZ_TRACE(...)                                              \
-    do {                                                            \
-        char _wb[512];                                              \
-        std::snprintf(_wb, sizeof(_wb), "[wizard] " __VA_ARGS__);   \
-        ::ui::cef::trace_file_line(_wb);                            \
-        std::fprintf(stderr, "%s\n", _wb);                         \
-        std::fflush(stderr);                                        \
+// Wizard diagnostics share the explicit opt-in, bounded CEF event sink.
+#define WIZ_TRACE(...)                                                       \
+    do {                                                                    \
+        if (::ui::cef::trace_enabled()) {                                    \
+            char _wb[512];                                                  \
+            std::snprintf(_wb, sizeof(_wb), "[wizard] " __VA_ARGS__);          \
+            ::ui::cef::trace_file_line(_wb);                                 \
+        }                                                                   \
     } while (0)
 
 namespace ui {

@@ -16,6 +16,8 @@
 #include "firmware/subprocess.h"
 #include "firmware/bus_models.h"
 #include "firmware/hardware.h"
+#include "firmware/private_storage.h"
+#include "firmware/renode_encoding.h"
 #include <map>
 
 namespace chudware::firmware {
@@ -23,6 +25,20 @@ namespace {
 
 constexpr size_t kUartCap = 32000;
 constexpr size_t kEventCap = 4096;
+
+struct EmulatorInputs {
+    std::filesystem::path dir;
+    explicit EmulatorInputs(const std::string& prefix) : dir(private_temp_directory(prefix)) {}
+    ~EmulatorInputs() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+    std::string copy(const std::string& source, const std::string& name) {
+        const auto destination = dir / name;
+        private_storage_detail::atomic_write(destination, private_storage_detail::read_file(source));
+        return destination.string();
+    }
+};
 
 // CHUDWARE_GPIO_EVT <PIN>=<level>[ t=<num>[ms|us|s]] — target-emitted events only.
 const std::regex kGpioEvtRe(
@@ -326,6 +342,9 @@ SimResult run_renode(const std::string& elf_path, const std::string& platform_fi
 
     double run_seconds = requested_run_s > 0 ? requested_run_s : 1.0;
     auto gpio_pins = pins_from_assertions(assertions);
+    EmulatorInputs inputs("renode");
+    const auto copied_elf = inputs.copy(elf_path, "firmware.elf");
+    const auto copied_platform = inputs.copy(platform_file, "platform.repl");
 
     // Compile the scenario (T-FIN3) — pure plan first, then aux files on disk.
     std::vector<std::string> scenario_setup;
@@ -337,13 +356,13 @@ SimResult run_renode(const std::string& elf_path, const std::string& platform_fi
         nlohmann::json caps = mcu_caps.is_object() ? mcu_caps : get_capabilities("cortex-m");
         std::string platform_text;
         {
-            std::ifstream in(platform_file);
+            std::ifstream in(copied_platform);
             std::stringstream ss;
             ss << in.rdbuf();
             platform_text = ss.str();
         }
         ScenarioPlan plan;
-        if(scenario.is_object()) plan=build_scenario_plan(scenario,caps,platform_text);
+        if(scenario.is_object()) plan=build_scenario_plan(scenario,caps,platform_text,requested_run_s * 1000);
         else {
             plan.aux_files["chudware_buses.cs"]=generated_bus_source(nlohmann::json::array());
             plan.pre_platform_lines={"include @{CHUDWARE_SCENARIO_DIR}/chudware_buses.cs"};
@@ -368,10 +387,7 @@ SimResult run_renode(const std::string& elf_path, const std::string& platform_fi
                        .count();
             return r;
         }
-        namespace fs = std::filesystem;
-        fs::path dir = fs::temp_directory_path() /
-                       fs::path("chudware_scenario_" + std::to_string(
-                           std::chrono::steady_clock::now().time_since_epoch().count()));
+        auto dir = private_directory(inputs.dir / "scenario");
         scenario_dir = dir.string();
         materialize_aux_files(plan, scenario_dir);
         scenario_setup = plan.pre_platform_lines;
@@ -382,23 +398,14 @@ SimResult run_renode(const std::string& elf_path, const std::string& platform_fi
         if(requested_run_s==0) run_seconds=std::max(run_seconds,plan.duration_ms/1000+1.0);
     }
 
-    std::string resc = build_resc(elf_path, platform_file, run_seconds, gpio_pins, gpio_regmap,
+    std::string resc = build_resc(copied_elf, copied_platform, run_seconds, gpio_pins, gpio_regmap,
                                   scenario_setup, scenario_timeline);
     namespace fs = std::filesystem;
-    fs::path resc_path = fs::temp_directory_path() /
-                         ("chudware_" + std::to_string(
-                              std::chrono::steady_clock::now().time_since_epoch().count()) +
-                          ".resc");
-    {
-        std::ofstream out(resc_path, std::ios::binary | std::ios::trunc);
-        out << resc;
-    }
+    fs::path resc_path = inputs.dir / "simulation.resc";
+    private_storage_detail::atomic_write(resc_path, resc);
 
     std::vector<std::string> cmd = {"renode", "--disable-xwt", "--console", resc_path.string()};
-    RunResult rr = run_capture(cmd, "", timeout_s);
-    std::error_code ec;
-    fs::remove(resc_path, ec);
-    if (!scenario_dir.empty()) fs::remove_all(scenario_dir, ec);
+    RunResult rr = run_capture(cmd, inputs.dir.string(), timeout_s, true);
 
     if (rr.not_found)
         return refused_result(
@@ -406,6 +413,8 @@ SimResult run_renode(const std::string& elf_path, const std::string& platform_fi
     if (rr.timed_out)
         return refused_result(
             "timeout: renode exceeded " + fmt_g(timeout_s) + "s", assertions, t0);
+    if (rr.output_limit_exceeded)
+        return refused_result("output_limit_exceeded: Renode capture is incomplete", assertions, t0);
     std::string raw = rr.stdout_text;
     if (!rr.stderr_text.empty()) {
         if (!raw.empty() && raw.back() != '\n') raw += '\n';
@@ -465,12 +474,13 @@ SimResult run_qemu(const std::string& elf_path, double timeout_s,
         return refused_result(
             "emulator_not_found: 'qemu-system-arm' is not installed / not on PATH",
             assertions, t0);
+    EmulatorInputs inputs("qemu");
+    const auto copied_elf = inputs.copy(elf_path, "firmware.elf");
     std::vector<std::string> cmd = {
         "qemu-system-arm", "-M", "mps2-an385", "-cpu", "cortex-m3",
-        "-kernel", elf_path, "-semihosting",
-        "-semihosting-config", "enable=on,target=native", "-nographic", "-no-reboot",
+        "-kernel", copied_elf, "-nographic", "-no-reboot",
     };
-    RunResult rr = run_capture(cmd, "", timeout_s);
+    RunResult rr = run_capture(cmd, inputs.dir.string(), timeout_s, true);
     if (rr.not_found)
         return refused_result(
             "emulator_not_found: 'qemu-system-arm' is not installed / not on PATH",
@@ -478,6 +488,8 @@ SimResult run_qemu(const std::string& elf_path, double timeout_s,
     if (rr.timed_out)
         return refused_result(
             "timeout: qemu-system-arm exceeded " + fmt_g(timeout_s) + "s", assertions, t0);
+    if (rr.output_limit_exceeded)
+        return refused_result("output_limit_exceeded: QEMU capture is incomplete", assertions, t0);
     std::string raw = rr.stdout_text;
     if (!rr.stderr_text.empty()) {
         if (!raw.empty() && raw.back() != '\n') raw += '\n';
@@ -1068,9 +1080,9 @@ std::string build_resc(const std::string& elf_path, const std::string& platform_
 
     std::vector<std::string> lines = {"mach create"};
     for(const auto& l:scenario_setup_lines) if(l.rfind("include ",0)==0) lines.push_back(l);
-    lines.push_back("machine LoadPlatformDescription @" + platform_file);
+    lines.push_back("machine LoadPlatformDescription " + renode_path(platform_file));
     for(const auto& l:scenario_setup_lines) if(l.rfind("include ",0)!=0) lines.push_back(l);
-    lines.push_back("sysbus LoadELF @" + elf_path);
+    lines.push_back("sysbus LoadELF " + renode_path(elf_path));
     if (!uart_name.empty()) lines.push_back("showAnalyzer sysbus." + uart_name);
     for (const auto& l : timeline_resc_lines(scenario_timeline, run_seconds))
         lines.push_back(l);
@@ -1078,9 +1090,9 @@ std::string build_resc(const std::string& elf_path, const std::string& platform_
     for (const auto& [p, _] : gpio_pins) ports.insert(p);
     for (char port : ports) {
         long long odr = base + stride * (port - 'A') + odr_offset;
-        lines.push_back("echo \"CHUDWARE_GPIO_ODR_BEGIN " + std::string(1, port) + "\"");
+        lines.push_back("echo " + renode_string("CHUDWARE_GPIO_ODR_BEGIN " + std::string(1, port)));
         lines.push_back("sysbus ReadDoubleWord " + fmt_hex(odr));
-        lines.push_back("echo \"CHUDWARE_GPIO_ODR_END " + std::string(1, port) + "\"");
+        lines.push_back("echo " + renode_string("CHUDWARE_GPIO_ODR_END " + std::string(1, port)));
     }
     lines.push_back("quit");
     std::string out;
@@ -1095,6 +1107,7 @@ SimResult run_simulation(const std::string& elf_path, const std::string& mcu_fam
                          const std::vector<std::string>& assertions, double timeout_s,
                          const nlohmann::json& scenario, double run_s, const std::string& backend) {
     auto t0 = std::chrono::steady_clock::now();
+    try {
     if (!std::isfinite(timeout_s) || timeout_s <= 0.0)
         return refused_result(
             "invalid_setup: timeout_s must be finite and greater than zero", assertions, t0);
@@ -1182,7 +1195,7 @@ SimResult run_simulation(const std::string& elf_path, const std::string& mcu_fam
             return unsupported_result(
                 caps, assertions, unsupported,
                 "platform lacks " + joined +
-                    " required by the assertions and no QEMU semihosting fallback is installed",
+                    " required by the assertions and no QEMU UART fallback is installed",
                 t0);
         }
         return run_renode(elf_path, platform, assertions, timeout_s, caps["gpio_regmap"],
@@ -1210,6 +1223,9 @@ SimResult run_simulation(const std::string& elf_path, const std::string& mcu_fam
         "emulator_not_found: neither 'renode' nor 'qemu-system-arm' found on PATH. Install "
         "Renode (https://renode.io) or QEMU for live emulation.",
         assertions, t0);
+    } catch (const std::exception& error) {
+        return refused_result("invalid_setup: " + std::string(error.what()), assertions, t0);
+    }
 }
 
 }  // namespace chudware::firmware

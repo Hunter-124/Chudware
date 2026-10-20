@@ -1,10 +1,13 @@
 #include "manufacturing/journal.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cerrno>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
+#include <ostream>
+#include <streambuf>
 #include <system_error>
 
 #ifdef _WIN32
@@ -109,24 +112,69 @@ uint64_t monotonic_ns() {
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
-std::vector<JournalRecord> read_records(const std::filesystem::path& path, device::Seq from) {
+class BoundedBuffer final : public std::streambuf {
+public:
+    explicit BoundedBuffer(size_t limit) : limit_(limit) {}
+    std::string bytes;
+protected:
+    std::streamsize xsputn(const char* data, std::streamsize count) override {
+        if (count < 0 || static_cast<size_t>(count) > limit_ - bytes.size())
+            throw std::length_error("journal record capacity exceeded");
+        bytes.append(data, static_cast<size_t>(count));
+        return count;
+    }
+    int_type overflow(int_type value) override {
+        if (traits_type::eq_int_type(value, traits_type::eof()))
+            return traits_type::not_eof(value);
+        const char byte = traits_type::to_char_type(value);
+        xsputn(&byte, 1);
+        return value;
+    }
+private:
+    size_t limit_;
+};
+
+std::string bounded_json(const nlohmann::json& value, size_t limit) {
+    BoundedBuffer buffer(limit);
+    std::ostream output(&buffer);
+    output.exceptions(std::ios::badbit | std::ios::failbit);
+    output << value;
+    return std::move(buffer.bytes);
+}
+
+void read_records(const std::filesystem::path& path, device::Seq from,
+                  const JournalLimits& limits,
+                  const std::function<bool(const JournalRecord&)>& visitor) {
+    if (std::filesystem::file_size(path) > limits.total_bytes)
+        throw std::length_error("journal total byte capacity exceeded");
     std::ifstream input(path, std::ios::binary);
-    if (!input && std::filesystem::exists(path)) throw std::runtime_error("cannot read journal");
-    std::vector<JournalRecord> records;
+    if (!input) throw std::runtime_error("cannot read journal");
     std::string line;
     size_t line_number = 0;
-    while (std::getline(input, line)) {
+    char byte;
+    while (input.get(byte)) {
+        if (line_number >= limits.total_records)
+            throw std::length_error("journal record count capacity exceeded");
+        if (byte != '\n') {
+            if (line.size() >= limits.record_bytes - 1)
+                throw std::length_error("journal record capacity exceeded");
+            line.push_back(byte);
+            continue;
+        }
         ++line_number;
-        if (line.empty()) continue;
+        if (line.empty()) throw std::runtime_error("empty journal record");
+        JournalRecord record;
         try {
-            auto record = nlohmann::json::parse(line).get<JournalRecord>();
-            if (record.seq >= from) records.push_back(std::move(record));
+            record = nlohmann::json::parse(line).get<JournalRecord>();
         } catch (const std::exception& error) {
             throw std::runtime_error("corrupt journal line " + std::to_string(line_number) +
                                      ": " + error.what());
         }
+        line.clear();
+        if (record.seq >= from && !visitor(record)) return;
     }
-    return records;
+    if (input.bad()) throw std::runtime_error("cannot read journal");
+    if (!line.empty()) throw std::runtime_error("unrepaired journal tail");
 }
 
 void repair_torn_tail(int fd) {
@@ -188,35 +236,58 @@ struct Journal::Impl {
     int lock_fd = -1;
     device::Seq current_head = 0;
     device::Seq epoch_floor = 1;
+    JournalLimits limits;
+    uint64_t total_bytes = 0;
+    size_t total_records = 0;
 
-    Impl(std::filesystem::path path, device::LaneEpoch current_epoch)
+    Impl(std::filesystem::path path, device::LaneEpoch current_epoch, JournalLimits bounds)
         : directory(std::move(path)), journal_path(directory / "journal.jsonl"),
           checkpoint_path(directory / "seq.head"), lock_path(directory / "writer.lock"),
-          epoch(std::move(current_epoch)) {
+          epoch(std::move(current_epoch)), limits(bounds) {
+        if (limits.record_bytes < 2 || limits.total_bytes < limits.record_bytes ||
+            limits.total_records == 0 || limits.replay_records == 0 ||
+            limits.replay_bytes < limits.record_bytes)
+            throw std::invalid_argument("invalid journal limits");
         std::filesystem::create_directories(directory);
         lock_fd = open_lock_file(lock_path);
         if (lock_fd < 0) throw std::runtime_error("journal already has a writer");
-        journal_fd = open_file(journal_path);
-        if (journal_fd < 0) throw_io("journal open");
-        repair_torn_tail(journal_fd);
-
-        const auto records = read_records(journal_path, 1);
-        for (const auto& record : records) current_head = std::max(current_head, record.seq);
-        device::Seq checkpoint_head = 0;
-        {
-            // Windows file streams do not share delete access. End the read handle
-            // before persist_head atomically replaces the checkpoint below.
-            std::ifstream checkpoint(checkpoint_path);
-            if (checkpoint) checkpoint >> checkpoint_head;
-        }
-        current_head = std::max(current_head, checkpoint_head);
-        epoch_floor = current_head + 1;
-        for (const auto& record : records) {
-            if (record.epoch == epoch) {
-                epoch_floor = std::min(epoch_floor, record.seq);
+        try {
+            journal_fd = open_file(journal_path);
+            if (journal_fd < 0) throw_io("journal open");
+            const auto end = seek_file(journal_fd, 0, SEEK_END);
+            if (end < 0) throw_io("journal seek");
+            if (static_cast<uint64_t>(end) > limits.total_bytes)
+                throw std::length_error("journal total byte capacity exceeded");
+            repair_torn_tail(journal_fd);
+            total_bytes = std::filesystem::file_size(journal_path);
+            device::Seq first_epoch_seq = 0;
+            read_records(journal_path, 1, limits, [&](const JournalRecord& record) {
+                if (record.seq <= current_head)
+                    throw std::runtime_error("journal seq is not strictly increasing");
+                current_head = record.seq;
+                ++total_records;
+                if (record.epoch == epoch && first_epoch_seq == 0)
+                    first_epoch_seq = record.seq;
+                return true;
+            });
+            device::Seq checkpoint_head = 0;
+            {
+                // Windows streams must close before the checkpoint is replaced.
+                std::ifstream checkpoint(checkpoint_path);
+                if (checkpoint) checkpoint >> checkpoint_head;
             }
+            current_head = std::max(current_head, checkpoint_head);
+            if (current_head == std::numeric_limits<device::Seq>::max())
+                throw std::overflow_error("journal seq exhausted");
+            epoch_floor = first_epoch_seq ? first_epoch_seq : current_head + 1;
+            persist_head(current_head);
+        } catch (...) {
+            if (journal_fd >= 0) close_file(journal_fd);
+            journal_fd = -1;
+            close_file(lock_fd);
+            lock_fd = -1;
+            throw;
         }
-        persist_head(current_head);
     }
 
     ~Impl() {
@@ -261,24 +332,46 @@ struct Journal::Impl {
     }
 };
 
-Journal::Journal(std::filesystem::path install_directory, device::LaneEpoch epoch)
-    : impl_(std::make_unique<Impl>(std::move(install_directory), std::move(epoch))) {}
+Journal::Journal(std::filesystem::path install_directory, device::LaneEpoch epoch,
+                 JournalLimits limits)
+    : impl_(std::make_unique<Impl>(std::move(install_directory), std::move(epoch), limits)) {}
 Journal::~Journal() = default;
 Journal::Journal(Journal&&) noexcept = default;
 Journal& Journal::operator=(Journal&&) noexcept = default;
 
 device::Seq Journal::append(std::string_view kind, std::string_view subject,
-                            nlohmann::json body, nlohmann::json raw) {
+                            const nlohmann::json& body, const nlohmann::json& raw) {
     if (kind.empty() || subject.empty()) throw std::invalid_argument("journal kind and subject are required");
+    if (kind.size() >= impl_->limits.record_bytes ||
+        subject.size() >= impl_->limits.record_bytes)
+        throw std::length_error("journal record capacity exceeded");
     if (impl_->current_head == std::numeric_limits<device::Seq>::max())
         throw std::overflow_error("journal seq exhausted");
+    if (impl_->total_records >= impl_->limits.total_records)
+        throw std::length_error("journal record count capacity exceeded");
     const device::Seq next = impl_->current_head + 1;
-    JournalRecord record{next, impl_->epoch, std::string(kind), std::string(subject),
-                         std::move(body), std::move(raw), monotonic_ns()};
-    const std::string bytes = nlohmann::json(record).dump() + "\n";
+    // Serialize through a capped sink directly from caller-owned JSON: a hostile
+    // body is never copied or fully dumped before its record quota is enforced.
+    const auto remaining = impl_->limits.total_bytes - impl_->total_bytes;
+    if (remaining < 2) throw std::length_error("journal total byte capacity exceeded");
+    BoundedBuffer buffer(static_cast<size_t>(
+        std::min<uint64_t>(impl_->limits.record_bytes - 1, remaining - 1)));
+    std::ostream output(&buffer);
+    output.exceptions(std::ios::badbit | std::ios::failbit);
+    output << "{\"seq\":" << next << ",\"epoch\":" << nlohmann::json(impl_->epoch)
+           << ",\"kind\":" << nlohmann::json(kind)
+           << ",\"subject\":" << nlohmann::json(subject)
+           << ",\"body\":" << body << ",\"raw\":" << raw
+           << ",\"t_mono_ns\":" << monotonic_ns() << "}";
+    std::string bytes = std::move(buffer.bytes);
+    bytes.push_back('\n');
+    if (bytes.size() > impl_->limits.total_bytes - impl_->total_bytes)
+        throw std::length_error("journal total byte capacity exceeded");
 
     impl_->persist_head(next);  // reserve before append: a crash can create a gap, never reuse a seq
     impl_->current_head = next;
+    impl_->total_bytes += bytes.size();
+    ++impl_->total_records;
     write_all(impl_->journal_fd, bytes);
     if (sync_file(impl_->journal_fd) != 0) throw_io("journal sync");
     if (impl_->epoch_floor > next) impl_->epoch_floor = next;
@@ -288,7 +381,25 @@ device::Seq Journal::append(std::string_view kind, std::string_view subject,
 device::Seq Journal::head() const { return impl_->current_head; }
 device::Seq Journal::epochFloor() const { return impl_->epoch_floor; }
 std::vector<JournalRecord> Journal::replay(device::Seq from) const {
-    return read_records(impl_->journal_path, from);
+    std::vector<JournalRecord> records;
+    size_t bytes = 0;
+    visit(from, [&](const JournalRecord& record) {
+        const auto size = bounded_json(nlohmann::json(record), impl_->limits.record_bytes).size();
+        if (records.size() >= impl_->limits.replay_records ||
+            size > impl_->limits.replay_bytes - bytes)
+            throw std::length_error("journal replay capacity exceeded; use streaming visit");
+        bytes += size;
+        records.push_back(record);
+        return true;
+    });
+    return records;
 }
+
+void Journal::visit(device::Seq from,
+                    const std::function<bool(const JournalRecord&)>& visitor) const {
+    read_records(impl_->journal_path, from, impl_->limits, visitor);
+}
+
+const JournalLimits& Journal::limits() const { return impl_->limits; }
 
 }  // namespace chudware::mfg

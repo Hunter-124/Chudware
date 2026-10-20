@@ -29,7 +29,9 @@ way the GUI's in-process path does (`services/worker/cpp_core.cpp`), so
     outer retry at once and never selects the in-process fallback.
 - **Single instance per key.** Linux: `flock` on `hostd-<key>.lock` held for the
   daemon's lifetime (evaporates on death — no stale-lock heuristics). Windows:
-  named mutex `Global\chudware-hostd-<SID>-<key>`.
+  an exclusive handle to a current-user/SYSTEM-only lock file under `%APPDATA%\Chudware`.
+  Public named mutexes are not singleton authority. New private objects explicitly use
+  the current user's SID as owner, including elevated launches; foreign-owned state is refused.
 - **Startup order**: acquire lock → remove stale socket → bind/listen → THEN
   load libchudware asynchronously. While OCCT loads, the handshake answers
   `state: loading`; an engine call can still fail or time out waiting for readiness.
@@ -71,6 +73,56 @@ way the GUI's in-process path does (`services/worker/cpp_core.cpp`), so
     takes the last token of the WHOLE output. Adding a second line makes one of
     them compare garbage against `hello.git_rev` and declare every daemon stale.
 
+## Windows daemon transport
+
+Native daemon reads and writes use separate overlapped completion events, with a
+sticky shutdown event to cover cancellation before an operation is submitted.
+Blocking reads wait for completion rather than `PeekNamedPipe`/`Sleep(1)` polling.
+Timeout cancellation drains the operation before its buffer retires; partial
+frames survive a timeout, zero-timeout reads poll without waiting, and lines over
+64 MiB fail closed. Concurrent event writes cannot reset the reader's event.
+Python discovery shares the typed, pointer-width-correct process TokenUser lookup
+with the private control-pipe implementation.
+
+`ipc_transport_windows` in core CTest exercises real native idle/pre-submit
+cancellation, simultaneous blocked reads/writes, duplex traffic, partial frames,
+EOF and the 64 MiB boundary. Performance measurements are recorded separately in
+the native Windows evidence archive; VM measurements are not GPU/UI benchmarks.
+
+## Windows worker lanes
+
+The daemon starts native workers with `CreateProcessW`, an explicit inherited-handle
+list and a kill-on-close Job Object assigned before the child runs. Workers use
+`DETACHED_PROCESS`: their private stdio needs no console, whereas `CREATE_NO_WINDOW`
+still creates a hidden `conhost.exe` child and prevents an authoritative idle census.
+Standard and session-owned agent lanes share routing, control, activity census and idle
+reaping; an interrupted agent turn is never replayed. Windows stdout reads wait on overlapped
+I/O completion or child exit instead of millisecond polling. Cancellation drains the
+pending operation before its buffer/event can be reused, and final output survives EOF.
+Negative read deadlines remain unbounded: transport timeouts are not agent lifetime caps.
+
+Control named pipes likewise use event waits and absolute request/response deadlines.
+Failed response writes do not add a second disconnect grace period. Windows desktop
+workers do not accept Linux tenant-cell execution contexts.
+
+Python worker activity uses a native Toolhelp parent snapshot and exact process
+creation FILETIMEs rather than `/proc`. It opens handles only within the worker's
+descendant tree, not unrelated protected system processes. Unknown descendants are
+counted and prevent an idle verdict; inaccessible or incomplete observations fail
+closed. Observed desktop SDK launches still require containment attestation:
+this census does not turn an escaped SDK/tool into trusted idle work.
+
+Windows cached saves publish the staged file without deleting the renamed result
+during cleanup. Both normal saves and cache-only writeback provide a terminated
+UTF-16 rename buffer; native Windows consumed characters past `FileNameLength` without
+that terminator. Archive readers use wide filenames and close before replacement.
+API paths remain UTF-8, including Unicode save/overwrite/relocation and mixed separators;
+unrelated NTFS names are compared as native code units, not narrowed through the ANSI code page.
+Cache provenance keys and save stages use explicit TokenUser ownership with the protected
+user/SYSTEM ACL, including elevated launches. The native runtime smoke checks verified
+checkpoint hydration with zero feature execution and no pending verification rebuild,
+then a tail edit reusing earlier checkpoints.
+
 ## Environment variables
 
 | Variable | Meaning |
@@ -99,7 +151,7 @@ way the GUI's in-process path does (`services/worker/cpp_core.cpp`), so
 | Thing | Linux | Windows |
 |---|---|---|
 | Socket / pipe | `$XDG_RUNTIME_DIR/chudware/hostd-<key>.sock` (fallback `/tmp/chudware-<uid>/…`, 0700, ownership-verified) | `\\.\pipe\chudware-hostd-<SID>-<key>` |
-| Lock / single instance | `<runtime dir>/hostd-<key>.lock` (flock) | named mutex `Global\chudware-hostd-<SID>-<key>` |
+| Lock / single instance | `<runtime dir>/hostd-<key>.lock` (flock) | `%APPDATA%\Chudware\hostd-<fnv1a(key)>.lock` (exclusive file handle) |
 | Logs | `~/.local/share/Chudware/logs/hostd.log` (5 MB × 3 rename rotation) | `%APPDATA%\Chudware\logs\hostd.log` |
 | Autosave / recovery | `~/.local/share/Chudware/hostd_autosave/<key>/` | `%APPDATA%\Chudware\hostd_autosave\<key>\` |
 
@@ -243,8 +295,9 @@ Every drain refuses new clients by name: `stale_binary` (soft, above),
   `CloseApplications=yes` enables Restart Manager. Separately, the developer
   `install.ps1` drains known install-directory daemons with `--stop --force`,
   then uses image-path-scoped `taskkill`; MCP registration pins `CHUDWARE_HOSTD_BIN`.
-  Windows daemon execution remains unverified by the daemon-disabled CI GUI smoke;
-  use the manual checklist in `PACKAGING_WINDOWS.md`.
+  The isolated native Windows developer checks are recorded in the remediation
+  evidence ledger. They do not qualify the installed payload, Restart Manager or
+  upgrade/uninstall behavior; use the manual checklist in `PACKAGING_WINDOWS.md`.
 - **Upgrades**: the developer installer has an explicit daemon stop path; the packaged
   installer uses Restart Manager. The Windows checklist must establish the runtime
   behaviour before claiming safe replacement of a running daemon.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json
 import os
@@ -24,7 +25,7 @@ from cryptography.hazmat.primitives import serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (  # noqa: E402
     Ed25519PrivateKey,
 )
-from fastapi import FastAPI  # noqa: E402
+from fastapi import FastAPI, HTTPException, Request  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 # `gateway.*`, not `Webservice.gateway.*`: conftest puts both the gateway dir and
@@ -160,3 +161,91 @@ def test_minimized_persists_only_verdict_reason_and_time(client):
     assert row["platform"] == "debugger_attached"
     assert row["risk_score"] == 0
     assert row["events"] == [{"reason": "debugger_attached", "occurred_at": "2026-08-12T12:00:00+00:00"}]
+
+
+@pytest.mark.parametrize("members", [1, 2])
+def test_expansion_is_bounded_before_json_and_rejected_input_is_rate_limited(
+    client, monkeypatch, members
+):
+    monkeypatch.setattr(security, "_by_ip", security.RateLimiter(2, 60.0))
+    observed = []
+    real_read = gzip.GzipFile.read
+
+    def bounded_read(stream, size=-1):
+        result = real_read(stream, size)
+        observed.append((size, len(result)))
+        return result
+
+    monkeypatch.setattr(gzip.GzipFile, "read", bounded_read)
+    member_size = security.MAX_EXPANDED_BYTES // members + 1
+    body = b"".join(gzip.compress(b"x" * member_size) for _ in range(members))
+    assert len(body) < security.MAX_COMPRESSED_BYTES
+    assert _post(client, {}, raw=body).status_code == 413
+    assert _post(client, {}, raw=body).status_code == 413
+    assert _post(client, {}, raw=body).status_code == 429
+    assert observed == [(security.MAX_EXPANDED_BYTES + 1,
+                         security.MAX_EXPANDED_BYTES + 1)] * 2
+    with tx() as cur:
+        cur.execute("SELECT count(*) AS n FROM security_event_batches")
+        assert cur.fetchone()["n"] == 0
+
+
+def test_chunked_security_body_stops_at_compressed_limit_without_reading_tail(monkeypatch):
+    monkeypatch.setattr(security, "_by_ip", security.RateLimiter(10, 60.0))
+    calls = []
+    chunks = [b"x" * (security.MAX_COMPRESSED_BYTES // 2),
+              b"x" * (security.MAX_COMPRESSED_BYTES // 2 + 1)]
+
+    async def receive():
+        calls.append(len(calls))
+        if len(calls) > len(chunks):
+            pytest.fail("ingress consumed body beyond the compressed ceiling")
+        return {"type": "http.request", "body": chunks[len(calls) - 1],
+                "more_body": True}
+
+    request = Request({"type": "http", "method": "POST",
+                       "path": "/api/security/events", "headers": [
+                           (b"content-encoding", b"gzip")],
+                       "client": ("chunked-fixture", 1234)}, receive=receive)
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(security.ingest_security_events(request))
+    assert caught.value.status_code == 413
+    assert len(calls) == 2
+    with tx() as cur:
+        cur.execute("SELECT count(*) AS n FROM security_event_batches")
+        assert cur.fetchone()["n"] == 0
+
+
+def test_ingress_rate_limit_precedes_body_reads(monkeypatch):
+    limiter = security.RateLimiter(1, 60.0)
+    limiter.enforce("blocked-fixture", "security event batches")
+    monkeypatch.setattr(security, "_by_ip", limiter)
+
+    async def receive():
+        pytest.fail("rate-limited request consumed body")
+
+    request = Request({"type": "http", "method": "POST",
+                       "path": "/api/security/events", "headers": [],
+                       "client": ("blocked-fixture", 1234)}, receive=receive)
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(security.ingest_security_events(request))
+    assert caught.value.status_code == 429
+    with tx() as cur:
+        cur.execute("SELECT count(*) AS n FROM security_event_batches")
+        assert cur.fetchone()["n"] == 0
+
+
+def test_security_expansion_ceiling_accepts_exact_boundary_only(client, monkeypatch):
+    monkeypatch.setattr(security, "_by_ip", security.RateLimiter(10, 60.0))
+    key, subject = _device("expansion-boundary@example.test")
+    batch = _batch(key, subject, 1, ["heartbeat"])
+    raw = json.dumps(batch).encode()
+    raw += b" " * (security.MAX_EXPANDED_BYTES - len(raw))
+    compressed = gzip.compress(raw)
+    assert len(compressed) < security.MAX_COMPRESSED_BYTES
+    assert _post(client, batch, raw=compressed).status_code == 200
+    assert _post(client, batch, raw=gzip.compress(raw + b" ")).status_code == 413
+    with tx() as cur:
+        cur.execute("SELECT count(*) AS n FROM security_event_batches WHERE subject=%s",
+                    (subject,))
+        assert cur.fetchone()["n"] == 1

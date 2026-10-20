@@ -33,6 +33,7 @@ class Resolution:
     source: str
     answers: dict[str, Any] = field(default_factory=dict)
     reply: str | None = None
+    steer_id: str = ""
 
 
 @dataclass
@@ -145,13 +146,13 @@ class TurnQuestions:
             }
         return {"ok": True, "batch_id": key, "answered": True}
 
-    def reply(self, text: str) -> str | None:
+    def reply(self, text: str, *, steer_id: str = "") -> str | None:
         """Resolve the OLDEST pending batch with the user's typed chat reply."""
         with self._lock:
             batch_id = next(iter(self._pending), None)
         if batch_id is None:
             return None
-        resolution = Resolution(source="reply", reply=text[:_MAX_REPLY_CHARS])
+        resolution = Resolution(source="reply", reply=text[:_MAX_REPLY_CHARS], steer_id=steer_id)
         return batch_id if self._resolve(batch_id, resolution) else None
 
     def close(self) -> None:
@@ -183,6 +184,8 @@ class TurnQuestions:
             frame["answers"] = resolution.answers
         if resolution.reply is not None:
             frame["reply"] = resolution.reply
+        if resolution.steer_id:
+            frame["steer_id"] = resolution.steer_id
         try:
             self._emit(frame)
         except Exception:  # noqa: BLE001 - the tool result still reaches the model

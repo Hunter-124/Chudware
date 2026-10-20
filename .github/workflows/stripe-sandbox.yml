@@ -28,10 +28,12 @@
 name: stripe-sandbox
 
 on:
-  # Called by deploy-prod and release. `secrets: inherit` at the call site is
-  # required; without it STRIPE_SANDBOX_ENV is absent and the gate reports
-  # NOT RUN rather than passing silently.
+  # Callers pass only STRIPE_SANDBOX_ENV; the callee also enforces the protected
+  # caller ref/event and environment before executing any repository code.
   workflow_call:
+    secrets:
+      STRIPE_SANDBOX_ENV:
+        required: false
     inputs:
       require_credentials:
         description: >-
@@ -80,11 +82,15 @@ concurrency:
 jobs:
   sandbox:
     name: Verify the live Stripe sandbox
+    if: ${{ github.ref_protected && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+    environment: chudware-control-protected
     # cc-linux-build, never cc-linux-livingroom. This job creates charges and
     # refunds; it has no business executing on the production gateway host, and
     # pinning it here means a future edit cannot accidentally point live billing
     # tests at prod's environment file.
-    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-build]
+    runs-on:
+      group: chudware-trusted-protected
+      labels: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-build]
     timeout-minutes: 20
     outputs:
       result: ${{ steps.run.outputs.result }}

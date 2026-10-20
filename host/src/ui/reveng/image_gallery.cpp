@@ -17,7 +17,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -203,30 +202,6 @@ std::vector<std::string> metaLines(const GalleryImage& img, int idx, int total) 
     return m;
 }
 
-// Show a file in the OS file manager, selecting it where the platform supports that.
-void revealInFileManager(const std::string& path) {
-    if (path.empty()) return;
-#if defined(__EMSCRIPTEN__)
-    (void)path;   // no OS file manager in the browser build
-#elif defined(_WIN32)
-    const std::string cmd = "explorer /select,\"" + path + "\"";
-    (void)std::system(cmd.c_str());
-#elif defined(__APPLE__)
-    const std::string cmd = "open -R \"" + path + "\" >/dev/null 2>&1 &";
-    (void)std::system(cmd.c_str());
-#else
-    // freedesktop FileManager1 selects the item; fall back to opening the containing folder.
-    const size_t slash = path.find_last_of('/');
-    const std::string dir = (slash == std::string::npos) ? std::string(".") : path.substr(0, slash);
-    const std::string cmd =
-        "dbus-send --session --print-reply --dest=org.freedesktop.FileManager1 "
-        "--type=method_call /org/freedesktop/FileManager1 "
-        "org.freedesktop.FileManager1.ShowItems array:string:\"file://" + path + "\" string:\"\" "
-        ">/dev/null 2>&1 || xdg-open \"" + dir + "\" >/dev/null 2>&1 &";
-    (void)std::system(cmd.c_str());
-#endif
-}
-
 // Append `path` as an unrated entry unless it is already in the set. Returns true when added.
 bool appendUnique(std::vector<GalleryImage>& images, const std::string& path) {
     if (path.empty()) return false;
@@ -387,7 +362,7 @@ void drawViewerModal(GalleryUI& g, std::vector<GalleryImage>& images,
     ImGui::SameLine(0.0f, metrics::reCtlGap());
     if (kit::SecondaryButton("Show in file manager", true, nullptr,
                              ImVec2(metrics::reBtnW() * 1.8f, metrics::reBtnH()))) {
-        revealInFileManager(img.path);
+        ui::revealInFileManager(img.path);
         out.revealed.push_back(img.path);
     }
 
@@ -678,7 +653,7 @@ void drawImageGallery(AppState& st,
                 ImGui::PushID(hoverIdx);
                 ImGui::SetCursorScreenPos(ImVec2(hoverMin.x, hoverMax.y - bh));
                 if (kit::SecondaryButton("Show", true, nullptr, ImVec2(bwL, bh))) {
-                    revealInFileManager(img.path);
+                    ui::revealInFileManager(img.path);
                     out.revealed.push_back(img.path);
                 }
                 overActions |= ImGui::IsItemHovered();

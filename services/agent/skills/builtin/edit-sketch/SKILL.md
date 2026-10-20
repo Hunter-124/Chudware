@@ -1,6 +1,6 @@
 ---
 name: edit-sketch
-description: 2D sketch workflow — close profiles, constrain to DOF 0, smart-dimension mating features first, then check_sketch before extrude/revolve. Uses ASCII readback for non-vision parity.
+description: 2D sketch workflow — true curves, geometric relations and functional driving dimensions, residual fully-definition, then check_sketch DOF 0 and not pinned_only before a solid feature.
 inject: auto
 triggers:
   keywords: [sketch, profile, constrain, dimension, dof, rectangle, circle sketch, ascii, draw a, draw me a]
@@ -21,28 +21,33 @@ triggers:
    endpoint-coincidence notes, closure + dof + ordered schedule), `grid` + `index` (the
    cell<->world contract) and `findings`. Do not guess the next edit from memory; ground it
    on that block. Full render is still available via `render_sketch_ascii(sketch)`.
-3. **Endpoints that touch are auto-coincident** when `sketch.auto_coincident` is on — profiles
-   should close without a manual "not closed" fight. Near-coincident endpoints are called out
-   in the readback findings.
-4. **ASCII verify loop** until DOF 0:
-   - edit (mutation) → **read ASCII + NL readback**
-   - `sketch_health(id)` — narrated free variables + ordered relations-then-dimensions schedule
-   - add scheduled relations, or `sketch_auto_constrain(id)` for near-touching endpoints
-   - `check_sketch(id)` → require `dof == 0` before using the profile
-   - fix → re-read → repeat
-5. Dimension **mating features first** (hole diameters, center distances that define an interface).
-   Envelope dims second. Dimension callouts appear by name/value in the readback.
-6. **Before declaring a sketch done:** call `render_sketch_ascii(sketch)` + `sketch_health` /
-   `check_sketch` and require dof 0 + closed profile. Text-only models rely on the NL entity /
-   dim / constraint list in the readback — do not skip it.
-7. Only then extrude/revolve/loft from the sketch via `add_features`.
-8. After the 3D feature lands: `describe_part` / `measure_part` the result.
+3. Draw roughly, then add geometric relations before independent functional driving dimensions.
+   origin, axis.h and axis.v are valid refs. For example:
+   `{"op":"sketch_add_constraint","sketch":"f1","constraint":{"id":"c1","type":"coincident","refs":["e1.center","origin"]}}`
+   then `{"op":"sketch_add_constraint","sketch":"f1","constraint":{"id":"c2","type":"radius","refs":["e1"],"value":{"value":4,"expr":null}}}`.
+   `sketch_set_dim` retunes an existing dimension: `{"op":"sketch_set_dim","sketch":"f1","id":"c2","value":5}`.
+   Read existing relations before adding coincidents; near-touching points may still need joining.
+4. Dimension mating features first (fit_calc for fit-driven sizes), envelope second. Use symmetry
+   about axis.v or a construction centerline and one half-size/spacing, not two dimensioned halves.
+   Use true arcs and tangent lines for slots/rounded profiles, not faceted polylines/splines.
+5. Convert surrounding geometry with sketch_convert, construction:true, associative:true:
+   face/edge/vertex refs use selectors; edge mode:"pierce" creates a plane-crossing point;
+   datum:"axis.x"|"axis.y"|"axis.z" and kind:"sketch_entity" are also supported.
+   Relate authored geometry to returned entities. Fixed external refs are legitimate.
+6. Append `{"op":"sketch_fully_define","sketch":"f1","relations":true,"dimensions":true,"anchor":"origin"}`.
+   add_features defaults auto_define:true after explicit intent. For staged edits use call
+   auto_define:false, or auto_define:false on feature/params/authoring op, then define before use.
+7. Read sketch_health and check_sketch: require closed material profile, dof == 0,
+   pinned_only == false, no conflicts/skipped constraints. Never blanket-fix the profile
+   to pass. Resolve free variables with relations/dimensions; re-read and repeat.
+8. Only then extrude/revolve/loft; a sketch alone is not a solid.
+9. After the 3D feature lands: `describe_part` / `measure_part` the result.
 
 ## Rules
 
-- Never extrude an under-constrained sketch (DOF > 0) for production geometry.
+- Never consume an under-constrained or pinned-only authored profile for production geometry.
 - Mating diameters go through `fit_calc` when they seat on a shaft/pin.
-- Verify-before-done: `check_sketch` green + post-feature describe/measure.
+- Verify-before-done: check_sketch dof 0 and not pinned_only + post-feature describe/measure.
 - Always **read the ASCII readback** after a sketch mutation before the next action.
 
 ## Deeper docs

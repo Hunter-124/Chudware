@@ -1,6 +1,8 @@
 #include "core/app_state.h"
 #include "core/jobs.h"
+#include "core/fs_backend.h"
 #include "worker_client.h"
+#include "engine_backend.h"
 
 #include <iostream>
 #include <memory>
@@ -18,7 +20,8 @@ bool WorkerClient::call(const std::string&, const nlohmann::json&, nlohmann::jso
     err = "WorkerClient is not available in test_agent_job_routing";
     return false;
 }
-bool WorkerClient::callAgentCancel(const std::string&, nlohmann::json&, std::string& err) {
+bool WorkerClient::callAgentCancel(const std::string&, nlohmann::json&, std::string& err,
+                                 const std::string&) {
     err = "WorkerClient is not available in test_agent_job_routing";
     return false;
 }
@@ -283,6 +286,138 @@ void testEventConsumption() {
         check(job->events.size() == 2, "terminal event queues exactly once");
     }
 }
+void testWorkspaceRelativePaths() {
+    std::string relative, err;
+    for (const std::string& root : {std::string(), std::string("."), std::string("./")}) {
+        check(chudware::workspaceRelativePath(root, relative, err) && relative.empty(),
+              "workspace root stays relative");
+    }
+    check(chudware::workspaceRelativePath("./parts//bracket.step+", relative, err) &&
+              relative == "parts/bracket.step+", "relative workspace path canonicalized");
+    for (const std::string& bad : {
+             std::string("/work/a.step+"), std::string("/srv/gateway/user/a.step+"),
+             std::string("C:/a.step+"), std::string("\\\\server\\share"),
+             std::string("../a.step+"), std::string("parts/../a.step+"),
+             std::string("parts/.."), std::string("parts\\a.step+"),
+             std::string("parts/a\0.step+", 14)}) {
+        check(!chudware::workspaceRelativePath(bad, relative, err) &&
+                  relative.empty() && !err.empty(),
+              "absolute traversal and NUL paths refuse without reinterpretation");
+    }
+}
+
+void testCellHandlesAndPaths() {
+    clearCellAgentSessionHandles();
+    const nlohmann::json extra = {
+        {"run_id", "client-run"},
+        {"options", {{"session_id", "local-conversation"}, {"sessions_dir", "/idbfs/sessions"},
+                     {"chudcode_session_file", "/srv/actor/session.jsonl"},
+                     {"workspace_dir", "./parts"}}}};
+    auto route = buildAgentJobRpcRoute("go", "doc", "local-conversation", false, extra, false, true);
+    check(route.cell && route.error.empty() && !route.params.contains("run_id") &&
+              !route.params.contains("session_id"), "cell route never mints client identifiers");
+    check(route.params["workspace_dir"] == "parts" &&
+              route.params["options"]["workspace_dir"] == "parts",
+          "cell workspace selection remains relative in both envelopes");
+    check(!route.params.contains("sessions_dir") &&
+              !route.params["options"].contains("chudcode_session_file"),
+          "browser-local and runtime paths are not sent");
+    const std::string run = "opaque:run/not-a-path?raw=%2f";
+    const std::string session = "opaque:session/../unchanged";
+    std::string err;
+    check(applyCellAgentHandles(route, {{"ok", true}, {"run_id", run}, {"session_id", session}}, err),
+          "cell mint reply accepted");
+    check(route.params["run_id"] == run && route.params["session_id"] == session &&
+              route.params["options"]["session_id"] == session,
+          "handles remain opaque and byte-exact");
+    bindCellAgentSessionHandle("local-conversation", session, "anthropic");
+    const auto resumed = buildAgentJobRpcRoute("continue", "doc", "local-conversation", false,
+                                               extra, false, true);
+    check(resumed.params["session_id"] == session && !resumed.params.contains("run_id"),
+          "resume uses only the cell binding and mints a fresh run");
+    check(cellAgentSessionHandle("other-conversation").empty(), "local binding is chat-scoped");
+    check(cellAgentSessionProvider("local-conversation") == "anthropic",
+          "session binding keeps the launched provider independently of the picker");
+    bindCellAgentSessionHandle("local-conversation", "child-handle");
+    check(cellAgentSessionProvider("local-conversation") == "anthropic",
+          "rewind handle replacement retains its credential provider");
+    bindCellAgentSessionHandle("other-conversation", "other-handle", "xai");
+    check(cellAgentSessionProvider("other-conversation") == "xai" &&
+              cellAgentSessionProvider("local-conversation") == "anthropic",
+          "simultaneous chat controls retain separate credential providers");
+    for (const auto& invalid : {nlohmann::json::object(),
+                               nlohmann::json{{"ok", false}, {"run_id", run}, {"session_id", session}},
+                               nlohmann::json{{"ok", true}, {"run_id", ""}, {"session_id", session}},
+                               nlohmann::json{{"ok", true}, {"run_id", run}, {"session_id", 12}}}) {
+        const auto before = route.params;
+        check(!applyCellAgentHandles(route, invalid, err) && route.params == before,
+              "malformed mint reply never mutates the route");
+    }
+    for (const char* path : {"/srv/gateway", "../outside", "parts/../outside"}) {
+        const auto bad = buildAgentJobRpcRoute("go", "doc", "chat", false,
+            {{"options", {{"workspace_dir", path}}}}, false, true);
+        check(!bad.error.empty(), "cell route rejects an unsafe workspace selection");
+        const auto attachment = buildAgentJobRpcRoute("go", "doc", "chat", false,
+            {{"attachments", nlohmann::json::array({{{"path", path}}})}}, false, true);
+        check(!attachment.error.empty(), "cell route rejects unsafe attachment paths");
+    }
+    const auto offline = buildAgentJobRpcRoute("go", "doc", "chat", false,
+                                               {{"offline", true}}, false, true);
+    check(!offline.error.empty(), "cell has no native offline fallback");
+    clearCellAgentSessionHandles();
+}
+
+void testCellPendingStop() {
+    JobState pending, other;
+    check(requestCellAgentStop(pending).empty() && pending.stopRequested.load(),
+          "Stop before mint records only a per-job pending cancellation");
+    check(publishCellAgentRunHandle(other, "other-run").empty() && !other.stopRequested.load(),
+          "pending Stop does not affect another job");
+    check(publishCellAgentRunHandle(pending, "minted-run") == "minted-run",
+          "mint publication consumes pending Stop as an exact handle");
+    check(requestCellAgentStop(pending).empty(), "repeated Stop does not dispatch again");
+    JobState started;
+    check(publishCellAgentRunHandle(started, "running-handle").empty(),
+          "normal mint publication does not cancel");
+    check(requestCellAgentStop(started) == "running-handle",
+          "Stop after mint returns the unchanged exact handle");
+}
+
+void testCellProtocolAdmission() {
+    const nlohmann::json current = {
+        {"proto", 1}, {"abi", "1"}, {"state", "ready"},
+        {"workspace_key", "user:00000000-0000-4000-8000-000000000001"},
+        {"web_rpc_version", 2},
+        {"web_rpc_methods", nlohmann::json::array(
+            {"subscribe", "doc_list", "doc_open", "agent_handles_new",
+             "chudcode_models_list", "agent_admin_turn"})}};
+    check(engine::webCellProtocolReady(current), "version two cell enables browser capabilities");
+    check(engine::webCellMethodAllowed(current, "doc_open") &&
+              engine::webCellMethodAllowed(current, "agent_handles_new"),
+          "only advertised CAD and handle methods are admitted");
+    check(!engine::webCellMethodAllowed(current, "doc_rebuild"),
+          "unadvertised method is refused without legacy fallback");
+    check(engine::webCellMethodAllowed(current, "subscribe") &&
+              engine::webCellMethodAllowed(current, "doc_list") &&
+              engine::webCellMethodAllowed(current, "chudcode_models_list") &&
+              engine::webCellMethodAllowed(current, "agent_admin_turn"),
+          "actual ready hello admits document bootstrap and credential-free provider chat");
+    check(!engine::webCellMethodAllowed(current, "recovery_list"),
+          "desktop-only recovery is not implied by a ready cell hello");
+    for (auto invalid : {nlohmann::json::object(),
+                         nlohmann::json{{"web_rpc_version", 1}, {"web_rpc_methods", current["web_rpc_methods"]}},
+                         nlohmann::json{{"web_rpc_version", 3}, {"web_rpc_methods", current["web_rpc_methods"]}},
+                         nlohmann::json{{"web_rpc_version", "2"}, {"web_rpc_methods", current["web_rpc_methods"]}},
+                         nlohmann::json{{"web_rpc_version", 2}, {"web_rpc_methods", "doc_open"}},
+                         nlohmann::json{{"web_rpc_version", 2}, {"web_rpc_methods", nlohmann::json::array({12})}}}) {
+        check(!engine::webCellProtocolReady(invalid) &&
+                  !engine::webCellMethodAllowed(invalid, "doc_open"),
+              "missing unknown older or malformed cell hello disables CAD and AI");
+        check(engine::webCellMethodAllowed(invalid, "hello") &&
+                  engine::webCellMethodAllowed(invalid, "ping"),
+              "hello and ping remain available during protocol refusal");
+    }
+}
 
 }  // namespace
 
@@ -295,6 +430,10 @@ int main() {
     testExplicitOfflineFallbacks();
     testAdminResultMapping();
     testEventConsumption();
+    testWorkspaceRelativePaths();
+    testCellHandlesAndPaths();
+    testCellPendingStop();
+    testCellProtocolAdmission();
     if (failures) return 1;
     std::cout << "agent job routing: PASS\n";
     return 0;

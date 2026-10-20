@@ -148,10 +148,13 @@ static const RibbonCmd kCmds[] = {
     { "sk_move",           "Move",           "move_ent",        "Sketch",   "Sketch Tools",    false, nullptr,          false },
 
     // --- Group: Relations ---
-    // C42: sk_relations wired (Add Relation popup over the selection). sk_fix greyed — Fix is
-    // reachable via that popup (single entity selected); a dedicated handler can enable it later.
+    // sk_relations opens the Add Relation popup over the selection (sketch entities plus picked
+    // model vertices/edges/faces); sk_fix pins the selection; sk_display_relations opens the
+    // Display/Delete Relations list; sk_fully_define runs the engine sketch_fully_define op.
     { "sk_relations",      "Relations",      "relations",       "Sketch",   "Relations",       true,  nullptr,          false },
     { "sk_fix",            "Fix",            "fix",             "Sketch",   "Relations",       false, nullptr,          false },
+    { "sk_display_relations","Show Relations","display_relations","Sketch", "Relations",       false, nullptr,          false },
+    { "sk_fully_define",   "Fully Define",   "fully_define",    "Sketch",   "Relations",       true,  nullptr,          false },
 
     // =========================================================================
     // Pseudo-tab: "Sketch3D" — the 3D free-space sketcher's ribbon tool set. NOT one of
@@ -1000,7 +1003,7 @@ const RibbonCmd* getRibbonCmds(int& count) {
 }
 
 bool ribbonRowActive(int index) {
-    constexpr int n = (int)(sizeof(kCmds) / sizeof(kCmds[0]));
+    static constexpr int n = (int)(sizeof(kCmds) / sizeof(kCmds[0]));
     // The table is static, so resolve every row once: retired, or superseded by a later row with
     // the same tab + cmd_id.
     static const std::vector<char> active = [] {

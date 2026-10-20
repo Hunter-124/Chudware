@@ -1,0 +1,20 @@
+[Unit]
+Description=Chudware isolated tenant cell %i
+Requires=chudware-cell@%i.socket chudware-egress-broker@%i.socket
+After=chudware-egress-broker@%i.socket
+
+[Service]
+Type=simple
+Sockets=chudware-cell@%i.socket
+Environment=CHUDWARE_CELL_CONFIG=%h/.config/chudware/cell-runtime.json
+ExecStart=@WEB_HOME@/current/cell/bin/chudware-cell-launch %i
+MemoryMax=8G
+MemorySwapMax=0
+CPUQuota=200%
+TasksMax=512
+IOWeight=50
+NoNewPrivileges=yes
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=30
+Restart=no

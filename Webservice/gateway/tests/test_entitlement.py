@@ -386,3 +386,35 @@ def test_revoked_device_requires_new_key() -> None:
     new_subject = entitlement._subject_for(email, "Laptop", new_public)
     assert new_subject != old_subject
     assert _raw_public(new_key) != _raw_public(old_key)
+
+def test_staging_rejects_production_signer_and_signed_refusals(signing_key, monkeypatch, tmp_path):
+    production_refusal = entitlement._signed_refusal("fixture denial", "n" * 32, now=1000)
+    staging_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    monkeypatch.setenv("CHUDWARE_DEPLOY_ENV", "staging")
+    monkeypatch.setenv("CHUDWARE_STAGING_ENTITLEMENT_PUBLIC_KEY", _raw_public(staging_key).hex())
+    with pytest.raises(RuntimeError):
+        entitlement._load_private_key()
+    with pytest.raises(HTTPException) as refused:
+        entitlement.verify_refusal(production_refusal, "n" * 32, 1000)
+    assert refused.value.status_code == 401
+    path = tmp_path / "staging.key"
+    path.write_bytes(bytes(range(32)))
+    path.chmod(0o600)
+    monkeypatch.setenv("CHUDWARE_ENTITLEMENT_KEY_PATH", str(path))
+    staging_refusal = entitlement._signed_refusal("fixture denial", "n" * 32, now=1000)
+    assert entitlement.verify_refusal(staging_refusal, "n" * 32, 1000) == "fixture denial"
+    monkeypatch.setenv("CHUDWARE_DEPLOY_ENV", "prod")
+    with pytest.raises(HTTPException) as refused:
+        entitlement.verify_refusal(staging_refusal, "n" * 32, 1000)
+    assert refused.value.status_code == 401
+
+
+@pytest.mark.parametrize("configuration", ["missing", "production-root"])
+def test_staging_cannot_share_production_entitlement_authority(signing_key, monkeypatch, configuration):
+    monkeypatch.setenv("CHUDWARE_DEPLOY_ENV", "staging")
+    if configuration == "missing":
+        monkeypatch.delenv("CHUDWARE_STAGING_ENTITLEMENT_PUBLIC_KEY", raising=False)
+    else:
+        monkeypatch.setenv("CHUDWARE_STAGING_ENTITLEMENT_PUBLIC_KEY", _raw_public(signing_key).hex())
+    with pytest.raises(RuntimeError):
+        entitlement._load_private_key()

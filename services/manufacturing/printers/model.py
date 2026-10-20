@@ -81,6 +81,44 @@ class AuthorizationRequired(AdapterError):
     pass
 
 
+def _address_class(host: str) -> str:
+    """Mirror transport_tcp.cpp's commissioned address classes, including mapped IPv4."""
+    address = ipaddress.ip_address(host.split("%", 1)[0])
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.ipv4_mapped is not None:
+            return _address_class(str(address.ipv4_mapped))
+        if address.is_unspecified or address.is_multicast:
+            return "invalid"
+        if address.is_loopback:
+            return "loopback"
+        if address in ipaddress.ip_network("fc00::/7") or address in ipaddress.ip_network("fe80::/10"):
+            return "local"
+        return "public"
+    first, second, *_ = address.packed
+    if first == 0 or first >= 224:
+        return "invalid"
+    if first == 127:
+        return "loopback"
+    if (first == 10 or (first == 172 and 16 <= second <= 31)
+            or (first == 192 and second == 168) or (first == 169 and second == 254)):
+        return "local"
+    return "public"
+
+
+def _commissioned_address_class(host: str, value: str | None) -> str:
+    if value is not None and value not in {"loopback", "local", "public"}:
+        raise ConfigurationError("printer address_class must be loopback, local, or public")
+    try:
+        literal_class = _address_class(host)
+    except ValueError:
+        if value is None:
+            raise ConfigurationError("commissioned DNS printer host requires address_class")
+        return value
+    if literal_class == "invalid" or (value is not None and value != literal_class):
+        raise ConfigurationError("printer IP does not match commissioned address_class")
+    return literal_class
+
+
 @dataclass(frozen=True, slots=True)
 class AuthConfig:
     """Authentication is always selected explicitly; there is no auto-detection."""
@@ -114,6 +152,7 @@ class EndpointConfig:
     origin: Literal["live", "virtual", "replay"] = "live"
     timeout_s: float = 2.0
     telemetry_ttl_ms: int = 5_000
+    address_class: Literal["loopback", "local", "public"] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.base_url, str):
@@ -129,6 +168,7 @@ class EndpointConfig:
             raise ConfigurationError("printer base_url must be an absolute http(s) URL")
         if parsed.username or parsed.password:
             raise ConfigurationError("credentials are forbidden in printer base_url")
+        _commissioned_address_class(parsed.hostname, self.address_class)
         if self.timeout_s <= 0:
             raise ConfigurationError("timeout_s must be positive")
         if self.telemetry_ttl_ms <= 0:

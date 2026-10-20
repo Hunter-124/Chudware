@@ -38,10 +38,18 @@ Rules enforced over the policy scope:
   unsafe-generic-linux-routing a Linux job can land on the production host
   billable-artifact-retention an upload has no short ``retention-days``
   powershell-non-ascii      a PowerShell step body carries a non-ASCII byte
+  incompatible-windows-shell a Windows run step can dispatch to an unavailable shell
   missing-jobs              the document declares no jobs
   missing-job-timeout       a job has no usable ``timeout-minutes:``
   banned-permission         ``permissions.administration`` anywhere
   invalid-permission-scope  a permission key GitHub does not accept
+  runner-trust-boundary     a job lacks an explicit isolated self-hosted group
+  protected-job-guard       persistent jobs lack the protected ref/event guard
+  protected-job-environment persistent jobs bypass protected environment approval
+  untrusted-secret-delivery branch/PR jobs can receive secrets or environment secrets
+  untrusted-write-permission branch/PR jobs have a write-capable GITHUB_TOKEN
+  protected-untrusted-input persistent jobs consume artifacts/caches or arbitrary refs
+  reusable-secret-boundary  reusable jobs inherit secrets or bypass guarded local calls
 
 Dependency-free by design. The gate has to run on a bare CPython before any
 package manager is available, so it ships a small indentation-driven parser
@@ -83,6 +91,7 @@ REQUIRED_WORKFLOWS: Tuple[str, ...] = (
     # Commercial payload preparation must remain self-hosted, bounded, and stop at
     # the authenticated offline-owner signing boundary.
     "release.yml",
+    "release-prepare.yml",
     # The continuous-deployment actuator. Without it a green master commit is
     # never promoted, which is exactly how production served a fifteen-day-old
     # web bundle behind a fully green tree. It is required rather than
@@ -96,7 +105,11 @@ REQUIRED_WORKFLOWS: Tuple[str, ...] = (
 # This gate polices itself too.
 SELF_WORKFLOW = "ci-workflow-policy.yml"
 
-POLICY_WORKFLOWS: Tuple[str, ...] = REQUIRED_WORKFLOWS + (SELF_WORKFLOW,)
+POLICY_WORKFLOWS: Tuple[str, ...] = REQUIRED_WORKFLOWS + (
+    SELF_WORKFLOW, "nightly-release.yml", "runner-provision.yml",
+    "chudcode-runtime-windows-build.yml", "stripe-sandbox.yml",
+    "site-build.yml", "prod-external-watch.yml",
+)
 
 WORKFLOW_DIR = Path(".github") / "workflows"
 
@@ -179,12 +192,6 @@ LINUX_ENDPOINT_LABELS = frozenset(
     {"cc-linux-build", "cc-linux-livingroom", "cc-linux-hunter"}
 )
 DEDICATED_RUNNER_EXCEPTIONS: Dict[Tuple[str, str], frozenset] = {
-    # Publishing a release IS the single-side-effect operation `cc-artifact-host`
-    # exists for: it uploads the built artifacts to R2 and notifies the gateway,
-    # so it must run on the one endpoint that holds those credentials and must
-    # NOT be spread across the generic pool. The build legs that produce those
-    # artifacts are separate jobs on the build labels and are still policed.
-    ("release.yml", "publish"): frozenset({"cc-artifact-host"}),
     # External health watch. The whole point is that it runs OFF the box it is
     # watching: an alerting job on livingroom-pc cannot report that
     # livingroom-pc is down. cloudcastle-server is the only always-on Linux
@@ -204,6 +211,22 @@ DEDICATED_RUNNER_EXCEPTIONS: Dict[Tuple[str, str], frozenset] = {
 # cancelled; later pushes and tags must queue.
 COHERENT_RELEASE_WORKFLOWS = frozenset({"native-build.yml"})
 PR_ONLY_CANCEL_EXPRESSION = "${{ github.event_name == 'pull_request' }}"
+
+# Groups are free self-hosted capacity, not GitHub-hosted larger runners.
+# Group membership and exact workflow/ref authorization are enforced outside
+# the checkout; this verifier cannot attest to those operational controls.
+UNTRUSTED_RUNNER_GROUP = "chudware-untrusted-ephemeral"
+TRUSTED_RUNNER_GROUP = "chudware-trusted-protected"
+PROTECTED_ENVIRONMENTS = frozenset({
+    "chudware-release-protected", "chudware-control-protected",
+    "chudware-maintenance-protected",
+})
+TRUSTED_JOB_GUARD = (
+    "github.ref_protected && "
+    "(github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && "
+    "(github.event_name == 'push' || github.event_name == 'workflow_dispatch' || "
+    "github.event_name == 'schedule')"
+)
 
 PERMISSION_VALUES = frozenset({"read", "write", "none"})
 PERMISSION_SHORTHANDS = frozenset({"read-all", "write-all"})
@@ -845,9 +868,9 @@ def resolve_runs_on(job: Mapping) -> Tuple[List[List[str]], Optional[str]]:
     value = job.get("runs-on")
 
     if isinstance(value, Mapping):
-        # ``runs-on: {group: ..., labels: ...}`` addresses a runner group, which
-        # is how larger (always-billed) runners are requested.
-        return [], "'runs-on' uses the runner-group mapping form"
+        if set(value) != {"group", "labels"}:
+            return [], "'runs-on' must name a group and explicit self-hosted labels"
+        value = value.get("labels")
 
     if isinstance(value, str):
         ref = MATRIX_REF_RE.match(value.strip())
@@ -899,8 +922,9 @@ def scalar_runs_on(job: Mapping) -> Optional[str]:
     because that is the same one-label routing wearing a matrix.
     """
     value = job.get("runs-on")
-    if isinstance(value, Sequence) or isinstance(value, Mapping) or value is None:
-        # Arrays are the contract; mappings and absence are reported elsewhere.
+    if isinstance(value, Mapping):
+        value = value.get("labels")
+    if isinstance(value, Sequence) or value is None:
         return None
     text = str(value).strip()
     ref = MATRIX_REF_RE.match(text)
@@ -918,11 +942,275 @@ def scalar_runs_on(job: Mapping) -> Optional[str]:
         )
     return None
 
+def _condition_parts(expression: str, operator: str) -> Tuple[List[str], bool]:
+    """Split a condition at top-level operators, respecting quotes and nesting."""
+    parts: List[str] = []
+    depth = 0
+    start = 0
+    i = 0
+    outer_end = -1
+    while i < len(expression):
+        character = expression[i]
+        if character in "'\"":
+            i = _scan_quoted(expression, i)
+            continue
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth < 0:
+                raise WorkflowParseError("unbalanced condition")
+            if depth == 0 and outer_end < 0:
+                outer_end = i
+        elif depth == 0 and expression.startswith(operator, i):
+            parts.append(expression[start:i].strip())
+            i += len(operator)
+            start = i
+            continue
+        i += 1
+    if depth:
+        raise WorkflowParseError("unbalanced condition")
+    parts.append(expression[start:].strip())
+    return parts, expression.startswith("(") and outer_end == len(expression) - 1
+
+
+def _condition_on_windows(value: Any, row: Dict[str, Any]) -> Optional[bool]:
+    """Prove true/false for the guard subset in use; unknown stays executable.
+
+    This is deliberately not a GitHub expression interpreter. Unknown contexts,
+    functions and syntax cannot prove a step excluded from Windows. Boolean
+    structure is retained so an OR bypass never masquerades as an OS guard.
+    """
+    expression = str(value).strip()
+    if expression.startswith("${{") and expression.endswith("}}"):
+        expression = expression[3:-2].strip()
+    try:
+        parts, enclosed = _condition_parts(expression, "||")
+        if len(parts) > 1:
+            values = [_condition_on_windows(part, row) for part in parts]
+            return True if True in values else (False if all(v is False for v in values) else None)
+        parts, enclosed = _condition_parts(expression, "&&")
+        if len(parts) > 1:
+            values = [_condition_on_windows(part, row) for part in parts]
+            return False if False in values else (True if all(v is True for v in values) else None)
+        if enclosed:
+            return _condition_on_windows(expression[1:-1], row)
+        if expression.startswith("!") and not expression.startswith("!="):
+            result = _condition_on_windows(expression[1:], row)
+            return None if result is None else not result
+
+        unknown = object()
+
+        def operand(text: str) -> Any:
+            if text == "runner.os":
+                return "Windows"
+            match = re.fullmatch(r"matrix\.([A-Za-z0-9_-]+)", text)
+            if match:
+                result = row.get(match.group(1), unknown)
+                return unknown if (
+                    isinstance(result, (Mapping, Sequence))
+                    or isinstance(result, str) and EXPRESSION_RE.search(result)
+                ) else result
+            if text.startswith("'") and _scan_quoted(text, 0) == len(text):
+                return text[1:-1].replace("''", "'")
+            if text.lower() in ("true", "false"):
+                return text.lower() == "true"
+            return unknown
+
+        for operator in ("==", "!="):
+            parts, _ = _condition_parts(expression, operator)
+            if len(parts) == 2:
+                left, right = (operand(part) for part in parts)
+                if left is unknown or right is unknown or type(left) is not type(right):
+                    return None
+                equal = left.lower() == right.lower() if isinstance(left, str) else left == right
+                return equal if operator == "==" else not equal
+            if len(parts) > 2:
+                return None
+        result = operand(expression)
+        if result is unknown:
+            return None
+        return bool(result)
+    except WorkflowParseError:
+        return None
+
+
+def _windows_matrix_contexts(job: Mapping) -> Iterator[Dict[str, Any]]:
+    """Retain include-row correlations; unresolved OS labels may mean Windows."""
+    strategy = job.get("strategy")
+    matrix = strategy.get("matrix") if isinstance(strategy, Mapping) else None
+    include = matrix.get("include") if isinstance(matrix, Mapping) else None
+    if isinstance(include, Sequence) and not (set(matrix) - {"include", "exclude"}):
+        rows = [dict(row) for row in include if isinstance(row, Mapping)]
+    else:
+        # Cartesian/dynamic matrices remain conservative. Singleton axes are
+        # known, but multi-value axes cannot prove a matrix-only guard false.
+        rows = [{
+            str(key): values[0]
+            for key in matrix if key not in ("include", "exclude")
+            if (values := _matrix_values(job, key)) is not None and len(values) == 1
+        }] if isinstance(matrix, Mapping) else [{}]
+    for row in rows:
+        routed_job = job
+        if isinstance(include, Sequence) and not (set(matrix) - {"include", "exclude"}):
+            routed_job = Mapping()
+            routed_job.update(job)
+            row_matrix = Mapping()
+            row_include = Sequence()
+            row_mapping = Mapping()
+            row_mapping.update(row)
+            row_include.append(row_mapping)
+            row_matrix["include"] = row_include
+            row_strategy = Mapping()
+            row_strategy["matrix"] = row_matrix
+            routed_job["strategy"] = row_strategy
+        candidates, _ = resolve_runs_on(routed_job)
+        if not candidates or any(
+            "windows" in {label.strip().lower() for label in labels}
+            or not ({"linux", "macos"} & {label.strip().lower() for label in labels})
+            for labels in candidates
+        ):
+            yield row
+
+
+def _default_run_shell(mapping: Mapping) -> Any:
+    defaults = mapping.get("defaults")
+    run = defaults.get("run") if isinstance(defaults, Mapping) else None
+    return run.get("shell") if isinstance(run, Mapping) else None
+
+
 
 def _coherent_cancel_is_safe(value: Any) -> bool:
     """Only no cancellation, literal false, or the exact PR-only guard is safe."""
     rendered = str(value).strip()
     return rendered.lower() in ("", "false", "none") or rendered == PR_ONLY_CANCEL_EXPRESSION
+
+
+def has_trusted_job_guard(value: Any) -> bool:
+    """Accept the canonical guard, optionally AND a fully enclosed condition.
+
+    Do not search for guard tokens: ``guard || true`` is not a guard. This
+    conservative grammar keeps the policy dependency-free and fail-closed.
+    """
+    expression = str(value or "").strip()
+    if expression.startswith("${{") and expression.endswith("}}"):
+        expression = expression[3:-2].strip()
+    if expression == TRUSTED_JOB_GUARD:
+        return True
+    prefix = "(" + TRUSTED_JOB_GUARD + ") && "
+    if not expression.startswith(prefix):
+        return False
+    remainder = expression[len(prefix):].strip()
+    if not remainder.startswith("("):
+        return False
+    depth = 0
+    i = 0
+    while i < len(remainder):
+        character = remainder[i]
+        if character in "'\"":
+            try:
+                i = _scan_quoted(remainder, i)
+            except WorkflowParseError:
+                return False
+            continue
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return i == len(remainder) - 1
+            if depth < 0:
+                return False
+        i += 1
+    return False
+
+
+def _scalar_values(node: Any) -> Iterator[str]:
+    if isinstance(node, Mapping):
+        for value in node.values():
+            yield from _scalar_values(value)
+    elif isinstance(node, Sequence):
+        for value in node:
+            yield from _scalar_values(value)
+    else:
+        yield str(node)
+
+
+def runner_boundary_findings(
+    document: Mapping, job: Mapping, job_id: str, relpath: str,
+    root: Optional[Path],
+) -> List[Finding]:
+    """Check execution/secret boundaries; never downgrade these to advisory."""
+    findings: List[Finding] = []
+
+    def add(rule: str, message: str, key: str = "runs-on") -> None:
+        findings.append(Finding(rule, ERROR, relpath, job.line_of(key), message))
+
+    if "uses" in job:
+        target = str(job["uses"])
+        secrets = job.get("secrets")
+        if secrets == "inherit":
+            add("reusable-secret-boundary", "reusable jobs must pass named secrets, never inherit", "secrets")
+        if not target.startswith("./.github/workflows/"):
+            add("reusable-secret-boundary", "runner policy only admits checked local reusable workflows", "uses")
+        if secrets and not has_trusted_job_guard(job.get("if")):
+            add("reusable-secret-boundary", "secret-bearing reusable calls require the protected ref/event guard", "if")
+        if root is not None and isinstance(secrets, Mapping) and target.startswith("./"):
+            path = Path(root) / target[2:]
+            if path.is_file():
+                try:
+                    callee = parse_workflow(path.read_text(encoding="utf-8"))
+                except WorkflowParseError:
+                    return findings  # reported on the callee by the repository sweep
+                events = callee.get("on")
+                call = events.get("workflow_call") if isinstance(events, Mapping) else None
+                declared = call.get("secrets") if isinstance(call, Mapping) else None
+                undeclared = set(secrets) - (set(declared) if isinstance(declared, Mapping) else set())
+                if undeclared:
+                    add("reusable-secret-boundary", "callee does not declare secret(s): " + ", ".join(sorted(undeclared)), "secrets")
+        return findings
+
+    selector = job.get("runs-on")
+    group = selector.get("group") if isinstance(selector, Mapping) else None
+    if group not in (UNTRUSTED_RUNNER_GROUP, TRUSTED_RUNNER_GROUP):
+        add("runner-trust-boundary", "job " + repr(job_id) + " must select a literal isolated self-hosted runner group")
+        return findings
+    if group == UNTRUSTED_RUNNER_GROUP:
+        values = list(_scalar_values(document.get("env"))) + list(_scalar_values(job))
+        if any(re.search(r"\$\{\{[^}]*\bsecrets(?:\.|\[)", value) for value in values) or "secrets" in job or "environment" in job:
+            add("untrusted-secret-delivery", "disposable branch/PR jobs must not receive secrets or select an environment", "environment")
+        permissions = job.get("permissions", document.get("permissions"))
+        if permissions == "write-all" or (
+            isinstance(permissions, Mapping) and any(value == "write" for value in permissions.values())
+        ):
+            add("untrusted-write-permission", "disposable branch/PR jobs require a read-only GITHUB_TOKEN", "permissions")
+        return findings
+
+    if not has_trusted_job_guard(job.get("if")):
+        add("protected-job-guard", "persistent jobs require the canonical protected ref/event guard", "if")
+    if set(_triggers(document)) & {"pull_request", "pull_request_target", "workflow_run"}:
+        add("protected-job-guard", "PR and artifact-triggered workflows may not target persistent protected runners", "if")
+    environment = job.get("environment")
+    name = environment.get("name") if isinstance(environment, Mapping) else environment
+    if not isinstance(name, str) or name not in PROTECTED_ENVIRONMENTS:
+        add("protected-job-environment", "persistent jobs must select a literal protected environment", "environment")
+    steps = job.get("steps")
+    if isinstance(steps, Sequence):
+        for step in steps:
+            if not isinstance(step, Mapping):
+                continue
+            action = str(step.get("uses", "")).split("@", 1)[0].lower()
+            if action in ("actions/download-artifact", "actions/cache") or action.startswith("actions/cache/"):
+                add("protected-untrusted-input", "protected jobs may not consume branch/PR Actions artifacts or caches", "steps")
+            if action == "actions/checkout":
+                options = step.get("with")
+                if isinstance(options, Mapping):
+                    ref = options.get("ref")
+                    if ref is not None and str(ref).strip() != "${{ github.sha }}":
+                        add("protected-untrusted-input", "protected checkout must use this guarded event commit, not an arbitrary ref", "steps")
+                    if options.get("repository") is not None:
+                        add("protected-untrusted-input", "protected checkout must not substitute an external repository", "steps")
+    return findings
 
 
 def check_document(
@@ -1120,6 +1408,7 @@ def check_document(
             add("missing-jobs", job_line, "job {0!r} is not a mapping".format(job_id))
             continue
         is_reusable_call = "uses" in job
+        findings.extend(runner_boundary_findings(document, job, str(job_id), relpath, root))
 
         # -- zero-spend runner routing --------------------------------------
         # Everything below exists because this repository is private and
@@ -1129,6 +1418,32 @@ def check_document(
         if not is_reusable_call:
             runs_on_line = job.line_of("runs-on") or job_line
             candidates, unresolved = resolve_runs_on(job)
+            windows_rows = list(_windows_matrix_contexts(job))
+            steps = job.get("steps")
+            default_shell = _default_run_shell(job)
+            if default_shell is None:
+                default_shell = _default_run_shell(document)
+            if isinstance(steps, Sequence):
+                for step in steps:
+                    if not isinstance(step, Mapping) or "run" not in step:
+                        continue
+                    shell = step.get("shell", default_shell)
+                    if shell == "powershell":
+                        continue
+                    if any(
+                        _condition_on_windows(step.get("if", "true"), row) is not False
+                        for row in windows_rows
+                    ):
+                        add(
+                            "incompatible-windows-shell",
+                            step.line_of("shell") if "shell" in step else step.line_of("run"),
+                            "job {0!r} can execute a run step on Windows with shell {1!r}; "
+                            "set shell: powershell (directly or in defaults.run.shell), or "
+                            "exclude Windows with a checked OS/matrix guard. These workers "
+                            "have Windows PowerShell 5.1, no pwsh, and a bash shim that can "
+                            "exit successfully without executing the script. An omitted shell "
+                            "does not explicitly select the supported interpreter.".format(job_id, shell),
+                        )
             if "runs-on" not in job:
                 add(
                     "missing-runs-on",

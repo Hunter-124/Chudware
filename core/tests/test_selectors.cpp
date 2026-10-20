@@ -19,16 +19,28 @@
 
 #include <cmath>
 #include <map>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include <Eigen/Dense>
 #include <nlohmann/json.hpp>
 
+#include <Bnd_Box.hxx>
+#include <BRepBndLib.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
+#include <BRepPrimAPI_MakeCone.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRepPrimAPI_MakeSphere.hxx>
+#include <BRepPrimAPI_MakeTorus.hxx>
+#include <BRep_Builder.hxx>
+#include <TopAbs.hxx>
+#include <TopExp.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
+#include <TopoDS_Compound.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 #include <gp_Ax2.hxx>
@@ -659,4 +671,140 @@ TEST_CASE("B11 oblique face: side is null when rep_dir is not axis-aligned") {
     json sel = make_selector(t);
     CHECK(sel["normal"].is_array());
     CHECK(sel["side"].is_null());  // contract: null for oblique faces
+}
+
+// B12. A pick must retain every field of the explicitly enumerated descriptor, not
+// merely resolve to something nearby. Include detached curved bodies so their normals
+// depend on the WHOLE compound's bbox, and reverse topology to exercise signed normals
+// and cylinder concavity. Sparse owners also pin the zero-based descriptor owner map.
+TEST_CASE("B12 face picks exactly match explicit descriptors across analytic surfaces") {
+    const gp_Ax2 cylinder_axis(gp_Pnt(40, 20, 10), gp_Dir(1, 2, 3));
+    const gp_Ax2 torus_axis(gp_Pnt(5, -40, 12), gp_Dir(1, 1, 2));
+    std::vector<std::pair<std::string, TopoDS_Shape>> fixtures = {
+        {"plane", geom::make_box(20, 10, 6)},
+        {"cylinder", BRepPrimAPI_MakeCylinder(cylinder_axis, 5, 12).Shape()},
+        {"cone", BRepPrimAPI_MakeCone(7, 3, 14).Shape()},
+        {"sphere", BRepPrimAPI_MakeSphere(gp_Pnt(-25, 15, 8), 6).Shape()},
+        {"torus", BRepPrimAPI_MakeTorus(torus_axis, 9, 2).Shape()},
+    };
+    BRep_Builder builder;
+    TopoDS_Compound compound;
+    builder.MakeCompound(compound);
+    for (const auto& fixture : fixtures) builder.Add(compound, fixture.second);
+    fixtures.emplace_back("mixed", compound);
+
+    for (const auto& fixture : fixtures) {
+        for (bool reversed : {false, true}) {
+            CAPTURE(fixture.first);
+            CAPTURE(reversed);
+            const TopoDS_Shape shape = reversed ? fixture.second.Reversed() : fixture.second;
+            const auto plain = chudware::doc::describe_faces(shape);
+            REQUIRE_FALSE(plain.empty());
+            std::map<int, std::string> owners;
+            for (std::size_t i = 0; i < plain.size(); i += 2)
+                owners.emplace(static_cast<int>(i), "feature_" + std::to_string(i));
+            const auto owned = chudware::doc::describe_faces(shape, owners);
+            REQUIRE(owned.size() == plain.size());
+            bool found_named_surface = fixture.first == "mixed";
+            for (std::size_t i = 0; i < plain.size(); ++i) {
+                CAPTURE(i);
+                CHECK(plain[i].index == static_cast<int>(i));
+                CHECK(plain[i].hint_index == static_cast<int>(i));
+                if (plain[i].surf == fixture.first) found_named_surface = true;
+                const int topo_id = static_cast<int>(i) + 1;
+                const auto pick = chudware::doc::make_pick_selector(
+                    shape, "face", topo_id, std::nullopt);
+                CHECK(pick.dump() == make_selector(plain[i]).dump());
+                const auto owner = owners.find(static_cast<int>(i));
+                const std::optional<std::string> expected_owner =
+                    owner == owners.end() ? std::nullopt : std::optional<std::string>(owner->second);
+                CHECK(owned[i].owner == expected_owner);
+                const auto owned_pick = chudware::doc::make_pick_selector(
+                    shape, "face", topo_id, expected_owner);
+                CHECK(owned_pick.dump() == make_selector(owned[i]).dump());
+                auto override_info = plain[i];
+                override_info.owner = "explicit_owner";
+                CHECK(chudware::doc::make_pick_selector(
+                          shape, "face", topo_id, std::string("explicit_owner")).dump() ==
+                      make_selector(override_info).dump());
+
+                if (fixture.first == "mixed" &&
+                    (plain[i].surf == "sphere" || plain[i].surf == "torus")) {
+                    // Independent whole-shape bbox oracle: a selected face's own bbox
+                    // would give a different (often degenerate) representative normal.
+                    Bnd_Box bounds;
+                    BRepBndLib::Add(shape, bounds);
+                    double x0, y0, z0, x1, y1, z1;
+                    bounds.Get(x0, y0, z0, x1, y1, z1);
+                    const Eigen::Vector3d center((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2);
+                    TopoInfo expected = plain[i];
+                    expected.rep_dir = (plain[i].centroid - center).normalized();
+                    CHECK(pick["normal"] == make_selector(expected)["normal"]);
+                    CHECK_FALSE(pick["normal"].is_null());
+                }
+            }
+            CHECK(found_named_surface);
+        }
+    }
+}
+
+TEST_CASE("B13 reversing a face pick retains the descriptor orientation semantics") {
+    const TopoDS_Shape box = geom::make_box(20, 10, 6);
+    const auto forward = chudware::doc::describe_faces(box);
+    const auto reverse = chudware::doc::describe_faces(box.Reversed());
+    REQUIRE(forward.size() == reverse.size());
+    for (std::size_t i = 0; i < forward.size(); ++i) {
+        REQUIRE(forward[i].axis.has_value());
+        REQUIRE(reverse[i].axis.has_value());
+        CHECK((*forward[i].axis + *reverse[i].axis).norm() == doctest::Approx(0).epsilon(1e-9));
+        const auto pick = chudware::doc::make_pick_selector(
+            box.Reversed(), "face", static_cast<int>(i) + 1, std::nullopt);
+        CHECK(pick.dump() == make_selector(reverse[i]).dump());
+        CHECK(pick["normal"] == pick["axis"]);
+    }
+
+    const TopoDS_Shape cylinder = BRepPrimAPI_MakeCylinder(5, 12).Shape();
+    const auto faces = chudware::doc::describe_faces(cylinder);
+    bool checked_cylinder = false;
+    for (const auto& face : faces) {
+        if (face.surf != "cylinder") continue;
+        checked_cylinder = true;
+        const auto pick = chudware::doc::make_pick_selector(
+            cylinder, "face", face.index + 1, std::nullopt);
+        const auto reversed = chudware::doc::make_pick_selector(
+            cylinder.Reversed(), "face", face.index + 1, std::nullopt);
+        CHECK(pick["concavity"] == "boss");
+        CHECK(reversed["concavity"] == "bore");
+        CHECK(pick["axis"] == reversed["axis"]);
+        CHECK(pick["normal"] == reversed["normal"]);
+        CHECK(pick["axis_point"] == reversed["axis_point"]);
+        CHECK(pick["area_or_len"] == reversed["area_or_len"]);
+    }
+    CHECK(checked_cylinder);
+}
+
+TEST_CASE("B14 invalid picks and null or empty shapes still return null") {
+    const TopoDS_Shape box = geom::make_box(20, 10, 6);
+    BRep_Builder builder;
+    TopoDS_Compound empty;
+    builder.MakeCompound(empty);
+    for (const auto& kind : {"face", "edge", "vertex"}) {
+        const TopAbs_ShapeEnum type = std::string(kind) == "face" ? TopAbs_FACE :
+                                     std::string(kind) == "edge" ? TopAbs_EDGE : TopAbs_VERTEX;
+        TopTools_IndexedMapOfShape topology;
+        TopExp::MapShapes(box, type, topology);
+        REQUIRE(topology.Extent() > 0);
+        CHECK(chudware::doc::make_pick_selector(
+                  box, kind, topology.Extent(), std::nullopt).is_object());
+        for (const int bad_id : {-1, 0, topology.Extent() + 1, std::numeric_limits<int>::max()}) {
+            CAPTURE(kind);
+            CAPTURE(bad_id);
+            CHECK(chudware::doc::make_pick_selector(
+                      box, kind, bad_id, std::string("ignored")).is_null());
+        }
+        CHECK(chudware::doc::make_pick_selector(
+                  TopoDS_Shape(), kind, 1, std::nullopt).is_null());
+        CHECK(chudware::doc::make_pick_selector(empty, kind, 1, std::nullopt).is_null());
+    }
+    CHECK(chudware::doc::make_pick_selector(box, "unknown", 1, std::nullopt).is_null());
 }

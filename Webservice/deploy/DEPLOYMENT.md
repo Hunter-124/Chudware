@@ -52,19 +52,34 @@ rules, verified 2026-09-02:
 
 ### Staging is loopback-only
 
-`chudware-gateway-staging.service` runs as a systemd user unit on the host and
-listens on `http://127.0.0.1:8310`, but it is **not publicly routed**:
-`staging.chudware.com` is absent from the tunnel ingress above and has no DNS
-record in the `chudware.com` zone. Reach it over loopback or an SSH tunnel. If a
-public staging hostname is added back, it must never be routed to port 8300. The
-staging gateway uses `~/chudware-web-staging`, PostgreSQL database
-`chudware_staging`, console-only mail, and Stripe test credentials (or no
-Stripe credentials). Its unit refuses to start if an `sk_live_` Stripe secret
-is present.
+The canonical staging unit belongs to the dedicated `chudware-staging` Unix
+account, with home `/var/lib/chudware-staging` and its own checkout/user manager.
+It listens on `127.0.0.1:8310`. `setup.sh staging`, `update.sh staging` and
+`CHUDWARE_DEPLOY_ENV=staging install_webd.sh` refuse the production account
+before mutation. Do not install staging into production's user manager.
 
-Production remains on port 8300 with data under `~/chudware-web-data` and
-database `chudware_prod`. Both gateways share application source and the webd
-engine, but never mutable gateway state or database credentials.
+Staging keeps state, workspace, bucket, browser bundle and customer release
+storage inside that account's `~/chudware-web-staging`. Its daemon unit is
+`chudware-hostd-staging`, with instance/socket `chudwareweb-staging`; it never
+loads production `webd.env`. Gateway and daemon hide `/home`; source/tooling
+must reside in the dedicated home. Production's desktop/MCP daemon is unchanged.
+
+The PostgreSQL login role and database must both be `chudware_staging`, with no
+production grants. Use independent session/OAuth/provider/publication credentials
+and a separate entitlement signing key. Set its 32-byte public half as 64 hex
+characters in `CHUDWARE_STAGING_ENTITLEMENT_PUBLIC_KEY`; the gateway refuses a
+production signing root. Product clients do not trust staging-issued licenses.
+Stripe is test-only or disabled. Staging administrator credentials cannot start
+production deployment jobs; journal reads select the staging unit. Retention
+operations enable only the selected environment and never stop the other timers.
+
+`cf_provision.py` removes its owned staging route/DNS by default and preserves
+unrelated tunnel configuration. `--publish-staging` is the deliberate opt-in,
+only after installed identity, filesystem/DB/IAM boundaries and ingress are
+verified. Any staged CDN uses the separate `chudware-releases-staging` bucket.
+These are source contracts, **not an attestation of current installed units or
+public tunnel state**. Local evidence and remaining release gates are in the
+[security audit](../../reports/security/2026-10-12/SECURITY_AUDIT.md).
 
 ## The `/admin` door
 
@@ -174,16 +189,20 @@ arithmetic says, and — unchanged from before — a *failed* promotion still
 leaves its partial tree behind for inspection.
 
 The set of `releases/*/deploy-manifest` files is the release index; there is no
-separate index file. Each is flat `key=value` (`schema=5`), and adds
-`release_id=` and `built_at_utc=` (strict `YYYY-MM-DDTHH:MM:SSZ`) to the
-existing `joint_sha256`, the `checkout_head` git rev it was built from, and the
-per-artifact digests. The verified `chud` binary, checked-in Chudcode artifact
-lock, `CHUDCODE-NOTICE`, and `CHUDCODE-THIRD-PARTY-NOTICES.txt` each have their
-own SHA-256 and participate in the joint hash. Rollback rechecks both the
-manifest digests and the notice hashes/provenance recorded in the lock before
-moving `current`. Advisor-enabled releases likewise hash the exact ONNX Runtime
-SONAME payload and four-file `polymesh-advisor/` package, so either model or
-agent-runtime changes produce a new joint release identifiable from disk alone.
+separate index file. Each is flat `key=value` (`schema=7`) with `release_id=`,
+`built_at_utc=` (strict `YYYY-MM-DDTHH:MM:SSZ`), `joint_sha256`, the
+`checkout_head` git rev it was built from, per-artifact digests, and
+`release_tree_sha256`: the path, mode, size and SHA-256 of every retained file
+except the manifest. The hostd unit and both captured gateway units are retained
+inside the release and hashed from those copies. Advisor-enabled releases hash
+the exact ONNX Runtime SONAME payload and `polymesh-advisor/` package.
+
+Manifests are written by the service account, so they are integrity records,
+not authorization. Rollback trusts a retained tree only when an operator-owned
+record `/var/lib/chudware-deployment-trust/<prod|staging>/<joint_sha256>` exists,
+contains exactly that release's `release_tree_sha256` plus LF, and the record
+and every parent directory are root-owned and not group/world writable.
+Releases with `schema=5` have no full-tree identity and cannot be rolled back.
 
 Release ids are `YYYYmmddTHHMMSSZ-<joint12>-<pid>`. The timestamp is UTC: it is
 what retention sorts on lexicographically, and a local-time stamp is
@@ -196,15 +215,17 @@ step:
 - `--list` prints the retained releases newest first and marks the one
   `current` points at.
 - Bare, or `--to <release-id>` (e.g.
-  `--to 20260822T171130Z-4f2a9c1d3b07-8241`), swaps `current` atomically to
-  that release, drains and restarts `chudware-hostd` through the same sequence
-  `install_webd.sh` uses, and rewrites `.webd-running-joint` to the restored
-  release's joint sha. The default target is the newest retained release that
-  is not already current.
+  `--to 20260822T171130Z-4f2a9c1d3b07-8241`), copies the named tree into a
+  new private `releases/<UTC>-rollback-*` snapshot without following links,
+  revalidates every file and the operator authorization there, and only then
+  executes, installs the hostd unit from, and points `current` at that snapshot.
+  It drains and restarts `chudware-hostd` through the same sequence
+  `install_webd.sh` uses and rewrites `.webd-running-joint`. The default target
+  is the newest authorized retained release that is not already current.
 - `--force` skips the bridge drain, for when production is already broken and
   waiting out `CHUDWARE_WEBD_RESTART_MAX_WAIT` protects nobody.
 - Exit 0 restored, 1 failure, 2 usage error or no rollback target available.
-- Retained-release validation checks the Linux binary and both notices against
+- Retained-release validation also checks the Linux binary and both notices against
   that release's artifact lock. Unavailable downloads for macOS or Windows
   do not make a verified Linux release unrestorable, and locks written before
   the x64-only matrix (which also list Linux ARM/macOS ARM) still verify. The
@@ -404,3 +425,44 @@ them; treat anything derived from the old token as compromised.
 **After rotation:** search the repo and git history for the old values before
 considering the incident closed; if this repo is ever made public, the
 history containing the old credentials must be purged or the repo re-created.
+
+## Browser execution cell deployment gate
+
+Linux browser execution uses per-workspace, socket-activated systemd user
+tenant cells, not the shared hostd. `install_webd.sh` stages the four cell/egress
+templates, stdlib launchers, worker source and authenticated offline worker venv
+under each release's `cell/` subtree (`cell/units/` holds the templates). Schema 7
+adds `cell_runtime_sha256` as the final joint-identity input, covering all sorted
+regular files in that subtree before computing `release_tree_sha256`. Thus
+cell-only changes trigger the same drain-aware promotion and rollback authorization.
+Runtime dependencies must come from the reviewed complete wheel lock and
+authenticated wheelhouse via `ensure_runtime`; incomplete inputs fail before
+live promotion. Select independently authenticated
+`CHUDWARE_BASE_PYTHON=/usr/bin/python3`; no repo/gateway venv is borrowed.
+Template installation never starts or restarts an existing cell.
+
+Before enabling admission, provision the private
+`~/.config/chudware/cell-runtime.json`, matching gateway and unit cells roots,
+exact workspace bases and optional exact provider/research egress host allowlist as described
+in RUNBOOK.md's **Linux browser tenant cells** section. OS interpreter/stdlib,
+bubblewrap, certificate roots and delegated cgroup controllers are operator
+integrity prerequisites. Cells clear the environment, hide host and gateway
+state, and actors receive only their own `/actor` mount; readonly Ask/Plan
+workspaces are enforced by mounts. Host CONNECT broker resolves and pins public
+unicast targets; direct cell networking is impossible. Research may reach any
+public destination on port 443 unless the optional exact-host allowlist restricts
+it. AI is BYOK-only, with no operator credentials or unsandboxed fallback.
+
+**Root-provisioned hard quotas for every workspace and every cell-state tree
+are mandatory before browser execution ships.** Upload accounting and IOWeight
+do not substitute for hard disk isolation. University/FUSE roots remain gated
+until equivalent quotas and no-symlink isolation are proven. There are no
+agent wall-clock or address-space caps; cgroup memory/CPU/task/IO limits apply.
+
+Required evidence: real-bubblewrap escape tests (absence-only skip), installed
+socket/template parity, effective cgroup limits, quota exhaustion isolation,
+principal revocation, actor ownership, persisted-cache warm reopen and a
+drain-aware retained-release rollback. Broker byte/idle limits bound abuse
+without terminating active long-running turns. Do not restore the browser
+surfaces solely because source tests pass; runtime/OS prerequisites are gates.
+

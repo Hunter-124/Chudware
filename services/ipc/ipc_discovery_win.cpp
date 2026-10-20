@@ -1,18 +1,16 @@
 // Windows implementation of daemon discovery/lifecycle (POSIX sibling:
-// ipc_discovery.cpp). WRITTEN ON LINUX, NEVER COMPILED HERE — unverified until
-// the manual checklist in docs/reference/PACKAGING_WINDOWS.md runs on a real box.
+// ipc_discovery.cpp).
 //
 // The function names stay transport-neutral on purpose:
 //   socketPath(key) -> \\.\pipe\chudware-hostd-<SID>-<key>   (a pipe NAME, not a file)
-//   lockPath(key)   -> Global\chudware-hostd-<SID>-<key>     (a named-MUTEX name)
+//   lockPath(key)   -> owner-protected state-directory lock file
 // so hostd/main.cpp and ipc_client.cpp compile unchanged on both platforms.
-//
-// The user SID in both names gives per-user isolation for free (pipe and mutex
-// namespaces are machine-global); the instance key keeps dev-tree and installed
-// daemons apart, exactly like the POSIX socket path scheme.
+// Pipe SID names isolate transport; singleton claims use private filesystem
+// state rather than a predictable public kernel-object namespace.
 #ifdef _WIN32
 
 #include "ipc_discovery.h"
+#include "ipc_private.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -119,15 +117,15 @@ std::string instanceKey(const std::string& hostdBin) {
 }
 
 std::string runtimeDir() {
-    // No runtime-file directory is needed on Windows (pipes and mutexes are
-    // kernel names, not files); alias to the state dir for any generic caller.
+    // Private filesystem state holds daemon and session-scoped GUI lock files.
     return stateDir();
 }
 
 std::string stateDir() {
-    if (const char* a = std::getenv("APPDATA"); a && *a)
-        return std::string(a) + "\\Chudware";
-    return "Chudware";  // last resort: relative to cwd (matches bootstrap fallback spirit)
+    const char* appdata = std::getenv("APPDATA");
+    if (!appdata || !*appdata) return "";
+    const std::string dir = std::string(appdata) + "\\Chudware";
+    return privateDir(dir) ? dir : std::string();
 }
 
 std::string socketPath(const std::string& key) {
@@ -139,23 +137,18 @@ std::string socketPath(const std::string& key) {
 }
 
 std::string lockPath(const std::string& key) {
-    // A named-mutex name, not a file path (see SingleInstance below). The
-    // "Global" prefix spans sessions, so two logons of the same user still
-    // share one daemon.
-    return "Global\\chudware-hostd-" + currentUserSid() + "-" + key;
+    const std::string dir = runtimeDir();
+    return dir.empty() ? "" : dir + "\\hostd-" + fnv1aHex(key) + ".lock";
 }
 
 std::string guiLockPath(const std::string& key) {
-    // "Local\" — NOT "Global\" like lockPath() — for two independent reasons:
-    //   1. Creating a name in the global namespace needs SeCreateGlobalPrivilege, which a plain
-    //      interactive user does not hold. The denial would come back as a CreateMutexW failure,
-    //      indistinguishable from "someone else has it", and the app would refuse to start at all.
-    //      The daemon can afford Global\ (it is a background service); a desktop window cannot.
-    //   2. The guard's whole job on losing is to RAISE the incumbent's window, and a window can
-    //      only be raised from inside its own interactive session — cross-session exclusion would
-    //      suppress the second session's window and have nothing to show for it.
-    // The SID stays for symmetry with lockPath()/socketPath() (and costs nothing).
-    return "Local\\chudware-gui-" + currentUserSid() + "-" + key;
+    // Preserve the GUI's per-interactive-session singleton, without a public
+    // named object another OS account can pre-create.
+    DWORD session = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &session)) return "";
+    const std::string dir = runtimeDir();
+    return dir.empty() ? "" : dir + "\\gui-" + std::to_string(session) +
+                                  "-" + fnv1aHex(key) + ".lock";
 }
 
 std::string resolveHostdBin(const std::string& hint) {
@@ -184,32 +177,31 @@ std::string resolveHostdBin(const std::string& hint) {
 #endif
 }
 
-// Named-mutex single instance. Like the POSIX flock, the claim evaporates on
-// process death (last handle close frees the name) — no stale state on disk.
+// Owner-protected file, opened without write/delete sharing. The live handle,
+// not file existence, is the claim, and process death releases it automatically.
 bool SingleInstance::acquire(const std::string& lockFile, std::string& err) {
     release();
-    HANDLE h = CreateMutexW(nullptr, /*initial owner*/ TRUE, widen(lockFile).c_str());
-    if (!h) {
-        err = "CreateMutexW " + lockFile + " " + lastErr("");
+    const auto path = std::filesystem::u8path(lockFile);
+    if (lockFile.empty() || !path.has_parent_path() ||
+        !privateDir(narrow(path.parent_path().native()))) {
+        err = "singleton requires a private user directory";
         return false;
     }
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        // Another daemon owns the name (we still got a handle; drop it).
-        CloseHandle(h);
-        err = "another instance holds " + lockFile;
+    FILE* file = privateFile(lockFile);
+    if (!file) {
+        err = "cannot acquire owner-private singleton " + lockFile;
         return false;
     }
-    h_ = h;
+    h_ = file;
     path_ = lockFile;
+    std::fprintf(file, "%lu\n", GetCurrentProcessId());
+    std::fflush(file);
     return true;
 }
 
 void SingleInstance::release() {
     if (h_) {
-        // No ReleaseMutex on purpose: the mutex EXISTENCE is the claim, and the
-        // name dies with the last handle. (An abandoned-mutex state is harmless
-        // here — nobody ever waits on it, they only test ERROR_ALREADY_EXISTS.)
-        CloseHandle((HANDLE)h_);
+        std::fclose(static_cast<FILE*>(h_));
         h_ = nullptr;
         path_.clear();
     }

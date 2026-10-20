@@ -502,7 +502,7 @@ def _outline_text(d: dict) -> str:
 
 
 # ---------------------------------------------------------------- A1: describe_sketch
-_DIM_CONSTRAINT_TYPES = {"distance", "angle", "radius", "diameter"}
+_DIM_CONSTRAINT_TYPES = {"distance", "length", "angle", "radius", "diameter", "arc_length"}
 
 
 def _sketch_authored_params(feat: Optional[dict]) -> dict:
@@ -597,12 +597,20 @@ def _sketch_digest(sketch: str, overview: dict, regions_resp: dict,
     dof = overview.get("dof", 0)
     over_ids = [k for k, v in statuses.items() if v == "over"]
     skipped = overview.get("skipped_constraints") or []
+    from services.mcp.ascii2d import sketch_design_intent
+    intent = sketch_design_intent(
+        authored.get("entities") or [], authored.get("constraints") or [],
+        health={**overview, "external_refs": authored.get("external_refs") or []})
     if status == "over" or over_ids:
         verdict = "Over-defined" + (f': conflicting entities {over_ids} — remove one constraint.'
                                     if over_ids else ' — remove a conflicting constraint.')
         fully_defined = False
-    elif status == "full" or dof == 0:
-        verdict = "Fully defined (dof 0) — every entity is pinned by relations + dimensions."
+    elif intent["pinned_only"]:
+        verdict = ("Pinned instead of constrained — replace profile fix pins with "
+                   "relations/driving dimensions, then sketch_fully_define.")
+        fully_defined = False
+    elif dof == 0 and not skipped:
+        verdict = "Fully defined (dof 0) — constrained parametrically, not pinned_only."
         fully_defined = True
     else:
         verdict = (f'Under-defined: {dof} degree(s) of freedom remain — add geometric relations '
@@ -625,7 +633,8 @@ def _sketch_digest(sketch: str, overview: dict, regions_resp: dict,
     return {"sketch": sketch, "plane": plane, "plane_ref": plane_name,
            "entities": entities, "relation_counts": relation_counts, "dimensions": dims,
            "regions": regions, "status": status, "dof": dof,
-           "fully_defined": fully_defined, "skipped_constraints": skipped, "verdict": verdict}
+           "fully_defined": fully_defined, "skipped_constraints": skipped, "verdict": verdict,
+           **intent}
 
 
 def _sketch_text(d: dict) -> str:
@@ -676,6 +685,7 @@ def _sketch_text(d: dict) -> str:
         lines.append("Regions: 0 closed loops")
 
     lines.append(d.get("verdict", ""))
+    lines.extend(f"Intent: {finding['message']}" for finding in d.get("findings") or [])
     return "\n".join(lines)
 
 
@@ -1759,8 +1769,11 @@ def sketch_health_text(d: dict) -> str:
     dof = d.get("dof", 0)
     status = d.get("status", "unknown")
     narration = d.get("dof_narration") or ""
-    if dof <= 0 and status == "full":
-        lines.append("DOF: 0 — fully constrained, ready to extrude")
+    if d.get("pinned_only"):
+        lines.append(f"DOF: {dof} — profile pinned instead of constrained; replace fix pins "
+                     "with relations/driving dimensions, then sketch_fully_define")
+    elif dof <= 0 and status == "full":
+        lines.append("DOF: 0 — fully constrained, not pinned_only")
     elif dof < 0 or status == "over":
         lines.append(f"DOF: {dof} — OVER-CONSTRAINED (conflicting constraints, see below)")
     else:
@@ -1785,8 +1798,10 @@ def sketch_health_text(d: dict) -> str:
     if schedule:
         lines.append("Schedule (apply in order):")
         lines.extend(_schedule_lines(schedule))
-    elif dof == 0 and status == "full":
+    elif dof == 0 and status == "full" and not d.get("pinned_only"):
         lines.append("Schedule: (nothing to do — sketch is fully constrained)")
+    for finding in d.get("findings") or []:
+        lines.append(f"Intent: {finding.get('message', '')}")
 
     return "\n".join(lines)
 
@@ -2194,15 +2209,61 @@ def register_gsl_tools(mcp: FastMCP) -> None:
           summary (closure status, DOF in words, conflicts/redundants, ordered schedule) —
           the feedback channel for no-vision local models. See sketch_health_text().
 
-        Sketch loop: edit -> sketch_health -> add the scheduled relations / run sketch_auto_constrain
-        -> sketch_health again until status is "full".
+        Sketch loop: draw roughly -> relations -> driving dimensions -> sketch_fully_define
+        -> check_sketch: dof 0 and not pinned_only. Fix-pinned profile entities are findings,
+        not design intent; fixed external construction references are legitimate.
         """
         try:
             d = _doc(doc_id)
             result = cb.call("sketch_health", {"doc_id": d, "sketch": sketch})
+            from services.mcp.ascii2d import live_sketch_design_intent
+            result.update(live_sketch_design_intent(d, sketch, result))
+            result["fully_defined"] = (
+                result.get("dof") == 0 and result.get("status") != "over"
+                and not result.get("conflicting") and not result.get("pinned_only")
+                and not result.get("skipped_constraints"))
             if text and result.get("ok"):
                 result["health_text"] = sketch_health_text(result)
             return _dumps(result)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def sketch_fully_define(sketch: str, relations: bool = True, dimensions: bool = True,
+                             anchor: str = "origin", entities: Optional[list[str]] = None,
+                             doc_id: Optional[str] = None) -> str:
+        """Finish a 2D sketch with editable geometric relations and driving dimensions, never fix pins.
+
+        Author design intent first (coincident/horizontal/vertical/tangent/equal/symmetric,
+        then critical dimensions); this engine op defines remaining freedom at the current
+        shape. relations/dimensions enable each pass; anchor="origin" adds positional intent,
+        anchor="none" leaves free placement. entities optionally limits the entity ids.
+        Returns exact relations_added/dimensions_added and solver health (dof/pinned_only).
+        A partial result is honest: inspect findings and remaining DOF instead of assuming
+        every curve can be fully defined. add_features already runs this after new sketches
+        and sketch_add_entity batches unless auto_define:false.
+        """
+        try:
+            d = _doc(doc_id)
+            op = {"op": "sketch_fully_define", "sketch": sketch, "relations": relations,
+                  "dimensions": dimensions, "anchor": anchor}
+            if entities is not None:
+                op["entities"] = entities
+            result = cb.call("doc_apply_ops", {"doc_id": d, "ops": [op]})
+            health = cb.call("sketch_health", {"doc_id": d, "sketch": sketch})
+            from services.mcp.ascii2d import live_sketch_design_intent, sketch_define_additions
+            health.update(live_sketch_design_intent(d, sketch, health))
+            tree = result.get("tree") or {}
+            feature = next((row for row in tree.get("features") or []
+                            if row.get("id") == sketch), {})
+            constraints = (feature.get("params") or {}).get("constraints") or []
+            failed = [row for row in (result.get("rebuild") or {}).get("feature_status") or []
+                      if not row.get("ok")]
+            return _dumps({"ok": not failed, "doc_id": d, "sketch": sketch,
+                           "revision": result.get("revision"), "health": health,
+                           "dof": health.get("dof"), "pinned_only": health["pinned_only"],
+                           **sketch_define_additions(result.get("id_map") or {}, 0, constraints),
+                           **({"failed_features": failed} if failed else {})})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

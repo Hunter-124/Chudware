@@ -33,8 +33,10 @@ filename and the binary's `--version` come from the same generated version heade
   uninstall runs the hash-checked native `chudware-uninstall-helper.exe`. It does **not** run
   `install.ps1` or any Python provisioning.
 - **Developer path (not used by the packaged installer)** — `services/installer/install.ps1`
-  provisions a managed Python 3.11 venv via `services/installer/provision.py` and registers
-  MCP clients; `services/installer/uninstall.ps1` only launches the registered OS uninstaller.
+  provisions a managed Python 3.11 venv only from a complete offline wheelhouse and
+  independently reviewed `vendor/python/RUNTIME_WHEELS.lock`, then registers MCP
+  clients. Missing identities fail closed; see [runtime prerequisites](BUILD_WINDOWS.md#reviewed-runtime-identity-prerequisite).
+  `services/installer/uninstall.ps1` only launches the registered OS uninstaller.
 
 ## Prerequisites on the Windows build host
 
@@ -55,7 +57,7 @@ From an x64 Native Tools PowerShell (mirrors the nightly Windows leg):
 cmake --preset windows-occt -DCHUDWARE_DEVELOPER_BUILD=OFF
 cmake --build --preset windows-occt
 ctest --test-dir build\windows-occt\core --output-on-failure
-cmake -S host -B host\build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_DEVELOPER_BUILD=OFF
+cmake -S host -B host\build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_LTO=ON -DCHUDWARE_DEVELOPER_BUILD=OFF
 cmake --build host\build-win
 ctest --test-dir host\build-win --output-on-failure
 $sidecars = Join-Path $env:TEMP "chudware-release-sidecars"
@@ -98,15 +100,20 @@ a successful Windows build or install.
 
 ## Engine-host daemon (chudware-hostd) — Windows validation checklist (Phase 6)
 
-The Windows backend of the shared engine daemon (named pipes, Job Objects, named-mutex
-single instance) is compiled by the `windows-occt` CI row (`chudware-hostd` is not
-POSIX-gated in `core/CMakeLists.txt`) and is a required release payload file, but its
-**runtime behaviour on Windows is not yet verified**: CI's Windows GUI smoke forces
-`CHUDWARE_ENGINE_DAEMON=0`. The sources are `services/ipc/ipc_transport_win.cpp`,
-`services/ipc/ipc_discovery_win.cpp`, `core/hostd/child_supervisor_win.cpp`, plus
-`#ifdef _WIN32` branches in `core/hostd/main.cpp`, `services/worker/engine_backend.cpp` and
-`services/mcp/daemon_bridge.py`. Every item below must pass on a real Windows 10/11 box
-before Windows daemon mode is considered shipped.
+The Windows backend uses named pipes, Job Objects and an owner-private exclusive
+file handle for single-instance admission; the retired public named mutex is not
+authority. It is a required release payload file. Isolated native Windows 11/MSVC
+developer execution and security/failure-path results are recorded in
+`reports/security/2026-10-12/release-hardening-remediation-evidence.json` and its
+`windows-native-evidence.zip` artifact. These results are not signed-installer,
+approved-private-runtime or GPU/desktop qualification. CI's daemon-disabled GUI
+smoke (`CHUDWARE_ENGINE_DAEMON=0`) does not supply that missing evidence.
+
+The platform sources include `services/ipc/ipc_transport_win.cpp`,
+`services/ipc/ipc_discovery_win.cpp`, `core/hostd/child_supervisor_win.cpp`,
+`core/hostd/worker_bridge.cpp` and `services/mcp/daemon_bridge.py`. The checklist
+below remains the installed-runtime acceptance gate, not a claim that every
+manual scenario has passed.
 Use an isolated instance key for this checklist and only terminate the daemon and
 children started for that validation. A running user session is not a test fixture.
 
@@ -124,7 +131,7 @@ children started for that validation. A running user session is not a test fixtu
       `chudware-hostd.exe --status` returns JSON with `state`, `pid`, `children`.
       Task Manager shows exactly ONE chudware-hostd.exe.
 - [ ] Start a second `chudware-hostd.exe --foreground`: it must exit 0 immediately
-      (named-mutex race lost), leaving the first serving.
+      (private file-lock claim lost), leaving the first serving.
 - [ ] `chudware-hostd.exe --stop` drains and exits the daemon; the pipe name disappears
       (`Test-Path \\.\pipe\chudware-hostd-<SID>-<key>` in PowerShell goes $false).
 - [ ] Idle exit: start the daemon with `CHUDWARE_HOSTD_LINGER_SECS=5`, connect nothing —

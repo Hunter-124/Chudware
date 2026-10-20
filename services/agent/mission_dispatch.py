@@ -1759,12 +1759,12 @@ class MissionDispatch:
                 # fallback.  Never leak it into the online Chudcode service.
                 options.pop("offline_provider", None)
 
-            parent_session = str(
-                options.get("session_id")
-                or options.get("chudcode_session_id")
-                or self.run_id
-                or f"mission-{node_id}"
-            )
+            from services.agent.online_turn import current_tool_session_id
+
+            # Shared governance outlives individual role turns. A nested host
+            # call belongs to its live child session, not the root dispatcher's
+            # original conversation (nor the shared run id).
+            parent_session = str(current_tool_session_id() or options.get("session_id") or "")
             previous_node = getattr(self, "_current_node_id", None)
             self._current_node_id = node_id or previous_node
             try:
@@ -2341,6 +2341,7 @@ class MissionDispatch:
                 mission_goals=list(goals or []) or None,
                 force=force,
                 on_event=self.on_event,
+                session_id=str(self.execution_options.get("session_id") or ""),
                 seat_heads=bool(seat_heads),
                 delegate_fn=_delegate if self.delegation_tree is not None else None,
             )
@@ -2351,6 +2352,7 @@ class MissionDispatch:
                     self.run_id,
                     create=False,
                     on_event=self.on_event,
+                    session_id=str(self.execution_options.get("session_id") or ""),
                 )
                 if self.org_chart is not None:
                     if self.org_chart.on_event is None:
@@ -2421,6 +2423,7 @@ class MissionDispatch:
                     board=self.coordination_board,
                     mission_goals=list(goals or []) or None,
                     on_event=self.on_event,
+                    session_id=str(self.execution_options.get("session_id") or ""),
                     delegate_fn=_delegate if self.delegation_tree is not None else None,
                     seat_heads=True,
                 )
@@ -2431,6 +2434,7 @@ class MissionDispatch:
                     self.run_id,
                     create=False,
                     on_event=self.on_event,
+                    session_id=str(self.execution_options.get("session_id") or ""),
                 )
                 if self.org_chart is not None and not self.corporate_agent_id:
                     self.corporate_agent_id = self.org_chart.director_id

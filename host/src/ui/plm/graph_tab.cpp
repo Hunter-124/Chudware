@@ -12,6 +12,8 @@
 
 #include "graph_force.h"
 #include "graph_thumbs.h"
+#include "graph_thumbnail.h"
+#include "../file_dialog.h"
 #include "graph_changes.h" // cad_graph_changes / watch overlay (the "what changed" rail)
 #include "plm_hub.h"
 
@@ -38,8 +40,6 @@
 #include "core/app_state.h"
 #include "core/async_rpc.h"
 #include "gl_compat.h"
-#include "miniz.h"
-#include "stb_image.h"
 #include "ui/anim.h"
 #include "ui/icons.h"
 #include "ui/metrics.h"
@@ -2963,26 +2963,6 @@ std::unordered_map<std::string, GraphThumb> &thumbCache() {
   return c;
 }
 
-bool readZipEntry(const std::string &zipPath, const char *entry,
-                  std::string &out) {
-  mz_zip_archive z;
-  std::memset(&z, 0, sizeof(z));
-  if (!mz_zip_reader_init_file(&z, zipPath.c_str(), 0))
-    return false;
-  bool ok = false;
-  int idx = mz_zip_reader_locate_file(&z, entry, nullptr, 0);
-  if (idx >= 0) {
-    size_t sz = 0;
-    void *p = mz_zip_reader_extract_to_heap(&z, (mz_uint)idx, &sz, 0);
-    if (p) {
-      out.assign(static_cast<const char *>(p), sz);
-      mz_free(p);
-      ok = true;
-    }
-  }
-  mz_zip_reader_end(&z);
-  return ok;
-}
 
 void freeAllGraphThumbs() {
   auto &c = thumbCache();
@@ -3003,6 +2983,16 @@ const GraphThumb *ensureGraphThumb(const std::string &absPath) {
   if (it != c.end()) {
     it->second.lastUse = ImGui::GetTime();
     return it->second.failed || !it->second.tex ? nullptr : &it->second;
+  }
+  constexpr size_t kThumbCap = 64;
+  while (c.size() >= kThumbCap) {
+    auto oldest = c.begin();
+    for (auto jt = c.begin(); jt != c.end(); ++jt)
+      if (jt->second.lastUse < oldest->second.lastUse)
+        oldest = jt;
+    if (oldest->second.tex)
+      glDeleteTextures(1, &oldest->second.tex);
+    c.erase(oldest);
   }
 
   GraphThumb slot;
@@ -3026,18 +3016,14 @@ const GraphThumb *ensureGraphThumb(const std::string &absPath) {
   }
 
   std::string png;
-  if (!readZipEntry(absPath, "thumbnail.png", png) || png.empty()) {
+  if (!graph_thumbnail::readPackageThumbnail(absPath, png)) {
     slot.failed = true;
     c[absPath] = std::move(slot);
     return nullptr;
   }
-  int w = 0, h = 0, n = 0;
-  unsigned char *px =
-      stbi_load_from_memory(reinterpret_cast<const unsigned char *>(png.data()),
-                            (int)png.size(), &w, &h, &n, 4);
-  if (!px || w <= 0 || h <= 0) {
-    if (px)
-      stbi_image_free(px);
+  int w = 0, h = 0;
+  unsigned char *px = graph_thumbnail::decodeThumbnailPng(png, w, h);
+  if (!px) {
     slot.failed = true;
     c[absPath] = std::move(slot);
     return nullptr;
@@ -3056,84 +3042,9 @@ const GraphThumb *ensureGraphThumb(const std::string &absPath) {
   slot.w = w;
   slot.h = h;
 
-  constexpr size_t kThumbCap = 64;
-  while (c.size() >= kThumbCap) {
-    auto oldest = c.begin();
-    for (auto jt = c.begin(); jt != c.end(); ++jt)
-      if (jt->second.lastUse < oldest->second.lastUse)
-        oldest = jt;
-    if (oldest->second.tex)
-      glDeleteTextures(1, &oldest->second.tex);
-    c.erase(oldest);
-  }
   auto [ins, ok] = c.emplace(absPath, std::move(slot));
   (void)ok;
   return &ins->second;
-}
-
-// Reveal a path in the OS file manager WITH the file highlighted/selected
-// (not just its parent folder). Falls back to opening the folder if the
-// select-aware call isn't available.
-void revealInFolder(const std::string &absPath) {
-  if (absPath.empty())
-    return;
-  std::error_code ec;
-  std::filesystem::path p(absPath);
-  const bool isFile = !std::filesystem::is_directory(p, ec);
-  std::filesystem::path folder = isFile ? p.parent_path() : p;
-  if (folder.empty())
-    return;
-#if defined(_WIN32)
-  // explorer /select,"C:\path\file" highlights the item in its folder.
-  std::string cmd =
-      isFile ? ("explorer /select,\"" + p.string() + "\"")
-             : ("explorer \"" + folder.string() + "\"");
-  (void)std::system(cmd.c_str());
-#elif defined(__APPLE__)
-  // open -R reveals + selects the file in Finder.
-  std::string cmd =
-      isFile ? ("open -R \"" + p.string() + "\" >/dev/null 2>&1 &")
-             : ("open \"" + folder.string() + "\" >/dev/null 2>&1 &");
-  (void)std::system(cmd.c_str());
-#else
-  // Linux: the freedesktop FileManager1 D-Bus API selects the item in the
-  // user's file manager (Nautilus/Dolphin/Nemo/etc.). Fall back to xdg-open
-  // on the folder if dbus-send isn't present.
-  if (isFile) {
-    std::string uri = "file://" + p.string();
-    std::string cmd =
-        "dbus-send --session --print-reply "
-        "--dest=org.freedesktop.FileManager1 "
-        "--type=method_call /org/freedesktop/FileManager1 "
-        "org.freedesktop.FileManager1.ShowItems "
-        "array:string:\"" +
-        uri + "\" string:\"\" >/dev/null 2>&1 || " +
-        "xdg-open \"" + folder.generic_string() + "\" >/dev/null 2>&1 &";
-    (void)std::system(cmd.c_str());
-  } else {
-    std::string cmd =
-        "xdg-open \"" + folder.generic_string() + "\" >/dev/null 2>&1 &";
-    (void)std::system(cmd.c_str());
-  }
-#endif
-}
-
-// Open a path with the OS default handler (file-manager double-click
-// semantics). Used for non-CAD project files (pdf/office/image) the app
-// cannot edit itself — st.requestOpenPath would route them at a doc parser.
-void openExternally(const std::string &absPath) {
-  if (absPath.empty())
-    return;
-#if defined(_WIN32)
-  std::string cmd = "start \"\" \"" + absPath + "\"";
-  (void)std::system(cmd.c_str());
-#elif defined(__APPLE__)
-  std::string cmd = "open \"" + absPath + "\" >/dev/null 2>&1 &";
-  (void)std::system(cmd.c_str());
-#else
-  std::string cmd = "xdg-open \"" + absPath + "\" >/dev/null 2>&1 &";
-  (void)std::system(cmd.c_str());
-#endif
 }
 
 // Compact labelled field row used by the node inspector.
@@ -4086,7 +3997,7 @@ void drawSidePanel(AppState &st, float panelW) {
                 Palette::toU32(rh ? palette.text : palette.textDim),
                 shown.c_str());
     if (rowClick && !abs.empty())
-      revealInFolder(abs);
+      ui::revealInFileManager(abs);
     if (rh)
       ImGui::SetTooltip("Show in file manager\n%s",
                         abs.empty() ? sel->path.c_str() : abs.c_str());
@@ -4216,13 +4127,13 @@ void drawSidePanel(AppState &st, float panelW) {
       // Non-CAD asset: hand to the OS, never the doc parser.
       if (graphGlassButton("##open_ext", "Open externally", true, -1.0f,
                            "new_doc"))
-        openExternally(absPath);
+        ui::openExternalFile(absPath);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
         ImGui::SetTooltip("Open with the system default application.");
       ImGui::Dummy(ImVec2(0, 4 * S));
       if (graphGlassButton("##reveal_file", "Reveal in folder", false, -1.0f,
                            "body_folder"))
-        revealInFolder(absPath);
+        ui::revealInFileManager(absPath);
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
         ImGui::SetTooltip("Show in the file manager.");
       ImGui::Dummy(ImVec2(0, 4 * S));
@@ -4947,7 +4858,7 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
         if (hn.kind == "file") {
           const std::string abs = resolveNodeAbsPath(st, hn);
           if (!abs.empty())
-            openExternally(abs);
+            ui::openExternalFile(abs);
         } else if (hn.kind == "keyword") {
           std::snprintf(G.search, sizeof(G.search), "%s", hn.label.c_str());
           G.centerPending = true;
@@ -5665,7 +5576,7 @@ void drawListView(AppState &st, ImVec2 canvasSz) {
         if (n.kind == "file") {
           const std::string abs = resolveNodeAbsPath(st, n);
           if (!abs.empty())
-            openExternally(abs);
+            ui::openExternalFile(abs);
         } else if (n.kind == "keyword") {
           std::snprintf(G.search, sizeof(G.search), "%s", n.label.c_str());
           G.centerPending = true;

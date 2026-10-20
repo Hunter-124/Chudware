@@ -782,7 +782,8 @@ def test_dod1_auto_coincident_closes_touching_loop():
     doc = r["doc_id"]
     # A rectangle with touching but non-coincident corners (no coincident constraints).
     # After add_features the auto-coincident pass should have stitched the 4 corners.
-    ra, _ = _call("add_features", {"ops": [_touching_rect_op()], "doc_id": doc})
+    ra, _ = _call("add_features", {"ops": [_touching_rect_op()], "doc_id": doc,
+                                   "auto_define": False})
     assert ra["ok"], ra
     fid = ra["features"][0]["id"]
 
@@ -823,7 +824,7 @@ def test_dod2_auto_constrain_reduces_dof_to_zero():
     r, _ = _call("new_part", {"name": "dp7_dof0"})
     doc = r["doc_id"]
     ra, _ = _call("add_features", {"ops": [_touching_rect_op(w=30.0, h=20.0)],
-                                   "doc_id": doc})
+                                   "doc_id": doc, "auto_define": False})
     assert ra["ok"], ra
     fid = ra["features"][0]["id"]
 
@@ -886,7 +887,8 @@ def test_dod4_health_text_state_b_open_underconstrained():
     r, _ = _call("new_part", {"name": "dp7_ht_open"})
     doc = r["doc_id"]
     # Gapped rect: 1mm gap at one corner > auto-coincident tolerance (1e-4mm) → stays open.
-    ra, _ = _call("add_features", {"ops": [_gapped_rect_op(gap=1.0)], "doc_id": doc})
+    ra, _ = _call("add_features", {"ops": [_gapped_rect_op(gap=1.0)], "doc_id": doc,
+                                   "auto_define": False})
     assert ra["ok"], ra
     fid = ra["features"][0]["id"]
 

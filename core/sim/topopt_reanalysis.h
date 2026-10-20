@@ -91,7 +91,8 @@ Reconstruction reconstruct_design(const Problem &, const Eigen::VectorXd &rho);
 
 // Resolves the study's original selectors on `mesh` and returns normalized
 // parse_problem_spec JSON built with the given `topology` object (no
-// preserve/exclude: the reconstructed geometry already embodies them).
+// preserve/exclude/build_plate: design-domain-only sections are omitted; the
+// reconstructed geometry already embodies passive regions).
 // Throws ModelError naming the selector label that failed.
 using BoundaryResolver = std::function<nlohmann::json(
     const PreparedMesh &mesh, const nlohmann::json &topology,

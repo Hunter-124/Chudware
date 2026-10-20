@@ -7,11 +7,9 @@
 //
 // The gateway's answer is a per-account credential store: POST/GET/DELETE
 // /api/providers/keys (Webservice/gateway/provider_keys.py). A key posted there is validated
-// against the provider, sealed with AES-256-GCM bound to the account, kept in PostgreSQL, and
-// resolved server-side for that account's agent turns only (engine_bridge.py _actor_for_turn,
-// key_source="byok"). Until this module existed, nothing inside the app called that endpoint —
-// the only client was the account portal's own JS page — so a web user had no reachable way to
-// give the app a provider credential.
+// against the provider, sealed with AES-256-GCM bound to the account, and kept in
+// PostgreSQL. P0 browser containment currently disables agent RPCs; storing a key
+// does not enable shared-daemon execution. Desktop credential paths are separate.
 //
 // Everything here is a no-op outside __EMSCRIPTEN__: `available()` answers false and the
 // desktop credential paths are untouched by construction.

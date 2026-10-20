@@ -55,13 +55,11 @@ def _hermetic_config():
     ``services/mcp/test_recon_tools.py`` and ``test_recon_hints.py`` went red on a box
     where nothing was broken.  A GUI toggle must never be able to turn this suite red.
 
-    ``services/paths.py`` resolves ``ROOT``/``CONFIG`` at IMPORT time from
-    ``XDG_DATA_HOME``, so exporting an env var from here is too late — every module that
-    matters reads ``paths.CONFIG`` as an *attribute* on each call (verified: config.py,
-    providers/sub_auth.py, research/common.py, serving/routing.py), so rebinding the
-    attribute is both sufficient and immediate.  ``load_config``'s cache is keyed on
-    ``str(paths.CONFIG)`` + mtime, so it invalidates itself; we still clear it on the way
-    in and out so a config read from before/after the swap cannot leak across.
+    The root conftest isolates HOME/XDG before collection. This separate config
+    also prevents settings written by another suite from becoming MCP tool policy.
+    Patch the module dictionary rather than resolving its dynamic CONFIG attribute:
+    teardown must remove the override, not freeze an actor-aware path as a desktop
+    constant. Clear the config cache when entering and leaving the override.
 
     The user's real config.json is never opened, read, or written by the suite.
     """
@@ -70,19 +68,18 @@ def _hermetic_config():
 
     tmp = Path(tempfile.mkdtemp(prefix="chudware-mcp-config-"))
     (tmp / "config.json").write_text("{}\n", encoding="utf-8")
-    real = paths.CONFIG
-    paths.CONFIG = tmp / "config.json"
-    agent_config._cfg_cache = None
-    agent_config._cfg_cache_path = None
-    agent_config._cfg_cache_mtime_ns = None
-    try:
-        yield paths.CONFIG
-    finally:
-        paths.CONFIG = real
+    with pytest.MonkeyPatch.context() as override:
+        override.setitem(paths.__dict__, "CONFIG", tmp / "config.json")
         agent_config._cfg_cache = None
         agent_config._cfg_cache_path = None
         agent_config._cfg_cache_mtime_ns = None
-        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            yield paths.CONFIG
+        finally:
+            agent_config._cfg_cache = None
+            agent_config._cfg_cache_path = None
+            agent_config._cfg_cache_mtime_ns = None
+            shutil.rmtree(tmp, ignore_errors=True)
 
 @pytest.fixture(autouse=True)
 def _no_helper_model_process(monkeypatch, tmp_path):

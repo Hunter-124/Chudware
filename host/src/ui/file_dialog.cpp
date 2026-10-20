@@ -1,7 +1,7 @@
 // Native file dialogs — implementation. See file_dialog.h for the contract.
 // Windows: the common dialogs (GetSaveFileNameW / GetOpenFileNameW).
-// Other (Linux/macOS): shell out to kdialog (KDE) or zenity (GTK), parsing the same
-// NUL-separated Win32 filter into the chosen tool's syntax.
+// Other (Linux/macOS): launch kdialog (KDE) or zenity (GTK) with argv, parsing the
+// same NUL-separated Win32 filter into the chosen tool's syntax. No shell.
 // Emscripten: workspace tree browser via /workspace/list (Open/Save/Folder) with an
 //             optional browser <input type=file> upload path for Open; afterFileWritten
 //             triggers a browser download of the server path.
@@ -55,12 +55,6 @@ std::string filterToAccept(const char* filter) {
     return out;
 }
 
-std::string pathJoinWs(const std::string& dir, const std::string& name) {
-    if (dir.empty() || dir == "/") return dir == "/" ? ("/" + name) : name;
-    char last = dir.back();
-    if (last == '/' || last == '\\') return dir + name;
-    return dir + "/" + name;
-}
 
 std::string ensureExt(std::string path, const char* defExt) {
     if (!defExt || !*defExt || path.empty()) return path;
@@ -74,7 +68,7 @@ std::string ensureExt(std::string path, const char* defExt) {
     return path;
 }
 
-// Remember last save/open folder (server abs) across dialogs.
+// Remember last workspace-relative folder across dialogs.
 std::string s_lastDir;
 
 }  // namespace
@@ -96,14 +90,17 @@ std::string saveFileDialog(const char* /*filter*/, const char* defExt, const cha
         }
     }
 
-    // Folder browser + filename (server abs path under workspace).
+    // Folder browser returns a workspace-relative destination.
     std::string path = chudware::browseWorkspace(chudware::WorkspaceBrowseMode::SaveAs,
                                                /*accept=*/nullptr, suggest.c_str());
     if (path.empty()) return {};
     path = ensureExt(path, defExt);
+    std::string relative, pathError;
+    if (!chudware::workspaceRelativePath(path, relative, pathError) || relative.empty()) return {};
+    path = std::move(relative);
     // Remember parent for next dialog.
     size_t cut = path.find_last_of('/');
-    if (cut != std::string::npos && cut > 0) s_lastDir = path.substr(0, cut);
+    s_lastDir = cut != std::string::npos && cut > 0 ? path.substr(0, cut) : ".";
     return path;
 }
 
@@ -119,9 +116,13 @@ std::string openFileDialog(const char* filter) {
     if (chosen.empty()) return {};  // cancel
 
     if (chosen != "__UPLOAD__") {
-        // Existing workspace file — return server abs path for doc_open.
+        // Existing file stays relative for the cell's doc_open mapping.
+        std::string relative, pathError;
+        if (!chudware::workspaceRelativePath(chosen, relative, pathError) ||
+            relative.empty()) return {};
+        chosen = std::move(relative);
         size_t cut = chosen.find_last_of('/');
-        if (cut != std::string::npos && cut > 0) s_lastDir = chosen.substr(0, cut);
+        s_lastDir = cut != std::string::npos && cut > 0 ? chosen.substr(0, cut) : ".";
         return chosen;
     }
 
@@ -153,27 +154,12 @@ std::string openFileDialog(const char* filter) {
             return {};
         }
     }
-    auto& fsb = chudware::fsBackend();
-    std::string root = s_lastDir.empty() ? fsb.defaultRoot() : s_lastDir;
-    // Gateway wants a relative dir under the workspace; "" = root.
-    // Upload into last-browsed folder when known, else workspace root.
-    std::string dirRel;
-    if (!root.empty() && root != "/") {
-        // Best-effort: if root is a subfolder of the workspace abs root, strip it.
-        std::string absRoot = fsb.defaultRoot();
-        if (!absRoot.empty() && root.size() > absRoot.size() &&
-            root.compare(0, absRoot.size(), absRoot) == 0 &&
-            (root[absRoot.size()] == '/' || root[absRoot.size()] == '\\')) {
-            dirRel = root.substr(absRoot.size() + 1);
-        } else if (root != absRoot) {
-            // Already relative-looking.
-            if (!root.empty() && root[0] != '/') dirRel = root;
-        }
-    }
-    std::string upErr;
-    std::string abs = chudware::fsUpload(dirRel, picked.name, picked.data.data(),
-                                       picked.data.size(), upErr);
-    if (abs.empty()) {
+    std::string dirRel, upErr;
+    const std::string folder = s_lastDir.empty() ? "." : s_lastDir;
+    if (!chudware::workspaceRelativePath(folder, dirRel, upErr)) return {};
+    std::string uploaded = chudware::fsUpload(dirRel, picked.name, picked.data.data(),
+                                            picked.data.size(), upErr);
+    if (uploaded.empty()) {
         const std::string msg = "Upload failed: " +
             (upErr.empty() ? std::string("unknown error") : upErr);
         EM_ASM({
@@ -182,15 +168,18 @@ std::string openFileDialog(const char* filter) {
         }, msg.c_str());
         return {};
     }
-    size_t cut = abs.find_last_of('/');
-    if (cut != std::string::npos && cut > 0) s_lastDir = abs.substr(0, cut);
-    return abs;
+    size_t cut = uploaded.find_last_of('/');
+    s_lastDir = cut != std::string::npos && cut > 0 ? uploaded.substr(0, cut) : ".";
+    return uploaded;
 }
 
 std::string openFolderDialog() {
     std::string chosen = chudware::browseWorkspace(chudware::WorkspaceBrowseMode::OpenFolder,
                                                  /*accept=*/nullptr, /*suggestedName=*/nullptr);
     if (chosen.empty()) return {};
+    std::string relative, pathError;
+    if (!chudware::workspaceRelativePath(chosen, relative, pathError)) return {};
+    chosen = relative.empty() ? "." : relative;
     s_lastDir = chosen;
     return chosen;
 }
@@ -214,6 +203,11 @@ void revealInFileManager(const std::string& /*path*/) {
     // Browser build: no OS file manager to reveal in.
 }
 
+bool openExternalFile(const std::string& /*path*/) {
+    // Browser workspace files are server-side, not local OS paths.
+    return false;
+}
+
 }  // namespace ui
 
 
@@ -233,6 +227,9 @@ void revealInFileManager(const std::string& /*path*/) {
 
 #include <cstring>
 #include <string>
+#include <filesystem>
+#include <limits>
+#include <shellapi.h>
 
 #include "file_dialog.h"
 
@@ -241,7 +238,7 @@ namespace ui {
 // ---- UTF-8 <-> UTF-16 ----
 
 static std::wstring widen(const std::string& s) {
-    if (s.empty()) return {};
+    if (s.empty() || s.size() > static_cast<size_t>(std::numeric_limits<int>::max())) return {};
     int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(),
                                 (int)s.size(), nullptr, 0);
     if (n <= 0) return {};
@@ -384,27 +381,49 @@ void afterFileWritten(const std::string& /*path*/) {
     // Desktop: the file is already on the user's disk.
 }
 
+bool openExternalFile(const std::string& path) {
+    if (path.empty() || path.find('\0') != std::string::npos) return false;
+    const std::wstring input = widen(path);
+    if (input.empty()) return false;
+    std::error_code ec;
+    const auto absolute = std::filesystem::absolute(std::filesystem::path(input), ec);
+    if (ec) return false;
+    const std::wstring wide = absolute.wstring();
+    return reinterpret_cast<INT_PTR>(
+               ShellExecuteW(GetActiveWindow(), L"open", wide.c_str(), nullptr, nullptr,
+                             SW_SHOWNORMAL)) > 32;
+}
+
 void revealInFileManager(const std::string& path) {
-    if (path.empty()) return;
-    const std::wstring wide = widen(path);
-    if (wide.empty()) return;
-    // SHOpenFolderAndSelectItems requires COM on the calling thread. S_FALSE
-    // still requires a matching CoUninitialize; a failed init owns nothing.
-    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    if (FAILED(com)) return;
-    PIDLIST_ABSOLUTE item = ILCreateFromPathW(wide.c_str());
-    if (!item) {
-        CoUninitialize();
+    if (path.empty() || path.find('\0') != std::string::npos) return;
+    const std::wstring input = widen(path);
+    if (input.empty()) return;
+    std::error_code ec;
+    const auto absolute = std::filesystem::absolute(std::filesystem::path(input), ec);
+    if (ec) return;
+    const std::wstring wide = absolute.wstring();
+    if (std::filesystem::is_directory(absolute, ec)) {
+        (void)openExternalFile(path);
         return;
     }
-    PIDLIST_ABSOLUTE folder = ILClone(item);
-    if (folder && ILRemoveLastID(folder)) {
-        PCUITEMID_CHILD child = ILFindLastID(item);
-        (void)SHOpenFolderAndSelectItems(folder, 1, &child, 0);
+    // An existing apartment is usable even when its threading model differs.
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(com) && com != RPC_E_CHANGED_MODE) return;
+    const bool ownsCom = SUCCEEDED(com);
+    HRESULT selected = E_FAIL;
+    PIDLIST_ABSOLUTE item = ILCreateFromPathW(wide.c_str());
+    if (item) {
+        PIDLIST_ABSOLUTE folder = ILClone(item);
+        if (folder && ILRemoveLastID(folder)) {
+            PCUITEMID_CHILD child = ILFindLastID(item);
+            selected = SHOpenFolderAndSelectItems(folder, 1, &child, 0);
+        }
+        if (folder) ILFree(folder);
+        ILFree(item);
     }
-    if (folder) ILFree(folder);
-    ILFree(item);
-    CoUninitialize();
+    if (ownsCom) CoUninitialize();
+    if (FAILED(selected))
+        (void)openExternalFile(absolute.parent_path().u8string());
 }
 
 }  // namespace ui
@@ -416,6 +435,15 @@ void revealInFileManager(const std::string& path) {
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <cerrno>
+#include <filesystem>
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <thread>
+#include <unistd.h>
+
+extern char** environ;
 
 #include "file_dialog.h"
 
@@ -424,35 +452,134 @@ namespace {
 
 std::string s_lastDir;  // remembered across dialogs so re-saves prefill
 
-bool haveCmd(const char* c) {
-    return std::system((std::string("command -v ") + c + " >/dev/null 2>&1").c_str()) == 0;
+bool haveCmd(const char* command) {
+    const char* path = std::getenv("PATH");
+    if (!path) return false;
+    const std::string search(path);
+    size_t start = 0;
+    do {
+        const size_t end = search.find(':', start);
+        const std::string dir = search.substr(start, end - start);
+        const auto candidate = std::filesystem::path(dir.empty() ? "." : dir) / command;
+        std::error_code ec;
+        if (::access(candidate.c_str(), X_OK) == 0 &&
+            std::filesystem::is_regular_file(candidate, ec)) return true;
+        if (end == std::string::npos) break;
+        start = end + 1;
+    } while (start <= search.size());
+    return false;
 }
 
-// Capture a command's stdout (trimmed of trailing newlines).
-std::string runCapture(const std::string& cmd) {
+int waitForChild(pid_t child) {
+    int status = 0;
+    pid_t waited;
+    do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+    return waited == child && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+// Only this process's child is reaped; launch failure never signals another app.
+pid_t spawnArgs(const std::vector<std::string>& args, int outputFd = -1,
+                int readFd = -1) {
+    if (args.empty()) return -1;
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& arg : args) {
+        if (arg.find('\0') != std::string::npos) return -1;
+        argv.push_back(const_cast<char*>(arg.c_str()));
+    }
+    argv.push_back(nullptr);
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) return -1;
+    int error = posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null",
+                                                O_RDONLY, 0);
+    if (!error)
+        error = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null",
+                                                 O_WRONLY, 0);
+    if (!error && outputFd >= 0)
+        error = posix_spawn_file_actions_adddup2(&actions, outputFd, STDOUT_FILENO);
+    else if (!error)
+        error = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null",
+                                                 O_WRONLY, 0);
+    if (!error && outputFd > STDERR_FILENO)
+        error = posix_spawn_file_actions_addclose(&actions, outputFd);
+    if (!error && readFd > STDERR_FILENO)
+        error = posix_spawn_file_actions_addclose(&actions, readFd);
+    pid_t child = -1;
+    if (!error)
+        error = posix_spawnp(&child, argv[0], &actions, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    return error ? -1 : child;
+}
+
+int runArgs(const std::vector<std::string>& args, std::string* output = nullptr) {
+    int pipeFd[2] = {-1, -1};
+    if (output) {
+        output->clear();
+        if (::pipe(pipeFd) != 0) return -1;
+        if (::fcntl(pipeFd[0], F_SETFD, FD_CLOEXEC) < 0 ||
+            ::fcntl(pipeFd[1], F_SETFD, FD_CLOEXEC) < 0) {
+            ::close(pipeFd[0]);
+            ::close(pipeFd[1]);
+            return -1;
+        }
+    }
+    const pid_t child = spawnArgs(args, pipeFd[1], pipeFd[0]);
+    if (pipeFd[1] >= 0) ::close(pipeFd[1]);
+    bool refused = false;
+    if (output && child > 0) {
+        constexpr size_t kDialogOutputCap = 64 * 1024;
+        char buffer[512];
+        for (;;) {
+            const ssize_t n = ::read(pipeFd[0], buffer, sizeof(buffer));
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) refused = true;
+            if (n <= 0) break;
+            if (static_cast<size_t>(n) > kDialogOutputCap - output->size())
+                refused = true;
+            if (!refused) output->append(buffer, static_cast<size_t>(n));
+        }
+    }
+    if (pipeFd[0] >= 0) ::close(pipeFd[0]);
+    const int result = child > 0 ? waitForChild(child) : -1;
+    if (output && (refused || result != 0 || output->find('\0') != std::string::npos))
+        output->clear();
+    return refused ? -1 : result;
+}
+
+std::string runCapture(const std::vector<std::string>& args) {
     std::string out;
-    FILE* p = popen(cmd.c_str(), "r");
-    if (!p) return "";
-    char buf[512];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), p)) > 0) out.append(buf, n);
-    pclose(p);
-    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+    if (runArgs(args, &out) != 0) return {};
+    // Remove the dialog's single record terminator, not newlines in the filename.
+    if (!out.empty() && out.back() == '\n') out.pop_back();
     return out;
 }
 
-// Single-quote an argument for the shell (escaping embedded single quotes).
-std::string shq(const std::string& s) {
-    std::string o = "'";
-    for (char c : s) {
-        if (c == '\'')
-            o += "'\\''";
-        else
-            o += c;
-    }
-    o += "'";
-    return o;
+std::string absoluteLocalPath(const std::string& path) {
+    if (path.empty() || path.find('\0') != std::string::npos) return {};
+    std::error_code ec;
+    const auto absolute = std::filesystem::absolute(std::filesystem::path(path), ec);
+    return ec ? std::string() : absolute.string();
 }
+
+#ifndef __APPLE__
+// A file URI is D-Bus data, not a shell/array delimiter. Encode UTF-8 bytes too.
+std::string fileUri(const std::string& absolute) {
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string uri = "file://";
+    for (unsigned char c : absolute) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '/' || c == '-' || c == '_' ||
+            c == '.' || c == '~') {
+            uri.push_back(static_cast<char>(c));
+        } else {
+            uri.push_back('%');
+            uri.push_back(hex[c >> 4]);
+            uri.push_back(hex[c & 15]);
+        }
+    }
+    return uri;
+}
+#endif
 
 std::string homeDir() {
     const char* h = std::getenv("HOME");
@@ -517,15 +644,14 @@ std::string kdialogFilter(const std::vector<FilterEntry>& f) {
 }
 
 // zenity: one --file-filter per entry, value "desc | pat1 pat2".
-std::string zenityFilters(const std::vector<FilterEntry>& f) {
-    std::string out;
-    for (const auto& e : f) {
-        std::string pats = e.patterns;
+void appendZenityFilters(std::vector<std::string>& args,
+                         const std::vector<FilterEntry>& filters) {
+    for (const auto& entry : filters) {
+        std::string pats = entry.patterns;
         for (char& c : pats)
             if (c == ';') c = ' ';
-        out += " --file-filter=" + shq(e.desc + " | " + pats);
+        args.push_back("--file-filter=" + entry.desc + " | " + pats);
     }
-    return out;
 }
 
 }  // namespace
@@ -534,17 +660,18 @@ std::string saveFileDialog(const char* filter, const char* defExt, const char* s
     auto entries = parseFilter(filter ? filter : "All files (*.*)\0*.*\0");
     std::string suggested = (suggestedName && *suggestedName) ? suggestedName : "";
     std::string res;
+    const std::string startPath = absoluteLocalPath(startDir() + "/" + suggested);
+    if (startPath.empty()) return {};
     if (haveCmd("kdialog")) {
-        std::string startPath = startDir() + "/" + suggested;
-        std::string cmd = "kdialog --getsavefilename " + shq(startPath);
+        std::vector<std::string> args{"kdialog", "--getsavefilename", startPath};
         std::string f = kdialogFilter(entries);
-        if (!f.empty()) cmd += " " + shq(f);
-        res = runCapture(cmd + " 2>/dev/null");
+        if (!f.empty()) args.push_back(std::move(f));
+        res = runCapture(args);
     } else if (haveCmd("zenity")) {
-        std::string startPath = startDir() + "/" + suggested;
-        std::string cmd = "zenity --file-selection --save --confirm-overwrite --filename=" +
-                          shq(startPath) + zenityFilters(entries);
-        res = runCapture(cmd + " 2>/dev/null");
+        std::vector<std::string> args{"zenity", "--file-selection", "--save",
+                                      "--confirm-overwrite", "--filename=" + startPath};
+        appendZenityFilters(args, entries);
+        res = runCapture(args);
     } else {
         return {};
     }
@@ -556,15 +683,18 @@ std::string saveFileDialog(const char* filter, const char* defExt, const char* s
 std::string openFileDialog(const char* filter) {
     auto entries = parseFilter(filter ? filter : "All files (*.*)\0*.*\0");
     std::string res;
+    const std::string startPath = absoluteLocalPath(startDir());
+    if (startPath.empty()) return {};
     if (haveCmd("kdialog")) {
-        std::string cmd = "kdialog --getopenfilename " + shq(startDir());
+        std::vector<std::string> args{"kdialog", "--getopenfilename", startPath};
         std::string f = kdialogFilter(entries);
-        if (!f.empty()) cmd += " " + shq(f);
-        res = runCapture(cmd + " 2>/dev/null");
+        if (!f.empty()) args.push_back(std::move(f));
+        res = runCapture(args);
     } else if (haveCmd("zenity")) {
-        std::string cmd = "zenity --file-selection --filename=" + shq(startDir() + "/") +
-                          zenityFilters(entries);
-        res = runCapture(cmd + " 2>/dev/null");
+        std::vector<std::string> args{"zenity", "--file-selection",
+                                      "--filename=" + startPath + "/"};
+        appendZenityFilters(args, entries);
+        res = runCapture(args);
     } else {
         return {};
     }
@@ -575,11 +705,13 @@ std::string openFileDialog(const char* filter) {
 
 std::string openFolderDialog() {
     std::string res;
+    const std::string startPath = absoluteLocalPath(startDir());
+    if (startPath.empty()) return {};
     if (haveCmd("kdialog")) {
-        res = runCapture("kdialog --getexistingdirectory " + shq(startDir()) + " 2>/dev/null");
+        res = runCapture({"kdialog", "--getexistingdirectory", startPath});
     } else if (haveCmd("zenity")) {
-        res = runCapture("zenity --file-selection --directory --filename=" +
-                         shq(startDir() + "/") + " 2>/dev/null");
+        res = runCapture({"zenity", "--file-selection", "--directory",
+                          "--filename=" + startPath + "/"});
     } else {
         return {};
     }
@@ -598,20 +730,16 @@ int promptImportMeshAsSolid() {
         "right-click the import in the tree)";
     if (haveCmd("kdialog")) {
         // kdialog --warningyesnocancel: exit 0=yes, 1=no, 2=cancel.
-        int rc = std::system(("kdialog --title 'Import Mesh' --warningyesnocancel " +
-                              shq(msg) + " >/dev/null 2>&1")
-                                 .c_str());
-        int code = (rc == -1) ? -1 : (rc >> 8);  // WEXITSTATUS
+        const int code = runArgs({"kdialog", "--title", "Import Mesh",
+                                   "--warningyesnocancel", msg});
         if (code == 0) return 1;
         if (code == 1) return 0;
         return -1;
     }
     if (haveCmd("zenity")) {
         // zenity --question has no cancel; exit 0=yes, else no.
-        int rc = std::system(("zenity --question --title='Import Mesh' --text=" + shq(msg) +
-                              " >/dev/null 2>&1")
-                                 .c_str());
-        return (rc != -1 && (rc >> 8) == 0) ? 1 : 0;
+        return runArgs({"zenity", "--question", "--title=Import Mesh",
+                         std::string("--text=") + msg}) == 0 ? 1 : 0;
     }
     return 1;  // no dialog tool: default to solid (the more useful import)
 }
@@ -620,24 +748,41 @@ void afterFileWritten(const std::string& /*path*/) {
     // Desktop: the file is already on the user's disk.
 }
 
-void revealInFileManager(const std::string& path) {
-    if (path.empty()) return;
+bool openExternalFile(const std::string& path) {
+    const std::string absolute = absoluteLocalPath(path);
+    if (absolute.empty()) return false;
 #if defined(__APPLE__)
-    // open -R reveals + selects the file in Finder.
-    (void)std::system(("open -R " + shq(path) + " >/dev/null 2>&1 &").c_str());
+    const pid_t child = spawnArgs({"open", absolute});
 #else
-    // freedesktop FileManager1 D-Bus API selects the item (Nautilus/Dolphin/Nemo/…);
-    // fall back to xdg-open on the containing folder when dbus-send isn't available.
-    const size_t slash = path.find_last_of('/');
-    const std::string dir = (slash == std::string::npos) ? std::string(".") : path.substr(0, slash);
-    const std::string cmd =
-        "dbus-send --session --print-reply --dest=org.freedesktop.FileManager1 "
-        "--type=method_call /org/freedesktop/FileManager1 "
-        "org.freedesktop.FileManager1.ShowItems array:string:" +
-        shq("file://" + path) + " string:\"\" >/dev/null 2>&1 || xdg-open " + shq(dir) +
-        " >/dev/null 2>&1 &";
-    (void)std::system(cmd.c_str());
+    const pid_t child = spawnArgs({"xdg-open", absolute});
 #endif
+    if (child <= 0) return false;
+    std::thread([child] { (void)waitForChild(child); }).detach();
+    return true;
+}
+
+void revealInFileManager(const std::string& path) {
+    const std::string absolute = absoluteLocalPath(path);
+    if (absolute.empty()) return;
+    std::error_code ec;
+    if (std::filesystem::is_directory(absolute, ec)) {
+        (void)openExternalFile(absolute);
+        return;
+    }
+    // Keep D-Bus/Finder waits and containing-folder fallback off the UI thread.
+    std::thread([absolute] {
+        const std::string folder = std::filesystem::path(absolute).parent_path().string();
+#if defined(__APPLE__)
+        if (runArgs({"open", "-R", absolute}) != 0)
+            (void)runArgs({"open", folder});
+#else
+        if (runArgs({"dbus-send", "--session", "--print-reply", "--reply-timeout=2000",
+                     "--dest=org.freedesktop.FileManager1", "--type=method_call",
+                     "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1.ShowItems",
+                     "array:string:" + fileUri(absolute), "string:"}) != 0)
+            (void)runArgs({"xdg-open", folder});
+#endif
+    }).detach();
 }
 
 }  // namespace ui

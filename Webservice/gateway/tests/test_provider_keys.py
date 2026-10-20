@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import builtins
 import hashlib
-import json
 import logging
 from pathlib import Path
 import sys
@@ -18,10 +17,9 @@ from fastapi.testclient import TestClient
 from starlette.types import ASGIApp, Receive, Scope, Send
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from gateway import accounts, app as app_mod, credits, db, engine_bridge, provider_keys
+from gateway import accounts, credits, db, provider_keys
 from gateway.config import settings
 from gateway.limits import RateLimiter
-from gateway.tests.test_engine_bridge import FakeDaemon, _rpc
 from services.agent import config as agent_config, worker_rpc
 
 SECRET = "sk-account-secret-never-leak-1234"
@@ -101,15 +99,6 @@ def accept_validation(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(provider_keys, "validate_key", accept)
 
 
-@pytest.fixture
-def daemon(unix_socket_path: Path, monkeypatch: pytest.MonkeyPatch):
-    fake = FakeDaemon(unix_socket_path)
-    fake.start()
-    monkeypatch.setattr(settings, "webd_socket", fake.sock_path)
-    monkeypatch.setattr(settings, "dev_mode", True)
-    monkeypatch.setattr(settings, "share_provider_keys", False)
-    yield fake
-    fake.stop()
 
 
 def _raw_provider_row(email: str, provider: str = "openai"):
@@ -121,16 +110,6 @@ def _raw_provider_row(email: str, provider: str = "openai"):
         return cur.fetchone()
 
 
-def _balance_and_ledger(email: str) -> tuple[int, list[dict]]:
-    with db.tx() as cur:
-        cur.execute("SELECT credit_balance FROM accounts WHERE email = %s", (email,))
-        balance = int(cur.fetchone()["credit_balance"])
-        cur.execute(
-            "SELECT kind, credits_delta, model, note FROM credit_ledger "
-            "WHERE email = %s ORDER BY id",
-            (email,),
-        )
-        return balance, list(cur.fetchall())
 
 
 def test_tenancy_at_rest_round_trip_and_no_leakage(
@@ -258,6 +237,25 @@ def test_validation_endpoint_is_rate_limited(
     assert int(limited.headers["Retry-After"]) >= 1
 
 
+def test_read_only_key_accessor_tracks_rotation_without_last_used_writes() -> None:
+    _seed(A)
+    _seed(B)
+    provider_keys._persist_validated_key(A, "openai", SECRET)
+    assert provider_keys.read_validated_key(A, "openai") == SECRET
+    assert provider_keys.read_validated_key(B, "openai") is None
+    assert _raw_provider_row(A)["last_used_at"] is None
+    provider_keys.resolve_validated_key(A, "openai")
+    timestamp = _raw_provider_row(A)["last_used_at"]
+    assert timestamp is not None
+    assert provider_keys.read_validated_key(A, "openai") == SECRET
+    assert _raw_provider_row(A)["last_used_at"] == timestamp
+    provider_keys._persist_validated_key(A, "openai", "rotated-fixture-secret")
+    assert provider_keys.read_validated_key(A, "openai") == "rotated-fixture-secret"
+    assert _raw_provider_row(A)["last_used_at"] is None
+    provider_keys.delete_key(A, "openai")
+    assert provider_keys.read_validated_key(A, "openai") is None
+
+
 def test_worker_clears_byok_key_between_tenants(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -287,7 +285,7 @@ def test_worker_clears_byok_key_between_tenants(
         },
         lambda _event: None,
     )
-    assert first["ok"] is True
+    assert first["ok"] is True, first
     assert [(p["web_tenant"], p["web_credential"]) for p in host.turns] == [(A, SECRET)]
     mismatch = worker_rpc._agent_admin_turn(
         {
@@ -378,145 +376,10 @@ def test_desktop_turn_never_imports_gateway(
         },
         lambda _event: None,
     )
-    assert result["ok"] is True
+    assert result["ok"] is True, result
     assert len(host.turns) == 1
     assert host.turns[0]["byok_key"] == "desktop-owned-key"
     assert host.turns[0]["byok_tenant"] == "desktop"
     assert host.turns[0]["settings"]["provider"] == "openai"
 
 
-def test_byok_precedes_credits_for_x_and_y_still_pools(
-    daemon: FakeDaemon, accept_validation: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("CHUDWARE_WEB_POOL_API_KEY", "shared-pool-test-key")
-    email = "demo@example.com"
-    _seed(email, ai_grant=True)
-    client = _client_for(email)
-    assert client.post(
-        "/api/providers/keys", json={"provider": "openai", "key": SECRET}
-    ).status_code == 200
-
-    credits.grant(email, 10, note="BYOK precedence test")
-    credits.refresh_model_rates(
-        lambda _url: {
-            "data": [{
-                "id": "vendor/cheap",
-                "pricing": {"prompt": "0.000001", "completion": "0.000002"},
-            }]
-        },
-        now=1_800_000_000,
-    )
-    before_byok = _balance_and_ledger(email)
-
-    with TestClient(app_mod.app).websocket_connect(
-        "/engine", headers={"X-Dev-User": email}
-    ) as ws:
-        _rpc(ws, 1, "hello")
-        byok = _rpc(ws, 2, "agent_ask_v2", {
-            "question": "BYOK X",
-            "provider": "openai",
-            "model": "vendor/cheap",
-            "api_key": "browser-forgery-must-be-stripped",
-            "_test_emit_usage": True,
-        })
-    assert byok["result"]["ok"] is True
-    assert _balance_and_ledger(email) == before_byok
-    byok_call = [c for c in daemon.calls if c.get("method") == "agent_ask_v2"][-1]
-    byok_actor = byok_call["params"]["options"]["_chudware_actor"]
-    assert byok_actor["key_source"] == "byok"
-    assert "_reservation_credits" not in byok_actor
-    assert byok_call["params"]["api_key"] == SECRET
-    assert byok_actor["_byok_key_sha256"] == hashlib.sha256(SECRET.encode()).hexdigest()
-    assert byok_call["params"]["api_key"] != "browser-forgery-must-be-stripped"
-
-    # The same account has no OpenRouter key. Provider Y deliberately falls
-    # through to the normal pool reservation/reconciliation path.
-    before_pool = _balance_and_ledger(email)
-    with TestClient(app_mod.app).websocket_connect(
-        "/engine", headers={"X-Dev-User": email}
-    ) as ws:
-        pooled = _rpc(ws, 3, "agent_ask_v2", {
-            "question": "pooled Y",
-            "provider": "openrouter",
-            "model": "vendor/cheap",
-            "max_tokens": 8,
-            "_test_emit_usage": True,
-        })
-    assert pooled["result"]["ok"] is True
-    after_pool = _balance_and_ledger(email)
-    assert after_pool[0] == before_pool[0] - 1
-    assert len(after_pool[1]) == len(before_pool[1]) + 1
-    spends = [row for row in after_pool[1] if row["kind"] == "spend"]
-    assert len(spends) == 1
-    reservation = json.loads(spends[0]["note"])["reservation"]
-    assert reservation["state"] == "reconciled"
-    pool_call = [c for c in daemon.calls if c.get("method") == "agent_ask_v2"][-1]
-    assert pool_call["params"]["options"]["_chudware_actor"]["key_source"] == "pool"
-    pool_actor = pool_call["params"]["options"]["_chudware_actor"]
-    assert pool_actor["_pool"] == {
-        "provider": "openrouter", "api_key": "shared-pool-test-key",
-    }
-    assert pool_actor["_pool_key_sha256"] == hashlib.sha256(
-        b"shared-pool-test-key"
-    ).hexdigest()
-
-
-def test_pool_without_operator_key_refuses_before_credit_reservation(
-    daemon: FakeDaemon, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv("CHUDWARE_WEB_POOL_API_KEY", raising=False)
-    _seed(A, ai_grant=True)
-    before = _balance_and_ledger(A)
-    with TestClient(app_mod.app).websocket_connect(
-        "/engine", headers={"X-Dev-User": A}
-    ) as ws:
-        _rpc(ws, 1, "hello")
-        denied = _rpc(ws, 2, "agent_ask_v2", {
-            "question": "pool without key", "provider": "openrouter",
-            "model": "vendor/cheap",
-        })
-    assert denied["result"]["reason"] == "pool_credential_unconfigured"
-    assert denied["result"]["hint"]
-    assert _balance_and_ledger(A) == before
-    assert not [call for call in daemon.calls if call.get("method") == "agent_ask_v2"]
-
-
-def test_subscription_digest_and_pool_model_injection(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(engine_bridge, "actor_for", lambda email: {
-        "email": email, "plan": "studio", "credits_remaining": 10, "key_source": "pool",
-    })
-    monkeypatch.setattr(engine_bridge, "resolve_validated_key", lambda *_: None)
-    monkeypatch.setattr(engine_bridge, "resolve_subscription_token", lambda *_, **_kwargs: {
-        "provider": "anthropic-sub", "access_token": "customer-oauth",
-    })
-    actor = engine_bridge._actor_for_turn(A, json.dumps({
-        "params": {"provider": "anthropic", "model": "claude-sonnet-4"},
-    }))
-    line = engine_bridge._sanitize_agent_rpc(json.dumps({
-        "method": "agent_ask_v2", "params": {
-            "provider": "anthropic", "model": "claude-sonnet-4",
-            "api_key": "browser-forgery",
-            "options": {"api_key": "nested-forgery", "_chudware_actor": {"email": "forged"}},
-        },
-    }), actor)
-    params = json.loads(line)["params"]
-    injected = params["options"]["_chudware_actor"]
-    assert "api_key" not in params and "api_key" not in params["options"]
-    assert injected["_subscription"]["access_token"] == "customer-oauth"
-    assert injected["_subscription_token_sha256"] == hashlib.sha256(b"customer-oauth").hexdigest()
-    monkeypatch.setattr(engine_bridge, "resolve_subscription_token", lambda *_, **_kwargs: None)
-    monkeypatch.setenv("CHUDWARE_WEB_POOL_API_KEY", "operator-pool")
-    monkeypatch.setenv("CHUDWARE_WEB_POOL_MODEL", "vendor/pool-model")
-    pool = engine_bridge._actor_for_turn(A, json.dumps({
-        "params": {"provider": "anthropic", "model": "browser-model"},
-    }))
-    pooled = json.loads(engine_bridge._sanitize_agent_rpc(json.dumps({
-        "method": "agent_ask_v2", "params": {
-            "provider": "anthropic", "model": "browser-model",
-            "options": {"provider": "openai", "model": "forged-option"},
-        },
-    }), pool))["params"]
-    assert pooled["provider"] == "openrouter"
-    assert pooled["model"] == "vendor/pool-model"
-    assert "model" not in pooled["options"] and "provider" not in pooled["options"]
-    assert pooled["options"]["_chudware_actor"]["_pool"]["api_key"] == "operator-pool"

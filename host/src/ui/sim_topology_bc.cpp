@@ -237,6 +237,9 @@ void visitWells(const json &study,
     }
   list(member(study, "preserve"), "/preserve", WellRole::Preserve, true, false);
   list(member(study, "exclude"), "/exclude", WellRole::Exclude, true, false);
+  const json &plate = member(member(study, "build_plate"), "faces");
+  if (plate.is_array())
+    fn({"/build_plate/faces", WellRole::Preserve, true, &plate, false});
   const json &th = member(study, "thermal");
   list(member(th, "fixtures"), "/thermal/fixtures", WellRole::Support, thermal,
        false);
@@ -1204,7 +1207,7 @@ bool applyStudyDefinition(json &study, const json &definition,
   std::set<std::string> native = {
       "name", "material", "mesh_order", "mesh_target_mm", "mesh_fineness",
       "mesh_min_mm", "fixtures", "loads", "load_cases", "preserve", "exclude",
-      "thermal", "flow", "topology", "method", "physics", "objective",
+      "thermal", "flow", "topology", "build_plate", "print_process", "method", "physics", "objective",
       "key", "E_mpa", "nu", "yield_mpa", "density_g_cm3", "k_w_mk",
       "alpha_per_k", "cp_j_kgk", "faces", "dofs", "label", "type", "vec",
       "vector", "magnitude", "weight", "box_min_mm", "box_max_mm",
@@ -1290,9 +1293,10 @@ bool applyStudyDefinition(json &study, const json &definition,
            number(v[0]) && number(v[1]) && number(v[2]);
   };
   if (!type(candidate, "name", "", text, "text") ||
+      !type(candidate, "print_process", "", text, "text") ||
       !type(candidate, "topology", "", object, "an object"))
     return false;
-  for (const char *key : {"thermal", "flow"})
+  for (const char *key : {"thermal", "flow", "build_plate"})
     if (!type(candidate, key, "", object, "an object"))
       return false;
   for (const char *key : {"fixtures", "loads", "load_cases", "preserve", "exclude"})
@@ -1395,12 +1399,12 @@ bool applyStudyDefinition(json &study, const json &definition,
         return true;
       };
   for (const char *key : {"fixtures", "loads", "load_cases", "preserve",
-                          "exclude", "thermal", "flow"})
+                          "exclude", "thermal", "flow", "build_plate"})
     if (candidate.contains(key) &&
         !boundaryTypes(candidate[key], std::string("/") + key))
       return false;
 
-  auto issues = validateTopology(member(candidate, "topology"), caps);
+  auto issues = validateTopology(member(candidate, "topology"), caps, candidate);
   for (auto &issue : issues)
     if (!issue.key.empty())
       issue.key = "/topology/" + issue.key;
@@ -1667,6 +1671,16 @@ bool buildRunEnvelope(const json &study,
     }
     out[which] = std::move(dst);
   }
+  const json &plate = member(study, "build_plate");
+  if (facesNonEmpty(plate)) {
+    json fs;
+    if (!resolveFaces(member(plate, "faces"), resolved, fs, error, "Bed face"))
+      return false;
+    out["build_plate"] = {{"faces", std::move(fs)}};
+    const json &label = member(plate, "label");
+    if (label.is_string() && !label.get<std::string>().empty())
+      out["build_plate"]["label"] = label;
+  }
   return true;
 }
 
@@ -1675,7 +1689,7 @@ std::string setupKey(const json &study) {
   for (const char *k :
        {"material", "mesh_order", "mesh_fineness", "mesh_target_mm",
         "mesh_min_mm", "fixtures", "loads", "load_cases", "preserve", "exclude",
-        "thermal", "flow", "topology"})
+        "thermal", "flow", "topology", "build_plate", "print_process"})
     if (study.is_object() && study.contains(k))
       s[k] = study[k];
   // Viewport pick identities are presentation only.
@@ -1972,14 +1986,21 @@ void textField(EditCtx &c, const char *id, const std::string &pointer,
 // the row is too narrow), the picks as removable chips in a wrapping flow
 // (hover lights the face in the viewport, × removes it), one dim hint line
 // while armed, and the field's issue line.
-void wellField(EditCtx &c, const std::string &pointer, const char *help) {
+void wellField(EditCtx &c, const std::string &pointer, const char *help,
+               const char *label = "Faces", bool createPlate = false) {
   json *faces = facesAt(c.study, pointer);
-  if (!faces)
+  if (!faces && !createPlate)
     return;
+  const auto ensureFaces = [&] {
+    if (!faces) {
+      c.study["build_plate"] = {{"faces", json::array()}};
+      faces = facesAt(c.study, pointer);
+    }
+  };
   const bool armed = c.view.armedPointer == pointer;
-  std::size_t n = faces->size();
+  std::size_t n = faces ? faces->size() : 0;
   ImGui::PushID("faces");
-  const FaceWellClick click = faceWellControls("Faces", (int)n, armed, help);
+  const FaceWellClick click = faceWellControls(label, (int)n, armed, help);
   ImGui::PopID();
   // A real well target, independent of Pick/Clear: delivery copies the face
   // and never toggles an already-present selector off.
@@ -1991,15 +2012,18 @@ void wellField(EditCtx &c, const std::string &pointer, const char *help) {
   ui::sim::FaceDrop dropped;
   if (!c.locked && !c.view.docId.empty() &&
       ui::sim::acceptFaceDrop(c.view.docId, dropped)) {
+    ensureFaces();
     dropped.selector["_pick"] = {{"body", dropped.body}, {"topo", dropped.topo}};
     if (appendFaces(c.study, pointer, {dropped.selector}))
       c.result.committed = true;
   }
-  n = faces->size();
+  n = faces ? faces->size() : 0;
   ImGui::PopID();
   const bool toggle = click.toggled;
   const bool clear = click.clear;
   if (toggle) {
+    if (!armed)
+      ensureFaces();
     c.view.armedPointer = armed ? std::string() : pointer;
     c.result.armChanged = true;
   }
@@ -2065,7 +2089,7 @@ void wellField(EditCtx &c, const std::string &pointer, const char *help) {
   if (removeAt >= 0) {
     faces->erase(static_cast<std::size_t>(removeAt));
     c.result.committed = true;
-  } else if (clear) {
+  } else if (clear && faces) {
     faces->clear();
     c.result.committed = true;
   }
@@ -2882,6 +2906,31 @@ void materialSection(
 }
 
 } // namespace
+
+BcResult drawBuildPlateEditor(AppState &st, json &study, BcView &view,
+                              const char *lockedReason) {
+  const std::vector<Issue> issues;
+  EditCtx c{st, study, view, issues};
+  c.locked = lockedReason != nullptr;
+  ImGui::PushID("build_plate");
+  ImGui::BeginDisabled(c.locked);
+  wellField(c, "/build_plate/faces",
+            "Pick the planar face that rests on the printer bed. Its inward normal sets the build direction.",
+            "Bed face", true);
+  ImGui::EndDisabled();
+  ImGui::PopID();
+  const json &faces = member(member(study, "build_plate"), "faces");
+  if (faces.is_array() && faces.empty()) {
+    if (c.result.committed && view.armedPointer == "/build_plate/faces") {
+      view.armedPointer.clear();
+      c.result.armChanged = true;
+    }
+    if (view.armedPointer != "/build_plate/faces")
+      study.erase("build_plate");
+  }
+  view.seenArmed = view.armedPointer;
+  return c.result;
+}
 
 BcResult drawBoundaryEditor(
     AppState &st, json &study, BcSection section, BcView &view,

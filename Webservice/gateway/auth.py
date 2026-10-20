@@ -548,6 +548,12 @@ class AuthMiddleware:
             self._jwks = JWKSCache(self.cfg.cf_jwks_url)
 
         try:
+            # JWKS lookup parses only the header. Reject malformed payloads and
+            # missing mandatory claims first, before fetching a signing key.
+            # Identity still comes exclusively from the verified decode below.
+            jwt.decode(token, options={
+                "verify_signature": False, "require": ["exp", "iss", "aud"],
+            })
             signing_key = self._jwks.get_signing_key(token)
             payload = jwt.decode(
                 token,
@@ -557,7 +563,7 @@ class AuthMiddleware:
                 issuer=self.cfg.cf_issuer,
                 options={"require": ["exp", "iss", "aud"]},
             )
-        except jwt.PyJWTError as exc:
+        except (jwt.PyJWTError, RecursionError) as exc:
             log.warning("JWT verification failed: %s", exc)
             raise AuthError("invalid access token", status=401) from exc
 

@@ -46,25 +46,32 @@ void endpointParsing() {
     check(!chudware::worker::detail::parseControlInfo(relative, false, parsed, err),
           "relative Unix endpoint is rejected");
 
+    const std::string pipe = "\\\\.\\pipe\\chudware-control-S-1-5-21-12345-" + token('b');
     json windows = {
-        {"transport", "tcp"}, {"endpoint", "127.0.0.1:49152"}, {"token", token('b')},
+        {"transport", "named_pipe"}, {"endpoint", pipe}, {"token", token('b')},
     };
     err.clear();
     check(chudware::worker::detail::parseControlInfo(windows, true, parsed, err),
-          "valid Windows loopback endpoint parses");
-    check(parsed.transport == ControlTransport::Tcp,
-          "Windows endpoint selects TCP transport");
+          "valid Windows owner-scoped pipe endpoint parses");
+    check(parsed.transport == ControlTransport::NamedPipe,
+          "Windows endpoint selects named pipe transport");
 
-    for (const char* endpoint : {"localhost:49152", "0.0.0.0:49152",
-                                 "127.0.0.1:0", "127.0.0.1:65536",
-                                 "127.0.0.1:not-a-port"}) {
+    for (const std::string& endpoint : {
+             std::string("127.0.0.1:49152"), std::string("\\\\server\\pipe\\chudware-control-S-1-5-21-") + token(),
+             std::string("\\\\.\\pipe\\arbitrary-") + token(),
+             std::string("\\\\.\\pipe\\chudware-control-S-1-5-21-short"),
+             std::string("\\\\.\\pipe\\chudware-control-S-owner-") + token(),
+             std::string("\\\\.\\pipe\\chudware-control-S-1-5-21-") + token('A')}) {
         json invalid = {
-            {"transport", "tcp"}, {"endpoint", endpoint}, {"token", token()},
+            {"transport", "named_pipe"}, {"endpoint", endpoint}, {"token", token()},
         };
         err.clear();
         check(!chudware::worker::detail::parseControlInfo(invalid, true, parsed, err),
-              "non-private or malformed TCP endpoint is rejected");
+              "remote, unscoped or malformed named pipe endpoint is rejected");
     }
+    json retiredTcp = {{"transport", "tcp"}, {"endpoint", "127.0.0.1:49152"}, {"token", token()}};
+    check(!chudware::worker::detail::parseControlInfo(retiredTcp, true, parsed, err),
+          "retired Windows TCP control transport is rejected");
 
     json uppercaseToken = {
         {"transport", "unix"},
@@ -170,6 +177,14 @@ void responseFramingAndRedaction() {
               R"({"ok":true,"result":"not-an-object"})", secret, result,
               err),
           "non-object control result is rejected");
+
+    err.clear();
+    check(!chudware::worker::detail::parseControlResponse(
+              json{{"ok", true}, {"result", {{"token", secret}}}}.dump(),
+              secret, result, err),
+          "successful responses cannot expose authentication material");
+    check(err.find(secret) == std::string::npos,
+          "rejected successful response keeps the token private");
 }
 
 void lifecycleAndFallbackSelection() {

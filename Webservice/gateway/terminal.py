@@ -71,6 +71,7 @@ _DEFAULT_COLS = 80
 _DEFAULT_ROWS = 24
 _READ_SIZE = 65536
 _KILL_GRACE_S = 0.5
+_AUTH_RECHECK_S = 1.0
 
 # Sustained pty→browser throughput and burst allowance. A `cat /dev/urandom`
 # inside a terminal must not be able to saturate the gateway's uplink (the
@@ -793,6 +794,11 @@ async def admin_terminal(ws: WebSocket) -> None:
     if getattr(user, "role", None) != "admin":
         await ws.close(code=4403)
         return
+    try:
+        user = revalidate_websocket_user(ws.scope, required_role="admin")
+    except AuthError as exc:
+        await ws.close(code=4401 if exc.status == 401 else 4403)
+        return
     email = getattr(user, "email", "") or ""
 
     cols, rows = _parse_size(ws)
@@ -804,6 +810,9 @@ async def admin_terminal(ws: WebSocket) -> None:
     pid = -1
     master_fd = -1
     pump_task: asyncio.Task | None = None
+    authority_task: asyncio.Task | None = None
+    recv_task: asyncio.Task | None = None
+    authority_close_code: int | None = None
     exit_code: int | None = None
     shell_died = False
     idle_timed_out = False
@@ -869,23 +878,25 @@ async def admin_terminal(ws: WebSocket) -> None:
             pass
         return
 
-    # Tell the client which session it landed on (for tab labels). ``name``
-    # is the human label (what the UI displays and re-attaches with — label
-    # lookup is ownership-checked server-side); ``id`` is the opaque identifier.
-    if tmux_pool and tmux_name and ws.client_state == WebSocketState.CONNECTED:
+    async def authorized() -> bool:
+        nonlocal authority_close_code
+        if authority_close_code is not None or ws.client_state != WebSocketState.CONNECTED:
+            return False
         try:
-            await ws.send_text(
-                json.dumps(
-                    {
-                        "type": "session",
-                        "name": landed_label or _display(tmux_name),
-                        "id": _display(tmux_name),
-                    },
-                    separators=(",", ":"),
-                )
-            )
-        except Exception:  # noqa: BLE001
-            pass
+            revalidate_websocket_user(ws.scope, required_role="admin")
+        except AuthError as exc:
+            authority_close_code = 4401 if exc.status == 401 else 4403
+            await ws.close(code=authority_close_code)
+            return False
+        return True
+
+    async def watch_authority() -> None:
+        # Silent browsers must lose access too; no traffic is needed to detach
+        # their client (or terminate their private fallback shell).
+        while True:
+            await asyncio.sleep(_AUTH_RECHECK_S)
+            if not await authorized():
+                return
 
     async def pty_to_ws() -> None:
         nonlocal exit_code, shell_died, last_activity
@@ -919,6 +930,8 @@ async def admin_terminal(ws: WebSocket) -> None:
                     bucket = 0.0
                 else:
                     bucket -= n
+                if not await authorized():
+                    break
                 await ws.send_bytes(data)
                 last_activity = loop.time()
         except asyncio.CancelledError:
@@ -930,13 +943,29 @@ async def admin_terminal(ws: WebSocket) -> None:
                 exit_code = _reap(pid)
 
     try:
+        authority_task = asyncio.create_task(watch_authority(), name="term-auth-watch")
+        # Session metadata, PTY bytes and exit metadata all require current
+        # authority, not merely the middleware's handshake snapshot.
+        if not await authorized():
+            return
+        if tmux_pool and tmux_name:
+            await ws.send_text(
+                json.dumps(
+                    {
+                        "type": "session",
+                        "name": landed_label or _display(tmux_name),
+                        "id": _display(tmux_name),
+                    },
+                    separators=(",", ":"),
+                )
+            )
         # The tmux path launches Chudcode itself; only the legacy shell needs injection.
         if not tmux_pool:
             await _inject_chud(master_fd, loop)
         pump_task = asyncio.create_task(pty_to_ws(), name="term-pty-to-ws")
 
         while True:
-            if pump_task.done():
+            if pump_task.done() or authority_task.done():
                 break
             remaining = last_activity + idle_timeout - loop.time()
             if remaining <= 0:
@@ -944,7 +973,7 @@ async def admin_terminal(ws: WebSocket) -> None:
                 break
             recv_task = asyncio.create_task(ws.receive(), name="term-ws-recv")
             done, pending = await asyncio.wait(
-                {pump_task, recv_task},
+                {pump_task, recv_task, authority_task},
                 timeout=remaining,
                 return_when=asyncio.FIRST_COMPLETED,
             )
@@ -959,7 +988,7 @@ async def admin_terminal(ws: WebSocket) -> None:
                 # the whole idle window — drop the client.
                 idle_timed_out = True
                 break
-            if pump_task in done:
+            if pump_task in done or authority_task in done:
                 if recv_task in done:
                     try:
                         recv_task.result()
@@ -974,10 +1003,7 @@ async def admin_terminal(ws: WebSocket) -> None:
                 break
             if msg.get("type") == "websocket.disconnect":
                 break
-            try:
-                revalidate_websocket_user(ws.scope, required_role="admin")
-            except AuthError as exc:
-                await ws.close(code=4401 if exc.status == 401 else 4403)
+            if not await authorized():
                 break
             last_activity = loop.time()
             if "bytes" in msg and msg["bytes"] is not None:
@@ -1011,6 +1037,18 @@ async def admin_terminal(ws: WebSocket) -> None:
     except Exception as exc:  # noqa: BLE001
         log.debug("terminal handler error: %s", exc)
     finally:
+        if recv_task is not None and not recv_task.done():
+            recv_task.cancel()
+            try:
+                await recv_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        if authority_task is not None:
+            authority_task.cancel()
+            try:
+                await authority_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         # Close/kill first so a blocked os.read in the pump unblocks. In shared
         # mode this only detaches the tmux client; the session keeps running.
         code = await _kill_child(
@@ -1040,20 +1078,21 @@ async def admin_terminal(ws: WebSocket) -> None:
         session_gone = not (tmux_name and _session_exists(tmux_name))
         if shell_died and session_gone and ws.client_state == WebSocketState.CONNECTED:
             try:
-                await ws.send_text(
-                    json.dumps(
-                        {
-                            "type": "exit",
-                            "code": int(exit_code if exit_code is not None else 0),
-                        },
-                        separators=(",", ":"),
+                if await authorized():
+                    await ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "exit",
+                                "code": int(exit_code if exit_code is not None else 0),
+                            },
+                            separators=(",", ":"),
+                        )
                     )
-                )
             except Exception:  # noqa: BLE001
                 pass
         if ws.client_state == WebSocketState.CONNECTED:
             try:
-                await ws.close(code=4408 if idle_timed_out else 1000)
+                await ws.close(code=authority_close_code or (4408 if idle_timed_out else 1000))
             except Exception:  # noqa: BLE001
                 pass
         log.info(

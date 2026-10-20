@@ -26,6 +26,9 @@
 #include <termios.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/sysmacros.h>
+#endif
 #endif
 
 namespace chudware::mfg::gateway {
@@ -118,6 +121,30 @@ bool pathWithin(const std::filesystem::path& path, const std::filesystem::path& 
     return true;
 }
 
+// Resolve only commissioned by-id aliases. Every component of the resulting
+// device path is opened without following symlinks, not just the final node.
+int openPosixSerialTarget(const std::filesystem::path& target) {
+    const auto absolute = std::filesystem::absolute(target).lexically_normal();
+    int directory = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0) return -1;
+    for (auto part = ++absolute.begin(); part != absolute.end(); ++part) {
+        auto next = part;
+        ++next;
+        const int flags = next == absolute.end()
+                              ? O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW
+                              : O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW;
+        const int opened = ::openat(directory, part->c_str(), flags);
+        const int error = errno;
+        ::close(directory);
+        if (opened < 0) {
+            errno = error;
+            return -1;
+        }
+        directory = opened;
+    }
+    return directory;
+}
+
 bool resolvePosixSerialTarget(const std::filesystem::path& address,
                               const SerialTransportOptions& options,
                               std::filesystem::path& target, std::string& why) {
@@ -158,11 +185,45 @@ std::optional<std::string> readSysfsAttribute(const std::filesystem::path& path)
     return value;
 }
 
-std::optional<EndpointIdentity> posixUsbIdentity(
+struct PosixUsbIdentity {
+    EndpointIdentity endpoint;
+    unsigned device_major = 0;
+    unsigned device_minor = 0;
+};
+
+bool deviceNumberMatches(const struct stat& status, const PosixUsbIdentity& identity) {
+    return S_ISCHR(status.st_mode) &&
+           static_cast<unsigned>(major(status.st_rdev)) == identity.device_major &&
+           static_cast<unsigned>(minor(status.st_rdev)) == identity.device_minor;
+}
+
+std::optional<PosixUsbIdentity> posixUsbIdentity(
     std::string_view commissioned_address, const std::filesystem::path& target,
     const SerialTransportOptions& options, std::string& why) {
-    std::filesystem::path cursor =
-        std::filesystem::path(options.posix_sysfs_tty_root) / target.filename() / "device";
+    const auto tty_path = std::filesystem::path(options.posix_sysfs_tty_root) / target.filename();
+    const auto device_number = readSysfsAttribute(tty_path / "dev");
+    PosixUsbIdentity identity;
+    if (!device_number) {
+        why = "serial USB identity refused: sysfs device number is unavailable";
+        return std::nullopt;
+    }
+    const auto colon = device_number->find(':');
+    if (colon == std::string::npos) {
+        why = "serial USB identity refused: sysfs device number is invalid";
+        return std::nullopt;
+    }
+    const char* begin = device_number->data();
+    const char* end = begin + device_number->size();
+    const auto [major_end, major_error] =
+        std::from_chars(begin, begin + colon, identity.device_major);
+    const auto [minor_end, minor_error] =
+        std::from_chars(begin + colon + 1, end, identity.device_minor);
+    if (major_error != std::errc{} || major_end != begin + colon ||
+        minor_error != std::errc{} || minor_end != end) {
+        why = "serial USB identity refused: sysfs device number is invalid";
+        return std::nullopt;
+    }
+    std::filesystem::path cursor = tty_path / "device";
     std::error_code error;
     if (!std::filesystem::exists(cursor, error) || error) {
         why = "serial USB identity refused: sysfs device path is unavailable";
@@ -185,8 +246,10 @@ std::optional<EndpointIdentity> posixUsbIdentity(
                 why = "serial USB identity refused: sysfs USB tuple is incomplete";
                 return std::nullopt;
             }
-            return EndpointIdentity::serial(std::string(commissioned_address), *vid, *pid,
-                                            *serial);
+            identity.endpoint = EndpointIdentity::serial(
+                std::string(commissioned_address), *vid, *pid, *serial);
+            if (!identity.endpoint.valid(&why)) return std::nullopt;
+            return identity;
         }
         const auto parent = cursor.parent_path();
         if (parent == cursor || parent.empty()) break;
@@ -235,36 +298,37 @@ device::OpenResult SerialTransport::open(const device::Endpoint& endpoint) {
     if (!resolvePosixSerialTarget(identity.address, options_, open_target, identity_why))
         return {false, std::move(identity_why)};
 
-    bool commissioned_usb_tuple = false;
-    for (const auto& entry : allowlist_.entries()) {
-        if (entry.endpoint.transport == device::TransportKind::Serial &&
-            entry.endpoint.address == identity.address &&
-            entry.machine_class == machine_class_ &&
-            !entry.endpoint.usb_vid.empty()) {
-            commissioned_usb_tuple = true;
-            break;
-        }
-    }
-    if (commissioned_usb_tuple) {
-        const auto observed =
-            posixUsbIdentity(identity.address, open_target, options_, identity_why);
-        if (!observed) return {false, std::move(identity_why)};
-        const bool matched = std::any_of(
-            allowlist_.entries().begin(), allowlist_.entries().end(),
-            [&](const AllowlistEntry& entry) {
-                return entry.endpoint.transport == device::TransportKind::Serial &&
-                       entry.endpoint.address == identity.address &&
-                       entry.machine_class == machine_class_ &&
-                       entry.endpoint.usb_vid == observed->usb_vid &&
-                       entry.endpoint.usb_pid == observed->usb_pid &&
-                       entry.endpoint.usb_serial == observed->usb_serial;
-            });
-        if (!matched) {
-            return {false, "serial USB identity mismatch: observed " + usbTuple(*observed) +
-                               " does not match the commissioned tuple"};
-        }
-        identity = *observed;
-    }
+    const auto commissioned = std::find_if(
+        allowlist_.entries().begin(), allowlist_.entries().end(),
+        [&](const AllowlistEntry& entry) {
+            return entry.endpoint.transport == device::TransportKind::Serial &&
+                   entry.endpoint.address == identity.address &&
+                   entry.machine_class == machine_class_;
+        });
+    if (commissioned == allowlist_.entries().end())
+        return {false, allowlist_.authorize({identity, machine_class_,
+                    {{"baud", std::to_string(options_.baud)}}, options_.operator_note}).why};
+    if (!commissioned->endpoint.valid(&identity_why))
+        return {false, "commissioning refused: " + identity_why};
+    struct stat validated_status {};
+    if (::lstat(open_target.c_str(), &validated_status) != 0)
+        return {false, "serial path validation failed: " + std::string(std::strerror(errno))};
+    if (!S_ISCHR(validated_status.st_mode))
+        return {false, "serial open refused: endpoint is not a character device"};
+    const auto observed = posixUsbIdentity(identity.address, open_target, options_, identity_why);
+    if (!observed) return {false, std::move(identity_why)};
+    if (!deviceNumberMatches(validated_status, *observed))
+        return {false, "serial USB identity mismatch: sysfs device number differs from endpoint"};
+    const bool matched = std::any_of(
+        allowlist_.entries().begin(), allowlist_.entries().end(),
+        [&](const AllowlistEntry& entry) {
+            return entry.endpoint.key() == observed->endpoint.key() &&
+                   entry.machine_class == machine_class_;
+        });
+    if (!matched)
+        return {false, "serial USB identity mismatch: observed " + usbTuple(observed->endpoint) +
+                           " does not match the commissioned tuple"};
+    identity = observed->endpoint;
 #endif
     CommissioningCandidate commissioning{
         identity,
@@ -293,9 +357,10 @@ device::OpenResult SerialTransport::open(const device::Endpoint& endpoint) {
     }
     handle_ = reinterpret_cast<std::intptr_t>(file);
 #else
-    const int fd = ::open(open_target.c_str(),
-                          O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+    const int fd = openPosixSerialTarget(open_target);
     if (fd < 0) {
+        if (errno == ELOOP || errno == ENOTDIR)
+            return {false, "serial symlink refused: device path contains a symlink or non-directory"};
         if (errno == EBUSY || errno == EACCES)
             return {false, "serial exclusive open refused: port is already claimed"};
         return {false, "serial open failed: " + std::string(std::strerror(errno))};
@@ -310,6 +375,18 @@ device::OpenResult SerialTransport::open(const device::Endpoint& endpoint) {
     if (!S_ISCHR(descriptor_status.st_mode)) {
         ::close(fd);
         return {false, "serial open refused: endpoint is not a character device"};
+    }
+    // No termios changes or identification traffic may precede this binding.
+    const auto opened_identity =
+        posixUsbIdentity(identity.address, open_target, options_, identity_why);
+    if (!opened_identity || !deviceNumberMatches(descriptor_status, *observed) ||
+        !deviceNumberMatches(descriptor_status, *opened_identity) ||
+        opened_identity->endpoint.key() != identity.key() ||
+        descriptor_status.st_dev != validated_status.st_dev ||
+        descriptor_status.st_ino != validated_status.st_ino ||
+        descriptor_status.st_rdev != validated_status.st_rdev) {
+        ::close(fd);
+        return {false, "serial USB identity mismatch: opened descriptor differs from validated device"};
     }
     if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
         const int error = errno;
@@ -766,8 +843,15 @@ std::vector<SerialCandidate> SerialTransport::enumerate(std::string* why) {
         const std::filesystem::directory_iterator end;
         while (!error && iterator != end) {
             const auto path = iterator->path();
-            candidates.push_back({EndpointIdentity::serial(path.string()),
-                                  path.filename().string(), true});
+            EndpointIdentity identity = EndpointIdentity::serial(path.string());
+            std::filesystem::path target;
+            std::string identity_why;
+            const SerialTransportOptions options;
+            if (resolvePosixSerialTarget(path, options, target, identity_why)) {
+                const auto observed = posixUsbIdentity(path.string(), target, options, identity_why);
+                if (observed) identity = observed->endpoint;
+            }
+            candidates.push_back({std::move(identity), path.filename().string(), true});
             iterator.increment(error);
         }
     }

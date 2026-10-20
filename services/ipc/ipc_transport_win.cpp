@@ -2,19 +2,11 @@
 // AF_UNIX backend lives in ipc_transport.cpp; both files are always listed in
 // CMake and self-select via the #ifdef, so no per-platform source lists.
 //
-// WRITTEN ON LINUX, NEVER COMPILED HERE — every Win32 call below was checked
-// against its documented signature, but this file is UNVERIFIED until the
-// manual Windows checklist in docs/reference/PACKAGING_WINDOWS.md runs on a real box.
-//
 // Shape of the backend:
 //   * Byte-mode duplex pipes, PIPE_REJECT_REMOTE_CLIENTS, unlimited instances.
-//   * All handles are opened FILE_FLAG_OVERLAPPED. Reads/writes still LOOK
-//     synchronous to the caller: writeLine blocks in GetOverlappedResult;
-//     readLine only issues ReadFile after PeekNamedPipe reports bytes, so the
-//     overlapped op completes immediately (this mirrors the proven
-//     WorkerClient::readLine polling pattern in services/worker/worker_client.cpp).
-//     Overlapped mode exists for ONE reason: accept() needs a timeout, and a
-//     timed ConnectNamedPipe is only possible overlapped.
+//   * Overlapped reads/writes wait on distinct completion events and a sticky
+//     shutdown event. Timeouts cancel and drain before stack buffers retire;
+//     normal blocking reads do not poll the pipe or the system timer.
 //   * Security (plan Top-risk "pipe squat/spoof"):
 //       server: explicit DACL = current-user SID + SYSTEM only, plus
 //               FILE_FLAG_FIRST_PIPE_INSTANCE on instance #1 so a squatter who
@@ -26,6 +18,7 @@
 #ifdef _WIN32
 
 #include "ipc_transport.h"
+#include "ipc_windows_local.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -88,6 +81,38 @@ PSID sidOf(std::vector<unsigned char>& tu) {
     return reinterpret_cast<TOKEN_USER*>(tu.data())->User.Sid;
 }
 
+enum class PipeIoResult { complete, timeout, closed };
+
+PipeIoResult pipeIo(HANDLE pipe, HANDLE event, HANDLE stopped, bool write,
+                    void* buffer, DWORD size, DWORD waitMs, DWORD& count) {
+    count = 0;
+    if (WaitForSingleObject(stopped, 0) == WAIT_OBJECT_0 || !ResetEvent(event))
+        return PipeIoResult::closed;
+    OVERLAPPED operation{};
+    operation.hEvent = event;
+    BOOL completed = write ? WriteFile(pipe, buffer, size, nullptr, &operation)
+                           : ReadFile(pipe, buffer, size, nullptr, &operation);
+    if (!completed) {
+        if (GetLastError() != ERROR_IO_PENDING) return PipeIoResult::closed;
+        const HANDLE events[] = {stopped, event};
+        const DWORD waited = WaitForMultipleObjects(2, events, FALSE, waitMs);
+        if (waited != WAIT_OBJECT_0 + 1) {
+            CancelIoEx(pipe, &operation);
+            // A completion can race the deadline. Preserve any consumed bytes,
+            // and always drain before the OVERLAPPED or caller buffer retires.
+            completed = GetOverlappedResult(pipe, &operation, &count, TRUE);
+            const DWORD error = completed ? ERROR_SUCCESS : GetLastError();
+            if (!completed) count = 0;
+            if (waited == WAIT_TIMEOUT && (completed || error == ERROR_OPERATION_ABORTED))
+                return PipeIoResult::timeout;
+            return PipeIoResult::closed;
+        }
+    }
+    completed = GetOverlappedResult(pipe, &operation, &count, FALSE);
+    if (!completed) count = 0;
+    return completed && count ? PipeIoResult::complete : PipeIoResult::closed;
+}
+
 }  // namespace
 
 // ------------------------------------------------------------------ IpcConn
@@ -95,7 +120,12 @@ PSID sidOf(std::vector<unsigned char>& tu) {
 IpcConn::IpcConn(void* pipeHandle) {
     if (pipeHandle == INVALID_HANDLE_VALUE) pipeHandle = nullptr;
     h_ = pipeHandle;
-    if (h_) ev_ = CreateEventW(nullptr, /*manual reset*/ TRUE, FALSE, nullptr);
+    if (h_) {
+        ev_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        writeEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        shutdownEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ev_ || !writeEvent_ || !shutdownEvent_) close();
+    }
 }
 
 IpcConn& IpcConn::operator=(IpcConn&& o) noexcept {
@@ -103,11 +133,15 @@ IpcConn& IpcConn::operator=(IpcConn&& o) noexcept {
         close();
         h_ = o.h_;
         ev_ = o.ev_;
+        writeEvent_ = o.writeEvent_;
+        shutdownEvent_ = o.shutdownEvent_;
         // std::atomic is not assignable — mirror the Linux path (store/load).
         eof_.store(o.eof_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         readBuf_ = std::move(o.readBuf_);
         o.h_ = nullptr;
         o.ev_ = nullptr;
+        o.writeEvent_ = nullptr;
+        o.shutdownEvent_ = nullptr;
         o.eof_.store(false, std::memory_order_relaxed);
         o.readBuf_.clear();
     }
@@ -124,78 +158,91 @@ void IpcConn::close() {
         CloseHandle((HANDLE)ev_);
         ev_ = nullptr;
     }
+    if (writeEvent_) {
+        CloseHandle((HANDLE)writeEvent_);
+        writeEvent_ = nullptr;
+    }
+    if (shutdownEvent_) {
+        CloseHandle((HANDLE)shutdownEvent_);
+        shutdownEvent_ = nullptr;
+    }
 }
 
 void IpcConn::shutdown() {
-    // Wake a peer thread parked in an overlapped readLine WITHOUT closing the handle
-    // (the owning thread still closes it). Mirrors the POSIX shutdown() interrupt used
-    // by the daemon shutdown path before join().
+    // The owner closes only after its I/O threads join. A persistent signal
+    // closes the race where CancelIoEx runs just before an operation is issued.
+    eof_.store(true, std::memory_order_release);
+    if (shutdownEvent_) SetEvent((HANDLE)shutdownEvent_);
     if (h_) CancelIoEx((HANDLE)h_, nullptr);
 }
 
 bool IpcConn::readLine(std::string& line, int timeoutMs) {
     if (!h_ || !ev_) return false;
-    const ULONGLONG start = GetTickCount64();
+    constexpr size_t kMaxLine = 64u * 1024u * 1024u;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(std::max(0, timeoutMs));
+    size_t scanFrom = 0;
     for (;;) {
-        size_t nl = readBuf_.find('\n');
+        const size_t nl = readBuf_.find('\n', scanFrom);
+        if ((nl != std::string::npos && nl > kMaxLine) ||
+            (nl == std::string::npos && readBuf_.size() > kMaxLine)) {
+            readBuf_.clear();
+            shutdown();
+            return false;
+        }
+        scanFrom = readBuf_.size();
         if (nl != std::string::npos) {
-            line = readBuf_.substr(0, nl);
+            line.assign(readBuf_.data(), nl);
             readBuf_.erase(0, nl + 1);
             return true;
         }
         if (eof_) return false;
-        if (timeoutMs >= 0 && (int)(GetTickCount64() - start) > timeoutMs) return false;
-
-        DWORD avail = 0;
-        if (!PeekNamedPipe((HANDLE)h_, nullptr, 0, nullptr, &avail, nullptr)) {
-            eof_ = true;  // ERROR_BROKEN_PIPE etc.: peer is gone
-            return false;
+        const DWORD wait = timeoutMs < 0 ? INFINITE
+                                        : local_pipe_detail::remainingMs(deadline);
+        if (timeoutMs > 0 && !wait) return false;
+        char buffer[16384];
+        DWORD want = static_cast<DWORD>(std::min(sizeof buffer, kMaxLine + 1 - readBuf_.size()));
+        if (timeoutMs == 0) {
+            DWORD available = 0;
+            if (!PeekNamedPipe((HANDLE)h_, nullptr, 0, nullptr, &available, nullptr)) {
+                eof_.store(true, std::memory_order_release);
+                return false;
+            }
+            if (!available) return false;
+            want = std::min(want, available);
         }
-        if (avail == 0) {
-            if (timeoutMs == 0) return false;  // non-blocking probe
-            Sleep(1);
-            continue;
-        }
-        char buf[16384];
-        DWORD want = avail < (DWORD)sizeof buf ? avail : (DWORD)sizeof buf;
-        OVERLAPPED ov{};
-        ov.hEvent = (HANDLE)ev_;
         DWORD got = 0;
-        // Data is already buffered (peeked), so this completes immediately; the
-        // OVERLAPPED is still mandatory because the handle is overlapped-mode.
-        if (!ReadFile((HANDLE)h_, buf, want, nullptr, &ov) &&
-            GetLastError() != ERROR_IO_PENDING) {
-            eof_ = true;
+        const auto result = pipeIo((HANDLE)h_, (HANDLE)ev_, (HANDLE)shutdownEvent_,
+                                   false, buffer, want, wait, got);
+        if (got) readBuf_.append(buffer, got);
+        if (result == PipeIoResult::timeout) return false;
+        if (result == PipeIoResult::closed) {
+            eof_.store(true, std::memory_order_release);
             return false;
         }
-        if (!GetOverlappedResult((HANDLE)h_, &ov, &got, /*bWait=*/TRUE) || got == 0) {
-            eof_ = true;
-            return false;
-        }
-        readBuf_.append(buf, got);
     }
 }
 
 bool IpcConn::writeLine(const std::string& line) {
-    if (!h_ || !ev_) return false;
-    std::string out = line;
-    out.push_back('\n');
-    size_t off = 0;
-    while (off < out.size()) {
-        OVERLAPPED ov{};
-        ov.hEvent = (HANDLE)ev_;
-        DWORD wrote = 0;
-        if (!WriteFile((HANDLE)h_, out.data() + off, (DWORD)(out.size() - off), nullptr,
-                       &ov) &&
-            GetLastError() != ERROR_IO_PENDING) {
-            eof_ = true;
-            return false;
+    if (!h_ || !writeEvent_ || eof_) return false;
+    // Two views avoid allocating/copying the whole frame merely to append '\n'.
+    const char newline = '\n';
+    const char* segments[] = {line.data(), &newline};
+    const size_t sizes[] = {line.size(), 1};
+    for (size_t segment = 0; segment < 2; ++segment) {
+        size_t offset = 0;
+        while (offset < sizes[segment]) {
+            DWORD wrote = 0;
+            const DWORD size = static_cast<DWORD>(
+                std::min<size_t>(sizes[segment] - offset, 65536));
+            const auto result = pipeIo((HANDLE)h_, (HANDLE)writeEvent_, (HANDLE)shutdownEvent_,
+                true, const_cast<char*>(segments[segment] + offset), size, INFINITE, wrote);
+            if (result != PipeIoResult::complete) {
+                eof_.store(true, std::memory_order_release);
+                return false;
+            }
+            offset += wrote;
         }
-        if (!GetOverlappedResult((HANDLE)h_, &ov, &wrote, /*bWait=*/TRUE) || wrote == 0) {
-            eof_ = true;
-            return false;
-        }
-        off += wrote;
     }
     return true;
 }
@@ -248,6 +295,11 @@ bool IpcListener::createNextInstance(bool first, std::string& err) {
     pending_ = h;
     connectPending_ = false;
     return true;
+}
+
+bool IpcListener::adoptListeningFd(int /*fd*/, std::string& err) {
+    err = "Windows: inherited Unix listeners are unsupported";
+    return false;
 }
 
 bool IpcListener::listen(const std::string& path, std::string& err) {
@@ -343,6 +395,12 @@ IpcConn IpcListener::accept(int timeoutMs) {
                 SetEvent(ev);  // client raced in between create and connect
             } else if (e == ERROR_IO_PENDING) {
                 connectPending_ = true;
+            } else if (e == ERROR_NO_DATA) {
+                // A client opened and closed before accept issued the connect.
+                // Without recycling, every subsequent accept hits NO_DATA and
+                // the live first instance permanently loses admission capacity.
+                DisconnectNamedPipe((HANDLE)pending_);
+                return IpcConn();
             } else {
                 return IpcConn();  // listener is likely broken; caller loops
             }
@@ -375,6 +433,14 @@ std::string IpcListener::releasePath() {
 
 void IpcListener::close(bool /*unlink_path*/) {
     // Named pipes have no sock file to unlink; unlink_path is ignored on Windows.
+    if (pending_ && ov_ && connectPending_) {
+        DWORD ignored = 0;
+        auto* operation = static_cast<OVERLAPPED*>(ov_);
+        CancelIoEx(static_cast<HANDLE>(pending_), operation);
+        // Closing the handle only requests cancellation too. The kernel must
+        // finish before the heap OVERLAPPED and its event can be freed.
+        GetOverlappedResult(static_cast<HANDLE>(pending_), operation, &ignored, TRUE);
+    }
     if (pending_) {
         CloseHandle((HANDLE)pending_);
         pending_ = nullptr;
@@ -423,33 +489,9 @@ IpcConn connectTo(const std::string& path, std::string& err) {
         return IpcConn();
     }
 
-    // Anti-spoof (plan Top-risk 2): only talk to a server running as us (or
-    // SYSTEM). A squatter re-creating the name after our daemon exits would
-    // otherwise receive our doc contents / agent_spawn commands.
-    ULONG serverPid = 0;
-    std::string terr;
-    if (!GetNamedPipeServerProcessId(h, &serverPid)) {
-        err = winErr("GetNamedPipeServerProcessId", GetLastError());
-        CloseHandle(h);
-        return IpcConn();
-    }
-    HANDLE sp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, serverPid);
-    if (!sp) {
-        err = winErr("OpenProcess(pipe server)", GetLastError());
-        CloseHandle(h);
-        return IpcConn();
-    }
-    std::vector<unsigned char> mine = tokenUser(GetCurrentProcess(), terr);
-    std::vector<unsigned char> theirs = tokenUser(sp, terr);
-    CloseHandle(sp);
-    bool ok = false;
-    if (!mine.empty() && !theirs.empty()) {
-        PSID s = sidOf(theirs);
-        ok = EqualSid(sidOf(mine), s) || IsWellKnownSid(s, WinLocalSystemSid);
-    }
-    if (!ok) {
-        err = terr.empty() ? "pipe server identity mismatch (not our user): " + path
-                           : "pipe server identity check failed: " + terr;
+    // Shared anti-spoof rule: capability/document bytes go only to our owner or SYSTEM.
+    if (!trustedPipeServer(h)) {
+        err = "pipe server identity mismatch";
         CloseHandle(h);
         return IpcConn();
     }

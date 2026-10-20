@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from pathlib import Path
 import hashlib
 
 import math
 import os
+import threading
 
 import pytest
 
@@ -18,6 +20,20 @@ from services.agent import (
     worker_rpc,
 )
 from services.mcp import cad_common
+from services.agent.test_chudcode_host import cell_launch_runtime
+
+
+def test_selected_nested_workspace_stays_authoritative(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    selected = repository / "nested workspace"
+    selected.mkdir(parents=True)
+    (repository / ".git").mkdir()
+    monkeypatch.chdir(repository)
+    project, save_dir, error = worker_rpc.resolve_workspace(
+        {"workspace_dir": str(selected)}
+    )
+    assert error is None
+    assert project == save_dir == str(selected.resolve())
 
 
 class _Binding:
@@ -91,7 +107,7 @@ class _FakeHost:
         self.cancel_calls.append(run_id)
         return {"ok": True, "run_id": run_id, "cancelled": True, "active": True}
 
-    def steer(self, run_id, text, attachments=None):
+    def steer(self, run_id, text, attachments=None, *, steer_id=None):
         self.steer_calls.append((run_id, text))
         return {"ok": True, "run_id": run_id, "steered": True, "active": True}
 
@@ -373,6 +389,7 @@ def online_lane(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "clear_pooled_credentials", lambda: None)
     monkeypatch.setattr(config, "bind_subscription_grant", lambda grant: None)
 
+    real_dispatch = mission_dispatch.MissionDispatch
     class FakeDispatch:
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
@@ -404,6 +421,7 @@ def online_lane(monkeypatch, tmp_path):
         tool_contexts=tool_contexts,
         prompt_calls=prompt_calls,
         workspace=tmp_path,
+        dispatch_type=real_dispatch,
     )
 
 
@@ -417,6 +435,80 @@ def _params(lane, *, run_id, request="Do the work", **extra):
         "model": "gpt-test",
         **extra,
     }
+
+
+@pytest.mark.parametrize("outcome", ["success", "cancel", "error", "crash", "preflight"])
+def test_admin_turn_retires_only_its_preflight_and_finalization_connections(
+    online_lane, monkeypatch, outcome
+):
+    from services.mcp import daemon_bridge
+
+    class Connection:
+        def __init__(self, *, writer_group):
+            self.closed = False
+
+        def call(self, method, params=None):
+            assert not self.closed
+            return {"docs": []}
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(daemon_bridge, "DaemonClient", Connection)
+    monkeypatch.setattr(daemon_bridge, "_clients", threading.local())
+    monkeypatch.setattr(daemon_bridge, "_call_connections", threading.local())
+    standalone = daemon_bridge.client()
+    caller_pool = daemon_bridge.TurnConnections()
+    host_pool = daemon_bridge.TurnConnections()
+    owned, nested = [], []
+
+    def preflight(method, params):
+        owned.append(daemon_bridge.client())
+        return owned[-1].call(method, params)
+
+    monkeypatch.setattr(worker_rpc, "_editor_engine_call", preflight)
+    save = cad_common.save_touched_docs
+
+    def final_save():
+        assert daemon_bridge.client() is owned[0]
+        assert not owned[0].closed
+        return save()
+
+    monkeypatch.setattr(cad_common, "save_touched_docs", final_save)
+    run_turn = online_lane.host.run_turn
+
+    def nested_turn(params, emit):
+        with daemon_bridge.turn_connection_scope(host_pool):
+            nested.append(daemon_bridge.client())
+            assert nested[-1] is not owned[0]
+            return run_turn(params, emit)
+
+    online_lane.host.run_turn = nested_turn
+    if outcome == "preflight":
+        def failed_prompt(*args, **kwargs):
+            raise RuntimeError("prompt assembly failed after the CAD preflight")
+        monkeypatch.setattr(mission_dispatch, "role_prompt", failed_prompt)
+    else:
+        online_lane.host.mode = outcome
+    try:
+        with daemon_bridge.turn_connection_scope(caller_pool):
+            caller = daemon_bridge.client()
+            result = worker_rpc._agent_admin_turn(
+                _params(online_lane, run_id=outcome,
+                        chudcode_session_file="/sessions/conversation-1.jsonl"),
+                lambda event: None,
+            )
+            assert result["ok"] is (outcome in {"success", "cancel"})
+            assert owned and all(connection.closed for connection in owned)
+            assert daemon_bridge.client() is caller and not caller.closed
+            assert all(not connection.closed for connection in nested)
+        assert daemon_bridge.client() is standalone and not standalone.closed
+        assert online_lane.saved == ([] if outcome == "preflight" else ["save"])
+        assert online_lane.host.shutdown_count == 0
+    finally:
+        caller_pool.close()
+        host_pool.close()
+        standalone.close()
 
 
 @pytest.mark.parametrize("failure", ["error", "crash"])
@@ -794,6 +886,104 @@ def test_pool_preflight_estimates_the_exact_sent_request(online_lane, monkeypatc
     next_sent = online_lane.host.turns[-1]["request"]
     assert next_sent == compose_request_text("Do the work", "", editor)
     assert estimates[-1] == max(1, math.ceil(len(next_sent.encode("utf-8")) / 4))
+
+
+def test_turn_builds_root_tools_before_activation_and_callbacks_keep_selected_root(
+    online_lane, tmp_path, monkeypatch,
+):
+    from services.agent import chudcode_roles, request_context as tenancy, workspace
+    from services.agent.test_chudcode_tools import (
+        _NEUTRAL_TOOL_OPTIONS, _Policy, _root_tool_entries,
+    )
+    from services.mcp import core_bridge
+
+    repository = tmp_path / "repository"
+    selected = repository / "nested" / "selected"
+    selected.mkdir(parents=True)
+    (repository / ".git").mkdir()
+    (selected / "arm.stl").write_text("solid arm\nendsolid arm\n")
+    online_lane.workspace = selected / ".." / "selected"
+    for name in ("CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT", "CHUDWARE_PROJECT_SAVE_DIR"):
+        monkeypatch.setenv(name, str(repository))
+    monkeypatch.setattr(config, "get_tool_options", lambda *_: dict(_NEUTRAL_TOOL_OPTIONS))
+    monkeypatch.setattr(config, "tool_timeout_s_default", lambda: 0)
+    monkeypatch.setattr(workspace, "_session_registry", {})
+    monkeypatch.setattr(
+        mission_dispatch, "role_prompt",
+        lambda *_args, **_kwargs: (
+            "Use the workspace", ["workspace_status", "browse_models", "fs_list"],
+        ),
+    )
+    entries = _root_tool_entries()
+    real_build = chudcode_roles.build_host_tools
+    assembly_roots = []
+
+    def build(context):
+        assembly_roots.append(tenancy.root_value("CHUDWARE_PROJECT_DIR"))
+        context.update(
+            tool_entries=entries, policy_registry=_Policy(),
+            resolver=lambda name: getattr(entries.get(name), "fn", None),
+        )
+        return real_build(context)
+
+    monkeypatch.setattr(chudcode_tools, "build_host_tools", build)
+    monkeypatch.setattr(
+        core_bridge, "call",
+        lambda method, params=None: {
+            "docs": [{"doc_id": "arm", "path": str(selected / "arm.stl")}],
+        },
+    )
+    real_run = online_lane.host.run_turn
+    observed = {}
+    failures = []
+
+    def run(params, emit):
+        bindings = {binding.name: binding for binding in params["host_tools"]}
+        assert params["mode"] == "agent"
+        assert {"workspace_status", "browse_models", "fs_list"} <= bindings.keys()
+
+        def callback():
+            try:
+                assert tenancy.current_context() == {}
+                host_context = SimpleNamespace(
+                    cancelled=False, tool_call_id="js-write-workspace",
+                    agent_id="ArmBuilder", parent_agent_id="Main",
+                )
+                for name, args in (
+                    ("workspace_status", {}),
+                    ("browse_models", {"sheets": False, "pattern": "*.stl"}),
+                    ("fs_list", {}),
+                ):
+                    tool = bindings[name].to_host_tool(lambda **kwargs: kwargs)
+                    observed[name] = tool["execute"](args, host_context)["details"]
+            except BaseException as exc:
+                failures.append(exc)
+
+        thread = threading.Thread(target=callback)
+        thread.start()
+        thread.join(5)
+        assert not thread.is_alive()
+        assert not failures
+        return real_run(params, emit)
+
+    monkeypatch.setattr(online_lane.host, "run_turn", run)
+    # The fixture's unset work style defaults to Plan, whose frozen read-only
+    # roster excludes workspace_status. Exercise the actual Agent tool assembly.
+    result = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="selected-root-tools", mode="agent"),
+        lambda _event: None,
+    )
+    assert result["ok"], result
+    assert assembly_roots == [str(repository)]
+    assert observed["workspace_status"]["ok"], observed["workspace_status"]
+    assert observed["workspace_status"]["project_dir"] == str(selected)
+    assert observed["workspace_status"]["docs"][0]["location"] == "project"
+    assert observed["browse_models"]["ok"], observed["browse_models"]
+    assert observed["browse_models"]["root"] == str(selected)
+    assert [row["file"] for row in observed["browse_models"]["models"]] == ["arm.stl"]
+    assert observed["fs_list"]["ok"], observed["fs_list"]
+    assert observed["fs_list"]["path"] == str(selected)
+    assert [row["name"] for row in observed["fs_list"]["entries"]] == ["arm.stl"]
 
 
 def test_crashed_turn_restores_workspace_and_credentials(online_lane, monkeypatch):
@@ -1313,3 +1503,181 @@ def test_explicit_turn_budget_is_announced_in_the_assembled_prompt(online_lane, 
     else:
         assert sent == f"Do the work\n\n{notice}"
         assert online_lane.host.turns[-1]["timeout"] == 600.0
+
+
+@pytest.mark.parametrize("mode", ["ask", "plan", "agent"])
+def test_cell_single_turn_does_not_authorize_delegate(online_lane, monkeypatch, mode):
+    from services.agent import request_context as tenancy
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(online_lane.workspace / "cell-state"))
+    monkeypatch.setattr(mission_dispatch, "MissionDispatch", online_lane.dispatch_type)
+    monkeypatch.setattr(worker_rpc, "resolve_workspace", lambda params: ("/work", "/work", None))
+    ctx = {"cell": True, "workspace_key": "team:worker/work", "actor_key": "alice",
+           "actor_hex": hashlib.sha256(b"alice").hexdigest()[:32], "right": "editor", "epoch": 1}
+    with tenancy.bind_context(ctx):
+        session = tenancy.mint_handle("session")
+        run_id = tenancy.mint_handle("run", parent=session)
+        result = worker_rpc._agent_admin_turn(_params(
+            online_lane, run_id=run_id, session_id=session, mode=mode,
+            _chudware_actor={"email": "alice@example.test", "plan": "pro",
+                             "credits_remaining": 10, "key_source": "byok"},
+            provider_grant="cpg1.fixture.signature",
+        ), lambda event: None)
+        assert result["ok"], result
+        dispatch = online_lane.tool_contexts[0]["mission_dispatch"]
+        assert dispatch.execution_options["max_subagent_depth"] == 0
+        refusal = dispatch.delegate(role="reviewer", brief="inspect only", budget_tokens=16000)
+        assert refusal["ok"] is False and refusal["reason"] == "spawn_depth_policy", refusal
+        assert len(online_lane.host.turns) == 1
+
+
+@pytest.mark.parametrize("mode", ["ask", "plan", "agent"])
+def test_cell_turn_delegate_uses_actual_parent_session_and_broker_scope(
+    online_lane, cell_launch_runtime, monkeypatch, mode
+):
+    from services.agent import chudcode_host, chudcode_roles, request_context as tenancy, role_models
+    from services.agent.test_chudcode_host import CellLaunchFactory
+
+    factory = CellLaunchFactory()
+    host = chudcode_host.ChudcodeSessionHost(client_factory=factory)
+    ctx = {"cell": True, "workspace_key": "team:worker/work", "actor_key": "alice",
+           "actor_hex": hashlib.sha256(b"alice").hexdigest()[:32], "right": "editor", "epoch": 1}
+    actor = {"email": "alice@example.test", "plan": "pro", "credits_remaining": 10,
+             "key_source": "byok"}
+    monkeypatch.setattr(mission_dispatch, "MissionDispatch", online_lane.dispatch_type)
+    monkeypatch.setattr(worker_rpc, "resolve_workspace", lambda params: ("/work", "/work", None))
+    monkeypatch.setattr(worker_rpc, "get_default_chudcode_host", lambda: host)
+    monkeypatch.setattr(role_models, "resolve_for_node", lambda *args, **kwargs: None)
+    monkeypatch.setattr(role_models, "resolve_role_model", lambda *args, **kwargs: None)
+    monkeypatch.setattr(config, "get_subagent_tool_call_budget", lambda: 0)
+    monkeypatch.setattr(config, "load_config", lambda: {
+        "provider": "openai", "model": "gpt-test",
+        "agent": {"compaction_strategy": "snapcompact"},
+    })
+    monkeypatch.setattr(chudcode_roles, "get_default_chudcode_host", lambda: host)
+    monkeypatch.setattr(chudcode_host, "get_default_chudcode_host", lambda: host)
+    try:
+        with tenancy.bind_context(ctx):
+            session = tenancy.mint_handle("session")
+            run_id = tenancy.mint_handle("run", parent=session)
+            params = _params(
+                online_lane, run_id=run_id, session_id=session, workspace_dir="/work",
+                request="Inspect two documents", doc_count=2,
+                mode=mode, _chudware_actor=actor, provider_grant="cpg1.fixture.signature",
+            )
+            result = worker_rpc._agent_admin_turn(params, lambda event: None)
+            assert result["ok"], result
+            dispatch = online_lane.tool_contexts[0]["mission_dispatch"]
+            assert dispatch.execution_options["session_id"] == session
+            parent = host.session_launch_params(session)
+            child = dispatch.delegate(role="reviewer", brief="inspect only", budget_tokens=16000)
+            if mode == "ask":
+                # Answer-only parents do not authorize delegation. Exercise the
+                # private live-parent role lane without changing that policy.
+                assert child["ok"] is False and child["reason"] == "spawn_depth_policy", child
+                assert len(factory.clients) == 1
+                child = chudcode_roles.run_role_turn(
+                    "inspect only", "reviewer", session_id=session, run_id="private-review",
+                )
+                assert child["success"], child
+            else:
+                assert child.get("executed") and child["subagent_status"] == "done", child
+            inherited = host.session_launch_params(child["session_id"])
+            assert child["session_id"] not in (session, run_id)
+            assert inherited["web_provider_grant"] == params["provider_grant"]
+            assert inherited["web_tenant"] == "alice"
+            assert inherited["mode"] == mode
+            assert inherited["settings"]["compaction_settings"] == parent["settings"]["compaction_settings"]
+            assert inherited["settings"]["compaction_settings"]["methodOrder"] == ["snapcompact"]
+            assert inherited["workspace_dir"] == "/work"
+            assert not {"api_key", "web_credential", "byok_key"} & inherited.keys()
+            client = factory.clients[-1]
+            assert client.kwargs["command"][:4] == [
+                "/opt/chudware/bin/chudware-actor-sandbox", ctx["actor_hex"],
+                "rw" if mode == "agent" else "ro", "--",
+            ]
+            assert client.kwargs["env"]["CHUDWARE_PROVIDER_GRANT"] == params["provider_grant"]
+            assert client.kwargs["env"]["ANTHROPIC_API_KEY"] == ""
+            assert "inspect only" in Path(client.session_file).read_text()
+            before = len(factory.clients)
+            assert chudcode_roles.run_role_turn(
+                "inspect", "reviewer", session_id=run_id, run_id="child"
+            )["stop_reason"] == "not_found"
+            assert len(factory.clients) == before
+            if mode == "agent":
+                pytest.importorskip("langgraph")
+                from services.agent.test_chudcode_tools import _Policy
+                assert host.release_session(child["session_id"]) == {"ok": True, "released": True}
+                # Real role bindings retain the owning roots after the turn exits.
+                # Preserve those roots here so the released-parent check is reached.
+                stale_child = chudcode_tools.HostToolBinding(
+                    "delegate", "Delegate from the owning role", {"type": "object"},
+                    context={"session_id": child["session_id"], "mode": "agent",
+                             "mission_dispatch": dispatch, "policy_registry": _Policy()},
+                    project_root="/work", save_root="/work",
+                )
+                refused = chudcode_tools.dispatch_host_tool(
+                    stale_child, {"role": "reviewer", "brief": "inspect only", "budget_tokens": 16000},
+                    None, None,
+                )
+                assert refused["ok"] is False and refused["stop_reason"] == "not_found", refused
+                assert len(factory.clients) == before
+                assert dispatch.execution_options["session_id"] == session
+                from services.dag.test_mcp_tools import _build_clients
+                from services.dag.test_executor import _two_node_graph
+                target = _build_clients()["dag_run"]
+                binding = chudcode_tools.HostToolBinding(
+                    "dag_run", "Run governed DAG", {"type": "object"}, handler=target,
+                    context={"session_id": session, "mode": "agent", "policy_registry": _Policy()},
+                    project_root="/work", save_root="/work",
+                )
+                dag_result = chudcode_tools.dispatch_host_tool(
+                    binding, {"graph_json": _two_node_graph(), "autonomy_default": "auto",
+                              "initial_state": {"session_id": "foreign-session"}}, None, None,
+                )
+                import json
+                dag_result = json.loads(dag_result) if isinstance(dag_result, str) else dag_result
+                assert dag_result["ok"], dag_result
+                assert dag_result["status"] == "done", dag_result
+                assert set(dag_result["nodes"]) == {"n_plan", "n_report"}
+                for node in dag_result["nodes"].values():
+                    assert node["status"] == "done", node
+                    turn = node["output"]["data"]["agent_result"]
+                    assert turn["success"] and turn["stop_reason"] == "completed", turn
+                    assert turn["session_id"] not in (session, run_id, "foreign-session")
+                    launched = host.session_launch_params(turn["session_id"])
+                    assert launched["web_provider_grant"] == params["provider_grant"]
+                    assert launched["settings"]["compaction_settings"] == parent["settings"]["compaction_settings"]
+                    assert launched["workspace_dir"] == "/work"
+                    assert Path(turn["chudcode_session_file"]).is_file()
+    finally:
+        host.shutdown()
+
+
+@pytest.mark.parametrize("field", ["api_key", "web_credential", "byok_key", "web_provider_grant"])
+def test_cell_worker_refuses_upstream_or_internal_credential_fields(online_lane, monkeypatch, field):
+    from services.agent import request_context as tenancy
+    monkeypatch.setenv("XDG_DATA_HOME", str(online_lane.workspace / "cell-state"))
+    ctx = {"cell": True, "workspace_key": "team:worker/work", "actor_key": "alice",
+           "actor_hex": hashlib.sha256(b"alice").hexdigest()[:32], "right": "editor", "epoch": 1}
+    monkeypatch.setattr(worker_rpc, "resolve_workspace", lambda params: ("/work", "/work", None))
+    with tenancy.bind_context(ctx):
+        session = tenancy.mint_handle("session")
+        run_id = tenancy.mint_handle("run", parent=session)
+        result = worker_rpc._agent_admin_turn(
+            _params(online_lane, run_id=run_id, session_id=session,
+                    _chudware_actor={"key_source": "byok"}, **{field: "forbidden"}),
+            lambda event: None,
+        )
+        assert result["reason"] == "credential_isolation_unsupported"
+        assert not online_lane.host.turns
+
+
+def test_broker_grants_are_redacted_from_nested_service_results():
+    assert worker_rpc._redact_sensitive_response({
+        "nested": [{"provider_grant": "cpg1.actor.signature",
+                    "web_provider_grant": "cpg1.actor.signature", "session_id": "opaque"}]
+    }) == {
+        "nested": [{"provider_grant": "<redacted>", "web_provider_grant": "<redacted>",
+                    "session_id": "opaque"}]
+    }

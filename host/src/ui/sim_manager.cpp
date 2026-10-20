@@ -1175,6 +1175,11 @@ bool SimManager::configureActiveStudy(AppState& st, const nlohmann::json& candid
     error = "/material must name an installed simulation material.";
     return false;
   }
+  if (updatePartMaterial && st.docLockedByAgent(st.docMirror.docId())) {
+    error = st.agentLockReason(st.docMirror.docId());
+    st.toast(ui::ToastLevel::Warn, error);
+    return false;
+  }
   const bool changed = setupDefinition(definition) != setupDefinition(before);
   if (changed && current.type != StudyType::Topology) {
     for (const char* key : {"results", "result", "result_summary", "summary",
@@ -1986,6 +1991,8 @@ bool SimManager::handleCommand(AppState &st, const std::string &cmdId) {
     if (cmdId == "sim_topology_manufacturing") {
       node_ = SimNode::Regions;
       topoSettingsView_.focusManufacturing = true;
+      topoBcView_.focusPointer.clear();
+      topoBcView_.armedPointer.clear();
       armedWell_ = -1;
       return true;
     }
@@ -2315,10 +2322,14 @@ void SimManager::configureActive(AppState &st, float density,
                                  const std::string &materialKey) {
   if (sel_ < 0 || sel_ >= (int)studies_.size())
     return;
+  if (!materialKey.empty() && st.docLockedByAgent(st.docMirror.docId())) {
+    st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
+    return;
+  }
   studies_[sel_].meshFineness =
       density; // density and fineness share the higher=finer sense
-  if (!materialKey.empty())
-    applyPartMaterial(st, studies_[sel_], materialKey);
+  if (!materialKey.empty() && !applyPartMaterial(st, studies_[sel_], materialKey))
+    return;
   persist(st, studies_[sel_]);
 }
 

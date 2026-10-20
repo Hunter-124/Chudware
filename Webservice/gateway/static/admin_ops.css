@@ -10,51 +10,6 @@
   margin-bottom: 0;
 }
 
-.deploy-card .deploy-label {
-  display: block;
-  font-size: var(--step--1);
-  color: var(--muted, #8b93a3);
-  margin: 0 0 8px;
-}
-
-.deploy-targets {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px 14px;
-  align-items: center;
-  margin: 0 0 10px;
-}
-
-.deploy-targets label {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: var(--step--1);
-  color: var(--fg, #e8eaf0);
-  cursor: pointer;
-  user-select: none;
-  min-height: 32px;
-}
-
-.deploy-targets input[type="checkbox"] {
-  width: 16px;
-  height: 16px;
-  accent-color: #42ecce;
-}
-
-.deploy-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
-  margin: 0 0 10px;
-}
-
-.deploy-actions .btn {
-  min-height: 40px;
-  padding: 8px 14px;
-}
-
 .deploy-note {
   font-size: var(--step--1);
   color: var(--muted, #8b93a3);

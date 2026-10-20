@@ -6,14 +6,18 @@
 //   * meta.json / document.json deflated.
 //   * unknown entries preserved verbatim on resave; the entries we own are never
 //     duplicated.
-//   * atomic: write "<path>.tmp" then std::filesystem::rename (replace).
+//   * atomic: write an owner-private, exclusively created stage, then publish it.
 
+#if defined(_WIN32)
+#define _CRT_RAND_S
+#endif
 #include "doc/stepplus.h"
 
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -22,12 +26,23 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <mutex>
+#include "util/sha256.h"
 
 #if defined(_WIN32)
 #  ifndef NOMINMAX
 #    define NOMINMAX
 #  endif
 #  include <windows.h>
+#  include <io.h>
+#  include <fcntl.h>
+#  include "../../services/ipc/ipc_private.h"
+#else
+#  include <cerrno>
+#  include <fcntl.h>
+#  include <sys/stat.h>
+#  include <unistd.h>
 #endif
 
 #include <BinTools.hxx>
@@ -86,6 +101,141 @@ bool is_geometry_cache(const std::string& name) {
            name == "cache.ckpt";
 }
 
+std::string provenance_key() {
+    namespace fs = std::filesystem;
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    fs::path state = fs::u8path(native_policy::setting(true));
+    if (state.empty()) {
+#if defined(_WIN32)
+        const wchar_t* xdg = _wgetenv(L"XDG_DATA_HOME");
+        const wchar_t* home = _wgetenv(L"LOCALAPPDATA");
+#else
+        const char* xdg = std::getenv("XDG_DATA_HOME");
+        const char* home = std::getenv("HOME");
+#endif
+        if (xdg && *xdg) state = fs::path(xdg) / "Chudware";
+        else if (home && *home) state = fs::path(home) /
+#if defined(_WIN32)
+            "Chudware"
+#else
+            ".local/share/Chudware"
+#endif
+        ;
+        else throw std::runtime_error("cache provenance state directory unavailable");
+    }
+    fs::create_directories(state);
+    const fs::path path = state / "cache-provenance.key";
+    std::string key(32, '\0');
+#if defined(_WIN32)
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (file == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND) {
+        for (size_t i = 0; i < key.size(); i += sizeof(unsigned int)) {
+            unsigned int random = 0;
+            if (rand_s(&random) != 0) throw std::runtime_error("cache key entropy unavailable");
+            std::memcpy(key.data() + i, &random, sizeof(random));
+        }
+        auto& security = chudware_ipc::privateSecurity();
+        if (!security.valid()) throw std::runtime_error("cache key ACL unavailable");
+        const fs::path temporary = path.native() + L".new-" +
+            std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+        file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, &security.attributes,
+                           CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("cache key staging failed");
+        DWORD written = 0;
+        bool ok = WriteFile(file, key.data(), 32, &written, nullptr) && written == 32 &&
+                  FlushFileBuffers(file);
+        CloseHandle(file);
+        if (ok && !MoveFileW(temporary.c_str(), path.c_str())) {
+            const DWORD error = GetLastError();
+            ok = error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS;
+        }
+        DeleteFileW(temporary.c_str());
+        if (!ok) throw std::runtime_error("cache key publication failed");
+        file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    }
+    if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("cache key open failed");
+    BY_HANDLE_FILE_INFORMATION info{};
+    DWORD bytes = 0;
+    const bool ok = GetFileInformationByHandle(file, &info) &&
+                   !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+                   info.nFileSizeHigh == 0 && info.nFileSizeLow == 32 &&
+                   ReadFile(file, key.data(), 32, &bytes, nullptr) && bytes == 32;
+    CloseHandle(file);
+    if (!ok) throw std::runtime_error("cache key invalid");
+#else
+    int file = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (file < 0 && errno == ENOENT) {
+        const int random = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+        if (random < 0) throw std::runtime_error("cache key entropy unavailable");
+        size_t offset = 0;
+        while (offset < key.size()) {
+            const ssize_t n = ::read(random, key.data() + offset, key.size() - offset);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) { ::close(random); throw std::runtime_error("cache key entropy failed"); }
+            offset += static_cast<size_t>(n);
+        }
+        ::close(random);
+        const std::string temporary = path.string() + ".new-" + std::to_string(::getpid());
+        const int stage = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                                                  O_CLOEXEC, 0600);
+        if (stage < 0) throw std::runtime_error("cache key staging failed");
+        offset = 0;
+        bool ok = true;
+        while (offset < key.size()) {
+            const ssize_t n = ::write(stage, key.data() + offset, key.size() - offset);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) { ok = false; break; }
+            offset += static_cast<size_t>(n);
+        }
+        if (::fsync(stage) != 0) ok = false;
+        ::close(stage);
+        if (ok && ::link(temporary.c_str(), path.c_str()) != 0 && errno != EEXIST) ok = false;
+        ::unlink(temporary.c_str());
+        if (!ok) throw std::runtime_error("cache key publication failed");
+        file = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    }
+    if (file < 0) throw std::runtime_error("cache key open failed");
+    struct stat info{};
+    const bool valid = ::fstat(file, &info) == 0 && S_ISREG(info.st_mode) &&
+                       info.st_uid == ::geteuid() && (info.st_mode & 0777) == 0600 &&
+                       info.st_size == 32;
+    const ssize_t bytes = valid ? ::read(file, key.data(), key.size()) : -1;
+    ::close(file);
+    if (bytes != 32) throw std::runtime_error("cache key invalid");
+#endif
+    return key;
+}
+
+std::string provenance_mac(const json& manifest) {
+    const std::string key = provenance_key();
+    std::array<uint8_t, 64> inner{}, outer{};
+    for (size_t i = 0; i < inner.size(); ++i) {
+        const uint8_t byte = i < key.size() ? static_cast<uint8_t>(key[i]) : 0;
+        inner[i] = byte ^ 0x36; outer[i] = byte ^ 0x5c;
+    }
+    const std::string bytes = manifest.dump();
+    util::Sha256 ih;
+    ih.update(inner.data(), inner.size());
+    ih.update(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
+    const auto digest = ih.finish();
+    util::Sha256 oh;
+    oh.update(outer.data(), outer.size()); oh.update(digest.data(), digest.size());
+    return oh.finish_hex();
+}
+
+json cache_manifest(const std::string& doc_hash) {
+    return {{"engine", stepplus_cache_engine_key()}, {"doc_hash", doc_hash},
+            {"members", json::object()}};
+}
+
+std::string sign_manifest(const json& manifest) {
+    return json{{"schema", "chudware-cache-provenance/1"}, {"manifest", manifest},
+                {"mac", provenance_mac(manifest)}}.dump();
+}
+
 // Caches the writer admits only into the archive budget left after every essential and
 // forward-compatible payload (mesh first, then build checkpoints, in name order). Both
 // are large binary blobs written STORED.
@@ -93,15 +243,66 @@ bool is_optional_cache(const std::string& name) {
     return name == "cache.aicm" || name == "cache.ckpt";
 }
 
-// An exclusive staging directory prevents unrelated saves from sharing "<path>.tmp".
-// Publishing a hard link is atomic and, unlike rename, never replaces a destination.
+// Keep the writer file open through publication; paths never reopen a reserved
+// staging file. Cleanup removes only our single file, never an unrelated tree.
 struct NativeStage {
     std::filesystem::path directory;
+    std::FILE* stream = nullptr;
+#if defined(_WIN32)
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    int descriptor = -1;
+    bool published = false;
+#else
+    int directory_fd = -1;
+#endif
     ~NativeStage() {
-        if (directory.empty()) return;
-        std::error_code ec;
-        std::filesystem::remove_all(directory, ec);
+#if defined(_WIN32)
+        if (handle != INVALID_HANDLE_VALUE && !published) {
+            FILE_DISPOSITION_INFO disposition{TRUE};
+            SetFileInformationByHandle(handle, FileDispositionInfo,
+                                      &disposition, sizeof(disposition));
+        }
+        if (stream) std::fclose(stream);
+        else if (descriptor >= 0) _close(descriptor);
+        else if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+#else
+        if (stream) std::fclose(stream);
+        if (directory_fd >= 0) {
+            ::unlinkat(directory_fd, "container.tmp", 0);
+            ::close(directory_fd);
+        }
+#endif
+        if (!directory.empty()) {
+            std::error_code ignored;
+            std::filesystem::remove(directory, ignored);
+        }
     }
+};
+
+// miniz's CFILE reader never owns its FILE*. Close both layers before replacing
+// a source archive: a CRT read handle otherwise denies deletion on Windows.
+struct NativeArchiveReader {
+    mz_zip_archive zip{};
+    std::FILE* stream = nullptr;
+
+    bool open(const std::filesystem::path& path) {
+#if defined(_WIN32)
+        stream = _wfopen(path.c_str(), L"rb");
+#else
+        stream = std::fopen(path.c_str(), "rb");
+#endif
+        return stream && mz_zip_reader_init_cfile(&zip, stream, 0, 0);
+    }
+
+    void close() {
+        if (zip.m_pState) mz_zip_reader_end(&zip);
+        if (stream) {
+            std::fclose(stream);
+            stream = nullptr;
+        }
+    }
+
+    ~NativeArchiveReader() { close(); }
 };
 
 // ------------------------------------------------------------------ thumbnail PNG
@@ -225,6 +426,7 @@ mz_uint64 optional_cache_budget(std::size_t document_bytes, std::size_t meta_byt
     auto reserve_payload = [&](std::size_t bytes) {
         budget = bytes > budget ? 0 : budget - bytes;
     };
+    if (owns_geometry_step) reserve_payload(2048); // bounded provenance envelope
     reserve_payload(document_bytes);
     reserve_payload(meta_bytes);
     reserve_payload(thumb_bytes);
@@ -242,6 +444,42 @@ std::string editable_document_json(const json& doc) {
     return canonical_doc_json(doc);
 }
 
+void configure_native_policy(const std::string& root, const std::string& state_dir) {
+    native_policy::configure(root, state_dir);
+}
+
+bool stepplus_cache_verified(const json& doc,
+                            const std::map<std::string, std::string>& entries,
+                            bool component_only) {
+    try {
+        auto provenance = entries.find("cache.provenance");
+        if (provenance == entries.end()) return false;
+        const json envelope = json::parse(provenance->second);
+        if (envelope.value("schema", std::string()) != "chudware-cache-provenance/1") return false;
+        const json expected_identity = cache_manifest(util::sha256_hex(editable_document_json(doc)));
+        const auto& manifest = envelope.at("manifest");
+        if (manifest.at("engine") != expected_identity["engine"] ||
+            manifest.at("doc_hash") != expected_identity["doc_hash"] ||
+            !manifest.at("members").is_object()) return false;
+        // Bounded readers can omit unrelated members. Authenticate the complete signed
+        // manifest, then check each admitted/consumed payload independently.
+        size_t checked = 0;
+        for (const auto& [name, bytes] : entries) {
+            if (!is_geometry_cache(name)) continue;
+            if (component_only && name != "cache.json" && name != "cache.brep") continue;
+            if (manifest.at("members").at(name) != util::sha256_hex(bytes)) return false;
+            ++checked;
+        }
+        if (checked == 0 || (component_only &&
+            (!entries.count("cache.json") || !entries.count("cache.brep")))) return false;
+        const std::string actual = envelope.at("mac").get<std::string>();
+        const std::string expected = provenance_mac(manifest);
+        if (actual.size() != expected.size()) return false;
+        unsigned char diff = 0;
+        for (size_t i = 0; i < actual.size(); ++i) diff |= actual[i] ^ expected[i];
+        return diff == 0;
+    } catch (...) { return false; }
+}
 
 // ---------------------------------------------------------------- shared editable-container save
 static std::string editable_container_save_impl(const json& doc, const std::string& path,
@@ -253,29 +491,65 @@ static std::string editable_container_save_impl(const json& doc, const std::stri
                                     std::vector<std::string>* dropped = nullptr) {
     const bool owns_geometry_step = container.rfind("aicad.step+/", 0) == 0;
     namespace fs = std::filesystem;
-    fs::path out_path(path);
-    fs::path tmp_path = out_path;
-    tmp_path += ".tmp";
+    fs::path out_path = fs::u8path(path);
+    fs::path tmp_path;
     NativeStage stage;
-    if (exclusive) {
-        std::error_code ec;
-        fs::create_directories(out_path.parent_path(), ec);
-        if (ec) io_error("native relocate: cannot create destination parent: " + ec.message());
-        static std::atomic<uint64_t> serial{0};
-        for (int attempt = 0; attempt < 100; ++attempt) {
-            auto candidate = out_path.parent_path() /
-                (".native-relocate-" + std::to_string(
-                    std::chrono::steady_clock::now().time_since_epoch().count()) + "-" +
-                 std::to_string(serial.fetch_add(1)));
-            if (fs::create_directory(candidate, ec)) {
-                stage.directory = std::move(candidate);
-                break;
-            }
-            if (ec) io_error("native relocate: cannot create staging directory: " + ec.message());
+    const fs::path parent = out_path.has_parent_path() ? out_path.parent_path() : fs::path(".");
+    std::error_code stage_error;
+    fs::create_directories(parent, stage_error);
+    if (stage_error) io_error("doc_save: cannot create destination parent: " + stage_error.message());
+    static std::atomic<uint64_t> serial{0};
+#if defined(_WIN32)
+    auto& security = chudware_ipc::privateSecurity();
+    if (!security.valid()) io_error("doc_save: cannot create owner-private staging policy");
+#endif
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        const auto candidate = parent /
+            (".native-save-" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()) + "-" +
+             std::to_string(serial.fetch_add(1)));
+#if defined(_WIN32)
+        if (CreateDirectoryW(candidate.c_str(), &security.attributes)) {
+            stage.directory = candidate;
+            break;
         }
-        if (stage.directory.empty()) io_error("native relocate: cannot reserve staging directory");
-        tmp_path = stage.directory / "container.tmp";
+        if (GetLastError() != ERROR_ALREADY_EXISTS)
+            io_error("doc_save: cannot reserve staging directory");
+#else
+        if (::mkdir(candidate.c_str(), 0700) == 0) {
+            stage.directory = candidate;
+            break;
+        }
+        if (errno != EEXIST) io_error("doc_save: cannot reserve staging directory");
+#endif
     }
+    if (stage.directory.empty()) io_error("doc_save: cannot reserve staging directory");
+    tmp_path = stage.directory / "container.tmp";
+#if defined(_WIN32)
+    HANDLE handle = CreateFileW(tmp_path.c_str(), GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, &security.attributes, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY |
+        FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) io_error("doc_save: cannot exclusively create staging file");
+    stage.handle = handle;
+    stage.descriptor = _open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_BINARY | _O_WRONLY);
+    if (stage.descriptor < 0) io_error("doc_save: cannot open staging stream");
+    stage.stream = _fdopen(stage.descriptor, "wb");
+    if (!stage.stream) io_error("doc_save: cannot open staging stream");
+#else
+    stage.directory_fd = ::open(stage.directory.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat directory_info{};
+    if (stage.directory_fd < 0 || ::fstat(stage.directory_fd, &directory_info) != 0 ||
+        directory_info.st_uid != ::geteuid() || (directory_info.st_mode & 0077) != 0)
+        io_error("doc_save: staging directory identity changed");
+    const int fd = ::openat(stage.directory_fd, "container.tmp",
+        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) io_error("doc_save: cannot exclusively create staging file");
+    stage.stream = ::fdopen(fd, "wb");
+    if (!stage.stream) {
+        ::close(fd);
+        io_error("doc_save: cannot open staging stream");
+    }
+#endif
 
     json meta = container_meta(doc, container, kind);
     if (preserved_meta) {
@@ -305,19 +579,17 @@ static std::string editable_container_save_impl(const json& doc, const std::stri
 
     mz_zip_archive zip;
     std::memset(&zip, 0, sizeof(zip));
-    if (!mz_zip_writer_init_file(&zip, tmp_path.string().c_str(), 0)) {
+    if (!mz_zip_writer_init_cfile(&zip, stage.stream, 0)) {
         if (format_name == ".step+")
-            io_error("doc_save: cannot create archive: " + tmp_path.string());
+            io_error("doc_save: cannot create archive: " + native_policy::path_utf8(tmp_path));
         io_error("doc_save: cannot create " + format_name + " archive: " +
-                 tmp_path.string());
+                 native_policy::path_utf8(tmp_path));
     }
 
     auto add = [&](const std::string& name, const std::string& data, bool stored) {
         mz_uint level = stored ? (mz_uint)MZ_NO_COMPRESSION : (mz_uint)MZ_DEFAULT_LEVEL;
         if (!mz_zip_writer_add_mem(&zip, name.c_str(), data.data(), data.size(), level)) {
             mz_zip_writer_end(&zip);
-            std::error_code ec;
-            std::filesystem::remove(tmp_path, ec);
             io_error("doc_save: cannot add entry '" + name + "'");
         }
     };
@@ -348,7 +620,9 @@ static std::string editable_container_save_impl(const json& doc, const std::stri
     // reader still reads a STORED entry transparently, so this stays fully back/forward
     // compatible; the cache is display-only + hash-gated, so the skipped zip CRC is fine.
     // cache.ckpt (CBOR + BinTools build checkpoints) follows the same rule.
+    json manifest = cache_manifest(util::sha256_hex(document));
     for (const auto& [name, data] : extra) {
+        if (owns_geometry_step && name == "cache.provenance") continue;
         if (is_known_entry(name, owns_geometry_step)) continue;
         // Optional caches: never persist one that the bounded reader would have to
         // discard before allocating its payload. The drop is reported to the caller.
@@ -368,24 +642,48 @@ static std::string editable_container_save_impl(const json& doc, const std::stri
                              data.size() > kMaxEntryExpandedBytes) ||
                             (name.rfind("studies/", 0) == 0 && name.find("/results.") != std::string::npos);
         add(name, data, /*stored=*/stored);
+        if (owns_geometry_step && is_geometry_cache(name))
+            manifest["members"][name] = util::sha256_hex(data);
+    }
+    if (owns_geometry_step && !manifest["members"].empty()) {
+        std::string provenance;
+        try { provenance = sign_manifest(manifest); }
+        catch (...) { mz_zip_writer_end(&zip); throw; }
+        add("cache.provenance", provenance, false);
     }
 
     if (!mz_zip_writer_finalize_archive(&zip)) {
         mz_zip_writer_end(&zip);
-        std::error_code ec;
-        fs::remove(tmp_path, ec);
         io_error("doc_save: cannot finalize archive");
     }
     mz_zip_writer_end(&zip);
 
-    std::error_code ec;
-    if (exclusive) fs::create_hard_link(tmp_path, out_path, ec);
-    else fs::rename(tmp_path, out_path, ec);  // ordinary save retains atomic replacement
-    if (ec) {
-        fs::remove(tmp_path, ec);
-        io_error("doc_save: cannot replace '" + out_path.string() + "'");
+    if (std::fflush(stage.stream) != 0) io_error("doc_save: cannot flush archive");
+#if defined(_WIN32)
+    const auto destination = fs::absolute(out_path).make_preferred().native();
+    const auto bytes = destination.size() * sizeof(wchar_t);
+    // Win32 resolves FileName as a NUL-terminated path despite FileNameLength.
+    std::vector<unsigned char> rename_buffer(
+        offsetof(FILE_RENAME_INFO, FileName) + bytes + sizeof(wchar_t));
+    auto* rename_info = reinterpret_cast<FILE_RENAME_INFO*>(rename_buffer.data());
+    rename_info->ReplaceIfExists = !exclusive;
+    rename_info->RootDirectory = nullptr;
+    rename_info->FileNameLength = static_cast<DWORD>(bytes);
+    std::memcpy(rename_info->FileName, destination.data(), bytes);
+    const HANDLE file_handle = reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stage.stream)));
+    if (!SetFileInformationByHandle(file_handle, FileRenameInfo, rename_info,
+                                   static_cast<DWORD>(rename_buffer.size()))) {
+        const DWORD error = GetLastError();
+        io_error("doc_save: cannot publish archive (Windows error " + std::to_string(error) + ")");
     }
-    return out_path.string();
+    stage.published = true;
+#else
+    const int result = exclusive
+        ? ::linkat(stage.directory_fd, "container.tmp", AT_FDCWD, out_path.c_str(), 0)
+        : ::renameat(stage.directory_fd, "container.tmp", AT_FDCWD, out_path.c_str());
+    if (result != 0) io_error("doc_save: cannot publish archive");
+#endif
+    return native_policy::path_utf8(out_path);
 }
 
 std::string editable_container_save(const json& doc, const std::string& path,
@@ -423,18 +721,15 @@ static StepPlusDoc editable_container_open_impl(const std::string& path,
                                     const std::string& expected_prefix,
                                     const std::string& format_name,
                                     NativeReadMode mode = NativeReadMode::Open) {
-    if (!std::filesystem::exists(path)) io_error("doc_open: no such file: " + path);
+    const auto native_path = std::filesystem::u8path(path);
+    if (!std::filesystem::exists(native_path)) io_error("doc_open: no such file: " + path);
     const bool owns_geometry_step = expected_prefix == "aicad.step+/";
     const bool read_only = mode == NativeReadMode::Document || mode == NativeReadMode::Component;
 
-    mz_zip_archive zip;
-    std::memset(&zip, 0, sizeof(zip));
-    if (!mz_zip_reader_init_file(&zip, path.c_str(), 0))
+    NativeArchiveReader reader;
+    if (!reader.open(native_path))
         io_error("doc_open: not a valid " + format_name + " (zip) container: " + path);
-    struct ReaderGuard {
-        mz_zip_archive& zip;
-        ~ReaderGuard() { if (zip.m_pState) mz_zip_reader_end(&zip); }
-    } guard{zip};
+    auto& zip = reader.zip;
 
     const mz_uint count = mz_zip_reader_get_num_files(&zip);
     if (count > kMaxArchiveEntries) {
@@ -493,7 +788,7 @@ static StepPlusDoc editable_container_open_impl(const std::string& path,
     }
 
     auto read_entry = [&](const std::string& name, std::string& out) -> bool {
-        const int idx = mz_zip_reader_locate_file(&zip, name.c_str(), nullptr, 0);
+        const int idx = mz_zip_reader_locate_file(&zip, name.c_str(), nullptr, MZ_ZIP_FLAG_CASE_SENSITIVE);
         if (idx < 0) return false;
         mz_zip_archive_file_stat st;
         if (!mz_zip_reader_file_stat(&zip, static_cast<mz_uint>(idx), &st)) return false;
@@ -541,6 +836,29 @@ static StepPlusDoc editable_container_open_impl(const std::string& path,
         mz_zip_reader_end(&zip);
         io_error(std::string("doc_open: bad document.json: ") + e.what());
     }
+    if (owns_geometry_step && native_policy::rooted()) {
+        const std::string base =
+            native_policy::path_utf8(std::filesystem::absolute(native_path).parent_path());
+        try {
+            if (result.doc.contains("components") && result.doc["components"].is_array())
+                for (const auto& component : result.doc["components"])
+                    if (component.contains("source") && component["source"].is_object() &&
+                        component["source"].contains("path"))
+                        native_policy::resolve_reference(
+                            component["source"]["path"].get<std::string>(), base);
+            if (result.doc.contains("features") && result.doc["features"].is_array())
+                for (const auto& feature : result.doc["features"]) {
+                    if (feature.value("type", std::string()) != "import") continue;
+                    const auto& p = feature.contains("params") ? feature["params"] : feature;
+                    if (p.contains("source_path") && p["source_path"].is_string() &&
+                        !p["source_path"].get_ref<const std::string&>().empty())
+                        native_policy::resolve_reference(p["source_path"].get<std::string>());
+                }
+        } catch (const std::exception& e) {
+            mz_zip_reader_end(&zip);
+            throw OpError("io_error", std::string("document reference refused: ") + e.what());
+        }
+    }
     if (mode == NativeReadMode::Metadata || mode == NativeReadMode::Document ||
         (mode == NativeReadMode::Component &&
          result.doc.value("schema", std::string()) == "aicad.asm/1")) {
@@ -555,11 +873,11 @@ static StepPlusDoc editable_container_open_impl(const std::string& path,
         if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
         const std::string name = st.m_filename;
         if (st.m_is_directory && mode != NativeReadMode::Relocate) continue;
-        if (mode == NativeReadMode::Component && name != "cache.json" && name != "cache.brep")
-            continue;
+        if (mode == NativeReadMode::Component &&
+            name != "cache.json" && name != "cache.brep" && name != "cache.provenance") continue;
         if (mode == NativeReadMode::Relocate) {
             if (name == "meta.json" || name == "document.json") continue;
-            if (is_geometry_cache(name)) {
+            if (is_geometry_cache(name) || name == "cache.provenance") {
                 result.warnings.push_back("invalidated:" + name);
                 continue;
             }
@@ -676,7 +994,7 @@ fs::path native_canonical(const fs::path& path) {
 }
 
 fs::path native_absolute(const json& value, const char* field) {
-    fs::path path(native_string(value, field));
+    const auto path = fs::u8path(native_string(value, field));
     if (!path.is_absolute()) native_invalid(std::string(field) + " must be absolute");
     return native_canonical(path);
 }
@@ -689,13 +1007,23 @@ std::string native_fold(std::string text) {
 // Check components as well as the leaf: "Parts/X" and existing "parts/x" must
 // not become two different files merely because this host is case-sensitive.
 void native_destination_available(const fs::path& destination) {
+    const auto same_folded = [](auto left, auto right) {
+        if (left >= 'A' && left <= 'Z') left += 'a' - 'A';
+        if (right >= 'A' && right <= 'Z') right += 'a' - 'A';
+        return left == right;
+    };
     fs::path parent = destination.root_path();
     for (const auto& component : destination.relative_path()) {
         if (fs::is_directory(parent)) {
-            const auto folded = native_fold(component.string());
+            const auto& component_name = component.native();
             for (const auto& sibling : fs::directory_iterator(parent)) {
-                const auto name = sibling.path().filename().string();
-                if (native_fold(name) == folded && name != component.string()) {
+                // Unrelated NTFS names can contain unpaired UTF-16 surrogates.
+                // Compare native code units without narrowing or allocating UTF-8.
+                const auto sibling_name = sibling.path().filename();
+                const auto& name = sibling_name.native();
+                if (name != component_name &&
+                    std::equal(name.begin(), name.end(), component_name.begin(),
+                               component_name.end(), same_folded)) {
                     // An existing ancestor's alternate spelling is not a second
                     // destination (Windows system/temp paths commonly use it).
                     // Leaves remain occupied, and distinct case-sensitive
@@ -705,7 +1033,7 @@ void native_destination_available(const fs::path& destination) {
                     if (requested != destination && fs::is_directory(requested) &&
                         fs::equivalent(requested, sibling.path(), ec) && !ec)
                         continue;
-                    native_invalid("case-colliding destination: " + destination.string());
+                    native_invalid("case-colliding destination: " + native_policy::path_utf8(destination));
                 }
             }
         }
@@ -713,7 +1041,7 @@ void native_destination_available(const fs::path& destination) {
     }
     // symlink_status also rejects dangling symlinks, which exists() alone misses.
     if (fs::exists(fs::symlink_status(destination)))
-        native_invalid("destination already exists: " + destination.string());
+        native_invalid("destination already exists: " + native_policy::path_utf8(destination));
 }
 
 std::string native_pointer_token(const std::string& token) {
@@ -756,7 +1084,7 @@ void native_reference(NativeReferences& refs, const json& value,
             row["supported"] = false;
             row["reason"] = "unsupported URI or foreign-platform path";
         } else if (supported) {
-            const fs::path path(literal);
+            const auto path = fs::u8path(literal);
 #if defined(_WIN32)
             // Drive-qualified/UNC absolute paths and backslash separators are
             // native here. Drive-relative or root-only paths lack a stable base.
@@ -770,7 +1098,7 @@ void native_reference(NativeReferences& refs, const json& value,
                 row["reason"] = "unsupported URI or foreign-platform path";
             } else {
                 const auto resolved = native_canonical(path.is_absolute() ? path : parent / path);
-                row["resolved_path"] = resolved.string();
+                row["resolved_path"] = native_policy::path_utf8(resolved);
                 row["exists"] = fs::exists(resolved);
                 row["format"] = "filesystem";
                 row["rewrite"] = true;
@@ -886,7 +1214,7 @@ json native_metadata(const json& doc, const fs::path& path, const NativeReferenc
             if (component.contains(key)) row[key] = component[key];
         components.push_back(std::move(row));
     }
-    return {{"ok", true}, {"path", path.string()}, {"schema", doc.at("schema")},
+    return {{"ok", true}, {"path", native_policy::path_utf8(path)}, {"schema", doc.at("schema")},
             {"name", doc.value("name", json())}, {"document_id", doc.value("id", json())},
             {"document_hash", stepplus_doc_hash(doc)},
             {"document_hash_algorithm", "native-canonical-fnv64-excluding-root-id"},
@@ -913,13 +1241,14 @@ struct NativeStamp {
     fs::file_time_type modified;
 };
 NativeStamp native_stamp(const fs::path& path) {
-    if (!fs::is_regular_file(path)) native_invalid("source is not a regular file: " + path.string());
+    if (!fs::is_regular_file(path))
+        native_invalid("source is not a regular file: " + native_policy::path_utf8(path));
     return {fs::file_size(path), fs::last_write_time(path)};
 }
 void native_check_stamp(const fs::path& path, const NativeStamp& stamp) {
     const auto current = native_stamp(path);
     if (current.size != stamp.size || current.modified != stamp.modified)
-        io_error("native relocate: source changed during operation: " + path.string());
+        io_error("native relocate: source changed during operation: " + native_policy::path_utf8(path));
 }
 }  // namespace
 
@@ -949,7 +1278,7 @@ json native_file_operations(const json& params) {
                     const auto path = native_absolute(value, "path");
                     const auto stamp = native_stamp(path);
                     const auto loaded = editable_container_open_impl(
-                        path.string(), "aicad.step+/", ".step+", NativeReadMode::Metadata);
+                        native_policy::path_utf8(path), "aicad.step+/", ".step+", NativeReadMode::Metadata);
                     const auto refs = native_references(loaded.doc, path.parent_path());
                     auto row = native_metadata(loaded.doc, path, refs);
                     row["immutable_document_hash"] = native_immutable_hash(loaded.doc, refs.dependencies);
@@ -980,8 +1309,8 @@ json native_file_operations(const json& params) {
                 if (!params["path_map"].is_object() || params["path_map"].size() > kMaxNativeFiles)
                     native_invalid("path_map must be an object with at most 4096 entries");
                 for (const auto& [old_path, new_path] : params["path_map"].items()) {
-                    const auto old_key = native_absolute(old_path, "path_map source").string();
-                    const auto new_key = native_absolute(new_path, "path_map destination").string();
+                    const auto old_key = native_policy::path_utf8(native_absolute(old_path, "path_map source"));
+                    const auto new_key = native_policy::path_utf8(native_absolute(new_path, "path_map destination"));
                     if (!path_map.emplace(old_key, new_key).second)
                         native_invalid("duplicate canonical path_map source");
                 }
@@ -991,13 +1320,15 @@ json native_file_operations(const json& params) {
                 if (!item.is_object() || !item.contains("path") || !item.contains("destination"))
                     native_invalid("each entry requires path and destination");
                 const auto path = native_absolute(item["path"], "path");
-                native_destination_available(fs::path(native_string(item["destination"], "destination")));
+                native_destination_available(fs::u8path(native_string(item["destination"], "destination")));
                 const auto destination = native_absolute(item["destination"], "destination");
-                if (!sources.insert(native_fold(path.string())).second)
-                    native_invalid("duplicate source: " + path.string());
-                if (!destinations.insert(native_fold(destination.string())).second)
-                    native_invalid("duplicate or case-colliding destination: " + destination.string());
-                if (native_fold(path.string()) == native_fold(destination.string()))
+                const auto path_text = native_policy::path_utf8(path);
+                const auto destination_text = native_policy::path_utf8(destination);
+                if (!sources.insert(native_fold(path_text)).second)
+                    native_invalid("duplicate source: " + path_text);
+                if (!destinations.insert(native_fold(destination_text)).second)
+                    native_invalid("duplicate or case-colliding destination: " + destination_text);
+                if (native_fold(path_text) == native_fold(destination_text))
                     native_invalid("source and destination must differ");
                 native_destination_available(destination);
                 if (item.contains("name")) native_string(item["name"], "name");
@@ -1010,16 +1341,16 @@ json native_file_operations(const json& params) {
                         native_string(name, "component name");
                     }
                 }
-                const auto inserted = path_map.emplace(path.string(), destination.string());
-                if (!inserted.second && inserted.first->second != destination.string())
-                    native_invalid("path_map disagrees with relocation entry: " + path.string());
+                const auto inserted = path_map.emplace(path_text, destination_text);
+                if (!inserted.second && inserted.first->second != destination_text)
+                    native_invalid("path_map disagrees with relocation entry: " + path_text);
                 entries.push_back({path, destination, native_stamp(path), item, {}});
             }
             for (const auto& entry : entries) {
                 fs::path prefix = entry.destination.root_path();
                 for (const auto& component : entry.destination.relative_path()) {
                     prefix /= component;
-                    const auto spelling = prefix.string();
+                    const auto spelling = native_policy::path_utf8(prefix);
                     const auto folded = native_fold(spelling);
                     const auto inserted = destination_components.emplace(folded, spelling);
                     if (!inserted.second && inserted.first->second != spelling)
@@ -1042,12 +1373,12 @@ json native_file_operations(const json& params) {
             // Retain only bounded hash/stamp records, never document trees or
             // embedded BREP across files. Large libraries remain one-file-at-a-time.
             for (auto& entry : entries) {
-                auto loaded = editable_container_open_impl(entry.path.string(), "aicad.step+/",
+                auto loaded = editable_container_open_impl(native_policy::path_utf8(entry.path), "aicad.step+/",
                                                            ".step+", NativeReadMode::Metadata);
                 auto refs = native_references(loaded.doc, entry.path.parent_path());
                 for (const auto& dependency : refs.dependencies)
                     if (!dependency.value("supported", false))
-                        native_invalid("unsupported dependency in " + entry.path.string() +
+                        native_invalid("unsupported dependency in " + native_policy::path_utf8(entry.path) +
                                        " at " + dependency["json_pointer"].get<std::string>());
                 if (entry.options.contains("component_names")) {
                     std::set<std::string> ids;
@@ -1061,13 +1392,13 @@ json native_file_operations(const json& params) {
                 native_check_stamp(entry.path, entry.stamp);
             }
             for (auto& entry : entries) {
-                json row{{"ok", false}, {"path", entry.path.string()},
+                json row{{"ok", false}, {"path", native_policy::path_utf8(entry.path)},
                          {"original_path", entry.options["path"]},
-                         {"destination", entry.destination.string()}, {"status", "not_written"}};
+                         {"destination", native_policy::path_utf8(entry.destination)}, {"status", "not_written"}};
                 try {
                     native_check_stamp(entry.path, entry.stamp);
                     native_destination_available(entry.destination);
-                    auto loaded = editable_container_open_impl(entry.path.string(), "aicad.step+/",
+                    auto loaded = editable_container_open_impl(native_policy::path_utf8(entry.path), "aicad.step+/",
                                                                ".step+", NativeReadMode::Relocate);
                     if (fnv1a_hex(editable_document_json(loaded.doc)) != entry.document_hash)
                         io_error("native relocate: source document changed");
@@ -1086,13 +1417,14 @@ json native_file_operations(const json& params) {
                         if (!dependency.value("rewrite", false)) continue;
                         const auto resolved = dependency["resolved_path"].get<std::string>();
                         const auto mapped = path_map.find(resolved);
-                        const fs::path target(mapped == path_map.end() ? resolved : mapped->second);
+                        const auto target = fs::u8path(mapped == path_map.end() ? resolved : mapped->second);
                         const auto relative = target.lexically_relative(entry.destination.parent_path());
-                        const auto replacement = relative.empty() ? target.string() : relative.generic_string();
+                        const auto replacement = relative.empty() ? native_policy::path_utf8(target)
+                                                                 : native_policy::generic_path_utf8(relative);
                         loaded.doc[json::json_pointer(dependency["json_pointer"].get<std::string>())] = replacement;
                         auto rewrite = dependency;
                         rewrite["destination_literal"] = replacement;
-                        rewrite["destination_resolved_path"] = target.string();
+                        rewrite["destination_resolved_path"] = native_policy::path_utf8(target);
                         rewrites.push_back(std::move(rewrite));
                     }
                     if (native_immutable_hash(loaded.doc, dependencies) != immutable_hash)
@@ -1114,7 +1446,7 @@ json native_file_operations(const json& params) {
                     row["preserved_entries"] = std::move(preserved);
                     const auto meta = json::parse(loaded.extra.at("meta.json"));
                     native_check_stamp(entry.path, entry.stamp);
-                    editable_container_save_impl(loaded.doc, entry.destination.string(), loaded.extra,
+                    editable_container_save_impl(loaded.doc, native_policy::path_utf8(entry.destination), loaded.extra,
                         kContainer, loaded.doc["schema"] == "aicad.asm/1" ? "assembly" : "part",
                         ".step+", &meta, true);
                     row["status"] = "written";
@@ -1123,7 +1455,7 @@ json native_file_operations(const json& params) {
                     native_check_stamp(entry.path, entry.stamp);
                     row["ok"] = true;
                 } catch (const std::exception& error) {
-                    auto failed = failure(error, entry.path.string());
+                    auto failed = failure(error, native_policy::path_utf8(entry.path));
                     row["code"] = failed["code"];
                     row["message"] = failed["message"];
                     if (row["status"] != "written") row["status"] = "failed";
@@ -1304,12 +1636,210 @@ std::string stepplus_cache_engine_key() {
     // resolve_profile_faces). A cache built by a silent snap must re-resolve and report it.
     // /13 DXF/DWG/SAT imports carry exact ACIS solids/surfaces and keep their baked body
     // grouping (a drawing profile stays one body); older snapshots lack those bodies.
-    static constexpr const char* kCacheSchema = "chudware-geomcache/13";
+    // /14 refuses closed but BRep-invalid, collapsed or self-intersecting dress results;
+    // old cached blends must rebuild through the geometry-validity acceptance gate.
+    // /15 a fillet on an edge shared by two bodies (line contact) fills the concave corners
+    // and joins them into one solid; caches holding the old failed fillet must rebuild.
+    // /16 UnifySameDomain runs on a topology copy (it edited the boolean's shared input
+    // TShapes in place, corrupting cached checkpoints) and a cut that grows the exact
+    // volume fails; caches/checkpoints built by the mutating unify may be invalid.
+    // /17 sketcher overhaul: oblique linear edges project as one analytic line (not a
+    // sampled BSpline run), composite rectangle/polygon entities carry relations, and the
+    // 2D solver applies the extended relation set (and no longer applies wrong-type
+    // residuals), so converted geometry and solved sketch coordinates can differ.
+    static constexpr const char* kCacheSchema = "chudware-geomcache/17";
 #ifdef OCC_VERSION_COMPLETE
     return std::string(kCacheSchema) + ";occt=" OCC_VERSION_COMPLETE;
 #else
     return std::string(kCacheSchema) + ";occt=none";
 #endif
+}
+
+// --- build-state write-back (contracts/stepplus.md §17) -----------------------------
+NativeFileStamp stepplus_file_stamp(const std::string& path) {
+    namespace fs = std::filesystem;
+    const auto native_path = fs::u8path(path);
+    std::error_code ec;
+    if (!fs::is_regular_file(native_path, ec) || ec) return {};
+    NativeFileStamp stamp;
+    stamp.size = fs::file_size(native_path, ec);
+    if (ec) return {};
+    const fs::file_time_type modified = fs::last_write_time(native_path, ec);
+    if (ec) return {};
+    stamp.mtime_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         modified.time_since_epoch()).count();
+    stamp.valid = true;
+    return stamp;
+}
+
+BuildStateWriteback stepplus_write_build_state(const std::string& path,
+                                               const NativeFileStamp& expected,
+                                               const std::string& doc_hash,
+                                               const std::map<std::string, std::string>& entries) {
+    namespace fs = std::filesystem;
+    BuildStateWriteback out;
+    json manifest = cache_manifest(doc_hash);
+    auto refuse = [&out](std::string why) {
+        out.reason = std::move(why);
+        return out;
+    };
+    auto is_build_state = [](const std::string& name) {
+        return is_geometry_cache(name) || name == "cache.provenance" || name == "geometry.step";
+    };
+    if (!(stepplus_file_stamp(path) == expected)) return refuse("file_changed");
+
+    const fs::path target = fs::u8path(path);
+    NativeArchiveReader reader;
+    if (!reader.open(target)) return refuse("not_a_container");
+    auto& src = reader.zip;
+
+    // The cache was built for this exact document; a file whose document.json no longer
+    // hashes to it (an edit that kept size and mtime) keeps its own members.
+    const int doc_index = mz_zip_reader_locate_file(&src, "document.json", nullptr, 0);
+    if (doc_index < 0) return refuse("not_a_container");
+    {
+        std::size_t doc_size = 0;
+        void* doc_heap = mz_zip_reader_extract_to_heap(&src, static_cast<mz_uint>(doc_index),
+                                                       &doc_size, 0);
+        if (!doc_heap) return refuse("io_error: cannot read document.json");
+        std::string doc_bytes(static_cast<const char*>(doc_heap), doc_size);
+        mz_free(doc_heap);
+        try {
+            const json authored = json::parse(doc_bytes);
+            if (stepplus_doc_hash(authored) != doc_hash) return refuse("document_changed");
+            manifest["doc_hash"] = util::sha256_hex(editable_document_json(authored));
+        } catch (const std::exception&) {
+            return refuse("not_a_container");
+        }
+    }
+
+    // The reader admits the optional caches (cache.aicm, then cache.ckpt) only into the
+    // expanded-byte budget every other member leaves — reserve exactly what stays.
+    const mz_uint count = mz_zip_reader_get_num_files(&src);
+    if (count > kMaxArchiveEntries) return refuse("io_error: archive entry count limit");
+    mz_uint64 budget = kMaxArchiveExpandedBytes;
+    auto reserve = [&budget](mz_uint64 bytes) { budget = bytes > budget ? 0 : budget - bytes; };
+    std::vector<mz_uint> kept;
+    kept.reserve(count);
+    for (mz_uint i = 0; i < count; ++i) {
+        mz_zip_archive_file_stat st;
+        if (!mz_zip_reader_file_stat(&src, i, &st)) return refuse("io_error: bad archive metadata");
+        if (is_build_state(st.m_filename)) continue;
+        reserve(st.m_uncomp_size);
+        kept.push_back(i);
+    }
+    for (const auto& [name, data] : entries)
+        if (!is_optional_cache(name)) reserve(data.size());
+    reserve(2048); // bounded provenance envelope
+
+    static std::atomic<uint64_t> serial{0};
+    NativeStage stage;
+    stage.directory = target.parent_path() /
+        (".native-buildstate-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" +
+         std::to_string(serial.fetch_add(1)));
+    const fs::path tmp = stage.directory / "container.tmp";
+#if defined(_WIN32)
+    auto& security = chudware_ipc::privateSecurity();
+    if (!security.valid()) return refuse("io_error: cannot create private staging policy");
+    if (!CreateDirectoryW(stage.directory.c_str(), &security.attributes))
+        return refuse("io_error: cannot create private staging directory");
+    stage.handle = CreateFileW(tmp.c_str(), GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, &security.attributes, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY |
+        FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (stage.handle == INVALID_HANDLE_VALUE) return refuse("io_error: staging open failed");
+    stage.descriptor = _open_osfhandle(reinterpret_cast<intptr_t>(stage.handle), _O_BINARY | _O_WRONLY);
+    if (stage.descriptor < 0) return refuse("io_error: staging stream failed");
+    stage.stream = _fdopen(stage.descriptor, "wb");
+#else
+    if (::mkdir(stage.directory.c_str(), 0700) != 0)
+        return refuse("io_error: cannot create private staging directory");
+    stage.directory_fd = ::open(stage.directory.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (stage.directory_fd < 0) return refuse("io_error: staging directory open failed");
+    const int fd = ::openat(stage.directory_fd, "container.tmp",
+        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return refuse("io_error: staging open failed");
+    stage.stream = ::fdopen(fd, "wb");
+    if (!stage.stream) ::close(fd);
+#endif
+    if (!stage.stream) return refuse("io_error: staging stream failed");
+    mz_zip_archive dst{};
+    if (!mz_zip_writer_init_cfile(&dst, stage.stream, 0))
+        return refuse("io_error: cannot create " + native_policy::path_utf8(tmp));
+    bool dst_open = true;
+    auto abandon = [&](std::string why) {
+        if (dst_open) mz_zip_writer_end(&dst);
+        dst_open = false;
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        out.entries.clear();
+        out.dropped.clear();
+        return refuse(std::move(why));
+    };
+    // Every authored member travels as its original compressed stream.
+    for (const mz_uint i : kept)
+        if (!mz_zip_writer_add_from_zip_reader(&dst, &src, i))
+            return abandon("io_error: cannot copy an archive member");
+    auto add = [&](const std::string& name, const std::string& data, bool stored) {
+        const mz_uint level = stored ? (mz_uint)MZ_NO_COMPRESSION : (mz_uint)MZ_DEFAULT_LEVEL;
+        return mz_zip_writer_add_mem(&dst, name.c_str(), data.data(), data.size(), level) != 0;
+    };
+    for (const auto& [name, data] : entries) {
+        if (name == "cache.provenance") continue;
+        if (!is_build_state(name)) continue;
+        if (is_optional_cache(name)) {
+            if (data.size() > budget) {
+                out.dropped.push_back(name);
+                continue;
+            }
+            budget -= data.size();
+        }
+        // Same storage rules as stepplus_save: optional caches and oversized geometry
+        // caches STORED, the rest deflated.
+        const bool stored = is_optional_cache(name) ||
+                            (is_geometry_cache(name) && data.size() > kMaxEntryExpandedBytes);
+        if (!add(name, data, stored)) return abandon("io_error: cannot add entry '" + name + "'");
+        if (is_geometry_cache(name)) manifest["members"][name] = util::sha256_hex(data);
+        out.entries.push_back(name);
+    }
+    if (!manifest["members"].empty()) {
+        std::string provenance;
+        try { provenance = sign_manifest(manifest); }
+        catch (const std::exception& e) { return abandon(e.what()); }
+        if (!add("cache.provenance", provenance, false)) return abandon("cache provenance write failed");
+        out.entries.push_back("cache.provenance");
+    }
+    if (!mz_zip_writer_finalize_archive(&dst)) return abandon("io_error: cannot finalize archive");
+    mz_zip_writer_end(&dst);
+    dst_open = false;
+    if (std::fflush(stage.stream) != 0) return abandon("io_error: staging flush failed");
+    reader.close();
+
+    // A save that landed while the copy was written wins; the build state is dropped.
+    if (!(stepplus_file_stamp(path) == expected)) return abandon("file_changed");
+#if defined(_WIN32)
+    const auto destination = fs::absolute(target).make_preferred().native();
+    const auto bytes = destination.size() * sizeof(wchar_t);
+    // Include the terminator required by Win32 path resolution.
+    std::vector<unsigned char> buffer(
+        offsetof(FILE_RENAME_INFO, FileName) + bytes + sizeof(wchar_t));
+    auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
+    rename->ReplaceIfExists = TRUE;
+    rename->FileNameLength = static_cast<DWORD>(bytes);
+    std::memcpy(rename->FileName, destination.data(), bytes);
+    if (!SetFileInformationByHandle(stage.handle, FileRenameInfo, rename,
+                                   static_cast<DWORD>(buffer.size()))) {
+        const DWORD error = GetLastError();
+        return abandon("io_error: cannot publish build state (Windows error " +
+                       std::to_string(error) + ")");
+    }
+    stage.published = true;
+#else
+    if (::renameat(stage.directory_fd, "container.tmp", AT_FDCWD, target.c_str()) != 0)
+        return abandon("io_error: cannot publish build state");
+#endif
+    out.written = true;
+    return out;
 }
 
 // --- studies/<id>/results.npz -------------------------------------------------

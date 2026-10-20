@@ -11,6 +11,8 @@
 #include <nlohmann/json.hpp>
 
 #include "jobs.h"
+#include "fs_backend.h"
+#include <map>
 
 #include "app_state.h"
 
@@ -34,6 +36,48 @@ static void failJobFromEscapedException(const std::shared_ptr<JobState>& job, co
 }
 
 namespace {
+std::mutex cellHandlesMutex;
+struct CellSessionBinding { std::string handle, provider; };
+std::map<std::string, CellSessionBinding> cellSessions;
+
+std::string jsonString(const nlohmann::json& value, const char* key) {
+    if (!value.is_object() || !value.contains(key) || !value[key].is_string()) return {};
+    return value[key].get<std::string>();
+}
+bool opaqueHandle(const nlohmann::json& value) {
+    return value.is_string() && !value.get_ref<const std::string&>().empty() &&
+           value.get_ref<const std::string&>().size() <= 1024 &&
+           value.get_ref<const std::string&>().find('\0') == std::string::npos;
+}
+
+bool mintCellAgentHandles(WorkerClient& worker, const std::shared_ptr<JobState>& job,
+                          AgentJobRpcRoute& route, std::string& err) {
+    if (!route.cell || !route.online) return true;
+    nlohmann::json request = nlohmann::json::object(), reply;
+    const auto session = route.params.find("session_id");
+    if (session != route.params.end()) request["session_id"] = *session;
+    if (!worker.call("agent_handles_new", request, reply, err, 30000) ||
+        !applyCellAgentHandles(route, reply, err)) return false;
+    bindCellAgentSessionHandle(job->convId, route.params["session_id"].get<std::string>(),
+                              jsonString(route.params, "provider"));
+    const auto pendingCancel = publishCellAgentRunHandle(
+        *job, route.params["run_id"].get<std::string>());
+    if (!pendingCancel.empty()) {
+        nlohmann::json cancelled;
+        if (!worker.callAgentCancel(pendingCancel, cancelled, err, jsonString(route.params, "provider"))) {
+            if (err.empty()) err = "Cell refused pending run cancellation";
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(job->mtx);
+        job->stopReason = "cancelled";
+        job->converged = false;
+        job->ready = true;
+        job->running = false;
+        err.clear();
+        return false;
+    }
+    return true;
+}
 
 bool explicitOffline(const nlohmann::json& extra, const nlohmann::json& options) {
     auto enabled = [](const nlohmann::json& value, const char* key) {
@@ -59,10 +103,6 @@ std::string nextAgentRunId() {
            std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
 }
 
-std::string jsonString(const nlohmann::json& value, const char* key) {
-    if (!value.is_object() || !value.contains(key) || !value[key].is_string()) return {};
-    return value[key].get<std::string>();
-}
 
 // The online turn budget is the caller's: an explicit positive `timeout` (seconds) rides to
 // agent_admin_turn and bounds chudcode_host's wait (abort + stop_reason "turn_budget" when it
@@ -87,6 +127,59 @@ std::string transportStopReason(const std::string& err) {
 }
 
 }  // namespace
+std::string cellAgentSessionHandle(const std::string& convId) {
+    std::lock_guard<std::mutex> lock(cellHandlesMutex);
+    const auto it = cellSessions.find(convId);
+    return it == cellSessions.end() ? std::string() : it->second.handle;
+}
+
+std::string cellAgentSessionProvider(const std::string& convId) {
+    std::lock_guard<std::mutex> lock(cellHandlesMutex);
+    const auto it = cellSessions.find(convId);
+    return it == cellSessions.end() ? std::string() : it->second.provider;
+}
+
+void bindCellAgentSessionHandle(const std::string& convId, const std::string& handle,
+                                const std::string& provider) {
+    std::lock_guard<std::mutex> lock(cellHandlesMutex);
+    if (handle.empty()) cellSessions.erase(convId);
+    else if (handle.size() <= 1024 && handle.find('\0') == std::string::npos) {
+        auto& binding = cellSessions[convId];
+        binding.handle = handle;
+        if (!provider.empty()) binding.provider = provider;
+    }
+}
+
+void clearCellAgentSessionHandles() {
+    std::lock_guard<std::mutex> lock(cellHandlesMutex);
+    cellSessions.clear();
+}
+
+bool applyCellAgentHandles(AgentJobRpcRoute& route, const nlohmann::json& reply,
+                           std::string& err) {
+    err.clear();
+    if (!reply.is_object() || !reply.contains("ok") || reply["ok"] != true ||
+        !reply.contains("run_id") || !opaqueHandle(reply["run_id"]) ||
+        !reply.contains("session_id") || !opaqueHandle(reply["session_id"])) {
+        err = "Cell did not issue agent handles";
+        return false;
+    }
+    route.params["run_id"] = reply["run_id"];
+    route.params["session_id"] = reply["session_id"];
+    route.params["options"]["session_id"] = reply["session_id"];
+    return true;
+}
+std::string requestCellAgentStop(JobState& job) {
+    std::lock_guard<std::mutex> lock(job.mtx);
+    if (job.stopRequested.exchange(true)) return {};
+    return job.runId;
+}
+
+std::string publishCellAgentRunHandle(JobState& job, const std::string& handle) {
+    std::lock_guard<std::mutex> lock(job.mtx);
+    job.runId = handle;
+    return job.stopRequested.load() ? handle : std::string();
+}
 
 int agentJobWaitMs(const AgentJobRpcRoute& route) {
     if (!route.online) return kOfflineRunWaitMs;
@@ -98,7 +191,7 @@ int agentJobWaitMs(const AgentJobRpcRoute& route) {
 
 AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::string& docId,
                                       const std::string& convId, bool cam,
-                                      const nlohmann::json& extra, bool mission) {
+                                      const nlohmann::json& extra, bool mission, bool cell) {
     nlohmann::json options = nlohmann::json::object();
     options["advisor"] = true;
     if (!mission) options["cam"] = cam;
@@ -108,6 +201,7 @@ AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::st
     }
 
     AgentJobRpcRoute route;
+    route.cell = cell;
     route.online = !explicitOffline(extra, options);
     route.method = route.online ? "agent_admin_turn"
                                 : (mission ? "agent_mission_v1" : "agent_run_v2");
@@ -117,6 +211,10 @@ AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::st
             if (it.key() != "options" && !route.params.contains(it.key()))
                 route.params[it.key()] = it.value();
         }
+    }
+    if (cell && !route.online) {
+        route.error = "Offline agent execution is unavailable in browser cells";
+        return route;
     }
     if (!route.online) {
         // The native core agent reads only the request text: the picked context rides inline.
@@ -144,14 +242,57 @@ AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::st
         route.params["options"]["corporate_force"] = true;
     }
 
-    std::string runId = jsonString(route.params, "run_id");
-    if (runId.empty()) runId = nextAgentRunId();
-    route.params["run_id"] = runId;
-
-    std::string sessionId = jsonString(route.params, "session_id");
-    if (sessionId.empty()) sessionId = convId;
-    if (sessionId.empty()) sessionId = runId;
-    route.params["session_id"] = sessionId;
+    if (cell) {
+        // Discard local conversation/run IDs and IDBFS/runtime paths. A resumed
+        // session can only come from the binding created by a cell reply.
+        for (const char* key : {"run_id", "session_id", "sessions_dir", "chudcode_session_file"}) {
+            route.params.erase(key);
+            route.params["options"].erase(key);
+        }
+        const std::string session = cellAgentSessionHandle(convId);
+        if (!session.empty()) route.params["session_id"] = session;
+        for (auto* object : {&route.params, &route.params["options"]}) {
+            auto workspace = object->find("workspace_dir");
+            if (workspace != object->end()) {
+                std::string relative;
+                if (!workspace->is_string() ||
+                    !chudware::workspaceRelativePath(workspace->get<std::string>(),
+                                                     relative, route.error)) {
+                    if (route.error.empty()) route.error = "Invalid workspace-relative path";
+                    return route;
+                }
+                *workspace = relative.empty() ? "." : relative;
+            }
+        }
+        for (auto* object : {&route.params, &route.params["options"]}) {
+            auto attachments = object->find("attachments");
+            if (attachments == object->end() || !attachments->is_array()) continue;
+            for (auto& attachment : *attachments) {
+                if (!attachment.is_object()) {
+                    route.error = "Invalid attachment";
+                    return route;
+                }
+                auto path = attachment.find("path");
+                if (path == attachment.end()) continue;
+                std::string relative;
+                if (!path->is_string() ||
+                    !chudware::workspaceRelativePath(path->get<std::string>(),
+                                                     relative, route.error)) {
+                    if (route.error.empty()) route.error = "Invalid workspace-relative path";
+                    return route;
+                }
+                *path = relative;
+            }
+        }
+    } else {
+        std::string runId = jsonString(route.params, "run_id");
+        if (runId.empty()) runId = nextAgentRunId();
+        route.params["run_id"] = runId;
+        std::string sessionId = jsonString(route.params, "session_id");
+        if (sessionId.empty()) sessionId = convId;
+        if (sessionId.empty()) sessionId = runId;
+        route.params["session_id"] = sessionId;
+    }
     // No default budget: an absent/zero/invalid `timeout` means the turn has no wall-clock
     // stop, so never forward a non-budget value the worker would have to second-guess.
     const auto timeout = route.params.find("timeout");
@@ -311,9 +452,16 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
     { std::lock_guard<std::mutex> lk(job->evMtx); job->events.clear(); }
     AgentJobRpcRoute route =
         buildAgentJobRpcRoute(request, docId, convId, cam, extra, /*mission=*/false);
+    if (!route.error.empty()) {
+        failJobFromEscapedException(job, route.error);
+        return;
+    }
     if (route.online) {
         std::lock_guard<std::mutex> lock(job->mtx);
         job->runId = route.params.value("run_id", std::string());
+#ifdef __EMSCRIPTEN__
+        job->provider = jsonString(route.params, "provider");
+#endif
     }
 
     // Capture the shared_ptr BY VALUE (not &job) so the JobState outlives this run even if
@@ -322,6 +470,10 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
         nlohmann::json result;
         std::string err;
         try {
+        if (!mintCellAgentHandles(w, job, route, err)) {
+            if (!err.empty()) failJobFromEscapedException(job, err);
+            return;
+        }
 
         WorkerClient::EventFn onEvent = [&job](const nlohmann::json& data) {
             consumeAgentJobEvent(job, data, /*mission=*/false);
@@ -341,7 +493,8 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
             if (!orphanId.empty()) {
                 nlohmann::json cr;
                 std::string ce;
-                if (w.callAgentCancel(orphanId, cr, ce) && cr.value("cancelled", false))
+                if (w.callAgentCancel(orphanId, cr, ce, route.cell ? jsonString(route.params, "provider") : "") &&
+                    cr.value("cancelled", false))
                     orphanCancelled = true;
             }
         }
@@ -520,9 +673,16 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
     { std::lock_guard<std::mutex> lk(job->evMtx); job->events.clear(); }
     AgentJobRpcRoute route =
         buildAgentJobRpcRoute(request, docId, convId, /*cam=*/false, extra, /*mission=*/true);
+    if (!route.error.empty()) {
+        failJobFromEscapedException(job, route.error);
+        return;
+    }
     if (route.online) {
         std::lock_guard<std::mutex> lock(job->mtx);
         job->runId = route.params.value("run_id", std::string());
+#ifdef __EMSCRIPTEN__
+        job->provider = jsonString(route.params, "provider");
+#endif
     }
 
     // Capture the shared_ptr BY VALUE (not &job) — see launchAgentRunV2 above.
@@ -530,6 +690,10 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
         nlohmann::json result;
         std::string err;
         try {
+        if (!mintCellAgentHandles(w, job, route, err)) {
+            if (!err.empty()) failJobFromEscapedException(job, err);
+            return;
+        }
 
         WorkerClient::EventFn onEvent = [&job](const nlohmann::json& data) {
             consumeAgentJobEvent(job, data, /*mission=*/true);

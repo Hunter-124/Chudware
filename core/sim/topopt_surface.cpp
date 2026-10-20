@@ -364,17 +364,32 @@ bool finite_f32(double x) {
 
 // Surface positions as float32 millimetres (shared by the STL and AICM
 // writers).
-std::vector<float> positions_mm_f32(const SurfaceMesh &s) {
+std::vector<float> positions_mm_f32(const SurfaceMesh &s,
+                                   bool refuse_invalid = true) {
   std::vector<float> out(static_cast<std::size_t>(s.vertex_count()) * 3);
   for (int v = 0; v < s.vertex_count(); ++v)
     for (int k = 0; k < 3; ++k) {
       const double mm = units::m_to_mm(s.points_m(k, v));
-      if (!finite_f32(mm))
+      if (!finite_f32(mm) && refuse_invalid)
         fail("invalid_input", "surface vertex " + std::to_string(v) +
                                   " is not finite in float32 millimetres");
-      out[static_cast<std::size_t>(3 * v + k)] = static_cast<float>(mm);
+      out[static_cast<std::size_t>(3 * v + k)] =
+          finite_f32(mm) ? static_cast<float>(mm)
+                         : std::numeric_limits<float>::quiet_NaN();
     }
   return out;
+}
+
+bool valid_f32_triangle(const SurfaceMesh &s, const std::vector<float> &f, int t) {
+  const auto corner = [&](int v) {
+    const std::size_t i = static_cast<std::size_t>(v) * 3;
+    return Eigen::Vector3d(f[i], f[i + 1], f[i + 2]);
+  };
+  const Eigen::Vector3d a = corner(s.triangles(0, t));
+  const double n2 = (corner(s.triangles(1, t)) - a)
+                        .cross(corner(s.triangles(2, t)) - a)
+                        .squaredNorm();
+  return std::isfinite(n2) && n2 > 0;
 }
 
 // Every triangle must keep a nonzero area in the float32 millimetre positions
@@ -382,16 +397,8 @@ std::vector<float> positions_mm_f32(const SurfaceMesh &s) {
 // created; coordinates are never rebased, so a collapse is a named refusal.
 void check_f32_triangles(const SurfaceMesh &s, const std::vector<float> &f,
                          const char *code, const char *format) {
-  const auto corner = [&](int v) {
-    const std::size_t i = static_cast<std::size_t>(v) * 3;
-    return Eigen::Vector3d(f[i], f[i + 1], f[i + 2]);
-  };
   for (int t = 0; t < s.triangle_count(); ++t) {
-    const Eigen::Vector3d a = corner(s.triangles(0, t));
-    const double n2 = (corner(s.triangles(1, t)) - a)
-                          .cross(corner(s.triangles(2, t)) - a)
-                          .squaredNorm();
-    if (!(std::isfinite(n2) && n2 > 0))
+    if (!valid_f32_triangle(s, f, t))
       fail(code, "triangle " + std::to_string(t) +
                      " has coincident or collinear corners in float32 "
                      "millimetres; the " +
@@ -1104,6 +1111,117 @@ bool triangles_touch(const SurfaceMesh &s, int tp, int tq) {
   return true;
 }
 
+// Moller triangle-plane intervals for non-coplanar pairs; convex polygon
+// clipping for coplanar pairs. Only the actual shared simplex is exempt.
+bool triangles_cross_beyond_shared(const SurfaceMesh &s, int a, int b) {
+  if (!triangles_touch(s, a, b))
+    return false;
+  Eigen::Vector3d shared[3];
+  int common = 0;
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      if (s.triangles(i, a) == s.triangles(j, b))
+        shared[common++] = tri_corner(s, a, i);
+  if (common == 0 || common == 3)
+    return true;
+  const Eigen::Vector3d origin = shared[0];
+  Eigen::Vector3d p[3], q[3];
+  double scale = 0;
+  for (int k = 0; k < 3; ++k) {
+    p[k] = tri_corner(s, a, k) - origin;
+    q[k] = tri_corner(s, b, k) - origin;
+    scale = std::max({scale, p[k].norm(), q[k].norm()});
+  }
+  const double tol = 256 * std::numeric_limits<double>::epsilon() * scale;
+  const Eigen::Vector3d np = (p[1] - p[0]).cross(p[2] - p[0]).normalized();
+  const Eigen::Vector3d nq = (q[1] - q[0]).cross(q[2] - q[0]).normalized();
+  const Eigen::Vector3d line = np.cross(nq);
+  if (line.norm() > 256 * std::numeric_limits<double>::epsilon()) {
+    const Eigen::Vector3d axis = line.normalized();
+    auto interval = [&](const Eigen::Vector3d (&v)[3], int triangle,
+                        int other, const Eigen::Vector3d &normal) {
+      double lo = std::numeric_limits<double>::infinity(), hi = -lo;
+      auto add = [&](const Eigen::Vector3d &x) {
+        const double t = x.dot(axis);
+        lo = std::min(lo, t);
+        hi = std::max(hi, t);
+      };
+      // Shared vertices lie on both planes by incidence. Re-evaluating their
+      // signed distance can invent a sign and a false edge-plane crossing.
+      auto distance = [&](int k) {
+        for (int j = 0; j < 3; ++j)
+          if (s.triangles(k, triangle) == s.triangles(j, other))
+            return 0.0;
+        return normal.dot(v[k]);
+      };
+      for (int k = 0; k < 3; ++k) {
+        const int j = (k + 1) % 3;
+        const double u = distance(k), w = distance(j);
+        if (u == 0)
+          add(v[k]);
+        if ((u < 0 && w > 0) || (u > 0 && w < 0))
+          add(v[k] + (u / (u - w)) * (v[j] - v[k]));
+      }
+      return std::pair<double, double>{lo, hi};
+    };
+    const auto ip = interval(p, a, b, nq), iq = interval(q, b, a, np);
+    const double lo = std::max(ip.first, iq.first);
+    const double hi = std::min(ip.second, iq.second);
+    if (lo > hi + tol)
+      return false;
+    double allowed_lo = (shared[0] - origin).dot(axis), allowed_hi = allowed_lo;
+    if (common == 2) {
+      const double t = (shared[1] - origin).dot(axis);
+      allowed_lo = std::min(allowed_lo, t);
+      allowed_hi = std::max(allowed_hi, t);
+    }
+    return lo < allowed_lo - tol || hi > allowed_hi + tol;
+  }
+  int drop = 0;
+  np.cwiseAbs().maxCoeff(&drop);
+  const int x = (drop + 1) % 3, y = (drop + 2) % 3;
+  auto project = [&](const Eigen::Vector3d &v) {
+    return Eigen::Vector2d(v[x], v[y]);
+  };
+  auto cross = [](const Eigen::Vector2d &u, const Eigen::Vector2d &v) {
+    return u.x() * v.y() - u.y() * v.x();
+  };
+  std::array<Eigen::Vector2d, 12> polygon, next;
+  for (int k = 0; k < 3; ++k)
+    polygon[k] = project(p[k]);
+  int count = 3;
+  const double sign = cross(project(q[1] - q[0]), project(q[2] - q[0])) >= 0
+                          ? 1.0 : -1.0;
+  for (int edge = 0; edge < 3 && count > 0; ++edge) {
+    const Eigen::Vector2d start = project(q[edge]);
+    const Eigen::Vector2d delta = project(q[(edge + 1) % 3]) - start;
+    int n = 0;
+    for (int i = 0; i < count; ++i) {
+      const Eigen::Vector2d u = polygon[i], v = polygon[(i + 1) % count];
+      const double du = sign * cross(delta, u - start);
+      const double dv = sign * cross(delta, v - start);
+      if (du >= 0)
+        next[n++] = u;
+      if ((du < 0 && dv > 0) || (du > 0 && dv < 0))
+        next[n++] = u + (du / (du - dv)) * (v - u);
+    }
+    for (int i = 0; i < n; ++i)
+      polygon[i] = next[i];
+    count = n;
+  }
+  const Eigen::Vector2d contact = project(shared[0] - origin);
+  const Eigen::Vector2d edge =
+      common == 2 ? project(shared[1] - shared[0]) : Eigen::Vector2d::Zero();
+  for (int i = 0; i < count; ++i) {
+    Eigen::Vector2d delta = polygon[i] - contact;
+    if (common == 2 && edge.squaredNorm() > 0)
+      delta -= std::clamp(delta.dot(edge) / edge.squaredNorm(), 0.0, 1.0) * edge;
+    if (delta.norm() > tol)
+      return true;
+  }
+  return false;
+}
+
 // Per shell: shares a vertex with, or has a triangle touching or crossing a
 // triangle of, another shell. Bounding-box broadphase, exact pair test.
 std::vector<std::uint8_t> touching_shells(const SurfaceMesh &s,
@@ -1621,6 +1739,224 @@ SurfaceEvidence validate_surface(const SurfaceMesh &s) {
   return ev;
 }
 
+bool surface_self_intersects(const SurfaceMesh &s,
+                              std::vector<int> *crossing_triangles) {
+  check_surface_shape(s);
+  const int T = s.triangle_count();
+  std::vector<std::uint8_t> marked;
+  if (crossing_triangles) {
+    crossing_triangles->clear();
+    marked.assign(static_cast<std::size_t>(T), 0);
+  }
+  bool found = false;
+  const bool finite = s.points_m.allFinite();
+  for (int t = 0; t < T; ++t) {
+    const double n2 = (tri_corner(s, t, 1) - tri_corner(s, t, 0))
+                          .cross(tri_corner(s, t, 2) - tri_corner(s, t, 0))
+                          .squaredNorm();
+    if (!(std::isfinite(n2) && n2 > 0)) {
+      if (!crossing_triangles)
+        return true;
+      marked[t] = 2;
+      found = true;
+    }
+  }
+  if (finite) {
+    const TriangleBvh bvh(s);
+    for (int t = 0; t < T && (!found || crossing_triangles); ++t) {
+      if (crossing_triangles && marked[t] == 2)
+        continue;
+      bvh.overlapping(bvh.lo(t), bvh.hi(t), [&](int other) {
+        if (other <= t || (found && !crossing_triangles))
+          return;
+        if (crossing_triangles &&
+            (marked[other] == 2 || (marked[t] && marked[other])))
+          return;
+        if (triangles_cross_beyond_shared(s, t, other)) {
+          found = true;
+          if (crossing_triangles)
+            marked[t] = marked[other] = 1;
+        }
+      });
+    }
+  }
+  if (crossing_triangles)
+    for (int t = 0; t < T; ++t)
+      if (marked[t])
+        crossing_triangles->push_back(t);
+  return found || !finite;
+}
+
+SurfaceMesh smooth_print_surface(const SurfaceMesh &raw,
+                                 const PrintSurfaceOptions &options,
+                                 PrintSurfaceEvidence &evidence) {
+  check_surface_shape(raw);
+  evidence = PrintSurfaceEvidence{};
+  evidence.iterations_requested = options.iterations;
+  if (options.iterations < 1 || !std::isfinite(options.lambda) ||
+      !std::isfinite(options.mu) || options.lambda <= 0 || options.lambda >= 1 ||
+      options.mu >= 0 || options.mu <= -1)
+    fail("invalid_input", "invalid print-surface Taubin smoothing parameters");
+  const int V = raw.vertex_count();
+  std::vector<std::uint8_t> movable(static_cast<std::size_t>(V), 1);
+  std::vector<std::vector<int>> neighbors(static_cast<std::size_t>(V));
+  for (int t = 0; t < raw.triangle_count(); ++t)
+    for (int k = 0; k < 3; ++k) {
+      const int v = raw.triangles(k, t);
+      if (raw.triangle_origin[t] != TriangleOrigin::Isosurface)
+        movable[v] = 0;
+      neighbors[v].push_back(raw.triangles((k + 1) % 3, t));
+      neighbors[v].push_back(raw.triangles((k + 2) % 3, t));
+    }
+  for (int v = 0; v < V; ++v) {
+    auto &adjacent = neighbors[v];
+    std::sort(adjacent.begin(), adjacent.end());
+    adjacent.erase(std::unique(adjacent.begin(), adjacent.end()), adjacent.end());
+    if (adjacent.empty())
+      movable[v] = 0;
+    if (movable[v])
+      ++evidence.smoothed_vertices;
+    else
+      ++evidence.pinned_vertices;
+  }
+  const double raw_volume = validate_surface(raw).signed_volume_m3;
+  SurfaceMesh candidate = raw;
+  Eigen::Matrix3Xd next(3, V);
+  std::vector<int> bad_triangles;
+  std::vector<std::uint8_t> rollback(static_cast<std::size_t>(V), 0);
+  for (int iterations = options.iterations; iterations >= 1; iterations /= 2) {
+    for (int round = 0; round <= 8; ++round) {
+      candidate.points_m = raw.points_m;
+      for (int i = 0; i < iterations; ++i)
+        for (double factor : {options.lambda, options.mu}) {
+          next = candidate.points_m;
+          for (int v = 0; v < V; ++v) {
+            if (!movable[v])
+              continue;
+            Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+            for (int n : neighbors[v])
+              mean += candidate.points_m.col(n);
+            mean /= static_cast<double>(neighbors[v].size());
+            next.col(v) += factor * (mean - candidate.points_m.col(v));
+          }
+          candidate.points_m.swap(next);
+        }
+      const auto geometry = validate_surface(candidate);
+      evidence.self_intersections_checked = true;
+      const bool intersects = surface_self_intersects(candidate, &bad_triangles);
+      const std::vector<float> f32 = positions_mm_f32(candidate, false);
+      for (int t = 0; t < candidate.triangle_count(); ++t)
+        if (!valid_f32_triangle(candidate, f32, t))
+          bad_triangles.push_back(t);
+      if (!bad_triangles.empty()) {
+        evidence.reason = intersects ? "smoothed triangles self-intersect"
+                                    : "smoothed triangles collapse in STL float32";
+        if (round == 8)
+          break;
+        std::fill(rollback.begin(), rollback.end(), 0);
+        for (int t : bad_triangles)
+          for (int k = 0; k < 3; ++k) {
+            const int v = raw.triangles(k, t);
+            rollback[v] = 1;
+            for (int n : neighbors[v])
+              rollback[n] = 1;
+          }
+        int added = 0;
+        for (int v = 0; v < V; ++v)
+          if (rollback[v] && movable[v]) {
+            movable[v] = 0;
+            ++added;
+          }
+        if (added == 0)
+          break;
+        evidence.rollback_vertices += added;
+        evidence.smoothed_vertices -= added;
+        ++evidence.rollback_rounds;
+        continue;
+      }
+      if (geometry.state != GeometryState::Valid || intersects) {
+        evidence.reason = "smoothed surface state " +
+                          std::string(to_string(geometry.state));
+        break;
+      }
+      evidence.state = "valid";
+      evidence.iterations_used = iterations;
+      evidence.reason.clear();
+      for (int v = 0; v < V; ++v)
+        evidence.max_displacement_mm = std::max(
+            evidence.max_displacement_mm,
+            1e3 * (candidate.points_m.col(v) - raw.points_m.col(v)).norm());
+      evidence.volume_change_fraction =
+          raw_volume > 0 ? (geometry.signed_volume_m3 - raw_volume) / raw_volume : 0;
+      return candidate;
+    }
+  }
+  evidence.state = "refused";
+  fail("print_surface_invalid", evidence.reason);
+}
+
+nlohmann::json to_json(const PrintSurfaceEvidence &e) {
+  nlohmann::json out = {
+      {"state", e.state},
+      {"iterations_requested", e.iterations_requested},
+      {"iterations_used", e.iterations_used},
+      {"rollback_vertices", e.rollback_vertices},
+      {"rollback_rounds", e.rollback_rounds},
+      {"pinned_vertices", e.pinned_vertices},
+      {"smoothed_vertices", e.smoothed_vertices},
+      {"max_displacement_mm", e.max_displacement_mm},
+      {"volume_change_fraction", e.volume_change_fraction},
+      {"self_intersections_checked", e.self_intersections_checked}};
+  if (!e.reason.empty())
+    out["reason"] = e.reason;
+  return out;
+}
+
+SurfaceOverhang measure_surface_overhang(const SurfaceMesh &s,
+                                         const Eigen::Vector3d &direction,
+                                         double angle_deg,
+                                         double plate_height_m,
+                                         double plate_tolerance_m) {
+  check_surface_shape(s);
+  if (!direction.allFinite() || !(direction.norm() > 0) ||
+      !(angle_deg > 0 && angle_deg < 90) ||
+      !std::isfinite(plate_height_m) || !(plate_tolerance_m >= 0))
+    fail("invalid_input", "invalid surface overhang settings");
+  const Eigen::Vector3d d = direction.normalized();
+  const double limit = std::sin(angle_deg * kPi / 180.0);
+  constexpr double cos_two_degrees = 0.9993908270190958;
+  SurfaceOverhang out;
+  out.vertex_fraction = Eigen::VectorXd::Zero(s.vertex_count());
+  Eigen::VectorXd area = Eigen::VectorXd::Zero(s.vertex_count());
+  for (int t = 0; t < s.triangle_count(); ++t) {
+    const Eigen::Vector3d cross = (tri_corner(s, t, 1) - tri_corner(s, t, 0))
+                                    .cross(tri_corner(s, t, 2) - tri_corner(s, t, 0));
+    const double twice_area = cross.norm();
+    if (!(twice_area > 0))
+      continue;
+    const double a = 0.5 * twice_area, nd = cross.dot(d) / twice_area;
+    bool on_plate = nd < -cos_two_degrees;
+    for (int k = 0; k < 3; ++k)
+      on_plate = on_plate &&
+                 std::abs(tri_corner(s, t, k).dot(d) - plate_height_m) <=
+                     plate_tolerance_m;
+    const bool unsupported = !on_plate && -nd > limit;
+    out.total_area_m2 += a;
+    if (unsupported)
+      out.unsupported_area_m2 += a;
+    for (int k = 0; k < 3; ++k) {
+      const int v = s.triangles(k, t);
+      area[v] += a;
+      if (unsupported)
+        out.vertex_fraction[v] += a;
+    }
+  }
+  for (int v = 0; v < s.vertex_count(); ++v)
+    if (area[v] > 0)
+      out.vertex_fraction[v] /= area[v];
+  return out;
+}
+
 Eigen::VectorXd interpolate_nodal_field(const SurfaceMesh &s,
                                         const Eigen::VectorXd &values,
                                         int components) {
@@ -1936,6 +2272,10 @@ ArtifactFile write_surface_aicm(const std::string &path, const SurfaceMesh &s,
         vmin = std::nextafter(vmin, -std::numeric_limits<float>::infinity());
         vmax = std::nextafter(vmax, std::numeric_limits<float>::infinity());
       }
+    }
+    if (sc.name == "overhang") {
+      vmin = 0;
+      vmax = 1;
     }
     chunks.push_back(aicm::scalar_chunk(1, sc.name, f32, vmin, vmax));
     arrays.push_back({{"name", sc.name},

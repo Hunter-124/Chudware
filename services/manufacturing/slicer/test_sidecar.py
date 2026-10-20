@@ -2,8 +2,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import os
 from pathlib import Path
+import subprocess
+import sys
 import time
+
+import pytest
 
 from services.manufacturing.slicer.contract import (
     Determinism,
@@ -16,6 +21,8 @@ from services.manufacturing.slicer.contract import (
 from services.manufacturing.slicer.sidecar import (
     MAX_MODEL_BYTES,
     SLICER_ENV_VAR,
+    _communicate_bounded,
+    _ProcessLimitError,
     invoke_sidecar,
 )
 
@@ -229,3 +236,103 @@ def test_timeout_kills_the_entire_process_group_without_orphan(tmp_path: Path) -
     while time.monotonic() < deadline and Path(f"/proc/{pid}").exists():
         time.sleep(0.01)
     assert not Path(f"/proc/{pid}").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX executable/pipe process-group fixture")
+def test_closed_output_pipes_do_not_remove_existing_sidecar_deadline(tmp_path: Path) -> None:
+    script = tmp_path / "closed-pipes"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import os, pathlib, time\n"
+        "pathlib.Path('slicer.pid').write_text(str(os.getpid()), encoding='ascii')\n"
+        "os.close(1); os.close(2)\n"
+        "time.sleep(4)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o700)
+    request = _request(tmp_path)
+    started = time.monotonic()
+    result = invoke_sidecar(
+        request,
+        tmp_path / "work-closed-pipes",
+        binary=script,
+        timeout_s=0.2,
+    )
+    elapsed = time.monotonic() - started
+    assert isinstance(result, SliceRefusal)
+    assert result.code == "slicer_timeout"
+    assert elapsed < 3.0  # includes the existing process-group shutdown grace
+    pid = int(
+        (tmp_path / "work-closed-pipes" / request.request_id / "slicer.pid").read_text(
+            encoding="ascii"
+        )
+    )
+    with pytest.raises(ChildProcessError):
+        os.waitpid(pid, os.WNOHANG)  # invoke_sidecar already reaped its own child
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX selectable subprocess pipes")
+def test_closed_pipe_wait_uses_remaining_deadline_not_a_fresh_timeout(tmp_path: Path) -> None:
+    with subprocess.Popen(
+        [
+            sys.executable, "-c",
+            "import os,time; time.sleep(0.3); os.close(1); os.close(2); time.sleep(0.4)",
+        ],
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    ) as process:
+        with pytest.raises(_ProcessLimitError) as refusal:
+            _communicate_bounded(process, timeout_s=0.6, limit=1024)
+        assert refusal.value.code == "slicer_timeout"
+        assert process.returncode is not None
+        with pytest.raises(ChildProcessError):
+            os.waitpid(process.pid, os.WNOHANG)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX selectable subprocess pipes")
+@pytest.mark.parametrize("timeout_s", [None, 2.0])
+def test_bounded_capture_preserves_output_and_waits_for_normal_closed_pipe_exit(
+    tmp_path: Path, timeout_s: float | None,
+) -> None:
+    with subprocess.Popen(
+        [
+            sys.executable, "-c",
+            "import os,time; "
+            "os.write(1, b'out\\x00\\xff\\n'); os.write(2, b'err\\x00\\xfe\\n'); "
+            "os.close(1); os.close(2); time.sleep(0.05)",
+        ],
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    ) as process:
+        output = _communicate_bounded(process, timeout_s=timeout_s, limit=1024)
+        assert output == (b"out\x00\xff\n", b"err\x00\xfe\n")
+        assert process.returncode == 0
+        assert process.stdout.closed
+        assert process.stderr.closed
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX selectable subprocess pipes")
+@pytest.mark.parametrize("descriptor", [1, 2])
+def test_no_deadline_still_enforces_each_output_byte_ceiling(
+    tmp_path: Path, descriptor: int,
+) -> None:
+    with subprocess.Popen(
+        [
+            sys.executable, "-c",
+            f"import os,time; os.write({descriptor}, b'x' * 2048); time.sleep(4)",
+        ],
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    ) as process:
+        with pytest.raises(_ProcessLimitError) as refusal:
+            _communicate_bounded(process, timeout_s=None, limit=1024)
+        assert refusal.value.code == "slicer_output_limit"
+        assert process.returncode is not None
+        with pytest.raises(ChildProcessError):
+            os.waitpid(process.pid, os.WNOHANG)

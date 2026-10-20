@@ -13,6 +13,7 @@
 #include <nlohmann/json.hpp>
 
 #include "imgui.h"
+#include "widgets/kit.h"
 
 #include "../bootstrap.h"
 #include "../core/app_state.h" // appdataAppDir — custom_materials.json
@@ -209,7 +210,8 @@ std::string materialDisplayName(const std::string &key) {
 }
 
 bool appearanceColorPicker(const char *popupId, float outColor[3],
-                           float *outMetallic, float *outRoughness) {
+                           float *outMetallic, float *outRoughness,
+                           const char *disabledReason) {
   // C38 (A1): per-popup-id seed state. Three callers share this function with
   // distinct popup ids; a single shared s_pick/s_seeded corrupted the seed when
   // two pickers were armed the same frame (the second BeginPopup would reuse
@@ -225,6 +227,7 @@ bool appearanceColorPicker(const char *popupId, float outColor[3],
   float *s_pick = ps.pick.data();
   bool committed = false;
   if (ImGui::BeginPopup(popupId)) {
+    const bool enabled = !disabledReason || !*disabledReason;
     // Seed the picker from the caller's current color once per open.
     if (!ps.seeded) {
       s_pick[0] = outColor[0];
@@ -245,6 +248,7 @@ bool appearanceColorPicker(const char *popupId, float outColor[3],
     // clicking it applies that color plus the preset's metalness/roughness
     // finish.
     const float sw = 22.0f * ui::uiScale;
+    ImGui::BeginDisabled(!enabled);
     for (int i = 0; i < kMaterialsCount; ++i) {
       if (i)
         ImGui::SameLine(0, 6.0f * ui::uiScale);
@@ -264,9 +268,12 @@ bool appearanceColorPicker(const char *popupId, float outColor[3],
         committed = true;
         ImGui::CloseCurrentPopup();
       }
+      if (!enabled && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", disabledReason);
       ImGui::SameLine(0, 2.0f * ui::uiScale);
       ImGui::TextUnformatted(kMaterials[i].name);
     }
+    ImGui::EndDisabled();
     ImGui::Separator();
     // Preset swatches (greys, primaries, plus common engineering colors). Click
     // = apply immediately. Sixteen entries rendered in two rows of eight.
@@ -288,6 +295,7 @@ bool appearanceColorPicker(const char *popupId, float outColor[3],
         {0.95f, 0.92f, 0.85f}, // cream
         {0.08f, 0.08f, 0.10f}, // near-black
     };
+    ImGui::BeginDisabled(!enabled);
     for (int i = 0; i < 16; ++i) {
       if (i && i != 8)
         ImGui::SameLine(0, 4.0f * ui::uiScale);
@@ -302,7 +310,10 @@ bool appearanceColorPicker(const char *popupId, float outColor[3],
         committed = true;
         ImGui::CloseCurrentPopup();
       }
+      if (!enabled && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", disabledReason);
     }
+    ImGui::EndDisabled();
     ImGui::Separator();
     ImGui::SetNextItemWidth(180.0f * ui::uiScale);
     ImGui::ColorPicker3("##appk", s_pick,
@@ -318,7 +329,8 @@ bool appearanceColorPicker(const char *popupId, float outColor[3],
       ImGui::SetNextItemWidth(180.0f * ui::uiScale);
       ImGui::SliderFloat("##rough", &ps.rough, 0.0f, 1.0f, "Roughness %.2f");
     }
-    if (ImGui::Button("Apply", ImVec2(80.0f * ui::uiScale, 0))) {
+    if (kit::primaryButton("Apply", enabled, disabledReason,
+                           ImVec2(80.0f * ui::uiScale, 0))) {
       outColor[0] = s_pick[0];
       outColor[1] = s_pick[1];
       outColor[2] = s_pick[2];

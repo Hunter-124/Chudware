@@ -18,27 +18,24 @@ NEVER approximate a curved or organic shape with a stack of boxes. A plain recta
 block may use a primitive. Use a single `script` feature ONLY as a true last resort when no
 combination of the cheatsheet features can express the geometry.
 
-SKETCH DISCIPLINE — match the constraint effort to the sketch KIND:
-  - SELF-DEFINED PRIMITIVE ENTITIES need NO manual constraints. A `polygon`/`hexagon`, `circle`,
-    `rectangle`, or `airfoil` entity is fully defined by its own fields (center, radius, across_flats,
-    sides, …). Do NOT add `coincident`/`concentric`/`fix`/`symmetric` constraints to pin such an
-    entity to the origin or to itself — center it with its `center:[x,y]` field instead. Leave the
-    sketch feature's `constraints` array EMPTY for a primitive-only sketch (see the polygon/circle
-    few-shots below). Adding constraints here is the #1 cause of a rejected sketch (dangling refs,
-    duplicate ids), because the primitive expands into many internal edges the model cannot name.
-  - HAND-DRAWN line/arc sketches (a bracket outline, a revolve half-profile) DO need geometric
-    RELATIONS — coincident (close the loop: each segment's end ON the next's start),
-    horizontal/vertical, parallel, perpendicular, tangent, equal, midpoint, collinear — PLUS DRIVING
-    DIMENSIONS for every named size, aiming at a FULLY DEFINED sketch (0 DOF). A driving dimension
-    whose value comes from an equation/global (`{value, expr}`) stays parametric.
-  - CONSTRAINT RULES (when you do add them): every constraint needs a UNIQUE `id` of the form `cN`
-    (c0, c1, …) and a `refs` array naming EXACTLY the entity handles it relates (coincident/parallel/
-    etc. take 2 refs). NEVER reference an entity `id` you did not define in THIS sketch, and NEVER
-    reference `"origin"` or a datum point as a constraint ref — the sketch origin is implicit, not an
-    addressable entity. If unsure, omit the constraint rather than emit a dangling ref.
-  - Self-check: after a hand-drawn sketch is built, the reviewer (or you, via `check_sketch`) reports
-    `dof` + conflicting/redundant constraints. Under-defined -> add relations/dimensions; over-defined
-    -> remove a conflicting/redundant one. Prefer a RELATION over a redundant driving dimension.
+SKETCH DISCIPLINE — geometry fields are initial guesses, not a fully defined sketch.
+  - Draw roughly → geometric relations → spec-driven dimensions → sketch_fully_define →
+    check_sketch. Require closed profile, dof == 0, pinned_only == false, no conflicts/skips.
+    Never blanket-fix authored geometry; converted fixed external references are legitimate.
+  - Give entities eN ids and constraints unique cN ids. Example circle intent:
+    {"id":"c1","type":"coincident","refs":["e1.center","origin"]},
+    {"id":"c2","type":"radius","refs":["e1"],"value":{"value":8,"expr":null}}.
+    origin, axis.h and axis.v ARE valid refs. Other refs must exist in this sketch.
+  - Use coincident, h/v, tangent, equal, concentric and symmetric before independent driving
+    dimensions. Symmetric profiles use a construction centerline or axis.v and one half-size,
+    not separately dimensioned halves. Use real arcs/slots, not faceted or spline substitutes.
+  - Project surrounding face/edge/vertex/pierce/datum/sketch geometry with sketch_convert,
+    construction:true; relate your profile to the returned entities instead of copying coords.
+  - Finish explicit intent with {"op":"sketch_fully_define","sketch":"$0"} (correct op index).
+    add_features defaults auto_define:true; opt out for staged work with call auto_define:false
+    or auto_define:false on the sketch feature/params/authoring op, then define before use.
+    Composites (rectangle/polygon/airfoil) still need driving dimensions and a quality check.
+    Read the sketch cheatsheet for full relation/ref syntax and exact edit ops.
 
 HARDWARE: the plan carries the concrete dimensions for any named off-the-shelf part — use exactly
 those. If you must cut a clearance hole or tapped hole for a metric bolt and the plan didn't give a

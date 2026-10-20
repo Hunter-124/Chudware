@@ -35,6 +35,27 @@
 namespace chudware_ipc { class EngineClient; }
 
 namespace engine {
+// Browser protocol admission is shared by dispatch and UI capability disclosure.
+// The advertised list is authoritative; unknown/older gateways never enable CAD/AI.
+inline bool webCellProtocolReady(const nlohmann::json& info) {
+    if (!info.is_object()) return false;
+    const auto version = info.find("web_rpc_version");
+    const auto methods = info.find("web_rpc_methods");
+    if (version == info.end() || !version->is_number_integer() || *version != 2 ||
+        methods == info.end() || !methods->is_array()) return false;
+    for (const auto& entry : *methods)
+        if (!entry.is_string()) return false;
+    return true;
+}
+
+inline bool webCellMethodAllowed(const nlohmann::json& info, const std::string& method) {
+    if (method == "hello" || method == "ping") return true;
+    if (!webCellProtocolReady(info)) return false;
+    for (const auto& entry : info["web_rpc_methods"])
+        if (entry.get_ref<const std::string&>() == method) return true;
+    return false;
+}
+
 
 // True iff the daemon backend was selected at startup (resolved once, thread-safe):
 // connected, or refused by a draining hostd and waiting for it to exit. False = legacy
@@ -87,11 +108,11 @@ bool call(const std::string& method, const nlohmann::json& params,
 // connections so app quit / AsyncRpc shutdown never hangs. No-op for unopened connections.
 void abortRunClient();
 
-// The dedicated daemon connection a method streams on. Agent runs (agent_admin_turn,
-// agent_run[_v2], agent_mission[_v1]) take the agent run connection, which falls back to the
-// shared GUI connection when it cannot open; simulation solves and sim_mesh take the private
-// simulation connection, which never falls back (the call fails instead). Everything else uses
-// the shared GUI connection. The two lanes are independent: a chat turn never waits for a solve.
+// The dedicated daemon connections a method streams on. Agent runs (agent_admin_turn,
+// agent_run[_v2], agent_mission[_v1]) lease one of at most eight private connections,
+// waiting when all are occupied. They fall back to the shared GUI connection only when
+// none can open and the pool is empty. Simulation solves and sim_mesh use one private
+// connection with no fallback. The lanes are independent: a chat turn never waits for a solve.
 enum class RunLane { None, Agent, Sim };
 RunLane runLane(const std::string& method);
 
@@ -100,11 +121,10 @@ RunLane runLane(const std::string& method);
 // WorkerClient sends it over a short-lived side connection while the lane is busy.
 bool isSimLanePreview(const std::string& method);
 
-// True when daemon-mode calls on `lane` will stream on that lane's dedicated connection
-// (opening it lazily if needed), i.e. engine::call will NOT occupy the shared GUI connection.
-// WorkerClient only lets a long run off its call mutex when this holds for the run's own lane;
-// one lane's readiness says nothing about the other's. False for RunLane::None and off daemon
-// mode.
+// True when a dedicated connection exists for `lane` or can be opened lazily.
+// Agent calls lease a pooled connection; simulation calls reuse their single connection.
+// WorkerClient uses this to release native long runs from callMtx_. Online daemon turns
+// never take that mutex. False for RunLane::None and off daemon mode.
 bool runConnectionReady(RunLane lane);
 
 // Backend availability probes with InProcCore semantics (routing predicates in

@@ -236,7 +236,7 @@ def card_solver(
 ) -> dict:
     """Failure card for a sketch solver conflict (over-constrained).
 
-    ``conflicting`` is the ``conflicting`` list from ``doc_sketch_health`` — each
+    ``conflicting`` is the ``conflicting`` list from ``sketch_health`` — each
     entry is a dict ``{"id": "c7", "type": "parallel", "suggestion": "..."}``.
     The list is verbatim-spliced into ``why.detail`` and each entry becomes a
     ``delete_constraint`` candidate fix with the kernel's own suggestion text.
@@ -252,7 +252,7 @@ def card_solver(
                 "action": "delete_constraint",
                 "params": {"doc_id": doc_id, "sketch": sketch_id, "id": c.get("id")},
                 "basis": c.get("suggestion") or (
-                    f"constraint {c.get('id')!r} ({c.get('type')}) flagged as conflicting by doc_sketch_health"
+                    f"constraint {c.get('id')!r} ({c.get('type')}) flagged as conflicting by sketch_health"
                 ),
                 "predicted_effect": (
                     f"removing {c.get('id')!r} resolves the over-constraint"
@@ -282,7 +282,7 @@ def card_solver(
         where=where,
         why={"kind": why_kind, "detail": why_detail},
         candidate_fixes=candidate_fixes,
-        helper_tools=["doc_sketch_health", "doc_sketch_auto_constrain"],
+        helper_tools=["sketch_health", "sketch_auto_constrain"],
     )
 
 

@@ -8,7 +8,6 @@ returned or logged.
 
 from __future__ import annotations
 
-import base64
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,11 +22,13 @@ try:
     from .auth import get_current_user
     from .config import settings
     from .db import tx
+    from .deployment_config import ConfigurationError, PROVIDER_KEY, decode_encryption_key
     from .limits import RateLimiter
 except ImportError:  # uvicorn app:app from the package directory
     from auth import get_current_user
     from config import settings
     from db import tx
+    from deployment_config import ConfigurationError, PROVIDER_KEY, decode_encryption_key
     from limits import RateLimiter
 
 router = APIRouter(prefix="/api/providers", tags=["provider-keys"])
@@ -87,16 +88,9 @@ def _key_bytes() -> bytes:
             "CHUDWARE_WEB_PROVIDER_KEY_ENCRYPTION_KEY is required for web BYOK"
         )
     try:
-        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
-    except (ValueError, TypeError) as exc:
-        raise RuntimeError(
-            "CHUDWARE_WEB_PROVIDER_KEY_ENCRYPTION_KEY must be URL-safe base64"
-        ) from exc
-    if len(raw) != 32:
-        raise RuntimeError(
-            "CHUDWARE_WEB_PROVIDER_KEY_ENCRYPTION_KEY must encode exactly 32 bytes"
-        )
-    return raw
+        return decode_encryption_key(encoded, PROVIDER_KEY)
+    except ConfigurationError as exc:
+        raise RuntimeError(str(exc)) from None
 
 
 def _aad(email: str, provider: str) -> bytes:
@@ -175,6 +169,21 @@ def has_validated_key(email: str, provider: str) -> bool:
             (_email(email), normalized_provider),
         )
         return cur.fetchone() is not None
+
+
+def read_validated_key(email: str, provider: str) -> str | None:
+    """Read the current validated key without locking or writing last-used metadata."""
+    normalized_provider = str(provider or "").strip().lower()
+    if normalized_provider not in VALIDATION_SPECS:
+        return None
+    normalized_email = _email(email)
+    with tx() as cur:
+        cur.execute(
+            "SELECT encrypted_key FROM provider_keys WHERE email=%s AND provider=%s "
+            "AND validation_state='validated'", (normalized_email, normalized_provider),
+        )
+        row = cur.fetchone()
+    return decrypt_key(normalized_email, normalized_provider, row["encrypted_key"]) if row else None
 
 
 def resolve_validated_key(email: str, provider: str) -> str | None:

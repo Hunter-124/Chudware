@@ -12,13 +12,14 @@ them:
 * **No account-existence oracle.** ``/api/auth/login`` returns one byte-identical
   401 for "no such email" and "wrong password", and burns a real argon2
   verification against a dummy hash on the unknown-email path so the two answers
-  also cost the same wall-clock time. ``/api/auth/register`` returns the same 202
-  for a fresh address and a taken one, and tells the *address owner* by mail.
+  also cost the same wall-clock time. ``/api/auth/register`` hashes once and returns
+  the same 202 for fresh and taken addresses, notifying the address owner by mail.
 * **Sessions are rows, not signed cookies.** Suspending an account has to end its
   live sessions on the very next request; a self-contained cookie cannot do that
   without a revocation table, at which point it is just a worse version of this.
-* **Tokens are stored hashed.** ``email_tokens`` holds a SHA-256 and nothing
-  else, so a database dump never yields a usable verification or reset link.
+* **Tokens are stored hashed.** ``email_tokens`` holds only SHA-256 digests;
+  queued bearer URLs are authenticated ciphertext under an external mail key.
+  Verification navigation never establishes or changes the browser's login.
 """
 
 from __future__ import annotations
@@ -40,13 +41,14 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 try:
-    from . import accounts
+    from . import accounts, mailer
     from .config import settings
     from .db import tx
     from .limits import login_by_email, login_by_ip
     from .mailer import send as send_mail
 except ImportError:  # uvicorn app:app from the package dir
     import accounts  # type: ignore
+    import mailer  # type: ignore
     from config import settings  # type: ignore
     from db import tx  # type: ignore
     from limits import login_by_email, login_by_ip  # type: ignore
@@ -191,6 +193,18 @@ def burn_dummy_verification(password: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _lock_account(email: str) -> None:
+    """Serialize authentication transitions, including absent credentials.
+
+    Lock the account before credentials, tokens, or sessions. A credential row
+    alone cannot protect OAuth-only accounts, and redeeming a token before this
+    lock would race OAuth invalidation. Call inside the transition's outer tx().
+    """
+    with tx() as cur:
+        cur.execute("SELECT email FROM accounts WHERE email = %s FOR UPDATE", (email,))
+        cur.fetchone()
+
+
 def get_credential(email: str) -> dict[str, Any] | None:
     with tx() as cur:
         cur.execute(
@@ -208,8 +222,13 @@ def set_password(email: str, password: str, *, verified: bool) -> None:
     (a redeemed reset token); registration always writes False and waits for the
     verification link.
     """
-    digest = hash_password(password)
+    _store_password(email, hash_password(password), verified=verified)
+
+
+def _store_password(email: str, digest: str, *, verified: bool) -> None:
+    """Persist a precomputed hash without repeating the expensive work."""
     with tx() as cur:
+        _lock_account(email)
         cur.execute(
             """
             INSERT INTO credentials (email, password_hash, email_verified,
@@ -239,6 +258,7 @@ def _rehash_if_needed(email: str, stored_hash: str, password: str) -> None:
 
 def mark_verified(email: str) -> None:
     with tx() as cur:
+        _lock_account(email)
         cur.execute(
             "UPDATE credentials"
             "   SET email_verified = TRUE,"
@@ -308,6 +328,10 @@ def create_session(
     sid = secrets.token_urlsafe(32)
     expires = _now() + (ttl or timedelta(days=max(1, int(settings.session_ttl_days))))
     with tx() as cur:
+        cur.execute("SELECT status FROM accounts WHERE email = %s FOR UPDATE", (email,))
+        account = cur.fetchone()
+        if account is None or account["status"] in ("denied", "suspended"):
+            raise HTTPException(status_code=403, detail="account is not permitted to sign in")
         cur.execute(
             "INSERT INTO sessions (sid, email, expires_at, user_agent, ip)"
             " VALUES (%s, %s, %s, %s, %s)",
@@ -388,6 +412,7 @@ def store_token(token: str, email: str, purpose: str, ttl: timedelta) -> None:
     """
     with tx() as cur:
         if email:
+            _lock_account(email)
             cur.execute(
                 "UPDATE email_tokens SET used_at = now()"
                 " WHERE email = %s AND purpose = %s AND used_at IS NULL",
@@ -401,7 +426,7 @@ def store_token(token: str, email: str, purpose: str, ttl: timedelta) -> None:
 
 
 def mint_token(email: str, purpose: str, ttl: timedelta) -> str:
-    """Issue a token for ``purpose`` and return its PLAINTEXT (the only copy)."""
+    """Issue a token for ``purpose``; plaintext is returned, never stored here."""
     token = secrets.token_urlsafe(32)
     store_token(token, email, purpose, ttl)
     return token
@@ -416,6 +441,17 @@ def consume_token(token: str, purpose: str) -> str | None:
     if not token:
         return None
     with tx() as cur:
+        # Read without a token-row lock, then take locks in account-first order.
+        # The UPDATE below rechecks validity after a concurrent OAuth cutover.
+        cur.execute(
+            "SELECT email FROM email_tokens WHERE token_hash = %s AND purpose = %s",
+            (token_hash(token), purpose),
+        )
+        candidate = cur.fetchone()
+        if candidate is None:
+            return None
+        if candidate["email"]:
+            _lock_account(candidate["email"])
         cur.execute(
             """
             UPDATE email_tokens SET used_at = now()
@@ -447,15 +483,13 @@ def oauth_email(provider: str, subject: str) -> str | None:
 
 
 def link_oauth_identity(provider: str, subject: str, email: str) -> None:
-    """Bind (provider, subject) to an account, following a provider-side email
-    change rather than forking a second account for it."""
+    """Bind a stable provider subject once; provider email changes never move it."""
     with tx() as cur:
         cur.execute(
             """
             INSERT INTO oauth_identities (provider, subject, email)
                  VALUES (%s, %s, %s)
-            ON CONFLICT (provider, subject) DO UPDATE
-                    SET email = EXCLUDED.email, linked_at = now()
+            ON CONFLICT (provider, subject) DO NOTHING
             """,
             (provider, subject, email),
         )
@@ -670,17 +704,70 @@ def begin_session_response(
     return response
 
 
-def complete_verification(request: Request, email: str) -> str:
-    """Mark the address verified, promote a pending account onto the trial, and
-    return a fresh session id. Shared by the verify link and the OAuth callback,
-    both of which are proofs of address ownership."""
-    mark_verified(email)
-    start_trial(email)
-    return create_session(
-        email,
-        user_agent=request.headers.get("user-agent", ""),
-        ip=client_ip(request),
+def complete_verification(email: str) -> None:
+    """Verify inbox ownership without creating or replacing a browser session."""
+    with tx():
+        _lock_account(email)
+        mark_verified(email)
+        start_trial(email)
+
+
+def _invalidate_password_capabilities(email: str) -> None:
+    """Invalidate verification and recovery links while holding the account lock."""
+    with tx() as cur:
+        cur.execute(
+            "UPDATE email_tokens SET used_at = now()"
+            " WHERE email = %s AND purpose IN (%s, %s) AND used_at IS NULL",
+            (email, PURPOSE_VERIFY, PURPOSE_RESET),
+        )
+
+
+def complete_oauth(request: Request, email: str) -> str:
+    """Finish provider ownership proof without blessing an unverified password.
+
+    Only a password verified independently of this OAuth flow survives. Remove
+    preregistration credentials and their capabilities before issuing the OAuth
+    session, in the same transaction as account linking and trial activation.
+    """
+    with tx() as cur:
+        _lock_account(email)
+        cur.execute(
+            "DELETE FROM credentials WHERE email = %s AND NOT email_verified",
+            (email,),
+        )
+        if cur.rowcount:
+            revoke_sessions(email)
+        _invalidate_password_capabilities(email)
+        start_trial(email)
+        return create_session(
+            email,
+            user_agent=request.headers.get("user-agent", ""),
+            ip=client_ip(request),
+        )
+
+
+def _issue_token_mail(email: str, purpose: str, ttl: timedelta) -> None:
+    token = secrets.token_urlsafe(32)
+    expires_at = _now() + ttl
+    url_key = "verify_url" if purpose == PURPOSE_VERIFY else "reset_url"
+    url = _verify_url(token) if purpose == PURPOSE_VERIFY else _reset_url(token)
+    message = mailer.prepare(
+        email, purpose,
+        {"email": email, url_key: url,
+         "expires_hours": str(max(1, int(ttl.total_seconds() // 3600)))},
+        expires_at=expires_at,
     )
+    if message is None:
+        return
+    # A savepoint preserves the previous deliverable token if enqueue fails,
+    # even when registration/resend already owns the outer account transaction.
+    with tx() as cur:
+        try:
+            with cur.connection.transaction():
+                store_token(token, email, purpose, ttl)
+                mailer.enqueue(message)
+        except Exception:
+            log.warning("authn: token mail enqueue failed purpose=%s", purpose)
 
 
 # ---------------------------------------------------------------------------
@@ -702,28 +789,30 @@ async def register(request: Request, body: dict[str, Any]) -> dict[str, str]:
     if not valid_email(email):
         raise HTTPException(status_code=400, detail="enter a valid email address")
     _check_password_policy(password)
+    # Exactly one Argon2 hash for every valid, admitted registration outcome.
+    digest = hash_password(password)
 
-    taken = get_credential(email) is not None or bool(oauth_providers_for(email))
-    if taken:
-        send_mail(
-            email,
-            "register_exists",
-            {"email": email, "login_url": _login_url(), "reset_url": f"{_base_url()}/#forgot"},
+    with tx():
+        accounts.ensure_account(email, display=email.split("@")[0])
+        _lock_account(email)
+        # OAuth-only bootstrap can precede the operator's first provider link.
+        # Do not let anonymous registration add a password to that admin.
+        account = accounts.get_account(email)
+        taken = (
+            get_credential(email) is not None
+            or bool(oauth_providers_for(email))
+            or (account is not None and account.role == "admin")
         )
-        return _ACCEPTED
+        if taken:
+            send_mail(
+                email,
+                "register_exists",
+                {"email": email, "login_url": _login_url(), "reset_url": f"{_base_url()}/#forgot"},
+            )
+            return _ACCEPTED
 
-    accounts.ensure_account(email, display=email.split("@")[0])
-    set_password(email, password, verified=False)
-    token = mint_token(email, PURPOSE_VERIFY, VERIFY_TTL)
-    send_mail(
-        email,
-        PURPOSE_VERIFY,
-        {
-            "email": email,
-            "verify_url": _verify_url(token),
-            "expires_hours": str(int(VERIFY_TTL.total_seconds() // 3600)),
-        },
-    )
+        _store_password(email, digest, verified=False)
+        _issue_token_mail(email, PURPOSE_VERIFY, VERIFY_TTL)
     log.info("authn: registration started for %s", email)
     return _ACCEPTED
 
@@ -741,21 +830,23 @@ async def login(request: Request, body: dict[str, Any]) -> JSONResponse:
     password = str(body.get("password") or "")
     login_by_email.enforce(email, "sign-in attempts for this account")
 
-    credential = get_credential(email)
-    if credential is None:
-        burn_dummy_verification(password)
-        raise HTTPException(status_code=401, detail=_LOGIN_FAILED)
-    if not verify_password(credential["password_hash"], password):
-        raise HTTPException(status_code=401, detail=_LOGIN_FAILED)
-    _rehash_if_needed(email, credential["password_hash"], password)
+    with tx():
+        _lock_account(email)
+        credential = get_credential(email)
+        if credential is None:
+            burn_dummy_verification(password)
+            raise HTTPException(status_code=401, detail=_LOGIN_FAILED)
+        if not verify_password(credential["password_hash"], password):
+            raise HTTPException(status_code=401, detail=_LOGIN_FAILED)
+        _rehash_if_needed(email, credential["password_hash"], password)
 
-    if not credential["email_verified"]:
-        # Only reachable with the CORRECT password, so this is not an oracle:
-        # the caller already knows the account exists.
-        raise HTTPException(status_code=403, detail="email address not verified")
+        if not credential["email_verified"]:
+            # Only reachable with the CORRECT password, so this is not an oracle:
+            # the caller already knows the account exists.
+            raise HTTPException(status_code=403, detail="email address not verified")
 
-    log.info("authn: login for %s", email)
-    return begin_session_response(request, email)
+        log.info("authn: login for %s", email)
+        return begin_session_response(request, email)
 
 
 @router.post("/api/auth/logout")
@@ -768,15 +859,14 @@ async def logout(request: Request) -> JSONResponse:
 
 @router.get("/api/auth/verify", response_model=None)
 async def verify(request: Request, token: str = "") -> Response:
-    """Redeem a verification link: verify the address, start the trial, sign in."""
-    email = consume_token(token, PURPOSE_VERIFY)
-    if email is None:
-        return _token_page("verification")
-    sid = complete_verification(request, email)
+    """Redeem email ownership only; signing in requires an explicit auth flow."""
+    with tx():
+        email = consume_token(token, PURPOSE_VERIFY)
+        if email is None:
+            return _token_page("verification")
+        complete_verification(email)
     log.info("authn: verified %s", email)
-    response = RedirectResponse("/", status_code=303)
-    attach_session_cookie(response, request, sid)
-    return response
+    return RedirectResponse("/signin?verified=1", status_code=303)
 
 
 @router.post("/api/auth/resend-verification", status_code=202)
@@ -789,18 +879,11 @@ async def resend_verification(request: Request, body: dict[str, Any]) -> dict[st
     # Access/OAuth can create a pending account without creating password
     # credentials. The account state, not a credentials row, is the authority
     # for whether this address still needs a verification link.
-    account = accounts.get_account(email)
-    if account is not None and account.status == "pending":
-        token = mint_token(email, PURPOSE_VERIFY, VERIFY_TTL)
-        send_mail(
-            email,
-            PURPOSE_VERIFY,
-            {
-                "email": email,
-                "verify_url": _verify_url(token),
-                "expires_hours": str(int(VERIFY_TTL.total_seconds() // 3600)),
-            },
-        )
+    with tx():
+        _lock_account(email)
+        account = accounts.get_account(email)
+        if account is not None and account.status == "pending":
+            _issue_token_mail(email, PURPOSE_VERIFY, VERIFY_TTL)
     return _ACCEPTED
 
 
@@ -816,25 +899,18 @@ async def forgot(request: Request, body: dict[str, Any]) -> dict[str, str]:
     email = normalize_email(body.get("email"))
     if not valid_email(email):
         return _ACCEPTED
-    if get_credential(email) is not None:
-        token = mint_token(email, PURPOSE_RESET, RESET_TTL)
-        send_mail(
-            email,
-            PURPOSE_RESET,
-            {
-                "email": email,
-                "reset_url": _reset_url(token),
-                "expires_hours": str(max(1, int(RESET_TTL.total_seconds() // 3600))),
-            },
-        )
-        return _ACCEPTED
-    providers = oauth_providers_for(email)
-    if providers:
-        send_mail(
-            email,
-            "oauth_only_reset",
-            {"email": email, "provider": providers[0], "login_url": _login_url()},
-        )
+    with tx():
+        _lock_account(email)
+        if get_credential(email) is not None:
+            _issue_token_mail(email, PURPOSE_RESET, RESET_TTL)
+            return _ACCEPTED
+        providers = oauth_providers_for(email)
+        if providers:
+            send_mail(
+                email,
+                "oauth_only_reset",
+                {"email": email, "provider": providers[0], "login_url": _login_url()},
+            )
     return _ACCEPTED
 
 
@@ -850,14 +926,15 @@ async def reset(request: Request, body: dict[str, Any]) -> JSONResponse:
     login_by_ip.enforce(client_ip(request), "authentication attempts")
     password = str(body.get("password") or "")
     _check_password_policy(password)
-    email = consume_token(str(body.get("token") or ""), PURPOSE_RESET)
-    if email is None:
-        raise HTTPException(status_code=400, detail="that reset link is no longer valid")
-    set_password(email, password, verified=True)
-    start_trial(email)
-    revoke_sessions(email)
-    log.info("authn: password reset for %s", email)
-    return begin_session_response(request, email, {"reset": True})
+    with tx():
+        email = consume_token(str(body.get("token") or ""), PURPOSE_RESET)
+        if email is None:
+            raise HTTPException(status_code=400, detail="that reset link is no longer valid")
+        set_password(email, password, verified=True)
+        start_trial(email)
+        revoke_sessions(email)
+        log.info("authn: password reset for %s", email)
+        return begin_session_response(request, email, {"reset": True})
 
 
 __all__ = [
@@ -871,6 +948,7 @@ __all__ = [
     "begin_session_response",
     "clear_session_cookie",
     "client_ip",
+    "complete_oauth",
     "complete_verification",
     "consume_token",
     "create_session",
@@ -919,9 +997,9 @@ def _cli(argv: list[str] | None = None) -> int:
     ``grant-admin`` is the operator bootstrap: it registers the address if
     needed, sets a password read from stdin (never argv, which is world-visible
     in /proc), marks it verified, activates it, and promotes it to ``admin``.
-    With ``--oauth-only`` no password is set at all, because an operator who
-    signs in through Google/GitHub/Microsoft has no password by design and a
-    throwaway one would only be a second, weaker way into the admin account.
+    With ``--oauth-only`` every password credential, verification/reset link,
+    and existing session is removed or revoked, so an old password cannot become
+    a second, weaker way into the admin account.
     Verification is granted by the operator's database access rather than by a
     mailed link, so this works on a deployment whose mail backend is still
     ``console`` — which is exactly the state a first admin is created in. It is
@@ -949,7 +1027,7 @@ def _cli(argv: list[str] | None = None) -> int:
     credential.add_argument(
         "--oauth-only",
         action="store_true",
-        help="set no password; the admin signs in through an OAuth provider",
+        help="remove password login and old sessions; sign in through an OAuth provider",
     )
     grant_sub = sub.add_parser(
         "grant-subscription",
@@ -978,12 +1056,19 @@ def _cli(argv: list[str] | None = None) -> int:
     if args.command == "grant-subscription":
         return _cli_grant_subscription(email, plan=args.plan, years=args.years)
 
-    account = accounts.get_account(email)
-    if account is None or not accounts.is_authorized(account):
-        print(f"no active account for {email!r}", file=sys.stderr)
+    try:
+        with tx():
+            _lock_account(email)
+            account = accounts.get_account(email)
+            if account is None or not accounts.is_authorized(account):
+                print(f"no active account for {email!r}", file=sys.stderr)
+                return 1
+            ttl = timedelta(seconds=max(1, args.ttl_seconds))
+            sid = create_session(email, user_agent="chudware-ops-cli", ttl=ttl)
+    except HTTPException as exc:
+        print(str(exc.detail), file=sys.stderr)
         return 1
-    ttl = timedelta(seconds=max(1, args.ttl_seconds))
-    print(create_session(email, user_agent="chudware-ops-cli", ttl=ttl))
+    print(sid)
     return 0
 
 
@@ -1006,15 +1091,20 @@ def _cli_grant_admin(email: str, *, password_stdin: bool, oauth_only: bool) -> i
             )
             return 1
 
-    accounts.ensure_account(email)
-    # verified=True: the operator's database access is the proof of control
-    # here, standing in for a mailed link the deployment may not be able to
-    # send yet.
-    if not oauth_only:
-        set_password(email, password, verified=True)
-    mark_verified(email)
-    accounts.set_status(email, "active", decided_by="chudware-ops-cli")
-    account = accounts.set_role(email, "admin")
+    with tx():
+        accounts.ensure_account(email)
+        _lock_account(email)
+        # Database access is the operator's proof of control. In OAuth-only
+        # mode it must retire an existing password, not verify it by accident.
+        if oauth_only:
+            with tx() as cur:
+                cur.execute("DELETE FROM credentials WHERE email = %s", (email,))
+            _invalidate_password_capabilities(email)
+            revoke_sessions(email)
+        else:
+            set_password(email, password, verified=True)
+        accounts.set_status(email, "active", decided_by="chudware-ops-cli")
+        account = accounts.set_role(email, "admin")
     if account is None:
         print(f"account vanished while promoting {email!r}", file=sys.stderr)
         return 1

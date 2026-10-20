@@ -25,6 +25,7 @@
 #include <limits>
 #include <set>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -32,10 +33,14 @@
 #include "sim/fea_static.h"
 #include "sim/flow_run.h"
 #include "sim/lbm.h"
+#ifdef CHUDWARE_WITH_CUDA
+#include "sim/lbm_cuda.h"
+#endif
 #include "sim/pipe_flow.h"
 #include "piping/solve.h"
 #include "sim/sim_cancel.h"
 #include "util/aicm_handoff.h"
+#include "util/resource_governor.h"
 
 using chudware::sim::fea_static_solve;
 using chudware::sim::FeaStaticResult;
@@ -754,7 +759,7 @@ TEST_CASE("LBM uniform flow preserves symmetry and balances mass") {
     for (float v : r.uz) CHECK(std::abs(v) < 1e-6f);
 }
 
-TEST_CASE("LBM CUDA path skips cleanly or matches CPU within float32 tol") {
+TEST_CASE("LBM CUDA asymmetric-body fields forces and convergence match CPU") {
     using chudware::sim::lbm_run;
     using chudware::sim::lbm_cuda_available;
     using chudware::sim::LbmParams;
@@ -764,38 +769,232 @@ TEST_CASE("LBM CUDA path skips cleanly or matches CPU within float32 tol") {
         for (int y = 3; y < 5; ++y)
             for (int z = 3; z < 5; ++z)
                 solid[(x * ny + y) * nz + z] = 1;
-    solid[(8 * ny + 4) * nz + 5] = 1;  // break span symmetry to exercise side force
-    LbmParams cpu_p;
-    cpu_p.backend = "cpu";
-    cpu_p.u_lat = 0.05;
-    cpu_p.tau0 = 0.6;
-    cpu_p.dx_m = 1e-3;
-    cpu_p.dt_s = 5e-6;
-    auto rc = lbm_run(solid, nx, ny, nz, cpu_p, 30);
-    REQUIRE(rc.ok);
-
-    LbmParams gp;
-    gp = cpu_p;
-    gp.backend = "cuda";
-    auto rg = lbm_run(solid, nx, ny, nz, gp, 30);
-    REQUIRE(rg.ok);
-    if (!lbm_cuda_available()) {
-        // CPU-only build or no device: must fall back honestly.
-        CHECK(rg.backend == "cpu");
-        CHECK_FALSE(rg.backend_fallback.empty());
-        return;
-    }
-    // CUDA available: either ran on CUDA or fell back with a reason.
-    if (rg.backend == "cuda") {
-        // Force parity within existing float32 tolerance (~1e-3 relative for small runs).
-        const double denom = std::max(1e-12, std::abs(rc.drag_n));
-        CHECK(std::abs(rg.drag_n - rc.drag_n) / denom < 1e-2);
-        const double side_denom = std::max(1e-12, std::abs(rc.side_n));
-        CHECK(std::abs(rg.side_n - rc.side_n) / side_denom < 1e-2);
-    } else {
-        CHECK_FALSE(rg.backend_fallback.empty());
+    solid[(8 * ny + 4) * nz + 5] = 1;  // exercise all three force components
+    LbmParams p;
+    p.backend = "cpu";
+    p.u_lat = 0.05;
+    p.tau0 = 0.6;
+    p.dx_m = 1e-3;
+    p.dt_s = 5e-6;
+    // Final partial checkpoints, the first drift estimate, the full five-sample
+    // window, and an early-stopping budget are separate behavioral boundaries.
+    for (int steps : {1, 9, 10, 11, 30, 40, 50, 97, 100}) {
+        CAPTURE(steps);
+        p.backend = "cpu";
+        auto cpu = lbm_run(solid, nx, ny, nz, p, steps);
+        REQUIRE(cpu.ok);
+        p.backend = "cuda";
+        auto gpu = lbm_run(solid, nx, ny, nz, p, steps);
+        REQUIRE(gpu.ok);
+        if (!lbm_cuda_available()) {
+            CHECK(gpu.backend == "cpu");
+            CHECK_FALSE(gpu.backend_fallback.empty());
+            continue;
+        }
+        // An available device must really run CUDA; a fallback is not a pass.
+        REQUIRE(gpu.backend == "cuda");
+        CHECK(gpu.backend_fallback.empty());
+        REQUIRE(gpu.rho.size() == cpu.rho.size());
+        REQUIRE(gpu.ux.size() == cpu.ux.size());
+        REQUIRE(gpu.uy.size() == cpu.uy.size());
+        REQUIRE(gpu.uz.size() == cpu.uz.size());
+        for (size_t c = 0; c < cpu.rho.size(); ++c) {
+            CHECK(std::abs(gpu.rho[c] - cpu.rho[c]) < 1e-5f);
+            CHECK(std::abs(gpu.ux[c] - cpu.ux[c]) / p.u_lat < 1e-4);
+            CHECK(std::abs(gpu.uy[c] - cpu.uy[c]) / p.u_lat < 1e-4);
+            CHECK(std::abs(gpu.uz[c] - cpu.uz[c]) / p.u_lat < 1e-4);
+        }
+        const double denom = std::max(1e-12, std::abs(cpu.drag_n));
+        CHECK(std::abs(gpu.drag_n - cpu.drag_n) / denom < 1e-3);
+        CHECK(std::abs(gpu.lift_n - cpu.lift_n) / denom < 1e-3);
+        CHECK(std::abs(gpu.side_n - cpu.side_n) / denom < 1e-3);
+        // Retain the previous side-relative gate as well as the force-vector gate.
+        const double side_denom = std::max(1e-12, std::abs(cpu.side_n));
+        CHECK(std::abs(gpu.side_n - cpu.side_n) / side_denom < 1e-2);
+        CHECK(gpu.cd == doctest::Approx(cpu.cd).epsilon(1e-3));
+        CHECK(gpu.frontal_area_mm2 == cpu.frontal_area_mm2);
+        CHECK(gpu.steps_run == cpu.steps_run);
+        CHECK(gpu.converged == cpu.converged);
+        CHECK(gpu.diverged == cpu.diverged);
+        CHECK(std::abs(gpu.residual - cpu.residual) < 1e-3);
+        CHECK(std::abs(gpu.mass_imbalance - cpu.mass_imbalance) < 1e-6);
+        auto repeat = lbm_run(solid, nx, ny, nz, p, steps);
+        REQUIRE(repeat.ok);
+        REQUIRE(repeat.backend == "cuda");
+        CHECK(repeat.rho == gpu.rho);
+        CHECK(repeat.ux == gpu.ux);
+        CHECK(repeat.uy == gpu.uy);
+        CHECK(repeat.uz == gpu.uz);
+        CHECK(repeat.drag_n == gpu.drag_n);
+        CHECK(repeat.lift_n == gpu.lift_n);
+        CHECK(repeat.side_n == gpu.side_n);
+        CHECK(repeat.residual == gpu.residual);
+        CHECK(repeat.steps_run == gpu.steps_run);
     }
 }
+
+TEST_CASE("LBM CUDA compact gather preserves per-direction recursive reduction") {
+    using namespace chudware::sim;
+    if (!lbm_cuda_available()) {
+        MESSAGE("CUDA reduction parity not exercised: build/device unavailable");
+        return;
+    }
+    const int nx = 24, ny = 18, nz = 18;
+    std::vector<uint8_t> mask(nx * ny * nz, 0);
+    for (int x = 8; x < 13; ++x)
+        for (int y = 2; y < 15; ++y)
+            for (int z = 2; z < 15; ++z)
+                mask[(x * ny + y) * nz + z] = 1;  // 169 links in each X direction
+    mask[(13 * ny + 11) * nz + 15] = 1;
+    LbmParams p;
+    p.tau0 = 0.6;
+    p.dt_s = 5e-6;
+    p.backend = "cpu";
+    auto cpu = lbm_run(mask, nx, ny, nz, p, 11);
+    p.backend = "cuda";
+    auto gpu = lbm_run(mask, nx, ny, nz, p, 11);
+    REQUIRE(cpu.ok);
+    REQUIRE(gpu.ok);
+    REQUIRE(gpu.backend == "cuda");
+    CHECK(gpu.steps_run == 11);
+    CHECK(gpu.residual == 1.0);  // two samples cannot establish force drift
+    CHECK_FALSE(gpu.converged);
+    const double scale = std::max(1e-12, std::abs(cpu.drag_n));
+    CHECK(std::abs(gpu.drag_n - cpu.drag_n) / scale < 1e-3);
+    CHECK(std::abs(gpu.lift_n - cpu.lift_n) / scale < 1e-3);
+    CHECK(std::abs(gpu.side_n - cpu.side_n) / scale < 1e-3);
+    REQUIRE(gpu.rho.size() == cpu.rho.size());
+    REQUIRE(gpu.ux.size() == cpu.ux.size());
+    REQUIRE(gpu.uy.size() == cpu.uy.size());
+    REQUIRE(gpu.uz.size() == cpu.uz.size());
+    for (size_t c = 0; c < mask.size(); ++c) {
+        CHECK(std::abs(gpu.rho[c] - cpu.rho[c]) < 1e-5f);
+        CHECK(std::abs(gpu.ux[c] - cpu.ux[c]) < 5e-6f);
+        CHECK(std::abs(gpu.uy[c] - cpu.uy[c]) < 5e-6f);
+        CHECK(std::abs(gpu.uz[c] - cpu.uz[c]) < 5e-6f);
+    }
+}
+
+TEST_CASE("LBM CUDA empty mask preserves zero forces and early-stop cadence") {
+    using namespace chudware::sim;
+    const int nx = 12, ny = 8, nz = 8;
+    std::vector<uint8_t> mask(nx * ny * nz, 0);
+    LbmParams p;
+    p.backend = "cpu";
+    p.tau0 = 0.6;
+    p.dt_s = 5e-6;
+    auto cpu = lbm_run(mask, nx, ny, nz, p, 100);
+    REQUIRE(cpu.ok);
+    CHECK(cpu.steps_run == 50);
+    p.backend = "cuda";
+    std::vector<std::pair<int, int>> progress;
+    auto gpu = lbm_run(mask, nx, ny, nz, p, 100,
+        [&](int step, int total) { progress.emplace_back(step, total); });
+    REQUIRE(gpu.ok);
+    if (!lbm_cuda_available()) {
+        CHECK(gpu.backend == "cpu");
+        CHECK_FALSE(gpu.backend_fallback.empty());
+        return;
+    }
+    REQUIRE(gpu.backend == "cuda");
+    CHECK(gpu.steps_run == cpu.steps_run);
+    CHECK(gpu.converged);
+    CHECK(gpu.residual == 0.0);
+    CHECK(gpu.drag_n == 0.0);
+    CHECK(gpu.lift_n == 0.0);
+    CHECK(gpu.side_n == 0.0);
+    CHECK(gpu.cd == 0.0);
+    CHECK(gpu.frontal_area_mm2 == 0.0);
+    CHECK(gpu.mass_imbalance < 3e-6);
+    CHECK(std::abs(gpu.mass_imbalance - cpu.mass_imbalance) < 1e-6);
+    REQUIRE_FALSE(progress.empty());
+    CHECK(progress.front() == std::make_pair(0, 100));
+    CHECK(progress.back() == std::make_pair(100, 100));
+    for (size_t c = 0; c < mask.size(); ++c) {
+        CHECK(std::abs(gpu.rho[c] - cpu.rho[c]) < 1e-5f);
+        CHECK(std::abs(gpu.ux[c] - cpu.ux[c]) < 5e-6f);
+        CHECK(std::abs(gpu.uy[c]) < 1e-6f);
+        CHECK(std::abs(gpu.uz[c]) < 1e-6f);
+    }
+}
+
+TEST_CASE("LBM CUDA cancellation is terminal even for a one-shot cancel hook") {
+    using namespace chudware::sim;
+    const int nx = 12, ny = 8, nz = 8;
+    std::vector<uint8_t> mask(nx * ny * nz, 0);
+    for (const auto& checkpoint : {std::make_pair(1, 1), std::make_pair(9, 1),
+                                   std::make_pair(10, 1), std::make_pair(11, 1),
+                                   std::make_pair(100, 1), std::make_pair(100, 4)}) {
+        const int steps = checkpoint.first;
+        const int cancel_at = checkpoint.second;
+        for (const char* backend : {"cpu", "cuda"}) {
+            CAPTURE(steps);
+            CAPTURE(backend);
+            CAPTURE(cancel_at);
+            LbmParams p;
+            p.backend = backend;
+            int polls = 0;
+            auto cancelled = lbm_run(mask, nx, ny, nz, p, steps, {},
+                                     [&] { return ++polls == cancel_at; });
+            CHECK_FALSE(cancelled.ok);
+            CHECK(cancelled.error.find("cancelled by sim_cancel") == 0);
+            CHECK(cancelled.steps_run == std::min(steps, cancel_at * 10));
+            CHECK(polls == cancel_at);
+            if (std::string(backend) == "cuda" && lbm_cuda_available())
+                CHECK(cancelled.backend == "cuda");
+            else
+                CHECK(cancelled.backend == "cpu");
+        }
+    }
+}
+
+#ifdef CHUDWARE_WITH_CUDA
+TEST_CASE("LBM CUDA completion callback failure cannot return success") {
+    using namespace chudware::sim;
+    if (!lbm_cuda_available()) {
+        MESSAGE("CUDA callback failure not exercised: device unavailable");
+        return;
+    }
+    std::vector<uint8_t> mask(12 * 8 * 8, 0);
+    LbmParams p;
+    std::string reason;
+    bool completed = false;
+    const auto result = lbm_run_cuda(mask, 12, 8, 8, p, 100,
+        [&](int step, int total) {
+            if (step == total) {
+                completed = true;
+                throw std::runtime_error("completion callback failed");
+            }
+        }, {}, reason);
+    REQUIRE(completed);
+    CHECK_FALSE(result.ok);
+    CHECK(result.error.find("completion callback failed") != std::string::npos);
+    CHECK(result.steps_run < 100);
+}
+
+TEST_CASE("LBM CUDA failure observes pending cancellation before CPU fallback") {
+    using namespace chudware::sim;
+    if (!lbm_cuda_available()) {
+        MESSAGE("CUDA fallback cancellation not exercised: device unavailable");
+        return;
+    }
+    std::vector<uint8_t> mask(12 * 8 * 8, 0);
+    LbmParams p;
+    p.backend = "cuda";
+    bool cancel = false;
+    const auto result = lbm_run(mask, 12, 8, 8, p, 100,
+        [&](int step, int) {
+            if (step == 0) {
+                cancel = true;
+                throw std::runtime_error("startup callback failed");
+            }
+        }, [&] { return cancel; });
+    CHECK_FALSE(result.ok);
+    CHECK(result.error.find("cancelled by sim_cancel") == 0);
+    CHECK(result.backend == "cuda");
+    CHECK(result.steps_run == 0);
+}
+#endif
 
 
 // ── sim_cancel: run/cancel registry + cooperative LBM cancel (T-RF16) ───────────
@@ -1517,6 +1716,52 @@ TEST_CASE("LBM slab scheduling preserves every population-derived field across t
     CHECK(serial.steps_run == parallel.steps_run);
 }
 
+TEST_CASE("LBM CUDA low-memory checkpoint is terminal and records actual steps") {
+    using namespace chudware::sim;
+    using namespace chudware::governor;
+    struct ProbeRestore {
+        HostMemoryProbe previous;
+        std::string old_governor;
+        bool had_governor = false;
+        explicit ProbeRestore(HostMemoryProbe probe) : previous(set_host_memory_probe(probe)) {
+            if (const char* value = std::getenv("CHUDWARE_GOVERNOR")) {
+                old_governor = value;
+                had_governor = true;
+            }
+            SimThreadEnv::set("CHUDWARE_GOVERNOR", "1");
+        }
+        ~ProbeRestore() {
+            set_host_memory_probe(previous);
+            SimThreadEnv::set("CHUDWARE_GOVERNOR", had_governor ? old_governor.c_str() : nullptr);
+        }
+    };
+    static thread_local int memory_polls = 0;
+    // One low-memory observation followed by recovery catches an illicit CPU retry.
+    ProbeRestore restore(+[]() -> HostMem {
+        return {UINT64_C(8) << 30, ++memory_polls == 1 ? UINT64_C(1) : UINT64_C(6) << 30};
+    });
+    const int nx = 12, ny = 8, nz = 8;
+    const std::vector<uint8_t> mask(nx * ny * nz, 0);
+    for (const char* backend : {"cpu", "cuda"}) {
+        CAPTURE(backend);
+        memory_polls = 0;
+        int starts = 0;
+        LbmParams p;
+        p.backend = backend;
+        auto stopped = lbm_run(mask, nx, ny, nz, p, 100,
+            [&](int step, int) { if (step == 0) ++starts; });
+        CHECK_FALSE(stopped.ok);
+        CHECK(stopped.steps_run == 10);
+        CHECK(stopped.error.find("host memory critically low (governor)") != std::string::npos);
+        CHECK(starts == 1);
+        CHECK(memory_polls == 1);
+        if (std::string(backend) == "cuda" && lbm_cuda_available())
+            CHECK(stopped.backend == "cuda");
+        else
+            CHECK(stopped.backend == "cpu");
+    }
+}
+
 TEST_CASE("pipe_flow pull-collision and window reuse preserve results across thread caps") {
     SimThreadEnv environment;
     const auto shell = stepped_duct({{0.0, 60.0, 5.0}}, 0.37, -0.21, 48);
@@ -1535,4 +1780,34 @@ TEST_CASE("pipe_flow pull-collision and window reuse preserve results across thr
         REQUIRE(parallel.contains(key));
         CHECK(serial[key] == parallel[key]);
     }
+}
+
+TEST_CASE("native input boundary: flow STL rejects exact-terminal malformed vertices") {
+    const auto path = std::filesystem::temp_directory_path() / "chudware_flow_stl_boundary.stl";
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::filesystem::remove(path); }
+    } cleanup{path};
+    for (const std::string& suffix : {std::string("vertex"), std::string("vertex 1"),
+                                      std::string("vertex 1 2")}) {
+        for (std::size_t padding : {12u, 42u, 102u}) {
+            std::ofstream(path, std::ios::binary) << "solid facet " << std::string(padding, ' ') << suffix;
+            std::vector<float> positions;
+            std::vector<uint32_t> indices;
+            std::string error;
+            CHECK_FALSE(chudware::sim::load_stl_soup(path.string(), positions, indices, error));
+            CHECK(error == "bad ASCII STL vertex");
+            CHECK(positions.empty());
+            CHECK(indices.empty());
+        }
+    }
+    std::ofstream(path, std::ios::binary) <<
+        "solid test\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\n"
+        "vertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid test";
+    std::vector<float> positions;
+    std::vector<uint32_t> indices;
+    std::string error;
+    REQUIRE(chudware::sim::load_stl_soup(path.string(), positions, indices, error));
+    CHECK(positions == std::vector<float>{0, 0, 0, 1, 0, 0, 0, 1, 0});
+    CHECK(indices == std::vector<uint32_t>{0, 1, 2});
 }

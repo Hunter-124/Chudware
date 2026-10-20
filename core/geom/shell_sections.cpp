@@ -1065,11 +1065,11 @@ TopoDS_Shape hollow(Context& cx, const Plan& plan, bool exact_prisms) {
     auto station = [&](const Segment& s, double z) -> std::optional<std::vector<Side>> {
         // Faces more than 3t off this station cannot be nearest to a point t from the skin;
         // leaving them out keeps every distance query small.
-        std::vector<TopoDS_Face> near;
+        std::vector<TopoDS_Face> nearby_faces;
         for (std::size_t i = 0; i < cx.laterals.size(); ++i)
             if (ranges[i].first < z + 3.0 * t && ranges[i].second > z - 3.0 * t)
-                near.push_back(cx.laterals[i]);
-        cx.skin.emplace(compound_of(near));
+                nearby_faces.push_back(cx.laterals[i]);
+        cx.skin.emplace(compound_of(nearby_faces));
         return station_loop(cx, s, z, ranges);
     };
     auto band_range = [&](std::size_t k) {

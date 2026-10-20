@@ -37,10 +37,15 @@ int promptImportMeshAsSolid();
 void afterFileWritten(const std::string& path);
 
 // Reveal a file in the OS file manager, selecting the item where the platform supports
-// it (Explorer /select, Finder `open -R`, freedesktop FileManager1 ShowItems); falls
-// back to opening the containing folder. No-op for empty paths and in the browser build
-// (no OS file manager — component paths there live in the gateway workspace).
+// it (Explorer selection, Finder `open -R`, freedesktop FileManager1 ShowItems); falls
+// back to opening the containing folder. Opens directories themselves. No-op for
+// empty/invalid paths and in the browser build (workspace paths are server-side).
 void revealInFileManager(const std::string& path);
+
+// Open a local file/directory with the OS default handler, never through a shell.
+// Relative paths resolve against cwd, not as opener options or URL schemes. Returns
+// false on invalid input or launch failure; unavailable in the browser build.
+bool openExternalFile(const std::string& path);
 
 // False in the browser build (no OS file manager); callers skip reveal menu items.
 inline bool haveOsFileManager() {

@@ -23,6 +23,9 @@ from typing import Callable
 
 
 def _manager():
+    from services.agent.request_context import in_cell
+    if in_cell():
+        raise ValueError("cell_refused")
     from services.browser.embed import get_manager
     return get_manager()
 
@@ -32,6 +35,8 @@ def _fail(reason: str, hint: str = "") -> dict:
 
 
 def _wrap_exc(exc: Exception) -> dict:
+    if str(exc) == "cell_refused":
+        return _fail("cell_refused", "Browser session management is unavailable in tenant cells.")
     if isinstance(exc, ImportError):
         return _fail("playwright_not_installed",
                      "pip install playwright && playwright install chromium")
@@ -45,6 +50,9 @@ def _browser_start_url(params: dict, _emit: Callable) -> dict:
     dir the Playwright scraper uses, so a future cookie-interop pass can share
     sessions. ``{ok, url, cache_dir}`` — degrades to ``{ok:false}`` structurally.
     """
+    from services.agent.request_context import in_cell
+    if in_cell():
+        return _fail("cell_refused")
     try:
         from services.browser.embed import start_url_for_site
         from services.browser import profiles
@@ -110,8 +118,12 @@ def _browser_session_import(params: dict, _emit: Callable) -> dict:
     reuse the session. ``{site, cookies:[...], verified?}``. The staging sidecar +
     metadata (login_verified_ts, which profiles.has_login gates on) needs no
     Playwright; the daemon push is best-effort and off-thread."""
+    from services.agent.request_context import in_cell
+    if in_cell():
+        return {"ok": False, "reason": "credential_isolation_unsupported",
+                "code": "credential_isolation_unsupported"}
     try:
-        import threading
+        from services.worker_activity import start_background_thread
 
         from services.browser.embed import import_session_cookies
         p = params or {}
@@ -121,8 +133,8 @@ def _browser_session_import(params: dict, _emit: Callable) -> dict:
         result = import_session_cookies(
             site, cookies, verified=bool(p.get("verified", True)))
         if cookies:
-            threading.Thread(target=_push_cookies_to_cef_daemon, args=(cookies,),
-                             daemon=True).start()
+            start_background_thread(_push_cookies_to_cef_daemon, args=(cookies,),
+                                    name="browser-cookie-forward")
         return result
     except Exception as exc:  # noqa: BLE001
         return _wrap_exc(exc)

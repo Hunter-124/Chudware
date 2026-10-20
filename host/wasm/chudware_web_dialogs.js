@@ -131,14 +131,13 @@ mergeInto(LibraryManager.library, {
     overlay.appendChild(panel);
     document.body.appendChild(overlay);
 
-    var rootAbs = '';
     var curRel = '';
     var selected = null;  // {name, rel, isDir}
 
-    function joinAbs(rel) {
-      if (!rel) return rootAbs;
-      if (!rootAbs) return '/' + rel;
-      return rootAbs.replace(/\/$/, '') + '/' + rel.replace(/^\//, '');
+    function workspacePath(rel) { return rel || '.'; }
+    function validRelative(rel) {
+      return typeof rel === 'string' && !/^[\/]/.test(rel) &&
+        !/[\\:\0]/.test(rel) && rel.split('/').indexOf('..') === -1;
     }
     function parentRel(rel) {
       if (!rel) return '';
@@ -178,9 +177,11 @@ mergeInto(LibraryManager.library, {
     }
 
     function paintList(j) {
-      if (j.root) rootAbs = j.root;
+      if (j.root !== '.' || !Array.isArray(j.dirs) || !Array.isArray(j.files))
+        throw new Error('Invalid workspace listing');
       curRel = (j.dir !== undefined && j.dir !== null) ? j.dir : curRel;
-      crumb.textContent = joinAbs(curRel) || '/';
+      if (!validRelative(curRel)) throw new Error('Invalid workspace directory');
+      crumb.textContent = workspacePath(curRel);
       list.innerHTML = '';
 
       if (curRel) {
@@ -195,6 +196,8 @@ mergeInto(LibraryManager.library, {
       (j.dirs || []).forEach(function(d) {
         var name = d.name || '';
         var drel = d.path || (curRel ? (curRel + '/' + name) : name);
+        if (!validRelative(drel) || !name || /[\/\\:\0]/.test(name) ||
+            name === '.' || name === '..') throw new Error('Invalid workspace entry');
         var isSel = !!(selected && selected.rel === drel);
         list.appendChild(renderRow(name, true, function(dbl) {
           if (dbl) {
@@ -212,12 +215,14 @@ mergeInto(LibraryManager.library, {
           var name = f.name || '';
           if (!extOk(name)) return;
           var frel = f.path || (curRel ? (curRel + '/' + name) : name);
+          if (!validRelative(frel) || !name || /[\/\\:\0]/.test(name) ||
+              name === '.' || name === '..') throw new Error('Invalid workspace entry');
           var isSel = !!(selected && selected.rel === frel);
           list.appendChild(renderRow(name, false, function(dbl) {
             selected = {name: name, rel: frel, isDir: false};
             if (mode === 2 && nameInput) nameInput.value = name;
             if (dbl && mode === 0) {
-              finish(1, joinAbs(frel));
+              finish(1, workspacePath(frel));
               return;
             }
             paintList(j);
@@ -234,6 +239,7 @@ mergeInto(LibraryManager.library, {
     }
 
     function loadDir(rel) {
+      if (!validRelative(rel || '')) return;
       list.innerHTML = '';
       var status = document.createElement('div');
       status.style.cssText = 'padding:12px;color:#888;font-size:12px;';
@@ -264,7 +270,7 @@ mergeInto(LibraryManager.library, {
     okBtn.onclick = function() {
       if (mode === 0) {
         if (selected && !selected.isDir) {
-          finish(1, joinAbs(selected.rel));
+          finish(1, workspacePath(selected.rel));
           return;
         }
         return;  // need a file
@@ -272,17 +278,15 @@ mergeInto(LibraryManager.library, {
       if (mode === 1) {
         var folderRel = (selected && selected.isDir && selected.name !== '..')
           ? selected.rel : curRel;
-        finish(1, joinAbs(folderRel));
+        finish(1, workspacePath(folderRel));
         return;
       }
       // SaveAs
       var fname = nameInput ? (nameInput.value || '').trim() : '';
       if (!fname) return;
-      // Strip any client-side directories from the typed name.
-      fname = fname.replace(/^.*[\\/]/, '');
-      if (!fname || fname.charAt(0) === '.') return;
+      if (!validRelative(fname) || /[\/]/.test(fname) || fname.charAt(0) === '.') return;
       var destRel = curRel ? (curRel + '/' + fname) : fname;
-      finish(1, joinAbs(destRel));
+      finish(1, workspacePath(destRel));
     };
 
     if (uploadBtn) {

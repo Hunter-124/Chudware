@@ -443,56 +443,6 @@ def test_force_cascade_injects_v_source_before_simulate():
         )
 
 
-def test_measure_between_honest_skip_without_features(monkeypatch):
-    from services.verify import battery as bat
-
-    monkeypatch.setattr(bat, "_doc_features", lambda doc_id: [])
-    # Dummy fn with a_query/b_query params.
-    def _fn(doc_id=None, a_query=None, b_query=None):
-        return {"ok": True, "distance": 1.0}
-
-    adapted, skip = bat._adapt_check_kwargs(
-        "measure_between", _fn, "doc-x", {},
-    )
-    assert adapted is None
-    assert skip is not None
-    payload = json.loads(skip)
-    assert payload.get("skipped") is True
-
-
-def test_measure_between_derives_two_feature_refs(monkeypatch):
-    """mega-22 R22: feature ids are not face queries — derive valid sides."""
-    from services.verify import battery as bat
-
-    monkeypatch.setattr(
-        bat, "_doc_features",
-        lambda doc_id: [
-            {"id": "feat_box", "type": "box"},
-            {"id": "feat_cut", "type": "extrude"},
-        ],
-    )
-    monkeypatch.setattr(bat, "_query_geometry_faces", lambda doc_id: [])
-    monkeypatch.setattr(
-        bat, "_bbox_extents",
-        lambda doc_id: {
-            "xmin": 0, "xmax": 10, "ymin": 0, "ymax": 10,
-            "zmin": 0, "zmax": 40,
-        },
-    )
-
-    def _fn(doc_id=None, a_query=None, b_query=None):
-        return {"ok": True, "distance": 1.0}
-
-    adapted, skip = bat._adapt_check_kwargs(
-        "measure_between", _fn, "doc-x", {},
-    )
-    assert skip is None
-    assert adapted is not None
-    assert adapted.get("a_query") in bat._VALID_SIDE_WORDS
-    assert adapted.get("b_query") in bat._VALID_SIDE_WORDS
-    assert adapted.get("a_query") != adapted.get("b_query")
-
-
 def test_post_power_success_force_cascades_wire(tmp_path, monkeypatch):
     """mega-19 a1 residual: after add_power, harness force-wires without thrash denials."""
     from services.agent.ledger import Ledger

@@ -13,7 +13,7 @@ source, not the stage:
     are ``res.fit`` (interference/clearance by part name + volume) and ``res.error``
     (rebuild).  So only the ``interference`` / ``rebuild`` checks fire there.
   - In the **doc path** (``advise(doc_id)`` MCP tool and DAG nodes carrying a
-    doc_id), the full batteries run against ``doc_eval_*`` / ``doc_sketch_health``.
+    doc_id), the full batteries run against ``doc_eval_*`` / ``sketch_health``.
 
 The full vocabulary is defined here regardless, because T-W7 (roles), the mission
 pipeline, and the exit-gate machinery all cite these stage names and batteries.
@@ -70,8 +70,9 @@ _TOOL_STAGE: dict[str, str] = {
     # sketch
     "check_sketch": "sketch",
     "describe_sketch": "sketch",
-    "doc_sketch_health": "sketch",
-    "doc_sketch_auto_constrain": "sketch",
+    "sketch_health": "sketch",
+    "sketch_auto_constrain": "sketch",
+    "sketch_fully_define": "sketch",
     "convert_face_to_sketch": "sketch",
     # feature
     "add_features": "feature",
@@ -196,8 +197,8 @@ _STAGE_SPEC: dict[str, dict] = {
     },
     "sketch": {
         "check_battery": [CHECK_SKETCH_HEALTH, CHECK_OPEN_PROFILE],
-        "helper_tools": ["doc_sketch_health", "doc_sketch_auto_constrain",
-                         "describe_sketch"],
+        "helper_tools": ["sketch_health", "sketch_auto_constrain",
+                         "sketch_fully_define", "describe_sketch"],
         "exit_gate": [CHECK_SKETCH_HEALTH, CHECK_OPEN_PROFILE],
         "playbook_default": "sketch_profile",
     },

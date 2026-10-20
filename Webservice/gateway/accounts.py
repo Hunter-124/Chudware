@@ -5,6 +5,10 @@ module decides *whether they may use the service* — pending / active / denied 
 suspended, on which plan, in which role. A newly seen identity is registered as
 ``pending`` with NO session rights and becomes active either by verifying its
 email address (self-serve, onto a trial) or by an admin decision.
+Each registration receives an immutable UUID (``accounts.uid``); re-registering
+a deleted email creates a new principal. Deletion revokes sessions and engine
+access, retains personal trees as tombstones, and refuses an organization owner
+until ownership is transferred.
 
 Storage is PostgreSQL via ``db.tx()`` — one pooled connection per call inside a
 real transaction, so read-modify-write sequences are serialized by the database
@@ -49,6 +53,7 @@ router = APIRouter(tags=["accounts"])
 @dataclass(frozen=True)
 class Account:
     email: str           # PK, lowercased
+    uid: str             # immutable UUID; email is never a workspace identity
     display: str
     status: str          # pending | active | denied | suspended
     plan: str            # trial | desktop | studio | enterprise
@@ -101,6 +106,7 @@ def _row_to_account(row: Mapping[str, Any] | None) -> Account | None:
         return None
     return Account(
         email=row["email"],
+        uid=str(row["uid"]),
         display=row["display"],
         status=row["status"],
         plan=row["plan"],
@@ -132,6 +138,54 @@ def _row_to_account(row: Mapping[str, Any] | None) -> Account | None:
 
 def _normalize_email(email: str) -> str:
     return (email or "").strip().lower()
+
+
+def _cells():
+    # cells resolves accounts; keep the reverse import lazy.
+    try:
+        from . import cells
+    except ImportError:
+        import cells  # type: ignore
+    return cells
+
+def delete_account(email: str) -> Account | None:
+    """Revoke access and retain deleted personal files before removing identity."""
+    email = _normalize_email(email)
+    with tx() as cur:
+        # Follow organization writers' lock order; never delete their owner
+        # while a transfer or a membership mutation is being authorized.
+        cur.execute(
+            "SELECT o.id FROM organizations o JOIN org_members m ON m.org_id = o.id"
+            " WHERE m.email = %s ORDER BY o.id FOR UPDATE OF o",
+            (email,),
+        )
+        cur.fetchall()
+        cur.execute("SELECT * FROM accounts WHERE email = %s FOR UPDATE", (email,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        cur.execute(
+            "SELECT 1 FROM org_members WHERE email = %s AND role = 'owner'", (email,)
+        )
+        if cur.fetchone() is not None:
+            raise HTTPException(status_code=409, detail="transfer organization ownership before deleting account")
+        account = _row_to_account(row)
+        assert account is not None
+        cur.execute("UPDATE accounts SET status = 'suspended' WHERE email = %s", (email,))
+        cur.execute(
+            "UPDATE sessions SET revoked_at = now() WHERE email = %s AND revoked_at IS NULL",
+            (email,),
+        )
+        _cells().revoke(email)
+        _cells().tombstone_personal(email, uid=account.uid)
+        cur.execute("DELETE FROM accounts WHERE email = %s", (email,))
+    try:
+        from .chat import hub
+    except ImportError:
+        from chat import hub  # type: ignore
+    hub.revoke(email)
+    return account
+
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +263,9 @@ def set_status(
 ) -> Account | None:
     """Transition an account's status. Role/plan are untouched; a suspended or
     denied admin keeps the role column but loses all rights via is_authorized.
+    Suspension/denial revoke every session atomically with the decision, so
+    reinstatement never revives a dormant bearer. Session issuance must lock
+    the same account row before checking status and inserting its session.
     Role can never change here — self-service escalation is impossible."""
     email = _normalize_email(email)
     if status not in STATUSES:
@@ -225,6 +282,12 @@ def set_status(
             (status, time.time(), decided_by.strip(), notes, email),
         )
         row = cur.fetchone()
+        if row is not None and status in {"suspended", "denied"}:
+            cur.execute(
+                "UPDATE sessions SET revoked_at = now()"
+                " WHERE email = %s AND revoked_at IS NULL",
+                (email,),
+            )
     if row is not None and status != "active":
         # Status changes also remove live chat access, even for idle sockets.
         # Import locally: chat -> orgs -> accounts is the normal import path.
@@ -233,6 +296,8 @@ def set_status(
         except ImportError:
             from chat import hub  # type: ignore
         hub.revoke(email)
+    if row is not None:
+        _cells().revoke(email)
     return _row_to_account(row)
 
 
@@ -245,6 +310,8 @@ def set_plan(email: str, plan: str) -> Account | None:
             "UPDATE accounts SET plan = %s WHERE email = %s RETURNING *", (plan, email)
         )
         row = cur.fetchone()
+    if row is not None:
+        _cells().revoke(email)
     return _row_to_account(row)
 
 
@@ -266,6 +333,8 @@ def set_role(email: str, role: str) -> Account | None:
             "UPDATE accounts SET role = %s WHERE email = %s RETURNING *", (role, email)
         )
         row = cur.fetchone()
+    if row is not None:
+        _cells().revoke(email)
     return _row_to_account(row)
 
 
@@ -331,6 +400,8 @@ def set_subscription(
             ),
         )
         row = cur.fetchone()
+    if row is not None:
+        _cells().revoke(email)
     return _row_to_account(row)
 
 
@@ -439,6 +510,7 @@ def _require_admin(request: Request) -> Any:
 def _account_dict(a: Account) -> dict[str, Any]:
     return {
         "email": a.email,
+        "uid": a.uid,
         "display": a.display,
         "status": a.status,
         "plan": a.plan,
@@ -496,6 +568,16 @@ def _mutate(request: Request, email: str, fn, *args: Any, **kwargs: Any) -> dict
     return {"ok": True, "account": _account_dict(account), "pending": pending_count()}
 
 
+@router.delete("/api/admin/accounts/{email}")
+async def admin_delete_account(email: str, request: Request) -> dict[str, Any]:
+    admin = _require_admin(request)
+    api_writes.enforce(admin.email, "admin account writes")
+    account = delete_account(email)
+    if account is None:
+        raise HTTPException(status_code=404, detail="account not found")
+    return {"ok": True, "email": account.email}
+
+
 @router.post("/api/admin/accounts/{email}/approve")
 async def admin_approve_account(email: str, request: Request) -> dict[str, Any]:
     admin = _require_admin(request)
@@ -532,8 +614,8 @@ async def admin_get_security_policy(email: str, request: Request) -> dict[str, A
         raise HTTPException(status_code=404, detail="enterprise account not found")
     with tx() as cur:
         cur.execute(
-            "SELECT a.policy_id, p.endpoint FROM account_security_policies a "
-            "JOIN security_policies p ON p.id = a.policy_id WHERE a.email = %s", (account.email,),
+            "SELECT a.policy_id, a.endpoint FROM account_security_policies a "
+            "WHERE a.email = %s", (account.email,),
         )
         row = cur.fetchone()
     return {"email": account.email, "policy": "standard" if row is None else row["policy_id"],
@@ -561,15 +643,11 @@ async def admin_set_security_policy(email: str, request: Request, body: dict[str
         raise HTTPException(status_code=400, detail="endpoint is only valid for customer_endpoint")
     with tx() as cur:
         cur.execute(
-            "INSERT INTO security_policies (id,telemetry_mode,endpoint,config) VALUES (%s,%s,%s,'{}'::jsonb) "
-            "ON CONFLICT (id) DO UPDATE SET endpoint=EXCLUDED.endpoint",
-            (policy, policy, endpoint),
-        )
-        cur.execute(
-            "INSERT INTO account_security_policies (email,policy_id,assigned_at,assigned_by) "
-            "VALUES (%s,%s,now(),%s) ON CONFLICT (email) DO UPDATE SET "
-            "policy_id=EXCLUDED.policy_id,assigned_at=EXCLUDED.assigned_at,assigned_by=EXCLUDED.assigned_by",
-            (account.email, policy, admin.email),
+            "INSERT INTO account_security_policies (email,policy_id,endpoint,assigned_at,assigned_by) "
+            "VALUES (%s,%s,%s,now(),%s) ON CONFLICT (email) DO UPDATE SET "
+            "policy_id=EXCLUDED.policy_id,endpoint=EXCLUDED.endpoint,"
+            "assigned_at=EXCLUDED.assigned_at,assigned_by=EXCLUDED.assigned_by",
+            (account.email, policy, endpoint, admin.email),
         )
     return {"ok": True, "email": account.email, "policy": policy, "endpoint": endpoint}
 

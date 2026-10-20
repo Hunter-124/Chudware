@@ -631,6 +631,9 @@ def register_dimension_scheme_tools(mcp: FastMCP) -> None:
         - Default tolerances derived from the process IT grade:
           CNC mill/lathe → IT7, sheet/laser → IT10, injection → IT11, FDM → IT12.
         - Function-critical dims listed first; envelope/auxiliary dims last.
+        Apply the selected critical dimensions with sketch_add_constraint (driven:false),
+        then sketch_fully_define for residual freedom; verify check_sketch dof 0 and
+        not pinned_only. This tool proposes a plan; it does not mutate the sketch.
 
         `process` is REQUIRED. Omitted or unknown values are refused with the valid process
         list; the planner never silently assumes FDM for a machined feature. ``material`` is

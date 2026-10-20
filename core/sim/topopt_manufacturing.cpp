@@ -399,6 +399,7 @@ nlohmann::json to_json(const ManufacturingReport &r) {
     out["overhang"] = {
         {"build_direction",
          {r.build_direction[0], r.build_direction[1], r.build_direction[2]}},
+        {"build_direction_source", r.build_direction_source},
         {"overhang_angle_deg", r.overhang_angle_deg},
         {"overhang_penalty", r.overhang_penalty},
         {"in_objective", r.overhang_in_objective},
@@ -410,6 +411,13 @@ nlohmann::json to_json(const ManufacturingReport &r) {
         {"formulation", r.overhang_formulation},
         {"heuristic", true},
         {"guaranteed_support_free", false}};
+    if (r.build_plate) {
+      const auto &b = *r.build_plate;
+      out["overhang"]["build_plate"] = {
+          {"triangles", b.triangles},
+          {"area_mm2", b.area_m2 * 1e6},
+          {"normal", {b.normal[0], b.normal[1], b.normal[2]}}};
+    }
   } else {
     out["overhang"] = nullptr;
   }
@@ -431,8 +439,14 @@ nlohmann::json to_json(const ManufacturingReport &r) {
       {"filter_radius_source", r.filter_radius_source},
       {"regularization", r.min_member_regularization},
       {"guaranteed", false},
-      {"note", "regularization intent; actual member thickness is validated "
-               "separately on the reconstructed geometry"}};
+      {"note", "minimum-member lower-bound intent via regularization; the "
+               "automatic radius filters features finer than approximately "
+               "four elements; actual member thickness is not measured"}};
+  if (r.min_member_filter_radius_mm) {
+    out["min_member"]["min_member_filter_radius_mm"] =
+        *r.min_member_filter_radius_mm;
+    out["min_member"]["mesh_floor_radius_mm"] = *r.mesh_floor_radius_mm;
+  }
   out["ties"] = {{"symmetry_axes",
                   {r.symmetry_axes[0], r.symmetry_axes[1], r.symmetry_axes[2]}},
                  {"extrusion_axis", r.extrusion_axis},

@@ -14,6 +14,10 @@ import json
 import uuid
 from typing import Any
 
+from services.plm.git_security import (
+    LocationCredentialError, SECRET_FIELDS, reject_location_credentials,
+)
+
 SCHEMA = "aicad.plm/1"
 LOCKS_SCHEMA = "aicad.plm.locks/1"
 
@@ -74,6 +78,7 @@ def _prefix_from_name(name: str) -> str:
 
 def dumps(manifest: dict[str, Any]) -> bytes:
     """Serialize a manifest deterministically (sorted keys, indent=2)."""
+    _validate(manifest)
     return json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
 
 
@@ -83,7 +88,36 @@ def loads(raw: bytes) -> dict[str, Any]:
     return m
 
 
+def loads_local(raw: bytes) -> dict[str, Any]:
+    """A read-only local view: withhold unsafe remote URLs, never repair history.
+
+    Peer manifests still use strict ``loads``. A blocked profile has no usable
+    destination; only explicit remote replacement can remove its repair marker.
+    """
+    m = json.loads(raw.decode("utf-8"))
+    _validate_schema(m)
+    for remote in m.get("remotes") or []:
+        try:
+            _validate_remote(remote)
+            if (remote.get("kind") in {"folder", "ssh", "https", "plm-server"}
+                    and not remote.get("url")):
+                raise ValueError("remote destination needs explicit replacement")
+        except ValueError:
+            remote["url"] = None
+            for key in list(remote):
+                if key.casefold() in SECRET_FIELDS:
+                    del remote[key]
+            remote["credential_repair_required"] = True
+    return m
+
+
 def _validate(m: dict[str, Any]) -> None:
+    _validate_schema(m)
+    for remote in m.get("remotes") or []:
+        _validate_remote(remote)
+
+
+def _validate_schema(m: dict[str, Any]) -> None:
     """Reject an unknown MAJOR schema (forward-tolerance, contract §4)."""
     schema = m.get("schema", "")
     if not schema.startswith("aicad.plm/"):
@@ -91,6 +125,16 @@ def _validate(m: dict[str, Any]) -> None:
     major = schema.split("/", 1)[1]
     if major != "1":
         raise ValueError(f"unsupported PLM manifest major version: {schema!r}")
+
+
+def _validate_remote(remote: dict[str, Any]) -> None:
+    if "credential_repair_required" in remote:
+        raise ValueError("internal remote diagnostics must not be stored in PLM history")
+    if any(value for key, value in remote.items() if key.casefold() in SECRET_FIELDS):
+        raise LocationCredentialError("remote credentials must not be stored in PLM history")
+    url = remote.get("url")
+    if isinstance(url, str):
+        reject_location_credentials(url)
 
 
 def find_item(manifest: dict[str, Any], item_id: str) -> dict[str, Any] | None:

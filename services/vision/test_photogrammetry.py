@@ -295,7 +295,7 @@ class TestCaptureSessionStartStop:
         port = _free_port()
         session = None
         try:
-            session = start_session(port=port)
+            session = start_session(port=port, bind_host="127.0.0.1")
             assert session.token
             assert len(session.token) >= 16
             assert str(port) in session.upload_url
@@ -308,7 +308,7 @@ class TestCaptureSessionStartStop:
     def test_stop_session_when_no_received(self, tmp_path):
         """Stopping a session with no uploaded photos is graceful."""
         port = _free_port()
-        session = start_session(port=port)
+        session = start_session(port=port, bind_host="127.0.0.1")
         assert session.received == []
         stop_session(session)  # should not raise
 
@@ -317,7 +317,7 @@ class TestCaptureSessionStartStop:
         port = _free_port()
         session = None
         try:
-            session = start_session(port=port)
+            session = start_session(port=port, bind_host="127.0.0.1")
             qr = session.qr
             assert isinstance(qr, str)
             assert len(qr) > 10
@@ -332,7 +332,7 @@ class TestTokenRequired:
         port = _free_port()
         session = None
         try:
-            session = start_session(port=port)
+            session = start_session(port=port, bind_host="127.0.0.1")
             time.sleep(0.1)  # give the thread a moment to bind
             url = f"http://127.0.0.1:{port}/upload"  # no token param
             req = urllib.request.Request(url)
@@ -350,7 +350,7 @@ class TestTokenRequired:
         port = _free_port()
         session = None
         try:
-            session = start_session(port=port)
+            session = start_session(port=port, bind_host="127.0.0.1")
             time.sleep(0.1)
             url = f"http://127.0.0.1:{port}/upload?token=wrongtoken123"
             req = urllib.request.Request(url)
@@ -368,7 +368,7 @@ class TestTokenRequired:
         port = _free_port()
         session = None
         try:
-            session = start_session(port=port)
+            session = start_session(port=port, bind_host="127.0.0.1")
             time.sleep(0.1)
             url = f"http://127.0.0.1:{port}/?token={session.token}"
             resp = urllib.request.urlopen(url, timeout=3)
@@ -409,7 +409,7 @@ class TestPhotoUpload:
         port = _free_port()
         session = None
         try:
-            session = start_session(port=port)
+            session = start_session(port=port, bind_host="127.0.0.1")
             time.sleep(0.1)
 
             fake_jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 16  # minimal JPEG magic bytes
@@ -440,7 +440,7 @@ class TestPhotoUpload:
         port = _free_port()
         session = None
         try:
-            session = start_session(port=port)
+            session = start_session(port=port, bind_host="127.0.0.1")
             time.sleep(0.1)
 
             for i, (fname, expected_stem_prefix) in enumerate([
@@ -471,7 +471,7 @@ class TestPhotoUpload:
         port = _free_port()
         session = None
         try:
-            session = start_session(port=port)
+            session = start_session(port=port, bind_host="127.0.0.1")
             time.sleep(0.1)
 
             body, ctype = self._build_multipart("photo", "x.jpg", b"\xff\xd8\xff\xe0")
@@ -495,7 +495,7 @@ class TestPhotoUpload:
         port = _free_port()
         session = None
         try:
-            session = start_session(port=port)
+            session = start_session(port=port, bind_host="127.0.0.1")
             time.sleep(0.1)
 
             fake_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8

@@ -21,7 +21,10 @@ from __future__ import annotations
 import io
 import json
 import re
+import struct
 import zipfile
+
+import pytest
 
 from services.plm import snapshot
 from services.plm.vault import Vault
@@ -137,6 +140,79 @@ def test_reassemble_round_trips_the_recipe_without_solved_state():
     assert not [n for n in names
                 if n.startswith("studies/") and n.rsplit("/", 1)[-1].startswith("results.")]
 
+
+def _declared_size(raw: bytes, name: str, size: int) -> bytes:
+    """Patch one ZIP directory record; payload stays a tiny bounded fixture."""
+    data = bytearray(raw)
+    pos = 0
+    while (pos := data.find(b"PK\x01\x02", pos)) >= 0:
+        name_size = struct.unpack_from("<H", data, pos + 28)[0]
+        if data[pos + 46:pos + 46 + name_size].decode("utf-8") == name:
+            struct.pack_into("<I", data, pos + 24, size)
+            return bytes(data)
+        pos += 46 + name_size
+    raise AssertionError(f"ZIP member not found: {name}")
+
+
+def test_zip_unknown_attachment_member_budget_rejects_before_read(tmp_path):
+    raw = _container(_part(), {"supplier.bin": b"x" * 4096})
+    oversized = _declared_size(raw, "supplier.bin", 64 * 1024 * 1024 + 1)
+    path = tmp_path / "untrusted.ecad+"
+    path.write_bytes(oversized)
+    with pytest.raises(ValueError, match="member byte limit"):
+        snapshot.explode_container(path)
+    assert path.read_bytes() == oversized
+
+
+def test_zip_compressed_unknown_attachment_enforces_configured_byte_budget(monkeypatch):
+    # A genuine highly compressible member crosses a deliberately small test
+    # budget; the production ceiling is separately pinned by directory metadata.
+    raw = _container(_part(), {"supplier.bin": b"\0" * (1024 * 1024)})
+    assert len(raw) < 16384
+    monkeypatch.setattr(snapshot, "_MAX_MEMBER_BYTES", 64 * 1024)
+    with pytest.raises(ValueError, match="member byte limit"):
+        snapshot.explode_container(raw)
+
+
+def test_zip_aggregate_budget_counts_all_preserved_unknowns(monkeypatch):
+    raw = _container(_part(), {"first.bin": b"\0" * 4096, "second.bin": b"\0" * 4096})
+    monkeypatch.setattr(snapshot, "_MAX_MEMBER_BYTES", 8192)
+    monkeypatch.setattr(snapshot, "_MAX_INFLATED_BYTES", 8192)
+    with pytest.raises(ValueError, match="aggregate byte limit"):
+        snapshot.explode_container(raw)
+
+
+def test_zip_entry_count_budget_includes_skipped_derived_members():
+    raw = _container(_part(), {f"cache.{i}": b"" for i in range(4095)})
+    with pytest.raises(ValueError, match="entry count limit"):
+        snapshot.explode_container(raw)
+
+
+def test_zip_dishonest_declared_attachment_size_fails_cleanly():
+    raw = _container(_part(), {"supplier.bin": b"x" * 4096})
+    malformed = _declared_size(raw, "supplier.bin", 1)
+    with pytest.raises((ValueError, zipfile.BadZipFile)):
+        snapshot.explode_container(malformed)
+
+
+def test_zip_attachment_roundtrip_leaves_live_warm_cache_bytes_untouched(tmp_path):
+    attachments = {"vendor/notes.bin": b"vendor\0payload", "ai/checkpoint.json": b'{"revision":3}'}
+    extras = {**_solved_extras(), **attachments}
+    raw = _container(_part(), extras)
+    # Warm solved state is neither inflated nor subject to attachment byte
+    # budgets. A large declared cache size must not cold-rewrite the live file.
+    raw = _declared_size(raw, "cache.brep", 512 * 1024 * 1024)
+    path = tmp_path / "warm.step+"
+    path.write_bytes(raw)
+    exploded = snapshot.explode_container(path)
+    for name, payload in attachments.items():
+        assert exploded.extras[name] == payload
+    restored = snapshot.explode_container(snapshot.reassemble_container(exploded))
+    assert restored == exploded
+    assert path.read_bytes() == raw
+    with zipfile.ZipFile(path) as zf:
+        assert zf.getinfo("cache.brep").file_size == 512 * 1024 * 1024
+        assert zf.read("cache.json") == extras["cache.json"]
 
 # ---------------------------------------------------------------------------
 # the committed shadow tree — the actual boundary

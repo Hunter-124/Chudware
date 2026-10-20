@@ -32,6 +32,8 @@ class _FakeEngine:
     def __init__(self):
         self.names: dict = {}
         self.paths: dict = {}
+        self.native_sources: dict = {}
+        self.source_edited: dict = {}
         self.origins: dict = {}  # doc_id -> hostd origin_kind ("gui" = the user opened it)
         self.saves: list = []
         self.exports: list = []
@@ -44,6 +46,8 @@ class _FakeEngine:
         if method == "doc_list":
             return {"docs": [{"doc_id": d, "name": n, "revision": 1,
                               "path": self.paths.get(d),
+                              "native_source_path": self.native_sources.get(d),
+                              "native_source_edited": self.source_edited.get(d, False),
                               "origin_kind": self.origins.get(d, "mcp")}
                              for d, n in self.names.items()]}
         if method == "asm_world_bodies":
@@ -171,6 +175,28 @@ def test_add_features_refreshes_the_saved_file(engine, monkeypatch, tmp_path):
     assert Path(r["saved_path"]).parent == tmp_path
     # Payload contract otherwise intact.
     assert r["doc_id"] and "revision" in r and "features" in r
+
+
+def test_add_features_never_writes_the_file_of_a_doc_the_user_opened(engine, monkeypatch,
+                                                                      tmp_path):
+    """c259: per-batch saves rewrote the user's open base.step+ with every intermediate
+    (including a kernel-broken cut) and cleared its dirty flag."""
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    _new_part("base")
+    user_file = tmp_path / "parts" / "base.step+"
+    user_file.parent.mkdir()
+    user_file.write_text("user's saved design")
+    engine.paths[_DOC] = str(user_file)
+    engine.origins[_DOC] = "gui"
+    engine.saves.clear()
+    r = json.loads(_tool("add_features")(doc_id=_DOC, ops=[
+        {"op": "add_feature", "feature": {"type": "box", "name": "Block",
+                                          "params": {"length": 40, "width": 30,
+                                                     "height": 20}}}]))
+    assert r["ok"] is True, r
+    assert r.get("saved_path") is None
+    assert [p for p in engine.saves if "autosave" not in p] == []
+    assert user_file.read_text() == "user's saved design"
 
 
 def test_add_features_unset_env_has_no_saved_path(engine, monkeypatch):
@@ -316,6 +342,80 @@ def test_bare_save_of_an_opened_file_saves_in_place(engine, monkeypatch, tmp_pat
     assert sorted(p.name for p in tmp_path.glob("*.step+")) == []
 
 
+@pytest.mark.parametrize("save_mode", ["automatic", "bare", "explicit"])
+def test_study_only_native_import_needs_a_separate_or_explicit_destination(
+        engine, monkeypatch, tmp_path, save_mode):
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    source = tmp_path / "arm.step+"
+    source.write_bytes(b"original source assembly")
+    engine.names[_DOC] = "arm"
+    engine.native_sources[_DOC] = str(source)
+
+    if save_mode == "automatic":
+        written = C._project_save(_DOC)
+    else:
+        result = json.loads(_tool("save_part")(
+            doc_id=_DOC, **({"path": str(source)} if save_mode == "explicit" else {})))
+        assert result["ok"] is True, result
+        written = result["path"]
+
+    if save_mode == "explicit":
+        assert written == str(source)
+        assert source.read_text() == "STEP+ fake payload"
+    else:
+        assert written == str(tmp_path / "arm_2.step+")
+        assert source.read_bytes() == b"original source assembly"
+        assert Path(written).read_text() == "STEP+ fake payload"
+
+
+@pytest.mark.parametrize("save_mode", ["automatic", "bare"])
+def test_authored_native_import_preserves_source_save_behavior(
+        engine, monkeypatch, tmp_path, save_mode):
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path / "project"))
+    source = tmp_path / "arm.step+"
+    source.write_text("original source assembly")
+    engine.names[_DOC] = "arm"
+    engine.native_sources[_DOC] = str(source)
+    engine.source_edited[_DOC] = True
+
+    if save_mode == "automatic":
+        written = C._project_save(_DOC)
+    else:
+        saved = json.loads(_tool("save_part")(doc_id=_DOC))
+        assert saved["ok"] is True, saved
+        written = saved["path"]
+
+    assert written == str(source)
+    assert source.read_text() == "STEP+ fake payload"
+    assert not (tmp_path / "project").exists()
+
+
+def test_persist_study_keeps_the_native_reassigned_identity(monkeypatch):
+    studies = [
+        {"id": "study-1", "type": "fea_static", "name": "Static"},
+        {"id": "study-1", "type": "motion", "name": "Motion: m75"},
+    ]
+    edits = []
+
+    def call(method, params):
+        if method == "sim_study_list":
+            return {"studies": studies}
+        assert method == "sim_study_edit"
+        edits.append((params["study_id"], dict(params["study"])))
+        studies[1] = {**params["study"], "id": "study-2"}
+        return {"studies": studies, "study_id": "study-2"}
+
+    monkeypatch.setattr(C.cb, "call", call)
+    for stop in (80, 40):
+        record = {"type": "motion", "name": "Motion: m75",
+                  "motion": {"drivers": [{"mate_id": "m75", "start": 0, "stop": stop}]}}
+        assert C._persist_study("doc-arm", record) == "study-2"
+        assert record["id"] == "study-2"
+    assert [edit[0] for edit in edits] == ["study-1", "study-2"]
+    assert studies[0] == {"id": "study-1", "type": "fea_static", "name": "Static"}
+    assert studies[1]["motion"]["drivers"][0]["stop"] == 40
+
+
 def test_explicit_save_retires_only_the_copy_the_harness_placed(engine, monkeypatch,
                                                                   tmp_path):
     monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
@@ -369,3 +469,126 @@ def test_save_over_the_file_open_in_the_users_tab_is_refused(engine, tmp_path):
     engine.paths["doc-agent-copy"] = str(opened)
     replaced = json.loads(_tool("save_part")(doc_id="doc-agent", path=str(opened)))
     assert replaced["ok"] is True and replaced["path"] == str(opened)
+
+
+@pytest.mark.parametrize("root_key", ["CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT"])
+def test_explicit_relative_save_uses_selected_nested_workspace_across_cwds(
+        engine, monkeypatch, tmp_path, root_key):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / ".git").mkdir()
+    (repository / ".plm").mkdir()
+    project = repository / "selected workspace"
+    destination = project / "parts" / "redesign" / "base.step+"
+    destination.parent.mkdir(parents=True)
+    other_project = tmp_path / "other-project"
+    other_project.mkdir()
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(other_project))
+    monkeypatch.setenv(root_key, str(project))
+    engine.names[_DOC] = "base"
+
+    for turn in ("initial-worker", "continuation-worker"):
+        worker = tmp_path / turn
+        worker.mkdir()
+        monkeypatch.chdir(worker)
+        saved = json.loads(_tool("save_part")(
+            doc_id=_DOC, path="parts/redesign/base.step+"))
+        assert saved["ok"] is True, saved
+        assert saved["path"] == str(destination)
+        assert destination.is_file()
+        assert list(worker.iterdir()) == []
+    assert engine.saves == [str(destination), str(destination)]
+    assert not (repository / "parts").exists()
+    assert list(other_project.iterdir()) == []
+
+
+@pytest.mark.parametrize("path_kind", ["absolute", "tilde"])
+def test_explicit_save_outside_workspace_needs_no_root(
+        engine, monkeypatch, tmp_path, path_kind):
+    home = tmp_path / "home"
+    home.mkdir()
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    monkeypatch.chdir(worker)
+    engine.names[_DOC] = "base"
+    destination = home / "base.step+"
+    path = str(destination) if path_kind == "absolute" else "~/base.step+"
+
+    saved = json.loads(_tool("save_part")(doc_id=_DOC, path=path))
+
+    assert saved["ok"] is True, saved
+    assert saved["path"] == str(destination)
+    assert destination.is_file()
+    assert engine.saves == [str(destination)]
+    assert list(worker.iterdir()) == []
+
+
+@pytest.mark.parametrize("root_state", ["unset", "missing", "file"])
+def test_relative_save_refuses_unavailable_authoritative_root(
+        engine, monkeypatch, tmp_path, root_state):
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    monkeypatch.chdir(worker)
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    if root_state != "unset":
+        configured = tmp_path / "unavailable-project"
+        if root_state == "file":
+            configured.write_text("not a directory")
+        monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(configured))
+        # An invalid authoritative root must not fall back to this valid root.
+        monkeypatch.setenv("CHUDWARE_FS_ROOT", str(worker))
+    engine.names[_DOC] = "base"
+
+    refused = json.loads(_tool("save_part")(doc_id=_DOC, path="base.step+"))
+
+    assert refused["ok"] is False, refused
+    assert "ABSOLUTE" in refused["error"]
+    assert engine.saves == []
+    assert list(worker.iterdir()) == []
+    assert not (tmp_path / "base.step+").exists()
+
+
+@pytest.mark.parametrize("path_kind", ["relative_alias", "absolute_alias", "credential_file"])
+def test_save_refuses_credential_destinations_after_symlink_resolution(
+        engine, monkeypatch, tmp_path, path_kind):
+    project = tmp_path / "project"
+    project.mkdir()
+    secrets = tmp_path / ".ssh"
+    secrets.mkdir()
+    alias = project / "ordinary-output"
+    alias.symlink_to(secrets, target_is_directory=True)
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(project))
+    engine.names[_DOC] = "base"
+    paths = {
+        "relative_alias": "ordinary-output/base.step+",
+        "absolute_alias": str(alias / "base.step+"),
+        "credential_file": str(project / ".netrc"),
+    }
+
+    refused = json.loads(_tool("save_part")(doc_id=_DOC, path=paths[path_kind]))
+
+    assert refused["ok"] is False, refused
+    assert "credential/key location" in refused["error"]
+    assert engine.saves == []
+    assert list(secrets.iterdir()) == []
+    assert not (project / ".netrc").exists()
+
+
+def test_sanitizer_canonicalizes_workspace_and_ordinary_output_symlinks(
+        monkeypatch, tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    root_alias = tmp_path / "workspace-link"
+    root_alias.symlink_to(project, target_is_directory=True)
+    destination = tmp_path / "deliverables"
+    destination.mkdir()
+    (project / "output").symlink_to(destination, target_is_directory=True)
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(root_alias))
+
+    assert C.resolve_agent_path("base.step+", "path") == str(project / "base.step+")
+    assert C._sanitize_output_path("output/base.step+") == str(destination / "base.step+")

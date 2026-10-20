@@ -181,6 +181,12 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Batch related ops in ONE call and read the reply's interpreted, per-feature "
             "status and changes fields plus its overlap and attachment warnings "
             "(floating/overhanging features) before anything else; a heavy op may return {job_id} — poll get_job. "
+            "Sketches: draw roughly, relations then functional driving dimensions, "
+            "sketch_fully_define, check_sketch (dof 0, not pinned_only). "
+            "Automatic definition (default on) runs after explicit intent; opt out with the "
+            "auto_define=false argument or auto_define:false on feature/params/authoring op. "
+            "Use origin/axis.h/axis.v refs, construction sketch_convert references, "
+            "true arcs/slots and symmetric centerlines; never blanket-fix profiles. "
             "op rename relabels a FEATURE by id; no op renames the part — name it in "
             "new_part(name=…) and its file in save_part(path=…)."
         ),
@@ -317,8 +323,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "check_sketch": {
         "prompt_note": (
-            "Require dof 0 before extruding/sweeping; 'under' lists what's loose, "
-            "'over' means drop a conflicting/redundant constraint — then re-check."
+            "Before consuming a profile require closed, dof == 0, pinned_only == false, "
+            "no conflicts/skipped constraints. Blanket fix is not design intent; fixed "
+            "external references are legitimate. Read findings/free variables, add "
+            "relations then driving dimensions, sketch_fully_define, and re-check."
         ),
     },
     "check_sketch3d": {
@@ -842,8 +850,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "sketch3d_add_constraints": {
         "prompt_note": (
-            "Point handles are 'e3.p1'/'e3.p2'/'e3.pm'; tangent/symmetric/equal/midpoint "
-            "are NOT in v1 (validator rejects). Re-check with check_sketch3d."
+            "Point handles: e3.p1/e3.p2/e3.pm, spline e3.pK, external vertex xN. "
+            "Use tangent/equal/midpoint/collinear/concentric/coradial and plane-based "
+            "on_plane/parallel_plane/normal_plane/symmetric; dimensions drive size. "
+            "Avoid blanket fix pins; re-check check_sketch3d."
         ),
     },
     "sketch3d_add_curves": {

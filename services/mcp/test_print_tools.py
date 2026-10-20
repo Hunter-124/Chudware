@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from services.mcp import core_bridge as cb
+from services.mcp.test_print_placement import _raw_stl_topology, write_sliver_box
 
 
 def _slicer_installed() -> bool:
@@ -180,4 +181,28 @@ def test_sequential_plate_with_two_objects_above_the_gantry_is_refused(tmp_path)
                    output_dir=str(tmp_path), name="too_tall")
     assert result["ok"] is False and result["reason"] == "too_tall_for_sequential", result
     assert len(result["objects"]) == 2
+    assert not list(tmp_path.glob("*.gcode"))
+
+
+def test_a_sub_micron_vertex_pair_reaches_the_slicer_unmerged(tmp_path):
+    """The 6-axis wrist case: PrusaSlicer used to delete two collapsed facets on load."""
+    mesh = write_sliver_box(tmp_path / "sliver.stl")
+    result = _call("slice_part", path=str(mesh), printer="ender 3", build_dir=[0, 1, 0],
+                   supports="off", output_dir=str(tmp_path), name="sliver")
+    assert result["ok"], result
+    assert _raw_stl_topology(tmp_path / ".sliver.slice" / "sliver.oriented.stl") == (10, 0)
+    repairs = result["slicer_mesh_repairs"]
+    assert repairs["available"] and repairs["volumes"] == 1, repairs
+    assert not any(repairs["counts"].values()), repairs
+    manifest = json.loads(Path(result["manifest_path"]).read_text())
+    assert manifest["slicer_mesh_repairs"] == repairs
+
+
+def test_a_plate_position_that_would_merge_vertices_is_refused_before_slicing(tmp_path):
+    mesh = str(write_sliver_box(tmp_path / "sliver.stl"))
+    result = _call("slice_part", parts=[{"path": mesh, "build_dir": [0, 1, 0]},
+                                        {"path": mesh, "build_dir": [0, 1, 0]}],
+                   printer="ender 3", supports="off", output_dir=str(tmp_path), name="slivers")
+    assert result["ok"] is False and result["reason"] == "slicer_mesh_precision_loss", result
+    assert result["placement"] == "plate" and result["collapsed_triangles"] == 2
     assert not list(tmp_path.glob("*.gcode"))

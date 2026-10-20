@@ -10,6 +10,17 @@ the `livingroom-pc` host. Read this before widening access to anyone.
 > Table rows below marked _(surface deleted)_ record findings against code that
 > no longer exists; they are kept because the reasoning still applies to the
 > surfaces that remain.
+> **2026-10-13 source hardening:** web contract 2 routes admitted CAD/agent methods
+> to socket-activated, namespace-isolated workspace cells and actor-private workers.
+> The explicit 660-method policy refuses unclassified methods, devices, lifecycle
+> authority, and unsupported provider/capture paths. BYOK credentials do not enter
+> other actors' namespaces; revoked silent observers close. Saved solve state reopens
+> warm, with authenticated cache provenance and background verification of foreign caches.
+> This supersedes the earlier version-1 `hello`/`ping` containment in source only.
+> **Not deployed or release-qualified:** authenticated worker artifacts, native publisher
+> fixtures, installed runner/host isolation, quotas, rotations and incident evidence remain
+> prerequisites in the [current audit](../../reports/security/2026-10-12/SECURITY_AUDIT.md).
+
 
 ---
 
@@ -21,8 +32,8 @@ every authenticated identity shared one workspace, one file bucket, one CAD
 daemon and one chat room, with no ownership checks anywhere. That is fine for
 five teammates and completely wrong for strangers.
 
-This pass closed the app-level holes. It did **not** make the host safe to point
-the public internet at — see §4.
+The historical pass did not close the multi-tenant boundary. Current P0 containment
+prevents general browser RPC forwarding; tenant isolation and §4 operations remain open.
 
 ---
 
@@ -32,7 +43,7 @@ the public internet at — see §4.
 |---|---|---|
 | CRITICAL | _(surface deleted)_ `/stream/<sid>/<path>` used `urljoin`, so `path` could replace the upstream host — an authenticated user could make the gateway fetch `http://192.168.0.1/` inside the home LAN | `build_upstream_url()` rejected any path with a scheme/netloc/control char. The stream proxy was deleted 2026-08-10. |
 | CRITICAL | `/workspace/*` and `/api/bucket/*` were one shared tree — any user could read, overwrite or `rmtree` any other user's files | Per-account roots via `user_slug(email)`; containment checked on the fully-resolved path; final-component symlinks rejected; `?scope=shared` is admin-only |
-| CRITICAL | `/engine` piped any user into the one shared CAD daemon, which resolves whatever absolute path it is handed | `_inject_identity()` overwrites the client's claimed identity; `path_violation()` rejects any RPC naming a path outside the caller's own roots; `agent_provider_*` is admin-only; per-account bridge cap |
+| CRITICAL | `/engine` piped any user into the one shared CAD daemon, which resolves whatever absolute path it is handed | Source cutover: web contract 2, explicit `contracts/cell_methods.json`, principal/role/epoch checks, one namespace-isolated cell per workspace, actor-private workers, no-follow paths and revocation. The 21-scenario two-tenant acceptance passes locally; production artifact/host qualification remains blocked. |
 | CRITICAL | _(surface deleted)_ Host AI provider keys (Firecrawl/Gemini/Moonshot/OpenRouter) were copied into every session container's environment | Session containers were deleted 2026-08-10. Host keys are now resolved server-side per request and only ever attached to a canonical, provider-matching endpoint; client-supplied credentials are stripped |
 | CRITICAL | Admin browser terminal = interactive shell as the gateway account | Off by default (`CHUDWARE_WEB_TERMINAL_ENABLED=0`); per-admin session ownership; opaque ids; session cap; idle timeout; output throttle; `MemoryMax`/`CPUQuota` on the scope |
 | HIGH | _(surface deleted)_ Identity headers (`Authorization`, `Cf-Access-Jwt-Assertion`, `X-Forwarded-*`) forwarded to the proxy upstream | Scrubbed before forwarding; the proxy was deleted 2026-08-10 |
@@ -307,6 +318,11 @@ and `www` are proxied CNAMEs to the Pages project now, carry no Access wall, and
 route to the origin at all; the gateway is reachable only at `app.chudware.com`.
 
 #### Provider-key sharing boundary
+Current P0 containment disables every inference/model-probe RPC at `/engine`,
+regardless of this setting or caller role. The former turn-selection behavior
+below is historical, not an available browser execution path. Account credential
+storage APIs remain unchanged; no stored credential is injected through `/engine`.
+
 
 `CHUDWARE_WEB_SHARE_PROVIDER_KEYS` is now an enforced financial and credential
 boundary. It defaults to `0`, and public or otherwise multi-tenant deployments
@@ -360,10 +376,10 @@ showed up by driving the real thing. Worth remembering when hardening further:
    bootstrap script needed a hash. Fixed in `appserve.py`, which now derives
    inline-script hashes from the file on disk so a rebuild refreshes them.
 2. **Requiring a container seat on `/engine` took the web client offline.**
-   `/app` is browser-native and never had a podman seat. Isolation belongs to
-   `_inject_identity` + `path_violation()`, not to seat ownership. (The seat
-   requirement, and the whole container product, were removed 2026-08-10; the
-   lesson is why `/engine` authorizes on identity alone today.)
+   `/app` is browser-native and never had a podman seat. The old identity/path-key
+   checks were insufficient: the 2026-10 audit reproduced process execution,
+   ambient credential disclosure and a NUL path escape. The current bridge is
+   default-deny; safe modeling needs real tenant ownership and worker isolation.
 3. **The terminal declared dead sessions on every deploy.** `shell_died` only
    meant the `tmux attach` client died, which happens on every gateway restart
    while the tmux server survives.

@@ -13,6 +13,7 @@ passes ``block['slots'][name]['text']`` in, never a value it typed.
 from __future__ import annotations
 
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 
 class Doc:
@@ -139,18 +140,18 @@ def _render_pdf(doc: Doc, out_path: Path) -> None:
     for op in doc.ops:
         kind = op[0]
         if kind == "heading":
-            flow.append(Paragraph(op[1], h.get(op[2], styles["Heading3"])))
+            flow.append(Paragraph(escape(op[1]), h.get(op[2], styles["Heading3"])))
         elif kind == "para":
-            flow.append(Paragraph(op[1], styles["BodyText"]))
+            flow.append(Paragraph(escape(op[1]), styles["BodyText"]))
         elif kind == "bullets":
             flow.append(ListFlowable(
-                [ListItem(Paragraph(i, styles["BodyText"])) for i in op[1]], bulletType="bullet"))
+                [ListItem(Paragraph(escape(i), styles["BodyText"])) for i in op[1]], bulletType="bullet"))
         elif kind == "kv":
             for label, value in op[1]:
-                flow.append(Paragraph(f"<b>{label}:</b> {value}", styles["BodyText"]))
+                flow.append(Paragraph(f"<b>{escape(label)}:</b> {escape(value)}", styles["BodyText"]))
         elif kind == "table":
             grid, header = op[1], op[2]
-            data = [[Paragraph(c, styles["BodyText"]) for c in row] for row in grid]
+            data = [[Paragraph(escape(c), styles["BodyText"]) for c in row] for row in grid]
             tbl = Table(data, hAlign="LEFT")
             ts = [("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
                   ("VALIGN", (0, 0), (-1, -1), "TOP")]
@@ -166,10 +167,10 @@ def _render_pdf(doc: Doc, out_path: Path) -> None:
                     flow.append(Image(str(path), width=5.0 * inch, height=3.5 * inch,
                                       kind="proportional"))
                 except Exception:  # noqa: BLE001
-                    flow.append(Paragraph(f"[render unavailable: {Path(path).name}]",
+                    flow.append(Paragraph(escape(f"[render unavailable: {Path(path).name}]"),
                                           styles["BodyText"]))
             if caption:
-                flow.append(Paragraph(f"<i>{caption}</i>", styles["BodyText"]))
+                flow.append(Paragraph(f"<i>{escape(caption)}</i>", styles["BodyText"]))
         elif kind == "spacer":
             flow.append(Spacer(1, 12))
     SimpleDocTemplate(str(out_path), pagesize=letter).build(flow)

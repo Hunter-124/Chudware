@@ -188,8 +188,8 @@ def _intent_preserved(document: dict, intent_dims: dict) -> bool:
 # ---- live-core binary verifier (guarded) ------------------------------------
 # The AUTHORITATIVE verifier (T-H11 driver note): apply candidate fix -> rebuild passes AND
 # compare_parts ≈100% vs the known-good part on unaffected bodies. A fix that rebuilds but
-# altered geometry scores 0. The contract was probed against the real core: load = doc_new +
-# eq_set(globals) + add_feature(features); failure surfaces as a raised CoreError (schema) OR
+# altered geometry scores 0. Load via doc_new + canonical doc ops, remapping authored feature ids
+# to the engine's newly minted ids; failure surfaces as a raised CoreError (schema) OR
 # a feature_status entry with ok=false (geometry); compare = eval_compare -> match_pct.
 
 LIVE_MATCH_THRESHOLD = 99.5  # match_pct >= this == "unaffected bodies compare ≈100%"
@@ -198,8 +198,45 @@ LIVE_MATCH_THRESHOLD = 99.5  # match_pct >= this == "unaffected bodies compare �
 def _core_err(e) -> str:
     detail = getattr(e, "detail", None)
     if isinstance(detail, dict) and detail.get("reason"):
-        return str(detail["reason"])[:200]
+        return f"{type(e).__name__}: {e} ({detail['reason']})"[:200]
     return f"{type(e).__name__}: {e}"[:200]
+
+
+
+def _document_ops(tree: dict) -> list[dict]:
+    """Replay source geometry, not compiled/readback fields hoisted as feature params."""
+    if tree.get("schema", "aicad.part/1") != "aicad.part/1":
+        raise ValueError("regen verifier requires a part document")
+    if tree.get("rollback_after"):
+        raise ValueError("regen verifier cannot replay an active rollback bar with doc ops")
+    ops = []
+    if tree.get("units"):
+        ops.append({"op": "set_units", "system": tree["units"]["system"]})
+    if tree.get("material"):
+        ops.append({"op": "set_material", "key": tree["material"]["key"]})
+    ops.extend({"op": "eq_set", "name": g["name"], "expr": g["expr"]}
+               for g in tree.get("equations", {}).get("globals", []))
+    features = tree.get("features", [])
+    mapping = {f["id"]: f"${len(ops) + i}" for i, f in enumerate(features)}
+
+    def remap(value):
+        if isinstance(value, str):
+            return mapping.get(value, value)
+        if isinstance(value, list):
+            return [remap(v) for v in value]
+        if isinstance(value, dict):
+            return {k: remap(v) for k, v in value.items()}
+        return value
+
+    for feature in features:
+        envelope = {k: copy.deepcopy(feature[k])
+                    for k in ("type", "name", "suppressed", "params", "refs", "folder")
+                    if k in feature}
+        for key in ("params", "refs"):
+            if key in envelope:
+                envelope[key] = remap(envelope[key])
+        ops.append({"op": "add_feature", "feature": envelope})
+    return ops
 
 
 def _make_live_verifier():
@@ -217,21 +254,38 @@ def _make_live_verifier():
     if not cb.available():
         return None, None
 
+    def close(doc_id: str) -> None:
+        cb.call("doc_close", {"doc_id": doc_id})
+
     def opener(document: dict) -> dict:
         tree = document.get("tree", document)
+        doc_id = None
         try:
-            doc_id = cb.call("doc_new", {"kind": "part", "name": tree.get("name", "regen_doc")})["doc_id"]
-            ops = [{"op": "eq_set", "name": g["name"], "expr": g["expr"]}
-                   for g in tree.get("equations", {}).get("globals", [])]
-            ops += [{"op": "add_feature", "feature": f} for f in tree.get("features", [])]
-            resp = cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": ops})
-        except Exception as e:  # schema/validation failure -> rebuild failed before geometry
+            ops = _document_ops(tree)
+            doc_id = cb.call("doc_new", {"kind": "part", "name": tree.get("name", "regen_doc"),
+                                         "internal": True})["doc_id"]
+            resp = cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": ops, "with_tess": False})
+            authored = iter(tree.get("features", []))
+            source_ids = {}
+            for index, op in enumerate(ops):
+                if op["op"] == "add_feature":
+                    feature = next(authored)
+                    minted = (resp.get("id_map") or {}).get(f"${index}")
+                    if minted:
+                        source_ids[minted] = feature["id"]
+            fs = (resp.get("rebuild", {}) or {}).get("feature_status") or resp.get("feature_status") or []
+            bad = [f'{source_ids.get(s.get("id"), s.get("id"))}: {s.get("error")}'
+                   for s in fs if not s.get("ok", True)]
+            if bad:
+                close(doc_id)
+                return {"doc_id": None, "rebuilt": False, "error": "; ".join(bad)}
+            return {"doc_id": doc_id, "rebuilt": True, "error": None}
+        except Exception as e:
+            if doc_id:
+                close(doc_id)
             return {"doc_id": None, "rebuilt": False, "error": _core_err(e)}
-        fs = (resp.get("rebuild", {}) or {}).get("feature_status") or resp.get("feature_status") or []
-        bad = [f'{s.get("id")}: {s.get("error")}' for s in fs if not s.get("ok", True)]
-        if bad:
-            return {"doc_id": doc_id, "rebuilt": False, "error": "; ".join(bad)}
-        return {"doc_id": doc_id, "rebuilt": True, "error": None}
+
+    opener.close = close
 
     def compare_fn(a: str, b: str):
         try:
@@ -275,33 +329,44 @@ def verify_fix(fixed: dict, claimed: bool, intent_dims: dict, *,
 
     if opener is not None and compare_fn is not None and good_document is not None:
         detail["mode"] = "live"
+        opened = []
         try:
-            res = opener(fixed)
-        except Exception as e:  # noqa: BLE001 — a core hiccup is a verifier error, not a pass
-            return _verification_error(detail, f"opener(fix) {type(e).__name__}: {e}")
-        detail["rebuilt"] = bool(res.get("rebuilt"))
-        if res.get("error"):
-            detail["rebuild_error"] = str(res["error"])[:200]
-        if not (claimed and res.get("rebuilt") and res.get("doc_id")):
-            detail["verdict"] = "fail"
-            return 0.0, False, detail
-        try:
-            good_res = opener(good_document)
-        except Exception as e:  # noqa: BLE001
-            return _verification_error(detail, f"opener(known-good) {type(e).__name__}: {e}")
-        if not (good_res.get("rebuilt") and good_res.get("doc_id")):
-            return _verification_error(
-                detail, f"known-good reference did not rebuild: {good_res.get('error')}")
-        try:
-            match = compare_fn(res["doc_id"], good_res["doc_id"])
-        except Exception as e:  # noqa: BLE001
-            return _verification_error(detail, f"compare {type(e).__name__}: {e}")
-        detail["match_pct"] = match
-        if match is None:
-            return _verification_error(detail, "eval_compare degraded (no match_pct)")
-        passed = bool(match >= LIVE_MATCH_THRESHOLD)
-        detail["verdict"] = "pass" if passed else "fail"
-        return (1.0 if passed else 0.0), passed, detail
+            try:
+                res = opener(fixed)
+                if res.get("doc_id"):
+                    opened.append(res["doc_id"])
+            except Exception as e:  # noqa: BLE001
+                return _verification_error(detail, f"opener(fix) {type(e).__name__}: {e}")
+            detail["rebuilt"] = bool(res.get("rebuilt"))
+            if res.get("error"):
+                detail["rebuild_error"] = str(res["error"])[:200]
+            if not (claimed and res.get("rebuilt") and res.get("doc_id")):
+                detail["verdict"] = "fail"
+                return 0.0, False, detail
+            try:
+                good_res = opener(good_document)
+                if good_res.get("doc_id"):
+                    opened.append(good_res["doc_id"])
+            except Exception as e:  # noqa: BLE001
+                return _verification_error(detail, f"opener(known-good) {type(e).__name__}: {e}")
+            if not (good_res.get("rebuilt") and good_res.get("doc_id")):
+                return _verification_error(
+                    detail, f"known-good reference did not rebuild: {good_res.get('error')}")
+            try:
+                match = compare_fn(res["doc_id"], good_res["doc_id"])
+            except Exception as e:  # noqa: BLE001
+                return _verification_error(detail, f"compare {type(e).__name__}: {e}")
+            detail["match_pct"] = match
+            if match is None:
+                return _verification_error(detail, "eval_compare degraded (no match_pct)")
+            passed = bool(match >= LIVE_MATCH_THRESHOLD)
+            detail["verdict"] = "pass" if passed else "fail"
+            return (1.0 if passed else 0.0), passed, detail
+        finally:
+            closer = getattr(opener, "close", None)
+            if closer:
+                for doc_id in opened:
+                    closer(doc_id)
 
     passed = bool(claimed and anomaly_gone and intent_ok)
     detail["verdict"] = "pass" if passed else "fail"

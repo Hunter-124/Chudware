@@ -9,14 +9,49 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <thread>
 
+#include "../../bootstrap.h" // appDir — services/sim/topology_print_processes.json
 #include "../../core/sim_client.h"
 #include "../file_dialog.h" // saveFileDialog / afterFileWritten — topology artifact export
 
 namespace ui {
 
 namespace {
+
+struct TopologyPrintProcesses {
+  std::vector<nlohmann::json> entries;
+  std::vector<std::string> labels, tips;
+};
+
+const TopologyPrintProcesses &topologyPrintProcesses() {
+  static const TopologyPrintProcesses data = [] {
+    TopologyPrintProcesses out;
+    std::ifstream file(appDir() + "/services/sim/topology_print_processes.json");
+    if (!file)
+      return out;
+    const auto root = nlohmann::json::parse(file, nullptr, false);
+    if (!root.is_object() || !root.contains("processes") || !root["processes"].is_array())
+      return out;
+    for (const auto &preset : root["processes"]) {
+      if (topoStr(preset, "id").empty() || topoStr(preset, "label").empty() ||
+          !preset.contains("topology") || !preset["topology"].is_object())
+        continue;
+      out.entries.push_back(preset);
+      out.labels.push_back(topoStr(preset, "label"));
+      std::string tip = topoStr(preset, "description");
+      for (const char *key : {"process", "nozzle_mm", "line_width_mm", "layer_height_mm"})
+        if (preset.contains(key))
+          tip += "\n" + std::string(key) + ": " + preset[key].dump();
+      for (const auto &[key, value] : preset["topology"].items())
+        tip += "\n" + key + ": " + (value.is_null() ? "Not set" : value.dump());
+      out.tips.push_back(std::move(tip));
+    }
+    return out;
+  }();
+  return data;
+}
 
 // configureActiveTopology merge: objects merge recursively, everything else replaces, null
 // erases.
@@ -69,6 +104,8 @@ std::vector<nlohmann::json> topoOverlayFields(const nlohmann::json &run,
 // own label, then the humanized chunk name, with proper nouns restored ("von Mises", "Tresca",
 // "Reynolds") — never a raw "Von mises".
 std::string topoFieldLabel(const std::string &name, const std::string &given) {
+  if (name == "overhang")
+    return "Needs support";
   for (int i = 0; i < kNStaticFields; ++i)
     if (name == kStaticFields[i].chunk)
       return kStaticFields[i].label;
@@ -106,6 +143,8 @@ void topoFieldMeta(const AppState &st, const nlohmann::json &desc, std::string &
   if (name == "density") {
     label = "Density (solid fraction)";
     unit.clear();
+  } else if (name == "overhang") {
+    unit.clear();
   } else if (raw == "Pa") {
     unit = u.stress;
     fromSI = u.stressFromMpa * 1e-6;
@@ -142,6 +181,22 @@ bool SimManager::configureActiveTopology(AppState &st, const nlohmann::json &pat
   s.topoRunsCheckKey.clear();
   persist(st, s);
   return true;
+}
+
+bool SimManager::applyActiveTopologyPrintProcess(AppState &st, const std::string &id) {
+  if (sel_ < 0 || sel_ >= (int)studies_.size() ||
+      studies_[sel_].type != StudyType::Topology || topologyRunActive())
+    return false;
+  for (const auto &preset : topologyPrintProcesses().entries) {
+    if (topoStr(preset, "id") != id)
+      continue;
+    Study &s = studies_[sel_];
+    if (!topology::applyPrintProcess(s.topo, preset, topoCaps_))
+      return false;
+    persist(st, s);
+    return true;
+  }
+  return false;
 }
 
 nlohmann::json SimManager::activeTopologyStudy() const {
@@ -274,7 +329,7 @@ bool SimManager::topologyReady(AppState &st, const Study &s, std::string &blocke
                   : (reason.empty() ? "This method/physics pair is not supported." : reason);
     return false;
   }
-  for (const auto &i : topology::validateTopology(topo, topoCaps_))
+  for (const auto &i : topology::validateTopology(topo, topoCaps_, s.topo))
     if (i.severity == topology::Severity::Blocking) {
       blocker = i.message;
       return false;
@@ -338,6 +393,7 @@ void SimManager::runTopology(AppState &st, Study &s) {
   meta.settings = settings;
   meta.setupKey = setup;
   meta.geometryKey = prep->topoGeometryKey;
+  meta.printProcess = topoStr(prep->topoStudy, "print_process");
   meta.startedUtc = now;
   topoRunMeta_ = meta;
   topoBcView_.armedPointer.clear();
@@ -426,6 +482,7 @@ void SimManager::finishTopologyRun(AppState &st, Study &s, const std::string &ow
   s.summary = o.headline;
   st.addLog("[topology] " + meta.runId + ": " + s.topoStatus);
   persist(st, ownerDocId, s);
+  checkTopologyDfam(st, s, ownerDocId, meta.runId, meta.printProcess);
   if (uiActive) {
     st.status = "Topology: " + o.headline;
     st.statusKind = s.topoStatusKind;
@@ -436,6 +493,57 @@ void SimManager::finishTopologyRun(AppState &st, Study &s, const std::string &ow
       topoActions_.push_back({s.id, {topology::ResultsAction::Kind::ShowRun, meta.runId, ""}});
     }
   }
+}
+
+void SimManager::checkTopologyDfam(AppState &st, Study &s, const std::string &ownerDocId,
+                                    const std::string &runId,
+                                    const std::string &printProcess) {
+  auto *run = topoFindRun(s.topo["runs"], runId);
+  if (!run)
+    return;
+  const auto &result = topoObj(*run, "result");
+  const auto &mfg = topoObj(result, "manufacturing");
+  if (!topoTrue(mfg, "geometry_valid") || topoTrue(topoObj(mfg, "dfam"), "checked"))
+    return;
+  const std::string runDir = topoStr(result, "result_dir");
+  if (runDir.empty()) {
+    if (topology::mergeDfamResult(*run, {}, "the run has no result directory")) {
+      s.topoRunsCheckKey.clear();
+      persist(st, ownerDocId, s);
+    }
+    return;
+  }
+  nlohmann::json params = {{"run_dir", runDir}};
+  if (!printProcess.empty())
+    params["print_process"] = printProcess;
+  const std::string studyId = s.id;
+  st.rpc.call("topology_dfam", std::move(params),
+              [&st, ownerDocId, studyId, runId](const core::RpcResult &reply) {
+    SimManager *owner = st.docMirror.hasDoc() && st.docMirror.docId() == ownerDocId
+                            ? st.simManager : nullptr;
+    if (!owner)
+      for (auto &tab : st.docTabs)
+        if (tab.docId == ownerDocId && tab.session && tab.session->sim)
+          owner = tab.session->sim.get();
+    if (!owner)
+      return;
+    for (auto &study : owner->studies_) {
+      if (study.type != StudyType::Topology || study.id != studyId ||
+          !study.topo.contains("runs"))
+        continue;
+      auto *record = topoFindRun(study.topo["runs"], runId);
+      if (!record)
+        return;
+      const std::string error = reply.ok && topoTrue(reply.result, "ok")
+                                    ? std::string()
+                                    : simJsonText(reply.result, "error", "message", reply.err);
+      if (topology::mergeDfamResult(*record, reply.result, error)) {
+        study.topoRunsCheckKey.clear();
+        owner->persist(st, ownerDocId, study);
+      }
+      return;
+    }
+  }, 120000);
 }
 
 void SimManager::refreshTopologyRunsView(AppState &st, Study &s, bool force) {
@@ -646,7 +754,8 @@ void SimManager::continueTopologyInCad(AppState &st, Study &s, const std::string
     return;
   }
   const nlohmann::json &result = topoObj(*run, "result");
-  const nlohmann::json &surface = topoObj(topoObj(result, "artifacts"), "surface_stl");
+  const nlohmann::json &surface = topoObj(topoObj(result, "artifacts"),
+                                         topology::surfaceArtifactKey(result).c_str());
   const std::string path = topoStr(surface, "path");
   if (!topoTrue(topoObj(result, "manufacturing"), "geometry_valid") ||
       path.empty() || topoTrue(surface, "missing") || topoTrue(surface, "stale")) {
@@ -795,7 +904,7 @@ void SimManager::drawTopologyForm(AppState &st, Study &s) {
     // Never insert a null `topology` key into an agent record just by drawing the form.
     nlohmann::json scratch = s.topo.contains("topology") ? s.topo["topology"] : nlohmann::json();
     if (topology::drawTopologySettings(st, scratch, topoCaps_, topoSettingsView_, lockedReason,
-                                       topology::kGroupsSolver)) {
+                                       topology::kGroupsSolver, s.topo)) {
       s.topo["topology"] = std::move(scratch);
       persist(st, s);
     }
@@ -821,13 +930,43 @@ void SimManager::drawTopologyForm(AppState &st, Study &s) {
     st.selection.clear(); // a freshly armed well starts without stale picks
   armedWell_ = topoBcView_.armedPointer.empty() ? -1 : kArmTopology;
   if (node_ == SimNode::Regions && !capsDown) {
-    // Manufacturing intent (symmetry, extrusion, additive) lives in the scalar settings; only
-    // those groups are drawn here (the Problem block belongs to the Study page).
     kit::gapSection();
-    nlohmann::json scratch = s.topo.contains("topology") ? s.topo["topology"] : nlohmann::json();
-    if (topology::drawTopologySettings(st, scratch, topoCaps_, topoSettingsView_, lockedReason,
-                                       topology::kGroupsManufacturing)) {
-      s.topo["topology"] = std::move(scratch);
+    nlohmann::json absentSettings;
+    nlohmann::json &settings = s.topo.contains("topology") ? s.topo["topology"] : absentSettings;
+    bool manufacturingCommit = false;
+    const auto additiveControls = [&] {
+      const auto &presets = topologyPrintProcesses();
+      if (!presets.entries.empty()) {
+        int &selected = topoSettingsView_.printProcessIndex;
+        if (selected < 0 || selected >= (int)presets.entries.size()) {
+          selected = 0;
+          for (std::size_t i = 0; i < presets.entries.size(); ++i)
+            if (topoStr(presets.entries[i], "id") == topoStr(s.topo, "print_process"))
+              selected = (int)i;
+        }
+        {
+          kit::FieldGroup group("print_process", "Print process");
+          kit::fieldCombo("preset", "Print process", &selected, presets.labels,
+                         kit::FieldOpts().withTip(presets.tips[selected].c_str()));
+        }
+        if (kit::secondaryButton("Apply"))
+          manufacturingCommit |= topology::applyPrintProcess(s.topo, presets.entries[selected],
+                                                               topoCaps_);
+        kit::itemTooltip(presets.tips[selected].c_str());
+        for (std::size_t i = 0; i < presets.entries.size(); ++i)
+          if (topoStr(presets.entries[i], "id") == topoStr(s.topo, "print_process"))
+            kit::chip(presets.labels[i].c_str(), kit::Tone::Accent);
+      }
+      const auto plate = topology::drawBuildPlateEditor(st, s.topo, topoBcView_, lockedReason);
+      manufacturingCommit |= plate.committed;
+      if (plate.armChanged)
+        st.selection.clear();
+      armedWell_ = topoBcView_.armedPointer.empty() ? -1 : kArmTopology;
+    };
+    const bool scalarCommit = topology::drawTopologySettings(
+        st, settings, topoCaps_, topoSettingsView_, lockedReason,
+        topology::kGroupsManufacturing, s.topo, additiveControls);
+    if (scalarCommit || manufacturingCommit) {
       persist(st, s);
     }
   }

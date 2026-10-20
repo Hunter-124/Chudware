@@ -56,6 +56,10 @@ bool applyEqOp(AppState& st, const nlohmann::json& op, const char* what) {
         st.toast(ui::ToastLevel::Warn, "No document open.");
         return false;
     }
+    if (st.docLockedByAgent(st.docMirror.docId())) {
+        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
+        return false;
+    }
     const std::string whatStr = what ? what : "equation";
     ++st.rebuildsInFlight;
     st.docMirror.applyOpsAsync(st.rpc, st.worker, nlohmann::json::array({op}),
@@ -90,6 +94,8 @@ struct ExprBuf {
 void drawEquationsDialog(AppState& st) {
     if (!st.showEquations) return;
     const auto& pal = ui::palette;
+    const bool locked = st.docLockedByAgent(st.docMirror.docId());
+    const std::string lockReason = locked ? st.agentLockReason(st.docMirror.docId()) : "";
 
     // Per-row expr edit buffers (persist across frames) + the Add-row buffers.
     static std::vector<ExprBuf> s_rows;
@@ -193,8 +199,11 @@ void drawEquationsDialog(AppState& st) {
                         ExprBuf* rb = nullptr;
                         for (auto& cand : s_rows) if (cand.name == name) { rb = &cand; break; }
                         if (rb && rb->lastDoc != expr) {
-                            std::memset(rb->buf.data(), 0, rb->buf.size());
-                            std::strncpy(rb->buf.data(), expr.c_str(), rb->buf.size() - 1);
+                            // A lock must not discard a human's uncommitted expression.
+                            if (!locked || rb->lastDoc == rb->buf.data()) {
+                                std::memset(rb->buf.data(), 0, rb->buf.size());
+                                std::strncpy(rb->buf.data(), expr.c_str(), rb->buf.size() - 1);
+                            }
                             rb->lastDoc = expr;
                         }
 
@@ -221,7 +230,8 @@ void drawEquationsDialog(AppState& st) {
                         // col 2: delete
                         ImGui::TableSetColumnIndex(2);
                         const std::string delTip = "Delete " + name;
-                        if (kit::iconButton("del", "delete", delTip.c_str()))
+                        if (kit::iconButton("del", "delete",
+                                            locked ? lockReason.c_str() : delTip.c_str(), !locked))
                             pendingDeleteName = name;
 
                         ImGui::PopID();
@@ -252,7 +262,8 @@ void drawEquationsDialog(AppState& st) {
                                                       s_addExpr.size(),
                                                       ImGuiInputTextFlags_EnterReturnsTrue);
             ImGui::SameLine();
-            bool addClicked = ImGui::Button("Add", ImVec2(ui::metrics::asmBtnW(), 0));
+            bool addClicked = kit::primaryButton("Add", !locked, lockReason.c_str(),
+                                                 ImVec2(ui::metrics::asmBtnW(), 0));
 
             if (addClicked || exprEnter) {
                 if (!validName(s_addName.data())) {

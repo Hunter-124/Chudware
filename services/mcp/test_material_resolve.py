@@ -469,8 +469,8 @@ def test_density_only_tread_measures_mass_but_refuses_isotropic_fea():
     explicit = _call("measure_part", {
         "doc_id": doc, "material": material, "density_g_cm3": 2.7})
     assert explicit["mass"]["mass_g"] == pytest.approx(2.7, rel=1e-6), explicit
-    default = _call("measure_part", {"doc_id": doc})
-    assert default["mass"]["mass_g"] == pytest.approx(7.85, rel=1e-6), default
+    applied = _call("measure_part", {"doc_id": doc})  # the material set above
+    assert applied["mass"]["mass_g"] == pytest.approx(1.22, rel=1e-6), applied
     with pytest.raises(ValueError):
         _resolve_material(material)
 

@@ -49,7 +49,8 @@
 //     inlets:[{label?, nodes, velocity_m_s:[3], temperature_c?}],
 //     outlets:[{label?, nodes, pressure_pa}], walls?:[{label?, nodes}] },
 //   "preserve": [ {label?, nodes:[int], thickness_mm?} | {label?,
-//   box_min_mm:[3], box_max_mm:[3]} ], "exclude":  [ same as preserve ]
+//   box_min_mm:[3], box_max_mm:[3]} ], "exclude":  [ same as preserve ],
+//   "build_plate": {label?, nodes:[int]} // resolved design-domain bed face
 // }
 // Thermal/flow node sets select exterior triangles whose three corners are all
 // in the set.
@@ -226,7 +227,8 @@ struct Settings {
 // Validates types, ranges, method/physics/objective/limit applicability;
 // refuses unknown keys. Does not decide capability support (that is
 // topology_capabilities()).
-Settings parse_settings(const nlohmann::json &topology);
+Settings parse_settings(const nlohmann::json &topology,
+                        bool has_build_plate = false);
 
 // ── Material
 // ────────────────────────────────────────────────────────────────────────
@@ -406,6 +408,12 @@ struct SurfacePatch {
   std::vector<int>
       faces; // indices into TetMesh surface arrays (all-corner rule)
   double area_m2 = 0;
+};
+
+struct BuildPlate {
+  int triangles = 0;
+  double area_m2 = 0;
+  Eigen::Vector3d normal = Eigen::Vector3d::Zero(); // outward
 };
 
 struct StructuralFixture {
@@ -652,6 +660,7 @@ struct ProblemSpec {
   std::vector<LoadCaseSpec> load_cases;
   std::optional<ThermalSpec> thermal;
   std::optional<FlowSpec> flow;
+  std::optional<NodeSet> build_plate;
   std::vector<RegionSpec> preserve, exclude;
 };
 ProblemSpec parse_problem_spec(const nlohmann::json &normalized);
@@ -671,6 +680,7 @@ struct Problem {
   std::string filter_radius_source; // explicit | min_member_mm |
                                     // auto_2x_median_element_size
   std::optional<double> min_member_m;
+  std::optional<BuildPlate> build_plate;
   double preserve_thickness_m = 0, exclude_thickness_m = 0;
   std::optional<StructuralBoundary> structural; // iff uses_structural_boundary
   std::optional<ThermalBoundary> thermal;       // iff uses_thermal_boundary

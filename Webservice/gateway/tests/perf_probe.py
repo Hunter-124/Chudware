@@ -1,4 +1,4 @@
-"""Live hostd + gateway WS bridge performance probe / ratchet.
+"""Live tenant-cell + gateway WS bridge performance probe / ratchet.
 
 Run standalone (cwd = Webservice/gateway)::
 
@@ -12,6 +12,7 @@ Or via pytest (skipped unless CHUDWARE_LIVE=1)::
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import socket
@@ -35,11 +36,8 @@ PERF_DIR = WEBSERVICE_DIR / "perf"
 BASELINE_PATH = PERF_DIR / "baseline.json"
 TRACES_DIR = PERF_DIR / "traces"
 
-HOSTD_SOCK = os.environ.get(
-    "CHUDWARE_WEBD_SOCKET",
-    f"{os.environ.get('XDG_RUNTIME_DIR', f'/tmp/chudware-{os.getuid()}')}/chudware/hostd-chudwareweb.sock",
-)
-DEV_HEADERS = {"X-Dev-User": "haedmonds69@gmail.com"}
+PERF_ACCOUNT = os.environ.get("CHUDWARE_PERF_ACCOUNT", "")
+DEV_HEADERS = {"X-Dev-User": PERF_ACCOUNT}
 N_ITERS = 20
 P95_REGRESS_FRAC = 0.15  # fail if p95 grows >15% vs baseline...
 P95_REGRESS_FLOOR_MS = 0.1  # ...AND by >0.1 ms absolute (sub-ms p95 noise floor)
@@ -112,11 +110,14 @@ def _utc_iso() -> str:
 def _require_live() -> None:
     if os.environ.get("CHUDWARE_LIVE") != "1":
         raise RuntimeError(
-            "CHUDWARE_LIVE=1 is required to run the live perf probe "
-            f"(socket {HOSTD_SOCK})"
+            "CHUDWARE_LIVE=1 is required to run the live tenant-cell perf probe"
         )
-    if not Path(HOSTD_SOCK).exists():
-        raise FileNotFoundError(f"hostd socket missing: {HOSTD_SOCK}")
+    if not PERF_ACCOUNT:
+        raise RuntimeError("CHUDWARE_PERF_ACCOUNT must name an existing approved test account")
+    from gateway import cells
+    principal = cells.resolve_workspace(PERF_ACCOUNT)
+    cells.prepare_cell(principal)
+    asyncio.run(cells.start_cell(principal.cell_id))
 
 
 # ---------------------------------------------------------------------------
@@ -127,8 +128,9 @@ def _require_live() -> None:
 class UnixRpc:
     """Newline-delimited JSON-RPC over a unix domain socket."""
 
-    def __init__(self, path: str = HOSTD_SOCK) -> None:
-        self.path = path
+    def __init__(self) -> None:
+        from gateway import cells
+        self.principal = cells.resolve_workspace(PERF_ACCOUNT)
         self._sock: socket.socket | None = None
         self._r: Any = None
         self._w: Any = None
@@ -136,9 +138,10 @@ class UnixRpc:
 
     def connect(self) -> None:
         self.close()
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        from gateway import cells
+        from gateway.config import settings
+        s = cells._connect_pinned(settings.cells_root / self.principal.cell_id)
         s.settimeout(60.0)
-        s.connect(self.path)
         self._sock = s
         # Buffered reader (default) — unbuffered makefile readline is 1-byte/syscall
         # and inflates timings on large hostd responses. Writer is unbuffered + flush.
@@ -167,6 +170,8 @@ class UnixRpc:
             raise RuntimeError("UnixRpc not connected")
         self._next_id += 1
         mid = self._next_id
+        if method == "hello":
+            params = dict(params or {}, principal=self.principal.hello())
         line = json.dumps(
             {"id": mid, "method": method, "params": params or {}},
             separators=(",", ":"),
@@ -347,11 +352,11 @@ def _ws_rpc(ws, mid: int, method: str, params: dict[str, Any] | None = None) -> 
 
 
 def measure_bridge() -> dict[str, dict[str, float]]:
-    """Same battery through the /engine WS bridge."""
+    """Measure the contained browser contract; CAD remains direct-socket only."""
     from fastapi.testclient import TestClient
 
     app = _import_app()
-    samples: dict[str, list[float]] = {m: [] for m in CORE_METHODS}
+    samples: dict[str, list[float]] = {"hello": [], "ping": []}
     next_id = 0
 
     def nid() -> int:
@@ -372,72 +377,15 @@ def measure_bridge() -> dict[str, dict[str, float]]:
                 raise RuntimeError(f"bridge hello failed: {resp}")
             samples["hello"].append(dt)
 
-    # 2) doc_new — 20 create+close
     with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
-        resp = _ws_rpc(ws, nid(), "hello", _hello_params())
-        if "error" in resp:
-            raise RuntimeError(f"bridge hello failed: {resp}")
-        for i in range(N_ITERS):
-            mid = nid()
-            t0 = time.perf_counter()
-            resp = _ws_rpc(ws, mid, "doc_new", {"name": f"perf_bridge_{i}"})
-            dt = (time.perf_counter() - t0) * 1000.0
-            if "error" in resp:
-                raise RuntimeError(f"bridge doc_new failed: {resp}")
-            samples["doc_new"].append(dt)
-            doc_id = (resp.get("result") or {}).get("doc_id")
-            if doc_id:
-                _ws_rpc(ws, nid(), "doc_close", {"doc_id": doc_id})
-
-    # 3–5) one doc for ops
-    with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
-        resp = _ws_rpc(ws, nid(), "hello", _hello_params())
-        if "error" in resp:
-            raise RuntimeError(f"bridge hello failed: {resp}")
-        resp = _ws_rpc(ws, nid(), "doc_new", {"name": "perf_bridge_ops"})
-        if "error" in resp:
-            raise RuntimeError(f"bridge doc_new (ops) failed: {resp}")
-        doc_id = (resp.get("result") or {}).get("doc_id")
-        if not doc_id:
-            raise RuntimeError(f"bridge doc_new missing doc_id: {resp}")
-
-        probe = _ws_rpc(ws, nid(), "measure_part", {"doc_id": doc_id})
-        measure_ok = "error" not in probe
-        if measure_ok:
-            samples["measure_part"] = []
-
         for _ in range(N_ITERS):
             mid = nid()
             t0 = time.perf_counter()
-            resp = _ws_rpc(
-                ws,
-                mid,
-                "doc_apply_ops",
-                {"doc_id": doc_id, "ops": [BOX_OP]},
-            )
+            resp = _ws_rpc(ws, mid, "ping")
             dt = (time.perf_counter() - t0) * 1000.0
-            if "error" in resp:
-                raise RuntimeError(f"bridge doc_apply_ops failed: {resp}")
-            samples["doc_apply_ops"].append(dt)
-
-            if measure_ok:
-                mid = nid()
-                t0 = time.perf_counter()
-                resp = _ws_rpc(ws, mid, "measure_part", {"doc_id": doc_id})
-                dt = (time.perf_counter() - t0) * 1000.0
-                if "error" in resp:
-                    raise RuntimeError(f"bridge measure_part failed: {resp}")
-                samples["measure_part"].append(dt)
-
-            mid = nid()
-            t0 = time.perf_counter()
-            resp = _ws_rpc(ws, mid, "doc_undo", {"doc_id": doc_id})
-            dt = (time.perf_counter() - t0) * 1000.0
-            if "error" in resp:
-                raise RuntimeError(f"bridge doc_undo failed: {resp}")
-            samples["doc_undo"].append(dt)
-
-        _ws_rpc(ws, nid(), "doc_close", {"doc_id": doc_id})
+            if resp.get("result") != {"ok": True}:
+                raise RuntimeError(f"bridge ping failed: {resp}")
+            samples["ping"].append(dt)
 
     return {name: _stats(vals) for name, vals in samples.items()}
 
@@ -520,7 +468,9 @@ def run_probe(*, rebaseline: bool = False) -> dict[str, Any]:
     PERF_DIR.mkdir(parents=True, exist_ok=True)
     TRACES_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"hostd socket: {HOSTD_SOCK}")
+    from gateway import cells
+    principal = cells.resolve_workspace(PERF_ACCOUNT)
+    print(f"tenant cell: {principal.cell_id}")
     print(f"iterations:   {N_ITERS}")
     print("measuring DIRECT …")
     direct, note = measure_direct()
@@ -538,7 +488,7 @@ def run_probe(*, rebaseline: bool = False) -> dict[str, Any]:
         "bridge_overhead_ms": overhead,
         "note": note,
         "n_iters": N_ITERS,
-        "socket": HOSTD_SOCK,
+        "cell_id": principal.cell_id,
     }
 
     # Always write a trace.

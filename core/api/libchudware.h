@@ -22,6 +22,8 @@
 // jemalloc). All strings are null-terminated UTF-8 JSON.
 #pragma once
 
+#include <stdint.h>
+
 #if defined(_WIN32)
 #  if defined(CHUDWARE_BUILD_DLL)
 #    define CHUDWARE_API __declspec(dllexport)
@@ -82,6 +84,15 @@ CHUDWARE_API const char* chudware_build_id(void);
 CHUDWARE_API void chudware_set_doc_publish_sink(
     void (*cb)(const char* method, const char* params_json, const char* result_json, void* ud),
     void* ud);
+
+// Process-wide asynchronous cache verification publication, outside document locks.
+CHUDWARE_API void chudware_set_cache_refresh_sink(
+    void (*cb)(const char* doc_id, const char* response_json, void* ud), void* ud);
+
+// Private lifecycle census, not a chudware_call method. No allocations or document
+// copies. Counts are lower bounds; nonzero return means incomplete (never idle).
+// counts[0..2] = cache verification, profiler, dirty documents.
+CHUDWARE_API int chudware_activity(uint64_t counts[3]);
 
 #ifdef __cplusplus
 }  // extern "C"

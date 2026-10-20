@@ -3,7 +3,7 @@
 Default OFF. Start with start_session(port, token) -> returns QR string (data URL PNG).
 Guided shot list: top, front, right, back, left, bottom, 3x angled 45 degrees.
 Upload endpoint: POST /upload?token=<tok> with multipart/form-data photo field.
-All endpoints check token. Binds to 0.0.0.0 but only LAN-reachable.
+All endpoints check token. The listener binds to one selected LAN interface, not all interfaces.
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from email.parser import BytesParser
 from email.policy import default as _EMAIL_POLICY
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from socketserver import ThreadingMixIn
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -28,6 +29,81 @@ try:
 except Exception:  # noqa: BLE001
     qrcode = None  # type: ignore
     HAVE_QRCODE = False
+
+_HANDSHAKE_TIMEOUT_S = 5.0
+_BODY_TIMEOUT_S = 30.0
+_MAX_CONNECTIONS = 16
+_MAX_HEADER_BYTES = 16 * 1024
+_MAX_UPLOAD_BYTES = 16 * 1024 * 1024
+_MAX_SESSION_BYTES = 256 * 1024 * 1024
+_MAX_UPLOAD_COUNT = 128
+
+
+def _close_connection(connection):
+    try:
+        connection.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    connection.close()
+
+
+class _CaptureServer(ThreadingMixIn, HTTPServer):
+    """Bounded concurrent connections, each with an absolute pre-auth deadline."""
+    daemon_threads = True
+    block_on_close = False
+
+    def __init__(self, address, handler):
+        self._slots = threading.BoundedSemaphore(_MAX_CONNECTIONS)
+        self._connections = set()
+        self._connections_lock = threading.Lock()
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            _close_connection(request)
+            return
+        request.settimeout(_HANDSHAKE_TIMEOUT_S)
+        with self._connections_lock:
+            self._connections.add(request)
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            with self._connections_lock:
+                self._connections.discard(request)
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._connections_lock:
+                self._connections.discard(request)
+            self._slots.release()
+
+    def server_close(self):
+        with self._connections_lock:
+            for request in self._connections:
+                _close_connection(request)
+        super().server_close()
+
+
+class _HeaderReader:
+    """Budget the request line and all headers before the token can be checked."""
+    def __init__(self, stream):
+        self.stream = stream
+        self.remaining = _MAX_HEADER_BYTES
+
+    def readline(self, size=-1):
+        line = self.stream.readline(min(size if size >= 0 else self.remaining + 1,
+                                        self.remaining + 1))
+        self.remaining -= len(line)
+        if self.remaining < 0:
+            raise TimeoutError("capture headers exceed limit")
+        return line
+
+    def close(self):
+        self.stream.close()
 
 _GUIDED_SHOTS = [
     "top",
@@ -114,10 +190,13 @@ class CaptureSession:
     work_dir: Optional[str] = field(default=None, repr=False)
     _server: Optional[HTTPServer] = field(default=None, repr=False)
     _thread: Optional[threading.Thread] = field(default=None, repr=False)
+    bind_host: str = "127.0.0.1"
+    _upload_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _received_bytes: int = field(default=0, repr=False)
 
     @property
     def upload_url(self) -> str:
-        ip = _lan_ip()
+        ip = self.bind_host
         return f"http://{ip}:{self.port}/upload?token={self.token}"
 
     @property
@@ -134,10 +213,22 @@ def _parse_multipart_photo(headers, rfile):
     Returns (None, None) when the body has no usable photo part.
     """
     ctype = headers.get("Content-Type", "")
-    length = int(headers.get("Content-Length", 0) or 0)
+    if headers.get("Transfer-Encoding") is not None:
+        raise ValueError("transfer encoding is not supported")
+    lengths = headers.get_all("Content-Length", []) if hasattr(headers, "get_all") else [headers.get("Content-Length", "0")]
+    if len(lengths) != 1:
+        raise ValueError("exactly one Content-Length is required")
+    try:
+        length = int(lengths[0])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid Content-Length") from exc
+    if length > _MAX_UPLOAD_BYTES:
+        raise ValueError("photo exceeds upload limit")
     if "multipart/form-data" not in ctype or length <= 0:
         return None, None
     body = rfile.read(length)
+    if len(body) != length:
+        raise ValueError("incomplete photo upload")
     doc = (b"Content-Type: " + ctype.encode("latin-1") +
            b"\r\nMIME-Version: 1.0\r\n\r\n" + body)
     msg = BytesParser(policy=_EMAIL_POLICY).parsebytes(doc)
@@ -155,6 +246,20 @@ def _make_handler(session: CaptureSession):
     """Build a request handler class bound to the given session."""
 
     class Handler(BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup()
+            self._body_stream = self.rfile
+            self.rfile = _HeaderReader(self.rfile)
+            self._deadline = threading.Timer(_HANDSHAKE_TIMEOUT_S, _close_connection,
+                                             args=(self.connection,))
+            self._deadline.daemon = True
+            self._deadline.start()
+
+        def finish(self):
+            self._deadline.cancel()
+            self.rfile = self._body_stream
+            super().finish()
+
         def log_message(self, fmt, *args):  # suppress default stderr logging
             pass
 
@@ -162,7 +267,16 @@ def _make_handler(session: CaptureSession):
             parsed = urlparse(self.path)
             qs = parse_qs(parsed.query)
             tok = (qs.get("token") or [""])[0]
-            return hmac.compare_digest(tok, session.token)
+            authorized = hmac.compare_digest(tok, session.token)
+            if authorized:
+                self._deadline.cancel()
+                self.rfile = self._body_stream
+                self.connection.settimeout(_BODY_TIMEOUT_S)
+                self._deadline = threading.Timer(_BODY_TIMEOUT_S, _close_connection,
+                                                 args=(self.connection,))
+                self._deadline.daemon = True
+                self._deadline.start()
+            return authorized
 
         def do_GET(self):
             parsed = urlparse(self.path)
@@ -220,13 +334,17 @@ def _make_handler(session: CaptureSession):
                     fn_ext = Path(filename).suffix.lower()
                     if fn_ext in (".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp"):
                         ext = fn_ext
-                idx = len(session.received)
-                shot_name = (session.shot_names[idx] if idx < len(session.shot_names)
-                             else f"extra_{idx}")
-                work_path = Path(session.work_dir)
-                dest = work_path / f"{idx:03d}_{shot_name}{ext}"
-                dest.write_bytes(data)
-                session.received.append(str(dest))
+                with session._upload_lock:
+                    idx = len(session.received)
+                    if idx >= _MAX_UPLOAD_COUNT or session._received_bytes + len(data) > _MAX_SESSION_BYTES:
+                        raise ValueError("capture session upload limit reached")
+                    shot_name = (session.shot_names[idx] if idx < len(session.shot_names)
+                                 else f"extra_{idx}")
+                    work_path = Path(session.work_dir)
+                    dest = work_path / f"{idx:03d}_{shot_name}{ext}"
+                    dest.write_bytes(data)
+                    session.received.append(str(dest))
+                    session._received_bytes += len(data)
                 body = b"OK"
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
@@ -235,7 +353,7 @@ def _make_handler(session: CaptureSession):
                 self.wfile.write(body)
             except Exception as exc:  # noqa: BLE001
                 body = f"Upload error: {exc}".encode("utf-8")
-                self.send_response(500)
+                self.send_response(400 if isinstance(exc, (ValueError, TimeoutError)) else 500)
                 self.send_header("Content-Type", "text/plain")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -249,23 +367,29 @@ def get_guided_shot_names() -> list:
     return list(_GUIDED_SHOTS)
 
 
-def start_session(port: int = 8742, token: Optional[str] = None) -> CaptureSession:
+def start_session(port: int = 8742, token: Optional[str] = None,
+                  bind_host: Optional[str] = None) -> CaptureSession:
     """Start a local capture HTTP server; return a CaptureSession with QR info.
 
     The session's .qr property returns a PNG data URL (or raw URL if qrcode is absent).
-    The server binds to 0.0.0.0 but is only LAN-reachable. Token is checked on every request.
+    By default binds only to the selected LAN interface. Pass a specific local interface
+    (e.g. 127.0.0.1 for local-only use). Wildcard binds are refused.
     """
     if token is None:
         token = secrets.token_urlsafe(16)
+    bind_host = bind_host or _lan_ip()
+    if bind_host in {"0.0.0.0", "::", ""}:
+        raise ValueError("capture requires a specific local interface")
     work_dir = tempfile.mkdtemp(prefix="chudware_capture_")   # persists past stop_session
     session = CaptureSession(
         port=port,
         token=token,
         shot_names=list(_GUIDED_SHOTS),
         work_dir=work_dir,
+        bind_host=bind_host,
     )
     handler_class = _make_handler(session)
-    server = HTTPServer(("0.0.0.0", port), handler_class)
+    server = _CaptureServer((bind_host, port), handler_class)
     session.port = server.server_address[1]                # resolves port=0 -> real port
     session._server = server
     t = threading.Thread(target=server.serve_forever, name=f"chudware-capture-{port}", daemon=True)
@@ -278,4 +402,5 @@ def stop_session(session: CaptureSession) -> None:
     """Shut down the HTTP server. The caller is responsible for session.work_dir cleanup."""
     if session._server is not None:
         session._server.shutdown()
+        session._server.server_close()
         session._server = None

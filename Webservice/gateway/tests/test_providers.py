@@ -79,10 +79,10 @@ def test_live_chudcode_catalog_overrides_static_presets_without_waiting(monkeypa
          "name": "Claude Opus 5.5"},
     ]}
     catalog = providers._live_catalog_rows(cli, {})
-    assert catalog["anthropic-sub"][0]["id"] == "claude-opus-6"
+    assert catalog["anthropic"][0]["id"] == "claude-opus-6"
     monkeypatch.setattr(providers, "_catalog_rows", catalog)
     monkeypatch.setattr(providers, "_catalog_next_refresh", float("inf"))
-    assert providers.default_model_for("anthropic-sub") == "claude-opus-6"
+    assert providers.default_model_for("anthropic") == "claude-opus-6"
     assert providers.default_model_for("openai") == providers._MODEL_PRESETS["openai"][0]["id"]
 
 
@@ -121,7 +121,7 @@ def test_public_discovery_keeps_chat_models_and_drops_non_chat_capabilities() ->
     }
     assert [row["id"] for row in rows["openai"]] == ["gpt-6-sol"]
     assert [row["id"] for row in rows["gemini"]] == ["gemini-3.5-flash"]
-    assert rows["anthropic-sub"] == rows["anthropic"]
+    assert "anthropic-sub" not in rows
     assert "unsupported-provider" not in rows
 
 
@@ -151,7 +151,7 @@ def test_validated_byok_is_listed_only_to_its_owner() -> None:
     assert "customer-key-secret" not in json.dumps(own)
 
 
-def test_only_usable_personal_isolated_oauth_is_advertised() -> None:
+def test_personal_and_shared_subscriptions_are_not_advertised() -> None:
     _account(CUSTOMER)
     _account(OPERATOR)
     _link(OPERATOR, "anthropic-sub", "shared", "operator-claude")
@@ -161,9 +161,7 @@ def test_only_usable_personal_isolated_oauth_is_advertised() -> None:
     _link(CUSTOMER, "anthropic-sub", "personal", "customer-claude")
     _link(CUSTOMER, "openai-codex", "personal", "customer-codex")
     listed = providers.list_available_providers(email=CUSTOMER)
-    assert [(row["id"], row["auth"]) for row in listed["providers"]] == [
-        ("anthropic-sub", "subscription"),
-    ]
+    assert listed["providers"] == []
     assert provider_accounts.resolve_subscription_token(CUSTOMER, "anthropic")["access_token"] == (
         "access-customer-claude-secret"
     )
@@ -171,7 +169,7 @@ def test_only_usable_personal_isolated_oauth_is_advertised() -> None:
     assert "customer-codex" not in json.dumps(listed)
 
 
-def test_verified_trial_domain_advertises_sponsored_claude_without_token_bytes() -> None:
+def test_verified_trial_subscription_is_still_unavailable_to_cells() -> None:
     trial_user = "student@dept.example.com"
     _account(trial_user)
     _account(OPERATOR)
@@ -188,14 +186,11 @@ def test_verified_trial_domain_advertises_sponsored_claude_without_token_bytes()
     _link(OPERATOR, "anthropic-sub", "personal", "admin-claude")
     with _client(trial_user) as client:
         listed = client.get("/api/providers").json()
-    assert [(entry["id"], entry["auth"], entry["label"])
-            for entry in listed["providers"]] == [
-        ("anthropic-sub", "subscription", "Claude (sponsored)")
-    ]
+    assert listed["providers"] == []
     assert "access-admin-claude-secret" not in json.dumps(listed)
 
 
-def test_pool_catalogue_follows_grant_credential_and_model_override(monkeypatch) -> None:
+def test_pool_never_enters_catalogue_even_with_grant_and_credentials(monkeypatch) -> None:
     _account(CUSTOMER, grant=True)
     _account(OPERATOR, grant=False)
     assert providers.list_available_providers(email=CUSTOMER)["providers"] == []
@@ -203,10 +198,8 @@ def test_pool_catalogue_follows_grant_credential_and_model_override(monkeypatch)
     monkeypatch.setenv("CHUDWARE_WEB_POOL_PROVIDER", "openrouter")
     monkeypatch.setenv("CHUDWARE_WEB_POOL_MODEL", "vendor/chosen-model")
     listed = providers.list_available_providers(email=CUSTOMER)
-    assert [(row["id"], row["auth"], row["models"]) for row in listed["providers"]] == [
-        ("openrouter", "pool", [{"id": "vendor/chosen-model", "label": "vendor/chosen-model"}]),
-    ]
-    assert listed["default_model"] == "vendor/chosen-model"
+    assert listed["providers"] == []
+    assert listed["default_model"] is None
     assert providers.list_available_providers(email=OPERATOR)["providers"] == []
     assert "operator-pool-secret" not in json.dumps(listed)
 
@@ -215,11 +208,11 @@ def test_pool_catalogue_follows_grant_credential_and_model_override(monkeypatch)
     assert [(row["id"], row["auth"]) for row in own["providers"]] == [("openrouter", "api_key")]
 
 
-def test_unreachable_subscription_store_does_not_expose_ambient(monkeypatch) -> None:
+def test_subscription_store_is_not_consulted_for_cell_availability(monkeypatch) -> None:
     _account(CUSTOMER)
     def unavailable(*_args):
         raise RuntimeError("store down")
-    monkeypatch.setattr(providers, "resolve_subscription_token", unavailable)
+    monkeypatch.setattr(provider_accounts, "resolve_subscription_token", unavailable)
     with _client(CUSTOMER) as client:
         response = client.get("/api/providers")
     assert response.status_code == 200

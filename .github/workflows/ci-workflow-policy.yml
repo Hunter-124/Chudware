@@ -54,12 +54,11 @@ concurrency:
 jobs:
   workflow-policy:
     name: Workflow policy
-    # Self-hosted on purpose, and named explicitly: a hosted label here would be
-    # billed, and a bare `self-hosted` could land this on the production gateway
-    # host. cc-linux-build is x86_64 Linux, which is exactly the actionlint asset
-    # pinned below; this gate is pure text analysis and holds the host for well
-    # under a minute.
-    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-build]
+    # PR-controlled Python executes only in a disposable Linux image, never
+    # on a persistent interpreter/profile later used for release credentials.
+    runs-on:
+      group: chudware-untrusted-ephemeral
+      labels: [self-hosted, Linux, X64, cc-linux-disposable]
     timeout-minutes: 15
     env:
       ACTIONLINT_VERSION: 1.7.12
@@ -104,8 +103,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Run-scoped: RUNNER_TEMP is wiped between jobs, so nothing here can
-          # leak into a later run or into the checkout.
+          # Job-local tools; the surrounding VM and all writable state are
+          # destroyed by the external runner controller after this one job.
           tools="$(mktemp -d "${RUNNER_TEMP}/actionlint.XXXXXXXX")"
           url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
 
@@ -255,7 +254,7 @@ jobs:
 
           echo "both validators fire on seeded defects and pass clean input"
 
-      - name: Check YAML alias runner policy boundaries
+      - name: Check runner routing and YAML alias policy boundaries
         shell: bash
         run: python3 scripts/test_verify_ci_workflows.py
 

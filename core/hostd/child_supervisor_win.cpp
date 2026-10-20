@@ -43,6 +43,7 @@
 #include <vector>
 
 #include "hostd_log.h"
+#include "../../services/ipc/ipc_private.h"
 #include "security/integrity.h"
 #include "security/runtime_guard.h"
 #include "util/platform_paths.h"
@@ -153,15 +154,17 @@ void ChildSupervisor::emitExited(const Child& c, int status) {
     log().line("child %s (pid %lu) exited: code=%d mission=%s", c.childId.c_str(),
                c.pid, status, c.missionId.c_str());
     if (!broadcast_) return;
-    json evt = {{"event", "mission.exited"},
-                {"data",
-                 {{"child_id", c.childId},
-                  {"pid", (long)c.pid},
-                  {"exit_code", status},
-                  {"signal", 0},
-                  {"mission_id", c.missionId},
-                  {"doc_id", c.docId}}}};
-    broadcast_(evt.dump());
+    try {
+        json evt = {{"event", "mission.exited"},
+                    {"data",
+                     {{"child_id", c.childId},
+                      {"pid", (long)c.pid},
+                      {"exit_code", status},
+                      {"signal", 0},
+                      {"mission_id", c.missionId},
+                      {"doc_id", c.docId}}}};
+        broadcast_(evt.dump());
+    } catch (...) { log().line("child exit event delivery failed"); }
 }
 
 bool ChildSupervisor::reapLocked(std::map<std::string, Child>::iterator it,
@@ -190,8 +193,7 @@ void ChildSupervisor::reaperLoop() {
             SpawnReq* req = pendingSpawns_.front();
             pendingSpawns_.pop_front();
             lk.unlock();
-            doSpawn(*req);
-            req->done.set_value();
+            completeSpawn(*req);
             lk.lock();
         }
         const long long now = monoMs();
@@ -222,9 +224,7 @@ void ChildSupervisor::reaperLoop() {
     while (!pendingSpawns_.empty()) {
         SpawnReq* req = pendingSpawns_.front();
         pendingSpawns_.pop_front();
-        req->isError = true;
-        req->result = json{{"code", "draining"}, {"message", "daemon is shutting down"}};
-        req->done.set_value();
+        completeSpawn(*req, true);
     }
 }
 
@@ -301,6 +301,10 @@ bool ChildSupervisor::handleMethod(int clientId, const std::string& method,
     }
 
     if (method != "agent_spawn") return false;
+    if (!validateSpawn(params, result)) {
+        isError = true;
+        return true;
+    }
 
     SpawnReq req;
     req.clientId = clientId;
@@ -316,7 +320,7 @@ bool ChildSupervisor::handleMethod(int clientId, const std::string& method,
         pendingSpawns_.push_back(&req);
     }
     cv_.notify_all();
-    fut.wait();
+    fut.get();
     result = std::move(req.result);
     isError = req.isError;
     return true;
@@ -346,15 +350,9 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
         return;
     }
 
-    if (!params.contains("argv") || !params["argv"].is_array() || params["argv"].empty()) {
-        isError = true;
-        result = json{{"code", "bad_params"},
-                      {"message", "agent_spawn needs a non-empty argv array"}};
-        return;
-    }
     std::vector<std::string> argvS;
-    for (auto& a : params["argv"])
-        argvS.push_back(a.is_string() ? a.get<std::string>() : a.dump());
+    for (const auto& a : params["argv"])
+        argvS.push_back(a.get<std::string>());
 
     std::wstring cmdline;
     for (auto& a : argvS) appendQuoted(cmdline, widen(a));
@@ -384,7 +382,7 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
     if (params.contains("env") && params["env"].is_object())
         for (auto& [k, v] : params["env"].items()) {
             std::wstring wk = widen(k);
-            std::wstring wv = widen(v.is_string() ? v.get<std::string>() : v.dump());
+            std::wstring wv = widen(v.get<std::string>());
             env[upKey(wk)] = wk + L"=" + wv;
         }
     std::wstring envBlock;  // std::map iteration = the sorted order required
@@ -401,13 +399,42 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
                   std::to_string(nextId_++);
     }
     if (!logDir_.empty()) {
-        CreateDirectoryW(widen(logDir_).c_str(), nullptr);  // usually exists
+        if (!chudware_ipc::privateDir(logDir_)) {
+            isError = true;
+            result = {{"code", "spawn_failed"}, {"message", "cannot create private child log directory"}};
+            return;
+        }
         logPath = logDir_ + "\\" + childId + ".log";
     }
+    Child c;
+    c.childId = childId;
+    c.missionId = params.value("mission_id", "");
+    c.docId = params.value("doc_id", "");
+    c.logPath = logPath;
+    c.spawnerClient = clientId;
+    c.spawnedMs = monoMs();
+    const std::string missionId = c.missionId;
+
+    struct SpawnGuard {
+        HANDLE job = nullptr, process = nullptr, thread = nullptr, input = INVALID_HANDLE_VALUE;
+        FILE* log = nullptr;
+        ~SpawnGuard() {
+            if (process) {
+                TerminateProcess(process, 1);
+                WaitForSingleObject(process, INFINITE);
+                CloseHandle(process);
+            }
+            if (thread) CloseHandle(thread);
+            if (job) CloseHandle(job);
+            if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
+            if (log) std::fclose(log);
+        }
+    } guard;
 
     // Job first (assign-before-resume): KILL_ON_JOB_CLOSE, breakaway NOT granted
     // to the child, so nothing it spawns can outlive it.
     HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    guard.job = job;
     if (!job) {
         isError = true;
         result = json{{"code", "spawn_failed"}, {"message", lastErr("CreateJobObjectW")}};
@@ -417,7 +444,6 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
     jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli,
                                  sizeof jeli)) {
-        CloseHandle(job);
         isError = true;
         result = json{{"code", "spawn_failed"},
                       {"message", lastErr("SetInformationJobObject")}};
@@ -430,11 +456,16 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
     sa.bInheritHandle = TRUE;
     HANDLE hNul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                               &sa, OPEN_EXISTING, 0, nullptr);
-    HANDLE hLog = INVALID_HANDLE_VALUE;
-    if (!logPath.empty())
-        hLog = CreateFileW(widen(logPath).c_str(), FILE_APPEND_DATA,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    guard.input = hNul;
+    guard.log = logPath.empty() ? nullptr : chudware_ipc::privateFile(logPath, true, true);
+    HANDLE hLog = guard.log ? reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(guard.log))) :
+                             INVALID_HANDLE_VALUE;
+    if (!logPath.empty() && (!guard.log ||
+            !SetHandleInformation(hLog, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT))) {
+        isError = true;
+        result = {{"code", "spawn_failed"}, {"message", "cannot create private child log"}};
+        return;
+    }
 
     STARTUPINFOW si{};
     si.cb = sizeof si;
@@ -448,11 +479,10 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
     BOOL ok = CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr,
                              /*inherit handles*/ TRUE, flags,
                              (LPVOID)envBlock.c_str(), nullptr, &si, &pi);
+    guard.process = pi.hProcess;
+    guard.thread = pi.hThread;
     const std::string createErr = ok ? "" : lastErr("CreateProcessW");
-    if (hNul != INVALID_HANDLE_VALUE && hNul) CloseHandle(hNul);
-    if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
     if (!ok) {
-        CloseHandle(job);
         isError = true;
         result = json{{"code", "spawn_failed"},
                       {"message", createErr + " (" + argvS[0] + ")"}};
@@ -461,39 +491,33 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
     if (!AssignProcessToJobObject(job, pi.hProcess)) {
         // Containment is the point — refuse to run an uncontained child.
         const std::string aerr = lastErr("AssignProcessToJobObject");
-        TerminateProcess(pi.hProcess, 1);
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        CloseHandle(job);
         isError = true;
         result = json{{"code", "spawn_failed"}, {"message", aerr}};
         return;
     }
-    ResumeThread(pi.hThread);
-    CloseHandle(pi.hThread);
+    if (ResumeThread(pi.hThread) == static_cast<DWORD>(-1)) {
+        isError = true;
+        result = {{"code", "spawn_failed"}, {"message", lastErr("ResumeThread")}};
+        return;
+    }
 
-    Child c;
-    c.childId = childId;
     c.process = pi.hProcess;
     c.job = job;
     c.pid = pi.dwProcessId;
-    c.missionId = params.value("mission_id", "");
-    c.docId = params.value("doc_id", "");
-    c.logPath = logPath;
-    c.spawnerClient = clientId;
-    c.spawnedMs = monoMs();
+    result = json{{"child_id", childId},
+                  {"pid", (long)pi.dwProcessId},
+                  {"pgid", (long)pi.dwProcessId},
+                  {"log", logPath}};
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        children_[childId] = std::move(c);
+        children_.emplace(childId, std::move(c));
     }
+    guard.process = nullptr;
+    guard.job = nullptr;  // table owns both handles after all throwing work
     cv_.notify_all();
     log().line("spawned child %s pid=%lu argv0=%s mission=%s (client #%d)",
                childId.c_str(), pi.dwProcessId, argvS[0].c_str(),
-               params.value("mission_id", "").c_str(), clientId);
-    result = json{{"child_id", childId},
-                  {"pid", (long)pi.dwProcessId},
-                  {"pgid", (long)pi.dwProcessId},  // shape parity with POSIX
-                  {"log", logPath}};
+               missionId.c_str(), clientId);
 }
 
 }  // namespace hostd

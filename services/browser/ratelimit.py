@@ -50,7 +50,6 @@ from __future__ import annotations
 import os
 import threading
 import time
-import urllib.request
 from urllib.parse import urlsplit
 
 from . import profiles
@@ -139,11 +138,12 @@ def _fetch_robots_crawl_delay(host: str) -> float | None:
     applies to us (the ``*`` group), or ``None`` when none is published or the
     file can't be read. Best-effort and short-timeout; never raises."""
     try:
-        req = urllib.request.Request(
-            f"https://{host}/robots.txt",
-            headers={"User-Agent": "Mozilla/5.0 (Chudware parts browser)"})
-        with urllib.request.urlopen(req, timeout=_ROBOTS_TIMEOUT_S) as resp:  # noqa: S310 — https host only
-            text = resp.read(65536).decode("utf-8", "replace")
+        from services.net.safe_http import get
+        response = get(f"https://{host}/robots.txt", schemes=("https",),
+                       headers={"User-Agent": "Mozilla/5.0 (Chudware parts browser)"},
+                       max_bytes=65536, idle_timeout=_ROBOTS_TIMEOUT_S)
+        response.raise_for_status()
+        text = response.text
     except Exception:  # noqa: BLE001 — no robots / network error → no published delay
         return None
     # Parse the '*' user-agent group's Crawl-delay (simple, tolerant scan).

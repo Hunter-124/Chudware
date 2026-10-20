@@ -21,7 +21,7 @@ from pydantic import BaseModel
 try:
     from . import accounts as _accounts_mod
     from . import credits
-    from . import mailer
+    from . import mailer, deployment_drain
     from .auth import get_current_user
     from .config import settings
     from .db import tx
@@ -29,7 +29,7 @@ try:
 except ImportError:  # uvicorn app:app from the package dir
     import accounts as _accounts_mod
     import credits
-    import mailer
+    import mailer, deployment_drain
     from auth import get_current_user
     from config import settings
     from db import tx
@@ -102,9 +102,6 @@ class AccountStore(Protocol):
     def ensure_account(self, email: str, display: str) -> Any: ...
     def set_plan(self, email: str, plan: str) -> Any: ...
     def set_stripe_customer(self, email: str, customer_id: str) -> Any: ...
-    def set_status(
-        self, email: str, status: str, decided_by: str = "", notes: str = ""
-    ) -> Any: ...
     def set_subscription(
         self,
         email: str,
@@ -212,13 +209,6 @@ def _subscription_line(obj: Any, cfg: BillingConfig) -> Any | None:
     return lines[0] if lines else None
 
 
-def _plan_from_subscription(obj: Any, cfg: BillingConfig) -> str | None:
-    metadata = _field(obj, "metadata") or {}
-    name = str(_field(metadata, "chudware_plan", "") or "").strip().lower()
-    if is_purchasable(name):
-        return name
-    line = _subscription_line(obj, cfg)
-    return _plan_name_for_price(cfg, _price_id(line)) if line is not None else None
 
 
 def _downgrade(account: Any, reason: str) -> None:
@@ -284,6 +274,23 @@ def _credit_price_metadata(price: Any, stripe: Any) -> tuple[str, Mapping[str, A
     return price_id, metadata
 
 
+def _claim_checkout_settlement(obj: Any, email: str, kind: str) -> bool:
+    """Deduplicate paid grants by Checkout/payment identity, not delivery id."""
+    session_id = str(_field(obj, "id", "") or "")
+    if not session_id:
+        raise HTTPException(400, "paid checkout session has no id")
+    payment = _field(obj, "payment_intent")
+    payment_id = payment if isinstance(payment, str) else str(_field(payment, "id", "") or "")
+    with tx() as cur:
+        cur.execute(
+            "INSERT INTO billing_checkout_settlements"
+            " (checkout_session_id,email,kind,stripe_payment_intent)"
+            " VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING checkout_session_id",
+            (session_id, email, kind, payment_id),
+        )
+        return cur.fetchone() is not None
+
+
 def _grant_credit_checkout(obj: Any, event: Any, cfg: BillingConfig, stripe: Any) -> None:
     email = _checkout_email(obj)
     lines = _checkout_lines(obj, stripe)
@@ -296,6 +303,8 @@ def _grant_credit_checkout(obj: Any, event: Any, cfg: BillingConfig, stripe: Any
     raw = str(_field(metadata, "chud_credits", "") or "").strip()
     if not raw.isdigit() or int(raw) <= 0:
         raise HTTPException(400, "credit pack price missing valid chud_credits metadata")
+    if not _claim_checkout_settlement(obj, email, "payment"):
+        return
     session_meta = _field(obj, "metadata") or {}
     credits.grant_purchased(
         email,
@@ -418,9 +427,19 @@ def _apply_event(store: AccountStore, event: Any) -> None:
     if handle_marketplace_event is not None and handle_marketplace_event(event):
         return
 
-    if event_type == "checkout.session.completed":
-        if str(_field(obj, "mode", "") or "") == "payment":
-            _grant_credit_checkout(obj, event, cfg, stripe)
+    if event_type in {
+        "checkout.session.completed", "checkout.session.async_payment_succeeded",
+        "checkout.session.async_payment_failed",
+    }:
+        mode = str(_field(obj, "mode", "") or "")
+        paid = str(_field(obj, "payment_status", "") or "") == "paid"
+        if event_type == "checkout.session.async_payment_failed":
+            return  # No unsettled value was granted; a later paid event may settle.
+        if mode == "payment":
+            if paid:
+                _grant_credit_checkout(obj, event, cfg, stripe)
+            return
+        if mode != "subscription":
             return
         metadata = _field(obj, "metadata") or {}
         email = _checkout_email(obj)
@@ -438,6 +457,17 @@ def _apply_event(store: AccountStore, event: Any) -> None:
         if customer_id:
             store.set_stripe_customer(email, customer_id)
         education = _is_edu(email)
+        if not paid:
+            # Bind the provider identity so a paid invoice can find this account.
+            # Neither completion nor an active subscription proves settlement.
+            if not getattr(account, "subscription_id", ""):
+                store.set_subscription(
+                    email, subscription_id=_subscription_id(obj),
+                    subscription_status="incomplete", is_edu=education,
+                )
+            return
+        if not _claim_checkout_settlement(obj, email, "subscription"):
+            return
         store.set_plan(email, plan)
         store.set_subscription(
             email,
@@ -446,12 +476,8 @@ def _apply_event(store: AccountStore, event: Any) -> None:
             price_id=_price_for_plan(cfg, plan, education),
             is_edu=education,
         )
-        store.set_status(
-            email,
-            "active",
-            decided_by="stripe",
-            notes=f"checkout.session.completed {event['id']}",
-        )
+        # Billing owns payment entitlements, not account approval or operator
+        # decision metadata. Even a paid checkout must not activate an account.
         log.info("entitlement upgraded: %s -> %s", account.email, plan)
         return
 
@@ -461,6 +487,14 @@ def _apply_event(store: AccountStore, event: Any) -> None:
             log.warning("subscription.updated for unknown customer — ignored")
             return
         status = str(_field(obj, "status", "") or "")
+        if status in {"active", "trialing"} and not (
+            getattr(account, "subscription_id", "") == str(_field(obj, "id", "") or "")
+            and (
+                getattr(account, "subscription_status", "") in {"active", "trialing"}
+                or (getattr(account, "paid_through", None) or 0) > time.time()
+            )
+        ):
+            status = "incomplete"
         price_id = _price_id(_subscription_line(obj, cfg) or {})
         store.set_subscription(
             account.email,
@@ -472,10 +506,6 @@ def _apply_event(store: AccountStore, event: Any) -> None:
         if status in _DOWNGRADE_STATUSES:
             _downgrade(account, f"subscription status {status}")
             return
-        if status in {"active", "trialing"}:
-            plan = _plan_from_subscription(obj, cfg)
-            if plan and plan != getattr(account, "plan", "trial"):
-                store.set_plan(account.email, plan)
         return
 
     if event_type == "customer.subscription.deleted":
@@ -696,7 +726,7 @@ async def stripe_webhook(request: Request) -> dict[str, str]:
     except stripe.error.SignatureVerificationError:
         log.warning("rejected Stripe webhook: bad signature")
         raise HTTPException(400, "invalid signature") from None
-    processed = _process_event_once(event)
+    processed = await deployment_drain.run_blocking(_process_event_once, event)
     return {"status": "processed" if processed else "duplicate"}
 
 

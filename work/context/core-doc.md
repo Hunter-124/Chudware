@@ -38,6 +38,20 @@ ownership and tessellation for the host's one AICM loader.
   history/provenance. Do not weaken regression assertions or fabricate parity results.
 - Document publication and save/open operations must preserve the user's active tab,
   live session and editable feature history; canonical dev guidance owns the details.
+- Dress-feature commit validates the final fillet/chamfer solid (B-rep, zero-area
+  faces and non-destructive self-intersection check). Failure keeps its preceding
+  body; changing this policy requires a STEP+ cache-engine epoch bump.
+- Atomic `doc_apply_ops` failures return `rejected_tree` alongside native
+  `feature_status` while the live tree/revision are restored. Diagnosis must use
+  that candidate, not look for the new failed feature in the restored tree.
+- Detached assembly cache validation hashes the persisted authored tree before
+  session-local absolute-path/name rewrites; engine/display/dependency checks remain.
+- Solid health checks SI in a proper rigid constituent-face frame, including nested
+  import wrappers. All relative geometry and world-space evidence remain intact;
+  scale/shear baked into geometry and genuinely folded skins are still checked.
+- Export tessellation resolves tangent-cusp boundary chords on native curves and
+  synchronizes located partner edges. STL checks actual serialized facet/edge
+  topology; no proximity welding or generic mesh healing is a valid substitute.
 
 ## Graphify starters
 - graphify query "doc_apply_ops document feature compiler"

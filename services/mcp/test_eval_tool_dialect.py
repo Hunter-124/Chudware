@@ -86,6 +86,138 @@ def empty() -> str:
 
 
 # --------------------------------------------------------------------------
+def test_animation_provenance_preserves_grouped_writer_identity():
+    """Reading build provenance must not turn a sibling worker into a foreign writer."""
+    from services.mcp import cad_animation_tools as anim
+    from services.mcp import daemon_bridge
+
+    owner = daemon_bridge.client()
+    doc_id = owner.call("doc_new", {"name": "animation_writer_identity"})["doc_id"]
+    worker = daemon_bridge.DaemonClient(writer_group=owner.writer_group)
+    outsider = daemon_bridge.DaemonClient(writer_group=owner.writer_group + "-outsider")
+    try:
+        worker.connect(spawn=False)
+        outsider.connect(spawn=False)
+        assert worker.call("attach_doc", {"doc_id": doc_id, "mode": "rw"})["ok"]
+        attached = outsider.call("attach_doc", {"doc_id": doc_id, "mode": "rw"})
+        assert attached["ok"]
+        assert "another writer" in attached["warning"]
+        first = owner.call("doc_apply_ops", {"doc_id": doc_id, "ops": PLATE[:1]})
+        assert first["revision"] == 1
+        assert "_foreign_edits" not in first
+
+        build_id, _source = anim._engine_build_id()
+        assert build_id
+        assert build_id == owner.call("daemon_status", {})["engine_build_id"]
+        second = worker.call("doc_apply_ops", {"doc_id": doc_id, "ops": PLATE[1:]})
+        assert second["revision"] == 2
+        assert "_foreign_edits" not in second
+        own_state = owner.call("doc_tree", {"doc_id": doc_id})
+        assert own_state["revision"] == 2
+        assert "_foreign_edits" not in own_state, own_state
+        assert len(own_state["tree"]["features"]) == 2
+
+        foreign_state = outsider.call("doc_tree", {"doc_id": doc_id})
+        assert foreign_state["_foreign_edits"][0]["revision"] == 2
+        edited = outsider.call("doc_apply_ops", {"doc_id": doc_id, "ops": [{
+            "op": "add_feature", "feature": {"type": "box", "name": "OtherWriter",
+                "params": {"length": 10, "width": 10, "height": 10}}}]})
+        assert edited["revision"] == 3
+        notified = owner.call("doc_tree", {"doc_id": doc_id})
+        assert notified["revision"] == 3
+        assert notified["_foreign_edits"][0]["doc_id"] == doc_id
+        assert notified["_foreign_edits"][0]["revision"] == 3
+        assert notified["_foreign_edits"][0]["method"] == "doc_apply_ops"
+    finally:
+        outsider.close()
+        worker.close()
+        owner.call("doc_close", {"doc_id": doc_id})
+
+
+def test_recovery_refreshes_remap_without_changing_grouped_writer_identity(monkeypatch):
+    """A real orphan recovery refreshes stale hello metadata and keeps worker ownership."""
+    import tempfile
+    import time
+    from pathlib import Path
+    from services.mcp import cad_animation_tools as anim
+    from services.mcp import cad_common
+    from services.mcp import daemon_bridge
+    from services.mcp import private_hostd
+
+    monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
+    monkeypatch.setenv("CHUDWARE_DOC_GC_GRACE_S", "1")
+    monkeypatch.setenv("CHUDWARE_DOC_GC_AGENT_GRACE_S", "1")
+    monkeypatch.setattr(cad_common, "_DOC_ALIASES", {})
+    monkeypatch.setattr(cad_common, "_CUR", {"doc_id": None})
+    # This daemon has its own short socket path, roots and PID. The package daemon
+    # and every document already held by module-scoped fixtures remain untouched.
+    with tempfile.TemporaryDirectory(prefix="cw-remap-", dir="/tmp") as directory:
+        scratch = Path(directory)
+        spawned = private_hostd.spawn_private_daemon(scratch)
+        assert spawned is not None, private_hostd.last_failure
+        process, socket_path, key = spawned
+        monkeypatch.setenv("CHUDWARE_HOSTD_SOCKET", socket_path)
+        monkeypatch.setenv("CHUDWARE_INSTANCE_KEY", key)
+        owner = daemon_bridge.DaemonClient(writer_group=daemon_bridge._WRITER_GROUP)
+        retired = daemon_bridge.DaemonClient(writer_group=key + "-retired")
+        worker = daemon_bridge.DaemonClient(writer_group=owner.writer_group)
+        monkeypatch.setattr(daemon_bridge, "client", lambda: owner)
+        try:
+            admission = owner.refresh_server_info()
+            assert admission["proto"] == 1
+            _early_build_id, early_source = anim._engine_build_id()
+            assert early_source.startswith("hostd "), early_source
+            assert owner.server_info is admission
+            retired.connect(spawn=False)
+            old_id = retired.call("doc_new", {"name": "fresh_recovery_remap"})["doc_id"]
+            assert retired.call("doc_apply_ops", {"doc_id": old_id, "ops": PLATE[:1]})[
+                "revision"] == 1
+            retired.close()
+            deadline = time.monotonic() + 10
+            entries = []
+            entry = None
+            while time.monotonic() < deadline:
+                entries = owner.call("recovery_list", {}).get("entries", [])
+                entry = next((row for row in entries if row.get("doc_id") == old_id), None)
+                if entry is not None:
+                    break
+                time.sleep(0.1)
+            assert entry is not None, entries
+            assert old_id not in owner.server_info.get("id_remap", {})
+            opened = owner.call("recovery_open", {"id": entry["id"]})["opened"]
+            new_id = next(row["doc_id"] for row in opened if row["original_doc_id"] == old_id)
+            assert old_id not in owner.server_info.get("id_remap", {})
+            worker.connect(spawn=False)
+            assert worker.call("attach_doc", {"doc_id": new_id, "mode": "rw"})["ok"]
+
+            recovered = cad_common._recover_via_daemon()
+
+            assert owner.server_info["id_remap"][old_id] == new_id
+            assert cad_common._DOC_ALIASES[old_id] == new_id
+            assert any(row["original_doc_id"] == old_id and row["doc_id"] == new_id
+                       and row["name"] == "fresh_recovery_remap" for row in recovered)
+            ready_build_id, ready_source = anim._engine_build_id()
+            assert ready_build_id == owner.call("daemon_status", {})["engine_build_id"]
+            assert ready_build_id
+            assert ready_source.startswith("hostd ")
+            before = owner.call("doc_tree", {"doc_id": new_id})
+            edited = worker.call("doc_apply_ops", {"doc_id": new_id, "ops": PLATE[1:]})
+            assert edited["revision"] == before["revision"] + 1
+            assert "_foreign_edits" not in edited, edited
+            after = owner.call("doc_tree", {"doc_id": new_id})
+            assert after["revision"] == edited["revision"]
+            assert "_foreign_edits" not in after, after
+            assert len(after["tree"]["features"]) == 2
+            doc = next(row for row in owner.call("doc_list", {})["docs"]
+                       if row["doc_id"] == new_id)
+            assert doc["origin_kind"] == "mcp"
+        finally:
+            worker.close()
+            retired.close()
+            owner.close()
+            private_hostd._stop(process, scratch)
+
+
 # query_geometry: the spellings a model actually writes
 # --------------------------------------------------------------------------
 
@@ -434,10 +566,10 @@ def test_check_feature_overlap_wraps_a_lone_feature_id(part):
 
 
 def test_measure_part_density_aliases(part):
-    steel = _call("measure_part", doc_id=part)
-    alu = _call("measure_part", density=2.7, doc_id=part)
-    assert alu["mass"]["mass_g"] < steel["mass"]["mass_g"]
-    assert "read as density_g_cm3=" in _notes(alu)
+    applied = _call("measure_part", doc_id=part)  # the part's own material (6061, 2.7)
+    steel = _call("measure_part", density=7.85, doc_id=part)
+    assert steel["mass"]["mass_g"] > applied["mass"]["mass_g"]
+    assert "read as density_g_cm3=" in _notes(steel)
 
 
 @pytest.mark.parametrize(("key", "value"), [
@@ -740,12 +872,13 @@ def test_measure_part_canonical_call_is_untouched(part):
     """The routing must not disturb the ordinary call or its density alias."""
     r, err = _dispatch("measure_part", doc_id=part)
     assert err is None and r["ok"] is True
-    steel = r["mass"]["mass_g"]
-    r2, err2 = _dispatch("measure_part", doc_id=part, density=2.70)
+    applied = r["mass"]["mass_g"]
+    applied_density = r["mass"]["material"]["density_g_cm3"]
+    r2, err2 = _dispatch("measure_part", doc_id=part, density=7.85)
     assert err2 is None and r2["ok"] is True
-    # Aluminium is lighter than steel for the same volume — proves density really applied.
-    assert r2["mass"]["mass_g"] < steel
-    assert r2["mass"]["mass_g"] == pytest.approx(steel * 2.70 / 7.85, rel=1e-6)
+    # The alias really drives the readout: mass scales with the density it names.
+    assert r2["mass"]["material"]["source"] == "explicit"
+    assert r2["mass"]["mass_g"] == pytest.approx(applied * 7.85 / applied_density, rel=1e-6)
 
 
 def test_measure_part_still_refuses_a_genuinely_unknown_argument(part):

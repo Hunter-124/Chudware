@@ -52,8 +52,10 @@ concurrency:
 jobs:
   build:
     name: ${{ matrix.label }}
-    # Product-private native runners; ARM follows these baseline checks.
-    runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", "${{ matrix.runner_label }}"]
+    # Manual branch builds and executable tests never share signing state.
+    runs-on:
+      group: chudware-untrusted-ephemeral
+      labels: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", "${{ matrix.runner_label }}"]
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
@@ -62,7 +64,7 @@ jobs:
           - label: Linux x86_64
             runner_os: Linux
             runner_arch: X64
-            runner_label: cc-linux-chudware
+            runner_label: cc-linux-disposable
             preset: linux-core
             test_mode: native
             arm_sdk: ''
@@ -74,7 +76,7 @@ jobs:
           - label: Windows x86_64
             runner_os: Windows
             runner_arch: X64
-            runner_label: cc-win-chudware
+            runner_label: cc-win-disposable
             # Exercise the shipping geometry paths (doc_view_metrics, sections,
             # drawing provenance); windows-core disables OCCT and misses them.
             preset: windows-occt
@@ -85,13 +87,9 @@ jobs:
             timeout_minutes: 180
             build_host: true
             host_build_dir: host/build-windows
-          # Ordinary configure/build/ctest: the private Chudware Mac TEST
-          # account on the Intel iMac (hidden ccci-chudware; no keychain,
-          # signing identity, sudo or GUI session). Its launchd daemon exports
-          # the per-product CMAKE_BUILD_PARALLEL_LEVEL/CTEST_PARALLEL_LEVEL caps
-          # that the cmake --build/ctest calls below inherit. Signed release
-          # packaging stays on the operator lanes (cc-mac-intel: release.yml,
-          # nightly-release.yml).
+          # The disposable native Mac image retains the private test-account
+          # identity and resource caps asserted below. It has its own OS disk,
+          # home, interpreter and tool cache, not the operator/signing host's.
           #
           # Core only. The macOS host GUI is not a phase-1 target: the macOS
           # presets build with CHUDWARE_ENABLE_CEF=OFF, and CEF's offscreen
@@ -101,7 +99,7 @@ jobs:
           - label: macOS x86_64
             runner_os: macOS
             runner_arch: X64
-            runner_label: cc-mac-chudware-intel
+            runner_label: cc-mac-disposable-intel
             ci_user: ccci-chudware
             preset: macos-x86_64
             test_mode: native
@@ -138,11 +136,9 @@ jobs:
           echo "runner=${RUNNER_NAME:-unknown} os=$RUNNER_OS arch=$RUNNER_ARCH host=$(hostname -s) user=$(id -un)"
           uname -a
 
-          # A row that names a private CI account must actually be running as
-          # it, natively (no Rosetta, no VM) on the architecture the row asked
-          # for, in its hidden 420-499 uid and 0700 home, with the lane
-          # identity and compiler caps its launchd daemon exports; an uncapped
-          # build would oversubscribe the shared Mac.
+          # Disposable Mac images retain the private account and native CPU
+          # architecture (no Rosetta), uid/home permissions and compiler caps.
+          # A VM is required isolation, not a reason to bypass these checks.
           if [ -n "${EXPECT_CI_USER}" ]; then
             if [ "$(id -un)" != "${EXPECT_CI_USER}" ] || [ "${CC_CI_PRODUCT:-}" != Chudware ] || [ "${CC_CI_LANE:-}" != test ]; then
               echo "::error::expected the private Chudware test account ${EXPECT_CI_USER} (CC_CI_PRODUCT=Chudware, CC_CI_LANE=test); got user=$(id -un) CC_CI_PRODUCT=${CC_CI_PRODUCT:-unset} CC_CI_LANE=${CC_CI_LANE:-unset}"
@@ -152,8 +148,8 @@ jobs:
               X64:x86_64 | ARM64:arm64) ;;
               *) echo "::error::runner arch ${RUNNER_ARCH} does not match the native machine $(uname -m)"; exit 1 ;;
             esac
-            if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" != 0 ] || [ "$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)" != 0 ]; then
-              echo "::error::the private test account must run natively on physical Mac hardware, never under Rosetta translation or in a virtual machine"
+            if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" != 0 ]; then
+              echo "::error::the disposable test image must use the native architecture, never Rosetta translation"
               exit 1
             fi
             ci_uid="$(id -u)"
@@ -280,14 +276,9 @@ jobs:
           Write-Host "runner=$env:RUNNER_NAME os=$env:RUNNER_OS arch=$env:RUNNER_ARCH host=$env:COMPUTERNAME"
           Write-Host "powershell=$($PSVersionTable.PSVersion)"
 
-          # The Windows runner service is its own non-administrator virtual
-          # account whose USERPROFILE is a private D:\ChudwareCI\Windows\profile.
-          # It cannot write Program Files, cannot edit the machine PATH, and
-          # cannot restart itself to pick a new one up, so runner-smoke's
-          # provisioning job installs ninja and Python into a profile-local
-          # directory and every Windows job puts that directory on PATH here.
-          # Done before the vswhere snapshot below so the dev-shell diff
-          # carries it into the build steps. See docs/reference/CI_RUNNERS.md.
+          # Image-owned tools in this disposable VM's non-admin profile, never
+          # mounted from the persistent packaging runner. Populate the qualified
+          # image offline; the runtime job only adds these paths to its own PATH.
           $tools = Join-Path $env:USERPROFILE 'chudware-ci-tools'
           foreach ($dir in @((Join-Path $tools 'bin'), (Join-Path $tools 'python'), (Join-Path $tools 'python\Scripts'))) {
             if (Test-Path $dir) {
@@ -407,11 +398,9 @@ jobs:
           # `git describe --tags`; a shallow clone without tags yields 0.0.0.
           fetch-depth: 0
 
-      # The cross rows' OCCT and its dependencies, built from pinned sources
-      # for the target architecture. Cached per runner account under its own
-      # RUNNER_TOOL_CACHE (never an operator Homebrew, another product's
-      # account or a shared prefix) and rebuilt only when the recipe changes.
-      # A cold build gets the row's arm_sdk_seconds; reuse takes seconds.
+      # Cross-row SDKs live in this VM's private RUNNER_TOOL_CACHE. A reviewed
+      # immutable image may seed the pinned SDK; writable caches never cross
+      # jobs or the signing boundary. Cold builds retain their bounded budget.
       - name: Build or reuse the ${{ matrix.arm_sdk }} SDK (POSIX, bounded)
         if: matrix.arm_sdk != '' && runner.os != 'Windows'
         shell: bash
@@ -866,21 +855,23 @@ jobs:
   arm:
     name: ${{ matrix.label }}
     needs: [build]
-    runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", "${{ matrix.runner_label }}"]
+    runs-on:
+      group: chudware-untrusted-ephemeral
+      labels: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", "${{ matrix.runner_label }}"]
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # These same-account cross builds start only after native baselines.
-          # The pinned, validated SDK lives in the account's RUNNER_TOOL_CACHE.
+          # Cross-builds start on a fresh disposable VM after native baselines.
+          # An immutable image SDK may seed this job's private tool cache.
           # A row's cold SDK, core build and (Linux) core suite share one hard
           # deadline, timeout_minutes less three: 237 minutes on Linux, 327 on
           # the Mac. Insufficient budget fails 124 instead of skipping tests.
           - label: Linux aarch64 (QEMU-emulated tests)
             runner_os: Linux
             runner_arch: X64
-            runner_label: cc-linux-chudware
+            runner_label: cc-linux-disposable
             preset: linux-aarch64-qemu
             test_mode: qemu
             arm_sdk: linux-aarch64
@@ -904,7 +895,7 @@ jobs:
           - label: macOS arm64 (cross-compiled, compile-only)
             runner_os: macOS
             runner_arch: X64
-            runner_label: cc-mac-chudware-intel
+            runner_label: cc-mac-disposable-intel
             ci_user: ccci-chudware
             preset: macos-arm64-cross
             test_mode: compile-only

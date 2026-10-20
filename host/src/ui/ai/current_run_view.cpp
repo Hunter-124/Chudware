@@ -9,6 +9,9 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "core/app_state.h"
+#ifdef __EMSCRIPTEN__
+#include "core/jobs.h"
+#endif
 #include "ui/copilot/copilot_internal.h"
 #include "ui/copilot/copilot.h"
 #include "ui/ai/agent_dag.h"
@@ -41,7 +44,7 @@ struct SubagentSession {
     std::string id, role, brief, status, statusNote, model, spawnKind;
     std::string createdTs, updatedTs;   // ISO-8601 UTC (registry created_ts / updated_ts)
     std::string modelOverride, providerOverride, effortOverride;
-    std::string ownerSession;           // registry session_id: the owning conversation id
+    std::string ownerSession;           // registry session_id (opaque cell handle on web)
     std::string parentNodeId;           // registry parent_node_id (spawning node, may be empty)
     int budgetTokens = 0, pendingSteers = 0, transcriptLen = 0;
     bool paused = false;
@@ -102,7 +105,24 @@ static void bindRegistry(SubChatState& cs, const SubagentSession& reg, const std
 }
 static void attachScope(const SubChatState& cs, nlohmann::json& p) {
     p["project_dir"] = cs.scopeProject;
+#ifdef __EMSCRIPTEN__
+    if (!cs.scopeSession.empty())
+        p["session_id"] = cellAgentSessionHandle(cs.scopeSession);
+#else
     if (!cs.scopeSession.empty()) p["session_id"] = cs.scopeSession;
+#endif
+}
+
+static std::string registryConversationId(const AppState& st, const std::string& session) {
+#ifdef __EMSCRIPTEN__
+    if (session.empty()) return {};
+    for (const auto& conversation : st.conversations)
+        if (cellAgentSessionHandle(conversation.id) == session) return conversation.id;
+    return {};
+#else
+    (void)st;
+    return session;
+#endif
 }
 
 // A trace step opened in the docked inspector. It takes the inspector over until the user goes
@@ -1092,18 +1112,19 @@ static void hubBuild(AppState& st) {
         if (s_sub.projectKey == s_hub.projectKey) {
             for (const auto& s : s_sub.sessions) {
                 if (s.id.empty()) continue;
-                if (s_hub.sessionOnly && s.ownerSession != s_hub.sessionId) continue;
-                const std::string key = hubKey(s.ownerSession, s.id);
+                const std::string ownerConv = registryConversationId(st, s.ownerSession);
+                if (s_hub.sessionOnly && ownerConv != s_hub.sessionId) continue;
+                const std::string key = hubKey(ownerConv.empty() ? s.ownerSession : ownerConv, s.id);
                 auto it = std::find_if(entries.begin(), entries.end(),
                                        [&key](const HubEntry& e) { return e.key == key; });
                 if (it != entries.end()) { it->hasReg = true; it->reg = s; continue; }
                 HubEntry e;
-                e.convId = s.ownerSession;
+                e.convId = ownerConv;
                 e.id = s.id;
                 e.key = key;
                 e.hasReg = true;
                 e.reg = s;
-                const Conversation* c = findConversation(st, s.ownerSession);
+                const Conversation* c = findConversation(st, ownerConv);
                 e.convTitle = s.ownerSession.empty() ? std::string("No owning session")
                     : c && convProjectKey(c->projectDir) == s_hub.projectKey ? sessionLabel(*c)
                     : std::string("Unlisted session");

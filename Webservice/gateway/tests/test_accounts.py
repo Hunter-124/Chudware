@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -110,6 +111,152 @@ def test_approve_deny_suspend_transitions(accounts_env):
         accounts.set_status("flow@example.com", "bogus")
 
 
+@pytest.mark.parametrize("status", ["suspended", "denied"])
+def test_status_revokes_dormant_sessions_before_reactivation(
+    accounts_env, monkeypatch, status
+):
+    import auth  # type: ignore
+    import authn  # type: ignore
+    import chat  # type: ignore
+    import db  # type: ignore
+    import limits  # type: ignore
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    accounts, config, _ = accounts_env
+    monkeypatch.setattr(config.settings, "dev_mode", False)
+    monkeypatch.setattr(config.settings, "session_secret", "test-status-revocation")
+    limits.login_by_email._hits.clear()
+    limits.login_by_ip._hits.clear()
+    email = "dormant@example.com"
+    password = "correct horse battery staple"
+    accounts.ensure_account(email)
+    authn.set_password(email, password, verified=True)
+    authn.start_trial(email)
+    accounts.ensure_account("unaffected@example.com")
+    authn.start_trial("unaffected@example.com")
+    unaffected = authn.create_session("unaffected@example.com")
+    revoked = []
+    monkeypatch.setattr(chat.hub, "revoke", revoked.append)
+
+    app = FastAPI()
+    app.add_middleware(auth.AuthMiddleware)
+    app.include_router(authn.router)
+    app.include_router(accounts.router)
+    with TestClient(app, base_url="https://testserver") as client:
+        assert client.post(
+            "/api/auth/login", json={"email": email, "password": password}
+        ).status_code == 200
+        dormant = client.cookies[authn.SESSION_COOKIE]
+        other = authn.create_session(email)
+        expired = authn.create_session(email, ttl=timedelta(seconds=-1))
+        already_revoked = authn.create_session(email)
+        authn.revoke_session(already_revoked)
+        with db.tx() as cur:
+            cur.execute(
+                "SELECT revoked_at FROM sessions WHERE sid = %s",
+                (authn.token_hash(already_revoked),),
+            )
+            original_revoked_at = cur.fetchone()["revoked_at"]
+
+        # No request or lookup while inactive: middleware cannot do the revoking.
+        accounts.set_status(
+            email.upper(), status, decided_by="operator@example.com", notes="blocked"
+        )
+        accounts.set_status(email, "active", decided_by="operator@example.com")
+        assert revoked == [email]
+        with db.tx() as cur:
+            cur.execute("SELECT sid, revoked_at FROM sessions WHERE email = %s", (email,))
+            rows = cur.fetchall()
+        assert len(rows) == 4
+        assert all(row["revoked_at"] is not None for row in rows)
+        assert next(
+            row["revoked_at"] for row in rows
+            if row["sid"] == authn.token_hash(already_revoked)
+        ) == original_revoked_at
+        for sid in (dormant, other, expired, already_revoked):
+            assert authn.lookup_session(sid) is None
+        assert authn.lookup_session(unaffected) == "unaffected@example.com"
+        assert client.get("/api/me/account").status_code == 401
+
+        assert client.post(
+            "/api/auth/login", json={"email": email, "password": password}
+        ).status_code == 200
+        fresh = client.cookies[authn.SESSION_COOKIE]
+        assert fresh not in (dormant, other, expired, already_revoked)
+        assert authn.lookup_session(fresh) == email
+        assert client.get("/api/me/account").status_code == 200
+
+
+@pytest.mark.parametrize("status", ["suspended", "denied"])
+def test_session_revocation_failure_rolls_back_status_decision(
+    accounts_env, monkeypatch, status
+):
+    import authn  # type: ignore
+    import chat  # type: ignore
+    import db  # type: ignore
+    import psycopg
+
+    accounts, _, _ = accounts_env
+    email = "rollback@example.com"
+    accounts.ensure_account(email)
+    before = accounts.set_status(
+        email, "active", decided_by="original@example.com", notes="original decision"
+    )
+    sid = authn.create_session(email)
+    revoked = []
+    monkeypatch.setattr(chat.hub, "revoke", revoked.append)
+    with db.tx() as cur:
+        cur.execute("""
+            CREATE FUNCTION reject_session_revocation() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'session revocation failed';
+            END;
+            $$
+        """)
+        cur.execute("""
+            CREATE TRIGGER reject_session_revocation BEFORE UPDATE ON sessions
+            FOR EACH ROW EXECUTE FUNCTION reject_session_revocation()
+        """)
+    with pytest.raises(psycopg.errors.RaiseException, match="session revocation failed"):
+        accounts.set_status(
+            email, status, decided_by="new@example.com", notes="must roll back"
+        )
+    assert accounts.get_account(email) == before
+    assert authn.lookup_session(sid) == email
+    assert revoked == []
+    with db.tx() as cur:
+        cur.execute("DROP TRIGGER reject_session_revocation ON sessions")
+        cur.execute("DROP FUNCTION reject_session_revocation()")
+    assert accounts.set_status(email, status).status == status
+    assert authn.lookup_session(sid) is None
+    assert revoked == [email]
+
+
+@pytest.mark.parametrize("status", ["suspended", "denied"])
+def test_enclosing_rollback_restores_status_and_sessions(accounts_env, status):
+    import authn  # type: ignore
+    import db  # type: ignore
+
+    accounts, _, _ = accounts_env
+    email = "outer-rollback@example.com"
+    accounts.ensure_account(email)
+    before = accounts.set_status(email, "active", decided_by="operator@example.com")
+    sid = authn.create_session(email)
+    with pytest.raises(RuntimeError, match="abort enclosing decision"):
+        with db.tx() as cur:
+            accounts.set_status(email, status, notes="rolled back")
+            cur.execute(
+                "SELECT revoked_at FROM sessions WHERE sid = %s",
+                (authn.token_hash(sid),),
+            )
+            assert cur.fetchone()["revoked_at"] is not None
+            raise RuntimeError("abort enclosing decision")
+    assert accounts.get_account(email) == before
+    assert authn.lookup_session(sid) == email
+
+
 def test_pending_count_and_listing(accounts_env):
     accounts, _, _ = accounts_env
     for i in range(5):
@@ -171,6 +318,7 @@ def test_admin_role_never_self_assigned(accounts_env):
     # anything that is not an active account to plain user.
     forged = accounts.Account(
         email="forged@example.com", display="", status="pending", plan="free",
+        uid="00000000-0000-4000-8000-000000000001",
         role="admin", created_at=0.0, decided_at=None, decided_by="",
         stripe_customer_id="", notes="",
     )

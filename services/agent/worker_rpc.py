@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
 from typing import Any
+from contextvars import copy_context
 
 from services.agent.online_turn import (
     activate_turn_env,
@@ -48,6 +49,9 @@ from services.agent.online_turn import (
     turn_budget_notice,
 )
 from services.agent.chudcode_host import get_default_chudcode_host
+from services.agent.request_context import (
+    control_delegate, current_context, in_cell, mint_handle, require_handle, scoped_key,
+)
 
 
 _LOG = logging.getLogger(__name__)
@@ -197,7 +201,9 @@ def _subscription_login(params: dict, _emit: Callable) -> dict:
                         "hint": result.get("hint"),
                     }
 
-        t = threading.Thread(target=_run, name=f"sub-login-{provider}", daemon=True)
+        context = copy_context()
+        t = threading.Thread(target=context.run, args=(_run,),
+                             name=f"sub-login-{provider}", daemon=True)
         t.start()
         return {"ok": True, "provider": provider, "in_progress": True}
     except Exception as exc:  # noqa: BLE001
@@ -324,6 +330,28 @@ def _as_list(value) -> list:
     return []
 
 
+def _cell_refusal(value: Any) -> dict[str, Any] | None:
+    """Preserve typed actor-boundary failures through RPC response adapters."""
+    if not in_cell():
+        return None
+    if isinstance(value, Mapping):
+        if value.get("ok") is not False:
+            return None
+        code = value.get("code") or value.get("reason")
+    elif isinstance(value, KeyError) and len(value.args) == 1:
+        code = value.args[0]
+    elif isinstance(value, Exception):
+        code = getattr(value, "code", None) or str(value)
+    else:
+        return None
+    if isinstance(code, str) and code in {
+        "not_found", "cell_refused", "forbidden_right", "revoked",
+        "credential_isolation_unsupported", "byok_credential_mismatch",
+    }:
+        return {"ok": False, "reason": code, "code": code}
+    return None
+
+
 def _online_manual_compaction_refusal(requested: str | None, configured: str) -> str | None:
     """Why an online manual compaction cannot honour the requested strategy, if it can't.
 
@@ -364,6 +392,9 @@ def _session_compact(params: dict, _emit: Callable) -> dict:
                 agent_config.online_compaction_settings()
             )
         except ValueError as exc:
+            refusal = _cell_refusal(exc)
+            if refusal is not None:
+                return refusal
             return {"ok": False, "reason": f"invalid_compaction_strategy: {exc}", "hint": ""}
         raw_requested = p.get("strategy")
         requested_strategy = (
@@ -436,6 +467,9 @@ def _session_compact(params: dict, _emit: Callable) -> dict:
                 out[key] = result[key]
         return out
     except Exception as exc:  # noqa: BLE001
+        refusal = _cell_refusal(exc)
+        if refusal is not None:
+            return refusal
         return {"ok": False, "reason": f"session_compact failed: {exc}", "hint": ""}
 
 
@@ -475,6 +509,9 @@ def _session_shake(params: dict, _emit: Callable) -> dict:
             "notice": result.get("notice") or "",
         }
     except Exception as exc:  # noqa: BLE001
+        refusal = _cell_refusal(exc)
+        if refusal is not None:
+            return refusal
         return {"ok": False, "reason": f"session_shake failed: {exc}", "hint": ""}
 
 
@@ -502,6 +539,9 @@ def _session_handoff(params: dict, _emit: Callable) -> dict:
         )
         return {"ok": True, "document": document or ""}
     except Exception as exc:  # noqa: BLE001
+        refusal = _cell_refusal(exc)
+        if refusal is not None:
+            return refusal
         return {"ok": False, "reason": f"session_handoff failed: {exc}", "hint": ""}
 
 
@@ -533,6 +573,9 @@ def _session_btw(params: dict, _emit: Callable) -> dict:
         )
         return {"ok": True, "answer": answer or ""}
     except Exception as exc:  # noqa: BLE001
+        refusal = _cell_refusal(exc)
+        if refusal is not None:
+            return refusal
         return {"ok": False, "reason": f"session_btw failed: {exc}", "hint": ""}
 
 
@@ -958,6 +1001,21 @@ _state_lock = threading.RLock()
 _active_proc: subprocess.Popen | None = None
 _active_thread: threading.Thread | None = None
 _bench_stopping = False
+
+
+def worker_activity() -> dict:
+    from services.worker_activity import registry_lock
+
+    with registry_lock(_state_lock):
+        thread = _active_thread
+        proc = _active_proc
+        running = proc is not None and proc.poll() is None
+        bench = int(running or (thread is not None
+                               and (thread.is_alive() or thread.ident is None)))
+    with registry_lock(_login_lock):
+        login = sum(bool(state.get("in_progress")) for state in _login_state.values())
+    return {"by_kind": {"bench": bench, "subscription_login": login},
+            "processes": [proc] if running else []}
 
 
 def _bench_pid_alive(pid: Any, cmd: Any) -> bool:
@@ -1575,13 +1633,12 @@ def _bench_run(params: dict, _emit: Callable) -> dict:
                     "exit_code": None,
                 }
             )
+            context = copy_context()
             t = threading.Thread(
-                target=_run_category_pipeline,
-                args=(
-                    category,
-                    cycle,
-                    modeling_mode if category == "modeling" else None,
-                ),
+                target=context.run,
+                args=(_run_category_pipeline,
+                      category, cycle,
+                      modeling_mode if category == "modeling" else None),
                 name=f"bench-cat-{category}",
                 daemon=True,
             )
@@ -1623,9 +1680,10 @@ def _bench_run(params: dict, _emit: Callable) -> dict:
             }
         )
 
+        context = copy_context()
         t = threading.Thread(
-            target=_run_pipeline,
-            args=(mode, tiers, cycle),
+            target=context.run,
+            args=(_run_pipeline, mode, tiers, cycle),
             name=f"bench-run-{mode}",
             daemon=True,
         )
@@ -1640,6 +1698,9 @@ def _bench_run(params: dict, _emit: Callable) -> dict:
             "cycle": cycle,
         }
     except Exception as exc:  # noqa: BLE001
+        with _state_lock:
+            if _active_thread is not None and _active_thread.ident is None:
+                _active_thread = None
         _write_status(
             {
                 "running": False,
@@ -1756,12 +1817,44 @@ def chudcode_agent_turn(params: dict, emit: Callable) -> dict:
                 "ok": False,
                 "reason": "Agent session host returned a non-object response",
             }
-        return result
+        return _cell_refusal(result) or result
     except Exception as exc:  # noqa: BLE001 - never cross the worker boundary
+        refusal = _cell_refusal(exc)
+        if refusal is not None:
+            return refusal
         return {
             "ok": False,
             "reason": f"Agent session host failed: {type(exc).__name__}: {exc}",
         }
+
+
+
+def _agent_handles_new(params: dict, _emit: Callable) -> dict:
+    if not in_cell():
+        return {"ok": False, "reason": "cell_refused", "code": "cell_refused"}
+    if not isinstance(params, dict) or set(params) - {"session_id"}:
+        return {"ok": False, "reason": "cell_refused", "code": "cell_refused"}
+    session_id = params.get("session_id")
+    try:
+        if session_id is not None:
+            require_handle(session_id, "session")
+        else:
+            session_id = mint_handle("session")
+        return {"ok": True, "session_id": session_id,
+                "run_id": mint_handle("run", session_id)}
+    except (KeyError, TypeError):
+        return {"ok": False, "reason": "not_found", "code": "not_found"}
+
+def _control_credentials(params: Mapping) -> dict:
+    if in_cell():
+        if any(key in params for key in ("api_key", "web_credential", "byok_key")):
+            raise ValueError("credential_isolation_unsupported")
+        # The authenticated actor lane and opaque handle authorize controls.
+        # Key deletion must never strand a running turn's cancel or answer.
+        return {}
+    return {"credential_params": params} if any(
+        key in params for key in ("web_actor", "web_credential", "byok_key")
+    ) else {}
 
 
 def chudcode_control(action: str, params: dict) -> dict:
@@ -1770,11 +1863,21 @@ def chudcode_control(action: str, params: dict) -> dict:
         return {"ok": False, "reason": "Agent control params must be an object"}
     command = str(action or "").strip().lower()
     try:
+        control_delegate("cancel" if command == "cancel" else command)
+        if in_cell():
+            if params.get("run_id"):
+                require_handle(params["run_id"], "run")
+            if params.get("session_id"):
+                require_handle(params["session_id"], "session")
         if command == "cancel":
-            return get_default_chudcode_host().cancel(params.get("run_id"))
+            return get_default_chudcode_host().cancel(params.get("run_id"), **_control_credentials(params))
         if command == "steer":
             return get_default_chudcode_host().steer(
-                params.get("run_id"), params.get("text"), params.get("attachments")
+                params.get("run_id"),
+                params.get("text"),
+                params.get("attachments"),
+                steer_id=params.get("steer_id"),
+                **_control_credentials(params),
             )
         if command == "answer":
             return get_default_chudcode_host().answer(
@@ -1782,16 +1885,29 @@ def chudcode_control(action: str, params: dict) -> dict:
                 params.get("batch_id"),
                 params.get("answers"),
                 declined=params.get("declined") is True,
+                **_control_credentials(params),
             )
         if command == "status":
             return get_default_chudcode_host().status(
-                run_id=params.get("run_id"), session_id=params.get("session_id")
+                run_id=params.get("run_id"), session_id=params.get("session_id"),
+                **_control_credentials(params),
             )
+        if command == "release":
+            return get_default_chudcode_host().release_session(params.get("session_id"), **_control_credentials(params))
         return {
             "ok": False,
             "reason": f"unsupported agent control action: {command}",
         }
     except Exception as exc:  # noqa: BLE001 - control is an RPC boundary
+        refusal = _cell_refusal(exc)
+        if refusal is not None:
+            return refusal
+        if isinstance(exc, KeyError) and str(exc).strip("'") == "not_found":
+            return {"ok": False, "reason": "not_found", "code": "not_found"}
+        if isinstance(exc, ValueError) and str(exc) in {
+                "cell_refused", "forbidden_right", "credential_isolation_unsupported",
+                "byok_credential_mismatch"}:
+            return {"ok": False, "reason": str(exc), "code": str(exc)}
         return {
             "ok": False,
             "reason": f"Agent {command or 'control'} failed: "
@@ -1812,6 +1928,8 @@ _SENSITIVE_RESPONSE_KEYS = frozenset(
         "accesstoken",
         "refreshtoken",
         "controltoken",
+        "providergrant",
+        "webprovidergrant",
         "secret",
         "password",
     }
@@ -1873,6 +1991,8 @@ def _bounded_text(value: Any, limit: int) -> str | None:
 
 
 def _has_unknown_params(params: Mapping[str, Any], allowed: frozenset[str]) -> bool:
+    if in_cell():
+        allowed = allowed | {"_chudware_actor", "provider", "model"}
     return bool(set(params) - allowed)
 
 
@@ -1904,6 +2024,9 @@ def _chudcode_transient_call(
         clean.setdefault("ok", True)
         return clean
     except Exception as exc:  # noqa: BLE001 - worker methods return clean refusals
+        refusal = _cell_refusal(exc)
+        if refusal is not None:
+            return refusal
         detail = type(exc).__name__ if secret_input else f"{type(exc).__name__}: {exc}"
         return {"ok": False, "reason": f"Agent service {command} failed: {detail}"}
 
@@ -1922,8 +2045,11 @@ def _chudcode_memory_call(command: str, params: dict, _emit: Callable) -> dict:
         if not isinstance(result, dict):
             return {"ok": False, "reason": f"Agent service {command} returned non-object"}
         result.setdefault("ok", True)
-        return result
+        return _cell_refusal(result) or result
     except Exception as exc:  # noqa: BLE001 - Settings must get a clean refusal
+        refusal = _cell_refusal(exc)
+        if refusal is not None:
+            return refusal
         return {
             "ok": False,
             "reason": f"Agent service {command} failed: {type(exc).__name__}: {exc}",
@@ -2202,19 +2328,40 @@ def _sanitize_model(item: Any) -> dict[str, Any] | None:
 
 
 def _chudcode_models_list(params: dict, _emit: Callable) -> dict:
-    unknown = set(params) - {"providerId"}
+    unknown = set(params) - ({"providerId", "_provider_catalog"} if in_cell() else {"providerId"})
     if unknown:
         return {"ok": False, "reason": "chudcode_models_list has unknown params"}
     provider_id = _bounded_text(params.get("providerId"), 128)
-    # Chudcode's get_available_models reads an in-memory registry. Re-querying that
-    # process cannot discover a newly released model; the host refreshes Chudcode's
-    # own on-disk catalog off-lane and replaces only the idle service process.
     host = get_default_chudcode_host()
-    try:
-        refreshing = host.refresh_catalog_if_stale()
-    except Exception:  # noqa: BLE001 - discovery must not hide the last good catalog
-        refreshing = False
-    raw = _chudcode_transient_call("get_available_models", {})
+    if in_cell():
+        catalog = params.get("_provider_catalog")
+        allowed = {"anthropic", "openai", "xai", "openrouter", "gemini"}
+        if not isinstance(catalog, dict) or set(catalog) - allowed:
+            return {"ok": False, "reason": "credential_isolation_unsupported"}
+        rows = []
+        for provider, grant in catalog.items():
+            native_provider = "google" if provider == "gemini" else provider
+            if provider_id is not None and provider_id != native_provider:
+                continue
+            try:
+                scoped = host.cell_catalog_models({
+                    "web_actor": True, "web_key_source": "byok",
+                    "web_tenant": current_context()["actor_key"],
+                    "web_provider": provider, "web_provider_grant": grant,
+                })
+            except Exception as exc:
+                return _cell_refusal(exc) or {
+                    "ok": False, "reason": f"Agent catalog discovery failed: {type(exc).__name__}"}
+            rows.extend(item for item in scoped["models"]
+                        if isinstance(item, dict) and item.get("provider") == native_provider)
+        raw, refreshing = {"ok": True, "models": rows}, False
+    else:
+        # Desktop discovery refreshes the runtime-owned registry off-lane.
+        try:
+            refreshing = host.refresh_catalog_if_stale()
+        except Exception:  # noqa: BLE001 - discovery must not hide the last good catalog
+            refreshing = False
+        raw = _chudcode_transient_call("get_available_models", {})
     if not raw.get("ok"):
         return raw
     models: list[dict[str, Any]] = []
@@ -2238,8 +2385,12 @@ def _chudcode_session_call(
     if session_id is None:
         return {"ok": False, "reason": "session_not_live"}
     try:
-        return get_default_chudcode_host().session_call(session_id, command, payload)
+        result = get_default_chudcode_host().session_call(session_id, command, payload)
+        return _cell_refusal(result) or result
     except Exception as exc:  # noqa: BLE001 - worker boundary
+        refusal = _cell_refusal(exc)
+        if refusal is not None:
+            return refusal
         return {
             "ok": False,
             "reason": f"Agent service {command} failed: {type(exc).__name__}: {exc}",
@@ -2265,6 +2416,9 @@ def _chudcode_export_session(params: dict, _emit: Callable) -> dict:
                 "reason": "Agent service export_session returned non-object",
             }
         if not raw.get("ok"):
+            refusal = _cell_refusal(raw)
+            if refusal is not None:
+                return refusal
             return {
                 "ok": False,
                 "reason": _bounded_text(raw.get("reason"), 4_096)
@@ -2278,6 +2432,9 @@ def _chudcode_export_session(params: dict, _emit: Callable) -> dict:
             }
         return {"ok": True, "path": path}
     except Exception as exc:  # noqa: BLE001 - worker boundary
+        refusal = _cell_refusal(exc)
+        if refusal is not None:
+            return refusal
         return {
             "ok": False,
             "reason": f"Agent service export_session failed: {type(exc).__name__}",
@@ -2301,11 +2458,16 @@ def _chudcode_branch_session(params: dict, _emit: Callable) -> dict:
                 "reason": "Agent service branch_session returned non-object",
             }
         if not raw.get("ok"):
+            refusal = _cell_refusal(raw)
+            if refusal is not None:
+                return refusal
             return {
                 "ok": False,
                 "reason": _bounded_text(raw.get("reason"), 4_096)
                 or "Agent service branch_session failed",
             }
+        if in_cell():
+            return {"ok": True, "chudcode_session_id": session_id}
         child_id = _bounded_text(raw.get("chudcode_session_id"), 256)
         child_file = _bounded_text(raw.get("chudcode_session_file"), 4_096)
         if child_id is None or child_file is None:
@@ -2319,6 +2481,9 @@ def _chudcode_branch_session(params: dict, _emit: Callable) -> dict:
             "chudcode_session_file": child_file,
         }
     except Exception as exc:  # noqa: BLE001 - worker boundary
+        refusal = _cell_refusal(exc)
+        if refusal is not None:
+            return refusal
         return {
             "ok": False,
             "reason": f"Agent service branch_session failed: {type(exc).__name__}",
@@ -2341,6 +2506,8 @@ def _chudcode_rewind_session(params: dict, _emit: Callable) -> dict:
     if type(occurrence) is not int or not 0 <= occurrence <= 100_000:
         return {"ok": False, "reason": "occurrence must be a nonnegative integer"}
     resume = {}
+    if in_cell() and any(key in params for key in ("session_file", "workspace_dir")):
+        return {"ok": False, "reason": "cell_refused", "code": "cell_refused"}
     for key in ("session_file", "workspace_dir"):
         if key in params:
             value = _bounded_text(params[key], 4_096)
@@ -2354,11 +2521,16 @@ def _chudcode_rewind_session(params: dict, _emit: Callable) -> dict:
         if not isinstance(raw, Mapping):
             return {"ok": False, "reason": "Agent service rewind returned non-object"}
         if not raw.get("ok"):
+            refusal = _cell_refusal(raw)
+            if refusal is not None:
+                return refusal
             return {
                 "ok": False,
                 "reason": _bounded_text(raw.get("reason"), 4_096)
                 or "Agent service rewind failed",
             }
+        if in_cell():
+            return {"ok": True, "chudcode_session_id": session_id}
         child_id = _bounded_text(raw.get("chudcode_session_id"), 256)
         child_file = _bounded_text(raw.get("chudcode_session_file"), 4_096)
         if child_id is None or child_file is None:
@@ -2369,6 +2541,9 @@ def _chudcode_rewind_session(params: dict, _emit: Callable) -> dict:
             "chudcode_session_file": child_file,
         }
     except Exception as exc:  # noqa: BLE001 - worker boundary
+        refusal = _cell_refusal(exc)
+        if refusal is not None:
+            return refusal
         return {"ok": False, "reason": f"Agent service rewind failed: {type(exc).__name__}"}
 
 
@@ -2390,6 +2565,9 @@ def _chudcode_repair_session(params: dict, _emit: Callable) -> dict:
             }
         clean = _redact_sensitive_response(raw)
         if not clean.get("ok"):
+            refusal = _cell_refusal(clean)
+            if refusal is not None:
+                return refusal
             return {
                 "ok": False,
                 "reason": _bounded_text(clean.get("reason"), 4_096)
@@ -2409,8 +2587,14 @@ def _chudcode_repair_session(params: dict, _emit: Callable) -> dict:
             "chudcode_session_id",
             "chudcode_session_file",
         }
+        if in_cell():
+            clean["chudcode_session_id"] = session_id
+            allowed -= {"backup_path", "chudcode_session_file"}
         return {str(key): value for key, value in clean.items() if key in allowed}
     except Exception as exc:  # noqa: BLE001 - worker boundary
+        refusal = _cell_refusal(exc)
+        if refusal is not None:
+            return refusal
         return {
             "ok": False,
             "reason": f"Agent service repair_session failed: {type(exc).__name__}",
@@ -2424,11 +2608,24 @@ def _chudcode_close_session(params: dict, _emit: Callable) -> dict:
     if session_id is None:
         return {"ok": False, "reason": "session_id is required"}
     try:
-        get_default_chudcode_host().close_session(session_id)
+        if in_cell():
+            require_handle(session_id, "session")
+        result = get_default_chudcode_host().close_session(session_id, **_control_credentials(params))
+        if isinstance(result, dict) and result.get("ok") is False:
+            return _cell_refusal(result) or result
         with _HISTORY_SEED_LOCK:
-            _HISTORY_SEEDED_SESSIONS.discard(session_id)
+            _HISTORY_SEEDED_SESSIONS.discard(scoped_key(session_id))
         return {"ok": True}
     except Exception as exc:  # noqa: BLE001 - worker boundary
+        refusal = _cell_refusal(exc)
+        if refusal is not None:
+            return refusal
+        if isinstance(exc, KeyError) and exc.args == ("not_found",):
+            return {"ok": False, "reason": "not_found", "code": "not_found"}
+        if isinstance(exc, ValueError) and str(exc) in {
+                "cell_refused", "credential_isolation_unsupported",
+                "byok_credential_mismatch"}:
+            return {"ok": False, "reason": str(exc), "code": str(exc)}
         return {
             "ok": False,
             "reason": f"Agent service close_session failed: {type(exc).__name__}",
@@ -2543,6 +2740,9 @@ def _chudcode_tool_state(params: dict, _emit: Callable) -> dict:
 
 
 def _chudcode_stt_failure(raw: Mapping[str, Any], command: str) -> dict:
+    refusal = _cell_refusal(raw)
+    if refusal is not None:
+        return refusal
     reason = _bounded_text(raw.get("reason") or raw.get("error"), 4_096)
     return {
         "ok": False,
@@ -2684,9 +2884,10 @@ def _claim_history_seed(
 ) -> tuple[str, bool]:
     """Reserve the first migration attempt; caller releases it on failure."""
     with _HISTORY_SEED_LOCK:
-        if session_id in _HISTORY_SEEDED_SESSIONS:
+        key = scoped_key(session_id)
+        if key in _HISTORY_SEEDED_SESSIONS:
             return "", False
-        _HISTORY_SEEDED_SESSIONS.add(session_id)
+        _HISTORY_SEEDED_SESSIONS.add(key)
     return ("" if resumed else _bounded_history_seed(raw_history)), True
 
 
@@ -3257,6 +3458,20 @@ def _clear_chudware_run_credentials(config_module: Any) -> None:
 
 def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     """Run the ordinary online lane exclusively through persistent Chudcode RPC."""
+    from services.mcp.daemon_bridge import TurnConnections, turn_connection_scope
+
+    # Preflight context reads and the final save sweep run on the persistent
+    # worker's request thread, not a host-tool thread. Give those CAD calls an
+    # explicit request owner too; its sockets must not outlive this turn.
+    connections = TurnConnections()
+    try:
+        with turn_connection_scope(connections):
+            return _run_agent_admin_turn(params, _emit)
+    finally:
+        connections.close()
+
+
+def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
     raw_params = params if isinstance(params, dict) else {}
     request = raw_params.get("request")
     if not isinstance(request, str) or not request.strip():
@@ -3269,6 +3484,12 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     role = param_str("role") or "general_agent"
     run_id = param_str("run_id") or f"admin-{time.time_ns():x}"
     session_id = param_str("session_id") or "default"
+    if in_cell():
+        try:
+            require_handle(session_id, "session")
+            require_handle(run_id, "run", session_id)
+        except (KeyError, TypeError):
+            return {"ok": False, "reason": "not_found", "code": "not_found"}
     try:
         from services.agent.roles import RoleError, load_role
     except ImportError as exc:
@@ -3302,6 +3523,14 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         _clear_chudware_run_credentials(agent_config)
         return {"ok": False, "reason": reason, **extra}
     raw_actor = raw_params.get("_chudware_actor")
+    if in_cell():
+        if any(key in raw_params for key in ("api_key", "web_credential", "byok_key",
+                                             "web_provider_grant")):
+            return refuse_before_run("credential_isolation_unsupported",
+                                     code="credential_isolation_unsupported")
+        if not isinstance(raw_actor, dict) or raw_actor.get("key_source") != "byok":
+            return refuse_before_run("credential_isolation_unsupported",
+                                     code="credential_isolation_unsupported")
     if raw_actor is None:
         credit_actor = None
     else:
@@ -3322,12 +3551,26 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     from services.agent.role_models import resolve_role_model
 
     byok_key = raw_params.get("api_key")
-    if credit_actor is not None and credit_actor.key_source == "byok":
+    if not in_cell() and credit_actor is not None and credit_actor.key_source == "byok":
         if not isinstance(byok_key, str) or not byok_key.strip():
             return refuse_before_run("BYOK provider credential unavailable")
     web_credential = None
     web_provider = ""
-    if credit_actor is not None:
+    web_provider_grant = None
+    if in_cell():
+        from services.agent.chudcode_host import _CELL_PROVIDER_BASES, _cell_provider_grant
+        web_provider = param_str("provider").lower()
+        if web_provider not in _CELL_PROVIDER_BASES:
+            return refuse_before_run("byok_unsupported_online")
+        if not param_str("model"):
+            return refuse_before_run("web_model_required")
+        try:
+            web_provider_grant = _cell_provider_grant({
+                "web_provider_grant": raw_params.get("provider_grant"),
+            })
+        except ValueError as exc:
+            return refuse_before_run(str(exc), code=str(exc))
+    elif credit_actor is not None:
         source = credit_actor.key_source
         if source == "subscription":
             grant = raw_actor.get("_subscription")
@@ -3383,13 +3626,15 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     attachments = None
     raw_attachments = raw_params.get("attachments")
     if isinstance(raw_attachments, list):
+        if len(raw_attachments) > _ATTACH_MAX:
+            return refuse_before_run("attachment_count_exceeded")
         attachments = [
             dict(item) for item in raw_attachments if isinstance(item, Mapping)
-        ][:_ATTACH_MAX] or None
+        ] or None
 
     resumed_session = bool(param_str("chudcode_session_file"))
     with _HISTORY_SEED_LOCK:
-        history_already_seeded = session_id in _HISTORY_SEEDED_SESSIONS
+        history_already_seeded = scoped_key(session_id) in _HISTORY_SEEDED_SESSIONS
     migration_candidate = (
         "" if resumed_session or history_already_seeded
         else _bounded_history_seed(raw_params.get("history"))
@@ -3398,6 +3643,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     options.update({"mode": turn_preferences.mode,
                     "advisor": turn_preferences.advisor,
                     "max_subagent_depth": turn_preferences.delegation_depth})
+    options["session_id"] = session_id
     for key in ("mode", "plan_only", "advisor", "autonomy"):
         if key in raw_params:
             options[key] = raw_params[key]
@@ -3518,6 +3764,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         "doc_id": raw_params.get("doc_id"),
         "workspace_dir": project_root,
         "project_dir": project_root,
+        "save_dir": save_dir,
         "options": options,
         "mode": options["mode"],
         "plan_only": options.get("plan_only"),
@@ -3566,10 +3813,13 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         host_params.update(
             web_actor=True,
             web_key_source=credit_actor.key_source,
-            web_credential=web_credential,
             web_provider=web_provider,
-            web_tenant=credit_actor.email,
+            web_tenant=current_context()["actor_key"] if in_cell() else credit_actor.email,
         )
+        if in_cell():
+            host_params["web_provider_grant"] = web_provider_grant
+        else:
+            host_params["web_credential"] = web_credential
     elif byok_key is not None:
         host_params.update(
             byok_key=byok_key,
@@ -3600,6 +3850,9 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         host_params["interactive_questions"] = True
     if budget_s is not None:
         host_params["timeout"] = budget_s
+    if in_cell():
+        for key in ("chudcode_session_dir", "chudcode_session_file", "sessions_dir"):
+            host_params.pop(key, None)
 
     event_context = {
         "run_id": run_id,
@@ -3618,6 +3871,13 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
                 dict(payload) if isinstance(payload, Mapping) else {"payload": payload}
             )
             data["kind"] = kind
+            if in_cell():
+                data.pop("chudcode_session_file", None)
+                if "chudcode_session_id" in data:
+                    data["chudcode_session_id"] = session_id
+                if (kind == "run_finished" and raw.get("reason") == "manager_stop"
+                        and isinstance(raw.get("control_delegate"), Mapping)):
+                    data["control_delegate"] = dict(raw["control_delegate"])
             if kind == "agent.provider_usage":
                 token_usage.record_usage(
                     provider=str(data.get("provider") or ""),
@@ -3637,7 +3897,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     except Exception as exc:  # noqa: BLE001
         if claimed_history_seed:
             with _HISTORY_SEED_LOCK:
-                _HISTORY_SEEDED_SESSIONS.discard(session_id)
+                _HISTORY_SEEDED_SESSIONS.discard(scoped_key(session_id))
         return {
             "ok": False,
             "reason": f"agent_admin_turn: workspace activation failed: "
@@ -3648,7 +3908,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         from services.agent import subagent_registry
 
         sessions_dir = param_str("sessions_dir")
-        if sessions_dir and session_id:
+        if sessions_dir and session_id and not in_cell():
             subagent_registry.bind_session(
                 session_id, str(Path(sessions_dir) / f"{session_id}.subagents")
             )
@@ -3716,7 +3976,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
                 "completed actions.", "", turn_budget_notice(remaining, readonly=readonly_turn))
             host_result = chudcode_agent_turn(host_params, raw_emit)
         if not host_result.get("ok"):
-            response = {
+            response = _cell_refusal(host_result) or {
                 "ok": False,
                 "reason": str(host_result.get("reason") or "Agent turn failed"),
             }
@@ -3740,9 +4000,15 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
                 "terminal": host_result.get("terminal"),
                 "cancelled": cancelled,
             }
+            if in_cell():
+                turn.pop("chudcode_session_file", None)
+                turn["chudcode_session_id"] = session_id
+                if host_result.get("stop_reason") == "manager_stop":
+                    turn["stop_reason"] = "manager_stop"
+                    turn["control_delegate"] = dict(host_result["control_delegate"])
             response = {"ok": True, "turn": turn}
     except Exception as exc:  # noqa: BLE001 - crash path still persists documents
-        response = {
+        response = _cell_refusal(exc) or {
             "ok": False,
             "reason": f"agent_admin_turn failed: {type(exc).__name__}: {exc}",
         }
@@ -3817,12 +4083,13 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             not response.get("ok") or response.get("turn", {}).get("cancelled")
         ):
             with _HISTORY_SEED_LOCK:
-                _HISTORY_SEEDED_SESSIONS.discard(session_id)
+                _HISTORY_SEEDED_SESSIONS.discard(scoped_key(session_id))
 
     return response
 
 
 ADMIN_METHODS: dict[str, Callable] = {
+    "agent_handles_new": _agent_handles_new,
     "agent_admin_turn": _agent_admin_turn,
     "agent_cancel": _agent_cancel,
     "agent_steer": _agent_steer,

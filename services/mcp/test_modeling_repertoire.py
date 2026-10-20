@@ -315,22 +315,18 @@ def test_a_bolt_circle_lands_its_holes_on_the_pitch_circle():
         assert math.hypot(cx, cy) == pytest.approx(30.0, abs=1e-2), m
 
 
-def test_mass_requires_explicit_analysis_material_even_when_document_has_one():
-    """Stored document material does not silently choose an analysis density.
-
-    set_material now records engineering identity for drawings/project metadata, but
-    measure_part remains explicit and deterministic: its material/density argument owns
-    the mass calculation and an explicit density wins over a name.
-    """
+def test_mass_uses_the_material_applied_to_the_model_unless_one_is_passed():
+    """The applied material sets mass; a passed name or density overrides it for the readout."""
     doc = _new("rep_material")
     _apply(doc, {"type": "box", "name": "Bar",
                  "params": {"length": 120, "width": 20, "height": 10}})  # 24 cm^3
-    _call("set_material", doc_id=doc, material="aluminum")
-    steel = _call("measure_part", doc_id=doc)["mass"]
-    assert steel["mass_g"] == pytest.approx(24.0 * 7.85, rel=1e-3), steel
+    _call("set_material", doc_id=doc, material="PLA")
+    pla = _call("measure_part", doc_id=doc)["mass"]
+    assert pla["material"]["source"] == "document_material", pla
+    assert pla["mass_g"] == pytest.approx(24.0 * 1.24, rel=1e-3), pla
 
     alu = _call("measure_part", doc_id=doc, material="aluminum")["mass"]
-    assert alu["material"]["density_g_cm3"] == pytest.approx(2.7, rel=1e-2), alu
+    assert alu["material"]["source"] == "explicit", alu
     assert alu["mass_g"] == pytest.approx(24.0 * 2.7, rel=1e-2), alu
 
     # An explicit number still beats a name.

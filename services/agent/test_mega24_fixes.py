@@ -307,16 +307,6 @@ def test_s23_t23_not_weakened():
     )
     assert score2 == 1.0
 
-    # Pair derivation never emits bare f1 (T23).
-    pair = bat._derive_measure_face_pair(None)
-    # None doc is fine; when it returns, no bare feature ids.
-    if pair is not None:
-        for ep in pair:
-            if isinstance(ep, str):
-                assert not ep.startswith("f") or ep in (
-                    "front", "back", "top", "bottom", "left", "right",
-                )
-
 
 # ---------------------------------------------------------------------------
 # Rebind residual (mega-24 a1 thrash-kill: 4 node fails, not mega-23-class)

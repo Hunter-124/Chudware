@@ -291,7 +291,7 @@ def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
 def _communicate_bounded(
     process: subprocess.Popen[bytes],
     *,
-    timeout_s: float,
+    timeout_s: float | None,
     limit: int,
 ) -> tuple[bytes, bytes]:
     if process.stdout is None or process.stderr is None:
@@ -301,11 +301,11 @@ def _communicate_bounded(
     for stream in streams:
         os.set_blocking(stream.fileno(), False)
         selector.register(stream, selectors.EVENT_READ)
-    deadline = time.monotonic() + timeout_s
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
     try:
         while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
                 raise _ProcessLimitError(
                     "slicer_timeout",
                     "The slicer exceeded its wall-clock time limit.",
@@ -327,7 +327,16 @@ def _communicate_bounded(
                         f"The slicer exceeded the {limit} byte {name} limit.",
                     )
                 target.extend(chunk)
-        process.wait()
+        # EOF is not process exit. Keep the original operation deadline while
+        # waiting for a child that has closed both pipes but is still running.
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        try:
+            process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            raise _ProcessLimitError(
+                "slicer_timeout",
+                "The slicer exceeded its wall-clock time limit.",
+            ) from exc
         return bytes(streams[process.stdout]), bytes(streams[process.stderr])
     except _ProcessLimitError:
         _stop_process_group(process)

@@ -11,25 +11,27 @@ that keep removable print media unambiguous:
     publishes, and a whole-drive ``inventory_token`` that is independent of pagination.
 
 ``publish_print_media``
-    Replaces a project's COMPLETE print set as one revision under ``PRINT/<PROJECT>/``.
-    Every file is named ``R<rrr><pp>_<PART>.<ext>`` so its first six characters (which
-    survive FAT 8.3 short-name truncation) identify release and part. Sources must be
-    ``print_ready`` slice_part packets whose G-code hashes match their manifest. The
-    previous managed revision (hash-verified) and caller-reviewed ``retire_paths`` are
-    archived into a non-printable ZIP and verified BEFORE anything leaves the printer's
-    view; new files are staged with a non-printable suffix and read back. A transaction
-    journal makes every swap reversible: controlled failures roll back in-process, and an
-    interrupted publish is reported by inventory and recovered (explicitly) by the next
-    publish. Unrecognized files are never touched.
+    Replaces a project's COMPLETE print set at the drive root by default, or in one
+    top-level project folder with ``layout="project"``. Stable lower-case part names
+    identify jobs; revision numbers remain in metadata. Sources must be
+    ``print_ready`` slice_part packets whose G-code hashes match their manifest; a job
+    that is not print_ready publishes only with a ``user_override`` (the user's explicit
+    instruction), recorded with its failed checks in the metadata, README and result. The
+    previous managed revision (hash-verified) and caller-reviewed ``retire_paths`` move
+    to non-printable temporary staging while new files are staged and read back. A
+    transaction journal makes every swap reversible until the complete new set and its
+    metadata verify. Committing permanently deletes retired bytes and recognized old
+    archives for this project. Interrupted publishes are reported by inventory and
+    recovered by the next publish. Unrecognized files are never touched.
 
 Layout on the drive::
 
-    PRINT/<PROJECT>/R00201_UPPER_ARM.gcode     current printable jobs
-    PRINT/<PROJECT>/chudware_manifest.json     managed sidecar manifest
-    PRINT/<PROJECT>/README.txt                 human-readable mapping
-    CHUDWARE/ARCHIVE/<PROJECT>/<PROJECT>_RETIRED_BY_R002.zip   retired toolpaths
-    CHUDWARE/JOURNAL.json                      present only while a publish is pending
-    CHUDWARE/.staging/<txn>/*.part             transient, never printable, never in tokens
+    upper_arm.gcode                           current printable job (default)
+    <PROJECT>/upper_arm.gcode                 optional project layout
+    .chudware_<PROJECT>_manifest.json          managed manifest
+    .chudware_<PROJECT>_README.txt             human-readable mapping
+    .chudware_JOURNAL.json                    pending transaction only
+    .chudware_staging_<txn>/*.part             temporary, removed after publishing
 
 Public functions return ``{"ok": True, ...}`` or ``{"ok": False, "error": code,
 "message": ...}``; they never raise.
@@ -48,13 +50,12 @@ import shutil
 import stat
 import time
 import uuid
-import zipfile
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
 try:  # POSIX (Linux/macOS): the drive lock is an flock on the mount root directory itself.
     import fcntl
-except ImportError:  # Windows: msvcrt byte-range lock on CHUDWARE/.lock (token-excluded)
+except ImportError:  # Windows: msvcrt byte-range lock on a hidden root file (token-excluded)
     fcntl = None  # type: ignore[assignment]
 try:
     import msvcrt
@@ -69,10 +70,13 @@ SCHEMA_INVENTORY_TOKEN = "chudware.print_media_inventory/1"
 PRINTABLE_SUFFIXES = frozenset({".gcode", ".gco", ".g", ".bgcode"})
 PRINT_DIR = "PRINT"
 META_DIR = "CHUDWARE"
-STAGING_DIR = f"{META_DIR}/.staging"
-LOCK_FILE = f"{META_DIR}/.lock"
-JOURNAL_PATH = f"{META_DIR}/JOURNAL.json"
-ARCHIVE_DIR = f"{META_DIR}/ARCHIVE"
+STAGING_DIR = ".chudware_staging"
+LOCK_FILE = ".chudware_lock"
+JOURNAL_PATH = ".chudware_JOURNAL.json"
+LEGACY_STAGING_DIR = f"{META_DIR}/.staging"
+LEGACY_LOCK_FILE = f"{META_DIR}/.lock"
+LEGACY_JOURNAL_PATH = f"{META_DIR}/JOURNAL.json"
+ARCHIVE_DIR = f"{META_DIR}/ARCHIVE"  # legacy reads and migration only
 MANIFEST_NAME = "chudware_manifest.json"
 README_NAME = "README.txt"
 STAGED_SUFFIX = ".part"
@@ -95,8 +99,9 @@ _RESERVED_NAMES = frozenset(
     | {f"COM{i}" for i in range(1, 10)}
     | {f"LPT{i}" for i in range(1, 10)}
 )
-_JOB_KEYS = frozenset({"part_id", "manifest_path", "gcode_path"})
+_JOB_KEYS = frozenset({"part_id", "manifest_path", "gcode_path", "user_override"})
 _EVIDENCE_KEYS = ("slicer_warnings", "gcode_check", "printability")
+_OVERRIDE_MAX = 500
 
 
 class _Refusal(Exception):
@@ -170,6 +175,8 @@ def _move(src: Path, dst: Path) -> None:
     """Same-filesystem rename; the only primitive that changes what the printer sees."""
     os.replace(src, dst)
     _fsync_dir(dst.parent)
+    if src.parent != dst.parent:
+        _fsync_dir(src.parent)
 
 
 def _lexists(path: Path) -> bool:
@@ -299,7 +306,7 @@ def _project_folder(project: Any) -> str:
     if not isinstance(project, str) or not _PROJECT_RE.fullmatch(project):
         raise _Refusal("project_invalid",
                        "project must be 1-32 characters of A-Z, 0-9, '_' or '-' starting with a "
-                       "letter or digit (it becomes the PRINT/<PROJECT> folder)",
+                       "letter or digit (also used for an optional top-level project folder)",
                        project=project if isinstance(project, str) else None)
     folder = project.upper()
     if folder in _RESERVED_NAMES:
@@ -336,8 +343,10 @@ def _normalize_retire_paths(retire_paths: Any) -> list[str]:
 
 
 def _slug(part_id: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", part_id).strip("_").upper()[:40].rstrip("_")
-    return slug or "PART"
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", part_id).strip("_").lower()[:40].rstrip("_")
+    if slug.upper() in _RESERVED_NAMES - {PRINT_DIR, META_DIR}:
+        slug = "part_" + slug
+    return slug or "part"
 
 
 def _read_source_manifest(path: Path) -> dict:
@@ -351,14 +360,38 @@ def _read_source_manifest(path: Path) -> dict:
     return {"obj": obj, "sha256": hashlib.sha256(data).hexdigest()}
 
 
+def _failed_checks(manifest: dict) -> list[str]:
+    """The checks that kept a slice_part packet from print_ready (mirrors slice_part's gate)."""
+    effective = manifest.get("effective")
+    supported = isinstance(effective, dict) and effective.get("support_material") in (
+        1, "1", True)
+    failed: list[str] = []
+    for key in ("gcode_check", "printability"):
+        section = manifest.get(key)
+        for row in (section.get("issues") if isinstance(section, dict) else None) or []:
+            if not isinstance(row, dict) or row.get("status") != "fail":
+                continue
+            if key == "printability" and supported and row.get("check") in (
+                    "overhang", "bridges"):
+                continue  # the enabled supports solve these; slice_part does not gate on them
+            name = f"{key}.{row.get('check')}"
+            if name not in failed:
+                failed.append(name)
+    repairs = manifest.get("slicer_mesh_repairs")
+    if isinstance(repairs, dict) and (not repairs.get("available")
+                                      or any((repairs.get("counts") or {}).values())):
+        failed.append("slicer_mesh_repairs")
+    return failed or ["print_ready_false"]
+
+
 def _validate_jobs(jobs: Any) -> list[dict]:
     if not isinstance(jobs, list) or not jobs:
         raise _Refusal("jobs_invalid",
                        "jobs must be a non-empty list: the COMPLETE desired print set for the "
                        "project")
     if len(jobs) > MAX_PARTS:
-        raise _Refusal("part_limit", f"{len(jobs)} jobs exceed the {MAX_PARTS}-part limit of the "
-                       "R<rrr><pp> naming scheme; split the project")
+        raise _Refusal("part_limit", f"{len(jobs)} jobs exceed the {MAX_PARTS}-part limit; "
+                       "split the project")
     errors: list[dict] = []
     sources: list[dict] = []
     seen: set[str] = set()
@@ -401,11 +434,25 @@ def _validate_jobs(jobs: Any) -> list[dict]:
                 f"{manifest_path} is not a {SCHEMA_SOURCE_JOB} packet (schema "
                 f"{manifest.get('schema')!r}); slice with slice_part", part_id=part_id)
             continue
-        if manifest.get("print_ready") is not True:
-            bad("not_print_ready",
-                f"{manifest_path} is not print_ready; fix the failing checks and slice again",
-                part_id=part_id, evidence=evidence)
+        override = job.get("user_override")
+        if override is not None and (not isinstance(override, str) or not override.strip()
+                                     or len(override) > _OVERRIDE_MAX):
+            bad("user_override_invalid",
+                f"user_override must quote the user's explicit instruction to put this job on "
+                f"the media although it is not print_ready (1-{_OVERRIDE_MAX} chars)",
+                part_id=part_id)
             continue
+        override_record = None
+        if manifest.get("print_ready") is not True:
+            if override is None:
+                bad("not_print_ready",
+                    f"{manifest_path} is not print_ready ({', '.join(_failed_checks(manifest))}); "
+                    "fix the failing checks and slice again, or, when the user explicitly wants "
+                    "it on the media anyway, pass user_override with their instruction",
+                    part_id=part_id, evidence=evidence)
+                continue
+            override_record = {"user_override": override.strip(),
+                               "failed_checks": _failed_checks(manifest)}
         expected = manifest.get("gcode_sha256")
         if not isinstance(expected, str) or not _SHA_RE.fullmatch(expected.lower()):
             bad("manifest_hash_missing", f"{manifest_path} has no valid gcode_sha256",
@@ -449,7 +496,7 @@ def _validate_jobs(jobs: Any) -> list[dict]:
         sources.append({
             "part_id": part_id,
             "slug": _slug(part_id),
-            "ext": gcode_path.suffix.lower(),
+            "ext": ".bgcode" if gcode_path.suffix.lower() == ".bgcode" else ".gcode",
             "gcode_path": gcode_path,
             "sha256": expected,
             "size": size,
@@ -459,12 +506,52 @@ def _validate_jobs(jobs: Any) -> list[dict]:
             "plate": _plate_contents(manifest),
             "printer": manifest.get("printer"),
             "warnings": evidence,
+            "override": override_record,
         })
     if errors:
         raise _Refusal("jobs_invalid",
                        f"{len(errors)} job(s) failed source verification; nothing was changed",
                        job_errors=errors)
     return sources
+
+
+def _manifest_rel(folder: str) -> str:
+    return f".chudware_{folder}_manifest.json"
+
+
+def _readme_rel(folder: str) -> str:
+    return f".chudware_{folder}_README.txt"
+
+
+def _legacy_archive_rel(folder: str, revision: int) -> str:
+    """Recognize an archive written by an older publisher; never create one."""
+    return f".chudware_{folder}_RETIRED_BY_R{revision:03d}.zip"
+
+
+def _txn_rel(journal: dict) -> str:
+    if "layout" not in journal:  # interrupted pre-cutover publications
+        return f"{LEGACY_STAGING_DIR}/{journal['txn']}"
+    return f"{STAGING_DIR}_{journal['txn']}"
+
+
+def _journal_rel(journal: dict) -> str:
+    return journal.get("_journal_path", JOURNAL_PATH if "layout" in journal else LEGACY_JOURNAL_PATH)
+
+
+def _project_paths(folder: str) -> tuple[str, str]:
+    return f"{PRINT_DIR}/{folder}/{MANIFEST_NAME}", f"{PRINT_DIR}/{folder}/{README_NAME}"
+
+
+def _tidy_project_dirs(rootp: Path, folder: str, *, legacy: bool = False,
+                       remove_project: bool = False) -> None:
+    # Remove only known obsolete layout parents, never a user's empty project folder.
+    dirs = ([f"{PRINT_DIR}/{folder}", PRINT_DIR, f"{ARCHIVE_DIR}/{folder}",
+             ARCHIVE_DIR, LEGACY_STAGING_DIR, META_DIR] if legacy else [])
+    if remove_project:
+        dirs.insert(0, folder)
+    for rel in dirs:
+        with contextlib.suppress(OSError):
+            os.rmdir(rootp / rel)
 
 
 # --------------------------------------------------------------------------------------
@@ -481,9 +568,12 @@ def _scan(rootp: Path) -> dict:
         printable = _is_printable(parts[-1])
         rec: dict = {"path": rel, "type": "file", "size": st.st_size, "printable": printable,
                      "sha256": None}
-        keep = rel == JOURNAL_PATH or (
+        keep = rel in (JOURNAL_PATH, LEGACY_JOURNAL_PATH) or (
+            len(parts) == 1 and re.fullmatch(
+                r"\.chudware_[A-Z0-9_-]+_(?:manifest\.json|README\.txt)", rel)) or (
             len(parts) == 3 and parts[0] == PRINT_DIR and parts[2] in (MANIFEST_NAME, README_NAME))
         must_hash = (printable or keep or parts[0] in (PRINT_DIR, META_DIR)
+                     or (len(parts) == 1 and parts[0].startswith(".chudware_"))
                      or st.st_size <= UNRELATED_HASH_LIMIT)
         if not must_hash:
             rec["hash_skipped"] = True
@@ -527,7 +617,9 @@ def _scan(rootp: Path) -> dict:
                 records.append({"path": rel, "type": "symlink", "target": target,
                                 "printable": _is_printable(entry.name)})
             elif stat.S_ISDIR(mode):
-                if rel == STAGING_DIR:
+                if rel == LEGACY_STAGING_DIR or (len(parts) == 1 and re.fullmatch(
+                        rf"{re.escape(STAGING_DIR)}_[0-9a-f]{{12,32}}", rel)):
+                    staging.append(rel)
                     for base, dirs, files in os.walk(entry.path, followlinks=False):
                         for name in sorted(dirs + files):
                             staging.append(
@@ -537,13 +629,24 @@ def _scan(rootp: Path) -> dict:
                 walk(entry.path, parts)
             elif not stat.S_ISREG(mode):
                 records.append({"path": rel, "type": "special", "printable": False})
-            elif rel == LOCK_FILE:
+            elif rel in (LOCK_FILE, LEGACY_LOCK_FILE):
                 continue
-            elif (len(parts) == 4 and parts[0] == META_DIR and parts[1] == "ARCHIVE"
-                  and entry.name.lower().endswith(".zip")):
-                archives.append({"path": rel, "project": parts[2], "size": st.st_size})
             else:
-                records.append(file_record(entry.path, parts, st))
+                archive_project = None
+                if (len(parts) == 4 and parts[0] == META_DIR and parts[1] == "ARCHIVE"
+                        and re.fullmatch(
+                            rf"{re.escape(parts[2])}_RETIRED_BY_R\d{{3}}\.zip", entry.name)):
+                    archive_project = parts[2]
+                elif len(parts) == 1:
+                    match = re.fullmatch(
+                        r"\.chudware_([A-Z0-9_-]+)_RETIRED_BY_R\d{3}\.zip", rel)
+                    if match:
+                        archive_project = match[1]
+                rec = file_record(entry.path, parts, st)
+                records.append(rec)
+                if archive_project is not None:
+                    archives.append({"path": rel, "project": archive_project,
+                                     "size": st.st_size, "sha256": rec.get("sha256")})
 
     walk(str(rootp), ())
     records.sort(key=lambda rec: rec["path"])
@@ -583,21 +686,40 @@ def _validate_media_manifest(obj: Any, folder: str) -> dict:
     revision = obj.get("revision")
     if isinstance(revision, bool) or not isinstance(revision, int) or not 1 <= revision <= 999:
         raise ValueError("revision is not an integer in 1..999")
-    prefix = f"{PRINT_DIR}/{folder}/"
+    layout = obj.get("layout", "legacy")
+    if layout not in ("legacy", "root", "project"):
+        raise ValueError("layout is unknown")
+    prefix = f"{PRINT_DIR}/{folder}/" if layout == "legacy" else (
+        f"{folder}/" if layout == "project" else "")
 
-    def in_folder(path: Any) -> bool:
-        if not isinstance(path, str) or not path.startswith(prefix):
+    def in_folder(path: Any, historical: bool = False) -> bool:
+        try:
+            _normalize_rel(path, "manifest")
+        except _Refusal:
             return False
-        name = path[len(prefix):]
-        return bool(name) and "/" not in name and "\\" not in name and name not in (".", "..")
+        prefixes = ((prefix,) if not historical or layout == "legacy"
+                    else ("", f"{folder}/", f"{PRINT_DIR}/{folder}/"))
+        return any(path.startswith(p) and "/" not in path[len(p):]
+                   and _is_printable(path[len(p):]) for p in prefixes)
 
     current = obj.get("current")
     if not isinstance(current, list):
         raise ValueError("current is not a list")
+    seen_paths: set[str] = set()
     for entry in current:
         if (not isinstance(entry, dict) or not isinstance(entry.get("part_id"), str)
-                or not in_folder(entry.get("path")) or not _check_sha(entry.get("sha256"))):
-            raise ValueError("a current entry lacks part_id/path/sha256 inside the folder")
+                or not in_folder(entry.get("path")) or not _check_sha(entry.get("sha256"))
+                or entry["path"].lower() in seen_paths
+                or (layout != "legacy" and not re.fullmatch(
+                    r"[a-z0-9_]+\.(?:gcode|bgcode)", entry["path"][len(prefix):]))):
+            raise ValueError("a current entry lacks unique part_id/path/sha256 inside the folder")
+        override = entry.get("override")
+        if override is not None and not (
+                isinstance(override, dict) and isinstance(override.get("user_override"), str)
+                and isinstance(override.get("failed_checks"), list)
+                and all(isinstance(c, str) for c in override["failed_checks"])):
+            raise ValueError("a current entry's override is malformed")
+        seen_paths.add(entry["path"].lower())
     history = obj.get("history", [])
     if not isinstance(history, list):
         raise ValueError("history is not a list")
@@ -608,7 +730,7 @@ def _validate_media_manifest(obj: Any, folder: str) -> dict:
         if isinstance(rev, bool) or not isinstance(rev, int):
             raise ValueError("history revision is not an integer")
         for f in item["files"]:
-            if not isinstance(f, dict) or not in_folder(f.get("path")) or not _check_sha(
+            if not isinstance(f, dict) or not in_folder(f.get("path"), True) or not _check_sha(
                     f.get("sha256")):
                 raise ValueError("history file entry is malformed")
     numbers = obj.get("part_numbers", {})
@@ -631,9 +753,16 @@ def _load_projects(records: list[dict]) -> tuple[dict[str, dict], dict[str, str]
     invalid: dict[str, str] = {}
     for rec in records:
         parts = rec["path"].split("/")
-        if len(parts) != 3 or parts[0] != PRINT_DIR or parts[2] != MANIFEST_NAME:
+        match = re.fullmatch(r"\.chudware_([A-Z0-9_-]+)_manifest\.json", rec["path"])
+        if match:
+            folder = match[1]
+        elif len(parts) == 3 and parts[0] == PRINT_DIR and parts[2] == MANIFEST_NAME:
+            folder = parts[1]
+        else:
             continue
-        folder = parts[1]
+        if folder in projects:
+            invalid[folder] = "multiple managed manifests exist for the same project"
+            continue
         if rec["type"] != "file":
             invalid[folder] = f"{rec['path']} is a {rec['type']}, not a manifest file"
             continue
@@ -643,20 +772,27 @@ def _load_projects(records: list[dict]) -> tuple[dict[str, dict], dict[str, str]
             continue
         try:
             projects[folder] = _validate_media_manifest(json.loads(data.decode("utf-8")), folder)
+            projects[folder]["_manifest_path"] = rec["path"]
         except (ValueError, UnicodeDecodeError) as exc:
             invalid[folder] = f"{rec['path']}: {exc}"
     return projects, invalid
 
 
 def _load_journal(records: list[dict]) -> Optional[dict]:
-    rec = next((r for r in records if r["path"] == JOURNAL_PATH), None)
-    if rec is None:
+    matches = [r for r in records if r["path"] in (JOURNAL_PATH, LEGACY_JOURNAL_PATH)]
+    if not matches:
         return None
+    if len(matches) != 1:
+        return {"valid": False, "error": "multiple transaction journals exist"}
+    rec = matches[0]
     if rec["type"] != "file" or rec.get("_data") is None:
-        return {"valid": False, "error": f"{JOURNAL_PATH} is not a readable small file"}
+        return {"valid": False, "error": f"{rec['path']} is not a readable small file"}
     try:
         obj = json.loads(rec["_data"].decode("utf-8"))
         _validate_journal(obj)
+        if (rec["path"] == JOURNAL_PATH) != (obj.get("layout") in ("root", "project")):
+            raise ValueError("journal location does not match its layout")
+        obj["_journal_path"] = rec["path"]
     except (ValueError, UnicodeDecodeError) as exc:
         return {"valid": False, "error": str(exc)}
     return {"valid": True, "obj": obj}
@@ -670,7 +806,10 @@ def _validate_journal(obj: Any) -> None:
         raise ValueError("journal txn id is malformed")
     if obj.get("phase") not in ("swapping", "committed"):
         raise ValueError("journal phase is unknown")
-    staging_prefix = f"{STAGING_DIR}/{txn}/"
+    layout = obj.get("layout", "legacy")
+    if layout not in ("legacy", "root", "project"):
+        raise ValueError("journal layout is unknown")
+    staging_prefix = _txn_rel(obj) + "/"
     try:
         folder = _project_folder(obj.get("project"))
     except _Refusal as exc:
@@ -678,7 +817,8 @@ def _validate_journal(obj: Any) -> None:
     revision = obj.get("revision")
     if type(revision) is not int or not 1 <= revision <= MAX_REVISION:
         raise ValueError("journal revision is malformed")
-    project_prefix = f"{PRINT_DIR}/{folder}/"
+    project_prefix = f"{PRINT_DIR}/{folder}/" if layout == "legacy" else (
+        f"{folder}/" if layout == "project" else "")
 
     def rel(value: Any, prefix: Optional[str] = None) -> None:
         try:
@@ -687,6 +827,18 @@ def _validate_journal(obj: Any) -> None:
             raise ValueError(exc.message) from None
         if prefix is not None and not normalized.startswith(prefix):
             raise ValueError(f"journal path {value!r} is outside {prefix}")
+    for key in ("retire", "place", "metadata", "relocate", "delete_archives"):
+        items = obj.get(key, [])
+        if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+            raise ValueError(f"journal {key} is not a list of objects")
+        seen: set[str] = set()
+        for item in items:
+            rel(item.get("path"))
+            if item["path"].lower() in seen:
+                raise ValueError(f"journal {key} has duplicate paths")
+            seen.add(item["path"].lower())
+    if obj.get("archive") is not None and not isinstance(obj["archive"], dict):
+        raise ValueError("journal archive is not an object")
 
     for item in obj.get("retire", []):
         rel(item.get("path"))
@@ -699,26 +851,64 @@ def _validate_journal(obj: Any) -> None:
         rel(item.get("path"), project_prefix)
         name = item["path"][len(project_prefix):]
         match = _MANAGED_NAME_RE.match(name)
-        if ("/" in name or not match or int(match[1]) != revision
-                or not 1 <= int(match[2]) <= MAX_PARTS or not _is_printable(name)):
+        if "/" in name or not _is_printable(name):
+            raise ValueError("journal placement is not a direct printable file")
+        if layout == "legacy" and (not match or int(match[1]) != revision
+                or not 1 <= int(match[2]) <= MAX_PARTS):
             raise ValueError("journal placement is not a file of this release")
+        if layout != "legacy" and not re.fullmatch(r"[a-z0-9_]+\.(?:gcode|bgcode)", name):
+            raise ValueError("journal placement is not a stable raw G-code name")
+        if "staged" in item:
+            rel(item["staged"], staging_prefix)
         if not _check_sha(item.get("sha256")):
             raise ValueError("journal place hash malformed")
     archive = obj.get("archive")
     if archive is not None:
-        rel(archive.get("path"), f"{ARCHIVE_DIR}/")
-        if archive["path"] != f"{ARCHIVE_DIR}/{folder}/{folder}_RETIRED_BY_R{revision:03d}.zip":
+        rel(archive.get("path"))
+        expected = (f"{ARCHIVE_DIR}/{folder}/{folder}_RETIRED_BY_R{revision:03d}.zip"
+                    if layout == "legacy" else _legacy_archive_rel(folder, revision))
+        if archive["path"] != expected:
             raise ValueError("journal archive belongs to another project or release")
         if not _check_sha(archive.get("sha256")):
             raise ValueError("journal archive hash malformed")
     for item in obj.get("metadata", []):
-        rel(item.get("path"), project_prefix)
-        if item["path"] not in (project_prefix + README_NAME, project_prefix + MANIFEST_NAME):
+        rel(item.get("path"))
+        allowed = _project_paths(folder)
+        if layout != "legacy":
+            allowed += (_manifest_rel(folder), _readme_rel(folder))
+        if item["path"] not in allowed:
             raise ValueError("journal metadata is not a managed metadata file")
-        if not _check_sha(item.get("new_sha256")):
+        if not _check_sha(item.get("new_sha256")) and not (
+                layout != "legacy" and item.get("new_sha256") is None
+                and item["path"] in _project_paths(folder) and item.get("old") is not None):
             raise ValueError("journal metadata hash malformed")
         if item.get("old") is not None and not isinstance(item.get("old"), str):
             raise ValueError("journal metadata old text malformed")
+    for item in obj.get("relocate", []):
+        rel(item.get("path"))
+        rel(item.get("dest"))
+        match = _ARCHIVE_NAME_RE.search(item["path"])
+        if (not item["path"].startswith(f"{ARCHIVE_DIR}/{folder}/") or not match
+                or item["path"] != f"{ARCHIVE_DIR}/{folder}/{folder}_RETIRED_BY_R{match[1]}.zip"
+                or item["dest"] != _legacy_archive_rel(folder, int(match[1]))
+                or not _check_sha(item.get("sha256"))):
+            raise ValueError("journal archive relocation is malformed")
+    for item in obj.get("delete_archives", []):
+        rel(item.get("held"), staging_prefix)
+        match = _ARCHIVE_NAME_RE.search(item["path"])
+        if (not match or item["path"] not in (
+                f"{ARCHIVE_DIR}/{folder}/{folder}_RETIRED_BY_R{match[1]}.zip",
+                _legacy_archive_rel(folder, int(match[1])))
+                or not _check_sha(item.get("sha256"))):
+            raise ValueError("journal archive deletion is malformed")
+    created_dirs = obj.get("created_dirs", [])
+    if not isinstance(created_dirs, list) or any(
+            value != folder or layout != "project" for value in created_dirs):
+        raise ValueError("journal created directory is not the project folder")
+    if obj.get("previous_layout") not in (None, "legacy", "root", "project"):
+        raise ValueError("journal previous layout is unknown")
+    if "cleanup_legacy" in obj and type(obj["cleanup_legacy"]) is not bool:
+        raise ValueError("journal legacy cleanup flag is malformed")
 
 
 def _similarity_key(name: str) -> str:
@@ -747,8 +937,11 @@ def _inventory(rootp: Path) -> dict:
             for f in item["files"]:
                 history_index.setdefault(f["path"], {})[f["sha256"]] = (
                     folder, item["revision"], f.get("part_id"))
-        metadata_paths[f"{PRINT_DIR}/{folder}/{MANIFEST_NAME}"] = None
-        metadata_paths[f"{PRINT_DIR}/{folder}/{README_NAME}"] = manifest.get("readme_sha256")
+        manifest_path = manifest["_manifest_path"]
+        metadata_paths[manifest_path] = None
+        readme_path = (_project_paths(folder)[1] if manifest_path.startswith(PRINT_DIR + "/")
+                       else _readme_rel(folder))
+        metadata_paths[readme_path] = manifest.get("readme_sha256")
 
     for rec in records:
         kind = rec["type"]
@@ -770,7 +963,7 @@ def _inventory(rootp: Path) -> dict:
             rec["managed"] = {"project": folder, "part_id": part_id, "revision": revision}
         elif path in metadata_paths and metadata_paths[path] in (None, sha):
             rec["status"] = "managed_metadata"
-        elif path == JOURNAL_PATH:
+        elif path in (JOURNAL_PATH, LEGACY_JOURNAL_PATH):
             rec["status"] = "transaction_journal"
         elif rec["printable"]:
             rec["status"] = "unmanaged"
@@ -790,13 +983,15 @@ def _inventory(rootp: Path) -> dict:
             else:
                 status = rec["status"]
             jobs.append({"part_id": entry["part_id"], "part_number": entry.get("part_number"),
-                         "path": entry["path"], "sha256": entry["sha256"], "status": status})
+                         "path": entry["path"], "sha256": entry["sha256"], "status": status,
+                         **({"override": entry["override"]} if entry.get("override") else {})})
         managed_projects.append({
             "project": folder, "revision": manifest["revision"],
             "release": f"R{manifest['revision']:03d}",
             "published_at": manifest.get("published_at"),
-            "folder": f"{PRINT_DIR}/{folder}",
-            "manifest_path": f"{PRINT_DIR}/{folder}/{MANIFEST_NAME}",
+            "folder": manifest.get("folder", f"{PRINT_DIR}/{folder}"),
+            "layout": manifest.get("layout", "legacy"),
+            "manifest_path": manifest["_manifest_path"],
             "jobs": jobs,
             "superseded_present": [r["path"] for r in records if r.get("status") == "superseded"
                                    and r["managed"]["project"] == folder],
@@ -874,7 +1069,7 @@ def _inventory(rootp: Path) -> dict:
         warnings.append({"code": "unmanaged_printables",
                          "message": f"{len(unmanaged)} printable file(s) are not managed by any "
                                     "published project; review them and pass retire_paths to "
-                                    "archive the obsolete ones",
+                                    "delete the obsolete ones",
                          "paths": [r["path"] for r in unmanaged]})
     if duplicate_groups:
         warnings.append({"code": "duplicate_printables",
@@ -884,7 +1079,7 @@ def _inventory(rootp: Path) -> dict:
     if symlinks:
         warnings.append({"code": "symlinks_present",
                          "message": "symlinks are listed but never followed; publishing refuses "
-                                    "if one sits under PRINT/ or CHUDWARE/",
+                                    "to traverse them for output, metadata or recovery",
                          "paths": [r["path"] for r in symlinks]})
     unreadable = [r["path"] for r in records if r["type"] == "unreadable"]
     if unreadable:
@@ -895,7 +1090,7 @@ def _inventory(rootp: Path) -> dict:
     if skipped:
         warnings.append({"code": "large_files_not_hashed",
                          "message": f"non-printable files over {UNRELATED_HASH_LIMIT} bytes "
-                                    "outside PRINT/ and CHUDWARE/ are tracked by size+mtime",
+                                    "outside managed metadata paths are tracked by size+mtime",
                          "paths": skipped})
     if scan["staging"] and journal_summary is None:
         warnings.append({"code": "stale_staging",
@@ -988,8 +1183,8 @@ def _drive_lock(rootp: Path) -> Iterator[None]:
     """Exclusive per-drive lock, released by the OS if the process dies.
 
     POSIX: ``flock`` on the mount root directory, so nothing is written to the drive.
-    Windows: ``msvcrt.locking`` on ``CHUDWARE/.lock``; the scan skips that file and the
-    token skips the ``CHUDWARE`` directory row, so taking the lock never changes the token.
+    Windows: ``msvcrt.locking`` on ``.chudware_lock``; the scan skips that flat root
+    file, so taking the lock never changes the token.
     """
     deadline = time.monotonic() + LOCK_WAIT_S
 
@@ -1019,7 +1214,7 @@ def _drive_lock(rootp: Path) -> Iterator[None]:
         raise _Refusal("lock_unsupported_platform",
                        "this platform offers neither fcntl.flock nor msvcrt.locking; publishing "
                        "to removable media is refused")
-    _ensure_dir(rootp, META_DIR)
+    _check_components(rootp, LOCK_FILE)
     fd = os.open(rootp / LOCK_FILE, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0))
     try:
         while not _msvcrt_try_lock(fd):
@@ -1071,9 +1266,9 @@ def inventory_print_media(root: str, offset: int = 0, limit: int = 200) -> dict:
 def _rollback(rootp: Path, journal: dict) -> list[str]:
     """Undo a swapping transaction from the journal; return unresolved problems."""
     problems: list[str] = []
-    txn_dir = rootp / STAGING_DIR / journal["txn"]
+    txn_dir = rootp / _txn_rel(journal)
     try:
-        _ensure_dir(rootp, f"{STAGING_DIR}/{journal['txn']}")
+        _ensure_dir(rootp, _txn_rel(journal))
     except (OSError, _Refusal) as exc:
         return [f"cannot prepare {txn_dir}: {exc}"]
     for item in reversed(journal.get("metadata", [])):
@@ -1097,6 +1292,11 @@ def _rollback(rootp: Path, journal: dict) -> list[str]:
             problems.append(f"{rel}: {exc}")
     for item in reversed(journal.get("place", [])):
         path = rootp / item["path"]
+        previous = next((r for r in journal.get("retire", []) if r["path"] == item["path"]), None)
+        if previous is not None and not _lexists(rootp / previous["held"]):
+            # Stable names can still hold untouched previous bytes before retirement.
+            if _hash_or_none(path) == previous["sha256"]:
+                continue
         if not _lexists(path):
             continue
         if _hash_or_none(path) != item["sha256"]:
@@ -1106,7 +1306,7 @@ def _rollback(rootp: Path, journal: dict) -> list[str]:
             os.unlink(path)
         except OSError as exc:
             problems.append(f"{item['path']}: {exc}")
-    for item in reversed(journal.get("retire", [])):
+    for item in reversed(journal.get("retire", []) + journal.get("delete_archives", [])):
         original = rootp / item["path"]
         held = rootp / item["held"]
         held_present = _lexists(held)
@@ -1125,6 +1325,19 @@ def _rollback(rootp: Path, journal: dict) -> list[str]:
             _move(held, original)
         except (OSError, _Refusal) as exc:
             problems.append(f"restore {item['path']}: {exc}")
+    for item in reversed(journal.get("relocate", [])):
+        original, moved = rootp / item["path"], rootp / item["dest"]
+        if _lexists(original):
+            if _hash_or_none(original) != item["sha256"]:
+                problems.append(f"{item['path']} changed during archive migration")
+            continue
+        if _hash_or_none(moved) != item["sha256"]:
+            problems.append(f"{item['dest']} is missing or altered")
+            continue
+        try:
+            _move(moved, original)
+        except OSError as exc:
+            problems.append(f"restore {item['path']}: {exc}")
     archive = journal.get("archive")
     if archive is not None and not problems:
         # Only once every retired file is back in place does its archive copy go away.
@@ -1135,41 +1348,101 @@ def _rollback(rootp: Path, journal: dict) -> list[str]:
                     os.unlink(path)
                 except OSError as exc:
                     problems.append(f"{archive['path']}: {exc}")
-                for directory in (path.parent, path.parent.parent):  # ARCHIVE/<P>, ARCHIVE
-                    with contextlib.suppress(OSError):
-                        os.rmdir(directory)
+                if archive["path"].startswith(ARCHIVE_DIR + "/"):
+                    for directory in (path.parent, path.parent.parent):
+                        with contextlib.suppress(OSError):
+                            os.rmdir(directory)
             else:
                 problems.append(f"{archive['path']} exists with unexpected content")
     if not problems:
         _remove_tree(txn_dir)
         with contextlib.suppress(FileNotFoundError):
-            os.unlink(rootp / JOURNAL_PATH)
+            os.unlink(rootp / _journal_rel(journal))
         _tidy_staging(rootp)
+        for rel in reversed(journal.get("created_dirs", [])):
+            with contextlib.suppress(OSError):
+                os.rmdir(rootp / rel)
+    return problems
+
+
+def _verify_commit(rootp: Path, journal: dict, *, held_required: bool = False) -> list[str]:
+    """Read back the complete live set and metadata before discarding any old bytes."""
+    problems: list[str] = []
+    for item in journal.get("place", []):
+        if _hash_or_none(rootp / item["path"]) != item["sha256"]:
+            problems.append(f"{item['path']} is missing or altered")
+    for item in journal.get("metadata", []):
+        actual = _hash_or_none(rootp / item["path"])
+        if actual != item["new_sha256"] or (
+                item["new_sha256"] is None and _lexists(rootp / item["path"])):
+            problems.append(f"{item['path']} metadata is missing or altered")
+    inv = _inventory(rootp)
+    manifest = inv["_projects"].get(journal["project"])
+    if journal["project"] in inv["_invalid"] or manifest is None:
+        problems.append("current managed manifest is missing or invalid")
+        current_paths: set[str] = set()
+    else:
+        current_paths = {entry["path"] for entry in manifest["current"]}
+        if manifest["revision"] != journal["revision"]:
+            problems.append("current managed manifest has the wrong revision")
+        by_path = {rec["path"]: rec for rec in inv["_records"]}
+        for entry in manifest["current"]:
+            rec = by_path.get(entry["path"])
+            if rec is None or rec.get("status") != "current":
+                problems.append(f"{entry['path']} is not the current managed file")
+        if journal.get("layout") == "project":
+            prefix = journal["project"] + "/"
+            stray = [rec["path"] for rec in inv["_records"] if rec.get("printable")
+                     and rec["path"].startswith(prefix) and rec["path"] not in current_paths]
+            if stray:
+                problems.append(f"non-current printables remain in the project folder: {stray}")
+    for item in journal.get("retire", []) + journal.get("delete_archives", []):
+        if item["path"] not in current_paths and _lexists(rootp / item["path"]):
+            problems.append(f"retired {item['path']} is still on the drive")
+        if held_required and not _lexists(rootp / item["held"]):
+            problems.append(f"held copy {item['held']} is missing before commit")
+        if _lexists(rootp / item["held"]) and (
+                _hash_or_none(rootp / item["held"]) != item["sha256"]):
+            problems.append(f"held copy {item['held']} is altered")
     return problems
 
 
 def _roll_forward(rootp: Path, journal: dict) -> list[str]:
-    """Finish a committed transaction: the new set is live, retired bytes are archived."""
-    problems: list[str] = []
-    archive = journal.get("archive")
-    if archive is not None and _hash_or_none(rootp / archive["path"]) != archive["sha256"]:
-        return [f"archive {archive['path']} is missing or altered; held retired files are kept "
-                f"under {STAGING_DIR}/{journal['txn']}"]
-    for item in journal.get("place", []):
-        if _hash_or_none(rootp / item["path"]) != item["sha256"]:
-            problems.append(f"{item['path']} is missing or altered")
+    """Verify a committed set, then permanently delete held bytes and owned old ZIPs."""
+    problems = _verify_commit(rootp, journal)
+    # Older journals may already have installed an archive or relocated one. Only
+    # matching owned bytes are deleted, and missing files allow interrupted cleanup.
+    old_archives = []
+    if journal.get("archive") is not None:
+        old_archives.append(journal["archive"])
+    for item in journal.get("relocate", []):
+        old_archives.extend({"path": rel, "sha256": item["sha256"]}
+                            for rel in (item["path"], item["dest"]))
+    for item in old_archives:
+        if _lexists(rootp / item["path"]) and (
+                _hash_or_none(rootp / item["path"]) != item["sha256"]):
+            problems.append(f"owned legacy archive {item['path']} is altered")
     if problems:
         return problems
-    _remove_tree(rootp / STAGING_DIR / journal["txn"])
+    for item in old_archives:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(rootp / item["path"])
+            _fsync_dir((rootp / item["path"]).parent)
+    _remove_tree(rootp / _txn_rel(journal))
     with contextlib.suppress(FileNotFoundError):
-        os.unlink(rootp / JOURNAL_PATH)
+        os.unlink(rootp / _journal_rel(journal))
+    _fsync_dir(rootp)
     _tidy_staging(rootp)
+    _tidy_project_dirs(rootp, journal["project"],
+                       legacy=journal.get("cleanup_legacy", "layout" not in journal),
+                       remove_project=journal.get("previous_layout") == "project"
+                       and journal.get("layout") == "root")
     return []
 
 
 def _tidy_staging(rootp: Path) -> None:
     with contextlib.suppress(OSError):
-        os.rmdir(rootp / STAGING_DIR)
+        os.rmdir(rootp / LEGACY_STAGING_DIR)
 
 
 def _recover(rootp: Path, journal_info: dict) -> dict:
@@ -1180,11 +1453,23 @@ def _recover(rootp: Path, journal_info: dict) -> dict:
     journal = journal_info["obj"]
     # Recovery runs before normal publish planning. A drive can have been remounted or
     # edited since the journal was written; validate every path before any rollback deletes.
-    paths = [JOURNAL_PATH, f"{STAGING_DIR}/{journal['txn']}"]
-    for item in journal.get("retire", []):
+    paths = [_journal_rel(journal), _txn_rel(journal)]
+    for item in journal.get("retire", []) + journal.get("delete_archives", []):
         paths.extend((item["path"], item["held"]))
     paths.extend(item["path"] for item in journal.get("place", []))
     paths.extend(item["path"] for item in journal.get("metadata", []))
+    for item in journal.get("relocate", []):
+        paths.extend((item["path"], item["dest"]))
+    projects, invalid = _load_projects(_scan(rootp)["records"])
+    foreign_invalid = {f: reason for f, reason in invalid.items() if f != journal["project"]}
+    if foreign_invalid:
+        raise _Refusal("journal_invalid", "managed manifests are invalid during recovery",
+                       projects=foreign_invalid)
+    foreign = {e["path"].lower() for f, m in projects.items() if f != journal["project"]
+               for e in m["current"] + [e for h in m.get("history", []) for e in h["files"]]}
+    if any(item["path"].lower() in foreign
+           for item in journal.get("place", []) + journal.get("retire", [])):
+        raise _Refusal("journal_invalid", "journal touches files managed by another project")
     if journal.get("archive") is not None:
         paths.append(journal["archive"]["path"])
     for path in paths:
@@ -1205,43 +1490,6 @@ def _recover(rootp: Path, journal_info: dict) -> dict:
 # Publish
 # --------------------------------------------------------------------------------------
 
-def _build_archive(rootp: Path, staged_zip: Path, retire: list[dict], info: dict) -> str:
-    with zipfile.ZipFile(staged_zip, "x", compression=zipfile.ZIP_DEFLATED) as archive:
-        for item in retire:
-            path = rootp / item["path"]
-            fd = _open_nofollow(path)
-            try:
-                st = os.fstat(fd)
-                if not stat.S_ISREG(st.st_mode):
-                    raise _Refusal("retire_not_regular", f"{item['path']} is not a regular file")
-                stamp = time.localtime(max(st.st_mtime, 315532800 + 86400))[:6]
-                member = zipfile.ZipInfo(item["path"], date_time=stamp)
-                member.compress_type = zipfile.ZIP_DEFLATED
-                digest = hashlib.sha256()
-                with archive.open(member, "w", force_zip64=st.st_size >= 2 ** 31) as out:
-                    while chunk := os.read(fd, _CHUNK):
-                        digest.update(chunk)
-                        out.write(chunk)
-            finally:
-                os.close(fd)
-            if digest.hexdigest() != item["sha256"]:
-                raise _Refusal("retire_file_changed",
-                               f"{item['path']} changed after inventory (sha256 "
-                               f"{digest.hexdigest()}); re-run the inventory")
-        archive.writestr("RETIRED.json", json.dumps(info, indent=2))
-    with open(staged_zip, "rb+") as stream:
-        os.fsync(stream.fileno())
-        _drop_page_cache(stream.fileno())
-    with zipfile.ZipFile(staged_zip) as archive:
-        for item in retire:
-            digest = hashlib.sha256()
-            with archive.open(item["path"]) as member:
-                while chunk := member.read(_CHUNK):
-                    digest.update(chunk)
-            if digest.hexdigest() != item["sha256"]:
-                raise _Refusal("archive_verify_failed",
-                               f"archived bytes of {item['path']} do not read back intact")
-    return _hash_path(staged_zip)[0]
 
 
 def _plate_contents(manifest: dict) -> Optional[dict]:
@@ -1261,21 +1509,24 @@ def _plate_contents(manifest: dict) -> Optional[dict]:
             "parts": parts}
 
 
-def _readme(folder: str, revision: int, published_at: str, current: list[dict],
-            archive_rel: Optional[str]) -> str:
+def _readme(folder: str, revision: int, published_at: str, current: list[dict]) -> str:
     lines = [
-        f"Chudware managed print folder: {PRINT_DIR}/{folder}",
+        f"Chudware managed print project: {folder}",
         f"Current release: R{revision:03d} (published {published_at})",
         "",
-        "Print ONLY the files listed here. The first six characters of each file name",
-        "identify it even when a printer shortens the name: R + 3-digit release + 2-digit part.",
-        f"Example: R{revision:03d}01 = release {revision}, part 01.",
+        "Print ONLY the files listed here. Stable part names always select the current",
+        "published bytes; release numbers are recorded here and in the manifest.",
         "",
     ]
     width = max(len(entry["file_name"]) for entry in current)
     for entry in current:
         lines.append(f"  {entry['file_name']:<{width}}  part_id={entry['part_id']}  "
                      f"sha256={entry['sha256'][:16]}")
+        override = entry.get("override")
+        if override:
+            lines.append(f"  {'':<{width}}  NOT print-ready (failed: "
+                         f"{', '.join(override['failed_checks'])}); published on the user's "
+                         f"instruction: {override['user_override']}")
         plate = entry.get("plate")
         if plate:
             members = ", ".join(f"{row['part']} x{row['copies']}" for row in plate["parts"])
@@ -1284,10 +1535,9 @@ def _readme(folder: str, revision: int, published_at: str, current: list[dict],
             lines.append(f"  {'':<{width}}  plate: {members}; prints {mode}")
     lines += [
         "",
-        f"Older releases are kept as non-printable ZIP archives in {ARCHIVE_DIR}/{folder}/.",
-        f"Latest archive: {archive_rel}" if archive_rel else "No release has been retired yet.",
-        "Do not copy G-code into this folder by hand: publish through Chudware so the old",
-        "files are archived and retired and this list stays true.",
+        "Deprecated print files are permanently deleted after the new set is verified.",
+        "Do not copy G-code here by hand: publish through Chudware so the old",
+        "files are deleted and this list stays true.",
         "",
     ]
     return "\n".join(lines)
@@ -1295,14 +1545,16 @@ def _readme(folder: str, revision: int, published_at: str, current: list[dict],
 
 def publish_print_media(root: str, project: str, jobs: list[dict], expected_inventory: str,
                         media_idle: bool = False,
-                        retire_paths: Optional[list[str]] = None) -> dict:
+                        retire_paths: Optional[list[str]] = None, *, layout: str = "root") -> dict:
     """Publish the COMPLETE print set of ``project`` as one managed revision (see module doc).
 
     Requires ``media_idle=True`` (offline USB media cannot report printer activity) and the
     ``inventory_token`` from an ``inventory_print_media`` call made after the last change.
+    ``layout="root"`` writes stable part names at the root; ``layout="project"`` writes
+    them inside one top-level project folder. Hidden metadata sidecars stay at root.
     """
     try:
-        return _publish(root, project, jobs, expected_inventory, media_idle, retire_paths)
+        return _publish(root, project, jobs, expected_inventory, media_idle, retire_paths, layout)
     except _Refusal as refusal:
         return refusal.result()
     except Exception as exc:  # noqa: BLE001 - the public boundary never raises
@@ -1310,13 +1562,15 @@ def publish_print_media(root: str, project: str, jobs: list[dict], expected_inve
 
 
 def _publish(root: Any, project: Any, jobs: Any, expected_inventory: Any, media_idle: Any,
-             retire_paths: Any) -> dict:
+             retire_paths: Any, layout: Any) -> dict:
     if media_idle is not True:
         raise _Refusal("media_not_confirmed_idle",
                        "pass media_idle=True only after confirming no printer is printing from "
                        "this drive; offline USB media cannot report printer activity")
     rootp = _root_path(root)
     folder = _project_folder(project)
+    if layout not in ("root", "project"):
+        raise _Refusal("layout_invalid", "layout must be 'root' or 'project'")
     if not isinstance(expected_inventory, str) or not _SHA_RE.fullmatch(expected_inventory):
         raise _Refusal("inventory_token_required",
                        "expected_inventory must be the inventory_token from inventory_print_media")
@@ -1336,7 +1590,7 @@ def _publish(root: Any, project: Any, jobs: Any, expected_inventory: Any, media_
             recovered = _recover(rootp, before["_journal"])
             before = _inventory(rootp)
         try:
-            result = _publish_locked(rootp, folder, sources, retire, before)
+            result = _publish_locked(rootp, folder, sources, retire, before, layout)
         except _Refusal as refusal:
             if recovered is not None:
                 refusal.details["recovered"] = recovered
@@ -1351,7 +1605,7 @@ def _publish(root: Any, project: Any, jobs: Any, expected_inventory: Any, media_
 
 
 def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[str],
-                    before: dict) -> dict:
+                    before: dict, layout: str) -> dict:
     records = before["_records"]
     by_path = {rec["path"]: rec for rec in records}
     projects = before["_projects"]
@@ -1364,7 +1618,7 @@ def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[
     if linked:
         raise _Refusal("media_symlink", "symlinks under PRINT/ or CHUDWARE/ are refused",
                        paths=linked)
-    folder_rel = f"{PRINT_DIR}/{folder}"
+    folder_rel = "." if layout == "root" else folder
     blocked = [rec["path"] for rec in records if rec["type"] in ("unreadable", "special")
                and (rec["path"] == folder_rel or rec["path"].startswith(folder_rel + "/"))]
     if blocked:
@@ -1377,6 +1631,37 @@ def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[
                            path=top)
     prev = projects.get(folder)
     explicit = set(retire)
+    manifest_rel = _manifest_rel(folder)
+    readme_rel = _readme_rel(folder)
+    old_manifest_rel = prev["_manifest_path"] if prev is not None else manifest_rel
+    old_readme_rel = (_project_paths(folder)[1] if old_manifest_rel.startswith(PRINT_DIR + "/")
+                      else readme_rel)
+    readme_rec = by_path.get(old_readme_rel)
+    if prev is not None and readme_rec is not None and readme_rec.get("status") != "managed_metadata":
+        raise _Refusal("managed_file_modified",
+                       f"{old_readme_rel} was edited since publication; restore or remove it",
+                       path=old_readme_rel)
+    for rel in (manifest_rel, readme_rel):
+        rec = next((r for r in records if r["path"].lower() == rel.lower()), None)
+        if rec is not None and (prev is None or old_manifest_rel != manifest_rel
+                                or rec["path"] != rel):
+            raise _Refusal("destination_exists", f"{rec['path']} is not this project's metadata",
+                           path=rec["path"])
+    delete_archives: list[dict] = []
+    for archive in before["archives"]:
+        if archive["project"] != folder:
+            continue
+        if not _check_sha(archive.get("sha256")):
+            raise _Refusal("media_unreadable", f"{archive['path']} cannot be read")
+        delete_archives.append({"path": archive["path"], "sha256": archive["sha256"],
+                                "size": archive["size"], "reason": "legacy_archive"})
+    foreign_current = {e["path"].lower(): f for f, m in projects.items() if f != folder
+                       for e in m["current"]}
+    if prev is not None:
+        conflicts = [e["path"] for e in prev["current"] if e["path"].lower() in foreign_current]
+        if conflicts:
+            raise _Refusal("managed_manifest_invalid", "projects claim the same current paths",
+                           paths=conflicts)
 
     # ---- previous managed set: verified before anything is planned ----
     plan: list[dict] = []
@@ -1393,10 +1678,10 @@ def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[
                                f"{entry['path']} is a {rec['type']}, not the managed file")
             if rec["sha256"] != entry["sha256"]:
                 if entry["path"] in explicit:
-                    continue  # reviewed by the caller: archived below as an explicit retire
+                    continue  # reviewed by the caller: deleted below as an explicit retire
                 raise _Refusal("managed_file_modified",
                                f"{entry['path']} no longer matches its recorded sha256; review it "
-                               "and pass it in retire_paths to archive it, or restore it",
+                               "and pass it in retire_paths to delete it, or restore it",
                                path=entry["path"], expected_sha256=entry["sha256"],
                                actual_sha256=rec["sha256"])
             plan.append({"path": entry["path"], "sha256": rec["sha256"], "size": rec["size"],
@@ -1414,17 +1699,27 @@ def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[
 
     # ---- idempotency: same verified set, nothing else pending ----
     desired = {s["part_id"]: (s["sha256"], s["ext"]) for s in sources}
+    cleanup_only = False
     if prev is not None:
         prev_set = {e["part_id"]: (e["sha256"], os.path.splitext(e["path"])[1].lower())
                     for e in prev["current"]}
         recorded = {r["path"] for r in prev.get("retired", [])}
         pending = [p for p in retire if p in by_path or p not in recorded]
         superseded = [p for p in plan if p["reason"] == "superseded_leftover"]
-        if (desired == prev_set and not missing_previous and len(plan) == len(prev["current"])
-                and not superseded and not pending):
+        desired_paths = {s["part_id"]: ("" if layout == "root" else folder + "/")
+                         + s["slug"] + s["ext"] for s in sources}
+        same_set = (desired == prev_set and not missing_previous
+                    and len(plan) == len(prev["current"]) and not superseded and not pending
+                    and prev.get("layout") == layout and old_manifest_rel == manifest_rel
+                    and all(desired_paths[e["part_id"]] == e["path"] for e in prev["current"]))
+        obsolete_metadata = "archive" in prev or any(
+            "archive" in item for item in prev.get("history", []))
+        if (same_set and not delete_archives and not before["staging_leftovers"]
+                and not obsolete_metadata):
             return _result(rootp, folder, before, status="unchanged",
                            revision=prev["revision"], current=prev["current"], retired=[],
-                           archive=None, warnings=[])
+                           deleted=[], warnings=[])
+        cleanup_only = same_set
 
     # ---- explicit, caller-reviewed retire paths ----
     other_current = {e["path"]: f for f, m in projects.items() if f != folder
@@ -1433,6 +1728,8 @@ def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[
         if rel in planned:
             continue
         rec = by_path.get(rel)
+        if rec is None and cleanup_only:
+            continue  # this reviewed path was already retired in the unchanged revision
         if rec is None:
             raise _Refusal("retire_path_missing",
                            f"retire path {rel} is not on the drive; re-run the inventory",
@@ -1447,7 +1744,8 @@ def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[
         owner = other_current.get(rel) or (rec.get("managed") or {}).get("project")
         if owner is None:
             owner = next((f for f in projects if f != folder
-                          and rel.startswith(f"{PRINT_DIR}/{f}/")), None)
+                          and (rel.startswith(f"{PRINT_DIR}/{f}/") or (
+                              projects[f].get("layout") == "project" and rel.startswith(f + "/")))), None)
         if owner is not None and owner != folder:
             raise _Refusal("retire_path_managed_elsewhere",
                            f"{rel} belongs to managed project {owner}; publish that project "
@@ -1457,35 +1755,31 @@ def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[
         plan.append({"path": rel, "sha256": rec["sha256"], "size": rec["size"],
                      "reason": "explicit"})
         planned.add(rel)
-    loose = [rec["path"] for rec in records if rec.get("printable")
+    loose = [rec["path"] for rec in records if layout == "project" and rec.get("printable")
              and rec["path"].startswith(folder_rel + "/") and rec["path"] not in planned]
     if loose:
         raise _Refusal("unmanaged_in_project_folder",
                        f"{folder_rel} holds printable files that are not this project's managed "
-                       "jobs; review them and pass them in retire_paths (they are archived, "
-                       "not deleted) or move them out by hand", paths=loose)
+                       "jobs; review them and pass them in retire_paths to permanently delete "
+                       "them, or move them out by hand", paths=loose)
 
     # ---- revision, part numbers, destination names ----
     highest = prev["revision"] if prev is not None else 0
     for item in (prev or {}).get("history", []):
         highest = max(highest, item["revision"])
-    folder_prefix = folder_rel + "/"
+    folder_prefix = "" if layout == "root" else folder_rel + "/"
     existing_names = [rec["path"][len(folder_prefix):] for rec in records
                       if rec["path"].startswith(folder_prefix)
                       and "/" not in rec["path"][len(folder_prefix):]]
-    for name in existing_names:
-        match = _MANAGED_NAME_RE.match(name)
-        if match:
-            highest = max(highest, int(match.group(1)))
     for archive in before["archives"]:
         match = _ARCHIVE_NAME_RE.search(archive["path"])
         if archive["project"] == folder and match:
             highest = max(highest, int(match.group(1)))
-    revision = highest + 1
+    revision = prev["revision"] if cleanup_only else highest + 1
     if revision > MAX_REVISION:
         raise _Refusal("revision_limit",
-                       f"project {folder} has used all {MAX_REVISION} releases of the R<rrr> "
-                       "naming scheme; publish under a new project name", project=folder)
+                       f"project {folder} has used all {MAX_REVISION} metadata revisions; "
+                       "publish under a new project name", project=folder)
     numbers: dict[str, int] = dict((prev or {}).get("part_numbers", {}))
     for entry in (prev or {}).get("current", []):
         if isinstance(entry.get("part_number"), int):
@@ -1507,72 +1801,58 @@ def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[
         assigned[source["part_id"]] = pick
     for source in sources:
         number = assigned[source["part_id"]]
-        name = f"R{revision:03d}{number:02d}_{source['slug']}{source['ext']}"
-        source.update(part_number=number, file_name=name, dest=f"{folder_rel}/{name}")
+        name = f"{source['slug']}{source['ext']}"
+        source.update(part_number=number, file_name=name, dest=folder_prefix + name)
     remaining = {n.lower() for n in existing_names if f"{folder_prefix}{n}" not in planned}
-    remaining_short = {n[:6].lower() for n in remaining}
+    named: set[str] = set()
     for source in sources:
-        if source["file_name"].lower() in remaining or \
-                source["file_name"][:6].lower() in remaining_short:
+        name = source["file_name"].lower()
+        if name in named:
             raise _Refusal("destination_exists",
-                           f"{source['dest']} (or its 6-character short name) is already taken "
-                           "by an unrecognized file; it is never overwritten",
+                           "distinct part_ids produce the same stable file name",
                            path=source["dest"])
-    if prev is None:
-        clashes = [n for n in remaining if n in (MANIFEST_NAME.lower(), README_NAME.lower())]
-        if clashes:
+        named.add(name)
+        if name in remaining or source["dest"].lower() in foreign_current:
             raise _Refusal("destination_exists",
-                           f"{folder_rel} already holds unrecognized {clashes}; refusing to "
-                           "overwrite them", paths=clashes)
-    readme_rel = f"{folder_rel}/{README_NAME}"
-    readme_rec = by_path.get(readme_rel)
-    if prev is not None and readme_rec is not None and readme_rec.get("status") != \
-            "managed_metadata":
-        raise _Refusal("managed_file_modified",
-                       f"{readme_rel} was edited since it was published; restore or remove it",
-                       path=readme_rel)
-    archive_rel = None
-    if plan:
-        archive_rel = f"{ARCHIVE_DIR}/{folder}/{folder}_RETIRED_BY_R{revision:03d}.zip"
-        if any(a["path"].lower() == archive_rel.lower() for a in before["archives"]) or \
-                archive_rel in by_path:
-            raise _Refusal("destination_exists", f"{archive_rel} already exists",
-                           path=archive_rel)
-    need = sum(s["size"] for s in sources) + sum(p["size"] for p in plan) + 2 * 1024 * 1024
+                           f"{source['dest']} is already taken by another file or project; "
+                           "it is never overwritten", path=source["dest"])
+    new_sources = [] if cleanup_only else sources
+    if cleanup_only:
+        plan = []
+    need = sum(s["size"] for s in new_sources) + 2 * 1024 * 1024
     free = shutil.disk_usage(rootp).free
     if free < need:
         raise _Refusal("insufficient_space",
                        f"the drive has {free} bytes free and this publish needs about {need}",
                        free_bytes=free, needed_bytes=need)
-    for rel in [s["dest"] for s in sources] + [p["path"] for p in plan] + [readme_rel]:
+    paths_to_check = [s["dest"] for s in sources] + [p["path"] for p in plan]
+    paths_to_check += [readme_rel, manifest_rel, old_readme_rel, old_manifest_rel, JOURNAL_PATH]
+    paths_to_check.extend(item["path"] for item in delete_archives)
+    for rel in paths_to_check:
         _check_components(rootp, rel)
 
     # ---- stage everything off the printer's view, verified ----
-    if before["staging_leftovers"]:
-        _remove_tree(rootp / STAGING_DIR)
+    for leftover in before["staging_leftovers"]:
+        if leftover == LEGACY_STAGING_DIR or re.fullmatch(
+                rf"{re.escape(STAGING_DIR)}_[0-9a-f]{{12,32}}", leftover):
+            _check_components(rootp, leftover)
+            _remove_tree(rootp / leftover)
     txn = uuid.uuid4().hex[:16]
     created: list[Path] = []
-    txn_rel = f"{STAGING_DIR}/{txn}"
-    published_at = _now()
+    txn_rel = f"{STAGING_DIR}_{txn}"
+    published_at = prev["published_at"] if cleanup_only else _now()
     try:
         txn_dir = _ensure_dir(rootp, txn_rel, created)
-        for index, source in enumerate(sources):
+        for index, source in enumerate(new_sources):
             source["staged"] = f"{txn_rel}/new-{index:02d}{STAGED_SUFFIX}"
             _stage_copy(source["gcode_path"], rootp / source["staged"], source["sha256"])
-        archive_sha = None
-        if plan:
-            for index, item in enumerate(plan):
-                item["held"] = f"{txn_rel}/retired-{index:02d}{STAGED_SUFFIX}"
-            info = {"schema": "chudware.print_media_archive/1", "project": folder,
-                    "retired_by_revision": revision, "archived_at": published_at,
-                    "files": [{k: item[k] for k in ("path", "sha256", "size", "reason")}
-                              | {k: item[k] for k in ("part_id", "revision") if k in item}
-                              for item in plan]}
-            staged_zip = txn_dir / f"archive{STAGED_SUFFIX}"
-            archive_sha = _build_archive(rootp, staged_zip, plan, info)
-        current = [{
+        for index, item in enumerate(plan):
+            item["held"] = f"{txn_rel}/retired-{index:02d}{STAGED_SUFFIX}"
+        for index, item in enumerate(delete_archives):
+            item["held"] = f"{txn_rel}/old-archive-{index:02d}{STAGED_SUFFIX}"
+        current = prev["current"] if cleanup_only else [{
             "part_id": s["part_id"], "part_number": s["part_number"],
-            "code": s["file_name"][:6], "file_name": s["file_name"], "path": s["dest"],
+            "file_name": s["file_name"], "path": s["dest"],
             "sha256": s["sha256"], "size": s["size"], "part": s["part"],
             **({"plate": s["plate"]} if s["plate"] else {}),
             "printer": s["printer"],
@@ -1580,30 +1860,32 @@ def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[
                        "manifest_sha256": s["manifest_sha256"],
                        "gcode_path": str(s["gcode_path"]), "gcode_sha256": s["sha256"]},
             "warnings": s["warnings"],
+            **({"override": s["override"]} if s["override"] else {}),
         } for s in sources]
-        readme_bytes = _readme(folder, revision, published_at, current, archive_rel).encode()
-        history = list((prev or {}).get("history", []))
-        if prev is not None:
+        readme_bytes = _readme(folder, revision, published_at, current).encode()
+        history = [{k: v for k, v in item.items() if k != "archive"}
+                   for item in (prev or {}).get("history", [])]
+        if prev is not None and not cleanup_only:
             history.append({
                 "revision": prev["revision"], "release": f"R{prev['revision']:03d}",
                 "published_at": prev.get("published_at"), "retired_by": revision,
-                "archive": archive_rel,
                 "files": [{"part_id": e["part_id"], "path": e["path"], "sha256": e["sha256"],
                            "present_at_retirement": e["path"] in planned}
                           for e in prev["current"]]})
         manifest = {
             "schema": SCHEMA_MEDIA_MANIFEST, "project": folder, "revision": revision,
             "release": f"R{revision:03d}", "published_at": published_at,
-            "folder": folder_rel,
+            "folder": folder_rel, "layout": layout,
             "instructions": (
-                "Print only the files in 'current'. Each name starts with R<release:3><part:2>; "
-                f"R{revision:03d}01 is release {revision}, part 01. Retired releases are "
-                f"non-printable ZIP archives under {ARCHIVE_DIR}/{folder}/. Publish through "
-                "Chudware; files copied here by hand are reported as unmanaged."),
+                "Print only the files in 'current'. Stable part names select the current "
+                "revision; deprecated print files are permanently deleted after verification. "
+                "Publish through Chudware; hand-copied files are reported as unmanaged."),
             "part_numbers": {**numbers, **assigned},
             "current": current,
-            "retired": [{k: v for k, v in item.items() if k != "held"} for item in plan],
-            "archive": {"path": archive_rel, "sha256": archive_sha} if archive_rel else None,
+            "retired": (prev.get("retired", []) if cleanup_only else
+                        [{k: v for k, v in item.items() if k != "held"} for item in plan]),
+            "deleted": [{k: v for k, v in item.items() if k != "held"}
+                        for item in plan + delete_archives],
             "history": history,
             "readme_sha256": hashlib.sha256(readme_bytes).hexdigest(),
         }
@@ -1612,19 +1894,24 @@ def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[
         staged_manifest = txn_dir / f"manifest{STAGED_SUFFIX}"
         _write_staged(staged_readme, readme_bytes)
         _write_staged(staged_manifest, manifest_bytes)
-        manifest_rel = f"{folder_rel}/{MANIFEST_NAME}"
         old_manifest = by_path.get(manifest_rel, {}).get("_data") if prev is not None else None
         old_readme = None
-        if prev is not None and readme_rec is not None:
+        if prev is not None and old_manifest_rel == manifest_rel and readme_rec is not None:
             old_readme = _hash_path(rootp / readme_rel, keep_bytes=True)[2]
         journal = {
             "schema": SCHEMA_JOURNAL, "txn": txn, "phase": "swapping", "project": folder,
-            "revision": revision, "started_at": published_at,
+            "revision": revision, "started_at": published_at, "layout": layout,
+            "delete_archives": [{"path": p["path"], "held": p["held"], "sha256": p["sha256"]}
+                                for p in delete_archives],
+            "created_dirs": [folder] if layout == "project" and folder not in by_path else [],
+            "previous_layout": prev.get("layout", "legacy") if prev is not None else None,
+            "cleanup_legacy": bool(delete_archives or (prev is not None
+                                               and prev.get("layout", "legacy") == "legacy")
+                                   or LEGACY_STAGING_DIR in before["staging_leftovers"]),
             "retire": [{"path": p["path"], "held": p["held"], "sha256": p["sha256"]}
                        for p in plan],
             "place": [{"path": s["dest"], "staged": s["staged"], "sha256": s["sha256"]}
-                      for s in sources],
-            "archive": {"path": archive_rel, "sha256": archive_sha} if archive_rel else None,
+                      for s in new_sources],
             "metadata": [
                 {"path": readme_rel, "new_sha256": manifest["readme_sha256"],
                  "old": old_readme.decode("utf-8") if old_readme is not None else None},
@@ -1633,7 +1920,17 @@ def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[
                  "old": old_manifest.decode("utf-8") if old_manifest is not None else None},
             ],
         }
+        if prev is not None and old_manifest_rel != manifest_rel:
+            for rel in (old_readme_rel, old_manifest_rel):
+                rec = by_path.get(rel)
+                if rec is not None:
+                    data = rec.get("_data")
+                    if data is None:
+                        raise _Refusal("managed_manifest_invalid", f"{rel} cannot be read safely")
+                    journal["metadata"].append({
+                        "path": rel, "new_sha256": None, "old": data.decode("utf-8")})
         journal_bytes = json.dumps(journal, indent=2).encode("utf-8")
+        _validate_journal(journal)
     except BaseException as exc:
         _remove_tree(rootp / txn_rel)
         for path in reversed(created):
@@ -1652,22 +1949,32 @@ def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[
     # ---- swap under a journal; every step is reversible until 'committed' ----
     try:
         _atomic_replace(rootp, JOURNAL_PATH, journal_bytes, txn_dir)
-        _ensure_dir(rootp, folder_rel)
-        if archive_rel:
-            _ensure_dir(rootp, f"{ARCHIVE_DIR}/{folder}")
-            if _lexists(rootp / archive_rel):
-                raise _Refusal("destination_exists", f"{archive_rel} appeared during publish")
-            _move(txn_dir / f"archive{STAGED_SUFFIX}", rootp / archive_rel)
-        for item in plan:
+        if layout == "project":
+            _ensure_dir(rootp, folder_rel)
+        for item in plan + delete_archives:
             if _hash_or_none(rootp / item["path"]) != item["sha256"]:
                 raise _Refusal("retire_file_changed", f"{item['path']} changed during publish")
             _move(rootp / item["path"], rootp / item["held"])
-        for source in sources:
+        for source in new_sources:
             if _lexists(rootp / source["dest"]):
                 raise _Refusal("destination_exists", f"{source['dest']} appeared during publish")
             _move(rootp / source["staged"], rootp / source["dest"])
         _move(staged_readme, rootp / readme_rel)
         _move(staged_manifest, rootp / manifest_rel)
+        for item in journal["metadata"]:
+            if item["new_sha256"] is None:
+                expected = hashlib.sha256(item["old"].encode("utf-8")).hexdigest()
+                if _hash_or_none(rootp / item["path"]) != expected:
+                    raise _Refusal("managed_file_modified", f"{item['path']} changed during migration")
+                os.unlink(rootp / item["path"])
+                _fsync_dir((rootp / item["path"]).parent)
+        problems = _verify_commit(rootp, journal, held_required=True)
+        if problems:
+            raise _Refusal("post_publish_verification_failed",
+                           "the new set failed readback before commit", problems=problems)
+        journal["phase"] = "committed"
+        _atomic_replace(rootp, JOURNAL_PATH, json.dumps(journal, indent=2).encode("utf-8"),
+                        txn_dir)
     except BaseException as exc:
         problems = _rollback(rootp, journal)
         if not isinstance(exc, Exception):
@@ -1682,15 +1989,12 @@ def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[
                        "was restored and nothing new was published",
                        current_set_untouched=True) from exc
 
-    # ---- commit: retired bytes live in the verified archive; drop the held copies ----
+    # ---- committed: reverify the live set before permanently deleting held old bytes ----
     warnings: list[dict] = []
-    journal["phase"] = "committed"
     try:
-        _atomic_replace(rootp, JOURNAL_PATH, json.dumps(journal, indent=2).encode("utf-8"),
-                        txn_dir)
-        _remove_tree(txn_dir)
-        os.unlink(rootp / JOURNAL_PATH)
-        _tidy_staging(rootp)
+        problems = _roll_forward(rootp, journal)
+        if problems:
+            raise OSError("; ".join(problems))
     except OSError as exc:
         warnings.append({"code": "cleanup_incomplete",
                          "message": f"the new set is live but transaction cleanup failed ({exc}); "
@@ -1706,10 +2010,14 @@ def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[
         rec = after_by_path.get(entry["path"])
         if rec is None or rec.get("status") != "current":
             failures.append(f"{entry['path']} is not present as the current managed file")
+    current_paths = {entry["path"] for entry in current}
     for item in plan:
-        if item["path"] in after_by_path:
+        if item["path"] in after_by_path and item["path"] not in current_paths:
             failures.append(f"retired {item['path']} is still on the drive")
-    stray = [rec["path"] for rec in after["_records"] if rec.get("printable")
+    for item in delete_archives:
+        if item["path"] in after_by_path:
+            failures.append(f"deprecated archive {item['path']} is still on the drive")
+    stray = [rec["path"] for rec in after["_records"] if layout == "project" and rec.get("printable")
              and rec["path"].startswith(folder_prefix) and rec.get("status") != "current"]
     if stray:
         failures.append(f"non-current printables remain in {folder_rel}: {stray}")
@@ -1718,23 +2026,33 @@ def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[
                        "the drive does not show exactly the published set after publishing",
                        problems=failures, inventory=_summary(after))
     return _result(rootp, folder, after, status="published", revision=revision,
-                   current=current, retired=manifest["retired"],
-                   archive=manifest["archive"], warnings=warnings)
+                   current=current,
+                   retired=[{k: v for k, v in item.items() if k != "held"} for item in plan],
+                   deleted=manifest["deleted"] if not any(
+                       w["code"] == "cleanup_incomplete" for w in warnings) else [],
+                   warnings=warnings)
 
 
 def _result(rootp: Path, folder: str, inv: dict, *, status: str, revision: int,
-            current: list[dict], retired: list[dict], archive: Optional[dict],
+            current: list[dict], retired: list[dict], deleted: list[dict],
             warnings: list[dict]) -> dict:
     unmanaged = [r["path"] for r in inv["unmanaged_printables"]]
     reconciled = bool(inv["reconciled"])
-    warnings = list(warnings)
+    warnings = [{
+        "code": "published_not_print_ready",
+        "part_id": e["part_id"], "path": e["path"],
+        "failed_checks": e["override"]["failed_checks"],
+        "message": f"{e['path']} is not print_ready (failed: "
+                   f"{', '.join(e['override']['failed_checks'])}); it is on the media only "
+                   f"because the user asked: {e['override']['user_override']}"}
+        for e in current if e.get("override")] + list(warnings)
     if not reconciled:
         status = f"{status}_unreconciled"
         warnings.append({
             "code": "drive_not_reconciled",
             "message": "the project's set is published, but the drive still holds printables "
                        "that are not current managed jobs (see unmanaged_printables and "
-                       "inventory.warnings); review them and pass retire_paths to archive the "
+                       "inventory.warnings); review them and pass retire_paths to delete the "
                        "obsolete ones"})
     return {
         "ok": True,
@@ -1742,13 +2060,15 @@ def _result(rootp: Path, folder: str, inv: dict, *, status: str, revision: int,
         "changed": status.startswith("published"),
         "root": str(rootp),
         "project": folder,
-        "folder": f"{PRINT_DIR}/{folder}",
+        "folder": inv["_projects"][folder].get("folder", f"{PRINT_DIR}/{folder}"),
+        "layout": inv["_projects"][folder].get("layout", "legacy"),
         "revision": revision,
         "release": f"R{revision:03d}",
         "current": [{k: e.get(k) for k in ("part_id", "part_number", "file_name", "path",
-                                           "sha256", "size", "warnings")} for e in current],
+                                           "sha256", "size", "warnings", "override")
+                     if k != "override" or e.get(k)} for e in current],
         "retired": retired,
-        "archive": archive,
+        "deleted": deleted,
         "unmanaged_printables": unmanaged,
         "reconciled": reconciled,
         "inventory_token": inv["inventory_token"],

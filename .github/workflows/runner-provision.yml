@@ -47,8 +47,11 @@ jobs:
     # The label choice selects the platform; the other job would otherwise queue
     # against a runner set that can never match and sit there until GitHub
     # fails it 24 hours later.
-    if: startsWith(inputs.runner_label, 'cc-win-')
-    runs-on: [self-hosted, Windows, X64, cloudcastle-ci, "${{ inputs.runner_label }}"]
+    if: ${{ (github.ref_protected && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')) && (startsWith(inputs.runner_label, 'cc-win-')) }}
+    environment: chudware-release-protected
+    runs-on:
+      group: chudware-trusted-protected
+      labels: [self-hosted, Windows, X64, cloudcastle-ci, "${{ inputs.runner_label }}"]
     timeout-minutes: 60
     steps:
 
@@ -59,34 +62,41 @@ jobs:
           $tools = Join-Path $env:USERPROFILE 'chudware-ci-tools'
           $innoDir = Join-Path $tools 'innosetup'
           $iscc = Join-Path $innoDir 'ISCC.exe'
-          if (Test-Path $iscc) {
-            Write-Host "Inno Setup already unpacked at $innoDir"
-          } else {
-            $work = Join-Path $env:TEMP 'inno-provision'
-            New-Item -ItemType Directory -Force $work | Out-Null
-            $isexe = Join-Path $work 'is.exe'
-            $innounpZip = Join-Path $work 'innounp.zip'
-            $innounpDir = Join-Path $work 'innounp'
-            Write-Host "downloading Inno Setup installer..."
-            Invoke-WebRequest -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $isexe -UserAgent 'Mozilla/5.0'
-            if ((Get-Item $isexe).Length -lt 1000000) { throw "is.exe download looks wrong (too small); install Inno Setup 6 manually" }
-            Write-Host "downloading innounp..."
-            Invoke-WebRequest -Uri 'https://www.rathlev-home.de/tools/download/innounp-2.zip' -OutFile $innounpZip -UserAgent 'Mozilla/5.0'
-            Expand-Archive $innounpZip $innounpDir -Force
-            $innounp = Get-ChildItem $innounpDir -Recurse -Filter innounp.exe | Select-Object -First 1
-            if (-not $innounp) { throw "innounp.exe not found in its archive" }
-            Write-Host "extracting Inno Setup payload..."
-            & $innounp.FullName -x -y -d"$innoDir" $isexe | Out-Null
-            # innounp unpacks into {app}\ below the target dir.
-            $found = Get-ChildItem $innoDir -Recurse -Filter ISCC.exe | Select-Object -First 1
-            if (-not $found) { throw "ISCC.exe not found after extraction" }
-            if ($found.FullName -ne $iscc) {
-              Get-ChildItem (Split-Path $found.FullName) -Recurse | Copy-Item -Destination $innoDir -Force -Recurse
-            }
-            if (-not (Test-Path $iscc)) { throw "ISCC.exe missing after flatten" }
-            Remove-Item $work -Recurse -Force
-            Write-Host "Inno Setup unpacked to $innoDir"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $cache = Join-Path $tools 'bootstrap-archives'
+          New-Item -ItemType Directory -Force $cache | Out-Null
+          $isexe = Join-Path $cache 'innosetup-6.7.3.exe'
+          $innounpZip = Join-Path $cache 'innounp-ui_2_2_13.zip'
+          # Primary digests: GitHub release APIs for jrsoftware/issrc is-6_7_3
+          # and jrathlev/InnoUnpacker-Windows-GUI ui_2_2_13.
+          if (-not (Test-Path $isexe)) {
+            Invoke-WebRequest -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $isexe
           }
+          if ((Get-FileHash -Algorithm SHA256 $isexe).Hash.ToLowerInvariant() -ne '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732') {
+            throw 'Inno Setup archive SHA-256 mismatch; refusing extraction'
+          }
+          if (-not (Test-Path $innounpZip)) {
+            Invoke-WebRequest -Uri 'https://github.com/jrathlev/InnoUnpacker-Windows-GUI/releases/download/ui_2_2_13/innounp-2.zip' -OutFile $innounpZip
+          }
+          if ((Get-FileHash -Algorithm SHA256 $innounpZip).Hash.ToLowerInvariant() -ne 'f2f037fdbc63de31248efae9ccb294398d160dc0cbad5f36d14c2f159e17bbf5') {
+            throw 'innounp archive SHA-256 mismatch; refusing extraction/execution'
+          }
+          $work = Join-Path $env:RUNNER_TEMP ("inno-authenticated-" + [Guid]::NewGuid().ToString('N'))
+          $innounpDir = Join-Path $work 'innounp'
+          $payload = Join-Path $work 'payload'
+          Expand-Archive $innounpZip $innounpDir
+          $extractors = @(Get-ChildItem $innounpDir -Recurse -Filter innounp.exe)
+          if ($extractors.Count -ne 1) { throw 'Expected exactly one authenticated innounp.exe' }
+          & $extractors[0].FullName -x -y -d"$payload" $isexe | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "innounp extraction failed ($LASTEXITCODE)" }
+          $compilers = @(Get-ChildItem $payload -Recurse -Filter ISCC.exe)
+          if ($compilers.Count -ne 1) { throw 'Expected exactly one authenticated ISCC.exe' }
+          # Do not retain unchecked files from an earlier tool installation.
+          if (Test-Path $innoDir) { Remove-Item $innoDir -Recurse -Force }
+          Copy-Item (Split-Path $compilers[0].FullName) $innoDir -Recurse
+          if (-not (Test-Path $iscc)) { throw 'ISCC.exe missing after authenticated provisioning' }
+          Remove-Item $work -Recurse -Force
+          Write-Host "Authenticated Inno Setup unpacked to $innoDir"
 
       - name: Capability report
         shell: powershell
@@ -102,8 +112,11 @@ jobs:
 
   provision-macos:
     name: Provision macOS packaging runner
-    if: startsWith(inputs.runner_label, 'cc-mac-')
-    runs-on: [self-hosted, macOS, cloudcastle-ci, "${{ inputs.runner_label }}"]
+    if: ${{ (github.ref_protected && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')) && (startsWith(inputs.runner_label, 'cc-mac-')) }}
+    environment: chudware-release-protected
+    runs-on:
+      group: chudware-trusted-protected
+      labels: [self-hosted, macOS, cloudcastle-ci, "${{ inputs.runner_label }}"]
     timeout-minutes: 90
     env:
       # cmake/ninja because the macos-* presets build with Ninja; python@3.13
@@ -150,73 +163,41 @@ jobs:
             fi
           done
 
-      - name: Provision the release Python (Nuitka, cryptography)
+      - name: Provision authenticated complete release Python
         shell: bash
         run: |
           set -euo pipefail
-          for dir in /opt/homebrew/bin /usr/local/bin; do
-            if [ -d "${dir}" ]; then PATH="${dir}:${PATH}"; fi
-          done
-          export PATH
-
+          # These nonsecret inputs come from the attested runner image, not an
+          # existing venv or a public package-index resolver.
+          : "${CHUDWARE_CI_BASE_PYTHON:?image-qualified base Python is required}"
+          : "${CHUDWARE_WHEELHOUSE:?reviewed complete offline wheelhouse is required}"
+          case "${CHUDWARE_CI_BASE_PYTHON}" in
+            /*) ;; *) echo '::error::base Python must be an absolute image-qualified path'; exit 1 ;;
+          esac
+          case "${CHUDWARE_WHEELHOUSE}" in
+            /*) ;; *) echo '::error::wheelhouse must be an absolute reviewed path'; exit 1 ;;
+          esac
+          while IFS= read -r variable; do
+            case "${variable}" in PYTHON*|LD_*|DYLD_*) unset "${variable}" ;; esac
+          done < <(compgen -e)
           venv="${HOME}/${RELEASE_VENV_SUBDIR}"
-          if [ -x "${venv}/bin/python3" ] \
-            && "${venv}/bin/python3" -c 'import cryptography, nuitka' >/dev/null 2>&1; then
-            # Still sync: a working venv can predate a new pin in the file.
-            "${venv}/bin/python3" -m pip install --quiet -r packaging/requirements-release.txt
-            echo "release python synced: $("${venv}/bin/python3" --version)"
-            exit 0
-          fi
-
-          # Homebrew's interpreter is externally managed (PEP 668), so the
-          # release dependencies live in a venv rather than in the formula.
-          base=""
-          for candidate in python3.14 python3.13 python3.12 python3.11; do
-            resolved="$(command -v "${candidate}" 2>/dev/null || true)"
-            [ -n "${resolved}" ] || continue
-            "${resolved}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
-              >/dev/null 2>&1 || continue
-            base="${resolved}"
-            break
-          done
-          [ -n "${base}" ] || {
-            echo '::error::no python 3.11+ on PATH after installing python@3.13; check the brew step above'
-            exit 1
-          }
-          echo "base interpreter=${base} ($("${base}" --version 2>&1))"
-
-          mkdir -p "$(dirname "${venv}")"
-          rm -rf "${venv}"
-          "${base}" -m venv "${venv}"
-          "${venv}/bin/python3" -m pip install --upgrade pip
-          "${venv}/bin/python3" -m pip install -r packaging/requirements-release.txt
-          "${venv}/bin/python3" -c 'import cryptography, nuitka; print("release python deps installed")'
+          VENV_DIR="${venv}" PYTHON="${CHUDWARE_CI_BASE_PYTHON}" \
+            bash scripts/provision_venv.sh
+          # The complete reviewed target must include applicable packaging
+          # requirements as authenticated wheels before sidecar compilation.
+          "${CHUDWARE_CI_BASE_PYTHON}" -I -S -c \
+            'import sys; sys.path.insert(0, sys.argv[1]); from services.installer.provision import main; sys.exit(main(sys.argv[2:]))' \
+            "${PWD}" --check-inputs --venv-dir "${venv}" \
+            --base-python "${CHUDWARE_CI_BASE_PYTHON}" --wheelhouse "${CHUDWARE_WHEELHOUSE}"
+          echo "authenticated release python: ${venv}/bin/python"
 
       - name: Provision the CEF SDK
         shell: bash
         run: |
           set -euo pipefail
-          # The release build enables the CEF webview and cef.cmake takes it from
-          # -DCEF_ROOT; the nightly resolves the newest dir under ~/chudware-cef-sdk.
-          root="${HOME}/chudware-cef-sdk"
-          if ls -d "${root}"/cef_binary_* >/dev/null 2>&1; then
-            echo "CEF SDK already present: $(ls -d "${root}"/cef_binary_* | head -1)"
-            exit 0
-          fi
-          case "$(uname -m)" in
-            arm64) flavor=macosarm64 ;;
-            x86_64) flavor=macosx64 ;;
-            *) echo "::error::unhandled mac arch $(uname -m)"; exit 1 ;;
-          esac
-          version="149.0.6+g0d0eeb6+chromium-149.0.7827.201"
-          fname="cef_binary_${version}_${flavor}_minimal.tar.bz2"
-          url="https://cef-builds.spotifycdn.com/$(printf '%s' "${fname}" | sed 's/+/%2B/g')"
-          mkdir -p "${root}"
-          echo "downloading ${url}"
-          curl -fL --retry 3 -o "${root}/${fname}" "${url}"
-          tar -xjf "${root}/${fname}" -C "${root}"
-          rm -f "${root}/${fname}"
-          ls -d "${root}"/cef_binary_* || { echo "::error::CEF SDK extract produced nothing"; exit 1; }
+          # The release consumer reauthenticates the same exact pinned archive
+          # into its own run directory immediately before CMake.
+          bash scripts/fetch_cef_posix.sh
 
       - name: Capability report
         shell: bash
@@ -280,8 +261,11 @@ jobs:
 
   provision-linux:
     name: Provision Linux release runner
-    if: inputs.runner_label == 'cc-linux-build'
-    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-build]
+    if: ${{ (github.ref_protected && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')) && (inputs.runner_label == 'cc-linux-build') }}
+    environment: chudware-release-protected
+    runs-on:
+      group: chudware-trusted-protected
+      labels: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-build]
     timeout-minutes: 60
     env:
       # nightly-release's linux-beta job packages the verified AppDir as a .deb and an
@@ -330,7 +314,7 @@ jobs:
           # before installing rather than half-way through: `sudo -n true` fails
           # immediately when sudo would prompt.
           if ! sudo -n true >/dev/null 2>&1; then
-            echo "::error::${RUNNER_NAME:-unknown} has no passwordless sudo, so CI cannot install ${packages} unattended. Run 'sudo ${manager} install -y ${packages}' on that host as the login user, then re-run this workflow. Without them nightly-release publishes the AppImage and SILENTLY publishes no .deb and no .rpm (its packaging step degrades to a warning on purpose, so the gap does not show up as a failed build)."
+            echo "::error::${RUNNER_NAME:-unknown} has no passwordless sudo, so CI cannot install ${packages} unattended. Run 'sudo ${manager} install -y ${packages}' on the qualified protected host, then re-run this workflow. Nightly release requires .deb and .rpm tools and fails before publication when they are missing."
             exit 1
           fi
 
@@ -349,28 +333,31 @@ jobs:
           echo "rpmbuild: $(rpmbuild --version)"
           echo "xz:       $(xz --version | head -n 1)"
 
-      - name: Provision the release Python (Nuitka, cryptography, pyyaml)
+      - name: Provision authenticated complete release Python
         shell: bash
         run: |
           set -euo pipefail
-          # The AppImage compiles the Python sidecars with Nuitka; the system
-          # interpreter is externally managed (PEP 668), so the release
-          # dependencies live in this venv, which the nightly resolves as
-          # CHUDWARE_RELEASE_PYTHON.
+          : "${CHUDWARE_CI_BASE_PYTHON:?image-qualified base Python is required}"
+          : "${CHUDWARE_WHEELHOUSE:?reviewed complete offline wheelhouse is required}"
+          case "${CHUDWARE_CI_BASE_PYTHON}" in
+            /*) ;; *) echo '::error::base Python must be an absolute image-qualified path'; exit 1 ;;
+          esac
+          case "${CHUDWARE_WHEELHOUSE}" in
+            /*) ;; *) echo '::error::wheelhouse must be an absolute reviewed path'; exit 1 ;;
+          esac
+          while IFS= read -r variable; do
+            case "${variable}" in PYTHON*|LD_*|DYLD_*) unset "${variable}" ;; esac
+          done < <(compgen -e)
           venv="${HOME}/chudware-ci-tools/release-python"
-          if [ -x "${venv}/bin/python3" ] \
-            && "${venv}/bin/python3" -c 'import nuitka, cryptography, yaml' >/dev/null 2>&1; then
-            # Still sync: a working venv can predate a new pin in the file.
-            "${venv}/bin/python3" -m pip install --quiet -r packaging/requirements-release.txt
-            echo "release python synced: $("${venv}/bin/python3" --version)"
-            exit 0
-          fi
-          mkdir -p "$(dirname "${venv}")"
-          rm -rf "${venv}"
-          python3 -m venv "${venv}"
-          "${venv}/bin/python3" -m pip install --quiet --upgrade pip
-          "${venv}/bin/python3" -m pip install --quiet -r packaging/requirements-release.txt
-          "${venv}/bin/python3" -c 'import nuitka, cryptography, yaml; print("release python deps installed")'
+          # Authenticate every wheel before any venv mutation. An unverified
+          # existing venv is preserved and requires explicit approved replacement.
+          VENV_DIR="${venv}" PYTHON="${CHUDWARE_CI_BASE_PYTHON}" \
+            bash scripts/provision_venv.sh
+          "${CHUDWARE_CI_BASE_PYTHON}" -I -S -c \
+            'import sys; sys.path.insert(0, sys.argv[1]); from services.installer.provision import main; sys.exit(main(sys.argv[2:]))' \
+            "${PWD}" --check-inputs --venv-dir "${venv}" \
+            --base-python "${CHUDWARE_CI_BASE_PYTHON}" --wheelhouse "${CHUDWARE_WHEELHOUSE}"
+          echo "authenticated release python: ${venv}/bin/python"
 
       - name: Capability report
         shell: bash
@@ -378,11 +365,9 @@ jobs:
           set -uo pipefail
           venv="${HOME}/chudware-ci-tools/release-python/bin/python3"
           missing=0
-          # rpmbuild and xz are asserted here, not merely installed above, because
-          # nightly-release's packaging step degrades to a ::warning:: when they are
-          # absent: without this line a runner that lost them would publish the AppImage
-          # and quietly stop publishing .deb and .rpm, and nothing would go red. Caught
-          # at provision time instead of at 3am in a release job.
+          # Native .deb/.rpm outputs are required, not best-effort omissions.
+          # Report missing capabilities during qualification, before a long
+          # release job reaches its mandatory package/evidence/signature gates.
           for tool in cmake ninja ctest xvfb-run rsync strip rpmbuild xz; do
             if command -v "${tool}" >/dev/null 2>&1; then
               printf '%-22s %s\n' "${tool}" "$(command -v "${tool}")"

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """MCP Runtime Audit — sonnet-vega, T-V2.
 
-Calls every registered MCP tool through the real mcp-venv with CHUDWARE_LIBCHUDWARE set
-and records WORKS / DEGRADED / DEAD / INCONCLUSIVE verdicts.
+Calls every registered MCP tool through the real mcp-venv using the canonical core
+library resolver and records WORKS / DEGRADED / DEAD / INCONCLUSIVE verdicts.
 
 Usage:
-    CHUDWARE_LIBCHUDWARE=/home/hunter/Repositories/CAD/core/build-linux/bin/libchudware.so \\
+    CHUDWARE_LIBCHUDWARE=/home/hunter/Repositories/CAD/core/build-occt-linux/bin/libchudware.so \\
         /home/hunter/.local/share/Chudware/mcp-venv/bin/python scripts/mcp_runtime_audit.py
 
     # Or with a custom output path:
@@ -39,13 +39,6 @@ from typing import Any
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
-LIBCHUDWARE = os.environ.get(
-    "CHUDWARE_LIBCHUDWARE",
-    str(_REPO / "core/build-linux/bin/libchudware.so"),
-)
-os.environ.setdefault("CHUDWARE_LIBCHUDWARE", LIBCHUDWARE)
-# Suppress OCCT noise on stdout (audit script is not an MCP stdio server)
-os.environ.setdefault("CHUDWARE_QUIET", "1")
 
 # ---------------------------------------------------------------------------
 # Families and their registration functions (mirrors server.py exactly)
@@ -432,7 +425,7 @@ def check_dependencies(req_file: Path | None = None) -> dict:
     applicable = 0
     for raw_line in req_file.read_text().splitlines():
         line = raw_line.split("#", 1)[0].strip()
-        if not line:
+        if not line or line in ("--no-index", "--only-binary=:all:"):
             continue
         requirement = Requirement(line)
         pkg = canonicalize_name(requirement.name)
@@ -456,6 +449,9 @@ def check_dependencies(req_file: Path | None = None) -> dict:
 def run_audit(out_path: Path | None = None) -> dict:
     from mcp.server.fastmcp import FastMCP
     import services.mcp.tool_registry as _reg
+    from services.mcp import core_bridge
+
+    libchudware = str(core_bridge._resolve_lib())
 
     mcp = FastMCP("Chudware-audit")
 
@@ -614,7 +610,7 @@ def run_audit(out_path: Path | None = None) -> dict:
         "declared_missing": declared_missing,
         "undeclared_deps": undeclared,
         "total_tools": len(all_tools),
-        "libchudware": LIBCHUDWARE,
+        "libchudware": libchudware,
     }
 
 
@@ -720,12 +716,13 @@ def make_markdown(data: dict) -> str:
             detail = fam_dead[0]["detail"][:80] if fam_dead else ""
             lines.append(f"| Provision `{fam}` family deps | {len(fam_dead)} dead tools | {detail} |")
         lines.append("")
-        lines.append("### Missing packages to install (pip lines):")
+        lines.append("### Missing runtime declarations:")
         lines.append("")
         for d in data.get("declared_missing", []):
-            lines.append(f"```")
-            lines.append(f"pip install {d['req_line'].split('#')[0].strip()}")
-            lines.append(f"```")
+            lines.append(f"- `{d['req_line'].split('#')[0].strip()}`")
+        lines.append("Provision the complete reviewed offline runtime with "
+                     "`CHUDWARE_WHEELHOUSE=/reviewed/wheelhouse scripts/provision_venv.sh`; "
+                     "never install the private RPC package from an index or editable checkout.")
         lines.append("")
 
     # Test pollution section (filled in separately — see audit script output)
@@ -958,13 +955,13 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"=== MCP Runtime Audit T-V2 ===")
-    print(f"Library: {LIBCHUDWARE}")
     print(f"Venv: {sys.executable}")
     print()
 
     if not args.no_tools:
         print("=== Tool-level calls ===")
         data = run_audit(out_path)
+        print(f"Library: {data['libchudware']}")
         md = make_markdown(data)
 
         if args.test_pollution:
@@ -997,4 +994,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # The explicit CLI owns stdout; importing audit helpers must not reconfigure MCP.
+    os.environ.setdefault("CHUDWARE_QUIET", "1")
     main()

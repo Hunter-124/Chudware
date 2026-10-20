@@ -27,6 +27,9 @@
 #include "layout.h"  // drawConfigurationsBody fallback
 
 #include "../core/app_state.h"
+#ifdef __EMSCRIPTEN__
+#include "../core/jobs.h"
+#endif
 #include "file_dialog.h"
 #include "../core/fs_backend.h"
 #include "../core/cpp_core.h"
@@ -4747,7 +4750,11 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         static bool s_sessInFlight = false;
         static std::string s_sessStatus;
         static bool s_sessStatusErr = false;
+#ifdef __EMSCRIPTEN__
+        const std::string sess = cellAgentSessionHandle(st.activeConvId());
+#else
         const std::string sess = st.activeConvId();
+#endif
         if (sess != s_sessFor) {
             s_sessFor = sess;
             s_sessAutoCompaction = true;
@@ -8071,7 +8078,11 @@ void drawSettingsModal(AppState& st, bool busy) {
                             static std::string s_ccError;
                             static std::string s_ccFor;
                             static double s_ccAt = -1e9;
+#ifdef __EMSCRIPTEN__
+                            const std::string ccSess = cellAgentSessionHandle(st.activeConvId());
+#else
                             const std::string ccSess = st.activeConvId();
+#endif
                             if (ccSess != s_ccFor) {
                                 s_ccFor = ccSess;
                                 s_ccLoaded = false;

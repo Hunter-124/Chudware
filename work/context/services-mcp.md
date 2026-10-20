@@ -45,6 +45,12 @@ Canonical guidance:
 - `services/mcp/cad_common.py` — doc registry/handoff, `_publish_current`, autosave (daemon
   mode: hostd is the only autosave authority), `save_touched_docs`, durable jobs;
   `cad_guide.py` `cad_guide_text(topic)` backs the `cad_guide` tool.
+  - `resolve_agent_path` and `_sanitize_output_path` resolve explicit relative destinations
+    against `CHUDWARE_PROJECT_DIR`, then `CHUDWARE_FS_ROOT`, never process cwd. The first
+    configured root is authoritative: canonicalize it without widening to parent project
+    markers; refuse missing/non-directory roots instead of falling back. Absolute/tilde
+    destinations need no root and remain outside the fs_* jail; the output sanitizer
+    denies credential/key locations after symlink resolution.
   - `show_in_app` in daemon mode confirms the document is open and returns `live:true`;
     it does not publish a handoff file or force the user's active tab. Legacy mode still
     writes the handoff.
@@ -57,6 +63,12 @@ Canonical guidance:
   into a facade.
   - CAD: `cad_{doc,eval,render,exchange,sim,asm,drawing,motion,animation}_tools.py` over
     `cad_common.py`.
+    Atomic mutation diagnosis uses native `rejected_tree` and `feature_status`,
+    not the restored live tree; provider failure must retain native error evidence.
+    Live verification replays canonical feature envelopes with sparse-ID remapping
+    in internal temporary documents, never handmade STEP+ containers.
+    Native STL checks serialized facets and source-solid edge closure; preserve
+    export refusals instead of quietly healing output or claiming print readiness.
   - ECAD: `ecad_{sch,pcb,sim,qa}_tools.py` over `ecad_common.py`. ECAD docs live in
     `core/ecad`; the facade is RPC-backed.
   - Reverse engineering: `reveng_{session,build}_tools.py` over `reveng_common.py`.
@@ -109,6 +121,11 @@ other service-only tools keep their own implementations. There is no C++ MCP ser
   otherwise corrupt JSON-RPC.
 - Gotcha: `core_bridge.available()` dlopens libchudware in-process even in daemon mode. It
   is a presence probe, not a hostd connect.
+
+- Printing precision: `print_tools._write_slicer_stl` refuses topology lost during float32
+  placement; origin-centred single-part meshes defer bed placement to PrusaSlicer.
+  Requested 3MF load-time repair evidence participates in readiness. Native DFM retains
+  face attribution; raw-mesh bore recognition must not merge tangent flares into the bore.
 
 ## Graphify starters
 - graphify query "services.mcp server register tool_registry view core_bridge call"

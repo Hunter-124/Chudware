@@ -18,6 +18,7 @@ import io
 import json
 import os
 import re
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,9 @@ MAX_EDGE_PX = 1568
 #: Encoded bytes per image. Anthropic refuses an image whose base64 form exceeds 5 MB;
 #: 3 MiB raw is 4 MiB of base64.
 MAX_BYTES = 3 * 1024 * 1024
+#: Bound source reads before decode/base64, including files growing during a read.
+MAX_SOURCE_BYTES = 20 * 1024 * 1024
+MAX_SOURCE_PIXELS = 20 * 1024 * 1024
 #: Downscaling stops at this edge: vision backends reject images below 200 px.
 MIN_EDGE_PX = 200
 
@@ -94,6 +98,8 @@ def image_ref(value: Any) -> dict[str, Any] | None:
         if path is not None:
             return {"kind": "image", "path": os.fspath(path), "mime": mime}
         data = getattr(value, "data", None)
+        if isinstance(data, (bytes, bytearray)) and len(data) > MAX_SOURCE_BYTES:
+            raise ImageUnavailable("inline image exceeds the image source byte limit")
         if isinstance(data, (bytes, bytearray)) and data:
             return {"kind": "image", "path": materialize(bytes(data), mime), "mime": mime}
         return None
@@ -101,6 +107,8 @@ def image_ref(value: Any) -> dict[str, Any] | None:
         data = getattr(value, "data", None)
         mime = getattr(value, "mimeType", None)
         if isinstance(data, str) and data and isinstance(mime, str):
+            if len(data) > 4 * ((MAX_SOURCE_BYTES + 2) // 3):
+                raise ImageUnavailable("inline image exceeds the image source byte limit")
             return {
                 "kind": "image",
                 "path": materialize(base64.b64decode(data), mime),
@@ -111,6 +119,8 @@ def image_ref(value: Any) -> dict[str, Any] | None:
 
 def materialize(data: bytes, mime: str) -> str:
     """Write image bytes into the durable render cache and return the path."""
+    if len(data) > MAX_SOURCE_BYTES:
+        raise ImageUnavailable("image exceeds the image source byte limit")
     from services.mcp.cad_common import render_output_path  # noqa: PLC0415 - heavy, rare
 
     path = render_output_path("tool-image", _SUFFIXES.get(mime, ".bin"))
@@ -245,6 +255,24 @@ def _with_size(ref: Mapping[str, Any]) -> dict[str, Any]:
     return described
 
 
+def read_image_bytes(path: str, *, max_bytes: int = MAX_SOURCE_BYTES) -> bytes:
+    """Read a regular image source through a hard byte ceiling, never to EOF."""
+    try:
+        fd = os.open(Path(path).expanduser(), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise ImageUnavailable(f"{path} is not a regular image file")
+            if info.st_size > max_bytes:
+                raise ImageUnavailable(f"{path} exceeds the image source byte limit ({max_bytes})")
+            raw = source.read(max_bytes + 1)
+            if len(raw) > max_bytes or os.fstat(source.fileno()).st_size > max_bytes:
+                raise ImageUnavailable(f"{path} exceeds the image source byte limit ({max_bytes})")
+            return raw
+    except OSError as exc:
+        raise ImageUnavailable(f"{path} is unreadable: {exc.strerror or exc}") from exc
+
+
 def load_model_image(path: str) -> ModelImage:
     """Load *path* as model-ready image bytes within :data:`MAX_EDGE_PX`/:data:`MAX_BYTES`.
 
@@ -253,15 +281,14 @@ def load_model_image(path: str) -> ModelImage:
     limit, then further by 0.8 steps until it fits the byte limit — never dropped.
     Raises :class:`ImageUnavailable` for an unreadable file or undecodable bytes.
     """
-    try:
-        raw = Path(path).read_bytes()
-    except OSError as exc:
-        raise ImageUnavailable(f"{path} is unreadable: {exc.strerror or exc}") from exc
+    raw = read_image_bytes(path)
     from PIL import Image, UnidentifiedImageError  # noqa: PLC0415
 
     try:
         with Image.open(io.BytesIO(raw)) as img:
             size = (int(img.width), int(img.height))
+            if size[0] * size[1] > MAX_SOURCE_PIXELS:
+                raise ImageUnavailable(f"{path} exceeds the image source pixel limit ({MAX_SOURCE_PIXELS})")
             mime = _MODEL_FORMATS.get(img.format or "")
             if mime is not None and max(size) <= MAX_EDGE_PX and len(raw) <= MAX_BYTES:
                 return ModelImage(raw, mime, size, size, reencoded=False)
@@ -294,6 +321,8 @@ def _reencode(img: Any, original: tuple[int, int]) -> ModelImage:
         else:
             shot.save(buffer, format=fmt)
         data = buffer.getvalue()
-        if len(data) <= MAX_BYTES or min(size) <= MIN_EDGE_PX:
+        if len(data) <= MAX_BYTES:
             return ModelImage(data, mime, size, original, reencoded=True)
+        if min(size) <= MIN_EDGE_PX:
+            raise ImageUnavailable("image cannot fit the model byte limit at the minimum edge")
         scale *= 0.8

@@ -7,6 +7,7 @@ flat ``templates.py`` when the package was split for the T-F15 engineering templ
 from __future__ import annotations
 
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 from . import Template, register_template, slot_lines
 
@@ -73,11 +74,11 @@ def _build_report_pdf(resolved: dict, out_path: Path) -> None:
     flow = []
     for blk in resolved["blocks"]:
         style = styles["Title"] if blk["type"] == "title" else styles["Heading2"]
-        flow.append(Paragraph(blk.get("heading") or resolved.get("title", ""), style))
+        flow.append(Paragraph(escape(blk.get("heading") or resolved.get("title", "")), style))
         for line in blk.get("body", []):
-            flow.append(Paragraph(line, styles["BodyText"]))
+            flow.append(Paragraph(escape(line), styles["BodyText"]))
         for line in slot_lines(blk):
-            flow.append(Paragraph(line, styles["BodyText"]))
+            flow.append(Paragraph(escape(line), styles["BodyText"]))
         flow.append(Spacer(1, 12))
     SimpleDocTemplate(str(out_path), pagesize=letter).build(flow)
 

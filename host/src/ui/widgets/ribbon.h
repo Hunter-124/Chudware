@@ -43,6 +43,10 @@ void setRibbonWorkspace(int workspace);
 // tools while the em_* electromagnetics solver backend is not installed. Sticky until changed.
 void setRibbonDisabledPrefix(const char* prefix, const char* reason);
 
+// Human mutation commands are disabled while an agent edits the active document.
+// Refresh before drawRibbon each frame; pass "" to clear. Keep-style session exits remain enabled.
+void setRibbonAgentLockReason(const char* reason);
+
 // Simulate study context: the SELECTED study's type key (SimManager's studyTypeKey: "static",
 // "modal", "buckling", "contact", "freq_response", "fatigue", "thermal", "thermal_fea", "flow",
 // "motion", "topology"), or "" when no study is selected. Call every frame (SimManager::tick);

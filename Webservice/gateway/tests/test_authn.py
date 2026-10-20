@@ -23,7 +23,9 @@ import io
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
+from threading import Event
 from urllib.parse import parse_qs, quote, urlparse
 
 import jwt
@@ -90,6 +92,9 @@ def client(pg, monkeypatch):
     """A gateway in production auth mode, with virgin rate limiters."""
     limits.login_by_email._hits.clear()
     limits.login_by_ip._hits.clear()
+    monkeypatch.setattr(mailer, "outbound", limits.RateLimiter(5, 3600.0))
+    _DELIVERED_MESSAGES.clear()
+    monkeypatch.setattr(mailer, "_deliver", lambda _to, _message: None)
     monkeypatch.setattr(settings, "dev_mode", False)
     monkeypatch.setattr(settings, "session_secret", "test-session-secret")
     monkeypatch.setattr(settings, "public_base_url", "https://chudware.test")
@@ -113,19 +118,21 @@ def _outbox() -> list[dict]:
 
 
 def _drain() -> int:
-    """Run one real drain pass. Delivery is what the drain does, not what
-    ``send()`` does — asserting on the queued row alone would pass even with
-    the drain task never wired into app startup."""
-    return asyncio.run(mailer.drain_once())
+    """Capture the fixture mailbox before successful delivery erases envelopes."""
+    pending = [
+        {**row, "ctx": mailer.decrypt_context(row["to_addr"], row["template"], row["ctx_json"])}
+        for row in _outbox() if row["sent_at"] is None and row["ctx_json"] != "{}"
+    ]
+    delivered = asyncio.run(mailer.drain_once())
+    sent = {row["id"] for row in _outbox() if row["sent_at"] is not None}
+    _DELIVERED_MESSAGES.extend(row for row in pending if row["id"] in sent)
+    return delivered
 
 
 def _delivered(template: str) -> dict:
-    """The single delivered message of ``template``, with ctx decoded."""
-    rows = [r for r in _outbox() if r["template"] == template]
+    rows = [r for r in _DELIVERED_MESSAGES if r["template"] == template]
     assert len(rows) == 1, f"expected exactly one {template} mail, got {len(rows)}"
-    row = rows[0]
-    assert row["sent_at"] is not None, f"{template} was queued but never delivered"
-    return {**row, "ctx": json.loads(row["ctx_json"])}
+    return rows[0]
 
 
 def _token_from(url: str) -> str:
@@ -147,6 +154,8 @@ def register_and_verify(client: TestClient, email: str, password: str = GOOD_PAS
         f"/api/auth/verify?token={_token_from(verify_url)}", follow_redirects=False
     )
     assert response.status_code == 303
+    assert "set-cookie" not in response.headers
+    assert login(client, email, password).status_code == 200
     return response
 
 
@@ -295,6 +304,7 @@ def test_registering_a_taken_address_returns_the_same_202_not_a_409(client):
 def test_sixth_wrong_password_for_one_email_is_throttled(client):
     register_and_verify(client, "target@example.com")
     client.post("/api/auth/logout")
+    limits.login_by_email._hits.pop("target@example.com", None)
 
     per_email = limits.login_by_email.limit
     for attempt in range(per_email):
@@ -340,6 +350,7 @@ def test_login_limiters_are_enforced_before_any_hashing(client):
     """
     register_and_verify(client, "costly@example.com")
     client.post("/api/auth/logout")
+    limits.login_by_email._hits.pop("costly@example.com", None)
 
     for _ in range(limits.login_by_email.limit):
         login(client, "costly@example.com", WRONG_PASSWORD)
@@ -411,8 +422,7 @@ def test_suspending_an_account_kills_its_live_session_on_the_next_request(client
     # THE point of server-side sessions. No logout, no cookie expiry, no
     # waiting for a token to age out — the very next request is refused.
     denied = client.get("/api/whoami")
-    assert denied.status_code == 403
-    assert denied.json()["account_status"] == "suspended"
+    assert denied.status_code == 401
 
     # And the row itself is revoked, so reinstating the account later does not
     # silently resurrect a session an operator believed they had ended.
@@ -571,8 +581,8 @@ def test_resend_verification_invalidates_the_previous_link(client):
     assert _drain() == 1
 
     urls = [
-        json.loads(r["ctx_json"])["verify_url"]
-        for r in _outbox()
+        r["ctx"]["verify_url"]
+        for r in _DELIVERED_MESSAGES
         if r["template"] == "verify_email"
     ]
     assert len(urls) == 2
@@ -807,6 +817,117 @@ def _start(client, next_value: str) -> str:
     )
     assert response.status_code == 302
     return parse_qs(urlparse(response.headers["location"]).query)["state"][0]
+
+
+def _oauth_callback(client, monkeypatch):
+    """Real browser state/cookie flow; only provider identity retrieval is fake."""
+    _google(monkeypatch)
+    state = _start(client, "/")
+    return client.get(
+        f"/api/auth/oauth/google/callback?code=fixture-code&state={state}",
+        follow_redirects=False,
+    )
+
+
+def test_oauth_discards_preregistered_password_and_stale_password_links(client, monkeypatch):
+    email = "social@example.com"
+    assert register(client, email).status_code == 202
+    assert login(client, email, GOOD_PASSWORD).status_code == 403
+    assert client.post("/api/auth/forgot", json={"email": email}).status_code == 202
+    assert _drain() == 2
+    verify_token = _token_from(_delivered("verify_email")["ctx"]["verify_url"])
+    reset_token = _token_from(_delivered("password_reset")["ctx"]["reset_url"])
+    old_session = authn.create_session(email)  # Pending-account sessions are supported.
+
+    response = _oauth_callback(client, monkeypatch)
+    assert response.status_code == 303
+    oauth_session = client.cookies[authn.SESSION_COOKIE]
+    assert authn.lookup_session(oauth_session) == email
+    assert client.get("/api/whoami").json()["email"] == email
+    account = accounts.get_account(email)
+    assert (account.status, account.plan) == ("active", "trial")
+    assert abs(account.trial_ends_at - (time.time() + settings.trial_days * 86_400)) < 300
+    assert authn.get_credential(email) is None
+    assert authn.lookup_session(old_session) is None
+
+    assert client.get(
+        f"/api/auth/verify?token={verify_token}", follow_redirects=False
+    ).status_code == 400
+    assert client.post(
+        "/api/auth/reset", json={"token": reset_token, "password": WRONG_PASSWORD}
+    ).status_code == 400
+    assert authn.get_credential(email) is None
+    assert client.get("/api/whoami").status_code == 200
+    assert client.post("/api/auth/logout").status_code == 200
+    assert login(client, email, GOOD_PASSWORD).status_code == 401
+
+    # A new recovery request cannot reintroduce password login either.
+    assert client.post("/api/auth/forgot", json={"email": email}).status_code == 202
+    assert _drain() == 1
+    assert _delivered("oauth_only_reset")["ctx"]["provider"] == "google"
+
+
+@pytest.mark.parametrize("plan", ["trial", "studio"])
+def test_oauth_preserves_verified_password_and_existing_entitlements(client, monkeypatch, plan):
+    email = "social@example.com"
+    register_and_verify(client, email)
+    accounts.set_plan(email, plan)
+    before = accounts.get_account(email)
+    credential = authn.get_credential(email)
+    old_session = client.cookies[authn.SESSION_COOKIE]
+
+    assert _oauth_callback(client, monkeypatch).status_code == 303
+    assert client.get("/api/whoami").json()["email"] == email
+    assert authn.get_credential(email) == credential
+    assert authn.lookup_session(old_session) == email
+    after = accounts.get_account(email)
+    assert (after.status, after.plan, after.trial_ends_at) == (
+        before.status, before.plan, before.trial_ends_at
+    )
+    assert client.post("/api/auth/logout").status_code == 200
+    assert login(client, email, GOOD_PASSWORD).status_code == 200
+
+
+@pytest.mark.parametrize("status", ["denied", "suspended"])
+def test_oauth_cannot_issue_a_session_or_reactivate_a_blocked_account(
+    client, monkeypatch, status
+):
+    email = "social@example.com"
+    register_and_verify(client, email)
+    accounts.set_status(email, status, decided_by="operator@example.com")
+    client.cookies.clear()
+    response = _oauth_callback(client, monkeypatch)
+    assert response.status_code == 403
+    assert oauth.OAUTH_TRANSACTION_COOKIE not in client.cookies
+    assert authn.SESSION_COOKIE not in client.cookies
+    assert accounts.get_account(email).status == status
+    assert login(client, email, GOOD_PASSWORD).status_code == 403
+    with db.tx() as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM sessions WHERE email = %s AND revoked_at IS NULL",
+            (email,),
+        )
+        assert cur.fetchone()["n"] == 0
+
+
+def test_oauth_completion_failure_rolls_back_link_password_and_tokens(client, monkeypatch):
+    email = "social@example.com"
+    assert register(client, email).status_code == 202
+    credential = authn.get_credential(email)
+    verify_token = authn.mint_token(email, authn.PURPOSE_VERIFY, authn.VERIFY_TTL)
+    reset_token = authn.mint_token(email, authn.PURPOSE_RESET, authn.RESET_TTL)
+
+    def fail_session(*_args, **_kwargs):
+        raise RuntimeError("fixture session failure")
+
+    monkeypatch.setattr(authn, "create_session", fail_session)
+    with pytest.raises(RuntimeError, match="fixture session failure"):
+        _oauth_callback(client, monkeypatch)
+    assert accounts.get_account(email).status == "pending"
+    assert authn.get_credential(email) == credential
+    assert authn.oauth_email("google", "provider-subject") is None
+    assert authn.consume_token(verify_token, authn.PURPOSE_VERIFY) == email
+    assert authn.consume_token(reset_token, authn.PURPOSE_RESET) == email
 
 
 def test_a_desktop_next_survives_start_and_is_the_callback_destination(
@@ -1230,6 +1351,118 @@ def test_grant_admin_oauth_only_creates_an_admin_with_no_password(monkeypatch):
     assert authn.get_credential("sso@chudware.com") is None
 
 
+@pytest.mark.parametrize("verified", [False, True])
+def test_grant_admin_oauth_only_retires_existing_password_tokens_and_sessions(
+    client, monkeypatch, verified
+):
+    email = "sso@chudware.com"
+    if verified:
+        register_and_verify(client, email)
+    else:
+        assert register(client, email).status_code == 202
+    verify_token = authn.mint_token(email, authn.PURPOSE_VERIFY, authn.VERIFY_TTL)
+    assert client.post("/api/auth/forgot", json={"email": email}).status_code == 202
+    assert _drain() >= 1
+    reset_token = _token_from(_delivered("password_reset")["ctx"]["reset_url"])
+    old_session = authn.create_session(email)
+
+    assert authn._cli(["grant-admin", "--email", email, "--oauth-only"]) == 0
+    assert (accounts.get_account(email).status, accounts.get_account(email).role) == (
+        "active", "admin"
+    )
+    assert authn.get_credential(email) is None
+    assert authn.lookup_session(old_session) is None
+    client.cookies.clear()
+    assert login(client, email, GOOD_PASSWORD).status_code == 401
+    assert client.get(
+        f"/api/auth/verify?token={verify_token}", follow_redirects=False
+    ).status_code == 400
+    assert client.post(
+        "/api/auth/reset", json={"token": reset_token, "password": WRONG_PASSWORD}
+    ).status_code == 400
+    assert authn.get_credential(email) is None
+    # Before the first provider link, anonymous signup cannot restore a password.
+    assert register(client, email).status_code == 202
+    assert authn.get_credential(email) is None
+
+    async def operator_identity(_provider, _code):
+        return "operator-subject", email
+
+    _google(monkeypatch)
+    monkeypatch.setattr(oauth, "resolve_identity", operator_identity)
+    state = _start(client, "/")
+    response = client.get(
+        f"/api/auth/oauth/google/callback?code=fixture-code&state={state}",
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert client.get("/api/whoami").json() == {
+        "email": email, "role": "admin", "status": "ok"
+    }
+    assert authn.get_credential(email) is None
+
+
+def test_grant_admin_oauth_only_serializes_with_inflight_password_reset(client, monkeypatch):
+    email = "sso@chudware.com"
+    assert register(client, email).status_code == 202
+    token = authn.mint_token(email, authn.PURPOSE_RESET, authn.RESET_TTL)
+    consumed = Event()
+    release = Event()
+    admin_lock_entered = Event()
+    real_consume = authn.consume_token
+    real_lock = authn._lock_account
+
+    def paused_consume(raw, purpose):
+        result = real_consume(raw, purpose)
+        if purpose == authn.PURPOSE_RESET and result is not None:
+            consumed.set()
+            assert release.wait(10), "reset transition was not released"
+        return result
+
+    def observed_lock(address):
+        if consumed.is_set() and not release.is_set():
+            admin_lock_entered.set()
+        return real_lock(address)
+
+    monkeypatch.setattr(authn, "consume_token", paused_consume)
+    monkeypatch.setattr(authn, "_lock_account", observed_lock)
+    request = Request({
+        "type": "http", "scheme": "https", "method": "POST",
+        "path": "/api/auth/reset", "headers": [], "client": CLIENT,
+        "server": ("testserver", 443), "query_string": b"",
+    })
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        resetting = pool.submit(
+            lambda: asyncio.run(authn.reset(
+                request, {"token": token, "password": WRONG_PASSWORD}
+            ))
+        )
+        granting = None
+        try:
+            assert consumed.wait(10), "reset did not consume its token"
+            granting = pool.submit(
+                authn._cli, ["grant-admin", "--email", email, "--oauth-only"]
+            )
+            assert admin_lock_entered.wait(10), "admin grant did not reach the account lock"
+            with pytest.raises(FutureTimeout):
+                granting.result(timeout=0.1)
+        finally:
+            release.set()
+        assert resetting.result(timeout=10).status_code == 200
+        assert granting.result(timeout=10) == 0
+
+    assert authn.get_credential(email) is None
+    assert login(client, email, WRONG_PASSWORD).status_code == 401
+    assert authn.consume_token(token, authn.PURPOSE_RESET) is None
+    with db.tx() as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM sessions WHERE email = %s AND revoked_at IS NULL",
+            (email,),
+        )
+        assert cur.fetchone()["n"] == 0
+
+
 def test_grant_admin_refuses_oauth_only_together_with_a_password(monkeypatch):
     monkeypatch.setattr("sys.stdin", io.StringIO("correct horse battery\n"))
     with pytest.raises(SystemExit) as caught:
@@ -1289,3 +1522,278 @@ def test_grant_subscription_refuses_an_unknown_account_and_an_unknown_plan():
         == 1
     )
     assert accounts.get_account("known@chudware.com").plan != "moon"
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_verification_navigation_never_creates_or_replaces_session(client, existing):
+    owner = "owner@example.com"
+    if existing:
+        register_and_verify(client, owner)
+    before = client.cookies.get(authn.SESSION_COOKIE)
+    accounts.ensure_account("attacker@example.com")
+    authn.set_password("attacker@example.com", GOOD_PASSWORD, verified=False)
+    token = authn.mint_token("attacker@example.com", authn.PURPOSE_VERIFY, authn.VERIFY_TTL)
+    with db.tx() as cur:
+        cur.execute("SELECT count(*) AS n FROM sessions")
+        count = cur.fetchone()["n"]
+    response = client.get(f"/api/auth/verify?token={token}", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/signin?verified=1"
+    assert "set-cookie" not in response.headers
+    assert client.cookies.get(authn.SESSION_COOKIE) == before
+    assert authn.get_credential("attacker@example.com")["email_verified"] is True
+    with db.tx() as cur:
+        cur.execute("SELECT count(*) AS n FROM sessions")
+        assert cur.fetchone()["n"] == count
+    if existing:
+        assert client.get("/api/whoami").json()["email"] == owner
+    else:
+        assert client.get("/api/whoami").status_code == 401
+    assert client.get(f"/api/auth/verify?token={token}", follow_redirects=False).status_code == 400
+
+
+@pytest.mark.parametrize("purpose,endpoint,url_key", [
+    (authn.PURPOSE_VERIFY, "/api/auth/resend-verification", "verify_url"),
+    (authn.PURPOSE_RESET, "/api/auth/forgot", "reset_url"),
+])
+def test_recipient_throttle_preserves_last_deliverable_token(client, purpose, endpoint, url_key):
+    email = "budget@example.com"
+    accounts.ensure_account(email)
+    authn.set_password(email, GOOD_PASSWORD, verified=False)
+    tokens = []
+    for _ in range(6):
+        assert client.post(endpoint, json={"email": email}).status_code == 202
+    rows = _outbox()
+    assert len(rows) == 5
+    for row in rows:
+        ctx = mailer.decrypt_context(email, purpose, row["ctx_json"])
+        tokens.append(_token_from(ctx[url_key]))
+    with db.tx() as cur:
+        cur.execute("SELECT token_hash FROM email_tokens WHERE email = %s AND used_at IS NULL", (email,))
+        assert [r["token_hash"] for r in cur.fetchall()] == [authn.token_hash(tokens[-1])]
+    assert all(token not in json.dumps(rows, default=str) for token in tokens)
+    assert _drain() == 5
+    if purpose == authn.PURPOSE_VERIFY:
+        assert client.get(f"/api/auth/verify?token={tokens[-1]}", follow_redirects=False).status_code == 303
+    else:
+        assert client.post("/api/auth/reset", json={"token": tokens[-1], "password": WRONG_PASSWORD}).status_code == 200
+    assert authn.consume_token(tokens[-1], purpose) is None
+
+
+@pytest.mark.parametrize("purpose,endpoint,url_key", [
+    (authn.PURPOSE_VERIFY, "/api/auth/resend-verification", "verify_url"),
+    (authn.PURPOSE_RESET, "/api/auth/forgot", "reset_url"),
+])
+def test_enqueue_failure_rolls_back_token_replacement(client, monkeypatch, purpose, endpoint, url_key):
+    email = "rollback@example.com"
+    accounts.ensure_account(email)
+    authn.set_password(email, GOOD_PASSWORD, verified=False)
+    assert client.post(endpoint, json={"email": email}).status_code == 202
+    row = _outbox()[0]
+    token = _token_from(mailer.decrypt_context(email, purpose, row["ctx_json"])[url_key])
+    def fail_enqueue(message):
+        with db.tx() as cur:
+            cur.execute("SELECT 1/0")
+    monkeypatch.setattr(mailer, "enqueue", fail_enqueue)
+    assert client.post(endpoint, json={"email": email}).status_code == 202
+    assert len(_outbox()) == 1
+    assert authn.consume_token(token, purpose) == email
+
+
+def test_registration_equalizes_real_hash_work_across_existing_identity_types(client, monkeypatch):
+    accounts.ensure_account("password@example.com")
+    authn.set_password("password@example.com", GOOD_PASSWORD, verified=False)
+    accounts.ensure_account("oauth@example.com")
+    authn.link_oauth_identity("google", "existing-sub", "oauth@example.com")
+    accounts.ensure_account("admin@example.com")
+    accounts.set_role("admin@example.com", "admin")
+    real_hash = authn.hash_password
+    calls = []
+    def counted(password):
+        calls.append(password)
+        return real_hash(password)
+    monkeypatch.setattr(authn, "hash_password", counted)
+    responses = []
+    for email in ["fresh@example.com", "password@example.com", "oauth@example.com", "admin@example.com"]:
+        before = len(calls)
+        responses.append(register(client, email))
+        assert len(calls) == before + 1
+    assert all(r.status_code == 202 and r.content == responses[0].content for r in responses)
+    assert calls == [GOOD_PASSWORD] * 4
+    assert authn.verify_password(authn.get_credential("password@example.com")["password_hash"], GOOD_PASSWORD)
+    assert authn.get_credential("oauth@example.com") is None
+    assert authn.get_credential("admin@example.com") is None
+
+
+def test_database_readable_reset_envelope_is_not_a_redemption_capability(client):
+    email = "ciphertext@example.com"
+    accounts.ensure_account(email)
+    authn.set_password(email, GOOD_PASSWORD, verified=True)
+    accounts.set_status(email, "active")
+    assert client.post("/api/auth/forgot", json={"email": email}).status_code == 202
+    row = _outbox()[0]
+    envelope = json.loads(row["ctx_json"])
+    assert set(envelope) == {"encrypted_v1"}
+    token = _token_from(mailer.decrypt_context(email, authn.PURPOSE_RESET, row["ctx_json"])["reset_url"])
+    assert token not in json.dumps(row, default=str)
+    for readable_value in [row["ctx_json"], envelope["encrypted_v1"]]:
+        assert client.post("/api/auth/reset", json={"token": readable_value, "password": WRONG_PASSWORD}).status_code == 400
+    assert authn.verify_password(authn.get_credential(email)["password_hash"], GOOD_PASSWORD)
+    assert client.post("/api/auth/reset", json={"token": token, "password": WRONG_PASSWORD}).status_code == 200
+    assert authn.verify_password(authn.get_credential(email)["password_hash"], WRONG_PASSWORD)
+
+
+def test_registration_throttle_precedes_equalized_hash_work(client, monkeypatch):
+    for _ in range(limits.login_by_ip.limit):
+        limits.login_by_ip.check(CLIENT[0])
+    def forbidden_hash(password):
+        raise AssertionError("throttled registration must not run Argon2")
+    monkeypatch.setattr(authn, "hash_password", forbidden_hash)
+    assert register(client, "throttled@example.com").status_code == 429
+
+
+@pytest.mark.parametrize("prior_link", [False, True])
+def test_register_first_token_budget_refusal_preserves_previous_capability(client, prior_link):
+    email = "first-budget@example.com"
+    previous = None
+    if prior_link:
+        accounts.ensure_account(email)
+        previous = authn.mint_token(email, authn.PURPOSE_VERIFY, authn.VERIFY_TTL)
+    # Reserve the real shared recipient budget before first password registration.
+    # No transport or prepare stub: the actual reservation contract must refuse.
+    for _ in range(mailer.outbound.limit):
+        assert mailer.outbound.check(email)
+    assert register(client, email).status_code == 202
+    assert authn.get_credential(email)["email_verified"] is False
+    assert _outbox() == []
+    with db.tx() as cur:
+        cur.execute("SELECT token_hash FROM email_tokens WHERE email=%s AND used_at IS NULL", (email,))
+        assert [row["token_hash"] for row in cur.fetchall()] == (
+            [authn.token_hash(previous)] if previous else []
+        )
+    if previous:
+        assert client.get(f"/api/auth/verify?token={previous}", follow_redirects=False).status_code == 303
+        assert authn.get_credential(email)["email_verified"] is True
+    else:
+        # A budget-refused first registration has no link, but a later admitted
+        # resend recovers normally without another registration/password change.
+        mailer.outbound._hits.clear()
+        assert client.post("/api/auth/resend-verification", json={"email": email}).status_code == 202
+        assert _drain() == 1
+        token = _token_from(_delivered(authn.PURPOSE_VERIFY)["ctx"]["verify_url"])
+        assert client.get(f"/api/auth/verify?token={token}", follow_redirects=False).status_code == 303
+
+
+@pytest.mark.parametrize("purpose,endpoint,url_key", [
+    (authn.PURPOSE_VERIFY, "/api/auth/resend-verification", "verify_url"),
+    (authn.PURPOSE_RESET, "/api/auth/forgot", "reset_url"),
+])
+def test_accepted_replacement_invalidates_previous_even_when_transport_finally_fails(
+    client, monkeypatch, purpose, endpoint, url_key,
+):
+    import socket
+
+    email = "accepted-then-failed@example.com"
+    accounts.ensure_account(email)
+    authn.set_password(email, GOOD_PASSWORD, verified=False)
+    assert client.post(endpoint, json={"email": email}).status_code == 202
+    previous = _token_from(mailer.decrypt_context(email, purpose, _outbox()[0]["ctx_json"])[url_key])
+    assert _drain() == 1
+    assert client.post(endpoint, json={"email": email}).status_code == 202
+    latest = _outbox()[-1]
+    replacement = _token_from(mailer.decrypt_context(email, purpose, latest["ctx_json"])[url_key])
+    assert authn.consume_token(previous, purpose) is None
+    # Real smtplib connection-refused; never contact a configured/provider host.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    monkeypatch.setattr(mailer.settings, "smtp_host", "127.0.0.1")
+    monkeypatch.setattr(mailer.settings, "smtp_port", port)
+    monkeypatch.setattr(mailer.settings, "smtp_tls", "implicit")
+    monkeypatch.setattr(mailer, "_deliver", mailer._deliver_smtp)
+    for _ in range(mailer.MAX_ATTEMPTS):
+        with db.tx() as cur:
+            cur.execute("UPDATE mail_outbox SET next_attempt_at=now() WHERE id=%s", (latest["id"],))
+        assert asyncio.run(mailer.drain_once()) == 0
+    with db.tx() as cur:
+        cur.execute("SELECT attempts,ctx_json,sent_at FROM mail_outbox WHERE id=%s", (latest["id"],))
+        row = cur.fetchone()
+    assert row == {"attempts": mailer.MAX_ATTEMPTS, "ctx_json": "{}", "sent_at": None}
+    assert authn.consume_token(previous, purpose) is None
+    # Existing accepted-token policy is intentionally unchanged: the new token
+    # remains valid, though no recipient delivery and no old-link recovery exist.
+    assert authn.consume_token(replacement, purpose) == email
+
+
+def test_protected_ops_session_uses_real_keys_without_secret_argv_or_ambient_configuration(
+    pg, tmp_path,
+):
+    import base64
+    import os
+    import subprocess
+
+    email = "operator-fixture@example.com"
+    accounts.ensure_account(email)
+    accounts.set_role(email, "admin")
+    accounts.set_status(email, "active")
+    helper = GATEWAY_DIR.parent / "deploy" / "gateway_preflight.py"
+    values = {
+        "CHUDWARE_DEPLOY_ENV": "prod", "CHUDWARE_DB_URL": pg,
+        "CHUDWARE_MAIL_CONTEXT_ENCRYPTION_KEY": base64.urlsafe_b64encode(b"m" * 32).decode(),
+        "CHUDWARE_WEB_PROVIDER_KEY_ENCRYPTION_KEY": base64.urlsafe_b64encode(b"p" * 32).decode(),
+        "CHUDWARE_MAIL_BACKEND": "smtp", "CHUDWARE_SMTP_HOST": "127.0.0.1",
+        "CHUDWARE_SMTP_USER": "fixture", "CHUDWARE_SMTP_PASS": "fixture-transport-credential",
+        # These optional credentials must not reach Settings construction.
+        "CHUDWARE_WEB_STRIPE_SECRET_KEY": "fixture-partial-billing-would-refuse",
+        "CHUDWARE_WEB_GOOGLE_CLIENT_ID": "fixture-partial-oauth",
+    }
+    for label, name in (("data", "CHUDWARE_WEB_DATA_ROOT"), ("workspace", "CHUDWARE_WORKSPACE_ROOT"),
+                        ("bucket", "CHUDWARE_WEB_BUCKET_ROOT"), ("cells", "CHUDWARE_CELLS_ROOT")):
+        values[name] = str(tmp_path / label)
+        Path(values[name]).mkdir()
+    path = tmp_path / "gateway.env"
+    path.write_text("".join(name + "=" + value + "\n" for name, value in values.items()))
+    path.chmod(0o600)
+    command = [sys.executable, "-I", str(helper), "ops-session", "--env-file", str(path),
+               "--environment", "prod", "--email", email, "--ttl-seconds", "120"]
+    child = None
+    try:
+        # Hold the real account lock so the child remains observable at its DB sink.
+        with db.tx() as cur:
+            cur.execute("SELECT email FROM accounts WHERE email=%s FOR UPDATE", (email,))
+            child = subprocess.Popen(command, env={
+                "PATH": os.defpath, "CHUDWARE_DB_URL": "invalid-ambient-db",
+                "CHUDWARE_MAIL_CONTEXT_ENCRYPTION_KEY": "invalid-ambient-key",
+                "CHUDWARE_WEB_STRIPE_SECRET_KEY": "invalid-ambient-billing",
+            }, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                cur.execute("SELECT pg_stat_clear_snapshot()")
+                cur.execute("SELECT 1 FROM pg_stat_activity WHERE pid<>pg_backend_pid() "
+                            "AND datname=current_database() AND wait_event_type='Lock'")
+                if cur.fetchone():
+                    break
+                assert child.poll() is None, child.communicate()
+                time.sleep(0.02)
+            else:
+                raise AssertionError("ops helper did not reach account locking")
+            argv = Path(f"/proc/{child.pid}/cmdline").read_bytes()
+            for name in ("CHUDWARE_DB_URL", "CHUDWARE_MAIL_CONTEXT_ENCRYPTION_KEY",
+                         "CHUDWARE_WEB_PROVIDER_KEY_ENCRYPTION_KEY", "CHUDWARE_SMTP_PASS"):
+                assert values[name].encode() not in argv
+        stdout, stderr = child.communicate(timeout=10)
+        assert child.returncode == 0, stderr
+        assert stderr == ""
+        token = stdout.strip()
+        assert token and stdout == token + "\n"
+        assert authn.lookup_session(token) == email
+        with db.tx() as cur:
+            cur.execute("SELECT user_agent,expires_at-created_at AS ttl FROM sessions WHERE sid=%s",
+                        (authn.token_hash(token),))
+            row = cur.fetchone()
+        assert row["user_agent"] == "chudware-ops-cli"
+        assert 119 <= row["ttl"].total_seconds() <= 121
+    finally:
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.communicate(timeout=5)

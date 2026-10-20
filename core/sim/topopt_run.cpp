@@ -190,7 +190,7 @@ const std::set<std::string> &envelope_keys() {
       "advisor_max_dof", "governor_probes",
       // physics
       "material", "topology", "fixtures", "loads", "load_cases", "thermal",
-      "flow", "preserve", "exclude"};
+      "flow", "preserve", "exclude", "build_plate"};
   return keys;
 }
 
@@ -360,6 +360,30 @@ json normalize_envelope(const json &study, const json &topology,
   out["material"] =
       study.contains("material") ? study["material"] : json::object();
 
+  if (include_regions && study.contains("build_plate")) {
+    const json &entry = study["build_plate"];
+    const std::string label = entry_label(entry, "Build plate");
+    check_entry_keys(entry, {"faces", "label"}, label);
+    const json faces = entry.value("faces", json());
+    if (faces.is_null() || (faces.is_array() && faces.empty()))
+      refuse("build_plate_empty", label + ": no boundary triangle matched");
+    const json &faceset = faceset_of(faces, label);
+    json nodes = json::array();
+    if (mesh) {
+      BoundarySelection selection;
+      std::string error;
+      if (!resolve_boundary_selection(faceset, *mesh, label, selection, error) ||
+          selection.facets.empty())
+        refuse("build_plate_empty", label + ": no boundary triangle matched");
+      nodes = nodes_json(selection.nodes);
+      ev.push_back({{"section", "build_plate"},
+                    {"label", label},
+                    {"nodes", selection.nodes.size()},
+                    {"complete_faces", selection.facets.size()},
+                    {"area_mm2", selection.area_mm2}});
+    }
+    out["build_plate"] = {{"label", label}, {"nodes", std::move(nodes)}};
+  }
   // ── Structural
   if (uses_structural_boundary(phys)) {
     const std::vector<FixtureEntry> shared =
@@ -1461,6 +1485,8 @@ json failure_packet(const std::string &code, const std::string &message,
             {"termination_detail", message},
             {"error", message},
             {"error_code", code}};
+  if (code.rfind("build_plate_", 0) == 0)
+    r["field"] = "build_plate";
   if (study.is_object() && study.contains("topology") &&
       study["topology"].is_object()) {
     const json &t = study["topology"];
@@ -1576,7 +1602,8 @@ Settings validate_topology_envelope(const json &study) {
   // Settings and capability.
   if (!study.contains("topology") || !study["topology"].is_object())
     refuse("section_missing", "study.topology is required");
-  const Settings s = parse_settings(study["topology"]);
+  const Settings s =
+      parse_settings(study["topology"], study.contains("build_plate"));
   const Compatibility compat = check_compatibility(s);
   if (!compat.supported)
     refuse(compat.code.empty() ? "method_physics_unsupported" : compat.code,
@@ -1697,7 +1724,8 @@ json resolve_topology_boundaries(const json &study, const json &topology,
   if (mesh.nodes_per_elem != 4)
     refuse("unsupported_element_order",
            "boundary resolution needs a tet4 mesh");
-  const Settings s = parse_settings(topology);
+  const Settings s =
+      parse_settings(topology, include_regions && study.contains("build_plate"));
   return normalize_envelope(study, topology, s.physics, &mesh, include_regions,
                             evidence);
 }
@@ -1720,6 +1748,7 @@ PreparedTopology prepare_topology_study(const json &study) {
   out.normalized = resolve_topology_boundaries(
       study, study["topology"], *out.source_mesh, true, &out.boundary_evidence);
   out.problem = prepare_problem(out.mesh, parse_problem_spec(out.normalized));
+  out.settings = out.problem->settings;
   return out;
 }
 
@@ -1865,6 +1894,7 @@ nlohmann::json fea_run_topology(const nlohmann::json &study) {
           failure_packet(e.code(), e.what(), study, "failed"));
     }
     const Problem &problem = *prep.problem;
+    settings = problem.settings;
     const TetMesh &mesh = *prep.mesh;
     const int E = mesh.element_count();
     artifacts["normalized_spec"] = artifact_json(
@@ -2064,6 +2094,12 @@ nlohmann::json fea_run_topology(const nlohmann::json &study) {
     summary["nodes"] = mesh.node_count();
     summary["filter_radius_mm"] = units::m_to_mm(problem.filter_radius_m);
     summary["filter_radius_source"] = problem.filter_radius_source;
+    if (problem.evidence["filter"].contains("min_member_filter_radius_mm")) {
+      summary["min_member_filter_radius_mm"] =
+          problem.evidence["filter"]["min_member_filter_radius_mm"];
+      summary["mesh_floor_radius_mm"] =
+          problem.evidence["filter"]["mesh_floor_radius_mm"];
+    }
     summary["overhang_measure"] = r.final_overhang;
     summary["density_threshold"] = settings.density_threshold;
 
@@ -2084,6 +2120,13 @@ nlohmann::json fea_run_topology(const nlohmann::json &study) {
       result["density"] = to_array(r.density);
     if (settings.method == Method::LevelSet && r.level_set.size() == E)
       result["level_set"] = to_array(r.level_set);
+    result["topology"] = topology_json;
+    result["topology"]["overhang_angle_deg"] = settings.overhang_angle_deg;
+    result["topology"]["overhang_penalty"] = settings.overhang_penalty;
+    if (settings.build_direction) {
+      const auto &d = *settings.build_direction;
+      result["topology"]["build_direction"] = {d[0], d[1], d[2]};
+    }
     result["evidence"] = {
         {"baseline", r.has_baseline ? r.baseline.evidence : json(nullptr)},
         {"final", r.has_final ? r.final_evaluation.evidence : json(nullptr)},
@@ -2224,8 +2267,11 @@ nlohmann::json fea_run_topology(const nlohmann::json &study) {
                               r.density, settings.density_threshold, vtu),
             "vtu", "Element density and final fields (mm, MPa, C)");
       });
+    PrintSurfaceEvidence print_evidence;
+    print_evidence.reason = "no geometry-valid reconstruction";
     if (rec) {
       const SurfaceMesh &surface = rec->solid.surface.mesh;
+      std::optional<SurfaceMesh> print_surface;
       if (rec->geometry_valid) {
         attempt("surface_stl", [&] {
           artifacts["surface_stl"] = artifact_json(
@@ -2233,11 +2279,55 @@ nlohmann::json fea_run_topology(const nlohmann::json &study) {
                         "chudware topology " + dir->run_id),
               "stl", "Reconstructed solid surface (validated)");
         });
+        attempt("surface_print_stl", [&] {
+          try {
+            SurfaceMesh candidate =
+                smooth_print_surface(surface, PrintSurfaceOptions{}, print_evidence);
+            artifacts["surface_print_stl"] = artifact_json(
+                write_stl((dir->dir / "surface_print.stl").string(), candidate,
+                          "chudware topology print " + dir->run_id),
+                "stl", "Print surface (smoothed, validated)");
+            print_surface = std::move(candidate);
+          } catch (const ModelError &e) {
+            print_evidence.state = "refused";
+            print_evidence.reason = e.what();
+            throw;
+          }
+        });
       } else {
         refusals["surface_stl"] = {
             {"code", "geometry_invalid"},
             {"message", "surface not exported: " +
                             rec->evidence["invalid_reasons"].dump()}};
+      }
+      const SurfaceMesh &displayed = print_surface ? *print_surface : surface;
+      const char *surface_name = print_surface ? "print" : "reconstruction";
+      std::optional<SurfaceOverhang> surface_overhang;
+      if (settings.build_direction && displayed.triangle_count() > 0) {
+        const Eigen::Vector3d &d = *settings.build_direction;
+        double plate = std::numeric_limits<double>::infinity();
+        for (int n = 0; n < mesh.node_count(); ++n)
+          if (mesh.node_referenced[n])
+            plate = std::min(plate, mesh.nodes_m.col(n).dot(d));
+        const double plate_tol =
+            1e-6 * std::max((mesh.bbox_max_m - mesh.bbox_min_m).norm(), 1e-300);
+        surface_overhang = measure_surface_overhang(
+            displayed, d, settings.overhang_angle_deg, plate, plate_tol);
+        auto &overhang = result["manufacturing"]["enforcement"]["overhang"];
+        overhang["surface_unsupported_area_mm2"] =
+            surface_overhang->unsupported_area_m2 * 1e6;
+        overhang["surface_unsupported_area_fraction"] =
+            surface_overhang->total_area_m2 > 0
+                ? surface_overhang->unsupported_area_m2 /
+                      surface_overhang->total_area_m2
+                : 0;
+        overhang["surface_measured_on"] = surface_name;
+        for (json &row : result["manufacturing"]["checks"])
+          if (row["id"] == "overhang")
+            row["note"] = row.value("note", std::string()) +
+                          "; displayed " + surface_name + " surface needs " +
+                          fmt_g(surface_overhang->unsupported_area_m2 * 1e6) +
+                          " mm2 of overhang support";
       }
       if (surface.triangle_count() > 0)
         attempt("overlay_aicm", [&] {
@@ -2272,17 +2362,21 @@ nlohmann::json fea_run_topology(const nlohmann::json &study) {
                            ? values
                            : nodal_average(mesh, values, 1));
           }
+          if (surface_overhang)
+            scalars.push_back({"overhang", "-", surface_overhang->vertex_fraction});
           ArtifactFile a =
-              write_surface_aicm((dir->dir / "overlay.aicm").string(), surface,
+              write_surface_aicm((dir->dir / "overlay.aicm").string(), displayed,
                                  scalars, "topology " + dir->run_id);
           json entry =
               artifact_json(a, "aicm", "Viewport density/field overlay");
+          entry["surface"] = surface_name;
           if (!skipped.empty())
             entry["skipped_scalars"] = std::move(skipped);
           artifacts["overlay_aicm"] = std::move(entry);
           result["overlay_aicm"] = a.path;
         });
     }
+    result["reconstruction"]["print_surface"] = to_json(print_evidence);
     if (rea && rea->evaluated)
       attempt("reanalysis_vtu", [&] {
         constexpr double kReanalysisRetained = 0.5;
@@ -2332,7 +2426,7 @@ nlohmann::json fea_run_topology(const nlohmann::json &study) {
                       tets.size() * sizeof(int));
       json setup = json::object();
       for (const char *key : {"fixtures", "loads", "load_cases", "thermal",
-                              "flow", "preserve", "exclude"})
+                              "flow", "preserve", "exclude", "build_plate"})
         if (study.contains(key))
           setup[key] = study[key];
       provenance["hashes"] = {

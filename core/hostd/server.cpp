@@ -7,6 +7,9 @@
 #include <ctime>
 #include <exception>
 #include <filesystem>
+#include <fstream>
+#include <functional>
+#include <stdexcept>
 #include <thread>
 
 #ifdef _WIN32
@@ -21,6 +24,8 @@
 #include "../util/secret_store.h"
 #include "../security/containment.h"
 #include "../../services/ipc/ipc_discovery.h"
+#include "../../services/ipc/ipc_private.h"
+#include "../util/sha256.h"
 #include "hostd_log.h"
 #include "mfg_lane.h"
 #include "worker_bridge.h"
@@ -28,6 +33,66 @@
 namespace hostd {
 
 using nlohmann::json;
+static void sendConnectionEvent(ClientConn& c, const std::string& line);
+
+namespace {
+std::mutex cacheSinkMutex;
+Server* cacheSinkServer = nullptr;
+
+void workspaceRelativePaths(json& value, const std::string& work) {
+    if (value.is_array()) {
+        for (auto& entry : value) workspaceRelativePaths(entry, work);
+    } else if (value.is_object()) {
+        static constexpr const char* keys[] = {
+            "path", "saved_path", "file_path", "folder_path", "origin_path", "source_path",
+            "input_path", "output_path", "workspace_dir", "project_dir", "cwd",
+            "image_path", "save_path", "model_path", "artifact_path", "out_path",
+            "step_path", "stl_path", "brep_path", "gcode_path", "progress_path"
+        };
+        for (auto& field : value.items()) {
+            auto& entry = field.value();
+            if (entry.is_string() && std::find(std::begin(keys), std::end(keys), field.key()) != std::end(keys)) {
+                const std::string& path = entry.get_ref<const std::string&>();
+                if (path == work) entry = ".";
+                else if (path.size() > work.size() && path.compare(0, work.size(), work) == 0 &&
+                         path[work.size()] == '/') entry = path.substr(work.size() + 1);
+            } else workspaceRelativePaths(entry, work);
+        }
+    }
+}
+}
+
+bool Server::installCacheRefreshSink() {
+    {
+        std::lock_guard<std::mutex> lock(cacheSinkMutex);
+        cacheSinkServer = this;
+    }
+    if (core::cpp_core().setCacheRefreshSink(&Server::cacheRefreshThunk, nullptr)) return true;
+    std::lock_guard<std::mutex> lock(cacheSinkMutex);
+    if (cacheSinkServer == this) cacheSinkServer = nullptr;
+    return false;
+}
+
+void Server::clearCacheRefreshSink() {
+    {
+        std::lock_guard<std::mutex> lock(cacheSinkMutex);
+        if (cacheSinkServer != this) return;
+        cacheSinkServer = nullptr;
+    }
+    core::cpp_core().setCacheRefreshSink(nullptr, nullptr);
+}
+
+void Server::cacheRefreshThunk(const char* docId, const char* responseJson, void*) {
+    if (!docId || !responseJson) return;
+    try {
+        const json response = json::parse(responseJson);
+        // Clearing the pointer drains callbacks before registry/server destruction.
+        std::lock_guard<std::mutex> lock(cacheSinkMutex);
+        if (cacheSinkServer) cacheSinkServer->registry_.publishCacheRefresh(docId, response);
+    } catch (const std::exception& e) {
+        log().line("cache refresh publication failed: %s", e.what());
+    }
+}
 
 static long selfPid() {
 #ifdef _WIN32
@@ -114,20 +179,404 @@ Server::Server(chudware_ipc::IpcListener listener, std::string buildId)
         engineWatchdogMs_ = (long long)std::max(0, std::atoi(w)) * 1000;
 }
 
+bool Server::configureCell(std::string state, std::string work,
+                           const std::string& policyPath, std::string& err) {
+    try {
+        std::ifstream input(policyPath);
+        if (!input) throw std::runtime_error("cell method policy unavailable");
+        input >> cellPolicy_;
+        if (!cellPolicy_.is_object() || cellPolicy_.empty())
+            throw std::runtime_error("invalid cell method policy");
+        for (const auto& item : cellPolicy_.items()) {
+            const auto& p = item.value();
+            if (!p.is_object() || p.size() != 3 ||
+                (p.at("cell") != "allow" && p.at("cell") != "refuse") ||
+                (p.at("right") != "read" && p.at("right") != "write" &&
+                 p.at("right") != "run" && p.at("right") != "manage") ||
+                (p.at("scope") != "workspace" && p.at("scope") != "actor"))
+                throw std::runtime_error("invalid cell method classification: " + item.key());
+        }
+        cellState_ = std::filesystem::canonical(state).string();
+        cellWork_ = std::filesystem::canonical(work).string();
+        if (const char* id = std::getenv("CHUDWARE_CELL_ID")) {
+            cellId_ = id;
+            if (cellId_.size() != 32 || !std::all_of(cellId_.begin(), cellId_.end(),
+                [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }))
+                throw std::runtime_error("invalid trusted cell identity");
+        }
+        const auto run = std::filesystem::path(cellState_) / "run";
+        if (!chudware_ipc::privateDir(run.string()))
+            throw std::runtime_error("private operator directory unavailable");
+        operatorListener_ = std::make_unique<chudware_ipc::IpcListener>();
+        if (!operatorListener_->listen((run / "operator.sock").string(), err)) return false;
+        cell_ = true;
+        return true;
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+}
+
+json Server::cellContext(const ClientConn& c) {
+    std::lock_guard<std::mutex> lock(cellMtx_);
+    return json{{"cell", true}, {"workspace_key", workspaceKey_}, {"actor_key", c.actorKey},
+                {"actor_hex", c.actorHex}, {"right", c.right}, {"epoch", c.epoch},
+                {"client_id", c.id}};
+}
+
+json Server::cellHello(ClientConn& c, const json& params, bool& isError) {
+    const auto refuse = [&](const char* code) {
+        isError = true;
+        return json{{"code", code}, {"message", code}};
+    };
+    const bool operatorHello = params.contains("operator") && params["operator"] == true &&
+                               params.value("client", std::string()) == "control";
+    if (operatorHello) {
+        if (!c.gateway || !c.operatorListener || c.helloDone || params.contains("principal"))
+            return refuse("cell_refused");
+        std::lock_guard<std::mutex> admission(clientsMtx_);
+        c.operatorControl = true;
+        c.controlOnly = true;
+        c.helloDone = true;
+        return json::object();
+    }
+    const bool principalControl = c.gateway && params.value("client", std::string()) == "control";
+    if (c.operatorControl || params.contains("operator") ||
+        (c.operatorListener && !principalControl)) return refuse("cell_refused");
+    std::unique_lock<std::mutex> transition(principalMtx_, std::defer_lock);
+    if (c.gateway) transition.lock();
+    std::unique_lock<std::mutex> lock(cellMtx_);
+    if (c.gateway) {
+        const auto p = params.find("principal");
+        if (p == params.end() || !p->is_object()) return refuse("cell_refused");
+        const std::string actor = p->value("actor_key", std::string());
+        const std::string workspace = p->value("workspace_key", std::string());
+        const std::string right = p->value("right", std::string());
+        const std::string nonce = p->value("connection_nonce", std::string());
+        if (actor.empty() || actor.size() > 128 || workspace.empty() || workspace.size() > 256 ||
+            nonce.empty() || nonce.size() > 256 || !p->contains("epoch") ||
+            !(*p)["epoch"].is_number_integer() ||
+            (right != "owner" && right != "manager" && right != "editor" && right != "viewer"))
+            return refuse("cell_refused");
+        const long long epoch = p->at("epoch").get<long long>();
+        if (epoch < 0 || (!workspaceKey_.empty() && workspace != workspaceKey_))
+            return refuse("cell_refused");
+        if (c.helloDone) {
+            if (c.actorKey != actor || c.epoch != epoch || c.right != right)
+                return refuse("cell_refused");
+        } else if (connectionNonces_.count(nonce)) return refuse("cell_refused");
+        auto& a = actors_[actor];
+        if (epoch < a.epoch) return refuse("revoked");
+        if (!principalControl) {
+            if (a.revoked && epoch <= a.epoch) return refuse("revoked");
+            if (epoch == a.epoch && !a.right.empty() && a.right != right)
+                return refuse("revoked");
+            if (epoch > a.epoch && a.epoch >= 0) {
+                const json owner{{"cell", true}, {"workspace_key", workspace},
+                    {"actor_key", actor}, {"actor_hex", a.hex}, {"right", a.right},
+                    {"epoch", a.epoch}, {"client_id", c.id}};
+                // Fence the old actor socket before publishing the new authority.
+                // Fresh hello cannot outrun asynchronous gateway revocation.
+                a.revoked = true;
+                lock.unlock();
+                retireActorGeneration(actor, epoch - 1, owner, -1);
+                lock.lock();
+            }
+        }
+        a.key = actor;
+        a.hex = chudware::util::sha256_hex(actor).substr(0, 32);
+        if (!a.listener && !principalControl) {
+            const auto directory = std::filesystem::path(cellState_) / "actors" / a.hex / "run";
+            if (!chudware_ipc::privateDir(directory.parent_path().string()) ||
+                !chudware_ipc::privateDir(directory.string())) return refuse("cell_refused");
+            a.listener = std::make_shared<chudware_ipc::IpcListener>();
+            std::string err;
+            if (!a.listener->listen((directory / "hostd.sock").string(), err)) {
+                a.listener.reset();
+                return refuse("cell_refused");
+            }
+        }
+        // A control hello authenticates the command channel; only the command
+        // itself may change authority or make a revoked actor usable again.
+        if (!principalControl) {
+            a.epoch = epoch;
+            a.right = right;
+            a.revoked = false;
+        }
+        workspaceKey_ = workspace;
+        connectionNonces_[nonce] = true;
+        c.actorKey = a.key;
+        c.actorHex = a.hex;
+        c.right = right;
+        c.epoch = epoch;
+    } else {
+        // Internal authority derives exclusively from the accepting actor socket.
+        const auto a = actors_.find(c.actorKey);
+        if (a == actors_.end() || a->second.revoked || a->second.epoch != c.epoch)
+            return refuse("revoked");
+        c.right = a->second.right;
+    }
+    c.helloDone = true;
+    c.userId = c.actorKey;
+    c.userDisplay = c.actorKey;
+    if (principalControl) c.controlOnly = true;
+    else {
+        c.writerGroup = workspaceKey_ + ":" + c.actorKey;
+        registry_.setWriterGroup(c.id, c.writerGroup);
+        registry_.setCellPrincipal(c.id, c.actorKey, c.right == "viewer");
+    }
+    return json::object();
+}
+
+json Server::changePrincipal(ClientConn& c, const std::string& method,
+                             const json& params, bool& isError) {
+    if (!c.gateway || !c.helloDone || c.operatorControl || c.actorKey.empty()) {
+        isError = true;
+        return json{{"code", "cell_refused"}, {"message", "gateway control required"}};
+    }
+    const std::string actor = params.value("actor_key", std::string());
+    const long long epoch = params.at("epoch").get<long long>();
+    const std::string right = method == "principal_update"
+                                  ? params.value("right", std::string()) : std::string();
+    if (actor.empty() || epoch < 0 || (method == "principal_update" &&
+        right != "owner" && right != "manager" && right != "editor" && right != "viewer")) {
+        isError = true;
+        return json{{"code", "bad_request"}, {"message", "invalid principal update"}};
+    }
+    std::lock_guard<std::mutex> transition(principalMtx_);
+    const bool revoke = method == "principal_revoke";
+    const long long revokedThrough = revoke ? epoch : epoch - 1;
+    json owner;
+    {
+        std::lock_guard<std::mutex> lock(cellMtx_);
+        auto& a = actors_[actor];
+        if (epoch < a.epoch) {
+            isError = true;
+            return json{{"code", "revoked"}, {"message", "stale principal update"}};
+        }
+        if (epoch == a.epoch && a.revoked == revoke && (revoke || a.right == right)) {
+            if (c.actorKey == actor) c.retireAfterReply = true;
+            return json{{"ok", true}, {"epoch", epoch}};
+        }
+        a.key = actor;
+        a.hex = chudware::util::sha256_hex(actor).substr(0, 32);
+        owner = json{{"cell", true}, {"workspace_key", workspaceKey_}, {"actor_key", actor},
+                     {"actor_hex", a.hex}, {"right", a.right}, {"epoch", a.epoch},
+                     {"client_id", c.id}};
+        a.epoch = epoch;
+        a.revoked = true;
+    }
+    retireActorGeneration(actor, revokedThrough, owner, c.id);
+    {
+        std::lock_guard<std::mutex> lock(cellMtx_);
+        auto& a = actors_.at(actor);
+        a.revoked = revoke;
+        if (!right.empty()) a.right = right;
+    }
+    if (c.actorKey == actor) c.retireAfterReply = true;
+    return json{{"ok", true}, {"epoch", epoch}};
+}
+
+void Server::retireActorGeneration(const std::string& actor, long long revokedThrough,
+                                  const json& owner, int controlClient) {
+    std::vector<std::string> runs;
+    std::vector<std::shared_ptr<ClientConn>> close;
+    {
+        std::lock_guard<std::mutex> lock(clientsMtx_);
+        std::lock_guard<std::mutex> identityLock(cellMtx_);
+        for (const auto& [run, key] : runOwners_) if (key == actor) runs.push_back(run);
+        for (const auto& [id, conn] : clients_)
+            if (conn->actorKey == actor && conn->epoch <= revokedThrough) close.push_back(conn);
+    }
+    for (const auto& conn : close) {
+        for (const auto& run : runs)
+            sendConnectionEvent(*conn, json{{"event", "agent.event"},
+                {"data", {{"kind", "run_stopped"}, {"run_id", run}, {"reason", "revoked"},
+                          {"actor_key", actor}}}}.dump());
+        if (conn->id != controlClient) {
+            registry_.onDisconnect(conn->id, conn->kind);
+            conn->conn.shutdown();
+        }
+    }
+    WorkerBridge::revokeActor(actor, workspaceKey_, revokedThrough);
+    if (status_.engineState == 1 && owner.value("epoch", -1LL) >= 0) {
+        json result;
+        std::string err;
+        const json stop{{"_cell_ctx", owner}, {"_cell_revoke_through", revokedThrough}};
+        json agentStop = stop;
+        agentStop["run_id"] = "";
+        core::cpp_core().call("agent_cancel", agentStop, result, err);
+        json simStop = stop;
+        simStop["job_id"] = "";
+        core::cpp_core().call("sim_cancel", simStop, result, err);
+    }
+}
+
+bool Server::cellAdmit(ClientConn& c, const std::string& method, json& params, json& error) {
+    const auto fail = [&](const char* code) {
+        error = json{{"code", code}, {"message", code}};
+        return false;
+    };
+    {
+        std::lock_guard<std::mutex> lock(cellMtx_);
+        const auto actor = actors_.find(c.actorKey);
+        if (!c.helloDone || actor == actors_.end()) return fail("cell_refused");
+        if (actor->second.revoked || c.epoch != actor->second.epoch) return fail("revoked");
+        c.right = actor->second.right;
+    }
+    const auto policy = cellPolicy_.find(method);
+    if (policy == cellPolicy_.end() || policy->at("cell") != "allow")
+        return fail("cell_refused");
+    const std::string right = policy->at("right");
+    if ((c.right == "viewer" && right != "read") ||
+        (right == "manage" && c.right != "manager" && c.right != "owner"))
+        return fail("forbidden_right");
+    // Canonical path confinement supplements the namespace boundary, including symlinks.
+    static const std::vector<std::string> pathKeys = {
+        "path", "file_path", "folder_path", "output_path", "input_path", "source_path",
+        "target_path", "workspace_dir", "project_dir", "session_file", "chudcode_session_file",
+        "aicm_path", "brep_path", "stl_path", "step_path", "image_path", "save_path",
+        "model_path", "artifact_path", "working_dir", "cwd", "directory", "root",
+        "out_path", "progress_path", "prompts_dir", "output_dir", "input_dir"
+    };
+    const auto under = [](const std::filesystem::path& p, const std::filesystem::path& root) {
+        auto a = p.begin();
+        for (auto b = root.begin(); b != root.end(); ++b, ++a)
+            if (a == p.end() || *a != *b) return false;
+        return true;
+    };
+    const auto own = std::filesystem::path(cellState_) / "actors" / c.actorHex;
+    std::function<bool(std::filesystem::path&, unsigned)> resolveFilePath =
+        [&](std::filesystem::path& p, unsigned links) {
+            const auto normalized = p.lexically_normal();
+            if (!under(normalized, cellWork_) && !under(normalized, own)) return false;
+            std::filesystem::path prefix;
+            for (auto it = p.begin(); it != p.end(); ++it) {
+                prefix /= *it;
+                std::error_code ec;
+                const auto status = std::filesystem::symlink_status(prefix, ec);
+                if (status.type() == std::filesystem::file_type::not_found) break;
+                if (ec) return false;
+                if (!std::filesystem::is_symlink(status)) continue;
+                if (links == 40) return false;
+                auto target = std::filesystem::read_symlink(prefix, ec);
+                if (ec) return false;
+                if (!target.is_absolute()) target = prefix.parent_path() / target;
+                auto remainder = it;
+                for (++remainder; remainder != p.end(); ++remainder) target /= *remainder;
+                // Unlike weakly_canonical, inspect dangling links too: their
+                // targets can be outside the cell and invisible in its namespace.
+                p = std::move(target);
+                return resolveFilePath(p, links + 1);
+            }
+            p = normalized;
+            return true;
+        };
+    std::function<bool(json&, bool, unsigned)> paths = [&](json& value, bool path, unsigned depth) {
+        if (value.is_object()) {
+            for (auto& field : value.items()) {
+                const bool isPath = std::find(pathKeys.begin(), pathKeys.end(), field.key()) != pathKeys.end();
+                if (!paths(field.value(), isPath, depth + 1)) return false;
+            }
+        } else if (value.is_array()) {
+            for (auto& item : value) if (!paths(item, path, depth + 1)) return false;
+        } else if (path && value.is_string() && !value.get_ref<const std::string&>().empty()) {
+            const auto& raw = value.get_ref<const std::string&>();
+            if (raw.find('\0') != std::string::npos) return false;
+            std::filesystem::path p(raw);
+            if (depth > 1) {
+                // Paths embedded in document content are persisted references,
+                // not file-operation arguments. Preserve their relative spelling;
+                // the engine resolves them and enforces symlink confinement.
+                if (p.is_absolute()) return false;
+                for (const auto& component : p)
+                    if (component == "..") return false;
+                return true;
+            }
+            if (!c.gateway && p.is_absolute() &&
+                (p == "/actor" || p.string().rfind("/actor/", 0) == 0))
+                p = own / p.lexically_relative("/actor");
+            if (!p.is_absolute()) p = std::filesystem::path(cellWork_) / p;
+            if (!resolveFilePath(p, 0)) return false;
+            value = p.string();
+        }
+        return true;
+    };
+    if (!paths(params, false, 0)) return fail("cell_refused");
+    json context = cellContext(c);
+    // Reject a recorded foreign owner before acquiring a worker lane. Unknown
+    // handles stay in the requester's own lane, whose persistent actor registry
+    // resolves them; this also permits session resumption after hostd restarts.
+    {
+        std::lock_guard<std::mutex> lock(cellMtx_);
+        std::string handleActor;
+        for (const char* key : {"run_id", "session_id", "job_id", "dag_id"}) {
+            const auto id = params.find(key);
+            if (id == params.end() || !id->is_string() || id->get_ref<const std::string&>().empty()) continue;
+            const auto owner = handleOwners_.find(std::string(key) + ":" + id->get<std::string>());
+            if (owner == handleOwners_.end()) continue;
+            if (!handleActor.empty() && handleActor != owner->second) return fail("not_found");
+            handleActor = owner->second;
+            if (owner->second == c.actorKey) continue;
+            // Cross-actor authority is stop-only: no content reads, steering or session writes.
+            const bool stop = method == "agent_cancel" || method == "sim_cancel" ||
+                              method == "reveng_cancel_splat";
+            if (!stop || (c.right != "manager" && c.right != "owner")) return fail("not_found");
+            const auto actor = actors_.find(owner->second);
+            if (actor == actors_.end() || actor->second.revoked) return fail("not_found");
+            context["actor_key"] = actor->second.key;
+            context["actor_hex"] = actor->second.hex;
+            context["epoch"] = actor->second.epoch;
+            context["right"] = actor->second.right;
+            context["control_delegate"] = json{{"actor_key", c.actorKey},
+                                               {"right", "manager"}, {"action", "cancel"}};
+        }
+    }
+    params["_cell_ctx"] = std::move(context);
+    return true;
+}
+
+void Server::rememberCellHandles(const ClientConn& c, const json& params, const json& result) {
+    if (!cell_ || !result.is_object()) return;
+    // A transport-successful worker reply can still be a semantic refusal.
+    // Never let a guessed handle in such a request poison the ownership ledger.
+    if (const auto ok = result.find("ok"); ok != result.end() && *ok == false) return;
+    std::lock_guard<std::mutex> lock(cellMtx_);
+    for (const char* key : {"run_id", "session_id", "job_id", "dag_id"}) {
+        for (const json* object : {&params, &result}) {
+            const auto value = object->find(key);
+            if (value != object->end() && value->is_string() && !value->get_ref<const std::string&>().empty())
+                handleOwners_.try_emplace(std::string(key) + ":" + value->get<std::string>(),
+                    params.at("_cell_ctx").value("actor_key", c.actorKey));
+        }
+    }
+}
+
+static void sendConnectionEvent(ClientConn& c, const std::string& line) {
+    // Dispatch/event callbacks never run while owning writeMtx: the connection
+    // loop locks it only AFTER dispatch returns. Waiting here cannot deadlock on
+    // a response needing the engine/registry lock. Bound both contention and the
+    // transport write (IpcConn's send timeout) so a wedged spectator cannot stall
+    // another writer indefinitely, without silently losing a live doc update.
+    std::unique_lock<std::timed_mutex> wlk(c.writeMtx, std::defer_lock);
+    const bool locked = wlk.try_lock_for(std::chrono::seconds(2));
+    if (locked && c.conn.writeLine(line)) return;
+    if (!c.eventWriteFailureLogged.exchange(true))
+        log().line("client #%d: event delivery failed (%s); disconnecting for re-sync",
+                   c.id, locked ? "socket write" : "write mutex timeout");
+    // A timed-out/partial event must not leave a client silently watching stale
+    // geometry (nor a partial JSON line). Reconnect re-subscribes and re-lists.
+    c.conn.shutdown();
+}
+
 void Server::sendEventToAll(const std::string& line) {
+    if (cell_) return;  // Broadcast classes are desktop/operator-only, never tenant data.
     std::vector<std::shared_ptr<ClientConn>> live;
     {
         std::lock_guard<std::mutex> lk(clientsMtx_);
         for (auto& [id, c] : clients_) live.push_back(c);
     }
-    for (auto& c : live) {
-        // try_lock, never block: a client mid-write (its own response, or another
-        // fanout) must not stall event delivery to everyone else. A busy client
-        // simply misses this push — it re-syncs on its next reconnect (which now
-        // re-subscribes + re-lists). Same rationale as sendEventTo.
-        std::unique_lock<std::mutex> wlk(c->writeMtx, std::try_to_lock);
-        if (wlk.owns_lock()) c->conn.writeLine(line);
-    }
+    for (auto& c : live) sendConnectionEvent(*c, line);
 }
 
 void Server::sendEventTo(int clientId, const std::string& line) {
@@ -138,13 +587,18 @@ void Server::sendEventTo(int clientId, const std::string& line) {
         if (it == clients_.end()) return;
         c = it->second;
     }
-    // try_lock (not lock_guard): if the client is mid-write we skip this push
-    // rather than block the caller — event fanout runs on OTHER clients' dispatch
-    // threads and on the accept loop, so blocking here on one wedged consumer
-    // would stall unrelated work. The bounded SO_SNDTIMEO write is the second
-    // backstop once we DO hold the lock.
-    std::unique_lock<std::mutex> wlk(c->writeMtx, std::try_to_lock);
-    if (wlk.owns_lock()) c->conn.writeLine(line);
+    if (cell_) {
+        std::lock_guard<std::mutex> lock(cellMtx_);
+        const auto actor = actors_.find(c->actorKey);
+        if (!c->helloDone || actor == actors_.end() || actor->second.revoked ||
+            actor->second.epoch != c->epoch) return;
+    }
+    if (cell_ && c->gateway) {
+        auto event = json::parse(line, nullptr, false);
+        if (!event.is_object()) return;
+        workspaceRelativePaths(event, cellWork_);
+        sendConnectionEvent(*c, event.dump());
+    } else sendConnectionEvent(*c, line);
 }
 
 // Live callback contexts. They live on the dispatch stack for the duration of the synchronous
@@ -166,7 +620,37 @@ void Server::sendAgentEvent(int clientId, const char* eventJson) {
     std::string line = "{\"event\":\"agent.event\",\"data\":";
     line += eventJson;
     line += "}";
-    sendEventTo(clientId, line);
+    if (!cell_) {
+        sendEventTo(clientId, line);
+        return;
+    }
+    std::vector<std::shared_ptr<ClientConn>> live;
+    {
+        std::lock_guard<std::mutex> lock(clientsMtx_);
+        for (const auto& [id, conn] : clients_) live.push_back(conn);
+    }
+    std::string actor;
+    {
+        std::lock_guard<std::mutex> lock(cellMtx_);
+        for (const auto& conn : live) if (conn->id == clientId) actor = conn->actorKey;
+        const auto event = json::parse(eventJson, nullptr, false);
+        if (event.is_object() && event.contains("run_id") && event["run_id"].is_string()) {
+            const std::string run = event["run_id"];
+            handleOwners_.try_emplace("run_id:" + run, actor);
+            const std::string kind = event.value("kind", std::string());
+            if (kind == "run_started") runOwners_[run] = actor;
+            if (kind == "run_finished" || kind == "run_stopped") runOwners_.erase(run);
+        }
+    }
+    if (actor.empty()) return;
+    for (const auto& conn : live) {
+        bool owns;
+        {
+            std::lock_guard<std::mutex> lock(cellMtx_);
+            owns = conn->helloDone && conn->actorKey == actor;
+        }
+        if (owns) sendEventTo(conn->id, line);
+    }
 }
 
 void Server::streamThunk(const char* eventJson, void* ud) {
@@ -213,6 +697,7 @@ std::string Server::detachSocketForFlockRelease() {
 }
 
 Server::~Server() {
+    clearCacheRefreshSink();
     // Client loops must not re-enter readLine once we start tearing down.
     stopping_ = true;
     // The watchdog thread polls stopping_ every 500ms; join it before tearing down.
@@ -379,6 +864,72 @@ bool Server::admitWhileDraining(chudware_ipc::IpcConn& conn, std::string& firstL
     return false;
 }
 
+json Server::cellCensus(bool commitExit, bool idleExit) {
+    WorkerBridge::Activity workers;
+    std::unique_lock<std::mutex> probe(cellCensusMtx_, std::try_to_lock);
+    if (probe.owns_lock()) workers = WorkerBridge::activity();
+    else workers.unknown = 1;
+    std::uint64_t native[3]{};
+    // Worker parents precede native children; task units include final publication.
+    const bool nativeComplete = status_.engineState.load() == 1 &&
+                                core::cpp_core().activity(native);
+    std::lock_guard<std::mutex> admission(clientsMtx_);
+    std::uint64_t sessions = 0;
+    for (const auto& [id, client] : clients_)
+        if (!client->controlOnly) ++sessions;
+    const auto rpc = static_cast<std::uint64_t>(std::max(0, status_.inflight.load()));
+    const bool complete = nativeComplete && workers.unknown == 0;
+    const std::uint64_t active = sessions + rpc + native[0] + native[1] + native[2] +
+                                 workers.busy + workers.background + workers.unknown;
+    const bool quiescent = complete && active == 0;
+    if (commitExit && quiescent && controlRepliesPending_.load() == 0 &&
+        (idleExit || status_.draining || (cellAdmissionClosed_ && cellExitWhenQuiescent_))) {
+        if (!cellAdmissionClosed_) { cellAdmissionClosed_ = true; ++cellGeneration_; }
+        cellExiting_ = true;
+    }
+    return json{{"schema", 1}, {"admission", cellAdmissionClosed_ ? "closed" : "open"},
+                {"generation", cellGeneration_}, {"sessions", sessions}, {"rpc_inflight", rpc},
+                {"native", {{"cache_verification", native[0]}, {"profiler", native[1]},
+                            {"dirty_documents", native[2]}}},
+                {"workers", {{"busy", workers.busy}, {"background", workers.background},
+                             {"unknown", workers.unknown}}},
+                {"active", active}, {"complete", complete}, {"quiescent", quiescent},
+                {"exiting", cellExiting_}};
+}
+
+json Server::cellOperator(ClientConn& c, const std::string& method,
+                          const json& params, bool& isError) {
+    const auto refuse = [&](const char* code) {
+        isError = true;
+        return json{{"code", code}, {"message", code}};
+    };
+    if (!c.gateway || !c.operatorControl || !c.helloDone) return refuse("cell_refused");
+    if (method == "ping") return json{{"ok", true}};
+    if (method == "cell_census") return cellCensus();
+    if (method != "cell_drain") return refuse("cell_refused");
+    const std::string admission = params.value("admission", std::string());
+    const std::string exit = params.value("exit", std::string("none"));
+    if ((admission != "closed" && admission != "open") ||
+        (exit != "none" && exit != "when_quiescent") ||
+        (admission == "open" && exit != "none")) return refuse("bad_request");
+    if (params.contains("generation") &&
+        (!params["generation"].is_number_unsigned() &&
+         (!params["generation"].is_number_integer() || params["generation"].get<long long>() < 0)))
+        return refuse("bad_request");
+    {
+        std::lock_guard<std::mutex> lock(clientsMtx_);
+        if (cellExiting_) return refuse("cell_exiting");
+        if ((admission == "open" && !params.contains("generation")) ||
+            (params.contains("generation") &&
+             params["generation"].get<std::uint64_t>() != cellGeneration_))
+            return refuse("stale_generation");
+        const bool closed = admission == "closed";
+        if (closed != cellAdmissionClosed_) { cellAdmissionClosed_ = closed; ++cellGeneration_; }
+        cellExitWhenQuiescent_ = closed && exit == "when_quiescent";
+    }
+    return cellCensus();
+}
+
 int Server::pinningClients(int idleWindowSecs) {
     std::vector<std::shared_ptr<ClientConn>> live;
     {
@@ -389,6 +940,7 @@ int Server::pinningClients(int idleWindowSecs) {
     const long long windowMs = (long long)std::max(1, idleWindowSecs) * 1000;
     int n = 0;
     for (const auto& c : live) {
+        if (c->controlOnly) continue;
         // The app being open is itself the reason this process exists.
         if (c->kind == "gui") { ++n; continue; }
         if (now - c->lastRpcMs.load() <= windowMs) { ++n; continue; }
@@ -431,7 +983,59 @@ bool Server::idleExpired(int lingerSecs) {
     // Never idle-exit under a running mission: children are the daemon's work
     // even with zero clients (GUI-close continuity).
     if (children_.aliveCount() > 0) return false;
-    return monoMs() - status_.lastActivityMs > (long long)idleLimitSecs * 1000;
+    if (monoMs() - status_.lastActivityMs <= (long long)idleLimitSecs * 1000) return false;
+    if (!cell_) return true;
+    if (monoMs() - lastCellProbeMs_ < 1000) return false;
+    lastCellProbeMs_ = monoMs();
+    const json census = cellCensus(true, true);
+    if (!census["exiting"].get<bool>()) { touch(); return false; }
+    return true;
+}
+
+void Server::acceptClient(chudware_ipc::IpcConn conn, bool gateway, const std::string& actor,
+                          bool operatorListener) {
+    if (!conn.valid()) return;
+    std::string firstLine;
+    if (status_.draining && !(cell_ && !gateway) && !admitWhileDraining(conn, firstLine)) return;
+    auto c = std::make_shared<ClientConn>();
+    c->gateway = gateway;
+    c->operatorListener = operatorListener;
+    if (cell_ && !gateway) {
+        std::lock_guard<std::mutex> lock(cellMtx_);
+        const auto a = actors_.find(actor);
+        if (a == actors_.end() || a->second.revoked) return;
+        c->actorKey = a->second.key;
+        c->actorHex = a->second.hex;
+        c->right = a->second.right;
+        c->epoch = a->second.epoch;
+    }
+    std::unique_lock<std::mutex> lock(clientsMtx_);
+    if (cell_ && cellExiting_) return;
+    if (cell_ && gateway && cellAdmissionClosed_) {
+        lock.unlock();
+        if (firstLine.empty() && !conn.readLine(firstLine, 1000)) return;
+        const json request = json::parse(firstLine, nullptr, false);
+        const bool control = request.is_object() && request.contains("method") &&
+            request["method"] == "hello" && request.contains("params") &&
+            request["params"].is_object() && request["params"].contains("client") &&
+            request["params"]["client"] == "control";
+        if (!control) {
+            const json id = request.is_object() && request.contains("id") ? request["id"] : json(-1);
+            conn.writeLine(json{{"id", id}, {"error", {{"code", "daemon_draining"},
+                {"message", "cell maintenance admission is closed"}, {"reason", "cell_drain"}}}}.dump());
+            return;
+        }
+        lock.lock();
+        if (cellExiting_) return;
+    }
+    c->id = nextClientId_++;
+    c->conn = std::move(conn);
+    c->lastRpcMs = monoMs();
+    clients_[c->id] = c;
+    ++status_.clients;
+    c->thread = std::thread([this, c, first = std::move(firstLine)]() mutable {
+        clientLoop(c, std::move(first));
+    });
 }
 
 void Server::run(int lingerSecs) {
@@ -441,32 +1045,31 @@ void Server::run(int lingerSecs) {
     if (engineWatchdogMs_ > 0 || engineWatchdogLongMs() > 0)
         watchdog_ = std::thread([this] { watchdogLoop(); });
     while (!stopping_) {
-        chudware_ipc::IpcConn conn = listener_.accept(500);
-        std::string firstLine;
-        // A refused connect (admitWhileDraining) is answered and closed there; the ticks
-        // below still run, so a client that retries fast cannot hold off the drain exit.
-        if (conn.valid() && (!status_.draining || admitWhileDraining(conn, firstLine))) {
-            auto c = std::make_shared<ClientConn>();
+        acceptClient(listener_.accept(cell_ ? 50 : 500), cell_);
+        if (cell_) {
+            acceptClient(operatorListener_->accept(0), true, {}, true);
+            std::vector<std::pair<std::string, std::shared_ptr<chudware_ipc::IpcListener>>> listeners;
             {
-                // Start the loop under the lock its disconnect tail takes, so that tail can
-                // never observe a not-yet-assigned (non-joinable) thread object.
-                std::lock_guard<std::mutex> lk(clientsMtx_);
-                c->id = nextClientId_++;
-                c->conn = std::move(conn);
-                c->lastRpcMs = monoMs();
-                clients_[c->id] = c;
-                ++status_.clients;
-                c->thread = std::thread([this, c, first = std::move(firstLine)]() mutable {
-                    clientLoop(c, std::move(first));
-                });
+                std::lock_guard<std::mutex> lock(cellMtx_);
+                for (const auto& [key, actor] : actors_)
+                    if (!actor.revoked && actor.listener) listeners.emplace_back(key, actor.listener);
             }
-            log().line("client #%d connected (%d total)", c->id, status_.clients.load());
+            for (const auto& [actor, listener] : listeners)
+                acceptClient(listener->accept(0), false, actor);
         }
         // Expire stale edit-holds + emit doc.lease_change; docs whose GC grace
         // expired with no attached client are retired + closed here so dead
         // sessions can never pile zombie docs into the shared engine.
         for (const std::string& id : registry_.tick()) gcCloseDoc(id);
         staleBinaryTick();  // mtime watch on hostd binary + libchudware (self-drain)
+        if (cell_) {
+            bool wantsExit = false;
+            { std::lock_guard<std::mutex> lock(clientsMtx_); wantsExit = cellExitWhenQuiescent_; }
+            if (wantsExit && monoMs() - lastCellProbeMs_ >= 1000) {
+                lastCellProbeMs_ = monoMs();
+                if (cellCensus(true)["exiting"].get<bool>()) break;
+            }
+        }
         if (status_.draining) {
             // A drain ends when the work ends — not when the last SOCKET goes away. Parked
             // connections do not count (pinningClients), and a HARD drain (--stop, tray Quit,
@@ -475,7 +1078,13 @@ void Server::run(int lingerSecs) {
             // silent socket was allowed to veto its own shutdown forever.
             const long long deadline = drainDeadlineMs_.load();
             const bool expired = deadline > 0 && monoMs() >= deadline;
-            if ((pinningClients(guiExitGraceSecs_) == 0 && status_.inflight == 0) || expired) {
+            const bool noWork = pinningClients(guiExitGraceSecs_) == 0 && status_.inflight == 0;
+            bool safeCell = !cell_;
+            if (cell_ && noWork && monoMs() - lastCellProbeMs_ >= 1000) {
+                lastCellProbeMs_ = monoMs();
+                safeCell = cellCensus(true)["exiting"].get<bool>();
+            }
+            if ((noWork && safeCell) || expired) {
                 if (expired && status_.clients > 0) {
                     log().line("drain deadline reached with %d client(s) still connected — "
                                "dropping them and exiting", status_.clients.load());
@@ -535,6 +1144,8 @@ bool Server::gcCloseDoc(const std::string& docId, const char* reason) {
         for (const auto& d : docs["docs"]) {
             if (d.is_object() && d.value("doc_id", std::string()) == docId) {
                 found = true;
+                if (cell_ && !discard && (d.value("dirty", false) || d.value("busy", false)))
+                    return false;
                 break;
             }
         }
@@ -630,10 +1241,15 @@ void Server::clientLoop(std::shared_ptr<ClientConn> c, std::string firstLine) {
             const std::string method = msg.contains("method") && msg["method"].is_string()
                                            ? msg["method"].get<std::string>()
                                            : std::string();
+            const bool operatorRequest = c->controlOnly ||
+                (cell_ && c->gateway && method == "hello" && msg.contains("params") &&
+                 msg["params"].is_object() && msg["params"].contains("client") &&
+                 msg["params"]["client"] == "control");
+            // Keep this barrier through reply delivery, not just dispatch.
+            InflightTally tally(operatorRequest ? controlRepliesPending_ : status_.inflight);
             bool isError = false;
             json payload;
             try {
-                InflightTally tally(status_.inflight);
                 // `value("params", object())` substitutes its default only when the KEY is
                 // ABSENT — an explicit `"params": null` on the wire comes back as null and
                 // makes the first `params.value(...)` in a handler throw type_error.306.
@@ -657,8 +1273,9 @@ void Server::clientLoop(std::shared_ptr<ClientConn> c, std::string firstLine) {
                 log().line("client #%d: '%s' threw a non-standard exception — rejected that "
                            "request", c->id, method.c_str());
             }
-            touch();
+            if (!c->controlOnly) touch();
             c->lastRpcMs = monoMs();  // this connection is doing work — see pinningClients
+            if (cell_ && c->gateway) workspaceRelativePaths(payload, cellWork_);
             json resp = {{"id", id}};
             resp[isError ? "error" : "result"] = std::move(payload);
             // dump() is this loop's other throw site: it rejects invalid UTF-8 (type_error.316),
@@ -674,8 +1291,9 @@ void Server::clientLoop(std::shared_ptr<ClientConn> c, std::string firstLine) {
                            {"error", {{"code", "encoding_error"}, {"message", e.what()}}}}
                           .dump();
             }
-            std::lock_guard<std::mutex> wlk(c->writeMtx);
+            std::lock_guard<std::timed_mutex> wlk(c->writeMtx);
             if (!c->conn.writeLine(out)) break;
+            if (c->retireAfterReply) break;
         }
     } catch (const std::exception& e) {
         log().line("client #%d: connection loop aborted (%s) — dropping this client only", c->id,
@@ -704,7 +1322,7 @@ void Server::clientLoop(std::shared_ptr<ClientConn> c, std::string firstLine) {
             }
         }
         --status_.clients;
-        touch();
+        if (!c->controlOnly) touch();
         log().line("client #%d (%s) disconnected (%d left)", c->id, c->kind.c_str(),
                    status_.clients.load());
         registry_.onDisconnect(c->id, c->kind);
@@ -713,12 +1331,31 @@ void Server::clientLoop(std::shared_ptr<ClientConn> c, std::string firstLine) {
     }
 }
 
-json Server::dispatch(ClientConn& c, const std::string& method, const json& params,
+json Server::dispatch(ClientConn& c, const std::string& method, const json& rawParams,
                       bool& isError) {
+    json params = rawParams;
+    params.erase("_cell_ctx");
+    params.erase("ctx");
+    params.erase("_cell_revoke_through");
+    params.erase("control_delegate");
     const char* stateNames[] = {"loading", "ready", "failed"};
     if (method == "hello") {
+        if (cell_) {
+            json result = cellHello(c, params, isError);
+            if (isError) return result;
+            c.kind = c.controlOnly ? "control" : c.gateway ? "gui" : "agent";
+            if (c.kind == "gui") guiDetached_ = false;
+            json hello{{"proto", 1}, {"abi", core::cpp_core().abiVersion()},
+                       {"git_rev", buildId_}, {"engine_build_id", core::cpp_core().buildId()},
+                       {"state", stateNames[status_.engineState.load()]},
+                       {"cell", true}, {"id_remap", json::object()}, {"recovery_pending", 0}};
+            if (c.operatorControl) { hello["operator"] = true; hello["cell_id"] = cellId_; }
+            return hello;
+        }
         c.kind = params.value("client", "unknown");
         c.pid = params.value("pid", 0L);
+        c.writerGroup = params.value("writer_group", std::string());
+        registry_.setWriterGroup(c.id, c.writerGroup);
         if (c.kind == "gui") guiDetached_ = false;  // GUI (re)attached: full linger again
         // Two distinct identities. AUTHORITY (manufacturing leases, undo policy)
         // always re-derives the authenticated local peer credential at the call
@@ -751,19 +1388,35 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                     // the GUI prompts the user when this is non-zero.
                     {"recovery_pending", autosave_ ? autosave_->orphanCount() : 0}};
     }
+    if (cell_) {
+        if (c.operatorControl) return cellOperator(c, method, params, isError);
+        if (method == "principal_revoke" || method == "principal_update")
+            return changePrincipal(c, method, params, isError);
+        if (c.controlOnly && method != "ping") {
+            isError = true;
+            return json{{"code", "cell_refused"}, {"message", "principal control only"}};
+        }
+        json error;
+        if (!cellAdmit(c, method, params, error)) {
+            isError = true;
+            return error;
+        }
+    }
     if (method == "ping") return json{{"ok", true}};
     // Containment is checked before every handler that can mutate daemon state,
     // supervise a child, enter the engine, or lazily spawn/forward to a worker.
     // Unknown methods fail closed here rather than reaching either passthrough.
     const bool lifecycleReadOnly = method == "daemon_status" || method == "attach_doc" ||
                                    method == "detach_doc" || method == "subscribe";
-    const bool containedAllowed = lifecycleReadOnly || DocRegistry::isReadOnlyMethod(method);
-    const auto containment = chudware::security::loadEmbeddedEnforcementState(
-        chudware_ipc::stateDir(), entitlementSubject(), std::time(nullptr));
-    if (!containment.active() && !containedAllowed) {
-        isError = true;
-        return json{{"code", "entitlement_read_only"},
-                    {"message", "protected operation disabled"}};
+    if (!cell_) {
+        const bool containedAllowed = lifecycleReadOnly || DocRegistry::isDesktopReadOnlyMethod(method);
+        const auto containment = chudware::security::loadEmbeddedEnforcementState(
+            chudware_ipc::stateDir(), entitlementSubject(), std::time(nullptr));
+        if (!containment.active() && !containedAllowed) {
+            isError = true;
+            return json{{"code", "entitlement_read_only"},
+                        {"message", "protected operation disabled"}};
+        }
     }
     const std::string authenticatedSeat = authenticatedPeerIdentity(c);
     // hello.client is display/routing metadata only. It cannot attest a human at
@@ -1027,8 +1680,26 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         const char* action = method == "agent_cancel"  ? "cancel"
                              : method == "agent_steer" ? "steer"
                                                        : "answer";
-        if (WorkerBridge::controlActiveRun(action, params, workerRunMatched,
-                                           controlResult, controlErr))
+        if (cell_ && method == "agent_cancel" && params.value("run_id", std::string()).empty()) {
+            std::vector<std::string> own;
+            {
+                std::lock_guard<std::mutex> lock(cellMtx_);
+                for (const auto& [run, actor] : runOwners_) if (actor == c.actorKey) own.push_back(run);
+            }
+            for (const auto& run : own) {
+                bool matched = false;
+                json ownControl = params;
+                ownControl["run_id"] = run;
+                ownControl.erase("_cell_ctx");
+                WorkerBridge::controlActiveRun("cancel", ownControl, matched,
+                    controlResult, controlErr, cellContext(c));
+            }
+        }
+        json workerControl = params;
+        workerControl.erase("_cell_ctx");
+        if (WorkerBridge::controlActiveRun(action, workerControl, workerRunMatched,
+                                           controlResult, controlErr,
+                                           cell_ ? params.at("_cell_ctx") : json::object()))
             return controlResult;
         if (workerRunMatched) {
             isError = true;
@@ -1038,6 +1709,10 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                                         : controlErr}};
         }
         if (method == "agent_answer") {
+            if (cell_) {
+                isError = true;
+                return json{{"code", "not_found"}, {"message", "not_found"}};
+            }
             const auto field = [&](const char* key) {
                 const auto it = params.is_object() ? params.find(key) : params.end();
                 return params.is_object() && it != params.end() && it->is_string()
@@ -1071,7 +1746,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     {
         json policyErr;
         if (!registry_.preCall(c.id, c.kind, c.userId, c.userDisplay, method, p, policyErr,
-                              attachWarning)) {
+                              attachWarning, cell_ && cellPolicy_.at(method).at("right") == "read")) {
             isError = true;
             return policyErr;
         }
@@ -1083,8 +1758,16 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     struct InflightGuard {
         Server& server;
         int clientId;
-        ~InflightGuard() { server.endInflight(clientId); }
-    } inflightGuard{*this, c.id};
+        std::string runId;
+        ~InflightGuard() {
+            server.endInflight(clientId);
+            if (server.cell_ && !runId.empty()) {
+                std::lock_guard<std::mutex> lock(server.cellMtx_);
+                server.runOwners_.erase(runId);
+            }
+        }
+    } inflightGuard{*this, c.id, cell_ && method == "agent_admin_turn"
+                                   ? p.value("run_id", std::string()) : std::string()};
     // Live streaming (transparency): agent events go back to the requesting client while nested
     // document commits enter the shared registry and fan out to every subscribed GUI. Both
     // thread-local sinks fire synchronously on this dispatch thread and are cleared by RAII.
@@ -1144,9 +1827,22 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
             WorkerBridge::EventFn workerEvent;
             if (streamThis) {
                 const int requester = c.id;
-                workerEvent = [this, requester](const json& data) {
+                const std::string owner = cell_ ? p.at("_cell_ctx").value("actor_key", c.actorKey) : std::string();
+                workerEvent = [this, requester, owner](const json& data) {
                     const std::string encoded = data.dump();
-                    sendAgentEvent(requester, encoded.c_str());
+                    if (!cell_ || owner.empty()) {
+                        sendAgentEvent(requester, encoded.c_str());
+                        return;
+                    }
+                    std::vector<int> recipients;
+                    {
+                        std::lock_guard<std::mutex> lock(clientsMtx_);
+                        std::lock_guard<std::mutex> identityLock(cellMtx_);
+                        for (const auto& [id, conn] : clients_)
+                            if (conn->helloDone && conn->actorKey == owner) recipients.push_back(id);
+                    }
+                    const std::string line = json{{"event", "agent.event"}, {"data", data}}.dump();
+                    for (int id : recipients) sendEventTo(id, line);
                 };
             }
             // An online turn's budget is the caller's optional `timeout` (seconds). The
@@ -1165,10 +1861,18 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                     workerTimeoutMs = ms >= 2147483647.0 ? 2147483647 : (int)ms;
                 }
             }
+            json workerParams = p;
+            workerParams.erase("_cell_ctx");
+            if (cell_ && method == "agent_admin_turn") {
+                std::lock_guard<std::mutex> lock(cellMtx_);
+                runOwners_[p.value("run_id", std::string())] = p.at("_cell_ctx").at("actor_key").get<std::string>();
+            }
             const bool workerOk =
-                WorkerBridge::forMethod(method).call(method, p, wresult, werr,
-                                                      workerTimeoutMs, workerEvent);
+                WorkerBridge::dispatch(method, workerParams, wresult, werr,
+                                       workerTimeoutMs, workerEvent,
+                                       cell_ ? p.at("_cell_ctx") : json::object());
             if (workerOk) {
+                rememberCellHandles(c, p, wresult);
                 // Worker success: return result verbatim except any legacy
                 // batched event copy; matching progress already streamed live.
                 if (streamThis && wresult.is_object()) wresult.erase("events");
@@ -1200,6 +1904,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         if (!e.contains("code")) e["code"] = "engine_error";
         return e;
     }
+    rememberCellHandles(c, p, result);
     // Live-streamed above (streamThis) -> the batched result["events"] copy is now redundant.
     // Drop it so a streaming client (which renders the live agent.event push) never double-
     // renders the run. (Same-build deploy: every client understands the push.)
@@ -1209,7 +1914,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     registry_.postCall(c.id, c.kind, c.userId, c.userDisplay, method, p, result);
     // Stamp origin_kind onto each doc_list entry so a GUI that connected after a
     // doc was minted can recover user-vs-AI ownership on bootstrap.
-    if (method == "doc_list") registry_.annotateDocList(result);
+    if (method == "doc_list") registry_.annotateDocList(result, c.id);
     // Closed means closed: an explicit doc_close deletes the doc's autosave
     // artifacts so it can never resurrect on the next daemon start.
     if (method == "doc_close" && autosave_)

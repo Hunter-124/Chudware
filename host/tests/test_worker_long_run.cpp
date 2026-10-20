@@ -1,4 +1,4 @@
-// test_worker_long_run.cpp — ctest for WorkerClient's daemon-mode long-run serialization.
+// test_worker_long_run.cpp — ctest for WorkerClient's daemon-mode long-run lanes.
 //
 // Links the REAL worker_client.cpp + engine_backend.cpp + ipc client/transport + async_rpc.cpp
 // against an in-process fake hostd: a private Unix socket (CHUDWARE_HOSTD_SOCKET, temp
@@ -14,8 +14,10 @@
 // Acceptance:
 //   ✓ while an agent_admin_turn is in flight, a worker-routed call and a doc_activate queued
 //     behind it on AsyncRpc both complete
-//   ✓ two long runs on one client never overlap: the second reaches hostd only after the first
-//     returned
+//   ✓ two online turns on one client overlap on different hostd connections, and their
+//     Stop/steer/answer calls reach hostd by run_id without fetching worker_control_info
+//   ✓ native agent runs still serialize: the second reaches hostd only after the first returns
+//   ✓ the agent connection pool admits eight calls, queues the ninth, and releases leases
 //   ✓ a native sim_run_topology with timeoutMs=-1 stays pending across solver silence far
 //     longer than the transport's 200 ms abort-poll slice (mesh/assembly/factorization emit
 //     nothing for seconds), streams its progress live, then receives its result; a GUI
@@ -39,6 +41,9 @@
 //     background thread's query on the same EngineClient
 //   ✓ background query EOF/timeout leaves primary liveness/generation intact and reconnects
 //     only that side connection; disconnect wakes every active background call
+//   ✓ a gateway id:null parse-error reply surfaces its exact structured refusal, invalidates
+//     only that socket, and reconnects without throwing or replaying the rejected call;
+//     malformed reply ids fail as protocol errors rather than being converted to integers
 //
 // engine_backend startup against a draining hostd (forked child: the backend latches once
 // per process):
@@ -71,6 +76,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <filesystem>
 #include <mutex>
 #include <optional>
@@ -130,7 +136,7 @@ public:
         ::unlink(path_.c_str());
     }
 
-    // Block every agent_admin_turn until releaseTurns(); re-arm for the next test.
+    // Block online turns and native agent runs until releaseTurns(); re-arm per test.
     void holdTurns() {
         std::lock_guard<std::mutex> lk(mtx_);
         releaseTurns_ = false;
@@ -154,6 +160,21 @@ public:
     int maxConcurrentTurns() {
         std::lock_guard<std::mutex> lk(mtx_);
         return maxConcurrent_;
+    }
+    bool waitNativeAgentsStarted(int n, int timeoutMs) {
+        return waitCount(nativeAgentsStarted_, n, timeoutMs);
+    }
+    int nativeAgentsStarted() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return nativeAgentsStarted_;
+    }
+    int maxConcurrentNativeAgents() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return maxConcurrentNativeAgents_;
+    }
+    int controlInfoRequests() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return controlInfoRequests_;
     }
     bool waitSimsStarted(int n, int timeoutMs) { return waitCount(simsStarted_, n, timeoutMs); }
     int simsStarted() {
@@ -307,19 +328,45 @@ private:
                                const json& params) {
         if (method == "hello")
             return json{{"state", "ready"}, {"client_id", clientId}};
-        if (method == "worker_control_info")
+        if (method == "worker_control_info") {
+            bump(controlInfoRequests_);
             return json{{"transport", "unix"},
                         {"endpoint", "/nonexistent/chudware-test-control.sock"},
                         {"token", std::string(64, 'a')}};
+        }
         if (method == "agent_admin_turn") {
             std::unique_lock<std::mutex> lk(mtx_);
             ++turnsStarted_;
             ++activeTurns_;
+            const std::string runId = params.value("run_id", std::string());
+            activeRunIds_.push_back(runId);
             if (activeTurns_ > maxConcurrent_) maxConcurrent_ = activeTurns_;
             cv_.notify_all();
-            cv_.wait(lk, [&] { return releaseTurns_; });
+            cv_.wait(lk, [&] { return releaseTurns_ || stopping_; });
             --activeTurns_;
+            activeRunIds_.erase(std::find(activeRunIds_.begin(), activeRunIds_.end(), runId));
+            return json{{"ok", true}, {"text", "done"}, {"client_id", clientId}};
+        }
+        if (method == "agent_run" || method == "agent_run_v2") {
+            std::unique_lock<std::mutex> lk(mtx_);
+            ++nativeAgentsStarted_;
+            ++activeNativeAgents_;
+            maxConcurrentNativeAgents_ = std::max(maxConcurrentNativeAgents_, activeNativeAgents_);
+            cv_.notify_all();
+            cv_.wait(lk, [&] { return releaseTurns_ || stopping_; });
+            --activeNativeAgents_;
             return json{{"ok", true}, {"text", "done"}};
+        }
+        if (method == "agent_cancel" || method == "agent_steer" || method == "agent_answer") {
+            std::lock_guard<std::mutex> lk(mtx_);
+            const std::string runId = params.value("run_id", std::string());
+            const bool active =
+                std::find(activeRunIds_.begin(), activeRunIds_.end(), runId) != activeRunIds_.end();
+            const char* flag = method == "agent_cancel" ? "cancelled" :
+                               method == "agent_steer" ? "steered" : "answered";
+            json reply{{"ok", true}, {"run_id", runId}, {flag, active}};
+            if (params.contains("provider")) reply["provider"] = params["provider"];
+            return reply;
         }
         if (method == "subscription_accounts") {
             {
@@ -419,6 +466,11 @@ private:
                     closeConn(fd);
                     return;
                 }
+                if (params.contains("reply_frame")) {
+                    // Exercise the real client parser with the peer's exact wire envelope.
+                    push(fd, params["reply_frame"]);
+                    continue;
+                }
                 const std::optional<json> result = handle(fd, clientId, method, params);
                 if (!result) {
                     closeConn(fd);
@@ -459,6 +511,11 @@ private:
     int turnsStarted_ = 0;
     int activeTurns_ = 0;
     int maxConcurrent_ = 0;
+    std::vector<std::string> activeRunIds_;
+    int nativeAgentsStarted_ = 0;
+    int activeNativeAgents_ = 0;
+    int maxConcurrentNativeAgents_ = 0;
+    int controlInfoRequests_ = 0;
     int simsStarted_ = 0;
     int activeSims_ = 0;
     int maxConcurrentSims_ = 0;
@@ -516,27 +573,102 @@ static void asyncLaneRunsDuringTurn(FakeHostd& hostd) {
     }
 }
 
-// Two long runs on one client still serialize: the second reaches hostd only after the first.
-static void longRunsNeverOverlap(FakeHostd& hostd) {
+// Concurrent conversations lease different connections and keep hostd-routed control live.
+static void onlineTurnsOverlap(FakeHostd& hostd) {
     WorkerClient w;
     hostd.holdTurns();
     const int before = hostd.turnsStarted();
-    auto runTurn = [&](const char* id) {
+    const int controlInfoBefore = hostd.controlInfoRequests();
+    json results[2];
+    bool ok[2] = {false, false};
+    auto runTurn = [&](int index, const char* id) {
+        std::string e;
+        ok[index] = w.call("agent_admin_turn", turnParams(id), results[index], e, 60000);
+    };
+    std::thread first(runTurn, 0, "run-a");
+    CHECK(hostd.waitTurnsStarted(before + 1, 5000));
+    std::thread second(runTurn, 1, "run-b");
+    CHECK(hostd.waitTurnsStarted(before + 2, 5000));
+    CHECK(hostd.activeTurns() == 2);
+    CHECK(hostd.maxConcurrentTurns() == 2);
+    CHECK(hostd.controlInfoRequests() == controlInfoBefore);
+    for (const char* id : {"run-a", "run-b"}) {
         json r;
         std::string e;
-        w.call("agent_admin_turn", turnParams(id), r, e, 60000);
-    };
-    std::thread first(runTurn, "run-a");
-    CHECK(hostd.waitTurnsStarted(before + 1, 5000));
-    std::thread second(runTurn, "run-b");
-    // A second run that skipped the long-run mutex reaches the fake hostd within milliseconds.
-    CHECK(!hostd.waitTurnsStarted(before + 2, 500));
-    CHECK(hostd.maxConcurrentTurns() == 1);
+        const std::string provider = std::string(id) == "run-a" ? "anthropic" : "xai";
+        CHECK(w.callAgentSteer(id, "continue", json::array(), "steer-test", r, e, provider));
+        CHECK(r.value("steered", false));
+        CHECK(r.value("run_id", std::string()) == id);
+        CHECK(r.value("provider", std::string()) == provider);
+        CHECK(w.callAgentAnswer(id, "batch-test", json{{"question", "yes"}}, false, r, e, provider));
+        CHECK(r.value("answered", false));
+        CHECK(r.value("run_id", std::string()) == id);
+        CHECK(r.value("provider", std::string()) == provider);
+        CHECK(w.callAgentCancel(id, r, e, provider));
+        CHECK(r.value("cancelled", false));
+        CHECK(r.value("run_id", std::string()) == id);
+        CHECK(r.value("provider", std::string()) == provider);
+    }
     hostd.releaseTurns();
     first.join();
     second.join();
+    CHECK(ok[0] && ok[1]);
+    CHECK(results[0].value("client_id", 0) != results[1].value("client_id", 0));
     CHECK(hostd.turnsStarted() == before + 2);
-    CHECK(hostd.maxConcurrentTurns() == 1);
+}
+
+// Offline native agents keep their existing per-client serialization.
+static void nativeAgentsNeverOverlap(FakeHostd& hostd) {
+    WorkerClient w;
+    hostd.holdTurns();
+    const int before = hostd.nativeAgentsStarted();
+    bool ok[2] = {false, false};
+    auto runAgent = [&](int index) {
+        json r;
+        std::string e;
+        ok[index] = w.call("agent_run_v2",
+                           json{{"request", "build it"}, {"doc_id", "doc-cpp00000002"}},
+                           r, e, 60000);
+    };
+    std::thread first(runAgent, 0);
+    CHECK(hostd.waitNativeAgentsStarted(before + 1, 5000));
+    std::thread second(runAgent, 1);
+    CHECK(!hostd.waitNativeAgentsStarted(before + 2, 500));
+    CHECK(hostd.maxConcurrentNativeAgents() == 1);
+    hostd.releaseTurns();
+    first.join();
+    second.join();
+    CHECK(ok[0] && ok[1]);
+    CHECK(hostd.nativeAgentsStarted() == before + 2);
+    CHECK(hostd.maxConcurrentNativeAgents() == 1);
+}
+
+// The pool is bounded even when hostd accepts more concurrent turns.
+static void agentConnectionPoolIsBounded(FakeHostd& hostd) {
+    WorkerClient w;
+    hostd.holdTurns();
+    const int before = hostd.turnsStarted();
+    bool ok[9] = {};
+    std::vector<std::thread> jobs;
+    jobs.reserve(9);
+    auto runTurn = [&](int index) {
+        json r;
+        std::string e;
+        ok[index] = w.call("agent_admin_turn",
+                           turnParams("run-pool-" + std::to_string(index)), r, e, 60000);
+    };
+    for (int i = 0; i < 8; ++i)
+        jobs.emplace_back(runTurn, i);
+    CHECK(hostd.waitTurnsStarted(before + 8, 5000));
+    CHECK(hostd.activeTurns() == 8);
+    jobs.emplace_back(runTurn, 8);
+    CHECK(!hostd.waitTurnsStarted(before + 9, 500));
+    CHECK(hostd.maxConcurrentTurns() == 8);
+    hostd.releaseTurns();
+    for (auto& job : jobs) job.join();
+    for (bool succeeded : ok) CHECK(succeeded);
+    CHECK(hostd.turnsStarted() == before + 9);
+    CHECK(hostd.maxConcurrentTurns() == 8);
 }
 
 // Native topology solves wait with timeoutMs=-1 on engine_backend's dedicated simulation
@@ -789,6 +921,45 @@ static int probeTag(const json& r) { return r.is_object() ? r.value("tag", 0) : 
 static int probeClientId(const json& r) {
     return r.is_object() ? r.value("client_id", 0) : 0;
 }
+static void uncorrelatedProtocolErrorsRetireConnection() {
+    EngineClient c;
+    CHECK(connectProbe(c, false));
+    CHECK(c.serverInfo().value("state", std::string()) == "ready");
+    const auto generation = c.reconnectGeneration();
+    const json refusal = {{"code", -32700}, {"message", "invalid JSON request"}};
+    json r;
+    std::string e;
+    CHECK(!c.call("transport_probe",
+                  {{"reply_frame", {{"id", nullptr}, {"error", refusal}}}},
+                  r, e, 5000));
+    CHECK(r == refusal);
+    CHECK(e == "invalid JSON request");
+    CHECK(!c.connected());
+    CHECK(c.reconnectGeneration() == generation);
+    e.clear();
+    CHECK(c.call("transport_probe", {{"tag", 71}}, r, e, 5000));
+    CHECK(probeTag(r) == 71);
+    CHECK(c.connected());
+    CHECK(c.reconnectGeneration() == generation + 1);
+
+    for (const auto& frame : {
+             json{{"id", nullptr}, {"result", json::object()}},
+             json{{"id", nullptr}, {"error", refusal}, {"result", json::object()}},
+             json{{"id", "2"}, {"result", json::object()}},
+             json{{"id", 2.0}, {"result", json::object()}},
+             json{{"id", false}, {"result", json::object()}},
+             json{{"result", json::object()}},
+             json::array()}) {
+        e.clear();
+        CHECK(!c.call("transport_probe", {{"reply_frame", frame}}, r, e, 5000));
+        CHECK(e == "daemon response has an invalid request id");
+        CHECK(!c.connected());
+        e.clear();
+        CHECK(c.call("transport_probe", {{"tag", 72}}, r, e, 5000));
+        CHECK(probeTag(r) == 72);
+    }
+}
+
 
 // Server-side holds establish ordering; no sleep is used to guess whether a query started.
 // The slow query stays gated until both independent calls have finished, then also spends
@@ -855,7 +1026,9 @@ static void backgroundQueriesDoNotBlockPrimary(FakeHostd& hostd) {
 
 // Keep failure and reconnect on the SAME background thread so it reuses the side slot.
 // Pause between them while the primary thread checks that its own socket was untouched.
-static void backgroundQueryFailureIsIsolated(bool eof) {
+enum class BackgroundFailure { Eof, Timeout, ProtocolRefusal };
+
+static void backgroundQueryFailureIsIsolated(BackgroundFailure failure) {
     EngineClient c;
     CHECK(connectProbe(c, false, "gui"));
     const int primaryId = probeClientId(c.serverInfo());
@@ -865,16 +1038,20 @@ static void backgroundQueryFailureIsIsolated(bool eof) {
     std::condition_variable cv;
     bool failed = false, resume = false;
     bool firstOk = false, failureOk = true, reconnectOk = false;
-    json firstResult, reconnectResult;
+    json firstResult, failureResult, reconnectResult;
     std::string failureErr;
     std::thread background([&] {
         std::string err;
         firstOk = c.call("subscription_accounts", json{{"tag", 3}}, firstResult, err, 5000);
-        json r;
-        failureOk = c.call("subscription_accounts",
-                           eof ? json{{"close", true}}
-                               : json{{"silent_ms", 2000}, {"tag", 4}},
-                           r, failureErr, eof ? 5000 : 250);
+        json params;
+        if (failure == BackgroundFailure::Eof) params = {{"close", true}};
+        else if (failure == BackgroundFailure::Timeout)
+            params = {{"silent_ms", 2000}, {"tag", 4}};
+        else
+            params = {{"reply_frame", {{"id", nullptr},
+                        {"error", {{"code", -32700}, {"message", "invalid JSON request"}}}}}};
+        failureOk = c.call("subscription_accounts", params, failureResult, failureErr,
+                           failure == BackgroundFailure::Timeout ? 250 : 5000);
         {
             std::unique_lock<std::mutex> lk(mtx);
             failed = true;
@@ -903,8 +1080,14 @@ static void backgroundQueryFailureIsIsolated(bool eof) {
     background.join();
     CHECK(firstOk);
     CHECK(!failureOk);
-    CHECK(eof ? failureErr == "daemon connection closed"
-              : failureErr.find("timed out") != std::string::npos);
+    if (failure == BackgroundFailure::Eof)
+        CHECK(failureErr == "daemon connection closed");
+    else if (failure == BackgroundFailure::Timeout)
+        CHECK(failureErr.find("timed out") != std::string::npos);
+    else {
+        CHECK(failureErr == "invalid JSON request");
+        CHECK(failureResult == json({{"code", -32700}, {"message", "invalid JSON request"}}));
+    }
     CHECK(reconnectOk);
     CHECK(probeTag(reconnectResult) == 5);  // never the timed-out call's stale tag 4
     CHECK(probeClientId(firstResult) != primaryId);
@@ -914,8 +1097,15 @@ static void backgroundQueryFailureIsIsolated(bool eof) {
     CHECK(c.reconnectGeneration() == generation);
 }
 
-static void backgroundQueryEofIsIsolated() { backgroundQueryFailureIsIsolated(true); }
-static void backgroundQueryTimeoutIsIsolated() { backgroundQueryFailureIsIsolated(false); }
+static void backgroundQueryEofIsIsolated() {
+    backgroundQueryFailureIsIsolated(BackgroundFailure::Eof);
+}
+static void backgroundQueryTimeoutIsIsolated() {
+    backgroundQueryFailureIsIsolated(BackgroundFailure::Timeout);
+}
+static void backgroundProtocolRefusalIsIsolated() {
+    backgroundQueryFailureIsIsolated(BackgroundFailure::ProtocolRefusal);
+}
 
 static void disconnectWakesAllBackgroundQueries(FakeHostd& hostd) {
     EngineClient c;
@@ -1176,7 +1366,157 @@ static void drainRefusalKeepsDaemonMode(FakeHostd& hostd) {
     CHECK(engine::call("doc_list", json::object(), r, ce, 5000));
 }
 
-int main() {
+// The local-pipe regression executes this test binary as its private worker, using
+// real stdio and Unix control transports without contacting a daemon or Python.
+static int privateControlWorker() {
+    const std::string path = std::getenv("CHUDWARE_TEST_PRIVATE_CONTROL_SOCKET");
+    const std::string token(64, 'a');
+    const int listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::snprintf(addr.sun_path, sizeof addr.sun_path, "%s", path.c_str());
+    if (::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0 ||
+        ::listen(listener, 8) != 0)
+        return 2;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool answered = false;
+    std::atomic<bool> stopping{false};
+    auto send = [](int fd, const json& value) {
+        const std::string frame = value.dump() + "\n";
+        (void)::send(fd, frame.data(), frame.size(), MSG_NOSIGNAL);
+    };
+    std::thread control([&] {
+        while (!stopping.load()) {
+            const int fd = ::accept(listener, nullptr, nullptr);
+            if (fd < 0) break;
+            std::string frame;
+            char chunk[4096];
+            while (frame.find('\n') == std::string::npos) {
+                const auto count = ::recv(fd, chunk, sizeof chunk, 0);
+                if (count <= 0) break;
+                frame.append(chunk, static_cast<size_t>(count));
+            }
+            const json request = json::parse(frame);
+            const auto& params = request["params"];
+            const std::string action = request.value("action", std::string());
+            const std::string failure = params.value(
+                action == "steer" ? "text" : "batch_id", std::string());
+            if (request.value("token", std::string()) != token) {
+                send(fd, json{{"ok", false}});
+            } else if (failure == "refused") {
+                send(fd, json{{"ok", false}, {"error", {{"message", "control refused"}}}});
+            } else if (failure == "malformed") {
+                (void)::send(fd, "not-json\n", 9, MSG_NOSIGNAL);
+            } else if (failure == "held") {
+                std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+            } else if (failure == "closed") {
+                // No response; the listener and endpoint remain alive.
+            } else {
+                send(fd, json{{"ok", true}, {"result", {{"answered", true}}}});
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    answered = true;
+                }
+                cv.notify_all();
+            }
+            ::close(fd);
+        }
+    });
+    int infoRequests = 0;
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        const json request = json::parse(line);
+        const auto method = request.value("method", std::string());
+        json result;
+        if (method == "shutdown") break;
+        if (method == "worker_control_info") {
+            ++infoRequests;
+            result = json{{"transport", "unix"}, {"endpoint", path}, {"token", token}};
+        } else if (method == "agent_admin_turn") {
+            std::cout << json{{"id", request["id"]}, {"event", "ready"},
+                              {"data", {{"kind", "ready"}}}}.dump() << '\n' << std::flush;
+            std::unique_lock<std::mutex> lock(mutex);
+            cv.wait_for(lock, std::chrono::seconds(10), [&] { return answered; });
+            result = json{{"answered", answered}, {"info_requests", infoRequests}};
+        }
+        std::cout << json{{"id", request["id"]}, {"ok", true},
+                          {"result", result}}.dump() << '\n' << std::flush;
+    }
+    stopping = true;
+    ::shutdown(listener, SHUT_RDWR);
+    ::close(listener);
+    control.join();
+    ::unlink(path.c_str());
+    return 0;
+}
+
+static void localPrivateFailuresPreserveEndpoint(const std::filesystem::path& dir,
+                                                 const std::string& executable) {
+    ::setenv("CHUDWARE_ENGINE_DAEMON", "0", 1);
+    ::setenv("CHUDWARE_WORKER_BIN", executable.c_str(), 1);
+    ::setenv("CHUDWARE_TEST_PRIVATE_CONTROL_SOCKET",
+             (dir / "private-control.sock").string().c_str(), 1);
+    WorkerClient worker;
+    std::string error;
+    if (!worker.start(error)) {
+        CHECK(false);
+        return;
+    }
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool ready = false;
+    json turnResult;
+    std::string turnError;
+    bool turnOk = false;
+    std::thread turn([&] {
+        turnOk = worker.call("agent_admin_turn", json{{"run_id", "private-run"}},
+                             turnResult, turnError, -1, [&](const json&) {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                ready = true;
+            }
+            cv.notify_all();
+        });
+    });
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        CHECK(cv.wait_for(lock, std::chrono::seconds(5), [&] { return ready; }));
+    }
+    for (bool answerAttempt : {false, true}) {
+        for (const char* failure : {"refused", "malformed", "closed", "held"}) {
+            json result;
+            error.clear();
+            const bool ok = answerAttempt
+                ? worker.callAgentAnswer("private-run", failure, json{{"q", "PETG"}},
+                                         false, result, error)
+                : worker.callAgentSteer("private-run", failure, json::array(), "",
+                                        result, error);
+            CHECK(!ok);
+            CHECK(error.find("endpoint unavailable") == std::string::npos);
+            CHECK(error.find(std::string(64, 'a')) == std::string::npos);
+        }
+    }
+    json answer;
+    error.clear();
+    const bool accepted = worker.callAgentAnswer(
+        "private-run", "pending-question", json{{"material", "PETG"}}, false,
+        answer, error);
+    CHECK(accepted);
+    CHECK(answer.value("answered", false));
+    // On failure, wake the unbounded stdio reader rather than hanging the test.
+    if (!accepted) worker.abortPending();
+    turn.join();
+    CHECK(turnOk);
+    CHECK(turnResult.value("answered", false));
+    CHECK(turnResult.value("info_requests", 0) == 1);
+    worker.stop();
+}
+
+int main(int argc, char** argv) {
+    if (argc == 3 && std::strcmp(argv[1], "--module") == 0 &&
+        std::strcmp(argv[2], "worker") == 0)
+        return privateControlWorker();
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() /
                          ("chudware-test-long-run-" + std::to_string(::getpid()));
@@ -1191,6 +1531,20 @@ int main() {
     ::unsetenv("CHUDWARE_ENGINE_DAEMON");
     ::unsetenv("CHUDWARE_RPC_TRACE");
 
+
+    {
+        const std::string executable = fs::canonical(argv[0]).string();
+        std::fflush(stdout);
+        const pid_t child = ::fork();  // backend selection is isolated before threads exist
+        if (child == 0) {
+            localPrivateFailuresPreserveEndpoint(dir, executable);
+            std::fflush(stdout);
+            ::_exit(g_failures ? 1 : 0);
+        }
+        int status = 0;
+        CHECK(child > 0 && ::waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+              WEXITSTATUS(status) == 0);
+    }
     {
         const std::string drainSock = (dir / "hostd-drain.sock").string();
         std::fflush(stdout);
@@ -1211,11 +1565,15 @@ int main() {
 
     {
         FakeHostd hostd(sock);
+        uncorrelatedProtocolErrorsRetireConnection();
         backgroundQueriesDoNotBlockPrimary(hostd);
         backgroundQueryEofIsIsolated();
         backgroundQueryTimeoutIsIsolated();
+        backgroundProtocolRefusalIsIsolated();
         disconnectWakesAllBackgroundQueries(hostd);
-        longRunsNeverOverlap(hostd);
+        onlineTurnsOverlap(hostd);
+        nativeAgentsNeverOverlap(hostd);
+        agentConnectionPoolIsBounded(hostd);
         silentTopologySolveStaysPending(hostd);
         unboundedWaitEndsOnEof();
         unboundedWaitEndsOnAbort(hostd);

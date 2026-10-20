@@ -5,6 +5,10 @@
 # Release configure: generate into host/build-macos-<arch>/generated/protected-assets, then
 # configure host and core/hostd with -DCHUDWARE_DEVELOPER_BUILD=OFF -DCHUDWARE_LTO=ON.
 set -euo pipefail
+for name in "${!PYTHON@}" "${!LD_@}" "${!DYLD_@}"; do
+    [ -z "$name" ] || unset "$name"
+done
+unset __PYVENV_LAUNCHER__ VIRTUAL_ENV
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="$REPO/dist"
@@ -13,7 +17,8 @@ MODE=""
 KEY_ID="${CHUDWARE_RELEASE_KEY_ID:-}"
 FINALIZE_SIGNATURE=""
 RELEASE_PUBLIC_KEY="${CHUDWARE_RELEASE_PUBLIC_KEY:-}"
-RELEASE_PYTHON="${CHUDWARE_RELEASE_PYTHON:-python3}"
+RELEASE_PYTHON="${CHUDWARE_RELEASE_PYTHON:-}"
+TRUSTED_BASE="${CHUDWARE_BASE_PYTHON:-${CHUDWARE_CI_BASE_PYTHON:-}}"
 CHUD_BIN="${CHUDWARE_CHUD_BIN:-}"
 
 while [ "$#" -gt 0 ]; do
@@ -56,6 +61,18 @@ else
         echo "error: --release-public-key is required with --finalize-signing" >&2; exit 2;
     }
 fi
+case "$TRUSTED_BASE" in /*) ;; *) echo "error: CHUDWARE_BASE_PYTHON must identify a separately authenticated absolute base Python" >&2; exit 1 ;; esac
+case "$RELEASE_PYTHON" in /*) ;; *) echo "error: CHUDWARE_RELEASE_PYTHON must identify the managed compiler runtime" >&2; exit 1 ;; esac
+COMPILER_VENV="$(dirname "$(dirname "$RELEASE_PYTHON")")"
+"$TRUSTED_BASE" -I -S -c 'import sys;sys.path.insert(0,sys.argv[1]);from services.installer.provision import main;sys.exit(main(sys.argv[2:]))' \
+    "$REPO" --check-inputs --base-python "$TRUSTED_BASE" --venv-dir "$COMPILER_VENV" \
+    --wheelhouse "${CHUDWARE_WHEELHOUSE:-$REPO/wheelhouse}"
+
+release_python() {
+    "$RELEASE_PYTHON" -I -c 'import sys;sys.path.insert(0,sys.argv[1]);from services.installer.provision import run_python_entry;run_python_entry(sys.argv[1],sys.argv[2],sys.argv[3:])' \
+        "$REPO" "${PROTECTED_ASSETS_OUT:+$PROTECTED_ASSETS_OUT/python}" "$@"
+}
+
 
 require_production_cache() {
     local build_dir="$1" label="$2" cache="$1/CMakeCache.txt"
@@ -72,9 +89,9 @@ stage_chudcode() {
         echo "error: --chud-bin or CHUDWARE_CHUD_BIN is required" >&2
         exit 1
     }
-    "$RELEASE_PYTHON" "$REPO/scripts/pin_chudcode.py" stage \
+    release_python "$REPO/scripts/pin_chudcode.py" stage \
         --target "macos-$ARCH" --input "$CHUD_BIN" --output "$destination"
-    "$RELEASE_PYTHON" "$REPO/scripts/pin_chudcode.py" stage-notices \
+    release_python "$REPO/scripts/pin_chudcode.py" stage-notices \
         --output-dir "$(dirname "$destination")"
     cp "$REPO/vendor/chudcode/CHUDCODE_ARTIFACT.lock" \
         "$(dirname "$destination")/CHUDCODE_ARTIFACT.lock"
@@ -82,7 +99,7 @@ stage_chudcode() {
 
 generate_protected_assets() {
     echo "==> generating protected prompt and role tables"
-    "$RELEASE_PYTHON" "$REPO/packaging/embed_protected_assets.py" \
+    release_python "$REPO/packaging/embed_protected_assets.py" \
         --source-root "$REPO" --output-dir "$PROTECTED_ASSETS_OUT"
     [ -f "$PROTECTED_ASSETS_OUT/python/chudware_protected_assets.py" ] || {
         echo "error: protected Python asset table was not generated" >&2
@@ -95,7 +112,7 @@ generate_protected_assets() {
 }
 prepare_signing_metadata() {
     local root="$1" request="$2"
-    PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$RELEASE_PYTHON" -c '
+    release_python -c '
 import sys
 from pathlib import Path
 from services.installer.payload_manifest import build_manifest, verify_manifest_payload, write_manifest, write_signing_preimage
@@ -110,7 +127,7 @@ write_signing_preimage(Path(sys.argv[5]), manifest["key_id"], canonical)
 
 finalize_signing_metadata() {
     local root="$1"
-    PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$RELEASE_PYTHON" -c '
+    release_python -c '
 import json, sys
 from pathlib import Path
 from services.installer.payload_manifest import canonical_manifest_bytes, finalize_signature
@@ -127,7 +144,7 @@ finalize_signature(root, key_id=manifest["key_id"], canonical_json=canonical,
 
 verify_staged_manifest() {
     local root="$1"
-    PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$RELEASE_PYTHON" -c '
+    release_python -c '
 import sys
 from pathlib import Path
 from services.installer.payload_manifest import verify_manifest_payload
@@ -138,7 +155,7 @@ verify_manifest_payload(root, (root / "payload-manifest.v1.json").read_bytes())
 
 verify_manifest_rows_unchanged() {
     local root="$1"
-    PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$RELEASE_PYTHON" -c '
+    release_python -c '
 import json, sys
 from pathlib import Path
 from services.installer.payload_manifest import canonical_manifest_bytes, snapshot_payload
@@ -168,7 +185,7 @@ emit_artifact_signing_request() {
     # `set -u`). Two statements.
     local artifact="$1"
     local request="$artifact.artifact-signing-request.bin"
-    PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$RELEASE_PYTHON" -c '
+    release_python -c '
 import hashlib, sys
 from pathlib import Path
 artifact, request, key_id, version, arch = (Path(sys.argv[1]), Path(sys.argv[2]),
@@ -187,7 +204,7 @@ build_python_sidecar() {
     work="$OUT/.nuitka-$name"
     rm -rf "$work"
     mkdir -p "$work"
-    "$RELEASE_PYTHON" -c 'import nuitka' >/dev/null 2>&1 || {
+    release_python -c 'import nuitka' >/dev/null 2>&1 || {
         echo "error: Nuitka is missing; install packaging/requirements-release.txt into the release Python" >&2
         exit 1
     }
@@ -196,6 +213,7 @@ build_python_sidecar() {
     # for background simulation jobs (services/sim/jobs.py), and the topology tool/study
     # modules back those jobs; forcing them fails the build if any is missing.
     local -a includes=("--include-module=chudware_protected_assets" "--include-module=services.$module"
+                       "--include-package=chudcode_rpc"
                        "--include-module=services.sim.job_worker"
                        "--include-module=services.sim.topology"
                        "--include-module=services.mcp.topology_tools")
@@ -219,8 +237,7 @@ build_python_sidecar() {
             --include-module=services.manufacturing.printers.worker_rpc
         )
     fi
-    (cd "$REPO" && PYTHONPATH="$PROTECTED_ASSETS_OUT/python${PYTHONPATH:+:$PYTHONPATH}" \
-        "$RELEASE_PYTHON" -m nuitka \
+    (cd "$REPO" && release_python -m nuitka \
         --mode=onefile --remove-output \
         --output-dir="$work" --output-filename="$name" \
         --nofollow-import-to='*.tests' --nofollow-import-to='*.test_*' \
@@ -351,7 +368,7 @@ else
     [ -d "$APP" ] && [ -f "$MANIFEST_PATH" ] || {
         echo "error: retained prepared Chudware.app or in-bundle manifest is missing under $OUT" >&2; exit 1;
     }
-    VERSION="$(PYTHONPATH="$REPO" "$RELEASE_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' "$MANIFEST_PATH")"
+    VERSION="$(release_python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' "$MANIFEST_PATH")"
     command -v ditto >/dev/null 2>&1 || { echo "error: required tool not found: ditto" >&2; exit 1; }
 fi
 

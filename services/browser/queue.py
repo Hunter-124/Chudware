@@ -34,6 +34,8 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
+from contextvars import Context, copy_context
+from services.agent.request_context import owner_key
 
 
 class JobStatus(str, Enum):
@@ -64,6 +66,8 @@ class ScrapeJob:
     # title, sku, price, source_url, fetched_ts, and any other vendor extras.
     # Populated when status transitions to DONE; empty dict until then.
     spec_data:      dict = field(default_factory=dict)
+    context:        Context | None = field(default=None, repr=False)
+    owner:          tuple[str, str] | None = field(default=None, repr=False)
 
 
 # ---- Global queue ----------------------------------------------------------------
@@ -77,6 +81,23 @@ _worker_started = False
 _POOL_SIZE = 4
 _site_locks: dict[str, threading.Lock] = {}
 _site_locks_guard = threading.Lock()
+_workers: list[threading.Thread] = []
+
+
+def worker_activity() -> dict:
+    from services.worker_activity import registry_lock
+
+    owner = owner_key()
+    with registry_lock(_lock):
+        jobs = sum(
+            job.owner == owner and (
+                job.status in (JobStatus.PENDING, JobStatus.RUNNING)
+                or (job.started_ts is not None and job.finished_ts is None))
+            for job in _jobs)
+        # Every worker claims a published job under this same lock before it can
+        # write. Empty executor capacity is idle; terminal status alone is not
+        # completion until the worker publishes finished_ts after unwinding.
+    return {"by_kind": {"scrape_jobs": jobs}}
 
 
 def _site_lock(site: str) -> threading.Lock:
@@ -110,7 +131,8 @@ def enqueue(site: str, query: str, preset: Optional[dict] = None) -> dict:
                 return {"ok": True, "id": j.id, "status": j.status.value, "deduplicated": True}
 
         job = ScrapeJob(id=str(uuid.uuid4())[:8], site=site, query=query,
-                        preset=preset if isinstance(preset, dict) else None)
+                        preset=preset if isinstance(preset, dict) else None,
+                        context=copy_context(), owner=owner_key())
         _jobs.append(job)
         _cond.notify_all()
 
@@ -264,7 +286,10 @@ def _worker_loop(worker_id: int) -> None:
 
         try:
             with _site_lock(job.site):
-                _run_job(job)
+                if job.context is None:
+                    _run_job(job)
+                else:
+                    job.context.run(_run_job, job)
         except Exception as exc:  # noqa: BLE001
             job.status = JobStatus.ERROR
             job.error  = f"worker exception: {exc}"
@@ -287,5 +312,12 @@ def ensure_worker_started() -> None:
         t = threading.Thread(
             target=_worker_loop, args=(i,), name=f"scrape-worker-{i}", daemon=True
         )
-        t.start()
+        with _lock:
+            _workers.append(t)
+        try:
+            t.start()
+        except BaseException:
+            with _lock:
+                _workers.remove(t)
+            raise
     _worker_started = True

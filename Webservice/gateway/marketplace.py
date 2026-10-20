@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+import asyncio
 import hashlib
 import logging
 import math
@@ -170,7 +171,9 @@ def derive_open_source(license_id: str, pricing_kind: str) -> bool:
     )
 
 
-def normalize_listing_input(payload: dict[str, Any]) -> dict[str, Any]:
+def normalize_listing_input(
+    payload: dict[str, Any], *, viewer_email: str | None = None
+) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise MarketplaceError(400, "invalid_input", "listing body must be an object")
     title = _text(payload.get("title"), "title", TITLE_MAX, TITLE_MIN)
@@ -243,10 +246,11 @@ def normalize_listing_input(payload: dict[str, Any]) -> dict[str, Any]:
                     400, "invalid_source", "choose an enabled source"
                 )
         if forked_from:
-            cur.execute("SELECT 1 FROM mk_listings WHERE id=%s", (forked_from,))
-            if cur.fetchone() is None:
+            cur.execute("SELECT * FROM mk_listings WHERE id=%s", (forked_from,))
+            upstream = cur.fetchone()
+            if upstream is None or not _visible(upstream, viewer_email, False):
                 raise MarketplaceError(
-                    400, "invalid_fork", "upstream listing does not exist"
+                    400, "invalid_fork", "upstream listing is not available"
                 )
     return {
         "title": title,
@@ -574,10 +578,12 @@ def listing_detail(
         upstream = None
         if row.get("forked_from"):
             cur.execute(
-                "SELECT id,slug,title FROM mk_listings WHERE id=%s",
+                "SELECT id,slug,title,seller_email,status FROM mk_listings WHERE id=%s",
                 (row["forked_from"],),
             )
             upstream = cur.fetchone()
+            if upstream is not None and not _visible(upstream, viewer_email, is_admin):
+                upstream = None
         cur.execute(
             "SELECT id,slug,title FROM mk_listings"
             " WHERE forked_from=%s AND status='published'"
@@ -929,7 +935,7 @@ def _facet_counts(state: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
 
 
 @router.get("/meta")
-async def marketplace_meta(request: Request) -> dict[str, Any]:
+def marketplace_meta(request: Request) -> dict[str, Any]:
     marketplace_enabled_or_404()
     optional_user(request)
     with tx() as cur:
@@ -976,7 +982,7 @@ async def marketplace_meta(request: Request) -> dict[str, Any]:
 
 
 @router.get("/handle-check")
-async def handle_check(request: Request, handle: str = "") -> dict[str, Any]:
+def handle_check(request: Request, handle: str = "") -> dict[str, Any]:
     marketplace_enabled_or_404()
     user = optional_user(request)
     if user:
@@ -1028,7 +1034,7 @@ async def handle_check(request: Request, handle: str = "") -> dict[str, Any]:
 
 
 @router.get("/listings")
-async def browse_listings(request: Request) -> dict[str, Any]:
+def browse_listings(request: Request) -> dict[str, Any]:
     marketplace_enabled_or_404()
     user = optional_user(request)
     viewer = user.email.lower() if user else None
@@ -1091,7 +1097,7 @@ async def browse_listings(request: Request) -> dict[str, Any]:
 
 
 @router.get("/listings/{listing_id}/reviews")
-async def listing_reviews(
+def listing_reviews(
     request: Request, listing_id: str, cursor: str = "", limit: int = 24
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -1144,7 +1150,7 @@ async def listing_reviews(
 
 
 @router.get("/listings/{slug_or_id}")
-async def get_listing_detail(request: Request, slug_or_id: str) -> dict[str, Any]:
+def get_listing_detail(request: Request, slug_or_id: str) -> dict[str, Any]:
     marketplace_enabled_or_404()
     user = optional_user(request)
     viewer = user.email.lower() if user else None
@@ -1158,7 +1164,7 @@ async def get_listing_detail(request: Request, slug_or_id: str) -> dict[str, Any
 
 
 @router.get("/sellers/{handle}")
-async def public_seller(request: Request, handle: str) -> dict[str, Any]:
+def public_seller(request: Request, handle: str) -> dict[str, Any]:
     marketplace_enabled_or_404()
     user = optional_user(request)
     viewer = user.email.lower() if user else None
@@ -1195,7 +1201,7 @@ async def public_seller(request: Request, handle: str) -> dict[str, Any]:
 
 
 @router.get("/assets/{asset_id}")
-async def public_asset(request: Request, asset_id: str) -> FileResponse:
+def public_asset(request: Request, asset_id: str) -> FileResponse:
     marketplace_enabled_or_404()
     optional_user(request)
     with tx() as cur:
@@ -1229,7 +1235,7 @@ async def public_asset(request: Request, asset_id: str) -> FileResponse:
 
 
 @router.get("/suggest")
-async def suggest(request: Request, q: str = "") -> dict[str, Any]:
+def suggest(request: Request, q: str = "") -> dict[str, Any]:
     marketplace_enabled_or_404()
     optional_user(request)
     search = to_tsquery_text(q)
@@ -1257,7 +1263,7 @@ def _published_listing(listing_id: str) -> dict[str, Any]:
 
 
 @router.post("/listings/{listing_id}/favorite")
-async def add_favorite(request: Request, listing_id: str) -> dict[str, Any]:
+def add_favorite(request: Request, listing_id: str) -> dict[str, Any]:
     marketplace_enabled_or_404()
     user = require_user(request)
     api_writes.enforce(user.email, "marketplace writes")
@@ -1278,7 +1284,7 @@ async def add_favorite(request: Request, listing_id: str) -> dict[str, Any]:
 
 
 @router.delete("/listings/{listing_id}/favorite")
-async def remove_favorite(request: Request, listing_id: str) -> dict[str, Any]:
+def remove_favorite(request: Request, listing_id: str) -> dict[str, Any]:
     marketplace_enabled_or_404()
     user = require_user(request)
     api_writes.enforce(user.email, "marketplace writes")
@@ -1298,7 +1304,7 @@ async def remove_favorite(request: Request, listing_id: str) -> dict[str, Any]:
 
 
 @router.post("/listings/{listing_id}/reviews")
-async def write_review(
+def write_review(
     request: Request, listing_id: str, body: dict[str, Any]
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -1358,7 +1364,7 @@ async def write_review(
 
 
 @router.post("/listings/{listing_id}/report")
-async def report_listing(
+def report_listing(
     request: Request, listing_id: str, body: dict[str, Any]
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -1391,7 +1397,7 @@ async def report_listing(
 
 
 @router.get("/download/{asset_id}")
-async def download_asset(request: Request, asset_id: str) -> FileResponse:
+def download_asset(request: Request, asset_id: str) -> FileResponse:
     marketplace_enabled_or_404()
     user = optional_user(request)
     viewer = user.email.lower() if user else None
@@ -1500,14 +1506,14 @@ def _load_collections(email: str) -> list[dict[str, Any]]:
 
 
 @router.get("/collections")
-async def get_collections(request: Request) -> dict[str, Any]:
+def get_collections(request: Request) -> dict[str, Any]:
     marketplace_enabled_or_404()
     user = require_user(request)
     return {"items": _load_collections(user.email.lower())}
 
 
 @router.post("/collections")
-async def create_collection(
+def create_collection(
     request: Request, body: dict[str, Any]
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -1544,7 +1550,7 @@ async def create_collection(
 
 
 @router.patch("/collections/{collection_id}")
-async def patch_collection(
+def patch_collection(
     request: Request, collection_id: str, body: dict[str, Any]
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -1589,7 +1595,7 @@ async def patch_collection(
 
 
 @router.delete("/collections/{collection_id}")
-async def delete_collection(request: Request, collection_id: str) -> dict[str, Any]:
+def delete_collection(request: Request, collection_id: str) -> dict[str, Any]:
     marketplace_enabled_or_404()
     user = require_user(request)
     api_writes.enforce(user.email, "marketplace writes")
@@ -1604,7 +1610,7 @@ async def delete_collection(request: Request, collection_id: str) -> dict[str, A
 
 
 @router.put("/collections/{collection_id}/items/{listing_id}")
-async def add_collection_item(
+def add_collection_item(
     request: Request, collection_id: str, listing_id: str
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -1628,7 +1634,7 @@ async def add_collection_item(
 
 
 @router.delete("/collections/{collection_id}/items/{listing_id}")
-async def remove_collection_item(
+def remove_collection_item(
     request: Request, collection_id: str, listing_id: str
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -1651,7 +1657,7 @@ async def remove_collection_item(
 
 
 @router.get("/me")
-async def marketplace_me(request: Request) -> dict[str, Any]:
+def marketplace_me(request: Request) -> dict[str, Any]:
     marketplace_enabled_or_404()
     user = require_user(request)
     email = user.email.lower()
@@ -1843,7 +1849,7 @@ def _validate_org(cur: Any, email: str, org_id: object) -> str | None:
 
 
 @studio_router.get("/seller")
-async def studio_get_seller(request: Request) -> dict[str, Any]:
+def studio_get_seller(request: Request) -> dict[str, Any]:
     marketplace_enabled_or_404()
     user = require_user(request)
     seller = get_seller(user.email)
@@ -1851,7 +1857,7 @@ async def studio_get_seller(request: Request) -> dict[str, Any]:
 
 
 @studio_router.post("/seller")
-async def studio_create_seller(
+def studio_create_seller(
     request: Request, body: dict[str, Any]
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -1915,7 +1921,7 @@ async def studio_create_seller(
 
 
 @studio_router.patch("/seller")
-async def studio_patch_seller(
+def studio_patch_seller(
     request: Request, body: dict[str, Any]
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -1989,7 +1995,7 @@ async def studio_patch_seller(
 
 
 @studio_router.get("/overview")
-async def studio_overview(request: Request) -> dict[str, Any]:
+def studio_overview(request: Request) -> dict[str, Any]:
     marketplace_enabled_or_404()
     user, seller = _seller_for(request)
     with tx() as cur:
@@ -2038,7 +2044,7 @@ def _listing_slug_candidates(title: str, listing_id: str) -> Iterator[str]:
 
 
 @studio_router.get("/listings")
-async def studio_listings(
+def studio_listings(
     request: Request, status: str = "", cursor: str = "", limit: int = 24
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -2082,13 +2088,13 @@ async def studio_listings(
 
 
 @studio_router.post("/listings")
-async def studio_create_listing(
+def studio_create_listing(
     request: Request, body: dict[str, Any]
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
     user, _ = _seller_for(request)
     api_writes.enforce(user.email, "marketplace writes")
-    data = normalize_listing_input(body)
+    data = normalize_listing_input(body, viewer_email=user.email.lower())
     listing_id = str(uuid.uuid4())
     for slug in _listing_slug_candidates(data["title"], listing_id):
         try:
@@ -2127,7 +2133,7 @@ async def studio_create_listing(
 
 
 @studio_router.get("/listings/{listing_id}")
-async def studio_get_listing(
+def studio_get_listing(
     request: Request, listing_id: str
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -2138,7 +2144,7 @@ async def studio_get_listing(
 
 
 @studio_router.patch("/listings/{listing_id}")
-async def studio_patch_listing(
+def studio_patch_listing(
     request: Request, listing_id: str, body: dict[str, Any]
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -2154,7 +2160,9 @@ async def studio_patch_listing(
                 "listing_locked",
                 "this listing cannot be edited in its current state",
             )
-        data = normalize_listing_input(_merged_listing_payload(current, body))
+        data = normalize_listing_input(
+            _merged_listing_payload(current, body), viewer_email=user.email.lower()
+        )
         if data["forked_from"] == str(current["id"]):
             raise MarketplaceError(
                 400, "invalid_fork", "a listing cannot be forked from itself"
@@ -2224,7 +2232,7 @@ async def studio_patch_listing(
 
 
 @studio_router.delete("/listings/{listing_id}")
-async def studio_delete_listing(
+def studio_delete_listing(
     request: Request, listing_id: str
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -2238,6 +2246,9 @@ async def studio_delete_listing(
             raise MarketplaceError(
                 409, "draft_only", "only draft listings can be deleted"
             )
+        cur.execute("SELECT id,filename FROM mk_assets WHERE listing_id=%s AND kind IN ('source','export')",
+                    (listing["id"],))
+        staged_assets = cur.fetchall()
         cur.execute("DELETE FROM mk_listings WHERE id=%s", (listing["id"],))
     root = settings.listing_asset_root(str(listing["id"]))
     try:
@@ -2246,6 +2257,12 @@ async def studio_delete_listing(
         pass
     except OSError:
         log.warning("could not remove listing assets %s", root, exc_info=True)
+    try:
+        from .marketplace_render import cleanup_listing_asset_stage
+    except ImportError:
+        from marketplace_render import cleanup_listing_asset_stage
+    for asset in staged_assets:
+        cleanup_listing_asset_stage(user.email, str(listing["id"]), str(asset["id"]), asset["filename"])
     return {"ok": True}
 
 
@@ -2339,12 +2356,14 @@ async def studio_upload_asset(
         else bool(gated)
     )
     content_type = safe_media_type(filename)
-    target: Path | None = None
-    try:
+    # No listing/seller locks are held while the upload yields or touches disk.
+    listing = await asyncio.to_thread(_owned_listing, listing_id, user.email)
+    target = asset_path(str(listing["id"]), rel_path)
+    committed = False
+    staged = ""
+    def commit_upload(size: int, sha256: str) -> dict[str, Any]:
         with tx() as cur:
-            listing = _owned_listing(
-                listing_id, user.email, lock=True, cur=cur
-            )
+            listing = _owned_listing(listing_id, user.email, lock=True, cur=cur)
             if kind == "evidence":
                 _ensure_evidence_mutable(cur, listing["id"])
             if version:
@@ -2354,23 +2373,8 @@ async def studio_upload_asset(
                 )
                 if cur.fetchone() is None:
                     raise MarketplaceError(
-                        400,
-                        "invalid_version",
-                        "version does not belong to this listing",
+                        400, "invalid_version", "version does not belong to this listing"
                     )
-            target = asset_path(str(listing["id"]), rel_path)
-            target.parent.mkdir(parents=True, exist_ok=False)
-            digest = hashlib.sha256()
-            size = 0
-            with target.open("xb") as output:
-                while chunk := await file.read(1 << 20):
-                    size += len(chunk)
-                    if size > settings.marketplace_max_asset_bytes:
-                        raise MarketplaceError(
-                            413, "asset_too_large", "asset exceeds the upload limit"
-                        )
-                    digest.update(chunk)
-                    output.write(chunk)
             cur.execute(
                 "SELECT email FROM mk_sellers WHERE email=%s FOR UPDATE",
                 (user.email.lower(),),
@@ -2382,10 +2386,7 @@ async def studio_upload_asset(
                 (user.email.lower(),),
             )
             if int(cur.fetchone()["used"]) + size > settings.marketplace_seller_quota_bytes:
-                raise MarketplaceError(
-                    413, "quota_exceeded", "seller asset quota exceeded"
-                )
-            sha256 = digest.hexdigest()
+                raise MarketplaceError(413, "quota_exceeded", "seller asset quota exceeded")
             cur.execute(
                 "INSERT INTO mk_assets"
                 " (id,listing_id,version_id,kind,role,filename,rel_path,"
@@ -2397,7 +2398,44 @@ async def studio_upload_asset(
                     sha256, actual_gated,
                 ),
             )
-            asset = cur.fetchone()
+            return dict(cur.fetchone())
+    try:
+        target.parent.mkdir(parents=True, exist_ok=False)
+        with target.open("xb") as output:
+            digest = hashlib.sha256()
+            size = 0
+            while chunk := await file.read(1 << 20):
+                size += len(chunk)
+                if size > settings.marketplace_max_asset_bytes:
+                    raise MarketplaceError(
+                        413, "asset_too_large", "asset exceeds the upload limit"
+                    )
+                digest.update(chunk)
+                output.write(chunk)
+        if kind in {"source", "export"}:
+            try:
+                from .marketplace_render import stage_listing_asset
+            except ImportError:
+                from marketplace_render import stage_listing_asset
+            staging = asyncio.create_task(asyncio.to_thread(
+                stage_listing_asset, user.email, str(listing["id"]), asset_id, rel_path, filename
+            ))
+            try:
+                staged = await asyncio.shield(staging)
+            except asyncio.CancelledError:
+                staged = await staging
+                raise
+        # Reauthorize and serialize quota/metadata only after all file I/O.
+        mutation = asyncio.create_task(
+            asyncio.to_thread(commit_upload, size, digest.hexdigest())
+        )
+        try:
+            asset = await asyncio.shield(mutation)
+            committed = True
+        except asyncio.CancelledError:
+            await mutation
+            committed = True
+            raise
     except psycopg.errors.UniqueViolation as exc:
         if target is not None:
             _cleanup_upload(target)
@@ -2423,14 +2461,22 @@ async def studio_upload_asset(
             ) from exc
         raise
     except BaseException:
-        if target is not None:
+        if target is not None and not committed:
             _cleanup_upload(target)
         raise
+    finally:
+        if staged and not committed:
+            try:
+                from .marketplace_render import cleanup_listing_asset_stage
+            except ImportError:
+                from marketplace_render import cleanup_listing_asset_stage
+            await asyncio.to_thread(cleanup_listing_asset_stage, user.email,
+                                    str(listing["id"]), asset_id, filename)
     return {"asset": _studio_asset(asset)}
 
 
 @studio_router.delete("/listings/{listing_id}/assets/{asset_id}")
-async def studio_delete_asset(
+def studio_delete_asset(
     request: Request, listing_id: str, asset_id: str
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -2460,11 +2506,17 @@ async def studio_delete_asset(
         target.parent.rmdir()
     except OSError:
         pass
+    if asset["kind"] in {"source", "export"}:
+        try:
+            from .marketplace_render import cleanup_listing_asset_stage
+        except ImportError:
+            from marketplace_render import cleanup_listing_asset_stage
+        cleanup_listing_asset_stage(user.email, str(listing["id"]), str(asset["id"]), asset["filename"])
     return {"ok": True}
 
 
 @studio_router.patch("/listings/{listing_id}/assets/{asset_id}")
-async def studio_patch_asset(
+def studio_patch_asset(
     request: Request,
     listing_id: str,
     asset_id: str,
@@ -2519,7 +2571,7 @@ async def studio_patch_asset(
 
 
 @studio_router.post("/listings/{listing_id}/versions")
-async def studio_create_version(
+def studio_create_version(
     request: Request, listing_id: str, body: dict[str, Any]
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -2562,7 +2614,7 @@ async def studio_create_version(
 
 
 @studio_router.post("/listings/{listing_id}/submit")
-async def studio_submit_listing(
+def studio_submit_listing(
     request: Request, listing_id: str
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -2633,7 +2685,7 @@ async def studio_submit_listing(
 
 
 @studio_router.post("/listings/{listing_id}/unlist")
-async def studio_unlist_listing(
+def studio_unlist_listing(
     request: Request, listing_id: str
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()
@@ -2658,7 +2710,7 @@ async def studio_unlist_listing(
 
 
 @studio_router.post("/listings/{listing_id}/attestation")
-async def studio_submit_attestation(
+def studio_submit_attestation(
     request: Request, listing_id: str, body: dict[str, Any]
 ) -> dict[str, Any]:
     marketplace_enabled_or_404()

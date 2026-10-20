@@ -1,6 +1,7 @@
-// First-run provisioning: ensure the %APPDATA%/Chudware runtime exists, provisioning it from
-// the payload next to the exe (app/ + wheelhouse/), the CHUDWARE_REPO source tree, or a dev
-// checkout discovered by walking up from the exe.
+// Development-only offline runtime provisioning from a trusted source payload,
+// reviewed wheel lock and complete wheelhouse. Customer releases use compiled sidecars.
+// Managed checks require a separately authenticated CHUDWARE_BASE_PYTHON.
+// Explicit CHUDWARE_PYTHON overrides remain caller-owned, not managed proof.
 #pragma once
 #include <string>
 
@@ -14,7 +15,7 @@ std::string runtimePython();
 // Resolved working dir that holds the engine/agent/services.mcp packages (cwd for the worker).
 std::string appDir();
 
-bool runtimeReady();                     // python file exists at runtimePython()
+bool runtimeReady();                     // independent base proves executable/platform + locked package identities
 bool ensureRuntime(std::string& log);    // provision if absent; true once ready
 bool repairRuntime(std::string& log);    // force a clean re-provision (broken/partial venv)
 

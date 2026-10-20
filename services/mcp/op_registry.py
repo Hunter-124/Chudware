@@ -36,6 +36,7 @@ DOC_OP_KINDS: tuple[str, ...] = (
     "sketch_delete_entity",
     "sketch_delete_constraint",
     "sketch_set_dim",
+    "sketch_fully_define",
     "sketch_toggle_construction",
     "sketch_convert",
     "sketch_break_external_ref",

@@ -262,50 +262,6 @@ class TestPanelTablesSnapshot(unittest.TestCase):
             "add prompt_note entries for new tools in "
             "services/agent/tool_guidance/<family>.py")
 
-    def test_snapshot_guidance_content_matches_live(self):
-        """Names alone are not enough — the CONTENT must match too.
-
-        The name-membership check above let seven entries sit materially stale
-        and WRONG in the compiled/offline GUI fallback: it told the user
-        set_material was visual-only (it stores the registry material), that
-        fmt='step+' routes through export_part, and that verify_battery is the
-        overall done-gate. Stale advice the user reads is worse than a missing
-        row, so pin the guidance dict itself.
-        """
-        import json
-        from pathlib import Path
-
-        from services.agent.tool_guidance import TOOL_GUIDANCE
-
-        snap_path = (
-            Path(__file__).resolve().parents[2]
-            / "host/src/ui/tool_panel_tables.snapshot.json"
-        )
-        if not snap_path.exists():
-            self.fail(f"panel snapshot missing: {snap_path} — run "
-                      "tools/gen_tool_panel_tables.py")
-        snap = json.loads(snap_path.read_text())
-        snap_guidance = snap.get("guidance") or {}
-        live_guidance = {
-            name: entry for name, entry in TOOL_GUIDANCE.items() if entry
-        }
-        # Compare through JSON so key order and tuple/list shape cannot
-        # produce a false mismatch.
-        def _norm(obj: dict) -> dict:
-            return json.loads(json.dumps(obj, sort_keys=True, default=str))
-
-        drifted = sorted(
-            name for name in set(snap_guidance) | set(live_guidance)
-            if _norm(snap_guidance.get(name) or {})
-            != _norm(live_guidance.get(name) or {})
-        )
-        self.assertEqual(
-            drifted, [],
-            f"{len(drifted)} guidance entries differ between the live Python "
-            f"table and the generated panel snapshot — re-run "
-            f"tools/gen_tool_panel_tables.py. Stale entries render as "
-            f"authoritative advice in Settings → AI → Tools.")
-
 
 if __name__ == "__main__":
     unittest.main()

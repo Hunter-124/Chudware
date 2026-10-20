@@ -452,6 +452,7 @@ struct JobState {
     // Active agent_run_v2 / mission run_id (from run_started event or result). Used by
     // requestStopRun → agent_cancel so Stop aborts the in-flight provider call.
     std::string runId;
+    std::string provider;            // launched provider; browser controls never use the current picker
     bool errorIsCad = false;          // error came from CAD code that didn't build (expected,
                                       // the loop self-corrects) — NOT an app/runtime failure
     bool isAssembly = false;          // final result was a multi-part assembly
@@ -607,6 +608,17 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size);
 
 enum ErrKind { ERR_NONE = 0, ERR_CAD = 1, ERR_SYSTEM = 2, ERR_PARTIAL = 3 };
 
+// Delivery of a user message sent while a run is live (ChatMsg::steerState). The agent reads
+// a steer at its next tool boundary; a pure wait (wait_job) ends early for it.
+enum SteerState {
+    STEER_NONE = 0,       // not a steer (an ordinary prompt)
+    STEER_SENDING = 1,    // handed to the control lane
+    STEER_QUEUED = 2,     // the agent holds it; it reads it after the current step
+    STEER_DELIVERED = 3,  // in the agent's context (or it answered an open question)
+    STEER_CARRIED = 4,    // Stop withdrew it unread: it opens this chat's next message
+    STEER_FAILED = 5,     // never reached the agent (run ended / transport error)
+};
+
 // ---------------- pre-flight clarify gate ----------------
 // Before a Design run, agent_clarify_v1 returns the build-critical questions (or ready=true).
 // One ClarifyQ per question; `answer` is the editable buffer shown in the inline clarify card,
@@ -667,6 +679,8 @@ struct ActivityItem {
     // 15 = firm_comm thread (collapsed-by-default; detail appends lines).
     // 16 = advisor card (stage chip + question + advice; expanded).
     // 17 = sub_run compact card (purpose + status).
+    // 18 = plan-section position marker; 19 = delegation card.
+    // 20 = ask_user question-card position marker (stage "__ask__:<batch_id>").
     int rowKind = 0;
     int ctxTokens = 0;      // rowKind 1: best-effort injected-token estimate (kept out of the
                             // turn's usage footer — it is not model I/O)
@@ -693,6 +707,10 @@ struct ChatMsg {
     // Assistant turn closed early because the user steered the run: the SAME run continues in
     // the next assistant message, below the steer. Its empty text is not an empty turn.
     bool steerSplit = false;
+    // User message sent mid-run (a steer): its delivery to the agent, drawn under the bubble.
+    // steerId correlates the control-lane response and the worker's agent.steer events.
+    std::string steerId;
+    int steerState = STEER_NONE;
     std::string model;             // assistant turn: model id at run start (label); empty = plain "Assistant"
     int errKind = ERR_NONE;        // ERR_CAD = generated code didn't build (calm, amber);
                                    // ERR_SYSTEM = app/runtime/provider failure (red)
@@ -769,6 +787,16 @@ bool feedAskEvent(std::vector<ChatMsg>& msgs, ChatMsg* active, const std::string
 bool closeOpenAsks(std::vector<ChatMsg>& msgs);
 // True when any message in `msgs` holds an open (pending/submitting) batch.
 bool hasOpenAsk(const std::vector<ChatMsg>& msgs);
+// Steer delivery: agent.steer {steer_id, status: delivered|carried} moves the matching user
+// bubble's steerState. Returns true when `kind` was a steer event. GL thread.
+bool feedSteerEvent(std::vector<ChatMsg>& msgs, const std::string& kind,
+                    const nlohmann::json& data);
+// Set the state of the user bubble carrying `steerId`; confirmed DELIVERED never downgrades
+// to a late control outcome (queued, carried, or failed). True if it changed.
+bool setSteerState(std::vector<ChatMsg>& msgs, const std::string& steerId, int state);
+// The run ended: steers it never confirmed (SENDING/QUEUED) are now FAILED. Returns true if
+// any changed. A Stop's withdrawn steers are CARRIED by the cancel response instead.
+bool settleOpenSteers(std::vector<ChatMsg>& msgs);
 
 // Resolve the LIVE message vector a conversation's ChatMsgs currently live in: AppState::chat if
 // convId is the currently VIEWED conversation, else that resident Conversation's parked msgs.
@@ -814,6 +842,7 @@ struct Conversation {
     std::vector<ChatMsg> msgs;      // populated only while INACTIVE (active lives in AppState::chat)
     int lastContextTokens = 0;     // per-session context meter (input tokens from last model call)
     std::vector<std::string> queuedPrompts;  // queued while this session's turn was active
+    std::vector<nlohmann::json> queuedPromptDrafts; // attachment/context snapshots aligned with queuedPrompts
     // Archived sessions are hidden from the default Sessions list (Show archived toggle
     // reveals them) but keep their transcript/history — a soft "trash" before real deletion.
     bool archived = false;
@@ -1005,6 +1034,10 @@ struct AppState {
         // event for kAgentEditPulseTimeoutS, so a finished/idle agent stops glowing on its own.
         // Timestamp-based (not a countdown timer) so nothing stacks or drifts across sleeps.
         std::chrono::steady_clock::time_point lastAgentEditAt{};
+        // Agent edit lock (issue #55 interim): steady-clock time of the last revision of this doc
+        // written by a NON-gui client (an in-app agent, its sub-agents, an external MCP agent),
+        // stamped for active and background tabs alike. Epoch = never. See docLockedByAgent.
+        std::chrono::steady_clock::time_point lastForeignWriteAt{};
         // A pushed foreign revision invalidated this tab's immutable mesh cache. The background
         // parser clears it after prewarming the matching revision; switchToTab never binds while set.
         bool        meshCacheInvalidated = false;
@@ -1504,6 +1537,22 @@ struct AppState {
     // True if THAT SPECIFIC conversation's run is running — for Send/Stop/busy UI scoped to
     // whichever conversation is on screen, so an unrelated background run never blocks it.
     bool convRunning(const std::string& convId) const;
+    // Agent edit lock (interim fix for issue #55: a cancelled human sketch/PM/drag doc_revert
+    // discarded agent edits made during the session). While an agent is editing a document the
+    // human's editing controls for THAT document are locked: it is locked once an agent wrote it
+    // (DocTab::lastForeignWriteAt) and stays locked while any in-app run that was live at that
+    // write is still running, or for kAgentLockGraceS after the last agent write (external
+    // agents, writes landing as a run ends). Docs the agent never wrote stay editable. Every
+    // human mutation path checks this; open human sessions on a newly locked doc exit keeping
+    // their work (never doc_revert).
+    static constexpr double kAgentLockGraceS = 8.0;
+    bool docLockedByAgent(const std::string& docId) const;
+    bool activeDocLockedByAgent() const;
+    // "" when `docId` is not locked; otherwise one sentence for toasts / disabled tooltips.
+    std::string agentLockReason(const std::string& docId) const;
+    // Last frame on which no run was active (maintained per frame by engine_events); a foreign
+    // write stamped at or after it happened during the current run(s).
+    std::chrono::steady_clock::time_point runsIdleAt{};
     // The id of the currently viewed conversation, or "" if none (activeConv invalid).
     std::string activeConvId() const;
     std::vector<char> code{std::vector<char>(64 * 1024, 0)};
@@ -1837,11 +1886,15 @@ struct AppState {
     // queuedPrompts: messages the user sent WHILE a turn was active (Claude-Code-style queue).
     // Drained one-at-a-time by the composer once the assistant is free again.
     std::vector<std::string> queuedPrompts;
+    std::vector<nlohmann::json> queuedPromptDrafts;
     // pendingAttachments (M23): absolute file paths attached via the composer paperclip. Shown
     // as chips above the input; they ride the NEXT send (submitTurn consumes + clears them —
     // small text files are inlined into the request, every path travels in the RPC payload's
     // "attachments" field).
     std::vector<std::string> pendingAttachments;
+    // Stable numbered roster for composer image references. Empty slots are detached images;
+    // never erase/reindex a slot while later draft markers still refer to it.
+    std::vector<std::string> pendingInlineImagePaths;
     // pendingContextRefs (Wave4): model entities the user attached to the NEXT prompt via the
     // composer "context cube" button — parts/components, faces, edges, sketches, features picked
     // from the viewport or the feature tree (ui::addContextRef). Shown as chips above the input

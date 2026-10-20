@@ -229,8 +229,8 @@ def register_preflight_tools(mcp: FastMCP) -> None:
 
         Checks planned ops BEFORE they touch the document:
         - ``refs_resolve``: stable ids / names in ops exist in the current tree.
-        - ``params_sane``: positive dimensions; fillet radius vs adjacent wall;
-          hole depth vs body extent.
+        - ``params_sane``: local positive dimension values. Geometry feasibility is
+          decided by the full native rebuild, not a radius/wall-size heuristic.
         - ``rebuild_predict``: native candidate feature_status and document status,
           without changing live geometry, history, revisions or cache state.
         - ``downstream_impact``: live features referencing entities you are editing.
@@ -242,9 +242,15 @@ def register_preflight_tools(mcp: FastMCP) -> None:
 
         **Read-only**: this tool NEVER mutates the live document.  It is safe to
         call speculatively before any destructive edit.
-        Existing history is not cold-replayed. Edited geometry, invalidated
-        suffixes and cache misses can still be expensive; no wall-clock bound
-        is guaranteed.
+        Existing history is not cold-replayed. One cumulative 10 s candidate budget
+        covers every native geometry probe and response serialization/transfer.
+        POSIX runs the rebuild in a private child, kills and reaps it on timeout,
+        and returns ``verdict:"skipped", skipped:"budget_exceeded",
+        still_running:false`` — never a geometry/radius failure. Unsupported
+        platforms return ``skipped:"isolation_unavailable"`` rather than execute
+        an unbounded fallback. Lock/metadata/transport waits, OS scheduling and
+        process cleanup are not a hard end-to-end wall-clock guarantee. Applying
+        real edits still performs complete, unchanged native geometry validation.
 
         Typical use:
             1. Before ``add_features``: call ``preflight_ops(ops)`` to catch

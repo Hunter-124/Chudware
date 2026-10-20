@@ -215,12 +215,13 @@ def test_render_pdf_degrades_cleanly(data, tmp_path, monkeypatch):
     project_dir = tmp_path / "chudware_project"
     project_dir.mkdir()
     monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(project_dir))
+    monkeypatch.setenv("CHUDWARE_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
 
     record = render_pdf(build_report_spec(data))
 
     if record["ok"]:
-        # path is project-relative (contract §3); resolve against the project dir used above.
-        p = project_dir / record["path"]
+        from services.deliverables.project import resolve_project_path
+        p = resolve_project_path(record["path"])
         assert p.exists()
     else:
         # Contract-shaped failure envelope (contracts/deliverables.md §6) — never a traceback.

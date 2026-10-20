@@ -9,6 +9,9 @@
 #include "../web_capabilities.h"    // ui::webGapReason — subscription sign-in is not a web path
 #include "../web_provider_keys.h"   // per-account BYOK on web (/api/providers/keys)
 #include "../chudcode_descriptors.h" // ui::parseChudcode* — Chudcode worker payload parsing
+#ifdef __EMSCRIPTEN__
+#include "core/jobs.h"
+#endif
 #include "../provider_usage.h"     // shared subscription status cache and single-flight poller
 
 #include <filesystem>
@@ -88,6 +91,15 @@ static void parseProbeRows(int provider, const nlohmann::json& result, ProviderM
 static char* providerKeyBuf(Settings& s, int provider);
 
 void refreshModelAvailability(AppState& st, bool force) {
+    if (ui::webBuild()) {
+        // Tenant cells own provider discovery and credentials. A desktop endpoint
+        // probe sends api_key (even when empty), which the browser contract refuses,
+        // and localhost would name the cell rather than the user's machine.
+        // Request model metadata on the existing credential-free catalog lane;
+        // a catalog refusal remains a refusal, never endpoint-availability proof.
+        refreshBridgeModelCatalog(st, force);
+        return;
+    }
     if (!force && (!st.workerStarted || st.workerBootPending || !st.startupPhase.empty()))
         return;
     // One async agent_list_models round-trip. `slots` are the providerModels entries its answer
@@ -419,15 +431,6 @@ bool drawFreeAiProviderCard(AppState& st) {
     const float S = ui::uiScale;
     bool changed = false;
     const bool active = (s.provider == ui::PROV_FREELLMAPI);
-    auto openInBrowser = [](const std::string& url) {
-#if defined(_WIN32)
-        std::system(("start \"\" \"" + url + "\"").c_str());
-#elif defined(__APPLE__)
-        std::system(("open '" + url + "'").c_str());
-#else
-        std::system(("xdg-open '" + url + "' >/dev/null 2>&1 &").c_str());
-#endif
-    };
     dimText("Aggregates free tiers from ~28 cloud AI providers behind one OpenAI-compatible "
             "endpoint + one unified key. Runs on YOUR machine (or a box you control) and "
             "forwards requests to real cloud providers over the internet \xe2\x80\x94 blocked "
@@ -485,16 +488,16 @@ bool drawFreeAiProviderCard(AppState& st) {
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kInstallCmd.c_str());
     ImGui::SameLine(0, 6.0f * S);
     if (ImGui::SmallButton("Download desktop app##fla"))
-        openInBrowser("https://github.com/tashfeenahmed/freellmapi/releases/latest");
+        ui::openExternalHttpUrl("https://github.com/tashfeenahmed/freellmapi/releases/latest");
     ImGui::SameLine(0, 6.0f * S);
     if (ImGui::SmallButton("Install guide##fla"))
-        openInBrowser("https://github.com/tashfeenahmed/freellmapi#quick-start");
+        ui::openExternalHttpUrl("https://github.com/tashfeenahmed/freellmapi#quick-start");
     ImGui::SameLine(0, 6.0f * S);
     {
         std::string dashUrl = (active && s.baseUrl[0]) ? s.baseUrl : "http://localhost:3001/v1";
         const size_t v1 = dashUrl.rfind("/v1");
         if (v1 != std::string::npos && v1 == dashUrl.size() - 3) dashUrl.resize(v1);
-        if (ImGui::SmallButton("Open dashboard##fla")) openInBrowser(dashUrl);
+        if (ImGui::SmallButton("Open dashboard##fla")) ui::openExternalHttpUrl(dashUrl);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Opens %s in your default browser (Keys page has the unified key "
                               "once the router is running).", dashUrl.c_str());
@@ -876,13 +879,8 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Open in browser##xai")) {
                     // Best-effort local open when the worker process is headless.
-#if defined(_WIN32)
-                    std::system(("start \"\" \"" + fallbackUrl + "\"").c_str());
-#elif defined(__APPLE__)
-                    std::system(("open '" + fallbackUrl + "'").c_str());
-#else
-                    std::system(("xdg-open '" + fallbackUrl + "' >/dev/null 2>&1 &").c_str());
-#endif
+                    if (!ui::openExternalHttpUrl(fallbackUrl))
+                        s_xaiError = "Could not open the sign-in link in your browser.";
                 }
             }
             pollXaiStatus(false);
@@ -1580,7 +1578,7 @@ bool bridgeRpcAbsent(const core::RpcResult& r) {
     }
     if (!r.result.is_object()) return false;
     if (r.result.contains("code")) {
-        const std::string c = r.result.value("code", std::string());
+        const std::string c = jsonOptStr(r.result, "code");
         if (c == "unknown_method" || c == "method_not_found" || c == "not_implemented")
             return true;
     }
@@ -1953,7 +1951,11 @@ void drawSessionCostStrip(AppState& st) {
     // session it actually ran, so the UI no longer rebuilds token events and re-sends them
     // to a bridge calculator. Refire on a conversation switch or when a turn completes
     // (turn-count + local token fingerprint), plus a 30s TTL while the strip is visible.
+#ifdef __EMSCRIPTEN__
+    const std::string sess = cellAgentSessionHandle(st.activeConvId());
+#else
     const std::string sess = st.activeConvId();
+#endif
     if (sess.empty()) return;
     long long fp = 0;
     for (const auto& m : st.chat) {
@@ -2204,6 +2206,8 @@ std::vector<DeadCredProvider> s_deadCredProviders;
 // user having opened Settings -> Providers. Fills st.signedInBridgeProviders (same set the
 // Providers panel writes) so the dropdown mirrors the Providers tab. TTL'd; degrades silently.
 static void refreshSignedInProviders(AppState& st, bool force) {
+    // Browser credentials belong to the gateway account, never a shared SDK auth store.
+    if (ui::webBuild()) return;
     static double s_lastPoll = -1e9;
     static bool s_inFlight = false;
     if (s_inFlight) return;
@@ -2353,11 +2357,21 @@ void drawModelDropdown(AppState& st, bool busy) {
     };
 
     const auto& catalog = ui::bridgeModelCatalog();
+    const auto& accountKeys = ui::webProviderKeys();
     if (!catalog.empty()) {
         for (const auto& m : catalog) {
             Route r = routeFor(m.provider);
             if (r.slot < 0) continue;                                        // no composer slot
-            if (st.signedInBridgeProviders.count(m.provider) == 0) continue; // provider not signed in
+            if (ui::webBuild()) {
+                const auto key = std::find_if(accountKeys.begin(), accountKeys.end(),
+                    [&m](const ui::WebProviderKey& row) {
+                        return row.state == "validated" &&
+                            (m.provider == "google" ? row.provider == "gemini" : row.provider == m.provider);
+                    });
+                if (key == accountKeys.end()) continue;
+            } else if (st.signedInBridgeProviders.count(m.provider) == 0) {
+                continue;
+            }
             std::string catk = (r.slot == ui::PROV_CLOUDCOMPAT) ? ui::cloudServiceKey(r.baseUrl)
                                                                 : ui::providerCatKey(r.slot);
             if (catOff(catk)) continue;                                      // provider bulk-disabled

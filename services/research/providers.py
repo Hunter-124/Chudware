@@ -2,8 +2,8 @@
 
 Small classes behind one interface (mirrors ``services/agent/providers/``); selection is
 env/config driven; :class:`MockSearchProvider` backs tests so the suite never touches the
-network (the gate runs offline). ``httpx`` is imported lazily inside ``search`` so a
-missing network stack never breaks import.
+network (the gate runs offline). Public HTTP uses the connection-pinned client
+with explicit response and idle budgets.
 
 Implemented providers are **Tavily** (recommended BYO-key default),
 **DuckDuckGo HTML** (zero-key fallback, ``confidence:"limited"``), and the mock.
@@ -73,13 +73,15 @@ class TavilyProvider(SearchProvider):
         key = os.environ.get(self.requires_key)
         if not key:
             raise RuntimeError("TAVILY_API_KEY not set")
-        import httpx
+        import json
+        from services.net.safe_http import request
 
-        resp = httpx.post(
-            self.ENDPOINT,
-            json={"api_key": key, "query": query, "max_results": max_results,
-                  "include_answer": True},
-            timeout=20.0,
+        resp = request(
+            self.ENDPOINT, method="POST",
+            body=json.dumps({"api_key": key, "query": query, "max_results": max_results,
+                             "include_answer": True}).encode(),
+            headers={"Content-Type": "application/json"}, idle_timeout=20.0,
+            max_bytes=4 * 1024 * 1024, max_redirects=0,
         )
         if resp.status_code in (403, 429):
             raise ProviderBlocked(f"Tavily returned HTTP {resp.status_code}")
@@ -102,17 +104,17 @@ class DDGProvider(SearchProvider):
     ENDPOINT = "https://html.duckduckgo.com/html/"
 
     def search(self, query: str, max_results: int = 5) -> dict:
-        import httpx
+        from urllib.parse import urlencode
+        from services.net.safe_http import request
 
         last_exc: Optional[Exception] = None
         for attempt in range(3):
             try:
-                resp = httpx.post(
-                    self.ENDPOINT,
-                    data={"q": query},
-                    headers={"User-Agent": _UA},
-                    timeout=20.0,
-                    follow_redirects=True,
+                resp = request(
+                    self.ENDPOINT, method="POST", body=urlencode({"q": query}).encode(),
+                    headers={"User-Agent": _UA,
+                             "Content-Type": "application/x-www-form-urlencoded"},
+                    idle_timeout=20.0, max_bytes=4 * 1024 * 1024,
                 )
                 if resp.status_code in (202, 403, 429) or _BLOCKED_PAGE.search(resp.text):
                     raise ProviderBlocked(f"DuckDuckGo returned an access challenge "

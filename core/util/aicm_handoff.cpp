@@ -1,11 +1,13 @@
 // Implementation of AICM shared-memory handoff. See aicm_handoff.h.
 #include "util/aicm_handoff.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -37,10 +39,25 @@ namespace {
 constexpr const char* kUriPrefix = "aicm-shm://";
 
 std::mutex g_mu;
+std::string g_publication_root;
+
+struct PublicationRoot {
+    bool enabled = false;
+    std::string path;
+};
+
+PublicationRoot publication_root() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (!g_publication_root.empty()) return {true, g_publication_root};
+    const char* state = std::getenv("CHUDWARE_CELL_STATE");
+    if (!state) return {};
+    return {true, *state ? std::string(state) + "/mesh" : std::string()};
+}
 
 struct CacheEntry {
     std::shared_ptr<const std::vector<uint8_t>> bytes;
     std::string uri;
+    std::string private_root;
 };
 std::unordered_map<std::string, CacheEntry> g_cache;
 
@@ -106,6 +123,183 @@ unsigned long process_id() {
 std::string object_key(const std::string& key) {
     return "p" + std::to_string(process_id()) + "_" + sanitize(key);
 }
+
+bool normalize_private_root(const std::string& root, std::string& normalized,
+                            std::string& err) {
+    if (root.empty() || root.find('\0') != std::string::npos) {
+        err = "invalid AICM publication root";
+        return false;
+    }
+    const auto path = std::filesystem::u8path(root);
+    if (!path.is_absolute() || path == path.root_path()) {
+        err = "AICM publication root must be an absolute directory";
+        return false;
+    }
+    for (const auto& part : path) {
+        if (part == "..") {
+            err = "AICM publication root cannot contain traversal";
+            return false;
+        }
+    }
+    normalized = path.lexically_normal().string();
+    while (normalized.size() > 1 && normalized.back() == '/') normalized.pop_back();
+    if (normalized == "/") {
+        err = "AICM publication root cannot be the filesystem root";
+        return false;
+    }
+    return true;
+}
+
+bool private_filename(const std::string& name) {
+    if (name.size() != 37 || name.compare(32, 5, ".aicm") != 0) return false;
+    for (size_t i = 0; i < 32; ++i) {
+        if (!((name[i] >= '0' && name[i] <= '9') ||
+              (name[i] >= 'a' && name[i] <= 'f'))) return false;
+    }
+    return true;
+}
+
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+// Walk from / with no-follow directory descriptors: neither publication nor cleanup
+// can be redirected through a symlink in the configured state path.
+int open_private_root(const std::string& root, bool create, std::string& err) {
+    int fd = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+        err = "cannot open AICM filesystem root";
+        return -1;
+    }
+    size_t start = 1;
+    while (start < root.size()) {
+        size_t end = root.find('/', start);
+        if (end == std::string::npos) end = root.size();
+        const std::string part = root.substr(start, end - start);
+        bool created = false;
+        int next = ::openat(fd, part.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next < 0 && errno == ENOENT && create && end == root.size()) {
+            if (::mkdirat(fd, part.c_str(), 0700) == 0) created = true;
+            else if (errno != EEXIST) {
+                ::close(fd);
+                err = "cannot create private AICM directory";
+                return -1;
+            }
+            next = ::openat(fd, part.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        }
+        ::close(fd);
+        if (next < 0) {
+            err = "cannot open symlink-free AICM directory";
+            return -1;
+        }
+        fd = next;
+        if (created && ::fchmod(fd, 0700) != 0) {
+            ::close(fd);
+            err = "cannot protect private AICM directory";
+            return -1;
+        }
+        start = end + 1;
+    }
+    struct stat st {};
+    if (::fstat(fd, &st) != 0 || st.st_uid != ::geteuid() || (st.st_mode & 07777) != 0700) {
+        ::close(fd);
+        err = "AICM publication directory must be owned by this user and mode 0700";
+        return -1;
+    }
+    return fd;
+}
+
+std::string publish_private_file(const std::string& root, const uint8_t* data, size_t n) {
+    std::string err;
+    const int dir = open_private_root(root, true, err);
+    if (dir < 0) return {};
+    std::string name;
+    int fd = -1;
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        uint8_t random[16];
+        if (::getentropy(random, sizeof(random)) != 0) break;
+        static constexpr char hex[] = "0123456789abcdef";
+        name.resize(32);
+        for (size_t i = 0; i < sizeof(random); ++i) {
+            name[2 * i] = hex[random[i] >> 4];
+            name[2 * i + 1] = hex[random[i] & 15];
+        }
+        name += ".aicm";
+        fd = ::openat(dir, name.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd >= 0 || errno != EEXIST) break;
+    }
+    if (fd < 0) {
+        ::close(dir);
+        return {};
+    }
+    bool ok = ::fchmod(fd, 0600) == 0;
+    size_t written = 0;
+    while (ok && written < n) {
+        const size_t chunk = std::min(n - written,
+                                     static_cast<size_t>(std::numeric_limits<ssize_t>::max()));
+        const ssize_t count = ::write(fd, data + written, chunk);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) { ok = false; break; }
+        written += static_cast<size_t>(count);
+    }
+    if (::close(fd) != 0) ok = false;
+    if (!ok) ::unlinkat(dir, name.c_str(), 0);
+    ::close(dir);
+    // No URI is exposed until the complete exclusive file has been closed.
+    return ok ? root + "/" + name : std::string();
+}
+
+void unlink_private_file(const std::string& root, const std::string& uri) {
+    const std::string prefix = root + "/";
+    if (uri.rfind(prefix, 0) != 0 || !private_filename(uri.substr(prefix.size()))) return;
+    std::string err;
+    const int dir = open_private_root(root, false, err);
+    if (dir < 0) return;
+    ::unlinkat(dir, uri.c_str() + prefix.size(), 0);
+    ::close(dir);
+}
+
+bool map_private_file(const std::string& root, const std::string& uri,
+                      Mapping& out, std::string& err) {
+    const std::string prefix = root + "/";
+    if (uri.rfind(prefix, 0) != 0 || !private_filename(uri.substr(prefix.size()))) {
+        err = "AICM uri is outside the private publication directory";
+        return false;
+    }
+    const int dir = open_private_root(root, false, err);
+    if (dir < 0) return false;
+    const int fd = ::openat(dir, uri.c_str() + prefix.size(),
+                            O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    ::close(dir);
+    struct stat st {};
+    if (fd < 0 || ::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_uid != ::geteuid() || (st.st_mode & 07777) != 0600 || st.st_size < 0 ||
+        static_cast<uintmax_t>(st.st_size) > std::numeric_limits<size_t>::max()) {
+        if (fd >= 0) ::close(fd);
+        err = "cannot open private AICM file";
+        return false;
+    }
+    const size_t size = static_cast<size_t>(st.st_size);
+    void* view = size ? ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0) : nullptr;
+    ::close(fd);
+    if (view == MAP_FAILED) {
+        err = "cannot map private AICM file";
+        return false;
+    }
+    auto* impl = new MapImpl;
+    impl->kind = MapImpl::Shm; // The POSIX unmap path releases any mmap-backed bytes.
+    impl->view = view;
+    impl->map_size = size;
+    out.impl = impl;
+    out.data = static_cast<const uint8_t*>(view);
+    out.size = size;
+    return true;
+}
+#else
+std::string publish_private_file(const std::string&, const uint8_t*, size_t) { return {}; }
+void unlink_private_file(const std::string&, const std::string&) {}
+bool map_private_file(const std::string&, const std::string&, Mapping&, std::string& err) {
+    err = "private AICM publication requires POSIX";
+    return false;
+}
+#endif
 
 std::string publish_file(const std::string& key, const uint8_t* data, size_t n) {
     std::error_code ec;
@@ -333,12 +527,44 @@ bool map_file(const std::string& path, Mapping& out, std::string& err) {
     return true;
 }
 
+void remove_publication(const std::string& uri, const std::string& private_root) {
+    if (uri.empty()) return;
+    if (!private_root.empty()) {
+        unlink_private_file(private_root, uri);
+    } else if (is_shm_uri(uri)) {
+        unlink_shm_name(name_from_uri(uri));
+    } else {
+        std::error_code ec;
+        std::filesystem::remove(uri, ec);
+    }
+}
+
 }  // namespace
 
 bool is_shm_uri(const std::string& uri) { return uri.rfind(kUriPrefix, 0) == 0; }
 
-// Cache keys stay process-local; object_key() adds the publishing process id to the shared
-// object/file name, so the published name is still /dev/shm/chudware_p<pid>_<doc>_r<rev>.
+bool set_publication_root(const std::string& root, std::string& err) {
+    err.clear();
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_publication_root = root;
+    }
+    const PublicationRoot selected = publication_root();
+    if (!selected.enabled) return true;
+    std::string normalized;
+    if (!normalize_private_root(selected.path, normalized, err)) return false;
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    const int fd = open_private_root(normalized, true, err);
+    if (fd < 0) return false;
+    ::close(fd);
+    return true;
+#else
+    err = "private AICM publication requires POSIX";
+    return false;
+#endif
+}
+
+// Keys remain process-local, even when cell publication uses opaque file names.
 static std::string doc_key_prefix(const std::string& doc_id) {
     return sanitize(doc_id) + "_r";
 }
@@ -368,28 +594,35 @@ void ensure_atexit_cleanup() {
 std::string publish(const std::string& key, const uint8_t* data, size_t n) {
     if (!data && n) return {};
     ensure_atexit_cleanup();
-    std::string uri = publish_shm(key, data, n);
-    if (uri.empty()) uri = publish_file(key, data, n);
+    const PublicationRoot selected = publication_root();
+    std::string private_root;
+    std::string uri;
+    if (selected.enabled) {
+        std::string err;
+        if (!normalize_private_root(selected.path, private_root, err)) return {};
+        uri = publish_private_file(private_root, data, n);
+    } else {
+        uri = publish_shm(key, data, n);
+        if (uri.empty()) uri = publish_file(key, data, n);
+    }
     if (uri.empty()) return {};
 
     CacheEntry e;
     e.bytes = n ? std::make_shared<const std::vector<uint8_t>>(data, data + n)
                 : std::make_shared<const std::vector<uint8_t>>();
     e.uri = uri;
+    e.private_root = private_root;
     std::string replaced;
+    std::string replaced_root;
     {
         std::lock_guard<std::mutex> lk(g_mu);
         CacheEntry& slot = g_cache[key];
         replaced = std::move(slot.uri);
+        replaced_root = std::move(slot.private_root);
         slot = std::move(e);
     }
-    // A fallback file from this key's previous publication is not reused once the key gets a
-    // shared object again (Windows falls back while a reader holds the old mapping); drop it
-    // so replaced fallbacks do not pile up in the temp dir. Same-path rewrites are kept.
-    if (!replaced.empty() && replaced != uri && !is_shm_uri(replaced)) {
-        std::error_code ec;
-        std::filesystem::remove(replaced, ec);
-    }
+    // Readers retain immutable bytes/mappings while replaced backing files are removed.
+    if (!replaced.empty() && replaced != uri) remove_publication(replaced, replaced_root);
     return uri;
 }
 
@@ -414,6 +647,13 @@ bool map(const std::string& uri, Mapping& out, std::string& err) {
                 return true;
             }
         }
+    }
+
+    const PublicationRoot selected = publication_root();
+    if (selected.enabled) {
+        std::string root;
+        if (!normalize_private_root(selected.path, root, err)) return false;
+        return map_private_file(root, uri, out, err);
     }
 
     if (is_shm_uri(uri)) {
@@ -447,21 +687,20 @@ void unmap(Mapping& m) {
 
 void release(const std::string& key) {
     std::string uri;
+    std::string private_root;
     {
         std::lock_guard<std::mutex> lk(g_mu);
         auto it = g_cache.find(key);
         if (it != g_cache.end()) {
             uri = it->second.uri;
+            private_root = std::move(it->second.private_root);
             g_cache.erase(it);
         }
     }
-    if (!uri.empty() && is_shm_uri(uri)) {
-        unlink_shm_name(name_from_uri(uri));
-    } else if (!uri.empty()) {
-        std::error_code ec;
-        std::filesystem::remove(uri, ec);
-    } else {
-        // Best-effort: unlink by constructed name even without a cache hit.
+    if (!uri.empty()) {
+        remove_publication(uri, private_root);
+    } else if (!publication_root().enabled) {
+        // Desktop best-effort unlink without a cache hit. Cells never touch shm.
         unlink_shm_name(shm_object_name(key));
     }
 }

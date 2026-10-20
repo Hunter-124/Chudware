@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -101,15 +102,18 @@ struct DocMesh {
     bool empty() const { return bodies.empty(); }
 };
 
-// Parse an AICM blob already in memory. Returns false (and sets err) on a malformed header or a
-// truncated/overrunning chunk; tolerant of trailing junk and unknown chunks otherwise.
+// Parse an AICM blob already in memory. Returns false (and sets err, clears out) for
+// unsupported versions/known record sizes, truncated chunks, wide count/product
+// overflows or invalid topology ranges. Counts are checked before narrowing or
+// allocating; known sections must match their declared payload exactly. Trailing
+// file bytes and unknown chunks remain forward-compatible.
 bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err);
 
 // Parse AICM bytes already in memory (alias of parseAicm; shared by file/mmap and web fetch).
 bool loadAicmBytes(const uint8_t* data, size_t size, DocMesh& out, std::string& err);
 
 // Convenience: map/read (native) or HTTP-fetch (web) the path/URI then parse.
-// Web: plain paths → GET /files/aicm?path=…; aicm-shm://name → GET /files/aicm?shm=….
+// Web: aicm-cell: workspace/document grant → authenticated /files/aicm fetch.
 bool loadAicmFile(const std::string& path, DocMesh& out, std::string& err);
 
 }  // namespace render

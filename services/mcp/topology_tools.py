@@ -185,7 +185,9 @@ def _run(study, doc_id, study_id, name, background, notes: list) -> dict:
         raise topo.TopologyInputError("missing_geometry", str(exc), "doc_id") from None
     caps = _capabilities()
     combo = topo.select_combination(caps, canonical["topology"])
+    topo.apply_print_process(canonical, combo, notes)
     settings = topo.run_settings(canonical["topology"], combo)
+    topo.require_topology_settings(canonical, combo)
     physics = settings["physics"]
     topo.require_run_inputs(canonical, physics)
     material = topo.run_material(canonical.get("material"), physics, _named_material, notes)
@@ -231,6 +233,9 @@ def _run(study, doc_id, study_id, name, background, notes: list) -> dict:
             "project_root": str(topo.project_jail()), "label": label,
             "started_utc": started, "settings": settings, "source": source,
             "inputs": inputs, "setup": setup, "notes": list(notes),
+            "print_process": canonical.get("print_process"),
+            "material_key": (canonical["material"] if isinstance(canonical.get("material"), str)
+                             else (canonical.get("material") or {}).get("key")),
             "formulation": combo.get("formulation"), "volume_phase": combo.get("volume_phase")}
     payload = {"method": _RPC, "params": {"study": envelope}}
     common = {
@@ -315,6 +320,26 @@ def _last_progress(job_id: str) -> Optional[dict]:
     return out or None
 
 
+def _print_handoff(result: dict, artifacts: dict, settings: dict, meta: dict) -> Optional[dict]:
+    surface = topo.surface_artifact(artifacts)
+    if surface is None or (result.get("manufacturing") or {}).get("geometry_valid") is not True:
+        return None
+    key, entry = surface
+    path = entry["path"]
+    build, source = topo.effective_build_direction(result, settings)
+    handoff = {"surface_path": path, "surface_artifact": key, "build_dir": build,
+               "build_dir_source": source, "slice_part": {"path": path, "build_dir": build},
+               "import_part": {"path": path, "as_solid": True}}
+    if meta.get("print_process"):
+        handoff["print_process"] = meta["print_process"]
+    material = {"pla": "PLA", "petg": "PETG", "abs": "ABS", "asa": "ASA", "tpu": "TPU"}.get(
+        str(meta.get("material_key") or "").lower())
+    if material:
+        handoff["material"] = material
+        handoff["slice_part"]["material"] = material
+    return handoff
+
+
 def _write_evidence(st: dict, raw: Optional[dict], state: str) -> dict:
     """Write this run's evidence into its directory ONCE: {result, paths, notes}.
 
@@ -370,7 +395,12 @@ def _write_evidence(st: dict, raw: Optional[dict], state: str) -> dict:
     notes.extend(art_notes)
     compact["artifacts"] = artifacts
     if finished:
-        compact["manufacturing"] = topo.dfam_report(compact, artifacts, settings)
+        process = topo.print_process(meta["print_process"]) if meta.get("print_process") else None
+        compact["manufacturing"] = topo.dfam_report(compact, artifacts, settings, process)
+        compact["topology"] = {**settings, **(compact.get("topology") or {})}
+        handoff = _print_handoff(compact, artifacts, settings, meta)
+        if handoff is not None:
+            compact["print_handoff"] = handoff
     source = meta.get("source") or {}
     inputs = meta.get("inputs") or {}
     provenance = {k: v for k, v in (compact.get("provenance") or {}).items()
@@ -424,6 +454,8 @@ def _collect(st: dict, raw: Optional[dict], state: str) -> dict:
            "feasible": oc["feasible"], "termination": oc["termination"],
            "print_ready": compact["manufacturing"]["print_ready"] is True,
            "artifact_dir": run_dir, "paths": list(evidence["paths"]), "result": compact}
+    if state == simjobs.DONE and "print_handoff" in compact:
+        out["print_handoff"] = compact["print_handoff"]
     if state != simjobs.DONE:
         out.update(state=state, error=compact.get("error"))
     if reason:
@@ -472,8 +504,10 @@ def register_topology_tools(mcp: FastMCP) -> None:
         `objectives` (first = default), `limits` (optional response-limit keys) and
         `parameters` (accepted topology{} keys) plus solver `defaults`. Only listed,
         supported pairs can run; nothing else is offered. `boundaries` lists which study
-        sections each physics consumes. When the engine build has no topology solver this
-        returns ok:false, code "capabilities_unavailable" — do not substitute a guess.
+        sections each physics consumes, including build_plate. `print_processes` lists
+        shared print presets (id, label, process, description, topology). When the engine
+        build has no topology solver this returns ok:false, code
+        "capabilities_unavailable" — do not substitute a guess.
         """
         try:
             caps = _capabilities()
@@ -487,10 +521,15 @@ def register_topology_tools(mcp: FastMCP) -> None:
         boundaries = {
             p: ([*(["fixtures", "loads", "load_cases"] if p in topo.STRUCTURAL_PHYSICS else []),
                  *(["thermal"] if p in topo.THERMAL_PHYSICS else []),
-                 *(["flow"] if p in topo.FLOW_PHYSICS else []), "preserve", "exclude"])
+                 *(["flow"] if p in topo.FLOW_PHYSICS else []),
+                 "preserve", "exclude", "build_plate"])
             for p in topo.PHYSICS}
         return _dumps({"ok": True, "available": True, "capabilities": caps,
                        "supported_pairs": pairs, "boundaries": boundaries,
+                       "print_processes": [
+                           {key: process[key] for key in
+                            ("id", "label", "process", "description", "topology")}
+                           for process in topo.print_processes()],
                        "material_required": dict(topo.REQUIRED_MATERIAL),
                        "units": "geometry mm; force N; pressure/stress MPa; thermal W, C, "
                                 "W/mK, W/m2K; flow m/s, Pa, Pa*s, kg/m3; density g/cm3"})
@@ -524,6 +563,7 @@ def register_topology_tools(mcp: FastMCP) -> None:
           {name, material: "<library key>" | {key?, E_mpa, nu, density_g_cm3, yield_mpa?,
              k_w_mk?, alpha_per_k?, cp_j_kgk?}, mesh_order: 1 (tet4 only),
            mesh_target_mm?, mesh_fineness? (0..1), mesh_min_mm?,
+           print_process?: "<print_processes id>", build_plate?: {faces:[sel], label?},
            topology: {physics, method, objective?, volume_fraction, max_iterations?,
              filter_radius_mm?, penalty?, ... limits such as stress_limit_mpa,
              symmetry_axes?, build_direction?, overhang_angle_deg?, min_member_mm?,
@@ -531,6 +571,10 @@ def register_topology_tools(mcp: FastMCP) -> None:
            preserve / exclude: [{faces:[sel], thickness_mm?} | {box_min_mm:[3], box_max_mm:[3]}]}
           A face selector (sel) is a face query ("top", {"of":"face","side":"-x"}), a face
           sid from describe_part, or a GUI face selector; it is resolved on the live part.
+          print_process fills absent topology parameters offered by the chosen pair;
+          explicit settings win, filled keys are saved and reported in notes. build_plate
+          selects the planar, lowest bed face; its inward normal supplies the build direction.
+          Overhang control needs build_plate or build_direction; its default angle is 45 deg.
 
         Boundaries by physics (sections a physics does not use stay in the study, unsent):
           structural       fixtures + loads (+ load_cases); objective compliance, or mass
@@ -565,6 +609,15 @@ def register_topology_tools(mcp: FastMCP) -> None:
             "loads": [{"faces": ["+x"], "type": "force", "vec": [0, 0, -800]}],
             "preserve": [{"faces": ["+x"], "thickness_mm": 3}]})
 
+        FDM example (PLA bracket; choose bed and load faces on the actual part)
+          run_topology_optimization(study={"name": "Printed PLA bracket",
+            "material": "pla", "print_process": "fdm_0.4",
+            "build_plate": {"faces": ["bottom"]}, "mesh_target_mm": 1,
+            "topology": {"physics": "structural", "method": "simp",
+                         "objective": "compliance", "volume_fraction": 0.3},
+            "fixtures": [{"faces": ["-x"]}],
+            "loads": [{"faces": ["+x"], "type": "force", "vec": [0, 0, -50]}]})
+
         Results (get_job/wait_job when done): `ok` = the computation finished, NOT a
         certified design; `converged` and `feasible` are separate (an iteration limit or a
         violated constraint is a finished, unconverged/infeasible run — report it as such).
@@ -576,6 +629,11 @@ def register_topology_tools(mcp: FastMCP) -> None:
         only slice_part's passing G-code check makes a part print-ready, and this tool does
         not slice; `print_ready_reason` says what passed and what is missing. Failures name
         the missing selection, material, geometry or unsupported combination (`code`, `field`).
+        With validated geometry and an intact surface, `print_handoff` gives the preferred
+        print surface path, effective build_dir/source and slice_part arguments. Add the
+        user's printer: slice_part(printer=<user's printer>, **print_handoff["slice_part"]).
+        Continue in CAD with import_part(path=print_handoff["surface_path"], as_solid=True)
+        (also supplied as print_handoff.import_part); the original feature history stays editable.
         """
         notes: list = []
         try:

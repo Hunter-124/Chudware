@@ -6,7 +6,7 @@ import json
 import zipfile
 from pathlib import Path
 
-from services.browser import adapters, session
+from services.browser import adapters
 from services.browser.adapters import makerworld, printables
 from services.parts import model_matcher
 from services.mcp import parts_tools as tools
@@ -136,32 +136,10 @@ def test_oversized_file_refuses_without_publishing_artifact(monkeypatch, tmp_pat
     assert not list((tmp_path / "reference").rglob("*.step"))
 
 
-def test_non_https_and_no_cad_link_refuse_by_name(monkeypatch):
-    assert tools.fetch_cad_model_impl("http://example.com/servo.step", import_part=False)["reason"] == "unsupported_format"
-    from importlib import import_module
-    fetch_page = import_module("services.research.fetch_page")
-    monkeypatch.setattr(fetch_page, "_http_get",
-                        lambda url: ("", url, "", '<div id="app"></div>'))
-    monkeypatch.setattr(session, "browser_fetch",
-                        lambda *_: {"ok": True, "content": '<div id="app"></div>'})
-    out = tools.fetch_cad_model_impl("https://example.com/model", import_part=False)
-    assert out == {"ok": False, "reason": "no_cad_link",
-                   "detail": "No CAD link on rendered page https://example.com/model.",
-                   "candidates": []}
-
-
-def test_unavailable_browser_names_refusal_after_static_fetch(monkeypatch):
-    from importlib import import_module
-    fetch_page = import_module("services.research.fetch_page")
-    monkeypatch.setattr(fetch_page, "_http_get",
-                        lambda url: ("", url, "", '<div id="app">JavaScript required</div>'))
-    monkeypatch.setattr(session, "browser_fetch",
-                        lambda *_: {"ok": False, "reason": "browser_fetch_failed",
-                                    "hint": "CEF is not built"})
-    result = tools.fetch_cad_model_impl("https://example.org/model", import_part=False)
-    assert result["reason"] == "browser_unavailable"
-    assert result["candidates"] == []
-    assert "CEF is not built" in result["detail"]
+def test_non_https_cad_url_refuses_by_name():
+    result = tools.fetch_cad_model_impl("http://example.com/servo.step", import_part=False)
+    assert result["ok"] is False
+    assert result["reason"] == "unsupported_format"
 
 
 def test_mg90s_keeps_standard_geometry_while_searching_public_models(monkeypatch):

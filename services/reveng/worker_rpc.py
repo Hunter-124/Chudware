@@ -44,6 +44,14 @@ def _fail(reason: str, hint: str = "") -> dict:
 
 
 def _wrap_exc(exc: Exception) -> dict:
+    if isinstance(exc, KeyError) and exc.args == ("not_found",):
+        from services.agent.request_context import in_cell
+        out = {"ok": False, "error": "not_found", "reason": "not_found"}
+        if in_cell():
+            out["code"] = "not_found"
+        return out
+    if isinstance(exc, ValueError) and str(exc) == "forbidden_right":
+        return {"ok": False, "error": "forbidden_right", "reason": "forbidden_right"}
     if isinstance(exc, ImportError):
         return _fail("reveng_unavailable",
                      "reverse-engineering tools not importable; check engine install")
@@ -116,6 +124,14 @@ def _call_tool(method: str, params: dict) -> dict:
     Params the tool does not declare are dropped (the GUI sends a few extras); a
     missing required argument is reported honestly instead of raising TypeError.
     """
+    from services.agent import request_context
+    request_context.control_delegate("cancel" if method == "reveng_cancel_splat" else method)
+    if request_context.in_cell() and method in (
+            "start_capture_session", "stop_capture_session"):
+        return {"ok": False, "reason": "cell_refused", "error": "cell_refused"}
+    if request_context.in_cell() and "session_id" in (params or {}):
+        from services.mcp.reveng_common import _load_session
+        _load_session(params["session_id"], merge_gaussian=False)
     fn = _tool_fn(method)
     if fn is None:
         return _fail(f"tool_not_registered: {method}",
@@ -125,6 +141,10 @@ def _call_tool(method: str, params: dict) -> dict:
     named = [p for p in sig.parameters.values()
              if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
                            inspect.Parameter.KEYWORD_ONLY)]
+    if request_context.in_cell() and any(p.name == "session_id" for p in named):
+        from services.mcp.reveng_common import _load_session
+        if "session_id" not in supplied:
+            _load_session(None, merge_gaussian=False)
     if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
         kwargs = supplied
     else:
@@ -148,7 +168,24 @@ def _bridge(method: str, **pinned: Any) -> Callable[[dict, Callable], dict]:
             merged = dict(params or {})
             for key, value in pinned.items():
                 merged.setdefault(key, value)
-            return _call_tool(method, merged)
+            result = _call_tool(method, merged)
+            from services.agent.request_context import control_delegate
+            delegate = control_delegate("cancel" if method == "reveng_cancel_splat" else method)
+            if delegate and result.get("ok"):
+                from services.mcp.reveng_common import _session_path
+                from datetime import datetime, timezone
+                event = {"kind": "run_stopped", "reason": "manager_stop",
+                         "control_delegate": delegate,
+                         "session_id": merged["session_id"],
+                         "ts": datetime.now(timezone.utc).isoformat()}
+                with (_session_path(merged["session_id"]) / "control-events.jsonl").open("a") as log:
+                    log.write(json.dumps(event) + "\n")
+                    log.flush()
+                _emit(event)
+                return {"ok": True, "session_id": merged["session_id"],
+                        "status": result.get("status", "cancelled"),
+                        "reason": "manager_stop", "control_delegate": delegate}
+            return result
         except Exception as exc:  # noqa: BLE001
             return _wrap_exc(exc)
 
@@ -258,9 +295,9 @@ def _download_into(url: str, site: str, dest_dir: Path) -> tuple[Path | None, di
     """
     try:
         from services.browser import session as _bsession
+        from services.net.safe_http import safe_download_path
+        dest = safe_download_path(dest_dir, url, default="file")
         dest_dir.mkdir(parents=True, exist_ok=True)
-        name = url.rsplit("/", 1)[-1].split("?", 1)[0] or "file"
-        dest = dest_dir / name
         out = _bsession.browser_download(url, site, dest)
         if out.get("ok") and dest.is_file():
             return dest, None

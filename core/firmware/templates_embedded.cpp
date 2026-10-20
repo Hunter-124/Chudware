@@ -86,20 +86,19 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
         {"include/chudware_trace.h", R"CHUDWARE_TMPL(/* chudware_trace.h — firmware-side pin-event shim for the QEMU emulation fallback (T-FIN1).
  *
  * QEMU (mps2-an385) has no external GPIO observer the host can poll, so the firmware
- * reports its own pin transitions over the semihosting console in a machine-readable
- * line the host-side parser (engine/firmware/emulator.py) picks up:
+ * reports its own pin transitions over a firmware-configured UART in a
+ * machine-readable line parsed by the host:
  *
  *     CHUDWARE_GPIO_EVT <PIN>=<level> t=<ms>ms
  *
- * Usage (semihosting must be enabled — fw_sim_run's QEMU path passes -semihosting):
+ * Usage (configure printf's UART driver; native semihosting is disabled):
  *
  *     #include "chudware_trace.h"
  *     CHUDWARE_GPIO_TRACE("PA5", 1, millis());   // pin name, level (0/1), timestamp in ms
  *     CHUDWARE_GPIO_TRACE_NT("PA5", 0);          // no-timestamp variant
  *
- * The same line format is what Renode's generated state-change hooks print, so
- * assertions ("gpio:PA5=1", timeline "gpio:PA5=1@>10ms") work identically on both
- * backends. Plain printf is enough: the mps2-an385 semihosting console is stdout.
+ * Both backends parse the same marker format. printf must use the selected
+ * target's actual UART, not semihosting or another native-host service.
  */
 #ifndef CHUDWARE_TRACE_H
 #define CHUDWARE_TRACE_H
@@ -119,8 +118,8 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
  *
  *     CHUDWARE_CPU_TRACE("sleep", millis());  __WFI();  CHUDWARE_CPU_TRACE("run", millis());
  *
- * state_str must be "run" or "sleep". Works on both backends (plain UART/semihosting
- * text); the host parser is engine/firmware/powerprofile.py. */
+ * state_str must be "run" or "sleep". Both backends parse plain UART text;
+ * the host parser derives the residency intervals. */
 #define CHUDWARE_CPU_TRACE(state_str, t_ms) \
     printf("CHUDWARE_CPU_EVT %s t=%lums\n", (state_str), (unsigned long)(t_ms))
 

@@ -248,7 +248,7 @@ def _fix_overlap(f: Finding) -> tuple[list[dict], list[str]]:
 
 def _fix_open_profile(f: Finding) -> tuple[list[dict], list[str]]:
     """Open sketch profile → auto_constrain proposal (T-W2)."""
-    helper = ["doc_sketch_auto_constrain", "doc_sketch_health"]
+    helper = ["sketch_auto_constrain", "sketch_health"]
     return [{
         "action": "auto_constrain",
         "params": {"doc_id": f.refs.get("doc_id", ""), "sketch": f.refs.get("sketch")},
@@ -256,6 +256,55 @@ def _fix_open_profile(f: Finding) -> tuple[list[dict], list[str]]:
         "predicted_effect": f"{f.numbers.get('open_chains', 'the open')} chain(s) close",
         "confidence": "calc",
     }], helper
+
+
+def _fix_sketch_quality(f: Finding) -> tuple[list[dict], list[str]]:
+    """Keep actionable design-intent and solver findings from being downgraded."""
+    sketch = f.refs.get("sketch")
+    helpers = ["describe_sketch", "sketch_health", "check_sketch", "add_features"]
+    if f.kind in ("under_dimensioned", "underconstrained"):
+        return [{
+            "action": "add_features",
+            "params": {
+                "doc_id": f.refs.get("doc_id", ""),
+                "ops": [{"op": "sketch_fully_define", "sketch": sketch,
+                         "relations": True, "dimensions": True, "anchor": "origin"}],
+            },
+            "basis": "after explicit design relations and dimensions, define residual DOF",
+            "predicted_effect": "adds non-fix constraints; recheck DOF and pinned_only",
+            "confidence": "heuristic",
+        }], helpers
+    actions = {
+        "pinned_instead_of_constrained": (
+            "replace_fixed_constraints",
+            "remove fix relations from authored profile entities, preserve converted external "
+            "references, and replace them with geometric relations and driving dimensions",
+        ),
+        "no_driving_dimensions": (
+            "add_driving_dimensions",
+            "choose critical lengths/radii and offsets as driving dimensions, not driven "
+            "measurements; replace redundant relations where necessary",
+        ),
+        "unreferenced_profile": (
+            "anchor_sketch_profile",
+            "reference profile geometry to origin, sketch axes or converted model geometry",
+        ),
+        "sketch_conflict": (
+            "resolve_sketch_constraints",
+            "inspect conflicting constraints and remove or correct the contradictory relation "
+            "before adding dimensions",
+        ),
+    }
+    action, basis = actions[f.kind]
+    return [{
+        "action": action,
+        "params": {"doc_id": f.refs.get("doc_id", ""), "sketch": sketch,
+                   "entities": f.refs.get("entities", []),
+                   "conflicting": f.extra.get("conflicting", [])},
+        "basis": basis,
+        "predicted_effect": "restores editable design intent; recheck sketch health afterwards",
+        "confidence": "heuristic",
+    }], helpers
 
 
 def _fix_rebuild(f: Finding) -> tuple[list[dict], list[str]]:
@@ -476,6 +525,12 @@ _FIX_PROVIDERS = {
     "interference": _fix_interference,
     "overlap": _fix_overlap,
     "open_profile": _fix_open_profile,
+    "pinned_instead_of_constrained": _fix_sketch_quality,
+    "no_driving_dimensions": _fix_sketch_quality,
+    "unreferenced_profile": _fix_sketch_quality,
+    "under_dimensioned": _fix_sketch_quality,
+    "underconstrained": _fix_sketch_quality,
+    "sketch_conflict": _fix_sketch_quality,
     "rebuild": _fix_rebuild,
     "sim_bc": _fix_sim_bc,
     "sim_margin": _fix_sim_margin,

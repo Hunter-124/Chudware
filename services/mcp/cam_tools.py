@@ -1022,10 +1022,10 @@ def register_cam_tools(mcp: FastMCP) -> None:
     # ------------------------------------------------------------------ persistence
     @mcp.tool()
     def cam_save(path: str) -> str:
-        """Save the active CAM job to a .cam+ file at *path*. The path is resolved to an
-        absolute path (matching this MCP process's cwd, not the engine daemon's) before the
-        core writes it; the response confirms the resolved path, that the file exists on
-        disk, and its size."""
+        """Save the active CAM job to a .cam+ file at *path*. Relative paths use the
+        selected project root, never the worker or daemon cwd; without a project root,
+        pass an absolute path. The response confirms the resolved path, file existence,
+        and size."""
         try:
             out_path = _sanitize_output_path(path)
             r = cb.call("cam_save", {"doc_id": _job(), "path": out_path})

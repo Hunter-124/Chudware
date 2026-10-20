@@ -165,6 +165,7 @@ class MoonrakerAdapter(PrinterAdapter):
                 self.http.auth_headers(),
                 self.config.timeout_s,
                 self.redactor,
+                address_class=self.config.address_class,
             ) as websocket:
                 websocket.send_json(request)
                 while not stopper.is_set():

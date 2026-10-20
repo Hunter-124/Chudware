@@ -4,6 +4,8 @@
 
 #ifdef __EMSCRIPTEN__
 #include "core/web_fetch.h"
+#include <nlohmann/json.hpp>
+#include <stdexcept>
 #endif
 
 #include <algorithm>
@@ -12,6 +14,8 @@
 #include <cstdio>
 #include <cstring>
 #include <list>
+#include <mutex>
+#include <utility>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -68,15 +72,23 @@ struct Cursor {
         return s;
     }
 
-    void floats(std::vector<float>& dst, size_t count) {
-        if (count > remaining() / sizeof(float)) { ok = false; return; }
-        dst.resize(count);
-        if (count) read(dst.data(), count * 4);  // IEEE-754 LE matches in-memory float on MSVC/x64
+    // Keep products wide until BOTH the payload and the destination representation
+    // have been checked. In wasm32, narrowing 3 * 0x55555556 first yields 2.
+    template<class T>
+    bool arrayFits(uint64_t count) const {
+        return ok && count <= remaining() / sizeof(T) &&
+               count <= std::vector<T>{}.max_size() &&
+               count <= uint64_t(std::numeric_limits<std::ptrdiff_t>::max()) / sizeof(T);
     }
-    void uints(std::vector<uint32_t>& dst, size_t count) {
-        if (count > remaining() / sizeof(uint32_t)) { ok = false; return; }
-        dst.resize(count);
-        if (count) read(dst.data(), count * 4);
+    void floats(std::vector<float>& dst, uint64_t count) {
+        if (!arrayFits<float>(count)) { ok = false; return; }
+        dst.resize(static_cast<size_t>(count));
+        if (count) read(dst.data(), static_cast<size_t>(count) * sizeof(float));
+    }
+    void uints(std::vector<uint32_t>& dst, uint64_t count) {
+        if (!arrayFits<uint32_t>(count)) { ok = false; return; }
+        dst.resize(static_cast<size_t>(count));
+        if (count) read(dst.data(), static_cast<size_t>(count) * sizeof(uint32_t));
     }
 };
 
@@ -84,17 +96,24 @@ struct Cursor {
 
 bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err) {
     out = DocMesh{};
+    err.clear();
+    if (!data || size > size_t(std::numeric_limits<std::ptrdiff_t>::max())) {
+        err = "invalid AICM buffer size";
+        return false;
+    }
     Cursor c(data, size);
-
+    DocMesh mesh;
     char magic[4];
     c.read(magic, 4);
     if (!c.ok || std::memcmp(magic, "AICM", 4) != 0) {
         err = "bad magic (not an AICM file)";
         return false;
     }
-    out.version = c.u32();
+    mesh.version = c.u32();
     uint32_t chunk_count = c.u32();
     if (!c.ok) { err = "truncated header"; return false; }
+    if (mesh.version != 1) { err = "unsupported AICM version"; return false; }
+    if (chunk_count > c.remaining() / 12) { err = "truncated chunk headers"; return false; }
 
     // FACE/EDGE/VERT bind to the most recent preceding BODY.
     BodyMesh* current = nullptr;
@@ -111,33 +130,44 @@ bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err)
             return false;
         }
         const uint8_t* file_end = c.end;
-        c.end = payload_start + payload_len;
+        c.end = payload_start + static_cast<size_t>(payload_len);
 
         auto fcc = [&](const char* s) { return std::memcmp(fourcc, s, 4) == 0; };
 
         if (fcc("BODY")) {
-            out.bodies.emplace_back();
-            current = &out.bodies.back();
-            current->body_id = c.u32();
-            current->name = c.str();
-            current->color[0] = c.f32();
-            current->color[1] = c.f32();
-            current->color[2] = c.f32();
-            current->n_verts = c.u32();
-            current->n_tris = c.u32();
-            c.floats(current->pos, 3ull * current->n_verts);
-            c.floats(current->nrm, 3ull * current->n_verts);
-            c.uints(current->idx, 3ull * current->n_tris);
+            BodyMesh body;
+            body.body_id = c.u32();
+            body.name = c.str();
+            body.color[0] = c.f32();
+            body.color[1] = c.f32();
+            body.color[2] = c.f32();
+            body.n_verts = c.u32();
+            body.n_tris = c.u32();
+            const uint64_t vertices = uint64_t(body.n_verts) * 3;
+            const uint64_t indices = uint64_t(body.n_tris) * 3;
+            const uint64_t geometry_bytes = vertices * 2 * sizeof(float) +
+                                            indices * sizeof(uint32_t);
+            if (!c.ok || geometry_bytes > c.remaining() ||
+                (c.remaining() - geometry_bytes != 0 && c.remaining() - geometry_bytes != 8) ||
+                indices > uint64_t(std::numeric_limits<int>::max()) ||
+                !c.arrayFits<float>(vertices) || !c.arrayFits<uint32_t>(indices)) {
+                err = "invalid BODY payload length or count";
+                return false;
+            }
+            mesh.bodies.push_back(std::move(body));
+            current = &mesh.bodies.back();
+            c.floats(current->pos, vertices);
+            c.floats(current->nrm, vertices);
+            c.uints(current->idx, indices);
             if (!c.ok) { err = "truncated BODY payload"; return false; }
             if (std::any_of(current->idx.begin(), current->idx.end(),
                             [&](uint32_t index) { return index >= current->n_verts; })) {
                 err = "invalid BODY vertex index";
                 return false;
             }
-            // C32-A material trailer: present iff the chunk has >=8 bytes left after idx. Old AICM
-            // files (no trailer) keep the dielectric defaults; the boundary re-sync below skips any
-            // bytes either way, so this stays forward-compatible.
-            if (c.ok && (size_t)(c.p - payload_start) + 8 <= payload_len) {
+            // The only supported BODY trailer is the two-float material record.
+            // Legacy files without it retain their dielectric appearance.
+            if (c.remaining() == 8) {
                 current->metallic = c.f32();
                 current->roughness = c.f32();
             }
@@ -172,7 +202,11 @@ bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err)
             }
         } else if (fcc("FACE")) {
             uint32_t n = c.u32();
-            if (!c.ok || n > c.remaining() / 13) { err = "truncated FACE payload"; return false; }
+            if (!current || !c.ok || uint64_t(n) * 13 != c.remaining() ||
+                n > std::vector<FaceRange>{}.max_size()) {
+                err = "invalid FACE payload length";
+                return false;
+            }
             std::vector<FaceRange> faces;
             faces.reserve(n);
             for (uint32_t i = 0; i < n; ++i) {
@@ -181,44 +215,65 @@ bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err)
                 f.first_tri = c.u32();
                 f.tri_count = c.u32();
                 f.surf_type = c.u8();
-                if (current && uint64_t(f.first_tri) + f.tri_count > current->n_tris) {
+                if (uint64_t(f.first_tri) + f.tri_count > current->n_tris) {
                     err = "invalid FACE triangle range";
                     return false;
                 }
                 faces.push_back(f);
             }
-            if (current) current->faces = std::move(faces);
+            current->faces = std::move(faces);
         } else if (fcc("EDGE")) {
             uint32_t n = c.u32();
-            if (!c.ok || n > c.remaining() / 13) { err = "truncated EDGE payload"; return false; }
+            if (!current || !c.ok || c.remaining() < 4 || n > (c.remaining() - 4) / 13 ||
+                n > std::vector<EdgeSegment>{}.max_size()) {
+                err = "invalid EDGE record count";
+                return false;
+            }
+            // Validate the point section before allocating the edge records.
+            Cursor points = c;
+            points.skip(static_cast<size_t>(uint64_t(n) * 13));
+            const uint32_t declared_pts = points.u32();
+            const uint64_t point_elements = uint64_t(declared_pts) * 3;
+            if (!points.ok || point_elements * sizeof(float) != points.remaining() ||
+                !points.arrayFits<float>(point_elements)) {
+                err = "invalid EDGE point payload length";
+                return false;
+            }
             std::vector<EdgeSegment> edges;
             edges.reserve(n);
+            uint64_t line_vertices = 0;
             for (uint32_t i = 0; i < n; ++i) {
                 EdgeSegment e;
                 e.edge_id = c.u32();
                 e.first_pt = c.u32();
                 e.pt_count = c.u32();
                 e.curve_type = c.u8();
+                if (uint64_t(e.first_pt) + e.pt_count > declared_pts) {
+                    err = "invalid EDGE point range";
+                    return false;
+                }
+                if (e.pt_count > 1) line_vertices += uint64_t(e.pt_count - 1) * 2;
+                if (line_vertices > uint64_t(std::numeric_limits<int>::max()) / 3 ||
+                    line_vertices > uint64_t(std::numeric_limits<std::ptrdiff_t>::max()) /
+                                        (3 * sizeof(float))) {
+                    err = "unsupported EDGE draw size";
+                    return false;
+                }
                 edges.push_back(e);
             }
-            uint32_t total_pts = c.u32();
+            c.u32(); // declared_pts was validated before allocating records.
             std::vector<float> pts;
-            c.floats(pts, 3ull * total_pts);
+            c.floats(pts, point_elements);
             if (!c.ok) { err = "truncated EDGE payload"; return false; }
-            if (current && std::any_of(edges.begin(), edges.end(),
-                                       [&](const EdgeSegment& e) {
-                                           return uint64_t(e.first_pt) + e.pt_count > total_pts;
-                                       })) {
-                err = "invalid EDGE point range";
-                return false;
-            }
-            if (current) {
-                current->edges = std::move(edges);
-                current->edge_pts = std::move(pts);
-            }
+            current->edges = std::move(edges);
+            current->edge_pts = std::move(pts);
         } else if (fcc("VERT")) {
             uint32_t n = c.u32();
-            if (!c.ok || n > c.remaining() / 16) { err = "truncated VERT payload"; return false; }
+            if (!current || !c.ok || uint64_t(n) * 16 != c.remaining() ||
+                n > std::vector<BrepVertex>{}.max_size()) {
+                err = "invalid VERT payload length";
+                return false;
+            }
             std::vector<BrepVertex> verts;
             verts.reserve(n);
             for (uint32_t i = 0; i < n; ++i) {
@@ -229,7 +284,7 @@ bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err)
                 v.xyz[2] = c.f32();
                 verts.push_back(v);
             }
-            if (current) current->brep_verts = std::move(verts);
+            current->brep_verts = std::move(verts);
         } else if (fcc("SCLR")) {
             ScalarField sf;
             sf.body_id = c.u32();
@@ -237,25 +292,59 @@ bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err)
             sf.vmin = c.f32();
             sf.vmax = c.f32();
             uint32_t n = c.u32();
+            if (!c.ok || uint64_t(n) * sizeof(float) != c.remaining() ||
+                !c.arrayFits<float>(n)) {
+                err = "invalid SCLR payload length";
+                return false;
+            }
             c.floats(sf.values, n);
-            out.scalars.push_back(std::move(sf));
+            mesh.scalars.push_back(std::move(sf));
         } else if (fcc("DISP")) {
             DispField df;
             df.body_id = c.u32();
             df.scale_hint = c.f32();
             uint32_t n = c.u32();
-            c.floats(df.vec, 3ull * n);
-            out.displacements.push_back(std::move(df));
+            const uint64_t elements = uint64_t(n) * 3;
+            if (!c.ok || elements * sizeof(float) != c.remaining() ||
+                !c.arrayFits<float>(elements)) {
+                err = "invalid DISP payload length";
+                return false;
+            }
+            c.floats(df.vec, elements);
+            mesh.displacements.push_back(std::move(df));
         } else if (fcc("LINS")) {
             LineSet ls;
             ls.name = c.str();
             uint32_t n_lines = c.u32();
+            if (!c.ok || c.remaining() < 5 || n_lines > (c.remaining() - 5) / 4 ||
+                !c.arrayFits<uint32_t>(n_lines)) {
+                err = "invalid LINS line count";
+                return false;
+            }
+            Cursor points = c;
+            uint64_t sum = 0;
+            for (uint32_t i = 0; i < n_lines; ++i) sum += points.u32();
+            const uint32_t total_pts = points.u32();
+            const uint64_t elements = uint64_t(total_pts) * 3;
+            if (!points.ok || elements * sizeof(float) >= points.remaining() ||
+                !points.arrayFits<float>(elements) || sum != total_pts) {
+                err = "invalid LINS point payload length";
+                return false;
+            }
+            points.skip(static_cast<size_t>(elements * sizeof(float)));
+            const uint8_t has_scalar = points.u8();
+            if (!points.ok || has_scalar > 1 ||
+                points.remaining() != (has_scalar ? uint64_t(total_pts) * sizeof(float) : 0) ||
+                (has_scalar && !points.arrayFits<float>(total_pts))) {
+                err = "invalid LINS scalar payload length";
+                return false;
+            }
             c.uints(ls.pts_per_line, n_lines);
-            uint32_t total_pts = c.u32();
-            c.floats(ls.pts, 3ull * total_pts);
+            c.u32(); // total_pts was validated above.
+            c.floats(ls.pts, elements);
             ls.has_scalar = c.u8() != 0;
             if (ls.has_scalar) c.floats(ls.scalar, total_pts);
-            out.lines.push_back(std::move(ls));
+            mesh.lines.push_back(std::move(ls));
         }
         // else: unknown fourcc — fall through and skip by payload_len below.
 
@@ -263,13 +352,13 @@ bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err)
 
         // Re-sync to the declared chunk boundary regardless of how much we consumed; this both
         // skips unknown chunks and guards against any per-chunk parse drift (spec requirement).
-        c.p = payload_start + payload_len;
+        c.p = payload_start + static_cast<size_t>(payload_len);
         c.end = file_end;
     }
 
     std::unordered_map<uint32_t, BodyMesh*> appearance_bodies;
     if (!appearances.empty()) {
-        for (BodyMesh& body : out.bodies) {
+        for (BodyMesh& body : mesh.bodies) {
             if (appearances.find(body.body_id) == appearances.end()) continue;
             auto inserted = appearance_bodies.emplace(body.body_id, &body);
             if (!inserted.second) inserted.first->second = nullptr;
@@ -312,6 +401,7 @@ bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err)
         body->appearance_regions = std::move(regions);
     }
 
+    out = std::move(mesh);
     return true;
 }
 
@@ -355,30 +445,28 @@ struct AicmLru {
     std::list<AicmLruEntry> order;  // front = most recent
     std::unordered_map<std::string, std::list<AicmLruEntry>::iterator> index;
     size_t totalBytes = 0;
+    std::mutex mutex;
 
-    bool lookup(const std::string& key, std::vector<uint8_t>& out) {
+    const std::vector<uint8_t>* lookup(const std::string& key) {
         auto it = index.find(key);
-        if (it == index.end()) return false;
+        if (it == index.end()) return nullptr;
         order.splice(order.begin(), order, it->second);  // move to MRU
-        out = it->second->bytes;
-        return true;
+        return &it->second->bytes;
     }
 
-    void insert(const std::string& key, const std::vector<uint8_t>& bytes) {
-        if (bytes.empty()) return;
+    void insert(const std::string& key, std::vector<uint8_t>&& bytes) {
+        if (bytes.empty() || bytes.size() > kAicmLruMaxBytes) return;
         auto it = index.find(key);
         if (it != index.end()) {
             totalBytes -= it->second->bytes.size();
             order.erase(it->second);
             index.erase(it);
         }
-        totalBytes += bytes.size();
-        order.push_front(AicmLruEntry{key, bytes});  // copy into cache
+        totalBytes += bytes.size(); // Both operands are bounded by the 64 MiB cache cap.
+        order.push_front(AicmLruEntry{key, std::move(bytes)});
         index[key] = order.begin();
         while (!order.empty() &&
                (order.size() > kAicmLruMaxEntries || totalBytes > kAicmLruMaxBytes)) {
-            // Keep at least the MRU entry even if it alone exceeds the byte cap.
-            if (order.size() == 1) break;
             totalBytes -= order.back().bytes.size();
             index.erase(order.back().key);
             order.pop_back();
@@ -394,57 +482,44 @@ AicmLru& aicmLru() {
 }  // namespace
 
 bool loadAicmFile(const std::string& path, DocMesh& out, std::string& err) {
-    // Browser has no /dev/shm or daemon FS — pull bytes from the gateway.
-    // Hit the in-memory LRU first so a warm (doc,rev) switch never re-GETs.
-    std::vector<uint8_t> bytes;
-    const bool cacheHit = aicmLru().lookup(path, bytes);
-
-    const bool is_shm = chudware::aicm_handoff::is_shm_uri(path);
-    if (!cacheHit) {
-        std::string url;
-        if (is_shm) {
-            // aicm-shm://[/]chudware_<key> → ?shm=chudware_<key> (gateway rejects a leading '/').
-            std::string name = path.substr(std::strlen("aicm-shm://"));
-            while (!name.empty() && name.front() == '/') name.erase(name.begin());
-            if (name.empty()) {
-                err = "malformed aicm-shm uri";
-                return false;
-            }
-            url = "/files/aicm?shm=" + urlEncode(name);
-        } else {
-            if (path.empty()) {
-                err = "empty AICM path";
-                return false;
-            }
-            url = "/files/aicm?path=" + urlEncode(path);
-        }
-
-        std::string ferr;
-        bytes = chudware::webFetch(url, ferr);
-        if (bytes.empty()) {
-            // 404 / network: fail the load as before. Do NOT cache empties.
-            err = ferr.empty() ? ("empty AICM response for " + path) : ferr;
-            return false;
-        }
-        aicmLru().insert(path, bytes);  // cache a copy; keep local bytes for parse
+    // The gateway binds this document grant to the authenticated actor, workspace
+    // and epoch. Never turn a daemon file path or shared-memory name into a fetch.
+    constexpr const char* prefix = "aicm-cell:";
+    if (path.compare(0, std::strlen(prefix), prefix) != 0) {
+        err = "AICM requires a workspace document grant";
+        return false;
     }
-
-    if (is_shm) {
-        // Gateway serves the raw shm object: uint64 LE size header + AICM payload
-        // (same layout map_shm strips on native).
-        if (bytes.size() < 8) {
-            err = "shm payload too short";
-            return false;
-        }
-        uint64_t sz = 0;
-        std::memcpy(&sz, bytes.data(), 8);
-        if (8ull + sz > static_cast<uint64_t>(bytes.size())) {
-            err = "shm payload size exceeds response";
-            return false;
-        }
-        return loadAicmBytes(bytes.data() + 8, static_cast<size_t>(sz), out, err);
+    std::string workspace, doc;
+    try {
+        const auto ref = nlohmann::json::parse(path.substr(std::strlen(prefix)));
+        workspace = ref.at("workspace_key").get<std::string>();
+        doc = ref.at("doc_id").get<std::string>();
+        if (workspace.empty() || doc.empty() ||
+            workspace.find('\0') != std::string::npos || doc.find('\0') != std::string::npos)
+            throw std::runtime_error("Invalid document grant");
+    } catch (const std::exception&) {
+        err = "Invalid AICM workspace document grant";
+        return false;
     }
-    return loadAicmBytes(bytes.data(), bytes.size(), out, err);
+    auto& cache = aicmLru();
+    {
+        std::lock_guard<std::mutex> guard(cache.mutex);
+        if (const auto* bytes = cache.lookup(path))
+            return loadAicmBytes(bytes->data(), bytes->size(), out, err);
+    }
+    const std::string url = "/files/aicm?workspace_key=" + urlEncode(workspace) +
+                            "&doc_id=" + urlEncode(doc);
+    auto bytes = chudware::webFetch(url, err);
+    if (bytes.empty()) {
+        if (err.empty()) err = "Empty AICM response";
+        return false;
+    }
+    if (!loadAicmBytes(bytes.data(), bytes.size(), out, err)) return false;
+    {
+        std::lock_guard<std::mutex> guard(cache.mutex);
+        cache.insert(path, std::move(bytes));
+    }
+    return true;
 }
 #else  // !__EMSCRIPTEN__
 

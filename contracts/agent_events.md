@@ -321,3 +321,30 @@ The online producer is the Chudcode session host and `services/agent/worker_rpc.
 The offline-safe producer is `core/agent/run.cpp`; `services/agent/agent_turn.py`
 retains the explicit Python provider loop. References above to `services.agent.loop`
 are historical implementation pointers, not an active module or wire requirement.
+
+## Online steer delivery (append-only, 2026-10-11)
+
+- `agent.steer {steer_id, status}` (Chudcode lane, mapped from the session host's
+  `agent_steer` frame by `services/agent/chudcode_events.py`). `status`:
+  - `delivered` — the steer's user message streamed into the turn (the model has it), or a
+    message a Stop withdrew opened the conversation's next prompt (emitted after that turn's
+    `agent_start`).
+  - `carried` — still in Chudcode's queue when the turn ended; withdrawn so Chudcode's settle
+    drain cannot answer it in an unobserved turn. It opens the conversation's next prompt.
+- `steer_id` is the GUI's correlation id from `agent_steer.steer_id`; steers sent without one
+  emit no event. Distinct from the C++ run machine's `agent_steer` kind above.
+- GUI: `copilot/feed.cpp::feedSteerEvent` moves the user bubble's `steerState`
+  (`app_state.h` `SteerState`), drawn as a caption under the bubble (`chat_log.cpp`).
+
+## Question-reply delivery evidence (append-only, 2026-10-13)
+
+A text-only steer consumed as a pending question's reply is delivered through the tool
+result, not a streamed user message. Its raw `agent_answer` frame carries the optional
+`steer_id`; the mapper emits both `agent.answer` and correlated `agent.steer
+{steer_id, status:"delivered"}`. A reply with images does not acknowledge the whole message
+until the original text and images stream into the model context.
+
+Confirmed delivery cannot be downgraded by a late queued/carried/failed control response.
+Unknown user frames and a successful Stop are not blanket delivery evidence for other
+messages. Legacy saved transcripts may reconcile an exact, unique, image-free resolved
+question reply within the same turn; ambiguous or cross-turn matches remain unconfirmed.

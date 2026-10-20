@@ -53,6 +53,7 @@ import hashlib
 import json
 import os
 import secrets
+import stat
 import threading
 import time
 import urllib.error
@@ -393,7 +394,15 @@ def oauth_begin(timeout_s: float = 300.0) -> dict:
     with _oauth_activity_lock:
         _oauth_activity["running"] = True
         _oauth_activity["last_result"] = None
-    threading.Thread(target=_wait, name="box-oauth-wait", daemon=True).start()
+    from services.worker_activity import start_background_thread
+
+    try:
+        start_background_thread(_wait, name="box-oauth-wait")
+    except BaseException:
+        srv.server_close()
+        with _oauth_activity_lock:
+            _oauth_activity["running"] = False
+        raise
     return {"ok": True, "authorize_url": url, "redirect_uri": OAUTH_REDIRECT_URI,
             "hint": "open authorize_url in a browser and approve access; the token "
                     "is stored automatically once Box redirects back"}
@@ -509,12 +518,78 @@ def enqueue_project(project: str, *, note: str = "") -> str | None:
 
 # --------------------------------------------------------------------------- mirroring
 
-def _sha1_file(p: Path) -> str:
-    h = hashlib.sha1()
-    with open(p, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+@contextlib.contextmanager
+def _open_project_file(root: Path, rel: str):
+    """Pin each directory and open a regular file without following any link."""
+    parts = Path(rel).parts
+    if not parts or Path(rel).is_absolute() or any(p in (".", "..") for p in parts):
+        raise OSError("invalid project-relative file")
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        create = kernel.CreateFileW
+        create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                           wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        create.restype = wintypes.HANDLE
+        close = kernel.CloseHandle
+        close.argtypes = [wintypes.HANDLE]
+        inspect = kernel.GetFileInformationByHandleEx
+        inspect.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+        class AttributeTag(ctypes.Structure):
+            _fields_ = [("attributes", wintypes.DWORD), ("tag", wintypes.DWORD)]
+        handles = []
+        leaf = None
+        try:
+            target = root.joinpath(*parts)
+            # No delete/write sharing: the checked directory chain cannot be
+            # renamed or have a reparse point replaced while the leaf is read.
+            chain = list(reversed(target.parents)) + [target]
+            for path in chain:
+                handle = create(str(path), 0x80000000 if path == target else 0,
+                                1, None, 3, 0x00200000 | 0x02000000, None)
+                if handle == ctypes.c_void_p(-1).value:
+                    raise OSError(ctypes.get_last_error(), "could not pin project file")
+                handles.append(handle)
+                tag = AttributeTag()
+                if not inspect(handle, 9, ctypes.byref(tag), ctypes.sizeof(tag)):
+                    raise OSError(ctypes.get_last_error(), "could not inspect project file")
+                if tag.attributes & 0x400:
+                    raise OSError("project links/reparse points cannot be mirrored")
+                if bool(tag.attributes & 0x10) != (path != target):
+                    raise OSError("project member has incompatible type")
+            leaf = handles.pop()
+            descriptor = msvcrt.open_osfhandle(leaf, os.O_RDONLY | os.O_BINARY)
+            leaf = None  # fd owns the handle
+            with os.fdopen(descriptor, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise OSError("project member is not regular")
+                yield stream
+        finally:
+            if leaf is not None:
+                close(leaf)
+            for handle in reversed(handles):
+                close(handle)
+    else:
+        descriptors = []
+        try:
+            directory = os.open(root.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            descriptors.append(directory)
+            for part in (*root.parts[1:], *parts[:-1]):
+                directory = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                    dir_fd=directory)
+                descriptors.append(directory)
+            descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                                 dir_fd=directory)
+            with os.fdopen(descriptor, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise OSError("project member is not regular")
+                yield stream
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
 
 
 def _iter_project_files(root: Path):
@@ -524,13 +599,17 @@ def _iter_project_files(root: Path):
     editor droppings are local-only.
     """
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in sorted(dirnames) if not d.startswith(".")]
+        dirnames[:] = [d for d in sorted(dirnames)
+                       if not d.startswith(".") and not (Path(dirpath) / d).is_symlink()]
         for fn in sorted(filenames):
             if fn.startswith("."):
                 continue
             p = Path(dirpath) / fn
             try:
-                size = p.stat().st_size
+                info = p.lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                size = info.st_size
             except OSError:
                 continue
             yield p.relative_to(root).as_posix(), p, size
@@ -568,9 +647,8 @@ def _raise_upload(status: int, body: Any, name: str) -> None:
 
 
 def _upload(token: str, file_id: str | None, parent_id: str, name: str,
-            path: Path) -> tuple[str, bool]:
-    """Upload *path*; returns ``(box_file_id, existed_before)``."""
-    payload = path.read_bytes()
+            payload: bytes) -> tuple[str, bool]:
+    """Upload the same verified bytes used for the mirror-state digest."""
     if file_id:
         data, ctype = _multipart({"name": name}, name, payload)
         status, body = _http("POST", f"{_UPLOAD}/files/{file_id}/content", token=token,
@@ -602,7 +680,7 @@ def _upload(token: str, file_id: str | None, parent_id: str, name: str,
 
 
 def _mirror_project(project: str, box: dict, deadline: float) -> dict:
-    root = Path(project)
+    root = Path(project).resolve()
     if not root.is_dir():
         raise BoxError("missing_project", project)
     token = _access_token(box)
@@ -624,7 +702,13 @@ def _mirror_project(project: str, box: dict, deadline: float) -> dict:
             skipped_large += 1
             continue
         try:
-            digest = _sha1_file(p)
+            with _open_project_file(root, rel) as stream:
+                payload = stream.read(max_bytes + 1)
+            if len(payload) > max_bytes:
+                skipped_large += 1
+                continue
+            digest = hashlib.sha1(payload).hexdigest()
+            size = len(payload)
         except OSError:
             continue  # deleted/unreadable mid-scan
         rec = state["files"].get(rel) or {}
@@ -636,7 +720,7 @@ def _mirror_project(project: str, box: dict, deadline: float) -> dict:
         for part in rel.split("/")[:-1]:
             walked = f"{walked}/{part}" if walked else part
             parent_id = _ensure_folder(token, state, parent_id, walked, part)
-        file_id, existed = _upload(token, rec.get("id"), parent_id, p.name, p)
+        file_id, existed = _upload(token, rec.get("id"), parent_id, p.name, payload)
         state["files"][rel] = {"id": file_id, "sha1": digest, "size": size}
         if existed:
             updated += 1
@@ -700,6 +784,16 @@ def _quarantine_spool_entry(entry: Path) -> Path:
         destination = quarantine / f"{entry.stem}-{uuid.uuid4().hex}{entry.suffix}"
     os.replace(entry, destination)
     return destination
+
+
+def worker_activity() -> dict:
+    from services.worker_activity import registry_lock
+
+    with registry_lock(_drain_activity_lock):
+        active = int(_drain_activity["running"] or _drain_lock.locked())
+    with registry_lock(_oauth_activity_lock):
+        oauth = int(_oauth_activity["running"])
+    return {"by_kind": {"box_mirror": active, "box_oauth": oauth}}
 
 
 def _drain_async(budget_s: float) -> None:
@@ -804,8 +898,9 @@ def drain(*, block: bool = False, budget_s: float = 300.0) -> dict:
             return {"ok": True, "started": False, "running": True}
         _drain_activity["running"] = True
     try:
-        threading.Thread(target=_drain_async, args=(budget_s,),
-                         name="box-mirror-drain", daemon=True).start()
+        from services.worker_activity import start_background_thread
+
+        start_background_thread(_drain_async, args=(budget_s,), name="box-mirror-drain")
     except Exception as e:  # noqa: BLE001
         result = {"ok": False, "reason": "internal_error",
                   "hint": f"{type(e).__name__}: {e}"}

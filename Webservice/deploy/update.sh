@@ -7,23 +7,10 @@
 #   bash Webservice/deploy/update.sh prod --tag v1.2.0
 #   bash Webservice/deploy/update.sh prod --continuous
 #
-# Staging follows origin/master and deploys only the gateway by default.
-# Production accepts exactly one of two release policies:
-#   --tag vX.Y.Z  pinned release; HEAD must be that exact v* tag.
-#   --continuous  untagged continuous deployment of origin/master HEAD, used by
-#                 .github/workflows/deploy-prod.yml so production tracks master
-#                 instead of silently serving a weeks-old bundle. The tradeoff
-#                 is deliberate and it is a policy change: a v* tag no longer
-#                 gates production. What gates it instead is the green master
-#                 CI gate upstream, plus every check below (clean tree,
-#                 ff-only pull, pg_dump rollback point, database-name and
-#                 entitlement asserts, joint-release parity validation and the
-#                 two post-deploy health assertions), with rollback.sh
-#                 restoring the previous retained joint release on failure.
-# The two policies are mutually exclusive, and a bare `prod` with neither flag
-# still refuses to deploy an untagged HEAD.
-# Both environments share this implementation so backup, migration, restart,
-# and authenticated health behavior cannot drift.
+# Automatic master activation is suspended pending independent release qualification.
+# An explicit operator/authorized manual workflow may select --continuous or a tag;
+# neither bypasses protected configuration, exact-ref or rollback-authority checks.
+# Retained rollback covers native/cell payloads only, never gateway source or DB.
 # ===========================================================================
 set -euo pipefail
 
@@ -42,30 +29,34 @@ Options:
   --host-only      Build the desktop binary only
   --web-only       Skip the desktop build; deploy engine/webd and gateway
   -h, --help       Show this help
+  --first-cutover-ack PATH  Explicit authority-registry record for this exact commit
 
 Health-test overrides:
   CHUDWARE_DEPLOY_HEALTH_BASE_URL  defaults to the selected loopback gateway
-  CHUDWARE_DEPLOY_HEALTHZ_PATH     defaults to /healthz
-  CHUDWARE_DEPLOY_ME_PATH          defaults to /api/me
   CHUDWARE_DEPLOY_HEALTH_ATTEMPTS  defaults to 30
 EOF
 }
 
 # Exit codes are a contract with .github/workflows/deploy-prod.yml:
 #   0  deployed
-#   1  FAILED PART-WAY: production may have been mutated -> the caller must roll back
+#   1  FAILED PART-WAY: production may have changed; classify native vs manual recovery
 #   2  usage error
 #   3  another deploy holds the host lock
-#   4  REFUSED BEFORE ANY MUTATION: production is exactly as it was -> do NOT roll back
+#   4  REFUSED BEFORE LIVE MUTATION: no service/payload/checkout/schema change; no rollback
 # Code 4 exists because a precondition refusal used to exit 1, and the workflow
 # then ran rollback.sh against a production it had never touched. The rollback
 # failed on its own unrelated grounds ("release ... is not restorable") and every
 # push for four days reported "ROLLBACK ITSELF FAILED ... Production needs
 # hands-on recovery now" when the only real problem was a dirty checkout.
+MUTATED="${CHUDWARE_DEPLOY_MUTATED:-0}"
 refuse() {
   echo "REFUSED: $1" >&2
-  echo "         production was not touched by this run." >&2
-  exit 4
+  if [[ "$MUTATED" = 0 ]]; then
+    echo "         live deployment was not changed by this run." >&2
+    exit 4
+  fi
+  echo "         deployment already changed; operator recovery may be required." >&2
+  exit 1
 }
 
 [[ $# -ge 1 ]] || { usage >&2; exit 2; }
@@ -82,12 +73,7 @@ case "$ENVIRONMENT" in
     DATA_ROOT="${CHUDWARE_WEB_DATA:-$HOME/chudware-web-data}"
     GATEWAY_ENV="${CHUDWARE_WEB_GATEWAY_ENV:-$DATA_ROOT/gateway.env}"
     GATEWAY_UNIT="chudware-gateway.service"
-    # post_deploy_health_assert defaults its base URL to
-    # http://127.0.0.1:$GATEWAY_PORT. Under `set -u` an unset GATEWAY_PORT
-    # aborts the run at the health assert — i.e. after the pg_dump, both
-    # builds, the joint-release promotion and the hostd restart have already
-    # landed — leaving a half-reported deploy that looks like a shell bug.
-    # The port belongs here with the other per-environment settings.
+    # The private-FD health/release helper uses the selected gateway's loopback port.
     GATEWAY_PORT=8300
     RETENTION_UNIT="chudware-security-retention.service"
     RETENTION_TIMER="chudware-security-retention.timer"
@@ -135,11 +121,19 @@ case "$ENVIRONMENT" in
     exit 2
     ;;
 esac
+if [[ "$ENVIRONMENT" = staging ]]; then
+  [[ "$(id -un)" = chudware-staging && "$HOME" = /var/lib/chudware-staging ]] \
+    || refuse "staging requires the dedicated chudware-staging account and home"
+elif [[ "$(id -un)" = chudware-staging ]]; then
+  refuse "staging identity cannot deploy production"
+fi
+export CHUDWARE_DEPLOY_ENV="$ENVIRONMENT"
 
 DO_PULL=1
 DO_GATEWAY=1
 RELEASE_TAG=""
 CONTINUOUS=0
+FIRST_CUTOVER_ACK=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tag)
@@ -150,6 +144,11 @@ while [[ $# -gt 0 ]]; do
     --continuous)
       CONTINUOUS=1
       shift
+      ;;
+    --first-cutover-ack)
+      [[ $# -ge 2 ]] || { echo "ERROR: --first-cutover-ack requires a path" >&2; exit 2; }
+      FIRST_CUTOVER_ACK="$2"
+      shift 2
       ;;
     --pull-only)
       DO_HOST=0; DO_ENGINE=0; DO_WEBD=0; DO_GATEWAY=0
@@ -202,7 +201,9 @@ fi
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 REPO="${CHUDWARE_REPO_DIR:-$REPO}"
-cd "$REPO"
+GATEWAY_PY="${CHUDWARE_GATEWAY_PYTHON:-$REPO/Webservice/gateway/.venv/bin/python}"
+cd "$REPO" || refuse "deployment checkout is unavailable"
+source "$REPO/Webservice/deploy/deployment_drain.sh" || refuse "private maintenance channel is invalid"
 REMOTE="${CHUDWARE_UPDATE_REMOTE:-origin}"
 REF="${CHUDWARE_UPDATE_BRANCH:-master}"
 # A pinned production deploy pulls the tag ref. Staging and a continuous
@@ -212,13 +213,13 @@ if [[ "$ENVIRONMENT" = prod && "$CONTINUOUS" = 0 ]]; then
   REF="$RELEASE_TAG"
 fi
 
-mkdir -p "$DATA_ROOT/logs"
+mkdir -p "$DATA_ROOT/logs" || refuse "deployment log directory is unavailable"
 LOGFILE="$DATA_ROOT/logs/update.log"
 STATUS="$DATA_ROOT/logs/deploy-status.json"
 # One host and one checkout: prod and staging must not pull or migrate in
 # parallel even though their logs and databases are separate.
 LOCK="${CHUDWARE_DEPLOY_LOCK:-$HOME/chudware-web-data/logs/deploy.lock}"
-mkdir -p "$(dirname "$LOCK")"
+mkdir -p "$(dirname "$LOCK")" || refuse "deployment lock directory is unavailable"
 # The re-exec hop after a self-replacing pull INHERITS fd 9 and the flock on it,
 # because exec keeps the process and its descriptors. It must not re-open fd 9:
 # doing so closes the inherited open file description, and the lock does not
@@ -240,12 +241,17 @@ fi
 exec > >(exec 9>&-; tee -a "$LOGFILE") 2>&1
 STARTED_AT="$(date +%s)"
 printf '{"running":true,"kind":"deploy-%s","started_at":%s,"last":null}\n' \
-  "$ENVIRONMENT" "$STARTED_AT" >"$STATUS"
+  "$ENVIRONMENT" "$STARTED_AT" >"$STATUS" || refuse "deployment status is not writable"
 # What actually went out, resolved once the working tree is final. Declared
 # before the EXIT trap so an early failure cannot trip `set -u` inside it.
 RELEASE_ID=""
 _cleanup() {
   local rc=$?
+  trap - EXIT
+  if [[ "$rc" != 0 ]]; then
+    if [[ "${DRAIN_ACQUIRED:-0}" = 1 ]]; then deployment_drain_abort || true; fi
+    if [[ "$MUTATED" = 1 ]]; then rc=1; else rc=4; fi
+  fi
   local finished_at release_json
   finished_at="$(date +%s)"
   # The revision rides inside "last": deploy_ops._read_status() drops unknown
@@ -257,27 +263,23 @@ _cleanup() {
   [[ -z "$RELEASE_ID" ]] || release_json="\"${RELEASE_ID//[^A-Za-z0-9._+@\/-]/_}\""
   printf '{"running":false,"kind":null,"started_at":null,"last":{"kind":"deploy-%s","rc":%s,"finished_at":%s,"release":%s}}\n' \
     "$ENVIRONMENT" "$rc" "$finished_at" "$release_json" >"$STATUS"
+  exit "$rc"
 }
 trap _cleanup EXIT
 
 env_value() {
   local key="$1"
-  python3 - "$GATEWAY_ENV" "$key" <<'PY'
+  env -i PATH=/usr/bin:/bin /usr/bin/python3 -I -S - \
+      "$REPO/Webservice/deploy" "$GATEWAY_ENV" "$ENVIRONMENT" "$key" <<'PY'
 from pathlib import Path
 import sys
-
-path, key = Path(sys.argv[1]), sys.argv[2]
-for raw in path.read_text(encoding="utf-8").splitlines():
-    line = raw.strip()
-    if not line or line.startswith("#") or "=" not in line:
-        continue
-    name, value = line.split("=", 1)
-    if name.strip() == key:
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        print(value)
-        break
+sys.path.insert(0, sys.argv[1])
+from gateway_preflight import load_deploy_environment
+try:
+    values = load_deploy_environment(Path(sys.argv[2]), sys.argv[3])
+    print(values.get(sys.argv[4], ""), end="")
+except (OSError, ValueError):
+    raise SystemExit("protected deployment configuration rejected") from None
 PY
 }
 with_pgpass() {
@@ -334,30 +336,22 @@ PY
 )"
   if [[ "$actual" != "$EXPECTED_DB" ]]; then
     echo "ERROR: $ENVIRONMENT gateway targets database '$actual', expected '$EXPECTED_DB'; refusing deployment" >&2
-    exit 1
+    refuse "database target does not match the selected environment"
   fi
   echo "    database isolation: $actual"
 }
 
 backup_database() {
-  command -v pg_dump >/dev/null 2>&1 \
-    || { echo "ERROR: pg_dump is required for the pre-deploy rollback point" >&2; exit 1; }
-  local backup_dir stamp final tmp
-  backup_dir="$DATA_ROOT/backups"
-  mkdir -p "$backup_dir"
-  chmod 700 "$backup_dir"
-  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  final="$backup_dir/pre-deploy-${ENVIRONMENT}-${stamp}.dump"
-  tmp="$final.tmp.$$"
-  umask 077
-  echo "=== [$(date -Iseconds)] pg_dump rollback point ($EXPECTED_DB) ==="
-  if ! with_pgpass "$DB_URL" pg_dump --no-password --format=custom --file="$tmp"; then
-    rm -f "$tmp"
-    echo "ERROR: pg_dump failed; deployment has not changed the database or service" >&2
-    exit 1
+  local gateway_python="${CHUDWARE_GATEWAY_PYTHON:-$REPO/Webservice/gateway/.venv/bin/python}"
+  [[ -x "$gateway_python" ]] \
+    || refuse "gateway Python is required for the encrypted pre-deploy recovery backup"
+  echo "=== [$(date -Iseconds)] encrypted pg_dump manual-recovery backup ($EXPECTED_DB) ==="
+  if ! CHUDWARE_DB_URL="$DB_URL" CHUDWARE_DEPLOY_ENV="$ENVIRONMENT" \
+      "$gateway_python" "$REPO/Webservice/deploy/backup_state.py" database \
+      --environment "$ENVIRONMENT" --data-root "$DATA_ROOT" --destination "$DATA_ROOT/backups"; then
+    echo "ERROR: encrypted backup failed; deployment has not changed the database or service" >&2
+    refuse "encrypted backup failed before deployment mutation"
   fi
-  mv "$tmp" "$final"
-  echo "    rollback dump: $final"
 }
 
 install_gateway_requirements() {
@@ -376,7 +370,16 @@ run_migrations() {
   echo "=== [$(date -Iseconds)] migrate $EXPECTED_DB ==="
   (
     cd "$REPO/Webservice/gateway"
-    CHUDWARE_DB_URL="$DB_URL" "$gateway_python" - <<'PY'
+    env -i HOME="$HOME" PATH=/usr/bin:/bin "$gateway_python" - \
+        "$REPO/Webservice/deploy" "$GATEWAY_ENV" "$ENVIRONMENT" <<'PY'
+from pathlib import Path
+import os
+import sys
+sys.path.insert(0, sys.argv[1])
+from gateway_preflight import load_deploy_environment
+values = load_deploy_environment(Path(sys.argv[2]), sys.argv[3])
+selected = {name: value for name, value in values.items() if name.startswith("CHUDWARE_")}
+os.environ.update(selected)
 import db
 
 try:
@@ -403,7 +406,6 @@ install_current_units() {
 enable_security_retention() {
   # Retention is operational hygiene, not a gateway availability dependency.
   # Surface failures in this deploy's journal/log but continue the gateway rollout.
-  systemctl --user disable --now chudware-security-retention.timer chudware-security-retention-staging.timer >/dev/null 2>&1 || true
   if ! systemctl --user enable --now "$RETENTION_UNIT" "$RETENTION_TIMER"; then
     echo "WARN: failed to enable retention for $ENVIRONMENT; expired security batches will not be purged" >&2
   fi
@@ -417,9 +419,7 @@ enable_release_retention() {
   # gateway. The admin route stays for a manual dry-run-then-confirm, but
   # nothing load-bearing may depend on somebody pressing it.
   #
-  # Both environments' timers are disabled first so a prod deploy cannot leave a
-  # staging timer running against the staging database, or the reverse.
-  systemctl --user disable --now chudware-release-retention.timer chudware-release-retention-staging.timer >/dev/null 2>&1 || true
+  # Enable only this environment; deploying staging never stops production timers.
   if ! systemctl --user enable --now "$RELEASE_RETENTION_UNIT" "$RELEASE_RETENTION_TIMER"; then
     echo "WARN: failed to enable release retention for $ENVIRONMENT; superseded beta artifacts will accumulate until the disk fills" >&2
   fi
@@ -446,88 +446,38 @@ assert_entitlement_credential() {
     staging) encrypted="$HOME/.config/credstore.encrypted/chudware-entitlement-staging.cred" ;;
   esac
   [[ -f "$encrypted" && -r "$encrypted" ]] \
-    || { echo "ERROR: encrypted entitlement credential is missing: $encrypted" >&2; exit 1; }
+    || refuse "encrypted entitlement credential is missing or unreadable"
   local mode
   mode="$(stat -c '%a' "$encrypted")"
-  [[ "$mode" = 600 ]] \
-    || { echo "ERROR: encrypted entitlement credential must have mode 600: $encrypted ($mode)" >&2; exit 1; }
+  [[ "$mode" = 600 && ! -L "$encrypted" && "$(stat -c '%u' "$encrypted")" = "$(id -u)" ]] \
+    || refuse "encrypted entitlement credential must be a protected owner-only regular file"
   if env_value CHUDWARE_ENTITLEMENT_KEY_PATH | grep -q .; then
     echo "ERROR: remove CHUDWARE_ENTITLEMENT_KEY_PATH from $GATEWAY_ENV; the systemd unit owns it" >&2
-    exit 1
+    refuse "plaintext entitlement key path is forbidden"
   fi
   echo "    entitlement credential: encrypted, mode 600"
 }
 
 
-post_deploy_health_assert() {
-  local base health_path me_path attempts health_email health_sid
-  local health_body health_code me_body me_code attempt
-  base="${CHUDWARE_DEPLOY_HEALTH_BASE_URL:-http://127.0.0.1:$GATEWAY_PORT}"
-  health_path="${CHUDWARE_DEPLOY_HEALTHZ_PATH:-/healthz}"
-  me_path="${CHUDWARE_DEPLOY_ME_PATH:-/api/me}"
-  attempts="${CHUDWARE_DEPLOY_HEALTH_ATTEMPTS:-30}"
-  [[ "$health_path" = /* && "$me_path" = /* ]] \
-    || { echo "ERROR: health paths must begin with /" >&2; return 1; }
-  [[ "$attempts" =~ ^[1-9][0-9]*$ ]] \
-    || { echo "ERROR: CHUDWARE_DEPLOY_HEALTH_ATTEMPTS must be a positive integer" >&2; return 1; }
-
-  health_email="$(env_value CHUDWARE_DEPLOY_HEALTH_EMAIL)"
-  if [[ -z "$health_email" ]]; then
-    health_email="$(with_pgpass "$DB_URL" psql --no-password -tAXq -v ON_ERROR_STOP=1 -c \
-      "SELECT email FROM accounts WHERE status='active' ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, email LIMIT 1")"
-  fi
-  [[ -n "$health_email" ]] \
-    || { echo "ERROR: no active $ENVIRONMENT account exists for authenticated /api/me health" >&2; return 1; }
-
-  health_sid="$(
-    cd "$REPO/Webservice/gateway"
-    CHUDWARE_DB_URL="$DB_URL" "$REPO/Webservice/gateway/.venv/bin/python" \
-      -c 'import authn, db, sys; rc = authn._cli(sys.argv[1:]); db.close_pool(); raise SystemExit(rc)' \
-      ops-session --email "$health_email" --ttl-seconds 300
-  )" || {
-    echo "ERROR: could not mint $ENVIRONMENT health session for $health_email" >&2
-    return 1
-  }
-  [[ -n "$health_sid" ]] \
-    || { echo "ERROR: health session was empty" >&2; return 1; }
-
-  health_body="$(mktemp)"
-  me_body="$(mktemp)"
-  for ((attempt = 1; attempt <= attempts; attempt++)); do
-    health_code="$(curl -sS --max-time 5 -o "$health_body" -w '%{http_code}' "$base$health_path" 2>/dev/null || true)"
-    me_code="$(curl -sS --max-time 5 -o "$me_body" -w '%{http_code}' \
-      --cookie "chudware_sid=$health_sid" "$base$me_path" 2>/dev/null || true)"
-    if [[ "$health_code" = 200 && "$me_code" = 200 ]] \
-        && HEALTH_FILE="$health_body" ME_FILE="$me_body" HEALTH_EMAIL="$health_email" python3 - <<'PY'
-import json
-import os
-from pathlib import Path
-
-health = json.loads(Path(os.environ["HEALTH_FILE"]).read_text())
-me = json.loads(Path(os.environ["ME_FILE"]).read_text())
-if health != {"ok": True} or me.get("email") != os.environ["HEALTH_EMAIL"]:
-    raise SystemExit(1)
-PY
-    then
-      rm -f "$health_body" "$me_body"
-      echo "    health asserted: $base$health_path=200, authenticated $base$me_path=200"
-      return 0
-    fi
-    sleep 1
-  done
-  echo "ERROR: post-deploy health assertion failed after $attempts attempts:" >&2
-  echo "       $base$health_path HTTP ${health_code:-000}" >&2
-  echo "       authenticated $base$me_path HTTP ${me_code:-000}" >&2
-  rm -f "$health_body" "$me_body"
-  return 1
+acquire_gateway_maintenance() {
+  deployment_drain_acquire \
+    || refuse "operator maintenance could not prove all work idle and every cell inactive; no cutover"
 }
+
 
 echo "=== chudware $ENVIRONMENT deploy start $(date -Iseconds) repo=$REPO ==="
 echo "    pull=$DO_PULL ref=${REF:-current} host=$DO_HOST engine=$DO_ENGINE webd=$DO_WEBD gateway=$DO_GATEWAY"
 
 # Everything in this block runs BEFORE the first change to production, so each
 # rejection here is a refusal (exit 4), not a part-way failure (exit 1).
-if [[ "$DO_GATEWAY" = 1 ]]; then
+if [[ "$DO_GATEWAY" = 1 || "$DO_WEBD" = 1 || "$DO_PULL" = 1 ]]; then
+  GATEWAY_PY="${CHUDWARE_GATEWAY_PYTHON:-$REPO/Webservice/gateway/.venv/bin/python}"
+  [[ "${CHUDWARE_DEPLOY_HEALTH_BASE_URL:-http://127.0.0.1:$GATEWAY_PORT}" = "http://127.0.0.1:$GATEWAY_PORT" ]] \
+    || refuse "authenticated health is restricted to the selected loopback gateway"
+  [[ -x "$GATEWAY_PY" ]] || refuse "gateway runtime is unavailable"
+  "$GATEWAY_PY" "$REPO/Webservice/deploy/gateway_preflight.py" validate \
+    --env-file "$GATEWAY_ENV" --environment "$ENVIRONMENT" \
+    || refuse "protected gateway configuration is not release-ready"
   [[ -r "$GATEWAY_ENV" ]] \
     || refuse "gateway environment is unreadable: $GATEWAY_ENV"
   DB_URL="$(env_value CHUDWARE_DB_URL)"
@@ -540,8 +490,53 @@ if [[ "$DO_GATEWAY" = 1 ]]; then
   esac
   assert_entitlement_credential
   assert_database_target
+fi
+if [[ "$DO_WEBD" = 1 ]]; then
+  [[ "${CHUDWARE_BASE_PYTHON:-}" = /usr/bin/python3 ]] \
+    || refuse "authenticated cell worker base runtime is required"
+  env -i PATH=/usr/bin:/bin /usr/bin/python3 -I -S \
+    "$REPO/Webservice/deploy/deployment_release.py" runtime-preflight \
+    --repo "$REPO" --wheelhouse "${CHUDWARE_WHEELHOUSE:-$REPO/wheelhouse}" \
+    || refuse "authenticated offline cell worker runtime inputs are unavailable"
+fi
+
+# Resolve the exact candidate without changing the canonical gateway checkout.
+if [[ "$DO_PULL" = 1 ]]; then
+  git fetch "$REMOTE" "$REF"
+  TARGET_COMMIT="$(git rev-parse 'FETCH_HEAD^{commit}')"
+else
+  TARGET_COMMIT="$(git rev-parse HEAD)"
+fi
+[[ "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ ]] || refuse "target commit is unresolved"
+[[ -z "${CHUDWARE_DEPLOY_TARGET_SHA:-}" || "$TARGET_COMMIT" = "$CHUDWARE_DEPLOY_TARGET_SHA" ]] \
+  || refuse "candidate no longer matches the independently gated commit"
+[[ -z "$(git status --porcelain)" ]] || refuse "working tree is dirty"
+AUTHORITY_ARGS=(promotion-preflight --web-home "${CHUDWARE_WEB_HOME:-$HOME/chudware-web}" \
+  --environment "$ENVIRONMENT" --target-commit "$TARGET_COMMIT")
+if [[ "$ENVIRONMENT" = staging ]]; then
+  AUTHORITY_ARGS=(promotion-preflight --web-home "${CHUDWARE_WEB_HOME:-$HOME/chudware-web-staging}" \
+    --environment "$ENVIRONMENT" --target-commit "$TARGET_COMMIT")
+fi
+[[ -z "$FIRST_CUTOVER_ACK" ]] || AUTHORITY_ARGS+=(--first-cutover-ack "$FIRST_CUTOVER_ACK")
+if [[ "$DO_GATEWAY" = 1 || "$DO_WEBD" = 1 || "$DO_HOST" = 1 || "$DO_PULL" = 1 ]]; then
+  env -i PATH=/usr/bin:/bin /usr/bin/python3 -I -S \
+    "$REPO/Webservice/deploy/deployment_release.py" "${AUTHORITY_ARGS[@]}" \
+    || refuse "rollback authority is unavailable for this exact candidate"
+fi
+if [[ "$DO_GATEWAY" = 1 || "$DO_WEBD" = 1 || "$DO_PULL" = 1 ]]; then
+  acquire_gateway_maintenance
+fi
+if [[ "$DO_GATEWAY" = 1 ]]; then
   backup_database
 fi
+
+# This marker is not release authority. It only prevents an automated native
+# rollback from pretending it restored canonical gateway files or database state.
+mark_gateway_mutation() {
+  MUTATED=1
+  printf 'manual_gateway_checkout_and_database_schema_recovery_required\n' \
+    > "$DATA_ROOT/logs/deploy-recovery-required"
+}
 
 if [[ "$DO_PULL" = 1 ]]; then
   echo "=== [$(date -Iseconds)] git fetch/pull $REMOTE $REF ==="
@@ -551,7 +546,8 @@ if [[ "$DO_PULL" = 1 ]]; then
     refuse "working tree dirty at $REPO — commit/stash before update.sh"
   fi
   BEFORE="$(git rev-parse --short HEAD)"
-  git pull --ff-only "$REMOTE" "$REF"
+  mark_gateway_mutation
+  git merge --ff-only "$TARGET_COMMIT"
   AFTER="$(git rev-parse --short HEAD)"
   echo "    HEAD $BEFORE -> $AFTER"
   if [[ "$BEFORE" != "$AFTER" ]]; then
@@ -588,11 +584,12 @@ if [[ "${CHUDWARE_DEPLOY_REEXECED:-0}" != 1 && -f "$SELF" ]]; then
     # --no-pull: the pull already happened and the tree is at the target ref.
     # Re-pulling would be harmless but re-checking a v* tag against a moving
     # remote is not, and it keeps the second hop's log honest about what it did.
-    exec bash "$SELF" "$ENVIRONMENT" "${ORIGINAL_ARGV[@]:1}" --no-pull
+    CHUDWARE_DEPLOY_MUTATED=1 exec bash "$SELF" "$ENVIRONMENT" "${ORIGINAL_ARGV[@]:1}" --no-pull
   fi
 fi
 
 RELEASE_ID="$(git rev-parse HEAD)"
+[[ "$RELEASE_ID" = "$TARGET_COMMIT" ]] || refuse "checkout does not match the qualified target"
 if [[ "$ENVIRONMENT" = prod ]]; then
   if [[ "$CONTINUOUS" = 1 ]]; then
     echo "    UNTAGGED CONTINUOUS DEPLOYMENT: promoting current $REF HEAD to production; no v* release tag gates this run"
@@ -611,6 +608,7 @@ fi
 
 if [[ "$DO_HOST" = 1 ]]; then
   echo "=== [$(date -Iseconds)] ./build.sh (host GUI) ==="
+  MUTATED=1
   ./build.sh
 fi
 
@@ -619,6 +617,7 @@ if [[ "$DO_ENGINE" = 1 ]]; then
   if [[ "$DO_WEBD" = 1 ]]; then
     [[ -f "$REPO/core/build-occt-linux/CMakeCache.txt" ]] \
       || { echo "ERROR: webd engine tree is not configured: core/build-occt-linux" >&2; exit 1; }
+    MUTATED=1
     echo "=== [$(date -Iseconds)] configure required webd PolyMesh backend ==="
     cmake -S core -B core/build-occt-linux -DCHUDWARE_WITH_POLYMESH=ON
   fi
@@ -632,12 +631,18 @@ if [[ "$DO_WEBD" = 1 ]]; then
   [[ "$DO_ENGINE" = 1 ]] \
     || { echo "ERROR: webd promotion requires the engine build in this update" >&2; exit 1; }
   echo "=== [$(date -Iseconds)] validate/promote joint hostd + WASM release ==="
+  INSTALL_ARGS=(--restart)
+  [[ -z "$FIRST_CUTOVER_ACK" ]] || INSTALL_ARGS+=(--first-cutover-ack "$FIRST_CUTOVER_ACK")
+  # The child may fail after changing native policy; conservatively unsafe from
+  # this boundary onward, even when the child itself can report a local refusal.
+  MUTATED=1
   CHUDWARE_WEBD_ARTIFACT_DIR="$ENGINE_ARTIFACT_DIR" \
-    CHUDWARE_WEBD_REQUIRE_IDLE=1 \
-    bash Webservice/deploy/install_webd.sh --restart
+    bash Webservice/deploy/install_webd.sh "${INSTALL_ARGS[@]}"
 fi
 
 if [[ "$DO_GATEWAY" = 1 ]]; then
+  deployment_drain_call check || refuse "maintenance lost authoritative inactive-cell proof"
+  mark_gateway_mutation
   install_gateway_requirements
   run_migrations
   install_current_units
@@ -651,7 +656,7 @@ if [[ "$DO_GATEWAY" = 1 ]]; then
     || { echo "ERROR: failed to restart $GATEWAY_UNIT" >&2; exit 1; }
   systemctl --user is-active --quiet "$GATEWAY_UNIT" \
     || { echo "ERROR: $GATEWAY_UNIT is not active after restart" >&2; exit 1; }
-  post_deploy_health_assert
 fi
+deployment_drain_complete || refuse "qualified cutover health/release failed; maintenance retained"
 
 echo "=== chudware $ENVIRONMENT deploy finished ok $(date -Iseconds) ==="

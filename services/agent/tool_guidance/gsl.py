@@ -34,9 +34,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "sketch_health": {
         "prompt_note": (
-            "Verify step after every sketch edit: apply the schedule in "
-            "order (relations first, then driving dimensions) and re-run "
-            "until status is 'full'."
+            "Apply relations then driving dimensions; sketch_fully_define handles residual "
+            "freedom. Require dof 0 and not pinned_only, not merely status='full'. "
+            "Read findings for pins, missing driving dimensions and origin/model references."
         ),
     },
     "sketch_auto_constrain": {
@@ -44,6 +44,13 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Auto-runs after sketch edits (sketch.auto_coincident, default "
             "ON) — call explicitly only to preview (apply=False) or "
             "re-stitch with a looser tol_mm."
+        ),
+    },
+    "sketch_fully_define": {
+        "prompt_note": (
+            "After explicit design-intent relations/critical dimensions, define residual "
+            "DOF without fix pins. anchor='origin'|'none'; entities optionally limits scope. "
+            "Inspect exact added counts and remaining DOF; check_sketch must not be pinned_only."
         ),
     },
     "describe_scene": {

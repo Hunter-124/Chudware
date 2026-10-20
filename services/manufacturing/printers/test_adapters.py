@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import io
 import json
 import logging
+import socket
+import ssl
 
 import pytest
 
@@ -18,6 +21,8 @@ from services.manufacturing.printers import (
     PrusaLinkAdapter,
 )
 from services.manufacturing.printers.model import Redactor
+from services.manufacturing.printers import http_client
+from services.manufacturing.printers.model import _address_class
 from services.manufacturing.printers.websocket import JsonWebSocket
 
 
@@ -29,8 +34,150 @@ def config(server: VirtualPrinter, auth: AuthConfig | None = None) -> EndpointCo
         origin="live",
         timeout_s=0.5,
         telemetry_ttl_ms=1_000,
+        address_class="loopback",
     )
 
+
+@pytest.mark.parametrize(('address', 'expected'), [
+    ('127.0.0.1', 'loopback'), ('10.0.0.1', 'local'), ('172.16.0.1', 'local'),
+    ('192.168.0.1', 'local'), ('169.254.1.1', 'local'), ('8.8.8.8', 'public'),
+    ('0.1.2.3', 'invalid'), ('224.0.0.1', 'invalid'), ('255.255.255.255', 'invalid'),
+    ('::', 'invalid'), ('::1', 'loopback'), ('ff02::1', 'invalid'),
+    ('fc00::1', 'local'), ('fe80::1', 'local'), ('2001:4860:4860::8888', 'public'),
+    ('::ffff:127.0.0.1', 'loopback'), ('::ffff:192.168.1.1', 'local'),
+    ('::ffff:224.0.0.1', 'invalid'),
+])
+def test_http_address_classes_match_native_transport(address, expected):
+    assert _address_class(address) == expected
+
+
+def test_dns_endpoints_require_commissioned_class():
+    with pytest.raises(ConfigurationError, match='requires address_class'):
+        EndpointConfig('http://printer.example', AuthConfig('trusted_host'), False)
+    with pytest.raises(ConfigurationError, match='requires address_class'):
+        http_client.HttpClient('http://printer.example', AuthConfig('trusted_host'), 1)
+    with pytest.raises(ConfigurationError, match='does not match'):
+        EndpointConfig('http://127.0.0.1', AuthConfig('trusted_host'), False, address_class='public')
+
+
+class _HttpSocket:
+    def __init__(self, connections, traffic):
+        self.connections = connections
+        self.traffic = traffic
+        self.closed = False
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def setsockopt(self, *args):
+        pass
+
+    def connect(self, sockaddr):
+        self.connections.append(sockaddr)
+
+    def sendall(self, data):
+        self.traffic.append(data)
+
+    def makefile(self, *args):
+        return io.BytesIO(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}')
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize('secure', [False, True])
+def test_http_pins_authorized_socket_retains_hostname_and_rechecks_dns(monkeypatch, secure):
+    connections, traffic, lookups, sni = [], [], [], []
+    answers = iter(['192.168.1.20', '127.0.0.1'])
+
+    def resolve(host, port, *args):
+        lookups.append((host, port))
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', (next(answers), port))]
+
+    monkeypatch.setattr(socket, 'getaddrinfo', resolve)
+    monkeypatch.setattr(socket, 'socket', lambda *args: _HttpSocket(connections, traffic))
+    monkeypatch.setenv('http_proxy', 'http://forbidden-proxy.invalid:8080')
+    monkeypatch.setenv('https_proxy', 'http://forbidden-proxy.invalid:8080')
+    scheme = 'https' if secure else 'http'
+    client = http_client.HttpClient(f'{scheme}://printer.example', AuthConfig('trusted_host'), 1,
+                                  address_class='local')
+    if secure:
+        context = ssl.create_default_context()
+
+        def wrap(raw, *, server_hostname):
+            sni.append(server_hostname)
+            return raw
+
+        monkeypatch.setattr(context, 'wrap_socket', wrap)
+        for handler in client._opener.handlers:
+            if isinstance(handler, http_client._PinnedHTTPSHandler):
+                handler._context = context
+    assert client.request_json('GET', '/status') == {}
+    assert connections == [('192.168.1.20', 443 if secure else 80)]
+    assert b'Host: printer.example\r\n' in b''.join(traffic)
+    assert sni == (['printer.example'] if secure else [])
+    with pytest.raises(ProtocolError) as refused:
+        client.request_json('GET', '/status')
+    assert refused.value.reason_code == 'address_refused'
+    assert len(lookups) == 2
+    assert len(connections) == 1
+
+
+def test_http_mixed_dns_answers_refuse_before_socket_creation(monkeypatch):
+    monkeypatch.setattr(socket, 'getaddrinfo', lambda host, port, *args: [
+        (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', (address, port))
+        for address in ('192.168.1.20', '8.8.8.8')])
+    monkeypatch.setattr(socket, 'socket', lambda *args: pytest.fail('unauthorized DNS reached socket creation'))
+    client = http_client.HttpClient('http://printer.example', AuthConfig('trusted_host'), 1,
+                                  address_class='local')
+    with pytest.raises(ProtocolError) as refused:
+        client.request('GET', '/status')
+    assert refused.value.reason_code == 'address_refused'
+
+
+def test_http_request_cannot_leave_commissioned_origin(monkeypatch):
+    monkeypatch.setattr(socket, 'getaddrinfo', lambda *args: pytest.fail('foreign request reached DNS'))
+    client = http_client.HttpClient('http://printer.example', AuthConfig('trusted_host'), 1,
+                                  address_class='local')
+    with pytest.raises(ProtocolError) as refused:
+        client.request('GET', 'https://other.example/status')
+    assert refused.value.reason_code == 'address_refused'
+
+
+
+def test_authorized_connect_retries_exact_numeric_addresses_and_closes_failed_socket(monkeypatch):
+    connections, traffic, sockets = [], [], []
+    addresses = [('192.168.1.20', 80), ('192.168.1.21', 80)]
+    monkeypatch.setattr(socket, 'getaddrinfo', lambda *args: [
+        (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', address) for address in addresses])
+
+    def make_socket(*args):
+        raw = _HttpSocket(connections, traffic)
+        if not sockets:
+            def fail(address):
+                connections.append(address)
+                raise ConnectionRefusedError('fixture refusal')
+            raw.connect = fail
+        sockets.append(raw)
+        return raw
+
+    monkeypatch.setattr(socket, 'socket', make_socket)
+    client = http_client.HttpClient('http://printer.example', AuthConfig('trusted_host'), 1,
+                                  address_class='local')
+    assert client.request_json('GET', '/status') == {}
+    assert connections == addresses
+    assert sockets[0].closed
+
+
+def test_websocket_upgrade_rejects_rebound_dns_before_sending_credentials(monkeypatch):
+    monkeypatch.setattr(socket, 'getaddrinfo', lambda host, port, *args: [
+        (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', ('127.0.0.1', port))])
+    monkeypatch.setattr(socket, 'socket', lambda *args: pytest.fail('rebound websocket created socket'))
+    websocket = JsonWebSocket('http://printer.example', '/websocket', {'X-Api-Key': 'secret'},
+                              1, Redactor(), address_class='local')
+    with pytest.raises(ProtocolError) as refused:
+        websocket.__enter__()
+    assert refused.value.reason_code == 'address_refused'
 
 def by_field(rows: list[dict[str, object]]) -> dict[str, dict[str, object]]:
     return {str(row["field"]): row for row in rows}
@@ -201,7 +348,7 @@ def test_octoprint_rejects_vendor_supplied_path_traversal() -> None:
 
 
 def test_websocket_rejects_interleaved_data_and_excessive_continuations() -> None:
-    websocket = JsonWebSocket("http://localhost", "/websocket", {}, 0.1, Redactor())
+    websocket = JsonWebSocket("http://localhost", "/websocket", {}, 0.1, Redactor(), address_class="loopback")
     interleaved = iter([(False, 0x1, b"{"), (True, 0x1, b"{}")])
     websocket._recv_frame = lambda: next(interleaved)  # type: ignore[method-assign]
     with pytest.raises(ProtocolError, match="interleaved"):

@@ -54,6 +54,7 @@
 #include "../../services/ipc/ipc_client.h"
 #include "../../services/ipc/ipc_discovery.h"
 #include "../../services/ipc/ipc_transport.h"
+#include "../../services/ipc/ipc_private.h"
 #include "../../services/worker/cpp_core.h"
 #include "api/chudware_version.h"  // CHUDWARE_VERSION_LINE (generated, <build>/generated)
 #include "autosave.h"
@@ -275,10 +276,8 @@ static int stopViaPidfile(const std::string& reason) {
     return 0;
 }
 #else
-// The Windows instance lock is a named MUTEX (ipc_discovery_win.cpp lockPath) — a
-// kernel object with no PID inside it, so there is no POSIX-style lock file to read
-// a pid back out of. --stop's pipe-dead escalation still needs one, so the daemon
-// drops a tiny side file in its state dir once it wins the single-instance claim.
+// The Windows singleton owns an exclusive private file handle. A separate PID
+// hint supports --stop's pipe-dead escalation without opening that claimed file.
 // The file is ADVISORY only: every reader re-validates the pid against a live
 // chudware-hostd.exe image before touching it, so a file orphaned by a crash — or a
 // pid Windows has since recycled onto an unrelated process — can never make us kill
@@ -473,6 +472,38 @@ int main(int argc, char** argv) {
     // The gate that matters guards the daemon path below — the one that loads
     // libchudware — and it still runs unconditionally there.
     std::string mode = argc > 1 ? argv[1] : "";
+    const bool cell = mode == "--cell";
+    int gatewayFd = -1;
+    std::string cellState, cellWork;
+    if (cell) {
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
+        std::fprintf(stderr, "chudware-hostd: tenant cells require POSIX socket activation\n");
+        return 2;
+#else
+        for (int i = 2; i < argc; ++i) {
+            const std::string option = argv[i];
+            if (i + 1 == argc) return 2;
+            const std::string value = argv[++i];
+            if (option == "--gateway-listen-fd") {
+                char* end = nullptr;
+                const long fd = std::strtol(value.c_str(), &end, 10);
+                if (!end || *end || fd < 3 || fd > 2147483647) return 2;
+                gatewayFd = static_cast<int>(fd);
+            } else if (option == "--cell-state") cellState = value;
+            else if (option == "--cell-work") cellWork = value;
+            else return 2;
+        }
+        if (gatewayFd < 3 || !std::filesystem::path(cellState).is_absolute() ||
+            !std::filesystem::path(cellWork).is_absolute() ||
+            !std::filesystem::is_directory(cellWork) || !chudware_ipc::privateDir(cellState)) {
+            std::fprintf(stderr, "chudware-hostd: cell requires gateway fd and absolute state/work directories\n");
+            return 2;
+        }
+        // Trusted launch configuration, established before engine loading or requests.
+        if (::setenv("CHUDWARE_NATIVE_ROOT", cellWork.c_str(), 1) != 0 ||
+            ::setenv("CHUDWARE_CELL_STATE", cellState.c_str(), 1) != 0) return 1;
+#endif
+    }
     if (mode == "--version") {
         // ONE line, "chudware-hostd <build-id>", and it must stay that way: two
         // independent staleness checks parse this output and disagree about where
@@ -504,9 +535,10 @@ int main(int argc, char** argv) {
         return controlCommand("daemon_drain", {{"force", force}},
                               /*stopEscalation=*/true);
     }
-    if (!mode.empty() && mode != "--foreground") {
+    if (!mode.empty() && mode != "--foreground" && !cell) {
         std::fprintf(stderr,
-                     "usage: chudware-hostd [--foreground|--status|--stop [--force]|--version]\n");
+                     "usage: chudware-hostd [--foreground|--status|--stop [--force]|--version]\n"
+                     "       chudware-hostd --cell --gateway-listen-fd N --cell-state DIR --cell-work DIR\n");
         return 2;
     }
 
@@ -521,15 +553,20 @@ int main(int argc, char** argv) {
     }
 
     const std::string self = selfPath();
-    const std::string key = chudware_ipc::instanceKey(self);
-    const std::string lock = chudware_ipc::lockPath(key);
-    const std::string sock = chudware_ipc::socketPath(key);
+    const std::string state = cell ? cellState : chudware_ipc::stateDir();
+    if (state.empty()) {
+        std::fprintf(stderr, "chudware-hostd: no owner-private state directory\n");
+        return 1;
+    }
+    const std::string key = cell ? "cell" : chudware_ipc::instanceKey(self);
+    const std::string lock = cell ? state + "/hostd.lock" : chudware_ipc::lockPath(key);
+    const std::string sock = cell ? state + "/gateway-inherited" : chudware_ipc::socketPath(key);
     if (lock.empty() || sock.empty()) {
         std::fprintf(stderr, "chudware-hostd: no usable runtime dir\n");
         return 1;
     }
 
-    hostd::log().open(chudware_ipc::stateDir() + "/logs");
+    hostd::log().open(state + "/logs");
 
     // 1. Single instance. Losing the race is SUCCESS for a spawn-on-demand
     //    daemon: the winner serves everyone; exit 0 so the spawner's retry
@@ -537,6 +574,10 @@ int main(int argc, char** argv) {
     chudware_ipc::SingleInstance instance;
     std::string err;
     if (!instance.acquire(lock, err)) {
+        if (cell) {
+            std::fprintf(stderr, "chudware-hostd: cell lock unavailable: %s\n", err.c_str());
+            return 1;
+        }
         // T-PERF10: spawn-loser flock-wait. The incumbent may be mid-drain with
         // the sock still up (or briefly gone). Poll for either a live sock
         // (client will reconnect) or a freed lock we can claim — up to ~5 s —
@@ -568,7 +609,7 @@ int main(int argc, char** argv) {
     // scratch pytest instances) leave hostd-*.sock/.lock pairs behind forever —
     // the flock died with the process, so a non-blocking acquire tells us the
     // owner is gone and the pair is garbage. Own key is skipped (we hold it).
-    {
+    if (!cell) {
         namespace fs = std::filesystem;
         const std::string dir = fs::path(sock).parent_path().string();
         std::error_code ec;
@@ -590,7 +631,7 @@ int main(int argc, char** argv) {
 #endif
 
 #ifdef _WIN32
-    // 1b (Windows). We now own the instance mutex, so record our pid for --stop's
+    // 1b (Windows). We now hold the exclusive instance lock file, so record our pid for --stop's
     // pipe-dead escalation (stopViaPidfile). Only the winner writes it, so the file
     // always names the daemon that actually holds the name. No stale-file sweep is
     // needed here: the reader validates the pid against a live chudware-hostd.exe
@@ -601,14 +642,25 @@ int main(int argc, char** argv) {
 
     // 2. Bind before engine load.
     chudware_ipc::IpcListener listener;
-    if (!listener.listen(sock, err)) {
+    if (!(cell ? listener.adoptListeningFd(gatewayFd, err) : listener.listen(sock, err))) {
         hostd::log().line("listen failed: %s", err.c_str());
         std::fprintf(stderr, "chudware-hostd: %s\n", err.c_str());
         return 1;
     }
 
     hostd::Server server(std::move(listener), CHUDWARE_HOSTD_BUILD_ID);
-    server.children().setLogDir(chudware_ipc::stateDir() + "/logs");
+    if (cell) {
+        std::string policy = "/opt/chudware/contracts/cell_methods.json";
+#ifdef CHUDWARE_DEVELOPER_BUILD
+        if (const char* overridePath = std::getenv("CHUDWARE_CELL_METHODS_FILE");
+            overridePath && *overridePath) policy = overridePath;
+#endif
+        if (!server.configureCell(cellState, cellWork, policy, err)) {
+            std::fprintf(stderr, "chudware-hostd: cell configuration failed: %s\n", err.c_str());
+            return 1;
+        }
+    }
+    server.children().setLogDir(state + "/logs");
     server.setSelfBinary(self);  // stale-binary self-drain watches this + libchudware
     g_server = &server;
 #ifdef _WIN32
@@ -639,9 +691,19 @@ int main(int argc, char** argv) {
     });
 
     // 3. Load the engine asynchronously (many seconds for OCCT).
-    std::thread loader([&server] {
+    std::thread loader([&server, cell] {
         std::string lerr;
         if (core::cpp_core().ensureLoaded(lerr)) {
+            if (!server.installCacheRefreshSink()) {
+                if (cell) {
+                    server.status().engineErr = "cell engine lacks cache refresh publication export";
+                    server.status().engineState = 2;
+                    hostd::log().line("%s", server.status().engineErr.c_str());
+                    server.stop();
+                    return;
+                }
+                hostd::log().line("engine has no asynchronous cache refresh publication export");
+            }
             server.status().engineState = 1;
             hostd::log().line("engine loaded, abi=%s",
                               core::cpp_core().abiVersion().c_str());
@@ -655,7 +717,15 @@ int main(int argc, char** argv) {
     // 4. Autosave scheduler + prior-session recovery (Phase 3). Keyed by
     //    instance so scratch/test daemons never touch the real one's sessions.
     hostd::Autosave autosave;
-    autosave.start(chudware_ipc::stateDir() + "/hostd_autosave/" + key,
+    if (!chudware_ipc::privateDir(state + "/hostd_autosave")) {
+        hostd::log().line("cannot secure autosave directory");
+        trayTickerStop.store(true);
+        if (trayTicker.joinable()) trayTicker.join();
+        hostd::trayStop();
+        loader.join();
+        return 1;
+    }
+    autosave.start(state + "/hostd_autosave/" + key,
                    &server.status().engineState);
     server.setAutosave(&autosave);
 
@@ -693,5 +763,5 @@ int main(int argc, char** argv) {
     removePidFile(pidFile);
 #endif
     hostd::log().line("hostd exiting");
-    return 0;
+    return cell && server.status().engineState == 2 ? 1 : 0;
 }

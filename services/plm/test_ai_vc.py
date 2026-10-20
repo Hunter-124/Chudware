@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -811,6 +812,36 @@ def test_rollback_preflight_detects_external_modification(store, tmp_path):
     assert pf3["file"]["provenance_known"] is True  # hash was recorded
 
 
+def test_rollback_preflight_ignores_rewritten_build_state(store, tmp_path):
+    """A container whose derived build state was rewritten (doc_open saving a
+    rebuild, contracts/stepplus.md §17) is not externally modified; an edit to
+    an authored member still is."""
+    f = tmp_path / "Bracket.step+"
+
+    def write(document: bytes, cache: bytes) -> None:
+        with zipfile.ZipFile(f, "w") as zf:
+            zf.writestr("meta.json", b'{"container": "aicad.step+/1"}')
+            zf.writestr("document.json", document)
+            zf.writestr("cache.json", cache)
+            zf.writestr("geometry.step", cache)
+
+    write(b'{"features": []}', b"stale-engine")
+    ai_vc.stamp_authored("fp6", "agent")
+    r0 = store.checkpoint("fp6", _part(4), turn_id=1, op_batch={"n": 1},
+                          kind="prompt", msg_idx=1, label="one", doc_file=str(f))
+    store.checkpoint("fp6", _part(4, wall=2.0), turn_id=2, op_batch={"n": 2},
+                     kind="prompt", msg_idx=2, label="two", doc_file=str(f))
+
+    write(b'{"features": []}', b"current-engine-build")
+    pf = ai_vc.plm_rollback_check("fp6", r0["id"], store=store)
+    assert pf["file"]["recorded_sha256"] != pf["file"]["current_sha256"]
+    assert pf["file"]["externally_modified"] is False
+
+    write(b'{"features": [{"id": "f1"}]}', b"current-engine-build")
+    pf = ai_vc.plm_rollback_check("fp6", r0["id"], store=store)
+    assert pf["file"]["externally_modified"] is True
+
+
 def test_rollback_preflight_unknown_provenance_for_old_records(store, tmp_path):
     """Old checkpoints (no recorded file hash): say provenance is unknown,
     never claim the file is unmodified — even when a path is supplied."""
@@ -906,6 +937,28 @@ def test_branch_bound_policy_timeline_and_rollback(tmp_path, monkeypatch):
         assert [c["id"] for c in restored_tl["checkpoints"]] == [first["id"]]
     finally:
         vault.close()
+
+
+def test_request_bound_history_root_does_not_use_ambient_project(tmp_path, monkeypatch):
+    from services.agent.request_context import bind_roots
+    from services.plm.vault import Vault
+
+    ambient = tmp_path / "ambient"
+    selected = tmp_path / "selected"
+    ambient.mkdir()
+    selected.mkdir()
+    for project in (ambient, selected):
+        Vault.open(project).close()
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(ambient))
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(ambient))
+    ambient_store = ai_vc.resolve_store()
+    with bind_roots(str(selected)):
+        selected_store = ai_vc.resolve_store()
+        selected_store.checkpoint("request-doc", _part(2), turn_id=1, op_batch={"n": 1})
+        assert selected_store.root.is_relative_to(selected)
+        assert selected_store.timeline("request-doc")["checkpoints"]
+        assert not ambient_store.timeline("request-doc")["checkpoints"]
+    assert ai_vc.resolve_store().root == ambient_store.root
 
 
 def test_parent_legacy_and_post_rollback_fork(store):

@@ -8,24 +8,33 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
+from services.agent.request_context import bind_roots, cell_path, in_cell
 
 
 # Host-call threads bind a caller-owned provider factory, never credential bytes in
 # tool arguments or a process-global actor. A bounded planner retains its provider.
 _HELPER_RUNTIME: ContextVar[Any] = ContextVar("chudware_helper_runtime", default=None)
+_TOOL_SESSION_ID: ContextVar[str | None] = ContextVar("chudware_tool_session_id", default=None)
 
 
 def current_helper_runtime() -> Any:
     return _HELPER_RUNTIME.get()
 
 
+def current_tool_session_id() -> str | None:
+    """Owning live conversation for this host call, never a model tool argument."""
+    return _TOOL_SESSION_ID.get()
+
+
 @contextmanager
-def bind_helper_runtime(runtime: Any) -> Iterator[None]:
+def bind_helper_runtime(runtime: Any, *, session_id: str | None = None) -> Iterator[None]:
     token = _HELPER_RUNTIME.set(runtime)
+    session_token = _TOOL_SESSION_ID.set(session_id)
     try:
         yield
     finally:
         _HELPER_RUNTIME.reset(token)
+        _TOOL_SESSION_ID.reset(session_token)
 
 
 def resolve_workspace(raw_params: Mapping[str, Any]) -> tuple[str, str, str | None]:
@@ -36,18 +45,12 @@ def resolve_workspace(raw_params: Mapping[str, Any]) -> tuple[str, str, str | No
     if not isinstance(raw_workspace, str) or not raw_workspace.strip():
         return "", "", "invalid_workspace: workspace_dir must be a non-empty directory"
     try:
-        from services.agent.project_context import resolve_project_root
-
-        candidate = Path(raw_workspace).expanduser().resolve()
+        candidate = cell_path(raw_workspace) if in_cell() else Path(raw_workspace).expanduser().resolve()
         if not candidate.is_dir():
             return "", "", f"invalid_workspace: not an existing directory: {candidate}"
-        root = Path(resolve_project_root(candidate)).expanduser().resolve()
-        if not root.is_dir():
-            return "", "", (
-                "invalid_workspace: resolved project root is not a directory: "
-                f"{root}"
-            )
-        return str(root), str(candidate), None
+        # The selected directory is authoritative, including inside another
+        # project. Ancestor discovery would silently widen tool/save scope.
+        return str(candidate), str(candidate), None
     except Exception as exc:  # noqa: BLE001 - invalid workspace is an RPC refusal
         return "", "", f"invalid_workspace: {type(exc).__name__}: {exc}"
 
@@ -199,36 +202,13 @@ def resolve_settings(
 def activate_turn_env(
     project_root: str, save_dir: str, config_module: Any
 ) -> Iterator[list[str]]:
-    """Restore cwd, workspace variables and run-scoped credentials even on failure.
-
-    The yielded error list records failures while restoring state; callers retain
-    their response finalization policy (a cleanup failure must not be hidden).
-    """
-    previous_cwd = os.getcwd()
-    keys = ("CHUDWARE_FS_ROOT", "CHUDWARE_PROJECT_DIR", "CHUDWARE_PROJECT_SAVE_DIR")
-    previous_env = {key: os.environ.get(key) for key in keys}
+    """Bind explicit roots without mutating the worker's cwd or environment."""
     errors: list[str] = []
     try:
-        if project_root:
-            os.chdir(project_root)
-            os.environ["CHUDWARE_FS_ROOT"] = project_root
-            os.environ["CHUDWARE_PROJECT_DIR"] = project_root
-            os.environ["CHUDWARE_PROJECT_SAVE_DIR"] = save_dir
-        yield errors
+        with bind_roots(project_root, save_dir):
+            yield errors
     finally:
         try:
             config_module.clear_pooled_credentials()
         except Exception as exc:  # noqa: BLE001 - attempt all remaining restores
             errors.append(f"credential_reset: {type(exc).__name__}: {exc}")
-        try:
-            os.chdir(previous_cwd)
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"cwd_restore: {type(exc).__name__}: {exc}")
-        for key, value in previous_env.items():
-            try:
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"env_restore[{key}]: {type(exc).__name__}: {exc}")

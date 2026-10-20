@@ -379,6 +379,155 @@ def test_ambiguous_caller_measure_ref_still_fails(monkeypatch):
     assert "matched multiple elements" in result["findings"][0]["detail"]
 
 
+def _probe_face(sid, z, normal, body=None, **extra):
+    face = {"sid": sid, "kind": "face", "surf": "plane",
+            "centroid": [0, 0, z], "normal": [0, 0, normal], **extra}
+    if body is not None:
+        face["body"] = body
+    return face
+
+
+def _measure_battery_engine(monkeypatch, faces, measurement=None):
+    """Run battery -> real measure_between adapter -> fake native boundary."""
+    from mcp.server.fastmcp import FastMCP
+    from services.mcp import cad_eval_tools, core_bridge
+    from services.verify import battery as bat
+
+    calls = []
+
+    def engine(method, args):
+        if method == "doc_tree":
+            return {"tree": {"features": [{"id": "f1", "type": "box"}]}}
+        if method == "doc_list":
+            return {"docs": [{"doc_id": "part", "name": "part"}]}
+        if method == "doc_query":
+            assert args["query"] == {"of": "face"}  # uncapped, all owners
+            return {"matches": faces}
+        if method == "eval_measure":
+            calls.append(args["refs"])
+            return measurement if measurement is not None else {"distance": 10.0}
+        raise AssertionError(f"unexpected engine call: {method}")
+
+    monkeypatch.setattr(core_bridge, "call", engine)
+    monkeypatch.setattr(core_bridge, "consume_foreign_edits", lambda: [])
+    mcp = FastMCP("battery-measure-consumer")
+    cad_eval_tools.register_cad_eval_tools(mcp)
+    monkeypatch.setattr(bat, "_get_fn", lambda module, name:
+                        mcp._tool_manager._tools[name].fn)
+    return calls
+
+
+def test_automatic_probe_keeps_body_provenance_for_repeated_sids(monkeypatch):
+    from services.verify import battery as bat
+
+    faces = [_probe_face("Fabc123", 10, 1, body=1),
+             _probe_face("Fdef456", 0, -1, body=1),
+             _probe_face("Fabc123", 10, 1, body=2),
+             _probe_face("Fdef456", 0, -1, body=2)]
+    calls = _measure_battery_engine(monkeypatch, faces)
+    result = bat.verify("part", ["measure_between"])
+
+    assert result["scores"] == {"measure_between": 1.0}
+    [refs] = calls
+    assert {ref["sid"] for ref in refs} == {"Fabc123", "Fdef456"}
+    assert len({ref["body_id"] for ref in refs}) == 1
+    assert all("selector" not in ref for ref in refs)  # world-space readbacks
+
+
+def test_automatic_probe_accepts_globally_unique_world_readbacks(monkeypatch):
+    from services.verify import battery as bat
+
+    calls = _measure_battery_engine(monkeypatch, [
+        _probe_face("Fabc123", 10, 1, component="instance-a"),
+        _probe_face("Fdef456", 0, -1, component="instance-a"),
+    ])
+    result = bat.verify("part", ["measure_between"])
+    assert result["scores"] == {"measure_between": 1.0}
+    assert calls == [[{"sid": "Fabc123"}, {"sid": "Fdef456"}]]
+
+
+@pytest.mark.parametrize("faces", [
+    [],
+    [{"side": "top"}, {"side": "bottom"}],
+    [_probe_face("Fabc123", 10, 1), _probe_face("Fabc123", 10, 1),
+     _probe_face("Fdef456", 0, -1), _probe_face("Fdef456", 0, -1)],
+    [_probe_face("Fabc123", 10, 1, body=1),
+     _probe_face("Fabc123", 10, 1, body=1),
+     _probe_face("Fdef456", 0, -1, body=1)],
+    [_probe_face("Fabc123", 10, 1, component="instance-a"),
+     _probe_face("Fabc123", 10, 1, component="instance-b"),
+     _probe_face("Fdef456", 0, -1, component="instance-a"),
+     _probe_face("Fdef456", 0, -1, component="instance-b")],
+    [_probe_face("Fabc123", 0, 1), _probe_face("Fdef456", 0, -1)],
+])
+def test_automatic_probe_skips_unsupported_topology_without_measuring(monkeypatch, faces):
+    from services.verify import battery as bat
+
+    calls = _measure_battery_engine(monkeypatch, faces)
+    result = bat.verify("part", ["measure_between"])
+
+    assert calls == []
+    assert result["scores"] == {}
+    assert result["skipped"] == ["measure_between"]
+    [finding] = result["findings"]
+    assert finding["not_evaluated"] is True
+    assert finding["reason"] == "probe_ref_unsupported"
+
+
+@pytest.mark.parametrize("a_ref,b_ref", [
+    ({"sid": "Fabc123", "body_id": 2}, {"sid": "Fdef456", "body_id": 2}),
+    ("Fabc123", "Fdef456"),
+    ("f1", "outer cylindrical face"),
+    ("top of component-a", "bottom of component-b"),
+    ({"of": "face", "side": "top"}, "bottom"),
+    ("", {}),
+])
+def test_explicit_measure_endpoints_are_never_replaced(monkeypatch, a_ref, b_ref):
+    from services.verify import battery as bat
+
+    monkeypatch.setattr(bat, "_study_only_kinds", lambda doc_id: [])
+    # Inspect what the battery actually dispatches, including invalid caller refs.
+    def measure(a_query=None, b_query=None, doc_id=None):
+        assert a_query == a_ref
+        assert b_query == b_ref
+        return json.dumps({"ok": False, "error": "explicit selector refused"})
+    monkeypatch.setattr(bat, "_get_fn", lambda module, name: measure)
+    result = bat.verify("part", ["measure_between"], a_query=a_ref, b_query=b_ref)
+    assert result["scores"] == {"measure_between": 0.0}
+    assert result["skipped"] == []
+
+
+def test_partial_explicit_ambiguous_probe_is_still_a_failure(monkeypatch):
+    from services.verify import battery as bat
+
+    seen = []
+    monkeypatch.setattr(bat, "_study_only_kinds", lambda doc_id: [])
+    monkeypatch.setattr(bat, "_derive_measure_face_pair", lambda doc_id:
+                        ({"sid": "Fabc123"}, {"sid": "Fdef456"}))
+    monkeypatch.setattr(bat, "_get_fn", lambda module, name:
+                        _ambiguous_measure_between(seen))
+    result = bat.verify("part", ["measure_between"], a_query={"of": "face"})
+    assert seen == [({"of": "face"}, {"sid": "Fdef456"})]
+    assert result["scores"] == {"measure_between": 0.0}
+    assert result["skipped"] == []
+
+
+@pytest.mark.parametrize("measurement", [
+    {}, {"distance": None}, {"distance": float("nan")},
+    {"distance": float("inf")}, {"distance": True},
+])
+def test_measurement_without_finite_evidence_cannot_pass(monkeypatch, measurement):
+    from services.verify import battery as bat
+
+    _measure_battery_engine(monkeypatch, [], measurement=measurement)
+    result = bat.verify("part", ["measure_between"],
+                        a_query={"sid": "Fabc123"}, b_query={"sid": "Fdef456"})
+    assert result["scores"] == {"measure_between": 0.0}
+    assert result["findings"][0]["ok"] is False
+
+
+
+
 def test_verify_findings_deterministic(monkeypatch):
     """Findings list (not just scores) is identical across repeated runs."""
     import services.verify.battery as bat
@@ -710,16 +859,16 @@ def test_adapt_check_sketch_skip_when_no_sketches(monkeypatch):
 
 
 def test_adapt_check_sketch_runs_with_derived_id(monkeypatch):
-    """check_sketch derives sketch id from doc and scores real path."""
+    """check_sketch derives every sketch id and scores the complete document."""
     from services.verify import battery as bat
     import json
 
-    seen = {}
+    seen = []
 
     def _fn(sketch, doc_id=None):
-        seen["sketch"] = sketch
-        seen["doc_id"] = doc_id
-        return json.dumps({"ok": True, "dof": 0, "status": "full"})
+        seen.append((sketch, doc_id))
+        return json.dumps({"ok": True, "dof": 0, "status": "full",
+                           "fully_defined": True, "pinned_only": False})
 
     monkeypatch.setattr(bat, "_sketch_ids", lambda doc_id: ["s1", "s2"])
     monkeypatch.setattr(bat, "_get_fn", lambda mk, fn: _fn)
@@ -727,14 +876,14 @@ def test_adapt_check_sketch_runs_with_derived_id(monkeypatch):
     r = bat.verify("doc-mech", ["check_sketch"])
     assert "check_sketch" not in r["skipped"]
     assert r["scores"]["check_sketch"] == 1.0
-    assert seen["sketch"] == "s1"
-    assert seen["doc_id"] == "doc-mech"
+    assert seen == [("s1", "doc-mech"), ("s2", "doc-mech")]
 
 
 def test_adapt_measure_between_skip_no_features(monkeypatch):
     from services.verify import battery as bat
 
     monkeypatch.setattr(bat, "_doc_features", lambda doc_id: [])
+    monkeypatch.setattr(bat, "_query_geometry_faces", lambda doc_id: [])
     monkeypatch.setattr(
         bat, "_get_fn",
         lambda mk, fn: (lambda a_query, b_query=None, doc_id=None: __import__("json").dumps({"ok": True})),
@@ -756,15 +905,13 @@ def test_adapt_measure_between_runs_with_derived_queries(monkeypatch):
         seen["b"] = b_query
         return json.dumps({"ok": True, "distance": 10.0})
 
-    monkeypatch.setattr(
-        bat, "_doc_features",
-        lambda doc_id: [{"id": "f1", "type": "box"}, {"id": "f2", "type": "fillet"}],
-    )
+    monkeypatch.setattr(bat, "_query_geometry_faces", lambda doc_id: [
+        _probe_face("Fabc123", 10, 1), _probe_face("Fdef456", 0, -1),
+    ])
     monkeypatch.setattr(bat, "_get_fn", lambda mk, fn: _fn)
     r = bat.verify("doc-mech", ["measure_between"])
     assert r["scores"]["measure_between"] == 1.0
-    assert seen["a"] in ("top", "bottom", "front", "back", "left", "right", "+z", "-z")
-    assert seen["b"] in ("top", "bottom", "front", "back", "left", "right", "+z", "-z")
+    assert {seen["a"]["sid"], seen["b"]["sid"]} == {"Fabc123", "Fdef456"}
     assert seen["a"] != seen["b"]
 
 

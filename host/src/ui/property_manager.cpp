@@ -612,6 +612,10 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     std::string mode;
     const PMFormDef* form = pmFormForCommand(cmdId, mode);
     if (!form) return false;
+    if (st.activeDocLockedByAgent()) {
+        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
+        return true;  // consume the recognized command without opening a form
+    }
     if (guestActive_) closeGuest();
     if (active_ && !cancelEdits(st)) return false;   // replacing a PM must roll back previews first
 
@@ -652,6 +656,7 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
         st.addLog("[pm] checkpoint failed — Cancel will use undo loop fallback");
     // Phase 4: exclusive daemon edit-hold while this form previews (released in close()).
     holdDocId_ = pmTakeOpenHold(st);
+    sessionDocId_ = st.docMirror.docId();
     lastHoldTime_ = ImGui::GetTime();
 
     ips_ = st.ips();   // document-unit display follows the active unit system (MMGS / IPS)
@@ -842,6 +847,10 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
 }
 
 bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
+    if (st.activeDocLockedByAgent()) {
+        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
+        return false;
+    }
     const nlohmann::json& tree = st.docMirror.tree();
     if (!tree.is_object()) return false;
     auto feat = tree.find("features");
@@ -883,6 +892,7 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
         st.addLog("[pm] checkpoint failed — Cancel will use undo loop fallback");
     // Phase 4: exclusive daemon edit-hold while this form previews (released in close()).
     holdDocId_ = pmTakeOpenHold(st);
+    sessionDocId_ = st.docMirror.docId();
     lastHoldTime_ = ImGui::GetTime();
 
     ips_ = st.ips();   // document-unit display follows the active unit system (MMGS / IPS)
@@ -991,19 +1001,19 @@ void PropertyManager::loadFromTree(AppState& st, const nlohmann::json& feature) 
         const char* key = f.def->key;
         switch (f.def->kind) {
             case PMFieldKind::Dim: {
-                if (params.contains(key) && params[key].is_object()) {
-                    const auto& d = params[key];
-                    if (d.contains("expr") && d["expr"].is_string()) {
-                        f.dimExpr = d["expr"].get<std::string>();
-                        if (d.contains("value") && d["value"].is_number())
-                            f.dimValue = d["value"].get<double>();
-                        std::string disp = "=" + f.dimExpr;
-                        std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
-                    } else if (d.contains("value") && d["value"].is_number()) {
-                        f.dimValue = d["value"].get<double>();
-                        std::string disp = pmFieldValueText(f.def, f.dimValue, ips_);
-                        std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
+                if (auto it = params.find(key); it != params.end()) {
+                    const auto& d = *it;
+                    if (d.is_number()) {
+                        f.dimValue = d.get<double>();
+                    } else if (d.is_object()) {
+                        if (auto expr = d.find("expr"); expr != d.end() && expr->is_string())
+                            f.dimExpr = expr->get<std::string>();
+                        if (auto value = d.find("value"); value != d.end() && value->is_number())
+                            f.dimValue = value->get<double>();
                     }
+                    std::string disp = f.dimExpr.empty()
+                        ? pmFieldValueText(f.def, f.dimValue, ips_) : "=" + f.dimExpr;
+                    std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                 }
                 break;
             }
@@ -1184,6 +1194,7 @@ void PropertyManager::reformatDimDisplays() {
 void PropertyManager::close() {
     pmEditRelease(holdDocId_);   // Phase 4: both OK and Cancel funnel through here
     holdDocId_.clear();
+    sessionDocId_.clear();
     active_ = false;
     editMode_ = false;
     form_ = nullptr;
@@ -1206,6 +1217,19 @@ void PropertyManager::close() {
     aiMessage_.clear();
     aiHighlights_.clear();
     ++aiRequestSeq_;
+}
+
+bool PropertyManager::closeForAgentLock(AppState& st) {
+    if ((!active_ && (!guestActive_ || guestReadOnly_)) ||
+        !st.docLockedByAgent(sessionDocId_)) return false;
+    std::string part = "part";
+    for (const auto& tab : st.docTabs)
+        if (tab.docId == sessionDocId_) { part = tab.title; break; }
+    closeIfActive();  // keep applied previews and release edit_hold; never revert
+    if (guestActive_) closeGuest();
+    st.toast(ui::ToastLevel::Info,
+             "Agent started editing " + part + " — your edit was kept and closed");
+    return true;
 }
 
 // ---- selector wells -------------------------------------------------------
@@ -2306,6 +2330,7 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
 // ---- preview / commit / cancel --------------------------------------------
 
 bool PropertyManager::applyPreview(AppState& st) {
+    if (closeForAgentLock(st)) return false;
     if (!st.docMirror.hasDoc() || !st.workerStarted) {
         previewError_ = "Document runtime is not ready.";
         return false;
@@ -2447,6 +2472,7 @@ bool PropertyManager::applyPreview(AppState& st) {
 }
 
 void PropertyManager::tick(AppState& st) {
+    if (closeForAgentLock(st)) return;
     // Phase 4: keep the daemon edit-hold fresh while the form is open. The
     // daemon already refreshes it on every preview op; this covers an open-but-
     // idle form, rate-limited to once/second.
@@ -2463,6 +2489,7 @@ void PropertyManager::tick(AppState& st) {
 }
 
 void PropertyManager::commit(AppState& st) {
+    if (closeForAgentLock(st)) return;
     // Make sure the latest field state is reflected before committing.
     if (!readyForPreview(form_, fields_)) {
         previewError_ = "Select the required references and enter valid dimensions before accepting.";
@@ -2494,6 +2521,7 @@ void PropertyManager::commit(AppState& st) {
 }
 
 bool PropertyManager::cancelEdits(AppState& st) {
+    if (closeForAgentLock(st)) return true;
     // C37-F: Single revert call replaces the old N-undo loop, eliminating the UI freeze.
     bool ok = true;
     if (!checkpointId_.empty()) {
@@ -2678,14 +2706,16 @@ void pmDrawFormHeader(const char* icon, const char* title, const char* descripti
     }
 }
 
-void PropertyManager::openGuest(const char* title, const char* icon,
-                                GuestFn body, GuestFn onOk, GuestFn onCancel) {
-    // Close a live feature form without rolling back if somehow both want the slot; prefer cancel
-    // so previews don't stick. Guest forms are mutually exclusive with feature forms.
-    if (active_ && !guestActive_) {
-        // Soft close: drop feature form state (no AppState available here for cancelEdits).
-        close();
+void PropertyManager::openGuest(AppState& st, const char* title, const char* icon,
+                                GuestFn body, GuestFn onOk, GuestFn onCancel, bool readOnly) {
+    if (!readOnly && st.activeDocLockedByAgent()) {
+        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
+        return;
     }
+    // Guest entry keeps any live feature preview, releasing its edit_hold without a revert.
+    closeIfActive();
+    sessionDocId_ = st.docMirror.docId();
+    guestReadOnly_ = readOnly;
     guestActive_ = true;
     guestTitle_ = title ? title : "";
     guestIcon_ = icon ? icon : "";
@@ -2696,6 +2726,8 @@ void PropertyManager::openGuest(const char* title, const char* icon,
 
 void PropertyManager::closeGuest() {
     guestActive_ = false;
+    guestReadOnly_ = false;
+    sessionDocId_.clear();
     guestTitle_.clear();
     guestIcon_.clear();
     guestBody_ = nullptr;
@@ -2861,6 +2893,7 @@ static bool pmSectionHeader(const char* label, const Palette& pal) {  // gui-lin
 // OK commits (commit() still guards form readiness + toasts on failure); Cancel reverts every preview
 // batch. Returns the cluster's pixel width (0 when inactive) so the caller can reserve space.
 float PropertyManager::drawChromeButtons(AppState& st, float rightX, float centerY) {
+    if (closeForAgentLock(st)) return 0.0f;
     if (!active()) return 0.0f;
     if (active_ && !guestActive_ && !form_) return 0.0f;
     const float S   = ui::uiScale;
@@ -3037,6 +3070,7 @@ void PropertyManager::draw(AppState& st) {
 
 // Wave 1D: the form's inner content (no Begin/End). Caller owns the surrounding window/child.
 void PropertyManager::drawBody(AppState& st) {
+    if (closeForAgentLock(st)) return;
     // Guest assembly forms (Mate/Insert/…) occupy the same left-pane slot as feature forms.
     if (guestActive_) {
         const ui::AdaptiveSurface& surf = pmSurf();

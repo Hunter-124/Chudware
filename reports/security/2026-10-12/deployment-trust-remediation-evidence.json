@@ -1,0 +1,120 @@
+{
+  "executed_at": "2026-10-13",
+  "result": "pass",
+  "observations": [
+    {
+      "scenario": "production marker served only through production workspace",
+      "actual": "production fixture bytes",
+      "expected": "production fixture bytes",
+      "pass": true
+    },
+    {
+      "scenario": "same-email staging workspace serves its own marker",
+      "actual": "staging fixture bytes",
+      "expected": "staging fixture bytes",
+      "pass": true
+    },
+    {
+      "scenario": "production bearer rejected by staging",
+      "actual": 401,
+      "expected": 401,
+      "pass": true
+    },
+    {
+      "scenario": "staging bearer rejected by production",
+      "actual": 401,
+      "expected": 401,
+      "pass": true
+    },
+    {
+      "scenario": "staging admin cannot rebuild production",
+      "actual": 403,
+      "expected": 403,
+      "pass": true
+    },
+    {
+      "scenario": "staging admin cannot redeploy production",
+      "actual": 403,
+      "expected": 403,
+      "pass": true
+    },
+    {
+      "scenario": "denied staging operation creates no deploy status",
+      "actual": false,
+      "expected": false,
+      "pass": true
+    },
+    {
+      "scenario": "production marker remains unchanged",
+      "actual": "production fixture bytes",
+      "expected": "production fixture bytes",
+      "pass": true
+    },
+    {
+      "scenario": "install_webd.sh refuses shared service identity",
+      "actual": 4,
+      "expected": 4,
+      "pass": true
+    },
+    {
+      "scenario": "install_webd.sh refusal does not create state",
+      "actual": false,
+      "expected": false,
+      "pass": true
+    },
+    {
+      "scenario": "update.sh refuses shared service identity",
+      "actual": 4,
+      "expected": 4,
+      "pass": true
+    },
+    {
+      "scenario": "update.sh refusal does not create state",
+      "actual": false,
+      "expected": false,
+      "pass": true
+    },
+    {
+      "scenario": "setup.sh refuses shared service identity",
+      "actual": 2,
+      "expected": 2,
+      "pass": true
+    },
+    {
+      "scenario": "setup.sh refusal does not create state",
+      "actual": false,
+      "expected": false,
+      "pass": true
+    },
+    {
+      "scenario": "genuine Ed25519 inert fixture installs",
+      "actual": 0,
+      "expected": 0,
+      "pass": true
+    },
+    {
+      "scenario": "installed inert bytes match signed artifact",
+      "actual": true,
+      "expected": true,
+      "pass": true
+    },
+    {
+      "scenario": "matching mutable hashes cannot authorize replacement artifact",
+      "actual": true,
+      "expected": true,
+      "pass": true
+    },
+    {
+      "scenario": "replacement artifact is not placed",
+      "actual": false,
+      "expected": false,
+      "pass": true
+    }
+  ],
+  "scope": "Real loopback Uvicorn gateways, disposable PostgreSQL roles/databases, private filesystem markers and real OpenSSL Ed25519 installer verification; no product release keys, production services, provider APIs, package managers or fixture artifact execution.",
+  "limits": [
+    "Gateway processes use the same developer UID; canonical dedicated staging account/user-manager installation is unexercised.",
+    "Entitlement trust and one installer pinned key replaced only in disposable fixture startup/script copies.",
+    "Windows/macOS native finalization and actual CI runner group/image isolation are unexercised."
+  ]
+}

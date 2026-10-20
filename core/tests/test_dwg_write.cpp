@@ -219,7 +219,7 @@ TEST_CASE("Native R2000 DWG: thousands of entities span several map pages") {
 
 TEST_CASE("Native R2000 DWG: polylines past 20000 vertices split at shared joints") {
     auto polyline = [](int n, bool close) {
-        Polyline pts;
+        chudware::doc::Polyline pts;
         for (int i = 0; i < n; ++i) pts.push_back({i * 0.01, (i % 7) * 0.5});
         if (close) pts.push_back(pts.front());
         DxfDocument d;

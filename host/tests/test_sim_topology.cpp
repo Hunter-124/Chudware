@@ -5,9 +5,11 @@
 // matrix decides what may run, and a result is never shown as more than it
 // proves.
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -195,6 +197,7 @@ void testValidation() {
       {"physics", "structural"}, {"method", "simp"}, {"objective", "mass"}};
   CHECK(hasIssue(topo::validateTopology(mass, caps), "objective"));
   mass["max_displacement_mm"] = 0.5;
+  mass["volume_fraction"] = 0.35;
   CHECK(!topo::hasBlocking(topo::validateTopology(mass, caps)));
 
   json unsupported = {
@@ -203,6 +206,113 @@ void testValidation() {
 
   CHECK(topo::hasBlocking(topo::validateTopology(ok, topo::Capabilities{})));
   CHECK(topo::hasBlocking(topo::validateTopology(json(), caps)));
+}
+
+void testPrintSetup() {
+  const auto caps = topo::parseCapabilities(capsJson());
+  json study = {{"topology", topo::newTopologyConfig(caps, "structural")}};
+  auto issues = topo::validateTopology(study["topology"], caps, study);
+  CHECK(hasIssue(issues, "volume_fraction"));
+  CHECK(issues.front().message == "Set the solid volume fraction (Goal).");
+  const json fluid = topo::newTopologyConfig(caps, "flow");
+  CHECK(topo::validateTopology(fluid, caps).front().message ==
+        "Set the fluid volume fraction (Goal).");
+  json chtMatrix = capsJson();
+  chtMatrix["physics"].push_back({{"id", "cht"}});
+  json chtPair = chtMatrix["combinations"][2];
+  chtPair["physics"] = "cht";
+  chtMatrix["combinations"].push_back(chtPair);
+  const auto chtCaps = topo::parseCapabilities(chtMatrix);
+  CHECK(topo::validateTopology(topo::newTopologyConfig(chtCaps, "cht"), chtCaps)
+            .front().message == "Set the fluid volume fraction (Goal).");
+  json noVolumeCaps = capsJson();
+  noVolumeCaps["combinations"][0]["parameters"] = json::array();
+  CHECK(!hasIssue(topo::validateTopology(study["topology"],
+                         topo::parseCapabilities(noVolumeCaps)), "volume_fraction"));
+
+  study["topology"]["volume_fraction"] = 0.35;
+  study["topology"]["agent_note"] = "keep";
+  study["topology"]["overhang_angle_deg"] = 30;
+  study["topology"]["min_member_mm"] = 3.0;
+  const json preset = {
+      {"id", "powder"}, {"topology", {{"min_member_mm", 1.0},
+          {"overhang_angle_deg", nullptr}, {"overhang_penalty", nullptr},
+          {"no_enclosed_voids", true}, {"unoffered", 7}}}};
+  CHECK(topo::applyPrintProcess(study, preset, caps));
+  CHECK(study["print_process"] == "powder");
+  CHECK(study["topology"]["min_member_mm"] == 1.0);
+  CHECK(study["topology"]["no_enclosed_voids"] == true);
+  CHECK(!study["topology"].contains("overhang_angle_deg"));
+  CHECK(!study["topology"].contains("unoffered"));
+  CHECK(study["topology"]["agent_note"] == "keep");
+  json limited = {{"topology", {{"physics", "structural"}, {"method", "beso"},
+                    {"objective", "compliance"}, {"overhang_angle_deg", 30}}}};
+  CHECK(topo::applyPrintProcess(limited, preset, caps));
+  CHECK(limited["print_process"] == "powder");
+  CHECK(!limited["topology"].contains("min_member_mm"));
+  CHECK(limited["topology"]["overhang_angle_deg"] == 30);
+
+  study["topology"]["overhang_angle_deg"] = 45;
+  study["topology"]["overhang_penalty"] = 1.0;
+  CHECK(hasIssue(topo::validateTopology(study["topology"], caps, study), "build_direction"));
+  study["build_plate"] = {{"faces", json::array()}};
+  CHECK(hasIssue(topo::validateTopology(study["topology"], caps, study), "build_direction"));
+  const json selector = {{"kind", "face"}, {"_pick", {{"body", 1}, {"topo", 6}}}};
+  study["build_plate"] = {{"faces", json::array({selector})}, {"label", "Bottom"}};
+  CHECK(!hasIssue(topo::validateTopology(study["topology"], caps, study), "build_direction"));
+  study["topology"].erase("overhang_angle_deg"); // native default is 45 degrees
+  CHECK(!topo::hasBlocking(topo::validateTopology(study["topology"], caps, study)));
+  const auto selectors = topo::selectorsToResolve(study);
+  CHECK(selectors.size() == 1);
+  std::vector<std::uint64_t> preview;
+  topo::collectFaceKeys(study, topo::WellRole::Preserve, preview);
+  CHECK(preview.size() == 1 && preview[0] == ((std::uint64_t(1) << 32) | 6));
+  const json faces = {{"points", {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}}},
+                      {"tol_mm", 0.1}, {"face_normal", {0, 0, -1}}};
+  std::map<std::string, json> resolved = {{topo::selectorKey(selector), faces}};
+  json envelope;
+  std::string error;
+  CHECK(!topo::buildRunEnvelope(study, {}, "/part.step", {}, envelope, error));
+  CHECK(topo::buildRunEnvelope(study, resolved, "/part.step", {}, envelope, error));
+  CHECK(envelope["build_plate"]["faces"]["points"] == faces["points"]);
+  CHECK(envelope["build_plate"]["label"] == "Bottom");
+  const std::string plateKey = topo::setupKey(study);
+  study.erase("build_plate");
+  CHECK(topo::setupKey(study) != plateKey);
+  CHECK(topo::buildRunEnvelope(study, {}, "/part.step", {}, envelope, error));
+  CHECK(!envelope.contains("build_plate"));
+}
+
+void testDfamMergeAndPrintSurface() {
+  json run = {{"run_id", "gui-run"}, {"result", {
+      {"manufacturing", {{"geometry_valid", true},
+          {"dfam", {{"checked", false}, {"passed", false}}}}},
+      {"artifacts", {
+          {"surface_stl", {{"path", "/raw.stl"}}},
+          {"surface_print_stl", {{"path", "/print.stl"}}}}}}}};
+  const json reply = {{"ok", true}, {"dfam", {{"checked", true}, {"passed", false},
+      {"checks", json::array({{{"check", "overhang"}, {"status", "fail"},
+                               {"note", "Needs supports"}}})}}},
+      {"print_ready_reason", "Needs supports and slicing"}};
+  CHECK(topo::mergeDfamResult(run, reply));
+  const auto &mfg = run["result"]["manufacturing"];
+  CHECK(mfg["dfam"] == reply["dfam"]);
+  CHECK(mfg["geometry_valid"] == true && mfg["print_ready"] == false);
+  CHECK(mfg["print_ready_reason"] == reply["print_ready_reason"]);
+  const json retained = run;
+  CHECK(!topo::mergeDfamResult(run, {{"ok", false}}, "offline"));
+  CHECK(run == retained);
+  CHECK(topo::surfaceArtifactKey(run["result"]) == "surface_print_stl");
+  run["result"]["artifacts"]["surface_print_stl"]["stale"] = true;
+  CHECK(topo::surfaceArtifactKey(run["result"]) == "surface_stl");
+  run["result"]["artifacts"]["surface_print_stl"]["stale"] = false;
+  run["result"]["artifacts"]["surface_print_stl"]["missing"] = true;
+  CHECK(topo::surfaceArtifactKey(run["result"]) == "surface_stl");
+  run["result"]["manufacturing"].erase("dfam");
+  CHECK(topo::mergeDfamResult(run, {{"ok", false}, {"error", "worker unavailable"}}));
+  const auto report = topo::manufacturingReport(run["result"], {});
+  CHECK(!report.dfamChecked && !report.dfamPassed && !report.printReady);
+  CHECK(report.printReadyReason == "DFAM check could not run: worker unavailable");
 }
 
 // Resolved facesets are canonical native inputs, whether a fixture is bare or
@@ -215,7 +325,7 @@ json resolvedStudy(const json &faceset) {
       {"name", "Resolved study"},
       {"material", {{"E_mpa", 70000.0}, {"nu", 0.3}}},
       {"topology", {{"physics", "structural"}, {"method", "simp"},
-                    {"objective", "compliance"}}},
+                    {"objective", "compliance"}, {"volume_fraction", 0.35}}},
       {"fixtures", json::array({
                        faceset,
                        {{"faces", json::array({faceset})}, {"dofs", {0, 1, 2}}}})},
@@ -569,6 +679,8 @@ int main() {
   testCapabilityMatrix();
   testSwitchPreservesUnownedKeys();
   testValidation();
+  testPrintSetup();
+  testDfamMergeAndPrintSurface();
   testResolvedFacesetDefinitionEdits();
   testInvalidResolvedFacesetDefinitionsAreTransactional();
   testApplyRunSettings();

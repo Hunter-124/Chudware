@@ -17,6 +17,7 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+from contextvars import copy_context
 
 from . import profiles
 from .adapters import all_adapters, get_adapter, login_wizard_sites
@@ -220,4 +221,5 @@ def run_health_check(sites: list[str] | None = None) -> list[dict[str, Any]]:
     # Three keeps the status board progressive while eliminating false failures.
     with ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_CANARIES,
                             thread_name_prefix="vendor-health") as pool:
-        return list(pool.map(_safe_check, sites))
+        futures = [pool.submit(copy_context().run, _safe_check, site) for site in sites]
+        return [future.result() for future in futures]

@@ -117,9 +117,13 @@ void IdPass::setSectionClip(int count, const float normals[3][3], const float of
         clipOffsets_[i] = offsets[i];
     }
     haveCachedFrame_ = false;
+    pickMemo_.valid = false;
 }
 
 void IdPass::destroy() {
+    built_ = false;
+    haveCachedFrame_ = false;
+    pickMemo_.valid = false;
     auto freeDraws = [](std::vector<BodyDraw>& v) {
         for (auto& d : v) {
             if (d.vao) glDeleteVertexArrays(1, &d.vao);
@@ -185,7 +189,13 @@ bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
     rgba8_ = (mode && std::strcmp(mode, "rgba8") == 0);
 #endif
 
-    if (!prog_) prog_ = linkProgram(kVertU, rgba8_ ? kFragRGBA : kFragU);
+    if (!prog_) {
+        prog_ = linkProgram(kVertU, rgba8_ ? kFragRGBA : kFragU);
+        mvpLoc_ = glGetUniformLocation(prog_, "uMVP");
+        clipCountLoc_ = glGetUniformLocation(prog_, "uClipCount");
+        clipNormalsLoc_ = glGetUniformLocation(prog_, "uClipN");
+        clipOffsetsLoc_ = glGetUniformLocation(prog_, "uClipOff");
+    }
     int linked = 0;
     glGetProgramiv(prog_, GL_LINK_STATUS, &linked);
     if (!linked) { err = "id_pass program link failed"; return false; }
@@ -280,7 +290,11 @@ bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
 }
 
 bool IdPass::render(const Renderer::CameraXform& cam, bool facesOnly) {
-    if (!built_ || cam.ssWidth <= 0 || cam.ssHeight <= 0) return false;
+    if (!built_ || cam.ssWidth <= 0 || cam.ssHeight <= 0) {
+        haveCachedFrame_ = false;
+        pickMemo_.valid = false;
+        return false;
+    }
 
     // Fingerprint every input consulted by the draw. The viewport invokes this only when it is
     // about to read a pick (or service the scripted pick driver), so non-viewport interaction does
@@ -301,10 +315,16 @@ bool IdPass::render(const Renderer::CameraXform& cam, bool facesOnly) {
     key.docGen = docGen_;
     key.facesOnly = facesOnly;
     if (haveCachedFrame_ && key == lastKey_) return true;
+    haveCachedFrame_ = false;
+    pickMemo_.valid = false;
 
     allocTargets(cam.ssWidth, cam.ssHeight);
 
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        return false;
+    }
     glViewport(0, 0, w_, h_);
 
     // Clear color (id = 0 == background) + depth. R32UI needs the integer clear path.
@@ -321,11 +341,11 @@ bool IdPass::render(const Renderer::CameraXform& cam, bool facesOnly) {
     glDisable(GL_BLEND);
 
     glUseProgram(prog_);
-    glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, cam.mvp.m);
-    glUniform1i(glGetUniformLocation(prog_, "uClipCount"), clipCount_);
+    glUniformMatrix4fv(mvpLoc_, 1, GL_FALSE, cam.mvp.m);
+    glUniform1i(clipCountLoc_, clipCount_);
     if (clipCount_ > 0) {
-        glUniform3fv(glGetUniformLocation(prog_, "uClipN"), clipCount_, clipNormals_[0]);
-        glUniform1fv(glGetUniformLocation(prog_, "uClipOff"), clipCount_, clipOffsets_);
+        glUniform3fv(clipNormalsLoc_, clipCount_, clipNormals_[0]);
+        glUniform1fv(clipOffsetsLoc_, clipCount_, clipOffsets_);
     }
 
     // Faces first, pushed back so edges/verts win the depth test on coincident geometry. Each body
@@ -372,6 +392,7 @@ bool IdPass::render(const Renderer::CameraXform& cam, bool facesOnly) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     // The id buffer now reflects `key`; reuse it until one of these inputs changes.
+    ++renderGen_;
     lastKey_ = key;
     haveCachedFrame_ = true;
     return true;
@@ -381,6 +402,7 @@ PickHit IdPass::pickFinal(int px, int py, int finalW, int finalH) {
     PickHit empty;
     if (!built_ || !haveCachedFrame_ || finalW <= 0 || finalH <= 0) return empty;
     if (px < 0 || py < 0 || px >= finalW || py >= finalH) return empty;
+    if (pickMemo_.matches(renderGen_, px, py, finalW, finalH, 0)) return pickMemo_.hit;
 
     // Map final (top-left) pixel -> supersampled (bottom-left) pixel. Sample the SS-block center.
     float sx = (px + 0.5f) * (float)w_ / (float)finalW;
@@ -402,16 +424,21 @@ PickHit IdPass::pickFinal(int px, int py, int finalW, int finalH) {
         glReadPixels(gx, gy, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &id);
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    return decodeId(id);
+    PickHit hit = decodeId(id);
+    pickMemo_ = {renderGen_, px, py, finalW, finalH, 0, hit, true};
+    return hit;
 }
 
 PickHit IdPass::pickFinalPreferEdge(int px, int py, int finalW, int finalH, int radiusPx) {
-    PickHit center = pickFinal(px, py, finalW, finalH);
-    // A vertex/edge already under the cursor wins outright (it's exactly what was asked for).
-    if (center.kind == PickKind::Edge || center.kind == PickKind::Vertex) return center;
-    if (!built_ || !haveCachedFrame_ || finalW <= 0 || finalH <= 0 || radiusPx <= 0)
-        return center;
-    if (px < 0 || py < 0 || px >= finalW || py >= finalH) return center;
+    if (radiusPx <= 0) return pickFinal(px, py, finalW, finalH);
+    PickHit empty;
+    if (!built_ || !haveCachedFrame_ || finalW <= 0 || finalH <= 0) return empty;
+    if (px < 0 || py < 0 || px >= finalW || py >= finalH) return empty;
+    if (pickMemo_.matches(renderGen_, px, py, finalW, finalH, radiusPx)) return pickMemo_.hit;
+    auto remember = [&](PickHit hit) {
+        pickMemo_ = {renderGen_, px, py, finalW, finalH, radiusPx, hit, true};
+        return hit;
+    };
 
     // Map the cursor + search radius into supersampled (GL bottom-left) space and read one block.
     float sx = (px + 0.5f) * (float)w_ / (float)finalW;
@@ -425,21 +452,33 @@ PickHit IdPass::pickFinalPreferEdge(int px, int py, int finalW, int finalH, int 
     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
     if (x1 >= w_) x1 = w_ - 1; if (y1 >= h_) y1 = h_ - 1;
     int bw = x1 - x0 + 1, bh = y1 - y0 + 1;
-    if (bw <= 0 || bh <= 0) return center;
+    if (bw <= 0 || bh <= 0) return pickFinal(px, py, finalW, finalH);
 
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    std::vector<uint32_t> block((size_t)bw * bh, 0u);
+    const size_t pixelCount = (size_t)bw * bh;
+    if (readbackIds_.size() < pixelCount) readbackIds_.resize(pixelCount);
     if (rgba8_) {
-        std::vector<unsigned char> rgba((size_t)bw * bh * 4, 0);
-        glReadPixels(x0, y0, bw, bh, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
-        for (size_t i = 0; i < block.size(); ++i)
-            block[i] = (uint32_t)rgba[i * 4] | ((uint32_t)rgba[i * 4 + 1] << 8) |
-                       ((uint32_t)rgba[i * 4 + 2] << 16) | ((uint32_t)rgba[i * 4 + 3] << 24);
+        if (readbackRgba_.size() < pixelCount * 4) readbackRgba_.resize(pixelCount * 4);
+        glReadPixels(x0, y0, bw, bh, GL_RGBA, GL_UNSIGNED_BYTE, readbackRgba_.data());
+        for (size_t i = 0; i < pixelCount; ++i)
+            readbackIds_[i] = (uint32_t)readbackRgba_[i * 4] |
+                              ((uint32_t)readbackRgba_[i * 4 + 1] << 8) |
+                              ((uint32_t)readbackRgba_[i * 4 + 2] << 16) |
+                              ((uint32_t)readbackRgba_[i * 4 + 3] << 24);
     } else {
-        glReadPixels(x0, y0, bw, bh, GL_RED_INTEGER, GL_UNSIGNED_INT, block.data());
+        glReadPixels(x0, y0, bw, bh, GL_RED_INTEGER, GL_UNSIGNED_INT, readbackIds_.data());
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // Use the very same pixel as pickFinal, including its boundary clamps. Do not let a nearby
+    // vertex replace an exact center edge: that early precedence is part of the picking contract.
+    int gx = cx, gy = cy;
+    if (gx < 0) gx = 0; if (gx >= w_) gx = w_ - 1;
+    if (gy < 0) gy = 0; if (gy >= h_) gy = h_ - 1;
+    PickHit center = decodeId(readbackIds_[(size_t)(gy - y0) * bw + (gx - x0)]);
+    if (center.kind == PickKind::Edge || center.kind == PickKind::Vertex)
+        return remember(center);
 
     // Two-tier nearest search within the (circular) radius, skipping hidden bodies. Vertices are a
     // smaller target than edges, which are a smaller target than faces, so precedence is strictly
@@ -451,7 +490,7 @@ PickHit IdPass::pickFinalPreferEdge(int px, int py, int finalW, int finalH, int 
     PickHit bestV, bestE;
     for (int j = 0; j < bh; ++j) {
         for (int i = 0; i < bw; ++i) {
-            uint32_t v = block[(size_t)j * bw + i];
+            uint32_t v = readbackIds_[(size_t)j * bw + i];
             if (v == 0 || bodyHidden(v)) continue;
             PickKind k = PickKind((v >> 18) & 0x3u);
             if (k != PickKind::Edge && k != PickKind::Vertex) continue;
@@ -464,9 +503,9 @@ PickHit IdPass::pickFinalPreferEdge(int px, int py, int finalW, int finalH, int 
             }
         }
     }
-    if (bestV.valid()) return bestV;   // vertex tier wins outright
-    if (bestE.valid()) return bestE;   // else nearest edge
-    return center;                     // else the exact-pixel face (or background)
+    if (bestV.valid()) return remember(bestV);  // vertex tier wins outright
+    if (bestE.valid()) return remember(bestE);  // else nearest edge
+    return remember(center);                  // else the exact-pixel face (or background)
 }
 
 }  // namespace render

@@ -11,6 +11,7 @@ Covers the wiring in auth.AuthMiddleware._resolve_user.
 from __future__ import annotations
 
 import sys
+import base64
 from pathlib import Path
 
 import pytest
@@ -102,3 +103,49 @@ def test_role_cannot_be_escalated_by_the_caller(env):
     )
     assert r.status_code == 200
     assert r.json()["role"] == "user"
+
+
+@pytest.mark.parametrize("parser", ["nested_json", "recursion_error"])
+@pytest.mark.parametrize("credential", ["header", "cookie"])
+def test_access_invalid_payload_is_normalized_on_protected_and_public_paths(pg, monkeypatch, parser, credential):
+    import auth
+    from config import settings
+    monkeypatch.setattr(settings, "dev_mode", False)
+    monkeypatch.setattr(settings, "session_secret", "fixture-session-secret")
+    monkeypatch.setattr(settings, "cf_team_domain", "https://fixture.invalid")
+    monkeypatch.setattr(settings, "cf_aud", "fixture-audience")
+    cache = auth.JWKSCache("https://fixture.invalid/keys")
+    signing_client = cache._refresh_if_needed()
+    def no_network(*args, **kwargs):
+        raise AssertionError("invalid payload must be refused before JWKS network fetch")
+    monkeypatch.setattr(signing_client, "fetch_data", no_network)
+    if parser == "recursion_error":
+        def recursion(*args):
+            raise RecursionError("fixture payload recursion")
+        monkeypatch.setattr(cache, "get_signing_key", recursion)
+    def encoded(raw):
+        return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+    # Newer JSON parsers can accept this depth without recursion. It remains an
+    # unusable Access payload (missing mandatory claims), refused before fetch.
+    # The separate injected parser case proves RecursionError normalization.
+    payload = '{"nested":' + "[" * 1100 + "0" + "]" * 1100 + "}" if parser == "nested_json" else (
+        '{"exp":4102444800,"iss":"https://fixture.invalid","aud":"fixture-audience"}'
+    )
+    token = encoded('{"alg":"RS256","kid":"fixture"}') + "." + encoded(payload) + ".AA"
+    app = FastAPI()
+    @app.get("/api/protected")
+    def protected():
+        return {"ok": True}
+    @app.get("/healthz")
+    def health():
+        return {"ok": True}
+    app.add_middleware(auth.AuthMiddleware, jwks=cache)
+    with TestClient(app) as client:
+        headers = {"cf-access-jwt-assertion": token} if credential == "header" else {}
+        if credential == "cookie":
+            client.cookies.set("CF_Authorization", token)
+        refused = client.get("/api/protected", headers=headers)
+        assert refused.status_code == 401
+        assert refused.json()["error"] == "invalid access token"
+        # Optional authentication must fail softly rather than break public pages.
+        assert client.get("/healthz", headers=headers).status_code == 200

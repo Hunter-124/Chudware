@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 try:
     from . import accounts, authn, billing, credits, entitlement, releases, orgs
     from .auth import get_current_user
+    from .db import tx
     from .limits import api_writes
     from .plans import limits_for
 except ImportError:  # uvicorn app:app from package dir
@@ -26,6 +27,7 @@ except ImportError:  # uvicorn app:app from package dir
     import entitlement  # type: ignore
     import releases  # type: ignore
     from auth import get_current_user  # type: ignore
+    from db import tx  # type: ignore
     from limits import api_writes  # type: ignore
     from plans import limits_for  # type: ignore
 
@@ -78,12 +80,14 @@ async def change_password(request: Request, body: dict[str, Any]) -> dict[str, b
     user, _ = _account(request)
     current = str(body.get("current_password") or "")
     replacement = str(body.get("new_password") or "")
-    credential = authn.get_credential(user.email)
-    if credential is None or not authn.verify_password(credential["password_hash"], current):
-        raise HTTPException(401, "current password is incorrect")
-    authn._check_password_policy(replacement)
-    api_writes.enforce(user.email, "portal password changes")
-    authn.set_password(user.email, replacement, verified=True)
+    with tx():
+        authn._lock_account(user.email)
+        credential = authn.get_credential(user.email)
+        if credential is None or not authn.verify_password(credential["password_hash"], current):
+            raise HTTPException(401, "current password is incorrect")
+        authn._check_password_policy(replacement)
+        api_writes.enforce(user.email, "portal password changes")
+        authn.set_password(user.email, replacement, verified=True)
     return {"ok": True}
 
 

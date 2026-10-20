@@ -272,3 +272,66 @@ def test_snapshot_tolerates_the_windows_cross_api_file_id(
     monkeypatch.setattr(payload_manifest, "_CROSS_FLAVOUR_IGNORED", ())
     with pytest.raises(payload_manifest.PayloadManifestError, match="ino="):
         payload_manifest._snapshot_file(root, "FreeImage.dll", "library", attempts=1)
+
+
+@pytest.mark.parametrize("channel", ["beta", "stable"])
+@pytest.mark.parametrize("mode", ["finalize", "finalize-with-override", "discover", "override"])
+def test_installer_request_uses_resolved_release_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, channel: str, mode: str
+) -> None:
+    """Exercise CLI completion and real signing-request bytes, not native signing."""
+    version = "1.2.3" if channel == "stable" else "1.2.3-beta.4"
+    monkeypatch.setenv("CHUDWARE_RELEASE_CHANNEL", channel)
+    payload = tmp_path / "Chudware"
+    payload.mkdir()
+    def finalized(*_args, **_kwargs):
+        return {"dist": str(payload), "version": version, "key_id": "release-v1"}
+    def staged(*_args, **kwargs):
+        assert kwargs["version"] == version
+        return {"dist": str(payload), "key_id": "release-v1"}
+    def compiled(_out, staged_payload, resolved_version, _public_key):
+        assert staged_payload == payload
+        assert resolved_version == version
+        artifact = tmp_path / f"Chudware-Setup-{resolved_version}-x86_64.exe"
+        artifact.write_bytes(b"disposable installer fixture")
+        return artifact
+    monkeypatch.setattr(build_release, "finalize_prepared_payload", finalized)
+    monkeypatch.setattr(build_release, "build", staged)
+    monkeypatch.setattr(build_release, "compile_installer", compiled)
+    monkeypatch.setattr(build_release, "read_built_version", lambda: version)
+    arguments = ["--out", str(tmp_path), "--release-public-key", "disposable"]
+    if mode.startswith("finalize"):
+        arguments += ["--finalize-signing", str(tmp_path / "disposable.sig")]
+        if mode == "finalize-with-override":
+            # Prepared signed payload identity remains authoritative.
+            arguments += ["--version", "9.9.9"]
+    elif mode == "override":
+        arguments += ["--version", version]
+    assert build_release.main(arguments) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["version"] == version
+    artifact = Path(result["installer"])
+    request = Path(result["artifact_signing_request"]).read_bytes().split(b"\0")
+    assert request == [
+        b"chudware-artifact-v1", b"release-v1", version.encode("ascii"),
+        b"windows", b"x86_64", hashlib.sha256(artifact.read_bytes()).hexdigest().encode("ascii"),
+    ]
+
+
+def test_failed_installer_builder_emits_no_artifact_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = tmp_path / "Chudware"
+    payload.mkdir()
+    monkeypatch.setattr(
+        build_release, "finalize_prepared_payload",
+        lambda *_args, **_kwargs: {"dist": str(payload), "version": "1.2.3", "key_id": "release-v1"},
+    )
+    def failed(*_args, **_kwargs):
+        raise RuntimeError("disposable native builder failure")
+    monkeypatch.setattr(build_release, "compile_installer", failed)
+    assert build_release.main([
+        "--out", str(tmp_path), "--finalize-signing", str(tmp_path / "disposable.sig"),
+        "--release-public-key", "disposable",
+    ]) == 1
+    assert not list(tmp_path.rglob("*.artifact-signing-request.bin"))

@@ -10,9 +10,11 @@ import json
 import os
 import signal
 import sys
+import subprocess
 import tempfile
 import time
 
+from pathlib import Path
 import pytest
 
 import services.mcp.tool_registry as reg
@@ -557,7 +559,8 @@ def test_run_shell_timeout_preserves_json_safe_partial_output(tmp_path):
         "time.sleep(2)\n"
     )
     r = _tools()["run_shell"](f'"{sys.executable}" "{script}"', timeout_s=1)
-    assert r["ok"] and r["timed_out"] and r["exit_code"] == 124
+    assert not r["ok"] and r["reason"] == "shell_deadline_exceeded"
+    assert r["timed_out"] and r["exit_code"] == 124
     assert "out\u2603" in r["output"] and "err\ufffd" in r["output"]
     json.dumps(r)
 
@@ -604,3 +607,336 @@ def test_run_shell_refuses_out_of_range_deadline_before_execution(tmp_path):
         f'"{sys.executable}" "{script}"', timeout_s=SHELL_MAX_TIMEOUT_S + 1)
     assert not result["ok"] and result["reason"] == "invalid_timeout"
     assert not marker.exists()
+
+
+def _observe_file_reads(monkeypatch, *, append_after_first_read=False):
+    """Instrument real admitted descriptors, never substitute file contents."""
+    from services.mcp import fs_tools
+
+    original = fs_tools._open_read_file
+    observed = []
+    grew = False
+
+    class ObservedFile:
+        def __init__(self, path):
+            self.path = path
+            self.file = original(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.file.close()
+
+        def fileno(self):
+            return self.file.fileno()
+
+        def read(self, count):
+            nonlocal grew
+            data = self.file.read(count)
+            observed.append((count, len(data)))
+            if append_after_first_read and not grew:
+                grew = True
+                with self.path.open("ab") as writer:
+                    writer.write(b"growth\n")
+            return data
+
+    monkeypatch.setattr(fs_tools, "_open_read_file", ObservedFile)
+    return observed
+
+
+def test_fs_read_large_line_uses_bounded_reads_and_exact_byte_pages(tmp_path, monkeypatch):
+    from services.mcp import fs_tools
+    from services.agent.chudcode_tools import _RESULT_TEXT_BYTES, host_tool_result
+
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    path = tmp_path / "wide.txt"
+    source = ("é" * (2 * 1024 * 1024) + "\r\ntail").encode()
+    path.write_bytes(source)
+    observed = _observe_file_reads(monkeypatch)
+    tools = _tools()
+    numbered = tools["fs_read"]("wide.txt:1-1")
+    assert numbered["ok"] and numbered["total_lines"] == 2
+    assert numbered["shown_lines"] == 1 and "[+" in numbered["text"]
+    first = tools["fs_read"]("wide.txt", byte_offset=0)
+    assert first["ok"] and first["truncated"]
+    # The host result budgets its actual Unicode-preserving JSON text, not
+    # json.dumps' default ASCII expansion (which triples this accented page).
+    next_at = first["next_byte_offset"]
+    second = tools["fs_read"]("wide.txt", byte_offset=next_at)
+    assert second["ok"] and second["byte_offset"] == next_at
+    for page in (first, second):
+        envelope = host_tool_result(
+            page, spill=lambda _value: pytest.fail("read page exceeded host result budget"))
+        wire_text = envelope["content"][0]["text"]
+        assert len(wire_text.encode("utf-8")) <= _RESULT_TEXT_BYTES
+        assert json.loads(wire_text) == page
+        assert envelope["details"] == page
+        assert len(json.dumps(page["text"], ensure_ascii=False).encode("utf-8")) - 2 <= (
+            fs_tools.READ_PAGE_BYTES)
+        assert page["bytes"] == len(page["text"].encode("utf-8"))
+        assert page["next_byte_offset"] == page["byte_offset"] + page["bytes"]
+    joined = (first["text"] + second["text"]).encode()
+    assert joined == source[:len(joined)]
+    assert max(count for count, _ in observed) <= fs_tools.IO_CHUNK_BYTES
+    assert all(count >= size for count, size in observed)
+
+
+def test_fs_read_refuses_oversized_snapshot_before_reading(tmp_path, monkeypatch):
+    from services.mcp import fs_tools
+
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    path = tmp_path / "huge.txt"
+    with path.open("wb") as stream:
+        stream.truncate(fs_tools.READ_MAX_INPUT_BYTES + 1)
+    observed = _observe_file_reads(monkeypatch)
+    result = _tools()["fs_read"]("huge.txt", byte_offset=0)
+    assert not result["ok"] and result["reason"] == "read_budget_exceeded"
+    assert observed == [] and "text" not in result
+
+
+@pytest.mark.parametrize("tool", ["fs_read", "fs_grep"])
+def test_fs_tools_refuse_growth_without_following_new_bytes(tmp_path, monkeypatch, tool):
+    from services.mcp import fs_tools
+
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    path = tmp_path / "growing.txt"
+    source = b"a" * (3 * fs_tools.IO_CHUNK_BYTES) + b"\n"
+    path.write_bytes(source)
+    observed = _observe_file_reads(monkeypatch, append_after_first_read=True)
+    tools = _tools()
+    result = tools[tool]("growing.txt") if tool == "fs_read" else tools[tool]("a", path="growing.txt")
+    assert not result["ok"] and result["reason"] == "file_changed"
+    assert sum(size for _, size in observed) == len(source)
+    assert max(count for count, _ in observed) <= fs_tools.IO_CHUNK_BYTES
+    assert "matches" not in result and "text" not in result
+
+
+def test_fs_read_byte_selector_handles_utf8_boundary_and_conflicts(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    (tmp_path / "unicode.txt").write_bytes("aéz\r\nlast".encode())
+    tools = _tools()
+    result = tools["fs_read"]("unicode.txt", byte_offset=2)
+    assert result["ok"] and result["byte_offset"] == 1 and result["text"] == "éz\r\nlast"
+    assert tools["fs_read"]("unicode.txt:1-1:raw")["text"] == "aéz\r\n"
+    assert tools["fs_read"]("unicode.txt:1-1", byte_offset=0)["reason"] == "conflicting_offsets"
+    assert tools["fs_read"]("unicode.txt", offset=1, byte_offset=0)["reason"] == "conflicting_offsets"
+
+
+def test_fs_grep_regex_semantics_caps_and_large_file_skip(tmp_path, monkeypatch):
+    from services.mcp import fs_tools
+
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "ordinary.txt").write_text("Alpha\r\nbeta\nALPHA\n", encoding="utf-8")
+    with (nested / "oversized.txt").open("wb") as stream:
+        stream.write(b"Alpha\n")
+        stream.truncate(fs_tools.GREP_MAX_FILE_BYTES + 1)
+    tools = _tools()
+    result = tools["fs_grep"]("^alpha$", path="nested", glob="*.txt", ignore_case=True)
+    assert result["ok"] and result["count"] == 2 and result["files_scanned"] == 2
+    assert [match["line"] for match in result["matches"]] == [1, 3]
+    assert [match["text"] for match in result["matches"]] == ["Alpha", "ALPHA"]
+    capped = tools["fs_grep"]("alpha", path="nested", ignore_case=True, max_matches=1)
+    assert capped["ok"] and capped["count"] == 1 and capped["truncated"]
+    invalid = tools["fs_grep"]("(", path="nested")
+    assert not invalid["ok"] and invalid["reason"] == "bad_pattern"
+
+
+def test_fs_grep_input_and_output_budget_refusals_are_not_partial_success(tmp_path, monkeypatch):
+    from services.mcp import fs_tools
+
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    (tmp_path / "a.txt").write_text("x" * 200)
+    (tmp_path / "b.txt").write_text("x" * 200)
+    monkeypatch.setattr(fs_tools, "GREP_MAX_INPUT_BYTES", 256)
+    result = _tools()["fs_grep"]("never", path=".")
+    assert not result["ok"] and result["reason"] == "search_budget_exceeded"
+    assert "matches" not in result
+    monkeypatch.setattr(fs_tools, "GREP_MAX_INPUT_BYTES", 64 * 1024 * 1024)
+    (tmp_path / "wide.txt").write_text(("match " + '"' * 1500 + "\n") * 100)
+    result = _tools()["fs_grep"]("match", path="wide.txt", max_matches=100)
+    assert not result["ok"] and result["reason"] == "search_output_budget_exceeded"
+    assert "matches" not in result
+
+
+def test_fs_enumeration_budgets_and_glob_selector_order(tmp_path, monkeypatch):
+    from services.mcp import fs_tools
+
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    for index in range(6):
+        path = nested / f"{index}.txt"
+        path.write_text("needle\n")
+        os.utime(path, ns=(index + 1, index + 1))
+    tools = _tools()
+    result = tools["fs_glob"]("nested/**/*.txt", limit=2)
+    assert result["ok"] and result["truncated"]
+    assert [Path(match).name for match in result["matches"]] == ["5.txt", "4.txt"]
+    assert tools["fs_glob"]("*.txt")["matches"] == []
+    monkeypatch.setattr(fs_tools, "FS_MAX_SCAN_ENTRIES", 3)
+    for name, args in (("fs_list", ("nested",)), ("fs_glob", ("**/*",)),
+                       ("fs_grep", ("needle",))):
+        result = tools[name](*args)
+        assert not result["ok"] and result["reason"] == "scan_budget_exceeded"
+        assert "matches" not in result and "entries" not in result
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX disposable process cleanup probe")
+def test_fs_grep_pathological_regex_keeps_control_responsive_and_reaps_child(tmp_path):
+    """Outer deadline also makes the old GIL-holding implementation safely testable."""
+    (tmp_path / "evil.txt").write_text("a" * 40 + "!\n")
+    (tmp_path / "control.txt").write_text("responsive\n")
+    pid_file = tmp_path / "grep-pid"
+    code = (
+        "import json, os, subprocess, threading, time\n"
+        "from pathlib import Path\n"
+        "from services.mcp import fs_tools\n"
+        "class Registry:\n"
+        " def __init__(self): self.tools = {}\n"
+        " def tool(self):\n"
+        "  def add(fn): self.tools[fn.__name__] = fn; return fn\n"
+        "  return add\n"
+        "registry = Registry(); fs_tools.register_fs_tools(registry)\n"
+        "original = fs_tools.subprocess.Popen\n"
+        "entered = threading.Event()\n"
+        "def launch(*args, **kwargs):\n"
+        " child = original(*args, **kwargs)\n"
+        f" Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+        " entered.set(); return child\n"
+        "fs_tools.subprocess.Popen = launch\n"
+        "result = {}\n"
+        "def search(): result.update(registry.tools['fs_grep']('(a+)+$', path='evil.txt'))\n"
+        "started = time.monotonic()\n"
+        "thread = threading.Thread(target=search, daemon=True); thread.start()\n"
+        "assert entered.wait(2)\n"
+        "time.sleep(0.25)\n"
+        "control_started = time.monotonic()\n"
+        "control = registry.tools['fs_read']('control.txt')\n"
+        "control_elapsed = time.monotonic() - control_started\n"
+        "assert control['ok'] and 'responsive' in control['text']\n"
+        "thread.join(8)\n"
+        "assert not thread.is_alive()\n"
+        "assert not any(t.name in {'fs-process-output', 'fs-grep-input'} for t in threading.enumerate())\n"
+        "print(json.dumps({'control': control['ok'], 'search': result, "
+        "'elapsed': time.monotonic() - started, 'control_elapsed': control_elapsed}), flush=True)\n"
+    )
+    env = {"PATH": os.defpath, "LANG": "C.UTF-8", "CHUDWARE_FS_ROOT": str(tmp_path)}
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[2], env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=12)
+        assert proc.returncode == 0, stderr.decode(errors="replace")
+        result = json.loads(stdout)
+        assert result["control"] and result["search"]["reason"] == "search_deadline_exceeded"
+        assert not result["search"]["ok"]
+        assert result["elapsed"] < 8 and result["control_elapsed"] < 1
+        child_pid = int(pid_file.read_text())
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
+        if pid_file.exists():
+            try:
+                os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group output budget")
+def test_run_shell_output_budget_stops_real_producer_and_descendant(tmp_path):
+    from services.mcp.fs_tools import SHELL_MAX_OUTPUT_BYTES
+
+    marker = tmp_path / "late-write"
+    pids = tmp_path / "output-pids.json"
+    child = tmp_path / "late.py"
+    child.write_text(
+        "import time\nfrom pathlib import Path\n"
+        f"time.sleep(2)\nPath({str(marker)!r}).write_text('escaped')\n")
+    producer = tmp_path / "producer.py"
+    producer.write_text(
+        "import json, os, subprocess, sys\nfrom pathlib import Path\n"
+        f"child = subprocess.Popen([sys.executable, {str(child)!r}])\n"
+        f"Path({str(pids)!r}).write_text(json.dumps([os.getpid(), child.pid]))\n"
+        "while True:\n"
+        " os.write(1, b'x' * 16384)\n"
+        " os.write(2, b'y' * 16384)\n")
+    try:
+        started = time.monotonic()
+        result = _tools()["run_shell"](f'"{sys.executable}" "{producer}"', timeout_s=20)
+        assert time.monotonic() - started < 8
+        assert not result["ok"] and result["reason"] == "output_budget_exceeded"
+        assert result["truncated"] and not result["timed_out"]
+        assert len(result["output"].encode()) <= SHELL_MAX_OUTPUT_BYTES + 128
+        assert pids.exists() and "x" in result["output"] and "y" in result["output"]
+        time.sleep(2.2)
+        assert not marker.exists()
+    finally:
+        if pids.exists():
+            for pid in json.loads(pids.read_text()):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+def test_run_shell_closes_stdin_and_keeps_bounded_success_output(tmp_path):
+    from services.mcp.fs_tools import SHELL_MAX_OUTPUT_BYTES
+
+    producer = tmp_path / "finite.py"
+    producer.write_text(
+        "import os, sys\n"
+        "assert sys.stdin.buffer.read() == b''\n"
+        f"os.write(1, b'x' * {SHELL_MAX_OUTPUT_BYTES})\n")
+    result = _tools()["run_shell"](f'"{sys.executable}" "{producer}"', timeout_s=5)
+    assert result["ok"] and not result["truncated"] and not result["timed_out"]
+    assert len(result["output"]) == SHELL_MAX_OUTPUT_BYTES
+
+
+def test_fs_grep_file_count_budget_is_a_refusal(tmp_path, monkeypatch):
+    from services.mcp import fs_tools
+
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(fs_tools, "MAX_GREP_FILES", 2)
+    for index in range(3):
+        (tmp_path / f"{index}.txt").write_text("needle\n")
+    result = _tools()["fs_grep"]("needle")
+    assert not result["ok"] and result["reason"] == "search_budget_exceeded"
+    assert "matches" not in result and "count" not in result
+
+
+def test_fs_grep_ignores_ambient_python_import_injection(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    injection = tmp_path / "injection"
+    injection.mkdir()
+    marker = tmp_path / "imported-ambient"
+    (injection / "re.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('injected')\n"
+        "raise RuntimeError('ambient regex import')\n")
+    monkeypatch.setenv("PYTHONPATH", str(injection))
+    monkeypatch.setenv("PYTHONSTARTUP", str(injection / "re.py"))
+    (tmp_path / "ordinary.txt").write_text("needle\n")
+    result = _tools()["fs_grep"]("needle", path="ordinary.txt")
+    assert result["ok"] and result["count"] == 1 and not marker.exists()
+
+
+def test_fs_grep_preserves_request_local_nested_workspace_jail(tmp_path, monkeypatch):
+    from services.agent.request_context import bind_roots
+
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    (tmp_path / "outside-selected.txt").write_text("not-admitted\n")
+    (selected / "alias.txt").symlink_to(tmp_path / "outside-selected.txt")
+    (selected / "inside.txt").write_text("ordinary\n")
+    tools = _tools()
+    with bind_roots(str(selected)):
+        result = tools["fs_grep"]("not-admitted", path=".")
+        assert result["ok"] and result["count"] == 0
+        assert tools["fs_grep"]("ordinary", path=".")["count"] == 1

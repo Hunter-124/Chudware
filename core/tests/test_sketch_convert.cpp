@@ -23,6 +23,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <string>
@@ -768,4 +769,207 @@ TEST_CASE("profile: two centroid picks that land on ONE region refuse (regions m
     CHECK(err.find("same region") != std::string::npos);
     CHECK(err.find("profile[0]") != std::string::npos);
     CHECK(err.find("profile[1]") != std::string::npos);
+}
+
+namespace {
+std::string add_projection_sketch(const std::string& doc, double offset = 0.0) {
+    const json result = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "sketch"},
+            {"params", {{"entities", json::array()}, {"constraints", json::array()}, {"offset", offset}}},
+            {"refs", {{"plane", "plane.top"}}}}}}}), false);
+    return result.at("id_map").at("$0").get<std::string>();
+}
+json convert_one(const std::string& doc, const std::string& sketch, const json& ref) {
+    return doc_apply_ops(doc, -1, json::array({
+        json{{"op", "sketch_convert"}, {"sketch", sketch}, {"refs", json::array({ref})}}}), false);
+}
+}
+
+TEST_CASE("convert: model vertex becomes an associative projected point") {
+    const std::string doc = make_box("VertexReference", 40, 30, 20);
+    const std::string sketch = add_projection_sketch(doc);
+    json selector;
+    for (int i = 1; i <= 8; ++i) {
+        const json candidate = chudware::doc::doc_resolve_pick(doc, 1, "vertex", i).at("selector");
+        if (candidate.at("centroid") == json::array({40.0, 30.0, 20.0})) selector = candidate;
+    }
+    REQUIRE(selector.is_object());
+    const json ref{{"kind", "vertex"}, {"selector", selector}};
+    const json result = convert_one(doc, sketch, ref);
+    const json feature = feature_of(result.at("tree"), sketch);
+    const json point = entity_of(feature, result.at("id_map").at("$0"));
+    REQUIRE(point.at("type") == "point");
+    CHECK(at_point(point.at("p"), 40, 30));
+    CHECK_FALSE(feature.at("params").at("external_refs").front().at("stale").get<bool>());
+    const json preview = chudware::doc::doc_sketch_project_ref(doc, sketch, ref);
+    CHECK(preview.at("entity").at("type") == "point");
+    CHECK(at_point(preview.at("entity").at("p"), 40, 30));
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < 8; ++i) {
+        const json refreshed = chudware::doc::doc_rebuild(doc);
+        CHECK(feature_of(refreshed.at("tree"), sketch).at("params") == feature.at("params"));
+    }
+    MESSAGE("unchanged solid-backed refresh x8: " << std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count() << " ms");
+    const json edge = doc_query(doc, {{"of", "edge"}, {"near", {20, 0, 20}}, {"count", 1}});
+    REQUIRE(edge.at("count").get<int>() == 1);
+    bool refused = false;
+    try { convert_one(doc, sketch, {{"kind", "edge"}, {"selector", edge.at("matches").front()},
+                                    {"mode", "pierce"}}); }
+    catch (const chudware::doc::OpError& error) {
+        refused = true;
+        CHECK(error.code == "convert_failed");
+        CHECK(error.detail.at("reason") == "no plane crossing");
+    }
+    CHECK(refused);
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("convert: pierce finds the plane crossing of a slanted edge and follows edits") {
+    const std::string doc = doc_new("part", "PierceReference").at("doc_id");
+    json entities = json::array({line("e1", 0, -10, 20, 10), line("e2", 20, 10, 40, 10),
+                                 line("e3", 40, 10, 40, -10), line("e4", 40, -10, 0, -10)});
+    const json body = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "sketch"},
+            {"params", {{"entities", entities}, {"constraints", json::array()}}},
+            {"refs", {{"plane", "plane.front"}}}}}},
+        json{{"op", "add_feature"}, {"feature", {{"type", "extrude"},
+            {"params", {{"mode", "boss"}, {"depth", dimv(30)}}},
+            {"refs", {{"profile", "$0"}}}}}}}), false);
+    for (const auto& status : body.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(status.value("ok", false), status.dump());
+    const std::string sketch = add_projection_sketch(doc, 5);
+    const json query = doc_query(doc, {{"of", "edge"}, {"near", {10, 0, 0}}, {"count", 1}});
+    REQUIRE(query.at("count").get<int>() == 1);
+    const json ref{{"kind", "edge"}, {"selector", query.at("matches").front()},
+                   {"mode", "pierce"}, {"near", {15, 0}}};
+    const json converted = convert_one(doc, sketch, ref);
+    const std::string eid = converted.at("id_map").at("$0");
+    json feature = feature_of(converted.at("tree"), sketch);
+    REQUIRE(entity_of(feature, eid).at("type") == "point");
+    CHECK(at_point(entity_of(feature, eid).at("p"), 15, 0));
+    CHECK(feature.at("params").at("external_refs").front().at("source") == ref);
+    const json edited = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e1"}, {"params", {{"p2", {22, 10}}}}},
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e2"}, {"params", {{"p1", {22, 10}}}}}
+    }), false);
+    feature = feature_of(edited.at("tree"), sketch);
+    CHECK_FALSE(feature.at("params").at("external_refs").front().at("stale").get<bool>());
+    CHECK(at_point(entity_of(feature, eid).at("p"), 16.5, 0));
+    const json shifted = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "edit_feature"}, {"id", sketch}, {"params", {{"offset", 6}}}}
+    }), false);
+    feature = feature_of(shifted.at("tree"), sketch);
+    CHECK_FALSE(feature.at("params").at("external_refs").front().at("stale").get<bool>());
+    CHECK(at_point(entity_of(feature, eid).at("p"), 17.6, 0));
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("kernel: pierce chooses a nearby crossing and rejects coplanar or disjoint edges") {
+    const TopoDS_Edge circle = BRepBuilderAPI_MakeEdge(
+        gp_Circ(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), 10));
+    const auto front = chudware::geom::SketchPlane::front();
+    const auto positive = chudware::doc::pierce_edge_to_plane(circle, front, Eigen::Vector2d(9, 0));
+    const auto negative = chudware::doc::pierce_edge_to_plane(circle, front, Eigen::Vector2d(-9, 0));
+    REQUIRE(positive.has_value());
+    REQUIRE(negative.has_value());
+    CHECK(at_point(positive->at("p"), 10, 0));
+    CHECK(at_point(negative->at("p"), -10, 0));
+    CHECK_FALSE(chudware::doc::pierce_edge_to_plane(circle, chudware::geom::SketchPlane::top()));
+    const TopoDS_Edge above = BRepBuilderAPI_MakeEdge(gp_Pnt(0, 0, 2), gp_Pnt(10, 0, 3));
+    CHECK_FALSE(chudware::doc::pierce_edge_to_plane(above, chudware::geom::SketchPlane::top()));
+}
+
+TEST_CASE("convert: datum axes and origin work without a solid and remain stable on refresh") {
+    const std::string doc = doc_new("part", "DatumReferences").at("doc_id");
+    const std::string sketch = add_projection_sketch(doc);
+    const json converted = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "sketch_convert"}, {"sketch", sketch},
+             {"refs", json::array({json{{"datum", "axis.x"}}, json{{"datum", "axis.z"}},
+                                    json{{"datum", "origin"}}})}}}), false);
+    const json before = feature_of(converted.at("tree"), sketch).at("params");
+    REQUIRE(before.at("entities").size() == 3);
+    CHECK(before.at("entities")[0].at("type") == "line");
+    CHECK(before.at("entities")[1].at("type") == "point");
+    CHECK(at_point(before.at("entities")[1].at("p"), 0, 0));
+    CHECK(at_point(before.at("entities")[2].at("p"), 0, 0));
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < 8; ++i) {
+        const json refreshed = chudware::doc::doc_rebuild(doc);
+        CHECK(feature_of(refreshed.at("tree"), sketch).at("params") == before);
+    }
+    MESSAGE("unchanged refresh x8: " << std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count() << " ms");
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("convert: another sketch entity is world lifted and re-resolved after its edit") {
+    const std::string doc = doc_new("part", "SketchEntityReference").at("doc_id");
+    const json source = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "sketch"},
+            {"params", {{"entities", json::array({line("e1", 2, 3, 12, 9)})},
+                        {"constraints", json::array()}, {"offset", 7}}},
+            {"refs", {{"plane", "plane.front"}}}}}}}), false);
+    const std::string source_id = source.at("id_map").at("$0");
+    const std::string sketch = add_projection_sketch(doc);
+    const json result = convert_one(doc, sketch,
+        {{"kind", "sketch_entity"}, {"sketch", source_id}, {"entity", "e1"}});
+    const std::string eid = result.at("id_map").at("$0");
+    json projected = entity_of(feature_of(result.at("tree"), sketch), eid);
+    CHECK(at_point(projected.at("p1"), 2, -7));
+    CHECK(at_point(projected.at("p2"), 12, -7));
+    const json edited = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "sketch_edit_entity"}, {"sketch", source_id}, {"id", "e1"},
+             {"params", {{"p2", {15, 11}}}}}}), false);
+    projected = entity_of(feature_of(edited.at("tree"), sketch), eid);
+    CHECK(at_point(projected.at("p2"), 15, -7));
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("fully define op: same-batch rectangle receives design-intent constraints and DOF zero") {
+    const std::string doc = doc_new("part", "FullyDefineRectangle").at("doc_id");
+    const json result = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "sketch"},
+            {"params", {{"entities", json::array({json{{"type", "rectangle"},
+                {"corner1", {0, 0}}, {"corner2", {40, 30}}}})}, {"constraints", json::array()}}},
+            {"refs", {{"plane", "plane.top"}}}}}},
+        json{{"op", "sketch_fully_define"}, {"sketch", "$0"}}}), false);
+    REQUIRE(result.at("id_map").contains("$1"));
+    const std::string sketch = result.at("id_map").at("$0");
+    const json feature = feature_of(result.at("tree"), sketch);
+    CHECK(feature.at("params").at("entities").size() == 4);
+    CHECK(feature.at("params").at("constraints").size() > 8);
+    for (const json& constraint : feature.at("params").at("constraints"))
+        CHECK(constraint.at("type") != "fix");
+    const json health = chudware::doc::doc_sketch_health(doc, sketch);
+    CHECK_MESSAGE(health.at("dof") == 0, health.dump());
+    CHECK(health.at("converged").get<bool>());
+    CHECK(health.at("skipped_constraints").empty());
+    const json again = doc_apply_ops(doc, -1,
+        json::array({json{{"op", "sketch_fully_define"}, {"sketch", sketch}}}), false);
+    CHECK_FALSE(again.at("id_map").contains("$0"));
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("composites: polygon and polyline retain connected editable design intent") {
+    const std::string doc = doc_new("part", "CompositeRelations").at("doc_id");
+    const std::string sketch = add_projection_sketch(doc);
+    chudware::doc::doc_set_meta(doc, "sketch.auto_coincident", false);
+    const json result = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "sketch_add_entity"}, {"sketch", sketch},
+             {"entity", {{"type", "polygon"}, {"sides", 5}, {"center", {0, 0}}, {"radius", 10}}}},
+        json{{"op", "sketch_add_entity"}, {"sketch", sketch},
+             {"entity", {{"type", "polyline"}, {"points", {{30, 0}, {40, 0}, {40, 10}}}}}}
+    }), false);
+    const json params = feature_of(result.at("tree"), sketch).at("params");
+    int coincident = 0, equal = 0;
+    for (const json& constraint : params.at("constraints")) {
+        coincident += constraint.at("type") == "coincident";
+        equal += constraint.at("type") == "equal";
+    }
+    CHECK(params.at("entities").size() == 7);
+    CHECK(coincident == 6);
+    CHECK(equal == 4);
+    CHECK(chudware::doc::doc_sketch_health(doc, sketch).at("skipped_constraints").empty());
+    chudware::doc::doc_close(doc);
 }

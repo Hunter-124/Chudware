@@ -7,7 +7,6 @@ user explicitly asks for one, no verification token or mail.
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -25,6 +24,7 @@ import auth  # noqa: E402
 import authn  # noqa: E402
 import db  # noqa: E402
 import limits  # noqa: E402
+import mailer  # noqa: E402
 import portal_serve  # noqa: E402
 from config import settings  # noqa: E402
 
@@ -37,6 +37,7 @@ def client(pg, monkeypatch):
     shipped = limits.login_by_ip
     fresh = limits.RateLimiter(shipped.limit, shipped.window)
     monkeypatch.setattr(authn, "login_by_ip", fresh)
+    monkeypatch.setattr(mailer, "outbound", limits.RateLimiter(5, 3600.0))
 
     app = FastAPI()
     app.include_router(authn.router)
@@ -74,13 +75,15 @@ def test_access_provisioned_account_can_resend_and_redeem_verification(client):
         )
         mail = cur.fetchone()
     assert mail["template"] == authn.PURPOSE_VERIFY
-    verify_url = json.loads(mail["ctx_json"])["verify_url"]
+    verify_url = mailer.decrypt_context(email, mail["template"], mail["ctx_json"])["verify_url"]
     token = parse_qs(urlparse(verify_url).query)["token"][0]
 
     redeemed = client.get(
         f"/api/auth/verify?token={token}", follow_redirects=False
     )
     assert redeemed.status_code == 303
+    assert "set-cookie" not in redeemed.headers
+    assert authn.SESSION_COOKIE not in client.cookies
     assert accounts.get_account(email).status == "active"
     assert authn.get_credential(email) is None
 

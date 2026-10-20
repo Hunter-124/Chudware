@@ -162,6 +162,7 @@
       "set_material",
       "set_process",
       "sketch_auto_constrain",
+      "sketch_fully_define",
       "undo",
       "verify_battery",
       "wall_thickness"
@@ -344,6 +345,7 @@
     "new_part",
     "solve_mates",
     "run_topology_optimization",
+    "sketch_fully_define",
     "publish_print_media"
   ],
   "edit_denied": [

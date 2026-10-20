@@ -34,6 +34,12 @@ Documents (.pdf/.docx/.pptx/.xlsx/.xlsm/.csv/.doc) route through the FROZEN
 ``office_tools.extract_office`` reader and are then paginated identically, so a 400-page PDF
 never floods context either.
 
+Text scans consume at most 64 MiB in finite chunks while retaining only one response
+page; files changing during the scan refuse. Directory traversals and search input/output
+have explicit work budgets. Regex compilation/search runs in a disposable readonly actor
+child with a two-second per-tool deadline, not in the serving worker's GIL. Shell pipes
+are drained under a byte budget and the command tree is stopped at budget/deadline refusal.
+
 SCOPING (the "limited cases" the base tooling is deliberately narrowed for):
   * A fixed, always-on credential-directory block applies to EVERY tool below (read and
     write alike) — ~/.ssh, ~/.aws, ~/.gnupg, cloud CLI credential stores, .netrc, etc. are
@@ -56,15 +62,25 @@ SCOPING (the "limited cases" the base tooling is deliberately narrowed for):
 from __future__ import annotations
 
 import bisect
+import codecs
+import contextvars
 import difflib
+import fnmatch
+import heapq
+import itertools
 import json
 import os
 import re
+import select
 import signal
 import subprocess
+import stat
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
+from services.agent.request_context import in_cell, root_value, sandbox_argv
 
 # --------------------------------------------------------------------------- scoping
 
@@ -89,7 +105,7 @@ def _is_sensitive_path(resolved: Path) -> bool:
 
 def _workspace_root() -> Optional[Path]:
     """Return the canonical mandatory filesystem jail, or ``None`` to fail closed."""
-    raw = os.environ.get("CHUDWARE_FS_ROOT", "").strip()
+    raw = root_value("CHUDWARE_FS_ROOT").strip()
     if not raw:
         return None
     try:
@@ -317,6 +333,15 @@ MAX_GLOB_RESULTS = 1000          # fs_glob result cap
 MAX_GREP_MATCHES = 500           # fs_grep match cap
 MAX_GREP_FILES = 5000            # fs_grep files-scanned cap
 GREP_MAX_FILE_BYTES = 8 * 1024 * 1024   # skip files larger than this in fs_grep
+READ_MAX_INPUT_BYTES = 64 * 1024 * 1024
+IO_CHUNK_BYTES = 64 * 1024
+FS_MAX_SCAN_ENTRIES = 20000
+FS_MAX_SCAN_DEPTH = 64
+FS_SCAN_DEADLINE_S = 10.0
+FS_RESPONSE_BYTES = 32 * 1024
+GREP_MAX_INPUT_BYTES = 64 * 1024 * 1024
+GREP_SEARCH_DEADLINE_S = 2.0
+GREP_MAX_PATTERN_BYTES = 4096
 SHELL_DEFAULT_TIMEOUT_S = 60
 SHELL_MAX_TIMEOUT_S = 24 * 60 * 60
 SHELL_MAX_OUTPUT_BYTES = 96 * 1024
@@ -640,16 +665,15 @@ def _window_lines(
             while 0 < skip_bytes < len(encoded) and encoded[skip_bytes] & 0xC0 == 0x80:
                 skip_bytes -= 1
             skip_chars = len(encoded[:skip_bytes].decode("utf-8"))
-            wanted = list(range(first, total + 1))
+            wanted = list(itertools.islice(range(first, total + 1), max_lines + 1))
     elif ranges:
-        wanted = []
-        for start, end in ranges:
-            stop = total if end is None else min(end, total)
-            wanted.extend(range(start, stop + 1))
-        wanted = [n for n in wanted if 1 <= n <= total]
+        wanted = list(itertools.islice(
+            (number for start, end in ranges
+             for number in range(max(start, 1), (total if end is None else min(end, total)) + 1)),
+            max_lines + 1))
     else:
         start = max(offset, 1)
-        wanted = list(range(start, total + 1))
+        wanted = list(itertools.islice(range(start, total + 1), max_lines + 1))
 
     truncated = False
     if len(wanted) > max_lines:
@@ -759,34 +783,265 @@ def _read_document(path: str, ranges, offset: int, limit: int, raw: bool,
     return _ok(path=path, kind=kind, is_document=True, **win)
 
 
+def _open_read_file(path: Path):
+    """Open only a regular, admitted file; never block on a FIFO or follow a new alias."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if os.name == "posix":
+        directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for component in path.parts[1:-1]:
+                child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=directory)
+                os.close(directory)
+                directory = child
+            fd = os.open(path.name, flags, dir_fd=directory)
+        finally:
+            os.close(directory)
+    else:
+        fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("only regular files can be read")
+        return os.fdopen(fd, "rb", buffering=0)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _file_unchanged(before, after) -> bool:
+    return (before.st_size, before.st_mtime_ns, before.st_ino, before.st_dev) == (
+        after.st_size, after.st_mtime_ns, after.st_ino, after.st_dev)
+
+
 def _read_text(path: str, ranges, offset: int, limit: int, raw: bool,
                byte_offset: Optional[int] = None) -> dict:
     p = Path(path)
+    max_lines = min(limit, HARD_MAX_LINES) if limit > 0 else (
+        HARD_MAX_LINES if byte_offset is not None else DEFAULT_MAX_LINES)
+    out: list[str] = []
+    starts: list[int] = []
+    numbers: list[int] = []
+    used = wanted = total = position = 0
+    line_start = line_length = 0
+    prefix = ""
+    page_closed = cut = False
+    first_page_start = 0
+    last_eol = False
+    range_index = 0
+
+    def selected(number: int) -> bool:
+        nonlocal range_index
+        if byte_offset is not None:
+            return position > byte_offset
+        if not ranges:
+            return number >= max(offset, 1)
+        while range_index < len(ranges):
+            start, end = ranges[range_index]
+            if end is not None and number > end:
+                range_index += 1
+                continue
+            return number >= start
+        return False
+
+    def consume(piece: str, eol: bool) -> None:
+        nonlocal position, prefix, line_length, total, line_start, last_eol
+        nonlocal wanted, used, page_closed, cut, first_page_start
+        encoded = piece.encode("utf-8")
+        piece_start = position
+        position += len(encoded)
+        line_length += len(piece)
+        # Retain only a possible page prefix, not a whole physical line.
+        if not page_closed:
+            keep = piece
+            if byte_offset is not None and piece_start < byte_offset:
+                skip = min(byte_offset - piece_start, len(encoded))
+                while 0 < skip < len(encoded) and encoded[skip] & 0xC0 == 0x80:
+                    skip -= 1
+                keep = encoded[skip:].decode("utf-8")
+                if not prefix:
+                    first_page_start = piece_start + skip
+            elif byte_offset is not None and not prefix:
+                first_page_start = piece_start
+            prefix += keep[:max(0, READ_PAGE_BYTES + 4 - len(prefix))]
+        if not eol:
+            last_eol = False
+            return
+        total += 1
+        last_eol = piece.endswith("\n")
+        if selected(total):
+            wanted += 1
+            if len(out) >= max_lines:
+                page_closed = True
+            if not page_closed:
+                if raw:
+                    formatted = prefix
+                else:
+                    body = prefix[:-1] if last_eol and line_length == len(prefix) else prefix
+                    length = line_length - int(last_eol)
+                    body = body[:MAX_LINE_COLUMNS]
+                    if length > MAX_LINE_COLUMNS:
+                        body += f"… [+{length - MAX_LINE_COLUMNS} chars]"
+                    formatted = f"{total:>6}\t{body}"
+                cost = _json_cost(formatted) + (0 if raw else 2)
+                incomplete = raw and line_length > len(prefix) and byte_offset is None
+                if byte_offset is not None:
+                    start_at = max(line_start, first_page_start)
+                    incomplete = len(formatted.encode("utf-8")) < position - start_at
+                if used + cost > READ_PAGE_BYTES or incomplete:
+                    page_closed = True
+                    if not out:
+                        formatted = formatted[:_fit_prefix(formatted, READ_PAGE_BYTES)]
+                        cut = True
+                    else:
+                        formatted = ""
+                if formatted or (raw and not line_length):
+                    out.append(formatted)
+                    numbers.append(total)
+                    starts.append(max(line_start, first_page_start) if byte_offset is not None else line_start)
+                    used += _json_cost(formatted) + (0 if raw else 2)
+        prefix = ""
+        line_length = 0
+        line_start = position
+
     try:
-        data = p.read_bytes()
-    except Exception as exc:  # noqa: BLE001
+        with _open_read_file(p) as fh:
+            before = os.fstat(fh.fileno())
+            if before.st_size > READ_MAX_INPUT_BYTES:
+                return _err("read_budget_exceeded",
+                            f"Text scan exceeds {READ_MAX_INPUT_BYTES} input bytes; narrow the file.")
+            remaining = before.st_size
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            sniff = b""
+            while remaining:
+                data = fh.read(min(IO_CHUNK_BYTES, remaining))
+                if not data:
+                    return _err("file_changed", "File shrank while being read; retry a stable file.")
+                remaining -= len(data)
+                if len(sniff) < 8192:
+                    sniff += data[:8192 - len(sniff)]
+                    if b"\x00" in sniff:
+                        return _err("binary_file", f"{p.name} looks binary; fs_read serves text only")
+                text = decoder.decode(data, final=not remaining)
+                at = 0
+                while at < len(text):
+                    end = text.find("\n", at)
+                    stop = end + 1 if end >= 0 else len(text)
+                    consume(text[at:stop], end >= 0)
+                    at = stop
+            if line_length:
+                consume("", True)
+            if not _file_unchanged(before, os.fstat(fh.fileno())):
+                return _err("file_changed", "File changed while being read; retry a stable file.")
+    except (OSError, ValueError) as exc:
         return _err("read_failed", str(exc))
-    # Binary sniff: NUL byte in the first 8 KiB → refuse to dump as text.
-    if b"\x00" in data[:8192]:
-        return _err("binary_file",
-                    f"{p.name} looks binary ({len(data)} bytes); fs_read serves text/documents only")
-    text = data.decode("utf-8", errors="replace")
-    lines = text.split("\n")
-    final_eol = lines[-1] == ""
-    if final_eol:
-        lines.pop()  # trailing newline shouldn't count as a phantom blank line
-    try:
-        win = _window_lines(lines, ranges, offset, limit, raw, final_eol, byte_offset)
-    except _ByteOffsetOutOfRange as exc:
-        return _err("byte_offset_out_of_range", str(exc))
+    if byte_offset is not None and byte_offset > position:
+        return _err("byte_offset_out_of_range",
+                    f"byte_offset={byte_offset} is past the end. The text has {position} bytes.")
+    shown = len(out)
+    truncated = wanted > shown or cut
+    win = dict(text="".join(out) if raw else "\n".join(out),
+               offset=numbers[0] if shown else max(offset, 1), total_lines=total,
+               shown_lines=shown, truncated=truncated)
+    if truncated and not cut and shown and numbers[-1] < total:
+        win["next_offset"] = numbers[-1] + 1
+        if not raw:
+            win["text"] += (
+                f"\n… [truncated — showed {shown} of {total} lines; continue with "
+                f"offset={win['next_offset']} or path selector ':{win['next_offset']}-']")
+    if raw:
+        page_start = starts[0] if shown else position
+        page_end = starts[-1] + len(out[-1].encode("utf-8")) if shown else page_start
+        win.update(byte_offset=page_start, bytes=len(win["text"].encode("utf-8")),
+                   total_bytes=position)
+        if truncated and page_end < position:
+            win["next_byte_offset"] = page_end
+            win["hint"] = f"Continue with raw=true and byte_offset={page_end}; join page texts."
     return _ok(path=str(p), kind=_kind_for(path) or "text", is_document=False, **win)
+
+
+class _FSBudgetError(RuntimeError):
+    def __init__(self, reason: str, hint: str):
+        super().__init__(hint)
+        self.reason = reason
+        self.hint = hint
+
+
+def _bounded_response(result: dict) -> dict:
+    if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > FS_RESPONSE_BYTES:
+        return _err("response_budget_exceeded", "Response exceeds 32 KiB; narrow path or lower the limit.")
+    return result
+
+
+def _iter_scoped_paths(base: Path, pattern: str, *, recursive: bool = False,
+                       deadline: Optional[float] = None, canonical: bool = True):
+    """Lazy, bounded glob traversal; no directory/path list is materialized."""
+    if len(pattern.encode("utf-8")) > GREP_MAX_PATTERN_BYTES:
+        raise _FSBudgetError("pattern_budget_exceeded", "Glob pattern exceeds 4096 bytes.")
+    if not pattern or pattern.startswith(("/", "\\")) or ".." in Path(pattern).parts:
+        raise _FSBudgetError("invalid_pattern", "Use a relative glob without parent traversal.")
+    parts = tuple(part for part in pattern.replace(os.sep, "/").split("/") if part and part != ".")
+    if len(parts) > FS_MAX_SCAN_DEPTH:
+        raise _FSBudgetError("pattern_budget_exceeded", "Glob pattern has too many components.")
+    directories_only = pattern.endswith(("/", os.sep))
+    if not parts:
+        yield base
+        return
+    if recursive:
+        parts = ("**", *parts)
+    deadline = deadline if deadline is not None else time.monotonic() + FS_SCAN_DEADLINE_S
+    seen = 0
+
+    def closure(states):
+        expanded = set(states)
+        for index in range(len(parts)):
+            if index in expanded and parts[index] == "**":
+                expanded.add(index + 1)
+        return expanded
+
+    def walk(directory: Path, states, depth: int):
+        nonlocal seen
+        if depth > FS_MAX_SCAN_DEPTH:
+            raise _FSBudgetError("scan_budget_exceeded", "Directory depth exceeds the scan budget.")
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if time.monotonic() >= deadline:
+                    raise _FSBudgetError("scan_deadline_exceeded", "Directory scan deadline expired; narrow path.")
+                seen += 1
+                if seen > FS_MAX_SCAN_ENTRIES:
+                    raise _FSBudgetError("scan_budget_exceeded", "Directory entry budget exhausted; narrow path.")
+                next_states = set()
+                for index in states:
+                    if index < len(parts):
+                        if parts[index] == "**":
+                            next_states.add(index)
+                        elif fnmatch.fnmatch(entry.name, parts[index]):
+                            next_states.add(index + 1)
+                next_states = closure(next_states)
+                if not next_states:
+                    continue
+                candidate = Path(entry.path)
+                resolved, blocked = _canonical_target(str(candidate), read=True)
+                if blocked or resolved is None:
+                    continue
+                if len(parts) in next_states and (not directories_only or resolved.is_dir()):
+                    yield resolved if canonical else candidate
+                if entry.is_dir(follow_symlinks=False) and any(index < len(parts) for index in next_states):
+                    yield from walk(resolved, next_states, depth + 1)
+
+    yield from walk(base, closure({0}), 0)
 
 
 def _list_dir(path: str, show_hidden: bool) -> dict:
     p = Path(path)
     try:
-        entries = sorted(p.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
-    except Exception as exc:  # noqa: BLE001
+        candidates = _iter_scoped_paths(p, "*", canonical=False)
+        entries = heapq.nsmallest(
+            MAX_LIST_ENTRIES + 1,
+            (entry for entry in candidates if show_hidden or not entry.name.startswith(".")),
+            key=lambda entry: (entry.is_file(), entry.name.lower()))
+    except _FSBudgetError as exc:
+        return _err(exc.reason, exc.hint)
+    except (OSError, ValueError) as exc:
         return _err("list_failed", str(exc))
     rows = []
     carded = 0
@@ -812,14 +1067,14 @@ def _list_dir(path: str, show_hidden: bool) -> dict:
                         carded += 1
         rows.append(row)
     geometry = sorted({r["name"] for r in rows if r.get("open_with") == "import_part"})
-    out = _ok(path=str(p), entries=rows, count=len(rows))
+    out = _ok(path=str(p), entries=rows, count=len(rows), truncated=len(entries) > MAX_LIST_ENTRIES)
     if geometry:
         out["note"] = (
             f"{len(geometry)} CAD/geometry file(s) here; each row's card summarises it. "
             "browse_models(path) shows them as labelled thumbnail sheets; to edit or "
             'measure one, open it with import_part(path="...") for a doc_id'
         )
-    return out
+    return _bounded_response(out)
 
 
 # =========================================================================== registration
@@ -833,7 +1088,9 @@ def register_fs_tools(mcp) -> None:
         """Read a text file, directory, or document with CONTEXT-SAFE, line-numbered output.
 
         Never dumps unbounded text. Each call returns one page of at most about 32 KB of
-        text. The page says the file's real length and how to page on.
+        text. Text input is streamed under a 64 MiB scan budget; larger or changing files
+        refuse with read_budget_exceeded/file_changed instead of an incomplete success.
+        A successful page says the file's real length and how to page on.
 
         path        : file/dir path; may carry a trailing selector — ':50' (from line 50),
                       ':50-200' (inclusive), ':50+150' (150 lines from 50), ':5-16,960-973'
@@ -927,21 +1184,18 @@ def register_fs_tools(mcp) -> None:
             return blocked
         assert base is not None
         cap = min(limit if limit > 0 else MAX_GLOB_RESULTS, MAX_GLOB_RESULTS)
-        hits: list[str] = []
+        if not base.is_dir():
+            return _err("not_a_directory", f"{path} is not a directory")
         try:
-            for match in base.glob(pattern):
-                resolved, descendant_block = _canonical_target(str(match), read=True)
-                if descendant_block or resolved is None:
-                    continue
-                hits.append(str(resolved))
-        except Exception as exc:  # noqa: BLE001
+            hits = heapq.nsmallest(
+                cap + 1, _iter_scoped_paths(base, pattern),
+                key=lambda entry: (-entry.stat().st_mtime_ns, str(entry)))
+        except _FSBudgetError as exc:
+            return _err(exc.reason, exc.hint)
+        except (OSError, ValueError) as exc:
             return _err("glob_failed", str(exc))
-        try:
-            hits.sort(key=lambda m: Path(m).stat().st_mtime, reverse=True)
-        except OSError:
-            hits.sort()
         truncated = len(hits) > cap
-        shown = hits[:cap]
+        shown = [str(hit) for hit in hits[:cap]]
         out = _ok(pattern=pattern, matches=shown, count=len(shown), truncated=truncated)
         geometry = [h for h in shown if _reader_for(h) == "import_part"]
         if geometry:
@@ -949,7 +1203,7 @@ def register_fs_tools(mcp) -> None:
             out["note"] = ("these are CAD/geometry files — fs_read cannot read them; call "
                            'import_part(path="...") for a doc_id, then describe_part / '
                            "measure_part / inspect_part")
-        return out
+        return _bounded_response(out)
 
     @mcp.tool()
     def browse_models(path: str = ".", pattern: str = "**/*", sheets: bool = True,
@@ -978,25 +1232,29 @@ def register_fs_tools(mcp) -> None:
         if not base.is_dir():
             return _err("not_a_directory", f"{path} is not a directory")
         cap = max(1, min(int(limit or 24), 48))
-        found: list[Path] = []
-        try:
-            for match in base.glob(pattern):
+        count = 0
+
+        def models():
+            nonlocal count
+            for match in _iter_scoped_paths(base, pattern, canonical=False):
                 rel = match.relative_to(base)
                 if any(part.startswith(".") for part in rel.parts):
                     continue
-                if not match.is_file() or _kind_for(match.name) not in CAD_EXTS:
-                    continue
-                resolved, descendant_block = _canonical_target(str(match), read=True)
-                if descendant_block or resolved is None:
-                    continue
-                found.append(match)
-        except Exception as exc:  # noqa: BLE001
+                if match.is_file() and _kind_for(match.name) in CAD_EXTS:
+                    count += 1
+                    yield match
+
+        try:
+            # Retain only the tiles and the bounded "not shown" window.
+            found = heapq.nsmallest(
+                cap + 200, models(),
+                key=lambda entry: (_archived(entry.relative_to(base)),
+                                   len(entry.relative_to(base).parts),
+                                   str(entry.relative_to(base)).lower()))
+        except _FSBudgetError as exc:
+            return _err(exc.reason, exc.hint)
+        except (OSError, ValueError) as exc:
             return _err("glob_failed", str(exc))
-        # Live models first: an archive/backup folder full of autosaves would otherwise
-        # fill every tile before the parts anyone is working on (6-axis: 70 of 94 files).
-        found.sort(key=lambda m: (_archived(m.relative_to(base)),
-                                  len(m.relative_to(base).parts),
-                                  str(m.relative_to(base)).lower()))
         shown = found[:cap]
         entries = [(str(m.relative_to(base)), model_card(m)) for m in shown]
         tiles, renders = build_tiles(
@@ -1018,65 +1276,71 @@ def register_fs_tools(mcp) -> None:
             if sheets and not tile.get("thumb") and tile.get("reason"):
                 row["preview"] = f"{tile['status']}: {tile['reason']}"
             models.append(row)
-        out = _ok(root=str(base), count=len(found), shown=len(models), models=models)
+        out = _ok(root=str(base), count=count, shown=len(models), models=models)
         if sheets and tiles:
             out["sheets"] = [_image_ref(p) for p in contact_sheets(tiles, sheet_dir())]
             out["renders"] = renders
-        if len(found) > cap:
+        if count > cap:
             out["not_shown"] = [str(m.relative_to(base)) for m in found[cap:cap + 200]]
-            out["note"] = (f"{len(found) - cap} more model(s) not tiled; narrow path/pattern "
+            out["note"] = (f"{count - cap} more model(s) not tiled; narrow path/pattern "
                            "or raise limit (max 48)")
         if renders.get("pending"):
             out["note"] = (out.get("note", "") + " " if out.get("note") else "") + (
                 f"{renders['pending']} thumbnail(s) not rendered yet (time budget) — call "
                 "again to fill them in; finished renders are cached")
-        return out
+        return _bounded_response(out)
 
     @mcp.tool()
     def fs_grep(pattern: str, path: str = ".", glob: str = "", ignore_case: bool = False,
                 max_matches: int = 0) -> dict:
         """Regex-search files under *path* (optionally filtered by *glob*, e.g. '*.py').
-        Returns {file, line, text} matches, capped at 500. Risk: read."""
+        Returns {file, line, text} matches, capped at 500. Compilation/search runs in a
+        killable readonly child with a two-second per-tool deadline. Input scans (64 MiB,
+        5000 files), traversal and 32 KiB responses refuse explicitly when exhausted.
+        Files initially over 8 MiB are skipped. Risk: read."""
         base, blocked = _canonical_target(path, read=True)
         if blocked:
             return blocked
         assert base is not None
-        try:
-            rx = re.compile(pattern, re.I if ignore_case else 0)
-        except re.error as exc:
-            return _err("bad_pattern", str(exc))
+        if len(pattern.encode("utf-8")) > GREP_MAX_PATTERN_BYTES:
+            return _err("pattern_budget_exceeded", "Regex pattern exceeds 4096 bytes.")
         cap = min(max_matches if max_matches > 0 else MAX_GREP_MATCHES, MAX_GREP_MATCHES)
-        files: list[Path] = [base] if base.is_file() else []
-        if base.is_dir():
-            for candidate in base.rglob(glob or "*"):
-                resolved, descendant_block = _canonical_target(str(candidate), read=True)
-                if not descendant_block and resolved is not None and resolved.is_file():
-                    files.append(resolved)
-        matches: list[dict] = []
-        scanned = 0
-        truncated = False
-        for fp in files:
-            if scanned >= MAX_GREP_FILES:
-                truncated = True
-                break
-            scanned += 1
-            try:
-                if fp.stat().st_size > GREP_MAX_FILE_BYTES:
-                    continue
-                with fp.open("r", encoding="utf-8", errors="replace") as fh:
-                    for i, line in enumerate(fh, 1):
-                        if rx.search(line):
-                            matches.append({"file": str(fp), "line": i,
-                                            "text": _clip_line(line.rstrip("\n"))})
-                            if len(matches) >= cap:
-                                truncated = True
-                                break
-            except (OSError, UnicodeError):
-                continue
-            if len(matches) >= cap:
-                break
-        return _ok(pattern=pattern, matches=matches, count=len(matches),
-                   files_scanned=scanned, truncated=truncated)
+        deadline = time.monotonic() + GREP_SEARCH_DEADLINE_S
+        try:
+            argv = sandbox_argv(
+                [sys.executable, "-I", "-S", "-B", str(Path(__file__).with_name("fs_grep_worker.py"))],
+                "ro")
+            env = {"PATH": os.defpath, "LANG": "C.UTF-8"}
+            if os.name == "nt" and "SYSTEMROOT" in os.environ:
+                env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+            if in_cell():
+                env["CHUDWARE_CELL"] = "1"
+                for key in ("CHUDWARE_ACTOR_SANDBOX", "CHUDWARE_ACTOR_HEX"):
+                    if key in os.environ:
+                        env[key] = os.environ[key]
+            proc = subprocess.Popen(
+                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                env=env, cwd=str(base if base.is_dir() else base.parent), bufsize=0,
+                start_new_session=os.name == "posix",
+                creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0))
+            output, refusal = _capture_bounded_process(
+                proc, deadline, FS_RESPONSE_BYTES,
+                producer=lambda stream: _produce_grep_input(
+                    stream, base, pattern, glob, ignore_case, cap, deadline))
+        except (OSError, ValueError) as exc:
+            return _err("search_worker_failed", str(exc))
+        if refusal:
+            reason = "search_deadline_exceeded" if refusal == "deadline_exceeded" else refusal
+            return _err(reason, "Search was refused; narrow path/pattern or simplify the regex.")
+        if proc.returncode != 0:
+            return _err("search_worker_failed", "Isolated regex worker exited without a search result.")
+        try:
+            result = json.loads(output)
+        except (ValueError, UnicodeError):
+            return _err("search_worker_failed", "Isolated regex worker returned an invalid result.")
+        if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
+            return _err("search_worker_failed", "Isolated regex worker returned an invalid result.")
+        return result
 
     @mcp.tool()
     def fs_write(path: str, content: str, make_dirs: bool = True) -> dict:
@@ -1143,13 +1407,170 @@ def _kill_shell_process_tree(proc: subprocess.Popen) -> None:
         except ProcessLookupError:
             pass
     else:
-        subprocess.run(
-            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
-            check=False,
-        )
-        if proc.poll() is None:
-            proc.kill()
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+                check=False,
+            )
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+
+def _capture_bounded_process(proc: subprocess.Popen, deadline: float, output_cap: int,
+                             producer=None) -> tuple[bytes, Optional[str]]:
+    """Drain finite pipe chunks; deadlines never depend on a child's Python GIL."""
+    output = bytearray()
+    done = threading.Event()
+    stop = threading.Event()
+    failure: list[str] = []
+    assert proc.stdout is not None
+
+    def collect():
+        try:
+            while not stop.is_set():
+                if os.name == "posix" and not select.select([proc.stdout], [], [], 0.05)[0]:
+                    continue
+                chunk = os.read(proc.stdout.fileno(), min(IO_CHUNK_BYTES, output_cap + 1 - len(output)))
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > output_cap:
+                    failure.append("output_budget_exceeded")
+                    break
+        except (OSError, ValueError):
+            if not stop.is_set():
+                failure.append("process_io_failed")
+        finally:
+            done.set()
+
+    def produce():
+        try:
+            producer(proc.stdin)
+        except BrokenPipeError:
+            pass  # A grep worker exits early at the caller's requested match cap.
+        except (OSError, ValueError, _FSBudgetError):
+            failure.append("process_io_failed")
+            done.set()
+        finally:
+            if proc.stdin is not None:
+                proc.stdin.close()
+
+    reader = threading.Thread(target=collect, name="fs-process-output", daemon=True)
+    producer_context = contextvars.copy_context()
+    writer = threading.Thread(
+        target=lambda: producer_context.run(produce), name="fs-grep-input", daemon=True
+    ) if producer else None
+    refusal = None
+    reader_started = writer_started = False
+    try:
+        reader.start()
+        reader_started = True
+        if writer is not None:
+            writer.start()
+            writer_started = True
+        if not done.wait(max(0, deadline - time.monotonic())):
+            refusal = "deadline_exceeded"
+        elif failure:
+            refusal = failure[0]
+        else:
+            try:
+                proc.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                refusal = "deadline_exceeded"
+    except RuntimeError:
+        refusal = "process_io_failed"
+    finally:
+        stop.set()
+        cleanup_deadline = time.monotonic() + 5.0
+        if refusal or proc.poll() is None:
+            try:
+                _kill_shell_process_tree(proc)
+            except (OSError, subprocess.TimeoutExpired):
+                refusal = "cleanup_failed"
+        try:
+            proc.wait(timeout=max(0, cleanup_deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            refusal = "cleanup_failed"
+        if reader_started:
+            reader.join(timeout=max(0, cleanup_deadline - time.monotonic()))
+        if writer_started:
+            writer.join(timeout=max(0, cleanup_deadline - time.monotonic()))
+        elif proc.stdin is not None:
+            proc.stdin.close()
+        if reader.is_alive() or (writer is not None and writer.is_alive()):
+            refusal = "cleanup_failed"
+        proc.stdout.close()
+    return bytes(output[:output_cap]), refusal
+
+
+def _produce_grep_input(stream, base: Path, pattern: str, glob: str,
+                        ignore_case: bool, cap: int, deadline: float) -> None:
+    """Only the parent admits/opens files. The child receives scoped data, not handles to paths."""
+    def send(data: bytes):
+        view = memoryview(data)
+        while view:
+            if time.monotonic() >= deadline:
+                raise _FSBudgetError("search_deadline_exceeded", "Search deadline expired.")
+            written = stream.write(view[:IO_CHUNK_BYTES])
+            if not written:
+                raise BrokenPipeError("search worker closed input")
+            view = view[written:]
+
+    def header(value: dict):
+        data = json.dumps(value, ensure_ascii=False).encode("utf-8") + b"\n"
+        if len(data) > FS_RESPONSE_BYTES:
+            raise _FSBudgetError("pattern_budget_exceeded", "Search header exceeds 32 KiB.")
+        send(data)
+
+    try:
+        header(dict(pattern=pattern, ignore_case=ignore_case, cap=cap,
+                    output_cap=FS_RESPONSE_BYTES, line_columns=MAX_LINE_COLUMNS,
+                    file_cap=GREP_MAX_FILE_BYTES))
+        files = iter((base,)) if base.is_file() else _iter_scoped_paths(
+            base, glob or "*", recursive=True, deadline=deadline)
+        scanned = input_bytes = 0
+        for candidate in files:
+            if not candidate.is_file():
+                continue
+            fp, blocked = _canonical_target(str(candidate), read=True)
+            if blocked or fp is None:
+                continue
+            scanned += 1
+            if scanned > MAX_GREP_FILES:
+                raise _FSBudgetError("search_budget_exceeded", "File scan budget exhausted; narrow path.")
+            try:
+                with _open_read_file(fp) as fh:
+                    before = os.fstat(fh.fileno())
+                    if before.st_size > GREP_MAX_FILE_BYTES:
+                        header({"skip": True})
+                        continue
+                    if input_bytes + before.st_size > GREP_MAX_INPUT_BYTES:
+                        raise _FSBudgetError("search_budget_exceeded", "Search input byte budget exhausted.")
+                    data = bytearray()
+                    remaining = before.st_size
+                    while remaining:
+                        if time.monotonic() >= deadline:
+                            raise _FSBudgetError("search_deadline_exceeded", "Search deadline expired.")
+                        chunk = fh.read(min(IO_CHUNK_BYTES, remaining))
+                        if not chunk:
+                            raise _FSBudgetError("file_changed", "Search input shrank during the read.")
+                        data.extend(chunk)
+                        remaining -= len(chunk)
+                    if not _file_unchanged(before, os.fstat(fh.fileno())):
+                        raise _FSBudgetError("file_changed", "Search input changed during the read.")
+                    input_bytes += len(data)
+            except (OSError, ValueError):
+                header({"skip": True})
+                continue
+            header({"file": str(fp), "bytes": len(data)})
+            send(data)
+        header({"end": True})
+    except _FSBudgetError as exc:
+        # The child discards accumulated matches instead of reporting a partial success.
+        data = json.dumps({"error": _err(exc.reason, exc.hint)}).encode("utf-8") + b"\n"
+        stream.write(data)
 
 
 def register_shell_tools(mcp) -> None:
@@ -1166,10 +1587,11 @@ def register_shell_tools(mcp) -> None:
         guard above is the other half of the safety story, not a substitute for one).
         timeout_s is honored exactly from 1 to 86400 seconds (default 60; zero uses
         the default). Out-of-range requests refuse before execution, never clamp.
-        On timeout the isolated POSIX process group / Windows process tree is killed.
-        Output over 96 KiB is truncated and decoded as UTF-8 with replacement,
-        including partial timeout output. Returns
-        {ok, exit_code, output, truncated, timed_out}. Risk: write.
+        At timeout or more than 96 KiB of output, the isolated POSIX process group /
+        Windows process tree is killed and reaped. Captured output is bounded while it
+        is produced, decoded as UTF-8 with replacement, and retained on a typed refusal
+        (shell_deadline_exceeded/output_budget_exceeded); never a partial ok:true.
+        Returns {ok, exit_code, output, truncated, timed_out, reason?, hint?}. Risk: write.
         """
         if not command.strip():
             return _err("empty_command", "command is empty")
@@ -1185,7 +1607,12 @@ def register_shell_tools(mcp) -> None:
             return _err("invalid_timeout",
                         f"timeout_s must be between 1 and {SHELL_MAX_TIMEOUT_S} seconds")
         root = _workspace_root()
-        workdir = cwd or (str(root) if root else None)
+        if root is None:
+            return _err("workspace_root_unavailable", "CHUDWARE_FS_ROOT must name an existing directory")
+        directory = Path(cwd).expanduser() if cwd else root
+        if not directory.is_absolute():
+            directory = root / directory
+        workdir = str(directory.resolve())
         if workdir and not Path(workdir).is_dir():
             return _err("bad_cwd", f"cwd is not a directory: {workdir}")
         if workdir:
@@ -1193,41 +1620,27 @@ def register_shell_tools(mcp) -> None:
             if blocked:
                 return blocked
         try:
+            argv = sandbox_argv(["/bin/sh", "-c", command]) if in_cell() else command
             proc = subprocess.Popen(
-                command, shell=True, cwd=workdir,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                argv, shell=not in_cell(), cwd=workdir,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
                 start_new_session=os.name == "posix",
                 creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
             )
-            timed_out = False
-            cleanup_failed = False
-            try:
-                try:
-                    output, _ = proc.communicate(timeout=timeout)
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                    _kill_shell_process_tree(proc)
-                    try:
-                        output, _ = proc.communicate(timeout=5)
-                    except subprocess.TimeoutExpired as exc:
-                        # An escaped descendant still owns the pipe. Never turn cleanup
-                        # into an unbounded wait or report complete tree termination.
-                        output = exc.output or b""
-                        cleanup_failed = True
-            finally:
-                if proc.stdout is not None:
-                    proc.stdout.close()
+            output, refusal = _capture_bounded_process(
+                proc, time.monotonic() + timeout, SHELL_MAX_OUTPUT_BYTES)
         except Exception as exc:  # noqa: BLE001
             return _err("exec_failed", str(exc))
-        truncated = len(output) > SHELL_MAX_OUTPUT_BYTES
-        text = output[:SHELL_MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+        timed_out = refusal == "deadline_exceeded"
+        truncated = refusal == "output_budget_exceeded"
+        text = output.decode("utf-8", errors="replace")
         if truncated:
-            text += "\n… [output truncated]"
+            text += "\n… [output budget exceeded; command stopped]"
         result = _ok(exit_code=124 if timed_out else proc.returncode,
                      timed_out=timed_out, truncated=truncated, output=text)
-        if cleanup_failed:
-            result.update(_err("cleanup_failed",
-                              "Command timed out; an escaped descendant kept output open "
-                              "after process-tree termination"))
+        if refusal:
+            result.update(_err(
+                "shell_deadline_exceeded" if timed_out else refusal,
+                "Command was stopped at its deadline or I/O budget; output is incomplete."))
         return result
 

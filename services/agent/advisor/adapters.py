@@ -16,7 +16,7 @@ Two sources exist:
 
   * :func:`findings_from_doc` — the **doc path** (``advise(doc_id)`` MCP tool and
     DAG nodes carrying a doc_id).  Runs the stage battery against ``doc_eval_*`` /
-    ``doc_sketch_health`` RPCs, where feature ids and measured diameters DO exist,
+    ``sketch_health`` RPCs, where feature ids and measured diameters DO exist,
     so the flagship ``interference → fit_calc`` computed fix runs for real.
 """
 from __future__ import annotations
@@ -278,34 +278,84 @@ def _check_overlap(doc_id: str, call: Any) -> list[Finding]:
 
 
 def _check_sketch(doc_id: str, call: Any, check: str) -> list[Finding]:
-    r = call("doc_sketch_health", doc_id=doc_id) or {}
+    from services.mcp.ascii2d import sketch_design_intent, sketch_feeds_feature
+
+    snapshot = call("doc_tree", doc_id=doc_id) or {}
+    features = (snapshot.get("tree") or {}).get("features")
+    if not isinstance(features, list):
+        raise RuntimeError("doc_tree returned no feature roster")
+
     out: list[Finding] = []
-    if check == stages.CHECK_OPEN_PROFILE and not r.get("closed", True):
-        out.append(Finding(
-            kind="open_profile",
-            check=stages.CHECK_OPEN_PROFILE,
-            severity="blocker",  # open profile gates sketch exit
-            finding=r.get("summary") or "sketch profile is not closed",
-            numbers={"open_chains": r.get("open_chains")},
-            refs={"doc_id": doc_id, "sketch": r.get("sketch")},
-            source_kind="kernel",
-            source_detail="doc_sketch_health",
-            extra={},
-        ))
-    if check == stages.CHECK_SKETCH_HEALTH:
-        dof = r.get("dof")
-        if isinstance(dof, (int, float)) and dof > 0:
-            out.append(Finding(
-                kind="underconstrained",
-                check=stages.CHECK_SKETCH_HEALTH,
-                severity="hint",
-                finding=r.get("dof_summary") or f"sketch under-constrained: {dof} DOF remain",
-                numbers={"dof": dof},
-                refs={"doc_id": doc_id, "sketch": r.get("sketch")},
-                source_kind="kernel",
-                source_detail="doc_sketch_health",
-                extra={},
-            ))
+    for feature in features:
+        if not isinstance(feature, dict) or feature.get("type") not in ("sketch", "sketch2d"):
+            continue
+        sketch = feature.get("id")
+        if not sketch:
+            raise RuntimeError("doc_tree returned a sketch without a feature id")
+        refs = {"doc_id": doc_id, "sketch": sketch}
+        try:
+            r = call("sketch_health", doc_id=doc_id, sketch=sketch)
+            if not isinstance(r, dict) or r.get("ok") is False:
+                raise RuntimeError(f"sketch_health failed: {r}")
+            closure = r.get("closure") or {}
+            if check == stages.CHECK_OPEN_PROFILE:
+                if not isinstance(closure.get("closed_chains_ok"), bool):
+                    raise RuntimeError("sketch_health returned no closure verdict")
+                endpoints = closure.get("open_endpoints") or []
+                if not closure["closed_chains_ok"] or endpoints:
+                    out.append(Finding(
+                        kind="open_profile", check=check, severity="blocker",
+                        finding=f"sketch {sketch} profile is not closed: "
+                                f"{len(endpoints)} open endpoint(s)",
+                        numbers={"open_endpoints": len(endpoints)},
+                        refs={**refs, "handles": endpoints}, source_kind="kernel",
+                        source_detail="sketch_health", extra={"closure": closure},
+                    ))
+                continue
+
+            dof, status = r.get("dof"), r.get("status")
+            if not isinstance(dof, (int, float)) or not status:
+                raise RuntimeError("sketch_health returned no DOF/status verdict")
+            params = feature.get("params") or {}
+            intent = sketch_design_intent(
+                params.get("entities") or [], params.get("constraints") or [],
+                health=r, feeds_feature=sketch_feeds_feature(features, str(sketch)),
+            )
+            quality_findings = list(intent["findings"])
+            if status == "under" and dof <= 0:
+                quality_findings.append({
+                    "kind": "under_dimensioned", "severity": "warning",
+                    "message": "Sketch reports under-defined status; inspect free variables "
+                               "and add geometric relations/driving dimensions.",
+                })
+            if status == "over" or r.get("conflicting") or r.get("converged") is False:
+                quality_findings.append({
+                    "kind": "sketch_conflict", "severity": "error",
+                    "message": "Sketch cannot solve cleanly; resolve conflicting constraints.",
+                })
+            for finding in quality_findings:
+                severity = finding.get("severity")
+                out.append(Finding(
+                    kind=finding["kind"], check=check,
+                    severity=("blocker" if severity in ("error", "fail", "blocker")
+                              else "info" if severity == "info" else "action"),
+                    finding=f"sketch {sketch}: {finding['message']}",
+                    numbers={"dof": dof, "status": status,
+                             "driving_dimensions": intent["driving_dimensions"]},
+                    refs={**refs, "entities": finding.get("entities", [])},
+                    source_kind="kernel", source_detail="sketch_health",
+                    extra={**finding, "pinned_only": intent["pinned_only"],
+                           "anchored": intent["anchored"],
+                           "free_variables": r.get("free_variables") or [],
+                           "dof_narration": r.get("dof_narration"),
+                           "conflicting": r.get("conflicting") or []},
+                ))
+        except Exception as exc:  # noqa: BLE001
+            failure = _check_outcome_finding(
+                check, doc_id, severity="blocker", outcome="error", error=exc,
+            )
+            failure.refs["sketch"] = sketch
+            out.append(failure)
     return out
 
 
@@ -517,7 +567,8 @@ def _default_rpc():
     native_methods = {
         "doc_eval_interference": "eval_interference",
         "doc_eval_feature_overlap": "eval_feature_overlap",
-        "doc_sketch_health": "sketch_health",
+        "doc_tree": "doc_tree",
+        "sketch_health": "sketch_health",
         "doc_feature_status": "doc_rebuild",
         "eval_thickness": "eval_thickness",
     }

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from .gcode_check import parse_gcode, verify_gcode
+from . import gcode_check
 
 
 _START = 'G90\nM83\nG28\nM190 S60\nM109 S220\n'
@@ -23,6 +24,52 @@ def _verify(tmp_path, text, **kwargs):
     path.write_text(text)
     result = verify_gcode(path, nozzle_mm=.4, material='PLA', bed_polygon=[(0,0),(100,0),(100,100),(0,100)], max_height_mm=100, **kwargs)
     return {row['check']:row for row in result['checks']}, result
+
+
+@pytest.mark.parametrize('width', ['nan', 'inf', '-inf', '0', '-1', '1e30', '1e1000', 'garbage'])
+def test_hostile_width_refuses_before_geometry(tmp_path, monkeypatch, width):
+    text = _START + _layer(.2).replace(';WIDTH:0.45', f';WIDTH:{width}') + _END
+    path = tmp_path/'hostile.gcode'
+    path.write_text(text)
+    monkeypatch.setattr(gcode_check, '_geometry', lambda model: pytest.fail('hostile WIDTH reached geometry'))
+    with pytest.raises(ValueError, match='WIDTH'):
+        parse_gcode(path)
+    result = verify_gcode(path)
+    assert result['ok'] is False
+    assert result['status'] == 'fail'
+    assert result['checks'][0]['check'] == 'analysis_budget'
+
+
+@pytest.mark.parametrize('floating', [False, True])
+def test_morphology_budget_refuses_before_kernel_allocation(tmp_path, monkeypatch, floating):
+    monkeypatch.setattr(gcode_check, '_MAX_KERNEL_SAMPLES', 1)
+    original_ogrid = gcode_check.np.ogrid
+
+    class BoundedGrid:
+        def __getitem__(self, key):
+            assert all(part.stop - part.start == 1 for part in key)
+            return original_ogrid[key]
+
+    monkeypatch.setattr(gcode_check.np, 'ogrid', BoundedGrid())
+    text = _START + (_layer(.2).replace('WIDTH:0.45', 'WIDTH:0.01') + _layer(.4, x=60)
+                     if floating else _layer(.2)) + _END
+    checks, result = _verify(tmp_path, text)
+    assert result['ok'] is False
+    assert 'Morphology kernel' in checks['analysis_budget']['note']
+
+
+def test_path_sampling_budget_refuses_before_repeating_samples(tmp_path, monkeypatch):
+    monkeypatch.setattr(gcode_check, '_MAX_PATH_SAMPLES', 10)
+    monkeypatch.setattr(gcode_check.np, 'repeat', lambda *args, **kwargs: pytest.fail('oversized samples allocated'))
+    checks, result = _verify(tmp_path, _START + _layer(.2) + _END)
+    assert result['ok'] is False
+    assert 'sampling budget' in checks['analysis_budget']['note']
+
+
+def test_oversized_grid_is_refused_not_safe_warning(tmp_path):
+    checks, result = _verify(tmp_path, _START + _layer(.2, length=100_000) + _END)
+    assert result['ok'] is False
+    assert 'grid budget' in checks['analysis_budget']['note']
 
 
 def test_supported_layers_pass_and_metadata(tmp_path):

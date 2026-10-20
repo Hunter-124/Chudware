@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -27,9 +29,18 @@ struct JournalRecord {
 void to_json(nlohmann::json& json, const JournalRecord& value);
 void from_json(const nlohmann::json& json, JournalRecord& value);
 
+struct JournalLimits {
+    size_t record_bytes = 256 * 1024;
+    uint64_t total_bytes = 64 * 1024 * 1024;
+    size_t total_records = 65536;
+    size_t replay_records = 1024;
+    size_t replay_bytes = 4 * 1024 * 1024;
+};
+
 class Journal {
 public:
-    Journal(std::filesystem::path install_directory, device::LaneEpoch epoch);
+    Journal(std::filesystem::path install_directory, device::LaneEpoch epoch,
+            JournalLimits limits = {});
     ~Journal();
 
     Journal(const Journal&) = delete;
@@ -38,10 +49,14 @@ public:
     Journal& operator=(Journal&&) noexcept;
 
     device::Seq append(std::string_view kind, std::string_view subject,
-                       nlohmann::json body, nlohmann::json raw = nullptr);
+                       const nlohmann::json& body, const nlohmann::json& raw = nullptr);
     device::Seq head() const;
     device::Seq epochFloor() const;
     std::vector<JournalRecord> replay(device::Seq from = 1) const;
+    // Streams one bounded record at a time; false stops without loading the rest.
+    void visit(device::Seq from,
+               const std::function<bool(const JournalRecord&)>& visitor) const;
+    const JournalLimits& limits() const;
 
 private:
     struct Impl;

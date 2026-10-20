@@ -170,6 +170,8 @@ void Sketch3DMode::applyEntities(const nlohmann::json& res) {
             se.pts.push_back(jv(e.value("p2", nlohmann::json())));
         } else if (se.type == "spline" && e.contains("points") && e["points"].is_array()) {
             for (const auto& p : e["points"]) se.pts.push_back(jv(p));
+            if (e.contains("samples") && e["samples"].is_array())
+                for (const auto& p : e["samples"]) se.samples.push_back(jv(p));
         }
         ents_.push_back(std::move(se));
     }
@@ -183,11 +185,22 @@ void Sketch3DMode::refreshHealth(AppState& st) {
     status_ = res.value("status", std::string("under"));
     converged_ = res.value("converged", true);
     nWires_ = res.contains("wires") && res["wires"].is_array() ? (int)res["wires"].size() : 0;
+    warning_.clear();
+    for (const auto& ref : externalRefs_)
+        if (ref.value("stale", false)) {
+            warning_ = "Model reference " + ref.value("id", std::string()) +
+                       " is stale; last known position retained.";
+            break;
+        }
+    if (res.contains("skipped_constraints") && !res["skipped_constraints"].empty())
+        warning_ += (warning_.empty() ? "" : "  ") +
+                    std::to_string(res["skipped_constraints"].size()) + " relation(s) not applied.";
 }
 
 void Sketch3DMode::reloadParamsFromTree(AppState& st) {
     entJson_ = nlohmann::json::array();
     conJson_ = nlohmann::json::array();
+    externalRefs_ = nlohmann::json::array();
     const auto& tree = st.docMirror.tree();
     if (!tree.is_object() || !tree.contains("features")) return;
     for (const auto& f : tree["features"]) {
@@ -197,6 +210,8 @@ void Sketch3DMode::reloadParamsFromTree(AppState& st) {
             entJson_ = params["entities"];
         if (params.contains("constraints") && params["constraints"].is_array())
             conJson_ = params["constraints"];
+        if (params.contains("external_refs") && params["external_refs"].is_array())
+            externalRefs_ = params["external_refs"];
         return;
     }
 }
@@ -216,6 +231,7 @@ bool Sketch3DMode::commitParams(AppState& st, const nlohmann::json* entities,
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     if (entities) entJson_ = *entities;
     if (constraints) conJson_ = *constraints;
+    reloadParamsFromTree(st);
     refreshHealth(st);
     return true;
 }
@@ -259,11 +275,89 @@ void Sketch3DMode::addConstraint(AppState& st, nlohmann::json con, const char* l
     commitParams(st, nullptr, &cons, label);
 }
 
+bool Sketch3DMode::isExternalHandle(const std::string& handle) const {
+    return !handle.empty() && handle[0] == 'x';
+}
+
+void Sketch3DMode::setModelVertexPicking(AppState& st, bool enabled) {
+    if (enabled == modelVertexPicking_) return;
+    if (enabled) {
+        resetTool();
+        savedPickFaces_ = st.selection.allowFaces;
+        savedPickEdges_ = st.selection.allowEdges;
+        savedPickVertices_ = st.selection.allowVertices;
+        st.selection.allowFaces = st.selection.allowEdges = false;
+        st.selection.allowVertices = true;
+        st.selection.clear();
+    } else {
+        st.selection.allowFaces = savedPickFaces_;
+        st.selection.allowEdges = savedPickEdges_;
+        st.selection.allowVertices = savedPickVertices_;
+    }
+    modelVertexPicking_ = enabled;
+}
+
+void Sketch3DMode::consumeModelVertexPick(AppState& st) {
+    if (!modelVertexPicking_ || st.selection.empty()) return;
+    // app.cpp resolves ordinary viewport selections through its asynchronous
+    // doc_resolve_pick queue, including document/revision guards. Never block
+    // the overlay on another resolve call or reuse an unresolved id-pass hit.
+    const auto& item = st.selection.items().back();
+    if (item.hit.kind != render::PickKind::Vertex || item.pending_resolve) return;
+    if (!item.resolution_error.empty()) {
+        st.toast(ui::ToastLevel::Warn, item.resolution_error);
+        st.selection.clear();
+        return;
+    }
+    auto selector = nlohmann::json::parse(item.selector, nullptr, false);
+    if (!selector.is_object()) return;
+    reloadParamsFromTree(st);
+    for (const auto& ref : externalRefs_) {
+        if (ref.contains("source") && ref["source"].value("selector", nlohmann::json()) == selector) {
+            const std::string id = ref.value("id", std::string());
+            if (std::find(selHandles_.begin(), selHandles_.end(), id) == selHandles_.end())
+                selHandles_.push_back(id);
+            setModelVertexPicking(st, false);
+            st.selection.clear();
+            return;
+        }
+    }
+    int next = 1;
+    const auto& tree = st.docMirror.tree();
+    if (tree.contains("features")) for (const auto& f : tree["features"]) {
+        const auto params = f.value("params", nlohmann::json::object());
+        if (!params.contains("external_refs") || !params["external_refs"].is_array()) continue;
+        for (const auto& ref : params["external_refs"]) {
+            const std::string id = ref.value("id", std::string());
+            if (!id.empty() && id[0] == 'x') next = std::max(next, std::atoi(id.c_str() + 1) + 1);
+        }
+    }
+    const std::string id = "x" + std::to_string(next);
+    auto refs = externalRefs_;
+    refs.push_back({{"id", id}, {"source", {{"kind", "vertex"}, {"selector", selector}}}, {"stale", true}});
+    nlohmann::json op{{"op", "edit_feature"}, {"id", fid_}, {"params", {{"external_refs", refs}}}};
+    auto result = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    setModelVertexPicking(st, false);
+    st.selection.clear();
+    if (!result.ok) {
+        st.toast(ui::ToastLevel::Warn, "Reference Vertex: " + result.error_message);
+        return;
+    }
+    if (!result.aicm_path.empty()) { std::string error; st.loadDocMesh(result.aicm_path, error); }
+    reloadParamsFromTree(st);
+    refreshHealth(st);
+    selHandles_.push_back(id);
+}
+
 // ---------------------------------------------------------------------------
 // enter / exit
 // ---------------------------------------------------------------------------
 
 bool Sketch3DMode::enterForFeature(AppState& st, const std::string& fid) {
+    if (st.activeDocLockedByAgent()) {
+        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
+        return false;
+    }
     if (active_) exitSketch(st, true);
     if (!st.docMirror.hasDoc() || !st.workerStarted) return false;
     fid_ = fid;
@@ -288,6 +382,10 @@ bool Sketch3DMode::enterForFeature(AppState& st, const std::string& fid) {
 }
 
 bool Sketch3DMode::enterNew(AppState& st) {
+    if (st.activeDocLockedByAgent()) {
+        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
+        return false;
+    }
     if (!st.docMirror.hasDoc() || !st.workerStarted) return false;
     nlohmann::json op = {{"op", "add_feature"},
                          {"feature", {{"type", "sketch3d"}, {"name", "3DSketch"},
@@ -305,6 +403,9 @@ bool Sketch3DMode::enterNew(AppState& st) {
 
 void Sketch3DMode::exitSketch(AppState& st, bool keep) {
     if (!active_) return;
+    setModelVertexPicking(st, false);
+    const bool locked = st.docLockedByAgent(docId_);
+    if (locked) keep = true;
     if (!keep && !cancelCheckpoint_.empty() && st.docMirror.docId() == docId_) {
         nlohmann::json res, params = {{"doc_id", docId_}, {"checkpoint", cancelCheckpoint_}};
         std::string err;
@@ -326,7 +427,7 @@ void Sketch3DMode::exitSketch(AppState& st, bool keep) {
     // keep=false (Cancel): only delete a NEW empty sketch. An EXISTING sketch the user emptied was
     // just restored by the revert block above; entJson_ (the in-memory mirror) is stale-empty and
     // must NOT trigger a delete of the restored feature — the isNewEmpty_ gate protects it.
-    if (entJson_.empty() && (keep || isNewEmpty_) && st.docMirror.docId() == docId_) {
+    if (!locked && entJson_.empty() && (keep || isNewEmpty_) && st.docMirror.docId() == docId_) {
         nlohmann::json op = {{"op", "delete_feature"}, {"id", fid_}};
         st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
     }
@@ -337,6 +438,7 @@ void Sketch3DMode::exitSketch(AppState& st, bool keep) {
     clearSel();
     dragArmed_ = dragging_ = false;
     dimPopupOpen_ = false;
+    planePopupOpen_ = false;
 }
 
 bool Sketch3DMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
@@ -348,6 +450,8 @@ bool Sketch3DMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     if (!active_) return false;
     if (cmdId == "sketch_exit" || cmdId == "sketch3d_exit") { exitSketch(st, true); return true; }
     if (cmdId == "sketch3d_cancel") { exitSketch(st, false); return true; }   // ribbon commit cluster ✗
+    if (cmdId.rfind("sk3d_", 0) == 0 && cmdId != "sk3d_relations")
+        setModelVertexPicking(st, false);
     // Ribbon tool buttons (Sketch tab, swapped to the "Sketch3D" row set while editing — see
     // ribbon.cpp/ribbon_def.cpp). Mirror the old floating overlay toolbar's tool-arming behavior.
     if (cmdId == "sk3d_line")   { resetTool(); tool_ = Sk3Tool::Line;   clearSel(); return true; }
@@ -362,7 +466,8 @@ bool Sketch3DMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "sk3d_delete") { deleteSelection(st); return true; }
     if (cmdId == "sk3d_fix") {
         for (const auto& h : selHandles_)
-            if (h != "origin") addConstraint(st, {{"type", "fix"}, {"refs", {h}}}, "Fix");
+            if (h != "origin" && !isExternalHandle(h))
+                addConstraint(st, {{"type", "fix"}, {"refs", {h}}}, "Fix");
         for (const auto& id : selEnts_) addConstraint(st, {{"type", "fix"}, {"refs", {id}}}, "Fix");
         clearSel();
         return true;
@@ -449,6 +554,7 @@ const Sk3Entity* Sketch3DMode::entById(const std::string& id) const {
 
 // handle name for point k of an entity ("e3.p1" style, per the contract grammar)
 static std::string handleName(const Sk3Entity& e, int k) {
+    if (!e.id.empty() && e.id[0] == 'x') return e.id;
     if (e.type == "point") return e.id + ".p";
     if (e.type == "line") return e.id + (k == 0 ? ".p1" : ".p2");
     if (e.type == "arc") return e.id + (k == 0 ? ".p1" : (k == 1 ? ".pm" : ".p2"));
@@ -519,23 +625,8 @@ void Sketch3DMode::samplePolyline(const Sk3Entity& e, std::vector<Vec3>& out) {
         }
         return;
     }
-    // spline: Catmull-Rom through the interpolation points (display approximation).
-    if (e.pts.size() < 2) { out = e.pts; return; }
-    const int seg = 8;
-    auto P = [&](int i) {
-        i = i < 0 ? 0 : (i >= (int)e.pts.size() ? (int)e.pts.size() - 1 : i);
-        return e.pts[i];
-    };
-    for (int i = 0; i + 1 < (int)e.pts.size(); ++i) {
-        Vec3 p0 = P(i - 1), p1 = P(i), p2 = P(i + 1), p3 = P(i + 2);
-        for (int k = (i == 0 ? 0 : 1); k <= seg; ++k) {
-            float t = (float)k / seg, t2 = t * t, t3 = t2 * t;
-            Vec3 q = (p1 * 2.0f + (p2 - p0) * t +
-                      (p0 * 2.0f - p1 * 5.0f + p2 * 4.0f - p3) * t2 +
-                      ((p1 - p2) * 3.0f + p3 - p0) * t3) * 0.5f;
-            out.push_back(q);
-        }
-    }
+    // Use the solver's OCCT-compatible interpolation, not a different local spline.
+    out = e.samples;
 }
 
 std::string Sketch3DMode::hitTestEntity(AppState& st, const ImVec2& s, const ImVec2& imgMin,
@@ -684,7 +775,8 @@ void Sketch3DMode::commitPoint(AppState& st) {
 // ---------------------------------------------------------------------------
 
 void Sketch3DMode::toggleSel(const std::string& idOrHandle) {
-    bool isHandle = idOrHandle.find('.') != std::string::npos || idOrHandle == "origin";
+    bool isHandle = idOrHandle.find('.') != std::string::npos || idOrHandle == "origin" ||
+                    isExternalHandle(idOrHandle);
     auto& vec = isHandle ? selHandles_ : selEnts_;
     auto it = std::find(vec.begin(), vec.end(), idOrHandle);
     if (it != vec.end()) vec.erase(it);
@@ -712,110 +804,140 @@ void Sketch3DMode::deleteSelection(AppState& st) {
 }
 
 void Sketch3DMode::drawConstraintButtons(AppState& st) {
-    // Classify the selection: nP point handles, line/arc entity ids.
-    const int nP = (int)selHandles_.size();
-    std::vector<std::string> lines, arcs;
+    const int nP = static_cast<int>(selHandles_.size()), nE = static_cast<int>(selEnts_.size());
+    std::vector<std::string> lines, arcs, splines;
     for (const auto& id : selEnts_) {
         const Sk3Entity* e = entById(id);
         if (!e) continue;
         if (e->type == "line") lines.push_back(id);
         else if (e->type == "arc") arcs.push_back(id);
+        else if (e->type == "spline") splines.push_back(id);
     }
-    const int nL = (int)lines.size(), nA = (int)arcs.size(), nE = (int)selEnts_.size();
-    auto btn = [&](const char* label) { return ImGui::SmallButton(label); };
-
-    bool any = false;
-    if (nP == 2 && nE == 0) {
+    const int nL = static_cast<int>(lines.size()), nA = static_cast<int>(arcs.size());
+    const int nS = static_cast<int>(splines.size());
+    const bool validPoints = std::none_of(selHandles_.begin(), selHandles_.end(),
+        [](const std::string& p) { return p == "origin"; });
+    nlohmann::json pending;
+    const char* pendingLabel = "Relation";
+    bool any = false, sameLine = false;
+    auto button = [&](const char* label) {
+        if (sameLine) ImGui::SameLine();
+        sameLine = true;
         any = true;
-        if (btn("Coincident"))
-            addConstraint(st, {{"type", "coincident"}, {"refs", {selHandles_[0], selHandles_[1]}}},
-                          "Coincident"), clearSel();
-        ImGui::SameLine();
-        if (btn("Distance")) {
-            dimPendingCon_ = {{"type", "distance"}, {"refs", {selHandles_[0], selHandles_[1]}}};
-            Vec3 a = handleWorld(selHandles_[0]), b = handleWorld(selHandles_[1]);
-            dimValue_ = length(b - a);
-            dimPopupOpen_ = true; dimFocus_ = true;
+        return ImGui::SmallButton(label);
+    };
+    auto relation = [&](const char* label, const char* type, const nlohmann::json& refs) {
+        if (button(label)) {
+            pending = {{"type", type}, {"refs", refs}};
+            pendingLabel = label;
         }
+    };
+    auto planeRelation = [&](const char* label, const char* type, const nlohmann::json& refs) {
+        if (button(label)) {
+            planePendingCon_ = {{"type", type}, {"refs", refs}};
+            planePopupOpen_ = true;
+        }
+    };
+    auto dimension = [&](const char* label, const char* type, const nlohmann::json& refs, double value) {
+        if (button(label)) {
+            dimPendingCon_ = {{"type", type}, {"refs", refs}};
+            dimValue_ = value;
+            dimPopupOpen_ = dimFocus_ = true;
+        }
+    };
+    if (validPoints && nP == 2 && nE == 0) {
+        relation("Coincident", "coincident", selHandles_);
+        dimension("Distance", "distance", selHandles_,
+                  length(handleWorld(selHandles_[1]) - handleWorld(selHandles_[0])));
+        planeRelation("Symmetric", "symmetric", selHandles_);
     }
-    if (nP == 1 && nL + nA == 1 && nE == 1) {
-        any = true;
-        if (btn("Point On"))
-            addConstraint(st, {{"type", "point_on"}, {"refs", {selHandles_[0], selEnts_[0]}}},
-                          "Point On"), clearSel();
+    if (validPoints && nP == 1 && nE == 1 && nL + nA + nS == 1) {
+        relation("Point On", "point_on", {selHandles_[0], selEnts_[0]});
+        if (nL + nA == 1) relation("Midpoint", "midpoint", {selHandles_[0], selEnts_[0]});
         if (nL == 1) {
-            ImGui::SameLine();
-            if (btn("Distance")) {
-                dimPendingCon_ = {{"type", "distance"}, {"refs", {selHandles_[0], lines[0]}}};
-                dimValue_ = 10.0;
-                dimPopupOpen_ = true; dimFocus_ = true;
-            }
+            const auto* line = entById(lines[0]);
+            Vec3 p = handleWorld(selHandles_[0]), d = line->pts[1] - line->pts[0];
+            double distance = length(d) > 1e-9f ? length(cross(p - line->pts[0], d)) / length(d) : 0;
+            dimension("Distance", "distance", {selHandles_[0], lines[0]}, distance);
         }
     }
     if (nL == 1 && nP == 0 && nE == 1) {
-        any = true;
-        if (btn("Length")) {
-            const Sk3Entity* e = entById(lines[0]);
-            dimPendingCon_ = {{"type", "length"}, {"refs", {lines[0]}}};
-            dimValue_ = (e && e->pts.size() == 2) ? length(e->pts[1] - e->pts[0]) : 10.0;
-            dimPopupOpen_ = true; dimFocus_ = true;
+        const auto* e = entById(lines[0]);
+        dimension("Length", "length", lines, length(e->pts[1] - e->pts[0]));
+        for (const char* axis : {"x", "y", "z"}) {
+            std::string label = std::string("Along ") + static_cast<char>(axis[0] - 'a' + 'A');
+            if (button(label.c_str())) {
+                pending = {{"type", "along_axis"}, {"refs", lines}, {"axis", axis}};
+                pendingLabel = "Along Axis";
+            }
         }
-        ImGui::SameLine();
-        if (btn("Along X"))
-            addConstraint(st, {{"type", "along_axis"}, {"refs", {lines[0]}}, {"axis", "x"}},
-                          "Along X"), clearSel();
-        ImGui::SameLine();
-        if (btn("Along Y"))
-            addConstraint(st, {{"type", "along_axis"}, {"refs", {lines[0]}}, {"axis", "y"}},
-                          "Along Y"), clearSel();
-        ImGui::SameLine();
-        if (btn("Along Z"))
-            addConstraint(st, {{"type", "along_axis"}, {"refs", {lines[0]}}, {"axis", "z"}},
-                          "Along Z"), clearSel();
+        sameLine = false;
+        planeRelation("Parallel to Plane", "parallel_plane", lines);
+        planeRelation("Normal to Plane", "normal_plane", lines);
     }
     if (nL == 2 && nP == 0 && nE == 2) {
-        any = true;
-        if (btn("Parallel"))
-            addConstraint(st, {{"type", "parallel"}, {"refs", {lines[0], lines[1]}}}, "Parallel"),
-                clearSel();
-        ImGui::SameLine();
-        if (btn("Perpendicular"))
-            addConstraint(st, {{"type", "perpendicular"}, {"refs", {lines[0], lines[1]}}},
-                          "Perpendicular"), clearSel();
-        ImGui::SameLine();
-        if (btn("Angle")) {
-            dimPendingCon_ = {{"type", "angle"}, {"refs", {lines[0], lines[1]}}};
-            dimValue_ = 90.0;
-            dimPopupOpen_ = true; dimFocus_ = true;
-        }
+        relation("Parallel", "parallel", lines);
+        relation("Perpendicular", "perpendicular", lines);
+        dimension("Angle", "angle", lines, 90);
+        relation("Collinear", "collinear", lines);
+        relation("Equal", "equal", lines);
     }
-    if (nP + nE == 1) {
-        any = true;
-        if (btn("Fix")) {
-            std::string ref = nP == 1 ? selHandles_[0] : selEnts_[0];
-            if (ref != "origin")
-                addConstraint(st, {{"type", "fix"}, {"refs", {ref}}}, "Fix");
-            clearSel();
+    if (nA == 2 && nP == 0 && nE == 2) {
+        relation("Equal", "equal", arcs);
+        relation("Concentric", "concentric", arcs);
+        relation("Coradial", "coradial", arcs);
+    }
+    // Tangency belongs to a shared end, never an interior spline point or an
+    // arbitrary pair of unconnected curves. Endpoint selections retain the branch.
+    if (nP + nE == 2) {
+        std::vector<std::string> refs = selEnts_;
+        refs.insert(refs.end(), selHandles_.begin(), selHandles_.end());
+        const auto* a = entById(refs[0].substr(0, refs[0].find('.')));
+        const auto* b = entById(refs[1].substr(0, refs[1].find('.')));
+        const bool pair = a && b && a != b &&
+            ((a->type == "arc" && b->type == "arc") ||
+             (a->type == "line" && (b->type == "arc" || b->type == "spline")) ||
+             (b->type == "line" && (a->type == "arc" || a->type == "spline")));
+        bool shared = false;
+        if (pair && !a->pts.empty() && !b->pts.empty()) {
+            for (int ia : {0, static_cast<int>(a->pts.size()) - 1})
+                for (int ib : {0, static_cast<int>(b->pts.size()) - 1}) {
+                    std::string ha = handleName(*a, ia), hb = handleName(*b, ib);
+                    if (refs[0].find('.') != std::string::npos && refs[0] != ha) continue;
+                    if (refs[1].find('.') != std::string::npos && refs[1] != hb) continue;
+                    if (length(a->pts[ia] - b->pts[ib]) < 1e-4f) shared = true;
+                    for (const auto& con : conJson_)
+                        if (con.value("type", std::string()) == "coincident" && con.contains("refs") &&
+                            con["refs"].is_array() && con["refs"].size() == 2 &&
+                            ((con["refs"][0] == ha && con["refs"][1] == hb) ||
+                             (con["refs"][1] == ha && con["refs"][0] == hb))) shared = true;
+                }
         }
+        if (shared) relation("Tangent", "tangent", refs);
+    }
+    sameLine = false;
+    if (validPoints && nP + nE == 1) {
+        const std::string ref = nP == 1 ? selHandles_[0] : selEnts_[0];
+        const auto* e = entById(ref.substr(0, ref.find('.')));
+        if (nP == 1 || (e && (e->type == "point" || e->type == "line" || e->type == "arc")))
+            planeRelation("On Plane", "on_plane", nlohmann::json::array({ref}));
+        if (!isExternalHandle(ref)) relation("Fix", "fix", nlohmann::json::array({ref}));
     }
     if (nE >= 1) {
-        if (any) ImGui::SameLine();
-        any = true;
-        if (btn("Delete")) deleteSelection(st);
-        ImGui::SameLine();
-        if (btn("Construction")) {
-            nlohmann::json ents = entJson_;
-            for (auto& e : ents) {
-                std::string id = e.value("id", std::string());
-                if (std::find(selEnts_.begin(), selEnts_.end(), id) != selEnts_.end())
+        if (button("Delete")) deleteSelection(st);
+        if (button("Construction")) {
+            auto entities = entJson_;
+            for (auto& e : entities)
+                if (std::find(selEnts_.begin(), selEnts_.end(), e.value("id", std::string())) != selEnts_.end())
                     e["construction"] = !e.value("construction", false);
-            }
-            commitParams(st, &ents, nullptr, "Construction");
+            commitParams(st, &entities, nullptr, "Construction");
         }
     }
-    if (!any && (nP + nE) > 0) {
-        ImGui::TextDisabled("(no relation for this selection)");
+    if (!pending.is_null()) {
+        addConstraint(st, pending, pendingLabel);
+        clearSel();
     }
+    if (!any && nP + nE > 0) ImGui::TextDisabled("(no relation for this selection)");
 }
 
 void Sketch3DMode::drawDimPopup(AppState& st) {
@@ -843,6 +965,31 @@ void Sketch3DMode::drawDimPopup(AppState& st) {
     } else {
         dimPopupOpen_ = false;
     }
+}
+
+void Sketch3DMode::drawPlanePopup(AppState& st) {
+    if (!planePopupOpen_) return;
+    ImGui::OpenPopup("sk3_relation_plane");
+    if (ImGui::BeginPopup("sk3_relation_plane")) {
+        ImGui::TextUnformatted("Relation plane");
+        const char* labels[] = {"Front (XZ)", "Top (XY)", "Right (YZ)", "Active Working Plane"};
+        const char* datums[] = {"front", "top", "right"};
+        for (int i = 0; i < 4; ++i) {
+            if (!ImGui::Selectable(labels[i])) continue;
+            nlohmann::json con = planePendingCon_;
+            con["plane"] = i < 3 ? nlohmann::json(datums[i]) :
+                nlohmann::json{{"origin", vj(wpO_)}, {"normal", vj(normalize(cross(wpU_, wpV_)))}};
+            addConstraint(st, con, "Plane Relation");
+            clearSel();
+            planePopupOpen_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+        if (ImGui::Selectable("Cancel")) {
+            planePopupOpen_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    } else planePopupOpen_ = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -909,7 +1056,13 @@ void Sketch3DMode::commitDrag(AppState& st) {
     dragInFlight_ = false;
     if (dragEntities_.is_array() && !dragEntities_.empty()) {
         // Contract §4.3: commit = plain edit_feature with the last drag response's entities.
-        commitParams(st, &dragEntities_, nullptr, "Drag");
+        nlohmann::json entities = nlohmann::json::array();
+        for (auto entity : dragEntities_) {
+            if (isExternalHandle(entity.value("id", std::string()))) continue;
+            if (entity.value("type", std::string()) == "spline") entity.erase("samples");
+            entities.push_back(std::move(entity));
+        }
+        commitParams(st, &entities, nullptr, "Drag");
     }
     dragEntities_ = nlohmann::json();
     dragHandle_.clear();
@@ -922,9 +1075,19 @@ void Sketch3DMode::commitDrag(AppState& st) {
 void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
                                const ImVec2& imgMax, int vw, int vh, bool imgHovered) {
     if (!active_) return;
+    if (st.docLockedByAgent(docId_)) {
+        std::string part = "part";
+        for (const auto& tab : st.docTabs)
+            if (tab.docId == docId_) { part = tab.title; break; }
+        exitSketch(st, true);
+        st.toast(ui::ToastLevel::Info,
+                 "Agent started editing " + part + " — your sketch was kept and closed");
+        return;
+    }
     // Doc switched underneath us (tab change / close): drop out cleanly.
     if (!st.docMirror.hasDoc() || st.docMirror.docId() != docId_) { exitSketch(st, true); return; }
     if (!st.renderer) return;
+    consumeModelVertexPick(st);
     const auto& cam = st.renderer->camera();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->PushClipRect(imgMin, imgMax, true);
@@ -933,7 +1096,7 @@ void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
 
     // ---- hover ----
     hovHandle_.clear(); hovEnt_.clear();
-    if (imgHovered && !dragging_) {
+    if (imgHovered && !dragging_ && !modelVertexPicking_) {
         Vec3 hw;
         if (!hitTestHandle(st, io.MousePos, imgMin, vw, vh, hovHandle_, hw))
             hovEnt_ = hitTestEntity(st, io.MousePos, imgMin, vw, vh);
@@ -941,13 +1104,29 @@ void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
     // GUI-picking overhaul: "hot" whenever a sketch entity/handle claims the cursor, a drawing
     // tool owns it, or a drag is live — the viewport's fallback model-pick must not fire then.
     // See Sketch3DMode::inSketchEntityHot().
-    entityHoverHot_ = tool_ != Sk3Tool::None || dragging_ || !hovHandle_.empty() || !hovEnt_.empty();
+    entityHoverHot_ = !modelVertexPicking_ &&
+        (tool_ != Sk3Tool::None || dragging_ || !hovHandle_.empty() || !hovEnt_.empty());
 
     // ---- entities ----
     const auto& pal = ui::palette;
     std::vector<Vec3> poly;
     std::vector<ImVec2> sp;
     for (const auto& e : ents_) {
+        if (isExternalHandle(e.id)) {
+            if (e.pts.empty()) continue;
+            ImVec2 q;
+            if (!worldToScreen(cam, imgMin, vw, vh, e.pts[0].x, e.pts[0].y, e.pts[0].z, q)) continue;
+            const bool selected = std::find(selHandles_.begin(), selHandles_.end(), e.id) != selHandles_.end();
+            bool stale = false;
+            for (const auto& ref : externalRefs_)
+                if (ref.value("id", std::string()) == e.id) stale = ref.value("stale", false);
+            const ImU32 ink = col(stale ? pal.statusWarn : selected || hovHandle_ == e.id ? pal.accent : pal.sketchInfer);
+            const float r = ui::metrics::U(selected || hovHandle_ == e.id ? 6.0f : 5.0f);
+            dl->AddQuad(ImVec2(q.x, q.y - r), ImVec2(q.x + r, q.y),
+                        ImVec2(q.x, q.y + r), ImVec2(q.x - r, q.y), ink, ui::metrics::U(1.5f));
+            dl->AddText(ImVec2(q.x + r + ui::metrics::U(3.0f), q.y - r), ink, e.id.c_str());
+            continue;
+        }
         bool sel = std::find(selEnts_.begin(), selEnts_.end(), e.id) != selEnts_.end();
         bool hov = hovEnt_ == e.id;
         const float* role = e.status == "over" ? pal.statusErr
@@ -1078,11 +1257,13 @@ void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
     }
 
     // ---- selection / drag (tool None) ----
-    if (tool_ == Sk3Tool::None) {
+    if (tool_ == Sk3Tool::None && !modelVertexPicking_) {
         const float kDragArmPx = 5.0f * ui::uiScale;   // matches the 2D sketcher's threshold
         if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !dragging_ &&
             !dragArmed_) {
-            if (!hovHandle_.empty()) {
+            if (!hovHandle_.empty() && isExternalHandle(hovHandle_)) {
+                toggleSel(hovHandle_);
+            } else if (!hovHandle_.empty()) {
                 dragArmed_ = true;
                 dragHandle_ = hovHandle_;
                 dragOrig_ = handleWorld(hovHandle_);
@@ -1150,8 +1331,10 @@ void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
         if ((ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace)) &&
             !io.WantTextInput)
             deleteSelection(st);
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape) && !dimPopupOpen_) clearSel();
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape) && !dimPopupOpen_ && !planePopupOpen_) clearSel();
     }
+    if (modelVertexPicking_ && ImGui::IsKeyPressed(ImGuiKey_Escape))
+        setModelVertexPicking(st, false);
 
     // Tab cycles the working plane preset (documented in the contract appendix).
     if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Tab))
@@ -1194,11 +1377,20 @@ void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
             const float* role = status_ == "over" || !converged_ ? ui::palette.statusErr
                               : status_ == "full" ? ui::palette.statusOk : ui::palette.sketchUnder;
             ImGui::TextColored(ImVec4(role[0], role[1], role[2], 1), "%s", sl.c_str());
+            if (!warning_.empty())
+                ImGui::TextColored(ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1],
+                                         ui::palette.statusWarn[2], ui::palette.statusWarn[3]),
+                                   "%s", warning_.c_str());
+            if (ImGui::SmallButton(modelVertexPicking_ ? "Cancel Vertex Pick" : "Reference Model Vertex"))
+                setModelVertexPicking(st, !modelVertexPicking_);
+            if (modelVertexPicking_)
+                ImGui::TextDisabled("Pick a model vertex (Esc to cancel). Existing sketch selection is retained.");
 
             // contextual constraints for the current selection (needs the live selection, so it
             // stays viewport-local rather than a static ribbon row set)
             if (!selEnts_.empty() || !selHandles_.empty()) drawConstraintButtons(st);
             drawDimPopup(st);
+            drawPlanePopup(st);
         }
         ImGui::End();
     }

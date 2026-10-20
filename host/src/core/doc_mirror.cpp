@@ -556,6 +556,19 @@ bool DocMirror::adoptOpenResponse(const nlohmann::json& res, std::string& err) {
         const auto warm = res.find("warm");
         lastOpenedWarm_ = warm != res.end() && warm->is_boolean() && warm->get<bool>();
         lastOpenedCacheMissReason_ = jstr(res, "cache_miss_reason");
+        // cache.writeback: `entries` is present only when the engine attempted the write.
+        lastOpenedWriteback_ = 0;
+        lastOpenedWritebackReason_.clear();
+        const auto cache = res.find("cache");
+        if (cache != res.end() && cache->is_object()) {
+            const auto wb = cache->find("writeback");
+            if (wb != cache->end() && wb->is_object() && wb->contains("entries")) {
+                const auto written = wb->find("written");
+                lastOpenedWriteback_ =
+                    written != wb->end() && written->is_boolean() && written->get<bool>() ? 1 : -1;
+                lastOpenedWritebackReason_ = jstr(*wb, "reason");
+            }
+        }
     }
     // W12+ — stash any restored drawings so the open caller can re-create their Drawing tabs.
     if (res.contains("drawings") && res["drawings"].is_array())

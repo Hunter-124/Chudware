@@ -423,7 +423,8 @@ def compact_simulation(res: dict, max_points: int = _SERIES_MAX_POINTS) -> dict:
 
 def _series_root() -> str:
     """The bound project root series files live under ('' when no project is bound)."""
-    return os.environ.get("CHUDWARE_PROJECT_SAVE_DIR", "").strip() or _project_dir() or ""
+    from services.agent.request_context import root_value
+    return root_value("CHUDWARE_PROJECT_SAVE_DIR").strip() or _project_dir() or ""
 
 
 def _series_dir() -> str:

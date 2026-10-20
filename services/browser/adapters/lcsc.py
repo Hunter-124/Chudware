@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 
 from .. import session as _session
-from . import download_dir, is_login_wall, login_required, provenance_envelope, register
+from . import download_path, is_login_wall, login_required, provenance_envelope, register
 
 SITE = "lcsc"
 BASE_URL = "https://www.lcsc.com"
@@ -108,8 +108,9 @@ class LcscAdapter:
             datasheet_url = ds_match.group("href")
             if datasheet_url.startswith("/"):
                 datasheet_url = BASE_URL + datasheet_url
-            filename = datasheet_url.rsplit("/", 1)[-1].split("?", 1)[0] or "datasheet.pdf"
-            dest = download_dir(SITE) / filename
+            dest, refusal = download_path(SITE, datasheet_url, default="datasheet.pdf")
+            if refusal is not None:
+                return refusal
             outcome = _session.browser_download(datasheet_url, SITE, dest)
             if outcome.get("ok"):
                 artifact_path = outcome["dest"]

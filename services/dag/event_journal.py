@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .run_ids import validate_run_id
+from services.agent.request_context import in_cell, owner_key, require_owner
+from .storage import resolve_run
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +44,8 @@ def _default_cache_runs_dir() -> Path:
 
 def run_events_path(run_id: str, runs_dir: Optional[Path] = None) -> Path:
     """Return the events.jsonl path for a run, creating the directory if needed."""
+    if in_cell():
+        return resolve_run(run_id).root / "events.jsonl"
     run_id = validate_run_id(run_id)
     base = runs_dir if runs_dir is not None else _default_cache_runs_dir()
     run_dir = base / run_id
@@ -63,20 +67,23 @@ class EventJournal:
     """
 
     def __init__(self, run_id: str, runs_dir: Optional[Path] = None) -> None:
-        self.run_id = run_id
-        self._path = run_events_path(run_id, runs_dir)
+        self._owner = owner_key()
+        self.run_id = resolve_run(run_id).run_id if in_cell() else run_id
+        self._path = run_events_path(self.run_id, runs_dir)
 
     @property
     def path(self) -> Path:
+        require_owner(self._owner)
         return self._path
 
     def emit(self, event_type: str, payload: dict[str, Any]) -> None:
         """Write one event line to the journal (flush before return)."""
+        require_owner(self._owner)
         record = {
+            **payload,
             "kind": event_type,
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "run_id": self.run_id,
-            **payload,
         }
         line = json.dumps(record, default=str) + "\n"
         with open(self._path, "a", encoding="utf-8") as f:

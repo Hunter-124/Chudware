@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from gateway import accounts, db, engine_bridge, provider_accounts
+from gateway import accounts, db, provider_accounts
 from gateway.config import settings
 from gateway.limits import RateLimiter
 
@@ -459,14 +459,8 @@ def test_nontrial_customer_never_gets_admin_claude_link(
     accounts.set_role(OPERATOR, "admin")
     _connect_claude(OPERATOR, role="admin", scope="shared")
     _verified(A)
-    monkeypatch.setenv("CHUDWARE_WEB_POOL_API_KEY", "dedicated-pool-key")
 
     assert provider_accounts.resolve_subscription_token(A, "anthropic") is None
-    params = _sanitized_params(A, _turn_line())
-    actor = params["options"]["_chudware_actor"]
-    assert actor["key_source"] == "pool"
-    assert "_subscription" not in actor
-    assert actor["_pool"] == {"provider": "openrouter", "api_key": "dedicated-pool-key"}
 
 
 def test_trial_customer_gets_admin_claude_but_not_lookalike_or_unverified(
@@ -695,121 +689,3 @@ def test_unlinking_removes_the_row_and_stops_resolution(vendor: VendorStub) -> N
     ).status_code == 404
 
 
-# ---------------------------------------------------------------------------
-# The turn seam: what engine_bridge actually puts on the wire to hostd
-# ---------------------------------------------------------------------------
-
-
-def _turn_line(provider: str = "anthropic") -> str:
-    return json.dumps(
-        {
-            "id": 1,
-            "method": "agent_run_v2",
-            "params": {"request": "model a bracket", "provider": provider},
-        }
-    )
-
-
-def _sanitized_params(email: str, line: str) -> dict:
-    actor = engine_bridge._actor_for_turn(email, line)
-    return json.loads(engine_bridge._sanitize_agent_rpc(line, actor))["params"]
-
-
-def test_a_connected_subscription_reaches_the_worker_inside_the_actor(
-    vendor: VendorStub,
-) -> None:
-    _seed(A)
-    _connect_claude(A)
-
-    params = _sanitized_params(A, _turn_line())
-    injected = params["options"]["_chudware_actor"]
-    assert injected["key_source"] == "subscription"
-    # hostd forwards _chudware_actor verbatim (core/agent/run.cpp:825) and the
-    # worker reads the grant from inside it. If this key ever moves, the worker
-    # silently falls back to the machine owner's own subscription.
-    assert injected["_subscription"] == {
-        "provider": "anthropic-sub",
-        "access_token": CLAUDE_ACCESS,
-    }
-    assert injected["_subscription_token_sha256"] == hashlib.sha256(
-        CLAUDE_ACCESS.encode("utf-8")
-    ).hexdigest()
-    # A bearer must never ride the API-key slot: it is not an API key.
-    assert "api_key" not in params
-
-
-def test_a_browser_cannot_forge_a_subscription_grant(vendor: VendorStub) -> None:
-    _seed(A)
-    forged = json.dumps(
-        {
-            "id": 1,
-            "method": "agent_run_v2",
-            "params": {
-                "request": "model a bracket",
-                "provider": "anthropic",
-                "subscription": {"provider": "anthropic-sub", "access_token": "forged"},
-                "options": {
-                    "_chudware_actor": {
-                        "email": "root@example.com",
-                        "plan": "studio",
-                        "credits_remaining": 10**9,
-                        "key_source": "subscription",
-                        "_subscription": {
-                            "provider": "anthropic-sub",
-                            "access_token": "forged",
-                        },
-                    }
-                },
-            },
-        }
-    )
-    params = _sanitized_params(A, forged)
-    assert "subscription" not in params
-    injected = params["options"]["_chudware_actor"]
-    assert injected["email"] == A
-    assert "forged" not in json.dumps(params)
-    # No link exists for this account, so the turn falls back to the metered pool.
-    assert injected["key_source"] == "pool"
-    assert "_subscription" not in injected
-
-
-def test_a_validated_api_key_still_outranks_a_subscription(
-    vendor: VendorStub, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _seed(A)
-    _connect_claude(A)
-    monkeypatch.setattr(
-        engine_bridge, "resolve_validated_key", lambda _e, _p: "sk-explicit-choice"
-    )
-
-    params = _sanitized_params(A, _turn_line())
-    injected = params["options"]["_chudware_actor"]
-    assert injected["key_source"] == "byok"
-    assert params["api_key"] == "sk-explicit-choice"
-    assert "_subscription" not in injected
-
-
-def test_byok_beats_trial_domain_sponsor(vendor: VendorStub, monkeypatch: pytest.MonkeyPatch) -> None:
-    _seed(A)
-    _verified(A)
-    _trial_domain()
-    _seed(OPERATOR)
-    accounts.set_role(OPERATOR, "admin")
-    _connect_claude(OPERATOR, role="admin", scope="shared")
-    monkeypatch.setattr(
-        engine_bridge, "resolve_validated_key", lambda _email, _provider: "own-api-key"
-    )
-
-    params = _sanitized_params(A, _turn_line("anthropic"))
-    assert params["api_key"] == "own-api-key"
-    assert params["options"]["_chudware_actor"]["key_source"] == "byok"
-    assert "_subscription" not in params["options"]["_chudware_actor"]
-
-
-def test_no_link_leaves_the_metered_pool_untouched(vendor: VendorStub) -> None:
-    _seed(A)
-    params = _sanitized_params(A, _turn_line())
-    injected = params["options"]["_chudware_actor"]
-    assert injected["key_source"] == "pool"
-    assert "_subscription" not in injected
-    assert "api_key" not in params

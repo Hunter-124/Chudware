@@ -50,7 +50,6 @@ class FakeAccount:
 class FakeAccounts:
     def __init__(self) -> None:
         self.by_email: dict[str, FakeAccount] = {}
-        self.status_calls: list[tuple] = []
         self.subscription_calls: list[dict] = []
 
     def get_account(self, email):
@@ -79,13 +78,6 @@ class FakeAccounts:
         account = self.by_email.get(email)
         if account:
             account.stripe_customer_id = customer_id
-        return account
-
-    def set_status(self, email, status, decided_by="", notes=""):
-        account = self.by_email.get(email)
-        if account:
-            account.status = status
-            self.status_calls.append((email, status, decided_by, notes))
         return account
 
     def set_subscription(self, email, **values):
@@ -365,6 +357,7 @@ class TestWebhook:
                 {
                     "id": "cs_subscription",
                     "mode": "subscription",
+                    "payment_status": "paid",
                     "client_reference_id": "payer@example.com",
                     "customer": "cus_real",
                     "subscription": "sub_real",
@@ -386,8 +379,142 @@ class TestWebhook:
                 account.status,
                 account.stripe_customer_id,
                 account.subscription_id,
-            ) == ("studio", "active", "cus_real", "sub_real")
-            assert account.notes == "checkout.session.completed evt_replay"
+            ) == ("studio", "pending", "cus_real", "sub_real")
+            assert account.notes == ""
+            assert account.decided_by == ""
+            assert account.decided_at is None
+        finally:
+            billing.set_account_store(None)
+
+    @pytest.mark.parametrize("status", ["active", "pending", "denied", "suspended"])
+    def test_billing_events_preserve_operator_status_and_decision(
+        self, client, stripe_config, monkeypatch, status
+    ):
+        email = "operator-owned@example.com"
+        accounts.ensure_account(email, "Operator-owned")
+        before = accounts.set_status(
+            email, status, decided_by="operator@example.com", notes="reviewed decision"
+        )
+        decision = (before.status, before.notes, before.decided_by, before.decided_at)
+        captured = {"price_metadata": {"chud_credits": "8000"}}
+        _install_fake_stripe(monkeypatch, captured)
+        sent = []
+        monkeypatch.setattr(billing.mailer, "send", lambda *args: sent.append(args))
+        billing.set_account_store(accounts)
+        try:
+            events = [
+                (
+                    "checkout.session.completed",
+                    {
+                        "id": "cs_operator",
+                        "mode": "subscription",
+                        "payment_status": "paid",
+                        "client_reference_id": email,
+                        "customer": "cus_operator",
+                        "subscription": "sub_operator",
+                        "metadata": {"chudware_plan": "studio"},
+                    },
+                    "studio",
+                    "active",
+                ),
+                (
+                    "customer.subscription.updated",
+                    {
+                        "id": "sub_operator",
+                        "customer": "cus_operator",
+                        "status": "active",
+                        "items": {"data": [{"price": {"id": "price_desktop"}}]},
+                    },
+                    "studio",
+                    "active",
+                ),
+                (
+                    "customer.subscription.updated",
+                    {
+                        "id": "sub_operator",
+                        "customer": "cus_operator",
+                        "status": "trialing",
+                        "items": {"data": [{"price": {"id": "price_studio"}}]},
+                    },
+                    "studio",
+                    "trialing",
+                ),
+                (
+                    "invoice.paid",
+                    {
+                        "customer": "cus_operator",
+                        "subscription": "sub_operator",
+                        "lines": {"data": [{
+                            "price": {"id": "price_desktop"},
+                            "period": {"start": 1_700_000_000, "end": 1_702_592_000},
+                        }]},
+                    },
+                    "desktop",
+                    "active",
+                ),
+                (
+                    "invoice.payment_failed",
+                    {"customer": "cus_operator", "amount_due": 15000, "currency": "usd"},
+                    "desktop",
+                    "active",
+                ),
+                (
+                    "checkout.session.completed",
+                    {
+                        "id": "cs_operator_credits",
+                        "mode": "payment",
+                        "client_reference_id": email,
+                        "payment_status": "paid",
+                        "line_items": {"data": [{
+                            "price": {"id": "price_credits_starter"},
+                        }]},
+                    },
+                    "desktop",
+                    "active",
+                ),
+                *[
+                    (
+                        "customer.subscription.updated",
+                        {
+                            "id": "sub_operator",
+                            "customer": "cus_operator",
+                            "status": subscription_status,
+                            "items": {"data": [{"price": {"id": "price_desktop"}}]},
+                        },
+                        "trial",
+                        subscription_status,
+                    )
+                    for subscription_status in (
+                        "past_due", "unpaid", "canceled", "incomplete_expired"
+                    )
+                ],
+                (
+                    "customer.subscription.deleted",
+                    {"id": "sub_operator", "customer": "cus_operator"},
+                    "trial",
+                    "canceled",
+                ),
+            ]
+            for index, (event_type, obj, plan, subscription_status) in enumerate(events):
+                event = _event(f"evt_operator_{status}_{index}", event_type, obj)
+                response = _post_webhook(client, event)
+                assert response.status_code == 200, response.text
+                assert response.json()["status"] == "processed"
+                after = accounts.get_account(email)
+                assert (after.status, after.notes, after.decided_by, after.decided_at) == decision
+                assert after.plan == plan
+                assert after.stripe_customer_id == "cus_operator"
+                assert after.subscription_id == "sub_operator"
+                assert after.subscription_status == subscription_status
+                assert after.price_id == (
+                    "price_studio" if index in (0, 2) else "price_desktop"
+                )
+                if index >= 3:
+                    assert after.subscribed_since == 1_700_000_000
+                    assert after.paid_through == 1_702_592_000
+                if index >= 5:
+                    assert after.credit_balance == 8000
+            assert sent[0][0:2] == (email, "payment_failed")
         finally:
             billing.set_account_store(None)
 
@@ -404,6 +531,7 @@ class TestWebhook:
             {
                 "id": "cs_credits",
                 "mode": "payment",
+                "payment_status": "paid",
                 "client_reference_id": "demo@example.com",
                 "metadata": {"chudware_pack": "starter"},
                 "line_items": {"data": [{"price": {"id": "price_credits_starter"}}]},
@@ -442,6 +570,7 @@ class TestWebhook:
             {
                 "id": "cs_bad_pack",
                 "mode": "payment",
+                "payment_status": "paid",
                 "client_reference_id": "demo@example.com",
                 "line_items": {"data": [{"price": {"id": "price_credits_starter"}}]},
             },
@@ -565,3 +694,94 @@ class TestDegradedMode:
         monkeypatch.setenv("CHUDWARE_WEB_STRIPE_SECRET_KEY", "sk_test_partial")
         with pytest.raises(ValueError, match="Stripe billing is partially configured"):
             Settings()
+
+
+@pytest.mark.parametrize("role", ["user", "admin"])
+@pytest.mark.parametrize("status", ["suspended", "denied"])
+def test_paid_checkout_after_operator_revocation_cannot_restore_access(
+    client, stripe_config, monkeypatch, role, status
+):
+    from gateway import db
+
+    _install_fake_stripe(monkeypatch, {})
+    billing.set_account_store(accounts)
+    email = f"revoked-{role}-{status}@example.com"
+    accounts.ensure_account(email, email)
+    with db.tx() as cur:
+        cur.execute("UPDATE accounts SET role=%s WHERE email=%s", (role, email))
+    before = accounts.set_status(email, status, decided_by="operator", notes="revoked")
+    event = _event("evt_revoked", "checkout.session.completed", {
+        "id": "cs_revoked", "mode": "subscription", "payment_status": "paid",
+        "client_reference_id": email, "customer": "cus_revoked",
+        "subscription": "sub_revoked", "metadata": {"chudware_plan": "studio"},
+    })
+    assert _post_webhook(client, event).status_code == 200
+    after = accounts.get_account(email)
+    assert (after.status, after.role, after.notes, after.decided_by, after.decided_at) == (
+        status, role, before.notes, before.decided_by, before.decided_at
+    )
+    assert after.plan == "studio"
+    assert client.get("/api/billing/status", headers={"X-Dev-User": email}).status_code == 403
+
+
+@pytest.mark.parametrize("mode", ["payment", "subscription"])
+def test_delayed_checkout_grants_only_once_after_paid_settlement(
+    client, stripe_config, monkeypatch, mode
+):
+    from gateway import db
+
+    _install_fake_stripe(monkeypatch, {"price_metadata": {"chud_credits": "8000"}})
+    billing.set_account_store(accounts)
+    email = "demo@example.com"
+    obj = {
+        "id": "cs_delayed", "mode": mode, "payment_status": "unpaid",
+        "payment_intent": "pi_delayed", "client_reference_id": email,
+        "customer": "cus_delayed", "subscription": "sub_delayed",
+        "metadata": {"chudware_plan": "studio", "chudware_pack": "starter"},
+        "line_items": {"data": [{"price": {"id": "price_credits_starter"}}]},
+    }
+    for index, event_type in enumerate((
+        "checkout.session.completed", "checkout.session.async_payment_failed",
+    )):
+        assert _post_webhook(client, _event(f"evt_wait_{index}", event_type, obj)).status_code == 200
+        account = accounts.get_account(email)
+        assert account.credit_balance == 0
+        assert account.plan == "trial"
+    if mode == "subscription":
+        updated = {
+            "id": "sub_delayed", "customer": "cus_delayed", "status": "active",
+            "items": {"data": [{"price": {"id": "price_studio"}}]},
+        }
+        assert _post_webhook(client, _event("evt_active_unpaid", "customer.subscription.updated", updated)).status_code == 200
+        assert accounts.get_account(email).plan == "trial"
+        assert accounts.get_account(email).subscription_status == "incomplete"
+    obj["payment_status"] = "paid"
+    for index, event_type in enumerate((
+        "checkout.session.async_payment_succeeded", "checkout.session.completed",
+        "checkout.session.async_payment_succeeded", "checkout.session.async_payment_failed",
+    )):
+        assert _post_webhook(client, _event(f"evt_paid_{index}", event_type, obj)).status_code == 200
+    account = accounts.get_account(email)
+    assert (account.plan, account.credit_balance) == (
+        ("trial", 8000) if mode == "payment" else ("studio", 0)
+    )
+    with db.tx() as cur:
+        cur.execute("SELECT count(*) AS n FROM billing_checkout_settlements")
+        assert cur.fetchone()["n"] == 1
+        cur.execute("SELECT count(*) AS n FROM credit_ledger WHERE kind='purchase'")
+        assert cur.fetchone()["n"] == (1 if mode == "payment" else 0)
+
+
+def test_paid_credit_payment_cannot_bind_multiple_checkout_grants(
+    client, stripe_config, monkeypatch
+):
+    _install_fake_stripe(monkeypatch, {"price_metadata": {"chud_credits": "8000"}})
+    billing.set_account_store(accounts)
+    for index in range(2):
+        event = _event(f"evt_binding_{index}", "checkout.session.completed", {
+            "id": f"cs_binding_{index}", "mode": "payment", "payment_status": "paid",
+            "payment_intent": "pi_same", "client_reference_id": "demo@example.com",
+            "line_items": {"data": [{"price": {"id": "price_credits_starter"}}]},
+        })
+        assert _post_webhook(client, event).status_code == 200
+    assert accounts.get_account("demo@example.com").credit_balance == 8000

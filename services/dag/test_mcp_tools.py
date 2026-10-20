@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # MagicMock FastMCP stub (mirrors test_req_tools.py pattern)
@@ -370,3 +372,75 @@ def test_dag_plan_executor_error_returns_ok_false():
         raw = tools["dag_plan"](brief="anything")
         result = json.loads(raw)
     assert result["ok"] is False
+
+
+@pytest.mark.parametrize("timeout_s", [0, 10])
+def test_actual_fastmcp_dag_run_and_native_schema_do_not_expose_session_authority(
+    tmp_path, monkeypatch, timeout_s
+):
+    import asyncio
+    import hashlib
+    from types import SimpleNamespace
+    from mcp.server.fastmcp import FastMCP
+    from services.agent import request_context as tenancy
+    from services.agent.chudcode_tools import build_host_tools, dispatch_host_tool
+    from services.agent.test_chudcode_tools import _Policy
+    from services.dag import executor, storage
+    from services.dag.mcp_tools import register_dag_tools
+    from services.dag.test_executor import _two_node_graph
+    from services.agent import config
+
+    monkeypatch.setattr(config, "get_tool_options", lambda *args: {"timeout_s": timeout_s})
+
+    # Keep the real FastMCP schema/validation and adapter paths, but make any
+    # attempt to execute unauthorized work fail instead of faking a done DAG.
+    def forbidden(*args, **kwargs):
+        pytest.fail("unauthorized cell invocation reached the DAG executor")
+
+    monkeypatch.setattr(executor, "run", forbidden)
+    monkeypatch.setattr(executor, "resume", forbidden)
+    mcp = FastMCP("dag-session-scope")
+    register_dag_tools(mcp)
+    tool = mcp._tool_manager.get_tool("dag_run")
+    assert not {"session_id", "parent_session_id", "_parent_session_id"} & tool.parameters["properties"].keys()
+
+    def bind(parent=None):
+        [binding] = [candidate for candidate in build_host_tools({
+            "tool_entries": {"dag_run": {"fn": tool.fn, "input_schema": tool.parameters}},
+            "policy_registry": _Policy(), "chudcode_builtin_names": (), "mode": "agent",
+            "session_id": parent,
+        }) if candidate.name == "dag_run"]
+        assert not {"session_id", "parent_session_id", "_parent_session_id"} & binding.input_schema["properties"].keys()
+        return binding
+
+    unscoped = bind()
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    ctx = {"cell": True, "workspace_key": "team:dag/scope", "actor_key": "alice",
+           "actor_hex": hashlib.sha256(b"alice").hexdigest()[:32], "right": "editor", "epoch": 1}
+    with tenancy.bind_context(ctx):
+        owned = [bind(), bind("model-forged-session")]
+    foreign = {**ctx, "actor_key": "bob", "actor_hex": hashlib.sha256(b"bob").hexdigest()[:32]}
+    with tenancy.bind_context(foreign):
+        other_actor = bind("model-forged-session")
+    with tenancy.bind_context({**ctx, "right": "owner", "epoch": 0}):
+        stale = bind("model-forged-session")
+
+    def decoded(value):
+        return json.loads(value) if isinstance(value, str) else value
+
+    args = {"graph_json": _two_node_graph(), "autonomy_default": "auto",
+            "initial_state": {"session_id": "model-forged-session"}}
+    expected = {"ok": False, "reason": "not_found", "code": "not_found"}
+    with tenancy.bind_context(ctx):
+        result = asyncio.run(tool.run(args))
+        if isinstance(result, tuple):
+            result = result[0]
+        if isinstance(result, list):
+            result = result[0].text
+        assert decoded(result) == expected
+        for binding in [unscoped, *owned, other_actor, stale]:
+            assert decoded(dispatch_host_tool(binding, args, None, None)) == expected
+            sdk_tool = binding.to_host_tool(lambda **kwargs: kwargs)
+            assert sdk_tool["execute"](args, SimpleNamespace(cancelled=False))["details"] == expected
+            assert tenancy.current_context() == ctx
+        assert storage.list_run_ids() == []

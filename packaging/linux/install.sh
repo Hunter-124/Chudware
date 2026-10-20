@@ -16,8 +16,8 @@
 # is written to be read:
 #   * every expansion is quoted, and nothing is ever passed through `eval`;
 #   * downloads land in a private mktemp directory removed by a trap on exit;
-#   * the sha256 published in the signed release manifest is verified against
-#     the bytes on disk BEFORE anything is installed, and a mismatch aborts;
+#   * sha256 and the domain-separated Ed25519 artifact signature are verified
+#     against public keys pinned in this script BEFORE anything is installed;
 #   * nothing is installed from a partial download — the verify step happens
 #     after the transfer completes, on the complete file;
 #   * privilege escalation is announced before it happens and never assumed.
@@ -57,10 +57,13 @@ Options:
                       Ignored for .deb and .rpm, which install to /opt/chudware.
   --base-url <url>    Gateway to install from. Default https://app.chudware.com,
                       or CHUDWARE_BASE_URL. For staging and testing.
-  --dry-run           Resolve and print exactly what would be downloaded and
-                      how it would be installed, then exit without touching
-                      the machine.
+  --dry-run           Resolve and print the download and verification plan,
+                      without downloading bytes or installing anything.
+                      This does NOT authenticate the artifact.
   -h, --help          This text.
+
+Verification requires locally installed OpenSSL 3 or newer with Ed25519 support.
+No verifier is downloaded and no environment or manifest public key is trusted.
 
 Examples:
   curl -fsSL https://app.chudware.com/install.sh | sh -s -- --token TOKEN
@@ -210,6 +213,46 @@ sha256_of() {
     fi
 }
 
+# Product trust ring from core/security/release_keys.h, encoded as Ed25519
+# SubjectPublicKeyInfo DER (302a300506032b6570032100 + the 32-byte public key).
+# Rotation must update these pins with the product ring before signing switches.
+# Deliberately no key file, environment override, or manifest-provided key.
+release_public_key() {
+    case "$1" in
+        release-v1)
+            printf '%s' 'MCowBQYDK2VwAyEAKay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc=' ;;
+        release-ci-v1)
+            printf '%s' 'MCowBQYDK2VwAyEA10NNxn9NbhHNTIztm167zPLhR3tZSdUtdoW2ykOgEPY=' ;;
+        *) return 1 ;;
+    esac
+}
+
+verify_artifact_signature() {
+    # Decode and round-trip to reject OpenSSL's permissive base64 parsing,
+    # including noncanonical pad bits. Ed25519 signatures are exactly 64 bytes.
+    printf '%s' "$SIGNATURE" | openssl base64 -d -A > "$TMP/artifact.sig" ||
+        die "malformed artifact signature; nothing has been installed"
+    [ "$(wc -c < "$TMP/artifact.sig" | tr -d ' ')" = "64" ] &&
+        [ "$(openssl base64 -A -in "$TMP/artifact.sig")" = "$SIGNATURE" ] ||
+        die "malformed artifact signature; nothing has been installed"
+    printf '%s' "$PUBLIC_KEY" | openssl base64 -d -A > "$TMP/release-key.der" ||
+        die "cannot decode the pinned release public key"
+    # Frozen signing tuple: NUL separators, no terminal NUL, no format field.
+    # Use the requested identity and computed digest, NOT mutable manifest data.
+    printf '%s\000%s\000%s\000%s\000%s\000%s' \
+        'chudware-artifact-v1' "$KEY_ID" "$VERSION" 'linux' "$ARCH" "$ACTUAL_SHA" \
+        > "$TMP/artifact.preimage"
+    if ! openssl pkeyutl -verify -pubin -keyform DER \
+        -inkey "$TMP/release-key.der" -rawin -in "$TMP/artifact.preimage" \
+        -sigfile "$TMP/artifact.sig" > "$TMP/verify.log" 2>&1; then
+        die "ARTIFACT SIGNATURE VERIFICATION FAILED for $KEY_ID/$VERSION/linux/$ARCH.
+       Nothing has been installed. The signature must match the pinned release
+       key, requested identity and downloaded bytes. Verification requires local
+       OpenSSL 3 or newer with Ed25519 support."
+    fi
+    info "Ed25519 artifact signature OK: $KEY_ID/$VERSION/linux/$ARCH"
+}
+
 # Minimal JSON readers for this gateway's own compact responses. FastAPI emits
 # `{"a":1,"b":"x"}` with no whitespace and no nesting inside a build object, and
 # none of the values (platform, arch, format, version, digest, URL) can contain
@@ -338,7 +381,7 @@ info "  plan      $PLAN"
 info ""
 
 # ---------------------------------------------------------------------------
-# Signed manifest (this is where the download URL comes from)
+# Release metadata (authenticated only after artifact signature verification)
 # ---------------------------------------------------------------------------
 
 MANIFEST_URL="$BASE_URL/api/releases/latest?channel=$CHANNEL&platform=linux&arch=$ARCH&format=$WANT_FORMAT"
@@ -348,7 +391,7 @@ if [ -n "$TOKEN" ]; then
     MANIFEST_URL="$MANIFEST_URL&download_token=$TOKEN"
 fi
 
-step "Fetching the signed release manifest"
+step "Fetching the release manifest"
 MANIFEST=""
 if ! MANIFEST="$(http_body "$MANIFEST_URL")"; then
     die "could not fetch the release manifest for $CHANNEL linux/$ARCH ($WANT_FORMAT)"
@@ -357,8 +400,32 @@ fi
 EXPECTED_SHA="$(json_string sha256 "$MANIFEST")"
 EXPECTED_SIZE="$(json_number size "$MANIFEST")"
 ARTIFACT_URL="$(json_string url "$MANIFEST")"
+KEY_ID="$(json_string key_id "$MANIFEST")"
+SIGNATURE="$(json_string signature "$MANIFEST")"
+
+[ "$(json_string version "$MANIFEST")" = "$VERSION" ] &&
+    [ "$(json_string platform "$MANIFEST")" = "linux" ] &&
+    [ "$(json_string arch "$MANIFEST")" = "$ARCH" ] &&
+    [ "$(json_string format "$MANIFEST")" = "$WANT_FORMAT" ] ||
+    die "the release manifest does not match the requested release identity; refusing to install"
+[ -n "$KEY_ID" ] || die "missing artifact signing key_id; refusing to install"
+PUBLIC_KEY="$(release_public_key "$KEY_ID")" ||
+    die "unknown artifact signing key_id '$KEY_ID'; refusing to install"
+[ -n "$SIGNATURE" ] || die "missing artifact signature; refusing to install"
+case "$SIGNATURE" in
+    *[!A-Za-z0-9+/=]*) die "malformed artifact signature; refusing to install" ;;
+esac
+[ "${#SIGNATURE}" = "88" ] || die "malformed artifact signature; refusing to install"
+case "$SIGNATURE" in
+    *==) ;;
+    *) die "malformed artifact signature; refusing to install" ;;
+esac
 
 [ -n "$EXPECTED_SHA" ] || die "the release manifest carries no sha256; refusing to install unverifiable bytes"
+case "$EXPECTED_SHA" in
+    *[!0-9a-f]*) die "the release manifest sha256 must be lowercase hexadecimal" ;;
+esac
+[ "${#EXPECTED_SHA}" = "64" ] || die "the release manifest sha256 must have 64 characters"
 if [ -n "$CATALOGUE_SHA" ] && [ "$CATALOGUE_SHA" != "$EXPECTED_SHA" ]; then
     die "the release catalogue and the release manifest disagree about the sha256 of $CHANNEL $VERSION ($WANT_FORMAT); refusing to continue"
 fi
@@ -376,7 +443,9 @@ if [ "$DRY_RUN" = "yes" ]; then
         info "Would download: $ARTIFACT_URL"
     fi
     info "Would verify sha256 $EXPECTED_SHA over $(human_bytes "$EXPECTED_SIZE")."
-    info "Would then $PLAN."
+    info "Would verify the Ed25519 artifact signature against pinned key $KEY_ID using local OpenSSL."
+    info "Artifact NOT authenticated: dry run does not download or verify bytes."
+    info "Would then $PLAN, only after both checks pass."
     exit 0
 fi
 
@@ -389,6 +458,9 @@ if [ -z "$ARTIFACT_URL" ]; then
     die "the download token was refused. Tokens expire after 15 minutes;
        open Downloads at $BASE_URL and copy a fresh install command."
 fi
+
+have openssl || die "OpenSSL 3 or newer with Ed25519 support is required to verify artifact signatures.
+       No verifier will be downloaded and nothing has been installed."
 
 # ---------------------------------------------------------------------------
 # Download and verify
@@ -445,7 +517,7 @@ if [ -z "$ACTUAL_SHA" ]; then
        Install coreutils and re-run."
 fi
 if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-    printf 'error: SHA256 MISMATCH — the download does not match the signed release manifest.\n' >&2
+    printf 'error: SHA256 MISMATCH — the download does not match the release manifest.\n' >&2
     printf '       expected %s\n' "$EXPECTED_SHA" >&2
     printf '       actual   %s\n' "$ACTUAL_SHA" >&2
     printf '       Nothing has been installed. Re-run; if it happens again, do NOT\n' >&2
@@ -459,6 +531,8 @@ if [ -n "$EXPECTED_SIZE" ]; then
     fi
 fi
 info "sha256 OK: $ACTUAL_SHA"
+step "Verifying the Ed25519 artifact signature"
+verify_artifact_signature
 # Same reason as the directory: apt's sandbox user must be able to read it.
 chmod 0644 "$ARTIFACT"
 

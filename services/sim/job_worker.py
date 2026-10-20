@@ -28,6 +28,7 @@ import traceback
 from pathlib import Path
 
 from services.sim import jobs as J
+from services.agent import request_context as _rc
 
 
 def _atomic_write(path: Path, obj: dict) -> None:
@@ -103,8 +104,41 @@ def main(argv: list) -> int:
         print("usage: python -m services.sim.job_worker <job_id>", file=sys.stderr)
         return 2
     job_id = argv[1]
+    if len(argv) > 2:
+        if len(argv) != 4 or argv[2] != "--job-dir":
+            raise ValueError("cell_refused")
+        d = Path(argv[3]).resolve()
+        base = Path(os.environ.get("XDG_DATA_HOME", "/actor/data")).resolve()
+        if base not in d.parents:
+            raise ValueError("cell_refused")
+        spec = json.loads((d / "payload.json").read_text(encoding="utf-8"))
+        roots = spec.get("roots") or {}
+        caller = _rc.owner_key() if _rc.current_context().get("cell") else None
+        with _rc.bind_context(spec.get("ctx")), _rc.bind_roots(
+                roots.get("project", "/work"), roots.get("save", "/work")):
+            if caller is not None and _rc.owner_key() != caller:
+                raise KeyError("not_found")
+            if not _rc.in_cell() or J.job_dir(job_id).resolve() != d:
+                raise KeyError("not_found")
+            return _main(job_id, d, spec)
+    if _rc.in_cell():
+        raise ValueError("cell_refused")
     d = J.job_dir(job_id)
     spec = json.loads((d / "payload.json").read_text(encoding="utf-8"))
+    return _main(job_id, d, spec)
+
+
+def _main(job_id: str, d: Path, spec: dict) -> int:
+    ctx = _rc.current_context()
+    project = _rc.root_value("CHUDWARE_PROJECT_DIR")
+    save = _rc.root_value("CHUDWARE_PROJECT_SAVE_DIR")
+
+    def _bound(fn):
+        def invoke():
+            with _rc.bind_context(ctx), _rc.bind_roots(project, save):
+                fn()
+        return invoke
+
     stage_name = spec["stage"]
     payload = spec.get("payload") or {}
     fn = J.STAGES.get(stage_name)
@@ -135,7 +169,7 @@ def main(argv: list) -> int:
                 continue
 
     if prog_file:
-        threading.Thread(target=_watch, name="progress-watch", daemon=True).start()
+        threading.Thread(target=_bound(_watch), name="progress-watch", daemon=True).start()
 
     outcome: dict = {}
     finished = threading.Event()
@@ -166,7 +200,7 @@ def main(argv: list) -> int:
     signal.signal(signal.SIGTERM, _on_term)
     signal.signal(signal.SIGINT, _on_term)
 
-    threading.Thread(target=_run, name=f"sim-stage-{stage_name}", daemon=True).start()
+    threading.Thread(target=_bound(_run), name=f"sim-stage-{stage_name}", daemon=True).start()
     while not finished.wait(0.25):
         progress.heartbeat()
     stop.set()

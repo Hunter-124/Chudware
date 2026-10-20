@@ -1,0 +1,76 @@
+#!/usr/bin/python3 -IS
+import os
+from pathlib import Path
+import stat
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cell_runtime import BASE_ENV, actor_environment, close_extra_fds, hex_id, open_path, pinned, rootfs, run_sandbox, set_environment
+
+
+def actor_argv(actor, access, command):
+    hex_id(actor)
+    if access not in ("rw", "ro") or not command or not command[0].startswith("/"):
+        raise ValueError("absolute executable and rw|ro class required")
+    if os.environ.get("CHUDWARE_CELL") != "1":
+        raise ValueError("actor launcher requires a cell")
+    if os.environ.get("CHUDWARE_ACTOR_SANDBOX") == "1" and os.environ.get("CHUDWARE_ACTOR_HEX") != actor:
+        raise ValueError("nested actor identity mismatch")
+    # Re-nesting sees only /actor; it cannot select any other actor directory.
+    source = "/actor" if os.environ.get("CHUDWARE_ACTOR_SANDBOX") == "1" else "/state/actors/" + actor
+    pins = []
+    args = rootfs("/opt/chudware", pins)
+    args += ["--bind" if access == "rw" else "--ro-bind", pinned("/work", pins), "/work",
+             "--bind", pinned(source, pins), "/actor"]
+    actor_fd = pins[-1]
+    for name in ("home", "data", "config", "cache", "run"):
+        try:
+            os.mkdir(name, 0o700, dir_fd=actor_fd)
+        except FileExistsError:
+            pass
+        check = open_path(source + "/" + name)
+        os.close(check)
+    for name in ("egress", "provider"):
+        sockfd = os.open("/run/" + name + ".sock", os.O_PATH | os.O_NOFOLLOW)
+        if not stat.S_ISSOCK(os.fstat(sockfd).st_mode):
+            os.close(sockfd)
+            raise ValueError(name + " broker socket required")
+        os.set_inheritable(sockfd, False)
+        pins.append(sockfd)
+        args += ["--ro-bind", "/proc/self/fd/" + str(sockfd), "/run/" + name + ".sock"]
+    env = {**BASE_ENV, **actor_environment(),
+           "CHUDWARE_ACTOR_HEX": actor, "CHUDWARE_ACTOR_STATE": "/actor", "CHUDWARE_ACTOR_SANDBOX": "1",
+           "CHUDWARE_CHUDCODE_BIN": "/opt/chudware/bin/chud",
+           "CHUDWARE_WORKER_PYTHON": "/opt/chudware/venv/bin/python3",
+           "HOME": "/actor/home", "XDG_DATA_HOME": "/actor/data", "XDG_CONFIG_HOME": "/actor/config",
+           "XDG_CACHE_HOME": "/actor/cache", "XDG_RUNTIME_DIR": "/actor/run",
+           "CHUDWARE_HOSTD_SOCKET": "/actor/run/hostd.sock"}
+    # Scoped Chudcode state may be a private temporary subtree of the actor.
+    for key in ("PI_CODING_AGENT_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"):
+        if key.startswith("XDG_") and os.environ.get("CHUDWARE_ACTOR_SANDBOX") != "1":
+            continue  # Cell-supervisor state is never an actor-state override.
+        value = os.environ.get(key)
+        if value:
+            if not value.startswith("/actor/") or any(p in (".", "..", "") for p in value.split("/")[2:]):
+                raise ValueError("scoped state outside actor")
+            env[key] = value
+    for key in ("SSL_CERT_FILE", "PI_PACKAGE_DIR"):
+        value = os.environ.get(key)
+        if value:
+            if not value.startswith(("/opt/chudware/", "/etc/ssl/certs/", "/etc/pki/")) or ".." in value.split("/"):
+                raise ValueError("runtime path outside payload/trust store")
+            env[key] = value
+    set_environment(args, env)
+    args += ["--", "/usr/bin/python3", "-I", "-S", "/opt/chudware/bin/chudware-actor-init", "--", *command]
+    return args, pins
+
+
+if __name__ == "__main__":
+    try:
+        if len(sys.argv) < 5 or sys.argv[3] != "--":
+            raise ValueError("usage: chudware-actor-sandbox <actor_hex> rw|ro -- <absolute argv...>")
+        close_extra_fds()
+        args, pins = actor_argv(sys.argv[1], sys.argv[2], sys.argv[4:])
+        sys.exit(run_sandbox(args, pins))
+    except Exception as exc:
+        print("cell_refused: " + str(exc), file=sys.stderr)
+        sys.exit(1)

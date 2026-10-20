@@ -12,7 +12,7 @@
 //   * the clipped volume (clip_density_domain): those per-tet solid pieces
 //     split into tetrahedra, conforming across tets, whose boundary is exactly
 //     the surface (measured, see ClippedDomain::boundary_matches_surface).
-// Exact rules, nothing smoothed, closed, decimated or removed beyond them:
+// Exact reconstruction rules (raw surface and reanalysis are never smoothed):
 //   * Crossing vertices are keyed by their global mesh edge and computed once,
 //     so neighbouring tets and caps share them bit-exactly (no cracks).
 //   * Nodal values within `threshold_snap` of the threshold snap onto it and
@@ -34,6 +34,12 @@
 // a surface is never repaired to pass. `GeometryState` names what the geometry
 // is; nothing here certifies printability (this module has no print_ready
 // notion).
+// A separate print surface applies 12 Taubin lambda=0.5, mu=-0.53 iterations
+// only to vertices whose incident triangles are all Isosurface-origin. Every
+// domain-cap vertex stays bit-exact. Crossing, degenerate or STL-precision
+// failures pin the affected vertices and their one-ring, then restart from raw
+// (at most eight rollback rounds per iteration count). Remaining validation
+// failures halve iterations down to 1, then refuse the print surface.
 //
 // Retained domain. The whole elements with rho_e >= threshold (a different,
 // coarser discretization of the thresholded design), compacted into
@@ -200,6 +206,43 @@ SurfaceResult extract_nodal_surface(const TetMesh &,
 SurfaceMesh domain_boundary_surface(const TetMesh &);
 // Topological and metric evidence for any SurfaceMesh.
 SurfaceEvidence validate_surface(const SurfaceMesh &);
+
+struct PrintSurfaceOptions {
+  int iterations = 12;
+  double lambda = 0.5, mu = -0.53;
+};
+struct PrintSurfaceEvidence {
+  std::string state = "skipped";
+  int iterations_requested = 12, iterations_used = 0;
+  int pinned_vertices = 0; // original boundary pins, excludes rollback vertices
+  int smoothed_vertices = 0;
+  int rollback_vertices = 0, rollback_rounds = 0;
+  double max_displacement_mm = 0, volume_change_fraction = 0;
+  bool self_intersections_checked = false;
+  std::string reason;
+};
+// BVH broadphase, triangle-plane interval / coplanar clipping narrowphase.
+// Shared vertex/edge contact is permitted, but crossings beyond it are not.
+// When requested, collects all affected triangle ids (unique, ascending,
+// storage bounded by triangle_count); otherwise stops at the first crossing.
+bool surface_self_intersects(const SurfaceMesh &,
+                              std::vector<int> *crossing_triangles = nullptr);
+// Refuses print_surface_invalid after all iteration counts fail. The evidence
+// is populated on success and refusal; the raw topology and sources are retained.
+SurfaceMesh smooth_print_surface(const SurfaceMesh &, const PrintSurfaceOptions &,
+                                 PrintSurfaceEvidence &);
+nlohmann::json to_json(const PrintSurfaceEvidence &);
+
+struct SurfaceOverhang {
+  Eigen::VectorXd vertex_fraction;
+  double unsupported_area_m2 = 0, total_area_m2 = 0;
+};
+// Plate height and tolerance are from the design domain (OverhangModel rule).
+SurfaceOverhang measure_surface_overhang(const SurfaceMesh &,
+                                         const Eigen::Vector3d &direction,
+                                         double angle_deg,
+                                         double plate_height_m,
+                                         double plate_tolerance_m);
 
 // Per surface vertex (V*components): node values are taken exactly, edge
 // vertices interpolate linearly along their edge (exact for P1 fields).

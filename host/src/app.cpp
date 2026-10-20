@@ -168,6 +168,7 @@ inline void wasmBootReady() {
 #endif
 #include "ui/viewport_panel.h"
 #include "ui/widgets/ribbon.h"
+#include "ui/widgets/kit.h"
 // --- C19: simulation + flow + evaluate UI ---
 #include "core/sim_client.h"
 #include "ui/evaluate_dialogs.h"
@@ -214,6 +215,64 @@ void setContextWindowSource(const std::string &src);
 // through ecad_panel's placement seam.
 // =====================================================================================
 namespace {
+
+// Reserved document-lock chrome: unlike a viewport overlay it never covers a workspace's
+// controls, document tabs or Copilot. Stop intentionally covers all live in-app conversations:
+// foreign writes do not carry a reliable conversation owner (including parallel sub-agents).
+float agentLockBannerHeight(const AppState& st) {
+  return st.activeDocLockedByAgent()
+             ? ImGui::GetFrameHeight() + ui::metrics::cpMenuRowPadY() * 2.0f
+             : 0.0f;
+}
+
+void drawAgentLockBanner(AppState& st, float x, float y, float w, float h) {
+  if (h <= 0.0f) return;
+  const float padX = ui::metrics::cpMenuRowPadX();
+  const float padY = ui::metrics::cpMenuRowPadY();
+  const float gap = ui::metrics::cpMenuHeadGap();
+  const std::string reason = st.agentLockReason(st.docMirror.docId());
+  bool running = false, stopping = true;
+  for (const auto& entry : st.runs) {
+    if (!entry.second || !entry.second->running.load()) continue;
+    running = true;
+    stopping = stopping && entry.second->stopRequested.load();
+  }
+  const char* label = stopping ? "Stopping…###agent_lock_stop" : "Stop###agent_lock_stop";
+  const float buttonW = running ? ImGui::CalcTextSize(label, nullptr, true).x +
+                                     ImGui::GetStyle().FramePadding.x * 2.0f : 0.0f;
+  float wash[4];
+  ui::Palette::withAlpha(ui::palette.statusWarn, wash, 0.14f);
+  ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_Always);
+  ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padX, padY));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::ColorConvertU32ToFloat4(ui::Palette::toU32(wash)));
+  if (ImGui::Begin("##agent_lock_strip", nullptr,
+                   ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
+                       ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBringToFrontOnFocus |
+                       ImGuiWindowFlags_NoScrollWithMouse)) {
+    ImGui::AlignTextToFramePadding();
+    const float textW = std::max(0.0f, w - padX * 2.0f -
+                                          (running ? buttonW + gap : 0.0f));
+    const std::string text = ui::kit::elide(reason.c_str(), textW);
+    ImGui::TextUnformatted(text.c_str());
+    if (ImGui::IsItemHovered()) ui::kit::tooltip(reason.c_str());
+    if (running) {
+      ImGui::SameLine();
+      ImGui::SetCursorPos(ImVec2(w - padX - buttonW, padY));
+      if (ui::kit::dangerButton(label, !stopping, "Waiting for the agent to stop",
+                                ImVec2(buttonW, 0.0f))) {
+        for (const auto& entry : st.runs)
+          if (entry.second && entry.second->running.load())
+            ui::requestStopRunFor(st, entry.first);
+      }
+    }
+  }
+  ImGui::End();
+  ImGui::PopStyleColor();
+  ImGui::PopStyleVar(3);
+}
 
 // Appearance ribbon: apply a set_appearance op to the whole model (body "b1")
 // and reload the mesh so the new color/material shows immediately.
@@ -3263,17 +3322,17 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       st.selection.clear();
   });
 
-  // C16: Doc mirror listener — re-draws the tree whenever a mutation lands.
+  // C16: Doc mirror listener — re-draws the tree whenever a snapshot is adopted.
   // (Tree reads st.docMirror.tree() directly; listener fires on the calling
   // thread.)
-  st.docMirror.setListener([&st]() {
+  st.docMirror.setListener([&st](bool revisionChanged) {
     // Nothing to do beyond triggering a redraw; ImGui redraws every frame so
     // the tree panel auto-updates from docMirror.tree() on the next frame.
     // We log the new revision for observability.
     st.addLog("[doc] tree updated  rev=" +
               std::to_string(st.docMirror.revision()));
     // C38 (T1): this is the single central choke point — DocMirror::notify()
-    // fires here after EVERY mutation (applyOps, resync, undo, redo, newPart)
+    // fires here after EVERY adopted tree (applyOps, resync, undo, redo, newPart)
     // once the rebuilt owner map is stored. Re-derive the feature highlight
     // from the fresh owner map so the tinted faces never go stale after a
     // topology rebuild retags them. (docUndo/docRedo also refresh explicitly,
@@ -3586,20 +3645,18 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       st.applyDatumVisibility(); // re-apply the FeatureManager eye hides to the
                                  // fresh datums
     }
-    // Document tabs: a real edit (applyOps/undo/redo/pushPull/revert) lights
-    // the active tab's unsaved-changes marker. Tab switches / fresh-doc
-    // activation / resyncs set suppressTabDirty so they don't falsely dirty a
-    // tab. Keep the cached title in step with renames, too. Also skip when the
-    // mirror has already re-pointed at a different doc than the active tab
-    // (open-second-file race: adoptOpenResponse notifies before applyOpenedDoc
-    // adds the tab). markActiveTabDirty / syncActiveTabTitle each guard on
-    // docId as well — belt and braces.
+    // Only a native revision change to this document is a real edit. Refreshing the
+    // same snapshot (including an agent turn that made no changes) still updates
+    // consumers, but must not claim unsaved changes or adopt an untouched AI tab.
+    // Tab/open bindings retain their explicit suppressTabDirty guard. Also skip
+    // the open-second-file interval before applyOpenedDoc adds the matching tab.
     if (!st.suppressTabDirty) {
       const bool activeMatchesMirror =
           st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
           st.docTabs[st.activeTab].docId == st.docMirror.docId();
       if (activeMatchesMirror) {
-        st.markActiveTabDirty();
+        if (revisionChanged)
+          st.markActiveTabDirty();
         st.syncActiveTabTitle();
       }
     }
@@ -3706,7 +3763,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                 *std::getenv("CHUDWARE_SHOT_KEEPTOAST")))
     st.suppressToasts = true;
   st.wantSettings = shot && shotMode && std::strcmp(shotMode, "settings") == 0;
-  st.wantChat = shot && shotMode && std::strcmp(shotMode, "chat") == 0;
+  st.wantChat = shot && shotMode &&
+                (std::strcmp(shotMode, "chat") == 0 ||
+                 std::strcmp(shotMode, "chat_evidence") == 0);
   // copilot_slash: slash-autocomplete regression — the composer holds a bare "/"
   // so the drop-up menu draws every frame (the detail-truncation loop once hung
   // the UI thread on exactly this draw), then a scripted Enter accepts the
@@ -4391,7 +4450,16 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     a.text = "Thickened the top face of Standoff by 5 mm and re-applied the 1 mm chamfer.";
     st.chat.push_back(a);
   }
-  if (st.wantChat) {
+  if (st.wantChat && std::strcmp(shotMode, "chat_evidence") == 0) {
+    ChatMsg u;
+    u.fromUser = true;
+    u.text = "Render the mounting bracket and inspect its bore geometry.";
+    st.chat.push_back(std::move(u));
+    ChatMsg live;
+    live.running = true;
+    live.ts = chatNowEpoch() - 95.0;
+    st.chat.push_back(std::move(live));
+  } else if (st.wantChat) {
     ChatMsg u;
     u.fromUser = true;
     u.text = "make it 30mm tall with a chamfered top edge";
@@ -4987,7 +5055,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             // cards instead; an answer can resolve a batch in an OLDER
             // bubble (a composer reply split the turn), so it needs msgs.
             const bool askEvent =
-                msgs && feedAskEvent(*msgs, active, orchKind, data);
+                msgs && (feedAskEvent(*msgs, active, orchKind, data) ||
+                         feedSteerEvent(*msgs, orchKind, data));
             if (!askEvent && active)
               feedTurnActivity(*active, orchKind, data);
             // Context meter. THREE sources, one per lane — do not collapse:
@@ -5056,6 +5125,15 @@ int run_gui(const char *screenshotPath, const char *openPath) {
               // The Chudcode resume key, sent as the turn starts. Persist it now: the old
               // post-turn doctor capture never ran when the daemon died mid-turn
               // (2026-09-27, c217), leaving a 2-hour session unresumable.
+#ifdef __EMSCRIPTEN__
+              const auto handle = cellAgentSessionHandle(runConvId);
+              if (!handle.empty()) {
+                ui::ChudcodeSessionLink &link = ui::chudcodeSessionLinkEnsure(runConvId);
+                link.sessionId = handle;
+                link.sessionFile.clear();
+                ui::persistChatHistory(st);
+              }
+#else
               const std::string file = data.value("chudcode_session_file", std::string());
               if (!file.empty()) {
                 ui::ChudcodeSessionLink &link = ui::chudcodeSessionLinkEnsure(runConvId);
@@ -5067,6 +5145,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                   ui::persistChatHistory(st);
                 }
               }
+#endif
             } else if (orchKind == "agent_call") {
               int est = 0;
               if (data.contains("context_tokens_est") &&
@@ -5163,8 +5242,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           !job.docKey.empty() && job.docKey == st.chatDocKey;
       std::vector<ChatMsg> *msgsPtr = conversationMsgs(st, runConvId);
       // The turn is over: a question it asked can no longer be answered.
-      if (msgsPtr)
+      if (msgsPtr) {
         closeOpenAsks(*msgsPtr);
+        // A steer the finished run never confirmed did not reach the agent. A Stop's
+        // own outcome (carried / delivered) lands with the cancel response instead.
+        if (!job.stopRequested.load() && job.stopReason != "cancelled")
+          settleOpenSteers(*msgsPtr);
+      }
       // The status line is viewport-singular — a background run must never
       // repaint it for the document the user is actually looking at.
       auto setStatus = [&](const char *text, int kind) {
@@ -6619,6 +6703,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
          std::strcmp(shotMode, "simaudit") == 0 ||
          std::strcmp(shotMode, "pipedraw") == 0 ||
          std::strcmp(shotMode, "hydraulics3d") == 0 ||
+         std::strcmp(shotMode, "chat_inline") == 0 ||
+         std::strcmp(shotMode, "copilot_ui") == 0 ||
          std::strcmp(shotMode, "dwgopen") == 0);
     if (!pointerShot)
       scenarios.tick(st);
@@ -6691,7 +6777,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     //     those cases as a second gate.
     {
       const bool canDoc =
-          st.workerStarted && !st.anyRunActive() && !st.agentV2Running;
+          st.workerStarted && !st.anyRunActive() && !st.agentV2Running &&
+          !st.activeDocLockedByAgent();
       const bool textFocus = io.WantTextInput;
       const bool inSketchNow = st.sketchMode->active() ||
                                (st.sketch3dMode && st.sketch3dMode->active());
@@ -7015,6 +7102,55 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           feedTurnActivity(live, kind, data);
         };
         const std::string model = st.settings.model[0] ? st.settings.model : "default";
+        // Replay real mapped tool-result evidence supplied by a runtime smoke. Keep the
+        // production feed/trace sinks and render collapsed tools exactly as a live turn.
+        if (std::strcmp(shotMode, "chat_evidence") == 0) {
+          // A tall capture keeps both real images and the hub visible without clipping
+          // earlier evidence out of this smoke's auto-scrolled transcript.
+          glfwSetWindowSize(win, 1340, 1600);
+          const char* fixture = std::getenv("CHUDWARE_CHAT_EVIDENCE");
+          std::ifstream input(fixture ? fixture : "");
+          nlohmann::json events;
+          try {
+            input >> events;
+            if (!events.is_array() || events.empty())
+              throw std::runtime_error("expected a nonempty mapped-event array");
+            for (const auto& event : events) {
+              const std::string kind = event.at("kind").get<std::string>();
+              emit(kind.c_str(), event.at("data"));
+            }
+            const nlohmann::json savedTrace = ui::agentDagToJson(convId);
+            ui::agentDagFromJson(convId, savedTrace);
+            std::vector<ui::AgentTraceAgent> agents;
+            ui::agentTraceSubagents(st, convId, agents);
+            for (const auto& event : events) {
+              const auto& data = event.at("data");
+              const std::string expected = data.value("name", std::string());
+              const std::string id = data.value("subagent_id", std::string());
+              if (expected.empty() || id.empty()) continue;
+              const auto found = std::find_if(agents.begin(), agents.end(),
+                  [&](const ui::AgentTraceAgent& agent) { return agent.id == id; });
+              if (found == agents.end() || found->name != expected)
+                throw std::runtime_error("restored task name differs for " + id);
+            }
+            for (const auto& agent : agents)
+              std::printf("chat_evidence: restored agent %s name=%s parent=%s status=%s\n",
+                          agent.id.c_str(), agent.name.c_str(), agent.parent.c_str(),
+                          agent.status.c_str());
+            if (std::getenv("CHUDWARE_CHAT_EVIDENCE_EXPANDED"))
+              for (auto& row : live.activity) {
+                if (row.rowKind == 3) {
+                  row.expanded = true;
+                  row.userToggled = true;
+                }
+              }
+            std::printf("chat_evidence: replayed %zu mapped events\n", events.size());
+          } catch (const std::exception& error) {
+            std::fprintf(stderr, "chat_evidence: %s\n", error.what());
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+          }
+        } else {
         emit("run_started", {{"run_id", "shot-chat-run"}, {"model", model}});
         emit("plan_state",
              {{"shape", "checklist"},
@@ -7084,6 +7220,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                        "clearance check needs the lid open."}});
         emit("status", {{"subagent_id", "geometry"}, {"phase", "tool"},
                         {"tool_call_id", "geo-3"}, {"tool_name", "add_hole"}});
+        }
         std::shared_ptr<JobState> job = st.runFor(convId);
         {
           std::lock_guard<std::mutex> lk(job->mtx);
@@ -7222,6 +7359,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     if (drawingRibbon && st.ribbonTab != AppState::RT_ViewLayout &&
         st.ribbonTab != AppState::RT_Annotation)
       st.ribbonTab = AppState::RT_ViewLayout;
+    const std::string ribbonAgentLockReason =
+        st.agentLockReason(st.docMirror.docId());
+    ui::setRibbonAgentLockReason(ribbonAgentLockReason.empty()
+                                    ? nullptr : ribbonAgentLockReason.c_str());
     float ribbonH =
         ui::drawRibbon(st.ribbonTab, st.showRibbon, st.showSimulationTools,
                        st.showPcbTools, barH, drawingRibbon);
@@ -7262,6 +7403,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     const float entBarH = 0.0f;
 #endif
 
+    const float agentBarH = agentLockBannerHeight(st);
+    if (agentBarH > 0.0f)
+      drawAgentLockBanner(st, vp->Pos.x,
+                         vp->Pos.y + barH + ribbonH + mfgBarH + entBarH,
+                         vp->Size.x, agentBarH);
+
     // ---------- default starter document ----------
     // Open straight into a fresh part on launch (non-shot) so the app is
     // immediately usable.
@@ -7276,7 +7423,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // ---------- dockspace host (between the title bar+ribbon and the status
     // bar) ----------
     const float statusH = ImGui::GetTextLineHeight() + 8.0f * scale;
-    const float dockTopY = barH + ribbonH + mfgBarH + entBarH;
+    const float dockTopY = barH + ribbonH + mfgBarH + entBarH + agentBarH;
 #ifdef __EMSCRIPTEN__
     const float mobileHudH = g_wasmMobile ? 56.0f : 0.0f;
 #else
@@ -7829,9 +7976,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // user tries to quit with a copilot run in flight. Runs execute daemon-side,
     // so "Continue in background" just lets the quit proceed — hostd keeps the
     // run (its tray icon shows the work) and exits on its own once the work
-    // finishes. "Stop agent & quit" fires agent_cancel (empty run_id = all live
-    // runs) first. Either choice then falls through to the dirty-doc prompt
-    // below if any user-owned docs are unsaved, or straight to the exit.
+    // finishes. "Stop agent & quit" cancels each exact browser run handle (native:
+    // empty run_id cancels all live runs). Either choice then falls through to
+    // the dirty-doc prompt below if any user-owned docs are unsaved, or exits.
     {
       static bool s_quitAgentModalOpen = false;
       if (st.wantQuitAgentConfirm) {
@@ -7884,10 +8031,15 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         }
         ImGui::SameLine();
         if (ImGui::Button("Stop agent & quit", ImVec2(bw, 0))) {
+#ifdef __EMSCRIPTEN__
+          for (const auto& entry : st.runs)
+            if (entry.second && entry.second->running.load())
+              ui::requestStopRunFor(st, entry.first);
+#else
           nlohmann::json res;
           std::string err;
-          // Empty run_id cancels ALL live runs (cooperative cancel).
           st.worker.callAgentCancel("", res, err);
+#endif
           s_quitAgentModalOpen = false;
           ImGui::CloseCurrentPopup();
           proceedQuit();
@@ -8645,8 +8797,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     }
   }
 
-  ui::persistChatHistory(
-      st); // save the active conversation transcript before teardown
+  ui::shutdownAgentControl(st);
+  ui::flushChatPersistence(st); // drain transcript and draft writes before teardown
   ui::freeIcons(); // C14: release atlas textures while GL context is still live
   ui::destroyCursors(); // W1-B: free the GLFW standard cursors
   if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))

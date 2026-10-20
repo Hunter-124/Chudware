@@ -39,7 +39,8 @@ class PrinterAdapter(ABC):
 
     def __init__(self, config: EndpointConfig, *, api_key_header: str = "X-Api-Key") -> None:
         self.config = config
-        self.http = HttpClient(config.base_url, config.auth, config.timeout_s, api_key_header)
+        self.http = HttpClient(config.base_url, config.auth, config.timeout_s, api_key_header,
+                               address_class=config.address_class)
         self.redactor = Redactor(config.auth.secret_values())
         self._last_ok: dict[str, dict[str, Any]] = {}
         self._operations: dict[str, Mapping[str, Any]] = {}

@@ -1,27 +1,35 @@
-// Explorer: working-project PLM changes, workspace files and separate recents.
-// Vault status/checkpoints are async; filesystem browsing uses FsBackend
-// snapshots. Explicit revision-named sibling files group only in the view:
-// every original path remains available for open, rename, copy and delete.
+// Explorer: the working folder's file tree first, with filter/search, a compact toolbar, and
+// collapsible Recent / Changes strips pinned at the bottom of the pane.
+// Vault status/checkpoints are async; filesystem browsing and search use FsBackend snapshots.
+// Explicit revision-named sibling files group only in the view: every original path remains
+// available for open, rename, copy and delete.
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
+#include <ctime>
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "imgui.h"
-#include "imgui_internal.h"  // ImRect (ui::adaptivePanel rect argument)
+#include "imgui_internal.h"  // ImRect, RenderArrow, ScrollToItem
 #include "widgets/kit.h"
 #include "plm/plm_hub.h"
 #include "plm/plm_workspace.h"
 
 #include "file_explorer.h"
+#include "anim.h"           // ui::anim::requestFrames (busy glyph in a strip header)
 #include "dragdrop.h"       // kFileDragPayload (Explorer drag source -> viewport drop target)
-#include "feature_tree.h"   // featureTreeOpenPath / featureTreeActivePath
+#include "feature_tree.h"   // fmRowPill / fmRowPillEnd / fmTreeIconInArrowSlot
+#include "file_dialog.h"    // revealInFileManager / haveOsFileManager
 #include "icons.h"          // getIcon / IconUV
 #include "layout.h"         // kLeftPaneExplorer
 #include "metrics.h"
@@ -65,18 +73,71 @@ static std::string pathExtension(const std::string& name) {
     if (dot == std::string::npos || dot == 0) return {};
     return name.substr(dot);
 }
+static std::string lowerCopy(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return s;
+}
+// Comparison key for one path: forward slashes, no trailing slash, case-folded on Windows. Used
+// for expansion state, selection, open-tab and reveal matching, so the same file spelled with a
+// different separator (doc tab vs. directory listing) still lines up.
+static std::string normKey(std::string s) {
+    for (char& c : s)
+        if (c == '\\') c = '/';
+    while (s.size() > 1 && s.back() == '/') s.pop_back();
+#ifdef _WIN32
+    s = lowerCopy(std::move(s));
+#endif
+    return s;
+}
+// `full` relative to `root` ("" when equal or outside), forward slashes.
+static std::string relativeTo(const std::string& root, const std::string& full) {
+    if (full.size() <= root.size()) return {};
+    std::string rel = full.substr(root.size());
+    while (!rel.empty() && (rel.front() == '/' || rel.front() == '\\')) rel.erase(rel.begin());
+    for (char& c : rel)
+        if (c == '\\') c = '/';
+    return rel;
+}
+
+// Natural, case-insensitive order: digit runs compare by value, so stack_2 < stack_10.
+static bool naturalLess(const std::string& a, const std::string& b) {
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        const unsigned char ca = (unsigned char)a[i], cb = (unsigned char)b[j];
+        if (std::isdigit(ca) && std::isdigit(cb)) {
+            size_t i0 = i, j0 = j;
+            while (i0 < a.size() && a[i0] == '0') ++i0;
+            while (j0 < b.size() && b[j0] == '0') ++j0;
+            size_t i1 = i0, j1 = j0;
+            while (i1 < a.size() && std::isdigit((unsigned char)a[i1])) ++i1;
+            while (j1 < b.size() && std::isdigit((unsigned char)b[j1])) ++j1;
+            const size_t la = i1 - i0, lb = j1 - j0;
+            if (la != lb) return la < lb;
+            const int c = a.compare(i0, la, b, j0, lb);
+            if (c != 0) return c < 0;
+            if (i1 - i != j1 - j) return i1 - i < j1 - j;   // equal value: fewer leading zeros first
+            i = i1;
+            j = j1;
+            continue;
+        }
+        const int la = std::tolower(ca), lb = std::tolower(cb);
+        if (la != lb) return la < lb;
+        ++i;
+        ++j;
+    }
+    if (a.size() - i != b.size() - j) return a.size() - i < b.size() - j;
+    return a < b;   // deterministic tie-break on case
+}
 
 // ---- module state (single Explorer instance) ----
 // Row styling comes from feature_tree.h's shared FM helpers (fmRowPill / fmRowPillEnd /
-// fmTreeIcon* / fmSectionDivider / fmToolbarIconBtn) so Explorer rows are pixel-identical to the
-// FeatureManager reference: same pill height + FramePadding, same soft-blue selection card, same
-// accent-outline hover, same 16px crisp icons and centered hairline section rules.
+// fmTreeIconInArrowSlot) so Explorer rows share the FeatureManager pill, selection card and
+// hover outline; the Explorer draws its own disclosure arrow, icon, label and metadata on top.
 
 // Liquid glass v2 (host contract §H4): fetch (never paint) the left pane's ONE glass surface —
 // layout.cpp's drawLeftPane already painted it this frame under "host_left_glass"; adaptivePanel
-// is idempotent per frame (A2), so this is a cheap cached lookup regardless of the rect passed
-// (window pos/size here is this child's rect, not the whole pane — irrelevant after the first
-// same-frame call).
+// is idempotent per frame (A2), so this is a cheap cached lookup regardless of the rect passed.
 static const ui::AdaptiveSurface& explorerSurf() {
     ImVec2 wp_ = ImGui::GetWindowPos(); ImVec2 ws_ = ImGui::GetWindowSize();
     ImRect r(wp_, ImVec2(wp_.x + ws_.x, wp_.y + ws_.y));
@@ -84,7 +145,7 @@ static const ui::AdaptiveSurface& explorerSurf() {
     // "host_left_glass" call sites (layout.cpp, feature_tree.cpp) must pass the same group.
     return ui::adaptivePanel(ui::panelId("host_left_glass"), r, ui::GlassGroup::FeatureManager);
 }
-static std::string s_selectedPath;     // the currently-highlighted tree node (file or folder)
+static std::string s_selectedPath;     // the currently-highlighted row (file or folder)
 static std::string s_currentFolder;    // folder that New Folder / Paste act inside (a dir, or a
                                        // file's parent); defaults to the workspace root
 static std::string s_renameId;         // path being inline-renamed ("" = none)
@@ -93,6 +154,22 @@ static bool        s_renameFocus = false;
 static std::string s_pendingDelete;    // path queued for the delete-confirm modal ("" = none)
 static std::string s_clipboardPath;    // Explorer copy/paste stash (a file or folder path)
 static std::string s_pendingNewFolder; // reveal intent, retained until the inline rename is visible
+// Expanded folders (normKey) and expanded revision-name groups ("\x01" + normKey(head)). The
+// Explorer owns this set instead of ImGui tree storage so Collapse all / Reveal can edit it.
+static std::unordered_set<std::string> s_expanded;
+static std::string s_scrollTarget;     // normKey of a row to bring into view once it is drawn
+static bool        s_scrollCenter = false;
+static char        s_query[160] = {0}; // filter field; non-empty switches the tree to results
+static bool        s_focusSearch = false;
+static bool        s_recentOpen = false;
+// Rows drawn in the tree/results this frame, in order; last frame's list drives Up/Down.
+struct VisRow { std::string path; bool isDir = false; };
+static std::vector<VisRow> s_rowsThisFrame, s_rowsLastFrame;
+static std::string s_selKey;           // normKey(s_selectedPath), refreshed before drawing rows
+static std::unordered_set<std::string> s_openKeys;   // normKey of every doc tab's saved path
+static std::string s_activeKey;        // normKey of the active doc tab's saved path
+static uint64_t    s_fsEpoch = 0;      // bumps on every listing invalidation (restarts search)
+
 // UI caches hold filtered/sorted rows; backend snapshots own refresh scheduling.
 // Shared ownership keeps a tree walk valid when a child mutation invalidates the
 // cache while its parent's rows are still being iterated.
@@ -105,8 +182,10 @@ struct DirListCache {
     uint64_t revision = UINT64_MAX;
     chudware::FsReadState state = chudware::FsReadState::Loading;
     std::string error;
-    std::vector<std::string> dirs;   // full paths, name-sorted (case-insensitive)
-    std::vector<std::string> files;  // full paths, name-sorted (case-insensitive)
+    std::vector<std::string> dirs;             // full paths, natural order
+    std::vector<chudware::FsEntry> dirMeta;    // parallel to dirs
+    std::vector<std::string> files;            // full paths, natural order
+    std::vector<chudware::FsEntry> fileMeta;   // parallel to files
     std::vector<int> fileGroup;  // -1 for ungrouped; otherwise index into legacyGroups
     std::vector<LegacyFileGroup> legacyGroups;
 };
@@ -128,7 +207,7 @@ struct ExplorerPlmState {
     // and `branchKnown` once any answer landed, so the chip keeps the last value while a
     // refresh is pending instead of flipping back to a loading label.
     bool branchLoading = false, branchKnown = false;
-    bool changesOpen = true, filesOpen = true;
+    bool changesOpen = false;   // bottom Changes strip, collapsed by default
     double fetchedAt = -1.0e9;
     char message[256] = {};
 };
@@ -254,48 +333,29 @@ static const ExplorerPlmItem* statusForPath(const std::string& path) {
     const std::string& project = s_plm.project;
     if (!s_plm.ready || project.empty() || path.size() <= project.size() ||
         !withinWorkspace(project, path)) return nullptr;
-    std::string rel = path.substr(project.size());
-    while (!rel.empty() && (rel.front() == '/' || rel.front() == '\\')) rel.erase(rel.begin());
-    for (char& c : rel) if (c == '\\') c = '/';
-    const auto found = s_plm.byPath.find(rel);
+    const auto found = s_plm.byPath.find(relativeTo(project, path));
     return found == s_plm.byPath.end() ? nullptr : found->second;
 }
-static std::string statusFileLabel(const std::string& name, const ExplorerPlmItem* status) {
-    if (!status) return name;
-    std::string label = name;
-    if (!status->change.empty()) label = "[" + status->change + "] " + label;
-    const std::string& rev = status->workingRev.empty() ? status->rev : status->workingRev;
-    if (!rev.empty()) label += " · rev " + rev;
-    if (!status->lifecycle.empty()) label += " · " + status->lifecycle;
-    return label;
+static std::string statusRev(const ExplorerPlmItem* status) {
+    if (!status) return {};
+    return status->workingRev.empty() ? status->rev : status->workingRev;
 }
+static int changedCount() {
+    if (!s_plm.ready) return 0;
+    int count = 0;
+    for (const auto& row : s_plm.items) if (!row.change.empty()) ++count;
+    for (const auto& row : s_plm.untracked) if (!row.change.empty()) ++count;
+    return count;
+}
+
 static std::map<std::string, std::shared_ptr<DirListCache>> s_dirListCache;
 static std::string s_workspaceError;
 
 static void invalidateDirListCache(bool workspaceChanged = false) {
     s_dirListCache.clear();
+    ++s_fsEpoch;
     chudware::fsBackend().invalidateBrowseCache(workspaceChanged);
 }
-
-// Hover tooltip: full file/dir name, plus absolute path on a second line when it adds context.
-static void itemPathTooltip(const std::string& name, const std::string& fullPath) {
-    if (!ImGui::IsItemHovered()) return;
-    if (fullPath.empty() || fullPath == name)
-        ImGui::SetTooltip("%s", name.c_str());
-    else
-        ImGui::SetTooltip("%s\n%s", name.c_str(), fullPath.c_str());
-}
-
-// TreeNodeEx label for a row about to be submitted at the cursor: the name elided with "…" to
-// the width left after the arrow/icon slot, so a long filename never runs under the pane edge
-// (itemPathTooltip carries the full name). A fixed "###row" id excludes the elided label from
-// the node identity as the pane resizes; callers PushID the path/index first.
-static std::string rowLabel(const std::string& name) {
-    const float w = ImGui::GetContentRegionAvail().x - ImGui::GetTreeNodeToLabelSpacing() -
-                    ImGui::GetStyle().FramePadding.x;
-    return ui::kit::elide(name.c_str(), w) + "###row";
-}
-
 
 // ---- known extensions ----------------------------------------------------
 // .step+ is our native part container and .draw+ is a standalone editable drawing;
@@ -313,10 +373,7 @@ static bool isKnownExt(const std::string& e) { return isCadExt(e) || isEcadExt(e
 
 // Lower-cased extension of a path, INCLUDING the leading dot.
 static std::string lowerExt(const std::string& p) {
-    std::string e = pathExtension(pathFilename(p));
-    std::transform(e.begin(), e.end(), e.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
-    return e;
+    return lowerCopy(pathExtension(pathFilename(p)));
 }
 
 // True when `child` is inside (or equal to) `root` — the guard for every destructive op so the
@@ -336,15 +393,26 @@ static bool withinWorkspace(const std::string& root, const std::string& child) {
     return cs.size() == rs.size() || cs[rs.size()] == '/';
 }
 
-// Pick a per-extension atlas icon name (verified against host/assets/icons/atlas.json). Folders use
-// "body_folder"; CAD parts use "part"; everything else falls back to a generic doc-ish glyph.
+// Per-extension atlas icon (contracts/icons.md inventory: part, file_* kinds, ws_drawing,
+// ecad_pcb). Folders use "body_folder"; everything unknown is the deliberately plain page.
 static const char* fileIconName(const std::string& ext) {
-    if (ext == ".step+" || ext == ".step" || ext == ".stp") return "part";
-    if (ext == ".iges" || ext == ".igs" || ext == ".stl" || ext == ".3mf") return "part";
-    if (ext == ".ecad+" || ext == ".ecad") return "ai_panel";   // generic-but-present glyph
-    if (ext == ".kicad_sch") return "ai_panel";
-    if (ext == ".kicad_pcb") return "ai_panel";
-    return "new_doc";
+    if (ext == ".step+") return "part";
+    if (ext == ".step" || ext == ".stp" || ext == ".iges" || ext == ".igs" ||
+        ext == ".sat" || ext == ".sab") return "file_step";
+    if (ext == ".stl" || ext == ".3mf" || ext == ".obj" || ext == ".ply") return "file_mesh";
+    if (ext == ".draw+" || ext == ".dxf" || ext == ".dwg") return "ws_drawing";
+    if (isEcadExt(ext)) return "ecad_pcb";
+    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp" || ext == ".bmp" ||
+        ext == ".gif" || ext == ".svg") return "file_image";
+    if (ext == ".json" || ext == ".csv" || ext == ".xml" || ext == ".yaml" || ext == ".yml" ||
+        ext == ".toml") return "file_data";
+    if (ext == ".pdf" || ext == ".md" || ext == ".txt" || ext == ".rtf") return "file_doc";
+    if (ext == ".py" || ext == ".cpp" || ext == ".hpp" || ext == ".c" || ext == ".h" ||
+        ext == ".js" || ext == ".ts" || ext == ".rs" || ext == ".sh" || ext == ".lua")
+        return "file_code";
+    if (ext == ".zip" || ext == ".tar" || ext == ".gz" || ext == ".7z" || ext == ".xz")
+        return "file_archive";
+    return "file_generic";
 }
 
 // Text fallback glyph for a row whose atlas icon is missing (fmTreeIcon* contract).
@@ -357,10 +425,16 @@ void ensureWorkspaceDir(AppState& st) {
     auto& fsb = chudware::fsBackend();
     if (st.workspaceDir.empty()) st.workspaceDir = st.settings.workspaceDir;
 #ifdef __EMSCRIPTEN__
-    // The gateway creates its authorized root. Never mkdir from a draw call.
-    // Do not publish "/" as a temporary daemon path while discovery is pending.
-    if (st.workspaceDir.empty() || st.workspaceDir == "/" || st.workspaceDir == "/workspace")
-        st.workspaceDir = fsb.pollDefaultRoot(s_workspaceError);
+    // Retire obsolete persisted host roots without stripping/reinterpreting them.
+    // The current authenticated workspace has only a logical relative root.
+    std::string relative, pathError;
+    if (!chudware::workspaceRelativePath(st.workspaceDir, relative, pathError)) {
+        st.workspaceDir = ".";
+        st.settings.workspaceDir = ".";
+    } else {
+        st.workspaceDir = relative.empty() ? "." : relative;
+    }
+    s_workspaceError.clear();
 #else
     if (st.workspaceDir.empty()) st.workspaceDir = fsb.defaultRoot();
 #endif
@@ -375,11 +449,57 @@ void ensureWorkspaceDir(AppState& st) {
         s_pendingDelete.clear();
         s_pendingNewFolder.clear();
         s_clipboardPath.clear();
+        s_expanded.clear();
+        s_scrollTarget.clear();
+        s_query[0] = '\0';
+        s_rowsLastFrame.clear();
 #ifndef __EMSCRIPTEN__
         // Desktop setup is idempotent once per workspace, not once per frame.
         fsb.mkdir(st.workspaceDir, s_workspaceError);
 #endif
     }
+}
+
+// ---- expansion / reveal -----------------------------------------------------
+static bool isExpanded(const std::string& dir) { return s_expanded.count(normKey(dir)) != 0; }
+static void setExpanded(const std::string& dir, bool open) {
+    if (open) s_expanded.insert(normKey(dir));
+    else s_expanded.erase(normKey(dir));
+}
+// Expand every folder between the workspace root (exclusive: its children are top level) and
+// `path` (inclusive when includeSelf).
+static void expandAncestors(const std::string& root, const std::string& path, bool includeSelf) {
+    const std::string rootKey = normKey(root);
+    std::string p = includeSelf ? path : pathParent(path);
+    while (!p.empty() && withinWorkspace(root, p)) {
+        const std::string key = normKey(p);
+        if (key == rootKey) break;
+        s_expanded.insert(key);
+        const std::string up = pathParent(p);
+        if (up == p) break;
+        p = up;
+    }
+}
+// Leave search, open the folders above `path`, select it and scroll it into view.
+static void revealPath(const std::string& root, const std::string& path, bool expandSelf) {
+    s_query[0] = '\0';
+    expandAncestors(root, path, expandSelf);
+    s_selectedPath = path;
+    s_currentFolder = expandSelf ? path : pathParent(path);
+    s_scrollTarget = normKey(path);
+    s_scrollCenter = true;
+}
+static void selectPath(const std::string& path, bool isDir) {
+    s_selectedPath = path;
+    s_currentFolder = isDir ? path : pathParent(path);
+    s_scrollTarget.clear();
+}
+static void beginRename(const std::string& root, const std::string& path) {
+    s_pendingNewFolder.clear();
+    revealPath(root, path, false);   // the inline editor lives in the tree, not the results
+    s_renameId = path;
+    std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", pathFilename(path).c_str());
+    s_renameFocus = true;
 }
 
 // ---- inline rename commit -------------------------------------------------
@@ -423,6 +543,18 @@ static void commitRename(AppState& st, const std::string& root) {
         remap(s_clipboardPath);
         remap(s_pendingNewFolder);
         remap(s_pendingDelete);
+        // Keep a renamed folder (and anything open beneath it) expanded.
+        const std::string oldKey = normKey(oldP), newKey = normKey(newP);
+        std::vector<std::string> moved;
+        for (auto it = s_expanded.begin(); it != s_expanded.end();) {
+            if (withinWorkspace(oldKey, *it)) {
+                moved.push_back(newKey + it->substr(oldKey.size()));
+                it = s_expanded.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto& key : moved) s_expanded.insert(std::move(key));
     }
 }
 
@@ -470,7 +602,7 @@ static bool doPaste(AppState& st, const std::string& root, const std::string& de
     invalidateExplorerPlm();
 
     st.toast(ui::ToastLevel::Info, "Pasted " + pathFilename(dest));
-    s_selectedPath = dest;
+    revealPath(root, dest, false);
     return true;
 }
 
@@ -491,6 +623,8 @@ static void createNewFolder(AppState& st, const std::string& root, const std::st
         s_renameFocus = false;
         s_pendingNewFolder = cand;
         s_currentFolder = dir;
+        s_query[0] = '\0';                       // the inline name editor lives in the tree
+        expandAncestors(root, cand, /*includeSelf=*/false);
         st.addLog("[explorer] new folder " + cand);
         invalidateDirListCache();
         invalidateExplorerPlm();
@@ -526,192 +660,289 @@ static const char* changeName(const std::string& code) {
     return "";
 }
 
-static void drawChanges(AppState& st, const std::string& project) {
-    auto& P = s_plm;
-    int count = 0;
-    if (P.ready) {
-        for (const auto& row : P.items) if (!row.change.empty()) ++count;
-        for (const auto& row : P.untracked) if (!row.change.empty()) ++count;
+// ---- row painter -------------------------------------------------------------
+// One Explorer row: FM pill + full-width hit target, then (left to right) indent, disclosure
+// arrow (folders/groups) or open-in-tab dot (files), type icon, elided name, an optional dim
+// suffix (search results' folder), and right-aligned vault metadata (rev + change code).
+// The row's InvisibleButton stays the last item so callers attach drag/context/tooltip to it.
+struct RowGeom { float arrowX = 0, iconX = 0, labelX = 0; };
+static RowGeom rowGeom(float x0, int depth) {
+    const float S = ui::uiScale, fs = ImGui::GetFontSize();
+    RowGeom g;
+    g.arrowX = x0 + 6.0f * S + (float)depth * fs;
+    g.iconX = g.arrowX + fs * 0.85f;
+    g.labelX = g.iconX + std::min(16.0f * S, fs) + 5.0f * S;
+    return g;
+}
+struct RowView {
+    int depth = 0;
+    bool arrow = false, expanded = false;
+    const char* icon = "file_generic";
+    const char* fallback = "[F]";
+    float iconAlpha = 1.0f;
+    const char* label = "";
+    const char* suffix = nullptr;
+    bool dim = false, accent = false, openDot = false, selected = false;
+    const float* tint = nullptr;
+    const ExplorerPlmItem* status = nullptr;
+};
+struct RowHit { bool clicked = false, doubleClicked = false; };
+
+static RowHit drawRow(const char* id, const RowView& v) {
+    RowHit hit;
+    const ui::AdaptiveSurface& surf = explorerSurf();
+    const float S = ui::uiScale;
+    ui::FmRowRect rr = ui::fmRowPill(v.selected, v.tint);
+    const float rowH = rr.mx.y - rr.mn.y;
+    ImGui::InvisibleButton(id, ImVec2(std::max(rr.mx.x - rr.mn.x, ui::metrics::stroke(1.0f)), rowH));
+    hit.clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    hit.doubleClicked = hit.clicked && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+    const RowGeom g = rowGeom(rr.mn.x, v.depth);
+    ui::fmTreeIconInArrowSlot(ImVec2(g.iconX - ImGui::GetStyle().FramePadding.x, rr.mn.y),
+                              v.icon, v.fallback, v.iconAlpha);
+    ui::fmRowPillEnd(rr, v.selected);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float fs = ImGui::GetFontSize();
+    const float midY = (rr.mn.y + rr.mx.y) * 0.5f;
+    const float textY = midY - fs * 0.5f;
+    const ImU32 inkPrimary = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
+    const ImU32 inkDim = ImGui::ColorConvertFloat4ToU32(surf.textSecondary);
+    const ImU32 inkAccent = ImGui::ColorConvertFloat4ToU32(kit::toneOn(kit::Tone::Accent, surf));
+    const float slotCx = (g.arrowX + g.iconX) * 0.5f;
+    if (v.arrow) {
+        const float sc = 0.7f;
+        ImGui::RenderArrow(dl, ImVec2(slotCx - fs * 0.5f, midY - fs * 0.5f * sc), inkDim,
+                           v.expanded ? ImGuiDir_Down : ImGuiDir_Right, sc);
+    } else if (v.openDot) {
+        dl->AddCircleFilled(ImVec2(slotCx, midY), fs * 0.17f, inkAccent);
     }
-    const std::string title = P.ready ? "Changes (" + std::to_string(count) + ")" : "Changes";
-    const bool open = kit::cardBegin("##explorer_changes", title.c_str(), "history", &P.changesOpen);
-    if (open) {
-        if (kit::iconButton("##changes_refresh", "refresh", "Refresh vault changes",
-                            !P.loading && !P.checkpointing && st.workerStarted)) {
-            invalidateExplorerPlm();
-            pollExplorerPlm(st, project, true);
+
+    // Right-aligned metadata: change code outermost (tone-colored), revision to its left.
+    const float gap = 4.0f * S;
+    float right = rr.mx.x - 6.0f * S;
+    if (v.status) {
+        const std::string& code = v.status->change;
+        if (!code.empty()) {
+            const float w = ImGui::CalcTextSize(code.c_str()).x;
+            dl->AddText(ImVec2(right - w, textY),
+                        ImGui::ColorConvertFloat4ToU32(kit::toneOn(changeTone(code), surf)),
+                        code.c_str());
+            right -= w + gap;
         }
-        ImGui::SameLine();
-        kit::dimText("Project-wide checkpoint");
-        if (P.loading && P.ready) kit::spinner("Refreshing project changes");
-        if (!st.workerStarted)
-            kit::blockedState("Vault offline", "The Chudware service is unavailable.",
-                              "Files can still be browsed; reconnect to see changes.");
-        else if (!P.error.empty())
-            kit::blockedState("Vault status unavailable", P.error.c_str(), "Refresh to retry.");
-        else if (P.loading && !P.ready)
-            kit::spinner("Checking project changes");
-        else if (!P.ready)
-            kit::emptyState("history", "Checking vault", "Your files are still available below.");
-        else if (!count)
-            kit::emptyState("ok_badge", "No changes", "The project matches its last checkpoint.");
-        else {
-            ImGui::BeginChild("##changes_rows", ImVec2(0, std::min(160.0f * uiScale,
-                       ImGui::GetTextLineHeightWithSpacing() * (count + 1))),
-                       ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
-            auto drawRow = [&](const ExplorerPlmItem& item) {
-                if (item.change.empty()) return;
-                ImGui::PushID(item.path.c_str());
-                kit::RowStyle style;
-                style.icon = "new_doc";
-                style.iconTone = changeTone(item.change);
-                style.meta = item.change.c_str();
-                const std::string tooltip = item.path + "\n" + changeName(item.change);
-                style.tooltip = tooltip.c_str();
-                if (kit::row("##change", item.path.c_str(), style)) {
-                    const std::string absolute = pathJoin(project, item.path);
-                    if (item.change != "D" && isKnownExt(lowerExt(absolute)))
-                        requestOpen(st, absolute);
-                    else if (!item.itemId.empty())
-                        openPlm(st, PlmPage::Files, item.itemId);
-                }
-                if (!item.itemId.empty()) {
-                    ui::pushContextMenuStyle();
-                    if (ImGui::BeginPopupContextItem("##change_menu")) {
-                        if (ImGui::MenuItem("History"))
-                            openPlm(st, PlmPage::Files, item.itemId);
-                        if (ImGui::MenuItem("Release in PLM"))
-                            openPlm(st, PlmPage::Releases, item.itemId);
-                        ImGui::EndPopup();
-                    }
-                    ui::popContextMenuStyle();
-                }
-                ImGui::PopID();
-            };
-            for (const auto& item : P.items) drawRow(item);
-            for (const auto& item : P.untracked) drawRow(item);
-            ui::drawWindowPillScrollbarV(explorerSurf());
-            ImGui::EndChild();
+        const std::string rev = statusRev(v.status);
+        if (!rev.empty()) {
+            const std::string revText = "rev " + rev;
+            const float w = ImGui::CalcTextSize(revText.c_str()).x;
+            if (right - w > g.labelX + fs * 3.0f) {
+                dl->AddText(ImVec2(right - w, textY), inkDim, revText.c_str());
+                right -= w + gap;
+            }
         }
-        kit::rule();
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##checkpoint_msg", "Checkpoint message",
-                                 P.message, sizeof(P.message));
-        if (kit::primaryButton("Checkpoint", P.ready && !P.loading && !P.checkpointing &&
-                                               count > 0 && st.workerStarted,
-                               "Requires available vault changes")) {
-            P.checkpointing = true;
-            P.checkpointError.clear();
-            P.checkpointOk.clear();
-            const std::string message = P.message;
-            const unsigned serial = P.serial;
-            st.rpc.call("plm_checkpoint", {{"path", project}, {"message", message}},
-                        [project, serial, message, &st](const core::RpcResult& r) {
-                auto& state = s_plm;
-                if (state.project != project || state.serial != serial ||
-                    st.plmProjectPath() != project) return;
-                state.checkpointing = false;
-                if (!plmOk(r, state.checkpointError)) return;
-                state.checkpointOk = "Checkpoint saved";
-                state.checkpointError.clear();
-                if (message == state.message) state.message[0] = '\0';
-                invalidateExplorerPlm();
-            });
-        }
-        ImGui::SameLine();
-        if (kit::secondaryButton("PLM", st.workerStarted, "Service unavailable"))
-            openPlm(st, PlmPage::Files);
-        if (P.checkpointing) kit::spinner("Saving checkpoint");
-        kit::inlineStatus(P.checkpointError.c_str(), kit::Tone::Err);
-        kit::inlineStatus(P.checkpointOk.c_str(), kit::Tone::Ok);
     }
-    kit::cardEnd();
+    const std::string name = kit::elide(v.label, std::max(right - g.labelX, fs));
+    dl->AddText(ImVec2(g.labelX, textY), v.accent ? inkAccent : (v.dim ? inkDim : inkPrimary),
+                name.c_str());
+    if (v.suffix && v.suffix[0]) {
+        const float sx = g.labelX + ImGui::CalcTextSize(name.c_str()).x + gap * 1.5f;
+        if (right - sx > fs * 2.0f)
+            dl->AddText(ImVec2(sx, textY), inkDim, kit::elide(v.suffix, right - sx).c_str());
+    }
+    return hit;
 }
 
-// ---- tree node rendering --------------------------------------------------
-// A file row: icon + name, selectable, double-click opens, F2/Del/context-menu act on it.
-static void drawFileRow(AppState& st, const std::string& root, const std::string& p,
-                        const std::string& ext) {
-    const std::string& pathStr = p;
-    const bool isRenaming = (s_renameId == pathStr);
-    const bool selected = (s_selectedPath == pathStr);
-    const std::string fname = pathFilename(p);
-    const ExplorerPlmItem* status = statusForPath(p);
-    const std::string annotated = statusFileLabel(fname, status);
-    ImGui::PushID(pathStr.c_str());
-    if (isRenaming) {
-        // Inline rename: pill + icon + InputText (same frame height as a normal row).
-        ui::FmRowRect rr = ui::fmRowPill(selected);
-        ui::fmTreeIcon(fileIconName(ext), fileIconFallback(ext));
-        ImGui::SameLine(0, 4.0f * ui::uiScale);
-        ImGui::SetNextItemWidth(-1);
-        if (s_renameFocus) { ImGui::SetKeyboardFocusHere(); s_renameFocus = false; }
-        if (ImGui::InputText("##rn", s_renameBuf, sizeof(s_renameBuf),
-                             ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll))
-            commitRename(st, root);
-        if (ImGui::IsItemDeactivated()) commitRename(st, root);   // click-away / Esc commits-or-cancels
-        ui::fmRowPillEnd(rr, selected);
+// Inline rename editor occupying a row (same pill and icon slot as the row it replaces).
+static void drawRenameRow(AppState& st, const std::string& root, const std::string& path,
+                          int depth, const char* icon, const char* fallback) {
+    const bool selected = normKey(path) == s_selKey;
+    ui::FmRowRect rr = ui::fmRowPill(selected);
+    const RowGeom g = rowGeom(rr.mn.x, depth);
+    ImGui::SetCursorScreenPos(ImVec2(g.labelX - ImGui::GetStyle().FramePadding.x, rr.mn.y));
+    ImGui::SetNextItemWidth(std::max(rr.mx.x - ImGui::GetCursorScreenPos().x - 4.0f * ui::uiScale,
+                                     ImGui::GetFontSize() * 4.0f));
+    const bool revealing = (s_pendingNewFolder == path);
+    if (s_renameFocus) ImGui::SetKeyboardFocusHere();
+    if (ImGui::InputText("##rename", s_renameBuf, sizeof(s_renameBuf),
+                         ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll))
+        commitRename(st, root);
+    if (ImGui::IsItemDeactivated()) commitRename(st, root);   // click-away commits; Esc cancels above
+    ui::fmTreeIconInArrowSlot(ImVec2(g.iconX - ImGui::GetStyle().FramePadding.x, rr.mn.y),
+                              icon, fallback);
+    if (revealing) {
+        ImGui::ScrollToItem(ImGuiScrollFlags_KeepVisibleCenterY);
+        // A clipped row needs another frame after scrolling before reveal is consumed.
+        if (ImGui::IsItemVisible()) {
+            s_pendingNewFolder.clear();
+            s_renameFocus = false;
+        }
     } else {
-        // FM leaf-row pattern (identical to the FeatureManager plane rows): pill FIRST at the
-        // row's true left edge, then a leaf TreeNodeEx, then the type icon painted into the
-        // unused leaf-arrow slot so icon + label share the FM's exact metrics and centering.
-        ui::FmRowRect rr = ui::fmRowPill(selected);
-        ImVec2 rowPos = ImGui::GetCursorScreenPos();
-        ImGui::TreeNodeEx(rowLabel(annotated).c_str(),
-                          ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
-                          ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
-        ui::fmTreeIconInArrowSlot(rowPos, fileIconName(ext), fileIconFallback(ext));
-        ui::fmRowPillEnd(rr, selected);
-        if (ImGui::IsItemClicked()) {
-            s_selectedPath = pathStr;
-            s_currentFolder = pathParent(p);
-            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) requestOpen(st, p);
-        }
-        // Drag model files to the viewport, or JSON scenarios to simulation setup.
-        // The absolute path includes its NUL terminator; each target validates
-        // the formats it accepts. Drag preview = the filename.
-        if ((isKnownExt(ext) || ext == ".json") &&
-            ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
-            ImGui::SetDragDropPayload(kFileDragPayload, pathStr.c_str(), pathStr.size() + 1);
-            ImGui::TextUnformatted(fname.c_str());
-            ImGui::EndDragDropSource();
-        }
-        // context menu
-        ui::pushContextMenuStyle();
-        if (ImGui::BeginPopupContextItem("##fctx")) {
-            s_selectedPath = pathStr;
-            s_currentFolder = pathParent(p);
-            if (ImGui::MenuItem("Open", nullptr, false, isKnownExt(ext))) requestOpen(st, p);
-            if (status && !status->itemId.empty()) {
-                if (ImGui::MenuItem("History"))
-                    openPlm(st, PlmPage::Files, status->itemId);
-                if (ImGui::MenuItem("Release in PLM"))
-                    openPlm(st, PlmPage::Releases, status->itemId);
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Rename", "F2")) {
-                s_pendingNewFolder.clear();
-                s_renameId = pathStr;
-                std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", fname.c_str());
-                s_renameFocus = true;
-            }
-            if (ImGui::MenuItem("Copy", "Ctrl+C")) s_clipboardPath = pathStr;
-            if (ImGui::MenuItem("Paste", "Ctrl+V", false, !s_clipboardPath.empty()))
-                doPaste(st, root, pathParent(p));
-            if (ImGui::MenuItem("Delete", "Del")) s_pendingDelete = pathStr;
-            ImGui::EndPopup();
-        }
-        ui::popContextMenuStyle();
-        itemPathTooltip(fname, pathStr);
-        if (ImGui::IsItemHovered() && status) {
-            const std::string rev = status->workingRev.empty() ? status->rev : status->workingRev;
-            std::string detail = pathStr;
-            if (!status->change.empty()) detail += "\n" + std::string(changeName(status->change));
-            if (!rev.empty()) detail += "\nRevision " + rev;
-            if (!status->lifecycle.empty()) detail += "\n" + status->lifecycle;
-            ImGui::SetTooltip("%s", detail.c_str());
-        }
+        s_renameFocus = false;
     }
+    ui::fmRowPillEnd(rr, selected);
+}
+
+// Selected rows keyboard-moved off screen, and reveal targets, scroll into view when drawn.
+static void scrollIfTarget(const std::string& path, const std::string& key) {
+    if (s_scrollTarget.empty() || key != s_scrollTarget) return;
+    s_selectedPath = path;
+    s_selKey = key;
+    ImGui::ScrollToItem(s_scrollCenter ? ImGuiScrollFlags_KeepVisibleCenterY
+                                       : ImGuiScrollFlags_KeepVisibleEdgeY);
+    s_scrollTarget.clear();
+    s_scrollCenter = false;
+}
+
+// ---- tooltips -----------------------------------------------------------------
+static std::string fmtWhen(int64_t unixSeconds) {
+    if (unixSeconds <= 0) return {};
+    const std::time_t t = (std::time_t)unixSeconds;
+    char buf[32] = {0};
+    if (const std::tm* lt = std::localtime(&t)) std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", lt);
+    return kit::fmtAgo((double)unixSeconds) + (buf[0] ? std::string(" (") + buf + ")" : std::string());
+}
+static void rowTooltip(const std::string& path, bool isDir, const chudware::FsEntry* meta,
+                       const ExplorerPlmItem* status, const char* note = nullptr) {
+    if (!ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) return;
+    std::string tip = pathFilename(path) + "\n" + path;
+    if (meta) {
+        std::string line;
+        if (!isDir) line = kit::fmtBytes(meta->size);
+        const std::string when = fmtWhen(meta->mtime);
+        if (!when.empty()) line += (line.empty() ? "Modified " : " \xC2\xB7 Modified ") + when;
+        if (!line.empty()) tip += "\n" + line;
+    }
+    if (status) {
+        std::string line;
+        if (!status->change.empty()) line = changeName(status->change);
+        const std::string rev = statusRev(status);
+        if (!rev.empty()) line += (line.empty() ? "" : " \xC2\xB7 ") + std::string("Revision ") + rev;
+        if (!status->lifecycle.empty()) line += (line.empty() ? "" : " \xC2\xB7 ") + status->lifecycle;
+        if (!line.empty()) tip += "\n" + line;
+    }
+    if (!isDir) {
+        const std::string key = normKey(path);
+        if (key == s_activeKey) tip += "\nActive document";
+        else if (s_openKeys.count(key)) tip += "\nOpen in a tab";
+        if (!isKnownExt(lowerExt(path))) tip += "\nNot a CAD/ECAD document";
+    }
+    if (note && note[0]) tip += std::string("\n") + note;
+    ImGui::SetTooltip("%s", tip.c_str());
+}
+
+// ---- context menus ------------------------------------------------------------
+static void pathMenuItems(const std::string& path) {
+    if (ImGui::MenuItem("Copy path")) ImGui::SetClipboardText(path.c_str());
+    // Desktop only: the browser build has no OS file manager. The helper backgrounds the
+    // launcher, so the GL thread never waits on it.
+    if (haveOsFileManager() && ImGui::MenuItem("Show in file manager"))
+        revealInFileManager(path);
+}
+static void setWorkingFolder(AppState& st, const std::string& dir) {
+    // An explicit working-folder choice; keep the user in the workspace they are browsing from.
+    const AppState::Workspace keep = st.activeWorkspace;
+    setActiveProjectDir(st, dir);
+    st.activeWorkspace = keep;
+}
+static void rootMenuItems(AppState& st, const std::string& root) {
+    s_currentFolder = root;
+    if (ImGui::MenuItem("New Folder")) createNewFolder(st, root, root);
+    if (ImGui::MenuItem("Paste", "Ctrl+V", false, !s_clipboardPath.empty())) doPaste(st, root, root);
+    if (ImGui::MenuItem("Refresh")) {
+        invalidateDirListCache();
+        invalidateExplorerPlm();
+    }
+    ImGui::Separator();
+    pathMenuItems(root);
+}
+static void fileContextMenu(AppState& st, const std::string& root, const std::string& p,
+                            const std::string& ext, const ExplorerPlmItem* status) {
+    ui::pushContextMenuStyle();
+    if (ImGui::BeginPopupContextItem("##fctx")) {
+        selectPath(p, false);
+        if (ImGui::MenuItem("Open", "Enter", false, isKnownExt(ext))) requestOpen(st, p);
+        if (status && !status->itemId.empty()) {
+            if (ImGui::MenuItem("History"))
+                openPlm(st, PlmPage::Files, status->itemId);
+            if (ImGui::MenuItem("Release in PLM"))
+                openPlm(st, PlmPage::Releases, status->itemId);
+        }
+        ImGui::Separator();
+        pathMenuItems(p);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Rename", "F2")) beginRename(root, p);
+        if (ImGui::MenuItem("Copy", "Ctrl+C")) s_clipboardPath = p;
+        if (ImGui::MenuItem("Paste", "Ctrl+V", false, !s_clipboardPath.empty()))
+            doPaste(st, root, pathParent(p));
+        if (ImGui::MenuItem("Delete", "Del")) s_pendingDelete = p;
+        ImGui::EndPopup();
+    }
+    ui::popContextMenuStyle();
+}
+static void folderContextMenu(AppState& st, const std::string& root, const std::string& dir) {
+    ui::pushContextMenuStyle();
+    if (ImGui::BeginPopupContextItem("##dctx")) {
+        selectPath(dir, true);
+        if (ImGui::MenuItem("New Folder")) createNewFolder(st, root, dir);
+        if (ImGui::MenuItem("Set as working folder")) setWorkingFolder(st, dir);
+        ImGui::Separator();
+        pathMenuItems(dir);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Rename", "F2")) beginRename(root, dir);
+        if (ImGui::MenuItem("Copy", "Ctrl+C")) s_clipboardPath = dir;
+        if (ImGui::MenuItem("Paste", "Ctrl+V", false, !s_clipboardPath.empty()))
+            doPaste(st, root, dir);
+        if (ImGui::MenuItem("Delete", "Del")) s_pendingDelete = dir;
+        ImGui::EndPopup();
+    }
+    ui::popContextMenuStyle();
+}
+
+// ---- file / folder rows ---------------------------------------------------------
+// A file row: single click selects, double click / Enter opens, drag drops into the viewport,
+// right-click for the menu. `suffix` is the dim folder shown beside search results.
+static void drawFileRow(AppState& st, const std::string& root, const std::string& p,
+                        const chudware::FsEntry* meta, int depth, const char* suffix = nullptr) {
+    const std::string ext = lowerExt(p);
+    const std::string key = normKey(p);
+    const std::string fname = pathFilename(p);
+    ImGui::PushID(p.c_str());
+    if (s_renameId == p) {
+        drawRenameRow(st, root, p, depth, fileIconName(ext), fileIconFallback(ext));
+        s_rowsThisFrame.push_back({p, false});
+        ImGui::PopID();
+        return;
+    }
+    const ExplorerPlmItem* status = statusForPath(p);
+    const bool active = !s_activeKey.empty() && key == s_activeKey;
+    RowView v;
+    v.depth = depth;
+    v.icon = fileIconName(ext);
+    v.fallback = fileIconFallback(ext);
+    v.label = fname.c_str();
+    v.suffix = suffix;
+    v.dim = !isKnownExt(ext);
+    v.iconAlpha = v.dim ? 0.6f : 1.0f;
+    v.accent = active;
+    v.openDot = active || s_openKeys.count(key) != 0;
+    v.tint = active ? ui::palette.accent : nullptr;
+    v.selected = key == s_selKey;
+    v.status = status;
+    const RowHit hit = drawRow("##file", v);
+    s_rowsThisFrame.push_back({p, false});
+    scrollIfTarget(p, key);
+    if (hit.clicked) selectPath(p, false);
+    if (hit.doubleClicked) requestOpen(st, p);
+    // Drag model files to the viewport, or JSON scenarios to simulation setup.
+    // The absolute path includes its NUL terminator; each target validates
+    // the formats it accepts. Drag preview = the filename.
+    if ((isKnownExt(ext) || ext == ".json") &&
+        ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+        ImGui::SetDragDropPayload(kFileDragPayload, p.c_str(), p.size() + 1);
+        ImGui::TextUnformatted(fname.c_str());
+        ImGui::EndDragDropSource();
+    }
+    fileContextMenu(st, root, p, ext, status);
+    rowTooltip(p, false, meta, status);
     ImGui::PopID();
 }
 
@@ -722,9 +953,7 @@ static std::string legacySeriesName(const std::string& path) {
     const std::string name = pathFilename(path), ext = pathExtension(name);
     if (!isKnownExt(lowerExt(path))) return {};
     const std::string stem = pathStem(name);
-    std::string low = stem;
-    std::transform(low.begin(), low.end(), low.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
+    const std::string low = lowerCopy(stem);
     for (size_t at = low.find_last_of("_-"); at != std::string::npos && at > 0;
          at = low.find_last_of("_-", at - 1)) {
         const std::string suffix = low.substr(at + 1);
@@ -744,12 +973,7 @@ static std::string legacySeriesName(const std::string& path) {
                                       [](unsigned char c) { return std::isdigit(c); });
             }
         }
-        if (version) {
-            std::string key = low.substr(0, at) + ext;
-            std::transform(key.begin(), key.end(), key.begin(),
-                           [](unsigned char c) { return (char)std::tolower(c); });
-            return key;
-        }
+        if (version) return lowerCopy(low.substr(0, at) + ext);
     }
     return {};
 }
@@ -763,10 +987,7 @@ static void groupLegacyFiles(DirListCache& rows) {
         if (!key.empty()) groups[key].push_back(i);
     }
     for (size_t i = 0; i < files.size(); ++i) {
-        std::string key = pathFilename(files[i]);
-        std::transform(key.begin(), key.end(), key.begin(),
-                       [](unsigned char c) { return (char)std::tolower(c); });
-        const auto found = groups.find(key);
+        const auto found = groups.find(lowerCopy(pathFilename(files[i])));
         if (found != groups.end()) found->second.insert(found->second.begin(), i);
     }
     for (auto& [key, members] : groups) {
@@ -776,199 +997,394 @@ static void groupLegacyFiles(DirListCache& rows) {
         group.head = *std::min_element(group.members.begin(), group.members.end());
         const std::string firstName = pathFilename(files[group.members.front()]);
         const std::string ext = pathExtension(firstName);
-        const std::string name = legacySeriesName(files[group.members.front()]).empty()
+        group.title = legacySeriesName(files[group.members.front()]).empty()
             ? firstName : pathStem(firstName).substr(0, key.size() - ext.size()) + ext;
-        group.title = name + " · " + std::to_string(group.members.size()) + " files";
         for (const size_t index : group.members)
             rows.fileGroup[index] = static_cast<int>(rows.legacyGroups.size());
         rows.legacyGroups.push_back(std::move(group));
     }
 }
 
-static void drawDirectoryFiles(AppState& st, const std::string& root,
-                               const DirListCache& rows) {
+// Files of one listing; explicit revision-named siblings collapse under one compact group row
+// ("name  · N revision copies") whose members stay individually openable rows.
+static void drawDirectoryFiles(AppState& st, const std::string& root, const DirListCache& rows,
+                               int depth) {
     for (size_t i = 0; i < rows.files.size(); ++i) {
         const int groupIndex = rows.fileGroup[i];
         if (groupIndex < 0) {
-            drawFileRow(st, root, rows.files[i], lowerExt(rows.files[i]));
+            drawFileRow(st, root, rows.files[i], &rows.fileMeta[i], depth);
             continue;
         }
         const LegacyFileGroup& group = rows.legacyGroups[static_cast<size_t>(groupIndex)];
         if (i != group.head) continue;
-        ImGui::PushID(rows.files[group.head].c_str());
-        const bool open = ImGui::TreeNodeEx(rowLabel(group.title).c_str(),
-                         ImGuiTreeNodeFlags_OpenOnArrow |
-                         ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("These are separate files and may be separate PLM items. "
-                              "No files have been merged or removed.");
-        if (open) {
-            kit::inlineStatus("Revision-named copies are separate files, not merged.",
-                              kit::Tone::Warn);
+        const std::string& headPath = rows.files[group.head];
+        const std::string groupKey = "\x01" + normKey(headPath);
+        if (!s_scrollTarget.empty())   // revealing a member opens its group
             for (const size_t index : group.members)
-                drawFileRow(st, root, rows.files[index], lowerExt(rows.files[index]));
-            ImGui::TreePop();
+                if (normKey(rows.files[index]) == s_scrollTarget) s_expanded.insert(groupKey);
+        bool open = s_expanded.count(groupKey) != 0;
+        const std::string ext = lowerExt(headPath);
+        const std::string count =
+            "\xC2\xB7 " + std::to_string(group.members.size()) + " revision copies";
+        ImGui::PushID(groupKey.c_str());
+        RowView v;
+        v.depth = depth;
+        v.arrow = true;
+        v.expanded = open;
+        v.icon = fileIconName(ext);
+        v.fallback = fileIconFallback(ext);
+        v.label = group.title.c_str();
+        v.suffix = count.c_str();
+        const RowHit hit = drawRow("##group", v);
+        if (hit.clicked && !hit.doubleClicked) {
+            open = !open;
+            if (open) s_expanded.insert(groupKey);
+            else s_expanded.erase(groupKey);
         }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+            ImGui::SetTooltip("Revision-named copies: separate files that may be separate PLM "
+                              "items.\nNothing has been merged or removed.");
         ImGui::PopID();
+        if (open)
+            for (const size_t index : group.members)
+                drawFileRow(st, root, rows.files[index], &rows.fileMeta[index], depth + 1);
     }
 }
 
-// Recursively draw a directory: lazy-list children on open, folders before files.
-// Hide dot entries, not non-CAD files. Backend snapshots own refresh scheduling.
-static void drawDirNode(AppState& st, const std::string& root, const std::string& dir, bool isRoot) {
-    auto& fsb = chudware::fsBackend();
-    // The "Workspace" section rule above the tree already names the section; the root row just
-    // shows the workspace folder's own name (FM-style: divider carries the section label).
-    std::string label = pathFilename(dir);
-    if (label.empty() || label == "/" || (label.size() == 2 && label[1] == ':'))
-        label = dir;  // root-ish
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth |
-                               ImGuiTreeNodeFlags_FramePadding;   // pill-height node
-    if (isRoot) flags |= ImGuiTreeNodeFlags_DefaultOpen;
-    if (!isRoot && s_pendingNewFolder == dir && s_renameId != dir) {
+// Cached, filtered, naturally-sorted rows for one directory (folders first, then files).
+// Dot entries are hidden; every other file is listed (non-documents render dimmed).
+static std::shared_ptr<DirListCache> dirRows(const std::string& dir) {
+    const auto& snapshot = chudware::fsBackend().pollDirectory(dir);
+    auto& cached = s_dirListCache[dir];
+    if (cached && cached->revision == snapshot.revision && cached->state == snapshot.state)
+        return cached;
+    auto fresh = std::make_shared<DirListCache>();
+    fresh->revision = snapshot.revision;
+    fresh->state = snapshot.state;
+    fresh->error = snapshot.error;
+    std::vector<const chudware::FsEntry*> dirs, files;
+    for (const auto& e : snapshot.entries) {
+        if (e.name.empty() || e.name[0] == '.') continue;
+        (e.isDir ? dirs : files).push_back(&e);
+    }
+    auto byName = [](const chudware::FsEntry* a, const chudware::FsEntry* b) {
+        return naturalLess(a->name, b->name);
+    };
+    std::sort(dirs.begin(), dirs.end(), byName);
+    std::sort(files.begin(), files.end(), byName);
+    for (const auto* e : dirs) {
+        fresh->dirs.push_back(pathJoin(dir, e->name));
+        fresh->dirMeta.push_back(*e);
+    }
+    for (const auto* e : files) {
+        fresh->files.push_back(pathJoin(dir, e->name));
+        fresh->fileMeta.push_back(*e);
+    }
+    groupLegacyFiles(*fresh);
+    cached = std::move(fresh);
+    return cached;
+}
+
+static void dimLine(int depth, const char* text) {
+    const float off = rowGeom(0.0f, depth).labelX;
+    ImGui::Indent(off);
+    kit::dimText(text);
+    ImGui::Unindent(off);
+}
+
+static void drawDirChildren(AppState& st, const std::string& root, const std::string& dir,
+                            int depth);
+
+// A folder row: clicking anywhere on it selects and toggles it.
+static void drawFolderRow(AppState& st, const std::string& root, const std::string& dir,
+                          const chudware::FsEntry* meta, int depth) {
+    if (s_pendingNewFolder == dir && s_renameId != dir) {
         s_renameId = dir;
         std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", pathFilename(dir).c_str());
         s_renameFocus = true;
         s_selectedPath = dir;
+        s_selKey = normKey(dir);
     }
-    const bool dirSelected = (s_selectedPath == dir);
-
     ImGui::PushID(dir.c_str());
-
-    // A non-root folder being inline-renamed shows an InputText in place of its tree node; its
-    // children stay collapsed during the rename (kept simple — folder rename is a leaf interaction).
-    if (!isRoot && s_renameId == dir) {
-        ui::FmRowRect rr = ui::fmRowPill(dirSelected);
-        ui::fmTreeIcon("body_folder", "[D]");
-        ImGui::SameLine(0, 4.0f * ui::uiScale);
-        ImGui::SetNextItemWidth(-1);
-        const bool revealing = (s_pendingNewFolder == dir);
-        if (s_renameFocus) ImGui::SetKeyboardFocusHere();
-        if (ImGui::InputText("##rnd", s_renameBuf, sizeof(s_renameBuf),
-                             ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll))
-            commitRename(st, root);
-        if (ImGui::IsItemDeactivated()) commitRename(st, root);
-        if (revealing) {
-            ImGui::SetScrollHereY(0.5f);
-            // A clipped row needs another frame after scrolling before reveal is consumed.
-            if (ImGui::IsItemVisible()) {
-                s_pendingNewFolder.clear();
-                s_renameFocus = false;
-            }
-        } else {
-            s_renameFocus = false;
-        }
-        ui::fmRowPillEnd(rr, dirSelected);
+    if (s_renameId == dir) {
+        // Children stay hidden during a folder rename (it is a leaf interaction).
+        drawRenameRow(st, root, dir, depth, "body_folder", "[D]");
+        s_rowsThisFrame.push_back({dir, true});
         ImGui::PopID();
         return;
     }
-
-    // FM expandable-row pattern (identical to the FeatureManager Origin row): pill, 16px icon as
-    // its own item, then the chevron node. Pill ends right after the node, BEFORE children.
-    ui::FmRowRect rr = ui::fmRowPill(dirSelected);
-    ui::fmTreeIcon("body_folder", "[D]");
-    ImGui::SameLine(0, 4.0f * ui::uiScale);
-    if (!s_pendingNewFolder.empty() && withinWorkspace(dir, s_pendingNewFolder))
-        ImGui::SetNextItemOpen(true, ImGuiCond_Always);
-    bool open = ImGui::TreeNodeEx(rowLabel(label).c_str(), flags);
-    ui::fmRowPillEnd(rr, dirSelected);
-    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
-        s_selectedPath = dir;
-        s_currentFolder = dir;
+    const std::string key = normKey(dir);
+    bool open = s_expanded.count(key) != 0;
+    RowView v;
+    v.depth = depth;
+    v.arrow = true;
+    v.expanded = open;
+    v.icon = "body_folder";
+    v.fallback = "[D]";
+    const std::string name = pathFilename(dir);
+    v.label = name.c_str();
+    v.selected = key == s_selKey;
+    const RowHit hit = drawRow("##dir", v);
+    s_rowsThisFrame.push_back({dir, true});
+    scrollIfTarget(dir, key);
+    if (hit.clicked) {
+        selectPath(dir, true);
+        if (!hit.doubleClicked) {   // the second click of a double-click must not undo the first
+            open = !open;
+            setExpanded(dir, open);
+        }
     }
-    itemPathTooltip(label, dir);
-    // folder context menu (New Folder / Paste / Rename / Delete — root only allows New Folder/Paste)
-    ui::pushContextMenuStyle();
-    if (ImGui::BeginPopupContextItem("##dctx")) {
-        s_selectedPath = dir;
-        s_currentFolder = dir;
-        if (ImGui::MenuItem("New Folder")) {
-            createNewFolder(st, root, dir);
-        }
-        if (ImGui::MenuItem("Set as working folder")) setActiveProjectDir(st, dir);
-        if (ImGui::MenuItem("Paste", "Ctrl+V", false, !s_clipboardPath.empty()))
-            doPaste(st, root, dir);
-        if (!isRoot) {
-            ImGui::Separator();
-            if (ImGui::MenuItem("Rename", "F2")) {
-                s_pendingNewFolder.clear();
-                s_renameId = dir;
-                std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", pathFilename(dir).c_str());
-                s_renameFocus = true;
-            }
-            if (ImGui::MenuItem("Delete", "Del")) s_pendingDelete = dir;
-        }
-        ImGui::EndPopup();
-    }
-    ui::popContextMenuStyle();
-
-    if (open) {
-        const auto& snapshot = fsb.pollDirectory(dir);
-        auto& cached = s_dirListCache[dir];
-        if (!cached || cached->revision != snapshot.revision || cached->state != snapshot.state) {
-            auto fresh = std::make_shared<DirListCache>();
-            fresh->revision = snapshot.revision;
-            fresh->state = snapshot.state;
-            fresh->error = snapshot.error;
-            const auto& entries = snapshot.entries;
-            fresh->files.reserve(entries.size());
-            for (const auto& e : entries) {
-                if (e.name.empty() || e.name[0] == '.') continue;
-                std::string full = pathJoin(dir, e.name);
-                if (e.isDir) {
-                    fresh->dirs.push_back(std::move(full));
-                } else {
-                    fresh->files.push_back(std::move(full));
-                }
-            }
-            auto byName = [](const std::string& a, const std::string& b) {
-                std::string an = pathFilename(a), bn = pathFilename(b);
-                std::transform(an.begin(), an.end(), an.begin(), ::tolower);
-                std::transform(bn.begin(), bn.end(), bn.begin(), ::tolower);
-                return an < bn;
-            };
-            std::sort(fresh->dirs.begin(), fresh->dirs.end(), byName);
-            std::sort(fresh->files.begin(), fresh->files.end(), byName);
-            groupLegacyFiles(*fresh);
-            cached = std::move(fresh);
-        }
-        const auto rows = cached;
-        for (const auto& d : rows->dirs) drawDirNode(st, root, d, /*isRoot=*/false);
-        drawDirectoryFiles(st, root, *rows);
-        // Loading is not absence: web mutations invalidate listings before their async refresh.
-        // Stop forcing ancestors only when a completed listing cannot contain the reveal target.
-        if (!s_pendingNewFolder.empty() && withinWorkspace(dir, s_pendingNewFolder) &&
-            rows->state != chudware::FsReadState::Loading &&
-            (rows->state != chudware::FsReadState::Ready ||
-             std::none_of(rows->dirs.begin(), rows->dirs.end(), [](const std::string& child) {
-                 return withinWorkspace(child, s_pendingNewFolder);
-             }))) {
-            if (s_renameId == s_pendingNewFolder) s_renameId.clear();
-            s_pendingNewFolder.clear();
-            s_renameFocus = false;
-        }
-        if (rows->state == chudware::FsReadState::Error)
-            ImGui::TextWrapped("Unable to read folder: %s", rows->error.c_str());
-        else if (rows->state == chudware::FsReadState::Missing)
-            ImGui::TextDisabled("  Folder missing");
-        else if (rows->state == chudware::FsReadState::Loading)
-            ImGui::TextDisabled("  Loading...");
-        else if (rows->dirs.empty() && rows->files.empty())
-            ImGui::TextDisabled("  (empty)");
-        ImGui::TreePop();
-    }
+    folderContextMenu(st, root, dir);
+    rowTooltip(dir, true, meta, nullptr);
     ImGui::PopID();
+    if (open) drawDirChildren(st, root, dir, depth + 1);
 }
 
-// ---- Recent section -------------------------------------------------------
-static bool s_recentOpen = false;
-static void drawRecentSection(AppState& st) {
+static void drawDirChildren(AppState& st, const std::string& root, const std::string& dir,
+                            int depth) {
+    const auto rows = dirRows(dir);   // shared copy: a mutation mid-walk cannot free these rows
+    for (size_t i = 0; i < rows->dirs.size(); ++i)
+        drawFolderRow(st, root, rows->dirs[i], &rows->dirMeta[i], depth);
+    drawDirectoryFiles(st, root, *rows, depth);
+    // Loading is not absence: web mutations invalidate listings before their async refresh.
+    // Stop forcing ancestors only when a completed listing cannot contain the reveal target.
+    if (!s_pendingNewFolder.empty() && withinWorkspace(dir, s_pendingNewFolder) &&
+        rows->state != chudware::FsReadState::Loading &&
+        (rows->state != chudware::FsReadState::Ready ||
+         std::none_of(rows->dirs.begin(), rows->dirs.end(), [](const std::string& child) {
+             return withinWorkspace(child, s_pendingNewFolder);
+         }))) {
+        if (s_renameId == s_pendingNewFolder) s_renameId.clear();
+        s_pendingNewFolder.clear();
+        s_renameFocus = false;
+    }
+    const bool empty = rows->dirs.empty() && rows->files.empty();
+    if (rows->state == chudware::FsReadState::Error) {
+        const std::string msg = "Unable to read folder: " + rows->error;
+        if (depth == 0) kit::blockedState("Folder unreadable", rows->error.c_str(), "Refresh to retry.");
+        else dimLine(depth, msg.c_str());
+    } else if (rows->state == chudware::FsReadState::Missing) {
+        if (depth == 0) kit::blockedState("Folder missing", dir.c_str(), "Choose another working folder.");
+        else dimLine(depth, "Folder missing");
+    } else if (rows->state == chudware::FsReadState::Loading && empty) {
+        if (depth == 0) kit::spinner("Loading\xE2\x80\xA6");
+        else dimLine(depth, "Loading\xE2\x80\xA6");
+    } else if (empty) {
+        if (depth == 0)
+            kit::emptyState("body_folder", "Empty folder",
+                            "Save a part here, or right-click to create a folder.");
+        else dimLine(depth, "Empty");
+    }
+}
+
+// ---- search -------------------------------------------------------------------
+// Bounded incremental BFS over FsBackend directory snapshots. Each frame polls at most
+// kSearchDirsPerFrame folders; a snapshot still loading (web) rotates to the back of the queue.
+// Dot folders are skipped; the walk stops after kSearchMaxEntries entries or kSearchMaxDepth.
+struct SearchHit {
+    std::string path, folder;   // folder: workspace-relative parent ("" at the top level)
+    bool isDir = false;
+    chudware::FsEntry meta;
+};
+struct SearchState {
+    std::string query, root;
+    uint64_t epoch = 0;
+    std::deque<std::pair<std::string, int>> queue;
+    std::vector<SearchHit> hits;
+    size_t scanned = 0, extraHits = 0;
+    bool capped = false, done = true;
+};
+static SearchState s_search;
+static constexpr size_t kSearchMaxEntries = 4000;
+static constexpr int kSearchMaxDepth = 12;
+static constexpr int kSearchDirsPerFrame = 48;
+static constexpr size_t kSearchMaxHits = 500;
+
+static std::string trimmedQuery() {
+    std::string q = s_query;
+    while (!q.empty() && q.front() == ' ') q.erase(q.begin());
+    while (!q.empty() && q.back() == ' ') q.pop_back();
+    return lowerCopy(std::move(q));
+}
+// Every space-separated token must occur in the name (or in the relative path, for a token
+// containing '/').
+static bool searchMatches(const std::string& query, const std::string& name, const std::string& rel) {
+    const std::string lname = lowerCopy(name), lrel = lowerCopy(rel);
+    size_t at = 0;
+    while (at < query.size()) {
+        size_t end = query.find(' ', at);
+        if (end == std::string::npos) end = query.size();
+        if (end > at) {
+            const std::string token = query.substr(at, end - at);
+            const std::string& hay = token.find('/') != std::string::npos ? lrel : lname;
+            if (hay.find(token) == std::string::npos) return false;
+        }
+        at = end + 1;
+    }
+    return true;
+}
+static void stepSearch(const std::string& root, const std::string& query) {
+    auto& S = s_search;
+    if (query != S.query || root != S.root || S.epoch != s_fsEpoch) {
+        S = SearchState{};
+        S.query = query;
+        S.root = root;
+        S.epoch = s_fsEpoch;
+        S.done = query.empty();
+        if (!S.done) S.queue.emplace_back(root, 0);
+    }
+    if (S.done) return;
+    auto& fsb = chudware::fsBackend();
+    size_t rotated = 0;
+    for (int budget = kSearchDirsPerFrame; budget > 0 && !S.queue.empty(); --budget) {
+        auto [dir, depth] = std::move(S.queue.front());
+        S.queue.pop_front();
+        const auto& snap = fsb.pollDirectory(dir);
+        if (snap.state == chudware::FsReadState::Loading) {
+            S.queue.emplace_back(std::move(dir), depth);
+            if (++rotated >= S.queue.size()) break;   // everything left is still loading
+            continue;
+        }
+        if (snap.state != chudware::FsReadState::Ready) continue;
+        std::vector<const chudware::FsEntry*> entries;
+        for (const auto& e : snap.entries)
+            if (!e.name.empty() && e.name[0] != '.') entries.push_back(&e);
+        std::sort(entries.begin(), entries.end(),
+                  [](const chudware::FsEntry* a, const chudware::FsEntry* b) {
+                      if (a->isDir != b->isDir) return a->isDir;
+                      return naturalLess(a->name, b->name);
+                  });
+        const std::string folder = relativeTo(root, dir);
+        for (const auto* e : entries) {
+            if (++S.scanned > kSearchMaxEntries) {
+                S.capped = true;
+                S.queue.clear();
+                break;
+            }
+            std::string full = pathJoin(dir, e->name);
+            const std::string rel = folder.empty() ? e->name : folder + "/" + e->name;
+            if (searchMatches(query, e->name, rel)) {
+                if (S.hits.size() < kSearchMaxHits) S.hits.push_back({full, folder, e->isDir, *e});
+                else ++S.extraHits;
+            }
+            if (e->isDir && depth + 1 < kSearchMaxDepth) S.queue.emplace_back(std::move(full), depth + 1);
+        }
+    }
+    S.done = S.queue.empty();
+}
+
+static void drawSearchResults(AppState& st, const std::string& root) {
+    const auto& S = s_search;
+    if (!S.done) kit::spinner("Searching\xE2\x80\xA6");
+    for (const SearchHit& h : S.hits) {
+        if (!h.isDir) {
+            drawFileRow(st, root, h.path, &h.meta, 0, h.folder.c_str());
+            continue;
+        }
+        const std::string key = normKey(h.path);
+        ImGui::PushID(h.path.c_str());
+        RowView v;
+        v.icon = "body_folder";
+        v.fallback = "[D]";
+        const std::string name = pathFilename(h.path);
+        v.label = name.c_str();
+        v.suffix = h.folder.c_str();
+        v.selected = key == s_selKey;
+        const RowHit hit = drawRow("##hitdir", v);
+        s_rowsThisFrame.push_back({h.path, true});
+        scrollIfTarget(h.path, key);
+        if (hit.clicked) selectPath(h.path, true);
+        if (hit.doubleClicked) revealPath(root, h.path, true);
+        folderContextMenu(st, root, h.path);
+        rowTooltip(h.path, true, &h.meta, nullptr, "Double-click to show it in the tree");
+        ImGui::PopID();
+    }
+    if (S.done && S.hits.empty()) kit::dimText("No matches");
+    if (S.extraHits > 0) {
+        const std::string more = "+" + std::to_string(S.extraHits) + " more matches \xE2\x80\x94 refine the filter";
+        kit::dimText(more.c_str());
+    }
+    if (S.capped) kit::dimText("Search stopped after 4000 entries \xE2\x80\x94 refine the filter.");
+}
+
+// ---- bottom strips ---------------------------------------------------------------
+// One-line collapsible strip header: disclosure arrow + label, then (right-aligned) an optional
+// count badge, busy mark and trailing state text. Returns true when clicked (toggle);
+// `menuRequested` reports a right-click (the badge chip is the last item, so callers open their
+// menu with OpenPopup rather than BeginPopupContextItem).
+static bool stripHeader(const char* id, const char* label, bool open, const char* badge,
+                        kit::Tone badgeTone, const char* trailing, kit::Tone trailingTone,
+                        bool busy, const char* tooltip, bool* menuRequested) {
+    const ui::AdaptiveSurface& surf = explorerSurf();
+    const float S = ui::uiScale, fs = ImGui::GetFontSize();
+    const float h = ImGui::GetFrameHeight();
+    const bool clicked = kit::rowBegin(id, h, false);
+    const bool hovered = ImGui::IsItemHovered();
+    if (menuRequested) *menuRequested = hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Right);
+    const ImVec2 p0 = ImGui::GetItemRectMin(), p1 = ImGui::GetItemRectMax();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float midY = (p0.y + p1.y) * 0.5f, textY = midY - fs * 0.5f;
+    const float padX = kit::padX(), gap = 4.0f * S;
+    const ImU32 inkDim = ImGui::ColorConvertFloat4ToU32(surf.textSecondary);
+    const float sc = 0.7f;
+    ImGui::RenderArrow(dl, ImVec2(p0.x + padX, midY - fs * 0.5f * sc), inkDim,
+                       open ? ImGuiDir_Down : ImGuiDir_Right, sc);
+    const float labelX = p0.x + padX + fs * 1.1f;
+    dl->AddText(ImVec2(labelX, textY), ImGui::GetColorU32(ImGuiCol_Text), label);
+    float right = p1.x - padX;
+    if (badge && badge[0]) {
+        const float chipW = ui::metrics::U(1.5f) * 2.0f + ImGui::CalcTextSize(badge).x;
+        const float chipH = ImGui::GetTextLineHeight() + ui::metrics::U(0.5f) * 2.0f;
+        ImGui::SetCursorScreenPos(ImVec2(right - chipW, midY - chipH * 0.5f));
+        kit::chip(badge, badgeTone);
+        right -= chipW + gap;
+    }
+    const float minX = labelX + ImGui::CalcTextSize(label).x + gap;
+    if (trailing && trailing[0] && right > minX + fs) {
+        const std::string t = kit::elide(trailing, right - minX);
+        const float w = ImGui::CalcTextSize(t.c_str()).x;
+        dl->AddText(ImVec2(right - w, textY),
+                    ImGui::ColorConvertFloat4ToU32(kit::toneOn(trailingTone, surf)), t.c_str());
+        right -= w + gap;
+    }
+    if (busy && right - fs > minX) {
+        kit::statusGlyph(dl, ImVec2(right - fs * 0.5f, midY), fs * 0.4f, kit::Status::Running, surf);
+        ui::anim::requestFrames();
+    }
+    if (hovered && tooltip && tooltip[0]) ImGui::SetTooltip("%s", tooltip);
+    kit::rowEnd();
+    return clicked;
+}
+
+static float pillRowH() { return ImGui::GetFontSize() + 8.0f * ui::uiScale; }   // fmRowPill frame
+static constexpr int kRecentRowsMax = 6;
+static constexpr int kChangeRowsMax = 5;
+// Strip toggles apply at the start of the NEXT frame, before the tree height is reserved, so a
+// strip never expands past the pane for a frame.
+static bool s_toggleRecent = false, s_toggleChanges = false;
+
+static float recentStripHeight(const AppState& st) {
+    if (st.recentFiles.empty()) return 0.0f;
+    const float sp = ImGui::GetStyle().ItemSpacing.y;
+    float h = ImGui::GetFrameHeight() + sp;
+    if (s_recentOpen)
+        h += (float)std::min<size_t>(st.recentFiles.size(), kRecentRowsMax) * (pillRowH() + sp) + sp;
+    return h;
+}
+
+static void drawRecentStrip(AppState& st) {
     if (st.recentFiles.empty()) return;
     auto& fsb = chudware::fsBackend();
-    if (!kit::cardBegin("##explorer_recent", "Recent", "history", &s_recentOpen)) {
-        kit::cardEnd();
-        return;
-    }
+    const std::string count = std::to_string(st.recentFiles.size());
+    if (stripHeader("##fx_recent", "Recent", s_recentOpen, count.c_str(), kit::Tone::Neutral,
+                    nullptr, kit::Tone::Neutral, false,
+                    "Recently opened files (may live outside the working folder)", nullptr))
+        s_toggleRecent = true;
+    if (!s_recentOpen) return;
+    const float sp = ImGui::GetStyle().ItemSpacing.y;
+    const float listH = (float)std::min<size_t>(st.recentFiles.size(), kRecentRowsMax) * (pillRowH() + sp);
+    ImGui::BeginChild("##fx_recent_rows", ImVec2(0, listH), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar);
 #ifndef __EMSCRIPTEN__
     static std::map<std::string, chudware::FsStatSnapshot> recentStats;
     static double checkedAt = -1e9;
@@ -993,20 +1409,18 @@ static void drawRecentSection(AppState& st) {
         const bool exists = probe.state != chudware::FsReadState::Ready || probe.value.exists;
         const std::string ext = lowerExt(rp);
         const std::string fname = pathFilename(rp);
-        // Same FM leaf-row pattern as the tree's file rows; a missing file keeps a readable dim
-        // state (dim text + faded icon), like the FM's hidden planes.
-        ui::FmRowRect rr = ui::fmRowPill(false);
-        ImVec2 rowPos = ImGui::GetCursorScreenPos();
-        if (!exists) ImGui::PushStyleColor(ImGuiCol_Text, explorerSurf().textSecondary);
-        ImGui::TreeNodeEx(rowLabel(statusFileLabel(fname, statusForPath(rp))).c_str(),
-                          ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
-                          ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
-        if (!exists) ImGui::PopStyleColor();
-        ui::fmTreeIconInArrowSlot(rowPos, fileIconName(ext), fileIconFallback(ext),
-                                  exists ? 1.0f : 0.45f);
-        ui::fmRowPillEnd(rr, false);
-        if (ImGui::IsItemClicked() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && exists)
-            requestOpen(st, rp);
+        const std::string key = normKey(rp);
+        const ExplorerPlmItem* status = statusForPath(rp);
+        RowView v;
+        v.icon = fileIconName(ext);
+        v.fallback = fileIconFallback(ext);
+        v.iconAlpha = exists ? 1.0f : 0.45f;
+        v.label = fname.c_str();
+        v.dim = !exists;
+        v.openDot = s_openKeys.count(key) != 0;
+        v.status = status;
+        const RowHit hit = drawRow("##recent", v);
+        if (hit.doubleClicked && exists) requestOpen(st, rp);
         // Recent files use the same model/scenario payload as directory rows.
         if (exists && (isKnownExt(ext) || ext == ".json") &&
             ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
@@ -1014,10 +1428,204 @@ static void drawRecentSection(AppState& st) {
             ImGui::TextUnformatted(fname.c_str());
             ImGui::EndDragDropSource();
         }
-        itemPathTooltip(fname, rp);
+        ui::pushContextMenuStyle();
+        if (ImGui::BeginPopupContextItem("##rctx")) {
+            if (ImGui::MenuItem("Open", nullptr, false, exists && isKnownExt(ext))) requestOpen(st, rp);
+            pathMenuItems(rp);
+            ImGui::EndPopup();
+        }
+        ui::popContextMenuStyle();
+        chudware::FsEntry meta;
+        meta.size = probe.value.size;
+        meta.mtime = probe.value.mtime;
+        rowTooltip(rp, false, probe.state == chudware::FsReadState::Ready && exists ? &meta : nullptr,
+                   status, exists ? nullptr : "Missing on disk");
         ImGui::PopID();
     }
-    kit::cardEnd();
+    ui::drawWindowPillScrollbarV(explorerSurf());
+    ImGui::EndChild();
+}
+
+// Changes strip body height. Everything except the populated list is a single line.
+static bool changesHasStatusLine() {
+    return s_plm.checkpointing || !s_plm.checkpointError.empty() || !s_plm.checkpointOk.empty();
+}
+static bool changesListMode(const AppState& st, int count) {
+    return st.workerStarted && s_plm.error.empty() && s_plm.ready && count > 0;
+}
+static float changesBodyHeight(const AppState& st, int count) {
+    const float sp = ImGui::GetStyle().ItemSpacing.y, fh = ImGui::GetFrameHeight();
+    if (!changesListMode(st, count)) return fh;
+    const float rowH = ImGui::GetTextLineHeight() + kit::padY() * 2.0f;
+    float h = (float)std::min(count, kChangeRowsMax) * (rowH + sp);
+    h += fh + sp + fh;
+    if (changesHasStatusLine()) h += sp + ImGui::GetTextLineHeightWithSpacing();
+    return h;
+}
+static float changesStripHeight(const std::string& project, float bodyH) {
+    if (project.empty()) return 0.0f;
+    const float sp = ImGui::GetStyle().ItemSpacing.y;
+    float h = ImGui::GetFrameHeight() + sp;
+    if (s_plm.changesOpen) h += bodyH + sp;
+    return h;
+}
+
+// A one-line note with an optional right-aligned button. Returns true when the button is clicked.
+static bool noteLine(const char* note, const char* button, bool enabled = true,
+                     const char* disabledReason = nullptr) {
+    const float gap = 4.0f * ui::uiScale;
+    const float btnW = button ? ImGui::CalcTextSize(button).x + ImGui::GetStyle().FramePadding.x * 4.0f : 0.0f;
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const float startX = ImGui::GetCursorPosX();
+    ImGui::AlignTextToFramePadding();
+    const std::string t = kit::elide(note, std::max(avail - btnW - gap, ImGui::GetFontSize()));
+    kit::dimText(t.c_str());
+    if (t != note && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", note);
+    if (!button) return false;
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(startX + avail - btnW);
+    return kit::secondaryButton(button, enabled, disabledReason, ImVec2(btnW, 0));
+}
+
+static void runCheckpoint(AppState& st, const std::string& project) {
+    auto& P = s_plm;
+    P.checkpointing = true;
+    P.checkpointError.clear();
+    P.checkpointOk.clear();
+    const std::string message = P.message;
+    const unsigned serial = P.serial;
+    st.rpc.call("plm_checkpoint", {{"path", project}, {"message", message}},
+                [project, serial, message, &st](const core::RpcResult& r) {
+        auto& state = s_plm;
+        if (state.project != project || state.serial != serial ||
+            st.plmProjectPath() != project) return;
+        state.checkpointing = false;
+        if (!plmOk(r, state.checkpointError)) return;
+        state.checkpointOk = "Checkpoint saved";
+        state.checkpointError.clear();
+        if (message == state.message) state.message[0] = '\0';
+        invalidateExplorerPlm();
+    });
+}
+
+static void drawChangesStrip(AppState& st, const std::string& project, int count, float bodyH) {
+    if (project.empty()) return;
+    auto& P = s_plm;
+    std::string badge, trailing;
+    kit::Tone trailingTone = kit::Tone::Neutral;
+    bool busy = false;
+    std::string tooltip = "Vault changes in the working folder since the last checkpoint";
+    if (!st.workerStarted) {
+        trailing = "Vault offline";
+        trailingTone = kit::Tone::Warn;
+    } else if (!P.error.empty()) {
+        trailing = "Status unavailable";
+        trailingTone = kit::Tone::Err;
+        tooltip = P.error;
+    } else if (!P.ready) {
+        trailing = "Checking\xE2\x80\xA6";
+        busy = P.loading;
+    } else {
+        if (count > 0) badge = std::to_string(count);
+        else trailing = "No changes";
+        busy = P.loading;
+    }
+    if (P.checkpointing) {
+        trailing = "Saving checkpoint\xE2\x80\xA6";
+        trailingTone = kit::Tone::Neutral;
+        busy = true;
+    }
+    bool menu = false;
+    if (stripHeader("##fx_changes", "Changes", P.changesOpen, badge.c_str(), kit::Tone::Warn,
+                    trailing.c_str(), trailingTone, busy, tooltip.c_str(), &menu))
+        s_toggleChanges = true;
+    if (menu) ImGui::OpenPopup("##fx_changes_ctx");
+    ui::pushContextMenuStyle();
+    if (ImGui::BeginPopup("##fx_changes_ctx")) {
+        if (ImGui::MenuItem("Refresh vault status", nullptr, false,
+                            !P.loading && !P.checkpointing && st.workerStarted)) {
+            invalidateExplorerPlm();
+            pollExplorerPlm(st, project, true);
+        }
+        if (ImGui::MenuItem("Open PLM", nullptr, false, st.workerStarted)) openPlm(st, PlmPage::Files);
+        ImGui::EndPopup();
+    }
+    ui::popContextMenuStyle();
+    if (!P.changesOpen) return;
+
+    ImGui::BeginChild("##fx_changes_body", ImVec2(0, bodyH), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar);
+    if (!st.workerStarted) {
+        noteLine("Reconnect to see changes; files stay browsable.", nullptr);
+    } else if (!P.error.empty()) {
+        if (noteLine(P.error.c_str(), "Retry", !P.loading && !P.checkpointing)) {
+            invalidateExplorerPlm();
+            pollExplorerPlm(st, project, true);
+        }
+    } else if (!P.ready) {
+        kit::spinner("Checking project changes");
+    } else if (count == 0) {
+        const std::string note = P.checkpointOk.empty()
+            ? std::string("Matches the last checkpoint.") : P.checkpointOk + " \xC2\xB7 no changes.";
+        if (noteLine(note.c_str(), "PLM", st.workerStarted, "Service unavailable"))
+            openPlm(st, PlmPage::Files);
+    } else {
+        const float sp = ImGui::GetStyle().ItemSpacing.y;
+        const float rowH = ImGui::GetTextLineHeight() + kit::padY() * 2.0f;
+        ImGui::BeginChild("##changes_rows",
+                          ImVec2(0, (float)std::min(count, kChangeRowsMax) * (rowH + sp)),
+                          ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+        auto drawChangeRow = [&](const ExplorerPlmItem& item) {
+            if (item.change.empty()) return;
+            ImGui::PushID(item.path.c_str());
+            kit::RowStyle style;
+            style.icon = fileIconName(lowerExt(item.path));
+            style.iconTone = changeTone(item.change);
+            style.meta = item.change.c_str();
+            const std::string tooltip = item.path + "\n" + changeName(item.change);
+            style.tooltip = tooltip.c_str();
+            if (kit::row("##change", item.path.c_str(), style)) {
+                const std::string absolute = pathJoin(project, item.path);
+                if (item.change != "D" && isKnownExt(lowerExt(absolute)))
+                    requestOpen(st, absolute);
+                else if (!item.itemId.empty())
+                    openPlm(st, PlmPage::Files, item.itemId);
+            }
+            ui::pushContextMenuStyle();
+            if (ImGui::BeginPopupContextItem("##change_menu")) {
+                const std::string absolute = pathJoin(project, item.path);
+                if (item.change != "D" && ImGui::MenuItem("Show in tree"))
+                    revealPath(project, absolute, false);
+                if (!item.itemId.empty()) {
+                    if (ImGui::MenuItem("History"))
+                        openPlm(st, PlmPage::Files, item.itemId);
+                    if (ImGui::MenuItem("Release in PLM"))
+                        openPlm(st, PlmPage::Releases, item.itemId);
+                }
+                ImGui::EndPopup();
+            }
+            ui::popContextMenuStyle();
+            ImGui::PopID();
+        };
+        for (const auto& item : P.items) drawChangeRow(item);
+        for (const auto& item : P.untracked) drawChangeRow(item);
+        ui::drawWindowPillScrollbarV(explorerSurf());
+        ImGui::EndChild();
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##checkpoint_msg", "Checkpoint message", P.message,
+                                 sizeof(P.message));
+        if (kit::primaryButton("Checkpoint", !P.loading && !P.checkpointing,
+                               "Wait for the vault scan to finish"))
+            runCheckpoint(st, project);
+        ImGui::SameLine();
+        if (kit::secondaryButton("Open PLM", st.workerStarted, "Service unavailable"))
+            openPlm(st, PlmPage::Files);
+        if (P.checkpointing) kit::spinner("Saving checkpoint");
+        kit::inlineStatus(P.checkpointError.c_str(), kit::Tone::Err);
+        kit::inlineStatus(P.checkpointOk.c_str(), kit::Tone::Ok);
+    }
+    ui::drawWindowPillScrollbarV(explorerSurf());
+    ImGui::EndChild();
 }
 
 // ---- delete confirm modal -------------------------------------------------
@@ -1061,13 +1669,196 @@ static void drawDeleteModal(AppState& st, const std::string& root) {
     if (!open) s_pendingDelete.clear();   // window-X closed it
 }
 
+// ---- keyboard -------------------------------------------------------------------
+// Pane-focused keys: Ctrl+F filter, Esc cancel/clear, F2 rename, Del delete, Enter open/toggle,
+// Up/Down move through last frame's visible rows, Right/Left expand/collapse (Left on a closed
+// or file row selects its parent folder).
+static void handleExplorerKeys(AppState& st, const std::string& root) {
+    if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) return;
+    ImGuiIO& io = ImGui::GetIO();
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F)) {
+        s_focusSearch = true;
+        return;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        s_pendingNewFolder.clear();
+        s_renameId.clear();
+        s_renameFocus = false;
+        // An active filter field clears itself (EscapeClearsAll); otherwise Esc leaves search.
+        if (!io.WantTextInput) s_query[0] = '\0';
+    }
+    if (io.WantTextInput || io.KeyCtrl || io.KeyAlt || io.KeySuper) return;
+    if (!s_selectedPath.empty()) {
+        if (ImGui::IsKeyPressed(ImGuiKey_F2, false)) { beginRename(root, s_selectedPath); return; }
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) { s_pendingDelete = s_selectedPath; return; }
+    }
+    const auto& rows = s_rowsLastFrame;
+    if (rows.empty()) return;
+    int at = -1;
+    const std::string selKey = normKey(s_selectedPath);
+    for (int i = 0; i < (int)rows.size(); ++i)
+        if (normKey(rows[i].path) == selKey) { at = i; break; }
+    auto moveTo = [&](int i) {
+        i = std::max(0, std::min(i, (int)rows.size() - 1));
+        selectPath(rows[i].path, rows[i].isDir);
+        s_scrollTarget = normKey(rows[i].path);
+        s_scrollCenter = false;
+    };
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) { moveTo(at < 0 ? 0 : at + 1); return; }
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) { moveTo(at < 0 ? (int)rows.size() - 1 : at - 1); return; }
+    if (at < 0) return;
+    const VisRow& row = rows[at];
+    const bool searching = s_query[0] != '\0';
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) {
+        if (!row.isDir) requestOpen(st, row.path);
+        else if (searching) revealPath(root, row.path, true);
+        else setExpanded(row.path, !isExpanded(row.path));
+        return;
+    }
+    if (searching) return;
+    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) && row.isDir) {
+        setExpanded(row.path, true);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
+        if (row.isDir && isExpanded(row.path)) {
+            setExpanded(row.path, false);
+        } else {
+            const std::string up = pathParent(row.path);
+            if (!up.empty() && normKey(up) != normKey(root) && withinWorkspace(root, up)) {
+                selectPath(up, true);
+                s_scrollTarget = normKey(up);
+                s_scrollCenter = false;
+            }
+        }
+    }
+}
+
+// ---- headless capture hooks --------------------------------------------------------
+// CHUDWARE_SHOT=explorer (app.cpp forces the Explorer tab) reads these once, so the capture
+// shows a deterministic state of the redesigned pane:
+//   CHUDWARE_EXPLORER_SHOT_EXPAND=parts,assemblies/sub   expand workspace-relative folders
+//   CHUDWARE_EXPLORER_SHOT_SELECT=parts/bracket.step+    select (and scroll to) a path
+//   CHUDWARE_EXPLORER_SHOT_QUERY=stack                   prefill the filter (results view)
+//   CHUDWARE_EXPLORER_SHOT_STRIPS=changes,recent         expand the bottom strips
+static void applyShotStateOnce(const std::string& root) {
+    static bool applied = false;
+    if (applied || root.empty()) return;
+    applied = true;
+    const char* shot = std::getenv("CHUDWARE_SHOT");
+    if (!shot || std::strcmp(shot, "explorer") != 0) return;
+    auto list = [](const char* env) {
+        std::vector<std::string> out;
+        const char* v = std::getenv(env);
+        if (!v) return out;
+        std::string s = v;
+        size_t at = 0;
+        while (at <= s.size()) {
+            size_t end = s.find(',', at);
+            if (end == std::string::npos) end = s.size();
+            if (end > at) out.push_back(s.substr(at, end - at));
+            at = end + 1;
+        }
+        return out;
+    };
+    for (const auto& rel : list("CHUDWARE_EXPLORER_SHOT_EXPAND"))
+        expandAncestors(root, pathJoin(root, rel), /*includeSelf=*/true);
+    for (const auto& rel : list("CHUDWARE_EXPLORER_SHOT_SELECT"))
+        revealPath(root, pathJoin(root, rel), false);
+    if (const char* q = std::getenv("CHUDWARE_EXPLORER_SHOT_QUERY"))
+        std::snprintf(s_query, sizeof(s_query), "%s", q);
+    for (const auto& strip : list("CHUDWARE_EXPLORER_SHOT_STRIPS")) {
+        if (strip == "changes") s_plm.changesOpen = true;
+        if (strip == "recent") s_recentOpen = true;
+    }
+}
+
+// ---- header + toolbar ---------------------------------------------------------------
+// One line: folder icon + working-folder name (tooltip: full path; right-click: folder actions)
+// with the vault branch chip inline at the right.
+static void drawHeaderLine(AppState& st, const std::string& root) {
+    const float S = ui::uiScale, fs = ImGui::GetFontSize();
+    const float h = ImGui::GetFrameHeight();
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const char* branch = !st.workerStarted ? nullptr
+        : !s_plm.branch.empty() ? s_plm.branch.c_str()
+        : s_plm.branchKnown ? "No branch" : nullptr;
+    const float gap = 4.0f * S;
+    const float chipW = branch ? ui::metrics::U(1.5f) * 2.0f + ImGui::CalcTextSize(branch).x : 0.0f;
+    const float nameW = std::max(avail - (branch ? chipW + gap : 0.0f), fs * 2.0f);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##fx_head", ImVec2(nameW, h));
+    ui::fmTreeIconInArrowSlot(ImVec2(p0.x - ImGui::GetStyle().FramePadding.x, p0.y),
+                              "body_folder", "[D]");
+    std::string name = pathFilename(root);
+    if (name.empty()) name = root;
+    const float textX = p0.x + std::min(16.0f * S, fs) + 6.0f * S;
+    const std::string shown = kit::elide(name.c_str(), std::max(p0.x + nameW - textX, fs));
+    ImGui::GetWindowDrawList()->AddText(ImVec2(textX, p0.y + (h - fs) * 0.5f),
+                                        ImGui::GetColorU32(ImGuiCol_Text), shown.c_str());
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+        ImGui::SetTooltip("Working folder\n%s\nRight-click for folder actions", root.c_str());
+    ui::pushContextMenuStyle();
+    if (ImGui::BeginPopupContextItem("##fx_head_ctx")) {
+        rootMenuItems(st, root);
+        ImGui::EndPopup();
+    }
+    ui::popContextMenuStyle();
+    if (branch) {
+        ImGui::SameLine(0, gap);
+        const float chipH = ImGui::GetTextLineHeight() + ui::metrics::U(0.5f) * 2.0f;
+        ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x, p0.y + (h - chipH) * 0.5f));
+        kit::chip(branch, kit::Tone::Neutral, false, "Active vault branch");
+    }
+}
+
+// Filter field with New folder / Refresh / Collapse all / Reveal active document beside it
+// (wrapping under it when the pane is too narrow).
+static void drawSearchToolbar(AppState& st, const std::string& root, const std::string& current,
+                              const std::string& activePath) {
+    const float S = ui::uiScale;
+    const float bs = ImGui::GetFrameHeight(), gap = 2.0f * S;
+    const int nButtons = 4;
+    const float toolW = (float)nButtons * (bs + gap);
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const bool inline_ = avail - toolW >= ImGui::GetFontSize() * 8.0f;
+    ImGui::SetNextItemWidth(inline_ ? avail - toolW : -1.0f);
+    if (s_focusSearch) {
+        ImGui::SetKeyboardFocusHere();
+        s_focusSearch = false;
+    }
+    ImGui::InputTextWithHint("##fx_search", "Filter files\xE2\x80\xA6 (Ctrl+F)", s_query,
+                             sizeof(s_query), ImGuiInputTextFlags_EscapeClearsAll);
+    if (inline_) ImGui::SameLine(0, gap);
+    const std::string folderName = pathFilename(current).empty() ? current : pathFilename(current);
+    const std::string newTip = "New folder in " + folderName;
+    if (kit::iconButton("##fx_new_folder", "folder_new", newTip.c_str(), true, kit::Tone::Neutral, bs))
+        createNewFolder(st, root, current);
+    ImGui::SameLine(0, gap);
+    if (kit::iconButton("##fx_refresh", "refresh", "Refresh files and vault status", true,
+                        kit::Tone::Neutral, bs)) {
+        invalidateDirListCache();
+        invalidateExplorerPlm();
+    }
+    ImGui::SameLine(0, gap);
+    if (kit::iconButton("##fx_collapse", "body_folder", "Collapse all folders",
+                        !s_expanded.empty(), kit::Tone::Neutral, bs))
+        s_expanded.clear();
+    ImGui::SameLine(0, gap);
+    const bool canReveal = !activePath.empty() && withinWorkspace(root, activePath) &&
+                           normKey(activePath) != normKey(root);
+    const char* revealTip = canReveal ? "Reveal active document in the tree"
+        : activePath.empty() ? "Reveal active document (it has not been saved)"
+                             : "Reveal active document (it is outside the working folder)";
+    if (kit::iconButton("##fx_reveal", "isolate", revealTip, canReveal, kit::Tone::Neutral, bs))
+        revealPath(root, activePath, false);
+}
+
 // ---- body -----------------------------------------------------------------
 void drawFileExplorerBody(AppState& st) {
     auto& fsb = chudware::fsBackend();
     ui::fmRowStripeReset();   // restart the FM stripe phase + refresh the shared FM palette
 
     // Compact vertical rhythm (the FeatureManager convention): tighten ItemSpacing.y only so
-    // the breadcrumb/rows don't read "double spaced". RAII so it unwinds on any early return.
+    // rows don't read "double spaced". RAII so it unwinds on any early return.
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                         ImVec2(ImGui::GetStyle().ItemSpacing.x, 4.0f * ui::uiScale));
     struct SpacingPop { ~SpacingPop() { ImGui::PopStyleVar(); } } spacingPop;
@@ -1080,45 +1871,33 @@ void drawFileExplorerBody(AppState& st) {
     }
     kit::pushDensity(kit::Density::Compact);
     struct DensityPop { ~DensityPop() { kit::popDensity(); } } densityPop;
+    applyShotStateOnce(root);
     const std::string project = st.plmProjectPath();
     pollExplorerPlm(st, project);
-    // Files already names the root in its tree row; avoid repeating it in the header too.
-    kit::sectionHeader("Working project", "body_folder", nullptr, -1, true);
-    if (!project.empty()) {
-        // Last known branch while a refresh is pending; no chip at all until the first answer
-        // for this project arrives (a single ref read, issued ahead of the item scan).
-        const char* branch = !st.workerStarted ? "Vault offline"
-            : !s_plm.branch.empty() ? s_plm.branch.c_str()
-            : s_plm.branchKnown ? "Branch unavailable" : nullptr;
-        if (branch) {
-            kit::chip(branch, kit::Tone::Neutral, false, "Active vault branch");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", project.c_str());
+    const int changes = changedCount();
+    if (s_toggleRecent) s_recentOpen = !s_recentOpen;
+    if (s_toggleChanges) s_plm.changesOpen = !s_plm.changesOpen;
+    s_toggleRecent = s_toggleChanges = false;
+
+    // Open-document markers: every tab's saved path, and the active one.
+    std::string activePath;
+    s_openKeys.clear();
+    s_activeKey.clear();
+    for (int i = 0; i < (int)st.docTabs.size(); ++i) {
+        const std::string& p = st.docTabs[i].path;
+        if (p.empty()) continue;
+        s_openKeys.insert(normKey(p));
+        if (i == st.activeTab) {
+            activePath = p;
+            s_activeKey = normKey(p);
         }
-        drawChanges(st, project);
-    } else {
-        kit::emptyState("body_folder", "No working project",
-                        "Choose a working folder to see its PLM changes.");
     }
 
-    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-        ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-        s_pendingNewFolder.clear();
-        s_renameId.clear();
-        s_renameFocus = false;
-    }
+    // Capture the pane's bottom before anything is laid out: the tree takes all the height the
+    // header, filter row and bottom strips leave.
+    const float paneBottom = ImGui::GetCursorScreenPos().y + ImGui::GetContentRegionAvail().y;
 
-    // Capture the OUTER pane's bottom before the auto-sized Files card changes the window.
-    const float explorerBottom = ImGui::GetCursorScreenPos().y + ImGui::GetContentRegionAvail().y;
-    const bool filesOpen = kit::cardBegin("##explorer_files", "Files", "body_folder",
-                                          &s_plm.filesOpen);
-    if (!filesOpen) {
-        kit::cardEnd();
-        drawRecentSection(st);
-        drawDeleteModal(st, root);
-        return;
-    }
-
-    // Reveal remains pending through Loading snapshots; drawDirNode consumes it at the input row.
+    handleExplorerKeys(st, root);
 
     std::string current = s_currentFolder.empty() ? root : s_currentFolder;
     const auto currentStat = fsb.pollStat(current);
@@ -1126,84 +1905,37 @@ void drawFileExplorerBody(AppState& st) {
         current = pathParent(current);
     if (current.empty() || !withinWorkspace(root, current)) current = root;
 
-    const auto selectedStat = s_selectedPath.empty() ? chudware::FsStatSnapshot{} : fsb.pollStat(s_selectedPath);
-    const bool selectedFile = !s_selectedPath.empty() && isKnownExt(lowerExt(s_selectedPath)) &&
-        selectedStat.state == chudware::FsReadState::Ready && selectedStat.value.isFile;
+    drawHeaderLine(st, root);
+    drawSearchToolbar(st, root, current, activePath);
 
-    // Toolbar: the exact FeatureManager top-strip layout — a centered row of 24px glass icon
-    // buttons (4dp gaps), the row reserved with a Dummy (glass/icons are draw-list only), the
-    // layout cursor restored after the absolute-positioned buttons, then Spacing before the body.
-    {
-        const float S = ui::uiScale;
-        const float bw = 24.0f * S, gap = 4.0f * S, nBtns = 4.0f;
-        const float toolW = nBtns * bw + (nBtns - 1) * gap;
-        ImVec2 toolRowMin = ImGui::GetCursorScreenPos();
-        const float availW = ImGui::GetContentRegionAvail().x;
-        ImGui::Dummy(ImVec2(availW, bw));
-        float bx = toolRowMin.x + std::max(0.0f, (availW - toolW) * 0.5f);
-        const float by = toolRowMin.y;
-        auto toolBtn = [&](const char* id, const char* icon, const char* tip, bool en) -> bool {
-            ImGui::SetCursorScreenPos(ImVec2(bx, by));
-            bool hit = ui::fmToolbarIconBtn(id, icon, tip, en);
-            bx += bw + gap;
-            return hit;
-        };
-        if (toolBtn("fx_open", "open", "Open selected file", selectedFile) && selectedFile)
-            requestOpen(st, s_selectedPath);
-        if (toolBtn("fx_new_folder", "folder_new", "New folder", true))
-            createNewFolder(st, root, current);
-        if (toolBtn("fx_paste", "paste", "Paste into current folder",
-                    !s_clipboardPath.empty()) && !s_clipboardPath.empty())
-            doPaste(st, root, current);
-        if (toolBtn("fx_refresh", "refresh", "Refresh", true)) {
-            invalidateDirListCache();
-            invalidateExplorerPlm();
-            st.toast(ui::ToastLevel::Info, "Explorer refreshed");
-        }
-        ImGui::SetCursorScreenPos(ImVec2(toolRowMin.x, toolRowMin.y + bw));
-        ImGui::Dummy(ImVec2(0, 0));
-        ImGui::Spacing();
-    }
+    const std::string query = trimmedQuery();
+    stepSearch(root, query);
+    s_selKey = normKey(s_selectedPath);
 
-    // A breadcrumb is useful only below the root; the root tree row already names the project.
-    if (current != root) {
-        const std::string folderName = pathFilename(current);
-        kit::dimText(folderName.c_str());
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", current.c_str());
-    }
-
-    // Keyboard: F2 rename / Del delete on the current selection (only when this pane owns nav and no
-    // text field is focused — the inline-rename InputText sets WantTextInput, so this won't fire mid
-    // rename).
-    if (!s_selectedPath.empty() && !ImGui::GetIO().WantTextInput &&
-        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
-        if (ImGui::IsKeyPressed(ImGuiKey_F2, false)) {
-            s_pendingNewFolder.clear();
-            s_renameId = s_selectedPath;
-            std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s",
-                          pathFilename(s_selectedPath).c_str());
-            s_renameFocus = true;
-        } else if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
-            s_pendingDelete = s_selectedPath;
-        }
-    }
-
-    // Keep the separate Recent header visible; expanded recents use the outer scrollbar.
-    const float recentHeaderHeight = st.recentFiles.empty() ? 0.0f :
-        kit::padY() * 2.0f +
-        std::max(ImGui::GetTextLineHeight(), metrics::iconHeader()) +
-        ImGui::GetStyle().ItemSpacing.y;
-    const float treeHeight = std::max(96.0f * ui::uiScale,
-        explorerBottom - ImGui::GetCursorScreenPos().y -
-        ImGui::GetStyle().WindowPadding.y - ImGui::GetStyle().ItemSpacing.y -
-        recentHeaderHeight);
-    ImGui::BeginChild("##fx_tree", ImVec2(0, treeHeight), ImGuiChildFlags_None,
+    const float sp = ImGui::GetStyle().ItemSpacing.y;
+    const float changesBodyH = changesBodyHeight(st, changes);
+    const float reserve = recentStripHeight(st) + changesStripHeight(project, changesBodyH);
+    const float treeH = std::max(pillRowH() * 3.0f,
+                                 paneBottom - ImGui::GetCursorScreenPos().y - reserve - sp);
+    s_rowsThisFrame.clear();
+    ImGui::BeginChild("##fx_tree", ImVec2(0, treeH), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar);
-    drawDirNode(st, root, root, /*isRoot=*/true);
+    if (!query.empty()) drawSearchResults(st, root);
+    else drawDirChildren(st, root, root, 0);
+    // Right-click on empty space acts on the working folder itself.
+    ui::pushContextMenuStyle();
+    if (ImGui::BeginPopupContextWindow("##fx_tree_ctx",
+                                       ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems)) {
+        rootMenuItems(st, root);
+        ImGui::EndPopup();
+    }
+    ui::popContextMenuStyle();
     ui::drawWindowPillScrollbarV(explorerSurf());
     ImGui::EndChild();
-    kit::cardEnd();
-    drawRecentSection(st);
+    s_rowsLastFrame.swap(s_rowsThisFrame);
+
+    drawRecentStrip(st);
+    drawChangesStrip(st, project, changes, changesBodyH);
 
     drawDeleteModal(st, root);
 }

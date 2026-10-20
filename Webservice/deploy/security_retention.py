@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
+
+GATEWAY = Path(__file__).resolve().parents[1] / "gateway"
+if str(GATEWAY) not in sys.path:
+    sys.path.insert(0, str(GATEWAY))
 
 import psycopg
 
@@ -57,7 +62,8 @@ def main() -> int:
         print("security retention failed: CHUDWARE_DB_URL is required", file=sys.stderr)
         return 2
     try:
-        deleted = purge_expired(dsn, batch_size())
+        import db
+        deleted = purge_expired(db.dsn(), batch_size())
     except Exception as exc:  # systemd/journal must expose failure without secrets
         print(f"security retention failed: {type(exc).__name__}", file=sys.stderr)
         return 1

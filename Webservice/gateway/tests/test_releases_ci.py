@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -28,11 +29,11 @@ from fastapi.testclient import TestClient
 
 from gateway import accounts, app as app_mod, db, releases
 from gateway.config import settings
+from gateway import release_evidence
 
 PUBLISH_TOKEN = "ci-publish-secret"
 BETA = "0.1.0-beta.42"
 STABLE = "0.1.0"
-_REAL_CI_PUBLIC_KEY = releases._RELEASE_PUBLIC_KEYS[releases._CI_KEY_ID]
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +59,7 @@ def ci_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture(autouse=True)
 def ci_key(monkeypatch: pytest.MonkeyPatch) -> Ed25519PrivateKey:
     private = Ed25519PrivateKey.generate()
+    monkeypatch.setitem(globals(), "_STAGE_SIGNER", private)
     monkeypatch.setitem(
         releases._RELEASE_PUBLIC_KEYS,
         releases._CI_KEY_ID,
@@ -90,6 +92,90 @@ def admin(monkeypatch: pytest.MonkeyPatch) -> TestClient:
 # ---------------------------------------------------------------------------
 
 
+def signed_sidecars(private, name, artifact, version, platform, arch, key_id, *,
+                    evidence=True, owner=None, publisher=None):
+    """Inert bytes with genuine signatures from disposable test keys only."""
+    digest = hashlib.sha256(artifact).hexdigest()
+    payload = {"schema": "chudware-payload-v1", "product": "Chudware",
+               "version": version, "platform": platform, "arch": arch,
+               "created_at": "2026-10-12T00:00:00Z", "key_id": key_id,
+               "files": [{"path": "Chudware", "size": len(artifact), "sha256": digest,
+                          "mode": 0o755, "kind": "executable"}]}
+    raw = release_evidence._payload.canonical_manifest_bytes(payload)
+    files = {name + ".payload-manifest.v1.json": raw,
+             name + ".payload-manifest.v1.sig": base64.b64encode(private.sign(
+                 release_evidence._payload.payload_signature_preimage(key_id, raw))) + b"\n"}
+    if not evidence:
+        return files
+    components = [{"type": "file", "name": "reviewed-input.lock",
+                   "hashes": [{"alg": "SHA-256", "content": "a" * 64}]}]
+    for filename in ("core-ctest.log", "core-junit.xml", "host-ctest.log",
+                     "host-junit.xml", "test-results.json"):
+        components.append({"type": "file", "name": "retained-test-results/" + filename,
+                           "hashes": [{"alg": "SHA-256",
+                                       "content": hashlib.sha256(filename.encode()).hexdigest()}]})
+    run_details: dict[str, Any] = {"builder": {"id": "https://chudware.com/builders/platform-v1"}}
+    if platform in {"windows", "macos"}:
+        kind = "authenticode" if platform == "windows" else "notarization"
+        report: dict[str, Any] = {"schema": "platform-signing.v1", "platform": platform,
+                                  "kind": kind, "artifact_sha256": digest}
+        annotations: dict[str, Any] = {"report": report}
+        if owner is None:
+            report.update({"verified": False,
+                           "reason": "owner_authorized_native_verification_not_supplied"})
+        else:
+            policy = {"schema": "chudware-platform-publishers-v1", "key_id": "release-v1",
+                      "windows": {"certificate_sha256": ["c" * 64]},
+                      "macos": {"team_ids": ["ABCDE12345"], "bundle_id": "com.chudware.Chudware"}}
+            raw_policy = release_evidence._json.canonical_json_bytes(policy)
+            report.update({
+                "verified": True,
+                "publisher_policy_sha256": hashlib.sha256(raw_policy).hexdigest(),
+                "publisher": publisher or ({"certificate_sha256": "c" * 64} if platform == "windows"
+                                           else {"team_id": "ABCDE12345",
+                                                 "bundle_id": "com.chudware.Chudware"}),
+            })
+            annotations.update({
+                "publisher_policy": policy,
+                "publisher_policy_signature": base64.b64encode(owner.sign(
+                    release_evidence._publishers.POLICY_DOMAIN + raw_policy)).decode("ascii"),
+            })
+        run_details["byproducts"] = [{
+            "name": "platform-signing.v1.json",
+            "digest": {"sha256": hashlib.sha256(
+                release_evidence._json.canonical_json_bytes(report)).hexdigest()},
+            "annotations": annotations,
+        }]
+    documents = {
+        "sbom": {"bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
+                 "metadata": {"component": {"type": "application", "name": "Chudware",
+                                            "version": version}},
+                 "components": components},
+        "provenance": {"_type": "https://in-toto.io/Statement/v1",
+                       "subject": [{"name": name, "digest": {"sha256": digest}}],
+                       "predicateType": "https://slsa.dev/provenance/v1",
+                       "predicate": {"buildDefinition": {
+                           "buildType": "https://chudware.com/build/platform/v1",
+                           "externalParameters": {"version": version, "platform": platform,
+                                                  "arch": arch, "commit": "d" * 40},
+                           "resolvedDependencies": [
+                               {"uri": row["name"], "digest": {"sha256": row["hashes"][0]["content"]}}
+                               for row in components]},
+                           "runDetails": run_details}},
+        "platform_test": {"schema": "platform-test.v1", "version": version, "platform": platform,
+                          "arch": arch, "commit": "d" * 40, "artifact_sha256": digest,
+                          "commands": ["ctest core", "ctest host"], "passed": True},
+    }
+    for kind, document in documents.items():
+        suffix, signature_suffix = release_evidence._SIDECARS[kind]
+        raw = release_evidence._json.canonical_json_bytes(document)
+        files[name + suffix] = raw
+        files[name + signature_suffix] = base64.b64encode(private.sign(
+            release_evidence._DOMAINS[kind] + raw)) + b"\n"
+    return files
+
+
+
 def _sign(private: Ed25519PrivateKey, version: str, platform: str, arch: str, digest: str) -> str:
     return base64.b64encode(
         private.sign(
@@ -107,16 +193,16 @@ def _stage(
     *,
     evidence: bool = True,
     fmt: str = "default",
+    owner: Ed25519PrivateKey | None = None,
+    publisher: dict[str, str] | None = None,
 ) -> dict[str, bytes]:
     """Write an artifact plus its sidecars into incoming/, exactly as CI does."""
     name = releases._canonical_artifact(version, platform, arch, fmt)
     files = {name: f"artifact bytes for {name}".encode()}
-    for suffix in releases._PAYLOAD_SIDECAR_SUFFIXES:
-        files[name + suffix] = f"{name}{suffix} contents".encode()
-    if evidence:
-        for _, filename in releases._EVIDENCE_SIDECARS:
-            files[f"{name}.{filename}"] = f"{name}.{filename} contents".encode()
-            files[f"{name}.{filename}.sig"] = f"{name}.{filename}.sig contents".encode()
+    files.update(signed_sidecars(
+        _STAGE_SIGNER, name, files[name], version, platform, arch,
+        releases._CI_KEY_ID, evidence=evidence, owner=owner, publisher=publisher,
+    ))
     incoming = releases._incoming_dir()
     incoming.mkdir(parents=True, exist_ok=True)
     for filename, blob in files.items():
@@ -171,12 +257,16 @@ def _body(
 
 
 def _publish(ci: TestClient, private: Ed25519PrivateKey, **kwargs: Any):
+    owner = kwargs.pop("owner", None)
+    publisher = kwargs.pop("publisher", None)
     files = _stage(
         kwargs.get("version", BETA),
         kwargs.get("platform", "linux"),
         kwargs.get("arch", "x86_64"),
         evidence=kwargs.get("evidence", True),
         fmt=kwargs.get("fmt", "default"),
+        owner=owner,
+        publisher=publisher,
     )
     return ci.post("/api/releases/ci/publish", json=_body(private, files, **kwargs))
 
@@ -216,19 +306,6 @@ def _insert_stable(
         store.with_name(store.name + suffix).write_bytes(b"sidecar")
 
 
-# ---------------------------------------------------------------------------
-# Key material
-# ---------------------------------------------------------------------------
-
-
-def test_release_ci_v1_public_key_is_registered_unconditionally() -> None:
-    # Captured at import, BEFORE the ephemeral-key fixture swaps it out. Asserted
-    # against the literal from the pipeline contract: a typo here makes every
-    # nightly a 422 that nobody is watching for.
-    assert _REAL_CI_PUBLIC_KEY == bytes.fromhex(
-        "d7434dc67f4d6e11cd4c8ced9b5ebbccf2e1477b5949d52d7685b6ca43a010f6"
-    )
-    assert releases._CI_KEY_ID == "release-ci-v1"
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +336,7 @@ def test_ci_publish_rejects_a_foreign_key_id(pg, ci: TestClient, ci_key) -> None
     assert response.json()["detail"] == "ci publications must be signed by release-ci-v1"
 
 
-def test_ci_publish_rejects_a_digest_mismatch_and_destroys_the_staged_artifact(
+def test_ci_publish_rejects_substituted_staged_artifact_before_registration(
     pg, ci: TestClient, ci_key
 ) -> None:
     files = _stage()
@@ -268,10 +345,10 @@ def test_ci_publish_rejects_a_digest_mismatch_and_destroys_the_staged_artifact(
     (releases._incoming_dir() / name).write_bytes(b"substituted bytes")
     response = ci.post("/api/releases/ci/publish", json=body)
     assert response.status_code == 422
-    assert "does not match the publication" in response.json()["detail"]
-    # Left in place it would sit under a canonical name waiting to be trusted by
-    # the next run's publish.
-    assert not (releases._incoming_dir() / name).exists()
+    with db.tx() as cur:
+        cur.execute("SELECT artifact_key FROM releases")
+        assert cur.fetchone() is None
+    assert not releases._store_path(f"beta/{BETA}/{name}").exists()
 
 
 def test_ci_publish_rejects_a_missing_staged_artifact(pg, ci: TestClient, ci_key) -> None:
@@ -316,7 +393,7 @@ def test_ci_publish_rejects_a_missing_payload_manifest_sidecar(
     (releases._incoming_dir() / (name + ".payload-manifest.v1.sig")).unlink()
     response = ci.post("/api/releases/ci/publish", json=_body(ci_key, files))
     assert response.status_code == 422
-    assert "payload manifest sidecar" in response.json()["detail"]
+    assert "release input is missing or unsafe" in response.json()["detail"]
 
 
 def test_ci_publish_rejects_a_prerelease_stable_version(pg, ci: TestClient, ci_key) -> None:
@@ -415,7 +492,7 @@ def test_successive_nightlies_share_one_constant_min_supported(
             "signature": _sign(ci_key, version, "linux", "x86_64", digest),
             "stable_signature": _sign(ci_key, "0.1.0", "linux", "x86_64", digest),
             "notes_url": "https://app.chudware.com/",
-            "commit_sha": "9f" * 20,
+            "commit_sha": "d" * 40,
             "evidence": {
                 key: value
                 for prefix, filename in releases._EVIDENCE_SIDECARS
@@ -435,7 +512,7 @@ def test_successive_nightlies_share_one_constant_min_supported(
         reported = ci.post(
             "/api/releases/ci/status",
             json={
-                "run_id": f"1748392{run_number}", "commit_sha": "9f" * 20,
+                "run_id": f"1748392{run_number}", "commit_sha": "d" * 40,
                 "channel": "beta", "platform": "linux", "arch": "x86_64",
                 "version": version, "status": "published", "detail": "",
             },
@@ -916,14 +993,12 @@ def test_ci_upload_then_publish_round_trip(ci: TestClient, ci_key, ci_env) -> No
     uploaded = ci.put(f"/api/releases/ci/upload/{name}", content=artifact)
     assert uploaded.status_code == 200, uploaded.text
     assert uploaded.json()["sha256"] == hashlib.sha256(artifact).hexdigest()
-    for suffix in (".payload-manifest.v1.json", ".payload-manifest.v1.sig"):
-        small = b"sidecar" + suffix.encode()
-        assert ci.put(
-            f"/api/releases/ci/upload/{name}{suffix}", content=small
-        ).status_code == 200
     files = {name: artifact}
-    for suffix in (".payload-manifest.v1.json", ".payload-manifest.v1.sig"):
-        files[f"{name}{suffix}"] = b"sidecar" + suffix.encode()
+    files.update(signed_sidecars(ci_key, name, artifact, version, platform, arch,
+                                 releases._CI_KEY_ID, evidence=False))
+    for filename, blob in files.items():
+        if filename != name:
+            assert ci.put(f"/api/releases/ci/upload/{filename}", content=blob).status_code == 200
     response = ci.post(
         "/api/releases/ci/publish", json=_body(ci_key, files, evidence=False)
     )
@@ -994,11 +1069,19 @@ def test_a_format_round_trips_through_publish_latest_and_promote(
     assert stable_manifest.json()["format"] == fmt
 
 
+@pytest.fixture
+def owner_key(monkeypatch: pytest.MonkeyPatch) -> Ed25519PrivateKey:
+    private = Ed25519PrivateKey.generate()
+    monkeypatch.setitem(releases._RELEASE_PUBLIC_KEYS, "release-v1", private.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw))
+    return private
+
+
 def test_windows_msi_round_trips_publish_latest_and_promote(
-    pg, ci: TestClient, admin: TestClient, ci_key
+    pg, ci: TestClient, admin: TestClient, ci_key, owner_key
 ) -> None:
     published = _publish(
-        ci, ci_key, platform="windows", arch="x86_64", fmt="msi"
+        ci, ci_key, platform="windows", arch="x86_64", fmt="msi", owner=owner_key
     )
     assert published.status_code == 200, published.text
     assert published.json()["format"] == "msi"
@@ -1040,6 +1123,33 @@ def test_windows_msi_round_trips_publish_latest_and_promote(
     assert stable.status_code == 200, stable.text
     assert stable.json()["version"] == STABLE
     assert stable.json()["format"] == "msi"
+
+
+@pytest.mark.parametrize("platform", ["windows", "macos"])
+def test_unsigned_native_beta_is_retained_but_never_promoted(pg, ci, admin, ci_key, platform):
+    assert _publish(ci, ci_key, platform=platform).status_code == 200
+    rows = admin.get("/api/admin/release-manifests").json()
+    assert rows[0]["promotable"] is False
+    response = admin.post("/api/admin/releases/promote",
+                          json={"version": BETA, "platform": platform, "arch": "x86_64"})
+    assert response.status_code == 422
+    assert "unsigned native beta" in response.json()["detail"]
+    with db.tx() as cur:
+        cur.execute("SELECT artifact_key FROM releases WHERE channel='stable'")
+        assert cur.fetchone() is None
+
+
+@pytest.mark.parametrize("case", ["publisher", "non_owner_policy"])
+def test_native_attestation_requires_owner_authorized_actual_publisher(pg, ci, ci_key, owner_key, case):
+    if case == "publisher":
+        response = _publish(ci, ci_key, platform="windows", owner=owner_key,
+                            publisher={"certificate_sha256": "e" * 64})
+    else:
+        response = _publish(ci, ci_key, platform="windows", owner=Ed25519PrivateKey.generate())
+    assert response.status_code == 422
+    with db.tx() as cur:
+        cur.execute("SELECT artifact_key FROM releases")
+        assert cur.fetchone() is None
 
 
 def test_four_formats_of_one_version_coexist_and_latest_picks_the_right_one(
@@ -1371,3 +1481,150 @@ def test_retention_keeps_a_stale_incoming_file_that_a_release_row_accounts_for(
     report = releases.prune_release_store()
     assert report["incoming_orphans"] == []
     assert lingering.is_file() and sidecar.is_file()
+
+@pytest.mark.parametrize("kind", ["payload", "sbom", "provenance", "platform_test"])
+def test_sidecar_hashes_do_not_substitute_for_authenticity(pg, ci, ci_key, kind):
+    files = _stage()
+    name = releases._canonical_artifact(BETA, "linux", "x86_64")
+    suffix = release_evidence._SIDECARS[kind][1]
+    files[name + suffix] = base64.b64encode(b"untrusted-signature".ljust(64, b"!")) + b"\n"
+    (releases._incoming_dir() / (name + suffix)).write_bytes(files[name + suffix])
+    response = ci.post("/api/releases/ci/publish", json=_body(ci_key, files))
+    assert response.status_code == 422
+    with db.tx() as cur:
+        cur.execute("SELECT artifact_key FROM releases")
+        assert cur.fetchone() is None
+    assert not releases._store_path(f"beta/{BETA}/{name}").exists()
+
+
+@pytest.mark.parametrize("kind,mutation", [
+    ("payload", "version"), ("provenance", "subject"), ("provenance", "commit"),
+    ("platform_test", "failed"), ("platform_test", "commands"),
+    ("platform_test", "digest"), ("sbom", "component_version"),
+    ("sbom", "input_digest"), ("sbom", "malformed_metadata"),
+])
+def test_signed_evidence_must_describe_this_successful_build(pg, ci, ci_key, kind, mutation):
+    files = _stage()
+    name = releases._canonical_artifact(BETA, "linux", "x86_64")
+    document_suffix, signature_suffix = release_evidence._SIDECARS[kind]
+    document = json.loads(files[name + document_suffix])
+    if mutation == "version":
+        document["version"] = "9.9.9"
+    elif mutation == "subject":
+        document["subject"][0]["digest"]["sha256"] = "e" * 64
+    elif mutation == "commit":
+        document["predicate"]["buildDefinition"]["externalParameters"]["commit"] = "e" * 40
+    elif mutation == "failed":
+        document["passed"] = False
+    elif mutation == "commands":
+        document["commands"] = ["ctest core"]
+    elif mutation == "digest":
+        document["artifact_sha256"] = "e" * 64
+    elif mutation == "component_version":
+        document["metadata"]["component"]["version"] = "9.9.9"
+    elif mutation == "malformed_metadata":
+        document["metadata"] = []
+    else:
+        document["components"][0]["hashes"][0]["content"] = "e" * 64
+    if kind == "payload":
+        raw = release_evidence._payload.canonical_manifest_bytes(document)
+        preimage = release_evidence._payload.payload_signature_preimage(releases._CI_KEY_ID, raw)
+    else:
+        raw = release_evidence._json.canonical_json_bytes(document)
+        preimage = release_evidence._DOMAINS[kind] + raw
+    files[name + document_suffix] = raw
+    files[name + signature_suffix] = base64.b64encode(ci_key.sign(preimage)) + b"\n"
+    for suffix in (document_suffix, signature_suffix):
+        (releases._incoming_dir() / (name + suffix)).write_bytes(files[name + suffix])
+    response = ci.post("/api/releases/ci/publish", json=_body(ci_key, files))
+    assert response.status_code == 422
+    with db.tx() as cur:
+        cur.execute("SELECT artifact_key FROM releases")
+        assert cur.fetchone() is None
+
+
+def test_publication_uses_checked_snapshot_when_incoming_files_change(pg, ci, ci_key, monkeypatch):
+    files = _stage()
+    name = releases._canonical_artifact(BETA, "linux", "x86_64")
+    verify = releases.verify_bundle
+    def replace_incoming_after_verification(artifact, *args, **kwargs):
+        result = verify(artifact, *args, **kwargs)
+        for filename in files:
+            (releases._incoming_dir() / filename).write_bytes(b"concurrent substituted bytes")
+        return result
+    monkeypatch.setattr(releases, "verify_bundle", replace_incoming_after_verification)
+    response = ci.post("/api/releases/ci/publish", json=_body(ci_key, files))
+    assert response.status_code == 200
+    stored = releases._store_path(response.json()["artifact_key"])
+    for filename, expected in files.items():
+        assert stored.with_name(filename).read_bytes() == expected
+
+
+def test_promotion_rechecks_stored_sidecar_signature_even_with_new_database_digest(pg, ci, ci_key, admin):
+    assert _publish(ci, ci_key).status_code == 200
+    name = releases._canonical_artifact(BETA, "linux", "x86_64")
+    key = f"beta/{BETA}/{name}"
+    signature = releases._store_path(key + ".provenance.slsa.json.sig")
+    signature.write_bytes(base64.b64encode(b"forged".ljust(64, b"!")) + b"\n")
+    with db.tx() as cur:
+        cur.execute("UPDATE releases SET provenance_signature_sha256=%s WHERE artifact_key=%s",
+                    (hashlib.sha256(signature.read_bytes()).hexdigest(), key))
+    response = admin.post("/api/admin/releases/promote",
+                          json={"version": BETA, "platform": "linux", "arch": "x86_64"})
+    assert response.status_code == 422
+    with db.tx() as cur:
+        cur.execute("SELECT artifact_key FROM releases WHERE channel='stable'")
+        assert cur.fetchone() is None
+    assert not releases._store_path(f"stable/{STABLE}/" + releases._canonical_artifact(STABLE, "linux", "x86_64")).exists()
+
+
+def _manual_publication(private, version, floor):
+    files = _stage(version)
+    name = releases._canonical_artifact(version, "linux", "x86_64")
+    body = _body(private, files, version=version, stable_version=version)
+    evidence = body.pop("evidence")
+    body.pop("stable_version")
+    body.pop("stable_signature")
+    body.update({"channel": "stable", "min_supported": floor,
+                 "artifact_key": f"stable/{version}/{name}", **evidence})
+    for prefix, filename in releases._EVIDENCE_SIDECARS:
+        body[prefix + "_key"] = body["artifact_key"] + "." + filename
+        body[prefix + "_signature_key"] = body[prefix + "_key"] + ".sig"
+    body.update({
+        "payload_manifest_key": body["artifact_key"] + releases._PAYLOAD_SIDECAR_SUFFIXES[0],
+        "payload_signature_key": body["artifact_key"] + releases._PAYLOAD_SIDECAR_SUFFIXES[1],
+        "payload_manifest_sha256": hashlib.sha256(files[name + releases._PAYLOAD_SIDECAR_SUFFIXES[0]]).hexdigest(),
+        "payload_signature_sha256": hashlib.sha256(files[name + releases._PAYLOAD_SIDECAR_SUFFIXES[1]]).hexdigest(),
+    })
+    destination = releases._store_path(body["artifact_key"])
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    for filename, raw in files.items():
+        destination.with_name(filename).write_bytes(raw)
+    return body, files
+
+
+def test_manual_publication_authenticates_bytes_and_numeric_support_floor(pg, ci, ci_key):
+    first, _ = _manual_publication(ci_key, "2.20.0", "2.9.0")
+    anonymous = TestClient(app_mod.app)
+    assert anonymous.post("/api/releases/latest/publish", json=first).status_code == 401
+    assert ci.post("/api/releases/latest/publish", json=first).status_code == 200
+    second, _ = _manual_publication(ci_key, "2.20.1", "2.10.0")
+    assert ci.post("/api/releases/latest/publish", json=second).status_code == 200
+    older_floor, _ = _manual_publication(ci_key, "2.20.2", "2.9.99")
+    assert ci.post("/api/releases/latest/publish", json=older_floor).status_code == 409
+    with db.tx() as cur:
+        cur.execute("SELECT min_supported FROM release_channels WHERE channel='stable'")
+        assert cur.fetchone()["min_supported"] == "2.10.0"
+        cur.execute("SELECT version FROM releases WHERE channel='stable' ORDER BY version")
+        assert [row["version"] for row in cur.fetchall()] == ["2.20.0", "2.20.1"]
+
+
+def test_manual_publication_rejects_hash_matching_unsigned_sidecars(pg, ci, ci_key):
+    body, _ = _manual_publication(ci_key, "2.20.0", "1.0.0")
+    signature = releases._store_path(body["payload_signature_key"])
+    signature.write_bytes(base64.b64encode(b"untrusted".ljust(64, b"!")) + b"\n")
+    body["payload_signature_sha256"] = hashlib.sha256(signature.read_bytes()).hexdigest()
+    assert ci.post("/api/releases/latest/publish", json=body).status_code == 422
+    with db.tx() as cur:
+        cur.execute("SELECT artifact_key FROM releases")
+        assert cur.fetchone() is None

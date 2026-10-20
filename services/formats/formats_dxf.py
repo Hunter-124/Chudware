@@ -7,8 +7,9 @@ solid's face.
 
 Pipeline
 --------
-1. Walk modelspace entities (recursing into ``INSERT`` block references, which are exploded to
-   their primitives in world coordinates).
+1. Admit the complete modelspace/block expansion against native-compatible instance, geometry,
+   work and depth limits; reject cyclic blocks. Place every ``INSERT`` / MINSERT grid primitive
+   in world coordinates without silently truncating over-budget geometry.
 2. Convert each supported entity to one or more build123d ``Edge``:
      * ``LINE``                      -> line edge
      * ``CIRCLE``                    -> full-circle edge
@@ -43,6 +44,14 @@ _CONNECT_TOL = 1e-6
 # Below this a polyline segment / curve span is treated as degenerate and dropped.
 _EPS = 1e-9
 
+# Match core/doc/formats.cpp's DXF expansion ceilings. Admit the complete logical
+# block tree before ezdxf copies entities or build123d constructs any geometry.
+_MAX_BLOCK_DEPTH = 16
+_MAX_INSTANCES = 100000
+_MAX_GEOMETRY = 1000000
+_MAX_WORK = 4000000
+_EDGE_TYPES = frozenset({"LINE", "CIRCLE", "ARC", "LWPOLYLINE", "POLYLINE", "ELLIPSE", "SPLINE"})
+
 # AutoCAD $INSUNITS codes: millimetres per drawing unit (0 = unitless, unchanged).
 _MM_PER_INSUNIT = {
     0: 1.0, 1: 25.4, 2: 304.8, 3: 1609344.0, 4: 1.0,
@@ -59,7 +68,8 @@ _MM_PER_INSUNIT = {
 def import_dxf(path: str | Path) -> list[tuple[str, Any]]:
     """Import a DXF file → ``[(name, shape)]`` (a single Compound body of faces + free wires).
 
-    Raises ``ValueError`` when the file cannot be read or carries no importable 2D geometry.
+    Raises ``ValueError`` when the file cannot be read, has no importable 2D geometry,
+    or contains cyclic, invalid or over-budget INSERT expansion.
     """
     import ezdxf
 
@@ -101,16 +111,120 @@ def bodies_from_doc(doc, stem: str, source: str = "") -> list[tuple[str, Any]]:
 
 # --------------------------------------------------------------------------- entity → edges
 
+class _DxfExpansionError(ValueError):
+    """An incomplete block expansion must never become a successful partial import."""
+
+
+class _DxfExpansionBudget:
+    def __init__(self) -> None:
+        self.visited = 0
+        self.work = 0
+        self.instances = 0
+        self.edges = 0
+
+    def charge(self, field: str, amount: int, copies: int, limit: int) -> None:
+        used = getattr(self, field)
+        if amount and copies > (limit - used) // amount:
+            raise _DxfExpansionError(f"DXF expansion budget exceeded: {field} (limit {limit})")
+        setattr(self, field, used + amount * copies)
+
+
+def _insert_instances(e) -> int:
+    rows, columns = e.dxf.row_count, e.dxf.column_count
+    if any(not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= _MAX_INSTANCES
+           for n in (rows, columns)):
+        raise _DxfExpansionError("DXF INSERT has invalid or over-budget array dimensions")
+    if rows > _MAX_INSTANCES // columns:
+        raise _DxfExpansionError("DXF INSERT array exceeds instance budget")
+    # Use declared dimensions, not mcount: zero spacing still makes multi_insert()
+    # visit the whole grid even when it suppresses duplicate locations.
+    return rows * columns
+
+
+def _admit_dxf_expansion(entities, budget: _DxfExpansionBudget,
+                         copies: int = 1, blocks: tuple[str, ...] = ()) -> None:
+    for e in entities:
+        budget.charge("visited", 1, copies, _MAX_WORK)
+        etype = e.dxftype()
+        payload = len(e.dxf.all_existing_dxf_attribs())
+        geometry = int(etype in _EDGE_TYPES)
+        if etype == "LWPOLYLINE":
+            geometry = len(e)
+            payload += geometry * 5
+        elif etype == "POLYLINE":
+            geometry = len(e.vertices)
+            payload += geometry * 5
+        elif etype == "SPLINE":
+            payload += (len(e.control_points) + len(e.fit_points)) * 3
+            payload += len(e.knots) + len(e.weights)
+        budget.charge("work", 1 + payload, copies, _MAX_WORK)
+        budget.charge("edges", geometry, copies, _MAX_GEOMETRY)
+        if etype != "INSERT":
+            continue
+        instances = _insert_instances(e)
+        budget.charge("instances", instances, copies, _MAX_INSTANCES)
+        budget.charge("work", len(e.attribs), copies * instances, _MAX_WORK)
+        block = e.block()
+        if block is None:
+            continue  # retain the existing unsupported/missing-block skip convention
+        name = block.name.casefold()
+        if name in blocks:
+            raise _DxfExpansionError(f"DXF INSERT block cycle: {block.name}")
+        if len(blocks) >= _MAX_BLOCK_DEPTH:
+            raise _DxfExpansionError(
+                f"DXF expansion budget exceeded: depth (limit {_MAX_BLOCK_DEPTH})")
+        _admit_dxf_expansion(block, budget, copies * instances, (*blocks, name))
+
+
+def _placed_entities(entities, parent_matrix=None):
+    """Expand an admitted tree, composing placements before copying primitives.
+
+    ezdxf's INSERT.virtual_entities() can recursively explode an unrepresentable
+    nested INSERT inside its transform fallback, bypassing caller accounting and
+    omitting that nested INSERT's MINSERT grid. Walk the original blocks instead;
+    ezdxf still owns primitive copying and non-uniform curve transformations.
+    """
+    from ezdxf.transform import copies
+
+    for e in entities:
+        if e.dxftype() == "INSERT":
+            try:
+                block = e.block()
+                if block is None:
+                    yield None
+                    continue
+                instances = e.multi_insert() if _insert_instances(e) > 1 else (e,)
+                for instance in instances:
+                    matrix = instance.matrix44()
+                    if parent_matrix is not None:
+                        matrix = matrix @ parent_matrix
+                    yield from _placed_entities(block, matrix)
+            except _DxfExpansionError:
+                raise
+            except Exception:  # noqa: BLE001 — retain malformed-entity skips
+                yield None
+        elif parent_matrix is not None and e.dxftype() in _EDGE_TYPES:
+            try:
+                _, virtual = copies((e,), parent_matrix)
+                yield from virtual or (None,)
+            except Exception:  # noqa: BLE001
+                yield None
+        else:
+            yield e
+
+
 
 def _entities_to_edges(entities) -> tuple[list, int]:
-    """Convert an iterable of ezdxf entities to a flat list of build123d Edges + a skipped count.
-
-    Recurses through ``INSERT`` block references via ``virtual_entities()`` (world-placed)."""
+    """Convert an admitted ezdxf layout to flat build123d Edges + a skipped count."""
+    _admit_dxf_expansion(entities, _DxfExpansionBudget())
     from build123d import Edge, Plane, Vector
 
     edges: list = []
     skipped = 0
-    for e in entities:
+    for e in _placed_entities(entities):
+        if e is None:
+            skipped += 1
+            continue
         etype = e.dxftype()
         try:
             if etype == "LINE":
@@ -132,10 +246,6 @@ def _entities_to_edges(entities) -> tuple[list, int]:
                     edges.append(se)
                 else:
                     skipped += 1
-            elif etype == "INSERT":
-                sub, sub_skipped = _entities_to_edges(e.virtual_entities())
-                edges.extend(sub)
-                skipped += sub_skipped
             else:
                 skipped += 1
         except Exception:  # noqa: BLE001 — one bad entity must not abort the whole import

@@ -34,6 +34,7 @@ import os
 import re
 import time
 import uuid
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
@@ -183,6 +184,23 @@ def _label_of(entry: Mapping) -> Optional[str]:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+@lru_cache(maxsize=1)
+def print_processes() -> list[dict]:
+    """Shared GUI/agent print-process presets."""
+    path = Path(__file__).with_name("topology_print_processes.json")
+    return json.loads(path.read_text(encoding="utf-8"))["processes"]
+
+
+def print_process(process_id: Any) -> dict:
+    for process in print_processes():
+        if process["id"] == process_id:
+            return process
+    valid = [p["id"] for p in print_processes()]
+    raise TopologyInputError(
+        "unknown_print_process",
+        f"Unknown print process {process_id!r}; valid ids: {valid}.", "study.print_process")
 
 
 # ---------------------------------------------------------------- selectors
@@ -635,6 +653,16 @@ def normalize_study(raw: Any, notes: list) -> dict:
             raise _invalid(f"topology.{key}", f"must be one of {list(vocab)}, got "
                                               f"{topology[key]!r}")
     study["topology"] = dict(topology)
+    if "print_process" in study:
+        print_process(study["print_process"])
+    if study.get("build_plate") is not None:
+        plate = study["build_plate"]
+        if not isinstance(plate, dict):
+            raise _invalid("study.build_plate", "must be an object with faces:[selector]")
+        plate = dict(plate)
+        faces = _faces(plate, "study.build_plate")
+        _reject_unknown(plate, (), "study.build_plate")
+        study["build_plate"] = {"faces": faces, **plate}
     material = study.get("material")
     if material is not None and not (
             (isinstance(material, str) and material.strip())
@@ -815,6 +843,23 @@ def select_combination(caps: dict, topology: dict) -> dict:
     return row
 
 
+def apply_print_process(study: dict, combination: dict, notes: list) -> None:
+    """Fill only absent, offered parameters; explicit study values always win."""
+    if "print_process" not in study:
+        return
+    process = print_process(study["print_process"])
+    topology = study["topology"]
+    offered = set(combination.get("parameters") or [])
+    filled = {}
+    for key, value in process["topology"].items():
+        if key in offered and key not in topology and value is not None:
+            topology[key] = value
+            filled[key] = value
+    if filled:
+        notes.append(f"print_process {process['id']} filled topology keys: "
+                     + ", ".join(f"{k}={json.dumps(v)}" for k, v in filled.items()))
+
+
 def run_settings(topology: dict, combination: dict) -> dict:
     """The ``topology`` object sent to the solver: exactly the keys this pair offers.
 
@@ -837,6 +882,42 @@ def run_settings(topology: dict, combination: dict) -> dict:
 
 
 # ---------------------------------------------------------------- run requirements
+
+def require_topology_settings(study: Mapping, combination: Optional[Mapping] = None) -> None:
+    """Refuse incomplete optimization intent before saving or exporting the study."""
+    topology = study["topology"]
+    if "volume_fraction" not in topology:
+        raise TopologyInputError(
+            "missing_volume_fraction", "A volume fraction in (0, 1] is required.",
+            "study.topology.volume_fraction")
+    vf = _finite(topology["volume_fraction"], "study.topology.volume_fraction")
+    if not 0.0 < vf <= 1.0:
+        raise TopologyInputError(
+            "out_of_range", "Volume fraction must be in (0, 1].",
+            "study.topology.volume_fraction")
+    penalty = topology.get("overhang_penalty", 0.0)
+    penalty = _finite(penalty, "study.topology.overhang_penalty")
+    has_direction = topology.get("build_direction") is not None
+    plate = study.get("build_plate")
+    has_plate = isinstance(plate, Mapping) and bool(plate.get("faces"))
+    if ("overhang_angle_deg" in topology or penalty > 0.0) and not (
+            has_direction or has_plate):
+        raise TopologyInputError(
+            "build_direction_required",
+            "Overhang control needs a build direction or a bed face (build_plate).",
+            "study.topology.build_direction")
+    # Native Settings defaults the angle to 45 degrees, including penalty-only studies.
+    limits = (combination or {}).get("limits")
+    has_limit = any(key in topology and topology[key] is not None
+                    for key in (limits if limits is not None else
+                                ("stress_limit_mpa", "max_displacement_mm",
+                                 "max_temperature_c", "min_frequency_hz",
+                                 "min_buckling_factor", "max_pressure_drop_pa")))
+    if topology.get("objective") == "mass" and not has_limit:
+        raise TopologyInputError(
+            "mass_needs_limit", "Mass minimization needs at least one response limit.",
+            "study.topology.objective")
+
 
 def _any_driving(loads: Iterable[dict]) -> bool:
     for load in loads:
@@ -967,6 +1048,9 @@ def build_envelope(study: dict, *, settings: dict, material: dict,
     env: dict = {"name": study["name"], "step_path": step_path, "mesh_order": 1,
                  "material": material, "topology": {**settings, "result_dir": result_dir},
                  **_mesh_options(study)}
+    if study.get("build_plate") is not None:
+        plate = study["build_plate"]
+        env["build_plate"] = labelled(plate, {"faces": faceset(plate, "build_plate")})
     if physics in STRUCTURAL_PHYSICS:
         env["fixtures"] = [fixture(e, f"fixtures[{i}]")
                            for i, e in enumerate(study.get("fixtures") or [])]
@@ -1102,11 +1186,7 @@ def validate_run_envelope(study: Any) -> None:
         raise ValueError(f"sim_run_topology topology.physics must be one of {list(PHYSICS)}")
     if method not in METHODS:
         raise ValueError(f"sim_run_topology topology.method must be one of {list(METHODS)}")
-    if "volume_fraction" not in topology:
-        raise ValueError("sim_run_topology topology.volume_fraction is required")
-    vf = topology["volume_fraction"]
-    if isinstance(vf, bool) or not isinstance(vf, (int, float)) or not 0.0 < vf <= 1.0:
-        raise ValueError("sim_run_topology topology.volume_fraction must be in (0, 1]")
+    _env_check(require_topology_settings, study)
     result_dir = topology.get("result_dir")
     if not isinstance(result_dir, str) or not os.path.isabs(result_dir) or not os.path.isdir(
             result_dir):
@@ -1199,6 +1279,11 @@ def validate_run_envelope(study: Any) -> None:
 
     bc_list(study.get("preserve"), "preserve", region)
     bc_list(study.get("exclude"), "exclude", region)
+    if study.get("build_plate") is not None:
+        plate = study["build_plate"]
+        if not isinstance(plate, dict):
+            raise ValueError("sim_run_topology build_plate must be an object")
+        _env_faceset(plate.get("faces"), "build_plate")
 
     if physics in THERMAL_PHYSICS:
         thermal = study["thermal"]
@@ -1459,15 +1544,33 @@ def verify_artifacts(artifacts: Any, run_dir: Path, overlay: Any = None) -> tupl
     return out, notes
 
 
-def _surface_artifact(artifacts: dict) -> Optional[tuple[str, dict]]:
-    for key, entry in artifacts.items():
+def surface_artifact(artifacts: dict, *, intact: bool = True) -> Optional[tuple[str, dict]]:
+    """Print surface first, raw surface second, then other supported surface formats."""
+    keys = dict.fromkeys(("surface_print_stl", "surface_stl", *artifacts))
+    for key in keys:
+        entry = artifacts.get(key)
+        if not isinstance(entry, dict):
+            continue
         fmt = str(entry.get("format") or Path(entry.get("path", "")).suffix.lstrip(".")).lower()
-        if fmt in SURFACE_FORMATS and not entry.get("missing") and not entry.get("stale"):
+        if fmt in SURFACE_FORMATS and (not intact or not (
+                entry.get("missing") or entry.get("stale"))):
             return key, entry
     return None
 
 
-def dfam_report(result: dict, artifacts: dict, settings: Mapping) -> dict:
+def effective_build_direction(result: Mapping, settings: Mapping) -> tuple[list, str]:
+    overhang = ((result.get("manufacturing") or {}).get("enforcement") or {}).get(
+        "overhang") or {}
+    if overhang.get("build_direction") is not None:
+        return list(overhang["build_direction"]), overhang.get(
+            "build_direction_source") or "build_direction"
+    if settings.get("build_direction") is not None:
+        return list(settings["build_direction"]), "build_direction"
+    return [0.0, 0.0, 1.0], "assumed"
+
+
+def dfam_report(result: dict, artifacts: dict, settings: Mapping,
+                print_process: Optional[dict] = None) -> dict:
     """Manufacturing block with a REAL DFAM check and an honest, never-true print_ready.
 
     services.dfam runs on the exported thresholded surface only when the solver validated
@@ -1478,7 +1581,10 @@ def dfam_report(result: dict, artifacts: dict, settings: Mapping) -> dict:
     """
     manufacturing = dict(result.get("manufacturing") or {})
     geometry_valid = manufacturing.get("geometry_valid") is True
-    surface = _surface_artifact(artifacts)
+    surface = surface_artifact(artifacts)
+    process = (print_process or {}).get("process", "fdm")
+    rules = f"{process.upper()} rules"
+    build, build_source = effective_build_direction(result, settings)
     dfam: dict
     if not geometry_valid:
         dfam = {"checked": False, "passed": False,
@@ -1490,11 +1596,13 @@ def dfam_report(result: dict, artifacts: dict, settings: Mapping) -> dict:
         key, entry = surface
         overhang = settings.get("overhang_angle_deg")
         min_member = settings.get("min_member_mm")
-        build = settings.get("build_direction") or [0.0, 0.0, 1.0]
+        params = None
         try:
             from services.dfam import PrintParams, analyze_printability, load_mesh_file  # noqa: PLC0415
 
-            kwargs: dict = {"process": "fdm"}
+            kwargs: dict = {k: v for k, v in (print_process or {}).items()
+                            if k in {"process", "nozzle_mm", "line_width_mm", "layer_height_mm"}}
+            kwargs.setdefault("process", process)
             if isinstance(overhang, (int, float)) and not isinstance(overhang, bool) \
                     and 0.0 < overhang <= 90.0:
                 kwargs["overhang_max_deg"] = float(overhang)
@@ -1509,14 +1617,27 @@ def dfam_report(result: dict, artifacts: dict, settings: Mapping) -> dict:
         else:
             rows = [{"check": r.get("check"), "status": r.get("status"), "note": r.get("note")}
                     for r in report.get("checks", [])]
-            failing = [r["check"] for r in rows if r["status"] != "pass"]
+            fails = [r["check"] for r in rows if r["status"] == "fail"]
+            warns = [r["check"] for r in rows if r["status"] == "warn"]
+            named = "; ".join(f"{label} {', '.join(checks)}"
+                              for label, checks in (("fail:", fails), ("warn:", warns)) if checks)
             dfam = {"checked": True, "passed": report.get("status") == "pass",
-                    "status": report.get("status"), "artifact": key, "process": "fdm",
+                    "status": report.get("status"), "artifact": key,
                     "build_dir": report.get("build_dir"),
                     "overhang_max_deg": params.overhang_max_deg,
                     "min_wall_mm": params.min_wall_mm, "checks": rows,
-                    "summary": ("all DFAM checks pass (FDM rules)" if not failing else
-                                f"DFAM {report.get('status')}: {', '.join(failing)}")}
+                    "summary": (f"all DFAM checks pass ({rules})" if not named else
+                                f"DFAM {report.get('status')} ({rules}): {named}")}
+        if params is not None:
+            dfam["layer_height_mm"] = params.layer_height_mm
+            if process == "fdm" or "nozzle_mm" in (print_process or {}):
+                dfam["nozzle_mm"] = params.nozzle_mm
+    dfam.setdefault("status", "not_checked")
+    dfam.setdefault("checks", [])
+    dfam.setdefault("build_dir", build)
+    dfam["process"] = process
+    if build_source == "assumed":
+        dfam["build_dir_assumed"] = True
     claimed = manufacturing.get("print_ready") is True
     manufacturing["dfam"] = dfam
     manufacturing["print_ready"] = False
@@ -1527,7 +1648,7 @@ def dfam_report(result: dict, artifacts: dict, settings: Mapping) -> dict:
     elif not (dfam["checked"] and dfam["passed"]):
         why = dfam["summary"]
     else:
-        why = "geometry validated and DFAM passed (FDM rules)"
+        why = f"geometry validated and DFAM passed ({rules})"
     manufacturing["print_ready_reason"] = (
         f"not print-ready: {why}; no sliced G-code has been validated (slice the exported "
         "surface with slice_part, whose passing G-code check is the print gate)")

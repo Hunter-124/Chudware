@@ -6,10 +6,13 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <utility>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 
 namespace fs = std::filesystem;
@@ -28,9 +31,122 @@ namespace cam {
 
 namespace {
 
+// Match the native editable-container payload budgets. miniz reads its central
+// directory during init, so its metadata allocator must enforce admission too.
+constexpr mz_uint kMaxArchiveEntries = 4096;
+constexpr mz_uint64 kMaxArchiveBytes = 256ull * 1024ull * 1024ull;
+constexpr std::size_t kMaxDirectoryBytes = 8 * 1024 * 1024;
+constexpr mz_uint64 kMaxEntryBytes = 64ull * 1024ull * 1024ull;
+constexpr mz_uint64 kMaxInflatedBytes = 256ull * 1024ull * 1024ull;
+constexpr mz_uint64 kMaxCompressionRatio = 200;
+constexpr int kMaxJobDepth = 128;
+constexpr std::size_t kMaxJobParseEvents = 1000000;
+
+struct ZipAllocationBudget {
+    mz_zip_archive& zip;
+    const char* refusal = nullptr;
+
+    bool admit(std::size_t items, std::size_t size) {
+        if (zip.m_total_files > kMaxArchiveEntries)
+            refusal = "ZIP entry count limit exceeded";
+        else if (size && items > kMaxDirectoryBytes / size)
+            refusal = "ZIP central-directory byte limit exceeded";
+        return refusal == nullptr;
+    }
+};
+
+void* zip_alloc(void* opaque, std::size_t items, std::size_t size) {
+    return static_cast<ZipAllocationBudget*>(opaque)->admit(items, size)
+        ? miniz_def_alloc_func(nullptr, items, size) : nullptr;
+}
+
+void* zip_realloc(void* opaque, void* address, std::size_t items, std::size_t size) {
+    return static_cast<ZipAllocationBudget*>(opaque)->admit(items, size)
+        ? miniz_def_realloc_func(nullptr, address, items, size) : nullptr;
+}
+
+void zip_free(void*, void* address) {
+    miniz_def_free_func(nullptr, address);
+}
+
+std::string read_job_archive(const std::string& path) {
+    // Pin the same opened file for size admission and extraction.
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> file(
+        std::fopen(path.c_str(), "rb"), &std::fclose);
+    auto refuse = [](const std::string& message) {
+        throw OpError("io_error", "cam_open: " + message, json::object());
+    };
+    if (!file) refuse("cannot open .cam+ file: " + path);
+    if (std::fseek(file.get(), 0, SEEK_END) != 0) refuse("cannot size .cam+ file");
+    const long file_bytes = std::ftell(file.get());
+    if (file_bytes < 0) refuse("cannot size .cam+ file");
+    if (static_cast<mz_uint64>(file_bytes) > kMaxArchiveBytes)
+        refuse("ZIP archive byte limit exceeded");
+    if (std::fseek(file.get(), 0, SEEK_SET) != 0) refuse("cannot seek .cam+ file");
+
+    mz_zip_archive zip{};
+    ZipAllocationBudget budget{zip};
+    zip.m_pAlloc = zip_alloc;
+    zip.m_pRealloc = zip_realloc;
+    zip.m_pFree = zip_free;
+    zip.m_pAlloc_opaque = &budget;
+    if (!mz_zip_reader_init_cfile(&zip, file.get(), static_cast<mz_uint64>(file_bytes),
+                                   MZ_ZIP_FLAG_DO_NOT_SORT_CENTRAL_DIRECTORY))
+        refuse(budget.refusal ? budget.refusal : "invalid .cam+ archive");
+    struct ReaderGuard {
+        mz_zip_archive& zip;
+        ~ReaderGuard() { mz_zip_reader_end(&zip); }
+    } guard{zip};
+
+    const mz_uint count = mz_zip_reader_get_num_files(&zip);
+    if (count > kMaxArchiveEntries) refuse("ZIP entry count limit exceeded");
+    if (mz_zip_get_central_dir_size(&zip) > kMaxDirectoryBytes)
+        refuse("ZIP central-directory byte limit exceeded");
+    mz_uint64 declared_total = 0;
+    std::set<std::string> names;
+    mz_uint job_index = count;
+    mz_uint64 job_bytes = 0;
+    for (mz_uint i = 0; i < count; ++i) {
+        mz_zip_archive_file_stat st{};
+        if (!mz_zip_reader_file_stat(&zip, i, &st)) refuse("invalid ZIP member metadata");
+        if (st.m_uncomp_size > kMaxEntryBytes) refuse("ZIP entry byte limit exceeded");
+        if (st.m_uncomp_size > kMaxInflatedBytes - declared_total)
+            refuse("ZIP aggregate byte limit exceeded");
+        declared_total += st.m_uncomp_size;
+        // The compressed size is itself bounded by the admitted archive. Divide
+        // with a remainder to avoid overflow and admit exactly the ratio ceiling.
+        if (st.m_uncomp_size &&
+            (!st.m_comp_size ||
+             (st.m_uncomp_size - 1) / st.m_comp_size >= kMaxCompressionRatio))
+            refuse("ZIP compression ratio limit exceeded");
+        const mz_uint name_size = mz_zip_reader_get_filename(&zip, i, nullptr, 0);
+        if (!name_size || name_size > 65536) refuse("invalid ZIP member name");
+        std::string name(name_size, '\0');
+        if (mz_zip_reader_get_filename(&zip, i, name.data(), name_size) != name_size)
+            refuse("invalid ZIP member name");
+        name.resize(name_size - 1);
+        if (name.find('\0') != std::string::npos) refuse("invalid ZIP member name");
+        if (name == "job.json" && !st.m_is_directory) {
+            job_index = i;
+            job_bytes = st.m_uncomp_size;
+        }
+        for (char& c : name) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (!names.insert(std::move(name)).second)
+            refuse("duplicate or case-aliased ZIP member name");
+    }
+    if (job_index == count) refuse("no job.json in archive");
+    // One admitted output buffer, indexed extraction, and miniz's actual stream
+    // size/CRC checks. A dishonest expanded-size claim cannot grow this buffer.
+    std::string data(static_cast<std::size_t>(job_bytes), '\0');
+    if (!mz_zip_reader_extract_to_mem(&zip, job_index, data.data(), data.size(), 0))
+        refuse("cannot inflate job.json");
+    return data;
+}
+
 struct CamSession {
     Job job;
     long revision = 1;
+    bool dirty = true;
     std::string path;
     std::vector<json> undo, redo;
     // cached generated toolpaths per setup id; invalidated on edit.
@@ -316,6 +432,13 @@ void apply_one(CamSession& s, const json& op, json& id_map) {
 
 }  // namespace
 
+bool dirty_document_count(std::uint64_t& count) {
+    std::unique_lock<std::mutex> lock(g_mtx, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    for (const auto& [id, session] : g_store) if (session.dirty) ++count;
+    return true;
+}
+
 // ───────────────────────────────────────────────────────── public RPCs ──
 json cam_new(const json& params) {
     std::lock_guard<std::mutex> lk(g_mtx);
@@ -338,6 +461,9 @@ json cam_apply_ops(const std::string& doc_id, long base_revision, const json& op
     snapshot(s);
     json id_map = json::object();
     const json& list = ops.is_array() ? ops : (ops.contains("ops") ? ops["ops"] : json::array());
+    // apply_one mutates in place. Even a later refused op must not let an
+    // already-applied edit disappear at cell exit.
+    s.dirty = true;
     for (auto& op : list) apply_one(s, op, id_map);
     s.revision += 1;
     s.stale = true;
@@ -354,6 +480,7 @@ json cam_undo(const std::string& doc_id) {
     s.job = Job::from_json(s.undo.back());
     s.undo.pop_back();
     s.revision += 1;
+    s.dirty = true;
     s.cache.clear(); s.generation_warnings.clear(); s.stale = true;
     return json{{"revision", s.revision}, {"tree", tree_of(s.job)}};
 }
@@ -364,6 +491,7 @@ json cam_redo(const std::string& doc_id) {
     s.undo.push_back(s.job.to_json());
     s.job = Job::from_json(s.redo.back());
     s.redo.pop_back();
+    s.dirty = true;
     s.cache.clear(); s.generation_warnings.clear(); s.stale = true;
     return json{{"revision", s.revision}, {"tree", tree_of(s.job)}};
 }
@@ -755,31 +883,38 @@ json cam_save(const std::string& doc_id, const std::string& path_in) {
     mz_zip_writer_end(&zip);
     if (!ok) throw OpError("io_error", "failed to write .cam+ archive", json::object());
     s.path = path;
+    s.dirty = false;
     return json{{"path", path}};
 }
 json cam_open(const std::string& path) {
-    std::lock_guard<std::mutex> lk(g_mtx);
-    mz_zip_archive zip;
-    std::memset(&zip, 0, sizeof(zip));
-    if (!mz_zip_reader_init_file(&zip, path.c_str(), 0))
-        throw OpError("io_error", "cannot open .cam+ file: " + path, json::object());
-    size_t sz = 0;
-    void* p = mz_zip_reader_extract_file_to_heap(&zip, "job.json", &sz, 0);
-    if (!p) { mz_zip_reader_end(&zip); throw OpError("io_error", "no job.json in archive", json::object()); }
-    std::string data((char*)p, sz);
-    mz_free(p);
-    mz_zip_reader_end(&zip);
+    // This does not touch session state: do not serialize other CAM documents
+    // behind untrusted archive I/O, inflation, JSON parsing or tree construction.
     CamSession s;
-    try {
-        s.job = Job::from_json(json::parse(data));
-    } catch (const std::exception& e) {
-        throw OpError("parse_error", std::string("bad job.json: ") + e.what(), json::object());
+    {
+        std::string data = read_job_archive(path);
+        try {
+            std::size_t events = 0;
+            s.job = Job::from_json(json::parse(data, [&](int depth, json::parse_event_t, json&) {
+                if (depth > kMaxJobDepth || ++events > kMaxJobParseEvents)
+                    throw std::runtime_error("job.json parse work limit exceeded");
+                return true;
+            }));
+        } catch (const std::exception& e) {
+            throw OpError("parse_error", std::string("bad job.json: ") + e.what(), json::object());
+        }
     }
-    if (s.job.id.empty()) s.job.id = new_id("cam");
     s.path = path;
-    std::string doc_id = new_id("cam");  // fresh SESSION id (independent of the persistent job.id)
-    g_store[doc_id] = std::move(s);
-    return json{{"doc_id", doc_id}, {"revision", g_store[doc_id].revision}, {"tree", tree_of(g_store[doc_id].job)}};
+    s.dirty = false;
+    json result{{"revision", s.revision}, {"tree", tree_of(s.job)}};
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (s.job.id.empty()) {
+        s.job.id = new_id("cam");
+        result["tree"]["id"] = s.job.id;
+    }
+    const std::string doc_id = new_id("cam");  // session id, not persistent job.id
+    result["doc_id"] = doc_id;
+    g_store.emplace(doc_id, std::move(s));
+    return result;
 }
 
 bool force_release_cam_lock() {

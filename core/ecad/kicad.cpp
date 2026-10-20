@@ -34,18 +34,43 @@ using nlohmann::json;
 namespace {
 
 // ---------------------------------------------------------------------------
-// sexpr.py — tokenizer + recursive-descent parser
-// ---------------------------------------------------------------------------
+// sexpr.py — bounded tokenizer + iterative parser
+// These are import budgets, not cache/geometry identity: ordinary KiCad trees are
+// shallow, but libraries and routed boards can contain many nodes.
+constexpr std::size_t kMaxInputBytes = 64 * 1024 * 1024;
+constexpr std::size_t kMaxNodes = 1000000;
+constexpr std::size_t kMaxDepth = 128;
 
 std::vector<std::string> tokenize(const std::string& text) {
+    if (text.size() > kMaxInputBytes)
+        throw std::runtime_error("KiCad input byte limit exceeded");
+    std::size_t nodes = 0, depth = 0, tokens = 0;
+    auto account = [&](char c) {
+        if (++tokens > 2 * kMaxNodes)
+            throw std::runtime_error("KiCad token limit exceeded");
+        if (c == ')') {
+            if (depth) --depth;
+            return;
+        }
+        if (++nodes > kMaxNodes)
+            throw std::runtime_error("KiCad node limit exceeded");
+        if (c == '(' && ++depth > kMaxDepth)
+            throw std::runtime_error("KiCad depth limit exceeded");
+    };
     std::vector<std::string> out;
     std::size_t i = 0;
     const std::size_t n = text.size();
     while (i < n) {
         const char c = text[i];
         if (std::isspace(static_cast<unsigned char>(c))) { ++i; continue; }
-        if (c == '(' || c == ')') { out.emplace_back(1, c); ++i; continue; }
+        if (c == '(' || c == ')') {
+            account(c);
+            out.emplace_back(1, c);
+            ++i;
+            continue;
+        }
         if (c == '"') {
+            account(c);
             // quoted string: "(?:[^"\\]|\\.)*"
             std::string tok(1, '"');
             std::size_t j = i + 1;
@@ -61,6 +86,7 @@ std::vector<std::string> tokenize(const std::string& text) {
             continue;
         }
         // bare symbol / number: [^\s()"]+
+        account(c);
         std::size_t j = i;
         while (j < n && !std::isspace(static_cast<unsigned char>(text[j])) && text[j] != '(' &&
                text[j] != ')' && text[j] != '"')
@@ -113,20 +139,31 @@ json parse_atom(const std::string& tok) {
 }
 
 json build(const std::vector<std::string>& toks, std::size_t& pos) {
-    const std::string& tok = toks[pos];
-    if (tok == "(") {
+    std::vector<json> stack;
+    stack.reserve(kMaxDepth);
+    while (pos < toks.size()) {
+        const std::string& tok = toks[pos];
+        if (tok == "(") {
+            stack.push_back(json::array());
+            ++pos;
+            continue;
+        }
+        if (tok == ")") {
+            if (stack.empty())
+                throw std::runtime_error("Unexpected ')' at token index " + std::to_string(pos));
+            json completed = std::move(stack.back());
+            stack.pop_back();
+            ++pos;
+            if (stack.empty()) return completed;
+            stack.back().push_back(std::move(completed));
+            continue;
+        }
+        json atom = parse_atom(tok);
         ++pos;
-        json arr = json::array();
-        while (pos < toks.size() && toks[pos] != ")") arr.push_back(build(toks, pos));
-        if (pos >= toks.size())
-            throw std::runtime_error("Unexpected end of input: unmatched '('");
-        ++pos;  // consume ')'
-        return arr;
+        if (stack.empty()) return atom;
+        stack.back().push_back(std::move(atom));
     }
-    if (tok == ")")
-        throw std::runtime_error("Unexpected ')' at token index " + std::to_string(pos));
-    ++pos;
-    return parse_atom(tok);
+    throw std::runtime_error("Unexpected end of input: unmatched '('");
 }
 
 // ---------------------------------------------------------------------------
@@ -204,9 +241,17 @@ std::string uuid4() {
 std::string read_text(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("No such file or directory: '" + path + "'");
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
+    std::string text;
+    char chunk[16384];
+    while (f) {
+        f.read(chunk, sizeof(chunk));
+        const std::size_t n = static_cast<std::size_t>(f.gcount());
+        if (n > kMaxInputBytes - text.size())
+            throw std::runtime_error("KiCad input byte limit exceeded");
+        text.append(chunk, n);
+    }
+    if (!f.eof()) throw std::runtime_error("Cannot read KiCad file: '" + path + "'");
+    return text;
 }
 
 // pathlib.Path(source).stem
@@ -219,6 +264,8 @@ std::string path_stem(const std::string& path) {
 }
 
 bool raw_sexpr(const std::string& source) {
+    if (source.size() > kMaxInputBytes)
+        throw std::runtime_error("KiCad input byte limit exceeded");
     // source.strip().startswith("(")
     const std::size_t i = source.find_first_not_of(" \t\r\n");
     return i != std::string::npos && source[i] == '(';

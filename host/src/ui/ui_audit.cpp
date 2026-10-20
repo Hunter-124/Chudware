@@ -677,6 +677,8 @@ const nlohmann::json& observedItems() {
                                       std::strcmp(shot, "simaudit") == 0 ||
                                       std::strcmp(shot, "pipedraw") == 0 ||
                                       std::strcmp(shot, "hydraulics3d") == 0 ||
+                                      std::strcmp(shot, "chat_inline") == 0 ||
+                                      std::strcmp(shot, "copilot_ui") == 0 ||
                                       std::strcmp(shot, "dwgopen") == 0);
     if (ctx && (R.active || pointerShot)) {
         installHooks(ctx);

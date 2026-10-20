@@ -15,6 +15,8 @@ import os
 import re
 import shutil
 import time
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
@@ -30,6 +32,7 @@ from pydantic import BaseModel
 try:
     from . import accounts, entitlement
     from .artifact_names import FORMATS, canonical_artifact
+    from .release_evidence import capture_bundle, verify_bundle, native_publisher_verified
     from .auth import get_current_user
     from .config import settings
     from .db import tx
@@ -38,6 +41,7 @@ except ImportError:  # uvicorn app:app from package dir
     import accounts  # type: ignore
     import entitlement  # type: ignore
     from artifact_names import FORMATS, canonical_artifact  # type: ignore
+    from release_evidence import capture_bundle, verify_bundle, native_publisher_verified
     from auth import get_current_user  # type: ignore
     from config import settings  # type: ignore
     from db import tx  # type: ignore
@@ -250,6 +254,11 @@ def _require_admin(request: Request):
 
 def _releases_dir() -> Path:
     env = (os.environ.get("CHUDWARE_RELEASES_DIR") or "").strip()
+    if settings.deploy_environment == "staging":
+        root = Path(env).expanduser().resolve() if env else settings.data_root / "customer-releases"
+        if not root.resolve().is_relative_to(settings.data_root.resolve()):
+            raise HTTPException(503, "staging release storage must be inside its data root")
+        return root
     if env:
         return Path(env).expanduser()
     return Path.home() / "chudware-releases"
@@ -613,6 +622,11 @@ def _r2_missing() -> list[str]:
 
 def _public_base_url() -> str:
     base = (os.environ.get("CHUDWARE_RELEASES_PUBLIC_BASE_URL") or "").strip()
+    if settings.deploy_environment == "staging":
+        origin = settings.public_base_url.rstrip("/")
+        if base and base.rstrip("/") != origin:
+            raise HTTPException(503, "staging release origin must match its gateway")
+        return origin
     return (base or _DEFAULT_PUBLIC_BASE_URL).rstrip("/")
 
 
@@ -639,6 +653,52 @@ def _download_url(artifact_key: str) -> str:
     return _presigned_url(artifact_key)
 
 
+def _r2_store():
+    bucket = os.environ.get("CHUDWARE_RELEASES_BUCKET") or (
+        "chudware-releases-staging" if settings.deploy_environment == "staging" else "chudware-releases"
+    )
+    if settings.deploy_environment == "staging" and bucket != "chudware-releases-staging":
+        raise HTTPException(503, "staging requires its own release bucket")
+    return boto3.client(
+        "s3", endpoint_url=os.environ["R2_ENDPOINT"],
+        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"], region_name="auto",
+    ), bucket
+
+
+@contextmanager
+def _capture_published_bundle(artifact_key: str):
+    source = _store_path(artifact_key)
+    if _r2_missing():
+        with capture_bundle(source) as captured:
+            yield captured
+        return
+    client, bucket = _r2_store()
+    with tempfile.TemporaryDirectory(prefix="chudware-object-publication-") as directory:
+        captured = Path(directory) / source.name
+        for suffix in _ARTIFACT_SUFFIXES:
+            target = captured.with_name(captured.name + suffix)
+            limit = 16 * 1024**2 if suffix else _ARTIFACT_CEILING
+            try:
+                result = client.get_object(Bucket=bucket, Key=artifact_key + suffix)
+                body = result["Body"]
+                try:
+                    total = 0
+                    with target.open("xb") as out:
+                        while block := body.read(1024 * 1024):
+                            total += len(block)
+                            if total > limit:
+                                raise HTTPException(422, "release object exceeds its byte limit")
+                            out.write(block)
+                finally:
+                    body.close()
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(422, "release object is missing or unreadable") from exc
+        yield captured
+
+
 def _presigned_url(artifact_key: str) -> str:
     missing = _r2_missing()
     if missing:
@@ -646,18 +706,12 @@ def _presigned_url(artifact_key: str) -> str:
             503,
             "release downloads are not configured; set " + ", ".join(missing),
         )
-    client = boto3.client(
-        "s3",
-        endpoint_url=os.environ["R2_ENDPOINT"],
-        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
-        region_name="auto",
-    )
+    client, bucket = _r2_store()
     return str(
         client.generate_presigned_url(
             "get_object",
             Params={
-                "Bucket": os.environ.get("CHUDWARE_RELEASES_BUCKET", "chudware-releases"),
+                "Bucket": bucket,
                 "Key": artifact_key,
             },
             ExpiresIn=900,
@@ -801,7 +855,7 @@ _RELEASE_COLUMNS = (
     "platform_test_sha256", "platform_test_signature_key", "platform_test_signature_sha256",
     # Appended, not inserted in identity order: this tuple is positional in the
     # generated INSERT, and tests pin column positions.
-    "format",
+    "format", "native_publisher_verified",
 )
 
 
@@ -814,7 +868,8 @@ def _insert_release_row(row: dict[str, Any], extra_columns: tuple[str, ...] = ()
     announced, must never be redefined by a later push.
     """
     columns = _RELEASE_COLUMNS + extra_columns
-    values = tuple(row.get(column) for column in columns)
+    values = tuple(row.get(column, False) if column == "native_publisher_verified"
+                   else row.get(column) for column in columns)
     channel = str(row["channel"])
     min_supported = str(row["min_supported"])
     requested_floor = _parse_release_version(min_supported, "min_supported")
@@ -850,9 +905,37 @@ def _insert_release_row(row: dict[str, Any], extra_columns: tuple[str, ...] = ()
         )
 
 
+@contextmanager
+def _publication_lock():
+    # One lock for the rare publication/promotion operations. It spans checking
+    # immutable identity, placing the bundle and inserting its row across workers.
+    import fcntl
+    import stat
+    root = _releases_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    fd = os.open(root / ".publication.lock",
+                 os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_mode & 0o022):
+            raise HTTPException(503, "release publication lock is unsafe")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def _upsert_release(value: PublishRelease) -> None:
     _validate_publish(value)
-    _insert_release_row({column: getattr(value, column) for column in _RELEASE_COLUMNS})
+    with _publication_lock():
+        row = value.model_dump()
+        with _capture_published_bundle(value.artifact_key) as artifact:
+            parsed = verify_bundle(artifact, row, _RELEASE_PUBLIC_KEYS)
+            row["native_publisher_verified"] = native_publisher_verified(
+                parsed, row, _RELEASE_PUBLIC_KEYS, required=value.channel == "stable",
+            )
+        _insert_release_row(row)
 
 
 @router.post("/api/releases/latest/publish")
@@ -879,11 +962,6 @@ def _staged(name: str) -> Path:
     return _incoming_dir() / _safe_name(name)
 
 
-def _require_staged(name: str, what: str) -> Path:
-    path = _staged(name)
-    if not path.is_file():
-        raise HTTPException(422, f"staged {what} is missing from incoming/: {name}")
-    return path
 
 
 def _validate_ci_publish(value: CiPublish) -> tuple[bytes, bytes]:
@@ -913,17 +991,14 @@ def _validate_ci_publish(value: CiPublish) -> tuple[bytes, bytes]:
 
 
 def _collect_ci_sidecars(
-    value: CiPublish, name: str, artifact_key: str
+    value: CiPublish, artifact: Path, artifact_key: str
 ) -> tuple[dict[str, Path], dict[str, Any]]:
-    """Digest the staged sidecars and derive the columns they populate.
-
-    Digests come from the bytes on disk, never from the request: CI's own
-    numbers are only used as a cross-check so a stale sidecar left over from the
-    previous run cannot be silently recorded as this build's evidence.
-    """
-    sidecars: dict[str, Path] = {}
-    for suffix in _PAYLOAD_SIDECAR_SUFFIXES:
-        sidecars[suffix] = _require_staged(name + suffix, "payload manifest sidecar")
+    """Derive publication columns from captured, authenticated sidecar bytes."""
+    name = artifact.name
+    sidecars = {
+        suffix: artifact.with_name(name + suffix)
+        for suffix in _PAYLOAD_SIDECAR_SUFFIXES
+    }
     columns: dict[str, Any] = {
         "payload_manifest_key": artifact_key + _PAYLOAD_SIDECAR_SUFFIXES[0],
         "payload_manifest_sha256": _digest_file(sidecars[_PAYLOAD_SIDECAR_SUFFIXES[0]])[0],
@@ -938,8 +1013,8 @@ def _collect_ci_sidecars(
     if value.evidence is None:
         return sidecars, columns
     for prefix, filename in _EVIDENCE_SIDECARS:
-        document = _require_staged(f"{name}.{filename}", f"{prefix} evidence")
-        signature = _require_staged(f"{name}.{filename}.sig", f"{prefix} evidence signature")
+        document = artifact.with_name(f"{name}.{filename}")
+        signature = artifact.with_name(f"{name}.{filename}.sig")
         document_digest = _digest_file(document)[0]
         signature_digest = _digest_file(signature)[0]
         for field, actual in (
@@ -987,6 +1062,11 @@ async def ci_publish_release(value: CiPublish, request: Request) -> dict[str, An
     _ci_by_ip.enforce(client, "ci release calls")
     _require_publish_token(request)
     signature, stable_signature = _validate_ci_publish(value)
+    with _publication_lock():
+        return _publish_ci_bundle(value, signature, stable_signature)
+
+
+def _publish_ci_bundle(value: CiPublish, signature: bytes, stable_signature: bytes) -> dict[str, Any]:
 
     name = _safe_name(
         _canonical_artifact(value.version, value.platform, value.arch, value.format)
@@ -994,77 +1074,65 @@ async def ci_publish_release(value: CiPublish, request: Request) -> dict[str, An
     staged = _staged(name)
     if not staged.is_file():
         raise HTTPException(404, f"staged artifact is missing from incoming/: {name}")
-    digest, size = _digest_file(staged)
-    if digest != value.sha256 or size != value.size:
-        # A truncated or swapped upload must not linger under a canonical name
-        # where the next run's publish would find and trust it.
-        staged.unlink(missing_ok=True)
-        raise HTTPException(
-            422, "staged artifact digest or size does not match the publication"
-        )
-    for signed_version, blob, field in (
-        (value.version, signature, "signature"),
-        (value.stable_version, stable_signature, "stable_signature"),
-    ):
-        try:
-            _verify_artifact_signature(
-                value.key_id, signed_version, value.platform, value.arch, digest, blob
-            )
-        except HTTPException as exc:
-            if exc.status_code == 422 and field == "stable_signature":
-                raise HTTPException(
-                    422, "stable_signature does not match the stable release identity"
-                ) from exc
-            raise
-
     artifact_key = f"{_CI_CHANNEL}/{value.version}/{name}"
     if _release_exists(
         _CI_CHANNEL, value.version, value.platform, value.arch, value.format
     ):
         raise HTTPException(409, "release identity is immutable and already registered")
-    sidecars, columns = _collect_ci_sidecars(value, name, artifact_key)
-
-    destination = _store_path(artifact_key)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    moved = [(staged, destination)]
-    moved.extend(
-        (path, destination.with_name(destination.name + suffix))
-        for suffix, path in sidecars.items()
-    )
-    for source, target in moved:
-        # Same filesystem in every supported layout, but replace() across
-        # devices raises; shutil.move handles both and is still atomic-ish
-        # within a device.
-        shutil.move(str(source), str(target))
-
-    columns.update(
-        {
-            "channel": _CI_CHANNEL,
-            "version": value.version,
-            "min_supported": value.min_supported,
-            "platform": value.platform,
-            "arch": value.arch,
-            "format": value.format,
-            "key_id": value.key_id,
-            "sha256": digest,
-            "size": size,
-            "signature": value.signature,
-            "notes_url": value.notes_url,
-            "artifact_key": artifact_key,
-            "stable_version": value.stable_version,
-            "stable_signature": value.stable_signature,
-        }
-    )
-    _insert_release_row(columns, ("stable_version", "stable_signature"))
+    with capture_bundle(staged, evidence=value.evidence is not None) as artifact:
+        digest, size = _digest_file(artifact)
+        if digest != value.sha256 or size != value.size:
+            raise HTTPException(422, "staged artifact digest or size does not match the publication")
+        for signed_version, blob, field in (
+            (value.version, signature, "signature"),
+            (value.stable_version, stable_signature, "stable_signature"),
+        ):
+            try:
+                _verify_artifact_signature(
+                    value.key_id, signed_version, value.platform, value.arch, digest, blob
+                )
+            except HTTPException as exc:
+                if exc.status_code == 422 and field == "stable_signature":
+                    raise HTTPException(
+                        422, "stable_signature does not match the stable release identity"
+                    ) from exc
+                raise
+        sidecars, columns = _collect_ci_sidecars(value, artifact, artifact_key)
+        identity = {**value.model_dump(), **columns}
+        parsed = verify_bundle(
+            artifact, identity, _RELEASE_PUBLIC_KEYS,
+            evidence=value.evidence is not None,
+        )
+        columns["native_publisher_verified"] = native_publisher_verified(
+            parsed, identity, _RELEASE_PUBLIC_KEYS,
+        )
+        destination = _store_path(artifact_key)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        moved = [(artifact, destination)]
+        moved.extend(
+            (path, destination.with_name(destination.name + suffix))
+            for suffix, path in sidecars.items()
+        )
+        for source, target in moved:
+            shutil.move(str(source), str(target))
+        columns.update(
+            {
+                "channel": _CI_CHANNEL, "version": value.version,
+                "min_supported": value.min_supported, "platform": value.platform,
+                "arch": value.arch, "format": value.format, "key_id": value.key_id,
+                "sha256": digest, "size": size, "signature": value.signature,
+                "notes_url": value.notes_url, "artifact_key": artifact_key,
+                "stable_version": value.stable_version,
+                "stable_signature": value.stable_signature,
+            }
+        )
+        _insert_release_row(columns, ("stable_version", "stable_signature"))
+    for suffix in ("", *sidecars):
+        staged.with_name(staged.name + suffix).unlink(missing_ok=True)
     return {
-        "ok": True,
-        "channel": _CI_CHANNEL,
-        "version": value.version,
-        "format": value.format,
-        "stable_version": value.stable_version,
-        "artifact_key": artifact_key,
-        "sha256": digest,
-        "size": size,
+        "ok": True, "channel": _CI_CHANNEL, "version": value.version,
+        "format": value.format, "stable_version": value.stable_version,
+        "artifact_key": artifact_key, "sha256": digest, "size": size,
         "evidence_complete": value.evidence is not None,
         "stored": [str(target.relative_to(_store_dir())) for _, target in moved],
     }
@@ -1311,7 +1379,10 @@ async def list_release_manifests(request: Request) -> list[dict[str, Any]]:
             SELECT *,
                    (stable_version IS NOT NULL AND stable_signature IS NOT NULL)
                        AS has_stable_pair,
-                   ({_EVIDENCE_COMPLETE_SQL}) AS evidence_complete
+                   ({_EVIDENCE_COMPLETE_SQL}) AS evidence_complete,
+                   (channel = 'beta' AND stable_version IS NOT NULL
+                    AND stable_signature IS NOT NULL AND ({_EVIDENCE_COMPLETE_SQL})
+                    AND (platform = 'linux' OR native_publisher_verified)) AS promotable
               FROM releases
              ORDER BY published_at DESC, channel, platform, arch, format
             """
@@ -1382,6 +1453,11 @@ async def promote_release(value: PromoteRelease, request: Request) -> dict[str, 
     needs no key on this host and cannot be turned into a signing oracle.
     """
     _require_admin(request)
+    with _publication_lock():
+        return _promote_release(value)
+
+
+def _promote_release(value: PromoteRelease) -> dict[str, Any]:
     if value.channel != _CI_CHANNEL:
         raise HTTPException(422, "only beta releases can be promoted")
     _parse_prerelease_version(value.version, "version")
@@ -1431,14 +1507,13 @@ async def promote_release(value: PromoteRelease, request: Request) -> dict[str, 
         raise HTTPException(
             409, "beta artifact bytes are not present on this host; cannot promote"
         )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    for suffix in _ARTIFACT_SUFFIXES:
-        sidecar = source.with_name(source.name + suffix)
-        if not sidecar.is_file():
-            raise HTTPException(
-                409, f"beta sidecar is missing on this host; cannot promote: {sidecar.name}"
-            )
-        shutil.copyfile(sidecar, destination.with_name(destination.name + suffix))
+    with capture_bundle(source) as artifact:
+        parsed = verify_bundle(artifact, row, _RELEASE_PUBLIC_KEYS)
+        native_publisher_verified(parsed, row, _RELEASE_PUBLIC_KEYS, required=True)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        for suffix in _ARTIFACT_SUFFIXES:
+            sidecar = artifact.with_name(artifact.name + suffix)
+            shutil.copyfile(sidecar, destination.with_name(destination.name + suffix))
 
     promoted = {column: row.get(column) for column in _RELEASE_COLUMNS}
     promoted.update(

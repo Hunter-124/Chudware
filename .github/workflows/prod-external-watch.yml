@@ -22,7 +22,11 @@ jobs:
   # Keep this id exactly `watch`: verify-ci-workflows.py grants the off-box
   # cc-artifact-host exception to this exact workflow/job pair only.
   watch:
-    runs-on: [self-hosted, linux, x64, cc-artifact-host]
+    if: ${{ github.ref_protected && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+    environment: chudware-control-protected
+    runs-on:
+      group: chudware-trusted-protected
+      labels: [self-hosted, linux, x64, cc-artifact-host]
     timeout-minutes: 4
     env:
       HEALTH_URL: https://app.chudware.com/healthz

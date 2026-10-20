@@ -262,7 +262,7 @@ def test_ample_pooled_turn_records_reported_actuals(monkeypatch):
         },
         events.append,
     )
-    assert out["ok"] is True
+    assert out["ok"] is True, out
     assert len(host.turns) == 1
     usage = next(event for event in events if event.get("kind") == "agent.provider_usage")
     assert usage["model"] == "vendor/cheap"
@@ -457,3 +457,31 @@ def test_ten_repeated_kills_drain_balance_then_preflight_refuses():
         row for row in _ledger("spend") if '"state":"reserved"' in row["note"]
     ]) == 10
 
+
+
+def test_paid_checkout_claim_and_credit_ledger_roll_back_together(monkeypatch):
+    monkeypatch.setattr(billing.settings, "stripe_price_credits_starter", "price_atomic")
+    monkeypatch.setattr(billing, "_stripe", lambda: SimpleNamespace(api_key=""))
+    obj = {
+        "id": "cs_atomic", "mode": "payment", "payment_status": "paid",
+        "client_reference_id": "buyer@example.com", "payment_intent": "pi_atomic",
+        "line_items": {"data": [{
+            "price": {"id": "price_atomic", "metadata": {"chud_credits": "8000"}},
+        }]},
+    }
+    event = {"id": "evt_atomic", "type": "checkout.session.completed", "data": {"object": obj}}
+    # No account: consumer failure must release both deduplication identities.
+    with pytest.raises(LookupError, match="account not found"):
+        billing._process_event_once(event)
+    with tx() as cur:
+        for table in ("billing_checkout_settlements", "credit_ledger", "processed_events"):
+            cur.execute(f"SELECT count(*) AS n FROM {table}")
+            assert cur.fetchone()["n"] == 0
+    _account()
+    assert billing._process_event_once(event) is True
+    obj["payment_status"] = "paid"
+    event["id"] = "evt_atomic_success"
+    event["type"] = "checkout.session.async_payment_succeeded"
+    assert billing._process_event_once(event) is True
+    assert _balance() == 8000
+    assert len(_ledger("purchase")) == 1

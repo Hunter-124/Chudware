@@ -618,7 +618,7 @@ def main(argv: list[str]) -> int:
             res["installer"] = str(installer)
             res["artifact_signing_request"] = str(
                 write_artifact_signing_request(
-                    installer, str(res["key_id"]), args.version, "windows", "x86_64"
+                    installer, str(res["key_id"]), version, "windows", "x86_64"
                 )
             )
     except (

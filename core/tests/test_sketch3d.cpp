@@ -49,6 +49,26 @@ double dist3(const json& a, const json& b) {
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
+Eigen::Vector3d vec3(const json& p) {
+    return {p[0].get<double>(), p[1].get<double>(), p[2].get<double>()};
+}
+Eigen::Vector3d center3(const json& arc) {
+    Eigen::Vector3d a = vec3(arc["p1"]), u = vec3(arc["pm"]) - a, v = vec3(arc["p2"]) - a;
+    Eigen::Vector3d n = u.cross(v);
+    return a + (u.squaredNorm() * v.cross(n) + v.squaredNorm() * n.cross(u)) / (2 * n.squaredNorm());
+}
+double radius3(const json& arc) { return (vec3(arc["p1"]) - center3(arc)).norm(); }
+Eigen::Vector3d tangent3(const json& arc, const char* end) {
+    Eigen::Vector3d n = (vec3(arc["pm"]) - vec3(arc["p1"])).cross(
+        vec3(arc["p2"]) - vec3(arc["p1"]));
+    return n.cross(vec3(arc[end]) - center3(arc)).normalized();
+}
+json plane_rel(const char* type, std::vector<const char*> refs, const json& plane) {
+    json c = rel("c2", type, refs);
+    c["plane"] = plane;
+    return c;
+}
+
 }  // namespace
 
 TEST_CASE("coincident pulls endpoints together; fix pins the anchor") {
@@ -296,4 +316,224 @@ TEST_CASE("eq_curve3d: endpoint is a valid coincident target and stays pinned") 
     // eq_curve3d endpoint never moves (equation-fixed); the line's p1 is pulled to it.
     CHECK(dist3(sol.entities["e1"]["p2"], json::array({10.0, 0.0, 0.0})) < 1e-6);
     CHECK(dist3(sol.entities["e2"]["p1"], sol.entities["e1"]["p2"]) < 1e-6);
+}
+
+TEST_CASE("3D tangent aligns line and arc directions at their coincident endpoint") {
+    json sk{{"entities", {arc3("e1", {10, 0, 0}, {std::sqrt(50.), std::sqrt(50.), 0}, {0, 10, 0}),
+                          line("e2", 10, 0, 0, 10.7, 7, 1)}},
+            {"constraints", {rel("c1", "fix", {"e1"}), rel("c2", "fix", {"e2.p1"}),
+                              rel("c3", "tangent", {"e1", "e2"})}}};
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(sol.converged);
+    CHECK(sol.skipped.empty());
+    Eigen::Vector3d direction = (vec3(sol.entities["e2"]["p2"]) - vec3(sol.entities["e2"]["p1"])).normalized();
+    CHECK(direction.cross(tangent3(sol.entities["e1"], "p1")).norm() < 1e-7);
+    CHECK(sol.dof == 1); // the tangent line's length remains editable
+}
+
+TEST_CASE("3D tangent joins two arcs at the selected end without imposing equal radius") {
+    json sk{{"entities", {arc3("e1", {10, 0, 0}, {std::sqrt(50.), std::sqrt(50.), 0}, {0, 10, 0}),
+                          arc3("e2", {0, 10, 0}, {7, 13, .4}, {10, 20, 1})}},
+            {"constraints", {rel("c1", "fix", {"e1"}), rel("c2", "fix", {"e2.p1"}),
+                              rel("c3", "tangent", {"e1.p2", "e2.p1"})}}};
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(sol.converged);
+    CHECK(sol.skipped.empty());
+    CHECK(tangent3(sol.entities["e1"], "p2").cross(tangent3(sol.entities["e2"], "p1")).norm() < 1e-7);
+}
+
+TEST_CASE("3D tangent uses the interpolated spline endpoint derivative, not its first chord") {
+    json spline{{"id", "e1"}, {"type", "spline"}, {"points", {{0, 0, 0}, {5, 3, 2}, {10, 0, 4}}}};
+    json sk{{"entities", {spline, line("e2", 0, 0, 0, -3, 1, .2)}},
+            {"constraints", {rel("c1", "fix", {"e1"}), rel("c2", "fix", {"e2.p1"}),
+                              rel("c3", "tangent", {"e1.p0", "e2"})}}};
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(sol.converged);
+    CHECK(sol.skipped.empty());
+    // Equal chord lengths: the quadratic end derivative is (-3 P0 + 4 P1 - P2)/2h.
+    Eigen::Vector3d expected(10, 12, 4);
+    Eigen::Vector3d actual = vec3(sol.entities["e2"]["p2"]) - vec3(sol.entities["e2"]["p1"]);
+    CHECK(actual.normalized().cross(expected.normalized()).norm() < 1e-7);
+}
+
+TEST_CASE("3D equal preserves editable line lengths and arc radii") {
+    SUBCASE("lines") {
+        json sk{{"entities", {line("e1", 0, 0, 0, 10, 0, 0), line("e2", 1, 3, 2, 7, 7, 4)}},
+                {"constraints", {rel("c1", "fix", {"e1"}), rel("c2", "equal", {"e1", "e2"})}}};
+        auto sol = solve_sketch3d(sk, json::object());
+        REQUIRE(sol.converged);
+        CHECK(sol.skipped.empty());
+        CHECK(dist3(sol.entities["e2"]["p1"], sol.entities["e2"]["p2"]) == doctest::Approx(10.).epsilon(1e-7));
+    }
+    SUBCASE("arcs") {
+        json sk{{"entities", {arc3("e1", {0, 0, 0}, {5, 5, 0}, {10, 0, 0}),
+                              arc3("e2", {20, 0, 1}, {26, 6, 1}, {32, 0, 1})}},
+                {"constraints", {rel("c1", "fix", {"e1"}), rel("c2", "equal", {"e1", "e2"})}}};
+        auto sol = solve_sketch3d(sk, json::object());
+        REQUIRE(sol.converged);
+        CHECK(sol.skipped.empty());
+        CHECK(radius3(sol.entities["e2"]) == doctest::Approx(5.).epsilon(1e-7));
+    }
+}
+
+TEST_CASE("3D midpoint targets a line midpoint and an arc mid-sweep, not the through point") {
+    SUBCASE("line") {
+        json sk{{"entities", {line("e1", 1, 2, 3, 9, 6, 7), point("e2", 6, 3, 4)}},
+                {"constraints", {rel("c1", "fix", {"e1"}), rel("c2", "midpoint", {"e2.p", "e1"})}}};
+        auto sol = solve_sketch3d(sk, json::object());
+        REQUIRE(sol.converged);
+        CHECK(sol.skipped.empty());
+        CHECK(dist3(sol.entities["e2"]["p"], json::array({5, 4, 5})) < 1e-7);
+    }
+    SUBCASE("arc") {
+        json sk{{"entities", {arc3("e1", {10, 0, 0}, {8, 6, 0}, {0, 10, 0}), point("e2", 6, 8, 1)}},
+                {"constraints", {rel("c1", "fix", {"e1"}), rel("c2", "midpoint", {"e2.p", "e1"})}}};
+        auto sol = solve_sketch3d(sk, json::object());
+        REQUIRE(sol.converged);
+        CHECK(sol.skipped.empty());
+        CHECK(dist3(sol.entities["e2"]["p"], json::array({std::sqrt(50.), std::sqrt(50.), 0})) < 1e-7);
+    }
+}
+
+TEST_CASE("3D collinear removes offset as well as angular error") {
+    json sk{{"entities", {line("e1", 0, 0, 0, 10, 0, 0), line("e2", 1, 2, 1, 8, 3, -1)}},
+            {"constraints", {rel("c1", "fix", {"e1"}), rel("c2", "collinear", {"e1", "e2"})}}};
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(sol.converged);
+    CHECK(sol.skipped.empty());
+    for (const char* end : {"p1", "p2"}) CHECK(vec3(sol.entities["e2"][end]).tail<2>().norm() < 1e-7);
+    CHECK(sol.dof == 2);
+}
+
+TEST_CASE("3D concentric aligns arc centers while leaving their radii independent") {
+    json sk{{"entities", {arc3("e1", {0, 0, 0}, {5, 5, 0}, {10, 0, 0}),
+                          arc3("e2", {1, 1, 1}, {5, 7, 1}, {9, 1, 1})}},
+            {"constraints", {rel("c1", "fix", {"e1"}), rel("c2", "concentric", {"e1", "e2"})}}};
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(sol.converged);
+    CHECK(sol.skipped.empty());
+    CHECK((center3(sol.entities["e1"]) - center3(sol.entities["e2"])).norm() < 1e-7);
+    CHECK(sol.dof == 6);
+}
+
+TEST_CASE("3D coradial aligns both the center and radius") {
+    json sk{{"entities", {arc3("e1", {0, 0, 0}, {5, 5, 0}, {10, 0, 0}),
+                          arc3("e2", {1, 1, 1}, {5, 7, 1}, {9, 1, 1})}},
+            {"constraints", {rel("c1", "fix", {"e1"}), rel("c2", "coradial", {"e1", "e2"})}}};
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(sol.converged);
+    CHECK(sol.skipped.empty());
+    CHECK((center3(sol.entities["e1"]) - center3(sol.entities["e2"])).norm() < 1e-7);
+    CHECK(radius3(sol.entities["e2"]) == doctest::Approx(5.).epsilon(1e-7));
+    CHECK(sol.dof == 5);
+}
+
+TEST_CASE("3D on_plane uses the engine datum convention and constrains whole curves") {
+    json entities, c;
+    SUBCASE("front is XZ") {
+        entities = {point("e1", 1, 2, 3)};
+        c = plane_rel("on_plane", {"e1"}, "front");
+    }
+    SUBCASE("top is XY") {
+        entities = {line("e1", 1, 2, 3, 4, 5, 6)};
+        c = plane_rel("on_plane", {"e1"}, "top");
+    }
+    SUBCASE("right is YZ") {
+        entities = {arc3("e1", {1, 0, 0}, {2, 5, 5}, {1, 10, 0})};
+        c = plane_rel("on_plane", {"e1"}, "right");
+    }
+    json sk{{"entities", entities}, {"constraints", {c}}};
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(sol.converged);
+    CHECK(sol.skipped.empty());
+    int coordinate = c["plane"] == "front" ? 1 : c["plane"] == "top" ? 2 : 0;
+    const auto& e = sol.entities["e1"];
+    for (const char* key : {"p", "p1", "pm", "p2"})
+        if (e.contains(key)) CHECK(std::abs(e[key][coordinate].get<double>()) < 1e-7);
+}
+
+TEST_CASE("3D parallel_plane leaves the line offset unchanged and removes normal direction") {
+    json sk{{"entities", {line("e1", 1, 2, 3, 8, 6, 5)}},
+            {"constraints", {plane_rel("parallel_plane", {"e1"}, "top")}}};
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(sol.converged);
+    CHECK(sol.skipped.empty());
+    CHECK(sol.entities["e1"]["p1"][2].get<double>() == doctest::Approx(4.).epsilon(1e-7));
+    CHECK(sol.entities["e1"]["p2"][2].get<double>() == doctest::Approx(4.).epsilon(1e-7));
+    CHECK(sol.dof == 5);
+}
+
+TEST_CASE("3D normal_plane accepts a normalized arbitrary working plane") {
+    json plane{{"origin", {4, 5, 6}}, {"normal", {2, 2, 0}}};
+    json sk{{"entities", {line("e1", 0, 0, 0, 8, 6, 1)}},
+            {"constraints", {plane_rel("normal_plane", {"e1"}, plane)}}};
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(sol.converged);
+    CHECK(sol.skipped.empty());
+    Eigen::Vector3d d = vec3(sol.entities["e1"]["p2"]) - vec3(sol.entities["e1"]["p1"]);
+    CHECK(d.cross(Eigen::Vector3d(1, 1, 0)).norm() < 1e-7);
+    CHECK(sol.dof == 4);
+}
+
+TEST_CASE("3D symmetric mirrors points about an offset, tilted working plane") {
+    json plane{{"origin", {1, 2, 3}}, {"normal", {2, 2, 0}}};
+    json sk{{"entities", {point("e1", 5, 6, 7), point("e2", -2, -1, 8)}},
+            {"constraints", {rel("c1", "fix", {"e1"}), plane_rel("symmetric", {"e1.p", "e2.p"}, plane)}}};
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(sol.converged);
+    CHECK(sol.skipped.empty());
+    CHECK(dist3(sol.entities["e2"]["p"], json::array({-3, -2, 7})) < 1e-7);
+    CHECK(sol.dof == 0);
+}
+
+TEST_CASE("3D point_on spline projects onto the interpolated curve from a perturbed point") {
+    // All points lie on y=x^2/10 and z=0, with equal chord lengths on each half.
+    // The three-point OCCT interpolation is the corresponding quadratic in chord parameter.
+    json spline{{"id", "e1"}, {"type", "spline"}, {"points", {{-10, 10, 0}, {0, 0, 0}, {10, 10, 0}}}};
+    json sk{{"entities", {spline, point("e2", 4, 2.8, 1.2)}},
+            {"constraints", {rel("c1", "fix", {"e1"}), rel("c2", "point_on", {"e2.p", "e1"})}}};
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(sol.converged);
+    CHECK(sol.skipped.empty());
+    const auto p = vec3(sol.entities["e2"]["p"]);
+    CHECK(std::abs(p.z()) < 1e-7);
+    CHECK(std::abs(p.y() - p.x() * p.x() / 10) < 1e-7);
+    CHECK(sol.dof == 1); // sliding along the spline must remain a genuine free DOF
+    REQUIRE(sol.entities["e1"]["samples"].size() > 3);
+    for (const auto& sample : sol.entities["e1"]["samples"]) {
+        const auto q = vec3(sample);
+        CHECK(std::abs(q.y() - q.x() * q.x() / 10) < 1e-7);
+    }
+}
+
+TEST_CASE("3D cubic spline point_on and display samples match the compiled interpolation") {
+    json spline{{"id", "e1"}, {"type", "spline"}, {"points", {{0, 0, 0}, {2, 3, 1}, {4, 0, 2}, {6, -3, 3}}}};
+    json sk{{"entities", {spline, point("e2", 3.2, 1.4, 1.8)}},
+            {"constraints", {rel("c1", "fix", {"e1"}), rel("c2", "point_on", {"e2.p", "e1"})}}};
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(sol.converged);
+    CHECK(sol.skipped.empty());
+    CHECK(sol.dof == 1);
+    auto check_curve = [](const json& point) {
+        Eigen::Vector3d p = vec3(point);
+        const double u = p.x() / 2;
+        CHECK(std::abs(p.z() - u) < 1e-7);
+        CHECK(std::abs(p.y() - (u * u * u - 6 * u * u + 8 * u)) < 1e-7);
+    };
+    check_curve(sol.entities["e2"]["p"]);
+    for (const auto& sample : sol.entities["e1"]["samples"]) check_curve(sample);
+}
+
+TEST_CASE("3D unsupported relations and bad planes report skipped ids and reasons") {
+    json sk{{"entities", {point("e1", 1, 2, 3), line("e2", 0, 0, 0, 10, 0, 0)}},
+            {"constraints", {rel("c1", "equal", {"e1", "e2"}),
+                              plane_rel("on_plane", {"e1"}, json{{"origin", {0, 0, 0}}, {"normal", {0, 0, 0}}}),
+                              rel("c3", "midpoint", {"e9.p", "e2"})}}};
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(sol.skipped.size() == 3);
+    CHECK(sol.skipped[0].first == "c1");
+    CHECK(sol.skipped[1].first == "c2");
+    CHECK(sol.skipped[2].first == "c3");
+    for (const auto& skipped : sol.skipped) CHECK_FALSE(skipped.second.empty());
+    CHECK(sol.dof == 9);
 }

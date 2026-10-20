@@ -26,6 +26,15 @@
 #include <string>
 #include <vector>
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <cerrno>
+#include <csignal>
+#include <new>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepGProp.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
@@ -498,5 +507,74 @@ TEST_CASE("fillet: isolated blend survives allocator pressure from other threads
     // survived through the in-process fallback - which is worth failing the build over, because
     // it is the daemon that loses its crash containment.
     CHECK(ms < 4000.0);
+#endif
+}
+
+TEST_CASE("advisory isolation returns payload without changing parent inputs") {
+    using namespace std::chrono_literals;
+    using chudware::util::IsolatedTaskStatus;
+    int source = 7;
+    const auto result = chudware::util::isolate_task([&] {
+        source = 99;
+        return std::string("candidate diagnostics");
+    }, std::chrono::steady_clock::now() + 2s);
+#if defined(__unix__) || defined(__APPLE__)
+    REQUIRE(result.status == IsolatedTaskStatus::completed);
+    CHECK(result.payload == "candidate diagnostics");
+#else
+    CHECK(result.status == IsolatedTaskStatus::unavailable);
+#endif
+    CHECK(source == 7);
+}
+
+TEST_CASE("advisory isolation kills cumulative slow probes without a parent fallback") {
+#if defined(__unix__) || defined(__APPLE__)
+    using namespace std::chrono_literals;
+    struct Shared {
+        std::atomic<long> child{0};
+        std::atomic<int> completed{0};
+    };
+    void* memory = ::mmap(nullptr, sizeof(Shared), PROT_READ | PROT_WRITE,
+                          MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    REQUIRE(memory != MAP_FAILED);
+    auto* shared = new (memory) Shared;
+    const auto started = std::chrono::steady_clock::now();
+    int source = 7;
+    const auto result = chudware::util::isolate_task([&] {
+        shared->child.store(static_cast<long>(::getpgrp()));
+        source = 99;
+        for (int probe = 0; probe < 20; ++probe) {
+            // Every probe individually fits, but their cumulative work does not.
+            chudware::util::isolate_shape_build([&] {
+                std::this_thread::sleep_for(100ms);
+                shared->completed.fetch_add(1);
+                return TopoDS_Shape();
+            }, 2s);
+        }
+        return std::string("must not finish");
+    }, started + 250ms);
+    const long child = shared->child.load();
+    CHECK(result.status == chudware::util::IsolatedTaskStatus::timed_out);
+    CHECK(result.payload.empty());
+    CHECK(source == 7);
+    CHECK(shared->completed.load() < 20);
+    CHECK(std::chrono::steady_clock::now() - started < 3s);
+    if (child > 0) {
+        CHECK(::kill(static_cast<pid_t>(child), 0) == -1);
+        CHECK(errno == ESRCH);
+        int status;
+        CHECK(::waitpid(static_cast<pid_t>(child), &status, WNOHANG) == -1);
+        CHECK(errno == ECHILD);
+    }
+    const int finished = shared->completed.load();
+    std::this_thread::sleep_for(150ms);
+    CHECK(shared->completed.load() == finished);  // no surviving native probe
+    shared->~Shared();
+    ::munmap(memory, sizeof(Shared));
+    // A timeout does not retire isolation or launch an unbounded retry.
+    const auto healthy = chudware::util::isolate_task([] { return std::string("ok"); },
+                                                     std::chrono::steady_clock::now() + 2s);
+    CHECK(healthy.status == chudware::util::IsolatedTaskStatus::completed);
+    CHECK(healthy.payload == "ok");
 #endif
 }

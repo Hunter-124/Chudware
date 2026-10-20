@@ -2,42 +2,85 @@
 # ===========================================================================
 #  install_webd.sh — promote one validated engine + WASM release to webd.
 # ---------------------------------------------------------------------------
-#  The engine and browser bundle are built/staged as one immutable release,
-#  validated before the live `current` symlink moves, and restarted only after
-#  authenticated gateway telemetry proves no engine bridges are active.
-#  Superseded releases are retained rather than deleted, so rollback.sh always
-#  has a validated tree to go back to.
+# The browser gateway launches workspace cells from the retained payload. The
+# optional shared daemon serves local/native clients only; this script never
+# enables, stops or restarts it. --restart requests a drained cell-payload cutover.
 # ===========================================================================
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-DST="${CHUDWARE_WEB_HOME:-$HOME/chudware-web}"
+ENVIRONMENT="${CHUDWARE_DEPLOY_ENV:-prod}"
+case "$ENVIRONMENT" in
+  prod)
+    [[ "$(id -un)" != chudware-staging ]] || { echo "REFUSED: staging identity cannot deploy production" >&2; exit 4; }
+    DST="${CHUDWARE_WEB_HOME:-$HOME/chudware-web}"
+    KEY="chudwareweb"
+    HOSTD_UNIT="chudware-hostd.service"
+    GATEWAY_UNIT="chudware-gateway.service"
+    DATA_DEFAULT="$HOME/chudware-web-data"
+    GATEWAY_PORT=8300
+    WORKSPACE_DEFAULT="$HOME/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build"
+    SERVICE_USER="!chudware-staging"
+    ;;
+  staging)
+    [[ "$(id -un)" = chudware-staging && "$HOME" = /var/lib/chudware-staging ]] \
+      || { echo "REFUSED: staging requires the dedicated chudware-staging account and home" >&2; exit 4; }
+    DST="${CHUDWARE_WEB_HOME:-$HOME/chudware-web-staging}"
+    KEY="chudwareweb-staging"
+    HOSTD_UNIT="chudware-hostd-staging.service"
+    GATEWAY_UNIT="chudware-gateway-staging.service"
+    DATA_DEFAULT="$HOME/chudware-web-staging"
+    GATEWAY_PORT=8310
+    WORKSPACE_DEFAULT="$DST/workspace"
+    SERVICE_USER="chudware-staging"
+    ;;
+  *) echo "REFUSED: CHUDWARE_DEPLOY_ENV must be prod or staging" >&2; exit 4 ;;
+esac
+export CHUDWARE_DEPLOY_ENV="$ENVIRONMENT"
 RELEASES="$DST/releases"
 BIN="$DST/bin"
 APP="$DST/app"
-KEY="chudwareweb"
-WORKSPACE_DEFAULT="$HOME/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build"
 WORKSPACE_ROOT="${CHUDWARE_WORKSPACE_ROOT:-$WORKSPACE_DEFAULT}"
-RESTART=0
+# Every live payload/policy install uses the same maintenance cutover.
+MUTATED=0
+FIRST_CUTOVER_ACK=""
 
-case "$#:${1:-}" in
-  0:) ;;
-  1:--restart) RESTART=1 ;;
-  *) echo "usage: $0 [--restart]" >&2; exit 2 ;;
-esac
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --restart) shift ;;
+    --first-cutover-ack)
+      [[ $# -ge 2 ]] || { echo "missing acknowledgment path" >&2; exit 2; }
+      FIRST_CUTOVER_ACK="$2"; shift 2 ;;
+    *) echo "usage: $0 [--restart] [--first-cutover-ack PATH]" >&2; exit 2 ;;
+  esac
+done
 
 fatal() {
   echo "[webd] ERROR: $*" >&2
-  exit 1
+  if [[ "$MUTATED" = 0 ]]; then exit 4; else exit 1; fi
 }
 
 # Match update.sh's pre-mutation refusal contract. Call only before service
 # definitions, the live release, or running services have been changed.
 refuse() {
   echo "[webd] REFUSED: $*" >&2
-  echo "[webd] live release and running services were not changed" >&2
-  exit 4
+  if [[ "$MUTATED" = 0 ]]; then
+    echo "[webd] live release and running services were not changed" >&2
+    exit 4
+  fi
+  exit 1
 }
+
+preflight_exit() {
+  local rc=$?
+  trap - EXIT
+  if [[ "$rc" != 0 ]]; then
+    if [[ "${DRAIN_ACQUIRED:-0}" = 1 ]]; then deployment_drain_abort || true; fi
+    if [[ "$MUTATED" = 0 ]]; then rc=4; else rc=1; fi
+  fi
+  exit "$rc"
+}
+trap preflight_exit EXIT
 
 # Retention depth for `releases/`, counting the release this run promotes. Before
 # this existed the previous release was deleted the instant a promotion succeeded,
@@ -45,8 +88,8 @@ refuse() {
 # Validated here rather than at GC time: the GC runs after a ~20 minute build and
 # a service restart, and discovering a typo'd retention count there is useless.
 KEEP_RELEASES="${CHUDWARE_WEBD_KEEP_RELEASES:-3}"
-[[ "$KEEP_RELEASES" =~ ^[0-9]+$ ]] && [ "$KEEP_RELEASES" -ge 1 ] \
-  || fatal "CHUDWARE_WEBD_KEEP_RELEASES must be an integer >= 1 (got '$KEEP_RELEASES')"
+[[ "$KEEP_RELEASES" =~ ^[0-9]+$ ]] && [ "$KEEP_RELEASES" -ge 2 ] \
+  || fatal "CHUDWARE_WEBD_KEEP_RELEASES must retain the current and at least one prior payload (integer >= 2)"
 
 PYTHON="$ROOT/Webservice/gateway/.venv/bin/python"
 if [ ! -x "$PYTHON" ]; then
@@ -57,26 +100,47 @@ command -v sha256sum >/dev/null 2>&1 || fatal "sha256sum is required"
 command -v curl >/dev/null 2>&1 || fatal "curl is required"
 command -v systemctl >/dev/null 2>&1 || fatal "systemctl is required"
 
+DATA_ROOT="${CHUDWARE_WEB_DATA:-$DATA_DEFAULT}"
+GATEWAY_ENV="${CHUDWARE_WEB_GATEWAY_ENV:-$DATA_ROOT/gateway.env}"
+GATEWAY_PY="${CHUDWARE_GATEWAY_PYTHON:-$ROOT/Webservice/gateway/.venv/bin/python}"
+source "$ROOT/Webservice/deploy/deployment_drain.sh" || refuse "private maintenance channel is invalid"
+[[ -x "$GATEWAY_PY" ]] || refuse "gateway runtime is unavailable"
+"$GATEWAY_PY" "$ROOT/Webservice/deploy/gateway_preflight.py" validate \
+  --env-file "$GATEWAY_ENV" --environment "$ENVIRONMENT" \
+  || refuse "protected gateway configuration is not release-ready"
+[[ "${CHUDWARE_BASE_PYTHON:-}" = /usr/bin/python3 ]] \
+  || refuse "authenticated cell worker base runtime is required"
+env -i PATH=/usr/bin:/bin /usr/bin/python3 -I -S \
+  "$ROOT/Webservice/deploy/deployment_release.py" runtime-preflight \
+  --repo "$ROOT" --wheelhouse "${CHUDWARE_WHEELHOUSE:-$ROOT/wheelhouse}" \
+  || refuse "authenticated offline cell worker runtime inputs are unavailable"
+TARGET_COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
+AUTHORITY_ARGS=(promotion-preflight --web-home "$DST" --environment "$ENVIRONMENT" \
+  --target-commit "$TARGET_COMMIT")
+[[ -z "$FIRST_CUTOVER_ACK" ]] || AUTHORITY_ARGS+=(--first-cutover-ack "$FIRST_CUTOVER_ACK")
+env -i PATH=/usr/bin:/bin /usr/bin/python3 -I -S \
+  "$ROOT/Webservice/deploy/deployment_release.py" "${AUTHORITY_ARGS[@]}" \
+  || refuse "independent prior-payload authority or explicit first-cutover acknowledgment is required"
+deployment_drain_acquire \
+  || refuse "operator maintenance could not prove all work idle and every cell inactive; no cutover"
+MUTATED=1
+
 mkdir -p "$DST" "$RELEASES"
 if [ ! -d "$WORKSPACE_ROOT" ]; then
   mkdir -p "$WORKSPACE_ROOT"
   echo "[webd] created workspace root $WORKSPACE_ROOT"
 fi
 
-# DWG import on the website runs inside the shared hostd: it shells out to LibreDWG's
-# `dwg2dxf` for the 2D entities (DWG export is a native writer and needs no LibreDWG).
-# LibreDWG is GPL-3.0, so it is a server-side subprocess only — never linked into the
-# engine and never part of the browser bundle. hostd looks on its own PATH, then in
-# <XDG_DATA_HOME|~/.local/share>/Chudware/tools/libredwg/bin (core/doc/dwg.cpp
-# libredwg_tool). Provision that managed copy for the environment the hostd unit
-# actually runs with; a verified install returns at once with no network access, a
-# first install fetches the SHA256-pinned source release and needs a C toolchain.
+# Legacy local/native LibreDWG provisioning is not a browser-cell readiness proof:
+# the managed HOME copy is outside the retained cell payload. Cell converter
+# availability requires independent runtime-image qualification. This step does
+# not start, stop or restart the optional local/native daemon.
 UNIT_XDG_DATA_HOME="$(systemctl --user show-environment 2>/dev/null |
   sed -n 's/^XDG_DATA_HOME=//p')"
 if ! LIBREDWG_LOG="$(env -u APPDATA XDG_DATA_HOME="$UNIT_XDG_DATA_HOME" \
     "$PYTHON" "$ROOT/scripts/provision_libredwg.py" 2>&1)"; then
   printf '%s\n' "$LIBREDWG_LOG" >&2
-  refuse "LibreDWG provisioning failed; web DWG import would be unavailable (scripts/provision_libredwg.py)"
+  refuse "legacy local/native LibreDWG provisioning failed; cell converter availability remains independently unqualified"
 fi
 echo "[webd] ${LIBREDWG_LOG##*$'\n'}"
 
@@ -96,16 +160,65 @@ done
 
 STAGE_ROOT="$(mktemp -d "$DST/.deploy-staging.XXXXXX")"
 cleanup() {
+  local rc=$?
+  trap - EXIT
   if [ -n "${STAGE_ROOT:-}" ] && [ -d "$STAGE_ROOT" ]; then
     rm -rf "$STAGE_ROOT"
   fi
+  if [[ "$rc" != 0 ]]; then
+    if [[ "${DRAIN_ACQUIRED:-0}" = 1 ]]; then deployment_drain_abort || true; fi
+    if [[ "$MUTATED" = 0 ]]; then rc=4; else rc=1; fi
+  fi
+  exit "$rc"
 }
 trap cleanup EXIT
 
 STAGE_BIN="$STAGE_ROOT/bin"
 STAGE_APP="$STAGE_ROOT/app"
 STAGE_PROMPTS="$STAGE_ROOT/agent/prompts"
-mkdir -p "$STAGE_BIN" "$STAGE_APP" "$STAGE_PROMPTS"
+STAGE_CELL="$STAGE_ROOT/cell"
+mkdir -p "$STAGE_BIN" "$STAGE_APP" "$STAGE_PROMPTS" "$STAGE_CELL/bin" "$STAGE_CELL/units"
+
+# Cells never borrow the gateway venv or repository at runtime. Authenticate the
+# complete offline wheel closure before creating the release-private worker venv.
+CELL_BASE="${CHUDWARE_BASE_PYTHON:-}"
+[[ "$CELL_BASE" = /usr/bin/python3 ]] \
+  || fatal "cell worker runtime requires independently authenticated CHUDWARE_BASE_PYTHON=/usr/bin/python3"
+if ! env -i HOME="$HOME" PATH=/usr/bin:/bin "$CELL_BASE" -I -S - \
+    "$ROOT" "$STAGE_CELL" "${CHUDWARE_WHEELHOUSE:-$ROOT/wheelhouse}" <<'PY'
+import os
+from pathlib import Path
+import shutil
+import sys
+root, stage, wheelhouse = map(Path, sys.argv[1:])
+sys.path.insert(0, str(root))
+from services.installer.provision import ensure_runtime
+temporary = stage / ".worker-runtime"
+result = ensure_runtime(base_python="/usr/bin/python3", wheelhouse=wheelhouse, venv_dir=temporary)
+if result.get("status") != "ready":
+    raise RuntimeError("authenticated cell worker runtime provisioning failed: " + str(result))
+# Retained runtime trees forbid links. Materialize the proven venv (including
+# its base interpreter and lib64 alias) without weakening that policy.
+shutil.copytree(temporary, stage / "venv", symlinks=False)
+shutil.rmtree(temporary)
+for executable in (stage / "venv/bin").iterdir():
+    if executable.is_file():
+        data = executable.read_bytes()
+        if data.startswith(b"#!") and b".worker-runtime/" in data.split(b"\n", 1)[0]:
+            _, rest = data.split(b"\n", 1)
+            executable.write_bytes(b"#!/opt/chudware/venv/bin/python\n" + rest)
+ignore = shutil.ignore_patterns("__pycache__", "*.pyc", "test_*", "tests", "build")
+shutil.copytree(root / "services", stage / "services", symlinks=False, ignore=ignore)
+if (root / "engine").is_dir():
+    shutil.copytree(root / "engine", stage / "engine", symlinks=False, ignore=ignore)
+shutil.copy2(root / "vendor/python/RUNTIME_WHEELS.lock", stage / "RUNTIME_WHEELS.lock")
+for source in (root / "Webservice/deploy/cell").iterdir():
+    if source.is_file() and source.name != "__pycache__":
+        shutil.copy2(source, stage / "bin" / source.name)
+PY
+then
+  fatal "cell worker runtime unavailable: reviewed vendor/python/RUNTIME_WHEELS.lock and complete authenticated offline wheelhouse (including chudcode-rpc==0.3.1) are required; no ambient/index fallback"
+fi
 
 # Stage one engine set. Optional $ORIGIN siblings are copied only from this tree.
 for f in libchudware.so libngcore.so libnglib.so lib3mf.so chudware-hostd; do
@@ -192,6 +305,14 @@ if ! "$PYTHON" "$ROOT/scripts/pin_chudcode.py" stage-notices \
 fi
 cp "$CHUD_LOCK" "$STAGE_ROOT/CHUDCODE_ARTIFACT.lock"
 echo "[webd] staged verified Chudcode binary and notices"
+# The cell mounts only its complete runtime subtree, never the release's app or
+# host-only unit definitions. Materialize trusted engine/artifact siblings.
+cp -aL "$STAGE_BIN/." "$STAGE_CELL/bin/"
+mkdir -p "$STAGE_CELL/agent/prompts"
+cp -aL "$STAGE_PROMPTS/." "$STAGE_CELL/agent/prompts/"
+for identity in CHUDCODE_ARTIFACT.lock CHUDCODE-NOTICE CHUDCODE-THIRD-PARTY-NOTICES.txt; do
+  cp "$STAGE_ROOT/$identity" "$STAGE_CELL/$identity"
+done
 
 # Build WASM into the private release stage, never directly over the live app.
 EMSDK_DIR="${EMSDK:-$HOME/.emsdk}"
@@ -224,7 +345,28 @@ fi
 # hostd/WASM cutover. The manifest is not created until both artifacts validated.
 PROMPTS_DST="$DST/current/agent/prompts"
 sed -e "s|@BIN@|$BIN|g" -e "s|@PROMPTS@|$PROMPTS_DST|g" -e "s|@REPO@|$ROOT|g" \
+  -e "s|@INSTANCE_KEY@|$KEY|g" -e "s|@SERVICE_USER@|$SERVICE_USER|g" \
   "$ROOT/Webservice/deploy/chudware-hostd.service" > "$STAGE_ROOT/chudware-hostd.service"
+if [[ "$ENVIRONMENT" = staging ]]; then
+  mkdir -p "$HOME/.config" "$HOME/.cache" "$HOME/.local/share"
+  cat >> "$STAGE_ROOT/chudware-hostd.service" <<EOF
+
+[Service]
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=$DST $HOME/.config $HOME/.cache $HOME/.local/share
+UMask=0077
+EOF
+fi
+cp "$ROOT/Webservice/deploy/chudware-gateway.service" "$STAGE_ROOT/chudware-gateway.service"
+cp "$ROOT/Webservice/deploy/chudware-gateway-staging.service" "$STAGE_ROOT/chudware-gateway-staging.service"
+for unit in chudware-cell@.socket chudware-cell@.service \
+    chudware-egress-broker@.socket chudware-egress-broker@.service; do
+  sed -e "s|@WEB_HOME@|$DST|g" "$ROOT/Webservice/deploy/$unit" > "$STAGE_CELL/units/$unit"
+done
 
 HOSTD_SHA="$(sha256sum "$STAGE_BIN/chudware-hostd" | cut -d' ' -f1)"
 LIB_SHA="$(sha256sum "$STAGE_BIN/libchudware.so" | cut -d' ' -f1)"
@@ -253,8 +395,8 @@ CHUD_LOCK_SHA="$(sha256sum "$STAGE_ROOT/CHUDCODE_ARTIFACT.lock" | cut -d' ' -f1)
 CHUD_NOTICE_SHA="$(sha256sum "$STAGE_ROOT/CHUDCODE-NOTICE" | cut -d' ' -f1)"
 CHUD_THIRD_PARTY_NOTICES_SHA="$(sha256sum "$STAGE_ROOT/CHUDCODE-THIRD-PARTY-NOTICES.txt" | cut -d' ' -f1)"
 HOSTD_UNIT_SHA="$(sha256sum "$STAGE_ROOT/chudware-hostd.service" | cut -d' ' -f1)"
-GATEWAY_UNIT_SHA="$(sha256sum "$ROOT/Webservice/deploy/chudware-gateway.service" | cut -d' ' -f1)"
-STAGING_GATEWAY_UNIT_SHA="$(sha256sum "$ROOT/Webservice/deploy/chudware-gateway-staging.service" | cut -d' ' -f1)"
+GATEWAY_UNIT_SHA="$(sha256sum "$STAGE_ROOT/chudware-gateway.service" | cut -d' ' -f1)"
+STAGING_GATEWAY_UNIT_SHA="$(sha256sum "$STAGE_ROOT/chudware-gateway-staging.service" | cut -d' ' -f1)"
 PROMPTS_SHA="$("$PYTHON" - "$STAGE_PROMPTS" <<'PY'
 from hashlib import sha256
 from pathlib import Path
@@ -265,6 +407,22 @@ for path in sorted(p for p in root.rglob("*") if p.is_file()):
     h.update(path.relative_to(root).as_posix().encode())
     h.update(b"\0")
     h.update(path.read_bytes())
+    h.update(b"\0")
+print(h.hexdigest())
+PY
+)"
+CELL_RUNTIME_SHA="$(env -i PATH=/usr/bin:/bin /usr/bin/python3 -I -S - "$STAGE_CELL" <<'PY'
+from hashlib import sha256
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+h = sha256()
+for path in sorted(p for p in root.rglob("*") if p.is_file()):
+    h.update(path.relative_to(root).as_posix().encode())
+    h.update(b"\0")
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(block)
     h.update(b"\0")
 print(h.hexdigest())
 PY
@@ -280,7 +438,7 @@ CHECKOUT_HEAD="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')"
 JOINT_SHA="$(printf '%s\n' "$HOSTD_SHA" "$LIB_SHA" "$ADVISOR_RUNTIME_SHA" \
   "$WASM_SHA" "$JS_SHA" "$CHUD_SHA" "$CHUD_LOCK_SHA" "$CHUD_NOTICE_SHA" \
   "$CHUD_THIRD_PARTY_NOTICES_SHA" "$HOSTD_UNIT_SHA" "$GATEWAY_UNIT_SHA" \
-  "$STAGING_GATEWAY_UNIT_SHA" "$PROMPTS_SHA" \
+  "$STAGING_GATEWAY_UNIT_SHA" "$PROMPTS_SHA" "$CELL_RUNTIME_SHA" \
   | sha256sum | cut -d' ' -f1)"
 # One clock read feeds both the release id and the manifest timestamp, so the two
 # can never straddle a second boundary and disagree. UTC rather than local time:
@@ -289,10 +447,13 @@ JOINT_SHA="$(printf '%s\n' "$HOSTD_SHA" "$LIB_SHA" "$ADVISOR_RUNTIME_SHA" \
 # which would let the collector reap the newest release instead of the oldest.
 BUILT_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RELEASE_ID="${BUILT_AT_UTC//[:-]/}-${JOINT_SHA:0:12}-$$"
+RELEASE_TREE_SHA="$(env -i PATH=/usr/bin:/bin /usr/bin/python3 -I -S \
+  "$ROOT/Webservice/deploy/deployment_release.py" tree-digest "$STAGE_ROOT")"
 cat > "$STAGE_ROOT/deploy-manifest" <<EOF
-schema=5
+schema=7
 release_id=$RELEASE_ID
 joint_sha256=$JOINT_SHA
+release_tree_sha256=$RELEASE_TREE_SHA
 hostd_sha256=$HOSTD_SHA
 libchudware_sha256=$LIB_SHA
 advisor_runtime_sha256=$ADVISOR_RUNTIME_SHA
@@ -306,6 +467,7 @@ hostd_unit_sha256=$HOSTD_UNIT_SHA
 gateway_unit_sha256=$GATEWAY_UNIT_SHA
 staging_gateway_unit_sha256=$STAGING_GATEWAY_UNIT_SHA
 prompts_sha256=$PROMPTS_SHA
+cell_runtime_sha256=$CELL_RUNTIME_SHA
 wasm_token=$WASM_TOKEN
 checkout_head=$CHECKOUT_HEAD
 source=$SRC
@@ -318,143 +480,19 @@ CURRENT_JOINT=""
 if [ -f "$DST/current/deploy-manifest" ]; then
   CURRENT_JOINT="$(sed -n 's/^joint_sha256=//p' "$DST/current/deploy-manifest" | sed -n '1p')"
 fi
-RUNNING=0
-systemctl --user is-active --quiet chudware-hostd.service && RUNNING=1
-RUNNING_JOINT="$(cat "$DST/.webd-running-joint" 2>/dev/null || true)"
+# The legacy shared daemon is not a browser gateway consumer. Never bounce an
+# active user's daemon during a cell-payload update.
 NEEDS_PROMOTION=0
 [ "$CURRENT_JOINT" = "$JOINT_SHA" ] || NEEDS_PROMOTION=1
-NEEDS_RESTART=0
-if [ "$RESTART" = 1 ] && { [ "$RUNNING" = 0 ] || [ "$RUNNING_JOINT" != "$JOINT_SHA" ]; }; then
-  NEEDS_RESTART=1
-fi
 
-if [ "$RUNNING" = 1 ] && [ "$RESTART" = 0 ] && [ "$NEEDS_PROMOTION" = 1 ]; then
-  refuse "hostd is running; refusing to promote a new joint release without --restart"
-fi
-
-# Read systemd-style KEY=value entries without sourcing a secrets file as shell.
-read_env_value() {
-  "$PYTHON" - "$1" "$2" <<'PY'
-from pathlib import Path
-import shlex
-import sys
-path, key = Path(sys.argv[1]), sys.argv[2]
-value = ""
-for raw in path.read_text(encoding="utf-8").splitlines():
-    line = raw.strip()
-    if not line or line.startswith("#") or "=" not in line:
-        continue
-    name, candidate = line.split("=", 1)
-    if name.strip() != key:
-        continue
-    parts = shlex.split(candidate.strip(), comments=True, posix=True)
-    value = " ".join(parts)
-print(value, end="")
-PY
-}
-with_pgpass() {
-  local dsn="$1"; shift
-  local pgpass rc safe_dsn
-  pgpass="$(mktemp)"
-  chmod 600 "$pgpass"
-  safe_dsn="$(DB_DSN="$dsn" "$PYTHON" - "$pgpass" <<'PY'
-import os, sys
-from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
-d = urlparse(os.environ["DB_DSN"])
-if d.scheme not in {"postgres", "postgresql"}:
-    raise SystemExit("database URL must use PostgreSQL")
-host, port = d.hostname or "localhost", d.port or 5432
-database, user = unquote(d.path.lstrip("/")), unquote(d.username or "")
-password = unquote(d.password or "")
-esc = lambda value: str(value).replace("\\", "\\\\").replace(":", "\\:")
-Path(sys.argv[1]).write_text(":".join(map(esc, (host, port, database, user, password))) + "\n")
-print(f"postgresql://{quote(user, safe='') + '@' if user else ''}{host}:{port}/{quote(database, safe='')}")
-PY
-)" || { rm -f "$pgpass"; return 1; }
-  if PGPASSFILE="$pgpass" "$@" "$safe_dsn"; then rc=0; else rc=$?; fi
-  rm -f "$pgpass"
-  return "$rc"
-}
-
-probe_engine_bridges() {
-  local body
-  if ! body="$(curl -fsS --max-time 3 -b "chudware_sid=$HEALTH_SID" "$HEALTH_URL/healthz")"; then
-    return 1
-  fi
-  HEALTH_JSON="$body" "$PYTHON" -c '
-import json, os
-try:
-    body = json.loads(os.environ["HEALTH_JSON"])
-    n = body["engine_bridges"]
-    if body.get("ok") is not True or type(n) is not int or n < 0:
-        raise ValueError
-    print(n)
-except Exception:
-    raise SystemExit(1)
-'
-}
-
-# A caller can require an idle proof even when hostd itself is unchanged (update.sh
-# does this before bouncing the gateway). Ordinary sync only drains for a real
-# hostd/WASM change. Missing session/account/telemetry is fail-closed.
-REQUIRE_IDLE="${CHUDWARE_WEBD_REQUIRE_IDLE:-0}"
-case "$REQUIRE_IDLE" in 0|1) ;; *) fatal "CHUDWARE_WEBD_REQUIRE_IDLE must be 0 or 1" ;; esac
-if [ "$RUNNING" = 1 ] && { [ "$NEEDS_RESTART" = 1 ] || [ "$REQUIRE_IDLE" = 1 ]; }; then
-  DATA_ROOT="${CHUDWARE_WEB_DATA:-$HOME/chudware-web-data}"
-  GATEWAY_ENV="${CHUDWARE_WEB_GATEWAY_ENV:-$DATA_ROOT/gateway.env}"
-  [ -r "$GATEWAY_ENV" ] || refuse "gateway env unreadable at $GATEWAY_ENV; cannot authenticate drain health"
-  FILE_DATA_ROOT="$(read_env_value "$GATEWAY_ENV" CHUDWARE_WEB_DATA)"
-  [ -z "$FILE_DATA_ROOT" ] || DATA_ROOT="$FILE_DATA_ROOT"
-  DATA_ROOT="${DATA_ROOT/#\~/$HOME}"
-  HEALTH_EMAIL="${CHUDWARE_WEBD_HEALTH_EMAIL:-$(read_env_value "$GATEWAY_ENV" CHUDWARE_WEBD_HEALTH_EMAIL)}"
-  if [ -z "$HEALTH_EMAIL" ]; then
-    HEALTH_DB_URL="$(read_env_value "$GATEWAY_ENV" CHUDWARE_DB_URL)"
-    [ -n "$HEALTH_DB_URL" ] || refuse "CHUDWARE_DB_URL missing from $GATEWAY_ENV; cannot select a loopback identity"
-    command -v psql >/dev/null 2>&1 || refuse "psql not found; install postgresql to read the account store"
-    if ! HEALTH_EMAIL="$(with_pgpass "$HEALTH_DB_URL" psql --no-password -tAXq -v ON_ERROR_STOP=1 -c \
-      "SELECT email FROM accounts WHERE status='active' ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, email LIMIT 1")"; then
-      refuse "could not read an active loopback identity from the account store"
-    fi
-  fi
-  [ -n "$HEALTH_EMAIL" ] || refuse "no active account available for authenticated drain health"
-  HEALTH_PORT="${CHUDWARE_WEB_GATEWAY_PORT:-8300}"
-  [[ "$HEALTH_PORT" =~ ^[0-9]+$ ]] && [ "$HEALTH_PORT" -ge 1 ] && [ "$HEALTH_PORT" -le 65535 ] \
-    || refuse "invalid loopback gateway port: $HEALTH_PORT"
-  HEALTH_URL="http://127.0.0.1:$HEALTH_PORT"
-  MAXW="${CHUDWARE_WEBD_RESTART_MAX_WAIT:-600}"
-  [[ "$MAXW" =~ ^[0-9]+$ ]] || refuse "CHUDWARE_WEBD_RESTART_MAX_WAIT must be a non-negative integer"
-  HEALTH_DB_URL="${HEALTH_DB_URL:-$(read_env_value "$GATEWAY_ENV" CHUDWARE_DB_URL)}"
-  [ -n "$HEALTH_DB_URL" ] || refuse "CHUDWARE_DB_URL missing from $GATEWAY_ENV; cannot mint a drain health session"
-  GATEWAY_DIR="$ROOT/Webservice/gateway"
-  GATEWAY_PY="$GATEWAY_DIR/.venv/bin/python"
-  [ -x "$GATEWAY_PY" ] || refuse "gateway venv python missing at $GATEWAY_PY; cannot mint a drain health session"
-  # The session must outlive the whole drain wait, or a long poll would start
-  # failing on an expired cookie and look like an unreachable gateway.
-  if ! HEALTH_SID="$(cd "$GATEWAY_DIR" && CHUDWARE_DB_URL="$HEALTH_DB_URL" \
-    "$GATEWAY_PY" -m authn ops-session --email "$HEALTH_EMAIL" --ttl-seconds "$((MAXW + 60))")"; then
-    refuse "could not mint an ops session for $HEALTH_EMAIL; refusing unauthenticated drain"
-  fi
-  [ -n "$HEALTH_SID" ] || refuse "ops session for $HEALTH_EMAIL was empty; refusing unauthenticated drain"
-  waited=0
-  while :; do
-    if ! active="$(probe_engine_bridges)"; then
-      refuse "authenticated $HEALTH_URL/healthz unreachable or missing engine_bridges; refusing restart"
-    fi
-    if [ "$active" = 0 ]; then
-      echo "[webd] authenticated drain reports zero active engine bridges"
-      break
-    fi
-    if [ "$waited" -ge "$MAXW" ]; then
-      refuse "$active engine bridge(s) still active after ${MAXW}s; refusing to drop users"
-    fi
-    echo "[webd] $active engine bridge(s) active — deferring promotion/restart (${waited}s/${MAXW}s)"
-    sleep 5
-    waited=$((waited + 5))
-  done
-fi
-# Install service definitions before moving `current`, so daemon-reload failure
-# cannot leave freshly promoted bits paired with stale service policy.
+# The acquired maintenance lease, not a public snapshot, owns this cutover.
+deployment_drain_call check || fatal "maintenance lost authoritative inactive-cell proof"
+# Recheck the prior target immediately before any live service policy changes.
+env -i PATH=/usr/bin:/bin /usr/bin/python3 -I -S \
+  "$ROOT/Webservice/deploy/deployment_release.py" "${AUTHORITY_ARGS[@]}" \
+  || refuse "prior-payload authorization changed during staging"
+MUTATED=1
+# Install cell/gateway policy before moving `current`.
 UNIT_DIR="$HOME/.config/systemd/user"
 mkdir -p "$UNIT_DIR"
 install_unit() {
@@ -463,11 +501,12 @@ install_unit() {
   cp "$src" "$tmp"
   mv -f "$tmp" "$dst"
 }
-install_unit "$STAGE_ROOT/chudware-hostd.service" "$UNIT_DIR/chudware-hostd.service"
-install_unit "$ROOT/Webservice/deploy/chudware-gateway.service" "$UNIT_DIR/chudware-gateway.service"
-install_unit "$ROOT/Webservice/deploy/chudware-gateway-staging.service" "$UNIT_DIR/chudware-gateway-staging.service"
+install_unit "$ROOT/Webservice/deploy/$GATEWAY_UNIT" "$UNIT_DIR/$GATEWAY_UNIT"
+for unit in chudware-cell@.socket chudware-cell@.service \
+    chudware-egress-broker@.socket chudware-egress-broker@.service; do
+  install_unit "$STAGE_CELL/units/$unit" "$UNIT_DIR/$unit"
+done
 systemctl --user daemon-reload || fatal "systemd user daemon-reload failed"
-systemctl --user enable chudware-hostd.service >/dev/null || fatal "could not enable chudware-hostd.service"
 echo "[webd] systemd units installed"
 
 LEGACY_BIN=""
@@ -519,52 +558,21 @@ else
   echo "[webd] joint release unchanged (sha ${JOINT_SHA:0:12}); no promotion"
 fi
 
-# Stable gateway/desktop discovery files are written atomically after promotion.
-RUNDIR="${XDG_RUNTIME_DIR:-/tmp/chudware-$(id -u)}"
-SOCK="$RUNDIR/chudware/hostd-$KEY.sock"
+# Workspace storage discovery only; browser execution is isolated in cells.
 cat > "$DST/.webd.env.staging.$$" <<EOF
-# written by install_webd.sh $(date -Is) — read by the gateway (config.py)
-CHUDWARE_WEBD_SOCKET=$SOCK
 CHUDWARE_WORKSPACE_ROOT=$WORKSPACE_ROOT
-CHUDWARE_CHUDCODE_BIN=$BIN/chud
 EOF
 mv -f "$DST/.webd.env.staging.$$" "$DST/webd.env"
-cat > "$DST/.chudware-shared.sh.staging.$$" <<EOF
-#!/usr/bin/env bash
-export CHUDWARE_INSTANCE_KEY=$KEY
-export CHUDWARE_HOSTD_BIN="$BIN/chudware-hostd"
-export CHUDWARE_CHUDCODE_BIN="$BIN/chud"
-export CHUDWARE_ENGINE_DAEMON=1
-exec "\${CHUDWARE_BIN:-$ROOT/host/build-linux/bin/chudware}" "\$@"
-EOF
-chmod +x "$DST/.chudware-shared.sh.staging.$$"
-mv -f "$DST/.chudware-shared.sh.staging.$$" "$DST/chudware-shared.sh"
+printf '%s\n' "$JOINT_SHA" > "$DST/.cell-payload-installed-joint.staging.$$"
+mv -f "$DST/.cell-payload-installed-joint.staging.$$" "$DST/.cell-payload-installed-joint"
 
-if [ "$RESTART" = 1 ]; then
-  if [ "$NEEDS_RESTART" = 1 ]; then
-    if ! systemctl --user restart chudware-hostd.service; then
-      fatal "systemctl restart chudware-hostd.service failed"
-    fi
-    ready=0
-    for ((attempt = 1; attempt <= 30; attempt++)); do
-      if systemctl --user is-active --quiet chudware-hostd.service \
-          && CHUDWARE_INSTANCE_KEY=$KEY "$BIN/chudware-hostd" --status >/dev/null 2>&1; then
-        ready=1
-        break
-      fi
-      sleep 1
-    done
-    [ "$ready" = 1 ] || fatal "chudware-hostd failed readiness after restart"
-    printf '%s\n' "$JOINT_SHA" > "$DST/.webd-running-joint.staging.$$"
-    mv -f "$DST/.webd-running-joint.staging.$$" "$DST/.webd-running-joint"
-    echo "[webd] restarted and ready (joint sha ${JOINT_SHA:0:12})"
-  else
-    echo "[webd] running release already matches joint sha ${JOINT_SHA:0:12}; no hostd restart"
-  fi
-else
-  echo "[webd] release installed; start it with: systemctl --user start chudware-hostd.service"
+echo "[webd] retained cell payload installed; existing workspace cells keep their private runtime"
+echo "[webd] shared local/native daemon was not enabled or restarted"
+
+if [[ "$DRAIN_BORROWED" = 0 ]]; then
+  systemctl --user restart "$GATEWAY_UNIT" || fatal "gateway restart failed; maintenance retained"
+  systemctl --user is-active --quiet "$GATEWAY_UNIT" || fatal "gateway is not active; maintenance retained"
 fi
-
 # Old trees are removed only after the requested service operation has completed
 # successfully, preserving a rollback artifact on restart/readiness failure.
 # LEGACY_BIN/LEGACY_APP are pre-`releases/`-layout leftovers, not release history.
@@ -610,4 +618,5 @@ done < <(
     fi
   done | sort -r
 )
+deployment_drain_complete || fatal "qualified cutover health/release failed; maintenance retained"
 echo "[webd] deployment complete (joint sha ${JOINT_SHA:0:12}; $kept release(s) retained)"

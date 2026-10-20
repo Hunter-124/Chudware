@@ -229,10 +229,16 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "publish_print_media": {
         "prompt_note": (
             "The only way G-code goes onto printer media — never cp/fs_write it there. "
-            "jobs = the COMPLETE project set of print_ready slice_part manifests; "
+            "jobs = the COMPLETE project set of print_ready slice_part manifests; a job that "
+            "is not print_ready goes on only when the user explicitly says to put it there "
+            "anyway: pass that job's user_override=<their words> and report its failed "
+            "checks — never refuse that instruction or hand-copy instead. "
             "media_idle=True only after the user confirms no printer is using the media. "
-            "Report the returned PRINT/<project>/R<rev><part>_*.gcode names and any "
-            "unmanaged printables left; never call the media clean while they remain."
+            "Default to raw files at drive root; layout='project' permits ONE top-level "
+            "project folder, never nested delivery trees or CAD/review packets. "
+            "Delete deprecated G-code, never archive it; keep only temporary rollback staging. "
+            "Report returned filenames and unmanaged printables left; never call the media "
+            "clean while they remain."
         ),
     },
 }

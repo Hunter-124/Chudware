@@ -20,11 +20,14 @@
 //     flow:{viscosity_pa_s, density_kg_m3, brinkman_max?, reference_length_mm?,
 //           fluid_k_w_mk?, fluid_cp_j_kgk?, inlets:[{faces, velocity_m_s,
 //           temperature_c?}], outlets:[{faces, pressure_pa}], walls:[{faces}]},
-//     preserve / exclude:[{faces, thickness_mm?} | {box_min_mm, box_max_mm}] }
+//     preserve / exclude:[{faces, thickness_mm?} | {box_min_mm, box_max_mm}],
+//     build_plate?:{faces:<faceset>, label?} }
 // where <faceset> is a resolved doc_face_points faceset ({points, tol_mm,
 // face_normal?, perp_tol_mm?, surface?, selector?}); a one-element array of
 // facesets is accepted, an unresolved selector or several facesets are refused.
 // Every entry may carry `label`, which names it in evidence and errors.
+// A planar, lowest build_plate derives the build direction opposite its
+// area-weighted outward boundary normal; explicit directions must agree.
 //
 // Order of work: the envelope, settings, method/physics compatibility, mesh
 // order and every section are validated (including a dry parse_problem_spec
@@ -45,7 +48,9 @@
 // <data>/Chudware/sim/topology_runs>/native-<utc>-<physics>-<method>-<hex>/
 // holding run.json, study.json, normalized_spec.json, history.jsonl,
 // checkpoint.json (atomic replace), history.json, density.vtu, surface.stl
-// (geometry-valid only), overlay.aicm, reanalysis.vtu, result.json — every one
+// (geometry-valid only; reanalysed raw surface), surface_print.stl (validated
+// Taubin-smoothed isosurface; domain caps pinned), overlay.aicm (print surface
+// when valid, otherwise reconstruction), reanalysis.vtu, result.json — every one
 // created exclusively (never overwriting), hashed (SHA-256) and listed in
 // `artifacts`. A write failure fails the run (ok:false, artifact_io); a file
 // that was not written is never listed. reanalysis.vtu carries, for every

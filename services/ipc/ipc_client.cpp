@@ -134,7 +134,7 @@ bool EngineClient::usesBackgroundConnection(const std::string& method,
         "chudcode_provider_list", "chudcode_auth_state", "chudcode_models_list",
         "chudcode_session_stats", "chudcode_stt_status", "skills_list", "skills_get",
         "ai_prompt_baseline", "ai_tool_catalog", "fw_projects", "fw_status",
-        "em_status", "sim_caps", "topology_capabilities"
+        "em_status", "sim_caps", "topology_capabilities", "topology_dfam"
     };
     for (const char* name : queries)
         if (method == name) return true;
@@ -442,7 +442,24 @@ bool EngineClient::readResponse(int id, json& out, std::string& err, int timeout
             }
             continue;
         }
-        if (msg.value("id", -1) == id) {
+        const auto responseId = msg.find("id");
+        if (responseId == msg.end() || !responseId->is_number_integer()) {
+            // JSON-RPC parse/invalid-request errors have id:null because the peer
+            // cannot correlate the rejected request. There is only one waiter on
+            // this socket: surface that error, then retire the uncorrelated stream.
+            // value("id", -1) throws on null (and aborts exception-disabled WASM).
+            const auto error = msg.find("error");
+            if (responseId != msg.end() && responseId->is_null() &&
+                error != msg.end() && error->is_object() && !msg.contains("result")) {
+                out = std::move(msg);
+                closeConnection();
+                return true;
+            }
+            err = "daemon response has an invalid request id";
+            closeConnection();
+            return false;
+        }
+        if (*responseId == id) {
             out = std::move(msg);
             return true;
         }

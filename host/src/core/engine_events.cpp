@@ -24,6 +24,7 @@
 #include "../ui/reveng/reveng_internal.h"  // RevEngEvent / feedRevEngEvent / RevEngState
 #include "../ui/manufacture/mfg_mirror.h"
 #include "../ui/sketch_mode.h"
+#include "../ui/sketch3d_mode.h"
 #include "../ui/sim_manager.h"
 
 namespace core {
@@ -40,7 +41,16 @@ constexpr int kAttachCallTimeoutMs = 10000;
 // safety gate pollAiCadHandoff used: never yank geometry out from under them.
 bool userMidEdit(AppState& st) {
     return (st.sketchMode && st.sketchMode->active()) ||
+           (st.sketch3dMode && st.sketch3dMode->active()) ||
            (st.propertyManager && st.propertyManager->active());
+}
+
+// Agent edit lock (AppState::docLockedByAgent): stamp a revision written by any client other
+// than a GUI seat. Empty source_kind (older daemons) is not treated as an agent.
+void stampForeignWrite(AppState& st, int idx, const json& d) {
+    const std::string kind = d.value("source_kind", std::string());
+    if (idx < 0 || kind.empty() || kind == "gui") return;
+    st.docTabs[idx].lastForeignWriteAt = std::chrono::steady_clock::now();
 }
 
 int tabIndexForDoc(AppState& st, const std::string& docId) {
@@ -98,6 +108,7 @@ static constexpr double kAgentEditPulseTimeoutS = 5.0;
 
 void agentEditPulseTimeoutTick(AppState& st) {
     const auto now = std::chrono::steady_clock::now();
+    if (!st.anyRunActive()) st.runsIdleAt = now;  // agent-lock run epoch (docLockedByAgent)
     for (AppState::DocTab& t : st.docTabs) {
         if (!t.aiPulse) continue;
         if (std::chrono::duration<double>(now - t.lastAgentEditAt).count() >
@@ -598,6 +609,7 @@ void handleEvent(AppState& st, const json& evt) {
 
     if (name == "doc.opened") {
         if (!docId.empty()) openMirrorTab(st, docId, eventDocName(d));
+        stampForeignWrite(st, tabIndexForDoc(st, docId), d);
         return;
     }
     if (name == "doc.changed") {
@@ -611,6 +623,7 @@ void handleEvent(AppState& st, const json& evt) {
             pendingChanged[docId] = d;
             return;
         }
+        stampForeignWrite(st, idx, d);
         // Multi-user authorship: toast when another seat edited this doc.
         // Local single-seat GUIs leave user empty — no toast.
         if (d.contains("user") && d["user"].is_object()) {
@@ -689,6 +702,10 @@ void handleEvent(AppState& st, const json& evt) {
         pendingOpen.erase(docId);
         pendingChanged.erase(docId);
         if (idx < 0) return;
+        // The writer detached: an agent that is no longer running cannot be mid-edit. A run
+        // still live elsewhere keeps the lock (another sub-agent may still write this doc).
+        if (!st.anyRunActive())
+            st.docTabs[idx].lastForeignWriteAt = std::chrono::steady_clock::time_point{};
         if (!st.docTabs[idx].aiHandoff || st.docTabs[idx].userAdopted) {
             // A tab the user opened themselves, or an AI mirror the user ADOPTED by editing:
             // it's user-owned now. Never auto-close it — the user decides its fate (and the

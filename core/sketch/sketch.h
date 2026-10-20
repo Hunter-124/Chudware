@@ -4,23 +4,12 @@
 // schema constraint to one (or more) residual blocks with analytic Jacobians.
 // dict-in / dict-out via nlohmann::json, mirroring the Python solve_sketch.
 //
-// Coverage: entities point/line/circle/arc/ellipse/ellipse_arc/parabola/conic/
-// slot/arc_slot/spline/style_spline/text (allocation + handle resolution +
-// extraction; conic-family derived handles carry their chain-rule Jacobians).
-// Constraints coincident, horizontal, vertical, parallel, perpendicular,
-// collinear, coradial, concentric, equal (line/slot length + circle/arc radius),
-// midpoint, symmetric, angle, point_on(line/circle/arc + numeric closest-point
-// projection on ellipse_arc/parabola/conic), fix (whole-entity + sub-handle +
-// conic-family handle pin), tangent(line-circle + circle-circle + line-conic
-// [ellipse_arc exact support / parabola+conic numeric] + line-spline + general
-// curve-curve via mutual-closest signed gap), distance (point-point aligned +
-// axis h/v, point-line, and the C50 min/max rim cond with radius as a variable),
-// radius, diameter (incl. slot width mapping). Polar (r, theta) placement = angle
-// + distance-to-origin. The numeric closest-point projections (conic/spline
-// point_on + tangent) match the Python scan resolutions / Newton iteration counts
-// / finite-difference steps verbatim for differential-harness parity. Line-line
-// tangent stays deferred (ill-defined). Unknown entities/constraints are skipped
-// forward-tolerantly, exactly like the Python.
+// Coverage: 2D geometric, dimensional, symmetry, intersection, curve-length,
+// endpoint G1/G2 (including coincident tangent junctions), and external-geometry
+// relations. Analytic Jacobians cover normalized line and elementary geometry;
+// conic/spline projections and endpoint curvature use numeric derivatives.
+// origin and axis.h/axis.v are fixed virtual geometry. Unsupported constraints
+// are reported in skipped.
 #pragma once
 
 #include <nlohmann/json.hpp>
@@ -30,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace chudware::sketch {
@@ -54,6 +44,7 @@ struct SketchSolution {
     int dof = 0;
     std::vector<std::string> redundant;    // constraint ids
     std::vector<std::string> conflicting;  // constraint ids
+    std::vector<std::pair<std::string, std::string>> skipped;  // constraint id, reason
     bool converged = false;
     Eigen::VectorXd x;  // solved variable vector (warm-start state)
     std::map<std::string, std::vector<int>> var_map;  // id -> variable indices
@@ -95,9 +86,9 @@ bool adopt_solved_coordinates(nlohmann::json& sketch, const nlohmann::json& env)
 
 // Current solved measurement for a DIMENSIONAL constraint, in canonical units —
 // C++ port of sketch_solver.py's measure_constraint. distance -> mm (point-point
-// Euclidean / axis per-coordinate rim / point-line), angle -> degrees in [0, 180),
-// radius/diameter -> mm. Non-dimensional relations and unresolvable refs return
-// nullopt. `entity_coords` is a solved-entity dict (the SketchSolution::entities form).
+// Euclidean / axis per-coordinate rim / point-line / line-line), angle -> degrees
+// in [0, 180), radius/diameter/arc_length -> mm. Non-dimensional relations and
+// unresolvable refs return nullopt. `entity_coords` is a solved-entity dict.
 std::optional<double> measure_constraint(const nlohmann::json& constraint,
                                          const nlohmann::json& entity_coords);
 

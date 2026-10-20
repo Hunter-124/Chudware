@@ -32,6 +32,33 @@
 namespace ui {
 
 namespace {
+extern bool g_skIps;
+std::string fmtLen(double mm);
+std::string fmtAng(double deg);
+
+const char* modelPickKind(render::PickKind kind) {
+    return kind == render::PickKind::Vertex ? "vertex" :
+           kind == render::PickKind::Edge ? "edge" :
+           kind == render::PickKind::Face ? "face" : nullptr;
+}
+
+// Selection observers have already resolved most picks asynchronously. Only a genuinely new,
+// tool-owned click needs the synchronous fallback; never resolve a populated selector again.
+nlohmann::json modelPickReference(AppState& st, const render::PickHit& hit, std::string& error) {
+    const char* kind = modelPickKind(hit.kind);
+    if (!kind) return {};
+    std::string text;
+    for (const auto& item : st.selection.items())
+        if (item.hit.kind == hit.kind && item.hit.body_id == hit.body_id &&
+            item.hit.topo_id == hit.topo_id && !item.selector.empty()) {
+            text = item.selector;
+            break;
+        }
+    if (text.empty()) text = st.docMirror.resolvePick(st.worker, hit.body_id, kind, hit.topo_id, error);
+    auto selector = nlohmann::json::parse(text, nullptr, false);
+    return selector.is_object() ? nlohmann::json{{"kind", kind}, {"selector", std::move(selector)}} :
+                                  nlohmann::json();
+}
 
 // M-1: an interpolating "spline" entity passes THROUGH its points, so drawing straight
 // segments between them makes a smooth curve look sharp-cornered — and a smooth swept/
@@ -65,6 +92,7 @@ inline std::vector<ImVec2> catmullRomUV(const std::vector<ImVec2>& p, int perSeg
 }
 
 constexpr float kSnapPx = 6.0f;        // endpoint coincident snap radius (screen px)
+constexpr float kRimInlinePx = 14.0f;  // rim point inline with origin/center: reach along rim (px)
 constexpr float kHandlePx = 8.0f;      // drag hit-test radius (screen px)
 constexpr float kHVDeg = 5.0f;         // horizontal/vertical auto-relation tolerance (deg)
 constexpr float kGridStep = 10.0f;     // sketch grid spacing (mm)
@@ -74,11 +102,15 @@ constexpr float kTangentDeg = 6.0f;    // Line-on-rim tangent direction-snap tol
 
 // C49: toolSnaps_ entries are either a plain coincident point handle ("e3.p2" / "e4.center" /
 // "e5.p"), or a prefixed inference snap: "mid:<lineId>" (line midpoint), "rim:<circleId>"
-// (point on a circle/arc rim), "tan:<circleId>" (on-rim + tangent direction matched).
-// coincRef() returns the handle only for the plain coincident form.
+// (point on a circle/arc rim), "tan:<circleId>" (on-rim + tangent direction matched),
+// "align:<uHandle>|<vHandle>" (vertical/horizontal alignment guide). A rim/tan record may carry
+// an alignment rider after ';' ("rim:e5;align:|origin" = on e5's rim, inline with the origin);
+// snapPrimary() strips it. coincRef() returns the handle only for the plain coincident form.
 inline bool snapHasPrefix(const std::string& s, const char* pfx) { return s.rfind(pfx, 0) == 0; }
+inline std::string snapPrimary(const std::string& s) { return s.substr(0, s.find(';')); }
 inline std::string coincRef(const std::string& s) {
-    if (snapHasPrefix(s, "mid:") || snapHasPrefix(s, "rim:") || snapHasPrefix(s, "tan:"))
+    if (snapHasPrefix(s, "mid:") || snapHasPrefix(s, "rim:") || snapHasPrefix(s, "tan:") ||
+        snapHasPrefix(s, "align:"))
         return std::string();
     return s;
 }
@@ -222,6 +254,20 @@ void drawRelationGlyph(ImDrawList* dl, ImVec2 c, float bs, const char* type, ImU
         L(1, 0, 0.3f, 0);    L(0.3f, 0, 0.65f, -0.35f);   L(0.3f, 0, 0.65f, 0.35f); }
     else if (!std::strcmp(type, "fix"))           { L(0, -1, 0, 0.55f); L(-1, 0.55f, 1, 0.55f);
         L(-0.85f, 1, -0.45f, 0.55f); L(-0.2f, 1, 0.2f, 0.55f); L(0.45f, 1, 0.85f, 0.55f); }
+    else if (!std::strcmp(type, "point_on"))      { L(-1, 0.4f, 1, 0.4f);
+        dl->AddCircleFilled(ImVec2(c.x, c.y + h * 0.4f), h * 0.38f, ink); }
+    else if (!std::strcmp(type, "intersection"))  { L(-1, -1, 1, 1); L(-1, 1, 1, -1);
+        dl->AddCircle(c, h * 0.4f, ink, 0, w); }
+    else if (!std::strcmp(type, "pierce"))        { L(-1, 0, 1, 0); L(0, -1, 0, 1);
+        dl->AddCircle(c, h * 0.65f, ink, 0, w); }
+    else if (!std::strcmp(type, "smooth"))        {
+        dl->AddBezierCubic(ImVec2(c.x-h, c.y+h), ImVec2(c.x, c.y+h),
+                           ImVec2(c.x, c.y-h), ImVec2(c.x+h, c.y-h), ink, w);
+        L(-0.4f, 0.7f, 0.4f, -0.7f); }
+    else if (!std::strcmp(type, "equal_curve_length")) {
+        dl->PathArcTo(ImVec2(c.x, c.y+h*0.7f), h, 3.5f, 5.9f);
+        dl->PathStroke(ink, 0, w); L(-0.8f, 0.4f, 0.8f, 0.4f);
+        L(-0.8f, 0.9f, 0.8f, 0.9f); }
     else { dl->AddCircleFilled(c, h * 0.4f, ink); }          // unknown relation: neutral dot
 }
 
@@ -475,6 +521,9 @@ static void parseEntities(const nlohmann::json& res, std::vector<SketchEntity>& 
         if (ext && ext->contains(se.id)) {
             se.external = true;
             se.externalStale = (*ext)[se.id].value("stale", false);
+            const auto source = (*ext)[se.id].find("source");
+            se.externalPierce = source != (*ext)[se.id].end() && source->is_object() &&
+                                source->value("mode", std::string()) == "pierce";
         }
         if (stats && stats->contains(se.id)) se.status = (*stats)[se.id].get<std::string>();
         else se.status = "under";
@@ -516,6 +565,11 @@ void SketchMode::applyEnterResult(const nlohmann::json& res) {
     redundant_.clear();
     if (res.contains("redundant") && res["redundant"].is_array())
         for (const auto& c : res["redundant"]) if (c.is_string()) redundant_.push_back(c.get<std::string>());
+    skipped_.clear();
+    if (res.contains("skipped_constraints") && res["skipped_constraints"].is_array())
+        for (const auto& c : res["skipped_constraints"])
+            if (c.is_object()) skipped_[c.value("id", std::string())] =
+                c.value("reason", std::string("Relation could not be applied"));
     // C50f: latch the conflict-freeze flag. solve_rejected:true means the system is contradictory
     // and `entities` carry last-valid (frozen) coords; cleared the moment a solve succeeds again.
     // Drag responses always report solve_rejected:false, so they release a prior freeze too.
@@ -525,13 +579,22 @@ void SketchMode::applyEnterResult(const nlohmann::json& res) {
         for (int i = 0; i < 16; ++i) frame_[i] = res["plane_frame"][i].get<float>();
     }
     parseEntities(res, ents_);
+    entIndex_.clear();
+    entIndex_.reserve(ents_.size());
+    for (size_t i = 0; i < ents_.size(); ++i) entIndex_.emplace(ents_[i].id, i);
+    const auto& geometry = res.contains("entities") ? res["entities"] : nlohmann::json();
+    if (geometry != entitiesSnapshot_) {
+        entitiesSnapshot_ = geometry;
+        ++entitiesRevision_;
+        regionsDirty_ = true;
+    }
     applyConstraints(res);   // C37-D: store the constraints array for dim annotations
     // C41 (T2) / C50: drop selected handles whose OWNING entity no longer exists (deleted/undone).
     // Virtual refs (sketch origin + datum axes) are not in ents_ but stay selectable as references.
     selIds_.erase(std::remove_if(selIds_.begin(), selIds_.end(),
                                  [&](const std::string& id) {
                                      const std::string base = id.substr(0, id.find('.'));
-                                     if (base == "origin" || base.rfind("axis.", 0) == 0) return false;
+                                     if (base == "origin" || id.rfind("axis.", 0) == 0) return false;
                                      return entById(base) == nullptr;
                                  }),
                   selIds_.end());
@@ -573,6 +636,7 @@ void SketchMode::applyEnterResult(const nlohmann::json& res) {
 
 // C37-D: pull the constraints array (worker_rpc.md §"constraints") off any sketch response.
 void SketchMode::applyConstraints(const nlohmann::json& res) {
+    badgesRevision_ = size_t(-1);
     cons_.clear();
     if (!res.contains("constraints") || !res["constraints"].is_array()) return;
     for (const auto& c : res["constraints"]) {
@@ -598,8 +662,64 @@ void SketchMode::applyConstraints(const nlohmann::json& res) {
 }
 
 const SketchEntity* SketchMode::entById(const std::string& id) const {
-    for (const auto& e : ents_) if (e.id == id) return &e;
-    return nullptr;
+    const auto it = entIndex_.find(id);
+    return it != entIndex_.end() && it->second < ents_.size() ? &ents_[it->second] : nullptr;
+}
+
+bool SketchMode::relationPointUV(const std::string& h, float& u, float& v) const {
+    if (h == "origin" || h.rfind("axis.", 0) == 0) { u = v = 0; return true; }
+    const auto dot = h.find('.');
+    const auto* e = entById(h.substr(0, dot));
+    if (!e) return false;
+    const auto sub = dot == std::string::npos ? std::string() : h.substr(dot + 1);
+    if (e->type == "spline" || e->type == "style_spline") {
+        if (e->pts.empty()) return false;
+        size_t i = e->pts.size() / 2;
+        if (sub == "start") i = 0;
+        else if (sub == "end") i = e->pts.size() - 1;
+        else if (sub.size() > 1 && sub[0] == 'p') {
+            i = 0;
+            for (size_t k = 1; k < sub.size(); ++k) {
+                if (sub[k] < '0' || sub[k] > '9') return false;
+                i = i * 10 + size_t(sub[k] - '0');
+                if (i >= e->pts.size()) return false;
+            }
+        }
+        u = e->pts[i].x; v = e->pts[i].y;
+    } else if (e->type == "point" || sub == "p" ||
+               ((e->type == "line" || e->type == "slot") && (sub == "p1" || sub == "start"))) {
+        u = e->p1[0]; v = e->p1[1];
+    } else if ((e->type == "line" || e->type == "slot") && (sub == "p2" || sub == "end")) {
+        u = e->p2[0]; v = e->p2[1];
+    } else if ((e->type == "arc" || e->type == "ellipse_arc") &&
+               (sub == "start" || sub == "end" || sub == "mid")) {
+        float sweep = e->end - e->start;
+        if (e->ccw) { while (sweep < 0) sweep += 360; }
+        else { while (sweep > 0) sweep -= 360; }
+        const float a = (sub == "start" ? e->start : sub == "end" ? e->end :
+                         e->start + sweep * 0.5f) * 3.14159265f / 180.0f;
+        const float x = (e->type == "arc" ? e->radius : e->rx) * std::cos(a);
+        const float y = (e->type == "arc" ? e->radius : e->ry) * std::sin(a);
+        const float r = e->rot * 3.14159265f / 180.0f;
+        u = e->center[0] + x * std::cos(r) - y * std::sin(r);
+        v = e->center[1] + x * std::sin(r) + y * std::cos(r);
+    } else if (e->type == "line" || e->type == "slot") {
+        u = (e->p1[0] + e->p2[0]) * 0.5f; v = (e->p1[1] + e->p2[1]) * 0.5f;
+    } else {
+        u = e->center[0]; v = e->center[1];
+    }
+    return true;
+}
+
+bool SketchMode::relationLineUV(const std::string& h, ImVec2& a, ImVec2& b) const {
+    if (h == "axis.h" || h == "axis.v") {
+        a = ImVec2(0, 0); b = h == "axis.h" ? ImVec2(1, 0) : ImVec2(0, 1);
+        return true;
+    }
+    const auto* e = entById(h);
+    if (!e || (e->type != "line" && e->type != "slot")) return false;
+    a = ImVec2(e->p1[0], e->p1[1]); b = ImVec2(e->p2[0], e->p2[1]);
+    return true;
 }
 
 // C41 (T2): is this entity id in the in-sketch selection?
@@ -838,8 +958,8 @@ void SketchMode::drawPastePreview(AppState& st, ImDrawList* dl, const ImVec2& cu
 // C38 (S1): resolve a stored entity id to its CURRENT index in ents_ (-1 if gone). DimPicks store
 // the id (stable) rather than the index (refilled by applyEnterResult/resolve mid-pick).
 int SketchMode::entIndexById(const std::string& id) const {
-    for (size_t i = 0; i < ents_.size(); ++i) if (ents_[i].id == id) return (int)i;
-    return -1;
+    const auto it = entIndex_.find(id);
+    return it != entIndex_.end() && it->second < ents_.size() ? (int)it->second : -1;
 }
 
 void SketchMode::resolve(AppState& st) {
@@ -892,6 +1012,11 @@ void SketchMode::addEntity(AppState& st, const nlohmann::json& entity,
 void SketchMode::pushSnapConstraint(const std::string& snap, const std::string& pt,
                                     nlohmann::json& cs) const {
     if (snap.empty()) return;
+    if (const auto semi = snap.find(';'); semi != std::string::npos) {   // rim + alignment rider
+        pushSnapConstraint(snap.substr(0, semi), pt, cs);
+        pushSnapConstraint(snap.substr(semi + 1), pt, cs);
+        return;
+    }
     if (snapHasPrefix(snap, "align:")) {
         // "align:<uHandle>|<vHandle>" — vertical (same u/x) to uHandle, horizontal (same v/y) to
         // vHandle; either side may be empty. Two-point form: refs = {source, this point}.
@@ -946,12 +1071,18 @@ void SketchMode::applyRelationOps(AppState& st, const nlohmann::json& ops,
 void SketchMode::addRelationOps(AppState& st, const nlohmann::json& ops,
                                 const std::string& label) {
     if (!ops.is_array() || ops.empty()) return;
+    const bool projects = std::any_of(ops.begin(), ops.end(), [](const auto& op) {
+        return op.is_object() && op.value("op", std::string()) == "sketch_convert";
+    });
 
     for (const auto& op : ops) {
         if (!op.is_object() || op.value("op", std::string()) != "sketch_add_constraint")
             continue;
         if (!op.contains("constraint") || !op["constraint"].is_object())
             continue;
+        // New projected IDs exist only inside the applyOps batch; a separate probe cannot
+        // resolve them. The normal transactional apply path validates the whole batch.
+        if (projects) continue;
         bool wouldOver = false;
         std::vector<std::string> pc, pr;
         if (sketchProbe(st, nlohmann::json{{"add_constraint", op["constraint"]}},
@@ -969,6 +1100,409 @@ void SketchMode::addRelationOps(AppState& st, const nlohmann::json& ops,
     applyRelationOps(st, ops, label);
     relPopupOpen_ = false;
     relIds_.clear();
+    relModelPicking_ = false;
+    relModelRefs_.clear(); relModelKey_.clear();
+}
+
+void SketchMode::fullyDefine(AppState& st) {
+    nlohmann::json op = {{"op", "sketch_fully_define"}, {"sketch", fid_},
+                         {"relations", true}, {"dimensions", true}, {"anchor", "origin"}};
+    std::set<std::string> entities;
+    for (const auto& h : selIds_)
+        if (const auto* e = entById(skBaseId(h))) entities.insert(e->id);
+    if (!entities.empty()) op["entities"] = entities;
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (!r.ok) {
+        st.toast(ui::ToastLevel::Warn, "Fully Define Sketch: " + r.error_message);
+        return;
+    }
+    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    resolve(st);
+    st.toast(dof_ == 0 ? ui::ToastLevel::Info : ui::ToastLevel::Warn,
+             "Fully Define Sketch: " + std::to_string(dof_) + " DOF remaining");
+}
+
+void SketchMode::drawRelationList(AppState& st, const ImVec2& lo, const ImVec2& hi) {
+    panelHoverRel_.clear();
+    if (!relationsPanel_.open) return;
+    std::vector<RelationRow> rows;
+    rows.reserve(cons_.size());
+    for (const auto& c : cons_) {
+        RelationRow row;
+        row.id = c.id; row.type = c.type;
+        row.dimension = c.isDimensional(); row.driven = c.driven;
+        for (const auto& h : c.refs) {
+            if (!row.label.empty()) row.label += ", ";
+            const auto* e = entById(skBaseId(h));
+            row.label += e ? e->type + " " + h : h;
+            row.external |= e && e->external;
+            if (e && e->externalPierce && c.type == "coincident") row.type = "pierce";
+            for (const auto& selected : selIds_)
+                if (selected == h || skBaseId(selected) == skBaseId(h))
+                    row.touchesSelection = true;
+        }
+        if (row.dimension) {
+            const double value = c.hasMeasured ? c.measured : c.value;
+            row.value = c.hasExpr ? "=" + c.expr :
+                        c.type == "angle" ? fmtAng(value) : fmtLen(value);
+            if (c.type != "angle") row.value += g_skIps ? " in" : " mm";
+        }
+        if (std::find(redundant_.begin(), redundant_.end(), c.id) != redundant_.end())
+            row.state = RelationRow::State::Redundant;
+        if (std::find(conflicting_.begin(), conflicting_.end(), c.id) != conflicting_.end())
+            row.state = RelationRow::State::Conflicting;
+        const auto skipped = skipped_.find(c.id);
+        if (skipped != skipped_.end()) {
+            row.state = RelationRow::State::Skipped;
+            row.stateReason = skipped->second;
+        }
+        rows.push_back(std::move(row));
+    }
+    auto result = drawRelationsPanel(relationsPanel_, rows, selRelIds_, lo, hi);
+    if (result.selectionChanged) selRelIds_ = std::move(result.selectIds);
+    panelHoverRel_ = std::move(result.hoveredId);
+    if (!result.deleteIds.empty()) {
+        nlohmann::json ops = nlohmann::json::array();
+        for (const auto& id : result.deleteIds)
+            ops.push_back({{"op", "sketch_delete_constraint"}, {"sketch", fid_}, {"id", id}});
+        applyRelationOps(st, ops, "Delete relations");
+    }
+}
+
+// World axes parallel to a sketch basis direction use the solver's fixed virtual lines.
+// All other axes go through the same associative conversion as model geometry.
+static std::string sketchAxisHandle(const std::string& h, const float* frame) {
+    if (h == "axis.h" || h == "axis.v") return h;
+    const int a = h == "axis.x" ? 0 : h == "axis.y" ? 1 : h == "axis.z" ? 2 : -1;
+    if (a < 0) return {};
+    if (std::abs(frame[a]) > 1.0f - 1e-6f) return "axis.h";
+    if (std::abs(frame[4+a]) > 1.0f - 1e-6f) return "axis.v";
+    return {};
+}
+
+void SketchMode::beginRelations(AppState& st) {
+    const auto selected = selIds_;
+    resetTool();
+    selIds_ = selected;
+    relIds_ = selected;
+    relPopupOpen_ = true;
+    // A keyboard/ribbon invocation with no pointer over the window (or a headless run) has no
+    // valid mouse position; anchor at the window center instead of off screen.
+    relPopupPos_ = ImGui::IsMousePosValid() ? ImGui::GetMousePos()
+                                            : ImGui::GetMainViewport()->GetCenter();
+    refreshRelationModelRefs(st);
+}
+
+void SketchMode::refreshRelationModelRefs(AppState& st) {
+    nlohmann::json refs = nlohmann::json::array();
+    for (const auto& h : relIds_)
+        if (h.rfind("axis.", 0) == 0 && sketchAxisHandle(h, frame_).empty())
+            refs.push_back({{"datum", h}});
+    bool pending = false;
+    for (const auto& item : st.selection.items()) {
+        const auto kind = item.hit.kind;
+        const char* name = kind == render::PickKind::Vertex ? "vertex" :
+                           kind == render::PickKind::Edge ? "edge" :
+                           kind == render::PickKind::Face ? "face" : nullptr;
+        if (!name) continue;
+        if (item.selector.empty()) { pending = true; continue; }
+        auto selector = nlohmann::json::parse(item.selector, nullptr, false);
+        if (selector.is_object()) refs.push_back({{"kind", name}, {"selector", selector}});
+    }
+    const std::string key = std::to_string(st.docMirror.revision()) + ":" + refs.dump() +
+                            (pending ? ":pending" : "");
+    if (key == relModelKey_) return;
+    relModelKey_ = key;
+    relModelRefs_.clear();
+    for (const auto& ref : refs) {
+        RelationModelRef model;
+        model.source = ref;
+        nlohmann::json res;
+        if (callSketch(st, "sketch_project_entities",
+                       {{"refs", nlohmann::json::array({ref})}}, res)) {
+            parseEntities(res, model.entities);
+        }
+        model.labels.reserve(model.entities.size());
+        for (size_t i = 0; i < model.entities.size(); ++i)
+            model.labels.push_back(model.entities[i].type + " " + std::to_string(i + 1));
+        if (ref.value("kind", std::string()) == "edge") {
+            auto pierce = ref;
+            pierce["mode"] = "pierce";
+            // A read-only probe rejects coplanar/no-crossing edges; those must not offer Pierce.
+            nlohmann::json probe;
+            std::string error;
+            model.canPierce = st.worker.call("sketch_project_ref",
+                {{"doc_id", st.docMirror.docId()}, {"sketch", fid_}, {"ref", pierce}},
+                probe, error) && !probe.contains("code") && probe.contains("entity");
+        }
+        relModelRefs_.push_back(std::move(model));
+    }
+}
+
+void SketchMode::drawAddRelations(AppState& st, bool& escHandled) {
+    if (!relPopupOpen_ && !relModelPicking_) return;
+    refreshRelationModelRefs(st);
+    if (relModelPicking_) {
+        ImGui::SetNextWindowPos(relPopupPos_, ImGuiCond_Appearing);
+        if (ImGui::Begin("Select relation references##SketchRelPick", nullptr,
+                         ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+            ui::kit::dimText("Pick model vertices, edges or faces. Ctrl-click adds more.");
+            ui::kit::dimText("Sketch selection is retained while picking model geometry.");
+            if (ui::kit::primaryButton("Use selected geometry##relation_use_model")) {
+                relModelPicking_ = false; relPopupOpen_ = true;
+                relPopupPos_ = ImGui::GetMousePos();
+            }
+            if (ui::kit::secondaryButton("Cancel##relation_cancel_model") ||
+                ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                relModelPicking_ = false; relPopupOpen_ = false; escHandled = true;
+            }
+        }
+        ImGui::End();
+        return;
+    }
+
+    struct Target {
+        std::string ref, type;
+        bool point = false, splineEnd = false;
+        int source = -1;
+    };
+    std::vector<Target> targets;
+    auto addTarget = [&](const std::string& h, const SketchEntity* e, int source) {
+        Target t;
+        t.ref = h; t.source = source;
+        t.type = e ? e->type : "line";
+        const auto dot = h.find('.');
+        const auto sub = dot == std::string::npos ? std::string() : h.substr(dot + 1);
+        t.point = h == "origin" || (e && (e->type == "point" || !sub.empty()));
+        if (e && (e->type == "spline" || e->type == "style_spline"))
+            t.splineEnd = sub == "start" || sub == "end" || sub == "p0" ||
+                          (!e->pts.empty() && sub == "p" + std::to_string(e->pts.size()-1));
+        targets.push_back(std::move(t));
+    };
+    for (const auto& h : relIds_) {
+        if (h.rfind("axis.", 0) == 0) {
+            const auto axis = sketchAxisHandle(h, frame_);
+            if (!axis.empty()) addTarget(axis, nullptr, -1);
+        } else if (h == "origin") addTarget(h, nullptr, -1);
+        else if (const auto* e = entById(skBaseId(h))) addTarget(h, e, -1);
+    }
+    size_t flat = 0;
+    for (size_t i = 0; i < relModelRefs_.size(); ++i) {
+        const auto& model = relModelRefs_[i];
+        for (size_t j = 0; j < model.entities.size(); ++j, ++flat) {
+            if ((int)j != model.selectedEntity) continue;
+            const auto ref = flat == 0 ? "$0" : "$0#" + std::to_string(flat);
+            addTarget(ref, &model.entities[j], (int)i);
+        }
+    }
+    auto line = [](const Target& t) { return !t.point && (t.type == "line" || t.type == "slot"); };
+    auto circle = [](const Target& t) { return !t.point && (t.type == "circle" || t.type == "arc"); };
+    auto ellipse = [](const Target& t) { return !t.point && (t.type == "ellipse" || t.type == "ellipse_arc"); };
+    auto curve = [](const Target& t) {
+        return !t.point && (t.type == "line" || t.type == "circle" || t.type == "arc" ||
+            t.type == "ellipse" || t.type == "ellipse_arc" || t.type == "spline" ||
+            t.type == "style_spline" || t.type == "conic" || t.type == "parabola");
+    };
+    auto lengthCurve = [](const Target& t) { return !t.point && (t.type == "line" || t.type == "arc"); };
+    ImGui::SetNextWindowPos(relPopupPos_, ImGuiCond_Appearing);
+    if (ImGui::Begin("Add Relation##SketchRel", nullptr,
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+        ui::kit::sectionHeader("Relations");
+        bool referencesChanged = false;
+        const bool referencesPending = std::any_of(st.selection.items().begin(), st.selection.items().end(),
+            [](const auto& item) { return modelPickKind(item.hit.kind) && item.selector.empty(); });
+        for (size_t i = 0; i < relModelRefs_.size(); ++i) {
+            auto& model = relModelRefs_[i];
+            if (model.entities.size() < 2) continue;
+            ImGui::PushID((int)i);
+            referencesChanged |= ui::kit::fieldCombo("boundary", "Projected boundary",
+                &model.selectedEntity, model.labels);
+            ImGui::PopID();
+        }
+        bool projectionsReady = true;
+        for (const auto& model : relModelRefs_) {
+            if (!model.entities.empty()) continue;
+            projectionsReady = false;
+            ui::kit::dimText(model.canPierce ? "This edge only supports a Pierce reference here." :
+                                             "This reference does not project into the sketch.");
+        }
+        if (referencesPending) {
+            bool failed = false;
+            for (const auto& item : st.selection.items())
+                if (modelPickKind(item.hit.kind) && !item.resolution_error.empty()) {
+                    ui::kit::dimText(item.resolution_error.c_str()); failed = true;
+                }
+            if (!failed) ui::kit::dimText("Resolving selected model geometry...");
+        }
+        bool any = false, applied = false;
+        const auto& snapshot = targets;
+        auto offer = [&](const char* label, const char* type,
+                         const std::vector<std::vector<std::string>>& groups) {
+            any = true;
+            if (applied || !ui::kit::secondaryButton(label,
+                    projectionsReady && !referencesPending && !referencesChanged,
+                    referencesPending ? "Waiting for selected model geometry" :
+                    !projectionsReady ? "Choose a projectable reference" : nullptr)) return;
+            nlohmann::json ops = nlohmann::json::array(), refs = nlohmann::json::array();
+            for (const auto& model : relModelRefs_) refs.push_back(model.source);
+            if (!refs.empty())
+                ops.push_back({{"op", "sketch_convert"}, {"sketch", fid_}, {"refs", refs},
+                               {"construction", true}, {"fix", true}, {"associative", true}});
+            for (const auto& group : groups)
+                ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_},
+                               {"constraint", {{"type", type}, {"refs", group}}}});
+            applied = true;
+            addRelationOps(st, ops, label);
+        };
+        const size_t n = snapshot.size();
+        auto all = [&](const auto& pred) {
+            return n > 0 && std::all_of(snapshot.begin(), snapshot.end(), pred);
+        };
+        auto chain = [&](const char* label, const char* type) {
+            std::vector<std::vector<std::string>> groups;
+            for (size_t i = 1; i < n; ++i) groups.push_back({snapshot[0].ref, snapshot[i].ref});
+            offer(label, type, groups);
+        };
+        auto each = [&](const char* label, const char* type) {
+            std::vector<std::vector<std::string>> groups;
+            for (const auto& t : snapshot)
+                if (t.source < 0 && t.ref != "origin" && t.ref.rfind("axis.", 0) != 0)
+                    groups.push_back({t.ref});
+            if (!groups.empty()) offer(label, type, groups);
+        };
+        if (n >= 2 && all([](const Target& t) { return t.point; })) {
+            chain("Coincident / Merge", "coincident");
+            chain("Horizontal (align Y)", "horizontal");
+            chain("Vertical (align X)", "vertical");
+        }
+        if (all(line)) {
+            if (all([](const Target& t) { return t.type == "line"; })) {
+                each("Horizontal (each)", "horizontal");
+                each("Vertical (each)", "vertical");
+            }
+            if (n >= 2) {
+                chain("Collinear", "collinear"); chain("Parallel", "parallel");
+                if (n == 2) chain("Perpendicular", "perpendicular");
+                if (all([](const Target& t) { return t.type == "line"; })) chain("Equal", "equal");
+            }
+        }
+        if (n >= 2 && all(circle)) {
+            chain("Equal", "equal"); chain("Coradial", "coradial");
+        }
+        if (n >= 2 && all(ellipse)) {
+            chain("Equal", "equal");
+        }
+        if (n >= 2 && all([](const Target& t) { return !t.point && t.type == "slot"; }))
+            chain("Equal slots (length and width)", "equal");
+        if (n >= 2 && all([](const Target& t) { return !t.point && t.type == "arc_slot"; })) {
+            chain("Equal arc slots (radius and width)", "equal");
+        }
+        if (n >= 2 && all([&](const Target& t) { return circle(t) || ellipse(t) ||
+                                                        (!t.point && t.type == "arc_slot"); })) {
+            chain("Concentric", "concentric");
+        }
+        if (n == 2) {
+            const auto& a = snapshot[0]; const auto& b = snapshot[1];
+            if (all(lengthCurve)) chain("Equal curve length", "equal_curve_length");
+            if ((a.splineEnd && (curve(b) || b.splineEnd)) ||
+                (b.splineEnd && (curve(a) || a.splineEnd))) {
+                const auto& end = a.splineEnd ? a : b;
+                const auto& other = a.splineEnd ? b : a;
+                offer("Tangent at spline endpoint", "tangent", {{end.ref, other.ref}});
+                if (other.splineEnd || other.type == "line" || circle(other))
+                    offer("Smooth (equal curvature)", "smooth", {{end.ref, other.ref}});
+            } else if (!a.point && !b.point &&
+                       ((a.type == "line" && (circle(b) || ellipse(b))) ||
+                        (b.type == "line" && (circle(a) || ellipse(a))) ||
+                        ((circle(a) || ellipse(a)) && (circle(b) || ellipse(b))))) {
+                chain("Tangent", "tangent");
+            }
+            if (a.point != b.point) {
+                const auto& p = a.point ? a : b; const auto& c = a.point ? b : a;
+                if (curve(c))
+                    offer(c.source >= 0 ? "On Edge" : "On curve", "point_on", {{p.ref, c.ref}});
+                if (c.type == "line" || c.type == "arc")
+                    offer("Midpoint", "midpoint", {{p.ref, c.ref}});
+                if (circle(c) || ellipse(c) || c.type == "arc_slot") {
+                    offer("Coincident to center", "coincident", {{p.ref, c.ref + ".center"}});
+                    offer("Concentric with point", "concentric", {{p.ref, c.ref}});
+                }
+            }
+        }
+        if (n == 3) {
+            std::vector<const Target*> points, curves;
+            for (const auto& t : snapshot) {
+                if (t.point) points.push_back(&t);
+                else if (curve(t)) curves.push_back(&t);
+            }
+            if (points.size() == 1 && curves.size() == 2)
+                offer("Intersection", "intersection", {{points[0]->ref, curves[0]->ref, curves[1]->ref}});
+            // An explicit virtual axis takes precedence; otherwise the last selected line is axis.
+            int axis = -1;
+            for (int i = 0; i < 3; ++i)
+                if (snapshot[i].ref.rfind("axis.", 0) == 0) axis = i;
+            if (axis < 0)
+                for (int i = 0; i < 3; ++i)
+                    if (snapshot[i].type == "line" && !snapshot[i].point) axis = i;
+            if (axis >= 0) {
+                std::vector<const Target*> subjects;
+                for (int i = 0; i < 3; ++i) if (i != axis) subjects.push_back(&snapshot[i]);
+                if ((subjects[0]->point && subjects[1]->point) ||
+                    (circle(*subjects[0]) && circle(*subjects[1])) ||
+                    (!subjects[0]->point && !subjects[1]->point &&
+                     subjects[0]->type == "line" && subjects[1]->type == "line"))
+                    offer("Symmetric (last line / selected axis)", "symmetric",
+                          {{subjects[0]->ref, subjects[1]->ref, snapshot[axis].ref}});
+            }
+        }
+        // Pierce is a coincident relation to the associative edge/plane intersection point.
+        if (!applied && relIds_.size() == 1 && relModelRefs_.size() == 1 &&
+            relModelRefs_[0].canPierce) {
+            float u = 0, v = 0;
+            const auto& h = relIds_[0];
+            const auto* e = entById(skBaseId(h));
+            if ((h == "origin" || (e && (e->type == "point" || h.find('.') != std::string::npos))) &&
+                relationPointUV(h, u, v)) {
+                any = true;
+                if (ui::kit::secondaryButton("Pierce##relation_pierce")) {
+                    auto ref = relModelRefs_[0].source;
+                    ref["mode"] = "pierce"; ref["near"] = {u, v};
+                    auto ops = nlohmann::json::array({
+                        {{"op", "sketch_convert"}, {"sketch", fid_}, {"refs", nlohmann::json::array({ref})},
+                         {"construction", true}, {"fix", true}, {"associative", true}},
+                        {{"op", "sketch_add_constraint"}, {"sketch", fid_},
+                         {"constraint", {{"type", "coincident"}, {"refs", {h, "$0"}}}}}});
+                    addRelationOps(st, ops, "Pierce"); applied = true;
+                }
+            }
+        }
+        if (n == 1 && relModelRefs_.empty()) each("Fix", "fix");
+        if (!applied && n == 1 && relModelRefs_.empty() && !snapshot[0].point &&
+            snapshot[0].type == "arc" &&
+            ui::kit::secondaryButton("Arc length dimension...##relation_arc_length")) {
+            const auto* e = entById(snapshot[0].ref);
+            if (e) {
+                float sweep = e->end - e->start;
+                if (e->ccw) { while (sweep < 0) sweep += 360.0f; }
+                else { while (sweep > 0) sweep -= 360.0f; }
+                dimType_ = "arc_length"; dimMeasured_ = e->radius * std::abs(sweep) * 3.141592653589793 / 180.0;
+                dimPending_ = {{"type", dimType_}, {"refs", {e->id}}};
+                SketchConstraint con; con.type = dimType_; con.refs = {e->id};
+                defaultPlacement(con, dimPlaceU_, dimPlaceV_);
+                tool_ = SketchTool::SmartDim; relPopupOpen_ = false; relIds_.clear();
+                dimOpenModify(ImGui::GetMousePos()); applied = true;
+            }
+        }
+        if (!any) ui::kit::dimText("No relations for this selection.");
+        if (!applied && ui::kit::secondaryButton("Select model geometry...##relation_model_pick")) {
+            relModelPicking_ = true; relPopupOpen_ = false;
+        }
+        if (!applied && (ui::kit::secondaryButton("Cancel##relation_cancel") ||
+                        ImGui::IsKeyPressed(ImGuiKey_Escape))) {
+            escHandled = true; relPopupOpen_ = false; relIds_.clear();
+        }
+    }
+    ImGui::End();
 }
 
 bool SketchMode::smartDimPicking() const {
@@ -1231,12 +1765,17 @@ bool SketchMode::cameraLock(float& yaw, float& pitch) const {
 }
 
 bool SketchMode::enterForFeature(AppState& st, const std::string& sketchFid) {
+    if (st.activeDocLockedByAgent()) {
+        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
+        return false;
+    }
     if (sketchFid.empty()) return false;
     fid_ = sketchFid;
     nlohmann::json res;
     if (!callSketch(st, "sketch_enter", nlohmann::json::object(), res)) { fid_.clear(); return false; }
     applyEnterResult(res);
     active_ = true;
+    docId_ = st.docMirror.docId();
     isNewEmpty_ = false;
     resetTool();
     // C34: remember the pre-sketch camera so exit can restore the user's 3D view
@@ -1275,6 +1814,10 @@ bool SketchMode::enterForFeature(AppState& st, const std::string& sketchFid) {
 
 // C37-D: create a sketch on an explicit plane ref and enter it. Returns the new feature id.
 std::string SketchMode::createSketchOnPlane(AppState& st, const nlohmann::json& planeRef) {
+    if (st.activeDocLockedByAgent()) {
+        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
+        return {};
+    }
     if (!st.docMirror.hasDoc()) {
         std::string err;
         if (!st.docMirror.newPart(st.worker, err)) { st.addLog("[sketch] newPart failed: " + err); return {}; }
@@ -1297,11 +1840,16 @@ std::string SketchMode::createSketchOnPlane(AppState& st, const nlohmann::json& 
 }
 
 void SketchMode::beginPlaneEdit(AppState& st, const std::string& sketchFid) {
+    if (st.activeDocLockedByAgent()) {
+        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
+        return;
+    }
     if (sketchFid.empty()) return;
     // The plane-pick overlay can't share the screen with an open sketcher — leave any active sketch
     // first (keep its entities), then arm the reparent pick.
     if (active_) exitSketch(st, /*keep=*/true);
     planeEditFid_ = sketchFid;
+    docId_ = st.docMirror.docId();
     planePicking_ = true;
     planeHover_ = -1;
     st.sketchPlanePickActive = true;
@@ -1310,6 +1858,13 @@ void SketchMode::beginPlaneEdit(AppState& st, const std::string& sketchFid) {
 }
 
 std::string SketchMode::consumePlanePick(AppState& st, const nlohmann::json& planeRef) {
+    if (st.activeDocLockedByAgent()) {
+        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
+        planePicking_ = false;
+        planeEditFid_.clear();
+        st.sketchPlanePickActive = false;
+        return {};
+    }
     // New-sketch path: defer to createSketchOnPlane and let the CALLER own the pick-flag lifecycle
     // (so a non-planar face leaves the user still in pick mode, as before).
     if (planeEditFid_.empty()) return createSketchOnPlane(st, planeRef);
@@ -1342,6 +1897,10 @@ std::string SketchMode::consumePlanePick(AppState& st, const nlohmann::json& pla
 }
 
 bool SketchMode::enterNewOnSelection(AppState& st) {
+    if (st.activeDocLockedByAgent()) {
+        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
+        return false;
+    }
     // C38 (S2): a double-fire of the ribbon "New Sketch" (sketch_new) while a sketch is already
     // entered would start a plane-pick over the live sketch and leave a zombie state. Refuse to
     // re-enter when already active — the user must exit the current sketch first.
@@ -1388,6 +1947,7 @@ bool SketchMode::enterNewOnSelection(AppState& st) {
         return !createSketchOnPlane(st, planeRef).empty();
     }
     // No usable selection: enter the interactive plane-pick (front/top/right or a planar face).
+    docId_ = st.docMirror.docId();
     planePicking_ = true;
     planeHover_ = -1;
     st.sketchPlanePickActive = true;
@@ -1408,7 +1968,7 @@ void SketchMode::exitSketch(AppState& st, bool keep) {
     resyncMirror(st);
     // Empty-sketch cleanup: Finish removes empty sketches; Cancel removes only a new empty sketch.
     // If dependents exist, keep the feature and warn rather than cascading their deletion.
-    if (ents_.empty() && (keep || isNewEmpty_)) {
+    if (!st.docLockedByAgent(docId_) && ents_.empty() && (keep || isNewEmpty_)) {
         std::vector<std::string> deps;
         collectSketchDependents(st, fid_, deps);
         if (deps.empty()) {
@@ -1424,6 +1984,7 @@ void SketchMode::exitSketch(AppState& st, bool keep) {
     active_ = false;
     isNewEmpty_ = false;
     fid_.clear();
+    docId_.clear();
     ents_.clear();
     cons_.clear();              // C37-D
     autoPlace_.clear(); projRefs_.clear();         // C37-D
@@ -1447,6 +2008,10 @@ void SketchMode::exitSketch(AppState& st, bool keep) {
 // that directly instead of a second rebuild, then mirror the exit-path teardown.
 void SketchMode::cancelSketch(AppState& st) {
     if (!active_) return;
+    if (st.docLockedByAgent(docId_)) {
+        exitSketch(st, /*keep=*/true);
+        return;
+    }
     cancelTool();
     if (cancelCheckpoint_.empty() || !st.docMirror.hasDoc() || !st.workerStarted) {
         // No checkpoint available — fall back to a plain exit (deletes an empty new sketch).
@@ -1489,6 +2054,7 @@ void SketchMode::cancelSketch(AppState& st) {
     active_ = false;
     isNewEmpty_ = false;
     fid_.clear();
+    docId_.clear();
     ents_.clear();
     cons_.clear();
     autoPlace_.clear(); projRefs_.clear();
@@ -1547,30 +2113,24 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
                                          mpStage_ = 0; mpSel_.clear();                     return true; }
     if (cmdId == "sk_circ_pattern")    { resetTool(); tool_ = SketchTool::CircPattern;
                                          mpStage_ = 0; mpSel_.clear();                     return true; }
-    // GUI-picking overhaul: if model faces/edges are already selected (picked before entering the
-    // sketch, or picked during it via the viewport's fallback model-pick), Convert applies to them
-    // immediately instead of requiring a click-after-button pick. Vertices aren't convertible
-    // (sketch_convert only takes edge/face refs), so a vertex-only selection falls through to the
-    // normal pick-mode arm below. The existing post-button pick mode remains the fallback when
-    // nothing usable is selected.
+    // Convert the complete model selection in a single operation and undo step.
     if (cmdId == "sk_convert_ent") {
         resetTool();
-        std::vector<nlohmann::json> refs;
+        nlohmann::json refs = nlohmann::json::array();
         for (const auto& it : st.selection.items()) {
             const render::PickHit& h = it.hit;
-            if (h.kind != render::PickKind::Edge && h.kind != render::PickKind::Face) continue;
+            const char* kind = h.kind == render::PickKind::Vertex ? "vertex" :
+                               h.kind == render::PickKind::Edge ? "edge" :
+                               h.kind == render::PickKind::Face ? "face" : nullptr;
+            if (!kind) continue;
             std::string perr;
-            std::string selStr = st.docMirror.resolvePick(
-                st.worker, h.body_id, h.kind == render::PickKind::Edge ? "edge" : "face",
-                h.topo_id, perr);
-            nlohmann::json selJs;
-            if (!selStr.empty()) { try { selJs = nlohmann::json::parse(selStr); } catch (...) {} }
-            if (selJs.is_object())
-                refs.push_back({{"kind", h.kind == render::PickKind::Edge ? "edge" : "face"},
-                                {"selector", selJs}});
+            const std::string selStr = !it.selector.empty() ? it.selector :
+                st.docMirror.resolvePick(st.worker, h.body_id, kind, h.topo_id, perr);
+            auto selector = nlohmann::json::parse(selStr, nullptr, false);
+            if (selector.is_object()) refs.push_back({{"kind", kind}, {"selector", selector}});
         }
         if (!refs.empty()) {
-            for (const auto& ref : refs) applyConvertRef(st, ref);
+            applyConvertRefs(st, refs);
             st.selection.clear();
             tool_ = SketchTool::None;
         } else {
@@ -1647,18 +2207,12 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
         }
         return true;
     }
-    // C42: minimal Add Relation popup over the current 1-2 entity selection (drawOverlay renders
-    // it; the offered relations depend on the selected entity types).
-    if (cmdId == "sk_relations") {
-        if (selIds_.empty()) {
-            st.toast(ui::ToastLevel::Info, "Add Relation: select sketch entities or points first");
-            return true;
-        }
-        relIds_ = selIds_;
-        relPopupOpen_ = true;
-        relPopupPos_ = ImGui::GetMousePos();
+    if (cmdId == "sk_display_relations") {
+        relationsPanel_.open = !relationsPanel_.open;
         return true;
     }
+    if (cmdId == "sk_fully_define") { fullyDefine(st); return true; }
+    if (cmdId == "sk_relations") { beginRelations(st); return true; }
     if (cmdId == "sk_fix") {
         // SolidWorks "Fix" relation as a one-click ribbon button: pin every selected entity/point
         // (the engine `fix` constraint zeroes that entity's DOF — sketch_solver.py). This is the
@@ -1745,6 +2299,12 @@ void SketchMode::clearEntitySelection() {
     hoverRelCid_.clear();
 }
 
+void SketchMode::selectEntities(const std::vector<std::string>& handles) {
+    selIds_.clear();
+    for (const auto& h : handles)
+        if (h == "origin" || entById(skBaseId(h))) selIds_.push_back(h);
+}
+
 void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSnaps_.clear();
                                centerline_ = false;   // centerline flavor clears on any tool change
                                conicRho_ = 0.5f; chainPrevId_.clear();
@@ -1755,6 +2315,7 @@ void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSn
                                hotRegion_ = entityLoopRegion_ = -1; dwellAccum_ = 0.0f; dwellEnt_.clear();
                                selRelIds_.clear(); hoverRelCid_.clear();
                                relPopupOpen_ = false; relIds_.clear();   // C42: relation popup too
+                               relModelPicking_ = false; relModelRefs_.clear(); relModelKey_.clear();
                                offsetStage_ = 0; offsetChain_.clear(); offsetFocusInput_ = false;
                                corner1Id_.clear();   // C52: drop a held first corner pick (keep radius/distance)
                                mpStage_ = 0; mpSel_.clear();   // C53: drop mirror/pattern selection (keep dims)
@@ -2152,10 +2713,11 @@ void SketchMode::applyPatternOp(AppState& st, bool circular) {
     mpStage_ = 0; mpSel_.clear();   // stay in the tool, ready for another pattern
 }
 
-// C53: apply one sketch_convert op for a model edge/face ref (a {kind, selector} or {datum} object).
-void SketchMode::applyConvertRef(AppState& st, const nlohmann::json& ref) {
+// Project all references together so conversion scales with the selection, not recompiles.
+void SketchMode::applyConvertRefs(AppState& st, const nlohmann::json& refs) {
+    if (!refs.is_array() || refs.empty()) return;
     nlohmann::json op = {{"op", "sketch_convert"}, {"sketch", fid_},
-                         {"refs", nlohmann::json::array({ref})}};
+                         {"refs", refs}, {"associative", true}};
     auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
     if (!r.ok) {
         std::string msg = r.error_message.empty() ? std::string("Convert failed") : r.error_message;
@@ -2462,6 +3024,54 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfe
                 best = d; snapHandle = "rim:" + e.id;
                 u = e.center[0] + e.radius * std::cos(a);
                 v = e.center[1] + e.radius * std::sin(a);
+            }
+        }
+    }
+    // 3b) Rim ∩ inline snap: while on a circle/arc rim, pull the point along the rim to where it
+    //     sits vertically/horizontally inline with the sketch origin, or with the curve's own
+    //     center (the quadrant points). Reported through `infer` like an alignment guide, with
+    //     snapHandle kept as "rim:<id>", so the placement records point_on + vertical/horizontal.
+    //     The origin is tried first, so it owns the tie when the curve is centered on it.
+    if (infer && snapHasPrefix(snapHandle, "rim:")) {
+        const SketchEntity* ce = entById(snapHandle.substr(4));
+        if (ce && ce->radius > 1e-5f) {
+            const float cx = ce->center[0], cy = ce->center[1], r = ce->radius;
+            float bestD = kRimInlinePx * ui::uiScale;
+            float bu = u, bv = v;
+            bool hitU = false, hitV = false;
+            std::string hitHandle;
+            ImVec2 hitSrc{0, 0};
+            auto tryInline = [&](const std::string& handle, float pu, float pv) {
+                if (excluded(handle)) return;
+                for (int axis = 0; axis < 2; ++axis) {      // 0: same u (vertical), 1: same v
+                    const float off = axis == 0 ? pu - cx : pv - cy;
+                    if (std::fabs(off) > r) continue;       // that line misses the rim
+                    const float h = std::sqrt(r * r - off * off);
+                    for (float sgn : {-1.0f, 1.0f}) {
+                        const float cu = axis == 0 ? pu : cx + sgn * h;
+                        const float cv = axis == 0 ? cy + sgn * h : pv;
+                        if (ce->type == "arc" &&
+                            !arcSweepContains(*ce, std::atan2(cv - cy, cu - cx) * 57.2957795f))
+                            continue;
+                        const ImVec2 s = uvToScreen(cu, cv);
+                        const ImVec2 ss = uvToScreen(pu, pv);
+                        // The rim passes through the source itself: that is a point snap's job.
+                        if (std::hypot(s.x - ss.x, s.y - ss.y) < 2.0f * snapPx) continue;
+                        const float d = std::hypot(s.x - cur.x, s.y - cur.y);
+                        if (d < bestD) {
+                            bestD = d; bu = cu; bv = cv;
+                            hitU = axis == 0; hitV = axis == 1;
+                            hitHandle = handle; hitSrc = ImVec2(pu, pv);
+                        }
+                    }
+                }
+            };
+            tryInline("origin", 0.0f, 0.0f);
+            tryInline(ce->id + ".center", cx, cy);
+            if (hitU || hitV) {
+                u = bu; v = bv;
+                if (hitU) { infer->alignU = true; infer->srcU = hitSrc; infer->srcUHandle = hitHandle; }
+                if (hitV) { infer->alignV = true; infer->srcV = hitSrc; infer->srcVHandle = hitHandle; }
             }
         }
     }
@@ -3490,8 +4100,11 @@ void SketchMode::applyDragSnapRelations(AppState& st, bool groupDrag) {
             push("point_on", {src, snap.substr(4)});
         else
             push("coincident", {snap, src});
-    } else if (!src.empty() || !alignSrcU.empty() || !alignSrcV.empty()) {
-        // Alignment guides -> two-point vertical (same u) / horizontal (same v) relations.
+    }
+    // Alignment guides (alone, or riding a rim snap) -> two-point vertical (same u) /
+    // horizontal (same v) relations.
+    if ((snap.empty() || snapHasPrefix(snap, "rim:")) &&
+        (!src.empty() || !alignSrcU.empty() || !alignSrcV.empty())) {
         const std::string srcU = alignSrcU.empty() ? src : alignSrcU;
         const std::string srcV = alignSrcV.empty() ? src : alignSrcV;
         if (infer.alignU && !infer.srcUHandle.empty() && !srcU.empty())
@@ -3808,18 +4421,27 @@ static std::string dimLabel(const SketchConstraint& c) {
 // A default annotation anchor in (u,v) for a constraint that has no stored placement: offset the
 // geometry's natural midpoint a bit so the line/arrows clear the entity.
 bool SketchMode::defaultPlacement(const SketchConstraint& c, float& pu, float& pv) const {
+    if ((c.type == "length" || c.type == "distance") && c.refs.size() == 1) {
+        const auto* e = entById(c.refs[0]);
+        if (!e || e->type != "line") return false;
+        const float dx = e->p2[0] - e->p1[0], dy = e->p2[1] - e->p1[1];
+        const float length = std::hypot(dx, dy);
+        pu = (e->p1[0] + e->p2[0]) * 0.5f + (length > 1e-6f ? -dy / length : 0) * 12.0f;
+        pv = (e->p1[1] + e->p2[1]) * 0.5f + (length > 1e-6f ? dx / length : 1) * 12.0f;
+        return true;
+    }
+    if (c.type == "arc_length" && c.refs.size() == 1) {
+        float u, v;
+        if (!relationPointUV(c.refs[0] + ".mid", u, v)) return false;
+        const auto* e = entById(c.refs[0]);
+        if (!e) return false;
+        pu = e->center[0] + (u - e->center[0]) * 1.3f;
+        pv = e->center[1] + (v - e->center[1]) * 1.3f;
+        return true;
+    }
     auto baseId = [](const std::string& h) { return h.substr(0, h.find('.')); };
     auto pt = [&](const std::string& h, float& u, float& v) -> bool {
-        if (baseId(h) == "origin") { u = 0; v = 0; return true; }
-        const SketchEntity* e = entById(baseId(h));
-        if (!e) return false;
-        if (h.find(".mid") != std::string::npos)      { u = (e->p1[0]+e->p2[0])*0.5f; v = (e->p1[1]+e->p2[1])*0.5f; }
-        else if (h.find(".p1") != std::string::npos)  { u = e->p1[0]; v = e->p1[1]; }
-        else if (h.find(".p2") != std::string::npos)  { u = e->p2[0]; v = e->p2[1]; }
-        else if (h.find(".center") != std::string::npos) { u = e->center[0]; v = e->center[1]; }
-        else if (e->type == "circle" || e->type == "arc") { u = e->center[0]; v = e->center[1]; }
-        else { u = e->p1[0]; v = e->p1[1]; }
-        return true;
+        return relationPointUV(h, u, v);
     };
     if (c.type == "radius" || c.type == "diameter") {
         const SketchEntity* e = c.refs.empty() ? nullptr : entById(baseId(c.refs[0]));
@@ -3836,10 +4458,10 @@ bool SketchMode::defaultPlacement(const SketchConstraint& c, float& pu, float& p
     }
     if (c.type == "angle") {
         if (c.refs.size() < 2) return false;
-        const SketchEntity* a = entById(baseId(c.refs[0])); const SketchEntity* b = entById(baseId(c.refs[1]));
-        if (!a || !b) return false;
-        pu = (a->p1[0] + a->p2[0] + b->p1[0] + b->p2[0]) * 0.25f;
-        pv = (a->p1[1] + a->p2[1] + b->p1[1] + b->p2[1]) * 0.25f;
+        ImVec2 a1, a2, b1, b2;
+        if (!relationLineUV(c.refs[0], a1, a2) || !relationLineUV(c.refs[1], b1, b2)) return false;
+        pu = (a1.x + a2.x + b1.x + b2.x) * 0.25f;
+        pv = (a1.y + a2.y + b1.y + b2.y) * 0.25f;
         return true;
     }
     // distance: midpoint of the two refs, pushed perpendicular by a fixed sketch offset.
@@ -3875,15 +4497,9 @@ void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 
     };
     auto baseId = [](const std::string& h) { return h.substr(0, h.find('.')); };
     auto handlePt = [&](const std::string& h, ImVec2& s) -> bool {
-        if (baseId(h) == "origin") { s = uvToScreen(0, 0); return true; }
-        const SketchEntity* e = entById(baseId(h));
-        if (!e) return false;
-        if (h.find(".mid") != std::string::npos)      s = uvToScreen((e->p1[0]+e->p2[0])*0.5f, (e->p1[1]+e->p2[1])*0.5f);
-        else if (h.find(".p1") != std::string::npos)  s = uvToScreen(e->p1[0], e->p1[1]);
-        else if (h.find(".p2") != std::string::npos)  s = uvToScreen(e->p2[0], e->p2[1]);
-        else if (h.find(".center") != std::string::npos) s = uvToScreen(e->center[0], e->center[1]);
-        else if (e->type == "circle" || e->type == "arc") s = uvToScreen(e->center[0], e->center[1]);
-        else s = uvToScreen(e->p1[0], e->p1[1]);
+        float u, v;
+        if (!relationPointUV(h, u, v)) return false;
+        s = uvToScreen(u, v);
         return true;
     };
     ImVec2 place = uvToScreen(pu, pv);
@@ -3891,6 +4507,21 @@ void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 
     ImVec2 ts = ImGui::CalcTextSize(lbl.c_str());
     const float th = dimThick(hovered);
     const float asz = dimArrowSz();
+    if (c.type == "arc_length" && c.refs.size() == 1) {
+        float u, v;
+        if (!relationPointUV(c.refs[0] + ".mid", u, v)) return;
+        const ImVec2 anchor = uvToScreen(u, v);
+        const std::string text = "Arc " + lbl;
+        const ImVec2 size = ImGui::CalcTextSize(text.c_str());
+        const ImVec2 tp(place.x + 4.0f * ui::uiScale, place.y - size.y * 0.5f);
+        dl->AddLine(anchor, place, lineCol, th); recSeg(anchor, place);
+        const float dx = place.x - anchor.x, dy = place.y - anchor.y;
+        const float length = std::hypot(dx, dy);
+        if (length > 1e-6f) arrowHead(dl, anchor, -dx / length, -dy / length, asz, lineCol);
+        labelChip(dl, tp, ImVec2(tp.x + size.x, tp.y + size.y));
+        dl->AddText(tp, textCol, text.c_str()); recText(tp, size);
+        return;
+    }
 
     // C51: a slot WIDTH dim (diameter/radius constraint on a slot) renders as a LINEAR dimension
     // across the slot at its spine midpoint — not a circle leader — with a plain (un-⌀'d) value.
@@ -3964,11 +4595,10 @@ void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 
 
     if (c.type == "angle") {
         if (c.refs.size() < 2) return;
-        const SketchEntity* a = entById(baseId(c.refs[0])); const SketchEntity* b = entById(baseId(c.refs[1]));
-        if (!a || !b) return;
-        // Vertex ≈ intersection of the two lines (fallback: midpoint of all 4 endpoints).
-        ImVec2 a1 = uvToScreen(a->p1[0], a->p1[1]), a2 = uvToScreen(a->p2[0], a->p2[1]);
-        ImVec2 b1 = uvToScreen(b->p1[0], b->p1[1]), b2 = uvToScreen(b->p2[0], b->p2[1]);
+        ImVec2 a1, a2, b1, b2;
+        if (!relationLineUV(c.refs[0], a1, a2) || !relationLineUV(c.refs[1], b1, b2)) return;
+        a1 = uvToScreen(a1.x, a1.y); a2 = uvToScreen(a2.x, a2.y);
+        b1 = uvToScreen(b1.x, b1.y); b2 = uvToScreen(b2.x, b2.y);
         float dax = a2.x - a1.x, day = a2.y - a1.y, dbx = b2.x - b1.x, dby = b2.y - b1.y;
         float den = dax * dby - day * dbx;
         ImVec2 vtx;
@@ -3994,11 +4624,15 @@ void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 
 
     // distance (point-point incl h/v, or point-line)
     ImVec2 P0, P1;
-    bool p0ok = !c.refs.empty() && handlePt(c.refs[0], P0);
+    const auto* singleLine = c.refs.size() == 1 ? entById(c.refs[0]) : nullptr;
+    if (singleLine && singleLine->type != "line") return;
     const SketchEntity* le = c.refs.size() > 1 ? entById(baseId(c.refs[1])) : nullptr;
-    bool secondIsLine = le && le->type == "line" && c.refs[1].find('.') == std::string::npos;
-    if (!p0ok) return;
-    if (secondIsLine) {
+    const bool secondIsLine = le && le->type == "line" && c.refs[1].find('.') == std::string::npos;
+    if (singleLine) {
+        P0 = uvToScreen(singleLine->p1[0], singleLine->p1[1]);
+        P1 = uvToScreen(singleLine->p2[0], singleLine->p2[1]);
+    } else if (c.refs.empty() || !handlePt(c.refs[0], P0)) return;
+    else if (secondIsLine) {
         // perpendicular foot of P0 onto the line
         ImVec2 l1 = uvToScreen(le->p1[0], le->p1[1]), l2 = uvToScreen(le->p2[0], le->p2[1]);
         float vx = l2.x - l1.x, vy = l2.y - l1.y; float L2 = vx * vx + vy * vy;
@@ -5939,6 +6573,20 @@ bool SketchMode::sketchOrbitCenter(Vec3& world) const {
 
 void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, const ImVec2& imgMax,
                              int vw, int vh, bool imgHovered) {
+    if ((active_ || planePicking_) && st.docLockedByAgent(
+            docId_.empty() ? st.docMirror.docId() : docId_)) {
+        std::string part = "part";
+        const std::string did = docId_.empty() ? st.docMirror.docId() : docId_;
+        for (const auto& tab : st.docTabs)
+            if (tab.docId == did) { part = tab.title; break; }
+        if (active_) exitSketch(st, /*keep=*/true);
+        planePicking_ = false;
+        planeEditFid_.clear();
+        st.sketchPlanePickActive = false;
+        st.toast(ui::ToastLevel::Info,
+                 "Agent started editing " + part + " — your sketch was kept and closed");
+        return;
+    }
     if (!st.renderer) return;
     // GUI-picking overhaul: default to "hot" (blocks the viewport's model-pick fallback) any time a
     // drawing/edit tool owns the cursor (tool_ != None) or before the idle-hover pass below runs;
@@ -6135,6 +6783,14 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     if (!active_) return;
     buildBasis(*st.renderer, imgMin, vw, vh);
     if (!basisOk_) return;
+    drawRelationList(st, skClipMin, skClipMax);
+    char relationsName[96];
+    std::snprintf(relationsName, sizeof(relationsName), "Display/Delete Relations###sketch_relations_%p",
+                  static_cast<void*>(&relationsPanel_));
+    const ImGuiWindow* relationsWindow = relationsPanel_.open ? ImGui::FindWindowByName(relationsName) : nullptr;
+    if (relationsWindow && relationsWindow->Rect().Contains(io.MousePos)) imgHovered = false;
+    const bool relationsOwnKeyboard = relationsWindow && GImGui->NavWindow &&
+        GImGui->NavWindow->RootWindow == relationsWindow->RootWindow;
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->PushClipRect(skClipMin, skClipMax, true);   // dodge the pinned FeatureManager / Copilot columns
@@ -6187,6 +6843,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // (Smart Dim pick-buffer clear, Offset stage back-out, Modify box close) set this so the
     // hover-independent catch-all at the end of drawOverlay doesn't also disarm the tool.
     bool escHandled = false;
+    // The relation popup is not modal; keep its clicks off the canvas below.
+    if (relPopupOpen_) imgHovered = false;
 
     // ---- faint grid (lines along sketch u/v through the origin neighbourhood) ----
     // Off by default (SolidWorks ships with the sketch grid off); right-click > Grid toggles it.
@@ -6284,7 +6942,17 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // donut hole with the live canvas showing through — no opaque punch (the sketch backdrop is
     // the 3D viewport, which no flat punch color can match). Legacy fill+punch remains as the
     // fallback for pathological loops the triangulator rejects.
-    rebuildRegions();
+    if (regionsDirty_) {
+        rebuildRegions();
+        for (auto& rg : regions_) {
+            std::vector<std::vector<ImVec2>> holes;
+            holes.reserve(rg.holeChildren.size());
+            for (int hi : rg.holeChildren)
+                if (hi >= 0 && hi < (int)regions_.size()) holes.push_back(regions_[(size_t)hi].poly);
+            skTriangulateWithHoles(rg.poly, holes, rg.triangles);
+        }
+        regionsDirty_ = false;
+    }
     if (hotRegion_ >= (int)regions_.size()) hotRegion_ = -1;
     {
         const ImU32 fillCol = col(pal.accent, 0.13f);
@@ -6312,11 +6980,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 for (const auto& p : regions_[(size_t)hi].poly) hp.push_back(uvToScreen(p.x, p.y));
                 if (hp.size() >= 3) holePolys.push_back(std::move(hp));
             }
-            std::vector<ImVec2> tris;
             const ImU32 fill = hot ? hotFill : fillCol;
-            if (skTriangulateWithHoles(sp, holePolys, tris)) {
-                for (size_t t = 0; t + 2 < tris.size(); t += 3)
-                    dl->AddTriangleFilled(tris[t], tris[t + 1], tris[t + 2], fill);
+            if (!rg.triangles.empty()) {
+                for (size_t t = 0; t + 2 < rg.triangles.size(); t += 3)
+                    dl->AddTriangleFilled(uvToScreen(rg.triangles[t].x, rg.triangles[t].y),
+                                          uvToScreen(rg.triangles[t+1].x, rg.triangles[t+1].y),
+                                          uvToScreen(rg.triangles[t+2].x, rg.triangles[t+2].y), fill);
             } else {
                 // Fallback: fill the outer loop and punch holes with opaque canvas.
                 dl->AddConcavePolyFilled(sp.data(), (int)sp.size(), fill);
@@ -6351,14 +7020,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         auto baseId = [](const std::string& h) { return h.substr(0, h.find('.')); };
         // Screen point a ref handle resolves to ("e3" entity, "e3.p2" point handle, or "origin").
         auto refScreen = [&](const std::string& h, ImVec2& s) -> bool {
-            if (baseId(h) == "origin") { s = uvToScreen(0, 0); return true; }
-            const SketchEntity* e = entById(baseId(h));
-            if (!e) return false;
-            if (h.find(".p1") != std::string::npos)           s = uvToScreen(e->p1[0], e->p1[1]);
-            else if (h.find(".p2") != std::string::npos)      s = uvToScreen(e->p2[0], e->p2[1]);
-            else if (h.find(".center") != std::string::npos)  s = uvToScreen(e->center[0], e->center[1]);
-            else if (e->type == "line")  s = uvToScreen((e->p1[0]+e->p2[0])*0.5f, (e->p1[1]+e->p2[1])*0.5f);
-            else                         s = uvToScreen(e->center[0], e->center[1]);
+            float u, v;
+            if (!relationPointUV(h, u, v)) return false;
+            s = uvToScreen(u, v);
             return true;
         };
         // Geometry point a badge POINTS AT: entity midpoint / the point / arc rim mid-sweep.
@@ -6421,71 +7085,79 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             out = ImVec2(s.x + off * 0.8f, s.y - off * 0.8f);
             return true;
         };
-        // (1) Collect every non-dimensional relation as a Badge. The chip glyph is a real
-        // vector mini-icon (drawRelationGlyph) keyed on the relation type — the old ASCII
-        // tokens ("//","col","cr") read as cramped letters, not constraint icons.
-        struct Badge { std::string cid; const char* type; const char* name; bool conflict;
-                       ImVec2 pos, anchor; };
-        std::vector<Badge> badges;
-        auto pushBadge = [&](const std::string& cid, const std::string& h, const char* type,
-                             bool conflict) {
-            ImVec2 pos, anchor;
-            if (!badgeAnchor(h, pos)) return;
-            if (!refAttach(h, anchor)) anchor = pos;
-            badges.push_back({cid, type, type, conflict, pos, anchor});
-        };
-        auto knownRel = [](const std::string& t) {
-            return t == "horizontal" || t == "vertical" || t == "parallel" ||
-                   t == "perpendicular" || t == "equal" || t == "coincident" ||
-                   t == "concentric" || t == "tangent" || t == "collinear" ||
-                   t == "coradial" || t == "midpoint" || t == "symmetric" || t == "fix";
-        };
-        for (const auto& c : cons_) {
-            if (c.isDimensional() || c.refs.empty()) continue;
-            if (!knownRel(c.type)) continue;
-            bool conflict = isConflict(c.id);
-            // Entity-pair relations get a badge on EACH ref (SolidWorks shows both sides);
-            // single-entity / point relations get one badge at the first ref.
-            bool pairRel = c.type == "parallel" || c.type == "perpendicular" ||
-                           c.type == "equal" || c.type == "tangent" || c.type == "concentric" ||
-                           c.type == "collinear" || c.type == "coradial" || c.type == "symmetric";
-            if (pairRel) { for (const auto& rh : c.refs) pushBadge(c.id, rh, c.type.c_str(), conflict); }
-            else         pushBadge(c.id, c.refs[0], c.type.c_str(), conflict);
-        }
-        // (2) Spread: 8 relaxation passes pushing any overlapping pair apart by half the overlap.
-        const float minD = bs + 2.0f * ui::uiScale;   // chip side + DPI-scaled breathing margin
-        for (int it = 0; it < 8; ++it) {
-            for (size_t i = 0; i < badges.size(); ++i) {
-                for (size_t j = i + 1; j < badges.size(); ++j) {
-                    float dx = badges[j].pos.x - badges[i].pos.x;
-                    float dy = badges[j].pos.y - badges[i].pos.y;
-                    float d = std::hypot(dx, dy);
-                    if (d >= minD) continue;
-                    float ox, oy;
-                    if (d < 1e-3f) { ox = minD * 0.5f; oy = 0.0f; }   // coincident -> shove along +x
-                    else { float push = (minD - d) * 0.5f; ox = dx / d * push; oy = dy / d * push; }
-                    badges[i].pos.x -= ox; badges[i].pos.y -= oy;
-                    badges[j].pos.x += ox; badges[j].pos.y += oy;
-                }
+        // Hover/selection/status only affect paint, not geometry-and-camera badge layout.
+        const std::array<float, 7> camera = {originS_.x, originS_.y, uAxisS_.x, uAxisS_.y,
+                                            vAxisS_.x, vAxisS_.y, ui::uiScale};
+        if (badgesRevision_ != entitiesRevision_ || badgesCamera_ != camera) {
+            relationBadges_.clear();
+            auto pushBadge = [&](const SketchConstraint& c, const std::string& h) {
+                ImVec2 pos, anchor;
+                if (!badgeAnchor(h, pos)) return;
+                if (!refAttach(h, anchor)) anchor = pos;
+                std::string type = c.type;
+                if (type == "coincident")
+                    for (const auto& ref : c.refs)
+                        if (const auto* e = entById(skBaseId(ref)); e && e->externalPierce)
+                            type = "pierce";
+                relationBadges_.push_back({c.id, std::move(type), pos, anchor});
+            };
+            for (const auto& c : cons_) {
+                if (c.isDimensional() || c.refs.empty()) continue;
+                const bool pair = c.type == "parallel" || c.type == "perpendicular" ||
+                    c.type == "equal" || c.type == "tangent" || c.type == "concentric" ||
+                    c.type == "collinear" || c.type == "coradial" || c.type == "symmetric" ||
+                    c.type == "smooth" || c.type == "equal_curve_length";
+                if (pair) { for (const auto& h : c.refs) pushBadge(c, h); }
+                else pushBadge(c, c.refs.front());
             }
+            // Spatial occupancy with path-compressed next-free rows avoids all-pairs scans.
+            const float cell = bs + 2.0f * ui::uiScale;
+            std::unordered_map<uint64_t, int> next;
+            next.reserve(relationBadges_.size());
+            auto key = [](int x, int y) {
+                return (uint64_t(uint32_t(x)) << 32) | uint32_t(y);
+            };
+            for (auto& b : relationBadges_) {
+                const int x = (int)std::floor(b.pos.x / cell);
+                const int start = (int)std::floor(b.pos.y / cell);
+                int y = start;
+                for (;;) {
+                    const auto it = next.find(key(x, y));
+                    if (it == next.end()) break;
+                    y = it->second;
+                }
+                for (int row = start; row != y;) {
+                    auto& jump = next[key(x, row)];
+                    const int old = jump; jump = y + 1; row = old;
+                }
+                next[key(x, y)] = y + 1;
+                b.pos = ImVec2((x + 0.5f) * cell, (y + 0.5f) * cell);
+            }
+            badgesRevision_ = entitiesRevision_;
+            badgesCamera_ = camera;
         }
         // (3) Draw: hairline leader (only when the chip drifted off its anchor) + chip + hit-rect.
         relHits_.clear();
-        for (const auto& b : badges) {
+        for (const auto& b : relationBadges_) {
             const ImVec2 gp = b.pos;
             if (std::hypot(gp.x - b.anchor.x, gp.y - b.anchor.y) > bs)
                 dl->AddLine(b.anchor, gp, leaderCol, 0.8f * ui::uiScale);
             ImVec2 c0(gp.x - bs * 0.5f, gp.y - bs * 0.5f), c1(gp.x + bs * 0.5f, gp.y + bs * 0.5f);
-            bool hot = isRelSelected(b.cid) || hoverRelCid_ == b.cid;
+            const bool hot = isRelSelected(b.cid) || hoverRelCid_ == b.cid || panelHoverRel_ == b.cid;
+            const bool conflict = isConflict(b.cid);
+            const auto skipped = skipped_.find(b.cid);
+            const ImU32 problem = conflict ? dimErrCol : col(pal.statusWarn);
+            const bool flagged = conflict || skipped != skipped_.end();
             dl->AddRectFilled(c0, c1, hot ? relSelBg : relBg, 3.5f * ui::uiScale);
-            dl->AddRect(c0, c1, b.conflict ? dimErrCol : (hot ? relSelBorder : relBorder),
-                        3.5f * ui::uiScale, 0, ((b.conflict || hot) ? 1.8f : 1.2f) * ui::uiScale);
-            drawRelationGlyph(dl, gp, bs, b.type,
-                              b.conflict ? dimErrCol : (hot ? relSelInk : relInk));
+            dl->AddRect(c0, c1, flagged ? problem : (hot ? relSelBorder : relBorder),
+                        3.5f * ui::uiScale, 0, ((flagged || hot) ? 1.8f : 1.2f) * ui::uiScale);
+            drawRelationGlyph(dl, gp, bs, b.type.c_str(),
+                              flagged ? problem : (hot ? relSelInk : relInk));
             relHits_.push_back({b.cid, c0, c1});
             if (imgHovered && io.MousePos.x >= c0.x && io.MousePos.x <= c1.x &&
                 io.MousePos.y >= c0.y && io.MousePos.y <= c1.y)
-                ImGui::SetTooltip("%s", b.name);
+                ImGui::SetTooltip("%s%s%s", b.type.c_str(), skipped != skipped_.end() ? ": " : "",
+                                  skipped != skipped_.end() ? skipped->second.c_str() : "");
         }
     }
 
@@ -6747,8 +7419,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 else continue;
             }
             bool conflict = isConflict(c.id);
-            ImU32 lc = conflict ? dimErrCol : dimLineCol;
-            ImU32 tc = conflict ? dimErrCol : (c.driven ? dimDrivenCol : dimTextCol);
+            const bool skipped = skipped_.find(c.id) != skipped_.end();
+            ImU32 lc = conflict ? dimErrCol : skipped ? col(pal.statusWarn) : dimLineCol;
+            ImU32 tc = conflict ? dimErrCol : skipped ? col(pal.statusWarn) :
+                       (c.driven ? dimDrivenCol : dimTextCol);
             DimHit hit; hit.cid = c.id;
             drawDimension(dl, c, lc, tc, false, pu, pv, &hit);
             drawn.push_back({&c, pu, pv, conflict, hit});
@@ -6798,6 +7472,33 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         dimHoverCid_ = newHover;
     }
 
+    if (!panelHoverRel_.empty()) {
+        for (const auto& c : cons_) {
+            if (c.id != panelHoverRel_) continue;
+            for (const auto& h : c.refs) {
+                const auto* e = entById(skBaseId(h));
+                if (h == "axis.h" || h == "axis.v") {
+                    const ImVec2 origin = uvToScreen(0, 0);
+                    const ImVec2 direction = h == "axis.h" ? uAxisS_ : vAxisS_;
+                    const float length = std::hypot(direction.x, direction.y);
+                    if (length > 1e-6f) {
+                        const float span = (imgMax.x - imgMin.x + imgMax.y - imgMin.y) / length;
+                        dl->AddLine(ImVec2(origin.x - direction.x * span, origin.y - direction.y * span),
+                                    ImVec2(origin.x + direction.x * span, origin.y + direction.y * span),
+                                    canvasAccent(), 2.0f * ui::uiScale);
+                    }
+                } else if (e && e->type != "point" && h.find('.') == std::string::npos)
+                    strokeEntityOutline(dl, *e, canvasAccent(), 3.0f * ui::uiScale);
+                else {
+                    float u, v;
+                    if (relationPointUV(h, u, v))
+                        dl->AddCircle(uvToScreen(u, v), 6.0f * ui::uiScale,
+                                      canvasAccent(), 0, 2.0f * ui::uiScale);
+                }
+            }
+        }
+    }
+
     // ---- selection / drag handles + interaction ----
     float mu = 0, mv = 0;
     if (imgHovered) screenToUV(io.MousePos, mu, mv);
@@ -6805,7 +7506,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // ---- C37-D: dimension text drag + double-click-to-edit + Delete ----
     // C47: also active while Smart Dimension is armed (SolidWorks lets you drag/edit existing
     // dims mid-dimensioning); the SmartDim pick-click below skips text-hovered clicks.
-    if ((tool_ == SketchTool::None || tool_ == SketchTool::SmartDim) && !dimPopupOpen_) {
+    if ((tool_ == SketchTool::None || tool_ == SketchTool::SmartDim) && !dimPopupOpen_ &&
+        !modelSelectionAllowed()) {
         // Begin a drag on the hovered dim text. C38 (S4): the second click of a double-click also
         // fires IsMouseClicked; exclude it so a double-click-to-edit never spawns a phantom drag
         // (which would commit a stray sketch_set_dim placement on release).
@@ -6848,7 +7550,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         // them, then re-solve). Virtual refs (origin / datum axes) are skipped. A hovered
         // dimension text takes priority (handler below) — keep this gated on dimHoverCid_.empty()
         // and BEFORE that handler (it clears the hover id).
-        if ((!selIds_.empty() || !selRelIds_.empty()) && dimHoverCid_.empty() && !io.WantTextInput &&
+        if (!relationsOwnKeyboard && (!selIds_.empty() || !selRelIds_.empty()) &&
+            dimHoverCid_.empty() && !io.WantTextInput &&
             (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
             // C50: selection may hold point handles ("e3.p2") — delete the OWNING entity, deduped.
             // C51: selected relations are deleted in the same batch via sketch_delete_constraint.
@@ -6888,7 +7591,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             selIds_.clear(); selRelIds_.clear();
         }
         // Delete key removes the hovered dim.
-        if (!dimHoverCid_.empty() && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+        if (!relationsOwnKeyboard && !dimHoverCid_.empty() && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
             nlohmann::json op = {{"op", "sketch_delete_constraint"}, {"sketch", fid_}, {"id", dimHoverCid_}};
             auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
             if (!r.ok) st.toast(ui::ToastLevel::Error, "Delete dimension: " + r.error_message);
@@ -6900,7 +7603,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
 
     // Drag (only when no drawing tool is active): hit-test handles, drag with sketch_drag, release
     // commits. At most one sketch_drag per frame (throttled by dragFrame_).
-    if (tool_ == SketchTool::None) {
+    if (tool_ == SketchTool::None && !modelSelectionAllowed()) {
         // C37-D: a hovered/dragging dimension text claims the click (dim drag/edit above handles it).
         auto toggleSel = [&](const std::string& id) {
             auto it = std::find(selIds_.begin(), selIds_.end(), id);
@@ -7233,14 +7936,14 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             const ImU32 halo = col(pal.viewportTop, 0.65f);
             ImVec2 sCur = uvToScreen(dragSnapUV_.x, dragSnapUV_.y);
             const float dd = 6.0f * ui::uiScale, dg = 4.0f * ui::uiScale, dw = 1.2f * ui::uiScale;
-            if (dragSnapHandle_.empty()) {
-                if (dragSnapInfer_.alignU)
-                    drawDashedLine(dl, uvToScreen(dragSnapInfer_.srcU.x, dragSnapInfer_.srcU.y),
-                                   sCur, inferCol, dw, dd, dg);
-                if (dragSnapInfer_.alignV)
-                    drawDashedLine(dl, uvToScreen(dragSnapInfer_.srcV.x, dragSnapInfer_.srcV.y),
-                                   sCur, inferCol, dw, dd, dg);
-            }
+            // Alignment guides fire alone or riding a rim snap (snapPoint never sets them under
+            // any other point snap).
+            if (dragSnapInfer_.alignU)
+                drawDashedLine(dl, uvToScreen(dragSnapInfer_.srcU.x, dragSnapInfer_.srcU.y),
+                               sCur, inferCol, dw, dd, dg);
+            if (dragSnapInfer_.alignV)
+                drawDashedLine(dl, uvToScreen(dragSnapInfer_.srcV.x, dragSnapInfer_.srcV.y),
+                               sCur, inferCol, dw, dd, dg);
             // Snap marker — same vocabulary as the drawing tools (dot / ring / diamond).
             const float ms = 5.0f * ui::uiScale;
             if (!dragSnapHandle_.empty()) {
@@ -7278,10 +7981,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 if (snapHasPrefix(dragSnapHandle_, "mid:")) chip("midpoint");
                 else if (snapHasPrefix(dragSnapHandle_, "rim:")) chip("point_on");
                 else chip("coincident");
-            } else {
-                if (dragSnapInfer_.alignU) chip("vertical");
-                if (dragSnapInfer_.alignV) chip("horizontal");
             }
+            if (dragSnapInfer_.alignU) chip("vertical");
+            if (dragSnapInfer_.alignV) chip("horizontal");
             if (!dragRelType_.empty()) chip(dragRelType_.c_str());
         }
         if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
@@ -7376,9 +8078,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         const bool allSelected = nRealEnts > 0 && nDelEnt >= nRealEnts;
 
         if (!selIds_.empty()) {
-            if (ImGui::MenuItem("Add Relation...")) {
-                relIds_ = selIds_; relPopupOpen_ = true; relPopupPos_ = ImGui::GetMousePos();
-            }
+            if (ImGui::MenuItem("Add Relation...")) beginRelations(st);
             ImGui::Separator();
         }
         if (canDelete) {
@@ -7419,6 +8119,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         }
         if (ImGui::MenuItem("Select")) resetTool();
         if (ImGui::MenuItem("Smart Dimension")) { resetTool(); tool_ = SketchTool::SmartDim; }
+        if (ImGui::MenuItem("Fully Define Sketch")) fullyDefine(st);
+        if (ImGui::MenuItem("Display/Delete Relations", nullptr, relationsPanel_.open))
+            relationsPanel_.open = !relationsPanel_.open;
         if (ImGui::MenuItem("Grid", nullptr, showGrid_)) showGrid_ = !showGrid_;
         if (ImGui::MenuItem("Automatic Relations", nullptr, autoAlignRelations_)) {
             autoAlignRelations_ = !autoAlignRelations_;
@@ -8130,21 +8833,24 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             // 1 px wide and otherwise loses the center pixel to the face. ~7 px grab radius (scaled).
             int grab = (int)std::lround(7.0f * ui::uiScale);
             render::PickHit h = st.idPass->pickFinalPreferEdge(px, py, vw, vh, grab);
-            if (h.valid() && (h.kind == render::PickKind::Edge || h.kind == render::PickKind::Face))
+            if (h.valid() && modelPickKind(h.kind))
                 extHit = h;
         }
         st.hover = extHit;   // standard 3D hover highlight on the pickable edge/face
         if (extHit.valid() && imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             std::string perr;
-            std::string selStr = st.docMirror.resolvePick(
-                st.worker, extHit.body_id,
-                extHit.kind == render::PickKind::Edge ? "edge" : "face", extHit.topo_id, perr);
-            nlohmann::json selJs;
-            if (!selStr.empty()) { try { selJs = nlohmann::json::parse(selStr); } catch (...) {} }
-            if (selJs.is_object()) {
-                applyConvertRef(st, nlohmann::json{
-                    {"kind", extHit.kind == render::PickKind::Edge ? "edge" : "face"},
-                    {"selector", selJs}});
+            const auto ref = modelPickReference(st, extHit, perr);
+            if (ref.is_object()) {
+                nlohmann::json refs = nlohmann::json::array();
+                for (const auto& item : st.selection.items()) {
+                    if (!modelPickKind(item.hit.kind)) continue;
+                    const auto selected = modelPickReference(st, item.hit, perr);
+                    if (selected.is_object() && std::find(refs.begin(), refs.end(), selected) == refs.end())
+                        refs.push_back(selected);
+                }
+                if (std::find(refs.begin(), refs.end(), ref) == refs.end()) refs.push_back(ref);
+                applyConvertRefs(st, refs);
+                st.selection.clear();
             } else {
                 st.toast(ui::ToastLevel::Warn, "Can't convert that geometry" +
                          (perr.empty() ? std::string() : ": " + perr));
@@ -8195,6 +8901,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                             su = first ? u1 : u2; sv = first ? v1 : v2;
                             snapH = "tan:" + ce->id;
                             tanSnap = true;
+                            infer.alignU = infer.alignV = false;  // tangent contact owns the point
                         }
                     }
                 }
@@ -8202,7 +8909,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 // (b) START point sits on a rim: keep the segment tangent at that contact.
                 if (!toolSnaps_.empty() && (snapHasPrefix(toolSnaps_[0], "rim:") ||
                                             snapHasPrefix(toolSnaps_[0], "tan:"))) {
-                    const SketchEntity* ce = entById(toolSnaps_[0].substr(4));
+                    const SketchEntity* ce = entById(snapPrimary(toolSnaps_[0]).substr(4));
                     if (ce && (ce->type == "circle" || ce->type == "arc")) {
                         float tx = -(a.y - ce->center[1]), ty = a.x - ce->center[0];
                         float tL = std::hypot(tx, ty);
@@ -8717,14 +9424,17 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             !(tool_ == SketchTool::Text && textPopupOpen_)) {
             // When no point snap fired but the click landed on a v/h alignment guide, record the
             // alignment so the commit can write it as a real vertical/horizontal relation (the new
-            // point's handle is filled in per-tool via pushSnapConstraint). Positional-only if the
-            // toggle is off — then this stays "" and only the pulled coordinate persists.
+            // point's handle is filled in per-tool via pushSnapConstraint). A rim snap pulled
+            // inline with the origin/center keeps the rim record and carries the alignment as a
+            // ';' rider. Positional-only if the toggle is off — then only the pulled coordinate
+            // (and any rim relation) persists.
             std::string clickSnap = snapH;
-            if (clickSnap.empty() && autoAlignRelations_ && inferenceOn_ &&
-                (infer.alignU || infer.alignV)) {
+            if ((clickSnap.empty() || snapHasPrefix(clickSnap, "rim:")) && autoAlignRelations_ &&
+                inferenceOn_ && (infer.alignU || infer.alignV)) {
                 std::string uH = infer.alignU ? infer.srcUHandle : std::string();
                 std::string vH = infer.alignV ? infer.srcVHandle : std::string();
-                if (!uH.empty() || !vH.empty()) clickSnap = "align:" + uH + "|" + vH;
+                if (!uH.empty() || !vH.empty())
+                    clickSnap += (clickSnap.empty() ? "align:" : ";align:") + uH + "|" + vH;
             }
             toolUV_.push_back(ImVec2(su, sv));
             toolSnaps_.push_back(clickSnap);
@@ -8798,7 +9508,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 // plain handle -> coincident; "mid:" -> midpoint; "rim:"/"tan:" -> point_on
                 // (+ one tangent per segment).
                 bool tangentEmitted = false;
-                auto snapCons = [&](const std::string& snap, const char* pt) {
+                auto snapCons = [&](const std::string& rec, const char* pt) {
+                    const std::string snap = snapPrimary(rec);
+                    if (snap.size() < rec.size())   // alignment rider ("rim:e5;align:|origin")
+                        pushSnapConstraint(rec.substr(snap.size() + 1), pt, cs);
                     if (snap.empty()) return;
                     if (snapHasPrefix(snap, "align:")) { pushSnapConstraint(snap, pt, cs); return; }
                     if (snapHasPrefix(snap, "mid:")) {
@@ -8884,9 +9597,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 // curve at the radius pick is left positional (ambiguous curve-curve relation).
                 nlohmann::json cs = nlohmann::json::array();
                 pushSnapConstraint(toolSnaps_[0], "$self.center", cs);
-                if (!toolSnaps_[1].empty() && !snapHasPrefix(toolSnaps_[1], "mid:") &&
-                    !snapHasPrefix(toolSnaps_[1], "rim:") && !snapHasPrefix(toolSnaps_[1], "tan:"))
-                    cs.push_back({{"type", "point_on"}, {"refs", {toolSnaps_[1], "$self"}}});
+                if (const std::string onRef = coincRef(toolSnaps_[1]); !onRef.empty())
+                    cs.push_back({{"type", "point_on"}, {"refs", {onRef, "$self"}}});
                 addEntity(st, ent, cs);
                 resetTool();
             } else if (tool_ == SketchTool::ArcCenter && toolUV_.size() == 3) {
@@ -9178,13 +9890,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     {"p", nlohmann::json::array({toolUV_[0].x, toolUV_[0].y})}};
                 // C49: a snapped Point pick gets the matching relation (its handle is "$self.p").
                 nlohmann::json cs = nlohmann::json::array();
-                const std::string& sp = toolSnaps_[0];
-                if (snapHasPrefix(sp, "mid:"))
-                    cs.push_back({{"type", "midpoint"}, {"refs", {"$self.p", sp.substr(4)}}});
-                else if (snapHasPrefix(sp, "rim:") || snapHasPrefix(sp, "tan:"))
-                    cs.push_back({{"type", "point_on"}, {"refs", {"$self.p", sp.substr(4)}}});
-                else if (!sp.empty())
-                    cs.push_back({{"type", "coincident"}, {"refs", {sp, "$self.p"}}});
+                pushSnapConstraint(toolSnaps_[0], "$self.p", cs);
                 addEntity(st, ent, cs);
                 toolUV_.clear(); toolSnaps_.clear();   // stay armed (SW point tool repeats)
             } else if (tool_ == SketchTool::Ellipse && toolUV_.size() == 3) {
@@ -9351,11 +10057,21 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         // id-buffer for a model edge/face. st.hover drives the standard 3D hover highlight
         // (rendered next frame); a click projects the reference into the sketch as a FIXED
         // construction entity (worker sketch_project_ref) and chains it as a pick.
+        std::string datumAxis;
+        if (canAddPick && imgHovered && !hoverHit) {
+            std::string axisName;
+            ImVec2 a, b;
+            if (hitTestDatumAxis(st, io.MousePos, imgMin, vw, vh, a, b, datumAxis, axisName) &&
+                (datumAxis == "axis.x" || datumAxis == "axis.y" || datumAxis == "axis.z")) {
+                dl->AddLine(a, b, hiCol, 2.5f * sdS);
+            } else datumAxis.clear();
+        }
         render::PickHit extHit{};
-        if (canAddPick && imgHovered && !hoverHit && st.hasDocMesh && st.idPass) {
+        if (canAddPick && imgHovered && !hoverHit && datumAxis.empty() && st.hasDocMesh && st.idPass) {
             int px = (int)(io.MousePos.x - imgMin.x), py = (int)(io.MousePos.y - imgMin.y);
-            render::PickHit h = st.idPass->pickFinal(px, py, vw, vh);
-            if (h.valid() && (h.kind == render::PickKind::Edge || h.kind == render::PickKind::Face))
+            render::PickHit h = st.idPass->pickFinalPreferEdge(px, py, vw, vh,
+                (int)std::lround(7.0f * ui::uiScale));
+            if (h.valid() && modelPickKind(h.kind))
                 extHit = h;
         }
         st.hover = extHit;   // empty hit = no highlight; cleared when SmartDim disarms (below)
@@ -9391,19 +10107,16 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         pickAdded = true;
                         dimBuildPending(io.MousePos, mu, mv);   // refresh the combo immediately
                     }
+                } else if (!datumAxis.empty()) {
+                    if (!addProjectedDimRef(st, {{"datum", datumAxis}}, "datum:" + datumAxis).empty()) {
+                        pickAdded = true;
+                        dimBuildPending(io.MousePos, mu, mv);
+                    }
                 } else if (extHit.valid()) {
                     std::string perr;
-                    std::string selStr = st.docMirror.resolvePick(
-                        st.worker, extHit.body_id,
-                        extHit.kind == render::PickKind::Edge ? "edge" : "face",
-                        extHit.topo_id, perr);
-                    nlohmann::json selJs;
-                    if (!selStr.empty()) { try { selJs = nlohmann::json::parse(selStr); } catch (...) {} }
-                    if (selJs.is_object()) {
-                        nlohmann::json ref = {
-                            {"kind", extHit.kind == render::PickKind::Edge ? "edge" : "face"},
-                            {"selector", selJs}};
-                        if (!addProjectedDimRef(st, ref, selStr).empty()) {
+                    const auto ref = modelPickReference(st, extHit, perr);
+                    if (ref.is_object()) {
+                        if (!addProjectedDimRef(st, ref, ref.dump()).empty()) {
                             pickAdded = true;
                             dimBuildPending(io.MousePos, mu, mv);
                         }
@@ -9731,6 +10444,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             const char* title = dimType_ == "diameter" ? "\xE2\x8C\x80 Diameter"
                               : dimType_ == "radius"   ? "R Radius"
                               : dimType_ == "angle"    ? "\xE2\x88\xA0 Angle"
+                              : dimType_ == "arc_length" ? "Arc length"
                               : "Distance";
             // ---- header row: title (accent) + live measured readout on the right ----
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
@@ -9931,148 +10645,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     drawEqCurvePopup(st, escHandled);
     drawAirfoilPopup(st, escHandled);
 
-    // ---- C50: Add Relation popup over an N-element selection (entities and/or point handles) ----
-    // Classifies the snapshotted selection and offers the SolidWorks relations valid for it:
-    // points -> coincident / horizontal (same Y) / vertical (same X); lines -> horizontal /
-    // vertical / collinear / perpendicular(2) / parallel / equal / symmetric(3); circles/arcs ->
-    // coradial / equal / concentric / tangent(2); line+circle -> tangent; point+line -> point_on /
-    // midpoint; 2 same-kind subjects + 1 line -> symmetric (axis last). Pair relations chain to the
-    // first ref (e0~e1, e0~e2, …); symmetric uses an explicit ordered [a,b,axis] ref list.
-    if (relPopupOpen_) {
-        for (const auto& h : relIds_) {
-            const std::string base = h.substr(0, h.find('.'));
-            // Virtual refs (origin / datum axes) are not in ents_ — keep them.
-            if (base == "origin" || base.rfind("axis.", 0) == 0) continue;
-            if (!entById(base)) { relPopupOpen_ = false; relIds_.clear(); break; }
-        }
-    }
-    if (relPopupOpen_) {
-        // Classify: a handle with a '.' (or a bare point entity) is a POINT; bare line/circle ids
-        // are entities. (Centers select as "eN.center" = point.) The bare "origin" is a point too.
-        auto isPointHandle = [&](const std::string& h) -> bool {
-            if (h == "origin") return true;
-            if (h.find('.') != std::string::npos) return true;
-            const SketchEntity* e = entById(h);
-            return e && e->type == "point";
-        };
-        int nPts = 0, nLines = 0, nCircles = 0, nOther = 0;
-        for (const auto& h : relIds_) {
-            if (isPointHandle(h)) { ++nPts; continue; }
-            const SketchEntity* e = entById(h);
-            if (!e) { ++nOther; continue; }
-            if (e->type == "line") ++nLines;
-            else if (e->type == "circle" || e->type == "arc") ++nCircles;
-            else ++nOther;
-        }
-        const int n = (int)relIds_.size();
-
-        ImGui::SetNextWindowPos(relPopupPos_, ImGuiCond_Appearing);
-        ImGui::SetNextWindowBgAlpha(0.98f);
-        if (ImGui::Begin("##SketchRel", nullptr,
-                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
-                         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
-            ImGui::Text("Add Relation  (%d selected)", n);
-            ImGui::PopStyleColor();
-            ImGui::Separator();
-            bool any = false;
-            // Emit a relation. mode: 'each' = one constraint per ref ($self-style single ref);
-            // 'chain' = relate refs[0] to every other ref; 'pair' = exactly refs[0],refs[1].
-            auto emit = [&](const char* label, const char* type, char mode) {
-                any = true;
-                if (!ImGui::MenuItem(label)) return;
-                nlohmann::json ops = nlohmann::json::array();
-                if (mode == 'e') {
-                    for (const auto& h : relIds_)
-                        ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_},
-                            {"constraint", {{"type", type}, {"refs", nlohmann::json::array({h})}}}});
-                } else if (mode == 'p') {
-                    ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_},
-                        {"constraint", {{"type", type}, {"refs", nlohmann::json::array({relIds_[0], relIds_[1]})}}}});
-                } else {  // chain
-                    for (size_t i = 1; i < relIds_.size(); ++i)
-                        ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_},
-                            {"constraint", {{"type", type}, {"refs", nlohmann::json::array({relIds_[0], relIds_[i]})}}}});
-                }
-                addRelationOps(st, ops, label);
-            };
-
-            // Emit a single multi-ref constraint with an explicit ordered ref list (used by
-            // symmetric, whose engine refs are [subjectA, subjectB, axisLine] — axis LAST).
-            auto emitOrdered = [&](const char* label, const char* type,
-                                   const std::vector<std::string>& refs) {
-                any = true;
-                if (!ImGui::MenuItem(label)) return;
-                nlohmann::json arr = nlohmann::json::array();
-                for (const auto& r : refs) arr.push_back(r);
-                nlohmann::json ops = nlohmann::json::array();
-                ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_},
-                    {"constraint", {{"type", type}, {"refs", arr}}}});
-                addRelationOps(st, ops, label);
-            };
-
-            const bool onlyPts    = nPts == n;
-            const bool onlyLines  = nLines == n;
-            const bool onlyCircs  = nCircles == n;
-
-            if (onlyPts && n >= 2) {
-                emit("Coincident / Merge", "coincident", n == 2 ? 'p' : 'c');
-                emit("Horizontal (align Y)", "horizontal", 'c');
-                emit("Vertical (align X)",   "vertical",   'c');
-            } else if (onlyLines && n == 1) {
-                emit("Horizontal", "horizontal", 'e');
-                emit("Vertical",   "vertical",   'e');
-                emit("Fix",        "fix",        'e');
-            } else if (onlyLines && n >= 2) {
-                // Order mirrors SolidWorks' line context menu: H, V, Collinear, Perp, Parallel, Equal.
-                emit("Horizontal (each)", "horizontal", 'e');
-                emit("Vertical (each)",   "vertical",   'e');
-                emit("Collinear", "collinear", 'c');
-                if (n == 2) emit("Perpendicular", "perpendicular", 'p');
-                emit("Parallel", "parallel", 'c');
-                emit("Equal", "equal", 'c');
-                // 3 lines selected: offer Symmetric with the LAST-picked line as the mirror axis
-                // (relIds_ preserves pick order). subjects = the two earlier lines.
-                if (n == 3)
-                    emitOrdered("Symmetric (last line = axis)", "symmetric",
-                                {relIds_[0], relIds_[1], relIds_[2]});
-            } else if (onlyCircs && n >= 2) {
-                emit("Collinear / Coradial", "coradial", 'c');  // same center + same radius
-                emit("Equal", "equal", 'c');
-                emit("Concentric", "concentric", 'c');
-                if (n == 2) emit("Tangent", "tangent", 'p');    // curve <-> curve tangency
-            } else if (n == 2 && nLines == 1 && nCircles == 1) {
-                emit("Tangent", "tangent", 'p');
-            } else if (n == 2 && nPts == 1 && nLines == 1) {
-                // point + line. Two readings: point ON the line, or point at the line MIDPOINT.
-                // Both expect refs [point, line]; reorder so the point handle is first.
-                if (!isPointHandle(relIds_[0])) std::swap(relIds_[0], relIds_[1]);
-                emit("Coincident (point on line)", "point_on", 'p');
-                emit("Midpoint (point at line center)", "midpoint", 'p');
-            } else if (n == 3 && nLines == 1 && (nPts == 2 || nCircles == 2)) {
-                // Two same-kind subjects + one line: mirror the subjects across that line.
-                // refs = [subjectA, subjectB, axisLine]; pull the lone line out to the end.
-                std::vector<std::string> subs; std::string axis;
-                for (const auto& h : relIds_) {
-                    const SketchEntity* e = isPointHandle(h) ? nullptr : entById(h);
-                    if (e && e->type == "line") axis = h; else subs.push_back(h);
-                }
-                if (subs.size() == 2 && !axis.empty())
-                    emitOrdered("Symmetric (across line)", "symmetric", {subs[0], subs[1], axis});
-            } else if (n == 1) {
-                // The origin is implicitly fixed; "Fix" on it would be a dead no-op constraint.
-                if (relIds_[0] != "origin") emit("Fix", "fix", 'e');
-            }
-            if (!any) ImGui::TextDisabled("No relations for this selection");
-            ImGui::Separator();
-            if (ImGui::MenuItem("Cancel") ||
-                (relPopupOpen_ && ImGui::IsKeyPressed(ImGuiKey_Escape))) {
-                escHandled = true;
-                relPopupOpen_ = false; relIds_.clear();
-            }
-        }
-        ImGui::End();
-    }
+    drawAddRelations(st, escHandled);
 
     // ---- C41 (T1): catch-all Esc — disarm the armed tool / in-progress chain even when the
     // viewport image is NOT hovered. The more specific handlers above run first: the ones that

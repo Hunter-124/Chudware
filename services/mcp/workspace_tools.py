@@ -15,6 +15,7 @@ from typing import Any
 
 from services.mcp import core_bridge as cb
 from services.mcp.tool_registry import model_selectors
+from services.agent import request_context
 
 
 def _current_doc_id() -> str:
@@ -40,11 +41,11 @@ def _current_doc_id() -> str:
 def _turn_project_dir() -> str:
     """The project directory of the current turn, or "" when none is set.
 
-    The online turn sets CHUDWARE_PROJECT_DIR and CHUDWARE_FS_ROOT for its whole
-    lifetime (services/agent/online_turn.py). The project dir has priority.
+    The online turn binds request-local roots (services/agent/online_turn.py).
+    The project dir has priority over the filesystem root.
     """
     for key in ("CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT"):
-        raw = os.environ.get(key, "").strip()
+        raw = request_context.root_value(key).strip()
         if raw:
             return os.path.normpath(os.path.abspath(os.path.expanduser(raw)))
     return ""
@@ -148,6 +149,8 @@ def register_workspace_tools(mcp) -> None:
         else:
             session = reg.get(rid)
             if session is None:
+                if request_context.in_cell():
+                    return {"ok": False, "error": "not_found", "reason": "not_found"}
                 # Production code registers a WorkspaceSession only for a multi-doc
                 # orchestration. A GUI chat turn ("gui-...") or a mission run id
                 # never resolves here, so the error must teach the call that works.
@@ -206,7 +209,12 @@ def register_workspace_tools(mcp) -> None:
         """
         from services.agent.workspace import read_doc_events
 
-        events = read_doc_events(run_id, doc_id, since_seq=since_seq)
+        try:
+            events = read_doc_events(run_id, doc_id, since_seq=since_seq)
+        except KeyError:
+            if request_context.in_cell():
+                return {"ok": False, "error": "not_found", "reason": "not_found"}
+            raise
         return {
             "ok": True,
             "run_id": run_id,

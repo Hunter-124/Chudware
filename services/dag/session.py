@@ -22,6 +22,7 @@ unexecutable, and every retry burned a billed completion.
 from __future__ import annotations
 
 from typing import Any
+from services.agent.request_context import owner_key, scoped_key
 
 #: Canonical slot.  ``mcp_tools`` aliases this exact dict as its ``_LAST`` so
 #: reads and writes on either name address one piece of state.
@@ -34,6 +35,14 @@ LAST: dict[str, Any] = {"graph_json": None, "graph_from": "", "run_id": ""}
 #: fact gate-paused.  Whoever ran or resumed the run in this process DID see the
 #: truth; this is where they leave it.
 RUNS: dict[str, dict[str, Any]] = {}
+_ACTOR_LAST: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def _last() -> dict[str, Any]:
+    owner = owner_key()
+    if owner is None:
+        return LAST
+    return _ACTOR_LAST.setdefault(owner, {"graph_json": None, "graph_from": "", "run_id": ""})
 
 
 def remember_graph(graph: Any, source: str = "") -> bool:
@@ -48,31 +57,31 @@ def remember_graph(graph: Any, source: str = "") -> bool:
     nodes = graph.get("nodes")
     if not isinstance(nodes, list) or not nodes:
         return False
-    LAST["graph_json"] = graph
-    LAST["graph_from"] = str(source or graph.get("id") or "")
+    _last()["graph_json"] = graph
+    _last()["graph_from"] = str(source or graph.get("id") or "")
     return True
 
 
 def planned_graph() -> dict | None:
     """The last planned graph, or None when nothing has been planned."""
-    graph = LAST["graph_json"]
+    graph = _last()["graph_json"]
     return graph if isinstance(graph, dict) else None
 
 
 def planned_from() -> str:
     """Label of whatever produced the planned graph (run id or graph id)."""
-    return str(LAST["graph_from"] or "")
+    return str(_last()["graph_from"] or "")
 
 
 def remember_run(run_id: Any) -> None:
     """Record *run_id* as the most recent run started in this session."""
     if isinstance(run_id, str) and run_id:
-        LAST["run_id"] = run_id
+        _last()["run_id"] = run_id
 
 
 def last_run() -> str:
     """The most recent run id started in this session, or ""."""
-    return str(LAST["run_id"] or "")
+    return str(_last()["run_id"] or "")
 
 
 def remember_result(result: Any) -> None:
@@ -94,7 +103,7 @@ def remember_result(result: Any) -> None:
                 node = payload.get("node_id") or payload.get("node") or payload.get("id")
                 if node:
                     gates.append(str(node))
-    RUNS[run_id] = {
+    RUNS[scoped_key(run_id)] = {
         "status": str(result.get("status") or "unknown"),
         "gates": gates,
         "gate_pending": bool(interrupted),
@@ -103,13 +112,18 @@ def remember_result(result: Any) -> None:
 
 def run_result(run_id: str) -> dict[str, Any] | None:
     """What this process last observed about *run_id*, or None if it never ran it."""
-    state = RUNS.get(str(run_id))
+    state = RUNS.get(scoped_key(str(run_id)))
     return dict(state) if isinstance(state, dict) else None
 
 
 def reset() -> None:
     """Drop the session memory (tests; a fresh process starts here anyway)."""
-    LAST["graph_json"] = None
-    LAST["graph_from"] = ""
-    LAST["run_id"] = ""
-    RUNS.clear()
+    _last().update({"graph_json": None, "graph_from": "", "run_id": ""})
+    owner = owner_key()
+    if owner is None:
+        RUNS.clear()
+    else:
+        prefix = "(" + repr(owner) + ", "
+        for key in list(RUNS):
+            if key.startswith(prefix):
+                del RUNS[key]

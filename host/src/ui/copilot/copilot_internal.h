@@ -176,6 +176,9 @@ extern double            s_chatHistoryLastPersist;
 // Batch `batchId` anywhere in `msgs` (newest message first); `owner` receives its message.
 AskBatch* findAskBatch(std::vector<ChatMsg>& msgs, const std::string& batchId,
                        ChatMsg** owner = nullptr);
+// Restored turns saved before question markers existed: anchor each unmarked ask_user batch
+// right after its ask_user tool row so the card draws where the agent asked.
+void anchorLegacyAsks(ChatMsg& m);
 
 
 namespace ui {
@@ -275,14 +278,15 @@ std::string timelineInlineProse(const ChatMsg& m);
 std::string timelineProseTail(const ChatMsg& m);
 
 // Packed tool-row detail: feedTurnActivity writes args_preview, then the capped failure text
-// after "\n\x1eERR\x1e\n", artifact paths after "\n\x1eART\x1e\n", and a per-call META trailer
-// after "\n\x1eMETA\x1e\n" ("<epoch-ts>\t<cache-read-tokens>" — the timestamp + prompt-cache
-// read of the completion that produced the call). ActivityItem gains no fields — app_state.h
-// is integrator-owned. chatActivityCopyText (ui_common) splits the same way so a clipboard
-// copy never carries the raw \x1e marker bytes.
+// after "\n\x1eERR\x1e\n", the image caption after "\n\x1eCAP\x1e\n", artifact paths after
+// "\n\x1eART\x1e\n", and a per-call META trailer after "\n\x1eMETA\x1e\n" ("<epoch-ts>\t
+// <cache-read-tokens>" — the timestamp + prompt-cache read of the completion that produced the
+// call). ActivityItem gains no fields — app_state.h is integrator-owned. chatActivityCopyText
+// (ui_common) splits the same way so a clipboard copy never carries the raw \x1e marker bytes.
 struct ToolRowDetail {
     std::string args;
     std::string err;
+    std::string cap;     // CAP trailer: the text the tool returned beside its images
     std::string arts;
     double ts = 0.0;     // META trailer: when the call ran (epoch s); 0 = unknown
     int cacheRead = 0;   // META trailer: tokens the producing completion read from cache
@@ -310,8 +314,13 @@ void agentAnswerDispatch(AppState& st, const std::string& runId, const std::stri
 void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts);
 void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts);
 // The online agent's ask_user question batches on this turn: interactive while pending,
-// a compact read-only summary once resolved (cards.cpp).
+// a compact read-only summary once resolved (cards.cpp). drawAskCards draws only batches with
+// no timeline marker (turns saved before markers existed); a marked batch draws at its marker
+// through drawAskMarker, i.e. where the agent asked.
 void drawAskCards(AppState& st, ChatMsg& m, const ui::Fonts& fonts);
+void drawAskMarker(AppState& st, ChatMsg& m, const ActivityItem& marker, const ui::Fonts& fonts);
+// ActivityItem::stage of batch `batchId`'s rowKind-20 timeline marker.
+std::string askMarkerStage(const std::string& batchId);
 void drawCorpOrgCard(ActivityItem& a, const ui::Fonts& fonts);
 void drawCorpMeetingCard(ActivityItem& a, const ui::Fonts& fonts);
 void drawCorpSteeringCard(const ActivityItem& a, const ui::Fonts& fonts);
@@ -415,8 +424,12 @@ struct EditStage {
     std::string targetText;       // typed text of the edited message (runtime match key)
     int  occurrence = 0;          // earlier matching user messages (runtime match ordinal)
     std::string savedPrompt;      // composer contents before edit (Esc restores)
+    std::vector<std::string> savedAttachments, savedImages;
+    std::vector<core::ContextRef> savedContextRefs;
     bool sendRequested = false;   // Enter pressed; transaction starts once the run settled
     std::string editedText;       // composer text frozen at send
+    std::vector<std::string> editedAttachments, editedImages;
+    std::vector<core::ContextRef> editedContextRefs;
     std::string docId;            // document whose AI-VC chain rolls back
     std::string newSessionId;     // rewind result, adopted only at commit
     std::string newSessionFile;
@@ -442,9 +455,7 @@ std::string aiVcRewindToast(int cpState);
 void drawDoubleRewindGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx,
                            ImU32 col);
 void drawPencilGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx, ImU32 col);
-// Header tab button, split so a tab strip can resolve its selection BEFORE anything paints.
-// Submit every hit zone, apply the clicks, then paint them all from the resolved selection —
-// a one-pass button necessarily paints a stale highlight on the frame it is clicked.
+// Header navigation: submit native hit zones, resolve clicks, then paint the final selection.
 struct HeaderBtnHit {
     ImRect rect;
     bool   clicked = false;
@@ -452,7 +463,7 @@ struct HeaderBtnHit {
     bool   held    = false;
 };
 HeaderBtnHit headerTextButtonHit(const char* id, float w);
-// `withLabel=false` paints an icon-only pill (narrow column); the tooltip carries the name.
+// Flat at rest; `withLabel=false` centres the icon and the caller provides its named tooltip.
 void headerTextButtonPaint(const HeaderBtnHit& h, const char* label, bool active,
                            const char* iconName = nullptr, bool withLabel = true);
 // ---- staged edit transaction (cards.cpp; see EditStage) ----
@@ -591,11 +602,17 @@ inline std::string userFacingRpcError(const core::RpcResult& r, const char* fall
 std::string composerText(const AppState& st);
 void drawBtwPanel(AppState& st);
 void submitTurn(AppState& st, const std::string& text);
+// Consume only referenced inline images, compact their numbering, and preserve ordinary files.
+nlohmann::json consumeComposerAttachments(AppState& st, std::string& requestText,
+                                           std::string* bubbleText = nullptr);
 void drawRuntimeBanner(AppState& st);
 // Queue a steer (non-empty `steer`) or a cancel (empty) for the active run on the agent control
 // channel — the one path that reaches a running turn while it holds the agent lane.
+// `steerId` names the steer's user bubble so its delivery state can follow (empty = none).
 void agentControlDispatch(AppState& st, const std::string& runId, const std::string& steer,
-                          nlohmann::json attachments = nlohmann::json::array());
+                          nlohmann::json attachments = nlohmann::json::array(),
+                          const std::string& steerId = std::string(),
+                          const std::string& convId = std::string());
 bool aiTurnActive(AppState& st);
 // Stop the VIEWED conversation's run (agent_cancel + soft-finalize its bubble). The run's
 // JobState stays running until the worker's actual terminal drains.
@@ -603,6 +620,8 @@ void requestStopRun(AppState& st);
 // Replace the composer text from outside the InputText (fresh widget state so an active
 // widget does not keep its stale buffer). Empty text also drops the session's saved draft.
 void composerSetText(AppState& st, const std::string& text);
+// Reset the restored buffer's widget/caret/hard-break state without deleting a saved draft.
+void composerResetInputState(AppState& st);
 void drawComposer(AppState& st, bool busy, bool canRun);
 
 // ---- sessions/tasks/artifacts panels (panel) ----

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -30,17 +31,29 @@ namespace hostd {
 struct ClientConn {
     int id = 0;
     std::string kind;  // gui | mcp | agent | test (from hello)
+    std::string writerGroup;  // optional shared writer identity from hello
     // Optional multi-user identity from hello params.user {id, display}.
     // Empty when the client did not send a user (local single-seat default).
     std::string userId;
     std::string userDisplay;
     long pid = 0;
+    bool gateway = false;
+    bool helloDone = false;
+    std::atomic<bool> controlOnly{false};
+    std::atomic<bool> operatorControl{false};
+    bool operatorListener = false;
+    bool retireAfterReply = false;
+    std::string actorKey;
+    std::string actorHex;
+    std::string right;
+    long long epoch = -1;
     chudware_ipc::IpcConn conn;
     // Monotonic ms of this connection's last request. A socket that has been silent
     // longer than the idle window, holds no attachment and has nothing in flight is a
     // PARKED connection — see Server::pinningClients().
     std::atomic<long long> lastRpcMs{0};
-    std::mutex writeMtx;  // response writes and (Phase 3) event pushes interleave
+    std::timed_mutex writeMtx;  // response writes and event pushes interleave
+    std::atomic<bool> eventWriteFailureLogged{false};
     std::thread thread;
 };
 
@@ -81,6 +94,11 @@ public:
     // (default 60 s); an mtime change (dev rebuild, installer upgrade) flips the
     // daemon to draining so the next client respawns the new build.
     void setSelfBinary(std::string path) { selfBinary_ = std::move(path); }
+    // Must be configured before run(); the gateway fd is the sole principal authority.
+    bool configureCell(std::string state, std::string work,
+                       const std::string& policyPath, std::string& err);
+    bool installCacheRefreshSink();
+    void clearCacheRefreshSink();
 
     // Accept/dispatch until the daemon has nothing left to do (or stop()). lingerSecs: how
     // long it must stay unpinned (see pinningClients) before self-exit.
@@ -174,6 +192,38 @@ private:
     // lock-free snapshot + doc.opened/doc.changed fanout path remains the single implementation.
     static void docPublishThunk(const char* method, const char* paramsJson,
                                 const char* resultJson, void* ud);
+    static void cacheRefreshThunk(const char* docId, const char* responseJson, void* ud);
+    struct CellActor {
+        std::string key, hex, right;
+        long long epoch = -1;
+        bool revoked = false;
+        std::shared_ptr<chudware_ipc::IpcListener> listener;
+    };
+    bool cell_ = false;
+    std::string cellState_, cellWork_, workspaceKey_;
+    nlohmann::json cellPolicy_;
+    // Serialize authority transitions, never hold cellMtx_ while retiring workers.
+    std::mutex principalMtx_;
+    std::mutex cellMtx_;
+    std::map<std::string, CellActor> actors_;
+    std::map<std::string, std::string> handleOwners_;
+    std::map<std::string, std::string> runOwners_;
+    std::map<std::string, bool> connectionNonces_;
+    nlohmann::json cellContext(const ClientConn& c);
+    nlohmann::json cellHello(ClientConn& c, const nlohmann::json& params, bool& isError);
+    nlohmann::json changePrincipal(ClientConn& c, const std::string& method,
+                                   const nlohmann::json& params, bool& isError);
+    void retireActorGeneration(const std::string& actor, long long revokedThrough,
+                               const nlohmann::json& owner, int controlClient);
+    bool cellAdmit(ClientConn& c, const std::string& method,
+                   nlohmann::json& params, nlohmann::json& error);
+    nlohmann::json cellOperator(ClientConn& c, const std::string& method,
+                                const nlohmann::json& params, bool& isError);
+    nlohmann::json cellCensus(bool commitExit = false, bool idleExit = false);
+    void acceptClient(chudware_ipc::IpcConn conn, bool gateway,
+                      const std::string& actor = {}, bool operatorListener = false);
+    void rememberCellHandles(const ClientConn& c, const nlohmann::json& params,
+                             const nlohmann::json& result);
 
     chudware_ipc::IpcListener listener_;
     std::string buildId_;
@@ -193,6 +243,14 @@ private:
     std::string drainReason_;
     std::string drainChangedPath_;
     std::mutex clientsMtx_;
+    // Connection registration and maintenance closure share this authority.
+    bool cellAdmissionClosed_ = false, cellExitWhenQuiescent_ = false, cellExiting_ = false;
+    std::uint64_t cellGeneration_ = 0;
+    std::atomic<int> controlRepliesPending_{0};
+    std::mutex cellCensusMtx_;
+    long long lastCellProbeMs_ = 0;  // accept loop only
+    std::string cellId_;
+    std::unique_ptr<chudware_ipc::IpcListener> operatorListener_;
     std::map<int, std::shared_ptr<ClientConn>> clients_;
     int nextClientId_ = 1;
     DocRegistry registry_;

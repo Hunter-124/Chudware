@@ -31,6 +31,11 @@
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakeSphere.hxx>
+#include <BRepTools.hxx>
+#include <BRep_Builder.hxx>
+#include <TopExp_Explorer.hxx>
+#include <TopoDS_Shell.hxx>
+#include <TopoDS_Solid.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
@@ -111,6 +116,45 @@ AsmInfo make_distance_mate_assembly(const fs::path& step_a, const fs::path& step
     std::string mate_id = mr.value("id_map", json::object()).value("$0", std::string());
 
     return {did, mate_id, cid_a, cid_b};
+}
+
+struct TranslatedPair {
+    std::string doc_id;
+    std::array<std::string, 2> mates;
+};
+
+// Two independently driven bodies share a translation, while a distant grounded
+// reference makes their two other pair placements genuinely change every frame.
+TranslatedPair make_translated_pair(const fs::path& path, double gap) {
+    const auto did = doc::doc_new("assembly", "translated_pair").at("doc_id").get<std::string>();
+    doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}}, {"fixed", true},
+         {"transform", {1,0,0,0, 0,1,0,1000, 0,0,1,0, 0,0,0,1}}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}}, {"fixed", false}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}}, {"fixed", false},
+         {"transform", {1,0,0,10 + gap, 0,1,0,0, 0,0,1,0, 0,0,0,1}}}
+    }), false);
+    const json selector = {{"kind", "face"}, {"centroid", {10,5,5}}};
+    json ops = json::array();
+    for (int k = 0; k < 2; ++k)
+        ops.push_back({{"op", "asm_add_mate"}, {"mate", {
+            {"type", "distance"}, {"align", "aligned"},
+            {"value", {{"value", k == 0 ? 0.0 : 10 + gap}}},
+            {"refs", {{{"component", "k1"}, {"selector", selector}},
+                      {{"component", k == 0 ? "k2" : "k3"}, {"selector", selector}}}}
+        }}});
+    const auto added = doc::doc_apply_ops(did, -1, ops, false);
+    REQUIRE(added.at("rebuild").at("converged").get<bool>());
+    return {did, {added.at("id_map").at("$0").get<std::string>(),
+                  added.at("id_map").at("$1").get<std::string>()}};
+}
+
+json translated_pair_sweep(const TranslatedPair& pair, double first_gap, double last_gap) {
+    return doc::doc_simulate_motion(pair.doc_id, "", 0, 0, 3, true, 0.5, nullptr,
+        json::array({
+            {{"mate_id", pair.mates[0]}, {"start", 0}, {"stop", 8}},
+            {{"mate_id", pair.mates[1]}, {"start", 10 + first_gap}, {"stop", 18 + last_gap}}
+        }));
 }
 
 }  // namespace
@@ -736,6 +780,193 @@ TEST_CASE("doc_simulate_motion: classification keeps overlap and exact unsafe cl
     CHECK(after.at("revision") == before.at("revision"));
     CHECK(after.at("tree") == before.at("tree"));
     fs::remove(path);
+}
+
+TEST_CASE("doc_simulate_motion: invariant relative placements retain exact pair evidence") {
+    double first_gap = 0.25, last_gap = 0.25;
+    bool multiple_solids = false;
+    SUBCASE("rigidly translating pair retains its exact unsafe clearance") {}
+    SUBCASE("clearance exactly at the threshold stays safe") { first_gap = last_gap = 0.5; }
+    SUBCASE("rigidly translating overlap retains its exact volume") { first_gap = last_gap = -1; }
+    SUBCASE("actual relative movement crosses the clearance boundary") { last_gap = 0.75; }
+    SUBCASE("sub-tolerance relative movement must not be rounded into a cache hit") {
+        first_gap = 0.5 - 1e-8;
+        last_gap = 0.5 + 1e-8;
+    }
+    SUBCASE("multi-solid boundaries follow changing relative placements") {
+        multiple_solids = true;
+        last_gap = 0.75;
+    }
+    const auto path = multiple_solids ? tmp_path("invariant_multisolid.step") :
+                                       make_box_step("invariant_pair");
+    if (multiple_solids)
+        doc::export_bodies({
+            BRepPrimAPI_MakeBox(10, 10, 10).Shape(),
+            BRepPrimAPI_MakeBox(gp_Pnt(0, 30, 0), 10, 10, 10).Shape()
+        }, path.string(), "step");
+    const auto pair = make_translated_pair(path, first_gap);
+    const auto result = translated_pair_sweep(pair, first_gap, last_gap);
+    INFO(result.dump(2));
+    REQUIRE(result.at("ok").get<bool>());
+    CHECK(result.at("interference").at("complete").get<bool>());
+    CHECK(result.at("interference").at("frames_checked") == 3);
+    const bool invariant = first_gap == last_gap;
+    for (const auto& frame : result.at("trajectory")) {
+        const int i = frame.at("i").get<int>();
+        const double gap = i == 0 ? first_gap : i == 2 ? last_gap : (first_gap + last_gap) / 2;
+        CHECK(frame.at("pairs_checked") == 3);
+        CHECK(frame.at("pairs_reused") == (invariant && i > 0 ? 1 : 0));
+        CHECK(frame.at("interference_complete").get<bool>());
+        CHECK(frame.at("interference").get<bool>() == (gap < 0.5));
+        if (gap < 0.5) {
+            REQUIRE(frame.at("collision_detail").size() == 1);
+            const auto& detail = frame.at("collision_detail").front();
+            CHECK(detail.at("component_a") == "k2");
+            CHECK(detail.at("component_b") == "k3");
+            CHECK(detail.value("reused", false) == (invariant && i > 0));
+            if (gap < 0)
+                CHECK(detail.at("overlap_volume_mm3").get<double>() == doctest::Approx(-100 * gap));
+            else {
+                CHECK(detail.at("distance_status") == "exact");
+                CHECK(detail.at("distance").get<double>() == doctest::Approx(gap).epsilon(1e-7));
+            }
+        } else
+            CHECK(frame.at("collision_detail").empty());
+        for (const auto& body : frame.at("bodies")) {
+            if (body.at("component") == "k2")
+                CHECK(body.at("transform").at(12).get<double>() == doctest::Approx(4.0 * i));
+            if (body.at("component") == "k3")
+                CHECK(body.at("transform").at(12).get<double>() == doctest::Approx(4.0 * i + 10 + gap));
+        }
+    }
+    doc::doc_close(pair.doc_id);
+    fs::remove(path);
+}
+
+TEST_CASE("doc_simulate_motion: cached hollow boundaries track moving cavity clearance") {
+    const auto shell_path = tmp_path("cavity_clearance_shell.step");
+    const auto probe_path = tmp_path("cavity_clearance_probe.step");
+    const auto shell = BRepAlgoAPI_Cut(
+        BRepPrimAPI_MakeBox(10, 10, 10).Shape(),
+        BRepPrimAPI_MakeBox(gp_Pnt(2, 2, 2), 6, 6, 6).Shape()).Shape();
+    doc::export_bodies({shell}, shell_path.string(), "step");
+    doc::export_bodies({BRepPrimAPI_MakeBox(1, 1, 1).Shape()}, probe_path.string(), "step");
+    const auto did = doc::doc_new("assembly", "moving_cavity_clearance")
+                         .at("doc_id").get<std::string>();
+    doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", shell_path.string()}}},
+         {"fixed", true}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", probe_path.string()}}},
+         {"fixed", false}, {"transform", {1,0,0,2.25, 0,1,0,4, 0,0,1,4, 0,0,0,1}}}
+    }), false);
+    const json refs = {
+        {{"component", "k1"}, {"selector", {{"kind", "face"}, {"centroid", {10,5,5}}}}},
+        {{"component", "k2"}, {"selector", {{"kind", "face"}, {"centroid", {1,0.5,0.5}}}}}
+    };
+    const auto added = doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "distance"}, {"align", "aligned"}, {"value", {{"value", -6.75}}},
+            {"refs", refs}
+        }}},
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "parallel"}, {"align", "aligned"}, {"refs", refs}
+        }}}
+    }), false);
+    REQUIRE(added.at("rebuild").at("converged").get<bool>());
+    const auto mid = added.at("id_map").at("$0").get<std::string>();
+    const auto result = doc::doc_simulate_motion(did, mid, -6.75, -6.25, 3, true, 0.5);
+    INFO(result.dump(2));
+    REQUIRE(result.at("ok").get<bool>());
+    CHECK(result.at("interference").at("complete").get<bool>());
+    REQUIRE(result.at("trajectory").size() == 3);
+    for (const auto& frame : result.at("trajectory")) {
+        const int i = frame.at("i").get<int>();
+        CHECK(frame.at("interference_complete").get<bool>());
+        CHECK(frame.at("pairs_checked") == 1);
+        CHECK(frame.at("pairs_reused") == 0);
+        CHECK(frame.at("interference").get<bool>() == (i == 0));
+        if (i == 0) {
+            REQUIRE(frame.at("collision_detail").size() == 1);
+            const auto& pair = frame.at("collision_detail").front();
+            CHECK(pair.at("distance_status") == "exact");
+            CHECK(pair.at("distance").get<double>() == doctest::Approx(0.25));
+            CHECK_FALSE(pair.value("reused", false));
+        } else
+            CHECK(frame.at("collision_detail").empty());
+        for (const auto& body : frame.at("bodies"))
+            if (body.at("component") == "k2") {
+                CHECK(body.at("transform").at(12).get<double>() ==
+                      doctest::Approx(2.25 + 0.25 * i));
+                CHECK(body.at("transform").at(13).get<double>() == doctest::Approx(4));
+                CHECK(body.at("transform").at(14).get<double>() == doctest::Approx(4));
+            }
+    }
+    doc::doc_close(did);
+    fs::remove(shell_path);
+    fs::remove(probe_path);
+}
+
+TEST_CASE("doc_simulate_motion: changed and failed source geometry cannot inherit pair evidence") {
+    const auto path = make_box_step("source_evidence");
+    const auto changed = tmp_path("source_evidence_changed.step");
+    const auto invalid_path = tmp_path("source_evidence_invalid.brep");
+    const auto pair = make_translated_pair(path, 0.25);
+    REQUIRE(translated_pair_sweep(pair, 0.25, 0.25).at("ok").get<bool>());
+
+    // Keep the selected +X face unchanged, but extend the other side into the
+    // neighboring body: identical mate values must now report an actual overlap.
+    doc::export_bodies({BRepPrimAPI_MakeBox(gp_Pnt(-1,0,0), 11,10,10).Shape()},
+                       changed.string(), "step");
+    doc::doc_apply_ops(pair.doc_id, -1, json::array({
+        {{"op", "asm_edit_component"}, {"id", "k3"}, {"source", {{"path", changed.string()}}}}
+    }), false);
+    const auto replacement = translated_pair_sweep(pair, 0.25, 0.25);
+    INFO(replacement.dump(2));
+    REQUIRE(replacement.at("ok").get<bool>());
+    for (const auto& frame : replacement.at("trajectory")) {
+        REQUIRE(frame.at("collision_detail").size() == 1);
+        const auto& detail = frame.at("collision_detail").front();
+        CHECK(detail.at("overlap_volume_mm3").get<double>() == doctest::Approx(75));
+        CHECK_FALSE(detail.contains("distance"));
+    }
+
+    // A reversed face leaves a solid with positive volume but invalid topology.
+    // Every sampled frame must remain incomplete, rather than reuse old success.
+    const TopoDS_Shape cube = BRepPrimAPI_MakeBox(10,10,10).Shape();
+    BRep_Builder builder;
+    TopoDS_Shell shell;
+    builder.MakeShell(shell);
+    bool reverse = true;
+    for (TopExp_Explorer it(cube, TopAbs_FACE); it.More(); it.Next()) {
+        TopoDS_Shape face = it.Current();
+        if (reverse) face.Reverse();
+        reverse = false;
+        builder.Add(shell, face);
+    }
+    TopoDS_Solid invalid;
+    builder.MakeSolid(invalid);
+    builder.Add(invalid, shell);
+    REQUIRE(BRepTools::Write(invalid, invalid_path.string().c_str()));
+    doc::doc_apply_ops(pair.doc_id, -1, json::array({
+        {{"op", "asm_edit_component"}, {"id", "k3"}, {"source", {{"path", invalid_path.string()}}}}
+    }), false);
+    const auto failed = translated_pair_sweep(pair, 0.25, 0.25);
+    INFO(failed.dump(2));
+    CHECK_FALSE(failed.at("ok").get<bool>());
+    CHECK_FALSE(failed.at("interference").at("complete").get<bool>());
+    CHECK(failed.at("interference").at("frames_checked") == 0);
+    REQUIRE(failed.at("trajectory").size() == 3);
+    for (const auto& frame : failed.at("trajectory")) {
+        CHECK_FALSE(frame.at("interference_complete").get<bool>());
+        CHECK(frame.at("pairs_checked") == 1);
+        CHECK(frame.at("pair_failures").size() == 2);
+        REQUIRE(frame.at("geometry_failures").size() == 1);
+        CHECK(frame.at("geometry_failures").front().at("reason") == "invalid_geometry");
+    }
+    doc::doc_close(pair.doc_id);
+    fs::remove(path);
+    fs::remove(changed);
+    fs::remove(invalid_path);
 }
 
 TEST_CASE("doc_simulate_motion: one drive transmits gear rotation in both directions") {

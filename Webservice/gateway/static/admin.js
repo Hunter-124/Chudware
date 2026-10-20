@@ -151,23 +151,11 @@
            esc(formatLabel(row)) + "</span>";
   }
 
-  // The server flags these, but fall back to the raw columns so a stale gateway
-  // still renders honest badges instead of claiming evidence is missing.
-  var EVIDENCE_COLUMNS = [
-    "commit_sha", "sbom_key", "sbom_sha256", "sbom_signature_key", "sbom_signature_sha256",
-    "provenance_key", "provenance_sha256", "provenance_signature_key",
-    "provenance_signature_sha256", "platform_test_key", "platform_test_sha256",
-    "platform_test_signature_key", "platform_test_signature_sha256"
-  ];
   function evidenceComplete(row) {
-    if (typeof row.evidence_complete === "boolean") return row.evidence_complete;
-    return EVIDENCE_COLUMNS.every(function (col) {
-      return row[col] != null && row[col] !== "";
-    });
+    return row.evidence_complete === true;
   }
   function hasStablePair(row) {
-    if (typeof row.has_stable_pair === "boolean") return row.has_stable_pair;
-    return Boolean(row.stable_version && row.stable_signature);
+    return row.has_stable_pair === true;
   }
 
   /* ---- shared release-manifest fetch: dashboard, table and manual card ---- */
@@ -751,200 +739,58 @@
     }, 5000);
   }
 
-  /* ---- deploy: rebuild / redeploy ---- */
+  /* ---- deployment: read-only operator status / logs ---- */
   (function initDeploy() {
-    var mount = document.getElementById("deploy-mount");
-    if (!mount) return;
-
-    var card = document.createElement("div");
-    card.className = "admin-card deploy-card";
-    card.innerHTML =
-      "<h2>Deploy</h2>" +
-      "<div class='deploy-section'>" +
-        "<span class='deploy-label'>Rebuild targets</span>" +
-        "<div class='deploy-targets' id='deploy-targets'>" +
-          "<label><input type='checkbox' value='wasm' checked> wasm</label>" +
-          "<label><input type='checkbox' value='engine'> engine</label>" +
-        "</div>" +
-        "<div class='deploy-actions'>" +
-          "<button type='button' class='btn primary' id='deploy-rebuild'>Rebuild</button>" +
-          "<button type='button' class='btn ghost' id='deploy-redeploy'>Redeploy gateway</button>" +
-        "</div>" +
-        "<p class='deploy-note'>Redeploy restarts chudware-gateway — this page and terminals/WS will briefly reconnect.</p>" +
-      "</div>" +
-      "<div class='deploy-status-row'>" +
-        "<span class='dep-pill dep-idle' id='deploy-status'>idle</span>" +
-      "</div>" +
-      "<pre class='deploy-log' id='deploy-log'>(no deploy log yet)</pre>";
-
-    mount.appendChild(card);
-
     var statusPill = document.getElementById("deploy-status");
     var logPre = document.getElementById("deploy-log");
-    var btnRebuild = document.getElementById("deploy-rebuild");
-    var btnRedeploy = document.getElementById("deploy-redeploy");
-    var targetBox = document.getElementById("deploy-targets");
-    var targetInputs = targetBox
-      ? Array.prototype.slice.call(targetBox.querySelectorAll("input[type=checkbox]"))
-      : [];
-
-    var pollTimer = null;
-    var activeKind = null;
-    var uiRunning = false;
-
-    function setControlsDisabled(disabled) {
-      btnRebuild.disabled = disabled;
-      btnRedeploy.disabled = disabled;
-      targetInputs.forEach(function (cb) { cb.disabled = disabled; });
-    }
+    var refreshButton = document.getElementById("deploy-refresh");
+    if (!statusPill || !logPre || !refreshButton) return;
 
     function setPill(cls, text) {
       statusPill.className = "dep-pill " + cls;
       statusPill.textContent = text;
     }
 
-    function selectedTargets() {
-      return targetInputs.filter(function (cb) { return cb.checked; })
-                         .map(function (cb) { return cb.value; });
-    }
-
-    function stopPolling() {
-      if (pollTimer != null) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-      }
-    }
-
-    function startPolling(kind) {
-      if (kind) activeKind = kind;
-      stopPolling();
-      pollOnce();
-      pollTimer = setInterval(pollOnce, 2000);
-    }
-
-    function renderLast(last) {
-      if (!last) {
-        setPill("dep-idle", "idle");
-        return;
-      }
-      var ok = last.rc === 0;
-      var kind = last.kind || "deploy";
-      var label = "last: " + (ok ? "ok" : "fail") + " rc=" + last.rc +
-                  (kind ? " · " + kind : "");
-      setPill(ok ? "dep-ok" : "dep-fail", label);
-    }
-
-    async function fetchLog(kind) {
-      if (!kind) return;
-      try {
-        var res = await fetch("/api/admin/deploy/log?kind=" +
-                              encodeURIComponent(kind) + "&lines=400");
-        var text = await res.text();
-        if (res.ok) {
-          logPre.textContent = text || "(empty log)";
-          logPre.scrollTop = logPre.scrollHeight;
-        }
-      } catch (e) { /* ignore transient log fetch errors */ }
-    }
-
-    async function pollOnce() {
+    async function refreshStatus() {
       try {
         var st = await api("/api/admin/deploy/status");
-        var running = !!(st && st.running);
-        var kind = (st && st.kind) || activeKind;
-
-        if (running) {
-          uiRunning = true;
-          activeKind = kind || activeKind;
-          setControlsDisabled(true);
-          setPill("dep-run", "running " + (kind || "…"));
-          await fetchLog(kind || activeKind);
-          // Ensure continuous polling when we discover a live run (e.g. on load).
-          if (pollTimer == null) {
-            pollTimer = setInterval(pollOnce, 2000);
-          }
+        if (st.running) {
+          setPill("dep-run", "recorded running: " + (st.kind || "deployment"));
+        } else if (st.last) {
+          var last = st.last;
+          var ok = last.rc === 0;
+          var label = "last: " + (ok ? "ok" : "fail") + " rc=" + last.rc +
+                      " · " + (last.kind || "deployment");
+          if (last.release) label += " · " + last.release;
+          setPill(ok ? "dep-ok" : "dep-fail", label);
         } else {
-          var wasPolling = pollTimer != null || uiRunning;
-          stopPolling();
-          uiRunning = false;
-          setControlsDisabled(false);
-          if (st && st.last) {
-            renderLast(st.last);
-            // Keep showing the finished run's log.
-            var logKind = (st.last && st.last.kind) || activeKind || kind;
-            if (wasPolling && logKind) await fetchLog(logKind);
-          } else {
-            setPill("dep-idle", "idle");
-          }
-          activeKind = null;
+          setPill("dep-idle", "no recorded deployment");
         }
       } catch (e) {
-        // Status endpoint blip (e.g. during redeploy restart) — keep trying.
+        setPill("dep-fail", "deployment status unavailable");
       }
     }
 
-    function isBusyError(e) {
-      var msg = String((e && e.message) || e || "").toLowerCase();
-      return msg.indexOf("busy") >= 0 || msg.indexOf("409") >= 0 ||
-             msg.indexOf("already") >= 0;
+    async function refreshDeployLog() {
+      try {
+        var response = await fetch("/api/admin/deploy/log?lines=400");
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        logPre.textContent = (await response.text()) || "(no operator deployment log yet)";
+        logPre.scrollTop = logPre.scrollHeight;
+      } catch (e) {
+        logPre.textContent = "Deployment log unavailable: " + String(e.message || e);
+      }
     }
 
-    btnRebuild.addEventListener("click", async function () {
-      var targets = selectedTargets();
-      if (!targets.length) {
-        setStatus("Pick at least one rebuild target.", true);
-        return;
-      }
-      setControlsDisabled(true);
-      try {
-        var r = await api("/api/admin/deploy/rebuild", {
-          method: "POST",
-          body: JSON.stringify({ targets: targets })
-        });
-        activeKind = (r && r.kind) || "rebuild";
-        setPill("dep-run", "running " + activeKind);
-        setStatus("Rebuild started.");
-        startPolling(activeKind);
-      } catch (e) {
-        if (isBusyError(e)) {
-          setStatus("A deploy is already running.", true);
-          uiRunning = true;
-          setControlsDisabled(true);
-          startPolling("rebuild");
-        } else {
-          setControlsDisabled(false);
-          setStatus(String(e.message || e), true);
-        }
-      }
-    });
+    function refreshDeployment() {
+      refreshStatus();
+      refreshDeployLog();
+    }
 
-    btnRedeploy.addEventListener("click", async function () {
-      if (!confirm("Restart the gateway now? Terminals/WS will briefly reconnect.")) return;
-      setControlsDisabled(true);
-      try {
-        var r = await api("/api/admin/deploy/redeploy", {
-          method: "POST",
-          body: "{}"
-        });
-        activeKind = (r && r.kind) || "redeploy";
-        setPill("dep-run", "running " + activeKind);
-        setStatus("Redeploy started — this page may briefly disconnect.");
-        startPolling(activeKind);
-      } catch (e) {
-        if (isBusyError(e)) {
-          setStatus("A deploy is already running.", true);
-          uiRunning = true;
-          setControlsDisabled(true);
-          startPolling("redeploy");
-        } else {
-          setControlsDisabled(false);
-          setStatus(String(e.message || e), true);
-        }
-      }
-    });
-
-    // Reflect a run started elsewhere (shared workspace).
-    pollOnce().catch(function () {});
+    refreshButton.addEventListener("click", refreshDeployment);
+    refreshDeployment();
+    // Observe qualified operator runs started outside this browser, including new runs.
+    setInterval(refreshDeployment, 5000);
   })();
 
   /* ---- signed customer release manifests ---- */
@@ -1598,7 +1444,7 @@
     var evidence = evidenceComplete(row);
     var pair = hasStablePair(row);
     if (row.channel === "beta") {
-      if (pair && evidence) {
+      if (row.promotable === true) {
         host.appendChild(actionBtn("Promote to stable", "btn primary", function () {
           promoteRelease(row).then(function (done) {
             if (done) reloadManifestViews();
@@ -1610,9 +1456,9 @@
         var why = document.createElement("span");
         why.className = "ac-dim";
         why.style.fontSize = "var(--step--2)";
-        why.textContent = !pair ? "no stable signature pair" : "evidence incomplete";
-        why.title = "Only CI-signed beta builds carrying both signatures and the full " +
-                    "evidence bundle can be promoted.";
+        why.textContent = !pair ? "no stable signature pair" :
+                          !evidence ? "evidence incomplete" : "publisher verification required";
+        why.title = "Only verified beta builds approved for stable publication can be promoted.";
         host.appendChild(why);
       }
     }

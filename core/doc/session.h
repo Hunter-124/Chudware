@@ -19,9 +19,12 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <functional>
+#include <cstdint>
 
 #include <nlohmann/json.hpp>
 
@@ -58,6 +61,10 @@ struct OpError : std::runtime_error {
 // to call when no lock is held by this thread. Returns true if it released any.
 bool force_release_doc_lock();
 
+// Nonblocking lifecycle census. False means a document/store was busy; counters
+// remain known lower bounds. Includes cache tasks through final publication.
+bool activity_counts(std::uint64_t& cache_verification, std::uint64_t& dirty_documents);
+
 // Create a new blank document ("part"; "assembly" not yet supported). Returns the
 // ops-response + "doc_id". Registers the session in the process-global store.
 //
@@ -81,6 +88,8 @@ nlohmann::json doc_new(const std::string& kind, const std::string& name,
 // otherwise a mismatch throws OpError("stale_revision"). A bad op throws OpError.
 // `coalesce` folds the batch into the previous undo step (no new snapshot).
 // `with_tess=false` omits mesh publication/response data, retaining rebuild diagnostics.
+// A compile rejection preserves the committed tree/revision and tessellation;
+// rejected_tree and rebuild.feature_status describe the rejected candidate.
 nlohmann::json doc_apply_ops(const std::string& doc_id, long base_revision,
                              const nlohmann::json& ops, bool coalesce, bool with_tess = true);
 
@@ -91,7 +100,14 @@ nlohmann::json doc_apply_ops(const std::string& doc_id, long base_revision,
 // Returns {ok, source_revision, rebuild} with the candidate rebuild diagnostics
 // (including in-band failures), or {ok:false, error} for structural exceptions.
 // Failure error strings retain the ops_emit.dry_run composition.
-nlohmann::json doc_dry_run_ops(const std::string& doc_id, const nlohmann::json& ops);
+// budget_ms > 0 opts advisory callers into POSIX process isolation for the entire
+// candidate (all probes + response serialization). Timeout kills/reaps the child
+// and returns ok:false, skipped:budget_exceeded, still_running:false. No fallback.
+// Unsupported platforms return skipped:isolation_unavailable. Source snapshot/
+// document-lock and transport waits are not a hard end-to-end wall-clock bound.
+// Zero preserves the complete unbudgeted modeler/fixer validation path.
+nlohmann::json doc_dry_run_ops(const std::string& doc_id, const nlohmann::json& ops,
+                                int budget_ms = 0);
 
 nlohmann::json doc_undo(const std::string& doc_id);     // bumps revision +1
 nlohmann::json doc_redo(const std::string& doc_id);     // bumps revision +1
@@ -152,16 +168,24 @@ nlohmann::json doc_asm_world_bodies(const std::string& doc_id, bool explode = fa
 nlohmann::json doc_asm_bom_components(const std::string& doc_id);
 
 // Enumerate the open C++ sessions: {"docs":[{doc_id,name,kind,path,revision,dirty}]}.
-// Mirrors engine.doc.session.list_sessions (metadata only — no compile).
+// Metadata only, no compile. Busy documents return their last committed summary
+// with busy:true instead of waiting behind an in-flight operation.
 nlohmann::json doc_list();
 
+// Test-only synchronization seam; not an RPC. Runs body under the same per-doc
+// lock as doc_apply_ops so contention regressions need no timing-sensitive geometry.
+void with_doc_lock_for_testing(const std::string& doc_id, void (*body)(void*), void* context);
+
 // PropertyManager-cancel checkpoints (engine.doc.session.checkpoint/revert).
-// doc_checkpoint deep-snapshots the current doc and returns {"checkpoint": id}.
+// doc_checkpoint deep-snapshots the current doc and returns {"checkpoint": id, "revision": revision}.
 // doc_revert restores the snapshot, pushes ONE undo entry of the pre-revert doc,
 // rebuilds, bumps the revision, and returns the ops-response. Checkpoints are
 // per-session and cleared on close. A bad id throws OpError("invalid_op").
+// expect_revision >= 0 guards against reverting another writer's edits: a mismatch
+// consumes the checkpoint and throws OpError("stale_revision") without changing the doc.
 nlohmann::json doc_checkpoint(const std::string& doc_id);
-nlohmann::json doc_revert(const std::string& doc_id, const std::string& checkpoint_id);
+nlohmann::json doc_revert(const std::string& doc_id, const std::string& checkpoint_id,
+                          long expect_revision = -1);
 
 // Copy/paste-as-derived live re-pull (engine.doc.session.refresh_derived). Re-bundles each
 // derived group's source feature (+ closure) from the LIVE source session and splices it back
@@ -355,9 +379,12 @@ nlohmann::json doc_weld_cut_list(const std::string& doc_id);
 // Evaluate — mass properties of the active body (port of engine/doc/evaluate.py::mass_props
 // via engine/worker.py::_eval_mass). body_id is 1-based; <= 0 selects the LAST body. Returns
 // {volume_mm3, mass_g, com[3], inertia[9] (row-major, kg·mm² scaled by density), principal_
-// moments[3], principal_axes[3][3], material{density_g_cm3}}. A surface body returns the
-// {is_surface, area_mm2, ...} report. Throws OpError on no bodies / a bad body_id.
-nlohmann::json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3);
+// moments[3], principal_axes[3][3], material{density_g_cm3, source, key?}}. A surface body
+// returns the {is_surface, area_mm2, ...} report. Throws OpError on no bodies / a bad body_id.
+// density_g_cm3 nullopt = each body's applied material (body override, document material,
+// assembly component material), 7.85 steel only where none resolves; a value overrides all.
+nlohmann::json doc_eval_mass(const std::string& doc_id, int body_id,
+                             std::optional<double> density_g_cm3 = std::nullopt);
 
 // Evaluate — least-squares CYLINDER AXIS of the body's surface near a world point: the
 // mating primitive for merging independently sourced CAD, where the imported body has no
@@ -628,6 +655,9 @@ nlohmann::json doc_save(const std::string& doc_id, const std::string& path,
 // re-uniqued against the open docs (recovered duplicates would otherwise all be "Part1").
 nlohmann::json doc_open(const std::string& path, bool as_solid = false,
                         bool detach_path = false);
+// Called outside document locks after an unverified saved cache is re-solved.
+void set_cache_refresh_sink(
+    std::function<void(const std::string&, const nlohmann::json&)> sink);
 
 // C18 interactive sketch mode — port of engine/doc/session.py sketch_* (warm-started
 // over chudware::sketch::solve_sketch). One sketch is "entered" at a time (active_sketch
@@ -701,11 +731,11 @@ nlohmann::json doc_sketch3d_drag(const std::string& doc_id, const std::string& s
                                  const std::string& handle, const nlohmann::json& xyz,
                                  const nlohmann::json& targets);
 
-// sketch_project_ref: read-only projection of a datum plane / planar face / model edge
-// into the sketch's (u,v) plane (engine/doc/session.py sketch_project_ref). `ref` is
-// {"datum":...} or {"kind":"face|edge","selector":{...}}; returns {entity, source}.
-// face/edge selectors resolve against the LAST solid body (single-body parts; the
-// oracle's multi-body best-match is deferred). Throws OpError/unsupported_ref.
+// Read-only projection through the same whole-document resolver as sketch_convert.
+// Refs: {datum:"front|top|right|axis.x|axis.y|axis.z|origin"},
+// {kind:"face|edge|vertex",selector}, or {kind:"sketch_entity",sketch,entity}.
+// Edge mode:"pierce" (optional near:[u,v]) returns an isolated plane crossing.
+// Returns {entity, source}; a multi-entity source previews its first projected entity.
 nlohmann::json doc_sketch_project_ref(const std::string& doc_id, const std::string& sketch_fid,
                                       const nlohmann::json& ref);
 
@@ -714,10 +744,10 @@ nlohmann::json doc_sketch_project_ref(const std::string& doc_id, const std::stri
 // return ready-to-insert doc-schema §3.1 REFERENCE entities (construction:true). Uses OCCT
 // orthographic projection (GeomProjLib) + recon.cpp's curve classifier, so faces project all
 // their boundary wires and tilted circles become ellipses correctly (the Convert-Entities fix).
-// READ-ONLY (compiles current bodies, no mutation); the caller inserts the returned entities
-// via sketch_add_entity ops so the projected geometry becomes constrainable. One-shot (not
-// associative — see T-BL43 follow-up). `refs` is a list of {"datum":...} or
-// {"kind":"face|edge","selector":{...}}. Returns {ok, entities, approx, sources, plane_frame}.
+// READ-ONLY: reuses the session compile cache, with no document/revision mutation.
+// Ref grammar matches doc_sketch_project_ref. Returns
+// {ok, entities, approx, sources:[{...,count}], plane_frame}. Use sketch_convert to
+// insert geometry with an associative external-reference link.
 nlohmann::json doc_sketch_project_entities(const std::string& doc_id,
                                            const std::string& sketch_fid,
                                            const nlohmann::json& refs);

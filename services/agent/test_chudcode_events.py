@@ -520,6 +520,216 @@ class ChudcodeEventMapperTests(unittest.TestCase):
         )
         self.assertEqual((kind, ended["id"], ended["status"]), ("sub_run", "CubeBuilder", "done"))
 
+    def test_task_subagent_rows_carry_the_assigned_name_not_the_agent_type(self):
+        """Chudcode's real frame shapes: the lifecycle start has no description
+        (the tiny-model label lands later in progress) and `agent` is the
+        definition type. The row name is the spawner-assigned id on every frame,
+        nested ids included, and never degrades to "task"."""
+        state = RpcFrameState()
+
+        def row(frame):
+            [(kind, body)] = map_rpc_frame(frame, CTX, state)
+            self.assertEqual(kind, "sub_run")
+            return body
+
+        lifecycle = {
+            "id": "HubTaskNames",
+            "index": 0,
+            "agent": "task",
+            "agentSource": "bundled",
+            "sessionFile": "/tmp/HubTaskNames.jsonl",
+            "parentToolCallId": "toolu_task_1",
+        }
+        started = row({"type": "subagent_lifecycle", "payload": {**lifecycle, "status": "started"}})
+        self.assertEqual(
+            (started["name"], started["purpose"], started["agent_type"]),
+            ("HubTaskNames", "HubTaskNames", "task"),
+        )
+        self.assertNotIn("description", started)
+
+        progress = row(
+            {
+                "type": "subagent_progress",
+                "payload": {
+                    "index": 0,
+                    "agent": "task",
+                    "agentSource": "bundled",
+                    "task": "<rendered subagent prompt>",
+                    "assignment": "# Target\nFix hub names",
+                    "parentToolCallId": "toolu_task_1",
+                    "progress": {
+                        "index": 0,
+                        "id": "HubTaskNames",
+                        "agent": "task",
+                        "status": "running",
+                        "task": "<rendered subagent prompt>",
+                        "description": "Fix subagent hub task names",
+                        "lastIntent": "Reading the DAG",
+                    },
+                },
+            }
+        )
+        self.assertEqual(
+            (progress["name"], progress["description"], progress["purpose"]),
+            ("HubTaskNames", "Fix subagent hub task names", "Fix subagent hub task names"),
+        )
+
+        nested = row(
+            {
+                "type": "subagent_lifecycle",
+                "payload": {
+                    "id": "HubTaskNames.Scout",
+                    "index": 0,
+                    "agent": "scout",
+                    "agentSource": "bundled",
+                    "status": "started",
+                    "parentToolCallId": "toolu_task_2",
+                },
+            }
+        )
+        self.assertEqual(
+            (nested["name"], nested["agent_type"], nested["parent_id"]),
+            ("HubTaskNames.Scout", "scout", "toolu_task_2"),
+        )
+
+        terminal_progress = row(
+            {
+                "type": "subagent_progress",
+                "payload": {
+                    "index": 0,
+                    "agent": "task",
+                    "task": "<rendered subagent prompt>",
+                    "progress": {"id": "HubTaskNames", "agent": "task", "status": "completed"},
+                },
+            }
+        )
+        self.assertEqual((terminal_progress["name"], terminal_progress["status"]), ("HubTaskNames", "done"))
+        self.assertEqual(terminal_progress["parent_id"], "toolu_task_1")
+
+        ended = row({"type": "subagent_lifecycle", "payload": {**lifecycle, "status": "completed"}})
+        self.assertEqual((ended["name"], ended["purpose"], ended["status"]), ("HubTaskNames", "HubTaskNames", "done"))
+        self.assertNotIn("task", (started["purpose"], ended["purpose"], terminal_progress["purpose"]))
+
+    def test_spawn_and_generic_lifecycle_keep_name_separate_from_role(self):
+        kind, spawned = one(
+            {
+                "type": "subagent_spawn",
+                "subagentId": "opaque-child-1",
+                "name": "BoreReview",
+                "role": "task",
+                "brief": "Review bearing bore fit",
+            }
+        )
+        self.assertEqual((kind, spawned["name"], spawned["role"]), ("agent.spawn", "BoreReview", "task"))
+        kind, ended = one(
+            {
+                "type": "subagent_completed",
+                "subagentId": "opaque-child-1",
+                "name": "BoreReview",
+                "purpose": "task",
+            }
+        )
+        self.assertEqual((kind, ended["name"], ended["status"]), ("sub_run", "BoreReview", "done"))
+
+    def test_tool_end_surfaces_returned_images_as_path_refs(self):
+        render_end = {
+            "type": "tool_execution_end",
+            "toolCallId": "r1",
+            "toolName": "render_part",
+            "result": {
+                "content": [
+                    {"type": "text", "text": '{"ok": true, "caption": "Iso view of bracket"}'},
+                    {"type": "image", "mimeType": "image/png", "data": "iVBOR"},
+                ],
+                "details": {
+                    "ok": True,
+                    "caption": "Iso view of bracket",
+                    "images": [
+                        {"kind": "image", "path": "/tmp/r1.png", "mime": "image/png", "width": 800, "height": 600}
+                    ],
+                },
+            },
+        }
+        kind, payload = one(render_end)
+        self.assertEqual(kind, "agent.tool_call")
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["artifacts"], [{"path": "/tmp/r1.png", "kind": "image"}])
+        self.assertEqual(payload["image_caption"], "Iso view of bracket")
+        self.assertNotIn("iVBOR", json.dumps(payload))
+
+        kind, failed = one(
+            {
+                "type": "tool_execution_end",
+                "toolCallId": "c1",
+                "toolName": "write",
+                "args": {"path": "xd://check_clearance", "content": "{}"},
+                "result": {
+                    "content": [{"type": "text", "text": "{}"}],
+                    "details": {
+                        "xdev": {
+                            "inner": {
+                                "ok": False,
+                                "error": "clash",
+                                "caption": "Section A",
+                                "images": [{"kind": "image", "path": "/tmp/c.png"}],
+                            }
+                        }
+                    },
+                },
+            }
+        )
+        self.assertFalse(failed["ok"])
+        self.assertIn({"path": "/tmp/c.png", "kind": "image"}, failed["artifacts"])
+        self.assertEqual(failed["image_caption"], "Section A")
+
+        state = RpcFrameState()
+        map_rpc_frame(
+            {
+                "type": "subagent_lifecycle",
+                "payload": {"id": "Renderer", "agent": "task", "status": "started", "parentToolCallId": "toolu_task_9", "index": 0},
+            },
+            CTX,
+            state,
+        )
+        [(kind, nested)] = map_rpc_frame(
+            {"type": "subagent_event", "payload": {"id": "Renderer", "event": render_end}}, CTX, state
+        )
+        self.assertEqual(
+            (kind, nested["subagent_id"], nested["parent_id"]), ("agent.tool_call", "Renderer", "toolu_task_9")
+        )
+        self.assertEqual(nested["artifacts"], [{"path": "/tmp/r1.png", "kind": "image"}])
+        self.assertEqual(nested["image_caption"], "Iso view of bracket")
+
+        multiple = copy.deepcopy(render_end)
+        multiple["artifacts"] = [{"kind": "image", "path": "/tmp/r1.png"}]
+        multiple["result"]["details"]["images"] += [
+            {"kind": "image", "path": "/tmp/r2.png"},
+            {"kind": "image", "path": "/tmp/r1.png"},
+        ]
+        _, deduped = one(multiple)
+        self.assertEqual(
+            deduped["artifacts"],
+            [{"path": "/tmp/r1.png", "kind": "image"}, {"path": "/tmp/r2.png", "kind": "image"}],
+        )
+        self.assertEqual(deduped["image_caption"], "Iso view of bracket")
+
+        already_present = copy.deepcopy(render_end)
+        already_present["artifacts"] = [{"kind": "image", "path": "/tmp/r1.png"}]
+        _, existing = one(already_present)
+        self.assertEqual(existing["artifacts"], [{"path": "/tmp/r1.png", "kind": "image"}])
+        self.assertEqual(existing["image_caption"], "Iso view of bracket")
+
+        _, numeric = one(
+            {
+                "type": "tool_execution_end",
+                "toolCallId": "q1",
+                "toolName": "inspect_geometry",
+                "result": {"details": {"ok": True, "clearance_mm": 1.25}},
+            }
+        )
+        self.assertNotIn("artifacts", numeric)
+        self.assertNotIn("image_caption", numeric)
+
     def test_usage_and_context_shapes_and_order(self):
         mapped = map_rpc_frame(
             {
@@ -1025,3 +1235,21 @@ class ChudcodeEventMapperTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_question_reply_acknowledges_only_its_correlated_user_message():
+    events = map_rpc_frame({"type": "agent_answer", "batch_id": "b-mount",
+                            "source": "reply", "reply": "Use command strips",
+                            "steer_id": "s-mount"}, CTX)
+    assert [kind for kind, _ in events] == ["agent.answer", "agent.steer"]
+    assert events[1][1]["steer_id"] == "s-mount"
+    assert events[1][1]["status"] == "delivered"
+    assert events[1][1]["run_id"] == CTX["run_id"]
+    assert events[1][1]["session_id"] == CTX["session_id"]
+    for source in ("user", "declined", "cancelled"):
+        assert [kind for kind, _ in map_rpc_frame(
+            {"type": "agent_answer", "batch_id": "b-mount", "source": source,
+             "steer_id": "s-mount"}, CTX)] == ["agent.answer"]
+    assert [kind for kind, _ in map_rpc_frame(
+        {"type": "agent_answer", "batch_id": "b-mount", "source": "reply",
+         "reply": "legacy uncorrelated text"}, CTX)] == ["agent.answer"]

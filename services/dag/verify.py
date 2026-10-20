@@ -277,14 +277,12 @@ def _eval_predicate(
     Error in evaluation → returns (False, error_string) so the caller can
     escalate with reason="predicate_error" (never auto-pass).
     """
-    ns: dict[str, Any] = {"result": result}
-    if extra_ns:
-        ns.update(extra_ns)
-    # Minimal safe builtins: comparison helpers only.
-    ns["__builtins__"] = {"abs": abs, "int": int, "float": float, "bool": bool,
-                          "len": len, "all": all, "any": any, "min": min, "max": max}
+    from .predicate import evaluate
+
+    ns: dict[str, Any] = dict(extra_ns or {})
+    ns["result"] = result
     try:
-        return bool(eval(predicate, ns)), None  # noqa: S307 — restricted namespace
+        return evaluate(predicate, ns), None
     except Exception as exc:
         return False, f"predicate evaluation error: {exc}"
 

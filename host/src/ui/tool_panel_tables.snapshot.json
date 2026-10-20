@@ -337,6 +337,7 @@
    "render_sim_ascii",
    "render_sketch_ascii",
    "sketch_auto_constrain",
+   "sketch_fully_define",
    "sketch_health"
   ],
   "intake": [
@@ -693,7 +694,7 @@
   "cam_post_dialects": "List the available post-processor controller dialects.",
   "cam_redo": "Redo the last undone CAM edit on the active job.",
   "cam_remove_operation": "Remove an operation from the active CAM job by *op_id*.",
-  "cam_save": "Save the active CAM job to a .cam+ file at *path*. The path is resolved to an absolute path (matching this MCP process's cwd, not the …",
+  "cam_save": "Save the active CAM job to a .cam+ file at *path*. Relative paths use the selected project root, never the worker or daemon cwd; without a …",
   "cam_set_stock": "Set/replace a setup's stock. stock types: box | box_offset | cylinder | cylinder_offset | from_solid | from_sim (see cad_guide('cam')). …",
   "cam_setup_sheet": "Generate the operator setup sheet as backward-compatible HTML + text.",
   "cam_simulate": "Material-removal simulation: removed/remaining volume, machined fraction, gouge, rapid-through-stock, and holder/shank collision checks …",
@@ -846,7 +847,7 @@
   "fit_report": "The fit report to review before printing: each mating pair's modeled-vs-source dimension, the clearance applied for the process, its …",
   "fs_edit": "Replace text in an existing file. By default *old* MUST occur exactly once (a safe, unambiguous edit); set replace_all=True to replace …",
   "fs_glob": "Find paths matching a glob (e.g. 'src/**/*.py'). Returns matches newest-first. Capped at 1000.",
-  "fs_grep": "Regex-search files under *path* (optionally filtered by *glob*, e.g. '*.py'). Returns {file, line, text} matches, capped at 500. Risk: read.",
+  "fs_grep": "Regex-search files under *path* (optionally filtered by *glob*, e.g. '*.py'). Returns {file, line, text} matches, capped at 500. …",
   "fs_list": "List a directory's entries (name, dir flag, size). Capped at 1000 entries.",
   "fs_read": "Read a text file, directory, or document with CONTEXT-SAFE, line-numbered output.",
   "fs_write": "Create or OVERWRITE a text file with *content*. Parent dirs are created by default. Returns {ok, path, bytes}. Risk: write.",
@@ -1146,7 +1147,7 @@
   "sim_results": "Collect a simulation job's results — from ANY tool that returned a job_id.",
   "sim_run": "Start an FEA solve in a SEPARATE PROCESS and return a job_id immediately.",
   "sim_status": "State of a sim job: queued|running|done|failed|cancelled, elapsed, progress.",
-  "simulate_motion": "Kinematic motion study: DRIVE one or more mates over synchronized ranges, re-solve the mechanism each sample, return every body's pose + a …",
+  "simulate_motion": "Sweep synchronized mate drivers; return sampled body poses and per-frame clash evidence.",
   "sketch3d_add_constraints": "Add constraints to a sketch3d and return the narrated solve results.",
   "sketch3d_add_curves": "Append curve entities to a sketch3d feature (edit_feature) and report the solve.",
   "sketch3d_as_sweep_guide": "Get the exact sweep ref syntax for using this sketch3d as the PATH or a GUIDE.",
@@ -1161,6 +1162,7 @@
   "sketch3d_sample_at": "Sample a POINT + TANGENT on the SOLVED sketch3d path at arc-length fraction t.",
   "sketch3d_section_at": "Cross-section the part with a plane whose ORIENTATION follows the path tangent.",
   "sketch_auto_constrain": "Stitch a sketch's near-touching endpoints closed by adding coincident constraints — the cheap way to close chains before dimensioning.",
+  "sketch_fully_define": "Finish a 2D sketch with editable geometric relations and driving dimensions, never fix pins.",
   "sketch_health": "The single narrated read of a sketch's constraint state — solve it and get back WHY it is under/over-defined plus an ordered plan to reach …",
   "sketch_preview_text": "Full TEXT description of a 2D sketch — entities, constraints, DOF, regions, health.",
   "slice_part": "Slice one part, or several parts on one plate, to printer-ready G-code with STOCK PrusaSlicer and prove the result.",
@@ -1193,7 +1195,7 @@
   "verify_packet": "Check ONE evidence-packet folder for mutual consistency BEFORE citing it.",
   "vessel_size": "Size a pressure vessel to ASME VIII-1: shell + head thickness, MAWP, hydrotest, volume and masses.",
   "wait_job": "Block until a background job (get_job id) finishes or timeout_s passes — use instead of sleep/poll loops.",
-  "wall_thickness": "How THIN is the thinnest wall? Inward ray-cast wall-thickness over the whole part.",
+  "wall_thickness": "Sample local wall spans by inward normal rays; NOT a structural-wall safety verdict.",
   "workspace_doc_events": "Return per-doc event stream entries starting at *since_seq*.",
   "workspace_status": "Return the workspace snapshot: project directory, open documents, owners."
  },
@@ -1232,7 +1234,7 @@
    "prompt_note": "Add one base/projected view to a make_drawing doc; x/y are sheet mm. Set show_hidden deliberately and use orientation controls only when the canonical directions do not expose the specified feature."
   },
   "add_features": {
-   "prompt_note": "Batch related ops in ONE call and read the reply's interpreted, per-feature status and changes fields plus its overlap and attachment warnings (floating/overhanging features) before anything else; a heavy op may return {job_id} — poll get_job. op rename relabels a FEATURE by id; no op renames the part — name it in new_part(name=…) and its file in save_part(path=…)."
+   "prompt_note": "Batch related ops in ONE call and read the reply's interpreted, per-feature status and changes fields plus its overlap and attachment warnings (floating/overhanging features) before anything else; a heavy op may return {job_id} — poll get_job. Sketches: draw roughly, relations then functional driving dimensions, sketch_fully_define, check_sketch (dof 0, not pinned_only). Automatic definition (default on) runs after explicit intent; opt out with the auto_define=false argument or auto_define:false on feature/params/authoring op. Use origin/axis.h/axis.v refs, construction sketch_convert references, true arcs/slots and symmetric centerlines; never blanket-fix profiles. op rename relabels a FEATURE by id; no op renames the part — name it in new_part(name=…) and its file in save_part(path=…)."
   },
   "add_gdt": {
    "prompt_note": "Declare add_datum/add_datum_target references first; row2 creates a composite frame and datum/material modifiers must match the ledger. Re-check placement with review_drawing and coverage with audit_drawing."
@@ -1430,7 +1432,7 @@
    "prompt_note": "Read this before verify_battery to pick check names and see cost/platform classes — it is the registry of everything the battery can run."
   },
   "check_sketch": {
-   "prompt_note": "Require dof 0 before extruding/sweeping; 'under' lists what's loose, 'over' means drop a conflicting/redundant constraint — then re-check."
+   "prompt_note": "Before consuming a profile require closed, dof == 0, pinned_only == false, no conflicts/skipped constraints. Blanket fix is not design intent; fixed external references are legitimate. Read findings/free variables, add relations then driving dimensions, sketch_fully_define, and re-check."
   },
   "check_sketch3d": {
    "prompt_note": "sketch3d twin of check_sketch; a sweep-spine path needn't reach dof 0, but pinned paths survive edits. wires[k] maps to the sweep ref."
@@ -1875,19 +1877,19 @@
    "param_defaults": {
     "limit": 200
    },
-   "prompt_note": "Matches come back newest-first, so recently generated outputs surface at the top; '**' recurses — anchor it under a subdirectory to stay under the 1000-result cap."
+   "prompt_note": "Matches come back newest-first, so recently generated outputs surface at the top; '**' recurses — anchor it under a subdirectory to stay under the scan and 32 KiB response budgets. Budget/deadline refusals are not empty or complete search results."
   },
   "fs_grep": {
    "param_defaults": {
     "max_matches": 100
    },
-   "prompt_note": "Python regex, line-oriented; skips files >8 MiB and stops after 5000 files, so narrow big trees with path+glob; follow hits up with fs_read's line selector."
+   "prompt_note": "Python regex, line-oriented, in a killable readonly child with a two-second per-tool deadline. Skips files initially >8 MiB; bounds input to 64 MiB, 5000 files and responses to 32 KiB. A deadline or budget exhaustion is a typed refusal, not partial success; simplify the regex or narrow path+glob/lower max_matches. Follow hits up with fs_read's line selector."
   },
   "fs_list": {
    "prompt_note": "Directories only (a file path errors) — orient here first, then fs_glob/fs_grep to go deeper; dirs sort before files; CAD rows carry a one-line card summary."
   },
   "fs_read": {
-   "prompt_note": "Windowed by design: after a fs_grep hit, jump straight there with a 'path:50-200' selector instead of paging from the top; binary files are refused, directories list entries; a CAD file returns its card plus a labelled render (preview image), not its bytes. To parse a large file (json.loads), read it with raw=true from byte_offset=0, follow next_byte_offset while truncated is true, and join the page texts."
+   "prompt_note": "Windowed by design: after a fs_grep hit, jump straight there with a 'path:50-200' selector instead of paging from the top; binary files are refused, directories list entries; a CAD file returns its card plus a labelled render (preview image), not its bytes. Text scans are chunked and bounded to 64 MiB; larger/changing inputs refuse with read_budget_exceeded/file_changed, not a partial success. To parse a large supported file (json.loads), read raw=true from byte_offset=0, follow next_byte_offset while truncated is true, and join the page texts; do not parse a single truncated page."
   },
   "fs_write": {
    "prompt_note": "Full overwrite, no append — never use it to patch an existing file; that is fs_edit's job. Parent dirs are created for you."
@@ -2507,7 +2509,7 @@
    "prompt_note": "Appends to an EXISTING sketch (convert_face_to_sketch creates one). 'front'/'top'/'right' mean datum planes, not faces — use a sid or side word for solid faces."
   },
   "publish_print_media": {
-   "prompt_note": "The only way G-code goes onto printer media — never cp/fs_write it there. jobs = the COMPLETE project set of print_ready slice_part manifests; media_idle=True only after the user confirms no printer is using the media. Report the returned PRINT/<project>/R<rev><part>_*.gcode names and any unmanaged printables left; never call the media clean while they remain."
+   "prompt_note": "The only way G-code goes onto printer media — never cp/fs_write it there. jobs = the COMPLETE project set of print_ready slice_part manifests; a job that is not print_ready goes on only when the user explicitly says to put it there anyway: pass that job's user_override=<their words> and report its failed checks — never refuse that instruction or hand-copy instead. media_idle=True only after the user confirms no printer is using the media. Default to raw files at drive root; layout='project' permits ONE top-level project folder, never nested delivery trees or CAD/review packets. Delete deprecated G-code, never archive it; keep only temporary rollback staging. Report returned filenames and unmanaged printables left; never call the media clean while they remain."
   },
   "pump_drive_size": {
    "prompt_note": "Electric motor for a pump: kind=hydraulic (flow_lpm + pressure_bar) or centrifugal (flow_m3h + head_m). Rounds shaft power x service_factor up the IEC kW or NEMA hp ladder; quote motor_rating, poles, frame and full_load_current_a. For a solved piping network use piping_pump_drive instead."
@@ -2778,7 +2780,7 @@
    "prompt_note": "Use for builds/tests/scripts; prefer fs_read/fs_grep/fs_glob/fs_write for plain file work. Stateless per call — pass cwd each time; pipe noisy output through head; check exit_code/timed_out."
   },
   "run_topology_optimization": {
-   "prompt_note": "Mutating (writes study, jobs, artifacts). Query topology_capabilities first, then run the same persisted UI study: run_topology_optimization(study=..., doc_id=..., background=True). Poll with get_job/wait_job; stop with sim_cancel. Report computation, convergence and feasibility separately — a finished run is not a converged or feasible one. Inspect the density fields, thresholded surface, actual-domain reanalysis and manufacturing checks; the source CAD stays editable. Geometry/DFAM checks alone are not print-ready: slice_part must validate the G-code."
+   "prompt_note": "Mutating (writes study, jobs, artifacts). Query topology_capabilities first, then run the same persisted UI study: run_topology_optimization(study=..., doc_id=..., background=True). Poll with get_job/wait_job; stop with sim_cancel. Report computation, convergence and feasibility separately — a finished run is not a converged or feasible one. Inspect the density fields, thresholded surface, actual-domain reanalysis and manufacturing checks; the source CAD stays editable. For printing set print_process and build_plate, read DFAM, then pass print_handoff slice_part arguments with the user's printer. Geometry/DFAM alone are not print-ready: slice_part must validate the G-code."
   },
   "save_part": {
    "prompt_note": "Native editable Chudware document only (.step+ ZIP); it is NOT ISO STEP and a machine shop cannot treat it as .step. Save it for project history, and for external manufacturing also call export_part(fmt='step', path='...step')."
@@ -2851,7 +2853,7 @@
    "timeout_s": 900
   },
   "sketch3d_add_constraints": {
-   "prompt_note": "Point handles are 'e3.p1'/'e3.p2'/'e3.pm'; tangent/symmetric/equal/midpoint are NOT in v1 (validator rejects). Re-check with check_sketch3d."
+   "prompt_note": "Point handles: e3.p1/e3.p2/e3.pm, spline e3.pK, external vertex xN. Use tangent/equal/midpoint/collinear/concentric/coradial and plane-based on_plane/parallel_plane/normal_plane/symmetric; dimensions drive size. Avoid blanket fix pins; re-check check_sketch3d."
   },
   "sketch3d_add_curves": {
    "prompt_note": "Arcs are THREE-POINT [start,mid,end]; endpoints within 1e-4 mm chain into wires automatically. Simple routes → sketch3d_path_from_points instead."
@@ -2892,8 +2894,11 @@
   "sketch_auto_constrain": {
    "prompt_note": "Auto-runs after sketch edits (sketch.auto_coincident, default ON) — call explicitly only to preview (apply=False) or re-stitch with a looser tol_mm."
   },
+  "sketch_fully_define": {
+   "prompt_note": "After explicit design-intent relations/critical dimensions, define residual DOF without fix pins. anchor='origin'|'none'; entities optionally limits scope. Inspect exact added counts and remaining DOF; check_sketch must not be pinned_only."
+  },
   "sketch_health": {
-   "prompt_note": "Verify step after every sketch edit: apply the schedule in order (relations first, then driving dimensions) and re-run until status is 'full'."
+   "prompt_note": "Apply relations then driving dimensions; sketch_fully_define handles residual freedom. Require dof 0 and not pinned_only, not merely status='full'. Read findings for pins, missing driving dimensions and origin/model references."
   },
   "sketch_preview_text": {
    "prompt_note": "No-vision full text of a 2D sketch (entities/constraints/regions/DOF) — the readable alternative to render_sketch; 3D → sketch3d_preview."
@@ -2960,7 +2965,7 @@
    "prompt_note": "Publish the FULL list every call (omitted items disappear from the panel) — same order, updated statuses, after each step."
   },
   "topology_capabilities": {
-   "prompt_note": "Read-only. Call FIRST to learn the supported topology methods, physics, constraints and limits before configuring a study; never assume a method or constraint that it does not list."
+   "prompt_note": "Read-only. Call FIRST to learn supported topology methods, physics, constraints, limits and print_processes before configuring a study; never assume an unlisted method or constraint. For printing choose a preset and a build_plate bed face."
   },
   "undo": {
    "prompt_note": "Usually denied for agents (undo_denied) — roll the doc back with plm_timeline then plm_rollback instead; if it does run, render_part to confirm the rolled-back state."

@@ -1,7 +1,7 @@
-// Copilot attachment image chrome: the square thumbnail tile drawn for a pasted/attached image
-// chip, and the full-size viewer ("lightbox") a click on that tile opens.
+// Copilot attachment image chrome: square composer thumbnails, aspect-preserving sent-message
+// previews, and the full-size viewer ("lightbox") a click on either opens.
 //
-// Both share ONE bounded texture cache, so clicking a chip that is already thumbnailed costs no
+// All share ONE bounded texture cache, so clicking an already-previewed attachment costs no
 // second GL upload. Uploads go through the same lazy ::loadTexture path the copilot timeline and
 // the AI-tab Documents preview use.
 //
@@ -33,9 +33,9 @@ namespace {
 
 // ---- shared bounded texture cache -----------------------------------------------------------
 // A pasted screenshot is multi-megapixel, so the ceiling here is tighter than the timeline's
-// artifact cache (activity_timeline.cpp): the composer never shows more than a handful of chips
-// and the viewer shows one. `use` is a monotonically increasing stamp bumped on every hit; the
-// lowest stamp is the least-recently-used entry.
+// artifact cache (activity_timeline.cpp). Composer chips, sent-message previews and the viewer
+// share it. `use` is a monotonically increasing stamp bumped on every hit; the lowest stamp is
+// the least-recently-used entry.
 struct ThumbTex {
     ::Tex              tex;
     unsigned long long use = 0;
@@ -151,19 +151,17 @@ bool        g_lbOpen = false;
 // thumbnail tile
 // =================================================================================================
 
-bool attachmentThumbnail(const std::string& path, float sizePx) {
-    if (path.empty() || sizePx < 4.0f) return false;
-
+static bool attachmentTile(const std::string& path, const ImVec2& size, const ::Tex* tex) {
     const auto& pal = palette;
     ImDrawList* dl  = ImGui::GetWindowDrawList();
 
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    const ImVec2 p1(p0.x + sizePx, p0.y + sizePx);
+    const ImVec2 p1(p0.x + size.x, p0.y + size.y);
 
     // Exact hit-test: one InvisibleButton the size of the tile, id derived from the path so a row
     // of chips never collides even when the caller forgot to PushID.
     ImGui::PushID(path.c_str());
-    ImGui::InvisibleButton("##attach_thumb", ImVec2(sizePx, sizePx));
+    ImGui::InvisibleButton("##attach_thumb", size);
     ImGui::PopID();
     const bool hovered = ImGui::IsItemHovered();
     const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
@@ -176,12 +174,6 @@ bool attachmentThumbnail(const std::string& path, float sizePx) {
     // image inside a chip instead of a floating sliver.
     dl->AddRectFilled(p0, p1, u32a(pal.glassBg, 0.55f), rnd);
 
-    const ::Tex* tex = nullptr;
-    if (isImageAttachment(path)) {
-        const ::Tex& t = texFor(path);
-        if (usable(t)) tex = &t;
-    }
-
     if (tex) {
         ImVec2 f0, f1;
         fitRect(ImVec2(p0.x + thick, p0.y + thick), ImVec2(p1.x - thick, p1.y - thick),
@@ -190,7 +182,8 @@ bool attachmentThumbnail(const std::string& path, float sizePx) {
         dl->AddImageRounded((ImTextureID)(intptr_t)tex->id, f0, f1, ImVec2(0, 0), ImVec2(1, 1),
                             IM_COL32_WHITE, rnd);
     } else {
-        drawFileGlyph(dl, ImVec2((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f), sizePx * 0.52f,
+        drawFileGlyph(dl, ImVec2((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f),
+                      std::min(size.x, size.y) * 0.52f,
                       u32a(pal.textDim, 0.55f), metrics::stroke(1.2f));
     }
 
@@ -208,6 +201,34 @@ bool attachmentThumbnail(const std::string& path, float sizePx) {
     }
 
     return clicked;
+}
+
+bool attachmentThumbnail(const std::string& path, float sizePx) {
+    if (path.empty() || sizePx < 4.0f) return false;
+    const ::Tex* tex = nullptr;
+    if (isImageAttachment(path)) {
+        const ::Tex& t = texFor(path);
+        if (usable(t)) tex = &t;
+    }
+    return attachmentTile(path, ImVec2(sizePx, sizePx), tex);
+}
+
+bool attachmentImagePreview(const std::string& path, float maxWidth, float maxHeight) {
+    if (path.empty() || maxWidth < 4.0f || maxHeight < 4.0f) return false;
+    const ::Tex* tex = nullptr;
+    if (isImageAttachment(path)) {
+        const ::Tex& t = texFor(path);
+        if (usable(t)) tex = &t;
+    }
+    ImVec2 size(maxWidth, std::min(maxHeight, ImGui::GetTextLineHeight() * 4.0f));
+    if (tex) {
+        // Keep small pastes at native resolution; large portrait/landscape images fit both axes.
+        const float border = metrics::stroke(1.0f) * 2.0f;
+        const float scale = std::min({(maxWidth - border) / static_cast<float>(tex->w),
+                                      (maxHeight - border) / static_cast<float>(tex->h), 1.0f});
+        size = ImVec2(tex->w * scale + border, tex->h * scale + border);
+    }
+    return attachmentTile(path, size, tex);
 }
 
 // =================================================================================================

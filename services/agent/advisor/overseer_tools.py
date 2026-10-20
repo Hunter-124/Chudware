@@ -94,7 +94,7 @@ def audit_now(
         provider=_offline_provider(providers) if offline else None,
         ledger=ledger,
         budget=budget,
-        session_id=session_id or run_id,
+        session_id=session_id,
         on_event=on_event,
         options=options,
         offline=offline,
@@ -149,7 +149,7 @@ def change_request(
     overseer = Overseer(
         provider=_offline_provider(providers) if offline else None,
         ledger=ledger,
-        session_id=session_id or run_id,
+        session_id=session_id,
         on_event=on_event,
         options=options,
         offline=offline,

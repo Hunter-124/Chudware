@@ -869,3 +869,37 @@ into its authored coordinates, if the sketch converges. Solved geometry does not
 a fix locks the shape that the readback shows. If the sketch does not converge, the authored
 coordinates stay. A sketch that does not converge reports the conflicting constraint ids and,
 for each coincident between fixed points, the authored gap.
+
+## 31. Sketch references, Fully Define and composite relations (append-only, 2026-10-16)
+
+**`sketch_convert`** accepts every reference kind of doc_schema "Sketch relation set v2 … external
+reference kinds" (vertex, edge `mode:"pierce"`, datum axes/origin, `sketch_entity`). It resolves
+the sketch plane and projects from the session's cached compile of the candidate document (the
+op never runs its own uncached compile), and the associative refresh reuses one per-model-state
+set of face/edge/vertex descriptors plus a per-ref projection memo keyed by source, resolved
+sketch plane and compiled body identity, so an unchanged model re-projects nothing. Send all
+picked refs of one action in ONE op (`refs:[...]`): one compile, one undo step. id_map is
+unchanged: `$i` the first new entity, `$i#k` the rest in ref order; later ops of the same batch
+may reference them (`sketch_add_constraint` refs `["e7", "$0"]`).
+
+**`sketch_fully_define`** — `{op:"sketch_fully_define", sketch, relations?:true, dimensions?:true,
+anchor?:"origin"|"none", entities?:[eid…]}`. Infers the relations a user would add (coincident,
+horizontal/vertical, endpoint tangent, parallel, perpendicular, exact equal lengths/radii,
+concentric, midpoint, collinear, point_on, origin anchoring), then driving dimensions for the DOF
+left (diameter/radius, line length, h/v location from the anchor, angle to `axis.h`, h/v
+location of every free spline through-point). Every value is the current measurement: the op
+never moves geometry, and each candidate is accepted only if the sketch still converges with no
+conflicting/redundant constraint and the DOF drops. `entities` restricts inference to those
+entities. id_map: `$i` the first new constraint id, `$i#k` the rest; nothing when it added
+nothing. It throws only for a bad sketch ref; callers read the DOF from `sketch_health`.
+
+**Composite entities** expand with their intent: `rectangle` → 4 lines + 4 coincident +
+2 horizontal + 2 vertical (rotated: 4 coincident + 2 parallel + 1 perpendicular); regular
+`polygon` → closed coincident chain + equal sides; `polyline` → coincident chain (+ closure).
+
+**MCP `add_features`** appends `sketch_fully_define` after each new sketch feature and after
+`sketch_add_entity` runs in the SAME batch (one revision, unchanged rollback), unless the call
+(`auto_define:false`), the op, or the sketch (`params.auto_define:false`) opts out. The readback
+reports relations/dimensions added and the resulting DOF; `check_sketch` reports `pinned_only`
+(DOF 0 reached through `fix` pins with no driving dimension) and never calls such a sketch fully
+defined.

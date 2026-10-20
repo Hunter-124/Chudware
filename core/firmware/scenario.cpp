@@ -12,6 +12,8 @@
 
 #include "firmware/pyfmt.h"
 #include "firmware/bus_models.h"
+#include "firmware/renode_encoding.h"
+#include "firmware/private_storage.h"
 
 namespace chudware::firmware {
 namespace {
@@ -46,6 +48,27 @@ std::string track_kinds_joined() {
 }
 
 bool is_num(const nlohmann::json& v) { return v.is_number() && std::isfinite(v.get<double>()); }
+
+constexpr size_t kScenarioWork = 32768;
+constexpr size_t kScenarioBytes = 1024 * 1024;
+
+bool bounded_scenario_value(const nlohmann::json& value, size_t& bytes,
+                            size_t& nodes, unsigned depth = 0) {
+    if (depth > 32 || ++nodes > kScenarioWork) return false;
+    const size_t cost = value.is_string() ? value.get_ref<const std::string&>().size() : 32;
+    if (cost > kScenarioBytes - bytes) return false;
+    bytes += cost;
+    if (value.is_structured()) {
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            if (value.is_object()) {
+                if (it.key().size() > kScenarioBytes - bytes) return false;
+                bytes += it.key().size();
+            }
+            if (!bounded_scenario_value(it.value(), bytes, nodes, depth + 1)) return false;
+        }
+    }
+    return true;
+}
 
 std::optional<std::string> validate_pin(const nlohmann::json& pin) {
     if (!pin.is_string()) return "pin must be STM32-style 'P<A-K><0-15>', got " + py_repr(pin);
@@ -148,8 +171,8 @@ std::vector<std::string> validate_track(const nlohmann::json& tr) {
                 errs.push_back(std::string(key) + ": " + *e);
         }
         if (!tr.contains("steps") || !tr["steps"].is_number_integer() ||
-            tr["steps"].get<long long>() < 1)
-            errs.push_back("quadrature needs integer 'steps' >= 1");
+            tr["steps"].get<double>() < 1 || tr["steps"].get<double>() > kScenarioWork)
+            errs.push_back("quadrature needs integer 'steps' in 1..32768");
         if (!is_num(tr.value("step_ms", nlohmann::json())) || tr["step_ms"].get<double>() <= 0)
             errs.push_back("quadrature needs 'step_ms' > 0");
         if (tr.value("direction", std::string("cw")) != "cw" &&
@@ -288,6 +311,19 @@ std::vector<std::string> validate_track(const nlohmann::json& tr) {
         errs.push_back("SPI CS requires cs_gpio=gpioPortA..K and cs_pin=0..15");
     if(kind=="uart_rx" && tr.contains("baud_hz") && (!is_num(tr["baud_hz"]) || tr["baud_hz"].get<double>()<=0))
         errs.push_back("UART baud_hz must be finite positive");
+    for (const char* key : {"bus", "uart", "name", "endpoint", "link_id"})
+        if (tr.contains(key) && (!tr[key].is_string() ||
+            !renode_identifier(tr[key].get<std::string>())))
+            errs.push_back(std::string(key) + " must be a Renode identifier (1..64 ASCII bytes)");
+    if (tr.contains("drive_events") && tr["drive_events"].is_array())
+        for (const auto& event : tr["drive_events"])
+            if (event.is_object() && event.contains("endpoint") &&
+                (!event["endpoint"].is_string() ||
+                 !renode_identifier(event["endpoint"].get<std::string>())))
+                errs.push_back("drive endpoint must be a Renode identifier");
+    for (const char* key : {"start_ms", "hold_ms", "sample_ms"})
+        if (tr.contains(key) && (!is_num(tr[key]) || tr[key].get<double>() < 0))
+            errs.push_back(std::string(key) + " must be finite nonnegative");
     return errs;
 }
 
@@ -487,6 +523,9 @@ std::pair<nlohmann::json, std::vector<std::string>> load_scenario(
 
 std::vector<std::string> validate_scenario(const nlohmann::json& sc) {
     std::vector<std::string> errors;
+    size_t bytes = 0, nodes = 0;
+    if (!bounded_scenario_value(sc, bytes, nodes))
+        return {"scenario input exceeds byte/node/depth budget"};
     const auto link_errors = validate_bus_links(sc);
     errors.insert(errors.end(), link_errors.begin(), link_errors.end());
     if (!sc.is_object() || sc.value("schema", std::string()) != kScenarioSchema) {
@@ -499,6 +538,41 @@ std::vector<std::string> validate_scenario(const nlohmann::json& sc) {
         errors.push_back("scenario must carry a non-empty 'tracks' list");
         return errors;
     }
+    if (sc["tracks"].size() > 128) return {"scenario track count exceeds 128"};
+    size_t work = 0;
+    for (const auto& track : sc["tracks"]) {
+        if (!track.is_object()) continue;
+        const auto add = [&](size_t amount) {
+            if (amount > kScenarioWork - work) return false;
+            work += amount;
+            return true;
+        };
+        if (!add(16)) return {"scenario expansion exceeds command budget"};
+        if (track.contains("steps") && track["steps"].is_number_integer()) {
+            const double steps = track["steps"].get<double>();
+            if (steps < 1 || steps > kScenarioWork || !add(static_cast<size_t>(steps)))
+                return {"scenario expansion exceeds command budget"};
+        }
+        for (const char* list : {"events", "samples", "presses", "drive_events", "response"}) {
+            if (!track.contains(list) || !track[list].is_array()) continue;
+            for (const auto& event : track[list]) {
+                if (!add(2)) return {"scenario expansion exceeds command budget"};
+                if (!event.is_object()) continue;
+                for (const char* field : {"text", "response"}) {
+                    if (!event.contains(field)) continue;
+                    if ((event[field].is_string() || event[field].is_array()) &&
+                        !add(event[field].is_string()
+                            ? event[field].get_ref<const std::string&>().size() : event[field].size()))
+                        return {"scenario expansion exceeds command budget"};
+                }
+            }
+        }
+    }
+    // Conservative monitor/auxiliary admission: each expanded action has at
+    // most 512 bytes of fixed syntax/identifiers; payload encoding at most 4x
+    // the admitted input, plus 1 MiB for maintained peripheral source.
+    if (work * 512 + bytes * 4 + kScenarioBytes > 16 * kScenarioBytes)
+        return {"scenario expansion exceeds command-byte budget"};
     int i = 0;
     for (const auto& tr : sc["tracks"]) {
         std::string tag = "tracks[" + std::to_string(i) + "]";
@@ -547,10 +621,26 @@ std::vector<int> waveform_samples(const nlohmann::json& wf, double sample_ms, in
 }
 
 ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann::json& caps,
-                                 const std::string& platform_text) {
+                                 const std::string& platform_text, double horizon_ms) {
     ScenarioPlan plan;
     plan.errors = validate_scenario(scenario);
     if (!plan.errors.empty()) return plan;
+    // Admit virtual horizon before materializing quadrature edges or UART bytes.
+    for (const auto& track : scenario["tracks"]) {
+        double end = 0;
+        if (track.value("kind", std::string()) == "quadrature")
+            end = track.value("start_ms", 0.0) +
+                  track["steps"].get<double>() * track["step_ms"].get<double>();
+        for (const char* list : {"events", "samples", "presses", "drive_events"})
+            if (track.contains(list) && track[list].is_array())
+                for (const auto& event : track[list])
+                    end = std::max(end, event.value("t_ms", 0.0) +
+                        (std::string(list) == "presses" ? event.value("hold_ms", 50.0) : 0.0));
+        if (!std::isfinite(end) || end < 0 || (horizon_ms > 0 && end > horizon_ms)) {
+            plan.errors.push_back("scenario stimulus exceeds finite virtual horizon");
+            return plan;
+        }
+    }
     plan.resolved_links = resolve_bus_links(scenario, caps, platform_text, plan.errors);
     if(!plan.errors.empty()) return plan;
     if(caps.value("family", std::string())=="stm32f4") {
@@ -561,7 +651,7 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
         for(const auto& link:plan.resolved_links) if(link["protocol"]=="spi") {
             const auto& peer=link["peer"];
             if(peer.contains("cs_gpio") && peer.contains("cs_pin"))
-                plan.setup_lines.push_back("machine LoadPlatformDescriptionFromString \""+peer["cs_gpio"].get<std::string>()+": { "+std::to_string(peer["cs_pin"].get<int>())+" -> "+link["bus"].get<std::string>()+"@0 }\"");
+                plan.setup_lines.push_back("machine LoadPlatformDescriptionFromString "+renode_string(peer["cs_gpio"].get<std::string>()+": { "+std::to_string(peer["cs_pin"].get<int>())+" -> "+link["bus"].get<std::string>()+"@0 }"));
         }
     }
 
@@ -590,10 +680,10 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
         std::regex_match(pin, m, kPinRe);
         std::string port = m[1].str();
         int num = std::stoi(m[2].str());
-        std::string line = "machine LoadPlatformDescriptionFromString \"" + btn_name(pin) +
-                           ": Miscellaneous.Button @ gpioPort" + port + " " +
-                           std::to_string(num) + " { -> gpioPort" + port + "@" +
-                           std::to_string(num) + " }\"";
+        std::string line = "machine LoadPlatformDescriptionFromString " +
+                           renode_string(btn_name(pin) + ": Miscellaneous.Button @ gpioPort" +
+                           port + " " + std::to_string(num) + " { -> gpioPort" + port +
+                           "@" + std::to_string(num) + " }");
         if (std::find(plan.setup_lines.begin(), plan.setup_lines.end(), line) ==
             plan.setup_lines.end())
             plan.setup_lines.push_back(line);
@@ -665,7 +755,7 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
                 if(model!="mpu6050" && model!="bmp280" && model!="lis3mdl" && model!="tmp103" && model!="registers") {
                     plan.errors.push_back("I2C device '"+model+"' has no implemented register model; use supported sensor or explicit generic registers");continue;
                 }
-                plan.setup_lines.push_back("sysbus."+bus+" SetDevice "+std::to_string(addr)+" \""+model+"\"");
+                plan.setup_lines.push_back("sysbus."+bus+" SetDevice "+std::to_string(addr)+" "+renode_string(model));
                 nlohmann::json samples=tr.value("samples",nlohmann::json::array());
                 if(samples.empty()) samples.push_back({{"t_ms",0.0},{"response",tr.value("response",nlohmann::json::array())},{"registers",tr.value("registers",nlohmann::json::object())}});
                 if(kind=="i2c_sensor") {
@@ -675,7 +765,7 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
                 const int start=tr.value("register_start",0);
                 for(size_t si=0;si<samples.size();++si) {
                     const auto& sample=samples[si];
-                    std::string command="sysbus."+bus+" SetRegisters "+std::to_string(addr)+" \""+register_hex(sample,start)+"\"";
+                    std::string command="sysbus."+bus+" SetRegisters "+std::to_string(addr)+" "+renode_string(register_hex(sample,start));
                     if(si==0) plan.setup_lines.push_back(command);
                     if(sample.value("t_ms",0.0)>0) plan.timeline.push_back({sample["t_ms"].get<double>(),command});
                 }
@@ -686,16 +776,14 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
             }
             if (kind == "i2c_sensor") {
                 std::string name = "aicadTemp" + std::to_string(i2c_seq);
-                plan.setup_lines.push_back("machine LoadPlatformDescriptionFromString \"" + name +
-                                           ": Sensors.TMP103 @ " + bus + " " + fmt_hex(addr) +
-                                           "\"");
+                plan.setup_lines.push_back("machine LoadPlatformDescriptionFromString " +
+                                           renode_string(name + ": Sensors.TMP103 @ " + bus + " " + fmt_hex(addr)));
                 plan.setup_lines.push_back("sysbus." + bus + "." + name + " Temperature " +
                                            fmt_g(tr["temperature_c"].get<double>()));
             } else {
                 std::string name = "aicadI2C" + std::to_string(i2c_seq);
-                plan.setup_lines.push_back("machine LoadPlatformDescriptionFromString \"" + name +
-                                           ": Mocks.DummyI2CSlave @ " + bus + " " + fmt_hex(addr) +
-                                           "\"");
+                plan.setup_lines.push_back("machine LoadPlatformDescriptionFromString " +
+                                           renode_string(name + ": Mocks.DummyI2CSlave @ " + bus + " " + fmt_hex(addr)));
                 nlohmann::json samples;
                 if (tr.contains("samples") && tr["samples"].is_array())
                     samples = tr["samples"];
@@ -718,8 +806,8 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
                             continue;
                         }
                         plan.timeline.push_back(
-                            {t, "echo \"CHUDWARE_I2C_SAMPLE " + bus + " " + fmt_hex(addr) +
-                                    " t_ms=" + fmt_g(t) + "\""});
+                            {t, "echo " + renode_string("CHUDWARE_I2C_SAMPLE " + bus + " " + fmt_hex(addr) +
+                                    " t_ms=" + fmt_g(t))});
                         for (const auto& b : s["response"])
                             plan.timeline.push_back({t, "sysbus." + bus + "." + name +
                                                             " EnqueueResponseByte " +
@@ -744,20 +832,20 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
                 continue;
             }
             if(family=="stm32f4") {
-                if(tr.contains("response_hex")) plan.setup_lines.push_back("sysbus."+bus+" SetResponse \""+tr["response_hex"].get<std::string>()+"\"");
-                if(tr.contains("registers")) plan.setup_lines.push_back("sysbus."+bus+" SetRegisters \""+register_hex(tr,0)+"\"");
+                if(tr.contains("response_hex")) plan.setup_lines.push_back("sysbus."+bus+" SetResponse "+renode_string(tr["response_hex"].get<std::string>()));
+                if(tr.contains("registers")) plan.setup_lines.push_back("sysbus."+bus+" SetRegisters "+renode_string(register_hex(tr,0)));
                 if(kind=="spi_stub" && !tr.contains("response_hex") && !tr.contains("registers"))
                     plan.setup_lines.push_back("sysbus."+bus+" SetResponse \"00\"");
                 if(tr.contains("cs_gpio") && tr.contains("cs_pin"))
-                    plan.setup_lines.push_back("machine LoadPlatformDescriptionFromString \""+tr["cs_gpio"].get<std::string>()+": { "+std::to_string(tr["cs_pin"].get<int>())+" -> "+bus+"@0 }\"");
+                    plan.setup_lines.push_back("machine LoadPlatformDescriptionFromString "+renode_string(tr["cs_gpio"].get<std::string>()+": { "+std::to_string(tr["cs_pin"].get<int>())+" -> "+bus+"@0 }"));
                 continue;
             }
             if(kind=="spi_peer" || tr.contains("response_hex") || tr.contains("registers")) {
                 plan.errors.push_back("programmable SPI peer requires real STM32F4 timed model");continue;
             }
             std::string name = tr.value("name", std::string("aicadSpiStub"));
-            plan.setup_lines.push_back("machine LoadPlatformDescriptionFromString \"" + name +
-                                       ": Mocks.DummySPISlave @ " + bus + "\"");
+            plan.setup_lines.push_back("machine LoadPlatformDescriptionFromString " +
+                                       renode_string(name + ": Mocks.DummySPISlave @ " + bus));
             plan.warnings.push_back(
                 "spi_stub '" + name +
                 "': DummySPISlave answers every frame with a fixed pattern (connectivity stub) — "
@@ -814,12 +902,29 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
                 plan.errors.push_back("CAN stimulus requires generated STM32F4 bxCAN model");continue;
             }
             std::string endpoint=tr.value("endpoint",std::string("peer"));
+            std::set<std::string> endpoints{"mcu", "peer"};
+            const auto configured = std::find_if(plan.resolved_links.begin(), plan.resolved_links.end(),
+                [&](const auto& link) { return link["bus"] == bus; });
+            if (configured != plan.resolved_links.end()) {
+                endpoints.clear();
+                for (const auto& signal : (*configured)["electrical"]["signals"])
+                    for (const auto& peer : signal["endpoints"])
+                        endpoints.insert(peer["id"].get<std::string>());
+            }
+            bool declared = endpoints.count(endpoint) != 0;
+            if (tr.contains("drive_events"))
+                for (const auto& event : tr["drive_events"])
+                    declared = declared && endpoints.count(event["endpoint"].get<std::string>());
+            if (!declared) {
+                plan.errors.push_back("CAN stimulus endpoint is not declared by its bus link");
+                continue;
+            }
             if(tr.contains("bitrate_hz"))
-                plan.setup_lines.push_back("sysbus."+bus+" ConfigurePeer \""+endpoint+"\" "+std::to_string(tr["bitrate_hz"].get<unsigned>())+" 0.875 1 "+(tr.value("ack_enabled",true)?"true":"false"));
+                plan.setup_lines.push_back("sysbus."+bus+" ConfigurePeer "+renode_string(endpoint)+" "+std::to_string(tr["bitrate_hz"].get<unsigned>())+" 0.875 1 "+(tr.value("ack_enabled",true)?"true":"false"));
             for(const auto& ev:tr["events"])
-                plan.timeline.push_back({ev["t_ms"].get<double>(),"sysbus."+bus+" SubmitFrame \""+endpoint+"\" "+std::to_string(ev["id"].get<unsigned>())+" "+(ev.value("extended",false)?"true":"false")+" "+(ev.value("remote",false)?"true":"false")+" \""+ev["payload_hex"].get<std::string>()+"\""});
+                plan.timeline.push_back({ev["t_ms"].get<double>(),"sysbus."+bus+" SubmitFrame "+renode_string(endpoint)+" "+std::to_string(ev["id"].get<unsigned>())+" "+(ev.value("extended",false)?"true":"false")+" "+(ev.value("remote",false)?"true":"false")+" "+renode_string(ev["payload_hex"].get<std::string>())});
             if(tr.contains("drive_events")) for(const auto& ev:tr["drive_events"])
-                plan.timeline.push_back({ev["t_ms"].get<double>(),"sysbus."+bus+" DriveExternal \""+ev["endpoint"].get<std::string>()+"\" "+std::to_string(ev["state"].get<int>())});
+                plan.timeline.push_back({ev["t_ms"].get<double>(),"sysbus."+bus+" DriveExternal "+renode_string(ev["endpoint"].get<std::string>())+" "+std::to_string(ev["state"].get<int>())});
         } else if (kind == "adc_waveform") {
             auto it = kAdcStubs.find(family);
             if (it == kAdcStubs.end()) {
@@ -850,14 +955,25 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
                 "    size: " + fmt_hex(stub.size) + "\n"
                 "    initable: true\n"
                 "    script: '''\n" + script + "'''\n";
-            plan.setup_lines.push_back("machine LoadPlatformDescription "
-                                       "@{CHUDWARE_SCENARIO_DIR}/" + repl_name);
+            plan.setup_lines.push_back("machine LoadPlatformDescription @{CHUDWARE_SCENARIO_DIR}/" + repl_name);
         }
     }
 
     std::stable_sort(plan.timeline.begin(), plan.timeline.end(),
                      [](const auto& a, const auto& b) { return a.first < b.first; });
     if (!plan.timeline.empty()) plan.duration_ms = plan.timeline.back().first;
+    size_t command_bytes = 0;
+    for (const auto& line : plan.setup_lines) command_bytes += line.size();
+    for (const auto& line : plan.pre_platform_lines) command_bytes += line.size();
+    for (const auto& [time, line] : plan.timeline) command_bytes += line.size() + 128;
+    for (const auto& [name, data] : plan.aux_files) command_bytes += name.size() + data.size();
+    if (command_bytes > 16 * kScenarioBytes) {
+        plan.errors.push_back("scenario generated command/auxiliary byte budget exceeded");
+        plan.timeline.clear();
+        plan.setup_lines.clear();
+        plan.pre_platform_lines.clear();
+        plan.aux_files.clear();
+    }
     return plan;
 }
 
@@ -875,30 +991,32 @@ std::vector<std::string> timeline_resc_lines(
     for (const auto& [t_ms, action] : timeline) {
         double dt = std::max(0.0, t_ms - now_ms);
         if (dt > 0) {
-            lines.push_back("emulation RunFor \"" + virtual_seconds(dt / 1000.0) + "\"");
+            lines.push_back("emulation RunFor " + renode_string(virtual_seconds(dt / 1000.0)));
             now_ms = t_ms;
-            lines.push_back("echo \"CHUDWARE_T_MARK " + fmt_g(now_ms) + "\"");
+            lines.push_back("echo " + renode_string("CHUDWARE_T_MARK " + fmt_g(now_ms)));
         }
         lines.push_back(action);
     }
     double remaining = run_seconds * 1000.0 - now_ms;
     if (remaining > 0) {
-        lines.push_back("emulation RunFor \"" + virtual_seconds(remaining / 1000.0) + "\"");
-        lines.push_back("echo \"CHUDWARE_T_MARK " + fmt_g(run_seconds * 1000.0) + "\"");
+        lines.push_back("emulation RunFor " + renode_string(virtual_seconds(remaining / 1000.0)));
+        lines.push_back("echo " + renode_string("CHUDWARE_T_MARK " + fmt_g(run_seconds * 1000.0)));
     }
     return lines;
 }
 
 void materialize_aux_files(ScenarioPlan& plan, const std::string& directory) {
     namespace fs = std::filesystem;
-    std::error_code ec;
-    fs::create_directories(directory, ec);
+    const auto dir = private_directory(directory);
+    (void)renode_path(dir);
     for (const auto& [name, content] : plan.aux_files) {
-        std::ofstream out(fs::path(directory) / name, std::ios::binary | std::ios::trunc);
-        out << content;
+        if (fs::path(name).filename() != fs::path(name))
+            throw std::invalid_argument("scenario auxiliary filename is not a basename");
+        (void)renode_path(dir / name);
+        private_storage_detail::atomic_write(dir / name, content);
     }
-    for (auto& ln : plan.setup_lines) replace_all(ln, "{CHUDWARE_SCENARIO_DIR}", directory);
-    for (auto& ln : plan.pre_platform_lines) replace_all(ln, "{CHUDWARE_SCENARIO_DIR}", directory);
+    for (auto& ln : plan.setup_lines) replace_all(ln, "{CHUDWARE_SCENARIO_DIR}", dir.generic_string());
+    for (auto& ln : plan.pre_platform_lines) replace_all(ln, "{CHUDWARE_SCENARIO_DIR}", dir.generic_string());
 }
 
 }  // namespace chudware::firmware

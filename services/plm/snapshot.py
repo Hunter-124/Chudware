@@ -80,6 +80,14 @@ _STUDIES_PREFIX = "studies/"
 _STUDY_RESULT_BASENAME_PREFIX = "results."
 _DERIVED_GEOMETRY = "geometry.step"
 
+# Budgets apply to entries PLM actually inflates, not the working file's warm
+# engine caches/geometry (which are skipped without being opened).
+_MAX_ZIP_ENTRIES = 4096
+_MAX_MEMBER_BYTES = 64 * 1024 * 1024
+_MAX_INFLATED_BYTES = 256 * 1024 * 1024
+_READ_CHUNK_BYTES = 64 * 1024
+_MAX_COMPRESSION_RATIO = 1000
+
 
 def is_derived_entry(name: str) -> bool:
     """True when a container entry is solved state, not recipe — stripped at the
@@ -122,10 +130,46 @@ def explode_container(
     extras: dict[str, bytes] = {}
 
     with zipfile.ZipFile(io.BytesIO(raw) if isinstance(raw, bytes) else raw, "r") as zf:
-        for name in zf.namelist():
+        members = zf.infolist()
+        if len(members) > _MAX_ZIP_ENTRIES:
+            raise ValueError("container ZIP entry count limit exceeded")
+        declared_total = 0
+        names: set[str] = set()
+        for info in members:
+            if info.filename in names:
+                raise ValueError("container ZIP has duplicate member names")
+            names.add(info.filename)
+            if is_derived_entry(info.filename):
+                continue
+            if info.file_size > _MAX_MEMBER_BYTES:
+                raise ValueError("container ZIP member byte limit exceeded")
+            if info.file_size > max(1, info.compress_size) * _MAX_COMPRESSION_RATIO:
+                raise ValueError("container ZIP compression ratio limit exceeded")
+            declared_total += info.file_size
+            if declared_total > _MAX_INFLATED_BYTES:
+                raise ValueError("container ZIP aggregate byte limit exceeded")
+
+        inflated_total = 0
+        for info in members:
+            name = info.filename
             if is_derived_entry(name):
-                continue  # solved state — never committed to history (rebuilds)
-            data = zf.read(name)
+                continue  # solved state — never opened or committed to history
+            limit = min(_MAX_MEMBER_BYTES, _MAX_INFLATED_BYTES - inflated_total)
+            chunks: list[bytes] = []
+            member_size = 0
+            with zf.open(info, "r") as member:
+                while True:
+                    chunk = member.read(min(_READ_CHUNK_BYTES, limit - member_size + 1))
+                    if not chunk:
+                        break
+                    member_size += len(chunk)
+                    if member_size > limit:
+                        raise ValueError("container ZIP inflation byte limit exceeded")
+                    chunks.append(chunk)
+            if member_size != info.file_size:
+                raise ValueError("container ZIP member size mismatch")
+            inflated_total += member_size
+            data = b"".join(chunks)
             if name == _DOCUMENT:
                 doc_bytes = data
             elif name == _THUMBNAIL:

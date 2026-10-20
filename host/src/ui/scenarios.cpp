@@ -3,6 +3,7 @@
 #include "scenarios.h"
 
 #include "gl_compat.h"
+#include "ui/feature_tree.h"
 //
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -24,6 +25,8 @@
 #include <functional>
 #include <mutex>
 #include <vector>
+#include <map>
+#include <sstream>
 
 #include "../core/app_state.h"
 #include "../core/sim_client.h"  // simaudit: mesh-preview idle wait (SimClient::busy)
@@ -35,6 +38,7 @@
 #include "evaluate_dialogs.h"
 #include "manufacture/manufacture_panel.h"
 #include "property_manager.h"
+#include "doc_tabs.h"
 #include "onboarding.h"
 #include "sim_manager.h"
 #include "sim_topology.h"
@@ -50,6 +54,14 @@
 #include "../render/id_pass.h"
 #include <imgui_internal.h>
 #include "firmware/fw_workspace.h"
+#include "engine_backend.h"
+#include "ipc_client.h"
+#ifndef __EMSCRIPTEN__
+#include "account_panel.h"
+#include "security/event_queue.h"
+#include "util/device_identity.h"
+#include "util/secret_store.h"
+#endif
 
 namespace {
 
@@ -154,6 +166,238 @@ struct SceneShotInput {
         return true;
     }
 };
+
+#ifndef __EMSCRIPTEN__
+// CHUDWARE_SHOT=entitlement_delayed uses the ordinary tick-triggered refresh and
+// real HTTP worker against an owned held error response. The opaque bearer and
+// storage sentinels are NOT signed entitlement/policy/enforcement authority.
+struct DelayedAccountShot {
+    bool init = false, want = false, done = false, failed = false;
+    int step = 0;
+    std::chrono::steady_clock::time_point started;
+    std::filesystem::path root, control;
+    nlohmann::json report, signedOutState;
+    using Secret = std::pair<bool, std::vector<unsigned char>>;
+    std::map<std::string, Secret> signedOutSecrets;
+    std::map<std::string, std::string> signedOutFiles;
+} g_delayedAccount;
+
+const char* const kDelayedAccountSecrets[] = {
+    "entitlement", "entitlement-subject-v1", "security-policy-v1",
+    "device-signing-pending-v1", "device-signing-v1", "entitlement-seal-key-v1",
+    "security-state-v1", "security-event-counters-v1",
+};
+
+nlohmann::json delayedAccountState(const AppState& st) {
+    return {{"signed_in", st.entitlementSignedIn}, {"read_only", st.entitlementReadOnly},
+            {"token_empty", st.entitlementToken.empty()}, {"plan", st.entitlementPlan},
+            {"email", st.entitlementEmail}, {"status", st.entitlementStatus},
+            {"mutation_verified", st.entitlementMutationVerified},
+            {"ai_verified", st.entitlementAiVerified},
+            {"banner_height", ui::entitlementBannerHeight(st)}};
+}
+
+DelayedAccountShot::Secret delayedAccountSecret(const char* account) {
+    std::vector<unsigned char> bytes;
+    const bool present = chudware::secret_store::load(
+        "com.chudware.desktop", account, bytes, appdataAppDir());
+    return {present, std::move(bytes)};
+}
+
+std::map<std::string, std::string> delayedAccountFiles() {
+    std::map<std::string, std::string> files;
+    for (const char* relative : {"security/events.v1",
+            "secrets/com_chudware_desktop-device-refresh-sequence-v1.state"}) {
+        std::ifstream in(std::filesystem::path(appdataAppDir()) / relative, std::ios::binary);
+        std::ostringstream out;
+        out << in.rdbuf();
+        files.emplace(relative, out.str());
+    }
+    return files;
+}
+
+bool delayedAccountCheck(const char* name, bool ok, const nlohmann::json& evidence = {}) {
+    auto& P = g_delayedAccount;
+    P.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    std::printf("entitlement_delayed: %s %s\n", ok ? "PASS" : "FAIL", name);
+    std::fflush(stdout);
+    if (!ok) {
+        P.report["failure"] = name;
+        P.failed = P.done = true;
+    }
+    return ok;
+}
+
+nlohmann::json delayedAccountMarker(const char* name) {
+    std::ifstream in(g_delayedAccount.control / name);
+    if (!in) return {};
+    try { return nlohmann::json::parse(in); }
+    catch (...) { return {}; }
+}
+
+void delayedAccountTick(AppState& st) {
+    auto& P = g_delayedAccount;
+    if (!P.init) {
+        P.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        P.want = st.shot && mode && std::strcmp(mode, "entitlement_delayed") == 0;
+        if (!P.want) return;
+        P.started = std::chrono::steady_clock::now();
+        P.report = {{"scenario", "entitlement_delayed"}, {"ok", false},
+                    {"proof", "real held HTTP error; no trusted entitlement fixture"},
+                    {"checks", nlohmann::json::array()}};
+        const char* root = std::getenv("CHUDWARE_ENTITLEMENT_DELAYED_ROOT");
+        P.root = root && *root ? std::filesystem::path(root) : std::filesystem::path();
+        P.control = P.root / "control";
+        auto ownedPath = [&](const char* path) {
+            if (!path || !*path || !P.root.is_absolute()) return false;
+            const auto relative = std::filesystem::path(path).lexically_normal()
+                .lexically_relative(P.root.lexically_normal());
+            return !relative.empty() && !relative.is_absolute() &&
+                *relative.begin() != ".." && relative != ".";
+        };
+        const char* daemon = std::getenv("CHUDWARE_ENGINE_DAEMON");
+        const char* endpoint = std::getenv("CHUDWARE_ENTITLEMENT_REFRESH_URL");
+        const auto fixture = delayedAccountMarker("fixture.json");
+        if (!delayedAccountCheck("owned_isolated_fixture",
+                ownedPath(appdataAppDir().c_str()) && ownedPath(std::getenv("HOME")) &&
+                ownedPath(std::getenv("CHUDWARE_SESSIONS_DIR")) &&
+                daemon && std::strcmp(daemon, "0") == 0 && endpoint && fixture.is_object() &&
+                fixture.value("scenario", "") == "entitlement_delayed" &&
+                fixture.value("loopback_only", false) &&
+                fixture.value("refresh_url", "") == endpoint &&
+                std::string(endpoint).rfind("http://127.0.0.1:", 0) == 0))
+            return;
+    }
+    if (!P.want || P.done) return;
+    if (std::chrono::steady_clock::now() - P.started > std::chrono::seconds(30)) {
+        delayedAccountCheck("completion_timeout", false, {{"step", P.step}});
+        return;
+    }
+    if (st.frame < 3) return;
+    switch (P.step) {
+    case 0: {
+        if (!delayedAccountCheck("initial_workers_idle", ui::desktopAccountRequestsIdle())) return;
+        const std::string dir = appdataAppDir();
+        const auto identity = chudware::device_identity::ensureForAuthorization(dir);
+        const auto candidate = chudware::device_identity::prepareAuthorizationKey(dir);
+        bool seeded = identity.status == chudware::device_identity::KeyStatus::Ready &&
+                      candidate.status == chudware::device_identity::KeyStatus::Ready;
+        const std::vector<unsigned char> sentinel{'o', 'w', 'n', 'e', 'd', '-', 'u', 'n', 's', 'i', 'g', 'n', 'e', 'd'};
+        for (const char* account : {"entitlement", "entitlement-subject-v1",
+                                    "security-policy-v1", "security-state-v1"})
+            seeded = chudware::secret_store::store("com.chudware.desktop", account, sentinel, dir) && seeded;
+        seeded = chudware::secret_store::store("com.chudware.desktop", "entitlement-seal-key-v1",
+                                              std::vector<unsigned char>(32, 0x5a), dir) && seeded;
+        chudware::security::EventQueue queue(dir);
+        std::string error;
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        seeded = queue.append({"heartbeat", now, chudware::security::securityEventScore("heartbeat")},
+                              &error) && seeded;
+        const auto batch = queue.prepareBatch("owned-fixture-subject", "standard",
+                                              "fixture", "linux", now, &error);
+        if (!delayedAccountCheck("real_owned_storage_and_device_key_seeded",
+                seeded && static_cast<bool>(batch) && queue.size() > 0,
+                {{"error", error}, {"pending_sequence", batch.sequence}})) return;
+        // The normal tick below launches startRefresh. No mailbox/result injection
+        // and no local grant of editing authority is involved.
+        st.entitlementSignedIn = true;
+        st.entitlementReadOnly = true;
+        st.entitlementToken = "unsigned-owned-fixture-bearer";
+        st.entitlementStatus = "Owned unsigned request fixture";
+        ++P.step;
+        return;
+    }
+    case 1: {
+        const auto received = delayedAccountMarker("received.json");
+        if (received.is_null()) return;
+        if (!delayedAccountCheck("real_refresh_request_held_before_signout",
+                received.value("request_index", 0) == 1 &&
+                received.value("signature_verified", false) &&
+                !ui::desktopAccountRequestsIdle(), received)) return;
+        std::map<std::string, DelayedAccountShot::Secret> beforeSecrets;
+        for (const char* account : kDelayedAccountSecrets)
+            beforeSecrets[account] = delayedAccountSecret(account);
+        const auto beforeFiles = delayedAccountFiles();
+        ui::signOutDesktopAccount(st);
+        P.signedOutState = delayedAccountState(st);
+        for (const char* account : kDelayedAccountSecrets)
+            P.signedOutSecrets[account] = delayedAccountSecret(account);
+        P.signedOutFiles = delayedAccountFiles();
+        const auto& secrets = P.signedOutSecrets;
+        bool erased = true;
+        for (const char* account : {"entitlement", "entitlement-subject-v1",
+                                    "security-policy-v1", "device-signing-pending-v1"})
+            erased = erased && !secrets.at(account).first;
+        bool retained = true;
+        for (const char* account : {"device-signing-v1", "entitlement-seal-key-v1",
+                                    "security-state-v1", "security-event-counters-v1"})
+            retained = retained && secrets.at(account).first &&
+                       secrets.at(account) == beforeSecrets.at(account);
+        if (!delayedAccountCheck("signout_erases_session_retains_identity_and_security",
+                erased && retained && !st.entitlementSignedIn && st.entitlementReadOnly &&
+                st.entitlementToken.empty() && P.signedOutFiles == beforeFiles &&
+                std::all_of(P.signedOutFiles.begin(), P.signedOutFiles.end(),
+                    [](const auto& entry) { return !entry.second.empty(); }), P.signedOutState)) return;
+        std::ofstream release(P.control / "release", std::ios::trunc);
+        release << "signed out\n";
+        release.close();
+        if (!delayedAccountCheck("held_response_released_after_signout", static_cast<bool>(release))) return;
+        ++P.step;
+        return;
+    }
+    case 2: {
+        const auto sent = delayedAccountMarker("sent.json");
+        if (sent.is_null() || !ui::desktopAccountRequestsIdle()) return;
+        if (!delayedAccountCheck("real_error_sent_and_worker_reaped",
+                sent.value("status", 0) == 503 && sent.value("released", false), sent)) return;
+        ui::tickAccountPanel(st);  // exercise the production UI-owner commit path once more
+        const auto after = delayedAccountState(st);
+        if (!delayedAccountCheck("late_completion_cannot_mutate_account_or_banner",
+                after == P.signedOutState, {{"signed_out", P.signedOutState}, {"after_tick", after}})) return;
+        nlohmann::json storage = nlohmann::json::object();
+        bool unchanged = true;
+        for (const char* account : kDelayedAccountSecrets) {
+            const bool same = delayedAccountSecret(account) == P.signedOutSecrets.at(account);
+            storage[account] = same;
+            unchanged = unchanged && same;
+        }
+        storage["event_queue_and_refresh_sequence_bytes"] = delayedAccountFiles() == P.signedOutFiles;
+        unchanged = unchanged && storage["event_queue_and_refresh_sequence_bytes"].get<bool>();
+        if (!delayedAccountCheck("late_completion_cannot_mutate_credentials_or_security",
+                                 unchanged, storage)) return;
+        P.report["ok"] = true;
+        P.done = true;
+        return;
+    }
+    }
+}
+
+bool delayedAccountEndFrame(AppState& st, int dw, int dh,
+                            const char* screenshotPath, bool& breakLoop) {
+    auto& P = g_delayedAccount;
+    if (!P.want) return false;
+    ++st.frame;
+    breakLoop = false;
+    if (P.done) {
+        writeBackbufferPng(screenshotPath, dw, dh);
+        std::ofstream out(P.root / "report.json", std::ios::trunc);
+        out << P.report.dump(2) << '\n';
+        out.close();
+        std::printf("entitlement_delayed: report -> %s ok=%d\n",
+                    (P.root / "report.json").string().c_str(), !P.failed);
+        std::fflush(stdout);
+        if (P.failed || !out) {
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+        breakLoop = true;
+    }
+    glfwSwapBuffers(st.win);
+    return true;
+}
+#endif
 
 // ---------- piping scenario (CHUDWARE_SHOT=piping) ----------
 // A fresh part with a 200 mm box in the way opens Simulate > Piping; a 2" sch 40 pipe is routed
@@ -2426,6 +2670,1119 @@ bool projectChatEndFrame(AppState& st, int dw, int dh, const char* screenshotPat
     return true;
 }
 
+// CHUDWARE_SHOT=steerstatus: chat-transcript positioning of mid-run user input. Seeds one live
+// turn with a steer in every state, then drives the real event/settle paths: agent.steer
+// delivered moves its bubble, late queued/failed/carried responses never move it back, and
+// the run's end fails what it never confirmed. Resolved asks recover exact text-only replies
+// on a real persistence/reload; ambiguous, unrelated, cross-turn and image replies stay honest.
+// Live and restored pre-marker question cards both draw where the agent asked.
+// Captures + steerstatus_report.json land in
+// scratch/steerstatus_shots; a failure exits non-zero. Run with a private HOME/XDG_DATA_HOME
+// (gate.sh shot_env) — the seeded chat is persisted like any other.
+struct SteerStatusShot {
+    bool init = false, want = false, done = false, failed = false;
+    int step = 0, settle = 0;
+    double started = 0.0;
+    std::string dir, capture, queued;
+    nlohmann::json report;
+};
+SteerStatusShot g_steer;
+
+bool steerCheck(const std::string& name, bool ok, const nlohmann::json& evidence) {
+    auto& P = g_steer;
+    P.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    std::printf("steerstatus: %s %s\n", ok ? "PASS" : "FAIL", name.c_str());
+    std::fflush(stdout);
+    if (!ok) {
+        P.report["failure"] = name;
+        P.failed = P.done = true;
+        P.queued.clear();
+        P.capture = P.dir + "/steerstatus_FAILED.png";
+    }
+    return ok;
+}
+
+int steerStateOf(const AppState& st, const char* id) {
+    for (const auto& m : st.chat)
+        if (m.fromUser && m.steerId == id) return m.steerState;
+    return -1;
+}
+
+void steerStatusTick(AppState& st) {
+    auto& P = g_steer;
+    if (!P.init) {
+        P.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        P.want = st.shot && mode && std::strcmp(mode, "steerstatus") == 0;
+        if (!P.want) return;
+        const char* repo = std::getenv("CHUDWARE_REPO");
+        std::error_code ec;
+        P.dir = std::filesystem::absolute(std::string(repo ? repo : ".") + "/scratch/steerstatus_shots", ec)
+                    .lexically_normal().string();
+        std::filesystem::remove_all(P.dir, ec);
+        std::filesystem::create_directories(P.dir, ec);
+        P.started = pipingNow();
+        P.report = {{"scenario", "steerstatus"}, {"ok", false}, {"checks", nlohmann::json::array()},
+                    {"captures", nlohmann::json::array()}};
+    }
+    if (!P.want || P.done) return;
+    if (pipingNow() - P.started > 120) { steerCheck("timeout", false, {{"step", P.step}}); return; }
+    if (st.frame < 5 || !P.capture.empty()) return;
+    if (P.settle > 0) { --P.settle; return; }
+    if (!P.queued.empty()) { P.capture = P.queued; P.queued.clear(); return; }
+
+    auto user = [&](const char* text, const char* id, int state) {
+        ChatMsg m;
+        m.fromUser = true;
+        m.text = text;
+        m.steerId = id ? id : "";
+        m.steerState = state;
+        st.chat.push_back(std::move(m));
+    };
+    switch (P.step) {
+    case 0: {
+        st.chat.clear();
+        user("Redesign the turret base for one MG996R.", nullptr, STEER_NONE);
+        ChatMsg split;
+        split.text = "Single shoulder servo; checking the carrier with an FEA ladder.";
+        split.steerSplit = true;
+        st.chat.push_back(std::move(split));
+        user("Don't worry about FEA, just eyeball it.", "s-queued", STEER_QUEUED);
+        user("Remove the dead space and add a roof.", "s-sent", STEER_SENDING);
+        user("Make it out of PETG.", "s-carried", STEER_CARRIED);
+        user("Mount the motor above it too.", "s-failed", STEER_FAILED);
+        ChatMsg live;
+        live.running = true;
+        live.liveStatus = "Running write";
+        st.chat.push_back(std::move(live));
+        // The real delivery event, then the control-lane "queued" reply arriving late.
+        const bool handled = ::feedSteerEvent(
+            st.chat, "agent.steer", {{"steer_id", "s-sent"}, {"status", "delivered"}});
+        const bool regressed = ::setSteerState(st.chat, "s-sent", STEER_QUEUED);
+        if (!steerCheck("delivered_event_moves_its_bubble",
+                        handled && !regressed && steerStateOf(st, "s-sent") == STEER_DELIVERED,
+                        {{"state", steerStateOf(st, "s-sent")}, {"regressed", regressed}}))
+            return;
+        const bool lateFailed = ::setSteerState(st.chat, "s-sent", STEER_FAILED);
+        const bool lateCarried = ::setSteerState(st.chat, "s-sent", STEER_CARRIED);
+        if (!steerCheck("delivery_survives_late_failed_and_carried_control",
+                        !lateFailed && !lateCarried &&
+                            steerStateOf(st, "s-sent") == STEER_DELIVERED,
+                        {{"state", steerStateOf(st, "s-sent")}}))
+            return;
+        ::feedSteerEvent(st.chat, "agent.steer",
+                         {{"steer_id", "s-failed"}, {"status", "delivered"}});
+        if (!steerCheck("late_delivery_recovers_previously_failed_bubble",
+                        steerStateOf(st, "s-failed") == STEER_DELIVERED,
+                        {{"state", steerStateOf(st, "s-failed")}}))
+            return;
+        if (!steerCheck("other_kinds_are_not_steer_events",
+                        !::feedSteerEvent(st.chat, "agent.answer", nlohmann::json::object()),
+                        nlohmann::json::object()))
+            return;
+        P.queued = P.dir + "/steerstatus_01_states.png";
+        P.settle = 8;
+        P.step = 1;
+        return;
+    }
+    case 1: {
+        st.chat.back().running = false;
+        const bool changed = ::settleOpenSteers(st.chat);
+        if (!steerCheck("run_end_fails_unconfirmed_steers",
+                        changed && steerStateOf(st, "s-queued") == STEER_FAILED &&
+                            steerStateOf(st, "s-sent") == STEER_DELIVERED &&
+                            steerStateOf(st, "s-carried") == STEER_CARRIED,
+                        {{"queued", steerStateOf(st, "s-queued")},
+                         {"sent", steerStateOf(st, "s-sent")},
+                         {"carried", steerStateOf(st, "s-carried")}}))
+            return;
+        P.queued = P.dir + "/steerstatus_02_settled.png";
+        P.settle = 8;
+        P.step = 2;
+        return;
+    }
+    case 2: {
+        // Question cards sit where the agent asked, not after the rest of the turn.
+        st.chat.clear();
+        auto tool = [](const char* name, const char* target) {
+            ActivityItem a;
+            a.rowKind = 3;
+            a.title = name;
+            a.reason = target;
+            a.status = "done";
+            return a;
+        };
+        auto batch = [](const char* id, const char* status) {
+            return askBatchFromJson({
+                {"batch_id", id}, {"status", status},
+                {"prompt", "Shorten the upper-arm frame and lower the motor onto a new roof?"},
+                {"questions", {{{"id", "layout"}, {"kind", "choice"},
+                                {"prompt", "Shorten the upper-arm frame and lower the motor onto a new roof?"},
+                                {"options", {"Compact the frame", "Keep 80 mm spacing"}}}}},
+                {"answers", {{"layout", "Compact the frame"}}}});
+        };
+        user("Remove the dead space and add a roof.", nullptr, STEER_NONE);
+        // A turn saved before markers existed: anchored on load after its ask_user row.
+        ChatMsg saved;
+        saved.activity = {tool("inspect_assembly", "6-axis"), tool("ask_user", "upper arm"),
+                          tool("add_features", "upper_arm"), tool("add_features", "upper_arm"),
+                          tool("verify_battery", "upper_arm"), tool("save_part", "upper_arm")};
+        saved.asks.push_back(batch("b_saved", "answered"));
+        saved.text = "Compacted the frame and added the roof.";
+        anchorLegacyAsks(saved);
+        const bool savedAnchored = saved.activity.size() == 7 && saved.activity[2].rowKind == 20 &&
+                                   saved.activity[2].stage == ui::askMarkerStage("b_saved");
+        st.chat.push_back(std::move(saved));
+        // A live turn: the question event marks its position; later tool rows follow it.
+        user("Also round the roof edges.", nullptr, STEER_NONE);
+        ChatMsg live;
+        live.running = true;
+        live.activity = {tool("describe_part", "upper_arm")};
+        st.chat.push_back(std::move(live));
+        ChatMsg* active = &st.chat.back();
+        ::feedAskEvent(st.chat, active, "agent.question",
+                       {{"batch_id", "b_live"},
+                        {"questions", {{{"id", "r"}, {"kind", "text"},
+                                        {"prompt", "Fillet radius for the roof edges?"}}}}});
+        active->activity.push_back(tool("add_features", "roof fillets"));
+        const bool liveAnchored = active->activity.size() == 3 && active->activity[1].rowKind == 20 &&
+                                  active->activity[1].stage == ui::askMarkerStage("b_live");
+        if (!steerCheck("question_cards_sit_where_asked", savedAnchored && liveAnchored,
+                        {{"saved", savedAnchored}, {"live", liveAnchored}}))
+            return;
+        P.settle = 8;
+        P.step = 3;
+        return;
+    }
+    case 3:
+        P.queued = P.dir + "/steerstatus_03_questions.png";
+        P.settle = 8;
+        P.step = 4;
+        return;
+    case 4: {
+        ui::ensureConversations(st);
+        st.chat.clear();
+        user("Design the camera mount.", nullptr, STEER_NONE);
+        ChatMsg asked;
+        asked.text = "Checking the mount; this thought must survive recovery.";
+        asked.steerSplit = true;
+        auto resolved = [](const char* id, const char* reply) {
+            return askBatchFromJson({
+                {"batch_id", id}, {"status", "reply"}, {"reply", reply},
+                {"questions", {{{"id", "mount"}, {"kind", "text"},
+                                {"prompt", "How will you mount it?"}}}}});
+        };
+        asked.asks.push_back(resolved("b-recover", "Use command strips outdoors."));
+        asked.asks.push_back(resolved("b-images", "Use the four holes [Image #1]."));
+        asked.asks.push_back(resolved("b-ambiguous", "PETG"));
+        st.chat.push_back(std::move(asked));
+        user("Use command strips outdoors.", "s-resolved", STEER_FAILED);
+        user("Keep it stealthy.", "s-unconfirmed", STEER_QUEUED);
+        user("Use the four holes [Image #1].", "s-image", STEER_FAILED);
+        st.chat.back().imagePaths.push_back(P.dir + "/missing.png");
+        user("PETG", "s-duplicate-a", STEER_FAILED);
+        user("PETG", "s-duplicate-b", STEER_FAILED);
+        user("A different turn.", nullptr, STEER_NONE);
+        user("Use command strips outdoors.", "s-other-turn", STEER_FAILED);
+        const size_t count = st.chat.size();
+        ui::persistChatHistory(st);
+        ui::loadChatHistory(st);
+        if (!steerCheck("resolved_ask_recovers_saved_failed_text_reply",
+                        steerStateOf(st, "s-resolved") == STEER_DELIVERED &&
+                            st.chat.size() == count && st.chat[1].text ==
+                                "Checking the mount; this thought must survive recovery.",
+                        {{"state", steerStateOf(st, "s-resolved")}, {"messages", st.chat.size()}}))
+            return;
+        if (!steerCheck("reload_keeps_unknown_images_ambiguous_and_other_turn_unread",
+                        steerStateOf(st, "s-unconfirmed") == STEER_FAILED &&
+                            steerStateOf(st, "s-image") == STEER_FAILED &&
+                            steerStateOf(st, "s-duplicate-a") == STEER_FAILED &&
+                            steerStateOf(st, "s-duplicate-b") == STEER_FAILED &&
+                            steerStateOf(st, "s-other-turn") == STEER_FAILED,
+                        {{"unknown", steerStateOf(st, "s-unconfirmed")},
+                         {"image", steerStateOf(st, "s-image")},
+                         {"ambiguous_a", steerStateOf(st, "s-duplicate-a")},
+                         {"ambiguous_b", steerStateOf(st, "s-duplicate-b")},
+                         {"other_turn", steerStateOf(st, "s-other-turn")}}))
+            return;
+        // Fold the actual question-answer feed path, then the corresponding mapped
+        // delivery event, with a failed control result arriving on either side.
+        ::setSteerState(st.chat, "s-unconfirmed", STEER_FAILED);
+        ::feedAskEvent(st.chat, &st.chat[1], "agent.question",
+                       {{"batch_id", "b-live-reply"},
+                        {"questions", {{{"id", "finish"}, {"kind", "text"},
+                                        {"prompt", "What finish?"}}}}});
+        ::feedAskEvent(st.chat, nullptr, "agent.answer",
+                       {{"batch_id", "b-live-reply"}, {"source", "reply"},
+                        {"reply", "Keep it stealthy."}});
+        ::feedSteerEvent(st.chat, "agent.steer",
+                         {{"steer_id", "s-unconfirmed"}, {"status", "delivered"}});
+        const bool regressed = ::setSteerState(st.chat, "s-unconfirmed", STEER_FAILED);
+        if (!steerCheck("consumption_evidence_wins_in_both_response_orders",
+                        !regressed && steerStateOf(st, "s-unconfirmed") == STEER_DELIVERED &&
+                            st.chat[1].asks.back().status == AskStatus::Reply,
+                        {{"state", steerStateOf(st, "s-unconfirmed")}}))
+            return;
+        P.settle = 8;
+        P.step = 5;
+        return;
+    }
+    case 5:
+        P.report["ok"] = true;
+        P.done = true;
+        P.capture = P.dir + "/steerstatus_04_recovered.png";
+        return;
+    default:
+        return;
+    }
+}
+
+bool steerStatusEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& breakLoop) {
+    auto& P = g_steer;
+    if (!P.want) return false;
+    ++st.frame;
+    if (!P.capture.empty()) {
+        writeBackbufferPng(P.capture.c_str(), dw, dh, P.done ? screenshotPath : nullptr);
+        std::printf("steerstatus: screenshot -> %s (%dx%d)\n", P.capture.c_str(), dw, dh);
+        std::fflush(stdout);
+        P.report["captures"].push_back(P.capture);
+        P.capture.clear();
+    }
+    glfwSwapBuffers(st.win);
+    breakLoop = false;
+    if (P.done && P.capture.empty()) {
+        const std::string path = P.dir + "/steerstatus_report.json";
+        std::ofstream out(path, std::ios::trunc);
+        out << P.report.dump(2) << '\n';
+        out.close();
+        std::printf("steerstatus: report -> %s ok=%d\n", path.c_str(), (int)P.report.value("ok", false));
+        std::fflush(stdout);
+        if (P.failed || !out) {
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+        breakLoop = true;
+    }
+    return true;
+}
+
+// Real clipboard/keyboard proof, isolated by the caller's HOME/XDG paths.
+struct ChatInlineShot {
+    struct Key { ImGuiKey key; bool ctrl = false, shift = false; };
+    bool want = false, init = false, done = false, failed = false, keyDown = false;
+    int step = 0, settle = 0, keyIndex = 0;
+    double started = 0;
+    std::vector<Key> keys;
+    std::vector<std::string> paths;
+    std::string capture, convId;
+    nlohmann::json report = {{"checks", nlohmann::json::array()}};
+} g_chatInline;
+
+bool chatInlineCheck(const char* name, bool ok, const nlohmann::json& evidence) {
+    auto& P = g_chatInline;
+    P.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    std::printf("chat_inline: %s %s\n", ok ? "PASS" : "FAIL", name);
+    std::fflush(stdout);
+    if (!ok) {
+        P.failed = P.done = true;
+        P.capture = "scratch/chat_inline_shots/FAILED.png";
+    }
+    return ok;
+}
+
+void chatInlineTick(AppState& st) {
+    auto& P = g_chatInline;
+    if (!P.init) {
+        P.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        P.want = st.shot && mode && std::strcmp(mode, "chat_inline") == 0;
+        P.started = pipingNow();
+    }
+    if (!P.want || P.done) return;
+    if (pipingNow() - P.started > 120) {
+        chatInlineCheck("timeout", false, {{"step", P.step}});
+        return;
+    }
+    if (!st.workerStarted || st.frame < 5 || !P.capture.empty()) return;
+    st.activeWorkspace = AppState::Workspace::AI;
+    ui::audit::observedItems();  // enable the real-item hooks before the click proof
+    if (P.settle > 0) { --P.settle; return; }
+    ImGuiIO& io = ImGui::GetIO();
+    if (P.keyIndex < (int)P.keys.size()) {
+        const auto& key = P.keys[P.keyIndex];
+        io.AddKeyEvent(ImGuiMod_Ctrl, !P.keyDown && key.ctrl);
+        io.AddKeyEvent(ImGuiMod_Shift, !P.keyDown && key.shift);
+        io.AddKeyEvent(key.key, !P.keyDown);
+        P.keyDown = !P.keyDown;
+        if (!P.keyDown) ++P.keyIndex;
+        return;
+    }
+    auto keys = [&](std::vector<ChatInlineShot::Key> k) {
+        P.keys = std::move(k); P.keyIndex = 0; P.keyDown = false; P.settle = 2;
+    };
+    auto next = [&](int step, int settle = 6) { P.step = step; P.settle = settle; };
+    auto restoreImages = [&](const std::string& text) {
+        st.pendingInlineImagePaths = P.paths;
+        st.pendingAttachments.clear();
+        ui::composerSetText(st, text);
+    };
+    switch (P.step) {
+    case 0: {
+        std::filesystem::create_directories("scratch/chat_inline_shots");
+        glfwSetWindowSize(st.win, 1340, 1400);
+        st.chat.clear();
+        st.designStarted = true;
+        ui::composerSetText(st, "Before SELECT After");
+        if (!chatInlineCheck("clipboard_portrait_ready",
+                std::system("xclip -selection clipboard -t image/png -i scratch/chat_inline_shots/portrait.png") == 0,
+                nlohmann::json::object())) return;
+        next(1);
+        break;
+    }
+    case 1: {
+        std::vector<ChatInlineShot::Key> k = {{ImGuiKey_Home, true}};
+        for (int i = 0; i < 7; ++i) k.push_back({ImGuiKey_RightArrow});
+        for (int i = 0; i < 6; ++i) k.push_back({ImGuiKey_RightArrow, false, true});
+        k.push_back({ImGuiKey_V, true});
+        keys(std::move(k)); next(2, 0);
+        break;
+    }
+    case 2: {
+        const auto text = ui::composerText(st);
+        if (!chatInlineCheck("paste_replaces_mid_text_selection",
+                             text == "Before [Image #1] After",
+                             {{"text", text}})) return;
+        io.AddInputCharactersUTF8("TAIL");
+        next(3);
+        break;
+    }
+    case 3: {
+        const auto text = ui::composerText(st);
+        if (!chatInlineCheck("caret_follows_pasted_reference",
+                             text == "Before [Image #1]TAIL After", {{"text", text}})) return;
+        if (!chatInlineCheck("clipboard_landscape_ready",
+                std::system("xclip -selection clipboard -t image/png -i scratch/chat_inline_shots/landscape.png") == 0,
+                nlohmann::json::object())) return;
+        keys({{ImGuiKey_End, true}, {ImGuiKey_V, true}});
+        next(4, 0);
+        break;
+    }
+    case 4: {
+        io.AddInputCharactersUTF8(" End");
+        next(5);
+        break;
+    }
+    case 5: {
+        const auto text = ui::composerText(st);
+        if (!chatInlineCheck("two_references_stay_at_paste_positions",
+                    text == "Before [Image #1]TAIL After[Image #2] End", {{"text", text}})) return;
+        P.paths = st.pendingInlineImagePaths;
+        P.capture = "scratch/chat_inline_shots/composer.png";
+        P.convId = st.activeConvId();
+        ui::savePromptDraft(st, true);
+        ChatMsg m; m.fromUser = true; m.text = text; m.imagePaths = P.paths;
+        st.chat.push_back(std::move(m));
+        ui::persistChatHistory(st);
+        next(50);
+        break;
+    }
+    case 50: {
+        ui::newConversation(st);
+        next(6);
+        break;
+    }
+    case 6: {
+        int index = -1;
+        for (int i = 0; i < (int)st.conversations.size(); ++i)
+            if (st.conversations[i].id == P.convId) index = i;
+        if (!chatInlineCheck("original_conversation_exists", index >= 0,
+                             {{"id", P.convId}})) return;
+        ui::switchConversation(st, index);
+        next(7);
+        break;
+    }
+    case 7: {
+        if (!chatInlineCheck("draft_restores_exact_image_roster",
+                st.pendingInlineImagePaths == P.paths &&
+                ui::composerText(st) == "Before [Image #1]TAIL After[Image #2] End",
+                {{"text", ui::composerText(st)}, {"paths", st.pendingInlineImagePaths}})) return;
+        std::string request = ui::composerText(st), bubble;
+        const auto attachments = ui::consumeComposerAttachments(st, request, &bubble);
+        if (!chatInlineCheck("send_preserves_order_without_duplicate_listing",
+                attachments.size() == 2 && attachments[0].value("path", "") == P.paths[0] &&
+                attachments[1].value("path", "") == P.paths[1] &&
+                request == bubble && bubble == "Before [Image #1]TAIL After[Image #2] End",
+                {{"request", request}, {"attachments", attachments}})) return;
+        restoreImages("[Image #2]");
+        next(8);
+        break;
+    }
+    case 8: {
+        std::string request = ui::composerText(st), bubble;
+        const auto attachments = ui::consumeComposerAttachments(st, request, &bubble);
+        if (!chatInlineCheck("deleted_reference_omitted_image_only_send_compacts_number",
+                attachments.size() == 1 && attachments[0].value("path", "") == P.paths[1] &&
+                request == "[Image #1]" && bubble == request,
+                {{"request", request}, {"attachments", attachments}})) return;
+        restoreImages("No images");
+        next(9);
+        break;
+    }
+    case 9: {
+        std::string request = ui::composerText(st);
+        const auto attachments = ui::consumeComposerAttachments(st, request);
+        if (!chatInlineCheck("deleting_all_references_sends_no_images", attachments.empty(),
+                             {{"attachments", attachments}})) return;
+        restoreImages("[Image #2] then [Image #1]");
+        next(10);
+        break;
+    }
+    case 10: {
+        std::string request = ui::composerText(st);
+        const auto attachments = ui::consumeComposerAttachments(st, request);
+        if (!chatInlineCheck("reordered_references_reorder_model_images",
+                attachments.size() == 2 && attachments[0].value("path", "") == P.paths[1] &&
+                attachments[1].value("path", "") == P.paths[0] &&
+                request == "[Image #1] then [Image #2]",
+                {{"request", request}, {"attachments", attachments}})) return;
+        ui::composerSetText(st, "Unsent draft");
+        ui::beginEditStage(st, 0);
+        next(11);
+        break;
+    }
+    case 11: {
+        if (!chatInlineCheck("edit_restores_sent_references_and_exact_images",
+                st.pendingInlineImagePaths == P.paths &&
+                ui::composerText(st) == st.chat[0].text,
+                {{"text", ui::composerText(st)}, {"paths", st.pendingInlineImagePaths}})) return;
+        if (!chatInlineCheck("edit_cancel_restores_previous_draft",
+                ui::cancelEditStage(st) && ui::composerText(st) == "Unsent draft" &&
+                st.pendingInlineImagePaths.empty(),
+                {{"text", ui::composerText(st)}})) return;
+        ui::composerSetText(st, "");
+        ui::persistChatHistory(st);
+        ui::loadChatHistory(st);
+        next(12);
+        break;
+    }
+    case 12: {
+        if (!chatInlineCheck("history_reopen_restores_inline_message",
+                !st.chat.empty() && st.chat[0].imagePaths == P.paths &&
+                st.chat[0].text == "Before [Image #1]TAIL After[Image #2] End",
+                {{"messages", st.chat.size()}})) return;
+        P.capture = "scratch/chat_inline_shots/transcript.png";
+        next(13);
+        break;
+    }
+    case 13: {
+        const auto& items = ui::audit::observedItems();
+        const auto item = std::find_if(items.begin(), items.end(), [](const auto& i) {
+            return i.value("label", "") == "##attach_thumb" && i.value("visible", false) &&
+                   i.value("window", "").find("##umsg") != std::string::npos;
+        });
+        if (item == items.end()) return;
+        const auto& rect = (*item)["rect"];
+        io.AddMousePosEvent((rect[0].template get<float>() + rect[2].template get<float>()) * 0.5f,
+                            (rect[1].template get<float>() + rect[3].template get<float>()) * 0.5f);
+        io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+        next(14, 0);
+        break;
+    }
+    case 14:
+        io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+        next(15);
+        break;
+    case 15: {
+        const auto* viewer = ImGui::FindWindowByName("##copilot_image_lightbox");
+        if (!chatInlineCheck("inline_image_click_opens_full_size_viewer",
+                             viewer && viewer->WasActive, nlohmann::json::object())) return;
+        P.capture = "scratch/chat_inline_shots/viewer.png";
+        next(16, 0);
+        break;
+    }
+    case 16:
+        io.AddKeyEvent(ImGuiKey_Escape, true);
+        next(160, 0);
+        break;
+    case 160:
+        io.AddKeyEvent(ImGuiKey_Escape, false);
+        next(17);
+        break;
+    case 17: {
+        st.chat.clear();
+        ChatMsg m;
+        m.fromUser = true;
+        m.text = "Legacy before\n[attached image: portrait.png]\nLegacy between\n"
+                 "[attached image: landscape.png]\nLegacy after";
+        m.imagePaths = P.paths;
+        st.chat.push_back(std::move(m));
+        next(18);
+        break;
+    }
+    case 18:
+        P.report["ok"] = true;
+        P.capture = "scratch/chat_inline_shots/legacy.png";
+        P.done = true;
+        break;
+    }
+}
+
+bool chatInlineEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& breakLoop) {
+    auto& P = g_chatInline;
+    if (!P.want) return false;
+    ++st.frame;
+    if (!P.capture.empty()) {
+        writeBackbufferPng(P.capture.c_str(), dw, dh, P.done ? screenshotPath : nullptr);
+        P.report["captures"].push_back(P.capture);
+        P.capture.clear();
+    }
+    glfwSwapBuffers(st.win);
+    breakLoop = P.done;
+    if (P.done) {
+        std::ofstream("scratch/chat_inline_shots/report.json") << P.report.dump(2) << '\n';
+        if (P.failed) { std::fflush(nullptr); std::_Exit(EXIT_FAILURE); }
+    }
+    return true;
+}
+
+// CHUDWARE_SHOT=agentlock: a real foreign write lands during an open human sketch.
+// The post-checkpoint human feature and foreign feature must both survive the keep-exit.
+struct AgentLockShot {
+    bool init = false, want = false, done = false, failed = false, realForeign = false;
+    int step = 0, settle = 0;
+    double started = 0.0;
+    std::string dir, capture, queued, doc, sketch, conv, viewed;
+    nlohmann::json report;
+};
+AgentLockShot g_agentLock;
+
+bool agentLockCheck(const char* name, bool ok, const nlohmann::json& evidence) {
+    auto& P = g_agentLock;
+    P.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    std::printf("[agentlock-shot] %s %s %s\n", ok ? "PASS" : "FAIL", name, evidence.dump().c_str());
+    std::fflush(stdout);
+    if (!ok) {
+        P.failed = P.done = true;
+        P.report["failure"] = name;
+        P.queued.clear();
+        P.capture = P.dir + "/agentlock_FAILED.png";
+    }
+    return ok;
+}
+
+nlohmann::json agentLockSketchOp(const char* name) {
+    return {{"op", "add_feature"}, {"feature", {
+        {"type", "sketch"}, {"name", name}, {"refs", {{"plane", "plane.top"}}},
+        {"params", {{"entities", nlohmann::json::array({
+            {{"id", "circle1"}, {"type", "circle"}, {"center", {0.0, 0.0}}, {"radius", 4.0}}
+        })}, {"constraints", nlohmann::json::array()}}}}}};
+}
+
+void agentLockTick(AppState& st) {
+    auto& P = g_agentLock;
+    if (!P.init) {
+        P.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        P.want = st.shot && mode && std::strcmp(mode, "agentlock") == 0;
+        if (!P.want) return;
+        const char* repo = std::getenv("CHUDWARE_REPO");
+        P.dir = std::string(repo ? repo : ".") + "/scratch/agentlock_shots";
+        std::error_code ec;
+        std::filesystem::create_directories(P.dir, ec);
+        P.started = pipingNow();
+        P.report = {{"scenario", "agentlock"}, {"ok", false},
+                    {"checks", nlohmann::json::array()}, {"captures", nlohmann::json::array()}};
+    }
+    if (!P.want || P.done) return;
+    if (pipingNow() - P.started > 120.0) {
+        agentLockCheck("timeout", false, {{"step", P.step}}); return;
+    }
+    if (!st.workerStarted || st.frame < 5 || !P.capture.empty() || st.rpc.busy()) return;
+    if (P.settle > 0) { --P.settle; return; }
+    if (!P.queued.empty()) { P.capture = std::move(P.queued); P.queued.clear(); return; }
+    auto shoot = [&](const char* name) {
+        P.queued = P.dir + "/agentlock_" + name + ".png";
+        P.settle = 4;
+        ++P.step;
+    };
+    auto featureNamed = [&](const char* name) {
+        const auto& tree = st.docMirror.tree();
+        if (!tree.contains("features") || !tree["features"].is_array()) return false;
+        for (const auto& feature : tree["features"])
+            if (feature.value("name", std::string()) == name) return true;
+        return false;
+    };
+    std::string err;
+    switch (P.step) {
+    case 0: {
+        st.showRibbon = true;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.entitlementReadOnly = false;
+        if (!agentLockCheck("new_part", st.docMirror.newPart(st.worker, err), {{"error", err}})) return;
+        st.addDocTab(false);
+        P.doc = st.docMirror.docId();
+        const auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {
+                {"type", "box"}, {"name", "Lock test block"},
+                {"params", {{"length", {{"value", 30.0}, {"expr", nullptr}}},
+                            {"width", {{"value", 20.0}, {"expr", nullptr}}},
+                            {"height", {{"value", 8.0}, {"expr", nullptr}}},
+                            {"centered", true}}}}}},
+            agentLockSketchOp("Human sketch")
+        }));
+        if (!agentLockCheck("build_part", r.ok, {{"error", r.error_message}})) return;
+        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        P.sketch = r.id_map.value("$1", std::string());
+        if (!agentLockCheck("open_human_sketch",
+                            !P.sketch.empty() && st.sketchMode->enterForFeature(st, P.sketch),
+                            {{"sketch", P.sketch}})) return;
+        // This feature is younger than the sketch's cancel checkpoint: a revert loses it.
+        const auto human = st.docMirror.applyOps(st.worker,
+            nlohmann::json::array({agentLockSketchOp("Human work after checkpoint")}));
+        if (!agentLockCheck("human_work_after_checkpoint", human.ok,
+                            {{"revision", human.revision}, {"error", human.error_message}})) return;
+        ++P.step;
+        P.settle = 4;
+        return;
+    }
+    case 1: {
+        const auto ops = nlohmann::json::array({agentLockSketchOp("Foreign agent feature")});
+#ifndef __EMSCRIPTEN__
+        if (engine::daemonMode()) {
+            chudware_ipc::EngineClient foreign;
+            chudware_ipc::EngineClient::Options options;
+            options.clientKind = "mcp";
+            options.allowSpawn = false;
+            nlohmann::json result;
+            bool ok = foreign.connectOrSpawn(options, err) &&
+                foreign.call("attach_doc", {{"doc_id", P.doc}, {"mode", "rw"}}, result, err, 15000) &&
+                foreign.call("doc_apply_ops",
+                    {{"doc_id", P.doc}, {"base_revision", st.docMirror.revision()}, {"ops", ops}},
+                    result, err, 15000);
+            ok = ok && !result.contains("code") && result.contains("revision");
+            if (!agentLockCheck("real_foreign_write", ok, {{"error", err}, {"result", result}})) return;
+            P.realForeign = true;
+        } else
+#endif
+        {
+            const auto r = st.docMirror.applyOps(st.worker, ops);
+            if (!agentLockCheck("foreign_write_without_daemon", r.ok,
+                                {{"error", r.error_message}})) return;
+            st.docTabs[st.activeTab].lastForeignWriteAt = std::chrono::steady_clock::now();
+            P.report["foreign_event_skipped"] = "This runtime has no second native daemon connection";
+        }
+        ++P.step;
+        P.settle = 4;
+        return;
+    }
+    case 2: {
+        if (!agentLockCheck("foreign_event_stamps_lock",
+                            st.activeDocLockedByAgent() &&
+                                st.docTabs[st.activeTab].lastForeignWriteAt !=
+                                    std::chrono::steady_clock::time_point{},
+                            {{"real_foreign_write", P.realForeign},
+                             {"reason", st.agentLockReason(P.doc)}})) return;
+        if (!agentLockCheck("session_closed_without_revert", !st.sketchMode->active() &&
+                            st.docMirror.resync(st.worker) && featureNamed("Human sketch") &&
+                            featureNamed("Human work after checkpoint") &&
+                            featureNamed("Foreign agent feature"),
+                            {{"sketch_active", st.sketchMode->active()},
+                             {"tree", st.docMirror.tree()}})) return;
+        shoot("01_external_locked");
+        return;
+    }
+    case 3: {
+        ImGuiWindow* banner = ImGui::FindWindowByName("##agent_lock_strip");
+        if (!agentLockCheck("external_banner_reserved_chrome",
+                            banner && banner->WasActive && ui::overlayBand().minY >=
+                                banner->Pos.y + banner->Size.y,
+                            {{"banner_visible", banner && banner->WasActive}})) return;
+        ui::ensureConversations(st);
+        P.viewed = st.activeConvId();
+        P.conv = "agentlock-background";
+        Conversation conv;
+        conv.id = P.conv;
+        conv.title = "Document editing agent";
+        conv.projectDir = st.workspaceDir;
+        ChatMsg live;
+        live.running = true;
+        live.text = "Editing this part";
+        conv.msgs.push_back(std::move(live));
+        st.conversations.push_back(std::move(conv));
+        st.runFor(P.conv)->running.store(true);
+        st.docTabs[st.activeTab].lastForeignWriteAt = std::chrono::steady_clock::now();
+        shoot("02_in_app_locked");
+        return;
+    }
+    case 4: {
+        if (st.ribbonDispatch) st.ribbonDispatch("extrude_boss");
+        if (!agentLockCheck("ribbon_mutation_refused", st.propertyManager &&
+                            !st.propertyManager->active(), nlohmann::json::object())) return;
+        const int revision = st.docMirror.revision();
+        const auto undo = st.docUndo();
+        if (!agentLockCheck("undo_refused", !undo.ok && undo.error_code == "agent_edit_locked" &&
+                            st.docMirror.revision() == revision,
+                            {{"error_code", undo.error_code}, {"revision", revision}})) return;
+        // The synthetic run has no provider to cancel. Exercise the real named-stop UI path
+        // without sending an empty run_id cancel to any actual worker.
+        const bool workerStarted = st.workerStarted;
+        st.workerStarted = false;
+        ui::requestStopRunFor(st, P.conv);
+        st.workerStarted = workerStarted;
+        const auto* run = st.runIfExists(P.conv);
+        const auto* msgs = conversationMsgs(st, P.conv);
+        if (!agentLockCheck("stop_targets_background_conversation",
+                            run && run->running.load() && run->stopRequested.load() &&
+                                st.activeConvId() == P.viewed && msgs && !msgs->back().running &&
+                                st.activeDocLockedByAgent(),
+                            {{"viewed_conversation", st.activeConvId()},
+                             {"stopped_conversation", P.conv}})) return;
+        shoot("03_stopping");
+        return;
+    }
+    case 5: {
+        ImGuiWindow* banner = ImGui::FindWindowByName("##agent_lock_strip");
+        if (!agentLockCheck("stopping_retains_banner_and_lock",
+                            banner && banner->WasActive && st.activeDocLockedByAgent(),
+                            nlohmann::json::object())) return;
+        st.runFor(P.conv)->running.store(false);
+        st.agentV2Running = st.anyRunActive();
+        st.docTabs[st.activeTab].lastForeignWriteAt =
+            std::chrono::steady_clock::now() - std::chrono::seconds(10);
+        ++P.step;
+        P.settle = 4;
+        return;
+    }
+    case 6: {
+        if (!agentLockCheck("controls_unlock_after_grace",
+                            !st.activeDocLockedByAgent() && st.agentLockReason(P.doc).empty(),
+                            {{"grace_s", AppState::kAgentLockGraceS}})) return;
+        if (!agentLockCheck("human_can_edit_again", st.sketchMode->enterForFeature(st, P.sketch),
+                            {{"sketch", P.sketch}})) return;
+        st.sketchMode->exitSketch(st, true);
+        const auto undo = st.docUndo();
+        if (!agentLockCheck("undo_available_after_unlock", undo.ok,
+                            {{"error", undo.error_message}})) return;
+        const auto redo = st.docRedo();
+        if (!agentLockCheck("redo_restores_agent_work", redo.ok &&
+                            featureNamed("Foreign agent feature"),
+                            {{"error", redo.error_message}})) return;
+        shoot("04_unlocked");
+        return;
+    }
+    default:
+        P.report["ok"] = true;
+        P.done = true;
+        P.capture = P.dir + "/agentlock_final.png";
+        return;
+    }
+}
+
+bool agentLockEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& breakLoop) {
+    auto& P = g_agentLock;
+    if (!P.want) return false;
+    ++st.frame;
+    if (!P.capture.empty()) {
+        writeBackbufferPng(P.capture.c_str(), dw, dh, P.done ? screenshotPath : nullptr);
+        P.report["captures"].push_back(P.capture);
+        P.capture.clear();
+    }
+    glfwSwapBuffers(st.win);
+    breakLoop = false;
+    if (P.done) {
+        const std::string path = P.dir + "/agentlock_report.json";
+        std::ofstream out(path, std::ios::trunc);
+        out << P.report.dump(2) << '\n';
+        out.close();
+        std::printf("[agentlock-shot] report %s %s\n", path.c_str(), P.report.dump().c_str());
+        std::fflush(stdout);
+        if (P.failed || !out) { std::fflush(nullptr); std::_Exit(EXIT_FAILURE); }
+        breakLoop = true;
+    }
+    return true;
+}
+
+// CHUDWARE_SHOT=featurestate: native document authority through the actual PM and tab listener.
+struct FeatureStateShot {
+    bool init = false, want = false, done = false, failed = false, dragApplied = false;
+    int step = 0, settle = 0, refreshRevision = -1;
+    double started = 0.0;
+    SceneShotInput input;
+    std::string dir, path, feature, capture, queued;
+    nlohmann::json report;
+};
+FeatureStateShot g_featureState;
+
+bool featureStateCheck(const char* name, bool ok, const nlohmann::json& evidence) {
+    auto& P = g_featureState;
+    P.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    std::printf("[featurestate-shot] %s %s %s\n", ok ? "PASS" : "FAIL", name,
+                evidence.dump().c_str());
+    std::fflush(stdout);
+    if (!ok) {
+        P.failed = P.done = true;
+        P.report["failure"] = name;
+        P.queued.clear();
+        P.capture = P.dir + "/FAILED.png";
+    }
+    return ok;
+}
+
+void featureStateTick(AppState& st) {
+    auto& P = g_featureState;
+    if (!P.init) {
+        P.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        P.want = st.shot && mode && std::strcmp(mode, "featurestate") == 0;
+        if (!P.want) return;
+        const char* out = std::getenv("CHUDWARE_FEATURESTATE_OUT");
+        P.dir = out ? out : "scratch/featurestate_shots";
+        std::error_code ec;
+        std::filesystem::create_directories(P.dir, ec);
+        P.path = (std::filesystem::absolute(P.dir) / "qualification.step+").string();
+        P.started = pipingNow();
+        P.report = {{"scenario", "featurestate"}, {"ok", false},
+                    {"checks", nlohmann::json::array()}, {"captures", nlohmann::json::array()}};
+    }
+    if (!P.want || P.done) return;
+    if (pipingNow() - P.started > 120.0) {
+        featureStateCheck("timeout", false, {{"step", P.step}}); return;
+    }
+    if (!st.workerStarted || st.frame < 5 || st.rpc.busy() || !P.capture.empty()) return;
+    if (P.settle > 0) { --P.settle; return; }
+    if (!P.queued.empty()) { P.capture = std::move(P.queued); P.queued.clear(); return; }
+
+    auto shoot = [&](const char* name) {
+        P.queued = P.dir + "/" + name + ".png";
+        P.settle = 4;
+        ++P.step;
+    };
+    auto nativeState = [&]() {
+        std::string error;
+        const auto docs = st.docMirror.list(st.worker, error);
+        for (const auto& doc : docs)
+            if (doc.value("doc_id", std::string()) == st.docMirror.docId()) return doc;
+        return nlohmann::json{{"error", error}};
+    };
+    auto stateMatches = [&](bool dirty) {
+        const auto native = nativeState();
+        return featureStateCheck(dirty ? "native_and_tab_dirty" : "native_and_tab_clean",
+            native.contains("dirty") && native["dirty"] == dirty &&
+            native.value("revision", -1) == st.docMirror.revision() &&
+            st.docTabs[st.activeTab].dirty == dirty,
+            {{"native", native}, {"tab_dirty", st.docTabs[st.activeTab].dirty},
+             {"mirror_revision", st.docMirror.revision()}});
+    };
+    auto formValues = [&]() {
+        nlohmann::json values = nlohmann::json::object();
+        for (const auto& item : st.propertyManager->calloutItems(st)) values[item.label] = item.value;
+        return values;
+    };
+    auto dimensions = [&]() {
+        nlohmann::json values = nlohmann::json::object();
+        for (const auto& feature : st.docMirror.tree()["features"]) {
+            if (feature.value("id", std::string()) != P.feature) continue;
+            for (const char* key : {"length", "width", "height"}) {
+                const auto& value = feature["params"][key];
+                values[key] = value.is_object() ? value["value"] : value;
+            }
+        }
+        return values;
+    };
+    auto save = [&]() {
+        st.docTabs[st.activeTab].path = P.path;
+        const auto result = ui::saveDocTab(st, st.activeTab, false);
+        return featureStateCheck("ordinary_tab_save", result == ui::TabSaveResult::Saved,
+                                 {{"path", P.path}, {"result", (int)result}}) && stateMatches(false);
+    };
+    auto reopen = [&]() {
+        std::string error;
+        const bool opened = st.docMirror.open(st.worker, P.path, error);
+        if (!featureStateCheck("saved_cache_reopen", opened &&
+                st.docMirror.lastOpenedCacheHit() && st.docMirror.lastOpenedWarm(),
+                {{"error", error}, {"cache_hit", st.docMirror.lastOpenedCacheHit()},
+                 {"warm", st.docMirror.lastOpenedWarm()}})) return false;
+        st.addDocTab(false);
+        st.docTabs[st.activeTab].path = P.path;
+        if (!st.docMirror.lastOpenedAicm().empty()) {
+            const bool loaded = st.loadDocMesh(st.docMirror.lastOpenedAicm(), error);
+            if (!featureStateCheck("cached_mesh_load", loaded, {{"error", error}})) return false;
+        }
+        return stateMatches(false);
+    };
+    std::string err;
+    switch (P.step) {
+    case 0: {
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.settings.units = Units::MMGS;
+        st.entitlementReadOnly = false;
+        st.workspaceDir = std::filesystem::absolute(P.dir).string();
+        const bool created = st.docMirror.newPart(st.worker, err);
+        if (!featureStateCheck("new_part", created, {{"error", err}})) return;
+        st.addDocTab(false);
+        const auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Qualification box"},
+                {"params", {{"length", 40}, {"width", 30.0}, {"height", 20}}},
+                {"refs", nlohmann::json::object()}}}}}));
+        P.feature = r.id_map.value("$0", std::string());
+        if (!featureStateCheck("canonical_numeric_box", r.ok && !P.feature.empty(),
+                               {{"response_tree", r.tree}, {"error", r.error_message}})) return;
+        if (!stateMatches(true) || !save() || !reopen()) return;
+        P.refreshRevision = st.docMirror.revision();
+        if (!featureStateCheck("opened_revision_zero", P.refreshRevision == 0,
+                               {{"revision", P.refreshRevision}})) return;
+        shoot("01_open_clean");
+        return;
+    }
+    case 1: {
+        if (!featureStateCheck("open_actual_property_manager",
+                st.propertyManager->openForEdit(st, P.feature), {{"feature", P.feature}})) return;
+        const auto values = formValues();
+        if (!featureStateCheck("canonical_dimensions_and_labels",
+                values.size() == 3 && values.value("Length", "") == "40 mm" &&
+                values.value("Width", "") == "30 mm" && values.value("Height", "") == "20 mm",
+                {{"displayed", values}, {"canonical", dimensions()}})) return;
+        const bool resynced = st.docMirror.resync(st.worker);
+        if (!featureStateCheck("unchanged_tree_resync", resynced,
+                               {{"revision", st.docMirror.revision()}}) || !stateMatches(false)) return;
+        const auto snapshot = st.docMirror.snapshot();
+        if (!featureStateCheck("unchanged_snapshot_restore", st.docMirror.restoreSnapshot(snapshot),
+                               {{"revision", snapshot.revision}}) || !stateMatches(false)) return;
+        std::string aicm;
+        const bool activated = st.docMirror.activate(st.worker, snapshot.docId, aicm, err);
+        if (!featureStateCheck("unchanged_activation",
+                activated && st.docMirror.revision() == P.refreshRevision, {{"error", err}}) ||
+            !stateMatches(false)) return;
+        shoot("02_edit_40_30_20_clean");
+        return;
+    }
+    case 2: {
+        st.propertyManager->closeIfActive();
+        st.settings.units = Units::IPS;
+        if (!featureStateCheck("ips_edit_open", st.propertyManager->openForEdit(st, P.feature),
+                               {{"feature", P.feature}})) return;
+        const auto values = formValues();
+        bool correct = values.size() == 3;
+        for (const auto& item : {std::pair<const char*, double>{"Length", 40.0},
+                                {"Width", 30.0}, {"Height", 20.0}}) {
+            const auto value = values.value(item.first, std::string());
+            correct = correct && value.find("in") != std::string::npos &&
+                std::abs(std::strtod(value.c_str(), nullptr) - item.second / 25.4) < 0.001;
+        }
+        if (!featureStateCheck("canonical_mm_displayed_in_inches", correct, {{"displayed", values}}) ||
+            !stateMatches(false)) return;
+        st.propertyManager->closeIfActive();
+        st.settings.units = Units::MMGS;
+        if (!featureStateCheck("drag_form_open", st.propertyManager->openForEdit(st, P.feature),
+                               {{"feature", P.feature}})) return;
+        ++P.step;
+        P.settle = 4;
+        return;
+    }
+    case 3: {
+        if (!P.dragApplied) {
+            ImVec2 lo, hi;
+            if (!ui::viewportClearRect(lo, hi)) {
+                featureStateCheck("drag_viewport_available", false, {{"feature", P.feature}});
+                return;
+            }
+            // A real viewport click releases the auto-focused dimension text editor
+            // before its drag consumer runs; mutating the field under active text input
+            // races ImGui's retained edit buffer rather than exercising a human gesture.
+            if (!P.input.click(ImVec2(lo.x + (hi.x - lo.x) * 0.02f,
+                                      lo.y + (hi.y - lo.y) * 0.12f))) return;
+            if (!featureStateCheck("dimension_drag_consumer",
+                    st.propertyManager->dragSetDim("length", 42.0), {{"feature", P.feature}})) return;
+            P.dragApplied = true;
+            P.settle = 4;
+            return;
+        }
+        const auto dims = dimensions();
+        if (!featureStateCheck("actual_pm_preview_keeps_other_dimensions",
+                dims == nlohmann::json{{"length", 42.0}, {"width", 30.0}, {"height", 20.0}},
+                {{"canonical", dims}, {"displayed", formValues()}}) || !stateMatches(true)) return;
+        st.propertyManager->closeIfActive();
+        if (!save()) return;
+        // The engine commits outside this mirror, just as another human/agent writer does.
+        nlohmann::json response;
+        const bool edited = st.worker.call("doc_apply_ops", {{"doc_id", st.docMirror.docId()},
+            {"base_revision", -1}, {"ops", nlohmann::json::array({
+                {{"op", "edit_feature"}, {"id", P.feature}, {"params", {{"height", 25.0}}}}
+            })}}, response, err);
+        if (!featureStateCheck("out_of_band_native_edit",
+                edited && !response.contains("code"), {{"error", err}})) return;
+        core::DocMirror pushed;
+        std::string aicm;
+        const bool adopted = pushed.adoptActivateResponse(st.docMirror.docId(), response, aicm, err) &&
+                             st.docMirror.restoreSnapshot(pushed.snapshot());
+        if (!featureStateCheck("adopt_real_published_snapshot", adopted,
+                {{"revision", response.value("revision", -1)}, {"error", err}}) ||
+            !stateMatches(true)) return;
+        if (!aicm.empty()) st.loadDocMesh(aicm, err);
+        const auto human = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "edit_feature"}, {"id", P.feature}, {"params", {{"width", 35.0}}}}
+        }));
+        if (!featureStateCheck("arrival_order_keeps_both_edits", human.ok &&
+                dimensions() == nlohmann::json{{"length", 42.0}, {"width", 35.0}, {"height", 25.0}},
+                {{"canonical", dimensions()}, {"error", human.error_message}})) return;
+        const auto undo = st.docMirror.undo(st.worker);
+        if (!featureStateCheck("undo_keeps_foreign_edit", undo.ok &&
+                dimensions() == nlohmann::json{{"length", 42.0}, {"width", 30.0}, {"height", 25.0}},
+                {{"canonical", dimensions()}, {"error", undo.error_message}}) || !stateMatches(true)) return;
+        const auto redo = st.docMirror.redo(st.worker);
+        if (!featureStateCheck("redo_keeps_foreign_edit", redo.ok &&
+                dimensions() == nlohmann::json{{"length", 42.0}, {"width", 35.0}, {"height", 25.0}},
+                {{"canonical", dimensions()}, {"error", redo.error_message}}) || !stateMatches(true)) return;
+        if (!save() || !reopen()) return;
+        const bool opened = st.propertyManager->openForEdit(st, P.feature);
+        const auto displayed = formValues();
+        if (!featureStateCheck("wrapped_dimensions_reopen", opened &&
+                displayed == nlohmann::json{{"Length", "42 mm"}, {"Width", "35 mm"}, {"Height", "25 mm"}},
+                {{"displayed", displayed}, {"canonical", dimensions()}})) return;
+        shoot("03_shared_edits_saved_clean");
+        return;
+    }
+    case 4: {
+        st.propertyManager->closeIfActive();
+        const auto edit = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "edit_feature"}, {"id", P.feature},
+             {"params", {{"length", {{"value", 46.0}, {"expr", "46"}}},
+                         {"height", {{"value", 26.0}, {"expr", nullptr}}}}}}
+        }));
+        const bool opened = edit.ok && st.propertyManager->openForEdit(st, P.feature);
+        const auto displayed = formValues();
+        if (!featureStateCheck("expression_and_wrapped_dimensions_preserved", opened &&
+                displayed == nlohmann::json{{"Length", "=46"}, {"Width", "35 mm"}, {"Height", "26 mm"}},
+                {{"displayed", displayed}, {"canonical", dimensions()}, {"error", edit.error_message}}) ||
+            !stateMatches(true)) return;
+        P.report["ok"] = true;
+        P.done = true;
+        P.capture = P.dir + "/04_expression_preserved.png";
+        return;
+    }
+    }
+}
+
+bool featureStateEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& done) {
+    auto& P = g_featureState;
+    if (!P.want) return false;
+    ++st.frame;
+    if (!P.capture.empty()) {
+        writeBackbufferPng(P.capture.c_str(), dw, dh, P.done ? screenshotPath : nullptr);
+        P.report["captures"].push_back(P.capture);
+        P.capture.clear();
+    }
+    glfwSwapBuffers(st.win);
+    done = P.done;
+    if (done) {
+        std::ofstream out(P.dir + "/report.json", std::ios::trunc);
+        out << P.report.dump(2) << '\n';
+        out.close();
+        if (!out || P.failed) { std::fflush(nullptr); std::_Exit(EXIT_FAILURE); }
+    }
+    return true;
+}
+
 struct SimAuditShot {
     bool init = false, want = false, done = false, failed = false, motionOk = false;
     int setup = 0, stage = 0, settle = 0, sub = 0, captureWait = 0, idleFrames = 0, shotNo = 0;
@@ -3005,6 +4362,16 @@ void saBuildSteps(SimAuditShot& A) {
                 !sm.selectStudyById(st, A.topoStructId))
                 A.note = "structural topology study not found";
             if (role) saPick(st, A, role);
+            if (std::strcmp(cmd, "sim_topology_manufacturing") == 0 &&
+                A.faces.contains("min_z")) {
+                auto bed = A.faces["min_z"]["sel"];
+                bed["_pick"] = {{"body", 1}, {"topo", A.faces["min_z"]["tid"]}};
+                sm.configureActiveTopology(st, {
+                    {"material", "pla"}, {"topology", {{"volume_fraction", 0.35}}},
+                    {"build_plate", {{"faces", nlohmann::json::array({bed})}}}});
+                if (!sm.applyActiveTopologyPrintProcess(st, "fdm_0.4"))
+                    A.note = "FDM 0.4 print preset unavailable";
+            }
             if (std::strcmp(cmd, "sim_mesh") == 0)
                 A.meshWait = !(st.simClient && st.simClient->busy());
             saRun(st, sm, topoTab, cmd);
@@ -6286,6 +7653,374 @@ bool pipeDrawEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, 
     }
     return true;
 }
+struct CopilotUiShot {
+    bool init = false, want = false, done = false, failed = false, workspace = false;
+    int step = 0, settle = 0, auditStage = 0;
+    double started = 0;
+    std::string dir, capture, auditName, originalConv;
+    SceneShotInput input;
+    nlohmann::json report = {{"checks", nlohmann::json::array()}, {"audits", nlohmann::json::array()}};
+} g_cpui;
+
+constexpr const char* kCpWall = "Vertical wall (L-bracket, camera hangs underneath with access to the USB connector)";
+constexpr const char* kCpEave = "Under an eave/ceiling (mounted upside down with the servos protected from direct rain)";
+constexpr const char* kCpFlat = "Top of a flat surface (railing, ledge, shelf, or a narrow outdoor mounting plate)";
+constexpr const char* kCpSeal = "Seal exposed joints against wind-driven rain while keeping the enclosure human-editable";
+constexpr const char* kCpDrain = "Leave a drainage route below the servos without creating a pocket that traps water";
+
+bool cpuiCheck(const char* name, bool ok, const nlohmann::json& evidence) {
+    auto& P = g_cpui;
+    P.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    std::printf("copilot_ui: %s %s\n", ok ? "PASS" : "FAIL", name);
+    std::fflush(stdout);
+    if (!ok) { P.failed = P.done = true; P.capture = P.dir + "/FAILED.png"; }
+    return ok;
+}
+
+bool cpuiRelated(const nlohmann::json& finding) {
+    const auto name = finding.value("window", std::string());
+    return name.find("Copilot") != std::string::npos || name.find("##ai_ws") != std::string::npos ||
+           name.find("##ask") != std::string::npos;
+}
+
+void cpuiAudit(const char* name) {
+    g_cpui.auditName = name;
+    g_cpui.auditStage = 1;
+    g_cpui.settle = 6;
+    ImGui::GetIO().AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+}
+
+void cpuiScrollTo(const char* label) {
+    if (shotItem(label, false)) { shotScrollTo(label, nullptr, true); return; }
+    // Offscreen auto-height cards may not submit their inputs. Scan the actual viewport with
+    // hover + wheel, reversing only at a real boundary until the target is observable.
+    static int frames = 0;
+    static std::string target;
+    static float direction = -1.0f;
+    if (target != label) { target = label; direction = -1.0f; frames = 0; }
+    for (const auto& w : ui::audit::observedWindows()) {
+        const auto name = w.value("window", std::string());
+        if ((name.find("/cp_chat_") == std::string::npos &&
+             name.find("/##ai_ws_chatlog_") == std::string::npos) ||
+            !w.value("wheel_enabled", false)) continue;
+        const auto& p = w["wheel_point"];
+        auto& io = ImGui::GetIO();
+        io.AddMousePosEvent(p[0].get<float>(), p[1].get<float>());
+        if (w.value("scroll_y", 0.0f) <= 0.5f) direction = -1.0f;
+        else if (w.value("scroll_y", 0.0f) >= w.value("scroll_max_y", 0.0f) - 0.5f)
+            direction = 1.0f;
+        if (frames++ % 4 == 1) io.AddMouseWheelEvent(0.0f, direction);
+        return;
+    }
+}
+
+bool cpuiClick(const char* label, bool continuation = false) {
+    auto& P = g_cpui;
+    if (P.input.phase > 0) return P.input.click(P.input.point);
+    const auto* item = shotItem(label, true);
+    if (!item) { cpuiScrollTo(label); return false; }
+    const auto& r = (*item)["full_rect"];
+    const auto& clip = (*item)["clip"];
+    if (r[1].get<float>() < clip[1].get<float>() - 1.0f ||
+        r[3].get<float>() > clip[3].get<float>() + 1.0f) {
+        cpuiScrollTo(label); return false;
+    }
+    auto point = shotPoint(*item);
+    if (continuation) {
+        if (!cpuiCheck("choice_label_wraps_without_clipping",
+                r[3].get<float>() - r[1].get<float>() > ImGui::GetTextLineHeight() * 1.5f &&
+                r[2].get<float>() <= clip[2].get<float>() + 1.0f, *item)) return false;
+        point.y = r[3].get<float>() - ImGui::GetTextLineHeight() * 0.5f;
+        point.x = r[0].get<float>() + ui::metrics::px(35.0f);
+    }
+    return P.input.click(point);
+}
+
+void copilotUiTick(AppState& st) {
+    auto& P = g_cpui;
+    if (!P.init) {
+        P.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        P.want = st.shot && mode && std::strcmp(mode, "copilot_ui") == 0;
+        if (!P.want) return;
+        P.workspace = std::getenv("CHUDWARE_COPILOT_UI_WORKSPACE") != nullptr;
+        const char* dir = std::getenv("CHUDWARE_COPILOT_UI_OUT");
+        P.dir = dir ? dir : "scratch/copilot_ui_shots";
+        std::filesystem::create_directories(P.dir);
+        P.started = pipingNow();
+    }
+    if (!P.want || P.done) return;
+    ui::audit::observedItems();
+    if (pipingNow() - P.started > 180) {
+        cpuiCheck("timeout", false, {{"step", P.step}, {"items", ui::audit::observedItems()},
+                                     {"windows", ui::audit::observedWindows()}}); return;
+    }
+    if (!st.workerStarted || st.frame < 5 || !P.capture.empty()) return;
+    st.activeWorkspace = P.workspace ? AppState::Workspace::AI : AppState::Workspace::Model;
+    st.showAIPanel = true;
+    if (P.settle > 0) { --P.settle; return; }
+    if (P.auditStage == 1) {
+        ui::audit::AuditOptions opt; opt.regions = ui::audit::RegionAll;
+        if (!ui::audit::begin(P.auditName, opt)) return;
+        P.auditStage = 2; return;
+    }
+    if (P.auditStage == 2) {
+        if (ui::audit::active()) return;
+        const auto result = ui::audit::lastResult();
+        P.report["audits"].push_back(result);
+        nlohmann::json related = nlohmann::json::array();
+        for (const char* kind : {"conflicts", "overflows"})
+            for (const auto& f : result[kind]) if (cpuiRelated(f)) related.push_back(f);
+        if (!cpuiCheck(P.auditName.c_str(), related.empty(), related)) return;
+        P.capture = P.dir + "/" + P.auditName + ".png";
+        P.auditStage = 0; return;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    auto next = [&](int step, int settle = 4) { P.step = step; P.settle = settle; };
+    static AskBatch empty;
+    auto& batch = st.chat.empty() || st.chat[0].asks.empty() ? empty : st.chat[0].asks[0];
+    switch (P.step) {
+    case 0: {
+        glfwSetWindowSize(st.win, static_cast<int>(ui::metrics::px(1280.0f)),
+                          static_cast<int>(ui::metrics::px(1100.0f)));
+        st.chat.clear();
+        st.designStarted = true;
+        ChatMsg m;
+        m.ts = 1.7e9;
+        m.asks.push_back(askBatchFromEvent({{"batch_id", "copilot-responsive"},
+            {"agent_id", "Mechanical design and manufacturing review team"},
+            {"questions", nlohmann::json::array({
+                {{"id", "mount"}, {"kind", "choice"}, {"required", true},
+                 {"prompt", "Outdoor + command strips + small/stealthy changes the base. What surface does it stick to?"},
+                 {"suggested", "eave"}, {"options", {{{"value", "wall"}, {"label", kCpWall}},
+                    {{"value", "eave"}, {"label", kCpEave}}, {{"value", "flat"}, {"label", kCpFlat}}}}},
+                {{"id", "weather"}, {"kind", "choice"}, {"multi", true},
+                 {"prompt", "Rain exposure and service access?"}, {"options", {
+                    {{"value", "seal"}, {"label", kCpSeal}}, {{"value", "drain"}, {"label", kCpDrain}},
+                    {{"value", "service-front"}, {"label", "Service access"}},
+                    {{"value", "service-rear"}, {"label", "Service access"}}}}},
+                {{"id", "offset"}, {"kind", "dimension"}, {"family", "length"},
+                 {"prompt", "How much clearance should remain between the roof and the servo horn?"}},
+                {{"id", "references"}, {"kind", "file_request"}, {"multiple", true},
+                 {"prompt", "Attach mounting reference images or documents."}}
+            })}}));
+        auto extra = askBatchFromEvent({{"batch_id", "copilot-geometry"}, {"questions", {
+            {{"id", "entities"}, {"kind", "geometry_select"}, {"multi", true},
+             {"prompt", "Which mounting faces should remain editable?"}, {"targets", {"face", "edge"}}},
+            {{"id", "approval"}, {"kind", "approval"},
+             {"prompt", "Add a drainage route and retain the original fastener pattern?"},
+             {"proposal", "The mounting interface stays unchanged while the drainage slot opens below the servos."}}
+        }}});
+        extra.questions[0].picks = {
+            {"face", "face-one", "", "Outer mounting face with a deliberately long engineering name", nullptr},
+            {"edge", "edge-two", "", "Reference edge near the roof and mounting screw clearance", nullptr}};
+        m.asks.push_back(std::move(extra));
+        st.chat.push_back(std::move(m));
+        for (int i = 0; i < 12; ++i) {
+            ChatMsg tail; tail.ts = 1.7e9;
+            tail.text = "Later transcript entry " + std::to_string(i) +
+                ": the mounting interface remains editable and the selected dimensions stay recorded.";
+            st.chat.push_back(std::move(tail));
+        }
+        ui::composerSetText(st, "Review the proposed mounting layout.");
+        next(1, 12); break;
+    }
+    case 1:
+        if (cpuiClick(kCpWall, true)) next(2); break;
+    case 2:
+        if (!cpuiCheck("continuation_line_selects_correct_raw_answer",
+                       buildAskAnswers(batch).value("mount", nlohmann::json()) == "wall",
+                       buildAskAnswers(batch))) return;
+        cpuiAudit("01_wrapped_choices"); next(3); break;
+    case 3:
+        if (cpuiClick("##other")) next(4); break;
+    case 4:
+        io.AddInputCharactersUTF8("Adhesive bracket on a railing"); next(5); break;
+    case 5:
+        if (!cpuiCheck("typing_other_selects_custom_answer",
+                askAnswerValue(batch.questions[0]) == "Adhesive bracket on a railing",
+                buildAskAnswers(batch))) return;
+        cpuiAudit("02_other_input"); next(6); break;
+    case 6:
+        if (cpuiClick(kCpSeal, true)) next(7); break;
+    case 7:
+        if (cpuiClick(kCpDrain, true)) next(8); break;
+    case 8:
+        if (!cpuiCheck("multiselect_retains_distinct_raw_values",
+                askAnswerValue(batch.questions[1]) == nlohmann::json::array({"seal", "drain"}),
+                buildAskAnswers(batch))) return;
+        cpuiAudit("03_multiselect"); next(9); break;
+    case 9:
+        if (cpuiClick("##dim")) next(10); break;
+    case 10:
+        io.AddInputCharactersUTF8("12.5"); next(11); break;
+    case 11:
+        if (cpuiClick("##unit")) next(12); break;
+    case 12:
+        if (cpuiClick("cm")) next(13); break;
+    case 13:
+        if (!cpuiCheck("dimension_keeps_typed_value_and_selected_unit",
+                askAnswerValue(batch.questions[2]) == nlohmann::json({{"value", 12.5}, {"unit", "cm"}}),
+                buildAskAnswers(batch))) return;
+        cpuiAudit("04_dimension"); next(14); break;
+    case 14:
+        if (cpuiClick("##paths")) next(15); break;
+    case 15:
+        io.AddInputCharactersUTF8("reference/front.png;reference/side.png"); next(16); break;
+    case 16:
+        if (!cpuiCheck("file_input_keeps_multiple_paths",
+                askAnswerValue(batch.questions[3]) == nlohmann::json({{"paths", {"reference/front.png", "reference/side.png"}}}),
+                buildAskAnswers(batch))) return;
+        cpuiAudit("05_file_request"); next(17); break;
+    case 17:
+        if (!shotItem("Clear")) { cpuiScrollTo("Clear"); return; }
+        cpuiAudit("06_geometry_with_picks"); next(170); break;
+    case 170:
+        if (cpuiClick("Clear")) next(18); break;
+    case 18:
+        if (!cpuiCheck("geometry_clear_removes_selected_entities",
+                st.chat[0].asks[1].questions[0].picks.empty(), nlohmann::json::object())) return;
+        cpuiAudit("06_geometry"); next(19); break;
+    case 19:
+        if (cpuiClick("Decline")) next(20); break;
+    case 20:
+        if (!cpuiCheck("approval_decline_is_false",
+                askAnswerValue(st.chat[0].asks[1].questions[1]) == false,
+                buildAskAnswers(st.chat[0].asks[1]))) return;
+        next(200); break;
+    case 200:
+        if (cpuiClick("Approve")) next(21); break;
+    case 21:
+        if (!cpuiCheck("approval_can_change_to_true",
+                askAnswerValue(st.chat[0].asks[1].questions[1]) == true,
+                buildAskAnswers(st.chat[0].asks[1]))) return;
+        cpuiAudit("07_approval"); next(22); break;
+    case 22: {
+        if (P.input.phase > 0) {
+            if (P.input.click(P.input.point)) next(23, 8);
+            break;
+        }
+        const auto* latest = shotItem("Jump to latest");
+        if (!latest) { cpuiScrollTo(kCpWall); return; }
+        const auto& r = (*latest)["full_rect"];
+        bool clear = true;
+        for (const auto& item : ui::audit::observedItems()) {
+            if (!item.value("visible", false) || item.value("window", "").find("##ask") == std::string::npos) continue;
+            const auto& q = item["rect"];
+            clear &= q[2].get<float>() <= r[0].get<float>() || q[0].get<float>() >= r[2].get<float>() ||
+                     q[3].get<float>() <= r[1].get<float>() || q[1].get<float>() >= r[3].get<float>();
+        }
+        if (!cpuiCheck("latest_footer_never_overlaps_question_controls", clear, *latest)) return;
+        if (cpuiClick("Jump to latest")) next(23, 8);
+        break;
+    }
+    case 23: {
+        const char* region = P.workspace ? "aiws.chatlog" : "copilot.panel";
+        if (!cpuiCheck("latest_click_reaches_tail_and_hides_action",
+                       ui::chatLogAtBottom(region) && !shotItem("Jump to latest"),
+                       {{"at_bottom", ui::chatLogAtBottom(region)}})) return;
+        for (auto& b : st.chat[0].asks)
+            applyAskAnswerEvent(b, {{"source", "user"}, {"answers", buildAskAnswers(b)}});
+        next(24); break;
+    }
+    case 24: {
+        const auto& windows = ui::audit::observedWindows();
+        const auto summary = std::find_if(windows.begin(), windows.end(), [](const auto& w) {
+            const auto& r = w["rect"];
+            return w.value("window", "").find("##ask_done") != std::string::npos &&
+                   r[3].template get<float>() - r[1].template get<float>() > ImGui::GetTextLineHeight() * 4.0f;
+        });
+        if (summary == windows.end()) { cpuiScrollTo("##ask_done"); return; }
+        cpuiAudit("08_answered_summary"); next(25); break;
+    }
+    case 25:
+        glfwSetWindowSize(st.win, static_cast<int>(ui::metrics::px(1280.0f)),
+                          static_cast<int>(ui::metrics::px(580.0f)));
+        next(26, 14); break;
+    case 26: {
+        const nlohmann::json* prompt = nullptr;
+        for (const auto& item : ui::audit::observedItems())
+            if (item.value("label", "").find("##aiprompt") == 0 && item.value("visible", false)) { prompt = &item; break; }
+        if (!cpuiCheck("short_window_keeps_composer_inside_clip", prompt &&
+                (*prompt)["full_rect"][3].get<float>() <= (*prompt)["clip"][3].get<float>() + 1.0f,
+                prompt ? *prompt : ui::audit::observedItems())) return;
+        cpuiAudit("09_short_window"); next(27); break;
+    }
+    case 27:
+        if (P.workspace) { next(46); break; }
+        cpuiAudit("10_compact_header");
+        P.originalConv = st.activeConvId();
+        next(28); break;
+    case 28:
+        if (cpuiClick("##hdr_tasks")) next(29); break;
+    case 29:
+        if (!cpuiCheck("header_tasks_opens_its_view", st.showTaskList &&
+                !st.showSessionsPicker && !st.showArtifacts, nlohmann::json::object())) return;
+        next(30); break;
+    case 30:
+        if (cpuiClick("##hdr_chat")) next(31); break;
+    case 31:
+        if (cpuiClick("##hdr_arts")) next(32); break;
+    case 32:
+        if (!cpuiCheck("header_artifacts_opens_its_view", st.showArtifacts &&
+                !st.showTaskList && !st.showSessionsPicker, nlohmann::json::object())) return;
+        next(33); break;
+    case 33:
+        if (cpuiClick("##hdr_chat")) next(34); break;
+    case 34:
+        if (cpuiClick("##hdr_sess")) next(35); break;
+    case 35:
+        if (!cpuiCheck("header_sessions_opens_its_view", st.showSessionsPicker &&
+                !st.showTaskList && !st.showArtifacts, nlohmann::json::object())) return;
+        next(36); break;
+    case 36:
+        if (cpuiClick("##hdr_chat")) next(37); break;
+    case 37:
+        if (cpuiClick("##hdr_gear")) next(38); break;
+    case 38:
+        if (!cpuiCheck("header_settings_opens_its_view", st.showAISettingsOverlay &&
+                !st.showSessionsPicker && !st.showArtifacts, nlohmann::json::object())) return;
+        next(39); break;
+    case 39:
+        if (cpuiClick("##hdr_chat")) next(40); break;
+    case 40:
+        if (cpuiClick("##cp_collapse")) next(41); break;
+    case 41:
+        if (!cpuiCheck("header_collapse_remains_reachable", st.settings.copilotCollapsed,
+                        nlohmann::json::object())) return;
+        cpuiAudit("11_collapsed_header"); next(42); break;
+    case 42:
+        if (cpuiClick("##cp_collapse")) next(43); break;
+    case 43:
+        if (!cpuiCheck("header_expand_restores_panel", !st.settings.copilotCollapsed,
+                        nlohmann::json::object())) return;
+        next(44); break;
+    case 44:
+        if (cpuiClick("##hdr_new")) next(45); break;
+    case 45:
+        if (!cpuiCheck("header_new_chat_starts_new_session", st.activeConvId() != P.originalConv &&
+                st.chat.empty() && ui::composerText(st).empty() && st.pendingInlineImagePaths.empty(),
+                {{"previous", P.originalConv}, {"active", st.activeConvId()}})) return;
+        next(46); break;
+    case 46:
+        P.report["ok"] = true; P.done = true; P.capture = P.dir + "/final.png"; break;
+    }
+}
+
+bool copilotUiEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& done) {
+    auto& P = g_cpui;
+    if (!P.want) return false;
+    ++st.frame;
+    if (!P.capture.empty()) {
+        writeBackbufferPng(P.capture.c_str(), dw, dh, P.done ? screenshotPath : nullptr);
+        P.report["captures"].push_back(P.capture); P.capture.clear();
+    }
+    std::ofstream out(P.dir + "/report.json", std::ios::trunc); out << P.report.dump(2) << '\n';
+    glfwSwapBuffers(st.win);
+    done = P.done;
+    if (!out || (done && P.failed)) { std::fflush(nullptr); std::_Exit(EXIT_FAILURE); }
+    return true;
+}
 }  // namespace
 
 namespace ui {
@@ -6333,7 +8068,13 @@ void ScenarioRunner::tick(AppState& st) {
             std::error_code ec; std::filesystem::create_directories(m1SavePath, ec);
         }
         auto loadMesh = [&](const core::OpsResponse& r) {
-            if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+            std::string error;
+            if (!r.ok || r.aicm_path.empty() || !st.loadDocMesh(r.aicm_path, error)) {
+                std::fprintf(stderr, "m1: mesh load failed: %s %s\n",
+                             r.error_message.c_str(), error.c_str());
+                std::fflush(nullptr);
+                std::_Exit(EXIT_FAILURE);
+            }
         };
         auto statusMs = [](const core::OpsResponse& r, const std::string& fid) -> double {
             if (!r.feature_status.is_array()) return -1.0;
@@ -6487,12 +8228,8 @@ void ScenarioRunner::tick(AppState& st) {
                     double filletAfter = statusMs(r, m1FilletId);
                     std::printf("m1: edit_fillet ok=%d rev=%d fillet_ms=%.2f\n",
                                 (int)r.ok, r.revision, filletAfter);
-                    std::printf("m1: cache-assert box f1 ms before=%.2f after=%.2f (cached=%s); "
-                                "fillet ms before=%.2f after=%.2f (recompiled=%s)\n",
-                                m1BoxMsBeforeEdit, boxAfter,
-                                (boxAfter == m1BoxMsBeforeEdit ? "yes" : "NO"),
-                                m1FilletMsBeforeEdit, filletAfter,
-                                (filletAfter != m1FilletMsBeforeEdit ? "yes" : "no"));
+                    std::printf("m1: feature timings box %.2f -> %.2f ms; fillet %.2f -> %.2f ms\n",
+                                m1BoxMsBeforeEdit, boxAfter, m1FilletMsBeforeEdit, filletAfter);
                     // Open the PM on the fillet so the screenshot shows the populated edit form.
                     st.propertyManager->openForEdit(st, m1FilletId);
                     std::fflush(stdout);
@@ -6519,7 +8256,32 @@ void ScenarioRunner::tick(AppState& st) {
                                 (int)opened, st.docMirror.revision(), nfeat,
                                 nfeat == 3 ? "(tree intact)" : "(TREE MISMATCH)");
                     std::fflush(stdout);
-                    // Reopen doesn't return an aicm; force a rebuild to refresh the viewport.
+                    // Adopt the saved mesh, as the normal open path does; never force a rebuild.
+                    st.addDocTab(false);
+                    std::string meshError;
+                    if (!saved || !opened || nfeat != 3 ||
+                        !st.docMirror.lastOpenedWarm() || !st.docMirror.lastOpenedCacheHit() ||
+                        !st.loadDocMesh(st.docMirror.lastOpenedAicm(), meshError)) {
+                        std::fprintf(stderr, "m1: cached reopen failed: %s %s\n",
+                                     serr.c_str(), meshError.c_str());
+                        std::fflush(nullptr);
+                        std::_Exit(EXIT_FAILURE);
+                    }
+                    st.docTabs[st.activeTab].path = sp;
+                    st.docTabs[st.activeTab].dirty = false;
+                    st.applyDocDrivenVisibility(st.docMirror.tree());
+                    const int openedTab = st.activeTab;
+                    const auto openedDoc = st.docMirror.docId();
+                    const auto tabCount = st.docTabs.size();
+                    const auto absolutePath =
+                        std::filesystem::absolute(std::filesystem::u8path(sp)).generic_u8string();
+                    if (!ui::featureTreeOpenPath(st, absolutePath) || st.activeTab != openedTab ||
+                        st.docMirror.docId() != openedDoc || st.docTabs.size() != tabCount) {
+                        std::fprintf(stderr, "m1: canonical reopen did not reuse the open document\n");
+                        std::fflush(nullptr);
+                        std::_Exit(EXIT_FAILURE);
+                    }
+                    std::printf("m1: cached mesh restored; canonical reopen reused the active document\n");
                     m1Capture = m1SavePath + "/m1_06_reopen.png"; m1Settle = kSettle;
                     break;
                 }
@@ -6658,12 +8420,159 @@ void ScenarioRunner::tick(AppState& st) {
                     sketchCapture = skSavePath + "/sketch_03_solid.png"; skSettle = kSettle;
                     break;
                 }
+                case 3: {  // mid-height sketch (z=5) + model refs resolved from the solid
+                    auto r = applyOne({{"op","add_feature"},{"feature",{
+                        {"type","sketch"},{"name","RelSketch"},
+                        {"refs",{{"plane","plane.top"}}},
+                        {"params",{{"offset",{{"value",5.0},{"expr",nullptr}}},
+                                   {"entities",{
+                                       {{"id","e1"},{"type","line"},{"p1",{10.0,46.0}},{"p2",{60.0,47.0}}},
+                                       {{"id","e2"},{"type","point"},{"p",{92.0,35.0}}},
+                                       {{"id","e3"},{"type","point"},{"p",{95.0,5.0}}}}},
+                                   {"constraints",nlohmann::json::array()},
+                                   {"auto_define",false}}}}}});
+                    skRelFid = (r.id_map.is_object() && r.id_map.contains("$0")) ? r.id_map["$0"].get<std::string>() : "";
+                    skRelLine = "e1"; skRelPierce = "e2"; skRelVertex = "e3";
+                    // Classify the solid's topology (x 0..100, y 0..40, z 0..10) from resolved picks.
+                    auto centroidOf = [](const nlohmann::json& o, double c[3]) {
+                        if (!o.contains("centroid") || !o["centroid"].is_array() || o["centroid"].size() < 3) return false;
+                        for (int k = 0; k < 3; ++k) c[k] = o["centroid"][k].get<double>();
+                        return true;
+                    };
+                    for (uint32_t tid = 1; tid <= 24; ++tid) {
+                        std::string se;
+                        const std::string s = st.docMirror.resolvePick(st.worker, 1, "edge", tid, se);
+                        auto o = nlohmann::json::parse(s, nullptr, false);
+                        double c[3];
+                        if (!o.is_object() || !centroidOf(o, c)) continue;
+                        if (std::abs(c[2] - 10.0) < 1e-3 && std::abs(c[1] - 40.0) < 1e-3) { skTopEdgeSel = s; skTopEdgeTid = (int)tid; }
+                        if (std::abs(c[2] - 5.0) < 1e-3 && std::abs(c[0] - 100.0) < 1e-3 && std::abs(c[1] - 40.0) < 1e-3) skVertEdgeSel = s;
+                    }
+                    for (uint32_t tid = 1; tid <= 16; ++tid) {
+                        std::string se;
+                        const std::string s = st.docMirror.resolvePick(st.worker, 1, "vertex", tid, se);
+                        auto o = nlohmann::json::parse(s, nullptr, false);
+                        double c[3];
+                        if (!o.is_object() || !centroidOf(o, c)) continue;
+                        if (std::abs(c[0] - 100.0) < 1e-3 && std::abs(c[1]) < 1e-3 && std::abs(c[2] - 10.0) < 1e-3) skVertexSel = s;
+                    }
+                    for (uint32_t tid = 1; tid <= 8; ++tid) {
+                        std::string se;
+                        const std::string s = st.docMirror.resolvePick(st.worker, 1, "face", tid, se);
+                        auto o = nlohmann::json::parse(s, nullptr, false);
+                        double c[3];
+                        if (o.is_object() && centroidOf(o, c) && std::abs(c[2] - 10.0) < 1e-3) { skTopFaceSel = s; skTopFaceTid = (int)tid; }
+                    }
+                    if (sk && !skRelFid.empty()) sk->enterForFeature(st, skRelFid);
+                    // Headless runs have no pointer: park it inside the viewport so the Add
+                    // Relation popup (placed at the mouse) opens on screen in the next step.
+                    if (ImVec2 lo, hi; ui::viewportClearRect(lo, hi))
+                        ImGui::GetIO().AddMousePosEvent(lo.x + (hi.x - lo.x) * 0.35f,
+                                                        lo.y + (hi.y - lo.y) * 0.30f);
+                    std::printf("sketch: relation sketch %s; refs top_edge=%d vertical_edge=%d vertex=%d top_face=%d\n",
+                                skRelFid.c_str(), (int)!skTopEdgeSel.empty(), (int)!skVertEdgeSel.empty(),
+                                (int)!skVertexSel.empty(), (int)!skTopFaceSel.empty());
+                    std::fflush(stdout);
+                    skSettle = 30;   // let Normal-To finish before the popup capture
+                    break;
+                }
+                case 4: {  // Add Relation popup over a sketch line + a selected model edge
+                    st.selection.clear();
+                    if (!skTopEdgeSel.empty()) {
+                        core::SelItem it;
+                        it.hit.body_id = 1; it.hit.kind = render::PickKind::Edge;
+                        it.hit.topo_id = (uint32_t)skTopEdgeTid;
+                        it.selector = skTopEdgeSel; it.pending_resolve = false;
+                        st.selection.mutableItems().push_back(it);
+                    }
+                    if (sk) { sk->selectEntities({skRelLine}); sk->onRibbonCommand(st, "sk_relations"); }
+                    std::printf("sketch: Add Relation popup opened for %s + model edge\n", skRelLine.c_str());
+                    std::fflush(stdout);
+                    skSettle = 3;   // auto-resized ImGui windows stay hidden on their first frame
+                    break;
+                }
+                case 5: {  // capture the popup once it has a size
+                    sketchCapture = skSavePath + "/sketch_04_relpopup.png"; skSettle = kSettle;
+                    break;
+                }
+                case 6: {  // the popup's batches: collinear to the edge, pierce, vertex coincident
+                    st.selection.clear();
+                    ImGui::GetIO().AddKeyEvent(ImGuiKey_Escape, true);   // dismiss the popup
+                    auto batch = [&](const nlohmann::json& ref, const nlohmann::json& con) {
+                        auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                            {{"op","sketch_convert"},{"sketch",skRelFid},{"refs",nlohmann::json::array({ref})},
+                             {"construction",true},{"fix",true},{"associative",true}},
+                            {{"op","sketch_add_constraint"},{"sketch",skRelFid},{"constraint",con}}}));
+                        if (!r.ok) std::printf("sketch: relation batch FAILED: %s\n", r.error_message.c_str());
+                        return r.ok;
+                    };
+                    const auto topEdge = nlohmann::json::parse(skTopEdgeSel, nullptr, false);
+                    const auto vertEdge = nlohmann::json::parse(skVertEdgeSel, nullptr, false);
+                    const auto vertex = nlohmann::json::parse(skVertexSel, nullptr, false);
+                    const bool okCol = batch({{"kind","edge"},{"selector",topEdge}},
+                        {{"type","collinear"},{"refs",{skRelLine,"$0"}}});
+                    const bool okPie = batch({{"kind","edge"},{"selector",vertEdge},{"mode","pierce"},{"near",{92.0,35.0}}},
+                        {{"type","coincident"},{"refs",{skRelPierce + ".p","$0"}}});
+                    const bool okVtx = batch({{"kind","vertex"},{"selector",vertex}},
+                        {{"type","coincident"},{"refs",{skRelVertex + ".p","$0"}}});
+                    nlohmann::json sres;
+                    st.worker.call("sketch_solve", {{"doc_id",st.docMirror.docId()},{"sketch",skRelFid}}, sres, err);
+                    auto ent = [&](const std::string& id) {
+                        if (sres.contains("entities") && sres["entities"].is_array())
+                            for (const auto& e : sres["entities"]) if (e.value("id",std::string()) == id) return e;
+                        return nlohmann::json();
+                    };
+                    const auto L = ent(skRelLine), P = ent(skRelPierce), Q = ent(skRelVertex);
+                    std::printf("sketch: model relations collinear=%d pierce=%d vertex=%d -> line y=(%.3f,%.3f) pierce=(%.3f,%.3f) vertex=(%.3f,%.3f) dof=%d\n",
+                                (int)okCol, (int)okPie, (int)okVtx,
+                                L.is_object() ? L["p1"][1].get<double>() : -1.0, L.is_object() ? L["p2"][1].get<double>() : -1.0,
+                                P.is_object() ? P["p"][0].get<double>() : -1.0, P.is_object() ? P["p"][1].get<double>() : -1.0,
+                                Q.is_object() ? Q["p"][0].get<double>() : -1.0, Q.is_object() ? Q["p"][1].get<double>() : -1.0,
+                                sres.value("dof", -1));
+                    std::fflush(stdout);
+                    if (sk) sk->enterForFeature(st, skRelFid);
+                    skSettle = 30;
+                    break;
+                }
+                case 7: {  // Fully Define + Display/Delete Relations panel
+                    ImGui::GetIO().AddKeyEvent(ImGuiKey_Escape, false);
+                    if (sk) {
+                        sk->clearEntitySelection();
+                        sk->onRibbonCommand(st, "sk_fully_define");
+                        sk->onRibbonCommand(st, "sk_display_relations");
+                    }
+                    std::printf("sketch: fully define -> %s\n", sk ? sk->statusLine().c_str() : "?");
+                    std::fflush(stdout);
+                    sketchCapture = skSavePath + "/sketch_05_relations.png"; skSettle = kSettle;
+                    break;
+                }
+                case 8: {  // Convert Entities of the solid's top face (one batched op), timed
+                    if (sk) sk->onRibbonCommand(st, "sk_display_relations");
+                    st.selection.clear();
+                    if (!skTopFaceSel.empty()) {
+                        core::SelItem it;
+                        it.hit.body_id = 1; it.hit.kind = render::PickKind::Face;
+                        it.hit.topo_id = (uint32_t)skTopFaceTid;
+                        it.selector = skTopFaceSel; it.pending_resolve = false;
+                        st.selection.mutableItems().push_back(it);
+                    }
+                    const auto t0 = std::chrono::steady_clock::now();
+                    if (sk) sk->onRibbonCommand(st, "sk_convert_ent");
+                    const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    std::printf("sketch: convert top face %.1f ms -> %s\n", ms,
+                                sk ? sk->statusLine().c_str() : "?");
+                    std::fflush(stdout);
+                    sketchCapture = skSavePath + "/sketch_06_convert.png"; skSettle = kSettle;
+                    break;
+                }
                 default:
+                    if (sk) sk->exitSketch(st, /*keep=*/true);
                     st.sketchShotDone = true;
                     std::printf("sketch: scenario complete\n"); std::fflush(stdout);
                     break;
             }
-            if (skStep <= 2) ++skStep;
+            if (skStep <= 8) ++skStep;
         }
     }
 
@@ -7385,6 +9294,18 @@ void ScenarioRunner::tick(AppState& st) {
 
     // ---------- root-scoped chat sessions (CHUDWARE_SHOT=projectchat) ----------
     projectChatTick(st);
+
+    // ---------- mid-run message delivery captions (CHUDWARE_SHOT=steerstatus) ----------
+    steerStatusTick(st);
+    chatInlineTick(st);
+    copilotUiTick(st);
+#ifndef __EMSCRIPTEN__
+    delayedAccountTick(st);
+#endif
+
+    // ---------- live document editing lock / keep-exit / takeover (CHUDWARE_SHOT=agentlock) ----------
+    agentLockTick(st);
+    featureStateTick(st);
 
     // ---------- simulation UI audit (CHUDWARE_SHOT=simaudit) ----------
     simAuditTick(st);
@@ -8755,6 +10676,32 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
     if (projectChatEndFrame(st, dw, dh, screenshotPath, projectChatBreak))
         return projectChatBreak ? FrameAction::Break : FrameAction::Continue;
 
+    // steerstatus: delivery-caption checks + report; exits non-zero on failure.
+    bool steerBreak = false;
+    if (steerStatusEndFrame(st, dw, dh, screenshotPath, steerBreak))
+        return steerBreak ? FrameAction::Break : FrameAction::Continue;
+
+    bool chatInlineBreak = false;
+    if (chatInlineEndFrame(st, dw, dh, screenshotPath, chatInlineBreak))
+        return chatInlineBreak ? FrameAction::Break : FrameAction::Continue;
+
+    bool copilotUiBreak = false;
+    if (copilotUiEndFrame(st, dw, dh, screenshotPath, copilotUiBreak))
+        return copilotUiBreak ? FrameAction::Break : FrameAction::Continue;
+
+    bool agentLockBreak = false;
+    if (agentLockEndFrame(st, dw, dh, screenshotPath, agentLockBreak))
+        return agentLockBreak ? FrameAction::Break : FrameAction::Continue;
+
+    bool featureStateBreak = false;
+    if (featureStateEndFrame(st, dw, dh, screenshotPath, featureStateBreak))
+        return featureStateBreak ? FrameAction::Break : FrameAction::Continue;
+#ifndef __EMSCRIPTEN__
+    bool delayedAccountBreak = false;
+    if (delayedAccountEndFrame(st, dw, dh, screenshotPath, delayedAccountBreak))
+        return delayedAccountBreak ? FrameAction::Break : FrameAction::Continue;
+#endif
+
     // simaudit: per-state captures + report; exits non-zero on any ID conflict.
     bool saBreak = false;
     if (simAuditEndFrame(st, dw, dh, screenshotPath, saBreak))
@@ -9290,8 +11237,8 @@ bool ScenarioRunner::topoVerifyRun(const nlohmann::json& run, const std::string&
 //   1 Simulate workspace + Topology ribbon tab; 2 wait for the native capability matrix,
 //     choose SIMP + a second structural method, capture the ribbon and the "+ New Study" picker
 //   3 sim_new_topology, picked fixture (-X) / force (+X) / preserve (bottom) faces
-//   4 configure: 500 N -Z force, 4 mm preserve band, exclude keep-out box, steel, 5 mm tet4
-//     mesh, SIMP compliance at 35 % solid; capture the Regions form
+//   4 configure: 500 N -Z force, 4 mm preserve band, exclude keep-out box, PLA, 5 mm tet4
+//     mesh, SIMP compliance at 35 % solid, FDM 0.4 preset and bottom bed face; capture Regions
 //   5..7 Boundaries / Manufacturing / Method captures
 //   8..9 Run SIMP, wait, verify, capture the result
 //   10..12 switch to the second method (selectCombination), run, verify, capture the result
@@ -9363,7 +11310,8 @@ void ScenarioRunner::runTopology(AppState& st) {
     auto validateActive = [&](const char* code) -> bool {
         const nlohmann::json study = st.simManager->activeTopologyStudy();
         const auto issues = topo::validateTopology(
-            study.value("topology", nlohmann::json::object()), st.simManager->topologyCapabilities());
+            study.value("topology", nlohmann::json::object()), st.simManager->topologyCapabilities(),
+            study);
         std::string blocking;
         for (const auto& is : issues) {
             const bool block = is.severity == topo::Severity::Blocking;
@@ -9399,8 +11347,76 @@ void ScenarioRunner::runTopology(AppState& st) {
             return;
         }
         const nlohmann::json run = sm->activeTopologyResult();
-        std::string why;
-        if (!topoVerifyRun(run, tag, why)) { topoFail("run_" + tag + "_invalid", why); return; }
+        static double dfamWaitStart = 0.0;
+        if (dfamWaitStart == 0.0) {
+            std::string why;
+            if (!topoVerifyRun(run, tag, why)) {
+                topoFail("run_" + tag + "_invalid", why);
+                return;
+            }
+        }
+        const auto result = run.value("result", nlohmann::json::object());
+        const auto manufacturing = result.value("manufacturing", nlohmann::json::object());
+        const auto dfam = manufacturing.value("dfam", nlohmann::json::object());
+        const auto artifacts = result.value("artifacts", nlohmann::json::object());
+        if (!manufacturing.value("geometry_valid", false)) {
+            // No validated geometry: no surface to print or check, so DFAM is never queued.
+            // The SIMP run is the scenario's reference print run and must validate.
+            if (tag == "simp") {
+                topoFail("run_simp_geometry", "the SIMP reconstruction was not validated: " +
+                                                  manufacturing.dump());
+                return;
+            }
+            if (dfam.value("checked", false) || artifacts.contains("surface_print_stl")) {
+                topoFail("run_" + tag + "_unvalidated_print",
+                         "an unvalidated reconstruction produced print evidence: " +
+                             manufacturing.dump());
+                return;
+            }
+            topoReport["print_checks"][tag] = {{"geometry_valid", false},
+                                               {"surface_print_stl", false},
+                                               {"dfam", dfam}};
+            std::printf("topology: run[%s] geometry not validated: no print surface, DFAM not run\n",
+                        tag.c_str());
+            topoRunIds.push_back(run.value("run_id", std::string()));
+            std::printf("topology: run[%s] verified in %.1f s\n", tag.c_str(), elapsed);
+            std::fflush(stdout);
+            sm->handleCommand(st, "sim_results");
+            shoot(shotName, kSettle * 2);
+            ++topoStep;
+            return;
+        }
+        if (!dfam.value("checked", false)) {
+            const std::string error = dfam.value("error", std::string());
+            if (!error.empty()) {
+                topoFail("run_" + tag + "_dfam_unavailable", "DFAM check could not run: " + error);
+                return;
+            }
+            if (dfamWaitStart == 0.0) dfamWaitStart = topoNow();
+            if (topoNow() - dfamWaitStart > 125.0)
+                topoFail("run_" + tag + "_dfam_timeout",
+                         "DFAM was not checked: " + manufacturing.dump());
+            return;
+        }
+        dfamWaitStart = 0.0;
+        if (!artifacts.contains("surface_print_stl")) {
+            topoFail("run_" + tag + "_print_surface", "surface_print_stl was not produced");
+            return;
+        }
+        bool hasOverhang = false;
+        const auto arrays = artifacts.value("overlay_aicm", nlohmann::json::object())
+                                     .value("arrays", nlohmann::json::array());
+        for (const auto &field : arrays)
+            hasOverhang |= field.value("name", std::string()) == "overhang";
+        if (!hasOverhang) {
+            topoFail("run_" + tag + "_overhang", "the viewport overlay does not offer overhang");
+            return;
+        }
+        topoReport["print_checks"][tag] = {
+            {"surface_print_stl", true}, {"overhang", true}, {"dfam", dfam}};
+        std::printf("topology: run[%s] surface_print_stl=present overlay.overhang=offered "
+                    "manufacturing.dfam.checked=true passed=%d\n",
+                    tag.c_str(), (int)dfam.value("passed", false));
         topoRunIds.push_back(run.value("run_id", std::string()));
         std::printf("topology: run[%s] verified in %.1f s\n", tag.c_str(), elapsed);
         std::fflush(stdout);
@@ -9425,6 +11441,9 @@ void ScenarioRunner::runTopology(AppState& st) {
         return;
     }
 
+    // The SIMP result is shown coloured by the unsupported-overhang scalar (the run's auto-show
+    // picks the active field); the BESO run gets the previous field back.
+    static std::string topoFieldBeforePrint;
     switch (topoStep) {
         case 0: {  // design domain
             std::string err;
@@ -9607,26 +11626,37 @@ void ScenarioRunner::runTopology(AppState& st) {
             setIf("filter_radius_mm", 10.0);   // two 5 mm elements
             setIf("penalty", 3.0);
             setIf("preserve_thickness_mm", 4.0);
-            setIf("build_direction", {0.0, 0.0, 1.0});
-            setIf("overhang_angle_deg", 45.0);
-            setIf("no_enclosed_voids", true);
+            t["build_direction"] = nullptr;  // bed face is the direction source
             const nlohmann::json patch = {
                 {"name", "Bracket topology"},
-                {"material", "steel_1018"},
+                {"material", "pla"},
                 {"mesh_order", 1},
                 {"mesh_target_mm", 5.0},
                 {"loads", loads},
                 {"preserve", preserve},
                 {"exclude", exclude},
+                {"build_plate", {{"faces", nlohmann::json::array({faceSel("min_z")})},
+                                   {"label", "Printer bed"}}},
                 {"topology", t}};
             if (!sm->configureActiveTopology(st, patch)) {
                 topoFail("configure", "configureActiveTopology refused the structural setup");
                 return;
             }
+            if (!sm->applyActiveTopologyPrintProcess(st, "fdm_0.4")) {
+                topoFail("print_process", "the FDM 0.4 preset could not be applied");
+                return;
+            }
+            const auto printed = sm->activeTopologyStudy();
+            if (printed.value("print_process", std::string()) != "fdm_0.4" ||
+                printed.value("build_plate", nlohmann::json::object())
+                       .value("faces", nlohmann::json::array()).empty()) {
+                topoFail("print_setup", "the preset or picked min_z bed face was not retained");
+                return;
+            }
             if (!validateActive("setup_blocked")) return;
             topoReport["structural_setup"] = sm->activeTopologyStudy();
             std::printf("topology: structural setup configured (SIMP, compliance, 35%% solid, "
-                        "steel, 5 mm tet4)\n");
+                        "PLA, FDM 0.4, min_z bed face, 5 mm tet4)\n");
             std::fflush(stdout);
             shoot("topology_02_regions.png", kSettle * 2);
             ++topoStep;
@@ -9648,6 +11678,10 @@ void ScenarioRunner::runTopology(AppState& st) {
             ++topoStep;
             return;
         case 8:
+            if (st.activeScalarField != "overhang") {
+                topoFieldBeforePrint = st.activeScalarField;
+                st.activeScalarField = "overhang";
+            }
             launchRun(topoMethodA.c_str());
             return;
         case 9:
@@ -9656,6 +11690,22 @@ void ScenarioRunner::runTopology(AppState& st) {
         case 10: {  // second method on the same setup; unsupported keys erased, never sent
             SimManager* sm = st.simManager;
             if (st.rpc.busy()) return;
+            // First pass: the SIMP result (overhang field) in a tall window so the results
+            // panel shows Manufacturing (DFAM) and the print-surface export rows; second pass
+            // restores the window and the previous field.
+            static int printShot = 0;
+            if (printShot == 0) {
+                glfwSetWindowSize(st.win, 1340, 2400);
+                sm->handleCommand(st, "sim_results");
+                shoot("topology_06b_print_" + topoMethodA + ".png", kSettle * 3);
+                printShot = 1;
+                return;
+            }
+            if (printShot == 1) {
+                glfwSetWindowSize(st.win, 1340, 838);
+                st.activeScalarField = topoFieldBeforePrint;
+                printShot = 2;
+            }
             const topo::Capabilities& caps = sm->topologyCapabilities();
             nlohmann::json t = sm->activeTopologyStudy().value("topology", nlohmann::json::object());
             const topo::SwitchResult sw = topo::selectCombination(t, caps, topoMethodB, "structural");

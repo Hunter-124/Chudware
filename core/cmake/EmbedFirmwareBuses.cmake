@@ -16,4 +16,6 @@ foreach(_index RANGE 0 4)
 endforeach()
 string(APPEND _firmware_bus_header "}\n")
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/firmware_bus_sources.h" "${_firmware_bus_header}")
+# Preserve the header timestamp when source bytes are unchanged.
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/firmware_bus_sources.h"
+     CONTENT "${_firmware_bus_header}" @ONLY NEWLINE_STYLE LF)

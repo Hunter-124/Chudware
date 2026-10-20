@@ -84,8 +84,10 @@ struct PushPullResult {
 
 class DocMirror {
 public:
-    // Listener called after every mutation that succeeds (on the calling thread).
-    using Listener = std::function<void()>;
+    // Listener called whenever a tree/snapshot is adopted (on the calling thread).
+    // revisionChanged is true only when the SAME document has a different native revision;
+    // an unchanged refresh or a binding to another document is not a document mutation.
+    using Listener = std::function<void(bool revisionChanged)>;
     void setListener(Listener l) { listener_ = std::move(l); }
 
     // W1-B (item 2/6): notified when an op was discarded because the mirror was stale and we had to
@@ -143,6 +145,11 @@ public:
     bool lastOpenedCacheHit() const { return lastOpenedCacheHit_; }
     bool lastOpenedWarm() const { return lastOpenedWarm_; }
     const std::string& lastOpenedCacheMissReason() const { return lastOpenedCacheMissReason_; }
+    //   lastOpenedWriteback — the open rebuilt and saved that build into the file (1), tried and
+    //                         was refused (-1, reason in lastOpenedWritebackReason), or did not
+    //                         try (0) — contracts/stepplus.md §17.
+    int lastOpenedWriteback() const { return lastOpenedWriteback_; }
+    const std::string& lastOpenedWritebackReason() const { return lastOpenedWritebackReason_; }
 
     // ---- W1-B (item 6): owner-map lookups ----
     // The parsed feature->topology map from the latest response that carried one. TOLERANT of the
@@ -351,12 +358,16 @@ public:
     void reset() {
         docId_.clear();
         revision_ = -1;
+        notifiedDocId_.clear();
+        notifiedRevision_ = -1;
         tree_ = {};
         featureStatus_ = {};
         refDatums_ = nlohmann::json::array();
         lastOpenedDrawings_ = nlohmann::json::array();
         lastOpenedCacheReported_ = lastOpenedCacheHit_ = lastOpenedWarm_ = false;
         lastOpenedCacheMissReason_.clear();
+        lastOpenedWriteback_ = 0;
+        lastOpenedWritebackReason_.clear();
         ownerMap_.clear();
         faceOwner_.clear();
         edgeOwner_.clear();
@@ -370,7 +381,13 @@ public:
 private:
     OpsResponse parseOpsResponse(const nlohmann::json& result);
     bool resyncTree(WorkerClient& w);  // called on stale_revision
-    void notify() { if (listener_) listener_(); }
+    void notify() {
+        const bool revisionChanged = !docId_.empty() && docId_ == notifiedDocId_ &&
+                                     revision_ != notifiedRevision_;
+        if (docId_ != notifiedDocId_) notifiedDocId_ = docId_;
+        notifiedRevision_ = revision_;
+        if (listener_) listener_(revisionChanged);
+    }
 
     // W1-B (item 6): (re)build ownerMap_ + the reverse lookups from a response's "owner_map" object.
     // TOLERATES a missing/null/empty owner_map: in that case the maps are cleared and lookups
@@ -379,6 +396,8 @@ private:
 
     std::string    docId_;
     int            revision_ = -1;
+    std::string    notifiedDocId_;
+    int            notifiedRevision_ = -1;
     nlohmann::json tree_;
     nlohmann::json featureStatus_;
     nlohmann::json refDatums_ = nlohmann::json::array();           // datum reference geometry to draw
@@ -389,6 +408,8 @@ private:
     bool           lastOpenedCacheHit_ = false;                    // doc_open "cache_hit"
     bool           lastOpenedWarm_ = false;                        // doc_open "warm"
     std::string    lastOpenedCacheMissReason_;                     // doc_open "cache_miss_reason"
+    int            lastOpenedWriteback_ = 0;                       // cache.writeback: 1 saved, -1 refused
+    std::string    lastOpenedWritebackReason_;                     // cache.writeback.reason
     Listener       listener_;
     StaleCb        staleResyncCb_;  // W1-B: fired on stale_revision auto-resync
     uint64_t       mutationGen_ = 0;  // T-PERF1: latest-wins guard for applyOpsAsync

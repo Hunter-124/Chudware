@@ -4,10 +4,18 @@
 #   powershell -ExecutionPolicy Bypass -File install.ps1 [-InstallDir <dir>] [-NoRegister]
 param(
     [string]$InstallDir = "$env:LOCALAPPDATA\Programs\Chudware",
+    [string]$BasePython = $env:CHUDWARE_BASE_PYTHON,
     [switch]$NoRegister
 )
 $ErrorActionPreference = "Stop"
 $src = $PSScriptRoot
+if (-not $BasePython) { $BasePython = $env:CHUDWARE_CI_BASE_PYTHON }
+if (-not $BasePython -or -not [IO.Path]::IsPathRooted($BasePython)) {
+    throw "select a separately authenticated absolute base Python with -BasePython or CHUDWARE_BASE_PYTHON"
+}
+foreach ($variable in @(Get-ChildItem Env: | Where-Object {
+    $_.Name -match '^(PYTHON|LD_|DYLD_)|^(__PYVENV_LAUNCHER__|VIRTUAL_ENV)$'
+})) { Remove-Item ("Env:" + $variable.Name) }
 Write-Host "==> Installing Chudware to $InstallDir"
 
 # ---------------------------------------------------------------------------
@@ -106,25 +114,19 @@ foreach ($item in @("chudware.exe", "chudware-hostd.exe", "chudware-hostd.pdb", 
     if (Test-Path $p) { Copy-Item $p -Destination $InstallDir -Recurse -Force }
 }
 
-# Resolve a base interpreter for creating the venv: bundled portable python preferred.
-$embed = Join-Path $InstallDir "python-embed\python.exe"
-if (Test-Path $embed) {
-    $basePy = $embed
-} else {
-    $pyCmd = Get-Command py -ErrorAction SilentlyContinue
-    if ($pyCmd) { $basePy = (& py -3.11 -c "import sys;print(sys.executable)") }
-    else { $basePy = (Get-Command python).Source }
-}
-Write-Host "==> Base python: $basePy"
+# Base/platform identity is an operator prerequisite, not an embedded executable's
+# self-reported version or PATH discovery result.
+$basePy = $BasePython
+Write-Host "==> Independently trusted base python: $basePy"
 
 $app = Join-Path $InstallDir "app"
 $wh = Join-Path $InstallDir "wheelhouse"
 Push-Location $app
 try {
-    $whArgs = @()
-    if (Test-Path $wh) { $whArgs = @("--wheelhouse", $wh) }
-    Write-Host "==> Provisioning runtime into %APPDATA%\Chudware ..."
-    $provisionOut = & $basePy -m services.installer.provision @whArgs --base-python $basePy --with-app-code
+    if (-not (Test-Path $wh -PathType Container)) { throw "reviewed offline runtime wheelhouse missing: $wh" }
+    Write-Host "==> Provisioning reviewed offline runtime into %APPDATA%\Chudware ..."
+    $provisionOut = & $basePy -I -S -c "import sys;sys.path.insert(0,sys.argv[1]);from services.installer.provision import main;sys.exit(main(sys.argv[2:]))" `
+        $app --wheelhouse $wh --base-python $basePy --with-app-code
     if ($LASTEXITCODE -ne 0) { $provisionOut | ForEach-Object { Write-Host $_ }; throw "provisioning failed" }
     $provisionOut | ForEach-Object { Write-Host $_ }
     # provision.py may legitimately reuse a pre-Chudware-rename venv (services/paths.py's
@@ -149,25 +151,8 @@ try {
         & $venvPy -m services.installer.setup_file_assoc --exe (Join-Path $InstallDir "chudware.exe")
     }
 
-    # Optional sim/firmware backends (Renode portable zip, openEMS MSVC note).
-    # Non-fatal: a failure here must never abort the install.
-    try {
-        Write-Host "==> Optional: provisioning Renode + openEMS (best-effort) ..."
-        $env:CHUDWARE_PROVISION_OPTIONAL_SIM = "1"
-        & $venvPy -c @"
-import sys
-try:
-    from services.installer.provision import ensure_optional_sim_tools
-    st = ensure_optional_sim_tools(install=True)
-    for k, v in st.items():
-        print(f'  {k}: installed={v.get(\"installed\")} path={v.get(\"path\") or v.get(\"python\")}')
-except Exception as e:
-    print(f'  optional sim tools skipped: {e}')
-    sys.exit(0)
-"@
-    } catch {
-        Write-Warning "optional Renode/openEMS provisioning skipped: $_"
-    }
+    # Optional browser/sim/AI tools use their explicit provisioning interfaces;
+    # this managed runtime path never starts online downloads/source builds.
 } finally {
     Pop-Location
 }

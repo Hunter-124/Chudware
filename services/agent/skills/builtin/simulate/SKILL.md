@@ -4,11 +4,28 @@ description: Run FEA, thermal, vibration, CFD, motion, EM, and topology optimiza
 inject: auto
 triggers:
   keywords: [fea, cfd, simulate, simulation, stress, modal, thermal, vibration, wind tunnel, drag, motion, eigenmode, s-parameter, antenna, contact, load case, strong enough, will this hold, can this hold, factor of safety, deflection, buckling, von mises, topology, thermomechanical, conjugate heat transfer]
-  tools: [run_fea_static, run_fea_adaptive, run_fea_modal, run_fea_fatigue, run_fea_frequency_response, run_fea_thermal, run_fea_buckling, run_fea_contact, run_fea_convergence, sim_evidence_packet, verify_packet, polymesh_cli, run_cfd_flow, run_cfd_accurate, em_eigenmode, em_driven, em_timedomain, ecad_antenna_design, ecad_antenna_analyze, topology_capabilities, run_topology_optimization]
+  tools: [run_fea_static, run_fea_adaptive, run_fea_modal, run_fea_fatigue, run_fea_frequency_response, run_fea_thermal, run_fea_buckling, run_fea_contact, run_fea_convergence, sim_evidence_packet, verify_packet, polymesh_cli, run_cfd_flow, run_cfd_accurate, simulate_motion, sweep_envelope, steering_turning_radius, motion_fea_handoff_sweep, em_eigenmode, em_driven, em_timedomain, ecad_antenna_design, ecad_antenna_analyze, topology_capabilities, run_topology_optimization]
   phases: [sim]
 ---
 
 # Simulate
+
+## Motion evidence and cost — before calling
+
+For mechanism work, read **Mechanism proof** below. `ok:true` means the sweep
+completed, not that it is collision-free. Guard `ok:false` before accessing
+`trajectory`; refusals/timeouts need not contain it. Never fabricate missing frames.
+Print the existing result before rerunning slow work. A timed-out call marked
+`status:"still_running"` / `in_flight:true` is not cancelled: the identical call in
+the same run joins the original work rather than restarting it.
+
+Start with overlap checking (`min_clearance_mm=0`). Positive `min_clearance_mm`
+requests expensive exact pair distances, not a cheap tolerance adjustment; budget
+it deliberately after a short sweep. Baseline overlaps are findings, not automatically
+permitted joints. Any accepted overlap needs a separately justified interface.
+Read every computed frame: top-level `interference.detail` is **FIRST HIT ONLY**,
+never the union of all swept pairs. Finite sampled poses cannot prove continuous
+path clearance, and overlap-only checks cannot prove a positive minimum clearance.
 
 ## Execute
 
@@ -150,6 +167,12 @@ writes to the document, so Ask/Plan cannot run it.
    kept fluid. Conflicts refuse by name (`passive_conflict`, `boundary_in_keep_out`,
    `port_in_preserve`, `tie_passive_conflict`, `symmetry_domain_mismatch`,
    `volume_fraction_infeasible`). Fix the setup; do not loosen it.
+   For printed parts choose a `print_process` id from discovery (e.g. `"fdm_0.4"`), set
+   `build_plate:{"faces":["bottom"]}` to the actual bed face, and use a real print material
+   (e.g. `"pla"`). The preset fills only absent, offered topology keys; explicit values win.
+   The planar, lowest bed face supplies the build direction; alternatively set
+   `topology.build_direction`. Overhang control defaults to 45 degrees when only a penalty
+   is set. `min_member_mm` is a lower bound, not a guarantee of printable feature size.
 3. **Run.** `run_topology_optimization(study=..., background=True)` saves the study before
    solving and returns `job_id`, `study_id`, `run_id` and `artifact_dir`. Re-run a study the
    user built with `study_id=` (given keys overlay the stored study). The same name updates
@@ -170,10 +193,13 @@ writes to the document, so Ask/Plan cannot run it.
    geometry is valid) from `artifact_dir`. `reanalysis.vtu` has a point field
    `von_mises[@case]` (MPa). To animate it, use
    `render_animation(kind='fea', vtu_path=..., field='von_mises@<case>')`.
-6. **Print gate.** `print_ready` stays false. DFAM on the surface is evidence, not
-   readiness, and nothing is sliced automatically. For a print claim, run
-   `slice_part(path=<surface.stl>, printer=<the user's printer>)` and quote its
-   `gcode_check`/`print_ready`.
+6. **Print workflow.** Read `result.manufacturing.dfam` for the chosen process, walls and
+   overhang findings; `print_ready` stays false until slicing. Use the preferred validated
+   print surface in `print_handoff`, and call
+   `slice_part(printer=<the user's printer>, **print_handoff["slice_part"])`, preserving its
+   reported design direction (an `"assumed"` source is not measured). Quote the slicer's
+   `gcode_check`/`print_ready`. Continue in CAD via
+   `import_part(**print_handoff["import_part"])`; the original study/history remains editable.
 
 Limits to state: flow/cht are steady Stokes-Brinkman (MINI). They refuse
 `flow_regime_invalid` when the prescribed-inlet Re exceeds 1 or the solved velocity bound
@@ -192,19 +218,32 @@ evidence for PASS and the proxy/backend/linear-model limits for every verdict.
 
 ## Mechanism proof (kinematics)
 
-A moving assembly is proven by the sweep, never by one pose. Read every
-`trajectory` frame's `collision_detail` (stable `component_a`/`component_b` and
-`overlap_volume_mm3`, plus unsafe clearance pairs), not only
-`interference.first_collision_step`/`first_collision_value`. A sampled-clear claim
-requires `check_interference=True`, `interference.complete:true`, every computed
-sample checked, and no collision/clearance hits. Null `interference`, failed pose
-checks, missing geometry or pair failures mean incomplete, not clear. Report ranges,
-sample count and minimum clearance; finite samples do not prove continuous clearance.
+Check the actual requested assembly/revision and each joint's range. For every
+computed `trajectory` frame inspect `converged`, `max_residual`, `worst_mate`,
+`tolerance`, `dof`, `residual_dof`, `pose_check` and `bodies` (component/name/world
+transform). Inspect `collision_detail` and `collisions`: stable `component_a` /
+`component_b`, `overlap_volume_mm3` for overlaps, or `distance` (mm) and warning for
+below-minimum-clearance pairs. `collisions` also includes clearance hits, with
+zero overlap volume; zero volume does not mean clear.
 
-- **Envelope:** `sweep_envelope(mate_id, start, stop, steps, components)` unions each
-  component's 8 transformed bbox corners over the sweep — the clearance number. Its
-  `fuse=True` mode builds the real swept solid (one `transform` copy per step fused into
-  `<component>_sweep`) and returns its volume/bbox; use it when a bbox over-reports.
+Frame `interference` is true for known hits, false only for a complete clear check,
+and null when unchecked or incomplete without a known hit. Read
+`interference_complete`, `pairs_checked`, `pairs_reused`, `pair_failures` and
+`geometry_failures` (check fields exist before using them on unchecked frames).
+Reused pairs retain exact results for unchanged relative poses; they are not skipped
+evidence. Known hits survive incomplete checks. A sampled-clear claim requires
+`check_interference=True`, top-level `interference.complete:true`,
+`frames_checked == steps`, all computed frames converged/pose-valid and no hits.
+Failed poses, missing geometry or pair failures are incomplete, never clear.
+`loop=True` appends a playback copy, not another computed check. Report ranges,
+sample count, clearance threshold and all findings; do not report a measured global
+minimum distance from a sweep that only checked overlaps or threshold violations.
+
+- **Envelope:** `sweep_envelope(mate_id, start, stop, steps, components)` bounds each
+  component's 8 transformed bbox corners at sampled poses, not a measured clearance.
+  `fuse=True` unions real placed solids (one `transform` copy per step fused into
+  `<component>_sweep`) and returns volume/bbox when a bbox over-reports. Both are
+  sampled envelopes, not a continuous swept-volume proof.
 - **No dimensional mate to drive:** a steering assembly poses its uprights with
   concentric/coincident mates about measured kingpin axes and owns no angle/distance
   mate, so `simulate_motion` has nothing to sweep. `sweep_envelope` and

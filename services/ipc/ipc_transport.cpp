@@ -229,6 +229,42 @@ bool IpcListener::listen(const std::string& path, std::string& err) {
     return true;
 }
 
+bool IpcListener::adoptListeningFd(int fd, std::string& err) {
+    close();
+    if (fd < 0) {
+        err = "invalid inherited listener fd";
+        return false;
+    }
+    fd_ = fd;  // close() owns cleanup on every failure; path_ stays empty.
+    sockaddr_storage address{};
+    socklen_t length = sizeof address;
+    int type = 0, accepting = 0;
+    socklen_t optionLength = sizeof type;
+    if (::getsockname(fd_, reinterpret_cast<sockaddr*>(&address), &length) != 0 ||
+        address.ss_family != AF_UNIX ||
+        ::getsockopt(fd_, SOL_SOCKET, SO_TYPE, &type, &optionLength) != 0 ||
+        type != SOCK_STREAM) {
+        err = "inherited listener must be an AF_UNIX stream socket";
+        close();
+        return false;
+    }
+    optionLength = sizeof accepting;
+    if (::getsockopt(fd_, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &optionLength) != 0 ||
+        !accepting) {
+        err = "inherited socket is not listening";
+        close();
+        return false;
+    }
+    const int flags = ::fcntl(fd_, F_GETFD);
+    if (flags < 0 || ::fcntl(fd_, F_SETFD, flags | FD_CLOEXEC) != 0) {
+        err = std::string("inherited listener CLOEXEC: ") + std::strerror(errno);
+        close();
+        return false;
+    }
+    err.clear();
+    return true;
+}
+
 IpcConn IpcListener::accept(int timeoutMs) {
     if (fd_ < 0) return IpcConn();
     struct pollfd pfd{fd_, POLLIN, 0};

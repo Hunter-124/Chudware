@@ -14,6 +14,8 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from typing import Any
 
+from services.agent import tool_images
+
 _MAX_DELTA = 16 * 1024
 _MAX_DETAIL = 4096
 _MAX_PREVIEW = 2048
@@ -21,6 +23,7 @@ _MAX_LABEL = 240
 _MAX_CALLS = 512
 _MAX_TERMINALS = 4096
 _MAX_TOOL_CONTENT = 64 * 1024
+_MAX_ARTIFACTS = 8
 
 
 class RpcFrameState:
@@ -637,10 +640,10 @@ def _tool_end(
         executed = _bool(failure, "executed")
     if executed is not None:
         payload["executed"] = executed
+    bounded: list[dict[str, str]] = []
     artifacts = data.get("artifacts")
     if isinstance(artifacts, list):
-        bounded = []
-        for item in artifacts[:8]:
+        for item in artifacts[:_MAX_ARTIFACTS]:
             if not isinstance(item, Mapping):
                 continue
             path = _str(item, "path", limit=_MAX_PREVIEW)
@@ -653,8 +656,33 @@ def _tool_end(
                     "kind": kind if kind in {"image", "mesh", "file"} else "file",
                 }
             )
-        if bounded:
-            payload["artifacts"] = bounded
+    # Visual evidence the tool returned to the model (renders, section/clash
+    # views) rides as path references, never inline bytes; failed geometry
+    # checks carry diagnostic images too.
+    evidence = cad_result_payload(result)
+    images = tool_images.image_refs(evidence) if evidence is not None else []
+    seen = {item["path"] for item in bounded}
+    took_image = False
+    for ref in images:
+        path = ref.get("path")
+        if not isinstance(path, str) or not path.strip():
+            continue
+        path = _cap(path, _MAX_PREVIEW)
+        if path in seen:
+            took_image = took_image or any(
+                item["path"] == path and item["kind"] == "image" for item in bounded
+            )
+            continue
+        if len(bounded) >= _MAX_ARTIFACTS:
+            break
+        seen.add(path)
+        bounded.append({"path": path, "kind": "image"})
+        took_image = True
+    if bounded:
+        payload["artifacts"] = bounded
+    caption = evidence.get("caption") if took_image and evidence is not None else None
+    if isinstance(caption, str) and caption.strip():
+        payload["image_caption"] = _cap(caption.strip(), _MAX_PREVIEW)
     usage = data.get("usage")
     if isinstance(usage, Mapping):
         payload["usage"] = {
@@ -753,6 +781,9 @@ def _subrun(
     )
     purpose = purpose or _str(data, "role", limit=120) or default_purpose
     payload: dict[str, Any] = {"purpose": purpose, "status": status}
+    name = _str(data, "name", limit=160)
+    if link.get("subagent_id") and name:
+        payload["name"] = name
     parent_stage = _str(
         data, "parentStage", "parent_stage", "parentId", "parent_id", limit=120
     )
@@ -1113,13 +1144,16 @@ def _subagent_frame(
         return None
     parent = _str(body, "parentToolCallId", "parent_tool_call_id", limit=160)
     if state is not None:
+        parent = parent or state.subagent_parent(subagent_id)
         state.remember_subagent(subagent_id, parent)
     raw_status = _name(_str(body, "status"))
+    # The id IS the spawner-assigned task name (`tasks[].name`, `Parent.Child` when
+    # nested); `agent` is only the definition type ("task", "scout") and
+    # `description` a late tiny-model label, so neither may stand in for the name.
+    description = _str(body, "description", limit=240)
     work: dict[str, Any] = {
         "subagent_id": subagent_id,
-        "purpose": _str(body, "description", limit=240)
-        or _str(body, "agent", limit=120)
-        or "Subagent",
+        "purpose": description or subagent_id,
     }
     if parent:
         work["parent_tool_call_id"] = parent
@@ -1129,7 +1163,14 @@ def _subagent_frame(
     detail = "aborted" if raw_status == "aborted" else _str(body, "lastIntent")
     if detail:
         work["detail"] = detail
-    return [_subrun(work, ctx, kind, _SUBAGENT_STATUS.get(raw_status, "running"))]
+    event, row = _subrun(work, ctx, kind, _SUBAGENT_STATUS.get(raw_status, "running"))
+    row["name"] = subagent_id
+    agent_type = _str(body, "agent", limit=120)
+    if agent_type:
+        row["agent_type"] = agent_type
+    if description:
+        row["description"] = description
+    return [(event, row)]
 
 
 
@@ -1298,7 +1339,17 @@ def map_rpc_frame(
         reply = _str(data, "reply", limit=_MAX_DETAIL)
         if reply:
             payload["reply"] = reply
-        return [("agent.answer", payload)]
+        events = [("agent.answer", payload)]
+        steer_id = _str(data, "steer_id", "steerId", limit=128)
+        if payload["source"] == "reply" and steer_id:
+            events.append(("agent.steer", _linked(link, steer_id=steer_id, status="delivered")))
+        return events
+    if event == "agent_steer":
+        steer_id = _str(data, "steer_id", "steerId", limit=128)
+        status = _str(data, "status", limit=32)
+        if not steer_id or status not in {"delivered", "carried"}:
+            return []
+        return [("agent.steer", _linked(link, steer_id=steer_id, status=status))]
 
     deltas = {
         "assistant_delta",
@@ -1678,13 +1729,16 @@ def map_rpc_frame(
         )
         payload = {
             "subagent_id": subagent,
-            "role": _str(data, "role", "name", limit=120) or "worker",
+            "role": _str(data, "role", "agent", limit=120) or "worker",
             "spawn_kind": _str(data, "spawnKind", "spawn_kind", limit=80) or "worker",
             "brief": _str(data, "brief", "task", "purpose", limit=120),
             "budget_tokens": _int(
                 data, "budgetTokens", "budget_tokens", "tokenBudget", "token_budget"
             ),
         }
+        name = _str(data, "name", "title", limit=160)
+        if name:
+            payload["name"] = name
         return [("agent.spawn", _linked(link, **payload))]
     if event in {"subagent_start", "subagent_started"}:
         return [_subrun(data, ctx, event, "running")]

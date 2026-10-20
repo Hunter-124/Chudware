@@ -107,6 +107,68 @@ double point_to_shape_dist(double px, double py, const Shape& s) {
     return std::max(d - s.margin, 0.0);
 }
 
+struct CellRange {
+    int begin, end;  // half-open
+};
+
+// Search the actual cell centres instead of converting world coordinates to int:
+// distant/huge bounds cannot overflow a cast, and negative origins or rounding
+// of min + (i + 0.5) * res do not move a boundary cell out of the range.
+CellRange cell_range(const std::vector<double>& centres, double lo, double hi, double res) {
+    const CellRange all{0, static_cast<int>(centres.size())};
+    if (!std::isfinite(lo) || !std::isfinite(hi) || lo > hi || !std::isfinite(res))
+        return all;
+    // One cell plus an arithmetic guard keeps this a broad phase only. The
+    // latter also covers segment projection's ax + t * (bx - ax) cancellation.
+    const double guard = res + 8.0 * std::numeric_limits<double>::epsilon() *
+                                   std::max(std::abs(lo), std::abs(hi));
+    lo = std::nextafter(lo - guard, -std::numeric_limits<double>::infinity());
+    hi = std::nextafter(hi + guard, std::numeric_limits<double>::infinity());
+    if (!std::isfinite(lo) || !std::isfinite(hi)) return all;
+    return {static_cast<int>(std::lower_bound(centres.begin(), centres.end(), lo) - centres.begin()),
+            static_cast<int>(std::upper_bound(centres.begin(), centres.end(), hi) - centres.begin())};
+}
+
+struct CellRect {
+    CellRange rows, cols;
+};
+
+CellRect clearance_cells(const Shape& s, double req, const std::vector<double>& cx,
+                         const std::vector<double>& cy, double res) {
+    const CellRect all{{0, static_cast<int>(cy.size())}, {0, static_cast<int>(cx.size())}};
+    if (!std::isfinite(req)) return all;
+    double x0, y0, x1, y1;
+    if (s.kind == "circle" || s.kind == "box") {
+        if (!std::isfinite(s.center.first) || !std::isfinite(s.center.second)) return all;
+        double hx, hy;
+        if (s.kind == "circle") {
+            if (!std::isfinite(s.margin)) return all;
+            hx = hy = std::max(s.margin, 0.0);
+        } else {
+            if (!std::isfinite(s.half.first) || !std::isfinite(s.half.second)) return all;
+            hx = std::max(s.half.first, 0.0);
+            hy = std::max(s.half.second, 0.0);
+        }
+        x0 = s.center.first - hx;
+        x1 = s.center.first + hx;
+        y0 = s.center.second - hy;
+        y1 = s.center.second + hy;
+    } else {
+        if (!std::isfinite(s.p1.first) || !std::isfinite(s.p1.second) ||
+            !std::isfinite(s.p2.first) || !std::isfinite(s.p2.second) ||
+            !std::isfinite(s.margin))
+            return all;
+        const double radius = std::max(s.margin, 0.0);
+        x0 = std::min(s.p1.first, s.p2.first) - radius;
+        x1 = std::max(s.p1.first, s.p2.first) + radius;
+        y0 = std::min(s.p1.second, s.p2.second) - radius;
+        y1 = std::max(s.p1.second, s.p2.second) + radius;
+    }
+    const double clearance = std::max(req, 0.0);
+    return {cell_range(cy, y0 - clearance, y1 + clearance, res),
+            cell_range(cx, x0 - clearance, x1 + clearance, res)};
+}
+
 json net_class_of(const json& board, const json& net) {
     if (board.contains("nets") && board["nets"].is_array()) {
         for (const auto& n : board["nets"]) {
@@ -332,8 +394,8 @@ std::vector<Point> simplify_collinear(const std::vector<Point>& loop) {
 bool boundary_loops(const std::vector<std::vector<bool>>& comp, int ny, int nx,
                     std::vector<Point>& outer, std::vector<std::vector<Point>>& holes) {
     // Adjacency: ordered list of out-edges per vertex; pop() is LIFO (matches Python list.pop()).
-    std::map<Point, std::vector<Point>> edges;
-    auto add_edge = [&](const Point& p, const Point& q) { edges[p].push_back(q); };
+    std::map<Point, std::vector<Point>> adj;
+    auto add_edge = [&](const Point& p, const Point& q) { adj[p].push_back(q); };
     for (int r = 0; r < ny; ++r) {
         for (int c = 0; c < nx; ++c) {
             if (!comp[r][c]) continue;
@@ -369,22 +431,25 @@ bool boundary_loops(const std::vector<std::vector<bool>>& comp, int ny, int nx,
                 note(tl, c == 0 || !comp[r][c - 1]);
             }
     }
-    std::map<Point, std::vector<Point>> adj = edges;
     long total = 0;
     for (auto& kv : adj) total += (long)kv.second.size();
     long used = 0;
     std::vector<std::vector<Point>> loops;
+    size_t start_index = 0;
     while (used < total) {
-        // find first key (insertion order) with an outgoing edge.
+        // Exhausted keys never regain edges. Retain the insertion-order frontier
+        // instead of rescanning every earlier contour for each new loop.
         Point start;
         bool found = false;
-        for (const Point& k : key_order) {
+        while (start_index < key_order.size()) {
+            const Point& k = key_order[start_index];
             auto it = adj.find(k);
             if (it != adj.end() && !it->second.empty()) {
                 start = k;
                 found = true;
                 break;
             }
+            ++start_index;
         }
         if (!found) break;
         std::vector<Point> loop{start};
@@ -586,16 +651,25 @@ json fill_zone(const json& board, const json& zone, double resolution) {
     for (const auto& s : shapes) {
         if (same_net(s.net, net)) continue;
         double req = std::max(base_clear, pair_clearance(board, net, s.net));
-        for (int r = 0; r < ny; ++r)
-            for (int c = 0; c < nx; ++c)
+        const CellRect cells = clearance_cells(s, req, cx, cy, res);
+        for (int r = cells.rows.begin; r < cells.rows.end; ++r)
+            for (int c = cells.cols.begin; c < cells.cols.end; ++c)
                 if (mask[r][c] && point_to_shape_dist(cx[c], cy[r], s) < req) mask[r][c] = false;
     }
 
     // 4) thermal relief
     auto tpads = thermal_pads(board, zone, layer, net);
     for (const auto& tp : tpads) {
-        for (int r = 0; r < ny; ++r)
-            for (int c = 0; c < nx; ++c)
+        CellRect cells{{0, ny}, {0, nx}};
+        // A nonfinite coordinate can make hypot NaN, for which voids() need
+        // not reject points outside r_gap. Preserve that predicate's behavior.
+        if (std::isfinite(tp.cx) && std::isfinite(tp.cy) && std::isfinite(tp.r_copper) &&
+            std::isfinite(tp.r_gap) && std::isfinite(tp.spoke_half)) {
+            cells = {cell_range(cy, tp.cy - tp.r_gap, tp.cy + tp.r_gap, res),
+                     cell_range(cx, tp.cx - tp.r_gap, tp.cx + tp.r_gap, res)};
+        }
+        for (int r = cells.rows.begin; r < cells.rows.end; ++r)
+            for (int c = cells.cols.begin; c < cells.cols.end; ++c)
                 if (mask[r][c] && tp.voids(cx[c], cy[r])) mask[r][c] = false;
     }
 

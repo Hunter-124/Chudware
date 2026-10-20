@@ -132,9 +132,9 @@ def _equation_cycle(globals_: list[dict]) -> Optional[tuple[str, str]]:
 
 @dataclass
 class Failure:
-    """One structural reason a document will not rebuild, with the vocabulary a fix needs."""
+    """One structural or native rebuild failure, with the vocabulary a fix needs."""
     kind: str                       # dangling_ref | bad_selector | suppressed_parent |
-                                    # param_out_of_range | circular_equation
+                                    # param_out_of_range | circular_equation | native_rebuild
     feature: Optional[str]          # feature id involved (None for equation cycles)
     detail: str                     # human-readable, prompt-ready
     options: dict[str, Any] = field(default_factory=dict)  # valid ids/kinds to choose from
@@ -146,9 +146,9 @@ class Failure:
 def detect_failures(document: dict) -> list[Failure]:
     """Derive the structural rebuild-failure signal from the document alone.
 
-    This is the OFFLINE failure signal; the live flow additionally has the engine's real
-    feature_status error, which is passed alongside as free-text context. Deterministic and
-    label-free so the bench stays honest.
+    This is the OFFLINE failure signal. ``diagnostic_failures`` adds the live engine's
+    feature_status evidence without claiming to infer geometry failures structurally.
+    Deterministic and label-free so the bench stays honest.
     """
     fids = _feature_ids(document)
     valid_ids = sorted(fids)
@@ -208,6 +208,24 @@ def detect_failures(document: dict) -> list[Failure]:
                     options={"value": v},
                 ))
     return out
+
+
+def diagnostic_failures(document: dict) -> list[Failure]:
+    """Keep native feature failures alongside the offline structural findings."""
+    failures = detect_failures(document)
+    features = {f.get("id"): f for f in _features(document)}
+    for status in (document.get("rebuild") or {}).get("feature_status", []):
+        if status.get("ok", True):
+            continue
+        fid = status.get("id")
+        feature = features.get(fid, {})
+        failures.append(Failure(
+            kind="native_rebuild", feature=fid,
+            detail=str(status.get("error") or "engine reported feature rebuild failure"),
+            options={"name": feature.get("name"), "type": feature.get("type"),
+                     "params": feature.get("params", {}), "refs": feature.get("refs", {})},
+        ))
+    return failures
 
 
 # ---------------------------------------------------------------------------
@@ -361,8 +379,9 @@ def build_diagnosis_prompt(document: dict, failures: list[Failure],
                            engine_error: Optional[str] = None) -> str:
     tree = _tree(document)
     feature_summary = [
-        {"id": f.get("id"), "type": f.get("type"), "suppressed": bool(f.get("suppressed")),
-         "refs": sorted(f.get("refs", {}).keys())}
+        {"id": f.get("id"), "name": f.get("name"), "type": f.get("type"),
+         "suppressed": bool(f.get("suppressed")),
+         "params": f.get("params", {}), "refs": f.get("refs", {})}
         for f in tree.get("features", [])
     ]
     payload = {
@@ -433,7 +452,7 @@ def diagnose(document: dict, provider: Provider, *,
     call is skipped silently.  Council results are attached to the returned Diagnosis as
     ``council_record`` (None if skipped).
     """
-    failures = detect_failures(document)
+    failures = diagnostic_failures(document)
     prompt = build_diagnosis_prompt(document, failures, engine_error=engine_error)
 
     # Capture the logged IP-18 ai_artifact's id/run_id so a downstream accept/reject action

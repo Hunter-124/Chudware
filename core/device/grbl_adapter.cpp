@@ -9,6 +9,9 @@ namespace chudware::device {
 namespace {
 
 constexpr std::uint64_t kFiveHzIntervalNs = 200'000'000;
+// Leave a small receive window within the 200 ms status cadence. Socket transports
+// enforce the deadline before recv; an already-expired poll cannot consume a banner.
+constexpr auto kServicePollBudget = std::chrono::milliseconds(5);
 
 ControllerSnapshot priorOrDefault(const mfg::FreshValue<ControllerSnapshot>& value) {
     if (value.state == mfg::FreshState::Ok && value.v) return *value.v;
@@ -104,7 +107,8 @@ void GrblAdapter::service(Seq journal_seq) {
                             : now + config_.poll_interval_ns;
     }
 
-    const PollResult result = transport_.poll(std::chrono::steady_clock::now());
+    const PollResult result =
+        transport_.poll(std::chrono::steady_clock::now() + kServicePollBudget);
     for (const auto& event : result.events) {
         processEvent(event, journal_seq);
         if (!open_) break;

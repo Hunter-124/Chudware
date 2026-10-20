@@ -19,6 +19,7 @@
 
 #include "../../services/worker/cpp_core.h"
 #include "hostd_log.h"
+#include "../../services/ipc/ipc_private.h"
 
 #include <miniz.h>
 
@@ -95,6 +96,11 @@ static long long fileMtimeMs(const fs::path& p) {
 }
 
 void Autosave::start(const std::string& baseDir, const std::atomic<int>* engineState) {
+    if (!chudware_ipc::privateDir(baseDir)) {
+        log().line("autosave: refusing non-private state directory");
+        recoveryDone_ = true;
+        return;
+    }
     baseDir_ = baseDir;
     orphanDir_ = baseDir_ + "/orphaned";
     engineState_ = engineState;
@@ -159,7 +165,7 @@ void Autosave::loop() {
 
 void Autosave::recoverPriorSession() {
     std::error_code ec;
-    fs::create_directories(baseDir_, ec);
+    if (!chudware_ipc::privateDir(baseDir_)) return;
 
     // Session dir names are zero-padded start-ms, so lexical max = most recent.
     // The orphan tier lives beside the session dirs and is never auto-opened.
@@ -182,7 +188,7 @@ void Autosave::recoverPriorSession() {
     // register each into the orphan tier so a client restores it deliberately via
     // recovery_list -> recovery_open (GUI "Recover?" prompt / recover_parts tool).
     const std::string dir = baseDir_ + "/" + latest;
-    fs::create_directories(orphanDir_, ec);
+    if (!chudware_ipc::privateDir(orphanDir_)) return;
     const long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
                                 .count();
@@ -218,20 +224,18 @@ void Autosave::recoverPriorSession() {
         char stem[128];
         std::snprintf(stem, sizeof stem, "%015lld-%s", nowMs, oldId.c_str());
         std::lock_guard<std::mutex> lk(orphanMtx_);
-        fs::copy_file(e.path(), orphanDir_ + "/" + stem + ".step+",
-                      fs::copy_options::overwrite_existing, ec);
-        if (ec) {
-            log().line("crash recovery: copy %s -> orphan failed: %s", oldId.c_str(),
-                       ec.message().c_str());
-            ec.clear();
+        if (!chudware_ipc::privateCopy(e.path().string(), orphanDir_ + "/" + stem + ".step+")) {
+            log().line("crash recovery: private copy %s -> orphan failed", oldId.c_str());
             continue;
         }
-        std::ofstream meta(orphanDir_ + "/" + stem + ".json", std::ios::trunc);
-        meta << json{{"doc_id", oldId},
-                     {"name", name},
-                     {"retired_ms", nowMs},
-                     {"from_crash", true}}
-                    .dump();
+        if (!chudware_ipc::privateWrite(orphanDir_ + "/" + stem + ".json",
+                    json{{"doc_id", oldId},
+                         {"name", name},
+                         {"retired_ms", nowMs},
+                         {"from_crash", true}}.dump())) {
+            fs::remove(orphanDir_ + "/" + stem + ".step+", ec);
+            continue;
+        }
         ++recovered;
     }
     fs::remove_all(dir, ec);  // consumed into the orphan tier
@@ -275,7 +279,10 @@ void Autosave::saveDirtyDocs() {
             if (it != lastSavedRev_.end() && rev >= 0 && it->second == rev)
                 continue;  // unchanged since last autosave — skip the full serialize
         }
-        fs::create_directories(sessionDir_, ec);
+        if (!chudware_ipc::privateDir(sessionDir_)) {
+            log().line("autosave: cannot create private session directory");
+            return;
+        }
         json result;
         const std::string path = sessionDir_ + "/" + id + ".step+";
         if (core::cpp_core().call("doc_save",
@@ -288,8 +295,9 @@ void Autosave::saveDirtyDocs() {
             // Name sidecar: crash recovery registers this .step+ into the orphan
             // tier WITHOUT opening it, so the human-readable name has to travel
             // beside the file (the .step+ stem is the doc_id).
-            std::ofstream meta(sessionDir_ + "/" + id + ".json", std::ios::trunc);
-            meta << json{{"name", d.value("name", id)}}.dump();
+            if (!chudware_ipc::privateWrite(sessionDir_ + "/" + id + ".json",
+                    json{{"name", d.value("name", id)}}.dump()))
+                log().line("autosave: private name sidecar write failed for %s", id.c_str());
         } else {
             log().line("autosave: doc_save(%s) failed: %s", id.c_str(), err.c_str());
         }
@@ -362,7 +370,7 @@ bool Autosave::retireDoc(const std::string& docId, const std::string& name) {
         }
     }
     std::error_code ec;
-    fs::create_directories(orphanDir_, ec);
+    if (!chudware_ipc::privateDir(orphanDir_)) return false;
     const long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
                                 .count();
@@ -380,8 +388,11 @@ bool Autosave::retireDoc(const std::string& docId, const std::string& name) {
     }
     {
         std::lock_guard<std::mutex> lk(orphanMtx_);
-        std::ofstream meta(base + ".json", std::ios::trunc);
-        meta << json{{"doc_id", docId}, {"name", name}, {"retired_ms", nowMs}}.dump();
+        if (!chudware_ipc::privateWrite(base + ".json",
+                json{{"doc_id", docId}, {"name", name}, {"retired_ms", nowMs}}.dump())) {
+            fs::remove(base + ".step+", ec);
+            return false;
+        }
     }
     fs::remove(sessionDir_ + "/" + docId + ".step+", ec);  // session copy is now redundant
     fs::remove(sessionDir_ + "/" + docId + ".json", ec);    // name sidecar

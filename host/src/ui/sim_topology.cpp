@@ -598,7 +598,8 @@ const std::vector<std::string> &scalarKeys() {
 // --------------------------------------------------------------------------------
 
 std::vector<Issue> validateTopology(const json &topology,
-                                    const Capabilities &caps) {
+                                    const Capabilities &caps,
+                                    const json &study) {
   std::vector<Issue> issues;
   auto block = [&](std::string key, std::string msg) {
     issues.push_back({std::move(key), Severity::Blocking, std::move(msg)});
@@ -645,6 +646,12 @@ std::vector<Issue> validateTopology(const json &topology,
     block("objective", objectiveLabel(objective, physics) +
                            " is not offered for " + pair + ".");
 
+  if (combo && combo->offersKey("volume_fraction") &&
+      !topology.contains("volume_fraction"))
+    block("volume_fraction", "Set the " +
+          (combo->volumePhase.empty() ? volumePhaseFor(physics) : combo->volumePhase) +
+          " volume fraction (Goal).");
+
   for (const KeySpec &s : kSpecs) {
     const auto it = topology.find(s.key);
     if (it == topology.end())
@@ -672,16 +679,15 @@ std::vector<Issue> validateTopology(const json &topology,
       block("objective",
             "Mass minimization needs at least one response limit.");
   }
-  const bool hasDir = topology.contains("build_direction");
+  const json &plateFaces = member(member(study, "build_plate"), "faces");
+  const bool hasDir = topology.contains("build_direction") ||
+                      (plateFaces.is_array() && !plateFaces.empty());
   if (topology.contains("overhang_angle_deg") && !hasDir)
-    block("build_direction", "Overhang control needs a build direction.");
+    block("build_direction", "Overhang control needs a build direction or a bed face.");
   const double pen = num(topology, "overhang_penalty");
   if (std::isfinite(pen) && pen > 0.0) {
     if (!hasDir)
-      block("build_direction", "Overhang control needs a build direction.");
-    if (!topology.contains("overhang_angle_deg"))
-      block("overhang_angle_deg",
-            "An overhang penalty needs an overhang limit angle.");
+      block("build_direction", "Overhang control needs a build direction or a bed face.");
   }
   // De-duplicate identical messages (the build-direction rule can fire twice).
   std::vector<Issue> unique;
@@ -712,6 +718,58 @@ json newTopologyConfig(const Capabilities &caps, const std::string &physics) {
                 {"objective", c->objectives.front()}};
   }
   return json::object();
+}
+
+bool applyPrintProcess(json &study, const json &preset, const Capabilities &caps) {
+  if (!study.is_object() || !preset.is_object() || str(preset, "id").empty() ||
+      !member(preset, "topology").is_object())
+    return false;
+  const auto settings = study.find("topology");
+  if (settings == study.end() || !settings->is_object())
+    return false;
+  json &topo = *settings;
+  const Combination *pair = caps.find(str(topo, "method"), str(topo, "physics"));
+  if (!pair || !pair->supported)
+    return false;
+  for (const auto &[key, value] : preset["topology"].items()) {
+    if (!pair->offersKey(key))
+      continue;
+    if (value.is_null())
+      topo.erase(key);
+    else
+      topo[key] = value;
+  }
+  study["print_process"] = preset["id"];
+  return true;
+}
+
+bool mergeDfamResult(json &run, const json &reply, const std::string &error) {
+  if (!run.is_object() || !member(run, "result").is_object())
+    return false;
+  json &mfg = run["result"]["manufacturing"];
+  if (!mfg.is_object() || boolTrue(member(mfg, "dfam"), "checked"))
+    return false;
+  const json &dfam = member(reply, "dfam");
+  if (error.empty() && boolTrue(reply, "ok") && boolTrue(dfam, "checked")) {
+    mfg["dfam"] = dfam;
+    mfg["print_ready_reason"] = str(reply, "print_ready_reason");
+  } else {
+    std::string why = error.empty() ? str(reply, "error") : error;
+    if (why.empty())
+      why = "the worker returned no checked result";
+    mfg["dfam"] = {{"checked", false}, {"passed", false}, {"status", "unavailable"},
+                   {"error", why}};
+    mfg["print_ready_reason"] = "DFAM check could not run: " + why;
+  }
+  mfg["print_ready"] = false;
+  return true;
+}
+
+std::string surfaceArtifactKey(const json &result) {
+  const json &surface = member(member(result, "artifacts"), "surface_print_stl");
+  return !str(surface, "path").empty() && !boolTrue(surface, "missing") &&
+                 !boolTrue(surface, "stale")
+             ? "surface_print_stl" : "surface_stl";
 }
 
 SwitchResult selectCombination(json &topology, const Capabilities &caps,
@@ -1077,6 +1135,10 @@ ManufacturingReport manufacturingReport(const json &result,
   else if (!rep.geometryValidated)
     rep.printReadyReason =
         "The result surface was not validated as a closed, manifold solid.";
+  else if (!str(dfam, "error").empty())
+    rep.printReadyReason = "DFAM check could not run: " + str(dfam, "error");
+  else if (!str(mfg, "print_ready_reason").empty())
+    rep.printReadyReason = str(mfg, "print_ready_reason");
   else if (!rep.dfamChecked)
     rep.printReadyReason =
         "DFAM checks were not run on the result geometry; the optimizer "
@@ -1387,10 +1449,14 @@ bool numberField(const KeySpec &s, json &topo, const Combination &c,
   const auto it = topo.find(s.key);
   bool present = it != topo.end() && it->is_number();
   kit::FieldOpts o;
-  const std::string tip = std::string(s.tip) + " Leave empty to use the " +
-                          (hint == "Auto" ? std::string("solver's default.")
-                                          : "default (" + hint + ").");
-  o.withTip(tip.c_str()).withHint(hint.c_str()).withPresent(&present);
+  const bool required = std::strcmp(s.key, "volume_fraction") == 0;
+  const std::string tip = std::string(s.tip) +
+      (required ? " Set the volume budget before running."
+                : " Leave empty to use the " +
+                  (hint == "Auto" ? std::string("solver's default.")
+                                  : "default (" + hint + ")."));
+  o.withTip(tip.c_str()).withHint(hint.c_str()).withPresent(&present)
+      .withRequired(required);
   if (!unit.empty())
     o.withUnit(unit.c_str());
   withFieldIssue(o, fi);
@@ -1607,14 +1673,18 @@ bool drawGroup(Group g, const char *id, const char *title, json &topo,
                const Combination &c, const std::string &physics,
                const DisplayUnits &du, SettingsView &view,
                const std::vector<Issue> &issues, const char *emptyNote,
-               const char *note = nullptr) {
+               const char *note, const json &study,
+               const std::function<void()> &additiveControls) {
   const bool any = groupOffered(g, c);
-  if (!any && !emptyNote)
+  const bool additive = g == Group::Additive && bool(additiveControls);
+  if (!any && !emptyNote && !additive)
     return false;
   kit::gapRow();
   bool committed = false;
   if (kit::cardBegin(id, title)) {
-    if (!any) {
+    if (additive)
+      additiveControls();
+    if (!any && !additive) {
       kit::dimText(emptyNote);
     } else {
       std::string widest;
@@ -1631,9 +1701,21 @@ bool drawGroup(Group g, const char *id, const char *title, json &topo,
       }
       {
         kit::FieldGroup group("fields", widest.c_str());
-        for (const KeySpec &s : kSpecs)
-          if (s.group == g && c.offersKey(s.key))
+        for (const KeySpec &s : kSpecs) {
+          if (s.group != g || !c.offersKey(s.key))
+            continue;
+          const json &faces = member(member(study, "build_plate"), "faces");
+          if (std::strcmp(s.key, "build_direction") == 0 &&
+              faces.is_array() && !faces.empty()) {
+            static const char *const labels[] = {"From bed face"};
+            int selected = 0;
+            kit::fieldEnum(s.key, s.label, &selected, labels, 1,
+                           kit::FieldOpts().withEnumStyle(kit::EnumStyle::Combo)
+                               .withDisabled(true, "Clear the bed face to set a direction."));
+          } else {
             committed |= drawSpec(s, topo, c, physics, du, view, issues);
+          }
+        }
       }
       if (note)
         kit::dimText(note);
@@ -1883,7 +1965,9 @@ bool axisToggles(bool on[3], const char *const *tips) {
 
 bool drawTopologySettings(AppState &st, json &topology,
                           const Capabilities &caps, SettingsView &view,
-                          const char *lockedReason, unsigned groups) {
+                          const char *lockedReason, unsigned groups,
+                          const json &study,
+                          const std::function<void()> &additiveControls) {
   ImGui::PushID("topology_settings");
   const bool problem = (groups & kGroupProblem) != 0;
   const bool mfg = (groups & kGroupsManufacturing) != 0;
@@ -1928,7 +2012,7 @@ bool drawTopologySettings(AppState &st, json &topology,
   }
 
   const DisplayUnits du = displayUnits(st);
-  const std::vector<Issue> issues = validateTopology(topology, caps);
+  const std::vector<Issue> issues = validateTopology(topology, caps, study);
   // Window-relative top of the form: the manufacturing focus falls back to it
   // when the chosen pair offers no manufacturing groups.
   const float formTop = ImGui::GetCursorScreenPos().y - ImGui::GetWindowPos().y;
@@ -1951,9 +2035,14 @@ bool drawTopologySettings(AppState &st, json &topology,
     const std::string methodTitle = methodLabel(method, &caps) + " parameters";
     auto group = [&](Group g, const char *id, const char *title,
                      const char *emptyNote, const char *note = nullptr) {
-      if (groups & groupBit(g))
+      if (groups & groupBit(g)) {
+        if (g == Group::Additive && view.focusManufacturing) {
+          scrollCursorToTop();
+          view.focusManufacturing = false;
+        }
         committed |= drawGroup(g, id, title, topology, *combo, physics, du,
-                               view, issues, emptyNote, note);
+                               view, issues, emptyNote, note, study, additiveControls);
+      }
     };
     group(Group::Goal, "goal", "Goal", nullptr);
     group(Group::Limits, "limits", "Response limits", noLimits.c_str());
@@ -1961,14 +2050,10 @@ bool drawTopologySettings(AppState &st, json &topology,
     group(Group::Regularization, "filter", "Filter and projection", nullptr);
     group(Group::Method, "method_params", methodTitle.c_str(), nullptr);
     if (mfg) {
-      if (view.focusManufacturing) {
-        scrollCursorToTop();
-        view.focusManufacturing = false;
-      }
       const bool symmetry = (groups & kGroupSymmetry) &&
                             groupOffered(Group::Geometry, *combo);
       const bool additive = (groups & kGroupAdditive) &&
-                            groupOffered(Group::Additive, *combo);
+                            (groupOffered(Group::Additive, *combo) || additiveControls);
       group(Group::Geometry, "symmetry", "Symmetry and passive regions",
             nullptr);
       group(Group::Additive, "additive", "Additive manufacturing", nullptr,
@@ -1982,6 +2067,10 @@ bool drawTopologySettings(AppState &st, json &topology,
         if (kit::cardBegin("mfg_none", "Manufacturing"))
           kit::dimText(none.c_str());
         kit::cardEnd();
+      }
+      if (view.focusManufacturing) {
+        ImGui::SetScrollFromPosY(formTop, 0.0f);
+        view.focusManufacturing = false;
       }
     }
     committed |= orphanSection(topology, *combo, physics, groups);
@@ -2439,6 +2528,34 @@ void manufacturingSection(const json &result, const json &settings) {
                                  : kit::Tone::Err,
                 true, "Design-for-additive checks on the result geometry.");
   kit::chipFlowEnd();
+  const json &dfamChecks = member(member(member(result, "manufacturing"), "dfam"), "checks");
+  if (dfamChecks.is_array() && !dfamChecks.empty()) {
+    // Check | Status fits the side pane; the notes of failed and warned checks follow as
+    // wrapped lines (every note is also the row tooltip).
+    std::vector<kit::MetricRow> rows;
+    std::vector<std::pair<std::string, kit::Tone>> findings;
+    rows.reserve(dfamChecks.size());
+    for (const auto &check : dfamChecks) {
+      const std::string status = str(check, "status");
+      kit::MetricRow row;
+      row.metric = humanize(str(check, "check"));
+      const kit::Tone tone = status == "pass"   ? kit::Tone::Ok
+                             : status == "fail" ? kit::Tone::Err
+                             : status == "warn" ? kit::Tone::Warn
+                                                : kit::Tone::Neutral;
+      row.values = {{humanize(status), tone}};
+      const json &note = member(check, "note");
+      if (note.is_string()) {
+        row.tooltip = note.get_ref<const std::string &>().c_str();
+        if (status == "fail" || status == "warn")
+          findings.emplace_back(row.metric + ": " + note.get<std::string>(), tone);
+      }
+      rows.push_back(std::move(row));
+    }
+    kit::metricTable("dfam_checks", {"Status"}, rows, "DFAM check");
+    for (const auto &[text, tone] : findings)
+      kit::inlineStatus(text.c_str(), tone);
+  }
   if (!rep.rows.empty()) {
     std::vector<kit::MetricRow> rows;
     rows.reserve(rep.rows.size());
@@ -2663,7 +2780,19 @@ void artifactsSection(AppState &st, const json &result, const std::string &runId
   const json &arts = member(result, "artifacts");
   const bool geometryValid =
       boolTrue(member(result, "manufacturing"), "geometry_valid");
-  const json &surface = member(arts, "surface_stl");
+  const json &printSurface = member(member(result, "reconstruction"), "print_surface");
+  if (printSurface.is_object()) {
+    std::string evidence = humanize(str(printSurface, "state"));
+    const double iterations = num(printSurface, "iterations_used");
+    const double volumeChange = num(printSurface, "volume_change_fraction");
+    if (std::isfinite(iterations))
+      evidence += " \xc2\xb7 " + kit::fmtValue(iterations) + " smoothing iterations";
+    if (std::isfinite(volumeChange))
+      evidence += " \xc2\xb7 volume change " + kit::fmtValue(volumeChange * 100.0) + "%";
+    kit::keyValueRowId("print_surface", "Print surface", evidence.c_str());
+  }
+  const std::string surfaceKey = surfaceArtifactKey(result);
+  const json &surface = member(arts, surfaceKey.c_str());
   const char *cadBlocker =
       !geometryValid ? "This run's reconstructed surface did not pass geometry validation."
       : str(surface, "path").empty() ? "This run retained no solid surface."
@@ -2674,15 +2803,15 @@ void artifactsSection(AppState &st, const json &result, const std::string &runId
   if (kit::primaryButton("Continue in CAD", cadBlocker == nullptr, cadBlocker)) {
     act.kind = ResultsAction::Kind::ContinueInCad;
     act.runId = runId;
-    act.artifactKey = "surface_stl";
+    act.artifactKey = surfaceKey;
   }
   bool viewable = false;
   std::string viewReason = "This run retained no viewport overlay.";
   if (arts.is_object()) {
     const float exportW = buttonWidth("Export");
-    for (const auto &[key, a] : arts.items()) {
+    const auto drawArtifact = [&](const std::string &key, const json &a) {
       if (!a.is_object())
-        continue;
+        return;
       const std::string format = str(a, "format");
       const bool missing = boolTrue(a, "missing");
       const bool stale = boolTrue(a, "stale");
@@ -2692,9 +2821,10 @@ void artifactsSection(AppState &st, const json &result, const std::string &runId
           viewReason = "The viewport overlay file is missing.";
         if (stale)
           viewReason = "The viewport overlay changed since the run.";
-        continue; // a viewport handoff, not an export product
+        return; // a viewport handoff, not an export product
       }
-      std::string title = str(a, "label");
+      std::string title = key == "surface_print_stl"
+                              ? "Print surface (smoothed)" : str(a, "label");
       if (title.empty())
         title = humanize(key);
       std::string secondary = format;
@@ -2737,7 +2867,13 @@ void artifactsSection(AppState &st, const json &result, const std::string &runId
         act.runId = runId;
         act.artifactKey = key;
       }
-    }
+    };
+    const auto print = arts.find("surface_print_stl");
+    if (print != arts.end())
+      drawArtifact(print.key(), print.value());
+    for (const auto &[key, artifact] : arts.items())
+      if (key != "surface_print_stl")
+        drawArtifact(key, artifact);
   }
   if (!str(result, "overlay_aicm").empty())
     viewable = true;

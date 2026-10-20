@@ -3,11 +3,12 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
-#include <fstream>
 #include <regex>
 #include <vector>
 
+#include "firmware/private_storage.h"
 #include "firmware/templates.h"
+#include "firmware/project.h"
 
 namespace chudware::firmware {
 namespace {
@@ -72,7 +73,7 @@ nlohmann::json caps_table() {
         {"adc", false}, {"i2c", false}, {"spi", false}, {"timers", false},
         {"gpio_regmap", nullptr},
         {"notes", "Generic fallback: CPU+NVIC+memory only; no peripherals. UART/gpio assertions "
-                  "need a specific family platform (or the QEMU semihosting path)."},
+                  "need a specific family platform and a real firmware UART driver."},
     };
     for(auto& [family,caps]:t.items()) if(family!="stm32f4") {
         caps["can"]=false;caps["timed_bus"]=false;caps["electrical_bus"]=false;
@@ -121,28 +122,14 @@ std::string get_platform_file(const std::string& mcu_family) {
     namespace fs = std::filesystem;
     std::string family = canonical_family(mcu_family);
     std::string want = caps_table()[family]["file"].get<std::string>();
-    fs::path dir = fs::temp_directory_path() / "chudware_renode_platforms";
-    std::error_code ec;
-    fs::create_directories(dir, ec);
+    const fs::path dir = private_directory(firmware_root() / "platforms");
     for (const auto& tf : renode_platform_files()) {
-        fs::path out = dir / tf.relpath;
-        bool write = true;
-        if (fs::is_regular_file(out, ec)) {
-            std::ifstream in(out, std::ios::binary);
-            std::string existing((std::istreambuf_iterator<char>(in)),
-                                 std::istreambuf_iterator<char>());
-            write = existing != tf.contents;
-        }
-        if (write) {
-            std::ofstream f(out, std::ios::binary | std::ios::trunc);
-            f << tf.contents;
-        }
+        const fs::path out = dir / tf.relpath;
+        std::string existing;
+        if (!private_storage_detail::read_file(out, existing, 1024 * 1024) || existing != tf.contents)
+            private_storage_detail::atomic_write(out, tf.contents);
     }
-    fs::path candidate = dir / want;
-    if (fs::is_regular_file(candidate, ec)) return candidate.string();
-    fs::path generic = dir / "cortex_m_generic.repl";
-    if (fs::is_regular_file(generic, ec)) return generic.string();
-    return "";
+    return (dir / want).string();
 }
 
 }  // namespace chudware::firmware

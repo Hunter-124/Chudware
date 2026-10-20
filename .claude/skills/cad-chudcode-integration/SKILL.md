@@ -25,17 +25,27 @@ Version-specific runtime behavior below is checked against
   agent/provider loop, an external MCP hop, or a runtime source/package install.
 - ECAD planning and regeneration diagnosis use the Provider-shaped
   `providers/chudcode_provider.py` adapter and `ChudcodeSessionHost.complete_text`.
-  Online tool calls inherit their owning turn's hidden model/credential factory;
+  Online tool calls inherit their owning turn's hidden model/credential factory
+  (cell helpers inherit the principal-bound broker grant, never BYOK key bytes);
   private clients have no tools, skills, rules, memory or saved CAD session. Web actors
   never fall back to desktop credentials. Explicit offline/local helper providers remain.
 - Helper calls have a positive finite budget (default 180 s), cancellation polling and
   bounded process cleanup; this is not a strict end-to-end deadline. ECAD also retains
   its separate planning budget. RPC v2 has no per-request output-token cap: do not claim
   `max_tokens` is enforced by this adapter. Ordinary conversations have no implicit cap.
-- Web actors never use ambient `chud` auth: BYOK, personal Claude OAuth and the pool
-  (`CHUDWARE_WEB_POOL_API_KEY`/`_PROVIDER`/`_MODEL`) each run in a credential-scoped Chudcode
-  process with a gateway digest proof; an actor without a servable credential refuses by name.
-  Desktop turns use the host login.
+- Web actors never use ambient `chud` auth. Tenant cells run only gateway-validated
+  BYOK for Anthropic/OpenAI/xAI/OpenRouter/Gemini. The gateway-owned
+  `Webservice/gateway/provider_broker.py` keeps key bytes on the host; the cell gets
+  only a `cpg1` grant bound to cell/workspace/actor/UID/epoch/right/team/provider/source/role,
+  through private `provider.sock` and actor port `127.0.0.1:18081`. The broker
+  revalidates live authority during transfers and resolves the newest rotated key.
+  Pool/subscription/sponsor turns still refuse `credential_isolation_unsupported`:
+  the current auth broker is BYOK-only. Cell credential identity is
+  (workspace, actor, provider), never the key, so rotation keeps cancel/resume working.
+  Chud launches through `chudware-actor-sandbox` (`ro` for Ask/Plan, `rw` for Agent);
+  distinct public-HTTPS CONNECT research egress uses `127.0.0.1:18080`, without
+  provider credential injection. Browser/computer overlays are off. Managers may
+  only stop another actor's run (`ctx.control_delegate`). Desktop turns use the host login.
 
 ## Topology
 
@@ -45,12 +55,20 @@ host GUI / hostd → core/agent/run.cpp → persistent services worker (core/hos
   → services/agent/chudcode_host.py::ChudcodeSessionHost → chudcode_rpc.RpcClient → chud --mode rpc
 ```
 
+Browser `/engine` enters the workspace-owned tenant cell through
+`Webservice/gateway/engine_bridge.py` / `cells.py`, then its actor-owned worker;
+it never reaches the optional shared local/native daemon. Successful local provider
+wire/SDK fixtures prove the observed stream/session bytes, not genuine provider
+signatures/cache hits, production readiness or release authority.
+
 The long-lived worker's process-global `ChudcodeSessionHost` owns one persistent RPC process
 per Chudware conversation. `online_turn.py` owns workspace/model/settings assembly and
 run-scoped environment lifetime. Ordinary calls use the worker's serialized stdio lane;
 Stop/steer/status/answer use `chudcode_control.ControlServer`, whose endpoint/token is exposed
-only via `worker_control_info` (mode-0600 Unix socket on POSIX, random loopback TCP on
-Windows). Never log or echo the token, never move control back onto stdio. Malformed,
+only via `worker_control_info` (mode-0600 Unix socket on POSIX; owner+SYSTEM,
+remote-rejecting named pipe on Windows, never TCP). Never log or echo the token,
+never move control back onto stdio. Windows transport qualification requires a
+genuine Windows run; Linux fixtures do not attest Windows ACLs. Malformed,
 oversized (request 64 KB), repeated-auth and oversized-response paths stay bounded — so
 steer images travel as paths, never inline bytes.
 
@@ -86,6 +104,8 @@ steer images travel as paths, never inline bytes.
 - The main chat MUST send `workspace_dir` (`composer.cpp attachAgentConversationOptions`): it
   is the `fs_*` jail (`CHUDWARE_FS_ROOT`), project-save root and Chudcode cwd; without it
   `fs_*` refuses `workspace_root_unavailable`.
+  `resolve_workspace` canonicalizes that exact selected directory, never widens a
+  nested selection through ancestor-project discovery.
 
 ## Session and lifecycle rules
 
@@ -94,10 +114,36 @@ steer images travel as paths, never inline bytes.
   evict only the LRU idle session, else refuse.
 - `RpcClient(max_event_history=CHUDWARE_CHUDCODE_EVENT_HISTORY)` defaults to 1e6 frames;
   nothing in the lane may silently cap an hours-long turn.
+- CAD sockets belong to the owning turn, not transient RPC tool-call threads:
+  `TurnConnections` in `daemon_bridge.py`, installed in `chudcode_host.run_turn` and leased
+  by `chudcode_tools.dispatch_host_tool`. Parallel calls use different sockets; nested calls
+  reuse their lease. End-of-turn cleanup retires idle sockets and lets in-flight calls finish.
+  Never detach documents after each tool completion or collapse parallel calls onto one socket.
+  Sub-agents share the project registry and explicitly name doc_id; no workspace/part copies
+  are required. Same-part batches serialize atomically, not as a semantic feature merge.
 - `run_id` is unique while active. Cancel before prompt is a valid cancellation; after prompt
   it sends `abort()` once. Duplicate cancel and identical steer are idempotent; pre-start
   steers queue until right after `prompt()`. A steer carries composer attachments/context refs
   like a fresh turn (`agent_steer` → `chudcode_host.steer`).
+- **Steers are append-only and tracked to delivery** (c252: a steer sat 2m41s behind a 900 s
+  `write xd://wait_job`, Stop then let Chudcode's settle drain answer it in a turn nobody
+  watched). A user steer stays in `_Run.undelivered` until its user `message_start` streams
+  (`agent_steer {steer_id, status:"delivered"}` → `agent.steer`). Meanwhile tools declaring
+  `wake` (host-injected like `cancel`; `wait_job`) end early with `woken_by` — never real work.
+  Stop calls `remove_queued_message` BEFORE `abort()`; withdrawn steers (`carried_steer_ids`)
+  and ones still queued at the terminal (`carried`) open the session's next prompt. Never
+  `abort_and_prompt` or abort to deliver a message: that drops the in-flight response.
+- **Delivery needs positive evidence.** A text-only steer consumed by `ask_user` emits
+  `agent_answer {source:"reply", steer_id}`; the mapper produces the correlated
+  `agent.steer delivered` even if the control response is lost. Image replies retain their
+  original text/images and require matching streamed evidence. Unknown user frames and Stop
+  never acknowledge all queued messages. GUI delivery is monotonic; legacy reload reconciles
+  only exact, unique, image-free question replies within their own turn (`steerstatus` shot).
+- **Control endpoints live as long as their worker generation.** `WorkerBridge` and
+  `WorkerClient` retain credentials after an individual control refusal/timeout/protocol
+  failure; clearing them strands Submit and Stop behind busy stdio (ESPCAM c261).
+  Hostd snapshots credentials under the control mutex, then releases it before socket I/O.
+  Teardown/replacement invalidates the endpoint; failed requests are never blindly replayed.
 - A turn requires terminal `agent_end` after `wait_for_idle`; idle without it is a protocol
   error. Event-forwarding errors fail the turn.
 - **No implicit wall-clock cap.** The GUI sends no `timeout`; native transports use `-1`.
@@ -126,6 +172,17 @@ steer images travel as paths, never inline bytes.
 - Shutdown follows ownership: `worker_bridge.cpp` owns the worker; `worker_main.stop_services`
   closes the control server, then `chudcode_shutdown()` disposes all saved-session and
   transient clients. Process-tree termination stays bounded; no RPC process outlives its worker.
+- **Deployment census is work authority, not cached-session count.**
+  `ChudcodeSessionHost.worker_activity` positively probes SDK settle/queue/STT and
+  process ownership; a cached idle SDK alone does not pin, unavailable evidence does.
+  Native `cell_census` independently counts non-control sessions, RPCs, dirty docs,
+  cache-verification/profiler tasks and busy/background/unknown workers. The gateway's
+  durable private maintenance lease closes new admission without cancelling accepted
+  work, generation-fences cell self-exit, then requires actual manager inactivity before
+  cutover. Operator probe/wait deadlines never terminate agent work or turn unknown into
+  zero. Postmutation failure retains maintenance; only same-lease protected recovery
+  with inactive cells and authenticated health may reopen. The optional shared native
+  daemon is never a participant; no bridge-only or forced-drain fallback exists.
 - Nested agents stay inside Chudcode; session/subagent/retry/compaction/todo/usage events map
   into the existing feed. Never synthesize success when Chudcode reports failure.
 
@@ -169,6 +226,13 @@ steer images travel as paths, never inline bytes.
    scaffold/guardrail checks → `agent_turn._dispatch_tool` accounting/loop guard. Preserve
    document/run/actor context injection and progress/cancel callbacks; `_reconcile_kwargs`
    maps synonyms and returns teaching errors (no cap charge), never a raw `TypeError`.
+   Bind selected `project_dir`/`save_dir` before turn activation; fresh SDK threads and
+   refreshes retain these explicit roots, never ambient tenant authority.
+   `_ToolCallRecovery` belongs to the run, not accounting dictionaries: exact retries
+   join pending/unconsumed work without spending another slot. Document creation must
+   not change its recovery key. Execution settles/refunds once before publishing its
+   terminal result. Close recoveries from both context and binding metadata at turn end;
+   stale callbacks refuse `run_ended`, while already-running native work may finish.
 5. Refusals keep machine-readable shapes; tool exceptions propagate as tool errors; success is
    finite JSON-safe data, never fabricated. A CAD `{"ok": false}` is a normal return:
    `chudcode_events.cad_result_payload` fails the card with the tool's own error, and the
@@ -180,6 +244,11 @@ steer images travel as paths, never inline bytes.
    at `_RESULT_TEXT_BYTES` (46 000 B) minus any skill prefix by halving the largest member
    (`_shorten_largest`, which ends each cut string with a `…[cut: …]` marker), with
    `_truncated{full_result,…}` naming the full JSON spilled by `_spill_full_result`.
+   Plain non-JSON guide/skill text also supplies `details` as a string; oversized
+   text uses `{items, _truncated}` with a full JSON-string spill. Consumers await
+   `tool.write`, check outer `hasError`, then read `details.xdev.inner` as dict|string.
+   A dict with `ok:false` is a refusal, not permission to read success-only keys.
+   A reporting exception never justifies replaying an already-successful mutation.
    `fs_read` pages (`byte_offset`/`next_byte_offset`, ~32 KB) so it never reaches the cap.
    Image tools cross as ONE mapping (`tool_images.image_result`: `{ok, caption, images,
    saved_path?}`) in text and details; the image blocks stay in `content`.
@@ -190,10 +259,18 @@ steer images travel as paths, never inline bytes.
    `skills.catalog_block()`. Trigger injection
    (`_skill_prefix`/`_prefixed`) rides the first matching result per `session:agent_id`, never
    on eval-bridged calls (`_eval_bridged`). Never copy a SKILL.md into a role card.
-9. Transient commands (auth, providers, catalog, memory, login) share one long-lived no-session
-   client (`_service_client`, warmed by `worker_main._warm_chudcode_service`, serialized on
-   `_service_lock`, replaced on death or memory-backend change, disposed on shutdown). Never
-   spawn per call.
+   Descriptions carry effective curated `prompt_note`, timeout/recovery policy and
+   matching built-in/project-auto `cad_skill` pointers even when eval suppresses the
+   result prefix; preserve this suffix when trimming the description. Always-denied
+   agent `undo`/`redo` stay out of discovery as well as dispatch.
+9. Desktop transient commands (auth, providers, catalog, memory, login) share one
+   long-lived no-session client (`_service_client`, warmed by
+   `worker_main._warm_chudcode_service`, serialized on `_service_lock`, replaced
+   on death or memory-backend change, disposed on shutdown). Never spawn per
+   desktop call. Tenant cells refuse this ambient service. Their model catalog
+   uses `cell_catalog_models`: an actor/provider-capability-scoped, metadata-only
+   SDK helper registered in the execution census and disposed after discovery.
+   It does not create/resume a conversation or inherit desktop credentials.
 10. Session processes are lean: `_make_client` passes `--tools <CAD_SESSION_TOOLS> --no-skills
     --no-lsp`, `--no-mcp` when `_binary_supports_flag` sees it, and the immutable
     content-keyed `_cad_session_overlay` (`--config`), which disables user-level context files
@@ -210,6 +287,12 @@ steer images travel as paths, never inline bytes.
     a shared overlay for another session. A changed choice refreshes only an idle connection
     at the next turn or manual compact, resuming the exact history (eval scratch state resets);
     explicit auto-compaction/retry switches survive; manual compact reports the committed method.
+11a. **Chats run turns concurrently; a conversation lives in ONE worker.** hostd runs each
+    turn in its own pool worker and keeps conversation→worker ownership. A worker's
+    `ChudcodeSessionHost` may cache many conversations, but another worker resumes one only
+    after the owner's control action `release` (`release_session`: refuses `session_busy`,
+    never cancels) disposed it. Never keep two live runtimes of one session: disposing the
+    stale one writes `session_exit` at its old leaf and the next resume forks from there.
 12. Eval-made CAD calls get feed rows: `run_turn` binds `host_call_observer`
     (`_bind_host_call_observer`); `_nested_call_reporter` emits `host_tool_start/_end` only for
     ids no in-flight tool frame owns.
@@ -217,9 +300,20 @@ steer images travel as paths, never inline bytes.
     explicit agent `tools:` allowlists narrow them, restricted/plan children get none, and
     aborting a sub-agent sends `host_tool_cancel`. Sub-agent calls run concurrently: cap slots
     reserve under `_CALL_ACCOUNTING_LOCK` (refunded if never run), records append under
-    `_RECORDS_LOCK`, `enable_tools` refreshes serialize. Default `subagent_subscription="events"`
+    `_RECORDS_LOCK`, `enable_tools` refreshes serialize. Each call runs inside
+    `cad_common.agent_doc_context` (run/session + agent id): each sub-agent has its own current
+    part, a doc-less sub-agent call targets that part before the turn doc (`_document_args`), and
+    its engine calls use its own thread's hostd connection (one `writer_group` per worker).
+    Default `subagent_subscription="events"`
     maps lifecycle to one upserted `sub_run` per sub-agent and `subagent_event` tool frames to
     `agent.tool_call` (`subagent_id`, parent = the `task` call), dropping child text.
+    Subscription lifecycle/progress `payload.id` is the assigned task handle (including
+    `Parent.Child`), not the generic `agent` definition type. The mapper keeps `name`,
+    `agent_type` and late `description` separate; progress/terminal/spawn events never
+    downgrade a named trace agent. Persist the assigned-name priority with the DAG.
+    Tool-result image references and captions also reach the parent feed (direct CAD
+    results and nested `xd://` results), even for failed inspections; never copy base64
+    into feed events or manufacture an image for a numeric-only geometry result.
     `general_agent.yaml` PARALLEL SUB-AGENTS: layout contract first, one document per
     sub-agent, parent integrates and mates.
 14. `ask_user` asks the human when the composer sends `interactive_questions: true`:
@@ -277,10 +371,12 @@ steer images travel as paths, never inline bytes.
 
 ## Auth, memory, settings
 
-- Service calls go through `transient_call` on the shared client; its overlay pins the
-  GUI-selected memory backend so `memory_*` use the same project backend as sessions.
-  `session_call` only targets an already-live session; a status/settings request never
-  creates or resumes a conversation.
+- Desktop service calls go through `transient_call` on the shared client; its
+  overlay pins the GUI-selected memory backend so `memory_*` use the same
+  project backend as sessions. Tenant cells instead use the scoped catalog
+  bootstrap above; legacy provider credential mutation is refused, not forwarded
+  into another actor's service. `session_call` only targets an already-live
+  session; a status/settings request never creates or resumes a conversation.
 - Secrets stay in typed `chudcode_rpc` wrappers; UI responses expose state, account labels,
   usage and model metadata, never credential bytes. Login requests are bounded and allow only
   safe web URLs into `extension_ui_request`.

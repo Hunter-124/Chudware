@@ -126,3 +126,47 @@ def test_constants_derive_from_active_root(paths_mod):
     assert paths.CACHE == root / "cache"
     assert paths.RUNTIME == root / "runtime"
     assert paths.MODELS == root / "models"
+
+
+def test_cell_artifact_handles_persist_and_are_actor_private(paths_mod, tmp_path, monkeypatch):
+    import hashlib
+    from services.agent import request_context as ctx
+    paths, _ = paths_mod
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", "/ambient-root")
+
+    def principal(actor, workspace="team:shared"):
+        return {"cell": True, "workspace_key": workspace, "actor_key": actor,
+                "actor_hex": hashlib.sha256(actor.encode()).hexdigest()[:32],
+                "right": "editor", "epoch": 1}
+
+    handle = "../../foreign/model"
+    with ctx.bind_context(principal("alice")):
+        alice_dir = paths.model_dir(handle)
+        (alice_dir / "result.json").write_text('{"secret":"alice"}')
+        assert alice_dir.is_relative_to(paths.actor_root())
+        assert len(alice_dir.name) == 32 and all(c in "0123456789abcdef" for c in alice_dir.name)
+        assert paths.data_roots() == [paths.actor_root()]
+        assert paths.CONFIG == paths.actor_root() / "config.json"
+        assert paths.BROWSER_DOWNLOADS.is_relative_to(paths.actor_root())
+        importlib.reload(paths)
+        assert paths.artifact_dir(handle) == alice_dir
+
+    with ctx.bind_context(principal("bob")):
+        for missing in (handle, "absent"):
+            with pytest.raises(KeyError, match="not_found"):
+                paths.artifact_dir(missing)
+        bob_dir = paths.model_dir(handle)
+        assert alice_dir != bob_dir
+        assert not (bob_dir / "result.json").exists()
+        (bob_dir / "result.json").write_text('{"secret":"bob"}')
+        assert paths.artifact_dir(handle) == bob_dir
+        assert paths.find_config().is_relative_to(paths.actor_root())
+
+    with ctx.bind_context(principal("alice", "team:other")):
+        with pytest.raises(KeyError, match="not_found"):
+            paths.artifact_dir(handle)
+
+    with ctx.bind_context(principal("alice")):
+        assert (paths.artifact_dir(handle) / "result.json").read_text() == '{"secret":"alice"}'
+    assert not (tmp_path / "foreign").exists()

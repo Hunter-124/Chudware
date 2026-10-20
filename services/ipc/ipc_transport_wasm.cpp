@@ -260,6 +260,11 @@ IpcListener& IpcListener::operator=(IpcListener&& o) noexcept {
     return *this;
 }
 
+bool IpcListener::adoptListeningFd(int /*fd*/, std::string& err) {
+    err = "WASM: inherited listeners are unsupported";
+    return false;
+}
+
 bool IpcListener::listen(const std::string& /*path*/, std::string& err) {
     err = "WASM: IpcListener not available (browser is the WS client)";
     return false;

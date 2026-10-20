@@ -4,9 +4,9 @@ Live-run root cause (run-74799871076856): the worker chdir's to the project root
 project-relative path passes the MCP process's ``os.path.isfile`` check — but the raw,
 still-relative path was then forwarded to the engine daemon, whose cwd differs, so
 ``doc_open``/``import_file`` could not find the file (and a relative EXPORT destination
-silently lands in the daemon's cwd instead of the user's project). These tests pin the
-contract: every path that crosses ``cb.call`` is absolute, while the caller-facing
-``imported_from`` keeps the original caller-supplied string so run records stay readable.
+silently lands in the daemon's cwd instead of the user's project). Explicit relative
+exports must use the selected workspace even when the worker cwd differs or a turn
+continues. Every engine path is absolute; ``imported_from`` keeps the supplied string.
 
 No engine needed: ``cb.call`` is stubbed and its payloads recorded.
 
@@ -45,7 +45,7 @@ class _StubMCP:
 
 
 @pytest.fixture()
-def exchange(monkeypatch):
+def exchange(monkeypatch, tmp_path):
     """Registered exchange tools with cb.call recorded + the engine faked."""
     calls: list = []
 
@@ -68,11 +68,18 @@ def exchange(monkeypatch):
                     "source_state": "live"}
         if method == "import_file":
             return {"doc_id": "doc-imported"}
+        if method in ("doc_save", "export_file"):
+            destination = Path(params["path"])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"fake native or interchange payload")
+            return {"path": str(destination)}
         return {}
 
     monkeypatch.setattr(M.cb, "call", _fake_call)
     # The handoff publisher is irrelevant here (and would doc_save into the real handoff dir).
     monkeypatch.setattr(M, "_publish_current", lambda *a, **k: None)
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
     mcp = _StubMCP()
     M.register_cad_exchange_tools(mcp)
     return mcp.tools, calls
@@ -131,10 +138,11 @@ def test_import_part_relative_interchange_goes_absolute(exchange, tmp_path, monk
 
 
 def test_export_part_relative_destination_goes_absolute(exchange, tmp_path, monkeypatch):
-    """(b) A relative EXPORT destination is resolved against the worker's cwd before
-    crossing to the engine — never silently written into the daemon's cwd."""
+    """A relative export uses the selected workspace, not worker or daemon cwd."""
     tools_fn, calls = exchange
-    monkeypatch.chdir(tmp_path)
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    monkeypatch.chdir(worker)
 
     out = json.loads(tools_fn["export_part"](fmt="step", path="out/bracket.step",
                                              doc_id="doc-live"))
@@ -144,12 +152,16 @@ def test_export_part_relative_destination_goes_absolute(exchange, tmp_path, monk
     assert len(exp) == 1, calls
     assert exp[0]["path"] == str(tmp_path / "out" / "bracket.step")
     assert os.path.isabs(exp[0]["path"])
+    assert Path(out["path"]).is_file()
+    assert not (worker / "out").exists()
 
 
 def test_export_part_stepplus_alias_goes_absolute(exchange, tmp_path, monkeypatch):
     """(b) The native step+ alias routes through doc_save with an absolute path too."""
     tools_fn, calls = exchange
-    monkeypatch.chdir(tmp_path)
+    worker = tmp_path / "continuation-worker"
+    worker.mkdir()
+    monkeypatch.chdir(worker)
 
     out = json.loads(tools_fn["export_part"](fmt="step+", path="deliverable",
                                              doc_id="doc-live"))
@@ -158,11 +170,16 @@ def test_export_part_stepplus_alias_goes_absolute(exchange, tmp_path, monkeypatc
     saves = [p for m, p in calls if m == "doc_save"]
     assert len(saves) == 1, calls
     assert saves[0]["path"] == str(tmp_path / "deliverable.step+")
+    assert out["ok"] is True, out
+    assert Path(out["path"]).is_file()
+    assert list(worker.iterdir()) == []
 
 
 def test_export_part_drawplus_uses_standalone_saver(exchange, tmp_path, monkeypatch):
     tools_fn, calls = exchange
-    monkeypatch.chdir(tmp_path)
+    worker = tmp_path / "drawing-worker"
+    worker.mkdir()
+    monkeypatch.chdir(worker)
 
     out = json.loads(tools_fn["export_part"](fmt="draw+", path="drawing",
                                              doc_id="dwg-cpp00000001"))
@@ -172,12 +189,16 @@ def test_export_part_drawplus_uses_standalone_saver(exchange, tmp_path, monkeypa
     saves = [p for m, p in calls if m == "drawing_save_standalone"]
     assert saves == [{"drawing_id": "dwg-cpp00000001",
                       "path": str(tmp_path / "drawing.draw+")}]
+    assert Path(out["path"]).is_file()
+    assert list(worker.iterdir()) == []
 
 def test_export_part_tilde_destination_expands(exchange, tmp_path, monkeypatch):
     """'~/x.step' must expand to $HOME — abspath alone would yield '<cwd>/~/x.step'."""
     tools_fn, calls = exchange
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.chdir(tmp_path)  # cwd must NOT be where the file lands
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    monkeypatch.chdir(worker)
 
     out = json.loads(tools_fn["export_part"](fmt="step", path="~/bracket.step",
                                              doc_id="doc-live"))
@@ -186,6 +207,8 @@ def test_export_part_tilde_destination_expands(exchange, tmp_path, monkeypatch):
     exp = [p for m, p in calls if m == "export_file"]
     assert len(exp) == 1, calls
     assert exp[0]["path"] == str(tmp_path / "bracket.step")
+    assert Path(out["path"]).is_file()
+    assert list(worker.iterdir()) == []
 
 
 def test_import_part_missing_relative_path_keeps_teaching_envelope(exchange, tmp_path,
@@ -325,3 +348,65 @@ def test_solidworks_without_com_falls_through_to_portable_native_import(
     assert out["component_names"] == ["Wheel"]
     assert "SolidWorks COM automation is unavailable" in out["feature_fallback_reason"]
     assert [method for method, _ in calls if method == "import_file"] == ["import_file"]
+
+
+@pytest.mark.parametrize("fmt", ["step", "step+", "draw+"])
+def test_export_absolute_destination_works_without_project_root(
+        exchange, monkeypatch, tmp_path, fmt):
+    tools, calls = exchange
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    monkeypatch.chdir(worker)
+    destination = tmp_path / "external-delivery" / f"base.{fmt}"
+
+    exported = json.loads(tools["export_part"](
+        fmt=fmt, path=str(destination), doc_id="doc-live"))
+
+    assert exported["ok"] is True, exported
+    assert exported["path"] == str(destination)
+    assert destination.is_file()
+    assert list(worker.iterdir()) == []
+    writes = [p["path"] for method, p in calls if method in (
+        "doc_save", "export_file", "drawing_save_standalone")]
+    assert writes == [str(destination)]
+
+
+@pytest.mark.parametrize("fmt", ["step", "step+", "draw+"])
+def test_export_relative_destination_refuses_without_project_root(
+        exchange, monkeypatch, tmp_path, fmt):
+    tools, calls = exchange
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    refused = json.loads(tools["export_part"](
+        fmt=fmt, path=f"base.{fmt}", doc_id="doc-live"))
+
+    assert refused["ok"] is False, refused
+    assert "ABSOLUTE" in refused["error"]
+    assert not [m for m, _p in calls if m in (
+        "doc_save", "export_file", "drawing_save_standalone")]
+    assert not (tmp_path / f"base.{fmt}").exists()
+
+
+@pytest.mark.parametrize("fmt", ["step", "step+", "draw+"])
+def test_export_refuses_symlinked_credential_destination(
+        exchange, monkeypatch, tmp_path, fmt):
+    tools, calls = exchange
+    project = tmp_path / "project"
+    project.mkdir()
+    secrets = tmp_path / ".ssh"
+    secrets.mkdir()
+    (project / "output").symlink_to(secrets, target_is_directory=True)
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(project))
+
+    refused = json.loads(tools["export_part"](
+        fmt=fmt, path=f"output/base.{fmt}", doc_id="doc-live"))
+
+    assert refused["ok"] is False, refused
+    assert "credential/key location" in refused["error"]
+    assert not [m for m, _p in calls if m in (
+        "doc_save", "export_file", "drawing_save_standalone")]
+    assert list(secrets.iterdir()) == []

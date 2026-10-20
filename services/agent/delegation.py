@@ -686,6 +686,22 @@ class DelegationTree:
                 e = "medium"
             if e in ("low", "medium", "high"):
                 effort_s = e
+        # Phase 4 (M11): every spawned node is also a registry session so the GUI
+        # can list it, open its transcript, and queue steering messages into it.
+        # Desktop remains best-effort; cells require a registered, minted handle.
+        try:
+            from services.agent import subagent_registry as _sreg  # noqa: PLC0415
+            registration = _sreg.register_session(
+                node_id, role=role, brief=brief, spawn_kind=kind,
+                parent_run_id=self._run_id, parent_node_id=parent_id,
+                requested_by=parent.role,
+                model=(model_assign.id or ""), budget_tokens=budget_tokens,
+                status="pending", project_dir=project_dir)
+            node_id = registration["id"]
+        except Exception:  # noqa: BLE001
+            from services.agent.request_context import in_cell
+            if in_cell():
+                raise
         node = DelegationNode(
             id=node_id,
             parent=parent_id,
@@ -718,20 +734,6 @@ class DelegationTree:
                 _ae.emit_event(_k, _p, live=self._on_event, journal=self._ev_journal)
             except Exception:  # noqa: BLE001 — spawn event never blocks delegation
                 pass
-
-        # Phase 4 (M11): every spawned node is also a registry session so the GUI
-        # can list it, open its transcript, and queue steering messages into it.
-        # Best-effort — a registry failure never blocks delegation.
-        try:
-            from services.agent import subagent_registry as _sreg  # noqa: PLC0415
-            _sreg.register_session(
-                node_id, role=role, brief=brief, spawn_kind=kind,
-                parent_run_id=self._run_id, parent_node_id=parent_id,
-                requested_by=parent.role,
-                model=(model_assign.id or ""), budget_tokens=budget_tokens,
-                status="pending", project_dir=project_dir)
-        except Exception:  # noqa: BLE001
-            pass
 
         # Update meter agent count BEFORE the agent-limit advisory so the emitted
         # event reflects the post-spawn count.

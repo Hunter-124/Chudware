@@ -15,6 +15,7 @@ Key sources (merged, deduped, first occurrence wins):
 3. ``keys.firecrawl`` in the app ``config.json`` — a JSON list, or one string with the
    same separators. This is where the GUI keys map lives (``keys.openrouter`` etc.), so a
    GUI settings save merge-overlays and never clobbers it.
+   Tenant cells use only their actor's BYOK environment keys, never config merging.
 
 Cooldown state is persisted to a small JSON file (keyed by *hash* of the key, never the
 key itself) so separate processes — the GUI agent, the MCP server, ``scrape_knowledge``,
@@ -33,8 +34,6 @@ import json
 import os
 import re
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -108,6 +107,10 @@ def load_keys(config_path: Optional[Path] = None) -> list[str]:
     single = os.environ.get(ENV_KEY, "").strip()
     if single:
         _add([single])
+
+    from services.agent.request_context import in_cell
+    if in_cell():
+        return out  # tenant BYOK only; never merge desktop/operator config keys
 
     cfg_path = config_path or _default_config_path()
     if cfg_path and Path(cfg_path).exists():
@@ -198,33 +201,21 @@ def _record_success(key: str) -> None:
 
 
 def _post(key: str, path: str, payload: dict, timeout: float) -> tuple[int, Optional[float], bytes]:
-    req = urllib.request.Request(
-        API_BASE + path,
-        data=json.dumps(payload).encode("utf-8"),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "User-Agent": "Chudware-research/1.1",
-        },
-    )
+    from services.net.safe_http import request
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, None, resp.read()
-    except urllib.error.HTTPError as exc:
-        retry_after: Optional[float] = None
-        raw_ra = exc.headers.get("Retry-After") if exc.headers else None
-        if raw_ra:
-            try:
-                retry_after = float(raw_ra)
-            except ValueError:
-                retry_after = None
+        resp = request(API_BASE + path, method="POST",
+                       body=json.dumps(payload).encode("utf-8"),
+                       headers={"Authorization": f"Bearer {key}",
+                                "Content-Type": "application/json",
+                                "User-Agent": "Chudware-research/1.1"},
+                       idle_timeout=timeout, max_bytes=8 * 1024 * 1024,
+                       max_redirects=0, schemes=("https",))
         try:
-            body = exc.read()
-        except Exception:  # noqa: BLE001
-            body = b""
-        return exc.code, retry_after, body
-    except (urllib.error.URLError, TimeoutError, OSError):
+            retry_after = float(resp.headers["retry-after"]) if "retry-after" in resp.headers else None
+        except ValueError:
+            retry_after = None
+        return resp.status_code, retry_after, resp.content
+    except (ValueError, RuntimeError, OSError):
         return 0, None, b""
 
 

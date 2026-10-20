@@ -27,6 +27,14 @@ struct LaneRpcResult {
     bool is_error = false;
 };
 
+// Server-owned admission limits; constructor injection allows small boundary fixtures.
+struct ArtifactLimits {
+    size_t max_objects = 256;
+    uint64_t max_retained_bytes = 64ULL * 1024 * 1024;
+    uint64_t max_artifact_bytes = 8ULL * 1024 * 1024;
+    size_t max_artifact_lines = 100000;
+};
+
 class ManufacturingLane {
 public:
     using EventSink = std::function<void(const std::string&)>;
@@ -35,7 +43,8 @@ public:
 
     explicit ManufacturingLane(std::filesystem::path state_directory,
                                bool emulator_endpoint_is_physical = false,
-                               std::function<uint64_t()> monotonic_clock = {});
+                               std::function<uint64_t()> monotonic_clock = {},
+                               ArtifactLimits artifact_limits = {});
     ~ManufacturingLane();
 
     ManufacturingLane(const ManufacturingLane&) = delete;
@@ -64,6 +73,8 @@ private:
         tier0::ArtifactKind kind = tier0::ArtifactKind::Nc;
         std::string hash_sha256;
         uint64_t bytes = 0;
+        uint64_t retained_bytes = 0;
+        size_t run_references = 0;
         std::vector<std::string> program_lines;
         std::string post_profile_id;
         std::string post_profile_hash;
@@ -116,6 +127,7 @@ private:
     std::optional<DeviceCandidate> findCandidate(std::string_view device_id) const;
     void selectTransport(const DeviceCandidate& candidate);
     void invalidateSelectedDeviceRecords(std::string_view previous_device_id);
+    void reclaimUnreferencedArtifacts(std::string_view device_id);
     void observeMachineIdentity(device::ControllerIdentitySnapshot identity,
                                 device::MachineFingerprint fingerprint);
     void failExpiredClaimSafely();
@@ -188,6 +200,8 @@ private:
     bool terminal_claim_ = false;
     std::optional<CommandLease> active_claim_;
     std::map<std::string, ArtifactRecord, std::less<>> artifacts_;
+    const ArtifactLimits artifact_limits_;
+    uint64_t retained_artifact_bytes_ = 0;
     std::map<std::string, RunRecord, std::less<>> runs_;
     std::map<std::string, ApprovalProposal, std::less<>> proposals_;
     std::map<std::string, ApprovalBinding, std::less<>> approvals_;

@@ -25,10 +25,11 @@ _DEFAULT_PROFILE = "playwright-headless"
 class PlaywrightClient:
     """Short-lived Playwright contexts over a persistent per-vendor profile."""
 
-    def __init__(self, profile: str = "", *,
+    def __init__(self, profile: str = "", *, max_download_bytes: int = 200 * 1024 * 1024,
                  sync_playwright: Callable[[], Any] | None = None) -> None:
         self._profile = profile
         self._sync_playwright = sync_playwright
+        self._max_download_bytes = max_download_bytes
 
     def _factory(self) -> Callable[[], Any]:
         if self._sync_playwright is not None:
@@ -62,6 +63,9 @@ class PlaywrightClient:
         propagate for :func:`session.browser_fetch` to convert to its standard
         failure envelope.
         """
+        from services.agent.request_context import in_cell
+        if in_cell():
+            return {"ok": False, "reason": "cell_refused"}
         with self._factory()() as pw:
             context, user_agent, version = self._launch_context(
                 pw, self._profile_dir(profile))
@@ -93,28 +97,31 @@ class PlaywrightClient:
                 context.close()
 
     def download(self, url: str, dest: str, *, profile: str = "") -> dict:
-        """Fetch ``url`` under the persistent context's cookies into ``dest``."""
+        """Stream public bytes with profile cookies; never buffer a Playwright body."""
+        from services.agent.request_context import in_cell
+        if in_cell():
+            return {"ok": False, "reason": "cell_refused"}
+        from services.net.safe_http import download
         destination = Path(dest)
-        destination.parent.mkdir(parents=True, exist_ok=True)
         with self._factory()() as pw:
             context, _user_agent, _version = self._launch_context(
                 pw, self._profile_dir(profile))
             try:
-                response = context.request.get(
-                    url, timeout=DOWNLOAD_TIMEOUT_MS, fail_on_status_code=False)
-                status = response.status
+                from .session import _apply_staged_cookies
+                _apply_staged_cookies(context, profile or self._profile or _DEFAULT_PROFILE)
+                def cookie_headers(current):
+                    cookies = context.cookies([current])
+                    return {"Cookie": "; ".join(f"{c['name']}={c['value']}" for c in cookies)}
+
+                response = download(url, destination, max_bytes=self._max_download_bytes,
+                                    idle_timeout=30.0, headers_for_url=cookie_headers)
+                status = response.status_code
                 if status in (403, 429):
                     return {"ok": False, "reason": "bot_walled", "status": status}
                 if status >= 400:
                     return {"ok": False, "reason": "http_error", "status": status}
-                body = response.body()
-                destination.write_bytes(body)
-                return {
-                    "ok": True,
-                    "status": status,
-                    "dest": str(destination),
-                    "bytes": len(body),
-                }
+                return {"ok": True, "status": status, "dest": str(destination),
+                        "bytes": response.bytes_written}
             finally:
                 context.close()
 

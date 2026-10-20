@@ -104,9 +104,22 @@ def spawn_private_daemon(tmp: Path) -> tuple[subprocess.Popen, str, str] | None:
     exe.chmod(0o755)
     key = f"private-{os.getpid()}-{uuid.uuid4().hex[:12]}"
     log = Path(tempfile.gettempdir()) / f"private-hostd-{key}.log"
+    roots = {
+        "HOME": tmp / "home",
+        "USERPROFILE": tmp / "home",
+        "XDG_DATA_HOME": tmp / "data",
+        "XDG_CONFIG_HOME": tmp / "config",
+        "XDG_CACHE_HOME": tmp / "cache",
+        "XDG_RUNTIME_DIR": tmp / "run",
+        "CHUDWARE_CACHE_ROOT": tmp / "agent-cache",
+        "CHUDWARE_MFG_STATE_DIR": tmp / "mfg-state",
+    }
+    for directory in roots.values():
+        directory.mkdir(mode=0o700, exist_ok=True)
     env = dict(os.environ, LD_LIBRARY_PATH=str(tmp),
                CHUDWARE_INSTANCE_KEY=key, CHUDWARE_HOSTD_SOCKET=sock,
-               CHUDWARE_MFG_STATE_DIR=str(tmp / "mfg-state"))
+               **{name: str(directory) for name, directory in roots.items()})
+    env.pop("APPDATA", None)
     env.pop("CHUDWARE_HOSTD_PIPE", None)
     # The manufacturing journal takes an exclusive flock in its state dir
     # (core/hostd/mfg_lane.cpp defaultStateDirectory); without a private override the

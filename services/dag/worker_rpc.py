@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Callable
 
 from services.dag.run_ids import validate_run_id
+from services.agent.request_context import in_cell
+from services.dag.storage import resolve_run
 
 
 def _runs_dir() -> Path:
@@ -47,13 +49,19 @@ def _dag_status(params: dict, _emit: Callable) -> dict:
     """
     try:
         run_id = (params or {}).get("run_id", "")
-        if not run_id:
+        if not run_id and not in_cell():
             return {"ok": False, "reason": "run_id is required"}
-        run_id = validate_run_id(run_id)
-        base = Path((params or {}).get("runs_dir") or _runs_dir())
-        db_path = base / f"{run_id}.db"
-        graph_path = base / f"{run_id}.graph.json"
+        if in_cell():
+            record = resolve_run(run_id)
+            run_id, db_path, graph_path = record.run_id, record.db, record.graph
+        else:
+            run_id = validate_run_id(run_id)
+            base = Path((params or {}).get("runs_dir") or _runs_dir())
+            db_path = base / f"{run_id}.db"
+            graph_path = base / f"{run_id}.graph.json"
         if not db_path.exists():
+            if in_cell():
+                raise KeyError("not_found")
             return {"ok": False, "reason": f"Run {run_id!r} not found",
                     "hint": f"Check the run_id or the runs_dir (default: {base})."}
         graph: dict = {}
@@ -77,12 +85,19 @@ def _dag_status(params: dict, _emit: Callable) -> dict:
             "checkpoint_db": str(db_path),
             "events_jsonl": str(events_jsonl) if events_jsonl.exists() else "",
         }
+    except KeyError:
+        return {"ok": False, "reason": "not_found", "code": "not_found"}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"dag_status failed: {exc}"}
 
 
 def _resume_with(run_id: str, decision: str, params: dict) -> dict:
     """Shared resume path for approve/abort — delegates to executor.resume()."""
+    try:
+        if in_cell():
+            run_id = resolve_run(run_id).run_id
+    except KeyError:
+        return {"ok": False, "reason": "not_found", "code": "not_found"}
     try:
         from services.dag import executor
     except ImportError as exc:
@@ -94,6 +109,8 @@ def _resume_with(run_id: str, decision: str, params: dict) -> dict:
             decision=decision,
             autonomy_default=(params or {}).get("autonomy_default", "approve"),
         )
+    except KeyError:
+        return {"ok": False, "reason": "not_found", "code": "not_found"}
     except FileNotFoundError as exc:
         return {"ok": False, "reason": str(exc),
                 "hint": "Verify run_id matches an existing paused run."}
@@ -116,7 +133,7 @@ def _resume_with(run_id: str, decision: str, params: dict) -> dict:
 def _dag_approve(params: dict, _emit: Callable) -> dict:
     """Worker method ``dag_approve`` → executor.resume(decision='approve')."""
     run_id = (params or {}).get("run_id", "")
-    if not run_id:
+    if not run_id and not in_cell():
         return {"ok": False, "reason": "run_id is required"}
     return _resume_with(run_id, "approve", params)
 
@@ -124,7 +141,7 @@ def _dag_approve(params: dict, _emit: Callable) -> dict:
 def _dag_abort(params: dict, _emit: Callable) -> dict:
     """Worker method ``dag_abort`` → executor.resume(decision='reject')."""
     run_id = (params or {}).get("run_id", "")
-    if not run_id:
+    if not run_id and not in_cell():
         return {"ok": False, "reason": "run_id is required"}
     return _resume_with(run_id, "reject", params)
 

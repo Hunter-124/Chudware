@@ -18,6 +18,7 @@
 //     load_cases: [ { name, weight?, fixtures?:[same as fixtures], loads:[same]
 //     } ], preserve / exclude: [ { faces:[<sel>], thickness_mm?, label? }
 //                         | { box_min_mm:[3], box_max_mm:[3], label? } ],
+//     build_plate: {faces:[<sel>...], label?}, print_process:"<preset id>",
 //     thermal: { reference_temperature_c?, fixtures:[{faces, temperature_c}],
 //                loads:[ {faces,type:"flux",magnitude_w_m2} |
 //                {faces,type:"power",power_w}
@@ -236,6 +237,9 @@ BcResult drawBoundaryEditor(
     const MaterialLookup &lookup,
     const std::vector<std::pair<std::string, std::string>> &libraryMaterials,
     const char *lockedReason = nullptr);
+// Draw the bed-face well inside the Additive manufacturing card.
+BcResult drawBuildPlateEditor(AppState &st, nlohmann::json &study, BcView &view,
+                              const char *lockedReason = nullptr);
 
 } // namespace topology
 } // namespace ui

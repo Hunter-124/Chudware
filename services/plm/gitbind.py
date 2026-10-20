@@ -43,6 +43,8 @@ from typing import Any
 from dulwich.objects import Blob, Commit, Tree
 from dulwich.repo import Repo
 
+from services.plm.git_security import git_argv, git_env
+
 VAULT_DIRNAME = ".aicadvault"
 
 
@@ -408,9 +410,10 @@ class GitBinding:
         if git_available():
             try:
                 subprocess.run(
-                    ["git", "--git-dir", str(self._vault_dir), "gc", "--quiet"],
+                    git_argv(["--git-dir", str(self._vault_dir), "gc", "--quiet"]),
                     check=True,
                     capture_output=True,
+                    env=git_env(),
                 )
                 return "git-gc"
             except (subprocess.CalledProcessError, OSError):

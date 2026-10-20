@@ -10,6 +10,8 @@
 3. `slice_part(doc_id=…, printer="ender 3", material="PLA", goal=…)` — vendor presets from the
    installed PrusaSlicer, orientation, supports and brim from the analysis, then
    `verify_gcode`. `copies=N` repeats one part on its plate.
+   Explicit user preferences win: no brim means `brim=0`; a direct-drive conversion needs
+   appropriate retraction overrides instead of blindly retaining Bowden retraction.
    Several parts in one job: `slice_part(parts=[{"doc_id": a, "copies": 2}, {"doc_id": b},
    {"path": "…stl"}], printer=…, name="small_parts")` — each part is oriented and analysed on
    its own (per-entry `orientation`/`build_dir`/`preserve_faces`/`strength_dir`), the
@@ -26,7 +28,10 @@
    `gcode_check.sequential_clearance` (hotend and gantry vs finished objects, from the
    toolpath) are the only guard.
 4. Deliver only `print_ready: true`, or name the failing check. Put G-code on printer media
-   only through the media tools below.
+   only through the media tools below. When the user asked for media delivery and a job is
+   not print_ready, ask them once (question tool) whether to put it on anyway, naming the
+   failed check and its practical risk; if they say yes — or already said so — publish it
+   with `user_override` (step 3). The user decides; never refuse or stall on it.
 - No slicer installed → `slicer_status` returns the install command; give it to the user.
 - NEVER download/extract a slicer, write slicer `.ini` keys by hand, or reuse a design-time
   build direction nobody measured. That combination produced collapsed support towers.
@@ -44,18 +49,27 @@ indistinguishable on its screen. The media must hold exactly the current set.
    printer, so `media_idle=True` is that confirmation — never assume it.
 3. `publish_print_media(root=…, project="<name>", jobs=[{"part_id": "upper_arm",
    "manifest_path": "<…>.print.json"}, …], expected_inventory=<inventory_token>,
-   media_idle=True)`. `jobs` is the whole project set: a part left out is retired. Every job
-   must be `print_ready: true` with the manifest's `gcode_sha256` (pass `gcode_path` only for
-   a saved G-code that moved). The tool never reslices or relaxes a check: on refusal, fix
-   the part and run `slice_part` again. Same content set = no new revision.
+   media_idle=True)`. `jobs` is the whole project set: a part left out is deleted. Every job
+   must match the manifest's `gcode_sha256` (pass `gcode_path` only for a saved G-code that
+   moved) and be `print_ready: true`, except a job the user explicitly told you to put on
+   the media anyway: add `"user_override": "<the user's words>"` to that job. It publishes
+   like any other, its failed checks recorded in the drive README/metadata and returned as a
+   `published_not_print_ready` warning you report. The tool never reslices or relaxes a
+   check on its own: without an override, a refusal means fix the part and run `slice_part`
+   again. Same content set and layout = no new revision.
    Unmanaged/hand-copied printables are never touched unless the user reviewed them and you
    pass their relative paths in `retire_paths`.
-4. Read back with `print_media_inventory` and report: the `PRINT/<project>/` path, each exact
-   `R<rev:03><part:02>_<PART>.gcode` filename (e.g. `R00101_UPPER_ARM.gcode`, release 001
-   part 01 — the first six characters stay unique when a printer truncates names) and its
-   part, the revision, what was archived (a non-printable ZIP), every warning unchanged
-   (slicer, printability, physical-fit caveats), and every unmanaged printable or duplicate
-   still on the media. While any remain, the media is NOT clean — list them and ask.
+   Deprecated G-code is permanently deleted after verified publication, NEVER archived
+   on the drive or host. Temporary rollback staging is removed after commit. Obsolete
+   managed archives are deleted too; unrelated files and other projects are untouched.
+4. Layout defaults to raw `<part>.gcode` files at the drive ROOT. Use `layout="project"`
+   only for one top-level `<PROJECT>/` folder; never create PRINT/, nested job folders,
+   CAD/review packets or per-release delivery trees on printer media. Keep STL, STEP+,
+   3MF and slicing evidence in the workspace, not on the drive.
+5. Read back with `print_media_inventory` and report the returned folder and each exact
+   filename with its part, the revision, what was deleted/replaced, every
+   warning unchanged (slicer, printability, physical-fit caveats), and every unmanaged
+   printable or duplicate still on the media. While any remain, the media is NOT clean.
 - A refusal (inventory changed, idle not confirmed, hash mismatch, modified managed file,
   symlink/path escape) or partial failure: report it with the state the tool returned; never
   fall back to copying.
@@ -64,7 +78,7 @@ indistinguishable on its screen. The media must hold exactly the current set.
   ad-hoc copies are how stale duplicates pile up. Humans have the same path:
   `python3 scripts/print_media.py inventory ROOT` and `python3 scripts/print_media.py publish
   ROOT --project PROJECT --jobs-file JOBS.json --expected-inventory TOKEN --media-idle
-  [--retire-path RELPATH …]`.
+  [--layout project] [--retire-path RELPATH …]`.
 
 ## Geometry rules (0.4 mm nozzle, 0.2 mm layers; scale with nozzle)
 - Walls: ≥ 1.2 mm (3 lines) structural, never < 0.8 mm; size in line-width multiples

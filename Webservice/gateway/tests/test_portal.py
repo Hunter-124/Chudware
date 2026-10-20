@@ -235,6 +235,57 @@ def test_password_change_and_signout_everywhere_delete_all_sessions(pg, monkeypa
     assert "Max-Age=0" in signed_out.headers["set-cookie"]
 
 
+def test_oauth_only_admin_grant_cannot_race_a_portal_password_change(pg, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+    from threading import Event
+
+    email = "portal-security@example.com"
+    _seed(email)
+    old = "correct horse battery staple"
+    new = "new correct horse battery staple"
+    authn.set_password(email, old, verified=True)
+    client = _client(monkeypatch, email)
+    checked = Event()
+    release = Event()
+    admin_lock_entered = Event()
+    real_verify = authn.verify_password
+    real_lock = authn._lock_account
+
+    def paused_verify(digest, password):
+        result = real_verify(digest, password)
+        checked.set()
+        assert release.wait(10), "portal password change was not released"
+        return result
+
+    def observed_lock(address):
+        if checked.is_set() and not release.is_set():
+            admin_lock_entered.set()
+        return real_lock(address)
+
+    monkeypatch.setattr(authn, "verify_password", paused_verify)
+    monkeypatch.setattr(authn, "_lock_account", observed_lock)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        changing = pool.submit(
+            client.post, "/api/portal/password",
+            json={"current_password": old, "new_password": new},
+        )
+        granting = None
+        try:
+            assert checked.wait(10), "portal did not check the current password"
+            granting = pool.submit(
+                authn._cli, ["grant-admin", "--email", email, "--oauth-only"]
+            )
+            assert admin_lock_entered.wait(10), "admin grant did not reach the account lock"
+            with pytest.raises(FutureTimeout):
+                granting.result(timeout=0.1)
+        finally:
+            release.set()
+        assert changing.result(timeout=10).status_code == 200
+        assert granting.result(timeout=10) == 0
+    assert authn.get_credential(email) is None
+    assert accounts.get_account(email).role == "admin"
+
+
 def test_usage_is_credit_only_and_never_exposes_upstream_cost(pg, monkeypatch):
     email = "portal-usage@example.com"
     _seed(email, plan="studio")

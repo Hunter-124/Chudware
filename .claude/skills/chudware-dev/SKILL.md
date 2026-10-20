@@ -39,6 +39,15 @@ Base skill for every non-GUI change. Pointers:
 - Notable multi-file efforts append a one-paragraph handoff to `docs/REFACTOR_LOG.md`
   (files, deferred items, gotchas). If a change alters structure or conventions, update the
   affected skill alongside it.
+- **Browser tenant cells:** web contract 2 admits a method only if
+  `contracts/cell_methods.json` classifies it `allow` for the caller's right
+  (owner/manager/editor/viewer); unclassified methods are refused and
+  `scripts/cell_methods.py` must stay complete. The gateway (`cells.py`) reaches one
+  socket-activated, bwrap-isolated cell per workspace (`chudware-cell@<hex>`) with a
+  principal hello; actors run in nested `chudware-actor-sandbox` lanes with server-minted
+  handles and typed `not_found` for foreign/absent/malformed ids. Never add raw forwarding,
+  unsandboxed fallbacks, ambient credentials or an admin bypass. Contract:
+  `contracts/worker_rpc.md` cell addendum; acceptance: `Webservice/deploy/tests/test_two_tenant_cells.py`.
 
 ## Repo pointers AGENTS.md does not carry
 
@@ -105,6 +114,13 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   are append-only and integrator-owned; subagents request edits instead of making them.
 - Additive/removal features in `core/doc/document.cpp` use `geom::fuse_unify`/`cut_unify`,
   never plain `fuse`/`cut` (split coplanar faces read as "not fused").
+- **Sketch ops never compile uncached.** An op handler that needs compiled geometry (sketch
+  plane, external-ref projection) reads it through `apply_ops_locked`'s session apply context
+  (session CompileCache + display quality); the associative refresh reuses the session-owned
+  external projection cache (per-model-state descriptors + per-ref memo). An uncached
+  `compile_document` there made one Convert Entities click cost ~11 s on a 341-edge part
+  (now ~0.2 s). Sketch residuals never reward a free line collapsing (normalized
+  collinear/point-on-line, angular parallel/perpendicular).
 - Any change to compiled geometry/topology bumps `stepplus_cache_engine_key`. After
   `./build.sh stage` an auto-spawned dev hostd serves the old engine until it drains — check
   `chudware-hostd --status` before trusting an MCP smoke.
@@ -112,9 +128,19 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   (`geom::op_history_record`, or `op_provenance_encode`/`_record` across
   `isolate_shape_build`'s sidecar) or every rebuilt face is attributed to that feature
   (`core/geom/op_history.h`).
+- **Never mutate a geom op's input.** Compile checkpoints hold live TShapes and
+  NonDestructive booleans share untouched sub-shapes with their argument; OCCT
+  UnifySameDomain edits its input's edges in place, so unify runs on a `BRepBuilderAPI_Copy`
+  (`geom::unify_same_domain`, `dress.cpp` join) with the copy's history recorded. A cut whose
+  exact volume grows fails (`require_cut_removed_material`, `core/doc/document.cpp`).
 - `core/agent/run.cpp` calls doc ops in-process; every direct `doc::doc_new`/`doc_apply_ops`
   site invokes the `chudware_set_doc_publish_sink` callback or its result is invisible to
   clients until the run ends. `internal:true` keeps propagating (preflight shadow clone).
+- **Preflight is bounded advisory work.** `preflight_ops` spends at most a 10000-ms
+  candidate budget via `doc_dry_run_ops(budget_ms=...)`; the whole scratch rebuild
+  stays in an expendable process group, never an unbounded parent fallback. Expiry
+  is `verdict:"skipped", skipped:"budget_exceeded"`, not failed geometry or a radius
+  verdict. Metadata/lock/transport/cleanup are outside that hard candidate bound.
 
 ## hostd / daemon lifecycle
 
@@ -126,6 +152,22 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   never raw `status_.clients`: a `gui` client always pins; others pin only with an engine call
   in flight, an attached doc, or an RPC inside the idle window
   (`test_hostd_registry.py::test_parked_client_does_not_pin_the_daemon` + `…_attached_client_still_pins_the_daemon`).
+- **One Python worker = one writer, concurrent leased connections.** Online turns own a
+  `daemon_bridge.TurnConnections` pool. A host call leases one independent socket; idle
+  sockets survive short-lived RPC threads until the turn ends. Standalone MCP retains its
+  per-thread fallback. All sockets send the process `writer_group`; `doc_registry` counts
+  a group once for rw/CAS/`_foreign_edits`/holds
+  (doc lifetime stays per connection). Events never drop silently (2 s wait, then disconnect for
+  resync). `doc_list`/minting never wait on another doc's work (snapshot, `busy:true`). Each
+  agent has its own current part (`cad_common.agent_doc_context`). Contract: worker_rpc.md
+  "Writer groups…" (2026-10-12).
+- **Agents of different chats share a part by arrival order.** `core_bridge` sends implicit
+  `doc_apply_ops` with `base_revision: -1` (no hostd CAS between writer groups); the engine
+  DocLock applies batches one at a time, each atomic and validated. Rollbacks never wipe a
+  foreign commit: `core_bridge.revert_own_batch` reverts only when the checkpoint revision + 1
+  is the batch revision, with `doc_revert expect_revision`; probes delete their own feature.
+  The end-of-turn save sweep skips untouched agent docs another writer group holds rw
+  (`doc_list.other_writer`). No semantic conflict check by design (`test_same_doc_writers`).
 - **Background GUI queries stay off the primary socket.** Document-free metadata/worker-
   bridged queries from non-primary threads use per-thread `gui-background` sockets (exact
   allowlist in `services/ipc/ipc_client.cpp`, reached through `services/worker/engine_backend.cpp`);
@@ -151,15 +193,28 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
 - **Worker lanes** (`WorkerBridge::forMethod`, `core/hostd/worker_bridge.cpp`): a new stateful
   agent RPC family joins the agent-lane prefix list or lands in a process blind to Chudcode
   sessions. Files shared across worker processes need flocks, not threading locks.
+- **Concurrent turns: one turn per agent worker.** `WorkerBridge::dispatch` runs each
+  `agent_admin_turn` in a pool worker (primary `agent` + on-demand `agent-turn` extras, cap
+  `CHUDWARE_AGENT_WORKERS`, default 4; extras idle 10 min are reaped at the next selection).
+  A conversation is owned by one worker: its turns and session-scoped calls go there; the same
+  conversation never runs twice at once. Moving it to a free worker first makes the busy owner
+  `release` (dispose) its idle Chudcode runtime over the control socket; a refused/failed
+  release keeps the conversation waiting for its owner. Two live runtimes of one session fork
+  its history: a disposed stale runtime writes `session_exit` at its old leaf and the next
+  resume continues from there (`test_busy_owner_releases_a_conversation_before_another_worker_resumes_it`).
+  Worker forks run on one daemon-lifetime thread: PDEATHSIG follows the forking THREAD, and
+  a worker forked on a connection thread died with that client (same rule as ChildSupervisor).
 - **Nothing waits behind a turn.** `WorkerBridge::stop()` cancels the active run over the
   control lane, waits ≤10 s, SIGTERMs, never respawns (`test_sigterm_mid_turn_ends_the_turn_and_the_daemon`).
-  A non-turn call behind `agent_admin_turn` fails at once with `worker_lane_busy`; other lane
-  waits end at the call's own timeout (`test_agent_lane_call_behind_a_turn_fails_fast_and_hostd_survives`;
+  A non-turn call behind the primary's `agent_admin_turn` fails at once with `worker_lane_busy`;
+  other lane waits end at the call's own timeout (`test_agent_lane_call_behind_a_turn_fails_fast_and_hostd_survives`;
   `provider_usage.cpp` treats busy as silent). hostd never replays an `agent_admin_turn` after
-  worker loss (`worker_lost_mid_turn`).
-- **No GUI call waits on a turn client-side.** In daemon mode long runs
-  (`agent_admin_turn`/`agent_run_v2`/`agent_mission_v1`) serialize on
-  `WorkerClient::longRunMtx_`, not `callMtx_`; two long runs never overlap (`test_worker_long_run`).
+  worker loss (`worker_lost_mid_turn`). Stop/steer/answer route by `run_id` across the pool.
+- **No GUI call waits on a turn client-side.** In daemon mode each `agent_admin_turn` leases its
+  own agent run connection (`engine_backend`, ≤8) and takes no client mutex, so turns of
+  different chats overlap; native `agent_run_v2`/`agent_mission_v1` still serialize on
+  `WorkerClient::longRunMtx_` (`test_worker_long_run`). Daemon turns never fetch
+  `worker_control_info`; control goes through hostd.
   An async tab switch stays selected until activation lands or fails (`core::SwitchHold`, `test_switch_hold`).
 - **CEF fetch daemon** (`host/src/ui/widgets/cef/cef_daemon.cpp`): `start_idle_watchdog` is
   armed before `initialize()`; every activity update goes through `mark_activity()`. Spawn is
@@ -187,13 +242,26 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   `compiled` + `compile_cache` from them, so a valid cache opens warm (first op executes 0
   features, first edit only the tail). Every skip is reported (`cache.skipped_reason`,
   `cache_miss_reason`), never swallowed; an oversized cache entry is a miss, never a failed
-  open (`test_appearance` "persisted build state" cases).
+  open (`test_appearance` "persisted build state" cases). **A rebuild is saved back too**
+  (§17): a `doc_open` that missed (engine-key bump, outside edit) and an assembly load of a
+  stale component write the fresh build into that file via `stepplus_write_build_state`, which
+  replaces only `cache.*`/`geometry.step` (every other member copied byte for byte, refused if
+  the file changed since the read). Never route that through `stepplus_save` — it rewrites
+  `meta.json`/`thumbnail.png` and the vault shows the file as modified.
 - **Mission docs are saved, never closed.** `cad_common.save_touched_docs()` runs at every
   turn terminal (`mission_dispatch.run_linear_role_turn`) and in the crash-path `finally`
   (`worker_rpc._agent_admin_turn`), writing docs hostd would retire into
   `CHUDWARE_PROJECT_SAVE_DIR`. It never touches `origin_kind=gui`, never writes an empty doc,
   skips pristine reproducible imports (`reproducible_from`) and docs recorded in
   `_DISCARDED_DOCS`.
+  The per-batch `_project_save` behind `add_features`/`new_part` skips `origin_kind=gui` too:
+  agent edits to a user-opened doc stay live (dirty, hostd-autosaved) until an explicit
+  save, never auto-written into the user's file (`test_project_save`).
+  Study-only detached native imports deliver to an unused project filename.
+  Non-study authored imports retain source-save behavior unless another GUI doc
+  holds that source (`doc_list.native_source_edited`; worker RPC six-axis addendum).
+  Loaded study IDs must not collide with newly minted IDs; `_persist_study` keeps
+  the `study_id` returned when a legacy duplicate is disambiguated.
 - **One design = one document; names carry no version.** A version token resumes the series
   (`_docs_in_version_series`; `fresh=True` escapes) and `_strip_version_suffix` normalizes all
   three `doc_new` mint payloads. Series lookups see the raw name; the strip is skipped when a
@@ -205,11 +273,19 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   (`_HARNESS_SAVED_PATHS`, `removed_stale_copy`). `save_part` refuses
   `path_open_in_user_tab` over a file a user-opened doc holds (`cad_common.user_doc_open_at`):
   the agent edits that doc in place. Empty docs refuse save/export unless `allow_empty`.
+  Explicit relative destinations resolve against `CHUDWARE_PROJECT_DIR`, then
+  `CHUDWARE_FS_ROOT`, never worker cwd or an ancestor repository. A selected nested
+  directory stays the project root; an invalid explicit root refuses rather than
+  falling through. Absolute/`~` exports still enforce credential-path checks.
 - **PLM tools.** `plm_item_add` is for non-design files (`.step+`/`.ecad+` auto-register on
   save → `plm_checkpoint`); its `path` is the project root, the tracked item goes in
   `file_path`/`folder_path`. `plm_*` default `path` to `CHUDWARE_PROJECT_DIR` →
   `CHUDWARE_FS_ROOT` → `project_context.resolve_project_root()`, else
   `project_root_unavailable`; document-scoped AI-VC ops take no project root.
+- **Agent edit lock (interim #55).** A doc written by a non-`gui` client locks every human
+  mutation path (`AppState::docLockedByAgent`, banner + Stop) while the writing run lives, or
+  for 8 s. Sessions on it keep-exit and never `doc_revert`. A new human mutation path must check
+  the predicate (`CHUDWARE_SHOT=agentlock`).
 - **The user's view.** An agent-opened doc never takes focus from the user's tab
   (`openMirrorTab`). Agent edits reach the active tab live: `engine_events.cpp` defers
   `doc.changed` only while `userMidEdit`; a revision without an `aicm_path` key keeps the mesh
@@ -227,7 +303,13 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   cross-project history viewing does not rewrite another root's remembered session.
   `CHUDWARE_SHOT=projectchat` exercises these transitions and real outside-file opening.
 - **Steers split the running bubble** (`composer.cpp::appendSteerToTranscript`, persisted
-  `steerSplit`/`"split"`): append-only, so AI-VC `msg_idx` anchors never shift.
+  `steerSplit`/`"split"`): append-only, so AI-VC `msg_idx` anchors never shift. The steer's
+  user bubble carries `steerId`/`steerState` (persisted `"sid"`/`"steer"`; open states load as
+  failed) and a caption under it: queued / read / unread-sends-next / not delivered
+  (`CHUDWARE_SHOT=steerstatus`).
+- **Question cards draw where asked:** `agent.question` appends a rowKind-20 timeline marker
+  (`__ask__:<batch_id>`) and the card renders at it; restored pre-marker batches anchor after
+  their `ask_user` tool row on load. Never draw a marked batch after the turn again.
 - The model picker has no default-hiding pass: `hidden_models` is only the user's own choice;
   `loadSettings` drops a list carrying `model_defaults_seeded`.
 
@@ -293,7 +375,9 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   `civil_site` study per model through `services/mcp/civil_common.py` (a changed model drops
   its results; `civil_load` restores); the `civil_*` tools have no GUI panel yet.
 - **Assemblies report honestly:** bbox/mass/import gather world solids (`measure_part` is the
-  MCP mass tool); `check_interference` refuses an empty doc and reports `pairs_checked`;
+  MCP mass tool; without `density_g_cm3`/`material=` each body weighs at its applied material —
+  body override, part material, component source material — and 7.85 steel only where none
+  resolves; `material.source` says which); `check_interference` refuses an empty doc and reports `pairs_checked`;
   a complete check is `ok:true` with the verdict in `clear` (interface_check: `status`), so
   a found clash is a finding, not a failed tool; `ok:false` means refused or incomplete;
   `validated: true` needs every component's solids and an exact round trip; a no-op
@@ -332,6 +416,12 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   Agents never download a slicer or hand-write slicer keys. PrusaSlicer 2.9.6 CLI (re-verify
   on upgrade): no `--arrange`, bare `--merge` segfaults headless (use `--dont-arrange --merge`),
   and no sequential-clearance check.
+- **Slicer input preserves topology.** Single-part STL placement is origin-centred with a
+  float32-grid-aligned shift; PrusaSlicer places it on the bed in double precision.
+  Newly merged vertices or zero-area triangles refuse as `slicer_mesh_precision_loss`,
+  never heal silently. Requested 3MF evidence must report zero load-time repairs.
+  DFAM tool reach is Euclidean; trapped-support failure applies per connected cluster,
+  not the sum of unrelated warning crumbs. Narrow and sealed cavities still fail.
 - Multi-part plates (`complete_individual_objects=True`, `slicer/plate.py`): hulls spaced by
   `extruder_clearance_radius` + brims + 2 mm, ascending height, at most one object above
   `extruder_clearance_height` (printed last); `gcode_check`'s `sequential_clearance` re-proves
@@ -342,6 +432,14 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   `services/manufacturing/print_media.py`; humans use `scripts/print_media.py`. The printer UI
   shows no timestamps, so stale duplicates are ambiguous. Publish takes the complete job set,
   the whole-drive `inventory_token` and explicit `media_idle=True`, reads back hashes,
-  archives prior managed revisions in a non-printable ZIP, and reports unmanaged printables
-  it did not touch. An agent with a shell can still `cp` — the guarantee is policy + tool,
-  not prevention.
+  and permanently deletes deprecated managed toolpaths after verified commit; no G-code
+  archives on media or host. Jobs must be `print_ready` unless the job carries the user's
+  explicit `user_override`: it then publishes with `failed_checks` recorded in the media
+  manifest, README, inventory and a `published_not_print_ready` warning. Agents never refuse
+  that instruction or hand-copy around it. Default `layout="root"` writes raw stable part filenames at the
+  drive root; `layout="project"` permits one top-level project folder, never nested delivery
+  trees. Tracking metadata stays in hidden root files. Legacy managed trees migrate and
+  obsolete managed archives are deleted; unknown files and other projects remain protected.
+  Temporary non-printable staging exists only for rollback/recovery and is deleted after
+  current files and metadata pass readback. Report every remaining unmanaged printable.
+  An agent with a shell can still `cp` — the guarantee is policy + tool, not prevention.

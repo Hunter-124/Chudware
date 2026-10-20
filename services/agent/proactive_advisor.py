@@ -308,12 +308,7 @@ def _try_llm_advice(
         "Max 4 short notes. No markdown. No tools or CAD mutators. "
         "No invented dimensions."
     )
-    parent_session = str(
-        source_options.get("session_id")
-        or source_options.get("parent_session_id")
-        or source_options.get("run_id")
-        or "proactive-advisor"
-    )
+    parent_session = str(source_options.get("session_id") or "")
     run_id = str(source_options.get("run_id") or f"{parent_session}:proactive")
     parent_id = str(
         source_options.get("node_id")

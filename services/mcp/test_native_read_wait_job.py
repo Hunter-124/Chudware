@@ -233,6 +233,24 @@ def test_wait_job_cancel_interrupts_only_wait(tools, running_job):
                                          poll_s=0.5))["status"] == "done"
 
 
+def test_a_user_message_wakes_the_wait_but_never_the_job(tools, running_job):
+    # c252: the user's message sat 2m41s behind a 900 s wait_job before they pressed Stop.
+    jid, release = running_job
+    arrived = threading.Event()
+    threading.Timer(0.2, arrived.set).start()
+    start = time.monotonic()
+    result = json.loads(tools["wait_job"](
+        job_id=jid, timeout_s=900, poll_s=30,
+        wake=lambda: "user_message" if arrived.is_set() else None))
+    assert time.monotonic() - start < 1.5
+    assert result["woken_by"] == "user_message"
+    assert result["status"] == "running" and result["still_running"] is True
+    assert f"wait_job('{jid}')" in result["hint"]
+    release.set()
+    assert json.loads(tools["wait_job"](job_id=jid, timeout_s=2,
+                                         poll_s=0.5))["status"] == "done"
+
+
 def test_wait_job_unknown_id_does_not_wait(tools):
     start = time.monotonic()
     unknown = json.loads(tools["wait_job"](job_id="job-unknown", timeout_s=900))

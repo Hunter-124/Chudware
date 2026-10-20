@@ -78,22 +78,24 @@ def _health(doc_id: str, fid: str) -> dict:
 
 
 def _apply_ops(doc_id: str, ops: list) -> dict:
-    """doc_apply_ops with all-or-nothing rollback (mirrors add_features' transaction)."""
+    """Apply an atomic PART batch or revision-guard its fallback rollback."""
     ckpt = None
     try:
-        ckpt = cb.call("doc_checkpoint", {"doc_id": doc_id}).get("checkpoint")
-    except Exception:  # noqa: BLE001
+        ckpt = cb.call("doc_checkpoint", {"doc_id": doc_id})
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "code", None) == "engine_connection_lost":
+            raise
         ckpt = None
     r = cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": ops})
     fs = (r.get("rebuild") or {}).get("feature_status", [])
     ok = all(s.get("ok") for s in fs) if fs else True
-    if not ok and ckpt:
-        try:
-            cb.call("doc_revert", {"doc_id": doc_id, "checkpoint": ckpt})
-        except Exception:  # noqa: BLE001
-            pass
+    if not ok:
+        reverted = bool(r.get("rejected_tree"))
+        if not reverted:
+            reverted = cb.revert_own_batch(doc_id, ckpt, r.get("revision"))
         fails = [{"id": s.get("id"), "error": s.get("error")} for s in fs if not s.get("ok")]
-        raise ValueError(f"ops rejected (doc rolled back): {json.dumps(fails)}")
+        state = "doc rolled back" if reverted else "failed features left in the tree"
+        raise ValueError(f"ops rejected ({state}): {json.dumps(fails)}")
     _mirror(doc_id)
     return r
 
@@ -696,7 +698,7 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
         """Add constraints to a sketch3d and return the narrated solve results.
 
         constraints: list of constraint records (doc_schema §3B); `id` ("c<N>") is optional
-        (auto-assigned).  v1 vocabulary:
+        (auto-assigned). Relations and dimensions:
           {type:'coincident',  refs:[pointH, pointH]}                pull two points together
           {type:'fix',         refs:[handle or 'e<N>']}             pin at authored coords
           {type:'distance',    refs:[pointH, pointH|lineE], value: mm}
@@ -705,12 +707,18 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
           {type:'perpendicular', refs:[lineE, lineE]}
           {type:'angle',       refs:[lineE, lineE], value: deg}
           {type:'along_axis',  refs:[lineE], axis:'x'|'y'|'z'}  (or dir:[x,y,z])
-          {type:'point_on',    refs:[pointH, lineE|arcE]}
-        Point handles: 'e3.p1'/'e3.p2' (line/arc ends), 'e3.pm' (arc through-point),
-        'e3.p0'..'e3.pN' (spline points), 'e3.p' (point entity).  `value` may be a bare
-        number or {value, expr} (expr evaluates against doc equations); add driven:true for
-        a reference (measured) dimension.  tangent/symmetric/equal/midpoint are NOT in v1 —
-        the validator rejects them.
+          {type:'point_on',    refs:[pointH, lineE|arcE|splineE]}
+          {type:'tangent'|'equal'|'collinear'|'concentric'|'coradial', refs:[curveE,curveE]}
+          {type:'midpoint', refs:[pointH,lineE|arcE]}
+          {type:'on_plane', refs:[pointH], plane:'front'|'top'|'right'}
+          {type:'parallel_plane'|'normal_plane', refs:[lineE], plane:'top'}
+          {type:'symmetric', refs:[pointH,pointH], plane:'right'}
+        plane may also be {origin:[x,y,z],normal:[x,y,z]}. Point handles:
+        'e3.p1'/'e3.p2' (line/arc ends), 'e3.pm' (arc through-point),
+        'e3.p0'..'e3.pN' (spline points), 'e3.p' (point entity), or an x<N> model-vertex
+        reference from sketch3d_ref_vertex. `value` is a number or {value,expr};
+        driven:true measures instead of driving. Prefer relations + driving dimensions
+        over fix-pinning authored coordinates; fix is appropriate for external references.
 
         Returns {ok, id, added, health} — health mirrors check_sketch's narrated read:
         status full/under/over, dof, conflicting/redundant constraint ids, and the remaining

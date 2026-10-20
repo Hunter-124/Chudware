@@ -30,6 +30,7 @@
   arc_center, arc_tangent, polygon, slot, spline, ellipse, point_ent, text_ent, trim, extend,
   offset_ent, convert_ent, mirror_ent, pattern_lin_ent, pattern_circ_ent, move_ent,
   construction, relations, fix`
+- **Sketch tab (relations management)**: `display_relations, fully_define`
 - **Sketch flyouts** (variant tools, parented under their base tool): `rect_3pt_corner,
   rect_3pt_center, parallelogram, circle_perimeter, slot_ctr_str, slot_arc_3pt, slot_arc_ctr,
   spline_style, spline_surface, spline_equation, ellipse_partial, parabola, conic`

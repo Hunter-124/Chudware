@@ -490,13 +490,25 @@ SIMULATE WORKSPACE (host GUI): every live simulation family has guided setup plu
 _MOTION_GUIDE = """\
 MOTION / KINEMATICS GUIDE — make an assembly MOVE, and check it clears as it goes.
 
-simulate_motion(mate_id, start, stop, steps, ...) is the assembly-motion study: it DRIVES one
-mate through a range and re-solves the whole mate graph at each sample, so the rest of the
-mechanism follows — SolidWorks-Motion / Onshape-Assembly-Motion for the common KINEMATIC case.
+Load cad_skill(name="simulate") before mechanism work. simulate_motion drives one or more
+synchronized angle/distance mates and re-solves the graph at each computed sample. It returns
+body world poses plus per-frame overlap/clearance findings, not continuous-path proof.
 
-WHAT IT ANSWERS: "does this linkage / crank / cam / gear-train move the way I meant, and does
-anything CLASH as it sweeps?" It returns a trajectory (every body's world 4x4 pose per step) plus
-a per-step interference sweep that flags the FIRST colliding step.
+EVIDENCE / COST FIRST
+  * Guard ok:false before indexing trajectory: refusals/timeouts need not contain it. Never
+    fabricate a trajectory. ok:true means completed, NOT collision-free.
+  * Read EVERY computed frame's collision_detail/collisions. Top-level interference.detail
+    is FIRST HIT ONLY, never a union; baseline overlaps are not automatically permitted
+    joints. Justify accepted pairs separately, rather than hiding them as known contacts.
+  * Sampled-clear requires check_interference=true, interference.complete=true,
+    frames_checked==steps, all frames converged/pose-valid and no hits. Missing geometry,
+    failed pairs, null unchecked evidence or failed poses are incomplete, not clear.
+  * min_clearance_mm=0 checks overlaps only. A positive threshold requests expensive exact
+    distances for candidate pairs below it, not a cheap tolerance adjustment or a global
+    minimum-distance table. Start with a short overlap sweep; budget clearance deliberately.
+  * Print the existing result before rerunning slow work. status="still_running" /
+    in_flight=true after timeout means not cancelled: an identical call in the same run
+    joins the original work, never restarts it. Do not change args to duplicate live work.
 
 SCOPE: kinematics by default — position (and, by sampling, velocity). Pass dynamics={...} (even
 {}) to ALSO run RIGID-BODY INVERSE DYNAMICS on the same sweep: mass/inertia from each component's
@@ -524,10 +536,19 @@ HOW TO USE
      Use drivers=[{"mate_id":"m3","start":0,"stop":180}, ...] for a synchronized
      multi-joint sweep. Do not hand-roll forward kinematics in Python or build
      throwaway pose assemblies.
-  3. Read the result: trajectory[i].bodies[j].transform is body j's world pose at sample i (the
-     datum a viewer animates); interference.first_collision_step / _value is the first clash (with
-     the interfering pair in `detail`). The study RESTORES the driven mate to its original value
-     when it finishes — it reads motion, it doesn't leave the assembly moved.
+  3. Read trajectory[i]: bodies[j].transform is row-major world 4x4; converged,
+     max_residual/worst_mate/tolerance, dof/residual_dof and pose_check describe that pose.
+     collision_detail has stable component_a/component_b, overlap_volume_mm3 for overlaps,
+     or distance (mm) and warning="below min clearance". collisions contains the same
+     hits with overlap_volume_mm3 defaulted to zero: zero volume can still be unsafe.
+     interference is true for known hits, false only for complete clear checks, or null
+     for unchecked/incomplete checks without known hits; interference_complete,
+     pairs_checked/pairs_reused, pair_failures and geometry_failures expose coverage.
+     Counts/geometry_failures may be absent on unchecked frames. Reused pair results
+     (reused=true) at unchanged relative poses count toward pairs_checked, not missing work.
+     Known hits survive incomplete checks. The loop playback copy is not another check.
+     interference.first_collision_step / first_collision_value and detail describe ONLY
+     the first colliding sample. Live poses/mates/history never change: it solves a snapshot.
   4. The user WATCHES it as the document's Motion study: every successful sweep is saved into
      the open assembly (result `motion_study.view`; Features > Assembly > Motion Study opens it).
      A rendered .mp4/.gif is a file, not a study — a film of another assembly file is not a
@@ -541,8 +562,9 @@ TIPS
   * A single angle/distance mate under-constrains a free body (it removes one DOF of six); pin the
     unwanted DOF with extra mates (e.g. a `parallel` to keep a planar linkage in-plane) so the
     driven pose is unique.
-  * Swept interference reuses check_interference per step — it does not reimplement collision;
-    tune it with min_clearance_mm just like a static check.
+  * More samples improve resolution but never prove continuous clearance. Report the
+    actual assembly/revision, ranges, computed sample count, threshold and all findings;
+    an overlap-only or threshold sweep does not measure a global minimum clearance.
 """
 
 _ASSEMBLY_GUIDE = """\
@@ -641,6 +663,11 @@ WORKFLOW
                                             A suppressed run (trivial batch, CHUDWARE_PREFLIGHT=0,
                                             or a preflight error) returns verdict "skipped" with
                                             the reason in skipped/skipped_detail.
+                                            An invalid fillet/chamfer solid is rejected even if
+                                            OCCT reports construction success. Atomic failure keeps
+                                            the prior live tree/revision; regen_diagnosis uses the
+                                            rejected candidate and native feature error. Provider
+                                            unavailability does not erase that native evidence.
   3. render_part()                          SEE it — ONE call returns a 2x2 grid of the four
                                             most useful complementary shots (the planner
                                             measures ~200 cameras in the engine and picks the
@@ -687,6 +714,17 @@ DOC OWNERSHIP & SAVE DISCIPLINE
   An unsaved AI doc that's just abandoned is retired to a crash-recovery tier — a safety
   net, NOT a delivery mechanism, and never surfaced to the user as a warning. If the user
   edits your doc they ADOPT it (it becomes theirs); you keep co-editing the same live doc.
+  Explicit save_part/export_part relative paths (e.g. "parts/redesign/base.step+") use
+  the selected workspace: CHUDWARE_PROJECT_DIR, then CHUDWARE_FS_ROOT, independent of
+  worker cwd or continuation. A selected nested workspace is not widened to a parent
+  project/repository. Without a valid project root, pass an absolute path. Absolute
+  and "~" destinations may be outside the workspace, but credential/key locations
+  are refused after resolving symlinks. Pathless saves keep an existing native file
+  in place, otherwise use CHUDWARE_PROJECT_SAVE_DIR (temp only with no project).
+  Native STL export refuses collapsed facets or a source-solid mesh that is not closed
+  and consistently oriented in the serialized output. It does not heal geometry or
+  weld nearby points. Keep the native error and inspect the source/export conditions
+  rather than deleting triangles or claiming an unchecked mesh is print-ready.
 
 PRIMITIVE PLACEMENT & ORIENTATION (box / cylinder / sphere / cone / torus)
   A primitive is built CENTRED ON THE ORIGIN and then placed. These are the placement keys,
@@ -781,12 +819,16 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
   sketch_health(id)      the narrated constraint read: WHICH free variables remain (dof in plain
                          words), open chain endpoints, per-entity under/full/over, redundant/
                          conflicting with removal hints, and an ORDERED schedule (relations first,
-                         then driving dims) to reach dof 0 — the sketch loop is edit -> sketch_health
-                         -> add the scheduled relations / sketch_auto_constrain -> repeat.
+                         then driving dims). Draw roughly -> relations -> critical dimensions ->
+                         sketch_fully_define -> check_sketch: dof 0 and not pinned_only.
   sketch_auto_constrain(id)  stitch near-touching endpoints coincident (apply=True, default) or
                          just propose them (apply=False); each add is rollback-safe (skips any that
                          would conflict) and it reports which chains closed. Runs automatically after
                          edits when doc meta sketch.auto_coincident is on (default).
+  sketch_fully_define(id) infer residual editable relations/dimensions (never blanket fix).
+                         relations=True, dimensions=True, anchor="origin"|"none", entities=[ids]
+                         optionally limit it. add_features runs this in the same revision after
+                         NEW sketches / sketch_add_entity batches; auto_define:false opts out.
   describe_scene(views)  the TEXT equivalent of render_part/contact_sheet for a model with no
                          vision: per requested view (default front/right/top/iso), which faces
                          face the camera (by sid/surf/side/dims) plus the part bbox — computed

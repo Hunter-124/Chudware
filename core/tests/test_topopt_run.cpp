@@ -14,9 +14,11 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <random>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -83,6 +85,17 @@ json x_face(double x) {
   return {{"points", points},
           {"tol_mm", std::hypot(kLy, kLz)},
           {"face_normal", {x > 0 ? 1.0 : -1.0, 0.0, 0.0}},
+          {"perp_tol_mm", 0.01}};
+}
+
+json z_face(double z) {
+  json points = json::array();
+  for (double x : {0.0, kLx / 2, kLx})
+    for (double y : {0.0, kLy / 2, kLy})
+      points.push_back({x, y, z});
+  return {{"points", points},
+          {"tol_mm", std::hypot(kLx, kLy)},
+          {"face_normal", {0.0, 0.0, z > 0 ? 1.0 : -1.0}},
           {"perp_tol_mm", 0.01}};
 }
 
@@ -185,6 +198,41 @@ std::size_t vtu_count(const std::string &xml, const std::string &attribute) {
   const std::size_t at = xml.find(key);
   REQUIRE(at != std::string::npos);
   return std::stoul(xml.substr(at + key.size()));
+}
+
+SurfaceMesh stl_positions(const std::string &bytes, const SurfaceMesh &raw) {
+  REQUIRE(bytes.size() == 84 + 50 * static_cast<std::size_t>(raw.triangle_count()));
+  SurfaceMesh out = raw;
+  for (int t = 0; t < raw.triangle_count(); ++t)
+    for (int k = 0; k < 3; ++k)
+      for (int c = 0; c < 3; ++c) {
+        float value;
+        std::memcpy(&value, bytes.data() + 84 + 50 * t + 12 + 12 * k + 4 * c, 4);
+        out.points_m(c, raw.triangles(k, t)) = value * 1e-3;
+      }
+  return out;
+}
+
+double mean_normal_deviation(const SurfaceMesh &surface) {
+  std::map<std::pair<int, int>, int> owner;
+  double sum = 0;
+  int count = 0;
+  auto normal = [&](int t) -> Eigen::Vector3d {
+    const Eigen::Vector3d a = surface.points_m.col(surface.triangles(0, t));
+    return (surface.points_m.col(surface.triangles(1, t)) - a)
+        .cross(surface.points_m.col(surface.triangles(2, t)) - a).normalized();
+  };
+  for (int t = 0; t < surface.triangle_count(); ++t)
+    for (int k = 0; k < 3; ++k) {
+      const int a = surface.triangles(k, t), b = surface.triangles((k + 1) % 3, t);
+      const auto key = std::minmax(a, b);
+      const auto [it, inserted] = owner.emplace(key, t);
+      if (!inserted) {
+        sum += std::acos(std::clamp(normal(t).dot(normal(it->second)), -1.0, 1.0));
+        ++count;
+      }
+    }
+  return count > 0 ? sum / count : 0;
 }
 
 } // namespace
@@ -353,6 +401,8 @@ TEST_CASE("structural inline run: honest result, consistent evidence, owned "
   CHECK(r["manufacturing"]["geometry_valid"] == rec["geometry_valid"]);
   if (!rec["geometry_valid"].get<bool>())
     CHECK_FALSE(r["artifacts"].contains("surface_stl"));
+  for (const auto &array : r["artifacts"]["overlay_aicm"]["arrays"])
+    CHECK(array["name"] != "overhang");
 
   // Owned, hashed, read-back artifacts; source untouched.
   const fs::path run_dir = r["result_dir"].get<std::string>();
@@ -638,4 +688,134 @@ TEST_CASE(
   CHECK(failed.status == "failed");
   CHECK_FALSE(failed.code.empty());
   CHECK_FALSE(failed.message.empty());
+}
+
+TEST_CASE("build plate resolves outward boundary normals before optimization") {
+  const fs::path dir = scratch_dir("build_plate");
+  json study = cantilever(dir, 1);
+  study["build_plate"] = {{"faces", z_face(0)}, {"label", "Printer bed"}};
+  study["topology"]["overhang_penalty"] = 0.2;
+  const auto prepared = prepare_topology_study(study);
+  REQUIRE(prepared.settings.build_direction);
+  CHECK(prepared.settings.build_direction->isApprox(Eigen::Vector3d::UnitZ()));
+  REQUIRE(prepared.problem->build_plate);
+  CHECK(prepared.problem->build_plate->triangles == 32);
+  CHECK(prepared.problem->build_plate->area_m2 == doctest::Approx(kLx * kLy * 1e-6));
+  CHECK(children(dir) == 0);
+  auto refused = [&](json invalid, const char *code) {
+    const json r = fea_run_topology(invalid);
+    INFO(code << ": " << r.value("error", std::string()));
+    CHECK_FALSE(r["ok"].get<bool>());
+    CHECK(r["error_code"] == code);
+    CHECK(r["field"] == "build_plate");
+    CHECK(r["error"].get<std::string>().find("Printer bed") != std::string::npos);
+    CHECK_FALSE(r.contains("history"));
+  };
+  json conflict = study;
+  conflict["topology"]["build_direction"] = {1, 0, 0};
+  refused(conflict, "build_plate_direction_conflict");
+  json nonplanar = study;
+  json picks = json::array();
+  const auto coordinates = study["points"].get<std::vector<double>>();
+  for (std::size_t n = 0; n < coordinates.size(); n += 3)
+    if (coordinates[n] == 0 || coordinates[n + 2] == 0)
+      picks.push_back({coordinates[n], coordinates[n + 1], coordinates[n + 2]});
+  nonplanar["build_plate"]["faces"] = {{"points", picks}, {"tol_mm", 0.01}};
+  refused(nonplanar, "build_plate_not_planar");
+  json empty = study;
+  empty["build_plate"]["faces"] = z_face(-20);
+  refused(empty, "build_plate_empty");
+  json top = study;
+  top["build_plate"]["faces"] = z_face(kLz);
+  const auto inverted = prepare_topology_study(top);
+  CHECK(inverted.settings.build_direction->isApprox(-Eigen::Vector3d::UnitZ()));
+  top["topology"]["build_direction"] = {0, 0, 1};
+  refused(top, "build_plate_direction_conflict");
+
+  // An underside ledge at z=5 is planar but another leg extends down to z=0.
+  json stepped = study;
+  json kept = json::array();
+  const auto points = stepped["points"].get<std::vector<double>>();
+  const auto tets = stepped["tets"].get<std::vector<int>>();
+  for (std::size_t t = 0; t < tets.size(); t += 4) {
+    double x = 0, z = 0;
+    for (int k = 0; k < 4; ++k) {
+      x += points[3 * tets[t + k]] / 4;
+      z += points[3 * tets[t + k] + 2] / 4;
+    }
+    if (x >= kLx / 2 && z < kLz / 2)
+      continue;
+    for (int k = 0; k < 4; ++k)
+      kept.push_back(tets[t + k]);
+  }
+  stepped["tets"] = std::move(kept);
+  stepped["build_plate"]["faces"] = z_face(kLz / 2);
+  stepped["build_plate"]["faces"]["face_normal"] = {0, 0, -1};
+  refused(stepped, "build_plate_not_lowest");
+  fs::remove_all(dir);
+}
+
+TEST_CASE("finished cantilever exports a pinned validated smoother print surface") {
+  const fs::path dir = scratch_dir("print_surface");
+  json study = cantilever(dir, 12);
+  study.update(box_mesh(16, 4, 4));
+  study["topology"]["volume_fraction"] = 0.6;
+  study["topology"]["density_threshold"] = 0.4;
+  study["build_plate"] = {{"faces", z_face(0)}, {"label", "Printer bed"}};
+  study["topology"]["min_member_mm"] = 1.2;
+  const json result = fea_run_topology(study);
+  INFO(result.value("error", std::string()));
+  INFO(result.value("artifact_refusals", json::object()).dump());
+  REQUIRE(result["ok"].get<bool>());
+  REQUIRE(result["reconstruction"]["geometry_valid"].get<bool>());
+  REQUIRE(result["artifacts"].contains("surface_print_stl"));
+  CHECK(result["reconstruction"]["print_surface"]["state"] == "valid");
+  CHECK(result["reconstruction"]["print_surface"]["pinned_vertices"].get<int>() > 0);
+  CHECK(result["reconstruction"]["print_surface"]["smoothed_vertices"].get<int>() > 0);
+  CHECK(result["artifacts"]["overlay_aicm"]["surface"] == "print");
+  CHECK(result["summary"]["filter_radius_source"] == "auto_2x_median_element_size");
+  CHECK(result["summary"]["min_member_filter_radius_mm"].get<double>() ==
+        doctest::Approx(0.6));
+  CHECK(result["summary"]["mesh_floor_radius_mm"].get<double>() >
+        result["summary"]["min_member_filter_radius_mm"].get<double>());
+  const auto &overhang = result["manufacturing"]["enforcement"]["overhang"];
+  CHECK(overhang["build_direction"] == json::array({0.0, 0.0, 1.0}));
+  CHECK(overhang["build_direction_source"] == "build_plate");
+  CHECK(overhang["build_plate"]["triangles"].get<int>() > 0);
+  CHECK(overhang["surface_measured_on"] == "print");
+  CHECK(overhang["surface_unsupported_area_mm2"].get<double>() >= 0);
+  bool scalar = false;
+  for (const auto &array : result["artifacts"]["overlay_aicm"]["arrays"])
+    scalar = scalar || array["name"] == "overhang";
+  CHECK(scalar);
+
+  const auto prep = prepare_topology_study(study);
+  const auto density = result["density"].get<std::vector<double>>();
+  const Eigen::VectorXd rho =
+      Eigen::Map<const Eigen::VectorXd>(density.data(), density.size());
+  const auto rec = reconstruct_design(*prep.problem, rho);
+  const SurfaceMesh &raw = rec.solid.surface.mesh;
+  const std::string raw_bytes =
+      read_file(result["artifacts"]["surface_stl"]["path"].get<std::string>());
+  const std::string print_bytes =
+      read_file(result["artifacts"]["surface_print_stl"]["path"].get<std::string>());
+  REQUIRE(raw_bytes.size() == print_bytes.size());
+  std::vector<bool> pinned(raw.vertex_count(), false);
+  for (int t = 0; t < raw.triangle_count(); ++t)
+    if (raw.triangle_origin[t] == TriangleOrigin::DomainBoundary)
+      for (int k = 0; k < 3; ++k)
+        pinned[raw.triangles(k, t)] = true;
+  for (int t = 0; t < raw.triangle_count(); ++t)
+    for (int k = 0; k < 3; ++k)
+      if (pinned[raw.triangles(k, t)]) {
+        const std::size_t offset = 84 + 50 * t + 12 + 12 * k;
+        CHECK(raw_bytes.compare(offset, 12, print_bytes, offset, 12) == 0);
+      }
+  const auto raw_stl = stl_positions(raw_bytes, raw);
+  const auto print_stl = stl_positions(print_bytes, raw);
+  CHECK(mean_normal_deviation(print_stl) < mean_normal_deviation(raw_stl));
+  CHECK(validate_surface(print_stl).state == GeometryState::Valid);
+  CHECK_FALSE(surface_self_intersects(print_stl));
+  check_artifacts(result, result["result_dir"].get<std::string>());
+  fs::remove_all(dir);
 }

@@ -89,3 +89,53 @@ method on either side (KiCad import is `ecad_open` dispatching on the `.kicad_sc
 `.kicad_pcb` extension), and that path is C++ since T-RF17 — nothing to track.
 `sim_cancel` and `fw_new_project` moved to `web_required` the same day as their
 cutovers landed; `fw_sim_run` (Renode emulator leg) is the only firmware remainder.
+
+## Tenant-cell browser protocol (2026-10-12 security cutover)
+
+This addendum supersedes the historical shared-native-only browser topology above.
+Browser CAD and AI are served only by OS-enforced tenant cells. Desktop/native
+dispatch, filesystem paths and session files retain their existing behaviour.
+
+- Gateway hello advertises `web_rpc_version: 2` and `web_rpc_methods: [<method>, …]`.
+  WASM dispatch admits only those exact methods; `hello` and `ping` remain available
+  before admission. Missing, older, unknown or malformed versions leave CAD/AI
+  disabled with `cell_refused`. There is no browser in-process fallback, native
+  read-only auto-upgrade or compatibility rebuild fallback.
+- Browser workspace root is `"."`; all file/dialog/attachment/workspace references
+  are relative. Absolute paths, Windows paths/backslashes, `..` components and NUL
+  are rejected, never stripped or reinterpreted. Invalid legacy persisted roots
+  are discarded in favour of `"."`. The cell maps accepted RPC paths below `/work`;
+  gateway host roots are never browser paths. `/workspace/list` returns root `"."`;
+  upload returns `{ok:true,path:<relative>,workspace_key:<key>,bytes:<size>}`.
+- `agent_handles_new {session_id?:<existing-cell-handle>}` returns
+  `{ok:true,run_id:<opaque>,session_id:<opaque>}` bound to the cell request's actor
+  context. The browser mints neither identifier and never sends its local chat id,
+  IDBFS sessions directory or runtime JSONL path as a run/session identity. Handles
+  are preserved byte-for-byte, bound to local chats, and persisted explicitly as
+  `cell_session_id`; historical native runtime ids are not adopted as cell handles.
+  Resume, compaction, voice and recovery actions use this binding. Branch/rewind
+  commits replace it with the returned child handle.
+- Browser Stop is always per-job and exact-handle. Stop before mint records a
+  pending cancellation; on mint completion that exact run is cancelled and its
+  turn is not sent. No browser path emits empty-run-id cancellation. Desktop Stop
+  semantics remain unchanged.
+- Browser run controls carry the provider captured at launch, including pre-mint
+  Stop, steering and answers; changing the composer's provider does not retarget
+  a live run's credentials. Session close uses the provider stored alongside its
+  opaque handle as `cell_session_provider`. Handle minting itself carries no
+  provider or provider key. Desktop wrappers retain their existing optional-free
+  call shape; browser cells receive BYOK credentials only from the gateway.
+- Gateway AICM replies use `aicm-cell:` followed by JSON
+  `{workspace_key,doc_id,path}`. Browser mesh fetch is
+  `/files/aicm?workspace_key=<key>&doc_id=<id>`, never an absolute path or shared
+  memory name. Gateway grants are actor/workspace/document/epoch-bound server
+  records and are revalidated on fetch; the reference's `path` is not authority.
+  Mesh caching keys the full workspace/document reference.
+- Feature history, relations and saved warm caches are unaffected: existing-file
+  picks, uploads and reopen paths all feed relative references to the same cell
+  document-open path rather than requesting a rebuild.
+
+Regression coverage: `host/tests/test_agent_job_routing.cpp` exercises workspace
+normalization and rejected boundaries, opaque mint/resume handles, malformed
+mint replies, per-job pending Stop and exact protocol/method admission. Parent
+verification includes native host tests and the WASM build.

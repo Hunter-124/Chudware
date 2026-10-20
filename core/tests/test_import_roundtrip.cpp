@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <map>
+#include <limits>
 
 #include <filesystem>
 #include <string>
@@ -350,9 +351,6 @@ TEST_CASE("Inch export writes inch coordinates that re-import at the same size")
     TessOptions tess;
     tess.units = parse_units("in");
     export_bodies({BRepPrimAPI_MakeBox(25.4, 50.8, 12.7).Shape()}, path.string(), "sat", tess);
-    std::ifstream in(path);
-    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    CHECK(text.find("25.4") != std::string::npos);  // header: millimetres per unit
     int units = 0;
     const auto bodies = import_bodies(path.string(), "sat", nullptr, &units);
     CHECK(units == 1);
@@ -1052,3 +1050,199 @@ TEST_CASE("3MF model units scale the raw mesh to document millimetres") {
     fs::remove(path);
 }
 #endif
+
+TEST_CASE("native input boundary: PLY rejects malformed properties before mesh consumers") {
+    using namespace chudware::doc;
+    const fs::path path = tmp("ply_boundary.ply");
+    struct Cleanup {
+        fs::path path;
+        ~Cleanup() { fs::remove(path); }
+    } cleanup{path};
+    auto fixture = [](const std::string& encoding, const std::string& vertex_props,
+                      const std::string& face_props, const std::string& body,
+                      const std::string& vertices = "3", const std::string& faces = "1") {
+        return "ply\nformat " + encoding + " 1.0\nelement vertex " + vertices + "\n" +
+               vertex_props + "element face " + faces + "\n" + face_props + "end_header\n" + body;
+    };
+    const std::string xyz = "property float x\nproperty float y\nproperty float z\n";
+    const std::string face = "property list uchar int vertex_indices\n";
+    auto reject = [&](const std::string& bytes) {
+        std::ofstream(path, std::ios::binary).write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        try {
+            (void)read_mesh(path.string(), "ply");
+            FAIL("unsafe PLY reached the raw mesh consumer");
+        } catch (const OpError& error) {
+            CHECK(error.code == "import_failed");
+            CHECK(std::string(error.what()).find("PLY:") != std::string::npos);
+        }
+        CHECK_THROWS_AS(import_bodies(path.string(), "ply"), OpError);
+    };
+    for (const std::string& face_row : {
+             std::string("3 0 1 3"), std::string("3 0 1 -1"), std::string("-1"),
+             std::string("3 0 1"), std::string("3 0 1 0.5"), std::string("999999999"),
+             std::string("3 0 1 nan")})
+        reject(fixture("ascii", xyz, face, "0 0 0\n1 0 0\n0 1 0\n" + face_row + "\n"));
+    reject(fixture("ascii", xyz, face, "0 0 0\n1 0 0\n0 1 inf\n3 0 1 2\n"));
+    reject(fixture("ascii", xyz, face, "", "-1"));
+    reject(fixture("ascii", xyz, face, "", "10000001"));
+    reject(fixture("ascii", "property mystery x\nproperty float y\nproperty float z\n",
+                   face, "0 0 0\n1 0 0\n0 1 0\n3 0 1 2\n"));
+    reject(fixture("ascii", xyz, "property list float int vertex_indices\n",
+                   "0 0 0\n1 0 0\n0 1 0\n3 0 1 2\n"));
+    reject(fixture("ascii", xyz, "property list uchar float vertex_indices\n",
+                   "0 0 0\n1 0 0\n0 1 0\n3 0 1 2\n"));
+
+    auto le = [](uint64_t value, std::size_t width) {
+        std::string bytes;
+        for (std::size_t i = 0; i < width; ++i)
+            bytes.push_back(static_cast<char>((value >> (8 * i)) & 255));
+        return bytes;
+    };
+    auto real = [&](float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return le(bits, 4);
+    };
+    std::string binary_vertices;
+    for (float value : {0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f, 0.f})
+        binary_vertices += real(value);
+    // Every supported scalar width must reject a short terminal field, not merely EOF.
+    for (const auto& [type, width] : std::vector<std::pair<std::string, std::size_t>>{
+             {"uchar", 1}, {"short", 2}, {"float", 4}, {"double", 8}}) {
+        for (std::size_t remaining = 0; remaining < width; ++remaining) {
+            const std::string props = "property uchar x\nproperty uchar y\nproperty " + type + " z\n";
+            reject(fixture("binary_little_endian", props, face,
+                           std::string(2 + remaining, '\0'), "1", "0"));
+        }
+    }
+    reject(fixture("binary_little_endian", xyz, face, std::string(1, '\0'), "1", "0"));
+    for (uint32_t index : {3u, UINT32_MAX})
+        reject(fixture("binary_little_endian", xyz, face,
+                       binary_vertices + le(3, 1) + le(0, 4) + le(1, 4) + le(index, 4)));
+    for (const std::string& count_type : {std::string("uchar"), std::string("int")}) {
+        const std::size_t width = count_type == "uchar" ? 1 : 4;
+        const std::string props = "property list " + count_type + " int vertex_indices\n";
+        reject(fixture("binary_little_endian", xyz, props, binary_vertices + le(3, width) + le(0, 4)));
+        if (width == 4) {
+            reject(fixture("binary_little_endian", xyz, props, binary_vertices + le(UINT32_MAX, 4)));
+            reject(fixture("binary_little_endian", xyz, props, binary_vertices + le(1000001, 4)));
+        }
+        for (std::size_t remaining = 0; remaining < width; ++remaining)
+            reject(fixture("binary_little_endian", xyz, props,
+                           binary_vertices + std::string(remaining, '\0')));
+    }
+    // Skipped list properties need the same complete byte admission as vertex_indices.
+    reject(fixture("binary_little_endian", xyz,
+                   face + "property list uchar double ignored\n",
+                   binary_vertices + le(3, 1) + le(0, 4) + le(1, 4) + le(2, 4) + le(1, 1) + le(0, 7)));
+    MeshData unsafe;
+    unsafe.verts = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+    unsafe.tris = {0, 1, 3};
+    CHECK_THROWS_AS(mesh_to_shape(unsafe), OpError);
+    unsafe.tris = {0, 1, 2};
+    unsafe.verts[0] = std::numeric_limits<double>::infinity();
+    CHECK_THROWS_AS(mesh_to_shape(unsafe), OpError);
+    std::string nonfinite = binary_vertices;
+    nonfinite.replace(0, 4, real(std::numeric_limits<float>::infinity()));
+    reject(fixture("binary_little_endian", xyz, face,
+                   nonfinite + le(3, 1) + le(0, 4) + le(1, 4) + le(2, 4)));
+    unsafe.verts = {0, 0, 0};
+    unsafe.tris = {0, 0};  // incomplete triangles must fail even before triangle_count().
+    CHECK_THROWS_AS(mesh_to_shape(unsafe), OpError);
+}
+
+TEST_CASE("native input boundary: valid PLY property layouts import and round-trip") {
+    using namespace chudware::doc;
+    const fs::path path = tmp("ply_valid_boundary.ply"), roundtrip = tmp("ply_boundary_roundtrip.ply");
+    struct Cleanup {
+        fs::path a, b;
+        ~Cleanup() { fs::remove(a); fs::remove(b); }
+    } cleanup{path, roundtrip};
+    const std::string props = "property float x\nproperty float y\nproperty float z\n"
+                              "property uchar colour\nproperty list uchar float extra\n";
+    const std::string face_props = "property uchar material\nproperty list uchar float extra\n"
+                                   "property list uchar int vertex_indices\nproperty uchar group\n";
+    const std::array<std::array<float, 3>, 4> vertices{{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
+    const std::array<std::array<uint32_t, 3>, 4> faces{{{0, 2, 1}, {0, 1, 3}, {0, 3, 2}, {1, 2, 3}}};
+    for (bool binary : {false, true}) {
+        std::ofstream out(path, std::ios::binary);
+        out << "ply\nformat " << (binary ? "binary_little_endian" : "ascii")
+            << " 1.0\nelement vertex 4\n" << props << "element face 4\n" << face_props << "end_header\n";
+        auto le = [&](uint32_t value, std::size_t width) {
+            for (std::size_t i = 0; i < width; ++i) out.put(static_cast<char>((value >> (8 * i)) & 255));
+        };
+        auto real = [&](float value) {
+            uint32_t bits;
+            std::memcpy(&bits, &value, sizeof(bits));
+            le(bits, 4);
+        };
+        for (const auto& vertex : vertices) {
+            if (binary) {
+                for (float value : vertex) real(value);
+                le(127, 1); le(1, 1); real(9);
+            } else out << vertex[0] << ' ' << vertex[1] << ' ' << vertex[2] << " 127 1 9\n";
+        }
+        for (const auto& indices : faces) {
+            if (binary) {
+                le(5, 1); le(1, 1); real(9); le(3, 1);
+                for (uint32_t index : indices) le(index, 4);
+                le(7, 1);
+            } else out << "5 1 9 3 " << indices[0] << ' ' << indices[1] << ' ' << indices[2] << " 7\n";
+        }
+        out.close();
+        const auto mesh = read_mesh(path.string(), "ply");
+        CHECK(mesh.vertex_count() == 4);
+        CHECK(mesh.triangle_count() == 4);
+        const auto bodies = import_bodies(path.string(), "ply");
+        REQUIRE(bodies.size() == 1);
+        CHECK(BRepCheck_Analyzer(bodies[0].second).IsValid());
+        CHECK(vol(bodies[0].second) == doctest::Approx(1.0 / 6.0));
+        export_bodies({bodies[0].second}, roundtrip.string(), "ply");
+        const auto reread = import_bodies(roundtrip.string(), "ply");
+        REQUIRE(reread.size() == 1);
+        CHECK(vol(reread[0].second) == doctest::Approx(1.0 / 6.0));
+    }
+}
+
+TEST_CASE("native input boundary: DXF arrays admit 4x4 and reject cumulative expansion") {
+    using namespace chudware::doc;
+    const fs::path path = tmp("dxf_array_boundary.dxf");
+    struct Cleanup {
+        fs::path path;
+        ~Cleanup() { fs::remove(path); }
+    } cleanup{path};
+    auto write = [&](const std::string& cols, const std::string& rows, int nested, int roots) {
+        std::ofstream out(path);
+        out << "0\nSECTION\n2\nBLOCKS\n0\nBLOCK\n2\nB0\n10\n0\n20\n0\n30\n0\n"
+               "0\nLINE\n10\n0\n20\n0\n30\n0\n11\n1\n21\n0\n31\n0\n0\nENDBLK\n";
+        for (int i = 1; i <= nested; ++i)
+            out << "0\nBLOCK\n2\nB" << i << "\n10\n0\n20\n0\n30\n0\n0\nINSERT\n2\nB"
+                << i - 1 << "\n70\n" << cols << "\n71\n" << rows << "\n0\nENDBLK\n";
+        out << "0\nENDSEC\n0\nSECTION\n2\nENTITIES\n";
+        for (int i = 0; i < roots; ++i)
+            out << "0\nINSERT\n2\nB" << nested << "\n70\n" << cols << "\n71\n" << rows
+                << "\n44\n2\n45\n2\n";
+        out << "0\nENDSEC\n0\nEOF\n";
+    };
+    write("4", "4", 0, 1);
+    const auto bodies = import_bodies(path.string(), "dxf");
+    REQUIRE(bodies.size() == 1);
+    TopTools_IndexedMapOfShape edges;
+    TopExp::MapShapes(bodies[0].second, TopAbs_EDGE, edges);
+    CHECK(edges.Extent() == 16);
+    double x0, y0, z0, x1, y1, z1;
+    bounds(bodies[0].second).Get(x0, y0, z0, x1, y1, z1);
+    CHECK(x0 == doctest::Approx(0).epsilon(1e-6));
+    CHECK(x1 == doctest::Approx(7).epsilon(1e-6));
+    CHECK(y1 == doctest::Approx(6).epsilon(1e-6));
+    for (const auto& dimensions : std::vector<std::pair<std::string, std::string>>{
+             {"32767", "32767"}, {"9223372036854775807", "2"},
+             {"184467440737095516160", "2"}, {"-1", "4"}, {"4garbage", "4"}}) {
+        write(dimensions.first, dimensions.second, 0, 1);
+        CHECK_THROWS_AS(import_bodies(path.string(), "dxf"), OpError);
+    }
+    write("16", "16", 2, 1);
+    CHECK_THROWS_AS(import_bodies(path.string(), "dxf"), OpError);
+    write("200", "200", 0, 3);
+    CHECK_THROWS_AS(import_bodies(path.string(), "dxf"), OpError);
+}

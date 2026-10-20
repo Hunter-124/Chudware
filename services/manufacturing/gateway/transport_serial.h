@@ -28,8 +28,10 @@ struct SerialTransportOptions {
     std::string posix_sysfs_tty_root = "/sys/class/tty";
 };
 
-// Real OS serial I/O. Authorization happens before the OS open call. The class
-// owns one exclusive handle and releases every OS claim from close()/destruction.
+// Real OS serial I/O. Commissioning requires a complete USB VID/PID/serial tuple.
+// POSIX binds validated sysfs device numbers to the opened character descriptor
+// before configuration or traffic. The class owns one exclusive handle and
+// releases every OS claim from close()/destruction.
 class SerialTransport final : public device::ITransport {
 public:
     SerialTransport(DeviceAllowlist& allowlist, device::MachineClass machine_class,

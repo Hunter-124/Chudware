@@ -94,7 +94,7 @@ def _rollback(tmp_path: Path, *args: str) -> subprocess.CompletedProcess:
     )
 
 
-def test_automatic_rollback_walks_past_a_torn_release(tmp_path):
+def test_default_payload_selection_walks_past_a_torn_release(tmp_path):
     releases = tmp_path / "chudware-web" / "releases"
     releases.mkdir(parents=True)
     _release(releases, "20260901T120000Z-live-1")
@@ -124,7 +124,7 @@ def test_an_operator_named_release_still_fails_loudly(tmp_path):
 
     proc = _rollback(tmp_path, "--to", "20260831T120000Z-torn-1")
     out = proc.stdout + proc.stderr
-    assert proc.returncode == 1, out
+    assert proc.returncode == 4, out
     # It must NOT quietly restore a different release than the one requested.
     assert "20260830T120000Z-good-1" not in out, out
 

@@ -813,3 +813,73 @@ def test_second_open_payout_request_is_refused(market, fake_stripe, marketplace_
             "SELECT count(*) AS n FROM credit_ledger WHERE kind = 'market_payout'"
         )
         assert int(cur.fetchone()["n"]) == 1
+
+
+def test_recoverable_card_failure_then_paid_same_checkout_settles_once(market, fake_stripe):
+    listing_id = market.cash_listing(fake_stripe)
+    order_id = market.cash_checkout(listing_id)
+    failed = {
+        "id": "evt_attempt_failed", "type": "payment_intent.payment_failed",
+        "data": {"object": {
+            "id": "pi_retry", "last_payment_error": {"message": "card declined"},
+            "metadata": {"chud_kind": "marketplace", "chud_order_id": order_id},
+        }},
+    }
+    assert marketplace_commerce.handle_marketplace_event(failed)
+    assert _order(order_id)["status"] == "pending"
+    assert _order(order_id)["failure_reason"] == "card declined"
+    assert _entitlement_count(listing_id, market.buyer) == 0
+    event = checkout_event(
+        order_id, listing_id, event_id="evt_retry_paid",
+        amount_total=2500, payment_intent="pi_retry",
+    )
+    for event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
+        event["type"] = event_type
+        event["id"] = "evt_retry_" + event_type
+        assert marketplace_commerce.handle_marketplace_event(event)
+    order = _order(order_id)
+    assert order["status"] == "paid"
+    assert order["stripe_payment_intent"] == "pi_retry"
+    assert order["failure_reason"] == ""
+    assert _entitlement_count(listing_id, market.buyer) == 1
+    with tx() as cur:
+        cur.execute("SELECT sales FROM mk_listings WHERE id=%s", (listing_id,))
+        assert cur.fetchone()["sales"] == 1
+    # A stale attempt/async failure must not destroy a verified paid settlement.
+    assert marketplace_commerce.handle_marketplace_event(failed)
+    event["type"] = "checkout.session.async_payment_failed"
+    event["id"] = "evt_stale_async_failure"
+    assert marketplace_commerce.handle_marketplace_event(event)
+    assert _order(order_id)["status"] == "paid"
+    assert _entitlement_count(listing_id, market.buyer) == 1
+
+
+def test_paid_checkout_must_match_recorded_checkout_not_just_order_metadata(market, fake_stripe):
+    listing_id = market.cash_listing(fake_stripe)
+    order_id = market.cash_checkout(listing_id)
+    event = checkout_event(
+        order_id, listing_id, event_id="evt_wrong_checkout", amount_total=2500,
+    )
+    event["data"]["object"]["id"] = "cs_other_checkout"
+    assert marketplace_commerce.handle_marketplace_event(event)
+    assert _order(order_id)["status"] == "pending"
+    assert _entitlement_count(listing_id, market.buyer) == 0
+
+
+def test_legacy_failed_order_recovers_only_from_its_bound_paid_checkout(market, fake_stripe):
+    listing_id = market.cash_listing(fake_stripe)
+    order_id = market.cash_checkout(listing_id)
+    with tx() as cur:
+        cur.execute(
+            "UPDATE mk_orders SET status='failed', failure_reason='card declined' WHERE id=%s",
+            (order_id,),
+        )
+    event = checkout_event(order_id, listing_id, event_id="evt_legacy_paid", amount_total=2500)
+    event["data"]["object"]["id"] = "cs_other"
+    assert marketplace_commerce.handle_marketplace_event(event)
+    assert _order(order_id)["status"] == "failed"
+    event["data"]["object"]["id"] = "cs_test_fake"
+    event["id"] = "evt_legacy_bound_paid"
+    assert marketplace_commerce.handle_marketplace_event(event)
+    assert _order(order_id)["status"] == "paid"
+    assert _entitlement_count(listing_id, market.buyer) == 1

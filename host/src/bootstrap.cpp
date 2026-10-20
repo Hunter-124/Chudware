@@ -3,18 +3,14 @@
 #ifdef _WIN32
 
 #include <windows.h>
-#include <bcrypt.h>
 
-#include <array>
-#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <set>
 #include <string>
 #include <vector>
 
-#pragma comment(lib, "bcrypt.lib")
 
 namespace {
 std::string narrow(const std::wstring &w) {
@@ -109,31 +105,30 @@ std::string appdataRoot() {
   return neu;
 }
 
-std::string runCapture(const std::string &cmd) {
-  std::string out;
-  FILE *p = _popen(cmd.c_str(), "r");
-  if (!p)
+// The base executable/platform runtime is authenticated by the operator. Never
+// run a candidate, PATH discovery helper, or bundled executable to attest itself.
+std::string resolveBasePython() {
+  const std::string base = env_or("CHUDWARE_BASE_PYTHON",
+                                 env_or("CHUDWARE_CI_BASE_PYTHON", ""));
+  const std::filesystem::path path(base);
+  std::error_code ec;
+  const auto resolved = std::filesystem::canonical(path, ec);
+  if (base.empty() || !path.is_absolute() || ec || !fileExists(base) ||
+      fileExists((path.parent_path().parent_path() / "pyvenv.cfg").string()) ||
+      fileExists((resolved.parent_path().parent_path() / "pyvenv.cfg").string()))
     return "";
-  std::array<char, 256> buf;
-  while (fgets(buf.data(), (int)buf.size(), p))
-    out += buf.data();
-  _pclose(p);
-  while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
-    out.pop_back();
-  return out;
-}
-std::string resolveBasePython(const std::string &dir) {
-  std::string embed = dir + "\\python-embed\\python.exe";
-  if (fileExists(embed))
-    return embed;
-  std::string r =
-      runCapture("py -3.11 -c \"import sys;print(sys.executable)\"");
-  if (fileExists(r))
-    return r;
-  r = runCapture("python -c \"import sys;print(sys.executable)\"");
-  if (fileExists(r))
-    return r;
-  return "";
+  const std::string override = env_or("CHUDWARE_PYTHON", "");
+  if (override.empty() || !fileExists(override)) {
+    const auto root = std::filesystem::weakly_canonical(
+        std::filesystem::path(runtimePython()).parent_path().parent_path(), ec);
+    if (ec)
+      return "";
+    const std::string prefix = root.string() + "\\";
+    const std::string executable = resolved.string();
+    if (_strnicmp(executable.c_str(), prefix.c_str(), prefix.size()) == 0)
+      return "";
+  }
+  return base;
 }
 int runWait(const std::string &cmd, const std::string &cwd) {
   STARTUPINFOA si{};
@@ -141,7 +136,23 @@ int runWait(const std::string &cmd, const std::string &cwd) {
   PROCESS_INFORMATION pi{};
   std::vector<char> c(cmd.begin(), cmd.end());
   c.push_back(0);
-  if (!CreateProcessA(nullptr, c.data(), nullptr, nullptr, FALSE, 0, nullptr,
+  std::vector<char> childEnv;
+  LPCH inherited = GetEnvironmentStringsA();
+  if (!inherited)
+    return -1;
+  for (const char *entry = inherited; *entry; entry += std::strlen(entry) + 1) {
+    if (_strnicmp(entry, "PYTHON", 6) == 0 ||
+        _strnicmp(entry, "LD_", 3) == 0 || _strnicmp(entry, "DYLD_", 5) == 0 ||
+        _strnicmp(entry, "__PYVENV_LAUNCHER__=", sizeof("__PYVENV_LAUNCHER__=") - 1) == 0 ||
+        _strnicmp(entry, "VIRTUAL_ENV=", sizeof("VIRTUAL_ENV=") - 1) == 0)
+      continue;
+    childEnv.insert(childEnv.end(), entry, entry + std::strlen(entry) + 1);
+  }
+  FreeEnvironmentStringsA(inherited);
+  if (childEnv.empty())
+    childEnv.push_back(0);
+  childEnv.push_back(0);
+  if (!CreateProcessA(nullptr, c.data(), nullptr, nullptr, FALSE, 0, childEnv.data(),
                       cwd.empty() ? nullptr : cwd.c_str(), &si, &pi))
     return -1;
   WaitForSingleObject(pi.hProcess, INFINITE);
@@ -152,14 +163,14 @@ int runWait(const std::string &cmd, const std::string &cwd) {
   return (int)code;
 }
 
-// A provisionable source tree: a dir with services/installer/provision.py +
-// requirements.txt, plus an optional offline wheelhouse beside it.
+// A development source payload requires reviewed offline dependency identities;
+// packaged customer sidecars do not use this provisioner.
 struct Payload {
   std::string srcDir;
   std::string wheelhouse;
 };
 bool hasSource(const std::string &d) {
-  return fileExists(d + "\\installer\\provision.py") &&
+  return fileExists(d + "\\services\\installer\\provision.py") &&
          fileExists(d + "\\requirements.txt");
 }
 bool findPayload(Payload &p) {
@@ -197,74 +208,26 @@ bool findPayload(Payload &p) {
   return false;
 }
 
-std::string readFileBytes(const std::string &path) {
-  std::ifstream f(path, std::ios::binary);
-  if (!f)
-    return "";
-  return std::string((std::istreambuf_iterator<char>(f)),
-                     std::istreambuf_iterator<char>());
-}
 
-// First 16 hex chars of the SHA-256 of `bytes` — matches provision.py's
-// hashlib.sha256(...).hexdigest()[:16] so the C++ readiness check agrees with
-// the Python one.
-std::string sha256hex16(const std::string &bytes) {
-  BCRYPT_ALG_HANDLE alg = nullptr;
-  if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM,
-                                                  nullptr, 0)))
-    return "";
-  unsigned char digest[32];
-  NTSTATUS st =
-      BCryptHash(alg, nullptr, 0,
-                 reinterpret_cast<PUCHAR>(const_cast<char *>(bytes.data())),
-                 (ULONG)bytes.size(), digest, sizeof(digest));
-  BCryptCloseAlgorithmProvider(alg, 0);
-  if (!BCRYPT_SUCCESS(st))
-    return "";
-  static const char hx[] = "0123456789abcdef";
-  std::string out;
-  out.reserve(16);
-  for (int i = 0; i < 8; ++i) { // 8 bytes -> 16 hex chars
-    out += hx[(digest[i] >> 4) & 0xF];
-    out += hx[digest[i] & 0xF];
-  }
-  return out;
-}
-
-// Pull "req_hash" out of %APPDATA%\Chudware\runtime\.ready.json (written by
-// provision.py).
-std::string stampReqHash() {
-  std::string s = readFileBytes(appdataRoot() + "\\runtime\\.ready.json");
-  const std::string key = "\"req_hash\"";
-  size_t k = s.find(key);
-  if (k == std::string::npos)
-    return "";
-  size_t q1 = s.find('"', s.find(':', k + key.size()));
-  if (q1 == std::string::npos)
-    return "";
-  size_t q2 = s.find('"', q1 + 1);
-  if (q2 == std::string::npos)
-    return "";
-  return s.substr(q1 + 1, q2 - q1 - 1);
-}
-
-// True unless we can positively prove the installed venv is stale. The
-// provisioning stamp's req_hash must equal the hash of the requirements the
-// payload would install; a mismatch (or a missing stamp next to an existing
-// python.exe) means a dependency was added/changed since the venv was built —
-// exactly the case that surfaced as a cryptic "No module named ..." at runtime.
-// If the payload's requirements can't be located (or hashing is unavailable) we
-// don't block.
+// Reuse requires the full lock/target and installed PEP 610 identities, not
+// merely a matching declaration hash or an importable private-package version.
 bool installedVenvFresh() {
   Payload pl;
-  if (!findPayload(pl))
-    return true;
-  std::string want =
-      sha256hex16(readFileBytes(pl.srcDir + "\\requirements.txt"));
-  if (want.empty())
-    return true;
-  std::string have = stampReqHash();
-  return !have.empty() && have == want;
+  if (!findPayload(pl) || pl.wheelhouse.empty() ||
+      !fileExists(pl.srcDir + "\\vendor\\python\\RUNTIME_WHEELS.lock") ||
+      !fileExists(pl.srcDir + "\\vendor\\chudcode\\CHUDCODE_ARTIFACT.lock"))
+    return false;
+  const std::string py = runtimePython();
+  const std::string venv = std::filesystem::path(py).parent_path().parent_path().string();
+  const std::string base = resolveBasePython();
+  if (base.empty())
+    return false;
+  std::string cmd = "\"" + base +
+                    "\" -I -S -c \"import sys;sys.path.insert(0,sys.argv[1]);"
+                    "from services.installer.provision import main;sys.exit(main(sys.argv[2:]))\" \"" +
+                    pl.srcDir + "\" --check-ready --base-python \"" + base +
+                    "\" --venv-dir \"" + venv + "\" --wheelhouse \"" + pl.wheelhouse + "\"";
+  return runWait(cmd, pl.srcDir) == 0;
 }
 
 bool provisionRuntime(bool force, std::string &log) {
@@ -279,19 +242,26 @@ bool provisionRuntime(bool force, std::string &log) {
           "install.ps1, or set CHUDWARE_REPO to your source checkout.";
     return false;
   }
-  std::string base = resolveBasePython(exeDir());
-  if (base.empty()) {
-    log = "no base Python 3.11 found - install Python 3.11 (or bundle "
-          "python-embed/) to build "
-          "the runtime.";
+  if (pl.wheelhouse.empty() ||
+      !fileExists(pl.srcDir + "\\vendor\\python\\RUNTIME_WHEELS.lock") ||
+      !fileExists(pl.srcDir + "\\vendor\\chudcode\\CHUDCODE_ARTIFACT.lock")) {
+    log = "reviewed runtime wheelhouse/lock missing; authenticate all runtime wheels "
+          "and vendor/python/RUNTIME_WHEELS.lock before provisioning.";
     return false;
   }
-  std::string cmd = "\"" + base + "\" -m services.installer.provision --base-python \"" +
-                    base + "\" --with-app-code";
+  std::string base = resolveBasePython();
+  if (base.empty()) {
+    log = "set CHUDWARE_BASE_PYTHON to a separately authenticated absolute base "
+          "Python path (including its stdlib/platform runtime).";
+    return false;
+  }
+  std::string cmd = "\"" + base +
+      "\" -I -S -c \"import sys;sys.path.insert(0,sys.argv[1]);"
+      "from services.installer.provision import main;sys.exit(main(sys.argv[2:]))\" \"" +
+      pl.srcDir + "\" --base-python \"" + base + "\" --with-app-code";
   if (force)
     cmd += " --force";
-  if (!pl.wheelhouse.empty())
-    cmd += " --wheelhouse \"" + pl.wheelhouse + "\"";
+  cmd += " --wheelhouse \"" + pl.wheelhouse + "\"";
   int rc = runWait(cmd, pl.srcDir);
   log = std::string(force ? "repaired runtime" : "provisioned runtime") +
         " (rc=" + std::to_string(rc) + ", base=" + base + ")";
@@ -363,15 +333,10 @@ bool runtimeReady() {
   std::string py = runtimePython();
   if (!fileExists(py))
     return false;
-  // An explicit dev python (CHUDWARE_PYTHON) or a portable runtime shipped next
-  // to the exe is trusted as-is. Only the managed %APPDATA% venv gets the
-  // stricter freshness check, so a stale venv (its python.exe exists but its
-  // packages predate a requirements change) is re-provisioned instead of being
-  // run against — which previously crashed mid-job with "No module named ...".
+  // Explicit developer interpreter overrides are caller-owned, not managed
+  // provisioning. Automatically discovered runtimes require locked identities.
   std::string envp = env_or("CHUDWARE_PYTHON", "");
   if (!envp.empty() && fileExists(envp))
-    return true;
-  if (py != appdataRoot() + "\\runtime\\venv\\Scripts\\python.exe")
     return true;
   return installedVenvFresh();
 }
@@ -403,11 +368,18 @@ bool repairRuntime(std::string &log) { return provisionRuntime(true, log); }
       // python3.11 + venv/bin.
 
 #include <unistd.h>
+#include <spawn.h>
+#include <sys/wait.h>
 
 #include <cstdlib>
 #include <filesystem>
 #include <set>
 #include <string>
+#include <vector>
+#include <cstring>
+#include <cerrno>
+
+extern char **environ;
 
 #include "util/platform_paths.h"
 
@@ -504,38 +476,51 @@ std::string appdataRoot() {
   }
   return neu.string();
 }
-std::string runCapture(const std::string &cmd) {
-  std::string out;
-  FILE *p = popen(cmd.c_str(), "r");
-  if (!p)
-    return "";
-  char buf[256];
-  size_t n;
-  while ((n = fread(buf, 1, sizeof(buf), p)) > 0)
-    out.append(buf, n);
-  pclose(p);
-  while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
-    out.pop_back();
-  return out;
-}
-// Resolve a base Python 3.11 to build the venv from (the Linux equivalent of
-// `py -3.11`).
 std::string resolveBasePython() {
-  for (const char *probe : {"python3.11", "python3", "python"}) {
-    std::string r =
-        runCapture(std::string(probe) +
-                   " -c 'import sys;print(sys.executable)' 2>/dev/null");
-    if (fileExists(r))
-      return r;
+  const std::string base = env_or("CHUDWARE_BASE_PYTHON",
+                                 env_or("CHUDWARE_CI_BASE_PYTHON", ""));
+  const fs::path path(base);
+  std::error_code ec;
+  const auto resolved = fs::canonical(path, ec);
+  if (base.empty() || !path.is_absolute() || ec || !fileExists(base) ||
+      fileExists((path.parent_path().parent_path() / "pyvenv.cfg").string()) ||
+      fileExists((resolved.parent_path().parent_path() / "pyvenv.cfg").string()))
+    return "";
+  const std::string override = env_or("CHUDWARE_PYTHON", "");
+  if (override.empty() || !fileExists(override)) {
+    const auto root = fs::weakly_canonical(fs::path(runtimePython()).parent_path().parent_path(), ec);
+    if (ec)
+      return "";
+    const auto relative = resolved.lexically_relative(root);
+    if (!relative.empty() && *relative.begin() != "..")
+      return "";
   }
-  return "";
+  return base;
 }
 int runWait(const std::string &cmd, const std::string &cwd) {
   std::string full = cwd.empty() ? cmd : ("cd " + shq(cwd) + " && " + cmd);
-  int rc = std::system(full.c_str());
-  if (rc == -1)
+  // Strip loader overrides before even /bin/sh is loaded; an `env -u` inside
+  // std::system would be too late to prevent LD_PRELOAD/DYLD injection.
+  std::vector<char *> childEnv;
+  for (char **entry = environ; entry && *entry; ++entry) {
+    if (std::strncmp(*entry, "PYTHON", 6) == 0 ||
+        std::strncmp(*entry, "LD_", 3) == 0 || std::strncmp(*entry, "DYLD_", 5) == 0 ||
+        std::strncmp(*entry, "__PYVENV_LAUNCHER__=", sizeof("__PYVENV_LAUNCHER__=") - 1) == 0 ||
+        std::strncmp(*entry, "VIRTUAL_ENV=", sizeof("VIRTUAL_ENV=") - 1) == 0)
+      continue;
+    childEnv.push_back(*entry);
+  }
+  childEnv.push_back(nullptr);
+  char *args[] = {const_cast<char *>("/bin/sh"), const_cast<char *>("-c"), full.data(), nullptr};
+  pid_t child = 0;
+  if (posix_spawn(&child, "/bin/sh", nullptr, nullptr, args, childEnv.data()) != 0)
     return -1;
-  return (rc >> 8) & 0xFF; // WEXITSTATUS
+  int status = 0;
+  while (waitpid(child, &status, 0) == -1) {
+    if (errno != EINTR)
+      return -1;
+  }
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 struct Payload {
@@ -543,7 +528,7 @@ struct Payload {
   std::string wheelhouse;
 };
 bool hasSource(const std::string &d) {
-  return fileExists((fs::path(d) / "installer" / "provision.py").string()) &&
+  return fileExists((fs::path(d) / "services" / "installer" / "provision.py").string()) &&
          fileExists((fs::path(d) / "requirements.txt").string());
 }
 bool findPayload(Payload &p) {
@@ -587,18 +572,26 @@ bool provisionRuntime(bool force, std::string &log) {
           "CHUDWARE_REPO.";
     return false;
   }
-  std::string base = resolveBasePython();
-  if (base.empty()) {
-    log =
-        "no base Python 3.11 found - install python3.11 to build the runtime.";
+  if (pl.wheelhouse.empty() ||
+      !fileExists((fs::path(pl.srcDir) / "vendor/python/RUNTIME_WHEELS.lock").string()) ||
+      !fileExists((fs::path(pl.srcDir) / "vendor/chudcode/CHUDCODE_ARTIFACT.lock").string())) {
+    log = "reviewed runtime wheelhouse/lock missing; authenticate all runtime wheels "
+          "and vendor/python/RUNTIME_WHEELS.lock before provisioning.";
     return false;
   }
-  std::string cmd = shq(base) + " -m services.installer.provision --base-python " +
-                    shq(base) + " --with-app-code";
+  std::string base = resolveBasePython();
+  if (base.empty()) {
+    log = "set CHUDWARE_BASE_PYTHON to a separately authenticated absolute base "
+          "Python path (including its stdlib/platform runtime).";
+    return false;
+  }
+  std::string cmd = shq(base) + " -I -S -c " +
+      shq("import sys;sys.path.insert(0,sys.argv[1]);"
+          "from services.installer.provision import main;sys.exit(main(sys.argv[2:]))") +
+      " " + shq(pl.srcDir) + " --base-python " + shq(base) + " --with-app-code";
   if (force)
     cmd += " --force";
-  if (!pl.wheelhouse.empty())
-    cmd += " --wheelhouse " + shq(pl.wheelhouse);
+  cmd += " --wheelhouse " + shq(pl.wheelhouse);
   int rc = runWait(cmd, pl.srcDir);
   log = std::string(force ? "repaired runtime" : "provisioned runtime") +
         " (rc=" + std::to_string(rc) + ", base=" + base + ")";
@@ -664,10 +657,28 @@ std::string appDir() {
 }
 
 bool runtimeReady() {
-  // On POSIX we don't apply the venv-freshness hash gate (the Windows path uses
-  // it to catch a stale %APPDATA% venv); presence of the interpreter is enough
-  // — see bootstrap.h.
-  return fileExists(runtimePython());
+  const std::string py = runtimePython();
+  if (!fileExists(py))
+    return false;
+  // An explicit developer interpreter is outside managed provisioning.
+  const std::string override = env_or("CHUDWARE_PYTHON", "");
+  if (!override.empty() && fileExists(override))
+    return true;
+  Payload pl;
+  if (!findPayload(pl) || pl.wheelhouse.empty() ||
+      !fileExists((fs::path(pl.srcDir) / "vendor/python/RUNTIME_WHEELS.lock").string()) ||
+      !fileExists((fs::path(pl.srcDir) / "vendor/chudcode/CHUDCODE_ARTIFACT.lock").string()))
+    return false;
+  const std::string base = resolveBasePython();
+  if (base.empty())
+    return false;
+  const std::string cmd = shq(base) +
+      " -I -S -c " + shq("import sys;sys.path.insert(0,sys.argv[1]);"
+                          "from services.installer.provision import main;sys.exit(main(sys.argv[2:]))") +
+      " " + shq(pl.srcDir) + " --check-ready --base-python " + shq(base) + " --venv-dir " +
+      shq(fs::path(py).parent_path().parent_path().string()) +
+      " --wheelhouse " + shq(pl.wheelhouse);
+  return runWait(cmd, pl.srcDir) == 0;
 }
 
 void ensurePromptsDir() {

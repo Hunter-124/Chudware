@@ -49,7 +49,7 @@ std::vector<int> waveform_samples(const nlohmann::json& wf, double sample_ms = 1
 // `caps` is the T-FIN2 capability entry (platform_db.get_capabilities);
 // `platform_text` the .repl content. Pure — aux files returned as content.
 ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann::json& caps,
-                                 const std::string& platform_text);
+                                 const std::string& platform_text, double horizon_ms = 0);
 
 // Render a t_ms-sorted timeline into paused emulation RunFor intervals.
 std::vector<std::string> timeline_resc_lines(

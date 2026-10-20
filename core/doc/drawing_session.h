@@ -21,16 +21,23 @@
 
 #include <map>
 #include <string>
+#include <cstdint>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
 namespace chudware::doc {
 
+bool dirty_drawing_count(std::uint64_t& count);  // nonblocking, false = unknown
+using DrawingSaveRevisions = std::map<std::string, std::pair<long, long>>;
+void drawings_saved(const DrawingSaveRevisions& revisions);
+
 // --- persistence (W12+ drawing embedding in the .step+ container) --------------
 // drawings_for_source: serialize every OPEN drawing whose live source is `source_doc_id`
 // to {"drawings/<drawing_id>.json": <drawing doc JSON string>} for .step+ embedding on
 // save (port of engine/doc/stepplus.py::_collect_drawing_entries). Empty when none.
-std::map<std::string, std::string> drawings_for_source(const std::string& source_doc_id);
+std::map<std::string, std::string> drawings_for_source(
+    const std::string& source_doc_id, DrawingSaveRevisions& revisions);
 // Called after a source session has been removed from the document registry.
 // Freeze every associated drawing on its final source tree/env and flag it stale.
 void drawings_source_closed(const std::string& source_doc_id,

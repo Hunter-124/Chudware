@@ -96,15 +96,13 @@ def _study_only_kinds(doc_id: Optional[str]) -> list[str]:
 
 
 def _measure_probe_chosen_by_battery(caller_kwargs: dict, call_kwargs: dict) -> bool:
-    """True when the battery, not the caller, set a measure_between endpoint.
+    """Only wholly automatic probes may turn an ambiguous ref into unavailable.
 
-    A caller endpoint that only needed side-word normalization ("top face" -> "top")
-    stays the caller's choice.
+    If either endpoint was supplied by the caller, preserve its refusal: the engine
+    does not say which endpoint was ambiguous.
     """
-    return any(
-        call_kwargs.get(key) != _normalize_side_query(caller_kwargs.get(key))
-        for key in ("a_query", "b_query")
-    )
+    return all(caller_kwargs.get(key) is None and call_kwargs.get(key) is not None
+               for key in ("a_query", "b_query"))
 
 
 def _is_ambiguous_ref_failure(result: dict) -> bool:
@@ -136,194 +134,116 @@ def _normalize_side_query(q: Any) -> Any:
             base = low[: -len(suf)].strip()
             if base in _VALID_SIDE_WORDS:
                 return base
-    # Leading side token: "top of body", "bottom planar".
-    first = low.split()[0] if low.split() else low
-    if first in _VALID_SIDE_WORDS:
-        return first
     return q
 
 
 def _query_geometry_faces(doc_id: Optional[str]) -> list[dict]:
-    """Best-effort face list via query_geometry / bbox (empty on miss)."""
+    """Read the complete live face roster, including topology and owner stamps."""
     if not doc_id:
         try:
             doc_id = _cur_doc()
         except Exception:  # noqa: BLE001
             return []
-    faces: list[dict] = []
-    # Prefer planar faces via engine query.
     try:
         from services.mcp import core_bridge as cb  # noqa: PLC0415
-        for q in (
-            {"of": "face", "surf": "plane"},
-            {"of": "face"},
-        ):
-            raw = cb.call("doc_query", {"doc_id": doc_id, "query": q}) or {}
-            matches = (
-                raw.get("matches")
-                or raw.get("faces")
-                or raw.get("results")
-                or raw.get("items")
-                or []
-            )
-            if isinstance(matches, list) and matches:
-                for m in matches:
-                    if isinstance(m, dict):
-                        faces.append(m)
-                if faces:
-                    break
+        raw = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}}) or {}
+        matches = raw.get("matches") or []
+        return [m for m in matches if isinstance(m, dict)]
     except Exception:  # noqa: BLE001
-        faces = []
-    return faces
-
-
-def _bbox_extents(doc_id: Optional[str]) -> Optional[dict]:
-    """Return axis-aligned bbox dict {xmin,xmax,ymin,ymax,zmin,zmax} if known."""
-    if not doc_id:
-        return None
-    try:
-        from services.mcp import core_bridge as cb  # noqa: PLC0415
-        mass = cb.call("eval_mass", {"doc_id": doc_id}) or {}
-        bb = (
-            mass.get("bbox")
-            or mass.get("bounding_box")
-            or (mass.get("mass") or {}).get("bbox")
-            if isinstance(mass.get("mass"), dict)
-            else None
-        )
-        if isinstance(bb, dict) and bb:
-            return bb
-        if isinstance(bb, (list, tuple)) and len(bb) >= 6:
-            return {
-                "xmin": float(bb[0]), "ymin": float(bb[1]), "zmin": float(bb[2]),
-                "xmax": float(bb[3]), "ymax": float(bb[4]), "zmax": float(bb[5]),
-            }
-        # Some payloads nest under aabb / box.
-        for key in ("aabb", "box", "bounds"):
-            b2 = mass.get(key)
-            if isinstance(b2, dict) and b2:
-                return b2
-    except Exception:  # noqa: BLE001
-        pass
-    # query_geometry fallback for whole body.
-    try:
-        from services.mcp import core_bridge as cb  # noqa: PLC0415
-        raw = cb.call("doc_query", {
-            "doc_id": doc_id,
-            "query": {"of": "body"},
-        }) or {}
-        bb = raw.get("bbox") or raw.get("bounding_box")
-        if isinstance(bb, dict):
-            return bb
-    except Exception:  # noqa: BLE001
-        pass
-    return None
+        return []
 
 
 def _derive_measure_face_pair(doc_id: Optional[str]) -> Optional[tuple[Any, Any]]:
-    """Derive two geometrically valid measure endpoints (mega-22 R22).
+    """Choose a real opposing planar-face span, never a broad side-word query.
 
-    Prefer largest planar face pair from query_geometry; else bbox extent sides
-    (top/bottom). NEVER invent multi-word names like 'top face' that the geom
-    query rejects. Returns (a_query, b_query) or None.
+    A SID is a geometry fingerprint, not a globally unique topology ID. Count it
+    within its body/component provenance before using it; identical instances or
+    duplicate fingerprints without an exact owner are unsupported, not first-match
+    picks. Query readbacks are world-space, so keep body_id flat (a selector envelope
+    would reinterpret an assembly readback in component-local coordinates).
     """
     faces = _query_geometry_faces(doc_id)
-    if len(faces) >= 2:
-        def _area(f: dict) -> float:
-            for k in ("area", "size", "area_mm2"):
-                v = f.get(k)
-                if isinstance(v, (int, float)):
-                    return float(v)
-            # bbox diagonal proxy
-            bb = f.get("bbox") or f.get("centroid")
-            if isinstance(bb, (list, tuple)) and len(bb) >= 3:
-                return abs(float(bb[0])) + abs(float(bb[1])) + abs(float(bb[2]))
-            return 0.0
+    counts: dict[tuple, int] = {}
+    sid_counts: dict[str, int] = {}
+    candidates = []
+    for face in faces:
+        sid = face.get("sid")
+        if not isinstance(sid, str) or not sid:
+            continue
+        body = face.get("body_id", face.get("body"))
+        body = body if type(body) is int and body > 0 else None
+        component = face.get("component", face.get("component_id"))
+        key = (body, sid)
+        counts[key] = counts.get(key, 0) + 1
+        sid_counts[sid] = sid_counts.get(sid, 0) + 1
+        candidates.append((face, body, component, sid, key))
 
-        ranked = sorted(faces, key=_area, reverse=True)
-        # Prefer opposite sides when annotated.
-        by_side: dict[str, dict] = {}
-        for f in ranked:
-            side = str(f.get("side") or f.get("normal_side") or "").lower()
-            if side in _VALID_SIDE_WORDS and side not in by_side:
-                by_side[side] = f
-        for a_s, b_s in (
-            ("top", "bottom"), ("+z", "-z"), ("front", "back"),
-            ("left", "right"), ("+x", "-x"), ("+y", "-y"),
-        ):
-            if a_s in by_side and b_s in by_side:
-                return a_s, b_s
-        # Fall back to two largest faces via full query dicts if they carry refs.
-        a_f, b_f = ranked[0], ranked[1]
-        def _as_q(f: dict) -> Any:
-            side = str(f.get("side") or "").lower()
-            if side in _VALID_SIDE_WORDS:
-                return side
-            # mega-23: NEVER emit bare feature/face ids (f1, Face_3, …) —
-            # engine treats bare strings as side words and soft-zeros.
-            # Prefer structured face queries over id strings.
-            if f.get("query") and isinstance(f.get("query"), dict):
-                return f["query"]
-            # Construct pick-largest planar query for the first, second-largest next.
-            return {"of": "face", "surf": "plane", "pick": "largest"}
+    def _vec(value):
+        if not isinstance(value, (list, tuple)) or len(value) != 3:
+            return None
+        try:
+            result = tuple(float(v) for v in value)
+        except (TypeError, ValueError):
+            return None
+        return result if all(math.isfinite(v) for v in result) else None
 
-        qa, qb = _as_q(a_f), _as_q(b_f)
-        if qa == qb and isinstance(qa, dict):
-            qb = {"of": "face", "surf": "plane", "pick": "smallest"}
-        # Prefer bbox extremes over two identical structured picks when
-        # neither face carries a valid side annotation (nonzero separation).
-        if (
-            isinstance(qa, dict) and isinstance(qb, dict)
-            and qa.get("pick") == "largest" and qb.get("pick") == "smallest"
-        ):
-            pass  # fall through to bbox below for nonzero-separation pair
-        elif qa != qb:
-            # Structured dict endpoints are valid; side words already handled.
-            if (
-                (isinstance(qa, str) and qa in _VALID_SIDE_WORDS)
-                or isinstance(qa, dict)
-            ) and (
-                (isinstance(qb, str) and qb in _VALID_SIDE_WORDS)
-                or isinstance(qb, dict)
-            ):
-                return qa, qb
+    usable = []
+    for face, body, component, sid, key in candidates:
+        # Component alone is not an eval_measure owner. Without body identity the
+        # SID must be unique across the entire document, including other instances.
+        if counts[key] != 1 or (body is None and sid_counts[sid] != 1):
+            continue
+        if face.get("surf") != "plane":
+            continue
+        center, normal = _vec(face.get("centroid")), _vec(face.get("normal"))
+        if center is None or normal is None:
+            continue
+        length = math.sqrt(sum(v * v for v in normal))
+        if length <= 1e-12:
+            continue
+        ref = {"sid": sid}
+        if body is not None:
+            ref["body_id"] = body
+        usable.append((ref, (body, component), center, tuple(v / length for v in normal)))
 
-    # Bbox extents → opposite axis sides (valid side words only).
-    bb = _bbox_extents(doc_id)
-    if isinstance(bb, dict) and bb:
-        def _span(lo: str, hi: str) -> float:
-            try:
-                return abs(float(bb.get(hi, 0)) - float(bb.get(lo, 0)))
-            except (TypeError, ValueError):
-                return 0.0
-        spans = [
-            (_span("zmin", "zmax"), "top", "bottom"),
-            (_span("ymin", "ymax"), "front", "back"),
-            (_span("xmin", "xmax"), "right", "left"),
-        ]
-        spans.sort(key=lambda t: t[0], reverse=True)
-        if spans[0][0] > 0:
-            return spans[0][1], spans[0][2]
-
-    # Solid features present → valid side words (NOT 'top face').
-    feats = _doc_features(doc_id)
-    if feats:
-        return "top", "bottom"
-    return None
+    best = None
+    best_rank = None
+    for i, (a_ref, a_owner, a_center, a_normal) in enumerate(usable):
+        for b_ref, b_owner, b_center, b_normal in usable[i + 1:]:
+            if sum(a * b for a, b in zip(a_normal, b_normal)) > -0.999:
+                continue
+            span = abs(sum((b - a) * n for a, b, n in
+                           zip(a_center, b_center, a_normal)))
+            if span <= 1e-6:
+                continue
+            # Prefer a span on one body/component, then the widest measured plane
+            # separation. Stable refs break ties, independent of query ordering.
+            pair = tuple(sorted((a_ref, b_ref), key=lambda ref: json.dumps(ref, sort_keys=True)))
+            rank = (a_owner == b_owner, span, json.dumps(pair, sort_keys=True))
+            if best_rank is None or rank > best_rank:
+                best, best_rank = pair, rank
+    return best
 
 
 
 def _sketch_ids(doc_id: Optional[str]) -> list[str]:
-    """Sketch feature ids on *doc_id* (2D sketches only)."""
+    """Read every 2D sketch id; an unavailable roster is an error, not an empty doc."""
+    from services.mcp import core_bridge as cb  # noqa: PLC0415
+
+    tree = (cb.call("doc_tree", {"doc_id": doc_id or _cur_doc()}) or {}).get("tree")
+    if not isinstance(tree, dict) or not isinstance(tree.get("features"), list):
+        raise RuntimeError("doc_tree returned no feature roster")
     out: list[str] = []
-    for f in _doc_features(doc_id):
-        ftype = str(f.get("type") or f.get("kind") or "").lower()
-        fid = f.get("id") or f.get("name")
-        if not fid:
+    for f in tree["features"]:
+        if not isinstance(f, dict):
             continue
+        ftype = str(f.get("type") or f.get("kind") or "").lower()
         if ftype in ("sketch", "sketch2d") or (
             ftype.startswith("sketch") and "3d" not in ftype
         ):
+            fid = f.get("id")
+            if not fid:
+                raise RuntimeError("doc_tree returned a sketch without a feature id")
             out.append(str(fid))
     return out
 
@@ -438,83 +358,31 @@ def _adapt_check_kwargs(
         if k in sig_params:
             call_kwargs[k] = v
 
-    if check_name == "check_sketch":
-        if not call_kwargs.get("sketch"):
-            sketches = _sketch_ids(doc_id)
-            if not sketches:
-                return None, _skip_json(
-                    check_name, "no sketches on document"
-                )
-            call_kwargs["sketch"] = sketches[0]
-        return call_kwargs, None
 
     if check_name == "measure_between":
-        # mega-22 R22 / a2 residual: feature ids (f1) and free-text
-        # ("outer cylindrical face") are NOT valid measure queries — the
-        # engine treats bare strings as side words (top/bottom/±x/…).
-        # Always derive geometrically valid face endpoints from
-        # query_geometry / bbox; rewrite bad caller strings.
-        a_q = call_kwargs.get("a_query")
-        b_q = call_kwargs.get("b_query")
-        if isinstance(a_q, str):
-            a_q = _normalize_side_query(a_q)
-            call_kwargs["a_query"] = a_q
-        if isinstance(b_q, str):
-            b_q = _normalize_side_query(b_q)
-            call_kwargs["b_query"] = b_q
-
-        def _valid_endpoint(q) -> bool:
-            if q in (None, ""):
-                return False
-            if isinstance(q, dict):
-                # Structured face/edge query is always engine-valid.
-                return bool(
-                    q.get("of") or q.get("side") or q.get("pick")
-                    or q.get("surf") or q.get("query")
-                )
-            if not isinstance(q, str):
-                return False
-            s = q.strip().lower()
-            if s in _VALID_SIDE_WORDS:
-                return True
-            # Feature ids like f1/feat_box are NOT face queries.
-            return False
-
-        if not _valid_endpoint(a_q) or not _valid_endpoint(b_q):
-            pair = _derive_measure_face_pair(
-                call_kwargs.get("doc_id") or doc_id
-            )
-            if pair is None:
-                # Last resort: valid opposite sides if any solid features exist.
-                feats = _doc_features(doc_id)
-                if feats:
-                    pair = ("top", "bottom")
-                else:
-                    # Distinct, actionable cause: an empty document cannot be
-                    # measured at all. Saying "no geometrically valid
-                    # endpoints" here misleads the model into retrying with
-                    # other queries when the real fix is to build geometry.
-                    return None, _skip_json(
-                        check_name,
-                        f"document {doc_id!r} has no features - nothing to "
-                        "measure; create geometry first (e.g. "
-                        "add_features(doc_id, [{'type': 'box', ...}])) then "
-                        "re-run measure_between (honest SKIP)",
-                    )
-            if not _valid_endpoint(call_kwargs.get("a_query")):
-                call_kwargs["a_query"] = pair[0]
-            if not _valid_endpoint(call_kwargs.get("b_query")):
-                call_kwargs["b_query"] = pair[1]
-
-        # Final normalize + guard.
+        # Explicit endpoints belong to the caller, including invalid or ambiguous
+        # ones. Normalize historical side spellings but never replace their target.
         for key in ("a_query", "b_query"):
-            call_kwargs[key] = _normalize_side_query(call_kwargs.get(key))
-            if not _valid_endpoint(call_kwargs.get(key)):
-                return None, _skip_json(
-                    check_name,
-                    f"invalid measure endpoint {call_kwargs.get(key)!r} "
-                    "(need side word or face query dict; honest SKIP)",
-                )
+            if key in call_kwargs:
+                call_kwargs[key] = _normalize_side_query(call_kwargs[key])
+        missing = [key for key in ("a_query", "b_query") if call_kwargs.get(key) is None]
+        if missing:
+            pair = _derive_measure_face_pair(call_kwargs.get("doc_id") or doc_id)
+            if pair is None:
+                return None, json.dumps({
+                    **_parse_jsonish(_skip_json(
+                        check_name,
+                        "preflight unsupported: no unambiguous opposing planar-face span "
+                        "in the resolved topology; no measurement was attempted. The document "
+                        "may have no features or no supported face pair. Supply explicit "
+                        "unique body-scoped refs to measure a specific design dimension.",
+                    )),
+                    "not_evaluated": True,
+                    "reason": "probe_ref_unsupported",
+                })
+            for key, ref in zip(("a_query", "b_query"), pair):
+                if key in missing:
+                    call_kwargs[key] = ref
         return call_kwargs, None
 
     if check_name == "ecad_check_impedance":
@@ -597,6 +465,65 @@ def _adapt_check_kwargs(
         )
 
     return call_kwargs, None
+
+
+def _check_all_sketches(fn: Any, doc_id: Optional[str], kwargs: dict) -> dict:
+    """Keep the per-sketch tool verdicts and require every requested sketch to pass."""
+    call_kwargs, _ = _adapt_check_kwargs("check_sketch", fn, doc_id, kwargs)
+    call_kwargs = call_kwargs or {}
+    sketches = ([call_kwargs["sketch"]] if call_kwargs.get("sketch")
+                else _sketch_ids(doc_id))
+    if not sketches:
+        return _parse_jsonish(_skip_json("check_sketch", "no sketches on document"))
+    results: list[dict] = []
+    findings: list[dict] = []
+    failures: list[dict] = []
+    for sketch in sketches:
+        try:
+            result = _parse_jsonish(fn(**{**call_kwargs, "sketch": sketch}))
+            if not result:
+                raise RuntimeError("check_sketch returned no result object")
+        except Exception as exc:  # noqa: BLE001
+            result = {"ok": False, "error": str(exc)}
+        result = {**result, "sketch": sketch}
+        result["pinned_only"] = result.get("pinned_only") is True
+        dof = result.get("dof")
+        closed = result.get("closure") or {}
+        fully_defined = (
+            result.get("ok") is True and result.get("fully_defined") is True
+            and not result["pinned_only"] and not result.get("skipped")
+            and result.get("status") not in ("under", "over")
+            and not (isinstance(dof, (int, float)) and dof > 0)
+            and not result.get("conflicting") and result.get("converged") is not False
+            and closed.get("closed_chains_ok") is not False
+            and not closed.get("open_endpoints") and not result.get("open_endpoints")
+            and not any(isinstance(f, dict) and (
+                f.get("ok") is False or f.get("severity") in ("error", "fail", "blocker"))
+                for f in result.get("findings") or [])
+        )
+        result["fully_defined"] = fully_defined
+        results.append(result)
+        for finding in result.get("findings") or []:
+            if isinstance(finding, dict):
+                findings.append({**finding, "sketch": sketch})
+        if not fully_defined:
+            failure = {
+                "sketch": sketch, "ok": False,
+                "detail": result.get("error") or (
+                    "Profile is pinned instead of constrained." if result["pinned_only"]
+                    else "Sketch is not fully defined, closed, and relation/dimension constrained."),
+                "fully_defined": False, "pinned_only": result["pinned_only"],
+            }
+            failures.append(failure)
+    return {
+        "ok": all(r.get("ok") is True and not r.get("skipped") for r in results),
+        "doc_id": doc_id,
+        "fully_defined": all(r["fully_defined"] for r in results),
+        "pinned_only": any(r["pinned_only"] for r in results),
+        "sketches": results, "findings": findings, "failures": failures,
+        "summary": (f"Checked {len(results)} sketch(es): "
+                    f"{len(failures)} failed sketch quality."),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -903,7 +830,7 @@ def _gap_groundedness(model_text: str = "", doc_id: str = None, **_) -> str:
     except Exception:  # noqa: BLE001
         pass
     try:
-        state["mass"] = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": 7.85})
+        state["mass"] = cb.call("eval_mass", {"doc_id": d})  # the model's applied materials
     except Exception:  # noqa: BLE001
         pass
     from tools.translator.groundedness import check_groundedness
@@ -920,7 +847,7 @@ def _gap_unit_sanity(doc_id: str = None, **_) -> str:
     from services.verify.unit_ranges import check_unit_ranges
     d = doc_id or _cur_doc()
     try:
-        state = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": 7.85})
+        state = cb.call("eval_mass", {"doc_id": d})
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)})
     violations = check_unit_ranges(state)
@@ -1236,17 +1163,57 @@ GAP_FNS: dict[str, Any] = {
 # The named field carries the pass verdict.
 _BINARY_VERDICT_FIELDS: dict[str, str] = {
     "check_interference": "clear",
+    "check_sketch": "fully_defined",
 }
 
 
-def _extract_score(check_name: str, reward_shape: str, result_json: str) -> tuple[float, list]:
+def _extract_score(check_name: str, reward_shape: str, result_json: str | dict) -> tuple[float, list]:
     """Parse JSON return from a check function → (score 0..1, findings list)."""
     try:
-        r = json.loads(result_json) if isinstance(result_json, str) else {}
+        r = result_json if isinstance(result_json, dict) else json.loads(result_json)
     except Exception:
         return 0.0, [{"check": check_name, "error": "parse_error", "raw": str(result_json)[:200]}]
 
     findings: list[dict] = []
+    if check_name == "check_sketch":
+        passed = (r.get("ok") is True and r.get("fully_defined") is True
+                  and not r.get("pinned_only") and not r.get("failures"))
+        for item in r.get("findings") or []:
+            if isinstance(item, dict):
+                findings.append({**item, "check": check_name,
+                                 "detail": item.get("message") or item.get("detail") or ""})
+        for failure in r.get("failures") or []:
+            if isinstance(failure, dict):
+                findings.append({**failure, "check": check_name, "ok": False})
+        if not passed and not r.get("failures"):
+            findings.append({
+                "check": check_name, "ok": False,
+                "detail": r.get("error") or r.get("summary")
+                          or "Sketch quality was not established.",
+            })
+        return (1.0 if passed else 0.0), findings
+
+    if check_name == "measure_between":
+        distance = r.get("distance")
+        try:
+            measured = (r.get("ok") is True and not isinstance(distance, bool)
+                        and distance is not None and math.isfinite(float(distance)))
+        except (TypeError, ValueError):
+            measured = False
+        if not measured:
+            return 0.0, [{
+                "check": check_name, "ok": False,
+                "detail": r.get("error") or r.get("summary")
+                          or "measure_between returned no finite distance evidence",
+            }]
+        if abs(float(distance)) <= 1e-9:
+            findings.append({
+                "check": check_name, "ok": True,
+                "detail": "distance 0.0 mm — coincident/adjacent faces "
+                          "(honest finding, not a soft-zero failure)",
+            })
+        return 1.0, findings
+
 
     if reward_shape == "binary":
         # For a check whose ok only means "the check ran", the verdict is a separate field.
@@ -1276,27 +1243,6 @@ def _extract_score(check_name: str, reward_shape: str, result_json: str) -> tupl
             })
         else:
             found = False
-            # mega-23 AC1 / measure_between: a successful finite distance (incl.
-            # honest 0.0 for coincident faces) is a real measurement — score 1.0
-            # and name coincidence instead of silent zero.
-            if check_name == "measure_between" and r.get("ok", False):
-                dist = r.get("distance")
-                try:
-                    if dist is not None and math.isfinite(float(dist)):
-                        dval = float(dist)
-                        score = 1.0
-                        found = True
-                        if abs(dval) <= 1e-9:
-                            findings.append({
-                                "check": check_name,
-                                "ok": True,
-                                "detail": (
-                                    "distance 0.0 mm — coincident/adjacent faces "
-                                    "(honest finding, not a soft-zero failure)"
-                                ),
-                            })
-                except (TypeError, ValueError):
-                    pass
             if not found:
                 # Scalar metrics may sit at the top level OR nested under
                 # `summary`. The sim tools (run_fea_static / _modal / cfd)
@@ -1404,6 +1350,8 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
           "elapsed_ms": float,
           "skipped": [check_name, ...],  # platform-filtered checks
           "interpreted": [{from, to}, ...],  # accepted check-name aliases
+          "check_results": {"check_sketch": {fully_defined, pinned_only, sketches,
+                                             findings, failures, ...}},
         }
     """
     import inspect
@@ -1440,6 +1388,7 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
     scores: dict[str, float] = {}
     findings: list[dict] = []
     skipped: list[str] = []
+    check_results: dict[str, dict] = {}
     study_only = _study_only_kinds(doc_id) if _SOLID_CHECKS.intersection(checks) else []
 
     for name in sorted(checks):  # deterministic order
@@ -1485,6 +1434,8 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
                         "check": name,
                         "ok": True,
                         "skipped": True,
+                        **{key: skip_obj[key] for key in ("not_evaluated", "reason")
+                           if key in skip_obj},
                         "detail": skip_obj.get("skip_reason")
                         or skip_obj.get("summary")
                         or "skipped",
@@ -1493,12 +1444,23 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
                 call_kwargs = adapted or {}
                 probe_chosen = (name == "measure_between"
                                 and _measure_probe_chosen_by_battery(kwargs, call_kwargs))
-                result = fn(**call_kwargs)
+                result = (_check_all_sketches(fn, doc_id, kwargs)
+                          if name == "check_sketch" else fn(**call_kwargs))
         except Exception as e:
-            result = json.dumps({"ok": False, "error": str(e)})
+            result = {"ok": False, "error": str(e)}
+            if name == "check_sketch":
+                result.update({
+                    "doc_id": doc_id, "fully_defined": False, "pinned_only": False,
+                    "sketches": [], "findings": [],
+                    "failures": [{"ok": False, "detail": str(e)}],
+                })
+            else:
+                result = json.dumps(result)
 
         # Gap / tool may also return honest SKIP envelope.
         parsed_early = _parse_jsonish(result)
+        if name == "check_sketch":
+            check_results[name] = parsed_early
         if parsed_early.get("skipped") is True:
             skipped.append(name)
             findings.append({
@@ -1542,6 +1504,7 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
         "elapsed_ms": round(elapsed, 1),
         "skipped": sorted(skipped),
         "interpreted": interpreted,
+        "check_results": check_results,
     }
 
 

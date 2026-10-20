@@ -2,15 +2,56 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import zipfile
+from pathlib import Path
 
 import pytest
 
 from services.mcp.test_gsl_tools import _call, cb, pytestmark
 
 
+@pytest.fixture(scope="module")
+def exchange_daemon():
+    """Own the document pool swept by these tools, without disturbing other suites."""
+    from services.mcp import cad_common as C
+    from services.mcp import daemon_bridge, private_hostd
+
+    with tempfile.TemporaryDirectory(prefix="cw-exchange-", dir="/tmp") as directory:
+        scratch = Path(directory)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
+            patch.setenv("CHUDWARE_CHUDCODE_BIN", str(scratch / "no-model-runtime"))
+            spawned = private_hostd.spawn_private_daemon(scratch)
+            assert spawned is not None, private_hostd.last_failure
+            process, socket_path, key = spawned
+            patch.setenv("CHUDWARE_HOSTD_SOCKET", socket_path)
+            patch.setenv("CHUDWARE_INSTANCE_KEY", key)
+            connection = daemon_bridge.DaemonClient(writer_group=key)
+            # These are real RPCs through one owned, thread-safe connection. A new
+            # socket environment alone would leave existing thread clients attached
+            # to the package daemon and its unrelated documents.
+            patch.setattr(daemon_bridge, "client", lambda: connection)
+            patch.setattr(C, "_TOUCHED_DOCS", [])
+            patch.setattr(C, "_PROCESS_DOCS", set())
+            patch.setattr(C, "_DOC_ALIASES", {})
+            patch.setattr(C, "_DISCARDED_DOCS", {})
+            patch.setattr(C, "_HARNESS_SAVED_PATHS", {})
+            patch.setattr(cb, "_FOREIGN_EDITS_PENDING", {})
+            try:
+                connection.connect(spawn=False)
+                with C.doc_scope():
+                    C._CUR["doc_id"] = None
+                    yield connection
+            finally:
+                C.quiesce_publishes(10.0)
+                connection.close()
+                private_hostd._stop(process, scratch)
+
+
+
 @pytest.fixture
-def docs():
+def docs(exchange_daemon):
     ids = []
     yield ids
     for did in reversed(ids):
@@ -189,8 +230,8 @@ def test_detached_native_import_is_reproducible_and_saves_edits_in_place(
         tmp_path, docs, monkeypatch):
     from services.mcp import cad_common as C
 
-    # Exercise the daemon's no-handoff publishing behavior in the in-process engine.
-    monkeypatch.setattr(cb, "active_daemon_mode", lambda: True)
+    # Exercise the real daemon's no-handoff behavior in this module's owned pool.
+    assert cb.active_daemon_mode()
     monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
     source = new_doc(docs)
     box(source)

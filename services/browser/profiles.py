@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from services import paths
+from services.agent import request_context
 
 # ---------------------------------------------------------------------------
 # Per-site profile locks (Parts Library V2 / embedded browser).
@@ -45,7 +46,7 @@ def profile_lock(site: str | None) -> threading.Lock:
     """
     if site is None:
         return threading.Lock()
-    key = slug(site)
+    key = request_context.scoped_key(slug(site))
     with _PROFILE_LOCKS_GUARD:
         lock = _PROFILE_LOCKS.get(key)
         if lock is None:
@@ -62,6 +63,20 @@ def slug(site: str) -> str:
     return s
 
 
+def _profile_root() -> Path:
+    return paths.actor_root() / "browser_profiles" if request_context.in_cell() else paths.BROWSER_PROFILES
+
+
+def _profile_storage(site: str, *, create: bool = True) -> Path:
+    site_slug = slug(site)
+    if request_context.in_cell():
+        p = paths.private_path("browser_profiles", site_slug, create=create)
+        if p is None:
+            raise KeyError("not_found")
+        return p
+    return _profile_root() / site_slug
+
+
 def profile_dir(site: str) -> Path:
     """Persistent Playwright user-data-dir for ``site``.
 
@@ -70,9 +85,9 @@ def profile_dir(site: str) -> Path:
     (:data:`services.paths.BROWSER_PROFILES`) is created eagerly so metadata can
     be written even before a profile exists.
     """
-    site_slug = slug(site)
-    paths.BROWSER_PROFILES.mkdir(parents=True, exist_ok=True)
-    return paths.BROWSER_PROFILES / site_slug
+    p = _profile_storage(site)
+    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return p
 
 
 def has_profile(site: str) -> bool:
@@ -105,17 +120,25 @@ def has_login(site: str) -> bool:
 
 
 def _meta_path(site: str) -> Path:
-    return paths.BROWSER_PROFILES / f"{slug(site)}.json"
+    return Path(str(_profile_storage(site)) + ".json")
 
 
 def load_meta(site: str) -> dict[str, Any]:
     p = _meta_path(site)
     if not p.exists():
+        if request_context.in_cell():
+            raise KeyError("not_found")
         return {}
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 — metadata is bookkeeping, never fatal to read
+        if request_context.in_cell():
+            raise KeyError("not_found") from None
         return {}
+    if request_context.in_cell() and (
+        not isinstance(data, dict) or data.get("tenant_owner") != list(request_context.owner_key())
+    ):
+        raise KeyError("not_found")
     return data if isinstance(data, dict) else {}
 
 
@@ -123,6 +146,8 @@ def _write_meta(site: str, meta: dict[str, Any]) -> dict[str, Any]:
     """Replace one metadata sidecar after normalising its site identifier."""
     data = dict(meta)
     data["site"] = slug(site)
+    if request_context.in_cell():
+        data["tenant_owner"] = list(request_context.owner_key())
     p = _meta_path(site)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
@@ -135,22 +160,25 @@ def save_meta(site: str, **fields: Any) -> dict[str, Any]:
     Never accepts (and callers must never pass) credential/cookie values —
     this sidecar is plain JSON bookkeeping only.
     """
-    meta = load_meta(site)
+    meta = load_meta(site) if _meta_path(site).exists() else {}
     meta.update(fields)
     return _write_meta(site, meta)
 
 
 def list_profiles() -> list[dict[str, Any]]:
     """All known site profiles' metadata, sorted by site id."""
-    if not paths.BROWSER_PROFILES.exists():
+    root = _profile_root()
+    if not root.exists():
         return []
     out: list[dict[str, Any]] = []
-    for meta_file in sorted(paths.BROWSER_PROFILES.glob("*.json")):
+    for meta_file in sorted(root.glob("*.json")):
         try:
             data = json.loads(meta_file.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             continue
         if isinstance(data, dict) and "site" in data:
+            if request_context.in_cell() and data.get("tenant_owner") != list(request_context.owner_key()):
+                continue
             out.append(data)
     return out
 
@@ -256,15 +284,16 @@ def delete_profile(site: str) -> bool:
     The caller owns :func:`profile_lock` while deleting when profile contention
     is possible. Returns True when any of the three artifacts existed.
     """
-    site_slug = slug(site)
+    d = _profile_storage(site, create=False)
+    # Check the owner stamp before removing any profile state.
+    load_meta(site)
     removed = False
-    d = paths.BROWSER_PROFILES / site_slug
     if d.exists():
         shutil.rmtree(d)
         removed = True
     for sidecar in (
-        paths.BROWSER_PROFILES / f"{site_slug}.json",
-        paths.BROWSER_PROFILES / f"{site_slug}.cookies.json",
+        _meta_path(site),
+        _cookie_sidecar_path(site),
     ):
         if sidecar.exists():
             sidecar.unlink()
@@ -287,7 +316,7 @@ def delete_profile(site: str) -> bool:
 
 
 def _cookie_sidecar_path(site: str) -> Path:
-    return paths.BROWSER_PROFILES / f"{slug(site)}.cookies.json"
+    return Path(str(_profile_storage(site)) + ".cookies.json")
 
 
 def save_session_cookies(site: str, cookies: list[dict[str, Any]]) -> int:
@@ -296,7 +325,10 @@ def save_session_cookies(site: str, cookies: list[dict[str, Any]]) -> int:
     staging — the newest login wins."""
     p = _cookie_sidecar_path(site)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(list(cookies)), encoding="utf-8")
+    data: Any = list(cookies)
+    if request_context.in_cell():
+        data = {"tenant_owner": list(request_context.owner_key()), "cookies": data}
+    p.write_text(json.dumps(data), encoding="utf-8")
     try:
         p.chmod(0o600)
     except OSError:
@@ -311,11 +343,17 @@ def consume_session_cookies(site: str) -> list[dict[str, Any]]:
     and the sidecar has no reason to exist."""
     p = _cookie_sidecar_path(site)
     if not p.exists():
+        if request_context.in_cell():
+            raise KeyError("not_found")
         return []
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 — a corrupt staging file is just discarded
         data = []
+    if request_context.in_cell():
+        if not isinstance(data, dict) or data.get("tenant_owner") != list(request_context.owner_key()):
+            raise KeyError("not_found")
+        data = data.get("cookies", [])
     try:
         p.unlink()
     except OSError:
@@ -329,6 +367,6 @@ def has_pending_session_cookies(site: str) -> bool:
 
 def touch_created(site: str) -> None:
     """Stamp ``created_ts`` the first time a profile is seen; a no-op afterwards."""
-    meta = load_meta(site)
+    meta = load_meta(site) if _meta_path(site).exists() else {}
     if not meta.get("created_ts"):
         save_meta(site, created_ts=time.time())

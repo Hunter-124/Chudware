@@ -26,7 +26,7 @@ import json
 import re
 
 from .. import session as _session
-from . import download_dir, is_login_wall, login_required, provenance_envelope, register
+from . import download_path, is_login_wall, login_required, provenance_envelope, register
 
 SITE = "misumi"
 BASE_URL = "https://us.misumi-ec.com"
@@ -160,8 +160,9 @@ class MisumiAdapter:
         part_number = part_match.group("part").strip() if part_match else result.get("part_number")
         price_match = _PRICE_RE.search(content)
 
-        filename = download_url.rsplit("/", 1)[-1].split("?", 1)[0] or "download.step"
-        dest = download_dir(SITE) / filename
+        dest, refusal = download_path(SITE, download_url, default="download.step")
+        if refusal is not None:
+            return refusal
         outcome = _session.browser_download(download_url, SITE, dest)
         if not outcome.get("ok"):
             return outcome

@@ -216,6 +216,15 @@ def test_delete_feature_accepts_the_feature_id_spelling():
     assert notes
 
 
+@pytest.mark.parametrize("alias", ["id", "feature_id", "feature", "target"])
+def test_set_rollback_reads_a_target_spelling_as_after(alias):
+    """c259: these reached the engine as ignored keys; the bar never moved, ok:true."""
+    notes: list = []
+    ops = M._normalize_op_elements([{"op": "set_rollback", alias: "f30"}], notes)
+    assert ops == [{"op": "set_rollback", "after": "f30"}]
+    assert notes
+
+
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
@@ -4464,7 +4473,9 @@ def test_compound_sketch_fix_pins_all_segments_for_creation_and_replacement(repl
             assert result["ok"], result
         feature = _cb.call("doc_tree", {"doc_id": doc})["tree"]["features"][0]
         entities = feature["params"]["entities"]
-        assert {c["refs"][0] for c in feature["params"]["constraints"]} == {e["id"] for e in entities}
+        constraints = feature["params"]["constraints"]
+        assert {c["refs"][0] for c in constraints if c["type"] == "fix"} == {e["id"] for e in entities}
+        assert {"coincident", "horizontal", "vertical"} <= {c["type"] for c in constraints}
         extruded = json.loads(add(doc_id=doc, ops=[{
             "type": "extrude", "refs": {"profile": sketch}, "params": {"depth": 3}}]))
         assert extruded["ok"] and extruded["volume_mm3"] == pytest.approx(720), extruded

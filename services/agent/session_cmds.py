@@ -245,6 +245,18 @@ def _run_one_shot_role(
         "settings": settings,
         "offline": local,
     }
+    if not local:
+        from services.agent.chudcode_host import get_default_chudcode_host
+        host = get_default_chudcode_host()
+        inherit = getattr(host, "session_launch_params", None)
+        if callable(inherit):
+            try:
+                options = {**inherit(parent_session), **options}
+            except KeyError as exc:
+                from services.agent.request_context import in_cell
+                if in_cell():
+                    raise SessionCommandUnavailable("not_found") from exc
+        options["mode"] = "ask"
     if local and provider is not None and not isinstance(provider, str):
         options["offline_provider"] = provider
     turn = run_role_turn(
@@ -264,6 +276,10 @@ def _run_one_shot_role(
 
 class SessionCommandUnavailable(RuntimeError):
     """A command requiring a live Chudcode session could not be served."""
+
+    def __init__(self, message: str, *, code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 def _offline_enabled() -> bool:
@@ -300,8 +316,11 @@ def _chudcode_session_call(
             key, command, params, **host_options
         )
     except Exception as exc:  # noqa: BLE001 - process boundary
+        code = getattr(exc, "code", None)
+        if code is None:
+            code = exc.args[0] if isinstance(exc, KeyError) and len(exc.args) == 1 else str(exc)
         raise SessionCommandUnavailable(
-            f"Agent session {command} unavailable: {exc}"
+            f"Agent session {command} unavailable: {exc}", code=code,
         ) from exc
     if not isinstance(result, dict):
         raise SessionCommandUnavailable(
@@ -310,7 +329,8 @@ def _chudcode_session_call(
     if result.get("ok") is False:
         reason = str(result.get("reason") or result.get("error") or "request failed")
         raise SessionCommandUnavailable(
-            f"Agent session {command} unavailable: {reason}"
+            f"Agent session {command} unavailable: {reason}",
+            code=result.get("code") or reason,
         )
     return result
 

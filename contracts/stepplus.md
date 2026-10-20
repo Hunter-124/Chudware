@@ -32,7 +32,9 @@
 - `document.json` numbers are canonical units (mm/deg/g) like everywhere else.
 - Extension is literally `.step+`. Save As also offers plain `.step` (geometry only) with a
   one-time "parametrics are not included in plain STEP" notice.
-- Atomic save: write to `<name>.step+.tmp`, then replace (no torn files on crash).
+- Atomic save: write through an exclusively created file in a new owner-private
+  staging directory, then publish that open file over the destination; no fixed
+  `<name>.tmp` path is opened. Archive members are matched case-sensitively.
 
 ## 4. Persisted-geometry cache entries (additive, 2026-07-12)
 
@@ -214,3 +216,112 @@ ACIS 3DSOLID/BODY/REGION/SURFACE entities of DXF/DWG files (and `.sat`/`.sab`) a
 and an embedded DXF/DWG/SAT import keeps one body per baked compound child (`embedded_bodies`), so
 a drawing profile with construction wires stays one body. Older caches lack those solids and are a
 cache miss (`engine_key`); the import rebuilds from its embedded geometry.
+
+## 16. Joining fillet cache epoch (2026-10-12)
+
+The current semantic key is `chudware-geomcache/15` plus the OCCT version. Epoch 15 fillets an
+edge shared by two bodies by filling its concave corners and joining the bodies into one solid
+(`contracts/doc_schema.md` §"Fillet on an edge shared by two bodies"). Before this epoch the
+same feature failed as "too large". Older caches are a cache miss (`engine_key`).
+
+## 17. Build-state write-back on rebuild (2026-10-12)
+
+Additive; no stored format changes and the engine key is unchanged. A build is saved into the
+file it was built from, not only by `doc_save`, so a stale cache (an engine epoch bump, a
+`document.json` edited outside Chudware, a missing or unsolved cache) costs one rebuild, not one
+per open:
+
+- **`doc_open`** of a native `.step+` (not `detach_path`) that missed its cache writes the build
+  it just produced back into that file: a part when the open executed features that succeeded
+  (a display-tier re-mesh or a retry of the same failing features writes nothing); an
+  assembly whenever its saved display missed. The response reports it in
+  `cache.writeback = {written, reason?, entries, dropped?, checkpoints?, cache_skipped_reason?,
+  components?}`; `components` lists `{id, build_state}` for every component the rebuild compiled.
+- **Assembly component loads** of a self-contained part (no legacy file-backed import) whose
+  `cache.json`/`cache.brep` did not serve compile it as a part session does and write the same
+  full build state into the component file (`AsmComponentStatus.build_state`).
+- Only the build-state members (`cache.json`, `cache.aicm`, `cache.brep`, `cache.ckpt`,
+  `geometry.step`) are replaced. `document.json`, `meta.json`, `thumbnail.png`, drawings, studies
+  and unknown entries are copied as their original compressed streams, byte for byte, so the
+  vault (`services/plm/snapshot.is_derived_entry`), AI-VC (`authored_sha256`) and every other
+  content comparison see an unchanged document. Budget and STORED rules are §4's.
+- The write refuses, leaving the file untouched, unless the file still carries the size+mtime
+  stamp taken before the read and its `document.json` still hashes to the built `doc_hash`
+  (`file_changed`, `document_changed`); a save that lands while the copy is written wins.
+  Unwritable files report `io_error: …`. A refusal never fails the open or the load.
+- Assembly `components` fingerprint rows for native files now also carry `doc_hash`; a row
+  whose size/mtime changed still matches when both rows carry the same `doc_hash`, so a
+  component's build-state write-back does not invalidate the assemblies that use it.
+
+## 18. Non-mutating unify cache epoch (2026-10-12)
+
+The current semantic key is `chudware-geomcache/16` plus the OCCT version. Epoch 16 runs
+UnifySameDomain on a topology copy of each boolean result. OCCT's unify edits the edges of the
+faces it merges in place, and a NonDestructive boolean shares untouched TShapes with its
+argument, which is a cached compile checkpoint. Before this epoch, a cut followed by an undo or
+delete could restore a corrupted, BRepCheck-invalid prefix, and `doc_save` persisted that state
+into `cache.ckpt`. A subtractive feature whose exact volume grows now fails by name
+(`… produced a body LARGER than its target`). Older caches are a cache miss (`engine_key`) and
+rebuild through §17's write-back.
+
+## 19. Cache provenance and rooted native references (2026-10-13)
+
+Derived build state carries `cache.provenance`, a JSON envelope with schema
+`chudware-cache-provenance/1`, `manifest`, and lowercase hexadecimal `mac`.
+The manifest is canonical compact JSON (lexicographically sorted object keys):
+`{engine, doc_hash, members}`, where `doc_hash` is SHA-256 of the canonical authored
+document (the existing noncryptographic cache-header identity remains unchanged), and
+`members` maps every written `cache.json`, `cache.aicm`, `cache.brep`, and `cache.ckpt`
+member to its SHA-256 digest. `mac` is HMAC-SHA256 over the canonical manifest.
+Optional-member admission happens before signing; omitted members are not claimed.
+Readers authenticate the whole signed manifest and independently verify the members
+they admit and consume. Skipped or absent unrelated members do not invalidate admitted
+checkpoints or component BREP state.
+`cache.provenance` is derived state, replaced by build-state write-back and invalidated
+on relocation, never copied as an authored attachment.
+
+The 32-byte random signing key is `cache-provenance.key` in the cell's `--cell-state`
+directory or the desktop's Chudware data directory. It is atomically published,
+owner-private (`0600` on POSIX), and never read from a document or workspace. Cell
+startup supplies trusted `CHUDWARE_CELL_STATE` and `CHUDWARE_NATIVE_ROOT` before loading
+the engine; tenant workers do not receive the state key.
+
+A matching MAC reports `cache_trust:"verified"` and retains warm open/activation:
+zero features execute. An absent, foreign, or invalid MAC does **not** block opening
+otherwise usable cached geometry: it reports `cache_trust:"unverified"` and
+`cache_verification_pending:true`, displays and hydrates the saved state immediately,
+and re-solves the feature history in a background scratch session with no restored
+checkpoints or unverified component-cache reuse. Completion replaces derived geometry
+without editing the feature history or revision, reports `cache_verification` with
+`completed`, `mismatch`, and guarded `writeback`, warns `cache_mismatch` when the display
+differs, and writes fresh authenticated state into the unchanged source file. Edits
+arriving during verification are retained; verification restarts against their current
+tree. Failed verification remains unverified and reports `cache_verification_failed`.
+The asynchronous refresh sink publishes the replacement outside document locks.
+Assembly component BREP loads follow the same trust policy; a containing session's
+background rebuild bypasses unverified components and updates their persisted state.
+
+With an allowed root configured (cell: `/work`), document-embedded component/import
+references, pump-curve file references, and numerical system-export destinations must
+be relative, contain neither NUL nor parent traversal, and resolve beneath that root
+without traversing symlinks (including dangling links). Unsafe references are refused
+before cached-state replay, sink access, or committing a native editing batch: rejected
+insert/edit/paste operations leave the tree and revision unchanged. Inline pump CSV is
+classified before filesystem access. SVG sheet IDs
+and output-name components are always safe leaf identifiers, independently of root
+configuration; traversal, absolute paths, separators and NUL are refused.
+Import provenance is stored workspace-relative even when the native RPC has already
+mapped its input to an absolute OS path; legacy file-backed imports resolve that
+reference against the configured workspace root. Assembly component references resolve
+against the containing document/project folder (or workspace root for unsaved cells).
+Rooted save-as refuses references that would require an absolute/traversing spelling.
+
+
+## 20. Sketcher overhaul cache epoch (2026-10-16)
+
+The current semantic key is `chudware-geomcache/17` plus the OCCT version. Epoch 17 projects an
+oblique straight model edge as one analytic line (it used to be a sampled run of collinear
+segments), expands composite rectangles/polygons/polylines with their relations, and solves the
+extended 2D relation set (junction tangency, normalized collinear/parallel residuals, no
+wrong-type residuals). Converted entities and solved sketch coordinates of older caches can
+differ, so they are a cache miss (`engine_key`) and rebuild through §17's write-back.

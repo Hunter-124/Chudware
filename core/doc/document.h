@@ -285,6 +285,10 @@ CompileResult compile_document(const nlohmann::json& doc, const nlohmann::json& 
 void apply_doc_appearance(const nlohmann::json& doc, uint32_t body_num,
                           float color[3], float& metallic, float& roughness);
 
+// Physical material registry key of part body `body_num` (1-based): the
+// doc["body_materials"]["b<body_num>"] override, else the document material, else "".
+std::string doc_body_material_key(const nlohmann::json& doc, uint32_t body_num);
+
 // Exact SID inventory paired with actual TopExp::MapShapes 1-based face IDs. A SID
 // may have multiple candidates (quantized hash collision); never choose one by ordinal.
 using FaceSidInventory = std::map<std::string, std::vector<std::pair<uint32_t, nlohmann::json>>>;

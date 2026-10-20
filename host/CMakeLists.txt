@@ -56,6 +56,7 @@ if(CHUDWARE_LTO)
   include(CheckIPOSupported)
   check_ipo_supported(RESULT _chudware_ipo_ok OUTPUT _chudware_ipo_msg LANGUAGES CXX)
   if(_chudware_ipo_ok)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../core/cmake/MsvcLtoPool.cmake")
     message(STATUS "CHUDWARE_LTO: interprocedural optimization ENABLED")
   else()
     message(WARNING "CHUDWARE_LTO requested but IPO unsupported by this toolchain: ${_chudware_ipo_msg}")
@@ -66,7 +67,7 @@ if(MSVC)
   add_compile_options(/utf-8 /MP)
 endif()
 
-include(FetchContent)
+include("${CMAKE_CURRENT_SOURCE_DIR}/../core/cmake/PinnedGitSource.cmake")
 
 # --- Embedded browser backend selection -------------------------------------
 # CEF is THE embedded-browser backend since the ScreencastWebView removal
@@ -101,50 +102,44 @@ if(NOT EMSCRIPTEN)
   set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
-  FetchContent_Declare(glfw
-    GIT_REPOSITORY https://github.com/glfw/glfw.git
-    GIT_TAG 3.4)
+  # Primary commit: https://api.github.com/repos/glfw/glfw/commits/3.4
+  chudware_populate_pinned_git(glfw https://github.com/glfw/glfw.git
+    7b6aead9fb88b3623e3b3725ebb42670cbe4c579)
+  add_subdirectory("${glfw_SOURCE_DIR}" "${glfw_BINARY_DIR}" EXCLUDE_FROM_ALL)
 endif()
 
 # --- glad (GL 3.3 core loader) — vendored, pre-generated into extern/glad ----
 # Compiled directly into the target; no configure-time fetch/generation.
 
 # --- stb (single-header PNG writer) -----------------------------------------
-FetchContent_Declare(stb
-  GIT_REPOSITORY https://github.com/nothings/stb.git
-  GIT_TAG master)
+# Primary master identity: https://api.github.com/repos/nothings/stb/commits/2c980bb59875b0d32144a71867fbdebb2f77cd20
+chudware_populate_pinned_git(stb https://github.com/nothings/stb.git
+  2c980bb59875b0d32144a71867fbdebb2f77cd20)
 
 # --- nlohmann/json (worker IPC) ---------------------------------------------
 set(JSON_BuildTests OFF CACHE INTERNAL "")
-FetchContent_Declare(json
-  URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
+# Same authenticated source identity as the core.
+chudware_populate_pinned_git(json https://github.com/nlohmann/json.git
+  9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03)
+add_subdirectory("${json_SOURCE_DIR}" "${json_BINARY_DIR}" EXCLUDE_FROM_ALL)
 
 # --- Dear ImGui (docking branch) — GUI --------------------------------------
-FetchContent_Declare(imgui
-  GIT_REPOSITORY https://github.com/ocornut/imgui.git
-  GIT_TAG v1.91.6-docking)
+# Primary commit: https://api.github.com/repos/ocornut/imgui/commits/v1.91.6-docking
+chudware_populate_pinned_git(imgui https://github.com/ocornut/imgui.git
+  947aa9c9722bd6ff740dd757da609ff41f4d3ba3)
 
 # --- miniz (ZIP read for `.step+` component feature lists) ------------------
-# Same amalgamated release core uses (core/CMakeLists.txt). host talks to the
-# worker over IPC and does NOT link libchudware, so it vendors its own copy to read
-# document.json out of a component `.step+` for the assembly tree's nested rows.
-# The release ships miniz.c/miniz.h with no root CMakeLists, so populate + build
-# a tiny static lib ourselves (C is already enabled on this project).
-# miniz: host reads document.json out of component `.step+` zips (assembly tree).
-FetchContent_Declare(miniz
-  URL https://github.com/richgel999/miniz/releases/download/3.0.2/miniz-3.0.2.zip)
-FetchContent_GetProperties(miniz)
-if(NOT miniz_POPULATED)
-  FetchContent_Populate(miniz)
-endif()
-add_library(chudware_host_miniz STATIC ${miniz_SOURCE_DIR}/miniz.c)
-target_include_directories(chudware_host_miniz PUBLIC ${miniz_SOURCE_DIR})
-
-if(EMSCRIPTEN)
-  FetchContent_MakeAvailable(stb json imgui)
-else()
-  FetchContent_MakeAvailable(glfw stb json imgui)
-endif()
+# The host talks to the worker over IPC, so build its own copy from the same
+# pinned 3.0.2 split sources as core (no unauthenticated release amalgamation).
+chudware_populate_pinned_git(miniz https://github.com/richgel999/miniz.git
+  293d4db1b7d0ffee9756d035b9ac6f7431ef8492)
+add_library(chudware_host_miniz STATIC
+  ${miniz_SOURCE_DIR}/miniz.c ${miniz_SOURCE_DIR}/miniz_zip.c
+  ${miniz_SOURCE_DIR}/miniz_tinfl.c ${miniz_SOURCE_DIR}/miniz_tdef.c)
+file(MAKE_DIRECTORY "${miniz_BINARY_DIR}")
+file(CONFIGURE OUTPUT "${miniz_BINARY_DIR}/miniz_export.h"
+  CONTENT "#pragma once\n#define MINIZ_EXPORT\n" NEWLINE_STYLE LF)
+target_include_directories(chudware_host_miniz PUBLIC "${miniz_SOURCE_DIR}" "${miniz_BINARY_DIR}")
 
 # Shared host sources (native + EMSCRIPTEN). Desktop-only / platform TUs are
 # stripped or swapped below for the web target.
@@ -237,6 +232,7 @@ set(CHUDWARE_CORE_SOURCES
   # --- end C17 ---
   # --- C18: sketch mode UI ---
   src/ui/sketch_mode.cpp
+  src/ui/sketch_relations_panel.cpp   # Display/Delete Relations panel (sketch_relations_panel.h)
   src/ui/airfoil.cpp   # NACA 4-/5-digit + .dat airfoil profile generator (SketchTool::Airfoil)
   src/ui/sketch3d_mode.cpp   # 3D free-space sketcher (sketch3d features)
   # --- end C18 ---
@@ -402,6 +398,7 @@ set_property(SOURCE
   src/ui/widgets/kit.cpp
   src/ui/widgets/kit_panel.cpp
   src/ui/widgets/kit_form.cpp
+  src/ui/copilot/cards.cpp
   src/ui/sim/sim_manager_forms.cpp
   src/ui/sim/sim_manager_flow.cpp
   src/ui/sim/sim_manager_motion.cpp
@@ -955,6 +952,7 @@ target_include_directories(test_async_rpc PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(test_async_rpc PRIVATE nlohmann_json::nlohmann_json)
 find_package(Threads REQUIRED)
+target_link_libraries(test_entitlement_commands PRIVATE Threads::Threads)
 target_link_libraries(test_async_rpc PRIVATE Threads::Threads)
 set_target_properties(test_async_rpc PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
@@ -1052,6 +1050,63 @@ add_test(NAME test_cef_spool_reaper
   COMMAND test_cef_spool_reaper
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end CEF metrics spool bound ---
+
+add_executable(test_external_open
+  tests/test_external_open.cpp
+  src/ui/file_dialog.cpp
+  src/ui/web_capabilities.cpp)
+target_include_directories(test_external_open PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_external_open PRIVATE Threads::Threads)
+if(WIN32)
+  target_link_libraries(test_external_open PRIVATE shell32 ole32 comdlg32)
+endif()
+set_target_properties(test_external_open PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_external_open COMMAND test_external_open)
+set_tests_properties(test_external_open PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_graph_thumbnail
+  tests/test_graph_thumbnail.cpp
+  src/stb_impl.cpp)
+target_include_directories(test_graph_thumbnail PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${miniz_SOURCE_DIR}
+  ${stb_SOURCE_DIR})
+target_link_libraries(test_graph_thumbnail PRIVATE chudware_host_miniz)
+set_target_properties(test_graph_thumbnail PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_graph_thumbnail COMMAND test_graph_thumbnail)
+
+add_executable(test_aicm_bounds
+  tests/test_aicm_bounds.cpp
+  src/render/aicm_loader.cpp
+  ../core/util/aicm_handoff.cpp)
+target_include_directories(test_aicm_bounds PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../core)
+target_link_libraries(test_aicm_bounds PRIVATE Threads::Threads)
+if(UNIX AND NOT APPLE)
+  target_link_libraries(test_aicm_bounds PRIVATE rt)
+endif()
+set_target_properties(test_aicm_bounds PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_aicm_bounds COMMAND test_aicm_bounds
+  "${CMAKE_CURRENT_SOURCE_DIR}/../contracts/fixtures/box.aicm")
+
+add_executable(test_cef_trace_bounds tests/test_cef_trace_bounds.cpp)
+target_include_directories(test_cef_trace_bounds PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc)
+target_link_libraries(test_cef_trace_bounds PRIVATE Threads::Threads)
+if(WIN32)
+  target_link_libraries(test_cef_trace_bounds PRIVATE advapi32)
+endif()
+set_target_properties(test_cef_trace_bounds PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_cef_trace_disabled COMMAND test_cef_trace_bounds --disabled)
+add_test(NAME test_cef_trace_explicit_opt_in COMMAND test_cef_trace_bounds --not-opted-in)
+add_test(NAME test_cef_trace_bounds COMMAND test_cef_trace_bounds --enabled)
 
 # --- copilot agent-authored text sanitizers: links the REAL agent_text.cpp (no GL / imgui /
 # AppState). Guards two live chat defects: tool-call cards printing the opaque engine doc id
@@ -1203,6 +1258,20 @@ set_target_properties(test_sim_topology PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME test_sim_topology COMMAND test_sim_topology
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+# Real-GL picking profiler; hidden context, deterministic geometry, no engine session.
+add_executable(profile_viewport
+  ../tools/profile_viewport.cpp
+  src/render/id_pass.cpp
+  ../extern/glad/src/gl.c)
+target_include_directories(profile_viewport PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/render
+  ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/include
+  ${stb_SOURCE_DIR})
+target_link_libraries(profile_viewport PRIVATE glfw)
+set_target_properties(profile_viewport PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET Chudware POST_BUILD

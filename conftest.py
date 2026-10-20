@@ -14,6 +14,24 @@ import types
 # regardless of where pytest is invoked from (merged from the earlier root conftest).
 import os
 _ROOT = os.path.dirname(os.path.abspath(__file__))
+_TEST_ROOTS = {
+    "HOME": "home",
+    "USERPROFILE": "home",
+    "XDG_DATA_HOME": "data",
+    "XDG_CONFIG_HOME": "config",
+    "XDG_CACHE_HOME": "cache",
+    "XDG_RUNTIME_DIR": "run",
+    "CHUDWARE_CACHE_ROOT": "agent-cache",
+    "CHUDWARE_SUBAGENTS_DIR": "subagents",
+    "CHUDWARE_ECAD_LIB_DIR": "ecad",
+    "CHUDWARE_HANDOFF_DIR": "handoff",
+    "CHUDWARE_BOX_MIRROR_DIR": "box-mirror",
+    "CHUDWARE_REVENG_DIR": "reveng",
+    "CHUDWARE_MFG_STATE_DIR": "manufacturing",
+}
+_test_environment = None
+_test_directory = None
+_collection_engine_override = False
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
@@ -219,7 +237,7 @@ def _isolated_engine_session():
 
 
 @_pytest.fixture(autouse=True)
-def _isolated_engine_in_mixed_suite(request, monkeypatch):
+def _isolated_engine_in_mixed_suite(request, _restore_path_configuration, monkeypatch):
     """Keep non-MCP tests off the user's daemon when MCP tests are collected too.
 
     services/mcp/conftest.py sets its daemon opt-out during collection, before
@@ -252,10 +270,53 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
+    # Fixtures run after collection. Imports can already resolve paths, migrate a
+    # legacy profile, or probe a backend, so isolate those roots before collection.
+    import tempfile
+    from pathlib import Path
+
+    global _test_environment, _test_directory, _collection_engine_override
+    _test_directory = tempfile.TemporaryDirectory(prefix="chudware-pytest-")
+    root = Path(_test_directory.name)
+    names = (*_TEST_ROOTS, "APPDATA", "CHUDWARE_TEST_WANTS_DAEMON")
+    _test_environment = {name: os.environ.get(name) for name in names}
+    os.environ.pop("APPDATA", None)
+    os.environ.pop("CHUDWARE_TEST_WANTS_DAEMON", None)
+    for name, suffix in _TEST_ROOTS.items():
+        directory = root / suffix
+        directory.mkdir(mode=0o700, exist_ok=True)
+        os.environ[name] = str(directory)
+    if not _EXPLICIT_ENGINE_TARGET:
+        os.environ["CHUDWARE_ENGINE_DAEMON"] = "0"
+        _collection_engine_override = True
     config.addinivalue_line(
         "markers",
         "live: hits real vendor sites over the network; opt in with --live or CHUDWARE_LIVE_TESTS=1",
     )
+
+
+def pytest_collection_finish(session):
+    global _collection_engine_override
+    if _collection_engine_override:
+        os.environ.pop("CHUDWARE_ENGINE_DAEMON", None)
+        _collection_engine_override = False
+
+
+def pytest_unconfigure(config):
+    global _test_directory, _test_environment, _collection_engine_override
+    if _collection_engine_override:
+        os.environ.pop("CHUDWARE_ENGINE_DAEMON", None)
+        _collection_engine_override = False
+    if _test_environment is not None:
+        for name, value in _test_environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        _test_environment = None
+    if _test_directory is not None:
+        _test_directory.cleanup()
+        _test_directory = None
 
 
 def _live_enabled(config) -> bool:
@@ -275,6 +336,43 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "live" in item.keywords:
             item.add_marker(skip_live)
+
+
+@_pytest.fixture(autouse=True)
+def _restore_path_configuration():
+    """Keep reloads and dynamic-attribute patches local to their owning test.
+
+    monkeypatch.setattr on paths.__getattr__ otherwise restores a concrete value,
+    permanently shadowing actor-aware paths. Module reloads also replace the
+    desktop root and can discard the MCP session's private CONFIG override.
+    """
+    paths = sys.modules.get("services.paths")
+    saved_paths = {}
+    if paths is not None:
+        names = (*paths._PATH_SUFFIXES, "_DESKTOP_ROOT")
+        saved_paths = {name: paths.__dict__[name] for name in names
+                       if name in paths.__dict__}
+    saved_environment = {name: os.environ.get(name) for name in _TEST_ROOTS}
+    try:
+        yield
+    finally:
+        if paths is not None:
+            for name in names:
+                if name in saved_paths:
+                    paths.__dict__[name] = saved_paths[name]
+                else:
+                    paths.__dict__.pop(name, None)
+        for name, value in saved_environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        agent_config = sys.modules.get("services.agent.config")
+        if agent_config is not None and "_cfg_cache" in agent_config.__dict__:
+            with agent_config._cfg_cache_lock:
+                agent_config._cfg_cache = None
+                agent_config._cfg_cache_path = None
+                agent_config._cfg_cache_mtime_ns = None
 
 
 @_pytest.fixture(autouse=True)

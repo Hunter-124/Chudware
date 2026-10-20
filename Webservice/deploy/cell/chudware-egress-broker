@@ -1,0 +1,84 @@
+#!/usr/bin/python3 -IS
+import os
+from pathlib import Path
+import socket
+import sys
+import threading
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cell_runtime import cell_config, close_extra_fds, configuration, connect_public, relay
+
+
+def handle(client, hosts):
+    upstream = None
+    try:
+        client.settimeout(10)
+        header = bytearray()
+        while not header.endswith(b"\r\n\r\n"):
+            if len(header) >= 8192:
+                raise ValueError("oversized request")
+            byte = client.recv(1)
+            if not byte:
+                raise ValueError("truncated request")
+            header += byte
+        text = header.decode("ascii")
+        rows = text.split("\r\n")
+        method, target, version = rows[0].split(" ")
+        if method != "CONNECT" or version != "HTTP/1.1" or target.count(":") != 1:
+            raise ValueError("CONNECT hostname:443 required")
+        host, port = target.split(":")
+        if port != "443" or host != host.lower():
+            raise ValueError("destination refused")
+        for row in rows[1:-2]:
+            if not row or row[0].isspace() or ":" not in row or any(ord(c) < 32 for c in row):
+                raise ValueError("invalid header")
+            name, value = row.split(":", 1)
+            if name.lower() not in ("host", "user-agent", "proxy-connection"):
+                raise ValueError("unsupported proxy header")
+            if name.lower() == "host" and value.strip() != target:
+                raise ValueError("host mismatch")
+        upstream = connect_public(host, 443, hosts)
+        client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        relay(client, upstream)
+    except (OSError, ValueError, UnicodeError):
+        try:
+            client.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        except OSError:
+            pass
+    finally:
+        if upstream is not None:
+            upstream.close()
+        client.close()
+
+
+def serve(listener, hosts):
+    slots = threading.BoundedSemaphore(32)
+    while True:
+        connection, _ = listener.accept()
+        if not slots.acquire(blocking=False):
+            connection.close()
+            continue
+        def run(client=connection):
+            try:
+                handle(client, hosts)
+            finally:
+                slots.release()
+        threading.Thread(target=run, daemon=True).start()
+
+
+if __name__ == "__main__":
+    try:
+        if len(sys.argv) != 2:
+            raise ValueError("usage: chudware-egress-broker <cell_id>")
+        cfg = configuration()
+        cell_config(sys.argv[1], cfg)
+        if os.environ.get("LISTEN_FDS") != "1" or os.environ.get("LISTEN_PID") != str(os.getpid()):
+            raise ValueError("one systemd listener required")
+        close_extra_fds((3,))
+        listener = socket.socket(fileno=3)
+        if listener.family != socket.AF_UNIX or not listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN):
+            raise ValueError("invalid broker listener")
+        hosts = cfg.get("egress_hosts")
+        serve(listener, None if hosts is None else frozenset(hosts))
+    except Exception as exc:
+        print("cell_refused: " + str(exc), file=sys.stderr)
+        sys.exit(1)

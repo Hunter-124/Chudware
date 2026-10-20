@@ -15,6 +15,7 @@ HARD SPLIT
     * orientation intent
     * dimensions from the ledger (DIM ids / values)
     * what the sketch must produce (closed profile, slot, hole pattern, etc.)
+    * model references to convert as construction and the symmetry/datum intent
 - Place the returned sketch on the correct plane/face/orientation.
 - Verify placement before committing the solid feature: call `render_part` and
   inspect the returned geometry; use `measure_part` when placement or scale is
@@ -44,6 +45,8 @@ THE LOOP
       dimensions, and profile intent. Do not freehand the profile in add_features
       when sketch2d can own it.
    b. Attach/place the returned sketch_ref on the planned plane/face/orientation.
+      Require check_sketch: closed profile, dof == 0, pinned_only == false, no
+      conflicts/skipped constraints; blanket-fixed geometry is not design intent.
    c. Vision check: render_part (or delegate vision) — confirm placement, normal,
       and profile sense before the solid op.
    d. preflight_ops for the planned solid (after a first solid exists, or at most

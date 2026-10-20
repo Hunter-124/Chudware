@@ -12,7 +12,8 @@ Ledger event kinds (WI-17):
 
 Enforcement points:
   * pre-dispatch  — WI-12 auto-checkpoint, WI-15 ref integrity
-  * done intercept — WI-11 battery, WI-13 interference, WI-14 orphan sketch
+  * done intercept — WI-11 battery, WI-13 interference, WI-14 orphan sketch,
+    and unresolved sketch-quality findings already observed by the turn
   * mission VERIFY — phases._gate_verify (missing battery = FAIL)
 """
 from __future__ import annotations
@@ -54,6 +55,7 @@ MUTATING_TOOLS: frozenset[str] = frozenset({
     "asm_add_component", "asm_mate", "solve_mates", "part_place", "set_material",
     "delete_feature", "remove_feature", "regen_resolve",
     "sketch3d_add", "sketch3d_edit", "convert_face_to_sketch",
+    "sketch_fully_define",
 }) | DESTRUCTIVE_TOOLS
 
 # Datum names the KERNEL resolves without a feature existing. Mirrors
@@ -100,6 +102,13 @@ MSG_ORPHAN_SKETCH = (
     '{{"done":true,"handoff":{{"waivers":[{{"check":"orphan_sketch:<id>",'
     '"reason":"<non-empty reason>"}}]}}}} for each intentional orphan. '
     "The waiver is a handoff field, not a tool call. Orphans: {ids}"
+)
+MSG_SKETCH_QUALITY = (
+    "HARD guardrail: unresolved sketch quality for {ids}. Replace blanket fixes "
+    "with geometric relations and driving dimensions, anchor the profile, and "
+    "recheck with check_sketch/sketch_health. Resolve open profiles or conflicts. "
+    "An intentional exception needs handoff.waivers with "
+    "check='sketch_quality:<id>' and a non-empty reason. Findings: {details}"
 )
 MSG_CHECKPOINT_FAIL = (
     "HARD guardrail: auto-checkpoint before tool {tool!r} failed ({reason}); "
@@ -411,6 +420,35 @@ def battery_evidence(ledger: Any, calls: list[dict] | None = None) -> Optional[d
     return None
 
 
+def _sketch_quality_problem(result: dict) -> Optional[str]:
+    """Reject explicit bad sketch evidence, even when the RPC itself succeeded."""
+    problems: list[str] = []
+    if result.get("ok") is False:
+        problems.append(str(result.get("error") or "sketch check failed"))
+    if result.get("pinned_only") is True:
+        problems.append("profile is pinned instead of constrained")
+    if result.get("fully_defined") is False:
+        problems.append("sketch is not fully defined")
+    dof = result.get("dof")
+    if (result.get("status") in ("under", "over")
+            or isinstance(dof, (int, float)) and dof > 0
+            or result.get("conflicting") or result.get("converged") is False):
+        problems.append("sketch solver reports unresolved degrees of freedom or conflicts")
+    closure = result.get("closure") or {}
+    if (closure.get("closed_chains_ok") is False or closure.get("open_endpoints")
+            or result.get("open_endpoints")):
+        problems.append("profile has open endpoints")
+    for finding in result.get("findings") or []:
+        if not isinstance(finding, dict):
+            continue
+        if (finding.get("ok") is False
+                or finding.get("severity") in ("error", "fail", "blocker")
+                or (finding.get("kind") or finding.get("code")) == "under_dimensioned"):
+            problems.append(str(finding.get("message") or finding.get("detail")
+                                or finding.get("kind") or "sketch quality finding"))
+    return "; ".join(dict.fromkeys(problems)) or None
+
+
 def _battery_result_ok(res: Any) -> bool:
     """Interpret a verify_battery return as PASS.
 
@@ -437,6 +475,12 @@ def _battery_result_ok(res: Any) -> bool:
         return False
     if res.get("ok") is False:
         return False
+    sketch_result = (res.get("check_results") or {}).get("check_sketch")
+    if isinstance(sketch_result, dict) and not sketch_result.get("skipped"):
+        if _sketch_quality_problem(sketch_result) or sketch_result.get("failures"):
+            return False
+    if res.get("pinned_only") is True or res.get("fully_defined") is False:
+        return False
     if not any(key in res for key in ("ok", "scores", "findings", "checks")):
         return False
     findings = res.get("findings")
@@ -446,7 +490,7 @@ def _battery_result_ok(res: Any) -> bool:
                 continue
             if f.get("ok") is False:
                 return False
-            if str(f.get("severity") or "").lower() == "fail":
+            if str(f.get("severity") or "").lower() in ("fail", "error", "blocker"):
                 return False
     scores = res.get("scores")
     if isinstance(scores, dict) and scores:
@@ -1333,6 +1377,85 @@ def check_no_orphan_sketch_at_done(
     return GuardVerdict(ok=False, name=name, outcome="blocked",
                         reason=msg, message=msg)
 
+def check_sketch_quality_before_done(
+    handoff: dict | None,
+    *,
+    ledger: Any = None,
+    calls: list[dict] | None = None,
+    doc_id: str | None = None,
+    tree_provider: Callable[[str], dict] | None = None,
+    tree: dict | None = None,
+    actor: str = "guardrails",
+) -> GuardVerdict:
+    """Do not discard observed failures; no new check is required for unseen sketches."""
+    latest: dict[tuple[str, str], Optional[str]] = {}
+    for call in _tool_call_events(ledger) + (calls or []):
+        tool = call.get("tool") or call.get("name")
+        if tool not in ("check_sketch", "sketch_health", "verify_battery"):
+            continue
+        result = call.get("result")
+        if isinstance(result, str):
+            import json  # noqa: PLC0415
+            try:
+                result = json.loads(result)
+            except (ValueError, TypeError):
+                continue
+        if not isinstance(result, dict):
+            continue
+        args = call.get("args") or {}
+        if tool == "verify_battery":
+            result = (result.get("check_results") or {}).get("check_sketch")
+            if not isinstance(result, dict) or result.get("skipped"):
+                continue
+            rows = result.get("sketches") or [result]
+        else:
+            rows = [result]
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            did = str(row.get("doc_id") or result.get("doc_id") or args.get("doc_id")
+                      or doc_id or "")
+            if doc_id and did and doc_id != did:
+                continue
+            sketch = str(row.get("sketch") or args.get("sketch") or "")
+            if not sketch:
+                continue
+            if not any(key in row for key in
+                       ("fully_defined", "pinned_only", "status", "dof", "closure", "findings")):
+                continue
+            latest[(did, sketch)] = _sketch_quality_problem(row)
+    if tree is None and any(latest.values()):
+        tree = _doc_tree(doc_id, tree_provider)
+    if tree is not None and isinstance(tree.get("features"), list):
+        active = {str(f.get("id")) for f in tree["features"] if isinstance(f, dict)
+                  and not f.get("deleted") and not f.get("suppressed")}
+        latest = {key: problem for key, problem in latest.items() if key[1] in active}
+    remaining: dict[str, str] = {}
+    waiver_reasons: list[str] = []
+    blanket = next((w for w in _waivers_from_handoff(handoff)
+                    if w["check"].lower() == "sketch_quality" and w["reason"].strip()), None)
+    for (_, sketch), problem in latest.items():
+        if not problem:
+            continue
+        waiver = find_waiver(handoff, f"sketch_quality:{sketch}") or blanket
+        if waiver:
+            waiver_reasons.append(waiver["reason"])
+            continue
+        remaining[sketch] = problem
+    name = "sketch_quality"
+    if not remaining:
+        outcome = "waived" if waiver_reasons else "passed"
+        reason = ("; ".join(dict.fromkeys(waiver_reasons)) if waiver_reasons
+                  else "no unresolved sketch findings")
+        emit_hard_guardrail(ledger, name, outcome, reason=reason, actor=actor)
+        return GuardVerdict(ok=True, name=name, outcome=outcome, reason=reason)
+    message = MSG_SKETCH_QUALITY.format(
+        ids=", ".join(remaining), details="; ".join(f"{s}: {p}" for s, p in remaining.items()),
+    )
+    emit_hard_guardrail(ledger, name, "blocked", reason=message, actor=actor)
+    return GuardVerdict(ok=False, name=name, outcome="blocked", reason=message, message=message)
+
+
 
 def check_done(
     handoff: dict | None = None,
@@ -1361,6 +1484,14 @@ def check_done(
         )
         if not v.ok:
             return v
+    if "sketch_quality" not in skip:
+        v = check_sketch_quality_before_done(
+            handoff, ledger=ledger, calls=calls, doc_id=doc_id,
+            tree_provider=tree_provider, tree=tree, actor=actor,
+        )
+        if not v.ok:
+            return v
+
 
     if "check_interference" not in skip:
         v = check_interference_before_done(

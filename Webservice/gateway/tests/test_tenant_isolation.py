@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-import json
 import os
 import sys
 import tempfile
@@ -273,10 +272,10 @@ def test_workspace_rejects_planted_symlink(client):
     (root_a / "evil").symlink_to(settings.workspace_root)
     (settings.workspace_root / "legacy.txt").write_text("shared", encoding="utf-8")
     # Final-component symlink is refused outright...
-    assert client.get("/workspace/download", params={"path": "evil"}, headers=A).status_code == 400
+    assert client.get("/workspace/download", params={"path": "evil"}, headers=A).status_code == 403
     # ...and resolving THROUGH it lands outside the jail, also refused.
     r = client.get("/workspace/download", params={"path": "evil/legacy.txt"}, headers=A)
-    assert r.status_code == 400
+    assert r.status_code == 403
 
 
 def test_workspace_upload_size_cap_leaves_no_partial(client, monkeypatch):
@@ -404,99 +403,52 @@ def test_user_slug_distinguishes_max_length_colliding_prefix_emails():
 
 
 def test_workspace_paths_stay_inside_the_callers_own_root(client):
-    """Absolute paths ARE returned — the WASM client needs them to drive
-    doc_open (host/src/core/fs_backend.h) — but they may only ever name the
-    caller's own tree, never the shared root and never another account's."""
+    """Browser paths are relative and identity is an immutable workspace key."""
     mine = _ws_user_root("alice@crimson.ua.edu")
     theirs = _ws_user_root("bob@crimson.ua.edu")
-
-    r = _upload_ws(client, A)
-    assert r.status_code == 200
-    abs_path = Path(r.json()["abs_path"])
-    assert abs_path.is_relative_to(mine)
-    assert not abs_path.is_relative_to(theirs)
-
+    response = _upload_ws(client, A)
+    assert response.status_code == 200
+    assert response.json()["path"] == "part.step"
+    assert "abs_path" not in response.json()
+    assert (mine / response.json()["path"]).is_file()
     listing = client.get("/workspace/list", headers=A).json()
-    assert Path(listing["root"]) == mine
-    # A standard user must never be handed the shared legacy root itself, and
-    # no other account's tree may appear in any payload.
-    for payload in (r.text, client.get("/workspace/list", headers=A).text):
-        assert f'"{settings.workspace_root}"' not in payload
+    assert listing["root"] == "."
+    assert listing["workspace_key"] == "user:" + accounts.get_account("alice@crimson.ua.edu").uid
+    for payload in (response.text, client.get("/workspace/list", headers=A).text):
+        assert str(settings.workspace_root) not in payload
         assert str(theirs) not in payload
 
 
 def test_files_aicm_cannot_read_across_tenants(client):
     assert _upload_ws(client, A).status_code == 200
-    victim = _ws_user_root("alice@crimson.ua.edu") / "part.step"
-    # The legacy allowlist covered ALL of workspace_root, including every
-    # users/<slug>/ subtree — an absolute-path cross-tenant read channel.
-    r = client.get("/files/aicm", params={"path": str(victim)}, headers=B)
-    assert r.status_code == 403
-    # The owner can still fetch their own published payloads.
-    r = client.get("/files/aicm", params={"path": str(victim)}, headers=A)
-    assert r.status_code == 200
+    key = "user:" + accounts.get_account("alice@crimson.ua.edu").uid
+    params = {"workspace_key": key, "path": "part.step"}
+    assert client.get("/files/aicm", params=params, headers=B).status_code == 403
+    assert client.get("/files/aicm", params=params, headers=A).status_code == 200
+    params["path"] = str(_ws_user_root("alice@crimson.ua.edu") / "part.step")
+    assert client.get("/files/aicm", params=params, headers=A).status_code == 400
 
 
-def test_mesh_handoffs_require_the_accounts_daemon_grant(client, monkeypatch, tmp_path):
-    generation = [(1, 2, 3)]
-    monkeypatch.setattr(engine_bridge, "_mesh_socket_generation", lambda: generation[0])
-    # The gateway's private account TMPDIR is the engine's temp root; the file
-    # fallback is served from there, not from a fixed /tmp.
-    private_tmp = tmp_path / "private-tmp"
-    private_tmp.mkdir()
-    monkeypatch.setattr(tempfile, "tempdir", str(private_tmp))
-    doc_id = "doc-cpp" + uuid.uuid4().hex
-    # Producer names are scoped by the publishing engine's pid (aicm_handoff object_key).
-    filename = f"p4242_{doc_id}_r2.aicm"
-    scratch = private_tmp / "chudware_cpp_docs"
-    scratch.mkdir()
-    file = scratch / filename
-    shm_name = f"chudware_p4242_{doc_id}_r2"
-    shm = Path("/dev/shm") / shm_name
-    file.write_bytes(b"alice file mesh")
-    shm.write_bytes(b"alice shm mesh")
-    try:
-        for headers in (A, B):
-            for params in ({"path": str(file)}, {"shm": shm_name},
-                           {"path": "aicm-shm://" + shm_name}):
-                assert client.get("/files/aicm", params=params, headers=headers).status_code == 403
-
-        pending = {1: ("doc_new", set())}
-        capabilities: set[str] = set()
-        engine_bridge._authorize_daemon_response(
-            json.dumps({"id": 1, "result": {"doc_id": doc_id}}),
-            pending, capabilities, [], "alice@crimson.ua.edu",
-        )
-        assert doc_id in capabilities
-        for params, expected in (
-            ({"path": str(file)}, b"alice file mesh"),
-            ({"path": "aicm-shm://" + shm_name}, b"alice shm mesh"),
-            ({"shm": shm_name}, b"alice shm mesh"),
-        ):
-            assert client.get("/files/aicm", params=params, headers=B).status_code == 403
-            response = client.get("/files/aicm", params=params, headers=A)
-            assert response.status_code == 200
-            assert response.content == expected
-        # The granted document's name under a different temp root (another account's
-        # TMPDIR) is not this engine's handoff.
-        foreign = tmp_path / "foreign-tmp" / "chudware_cpp_docs" / filename
-        foreign.parent.mkdir(parents=True)
-        foreign.write_bytes(b"foreign mesh")
-        assert client.get("/files/aicm", params={"path": str(foreign)}, headers=A).status_code == 403
-        # A daemon restart may reuse its sequential document IDs; old grants
-        # must not authorize the new process's mesh.
-        generation[0] = (1, 2, 4)
-        assert client.get("/files/aicm", params={"shm": shm_name}, headers=A).status_code == 403
-        # A grant for one document never covers the neighboring sequential id.
-        other = scratch / f"p4242_{doc_id}extra_r2.aicm"
-        other.write_bytes(b"other")
-        try:
-            assert client.get("/files/aicm", params={"path": str(other)}, headers=A).status_code == 403
-        finally:
-            other.unlink()
-    finally:
-        file.unlink()
-        shm.unlink()
+def test_mesh_handoffs_require_the_accounts_cell_grant(client, monkeypatch, tmp_path):
+    from gateway import cells
+    monkeypatch.setattr(settings, "cells_root", tmp_path / "cells")
+    principal = cells.resolve_workspace("alice@crimson.ua.edu")
+    mesh_root = settings.cells_root / principal.cell_id / "state" / "mesh"
+    mesh_root.mkdir(parents=True)
+    name = uuid.uuid4().hex + ".aicm"
+    mesh = mesh_root / name
+    mesh.write_bytes(b"alice mesh")
+    doc_id = "doc-" + uuid.uuid4().hex
+    params = {"workspace_key": principal.workspace_key, "doc_id": doc_id}
+    assert client.get("/files/aicm", params=params, headers=A).status_code == 403
+    engine_bridge.grant_mesh_document(principal, doc_id, "/state/mesh/" + name)
+    assert client.get("/files/aicm", params=params, headers=B).status_code == 403
+    response = client.get("/files/aicm", params=params, headers=A)
+    assert response.status_code == 200 and response.content == b"alice mesh"
+    assert client.get("/files/aicm", params={**params, "doc_id": "other"}, headers=A).status_code == 403
+    assert client.get("/files/aicm", params={**params, "shm": "legacy"}, headers=A).status_code == 400
+    cells.revoke("alice@crimson.ua.edu")
+    assert client.get("/files/aicm", params=params, headers=A).status_code == 403
 
 
 def test_healthz_presence_is_account_scoped_except_for_admin(client, monkeypatch):
@@ -523,7 +475,7 @@ def test_bucket_upload_is_invisible_to_other_user(client):
 
     listing = client.get("/api/bucket/list", headers=B).json()
     assert all(f["name"] != "notes.txt" for f in listing["files"])
-    assert Path(listing["root"]) == _bucket_user_root("bob@crimson.ua.edu")
+    assert listing["root"] == "."
 
     r = client.get("/api/bucket/download", params={"path": "notes.txt"}, headers=B)
     assert r.status_code == 404
@@ -539,6 +491,12 @@ def test_bucket_delete_and_rename_cannot_cross_tenants(client):
     assert r.status_code == 200
 
 
+@pytest.mark.parametrize("route", ["/workspace/mkdir", "/api/bucket/mkdir"])
+@pytest.mark.parametrize("path", ["nul\x00path", "line\nbreak", "del\x7f"])
+def test_control_character_paths_are_bad_requests_not_server_errors(client, route, path):
+    assert client.post(route, headers=A, json={"path": path}).status_code == 400
+
+
 def test_bucket_rejects_dotdot_absolute_and_symlink(client):
     assert client.get("/api/bucket/download", params={"path": "../x"}, headers=A).status_code == 400
     assert client.get("/api/bucket/download", params={"path": "/etc/passwd"}, headers=A).status_code == 400
@@ -546,7 +504,7 @@ def test_bucket_rejects_dotdot_absolute_and_symlink(client):
     assert _upload_bucket(client, A).status_code == 200  # create A's root
     root_a = _bucket_user_root("alice@crimson.ua.edu")
     (root_a / "evil").symlink_to(settings.bucket_root)
-    assert client.get("/api/bucket/download", params={"path": "evil"}, headers=A).status_code == 400
+    assert client.get("/api/bucket/download", params={"path": "evil"}, headers=A).status_code == 403
 
 
 def test_bucket_rename_cannot_move_the_bucket_root_out_of_its_jail(client):
@@ -570,36 +528,18 @@ def test_bucket_rename_cannot_move_the_bucket_root_out_of_its_jail(client):
 # ---------------------------------------------------------------------------
 
 
-def test_shared_scope_is_admin_only_and_preserves_legacy_data(client):
-    # Pre-tenant single-tenant content lives directly under the legacy root.
+def test_shared_scope_refused_and_preserves_legacy_data(client):
     (settings.workspace_root / "legacy.step").write_text("team data", encoding="utf-8")
     (settings.bucket_root / "legacy.txt").write_text("team drop", encoding="utf-8")
-
-    # Non-admins can never opt in, on either module.
-    for url in ("/workspace/list", "/api/bucket/list"):
-        r = client.get(url, params={"scope": "shared"}, headers=B)
-        assert r.status_code == 403
-    # A garbage scope is rejected rather than silently widening access.
+    for headers in (A, B, ADMIN):
+        assert client.get("/workspace/list", params={"scope": "shared"}, headers=headers).status_code == 403
+        assert client.get("/workspace/download", params={"path": "legacy.step", "scope": "shared"},
+                          headers=headers).status_code == 403
     assert client.get("/workspace/list", params={"scope": "root"}, headers=ADMIN).status_code == 400
-
-    # Admin sees the legacy tree — and ONLY with the explicit opt-in.
-    shared = client.get("/workspace/list", params={"scope": "shared"}, headers=ADMIN).json()
-    assert any(f["name"] == "legacy.step" for f in shared["files"])
     own = client.get("/workspace/list", headers=ADMIN).json()
     assert all(f["name"] != "legacy.step" for f in own["files"])
-
-    r = client.get(
-        "/workspace/download",
-        params={"path": "legacy.step", "scope": "shared"},
-        headers=ADMIN,
-    )
-    assert r.status_code == 200
-    assert r.content == b"team data"
-
-    shared_b = client.get("/api/bucket/list", params={"scope": "shared"}, headers=ADMIN).json()
-    assert any(f["name"] == "legacy.txt" for f in shared_b["files"])
-
-    # Legacy data survived everything above, unmoved and undeleted.
+    # Legacy shared storage is not admitted, even for administrators.
+    assert client.get("/api/bucket/list", params={"scope": "shared"}, headers=B).status_code == 403
     assert (settings.workspace_root / "legacy.step").read_text() == "team data"
     assert (settings.bucket_root / "legacy.txt").read_text() == "team drop"
 
@@ -622,8 +562,7 @@ def _invite_token(to: str) -> str:
         )
         row = cur.fetchone()
     assert row is not None, f"no invitation queued for {to}"
-    ctx = row["ctx_json"]
-    ctx = json.loads(ctx) if isinstance(ctx, str) else ctx
+    ctx = mailer.decrypt_context(to, "org_invite", row["ctx_json"])
     return ctx["invite_url"].split("org_invite=", 1)[1].split("#", 1)[0]
 
 
@@ -675,7 +614,7 @@ def test_team_bucket_is_shared_by_the_team_and_lands_outside_personal_trees(clie
     assert listing["team"]["id"] == team_id
     assert listing["team"]["org_id"] == org_id
     assert listing["team"]["name"] == "General"
-    assert Path(listing["root"]) == _team_root(org_id, team_id)
+    assert listing["root"] == "."
     got = client.get(
         "/api/bucket/download", headers=B, params={"path": "plan.txt", "team": team_id}
     )
@@ -695,14 +634,14 @@ def test_team_bucket_is_shared_by_the_team_and_lands_outside_personal_trees(clie
     assert [f["name"] for f in personal["files"]] == []
     assert personal["scope"] == "personal"
     assert personal["team"] is None
-    assert Path(personal["root"]) == _bucket_user_root(BOB)
+    assert personal["root"] == "."
 
 
 def test_personal_bucket_listing_keeps_its_existing_shape(client):
     assert _upload_bucket(client, A, name="notes.txt").status_code == 200
     listing = client.get("/api/bucket/list", headers=A).json()
     assert {"root", "dir", "dirs", "files"} <= set(listing)
-    assert Path(listing["root"]) == _bucket_user_root(ALICE)
+    assert listing["root"] == "."
     assert [f["name"] for f in listing["files"]] == ["notes.txt"]
 
 
@@ -907,20 +846,22 @@ def test_workspace_and_bucket_serialize_team_quota_mutations(client, monkeypatch
     entered = Event()
     release = Event()
     second_admitted = Event()
-    original_quota = workspace_mod.enforce_disk_quota
+    original_store = workspace_mod.store_upload
     original_scope = bucket_mod._caller_scope
 
-    def held_quota(*args, **kwargs):
+    def held_store(*args, **kwargs):
+        # Native storage mutation, not the earlier pre-buffer quota preflight,
+        # is the critical section shared by workspace and bucket.
         entered.set()
         assert release.wait(10)
-        return original_quota(*args, **kwargs)
+        return original_store(*args, **kwargs)
 
     def admitted_scope(*args, **kwargs):
         result = original_scope(*args, **kwargs)
         second_admitted.set()
         return result
 
-    monkeypatch.setattr(workspace_mod, "enforce_disk_quota", held_quota)
+    monkeypatch.setattr(workspace_mod, "store_upload", held_store)
     monkeypatch.setattr(bucket_mod, "_caller_scope", admitted_scope)
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(client.post, "/workspace/upload?team=" + team_id,

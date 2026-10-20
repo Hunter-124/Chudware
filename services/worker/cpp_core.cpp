@@ -34,6 +34,16 @@ std::wstring widen(const std::string& s) {
     return w;
 }
 
+std::string narrow(const std::wstring& path) {
+    if (path.empty()) return {};
+    const int size = WideCharToMultiByte(CP_UTF8, 0, path.data(),
+        static_cast<int>(path.size()), nullptr, 0, nullptr, nullptr);
+    std::string result(size, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, path.data(), static_cast<int>(path.size()),
+                        result.data(), size, nullptr, nullptr);
+    return result;
+}
+
 // Directory containing the running host exe (where libchudware.dll is staged for a
 // shipped build / by build.bat).
 std::wstring exe_dir() {
@@ -167,6 +177,10 @@ set_event_sink_ = reinterpret_cast<void (*)(void (*)(const char*, void*), void*)
 set_doc_publish_sink_ = reinterpret_cast<
     void (*)(void (*)(const char*, const char*, const char*, void*), void*)>(
     dlsym(h, "chudware_set_doc_publish_sink"));
+set_cache_refresh_sink_ = reinterpret_cast<
+    void (*)(void (*)(const char*, const char*, void*), void*)>(
+    dlsym(h, "chudware_set_cache_refresh_sink"));
+activity_ = reinterpret_cast<int (*)(std::uint64_t*)>(dlsym(h, "chudware_activity"));
 loaded_ = true;
 // One-shot startup diagnostic: which lib actually serves in-proc agent runs.
 std::fprintf(stderr,
@@ -228,8 +242,6 @@ return true;
 #endif
     std::string loadDiag;
     std::wstring winnerW;
-    // The POSIX branch above declares its own `h`; this one never did, so the
-    // Windows path did not compile in either build mode.
     HMODULE h = nullptr;
     for (const std::wstring& path : candidates) {
 #ifdef CHUDWARE_DEVELOPER_BUILD
@@ -242,8 +254,11 @@ return true;
 #endif
         if (h) { winnerW = path; break; }
         DWORD gle = GetLastError();
-        std::string p(path.begin(), path.end());
-        loadDiag += "[" + p + " -> Win32 " + std::to_string(gle) + "] ";
+        loadDiag.push_back('[');
+        loadDiag += narrow(path);
+        loadDiag += " -> Win32 ";
+        loadDiag += std::to_string(gle);
+        loadDiag += "] ";
     }
 #ifndef CHUDWARE_DEVELOPER_BUILD
     CloseHandle(pinnedFile);
@@ -276,14 +291,7 @@ return true;
     }
     dll_ = h;
     abi_ = abi_fn_();
-    {
-        int n = WideCharToMultiByte(CP_UTF8, 0, winnerW.c_str(), (int)winnerW.size(),
-                                    nullptr, 0, nullptr, nullptr);
-        std::string p(n, '\0');
-        WideCharToMultiByte(CP_UTF8, 0, winnerW.c_str(), (int)winnerW.size(), p.data(), n,
-                            nullptr, nullptr);
-        path_ = p;
-    }
+    path_ = narrow(winnerW);
     // Optional export (older engines predate it) — see the POSIX branch.
     if (auto bid = reinterpret_cast<const char* (*)(void)>(
             GetProcAddress(h, "chudware_build_id")))
@@ -294,6 +302,11 @@ return true;
     set_doc_publish_sink_ = reinterpret_cast<
         void (*)(void (*)(const char*, const char*, const char*, void*), void*)>(
         GetProcAddress(h, "chudware_set_doc_publish_sink"));
+    set_cache_refresh_sink_ = reinterpret_cast<
+        void (*)(void (*)(const char*, const char*, void*), void*)>(
+        GetProcAddress(h, "chudware_set_cache_refresh_sink"));
+    activity_ = reinterpret_cast<int (*)(std::uint64_t*)>(
+        GetProcAddress(h, "chudware_activity"));
     loaded_ = true;
     return true;
 #endif
@@ -349,6 +362,21 @@ void CppCore::setDocPublishSink(
 bool CppCore::hasDocPublishSink() {
     std::string e;
     return ensureLoaded(e) && set_doc_publish_sink_ != nullptr;
+}
+
+bool CppCore::setCacheRefreshSink(
+    void (*cb)(const char* doc_id, const char* response_json, void* ud), void* ud) {
+    std::string err;
+    if (!ensureLoaded(err) || !set_cache_refresh_sink_) return false;
+    set_cache_refresh_sink_(cb, ud);
+    return true;
+}
+
+bool CppCore::activity(std::uint64_t counts[3]) {
+    counts[0] = counts[1] = counts[2] = 0;
+    // Census must neither initiate engine loading nor manufacture a zero for an
+    // older engine. hostd publishes engineState only after ensureLoaded returns.
+    return loaded_ && activity_ && activity_(counts) == 0;
 }
 
 

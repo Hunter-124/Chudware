@@ -19,12 +19,12 @@ from .reveng_common import (
     _extract_frames_safe,
     _ingest_pdf,
     _load_session,
+    _list_sessions,
     _make_session,
     _new_session_id,
     _not_provisioned,
     _now_iso,
     _research_ingest,
-    _reveng_dir,
     _reveng_status,
     _save_session,
     _session_image_paths,
@@ -788,14 +788,7 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
         Returns ``{ok, sessions: [session_summary]}`` where each summary has
         session_id, name, status, created_at, updated_at, part_ref, images.
         """
-        root = _reveng_dir()
-        sessions = []
-        if root.exists():
-            for d in sorted(root.iterdir()):
-                if d.is_dir() and (d / "session.json").exists():
-                    s = _load_session(d.name)
-                    if s:
-                        sessions.append(_session_summary(s))
+        sessions = [_session_summary(s) for s in _list_sessions()]
         return _dumps({"ok": True, "sessions": sessions})
 
 

@@ -1587,6 +1587,7 @@ index and their own measurement; `node_runner.py` and `delegation.py` cannot reu
 cache until it can key on a resolved allowlist rather than role+capability; `zonefill.cpp` keeps
 its own net-class scan.
 
+
 ## 2026-08-30 — profile control, path containment, and bounded failure cleanup
 
 Completed T-X5's `browser_profiles` list/refresh/delete seam across
@@ -5773,6 +5774,7 @@ Limits: no live-provider/login, Windows/macOS, AppImage, openEMS, physical hardw
 download, GPU-training or real-power-loss proof. Graphify refresh was AST-incremental, not a
 new semantic extraction. No user daemon was restarted and no unrelated work was discarded.
 
+
 ## 2026-10-05 — bounded STM32F4 bus cutover and exercised flight mission
 
 Implemented I2C, TTL UART, master SPI and classical bxCAN in one shared Renode runtime,
@@ -6073,6 +6075,7 @@ The actual stage was exercised with real pytest: the original hid an assertion
 failure's identity, the revised stage emitted its name/source/assertion details,
 collection errors remained fatal with diagnostics, and all-passing units stayed
 green without failure blocks. Temporary smoke fixtures were removed.
+
 
 ## 2026-10-06 — Simulation GUI overhaul onto one standard
 
@@ -6792,6 +6795,36 @@ and leaves TEXT width factor 0 (set to 1). GUI: File > Export DXF/DWG (tessellat
 import/insert filters list DXF/DWG, Drawing ribbon `dwg_export_dwg`, flat-pattern DWG.
 `.sto` was asked about and is not implemented (no CAD-standard format).
 
+## 2026-10-11 — Mid-run messages: wake waits, no ghost turn after Stop, delivery captions
+
+c252 "froze": the user's message arrived as a steer the moment the agent called
+`write xd://wait_job {timeout_s:900}` on an FEA job. Chudcode only injects a steer at a tool
+boundary and a host tool is not interruptible, so it sat 2m41s until the user pressed Stop; the
+abort kept the queued steer and Chudcode's settle drain started a fresh model call with it that
+no Chudware listener observed (`message user steering:true` after `stopReason:aborted`). Fix:
+`chudcode_host` tracks user steers (`_Run.undelivered`) until their user `message_start`
+streams, exposes `user_steer_pending` on the run context, and `dispatch_host_tool` injects a
+`wake` probe into tools that declare it (`wait_job` returns `woken_by:"user_message"`, job
+untouched); the steer then lands at the normal boundary — append-only, real tool result, no
+aborted response, reasoning items and prompt-cache prefix intact (real codex smoke:
+cacheRead held across the steer). Stop now `remove_queued_message`s unread steers before
+`abort()`; withdrawn steers and ones stranded at the terminal open the session's next prompt.
+`agent_steer.steer_id` round-trips to `agent.steer {delivered|carried}`; the GUI keeps
+`ChatMsg::steerId/steerState` and draws a caption under the bubble (queued / read / unread ·
+sends next time / not delivered); `CHUDWARE_SHOT=steerstatus`. Not changed: a steer during
+real work (synchronous solve/build) still waits for that tool — Chudcode semantics. Carried
+steers live in the worker process; a worker restart drops them while the caption still says
+"sends next time". Also seen in c252, not addressed here: the first request of each new user
+turn re-read only 121 088 of ~185 k cached tokens (later requests in the turn hit fully).
+
+Same session, ask_user cards: `drawAssistantTurn` drew every question batch after the whole
+timeline and reply, so an answered card in c252 (asked at row 24 of 63) trailed the rest of
+the run. `feedAskEvent` now appends a rowKind-20 marker (stage `__ask__:<batch_id>`) to the
+asking turn and `drawAgentTimeline` draws the card there (full width, off the spine);
+`drawAskCards` draws only unmarked batches. Load anchors pre-marker batches after their
+`ask_user` tool row (`anchorLegacyAsks`); persistence keeps rk 20 like plan markers.
+`CHUDWARE_SHOT=steerstatus` asserts both paths.
+
 ## 2026-10-11 — Native AutoCAD R2000 DWG writer replaces LibreDWG `dwgadd`
 
 `write_dwg` no longer drives `dwgadd` (exit-0-without-writing, crashes past ~1000 objects,
@@ -6846,6 +6879,98 @@ AutoCAD itself. Web: gateway grants docs minted by `import_file`, deploy provisi
 Tests: `test_acis_read`, `test_acis_write`, `test_dwg_native`, `test_dxf_r2000`, `test_dwg_write`,
 `test_import_roundtrip` (ACIS round trips, inch export, STEP with free wires).
 
+## 2026-10-11 — Subagent task names and inline visual evidence
+
+`services/agent/chudcode_events.py` now separates the Chudcode assigned task handle from
+the generic agent type and late description; `host/src/ui/ai/agent_dag.cpp` preserves that
+name through lifecycle/spawn updates and DAG persistence, including nested task handles.
+Anonymous legacy activity is not assigned a guessed identity. The same mapper extracts
+actual tool-returned image paths/captions from direct and nested CAD results, including
+failed inspection diagnostics. The Copilot feed, activity timeline and internal detail
+parser keep those images inline at completion, outside collapsed drawers and in grouped-call
+order; expanded drawers do not duplicate images, and legacy Session files thumbnails
+appear only when their tool evidence is absent. `ui_common.cpp` copies captions and
+`conversations.cpp` preserves complete bounded tool trailers on compact persistence.
+Show renders inline still governs display; numeric-only geometry checks create no
+synthetic renders. Added the `chat_evidence` mapped-event screenshot scenario in
+`app.cpp`. Verified: application build, 89 Python tests plus 10 subtests, five GUI lint
+rules, native `render_part`/`inspect_part` image results replayed into actual collapsed,
+grouped, simplified and expanded chat UI, and assigned names/nested parents retained
+through DAG save/restore. Smoke uses private short HOME/appdata paths to avoid AF_UNIX
+path-length limits and explicit separate Xvfb display numbers (concurrent auto-number
+launches collided); no user session or daemon was stopped.
+
+## 2026-10-12 — Six-axis recovery: save roots, tool results and rejected geometry
+
+The c255 trace exposed separate persistence, tool-envelope and geometry failures.
+`cad_common` now resolves explicit relative save/export destinations against the selected
+project, not the worker cwd or an ancestor repository; absolute paths retain credential-path
+checks. `chudcode_tools` carries successful guide/skill text in `details` as well as content,
+including bounded full-result spills. The general-agent policy separates motor-case centering
+from shaft coaxiality and requires stopped/released part ownership and frozen saved handoffs
+before assembly verification. Native dress operations reject invalid B-reps, zero-area faces
+and self-intersections before replacing the preceding body (cache epoch `geomcache/14`).
+Atomic failures expose `rejected_tree`; regeneration diagnosis uses that candidate and its
+native feature errors rather than the restored live tree. The live verifier replays canonical
+feature envelopes with sparse-ID remapping through supported operations and closes its
+temporary documents. Verification: 203 targeted Python tests and 19 subtests; five native
+document cases with 1,624 assertions; private native save/export tests from two worker cwd
+values with credential-symlink refusal and unchanged rollback state. The reduced wrist
+R4 fillet committed two zero-area/self-intersecting faces before the fix; afterward it
+rejects the feature and preserves the sound original volume. Real Chudcode guide/skill
+calls and two parallel GPT workers returned usable text details without `KeyError: inner`.
+No user daemon was stopped, no session history was rewritten, and these software checks
+do not qualify the robot's physical fit or printed strength.
+The subsequent real nested-workspace smoke also exposed `online_turn.resolve_workspace`
+widening the selection before any tools ran. It now retains the exact canonical directory.
+The same resumed Chudcode workflow now reports the selected nested root through
+`workspace_status` (previously the repository root); all 34 worker RPC cases pass.
+Reopening the actual robot with the new guard separately exposed wrist feature f74's
+existing 4 mm chamfer zero-area face, demonstrating why cached historical pass reports
+cannot substitute for rebuilding and verifying the saved model after this correction.
+
+The actual recovery then exposed two native delivery defects. `core/doc/formats.cpp`
+now refines overlapping tangent-cusp boundary chords on their native curves before
+face meshing, synchronizing parameters across located partner edges and all incident
+pcurves. STL omits only native degenerate-edge pole facets with zero boundary chain,
+then checks noncollapse and closed, oppositely directed edge incidence in the actual
+ASCII/binary representation. It does not heal the source or weld nearby points.
+`session.cpp` evaluates self-intersection in a constituent face's proper rigid frame,
+including nested import wrappers; world metrics and genuine folded/scaled/sheared
+defects remain unchanged. Detached assembly cache validation now hashes the authored
+file before session-local path/name rewriting; dependency changes still invalidate it.
+Added reduced geometry/boundary regressions in `test_formats_registry`,
+`test_interference` (including the two-face `placed_fillet_skin.brep` witness), and
+`test_appearance`. The document, formats, appearance and interference ctest suites pass.
+Private real-base exports pass exact raw-facet checks in binary, ASCII and fine binary:
+15,644/15,644/89,054 facets, zero degenerates, one closed oriented surface, unchanged
+source hash. Independent reopening reports cache hits on all five saved deliverables
+and all 27 assembly bodies sound with every self-intersection check completed.
+These are exporter/checker/persistence changes, not a further feature-geometry epoch.
+The full Linux gate passed (11,670 Python tests, desktop/WASM builds, daemon lifecycle,
+web parity, packaging and GUI-shot smokes). Its advisory generated-manual drift was
+resolved through `tools.manual_gen`; coverage is 516/516 with a clean drift check.
+After the delivery fixes, the complete gate-tree native rebuild and all 130 ctest
+suites passed again; final source audits pass all ten gates. Code graph refreshed.
+
+The final real slicing pass exposed a further float32 placement defect: resting the fine
+wrist mesh on the bed merged a 1.9e-6 mm vertex pair and PrusaSlicer silently removed two
+facets. `services/mcp/print_tools.py` now centres single-part input with a grid-aligned
+shift, refuses newly merged/zero-area geometry before slicing, and checks requested 3MF
+repair evidence. DFAM support reach now uses the same Euclidean tool shape as its clearance
+erosion; trapped-volume status is per cluster/cavity, and tangent raw-mesh bores remain
+recognisable. Existing narrow/sealed-cavity failures remain covered. The manufacturing
+union passed 150 tests initially; the one new bore fixture incorrectly included its flared
+mouth in the straight-bore assertion, corrected to its actual axial bounds and passed.
+All four actual native source parts then sliced with `print_ready=true`, zero slicer
+repairs, unchanged source hashes and exact closed consistently wound input meshes.
+The resumed Chudware session then regenerated the actual four-job delivery packet through
+native document slicing and independent G-code verification. Parent acceptance checked all
+28 output hashes, all five frozen source identities, all delivered/input STL topologies and
+zero repair counters in each 3MF. All four jobs are ready with recorded warnings; no physical
+fit/strength/servo-duty claim or media write. Final source audits and generated-manual drift
+checks pass; the live shared daemon was left untouched.
+
 ## 2026-10-12 — AutoCAD drawings: construction curves stay curves beside 3D content
 
 Opening `SteelTubeWidget.dwg` showed a lid on an open tube: the DXF lane turned every closed
@@ -6856,3 +6981,409 @@ curves as wires when the drawing has 3D content (ACIS bodies, meshes or ACIS ent
 sheets when the document has solids/shells, so they still re-import as faces. The ACIS surface
 itself was already right (outer wall, bottom, rim annulus, inner wall; open top). Test:
 `test_import_roundtrip` cube/disc/circle round trip for DXF and DWG.
+
+## 2026-10-12 — Fillet joins two bodies that share only an edge
+
+A ring resting on a tube rim shares one edge with four faces (two per solid); `add` keeps both
+solids in one result, but BRepFilletAPI needs two faces per edge, so a fillet there failed as
+"too large" and the part stayed two physical solids. `geom::fillet_edges` (explicit edges,
+`core/geom/dress.cpp`) now treats an edge whose faces span two solids as a contact edge. It
+classifies the four sectors around the edge midpoint. Each empty sector under 180° gets the
+exact rolling-ball cross-section, swept by a prism (line) or a revolution (circle). The sweep
+is fused in with UnifySameDomain; both histories are recorded. Other picks are mapped onto the
+joined shape through those histories, then blended as before. The fillet is exact only when the
+faces run straight from the edge, so the code checks five stations along the edge. It refuses
+curved faces or an oversize radius by name (`fillet_edges(..., why)`, surfaced by
+`document.cpp`). An earlier prototype used "fill the other corner, then BRepFilletAPI" and was
+not robust at the edge ends. Variable fillets, chamfers and the dir/all-edges overloads do not
+join. Cache epoch `geomcache/15`; contracts `doc_schema.md` §"Fillet on an edge shared by two
+bodies", `stepplus.md` §16. Test: `test_document` "a fillet on an edge shared by two bodies
+joins them into one solid".
+
+## 2026-10-12 — STL export: folded BRepMesh fins at vanishing-fillet poles
+
+The 6-axis `base` and `turntable` (sound, single solids) refused STL/slicing with "not a closed
+consistently oriented source solid". Cause: a fillet that runs out where its two support faces
+become tangent is a rational B-spline face with a degenerate edge (pole). BRepMesh inserts a
+node column toward the pole and links BOTH UV ends of the degenerate edge to it, so each
+column edge X-Y carries `(P1,X,Y)` and `(P2,Y,X)`: in 3D one facet plus its reverse (a
+double-covered spike), and pole edges are used 4 times. `stl_face_facets`
+(`core/doc/formats.cpp`) now omits such pairs, identified by topology only (one corner each on
+the same degenerate-edge polygon, same exact 3D point, same UV edge, opposite winding). The
+pair's chain is zero, so this welds and heals nothing; nodes never move and the validator
+still requires every serialized edge twice, once each way. The writer and
+`validate_stl_solid` share one per-face facet list. Test: `test_formats_registry` "STL exports
+a vanishing fillet whose pole BRepMesh folds…" (inside-corner R2/R3 floor fillets, R0.5 on
+their crossing; it requires the raw fold first).
+
+## 2026-10-12 — Rebuilt build state is saved back into the file; Explorer redesign
+
+Drag-drop, Explorer and "Open Part" from an assembly all reach `doc_open` through
+`st.requestOpenPath`; the full re-resolve came from every file saved before the latest
+engine-key bump (`chudware-geomcache/15`) missing its cache, and nothing ever rewrote it.
+`doc_open` now writes the build it just produced back into the file
+(`write_back_build_state`, `core/doc/session.cpp`; reported as `cache.writeback`), and an
+assembly load of a stale self-contained component does the same for the component
+(`compile_component_with_build_state`, `AsmComponentStatus.build_state`). The write goes
+through `stepplus_write_build_state` (`core/doc/stepplus.cpp`): it copies every non-build-state
+ZIP member as its compressed stream and replaces only `cache.*`/`geometry.step`, refusing on a
+changed size+mtime stamp or document hash. `persist_build_state` is the extracted `doc_save`
+cache builder shared by both. Assembly fingerprints carry per-component `doc_hash` so a
+component rewrite that keeps its document no longer invalidates the assembly display; AI-VC
+`file_fingerprint` adds `authored_sha256` so rollback preflight ignores derived members.
+Measured on the six-axis arm: assembly cold open 35 s → 0.24 s on the next fresh process; a
+lazy full assembly rebuild after a cache-hit open 1.4 s. Contract: `contracts/stepplus.md` §17;
+tests: `test_appearance` "stale cache saves the build", "never replaces a file that changed",
+"rebuilt component saves its build"; `test_ai_vc::test_rollback_preflight_ignores_rewritten_build_state`.
+Open toast says "build saved to the file" (DocMirror `lastOpenedWriteback`). Same session:
+`host/src/ui/file_explorer.cpp` rewritten — tree is the primary surface (no root node, one
+header line + branch chip), recursive filter (Ctrl+F), compact toolbar (new folder, refresh,
+collapse all, reveal active doc), natural sort, right-aligned change/rev badges, open-document
+markers, keyboard navigation, collapsed Recent/Changes strips at the bottom; shot hooks
+`CHUDWARE_EXPLORER_SHOT_{EXPAND,SELECT,QUERY,STRIPS}` under `CHUDWARE_SHOT=explorer`.
+Deferred: no `collapse_all` icon exists yet (Collapse all uses `body_folder`).
+
+## 2026-10-12 — c259: unify corrupted cached checkpoints; agent auto-wrote the user's open file
+
+The in-app agent (6-axis `base_revD`, "slip-in" slot) spent its turn bisecting phantom regen
+failures. Root cause: `ShapeUpgrade_UnifySameDomain` edits its input's edges in place even in
+safe-input mode (temporary pcurves, `BRep_Builder::Range`), and a NonDestructive boolean shares
+every untouched TShape with its argument, i.e. a cached compile checkpoint. A full-height box cut
+came back as 3 shells (+44 cm^3, BRepCheck-invalid, `ok:true`), and deleting it restored a
+corrupted prefix (101 895 mm^3 instead of 92 847, invalid). `_project_save` then wrote that state,
+with `cache.ckpt`, into the user's open `base.step+` after every batch and cleared its dirty
+flag. Fixes: `geom::unify_same_domain` and the `dress.cpp` joining-fillet unify run on a
+`BRepBuilderAPI_Copy`, with the copy's history recorded. With this fix the same cut is valid
+(87 828 mm^3) and delete restores 92 847. A subtractive feature whose exact volume grows fails by
+name (`require_cut_removed_material`, `core/doc/document.cpp`, all cut sites). Cache epoch
+`chudware-geomcache/16` (`contracts/stepplus.md` §18) forces corrupted saved checkpoints to
+rebuild. `_project_save` skips `origin_kind=gui` docs. A run of `delete_feature` ops applies
+dependents first, so `[sketch, its extrude]` deletes in either order. `set_rollback` refuses keys
+other than `after`, and the Python normalizer maps `id`/`feature_id`/`feature`/`target` to
+`after`. Tests: `test_document` "a delete batch naming a sketch before its extrude deletes both";
+`test_project_save::test_add_features_never_writes_the_file_of_a_doc_the_user_opened`;
+`test_add_features_shape::test_set_rollback_reads_a_target_spelling_as_after`. There is no
+minimal synthetic repro of the unify mutation: a plain revolve+bore+tunnel does not trigger it.
+Verified on copies of the real part, old vs new `libchudware`. Deferred: compile ignores
+`rollback_after` (the bar is cosmetic; `rolled_back` is hardcoded false; backburnered by the
+owner in favor of git-style PLM); `plm_rollback` returns `ok:true` without touching the live
+doc; `undo`/`redo` are advertised to the main chat but always denied for agents; a GUI
+sketch/drag-cancel `doc_revert` can discard agent edits made during the session (issue #55).
+
+## 2026-10-12 — Mass uses the material applied to the model
+
+`eval_mass` without a density now weighs each body with its applied material: the
+`body_materials` override, else the document material, at its registry density
+(`chudware::materials::density`). For assemblies it uses each component body's source-part
+material, carried as `AsmBodyOut.body_material_keys` / `LoadedComponent.body_material_keys` through
+`load_bodies`; a nested sub-assembly body keeps a key only when its bodies agree. Steel 7.85 applies
+only to a body with no material, or with a key that has no registry density (`unresolved_key`).
+Mixed totals weight mass, COM and inertia per body (`GProp_GProps::Add(props, density)`). Every
+`material` block names its `source`: explicit | body_material | document_material |
+component_material | default, with `per_body`/`mixed` at the top when bodies differ.
+`measure_part` passes a density only when one is given (`density_g_cm3=`/`material=`). The Mass
+Properties panel sends one only for a custom override and displays the density the engine
+reports. The BOM panel and the verify battery inherit applied materials. New parts default to
+`alu_6061`, so an untouched part now weighs as aluminum. Test: `test_document` "eval_mass weighs each
+body with its applied material"; Python pins updated (`test_modeling_repertoire`,
+`test_material_resolve`, `test_eval_tool_dialect`).
+
+## 2026-10-12 — Agent edit lock (interim #55) and real-time parallel agent editing
+
+**Lock.** `AppState::docLockedByAgent` (host/src/core/app_state.*) drives the lock.
+`engine_events.cpp` stamps `DocTab::lastForeignWriteAt` from `doc.changed`/`doc.opened` with a
+non-`gui` `source_kind`. A doc stays locked while any run live at that write continues, or for
+`kAgentLockGraceS` (8 s); `last_writer_detached` clears the lock once no run is active. Gated
+paths:
+- `CommandRouter::authorize` (Mutate commands) and ribbon greying (`setRibbonAgentLockReason`, fed per frame from app.cpp).
+- Feature tree mutations and edit entries.
+- Sketch, 3D-sketch and PropertyManager entry (`openGuest` now takes `AppState&`).
+- Viewport drags, appearance and hide.
+- Mass/Sim material, equations, AsmPanels mate/pattern/insert.
+- `docUndo`/`docRedo` (`agent_edit_locked`) and app.cpp document keys.
+
+Open sessions on a doc that becomes locked keep-exit; locked cancel paths never `doc_revert`.
+`userMidEdit` now also covers the 3D sketch. app.cpp draws a reserved banner with Stop
+(`requestStopRunFor`, copilot.h). Shot: `CHUDWARE_SHOT=agentlock` (16 self-checks, including a real
+second-client MCP write).
+
+**Parallel agents.**
+- `daemon_bridge` opens one hostd connection per calling thread (thread-local, closed on thread exit). Every connection sends a per-process `writer_group`. hostd (`doc_registry`) treats a group as one writer for rw counting, CAS revision, `_foreign_edits` and holds. Doc lifetime stays per connection.
+- hostd no longer drops events on a busy connection: it waits 2 s, then disconnects for resync.
+- `doc_list`/`unique_doc_name`/`resume_open_doc` serve busy sessions from a per-session summary snapshot (`busy:true`). They no longer wait behind another doc's compile.
+- Rejected batches publish only the committed tessellation.
+- `core_bridge` retries implicit-CAS `stale_revision` once and `busy_preview` for up to 30 s.
+- The current part is per agent (`cad_common.agent_doc_context`, bound in `chudcode_tools.dispatch_host_tool`). A sub-agent's doc-less call targets its own part before the turn doc.
+
+Measured through a private hostd: 4 sub-agents, each building its own part, took 15 s wall
+against 11.5 s for one agent alone. All revisions reached a subscribed observer. Two agents
+co-editing one part landed 8/8 edits. Tests: `test_hostd_registry` writer-group cases (53 pass);
+`test_document` "doc_list and document minting stay responsive…" and "doc_apply_ops rejection
+preserves the committed revision AICM"; `test_multiagent_overlap`, `test_current_part`,
+`test_chudcode_tools` and `test_daemon_bridge` additions. Pre-existing failure:
+`test_multiagent_overlap::test_autosave_skips_unchanged_docs` fails under the suite's private
+hostd, because Python autosave is a no-op in daemon mode, and passes with
+`CHUDWARE_ENGINE_DAEMON=0`.
+
+Deferred: the real fix for #55 (a `doc_revert` that refuses or merges across foreign revisions).
+Two conversations still cannot run turns in parallel (worker lane mutex).
+
+## 2026-10-12 — Concurrent chat turns and same-part editing across chats
+
+**Turns.**
+- hostd `WorkerBridge::dispatch` replaces the single agent worker with a pool: the primary plus `agent-turn` extras, up to `CHUDWARE_AGENT_WORKERS`, default 4. Each worker runs one turn at a time.
+- Conversation ownership keeps a conversation's live Chudcode runtime in one worker. Moving a conversation first asks its busy owner to `release` it over the control socket.
+- A real-chud smoke showed why the release is needed. Without it, a stale runtime's disposal wrote `session_exit` at its old leaf, and the next resume forked the history (turn 3 chained from turn 1).
+- Fixed a latent bug: worker children were forked on hostd connection threads, so Linux PDEATHSIG killed every worker when the client that triggered the spawn disconnected. The next turn then paid a respawn and lost its live sessions. Forks now run on one daemon-lifetime thread, as `ChildSupervisor` already does.
+- GUI: daemon `agent_admin_turn` leases its own run connection (`engine_backend` pool, at most 8) and takes no client mutex. Control goes through hostd by `run_id`.
+- Worker: lane `agent-turn` (no bench reconcile/shutdown). Control sockets are per pid. `ChudcodeSessionHost.release_session`.
+
+**Shared parts.**
+- `core_bridge` sends implicit batches with `base_revision: -1`; the engine DocLock serializes them.
+- `doc_checkpoint` returns its revision. `doc_revert expect_revision` and `core_bridge.revert_own_batch` stop a rollback from wiping another writer's commit.
+- Recon probes delete only their own feature.
+- Assembly tools dropped the CAS read they took just before applying.
+- `doc_list.other_writer` keeps one chat's end-of-turn save sweep off another chat's in-progress agent doc.
+
+**Evidence.**
+- Private hostd with the real Python worker and Chudcode: two chats' turns overlapped for 6.4 s of about 7 s, in two workers (`agent` and `agent-turn`). The follow-up turn reused its worker's live session (2.2 s, no respawn).
+- Session-migration smoke: A1, A2 and A3 ran on different workers and form one linear history.
+- Two separate agent processes ran `add_features` on one part: 8/8 batches landed interleaved at revisions 1..8, and invalid batches were refused normally.
+- Tests:
+  - `test_hostd_worker_bridge`: concurrency, same-conversation serialization, release accept/refuse.
+  - `test_same_doc_writers`, `test_document` guarded revert, `test_worker_long_run` (online turns overlap, native runs do not).
+  - `test_chudcode_host` and `test_chudcode_control` release tests, `test_terminal_save_sweep`.
+
+## 2026-10-12 — Inline pasted images in chat
+
+Image paste now inserts a numbered reference at the composer caret, replacing its selection;
+sent bubbles render the picture between the surrounding prose instead of showing attached-image
+filename lines plus a trailing thumbnail strip. `inline_image_refs.h`, `composer.cpp`,
+`chat_log.cpp` and `image_lightbox.*` share exact path rosters and aspect-preserving previews.
+`app_state.h`, `conversations.cpp`, `cards.cpp` and `copilot_internal.h` preserve stable draft
+slots, queued attachment snapshots and staged edit/cancel state. Sending/steering omits deleted
+references, orders images by first reference and compacts numbering; legacy records use only
+their recorded paths, never a basename lookup. `CHUDWARE_SHOT=chat_inline` in `scenarios.cpp`
+uses actual clipboard/keyboard/mouse input: 15 checks passed for caret/selection, deletion,
+image-only payloads, reorder, drafts/history and edit/cancel/viewer behavior, with zero ImGui ID
+conflicts. Portrait/landscape pasted bytes matched the fixtures; composer, transcript, legacy
+and viewer captures were inspected. Desktop build and theme/color/glyph/dupe/scale lints passed.
+The smoke uses private HOME/XDG paths, in-process engine and isolated Wayland/X11 clipboard
+environment; no live provider turn or browser/WASM runtime was exercised.
+
+## 2026-10-13 — Concurrent-agent connection lifetime and responsive chat
+
+- `daemon_bridge.TurnConnections`, `chudcode_host.py` and `chudcode_tools.py` retain CAD
+  sockets for the owning turn instead of closing them with each transient RPC tool thread.
+  Concurrent calls lease independent sockets; retirement never interrupts an in-flight
+  mutation. Genuine disconnect/lock-release notifications remain visible.
+- `general_agent.yaml` now describes a shared project registry with explicit part IDs and
+  agreed feature scopes, not mandatory private parts per sub-agent. Existing atomic,
+  sequential same-part batch application and geometry validation are unchanged.
+- `conversations.cpp`, `chat_message_snapshot.h` and `chat_persistence.h` reuse exact
+  unchanged snapshots and move routine desktop durable writes to one ordered, coalescing
+  writer. Explicit saves/reloads and shutdown remain barriers; failures retain retry state,
+  indexes follow transcript durability, and deletions cannot be resurrected by older saves.
+- `activity_timeline.cpp` and `chat_log.cpp` cache parsed tool rows and stable heights,
+  window settled offscreen rows/group members, and invalidate for content/layout changes.
+- `composer.cpp` now owns and joins its control thread. The old detached thread was
+  reproduced hanging in `pthread_cond_destroy` at process exit. GUI shutdown drains accepted
+  answer/steer jobs and their results before final persistence and worker/AppState teardown.
+
+Evidence: the untouched live session spent 4.99 s of an 8 s trace in 1,658 fsync calls,
+rewriting 119 distinct session/index files. An isolated production-object smoke with 118
+sessions and 400 tool rows rewrote only the edited transcript: median UI snapshot 5.47 ms,
+median timeline draw 0.231 ms; final text persisted and normal shutdown completed. Storage
+trace placed 256 transcript/index/draft fsync calls on the writer thread; the one main-thread
+fsync was outside the autosave series (the harness explicitly changes a saved UI preference).
+These are component timings, not whole-application FPS claims.
+
+Verification: desktop build and changed-Copilot GUI lint passed; 259 Python tests passed,
+one skipped, plus 19 subtests. Private native-engine smokes ran 3 agents/12 edits on separate
+parts with zero mid-turn disconnects and proper turn-end release, then 3 agents/12 sequential
+revisions on one shared part with all features preserved and explicit IDs overriding each
+agent's unrelated current-part slot. Failure injection exercised file-fsync, rename and
+directory-fsync retry, unchanged writes, coalesced deletion and shutdown drain. Real GUI
+`chat_evidence` replay (182 events), `projectchat` and `steerstatus` scenarios passed; captures
+were inspected. Live GUI, daemon and agent runs were not restarted or modified. Desktop
+runtime only; no provider/network or browser/WASM performance claim.
+
+## 2026-10-13 — ESPCAM message receipts and question submission
+
+ESPCAM c261 proved that a question consumed a typed reply while its user bubble said
+“Not delivered”; the next form failed with “worker control endpoint unavailable for active
+run.” `core/hostd/worker_bridge.cpp` and `services/worker/worker_client.*` now retain
+generation-owned control credentials after individual failures and keep socket I/O outside
+hostd's control-state lock. `services/agent/chudcode_{host,questions,events}.py` correlates
+text-only question replies to authoritative delivery events, retains unresolved correlations
+after send failure, and requires matching text/images for image delivery. Copilot
+`feed.cpp`, `composer.cpp`, `conversations.cpp`, `copilot.h` and the state-header contract
+make confirmed delivery monotonic, remove blanket Stop/unknown-frame delivery guesses, and
+recover only exact unique image-free replies within the original saved turn. Regression
+coverage lives in the three Chudcode suites, native worker control/long-run tests, hostd
+worker bridge tests and the existing `steerstatus` scenario. Verification: 128 Python
+delivery/question/event tests passed (one skipped), all 25 hostd tests and both native
+control targets passed; nine GUI scenario checks passed and receipt/question captures were
+inspected. A real provider→hostd→worker turn survived an oversized control refusal, accepted
+a typed PETG reply with a delivery event, accepted a subsequent Ender 3 form answer and
+reported both correctly. GUI and daemon built and staged; the initial unrestricted GUI
+build was killed (exit 137), then the bounded `-j 2` build passed. All five GUI lint rules
+passed. Contracts and the integration skill document the endpoint lifetime and evidence
+rules. Recovery preserved the original GUI/runtime/child histories, gracefully retired
+only c261's already-stopped stranded runtime, and its runtime session doctor reported
+healthy with zero findings. No JSONL surgery or forced daemon shutdown.
+The rebuilt desktop reopened c261 in ESPCAM and submitted exactly one continuation through
+its composer, preserving the original session ID/file and Claude Opus 5.5 / High settings.
+The old Command-strip message now persists as delivered. The live GUI showed the resumed
+model incorporating the saved under-eave/PETG/Ender 3 answers; the application remains open.
+
+## Copilot responsive header and question layouts
+
+`panel.cpp` and the header helpers in `cards.cpp` now use compact flat navigation with measured
+widths, one row when everything fits and a second row for Sessions/New chat otherwise. Tasks
+has a name rather than an idle `0/0`, and header glyphs use the existing DPI-crisp SDF path.
+Question choices wrap within full-row hit areas; Other has its own full-width input. Unit and
+file controls stack by available width, geometry labels/actions wrap/stack, and pending/resolved
+headings wrap. `chat_log.cpp`/`copilot.h`, `panel.cpp`, `ai_workspace.cpp` and `agent_dag.cpp`
+replace the floating latest-reply overlay with one reserved footer and budget short windows
+around the composer; the trace tree also respects the remaining timeline/footer budget.
+`host/CMakeLists.txt` enables semantic question-item annotations. The `copilot_ui` scenario in
+`scenarios.cpp/.h` exercised real clicks and text entry in five isolated configurations:
+200/340/520dp panes, 1x/1.5x/2x DPI, light/dark themes and the AI workspace. All 156 checks
+and 58 layout audits passed, with zero ID conflicts or horizontal overflows; captures were
+inspected. Build and six GUI lint rules passed. Matrix runs need distinct session directories
+and displays: the default screenshot store is shared by scenario name and cleared on startup.
+Answer transport remains unchanged; live provider dispatch and browser/WASM runtime were not
+exercised. Existing user GUI/daemon sessions were not stopped or restarted by this work.
+
+## 2026-10-13 — Flat printer-media delivery and delete-only retirement
+
+`services/manufacturing/print_media.py` now publishes stable raw part filenames at the drive root by default, or in one top-level project folder with `layout="project"`. Hidden root metadata replaces the `PRINT/<PROJECT>` and `CHUDWARE` trees; existing managed sets migrate even when their job bytes are unchanged. Deprecated managed G-code, reviewed legacy printables and owned obsolete archives are permanently deleted after current files and metadata pass hash readback. No new toolpath ZIP is created on media or host; temporary staging retains rollback capability only until verified commit, including crash recovery. The MCP wrapper, human CLI, agent printing guidance and development skill use this contract; filesystem regressions cover layout, deletion, migration, collisions, rollback and recovery. Runtime proof used stock PrusaSlicer on the desktop 6-axis `base.step+` and `forearm_lower.step+`, Ender-3 v1/PLA/direct-drive settings and zero brim. Both passed print-readiness and zero-repair checks; the forearm required measured +Y orientation and snug/sheath supports and retains support/adhesion warnings. A real MCP root-to-project smoke left no ZIPs; actual `PRO GAMER D` readback proved root-level `base.gcode` and `forearm_lower.gcode`, deleted 22 obsolete robot printables and the old robot archive, removed the obsolete managed trees, and preserved/reported unrelated OS-trash files. Source model hashes stayed unchanged during slicing; no physical print/fit test or user-session restart.
+
+Final scoped verification: 142 publishing, real-engine/slicer MCP and agent-mode tests passed; actual MCP root/project delivery, physical-drive SHA-256 readback and the human inventory CLI were exercised. Throwaway slicing/pose/delivery scripts were removed.
+
+
+## 2026-10-13 — Security P0 browser containment and identity authority
+
+`Webservice/gateway/engine_bridge.py` now accepts one strictly parsed/canonical request per frame under a version-1 default-deny contract (`hello`/`ping` only), including administrators; it hides global recovery metadata, drops global events/unsolicited responses, bounds pending requests, and removes raw forwarding, path-key heuristics and credential-injection code. Browser CAD/AI execution is deliberately unavailable pending tenant-owned sinks and isolated workers; native desktop/MCP transports are unchanged. `authn.py`/`oauth.py` separate provider ownership proof from password verification, invalidate preregistration capabilities, preserve independently verified passwords, and remove password login on OAuth-only admin bootstrap. Account-row locking covers session issuance and credential transitions, including `portal_api.py`; `accounts.py` revokes sessions transactionally on suspension/denial, and `billing.py` no longer changes operator account status. Changed contract tests remove obsolete forwarding expectations; disposable-PostgreSQL regressions exercise callback, dormant-session, billing, rollback and concurrency behavior. The gateway suite passed 814 tests with 29 skips; separate actual production-mode ASGI/native-hostd smoke evidence is retained in `reports/security/2026-10-12/p0-remediation-evidence.json`, alongside unchanged vulnerable-state evidence. No production service, user daemon, real credential, provider API, signing operation or physical device was touched. External release remains blocked by staging/signing/ownership/isolation/parser/dependency/operational gates; historical compromise requires operator review and revocation, not merely deployment of this patch.
+
+
+## 2026-10-13 — Tenant cells, release authenticity and audit hardening wave
+
+Browser CAD/AI moves from the P0 `hello`/`ping` containment to OS-isolated tenant cells (contract in `contracts/worker_rpc.md` cell addendum, `contracts/cell_methods.json`, `contracts/stepplus.md` §19). Gateway (`cells.py`, `engine_bridge.py`, migration 0022) resolves `(account_uid, workspace)` → one socket-activated `chudware-cell@<hex>` (`Webservice/deploy/cell/`: launcher, nested `chudware-actor-sandbox`, CONNECT egress broker on 127.0.0.1:18080, `chudware-worker` runpy bootstrap) and sends a principal hello; hostd `--cell` adopts fd 3, enforces per-method rights, per-actor lanes/listeners, owner-checked controls (managers: cancel only via `ctx.control_delegate`), revocation, attached-only events, and refuses escaping file/embedded references. Workers bind envelope ctx, mint opaque handles, return typed `not_found`, keep BYOK identity as (workspace, actor, provider) and never mutate process env per turn. Cache provenance HMAC (`cache.provenance`) keeps verified warm reopen at zero features executed; foreign caches restore immediately as `cache_trust:"unverified"` and refresh in the background. Release side: gateway authenticates payload/SBOM/provenance/platform-test signatures and identities from private snapshots at CI/manual publish and promotion, Windows/macOS stable promotion requires an owner-authorized native publisher byproduct, rollback restores only operator-authorized (root-owned record) private snapshots (`deployment_release.py`, manifest schema 7 with `cell_runtime_sha256`), Chudcode verify/stage execute private snapshots, managed Git sources use `--no-replace-objects`. Hardening: central `services/net/safe_http.py`, PLM git/zip/manifest/relay fixes, SPICE name remapping + directive grammar, PDF escaping, firmware without semihosting and with Renode `@/abs` encoding, bounded manufacturing state, parser `.inc` regressions under ASan/UBSan, identity/commerce fixes (migration 0023, mandatory `CHUDWARE_MAIL_CONTEXT_ENCRYPTION_KEY`), dependency pins with `reports/security/2026-10-12/dependency-dispositions.md`. Gotchas: systemd `PrivateNetwork=yes` on user units implies a user namespace that maps root-owned ancestors to nobody, so ownership-checking tests (firmware storage, Box mirror) must not run under it; AF_UNIX paths >107 bytes break deep pytest tmp roots; bwrap has no `--preserve-fds`. Deferred/blocked: authenticated runtime wheel lock (cell payload staging fails closed), root-provisioned disk quotas, installed-unit/cgroup evidence on the production host, provider broker for pooled/subscription web turns, Windows/macOS native verification runs.
+
+## 2026-10-13 — Operational recovery and mixed-suite lifetime follow-up
+
+`Webservice/deploy/backup_state.py` now streams actual PostgreSQL dumps into age, archives configured data/workspace/bucket/cell roots with mount manifests and credential separation, scopes retention to owned environment/family artifacts, and restores only into explicit isolated targets without retained plaintext dumps or broad sudo fallback. `backup.sh`, `update.sh`, the backup unit and RUNBOOK agree; a disposable real pg_dump→age→pg_restore drill recovered all four roots and cached-part bytes while leaving source rows unchanged. `terminal.py` revalidates immediately before outbound PTY/session/exit payloads and closes silent revoked endpoints within one second without killing another attachment; entitlement provisioning uses bounded memory-only stdin and encrypted-only atomic output. Mixed-suite fixtures now isolate HOME/XDG before collection, preserve dynamic path attributes, stop selecting the stale slim engine at collection, and give spawned daemons private state roots. The broad sweep exposed a genuine `doc_view_metrics` SIGABRT: partial vector-of-thread construction unwound joinable threads. `session.cpp` now honors the solver governor and cancels/joins safely, returning `metrics_failed` without partial success; the constrained native consumer then recovers exactly. Python 3.11 wheel authentication also stopped discarding authenticated vendored `.dist-info/INSTALLER` bytes as if they were top-level pip-generated metadata; real offline-install/tamper regressions pass on 3.11 and 3.14. Durable scopes and remaining release prerequisites are in `reports/security/2026-10-12/release-hardening-remediation-evidence.json`; production/CI/provider qualification and historical incident closure are not inferred from these source/scratch results.
+
+## 2026-10-13 — Release qualification tooling and grouped-writer continuity
+
+`packaging/qualify_native_release.py` adds read-only prerequisite inspection and genuine-target-OS artifact qualification using the existing publisher policy, retained CTest records, and evidence/signing-request formats; it never signs or promotes. `platform_publishers.py` now bounds native verifier subprocess output and duration. Central qualification/finalizer/evidence/signing coverage passes 183 cases with 25 native-only skips; a real Linux CLI invocation refuses an unsigned Windows fixture without creating an output directory. Real native host/publisher qualification remains outstanding. The MCP animation metadata path no longer re-handshakes away `writer_group`; recovery refreshes metadata through `DaemonClient.refresh_server_info()`. A 781-case whole-collection focused run and separate private-daemon smoke preserve own-group edits while reporting genuine outsider edits. The complete prior-wave regression sweep remains separate.
+
+## 2026-10-13 — Offline prerequisite tooling and real admin promotion surface
+
+Runtime preparation now distinguishes unapproved wheel observations from independently reviewed exact-target inputs; the explicit isolated SDK builder consumes reviewed source/base/backend identities, never acting as a provisioning fallback. Central regression: 64 passed; wheelhouse validation separately passes 30 cases, including a real file growing during bounded hashing. Two actual offline builds from pinned private SDK commit `2eaba2f4` produced identical `8ae5f2a8…` wheel hashes, still unapproved for release. Read-only CI evidence collection passes 14 behavioral cases; its actual conformant synthetic-export CLI still exits 1 with three authority gates unavailable. P3 host evidence collection passes 65 cases and its actual no-packet CLI reports all eight gates unavailable. These tools do not establish deployed authority. A real isolated Chromium session against the disposable staging gateway visually verified native publisher-required rows without promotion controls and exercised click/confirmation to publish only the inert local Linux stable fixture. No genuine native signing, production release or CAD/provider qualification is implied. Full audit reconciliation additionally exposed desktop shell/sign-out/thumbnail/trace defects and finding-level proof gaps; these require their own exercised disposition rather than prior aggregate suite counts.
+
+## 2026-10-14 — Quota authority and desktop residual proof
+
+Cell admission now requires a root-protected complete owner quota plan/proof over workspace, state and bucket roots, with enforced XFS/ext4 project limits and boot/mount/device/inode binding. It refuses unsafe aliases and migrations and mounts checked descriptors. Quota/runtime regression passed 71 cases. A separate actual XFS loop-image ioctl/write probe showed initial-namespace owners can clear inheritance, while the nested cell user namespace refuses that mutation and retains the hard byte limit; the namespace is part of the security boundary, not optional packaging.
+
+Native desktop compilation and 37 CTests passed after shell-free external opening, generation-fenced account completion, bounded thumbnail inflation, bounded opt-in CEF trace sinks and checked AICM counts. Actual isolated native screenshots confirmed sign-out clears both live and stored credentials, preserves read-only access and reserves a nonoverlapping banner row; settings and the canned capture surface rendered with zero ID conflicts. This build had CEF disabled and preceded the Windows named-pipe cutover, so neither the live CEF callback nor Windows OS isolation is certified by it. The broad Python sweep stopped after 8,698 passes and five newly exposed fixture-isolation failures; source corrections and later broker/cell changes still require final verification.
+
+## 2026-10-14 — Actual residual-path and dependency observations
+
+The native, desktop and WebAssembly build chain succeeded. Direct C ABI smoke leaves drawings and output files unchanged across 20 Ask/Plan/plan-only requests on both native agent entrypoints, while eight Agent/default controls still create real drawings or matching G-code. After correcting the fixture's separate design/Ask mock descriptors, 12 explicit-approved-plan scenarios on both native entrypoints completed design execution and created the expected editable 30×20×10 box instead of entering the drawing/CAM shortcuts. The native activity export reported one dirty document after each edit and zero after closing all documents. CAM refuses seven hostile archive forms without consuming session IDs or damaging an existing job, then preserves a valid human edit through save/reopen; CAD graph construction admits the valid recipe and rejects oversized document metadata. Actual pathological `fs_grep` returns a typed deadline refusal in about two seconds without blocking an independent read, and a normal search still returns its expected line.
+
+Actual OSV queries on 2026-10-14 returned no advisory matches or pagination for 54 exact public declaration versions and 171 unique public versions installed in the disposable upgraded gateway environment. All 17 gateway pins match installed versions under PEP 440 normalization. This is neither private/runtime-image approval nor native, browser, OS or advisory-exploit qualification. The original vulnerable audit JSON remains unchanged. The provider-cutover gateway sweep still exposed lifecycle/fixture failures after 1,303 passes; those corrective edits and the new native/worker/gateway maintenance census require an integrated gate before release.
+
+## 2026-10-14 — Bounded Python import and verified acquisition paths
+
+The shared Python DXF traversal now budgets nested INSERT/MINSERT work before expansion. An actual nested 2×2 fixture imports four edges, while a 32767×32767 array is refused before materializing instances. The slicer keeps its existing subprocess deadline after both output pipes close; an actual child that closes its pipes then sleeps returns `slicer_timeout` and is reaped. These are operation bounds, not agent lifetime limits.
+
+Real namespace-only DNS/TLS acquisition exercised the unmodified production resolver and pinned-IP connector against private fixture servers. Trusted matching certificates succeed; wrong-hostname and untrusted-CA certificates fail. Redirects retain the new hostname's SNI/verification, and a private-address redirect is refused. Static CAD-page acquisition succeeds; a JavaScript-only shell returns `no_cad_link` without invoking the removed unrestricted rendered-browser fallback. No shared browser profile or live provider was used.
+
+An actual local Git flow rejects a credentialed PLM link without committing, opens legacy unsafe metadata with redacted diagnostics, and refuses unapproved sync. Explicit clean-remote approval appends a repair without changing historical bytes; a subsequent checkpoint and real bare-repository sync succeed. This is forward repair, not credential revocation or historical incident closure.
+
+## 2026-10-14 — Integrated native and desktop regression gate
+
+The current native, WebAssembly, desktop and CEF builds succeed. The CEF C++20 build exposed a `std::u8string`/`std::string` conversion in trace-directory setup; retaining the original UTF-8 parent path fixes that incompatibility without re-encoding. Central CTest passed all 136 native and 37 desktop executables, including approved-mode handling and native cache/dirty-document census coverage. These Linux results do not certify Windows IPC, macOS signing, live firmware tools, or the still-pending integrated Python/gateway/cell drain proof.
+
+The real CEF Parts Library browser, not the screenshot-only helper, executed a local page's console callbacks inside an owned network/PID namespace. Default tracing created no trace file and did not echo the page's private sentinel to stderr. Explicit opt-in produced metadata-only console events in a mode-0600 file. After seeding that file to 1 MiB minus 128 bytes, two real reloads reached 1,048,575 bytes and then stayed there while the page continued completing. Both actual surfaces were visually inspected; all proof processes and the private daemon were isolated from user sessions.
+
+## 2026-10-14 — Actual portable SolidWorks and printer-lane paths
+
+The portable SolidWorks importer decoded a real compressed tetrahedron fixture to four triangles and 166.6666666667 mm³, and preserved a 20 mm assembly-instance translation. A raw-deflate stream with 4 MiB of output but a one-byte declared size was rejected at the inflater boundary; peak traced Python allocation during that refusal was 53,185 bytes (not a native-allocation measurement). The actual native manufacturing lane also exchanged requests with the real Python Moonraker adapter against an isolated loopback fixture: an IP-literal endpoint with no `address_class` connected, returned two complete telemetry snapshots, and retained the `transport` authority ceiling. No physical device was operated.
+
+## 2026-10-14 — Named remediation evidence and honest acceptance closeout
+
+`reports/security/2026-10-12/release-hardening-remediation-evidence.json` now adds 104 finding/companion mappings and 1,044 exact class/test/status records from the complete, untruncated parent XML index plus completed newer quota and native-final artifacts, with original numbered and phase acceptance requirements reconciled separately. The original vulnerable audit/reviews, dependency and secret-scan reports remain unchanged. Native executable passes are distinguished from registered source cases, compiled-out platform branches and optional live-tool legs. Actual wasm32 `loadAicmBytes` rejects wrapped BODY/envelope/PTRDIFF inputs and decodes the real golden; actual capture trickle closes in 0.201000345 seconds without partial files, followed by authenticated PNG HTTP 200. Latest completed full Python remains 13,074 passed with one historical capture-fixture expectation failure; the corrected module and focused follow-ups do not make the still-running broad rerun green. Quota `results-j.xml` has 99 passed/one empty-profiler-report fixture assertion failure: both actual SDK census cases and provider revocation pass, but corrected viewer/editor/manager admission and the final combined quota wave remain unverified. The newest build, actual delayed account HTTP/GUI completion, chat artifact callbacks and browser picker/Copilot edit/save/reopen are pending. `services/reveng/test_tenancy.py` adds exported/imported bundle rejection, CRC/content and desktop custom-destination regressions, while `Webservice/deploy/tests/test_reveng_cell_boundary.py::test_num4_owned_bundle_and_foreign_destination_boundary` adds the real personal/shared-team gateway/native export consumer scenario; neither new proof was executed by its worker, and actor-private `/tmp` plus explicit desktop destinations remain supported. Exact parent todo recommendations identify local closure candidates without changing the todo or implying release readiness; native Windows/macOS, reviewed complete private runtime inputs, genuine CI/installed-host authority, historical rotation/exposure, off-host recovery and live mail/DNS qualification remain separate prerequisites. No checks, builds, formatting, live services, production/customer/device operations or signing were performed by this evidence worker.
+
+## 2026-10-14 — Epoch retirement and real delayed-account completion
+
+Native authority transitions now serialize publication with retirement: control hello does not mutate actor authority, newer GUI epochs retire only older actor/workspace generations, and repeated updates cannot close fresh sessions or kill fresh workers. Real two-tenant provider revocation/reconnect and delayed-control replay pass. The embedded worker regression harness now supplies the required workspace and epoch cutoff; all 261 native-cell/policy regressions pass after the broad run exposed its two stale callers.
+
+The production account panel was exercised with a real device-signed refresh held by an owned loopback HTTP fixture until sign-out. After the released 503 and actual worker reaping, normal account tick preserves signed-out/read-only state and banner, erased session credentials, device identity, security events and monotonic refresh-sequence bytes. The harness inherits the original network-namespace descriptor to verify isolation without reading privileged `/proc/1` state, and preserves the provisioned Python interpreter path instead of resolving away its virtual environment. The inspected screenshot keeps the notice above, not over, Copilot. This proves stale error completion through the production path; stale successful refresh/login candidates remain covered by the existing mailbox regressions, without inventing entitlement authority.
+
+## 2026-10-14 — Real tenant boundary closeout and deployment shortcut retirement
+
+The complete disposable XFS/cell gate passes all 104 cases. Real personal/shared-team SDK turns survive another actor's refused legacy credential mutations and resume the same session. Viewer/editor/manager admission and actual profiler state transitions pass without admitting dangerous operations. NUM-4 now exercises real native actor mounts and Python consumers: valid bundles preserve the owned session/mesh across workspace, actor/home, user-selected symlink and private-tmp destinations; malformed/absent/foreign handles cannot mutate destinations, and outside sentinels remain unchanged. Exact archive-member-set assertions were removed rather than repinned when a legitimate internal lock file appeared; CRC, manifest, mesh and foreign-data invariants remain.
+
+The unsafe admin rebuild/redeploy routes, buttons and shell shortcuts are removed. The System panel is a read-only operator deployment monitor, not a second build/restart authority. The gateway/deployment gate passes 1,443 cases with 63 explicit skips; quota-required cases pass in the separate real-cell run. Qualified update/rollback retain exact-commit, dirty-tree, maintenance-census and independent first-cutover recovery requirements. No live service was restarted.
+
+Runbook and canonical integration guidance now distinguish optional local/native daemon ceilings from tenant-cell ceilings, Windows private named pipes from obsolete loopback control, and actor-scoped catalog helpers from desktop's shared transient client. The release guide explicitly states that artifact signatures do not bind `min_supported`; no floor increase or signing authority is authorized. All 145 redacted historical-secret detections retain owner-review-required disposition: pathnames, fixture usage and deletion do not prove false positivity or revocation. Installed-host, CI/image, native-platform, private-runtime, rotation/exposure and off-host recovery authority remain external prerequisites.
+
+## 2026-10-14 — Browser edit/save/reopen and actual desktop consumer proof
+
+PropertyManager now reads canonical numeric dimensions as well as expression-bearing values. DocMirror notifications distinguish an actual same-document revision transition from unchanged refresh/activation/snapshot traffic, so read-only Ask no longer dirties the GUI. The owned native scenario passes 42 checks across 40/30/20 dimensions, inch conversion, drag, independent native/local edits, undo/redo, ordinary save, warm reopen and expression preservation. Linux, WASM and CEF builds complete.
+
+Actual Chromium exercises the tenant canvas and scoped provider path: Claude 4.1 Opus Ask streams the local synthetic response while the part remains clean; human editing produces 50/30/20, saves, closes and reopens with verified cached state and zero feature execution. Actual admin UI permits only the qualified Linux fixture promotion, retains Windows/macOS publisher refusal, and exposes read-only deployment monitoring; retired rebuild/redeploy POSTs return 404. Owned browser and gateway/cell fixtures are stopped without touching user sessions. Synthetic identities and development authentication are not production qualification.
+
+The real CEF download CLI accepts exact benign bytes and refuses both declared and streamed 256 MiB responses under its 200 MiB ceiling, preserving existing destination bytes. Each request uses a fresh process/cache; sender progress is not a memory measurement or same-process recovery proof. The final chat artifact open/reveal callbacks compile against the shell-free APIs already exercised by the real Linux argv recorder; native Windows/macOS launch behavior is not attested.
+
+## 2026-10-14 — Final native gate and deterministic TCP teardown coverage
+
+The final Linux gate passes 136 core and 37 desktop executables. One earlier round-trip run returned an error before payload, but its socket reason was not captured; 1,000 focused and 100 complete instrumented pre-change runs did not reproduce it. A teardown scheduling race is an inference, not an established production defect. The fixture now waits for the client's receipt acknowledgment instead of closing after 50 ms, and aggregates TCP stream fragments instead of requiring a single event. A separate deterministic case closes the peer before polling, verifies an expired poll leaves data untouched, then requires the complete final payload before EOF and refuses subsequent writes. Half-close/reset coverage remains. All 13 transport cases and 122 assertions pass in the final gate, as do 100 complete post-change transport runs; no production error handling was suppressed.
+
+## 2026-10-14 — Completed local regression and release prerequisite ledger
+
+The final full `services scripts tools` sweep completes with 13,087 passed, 194 skipped, one expected failure and 206 passed subtests in 2,091.72 seconds. All 29 focused reverse-engineering tenancy/export cases also pass. Together with the completed 1,443-case gateway/deployment gate, 104-case real quota/cell gate, 136 core and 37 desktop executables, and actual browser/native/CEF/account consumer observations, this closes the reachable local verification work. Skips and synthetic trust never count as unavailable platform or production proof.
+
+The evidence ledger reconciles all 26 original numbered/phase acceptance clauses and 104 finding/companion mappings while preserving historical failures. Release qualification remains blocked on genuine native-platform/publisher, approved private-runtime/bootstrap, CI/image/secret migration, installed host/edge, live mail/provider, historical credential/consumer/exposure and off-host recovery authority. All 145 historical secret detections remain owner-review-required. Owned fixtures and temporary smoke drivers are cleaned up; no user session, customer system, device, signing service or CI runner was operated.
+
+## 2026-10-15 — Native Windows IPC, workers and cached document persistence
+
+Genuine Windows 11/MSVC execution exposed daemon pipe polling latency and an indefinite read that shutdown could not wake. Separate overlapped read/write events, sticky cancellation and cancel-and-drain now preserve partial frames and enforce the existing 64 MiB ceiling. Native regression covers duplex traffic, blocked read/write cancellation and boundary-sized frames. Three quiet matched native-VM pairs measured median per-run daemon round trips of 33.109495 ms before versus 0.077285 ms after, control round trips of 4.80254 versus 0.733935 ms, and control idle CPU of 906.25 versus 15.625 ms per eight seconds. These are transport measurements, not GPU or desktop-rendering benchmarks; the original single-pair evidence remains retained.
+
+Native workers use restricted inherited handles and suspended creation followed by kill-on-close Job assignment. Detached console creation avoids the hidden `conhost.exe` child that `CREATE_NO_WINDOW` still allocates; an actual native probe demonstrated that helper preventing an idle census. Control requests use event waits and absolute deadlines; response disconnect waits for the remaining request trailer to drain rather than losing a successful reply. Private IPC objects, firmware directories and cache/save stages explicitly use TokenUser ownership, including elevated launches. Python discovery reuses typed SID lookup, and Python activity now has a real Toolhelp/FILETIME census. Unknown descendants and uncontained SDK work still prevent a trusted idle verdict.
+
+The real engine exposed saved archives deleted by staged-file cleanup and unterminated Windows rename buffers publishing unintended filenames or failing with error 123. Both normal saves and cache-only writeback now preserve publication and supply a UTF-16 terminator. Archive reads, saves and relocation keep explicit UTF-8/native boundaries, close readers before replacement, and tolerate unrelated NTFS sibling names that cannot be encoded as UTF-8. Native save/restart/reopen restores verified checkpoints with zero feature execution and no pending verification rebuild; a tail edit reuses the earlier two checkpoints. Firmware metadata replacement closes the checked destination handle before rename. Native CppCore diagnostics preserve Unicode paths instead of narrowing wchar_t values. MSVC portability fixes cover Windows macro collisions, C++17 template syntax and static storage for the ribbon's captureless-lambda constant. Release/LTO links are serialized by default without disabling parallel compilation. Unchanged CMake configuration no longer rewrites generated miniz or embedded firmware-source headers; the latter previously recompiled `bus_models.cpp` and relinked the engine despite identical source bytes.
+
+The Windows stdout integrity fixture now yields within a frame without scheduling once per character, waits for producer completion before decoding, and verifies payload integrity. It no longer treats unfinished writers under native-build load as malformed completed frames. Native run records, preserved failures and qualification limits live in `reports/security/2026-10-12/windows-native-evidence.zip` and the remediation evidence ledger. Portable developer tools and diagnostic runtime sources do not authorize signed/customer-runtime release; approved private-runtime inputs, positive publisher fixtures and installed/GPU qualification remain separate prerequisites. Original user sessions and the original Windows VM are untouched.
+
+Actual native desktop captures use an isolated per-application llvmpipe driver because the owned guest has no WGL-capable GPU driver. Visual inspection—not PNG existence—exposed the M1 scenario dropping the restored mesh after reopen. The scenario now adopts the cached mesh and rejects failed mesh loading or a non-warm round trip instead of forcing a rebuild. Its former timing-equality printout is diagnostic timing only, not a cache correctness assertion. A separate native probe reproduced GUI tab matching treating an absolute Unicode path as nonexistent and throwing while normalizing a relative path under a Unicode working directory. Matching now uses explicit UTF-8/native conversion; M1 also checks that an absolute spelling reuses the selected document saved under a relative spelling.
+
+The completed native Release/LTO gate passes all 137 core executables and 34 host executables, with the host's explicit Windows `test_external_open` skip retained. The complete native Python gate passes 161 cases with 39 explicit platform/authority skips. Actual Unicode full-save and cache-only reopen take 4.56 and 4.30 ms on the three-feature fixture, restore verified checkpoints, execute zero features and schedule no verification rebuild; both files also restore under the same account's genuinely unelevated token. Actual worker/control RPCs and clean shutdown pass. A post-suite first daemon connection measures 412 ms, then 129–137 ms on restarts; earlier 13.5–16.4 second starts remain unexplained and are not claimed as a demonstrated cold-start speedup.
+
+The corrected native M1 capture visibly contains the restored filleted/shelled model and its three-feature tree; its production open-path check reuses the selected tab for an absolute Unicode spelling. Missing-engine M1 exits unsuccessfully without a capture, while the engine-free static chat scenario still renders. These are real software-rendered desktop observations, not hardware GPU, authenticated editing, provider, CEF or installed-release qualification.
+
+The final native unchanged-configure check preserves all three generated-header timestamps and hashes. The core runs only its build-ID refresh, and the host reports `ninja: no work to do`; neither recompiles nor relinks. The firmware header remains byte-identical to the original embedded source data.
+
+## 2026-10-15 — Measured performance audit and exact hot-path cutover
+
+[The performance audit](review/PERF_AUDIT_2026-10-15.md) records private, sequential Linux/NVIDIA before/after evidence and retained profiler commands for the SHA-NI/scalar SHA path, cached AICM publication without a temporary mesh copy, direct face descriptors, bounded PCB scans with monotonic contour traversal, linear Python IPC framing, memoized single-block GL picks, and corrected compact-transfer CUDA LBM. Verified warm-open median falls 65.470 → 36.083 ms; all 442 selectors remain exact; dense fill falls 7936.428 → 113.815 ms with byte-identical output; the 128×64×64/200-step GPU fixture is bit-identical to CPU at 0.273 versus 2.033 s median, with Nsight D2H bytes reduced 197.86×. CUDA remains optional/default OFF, geometry/cache/solver contracts remain intact, old/new saved caches reopen verified with zero feature execution, and actual GUI pick/M1 captures were visually inspected without touching user sessions or staging dist. Independent review reproduced and corrected import-time discovery mutation, false warm-open success after real cache loss, valid throughput after export failure, and positive MLUPS after a real governor stop; scoped execution now restores discovery, validates saved-cache hydration and exports before crediting throughput, and emits null MLUPS for failed solves. Linux RSS diagnosis additionally proved `getrusage` inherited launcher peaks; new captures use current-image `VmHWM`, historical baseline peaks are marked unavailable without changing timings, and no memory speedup is inferred. Post-review CLI proofs cover the real failure paths, 442 exact selectors and 16×8×8 CPU/GPU parity; hashes match Python at 15 sizes including 64 MiB. Scoped validation passes all eight selected CTest modules (including the full 38-case CUDA-enabled simulation suite), 70 combined tool/sampling/daemon pytest cases, and the final 30-case RSS-aware performance-test run. The complete repository gate passed native/host/WASM builds, all 137 core CTest executables, daemon/web/packaging checks and GUI smokes, but exited 1 on five Python environment failures: three overlong Unix socket paths and two DVC user-package discovery failures under private HOME. Complete affected-suite reruns with short pytest paths and explicit PYTHONUSERBASE passed 4,017 MCP tests and 525 tooling tests, without weakening assertions or changing application code for those failures. The original monolithic gate is not relabeled green; its diagnostics and correction commands are retained in the report. Raw scratch captures are ephemeral; durable sources and the machine/thread-specific schema-2 after baseline are linked in the report. FEA meshing, DFAM ray walls, dense DRC and patterned tessellation remain measured bottlenecks; PLM/CAM/sketch/hydraulic/gateway findings are static-only, and other platforms are unqualified by this pass.
+
+## 2026-10-15 — Six-axis c275 tooling, knowledge delivery and recoverable waits
+
+Audited the latest Desktop six-axis trace without changing its session or project files. `core/doc/session.cpp` now reuses immutable motion geometry/exact-relative-pose pair evidence and avoids redundant solid containment only for proven-disjoint threshold checks; native motion/interference regressions retain tiny-gap, containment, cavity, multi-solid and invalid-geometry coverage. Replaying the recorded 17-frame, 0.5-mm J3 sweep on copies of the current 27-component project completes in 309.31 s (the trace timed out at 900 s), with all 351 pairs classified per frame and unchanged source hashes. The opposite sweep completes in 305.39 s through an intentionally one-second host timeout and retry, executing native work exactly once and recovering its full result. `agent_turn.py`, `chudcode_tools.py` and `chudcode_host.py` own/retire recoveries per run, preserve creating-call identity and settle late validation refunds once. `worker_rpc.py`/`workspace_tools.py` capture selected roots before activation; live fresh-thread initial/refreshed bindings now find the real selected-directory STEP+ and classify its document as project-local. Online descriptions retain curated notes, effective timeout policy and project/built-in skill pointers even through eval; the simulate skill, guide and role helper document complete frame evidence and reject inner failed results before indexing. Agent discovery no longer advertises denied undo/redo. `process_isolation.*`, native dry-run dispatch and advisor preflight bound the entire candidate process group: the copied forearm probe returns an honest construction failure in 9.38 s, while an injected stall returns `budget_exceeded`, `still_running:false` in 10.10 s with the source state unchanged. Blend diagnostics no longer infer radius feasibility from a null kernel result; thickness reports its actual minimum ray and sampling limits without hiding the 0.00219-mm local taper. `verify/battery.py` uses unique opposing planar-face references rather than ambiguous generic selectors; the real forearm measurement passes. `cad_common.py` and native study mutations preserve detached study-only sources, deliver to an unused project filename, and disambiguate legacy duplicate study IDs without rewriting unrelated studies; a private-daemon import/study/terminal-save/reopen preserves source and occupied destination bytes and round-trips the results. Verification: five native suites, 786 Python tests plus 26 subtests (two skips), all ten source-audit gates, and private runtime smokes. Engine/daemon artifacts were atomically staged and their hashes matched the verified build; no user daemon was stopped or restarted. Contracts and both integration/development skills record the new invariants. Remaining model contacts, sub-0.5-mm fits and genuine overhang/taper findings are not suppressed or certified safe; this is tooling repair, not a model redesign or live-provider qualification.
+
+## 2026-10-15 — User override for not-print-ready printer media delivery
+
+The in-app agent refused to put a failing slice (`arm_upper`, trapped-support printability fail) on the user's flashdrive: `publish_print_media` hard-refused `not_print_ready`, and the prompts forbade any other route, so the agent first refused and then offered an unmanaged hand copy. Jobs now accept `user_override` (the user's explicit words, 1–500 chars); a not-ready job publishes only with it, through the same hash-verified, revisioned, stale-deleting transaction. `_failed_checks` mirrors slice_part's gate (gcode_check fails, printability fails except overhang/bridges when supports are on, unproven slicer mesh repairs); the override and its failed checks land in the media manifest (validated on read), README, inventory job rows and a `published_not_print_ready` warning on every publish/unchanged result. Hash checks are never overridden. Prompts (`general_agent.yaml`, printing cheatsheet, cam guidance, `slice_part` next steps, publish docstring, `scripts/print_media.py`) tell agents to ask once via the question tool, then publish with the override — never refuse or copy. Regenerating the tool tables also picked up four pre-existing description drifts (`cam_save`, `fs_grep`, `simulate_motion`, `wall_thickness`). Verification: `test_print_media.py` override test plus print/mode/guidance/role suites (187 passed), `scripts/check.py` 10/10, and a CLI publish of the real `arm_upper.print.json` to a scratch drive (README and warning name `printability.support`; bytes hash-identical).
+
+## 2026-10-16 — Sketcher overhaul: relation set, model references, Fully Define, Convert performance
+
+Audit found the 2D solver silently dropping wrong-type relations (parallel on arcs fed garbage residuals), no way to relate sketch geometry to model vertices/edges/pierce points or datum axes, no Fully Define, and Convert Entities costing ~11 s per click on a 341-edge part (`op_sketch_convert` ran two UNCACHED full `compile_document`s; every later edit in a doc with external refs re-described all faces/edges per ref, ~585 ms, and `sim_bbox_diag` stripped triangulation with `BRepTools::Clean`). Engine (`core/sketch/sketch.cpp`, `core/doc/validate.cpp`): intersection, arc midpoint, point concentric, ellipse/slot/arc_slot equal, `equal_curve_length`, full-ellipse and spline/arc endpoint (G1) tangency, `smooth` (G2), point_on spline, line/circle symmetric, `[line,line]` distance, `arc_length`, virtual `axis.h`/`axis.v`; `SketchSolution::skipped` → `skipped_constraints`; junction-form tangency for curves joined by coincident (a dimensioned slot is DOF 0, was 4 spurious DOF); normalized collinear/point-on-line and angular parallel/perpendicular (collinear used to collapse a free line to zero length against a converted model edge — caught by the `sketch` scenario). 3D (`sketch3d.cpp`): tangent, equal, midpoint, collinear, concentric, coradial, on/parallel/normal to plane, plane symmetry, point_on spline (GeomAPI_Interpolate-exact evaluator), GUI vertex references. `core/sketch/sketch_define.cpp`: Fully Define (relations, then dimensions incl. spline points, never moving geometry; 200 entities < 0.5 s), op `sketch_fully_define`. `core/doc/session.cpp`/`recon.cpp`: apply context gives op handlers the session CompileCache; session-owned external projection cache (descriptors per model state, per-ref memo); vertex, pierce, datum axis/origin and `sketch_entity` refs; `sketch_project_ref` through the shared resolver; composite rectangle/polygon/polyline relations. Measured (private engine, same part): convert face 11 109 → 373 ms, convert edge 11 665 → 127–215 ms, sketch edit after converts 580 → 75 ms; plain edits unchanged at ~58 ms. GUI (`sketch_mode.cpp`, new `sketch_relations_panel.cpp`, `viewport_panel.cpp`): complete Add Relation table, model vertex/edge/face references projected + related in one batch (Pierce, On Edge, Collinear…), new glyphs incl. point_on, Display/Delete Relations panel, Fully Define button, batched Convert reusing resolved selectors, id-pass refresh after mesh reload (model hover no longer dies after the first Convert/Smart Dim click), dirty-flagged regions and cached badge layout. AI (`services/mcp`, `services/agent`): `add_features` appends `sketch_fully_define` in the same batch (opt-out `auto_define:false`), `check_sketch` reports `pinned_only` and never calls a fix-pinned sketch fully defined, advisor/battery check every sketch, prompts teach relations/dimensions/origin/axis refs/external references instead of `"constraints":[]`; new MCP tool `sketch_fully_define`. Cache epoch `geomcache/17` (contracts/stepplus.md §20); contracts doc_schema "Sketch relation set v2…", doc_ops §31, sketch3d_gui_contract §9. Verified: core ctest 137/137, sketch/agent pytest, `CHUDWARE_SHOT=sketch` steps 3–8 (collinear to model edge lands on y=40, pierce (100,40), vertex (100,0), Fully Define DOF 0), SW parity verdicts identical before/after. Deferred: 3D edge/face external refs (vertex only), silhouette edges of curved faces, headless sketch camera framing (pre-existing: captures sit far too close, so judge overlays by printed coordinates).
+
+## 2026-10-16 — Topology optimization for 3D-printed parts (GUI + agent parity)
+
+Printing with topology results needed six numbers typed by hand, a raw build-direction vector, a jagged marching-tet STL, no DFAM in GUI runs and no slicer handoff. Shared preset data `services/sim/topology_print_processes.json` (fdm_0.4/fdm_0.6/resin/powder; GUI Apply overwrites offered keys, agent `print_process` fills unset keys; `overhang_penalty` 2 measured on two clamped beams: 23-32 % less print-surface support area for ≤6 % compliance). Study `build_plate` (bed face) → native derives build direction with named refusals (`core/sim/topopt_model.cpp`). `min_member_mm` filter radius gets a 2×median-element floor. Native print surface `surface_print.stl` (`core/sim/topopt_surface.cpp` pinned Taubin smoothing, local rollback of folding micro-triangles, BVH tri-tri self-intersection check with exact shared-vertex incidence) drives the overlay, which gains an `overhang` ("Needs support") scalar plus surface support-area evidence. GUI (`sim_topology*`, `sim_manager_topology.cpp`): volume-fraction gate, preset/bed-face card, print surface first for Export/Continue in CAD, async `topology_dfam` worker (`services/sim/topology_worker_rpc.py`, gui-background, cell `allow/run/actor`) merging DFAM rows into the run. Agent (`services/sim/topology.py`, `topology_tools.py`): early refusals before save/export, process-aware DFAM on the print surface, `print_handoff` with `slice_part`/`import_part` arguments. Contract: worker_rpc.md 2026-10-16 addendum. Verified: topopt ctest 10/10, `test_sim_topology`, `test_topology_tools.py` 68, `CHUDWARE_SHOT=topology` ok, private-hostd agent run + stock PrusaSlicer slice of the print surface. Gotchas: where the thresholded surface grazes a part face it leaves sub-layer slivers; DFAM calls the raw one a knife edge (min_wall warn) and, once smoothing flattens it, a thin skin (min_wall fail) — same sliver, stricter verdict. `slice_part(printer="prusa mk4", material="PLA")` currently fails filament resolution ("AmazonBasics PLA"), unrelated to topology.

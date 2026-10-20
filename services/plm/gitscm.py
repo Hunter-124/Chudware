@@ -24,6 +24,8 @@ import threading
 import time
 from typing import Any
 
+from services.plm.git_security import git_argv, git_env, valid_name, validate_location
+
 # ---------------------------------------------------------------------------
 # process helpers
 # ---------------------------------------------------------------------------
@@ -32,6 +34,18 @@ _TIMEOUT = 60  # seconds — network ops (push/pull/gh) can be slow but not fore
 _GH_AUTH_START_TIMEOUT_S = 8.0
 _gh_auth_lock = threading.Lock()
 _gh_auth_job: dict[str, Any] | None = None
+
+
+def worker_activity() -> dict:
+    from services.worker_activity import registry_lock
+
+    with registry_lock(_gh_auth_lock):
+        job = _gh_auth_job
+        proc = job["process"] if job is not None else None
+        running = proc is not None and proc.poll() is None
+        reader = job is not None and not job["reader_done"]
+    return {"by_kind": {"github_login": int(running or reader)},
+            "processes": [proc] if running else []}
 
 
 def _have(binary: str) -> bool:
@@ -52,9 +66,7 @@ def _run(args: list[str], cwd: str, *, timeout: int = _TIMEOUT,
     if check_repo and not os.path.isdir(cwd):
         return {"ok": False, "code": 2, "out": "", "err": "no such folder"}
     try:
-        # Keep git non-interactive: never prompt for credentials on the GL thread.
-        env = dict(os.environ)
-        env.setdefault("GIT_TERMINAL_PROMPT", "0")
+        env = git_env() if binary == "git" else dict(os.environ)
         p = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
                            timeout=timeout, env=env)
         return {"ok": p.returncode == 0, "code": p.returncode,
@@ -66,7 +78,7 @@ def _run(args: list[str], cwd: str, *, timeout: int = _TIMEOUT,
 
 
 def _git(args: list[str], cwd: str, **kw) -> dict:
-    return _run(["git", *args], cwd, **kw)
+    return _run(git_argv(args), cwd, **kw)
 
 
 def _gh(args: list[str], cwd: str, **kw) -> dict:
@@ -85,6 +97,41 @@ def _gh_missing() -> dict:
     return _fail("gh_missing",
                  "The GitHub CLI (gh) is not installed — GitHub features are "
                  "unavailable, but local git still works.")
+
+
+def _revision(path: str, ref: str) -> dict:
+    if (not isinstance(ref, str) or ref.startswith("-")
+            or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_./-]*(?:[~^][0-9]*)*", ref)):
+        return _fail("invalid_ref", "Use a commit id or a branch/tag revision, not an option.")
+    return _git(["rev-parse", "--verify", "--end-of-options", ref + "^{commit}"], path)
+
+
+def _network_remote(path: str, remote: str = "") -> dict | None:
+    if remote and not valid_name(remote):
+        return _fail("invalid_remote", "Use a configured remote name, not an option or URL.")
+    configured = _git(["config", "--get-regexp", r"^remote\..*\.(url|pushurl|uploadpack|receivepack)$"], path)
+    if configured["code"] not in (0, 1):
+        return _fail("invalid_remote", "Could not inspect remote configuration.")
+    names = set()
+    for line in configured["out"].splitlines():
+        key, _, value = line.partition(" ")
+        name, _, field = key[len("remote."):].rpartition(".")
+        if remote and name != remote:
+            continue
+        names.add(name)
+        if field in ("uploadpack", "receivepack"):
+            return _fail("invalid_remote", "Custom remote executables are not allowed.")
+        try:
+            validate_location(value)
+        except ValueError as exc:
+            return _fail("invalid_remote", str(exc))
+    if remote and remote not in names:
+        return _fail("invalid_remote", "Use a configured remote name.")
+    # URL rewrite rules can silently select a helper transport or destination.
+    rewrites = _git(["config", "--get-regexp", r"^url\..*\.(insteadof|pushinsteadof)$"], path)
+    if rewrites["code"] != 1:
+        return _fail("invalid_remote", "URL rewrite rules are not allowed for PLM Git sync.")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +214,10 @@ def log(path: str, limit: int = 50, ref: str = "") -> dict:
     fmt = sep.join(["%h", "%an", "%aI", "%s"])
     args = ["log", f"--pretty=format:{fmt}", f"-n{max(1, int(limit))}"]
     if ref:
-        args.append(ref)
+        revision = _revision(path, ref)
+        if not revision["ok"]:
+            return _fail("invalid_ref", revision.get("hint") or revision["err"])
+        args += ["--end-of-options", revision["out"].strip()]
     r = _git(args, path)
     if not r["ok"]:
         # empty repo (no commits) is not an error — return an empty list
@@ -239,7 +289,12 @@ def tree(path: str, ref: str = "HEAD") -> dict:
     """Tracked files at *ref* (flat list of repo-relative paths)."""
     if not _have("git"):
         return _git_missing()
-    r = _git(["ls-tree", "-r", "--name-only", ref or "HEAD"], path)
+    revision = _revision(path, ref or "HEAD")
+    if not revision["ok"]:
+        if revision.get("reason") == "invalid_ref":
+            return revision
+        return {"ok": True, "files": []}
+    r = _git(["ls-tree", "-r", "--name-only", revision["out"].strip()], path)
     if not r["ok"]:
         if "Not a valid object name" in r["err"] or "unknown revision" in r["err"]:
             return {"ok": True, "files": []}  # no commits yet
@@ -255,7 +310,10 @@ def file_at(path: str, file: str, ref: str = "HEAD",
         return _git_missing()
     if not file:
         return _fail("invalid", "no file given")
-    r = _git(["show", f"{ref or 'HEAD'}:{file}"], path)
+    revision = _revision(path, ref or "HEAD")
+    if not revision["ok"]:
+        return _fail("invalid_ref", revision.get("hint") or revision["err"])
+    r = _git(["show", "--end-of-options", f"{revision['out'].strip()}:{file}"], path)
     if not r["ok"]:
         return _fail("show_failed", r["err"] or "could not read file")
     text = r["out"]
@@ -268,7 +326,7 @@ def diff(path: str, file: str = "", staged: bool = False) -> dict:
     """Unified diff for a file (or the whole tree when *file* is empty)."""
     if not _have("git"):
         return _git_missing()
-    args = ["diff"]
+    args = ["diff", "--no-ext-diff", "--no-textconv"]
     if staged:
         args.append("--cached")
     if file:
@@ -324,8 +382,8 @@ def commit(path: str, message: str, stage_all: bool = False) -> dict:
 def create_branch(path: str, name: str, checkout: bool = True) -> dict:
     if not _have("git"):
         return _git_missing()
-    if not (name or "").strip():
-        return _fail("invalid", "a branch needs a name")
+    if not valid_name(name):
+        return _fail("invalid", "a branch needs a valid non-option name")
     args = ["checkout", "-b", name] if checkout else ["branch", name]
     r = _git(args, path)
     if not r["ok"]:
@@ -336,7 +394,9 @@ def create_branch(path: str, name: str, checkout: bool = True) -> dict:
 def checkout_branch(path: str, name: str) -> dict:
     if not _have("git"):
         return _git_missing()
-    r = _git(["checkout", name], path)
+    if not valid_name(name):
+        return _fail("invalid", "a branch needs a valid non-option name")
+    r = _git(["checkout", name, "--"], path)
     if not r["ok"]:
         return _fail("checkout_failed", r["err"] or "could not switch branch")
     return {"ok": True}
@@ -345,7 +405,10 @@ def checkout_branch(path: str, name: str) -> dict:
 def fetch(path: str, remote: str = "") -> dict:
     if not _have("git"):
         return _git_missing()
-    args = ["fetch", "--prune"] + ([remote] if remote else ["--all"])
+    refusal = _network_remote(path, remote)
+    if refusal:
+        return refusal
+    args = ["fetch", "--prune", "--", remote] if remote else ["fetch", "--prune", "--all"]
     r = _git(args, path)
     if not r["ok"]:
         return _fail("fetch_failed", r["err"] or "could not fetch")
@@ -355,6 +418,9 @@ def fetch(path: str, remote: str = "") -> dict:
 def pull(path: str) -> dict:
     if not _have("git"):
         return _git_missing()
+    refusal = _network_remote(path)
+    if refusal:
+        return refusal
     r = _git(["pull", "--ff-only"], path)
     if not r["ok"]:
         return _fail("pull_failed", r["err"] or "could not pull")
@@ -364,6 +430,9 @@ def pull(path: str) -> dict:
 def push(path: str, set_upstream: bool = False) -> dict:
     if not _have("git"):
         return _git_missing()
+    refusal = _network_remote(path)
+    if refusal:
+        return refusal
     args = ["push"]
     if set_upstream:
         # push the current branch and set its upstream in one shot
@@ -492,8 +561,9 @@ def gh_auth_login(path: str = ".", hostname: str = "") -> dict:
     }
     with _gh_auth_lock:
         _gh_auth_job = job
-    threading.Thread(target=_read_gh_auth_output, args=(proc, job),
-                     name="gh-auth-login-output", daemon=True).start()
+    from services.worker_activity import start_background_thread
+
+    start_background_thread(_read_gh_auth_output, args=(proc, job), name="gh-auth-login-output")
 
     deadline = time.monotonic() + _GH_AUTH_START_TIMEOUT_S
     while True:

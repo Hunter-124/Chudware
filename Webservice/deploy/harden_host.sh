@@ -340,23 +340,13 @@ fi
 if show gateway; then
   note "gateway: disable terminal and shared host provider keys"
   prod_env="$SVC_HOME/chudware-web-data/gateway.env"
-  stage_env="$SVC_HOME/chudware-web-staging/gateway.env"
   if want gateway; then
     set_env_value "$prod_env" CHUDWARE_WEB_TERMINAL_ENABLED 0
     set_env_value "$prod_env" CHUDWARE_WEB_SHARE_PROVIDER_KEYS 0
-    if [[ -f "$stage_env" ]]; then
-      set_env_value "$stage_env" CHUDWARE_WEB_TERMINAL_ENABLED 0
-      set_env_value "$stage_env" CHUDWARE_WEB_SHARE_PROVIDER_KEYS 0
-    fi
     user_systemctl restart chudware-gateway.service
     user_systemctl is-active --quiet chudware-gateway.service ||
       die "production gateway did not become active after hardening flags"
-    if user_systemctl cat chudware-gateway-staging.service >/dev/null 2>&1; then
-      user_systemctl restart chudware-gateway-staging.service
-      user_systemctl is-active --quiet chudware-gateway-staging.service ||
-        die "staging gateway did not become active after hardening flags"
-    fi
-    did "set both flags to 0 and restarted every installed gateway"
+    did "set production flags to 0 and restarted the production gateway; staging has a separate service identity"
   else
     would "set CHUDWARE_WEB_TERMINAL_ENABLED=0 and CHUDWARE_WEB_SHARE_PROVIDER_KEYS=0; restart gateways"
   fi

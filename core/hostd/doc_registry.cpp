@@ -3,6 +3,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cstdlib>
+#include <string_view>
 
 #include "hostd_log.h"
 
@@ -20,7 +21,7 @@ static long long monoMs() {
 
 // Read-only allowlist (see the header for the rationale). Exact names first,
 // then prefixes. Everything else that carries a doc_id counts as MUTATING.
-bool DocRegistry::isReadOnlyMethod(const std::string& m) {
+static bool isDocumentReadOnlyMethod(const std::string& m) {
     static const std::set<std::string> kExact = {
         // doc reads
         "doc_list", "doc_tree", "doc_query", "doc_bbox", "doc_adjacency",
@@ -62,6 +63,34 @@ bool DocRegistry::isReadOnlyMethod(const std::string& m) {
     for (const auto& p : kPrefixes)
         if (m.rfind(p, 0) == 0) return true;
     return false;
+}
+
+bool DocRegistry::isDesktopReadOnlyMethod(const std::string& m) {
+    return isDocumentReadOnlyMethod(m);
+}
+
+bool DocRegistry::isReadOnlyMethod(const std::string& m) {
+    // Cell authorization must not treat whole agent/sim/export families as reads.
+    // Keep desktop document-only semantics separate from this security allowlist.
+    static const std::set<std::string> reads = {
+        "doc_list", "doc_tree", "doc_query", "doc_bbox", "doc_adjacency",
+        "doc_get_meta", "doc_validate", "doc_resolve_pick", "doc_activate",
+        "doc_rebuild", "doc_dry_run_ops", "doc_dep_query", "doc_drawing_views",
+        "doc_sketch_overview", "doc_sketch_regions", "doc_view_metrics", "doc_snapshot",
+        "doc_face_edges", "doc_face_points", "doc_face_wires", "doc_formats", "doc_list_ops",
+        "doc_render_contact_sheet", "doc_render_diff", "doc_render_png", "doc_render_view",
+        "asm_world_bodies", "config_list", "sim_study_list", "weld_cut_list",
+        "sketch_health", "sketch3d_health", "sketch_probe",
+        "drawing_get", "drawing_bom", "drawing_model_items", "drawing_list_sheets",
+        "drawing_render_png", "cam_describe", "cam_tree", "cam_extract", "cam_extract_from_doc",
+        "ecad_describe", "ecad_tree", "ecad_resolve_pick", "ecad_dfm",
+        "eval_check", "eval_compare", "eval_curvature", "eval_draft", "eval_feature_attachment",
+        "eval_feature_overlap", "eval_fit_cylinder", "eval_geometry_analysis", "eval_interference",
+        "eval_mass", "eval_measure", "eval_model_integrity", "eval_section_props",
+        "eval_solid_health", "eval_symmetry", "eval_thickness",
+        "mesh_read_raw", "sim_map_to_surface", "worker_normalize_face_query"
+    };
+    return reads.count(m) != 0;
 }
 
 // Mutating responses carry a top-level "revision" (ops_response / doc_tree /
@@ -158,10 +187,57 @@ void DocRegistry::updateOrphanDeadlineLocked(DocState& d) {
     if (d.orphanDeadlineMs == 0) d.orphanDeadlineMs = monoMs() + grace;
 }
 
+void DocRegistry::setWriterGroup(int clientId, const std::string& writerGroup) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (writerGroup.empty()) writerGroups_.erase(clientId);
+    else writerGroups_[clientId] = writerGroup;
+}
+
+void DocRegistry::setCellPrincipal(int clientId, const std::string& actorKey, bool readOnly) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    cellPrincipals_[clientId] = CellPrincipal{actorKey, readOnly};
+    if (!readOnly) return;
+    for (auto& [id, d] : docs_) {
+        auto it = d.attach.find(clientId);
+        if (it != d.attach.end()) it->second.mode = "ro";
+        if (d.hold.active && d.hold.clientId == clientId) d.hold = Hold{};
+    }
+}
+
+const std::string& DocRegistry::writerGroupLocked(int clientId) const {
+    static const std::string empty;
+    const auto it = writerGroups_.find(clientId);
+    return it == writerGroups_.end() ? empty : it->second;
+}
+
+bool DocRegistry::sameWriterLocked(int a, int b) const {
+    if (a == b) return true;
+    const auto& group = writerGroupLocked(a);
+    return !group.empty() && group == writerGroupLocked(b);
+}
+
+long& DocRegistry::lastSeenRevLocked(DocState& d, int clientId) {
+    const auto& group = writerGroupLocked(clientId);
+    if (group.empty()) return d.attach[clientId].lastSeenRev;
+    return d.groupLastSeenRev.try_emplace(group, -1).first->second;
+}
+
+void DocRegistry::forgetDetachedGroupLocked(DocState& d, int clientId) {
+    const auto& group = writerGroupLocked(clientId);
+    if (group.empty()) return;
+    for (const auto& [cid, a] : d.attach)
+        if (sameWriterLocked(cid, clientId)) return;
+    d.groupLastSeenRev.erase(group);
+}
+
 int DocRegistry::rwCountLocked(const DocState& d) const {
     int n = 0;
-    for (const auto& [id, a] : d.attach)
-        if (a.mode == "rw") ++n;
+    std::set<std::string_view> groups;
+    for (const auto& [id, a] : d.attach) {
+        if (a.mode != "rw") continue;
+        const auto& group = writerGroupLocked(id);
+        if (group.empty() || groups.insert(group).second) ++n;
+    }
     return n;
 }
 
@@ -178,6 +254,10 @@ void DocRegistry::fanoutLocked(const std::string& docId, const json& evt, int ex
     const std::string line = evt.dump();
     for (const auto& [cid, ids] : subs_) {
         if (cid == exceptClient) continue;
+        if (cellPrincipals_.count(cid)) {
+            auto doc = docs_.find(docId);
+            if (doc == docs_.end() || !doc->second.attach.count(cid)) continue;
+        }
         if (ids.count("*") || ids.count(docId)) out.push_back({cid, line});
     }
 }
@@ -284,6 +364,8 @@ bool DocRegistry::handleMethod(int clientId, const std::string& kind,
 
         if (method == "attach_doc") {
             std::string mode = params.value("mode", std::string("rw"));
+            if (cellPrincipals_.count(clientId) && cellPrincipals_.at(clientId).readOnly &&
+                mode == "rw") mode = "ro";
             if (mode != "rw" && mode != "ro") {
                 isError = true;
                 result = json{{"code", "invalid_params"},
@@ -296,12 +378,15 @@ bool DocRegistry::handleMethod(int clientId, const std::string& kind,
                 std::string otherWriter;
                 if (mode == "rw") {
                     for (const auto& [cid, a] : d.attach)
-                        if (cid != clientId && a.mode == "rw")
+                        if (!sameWriterLocked(cid, clientId) && a.mode == "rw")
                             otherWriter = kind + "#" + std::to_string(cid);
                 }
                 Attach& a = d.attach[clientId];
                 a.mode = mode;
-                if (a.lastSeenRev < 0) a.lastSeenRev = d.revision;
+                long& seen = lastSeenRevLocked(d, clientId);
+                if (seen < 0) seen = d.revision;
+                // attach_doc itself returns the current revision to every member.
+                if (!writerGroupLocked(clientId).empty()) seen = std::max(seen, d.revision);
                 updateOrphanDeadlineLocked(d);
                 result = json{{"ok", true}, {"mode", mode}, {"revision", d.revision}};
                 if (!otherWriter.empty()) {
@@ -317,6 +402,7 @@ bool DocRegistry::handleMethod(int clientId, const std::string& kind,
                 auto ait = d.attach.find(clientId);
                 const bool wasRw = ait != d.attach.end() && ait->second.mode == "rw";
                 if (ait != d.attach.end()) d.attach.erase(ait);
+                forgetDetachedGroupLocked(d, clientId);
                 if (d.hold.active && d.hold.clientId == clientId) d.hold = Hold{};
                 updateOrphanDeadlineLocked(d);
                 if (wasRw && rwCountLocked(d) == 0 && !d.internal) {
@@ -331,9 +417,14 @@ bool DocRegistry::handleMethod(int clientId, const std::string& kind,
             }
             result = json{{"ok", true}};
         } else if (method == "edit_hold") {
+            if (cellPrincipals_.count(clientId) && cellPrincipals_.at(clientId).readOnly) {
+                isError = true;
+                result = json{{"code", "forbidden_right"}, {"message", "viewer cannot edit"}};
+                return true;
+            }
             DocState& d = docs_[docId];
             expireHoldLocked(docId, d, pending);
-            if (d.hold.active && d.hold.clientId != clientId) {
+            if (d.hold.active && !sameWriterLocked(d.hold.clientId, clientId)) {
                 isError = true;
                 result = json{{"code", "busy_preview"},
                               {"message", "doc is held by another client"},
@@ -341,7 +432,10 @@ bool DocRegistry::handleMethod(int clientId, const std::string& kind,
                               {"retry_ms", 500}};
             } else {
                 const bool fresh = !d.hold.active;
-                d.hold = Hold{true, clientId, kind, monoMs() + (long long)holdSecs() * 1000};
+                if (fresh) d.hold = Hold{true, clientId, kind, 0};
+                // A group member refreshes the lease without stealing the connection
+                // that owns its detach/disconnect lifetime.
+                d.hold.deadlineMs = monoMs() + (long long)holdSecs() * 1000;
                 if (fresh && !d.internal) {  // internal docs announce no lease state
                     json evt = {{"event", "doc.lease_change"},
                                 {"data", {{"doc_id", docId},
@@ -354,7 +448,7 @@ bool DocRegistry::handleMethod(int clientId, const std::string& kind,
         } else if (method == "edit_release") {
             auto it = docs_.find(docId);
             if (it != docs_.end() && it->second.hold.active &&
-                it->second.hold.clientId == clientId) {
+                sameWriterLocked(it->second.hold.clientId, clientId)) {
                 it->second.hold = Hold{};
                 if (!it->second.internal) {  // internal docs announce no lease state
                     json evt = {{"event", "doc.lease_change"},
@@ -388,7 +482,7 @@ bool DocRegistry::handleMethod(int clientId, const std::string& kind,
 
 bool DocRegistry::preCall(int clientId, const std::string& kind, const std::string& /*userId*/,
                           const std::string& /*userDisplay*/, const std::string& method,
-                          json& params, json& err, std::string& warning) {
+                          json& params, json& err, std::string& warning, bool cellPolicyRead) {
     // Agent undo gating (P2 multi-user): interactive undo/redo is human-only.
     // Agents keep doc_checkpoint/doc_revert + autosave/PLM for rollback. Kill-switch
     // CHUDWARE_UNDO_AGENTS=1 restores the old free-for-all behaviour.
@@ -403,10 +497,25 @@ bool DocRegistry::preCall(int clientId, const std::string& kind, const std::stri
         }
     }
 
-    if (isReadOnlyMethod(method)) return true;
     const std::string docId =
         params.is_object() ? params.value("doc_id", std::string()) : std::string();
-    if (docId.empty()) return true;  // doc_new/doc_open etc. mint; nothing to guard yet
+    // Document-free methods (including mint admission) are governed by the server's
+    // authoritative cell method policy, not this document attachment gate.
+    if (docId.empty()) return true;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto principal = cellPrincipals_.find(clientId);
+        if (principal != cellPrincipals_.end() && principal->second.readOnly &&
+            !cellPolicyRead && !isReadOnlyMethod(method)) {
+            err = json{{"code", "forbidden_right"}, {"message", "viewer cannot edit"}};
+            return false;
+        }
+        if (principal == cellPrincipals_.end() && isDocumentReadOnlyMethod(method))
+            return true;
+        if (principal != cellPrincipals_.end() &&
+            (cellPolicyRead || isReadOnlyMethod(method))) return true;
+    }
+    // A protected document operation reaches the attachment/hold gate below.
 
     std::vector<PendingEvent> pending;
     bool ok = true;
@@ -416,7 +525,7 @@ bool DocRegistry::preCall(int clientId, const std::string& kind, const std::stri
         expireHoldLocked(docId, d, pending);
 
         // Edit-hold: someone (typically the GUI mid-preview) has exclusive edit.
-        if (d.hold.active && d.hold.clientId != clientId) {
+        if (d.hold.active && !sameWriterLocked(d.hold.clientId, clientId)) {
             err = json{{"code", "busy_preview"},
                        {"message", "doc is held for editing by " + d.hold.kind +
                                        "; retry shortly"},
@@ -424,7 +533,7 @@ bool DocRegistry::preCall(int clientId, const std::string& kind, const std::stri
                        {"retry_ms", 500}};
             ok = false;
         } else {
-            if (d.hold.active && d.hold.clientId == clientId)  // refresh on re-call
+            if (d.hold.active)  // same writer (including a group member): refresh
                 d.hold.deadlineMs = monoMs() + (long long)holdSecs() * 1000;
 
             auto ait = d.attach.find(clientId);
@@ -442,28 +551,30 @@ bool DocRegistry::preCall(int clientId, const std::string& kind, const std::stri
                     // Unattached mutator: implicit rw attach (compat with every
                     // pre-registry flow), warning when a writer already exists.
                     for (const auto& [cid, a] : d.attach)
-                        if (cid != clientId && a.mode == "rw")
+                        if (!sameWriterLocked(cid, clientId) && a.mode == "rw")
                             warning = "doc has another writer: client#" + std::to_string(cid);
                     Attach& a = d.attach[clientId];
                     a.mode = "rw";
-                    if (a.lastSeenRev < 0) a.lastSeenRev = d.revision;
+                    long& seen = lastSeenRevLocked(d, clientId);
+                    if (seen < 0) seen = d.revision;
                     updateOrphanDeadlineLocked(d);
                     ait = d.attach.find(clientId);
                 }
                 // Overlap CAS — only when the doc actually has >1 writer, so the
                 // single-writer path stays byte-identical to Phase 1/2.
-                if (rwCountLocked(d) > 1 && ait->second.lastSeenRev >= 0) {
+                const long seen = lastSeenRevLocked(d, clientId);
+                if (rwCountLocked(d) > 1 && seen >= 0) {
                     if (method == "doc_apply_ops") {
                         if (!params.contains("base_revision"))
-                            params["base_revision"] = ait->second.lastSeenRev;
+                            params["base_revision"] = seen;
                     } else if (method == "doc_undo" || method == "doc_redo") {
                         // The engine's undo/redo take no base_revision, so the CAS
                         // check lives here: reject when the caller's view is stale
                         // (same envelope the engine emits for apply_ops races).
-                        if (d.revision >= 0 && d.revision != ait->second.lastSeenRev) {
+                        if (d.revision >= 0 && d.revision != seen) {
                             err = json{{"code", "stale_revision"},
                                        {"message", "base_revision " +
-                                                       std::to_string(ait->second.lastSeenRev) +
+                                                       std::to_string(seen) +
                                                        " != current " +
                                                        std::to_string(d.revision)},
                                        {"detail", {{"doc_id", docId},
@@ -514,7 +625,32 @@ static json snapshotPayload(const std::string& docId, long rev, int clientId,
         if (result["rebuild"].contains("feature_status"))
             data["feature_status"] = result["rebuild"]["feature_status"];
     }
+    for (const char* key : {"cache_trust", "cache_verification", "warnings", "mismatch", "warning"})
+        if (result.contains(key)) data[key] = result[key];
     return data;
+}
+
+void DocRegistry::publishCacheRefresh(const std::string& docId, const json& response) {
+    std::vector<PendingEvent> pending;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = docs_.find(docId);
+        if (it == docs_.end() || it->second.internal || !response.is_object()) return;
+        DocState& d = it->second;
+        const long revision = sniffRevision(response);
+        if (revision < 0 || revision != d.revision) return;
+        json data = d.lastPush.is_object() ? d.lastPush : json::object();
+        data.update(snapshotPayload(docId, revision, d.lastWriterClient,
+            d.lastWriterKind, d.lastWriterMethod, d.lastWriterUserId,
+            d.lastWriterUserDisplay, response));
+        if (!d.lastWriterActorKey.empty()) data["actor_key"] = d.lastWriterActorKey;
+        d.lastPush = std::move(data);
+        const std::string line = json{{"event", "doc.changed"}, {"data", d.lastPush}}.dump();
+        for (const auto& [cid, ids] : subs_)
+            if (d.attach.count(cid) && (ids.count("*") || ids.count(docId)))
+                pending.push_back({cid, line});
+    }
+    flush(pending);
 }
 
 void DocRegistry::postCall(int clientId, const std::string& kind, const std::string& userId,
@@ -568,15 +704,19 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
         if (minted) {
             // The client whose call minted the doc gets rw implicitly.
             Attach& a = d.attach[clientId];
-            a.mode = "rw";
+            a.mode = cellPrincipals_.count(clientId) && cellPrincipals_.at(clientId).readOnly
+                         ? "ro" : "rw";
             updateOrphanDeadlineLocked(d);
-            a.lastSeenRev = rev;
+            lastSeenRevLocked(d, clientId) = rev;
             d.revision = rev;
             d.lastWriterClient = clientId;
+            d.lastWriterGroup = writerGroupLocked(clientId);
             d.lastWriterKind = kind;
             d.lastWriterMethod = method;
             d.lastWriterUserId = userId;
             d.lastWriterUserDisplay = userDisplay;
+            if (cellPrincipals_.count(clientId))
+                d.lastWriterActorKey = cellPrincipals_.at(clientId).actorKey;
             d.originKind = kind;  // who created it — user (gui) vs AI (mcp/agent)
             // {"internal":true} on the MINTING request marks a doc the daemon must never
             // announce. find() is safe on a null/non-object params and a non-bool value
@@ -620,6 +760,8 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                 result["tree"].is_object())
                 d.lastPush = snapshotPayload(docId, rev, clientId, kind, method, userId,
                                              userDisplay, result);
+            if (!d.lastPush.is_null() && !d.lastWriterActorKey.empty())
+                d.lastPush["actor_key"] = d.lastWriterActorKey;
             // "name" lets a subscriber title the doc's tab on the spot instead of
             // chasing a doc_tree round-trip (which takes the doc's engine lock while
             // the minting client is still mid-op). Omitted when the minting response
@@ -631,6 +773,7 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                          {"origin_kind", kind},
                          {"method", method},
                          {"user", {{"id", userId}, {"display", userDisplay}}}};
+            if (!d.lastWriterActorKey.empty()) data["actor_key"] = d.lastWriterActorKey;
             if (const std::string nm = sniffName(result); !nm.empty()) data["name"] = nm;
             json evt = {{"event", "doc.opened"}, {"data", data}};
             fanoutLocked(docId, evt, fanoutExclude, pending);
@@ -641,10 +784,16 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
         // _foreign_edits piggyback — BEFORE this call updates our last-seen: if
         // another client advanced the doc since this client's last touch, say so
         // in the result envelope (cad_tools turns it into a tool-output note).
-        Attach& a = d.attach[clientId];  // observer entry (mode "") for pure readers
+        Attach& observer = d.attach[clientId];
+        if (cellPrincipals_.count(clientId) && cellPrincipals_.at(clientId).readOnly &&
+            observer.mode.empty()) observer.mode = "ro";
+        long& seen = lastSeenRevLocked(d, clientId);
+        const auto& group = writerGroupLocked(clientId);
         updateOrphanDeadlineLocked(d);   // any live touch resets the GC countdown
-        if (result.is_object() && a.lastSeenRev >= 0 && d.revision > a.lastSeenRev &&
-            d.lastWriterClient != clientId && d.lastWriterClient != -1) {
+        const bool ownWrite = d.lastWriterClient == clientId ||
+                              (!group.empty() && group == d.lastWriterGroup);
+        if (result.is_object() && seen >= 0 && d.revision > seen &&
+            !ownWrite && d.lastWriterClient != -1) {
             result["_foreign_edits"] = json::array({json{
                 {"doc_id", docId},
                 {"revision", d.revision},
@@ -652,23 +801,31 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                 {"method", d.lastWriterMethod},
                 {"user", {{"id", d.lastWriterUserId},
                           {"display", d.lastWriterUserDisplay}}}}});
+            if (!d.lastWriterActorKey.empty())
+                result["_foreign_edits"][0]["actor_key"] = d.lastWriterActorKey;
         }
 
         if (rev >= 0) {
             const bool advanced = rev > d.revision && d.revision >= 0;
             if (rev > d.revision) d.revision = rev;
-            a.lastSeenRev = rev;
-            if (advanced && !isReadOnlyMethod(method)) {
+            // Concurrent responses may arrive out of revision order. A shared
+            // writer must never forget a newer revision seen by another member.
+            seen = group.empty() ? rev : std::max(seen, rev);
+            if (advanced && !isDocumentReadOnlyMethod(method)) {
                 d.lastWriterClient = clientId;
+                d.lastWriterGroup = group;
                 d.lastWriterKind = kind;
                 d.lastWriterMethod = method;
                 d.lastWriterUserId = userId;
                 d.lastWriterUserDisplay = userDisplay;
+                d.lastWriterActorKey = cellPrincipals_.count(clientId)
+                    ? cellPrincipals_.at(clientId).actorKey : std::string();
                 // No doc.changed for an internal doc (DocState::internal): no subscriber
                 // was told it opened, and the payload below copies the whole tree.
                 if (!d.internal) {
                     json data = snapshotPayload(docId, rev, clientId, kind, method, userId,
                                                 userDisplay, result);
+                    if (!d.lastWriterActorKey.empty()) data["actor_key"] = d.lastWriterActorKey;
                     // Keep the payload so a mirror tab that appears AFTER this push can
                     // still be populated without a doc_activate (see DocState::lastPush).
                     d.lastPush = data;
@@ -677,22 +834,29 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                 }
             } else if (advanced && !d.internal && method.rfind("sim_study_", 0) == 0 &&
                        method != "sim_study_list") {
-                // Study add/edit/delete stays read-only for ACCESS (a GUI viewer may edit the
-                // studies of an agent's doc) but it is a real revision with no tree, so it is
-                // announced on its own event instead of a doc.changed the mirror would reject.
+                if (cellPrincipals_.count(clientId)) {
+                    d.lastWriterClient = clientId;
+                    d.lastWriterGroup = group;
+                    d.lastWriterKind = kind;
+                    d.lastWriterMethod = method;
+                    d.lastWriterUserId = userId;
+                    d.lastWriterUserDisplay = userDisplay;
+                    d.lastWriterActorKey = cellPrincipals_.at(clientId).actorKey;
+                }
+                // Desktop viewers may edit studies; cell viewers are denied by the
+                // exact write policy. Study revisions have no tree, so use their
+                // dedicated event rather than a doc.changed snapshot.
                 // Without it an agent's persisted FEA/motion study never reached an open
                 // Simulation tree until some unrelated edit bumped the mirror's revision.
-                fanoutLocked(docId,
-                             json{{"event", "doc.studies_changed"},
-                                  {"data", {{"doc_id", docId},
-                                            {"revision", rev},
-                                            {"source_client", clientId},
-                                            {"source_kind", kind},
-                                            {"method", method}}}},
+                json data = {{"doc_id", docId}, {"revision", rev},
+                             {"source_client", clientId}, {"source_kind", kind},
+                             {"method", method}};
+                if (!d.lastWriterActorKey.empty()) data["actor_key"] = d.lastWriterActorKey;
+                fanoutLocked(docId, json{{"event", "doc.studies_changed"}, {"data", std::move(data)}},
                              fanoutExclude, pending);
             }
-        } else if (a.lastSeenRev < 0) {
-            a.lastSeenRev = d.revision;  // first touch via a rev-less response
+        } else if (seen < 0) {
+            seen = d.revision;  // first touch via a rev-less response
         }
     }
     flush(pending);
@@ -728,10 +892,17 @@ void DocRegistry::onDisconnect(int clientId, const std::string& kind) {
             const bool wasRw = ait != d.attach.end() && ait->second.mode == "rw";
             if (heldHere) d.hold = Hold{};
             if (ait != d.attach.end()) d.attach.erase(ait);
+            forgetDetachedGroupLocked(d, clientId);
+            bool writerRemains = false;
+            for (const auto& [cid, a] : d.attach)
+                if (a.mode == "rw" && sameWriterLocked(cid, clientId)) {
+                    writerRemains = true;
+                    break;
+                }
             updateOrphanDeadlineLocked(d);
             // Internal docs (DocState::internal) hold no announced lease: nobody was
             // ever told they exist, so there is no lease state to correct.
-            if ((heldHere || wasRw) && !d.internal) {
+            if ((heldHere || (wasRw && !writerRemains)) && !d.internal) {
                 json evt = {{"event", "doc.lease_change"},
                             {"data", {{"doc_id", docId},
                                       {"holder", kind},
@@ -751,13 +922,15 @@ void DocRegistry::onDisconnect(int clientId, const std::string& kind) {
                 fanoutLocked(docId, evt, clientId, pending);
             }
         }
+        writerGroups_.erase(clientId);
+        cellPrincipals_.erase(clientId);
     }
     flush(pending);
 }
 
 // ------------------------------------------------------------- ownership reads
 
-void DocRegistry::annotateDocList(json& result) {
+void DocRegistry::annotateDocList(json& result, int clientId) {
     if (!result.is_object() || !result.contains("docs") || !result["docs"].is_array())
         return;
     std::lock_guard<std::mutex> lk(mtx_);
@@ -770,6 +943,7 @@ void DocRegistry::annotateDocList(json& result) {
     json kept = json::array();
     for (auto& e : result["docs"]) {
         if (!e.is_object()) { kept.push_back(std::move(e)); continue; }
+        e["other_writer"] = false;
         const std::string id = e.value("doc_id", std::string());
         if (id.empty()) { kept.push_back(std::move(e)); continue; }
         auto it = docs_.find(id);
@@ -777,12 +951,24 @@ void DocRegistry::annotateDocList(json& result) {
         e["origin_kind"] = (it != docs_.end() && !it->second.originKind.empty())
                                ? it->second.originKind
                                : std::string("unknown");
+        if (it != docs_.end()) {
+            if (!it->second.lastWriterActorKey.empty())
+                e["lastWriter"] = {{"actor_key", it->second.lastWriterActorKey}};
+            for (const auto& [cid, attach] : it->second.attach) {
+                if (attach.mode == "rw" && !sameWriterLocked(cid, clientId)) {
+                    e["other_writer"] = true;
+                    break;
+                }
+            }
+        }
         kept.push_back(std::move(e));
     }
     result["docs"] = std::move(kept);
 }
 
 bool DocRegistry::hasOtherRwWriter(const std::string& docId, int clientId) {
+    // This is a document-lifetime check, not edit ownership: even another member
+    // of the same writer group still needs the live doc when this connection closes.
     std::lock_guard<std::mutex> lk(mtx_);
     auto it = docs_.find(docId);
     if (it == docs_.end()) return false;

@@ -12,6 +12,7 @@
 #include "ui/ai/ai_prefs.h"           // cached chat-display prefs (Settings -> AI -> Harness)
 #include "gl_compat.h"                // glDeleteTextures — bounded artifact texture cache
 #include "util/time_local.h"
+#include "ui/file_dialog.h"
 
 namespace ui {
 
@@ -234,7 +235,8 @@ static void paintSoftShell(ImDrawList* dl, const ImRect& r, float rnd, ImU32 fil
 }
 
 static RowShell beginRowShell(const char* id, ui::kit::Tone tone, float wash, float edge,
-                              bool interactive = false, float openE = 0.0f) {
+                              bool interactive = false, float openE = 0.0f,
+                              bool measureOffscreen = false) {
     RowShell sh;
     sh.dl     = ImGui::GetWindowDrawList();
     sh.origin = ImGui::GetCursorScreenPos();
@@ -252,7 +254,8 @@ static RowShell beginRowShell(const char* id, ui::kit::Tone tone, float wash, fl
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                         ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::kit::rowGap()));
     ImGui::BeginChild(id, ImVec2(0, 0),
-                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding |
+                      (measureOffscreen ? ImGuiChildFlags_AlwaysAutoResize : ImGuiChildFlags_None));
     return sh;
 }
 
@@ -1098,15 +1101,6 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
 // Shared by the inline chat artifact rows (tool-call files/images) and the Session Artifacts
 // panel: open with the OS default handler, or reveal in the OS file manager. Warn-toasts when
 // the file is gone (moved/deleted after the run).
-static std::string chatShellQuote(std::string s) {
-    std::string out;
-    out.reserve(s.size() + 2);
-    for (char c : s) {
-        if (c == '"' || c == '\\' || c == '$' || c == '`') out.push_back('\\');
-        out.push_back(c);
-    }
-    return out;
-}
 
 static bool chatArtifactExists(const std::string& path) {
     namespace fs = std::filesystem;
@@ -1120,15 +1114,8 @@ static void chatArtifactOpen(AppState& st, const std::string& path) {
         st.toast(ui::ToastLevel::Warn, "File not found: " + fs::path(path).filename().string());
         return;
     }
-    const std::string q = chatShellQuote(path);
-#ifdef _WIN32
-    std::string cmd = "start \"\" \"" + q + "\"";
-#elif defined(__APPLE__)
-    std::string cmd = "open \"" + q + "\"";
-#else
-    std::string cmd = "xdg-open \"" + q + "\" >/dev/null 2>&1 &";
-#endif
-    (void)std::system(cmd.c_str());
+    if (!ui::openExternalFile(path))
+        st.toast(ui::ToastLevel::Warn, "Could not open file: " + path);
 }
 
 void chatArtifactReveal(AppState& st, const std::string& path) {
@@ -1137,22 +1124,7 @@ void chatArtifactReveal(AppState& st, const std::string& path) {
         st.toast(ui::ToastLevel::Warn, "File not found: " + fs::path(path).filename().string());
         return;
     }
-    // A directory target (e.g. an unsaved document's workspace folder) is opened directly;
-    // a file target is revealed/selected inside its containing folder.
-    std::error_code ec;
-    const bool isDir = fs::is_directory(path, ec);
-    const std::string q = chatShellQuote(path);
-#ifdef _WIN32
-    std::string cmd = isDir ? "explorer \"" + q + "\"" : "explorer /select,\"" + q + "\"";
-#elif defined(__APPLE__)
-    std::string cmd = isDir ? "open \"" + q + "\"" : "open -R \"" + q + "\"";
-#else
-    // No portable select-file on Linux — open the containing folder instead.
-    const std::string dir = isDir ? path : fs::path(path).parent_path().string();
-    const std::string qd = chatShellQuote(dir.empty() ? std::string(".") : dir);
-    std::string cmd = "xdg-open \"" + qd + "\" >/dev/null 2>&1 &";
-#endif
-    (void)std::system(cmd.c_str());
+    ui::revealInFileManager(path);
 }
 
 // Lower-cased extension (with the leading dot) of a path.
@@ -1210,8 +1182,8 @@ void chatArtifactActions(AppState& st, const std::string& path) {
 }
 
 // The packed tool-row detail: feedTurnActivity writes args_preview, then the capped failure
-// text after "\n\x1eERR\x1e\n", artifact paths after "\n\x1eART\x1e\n" and the ts/cache-read
-// META trailer last (ActivityItem gains no fields — app_state.h is integrator-owned). Split
+// text after "\n\x1eERR\x1e\n", image captions after "\n\x1eCAP\x1e\n", artifact paths after
+// "\n\x1eART\x1e\n" and the ts/cache-read META trailer last (ActivityItem gains no fields). Split
 // back into its parts. ToolRowDetail / declaration shared via copilot_internal.h —
 // chatActivityCopyText (ui_common) uses the same split so a clipboard copy never carries the
 // raw markers.
@@ -1251,6 +1223,18 @@ ToolRowDetail splitToolRowDetail(const std::string& detail) {
         d.args = d.args.substr(0, mark);
     } else if (d.args.rfind(kArtMarkBare, 0) == 0) {
         d.arts = d.args.substr(std::strlen(kArtMarkBare));
+        d.args.clear();
+    }
+    // CAP sits between ERR and ART (feed.cpp packs it just ahead of ART), so it is lifted off the
+    // remaining tail before the ERR split.
+    const char* kCapMark = "\n\x1e" "CAP\x1e\n";
+    const char* kCapMarkBare = "\x1e" "CAP\x1e\n";
+    mark = d.args.find(kCapMark);
+    if (mark != std::string::npos) {
+        d.cap = d.args.substr(mark + std::strlen(kCapMark));
+        d.args = d.args.substr(0, mark);
+    } else if (d.args.rfind(kCapMarkBare, 0) == 0) {
+        d.cap = d.args.substr(std::strlen(kCapMarkBare));
         d.args.clear();
     }
     const char* kErrMark = "\n\x1e" "ERR\x1e\n";
@@ -1303,6 +1287,56 @@ static bool artifactLine(const std::string& line, std::string* kindOut, std::str
     if (pathOut) *pathOut = path;
     return true;
 }
+// Images are transcript evidence, not drawer content. Validate with the same parser the painter
+// and receipt use so a corrupt legacy path cannot advertise an empty disclosure.
+static bool drawerHasArtifacts(const std::string& blob, bool imagesInline) {
+    std::istringstream iss(blob);
+    std::string line;
+    while (std::getline(iss, line)) {
+        std::string kind;
+        if (artifactLine(line, &kind, nullptr) && (kind != "image" || !imagesInline)) return true;
+    }
+    return false;
+}
+
+static bool hasImageArtifacts(const std::string& blob) {
+    std::istringstream iss(blob);
+    std::string line;
+    while (std::getline(iss, line)) {
+        std::string kind;
+        if (artifactLine(line, &kind, nullptr) && kind == "image") return true;
+    }
+    return false;
+}
+
+// A restored Session files row is an aggregate index, not another return from the agent. Suppress
+// only images retained at their original tool rows; old transcripts with index-only artifacts
+// still show their sole evidence. Match the existing ART wire format without reparsing every row.
+static bool timelineHasEvidencePath(const std::vector<ActivityItem>& rows, const std::string& path) {
+    for (const ActivityItem& row : rows) {
+        if (row.rowKind != 3 || row.stage == "artifacts") continue;
+        const size_t art = row.detail.find("\x1e" "ART\x1e\n");
+        if (art == std::string::npos) continue;
+        size_t pos = row.detail.find(path, art + 5);
+        while (pos != std::string::npos) {
+            const size_t end = pos + path.size();
+            if (pos >= 6 && row.detail.compare(pos - 6, 6, "image\t") == 0 &&
+                (end == row.detail.size() || row.detail[end] == '\n')) return true;
+            pos = row.detail.find(path, pos + 1);
+        }
+    }
+    return false;
+}
+
+static std::string evidenceCaptionLead(const std::string& caption) {
+    size_t end = std::min(caption.find('\n'), size_t(360));
+    end = std::min(end, caption.size());
+    if (end == caption.size()) return caption;
+    // Do not split a UTF-8 codepoint when a long first paragraph is shortened.
+    while (end > 0 && (static_cast<unsigned char>(caption[end]) & 0xc0) == 0x80) --end;
+    return caption.substr(0, end) + "\xe2\x80\xa6";
+}
+
 
 // Rendering policy for the structured tool outcome. Legacy means the OUT trailer is absent,
 // malformed, or from a future daemon; every caller must then preserve the old status-based path.
@@ -1390,6 +1424,146 @@ static ToolOutcomePresentation toolOutcomePresentation(const ActivityItem& a) {
             break;
     }
     return p;
+}
+
+// A live turn is deliberately not windowed by chat_log.cpp. Cache its tool rows here instead:
+// the old loop reparsed every packed detail (including folded members) and submitted every
+// auto-height child even when thousands of pixels outside the log's clip rectangle.
+// Snapshots are byte-exact, not pointer/size/hash keys: completion and steering may replace a
+// string in place without changing its length. Only changed tools pay for parsing/sanitizing.
+struct ToolTimelineRow {
+    ActivityItem source;
+    ToolRowDetail parts;
+    ToolOutcomePresentation outcome;
+    std::string groupKey;
+    bool valid = false, changed = true, images = false, files = false, settled = false;
+    float height = -1.0f, headOffset = -1.0f;
+    float drawerHeight = -1.0f, evidenceHeight = -1.0f, artifactHeight = -1.0f;
+    size_t end = 0;
+    int rewind = -1;
+    bool frontier = false;
+};
+
+static bool sameToolRow(const ActivityItem& a, const ActivityItem& b) {
+    return a.rowKind == b.rowKind && a.stage == b.stage && a.title == b.title &&
+           a.reason == b.reason && a.status == b.status && a.detail == b.detail &&
+           a.durationMs == b.durationMs && a.expanded == b.expanded &&
+           a.userToggled == b.userToggled && a.streaming == b.streaming;
+}
+
+struct ToolTimelineCache {
+    std::vector<ToolTimelineRow> rows;
+    std::vector<std::pair<std::string, std::string>> docs;
+    std::string conversation;
+    ImGuiStyle style{};
+    ImFont* font = nullptr;
+    ImFont* mono = nullptr;
+    ImFont* medium = nullptr;
+    float width = -1.0f, fontSize = -1.0f, monoSize = -1.0f, mediumSize = -1.0f;
+    int detail = -1, frame = -1;
+    double stamp = 0.0;
+    bool renders = false, grouping = false, humanize = false, collapse = false;
+    bool rewindAvailable = false, rewindBusy = false;
+    double checkpointFetch = -1.0;
+    size_t checkpoints = 0;
+};
+
+static std::unordered_map<ImGuiID, ToolTimelineCache> s_toolTimelines;
+
+static ToolTimelineCache& toolTimelineCache(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
+    // Bound both lifetime and retained transcripts. No pointers into chat/activity survive a
+    // frame (switching conversations and growing the vectors can move all of their storage).
+    const ImGuiID id = ImGui::GetID("##tool_timeline_cache");
+    const int frame = ImGui::GetFrameCount();
+    for (auto it = s_toolTimelines.begin(); it != s_toolTimelines.end();) {
+        if (it->first != id && frame - it->second.frame > 120) it = s_toolTimelines.erase(it);
+        else ++it;
+    }
+    if (s_toolTimelines.find(id) == s_toolTimelines.end() && s_toolTimelines.size() >= 8) {
+        auto oldest = s_toolTimelines.begin();
+        for (auto it = s_toolTimelines.begin(); it != s_toolTimelines.end(); ++it)
+            if (it->second.frame < oldest->second.frame) oldest = it;
+        s_toolTimelines.erase(oldest);
+    }
+    ToolTimelineCache& cache = s_toolTimelines[id];
+    const std::string conversation = st.activeConvId();
+    if (cache.conversation != conversation || cache.stamp != m.ts) {
+        cache = ToolTimelineCache{};
+        cache.conversation = conversation;
+        cache.stamp = m.ts;
+    }
+    cache.frame = frame;
+    bool docsChanged = cache.docs.size() != st.docTabs.size();
+    if (!docsChanged)
+        for (size_t i = 0; i < st.docTabs.size(); ++i)
+            if (cache.docs[i].first != st.docTabs[i].docId ||
+                cache.docs[i].second != st.docTabs[i].displayTitle()) { docsChanged = true; break; }
+    if (docsChanged) {
+        cache.docs.clear();
+        for (const auto& tab : st.docTabs) cache.docs.emplace_back(tab.docId, tab.displayTitle());
+    }
+    const float width = ImGui::GetContentRegionAvail().x;
+    const bool humanize = ui::chatHumanizeDocIds();
+    const bool layoutChanged = cache.width != width || cache.font != ImGui::GetFont() ||
+        cache.mono != fonts.mono || cache.medium != fonts.medium ||
+        cache.fontSize != ImGui::GetFontSize() ||
+        cache.monoSize != (fonts.mono ? fonts.mono->FontSize * fonts.mono->Scale : 0.0f) ||
+        cache.mediumSize != (fonts.medium ? fonts.medium->FontSize * fonts.medium->Scale : 0.0f) ||
+        std::memcmp(&cache.style, &ImGui::GetStyle(), sizeof(ImGuiStyle)) != 0 ||
+        cache.detail != ui::chatToolDetail() || cache.renders != ui::chatShowRenders() ||
+        cache.grouping != ui::chatGroupToolCalls() || cache.collapse != ui::chatCollapseAnim() ||
+        cache.rewindAvailable != s_aiVc.available || cache.rewindBusy != s_aiVc.busy ||
+        cache.checkpointFetch != s_aiVc.lastFetch || cache.checkpoints != s_aiVc.checkpoints.size() ||
+        cache.humanize != humanize;
+    cache.width = width;
+    cache.font = ImGui::GetFont();
+    cache.mono = fonts.mono;
+    cache.medium = fonts.medium;
+    cache.fontSize = ImGui::GetFontSize();
+    cache.monoSize = fonts.mono ? fonts.mono->FontSize * fonts.mono->Scale : 0.0f;
+    cache.mediumSize = fonts.medium ? fonts.medium->FontSize * fonts.medium->Scale : 0.0f;
+    cache.style = ImGui::GetStyle();
+    cache.detail = ui::chatToolDetail();
+    cache.renders = ui::chatShowRenders();
+    cache.grouping = ui::chatGroupToolCalls();
+    cache.collapse = ui::chatCollapseAnim();
+    const bool sanitizeChanged = docsChanged || cache.humanize != humanize;
+    cache.rewindAvailable = s_aiVc.available;
+    cache.rewindBusy = s_aiVc.busy;
+    cache.checkpointFetch = s_aiVc.lastFetch;
+    cache.checkpoints = s_aiVc.checkpoints.size();
+    cache.humanize = humanize;
+    // At most 8192 rows / 4 MiB of source text per timeline (parsed trailers retain at most
+    // another copy). Larger transcripts still render correctly; excess rows use the old path.
+    cache.rows.resize(std::min(m.activity.size(), size_t(8192)));
+    size_t bytes = 0;
+    for (size_t i = 0; i < m.activity.size(); ++i) {
+        ActivityItem& a = m.activity[i];
+        const size_t rowBytes = a.detail.size() + a.title.size() + a.reason.size() + a.stage.size();
+        if (a.rowKind != 3 || i >= cache.rows.size() || rowBytes > 4 * 1024 * 1024 - bytes) {
+            if (i < cache.rows.size()) cache.rows[i] = ToolTimelineRow{};
+            sanitizeActivityItem(st, a);
+            continue;
+        }
+        bytes += rowBytes;
+        ToolTimelineRow& row = cache.rows[i];
+        row.changed = !row.valid || !sameToolRow(row.source, a) || sanitizeChanged;
+        if (row.changed) {
+            sanitizeActivityItem(st, a);
+            row.source = ActivityItem(a);  // replace old capacities as well as old content
+            row.parts = splitToolRowDetail(a.detail);
+            row.outcome = toolOutcomePresentation(a);
+            row.images = hasImageArtifacts(row.parts.arts);
+            row.files = drawerHasArtifacts(row.parts.arts, true);
+            row.groupKey = row.outcome.succeeded
+                ? ui::toolPhrase(a.title, a.reason, true).groupKey : std::string();
+            row.valid = true;
+        }
+        if (row.changed || layoutChanged) {
+            row.height = row.drawerHeight = row.evidenceHeight = row.artifactHeight = -1.0f;
+        }
+    }
+    return cache;
 }
 
 static bool toolRowIsDeclined(const ActivityItem& a) {
@@ -1623,7 +1797,9 @@ static void drawToolArgs(const std::string& args, const ui::Fonts& fonts) {
 static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& fonts,
                                 int failCount, bool liveFrontier, int callI = -1,
                                 const std::vector<ActivityItem*>* group = nullptr,
-                                bool onSpine = false) {
+                                bool onSpine = false,
+                                const std::vector<ActivityItem>* timeline = nullptr,
+                                std::vector<ToolTimelineRow>* cachedRows = nullptr) {
     const float gap = ui::metrics::U(1.5f);
     // Chat-display prefs (cached in ai_prefs — safe to read per row per frame).
     const int  detailLvl = ui::chatToolDetail();
@@ -1633,11 +1809,46 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     const int  groupN    = (group && group->size() > 1) ? (int)group->size() : 1;
     // Split the packed detail once and resolve the structured presentation once. Unknown/missing
     // taxonomy stays on the legacy status path; no historical row receives an invented state.
-    const ToolRowDetail parts = splitToolRowDetail(a.detail);
+    auto cached = [&](const ActivityItem& row) -> ToolTimelineRow* {
+        if (!cachedRows || !timeline) return nullptr;
+        const size_t idx = size_t(&row - timeline->data());
+        return idx < cachedRows->size() && (*cachedRows)[idx].valid ? &(*cachedRows)[idx] : nullptr;
+    };
+    const ToolTimelineRow* rowCache = cached(a);
+    const ToolRowDetail uncachedParts = rowCache ? ToolRowDetail{} : splitToolRowDetail(a.detail);
+    const ToolRowDetail& parts = rowCache ? rowCache->parts : uncachedParts;
+    ToolRowDetail memberParts;
+    auto detailOf = [&](const ActivityItem& row) -> const ToolRowDetail& {
+        if (const ToolTimelineRow* c = cached(row)) return c->parts;
+        memberParts = splitToolRowDetail(row.detail);
+        return memberParts;
+    };
+    // A folded row can itself span many viewports. Window its individual drawer/evidence
+    // members too, retaining exact measured heights in the same content/layout cache.
+    auto windowMember = [&](const ActivityItem& member, float ToolTimelineRow::*height,
+                            bool allowSkip, auto&& draw) {
+        ToolTimelineRow* c = cached(member);
+        const float y = ImGui::GetCursorPosY();
+        const float sy = ImGui::GetCursorScreenPos().y;
+        const ImRect clip = ImGui::GetCurrentWindow()->ClipRect;
+        const float slack = ImGui::GetTextLineHeightWithSpacing() * 2.0f;
+        if (c && allowSkip && (c->*height) >= 0.0f &&
+            (sy + (c->*height) < clip.Min.y - slack || sy > clip.Max.y + slack)) {
+            if ((c->*height) > 0.0f) {
+                ImGui::Dummy(ImVec2(0.0f, ImMax(0.0f, (c->*height) - ImGui::GetStyle().ItemSpacing.y)));
+                ImGui::SetCursorPosY(y + (c->*height));
+            }
+            return;
+        }
+        draw();
+        if (c) (c->*height) = allowSkip ? ImGui::GetCursorPosY() - y : -1.0f;
+    };
     const std::string& argsBody = parts.args;
     const std::string& errBody  = parts.err;
     const std::string& artsBlob = parts.arts;
-    const ToolOutcomePresentation outcome = toolOutcomePresentation(a);
+    const ToolOutcomePresentation uncachedOutcome = rowCache ? ToolOutcomePresentation{}
+                                                             : toolOutcomePresentation(a);
+    const ToolOutcomePresentation& outcome = rowCache ? rowCache->outcome : uncachedOutcome;
     const bool hardFail = outcome.failure;
     const bool declined = outcome.declined;
     const bool timeout  = outcome.timeout;
@@ -1659,15 +1870,25 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     const bool open = a.userToggled ? a.expanded : (a.expanded || liveFrontier);
     // A summarized exception whose raw text IS its inline line has nothing extra to reveal, so it
     // must not advertise a chevron onto an empty drawer.
-    bool hasDrawer = !argsBody.empty() || !artsBlob.empty() ||
+    // Visual evidence — the images a call returned to the agent (a render, a section, a clash
+    // highlight) — is drawn UNDER the row whether or not the drawer is open, grouped or not, at
+    // every detail level: it is what the agent looked at, so it belongs in the transcript at the
+    // point it arrived. Only the display preference turns that off; then images fall back to dim
+    // path lines in the drawer. A restored "Session files" index shows only evidence whose
+    // originating tool row is missing (legacy history); retained tool images never repeat.
+    const bool inlineEvidence = showRenders;
+    bool hasDrawer = !argsBody.empty() || drawerHasArtifacts(artsBlob, inlineEvidence) ||
                      (declined && !errBody.empty()) ||
                      (exceptional && !outcome.message.empty() && outcome.message != errLine) ||
                      ((hardFail || timeout) && !errBody.empty() && errBody != errLine);
     if (groupN > 1) {
         hasDrawer = false;
         for (const ActivityItem* mi : *group) {
-            const ToolRowDetail mp = splitToolRowDetail(mi->detail);
-            if (!mp.args.empty() || !mp.err.empty() || !mp.arts.empty()) { hasDrawer = true; break; }
+            const ToolRowDetail& mp = detailOf(*mi);
+            const ToolTimelineRow* member = cached(*mi);
+            const bool artifacts = member ? member->files || (!inlineEvidence && member->images)
+                                          : drawerHasArtifacts(mp.arts, inlineEvidence);
+            if (!mp.args.empty() || !mp.err.empty() || artifacts) { hasDrawer = true; break; }
         }
     }
     // Simplified mode has no disclosure, no args drawer and no engine ids at all — artifacts still
@@ -1682,46 +1903,91 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     // A completed call has no resting fill — it is a log line that lights up under the pointer;
     // an exceptional one is a soft rounded tint, never a bar.
     RowShell sh = beginRowShell("##toolrow", outcome.tone, exceptional ? kFailWash : 0.0f,
-                                exceptional ? kFailEdge : 0.0f, hasDrawer, openE);
+                                exceptional ? kFailEdge : 0.0f, hasDrawer, openE, true);
     const ui::AdaptiveSurface& surf = chatSurf();
 
-    // One artifact blob -> inline images (or, with renders off, dim path lines) + file actions.
-    // Shared by the single-row drawer, every member of a grouped drawer, and simplified mode.
-    auto drawArtifacts = [&](const std::string& blob) {
-        if (blob.empty()) return;
-        const float logW = ImGui::GetContentRegionAvail().x;
-        std::istringstream iss(blob);
+    // Drawer / simplified-mode artifact list: dim "kind: path" lines + file actions for meshes and
+    // files — and, with renders explicitly disabled, images with the caption the tool returned.
+    auto drawArtifacts = [&](const ToolRowDetail& d) {
+        if (d.arts.empty()) return;
+        std::istringstream iss(d.arts);
         std::string line;
-        int imgI = 0;
+        int artI = 0;
+        bool captioned = inlineEvidence || d.cap.empty();
         while (std::getline(iss, line)) {
             std::string kindA, path;
             // artifactLine drops continuation lines from a corrupted multi-line "path": offering an
             // (open) button on "WORKFLOW" is worse than showing nothing.
             if (!artifactLine(line, &kindA, &path)) continue;
-            ++imgI;
-            if (kindA == "image" && showRenders) {
-                const Tex& tx = artTexFor(path);
-                if (tx.id) {
-                    float maxTw = ui::metrics::copilotThumbW();
-                    float tw = logW < maxTw ? logW : maxTw;
-                    float th = tw * (float)tx.h / (float)std::max(1, tx.w);
-                    ImGui::PushID(imgI);
-                    ImGui::Image((ImTextureID)(intptr_t)tx.id, ImVec2(tw, th));
-                    ImGui::PopID();
-                } else {
-                    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-                    ImGui::TextWrapped("image: %s", path.c_str());
-                    ImGui::PopStyleColor();
-                }
-            } else {
-                // mesh / file — and, with renders off, images too: a dim path line, no upload.
-                ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-                ImGui::TextWrapped("%s: %s", kindA.c_str(), path.c_str());
+            if (kindA == "image" && inlineEvidence) continue;
+            ++artI;
+            if (kindA == "image" && !captioned) {
+                captioned = true;
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+                ImGui::TextWrapped("%s", d.cap.c_str());
                 ImGui::PopStyleColor();
             }
-            ImGui::PushID(imgI + 1000);
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+            ImGui::TextWrapped("%s: %s", kindA.c_str(), path.c_str());
+            ImGui::PopStyleColor();
+            ImGui::PushID(artI + 1000);
             chatArtifactActions(st, path);
             ImGui::PopID();
+        }
+    };
+    // Inline evidence for ONE call: each returned image (bounded thumbnail, larger on hover; a
+    // missing file keeps the dim "image: path" line) with its file actions, then the caption the
+    // tool returned with them — its first paragraph inline, the whole text on hover.
+    auto drawEvidence = [&](const ToolRowDetail& d) {
+        if (!inlineEvidence || d.arts.empty()) return;
+        const float logW = ImGui::GetContentRegionAvail().x;
+        std::istringstream iss(d.arts);
+        std::string line;
+        int imgI = 0;
+        while (std::getline(iss, line)) {
+            std::string kindA, path;
+            if (!artifactLine(line, &kindA, &path) || kindA != "image") continue;
+            if (a.stage == "artifacts" && timeline && timelineHasEvidencePath(*timeline, path))
+                continue;
+            ++imgI;
+            ImGui::PushID(imgI);
+            const Tex& tx = artTexFor(path);
+            if (tx.id) {
+                const float maxTw = ui::metrics::copilotThumbW();
+                const float tw = logW < maxTw ? logW : maxTw;
+                const float th = tw * (float)tx.h / (float)std::max(1, tx.w);
+                ImGui::Image((ImTextureID)(intptr_t)tx.id, ImVec2(tw, th));
+                if (ImGui::IsItemHovered()) {
+                    const float bigW = ImMin(ui::metrics::px(560.0f), (float)tx.w);
+                    ImGui::BeginTooltip();
+                    ImGui::Image((ImTextureID)(intptr_t)tx.id,
+                                 ImVec2(bigW, bigW * (float)tx.h / (float)std::max(1, tx.w)));
+                    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+                    ImGui::TextUnformatted(path.c_str());
+                    ImGui::PopStyleColor();
+                    ImGui::EndTooltip();
+                }
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+                ImGui::TextWrapped("image: %s", path.c_str());
+                ImGui::PopStyleColor();
+            }
+            ImGui::PushID(1000);
+            chatArtifactActions(st, path);
+            ImGui::PopID();
+            ImGui::PopID();
+        }
+        if (imgI == 0 || d.cap.empty()) return;
+        const std::string lead = evidenceCaptionLead(d.cap);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("%s", lead.c_str());
+        ImGui::PopStyleColor();
+        if (lead != d.cap && ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 36.0f);
+            ImGui::TextUnformatted(d.cap.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
         }
     };
 
@@ -1763,7 +2029,7 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     double metaTs = parts.ts;
     int    metaCache = parts.cacheRead;
     if (groupN > 1) {
-        const ToolRowDetail tailParts = splitToolRowDetail(group->back()->detail);
+        const ToolRowDetail& tailParts = detailOf(*group->back());
         metaTs = tailParts.ts;
         metaCache = tailParts.cacheRead;
     }
@@ -1941,11 +2207,13 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     }
 
     if (simple) {
-        // No drawer, but a render the agent looked at must still reach the user.
+        // No drawer: non-image files (and, with renders off, image paths) list inline here.
         if (groupN > 1)
-            for (const ActivityItem* mi : *group) drawArtifacts(splitToolRowDetail(mi->detail).arts);
+            for (const ActivityItem* mi : *group)
+                windowMember(*mi, &ToolTimelineRow::artifactHeight, true,
+                             [&] { drawArtifacts(detailOf(*mi)); });
         else
-            drawArtifacts(artsBlob);
+            drawArtifacts(parts);
     }
     if (openE > 0.0f && hasDrawer) {
         CollapseBody cb = beginCollapseBody(animKey, openE, "##toolanim");
@@ -1956,11 +2224,13 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
             int memberI = 0;
             for (const ActivityItem* mi : *group) {
                 ImGui::PushID(memberI++);
-                const ToolRowDetail mp = splitToolRowDetail(mi->detail);
-                const std::string t = ui::humanTarget(mi->reason);
-                if (!t.empty()) dimText(t.c_str());
-                drawToolArgs(mp.args, fonts);
-                drawArtifacts(mp.arts);
+                windowMember(*mi, &ToolTimelineRow::drawerHeight, openE >= 1.0f, [&] {
+                    const ToolRowDetail& mp = detailOf(*mi);
+                    const std::string t = ui::humanTarget(mi->reason);
+                    if (!t.empty()) dimText(t.c_str());
+                    drawToolArgs(mp.args, fonts);
+                    drawArtifacts(mp);
+                });
                 ImGui::PopID();
             }
         } else {
@@ -1988,9 +2258,28 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
             if (!argsBody.empty() &&
                 !(declined && errBody.find(argsBody) != std::string::npos))
                 drawToolArgs(argsBody, fonts);
-            drawArtifacts(artsBlob);
+            drawArtifacts(parts);
         }
         endCollapseBody(cb);
+    }
+    // The evidence itself, after the drawer: header (what was called) -> drawer (how) -> what came
+    // back. Hung from the title column like the inline error line. A fold shows every member's
+    // images in call order, so grouping never hides one.
+    if (inlineEvidence) {
+        const float ind = titleX - ImGui::GetCursorStartPos().x;
+        ImGui::Indent(ind);
+        if (groupN > 1) {
+            int memberI = 0;
+            for (const ActivityItem* mi : *group) {
+                ImGui::PushID(2000 + memberI++);
+                windowMember(*mi, &ToolTimelineRow::evidenceHeight, true,
+                             [&] { drawEvidence(detailOf(*mi)); });
+                ImGui::PopID();
+            }
+        } else {
+            drawEvidence(parts);
+        }
+        ImGui::Unindent(ind);
     }
     ImRect rowRect = endRowShell(sh);
     {
@@ -2372,8 +2661,9 @@ private:
 // What this row's mark says. It uses the same structured taxonomy as the row's own glyph so the
 // gutter cannot disagree with the label beside it. Missing/future values deliberately fall through
 // to the legacy status mapping.
-ui::kit::Status spineStatusOf(const ActivityItem& a, bool turnRunning, bool frontier) {
-    switch (ui::copilot::toolOutcomeFromDetail(a.detail).kind) {
+ui::kit::Status spineStatusOf(const ActivityItem& a, bool turnRunning, bool frontier,
+                             const ToolOutcomePresentation* outcome = nullptr) {
+    switch (outcome ? outcome->info.kind : ui::copilot::toolOutcomeFromDetail(a.detail).kind) {
         case ui::copilot::ToolOutcomeKind::Ok:
             return ui::kit::Status::Done;
         case ui::copilot::ToolOutcomeKind::PolicyRefusal:
@@ -2490,7 +2780,10 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
     }
     // Resolve opaque doc ids to part names and fold uncovered glyphs before ANY row is measured
     // or drawn — one place, every row kind, and the widths computed below are the final ones.
-    for (auto& a : m.activity) sanitizeActivityItem(st, a);
+    ToolTimelineCache& toolCache = toolTimelineCache(st, m, fonts);
+    auto cachedTool = [&](size_t idx) -> ToolTimelineRow* {
+        return idx < toolCache.rows.size() && toolCache.rows[idx].valid ? &toolCache.rows[idx] : nullptr;
+    };
     // No blanket leading Dummy here: EVERY dispatched row (both the local draw* functions below
     // and cards.cpp's corp/firm/swarm family) already opens with its own cpChatRowGap() Dummy —
     // one used to sit here too, doubling the gap above the first card in every turn.
@@ -2520,8 +2813,11 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
     const float spineCell = ImGui::GetTextLineHeight();             // the status-mark glyph cell
     const float spineW    = spineCell + ui::kit::padX() * 0.5f;     // gutter the rows indent past
     const float railX     = ImGui::GetCursorScreenPos().x + spineCell * 0.5f;
-    std::vector<SpineMark> spineMarks;
-    spineMarks.reserve(m.activity.size());
+    // Keep the nearest offscreen mark at each boundary, so clipped rail segments are identical
+    // without generating glyphs/vertices for every tool in a long active turn.
+    static std::vector<SpineMark> spineMarks;
+    spineMarks.clear();
+    const ImRect timelineClip = ImGui::GetCurrentWindow()->ClipRect;
     bool spineBreak = false;   // prose landed since the last mark: do not join across it
     ImDrawList* const spineDl = ImGui::GetWindowDrawList();
     ChannelSplit spine(spineDl, 2);
@@ -2544,19 +2840,29 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
         // documented to be called from the turn footer, i.e. the message scope, not the row scope.
         // The cursor is at the row's top edge here, which is the position we want to bring into
         // view; a tall card centred on its own middle would push its header offscreen.
+        const bool anchorRequested = g_pendingAnchor == activityAnchorId((int)i);
         consumeAnchorScroll(activityAnchorId((int)i));
         ImGui::PushID((int)i);
         // Where this row's status mark sits on the rail, and what it says. Captured around the
         // dispatch so a row that draws nothing (an empty prose segment) leaves no orphan mark.
         const float rowTopY = ImGui::GetCursorScreenPos().y;
-        const ui::kit::Status rowStatus = spineStatusOf(a, turnRunning, i == lastVisible);
-        const bool onSpine = !isProseOutputRow(a) && a.rowKind != 1;
+        ToolTimelineRow* const firstTool = a.rowKind == 3 ? cachedTool(i) : nullptr;
+        const ui::kit::Status rowStatus = spineStatusOf(a, turnRunning, i == lastVisible,
+                                                       firstTool ? &firstTool->outcome : nullptr);
+        const bool onSpine = !isProseOutputRow(a) && a.rowKind != 1 && a.rowKind != 20;
         g_rowHeadY = -1.0f;   // each painter records its own header centre (noteRowHead)
         if (isProseOutputRow(a)) {
             // The model's own words, in the column at the point it said them — full width, out of
             // the spine gutter, and the rail breaks around them.
             ImGui::Unindent(spineW);
             drawProseBubble(a, fonts);
+            ImGui::Indent(spineW);
+            if (ImGui::GetCursorScreenPos().y > rowTopY) spineBreak = true;
+        } else if (a.rowKind == 20) {
+            // ask_user marker — the question card (form while pending, summary once answered)
+            // at the point the agent asked, full width like prose, breaking the rail.
+            ImGui::Unindent(spineW);
+            drawAskMarker(st, m, a, fonts);
             ImGui::Indent(spineW);
             if (ImGui::GetCursorScreenPos().y > rowTopY) spineBreak = true;
         } else if (a.rowKind == 1) {
@@ -2573,15 +2879,24 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
             int failCount = 1;
             size_t drawIdx = i;
             size_t frontIdx = i;     // the run's LAST row decides live-frontier auto-expansion
-            std::vector<ActivityItem*> group;
-            const ToolOutcomePresentation aOutcome = toolOutcomePresentation(a);
-            if (aOutcome.failure) {
+            size_t groupCount = 1;
+            const size_t firstIdx = i;
+            const ToolOutcomePresentation uncachedOutcome = firstTool ? ToolOutcomePresentation{}
+                                                                      : toolOutcomePresentation(a);
+            const ToolOutcomePresentation& aOutcome = firstTool ? firstTool->outcome : uncachedOutcome;
+            if (aOutcome.failure && !(firstTool ? firstTool->images
+                                                : hasImageArtifacts(splitToolRowDetail(a.detail).arts))) {
                 const ui::copilot::ToolOutcomeKind aKind = aOutcome.info.kind;
                 size_t j = i + 1;
                 while (j < m.activity.size()) {
                     const ActivityItem& n = m.activity[j];
-                    const ToolOutcomePresentation nOutcome = toolOutcomePresentation(n);
+                    const ToolTimelineRow* next = cachedTool(j);
+                    const ToolOutcomePresentation fallback = next ? ToolOutcomePresentation{} : toolOutcomePresentation(n);
+                    const ToolOutcomePresentation& nOutcome = next ? next->outcome : fallback;
                     if (n.rowKind != 3 || !nOutcome.failure) break;
+                    // A failed geometry check may return a diagnostic image. Never fold away
+                    // an attempt's evidence in favour of the last attempt's error summary.
+                    if (next ? next->images : hasImageArtifacts(splitToolRowDetail(n.detail).arts)) break;
                     if (n.title != a.title || n.reason != a.reason) break;
                     if (nOutcome.info.kind != aKind) break;
                     ++failCount;
@@ -2594,20 +2909,24 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
                        a.status != "running" && a.stage != "artifacts") {
                 // Fold a run of consecutive successful calls that phrase to the same groupKey
                 // into ONE card ("Rendering the part x 3") instead of N near-identical cards.
-                const std::string key = ui::toolPhrase(a.title, a.reason, true).groupKey;
+                const std::string uncachedKey = firstTool ? std::string()
+                    : ui::toolPhrase(a.title, a.reason, true).groupKey;
+                const std::string& key = firstTool ? firstTool->groupKey : uncachedKey;
                 if (!key.empty()) {
                     size_t j = i + 1;
                     while (j < m.activity.size()) {
                         const ActivityItem& n = m.activity[j];
-                        const ToolOutcomePresentation nOutcome = toolOutcomePresentation(n);
+                        const ToolTimelineRow* next = cachedTool(j);
+                        const ToolOutcomePresentation fallback = next ? ToolOutcomePresentation{} : toolOutcomePresentation(n);
+                        const ToolOutcomePresentation& nOutcome = next ? next->outcome : fallback;
                         if (n.rowKind != 3 || !nOutcome.succeeded || n.status == "running") break;
                         if (n.stage == "artifacts") break;
-                        if (ui::toolPhrase(n.title, n.reason, true).groupKey != key) break;
+                        if (next ? next->groupKey != key
+                                 : ui::toolPhrase(n.title, n.reason, true).groupKey != key) break;
                         ++j;
                     }
                     if (j > i + 1) {
-                        group.reserve(j - i);
-                        for (size_t k = i; k < j; ++k) group.push_back(&m.activity[k]);
+                        groupCount = j - i;
                         frontIdx = j - 1;
                         i = j - 1;   // loop ++i advances past the folded run
                     }
@@ -2621,17 +2940,61 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
             if (a.stage != "artifacts") {
                 callIdx = ++toolOrdinal;
                 if (failCount > 1) toolOrdinal += failCount - 1;
-                if (group.size() > 1) toolOrdinal += (int)group.size() - 1;
+                if (groupCount > 1) toolOrdinal += (int)groupCount - 1;
             }
             // A grouped card must never offer a rewind glyph pointing at an arbitrary member;
             // the identical-failure fold still rewinds to before the FIRST attempt. The most
             // recent row of the whole chat (the live frontier of the LAST turn) offers none
             // either: it IS the current state — there is nothing to rewind to.
             const bool chatFrontier = isLastTurn && (frontIdx == lastVisible);
-            const int rewindIdx = (group.size() > 1 || chatFrontier) ? -1 : callIdx;
-            drawToolCallRowImpl(st, m.activity[drawIdx], fonts, failCount,
-                                turnRunning && (frontIdx == lastVisible), rewindIdx,
-                                group.size() > 1 ? &group : nullptr, onSpine);
+            const int rewindIdx = (groupCount > 1 || chatFrontier) ? -1 : callIdx;
+            bool changed = !firstTool;
+            bool anchor = anchorRequested;
+            ImGui::PopID();
+            for (size_t k = firstIdx; k <= frontIdx; ++k) {
+                const ToolTimelineRow* member = cachedTool(k);
+                changed = changed || !member || member->changed;
+                const ImGuiID messageAnchor = activityAnchorId((int)k);
+                anchor = anchor || g_pendingAnchor == messageAnchor;
+                consumeAnchorScroll(messageAnchor);
+            }
+            ImGui::PushID((int)firstIdx);
+            const bool frontier = turnRunning && (frontIdx == lastVisible);
+            const ImRect clip = ImGui::GetCurrentWindow()->ClipRect;
+            const float slack = ImGui::GetTextLineHeightWithSpacing() * 2.0f;
+            const bool reusable = firstTool && !changed && firstTool->height > 0.0f &&
+                firstTool->settled && firstTool->end == frontIdx && firstTool->rewind == rewindIdx &&
+                firstTool->frontier == frontier && a.stage != "artifacts";
+            if (reusable && !anchor &&
+                (rowTopY + firstTool->height < clip.Min.y - slack || rowTopY > clip.Max.y + slack)) {
+                const float y = ImGui::GetCursorPosY();
+                ImGui::Dummy(ImVec2(0.0f, ImMax(0.0f, firstTool->height - ImGui::GetStyle().ItemSpacing.y)));
+                ImGui::SetCursorPosY(y + firstTool->height);
+                g_rowHeadY = rowTopY + firstTool->headOffset;
+            } else {
+                std::vector<ActivityItem*> group;
+                if (groupCount > 1) {
+                    group.reserve(groupCount);
+                    for (size_t k = firstIdx; k <= frontIdx; ++k) group.push_back(&m.activity[k]);
+                }
+                drawToolCallRowImpl(st, m.activity[drawIdx], fonts, failCount, frontier, rewindIdx,
+                                    group.size() > 1 ? &group : nullptr, onSpine, &m.activity, &toolCache.rows);
+                if (firstTool) {
+                    const float height = ImGui::GetCursorScreenPos().y - rowTopY;
+                    // AutoResizeY consumes the previous frame's content extent. Never freeze
+                    // the first padding-only measurement into an offscreen spacer.
+                    const bool stableHeight = firstTool->height > 0.0f &&
+                                              std::fabs(firstTool->height - height) < 0.5f;
+                    firstTool->height = height;
+                    firstTool->headOffset = g_rowHeadY - rowTopY;
+                    firstTool->end = frontIdx;
+                    firstTool->rewind = rewindIdx;
+                    firstTool->frontier = frontier;
+                    const auto anim = s_collapseT.find(ImGui::GetID("##toolrow_anim"));
+                    firstTool->settled = stableHeight && (!ui::chatCollapseAnim() ||
+                        anim == s_collapseT.end() || anim->second.t == 0.0f || anim->second.t == 1.0f);
+                }
+            }
         } else if (a.rowKind == 19) {
             drawDelegationCard(a, fonts);
         } else if (a.rowKind == 4) {
@@ -2678,7 +3041,13 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
                     : rowTopY + ui::metrics::cpChatRowGap() + ui::kit::padY() + half;
                 const float lo = rowTopY + half;
                 const float hi = ImMax(lo, rowBotY - half);
-                spineMarks.push_back(SpineMark{ImClamp(my, lo, hi), rowStatus, !spineBreak});
+                const SpineMark mark{ImClamp(my, lo, hi), rowStatus, !spineBreak};
+                if (mark.y < timelineClip.Min.y - spineCell) {
+                    if (spineMarks.empty()) spineMarks.push_back(mark);
+                    else spineMarks.back() = mark;
+                } else if (spineMarks.empty() || spineMarks.back().y <= timelineClip.Max.y + spineCell) {
+                    spineMarks.push_back(mark);
+                }
                 spineBreak = false;
             }
         }

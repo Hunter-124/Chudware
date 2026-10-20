@@ -22,6 +22,7 @@ Run:  python3 -m pytest services/mcp/test_terminal_save_sweep.py -q -p no:random
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 from pathlib import Path
@@ -62,10 +63,26 @@ class _FakeEngine:
             self.saves.append((p.get("doc_id"), p.get("path")))
             dest = Path(str(p.get("path")))
             dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text("ISO-10303-21;\n")  # a real file, so the size check passes
+            dest.write_text(json.dumps({
+                "doc_id": p.get("doc_id"),
+                "studies": self.studies.get(p.get("doc_id"), []),
+            }))
+            for row in self.docs:
+                if row.get("doc_id") == p.get("doc_id"):
+                    row.update(path=str(dest), dirty=False)
             return {"ok": True, "path": str(dest)}
         if method == "sim_study_list":
             return {"studies": [dict(s) for s in self.studies.get(p.get("doc_id"), [])]}
+        if method == "sim_study_add":
+            studies = self.studies.setdefault(p["doc_id"], [])
+            record = dict(p["study"])
+            record.setdefault("id", f"study-{len(studies) + 1}")
+            studies.append(record)
+            for row in self.docs:
+                if row.get("doc_id") == p["doc_id"]:
+                    row.update(revision=row.get("revision", 0) + 1, dirty=True,
+                               reproducible_from=[])
+            return {"study_id": record["id"]}
         return {}
 
 
@@ -324,6 +341,52 @@ def test_a_pristine_import_of_an_existing_file_is_not_written_to_the_project(
     assert out["persistence_failure"] is None
 
 
+@pytest.mark.parametrize("gui_open,design_edited", [
+    (False, False), (True, False), (True, True),
+])
+def test_detached_simulation_preserves_its_source_and_delivers_its_study(
+        sweep, tmp_path, gui_open, design_edited):
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "arm.step+"
+    source.write_bytes(b"user's saved assembly")
+    occupied = project / "arm_2.step+"
+    occupied.write_bytes(b"another existing deliverable")
+    docs = [{
+        "doc_id": "d-scratch", "name": "arm", "kind": "assembly",
+        "component_count": 3, "revision": int(design_edited), "dirty": design_edited,
+        "path": None, "native_source_path": str(source),
+        "native_source_edited": design_edited,
+        "reproducible_from": [] if design_edited else [str(source)],
+        "origin_kind": "agent",
+    }]
+    if gui_open:
+        docs.append({
+            "doc_id": "d-gui", "name": "user arm", "kind": "assembly",
+            "component_count": 3, "dirty": True, "path": str(source),
+            "origin_kind": "gui",
+        })
+    fake = sweep(docs, touched=["d-scratch"], project_dir=project)
+    record = {"type": "motion", "name": "Motion: m75",
+              "motion": {"drivers": [{"mate_id": "m75", "start": 0, "stop": 80}],
+                         "min_clearance": 0.5}}
+    study_id = C._persist_study("d-scratch", record)
+    assert study_id
+
+    result = C.save_touched_docs()
+
+    destination = project / "arm_3.step+"
+    assert fake.saves == [("d-scratch", str(destination))]
+    assert result["saved"][0]["path"] == str(destination)
+    assert result["errors"] == []
+    assert source.read_bytes() == b"user's saved assembly"
+    assert occupied.read_bytes() == b"another existing deliverable"
+    assert json.loads(destination.read_text())["studies"] == [
+        {**record, "id": study_id}]
+    assert C.save_touched_docs()["saved"] == []
+    assert fake.saves == [("d-scratch", str(destination))]
+
+
 def test_detached_recovery_snapshot_still_gets_a_real_deliverable(
         sweep, tmp_path, monkeypatch):
     recovery = tmp_path / "hostd_autosave"
@@ -346,9 +409,9 @@ def test_detached_recovery_snapshot_still_gets_a_real_deliverable(
 
 
 def test_an_agent_origin_doc_this_process_never_touched_is_still_swept(sweep):
-    """The worker is forked per turn, so a doc built by an earlier turn's worker is not
-    in this process's registry. origin_kind is the engine's own attribution and covers
-    it — without this the very docs that flooded the prompt would be missed."""
+    """A doc left by an earlier worker is absent from this process's registry.
+    Agent attribution still covers it when no other writer holds it, so abandoned
+    unsaved docs do not get stranded."""
     fake = sweep(
         [
             {
@@ -366,6 +429,42 @@ def test_an_agent_origin_doc_this_process_never_touched_is_still_swept(sweep):
     out = C.save_touched_docs()
 
     assert [s[0] for s in fake.saves] == ["d-earlier"]
+
+
+def test_sweep_skips_untouched_docs_held_by_another_writer(sweep, monkeypatch, tmp_path):
+    sweep(
+        [
+            {
+                "doc_id": did,
+                "name": did,
+                "kind": "part",
+                "feature_count": 3,
+                "dirty": True,
+                "path": "",
+                "origin_kind": "agent",
+                **({"other_writer": True} if other_writer else {}),
+            }
+            for did, other_writer in (
+                ("d-foreign", True),
+                ("d-unclaimed", False),
+                ("d-touched", True),
+            )
+        ],
+        touched=["d-touched"],
+    )
+    saved = []
+
+    def project_save(doc_id, name):
+        saved.append(doc_id)
+        return str(tmp_path / f"{name}.step+")
+
+    monkeypatch.setattr(C, "_project_save", project_save)
+    out = C.save_touched_docs()
+
+    assert saved == ["d-unclaimed", "d-touched"]
+    assert [row["doc_id"] for row in out["saved"]] == saved
+    assert out["errors"] == []
+    assert out["persistence_failure"] is None
 
 
 def test_a_touched_dirty_doc_without_a_project_folder_is_a_persistence_failure(sweep):

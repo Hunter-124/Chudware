@@ -18,7 +18,6 @@ Design:
 from __future__ import annotations
 
 import math
-import os
 import pathlib
 import sys
 import types
@@ -132,27 +131,15 @@ class TestOverlapAxisFromBboxes(unittest.TestCase):
 #    runs the full advisor pipeline, and asserts the finding names the axis.
 # ===========================================================================
 
-def _libchudware_path() -> str | None:
-    """Return the first libchudware.so found under known build paths, or None."""
-    env = os.environ.get("CHUDWARE_LIBCHUDWARE")
-    if env and pathlib.Path(env).exists():
-        return env
-    candidates = [
-        _REPO / "core" / "build-linux" / "bin" / "libchudware.so",
-        _REPO / "core" / "build-occt-linux" / "bin" / "libchudware.so",
-    ]
-    for c in candidates:
-        if c.exists():
-            return str(c)
-    # Try sibling worktrees (CI shares builds between tasks)
-    for sibling in (_REPO.parent).glob("CAD-*/core/build-linux/bin/libchudware.so"):
-        return str(sibling)
-    return None
+from services.mcp import core_bridge as _core_bridge
 
-
-_SO = _libchudware_path()
-_SKIP_ENGINE = _SO is None
-_SKIP_REASON = "libchudware.so not found — set CHUDWARE_LIBCHUDWARE or build core/build-linux"
+try:
+    _core_bridge._resolve_lib()
+except _core_bridge.CoreError:
+    _SKIP_ENGINE = True
+else:
+    _SKIP_ENGINE = False
+_SKIP_REASON = "libchudware not found — build the canonical core engine"
 
 
 @unittest.skipIf(_SKIP_ENGINE, _SKIP_REASON)
@@ -161,9 +148,7 @@ class TestInterferenceAdvisorRealEngine(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        os.environ["CHUDWARE_LIBCHUDWARE"] = _SO  # type: ignore[arg-type]
-        from services.mcp import core_bridge as cb  # noqa: PLC0415
-        cls._cb = cb
+        cls._cb = _core_bridge
 
     def _build_overlap_doc(self) -> str:
         """Create a doc with two overlapping 20×20×20 boxes (offset +10 in X).

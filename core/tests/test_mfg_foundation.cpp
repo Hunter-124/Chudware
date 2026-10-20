@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -152,6 +153,134 @@ TEST_CASE("journal seq is monotonic across reopen and replay is idempotent") {
         CHECK(repaired.append("run.transition", "run:00000000000000000000000000",
                               {{"n", 4}}) == second + 2);
     }
+}
+
+TEST_CASE("journal ingestion quotas refuse without consuming durable seq or bytes") {
+    using namespace chudware;
+    TempDirectory temporary;
+    const mfg::JournalLimits limits{1024, 4096, 2, 2, 2048};
+    const auto epoch = device::LaneEpoch::mint("quota");
+    {
+        mfg::Journal journal(temporary.path, epoch, limits);
+        CHECK(journal.append("event", "subject", {{"n", 1}}) == 1);
+        const auto bytes = std::filesystem::file_size(temporary.path / "journal.jsonl");
+        CHECK_THROWS(journal.append("event", "subject", {{"payload", std::string(1024, 'x')}}));
+        CHECK(journal.head() == 1);
+        CHECK(std::filesystem::file_size(temporary.path / "journal.jsonl") == bytes);
+        CHECK(journal.append("event", "subject", {{"n", 2}}) == 2);
+        const auto full_bytes = std::filesystem::file_size(temporary.path / "journal.jsonl");
+        CHECK_THROWS_AS(journal.append("event", "subject", {{"n", 3}}), std::length_error);
+        CHECK(journal.head() == 2);
+        CHECK(std::filesystem::file_size(temporary.path / "journal.jsonl") == full_bytes);
+    }
+    mfg::Journal reopened(temporary.path, epoch, limits);
+    CHECK(reopened.head() == 2);
+    CHECK(reopened.epochFloor() == 1);
+    CHECK(reopened.replay().size() == 2);
+    CHECK_THROWS_AS(reopened.append("event", "subject", {{"n", 3}}), std::length_error);
+}
+
+TEST_CASE("journal total byte quota refuses before checkpoint reservation") {
+    using namespace chudware;
+    TempDirectory temporary;
+    mfg::Journal journal(temporary.path, device::LaneEpoch::mint("bytes"),
+                         {1024, 1024, 100, 100, 1024});
+    while (true) {
+        const auto head = journal.head();
+        const auto bytes = std::filesystem::file_size(temporary.path / "journal.jsonl");
+        try {
+            journal.append("event", "subject", {{"payload", std::string(200, 'x')}});
+        } catch (const std::exception&) {
+            CHECK(head > 0);
+            CHECK(journal.head() == head);
+            CHECK(std::filesystem::file_size(temporary.path / "journal.jsonl") == bytes);
+            std::ifstream checkpoint(temporary.path / "seq.head");
+            device::Seq reserved = 0;
+            checkpoint >> reserved;
+            CHECK(reserved == head);
+            break;
+        }
+        REQUIRE(journal.head() <= 3);
+    }
+}
+
+TEST_CASE("journal startup rejects oversized records totals and counts without truncation") {
+    using namespace chudware;
+    const mfg::JournalLimits limits{1024, 2048, 2, 2, 2048};
+    for (size_t size : {size_t{1025}, size_t{2049}}) {
+        TempDirectory temporary;
+        {
+            std::ofstream hostile(temporary.path / "journal.jsonl", std::ios::binary);
+            hostile << std::string(size - 1, 'x') << '\n';
+        }
+        CHECK_THROWS_AS(mfg::Journal(temporary.path, device::LaneEpoch::mint("hostile"), limits),
+                        std::length_error);
+        CHECK(std::filesystem::file_size(temporary.path / "journal.jsonl") == size);
+        // A failed constructor must release the writer lock, not mask the refusal.
+        CHECK_THROWS_AS(mfg::Journal(temporary.path, device::LaneEpoch::mint("again"), limits),
+                        std::length_error);
+    }
+    TempDirectory temporary;
+    {
+        mfg::Journal journal(temporary.path, device::LaneEpoch::mint("seed"));
+        for (int n = 0; n < 3; ++n) journal.append("event", "subject", {{"n", n}});
+    }
+    const auto bytes = std::filesystem::file_size(temporary.path / "journal.jsonl");
+    CHECK_THROWS_AS(mfg::Journal(temporary.path, device::LaneEpoch::mint("count"), limits),
+                    std::length_error);
+    CHECK(std::filesystem::file_size(temporary.path / "journal.jsonl") == bytes);
+}
+
+TEST_CASE("journal replay is bounded while streaming restore retains every record") {
+    using namespace chudware;
+    TempDirectory temporary;
+    const auto epoch = device::LaneEpoch::mint("stream");
+    const mfg::JournalLimits limits{1024, 8192, 8, 1, 1024};
+    {
+        mfg::Journal journal(temporary.path, epoch, limits);
+        for (int n = 1; n <= 3; ++n) journal.append("event", "subject", {{"n", n}});
+        CHECK_THROWS_AS(journal.replay(), std::length_error);
+        REQUIRE(journal.replay(3).size() == 1);
+        size_t visited = 0;
+        journal.visit(1, [&](const mfg::JournalRecord& row) {
+            CHECK(row.seq == ++visited);
+            return true;
+        });
+        CHECK(visited == 3);
+        visited = 0;
+        journal.visit(1, [&](const mfg::JournalRecord&) { ++visited; return false; });
+        CHECK(visited == 1);
+    }
+    mfg::Journal reopened(temporary.path, epoch, limits);
+    CHECK(reopened.head() == 3);
+    CHECK(reopened.epochFloor() == 1);
+    CHECK_THROWS_AS(reopened.replay(), std::length_error);
+}
+
+TEST_CASE("journal byte-bounded replay and torn tail preserve reserved sequence gaps") {
+    using namespace chudware;
+    TempDirectory temporary;
+    const auto epoch = device::LaneEpoch::mint("gap");
+    const mfg::JournalLimits limits{1024, 8192, 8, 8, 1024};
+    {
+        mfg::Journal journal(temporary.path, epoch, limits);
+        journal.append("event", "subject", {{"payload", std::string(400, 'x')}});
+        journal.append("event", "subject", {{"payload", std::string(400, 'y')}});
+        CHECK_THROWS_AS(journal.replay(), std::length_error);
+    }
+    {
+        std::ofstream checkpoint(temporary.path / "seq.head");
+        checkpoint << "3\n";
+        std::ofstream torn(temporary.path / "journal.jsonl", std::ios::binary | std::ios::app);
+        torn << "{\"seq\":3";
+    }
+    mfg::Journal repaired(temporary.path, epoch, limits);
+    CHECK(repaired.head() == 3);
+    CHECK(repaired.epochFloor() == 1);
+    CHECK(repaired.append("event", "subject", {{"n", 4}}) == 4);
+    const auto last = repaired.replay(4);
+    REQUIRE(last.size() == 1);
+    CHECK(last.at(0).seq == 4);
 }
 
 TEST_CASE("result registry is total and refuses unregistered kinds") {

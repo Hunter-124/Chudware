@@ -4,14 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import errno
+from http.client import HTTPConnection, HTTPSConnection
 import json
 import logging
 import secrets
 import socket
 from typing import Any, Iterable, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from urllib.request import (
+    HTTPHandler,
+    HTTPSHandler,
+    ProxyHandler,
     HTTPBasicAuthHandler,
     HTTPDigestAuthHandler,
     HTTPPasswordMgrWithDefaultRealm,
@@ -20,7 +24,7 @@ from urllib.request import (
     build_opener,
 )
 
-from .model import AuthConfig, ProtocolError, Redactor
+from .model import AuthConfig, ProtocolError, Redactor, _address_class, _commissioned_address_class
 
 _LOG = logging.getLogger(__name__)
 _MAX_ERROR_BYTES = 512
@@ -68,21 +72,83 @@ def _read_bounded(stream: Any) -> bytes:
     return body
 
 
+def _connect_authorized(host: str, port: int, timeout: float, address_class: str) -> socket.socket:
+    """Resolve on every connection, validate the whole answer, then connect numeric sockaddrs."""
+    addresses = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+    if not addresses:
+        raise ProtocolError("printer DNS returned no addresses", reason_code="address_refused")
+    for family, socktype, protocol, _, sockaddr in addresses:
+        try:
+            permitted = (family in {socket.AF_INET, socket.AF_INET6}
+                         and socktype == socket.SOCK_STREAM and protocol == socket.IPPROTO_TCP
+                         and _address_class(sockaddr[0]) == address_class and sockaddr[1] == port)
+        except (ValueError, IndexError, TypeError):
+            permitted = False
+        if not permitted:
+            raise ProtocolError("printer resolved address differs from commissioned address_class",
+                                reason_code="address_refused")
+    last_error = None
+    for family, socktype, protocol, _, sockaddr in addresses:
+        raw = socket.socket(family, socktype, protocol)
+        try:
+            raw.settimeout(timeout)
+            raw.connect(sockaddr)
+            return raw
+        except OSError as exc:
+            raw.close()
+            last_error = exc
+    assert last_error is not None
+    raise last_error
+
+
+class _PinnedHTTPHandler(HTTPHandler):
+    def __init__(self, address_class: str) -> None:
+        super().__init__()
+        self.address_class = address_class
+
+    def _connection(self, host: str, **kwargs: Any) -> HTTPConnection:
+        connection = HTTPConnection(host, **kwargs)
+        connection._create_connection = lambda address, timeout, source_address=None: _connect_authorized(
+            address[0], address[1], timeout, self.address_class)
+        return connection
+
+    def http_open(self, request: Request) -> Any:
+        return self.do_open(self._connection, request)
+
+
+class _PinnedHTTPSHandler(HTTPSHandler):
+    def __init__(self, address_class: str) -> None:
+        super().__init__()
+        self.address_class = address_class
+
+    def _connection(self, host: str, **kwargs: Any) -> HTTPSConnection:
+        connection = HTTPSConnection(host, **kwargs)
+        connection._create_connection = lambda address, timeout, source_address=None: _connect_authorized(
+            address[0], address[1], timeout, self.address_class)
+        return connection
+
+    def https_open(self, request: Request) -> Any:
+        return self.do_open(self._connection, request, context=self._context)
+
+
 class HttpClient:
-    def __init__(self, base_url: str, auth: AuthConfig, timeout_s: float, api_key_header: str = "X-Api-Key") -> None:
+    def __init__(self, base_url: str, auth: AuthConfig, timeout_s: float,
+                 api_key_header: str = "X-Api-Key", *, address_class: str | None = None) -> None:
         self.base_url = base_url.rstrip("/") + "/"
+        parsed = urlsplit(self.base_url)
+        self.address_class = _commissioned_address_class(parsed.hostname or "", address_class)
+        self._origin = (parsed.scheme, parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
         self.auth = auth
         self.timeout_s = timeout_s
         self.api_key_header = api_key_header
         self.redactor = Redactor(auth.secret_values())
+        handlers = [ProxyHandler({}), _NoRedirect(), _PinnedHTTPHandler(self.address_class),
+                    _PinnedHTTPSHandler(self.address_class)]
         if auth.mode == "digest":
             passwords = HTTPPasswordMgrWithDefaultRealm()
             passwords.add_password(None, self.base_url, auth.username or "", auth.password or "")
-            self._opener = build_opener(
-                _NoRedirect(), HTTPDigestAuthHandler(passwords), HTTPBasicAuthHandler(passwords)
-            )
-        else:
-            self._opener = build_opener(_NoRedirect())
+            handlers.extend([HTTPDigestAuthHandler(passwords), HTTPBasicAuthHandler(passwords)])
+        self._opener = build_opener(*handlers)
 
     def auth_headers(self) -> dict[str, str]:
         if self.auth.mode == "api_key":
@@ -100,6 +166,10 @@ class HttpClient:
     ) -> HttpResponse:
         relative = path.lstrip("/")
         url = urljoin(self.base_url, relative)
+        parsed = urlsplit(url)
+        origin = (parsed.scheme, parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+        if parsed.username or parsed.password or origin != self._origin:
+            raise ProtocolError("printer HTTP request leaves commissioned endpoint", reason_code="address_refused")
         merged = {"Accept": "application/json", **self.auth_headers(), **dict(headers or {})}
         request = Request(url, data=body, headers=merged, method=method.upper())
         allowed = frozenset(expected)

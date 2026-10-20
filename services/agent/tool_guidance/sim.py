@@ -37,9 +37,9 @@ _FEA_TIMEOUT_S = fea_timeout_s()
 ENTRIES: dict[str, dict[str, Any]] = {
     "topology_capabilities": {
         "prompt_note": (
-            "Read-only. Call FIRST to learn the supported topology methods, "
-            "physics, constraints and limits before configuring a study; never "
-            "assume a method or constraint that it does not list."
+            "Read-only. Call FIRST to learn supported topology methods, physics, constraints, "
+            "limits and print_processes before configuring a study; never assume an unlisted "
+            "method or constraint. For printing choose a preset and a build_plate bed face."
         ),
     },
     "run_topology_optimization": {
@@ -50,7 +50,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "computation, convergence and feasibility separately — a finished run is not a "
             "converged or feasible one. Inspect the density fields, thresholded surface, "
             "actual-domain reanalysis and manufacturing checks; the source CAD stays editable. "
-            "Geometry/DFAM checks alone are not print-ready: slice_part must validate the G-code."
+            "For printing set print_process and build_plate, read DFAM, then pass print_handoff "
+            "slice_part arguments with the user's printer. Geometry/DFAM alone are not "
+            "print-ready: slice_part must validate the G-code."
         ),
     },
     "sim_cancel": {

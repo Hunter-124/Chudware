@@ -95,9 +95,8 @@ def _policy_assignment(account: Any) -> dict[str, Any]:
         return {"policy_id": "standard", "endpoint": None, "config": {}}
     with tx() as cur:
         cur.execute(
-            "SELECT a.policy_id, p.endpoint, p.config "
-            "FROM account_security_policies a JOIN security_policies p ON p.id = a.policy_id "
-            "WHERE a.email = %s", (account.email,),
+            "SELECT a.policy_id, a.endpoint, a.config "
+            "FROM account_security_policies a WHERE a.email = %s", (account.email,),
         )
         row = cur.fetchone()
     if row is None or str(row["policy_id"]) not in _POLICY_MODES:
@@ -192,6 +191,21 @@ def _canonical(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
 
+def _verification_key() -> bytes:
+    environment = os.environ.get("CHUDWARE_DEPLOY_ENV", "prod")
+    if environment == "prod":
+        return EMBEDDED_PUBLIC_KEY
+    if environment != "staging":
+        raise RuntimeError("unknown entitlement deployment environment")
+    raw = os.environ.get("CHUDWARE_STAGING_ENTITLEMENT_PUBLIC_KEY", "")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", raw):
+        raise RuntimeError("staging requires an independent entitlement public key")
+    public = bytes.fromhex(raw)
+    if public == EMBEDDED_PUBLIC_KEY:
+        raise RuntimeError("staging must not hold the production entitlement signing key")
+    return public
+
+
 def _key_file() -> Path:
     value = os.environ.get(ENTITLEMENT_KEY_ENV, "").strip()
     if not value:
@@ -226,7 +240,7 @@ def _load_private_key(path: Path | None = None) -> Ed25519PrivateKey:
     public = key.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw
     )
-    if public != EMBEDDED_PUBLIC_KEY:
+    if public != _verification_key():
         raise RuntimeError("entitlement private key does not match the shipped public key")
     return key
 
@@ -255,7 +269,7 @@ def _verify_signed_json(token: str, public_key: bytes) -> dict[str, Any]:
 
 def verify_compact(token: str, public_key: bytes | None = None) -> dict[str, Any]:
     """Verify before parsing the signed JSON and require the exact token shape."""
-    payload = _verify_signed_json(token, public_key or EMBEDDED_PUBLIC_KEY)
+    payload = _verify_signed_json(token, public_key or _verification_key())
     expected = {
         "v", "sub", "email", "plan", "issued_at", "paid_through",
         "subscribed_since", "grace_days", "nonce",
@@ -417,7 +431,7 @@ def verify_refusal(
     proof = response.get("proof")
     if not isinstance(proof, str):
         raise HTTPException(401, "unsigned refusal")
-    signed = _verify_signed_json(proof, public_key or EMBEDDED_PUBLIC_KEY)
+    signed = _verify_signed_json(proof, public_key or _verification_key())
     unsigned = dict(response)
     unsigned.pop("proof", None)
     if signed != unsigned:

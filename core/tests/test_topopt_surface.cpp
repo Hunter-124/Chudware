@@ -842,3 +842,234 @@ TEST_CASE("AICM keeps far-from-origin triangles that survive float32") {
   CHECK(lo == 1.0e6f);
   CHECK(hi == 1.0e6f + 1.0f);
 }
+
+TEST_CASE("print surface triangle intersections exclude only shared contact") {
+  SurfaceMesh s;
+  s.points_m.resize(3, 6);
+  s.points_m.col(0) << 0, 0, 0;
+  s.points_m.col(1) << 2, 0, 0;
+  s.points_m.col(2) << 0, 2, 0;
+  s.points_m.col(3) << 0.5, 0.5, -1;
+  s.points_m.col(4) << 0.5, 0.5, 1;
+  s.points_m.col(5) << 1, 1, 0;
+  s.triangles.resize(3, 2);
+  s.triangles.col(0) << 0, 1, 2;
+  s.triangles.col(1) << 3, 4, 5;
+  s.vertex_source.resize(6);
+  s.triangle_element = Eigen::VectorXi::Zero(2);
+  s.triangle_origin.assign(2, TriangleOrigin::Isosurface);
+  CHECK(surface_self_intersects(s));
+  s.points_m.col(3).x() = 3;
+  s.points_m.col(4).x() = 3;
+  s.points_m.col(5).x() = 4;
+  CHECK_FALSE(surface_self_intersects(s));
+  // Sharing a vertex does not exempt a fold crossing the first triangle.
+  s.triangles.col(1) << 0, 3, 4;
+  s.points_m.col(3) << 1, 1, -1;
+  s.points_m.col(4) << 1, 1, 1;
+  CHECK(surface_self_intersects(s));
+  s.points_m.col(3) << -1, 0, 1;
+  s.points_m.col(4) << 0, -1, 1;
+  CHECK_FALSE(surface_self_intersects(s));
+  // Coplanar contact at the shared vertex is fine; overlap is not.
+  s.points_m.col(3) << -1, 0, 0;
+  s.points_m.col(4) << 0, -1, 0;
+  CHECK_FALSE(surface_self_intersects(s));
+  s.points_m.col(3) << 1, 0, 0;
+  s.points_m.col(4) << 0, 1, 0;
+  CHECK(surface_self_intersects(s));
+  s.triangles.col(1) << 1, 0, 3;
+  s.points_m.col(3) << 0, -1, 0;
+  CHECK_FALSE(surface_self_intersects(s));
+  s.points_m.col(3) << 0.5, 0.5, 0;
+  CHECK(surface_self_intersects(s));
+}
+
+TEST_CASE("print surface pins every cap vertex and validates STL precision") {
+  const Box box = make_box(8, 4, 4, 1, 1, 1);
+  const auto mesh = mesh_of(box);
+  Eigen::VectorXd nodal(mesh->node_count());
+  for (int n = 0; n < mesh->node_count(); ++n) {
+    const Eigen::Vector3d p = mesh->nodes_m.col(n) * 1e3;
+    nodal[n] = std::clamp(0.5 + (p.y() - 1.6 - 0.2 * std::sin(p.x() * 2)) / 4,
+                          0.0, 1.0);
+  }
+  const auto raw = extract_nodal_surface(*mesh, nodal, {});
+  REQUIRE(raw.evidence.state == GeometryState::Valid);
+  PrintSurfaceEvidence evidence;
+  const auto smoothed = smooth_print_surface(raw.mesh, {}, evidence);
+  CHECK(evidence.state == "valid");
+  CHECK(evidence.iterations_requested == 12);
+  CHECK(evidence.iterations_used > 0);
+  CHECK(evidence.pinned_vertices > 0);
+  CHECK(evidence.smoothed_vertices > 0);
+  CHECK(evidence.max_displacement_mm > 0);
+  CHECK(evidence.self_intersections_checked);
+  CHECK(validate_surface(smoothed).state == GeometryState::Valid);
+  CHECK_FALSE(surface_self_intersects(smoothed));
+  CHECK(smoothed.triangles == raw.mesh.triangles);
+  for (int t = 0; t < raw.mesh.triangle_count(); ++t)
+    if (raw.mesh.triangle_origin[t] == TriangleOrigin::DomainBoundary)
+      for (int k = 0; k < 3; ++k) {
+        const int v = raw.mesh.triangles(k, t);
+        CHECK(std::memcmp(raw.mesh.points_m.col(v).data(),
+                          smoothed.points_m.col(v).data(), 3 * sizeof(double)) == 0);
+      }
+  TempDir dir;
+  write_stl(dir.file("print.stl"), smoothed, "Print surface");
+  SurfaceMesh invalid = raw.mesh;
+  invalid.triangles.conservativeResize(3, invalid.triangle_count() - 1);
+  invalid.triangle_element.conservativeResize(invalid.triangle_count());
+  invalid.triangle_origin.resize(invalid.triangle_count());
+  CHECK(error_code([&] { smooth_print_surface(invalid, {}, evidence); }) ==
+        "print_surface_invalid");
+  CHECK(evidence.state == "refused");
+}
+
+TEST_CASE("surface overhang is area weighted and excludes the build plate") {
+  const Box box = make_box(2, 2, 2, 1, 1, 1);
+  const auto mesh = mesh_of(box);
+  const auto s = domain_boundary_surface(*mesh);
+  const auto up = measure_surface_overhang(s, Eigen::Vector3d::UnitZ(), 45, 0,
+                                          1e-6 * mesh->bbox_max_m.norm());
+  CHECK(up.unsupported_area_m2 == 0);
+  CHECK(up.vertex_fraction.isZero());
+  const auto elevated = measure_surface_overhang(s, Eigen::Vector3d::UnitZ(),
+                                                45, -0.001, 1e-9);
+  CHECK(elevated.unsupported_area_m2 == doctest::Approx(4e-6));
+  CHECK(elevated.total_area_m2 == doctest::Approx(24e-6));
+  CHECK(elevated.vertex_fraction.minCoeff() >= 0);
+  CHECK(elevated.vertex_fraction.maxCoeff() <= 1);
+  TempDir dir;
+  const auto path = dir.file("overhang.aicm");
+  write_surface_aicm(path, s, {{"overhang", "-", elevated.vertex_fraction}}, "part");
+  render::DocMesh doc;
+  std::string error;
+  REQUIRE(render::loadAicmFile(path, doc, error));
+  REQUIRE(doc.scalars.size() == 1);
+  CHECK(doc.scalars[0].name == "overhang");
+  for (std::size_t v = 0; v < doc.scalars[0].values.size(); ++v)
+    CHECK(doc.scalars[0].values[v] ==
+          doctest::Approx(elevated.vertex_fraction[v]).epsilon(1e-6));
+}
+
+TEST_CASE("print intersection keeps exact shared-plane incidence") {
+  SurfaceMesh s;
+  s.points_m.resize(3, 5);
+  // Near-planar triangles from a marching-tet box reconstruction, in mm.
+  // The triangles meet only at vertex 0. Recomputing its signed plane
+  // distance introduced a roundoff sign and a spurious crossing interval.
+  s.points_m.col(0) << 27.749221801757812, 5.63823938369751, 1.5358493328094482;
+  s.points_m.col(1) << 27.36842155456543, 5.923381328582764, 0;
+  s.points_m.col(2) << 27.36842155456543, 5.684165000915527, 1.5789045095443726;
+  s.points_m.col(3) << 29.473684310913086, 5.635838985443116, 0;
+  s.points_m.col(4) << 27.46274757385254, 5.910389423370361, 0;
+  s.points_m *= 1e-3;
+  s.vertex_source.resize(5);
+  s.triangle_element = Eigen::VectorXi::Zero(2);
+  s.triangle_origin.assign(2, TriangleOrigin::Isosurface);
+  s.triangles.resize(3, 2);
+  s.triangles.col(0) << 0, 1, 2;
+  s.triangles.col(1) << 3, 4, 0;
+  CHECK_FALSE(surface_self_intersects(s));
+  for (int rotation = 0; rotation < 3; ++rotation) {
+    for (int t = 0; t < 2; ++t) {
+      const Eigen::Vector3i ids = s.triangles.col(t);
+      s.triangles.col(t) << ids[1], ids[2], ids[0];
+    }
+    CHECK_FALSE(surface_self_intersects(s));
+  }
+}
+
+namespace {
+SurfaceMesh unchecked_print_iteration(const SurfaceMesh &raw) {
+  SurfaceMesh candidate = raw;
+  std::vector<std::set<int>> neighbors(raw.vertex_count());
+  std::vector<bool> pinned(raw.vertex_count(), false);
+  for (int t = 0; t < raw.triangle_count(); ++t)
+    for (int k = 0; k < 3; ++k) {
+      const int v = raw.triangles(k, t);
+      pinned[v] = pinned[v] || raw.triangle_origin[t] != TriangleOrigin::Isosurface;
+      neighbors[v].insert(raw.triangles((k + 1) % 3, t));
+      neighbors[v].insert(raw.triangles((k + 2) % 3, t));
+    }
+  for (double factor : {0.5, -0.53}) {
+    Eigen::Matrix3Xd next = candidate.points_m;
+    for (int v = 0; v < raw.vertex_count(); ++v) {
+      if (pinned[v] || neighbors[v].empty())
+        continue;
+      Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+      for (int n : neighbors[v])
+        mean += candidate.points_m.col(n);
+      mean /= static_cast<double>(neighbors[v].size());
+      next.col(v) += factor * (mean - candidate.points_m.col(v));
+    }
+    candidate.points_m.swap(next);
+  }
+  return candidate;
+}
+} // namespace
+
+TEST_CASE("print surface locally rolls back microtriangle folds and their one-ring") {
+  const Box box = make_box(4, 4, 4, 1, 1, 1);
+  const auto mesh = mesh_of(box);
+  Eigen::VectorXd nodal(mesh->node_count());
+  for (int n = 0; n < mesh->node_count(); ++n) {
+    const Eigen::Vector3d p = mesh->nodes_m.col(n) * 1e3;
+    nodal[n] = std::clamp(0.5 + (p.y() - 2 + 0.1 * p.z() - 0.001) / 8,
+                          0.0, 1.0);
+  }
+  const auto raw = extract_nodal_surface(*mesh, nodal, {});
+  REQUIRE(raw.evidence.state == GeometryState::Valid);
+  CHECK(raw.evidence.min_edge_m < 1e-5);
+  CHECK_FALSE(surface_self_intersects(raw.mesh));
+  const auto folded = unchecked_print_iteration(raw.mesh);
+  std::vector<int> crossing;
+  REQUIRE(surface_self_intersects(folded, &crossing));
+  REQUIRE_FALSE(crossing.empty());
+  CHECK(std::is_sorted(crossing.begin(), crossing.end()));
+  CHECK(std::adjacent_find(crossing.begin(), crossing.end()) == crossing.end());
+  std::vector<bool> affected(raw.mesh.vertex_count(), false);
+  std::vector<bool> boundary(raw.mesh.vertex_count(), false);
+  for (int t : crossing)
+    for (int k = 0; k < 3; ++k)
+      affected[raw.mesh.triangles(k, t)] = true;
+  std::vector<bool> one_ring = affected;
+  for (int t = 0; t < raw.mesh.triangle_count(); ++t) {
+    bool touches = false;
+    for (int k = 0; k < 3; ++k) {
+      const int v = raw.mesh.triangles(k, t);
+      touches = touches || affected[v];
+      if (raw.mesh.triangle_origin[t] == TriangleOrigin::DomainBoundary)
+        boundary[v] = true;
+    }
+    if (touches)
+      for (int k = 0; k < 3; ++k)
+        one_ring[raw.mesh.triangles(k, t)] = true;
+  }
+  PrintSurfaceOptions options;
+  options.iterations = 1;
+  PrintSurfaceEvidence evidence;
+  const auto result = smooth_print_surface(raw.mesh, options, evidence);
+  CHECK(evidence.state == "valid");
+  CHECK(evidence.iterations_used == 1);
+  CHECK(evidence.rollback_vertices > 0);
+  CHECK(evidence.rollback_rounds > 0);
+  CHECK(evidence.rollback_rounds <= 8);
+  CHECK(evidence.pinned_vertices == std::count(boundary.begin(), boundary.end(), true));
+  CHECK(evidence.smoothed_vertices > 0);
+  CHECK(evidence.pinned_vertices + evidence.rollback_vertices +
+            evidence.smoothed_vertices == raw.mesh.vertex_count());
+  CHECK(evidence.max_displacement_mm > 0);
+  CHECK(to_json(evidence)["rollback_vertices"] == evidence.rollback_vertices);
+  CHECK(to_json(evidence)["rollback_rounds"] == evidence.rollback_rounds);
+  CHECK(validate_surface(result).state == GeometryState::Valid);
+  CHECK_FALSE(surface_self_intersects(result));
+  for (int v = 0; v < raw.mesh.vertex_count(); ++v)
+    if (one_ring[v] || boundary[v])
+      CHECK(std::memcmp(result.points_m.col(v).data(),
+                        raw.mesh.points_m.col(v).data(), 3 * sizeof(double)) == 0);
+  TempDir dir;
+  write_stl(dir.file("rollback.stl"), result, "Locally rolled-back print surface");
+}
+

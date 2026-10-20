@@ -20,6 +20,8 @@
 #include "firmware/sensor_models.h"
 #include "firmware/sim_sensor_bridge.h"
 #include "firmware/subprocess.h"
+#include "firmware/private_storage.h"
+#include "firmware/renode_encoding.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -36,10 +38,26 @@
 #include <doctest/doctest.h>
 
 using nlohmann::json;
+#ifndef _WIN32
+#include <unistd.h>
+#include <sys/stat.h>
+#endif
 namespace fs = std::filesystem;
 
 namespace {
 
+struct EnvironmentGuard {
+    std::string key;
+    std::optional<std::string> previous;
+    EnvironmentGuard(std::string name, const std::string& value) : key(std::move(name)) {
+        if (const char* old = std::getenv(key.c_str())) previous = old;
+        chudware::test::setEnvironment(key.c_str(), value.c_str());
+    }
+    ~EnvironmentGuard() {
+        chudware::test::setOrUnsetEnvironment(key.c_str(),
+            previous ? previous->c_str() : nullptr);
+    }
+};
 
 #ifndef CHUDWARE_TEST_DATA
 #define CHUDWARE_TEST_DATA "tests/data/firmware"
@@ -82,7 +100,7 @@ struct FirmwareRootGuard {
         dir = fs::temp_directory_path() /
               ("chudware-fwtest-" + std::to_string(static_cast<long long>(
                    std::chrono::system_clock::now().time_since_epoch().count())));
-        fs::create_directories(dir);
+        chudware::firmware::private_directory(dir);
         chudware::test::setEnvironment("CHUDWARE_FIRMWARE_DIR", dir.string().c_str());
     }
     ~FirmwareRootGuard() {
@@ -211,10 +229,16 @@ TEST_CASE("fw_sources: list / add / remove / unknown project") {
 
     // Add materialises an empty stub; result is sorted.
     r = call("fw_sources", {{"project_id", pid}, {"add", json::array({"src/driver.c"})}});
+    INFO(r.dump());
+    REQUIRE_FALSE(r.contains("code"));
+    r = call("fw_sources", {{"project_id", pid}});
     CHECK(r["src_paths"] == json::array({"src/driver.c", "src/main.c", "src/startup.c"}));
     CHECK(fs::is_regular_file(guard.dir / pid / "src" / "driver.c"));
 
     r = call("fw_sources", {{"project_id", pid}, {"remove", json::array({"src/startup.c"})}});
+    INFO(r.dump());
+    REQUIRE_FALSE(r.contains("code"));
+    r = call("fw_sources", {{"project_id", pid}});
     CHECK(r["src_paths"] == json::array({"src/driver.c", "src/main.c"}));
 
     r = call("fw_sources", {{"project_id", "does-not-exist"}});
@@ -1043,7 +1067,7 @@ static std::string build_semi_hello(const fs::path& dir) {
     return fs::is_regular_file(elf, ec) ? elf.string() : "";
 }
 
-TEST_CASE("fw_sim_run LIVE: QEMU semihosting path (honest skip without tools)") {
+TEST_CASE("fw_sim_run LIVE: QEMU refuses firmware requiring native semihosting") {
     bool have_qemu = !chudware::firmware::which("qemu-system-arm").empty();
     FirmwareRootGuard guard;
     std::string elf = build_semi_hello(guard.dir);
@@ -1054,52 +1078,19 @@ TEST_CASE("fw_sim_run LIVE: QEMU semihosting path (honest skip without tools)") 
     }
     json proj = call("fw_new_project", {{"mcu_family", "cortex-m4"}});
     std::string pid = proj["project_id"];
-    // cortex-m4 → canonical cortex-m (generic platform). With NO assertions
-    // the T-FIN2 gate has nothing to refuse, so the run takes the preferred
-    // Renode backend even on the generic platform (same as the oracle).
-  // Budget note: Renode cold start is CPU-bound. Under parallel ctest the
-  // mesher suites can starve the emulator, so this target keeps its measured
-  // RUN_SERIAL budget.
-  //
-    // Re-measured 2026-07-29. Raising the budget is NOT the fix: at 180 s the leg still
-    // reported "timeout: renode exceeded 180s" under `ctest -j6` (burning 360 s across both
-    // live legs) while the same binary passed 1/1 with the box idle. RUN_SERIAL serialises
-    // this target against other TESTS but not against the residual machine load they leave
-    // behind, and these legs launch real external emulators (.NET renode, QEMU).
-    //
-    // So a TIMEOUT is now an honest SKIP, not a failure — the same treatment the
-    // tools-absent path already gets above. The boundary is deliberate and narrow:
-    //   * emulator produced output that is WRONG  -> FAIL (a real firmware defect)
-    //   * emulator produced no output in budget   -> SKIP (we learned nothing; asserting on
-    //                                                an experiment that never ran is noise,
-    //                                                and a red gate everyone ignores is
-    //                                                worse than a skip that says why)
-    json r = call("fw_sim_run", {{"project_id", pid},
-                                 {"elf_path", elf},
-                                 {"timeout_s", 180.0}});
-    if (emulator_timed_out(r)) {
-        MESSAGE("SKIP live QEMU leg: emulator did not finish in budget (machine contention) - "
-                << r.value("uart_log", std::string{}));
-        return;
-    }
-    CHECK(r.value("passed", false) == true);
-    CHECK(r.value("ms", 0.0) > 0.0);
-    REQUIRE_FALSE(r["trace_path"].is_null());
-    json trace = read_json(r["trace_path"].get<std::string>());
-    CHECK(trace.value("schema", "") == "aicad.firmware.trace/1");
-    CHECK(trace.value("source", "") == "renode");
-    CHECK(trace.contains("events"));
-
-    // A uart: assertion exceeds the generic Renode platform's capability, so the
-    // gate selects QEMU semihosting. QEMU writes this target's semihosting stream
-    // to STDERR; the emulator must merge both subprocess streams rather than
-    // reporting a false missing-UART failure.
-    r = call("fw_sim_run", {{"project_id", pid},
-                            {"elf_path", elf},
-                            {"assertions", json::array({"uart:hello world"})},
-                            {"timeout_s", 180.0}});
-    CHECK(r.value("passed", false) == true);
-    CHECK(r.value("uart_log", std::string()).find("hello world") != std::string::npos);
+    // The fixture asks for semihosting console/exit. That host-service interface
+    // is no longer enabled: it must not produce verified console evidence.
+    const json r = call("fw_sim_run", {{"project_id", pid},
+                                     {"elf_path", elf},
+                                     {"backend", "qemu"},
+                                     {"assertions", json::array({"uart:hello world"})},
+                                     {"timeout_s", 2.0}});
+    CHECK_FALSE(r.value("passed", true));
+    CHECK(r.value("uart_log", std::string()).find("hello world") == std::string::npos);
+    const std::string uart = r.value("uart_log", std::string());
+    const bool refused_by_fault = uart.rfind("emulator_fault:", 0) == 0;
+    const bool refused_by_timeout = uart.rfind("timeout:", 0) == 0;
+    CHECK((refused_by_fault || refused_by_timeout));
 }
 
 TEST_CASE("fw_sim_run LIVE: Renode UART path on stm32f4 (honest skip without tools)") {
@@ -1125,7 +1116,7 @@ TEST_CASE("fw_sim_run LIVE: Renode UART path on stm32f4 (honest skip without too
     // UART-only assertion → no AddStateChangedHook lines in the .resc (the
     // hook command errors on Renode 1.16.1 and aborts the script — same in
     // the Python oracle). The live run captures "hello renode" from USART1.
-    // Budget and the timeout-is-a-SKIP rule: see the QEMU leg above for the measurement.
+    // A cold Renode startup can exceed the live fixture budget under contention.
     json r = call("fw_sim_run", {{"project_id", pid},
                                  {"elf_path", elf},
                                  {"assertions", json::array({"uart:hello renode"})},
@@ -1471,7 +1462,7 @@ TEST_CASE("sensor scenario setup rejects meaningless or unbounded inputs") {
         std::invalid_argument);
 }
 
-TEST_CASE("fw_verify_board: emulate=true takes the live path") {
+TEST_CASE("fw_verify_board refuses dynamic evidence requiring native semihosting") {
     FirmwareRootGuard guard;
     bool have_qemu = !chudware::firmware::which("qemu-system-arm").empty();
     std::string elf = build_semi_hello(guard.dir);
@@ -1491,14 +1482,14 @@ TEST_CASE("fw_verify_board: emulate=true takes the live path") {
         {"sources", json{{"src/main.c", "void f(void) { digitalWrite(PIN_PA5, 1); }\n"}}},
         {"project_id", pid},
         {"emulate", true},
-        {"timeout_s", 180.0},
+        {"timeout_s", 2.0},
     });
     REQUIRE(r.value("ok", false) == true);
     INFO("dynamic: ", r["dynamic"].dump());
-    // The semihosting stream is merged from stdout/stderr and the canonical trace marker
-    // is parsed into a real dynamic GPIO event.
-    CHECK(r["dynamic"].value("ran", false) == true);
-    CHECK(r["dynamic"].value("source", "") == "emulation");
+    // Native semihosting markers are not available as physical GPIO evidence.
+    CHECK_FALSE(r["dynamic"].value("ran", true));
+    CHECK(r["dynamic"]["source"].is_null());
+    CHECK_FALSE(r["dynamic"].value("reason", "").empty());
     // The no-ELF degrade is still intact:
     json proj2 = call("fw_new_project", {{"mcu_family", "stm32f4"}});
     r = call("fw_verify_board", {
@@ -1508,4 +1499,277 @@ TEST_CASE("fw_verify_board: emulate=true takes the live path") {
         {"emulate", true},
     });
     CHECK(r["dynamic"].value("reason", "") == "no_elf: run fw_build first");
+}
+
+TEST_CASE("firmware scenario admits work and monitor identifiers before expansion") {
+    using namespace chudware::firmware;
+    json quadrature{{"schema", kScenarioSchema}, {"tracks", json::array({
+        {{"kind", "quadrature"}, {"pin_a", "PA0"}, {"pin_b", "PA1"},
+         {"steps", 100000000}, {"step_ms", 1.0}}})}};
+    CHECK_FALSE(validate_scenario(quadrature).empty());
+    auto caps = get_capabilities("stm32f4");
+    auto plan = build_scenario_plan(quadrature, caps, "gpioPortA:");
+    CHECK_FALSE(plan.errors.empty());
+    CHECK(plan.timeline.empty());
+    quadrature["tracks"][0]["steps"] = 8;
+    plan = build_scenario_plan(quadrature, caps, "gpioPortA:", 4.0);
+    CHECK_FALSE(plan.errors.empty());
+    CHECK(plan.timeline.empty());
+    plan = build_scenario_plan(quadrature, caps, "gpioPortA:", 8.0);
+    REQUIRE(plan.errors.empty());
+    CHECK(plan.timeline.size() == 8);
+    quadrature["tracks"] = json::array({quadrature["tracks"][0], quadrature["tracks"][0]});
+    for (auto& track : quadrature["tracks"]) track["steps"] = 20000;
+    CHECK_FALSE(validate_scenario(quadrature).empty());
+
+    json can{{"schema", kScenarioSchema}, {"tracks", json::array({
+        {{"kind", "can_frames"}, {"endpoint", "peer"},
+         {"events", json::array({{{"t_ms", 0}, {"id", 1}, {"payload_hex", "01"}}})},
+         {"drive_events", json::array({{{"t_ms", 1}, {"endpoint", "peer"}, {"state", 0}}})}}})}};
+    for (const std::string hostile : {"peer\" 0\necho \"AUDIT_MARK\"\n#", "peer\\escape", "peer;quit"}) {
+        can["tracks"][0]["drive_events"][0]["endpoint"] = hostile;
+        CHECK_FALSE(validate_scenario(can).empty());
+        CHECK(build_scenario_plan(can, caps, "can1:").timeline.empty());
+    }
+    can["tracks"][0]["drive_events"][0]["endpoint"] = "undeclared";
+    CHECK_FALSE(build_scenario_plan(can, caps, "can1:").errors.empty());
+#ifdef _WIN32
+    CHECK(renode_path("C:/private/input-safe.elf") == "@C:/private/input-safe.elf");
+#else
+    CHECK(renode_path("/private/input-safe.elf") == "@/private/input-safe.elf");
+#endif
+    CHECK_THROWS_AS(renode_path("/private/input with spaces.elf"), std::invalid_argument);
+    CHECK_THROWS_AS(renode_path("/private/quoted\".elf"), std::invalid_argument);
+    CHECK_THROWS_AS(renode_path("/private/input;quit.elf"), std::invalid_argument);
+    CHECK_THROWS_AS(renode_path("relative.elf"), std::invalid_argument);
+    CHECK_THROWS_AS(renode_string("peer\nquit"), std::invalid_argument);
+}
+
+TEST_CASE("firmware fake backends receive copied inputs and no native host services") {
+#ifndef _WIN32
+    using namespace chudware::firmware;
+    FirmwareRootGuard root;
+    const auto dir = private_directory(root.dir / "fake");
+    EnvironmentGuard path("PATH", dir.string());
+    EnvironmentGuard credential("CHUDWARE_FW_CREDENTIAL", "synthetic-secret");
+    const auto elf = dir / "input with spaces.elf";
+    {
+        char header[52] = {};
+        header[0] = '\x7f'; header[1] = 'E'; header[2] = 'L'; header[3] = 'F';
+        header[4] = 1; header[5] = 1; header[6] = 1; header[16] = 2; header[18] = 40;
+        std::ofstream image(elf, std::ios::binary);
+        image.write(header, sizeof(header));
+    }
+    for (const std::string backend : {"qemu-system-arm", "renode"}) {
+        const auto log = dir / (backend + ".record");
+        const auto executable = dir / backend;
+        std::ofstream script(executable);
+        script << "#!/bin/sh\n"
+               << "{ printf 'credential=%s\\n' \"$CHUDWARE_FW_CREDENTIAL\"; "
+               << "printf 'arg=%s\\n' \"$@\"; printf 'cwd=%s\\n' \"$PWD\";\n";
+        if (backend == "renode") script << "/bin/cat \"$3\"\n";
+        else script << "test -f \"$6\" || exit 8\n";
+        script << "} > '" << log.string() << "'\nexit 0\n";
+        script.close();
+        fs::permissions(executable, fs::perms::owner_all);
+        json scenario;
+        if (backend == "renode")
+            scenario = {{"schema", kScenarioSchema}, {"tracks", json::array({
+                {{"kind", "can_frames"}, {"endpoint", "peer"},
+                 {"events", json::array({{{"t_ms", 0}, {"id", 1}, {"payload_hex", "AB"}}})}}})}};
+        const auto result = run_simulation(elf.string(), "stm32f4", {}, 2.0, scenario, 0,
+                                           backend == "renode" ? "renode" : "qemu");
+        REQUIRE(result.passed);
+        const auto recorded = read_text(log);
+        CHECK(recorded.find("credential=\n") != std::string::npos);
+        CHECK(recorded.find("synthetic-secret") == std::string::npos);
+        CHECK(recorded.find(elf.string()) == std::string::npos);
+        CHECK(recorded.find("semihosting") == std::string::npos);
+        CHECK(recorded.find("target=native") == std::string::npos);
+        if (backend == "renode") {
+            CHECK(recorded.find("sysbus.can1 SubmitFrame \"peer\" 1 false false \"AB\"") != std::string::npos);
+            CHECK(recorded.find("LoadELF @") != std::string::npos);
+            CHECK(recorded.find("LoadPlatformDescription @") != std::string::npos);
+            CHECK(recorded.find("include @") != std::string::npos);
+            CHECK(recorded.find("@\"") == std::string::npos);
+        }
+    }
+#endif
+}
+
+TEST_CASE("firmware capture refuses output overflow while draining both streams") {
+#ifndef _WIN32
+    using namespace chudware::firmware;
+    FirmwareRootGuard root;
+    const auto dir = private_directory(root.dir / "capture");
+    const auto executable = dir / "finite-output";
+    std::ofstream script(executable);
+    script << "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 4096 ]; do\n"
+           << "printf '0123456789abcdef0123456789abcdef\\n'\n"
+           << "printf 'fedcba9876543210fedcba9876543210\\n' >&2\n"
+           << "i=$((i + 1))\ndone\n";
+    script.close();
+    fs::permissions(executable, fs::perms::owner_all);
+    const auto result = run_capture({executable.string()}, dir.string(), 2, true, 65536);
+    CHECK(result.output_limit_exceeded);
+    CHECK(result.returncode == -1);
+    CHECK_FALSE(result.timed_out);
+    CHECK(result.stdout_text.size() <= 32768);
+    CHECK(result.stderr_text.size() <= 32768);
+    CHECK(result.stdout_text.size() + result.stderr_text.size() <= 65536);
+    const auto closed = run_capture({"/bin/sh", "-c", "exec 1>&- 2>&-; /bin/sleep 1"},
+                                    dir.string(), 0.05, true);
+    CHECK(closed.timed_out);
+#endif
+}
+
+TEST_CASE("firmware private storage refuses symlinks without overwriting a sentinel") {
+#ifndef _WIN32
+    using namespace chudware::firmware;
+    FirmwareRootGuard root;
+    const auto sentinel = root.dir / "sentinel";
+    std::ofstream(sentinel) << "preserve";
+    const auto link = root.dir / "foreign";
+    fs::create_directory_symlink(root.dir, link);
+    CHECK_THROWS(private_directory(link / "cache"));
+    CHECK(read_text(sentinel) == "preserve");
+    const auto dir = private_directory(root.dir / "owned");
+    fs::create_symlink(sentinel, dir / "platform.repl");
+    CHECK_THROWS(private_storage_detail::atomic_write(dir / "platform.repl", "replace"));
+    CHECK(read_text(sentinel) == "preserve");
+    struct stat info {};
+    REQUIRE(::stat(dir.c_str(), &info) == 0);
+    CHECK(info.st_uid == ::geteuid());
+    CHECK((info.st_mode & 077) == 0);
+#endif
+}
+
+TEST_CASE("firmware streaming capture preserves argv and finite output on every platform") {
+    using namespace chudware::firmware;
+    auto python = which("python3");
+    if (python.empty()) python = which("python");
+    if (python.empty()) { MESSAGE("SKIP cross-platform capture: Python absent"); return; }
+    FirmwareRootGuard root;
+    SUBCASE("finite stdout and stderr are drained while the child runs") {
+        const auto result = run_capture({python, "-c",
+            "import os; os.write(1,b'o'*65536); os.write(2,b'e'*65536)"},
+            root.dir.string(), 5, true);
+        CHECK(result.returncode == 0);
+        CHECK_FALSE(result.output_limit_exceeded);
+        CHECK(result.stdout_text == std::string(65536, 'o'));
+        CHECK(result.stderr_text == std::string(65536, 'e'));
+    }
+    SUBCASE("quoted and trailing-backslash arguments retain their identity") {
+        const std::vector<std::string> values{"", "two words", "a\"b", "C:\\space dir\\", "slashes\\\\\"quote"};
+        std::vector<std::string> argv{python, "-c", "import json,sys; print(json.dumps(sys.argv[1:]))"};
+        argv.insert(argv.end(), values.begin(), values.end());
+        const auto result = run_capture(argv, root.dir.string(), 5, true);
+        REQUIRE(result.returncode == 0);
+        CHECK(json::parse(result.stdout_text) == json(values));
+    }
+    SUBCASE("finite stderr overflow is explicitly incomplete") {
+        const auto result = run_capture({python, "-c", "import os; os.write(2,b'x'*131072)"},
+                                        root.dir.string(), 5, true, 65536);
+        CHECK(result.returncode == -1);
+        CHECK(result.output_limit_exceeded);
+        CHECK(result.stderr_text.size() <= 32768);
+        CHECK(result.stdout_text.size() + result.stderr_text.size() <= 65536);
+    }
+    SUBCASE("output overflow kills descendants before they write a marker") {
+        const auto marker = root.dir / "child-survived";
+        const auto result = run_capture({python, "-c",
+            "import os,subprocess,sys,time; subprocess.Popen([sys.executable,'-c',"
+            "'import pathlib,sys,time; time.sleep(1.5); pathlib.Path(sys.argv[1]).write_text(\"escaped\")',"
+            "sys.argv[1]]); os.write(1,b'x'*131072); time.sleep(10)", marker.string()},
+            root.dir.string(), 5, true, 65536);
+        CHECK(result.output_limit_exceeded);
+        const auto pause = run_capture({python, "-c", "import time; time.sleep(2)"},
+                                       root.dir.string(), 5, true);
+        REQUIRE(pause.returncode == 0);
+        CHECK_FALSE(fs::exists(marker));
+    }
+}
+
+TEST_CASE("firmware cache and project atomic writes refuse symlink takeover") {
+#ifndef _WIN32
+    using namespace chudware::firmware;
+    FirmwareRootGuard root;
+    const auto base = firmware_root();
+    const auto sentinel = base / "sentinel";
+    private_storage_detail::atomic_write(sentinel, "preserve");
+    const auto project = new_project(std::nullopt, "stm32f4", "cmake", "private");
+    fs::remove(project.sidecar());
+    fs::create_symlink(sentinel, project.sidecar());
+    CHECK_THROWS(save(project));
+    CHECK(read_text(sentinel) == "preserve");
+    fs::remove(project.sidecar());
+    fs::create_symlink(sentinel, project.root_dir() / ".project.json.tmp");
+    CHECK_NOTHROW(save(project));
+    CHECK(read_text(sentinel) == "preserve");
+    const auto platforms = private_directory(base / "platforms");
+    fs::create_symlink(sentinel, platforms / "stm32f4_discovery.repl");
+    CHECK_THROWS(get_platform_file("stm32f4"));
+    CHECK(read_text(sentinel) == "preserve");
+    CHECK_THROWS(load("../outside"));
+    const auto outside = base / "outside.c";
+    const auto refused = call("fw_sources", {{"project_id", project.project_id}, {"add", json::array({"../outside.c"})}});
+    CHECK(refused.value("code", "") == "invalid_request");
+    CHECK_FALSE(fs::exists(outside));
+#endif
+}
+
+TEST_CASE("firmware storage rejects unsafe ownership permissions and oversized reads") {
+#ifndef _WIN32
+    using namespace chudware::firmware;
+    FirmwareRootGuard guard;
+    const auto root = firmware_root();
+    const auto file = root / "private.txt";
+    private_storage_detail::atomic_write(file, "small");
+    struct stat info {};
+    REQUIRE(::lstat(file.c_str(), &info) == 0);
+    CHECK((info.st_mode & 0777) == 0600);
+    CHECK_THROWS(private_storage_detail::read_file(file, 4));
+    CHECK(private_storage_detail::read_file(file, 5) == "small");
+    fs::permissions(file, fs::perms::group_write, fs::perm_options::add);
+    CHECK_THROWS(private_storage_detail::read_file(file));
+    CHECK_THROWS(private_storage_detail::atomic_write(file, "replace"));
+    CHECK(read_text(file) == "small");
+    const auto writable = root / "writable";
+    fs::create_directory(writable);
+    fs::permissions(writable, fs::perms::others_write, fs::perm_options::add);
+    CHECK_THROWS(private_directory(writable / "child"));
+    CHECK_FALSE(fs::exists(writable / "child"));
+    if (::geteuid() == 0) {
+        const auto foreign = root / "foreign";
+        fs::create_directory(foreign);
+        REQUIRE(::chown(foreign.c_str(), 12345, 12345) == 0);
+        CHECK_THROWS(private_directory(foreign));
+    }
+#endif
+}
+
+TEST_CASE("firmware temporary reservations and persistent per-user defaults are private") {
+    using namespace chudware::firmware;
+    FirmwareRootGuard guard;
+    const auto root = firmware_root();
+    const auto first = private_temp_directory("emulator");
+    const auto second = private_temp_directory("emulator");
+    CHECK(first != second);
+    CHECK(first.parent_path() == root / "tmp");
+    CHECK(second.parent_path() == root / "tmp");
+    CHECK_THROWS(private_temp_directory("../escape"));
+    EnvironmentGuard no_override("CHUDWARE_FIRMWARE_DIR", "");
+#ifdef _WIN32
+    EnvironmentGuard appdata("APPDATA", (guard.dir / "roaming").string());
+    CHECK(firmware_root() == guard.dir / "roaming" / "Chudware" / "firmware");
+#else
+    EnvironmentGuard home("HOME", guard.dir.string());
+    {
+        EnvironmentGuard xdg("XDG_DATA_HOME", (guard.dir / "xdg").string());
+        CHECK(firmware_root() == guard.dir / "xdg" / "Chudware" / "firmware");
+    }
+    EnvironmentGuard no_xdg("XDG_DATA_HOME", "");
+    CHECK(firmware_root() == guard.dir / ".local" / "share" / "Chudware" / "firmware");
+#endif
+    CHECK(fs::path(get_platform_file("stm32f4")).parent_path() == firmware_root() / "platforms");
 }

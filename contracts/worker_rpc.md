@@ -347,8 +347,11 @@ labelled cutting line / detail circle on the parent and titles each derived view
 
 ### Evaluate (M5; overlay-producing methods return `{aicm_path}` with `SCLR` chunks)
 `eval_measure {doc_id, refs:[Selector,…]}` → `{kind, distance?, angle?, length?, area?, radius?,
-points?:[…]} `· `eval_mass {doc_id, body?}` → `{volume_mm3, mass_g, com:[3], inertia:[9],
-material}` · `eval_section_props {doc_id, plane: Selector|datum-id}` · `eval_interference
+points?:[…]} `· `eval_mass {doc_id, body?, density_g_cm3?}` → `{volume_mm3, mass_g, com:[3],
+inertia:[9], material:{density_g_cm3, source, key?, mixed?}}` (no density = each body's applied
+material: `body_materials` override, document material, assembly component source material;
+7.85 only where none resolves; `source` ∈ explicit|body_material|document_material|
+component_material|default|per_body) · `eval_section_props {doc_id, plane: Selector|datum-id}` · `eval_interference
 {doc_id}` → fit-report shape (kernel `_fit_report`) · `eval_draft {doc_id, pull:[3], angle_deg}`
 · `eval_thickness {doc_id}` · `eval_curvature {doc_id, kind: "gaussian"\|"mean"\|"max"}` ·
 `eval_check {doc_id}` → `{issues:[{kind, severity, text, ref?}]}` · `eval_symmetry {doc_id,
@@ -2156,3 +2159,413 @@ file. If the assembly has no file, it is the `project_dir` that `doc_new` receiv
 exists, it is null. `doc_new.project_dir` must be absolute. A relative value fails with
 `invalid_op` (`relative project_dir`). `describe_assembly` returns `source_resolved` next to
 each stored `source`, and `read_native_file` does the same for native assemblies.
+
+## Online steer correlation and Stop withdrawal (append-only, 2026-10-11)
+
+`agent_steer` (and control action `steer`) accepts an OPTIONAL `steer_id` string and echoes it
+as `steer_id` in every response. A user steer stays tracked until its user message streams
+(`agent.steer {status:"delivered"}`, contracts/agent_events.md). While one is unread, host
+tools that declare a `wake` parameter receive a host callable returning `"user_message"`;
+`wait_job` uses it to end its wait at once with `woken_by:"user_message"`, `still_running:true`
+(the job keeps running). `agent_cancel` (control action `cancel`) withdraws unread user steers
+from Chudcode's queue BEFORE aborting and returns `carried_steer_ids` (ids of the withdrawn
+steers that carried one); a withdrawn steer opens that conversation's next prompt, in order.
+
+## Writer groups, event delivery, busy doc_list (append-only, 2026-10-12)
+
+- `hello` accepts an OPTIONAL `writer_group` string. Every Python worker process opens one
+  connection per calling thread (parallel sub-agents run engine calls concurrently) and sends
+  one per-process `writer_group` on each. hostd treats a group as ONE writer: it is counted once
+  for read-write attach/CAS `base_revision` injection, shares one last-seen revision, is not a
+  "foreign" writer to itself (`_foreign_edits`), and a member's `edit_hold` does not refuse the
+  other members. Document lifetime stays per connection: a member leaving detaches and never
+  destroys a doc another member still attaches. Clients without the field are unchanged.
+- Event delivery (`doc.*`, agent events) never drops silently. A send waits up to 2 s for the
+  connection's write lock. On failure, hostd logs once and disconnects that client, which
+  reconnects, re-subscribes and re-lists.
+- `doc_list` and name minting never wait on another document's in-flight operation. A busy doc's
+  entry is served from its last summary snapshot with `busy: true`. A rejected `doc_apply_ops`
+  batch never republishes geometry under the committed revision's AICM key.
+- Python `core_bridge`: `doc_apply_ops` without an explicit `base_revision` is sent with
+  `base_revision: -1` (see "Concurrent agent turns and shared parts"). A mutating call refused
+  `busy_preview` (a user PropertyManager hold) retries at the server's `retry_ms` for up to 30 s,
+  then raises a teaching error. Each sub-agent keeps its own current part (keyed by run/session +
+  agent id). A doc-less sub-agent call targets that sub-agent's part before the turn's document.
+- GUI interim lock (issue #55): a doc written by a non-`gui` `source_kind` locks every human
+  mutation of it while the run(s) live at that write continue, or for 8 s after the last foreign
+  write (`AppState::docLockedByAgent`). Open human sketch/3D-sketch/PM/drag sessions on it exit
+  keeping their work (never `doc_revert`). A reserved banner offers Stop
+  (`CHUDWARE_SHOT=agentlock`).
+
+## Concurrent agent turns and shared parts (append-only, 2026-10-12)
+
+**Worker pool.** hostd runs each `agent_admin_turn` in its own agent-lane worker process:
+- The primary worker (`CHUDWARE_HOSTD_WORKER_LANE=agent`) serves every non-turn agent-lane call and takes turns when it is free.
+- Extras (`agent-turn`) start on demand, up to `CHUDWARE_AGENT_WORKERS` total (default 4, clamped 1..8).
+- An `agent-turn` worker starts the control server and warms the prompt cache. It never reconciles or shuts down the bench, and never warms the transient Chudcode service process.
+- An extra idle for 10 minutes is stopped at the next turn selection.
+- When every worker is busy and the cap is reached, a turn waits for its call's timeout and then fails with `worker_lane_busy`; a turn with no timeout waits until a worker frees.
+
+**Conversation ownership.**
+- hostd maps `session_id` to the worker that last ran it. That conversation's turns, and agent-lane calls carrying its `session_id`, go to that worker. Exceptions: `worker_control_info` and `rule_create` always go to the primary.
+- One conversation never runs two turns at once.
+- To move a conversation to a free worker, hostd first sends the busy owner the control action `release {session_id}`. Replies:
+  - `{ok:true, released:bool}` after the idle Chudcode runtime is disposed (its session file is flushed).
+  - `{ok:false, reason:"session_busy"}` when the conversation has a live run. Nothing is cancelled.
+- If the release fails or is refused, the turn waits for the owner.
+- A worker that is being reaped keeps its conversations until its child has exited.
+
+**Control.** `agent_cancel`, `agent_steer` and `agent_answer` reach the worker running that `run_id`, in any pool worker. Daemon-mode GUI turns no longer fetch `worker_control_info`. Control sockets are named `chudcode-worker-<ppid>-<pid>.sock`, so pool workers no longer collide.
+
+**Process lifetime.** Workers are forked on a daemon-lifetime thread. Linux PDEATHSIG follows the forking thread, so before this fix a worker died as soon as the client connection that triggered its spawn closed.
+
+**GUI connections.** In daemon mode each concurrent `agent_admin_turn` leases its own agent run connection (at most 8). Native `agent_run_v2` and `agent_mission_v1` still run one at a time.
+
+**Shared parts.**
+- Python `core_bridge` sends `doc_apply_ops` without an explicit `base_revision` as `base_revision: -1`. Batches from different writer groups then apply in arrival order under the engine's per-doc lock, each atomic and validated, with no CAS refusal.
+- An explicit `base_revision` still gets CAS.
+- `doc_checkpoint` returns `{checkpoint, revision}`.
+- `doc_revert` accepts optional `expect_revision`. On mismatch it raises `stale_revision` (detail `current_revision`), consumes the checkpoint, and leaves the doc untouched.
+- `doc_list` rows carry `other_writer` (bool): a connection outside the caller's writer group holds an rw attach. The end-of-turn save sweep skips untouched agent docs that have `other_writer`.
+
+## Turn-owned CAD sockets (append-only, 2026-10-13)
+
+This supersedes the calling-thread lifetime described under Writer groups. Online agent
+turns lease independent daemon sockets from a turn-owned pool. A completed host tool returns
+its socket to that pool rather than disconnecting when its transient RPC thread exits.
+Nested calls reuse the current lease; simultaneous calls never share a socket. The pool is
+bounded by peak simultaneous CAD calls, not accumulated tool count. Lazy acquisition does
+not open sockets for tools that never call CAD.
+
+Turn cleanup closes idle sockets; an already-dispatched call retains its lease until return.
+No mutation is interrupted by pool retirement. A new lease after retirement fails with
+`engine_connection_lost`, `detail.outcome: not_dispatched`. Actual daemon loss still
+follows existing no-blind-mutation-replay rules. Standalone MCP calls retain thread-local
+connections. Document locks and disconnect events remain real: do not hide them in the GUI.
+
+Agents share one project registry and explicitly address parts. Connections are transport
+resources, not separate workspaces. Per-document atomic batch serialization and explicit
+CAS semantics above remain unchanged.
+
+## Control endpoint lifetime (append-only, 2026-10-13)
+
+The authenticated endpoint belongs to the worker process generation, not a single control
+request. Request refusal, timeout, malformed/oversized response, or connection loss reports
+that request's failure without erasing the endpoint required by later answer/steer/Stop
+calls. Worker teardown or replacement invalidates it. Requests are never blindly replayed,
+and control never falls back onto a stdio lane occupied by a turn.
+
+Hostd snapshots endpoint credentials under its control-state mutex and releases the mutex
+before network I/O; a stalled request cannot block another conversation's control routing
+or the owning turn's terminal cleanup. Existing request limits and deadlines remain in force.
+
+## Tenant-cell RPC admission and ownership (append-only, 2026-10-13)
+
+This addendum applies ONLY to hostd launched with `--cell`. Desktop/local daemon
+discovery, authentication, document sharing, and worker behaviour remain unchanged.
+Browser CAD and AI execution require an OS-isolated workspace cell and nested
+actor worker sandboxes; there is no unsandboxed fallback.
+
+### Principals and transport
+
+The gateway connects through the host-only socket-activated listener and sends
+`hello` with `principal:{workspace_key,actor_key,right,epoch,connection_nonce}`.
+`workspace_key` is `user:<immutable account UUID>` or `team:<org_id>/<team_id>`;
+`actor_key` is the immutable account UUID, never an email. `right` is
+`owner|manager|editor|viewer`, and `epoch` is the gateway-owned revocation epoch.
+The gateway's trusted connection establishes the principal; tenant-supplied
+principal fields on other listeners cannot establish or elevate identity.
+
+An actor's internal listener is `/state/actors/<actor_hex>/run/hostd.sock`,
+where `actor_hex = sha256(actor_key)[:32]`. Its listener identity establishes the
+actor and caps rights at that actor's current gateway grant. No anonymous internal
+listener is available to tenant code. Client `writer_group` cannot override cell
+identity: the effective writer group is `(workspace_key,actor_key)`.
+
+`principal_revoke {actor_key,epoch}` and
+`principal_update {actor_key,right,epoch}` are gateway-only identity controls,
+NOT browser/actor RPCs. Their public method-policy entries are `cell:"refuse"`.
+Trusted gateway identity-control dispatch is separate from tenant admission.
+Revocation or grant change closes the actor's connections and subscriptions,
+stops its runs with `run_stopped reason=revoked`, and drops its worker lanes;
+stale epochs refuse with `revoked`.
+Native and worker actor registries retain epoch tombstones even when no worker
+lane or run is active. An already-admitted request carrying a retired epoch
+cannot start work after revocation. `principal_update` retires epochs older
+than its new epoch, while permitting fresh reconnections at that new epoch.
+The native cancellation marker `_cell_revoke_through` is hostd-only: hostd
+strips it from tenant requests before dispatch. It is an internal parameter,
+not a public RPC method or a tenant-authorized cancellation capability.
+
+### Explicit method policy
+
+`contracts/cell_methods.json` is a flat JSON object, consumed directly by hostd
+and the gateway:
+
+```json
+{
+  "doc_tree": {"cell": "allow", "right": "read", "scope": "workspace"},
+  "agent_admin_turn": {"cell": "allow", "right": "run", "scope": "actor"},
+  "worker_control_info": {"cell": "refuse", "right": "write", "scope": "workspace"}
+}
+```
+
+The example illustrates the schema; the checked-in file is the exhaustive
+classification. Each method has EXACTLY `cell`, `right`, and `scope`.
+`cell` is `allow|refuse`, `right` is `read|write|run|manage`, and `scope` is
+`workspace|actor`. Unknown methods ALWAYS refuse with `cell_refused`; there is
+no runtime prefix, wildcard, read-shaped-name heuristic, or administrator bypass.
+`refuse` overrides every grant. Viewers have `read` only; editors can additionally
+`write` and `run`; owners/managers can additionally `manage`. Actor-scoped access
+still requires ownership even when the method's required right is satisfied.
+Cross-actor manager authority is limited to explicit cancel/stop controls.
+Steer, answer, close, release, session mutation, and private reads remain
+owner-only; foreign access refuses `not_found`.
+
+`scripts/cell_methods.py` reuses `scripts/parity_audit.py`'s native and worker
+harvest, then includes the delegated native dispatchers and hostd lifecycle,
+document-registry, child-supervision, and manufacturing handlers. Missing OR
+stale classifications fail validation. A new delegated dispatcher also requires
+an explicit source mapping. `--generate` only canonicalizes a complete, explicitly
+classified file; it never grants or guesses a classification for an added method.
+The installed cell runtime policy is `/opt/chudware/contracts/cell_methods.json`;
+a missing or malformed policy fails cell admission closed.
+
+Document revision read-only guards are not tenant permission classifiers.
+`doc_save`, history clearing/checkpointing, export-to-file, actor/session changes,
+simulation study mutation, job cancellation, and code/AI execution do not become
+viewer reads merely because an older document guard admitted their prefixes.
+Pure document queries, activation/rebuild without model edits, rendering,
+measurements, and inspection remain reads. Viewer attachments are pinned `ro`
+by their principal, regardless of client-requested mode.
+`doc_open` is a `read` operation for opening an existing workspace file into a
+fresh document and rendering previews. The registry pins a viewer's new attachment
+`ro`; file open does not authorize document edits, explicit saves, or `import_file`,
+which continues to require `write`.
+Query-shaped PLM handlers that open/seed a vault, export optional history
+thumbnails, or rebuild persisted graph data require `write`; their names alone
+do not establish viewer safety.
+
+Always refused tenant surfaces include `agent_spawn/agent_stop/agent_list`,
+`daemon_*`, `recovery_*`, `mfg_*`, firmware/device/serial operations,
+CLI providers (`claude_cli`/`codex_cli`), provider pool/subscription management,
+Box mirroring, `worker_control_info`, and test-only stall RPCs. CLI providers and
+pool/subscription credential selection embedded within another RPC's parameters
+must also refuse; method admission alone cannot authorize such credential modes.
+Cell AI uses actor-isolated BYOK credentials and returns
+`credential_isolation_unsupported` for unsupported credential scopes.
+Phone/LAN capture bridges are also refused: every `capture_*` method, plus
+`start_capture_session` and `stop_capture_session`. Offline reconstruction of
+workspace files remains available through the non-capture reverse-engineering RPCs.
+
+### Worker context, resources, and events
+
+Hostd sends the worker envelope's trusted request context:
+`ctx:{workspace_key,actor_key,actor_hex,right,epoch,client_id,cell:true}`.
+The worker binds `ctx` per request with a context variable; desktop requests do
+not acquire tenant identity. Worker lanes are keyed by actor and launched through
+the fixed actor sandbox, with `/work` bound `rw` or `ro` as appropriate. Ask/Plan
+code execution uses the actor's `ro` sandbox. No per-turn process-global cwd or
+environment mutation is permitted; roots and credential scope are explicit.
+The cell overlay disables browser/computer capabilities.
+
+Sessions, runs, steers, history seeds, subagents, DAGs, reverse-engineering
+sessions, simulation jobs, leases, profiles, and artifacts stamp
+`(workspace_key,actor_key)` at creation. Every lookup, control, mutation, and
+event checks ownership. A foreign ID has the same `not_found` response as an
+absent ID. Server-minted opaque IDs are not filesystem path components;
+client handles map to internal IDs server-side. Empty run cancellation targets
+only the caller's own runs.
+
+For an explicitly authorized cross-actor cancel/stop, hostd preserves the
+owning actor's identity, rights, and epoch in `ctx`, and adds the optional nested
+field `ctx.control_delegate`:
+`{actor_key:<manager>,right:"manager",action:"cancel"}`.
+This field is absent on ordinary requests; it is NOT a top-level envelope sibling.
+The marker identifies the manager requesting cancellation without replacing the
+run owner or granting read/mutation authority. It is never tenant-supplied or an
+entry in `contracts/cell_methods.json`. Authorized stop does not require the
+owning actor's original BYOK credentials.
+No delegation is accepted for steer, answer, close, or release; those operations
+require the owner and otherwise return `not_found`. The flat policy continues
+to mark every such method `scope:"actor"`: satisfying its `right` alone never
+authorizes another actor's resources.
+The cross-actor cancellation allowlist is `agent_cancel`,
+`reveng_cancel_splat`, and native `sim_cancel` only. `dag_abort` is owner-only:
+it rejects a paused gate and does not stop an active DAG run, so it is not a
+delegated stop capability.
+
+`agent_handles_new {session_id?:existing}` is an actor-scoped `run` operation:
+it returns `{ok:true,run_id,session_id}` with server-minted handles for a cell
+turn. A session with a recorded foreign owner refuses `not_found` before
+acquiring a worker lane. An unknown handle is dispatched only to the requester's
+own actor lane, whose persistent registry resolves ownership or returns
+`not_found`; this preserves session resumption after cell/hostd restart.
+`worker_lane_busy` on that path describes only the requester's own lane.
+Hostd records ownership on a successful response. Clients use these handles for
+the corresponding turn and controls; this handshake does not grant access to
+another actor's worker or relax gateway right checks.
+
+Gateway doc events are delivered only for documents that connection attached.
+Agent/run/chat/subagent/DAG/job events are delivered only to the owning actor.
+Manufacturing, child-supervision, and daemon broadcast event classes never cross
+the tenant gateway connection. Document edits remain workspace-shared and
+carry `actor_key` in edit attribution and last-writer data.
+
+Top-level file-operation arguments resolve under `/work`; hostd additionally
+rejects absolute paths outside `/work` and the caller's own
+`/state/actors/<actor_hex>` state. Embedded document references, including
+assembly `source.path` and import-feature paths, remain workspace-relative:
+hostd preserves their spelling and rejects absolute paths, `..` components,
+and NUL bytes before engine dispatch. The native reference resolver enforces
+symlink confinement when inserting or resolving those references. The
+namespace is the primary filesystem boundary. Feature history, atomic
+arrival-order document edits, warm persisted build caches, and human-editable
+relations/dimensions retain their existing contracts.
+
+Cell refusals use the existing error envelope and named codes:
+`not_found`, `forbidden_right`, `revoked`, `cell_refused`, and
+`credential_isolation_unsupported`. A refusal is not a successful no-op and
+never causes desktop fallback or mutation replay.
+
+Cell startup requires the native `chudware_set_cache_refresh_sink` export so
+asynchronous cache verification can publish refreshed geometry. A missing export
+fails cell startup closed. Desktop compatibility keeps this export optional:
+its absence must not crash or block the immediate warm cached snapshot.
+
+## Six-axis trace tooling corrections (append-only, 2026-10-15)
+
+### Owning roots, online knowledge and timeout recovery
+
+Host-tool bindings capture the selected canonical `project_dir` and `save_dir` from
+their owning turn before activation; fresh SDK threads and tool refreshes retain
+those roots. An explicitly unavailable cell root refuses rather than inheriting
+ambient desktop authority. `workspace_status` uses the same request-local roots.
+Online descriptions retain their schema summary and include effective curated
+`prompt_note`, timeout/recovery policy and matching built-in/project-auto
+`cad_skill` pointers. Eval suppressing result-prefix injection must not hide these
+pointers. Always-denied agent `undo`/`redo` are absent from mounted/loadable tools;
+human history RPCs are unchanged.
+
+A host-tool wait expiring is not evidence that native work stopped. Its refusal
+reports `status:"still_running"`, `in_flight:true`, `timed_out:true`, `timeout_s`
+and `started_new`. The identical invocation within the same run/agent/document/
+tenant/root authority joins the original future, including a completed but
+unconsumed result. A document-creating call does not change identity when it makes
+its new document current. A retry observer neither spends another cap slot nor
+executes the body again; pre-body validation refusals refund once even after the
+initial wait ended. A later invocation after result consumption is fresh work.
+Turn completion/abort retires context- and metadata-held recovery objects, releases
+retained results and rejects stale callbacks with `run_ended`; it does not kill
+native work. This is run-local recovery, not durable cross-process replay.
+Consumers check outer `hasError` and inner `ok:false` before success-only fields.
+
+### Bounded advisory rebuilds and measurement evidence
+
+Native `doc_dry_run_ops` accepts optional integer `budget_ms >= 0`; omitted/zero
+retains complete unbounded validation for existing callers. `preflight_ops` uses
+a cumulative 10000-ms candidate budget, subtracting elapsed metadata work.
+The bounded POSIX lane snapshots without mutating the live document, then runs
+the entire candidate in an expendable process group. Rebuild, serialization and
+bounded result transfer share the deadline; it never falls back into an unbounded
+parent rebuild. Its direct child is reaped and the group terminated on expiry.
+Unavailable isolation, isolation failure and expiry return native `ok:false`,
+`skipped:"isolation_unavailable"|"isolation_failed"|"budget_exceeded"`,
+`timed_out`, `still_running:false`, `budget_ms`, `source_revision` and `error`.
+Python reports `verdict:"skipped"` with the corresponding reason, not feasibility.
+The candidate budget is not a hard end-to-end bound on lock acquisition, metadata
+RPCs, transport or OS cleanup. Null blend construction does not establish that a
+radius is too large.
+
+Motion threshold checks may reuse successful geometry and pair results only at
+unchanged exact topology/relative rigid pose. Proven-disjoint validated members
+may use all boundary shells for distance, avoiding redundant solid containment;
+uncertain or positive-volume intersections keep the full-solid path. Per-frame
+`pairs_checked` includes reused classifications; `pairs_reused` and pair
+`reused:true` expose reuse. The aggregate interference detail remains the first
+hit, not a union or continuous-path proof. Wall-thickness minima remain sampled
+local inward-ray spans, including edge tapers; `measurement_basis` and
+`minimum_sample` expose offsets, cutoffs, unresolved samples and the winning ray.
+Automatic battery distance probes select uniquely addressable opposing planar
+faces; unsupported topology is a named skip, not a fabricated bbox measurement.
+
+### Detached-source save authority and study identity
+
+This narrows the September 30 native-source save-back rule: study-only detached
+scratch must save to an unused project destination, not overwrite its source.
+Detached documents with non-study authored changes retain source-save behavior
+unless another GUI document holds that source, in which case automatic delivery
+also chooses an unused destination. Explicit saves retain GUI-holder protection;
+documents already opened on a real path keep their existing save-in-place rule.
+`doc_list[].native_source_edited` is true when native provenance exists and
+monotonic revisions exceed study-only revisions; explicit undo/revert count as
+non-study authoring. This flag is not a geometric-difference comparison.
+
+New study IDs are unique within the loaded document. Editing a legacy duplicate
+ID selects the first matching payload `type` and `name`, assigns that entry a
+fresh stable ID and returns it as `sim_study_edit.study_id`; unrelated entries
+are unchanged. A duplicate ID without a matching key refuses `invalid_op`
+(`reason:"ambiguous study id"`). `_persist_study` retains the returned identity.
+Opening an archive does not globally rewrite legacy study IDs.
+
+## Topology optimization for 3D printing (append-only, 2026-10-16)
+
+### Study and native envelope
+
+The canonical topology study (GUI and `run_topology_optimization`) gains two top-level
+keys. `print_process:"<id>"` names a preset from
+`services/sim/topology_print_processes.json` (schema `chudware.topology_print_processes/1`:
+`processes[{id,label,process:fdm|sla|sls,nozzle_mm?,line_width_mm?,layer_height_mm,
+description,topology:{key:value|null}}]`). Applying a preset writes only topology keys the
+selected method x physics pair offers; `null` erases a key. The GUI Apply action overwrites;
+the model tool fills keys the study does not set explicitly and persists them. Unknown ids
+refuse `unknown_print_process` (field `study.print_process`).
+`build_plate:{faces:[selector...],label?}` is the bed contact face. `sim_run_topology`
+accepts `build_plate:{faces:<resolved faceset>,label?}` for every physics; the derived build
+direction is the negated area-weighted outward normal. Native refusals, raised before
+optimization with `field:"build_plate"`: `build_plate_empty`, `build_plate_not_planar`
+(> 2 deg spread), `build_plate_direction_conflict` (explicit `build_direction` > 2 deg
+away), `build_plate_not_lowest` (material below the plate plane; message gives mm).
+An overhang penalty needs `build_direction` or `build_plate` (`build_direction_required`);
+the model tool refuses that, a missing/out-of-range `volume_fraction`
+(`missing_volume_fraction`) and a mass objective without a response limit
+(`mass_needs_limit`) before saving the study or exporting STEP.
+
+### Result additions
+
+`result.topology` carries the run's topology settings plus effective `build_direction`,
+`overhang_angle_deg` and `overhang_penalty`. With no explicit `filter_radius_mm`, a set
+`min_member_mm` yields radius max(min_member/2, 2 x median element size); summary then
+reports `min_member_filter_radius_mm` and `mesh_floor_radius_mm`.
+`manufacturing.enforcement.overhang` adds `build_direction_source`
+(`build_plate|build_direction`), `build_plate{triangles,area_mm2,normal}`,
+`surface_unsupported_area_mm2`, `surface_unsupported_area_fraction` and
+`surface_measured_on` (`print|reconstruction`). A geometry-valid run also writes
+`surface_print.stl` (artifact `surface_print_stl`): pinned Taubin smoothing of the validated
+surface (domain-boundary vertices fixed). Crossing, degenerate or float32-failing triangles
+are rolled back to raw positions with their one-ring (up to 8 rounds per iteration count,
+then the count halves 12→6→3→1). It is accepted only as a valid manifold without
+self-intersecting triangles, else `artifact_refusals.surface_print_stl`
+`{code:"print_surface_invalid"}`. `reconstruction.print_surface{state,iterations_requested,
+iterations_used,pinned_vertices,smoothed_vertices,rollback_vertices,rollback_rounds,
+max_displacement_mm,volume_change_fraction,self_intersections_checked,reason?}` reports it.
+`overlay.aicm` uses the print surface when
+valid (`artifacts.overlay_aicm.surface`) and appends vertex scalar `overhang` (0..1, fixed
+range) when a build direction is known. `surface.stl` and the reanalysis are unchanged.
+
+### Worker method `topology_dfam`
+
+Python worker method (general lane, gui-background allowlisted; cell policy
+`allow/run/actor`). Params `{run_dir:<absolute sim_run_topology run directory>,
+print_process?:<id>}`. It reads `<run_dir>/result.json`, refuses a non-topology result
+(`invalid_result`) or a preferred surface (`surface_print_stl`, else `surface_stl`) whose
+file is outside the run dir, missing, stale or not matching its sha256
+(`artifact_mismatch`), then runs the same `services.sim.topology.dfam_report` as the model
+tool collector with the preset's process/nozzle/layer height and the effective build
+direction (+Z with `build_dir_assumed:true` when none). Returns
+`{ok:true,dfam:{checked,passed,status,artifact,process,build_dir,overhang_max_deg,
+min_wall_mm,nozzle_mm?,layer_height_mm?,checks[{check,status,note}],summary},
+print_ready:false,print_ready_reason}` or `{ok:false,code,error}`. The GUI merges `dfam`
+into the finished run record of a geometry-valid GUI run and persists the study; agent run
+records are never rewritten. `print_ready` stays false: only `slice_part` G-code validation
+makes a part print-ready.

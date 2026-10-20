@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <functional>
@@ -712,7 +713,7 @@ CurveDescriptor curve_descriptor(const std::string& etype,
         d.idx = pick(vidx, {0, 1, 2});
         d.eval = circle_curve;
         d.scan = [](const VectorXd&, int n) { return linspace(0.0, 2.0 * kPi, n); };
-    } else if (etype == "ellipse_arc") {
+    } else if (etype == "ellipse_arc" || etype == "ellipse") {
         d.ok = true;
         d.idx = pick(vidx, {0, 1, 2, 3, 4});
         d.eval = ellipse_arc_curve;
@@ -728,6 +729,7 @@ CurveDescriptor curve_descriptor(const std::string& etype,
         d.eval = conic_curve;
         d.scan = [](const VectorXd&, int n) { return linspace(0.0, 1.0, n); };
     } else if (etype == "spline") {
+        if (vidx.size() < 4) throw std::runtime_error("spline curve has fewer than two points");
         d.ok = true;
         d.idx = vidx;
         int npts = static_cast<int>(vidx.size()) / 2;
@@ -736,6 +738,7 @@ CurveDescriptor curve_descriptor(const std::string& etype,
             return linspace(0.0, static_cast<double>(std::max(npts - 1, 1)), n);
         };
     } else if (etype == "style_spline") {
+        if (vidx.size() < 4) throw std::runtime_error("style_spline curve has fewer than two points");
         d.ok = true;
         d.idx = vidx;
         d.eval = style_spline_curve;
@@ -1222,7 +1225,8 @@ void add_point_on(System& sys, const std::string& cid, const std::string& point_
             [pv, kp](const VectorXd& xs) {
                 Vector2d P = pv(vhead(xs, kp));
                 double ax = xs(kp), ay = xs(kp + 1), bx = xs(kp + 2), by = xs(kp + 3);
-                return r1((bx - ax) * (P(1) - ay) - (by - ay) * (P(0) - ax));
+                double length = std::max(std::hypot(bx - ax, by - ay), 1e-12);
+                return r1(((bx - ax) * (P(1) - ay) - (by - ay) * (P(0) - ax)) / length);
             },
             combined,
             [pv, pj, kp](const VectorXd& xs) {
@@ -1237,6 +1241,11 @@ void add_point_on(System& sys, const std::string& cid, const std::string& point_
                 J(0, kp + 1) = (Px - ax) - dxab;
                 J(0, kp + 2) = Py - ay;
                 J(0, kp + 3) = -(Px - ax);
+                double length = std::max(std::hypot(dxab, dyab), 1e-12);
+                double cross = dxab * (Py - ay) - dyab * (Px - ax);
+                Eigen::RowVector4d dl(-dxab / length, -dyab / length, dxab / length, dyab / length);
+                J /= length;
+                J.rightCols(4) -= (cross / (length * length)) * dl;
                 return J;
             },
             cid);
@@ -1328,7 +1337,34 @@ void add_point_on(System& sys, const std::string& cid, const std::string& point_
             [rfn](const VectorXd& xs) { return numeric_jac_1(rfn, xs); }, cid);
         return;
     }
-    // else: unsupported entity type for point_on -- skip silently.
+    if (t == "spline" || t == "style_spline") {
+        CurveDescriptor desc = curve_descriptor(t, var_map.at(eid));
+        const int ke = static_cast<int>(desc.idx.size());
+        auto rfn = [pv, kp, ke, desc](const VectorXd& v) {
+            Vector2d P = pv(v.head(kp));
+            VectorXd cv = v.segment(kp, ke);
+            VectorXd scan = desc.scan(cv, 81);
+            double best = scan(0), dist = std::numeric_limits<double>::infinity();
+            for (int i = 0; i < scan.size(); ++i) {
+                double d = (desc.eval(cv, scan(i)).first - P).squaredNorm();
+                if (d < dist) { dist = d; best = scan(i); }
+            }
+            double u = newton_project([&](double p) { return desc.eval(cv, p); }, best, P);
+            u = std::clamp(u, scan(0), scan(scan.size() - 1));
+            CurvePair q = desc.eval(cv, u);
+            Vector2d delta = P - q.first;
+            double offset = signed_offset(P, q.first, q.second);
+            if ((u <= scan(0) + 1e-10 && delta.dot(q.second) < 0) ||
+                (u >= scan(scan.size() - 1) - 1e-10 && delta.dot(q.second) > 0))
+                return std::copysign(delta.norm(), offset == 0 ? 1.0 : offset);
+            return offset;
+        };
+        sys.add_residual([rfn](const VectorXd& v) { return r1(rfn(v)); },
+                         concat(p.idx, desc.idx),
+                         [rfn](const VectorXd& v) { return numeric_jac_1(rfn, v); }, cid);
+        return;
+    }
+    throw std::runtime_error("point_on: unsupported curve ref '" + entity_h + "' (" + t + ")");
 }
 
 void add_fix(System& sys, const std::string& cid, const std::string& handle,
@@ -1341,12 +1377,14 @@ void add_fix(System& sys, const std::string& cid, const std::string& handle,
     auto dot = handle.find('.');
     if (dot != std::string::npos) sub = handle.substr(dot + 1);
 
+    bool applied = false;
     auto pin = [&](const std::vector<int>& idx, const VectorXd& tgt) {
         int k = static_cast<int>(idx.size());
         VectorXd t_copy = tgt;
         sys.add_residual(
             [t_copy, k](const VectorXd& xs) { return VectorXd(xs - t_copy); }, idx,
             [k](const VectorXd&) { return MatrixXd(MatrixXd::Identity(k, k)); }, cid);
+        applied = true;
     };
 
     if (t == "point") {
@@ -1452,60 +1490,35 @@ void add_fix(System& sys, const std::string& cid, const std::string& handle,
                 return r1Vec2(P - tgt);
             },
             h.idx, [hj](const VectorXd& xs) { return hj(xs); }, cid);
+        applied = true;
     }
+    if (!applied) throw std::runtime_error("fix: unsupported handle '" + handle + "'");
 }
 
-// Two lines' direction vars [ax,ay,bx,by] for parallel/perpendicular/collinear.
-void add_parallel(System& sys, const std::string& cid, const std::string& h0,
-                  const std::string& h1, const VarMap& var_map) {
-    std::vector<int> combined =
-        concat(pick(var_map.at(eid_of(h0)), {0, 1, 2, 3}),
-               pick(var_map.at(eid_of(h1)), {0, 1, 2, 3}));
-    sys.add_residual(
-        [](const VectorXd& xs) {
-            double ax = xs(0), ay = xs(1), bx = xs(2), by = xs(3);
-            double cx = xs(4), cy = xs(5), dx = xs(6), dy = xs(7);
-            return r1((bx - ax) * (dy - cy) - (by - ay) * (dx - cx));
-        },
-        combined,
-        [](const VectorXd& xs) {
-            double ax = xs(0), ay = xs(1), bx = xs(2), by = xs(3);
-            double cx = xs(4), cy = xs(5), dx = xs(6), dy = xs(7);
-            MatrixXd J(1, 8);
-            J << -(dy - cy), (dx - cx), (dy - cy), -(dx - cx), (by - ay), -(bx - ax),
-                -(by - ay), (bx - ax);
-            return J;
-        },
-        cid);
-}
-
-void add_perpendicular(System& sys, const std::string& cid, const std::string& h0,
-                       const std::string& h1, const VarMap& var_map) {
-    std::vector<int> combined =
-        concat(pick(var_map.at(eid_of(h0)), {0, 1, 2, 3}),
-               pick(var_map.at(eid_of(h1)), {0, 1, 2, 3}));
-    sys.add_residual(
-        [](const VectorXd& xs) {
-            double ax = xs(0), ay = xs(1), bx = xs(2), by = xs(3);
-            double cx = xs(4), cy = xs(5), dx = xs(6), dy = xs(7);
-            return r1((bx - ax) * (dx - cx) + (by - ay) * (dy - cy));
-        },
-        combined,
-        [](const VectorXd& xs) {
-            double ax = xs(0), ay = xs(1), bx = xs(2), by = xs(3);
-            double cx = xs(4), cy = xs(5), dx = xs(6), dy = xs(7);
-            MatrixXd J(1, 8);
-            J << -(dx - cx), -(dy - cy), (dx - cx), (dy - cy), -(bx - ax), -(by - ay),
-                (bx - ax), (by - ay);
-            return J;
-        },
-        cid);
-}
 
 void add_equal(System& sys, const std::string& cid, const std::string& h0,
                const std::string& h1, const EntMap& entities, const VarMap& var_map) {
     std::string e0 = eid_of(h0), e1 = eid_of(h1);
     std::string t0 = entities.at(e0).at("type"), t1 = entities.at(e1).at("type");
+    auto equal_vars = [&](std::initializer_list<int> positions) {
+        auto a = pick(var_map.at(e0), positions), b = pick(var_map.at(e1), positions);
+        const int n = static_cast<int>(a.size());
+        sys.add_residual([n](const VectorXd& v) { return VectorXd(v.head(n) - v.tail(n)); },
+                         concat(a, b), [n](const VectorXd&) {
+            MatrixXd j = MatrixXd::Zero(n, 2 * n);
+            j.leftCols(n).setIdentity(); j.rightCols(n) = -MatrixXd::Identity(n, n);
+            return j;
+        }, cid);
+    };
+    if (t0 == "slot" && t1 == "slot") equal_vars({4});
+    if ((t0 == "ellipse" || t0 == "ellipse_arc") && (t1 == "ellipse" || t1 == "ellipse_arc")) {
+        equal_vars({2, 3});
+        return;
+    }
+    if (t0 == "arc_slot" && t1 == "arc_slot") {
+        equal_vars({2, 5});
+        return;
+    }
     // line-line OR slot-slot: equal SPINE length |p2-p1| (both store the spine
     // endpoints in vars [0..3]). Port of _add_equal / _add_equal_length_4var.
     if ((t0 == "line" && t1 == "line") || (t0 == "slot" && t1 == "slot")) {
@@ -1538,6 +1551,9 @@ void add_equal(System& sys, const std::string& cid, const std::string& h0,
                              return j;
                          },
                          cid);
+    } else {
+        throw std::runtime_error("equal: incompatible refs '" + h0 + "' (" + t0 +
+                                 "), '" + h1 + "' (" + t1 + ")");
     }
 }
 
@@ -1673,112 +1689,7 @@ void add_whole_line_hv(System& sys, const std::string& cid, const std::string& e
                      cid);
 }
 
-void add_concentric(System& sys, const std::string& cid, const std::string& h0,
-                    const std::string& h1, const VarMap& var_map) {
-    std::vector<int> combined = concat(pick(var_map.at(eid_of(h0)), {0, 1}),
-                                       pick(var_map.at(eid_of(h1)), {0, 1}));
-    sys.add_residual(
-        [](const VectorXd& xs) {
-            VectorXd r(2);
-            r << xs(0) - xs(2), xs(1) - xs(3);
-            return r;
-        },
-        combined,
-        [](const VectorXd&) {
-            MatrixXd j(2, 4);
-            j << 1, 0, -1, 0, 0, 1, 0, -1;
-            return j;
-        },
-        cid);
-}
 
-// Angle between two lines (unsigned, atan2(|cross|, dot)). Port of _add_angle.
-void add_angle(System& sys, const std::string& cid, const std::string& h0,
-               const std::string& h1, double ang_deg, const VarMap& var_map) {
-    std::vector<int> combined = concat(pick(var_map.at(eid_of(h0)), {0, 1, 2, 3}),
-                                       pick(var_map.at(eid_of(h1)), {0, 1, 2, 3}));
-    double ang_rad = ang_deg * kDeg;
-    sys.add_residual(
-        [ang_rad](const VectorXd& xs) {
-            double ax = xs(0), ay = xs(1), bx = xs(2), by = xs(3);
-            double cx = xs(4), cy = xs(5), dx = xs(6), dy = xs(7);
-            double ux = bx - ax, uy = by - ay;
-            double vx = dx - cx, vy = dy - cy;
-            double cross = ux * vy - uy * vx;
-            double dot = ux * vx + uy * vy;
-            double theta = std::atan2(std::abs(cross), dot);
-            return r1(theta - ang_rad);
-        },
-        combined,
-        [](const VectorXd& xs) {
-            double ax = xs(0), ay = xs(1), bx = xs(2), by = xs(3);
-            double cx = xs(4), cy = xs(5), dx = xs(6), dy = xs(7);
-            double ux = bx - ax, uy = by - ay;
-            double vx = dx - cx, vy = dy - cy;
-            double cross = ux * vy - uy * vx;
-            double dot = ux * vx + uy * vy;
-            double abs_cross = std::abs(cross);
-            double sgn_cross = cross >= 0 ? 1.0 : -1.0;
-            double denom = dot * dot + abs_cross * abs_cross;
-            if (denom < 1e-24) return MatrixXd(MatrixXd::Zero(1, 8));
-            double dc_dux = vy, dc_duy = -vx, dc_dvx = -uy, dc_dvy = ux;
-            double dd_dux = vx, dd_duy = vy, dd_dvx = ux, dd_dvy = uy;
-            auto dtheta = [&](double dc_d_var, double dd_d_var) {
-                return (dot * sgn_cross * dc_d_var - abs_cross * dd_d_var) / denom;
-            };
-            double dt_dux = dtheta(dc_dux, dd_dux);
-            double dt_duy = dtheta(dc_duy, dd_duy);
-            double dt_dvx = dtheta(dc_dvx, dd_dvx);
-            double dt_dvy = dtheta(dc_dvy, dd_dvy);
-            MatrixXd J(1, 8);
-            J << -dt_dux, -dt_duy, dt_dux, dt_duy, -dt_dvx, -dt_dvy, dt_dvx, dt_dvy;
-            return J;
-        },
-        cid);
-}
-
-// Two lines collinear: parallel + endpoint C of line B on line A (2 residuals).
-// Port of _add_collinear.
-void add_collinear(System& sys, const std::string& cid, const std::string& h0,
-                   const std::string& h1, const VarMap& var_map) {
-    std::vector<int> combined = concat(pick(var_map.at(eid_of(h0)), {0, 1, 2, 3}),
-                                       pick(var_map.at(eid_of(h1)), {0, 1, 2, 3}));
-    sys.add_residual(
-        [](const VectorXd& xs) {
-            double ax = xs(0), ay = xs(1), bx = xs(2), by = xs(3);
-            double cx = xs(4), cy = xs(5), dx = xs(6), dy = xs(7);
-            VectorXd r(2);
-            r << (bx - ax) * (dy - cy) - (by - ay) * (dx - cx),
-                 (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-            return r;
-        },
-        combined,
-        [](const VectorXd& xs) {
-            double ax = xs(0), ay = xs(1), bx = xs(2), by = xs(3);
-            double cx = xs(4), cy = xs(5), dx = xs(6), dy = xs(7);
-            MatrixXd J(2, 8);
-            // r1 = (bx-ax)(dy-cy) - (by-ay)(dx-cx)
-            J(0, 0) = -(dy - cy);
-            J(0, 1) = (dx - cx);
-            J(0, 2) = (dy - cy);
-            J(0, 3) = -(dx - cx);
-            J(0, 4) = (by - ay);
-            J(0, 5) = -(bx - ax);
-            J(0, 6) = -(by - ay);
-            J(0, 7) = (bx - ax);
-            // r2 = (bx-ax)(cy-ay) - (by-ay)(cx-ax)
-            J(1, 0) = -(cy - ay) + (by - ay);
-            J(1, 1) = -(bx - ax) + (cx - ax);
-            J(1, 2) = (cy - ay);
-            J(1, 3) = -(cx - ax);
-            J(1, 4) = -(by - ay);
-            J(1, 5) = (bx - ax);
-            J(1, 6) = 0.0;
-            J(1, 7) = 0.0;
-            return J;
-        },
-        cid);
-}
 
 // Two circles/arcs share center AND radius (3 linear residuals). Port of _add_coradial.
 void add_coradial(System& sys, const std::string& cid, const std::string& h0,
@@ -1862,7 +1773,7 @@ void add_tangent_line_conic(System& sys, const std::string& cid,
     const std::string etype = entities.at(conic_eid).at("type");
     std::vector<int> lidx = pick(var_map.at(line_eid), {0, 1, 2, 3});
 
-    if (etype == "ellipse_arc") {
+    if (etype == "ellipse_arc" || etype == "ellipse") {
         std::vector<int> eidx = pick(var_map.at(conic_eid), {0, 1, 2, 3, 4});
         std::vector<int> combined = concat(lidx, eidx);
         auto rfn = [](const VectorXd& v) {
@@ -1947,7 +1858,7 @@ void add_tangent_curve_curve(System& sys, const std::string& cid,
                              bool interactive = false) {
     CurveDescriptor d0 = curve_descriptor(entities.at(eid0).at("type"), var_map.at(eid0));
     CurveDescriptor d1 = curve_descriptor(entities.at(eid1).at("type"), var_map.at(eid1));
-    if (!d0.ok || !d1.ok) return;  // unsupported entity type -> skip silently
+    if (!d0.ok || !d1.ok) throw std::runtime_error("tangent: unsupported curve pair");
     CurveFn curve0 = d0.eval, curve1 = d1.eval;
     ScanFn scan0 = d0.scan, scan1 = d1.scan;
     int k0 = static_cast<int>(d0.idx.size()), k1 = static_cast<int>(d1.idx.size());
@@ -1988,10 +1899,11 @@ void add_symmetric(System& sys, const std::string& cid, const std::string& h0,
             double bx = xs(k0 + k1 + 2), by = xs(k0 + k1 + 3);
             double Mx = (P(0) + Q(0)) * 0.5, My = (P(1) + Q(1)) * 0.5;
             double dxab = bx - ax, dyab = by - ay;
+            double length = std::max(std::hypot(dxab, dyab), 1e-12);
             double c1 = dxab * (My - ay) - dyab * (Mx - ax);
             double c2 = (P(0) - Q(0)) * dxab + (P(1) - Q(1)) * dyab;
             VectorXd r(2);
-            r << c1, c2;
+            r << c1 / length, c2 / length;
             return r;
         },
         combined,
@@ -2019,14 +1931,628 @@ void add_symmetric(System& sys, const std::string& cid, const std::string& h0,
             if (k0) J.block(1, 0, 1, k0) = rowdot(dc2_dP, Jp0);
             if (k1) J.block(1, k0, 1, k1) = rowdot(dc2_dQ, Jq0);
             J.block(1, k0 + k1, 1, 4) = dc2_da;
+            double length = std::max(std::hypot(dxab, dyab), 1e-12);
+            double c1 = dxab * (My - ay) - dyab * (Mx - ax);
+            double c2 = (P(0) - Q(0)) * dxab + (P(1) - Q(1)) * dyab;
+            Eigen::RowVector4d dl(-dxab / length, -dyab / length, dxab / length, dyab / length);
+            J /= length;
+            J.block(0, k0 + k1, 1, 4) -= (c1 / (length * length)) * dl;
+            J.block(1, k0 + k1, 1, 4) -= (c2 / (length * length)) * dl;
             return J;
         },
         cid);
 }
 
+bool is_axis(const std::string& h) { return h == "axis.h" || h == "axis.v"; }
+
+bool is_direction_ref(const std::string& h, const EntMap& entities) {
+    if (is_axis(h)) return true;
+    auto it = entities.find(h);
+    return it != entities.end() &&
+           (it->second.value("type", "") == "line" || it->second.value("type", "") == "slot");
+}
+
+// Virtual axes have no variables, just like the virtual origin point.
+struct LineRef {
+    std::vector<int> idx;
+    std::function<Eigen::Vector4d(const VectorXd&)> val;
+};
+LineRef line_ref(const std::string& h, const EntMap& entities, const VarMap& vars) {
+    if (is_axis(h)) {
+        const bool horizontal = h == "axis.h";
+        return {{}, [horizontal](const VectorXd&) {
+            return Eigen::Vector4d(0, 0, horizontal ? 1 : 0, horizontal ? 0 : 1);
+        }};
+    }
+    if (!is_direction_ref(h, entities))
+        throw std::runtime_error("ref '" + h + "' needs a line/slot/axis");
+    return {pick(vars.at(h), {0, 1, 2, 3}),
+            [](const VectorXd& v) { return Eigen::Vector4d(v.head(4)); }};
+}
+
+// Angular residuals are homogeneous in both line lengths. Unlike raw cross/dot
+// products, shrinking a free line cannot improve parallel/perpendicular error.
+void add_line_orientation(System& sys, const std::string& cid, const std::string& type,
+                           const std::string& h0, const std::string& h1, double degrees,
+                           const EntMap& entities, const VarMap& vars) {
+    LineRef a = line_ref(h0, entities, vars), b = line_ref(h1, entities, vars);
+    int ka = static_cast<int>(a.idx.size()), kb = static_cast<int>(b.idx.size());
+    auto authored_direction = [&](const std::string& h) {
+        if (is_axis(h)) return h == "axis.h" ? Vector2d(1, 0) : Vector2d(0, 1);
+        const json& e = entities.at(h);
+        return Vector2d(num(jat(jat(e, "p2"), 0)) - num(jat(jat(e, "p1"), 0)),
+                        num(jat(jat(e, "p2"), 1)) - num(jat(jat(e, "p1"), 1)));
+    };
+    Vector2d u0 = authored_direction(h0), v0 = authored_direction(h1);
+    if (u0.norm() < 1e-12 || v0.norm() < 1e-12)
+        throw std::runtime_error(type + ": zero-length direction ref '" + (u0.norm() < 1e-12 ? h0 : h1) + "'");
+    double theta0 = std::atan2(u0.x() * v0.y() - u0.y() * v0.x(), u0.dot(v0));
+    double target = type == "perpendicular" ? .5 * kPi : 0;
+    if (type != "angle") target += std::round((theta0 - target) / kPi) * kPi;
+    else target = degrees * kDeg;
+    sys.add_residual([a, b, ka, kb, type, target](const VectorXd& v) {
+        Eigen::Vector4d av = a.val(v.head(ka)), bv = b.val(v.segment(ka, kb));
+        Vector2d u = av.tail<2>() - av.head<2>(), w = bv.tail<2>() - bv.head<2>();
+        double cross = u.x() * w.y() - u.y() * w.x();
+        double theta = std::atan2(type == "angle" ? std::abs(cross) : cross, u.dot(w));
+        return r1(type == "angle" ? theta - target : std::remainder(theta - target, 2 * kPi));
+    }, concat(a.idx, b.idx), [a, b, ka, kb, type](const VectorXd& v) {
+        Eigen::Vector4d av = a.val(v.head(ka)), bv = b.val(v.segment(ka, kb));
+        Vector2d u = av.tail<2>() - av.head<2>(), w = bv.tail<2>() - bv.head<2>();
+        double sign = type == "angle" && u.x() * w.y() - u.y() * w.x() < 0 ? -1 : 1;
+        Vector2d du = sign * Vector2d(u.y(), -u.x()) / std::max(u.squaredNorm(), 1e-24);
+        Vector2d dw = sign * Vector2d(-w.y(), w.x()) / std::max(w.squaredNorm(), 1e-24);
+        MatrixXd j(1, ka + kb);
+        if (ka) { j.block<1, 2>(0, 0) = -du.transpose(); j.block<1, 2>(0, 2) = du.transpose(); }
+        if (kb) { j.block<1, 2>(0, ka) = -dw.transpose(); j.block<1, 2>(0, ka + 2) = dw.transpose(); }
+        return j;
+    }, cid);
+}
+
+// Both endpoints of the movable line lie on the reference's infinite line.
+// Prefer fixed/virtual references in either ref order; normalization removes
+// length-scaling incentives while the relation removes exactly two geometric DOFs.
+void add_collinear(System& sys, const std::string& cid, const std::string& h0,
+                     const std::string& h1, const EntMap& entities, const VarMap& vars,
+                     const std::set<std::string>& fixed_lines) {
+    bool fixed0 = is_axis(h0) || fixed_lines.count(h0), fixed1 = is_axis(h1) || fixed_lines.count(h1);
+    const std::string& reference = fixed0 && !fixed1 ? h0 : h1;
+    const std::string& moving = fixed0 && !fixed1 ? h1 : h0;
+    LineRef a = line_ref(moving, entities, vars), b = line_ref(reference, entities, vars);
+    int ka = static_cast<int>(a.idx.size()), kb = static_cast<int>(b.idx.size());
+    sys.add_residual([a, b, ka, kb](const VectorXd& v) {
+        Eigen::Vector4d av = a.val(v.head(ka)), bv = b.val(v.segment(ka, kb));
+        Vector2d u = bv.tail<2>() - bv.head<2>();
+        double length = std::max(u.norm(), 1e-12);
+        Vector2d d0 = av.head<2>() - bv.head<2>(), d1 = av.tail<2>() - bv.head<2>();
+        VectorXd r(2);
+        r << (u.x() * d0.y() - u.y() * d0.x()) / length,
+             (u.x() * d1.y() - u.y() * d1.x()) / length;
+        return r;
+    }, concat(a.idx, b.idx), [a, b, ka, kb](const VectorXd& v) {
+        Eigen::Vector4d av = a.val(v.head(ka)), bv = b.val(v.segment(ka, kb));
+        Vector2d u = bv.tail<2>() - bv.head<2>();
+        double length = std::max(u.norm(), 1e-12);
+        Vector2d normal(-u.y() / length, u.x() / length);
+        MatrixXd j = MatrixXd::Zero(2, ka + kb);
+        for (int i = 0; i < 2; ++i) {
+            Vector2d d = av.segment<2>(2 * i) - bv.head<2>();
+            double cross = u.x() * d.y() - u.y() * d.x();
+            Vector2d gu = Vector2d(d.y(), -d.x()) / length - cross * u / (length * length * length);
+            if (ka) j.block<1, 2>(i, 2 * i) = normal.transpose();
+            if (kb) {
+                j.block<1, 2>(i, ka) = (-gu - normal).transpose();
+                j.block<1, 2>(i, ka + 2) = gu.transpose();
+            }
+        }
+        return j;
+    }, cid);
+}
+
+
+using ResidualFn = std::function<VectorXd(const VectorXd&)>;
+void add_numeric(System& sys, const std::string& cid, const std::vector<int>& idx,
+                 ResidualFn fn) {
+    sys.add_residual(fn, idx, [fn](const VectorXd& v) {
+        MatrixXd j(fn(v).size(), v.size());
+        for (int i = 0; i < v.size(); ++i) {
+            double h = 1e-6 * std::max(1.0, std::abs(v(i)));
+            VectorXd a = v, b = v;
+            a(i) += h; b(i) -= h;
+            j.col(i) = (fn(a) - fn(b)) / (2 * h);
+        }
+        return j;
+    }, cid);
+}
+
+
+void add_point_axis(System& sys, const std::string& cid, const std::string& point,
+                     const std::string& axis, double distance, bool dimension,
+                     const EntMap& entities, const VarMap& vars) {
+    Handle p = resolve_handle(point, entities, vars);
+    const int coordinate = axis == "axis.h" ? 1 : 0;
+    sys.add_residual([p, coordinate, distance, dimension](const VectorXd& v) {
+        double x = p.val(v)(coordinate);
+        return r1((dimension ? std::abs(x) : x) - distance);
+    }, p.idx, [p, coordinate, dimension](const VectorXd& v) {
+        MatrixXd j = p.jac(v).row(coordinate);
+        if (dimension && p.val(v)(coordinate) < 0) j = -j;
+        return j;
+    }, cid);
+}
+
+void add_line_distance(System& sys, const std::string& cid, const std::string& h0,
+                        const std::string& h1, double value,
+                        const EntMap& entities, const VarMap& vars) {
+    LineRef a = line_ref(h0, entities, vars), b = line_ref(h1, entities, vars);
+    int ka = static_cast<int>(a.idx.size()), kb = static_cast<int>(b.idx.size());
+    sys.add_residual([a, b, ka, kb, value](const VectorXd& v) {
+        Eigen::Vector4d av = a.val(v.head(ka)), bv = b.val(v.segment(ka, kb));
+        Vector2d u = av.tail<2>() - av.head<2>();
+        Vector2d d = (bv.head<2>() + bv.tail<2>()) * .5 - av.head<2>();
+        return r1(std::abs(u.x() * d.y() - u.y() * d.x()) / std::max(u.norm(), 1e-12) - value);
+    }, concat(a.idx, b.idx), [a, b, ka, kb](const VectorXd& v) {
+        Eigen::Vector4d av = a.val(v.head(ka)), bv = b.val(v.segment(ka, kb));
+        Vector2d u = av.tail<2>() - av.head<2>();
+        Vector2d d = (bv.head<2>() + bv.tail<2>()) * .5 - av.head<2>();
+        double length = std::max(u.norm(), 1e-12), cross = u.x() * d.y() - u.y() * d.x();
+        double s = cross < 0 ? -1 : 1;
+        Vector2d gu = s * Vector2d(d.y(), -d.x()) / length -
+                      std::abs(cross) * u / (length * length * length);
+        Vector2d gd = s * Vector2d(-u.y(), u.x()) / length;
+        MatrixXd j(1, ka + kb);
+        if (ka) { j.block<1, 2>(0, 0) = (-gu - gd).transpose(); j.block<1, 2>(0, 2) = gu.transpose(); }
+        if (kb) { j.block<1, 2>(0, ka) = .5 * gd.transpose(); j.block<1, 2>(0, ka + 2) = .5 * gd.transpose(); }
+        return j;
+    }, cid);
+}
+
+// Match the directed sweep used by arc geometry (degrees, ccw by default).
+double arc_sweep(double start, double end, bool ccw) {
+    double sweep = std::fmod(ccw ? end - start : start - end, 360.0);
+    if (sweep < 0) sweep += 360.0;
+    if (sweep < 1e-12 && std::abs(end - start) > 1e-12) sweep = 360.0;
+    return sweep;
+}
+
+void add_arc_midpoint(System& sys, const std::string& cid, const std::string& point,
+                       const std::string& arc, const EntMap& entities, const VarMap& vars) {
+    Handle p = resolve_handle(point, entities, vars);
+    auto idx = pick(vars.at(arc), {0, 1, 2, 3, 4});
+    int kp = static_cast<int>(p.idx.size());
+    bool ccw = entities.at(arc).value("ccw", true);
+    sys.add_residual([p, kp, ccw](const VectorXd& v) {
+        VectorXd a = v.tail(5);
+        double angle = (a(3) + (ccw ? .5 : -.5) * arc_sweep(a(3), a(4), ccw)) * kDeg;
+        Vector2d mid(a(0) + a(2) * std::cos(angle), a(1) + a(2) * std::sin(angle));
+        return r1Vec2(p.val(v.head(kp)) - mid);
+    }, concat(p.idx, idx), [p, kp, ccw](const VectorXd& v) {
+        VectorXd a = v.tail(5);
+        double angle = (a(3) + (ccw ? .5 : -.5) * arc_sweep(a(3), a(4), ccw)) * kDeg;
+        MatrixXd j = MatrixXd::Zero(2, kp + 5);
+        j.leftCols(kp) = p.jac(v.head(kp));
+        j(0, kp) = -1; j(1, kp + 1) = -1;
+        j(0, kp + 2) = -std::cos(angle); j(1, kp + 2) = -std::sin(angle);
+        j(0, kp + 3) = j(0, kp + 4) = .5 * a(2) * std::sin(angle) * kDeg;
+        j(1, kp + 3) = j(1, kp + 4) = -.5 * a(2) * std::cos(angle) * kDeg;
+        return j;
+    }, cid);
+}
+
+struct LengthRef {
+    std::vector<int> idx;
+    std::function<double(const VectorXd&)> val;
+    std::function<Eigen::RowVectorXd(const VectorXd&)> jac;
+};
+LengthRef curve_length_ref(const std::string& h, const EntMap& entities, const VarMap& vars) {
+    auto it = entities.find(h);
+    if (it == entities.end()) throw std::runtime_error("curve length needs line/arc ref '" + h + "'");
+    std::string t = it->second.value("type", "");
+    if (t == "line") return {pick(vars.at(h), {0, 1, 2, 3}),
+        [](const VectorXd& v) { return (v.segment<2>(2) - v.head<2>()).norm(); },
+        [](const VectorXd& v) {
+            Vector2d d = v.segment<2>(2) - v.head<2>(); d /= std::max(d.norm(), 1e-12);
+            Eigen::RowVectorXd j(4); j << -d.x(), -d.y(), d.x(), d.y(); return j;
+        }};
+    if (t == "arc") {
+        bool ccw = it->second.value("ccw", true);
+        return {pick(vars.at(h), {2, 3, 4}),
+            [ccw](const VectorXd& v) { return v(0) * arc_sweep(v(1), v(2), ccw) * kDeg; },
+            [ccw](const VectorXd& v) {
+                Eigen::RowVectorXd j(3); double d = (ccw ? 1 : -1) * v(0) * kDeg;
+                j << arc_sweep(v(1), v(2), ccw) * kDeg, -d, d; return j;
+            }};
+    }
+    throw std::runtime_error("curve length needs line/arc ref '" + h + "' (got " + t + ")");
+}
+
+void add_curve_length(System& sys, const std::string& cid, const LengthRef& a,
+                       const std::optional<LengthRef>& b, double value) {
+    int ka = static_cast<int>(a.idx.size()), kb = b ? static_cast<int>(b->idx.size()) : 0;
+    sys.add_residual([a, b, ka, kb, value](const VectorXd& v) {
+        return r1(a.val(v.head(ka)) - (b ? b->val(v.segment(ka, kb)) : value));
+    }, b ? concat(a.idx, b->idx) : a.idx, [a, b, ka, kb](const VectorXd& v) {
+        MatrixXd j(1, ka + kb); j.leftCols(ka) = a.jac(v.head(ka));
+        if (b) j.rightCols(kb) = -b->jac(v.segment(ka, kb));
+        return j;
+    }, cid);
+}
+
+// Endpoint derivatives avoid nested finite differences at clamped spline ends.
+struct EndpointJet { Vector2d p, d, dd; };
+EndpointJet spline_endpoint(const VectorXd& v, bool style, bool end) {
+    const int n = static_cast<int>(v.size()) / 2;
+    auto p = [&](int i) { return Vector2d(v(2 * i), v(2 * i + 1)); };
+    if (n < 2) throw std::runtime_error("spline endpoint needs at least two points");
+    Vector2d a = p(end ? n - 1 : 0), b = p(end ? n - 2 : 1);
+    Vector2d d = end ? Vector2d(a - b) : Vector2d(b - a), dd = Vector2d::Zero();
+    if (style) {
+        int degree = std::min(3, n - 1), spans = n - degree;
+        d *= degree * spans;
+        if (degree > 1) {
+            Vector2d c = p(end ? n - 3 : 2);
+            double next_span = spans > 1 ? 2.0 / spans : 1.0;
+            dd = (degree - 1) * spans *
+                 (degree * (c - b) / next_span - degree * spans * (b - a));
+        }
+    } else if (n > 2) {
+        dd = -a + 2 * b - p(end ? n - 3 : 2);
+    }
+    return {a, d, dd};
+}
+
+std::optional<bool> spline_end(const std::string& h, const EntMap& entities) {
+    auto dot = h.find('.');
+    if (dot == std::string::npos) return std::nullopt;
+    auto it = entities.find(h.substr(0, dot));
+    if (it == entities.end()) return std::nullopt;
+    std::string t = it->second.value("type", "");
+    if (t != "spline" && t != "style_spline") return std::nullopt;
+    std::string sub = h.substr(dot + 1);
+    if (sub == "start" || sub == "p0") return false;
+    if (sub == "end" || sub == "p" + std::to_string(it->second.at("points").size() - 1)) return true;
+    return std::nullopt;
+}
+
+struct UnionFind {
+    std::map<std::string, std::string> parent;
+    std::string find(const std::string& x) {
+        auto it = parent.find(x);
+        if (it == parent.end()) {
+            parent[x] = x;
+            return x;
+        }
+        if (it->second != x) it->second = find(it->second);
+        return it->second;
+    }
+    void unite(const std::string& a, const std::string& b) {
+        std::string ra = find(a), rb = find(b);
+        if (ra != rb) parent[ra] = rb;
+    }
+};
+bool arc_end(const std::string& h, const EntMap& entities) {
+    auto it = entities.find(eid_of(h));
+    return it != entities.end() && it->second.value("type", "") == "arc" &&
+           (h == eid_of(h) + ".start" || h == eid_of(h) + ".end");
+}
+
+bool trimmed_end(const std::string& h, const EntMap& entities) {
+    auto it = entities.find(eid_of(h));
+    if (it == entities.end()) return false;
+    std::string t = it->second.value("type", "");
+    if (t != "arc" && t != "ellipse_arc" && t != "parabola" && t != "conic") return false;
+    return h == eid_of(h) + ".start" || h == eid_of(h) + ".end" ||
+           (t == "conic" && (h == eid_of(h) + ".p0" || h == eid_of(h) + ".p1"));
+}
+
+struct JetRef {
+    std::vector<int> idx;
+    std::function<EndpointJet(const VectorXd&, const Vector2d&)> val;
+};
+JetRef jet_ref(const std::string& h, const EntMap& entities, const VarMap& vars) {
+    if (is_direction_ref(h, entities)) {
+        LineRef l = line_ref(h, entities, vars);
+        return {l.idx, [l](const VectorXd& v, const Vector2d&) {
+            Eigen::Vector4d a = l.val(v);
+            return EndpointJet{a.head<2>(), a.tail<2>() - a.head<2>(), Vector2d::Zero()};
+        }};
+    }
+    std::string eid = eid_of(h), t = entities.at(eid).value("type", "");
+    auto end = spline_end(h, entities);
+    if (end) return {vars.at(eid), [end, style = t == "style_spline"](const VectorXd& v, const Vector2d&) {
+        return spline_endpoint(v, style, *end);
+    }};
+    if (t == "circle" || t == "arc") {
+        bool endpoint = arc_end(h, entities);
+        bool at_end = h == eid + ".end";
+        auto idx = endpoint ? pick(vars.at(eid), {0, 1, 2, at_end ? 4 : 3}) :
+                              pick(vars.at(eid), {0, 1, 2});
+        return {idx, [endpoint](const VectorXd& v, const Vector2d& p) {
+            double a = endpoint ? v(3) * kDeg : std::atan2(p.y() - v(1), p.x() - v(0));
+            CurvePair c = circle_curve(v, a);
+            return EndpointJet{c.first, c.second, Vector2d(-v(2) * std::cos(a), -v(2) * std::sin(a))};
+        }};
+    }
+    if (trimmed_end(h, entities)) {
+        bool at_end = h == eid + ".end" || (t == "conic" && h == eid + ".p1");
+        if (t == "ellipse_arc") {
+            return {pick(vars.at(eid), {0, 1, 2, 3, 4, at_end ? 6 : 5}),
+                [](const VectorXd& v, const Vector2d&) {
+                    CurvePair c = ellipse_arc_curve(v, v(5) * kDeg);
+                    return EndpointJet{c.first, c.second, Vector2d::Zero()};
+                }};
+        }
+        if (t == "parabola") {
+            return {pick(vars.at(eid), {0, 1, 2, 3, at_end ? 5 : 4}),
+                [](const VectorXd& v, const Vector2d&) {
+                    CurvePair c = parabola_curve(v, v(4));
+                    return EndpointJet{c.first, c.second, Vector2d::Zero()};
+                }};
+        }
+        if (t == "conic") {
+            return {vars.at(eid), [at_end](const VectorXd& v, const Vector2d&) {
+                CurvePair c = conic_curve(v, at_end ? 1 : 0);
+                return EndpointJet{c.first, c.second, Vector2d::Zero()};
+            }};
+        }
+    }
+    CurveDescriptor desc = curve_descriptor(t, vars.at(eid));
+    if (!desc.ok) throw std::runtime_error("tangent: unsupported curve ref '" + h + "'");
+    return {desc.idx, [desc](const VectorXd& v, const Vector2d& p) {
+        VectorXd scan = desc.scan(v, 81);
+        double best = scan(0), dist = std::numeric_limits<double>::infinity();
+        for (int i = 0; i < scan.size(); ++i) {
+            double d = (desc.eval(v, scan(i)).first - p).squaredNorm();
+            if (d < dist) { dist = d; best = scan(i); }
+        }
+        double u = newton_project([&](double x) { return desc.eval(v, x); }, best, p);
+        CurvePair c = desc.eval(v, u);
+        return EndpointJet{c.first, c.second, Vector2d::Zero()};
+    }};
+}
+
+void add_endpoint_continuity(System& sys, const std::string& cid, const std::string& first,
+                              const std::string& other, bool smooth,
+                              const EntMap& entities, const VarMap& vars) {
+    if (!spline_end(first, entities) && !(trimmed_end(first, entities) && !smooth))
+        throw std::runtime_error("endpoint relation needs spline endpoint ref '" + first + "'");
+    auto target_end = spline_end(other, entities);
+    std::string t = is_axis(other) ? "line" : entities.at(eid_of(other)).value("type", "");
+    if (smooth && !is_direction_ref(other, entities) && t != "circle" && t != "arc" && !target_end)
+        throw std::runtime_error("smooth: unsupported target ref '" + other + "'");
+    JetRef a = jet_ref(first, entities, vars), b = jet_ref(other, entities, vars);
+    int ka = static_cast<int>(a.idx.size()), kb = static_cast<int>(b.idx.size());
+    add_numeric(sys, cid, concat(a.idx, b.idx), [a, b, ka, kb, smooth](const VectorXd& v) {
+        EndpointJet x = a.val(v.head(ka), Vector2d::Zero());
+        EndpointJet y = b.val(v.segment(ka, kb), x.p);
+        double nx = std::max(x.d.norm(), 1e-12), ny = std::max(y.d.norm(), 1e-12);
+        double g1 = (x.d.x() * y.d.y() - x.d.y() * y.d.x()) / (nx * ny);
+        if (!smooth) return r1(g1);
+        double cx = (x.d.x() * x.dd.y() - x.d.y() * x.dd.x()) / (nx * nx * nx);
+        double cy = (y.d.x() * y.dd.y() - y.d.y() * y.dd.x()) / (ny * ny * ny);
+        VectorXd r(2); r << g1, cx - (x.d.dot(y.d) < 0 ? -cy : cy); return r;
+    });
+}
+
+void add_extended_symmetric(System& sys, const std::string& cid, const std::string& h0,
+                             const std::string& h1, const std::string& axis,
+                             const EntMap& entities, const VarMap& vars) {
+    LineRef ax = line_ref(axis, entities, vars);
+    auto reflect = [](const Vector2d& p, const Eigen::Vector4d& a) {
+        Vector2d u = a.tail<2>() - a.head<2>();
+        return Vector2d(a.head<2>() + 2 * u * u.dot(p - a.head<2>()) /
+                        std::max(u.squaredNorm(), 1e-24) - (p - a.head<2>()));
+    };
+    bool lines = is_direction_ref(h0, entities) && is_direction_ref(h1, entities);
+    auto circle_ref = [&](const std::string& h) {
+        auto it = entities.find(h);
+        return it != entities.end() && (it->second.value("type", "") == "circle" ||
+                                        it->second.value("type", "") == "arc");
+    };
+    bool circles = circle_ref(h0) && circle_ref(h1);
+    if (lines) {
+        LineRef a = line_ref(h0, entities, vars), b = line_ref(h1, entities, vars);
+        int ka = static_cast<int>(a.idx.size()), kb = static_cast<int>(b.idx.size());
+        int kc = static_cast<int>(ax.idx.size());
+        VectorXd seed = sys.init_vector();
+        auto local = [&](const std::vector<int>& idx) {
+            VectorXd v(idx.size()); for (size_t i = 0; i < idx.size(); ++i) v(i) = seed(idx[i]); return v;
+        };
+        Eigen::Vector4d av = a.val(local(a.idx)), bv = b.val(local(b.idx)), cv = ax.val(local(ax.idx));
+        bool reverse = (reflect(av.head<2>(), cv) - bv.tail<2>()).squaredNorm() +
+                       (reflect(av.tail<2>(), cv) - bv.head<2>()).squaredNorm() <
+                       (reflect(av.head<2>(), cv) - bv.head<2>()).squaredNorm() +
+                       (reflect(av.tail<2>(), cv) - bv.tail<2>()).squaredNorm();
+        add_numeric(sys, cid, concat(a.idx, b.idx, ax.idx),
+            [a, b, ax, ka, kb, kc, reverse, reflect](const VectorXd& v) {
+                Eigen::Vector4d a0 = a.val(v.head(ka)), b0 = b.val(v.segment(ka, kb));
+                Eigen::Vector4d axis0 = ax.val(v.segment(ka + kb, kc));
+                VectorXd r(4);
+                Vector2d p = reverse ? Vector2d(b0.tail<2>()) : Vector2d(b0.head<2>());
+                Vector2d q = reverse ? Vector2d(b0.head<2>()) : Vector2d(b0.tail<2>());
+                r.head<2>() = reflect(a0.head<2>(), axis0) - p;
+                r.tail<2>() = reflect(a0.tail<2>(), axis0) - q;
+                return r;
+            });
+        return;
+    }
+    // Whole curved entities use centers; explicit point handles keep their points.
+    auto point_ref = [&](const std::string& h) {
+        if (h == "origin" || h == "origin.p") return true;
+        auto it = entities.find(eid_of(h));
+        return it != entities.end() && (h.find('.') != std::string::npos || it->second.value("type", "") == "point");
+    };
+    if (!circles && (!point_ref(h0) || !point_ref(h1)))
+        throw std::runtime_error("symmetric: incompatible refs '" + h0 + "', '" + h1 + "'");
+    Handle a = resolve_handle(h0, entities, vars), b = resolve_handle(h1, entities, vars);
+    int ka = static_cast<int>(a.idx.size()), kb = static_cast<int>(b.idx.size()), kc = static_cast<int>(ax.idx.size());
+    add_numeric(sys, cid, concat(a.idx, b.idx, ax.idx), [a, b, ax, ka, kb, kc, reflect](const VectorXd& v) {
+        return r1Vec2(reflect(a.val(v.head(ka)), ax.val(v.segment(ka + kb, kc))) -
+                      b.val(v.segment(ka, kb)));
+    });
+    if (circles) add_equal(sys, cid, h0, h1, entities, vars);
+}
+
+// Convex support gap gives actual tangency, not a zero gap at a crossing of two
+// ellipses. Freeze external/contained contact intent from the authored geometry.
+void add_ellipse_pair_tangent(System& sys, const std::string& cid, const std::string& h0,
+                              const std::string& h1, const EntMap& entities, const VarMap& vars) {
+    bool ell0 = entities.at(h0).value("type", "") == "ellipse" || entities.at(h0).value("type", "") == "ellipse_arc";
+    bool ell1 = entities.at(h1).value("type", "") == "ellipse" || entities.at(h1).value("type", "") == "ellipse_arc";
+    auto a = ell0 ? pick(vars.at(h0), {0, 1, 2, 3, 4}) : pick(vars.at(h0), {0, 1, 2});
+    auto b = ell1 ? pick(vars.at(h1), {0, 1, 2, 3, 4}) : pick(vars.at(h1), {0, 1, 2});
+    int ka = static_cast<int>(a.size()), kb = static_cast<int>(b.size());
+    auto gap = [ell0, ell1, ka, kb](const VectorXd& v, int mode) {
+        auto support = [](const VectorXd& p, bool ellipse, double angle) {
+            if (!ellipse) return std::abs(p(2));
+            double a = angle - p(4) * kDeg;
+            return std::hypot(p(2) * std::cos(a), p(3) * std::sin(a));
+        };
+        VectorXd x = v.head(ka), y = v.segment(ka, kb);
+        auto f = [&](double angle) {
+            double center = (y(0) - x(0)) * std::cos(angle) + (y(1) - x(1)) * std::sin(angle);
+            double sx = support(x, ell0, angle), sy = support(y, ell1, angle);
+            if (mode == 1) return center + sy - sx;
+            if (mode == 2) return -center + sx - sy;
+            return center - sx - sy;
+        };
+        constexpr int samples = 96;
+        double best = 0, value = f(0), step = 2 * kPi / samples;
+        for (int i = 1; i < samples; ++i) {
+            double angle = i * step, candidate = f(angle);
+            if (candidate > value) { best = angle; value = candidate; }
+        }
+        double left = best - step, right = best + step;
+        constexpr double ratio = .6180339887498948482;
+        double p = right - ratio * (right - left), q = left + ratio * (right - left);
+        double fp = f(p), fq = f(q);
+        for (int i = 0; i < 48; ++i) {
+            if (fp < fq) { left = p; p = q; fp = fq; q = left + ratio * (right - left); fq = f(q); }
+            else { right = q; q = p; fq = fp; p = right - ratio * (right - left); fp = f(p); }
+        }
+        return std::max(fp, fq);
+    };
+    auto idx = concat(a, b);
+    VectorXd init = sys.init_vector(), seed(idx.size());
+    for (size_t i = 0; i < idx.size(); ++i) seed(i) = init(idx[i]);
+    int mode = gap(seed, 1) < 0 ? 1 : (gap(seed, 2) < 0 ? 2 : 0);
+    auto fn = [gap, mode](const VectorXd& v) { return gap(v, mode); };
+    sys.add_residual([fn](const VectorXd& v) { return r1(fn(v)); }, idx,
+                     [fn](const VectorXd& v) { return numeric_jac_1(fn, v); }, cid);
+}
+
+using JunctionMap = std::map<std::pair<std::string, std::string>,
+                             std::pair<std::string, std::string>>;
+
+// Coincidence topology, not coordinate proximity, identifies a tangent junction.
+// Normalize aliases and union through standalone points or other coincidences.
+JunctionMap tangent_junctions(const EntMap& entities, const VarMap& vars, const json& constraints) {
+    JunctionMap result;
+    std::set<std::pair<std::string, std::string>> pairs;
+    for (const auto& c : constraints) {
+        const json& refs = jat(c, "refs");
+        if (jat(c, "type") != "tangent" || jat(c, "driven") == true ||
+            !refs.is_array() || refs.size() != 2 || !refs[0].is_string() || !refs[1].is_string()) continue;
+        std::string a = refs[0].get<std::string>(), b = refs[1].get<std::string>();
+        if (a.find('.') != std::string::npos || b.find('.') != std::string::npos ||
+            a == b || !entities.count(a) || !entities.count(b)) continue;
+        if (b < a) std::swap(a, b);
+        pairs.emplace(std::move(a), std::move(b));
+    }
+    if (pairs.empty()) return result;
+    auto type_of = [&](const std::string& id) {
+        auto it = entities.find(id);
+        return it != entities.end() && jat(it->second, "type").is_string() ?
+            it->second["type"].get<std::string>() : std::string();
+    };
+    auto canonical = [&](const std::string& h) {
+        std::string id = eid_of(h), sub = h.find('.') == std::string::npos ? "" : h.substr(h.find('.') + 1);
+        std::string t = type_of(id);
+        if (id == "origin" || t == "point") return id;
+        if (t == "line") {
+            if (sub.empty() || sub == "start" || sub == "p1") return id + ".p1";
+            if (sub == "end" || sub == "p2") return id + ".p2";
+        }
+        if (t == "spline" || t == "style_spline") {
+            const json& points = jat(entities.at(id), "points");
+            if (sub.empty() || sub == "start" || sub == "p0") return id + ".start";
+            if (sub == "end" || (points.is_array() && !points.empty() &&
+                sub == "p" + std::to_string(points.size() - 1))) return id + ".end";
+        }
+        if (t == "conic") {
+            if (sub.empty() || sub == "start" || sub == "p0") return id + ".start";
+            if (sub == "end" || sub == "p1") return id + ".end";
+        }
+        return h;
+    };
+    UnionFind joined;
+    for (const auto& c : constraints) {
+        const json& refs = jat(c, "refs");
+        if (jat(c, "type") != "coincident" || jat(c, "driven") == true ||
+            !refs.is_array() || refs.size() != 2 || !refs[0].is_string() || !refs[1].is_string()) continue;
+        const std::string a = refs[0].get<std::string>(), b = refs[1].get<std::string>();
+        try {
+            resolve_handle(a, entities, vars);
+            resolve_handle(b, entities, vars);
+        } catch (...) { continue; }
+        joined.unite(canonical(a), canonical(b));
+    }
+    auto ends = [&](const std::string& id) -> std::pair<std::string, std::string> {
+        std::string t = type_of(id);
+        if (t == "line") return {id + ".p1", id + ".p2"};
+        if (t == "arc" || t == "ellipse_arc" || t == "parabola" || t == "conic" ||
+            t == "spline" || t == "style_spline") return {id + ".start", id + ".end"};
+        return {};
+    };
+    for (const auto& pair : pairs) {
+        auto a = ends(pair.first), b = ends(pair.second);
+        if (a.first.empty() || b.first.empty()) continue;
+        for (const auto& x : {a.first, a.second}) {
+            for (const auto& y : {b.first, b.second}) {
+                if (joined.find(x) == joined.find(y)) {
+                    result.emplace(pair, std::make_pair(x, y));
+                    break;
+                }
+            }
+            if (result.count(pair)) break;
+        }
+    }
+    return result;
+}
+
+struct ConstraintContext {
+    JunctionMap junctions;
+    std::set<std::string> fixed_lines;
+};
+
+ConstraintContext constraint_context(const EntMap& entities, const VarMap& vars, const json& constraints) {
+    ConstraintContext result{tangent_junctions(entities, vars, constraints), {}};
+    bool needs_reference = false;
+    for (const auto& c : constraints)
+        if (jat(c, "type") == "collinear") { needs_reference = true; break; }
+    if (!needs_reference) return result;
+    std::map<std::string, unsigned> endpoints;
+    for (const auto& c : constraints) {
+        const json& refs = jat(c, "refs");
+        if (jat(c, "type") != "fix" || jat(c, "driven") == true || !refs.is_array() ||
+            refs.size() != 1 || !refs[0].is_string()) continue;
+        std::string h = refs[0].get<std::string>(), id = eid_of(h);
+        auto it = entities.find(id);
+        if (it == entities.end()) continue;
+        const json& t = jat(it->second, "type");
+        if (t != "line" && t != "slot") continue;
+        if (h == id && t == "line") endpoints[id] = 3;
+        else if (h == id + ".p1" || (h == id && t == "slot")) endpoints[id] |= 1;
+        else if (h == id + ".p2") endpoints[id] |= 2;
+    }
+    for (const auto& p : endpoints)
+        if (p.second == 3) result.fixed_lines.insert(p.first);
+    return result;
+}
+
 void add_constraint(System& sys, const json& c, const EntMap& entities,
                     const VarMap& var_map, const json& env,
-                    bool interactive = false) {
+                    bool interactive, const ConstraintContext& context) {
     if (!c.is_object() || !c.contains("type") || !c["type"].is_string())
         throw std::runtime_error("constraint missing type");
     const std::string ctype = c.at("type").get<std::string>();
@@ -2040,6 +2566,11 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
     }
     const std::string cid = c.value("id", std::string());
     if (c.value("driven", false)) return;  // reference dims measured after solve
+    std::size_t maximum = ctype == "symmetric" || ctype == "intersection" ? 3 :
+        (ctype == "fix" || ctype == "radius" || ctype == "diameter" ||
+         ctype == "length" || ctype == "arc_length" ? 1 : 2);
+    if (refs.size() > maximum)
+        throw std::runtime_error(ctype + ": too many refs (" + std::to_string(refs.size()) + ")");
 
     // Bound-safe ref access. Every branch MUST go through this (or an explicit
     // refs.size() check) before indexing — a bad modeler payload used to
@@ -2060,7 +2591,7 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
     };
     auto known_entity = [&](const std::string& h) {
         const std::string eid = eid_of(h);
-        if (eid == "origin") return;
+        if (eid == "origin" || is_axis(h)) return;
         if (!entities.count(eid))
             throw std::runtime_error(ctype + " constraint: unknown entity '" + eid +
                                      "' (ref '" + h + "')" +
@@ -2070,6 +2601,97 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
                                      "' has no solver vars" +
                                      (cid.empty() ? std::string() : " [" + cid + "]"));
     };
+    auto require_line = [&](const std::string& h) {
+        known_entity(h);
+        if (!is_direction_ref(h, entities))
+            throw std::runtime_error(ctype + ": ref '" + h + "' needs line/slot/axis");
+    };
+    auto point_on_supported = [&](const std::string& h) {
+        if (is_axis(h)) return;
+        auto it = entities.find(h);
+        known_entity(h);
+        if (it != entities.end() && it->second.value("type", "") == "line") {
+            pick(var_map.at(h), {0, 1, 2, 3});
+            return;
+        }
+        if (it == entities.end() || !curve_descriptor(it->second.value("type", ""), var_map.at(h)).ok)
+            throw std::runtime_error(ctype + ": unsupported curve ref '" + h + "'");
+    };
+    if (ctype == "parallel" || ctype == "perpendicular" || ctype == "collinear" || ctype == "angle") {
+        need(2); require_line(refs[0]); require_line(refs[1]);
+        if (ctype == "collinear")
+            add_collinear(sys, cid, refs[0], refs[1], entities, var_map, context.fixed_lines);
+        else add_line_orientation(sys, cid, ctype, refs[0], refs[1],
+                                  ctype == "angle" ? resolve_dim(c, env) : 0, entities, var_map);
+        return;
+    }
+    if (ctype == "intersection") {
+        need(3);
+        resolve_handle(refs[0], entities, var_map);
+        point_on_supported(refs[1]); point_on_supported(refs[2]);
+        for (int i = 1; i <= 2; ++i) {
+            if (is_axis(refs[i])) add_point_axis(sys, cid, refs[0], refs[i], 0, false, entities, var_map);
+            else add_point_on(sys, cid, refs[0], refs[i], entities, var_map);
+        }
+        return;
+    }
+    if (ctype == "arc_length" || ctype == "equal_curve_length") {
+        need(ctype == "arc_length" ? 1 : 2);
+        if (ctype == "arc_length" &&
+            (!entities.count(refs[0]) || entities.at(refs[0]).value("type", "") != "arc"))
+            throw std::runtime_error("arc_length needs arc ref '" + refs[0] + "'");
+        LengthRef a = curve_length_ref(refs[0], entities, var_map);
+        std::optional<LengthRef> b;
+        if (ctype == "equal_curve_length") b = curve_length_ref(refs[1], entities, var_map);
+        add_curve_length(sys, cid, a, b, b ? 0 : resolve_dim(c, env));
+        return;
+    }
+    if (ctype == "smooth" || ctype == "tangent") {
+        need(2);
+        if (ctype == "tangent" &&
+            refs[0] == eid_of(refs[0]) && refs[1] == eid_of(refs[1])) {
+            const bool reverse = refs[1] < refs[0];
+            auto key = reverse ? std::make_pair(refs[1], refs[0]) : std::make_pair(refs[0], refs[1]);
+            auto it = context.junctions.find(key);
+            if (it != context.junctions.end()) {
+                refs[0] = reverse ? it->second.second : it->second.first;
+                refs[1] = reverse ? it->second.first : it->second.second;
+                for (auto& h : refs) {
+                    const std::string id = eid_of(h);
+                    if (entities.at(id).value("type", "") == "line") h = id;
+                }
+            }
+        }
+        bool first = spline_end(refs[0], entities).has_value() || (ctype == "tangent" && trimmed_end(refs[0], entities));
+        bool second = spline_end(refs[1], entities).has_value() || (ctype == "tangent" && trimmed_end(refs[1], entities));
+        if (ctype == "smooth" || first || second) {
+            add_endpoint_continuity(sys, cid, first || ctype == "smooth" ? refs[0] : refs[1],
+                                    first || ctype == "smooth" ? refs[1] : refs[0],
+                                    ctype == "smooth", entities, var_map);
+            return;
+        }
+        if (is_axis(refs[0]) || is_axis(refs[1])) {
+            std::string axis = is_axis(refs[0]) ? refs[0] : refs[1];
+            std::string other = is_axis(refs[0]) ? refs[1] : refs[0];
+            known_entity(other);
+            if (is_direction_ref(other, entities))
+                throw std::runtime_error("tangent: line-line refs are not supported");
+            std::string t = entities.at(eid_of(other)).value("type", "");
+            CurveDescriptor desc = curve_descriptor(t, var_map.at(eid_of(other)));
+            if (!desc.ok) throw std::runtime_error("tangent: unsupported ref '" + other + "'");
+            bool horizontal = axis == "axis.h";
+            auto fn = [desc, t, horizontal](const VectorXd& v) {
+                VectorXd l(4); l << 0, 0, horizontal ? 1 : 0, horizontal ? 0 : 1;
+                if (t == "circle" || t == "arc") return std::abs(v(horizontal ? 1 : 0)) - v(2);
+                if (t == "ellipse" || t == "ellipse_arc") return ellipse_line_support(l, v);
+                double u = extremum_param(desc.eval, v, horizontal ? 0 : -1, horizontal ? 1 : 0, desc.scan);
+                return desc.eval(v, u).first(horizontal ? 1 : 0);
+            };
+            sys.add_residual([fn](const VectorXd& v) { return r1(fn(v)); }, desc.idx,
+                             [fn](const VectorXd& v) { return numeric_jac_1(fn, v); }, cid);
+            return;
+        }
+    }
 
     if (ctype == "coincident") {
         need(2);
@@ -2099,30 +2721,28 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
             // Single point-handle form is not meaningful for h/v; require 2.
             need(2);
         }
-    } else if (ctype == "parallel") {
-        need(2);
-        known_entity(refs[0]);
-        known_entity(refs[1]);
-        add_parallel(sys, cid, refs[0], refs[1], var_map);
-    } else if (ctype == "perpendicular") {
-        need(2);
-        known_entity(refs[0]);
-        known_entity(refs[1]);
-        add_perpendicular(sys, cid, refs[0], refs[1], var_map);
     } else if (ctype == "concentric") {
         need(2);
         known_entity(refs[0]);
         known_entity(refs[1]);
-        add_concentric(sys, cid, refs[0], refs[1], var_map);
-    } else if (ctype == "collinear") {
-        need(2);
-        known_entity(refs[0]);
-        known_entity(refs[1]);
-        add_collinear(sys, cid, refs[0], refs[1], var_map);
+        for (const auto& h : refs) {
+            if (h == "origin" || h == "origin.p") continue;
+            std::string et = entities.at(eid_of(h)).value("type", "");
+            if (h.find('.') == std::string::npos && et != "circle" && et != "arc" &&
+                et != "ellipse" && et != "ellipse_arc" && et != "arc_slot" && et != "point")
+                throw std::runtime_error("concentric: ref '" + h + "' needs a center or point handle");
+            resolve_handle(h, entities, var_map);
+        }
+        add_two_point(sys, cid, refs[0], refs[1], 0, entities, var_map);
     } else if (ctype == "coradial") {
         need(2);
         known_entity(refs[0]);
         known_entity(refs[1]);
+        for (const auto& h : refs) {
+            if (!entities.count(h) || (entities.at(h).value("type", "") != "circle" &&
+                                       entities.at(h).value("type", "") != "arc"))
+                throw std::runtime_error("coradial: ref '" + h + "' needs circle/arc");
+        }
         add_coradial(sys, cid, refs[0], refs[1], var_map);
     } else if (ctype == "equal") {
         need(2);
@@ -2133,27 +2753,36 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
         need(2);
         known_entity(refs[0]);
         known_entity(refs[1]);
-        add_midpoint(sys, cid, refs[0], refs[1], entities, var_map);
+        if (entities.count(refs[1]) && entities.at(refs[1]).value("type", "") == "arc")
+            add_arc_midpoint(sys, cid, refs[0], refs[1], entities, var_map);
+        else {
+            require_line(refs[1]);
+            if (!is_axis(refs[1]) && entities.at(refs[1]).value("type", "") != "line")
+                throw std::runtime_error("midpoint: ref '" + refs[1] + "' needs line/arc");
+            if (is_axis(refs[1])) add_two_point(sys, cid, refs[0], "origin", 0, entities, var_map);
+            else add_midpoint(sys, cid, refs[0], refs[1], entities, var_map);
+        }
     } else if (ctype == "symmetric") {
         need(3);
         known_entity(refs[0]);
         known_entity(refs[1]);
         known_entity(refs[2]);
-        add_symmetric(sys, cid, refs[0], refs[1], refs[2], entities, var_map);
-    } else if (ctype == "angle") {
-        need(2);
-        known_entity(refs[0]);
-        known_entity(refs[1]);
-        add_angle(sys, cid, refs[0], refs[1], resolve_dim(c, env), var_map);
+        if (!is_axis(refs[2]) && refs[0].find('.') != std::string::npos &&
+            refs[1].find('.') != std::string::npos) {
+            require_line(refs[2]);
+            add_symmetric(sys, cid, refs[0], refs[1], refs[2], entities, var_map);
+        } else add_extended_symmetric(sys, cid, refs[0], refs[1], refs[2], entities, var_map);
     } else if (ctype == "fix") {
         need(1);
         known_entity(refs[0]);
-        add_fix(sys, cid, refs[0], entities, var_map);
+        if (!is_axis(refs[0])) add_fix(sys, cid, refs[0], entities, var_map);
     } else if (ctype == "point_on") {
         need(2);
         known_entity(refs[0]);
         known_entity(refs[1]);
-        add_point_on(sys, cid, refs[0], refs[1], entities, var_map);
+        point_on_supported(refs[1]);
+        if (is_axis(refs[1])) add_point_axis(sys, cid, refs[0], refs[1], 0, false, entities, var_map);
+        else add_point_on(sys, cid, refs[0], refs[1], entities, var_map);
     } else if (ctype == "tangent") {
         need(2);
         known_entity(refs[0]);
@@ -2162,7 +2791,7 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
         std::string t0 = entities.at(e0).at("type"), t1 = entities.at(e1).at("type");
         auto is_curved = [](const std::string& t) { return t == "circle" || t == "arc"; };
         auto is_conic = [](const std::string& t) {
-            return t == "ellipse_arc" || t == "parabola" || t == "conic";
+            return t == "ellipse" || t == "ellipse_arc" || t == "parabola" || t == "conic";
         };
         auto is_spline = [](const std::string& t) {
             return t == "spline" || t == "style_spline";
@@ -2186,9 +2815,13 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
             add_tangent_line_curve(sys, cid, e0, e1, entities, var_map);
         else if (is_spline(t0) && t1 == "line")
             add_tangent_line_curve(sys, cid, e1, e0, entities, var_map);
+        else if ((t0 == "ellipse" || t1 == "ellipse") &&
+                 (curved0 || t0 == "ellipse" || t0 == "ellipse_arc") &&
+                 (curved1 || t1 == "ellipse" || t1 == "ellipse_arc"))
+            add_ellipse_pair_tangent(sys, cid, e0, e1, entities, var_map);
         else if (is_generic(t0) && is_generic(t1))
             add_tangent_curve_curve(sys, cid, e0, e1, entities, var_map, interactive);
-        // line-line tangent (ill-defined) stays deferred; skip.
+        else throw std::runtime_error("tangent: unsupported refs '" + refs[0] + "', '" + refs[1] + "'");
     } else if (ctype == "distance") {
         // SEMANTIC: a single bare line/slot ref is a LINE-LENGTH dimension
         // (SolidWorks-style "select edge → Smart Dimension"). Two-ref form is
@@ -2209,6 +2842,16 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
             need(2);
             known_entity(refs[0]);
             known_entity(refs[1]);
+            if (is_direction_ref(refs[0], entities) && is_direction_ref(refs[1], entities)) {
+                add_line_distance(sys, cid, refs[0], refs[1], resolve_dim(c, env), entities, var_map);
+                return;
+            }
+            if (is_axis(refs[0]) || is_axis(refs[1])) {
+                bool first = is_axis(refs[0]);
+                add_point_axis(sys, cid, first ? refs[1] : refs[0], first ? refs[0] : refs[1],
+                                 resolve_dim(c, env), true, entities, var_map);
+                return;
+            }
             std::string axis;
             if (c.contains("axis") && c["axis"].is_string())
                 axis = c["axis"].get<std::string>();
@@ -2254,8 +2897,9 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
             throw std::runtime_error(ctype + " constraint needs a circle/arc/slot ref (got '" +
                                      et + "': '" + refs[0] + "')");
         }
+    } else {
+        throw std::runtime_error("unsupported constraint type '" + ctype + "'");
     }
-    // unknown -> skip (forward-tolerant)
 }
 
 // ---- result emission --------------------------------------------------------
@@ -2420,7 +3064,7 @@ std::map<std::string, std::string> compute_statuses(
 // helpers return std::nullopt where the Python returns None (dangling refs).
 
 const std::set<std::string> kDimensionalTypes = {"distance", "angle", "radius",
-                                                 "diameter", "length"};
+                                                 "diameter", "length", "arc_length"};
 
 // World (x, y) of a point handle against SOLVED entity coords. nullopt if it cannot
 // be resolved (dangling). Port of _handle_point.
@@ -2465,6 +3109,21 @@ std::optional<Vector2d> handle_point(const std::string& handle, const json& coor
         if (!has_sub || sub == "p1" || sub == "start") return as_pt(ent.at("p1"));
         if (sub == "p2" || sub == "end") return as_pt(ent.at("p2"));
     }
+    if (et == "spline" || et == "style_spline") {
+        const json& points = jat(ent, "points");
+        if (!points.is_array() || points.empty()) return std::nullopt;
+        size_t index = 0;
+        if (sub == "end") index = points.size() - 1;
+        else if (has_sub && sub != "start") {
+            if (sub.size() < 2 || sub[0] != 'p') return std::nullopt;
+            const char* end = sub.data() + sub.size();
+            auto parsed = std::from_chars(sub.data() + 1, end, index);
+            if (parsed.ec != std::errc() || parsed.ptr != end) return std::nullopt;
+        }
+        if (index >= points.size() || !points[index].is_array() || points[index].size() != 2 ||
+            !points[index][0].is_number() || !points[index][1].is_number()) return std::nullopt;
+        return as_pt(points[index]);
+    }
     return std::nullopt;
 }
 
@@ -2472,10 +3131,13 @@ std::optional<Vector2d> handle_point(const std::string& handle, const json& coor
 // Port of _line_endpoints.
 std::optional<std::pair<Vector2d, Vector2d>> line_endpoints(const std::string& handle,
                                                             const json& coords) {
+    if (is_axis(handle))
+        return std::make_pair(Vector2d::Zero().eval(), handle == "axis.h" ? Vector2d(1, 0) : Vector2d(0, 1));
     std::string eid = handle.substr(0, handle.find('.'));
     if (!coords.contains(eid)) return std::nullopt;
     const json& ent = coords.at(eid);
-    if (ent.value("type", std::string()) != "line") return std::nullopt;
+    if (ent.value("type", std::string()) != "line" && ent.value("type", std::string()) != "slot")
+        return std::nullopt;
     return std::make_pair(Vector2d(num(ent["p1"][0]), num(ent["p1"][1])),
                           Vector2d(num(ent["p2"][0]), num(ent["p2"][1])));
 }
@@ -2509,25 +3171,9 @@ double measure_cond_adj(const json& constraint, const std::vector<std::string>& 
 // One dense System for a sketch with many independent profiles is O(n³) on the
 // LM / SVD steps. Union-find over entities linked by constraint refs partitions
 // the sketch into independent components that can be solved separately; DOF /
-// statuses / diagnostics are summed/merged afterward. Exact/oracle path
-// (interactive=false) stays monolithic for byte-identical parity.
+// statuses / diagnostics are summed/merged afterward. Exact solves only split
+// independently fixed components; the movable remainder stays monolithic.
 
-struct UnionFind {
-    std::map<std::string, std::string> parent;
-    std::string find(const std::string& x) {
-        auto it = parent.find(x);
-        if (it == parent.end()) {
-            parent[x] = x;
-            return x;
-        }
-        if (it->second != x) it->second = find(it->second);
-        return it->second;
-    }
-    void unite(const std::string& a, const std::string& b) {
-        std::string ra = find(a), rb = find(b);
-        if (ra != rb) parent[ra] = rb;
-    }
-};
 
 std::string eid_of_handle(const std::string& h) {
     auto d = h.find('.');
@@ -2583,7 +3229,7 @@ std::vector<SketchComponent> partition_components(const json& entities_list,
     if (comps.empty()) return comps;
 
     for (const auto& c : constraints_list) {
-        if (!c.is_object()) continue;
+        if (!c.is_object()) { comps[0].constraints.push_back(c); continue; }
         std::string root;
         if (c.contains("refs") && c["refs"].is_array()) {
             for (const auto& r : c["refs"]) {
@@ -2626,11 +3272,15 @@ SketchSolution solve_sketch_monolithic(const json& sketch, const json& env,
     }
 
     std::map<std::string, std::vector<int>> tag_vars;
+    SketchSolution sol;
+    const auto context = constraint_context(entities, var_map, constraints_list);
     for (const auto& c : constraints_list) {
         try {
-            add_constraint(sys, c, entities, var_map, env, interactive);
+            add_constraint(sys, c, entities, var_map, env, interactive, context);
+        } catch (const std::exception& e) {
+            sol.skipped.emplace_back(jid(c), e.what());
         } catch (...) {
-            // forward-tolerant: skip malformed/unsupported constraints
+            sol.skipped.emplace_back(jid(c), "unknown constraint registration error");
         }
     }
 
@@ -2671,7 +3321,6 @@ SketchSolution solve_sketch_monolithic(const json& sketch, const json& env,
         }
     }
 
-    SketchSolution sol;
     auto res = sys.solve(x0, 1e-10, 100, time_budget_ms);
     sol.x = res.x;
     sol.converged = res.converged;
@@ -2691,11 +3340,12 @@ SketchSolution solve_sketch_monolithic(const json& sketch, const json& env,
     for (const auto& c : constraints_list) {
         // reconstruct which variables a conflicting tag touches from refs
         // (cheap: union of referenced entity var blocks).
-        if (!c.contains("id")) continue;
+        if (!c.is_object() || !c.contains("id") || !c["id"].is_string()) continue;
         std::string cid = c["id"];
         std::vector<int> vars;
-        if (c.contains("refs"))
+        if (c.contains("refs") && c["refs"].is_array())
             for (const auto& r : c["refs"]) {
+                if (!r.is_string()) continue;
                 std::string h = r.get<std::string>();
                 std::string eid = h.substr(0, h.find('.'));
                 auto it = var_map.find(eid);
@@ -2715,8 +3365,8 @@ SketchSolution solve_sketch_monolithic(const json& sketch, const json& env,
     return sol;
 }
 
-// Merge per-component solutions into one SketchSolution with a concatenated
-// global variable layout (stable for warm-start / drag handoff).
+// Merge component results back into the original entity-allocation order, so
+// warm starts and consumers reusing x with a rebuilt System see identical indices.
 SketchSolution merge_component_solutions(
     const std::vector<SketchSolution>& parts,
     const json& full_entities_list) {
@@ -2725,8 +3375,10 @@ SketchSolution merge_component_solutions(
     sol.dof = 0;
     sol.entities = json::object();
     sol.statuses = {};
-    int offset = 0;
-    std::vector<double> x_all;
+    int n_vars = 0;
+    for (const auto& p : parts) n_vars += static_cast<int>(p.x.size());
+    sol.x.resize(n_vars);
+    std::map<std::string, std::pair<const SketchSolution*, const std::vector<int>*>> layout;
     std::map<std::string, std::string> cur_sig;
     for (const auto& e : full_entities_list)
         if (e.is_object() && e.contains("id")) cur_sig[e["id"]] = e.dump();
@@ -2737,23 +3389,26 @@ SketchSolution merge_component_solutions(
         sol.redundant.insert(sol.redundant.end(), p.redundant.begin(), p.redundant.end());
         sol.conflicting.insert(sol.conflicting.end(), p.conflicting.begin(),
                                p.conflicting.end());
+        sol.skipped.insert(sol.skipped.end(), p.skipped.begin(), p.skipped.end());
         for (auto it = p.entities.begin(); it != p.entities.end(); ++it)
             sol.entities[it.key()] = it.value();
         for (const auto& kv : p.statuses) sol.statuses[kv.first] = kv.second;
-        for (const auto& kv : p.var_map) {
-            std::vector<int> gidx;
-            gidx.reserve(kv.second.size());
-            for (int li : kv.second) gidx.push_back(li + offset);
-            sol.var_map[kv.first] = std::move(gidx);
-        }
-        for (int i = 0; i < p.x.size(); ++i) x_all.push_back(p.x(i));
-        offset += static_cast<int>(p.x.size());
+        for (const auto& kv : p.var_map) layout[kv.first] = {&p, &kv.second};
     }
-    if (x_all.empty())
-        sol.x = Eigen::VectorXd();
-    else
-        sol.x = Eigen::Map<const Eigen::VectorXd>(
-            x_all.data(), static_cast<Eigen::Index>(x_all.size()));
+    int offset = 0;
+    for (const auto& e : full_entities_list) {
+        const std::string id = jid(e);
+        auto it = layout.find(id);
+        if (it == layout.end()) continue;
+        const auto& part = *it->second.first;
+        const auto& local = *it->second.second;
+        auto& global = sol.var_map[id];
+        global.reserve(local.size());
+        for (int i : local) {
+            global.push_back(offset);
+            sol.x(offset++) = part.x(i);
+        }
+    }
     // Entities with no vars (or missing from a part) still need status defaults.
     for (const auto& e : full_entities_list) {
         if (!e.is_object() || !e.contains("id")) continue;
@@ -2767,7 +3422,7 @@ SketchSolution merge_component_solutions(
     }
     sol.state.x = sol.x;
     sol.state.var_map = sol.var_map;
-    sol.state.n_vars = static_cast<int>(x_all.size());
+    sol.state.n_vars = n_vars;
     sol.state.ent_sig = cur_sig;
     return sol;
 }
@@ -2778,21 +3433,79 @@ SketchSolution solve_sketch(const json& sketch, const json& env,
                             const std::optional<SolveState>& warm,
                             std::optional<double> time_budget_ms,
                             bool interactive) {
-    // Exact / oracle path: always one monolithic System (parity invariant).
-    if (!interactive)
-        return solve_sketch_monolithic(sketch, env, warm, time_budget_ms, false);
+    // Purely fixed conversions are common and should not enlarge the dense QR of
+    // a later, unrelated edit. Other exact solves retain the historical system.
 
     json entities_list = sketch.value("entities", json::array());
     json constraints_list = sketch.value("constraints", json::array());
     // Small sketches: decomp overhead dominates. Also a single component is just
     // the monolithic path.
-    if (!entities_list.is_array() || entities_list.size() < 2)
-        return solve_sketch_monolithic(sketch, env, warm, time_budget_ms, true);
+    if (!entities_list.is_array() || entities_list.size() < 2 || !constraints_list.is_array())
+        return solve_sketch_monolithic(sketch, env, warm, time_budget_ms, interactive);
+    std::set<std::string> whole_fixed;
+    if (!interactive) {
+        if (warm && warm->ent_sig.empty())
+            return solve_sketch_monolithic(sketch, env, warm, time_budget_ms, false);
+        std::set<std::string> ids;
+        for (const auto& e : entities_list) {
+            if (!e.is_object() || !jat(e, "id").is_string() || !jat(e, "type").is_string() ||
+                !ids.insert(jid(e)).second)
+                return solve_sketch_monolithic(sketch, env, warm, time_budget_ms, false);
+        }
+        for (const auto& c : constraints_list) {
+            if (!c.is_object() || jat(c, "type") != "fix" || jat(c, "driven") == true ||
+                !c.contains("refs") || !c["refs"].is_array() || c["refs"].size() != 1 ||
+                !c["refs"][0].is_string()) continue;
+            const std::string h = c["refs"][0].get<std::string>();
+            if (h.find('.') == std::string::npos) whole_fixed.insert(h);
+        }
+        if (whole_fixed.empty())
+            return solve_sketch_monolithic(sketch, env, warm, time_budget_ms, false);
+    }
 
     std::vector<SketchComponent> comps =
         partition_components(entities_list, constraints_list);
     if (comps.size() <= 1)
-        return solve_sketch_monolithic(sketch, env, warm, time_budget_ms, true);
+        return solve_sketch_monolithic(sketch, env, warm, time_budget_ms, interactive);
+    if (!interactive) {
+        std::vector<bool> fixed(comps.size(), false);
+        std::map<std::string, size_t> component_of;
+        size_t count = 0;
+        for (size_t i = 0; i < comps.size(); ++i) {
+            fixed[i] = true;
+            for (const auto& e : comps[i].entities) {
+                const std::string id = jid(e), t = e.value("type", "");
+                component_of[id] = i;
+                // Whole fix on the remaining families only pins a derived point.
+                if (!whole_fixed.count(id) || (t != "point" && t != "line" && t != "circle" &&
+                    t != "arc" && t != "ellipse" && t != "spline" && t != "style_spline"))
+                    fixed[i] = false;
+            }
+            if (fixed[i]) ++count;
+        }
+        if (count == 0)
+            return solve_sketch_monolithic(sketch, env, warm, time_budget_ms, false);
+        SketchComponent remainder;
+        for (const auto& e : entities_list)
+            if (!fixed[component_of.at(jid(e))]) remainder.entities.push_back(e);
+        for (const auto& c : constraints_list) {
+            size_t component = 0;
+            if (c.is_object() && c.contains("refs") && c["refs"].is_array()) {
+                for (const auto& h : c["refs"]) {
+                    if (!h.is_string()) continue;
+                    auto it = component_of.find(eid_of_handle(h.get<std::string>()));
+                    if (it != component_of.end()) { component = it->second; break; }
+                }
+            }
+            if (!fixed[component]) remainder.constraints.push_back(c);
+        }
+        std::vector<SketchComponent> split;
+        split.reserve(count + (remainder.entities.empty() ? 0 : 1));
+        if (!remainder.entities.empty()) split.push_back(std::move(remainder));
+        for (size_t i = 0; i < comps.size(); ++i)
+            if (fixed[i]) split.push_back(std::move(comps[i]));
+        comps = std::move(split);
+    }
 
     // Independent components — solve each with its own dense System (T-PERF9).
     // Wall-clock budget is shared across components (remaining time each round).
@@ -2819,9 +3532,23 @@ SketchSolution solve_sketch(const json& sketch, const json& env,
             }
         }
         parts.push_back(
-            solve_sketch_monolithic(sub, env, warm, budget, /*interactive=*/true));
+            solve_sketch_monolithic(sub, env, warm, budget, interactive));
     }
-    return merge_component_solutions(parts, entities_list);
+    auto sol = merge_component_solutions(parts, entities_list);
+    // Component execution order must not change chronological diagnostics.
+    std::map<std::string, size_t> order;
+    for (size_t i = 0; i < constraints_list.size(); ++i) order.emplace(jid(constraints_list[i]), i);
+    auto position = [&](const std::string& id) {
+        auto it = order.find(id);
+        return it == order.end() ? constraints_list.size() : it->second;
+    };
+    auto earlier = [&](const std::string& a, const std::string& b) { return position(a) < position(b); };
+    std::stable_sort(sol.redundant.begin(), sol.redundant.end(), earlier);
+    std::stable_sort(sol.conflicting.begin(), sol.conflicting.end(), earlier);
+    std::stable_sort(sol.skipped.begin(), sol.skipped.end(), [&](const auto& a, const auto& b) {
+        return position(a.first) < position(b.first);
+    });
+    return sol;
 }
 
 SketchSolution solve_sketch(const json& sketch, const json& env) {
@@ -3054,9 +3781,10 @@ std::vector<FreeVar> free_variables_at(const json& sketch, const json& env,
             var_map[jid(e)] = sys.add_vars(0, {});
         }
     }
+    const auto context = constraint_context(entities, var_map, constraints_list);
     for (const auto& c : constraints_list) {
         try {
-            add_constraint(sys, c, entities, var_map, env);
+            add_constraint(sys, c, entities, var_map, env, false, context);
         } catch (...) { /* forward-tolerant */ }
     }
 
@@ -3071,7 +3799,7 @@ std::vector<FreeVar> free_variables_at(const json& sketch, const json& env,
     MatrixXd J = sys.real_jacobian(x);
 
     std::vector<FreeVar> out;
-    if (J.rows() == 0 || n == 0) return out;  // wholly unconstrained -> no J rows
+    if (n == 0) return out;
 
     // Share the per-entity classifier's projection, including coordinates absent
     // from every constraint Jacobian.
@@ -3181,6 +3909,13 @@ std::optional<double> measure_constraint(const json& constraint,
         return h.substr(0, h.find('.'));
     };
 
+    if (ctype == "arc_length") {
+        if (refs.size() != 1 || !entity_coords.contains(refs[0])) return std::nullopt;
+        const json& e = entity_coords.at(refs[0]);
+        if (e.value("type", "") != "arc") return std::nullopt;
+        return num(e.at("radius")) * arc_sweep(num(e.at("start")), num(e.at("end")),
+                                              e.value("ccw", true)) * kDeg;
+    }
     if (ctype == "radius") {
         std::string eid = eid0();
         if (!eid.empty() && entity_coords.contains(eid)) {
@@ -3240,12 +3975,18 @@ std::optional<double> measure_constraint(const json& constraint,
         }
         if (refs.size() < 2) return std::nullopt;
         auto is_line = [&](const std::string& h) {
-            std::string eid = h.substr(0, h.find('.'));
-            if (!entity_coords.contains(eid)) return false;
-            return entity_coords.at(eid).value("type", std::string()) == "line" &&
-                   h.find('.') == std::string::npos;
+            if (is_axis(h)) return true;
+            if (!entity_coords.contains(h)) return false;
+            std::string t = entity_coords.at(h).value("type", "");
+            return t == "line" || t == "slot";
         };
         double adj = measure_cond_adj(constraint, refs, entity_coords);
+        if (is_line(refs[0]) && is_line(refs[1])) {
+            auto a = line_endpoints(refs[0], entity_coords), b = line_endpoints(refs[1], entity_coords);
+            if (!a || !b) return std::nullopt;
+            Vector2d u = a->second - a->first, d = (b->first + b->second) * .5 - a->first;
+            return std::abs(u.x() * d.y() - u.y() * d.x()) / std::max(u.norm(), 1e-12);
+        }
         if (is_line(refs[0]) || is_line(refs[1])) {
             const std::string& line_h = is_line(refs[0]) ? refs[0] : refs[1];
             const std::string& pt_h = is_line(refs[0]) ? refs[1] : refs[0];
@@ -3332,9 +4073,10 @@ DragComp build_drag_comp(const SketchComponent& sc, const json& env) {
         }
     }
     dc.sys.set_interactive(true);
+    const auto context = constraint_context(dc.entities, dc.var_map, sc.constraints);
     for (const auto& c : sc.constraints) {
         try {
-            add_constraint(dc.sys, c, dc.entities, dc.var_map, env, /*interactive=*/true);
+            add_constraint(dc.sys, c, dc.entities, dc.var_map, env, true, context);
         } catch (...) {
         }
     }
@@ -3442,10 +4184,11 @@ json drag(const SolveState& state, const std::string& handle,
                     ctx->var_map[jid(e)] = ctx->sys.add_vars(0, {});
                 }
             }
+            const auto context = constraint_context(ctx->entities, ctx->var_map, ctx->constraints_list);
             for (const auto& c : ctx->constraints_list) {
                 try {
                     add_constraint(ctx->sys, c, ctx->entities, ctx->var_map, env,
-                                   /*interactive=*/true);
+                                   true, context);
                 } catch (...) {
                 }
             }

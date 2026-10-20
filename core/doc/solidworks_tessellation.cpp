@@ -42,6 +42,43 @@ constexpr std::uint32_t kMaxCompressedBytes = 64u * 1024u * 1024u;
 constexpr std::uint32_t kMaxInflatedBytes = 512u * 1024u * 1024u;
 constexpr std::uint32_t kMaxArrayItems = 16u * 1024u * 1024u;
 
+// Match the Python portable reader. Keep the existing 512 MiB stream ceiling as the
+// whole-file/retained-stream/mesh ceiling too: importing more must use the exact STEP
+// lane, not silently simplify engineering geometry. Count logical placed geometry
+// even though this reader shares meshes (the native consumer instantiates every body).
+struct Limits {
+    std::size_t file_bytes = kMaxInflatedBytes;
+    std::size_t stream_bytes = kMaxInflatedBytes;
+    std::size_t streams = 4096;
+    std::size_t instances = 65536;
+    std::size_t work = 1024u * 1024u;
+    std::size_t vertices = kMaxArrayItems;
+    std::size_t triangles = kMaxArrayItems;
+    std::size_t mesh_bytes = kMaxInflatedBytes;
+};
+
+void charge(std::size_t& used, std::size_t amount, std::size_t limit, const char* kind) {
+    if (used > limit || amount > limit - used)
+        throw std::runtime_error(std::string("SolidWorks ") + kind + " budget exceeded");
+    used += amount;
+}
+
+struct MeshBudget {
+    std::size_t vertices = 0;
+    std::size_t triangles = 0;
+    std::size_t bytes = 0;
+
+    void add(std::size_t verts, std::size_t tris, const Limits& limits) {
+        charge(vertices, verts, limits.vertices, "aggregate vertex");
+        charge(triangles, tris, limits.triangles, "aggregate triangle");
+        // Divide before multiplying, so even a malformed count cannot wrap.
+        if (verts > limits.mesh_bytes / 24 || tris > limits.mesh_bytes / 12)
+            throw std::runtime_error("SolidWorks aggregate mesh byte budget exceeded");
+        charge(bytes, verts * 24, limits.mesh_bytes, "aggregate mesh byte");
+        charge(bytes, tris * 12, limits.mesh_bytes, "aggregate mesh byte");
+    }
+};
+
 Mat4 identity_matrix() {
     return {1.0, 0.0, 0.0, 0.0,
             0.0, 1.0, 0.0, 0.0,
@@ -81,13 +118,15 @@ bool matches_chunk(const Bytes& data, std::size_t offset) {
                       data.begin() + static_cast<std::ptrdiff_t>(offset));
 }
 
-Bytes read_file(const std::string& path) {
+Bytes read_file(const std::string& path, const Limits& limits) {
     std::ifstream in(path, std::ios::binary | std::ios::ate);
     if (!in) throw std::runtime_error("cannot open SolidWorks file: " + path);
     const std::streamoff end = in.tellg();
     if (end <= 0) throw std::runtime_error("SolidWorks file is empty: " + path);
     if (static_cast<std::uint64_t>(end) > std::numeric_limits<std::size_t>::max())
         throw std::runtime_error("SolidWorks file is too large to address: " + path);
+    if (static_cast<std::uint64_t>(end) > limits.file_bytes)
+        throw std::runtime_error("SolidWorks input file byte budget exceeded");
     Bytes data(static_cast<std::size_t>(end));
     in.seekg(0, std::ios::beg);
     if (!in.read(reinterpret_cast<char*>(data.data()), end))
@@ -130,8 +169,8 @@ Bytes inflate_raw(const std::uint8_t* input, std::size_t input_size, std::size_t
     return out;
 }
 
-StreamMap read_modern_streams(const std::string& path, bool assembly) {
-    const Bytes data = read_file(path);
+StreamMap read_modern_streams(const std::string& path, bool assembly, const Limits& limits) {
+    const Bytes data = read_file(path, limits);
     if (data.size() < 22)
         throw std::runtime_error("SolidWorks file is too short to contain a modern document");
     if (data.size() >= 8 && data[0] == 0xd0 && data[1] == 0xcf && data[2] == 0x11 &&
@@ -150,6 +189,8 @@ StreamMap read_modern_streams(const std::string& path, bool assembly) {
             "unrecognized SolidWorks container (expected a SolidWorks 2015+ chunk stream)");
 
     StreamMap streams;
+    std::size_t stream_count = 0;
+    std::size_t expanded_bytes = 0;
     const int key = data[7];
     std::size_t search = 0;
     while (search + kChunkMarker.size() <= data.size()) {
@@ -179,7 +220,10 @@ StreamMap read_modern_streams(const std::string& path, bool assembly) {
         const std::size_t payload = name_start + name_size;
         if (f1 < kInlineChunk) { search = marker + kChunkMarker.size(); continue; }
         if (compressed == 0) {
-            if (wanted_stream(name, assembly)) streams.try_emplace(name, Bytes{});
+            if (wanted_stream(name, assembly) && streams.find(name) == streams.end()) {
+                charge(stream_count, 1, limits.streams, "stream count");
+                streams.try_emplace(name, Bytes{});
+            }
             search = marker + kChunkMarker.size();
             continue;
         }
@@ -187,8 +231,13 @@ StreamMap read_modern_streams(const std::string& path, bool assembly) {
             search = marker + 1;
             continue;
         }
-        if (wanted_stream(name, assembly) && streams.find(name) == streams.end())
+        if (wanted_stream(name, assembly) && streams.find(name) == streams.end()) {
+            if (expanded == 0 || expanded > kMaxInflatedBytes)
+                throw std::runtime_error("SolidWorks stream '" + name + "' has an invalid expanded size");
+            charge(stream_count, 1, limits.streams, "stream count");
+            charge(expanded_bytes, expanded, limits.stream_bytes, "aggregate expanded byte");
             streams.emplace(name, inflate_raw(data.data() + payload, compressed, expanded, name));
+        }
         search = payload + compressed;
     }
     return streams;
@@ -242,7 +291,8 @@ std::map<std::size_t, std::size_t> strip_headers(const Bytes& data) {
     return by_end;
 }
 
-MeshData parse_face_tessellations(const Bytes& data, std::optional<std::uint32_t> expected_faces) {
+MeshData parse_face_tessellations(const Bytes& data, std::optional<std::uint32_t> expected_faces,
+                                 MeshBudget& budget, const Limits& limits) {
     const std::vector<ArrayRecord> arrays = float_arrays(data);
     if (arrays.empty() || arrays.size() % 4 != 0)
         throw std::runtime_error("saved SolidWorks display list contains no complete face arrays");
@@ -259,6 +309,7 @@ MeshData parse_face_tessellations(const Bytes& data, std::optional<std::uint32_t
         total_vertices += arrays[face * 4].count;
     if (total_vertices > std::numeric_limits<std::uint32_t>::max())
         throw std::runtime_error("SolidWorks tessellation has more than 2^32 vertices");
+    budget.add(static_cast<std::size_t>(total_vertices), 0, limits);
     mesh.verts.reserve(static_cast<std::size_t>(total_vertices) * 3);
 
     for (std::size_t face = 0; face < face_count; ++face) {
@@ -313,6 +364,7 @@ MeshData parse_face_tessellations(const Bytes& data, std::optional<std::uint32_t
                 const double cy = abz * acx - abx * acz;
                 const double cz = abx * acy - aby * acx;
                 if (cx * cx + cy * cy + cz * cz <= 1e-20) continue;
+                budget.add(0, 1, limits);
                 mesh.tris.insert(mesh.tris.end(), {ia, ib, ic});
             }
             cursor += length;
@@ -517,18 +569,71 @@ std::string unique_name(std::string candidate, std::unordered_map<std::string, i
     return count == 1 ? candidate : candidate + "-" + std::to_string(count);
 }
 
-}  // namespace
+// Memoized costs account for every DAG path without materializing instances. Heights
+// retain the depth guard when a model is reached later through a longer path.
+struct ExpansionCost {
+    std::size_t instances = 0;
+    std::size_t work = 0;
+    MeshBudget mesh;
+    int height = 0;
+};
 
-std::vector<SolidWorksTessellationBody> read_solidworks_tessellation(
-    const std::string& path, bool assembly) {
-    StreamMap streams = read_modern_streams(path, assembly);
+ExpansionCost expansion_cost(
+    const AssemblyTree& tree,
+    const std::unordered_map<std::string, std::shared_ptr<const MeshData>>& meshes,
+    const Limits& limits) {
+    std::unordered_map<std::string, ExpansionCost> memo;
+    std::unordered_set<std::string> stack;
+    const auto count = [&](auto&& self, const std::string& id, int depth) -> ExpansionCost {
+        if (depth > 64) throw std::runtime_error("SolidWorks assembly nesting exceeds 64 levels");
+        const auto cached = memo.find(id);
+        if (cached != memo.end()) {
+            if (depth + cached->second.height > 64)
+                throw std::runtime_error("SolidWorks assembly nesting exceeds 64 levels");
+            return cached->second;
+        }
+        if (!stack.insert(id).second)
+            throw std::runtime_error("SolidWorks assembly component graph contains a cycle");
+        const auto owner = tree.model_index.find(id);
+        if (owner == tree.model_index.end())
+            throw std::runtime_error("SolidWorks assembly references unknown model id " + id);
+        ExpansionCost cost;
+        for (const Reference& ref : tree.models[owner->second].references) {
+            charge(cost.work, 1, limits.work, "instance work");
+            if (ref.suppressed) continue;
+            const auto mesh = meshes.find(ref.model_ref);
+            if (mesh != meshes.end()) {
+                charge(cost.instances, 1, limits.instances, "instance count");
+                cost.mesh.add(mesh->second->vertex_count(), mesh->second->triangle_count(), limits);
+            } else {
+                const ExpansionCost child = self(self, ref.model_ref, depth + 1);
+                charge(cost.instances, child.instances, limits.instances, "instance count");
+                charge(cost.work, child.work, limits.work, "instance work");
+                cost.mesh.add(child.mesh.vertices, child.mesh.triangles, limits);
+                cost.height = std::max(cost.height, child.height + 1);
+            }
+        }
+        stack.erase(id);
+        memo.emplace(id, cost);
+        return cost;
+    };
+    return count(count, tree.root_model, 0);
+}
+
+std::vector<SolidWorksTessellationBody> read_solidworks_tessellation_impl(
+    const std::string& path, bool assembly, const Limits& limits) {
+    StreamMap streams = read_modern_streams(path, assembly, limits);
+    MeshBudget source_budget;
     if (!assembly) {
         const auto it = streams.find("Contents/DisplayLists");
         if (it == streams.end() || it->second.empty())
             throw std::runtime_error(
                 "SolidWorks part has no saved display tessellation; rebuild/save it in SolidWorks "
                 "or export STEP");
-        auto mesh = std::make_shared<MeshData>(parse_face_tessellations(it->second, std::nullopt));
+        std::size_t instance_count = 0;
+        charge(instance_count, 1, limits.instances, "instance count");
+        auto mesh = std::make_shared<MeshData>(
+            parse_face_tessellations(it->second, std::nullopt, source_budget, limits));
         std::string name = std::filesystem::path(path).stem().string();
         return {{name.empty() ? std::string("SolidWorks Part") : std::move(name),
                  std::move(mesh), identity_matrix()}};
@@ -548,11 +653,13 @@ std::vector<SolidWorksTessellationBody> read_solidworks_tessellation(
             throw std::runtime_error("SolidWorks assembly face stream '" + name +
                                      "' contains no component blocks");
         for (const auto& [start, end] : blocks) {
+            std::size_t count = block_meshes.size();
+            charge(count, 1, limits.instances, "source mesh count");
             Bytes block(bytes.begin() + static_cast<std::ptrdiff_t>(start),
                         bytes.begin() + static_cast<std::ptrdiff_t>(end));
             const std::uint32_t expected_faces = read_u32(block, 12);
             block_meshes.push_back(std::make_shared<MeshData>(
-                parse_face_tessellations(block, expected_faces)));
+                parse_face_tessellations(block, expected_faces, source_budget, limits)));
         }
     }
     if (block_meshes.empty())
@@ -588,7 +695,13 @@ std::vector<SolidWorksTessellationBody> read_solidworks_tessellation(
     for (std::size_t i = 0; i < part_models.size(); ++i)
         mesh_by_model.emplace(part_models[i]->id, block_meshes[i]);
 
+    const ExpansionCost expected = expansion_cost(tree, mesh_by_model, limits);
+    std::size_t instance_count = 0;
+    std::size_t work = 0;
+    MeshBudget placed_budget;
+
     std::vector<SolidWorksTessellationBody> out;
+    out.reserve(expected.instances);
     std::unordered_map<std::string, int> used_names;
     std::unordered_set<std::string> recursion_stack;
     const auto expand = [&](auto&& self, const std::string& model_id, const Mat4& parent,
@@ -601,6 +714,7 @@ std::vector<SolidWorksTessellationBody> read_solidworks_tessellation(
             throw std::runtime_error("SolidWorks assembly references unknown model id " + model_id);
         const Model& owner = tree.models[owner_it->second];
         for (const Reference& ref : owner.references) {
+            charge(work, 1, limits.work, "instance work");
             if (ref.suppressed) continue;
             const Mat4 world = multiply(ref.transform, parent);  // row-vector local * parent
             const auto mesh_it = mesh_by_model.find(ref.model_ref);
@@ -608,6 +722,9 @@ std::vector<SolidWorksTessellationBody> read_solidworks_tessellation(
                 (ref.number.empty() ? std::string() : "-" + ref.number);
             const std::string path_name = prefix.empty() ? local_name : prefix + "/" + local_name;
             if (mesh_it != mesh_by_model.end()) {
+                charge(instance_count, 1, limits.instances, "instance count");
+                placed_budget.add(mesh_it->second->vertex_count(),
+                                  mesh_it->second->triangle_count(), limits);
                 out.push_back({unique_name(path_name, used_names), mesh_it->second, world});
             } else {
                 self(self, ref.model_ref, world, path_name, depth + 1);
@@ -619,6 +736,13 @@ std::vector<SolidWorksTessellationBody> read_solidworks_tessellation(
     if (out.empty())
         throw std::runtime_error("SolidWorks assembly resolved no unsuppressed part instances");
     return out;
+}
+
+}  // namespace
+
+std::vector<SolidWorksTessellationBody> read_solidworks_tessellation(
+    const std::string& path, bool assembly) {
+    return read_solidworks_tessellation_impl(path, assembly, Limits{});
 }
 
 }  // namespace chudware::doc

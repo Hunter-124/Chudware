@@ -1773,15 +1773,21 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         // Optional artifacts:[{path,kind}] — pack image paths into detail after a delimiter so
         // drawToolCallRow can expand them without new ActivityItem fields (app_state.h is
         // integrator-owned). Delimiter is unlikely in args JSON: "\n\x1eART\x1e\n".
+        // image_caption — the text the tool returned WITH its images (what the agent read beside
+        // the pixels) — rides just ahead of ART after "\n\x1eCAP\x1e\n". It precedes ART so the
+        // session-artifact scan (conversations.cpp, ART to end of detail) never reads caption
+        // lines as file paths.
         if (data.contains("artifacts") && data["artifacts"].is_array()) {
             std::string arts;
             int n = 0;
+            bool anyImage = false;
             for (const auto& art : data["artifacts"]) {
                 if (!art.is_object() || n >= 8) break;
                 std::string path = jstr(art, "path");
                 std::string kindA = jstr(art, "kind");
                 if (path.empty()) continue;
                 if (kindA != "image" && kindA != "mesh" && kindA != "file") kindA = "file";
+                if (kindA == "image") anyImage = true;
                 if (!arts.empty()) arts += "\n";
                 arts += kindA;
                 arts += '\t';
@@ -1789,6 +1795,13 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 ++n;
             }
             if (!arts.empty()) {
+                const std::string caption =
+                    anyImage ? ui::foldToAtlasGlyphs(jstr(data, "image_caption")) : std::string();
+                if (!caption.empty()) {
+                    if (!ni.detail.empty()) ni.detail += "\n\x1e" "CAP\x1e\n";
+                    else ni.detail = "\x1e" "CAP\x1e\n";
+                    ni.detail += caption;
+                }
                 if (!ni.detail.empty()) ni.detail += "\n\x1e" "ART\x1e\n";
                 else ni.detail = "\x1e" "ART\x1e\n";
                 ni.detail += arts;
@@ -2331,6 +2344,33 @@ AskBatch* findAskBatch(std::vector<ChatMsg>& msgs, const std::string& batchId, C
     return nullptr;
 }
 
+void anchorLegacyAsks(ChatMsg& m) {
+    // Batches saved before rowKind-20 markers existed: the n-th unmarked batch was asked by the
+    // n-th ask_user tool call, so its card goes right after that call's row. A batch with no
+    // such row keeps drawing after the turn (drawAskCards).
+    size_t searchFrom = 0;
+    for (const AskBatch& b : m.asks) {
+        if (b.batchId.empty()) continue;
+        const std::string stage = ui::askMarkerStage(b.batchId);
+        const bool marked = std::any_of(m.activity.begin(), m.activity.end(),
+                                        [&](const ActivityItem& a) {
+                                            return a.rowKind == 20 && a.stage == stage;
+                                        });
+        if (marked) continue;
+        size_t at = searchFrom;
+        while (at < m.activity.size() &&
+               !(m.activity[at].rowKind == 3 && m.activity[at].title == "ask_user"))
+            ++at;
+        if (at >= m.activity.size()) return;
+        ActivityItem marker;
+        marker.rowKind = 20;
+        marker.stage = stage;
+        marker.status = "done";
+        m.activity.insert(m.activity.begin() + (std::ptrdiff_t)(at + 1), std::move(marker));
+        searchFrom = at + 2;
+    }
+}
+
 bool feedAskEvent(std::vector<ChatMsg>& msgs, ChatMsg* active, const std::string& kind,
                   const nlohmann::json& data) {
     if (kind == "agent.question") {
@@ -2342,6 +2382,14 @@ bool feedAskEvent(std::vector<ChatMsg>& msgs, ChatMsg* active, const std::string
             for (auto it = msgs.rbegin(); it != msgs.rend() && !host; ++it)
                 if (!it->fromUser) host = &*it;
         if (!host) return true;
+        // Position marker (rowKind 20): the card draws HERE in the timeline, where the agent
+        // asked — not after everything the turn did later (answered cards used to trail the
+        // whole run, far below the point the question came up).
+        ActivityItem marker;
+        marker.rowKind = 20;
+        marker.stage = ui::askMarkerStage(incoming.batchId);
+        marker.status = "done";
+        host->activity.push_back(std::move(marker));
         host->asks.push_back(std::move(incoming));
         host->uiCachedH = -1.0f;
         markChatHistoryDirty();
@@ -2380,4 +2428,83 @@ bool hasOpenAsk(const std::vector<ChatMsg>& msgs) {
         for (const auto& b : m.asks)
             if (askStatusOpen(b.status)) return true;
     return false;
+}
+
+// ---- mid-run user messages (steers) ----------------------------------------------------------
+bool setSteerState(std::vector<ChatMsg>& msgs, const std::string& steerId, int state) {
+    if (steerId.empty()) return false;
+    for (auto it = msgs.rbegin(); it != msgs.rend(); ++it) {
+        if (!it->fromUser || it->steerId != steerId) continue;
+        // Streamed consumption is authoritative over every late control outcome,
+        // including a transport failure after the runtime already read the message.
+        if (it->steerState == state || it->steerState == STEER_DELIVERED ||
+            (it->steerState == STEER_CARRIED && state != STEER_DELIVERED))
+            return false;
+        it->steerState = state;
+        it->uiCachedH = -1.0f;
+        markChatHistoryDirty();
+        return true;
+    }
+    return false;
+}
+
+bool feedSteerEvent(std::vector<ChatMsg>& msgs, const std::string& kind,
+                    const nlohmann::json& data) {
+    if (kind != "agent.steer") return false;
+    const std::string status = jstr(data, "status");
+    if (status == "delivered")
+        setSteerState(msgs, jstr(data, "steer_id"), STEER_DELIVERED);
+    else if (status == "carried")
+        setSteerState(msgs, jstr(data, "steer_id"), STEER_CARRIED);
+    return true;
+}
+
+bool settleOpenSteers(std::vector<ChatMsg>& msgs) {
+    bool changed = false;
+    for (auto& m : msgs)
+        if (m.fromUser && (m.steerState == STEER_SENDING || m.steerState == STEER_QUEUED)) {
+            m.steerState = STEER_FAILED;
+            m.uiCachedH = -1.0f;
+            changed = true;
+        }
+    if (changed) markChatHistoryDirty();
+    return changed;
+}
+
+bool ui::reconcileResolvedAskReplies(std::vector<ChatMsg>& msgs) {
+    bool changed = false;
+    size_t turnBegin = 0;
+    while (turnBegin < msgs.size()) {
+        size_t turnEnd = turnBegin + 1;
+        while (turnEnd < msgs.size() &&
+               !(msgs[turnEnd].fromUser && msgs[turnEnd].steerId.empty()))
+            ++turnEnd;
+        for (size_t i = turnBegin; i < turnEnd; ++i) {
+            for (const AskBatch& b : msgs[i].asks) {
+                if (b.status != AskStatus::Reply || b.reply.empty()) continue;
+                ChatMsg* match = nullptr;
+                bool ambiguous = false;
+                for (size_t j = turnBegin; j < turnEnd; ++j) {
+                    ChatMsg& m = msgs[j];
+                    // A resolved text reply says nothing about separately queued images.
+                    // Do not normalize/substring-match: old bounded replies and duplicate
+                    // text cannot establish which exact composer payload was consumed.
+                    if (!m.fromUser || m.steerId.empty() || m.text != b.reply)
+                        continue;
+                    if (match) { ambiguous = true; break; }
+                    match = &m;
+                }
+                if (!match || ambiguous || !match->imagePaths.empty() ||
+                    (match->steerState != STEER_SENDING && match->steerState != STEER_QUEUED &&
+                     match->steerState != STEER_FAILED))
+                    continue;
+                match->steerState = STEER_DELIVERED;
+                match->uiCachedH = -1.0f;
+                changed = true;
+            }
+        }
+        turnBegin = turnEnd;
+    }
+    if (changed) markChatHistoryDirty();
+    return changed;
 }

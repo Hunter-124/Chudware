@@ -54,6 +54,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
+from services.plm import snapshot
+
 ORIGIN_EXTRACTED = "extracted"
 ORIGIN_INFERRED = "inferred"
 
@@ -1798,14 +1800,43 @@ def _read_container(path: Path) -> tuple[dict | None, list[str], str | None]:
         # ZIP seeks directly to document.json; never copy cached geometry or
         # simulation payloads just to inspect the design recipe.
         with zipfile.ZipFile(path) as zf:
-            names = zf.namelist()
-            if "document.json" not in names:
+            members = zf.infolist()
+            if len(members) > snapshot._MAX_ZIP_ENTRIES:
                 return None, [], None
-            doc_bytes = zf.read("document.json")
+            folded_names: set[str] = set()
+            document = None
+            for info in members:
+                folded = info.filename.casefold()
+                if folded in folded_names:
+                    return None, [], None
+                folded_names.add(folded)
+                if info.filename == "document.json":
+                    document = info
+            if document is None or document.is_dir():
+                return None, [], None
+            if (document.file_size > snapshot._MAX_MEMBER_BYTES
+                    or document.file_size > max(1, document.compress_size)
+                    * snapshot._MAX_COMPRESSION_RATIO):
+                return None, [], None
+            doc_bytes = bytearray()
+            with zf.open(document) as member:
+                while True:
+                    chunk = member.read(min(
+                        snapshot._READ_CHUNK_BYTES,
+                        snapshot._MAX_MEMBER_BYTES - len(doc_bytes) + 1,
+                    ))
+                    if not chunk:
+                        break
+                    if len(doc_bytes) + len(chunk) > snapshot._MAX_MEMBER_BYTES:
+                        return None, [], None
+                    doc_bytes.extend(chunk)
+            if len(doc_bytes) != document.file_size:
+                return None, [], None
             doc_hash = hashlib.blake2b(doc_bytes, digest_size=8).hexdigest()
             doc = json.loads(doc_bytes.decode("utf-8"))
             study_ids = []
-            for n in names:
+            for info in members:
+                n = info.filename
                 if n.startswith("studies/") and n.endswith(".json"):
                     # studies/<id>.json
                     parts = n.split("/")

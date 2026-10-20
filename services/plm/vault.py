@@ -270,6 +270,16 @@ class VaultError(Exception):
         self.reason = reason
         self.hint = hint
 
+
+def _require_repaired_remotes(m: dict[str, Any]) -> None:
+    if any(remote.get("credential_repair_required") for remote in m.get("remotes") or []):
+        raise VaultError(
+            "invalid_mode",
+            "Remote credentials need explicit replacement with plm_add_remote before recording changes. "
+            "Rotate exposed credentials and handle old history separately.",
+        )
+
+
 def _released_edit_hint(error: Any, item_id: str) -> str:
     """Turn the released-revision lock into the exact next PLM action."""
     if error.reason != "locked":
@@ -319,14 +329,14 @@ class Vault:
     # -- reading -----------------------------------------------------------
 
     def manifest(self) -> dict[str, Any]:
-        """Return the current project manifest (from HEAD, or a fresh empty one)."""
+        """Read HEAD without writing; unsafe remote destinations are withheld."""
         head = self._bind.head_commit()
         if head is None:
             return manifest.new_manifest(self.project_dir.name, _now_iso())
         raw = self._bind.read_blob_at(head, "manifest.json")
         if raw is None:  # corrupted/empty — degrade gracefully (DoD)
             return manifest.new_manifest(self.project_dir.name, _now_iso())
-        m = manifest.loads(raw)
+        m = manifest.loads_local(raw)
         missing = {
             (it["item_id"], rr["rev"])
             for it in m["items"]
@@ -341,7 +351,7 @@ class Vault:
                 current_raw = self._bind.read_blob_at(commit, "manifest.json")
                 if current_raw is None:
                     continue
-                current = manifest.loads(current_raw)
+                current = manifest.loads_local(current_raw)
                 present = {
                     (it["item_id"], rr["rev"])
                     for it in current["items"]
@@ -349,7 +359,7 @@ class Vault:
                 }
                 parent = meta["parents"][0] if meta["parents"] else None
                 parent_raw = self._bind.read_blob_at(parent, "manifest.json") if parent else None
-                previous = manifest.loads(parent_raw) if parent_raw else {"items": []}
+                previous = manifest.loads_local(parent_raw) if parent_raw else {"items": []}
                 prior = {
                     (it["item_id"], rr["rev"])
                     for it in previous["items"]
@@ -724,6 +734,12 @@ class Vault:
         name = str(name or "").strip() or "Linked code"
         if not url:
             raise VaultError("invalid_mode", "a link needs a location")
+        from services.plm.git_security import reject_location_credentials
+
+        try:
+            reject_location_credentials(url)
+        except ValueError as exc:
+            raise VaultError("invalid_mode", str(exc)) from exc
         m = self.manifest()
         item = manifest.register_item(
             m, kind=doctypes.kind_for("linked_repo"), path=name, doc_type="linked_repo")
@@ -753,7 +769,21 @@ class Vault:
         if not cfg_path.is_file():
             return {}
         try:
-            return _json.loads(cfg_path.read_text("utf-8"))
+            cfg = _json.loads(cfg_path.read_text("utf-8"))
+            from services.plm.git_security import SECRET_FIELDS, reject_location_credentials
+
+            for approval in (cfg.get("approved_remotes") or {}).values():
+                try:
+                    if any(value for key, value in approval.items() if key.casefold() in SECRET_FIELDS):
+                        raise ValueError("credentialed approval")
+                    if isinstance(approval.get("url"), str):
+                        reject_location_credentials(approval["url"])
+                except ValueError:
+                    approval["url"] = None
+                    for key in list(approval):
+                        if key.casefold() in SECRET_FIELDS:
+                            del approval[key]
+            return cfg
         except Exception:
             return {}
 
@@ -869,6 +899,7 @@ class Vault:
         that path. Does NOT re-read working design files, so a planning edit
         never captures unsaved design changes. Respects the geometry.step
         release-only invariant (§2) by not carrying it forward."""
+        _require_repaired_remotes(self.manifest())
         head = self._bind.head_commit()
         if head is not None:
             files = {p: d for p, d in self._bind.read_tree(head).items()
@@ -883,9 +914,18 @@ class Vault:
             scope=scope)
         return self._bind.commit_tree(files, emeta)
 
-    def _commit_manifest_change(self, m: dict[str, Any]) -> str:
-        """Persist a manifest-only change as an auto entry (§3.1: the manifest
-        is re-committed with every history entry)."""
+    def _commit_manifest_change(self, m: dict[str, Any], *, remote_repair: bool = False) -> str:
+        """Record a manifest change; only explicit remote replacement may repair.
+
+        Unreplaced unsafe profiles are stored disabled, with no destination.
+        Diagnostic markers are local-only and never enter the peer schema.
+        """
+        if remote_repair:
+            m = dict(m)
+            m["remotes"] = [dict(profile) for profile in m.get("remotes") or []]
+            for profile in m["remotes"]:
+                if profile.pop("credential_repair_required", False):
+                    profile["url"] = None
         files = self._explode_project_into_shadow(m, kind=hist.KIND_AUTO, message="")
         author = _user_author()
         emeta = gitbind.EntryMeta(
@@ -941,6 +981,7 @@ class Vault:
         """Forward-only restore (contract §3.3): re-assemble the working files
         from a prior entry's tree, then cut a NEW ``restore`` entry. History is
         never rewound."""
+        _require_repaired_remotes(self.manifest())
         try:
             src_tree = self._bind.read_tree(commit)
         except KeyError:
@@ -1134,7 +1175,7 @@ class Vault:
         release_by_commit: dict[str, dict[str, str]] = {}
         manifest_raw = self._bind.read_blob_at(head, "manifest.json") if head else None
         if manifest_raw:
-            current_manifest = manifest.loads(manifest_raw)
+            current_manifest = manifest.loads_local(manifest_raw)
             for item in current_manifest.get("items", []):
                 for released in item.get("released_revs", []) or []:
                     commit = released.get("commit")
@@ -1258,6 +1299,7 @@ class Vault:
         sibling trees (e.g. ``planning/``) are carried forward verbatim.
         Returns the whole ``{path: bytes}`` shadow tree to commit.
         """
+        _require_repaired_remotes(m)
         author = author or _user_author()
         geometry_for = geometry_for or {}
         inject = inject or {}

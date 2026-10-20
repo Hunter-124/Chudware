@@ -1,69 +1,121 @@
-SKETCH. Create a sketch on a plane, then add entities. Coordinates are 2D on the plane; the plane is centered on the world origin. THIS is how you place geometry away from the origin (primitives can't be moved) - sketch entities sit at exactly the [x,y] you give them.
+SKETCH — draw roughly → geometric relations → driving dimensions → sketch_fully_define → check_sketch.
+Coordinates are 2D mm on refs.plane: "plane.top" (XY), "plane.front" (XZ), "plane.right" (YZ),
+or a measured face selector. Geometry fields are initial guesses, NOT constraints.
+Read each mutation's sketch_readbacks; require a closed material profile, dof == 0,
+pinned_only == false, no conflicts or skipped constraints before its solid feature.
+Never blanket-fix authored geometry. Fixed associative external references are legitimate.
 
-Op shape (a JSON ARRAY): first an `add_feature` of type `sketch` (refs.plane = "plane.top"|"plane.front"|"plane.right"), then `sketch_add_entity` ops referring to it as `"$0"`.
+AUTHORING
+- add_features accepts an ops array. add_feature uses feature:{type:"sketch",refs:{plane},params:{entities, constraints}}.
+- Assign entity ids e1,e2,… and unique constraint ids c1,c2,… within each sketch.
+  Handles: line e1.p1/e1.p2; circle/arc e2.center; arc e2.start/e2.end;
+  spline e3.start/e3.end or e3.p0/e3.p1/…; point e4.p. Bare entity ids name curves.
+  origin is a valid fixed point; axis.h/axis.v are fixed horizontal/vertical lines through it.
+- circle {center:[u,v],radius}; line {p1:[u,v],p2:[u,v]};
+  arc {center:[u,v],radius,start:<degrees>,end:<degrees>,ccw:true}; point {p:[u,v]}.
+  rectangle {center:[u,v],width,height} expands into joined horizontal/vertical lines;
+  polygon {center:[u,v],sides:6,across_flats:12} expands into equal joined sides.
+  Other polygon sizes: exactly one of across_flats/circumradius/inradius; rotation is degrees.
+  spline {points:[[u,v],…]} is for genuinely freeform geometry; airfoil {naca:"2412",chord:120,aoa:2} for wings.
+- Use true circular arcs and tangent lines for slots/rounded profiles, not faceted polylines
+  or spline substitutes. A straight slot is two parallel lines plus two semicircular arcs
+  (Example C); native slot/arc_slot solver entities are not a substitute for an extrudable wire.
+- Symmetric profiles: one centerline (construction:true) or axis.v, one half-size/spacing,
+  symmetric relations, then only the independent dimensions. Do not dimension both halves.
 
-The reserved plane names are "plane.top" (the XY plane, +Z up), "plane.front" (XZ), "plane.right" (YZ). Write those. "XY"/"XZ"/"YZ" and bare "top"/"front"/"right" are ALSO accepted and rewritten to the reserved name for you (the rewrite comes back in `interpreted`), so a plane name never costs you a turn — but the four-word canonical spelling is what the engine stores.
+RELATIONS / DIMENSIONS — put these constraint objects in params.constraints, or append with
+  {"op":"sketch_add_constraint","sketch":"f1","constraint":{"id":"c20","type":"radius","refs":["e2"],"value":{"value":4,"expr":null}}}
+Create a dimension this way; sketch_set_dim only RETUNES an existing dimension:
+  {"op":"sketch_set_dim","sketch":"f1","id":"c20","value":5}
+Dimensions use value:{value:<number>,expr:null}; a real global/equation may replace expr.
+The following are alternative constraint examples, NOT one combined constraint set:
 
-Entity `type` is one of: `circle` (center, radius), `line` (p1, p2), `arc` (center, radius, start, end, ccw), `point` (p), `rectangle` (center+width+height OR corner1+corner2 — PREFERRED over 4 lines; expands to a closed loop), `spline` (points: [[x,y],...] - a smooth curve THROUGH the points, for organic / profile / cam outlines), `airfoil` (naca:"2412", chord, aoa - a NACA aerofoil section as one closed loop, for wings), `polygon` (a regular N-gon as ONE closed loop).
+  type                 refs example                          meaning / supported geometry
+  coincident           ["e1.p2","e2.start"]                 join points (also ["e3.center","origin"])
+  horizontal/vertical  ["e1"] or ["e1.p1","e2.p1"]          line orientation / align two points
+  parallel             ["e1","axis.h"]                      lines or slot spines
+  perpendicular        ["e1","axis.v"]                      lines or slot spines
+  collinear            ["e1","e2"]                          same infinite line; axes allowed
+  point_on             ["e3.p","e1"]                        point on line/circle/arc/ellipse/conic/spline
+  intersection         ["e3.p","e1","e2"]                   point on both curves (lines infinite)
+  midpoint             ["e3.p","e1"]                        point at line midpoint or arc mid-sweep
+  concentric           ["e2","e3.center"]                   circle/arc/ellipse/ellipse_arc/arc_slot centers or points
+  coradial             ["e2","e4"]                          circles/arcs: same center and radius
+  equal                ["e1","e2"]                          same family: lines, circles/arcs, ellipses,
+                                                             slots (length+width), arc_slots (radius+width)
+  equal_curve_length   ["e1","e2"]                          line/arc pairs, including mixed pairs
+  tangent              ["e1","e2"]                          supported curves, not line-line; ellipse allowed
+  tangent              ["e3.end","e2"]                      spline endpoint G1 (first/last .pK also valid)
+  smooth               ["e3.end","e2"]                      spline end G2 to line/arc/circle/spline end;
+                                                             add coincidence separately
+  symmetric            ["e1.p1","e2.p2","axis.v"]           points about a line or axis.h/axis.v;
+                                                             also two whole lines or two circles/arcs
+  fix                  ["e9"]                               deliberate reference pin, NOT a definition strategy
+  distance             ["origin","e2.center"]               value: center location (axis:"h"/"v" optional)
+  distance             ["e3.p","e1"]                        value: point-to-line distance
+  distance             ["e1","e2"]                          value: parallel-line separation
+  length               ["e1"]                               value: line/slot spine length (distance also accepts one)
+  angle                ["e1","axis.h"]                      value: degrees; lines/slot spines/virtual axes
+  radius/diameter      ["e2"]                               value: circle/arc size, or slot cap radius/width
+  arc_length           ["e2"]                               value: arc radius × absolute sweep (mm)
 
-A `polygon` is the way to make a HEXAGON / hex standoff / nut / bolt-head / any regular N-sided profile - NEVER draw it as a spline (an open spline makes no closed region and the extrude builds nothing). Shape: `{"type":"polygon","center":[0,0],"sides":6,"across_flats":12}`. Give `sides` (>=3) and EXACTLY ONE size: `across_flats` (the wrench/spanner size, flat-to-flat - the usual way to spec a hex), or `circumradius` (centre-to-vertex), or `inradius`. Optional `rotation` (degrees). NAMED shorthands set the side count for you (an explicit `sides` still overrides): `triangle`(3), `pentagon`(5), `hexagon`(6), `heptagon`(7), `octagon`(8), `nonagon`(9), `decagon`(10), `dodecagon`(12) - e.g. `{"type":"octagon","center":[0,0],"across_flats":20}`. The engine expands it into the N lines - do NOT also add the lines yourself; just extrude the sketch.
+After explicit intent, append {"op":"sketch_fully_define","sketch":"f1","relations":true,"dimensions":true,"anchor":"origin"}.
+Optional entities:["e1",…] limits the scope; anchor:"none" avoids origin anchoring.
+add_features defaults auto_define:true for newly authored sketches and sketch_add_entity batches,
+appending residual definition after explicit relations/dimensions in the same transaction.
+For intentional staged/free geometry opt out with add_features(...,auto_define=false), or
+"auto_define":false on the sketch feature, its params, or the authoring op. Then explicitly
+fully-define and check before consuming it. Automatic definition does not replace functional dims.
 
-A spline closes a profile when its ends meet the other edges (e.g. a revolve half-profile = a spline outer wall + a line back down the axis). An `airfoil` entity is self-contained (it expands to the upper/lower splines + trailing-edge line) - just extrude it.
+EXTERNAL DESIGN REFERENCES — inspect selectors first; sketch_convert is associative by default.
+Use construction:true to keep projected geometry OUT of the profile, then relate authored geometry
+with coincident/point_on/concentric/distance to the returned entities. fix:true pins the reference,
+not your profile. Each conversion returns $<op-index>, $<op-index>#1,… in ref order.
+  {"op":"sketch_convert","sketch":"f1","construction":true,"fix":true,"associative":true,"refs":[{"kind":"edge","selector":{"sid":"<measured-edge-sid>"}}]}
+Ref alternatives (real selectors/ids from readback, never invented):
+  {"kind":"face","selector":{"sid":"<face-sid>"}}          all boundary wires
+  {"kind":"vertex","selector":{"sid":"<vertex-sid>"}}      projected point
+  {"kind":"edge","selector":{"sid":"<edge-sid>"},"mode":"pierce","near":[0,0]}
+  {"datum":"axis.x"} / {"datum":"axis.y"} / {"datum":"axis.z"} / {"datum":"origin"}
+  {"datum":"front"} / {"datum":"top"} / {"datum":"right"}  plane intersection
+  {"kind":"sketch_entity","sketch":"f2","entity":"e1"}
+A pierce ref must cross the sketch plane; near selects among crossings. Projected axes may
+collapse to a point when perpendicular. After conversion, a following constraint can use
+refs:["e1.p1","$<convert-index>.p"] for a converted vertex/pierce point.
 
-A SKETCH IS NOT A SOLID. Every example below ends with the feature that turns it into one, because that is the step models most often leave out. The extrude op:
-  {"op":"add_feature","feature":{"type":"extrude","name":"Body",
-     "params":{"mode":"boss","depth":10},"refs":{"profile":"$0"}}}
-  params.mode  "boss" fuses into the current body (the default if you omit it), "cut" subtracts, "new" makes a separate body.
-  params.depth how far, in mm. Optional params.mid_plane:true grows BOTH ways from the sketch plane.
-  refs.profile the sketch: "$0" for one added earlier in this SAME batch, or its "fN" id. A bare string is fine — a one-element list ["$0"] is the same thing.
-  revolve is the same shape with params.angle and refs.axis; loft takes refs.sections; sweep takes refs.profile + refs.path.
+EDIT OPS — existing sketch f1 and entity ids from readback (these are independent examples):
+  {"op":"sketch_fillet","sketch":"f1","e1":"e1","e2":"e2","radius":2}
+  {"op":"sketch_trim","sketch":"f1","entity":"e3","point":[10,4],"keep_construction":true}
+  {"op":"sketch_mirror_entities","sketch":"f1","entities":["e1","e2"],"line":"e9"}
+  {"op":"sketch_pattern_entities","sketch":"f1","entities":["e1"],"mode":"linear","count":3,"dir":[1,0],"spacing":12}
+  {"op":"sketch_pattern_entities","sketch":"f1","entities":["e1"],"mode":"circular","count":4,"center":[0,0],"angle":360,"equal_spacing":true}
+Fillet trims two lines and adds a true arc, coincidents and tangents. Trim removes the span
+under point (optionally retains it as construction). Mirror requires a real line entity e9,
+not a virtual axis; it adds symmetry relations. Pattern count INCLUDES the seed; copies still
+need design intent/definition. Re-read after topology edits, then fully-define and check.
 
-Example A - a r=8 x 10mm tall cylinder, sketch to solid:
+WORKED SOLIDS — complete ops arrays; in interactive work check_sketch before the solid op.
+A sketch alone has no volume. extrude refs.profile is the sketch; mode boss fuses, cut removes,
+new creates an independent body. Revolve uses refs.axis; loft uses refs.sections; sweep uses refs.path.
+
+Example A — origin-centered r8 post, driven by radius (not fixed coordinates):
 [
- {"op":"add_feature","feature":{"type":"sketch","name":"Sketch1","params":{"entities":[],"constraints":[]},"refs":{"plane":"plane.top"}}},
- {"op":"sketch_add_entity","sketch":"$0","entity":{"type":"circle","center":[0,0],"radius":8}},
- {"op":"add_feature","feature":{"type":"extrude","name":"Post","params":{"mode":"boss","depth":10},"refs":{"profile":"$0"}}}
+ {"op":"add_feature","feature":{"type":"sketch","name":"PostProfile","refs":{"plane":"plane.top"},"params":{"entities":[{"id":"e1","type":"circle","center":[0,0],"radius":8}],"constraints":[{"id":"c1","type":"coincident","refs":["e1.center","origin"]},{"id":"c2","type":"radius","refs":["e1"],"value":{"value":8,"expr":null}}]}}},
+ {"op":"sketch_fully_define","sketch":"$0"},
+ {"op":"add_feature","feature":{"type":"extrude","name":"Post","params":{"mode":"new","depth":10},"refs":{"profile":"$0"}}}
 ]
 
-Example B - four 3mm-radius bolt holes CUT through a 60x60x6 plate (the right way to lay out a bolt pattern). Note the cut extrude at the end and how it reaches "$1", the sketch, not "$0":
+Example B — two equal holes symmetric about axis.v, with one center spacing and one radius:
 [
- {"op":"add_feature","feature":{"type":"box","name":"Plate","params":{"length":60,"width":60,"height":6}}},
- {"op":"add_feature","feature":{"type":"sketch","name":"Bolts","params":{"entities":[],"constraints":[]},"refs":{"plane":"plane.top"}}},
- {"op":"sketch_add_entity","sketch":"$1","entity":{"type":"circle","center":[24,24],"radius":3}},
- {"op":"sketch_add_entity","sketch":"$1","entity":{"type":"circle","center":[24,-24],"radius":3}},
- {"op":"sketch_add_entity","sketch":"$1","entity":{"type":"circle","center":[-24,24],"radius":3}},
- {"op":"sketch_add_entity","sketch":"$1","entity":{"type":"circle","center":[-24,-24],"radius":3}},
- {"op":"add_feature","feature":{"type":"extrude","name":"Holes","params":{"mode":"cut","depth":20,"mid_plane":true},"refs":{"profile":"$1"}}}
+ {"op":"add_feature","feature":{"type":"box","name":"Plate","params":{"length":60,"width":40,"height":6}}},
+ {"op":"add_feature","feature":{"type":"sketch","name":"HoleCenters","refs":{"plane":"plane.top"},"params":{"entities":[{"id":"e1","type":"circle","center":[-20,0],"radius":3},{"id":"e2","type":"circle","center":[20,0],"radius":3}],"constraints":[{"id":"c1","type":"symmetric","refs":["e1","e2","axis.v"]},{"id":"c2","type":"point_on","refs":["e1.center","axis.h"]},{"id":"c3","type":"distance","refs":["e1.center","e2.center"],"value":{"value":40,"expr":null}},{"id":"c4","type":"radius","refs":["e1"],"value":{"value":3,"expr":null}}]}}},
+ {"op":"sketch_fully_define","sketch":"$1"},
+ {"op":"add_feature","feature":{"type":"extrude","name":"Holes","params":{"mode":"cut","end":"through_all"},"refs":{"profile":"$1"}}}
 ]
 
-Example C - a NACA 2412 wing section extruded into a 400mm wing:
+Example C — real 28×8 slot profile: 20mm center spacing plus r4 semicircles, tangent joins:
 [
- {"op":"add_feature","feature":{"type":"sketch","name":"WingSec","params":{"entities":[],"constraints":[]},"refs":{"plane":"plane.front"}}},
- {"op":"sketch_add_entity","sketch":"$0","entity":{"type":"airfoil","naca":"2412","chord":120,"aoa":2}},
- {"op":"add_feature","feature":{"type":"extrude","name":"Wing","params":{"mode":"new","depth":400},"refs":{"profile":"$0"}}}
+ {"op":"add_feature","feature":{"type":"sketch","name":"SlotProfile","refs":{"plane":"plane.top"},"params":{"entities":[{"id":"e1","type":"line","p1":[-10,4],"p2":[10,4]},{"id":"e2","type":"arc","center":[10,0],"radius":4,"start":270,"end":90,"ccw":true},{"id":"e3","type":"line","p1":[10,-4],"p2":[-10,-4]},{"id":"e4","type":"arc","center":[-10,0],"radius":4,"start":90,"end":270,"ccw":true}],"constraints":[{"id":"c1","type":"coincident","refs":["e1.p2","e2.end"]},{"id":"c2","type":"coincident","refs":["e2.start","e3.p1"]},{"id":"c3","type":"coincident","refs":["e3.p2","e4.end"]},{"id":"c4","type":"coincident","refs":["e4.start","e1.p1"]},{"id":"c5","type":"tangent","refs":["e1","e2"]},{"id":"c6","type":"tangent","refs":["e2","e3"]},{"id":"c7","type":"tangent","refs":["e3","e4"]},{"id":"c8","type":"tangent","refs":["e4","e1"]},{"id":"c9","type":"horizontal","refs":["e1"]},{"id":"c10","type":"symmetric","refs":["e2.center","e4.center","axis.v"]},{"id":"c11","type":"point_on","refs":["e2.center","axis.h"]},{"id":"c12","type":"radius","refs":["e2"],"value":{"value":4,"expr":null}},{"id":"c13","type":"distance","refs":["e2.center","e4.center"],"value":{"value":20,"expr":null}}]}}},
+ {"op":"sketch_fully_define","sketch":"$0"},
+ {"op":"add_feature","feature":{"type":"extrude","name":"SlotBody","params":{"mode":"new","depth":5},"refs":{"profile":"$0"}}}
 ]
-
-3 common mistakes:
-1. Stopping at the sketch. A sketch ALONE makes no solid and reports no volume - it must be extruded/cut/revolved/lofted. Put that op in the SAME batch, as every example above does.
-2. Entity coords are 2D ([x,y]) on the plane, never 3D. (The plane NAME is forgiving - see above - but the coordinates are not.)
-3. Prefer `rectangle` (center+width+height) over 4 hand-drawn lines; a round hole/post is a `circle`; a curved profile is a `spline`. 4 lines still work if you already have corners pinned.
-
-PROJECTING EXISTING GEOMETRY INTO A SKETCH ("Convert Entities"):
-Use project_into_sketch(sketch, refs) to append edges/faces from the surrounding solid into an
-existing sketch. This is the MCP equivalent of SolidWorks "Convert Entities" — it does NOT create
-a new sketch (for that, use convert_face_to_sketch).
-
-  refs accepts: a datum string ("front"/"top"/"right" → datum plane intersection line), a face sid
-  ("F…" from describe_part), a side word ("bottom" etc.; note "front"/"top"/"right" are datums
-  first), an edge sid ("E…"), a ref dict {"kind":"face","selector":{"sid":"…"}}, or a list of any mix.
-
-  A face ref projects ALL its boundary wires (outer + hole loops) as entities. Oblique circles
-  become ellipses. Each projected entity is pinned with a fix relation.
-
-  ONE-SHOT (non-associative): converted entities do NOT update when the source model changes.
-  Pass construction=True for blue reference-only geometry (excluded from extrude regions).
-
-  Example — project the top face's outline into an existing sketch "s2":
-  project_into_sketch("s2", "Fdb31d2")   # face sid from describe_part
-
-  The underlying doc op is sketch_convert (see ops_cheatsheet for the raw op shape).

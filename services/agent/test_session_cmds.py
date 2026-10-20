@@ -450,3 +450,42 @@ class TestSessionRpc(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_cell_btw_carries_parent_byok_scope_and_readonly_mode(monkeypatch):
+    import hashlib
+    from services.agent import chudcode_host, chudcode_roles, request_context as tenancy
+    from services.agent import session_cmds
+
+    actor = "btw-owner"
+    ctx = {
+        "cell": True, "workspace_key": "team:commands/work", "actor_key": actor,
+        "actor_hex": hashlib.sha256(actor.encode()).hexdigest()[:32],
+        "right": "editor", "epoch": 1,
+    }
+    inherited = {
+        "web_actor": True, "web_key_source": "byok", "web_tenant": actor,
+        "web_provider": "openai", "web_provider_grant": "parent-scoped-grant",
+        "workspace_dir": "/work", "mode": "agent",
+    }
+
+    class ScopedHost:
+        def session_launch_params(self, session_id):
+            assert session_id == "parent"
+            assert tenancy.owner_key() == (ctx["workspace_key"], actor)
+            return dict(inherited)
+
+    seen = []
+
+    def role(request, role_name, **kwargs):
+        seen.append(kwargs)
+        return {"success": True, "result": "side answer"}
+
+    monkeypatch.setattr(chudcode_host, "get_default_chudcode_host", lambda: ScopedHost())
+    monkeypatch.setattr(chudcode_roles, "run_role_turn", role)
+    with tenancy.bind_context(ctx):
+        assert session_cmds.btw_answer([], "question", session_id="parent") == "side answer"
+    assert seen[0]["options"]["web_provider_grant"] == "parent-scoped-grant"
+    assert seen[0]["options"]["web_tenant"] == actor
+    assert seen[0]["options"]["mode"] == "ask"
+    assert seen[0]["close_session"]

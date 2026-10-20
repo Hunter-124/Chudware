@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+from services.agent.request_context import actor_state_root, in_cell, root_value
 
 from .errors import DeliverableError
 
@@ -39,7 +40,7 @@ _REGISTRY = "registry.json"
 
 
 def project_dir() -> Path:
-    env = os.environ.get("CHUDWARE_PROJECT_DIR")
+    env = root_value("CHUDWARE_PROJECT_DIR")
     if not env or not env.strip():
         raise DeliverableError(
             "project_root_unavailable",
@@ -65,6 +66,11 @@ def _project_slug(root: Path | None = None) -> str:
 def artifacts_dir() -> Path:
     """Hidden per-project artifact store — NOT inside the user's project folder."""
     root = project_dir()
+    if in_cell():
+        digest = hashlib.sha256(str(root.resolve()).encode()).hexdigest()
+        d = actor_state_root() / "deliverables" / digest
+        d.mkdir(parents=True, exist_ok=True)
+        return d
     env = os.environ.get("CHUDWARE_ARTIFACTS_DIR")
     d = Path(env) if env else (_APP_ROOT / "projects" / _project_slug(root) / _ARTIFACTS)
     d.mkdir(parents=True, exist_ok=True)
@@ -102,6 +108,20 @@ def resolve_project_path(path: str) -> Path:
     is looked for in the hidden artifact store first (that is where records point),
     then under the user's project."""
     p = Path(path)
+    if in_cell():
+        base = artifacts_dir().resolve()
+        if not p.is_absolute():
+            artifact = (base / p).resolve()
+            if artifact != base and base not in artifact.parents:
+                raise DeliverableError("not_found", "not_found")
+            if artifact.exists():
+                return artifact
+            p = project_dir() / p
+        resolved = p.resolve()
+        if not (resolved == base or base in resolved.parents
+                or resolved == Path("/work") or Path("/work") in resolved.parents):
+            raise DeliverableError("not_found", "not_found")
+        return resolved
     if p.is_absolute():
         return p
     candidate = (artifacts_dir() / p).resolve()

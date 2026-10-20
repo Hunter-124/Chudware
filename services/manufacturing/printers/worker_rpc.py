@@ -93,6 +93,7 @@ def _open(params: Mapping[str, Any]) -> dict[str, Any]:
         origin=endpoint.get("origin", "live"),
         timeout_s=endpoint.get("timeout_s", 2.0),
         telemetry_ttl_ms=endpoint.get("telemetry_ttl_ms", 5_000),
+        address_class=endpoint.get("address_class"),
     )
     adapter = adapter_type(config)
     with _LOCK:

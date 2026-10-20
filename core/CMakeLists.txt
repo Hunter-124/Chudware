@@ -81,6 +81,7 @@ if(CHUDWARE_LTO)
   check_ipo_supported(RESULT _ipo_ok OUTPUT _ipo_msg LANGUAGES CXX)
   if(_ipo_ok)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/MsvcLtoPool.cmake")
     message(STATUS "CHUDWARE_LTO: interprocedural optimization ENABLED")
   else()
     message(WARNING "CHUDWARE_LTO requested but IPO unsupported by this toolchain: ${_ipo_msg}")
@@ -112,74 +113,63 @@ if(MSVC)
   add_compile_definitions(NOMINMAX _USE_MATH_DEFINES)
 endif()
 
-include(FetchContent)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PinnedGitSource.cmake")
 
 # --- Eigen (header-only linear algebra; replaces numpy/scipy.linalg) ---------
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
 set(EIGEN_BUILD_PKGCONFIG OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(eigen
-  GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
-  GIT_TAG 3.4.0
-  GIT_SHALLOW TRUE)
-FetchContent_MakeAvailable(eigen)
+# Primary tag identity: https://gitlab.com/api/v4/projects/libeigen%2Feigen/repository/tags/3.4.0
+chudware_populate_pinned_git(eigen https://gitlab.com/libeigen/eigen.git
+  3147391d946bb4b6c68edd901f2add6ac1f31f8c)
+add_subdirectory("${eigen_SOURCE_DIR}" "${eigen_BINARY_DIR}" EXCLUDE_FROM_ALL)
 
 # --- nlohmann/json (fixture / sketch dict parsing; same lib the host uses) ----
 set(JSON_BuildTests OFF CACHE INTERNAL "")
-FetchContent_Declare(json
-  URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
-FetchContent_MakeAvailable(json)
+# Primary commit: https://api.github.com/repos/nlohmann/json/commits/v3.11.3
+chudware_populate_pinned_git(json https://github.com/nlohmann/json.git
+  9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03)
+add_subdirectory("${json_SOURCE_DIR}" "${json_BINARY_DIR}" EXCLUDE_FROM_ALL)
 
 # --- miniz (ZIP read+write for the .step+ container) -------------------------
-# The amalgamated release ships miniz.c/miniz.h with no CMakeLists at the root, so
-# Populate (not MakeAvailable) it and build a tiny static lib ourselves. CMake's
-# file(ARCHIVE_EXTRACT) is extract-only — insufficient for save().
-FetchContent_Declare(miniz
-  URL https://github.com/richgel999/miniz/releases/download/3.0.2/miniz-3.0.2.zip)
-FetchContent_GetProperties(miniz)
-if(NOT miniz_POPULATED)
-  FetchContent_Populate(miniz)
-endif()
-add_library(chudware_miniz STATIC ${miniz_SOURCE_DIR}/miniz.c)
-target_include_directories(chudware_miniz PUBLIC ${miniz_SOURCE_DIR})
+# Build the same 3.0.2 sources rather than the release's unauthenticated
+# amalgamation. Primary commit: https://api.github.com/repos/richgel999/miniz/commits/3.0.2
+chudware_populate_pinned_git(miniz https://github.com/richgel999/miniz.git
+  293d4db1b7d0ffee9756d035b9ac6f7431ef8492)
+add_library(chudware_miniz STATIC
+  ${miniz_SOURCE_DIR}/miniz.c ${miniz_SOURCE_DIR}/miniz_zip.c
+  ${miniz_SOURCE_DIR}/miniz_tinfl.c ${miniz_SOURCE_DIR}/miniz_tdef.c)
+# Upstream's static build generates an empty export decoration.
+# Preserve its timestamp on unchanged reconfigure: engine consumers include it.
+file(MAKE_DIRECTORY "${miniz_BINARY_DIR}")
+file(CONFIGURE OUTPUT "${miniz_BINARY_DIR}/miniz_export.h"
+  CONTENT "#pragma once\n#define MINIZ_EXPORT\n" NEWLINE_STYLE LF)
+target_include_directories(chudware_miniz PUBLIC "${miniz_SOURCE_DIR}" "${miniz_BINARY_DIR}")
 # Match the dynamic CRT the rest of the core + the DLL use (silences LNK4098 and keeps
 # miniz's malloc/free on the same heap as the DLL that calls mz_free).
 set_property(TARGET chudware_miniz PROPERTY
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 # --- Spectra (header-only eigensolvers over Eigen; modal FEA shift-invert) ----
-# Like doctest, point SOURCE_SUBDIR at a non-existent subdir so MakeAvailable only
-# POPULATES it (we add ${spectra_SOURCE_DIR}/include to the path) and skips Spectra's
-# own CMake (avoids any cmake_minimum_required friction under CMake 4.x).
-FetchContent_Declare(spectra
-  GIT_REPOSITORY https://github.com/yixuan/spectra.git
-  GIT_TAG v1.0.1
-  GIT_SHALLOW TRUE
-  SOURCE_SUBDIR _no_cmake_)
-FetchContent_MakeAvailable(spectra)
+# Populate authenticated headers without running Spectra's upstream CMake.
+# Primary commit: https://api.github.com/repos/yixuan/spectra/commits/v1.0.1
+chudware_populate_pinned_git(spectra https://github.com/yixuan/spectra.git
+  bdd707b9a872bb17622696ed3cca2a27b743a5b7)
 
 # --- doctest (C++ unit tests; header-only) -----------------------------------
-# Point SOURCE_SUBDIR at the header folder (no CMakeLists there) so MakeAvailable
-# populates but skips doctest's own ancient cmake_minimum_required(3.0), which
-# errors under CMake 4.x. We just add the header dir to the include path.
-FetchContent_Declare(doctest
-  GIT_REPOSITORY https://github.com/doctest/doctest.git
-  GIT_TAG v2.4.11
-  GIT_SHALLOW TRUE
-  SOURCE_SUBDIR doctest)
-FetchContent_MakeAvailable(doctest)
+# Populate authenticated headers without running doctest's upstream CMake.
+# Primary commit: https://api.github.com/repos/doctest/doctest/commits/v2.4.11
+chudware_populate_pinned_git(doctest https://github.com/doctest/doctest.git
+  ae7a13539fb71f270b87eb2e874fbac80bc8dda2)
 
 # --- Clipper2 (polygon offset / boolean for the CAM toolpath engine) ----------
 # Boost Software License 1.0 (GPL-clean, commercial-safe). The amalgamated lib
 # ships its own CMakeLists under CPP/, but we POPULATE-only and compile the three
 # engine .cpp ourselves into a tiny static lib (mirrors the miniz approach) to
 # skip Clipper2's tests/benchmarks/USINGZ options. See contracts/licenses.md.
-FetchContent_Declare(clipper2
-  GIT_REPOSITORY https://github.com/AngusJohnson/Clipper2.git
-  GIT_TAG Clipper2_1.5.4
-  GIT_SHALLOW TRUE
-  SOURCE_SUBDIR _no_cmake_)
-FetchContent_MakeAvailable(clipper2)
+# Primary commit: https://api.github.com/repos/AngusJohnson/Clipper2/commits/Clipper2_1.5.4
+chudware_populate_pinned_git(clipper2 https://github.com/AngusJohnson/Clipper2.git
+  ef88ee97c0e759792e43a2b2d8072def6c9244e8)
 add_library(chudware_clipper2 STATIC
   ${clipper2_SOURCE_DIR}/CPP/Clipper2Lib/src/clipper.engine.cpp
   ${clipper2_SOURCE_DIR}/CPP/Clipper2Lib/src/clipper.offset.cpp
@@ -346,11 +336,17 @@ if(CHUDWARE_WITH_CUDA)
   target_link_libraries(chudware_sim PUBLIC CUDA::cudart)
   set_target_properties(chudware_sim PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
+    # Resolve here so downstream C++ targets cannot drop the Ampere image when
+    # their default device-link architecture differs from this archive's list.
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
     CUDA_ARCHITECTURES "75;86"
     CUDA_STANDARD 17)
   # sm_75 (Turing) + sm_86 (Ampere, RTX 3080 Ti). allow-unsupported-compiler is
   # needed when the host GCC is newer than nvcc's official support ceiling.
   target_compile_options(chudware_sim PRIVATE
+    # CPU reference uses separately rounded float32 operations. Keep GPU fields
+    # and derived force/continuity checks within the same numerical contract.
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
     $<$<COMPILE_LANGUAGE:CUDA>:-allow-unsupported-compiler>)
 endif()
 
@@ -466,6 +462,9 @@ add_library(chudware_firmware STATIC
 target_include_directories(chudware_firmware PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(chudware_firmware PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(chudware_firmware PUBLIC nlohmann_json::nlohmann_json chudware_ecad)
+if(WIN32)
+  target_link_libraries(chudware_firmware PUBLIC advapi32)  # private_storage.h owner-only ACLs
+endif()
 if(MSVC)
   # MSVC only defines M_PI et al. in <cmath> when _USE_MATH_DEFINES is set (firmware/scenario.cpp).
   target_compile_definitions(chudware_firmware PUBLIC _USE_MATH_DEFINES)
@@ -653,7 +652,8 @@ add_test(NAME cam COMMAND test_cam)
 # --- libchudware sketch (parameterization + constraints over the solver core) ---
 add_library(chudware_sketch STATIC
   sketch/sketch.cpp
-  sketch/sketch3d.cpp)
+  sketch/sketch3d.cpp
+  sketch/sketch_define.cpp)
 target_include_directories(chudware_sketch PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(chudware_sketch PUBLIC chudware_solver chudware_util nlohmann_json::nlohmann_json)
 
@@ -730,6 +730,14 @@ target_link_libraries(test_sketch3d PRIVATE chudware_sketch)
 set_target_properties(test_sketch3d PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME sketch3d COMMAND test_sketch3d)
+
+add_executable(test_sketch_define
+  tests/test_sketch_define.cpp)
+target_include_directories(test_sketch_define PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_sketch_define PRIVATE chudware_sketch)
+set_target_properties(test_sketch_define PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME sketch_define COMMAND test_sketch_define)
 
 add_executable(test_drag
   tests/test_drag.cpp)
@@ -1465,7 +1473,7 @@ if(CHUDWARE_WITH_OCCT)
       ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
     target_link_libraries(test_sim_cache PRIVATE
       chudware_mesh chudware_doc chudware_geom_occt chudware_sim
-      chudware_sketch chudware_geom chudware_util)
+      chudware_sketch chudware_geom chudware_util chudware_piping)
     set_target_properties(test_sim_cache PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
     add_test(NAME sim_cache COMMAND test_sim_cache)
@@ -1605,6 +1613,25 @@ if(CHUDWARE_WITH_OCCT)
   set_tests_properties(import_roundtrip PROPERTIES RUN_SERIAL TRUE
     ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # Standalone hostile SolidWorks parser fixtures; no daemon or geometry sewing.
+  add_executable(test_solidworks_bounds tests/test_solidworks_bounds.cpp)
+  target_include_directories(test_solidworks_bounds PRIVATE
+    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_solidworks_bounds PRIVATE chudware_miniz)
+  set_target_properties(test_solidworks_bounds PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME solidworks_bounds COMMAND test_solidworks_bounds)
+  # Standalone hostile STL/PLY parser fixtures: production reader translation units only.
+  foreach(_bounds_test IN ITEMS test_stl_bounds test_ply_bounds test_sat_bounds)
+    add_executable(${_bounds_test} tests/${_bounds_test}.cpp)
+    target_include_directories(${_bounds_test} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR} ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+    target_link_libraries(${_bounds_test} PRIVATE chudware_miniz nlohmann_json::nlohmann_json)
+    set_target_properties(${_bounds_test} PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    add_test(NAME ${_bounds_test} COMMAND ${_bounds_test})
+  endforeach()
+
   # --- AutoCAD interchange: ACIS SAT/SAB read+write, native DWG (R2013+ data storage read,
   # R2000 write) and the R2000 DXF writer that carries ACIS solids. One executable each.
   foreach(_acad_test dwg_write dwg_native dxf_r2000 acis_read acis_write)
@@ -1727,7 +1754,11 @@ if(CHUDWARE_WITH_OCCT)
     chudware_mate
     chudware_miniz
     chudware_parts
+    chudware_materials  # doc_eval_mass: registry density of the applied material
     nlohmann_json::nlohmann_json)
+  if(WIN32)
+    target_link_libraries(chudware_doc PUBLIC advapi32)
+  endif()
   if(CHUDWARE_WITH_OPENNURBS)
     if(WIN32)
       target_link_libraries(chudware_doc PUBLIC opennurbsStatic)
@@ -1749,7 +1780,8 @@ if(CHUDWARE_WITH_OCCT)
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_document PRIVATE
-    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_host_aicm_loader)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_host_aicm_loader
+    chudware_ecad)
   set_target_properties(test_document PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME document COMMAND test_document)
@@ -1954,6 +1986,17 @@ if(CHUDWARE_WITH_OCCT)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME render_camera COMMAND test_render_camera)
   set_tests_properties(render_camera PROPERTIES
+    ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  add_executable(test_agent_mode_fast_paths tests/test_agent_mode_fast_paths.cpp)
+  target_include_directories(test_agent_mode_fast_paths PRIVATE ${doctest_SOURCE_DIR})
+  target_link_libraries(test_agent_mode_fast_paths PRIVATE
+    chudware nlohmann_json::nlohmann_json)
+  set_target_properties(test_agent_mode_fast_paths PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME agent_mode_fast_paths COMMAND test_agent_mode_fast_paths)
+  set_tests_properties(agent_mode_fast_paths PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
     ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- ViewNet view metrics (doc_view_metrics) + doc_render_view section ---------------
@@ -2388,6 +2431,21 @@ if(CHUDWARE_WITH_OCCT)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_dependencies(chudware-hostd chudware)  # engine staged before the daemon can serve it
 
+  # Offline cell-ownership regressions over the real DocRegistry, native run/sim controls.
+  if(NOT WIN32)
+    add_executable(test_hostd_cell_ownership
+      ${CMAKE_CURRENT_SOURCE_DIR}/../host/tests/test_hostd_cell_ownership.cpp
+      hostd/doc_registry.cpp
+      hostd/hostd_log.cpp)
+    target_include_directories(test_hostd_cell_ownership PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR} ${CHUDWARE_GENERATED_INCLUDE_DIR})
+    target_link_libraries(test_hostd_cell_ownership PRIVATE
+      chudware chudware_sim chudware_agent Threads::Threads nlohmann_json::nlohmann_json)
+    set_target_properties(test_hostd_cell_ownership PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    add_test(NAME hostd_cell_ownership COMMAND test_hostd_cell_ownership)
+  endif()
+
   # --- polymesh: the Polyhedral-FEA command-line driver ----------------------
   # ProvisionPolymesh adds the dependency EXCLUDE_FROM_ALL (Chudware consumes its static
   # libraries), which also excluded the `polymesh` CLI declared by apps/cli — so the
@@ -2428,6 +2486,29 @@ target_include_directories(test_engine_watchdog PRIVATE ${doctest_SOURCE_DIR})
 set_target_properties(test_engine_watchdog PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME engine_watchdog COMMAND test_engine_watchdog)
+
+# Exercise the production Windows worker bridge with owned native child processes.
+# The driver includes worker_bridge.cpp; its integrity/log replacements are test-local.
+if(WIN32)
+  add_executable(test_hostd_worker_bridge_win
+    tests/test_hostd_worker_bridge_win.cpp util/platform_paths.cpp)
+  target_include_directories(test_hostd_worker_bridge_win PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_definitions(test_hostd_worker_bridge_win PRIVATE
+    CHUDWARE_DEVELOPER_BUILD=1 _WIN32_WINNT=0x0A00)
+  target_link_libraries(test_hostd_worker_bridge_win PRIVATE nlohmann_json::nlohmann_json advapi32)
+  set_target_properties(test_hostd_worker_bridge_win PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME hostd_worker_bridge_windows COMMAND test_hostd_worker_bridge_win)
+
+  add_executable(test_ipc_transport_win tests/test_ipc_transport_win.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_transport_win.cpp)
+  target_compile_definitions(test_ipc_transport_win PRIVATE _WIN32_WINNT=0x0A00)
+  target_link_libraries(test_ipc_transport_win PRIVATE advapi32)
+  set_target_properties(test_ipc_transport_win PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME ipc_transport_windows COMMAND test_ipc_transport_win)
+  set_tests_properties(ipc_transport_windows PROPERTIES TIMEOUT 60)
+endif()
 
 # === 3D assembly mate solver (ported from the retired Python mate_solver) =====
 # Standalone, OCCT-free: rigid-component placement over the shared solver core
@@ -2762,6 +2843,29 @@ if(TARGET chudware_mesh)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME fea_prepare COMMAND test_fea_prepare)
 endif()
+
+# Standalone performance drivers: no daemon, project files, or online providers.
+add_executable(lbm_profile tools/lbm_profile.cpp)
+target_link_libraries(lbm_profile PRIVATE chudware_sim)
+set_target_properties(lbm_profile PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+add_executable(ecad_profile tools/ecad_profile.cpp)
+target_link_libraries(ecad_profile PRIVATE chudware_ecad)
+set_target_properties(ecad_profile PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+add_executable(hash_profile tools/hash_profile.cpp)
+target_link_libraries(hash_profile PRIVATE chudware_util)
+set_target_properties(hash_profile PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+add_executable(test_sha256 tests/test_sha256.cpp)
+target_include_directories(test_sha256 PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_sha256 PRIVATE chudware_util)
+set_target_properties(test_sha256 PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME sha256 COMMAND test_sha256)
 
 # The emulated ARM suite still registers every portable core test. Explicit
 # native TIMEOUT values override ctest's default: allow eightfold emulation

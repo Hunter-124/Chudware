@@ -7,7 +7,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/Repositories/CAD/Webservice/gateway
-EnvironmentFile=-%h/chudware-web-data/gateway.env
+EnvironmentFile=%h/chudware-web-data/gateway.env
 EnvironmentFile=-%h/chudware-web/webd.env
 Environment=CHUDWARE_WEB_DATA=%h/chudware-web-data
 # systemd decrypts this into a private runtime credential directory. The key
@@ -17,8 +17,9 @@ Environment=CHUDWARE_ENTITLEMENT_KEY_PATH=%d/entitlement.key
 # Keep uvicorn's WebSocket frame ceiling identical to the gateway forwarding
 # budget. EnvironmentFile overrides this default when the operator tunes it.
 Environment=CHUDWARE_WEB_WS_MAX_MESSAGE_BYTES=4194304
-# Production-like units must never enable the local authentication bypass.
-ExecStartPre=/usr/bin/bash -c 'case "${CHUDWARE_WEB_DEV:-}" in ""|0|false|False|FALSE|no|No|NO|off|Off|OFF) exit 0;; *) echo "ERROR: CHUDWARE_WEB_DEV must be disabled in production" >&2; exit 1;; esac'
+# Validate protected operator input before authn/database initialization. This is
+# configuration readiness only; DNS/provider acceptance and receipt remain external.
+ExecStartPre=%h/Repositories/CAD/Webservice/gateway/.venv/bin/python %h/Repositories/CAD/Webservice/deploy/gateway_preflight.py validate --env-file %h/chudware-web-data/gateway.env --environment prod
 # venv + uvicorn; app module owned by GatewayCore
 ExecStart=%h/Repositories/CAD/Webservice/gateway/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8300 --proxy-headers --forwarded-allow-ips=127.0.0.1 --ws-max-size ${CHUDWARE_WEB_WS_MAX_MESSAGE_BYTES} --no-access-log
 Restart=on-failure
@@ -26,6 +27,7 @@ RestartSec=3
 MemoryMax=1G
 # Soft guard so the unit dies cleanly before the OOM killer thrash
 MemoryHigh=900M
+TasksMax=256
 TimeoutStopSec=30
 KillMode=mixed
 NoNewPrivileges=yes

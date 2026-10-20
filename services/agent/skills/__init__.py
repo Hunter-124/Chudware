@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Optional
+from services.agent.request_context import root_value
 
 # --------------------------------------------------------------------------- constants
 
@@ -89,7 +90,7 @@ def project_skills_dir(project_root: Path | str | None = None) -> Path:
         return Path(override)
     if project_root is not None:
         return Path(project_root) / ".chudware" / "skills"
-    env = os.environ.get("CHUDWARE_PROJECT_DIR")
+    env = root_value("CHUDWARE_PROJECT_DIR")
     root = Path(env) if env else Path.cwd()
     return root / ".chudware" / "skills"
 

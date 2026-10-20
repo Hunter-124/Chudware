@@ -9,7 +9,7 @@
 <link rel="stylesheet" href="/static/base.css">
 <link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/admin_wm.css?v=1">
-<link rel="stylesheet" href="/static/admin_ops.css?v=2">
+<link rel="stylesheet" href="/static/admin_ops.css?v=3">
 <link rel="stylesheet" href="/static/admin_billing.css?v=1">
 <link rel="stylesheet" href="/static/admin_marketplace.css?v=1">
 <style>
@@ -649,7 +649,7 @@
             <h2>Host health</h2>
             <div id="host-bar" class="dash-hostbar">Loading&hellip;</div>
             <div class="dash-actions">
-              <button type="button" class="btn ghost" data-goto="system">Deploy &amp; logs</button>
+              <button type="button" class="btn ghost" data-goto="system">Deployment status &amp; logs</button>
               <button type="button" class="btn ghost" data-goto="terminal">Open terminal</button>
             </div>
           </div>
@@ -838,8 +838,20 @@
     <!-- ============================= System ============================== -->
     <section class="tab-panel" id="panel-system" data-tab="system" role="tabpanel" aria-labelledby="tab-system">
       <div class="panel-inner">
-        <!-- deploy card mounts here -->
-        <div id="deploy-mount"></div>
+        <div class="admin-card deploy-card">
+          <h2>Deployment status (read-only)</h2>
+          <div class="deploy-section">
+            <p class="deploy-note">This browser cannot build the live checkout or restart services. Deployment and recovery require a qualified operator on the protected deployment host.</p>
+            <p class="deploy-note">Deploy a qualified production tag with <code>bash Webservice/deploy/update.sh prod --tag &lt;qualified-v-tag&gt;</code>. For an independently authorized retained payload, use <code>bash Webservice/deploy/rollback.sh --to &lt;qualified-release-id&gt;</code>; this does not restore gateway source or the database.</p>
+            <p class="deploy-note">These commands do not grant deployment authority. Protected configuration, exact-ref checks, independently authorized rollback or explicit first-cutover acknowledgment, maintenance, inactive-cell proof and authenticated health remain required. Accepted work must finish before cutover. Follow <code>Webservice/deploy/RUNBOOK.md</code>, section (h).</p>
+            <p class="deploy-note">The operator-written status snapshot and <code>update.log</code> below are monitoring only, not proof of quiescence or permission to cut over.</p>
+          </div>
+          <div class="deploy-status-row">
+            <span class="dep-pill dep-idle" id="deploy-status" role="status" aria-live="polite">loading deployment status</span>
+            <button type="button" class="btn ghost" id="deploy-refresh">Refresh status &amp; log</button>
+          </div>
+          <pre class="deploy-log" id="deploy-log">(loading operator deployment log)</pre>
+        </div>
         <div class="admin-card">
           <h2>Host files</h2>
           <p class="card-note">
@@ -896,7 +908,7 @@
   </div>
 </div>
 <!-- admin.js is unhashed; bump this version when its copy or behavior changes. -->
-<script src="/static/admin.js?v=15"></script>
+<script src="/static/admin.js?v=17"></script>
 <!-- Loaded AFTER admin.js because each guards on a mount id that lives in the
      markup above, not on anything admin.js creates; the ordering is for
      determinism when reading the file, not a dependency. Both files are served

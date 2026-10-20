@@ -4,15 +4,15 @@
 //
 // Paths:
 //   Desktop: ordinary OS paths (absolute).
-//   Web:     server-side absolute paths returned by the gateway (upload's
-//            abs_path, list's root + entry path). defaultRoot() is that server
-//            workspace root. Daemon RPCs (doc_open/doc_save/export_file) take
-//            these same abs paths.
+//   Web: workspace-relative paths only; "." is the logical workspace root.
+//        The cell maps RPC paths beneath /work. Gateway host roots never reach
+//        the browser, and are never accepted as workspace paths.
 #pragma once
 
 #include <cstdint>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace chudware {
@@ -72,7 +72,7 @@ public:
     virtual FsStat stat(const std::string& path, std::string& err) = 0;
 
     // Workspace root. Desktop: Documents/Chudware or Documents/Chudware.
-    // Web: server abs workspace root (from gateway list).
+    // Web: "." (logical workspace root; never a server filesystem path).
     virtual std::string defaultRoot() = 0;
 
     // Render-time reads. Snapshots refresh after two seconds, coalesce requests,
@@ -85,7 +85,7 @@ public:
         err.clear();
         return defaultRoot();
     }
-    // Workspace changes additionally retire the discovered server root.
+    // Workspace changes retire in-flight workspace reads.
     virtual void invalidateBrowseCache(bool workspaceChanged = false);
 
     // ---- convenience (implemented in terms of the above where possible) ----
@@ -129,11 +129,42 @@ private:
 };
 
 
+// Validate and canonicalize a browser workspace reference without filesystem IO.
+// Reject rather than reinterpret OS paths, traversal, backslashes or embedded NUL.
+inline bool workspaceRelativePath(const std::string& path, std::string& relative,
+                                  std::string& err) {
+    relative.clear();
+    err.clear();
+    if ((!path.empty() && path.front() == '/') ||
+        path.find_first_of("\\:") != std::string::npos ||
+        path.find('\0') != std::string::npos) {
+        err = "Invalid workspace-relative path";
+        return false;
+    }
+    size_t start = 0;
+    while (start < path.size()) {
+        size_t end = path.find('/', start);
+        if (end == std::string::npos) end = path.size();
+        const std::string_view component(path.data() + start, end - start);
+        if (component == "..") {
+            relative.clear();
+            err = "Workspace path traversal is not allowed";
+            return false;
+        }
+        if (!component.empty() && component != ".") {
+            if (!relative.empty()) relative += '/';
+            relative += component;
+        }
+        start = end + 1;
+    }
+    return true;
+}
+
 // Process-wide backend (desktop or web, selected at compile time).
 FsBackend& fsBackend();
 
 // Web-only helpers (no-ops / fail on desktop). Used by file_dialog import/export.
-// Upload bytes as `filename` under workspace `dir` ("" = root). Returns abs_path.
+// Upload bytes as `filename` under workspace `dir` ("" = root). Returns relative path.
 std::string fsUpload(const std::string& dir, const std::string& filename,
                      const uint8_t* data, size_t len, std::string& err);
 // Trigger a browser download of a server workspace path (GET /workspace/download).

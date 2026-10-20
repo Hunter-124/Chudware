@@ -8,6 +8,7 @@ subcommands perform network I/O.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -327,13 +328,22 @@ def _verify_executable_version(
             f"cannot executable-verify {target} Chudcode artifact on {current}"
         )
     try:
-        completed = subprocess.run(
-            [str(path.resolve()), "--version"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory(prefix="version-home-", dir=path.parent) as directory:
+            environment = {
+                name: os.environ[name]
+                for name in ("SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP")
+                if name in os.environ
+            }
+            environment.update({
+                "PATH": os.defpath, "HOME": directory, "USERPROFILE": directory,
+                "APPDATA": directory, "LOCALAPPDATA": directory,
+                "XDG_CONFIG_HOME": directory, "XDG_DATA_HOME": directory,
+                "XDG_CACHE_HOME": directory,
+            })
+            completed = subprocess.run(
+                [str(path.resolve()), "--version"], capture_output=True,
+                text=True, timeout=10, check=False, cwd=directory, env=environment,
+            )
     except (OSError, subprocess.SubprocessError) as exc:
         raise ArtifactLockError(
             f"could not execute Chudcode artifact for product-version verification: {path}"
@@ -364,60 +374,71 @@ def _pinned_artifact(lock: dict[str, Any], target: str) -> dict[str, Any]:
     return artifact
 
 
-def verify_binary(
-    path: Path, target: str, *, lock_path: Path | None = None
-) -> dict[str, Any]:
-    lock = load_lock(lock_path or DEFAULT_LOCK, require_pinned=False)
+@contextmanager
+def _verified_snapshot(path: Path, target: str, lock_path: Path):
+    lock = load_lock(lock_path, require_pinned=False)
     if target not in SUPPORTED_TARGETS:
         raise ArtifactLockError(f"unsupported Chudcode artifact target: {target}")
     if not path.is_file() or path.is_symlink():
         raise ArtifactLockError(f"required Chudcode binary is missing or unsafe: {path}")
-    actual_target = _binary_target(path)
-    if actual_target != target:
-        raise ArtifactLockError(
-            f"wrong-target Chudcode binary: expected {target}, found {actual_target}"
-        )
-    actual_hash = _sha256(path)
-    expected = _pinned_artifact(lock, target)["sha256"]
-    if actual_hash != expected:
-        raise ArtifactLockError(
-            f"Chudcode binary sha256 mismatch for {target}: "
-            f"expected {expected}, found {actual_hash}"
-        )
-    version_output = _verify_executable_version(path, target, lock)
-    return {
-        "path": str(path),
-        "target": target,
-        "sha256": actual_hash,
-        "version": lock["version"],
-        "rpc_protocol": lock["rpc_protocol"],
-        "repository_commit": lock["repository_commit"],
-        "engine_version": lock["engine_version"],
-        "version_output": version_output,
-    }
+    with tempfile.TemporaryDirectory(prefix="chudware-verified-artifact-") as directory:
+        snapshot = Path(directory) / CANONICAL_NAMES[target]
+        # External paths are never executed. A concurrent input change can only
+        # make this private copy fail its target/digest checks.
+        with path.open("rb") as source, snapshot.open("xb") as output:
+            shutil.copyfileobj(source, output)
+        snapshot.chmod(0o700)
+        actual_target = _binary_target(snapshot)
+        if actual_target != target:
+            raise ArtifactLockError(
+                f"wrong-target Chudcode binary: expected {target}, found {actual_target}"
+            )
+        actual_hash = _sha256(snapshot)
+        expected = _pinned_artifact(lock, target)["sha256"]
+        if actual_hash != expected:
+            raise ArtifactLockError(
+                f"Chudcode binary sha256 mismatch for {target}: expected {expected}, found {actual_hash}"
+            )
+        version_output = _verify_executable_version(snapshot, target, lock)
+        yield snapshot, {
+            "path": str(path), "target": target, "sha256": actual_hash,
+            "version": lock["version"], "rpc_protocol": lock["rpc_protocol"],
+            "repository_commit": lock["repository_commit"],
+            "engine_version": lock["engine_version"], "version_output": version_output,
+        }
+
+
+def verify_binary(
+    path: Path, target: str, *, lock_path: Path | None = None
+) -> dict[str, Any]:
+    with _verified_snapshot(path, target, lock_path or DEFAULT_LOCK) as (_, evidence):
+        return evidence
 
 
 def stage_binary(
     source: Path, destination: Path, target: str, *, lock_path: Path | None = None
 ) -> dict[str, Any]:
     lock_path = lock_path or DEFAULT_LOCK
-    evidence = verify_binary(source, target, lock_path=lock_path)
+    if target not in SUPPORTED_TARGETS:
+        raise ArtifactLockError(f"unsupported Chudcode artifact target: {target}")
     expected_name = CANONICAL_NAMES[target]
     if destination.name != expected_name:
         raise ArtifactLockError(
             f"staged Chudcode binary must be named {expected_name}, not {destination.name}"
         )
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(destination.name + ".tmp")
-    temporary.unlink(missing_ok=True)
-    try:
-        shutil.copy2(source, temporary)
-        if not target.startswith("windows-"):
-            temporary.chmod(temporary.stat().st_mode | 0o111)
-        verify_binary(temporary, target, lock_path=lock_path)
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
+    with _verified_snapshot(source, target, lock_path) as (snapshot, evidence):
+        fd, name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+        temporary = Path(name)
+        try:
+            with os.fdopen(fd, "wb") as output, snapshot.open("rb") as input_file:
+                shutil.copyfileobj(input_file, output)
+            temporary.chmod(0o700)
+            if _sha256(temporary) != evidence["sha256"]:
+                raise ArtifactLockError("staged Chudcode snapshot changed before publication")
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
     evidence["staged"] = str(destination)
     return evidence
 

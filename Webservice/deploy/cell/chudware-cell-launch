@@ -1,0 +1,77 @@
+#!/usr/bin/python3 -IS
+import os
+from pathlib import Path
+import socket
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cell_runtime import BASE_ENV, cell_config, close_extra_fds, configuration, private, quota_roots, rootfs, run_sandbox, set_environment
+from storage_quota import inode_attributes
+
+
+def launch(cell_id):
+    cfg = configuration()
+    cell, work = cell_config(cell_id, cfg)
+    if os.environ.get("LISTEN_FDS") != "1" or os.environ.get("LISTEN_PID") != str(os.getpid()):
+        raise ValueError("exactly one systemd listener required")
+    listener = socket.socket(fileno=os.dup(3))
+    try:
+        if listener.family != socket.AF_UNIX or not listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN):
+            raise ValueError("fd 3 must be a Unix listener")
+    finally:
+        listener.close()
+    close_extra_fds((3,))
+    pins = []
+    payload = str(Path(__file__).resolve().parent.parent)
+    args = rootfs(payload, pins)
+    workspace, state = quota_roots(cell_id, cfg, cell, work, pins)
+    args += ["--bind", workspace, "/work", "--bind", state, "/state"]
+    # Socket file, never its host-only parent directory. Pin against substitution.
+    from cell_runtime import open_path
+    import stat
+    cell_fd = open_path(cell)
+    try:
+        for name in ("egress", "provider"):
+            broker_fd = os.open(name + ".sock", os.O_PATH | os.O_NOFOLLOW, dir_fd=cell_fd)
+            if not stat.S_ISSOCK(os.fstat(broker_fd).st_mode):
+                os.close(broker_fd)
+                raise ValueError(name + " broker socket required")
+            os.set_inheritable(broker_fd, False)
+            pins.append(broker_fd)
+            args += ["--ro-bind", "/proc/self/fd/" + str(broker_fd), "/run/" + name + ".sock"]
+    finally:
+        os.close(cell_fd)
+    env = {**BASE_ENV, "CHUDWARE_CELL_ID": cell_id, "HOME": "/state/home", "XDG_DATA_HOME": "/state/data",
+           "XDG_CONFIG_HOME": "/state/config", "XDG_CACHE_HOME": "/state/cache",
+           "XDG_RUNTIME_DIR": "/state/run", "CHUDWARE_WORKER_PYTHON": "/opt/chudware/venv/bin/python3",
+           "CHUDWARE_CHUDCODE_BIN": "/opt/chudware/bin/chud"}
+    # Initialize through the quota-verified state descriptor, not a fresh path
+    # lookup beneath a gateway-writable parent. New directories inherit the
+    # kernel project quota; saved CAD remains on the durable workspace mount.
+    state_fd = int(state.rsplit("/", 1)[1])
+    for name in ("home", "data", "config", "cache", "run", "actors"):
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=state_fd)
+        except FileExistsError:
+            pass
+        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=state_fd)
+        try:
+            private(child, 0o700)
+            if inode_attributes(child) != inode_attributes(state_fd):
+                raise ValueError("cell-state directory lost quota inheritance")
+        finally:
+            os.close(child)
+    set_environment(args, env)
+    os.set_inheritable(3, True)
+    args += ["--", "/usr/bin/python3", "-I", "-S", "/opt/chudware/bin/chudware-cell-init"]
+    return run_sandbox(args, pins, (3,))
+
+
+if __name__ == "__main__":
+    try:
+        if len(sys.argv) != 2:
+            raise ValueError("usage: chudware-cell-launch <cell_id>")
+        sys.exit(launch(sys.argv[1]))
+    except Exception as exc:
+        print("cell_refused: " + str(exc), file=sys.stderr)
+        sys.exit(1)

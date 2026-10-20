@@ -210,6 +210,7 @@ class PrusaLinkAdapter(PrinterAdapter):
             AuthConfig("trusted_host"),
             self.config.timeout_s,
             "X-Api-Key",
+            address_class=self.config.address_class,
         )
         response = unauthenticated.request("GET", "/api/version", expected=(200, 401, 403))
         challenge = response.headers.get("WWW-Authenticate", "")

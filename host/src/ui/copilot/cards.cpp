@@ -7,6 +7,7 @@
 // timeline that hosts them lives in activity_timeline.cpp.
 
 #include "copilot_internal.h"
+#include "ui/copilot/inline_image_refs.h"
 #include "ui/chudcode_session_actions.h"  // chudcode_rewind_session + per-conversation link
 #include <algorithm>
 #include <iterator>
@@ -1253,24 +1254,67 @@ static bool askSameSentence(const std::string& a, const std::string& b) {
 static void drawAskInput(AppState& st, AskQuestion& q, const ui::AdaptiveSurface& surf) {
     const auto& pal = ui::palette;
     const ImGuiStyle& style = ImGui::GetStyle();
+    // A native selectable owns the entire wrapped row, including keyboard activation.
+    // The selector is only a compact glyph; its size never dictates the row's hit area.
+    auto choiceRow = [&](const char* id, const char* label, bool selected, bool multi) {
+        const float width = std::max(ImGui::GetContentRegionAvail().x,
+                                     ui::metrics::stroke(1.0f));
+        const float padX = kit::padX();
+        const float padY = kit::padY();
+        const float glyph = ImGui::GetTextLineHeight() * 0.7f;
+        const float gap = ImGui::GetStyle().ItemInnerSpacing.x;
+        const float textW = std::max(width - padX * 2.0f - glyph - gap,
+                                     ui::metrics::stroke(1.0f));
+        const ImVec2 textSize = ImGui::CalcTextSize(label, nullptr, false, textW);
+        const float height = std::max(ImGui::GetFrameHeight(), textSize.y + padY * 2.0f);
+        const ImVec2 origin = ImGui::GetCursorScreenPos();
+        const bool clicked = ImGui::Selectable(
+            id, selected, ImGuiSelectableFlags_NoPadWithHalfSpacing, ImVec2(width, height));
+        ImGuiContext& g = *GImGui;
+        IMGUI_TEST_ENGINE_ITEM_INFO(
+            ImGui::GetItemID(), label, GImGui->LastItemData.StatusFlags |
+                ImGuiItemStatusFlags_Checkable |
+                (selected ? ImGuiItemStatusFlags_Checked : 0));
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 g0(origin.x + padX, origin.y + padY +
+                                            (ImGui::GetTextLineHeight() - glyph) * 0.5f);
+        const ImU32 ink = ImGui::GetColorU32(ImGuiCol_Text);
+        const ImU32 mark = ImGui::GetColorU32(ImGuiCol_CheckMark);
+        if (multi) {
+            dl->AddRect(g0, ImVec2(g0.x + glyph, g0.y + glyph), ink,
+                        ui::metrics::rounding(2.0f), 0, ui::metrics::stroke(1.0f));
+            if (selected)
+                ImGui::RenderCheckMark(dl, ImVec2(g0.x + glyph * 0.15f,
+                                                 g0.y + glyph * 0.15f), mark, glyph * 0.7f);
+        } else {
+            const ImVec2 center(g0.x + glyph * 0.5f, g0.y + glyph * 0.5f);
+            dl->AddCircle(center, glyph * 0.5f, ink, 0, ui::metrics::stroke(1.0f));
+            if (selected) dl->AddCircleFilled(center, glyph * 0.28f, mark);
+        }
+        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                    ImVec2(g0.x + glyph + gap, origin.y + padY), ink,
+                    label, nullptr, textW);
+        return clicked;
+    };
     if (q.kind == "choice") {
         if (q.checked.size() != q.options.size()) q.checked.resize(q.options.size(), 0);
         for (size_t oi = 0; oi < q.options.size(); ++oi) {
             ImGui::PushID((int)oi);
             const AskOption& opt = q.options[oi];
             const char* lab = opt.label.empty() ? opt.value.c_str() : opt.label.c_str();
-            if (q.multi) {
-                bool on = q.checked[oi] != 0;
-                if (ImGui::Checkbox(lab, &on)) q.checked[oi] = on ? 1 : 0;
-            } else if (ImGui::RadioButton(lab, q.choice == (int)oi)) {
-                q.choice = (int)oi;
+            if (choiceRow("##ask_choice", lab,
+                          q.multi ? q.checked[oi] != 0 : q.choice == (int)oi, q.multi)) {
+                if (q.multi) q.checked[oi] = q.checked[oi] ? 0 : 1;
+                else q.choice = (int)oi;
             }
             ImGui::PopID();
         }
         // "Other": the user's own words. Typing in the field selects the row.
-        if (q.multi) ImGui::Checkbox("Other", &q.otherOn);
-        else if (ImGui::RadioButton("Other", q.choice == kAskOther)) q.choice = kAskOther;
-        ImGui::SameLine();
+        if (choiceRow("##ask_other_choice", "Other",
+                      q.multi ? q.otherOn : q.choice == kAskOther, q.multi)) {
+            if (q.multi) q.otherOn = !q.otherOn;
+            else q.choice = kAskOther;
+        }
         ImGui::SetNextItemWidth(-FLT_MIN);
         if (ImGui::InputTextWithHint("##other", "Your own answer", q.otherBuf.data(),
                                      q.otherBuf.size())) {
@@ -1280,17 +1324,23 @@ static void drawAskInput(AppState& st, AskQuestion& q, const ui::AdaptiveSurface
     } else if (q.kind == "dimension") {
         const auto& units = askDimUnits(q.family);
         const bool pickUnit = units.size() > 1;
-        const float unitW = pickUnit ? ui::metrics::U(18.0f) : 0.0f;
-        ImGui::SetNextItemWidth(pickUnit ? ImGui::GetContentRegionAvail().x - unitW -
-                                               style.ItemSpacing.x
-                                         : -FLT_MIN);
+        float unitW = ImGui::GetFrameHeight() + style.FramePadding.x * 2.0f;
+        for (const auto& u : units)
+            unitW = std::max(unitW, ImGui::CalcTextSize(u.c_str()).x +
+                                       ImGui::GetFrameHeight() + style.FramePadding.x * 2.0f);
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const float minValueW = ImGui::CalcTextSize("-0.000000").x +
+                                style.FramePadding.x * 2.0f;
+        const bool inlineUnit = pickUnit && avail >= minValueW + unitW + style.ItemSpacing.x;
+        ImGui::SetNextItemWidth(inlineUnit ? avail - unitW - style.ItemSpacing.x : -FLT_MIN);
         ImGui::InputTextWithHint("##dim", "Value", q.textBuf.data(), q.textBuf.size(),
                                  ImGuiInputTextFlags_CharsScientific);
         if (pickUnit) {
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(unitW);
+            if (inlineUnit) ImGui::SameLine();
+            ImGui::SetNextItemWidth(inlineUnit ? unitW : -FLT_MIN);
             const ImVec4 popBg(pal.popupBg[0], pal.popupBg[1], pal.popupBg[2], pal.popupBg[3]);
             ImGui::PushStyleColor(ImGuiCol_PopupBg, popBg);
+            const ImGuiID unitId = ImGui::GetID("##unit");
             if (ImGui::BeginCombo("##unit", q.unit.c_str())) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ui::maxContrastTextOn(popBg));
                 for (const auto& u : units)
@@ -1299,6 +1349,8 @@ static void drawAskInput(AppState& st, AskQuestion& q, const ui::AdaptiveSurface
                 ImGui::EndCombo();
             }
             ImGui::PopStyleColor();
+            ImGuiContext& g = *GImGui;
+            IMGUI_TEST_ENGINE_ITEM_INFO(unitId, "##unit", 0);
         }
     } else if (q.kind == "approval") {
         // The proposal often restates the prompt ("Add vent slots?" / "Add vent slots"); a
@@ -1308,26 +1360,22 @@ static void drawAskInput(AppState& st, AskQuestion& q, const ui::AdaptiveSurface
             ImGui::TextWrapped("%s", q.proposal.c_str());
             ImGui::PopStyleColor();
         }
-        // kit::segmented always shows a selection, so it would imply a choice the user has not
-        // made; with no suggested default, start from two unselected radios instead.
-        if (q.approval < 0) {
-            if (ImGui::RadioButton("Approve", false)) q.approval = 1;
-            ImGui::SameLine();
-            if (ImGui::RadioButton("Decline", false)) q.approval = 0;
-        } else {
-            static const char* const kApprove[] = {"Approve", "Decline"};
-            int sel = q.approval == 1 ? 0 : 1;
-            if (kit::segmented("##approval", kApprove, 2, &sel)) q.approval = sel == 0 ? 1 : 0;
-        }
+        // Keep both states native and keyboard-accessible without suggesting a default.
+        if (choiceRow("##ask_approve", "Approve", q.approval == 1, false)) q.approval = 1;
+        if (choiceRow("##ask_decline", "Decline", q.approval == 0, false)) q.approval = 0;
     } else if (q.kind == "file_request") {
         const char* browse = "Browse\xe2\x80\xa6";
         const float browseW = ImGui::CalcTextSize(browse).x + style.FramePadding.x * 2.0f;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - browseW - style.ItemSpacing.x);
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const bool inlineBrowse = avail >= browseW + style.ItemSpacing.x +
+                                              ImGui::GetFontSize() * 12.0f;
+        ImGui::SetNextItemWidth(inlineBrowse ? avail - browseW - style.ItemSpacing.x : -FLT_MIN);
         ImGui::InputTextWithHint("##paths",
                                  q.multiple ? "File paths, separated by ;" : "File path",
                                  q.textBuf.data(), q.textBuf.size());
-        ImGui::SameLine();
-        if (kit::secondaryButton(browse)) {
+        if (inlineBrowse) ImGui::SameLine();
+        if (kit::secondaryButton("Browse\xe2\x80\xa6###ask_browse", true, nullptr,
+                                 inlineBrowse ? ImVec2(0, 0) : ImVec2(-1, 0))) {
             if (std::getenv("CHUDWARE_NO_FILE_DIALOGS")) {
                 st.toast(ui::ToastLevel::Info,
                          "File dialogs are disabled (CHUDWARE_NO_FILE_DIALOGS).");
@@ -1356,9 +1404,16 @@ static void drawAskInput(AppState& st, AskQuestion& q, const ui::AdaptiveSurface
                 const AskPick& p = q.picks[pi];
                 const std::string lab = p.label.empty() ? p.kind + " " + p.id : p.label;
                 ImGui::PushID((int)pi);
-                kit::chip(lab.c_str(), kit::Tone::Accent);
+                // Even one chip can exceed a narrow card; keep the full identity as prose.
+                if (ImGui::CalcTextSize(lab.c_str()).x + kit::padX() * 2.0f <=
+                    ImGui::GetContentRegionAvail().x) {
+                    kit::chip(lab.c_str(), kit::Tone::Accent);
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Text, semanticOnGlass(pal.accent, surf));
+                    ImGui::TextWrapped("%s", lab.c_str());
+                    ImGui::PopStyleColor();
+                }
                 ImGui::PopID();
-                if (pi + 1 < q.picks.size()) ImGui::SameLine();
             }
         }
         const bool resolving =
@@ -1366,21 +1421,26 @@ static void drawAskInput(AppState& st, AskQuestion& q, const ui::AdaptiveSurface
                         [](const core::ContextRef& r) { return r.resolving; });
         const int nRefs = (int)st.pendingContextRefs.size();
         const std::string useLbl = "Use picked geometry" +
-                                   (nRefs > 0 ? " (" + std::to_string(nRefs) + ")" : std::string());
-        if (kit::secondaryButton(useLbl.c_str(), nRefs > 0 && !resolving,
+                                   (nRefs > 0 ? " (" + std::to_string(nRefs) + ")" : std::string()) +
+                                   "###ask_use_picks";
+        const bool compactUse = ImGui::CalcTextSize(useLbl.c_str(), nullptr, true).x +
+                                    style.FramePadding.x * 2.0f > ImGui::GetContentRegionAvail().x;
+        if (kit::secondaryButton(compactUse ? "Use picks###ask_use_picks" : useLbl.c_str(),
+                                 nRefs > 0 && !resolving,
                                  resolving ? "Waiting for the pick to resolve\xe2\x80\xa6"
-                                           : "Pick on the model first, then use it here.")) {
+                                           : "Pick on the model first, then use it here.",
+                                 ImVec2(-1, 0))) {
             if (askTakePicks(st, q) == 0)
                 st.toast(ui::ToastLevel::Info,
                          "None of the picked items fits this question.");
         }
-        ImGui::SameLine();
-        if (kit::secondaryButton(st.contextPickActive ? "Picking\xe2\x80\xa6" : "Pick on model",
-                                 !st.contextPickActive, "Click the model, then Esc"))
+        if (kit::secondaryButton(st.contextPickActive ? "Picking\xe2\x80\xa6###ask_pick_model"
+                                                      : "Pick on model###ask_pick_model",
+                                 !st.contextPickActive, "Click the model, then Esc", ImVec2(-1, 0)))
             st.contextPickActive = true;
         if (!q.picks.empty()) {
-            ImGui::SameLine();
-            if (kit::secondaryButton("Clear")) q.picks.clear();
+            if (kit::secondaryButton("Clear###ask_clear_picks", true, nullptr,
+                                     ImVec2(-1, 0))) q.picks.clear();
         }
     } else if (q.kind == "text" && q.multiline) {
         drawChatInput("##text", q.textBuf, "Your answer", 6);
@@ -1422,11 +1482,14 @@ static void drawAskSummary(AskBatch& b, const ui::Fonts& fonts) {
                                                                     : kit::Status::Skipped);
     ImGui::SameLine();
     ImGui::PushFont(fonts.medium);
-    ImGui::TextColored(surf.textSecondary, "%s", askResolvedTitle(b.status));
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+    ImGui::TextWrapped("%s", askResolvedTitle(b.status));
+    ImGui::PopStyleColor();
     ImGui::PopFont();
     if (!b.agentId.empty()) {
-        ImGui::SameLine();
-        ImGui::TextColored(surf.textTertiary, "\xc2\xb7  %s", b.agentId.c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextWrapped("%s", b.agentId.c_str());
+        ImGui::PopStyleColor();
     }
     if (b.status == AskStatus::Expired && !b.error.empty() &&
         b.error != "The run that asked has ended.")
@@ -1493,6 +1556,7 @@ static void drawAskForm(AppState& st, ChatMsg& m, AskBatch& b, const ui::Fonts& 
     GlassBubble gb = beginUserActionCard();
     ImGui::BeginChild("##ask", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    kit::pushDensity(kit::Density::Compact);
     // Fields sit on glass: derive the frame from the surface ink (the Quick-settings idiom), so
     // values stay legible over a bright or dark backdrop.
     const ImVec4 ink = surf.textPrimary;
@@ -1510,9 +1574,10 @@ static void drawAskForm(AppState& st, ChatMsg& m, AskBatch& b, const ui::Fonts& 
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
 
     ImGui::PushFont(fonts.medium);
-    ImGui::TextColored(accentCol, "%s",
-                       b.agentId.empty() ? "Questions for you"
-                                         : ("Questions from " + b.agentId).c_str());
+    ImGui::PushStyleColor(ImGuiCol_Text, accentCol);
+    ImGui::TextWrapped("%s", b.agentId.empty() ? "Questions for you"
+                                             : ("Questions from " + b.agentId).c_str());
+    ImGui::PopStyleColor();
     ImGui::PopFont();
     dimText("Answer here and submit, or just reply in the chat. The agent waits for you.");
 
@@ -1533,7 +1598,11 @@ static void drawAskForm(AppState& st, ChatMsg& m, AskBatch& b, const ui::Fonts& 
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
     std::string notReady;
     const bool ready = askBatchReady(b, &notReady);
-    if (busy) kit::spinner("Sending your answers\xe2\x80\xa6");
+    if (busy) {
+        kit::spinner("");
+        ImGui::SameLine();
+        ImGui::TextWrapped("Sending your answers\xe2\x80\xa6");
+    }
     kit::inlineStatus(b.error.c_str(), kit::Tone::Err);
     const bool submit = kit::primaryButton(
         "Submit answers", ready && !busy,
@@ -1546,6 +1615,7 @@ static void drawAskForm(AppState& st, ChatMsg& m, AskBatch& b, const ui::Fonts& 
 
     ImGui::PopStyleVar();
     ImGui::PopStyleColor(8);
+    kit::popDensity();
     ImGui::EndChild();
     endUserActionCard(gb);   // pops the ##ask WindowPadding
 
@@ -1567,14 +1637,34 @@ static void drawAskForm(AppState& st, ChatMsg& m, AskBatch& b, const ui::Fonts& 
     agentAnswerDispatch(st, runId, b.batchId, std::move(answers), /*declined=*/dismiss);
 }
 
+std::string askMarkerStage(const std::string& batchId) { return "__ask__:" + batchId; }
+
+static void drawAskCard(AppState& st, ChatMsg& m, AskBatch& b, size_t index,
+                        const ui::Fonts& fonts) {
+    if (b.batchId.empty()) ImGui::PushID((int)index);
+    else ImGui::PushID(b.batchId.c_str());
+    if (askStatusOpen(b.status)) drawAskForm(st, m, b, fonts);
+    else drawAskSummary(b, fonts);
+    ImGui::PopID();
+}
+
+void drawAskMarker(AppState& st, ChatMsg& m, const ActivityItem& marker, const ui::Fonts& fonts) {
+    for (size_t bi = 0; bi < m.asks.size(); ++bi)
+        if (!m.asks[bi].batchId.empty() && askMarkerStage(m.asks[bi].batchId) == marker.stage) {
+            drawAskCard(st, m, m.asks[bi], bi, fonts);
+            return;
+        }
+}
+
 void drawAskCards(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     for (size_t bi = 0; bi < m.asks.size(); ++bi) {
         AskBatch& b = m.asks[bi];
-        if (b.batchId.empty()) ImGui::PushID((int)bi);
-        else ImGui::PushID(b.batchId.c_str());
-        if (askStatusOpen(b.status)) drawAskForm(st, m, b, fonts);
-        else drawAskSummary(b, fonts);
-        ImGui::PopID();
+        const bool anchored =
+            !b.batchId.empty() &&
+            std::any_of(m.activity.begin(), m.activity.end(), [&](const ActivityItem& a) {
+                return a.rowKind == 20 && a.stage == askMarkerStage(b.batchId);
+            });
+        if (!anchored) drawAskCard(st, m, b, bi, fonts);
     }
 }
 
@@ -3269,7 +3359,10 @@ HeaderBtnHit headerTextButtonHit(const char* id, float w) {
     ImGui::PushID(id);
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
     const float bh = ImGui::GetFrameHeight();
-    h.clicked = ImGui::InvisibleButton("##hit", ImVec2(w, bh));
+    h.clicked = ImGui::Selectable("##hit", false, ImGuiSelectableFlags_NoPadWithHalfSpacing,
+                                 ImVec2(w, bh));
+    ImGuiContext& g = *GImGui;
+    IMGUI_TEST_ENGINE_ITEM_INFO(ImGui::GetItemID(), id, GImGui->LastItemData.StatusFlags);
     h.hovered = ImGui::IsItemHovered();
     h.held    = ImGui::IsItemActive();
     h.rect    = ImRect(p0, ImVec2(p0.x + w, p0.y + bh));
@@ -3282,23 +3375,27 @@ void headerTextButtonPaint(const HeaderBtnHit& h, const char* label, bool active
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
     const ImVec4 txt = surf.textPrimary;
-    const float round = ui::metrics::rounding(4.0f);  // less-rounded rectangular box
+    const float round = ui::metrics::cpMenuChipRound();
     const float iconSz = ImGui::GetTextLineHeight() * 0.92f;
     const float iconGap = 4.0f * sc;
-    IconUV icon = (iconName && iconName[0]) ? ui::getIcon(iconName, 20) : IconUV{};
-    const bool haveIcon = icon.valid;
-    const float padX = (haveIcon ? 6.0f : 8.0f) * sc;
+    const bool haveIcon = iconName && iconName[0];
+    const float padX = 6.0f * sc;
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImVec4 bg = active
-        ? ImVec4(ui::palette.chipBg[0], ui::palette.chipBg[1], ui::palette.chipBg[2],
-                 ui::palette.chipBg[3])
-        : ImVec4(txt.x, txt.y, txt.z, h.held ? 0.22f : (h.hovered ? 0.14f : 0.06f));
-    dl->AddRectFilled(h.rect.Min, h.rect.Max, ImGui::ColorConvertFloat4ToU32(bg), round);
-    dl->AddRect(h.rect.Min, h.rect.Max,
-                ImGui::ColorConvertFloat4ToU32(
-                    ImVec4(txt.x, txt.y, txt.z, active ? 0.45f : 0.25f)),
-                round, 0, ui::metrics::stroke(1.0f));
+    // Navigation is flat at rest: only the current view and hovered actions carry a wash.
+    if (active || h.hovered || h.held) {
+        const ImVec4 bg = active
+            ? ImVec4(ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], 0.12f)
+            : ImVec4(txt.x, txt.y, txt.z, h.held ? 0.14f : 0.06f);
+        dl->AddRectFilled(h.rect.Min, h.rect.Max, ImGui::ColorConvertFloat4ToU32(bg), round);
+    }
+    if (active) {
+        const float inset = ui::metrics::px(6.0f);
+        const float y = h.rect.Max.y - ui::metrics::stroke(1.0f);
+        dl->AddLine(ImVec2(h.rect.Min.x + inset, y), ImVec2(h.rect.Max.x - inset, y),
+                    ImGui::ColorConvertFloat4ToU32(semanticOnGlass(ui::palette.accent, surf)),
+                    ui::metrics::stroke(1.5f));
+    }
 
     // withLabel=false is the narrow-column pill: the icon centres in the box on its own and
     // the tooltip carries the name. Never squeeze the label in — draw-list text is not clipped
@@ -3307,16 +3404,13 @@ void headerTextButtonPaint(const HeaderBtnHit& h, const char* label, bool active
     const float labelW = withLabel ? ImGui::CalcTextSize(label).x : 0.0f;
     const float contentW = (haveIcon ? iconSz + (withLabel ? iconGap : 0.0f) : 0.0f) + labelW;
     float x = withLabel ? (h.rect.Min.x + padX)
-                        : std::max(h.rect.Min.x + padX,
-                                   (h.rect.Min.x + h.rect.Max.x) * 0.5f - contentW * 0.5f);
+                        : (h.rect.Min.x + h.rect.Max.x - contentW) * 0.5f;
     if (haveIcon) {
         const ImVec4 tint = active ? surf.textPrimary
                                    : ImVec4(surf.textSecondary.x, surf.textSecondary.y,
                                             surf.textSecondary.z, 0.95f);
-        dl->AddImage(icon.texId,
-                     ImVec2(x, midY - iconSz * 0.5f),
-                     ImVec2(x + iconSz, midY + iconSz * 0.5f),
-                     icon.uv0, icon.uv1, ImGui::ColorConvertFloat4ToU32(tint));
+        ui::drawIconGlass(dl, iconName, ImVec2(x + iconSz * 0.5f, midY), iconSz,
+                          ImGui::ColorConvertFloat4ToU32(tint), 0);
         x += iconSz + iconGap;
     }
     if (!withLabel) return;
@@ -3381,8 +3475,16 @@ bool cancelEditStage(AppState& st) {
     }
     const bool viewed = st.activeConvId() == s_edit.convId;
     const std::string saved = std::move(s_edit.savedPrompt);
+    if (viewed) {
+        st.pendingAttachments = std::move(s_edit.savedAttachments);
+        st.pendingInlineImagePaths = std::move(s_edit.savedImages);
+        st.pendingContextRefs = std::move(s_edit.savedContextRefs);
+    }
     s_edit = EditStage{};
-    if (viewed) composerSetText(st, saved);
+    if (viewed) {
+        composerSetText(st, saved);
+        savePromptDraft(st, /*force=*/true);
+    }
     return true;
 }
 
@@ -3412,7 +3514,7 @@ void beginEditStage(AppState& st, int msgIdx) {
         if (!cancelEditStage(st)) return;
     }
     const std::string target = chudcodeEditTypedText(st.chat[msgIdx].text);
-    if (target.empty()) {
+    if (target.empty() && st.chat[msgIdx].imagePaths.empty()) {
         st.toast(ui::ToastLevel::Info, "This message has no text to edit.");
         return;
     }
@@ -3428,8 +3530,37 @@ void beginEditStage(AppState& st, int msgIdx) {
     s_edit.msgIdx = msgIdx;
     s_edit.targetText = target;
     s_edit.occurrence = chudcodeEditOccurrence(earlier, target);
-    s_edit.savedPrompt = st.prompt.empty() ? std::string() : std::string(st.prompt.data());
-    composerSetText(st, target);
+    s_edit.savedPrompt = composerText(st);
+    s_edit.savedAttachments = std::move(st.pendingAttachments);
+    s_edit.savedImages = std::move(st.pendingInlineImagePaths);
+    s_edit.savedContextRefs = std::move(st.pendingContextRefs);
+    st.pendingAttachments.clear();
+    st.pendingContextRefs = st.chat[msgIdx].contextRefs;
+    st.pendingInlineImagePaths = st.chat[msgIdx].imagePaths;
+    // New messages retain every numbered reference exactly where it was authored. Legacy
+    // image markers are converted in stored roster order, never looked up by basename.
+    std::string editable = st.chat[msgIdx].text;
+    const size_t fileRoster = editable.rfind("\n[attached:");
+    if (fileRoster != std::string::npos && editable.find('\n', fileRoster + 1) == std::string::npos &&
+        editable.back() == ']')
+        editable.erase(fileRoster);
+    if (ui::copilot::inlineImageRefs(editable, st.pendingInlineImagePaths.size()).empty()) {
+        size_t pos = 0, image = 0;
+        while (image < st.pendingInlineImagePaths.size() &&
+               (pos = editable.find("[attached image:", pos)) != std::string::npos) {
+            const size_t end = editable.find(']', pos);
+            if (end == std::string::npos) break;
+            const std::string marker = ui::copilot::inlineImageMarker(image++);
+            editable.replace(pos, end - pos + 1, marker);
+            pos += marker.size();
+        }
+        for (; image < st.pendingInlineImagePaths.size(); ++image) {
+            if (!editable.empty()) editable += "\n";
+            editable += ui::copilot::inlineImageMarker(image);
+        }
+    }
+    composerSetText(st, editable);
+    savePromptDraft(st, /*force=*/true);
 }
 
 static void editStageStartRollback(AppState& st);
@@ -3453,7 +3584,12 @@ static void editStageStart(AppState& st) {
     s_edit.gen = ++s_editGen;
     s_edit.phase = EditPhase::Rewinding;
     const ChudcodeSessionLink* link = chudcodeSessionLink(s_edit.convId);
-    if (!link || (link->sessionFile.empty() && !link->runtimeLive)) {
+#ifdef __EMSCRIPTEN__
+    const bool hasHistory = link && !link->sessionId.empty();
+#else
+    const bool hasHistory = link && (!link->sessionFile.empty() || link->runtimeLive);
+#endif
+    if (!hasHistory) {
         editStageStartRollback(st);
         return;
     }
@@ -3561,12 +3697,17 @@ static void editStageCommit(AppState& st) {
                  "The edited conversation no longer exists \xe2\x80\x94 nothing was sent.");
         return;
     }
-    if (!s_edit.newSessionFile.empty()) {
-        ChudcodeSessionLink& link = chudcodeSessionLinkEnsure(s_edit.convId);
+#ifdef __EMSCRIPTEN__
+    const bool hasBranch = !s_edit.newSessionId.empty();
+#else
+    const bool hasBranch = !s_edit.newSessionFile.empty();
+#endif
+    if (hasBranch) {
+        ChudcodeSessionLink link;
         link.sessionId = s_edit.newSessionId;
         link.sessionFile = s_edit.newSessionFile;
-        link.health.clear();       // a new file: its doctor verdict is unknown
-        link.runtimeLive = false;  // the next turn resumes the branch from its file
+        // The next turn resumes the branch; no previous health verdict carries.
+        chudcodeSessionLinkSet(s_edit.convId, std::move(link));
     }
     const int parked = (int)msgs->size() - s_edit.msgIdx;
     parkConversationTail(st, s_edit.convId, s_edit.msgIdx,
@@ -3583,6 +3724,10 @@ static void editStageLaunchIfViewed(AppState& st) {
     if (st.convRunning(s_edit.convId)) return;
     const std::string text = s_edit.editedText;
     const bool geometry = s_edit.geometryRolledBack;
+    st.pendingAttachments = std::move(s_edit.editedAttachments);
+    st.pendingInlineImagePaths = std::move(s_edit.editedImages);
+    st.pendingContextRefs = std::move(s_edit.editedContextRefs);
+    composerSetText(st, text);
     s_edit = EditStage{};   // release the composer before submitting
     const size_t before = st.chat.size();
     submitTurn(st, text);
@@ -3606,6 +3751,9 @@ void editStageSubmit(AppState& st, const std::string& text) {
         st.activeConvId() != s_edit.convId || text.empty())
         return;
     s_edit.editedText = text;
+    s_edit.editedAttachments = st.pendingAttachments;
+    s_edit.editedImages = st.pendingInlineImagePaths;
+    s_edit.editedContextRefs = st.pendingContextRefs;
     s_edit.sendRequested = true;
     s_edit.docId = aiVcActiveDocId(st);
     if (aiTurnActive(st)) requestStopRun(st);

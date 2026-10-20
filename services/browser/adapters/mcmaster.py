@@ -53,7 +53,7 @@ import re
 import urllib.parse
 
 from .. import session as _session
-from . import (download_dir, is_login_wall, login_required, provenance_envelope,
+from . import (download_path, is_login_wall, login_required, provenance_envelope,
               register, terms_confirmation_required)
 
 SITE = "mcmaster"
@@ -300,8 +300,11 @@ class McMasterAdapter:
                             f"model or the session expired — run vendor_login('mcmaster')"}
 
         download_url = BASE_URL + urllib.parse.quote(file_path)
-        filename = (file_path.rsplit("/", 1)[-1] or f"{part_number}.step")
-        dest = download_dir(SITE) / filename
+        dest, refusal = download_path(
+            SITE, download_url, default=f"{part_number}.step",
+            filename=file_path.rsplit("/", 1)[-1] or None)
+        if refusal is not None:
+            return refusal
         outcome = _session.browser_download(download_url, SITE, dest)
         if not outcome.get("ok"):
             return outcome
@@ -311,7 +314,7 @@ class McMasterAdapter:
             session_profile_used=outcome.get("session_profile_used", SITE),
             license_note=LICENSE_NOTE,
             artifact_path=outcome["dest"],
-            title=result.get("title", "") or filename,
+            title=result.get("title", "") or dest.name,
             sku=part_number,
             price=(f"${price_match.group('price')}"
                    if (price_match := _PRICE_RE.search(html_dom)) else None),

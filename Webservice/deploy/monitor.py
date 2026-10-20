@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -377,6 +378,8 @@ def install_observability() -> dict[str, Any]:
         mode=0o644,
     )
     _write_private(token_file, metrics_token + "\n")
+    if any(char in grafana_password for char in "\r\n\x00"):
+        raise RuntimeError("Grafana password must fit one environment-file value")
     _write_private(
         grafana_datasource,
         "apiVersion: 1\n"
@@ -418,34 +421,39 @@ def install_observability() -> dict[str, Any]:
             "--web.listen-address=127.0.0.1:9090",
         ]
     )
-    _podman(
-        [
-            "run",
-            "-d",
-            "--replace",
-            "--name",
-            "chudware-grafana",
-            "--network",
-            "host",
-            "--restart",
-            "unless-stopped",
-            "-e",
-            "GF_SERVER_HTTP_ADDR=127.0.0.1",
-            "-e",
-            "GF_SECURITY_ADMIN_USER=admin",
-            "-e",
-            f"GF_SECURITY_ADMIN_PASSWORD={grafana_password}",
-            "-e",
-            "GF_USERS_ALLOW_SIGN_UP=false",
-            "-e",
-            "GF_SERVER_HTTP_PORT=3000",
-            "-v",
-            f"{grafana_datasource.parent.parent}:/etc/grafana/provisioning:ro,Z",
-            "-v",
-            "chudware-grafana-data:/var/lib/grafana:Z",
-            GRAFANA_IMAGE,
-        ]
-    )
+    # Podman consumes this file when creating the container; restarts use the
+    # saved container configuration, not the host-side delivery file.
+    with tempfile.TemporaryDirectory(prefix=".grafana-", dir=OBS_ROOT) as private:
+        grafana_env = Path(private) / "grafana.env"
+        _write_private(grafana_env, f"GF_SECURITY_ADMIN_PASSWORD={grafana_password}\n")
+        _podman(
+            [
+                "run",
+                "-d",
+                "--replace",
+                "--name",
+                "chudware-grafana",
+                "--network",
+                "host",
+                "--restart",
+                "unless-stopped",
+                "-e",
+                "GF_SERVER_HTTP_ADDR=127.0.0.1",
+                "-e",
+                "GF_SECURITY_ADMIN_USER=admin",
+                "--env-file",
+                str(grafana_env),
+                "-e",
+                "GF_USERS_ALLOW_SIGN_UP=false",
+                "-e",
+                "GF_SERVER_HTTP_PORT=3000",
+                "-v",
+                f"{grafana_datasource.parent.parent}:/etc/grafana/provisioning:ro,Z",
+                "-v",
+                "chudware-grafana-data:/var/lib/grafana:Z",
+                GRAFANA_IMAGE,
+            ]
+        )
     rc, out, err = _run(
         ["systemctl", "--user", "enable", "--now", "podman-restart.service"]
     )

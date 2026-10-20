@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Idempotently describe the production Chudware Cloudflare topology.
 
-The tunnel serves the portal and staging gateway. The public marketing apex/www
-live on Cloudflare Pages. This script provisions NO Cloudflare Access
+The tunnel serves the portal; staging stays unpublished unless explicitly selected.
+The public marketing apex/www live on Cloudflare Pages. This script provisions NO Cloudflare Access
 application: the door to ``app.chudware.com/admin`` is the gateway's own
 session cookie plus ``accounts.role == 'admin'``, granted by
 ``python -m authn grant-admin``. Fronting ``/admin*`` with Access meant the
@@ -124,10 +124,47 @@ def _upsert_cname(zones: list[dict], hostname: str, target: str) -> None:
         api("POST", f"/zones/{zone['id']}/dns_records", body)
     print(f"dns: {hostname} CNAME {target} (proxied)")
 
+def configure_ingress(tunnel_id: str, publish_staging: bool) -> None:
+    path = f"/accounts/{ACCOUNT_ID}/cfd_tunnel/{tunnel_id}/configurations"
+    current = api("GET", path)
+    if not isinstance(current, dict) or not isinstance(current.get("config", {}), dict):
+        sys.exit("invalid existing tunnel configuration; refusing to replace it")
+    config = dict(current.get("config", {}))
+    previous = config.get("ingress", [])
+    if not isinstance(previous, list) or any(not isinstance(row, dict) for row in previous):
+        sys.exit("invalid existing tunnel ingress; refusing to replace it")
+    managed = {PORTAL_HOST, STAGING_HOST}
+    foreign = [
+        row for row in previous
+        if row.get("hostname") not in managed and (row.get("hostname") or row.get("path"))
+    ]
+    fallbacks = [row for row in previous if not row.get("hostname") and not row.get("path")]
+    if len(fallbacks) > 1:
+        sys.exit("ambiguous tunnel fallback; refusing to replace it")
+    ingress = [{"hostname": PORTAL_HOST, "service": PRODUCTION_SERVICE}]
+    if publish_staging:
+        ingress.append({"hostname": STAGING_HOST, "service": STAGING_SERVICE})
+    config["ingress"] = ingress + foreign + (fallbacks or [{"service": "http_status:404"}])
+    api("PUT", path, {"config": config})
+
+
+def remove_staging_dns(zones: list[dict], target: str) -> None:
+    zone = _zone(zones, STAGING_HOST)
+    records = api("GET", f"/zones/{zone['id']}/dns_records?name={STAGING_HOST}")
+    if not isinstance(records, list):
+        sys.exit("invalid staging DNS response")
+    for record in records:
+        if record.get("type") == "CNAME" and record.get("content") == target:
+            api("DELETE", f"/zones/{zone['id']}/dns_records/{record['id']}")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pages-project", default=PAGES_PROJECT)
+    parser.add_argument(
+        "--publish-staging", action="store_true",
+        help="explicitly publish the isolated staging gateway; private by default",
+    )
     args = parser.parse_args()
 
     tunnels = api("GET", f"/accounts/{ACCOUNT_ID}/cfd_tunnel?is_deleted=false")
@@ -140,21 +177,18 @@ def main() -> None:
     tunnel_id = tunnel["id"]
     print(f"tunnel {TUNNEL_NAME}: {tunnel_id}")
 
-    ingress = [
-        {"hostname": PORTAL_HOST, "service": PRODUCTION_SERVICE},
-        {"hostname": STAGING_HOST, "service": STAGING_SERVICE},
-        {"service": "http_status:404"},
-    ]
-    api("PUT", f"/accounts/{ACCOUNT_ID}/cfd_tunnel/{tunnel_id}/configurations", {"config": {"ingress": ingress}})
-    print(f"ingress: {PORTAL_HOST} -> {PRODUCTION_SERVICE}")
-    print(f"ingress: {STAGING_HOST} -> {STAGING_SERVICE}")
-    print("ingress: catch-all -> 404")
+    configure_ingress(tunnel_id, args.publish_staging)
+    print(f"ingress: {PORTAL_HOST} -> {PRODUCTION_SERVICE}; unrelated routes preserved")
+    print(f"staging: {'published explicitly' if args.publish_staging else 'unpublished'}")
 
     zones = api("GET", "/zones")
     assert isinstance(zones, list)
     tunnel_target = f"{tunnel_id}.cfargotunnel.com"
     _upsert_cname(zones, PORTAL_HOST, tunnel_target)
-    _upsert_cname(zones, STAGING_HOST, tunnel_target)
+    if args.publish_staging:
+        _upsert_cname(zones, STAGING_HOST, tunnel_target)
+    else:
+        remove_staging_dns(zones, tunnel_target)
     pages_target = f"{args.pages_project}.pages.dev"
     for hostname in PAGES_HOSTS:
         _upsert_cname(zones, hostname, pages_target)

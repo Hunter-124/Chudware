@@ -14,6 +14,25 @@ Public API
   ``services/agent/plm_bridge.py`` (T-W18) imports (contract §7.1).
 
 The ``plm_*`` MCP tools live in ``services/mcp/plm_tools.py``.
+
+Security boundaries (2026-10 integration audit)
+--------------------------------------------
+Remote destinations must be approved locally with ``remote.add_remote``.
+Approval lives in unversioned vault ``config.json``; a pulled manifest changing
+the kind/URL is refused by sync, locks and live joins until explicitly approved.
+Pre-existing destinations also need this one-time local approval; credentials
+must never appear in URL userinfo, query tokens or versioned remote fields.
+Rotate credentials previously shared in history (history is not rewritten).
+
+Git uses validated names/revisions, fixed transport schemes, a minimal process
+environment and disabled hooks/fsmonitor/external diff. Reserved project control
+paths cannot be tracked/restored. Snapshot attachment budgets are 4096 members,
+64 MiB/member, 256 MiB expanded aggregate and 1000:1 compression ratio; solved
+state is skipped without opening it, leaving warm live caches untouched.
+Box mirrors regular files through no-follow directory/file handles, hashing and
+uploading the same bounded verified bytes. Live relays require a bearer token
+even on loopback; native clients omit Origin and browser clients require an exact
+``LivePlmServer.allowed_origins`` / CLI ``--origin`` allowlist.
 """
 from __future__ import annotations
 

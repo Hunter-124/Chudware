@@ -4,9 +4,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <windows.h>
+#include "../ipc/ipc_windows_local.h"
 #elif !defined(__EMSCRIPTEN__)
 #include <fcntl.h>
 #include <poll.h>
@@ -772,44 +771,7 @@ bool sameCanonicalPath(const std::string &left, const std::string &right) {
   return !leftEc && !rightEc && canonicalLeft == canonicalRight;
 }
 #if !defined(__EMSCRIPTEN__)
-#ifdef _WIN32
-using WorkerControlSocket = SOCKET;
-constexpr WorkerControlSocket kInvalidWorkerControlSocket = INVALID_SOCKET;
-void closeWorkerControlSocket(WorkerControlSocket socket) {
-  if (socket != kInvalidWorkerControlSocket)
-    closesocket(socket);
-}
-int workerControlSocketError() { return WSAGetLastError(); }
-bool workerControlConnectPending(int error) {
-  return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS ||
-         error == WSAEINVAL;
-}
-bool workerControlWouldBlock(int error) {
-  return error == WSAEWOULDBLOCK;
-}
-bool workerControlInterrupted(int error) { return error == WSAEINTR; }
-bool setWorkerControlNonblocking(WorkerControlSocket socket) {
-  u_long enabled = 1;
-  return ioctlsocket(socket, FIONBIO, &enabled) == 0;
-}
-bool ensureWorkerControlSockets(std::string &err) {
-  struct WinsockLifetime {
-    bool ready = false;
-    WinsockLifetime() {
-      WSADATA data{};
-      ready = WSAStartup(MAKEWORD(2, 2), &data) == 0;
-    }
-    ~WinsockLifetime() {
-      if (ready)
-        WSACleanup();
-    }
-  };
-  static WinsockLifetime lifetime;
-  if (!lifetime.ready)
-    err = "worker control socket initialization failed";
-  return lifetime.ready;
-}
-#else
+#ifndef _WIN32
 using WorkerControlSocket = int;
 constexpr WorkerControlSocket kInvalidWorkerControlSocket = -1;
 void closeWorkerControlSocket(WorkerControlSocket socket) {
@@ -832,7 +794,6 @@ bool setWorkerControlNonblocking(WorkerControlSocket socket) {
          fcntl(socket, F_SETFD, descriptorFlags | FD_CLOEXEC) == 0;
 }
 bool ensureWorkerControlSockets(std::string &) { return true; }
-#endif
 
 class WorkerControlSocketHandle {
 public:
@@ -872,22 +833,10 @@ bool waitWorkerControlSocket(WorkerControlSocket socket, bool writable,
       err = "worker control request timed out";
       return false;
     }
-#ifdef _WIN32
-    fd_set set;
-    FD_ZERO(&set);
-    FD_SET(socket, &set);
-    timeval timeout{};
-    timeout.tv_sec = timeoutMs / 1000;
-    timeout.tv_usec = (timeoutMs % 1000) * 1000;
-    const int ready =
-        select(0, writable ? nullptr : &set, writable ? &set : nullptr, nullptr,
-               &timeout);
-#else
     pollfd descriptor{};
     descriptor.fd = socket;
     descriptor.events = writable ? POLLOUT : POLLIN;
     const int ready = ::poll(&descriptor, 1, timeoutMs);
-#endif
     if (ready > 0)
       return true;
     if (ready == 0) {
@@ -907,16 +856,6 @@ bool connectWorkerControlSocket(
     std::string &err) {
   if (!ensureWorkerControlSockets(err))
     return false;
-#ifdef _WIN32
-  if (info.transport != chudware::worker::detail::ControlTransport::Tcp) {
-    err = "worker control transport is unavailable";
-    return false;
-  }
-  const auto colon = info.endpoint.rfind(':');
-  const unsigned short port = static_cast<unsigned short>(
-      std::strtoul(info.endpoint.c_str() + colon + 1, nullptr, 10));
-  WorkerControlSocket socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-#else
   if (info.transport != chudware::worker::detail::ControlTransport::Unix) {
     err = "worker control transport is unavailable";
     return false;
@@ -925,7 +864,6 @@ bool connectWorkerControlSocket(
   WorkerControlSocket socket = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 #else
   WorkerControlSocket socket = ::socket(AF_UNIX, SOCK_STREAM, 0);
-#endif
 #endif
   if (socket == kInvalidWorkerControlSocket) {
     err = "worker control socket creation failed";
@@ -944,31 +882,18 @@ bool connectWorkerControlSocket(
     err = "worker control socket setup failed";
     return false;
   }
-#ifdef _WIN32
-  sockaddr_in address{};
-  address.sin_family = AF_INET;
-  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  address.sin_port = htons(port);
-  const int status =
-      ::connect(socket, reinterpret_cast<sockaddr *>(&address), sizeof(address));
-#else
   sockaddr_un address{};
   address.sun_family = AF_UNIX;
   std::memcpy(address.sun_path, info.endpoint.c_str(), info.endpoint.size() + 1);
   const int status =
       ::connect(socket, reinterpret_cast<sockaddr *>(&address), sizeof(address));
-#endif
   if (status != 0) {
     const int connectError = workerControlSocketError();
     if (!workerControlConnectPending(connectError) ||
         !waitWorkerControlSocket(socket, true, deadline, err))
       return false;
     int completionError = 0;
-#ifdef _WIN32
-    int completionSize = sizeof(completionError);
-#else
     socklen_t completionSize = sizeof(completionError);
-#endif
     if (getsockopt(socket, SOL_SOCKET, SO_ERROR,
                    reinterpret_cast<char *>(&completionError),
                    &completionSize) != 0 ||
@@ -980,10 +905,23 @@ bool connectWorkerControlSocket(
   connected = guard.release();
   return true;
 }
+#endif
 
 bool exchangeWorkerControl(
     const chudware::worker::detail::ControlInfo &info, std::string &request,
     std::string &response, std::string &err) {
+#ifdef _WIN32
+  if (info.transport != chudware::worker::detail::ControlTransport::NamedPipe) {
+    err = "worker control transport is unavailable";
+    return false;
+  }
+  const bool ok = chudware_ipc::exchangeLocalPipe(
+      info.endpoint, request, response,
+      chudware::worker::detail::kControlResponseLimit,
+      chudware::worker::detail::kControlTimeoutMs, err);
+  chudware::worker::detail::secureClear(request);
+  return ok;
+#else
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(
                             chudware::worker::detail::kControlTimeoutMs);
@@ -995,11 +933,6 @@ bool exchangeWorkerControl(
   while (sent < request.size()) {
     if (!waitWorkerControlSocket(socket, true, deadline, err))
       return false;
-#ifdef _WIN32
-    const int wrote =
-        ::send(socket, request.data() + sent,
-               static_cast<int>(request.size() - sent), 0);
-#else
 #ifdef MSG_NOSIGNAL
     const ssize_t wrote =
         ::send(socket, request.data() + sent, request.size() - sent,
@@ -1007,7 +940,6 @@ bool exchangeWorkerControl(
 #else
     const ssize_t wrote =
         ::send(socket, request.data() + sent, request.size() - sent, 0);
-#endif
 #endif
     if (wrote > 0) {
       sent += static_cast<std::size_t>(wrote);
@@ -1027,11 +959,7 @@ bool exchangeWorkerControl(
   for (;;) {
     if (!waitWorkerControlSocket(socket, false, deadline, err))
       return false;
-#ifdef _WIN32
-    const int received = ::recv(socket, chunk, sizeof(chunk), 0);
-#else
     const ssize_t received = ::recv(socket, chunk, sizeof(chunk), 0);
-#endif
     if (received > 0) {
       const char *newline = static_cast<const char *>(
           std::memchr(chunk, '\n', static_cast<std::size_t>(received)));
@@ -1059,6 +987,7 @@ bool exchangeWorkerControl(
     err = "worker control receive failed";
     return false;
   }
+#endif
 }
 #endif
 
@@ -1149,6 +1078,9 @@ bool WorkerClient::callWorkerControl(const std::string &action,
                                      const json &params, bool &matched,
                                      json &result, std::string &err) {
   matched = false;
+  // Daemon turns belong to hostd's worker pool, not this local pipe endpoint.
+  if (engine::daemonMode())
+    return false;
   WorkerControlInfo info;
   {
     std::lock_guard<std::mutex> lock(workerControlMtx_);
@@ -1186,15 +1118,10 @@ bool WorkerClient::callWorkerControl(const std::string &action,
                                                      result, err))
     return true;
 
-  // A failed private connection is stale for this worker generation. Keep the
-  // active run marker until its terminal stdio response so a second Stop never
-  // falls through to a concurrent read of that stream.
-  std::lock_guard<std::mutex> lock(workerControlMtx_);
-  if (workerControl_.endpoint == info.endpoint &&
-      workerControl_.token == info.token) {
-    chudware::worker::detail::secureClear(workerControl_.token);
-    workerControl_ = {};
-  }
+  // Private connections are independent of the worker's endpoint lifetime. A
+  // refusal, timeout, or malformed/closed response does not prove replacement.
+  // Keep the endpoint until worker teardown so the next answer/Stop can use it
+  // without fetching control info behind the active turn on stdio.
   return false;
 #endif
 }
@@ -1837,8 +1764,9 @@ bool WorkerClient::call(const std::string &method, const json &params,
 }
 
 bool WorkerClient::callAgentCancel(const std::string &runId, json &result,
-                                   std::string &err) {
-  const json params{{"run_id", runId}};
+                                   std::string &err, const std::string &provider) {
+  json params{{"run_id", runId}};
+  if (!provider.empty()) params["provider"] = provider;
   bool matched = false;
   if (callWorkerControl("cancel", runId, params, matched, result, err))
     return true;
@@ -1849,11 +1777,15 @@ bool WorkerClient::callAgentCancel(const std::string &runId, json &result,
 
 bool WorkerClient::callAgentSteer(const std::string &runId,
                                   const std::string &text,
-                                  const json &attachments, json &result,
-                                  std::string &err) {
+                                  const json &attachments,
+                                  const std::string &steerId, json &result,
+                                  std::string &err, const std::string &provider) {
   json params{{"run_id", runId}, {"text", text}};
+  if (!provider.empty()) params["provider"] = provider;
   if (attachments.is_array() && !attachments.empty())
     params["attachments"] = attachments;
+  if (!steerId.empty())
+    params["steer_id"] = steerId;
   bool matched = false;
   if (callWorkerControl("steer", runId, params, matched, result, err))
     return true;
@@ -1865,8 +1797,10 @@ bool WorkerClient::callAgentSteer(const std::string &runId,
 bool WorkerClient::callAgentAnswer(const std::string &runId,
                                    const std::string &batchId,
                                    const json &answers, bool declined,
-                                   json &result, std::string &err) {
+                                   json &result, std::string &err,
+                                   const std::string &provider) {
   json params{{"run_id", runId}, {"batch_id", batchId}};
+  if (!provider.empty()) params["provider"] = provider;
   if (declined)
     params["declined"] = true;
   else
@@ -1939,6 +1873,11 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
   const bool isAgentControl =
       (method == "agent_cancel" || method == "agent_steer" ||
        method == "agent_answer");
+#ifdef __EMSCRIPTEN__
+  // Browser controls must share the cell admission guard, not native side sockets.
+  if (isAgentControl)
+    return engine::call(method, params, result, err, timeoutMs, onEvent);
+#endif
   const bool isCppSimCancel =
       (method == "sim_cancel" && routeSimToCpp(method, params));
   auto *sharedClient = engine::daemonMode() ? engine::client() : nullptr;
@@ -1947,31 +1886,21 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
   // before the independent socket is reached (notably doc_new behind model probes).
   const bool backgroundQuery =
       sharedClient && sharedClient->usesBackgroundConnection(method, params);
+  const bool daemonAgentTurn =
+      method == "agent_admin_turn" && engine::daemonMode();
   const bool bypassCallMutex =
-      isAgentControl || isCppSimCancel || backgroundQuery;
-  // The long streaming runs keep full serialization among themselves, per lane:
-  // two agent runs must never overlap (they would interleave ops on the same doc
-  // in the daemon), and simulation solves share engine_backend's single
-  // simulation connection. engine::runLane is the one classifier both layers use.
+      isAgentControl || isCppSimCancel || backgroundQuery || daemonAgentTurn;
   const engine::RunLane lane = engine::runLane(method);
   const bool isLongRun = lane != engine::RunLane::None;
-  // In daemon mode a long run needs nothing callMtx_ guards: it streams on its
-  // lane's dedicated connection, and an agent run's worker-control state has its
-  // own mutex. Holding callMtx_ for a turn or a solve that lives for hours parked
-  // EVERY other call on this client behind it — any worker-routed call
-  // (subscription_*, chudcode_*, plm_*) queued on the GUI's single-FIFO st.rpc
-  // lane blocked in lk.lock() below, and every later
-  // doc_activate/doc_tree/doc_snapshot waited behind that one forever: a tab
-  // click showed "Loading" for the whole turn (2026-09-27). So a daemon-mode
-  // agent run serializes on longRunMtx_ only, and a simulation-lane call on the
-  // process-wide g_simLaneMtx only: separate mutexes, so a chat turn and a solve
-  // never wait for each other. Pipe mode keeps callMtx_: the Python stdio pipe
-  // carries one request at a time. So does a run whose OWN lane connection could
-  // not open (an agent run would hold the shared connection instead; a simulation
-  // call fails at once), which is also why such a run never takes the engine-bound
-  // side channel below.
-  const bool daemonLongRun = isLongRun && engine::daemonMode() &&
-                             engine::runConnectionReady(lane);
+  // Dedicated daemon connections keep long calls off the GUI document socket.
+  // Native runs use longRunMtx_ and simulations use g_simLaneMtx, independently.
+  // Online daemon turns take neither lane mutex nor callMtx_: each leases its
+  // own agent connection and control goes through hostd by run_id.
+  // Pipe mode still holds callMtx_ because stdio carries one request at a time.
+  // Native runs whose private connection cannot open also keep callMtx_ for
+  // their shared-connection fallback.
+  const bool daemonLongRun = isLongRun && !daemonAgentTurn &&
+                             engine::daemonMode() && engine::runConnectionReady(lane);
   std::mutex &laneMtx =
       lane == engine::RunLane::Sim ? g_simLaneMtx : longRunMtx_;
   std::unique_lock<std::mutex> lk(daemonLongRun ? laneMtx : callMtx_,
@@ -2447,37 +2376,14 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
   const bool routeViaEngine = engine::daemonMode();
 #endif
   if (routeViaEngine) {
-    std::string workerRunId;
-    bool workerAgentRun = false;
 #if !defined(__EMSCRIPTEN__)
-    workerAgentRun = method == "agent_admin_turn";
-    if (workerAgentRun) {
-      workerRunId = params.is_object()
-                        ? params.value("run_id", std::string())
-                        : std::string();
-      if (workerRunId.empty()) {
-        err = "agent_admin_turn requires a non-empty run_id";
-        return false;
-      }
-      // hostd may have restarted its worker since the preceding run. Refresh
-      // through WorkerBridge before every daemon-backed long call; the private
-      // endpoint itself is then used directly for mid-call control.
-      clearWorkerControlInfo();
-      json info;
-      std::string controlErr;
-      if (!engine::call("worker_control_info", json::object(), info,
-                        controlErr, 5000) ||
-          !installWorkerControlInfo(info, controlErr)) {
-        err = controlErr.empty() ? "worker control info unavailable"
-                                 : controlErr;
-        clearWorkerControlInfo();
-        return false;
-      }
+    if (method == "agent_admin_turn" &&
+        (!params.is_object() ||
+         params.value("run_id", std::string()).empty())) {
+      err = "agent_admin_turn requires a non-empty run_id";
+      return false;
     }
 #endif
-    ActiveWorkerRunMarker activeWorkerRun(
-        workerControlMtx_, activeWorkerRunId_, std::move(workerRunId),
-        workerAgentRun);
     std::string cerr;
     if (engine::call(method, params, result, cerr, timeoutMs, onEvent))
       return true;

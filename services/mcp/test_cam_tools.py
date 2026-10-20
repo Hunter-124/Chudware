@@ -794,10 +794,8 @@ def test_cam_undo_redo_changes_field(monkeypatch):
 
 
 def test_cam_save_resolves_path_and_confirms_write(tmp_path, monkeypatch):
-    """T-fix: cam_save must resolve a relative `path` against THIS process's cwd (via
-    _sanitize_output_path — same convention as cad_exchange_tools/cad_drawing_tools),
-    not whatever cwd the engine daemon happens to run under, and the response must
-    prove the file actually landed there (exists + size), not just echo the input."""
+    """cam_save resolves a relative path against the selected workspace, not either
+    process's cwd, and confirms that the file actually landed there."""
     from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP
 
@@ -812,7 +810,10 @@ def test_cam_save_resolves_path_and_confirms_write(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ct.cb, "call", fake_call)
     monkeypatch.setitem(ct._CAM, "doc_id", "doc-1")
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    monkeypatch.chdir(worker)
 
     mcp = FastMCP("test-cam-save")
     ct.register_cam_tools(mcp)
@@ -823,6 +824,7 @@ def test_cam_save_resolves_path_and_confirms_write(tmp_path, monkeypatch):
     assert out.get("exists") is True, out
     assert out.get("size_bytes") == len(b"CAMDATA"), out
     assert expected in out.get("changes", "") and "7 bytes" in out.get("changes", ""), out
+    assert list(worker.iterdir()) == []
 
 
 def test_cam_open_changes_field(monkeypatch, tmp_path):
@@ -840,6 +842,7 @@ def test_cam_open_changes_field(monkeypatch, tmp_path):
     monkeypatch.setattr(ct.cb, "call", fake_call)
     monkeypatch.setitem(ct._CAM, "doc_id", None)
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
 
     mcp = FastMCP("test-cam-open")
     ct.register_cam_tools(mcp)

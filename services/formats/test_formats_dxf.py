@@ -11,6 +11,7 @@ import pytest
 ezdxf = pytest.importorskip("ezdxf")
 
 from services.formats.formats import import_path, list_formats  # noqa: E402
+from services.formats import formats_dxf  # noqa: E402
 
 
 def _write(tmp_path, build) -> str:
@@ -130,3 +131,150 @@ def test_dxf_detected_by_extension(tmp_path):
     p = _write(tmp_path, lambda msp: msp.add_circle((0, 0), 1.0))
     bodies = import_path(p, format=None)
     assert len(bodies) == 1 and len(bodies[0][1].faces()) == 1
+
+
+def _no_expansion(*args, **kwargs):
+    raise AssertionError("unadmitted DXF reached virtual-entity generation")
+
+
+def _nested_blocks_doc(depth):
+    doc = ezdxf.new(units=4)
+    blocks = [doc.blocks.new(name=f"LEVEL_{i}") for i in range(depth)]
+    for i, block in enumerate(blocks[:-1]):
+        block.add_blockref(blocks[i + 1].name, (1, 0))
+    blocks[-1].add_line((0, 0), (1, 0))
+    doc.modelspace().add_blockref(blocks[0].name, (1, 0))
+    return doc
+
+
+def test_nested_minsert_preserves_every_world_placement_under_nonuniform_scale(tmp_path):
+    doc = ezdxf.new(units=4)
+    unit = doc.blocks.new(name="UNIT")
+    unit.add_line((0, 0), (1, 0))
+    grid = doc.blocks.new(name="GRID")
+    grid.add_blockref("UNIT", (3, 4), dxfattribs={
+        "rotation": 45, "row_count": 2, "column_count": 2,
+        "row_spacing": 10, "column_spacing": 20,
+    })
+    doc.modelspace().add_blockref("GRID", (100, 200), dxfattribs={
+        "xscale": 2, "yscale": 1,
+    })
+    # An unreachable cyclic definition does not invalidate ordinary geometry.
+    unused = doc.blocks.new(name="UNUSED")
+    unused.add_blockref("UNUSED", (0, 0))
+    path = tmp_path / "nested.dxf"
+    doc.saveas(path)
+
+    _, shape = import_path(path)[0]
+    edges = shape.edges()
+    assert len(edges) == 4
+    assert [edge.length for edge in edges] == pytest.approx([math.sqrt(2.5)] * 4)
+    centers = sorted((edge.center().X, edge.center().Y) for edge in edges)
+    c = math.sqrt(0.5)
+    expected_centers = sorted(
+        (100 + 2 * (3 + (column * 20 - row * 10 + 0.5) * c),
+         200 + 4 + (column * 20 + row * 10 + 0.5) * c)
+        for row in range(2) for column in range(2)
+    )
+    for actual, expected in zip(centers, expected_centers):
+        assert actual == pytest.approx(expected)
+
+
+def test_nested_blocks_at_native_depth_limit_remain_importable(tmp_path):
+    doc = _nested_blocks_doc(formats_dxf._MAX_BLOCK_DEPTH)
+    path = tmp_path / "depth-limit.dxf"
+    doc.saveas(path)
+    _, shape = import_path(path)[0]
+    assert len(shape.edges()) == 1
+    assert shape.edges()[0].center().X == pytest.approx(formats_dxf._MAX_BLOCK_DEPTH + 0.5)
+
+
+@pytest.mark.parametrize("depth", [17, 256])
+def test_excessive_block_depth_refuses_before_virtual_generation(tmp_path, monkeypatch, depth):
+    doc = _nested_blocks_doc(depth)
+    # Importable root geometry must not turn a rejected nested block into success.
+    doc.modelspace().add_line((1000, 0), (1001, 0))
+    path = tmp_path / "too-deep.dxf"
+    doc.saveas(path)
+    monkeypatch.setattr(formats_dxf, "_placed_entities", _no_expansion)
+    budget = formats_dxf._DxfExpansionBudget()
+    with pytest.raises(ValueError, match="DXF expansion budget exceeded: depth"):
+        formats_dxf._admit_dxf_expansion(doc.modelspace(), budget)
+    assert budget.visited == formats_dxf._MAX_BLOCK_DEPTH + 1
+    assert budget.instances == formats_dxf._MAX_BLOCK_DEPTH + 1
+    with pytest.raises(ValueError, match="DXF expansion budget exceeded: depth"):
+        import_path(path)
+
+
+@pytest.mark.parametrize("rows, columns", [
+    (32767, 32767), (100001, 1), (1, 100001), (0, 1), (-1, 1),
+])
+@pytest.mark.parametrize("spacing", [0, 1])
+def test_insert_array_dimensions_refuse_before_grid_iteration(
+    tmp_path, monkeypatch, rows, columns, spacing,
+):
+    doc = ezdxf.new(units=4)
+    unit = doc.blocks.new(name="UNIT")
+    unit.add_line((0, 0), (1, 0))
+    msp = doc.modelspace()
+    msp.add_line((1000, 0), (1001, 0))
+    insert = msp.add_blockref("UNIT", (0, 0), dxfattribs={
+        "row_spacing": spacing, "column_spacing": spacing,
+    })
+    # Match readfile's raw loading path; public setters repair nonpositive counts.
+    insert.dxf.unprotected_set("row_count", rows)
+    insert.dxf.unprotected_set("column_count", columns)
+    path = tmp_path / "array.dxf"
+    doc.saveas(path)
+    monkeypatch.setattr(formats_dxf, "_placed_entities", _no_expansion)
+    monkeypatch.setattr(type(insert), "multi_insert", _no_expansion)
+    with pytest.raises(ValueError, match="DXF INSERT.*(dimensions|instance budget)"):
+        import_path(path)
+
+
+def test_reachable_block_cycle_refuses_instead_of_returning_partial_geometry(tmp_path, monkeypatch):
+    doc = ezdxf.new(units=4)
+    first = doc.blocks.new(name="FIRST")
+    second = doc.blocks.new(name="SECOND")
+    first.add_blockref("SECOND", (0, 0))
+    second.add_blockref("FIRST", (0, 0))
+    doc.modelspace().add_line((0, 0), (1, 0))
+    doc.modelspace().add_blockref("FIRST", (0, 0))
+    path = tmp_path / "cycle.dxf"
+    doc.saveas(path)
+    monkeypatch.setattr(formats_dxf, "_placed_entities", _no_expansion)
+    with pytest.raises(ValueError, match="DXF INSERT block cycle"):
+        import_path(path)
+
+
+@pytest.mark.parametrize("field, ceiling", [
+    ("instances", "_MAX_INSTANCES"), ("work", "_MAX_WORK"), ("edges", "_MAX_GEOMETRY"),
+])
+def test_cumulative_expansion_accounts_repeated_blocks_before_generation(monkeypatch, field, ceiling):
+    doc = ezdxf.new(units=4)
+    unit = doc.blocks.new(name="UNIT")
+    unit.add_line((0, 0), (1, 0))
+    grid = doc.blocks.new(name="GRID")
+    grid.add_blockref("UNIT", (0, 0), dxfattribs={
+        "row_count": 2, "column_count": 2, "row_spacing": 5, "column_spacing": 5,
+    })
+    msp = doc.modelspace()
+    msp.add_blockref("GRID", (0, 0))
+    msp.add_blockref("GRID", (100, 0))
+    budget = formats_dxf._DxfExpansionBudget()
+    formats_dxf._admit_dxf_expansion(msp, budget)
+    assert budget.visited == 12  # two roots, two child INSERTs, eight placed LINEs
+    assert budget.instances == 10
+    assert budget.edges == 8
+    repeated = formats_dxf._DxfExpansionBudget()
+    formats_dxf._admit_dxf_expansion(msp, repeated)
+    assert vars(repeated) == vars(budget)
+
+    needed = getattr(budget, field)
+    monkeypatch.setattr(formats_dxf, ceiling, needed)
+    _, shape = formats_dxf.bodies_from_doc(doc, "admitted")[0]
+    assert len(shape.edges()) == 8
+    monkeypatch.setattr(formats_dxf, ceiling, needed - 1)
+    monkeypatch.setattr(formats_dxf, "_placed_entities", _no_expansion)
+    with pytest.raises(ValueError, match=f"DXF expansion budget exceeded: {field}"):
+        formats_dxf.bodies_from_doc(doc, "refused")

@@ -294,7 +294,9 @@ TEST_CASE("TCP round trip is non-blocking, commissioned, simulated, and capped a
     FakeServer server([](Socket peer) {
         const auto request = recv_exact(peer, 5);
         send_all(peer, request);
-        std::this_thread::sleep_for(50ms);
+        // Round-trip completion, not an arbitrary teardown timer, owns this socket.
+        if (recv_exact(peer, 1).front() != std::byte{'!'})
+            throw std::runtime_error("echo receipt acknowledgement missing");
     });
     CommissionedEndpoint commissioned(TransportKind::Tcp, server.port());
     TcpTransport transport(commissioned.allowlist, MachineClass::OpenFrameMill, 1s);
@@ -311,12 +313,97 @@ TEST_CASE("TCP round trip is non-blocking, commissioned, simulated, and capped a
     const auto written = transport.write(bytes("hello"));
     REQUIRE(written.ok);
     REQUIRE(written.bytes_written == 5);
-    const auto events = poll_until(transport);
-    REQUIRE_FALSE(events.empty());
-    CHECK(events.front().kind == TransportEvent::Kind::Data);
-    CHECK(text(events.front().data) == "hello");
-    CHECK(events.front().raw.empty());
+    std::string reply;
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (reply.size() < 5 && std::chrono::steady_clock::now() < deadline) {
+        const auto batch = transport.poll(deadline);
+        for (const auto& event : batch.events) {
+            CAPTURE(event.why);
+            CAPTURE(event.raw);
+            REQUIRE(event.kind == TransportEvent::Kind::Data);
+            CHECK(event.raw.empty());
+            reply.append(reinterpret_cast<const char*>(event.data.data()), event.data.size());
+        }
+    }
+    CHECK(reply == "hello");
+    const auto acknowledged = transport.write(bytes("!"));
+    REQUIRE(acknowledged.ok);
+    REQUIRE(acknowledged.bytes_written == 1);
     transport.close();
+    server.finish();
+}
+
+TEST_CASE("Grbl service consumes TCP and WebSocket identity and status within a bounded poll") {
+    bool websocket = false;
+    SUBCASE("TCP") {}
+    SUBCASE("WebSocket") { websocket = true; }
+    std::atomic<bool> opened{false};
+    std::atomic<bool> sent{false};
+    std::atomic<bool> finished{false};
+    const std::string reply =
+        "Grbl 1.1h ['$' for help]\r\n"
+        "[VER:1.1h:fixture]\r\n[OPT:V,15,128]\r\nok\r\n"
+        "$100=250\r\n$101=250\r\n$102=250\r\nok\r\n"
+        "<Idle|MPos:1,2,3|WCO:0,0,0|FS:0,0>\r\n";
+    FakeServer server([&](Socket peer) {
+        if (websocket) ws_upgrade(peer);
+        const auto end = std::chrono::steady_clock::now() + 2s;
+        while (!opened.load() && std::chrono::steady_clock::now() < end)
+            std::this_thread::sleep_for(1ms);
+        if (!opened.load()) throw std::runtime_error("adapter never opened fixture");
+        if (websocket) send_all(peer, server_frame(0x1, bytes(reply)));
+        else send_all(peer, reply);
+        sent = true;
+        while (!finished.load() && std::chrono::steady_clock::now() < end)
+            std::this_thread::sleep_for(1ms);
+    });
+    const auto kind = websocket ? TransportKind::WebSocket : TransportKind::Tcp;
+    CommissionedEndpoint commissioned(kind, server.port(), websocket ? "/fluidnc" : "");
+    TcpTransport tcp(commissioned.allowlist, MachineClass::OpenFrameMill, 1s);
+    WebSocketTransport ws(commissioned.allowlist, MachineClass::OpenFrameMill);
+    chudware::device::ITransport& transport = websocket
+        ? static_cast<chudware::device::ITransport&>(ws)
+        : static_cast<chudware::device::ITransport&>(tcp);
+    chudware::device::GrblAdapter adapter(transport, [] { return std::uint64_t{1}; });
+    REQUIRE(adapter.open(websocket ? ws_endpoint(server.port()) : tcp_endpoint(server.port())).ok);
+    opened = true;
+    const auto end = std::chrono::steady_clock::now() + 1s;
+    while (!sent.load() && std::chrono::steady_clock::now() < end)
+        std::this_thread::sleep_for(1ms);
+    REQUIRE(sent.load());
+
+    // Data is ready, but an exhausted transport deadline must leave it untouched.
+    CHECK(transport.poll(std::chrono::steady_clock::now()).events.empty());
+    for (unsigned i = 0; i < 64; ++i) {
+        adapter.service(17);
+        const auto snapshot = adapter.snapshot();
+        if (adapter.fingerprint() && snapshot.v &&
+            snapshot.v->state == chudware::device::DeviceState::Idle) break;
+    }
+    CHECK(adapter.fingerprint().has_value());
+    const auto& identity = adapter.identity();
+    CHECK(identity.has_value());
+    if (identity) {
+        CHECK(identity->firmware_banner == "Grbl 1.1h ['$' for help]");
+        CHECK(identity->axis_count == 3);
+        CHECK(identity->transport_kind == (websocket ? "websocket" : "tcp"));
+    }
+    const auto snapshot = adapter.snapshot();
+    CHECK(snapshot.v.has_value());
+    if (snapshot.v) {
+        CHECK(snapshot.v->state == chudware::device::DeviceState::Idle);
+        CHECK(snapshot.v->mpos == std::array<double, 3>{1, 2, 3});
+        CHECK(snapshot.seq == 17);
+    }
+    // A quiet socket waits briefly rather than turning the lane's service loop
+    // into an immediate retry spin; it never inherits the 200 ms status interval.
+    const auto quiet_started = std::chrono::steady_clock::now();
+    adapter.service(18);
+    const auto quiet_elapsed = std::chrono::steady_clock::now() - quiet_started;
+    CHECK(quiet_elapsed >= 1ms);
+    CHECK(quiet_elapsed < 100ms);
+    finished = true;
+    adapter.close();
     server.finish();
 }
 
@@ -385,6 +472,37 @@ TEST_CASE("TCP refuses uncommissioned endpoints before any connection attempt") 
     CHECK_FALSE(result.ok);
     CHECK(result.why.find("commissioning refused") != std::string::npos);
     std::filesystem::remove(file, ignored);
+}
+
+TEST_CASE("TCP preserves final payload until a fresh poll and reports EOF after its bytes") {
+    FakeServer server([](Socket peer) { send_all(peer, "final payload"); });
+    CommissionedEndpoint commissioned(TransportKind::Tcp, server.port());
+    TcpTransport transport(commissioned.allowlist, MachineClass::OpenFrameMill, 1s);
+    REQUIRE(transport.open(tcp_endpoint(server.port())).ok);
+    server.finish();  // The peer is already closed before the first receive.
+    CHECK(transport.poll(std::chrono::steady_clock::now()).events.empty());
+
+    std::string received;
+    bool closed = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (!closed && std::chrono::steady_clock::now() < deadline) {
+        const auto batch = transport.poll(deadline);
+        for (const auto& event : batch.events) {
+            CAPTURE(event.why);
+            CHECK_FALSE(closed);
+            if (event.kind == TransportEvent::Kind::Data) {
+                CHECK(event.raw.empty());
+                received.append(reinterpret_cast<const char*>(event.data.data()), event.data.size());
+            } else {
+                REQUIRE(event.kind == TransportEvent::Kind::Closed);
+                CHECK(event.why.find("device_lost") != std::string::npos);
+                closed = true;
+            }
+        }
+    }
+    CHECK(received == "final payload");
+    CHECK(closed);
+    CHECK_FALSE(transport.write(bytes("resume")).ok);
 }
 
 TEST_CASE("TCP detects a peer half-close as terminal device_lost") {

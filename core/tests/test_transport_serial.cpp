@@ -22,6 +22,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/stat.h>
+#ifdef __linux__
+#include <sys/sysmacros.h>
+#endif
 #include <unistd.h>
 #endif
 
@@ -60,7 +64,7 @@ struct TempDirectory {
 
 AllowlistEntry serialEntry(std::string path, std::string note = "PTY acceptance fixture") {
     return {
-        EndpointIdentity::serial(std::move(path)),
+        EndpointIdentity::serial(std::move(path), "1a86", "7523", "CONTROLLER-42"),
         MachineClass::Emulated,
         {{"baud", "115200"}},
         std::move(note),
@@ -112,6 +116,28 @@ TEST_CASE("commissioning allowlist is durable, class/config exact, and epoch tra
     REQUIRE(allowlist.reload(&why));
     CHECK(allowlist.epoch() == 3);
     CHECK(allowlist.entries().front().connection.at("baud") == "57600");
+}
+
+TEST_CASE("serial commissioning refuses tupleless and incomplete USB identities") {
+    TempDirectory temporary;
+    DeviceAllowlist allowlist(temporary.path / "devices.allowlist");
+    const std::array<EndpointIdentity, 4> invalid{
+        EndpointIdentity::serial("/dev/ttyUSB0"),
+        EndpointIdentity::serial("/dev/ttyUSB0", "1a86", "", "CONTROLLER-42"),
+        EndpointIdentity::serial("/dev/ttyUSB0", "", "7523", "CONTROLLER-42"),
+        EndpointIdentity::serial("/dev/ttyUSB0", "1a86", "7523", ""),
+    };
+    for (const auto& identity : invalid) {
+        auto entry = serialEntry(identity.address);
+        entry.endpoint = identity;
+        std::string why;
+        CHECK_FALSE(allowlist.upsert(entry, &why));
+        CHECK(why.find("vid, pid, and serial together") != std::string::npos);
+        CHECK_FALSE(allowlist.authorize(entry).allowed);
+        CHECK_FALSE(DeviceAllowlist::parseLine(DeviceAllowlist::formatLine(entry), &why));
+    }
+    CHECK(allowlist.entries().empty());
+    CHECK(allowlist.epoch() == 0);
 }
 
 TEST_CASE("network allowlist keys kind host port and validates websocket path") {
@@ -176,6 +202,25 @@ void writeTextFile(const std::filesystem::path& path, std::string_view value) {
     output << value << '\n';
 }
 
+SerialTransportOptions fixtureOptions(const TempDirectory& temporary, std::string_view target,
+                                      const AllowlistEntry& entry) {
+    SerialTransportOptions options;
+    options.operator_note = entry.operator_note;
+    options.posix_sysfs_tty_root = (temporary.path / "sys-class-tty").string();
+    const auto tty_path = std::filesystem::path(options.posix_sysfs_tty_root) /
+                          std::filesystem::path(target).filename();
+    const auto device_path = tty_path / "device";
+    std::filesystem::create_directories(device_path);
+    struct stat status {};
+    REQUIRE(::stat(std::string(target).c_str(), &status) == 0);
+    writeTextFile(tty_path / "dev", std::to_string(major(status.st_rdev)) + ":" +
+                                      std::to_string(minor(status.st_rdev)));
+    writeTextFile(device_path / "idVendor", entry.endpoint.usb_vid);
+    writeTextFile(device_path / "idProduct", entry.endpoint.usb_pid);
+    writeTextFile(device_path / "serial", entry.endpoint.usb_serial);
+    return options;
+}
+
 TEST_CASE("POSIX serial refuses generic symlinks and non-character devices by name") {
     TempDirectory temporary;
     DeviceAllowlist allowlist(temporary.path / "devices.allowlist");
@@ -215,13 +260,12 @@ TEST_CASE("POSIX by-id serial open verifies the commissioned sysfs USB tuple") {
     const auto by_id_path = by_id_root / "usb-controller";
     std::filesystem::create_symlink(pty.slave_path, by_id_path);
 
-    const auto sysfs_root = temporary.path / "sys-class-tty";
-    const auto sysfs_device =
-        sysfs_root / std::filesystem::path(pty.slave_path).filename() / "device";
-    std::filesystem::create_directories(sysfs_device);
-    writeTextFile(sysfs_device / "idVendor", "1A86");
-    writeTextFile(sysfs_device / "idProduct", "7523");
-    writeTextFile(sysfs_device / "serial", "CONTROLLER-42");
+    const auto fixture_entry = serialEntry(by_id_path.string(), "USB tuple fixture");
+    auto options = fixtureOptions(temporary, pty.slave_path, fixture_entry);
+    options.posix_by_id_root = by_id_root.string();
+    const auto tty_path = std::filesystem::path(options.posix_sysfs_tty_root) /
+                          std::filesystem::path(pty.slave_path).filename();
+    const auto sysfs_device = tty_path / "device";
 
     AllowlistEntry entry{
         EndpointIdentity::serial(by_id_path.string(), "1a86", "7523", "CONTROLLER-42"),
@@ -232,10 +276,7 @@ TEST_CASE("POSIX by-id serial open verifies the commissioned sysfs USB tuple") {
     std::string why;
     REQUIRE(allowlist.upsert(entry, &why));
 
-    SerialTransportOptions options;
     options.operator_note = entry.operator_note;
-    options.posix_by_id_root = by_id_root.string();
-    options.posix_sysfs_tty_root = sysfs_root.string();
     SerialTransport transport(allowlist, MachineClass::Emulated, options);
     const Endpoint endpoint{"usb-grbl", by_id_path.string(), false};
     const auto matched = transport.open(endpoint);
@@ -247,6 +288,127 @@ TEST_CASE("POSIX by-id serial open verifies the commissioned sysfs USB tuple") {
     CHECK_FALSE(mismatched.ok);
     CHECK(mismatched.why.find("serial USB identity mismatch") != std::string::npos);
     CHECK(mismatched.why.find("SUBSTITUTED-DEVICE") != std::string::npos);
+
+    writeTextFile(sysfs_device / "serial", entry.endpoint.usb_serial);
+    writeTextFile(tty_path / "dev", "1:3");
+    const auto wrong_device_number = transport.open(endpoint);
+    CHECK_FALSE(wrong_device_number.ok);
+    CHECK(wrong_device_number.why.find("sysfs device number differs") != std::string::npos);
+
+    writeTextFile(tty_path / "dev", "invalid:device");
+    const auto malformed_device_number = transport.open(endpoint);
+    CHECK_FALSE(malformed_device_number.ok);
+    CHECK(malformed_device_number.why.find("sysfs device number is invalid") != std::string::npos);
+
+    std::filesystem::remove(tty_path / "dev");
+    const auto missing_device_number = transport.open(endpoint);
+    CHECK_FALSE(missing_device_number.ok);
+    CHECK(missing_device_number.why.find("sysfs device number is unavailable") != std::string::npos);
+
+    options = fixtureOptions(temporary, pty.slave_path, entry);
+    options.posix_by_id_root = by_id_root.string();
+    std::filesystem::remove(sysfs_device / "serial");
+    SerialTransport incomplete(allowlist, MachineClass::Emulated, options);
+    const auto missing_serial = incomplete.open(endpoint);
+    CHECK_FALSE(missing_serial.ok);
+    CHECK(missing_serial.why.find("sysfs USB tuple is incomplete") != std::string::npos);
+}
+
+TEST_CASE("POSIX tupleless by-id commissioning cannot authorize either replacement PTY") {
+    TempDirectory temporary;
+    DeviceAllowlist allowlist(temporary.path / "devices.allowlist");
+    PseudoTerminal original;
+    PseudoTerminal replacement;
+    const auto root = temporary.path / "by-id";
+    std::filesystem::create_directories(root);
+    const auto alias = root / "usb-controller";
+    std::filesystem::create_symlink(original.slave_path, alias);
+    auto entry = serialEntry(alias.string());
+    entry.endpoint = EndpointIdentity::serial(alias.string());
+    std::string why;
+    CHECK_FALSE(allowlist.upsert(entry, &why));
+    CHECK(why.find("vid, pid, and serial together") != std::string::npos);
+    SerialTransportOptions options;
+    options.posix_by_id_root = root.string();
+    SerialTransport transport(allowlist, MachineClass::Emulated, options);
+    CHECK_FALSE(transport.open({"tupleless", alias.string(), true}).ok);
+    std::filesystem::remove(alias);
+    std::filesystem::create_symlink(replacement.slave_path, alias);
+    CHECK_FALSE(transport.open({"tupleless", alias.string(), false}).ok);
+    CHECK_FALSE(transport.isOpen());
+}
+
+TEST_CASE("POSIX serial refuses symlinks in device path parents") {
+    TempDirectory temporary;
+    DeviceAllowlist allowlist(temporary.path / "devices.allowlist");
+    PseudoTerminal pty;
+    const auto alias_root = temporary.path / "aliased-pts";
+    std::filesystem::create_directory_symlink(
+        std::filesystem::path(pty.slave_path).parent_path(), alias_root);
+    const auto alias = alias_root / std::filesystem::path(pty.slave_path).filename();
+    const auto entry = serialEntry(alias.string());
+    std::string why;
+    REQUIRE(allowlist.upsert(entry, &why));
+    auto options = fixtureOptions(temporary, pty.slave_path, entry);
+    SerialTransport transport(allowlist, MachineClass::Emulated, options);
+    const auto result = transport.open({"parent-symlink", alias.string(), false});
+    CHECK_FALSE(result.ok);
+    CHECK(result.why.find("serial symlink refused") != std::string::npos);
+    CHECK_FALSE(transport.isOpen());
+}
+
+TEST_CASE("POSIX serial binds the opened descriptor to the pre-open sysfs device number") {
+    TempDirectory temporary;
+    DeviceAllowlist allowlist(temporary.path / "devices.allowlist");
+    PseudoTerminal pty;
+    const auto entry = serialEntry(pty.slave_path);
+    std::string why;
+    REQUIRE(allowlist.upsert(entry, &why));
+    auto options = fixtureOptions(temporary, pty.slave_path, entry);
+    const auto tty_path = std::filesystem::path(options.posix_sysfs_tty_root) /
+                          std::filesystem::path(pty.slave_path).filename();
+    const auto vendor_path = tty_path / "device" / "idVendor";
+    std::filesystem::remove(vendor_path);
+    REQUIRE(::mkfifo(vendor_path.c_str(), 0600) == 0);
+    std::atomic<bool> fixture_failed = false;
+    // The first dev read precedes idVendor. Change the sysfs mapping while that
+    // first tuple read is paused, then restore a regular vendor attribute so the
+    // descriptor's post-open tuple read cannot block.
+    std::thread substitution([&] {
+        int writer = -1;
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            writer = ::open(vendor_path.c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+            if (writer >= 0) break;
+            if (errno != ENXIO && errno != EINTR) {
+                fixture_failed = true;
+                return;
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+        if (writer < 0) {
+            fixture_failed = true;
+            return;
+        }
+        std::error_code error;
+        std::filesystem::remove(vendor_path, error);
+        std::ofstream vendor(vendor_path);
+        std::ofstream number(tty_path / "dev", std::ios::trunc);
+        vendor << "1a86\n";
+        number << "1:3\n";
+        vendor.close();
+        number.close();
+        if (error || !vendor || !number || ::write(writer, "1a86\n", 5) != 5)
+            fixture_failed = true;
+        ::close(writer);
+    });
+    SerialTransport transport(allowlist, MachineClass::Emulated, options);
+    const auto result = transport.open({"descriptor-substitution", pty.slave_path, false});
+    substitution.join();
+    CHECK_FALSE(fixture_failed.load());
+    CHECK_FALSE(result.ok);
+    CHECK(result.why.find("opened descriptor differs") != std::string::npos);
+    CHECK_FALSE(transport.isOpen());
 }
 
 
@@ -258,9 +420,7 @@ TEST_CASE("POSIX serial transport enforces allowlist and exclusive ownership") {
     const auto entry = serialEntry(pty.slave_path);
     REQUIRE(allowlist.upsert(entry, &why));
 
-    SerialTransportOptions options;
-    options.baud = 115200;
-    options.operator_note = entry.operator_note;
+    auto options = fixtureOptions(temporary, pty.slave_path, entry);
     SerialTransport first(allowlist, MachineClass::Emulated, options);
     Endpoint endpoint{"pty-grbl", pty.slave_path, false};
     const auto first_open = first.open(endpoint);
@@ -278,7 +438,9 @@ TEST_CASE("POSIX serial transport enforces allowlist and exclusive ownership") {
     PseudoTerminal missing;
     Endpoint denied_endpoint{"not-commissioned", missing.slave_path, false};
     const auto denied = second.open(denied_endpoint);
-    const auto exact_missing = DeviceAllowlist::formatLine(serialEntry(missing.slave_path));
+    const auto exact_missing = DeviceAllowlist::formatLine({
+        EndpointIdentity::serial(missing.slave_path), MachineClass::Emulated,
+        {{"baud", "115200"}}, options.operator_note});
     CHECK_FALSE(denied.ok);
     CHECK(denied.why.find(missing.slave_path) != std::string::npos);
     CHECK(denied.why.find(exact_missing) != std::string::npos);
@@ -295,8 +457,7 @@ TEST_CASE("POSIX serial max deadline services silently without awaiting data") {
     const auto entry = serialEntry(pty.slave_path);
     std::string why;
     REQUIRE(allowlist.upsert(entry, &why));
-    SerialTransportOptions options;
-    options.operator_note = entry.operator_note;
+    auto options = fixtureOptions(temporary, pty.slave_path, entry);
     SerialTransport transport(allowlist, MachineClass::Emulated, options);
     REQUIRE(transport.open({"pty-grbl", pty.slave_path, false}).ok);
 
@@ -318,10 +479,9 @@ TEST_CASE("POSIX serial handles partial writes and bounded chunked status reads"
     std::string why;
     REQUIRE(allowlist.upsert(entry, &why));
 
-    SerialTransportOptions options;
+    auto options = fixtureOptions(temporary, pty.slave_path, entry);
     options.max_read_bytes = 11;
     options.write_timeout = 5s;
-    options.operator_note = entry.operator_note;
     SerialTransport transport(allowlist, MachineClass::Emulated, options);
     REQUIRE(transport.open({"pty-grbl", pty.slave_path, false}).ok);
 
@@ -381,8 +541,7 @@ TEST_CASE("POSIX serial reports device_lost and capability remains transport-onl
     auto entry = serialEntry(pty.slave_path);
     std::string why;
     REQUIRE(allowlist.upsert(entry, &why));
-    SerialTransportOptions options;
-    options.operator_note = entry.operator_note;
+    auto options = fixtureOptions(temporary, pty.slave_path, entry);
     SerialTransport transport(allowlist, MachineClass::Emulated, options);
     REQUIRE(transport.open({"pty-grbl", pty.slave_path, true}).ok);
 

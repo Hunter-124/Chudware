@@ -22,12 +22,24 @@ Canonical guidance:
 - `services/agent/chudcode_tools.py` `build_host_tools` / `dispatch_host_tool` — projects the
   live MCP/mission registries as host tools. `_effective_names` applies the allowlist
   tri-state, mode policy and floors.
+  `host_tool_result` always supplies content and details: JSON objects/arrays stay
+  structured, plain cad_guide/cad_skill text stays a string. Both are UTF-8 bounded;
+  over-budget text becomes `{items: <cut string>, _truncated: {full_result, …}}`,
+  with the full JSON string spilled at that path (no invented `ok:true`).
+  In eval, await `tool.write`, check outer `hasError` before
+  `details.xdev.inner`, then inner `ok:false` before success-only keys.
+  Text has no `ok`; complete spills load with `json.load(open(full_result))`.
+  A reporting exception is not permission to repeat successful mutations:
+  recover recorded replies and inspect current state first.
 - `services/agent/chudcode_events.py` `map_rpc_frame` / `RpcFrameState` — the only RPC-frame
   → feed mapper.
 - `services/agent/chudcode_control.py` `ControlServer` — the authenticated private
   cancel/steer/status lane; `worker_control_info` exposes it.
 - `services/agent/online_turn.py` — `resolve_workspace`, `resolve_settings`,
   `resolve_model_and_effort`, `activate_turn_env`.
+  `resolve_workspace` retains the exact canonical selected directory, even beneath
+  another project's markers. It does not infer an ancestor root; the same selection
+  drives tool scope, save root and Chudcode cwd.
 - `services/agent/chudcode_roles.py` `run_role_turn` and
   `mission_dispatch.MissionDispatch` — delegated role/mission turns through Chudcode.
 - `services/agent/tool_categories.py` (`MAIN_CHAT_CORE_TOOLS`, `resolve_tool_requests`),
@@ -37,6 +49,12 @@ Canonical guidance:
   `validate_suite`, `assemble_context`, `validate_handoff`, `list_editable_prompts`) — loads
   the `roles/*.yaml` cards (`schema: aicad.role/1`; `council_seats.yaml` is data) and
   `playbooks/*.yaml`.
+  `general_agent.yaml` requires ownership recovery from roster/history and the
+  layout contract after compaction, not replacement on a missing handle. A failed
+  provider child is incomplete; takeover requires a stopped owner and released
+  document. Children freeze, verify and save revisioned handoffs before parent
+  assembly integration/sweeps; no concurrent sweeps against mutating child parts.
+  User-requested case/body centering remains distinct from shaft coaxiality.
 - `services/agent/skills/builtin/<name>/SKILL.md` — CAD skills fetched via `cad_skill(name)`,
   never `skill://`.
 - `services/agent/tool_guidance/` — a curated `prompt_note`/`timeout_s` per tool family

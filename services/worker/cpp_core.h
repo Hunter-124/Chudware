@@ -12,6 +12,7 @@
 
 #include <mutex>
 #include <string>
+#include <cstdint>
 
 #include <nlohmann/json.hpp>
 
@@ -58,6 +59,14 @@ public:
         void* ud);
     bool hasDocPublishSink();
 
+    // Optional process-wide publication from asynchronous persisted-cache verification.
+    // Missing export means unsupported; the caller can retain the immediate warm snapshot.
+    bool setCacheRefreshSink(
+        void (*cb)(const char* doc_id, const char* response_json, void* ud), void* ud);
+
+    // Dedicated optional lifecycle export. Missing/busy capability is unknown.
+    bool activity(std::uint64_t counts[3]);
+
 
 private:
     std::mutex mtx_;
@@ -73,6 +82,9 @@ private:
     void (*set_event_sink_)(void (*)(const char*, void*), void*) = nullptr;  // optional export
     void (*set_doc_publish_sink_)(
         void (*)(const char*, const char*, const char*, void*), void*) = nullptr;
+    void (*set_cache_refresh_sink_)(
+        void (*)(const char*, const char*, void*), void*) = nullptr;
+    int (*activity_)(std::uint64_t*) = nullptr;
 };
 
 // Process-wide singleton. The diagnostic seam is dev-only and gated behind an env

@@ -7,10 +7,11 @@ are AGPL and are never imported in-process here.** The dep is *optional and
 feature-detected*: with no PDF tool installed the helper returns the §6 degradation shape
 (``reason:"no_pdf_tool"``) — CI stays green with zero new hard dependencies.
 
-T-X4: on a 401/403 from a plain fetch, retries once via T-X1's authenticated browser
-session (``services/browser``) IF a matching site profile already exists — never
-triggers a login from this path. See ``_try_browser_fallback`` below and
-``contracts/research_tools.md`` §9.
+Remote PDFs use connection-pinned public HTTP with a 32 MiB wire/decoded budget.
+On a 401/403, desktop callers may retry once with a matching browser profile's
+cookies through that same public client; this never renders a page or triggers
+login. Tenant cells refuse browser-profile fallback. See ``_try_browser_fallback``
+and ``contracts/research_tools.md`` §9.
 """
 from __future__ import annotations
 
@@ -94,7 +95,7 @@ def _try_browser_fallback(
 
     with tempfile.TemporaryDirectory() as tmp:
         dest = Path(tmp) / "datasheet.pdf"
-        result = browser_download(url, site, dest)
+        result = browser_download(url, site, dest, public_only=True)
         if not result.get("ok"):
             return None, None, (result if result.get("reason") in _ACTIONABLE_BROWSER_REASONS
                                 else None)
@@ -121,9 +122,9 @@ def _read_bytes(source: str) -> tuple[Optional[bytes], Optional[dict], Optional[
         if is_offline():
             return None, fail("offline", "Offline mode blocks fetching a remote PDF; pass a local path."), None
         try:
-            import httpx  # BSD, already a dep
-            r = httpx.get(s, follow_redirects=True, timeout=30.0,
-                          headers={"User-Agent": "Chudware-research/1.0"})
+            from services.net.safe_http import get
+            r = get(s, max_bytes=32 * 1024 * 1024, idle_timeout=30.0,
+                    headers={"User-Agent": "Chudware-research/1.0"})
             if r.status_code in (401, 403):
                 data, session_profile_used, refusal = _try_browser_fallback(s)
                 if data is not None:

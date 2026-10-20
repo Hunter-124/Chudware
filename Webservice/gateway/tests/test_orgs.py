@@ -9,11 +9,13 @@ by Python bookkeeping.
 
 from __future__ import annotations
 
-import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
+import psycopg
 import pytest
 
 GATEWAY_DIR = Path(__file__).resolve().parents[1]
@@ -113,8 +115,7 @@ def _queued_invite_ctx(to: str) -> dict:
         )
         row = cur.fetchone()
     assert row is not None, f"no invitation mail queued for {to}"
-    ctx = row["ctx_json"]
-    return json.loads(ctx) if isinstance(ctx, str) else ctx
+    return mailer.decrypt_context(to, "org_invite", row["ctx_json"])
 
 
 def _invite_token(to: str) -> str:
@@ -555,6 +556,144 @@ def test_transfer_ownership_is_atomic_and_leaves_exactly_one_owner(client):
     assert client.delete(f"/api/orgs/{org['id']}", headers=H_SECOND).status_code == 200
 
 
+@pytest.mark.parametrize("first", ["remove", "transfer"])
+def test_concurrent_owner_transfer_and_admin_removal_preserve_authority(
+    client, pg, monkeypatch, first
+):
+    # Bound the real request SQL too, so a failed ordering assertion cannot
+    # strand a TestClient thread in PostgreSQL during fixture teardown.
+    monkeypatch.setenv(
+        "CHUDWARE_DB_URL",
+        psycopg.conninfo.make_conninfo(
+            pg, options="-c statement_timeout=30000 -c lock_timeout=30000"
+        ),
+    )
+    org = _create_org(client)
+    org_id = org["id"]
+    general = _team_of(org, "General")
+    _join(client, org_id, ADMIN, H_ADMIN, role="admin")
+    _join(client, org_id, SECOND, H_SECOND)  # Active Studio, not a plan-gate refusal.
+
+    responses, failures = {}, {}
+    completed = {operation: threading.Event() for operation in ("remove", "transfer")}
+    threads = []
+
+    def request(operation):
+        # Independent portals let both HTTP requests run even while an async
+        # route is blocked in synchronous SQL. The client fixture owns lifespan.
+        worker_client = TestClient(app_mod.app)
+        try:
+            if operation == "remove":
+                responses[operation] = worker_client.delete(
+                    f"/api/orgs/{org_id}/members/{SECOND}", headers=H_ADMIN
+                )
+            else:
+                responses[operation] = worker_client.post(
+                    f"/api/orgs/{org_id}/transfer-ownership",
+                    headers=H_OWNER,
+                    json={"email": SECOND},
+                )
+        except BaseException as error:
+            failures[operation] = error
+        finally:
+            worker_client.close()
+            completed[operation].set()
+
+    def start(operation):
+        thread = threading.Thread(target=request, args=(operation,), daemon=True)
+        thread.start()
+        threads.append(thread)
+
+    with (
+        psycopg.connect(pg, options="-c statement_timeout=5000") as holder,
+        psycopg.connect(
+            pg, autocommit=True, options="-c statement_timeout=5000"
+        ) as observer,
+    ):
+        def wait_for_blocked(operation, blocker):
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                rows = observer.execute(
+                    "SELECT pid FROM pg_stat_activity"
+                    " WHERE datname = current_database()"
+                    " AND %s = ANY(pg_blocking_pids(pid))",
+                    (blocker,),
+                ).fetchall()
+                if rows:
+                    assert len(rows) == 1, rows
+                    return rows[0][0]
+                assert not completed[operation].is_set(), (
+                    operation, responses.get(operation), failures.get(operation)
+                )
+                # Poll the actual PostgreSQL wait graph, not an assumed delay.
+                completed[operation].wait(0.01)
+            pytest.fail(f"{operation} did not block behind PostgreSQL backend {blocker}")
+
+        try:
+            if first == "remove":
+                # Removal has already checked T's role and holds the org lock
+                # when deleting T's team row blocks on this fixture transaction.
+                row = holder.execute(
+                    "SELECT email FROM team_members"
+                    " WHERE team_id = %s AND email = %s FOR UPDATE",
+                    (general["id"], SECOND),
+                ).fetchone()
+            else:
+                # Transfer has demoted O and holds the org lock when promotion
+                # blocks on T's org row. The later removal must recheck T's role.
+                row = holder.execute(
+                    "SELECT email FROM org_members"
+                    " WHERE org_id = %s AND email = %s FOR UPDATE",
+                    (org_id, SECOND),
+                ).fetchone()
+            assert row == (SECOND,)
+            holder_pid = holder.info.backend_pid
+            start(first)
+            first_pid = wait_for_blocked(first, holder_pid)
+            second = "transfer" if first == "remove" else "remove"
+            start(second)
+            wait_for_blocked(second, first_pid)
+            assert not completed[first].is_set()
+            assert not completed[second].is_set()
+        finally:
+            # Release the fixture lock even if observing either edge fails.
+            # Request SQL has a 30 s deadline; joins are independently bounded.
+            holder.rollback()
+            for thread in threads:
+                thread.join(timeout=35)
+            assert all(not thread.is_alive() for thread in threads), (
+                "concurrent organization HTTP requests did not finish"
+            )
+
+    assert not failures, failures
+    assert responses[first].status_code == 200, responses[first].text
+    refused = responses[second]
+    assert refused.status_code == (404 if first == "remove" else 400), refused.text
+    assert _owner_count(org_id) == 1
+    owner = OWNER if first == "remove" else SECOND
+    with db.tx() as cur:
+        cur.execute(
+            "SELECT email FROM org_members WHERE org_id = %s AND role = 'owner'",
+            (org_id,),
+        )
+        assert [row["email"] for row in cur.fetchall()] == [owner]
+        cur.execute(
+            "SELECT count(*) AS n FROM team_members WHERE team_id = %s AND email = %s",
+            (general["id"], SECOND),
+        )
+        assert int(cur.fetchone()["n"]) == (0 if first == "remove" else 1)
+
+    detail = client.get(f"/api/orgs/{org_id}", headers=H_OWNER)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["organization"]["owner_email"] == owner
+    expected_roles = {OWNER: "owner", ADMIN: "admin"} if first == "remove" else {
+        OWNER: "admin", ADMIN: "admin", SECOND: "owner"
+    }
+    assert {m["email"]: m["role"] for m in detail.json()["members"]} == expected_roles
+    target_view = client.get(f"/api/orgs/{org_id}", headers=H_SECOND)
+    assert target_view.status_code == (404 if first == "remove" else 200), target_view.text
+
+
 def test_transfer_ownership_rejects_non_members_self_and_unfunded_targets(client):
     org = _create_org(client)
     _join(client, org["id"], MEMBER, H_MEMBER)  # MEMBER is on a trial plan
@@ -770,7 +909,9 @@ def test_university_external_owner_can_open_and_write_workspace(client, monkeypa
     assert not orgs.university_eligible(OWNER)
     selected = client.post("/workspace/selection", headers=H_OWNER, json={"team": team_id})
     assert selected.status_code == 200, selected.text
-    assert client.get("/workspace/list", headers=H_OWNER).json()["root"] == str(root)
+    listing = client.get("/workspace/list", headers=H_OWNER).json()
+    assert listing["root"] == "."
+    assert listing["workspace_key"] == f"team:{settings.university_org_id}/{team_id}"
     uploaded = client.post(
         "/api/bucket/upload", headers=H_OWNER, params={"team": team_id},
         files=[("files", ("project.txt", b"shared project"))], data={"dir": ""},
@@ -822,7 +963,13 @@ def test_university_requires_verified_domain_boundary(client, monkeypatch, tmp_p
     headers = {"X-Dev-User": email}
     response = client.get("/workspace/list", headers=headers)
     assert response.status_code == 200
-    assert (response.json()["root"] == str(root)) is allowed
+    listing = response.json()
+    assert listing["root"] == "."
+    expected_key = (
+        f"team:{settings.university_org_id}/{team_id}"
+        if allowed else f"user:{accounts.get_account(email).uid}"
+    )
+    assert listing["workspace_key"] == expected_key
     direct = client.get("/api/bucket/download", params={"team": team_id, "path": "project.txt"}, headers=headers)
     assert direct.status_code == (200 if allowed else 404)
     assert accounts.get_account(email).role == "user"
@@ -837,11 +984,17 @@ def test_university_selection_mount_loss_and_suspension(client, monkeypatch, tmp
     with db.tx() as cur:
         cur.execute("INSERT INTO oauth_identities(provider,subject,email) VALUES ('google','university-test',%s)", (email,))
     headers = {"X-Dev-User": email}
-    assert client.get("/workspace/list", headers=headers).json()["root"] == str(root)
+    listing = client.get("/workspace/list", headers=headers).json()
+    assert listing["root"] == "."
+    assert listing["workspace_key"] == f"team:{settings.university_org_id}/{team_id}"
     selected = client.post("/workspace/selection", headers=headers, json={"team": "personal"})
     assert selected.status_code == 200
-    assert client.get("/workspace/list", headers=headers).json()["root"] != str(root)
-    assert client.get("/workspace/list", params={"team": team_id}, headers=headers).json()["root"] == str(root)
+    listing = client.get("/workspace/list", headers=headers).json()
+    assert listing["root"] == "."
+    assert listing["workspace_key"] == f"user:{accounts.get_account(email).uid}"
+    listing = client.get("/workspace/list", params={"team": team_id}, headers=headers).json()
+    assert listing["root"] == "."
+    assert listing["workspace_key"] == f"team:{settings.university_org_id}/{team_id}"
     monkeypatch.setattr(Path, "is_mount", lambda p: False)
     assert client.get("/workspace/list", params={"team": team_id}, headers=headers).status_code == 503
     accounts.set_status(email, "suspended", decided_by="test")
@@ -865,30 +1018,36 @@ def test_open_workspace_rebinds_files_and_rejects_another_teams_link(client, mon
     opened = client.get("/app/", params={"team": team["id"]}, headers=H_OWNER)
     assert opened.status_code == 200, opened.text
     listing = client.get("/workspace/list", headers=H_OWNER).json()
-    assert listing["root"] == str(team_root)
+    assert listing["root"] == "."
+    assert listing["workspace_key"] == f"team:{team['org_id']}/{team['id']}"
     assert "team-project.txt" in {entry["name"] for entry in listing["files"]}
 
     other = _team_of(_create_org(client, H_OUTSIDER, "Other team"), "General")
     denied = client.get("/app/", params={"team": other["id"]}, headers=H_OWNER)
     assert denied.status_code == 404
-    assert client.get("/workspace/list", headers=H_OWNER).json()["root"] == str(team_root)
+    listing = client.get("/workspace/list", headers=H_OWNER).json()
+    assert listing["root"] == "."
+    assert listing["workspace_key"] == f"team:{team['org_id']}/{team['id']}"
 
     personal = client.get("/app/", params={"team": "personal"}, headers=H_OWNER)
     assert personal.status_code == 200, personal.text
     listing = client.get("/workspace/list", headers=H_OWNER).json()
-    assert listing["root"] != str(team_root)
+    assert listing["root"] == "."
+    assert listing["workspace_key"] == f"user:{accounts.get_account(OWNER).uid}"
     assert "team-project.txt" not in {entry["name"] for entry in listing["files"]}
 
 
 def test_university_expired_trial_does_not_unlock_other_services(client, monkeypatch, tmp_path):
-    _, root = _university(client, monkeypatch, tmp_path)
+    team_id, _ = _university(client, monkeypatch, tmp_path)
     email = "expired@ua.edu"
     _seed(email)
     with db.tx() as cur:
         cur.execute("INSERT INTO oauth_identities(provider,subject,email) VALUES ('google','expired-university',%s)", (email,))
         cur.execute("UPDATE accounts SET trial_ends_at = 1 WHERE email = %s", (email,))
     headers = {"X-Dev-User": email}
-    assert client.get("/workspace/list", headers=headers).json()["root"] == str(root)
+    listing = client.get("/workspace/list", headers=headers).json()
+    assert listing["root"] == "."
+    assert listing["workspace_key"] == f"team:{settings.university_org_id}/{team_id}"
     portal = client.get("/api/portal/account", headers=headers)
     assert portal.status_code == 200
     assert portal.json()["workspace"]["storage_provider"] == "box"

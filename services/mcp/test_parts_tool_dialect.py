@@ -59,6 +59,24 @@ def _call(tool: str, /, **kwargs) -> dict:
 def _notes(payload: dict) -> str:
     return " ".join(payload.get("interpreted") or [])
 
+@pytest.fixture(scope="module", autouse=True)
+def local_catalog(tmp_path_factory):
+    """Exercise dialects against real bundled records, never a user's live providers."""
+    import services.parts as parts
+    from services.parts.adapters.bolts_adapter import BoltsAdapter
+    from services.parts.adapters.core_families_adapter import CoreFamiliesAdapter
+
+    root = tmp_path_factory.mktemp("parts-dialect-catalog")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("CHUDWARE_PARTS_INDEX_CACHE", str(root / "parts.sqlite"))
+        hub = parts.PartsHub()
+        hub.register(BoltsAdapter())
+        hub.register(CoreFamiliesAdapter())
+        hub.rebuild_index()
+        patch.setattr(parts, "_hub", hub)
+        yield hub
+
+
 
 @pytest.fixture
 def placed(monkeypatch):
@@ -141,7 +159,15 @@ def test_the_interpretation_echo_survives_output_budget_pressure():
     saw hits for a query it never wrote, with no record of the rewrite — the
     silent-rewrite defect this echo exists to prevent.
     """
-    out = _call("part_search", part_type="bushing", bore_mm=20)
+    from services.mcp import result_serving as rs
+
+    payload = _call("part_search", part_type="bushing", bore_mm=20, detail="full")
+    assert payload["ok"] is True
+    summary = rs.project_part_search(payload, rs.ServeOpts(detail="summary"))
+    # Apply real budget pressure explicitly, independent of live vendor notices
+    # or the size of whichever local catalog a preceding test happened to leave.
+    budget = max(1, rs.count_tokens(summary) // 2)
+    out = json.loads(rs.serve(summary, rs.ServeOpts(budget_tokens=budget)))
     assert out["meta"]["truncated"] is True, "expected a budget-trimmed payload"
     dropped = out["meta"]["omitted_keys"]
     for key in ("applied", "interpreted", "interpreted_args"):

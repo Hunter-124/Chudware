@@ -75,6 +75,9 @@ class _Context:
     def close(self) -> None:
         self.closed = True
 
+    def cookies(self, urls):
+        return [{"name": "session", "value": "fixture"}]
+
 
 class _VersionBrowser:
     version = "149.0.7827.55"
@@ -176,6 +179,15 @@ def test_download_uses_context_cookies_and_writes_bytes(monkeypatch, tmp_path):
     context = _Context("", 200, "https://vendor.example/",
                        download=_Response(200, b"STEP payload"))
     dest = tmp_path / "part.step"
+    from services.net import safe_http
+    calls = []
+
+    def download(url, destination, **kwargs):
+        calls.append((url, kwargs["headers_for_url"](url)))
+        destination.write_bytes(b"STEP payload")
+        return safe_http.Response(200, {}, url, bytes_written=len(b"STEP payload"))
+
+    monkeypatch.setattr(safe_http, "download", download)
     result = pw_client.PlaywrightClient(
         "vendor", sync_playwright=_factory(context)).download(
             "https://vendor.example/part.step", str(dest))
@@ -184,7 +196,8 @@ def test_download_uses_context_cookies_and_writes_bytes(monkeypatch, tmp_path):
     assert result["status"] == 200
     assert result["bytes"] == len(b"STEP payload")
     assert dest.read_bytes() == b"STEP payload"
-    assert context.request.calls[0][0] == "https://vendor.example/part.step"
+    assert calls == [("https://vendor.example/part.step", {"Cookie": "session=fixture"})]
+    assert context.request.calls == []
 
 
 def test_download_bot_wall_does_not_write_partial_file(monkeypatch, tmp_path):
@@ -192,6 +205,9 @@ def test_download_bot_wall_does_not_write_partial_file(monkeypatch, tmp_path):
     context = _Context("", 403, "https://vendor.example/",
                        download=_Response(403, b"Access Denied"))
     dest = tmp_path / "blocked.step"
+    from services.net import safe_http
+    monkeypatch.setattr(safe_http, "download",
+                        lambda url, *_args, **_kwargs: safe_http.Response(403, {}, url))
     result = pw_client.PlaywrightClient(
         "vendor", sync_playwright=_factory(context)).download(
             "https://vendor.example/blocked.step", str(dest))

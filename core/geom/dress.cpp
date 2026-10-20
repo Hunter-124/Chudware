@@ -15,7 +15,12 @@
 
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Curve2d.hxx>
+#include <BRepAlgoAPI_Fuse.hxx>
+#include <BRepBuilderAPI_Copy.hxx>
+#include <BRepTools_History.hxx>
 #include <BRepCheck_Analyzer.hxx>
+#include <BRepClass3d_SolidClassifier.hxx>
+#include <BRepClass_FaceClassifier.hxx>
 #include <BRepLProp_SLProps.hxx>
 #include <BRepOffset_Error.hxx>
 #include <BRepOffset_MakeOffset.hxx>
@@ -23,22 +28,32 @@
 #include <BRep_Tool.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepFilletAPI_MakeChamfer.hxx>
+#include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
 #include <BRepBuilderAPI_MakeSolid.hxx>
+#include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_Sewing.hxx>
 #include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepOffsetAPI_DraftAngle.hxx>
 #include <BRepOffsetAPI_MakeOffsetShape.hxx>
 #include <BRepOffsetAPI_MakeThickSolid.hxx>
 #include <BRepOffset_Mode.hxx>
+#include <BRepPrimAPI_MakePrism.hxx>
+#include <BRepPrimAPI_MakeRevol.hxx>
 #include <BRepLib.hxx>
 #include <BRepGProp.hxx>
+#include <GCPnts_AbscissaPoint.hxx>
+#include <GC_MakeArcOfCircle.hxx>
 #include <GProp_GProps.hxx>
+#include <GeomAPI_ProjectPointOnSurf.hxx>
 #include <GeomAbs_CurveType.hxx>
 #include <GeomAbs_JoinType.hxx>
 #include <GeomAbs_Shape.hxx>
 #include <GeomAbs_SurfaceType.hxx>
+#include <GeomLProp_SLProps.hxx>
+#include <Precision.hxx>
+#include <ShapeUpgrade_UnifySameDomain.hxx>
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
@@ -52,10 +67,12 @@
 #include <TopoDS_Vertex.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
+#include <gp_Circ.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Pnt2d.hxx>
+#include <gp_Trsf.hxx>
 #include <gp_Vec.hxx>
 
 namespace geom {
@@ -164,14 +181,14 @@ std::vector<TopoDS_Edge> select_blendable(const TopoDS_Shape& shape,
 
 // Build a fillet/chamfer over `good`, dropping any edge that breaks the build instead of failing
 // the whole feature. Fast path adds them all at once (the common, correct case); on failure it
-// re-adds one at a time and keeps only the edges that still produce a valid solid. This is what
+// re-adds one at a time and keeps only edges that still produce a watertight solid. This is what
 // the user expects when most edges are fine and one section is too tight for the radius (a rim near
 // the axis, a corner OCCT can't resolve, radius > local half-width) — "round what you can" beats
 // a hard error. `Builder` is BRepFilletAPI_MakeFillet/_MakeChamfer; `add(mk, edge)` applies the leg.
-// An edge is ACCEPTED only when its build is IsDone AND the result is still a WATERTIGHT solid:
-// an edge whose drop (or whose own blend) opens the shell is rejected too, so the returned body
-// is always closed — otherwise the downstream open-shell guard would reject the whole feature
-// even though most edges rounded fine (the all-or-nothing "produced an open/invalid body" bug).
+// This is a topology-only gate: an edge is accepted here when IsDone and WATERTIGHT.
+// A closed result can still contain overlapping or collapsed faces. The document's
+// final dress geometry gate rejects those before consuming the preceding body,
+// rather than treating an invalid result as another reason to silently drop picks.
 template <class Builder, class AddFn>
 TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
                                 const std::vector<TopoDS_Edge>& good, AddFn add,
@@ -240,6 +257,324 @@ TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
     if (n_dropped) *n_dropped = (int)(good.size() - accepted.size());
     return accepted.empty() ? TopoDS_Shape()
                             : finish(build(accepted, recording ? &prov : nullptr));
+}
+
+// --- contact-edge (joining) fillets ---
+// Two solids that meet only along a line share that edge: it has four faces, two per solid,
+// and BRepFilletAPI (two faces per edge) cannot blend it. Around such an edge the normal plane
+// alternates solid A, an empty corner, solid B, an empty corner. Each empty corner narrower than
+// 180 degrees gets the rolling-ball fillet's cross-section (the region between the two faces and
+// the tangent arc), swept along the edge, and the sweep is fused in. The faces must run straight
+// away from the edge so one cross-section is exact along its whole length: a straight edge is
+// swept by a prism, a circular edge by a revolution about the circle's axis.
+
+struct ContactFace {
+    TopoDS_Face face;
+    int solid = -1;      // index into the edge's two solids
+    gp_Vec dir;          // unit direction into the face, normal to the edge, at the edge midpoint
+    double angle = 0.0;  // of `dir` in the edge's normal-plane frame
+};
+
+// Projects `p` onto `face`'s surface: kOnFace when it lies within `tol` of the surface and
+// inside (or on the boundary of) the face.
+enum class FacePoint { kOnFace, kOffSurface, kOutside };
+
+FacePoint classify_on_face(const TopoDS_Face& face, const gp_Pnt& p, double tol) {
+    GeomAPI_ProjectPointOnSurf proj(p, BRep_Tool::Surface(face));
+    if (proj.NbPoints() == 0 || proj.LowerDistance() > tol) return FacePoint::kOffSurface;
+    Standard_Real u = 0, v = 0;
+    proj.LowerDistanceParameters(u, v);
+    BRepClass_FaceClassifier cls(face, gp_Pnt2d(u, v), tol);
+    const TopAbs_State st = cls.State();
+    return st == TopAbs_IN || st == TopAbs_ON ? FacePoint::kOnFace : FacePoint::kOutside;
+}
+
+// The fillet material for every concave corner around contact edge `e`. Empty with `why` set
+// when the edge is not a supported two-solid contact or `r` does not fit.
+std::vector<TopoDS_Shape> contact_fillet_material(
+        const TopoDS_Edge& e, double r,
+        const TopTools_IndexedDataMapOfShapeListOfShape& edge_faces,
+        const TopTools_IndexedDataMapOfShapeListOfShape& face_solids, std::string& why) {
+    TopTools_IndexedMapOfShape solids;
+    std::vector<ContactFace> faces;
+    TopTools_IndexedMapOfShape seen;
+    for (TopTools_ListIteratorOfListOfShape it(edge_faces.FindFromKey(e)); it.More(); it.Next()) {
+        if (seen.Contains(it.Value())) continue;
+        seen.Add(it.Value());
+        if (!face_solids.Contains(it.Value()) || face_solids.FindFromKey(it.Value()).Extent() != 1) {
+            why = "the shared edge must border exactly two solid bodies";
+            return {};
+        }
+        ContactFace cf;
+        cf.face = TopoDS::Face(it.Value());
+        cf.solid = solids.Add(face_solids.FindFromKey(it.Value()).First()) - 1;
+        faces.push_back(cf);
+    }
+    if (faces.size() != 4 || solids.Extent() != 2 ||
+        std::count_if(faces.begin(), faces.end(), [](const ContactFace& f) { return f.solid == 0; }) != 2) {
+        why = "the shared edge must border exactly two solid bodies, two faces each";
+        return {};
+    }
+
+    const BRepAdaptor_Curve curve(e);
+    const GeomAbs_CurveType kind = curve.GetType();
+    if (kind != GeomAbs_Line && kind != GeomAbs_Circle) {
+        why = "a joining fillet needs a straight or circular shared edge";
+        return {};
+    }
+    const double u0 = curve.FirstParameter(), u1 = curve.LastParameter();
+    const double um = 0.5 * (u0 + u1);
+    const double length = GCPnts_AbscissaPoint::Length(curve);
+    if (!(length > Precision::Confusion())) {
+        why = "the shared edge has no length";
+        return {};
+    }
+    gp_Pnt pm;
+    gp_Vec tm;
+    curve.D1(um, pm, tm);
+    if (tm.Magnitude() < 1e-12) {
+        why = "the shared edge has no tangent";
+        return {};
+    }
+    tm.Normalize();
+    // Transport a midpoint direction to parameter `u`: identity along a line, the circle's
+    // rotation along an arc (faces of a revolved corner keep their angle to the radial plane).
+    auto transport = [&](const gp_Vec& v, double u) {
+        if (kind == GeomAbs_Line) return v;
+        gp_Trsf rot;
+        rot.SetRotation(curve.Circle().Axis(), u - um);
+        return v.Transformed(rot);
+    };
+
+    // Each face's in-face direction at the midpoint: normal to the edge, tangent to the face,
+    // pointing into it (the sign that stays on the face).
+    const double probe = 1e-3 * std::min(r, length);
+    for (ContactFace& cf : faces) {
+        const Handle(Geom_Surface) surf = BRep_Tool::Surface(cf.face);
+        GeomAPI_ProjectPointOnSurf proj(pm, surf);
+        if (proj.NbPoints() == 0) {
+            why = "could not resolve the faces around the shared edge";
+            return {};
+        }
+        Standard_Real su = 0, sv = 0;
+        proj.LowerDistanceParameters(su, sv);
+        GeomLProp_SLProps props(surf, su, sv, 1, Precision::Confusion());
+        if (!props.IsNormalDefined()) {
+            why = "could not resolve the faces around the shared edge";
+            return {};
+        }
+        gp_Vec dir = tm.Crossed(gp_Vec(props.Normal()));
+        if (dir.Magnitude() < 1e-9) {
+            why = "a face is tangent to the shared edge's direction";
+            return {};
+        }
+        dir.Normalize();
+        const double tol = std::max(1e-6, BRep_Tool::Tolerance(cf.face)) + 1e-3 * probe;
+        if (classify_on_face(cf.face, pm.Translated(dir * probe), tol) != FacePoint::kOnFace) {
+            dir.Reverse();
+            if (classify_on_face(cf.face, pm.Translated(dir * probe), tol) != FacePoint::kOnFace) {
+                why = "could not resolve the faces around the shared edge";
+                return {};
+            }
+        }
+        cf.dir = dir;
+    }
+    const gp_Vec xd = faces[0].dir;
+    const gp_Vec yd = tm.Crossed(xd);
+    for (ContactFace& cf : faces) {
+        double a = std::atan2(cf.dir.Dot(yd), cf.dir.Dot(xd));
+        cf.angle = a < 0 ? a + 2 * M_PI : a;
+    }
+    std::sort(faces.begin(), faces.end(),
+              [](const ContactFace& a, const ContactFace& b) { return a.angle < b.angle; });
+
+    std::vector<TopoDS_Shape> material;
+    const gp_Pnt p0 = curve.Value(u0);
+    for (size_t k = 0; k < faces.size(); ++k) {
+        const ContactFace& fa = faces[k];
+        const ContactFace& fb = faces[(k + 1) % faces.size()];
+        double span = fb.angle - fa.angle;
+        if (span <= 0) span += 2 * M_PI;
+        // A corner is empty when its bisector point lies in neither solid.
+        const double mid = fa.angle + 0.5 * span;
+        const gp_Vec bis = xd * std::cos(mid) + yd * std::sin(mid);
+        const gp_Pnt sample = pm.Translated(bis * probe);
+        bool filled = false;
+        for (int s = 1; s <= solids.Extent() && !filled; ++s) {
+            BRepClass3d_SolidClassifier cls(solids(s), sample, Precision::Confusion());
+            filled = cls.State() == TopAbs_IN;
+        }
+        if (filled || span >= M_PI - 1e-6) continue;  // material, or a flat/convex opening
+        if (fa.solid == fb.solid) {
+            why = "a corner at the shared edge is bounded by one body on both sides";
+            return {};
+        }
+        const double tangent = r / std::tan(0.5 * span);   // edge to tangent line, along each face
+        const double center = r / std::sin(0.5 * span);    // edge to arc center, along the bisector
+        // The cross-section is exact only if each face contains the straight leg from the edge
+        // to the tangent line everywhere along the edge.
+        for (double frac : {0.0, 0.25, 0.5, 0.75, 1.0}) {
+            const double u = u0 + frac * (u1 - u0);
+            const gp_Pnt p = curve.Value(u);
+            for (const ContactFace* f : {&fa, &fb}) {
+                const gp_Vec dir = transport(f->dir, u);
+                const double tol = std::max(1e-6, BRep_Tool::Tolerance(f->face)) + 1e-7 * r;
+                for (double leg : {0.5, 1.0}) {
+                    const FacePoint fp = classify_on_face(f->face, p.Translated(dir * (leg * tangent)), tol);
+                    if (fp == FacePoint::kOffSurface) {
+                        why = "the faces at the shared edge curve away from it; a joining fillet "
+                              "needs faces that run straight from the edge (planes, cylinders, cones)";
+                        return {};
+                    }
+                    if (fp == FacePoint::kOutside) {
+                        char buf[160];
+                        std::snprintf(buf, sizeof(buf),
+                                      "radius %.4g mm is too large for the faces at the shared edge",
+                                      r);
+                        why = buf;
+                        return {};
+                    }
+                }
+            }
+        }
+        // Cross-section in the normal plane at the edge start: edge point, tangent line on face
+        // a, the arc nearest the edge, tangent line on face b.
+        const gp_Vec da = transport(fa.dir, u0), db = transport(fb.dir, u0);
+        const gp_Vec dbis = transport(bis, u0);
+        const gp_Pnt ta = p0.Translated(da * tangent), tb = p0.Translated(db * tangent);
+        const gp_Pnt apex = p0.Translated(dbis * (center - r));
+        try {
+            GC_MakeArcOfCircle arc(ta, apex, tb);
+            if (!arc.IsDone()) {
+                why = "could not build the fillet cross-section";
+                return {};
+            }
+            BRepBuilderAPI_MakeWire wire(BRepBuilderAPI_MakeEdge(p0, ta).Edge(),
+                                         BRepBuilderAPI_MakeEdge(arc.Value()).Edge(),
+                                         BRepBuilderAPI_MakeEdge(tb, p0).Edge());
+            BRepBuilderAPI_MakeFace section(wire.Wire(), Standard_True);
+            if (!section.IsDone()) {
+                why = "could not build the fillet cross-section";
+                return {};
+            }
+            TopoDS_Shape swept;
+            if (kind == GeomAbs_Line) {
+                swept = BRepPrimAPI_MakePrism(section.Face(), gp_Vec(p0, curve.Value(u1))).Shape();
+            } else {
+                swept = BRepPrimAPI_MakeRevol(section.Face(), curve.Circle().Axis(), u1 - u0).Shape();
+            }
+            GProp_GProps props;
+            BRepGProp::VolumeProperties(swept, props);
+            if (swept.IsNull() || !BRepCheck_Analyzer(swept).IsValid() || !(props.Mass() > 0)) {
+                why = "the fillet sweep along the shared edge is invalid";
+                return {};
+            }
+            material.push_back(swept);
+        } catch (const Standard_Failure&) {
+            why = "could not build the fillet along the shared edge";
+            return {};
+        }
+    }
+    if (material.empty()) why = "the shared edge has no concave corner to fillet";
+    return material;
+}
+
+int solid_count(const TopoDS_Shape& s) {
+    int n = 0;
+    for (TopExp_Explorer ex(s, TopAbs_SOLID); ex.More(); ex.Next()) ++n;
+    return n;
+}
+
+// Joins `shape` across its contact edges (see above) and maps `manifold` (the other picks)
+// onto the joined shape. `joined` counts contact edges that were filled; `failed` counts
+// contact edges plus manifold picks that could not be carried over.
+struct ContactJoin {
+    TopoDS_Shape shape;
+    std::vector<TopoDS_Edge> manifold;
+    int joined = 0;
+    int failed = 0;
+    std::string why;
+};
+
+ContactJoin join_contact_edges(const TopoDS_Shape& shape, double r,
+                               const std::vector<TopoDS_Edge>& contact,
+                               const std::vector<TopoDS_Edge>& manifold,
+                               const TopTools_IndexedDataMapOfShapeListOfShape& edge_faces,
+                               const TopTools_IndexedDataMapOfShapeListOfShape& face_solids) {
+    ContactJoin out;
+    out.shape = shape;
+    out.manifold = manifold;
+    TopTools_ListOfShape tools;
+    int filled_edges = 0;
+    for (const TopoDS_Edge& e : contact) {
+        std::string why;
+        const std::vector<TopoDS_Shape> material =
+            contact_fillet_material(e, r, edge_faces, face_solids, why);
+        if (material.empty()) {
+            ++out.failed;
+            if (out.why.empty()) out.why = why;
+            continue;
+        }
+        ++filled_edges;
+        for (const TopoDS_Shape& m : material) tools.Append(m);
+    }
+    if (tools.IsEmpty()) return out;
+
+    auto fail_all = [&](const char* why) {
+        out.failed += filled_edges;
+        if (out.why.empty()) out.why = why;
+        return out;
+    };
+    try {
+        TopTools_ListOfShape args;
+        args.Append(shape);
+        BRepAlgoAPI_Fuse fuse;
+        fuse.SetArguments(args);
+        fuse.SetTools(tools);
+        fuse.SetNonDestructive(Standard_True);
+        fuse.Build();
+        if (!fuse.IsDone()) return fail_all("the kernel could not fuse the joining fillet");
+        // Unify a topology copy: UnifySameDomain edits its input's edges in place, and the
+        // NonDestructive fuse shares untouched TShapes with `shape` (see
+        // geom::unify_same_domain).
+        TopTools_ListOfShape fused_args;
+        fused_args.Append(fuse.Shape());
+        BRepBuilderAPI_Copy copier(fuse.Shape(), Standard_False, Standard_False);
+        ShapeUpgrade_UnifySameDomain unify(copier.Shape(), Standard_True, Standard_True,
+                                           Standard_False);
+        unify.Build();
+        const TopoDS_Shape joined = unify.Shape();
+        if (joined.IsNull() || solid_count(joined) >= solid_count(shape) ||
+            !BRepCheck_Analyzer(joined).IsValid())
+            return fail_all("the joining fillet did not merge the bodies into one valid solid");
+        const std::vector<Handle(BRepTools_History)> histories = {
+            fuse.History(), new BRepTools_History(fused_args, copier), unify.History()};
+        if (op_history_recording())
+            for (const auto& h : histories) op_history_record(h);
+        TopTools_IndexedMapOfShape joined_edges;
+        TopExp::MapShapes(joined, TopAbs_EDGE, joined_edges);
+        out.manifold.clear();
+        for (const TopoDS_Edge& e : manifold) {
+            TopTools_ListOfShape images;
+            op_history_images(e, histories, images);
+            bool kept = false;
+            for (TopTools_ListIteratorOfListOfShape it(images); it.More(); it.Next()) {
+                if (it.Value().ShapeType() != TopAbs_EDGE || !joined_edges.Contains(it.Value()))
+                    continue;
+                const TopoDS_Edge image = TopoDS::Edge(joined_edges(joined_edges.FindIndex(it.Value())));
+                if (std::none_of(out.manifold.begin(), out.manifold.end(),
+                                 [&](const TopoDS_Edge& x) { return x.IsSame(image); }))
+                    out.manifold.push_back(image);
+                kept = true;
+            }
+            if (!kept) ++out.failed;
+        }
+        out.shape = joined;
+        out.joined = filled_edges;
+        return out;
+    } catch (const Standard_Failure&) {
+        return fail_all("the kernel could not fuse the joining fillet");
+    }
 }
 
 }  // namespace
@@ -320,11 +655,49 @@ static std::vector<TopoDS_Edge> blendable_only(const TopoDS_Shape& shape,
 }
 
 TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
-                          const std::vector<TopoDS_Edge>& edges, int* n_dropped) {
+                          const std::vector<TopoDS_Edge>& edges, int* n_dropped,
+                          std::string* why) {
+    if (n_dropped) *n_dropped = 0;
+    if (why) why->clear();
     if (edges.empty()) return TopoDS_Shape();
-    return blend_drop_failing<BRepFilletAPI_MakeFillet>(
-        shape, blendable_only(shape, edges),
-        [r](BRepFilletAPI_MakeFillet& mk, const TopoDS_Edge& e) { mk.Add(r, e); }, n_dropped);
+    auto blend = [r](const TopoDS_Shape& s, const std::vector<TopoDS_Edge>& es, int* nd) {
+        return blend_drop_failing<BRepFilletAPI_MakeFillet>(
+            s, es, [r](BRepFilletAPI_MakeFillet& mk, const TopoDS_Edge& e) { mk.Add(r, e); }, nd);
+    };
+    const std::vector<TopoDS_Edge> good = blendable_only(shape, edges);
+    // A pick whose faces belong to two different solids is a contact edge between bodies.
+    TopTools_IndexedDataMapOfShapeListOfShape edge_faces, face_solids;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
+    TopExp::MapShapesAndAncestors(shape, TopAbs_FACE, TopAbs_SOLID, face_solids);
+    std::vector<TopoDS_Edge> contact, manifold;
+    for (const TopoDS_Edge& e : good) {
+        TopTools_IndexedMapOfShape solids;
+        if (edge_faces.Contains(e))
+            for (TopTools_ListIteratorOfListOfShape it(edge_faces.FindFromKey(e)); it.More(); it.Next())
+                if (face_solids.Contains(it.Value()))
+                    for (TopTools_ListIteratorOfListOfShape s(face_solids.FindFromKey(it.Value()));
+                         s.More(); s.Next())
+                        solids.Add(s.Value());
+        (solids.Extent() > 1 ? contact : manifold).push_back(e);
+    }
+    if (contact.empty()) return blend(shape, good, n_dropped);
+
+    ContactJoin join = join_contact_edges(shape, r, contact, manifold, edge_faces, face_solids);
+    if (why) *why = join.why;
+    int dropped = join.failed;
+    TopoDS_Shape out = join.joined > 0 ? join.shape : TopoDS_Shape();
+    if (!join.manifold.empty()) {
+        int nd = 0;
+        const TopoDS_Shape blended = blend(join.shape, join.manifold, &nd);
+        if (blended.IsNull()) {
+            dropped += (int)join.manifold.size();
+        } else {
+            dropped += nd;
+            out = blended;
+        }
+    }
+    if (n_dropped) *n_dropped = dropped;
+    return out;
 }
 
 TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,

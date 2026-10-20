@@ -18,7 +18,7 @@ deployment that already has them.
 
 ## (a) SECURITY FIRST — rotate leaked credentials
 
-`Webservice/Cloudflare-info.txt` (and git history) held a **live Cloudflare API token** and **R2 S3 keys**. Treat them as compromised.
+`Webservice/Cloudflare-info.txt` (and git history) held a **live Cloudflare API token** and **R2 S3 keys**. **Rotated 2026-10-20:** the all-permissions account token `old-cell-14db` (and its derived R2 pair) is revoked, the remotely-managed tunnel secret was re-issued, and scoped replacements exist (`chudware-ops-2026-10-20` in `Cloudflare-info.txt`, `chudware-pages-deploy-2026-10-20` only in the GitHub `CLOUDFLARE_API_TOKEN` secret, `kinocasino-access-2026-10-20` only in `~/kinocasino/kinocasino.env`). Any value still found in history is dead. The steps below remain the procedure for the next rotation.
 
 ### Rotate now
 
@@ -415,6 +415,12 @@ curl -sS http://127.0.0.1:8300/healthz
 ```
 
 Env file: `~/chudware-web-data/gateway.env`. Unit `MemoryMax=1G`.
+
+If a start fails with `Failed to set up credentials: File exists` (status
+243/CREDENTIALS), a previously failed start left
+`/run/user/$UID/systemd/temporary-credentials/chudware-gateway.service` behind
+(systemd 259 user manager). Stop the unit, remove only that directory, then
+`systemctl --user reset-failed chudware-gateway` and start it again.
 
 ### Workspace cell engine logs
 

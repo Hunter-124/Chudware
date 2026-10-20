@@ -4,7 +4,30 @@ Trigger: owner reported suspicious visitors in traffic analytics.
 Scope: live production (`livingroom-pc`, `app.chudware.com` gateway, PostgreSQL `chudware_prod`),
 Cloudflare account/edge, GitHub repository access, the developer workstation (`hunter-pc`), the
 `cloudcastle-prod` host that holds a root agent on production, plus a source/dependency refresh.
-All production work was read-only; nothing was changed, restarted, suspended, or rotated.
+The 2026-10-19 assessment itself was read-only; the changes made afterwards are recorded below.
+
+## Remediation applied 2026-10-20 (owner-authorized)
+
+| Finding | Action | Verification |
+|---|---|---|
+| BA-01 | Temporary Cloudflare rule blocked `/engine`, `/ws/*` and `/admin/terminal` outside the owner networks while the fix shipped. Then the remediated tree (`df401ad6b`) and gateway hardening (`51ac00d9d`, `86629b3ea`) were deployed by manual gateway cutover. The shared web hostd, `chudware-webd-sync` and the legacy staging gateway were stopped and disabled. `NoNewPrivileges=yes` drop-ins were added to every chudware user unit. Once the fix was live, the temporary rule was removed. | Loopback probe: an expired-trial account is refused before accept (403). An admin `/engine` connection closes with `1013 cell unavailable`, and `agent_spawn` never reaches a process. Gateway health is `{"ok":true}`. |
+| BA-02 | Revoked account token `old-cell-14db`, which also kills the R2 pair derived from it. Re-issued the tunnel secret (that token could read it). Created scoped tokens: ops (DNS, Email Routing, Tunnel, Zone WAF), Pages deploy (GitHub secret updated), Kinocasino Access (its env updated, service restarted). Deleted the unused broad read-only user token "Cloudflare Agent Token - 2026-07-14". Replaced the leaked literals in the test with digests. | The old token's verify call returns `401 Invalid API Token`. All four tunnel connectors are new and come from the production host. app.chudware.com, chudware.com and scootware.us respond. |
+| BA-03 | Prod venv rebuilt from pins: PyJWT 2.15.0, cryptography 50.0.0, urllib3 2.8.0. | `pip show` on prod |
+| BA-04 | journald raised to 1 GiB with 45-day retention. Cloudflare HTTP analytics (30 days) serve as the access log, because uvicorn access logs would record OAuth and verification tokens in query strings. | `journalctl --disk-usage` |
+| BA-05 | Resolved: `iamnotyobabydaddy` is Michael Edmonds, an active contributor to `chudcode`/`omp`. Briefly removed, then re-invited with write access. | `gh api …/collaborators` |
+| BA-06 | Removed the 4 empty test-fixture workspaces. Dump set to mode 0600. | `ls` |
+| BA-07 | Left at `p=none`. Gateway mail goes through Gmail SMTP as `noreply@chudware.com` without aligned SPF/DKIM, so `quarantine` would spam-file verification mail. | DNS + `gateway.env` mail keys |
+| GW-D01..D06 | All fixed in `51ac00d9d`. | Externally, a 1 MiB body and a chunked oversized body both get **413**, and a normal bad login gets 401. Gateway suite: 1195 passed (one Playwright-environment failure). Deploy suite: 299 passed. |
+| Edge | WAF custom rule blocks dotfile, PHP/WordPress, traversal, tfstate, `.env`/`.sql`/`.bak` probes. Rate limit on `/api/auth/*` is 15 requests per 10 s per IP. | From an external host, `/.env`, `/wp-admin/install.php` and `../proc/self/environ` return 403; the site and `/signin` return 200. |
+| hunter-pc | Ollama bound to `127.0.0.1` (14 days of logs showed only local clients). | `ss -ltn` |
+
+Remaining:
+- Browser CAD and AI stay unavailable until tenant cells are provisioned. That needs XFS/ext4 project-quota storage, since the root filesystem is btrfs, plus a runtime wheelhouse and promotion authority. The new design refuses to run them without these.
+- `liveuser` keeps NOPASSWD sudo because the shared host's CI and admin tooling depend on it. Web-facing services can no longer escalate through it.
+- The pre-cutover dump `~/chudware-web-data/backups/pre-cutover-prod-20261020.sql.gz` is plaintext at mode 0600.
+- Production outage: the gateway was down about 4 minutes (06:53–06:57 EDT) during the cutover while a sandbox-only preflight refusal was fixed.
+
+The sections below are the original read-only assessment.
 
 ## Verdict
 

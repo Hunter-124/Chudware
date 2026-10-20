@@ -92,8 +92,8 @@ free RAM, disk, `nvidia-smi` VRAM; JSONL log; `/healthz` for a remote glance.
 No Prometheus in v1.
 
 ## Security notes
-- **ROTATE the Cloudflare API token + R2 keys** from `Cloudflare-info.txt` — they were pushed
-  to the public GitHub repo (untracked in ac1b912f, but history retains them).
+- The Cloudflare API token + R2 keys once pushed to the public GitHub repo
+  (untracked in ac1b912f, history retains them) were revoked 2026-10-20.
 - Gateway binds 127.0.0.1 only; the tunnel is the sole ingress; every request is
   authorized server-side — the `chudware_sid` session row first, an Access JWT only in
   the fallback mode nothing uses today.

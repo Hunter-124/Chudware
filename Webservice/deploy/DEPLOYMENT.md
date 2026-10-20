@@ -11,10 +11,10 @@ referenced below by placeholder only.
 | `<R2_ACCESS_KEY_ID>` | R2 S3-compatible Access Key ID | `Webservice/Cloudflare-info.txt` |
 | `<R2_SECRET_ACCESS_KEY>` | R2 S3-compatible Secret Access Key | `Webservice/Cloudflare-info.txt` |
 
-> **ROTATION REQUIRED:** these credentials were committed to git history in
-> `84963165` (removed from tracking in `ac1b912f`). The values in git history
-> must be considered compromised — rotate them before relying on this
-> deployment. See "Credential rotation" at the bottom.
+> **ROTATED 2026-10-20:** the credentials committed to git history in
+> `84963165` (removed from tracking in `ac1b912f`) are revoked; the values in
+> history are dead. Current scoped tokens are listed in RUNBOOK §a. See
+> "Credential rotation" at the bottom for the procedure.
 
 ## Account
 

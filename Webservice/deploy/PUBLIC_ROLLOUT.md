@@ -595,9 +595,9 @@ Found, NOT fixed — each is a real gap:
   dashboard. Keeping the sampler alive is not cosmetic: this host shares `/` with a
   self-hosted Actions runner whose cache filled the disk on 2026-08-10 and took
   Stalwart's RocksDB down with `No space left on device`.
-- **The Cloudflare API token and R2 keys in `Webservice/Cloudflare-info.txt` are
-  compromised** — the file says so itself; they were committed in `84963165`
-  and are still the live credentials. Rotate them.
+- ~~**The Cloudflare API token and R2 keys in `Webservice/Cloudflare-info.txt` are
+  compromised**~~ — **rotated 2026-10-20.** The token committed in `84963165` is
+  revoked (its R2 pair with it) and the tunnel secret was re-issued; see RUNBOOK §a.
 - **No Google OAuth in prod.** With Access no longer fronting the host, a user
   who cannot receive mail has no self-service recovery at all: no OAuth, and
   password reset needs the transport in §9. Configuring OAuth would give a mail-

@@ -1,6 +1,6 @@
 # Contract: CAM simulation frames, audit, machines, job diff
 
-> **Frozen seam.** Append-only; changes require integrator sign-off + a version bump
+> **Frozen seam.** Append-only; changes require maintainer sign-off + a version bump
 > (see `contracts/README.md`). Executable producers live in `core/cam/` (`stock_sim`,
 > `audit`, `feeds`/`MachineDB`, `session`) with thin MCP wrappers under `services/mcp/`.
 

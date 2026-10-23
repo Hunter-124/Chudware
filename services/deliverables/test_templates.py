@@ -1,4 +1,4 @@
-"""Golden-file tests for the five T-F15 engineering deliverable templates.
+"""Golden-file tests for the five engineering deliverable templates.
 
 Templates covered (name / kind / formats):
   - design_review        (presentation / pptx)

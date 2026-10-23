@@ -1,10 +1,10 @@
-"""Regression tests for interface_check (T-BL49) — real engine geometry, asserted deltas.
+"""Regression tests for interface_check — real engine geometry, asserted deltas.
 
 Drives the registered interface_check MCP tool end-to-end against the staged libchudware.so.
 The worked example: a 4-hole plate stack (bracket + plate). A deliberately MISALIGNED version
 must be FLAGGED with the correct position delta; the CORRECTED (registered) version must PASS.
 
-Also covers the shared doc_query `body_id` selector this tool depends on (T-BL49 engine change):
+Also covers the shared doc_query `body_id` selector this tool depends on:
 per-body face selection, world-placed assembly bodies and the out-of-range guard.
 
 Run:  python -m pytest services/mcp/test_interface_check.py -v

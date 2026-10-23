@@ -1,6 +1,6 @@
-"""mission_dispatch.py — run-scoped tool dispatch for mission agent turns (T-W32).
+"""mission_dispatch.py — run-scoped tool dispatch for mission agent turns.
 
-T-W30's REAL gym cycles diagnosed a *dispatch-coverage gap*: role cards allow
+Benchmark gym cycles diagnosed a *dispatch-coverage gap*: role cards allow
 run-scoped tools (``ledger_get``/``ledger_note``, ``dag_plan``, ``ask_user``,
 ``delegate``, ``part_search``) that the process-wide battery/research resolver
 cannot serve — they need mission context (the run's ledger handle, run_id,
@@ -13,7 +13,7 @@ fallback (``reviewer_exec._resolve_fn``), so:
 
   * a mission-scoped tool resolves against the run (mission hit), and
   * everything else falls through to the ONE process-wide registry (global
-    fallback) — same singleton discipline as T-W30.
+    fallback) — same singleton discipline as the agent turn.
 
 Honesty rules:
   * ``ask_user`` in an autonomous run never fabricates a human: it RECORDS the
@@ -356,8 +356,8 @@ class MissionDispatch:
         doc_id: default doc context for tools that accept one.
     """
 
-    #: The run-scoped tool families this layer serves (T-W32 DoD list + the
-    #: Parts Library V2 sourcing surface — workstream 5) + coordination board
+    #: The run-scoped tool families this layer serves (core mission tools + the
+    #: Parts Library V2 sourcing surface) + coordination board
     #: + corporate org mode (aicad.corporate/1).
     TOOLS = (
         "ledger_get",
@@ -2151,7 +2151,7 @@ class MissionDispatch:
                 "hint": "Take artifact_path from scrape_queue_status on a done job.",
             }
         try:
-            from services.mcp import core_bridge as cb  # noqa: PLC0415 — ported to core (T-RF19)
+            from services.mcp import core_bridge as cb  # noqa: PLC0415 — ported to core
 
             out = cb.call("part_import_file", {"path": path})
         except Exception as exc:  # noqa: BLE001
@@ -3132,8 +3132,8 @@ def run_linear_role_turn(
         )
     finally:
         _org_tools.bind_mission_context(None)
-    # TERMINAL SAVE SWEEP. Nothing closes the documents a run builds (T-RF5 deleted
-    # loop._terminal_autosave_close_docs; the C++ mission path only doc_saves the doc a
+    # TERMINAL SAVE SWEEP. Nothing closes the documents a run builds (the Python
+    # loop._terminal_autosave_close_docs was removed; the C++ mission path only doc_saves the doc a
     # DAG node is on), so an agent doc with no real backing file sat abandoned until the
     # 30-min agent GC grace, was retired to hostd's crash-recovery ORPHAN tier, and came
     # back as a "part potentially lost" row in the GUI's "Recover unsaved parts?" prompt

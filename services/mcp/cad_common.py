@@ -1,5 +1,5 @@
-"""Shared state + helpers for the mechanical-CAD MCP tool family modules (T-RF8 split
-of the former cad_tools.py god file): doc registry/aliases, handoff publish, autosave +
+"""Shared state + helpers for the mechanical-CAD MCP tool family modules (split out
+of the former monolithic cad_tools.py): doc registry/aliases, handoff publish, autosave +
 recovery, background jobs, materials/appearance, inspect/measure/render helper machinery.
 Imported by the cad_*_tools family modules; re-exported through the cad_tools facade."""
 
@@ -1302,7 +1302,7 @@ def archive_before_write(
 # its doc sessions. To make the AI's part visible in the app's viewport, we publish it as a
 # native .step+ doc plus a tiny live.json {rev, step} into <appdata>/<app>/handoff/; the GUI
 # polls that control file each frame (ui::pollAiCadHandoff) and opens/refreshes one tab from it.
-# <app> follows the T-G10 alias rule (Chudware, or the legacy Chudware dir when it already
+# <app> follows the app-dir alias rule (Chudware, or the legacy Chudware dir when it already
 # exists), matching platform::appdataRoot() so publisher and reader agree.
 _PUB: dict = {"rev": None, "docs": {}, "active": None}
 
@@ -1908,7 +1908,7 @@ def _project_save_stem(name: Optional[str], doc_id: str) -> str:
 # auto project-save, bare save_part into CHUDWARE_PROJECT_SAVE_DIR). Nobody asked for that
 # location, so when the same document is later saved to an explicit path the old file is a
 # stale duplicate the harness itself created. Live 2026-09-24: five `<Stem>.step+` copies
-# were left in the ME-490 project root beside the real files the agent saved under CAD/.
+# were left in the user's project root beside the real files the agent saved under CAD/.
 _HARNESS_SAVED_PATHS: dict = {}
 
 
@@ -2076,8 +2076,8 @@ def _project_save(doc_id: Optional[str], name: Optional[str] = None) -> Optional
 # hostd retires an abandoned doc to the crash-recovery ORPHAN tier when
 # `path.empty() || dirty || isAutosavePath(path)` (core/hostd/server.cpp::gcCloseDoc), and
 # everything in that tier is offered back through the GUI's "Recover unsaved parts?"
-# prompt. Nothing closes the documents a run built — T-RF5 deleted
-# services/agent/loop.py's `_terminal_autosave_close_docs` and the C++ mission path only
+# prompt. Nothing closes the documents a run built — services/agent/loop.py's
+# `_terminal_autosave_close_docs` was removed and the C++ mission path only
 # doc_saves the one doc a DAG node is on — so every agent doc without a real backing file
 # eventually became a "part potentially lost" row. Measured on the reporting user's
 # machine 2026-08-05: eight retired in the same second at the 30-min agent GC grace
@@ -3145,7 +3145,7 @@ def solve_durable_or_handoff(kind: str, stage: str, payload: dict,
 
 # A small material library so FEA tools take a friendly name. Fields are exactly what the
 # host's study expects (host/src/ui/sim_manager.cpp): E in MPa, density g/cm^3, strengths MPa.
-# T-F2: these are sourced from the unified materials registry — the single provenance-stamped
+# These are sourced from the unified materials registry — the single provenance-stamped
 # first-party table — now served by the C++ core (core/materials, via the libchudware
 # material_fea_table / material_fea_aliases methods) instead of the retired Python
 # engine.materials module. `fea_table()` reproduces exactly the legacy 7-entry library +
@@ -3385,7 +3385,7 @@ def _resolve_material_name(material: Optional[str]) -> dict:
 # capitalized key among lowercase siblings, which is a trap of our own making.
 # A model that writes the obvious `e_mpa` used to be told
 # "E_mpa must be > 0 (got 0.0)" about a material dict that was completely
-# correct. Observed live 2026-08-04 (k3-256k, T-W11 bracket):
+# correct. Observed live 2026-08-04 (k3-256k, bracket test):
 # {"name": "6061-T6", "e_mpa": 68900, "nu": 0.33, "yield_mpa": 276}.
 #
 # Case-fold every supplied key onto its canonical spelling, plus the handful of
@@ -7593,7 +7593,7 @@ def _persist_study(doc_id: str, record: dict) -> Optional[str]:
         return None
 
 
-# --------------------------------------------------- T-BL04 thermal helpers
+# --------------------------------------------------- thermal helpers
 
 # Typical thermal conductivity (W/m·K) by material family — used by run_fea_thermal
 # when neither the caller nor the material dict supplies one. Engineering nominals
@@ -7614,7 +7614,7 @@ def _default_conductivity(mat: dict, material_arg: Any) -> float:
 
 
 # Typical specific heat (J/(kg·K)) by material family — used by the TRANSIENT thermal
-# path (T-FIN18) when neither the caller nor the material dict supplies cp. Same
+# path when neither the caller nor the material dict supplies cp. Same
 # engineering-nominal spirit as the conductivity table above.
 _DEFAULT_SPECIFIC_HEAT_JKGK: dict = {
     "steel": 490.0, "stainless": 500.0, "aluminum": 900.0, "titanium": 520.0,

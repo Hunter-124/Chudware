@@ -869,7 +869,7 @@ void drawDatasheetEntry(AppState& st) {
         }
 
         // ---- drop zone ---- (reThumbMd is the nearest token to a comfortable drop target; a
-        // dedicated reDropZoneH() would be the honest name for it — reported to the integrator)
+        // dedicated reDropZoneH() would be the honest name for it)
         const ImVec2 zone(ImGui::GetContentRegionAvail().x, mx::reThumbMd());
         ImGui::BeginChild("##re_ds_drop", zone, ImGuiChildFlags_Border);
         {

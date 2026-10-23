@@ -50,7 +50,7 @@ public:
     // Try to take the lock (non-blocking). False = another daemon holds it.
     bool acquire(const std::string& lockFile, std::string& err);
     void release();
-    // T-PERF10: sock path to unlink when the flock is released (so the sock
+    // Sock path to unlink when the flock is released (so the sock
     // file never disappears while the lock is still held). Empty = no-op.
     void setSockPathToUnlink(const std::string& sockPath) { sock_path_ = sockPath; }
 #ifdef _WIN32
@@ -66,7 +66,7 @@ private:
     int fd_ = -1;
 #endif
     std::string path_;
-    std::string sock_path_;  // deferred unlink (T-PERF10 drain-window)
+    std::string sock_path_;  // deferred unlink (drain-window)
 };
 
 // Spawn `argv` fully detached (double-fork + setsid, fds to /dev/null) so the

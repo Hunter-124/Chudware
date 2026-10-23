@@ -1,4 +1,4 @@
-"""PDN v1 tests (T-FIN13): analytic validation + fixture behaviour + sidecar shape.
+"""PDN v1 tests: analytic validation + fixture behaviour + sidecar shape.
 
 Analytic cases (DoD: within 5% of closed form):
   * uniform strip  — R = R_sheet * L/W
@@ -202,7 +202,7 @@ def test_undersized_3a_trace_flags_drop_and_density():
     assert r["ok"], r
     assert r["vsrc"] == 5.0  # inferred from the rail metadata
     u1 = next(d for d in r["drops"] if d["ref"] == "U1")
-    assert u1["i_a"] == 3.0                      # sink current from T-FIN8 metadata
+    assert u1["i_a"] == 3.0                      # sink current from engineering metadata
     assert u1["within_tolerance"] is False       # delivered < voltage_v_min
     assert u1["drop_v"] > 0.1
     # current density on the 0.3 mm trace: 3 / (0.3*0.035) ~ 286 A/mm²
@@ -270,7 +270,7 @@ def test_no_source_is_actionable_error():
     assert not r["ok"] and "source" in r["error"]
 
 
-# ── sidecar extension shape (the T-FIN16 seam) ──────────────────────────────────
+# ── sidecar extension shape (the thermal-handoff seam) ─────────────────────────
 
 def test_i2r_sidecar_extension_shape():
     b = _board()

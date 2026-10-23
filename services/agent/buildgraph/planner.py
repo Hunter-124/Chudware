@@ -1,7 +1,6 @@
 """planner.py — Build-order DAG planner for aicad.buildgraph/1.
 
 Contract: contracts/advisor.md §13 (FROZEN), §3.
-T-W15.
 
 This planner is LLM-FREE.  Ambiguity in a plan becomes an aicad.advisory/1
 finding, never a guess.

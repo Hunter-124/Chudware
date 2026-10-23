@@ -629,7 +629,7 @@ double extremum_param(const CurveFn& curve, const VectorXd& cv, double nx, doubl
 // Params (p, q) at the mutual closest approach of two curves: 25x25 coarse scan
 // then 8 alternating closest-point projections. Port of _mutual_closest.
 // When `warm_pq` is non-null and holds a finite prior (p,q) from an earlier residual
-// evaluation in the same solve (T-PERF8d interactive path), the expensive 25×25
+// evaluation in the same solve (interactive path), the expensive 25×25
 // scan is skipped and Newton continues from the warm seed — same attractor for a
 // smoothly moving geometry, much cheaper under LM's many residual probes.
 std::pair<double, double> mutual_closest(const CurveFn& curve0, const VectorXd& cv0,
@@ -1850,7 +1850,7 @@ void add_tangent_line_curve(System& sys, const std::string& cid,
 // excluding line-circle and circle-circle handled above). Single scalar residual
 // = signed gap at the mutual closest point. Numeric Jacobian. Range-free for
 // trimmed curves. Port of _add_tangent_curve_curve.
-// `interactive`: T-PERF8(d) — warm-start the mutual-closest (p,q) across residual
+// `interactive`: warm-start the mutual-closest (p,q) across residual
 // evaluations within one solve (shared across residual + numeric Jacobian probes).
 void add_tangent_curve_curve(System& sys, const std::string& cid,
                              const std::string& eid0, const std::string& eid1,
@@ -3167,7 +3167,7 @@ double measure_cond_adj(const json& constraint, const std::vector<std::string>& 
     return adj;
 }
 
-// ---- T-PERF9 connected-component decomposition --------------------------------
+// ---- connected-component decomposition ----------------------------------------
 // One dense System for a sketch with many independent profiles is O(n³) on the
 // LM / SVD steps. Union-find over entities linked by constraint refs partitions
 // the sketch into independent components that can be solved separately; DOF /
@@ -3507,7 +3507,7 @@ SketchSolution solve_sketch(const json& sketch, const json& env,
         comps = std::move(split);
     }
 
-    // Independent components — solve each with its own dense System (T-PERF9).
+    // Independent components — solve each with its own dense System.
     // Wall-clock budget is shared across components (remaining time each round).
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<SketchSolution> parts;
@@ -3722,7 +3722,7 @@ std::map<std::string, std::string> warm_gate_decision(const json& sketch,
     return decision;
 }
 
-// ---- T-W2 free-variable narration + endpoint enumeration --------------------
+// ---- free-variable narration + endpoint enumeration -------------------------
 
 namespace {
 
@@ -4028,7 +4028,7 @@ std::optional<double> measure_constraint(const json& constraint,
 // the registration-time shape probe in nsolve's add_residual has no side effects the
 // solve depends on), so caching preserves solve semantics by construction.
 //
-// T-PERF9: when the sketch partitions into multiple connected components, only the
+// When the sketch partitions into multiple connected components, only the
 // component(s) containing the drag target(s) are built into Systems; other entities
 // keep their pre-drag solved coords. A single-component sketch uses the historical
 // one-System path (identical block registration order).
@@ -4049,7 +4049,7 @@ struct DragContext {
     json entities_list;
     json constraints_list;
 
-    // Multi-component drag (T-PERF9): one System per dragged component.
+    // Multi-component drag: one System per dragged component.
     std::vector<DragComp> comps;
     std::map<std::string, int> eid_to_comp;  // entity id -> index in comps (-1 = frozen)
     json frozen_coords = json::object();    // non-dragged entities (pre-drag positions)
@@ -4143,7 +4143,7 @@ json drag(const SolveState& state, const std::string& handle,
             }
         }
 
-        // T-PERF9: partition; if multiple components, only build Systems for those
+        // Partition; if multiple components, only build Systems for those
         // that contain a drag target. Otherwise fall back to the historical one-System.
         std::vector<SketchComponent> all_comps =
             partition_components(ctx->entities_list, ctx->constraints_list);
@@ -4210,7 +4210,7 @@ json drag(const SolveState& state, const std::string& handle,
     const json& entities_list = ctx->entities_list;
     const json& constraints_list = ctx->constraints_list;
 
-    // ---- multi-component drag path (T-PERF9) --------------------------------
+    // ---- multi-component drag path ----------------------------------------
     if (ctx->multi) {
         bool any_target = false;
         std::vector<std::string> rejected_handles;

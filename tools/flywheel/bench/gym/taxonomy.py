@@ -704,7 +704,7 @@ def classify_ledger(ledger: dict[str, Any], *, manifest: dict | None = None,
 
 
 # ---------------------------------------------------------------------------
-# Tool-misuse fingerprints (WI-11 instrumentation)
+# Tool-misuse fingerprints (instrumentation)
 # ---------------------------------------------------------------------------
 
 # Regex buckets for error-class tagging of failed tool_calls.

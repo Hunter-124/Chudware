@@ -1,4 +1,4 @@
-"""services/browser/adapters/hiwin.py — HIWIN source adapter (T-X7).
+"""services/browser/adapters/hiwin.py — HIWIN source adapter.
 
 HIWIN (hiwin.com) makes linear guideways, ball screws and linear actuators.
 The site's Google CSE results render in a cross-origin iframe that CEF's

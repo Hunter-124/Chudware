@@ -1,4 +1,4 @@
-"""Tests for services/browser/adapters — T-X2.
+"""Tests for services/browser/adapters.
 
 No real Playwright, no real network: `services.browser.session`'s
 `browser_fetch`/`browser_download` are monkeypatched directly (adapters call

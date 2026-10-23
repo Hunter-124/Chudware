@@ -88,7 +88,7 @@ PyNiteFEA==1.0.1
 # EPANET/SWMM/IfcOpenShell are NOT runtime deps (V&V fixture provenance only).
 pyproj==3.7.2
 
-# PLM vault (Pillar 19, services/plm/): the hidden git-backed version-control store.
+# PLM vault (services/plm/): the hidden git-backed version-control store.
 # dulwich is a pure-Python git implementation, dual-licensed Apache-2.0 OR GPL-2.0-or-later —
 # we take the Apache-2.0 arm (in-process-clean per contracts/licenses.md + the guardrails).
 # Chosen over pygit2/subprocess-git for zero-provisioning cross-platform (Fedora/Windows)

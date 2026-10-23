@@ -1,8 +1,8 @@
 # SW-Parity Corpus Run Notes
 
-**Author**: Claude (claude-sonnet-4-6) — no access to SolidWorks. All `expect.sw_rationale` values
-are derived from geometric first principles and should be validated by the human owner (SolidWorks
-expert) before treating any DIVERGE as a confirmed bug.
+**Author**: AI-generated, without access to SolidWorks. All `expect.sw_rationale` values
+are derived from geometric first principles and should be validated by a SolidWorks user
+before treating any DIVERGE as a confirmed bug.
 
 **Date**: 2026-06-15 (recorded baseline)  
 **Solver at baseline**: the Python oracle `engine.doc.sketch_solver` (since deleted), kept at
@@ -71,7 +71,7 @@ entities. This creates two independent paths to constrain the same DOFs, making 
 relation between apex and midpoint) and the `fix` redundant in the presence of the coincident chain.
 The branch-selection IS verified (apex y is on the correct side) — the redundancy is my fixture's
 double-bookkeeping, not a solver bug.  
-**Action for owner**: Verify in SW that the apex indeed stays above/below. The Python solver does
+**Action**: Verify in SW that the apex indeed stays above/below. The Python solver does
 respect the initial-geometry side.  
 **Confidence in SW-expected**: HIGH for branch direction. The redundancy finding is a non-issue.
 
@@ -106,7 +106,7 @@ twice (each coincident gives 2 equations for 1 angle variable, one equation is a
 redundant). The solver correctly identifies 2 of those 4 as redundant.  
 **The critical SW-parity question**: Does the arc angle NOT flip? Answer: Yes, both F3a and F3c
 show the Python solver correctly preserves the start/end orientation.  
-**Action for owner**: No bug. Verify in SW that a coincident-constrained arc retains its
+**Action**: No bug. Verify in SW that a coincident-constrained arc retains its
 start/end identity. The solver holds it correctly.
 
 ---
@@ -124,7 +124,7 @@ NOT constrained by anything.
 **The important observation**: The angles DID stay at 200/340 (no spontaneous flip), which is
 correct warm-start / null-step behavior — when a variable has no constraint, Newton doesn't move it.
 This is the correct solver behavior but NOT a pinned result.  
-**Action for owner**: To fully constrain this arc in SW you'd add angle or endpoint constraints.
+**Action**: To fully constrain this arc in SW you'd add angle or endpoint constraints.
 No solver bug. Fixture expect corrected to dof=2.
 
 ---
@@ -156,7 +156,7 @@ constraint (e.g., fix one line's p2 y=0, or add a `horizontal` relation).
 **Actual solver output**: e1 ends at (50, -0.288) and e2 ends at (50, 5.585), making the angle
 between them ≈ 1° (as demanded). The GEOMETRY is correct; only the DOF counting in my expect was
 wrong.  
-**Action for owner**: No solver bug. To make this a dof=0 test, add one absolute orientation
+**Action**: No solver bug. To make this a dof=0 test, add one absolute orientation
 reference to one of the lines.  
 **Confidence**: HIGH that dof=1 is correct; MEDIUM on which line to add the reference.
 
@@ -229,7 +229,7 @@ direction `ux=1, uy=0` rather than `ux=uy=0`. This gives Newton a position gradi
 the centers. The fallback is identical in Python and C++, so the two stay bit-for-bit at parity
 (the guard fixture confirms it).
 
-**Action for owner**: Reproduce in SolidWorks: draw two concentric circles (centers exactly
+**Action**: Reproduce in SolidWorks: draw two concentric circles (centers exactly
 coincident), apply a tangent relation, internal arrangement. SW should move one center by
 |r0-r1| (here 5). Confirm the SEPARATION (5) and INTERNAL branch match; the ±x side is
 implementation-defined at the exact degeneracy.
@@ -273,7 +273,7 @@ length separately and use coincidents to form the rectangle.
 
 ## Ranked shortlist of real bugs / divergences for human validation
 
-### Priority 1 — HIGH CONFIDENCE (submit to owner for SW validation)
+### Priority 1 — HIGH CONFIDENCE (submit for SW validation)
 
 **BUG-1: Tangent circle-circle Jacobian degeneracy at d=0 (F4e) — RESOLVED 2026-06-15**  
 File: `F4e_coincident_circle_centers_tangent.json` (guard: `corpora/sketch/hardening_tangent_cc_coincident.json`)  
@@ -284,7 +284,7 @@ deterministic `ux=1, uy=0` fallback (identical in Python `_add_tangent_circle_ci
 `add_tangent_circle_circle`), so Newton separates the centers to |r0-r1| (internal) / r0+r1 (external).
 Now converges at dof=0 with the centers 5 apart (internal). See the F4e detail above for the geometry
 the SW expert should confirm.  
-**Confidence: HIGH.** Remaining owner action: confirm the SW separation/branch match (the ±x side is
+**Confidence: HIGH.** Remaining action: confirm the SW separation/branch match (the ±x side is
 implementation-defined at the exact degeneracy).
 
 ### Priority 2 — FIXTURE DESIGN ISSUES (need re-authoring; not solver bugs)
@@ -329,5 +329,5 @@ These diverged because of mistakes in the fixture JSON, not the solver:
 - **LOW** = behavior at exact degeneracies (zero distances, zero angles) where SW may have
   undocumented fallback strategies.
 
-The owner should run SolidWorks validation against the `sw_rationale` field of each fixture.
+A SolidWorks user should run validation against the `sw_rationale` field of each fixture.
 The most important case to validate is **BUG-1** (F4e) which has a clear code path to the bug.

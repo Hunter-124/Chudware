@@ -1,4 +1,4 @@
-"""CatalogProvider adapter for raw metal/plastic stock (T-CatalogStock).
+"""CatalogProvider adapter for raw metal/plastic stock.
 
 Generates round bar, hex bar, flat bar, plate/sheet, and round tube records
 across common engineering alloys and plastics, spanning the standard imperial

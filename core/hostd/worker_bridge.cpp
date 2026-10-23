@@ -568,6 +568,16 @@ std::string homeDir() {
 }
 #endif
 
+#ifdef CHUDWARE_DEVELOPER_BUILD
+// Developer worker cwd: CHUDWARE_REPO, else the source checkout this binary runs
+// from, else ".".
+std::string developerRepoRoot() {
+    if (std::string env = envOr("CHUDWARE_REPO", ""); !env.empty()) return env;
+    const auto root = chudware::platform::developerSourceRoot();
+    return root.empty() ? std::string(".") : nativeUtf8(root.native());
+}
+#endif
+
 bool fileExists(const std::string& p) {
     std::error_code ec;
     return std::filesystem::is_regular_file(std::filesystem::u8path(p), ec);
@@ -1275,21 +1285,6 @@ std::string windowsPython() {
     // Developer-only PATH discovery; packaged workers never use an interpreter.
     return "python.exe";
 }
-
-std::string windowsSourceRoot() {
-    std::error_code ec;
-    for (auto root : {std::filesystem::u8path(chudware::platform::executablePath()).parent_path(),
-                      std::filesystem::current_path(ec)}) {
-        while (!root.empty()) {
-            if (std::filesystem::is_regular_file(root / "services/worker_main.py", ec))
-                return nativeUtf8(root.native());
-            const auto parent = root.parent_path();
-            if (parent == root) break;
-            root = parent;
-        }
-    }
-    return ".";
-}
 #endif
 
 #ifndef _WIN32
@@ -1392,12 +1387,7 @@ bool WorkerBridge::spawn(std::string& err) {
         }
         repo_ = compiledWorker_
                     ? nativeUtf8(std::filesystem::u8path(workerBin_).parent_path().native())
-                    : envOr("CHUDWARE_REPO",
-#ifdef _WIN32
-                            windowsSourceRoot());
-#else
-                            home.empty() ? std::string(".") : home + "/Repositories/CAD");
-#endif
+                    : developerRepoRoot();
 #else
         workerBin_ = adjacentWorkerBinary(err);
         if (workerBin_.empty()) return false;

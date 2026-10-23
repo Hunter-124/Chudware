@@ -4,7 +4,7 @@
 # `engine_oracle` spellings canonicalize to the same entry. scripts/oracle_import_audit.py
 # scans services/, scripts/ and tools/ and FAILS on any engine import not covered here.
 #
-# 2026-07-23 (zero-Python cutover, T-RF21): engine_oracle/ and the `engine` symlink are
+# 2026-07-23 (zero-Python cutover): engine_oracle/ and the `engine` symlink are
 # deleted, so every such import is broken. This list is intentionally EMPTY and stays the
 # ratchet that keeps it that way: retarget an offending import (services.* re-home, C++ RPC
 # via core_bridge) instead of adding an entry.

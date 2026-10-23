@@ -153,7 +153,7 @@ def check_deflection(span_mm: float, deflection_mm: float) -> RuleResult:
 
 # Post compression material constant — Douglas Fir-Larch No.2, Fc = 9.307 MPa
 # (same public-domain reference value as checks.py; no Cp in v1).
-# Section areas come from the T-D3 lumber table (get_lumber_section) — ANSI/AWC PS 20
+# Section areas come from the lumber table (get_lumber_section) — ANSI/AWC PS 20
 # dressed (S4S) dimensions — NOT a hardcoded table (a previous table here overstated
 # areas by 19–43%, which overstated post capacity).
 _FC_MPA = 9.307

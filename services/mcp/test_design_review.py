@@ -1,4 +1,4 @@
-"""test_design_review.py — Tests for design_review_tools.py (T-F12 DoD).
+"""test_design_review.py — Tests for design_review_tools.py.
 
 DoD coverage:
   - design_review() returns narrated text (not JSON dump)

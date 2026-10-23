@@ -88,7 +88,7 @@ def test_ingest_extracts_mpn_candidate():
 
 
 def _match_part_number(mpn, generate=False):
-    """engine_oracle.spec_sheet_matcher was deleted (T-RF18) — call the C++ port."""
+    """engine_oracle.spec_sheet_matcher was deleted — call the C++ port."""
     from services.mcp import core_bridge as cb
 
     r = cb.call("match_part_number", {"mpn": mpn, "generate": generate})

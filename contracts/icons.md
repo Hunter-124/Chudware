@@ -69,10 +69,10 @@ never shifts any other icon's cell.
 
 Adding an icon = add a draw function + name here; atlas layout is computed, never hand-packed.
 
-## Manufacture toolpath tiles (T-BL34, append-only)
+## Manufacture toolpath tiles (append-only)
 
 The Manufacture ribbon op buttons get dedicated cells (previously they borrowed Features
-glyphs). Per Hunter's directive (2026-07-04) the shipped art is a **photographic render of
+glyphs). Per a 2026-07-04 design decision the shipped art is a **photographic render of
 the real generated toolpath** — `scripts/cam_toolpath_icons.py` drives
 `cam_new → add_tool/add_setup/add_operation → cam_generate → cam_simulate` and draws the
 returned moves (backplot palette: rapid/lead/cut/plunge/arc) over the stock silhouette.

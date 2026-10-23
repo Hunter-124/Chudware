@@ -321,7 +321,7 @@ def thermal_anchor(
 
 
 # ---------------------------------------------------------------------------
-# Fatigue anchor helper (Goodman / Soderberg S-N hand-calc reference) — T-SIM4
+# Fatigue anchor helper (Goodman / Soderberg S-N hand-calc reference)
 # ---------------------------------------------------------------------------
 
 #: Citation for every number fatigue_anchor produces. The criteria equations and the

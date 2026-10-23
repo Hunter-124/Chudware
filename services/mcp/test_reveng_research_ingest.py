@@ -214,7 +214,7 @@ class TestResearchAndIngest:
 
 
 # ---------------------------------------------------------------------------
-import services.mcp.reveng_common as rc_mod  # noqa: E402  T-RF8: ingest internals moved
+import services.mcp.reveng_common as rc_mod  # noqa: E402  ingest internals moved
 
 
 # MCP tool integration tests (reveng_tools layer)

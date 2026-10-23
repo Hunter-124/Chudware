@@ -22,7 +22,7 @@ class WorkerClient;
 
 namespace core {
 
-class AsyncRpc;  // async_rpc.h — non-blocking worker round-trips (T-PERF1 applyOpsAsync)
+class AsyncRpc;  // async_rpc.h — non-blocking worker round-trips (applyOpsAsync)
 
 // W1-B (item 6): the topology a single feature owns, parsed from a response's "owner_map".
 // Shape on the wire: {"<fid>": {"bodies":[id...], "faces":[[body,face]...], "edges":[[body,edge]...]}}.
@@ -198,7 +198,7 @@ public:
     // Ctrl+Z reverts the whole action.
     OpsResponse applyOps(WorkerClient& w, const nlohmann::json& ops, bool coalesce = false);
 
-    // T-PERF1: non-blocking applyOps. Queues doc_apply_ops on `rpc` (GL-thread AsyncRpc). The
+    // Non-blocking applyOps. Queues doc_apply_ops on `rpc` (GL-thread AsyncRpc). The
     // Done callback runs inside a later rpc.drain() on the GL thread so it may touch AppState /
     // loadDocMesh freely. Mirror state (revision/tree/owner_map) is updated ONLY when this
     // submission is still the latest for this mirror (`mutationGen`) AND the active doc_id still
@@ -233,7 +233,7 @@ public:
     PushPullResult pushPull(WorkerClient& w, uint32_t body_id, uint32_t topo_id,
                             double distance, bool commit);
 
-    // T-PERF2: GL-thread ingest of a finished doc_push_pull / doc_revert (or any ops-shaped)
+    // GL-thread ingest of a finished doc_push_pull / doc_revert (or any ops-shaped)
     // JSON response. Used by async latest-wins drag pipelines that issue the RPC via AsyncRpc
     // and only touch the mirror inside drain(). Same post-conditions as the sync helpers when
     // the response is successful; returns a filled PushPullResult / OpsResponse for the caller.
@@ -266,7 +266,7 @@ public:
     bool save(WorkerClient& w, const std::string& path, std::string& err);
     bool open(WorkerClient& w, const std::string& path, std::string& err, bool asSolid = false);
 
-    // T-PERF4: GL-thread adopt of a finished doc_open JSON (from AsyncRpc). Same post-conditions
+    // GL-thread adopt of a finished doc_open JSON (from AsyncRpc). Same post-conditions
     // as open() on success. Returns false if the envelope is an error or missing doc_id.
     bool adoptOpenResponse(const nlohmann::json& res, std::string& err);
 
@@ -279,7 +279,7 @@ public:
                   std::string& err);
 
 
-    // T-PERF4: adopt a finished doc_rebuild JSON as activate() would (GL thread / drain).
+    // Adopt a finished doc_rebuild JSON as activate() would (GL thread / drain).
     bool adoptActivateResponse(const std::string& docId, const nlohmann::json& res,
                                std::string& aicmPath, std::string& err);
 
@@ -412,7 +412,7 @@ private:
     std::string    lastOpenedWritebackReason_;                     // cache.writeback.reason
     Listener       listener_;
     StaleCb        staleResyncCb_;  // W1-B: fired on stale_revision auto-resync
-    uint64_t       mutationGen_ = 0;  // T-PERF1: latest-wins guard for applyOpsAsync
+    uint64_t       mutationGen_ = 0;  // latest-wins guard for applyOpsAsync
 
     // W1-B: parsed owner map + reverse indices (key = (body<<32)|topo for faces/edges).
     std::unordered_map<std::string, Owned> ownerMap_;          // fid -> owned topology

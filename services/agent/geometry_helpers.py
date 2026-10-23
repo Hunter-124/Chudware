@@ -1,5 +1,5 @@
 """Proactive op-aware helper / calculator registry — the HEART of "advise, don't
-recall" (T-DP3, Stage 2 GEOMETRY REALIZATION).
+recall" (Stage 2 GEOMETRY REALIZATION).
 
 Design-pipeline doc §2 Stage 2, §3.2; contract ``contracts/design_pipeline.md`` §8.
 
@@ -67,7 +67,7 @@ def canonical_process_strict(process: Optional[str]) -> Optional[str]:
     input untouched otherwise, so the caller's existing "Unknown process 'x'.
     Known processes: [...]" teaching error still fires for a genuine typo.
 
-    Live 2026-08-04 (T-W11 bracket, BOTH opus-5 and k3-256k): the mission says
+    Live 2026-08-04 (bracket mission, BOTH opus-5 and k3-256k): the mission says
     the part "will be machined", and both models called
     ``set_process("machining")`` / ``dfm_check(process="machining")``. The alias
     table below already knew that word — nothing consulted it.
@@ -151,7 +151,7 @@ _OFFLINE_PROFILE_PARAMS: dict[str, dict[str, Any]] = {
 class HelperBinding:
     """One geometry kind → its trigger + helper tools + a resolver name.
 
-    ``trigger_id`` is the existing ``aicad.trigger/1`` id (or the two T-DP3-added
+    ``trigger_id`` is the existing ``aicad.trigger/1`` id (or the two pipeline-added
     ids) that injects the context pack for this kind. ``tools`` are the MCP tools
     the geometry_designer should call. ``resolver`` names the gating function below.
     """
@@ -163,7 +163,7 @@ class HelperBinding:
 
 
 # The op-aware registry. ≥8 geometry kinds (contract §8 binding table + the two
-# T-DP3-added kinds), each bound to a real trigger and helper set.
+# pipeline-added kinds), each bound to a real trigger and helper set.
 _BINDINGS: dict[str, HelperBinding] = {
     "mating_bore": HelperBinding(
         "mating_bore", "bearing_seat",

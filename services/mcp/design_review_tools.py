@@ -1,6 +1,5 @@
 """design_review_tools.py — MCP tool: design_review battery.
 
-Contract: T-F12 DoD.
 Registered by: services/mcp/server.py (append-only).
 Narration contract: contracts/narration.md (never raw JSON dumps).
 
@@ -16,7 +15,7 @@ Additional checks (not in DISPATCH_TABLE — called directly via battery._get_fn
   dfm_check              — DFM/manufacturability check (intake module)
 
 These two are kept separate from DISPATCH_TABLE intentionally: adding them would
-require editing verify.py, which is out of T-F12 scope.  They share the same
+require editing verify.py, which is out of this module's scope.  They share the same
 _get_fn registry, so there is still ONE live registry for all checks.
 """
 from __future__ import annotations
@@ -61,7 +60,7 @@ def register_design_review_tools(mcp: "FastMCP") -> None:
             req_ids:       Optional list of aicad.req/1 requirement IDs (e.g. ["R1"]).
                            Each is auto-verified by running its named verify_by verifiers
                            via the battery; the result (status flip + evidence ref) is
-                           written back into the requirements doc automatically (T-BL09).
+                           written back into the requirements doc automatically.
             req_path:      Path to the .req.json requirements doc for req_ids (omit when
                            the req doc is stored as doc-meta on doc_id).
 
@@ -98,7 +97,7 @@ _ALL_CHECKS = [
     "firmware",
     "dc_ratio",
     "budget",
-    "layout_coverage",  # T-BL50: critical-dim & interface coverage gate
+    "layout_coverage",  # critical-dim & interface coverage gate
 ]
 
 # Checks that use DISPATCH_TABLE directly
@@ -150,7 +149,7 @@ def _run_design_review(
         else:
             results[check_name] = _call_direct_check(check_name, doc_id)
 
-    # Requirement auto-verification (T-BL09) — each req_id runs its verify_by
+    # Requirement auto-verification — each req_id runs its verify_by
     # verifiers via the same battery registry and writes status + evidence back
     # into the requirements doc (services/dag/verify._run_requirement_verify).
     req_results: dict[str, Any] = {}
@@ -299,7 +298,7 @@ def _call_direct_check(check_name: str, doc_id: Optional[str]) -> dict[str, Any]
             return bool(r.get("ok", False)) and int(r.get("violations", 1)) == 0
 
     elif check_name == "interface_check":
-        # T-BL49: interface_check lives in its own module (not a private-MCP module), so call
+        # interface_check lives in its own module (not a private-MCP module), so call
         # its implementation directly rather than via battery._get_fn.
         try:
             from services.mcp.interface_check_tools import run_interface_check as tool_fn
@@ -419,7 +418,7 @@ _CHECK_LABELS: dict[str, str] = {
     "firmware":        "Firmware simulation assertions",
     "dc_ratio":        "Structural DC-ratio",
     "budget":          "BOM budget check",
-    "layout_coverage": "Layout coverage (critical dims & interfaces)",  # T-BL50
+    "layout_coverage": "Layout coverage (critical dims & interfaces)",
 }
 
 
@@ -487,7 +486,7 @@ def _narrate(
             lines.append(f"  ? {label}: unknown status={status!r}")
             skip_count += 1
 
-    # Requirements section (T-BL09 — auto-verified aicad.req/1 requirements)
+    # Requirements section (auto-verified aicad.req/1 requirements)
     if req_results:
         lines.append("")
         lines.append("Requirements (auto-verified, evidence written back):")

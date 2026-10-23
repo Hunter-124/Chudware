@@ -1,4 +1,4 @@
-// CFD / kinematic / flight-profile → aicad.fwscenario/1 sensor bridge (T-RF15
+// CFD / kinematic / flight-profile → aicad.fwscenario/1 sensor bridge (C++
 // port of engine_oracle/firmware/sim_sensor_bridge.py). Samples the profile
 // onto a uniform grid and packs device register bytes into time-varying I2C
 // tracks (uart_rx NMEA for GNSS). Physics lives in sensor_models.*.

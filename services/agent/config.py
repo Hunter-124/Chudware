@@ -1367,7 +1367,7 @@ def offline_enabled(cfg: dict | None = None) -> bool:
 #                  rehydrate inbound; images blocked outbound
 #   "local_only" — refuse ALL non-loopback providers (same enforcement as offline_mode)
 # offline_mode remains the legacy hard switch and still forces local-only refusal;
-# compliance_mode=local_only is the named WS3 equivalent. See docs/REDACTION_DESIGN.md.
+# compliance_mode=local_only is the named equivalent. See docs/design/REDACTION_DESIGN.md.
 
 COMPLIANCE_SETTING = "compliance_mode"
 _VALID_COMPLIANCE_MODES = {"off", "redact", "local_only"}
@@ -1459,7 +1459,7 @@ def provider_offline_safe(provider: Provider) -> bool:
     if name == "llamacpp":
         return _host_is_loopback(base_url or DEFAULT_LOCAL_BASE_URL)
     if name == "vllm":
-        # vLLM serves LoRA adapters locally (T-H9); offline-safe only when its endpoint is
+        # vLLM serves LoRA adapters locally; offline-safe only when its endpoint is
         # loopback — same rule as openai/llamacpp, NOT the never-offline cloud set.
         return _host_is_loopback(base_url or "http://localhost:8000/v1")
     # Unknown provider with a loopback base_url is allowed; anything else is refused.
@@ -1962,7 +1962,7 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         return LlamaCppProvider(lcfg, model=lcfg["model"])
 
     if name == "vllm":
-        # T-H9: per-task LoRA serving. OpenAI-compatible vLLM instance; the served LoRA is
+        # Per-task LoRA serving. OpenAI-compatible vLLM instance; the served LoRA is
         # picked by the `adapter` field. Enters as just another providers/1 adapter.
         from .providers.vllm_provider import (
             VLLMProvider,

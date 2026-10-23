@@ -278,7 +278,7 @@ struct ExternalProjectionCache {
 };
 
 struct Session {
-    // T-PERF5: per-doc mutex. Locked by DocLock::acquire / require_session; never
+    // Per-doc mutex. Locked by DocLock::acquire / require_session; never
     // touched while holding g_registry_mtx (pin-then-lock). Non-copyable/non-movable
     // because of the mutex — sessions live behind shared_ptr in g_sessions.
     std::mutex mtx;
@@ -593,7 +593,7 @@ static void drop_history_entry(const std::string& entry) {
 }
 
 // =============================================================================
-// T-PERF5 — per-doc engine locking
+// Per-doc engine locking
 // =============================================================================
 //
 // Lock order (MUST be respected to avoid deadlock):
@@ -618,7 +618,7 @@ std::mutex g_registry_mtx;
 std::map<std::string, std::shared_ptr<Session>> g_sessions;
 std::atomic<std::uint64_t> g_cache_verification_active{0};
 
-// --- Contention meters (Phase 1b; now attribute per-doc acquires) -------------
+// --- Contention meters (attributed to per-doc acquires) -----------------------
 struct ContentionMeters {
     std::atomic<unsigned long long> acquisitions{0};
     std::atomic<unsigned long long> contended{0};       // acquires that had to wait (>threshold)
@@ -1497,7 +1497,7 @@ void op_reorder_feature(json& doc, const json& op, const json& id_map) {
 }
 
 // Forward declarations (defined later in this TU — same unnamed namespace) so
-// op_sketch_convert can project against compiled geometry from inside the ops path (T-BL43).
+// op_sketch_convert can project against compiled geometry from inside the ops path.
 // `pre` is the caller's cached compile of THIS document; plane and projection share it.
 thread_local Session* apply_session = nullptr;
 bool inc_rebuild_enabled();
@@ -1509,7 +1509,7 @@ chudware::geom::SketchPlane cached_external_sketch_plane(
 json project_external_refs(const json& doc, const chudware::geom::SketchPlane& plane,
                            const json& refs, const CompileResult* pre,
                            bool strict = false, ExternalProjectionCache* context = nullptr);
-// T-BL49 associative Convert Entities — re-resolve + re-project every sketch's
+// Associative Convert Entities — re-resolve + re-project every sketch's
 // params.external_refs against the current model state (defined near
 // project_external_refs below; called from apply_ops_locked / doc_rebuild).
 // `cache` (optional) is the owning session's incremental-rebuild CompileCache: the
@@ -2185,7 +2185,7 @@ void op_sketch_convert(json& doc, const json& op, std::size_t idx, IdGen& gen, j
         id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = ids[k];
 }
 
-// T-BL49 — break the associative link of ONE external ref (SolidWorks "break link"):
+// Break the associative link of ONE external ref (SolidWorks "break link"):
 // removes the ref record; the converted entities stay in the sketch as ordinary
 // (still fix-pinned) geometry. {op:"sketch_break_external_ref", sketch:<fid>, id:"x<N>",
 // delete_entities:false} — pass delete_entities:true to also remove the owned entities
@@ -4560,7 +4560,7 @@ json warm_and_respond(Session& s, CompileResult r, const json& id_map, bool with
     return resp;
 }
 
-// T-PERF10: publish tess AICM via aicm_handoff (aicm-shm://…, or its own pid-scoped temp
+// Publish tess AICM via aicm_handoff (aicm-shm://…, or its own pid-scoped temp
 // file when shm is unavailable) so the host maps it without a second unscoped file. Empty
 // on a hard publish failure: responses then carry no aicm_path (the existing "no mesh"
 // signal) instead of failing an edit/open whose document state has already committed.
@@ -4570,7 +4570,7 @@ std::string publish_doc_aicm(const std::string& doc_id, long revision,
     const std::string key = chudware::aicm_handoff::key_for(doc_id, revision);
     std::string uri = chudware::aicm_handoff::publish(key, data, size);
     // Drop old revisions so shm objects don't accumulate. Keep a few recent ones:
-    // the host's async mesh loader (T-PERF3) may still be mapping the previous path
+    // the host's async mesh loader may still be mapping the previous path
     // while this rebuild publishes the next.
     if (revision > 3)
         chudware::aicm_handoff::release_older_than(doc_id, revision - 3);
@@ -5203,15 +5203,15 @@ bool is_readonly_batch(const json& ops) {
     return true;
 }
 
-// T-W2: after a sketch-mutating batch is applied to `working`, add auto-coincident
+// After a sketch-mutating batch is applied to `working`, add auto-coincident
 // constraints to the touched sketches (config-gated, default ON). Defined far below;
 // forward-declared here so apply_ops_locked can call it. `working` is the post-op doc,
 // pre-compile; `sketch_fids` are the sketch features the batch touched; `gen` mints ids.
-// `touched_eids` scopes the proximity scan (T-PERF10); empty = full scan.
+// `touched_eids` scopes the proximity scan; empty = full scan.
 void maybe_auto_constrain(json& working, const std::vector<std::string>& sketch_fids,
                           IdGen& gen,
                           const std::unordered_set<std::string>& touched_eids = {});
-// Entity ids touched by sketch-mutating ops in a batch (T-PERF10 scope). Defined with
+// Entity ids touched by sketch-mutating ops in a batch (proximity-scan scope). Defined with
 // the auto-coincide helpers below.
 std::unordered_set<std::string> touched_entity_ids(const json& ops, const json& id_map);
 
@@ -5391,24 +5391,24 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
         }
     }
 
-    // T-W2 auto-coincident: on a sketch-mutating batch, pin touching endpoints (within
+    // Auto-coincident: on a sketch-mutating batch, pin touching endpoints (within
     // tolerance) as coincident BEFORE validation/compile, so touching-corner profiles
     // are already closed when the model sees them. Config-gated (default ON), best-effort
     // — it only ADDS safe (non-conflicting) coincident constraints; a failure is silent.
-    // T-PERF10: proximity scan is scoped to entities this batch touched.
+    // The proximity scan is scoped to entities this batch touched.
     {
         std::vector<std::string> sk_fids = touched_sketch_fids(ops, id_map);
         if (!sk_fids.empty()) {
             // Reseed IdGen from `working` (not from the original doc) so that authored
             // entity/constraint ids embedded inside add_feature ops are visible to gen.
             // Without this, gen starts at its pre-op maximum and mints ids that collide
-            // with authored ids in the newly-inserted feature params (T-DP7).
+            // with authored ids in the newly-inserted feature params.
             gen.scan(working);
             maybe_auto_constrain(working, sk_fids, gen, touched_entity_ids(ops, id_map));
         }
     }
 
-    // T-BL49 associative Convert Entities — after the batch mutated the tree (an upstream
+    // Associative Convert Entities — after the batch mutated the tree (an upstream
     // dim edit, a feature delete, a new boss...), re-resolve + re-project every sketch's
     // external_refs against the post-batch model so converted geometry follows its source.
     // Never blocks the edit: a total failure here leaves the last-good projected entities
@@ -5773,7 +5773,7 @@ chudware::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json
     return plane;
 }
 
-// Session convenience wrapper (the original entry point — all pre-T-BL43 callers).
+// Session convenience wrapper (the original entry point, predating the cached-compile overload).
 // PERF: a valid read-cache compile (compiled_rev == revision, never stale — every
 // geometry-changing op bumps revision) already carries the datums side-channel and the
 // surviving shapes this resolution reads, so serve it instead of recompiling the tree
@@ -5918,7 +5918,7 @@ SolveActive solve_active(Session& s, const json& feat,
     sk["entities"] = params.contains("entities") ? params["entities"] : json::array();
     sk["constraints"] = params.contains("constraints") ? params["constraints"] : json::array();
 
-    // Interactive solve (T-PERF8 LDLT + T-PERF9 component decomp). Exact/oracle
+    // Interactive solve (LDLT + connected-component decomposition). Exact/oracle
     // callers hit solve_sketch without interactive; this path is the live sketcher.
     chudware::sketch::SketchSolution sol =
         chudware::sketch::solve_sketch(sk, env, warm, /*time_budget_ms=*/std::nullopt,
@@ -5971,7 +5971,7 @@ json strvec_json(const std::vector<std::string>& v) {
     return a;
 }
 
-// T-BL49 — external-ref ownership map (eid -> {ref, stale}) so the host can style
+// External-ref ownership map (eid -> {ref, stale}) so the host can style
 // converted entities distinctly (and dash/warn the stale ones). Absent key = a normal
 // user-drawn entity. Shared by sketch_result (enter/solve) and doc_sketch_drag.
 json sketch_external_map(const json& feat) {
@@ -6081,13 +6081,13 @@ static bool path_within(const std::string& file, const std::string& dir) {
 // candidate reproduces that ranking. Deterministic — never a coin flip.
 //
 // A BUILT part is resumed too, not skipped: the reply carries feature_count so the
-// caller can tell the agent what it resumed onto (docs/REFACTOR_LOG.md ~5274, ~5309 —
-// inheriting a stranger's half-built body silently is what produced twelve "boss added
-// no material (it is buried inside the body)" failures, so the count must travel).
+// caller can tell the agent what it resumed onto. Inheriting a stranger's half-built body
+// silently is what produced twelve "boss added no material (it is buried inside the body)"
+// failures, so the count must travel.
 //
 // `project_dir` (optional) scopes the match: a document opened from or saved to a file
 // OUTSIDE it belongs to another project and is never resumed. An agent building
-// "sixaxis_arm" in /tmp/run4 resumed the user's Desktop assembly of that name, left open
+// "sixaxis_arm" in a scratch directory resumed the user's Desktop assembly of that name, left open
 // in the shared hostd, and added 13 components to it (2026-09-27). Unsaved documents have
 // no location and stay resumable.
 static std::optional<json> resume_open_doc(const std::string& requested,
@@ -6636,7 +6636,7 @@ json doc_rebuild(const std::string& doc_id) {
         rebuild_assembly(s);
         return ops_response_assembly(s, json::object());
     }
-    // T-BL49 — an explicit rebuild also re-syncs associative Convert Entities (covers
+    // An explicit rebuild also re-syncs associative Convert Entities (covers
     // mutation paths that bypass doc_apply_ops, e.g. sketch_drag_commit). No revision
     // bump: re-projection is derived data; the compile below sees the refreshed tree.
     CompileCache* cache = inc_rebuild_enabled() ? s.compile_cache.get() : nullptr;
@@ -7080,7 +7080,7 @@ bool doc_close(const std::string& doc_id) {
     drawings_source_closed(doc_id, source_tree, source_env, source_revision);
     // Session teardown happens when `pin` goes out of scope below.
     wipe_undo_journal(doc_id);
-    // T-PERF10: free AICM shared-memory objects for this doc (all revisions).
+    // Free AICM shared-memory objects for this doc (all revisions).
     chudware::aicm_handoff::release_doc(doc_id);
     return true;
 }
@@ -10564,7 +10564,7 @@ json doc_query(const std::string& doc_id, const json& query) {
     // Default: query the WHOLE document — every body of a multi-body/assembly doc (see
     // whole_doc_shape). An optional 1-based "body_id" in the query dict still selects a
     // SPECIFIC surviving solid — the same per-body selection eval_measure/eval_mass/
-    // eval_check already expose via eval_active_shape (interface_check, T-BL49).
+    // eval_check already expose via eval_active_shape (interface_check).
     int body_id = query.is_object() && query.contains("body_id") && query["body_id"].is_number()
                       ? query["body_id"].get<int>() : 0;
     TopoDS_Shape shape;
@@ -12193,7 +12193,7 @@ json doc_eval_geometry_analysis(const std::string& doc_id, const json& options) 
     }
 }
 
-// ── eval_solid_health (T-GH1) ────────────────────────────────────────────────────────────
+// ── eval_solid_health ────────────────────────────────────────────────────────────────────
 // "Is this body actually a sound closed solid?" — the question every downstream consumer
 // (an FEA mesher, a CAM toolpath, a STEP/STL export) silently assumes the answer to, and
 // which nothing in the API could answer. doc_eval_check returns a bare issue LIST: no
@@ -13860,7 +13860,7 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
     }
     scope["checked_members"] = members.size();
     // An EMPTY document is the trap: `check_interference` on nothing "passes" and the
-    // caller records a verified placement (ME 490 O-38). A single body, or a `members`
+    // caller records a verified placement. A single body, or a `members`
     // filter that keeps one, is a legitimate no-pair result and stays ok:true with
     // pairs_checked = 0 so nobody mistakes it for a verification.
     if (members.empty())
@@ -16926,7 +16926,7 @@ static PartCacheOpen open_part_from_caches(Session& s,
     if (miss.empty()) {
         out.hit = true;
         out.resp = header["response"];
-        // T-PERF10: re-materialize cached mesh via aicm-shm (same handoff as live rebuilds).
+        // Re-materialize cached mesh via aicm-shm (same handoff as live rebuilds).
         std::string ap = publish_doc_aicm(s.doc_id, s.revision,
             reinterpret_cast<const uint8_t*>(ca->data()), ca->size());
         if (!ap.empty()) {
@@ -18124,7 +18124,7 @@ json poly_to_json(const std::vector<Eigen::Vector2d>& p) {
 }  // namespace
 
 // Region enumeration on an ALREADY-LOCKED session (no DocLock). The public RPC is a
-// thin locking wrapper; internal callers (T-W2 auto-constrain closure delta) that
+// thin locking wrapper; internal callers (auto-constrain closure delta) that
 // already hold the DocLock call this directly to avoid re-entering the non-recursive
 // g_mtx (which would deadlock).
 json sketch_regions_locked(Session& s, const std::string& sketch_fid) {
@@ -18377,7 +18377,7 @@ json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
     return out;
 }
 
-// ------------------------------------------------------- T-W2 sketch completion
+// ------------------------------------------------------- sketch completion
 namespace {
 
 // Is `sketch.auto_coincident` enabled for this doc? Stored in doc["meta"] (the
@@ -18423,7 +18423,7 @@ std::unordered_set<std::string> coincident_pair_set(const json& constraints) {
 // at most one NEW proposal (a greedy union so a shared corner emits one edge, not a
 // clique). Endpoints on the SAME entity are never paired (self-coincidence is noise).
 //
-// T-PERF10: when `touched_eids` is non-empty, only pairs where at least ONE endpoint
+// When `touched_eids` is non-empty, only pairs where at least ONE endpoint
 // belongs to a touched entity are considered — O(E·T) instead of O(E²) on edit of a
 // single entity in a large sketch. Empty set = full scan (explicit auto-constrain RPC).
 // Returns [{a:{handle}, b:{handle}, gap_mm}], nearest-first.
@@ -18661,7 +18661,7 @@ json apply_coincident_proposals(json& params, const json& proposals, const json&
 // failure on a feature leaves it untouched (never blocks the user's edit). This is the
 // "touching endpoints are already coincident before the model sees a not-closed error"
 // path — it adds constraints, so touching-corner profiles close automatically.
-// `touched_eids` (T-PERF10) scopes the O(E²) proximity scan to entities this batch
+// `touched_eids` scopes the O(E²) proximity scan to entities this batch
 // created/edited; empty = full scan (e.g. brand-new multi-entity sketch).
 void maybe_auto_constrain(json& working, const std::vector<std::string>& sketch_fids,
                           IdGen& gen,
@@ -18984,7 +18984,7 @@ json doc_sketch_health(const std::string& doc_id, const std::string& sketch_fid)
     out["conflicting"] = conflicting;
     out["schedule"] = schedule;
     out["advisory"] = advisory;
-    // T-BL49 — associative Convert Entities status: one row per external ref, so a driver
+    // Associative Convert Entities status: one row per external ref, so a driver
     // (or the PM panel) sees which converted geometry is live vs stale (source no longer
     // resolves; last-good geometry kept). Empty array when the sketch has no external refs.
     {
@@ -19033,7 +19033,7 @@ std::pair<Eigen::Vector2d, Eigen::Vector2d> plane_plane_line_uv(
     return {p_near, t};
 }
 
-// Shared T-BL43 projection core — used by BOTH the sketch_convert op (mutating, ops path)
+// Shared Convert Entities projection core — used by BOTH the sketch_convert op (mutating, ops path)
 // and the doc_sketch_project_entities RPC (read-only preview). Compiles `doc`, resolves each
 // external ref (datum plane / face / model edge), and projects it orthographically onto
 // `plane` via recon.cpp's GeomProjLib kernel. A face contributes ALL its boundary wires;
@@ -19303,7 +19303,7 @@ json project_external_refs(const json& doc, const chudware::geom::SketchPlane& p
     return json{{"entities", all_entities}, {"approx", any_approx}, {"sources", sources}};
 }
 
-// ---------------------------------------------------------------- T-BL49 associative refresh
+// ---------------------------------------------------------------- associative refresh
 
 // Remove one sketch entity + every constraint whose refs touch it (same cascade as
 // op_sketch_delete_entity, but callable on a params object during the refresh walk).
@@ -19497,7 +19497,7 @@ void refresh_sketch_external_refs(json& doc, CompileCache* cache,
     context->projections = std::move(used_projections);
 }
 
-// sketch3d external model references (T-3DXREF): re-resolve every sketch3d feature's
+// sketch3d external model references: re-resolve every sketch3d feature's
 // params.external_refs against the current model and write back last_point/stale.
 // v1 targets: vertex -> fixed 3D point (REQUIRED, implemented below). edge/face
 // targets are NOT resolved here (gated — see contracts/doc_schema.md §3B); an
@@ -19669,7 +19669,7 @@ json doc_dep_register(const std::string& source_doc_id,
                       const std::string& dep_doc_id,
                       const std::string& kind,
                       long linked_revision) {
-    // Registry-only: g_dep_registry is guarded by g_registry_mtx (T-PERF5).
+    // Registry-only: g_dep_registry is guarded by g_registry_mtx.
     std::lock_guard<std::mutex> reg(g_registry_mtx);
     auto& entries = g_dep_registry[source_doc_id];
     // Upsert: find existing entry for (dep_doc_id, kind) and update revision.
@@ -19757,7 +19757,7 @@ json doc_dep_unregister(const std::string& dep_doc_id, const std::string& kind) 
 }
 
 // ============================================================ kinematic motion study
-// (+ optional rigid-body inverse dynamics on the swept trajectory — T-FIN20;
+// (+ optional rigid-body inverse dynamics on the swept trajectory;
 //  the math lives in doc/motion_dynamics.{h,cpp}, this file only gathers mass
 //  properties, resolved mate geometry and poses, and serialises the result.)
 
@@ -20954,7 +20954,7 @@ json& find_sketch3d_feature(Session& s, const std::string& fid) {
 
 // The {entities, constraints} dict solve_sketch3d takes, from either the host
 // canonical shape (params.entities) or the flat fallback. Also grounds resolved
-// external_refs (T-3DXREF) as fixed construction points + implicit fix constraints
+// external_refs as fixed construction points + implicit fix constraints
 // — same injection compile_document's sketch3d branch does, kept in sync here so
 // sketch3d_health/sketch3d_drag see the exact same solve.
 json sketch3d_solver_input(const json& feat) {
@@ -21092,7 +21092,7 @@ json doc_sketch3d_drag(const std::string& doc_id, const std::string& sketch_fid,
                 {"budget_exceeded", res.value("budget_exceeded", false)}};
 }
 
-// --- g_mtx contention reporting (Phase 1b) -----------------------------------------
+// --- g_mtx contention reporting ----------------------------------------------------
 // Stamp the calling thread's current RPC method so DocLock can attribute lock wait/hold to
 // the caller. Pass a pointer with process-lifetime stability (the dispatch boundary passes an
 // interned/stack std::string's c_str for the call duration; cleared to nullptr after). The

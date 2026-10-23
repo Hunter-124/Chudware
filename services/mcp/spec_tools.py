@@ -1,7 +1,7 @@
-"""Spec-sheet matching MCP tools (deterministic BOLTS/KiCad lookup, workstream B / T-B4).
+"""Spec-sheet matching MCP tools (deterministic BOLTS/KiCad lookup).
 
 Thin MCP adapter over the C++ core (libchudware ``match_part_number`` / ``spec_sheet_match`` /
-``list_spec_templates`` RPCs via :mod:`services.mcp.core_bridge`, T-RF18). ``match_part_number``
+``list_spec_templates`` RPCs via :mod:`services.mcp.core_bridge`). ``match_part_number``
 takes a purchased manufacturer/vendor part number, strips vendor packaging suffixes, and resolves
 it against the clean-room ISO/DIN standard-part tables (fasteners, bearings) — falling back to the
 user's own installed KiCad symbol libraries — then builds real editable geometry via the

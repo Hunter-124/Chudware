@@ -114,4 +114,23 @@ bool processAlive(long pid) {
 #endif
 }
 
+std::filesystem::path developerSourceRoot() {
+#if defined(__EMSCRIPTEN__)
+    return {};
+#else
+    std::error_code ec;
+    for (auto root : {std::filesystem::u8path(executablePath()).parent_path(),
+                      std::filesystem::current_path(ec)}) {
+        while (!root.empty()) {
+            if (std::filesystem::is_regular_file(root / "services" / "worker_main.py", ec))
+                return root;
+            const auto parent = root.parent_path();
+            if (parent == root) break;
+            root = parent;
+        }
+    }
+    return {};
+#endif
+}
+
 }  // namespace chudware::platform

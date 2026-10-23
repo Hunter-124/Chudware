@@ -1,4 +1,4 @@
-"""services/browser/adapters/thomson.py — Thomson source adapter (T-X7).
+"""services/browser/adapters/thomson.py — Thomson source adapter.
 
 Thomson (thomsonlinear.com) makes linear actuators, ball screws, lead
 screws and profile rail guides. Search is public; per-part CAD downloads sit

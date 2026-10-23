@@ -169,7 +169,7 @@ struct MeshOut {
   // ── The bounded quality pass over the refined region ─────────────────────
   // A bisection wave is conforming but not shapely: LEPP closure leaves
   // stretched neighbours a whole size class away from the interface, and the
-  // ME 490 hinge saddle came back with aspect_max 263 / jacobian_min 0.0029
+  // rover hinge saddle came back with aspect_max 263 / jacobian_min 0.0029
   // and 50 cells under polymesh's ship floor while the interface itself was
   // exactly what was asked for. So each wave — and the mesh the last wave
   // leaves — gets a bounded pass of boundary-aware smoothing, 2-3/3-2 edge
@@ -199,7 +199,7 @@ struct MeshOut {
   // left linear inside a quadratic mesh, and refused the whole order-2 study
   // as "unsupported tet4 connectivity". A nonzero value here means polymesh's
   // graded fill emitted inverted cells at this size (33 of 467162 on the
-  // ME 490 wheel-disc 90 deg sector at fineness 0.5) and Chudware absorbed
+  // rover wheel-disc 90 deg sector at fineness 0.5) and Chudware absorbed
   // them.
   int reoriented_elems = 0;
 
@@ -239,7 +239,7 @@ struct MeshOut {
 
   // ── Solids the mesher FUSED before filling ───────────────────────────────
   // Separately-meshed solids share no nodes, so two rods that merely touch (or
-  // interpenetrate — the ME 490 rover records 9299.81 mm3 of overlap between
+  // interpenetrate — a rover model records 9299.81 mm3 of overlap between
   // source bodies 200 and 201) mesh as two islands and every static study on
   // them is refused for rigid-body motion. A multi-solid STEP whose solids
   // OVERLAP or touch within tolerance is therefore fused into one solid before

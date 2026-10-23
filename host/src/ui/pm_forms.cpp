@@ -1,6 +1,6 @@
 // PropertyManager form table (C17).
 //
-// ONE data-driven table per feature type, each row in docs/contracts/feature_params.md field
+// ONE data-driven table per feature type, each row in contracts/feature_params.md field
 // order. Adding a feature later is a table edit here — no bespoke draw code. Consumed by
 // property_manager.cpp (which renders the rows) and the ribbon dispatcher (cmd_id -> form).
 #include <cstring>

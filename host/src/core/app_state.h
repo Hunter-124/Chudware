@@ -160,7 +160,7 @@ struct Settings {
                                  // default: cloud large, local 8192). Input + output are fitted to
                                  // this so a small LOCAL model never overruns it and breaks the chain.
     std::string systemPrompt;    // system prompt override; empty = built-in
-    std::string theme = "light";  // "dark" | "light" — persisted to config.json (owner default: light)
+    std::string theme = "light";  // "dark" | "light" — persisted to config.json (default: light)
     Units units = Units::MMGS;   // document display/input unit system — persisted to config.json
     bool orthographic = true;    // viewport projection: true=orthographic (CAD default), false=perspective
                                  // — persisted to config.json as "orthographic"
@@ -222,7 +222,7 @@ struct Settings {
     // CAD-Coder-style design history) over a monolithic solid. Serialized "experimental.cad_sequence_mode".
     bool expCadSequenceMode = false;
 
-    // T-G21: vertical-collapse state of the pinned FeatureManager / Copilot glass columns — a
+    // Vertical-collapse state of the pinned FeatureManager / Copilot glass columns — a
     // collapsed column (rolled up to its header strip) stays collapsed across restarts. Serialized
     // "fm_collapsed" / "copilot_collapsed".
     bool fmCollapsed = false;
@@ -930,7 +930,7 @@ struct AppState {
     // `workspaces` cycle scenario, which changes workspace deliberately).
     int shotWorkspacePin = -1;
 
-    // ---- Wave N: AI-ECAD document (worker ecad_* RPCs; the editor mirror lives in ecad_panel.cpp) ----
+    // ---- ECAD document (worker ecad_* RPCs; the editor mirror lives in ecad_panel.cpp) ----
     std::string ecadDocId;          // open ECAD doc id ("" = none)
     int         ecadRevision = -1;  // last known ECAD revision (optimistic-concurrency base)
     bool        wantEcad = false;   // CHUDWARE_SHOT=ecad scripted scenario
@@ -1158,7 +1158,7 @@ struct AppState {
     // the central region (viewport / sketcher / sim / ecad / cam / plm / parts / ai) and which
     // ribbon set is visible. Title bar writes it; app.cpp routes on it; ribbon filters by it.
     // RE-ANCHOR(reveng): append ReverseEng after AI (RE-03 workspace tab shell).
-    // T-FIN5: append Firmware after ReverseEng (append-only — status_bar indexes by value).
+    // Append Firmware after ReverseEng (append-only — status_bar indexes by value).
     enum class Workspace { Model, Drawing, Simulate, Electronics, Manufacture, PLM, PartsLibrary, AI, ReverseEng, Firmware };
     Workspace activeWorkspace = Workspace::Model;
     // Parts Library → Reverse Engineering handoff seam. The parts panel's
@@ -1594,7 +1594,7 @@ struct AppState {
     // and each click re-enters switchToTab — without this every click would queue another
     // identical registry read.
     std::set<std::string> snapshotPrimeInFlight;
-    // T-PERF3: mesh loader generation — bumped on every loadDocMeshAsync; drain drops
+    // Mesh loader generation — bumped on every loadDocMeshAsync; drain drops
     // completions whose gen != meshGen_ (latest-wins; keep-last-good on screen meanwhile).
     std::atomic<uint64_t> meshGen_{0};
     std::string buildErrSummary;  // last "Build code" failure, shown under the editor
@@ -1805,7 +1805,7 @@ struct AppState {
     int simUnits = 0;
     bool wantFea = false;       // C19: CHUDWARE_SHOT=fea scripted static-study scenario
     bool feaShotDone = false;   // guard so the fea scenario runs exactly once
-    // T-FIN24: CHUDWARE_SHOT=simdisc_mech|simdisc_ecad — Simulate-tab disclosure-matrix shots.
+    // CHUDWARE_SHOT=simdisc_mech|simdisc_ecad — Simulate-tab disclosure-matrix shots.
     // mech: part only -> the "+ New Study" picker must show NO electronics options.
     // ecad: PCB tab + part -> electronics simulation + firmware emulation rows appear.
     bool wantSimDisc = false;
@@ -1819,7 +1819,7 @@ struct AppState {
     bool drawingShotDone = false;  // guard so the drawing scenario runs exactly once
     bool wantEvalMass = false;  // C19: CHUDWARE_SHOT=evalmass mass-properties window
     bool evalMassShotDone = false;
-    bool wantIconPipe = false;  // T-G15: CHUDWARE_SHOT=iconpipe — recipe-driven clean-viewport icon render
+    bool wantIconPipe = false;  // CHUDWARE_SHOT=iconpipe — recipe-driven clean-viewport icon render
     bool iconPipeShotDone = false;  // guard: keeps the frame loop alive until every recipe is captured
 
     // ---- SketchMode (C18) — in-sketch tools/overlay; typed like the PropertyManager (W1-B) ----
@@ -1924,7 +1924,7 @@ struct AppState {
     // GL thread. toast() and drawToasts() both take the lock.
     std::mutex toastsMtx;
     std::vector<ui::Toast> toasts;
-    // T-BL31 NEW-3: CHUDWARE_SHOT=ribbon suppresses toasts (the Chudware on-load toast otherwise
+    // CHUDWARE_SHOT=ribbon suppresses toasts (the Chudware on-load toast otherwise
     // occludes leftmost ribbon groups in per-tab icon-verification captures); real usage is
     // unaffected since toasts still auto-dismiss there. See app.cpp wantRibbon setup.
     bool suppressToasts = false;
@@ -2085,7 +2085,7 @@ struct AppState {
     // buffers. Rebuilds only the independent pick/overlay buffers; no worker or disk round-trip.
     bool bindCachedDocMesh(DocSession& session, std::string& err);
 
-    // T-PERF3: non-blocking mesh load. Disk parse + pick-cache build run on a dedicated loader
+    // Non-blocking mesh load. Disk parse + pick-cache build run on a dedicated loader
     // thread; GL upload happens inside drainMeshLoads() (call once per frame after rpc.drain()).
     // meshGen drops stale completions when a newer load is queued. Keep-last-good is free: the
     // previous mesh stays on screen until a current completion commits. Safe to call from GL

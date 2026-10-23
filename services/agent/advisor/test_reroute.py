@@ -1,6 +1,6 @@
-"""Tests for the T-DP5 overseer reroute loop + user-change → stage mapping.
+"""Tests for the overseer reroute loop + user-change → stage mapping.
 
-Covers the T-DP5 DoD:
+Covers:
   * the overseer emits ``audit`` ledger events carrying ``targeted_reentry``
     ``{stage, finding-context, role}`` per verdict;
   * a reroute lands at the CORRECT owning stage — a geometry error routes to the
@@ -327,7 +327,7 @@ def test_master_intent_survives_a_tiny_budget():
 
 def test_drifted_geometry_output_is_caught_and_rerouted(tmp_path):
     """A spec_drift verdict (geometry drifted from the briefed 25mm envelope) is
-    caught and re-grounds at the OWNING geometry stage — the drift-catch DoD."""
+    caught and re-grounds at the OWNING geometry stage."""
     lg = _dp_ledger(tmp_path)
     prov = _CannedProvider([_drift_audit()])
     o = Overseer(provider=prov, role_card={"system_prompt": "audit."}, ledger=lg)

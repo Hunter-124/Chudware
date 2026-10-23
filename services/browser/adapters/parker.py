@@ -1,4 +1,4 @@
-"""services/browser/adapters/parker.py — Parker Hannifin source adapter (T-X7).
+"""services/browser/adapters/parker.py — Parker Hannifin source adapter.
 
 Parker (parker.com) hosts a huge hydraulics / pneumatics / motion catalog.
 CAD largely routes through CADENAS PARTcommunity, but many divisions host

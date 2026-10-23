@@ -1,4 +1,4 @@
-// Format-registry parity tests (T-RF19 — engine_oracle/doc cutover).
+// Format-registry parity tests (engine_oracle/doc cutover).
 //
 // The doc_formats RPC payload is a byte-parity port of the Python oracle's
 // engine/doc/formats.py::list_formats (FORMAT_REGISTRY). These tests pin the

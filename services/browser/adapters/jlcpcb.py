@@ -1,4 +1,4 @@
-"""services/browser/adapters/jlcpcb.py — JLCPCB source adapter (T-X7).
+"""services/browser/adapters/jlcpcb.py — JLCPCB source adapter.
 
 JLCPCB's parts library (LCSC-sourced parts used in JLC's SMT assembly
 service) has no downloadable CAD file here — this adapter returns a
@@ -9,7 +9,7 @@ behind a per-order terms click-through; this adapter never accepts that on
 the user's behalf and surfaces :func:`terms_confirmation_required` instead.
 
 NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live logged-in JLCPCB session (T-X6 gates the real per-source
+against a live logged-in JLCPCB session (the gated integration suite covers the real per-source
 integration tests behind an env flag).
 """
 from __future__ import annotations

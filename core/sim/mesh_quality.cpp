@@ -324,7 +324,7 @@ bool fill_quality(MeshOut &out) {
   // Nodes NO element references are not components of the domain, and counting
   // them here was a live defect, not pedantry: the hanging-fragment dissolve
   // preserves node numbering by design, so every repaired mesh carries orphan
-  // nodes — on the ME 490 caliper-bracket isolate at tet4 h = 3.0 mm this read
+  // nodes — on a rover caliper-bracket isolate at tet4 h = 3.0 mm this read
   // 57 components for a domain of 4, and 45 for 8 at h = 4.0. Two consumers
   // then read a number that was mostly orphan count: mesh_loaded_model's
   // honest-coarsening rebuild ("came back in more pieces than the shape has
@@ -539,7 +539,7 @@ namespace {
 // body was marked a hanging fragment, so `count_lonely_nodes` reported every
 // node in the part and `repair_lonely_nodes` tried to dissolve the entire
 // mesh (which its own empty-result guard then refused, leaving the study to be
-// refused for a mechanism that did not exist). Measured on the ME 490 wheel
+// refused for a mechanism that did not exist). Measured on a rover wheel
 // sector at fineness 0.5: the fill hands over 102752 elements in exactly three
 // face-connected fragments — the body (102750) and two isolated tets — and the
 // study came back "mesh has 22026 node(s) on element fragment(s) that touch
@@ -757,7 +757,7 @@ int element_component_count(const MeshOut &out, int stride, int node_count) {
 // A component that is not the domain, is under a MILLIONTH of the domain's
 // volume, and is smaller than ONE average element of this very mesh is fill
 // debris: it cannot carry load, it cannot be refined into anything, and it
-// costs the whole study a rigid-body refusal. Measured on the ME 490
+// costs the whole study a rigid-body refusal. Measured on a rover
 // caliper-bracket isolate (body 201 — rods that pass THROUGH each other, so
 // their union leaves a 9.8 um knife-edge where one emerges from the next), tet4:
 //

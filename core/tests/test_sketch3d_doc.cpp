@@ -297,7 +297,7 @@ TEST_CASE("sketch3d health + drag RPCs through the session layer") {
     chudware::doc::doc_close(doc_id);
 }
 
-// ---- T-3DXREF: sketch3d external vertex references -------------------------
+// ---- sketch3d external vertex references ------------------------------------
 
 TEST_CASE("sketch3d external vertex ref: resolves, grounds a coincident constraint, "
          "follows an upstream edit, goes stale (kept) when the source is deleted") {

@@ -49,7 +49,7 @@ Every make_* returns a record: {artifact_id, kind, path, created_ts, run_id, sou
 spec_ref}. list_artifacts reads them back, newest first.
 
 ═══════════════════════════════════════════════════════════════════════════════════════════════
-ENGINEERING TEMPLATES v1 (T-F15) — the standard documents a professional engineer ships. Each
+ENGINEERING TEMPLATES v1 — the standard documents a professional engineer ships. Each
 registers against the same generic registry and is driven by one existing make_* tool (no new
 tool). Select one via spec.template. The `deliverables.joins` helpers turn raw engine results
 into the attached_results bag + the slot refs, so you never type a number.
@@ -79,7 +79,7 @@ into the attached_results bag + the slot refs, so you never type a number.
 3) bom_workbook  — make_workbook, format xlsx. One sheet per assembly level, LIVE cost formulas.
    Sheet columns are FIXED: Item | Qty | Unit Cost | Ext Cost | Source (indices 0..4).
    LOAD-BEARING columns: Qty (1), Unit Cost (2). Ext Cost is a live "=B2*C2" formula; a rollup
-   row uses "=SUM(...)". Source is free prose (a WS-B sourced-part link, blank if unsourced).
+   row uses "=SUM(...)". Source is free prose (a sourced-part link, blank if unsourced).
    Easiest: `deliverables.joins.bom_rollup([{item,qty,unit_cost?,source?}, ...])` returns the
    sheet block + attached_results ready to drop into the spec.
 

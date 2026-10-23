@@ -6,8 +6,8 @@
 > artifact, a provenance rule that guarantees **the model never types a load-bearing number**,
 > and an artifact registry the rest of the system reads.
 >
-> **Contract-first.** This file is frozen BEFORE the code (`services/deliverables/`, T-F14 D2).
-> Append-only per the `contracts/README.md` frozen-seam policy; changes need integrator sign-off
+> **Contract-first.** This file is frozen BEFORE the code (`services/deliverables/`).
+> Append-only per the `contracts/README.md` frozen-seam policy; changes need maintainer sign-off
 > and a version bump (`deliverables/2`).
 >
 > **Open-source-first (master plan §3.6, CONTRIBUTING license guardrails).** We do NOT write
@@ -106,8 +106,8 @@ WeasyPrint/reportlab (in-process, no subprocess) for `pdf`.
 
 ## 3. Artifact record (frozen output schema)
 
-Every `make_*` returns this record on success. It is what `describe_project` (T-F8), the preview
-pane (T-F16), and T-H1 telemetry consume — **do not change its shape without a version bump.**
+Every `make_*` returns this record on success. It is what `describe_project`, the preview
+pane, and AI telemetry consume — **do not change its shape without a version bump.**
 
 ```json
 {
@@ -375,18 +375,18 @@ names (§4.3). Templates are looked up through a generic registry (name → buil
 
 Out of scope for this contract (named so the boundary is explicit):
 
-- Real engineering templates — design-review deck, calc package, BOM workbook — are **T-F15**.
-  They register against the same generic template registry; no contract change is required.
-- The in-app preview pane is **T-F16**; it consumes the §3 artifact record and `render_document`.
+- Real engineering templates — design-review deck, calc package, BOM workbook — are separate
+  work. They register against the same generic template registry; no contract change is required.
+- The in-app preview pane is separate work; it consumes the §3 artifact record and `render_document`.
 
-A `cad_guide('deliverables')` topic (registered by the implementation dispatch) documents this
+A `cad_guide('deliverables')` topic (registered by the implementation) documents this
 tool family for agents at runtime.
 
 ## 9. Versioning & freeze
 
-- Contract id: **`deliverables/1`**. Frozen 2026-07-02 (Pillar 15, FABLE-ARC).
+- Contract id: **`deliverables/1`**. Frozen 2026-07-02.
 - Append-only. The §3 artifact record, the §4 provenance rules, and the §6 reason-code set are the
-  load-bearing seams other tasks (T-F8, T-F16, T-H1) build on — a breaking change to any of them
-  requires integrator sign-off and `deliverables/2`.
+  load-bearing seams other components (narration, preview pane, telemetry) build on — a breaking change to any of them
+  requires maintainer sign-off and `deliverables/2`.
 - Adding a template (§8) or an in-process engine row (§7, with the matching `contracts/licenses.md`
   row) is a compatible, non-versioning change.

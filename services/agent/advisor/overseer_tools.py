@@ -1,11 +1,11 @@
 """In-app entry points for the overseer: ``audit_now`` and ``change_request``.
 
-Task T-W13, in-app pivot (2026-07-04): the sole integration target is the in-app
+In-app design (2026-07-04): the sole integration target is the in-app
 copilot harness (services/agent + GUI).  These are plain callables the loop / dag
 runner / pipeline invoke by name — no MCP dependency.  Registering them on the MCP
-server is OPTIONAL (parked to T-W20); :func:`register_overseer_tools` is provided as
+server is OPTIONAL; :func:`register_overseer_tools` is provided as
 a free mirror of ``buildgraph.mcp_tools.register_buildgraph_tools`` but is NOT wired
-into ``services/mcp/server.py`` here (MCP freshness is out of scope per the pivot).
+into ``services/mcp/server.py``.
 
 Both functions load the run ledger and active build graph, then execute the
 ``overseer`` role through Chudcode.  A caller may request the deterministic local
@@ -30,7 +30,7 @@ _CR_LEDGER_BUDGET = 2000  # tokens rendered into the change-request self-audit
 
 
 def _load_buildgraph(run_id: str, runs_dir: Optional[Path]) -> dict | None:
-    """Load the active build graph for *run_id* from its sidecar (T-W15).
+    """Load the active build graph for *run_id* from its sidecar.
 
     Reuses the buildgraph sidecar reader so we stay consistent with how the graph
     was persisted.  Returns the ``aicad.buildgraph/1`` dict or ``None``.
@@ -181,8 +181,8 @@ def change_request(
 
 
 # ---------------------------------------------------------------------------
-# Optional MCP registration (free mirror — NOT wired into server.py; T-W20 parks
-# external MCP surface polish).  Present so the tools are one call from exposure.
+# Optional MCP registration (free mirror — NOT wired into server.py).
+# Present so the tools are one call from exposure.
 # ---------------------------------------------------------------------------
 
 
@@ -191,8 +191,8 @@ def register_overseer_tools(
 ) -> None:
     """Register ``audit_now`` and ``change_request`` MCP tools onto *mcp*.
 
-    Not called from server.py in T-W13 (in-app pivot).  A future MCP-freshness task
-    (T-W20) can call this and add both tools to the server instructions.
+    Not called from server.py (the overseer is integrated in-app).  A future MCP
+    integration can call this and add both tools to the server instructions.
     """
     import json as _json
 

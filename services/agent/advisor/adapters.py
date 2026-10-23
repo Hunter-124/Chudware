@@ -1,6 +1,6 @@
-"""Host adapters — normalize a host result into engine :class:`Finding`s (T-W5).
+"""Host adapters — normalize a host result into engine :class:`Finding`s.
 
-Per the advisor review: the engine is pure over a normalized observation; the
+The engine is pure over a normalized observation; the
 loop-vs-doc mismatch lives here in ~two thin adapters, not smeared through the
 engine.
 
@@ -87,7 +87,7 @@ def observe_build(res: Any, stage: str = "feature", seq: int = 0,
     Default stage is ``assembly`` when the result is an assembly (interference is
     an assembly-stage check), else ``feature``.
 
-    *output_text* / *tool_names* / *cooldown_state* (T-W21 §20) thread the
+    *output_text* / *tool_names* / *cooldown_state* (§20) thread the
     trigger-injection signals through to :func:`engine.build_advisory`.
     agent_turn.py's turn loop is also a caller of this adapter — it has no
     build123d result, so it passes ``res={}`` purely for the trigger path.
@@ -145,7 +145,7 @@ def observe_doc(doc_id: str, stage: str, seq: int = 0,
                 rpc: Optional[Any] = None, user_override: bool = False,
                 output_text: str = "", tool_names: Optional[list[str]] = None,
                 cooldown_state: Optional[dict] = None) -> Observation:
-    """T-W21 §20: *output_text* / *tool_names* / *cooldown_state* are optional
+    """§20: *output_text* / *tool_names* / *cooldown_state* are optional
     trigger-injection signals threaded through to :func:`engine.build_advisory`;
     absent by default so the advise() MCP doc path (no turn signals) is unchanged.
     """
@@ -196,7 +196,7 @@ def _run_check(check: str, doc_id: str, call: Any) -> list[Finding]:
         return _check_sketch(doc_id, call, check)
     if check == stages.CHECK_REBUILD:
         return _check_rebuild(doc_id, call)
-    # T-DP6 diagnostic advisor checks
+    # Diagnostic advisor checks
     if check == stages.CHECK_WALL_THICKNESS:
         return _check_wall_thickness(doc_id, call)
     if check == stages.CHECK_DFM:
@@ -211,7 +211,7 @@ def _check_interference(doc_id: str, call: Any) -> list[Finding]:
     r = call("doc_eval_interference", doc_id=doc_id) or {}
     # Build a name→bbox lookup from the ``parts`` list so the engine can derive
     # the minimum-translation-separation axis without a second RPC call.
-    # T-DP6: kernel returns {parts:[{name, bbox:{min,max,size}, volume}], interferences:[{a,b,volume}]}
+    # Kernel returns {parts:[{name, bbox:{min,max,size}, volume}], interferences:[{a,b,volume}]}
     bbox_by_name: dict[str, dict] = {}
     for part in r.get("parts", []):
         name = part.get("name")
@@ -231,7 +231,7 @@ def _check_interference(doc_id: str, call: Any) -> list[Finding]:
                 "fit": it.get("fit", "H7/g6"),
                 "nominal": it.get("nominal", it.get("shaft_d")),
             }
-        # T-DP6: carry bbox data so engine._fix_interference can derive the MTS axis.
+        # Carry bbox data so engine._fix_interference can derive the MTS axis.
         a_name = it.get("a", "")
         b_name = it.get("b", "")
         if a_name in bbox_by_name:
@@ -378,7 +378,7 @@ def _check_rebuild(doc_id: str, call: Any) -> list[Finding]:
 
 
 # ---------------------------------------------------------------------------
-# T-DP6: wall_thickness, DFM, and interface_fitment checks
+# Diagnostic advisors: wall_thickness, DFM, and interface_fitment checks
 # ---------------------------------------------------------------------------
 
 def _check_wall_thickness(doc_id: str, call: Any) -> list[Finding]:
@@ -479,10 +479,10 @@ def _check_dfm(doc_id: str, call: Any) -> list[Finding]:
 
 
 def _check_interface_fitment(doc_id: str, call: Any) -> list[Finding]:
-    """Run interface_check (T-BL49) → per-pair alignment Findings.
+    """Run interface_check → per-pair alignment Findings.
 
     Each failed/warned finding in the interface_check ``findings`` list becomes an
-    ``action`` Finding; the pre-computed ``fix`` string from T-BL49 is carried in
+    ``action`` Finding; the tool's pre-computed ``fix`` string is carried in
     ``extra`` so the engine fix provider can lift it directly into a candidate_fix.
     """
     ic = call("interface_check", doc_id=doc_id) or {}

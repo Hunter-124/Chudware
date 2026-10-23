@@ -4,7 +4,7 @@ This module owns:
 - Dataclass definitions for every record in the schema.
 - ``to_dict`` / ``from_dict`` round-trip (JSON-safe plain dicts).
 - ``VALID_VERIFIERS`` — the canonical list of MCP tool names that may appear in
-  ``verify_by[].verifier``.  T-H4 may extend this list via contract amendment.
+  ``verify_by[].verifier``.  The verifier battery may extend this list via contract amendment.
 - ``markdown_projection`` — a deterministic, diff-stable, **read-only** view.
 - Factory helpers for creating new documents and mutating them correctly.
 
@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # VALID_VERIFIERS — normative list; see contracts/requirements.md §3.
-# T-H4 verifier battery may extend this via contract amendment.
+# The verifier battery may extend this via contract amendment.
 # ---------------------------------------------------------------------------
 VALID_VERIFIERS: frozenset[str] = frozenset({
     "check_sketch",

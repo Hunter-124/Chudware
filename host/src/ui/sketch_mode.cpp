@@ -510,7 +510,7 @@ static void parseEntities(const nlohmann::json& res, std::vector<SketchEntity>& 
     out.clear();
     const nlohmann::json* stats = res.contains("statuses") ? &res["statuses"] : nullptr;
     if (!res.contains("entities") || !res["entities"].is_array()) return;
-    // T-BL49: eid -> {ref, stale} ownership map for associative Convert Entities styling.
+    // eid -> {ref, stale} ownership map for associative Convert Entities styling.
     const nlohmann::json* ext = res.contains("external") && res["external"].is_object()
                                     ? &res["external"] : nullptr;
     for (const auto& e : res["entities"]) {
@@ -3706,7 +3706,7 @@ void SketchMode::beginGroupDrag(const std::vector<std::string>& ids, float start
     groupDragging_ = true;
 }
 
-// T-PERF2: latest-wins async sketch_drag — never block the GL thread on a solve.
+// Latest-wins async sketch_drag — never block the GL thread on a solve.
 void SketchMode::queueSketchDrag(AppState& st, nlohmann::json extra) {
     dragPendingExtra_ = std::move(extra);
     dragPending_ = true;
@@ -3742,7 +3742,7 @@ void SketchMode::kickSketchDragAsync(AppState& st) {
 
 // Push one transient frame of the group translation: every captured handle soft-targeted at its
 // original (u,v) plus the cursor delta. Throttled to once per frame by the caller (dragFrame_);
-// the RPC itself is latest-wins async (T-PERF2).
+// the RPC itself is latest-wins async.
 void SketchMode::updateGroupDrag(AppState& st, float curU, float curV) {
     if (groupDragTargets_.empty()) return;
     float dx = curU - groupDragStartUV_.x, dy = curV - groupDragStartUV_.y;
@@ -6168,7 +6168,7 @@ bool SketchMode::drawAxisPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
     return true;
 }
 
-// T-BL37: hit-test displayed point datums (world origin + user-created point features) in screen
+// Hit-test displayed point datums (world origin + user-created point features) in screen
 // space. A 2D distance test against the projected world point, within a grab radius. On click,
 // routes the point datum into the active PM well via routeDatumPoint().
 bool SketchMode::drawPointPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
@@ -7164,7 +7164,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // ---- entities (color by solver status via theme roles) ----
     auto statusCol = [&](const SketchEntity& e) -> ImU32 {
         if (e.status == "over") return col(pal.statusErr);
-        // T-BL49: external-ref (Convert Entities) provenance beats the solved-ink color —
+        // External-ref (Convert Entities) provenance beats the solved-ink color —
         // violet when live, warning amber when the source no longer resolves (stale).
         if (e.externalStale) return col(pal.sketchExternalStale);
         if (e.external) return col(pal.sketchExternal);
@@ -7179,7 +7179,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // DPI-scaled marker sizes shared by the entity loop (endpoint/center dots, point crosses).
     const float dotR = 3.0f * ui::uiScale, ctrR = 2.5f * ui::uiScale;
     for (const auto& e0 : ents_) {
-        // T-BL49: a STALE external-ref entity draws DASHED (warning styling) — reuse the
+        // A STALE external-ref entity draws DASHED (warning styling) — reuse the
         // construction dash path on a per-draw copy so every entity-type branch below
         // inherits it without touching the stored construction flag.
         SketchEntity e = e0;

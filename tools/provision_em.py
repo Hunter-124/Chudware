@@ -45,7 +45,7 @@ _INSTALL_HINT = (
     "tinyxml-devel hdf5-devel vtk-devel boost-devel CGAL-devel fparser-devel "
     "python3-devel python3-cython, then "
     "`python -m tools.provision_em --install`), "
-    "or use the openSUSE/Ubuntu packages; see docs/EM_SIMULATION.md"
+    "or use the openSUSE/Ubuntu packages; see docs/reference/EM_SIMULATION.md"
 )
 
 _FEDORA_DEPS = (
@@ -98,20 +98,19 @@ def _candidate_pythons() -> list[Path]:
         seen.add(key)
         out.append(path)
 
-    add(os.environ.get("CHUDWARE_PYTHON") or os.environ.get("CHUDWARE_PYTHON"))
+    add(os.environ.get("CHUDWARE_PYTHON"))
 
     # openEMS's own install venv (created by update_openEMS.sh --python).
     add(_default_prefix() / "venv" / ("Scripts" if win else "bin") / ("python.exe" if win else "python"))
 
     home = Path.home()
-    for root_name in ("Chudware", "Chudware"):
-        if win:
-            appdata = Path(os.environ.get("APPDATA") or (home / "AppData" / "Roaming"))
-            add(appdata / root_name / "mcp-venv" / "Scripts" / "python.exe")
-            add(appdata / root_name / "runtime" / "venv" / "Scripts" / "python.exe")
-        else:
-            add(home / ".local" / "share" / root_name / "mcp-venv" / "bin" / "python")
-            add(home / ".local" / "share" / root_name / "runtime" / "venv" / "bin" / "python")
+    if win:
+        appdata = Path(os.environ.get("APPDATA") or (home / "AppData" / "Roaming"))
+        add(appdata / "Chudware" / "mcp-venv" / "Scripts" / "python.exe")
+        add(appdata / "Chudware" / "runtime" / "venv" / "Scripts" / "python.exe")
+    else:
+        add(home / ".local" / "share" / "Chudware" / "mcp-venv" / "bin" / "python")
+        add(home / ".local" / "share" / "Chudware" / "runtime" / "venv" / "bin" / "python")
 
     here = Path(__file__).resolve().parent.parent
     if win:
@@ -241,7 +240,7 @@ def _try_install_build_deps() -> None:
         return
 
     if _have_cmd("dnf"):
-        cmd = ["sudo", "dnf", "install", "-y", "--disablerepo=*claude*", *_FEDORA_DEPS]
+        cmd = ["sudo", "dnf", "install", "-y", *_FEDORA_DEPS]
         print(f"[provision] ensuring Fedora build deps via dnf ({', '.join(missing_markers) or 'refresh'})...")
         try:
             subprocess.run(cmd, timeout=1800, check=False)

@@ -218,7 +218,7 @@ report_engine_staleness() {
 }
 # --- Polyhedral-FEA source selection ---------------------------------------
 # CHUDWARE_POLYMESH_ROOT=<checkout> builds core against a LIVE Polyhedral-FEA working tree
-# (the repository root, e.g. ~/Repositories/Polyhedral-FEA-private) instead of the pinned
+# (the repository root, e.g. ~/src/Polyhedral-FEA) instead of the pinned
 # third_party fetch. It is forwarded as -DPOLYMESH_SOURCE_DIR, and because the variable is
 # cached, an already-configured tree must be re-configured for the switch to take effect —
 # and re-configured again (with the flag absent, which clears it) to go back to the pin.

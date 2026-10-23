@@ -1452,7 +1452,7 @@ def _make_symbols() -> dict:
     return syms
 
 
-# ─── engineering-metadata seeds (T-FIN8; schema: contracts/ecad/boardphys.md) ──
+# ─── engineering-metadata seeds (schema: contracts/ecad/boardphys.md) ─────────
 # Values are DATASHEET-CLASS SEEDS, each with a source note (research_datasheet_fetch
 # style provenance). They are nominal/typical figures for the generic part class the
 # starter symbol represents — good enough for power budgets and thermal screening, and
@@ -2340,7 +2340,7 @@ def _make_footprints() -> dict:
     return fps
 
 
-# ─── footprint engineering-metadata seeds (T-FIN8) ────────────────────────────
+# ─── footprint engineering-metadata seeds ─────────────────────────────────────
 # Package BODY dims (nominal plastic body, mm — not lead span) + JEDEC-style
 # single-part theta_ja seeds. ecad_to_3d uses the body dims for component solids;
 # the boardphys sidecar carries theta for the thermal handoff. All approximate,

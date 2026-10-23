@@ -115,7 +115,7 @@ def clean_board() -> dict:
     b = schema.new_board("hosttest")
     _add_nets(b, "3V3", "NRST", "BOOT", "XIN", "XOUT", "VCORE", "VIO", "PG1", "SIG")
     fps = b["footprints"]
-    # MCU with full T-FIN8 metadata (sequencing requirement VCORE before VIO)
+    # MCU with full engineering metadata (sequencing requirement VCORE before VIO)
     fps.append(_fp("U1", "MCU:GENERIC", [0.0, 0.0],
                    ["3V3", "GND", "NRST", "BOOT", "XIN", "XOUT", "SIG"],
                    value="MCU", eng_overrides=MCU_ENG))

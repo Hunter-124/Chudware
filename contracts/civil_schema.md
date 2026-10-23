@@ -1,6 +1,6 @@
 # Contract: `aicad.civil/1` — civil / site / utility infrastructure model
 
-> **Frozen seam.** Append-only; changes require integrator sign-off + a version bump
+> **Frozen seam.** Append-only; changes require maintainer sign-off + a version bump
 > (see `contracts/README.md`). Python package: `services/civil/`; MCP surface:
 > `services/mcp/civil_tools.py` (`civil_*` tools, registry family `sim`).
 

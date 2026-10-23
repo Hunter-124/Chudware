@@ -24,7 +24,7 @@ Design contract:
     everywhere (matches the core ``piping_solve`` / ``catalog.nearest_pipe`` style).
   - build123d / OCP imported lazily (same as ``threed.py``); absent kernel → soft fail.
   - ``fluids`` optional; absent → soft fail on hydraulic calcs only.
-  - No new dependencies beyond what T-E1/T-E2 already use.
+  - No new dependencies beyond what the piping hydraulics modules already use.
 """
 
 from __future__ import annotations

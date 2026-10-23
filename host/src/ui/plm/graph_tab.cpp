@@ -197,7 +197,7 @@ struct GraphTabState {
   std::vector<std::string> projects;
   std::string scopePending; // plmGraphScopeNode request applied on next draw
   std::string focusPending; // plmGraphFocus request to apply on next draw
-  // ME489-scale guards ----------------------------------------------------
+  // Large-project scale guards -----------------------------------------------
   bool hideArchive = true;
   // Project-view cleanup: skip nodes with no visible links (scattered dots).
   bool hideUnconnected = true;
@@ -304,12 +304,12 @@ struct GraphTabState {
   bool fitOnSettle = false; // fit once when a fresh layout first settles
   // Per-frame scratch: visibleIdx re-sorted back-to-front by projected depth
   // (3D only) plus the perspective each visible node projected to. Members so
-  // the sort does not allocate every frame at ME489 scale.
+  // the sort does not allocate every frame at large-project scale.
   std::vector<int> drawOrder;
   std::vector<float> perspOf; // indexed by nodes[] index
   // Label occupancy scratch (per frame). labelShown is indexed by nodes[]
   // index and gates the paint; labelTaken holds the rects already reserved.
-  // Members so the pass does not allocate every frame at ME489 scale.
+  // Members so the pass does not allocate every frame at large-project scale.
   std::vector<LabelCand> labelCand;
   std::vector<ImRect> labelTaken;
   std::vector<char> labelShown;
@@ -734,7 +734,7 @@ void rebuildIdIndex(GraphTabState &G) {
 // Whole-graph derived edge facts that the DRAW and INSPECT paths used to
 // recompute by scanning G.edges every frame: out/in degree per node, and the
 // INSTANCE_OF target of every instance node. Both are O(edges) once per data
-// load instead of O(edges) per node per frame — at ME489 scale the old
+// load instead of O(edges) per node per frame — at large-project scale the old
 // inspector rescan alone was ~60k string compares a frame, and resolving an
 // instance thumbnail was the same scan again per instance.
 void rebuildEdgeIndex(GraphTabState &G) {
@@ -4469,7 +4469,7 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
   };
 
   // Back-to-front paint order + this frame's depth range. Reuses two member
-  // vectors, so the sort does not allocate at ME489 scale.
+  // vectors, so the sort does not allocate at large-project scale.
   float perspMin = 1.0f, perspMax = 1.0f;
   buildDrawOrder(G, P, perspMin, perspMax);
   const float perspSpan = std::max(perspMax - perspMin, 1e-4f);
@@ -5133,7 +5133,7 @@ void drawCanvas(AppState &st, ImVec2 canvasSz) {
         const ImGuiID bid = ImGui::GetID(n.id.c_str());
         const bool want = r >= kBillboardR;
         // peek() so a disc nowhere near the threshold never even allocates a
-        // tween slot: at ME489 scale that would be a table entry per node.
+        // tween slot: at large-project scale that would be a table entry per node.
         if (want || ui::anim::peek(bid) > 0.004f)
           billT = ui::anim::toward(bid, want ? 1.0f : 0.0f, ui::anim::kFast);
         GraphGridThumb th;
@@ -6240,7 +6240,7 @@ void plmDrawGraphPage(AppState &st) {
   }
 
   // Auto-refresh when the OS app regains focus (bypasses the poll interval).
-  // Use force=false so a warm ME489-scale cache can serve without a full
+  // Use force=false so a warm large-project cache can serve without a full
   // rebuild (mtime fast-path).
   const bool lost = ImGui::GetIO().AppFocusLost;
   if (G.wasAppFocusLost && !lost)

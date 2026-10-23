@@ -447,7 +447,7 @@ def test_describe_results_modal_study_and_named_lookup():
     assert r3["ok"] is False and "No study named" in r3["error"], r3
 
 
-# ---------------------------------------------------------------- describe_assembly (T-F8)
+# ---------------------------------------------------------------- describe_assembly
 
 
 def _new_description_boxes(name: str, offset: float) -> str:
@@ -629,7 +629,7 @@ def test_describe_assembly_leaves_a_solved_assembly_unedited(tmp_path):
         _call("close_part", {"doc_id": plate})
 
 
-# ---------------------------------------------------------------- describe_board (T-F8)
+# ---------------------------------------------------------------- describe_board
 
 
 def test_describe_board_no_ecad_doc_graceful():
@@ -664,7 +664,7 @@ def test_describe_board_schematic_narration():
     assert re.search(r"\d+ component\(s\)", text), text
 
 
-# ---------------------------------------------------------------- describe_project (T-F8)
+# ---------------------------------------------------------------- describe_project
 
 
 def test_describe_project_no_run_graceful():
@@ -684,7 +684,7 @@ def test_describe_project_full_run():
         "name": "Test Sprint",
         "nodes": [
             {"id": "T-1", "title": "Do something", "status": "done"},
-            {"id": "T-2", "title": "Do another", "status": "doing", "owner": "opus-test"},
+            {"id": "T-2", "title": "Do another", "status": "doing", "owner": "worker-1"},
             {"id": "T-3", "title": "Blocked task", "status": "blocked",
              "blocked_reason": "waiting on T-1"},
             {"id": "T-4", "title": "Pending task", "status": "todo"},
@@ -704,7 +704,7 @@ def test_describe_project_full_run():
     assert "12,345" in text and "100,000" in text and "(12.3%)" in text, text
     assert "(source: dag_run.budget)" in text, text
     assert "[done] T-1: Do something" in text, text
-    assert "[doing] T-2: Do another  (owner: opus-test)" in text, text
+    assert "[doing] T-2: Do another  (owner: worker-1)" in text, text
     assert "[blocked] T-3: Blocked task  reason: waiting on T-1" in text, text
     assert "Q (Q1): Should we use X or Y?" in text, text
     assert ("(Source: dag_run dict — numbers narrated from the DAG run record, "
@@ -720,7 +720,7 @@ def test_describe_project_empty_nodes():
     assert "No open questions." in r["text"], r
 
 
-# ---------------------------------------------------------------- T-DP7: sketch_health / auto-constrain
+# ---------------------------------------------------------------- sketch_health / auto-constrain
 
 
 def _touching_rect_op(w: float = 30.0, h: float = 20.0):
@@ -768,7 +768,7 @@ def _gapped_rect_op(w: float = 30.0, h: float = 20.0, gap: float = 1.0):
 
 
 def test_dod1_auto_coincident_closes_touching_loop():
-    """DoD 1 — T-DP7: touching endpoints forming a loop become coincident on sketch edit
+    """DoD 1: touching endpoints forming a loop become coincident on sketch edit
     (sketch.auto_coincident=ON, the default).
 
     The maybe_auto_constrain pass runs inside apply_ops_locked BEFORE validation, so a
@@ -807,7 +807,7 @@ def test_dod1_auto_coincident_closes_touching_loop():
 
 
 def test_dod2_auto_constrain_reduces_dof_to_zero():
-    """DoD 2 — T-DP7: auto-constrain drives a representative underconstrained sketch toward
+    """DoD 2: auto-constrain drives a representative underconstrained sketch toward
     DOF 0.
 
     Strategy: use the touching-rect fixture (corners auto-stitched on add_features) which

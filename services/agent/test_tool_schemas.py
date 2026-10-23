@@ -1,4 +1,4 @@
-"""Tests for tool_schemas.py — trimmed schema rendering for the §9.1 tools slot (T-W32).
+"""Tests for tool_schemas.py — trimmed schema rendering for the §9.1 tools slot.
 
 DoD coverage: turn prompts carry trimmed schemas for exactly the allowed tools;
 token cost is MEASURED (same 4-chars/token stick as tiers.TurnAssembler) and

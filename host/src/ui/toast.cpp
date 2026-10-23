@@ -136,7 +136,7 @@ void drawToasts(AppState& st) {
     const auto& pal = ui::palette;
 
     // Anchor top-RIGHT of the viewport span the pinned columns leave clear, below the REAL ribbon
-    // bottom (T-BL31 NEW-3: a fixed 64dp guess undershot the ribbon's actual height and pinned the
+    // bottom (a fixed 64dp guess undershot the ribbon's actual height and pinned the
     // card over its leftmost groups). overlayBand().minY is the same ribbon-bottom Y the
     // FeatureManager/Copilot columns already anchor to; fall back to a modest fixed inset for the
     // pre-publish first frame.

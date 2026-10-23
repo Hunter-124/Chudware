@@ -1,7 +1,7 @@
 schema: aicad.routing/1
-# Model source registry — user-configured via the GUI settings (T-W17 builds the UI).
+# Model source registry — user-configured via the GUI settings.
 # This is the ONLY place role->model bindings live. No hardcoded role->model choices
-# anywhere else in the codebase (contract section 14, Hunter directive 2026-07-04).
+# anywhere else in the codebase (contract section 14; design decision 2026-07-04).
 #
 # Tiers (capability ranking — data, not code):
 #   frontier     — large cloud models (Anthropic, OpenAI flagship)
@@ -18,7 +18,7 @@ schema: aicad.routing/1
 # Source kinds (NO consumer-OAuth kinds — Pillar 12):
 #   anthropic | openai | openrouter | gemini | xai | lmstudio | llamacpp | ollama | vllm
 
-sources: []  # populated by the user via the settings GUI (T-W17)
+sources: []  # populated by the user via the settings GUI
   # Example entries (uncomment and fill in):
   # - id: anthropic_api
   #   kind: anthropic
@@ -49,11 +49,11 @@ assignments:
   clarifier:              [cheap_local, strong]
   spec_writer:            [cheap_local, strong]
   manufacturing_planner:  [cheap_local, strong]   # 2026-08-26 mfg plan stage
-  feature_architect:      [cheap_local, strong]   # T-DP2 design-pipeline Stage 1
-  geometry_designer:      [cheap_local, strong]   # T-DP3 design-pipeline Stage 2
-  linkage_planner:        [cheap_local, strong]   # T-DP4 design-pipeline Stage 3
+  feature_architect:      [cheap_local, strong]   # design-pipeline Stage 1
+  geometry_designer:      [cheap_local, strong]   # design-pipeline Stage 2
+  linkage_planner:        [cheap_local, strong]   # design-pipeline Stage 3
   department_manager:     [strongest]
-  # W17-added roles (additive):
+  # Additional roles (additive):
   layout_engineer:        [cheap_local, strong]
   sim_engineer:           [strong, cheap_local]
   assembly_fit_engineer:  [strong, cheap_local]
@@ -82,7 +82,7 @@ assignments:
   default:                [cheap_local, strong]
 
 
-# T-DP9: Hierarchical delegation rails — no hard depth cap.
+# Hierarchical delegation rails — no hard depth cap.
 # These are advisory soft limits; reaching them emits a warning ledger event
 # but the spawn still proceeds. The kill-switch (kill_delegation_tree tool or
 # DelegationTree.kill()) is the human-controlled hard stop.

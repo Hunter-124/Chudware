@@ -1,12 +1,12 @@
 """Pack AI-generated icon PNGs into the Chudware atlases.
 
 This is the AI-icon counterpart to the legacy procedural `make_icons.py`. Instead of
-drawing glyphs, it composites pre-rendered source PNGs (one per icon name, produced from
-`docs/ICONS_AI_PROMPTS.md`) into the two atlases the C++ loader consumes.
+drawing glyphs, it composites pre-rendered source PNGs (one per icon name, generated
+from per-icon image prompts) into the two atlases the C++ loader consumes.
 
-Source:  host/assets/icons/src/<name>.png   (1024x1024-ish, transparent alpha, square)
-Outputs: host/assets/icons/atlas_dark.png, atlas_light.png   (pixel-identical)
-Layout:  REUSED verbatim from the existing host/assets/icons/atlas.json, so every icon's
+Source:  assets/icons/src/<name>.png   (1024x1024-ish, transparent alpha, square)
+Outputs: assets/icons/atlas_dark.png, atlas_light.png   (pixel-identical)
+Layout:  REUSED verbatim from the existing assets/icons/atlas.json, so every icon's
          UVs stay put and `host/src/ui/icons.cpp` needs no change. atlas.json is left
          untouched when writing in place (only copied when packing to a different dir).
 
@@ -15,9 +15,9 @@ the way the old monochrome line-art did. The loader still swaps textures on them
 both just hold the same art.
 
 Usage:
-  python host/assets/pack_icons.py                 # pack src/ -> icons/ in place
-  python host/assets/pack_icons.py --check         # report which source PNGs are missing
-  python host/assets/pack_icons.py --src DIR --out DIR
+  python assets/pack_icons.py                 # pack src/ -> icons/ in place
+  python assets/pack_icons.py --check         # report which source PNGs are missing
+  python assets/pack_icons.py --src DIR --out DIR
 """
 from __future__ import annotations
 

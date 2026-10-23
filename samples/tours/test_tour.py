@@ -1,5 +1,5 @@
 """
-samples/tours/test_tour.py — T-Q3 DoD: one tour script runs end-to-end headless.
+samples/tours/test_tour.py — one tour script runs end-to-end headless.
 
 Usage:
   CHUDWARE_LIBCHUDWARE=<path>/libchudware.so python -m pytest samples/tours/test_tour.py -v

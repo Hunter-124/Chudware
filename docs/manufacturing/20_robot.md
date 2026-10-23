@@ -1182,8 +1182,8 @@ imported in-process, absence degrades honestly.
 
 ## 10. Integrator-owned appends requested (not performed here)
 
-Contracts, the C ABI, top-level CMake, and gate files are append-only and integrator-owned. Exact
-content is specified so the integrator appends rather than designs.
+Contracts, the C ABI, top-level CMake, and gate files are append-only and maintainer-owned. Exact
+content is specified so the maintainer appends rather than designs.
 
 1. **`contracts/mfg_robot.md`** — new contract, marked *frozen seam, append-only*, carrying §4's
    five schemas verbatim, §6's capability/Tier-0/gate/invalidation tables, and the non-goals list

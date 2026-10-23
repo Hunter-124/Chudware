@@ -94,7 +94,7 @@ uint64_t free_envelope(const HostMem& m) {
 // counts the PAGE CACHE and every other file-backed page charged to the cgroup,
 // which is reclaimable under pressure and is not what a solve competes for. That
 // distinction is not academic — a 10 GB `systemd-run --scope -p MemoryMax=10G`
-// holding the ME-490 mission driver, its python worker and chudware-hostd had
+// holding a long-running mission driver, its python worker and chudware-hostd had
 // streamed STEP/VTU through the page cache until memory.current sat within a few
 // hundred MB of the limit, and `limit - (memory.current - own_rss)` collapsed the
 // whole budget to 0.4 GB. run_fea_static then refused a study the scope had 8+ GB

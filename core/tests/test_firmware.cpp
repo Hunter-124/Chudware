@@ -1,4 +1,4 @@
-// T-RF15 (node R4a) — firmware engine surface unit tests, driving
+// Firmware engine surface unit tests, driving
 // chudware::firmware::call directly (no routing layer). Mirrors the Python
 // suites engine_oracle/firmware/test_project.py / test_pinmap.py /
 // test_coverify.py / test_mcp_tools.py over the same fixture shapes.
@@ -160,7 +160,7 @@ TEST_CASE("dispatch: unknown methods fall through") {
     json result;
     std::string err;
     CHECK_FALSE(chudware::firmware::call("bogus_method", json::object(), result, err));
-    // The whole fw_* surface is ported (T-RF15 resume) — every fw_ method handles.
+    // The whole fw_* surface is ported — every fw_ method handles.
     for (const char* m : {"fw_sim_run", "fw_power_profile", "fw_sensor_scenario"}) {
         CHECK(chudware::firmware::call(m, json::object(), result, err));
     }
@@ -460,7 +460,7 @@ TEST_CASE("fw_status: doctor payload shape (tools may or may not be installed)")
         CHECK(r["families"][f].contains("can_flash"));
         CHECK(r["families"][f].contains("missing"));
     }
-    // T-FIN2 decisions baked into the matrix: esp32 can never emulate; avr
+    // Design decisions baked into the matrix: esp32 can never emulate; avr
     // cannot flash (no wired path).
     CHECK(r["families"]["esp32"].value("can_emulate", true) == false);
     CHECK(r["families"]["avr"].value("can_flash", true) == false);
@@ -495,7 +495,7 @@ TEST_CASE("fw_projects: lists sidecars newest-first, skips corrupt ones") {
     (void)b;
 }
 
-// ── T-RF15 resume: the emulator leg (fw_sim_run / fw_power_profile /
+// ── the emulator leg (fw_sim_run / fw_power_profile /
 // fw_sensor_scenario) ──────────────────────────────────────────────────────
 
 TEST_CASE("emulator parsers: gpio/uart events + ODR snapshot (pure)") {
@@ -1037,7 +1037,7 @@ TEST_CASE("fw_sim_run: envelopes + no-elf + esp32 refusal + invalid scenario") {
                             {"scenario", json{{"schema", "wrong"}}}});
     CHECK(r.value("code", "") == "invalid_scenario");
 
-    // ESP32 target: emulation == "none" → platform_capability refusal (T-FIN2).
+    // ESP32 target: emulation == "none" → platform_capability refusal.
     json esp = call("fw_new_project", {{"mcu_family", "esp32"}});
     std::string epid = esp["project_id"];
     fs::path ebuild = guard.dir / epid / "build";

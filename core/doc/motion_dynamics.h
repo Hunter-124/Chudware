@@ -1,4 +1,4 @@
-// Rigid-body INVERSE dynamics on a prescribed motion trajectory (T-FIN20).
+// Rigid-body INVERSE dynamics on a prescribed motion trajectory.
 //
 // doc_simulate_motion sweeps one driven mate and records every body's world pose
 // per frame — pure kinematics. This module takes that trajectory (poses over time)

@@ -1,4 +1,4 @@
-"""Tests for T-P2 parts-hub adapters and live-vendor federation.
+"""Tests for the domain parts-hub adapters and live-vendor federation.
 
 All tests are CI-safe: no network, no core binary, no vendor credentials required.
 Live vendor tests mock the ProviderChain at the HTTP seam.
@@ -256,7 +256,7 @@ class TestEcadKicadAdapter:
         assert len(fps) > 0, "Expected starter footprint records"
 
     def test_m3_mounting_hole_in_starter(self):
-        """M3 mounting hole footprint must be in the starter library (T-P2 cross-domain DoD)."""
+        """M3 mounting hole footprint must be in the starter library (cross-domain)."""
         from services.parts.adapters.ecad_kicad_adapter import EcadKicadAdapter
         adapter = EcadKicadAdapter()
         records = list(adapter.iter_records())
@@ -368,7 +368,7 @@ class TestFederation:
         # FAMILIES (domain mech_family) that legitimately share the +1000 boost, so
         # the env-robust invariant is: first result is an exact M3 designation from a
         # threaded-hardware domain — never the ecad footprint. (Provider-overlap
-        # dedup/ranking polish is recorded in T-P3's driver notes.)
+        # dedup/ranking polish is a separate concern.)
         first = results[0]
         assert first["domain"] in {"fastener", "mech_family"}, (
             f"Exact M3 hardware must rank first; got domain: {first['domain']!r}"
@@ -390,14 +390,14 @@ class TestFederation:
         )
 
     def test_p1_44_tests_still_pass_via_hub_search(self):
-        """Regression: hub.search still returns fastener/bearing results (T-P1 baseline)."""
+        """Regression: hub.search still returns fastener/bearing results (core baseline)."""
         hub = _make_hub()
         # fastener
         r = hub.search("M8 socket head")
-        assert any(rec["domain"] == "fastener" for rec in r), "T-P1 fastener baseline broken"
+        assert any(rec["domain"] == "fastener" for rec in r), "core fastener baseline broken"
         # bearing
         r2 = hub.search("6205 bearing")
-        assert any(rec["domain"] == "bearing" for rec in r2), "T-P1 bearing baseline broken"
+        assert any(rec["domain"] == "bearing" for rec in r2), "core bearing baseline broken"
 
 
 # ---------------------------------------------------------------------------

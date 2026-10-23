@@ -4,7 +4,7 @@
 //
 // Centralized DPI-scaled dimensions; gui_lint.py's scale rule recognizes px()/U().
 // Accessors return logical sizes multiplied by ui::uiScale. Layout conventions:
-// .claude/skills/gui-theme-layout/SKILL.md.
+// docs/dev/gui-theme-layout.md.
 //
 // Usage:
 //   ImGui::SetNextItemWidth(ui::metrics::pmLabelCol());
@@ -67,7 +67,7 @@ inline int   copilotInputMaxLines(){ return 6; }          // prompt box grows to
 inline float copilotThumbW()      { return px(220.0f); }  // iteration contact-sheet thumbnail width
 inline float copilotProseMaxH()   { return px(150.0f); }  // thoughts / prose scroll cap
 inline float copilotProseStreamCapH() { return px(420.0f); }  // generous grow cap for a LIVE
-// streaming thinking/thought box (T-RF6b "let it fill out"): while text is arriving it grows to
+// streaming thinking/thought box: while text is arriving it grows to
 // fit instead of scrolling inside copilotProseMaxH(), up to this height, THEN falls back to the
 // normal fixed-height scroll. Finished/historical drawers keep using copilotProseMaxH().
 inline float copilotDiffMaxH()    { return px(220.0f); }  // diff / code view scroll cap

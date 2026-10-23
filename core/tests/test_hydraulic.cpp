@@ -4,8 +4,7 @@
 // motor / pump-drive sizing, BOM, and the dispatch envelopes (incl. the
 // hydraulic→piping and hydraulic→FEA handoff + verify flows end-to-end).
 // Mirrors the Python oracle suite engine_oracle/hydraulic/test_hydraulic.py
-// plus the services/mcp/test_hydraulic_handoff.py flow; byte-identical
-// envelope parity is proven separately by the /tmp harness driving rpc_cli.
+// plus the services/mcp/test_hydraulic_handoff.py flow.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 

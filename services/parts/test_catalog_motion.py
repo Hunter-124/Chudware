@@ -7,7 +7,7 @@ Covers:
     the BoltsAdapter/HeatsinksAdapter tests check).
   - part_ids are unique within each adapter (and across all three).
   - A PartsHub bootstrap (adapters are wired into PartsHub.bootstrap() alongside
-    the other T-P1/T-P2 adapters) followed by search("nema 17") returns a
+    the other built-in adapters) followed by search("nema 17") returns a
     stepper motor as the TOP hit — not a bearing (the proven accuracy bug:
     the bare token "17" spuriously matches bearing designations like 6203).
 
@@ -158,7 +158,7 @@ def test_shaft_couplings_covers_couplers_and_collars():
 
 # ---------------------------------------------------------------------------
 # End-to-end: PartsHub.bootstrap() (which now registers these adapters
-# alongside the other T-P1/T-P2 adapters) — search("nema 17") ranks a
+# alongside the other built-in adapters) — search("nema 17") ranks a
 # stepper motor first, not a bearing (the proven "17" token accuracy bug).
 # ---------------------------------------------------------------------------
 

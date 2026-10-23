@@ -33,7 +33,7 @@ from services.agent.interaction import cache_root
 SCHEMA = "aicad.ledger/1"
 _CHARS_PER_TOKEN = 4  # repo-wide heuristic
 
-# T-DP1: design-pipeline event kind → state section (contract design_pipeline.md §4).
+# Design-pipeline event kind → state section (contract design_pipeline.md §4).
 # One place both _apply and the section allow-lists read, so the four kinds stay in
 # lockstep across the ledger, mission_dispatch, and the phase gates.
 _DP_KIND_SECTION: dict[str, str] = {
@@ -134,18 +134,18 @@ def _empty_state(run_id: str) -> dict:
         "questions": [],
         "stage_log": [],
         "artifacts": [],
-        # T-W30: per-acceptance-criterion verification results written by the
+        # Per-acceptance-criterion verification results written by the
         # reviewer role (reviewer_exec.run_acceptance_checks). The VERIFY phase
         # gate READS these — it never fabricates PASS. Each entry:
         #   {id, result: PASS|FAIL|NOT-CHECKED, check_tool, pass_rule,
         #    detail, evidence}
         "criterion_results": [],
-        # T-DP1: design-pipeline stage artifacts (contract design_pipeline.md §3/§4,
+        # Design-pipeline stage artifacts (contract design_pipeline.md §3/§4,
         # extends aicad.ledger/1). Each is a typed handoff the six-stage refinement
         # writes; the flagged phase gates READ these (never the handoff prose).
-        "features": [],          # Stage 1 feature[] (feature_architect, T-DP2)
-        "geometry_specs": [],    # Stage 2 geometry_spec[] (geometry_designer, T-DP3)
-        "linkages": [],          # Stage 3 linkage[] (linkage_planner, T-DP4)
+        "features": [],          # Stage 1 feature[] (feature_architect)
+        "geometry_specs": [],    # Stage 2 geometry_spec[] (geometry_designer)
+        "linkages": [],          # Stage 3 linkage[] (linkage_planner)
         "build_nodes": [],       # Stage 4 build_node[] (build_strategist)
         "mfg_plans": [],         # Typed manufacturing-plan scratchpad
     }
@@ -241,7 +241,7 @@ def _apply(state: dict, event: dict) -> dict:
             state["stage_log"].append(entry)
 
     elif kind == "criterion_result":
-        # T-W30: reviewer's per-criterion verdict. Keyed by ac id; last write wins
+        # Reviewer's per-criterion verdict. Keyed by ac id; last write wins
         # (a re-review after a CORRECT loop overwrites the earlier verdict).
         ac_id = payload.get("id")
         existing = next((c for c in state["criterion_results"]
@@ -542,7 +542,7 @@ class Ledger:
                              *, check_tool: str = "", pass_rule: str = "",
                              detail: str = "",
                              evidence: dict | None = None) -> dict:
-        """Record one acceptance-criterion verdict (T-W30).
+        """Record one acceptance-criterion verdict.
 
         ``result`` is one of ``PASS`` / ``FAIL`` / ``NOT-CHECKED`` (the reviewer
         role's only allowed verdicts). ``evidence`` is the raw check-tool output
@@ -564,7 +564,7 @@ class Ledger:
         validate_ledger_payload("mfg_plan", body)
         return self.append(actor, "mfg_plan", body)
     # ------------------------------------------------------------------
-    # T-DP1: design-pipeline stage-artifact writers
+    # Design-pipeline stage-artifact writers
     # (contract design_pipeline.md §3/§4 — extends aicad.ledger/1)
     # ------------------------------------------------------------------
 
@@ -572,11 +572,12 @@ class Ledger:
                     driving_requirement: str,
                     interfaces_with: list[str] | None = None,
                     criticality: str = "important") -> dict:
-        """Append a Stage-1 ``feature`` event (feature_architect, T-DP2).
+        """Append a Stage-1 ``feature`` event (feature_architect).
 
         Mirrors §22 rung-A features[]. The coverage rule (every feature traces to a
-        requirement/assumption; every requirement maps to ≥1 feature) is a T-DP2
-        checker, not this writer — the writer only records the typed handoff."""
+        requirement/assumption; every requirement maps to ≥1 feature) is enforced by
+        pipeline/functional_decomposition.py, not this writer — the writer only
+        records the typed handoff."""
         return self.append(actor, "feature", {
             "id": feature_id,
             "function": function,
@@ -592,7 +593,7 @@ class Ledger:
                           nominal_dims: list[dict] | None = None,
                           tolerances: list[dict] | None = None,
                           datum_refs: list[str] | None = None) -> dict:
-        """Append a Stage-2 ``geometry_spec`` event (geometry_designer, T-DP3).
+        """Append a Stage-2 ``geometry_spec`` event (geometry_designer).
 
         ``provenance`` is REQUIRED (contract §3.2 / §4) — the geometry-side twin of
         the dimension provenance rule: never recall a number. A spec written without
@@ -616,10 +617,11 @@ class Ledger:
                     datum_tree: list[dict] | None = None,
                     reference_edges: list[dict] | None = None,
                     shared_interfaces: list[dict] | None = None) -> dict:
-        """Append a Stage-3 ``linkage`` event (linkage_planner, T-DP4).
+        """Append a Stage-3 ``linkage`` event (linkage_planner).
 
         Mirrors §22 rung-C. Reference integrity (no dangling refs / no cycles) and
-        interface consistency are T-DP4 checkers, not this writer."""
+        interface consistency are checked in pipeline/linkage_integrity.py, not
+        this writer."""
         return self.append(actor, "linkage", {
             "id": linkage_id,
             "datum_tree": datum_tree or [],
@@ -648,8 +650,8 @@ class Ledger:
         })
 
     # ------------------------------------------------------------------
-    # T-DP1: scoped-slice accessors (contract design_pipeline.md §9)
-    # Read-only views the mission-dispatch layer (T-W30/W32) hands to
+    # Scoped-slice accessors (contract design_pipeline.md §9)
+    # Read-only views the mission-dispatch layer hands to
     # fresh-context stages — a stage sees only the prior rung's artifacts.
     # ------------------------------------------------------------------
 

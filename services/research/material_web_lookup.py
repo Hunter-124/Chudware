@@ -1,7 +1,7 @@
 """``material_web_lookup(material, property?, source?)`` — OPT-IN, rate-limited, cited
 point-lookups of material properties from external materials-info websites.
 
-Posture (be factual): this tool was added at the owner's explicit direction on
+Posture (be factual): this tool was added as a deliberate project decision on
 2026-07-08. It is:
 
 * **OPT-IN** — env-gated behind ``CHUDWARE_ENABLE_MATERIAL_WEB`` and **DISABLED by
@@ -17,7 +17,7 @@ degradation and does not retry-hammer. Known bot-walled sources (MatWeb) are ref
 without any fetch.
 
 MatWeb, MakeItFrom, and Matmatch are named in ``contracts/research_tools.md`` as
-prohibiting programmatic access; this path therefore exists only under the owner's
+prohibiting programmatic access; this path therefore exists only under the project's
 accepted-risk override recorded in ``contracts/license_debt.md``. The compliant default
 remains the first-party bundled registry served by ``material_lookup``.
 
@@ -74,7 +74,7 @@ WEB_SOURCES: dict = {
         "material_url": _makeitfrom_material,
         "license_note": (
             "MakeItFrom prohibits programmatic access per contracts/research_tools.md; "
-            "used only under the owner's accepted-risk override (contracts/license_debt.md)."
+            "used only under the project's accepted-risk override (contracts/license_debt.md)."
         ),
     },
     "matweb": {

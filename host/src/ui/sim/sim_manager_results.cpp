@@ -456,7 +456,7 @@ void SimManager::drawResultControls(AppState &st, Study &s) {
     drawTopologyResults(st, s);
     return;
   }
-  // T-FIN24 kinds render numeric/plot results (no viewport overlay).
+  // Multiphysics kinds render numeric/plot results (no viewport overlay).
   if (s.type == StudyType::Buckling || s.type == StudyType::Contact ||
       s.type == StudyType::FreqResponse || s.type == StudyType::ThermalFea) {
     drawAdvancedResults(st, s);

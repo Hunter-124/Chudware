@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""T-G15 screenshot-based ribbon icon pipeline.
+"""Screenshot-based ribbon icon pipeline.
 
 Regenerable, one-command pipeline that turns a data-driven recipe table into ribbon
-icon tiles that are *actual clean-viewport screenshots of demo parts* (per Erik's
-T-G12 round-1 ask), then injects them into the icon atlases the C++ loader consumes.
+icon tiles that are *actual clean-viewport screenshots of demo parts*, then injects them
+into the icon atlases the C++ loader consumes.
 
 Flow (see docs in each function):
   1. RECIPES  -> a JSON recipe list (name, camera, build steps).
@@ -20,12 +20,12 @@ Flow (see docs in each function):
 The recipes double as a smoke test: a build step that fails prints ok=0 and yields an
 empty tile, which the contact sheet makes obvious.
 
-Shared visual contract (work/tasks/T-G15.md): icons carry NO baked background plate --
+Shared visual contract: icons carry NO baked background plate --
 they render on transparency so the one asset works on the ribbon glass in both light and
 dark mode. Modified-face emphasis (selection-highlight colour) is a follow-up layer (needs
-a highlight overlay in the thumbnail FBO keyed by selection topo-ids) -- see the handoff.
+a highlight overlay in the thumbnail FBO keyed by selection topo-ids).
 
-T-BL34 (v2): three layers on top of the T-G15 flow --
+v2 adds three layers on top of the screenshot flow --
   * operation-COLOR emphasis: recipes color the op-created body with the app accent
     teal (ui_theme accent #2DD4BF) via set_appearance, so the tile reads "this is what
     the op made" (per-face emphasis is still a renderer follow-up; per-body v1).
@@ -33,7 +33,7 @@ T-BL34 (v2): three layers on top of the T-G15 flow --
     boolean badge) composited onto the tile in Python post-render (ANNOTATIONS table).
   * Manufacture toolpath tiles: scripts/cam_toolpath_icons.py drives the REAL CAM chain
     (cam_new -> add_tool/setup/operation -> cam_generate -> cam_simulate) and renders the
-    generated cutter moves over the stock (Hunter directive 2026-07-04: showcase the
+    generated cutter moves over the stock (design decision 2026-07-04: showcase the
     generated toolpaths). Those cells (cam_*) are appended to the atlas byte-preservingly
     by ensure_cells(); ribbon_def.cpp points the Manufacture op buttons at them.
 
@@ -677,7 +677,7 @@ RECIPES: dict[str, dict] = {
             "type": "mirror", "name": "Mir1",
             "params": {},
             "refs": {"plane": datum("plane.front"), "features": ["f4"]}}},
-        # NOTE(T-BL34): merge=False + accent broke the mirror copy (only the seed
+        # NOTE: merge=False + accent broke the mirror copy (only the seed
         # rendered); reverted to the proven merged recipe -- the dash annotation
         # carries the intent. Per-body emphasis here needs the per-face follow-up.
     ]},
@@ -824,7 +824,7 @@ RECIPES: dict[str, dict] = {
     ]},
 
     # -----------------------------------------------------------------------
-    # Features -> Hole / Thread / Split  (T-BL: procedural glyphs -> real renders)
+    # Features -> Hole / Thread / Split  (real renders replacing procedural glyphs)
     # -----------------------------------------------------------------------
 
     # hole_wizard: a block with a COUNTERBORED hole bored down through its top face.
@@ -1093,8 +1093,8 @@ RECIPES: dict[str, dict] = {
 
     # -----------------------------------------------------------------------
     # Appearance -> Material (first tranche already live -- do NOT redo)
-    # appr_glass / appr_paint: atlas cells exist but NOT wired to any ribbon button.
-    # See work/questions/T-BL29.md Q4 — skipped.
+    # appr_glass / appr_paint: atlas cells exist but NOT wired to any ribbon button,
+    # so they are skipped.
     # -----------------------------------------------------------------------
 
     # Material presets: one SPHERE per material in its OWN preset color, so each of the
@@ -1115,7 +1115,7 @@ RECIPES: dict[str, dict] = {
 
     # -----------------------------------------------------------------------
     # Appearance -> Display: display_* are line-art SDF glyphs, NOT photographic.
-    # SDF invisible-icon bug (kFar int32 overflow) fixed in T-G15 (kFar=1<<12).
+    # SDF invisible-icon bug (kFar int32 overflow) fixed (kFar=1<<12).
     # In-context verification via CHUDWARE_RIBBON_TAB=Appearance is the right check.
     # Not added here -- photographic renders would override correct line-art glyphs.
     # -----------------------------------------------------------------------
@@ -1123,7 +1123,7 @@ RECIPES: dict[str, dict] = {
 
 
 # ---------------------------------------------------------------------------------------
-# T-BL34: operation-intent annotation overlays. Minimal, one cue per tile, composited in
+# Operation-intent annotation overlays. Minimal, one cue per tile, composited in
 # Python post-render (never in the C++ renderer). Coordinates are normalized (0..1) tile
 # space. Drawn at 4x then downscaled so they stay crisp at 32/20 px.
 #   arrow  [x0,y0,x1,y1]      straight arrow head at (x1,y1)         (direction of the op)
@@ -1290,7 +1290,7 @@ def _annotation_layer(spec: dict, px: int) -> Image.Image:
 def load_tile(name: str) -> Image.Image | None:
     """Load a rendered tile and composite its operation-intent annotation (if any).
     Single source used by both atlas injection and the contact sheets, so what
-    Hunter reviews is exactly what ships."""
+    gets reviewed is exactly what ships."""
     src = RENDER_DIR / f"{name}.png"
     if not src.exists():
         return None
@@ -1303,7 +1303,7 @@ def load_tile(name: str) -> Image.Image | None:
 
 
 # ---------------------------------------------------------------------------------------
-# T-BL34: byte-preserving atlas extension for NEW cells (the cam_* Manufacture tiles).
+# Byte-preserving atlas extension for NEW cells (the cam_* Manufacture tiles).
 # Existing rows/UVs are untouched; new 34px rows are appended at the bottom following the
 # exact make_icons.py layout (@32 at x=0,y+1; @20 at x=34,y+7). make_icons.py also knows
 # these names (CONTRACT_NAMES + drawers), so a full atlas regen produces the same layout;
@@ -1415,7 +1415,7 @@ def write_recipes(path: Path, only: set[str] | None = None) -> None:
 def run_app(recipes_json: Path, theme: str = "dark", timeout_s: int = 300) -> int:
     """Run the host GUI headless (CHUDWARE_SHOT=iconpipe) to render every recipe to RENDER_DIR.
 
-    Targets host/build-linux/bin/Chudware (ui/imgui / AI-CAD2 is retired — see docs/PORT_LEDGER.md).
+    Targets host/build-linux/bin/Chudware (the retired ui/imgui frontend is gone).
     On Linux we wrap in xvfb-run (llvmpipe) for a deterministic, GPU-independent server; on
     Windows the desktop session supplies GL, so the exe runs directly. One invocation drains ALL
     recipes in a single tick.
@@ -1495,7 +1495,7 @@ def inject(names: list[str]) -> list[str]:
     atlases = {fn: Image.open(ICON_DIR / fn).convert("RGBA")
                for fn in ("atlas_dark.png", "atlas_light.png")}
     for name in names:
-        render = load_tile(name)  # annotated tile (T-BL34) or None if not rendered
+        render = load_tile(name)  # annotated tile or None if not rendered
         if render is None:
             print(f"   SKIP {name}: no render at {RENDER_DIR / (name + '.png')}")
             continue
@@ -1545,7 +1545,7 @@ def inject(names: list[str]) -> list[str]:
 
 def contact_sheet(names: list[str]) -> None:
     """Light + dark review sheets of every tile, at review size AND true 32px ribbon
-    size, using load_tile so annotations/coloring are exactly what ships (T-BL34)."""
+    size, using load_tile so annotations/coloring are exactly what ships."""
     from PIL import ImageDraw
     themes = {
         "dark": {"bg": (44, 46, 52, 255), "fg": (230, 230, 230, 255),
@@ -1610,7 +1610,7 @@ def main(argv=None) -> int:
         write_recipes(recipes_json, only=only)
         rc = run_app(recipes_json, theme=args.theme)
         print(f"[icon_pipeline] app exit={rc}")
-        # T-BL34: Manufacture tiles from the REAL CAM chain (also a CAM smoke test)
+        # Manufacture tiles from the REAL CAM chain (also a CAM smoke test)
         # Skipped under --only unless a cam_* tile was actually asked for: the CAM chain
         # is minutes of solving and has nothing to do with a modeling-tile iteration.
         if only is None or any(n.startswith("cam_") for n in only):

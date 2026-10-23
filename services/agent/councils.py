@@ -10,22 +10,22 @@ chat: each seat produces a *typed position* in round 1; round 2 receives those
 typed positions as structured input (not chat history) and either integrates or
 dissents (with a trigger_condition).
 
-T-W14 (delegation) is not yet merged.  Seats run as plain provider calls behind a
-delegation-shaped seam (`_run_seat`).  Swap in the real ponder delegation later
-without changing call sites.  Flagged in FEATURE_FLAGGED_TOOLS (`council_convene`).
+Seats run as plain provider calls behind a delegation-shaped seam
+(`_run_seat`).  A ponder delegation can be swapped in later without changing
+call sites.  Flagged in FEATURE_FLAGGED_TOOLS (`council_convene`).
 
-T-W19 (buildgraph pipeline) is not yet merged.  Phase-3 gate is feature-flagged
-behind ``CHUDWARE_COUNCIL_BUILDGRAPH`` (default on).
+Buildgraph integration: the Phase-3 gate is feature-flagged behind
+``CHUDWARE_COUNCIL_BUILDGRAPH`` (default on).
 
 ## Public API
 
 - ``council_convene(kind, topic, inputs, provider, ledger=None, providers=None)``
   Runs a full 2-round council and returns the council record dict.
-  Signature is the seam T-W22's org.py will call; matching T-W22's stub.
+  Signature is the seam org.py calls.
   ``providers`` is an optional list of Provider instances for diverse-model
-  selection (T-DP8); if omitted the single ``provider`` is used for all seats.
+  selection; if omitted the single ``provider`` is used for all seats.
 
-- ``resolve_policy(stage, tier, *, overrides=None, path=None)``  — T-DP8
+- ``resolve_policy(stage, tier, *, overrides=None, path=None)``
   Resolve the CouncilPolicy for a given (stage, tier).  Returns a CouncilPolicy
   dataclass with enabled/breadth/diverse_models/temperatures.
 
@@ -53,7 +53,7 @@ import yaml
 from services.agent import protected_assets
 
 # ---------------------------------------------------------------------------
-# T-DP8: Council policy engine imports
+# Council policy engine imports
 # ---------------------------------------------------------------------------
 
 from dataclasses import dataclass as _dataclass
@@ -70,7 +70,7 @@ COUNCIL_SCHEMA = "aicad.council/1"
 ADVISORY_SCHEMA = "aicad.advisory/1"
 
 # Phase-3 buildgraph seam feature-flag (default on; off = disable must_have
-# injection into buildgraph, e.g. while T-W19 is integrating).
+# injection into buildgraph).
 _BUILDGRAPH_SEAM_ENABLED = os.environ.get("CHUDWARE_COUNCIL_BUILDGRAPH", "1") != "0"
 
 _DEFAULT_PONDER_ROUND1_TOKENS = 1500
@@ -87,7 +87,7 @@ _SEATS_YAML = (
 _SEATS_CACHE: Optional[dict] = None
 
 # ---------------------------------------------------------------------------
-# T-DP8: Council policy engine (aicad.council_policy/1)
+# Council policy engine (aicad.council_policy/1)
 # ---------------------------------------------------------------------------
 
 _POLICY_YAML = (
@@ -288,7 +288,7 @@ def get_seat_personas() -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Typed-position JSON schema + GBNF emitter (T-W7 contract)
+# Typed-position JSON schema + GBNF emitter
 # ---------------------------------------------------------------------------
 
 #: The typed position schema each seat must output.
@@ -307,8 +307,8 @@ TYPED_POSITION_SCHEMA: dict[str, Any] = {
 def _schema_to_gbnf(schema: dict) -> str:
     """Minimal JSON-schema → GBNF emitter for typed positions.
 
-    Delegates to roles.py's emitter when that module is importable (T-W7 merged
-    and real); falls back to a hand-written grammar for the typed-position schema.
+    Delegates to roles.py's emitter when that module is importable; falls
+    back to a hand-written grammar for the typed-position schema.
 
     Only the typed-position schema is needed here — the fallback covers exactly
     that shape.
@@ -387,7 +387,7 @@ def _new_council_record(kind: str, topic: str, inputs: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Seat runner — delegation-shaped seam (T-W14 not merged)
+# Seat runner — delegation-shaped seam
 # ---------------------------------------------------------------------------
 class _SeatReplyError(ValueError):
     def __init__(self, message: str, raw_reply: str) -> None:
@@ -437,12 +437,12 @@ def _run_seat(
 
     Returns (typed_position_dict, dissent_or_None).
 
-    T-W14 SEAM: seats run as plain provider.complete() calls here.
-    When T-W14 lands, replace with a ponder delegation of kind="ponder"
-    (auto-approved, read-only, budget-bounded per §12 amendment).
+    Seats run as plain provider.complete() calls here.  A ponder delegation
+    of kind="ponder" (auto-approved, read-only, budget-bounded per §12
+    amendment) can replace this body.
     The signature of this function is the seam — callers don't change.
 
-    T-DP8: ``temperature`` is passed through to provider.complete() via
+    ``temperature`` is passed through to provider.complete() via
     kwargs when provided.  Providers that don't accept temperature silently
     ignore the kwarg (base.Provider.complete has no temperature param;
     concrete providers that support it accept **kwargs).
@@ -484,7 +484,7 @@ def _run_seat(
 
     user_message = "\n".join(parts)
 
-    # T-DP8: pass temperature as kwarg when set; providers that don't accept
+    # Pass temperature as kwarg when set; providers that don't accept
     # temperature (e.g. the base mock) gracefully fall back to the no-temp call.
     if temperature is not None:
         try:
@@ -918,7 +918,7 @@ def _pick_provider(providers: list[Any], seat_index: int) -> Any:
     With 1 provider: always returns that provider (temperature-diversity fallback
     handles diversity via the ``temperature`` kwarg).
     With N providers: cycles by seat index so consecutive seats use different
-    model sources (diverse-model selection, T-DP8).
+    model sources (diverse-model selection).
     """
     if not providers:
         raise ValueError("_pick_provider: empty providers list")
@@ -961,8 +961,8 @@ def council_convene(
 ) -> dict:
     """Convene a council and return the completed aicad.council/1 record.
 
-    This is the T-W22 seam: org.py will call council_convene(kind, topic, inputs).
-    The signature is stable; all new T-DP8 params are keyword-only with defaults.
+    This is the seam org.py calls: council_convene(kind, topic, inputs).
+    The signature is stable; policy params are keyword-only with defaults.
 
     Args:
         kind:     Council kind (e.g. "build_strategy").
@@ -975,7 +975,7 @@ def council_convene(
         actor:    Ledger actor string.
         registry: Optional DissentsRegistry to register dissents into.
 
-        T-DP8 keyword-only params:
+        Keyword-only policy params:
         providers:       Optional list of Provider instances.  When given with
                          >1 element, seats are assigned round-robin (diverse-model
                          selection).  When given with 1 element or omitted, a
@@ -1010,7 +1010,7 @@ def council_convene(
     round1_tokens = _DEFAULT_PONDER_ROUND1_TOKENS
     round2_tokens = _DEFAULT_PONDER_ROUND2_TOKENS
 
-    # T-DP8: resolve policy when stage+tier provided; apply breadth + diversity.
+    # Resolve policy when stage+tier provided; apply breadth + diversity.
     policy: Optional[CouncilPolicy] = None
     if stage is not None and tier is not None:
         policy = resolve_policy(

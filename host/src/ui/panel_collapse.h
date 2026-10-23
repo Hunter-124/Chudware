@@ -1,5 +1,5 @@
-// Shared vertical-collapse animation for the pinned FeatureManager and Copilot glass columns
-// (T-G21). Both columns used to shrink to a small square pill in both axes; they now roll UP
+// Shared vertical-collapse animation for the pinned FeatureManager and Copilot glass columns.
+// Both columns used to shrink to a small square pill in both axes; they now roll UP
 // toward their header strip instead — the header (tabs/title row + the collapse control) stays
 // pinned at the column's fixed position while only the window HEIGHT animates down to the
 // header's height, leaving the viewport visible underneath. One helper so both columns share

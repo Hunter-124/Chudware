@@ -1,6 +1,6 @@
-"""test_org.py — T-W22 org runtime tests (aicad.org/1).
+"""test_org.py — Org runtime tests (aicad.org/1).
 
-DoD proofs required (per task file + advisor):
+Coverage (per contract §18):
   1. Clustering on a 4-deliverable manifest → correct department cluster fixture.
   2. interface_change gating: send → sender's exit blocked → ack → unblocked.
   3. Silent-expiry impossible: closing a request without a resolution is unrepresentable
@@ -9,7 +9,7 @@ DoD proofs required (per task file + advisor):
   5. Report cadence: dept report emitted every N node completions.
 
 All tests run headless: no FastMCP, no libchudware, no LLM.  Ledger injection uses
-the real Ledger (T-W1, MERGED) against a tmp_path.
+the real Ledger against a tmp_path.
 """
 from __future__ import annotations
 
@@ -830,7 +830,7 @@ class TestOverseerConcernFeedIntegration:
 
 class TestDepartmentManagerCard:
     """Proof: roles.load_role('department_manager') loads verbatim and
-    the card's role id can be attached to a fixture department (DoD §3).
+    the card's role id can be attached to a fixture department.
     """
 
     def test_department_manager_card_loads(self):

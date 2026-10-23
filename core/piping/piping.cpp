@@ -1,6 +1,6 @@
 // core/piping/piping.cpp — the piping dispatch: port of the piping_tools.py
 // tool bodies (minus MCP session bookkeeping and the kernel/CFD orchestration
-// legs of piping_cfd_handoff, which stay MCP-side in T-RF20).
+// legs of piping_cfd_handoff, which stay MCP-side).
 #include "piping/piping.h"
 
 #include "piping/bom.h"

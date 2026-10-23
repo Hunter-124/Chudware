@@ -264,7 +264,7 @@ class TestProvenanceWarning(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# §5  mark_faulty — 3-level fixture (the key DoD test)
+# §5  mark_faulty — 3-level fixture (the key test)
 # ---------------------------------------------------------------------------
 
 class TestMarkFaulty3Level(unittest.TestCase):
@@ -377,19 +377,19 @@ class TestMarkFaulty3Level(unittest.TestCase):
         self.assertIn("DIM9", report["affected_dims"])
 
     def test_change_plan_flag_wraps_report(self):
-        """When T-W13 flag set, report is wrapped in change-plan envelope."""
-        orig = os.environ.get("CHUDWARE_CHANGE_PLAN_T_W13")
+        """When the change-plan flag is set, report is wrapped in change-plan envelope."""
+        orig = os.environ.get("CHUDWARE_CHANGE_PLAN")
         try:
-            os.environ["CHUDWARE_CHANGE_PLAN_T_W13"] = "1"
+            os.environ["CHUDWARE_CHANGE_PLAN"] = "1"
             wrapped = mark_faulty("DIM7", "why", self.ledger)
             self.assertEqual(wrapped["schema"], "aicad.change_plan/1")
             self.assertIn("impact", wrapped)
             self.assertEqual(wrapped["impact"]["schema"], "aicad.impact/1")
         finally:
             if orig is None:
-                os.environ.pop("CHUDWARE_CHANGE_PLAN_T_W13", None)
+                os.environ.pop("CHUDWARE_CHANGE_PLAN", None)
             else:
-                os.environ["CHUDWARE_CHANGE_PLAN_T_W13"] = orig
+                os.environ["CHUDWARE_CHANGE_PLAN"] = orig
 
 
 # ---------------------------------------------------------------------------

@@ -537,7 +537,7 @@ stronger property than a guard that denies them.
 
 ### 4.6 New gate script — `scripts/mfg_monitor_readonly_gate.sh`
 
-New file, not an edit to an integrator-owned gate. Integrator-owned append: one invocation line in
+New file, not an edit to an maintainer-owned gate. Maintainer-owned append: one invocation line in
 `scripts/gate.sh`. The script:
 1. runs `test_readonly_surface.py`;
 2. if `chudware-mfg-opcua-collector` is built, runs `nm -uC` over it and fails on any
@@ -639,7 +639,7 @@ be a machine's data source.
 
 ---
 
-## 6. RPC and event contract additions (append-only, integrator-applied)
+## 6. RPC and event contract additions (append-only, maintainer-applied)
 
 ### 6.1 `contracts/worker_rpc.md` §8 "Manufacturing monitor (read-only)" (allocated, `MFG-SECT-1`)
 

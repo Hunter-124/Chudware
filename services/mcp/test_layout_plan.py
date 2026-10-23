@@ -1,4 +1,4 @@
-"""test_layout_plan.py — end-to-end demo test for T-BL50.
+"""test_layout_plan.py — end-to-end demo test for plan-first layout capture.
 
 Scenario: plan a 2-part assembly (envelope + 1 interface + 2 critical dims)
   → model it (mocked) → layout_coverage reports the unverified dims

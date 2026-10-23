@@ -30,7 +30,7 @@ namespace chudware::sim {
 // difference is not small. A candidate is formed between two boundary NODES, so the
 // gap it records is n̂·(p_b − p_a) = r_bore·cos(dtheta) − r_pin, where dtheta is
 // however far apart the two meshes happened to sample the arc — up to a whole
-// element of lateral offset, since that is the pairing tolerance. On the ME 490
+// element of lateral offset, since that is the pairing tolerance. On a rover
 // hinge (pin r = 6.000 in a saddle r = 6.300, a 0.300 mm clearance) the closest
 // approach over 1899 candidate pairs read 0.03665 mm: linear facet sampling ate
 // 87.8 % of the real clearance. The h/gap guard below then demanded an interface
@@ -133,7 +133,7 @@ struct ContactCandidateSet {
     // sampling of this interface consumed. 0 without a probe. It is a measurement,
     // not a defect count — a coarse curved fit legitimately has a large one — but
     // it is the number that says whether the mesh describes the fit at all (the
-    // ME 490 hinge: 0.2633 mm of a 0.300 mm clearance).
+    // rover hinge: 0.2633 mm of a 0.300 mm clearance).
     double facet_error_mm = 0.0;
     // Pairs whose gap came from the probe, and the distinct NODES of the pairs that
     // had to fall back to the facet value because neither end could be attributed

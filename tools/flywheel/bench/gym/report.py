@@ -154,7 +154,7 @@ def lead_findings(taxonomy_counts: dict[str, int]) -> list[dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# Discipline Index (WI-2) + instrumentation (WI-11)
+# Discipline Index + instrumentation
 # ---------------------------------------------------------------------------
 
 _CHECKPOINT_TOOLS = frozenset({
@@ -238,7 +238,7 @@ def compute_discipline_index(ledger: dict, *,
                              mission: dict | None = None,
                              graded: dict | None = None,
                              classifications: list | None = None) -> dict[str, Any]:
-    """Compute Discipline Index H1–H6 for one cell (WI-2).
+    """Compute Discipline Index H1–H6 for one cell.
 
     N/A components are skipped (no assembly → drop H3; no destructive ops → drop H4).
     Returns ``{score, components, n_applicable}`` where score is mean of applicable.
@@ -583,7 +583,7 @@ def _discipline_vs_success(cells: list[dict], di_scores: list[dict]) -> dict[str
 
 
 def compute_instrumentation(cells: list[dict]) -> dict[str, Any]:
-    """Build the cycle-level instrumentation block (WI-11)."""
+    """Build the cycle-level instrumentation block."""
     di_scores = []
     misuse_all: list[dict] = []
     for c in cells:

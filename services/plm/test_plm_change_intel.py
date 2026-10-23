@@ -1,6 +1,6 @@
-"""Tests for PLM change intelligence (T-R3, contract aicad.plm/1 §7/§8).
+"""Tests for PLM change intelligence (contract aicad.plm/1 §7/§8).
 
-Covers the T-R3 DoD:
+Covers:
   * every history entry gets a deterministic plain-language summary; numerals
     provably copied from doc_diff output (numeral-fidelity property)
   * checkpoint/release messages drafted deterministically via plm machinery;
@@ -313,7 +313,7 @@ def test_suggest_checkpoint_time_and_ops_signals():
 
 
 # ---------------------------------------------------------------------------
-# stale-reference detection (capability-checked on T-R4 freeze data)
+# stale-reference detection (capability-checked on release freeze data)
 # ---------------------------------------------------------------------------
 
 def _manifest_with_freeze(pinned_rev="A", current_rev="B", superseded=True):
@@ -386,7 +386,7 @@ def test_managed_scripted_run_cuts_attributed_checkpoint(tmp_path):
         newest = v.history()[0]
         assert newest["kind"] == "checkpoint"
         assert newest["author"]["kind"] == "ai"          # timeline marks it AI
-        assert newest["ai"]["run_id"] == "run_t3"        # T-H1 telemetry join
+        assert newest["ai"]["run_id"] == "run_t3"        # telemetry join
         assert newest["ai"]["artifact_id"] == "bg_9"
         assert newest["ai"]["reversible"] is True
         _assert_no_git_vocab(newest["message"])
@@ -403,7 +403,7 @@ def test_managed_scripted_run_cuts_attributed_checkpoint(tmp_path):
 
 
 def test_managed_multi_part_checkpoint_attributes_each_item(tmp_path):
-    """T-DP14: one boundary preserves each participant's work-unit join."""
+    """One boundary preserves each participant's work-unit join."""
     from services.agent.plm_bridge import PLMBridge
 
     part_a = _part(3.0)

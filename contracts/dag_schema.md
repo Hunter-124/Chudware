@@ -2,9 +2,8 @@
 
 > **Version 1.** Changes to any field, enum value, or checkpoint format require a
 > schema-string bump (`aicad.dag/2`) and a migration note here.
-> This file was frozen by T-A1 (2026-07-02) after B/C/D workstream review (see
-> T-A1 check-in in work/FOREMAN.md). All downstream tasks (T-A2–T-A4, T-F4,
-> T-F12, T-F17) consume this contract as-is.
+> Frozen 2026-07-02 after cross-workstream review; downstream consumers use this
+> contract as-is.
 
 ---
 
@@ -16,15 +15,15 @@ Chudware engine. Each node represents one bounded capability (design, simulate, 
 SQLite-persisted checkpoints, and surfaces run state for mission-control UIs and
 agent-loop integrations.
 
-**Seams reserved for downstream tasks:**
+**Seams reserved for later work:**
 
-| Seam | Reserved for | Description |
-|---|---|---|
-| `autonomy: "approve"` pause/resume | T-A3 | machine.h `interrupt()` / `pause` verdict wired here |
-| `verify` node type | T-A4 | Full verify-node execution logic lives in T-A4 |
-| `dag_replan` | T-F12 | Splice nodes into a running DAG — not built in T-A1/A2/A3 |
+| Seam | Description |
+|---|---|
+| `autonomy: "approve"` pause/resume | machine.h `interrupt()` / `pause` verdict wired here |
+| `verify` node type | Full verify-node execution logic lives with the verifier battery |
+| `dag_replan` | Splice nodes into a running DAG — not part of the initial executor |
 
-Do **not** implement these seams in T-A1 through T-A3 without explicit advisor sign-off.
+Do **not** implement these seams without a contract amendment.
 
 ---
 
@@ -74,7 +73,7 @@ The graph document that `executor.run()` accepts:
 | `inputs` | object | yes | Arbitrary key→value pairs passed to the node handler. Keys are node-type-specific (§3). Supports template refs like `"$n1.output.doc_id"` resolved at runtime. |
 | `tools` | string[] | no | MCP tool allow-list for this node's agent call. `null`/absent = all tools available (max autonomy). Used by tool-governance (Pillar 9). |
 | `end_condition` | string | no | Natural-language or structured hint for when the node considers itself done. The executor passes this to the agent system prompt. `null` = node handler decides. |
-| `verify` | `VerifySpec \| null` | no | If present, the executor runs a verify sub-node after the main node. **Spec reserved for T-A4.** For now: `null` always; a non-null value is accepted but the verify logic is a no-op stub. |
+| `verify` | `VerifySpec \| null` | no | If present, the executor runs a verify sub-node after the main node. **Spec reserved.** For now: `null` always; a non-null value is accepted but the verify logic is a no-op stub. |
 | `on_fail` | `FailAction` | yes | What to do if the node fails or exceeds budget — see §5. |
 | `autonomy` | `AutonomyLevel` | yes | How much human oversight this node needs — see §6. |
 
@@ -104,9 +103,9 @@ Each node handler returns an output object merged into the graph state under key
 | `"ecad"` | Schematic/PCB design via the ECAD agent. |
 | `"firmware"` | Firmware/embedded code generation (reserved; executor stubs). |
 | `"structural"` | FEA static/modal analysis on an existing doc. |
-| `"source"` | BOM sourcing: find and price parts from vendor APIs (WS-B). |
+| `"source"` | BOM sourcing: find and price parts from vendor APIs. |
 | `"simulate"` | CFD/flow simulation on an existing doc. |
-| `"verify"` | Quality check: runs a verifier battery against the current doc state. **Reserved for T-A4** — executor runs stub. |
+| `"verify"` | Quality check: runs a verifier battery against the current doc state. **Reserved** — executor runs stub. |
 | `"gate"` | Human-checkpoint: emit a question, wait for approval or override before proceeding. Requires `autonomy: "approve"` or `"manual"`. |
 | `"report"` | Synthesise results into a plain-language verdict / deliverable. |
 
@@ -143,7 +142,7 @@ Conditional branching (e.g., `on_fail` routing) is expressed by the executor log
 | Value | Description |
 |---|---|
 | `"auto"` | Node runs without user interaction. The executor calls the agent and advances on success. |
-| `"approve"` | Node pauses **before execution** to emit a `dag.node.approval_required` event and wait for the user to confirm. **Seam for T-A3 `interrupt()`** — the actual interrupt mechanism is wired by T-A3; the executor in T-A1 stubs this as an immediate approval pass-through and emits a warning. |
+| `"approve"` | Node pauses **before execution** to emit a `dag.node.approval_required` event and wait for the user to confirm. **Seam for `interrupt()`** — the interrupt mechanism is wired separately; the initial executor stubs this as an immediate approval pass-through and emits a warning. |
 | `"manual"` | Node never runs autonomously: executor emits `dag.node.manual_required`, sets run state `"paused"`, and waits for the user to supply the output directly. |
 
 ---
@@ -186,7 +185,7 @@ Conditional branching (e.g., `on_fail` routing) is expressed by the executor log
 
 **Checkpoint contents** (managed by LangGraph, not authored here): LangGraph persists the full
 `StateGraph` channel values at each node transition. The run's DAG state at any checkpoint can
-be read back for resume and for the mission-control UX feed (T-F17).
+be read back for resume and for the mission-control UX feed.
 
 **Thread model:** Each graph execution uses `thread_id = run_id` as the LangGraph thread
 identifier. Multiple runs over the same graph are separate threads.
@@ -228,14 +227,14 @@ The executor emits events to the optional `emit` callback (same pattern as `serv
 
 ---
 
-## 12. Reserved concepts (do not implement before the noted task)
+## 12. Reserved concepts (do not implement without a contract amendment)
 
-- **`dag_replan`** — splice/insert/remove nodes in a running graph. Reserved for T-F12.
+- **`dag_replan`** — splice/insert/remove nodes in a running graph. Reserved.
   Leave the seam: `executor.run()` must not assume the node list is immutable, but
   implementing the mutation API is out of scope here.
-- **`interrupt()`** — machine.h pause verdict for `autonomy: "approve"` nodes. Reserved for T-A3.
-- **Full verify-node logic** — the `"verify"` node type stub is all T-A1 delivers. T-A4 owns
-  the verifier battery and result schema.
+- **`interrupt()`** — machine.h pause verdict for `autonomy: "approve"` nodes. Reserved.
+- **Full verify-node logic** — the initial executor delivers only the `"verify"` node type
+  stub; the verifier battery owns the result schema.
 
 ---
 
@@ -252,7 +251,7 @@ Python schema validation lives in `services/dag/graph_loader.py` (`validate_grap
 
 ---
 
-## 14. Narration view (additive, T-F8 — merged 2026-07-02)
+## 14. Narration view (additive, merged 2026-07-02)
 
 `describe_project(run=...)` (services/mcp/gsl_tools.py) additionally consumes these
 OPTIONAL run-dict fields; executors SHOULD populate them (narration degrades gracefully
@@ -262,7 +261,7 @@ via `.get()` when absent — this appendix is additive and does not bump the sch
 - `budget` — `{"tokens_used": int, "tokens_cap": int}` (aliases `spent`/`cap` accepted)
 - `open_questions` — `[{"node": id, "question"|"text": str, "blocked_reason"?: str}]`
 
-T-A2's node runner / executor is the natural producer (recorded in its Driver notes).
+The DAG node runner / executor is the natural producer.
 
 ## Current implementation pointers
 

@@ -4,7 +4,7 @@
   "_notes": [
     "IT grades IT5-IT12 computed from i = 0.45*D^(1/3) + 0.001*D, D = geometric mean of range bounds (um), rounded to nearest integer um. source.kind='closed_form'.",
     "Fundamental deviations for lowercase shafts a-h and js: formula-derived (source.kind='closed_form'). Shafts k,m,n,p,r,s: tabulated from ISO 286-1/-2 shaft deviation tables (source.kind='table').",
-    "Hole deviations: H only (EI=0, ES=+IT) in this release; K/M/N/P/R/S require the delta-correction rule (ISO 286-1 clause 5.3) and are deferred (marked 'todo'). T-W3 spot-checks only exercise H holes.",
+    "Hole deviations: H only (EI=0, ES=+IT) in this release; K/M/N/P/R/S require the delta-correction rule (ISO 286-1 clause 5.3) and are deferred (marked 'todo'). The spot-check tests only exercise H holes.",
     "D_mean convention: for range [lo, hi], D = sqrt(lo*hi) except 1-3 where D = sqrt(1*3) = 1.732 mm.",
     "All deviations in micrometres (um). Sign convention: positive = above nominal, negative = below nominal.",
     "Ranges use ISO 286 'over X up to and including Y' convention (e.g. 50mm falls in 30-50 range, not 50-80)."
@@ -285,7 +285,7 @@
   },
 
   "hole_deviations": {
-    "_note": "H hole: EI=0 (fundamental deviation), ES=+IT_grade. This is the hole-basis reference. Other uppercase holes (G, F, E, D, JS, K, N, P, R, S) require the delta-correction rule per ISO 286-1 clause 5.3 and are deferred (marked 'todo'). T-W3 spot-checks use H holes only.",
+    "_note": "H hole: EI=0 (fundamental deviation), ES=+IT_grade. This is the hole-basis reference. Other uppercase holes (G, F, E, D, JS, K, N, P, R, S) require the delta-correction rule per ISO 286-1 clause 5.3 and are deferred (marked 'todo'). The spot-check tests use H holes only.",
     "H": {
       "_note": "H hole: EI=0, ES=+IT_grade. formula-derived.",
       "_source_kind": "closed_form",

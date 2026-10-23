@@ -1,6 +1,7 @@
 """Tests for two-division bench + Discipline Index + inject hook + leaderboard keys.
 
-Covers bench-divisions-spec WI-1/2/11/12/13-registry + GAP-INJECT + GAP-CP-EVENT reader.
+Covers the division registry, Discipline Index, instrumentation, leaderboard keys,
+GAP-INJECT and the GAP-CP-EVENT reader.
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ from tools.flywheel.bench.gym.taxonomy import misuse_fingerprints, misuse_error_
 
 
 # ---------------------------------------------------------------------------
-# Registry + Challenge fields (WI-1 / WI-13)
+# Registry + Challenge fields
 # ---------------------------------------------------------------------------
 
 class TestRegistryAndChallengeFields:
@@ -71,7 +72,7 @@ class TestRegistryAndChallengeFields:
 
 
 # ---------------------------------------------------------------------------
-# Division scheduling / refusal (WI-1)
+# Division scheduling / refusal
 # ---------------------------------------------------------------------------
 
 class TestDivisionScheduling:
@@ -147,7 +148,7 @@ class TestDivisionScheduling:
 
 
 # ---------------------------------------------------------------------------
-# Discipline Index (WI-2) + GAP-CP-EVENT reader
+# Discipline Index + GAP-CP-EVENT reader
 # ---------------------------------------------------------------------------
 
 def _ledger(events: list[dict]) -> dict:
@@ -260,7 +261,7 @@ class TestDisciplineIndex:
 
 
 # ---------------------------------------------------------------------------
-# GAP-INJECT hook (WI-6)
+# GAP-INJECT hook
 # ---------------------------------------------------------------------------
 
 class TestInjectFaults:
@@ -311,7 +312,7 @@ class TestInjectFaults:
 
 
 # ---------------------------------------------------------------------------
-# Misuse fingerprints (WI-11 helper)
+# Misuse fingerprints helper
 # ---------------------------------------------------------------------------
 
 class TestMisuseFingerprints:
@@ -337,7 +338,7 @@ class TestMisuseFingerprints:
 
 
 # ---------------------------------------------------------------------------
-# Instrumentation block (WI-11)
+# Instrumentation block
 # ---------------------------------------------------------------------------
 
 class TestInstrumentation:
@@ -383,7 +384,7 @@ class TestInstrumentation:
 
 
 # ---------------------------------------------------------------------------
-# Leaderboard additive keys (WI-12)
+# Leaderboard additive keys
 # ---------------------------------------------------------------------------
 
 class TestLeaderboardAdditive:

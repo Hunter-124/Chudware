@@ -1,4 +1,4 @@
-"""Tests for T-X3: the import_file placer + browser catalog provider hub wiring.
+"""Tests for the import_file placer + browser catalog provider hub wiring.
 
 No real core, no real Playwright/network: core_bridge.call and the browser
 adapters are monkeypatched/faked directly.
@@ -280,7 +280,7 @@ def test_bootstrap_registers_browser_catalog_providers():
 def test_zero_profile_search_contributes_nothing(tmp_path, monkeypatch):
     """DoD: no saved browser profile anywhere -> catalog providers contribute zero
     results, silently -- part_search behavior for an otherwise-empty query is
-    unaffected by T-X3 (same shape as before this task: an empty live_results list
+    unaffected (an empty live_results list
     from these providers, no ask_user noise).
 
     LIVE-NETWORK (gated 2026-07-07): this test makes a real vendor search, so it

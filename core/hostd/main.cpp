@@ -4,8 +4,7 @@
 // the desktop GUI, each MCP server process, and (Phase 5) supervised agent
 // workers. Whichever client starts first spawns the daemon (detached, via
 // chudware_ipc::spawnDetached); the daemon self-exits after CHUDWARE_HOSTD_LINGER_SECS
-// of no clients + no work. See ~/.claude plan "shared engine host daemon" and
-// docs/HOSTD.md (Phase 7).
+// of no clients + no work. See docs/reference/HOSTD.md (Phase 7).
 //
 //   chudware-hostd                 run (assumes already detached by the spawner)
 //   chudware-hostd --foreground    same, explicit (dev convenience)
@@ -578,7 +577,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "chudware-hostd: cell lock unavailable: %s\n", err.c_str());
             return 1;
         }
-        // T-PERF10: spawn-loser flock-wait. The incumbent may be mid-drain with
+        // Spawn-loser flock-wait. The incumbent may be mid-drain with
         // the sock still up (or briefly gone). Poll for either a live sock
         // (client will reconnect) or a freed lock we can claim — up to ~5 s —
         // instead of immediately exiting and leaving the spawner to burn budget.
@@ -752,7 +751,7 @@ int main(int argc, char** argv) {
     // Deterministically reap the directly-owned worker child on explicit drain/--stop
     // (or ordinary idle-exit), rather than relying on static-destructor order.
     hostd::WorkerBridge::shutdownIfCreated();
-    // T-PERF10 drain-window: hand the sock path to SingleInstance BEFORE the
+    // Drain window: hand the sock path to SingleInstance BEFORE the
     // Server dtor closes the listen fd, so unlink happens only at flock release
     // (instance is destroyed after server, so order is: close fd → release flock
     // → unlink sock). Clients never observe lock-held-with-no-sock.

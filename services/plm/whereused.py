@@ -1,4 +1,4 @@
-"""services.plm.whereused — the derived where-used index (T-R4, plan §3.4).
+"""services.plm.whereused — the derived where-used index.
 
 Where-used is **derived, never stored** (contract §4): given the manifest and
 the project's canonical documents, walk every consumer edge —
@@ -13,9 +13,9 @@ the project's canonical documents, walk every consumer edge —
 Matching is by item **path** (exact or basename-sans-suffix) or **doc uuid**,
 so live-session ids and at-rest paths both resolve.
 
-Powers the stale-ref flags (T-R3 ``assist.stale_refs``) and the Project Hub
-explorer (T-R6). The dedicated MCP tool surface ships thin here (T-R4 task
-card) and grows into the Hub in T-R6.
+Powers the stale-ref flags (``assist.stale_refs``) and the Project Hub
+explorer. The dedicated MCP tool surface ships thin here and
+grows into the Hub.
 """
 from __future__ import annotations
 

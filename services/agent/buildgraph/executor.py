@@ -1,18 +1,17 @@
 """executor.py — Topological executor for aicad.buildgraph/1 graphs.
 
 Contract: contracts/advisor.md §13 (FROZEN).
-T-W15.
 
 This is the FINE-GRAINED executor for modeling jobs — NOT the mission executor
 (services/dag/executor.py uses LangGraph + SQLite).  BuildGraphExecutor is a
 plain in-memory topo walk with per-node status tracking and a ready_nodes()
-surface for T-W16 multi-doc fan-out.
+surface for multi-doc fan-out.
 
 Key design decisions
 --------------------
 * No LangGraph, no SQLite here — this runs inside a modeling job.
 * ready_nodes() returns the current parallel frontier (nodes whose requires are
-  all "done") — T-W16 will call this to assign sub-agents.
+  all "done") — a fan-out caller uses this to assign sub-agents.
 * Failed nodes block their dependents; dependents are marked "skipped" with a
   reason string in status_detail.
 * Status transitions:  pending → building → done | failed
@@ -58,7 +57,7 @@ class BuildGraphExecutor:
           # ... do work on the nodes ...
           executor.finish_node(node_id, success=True)  # marks done/failed
 
-    T-W16 will iterate ready_nodes() and dispatch sub-agents.
+    A multi-doc fan-out caller iterates ready_nodes() and dispatches sub-agents.
     """
 
     def __init__(
@@ -236,7 +235,7 @@ def run_sync(
     node_fn(node_dict) -> (success: bool, output: dict)
 
     Returns the executor so the caller can inspect statuses.
-    This is the simple path; T-W16 uses ready_nodes() directly for fan-out.
+    This is the simple path; fan-out callers use ready_nodes() directly.
     """
     ex = BuildGraphExecutor(graph, emit=emit)
     while not ex.is_done():

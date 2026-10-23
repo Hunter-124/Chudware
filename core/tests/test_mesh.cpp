@@ -213,7 +213,7 @@ TEST_CASE("removed backend selectors are rejected before geometry access") {
 // part; on a slab it over-estimates by 7.5-9.4x (measured 2026-09-05), and coarsening on
 // it produced meshes that were not meshes: a 120x60x3 mm plate raised 3.01 -> 8.80 mm
 // (0.3 elements across the thickness, 32.7% poor elements), a D12 rod 2.84 -> 5.15 mm
-// (aspect_max 339), and the fin25 sensor board 2.60 -> 4.46 mm, which polymesh refused to
+// (aspect_max 339), and the sensor-node demo board 2.60 -> 4.46 mm, which polymesh refused to
 // fill at all. The invariant is four elements across the thinnest bbox direction, and it
 // binds BOTH budget rungs — a recalibration of the element-count constants must not be
 // able to walk past it again.

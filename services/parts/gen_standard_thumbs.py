@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pre-render 3D CAD-model thumbnails for every standard (mech_family) library part.
 
-Hunter's "template parts + scripts to generate the sizes/variations": each parametric
+Template parts + scripts generate the sizes/variations: each parametric
 family+size is instantiated via the core ``parts_make`` (the template part) and rendered
 to a PNG, warming the same on-disk thumbnail cache the GUI's ``parts_thumbnail`` RPC reads
 (keyed by ``sha1(part_id)``). With the cache warm, the Parts Library shows the real model

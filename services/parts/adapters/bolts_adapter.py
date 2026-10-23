@@ -1,9 +1,9 @@
-"""CatalogProvider adapter for the BOLTS-format fastener/bearing tables (T-P1).
+"""CatalogProvider adapter for the BOLTS-format fastener/bearing tables.
 
 Wraps services/parts/bolts_loader.py + the clean-room ISO/DIN data under
 services/parts/data/bolts/. Covers domain=fastener and domain=bearing.
 
-No rewrite, no data move — pure adapter per the T-P1 architecture ruling.
+No rewrite, no data move — pure adapter by design.
 
 Provenance / license: clean-room ISO/DIN dimensional data; see services/parts/data/bolts/README.md
 and contracts/licenses.md. NOT BOLTS GPL data.

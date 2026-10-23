@@ -262,7 +262,7 @@ def test_export_skips_non_io_pins():
 
 def test_schematic_roundtrip():
     from services.ecad import library, schema
-    # T-RF21: netlist is compiled C++-side; the facade resolves it from the doc's
+    # The netlist is compiled C++-side; the facade resolves it from the doc's
     # owning session, so mint one around the inline doc first.
     from services.mcp.ecad_common import ecad_session as esess, netlist_mod as netlist
     doc = schema.new_schematic("fpga_demo")

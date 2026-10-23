@@ -1,4 +1,4 @@
-"""CAD assembly + motion MCP tools (T-RF8 split of cad_tools.py): new_assembly, asm_add_component, asm_mate, solve_mates, simulate_motion, motion_fea_handoff, list_world_bodies."""
+"""CAD assembly + motion MCP tools (split out of cad_tools.py): new_assembly, asm_add_component, asm_mate, solve_mates, simulate_motion, motion_fea_handoff, list_world_bodies."""
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
@@ -239,7 +239,7 @@ def resolve_mate_ref(asm_doc: str, comps: dict, tag: str, ref: dict) -> dict:
 
 
 def register_cad_asm_tools(mcp: FastMCP) -> None:
-    """CAD assembly + motion MCP tools (T-RF8 split of cad_tools.py): new_assembly, asm_add_component, asm_mate, solve_mates, simulate_motion, motion_fea_handoff, list_world_bodies."""
+    """CAD assembly + motion MCP tools (split out of cad_tools.py): new_assembly, asm_add_component, asm_mate, solve_mates, simulate_motion, motion_fea_handoff, list_world_bodies."""
 
 
     # ---------------------------------------------------------------- assembly

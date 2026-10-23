@@ -55,7 +55,7 @@ def _mat_props(material_id: str) -> tuple[float, float, float]:
 
 
 # ---------------------------------------------------------------------------
-# Pure compute (T-W9 callable)
+# Pure compute (FEA cross-check callable)
 # ---------------------------------------------------------------------------
 
 def press_fit_raw(

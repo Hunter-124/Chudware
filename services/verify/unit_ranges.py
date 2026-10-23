@@ -1,6 +1,6 @@
 """Unit-sanity range table — catches the ksi/MPa 6.9x class of unit confusion.
 
-Cited by T-H3's quantity validation too. Table lives here, not in the battery,
+Also used by the requirements quantity validation. Table lives here, not in the battery,
 so it can be imported independently.
 """
 from __future__ import annotations

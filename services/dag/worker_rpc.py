@@ -1,4 +1,4 @@
-"""Worker-RPC bridge for the DAG steering seam (T-F17 mission-control UX).
+"""Worker-RPC bridge for the DAG steering seam (mission-control UX).
 
 Exposes ``dag_status``, ``dag_approve``, and ``dag_abort`` as **engine-worker
 methods** so the C++/ImGui mission-control panel
@@ -44,7 +44,7 @@ def _dag_status(params: dict, _emit: Callable) -> dict:
     """Worker method ``dag_status`` → persisted run topology + events.jsonl path.
 
     Restart-safe: reads the .graph.json sidecar + checkpoint DB from disk.
-    Adds ``events_jsonl`` (the T-F17 EventJournal path) so the panel can replay
+    Adds ``events_jsonl`` (the EventJournal path) so the panel can replay
     the full event trail after an app restart.
     """
     try:

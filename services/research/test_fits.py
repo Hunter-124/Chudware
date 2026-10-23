@@ -2,7 +2,7 @@
 
 Run: python -m pytest services/research/test_fits.py -v
 
-Spot-check requirements from work order T-W3:
+Spot-check requirements:
 - 20H7 = +0.021/0
 - 20g6 = -0.007/-0.020
 - 50H7/p6 is a press fit (interference)

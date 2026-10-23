@@ -636,7 +636,7 @@ class TestDivergenceWarn:
 
 
 # ---------------------------------------------------------------------------
-# 6. Stage battery wiring (T-W5 seam)
+# 6. Stage battery wiring (advisory-engine seam)
 # ---------------------------------------------------------------------------
 
 class TestStageBattery:
@@ -830,7 +830,7 @@ class TestCantileverAnchorMockProve:
 
 
 # ---------------------------------------------------------------------------
-# 9. Thermal anchor (1D plane-wall Fourier reference) — T-SIM1
+# 9. Thermal anchor (1D plane-wall Fourier reference)
 # ---------------------------------------------------------------------------
 
 class TestThermalAnchor:
@@ -888,7 +888,7 @@ class TestThermalAnchor:
 
 
 # ---------------------------------------------------------------------------
-# 10. Thermal BC lint (steady versus transient public schemas) — T-SIM1
+# 10. Thermal BC lint (steady versus transient public schemas)
 # ---------------------------------------------------------------------------
 
 class TestThermalBcLint:
@@ -996,7 +996,7 @@ class TestThermalBcLint:
 
 
 # ---------------------------------------------------------------------------
-# 10. Fatigue anchor (T-SIM4) — Goodman / Soderberg S-N hand-calc reference
+# 10. Fatigue anchor — Goodman / Soderberg S-N hand-calc reference
 # ---------------------------------------------------------------------------
 #
 # Citation honesty: every expected number below is hand-computed in the docstring

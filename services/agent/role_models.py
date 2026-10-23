@@ -1,6 +1,6 @@
-"""role_models.py — per-role model assignment + auto ranking pick (WS2 / WS4).
+"""role_models.py — per-role model assignment + auto ranking pick.
 
-Contract (docs/plans/AI_HARNESS_ROADMAP.md WS2 + wave Contract):
+Contract:
   * config.json ``ai_roles`` maps role → ``{provider, model}`` | ``"auto"``
     for: advisor | task | planning | vision | default | plm | redaction.
   * Each role entry MAY also carry ``thinking``: ``"auto"|"low"|"medium"|"high"``
@@ -159,7 +159,7 @@ _TASK_CLASS_MIN_RANK: dict[str, int] = {
     "unknown": 3,
 }
 
-# Max spawn depth defaults by capability letter (WS4 spawn-depth policy).
+# Max spawn depth defaults by capability letter (spawn-depth policy).
 _MAX_SPAWN_DEPTH_BY_LETTER: dict[str, int] = {
     "A": 2,
     "B": 4,

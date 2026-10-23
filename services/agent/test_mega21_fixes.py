@@ -254,7 +254,7 @@ def test_airframe_ops_cover_brief_dims():
 # _noop_when_mech_present) and once in test_mega22_fixes. A fourth test,
 # `test_loop_deliver_gate_blocks_zero_mech`, claimed to cover the loop's terminal status
 # MAPPING and was removed 2026-08-05: its subject
-# (`services/agent/loop.py::_drive_phases_from_dag`) was deleted by T-RF5, and what it
+# (`services/agent/loop.py::_drive_phases_from_dag`) was deleted with the Python loop, and what it
 # actually asserted was a tautology — it monkeypatched `mech_deliver_gate` to return
 # allow_deliver=False, re-implemented the status mapping inside the test body
 # (`status = "blocked"`), then asserted `status == "blocked"`. It imported `loop`,

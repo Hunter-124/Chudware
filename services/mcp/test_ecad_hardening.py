@@ -16,7 +16,7 @@ import pathlib
 import tempfile
 import time
 
-import services.mcp.ecad_common as et  # T-RF8: budget/session internals moved
+import services.mcp.ecad_common as et  # budget/session internals moved
 import services.mcp.ecad_sch_tools as sch_tools
 from services.ecad import autosave as eauto
 from services.mcp.ecad_common import ecad_session as esess
@@ -269,7 +269,7 @@ def test_terminal_job_retention_has_a_hard_count_bound() -> None:
 
 def test_autoroute_overrun_returns_clean_message() -> None:
     """A router overrun returns a job and the test drains that worker before teardown."""
-    import services.mcp.ecad_pcb_tools as _pcb_tools  # T-RF20: tool RPCs via ecad_common._rpc
+    import services.mcp.ecad_pcb_tools as _pcb_tools  # tool RPCs via ecad_common._rpc
 
     tools = _tools()
     _call(tools, "ecad_new_pcb", name="HeavyBoard")
@@ -313,7 +313,7 @@ def test_autoroute_overrun_returns_clean_message() -> None:
 
 def test_simulate_overrun_returns_clean_message() -> None:
     """ecad_simulate hands off safely and its test worker is drained before teardown."""
-    import services.mcp.ecad_sim_tools as _sim_tools  # T-RF20: tool runs C++ sim via _sim_run
+    import services.mcp.ecad_sim_tools as _sim_tools  # tool runs C++ sim via _sim_run
 
     tools = _tools()
     # minimal sim-able schematic: a source + resistor to ground (recipe via ecad_design is heavy;
@@ -572,7 +572,7 @@ def test_ecad_design_slow_provider_falls_back_promptly() -> None:
         return slow
 
     helper.helper_provider = resolve_provider
-    import services.mcp.ecad_sim_tools as et_sim  # T-RF8: ecad_design looks it up here
+    import services.mcp.ecad_sim_tools as et_sim  # ecad_design looks it up here
     orig_reach = et_sim._provider_reachable
     et_sim._provider_reachable = lambda p, timeout_s=0.6: True  # type: ignore[assignment]
 

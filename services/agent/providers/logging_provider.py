@@ -2,7 +2,7 @@
 
 This is a transparent decorator that conforms to contracts/providers.md (v1).  It
 delegates every call to an inner provider and, around complete_ex, captures the
-request/response bodies as sidecars and emits an ai_artifact event reusing the T-H1
+request/response bodies as sidecars and emits an ai_artifact event reusing the
 helpers from services/agent/loop.py.
 
 Design decisions:
@@ -14,7 +14,7 @@ Design decisions:
 2. DOUBLE-EMIT AVOIDANCE — loop.py already emits ai_artifact at IP-1 post-build with
    verifier_scores.  Set suppress_emit=True (the default for IP-1) to write sidecars
    only; the caller (loop.py) reads sidecar_paths and passes them as input_ref /
-   output_ref.  See work/questions/T-H7.md Q1.
+   output_ref.
 
 3. CONSENT GATES SIDECAR WRITES — at meta/off consent tiers, request/response bodies
    are NOT written (empty refs returned). Metadata fields (hash, latency) remain.
@@ -218,7 +218,7 @@ class LoggingProvider(Provider):
 def _default_sidecar_dir() -> Path:
     # services.paths exports ROOT (the %APPDATA%/Chudware | XDG data root), not DATA —
     # the old attribute reference made the default sidecar dir a runtime AttributeError
-    # on every platform (T-B5 finding; callers had to pass sidecar_dir explicitly).
+    # on every platform (callers had to pass sidecar_dir explicitly).
     import services.paths as _paths  # type: ignore[import]
     return _paths.ROOT / "telemetry" / "sidecars"
 
@@ -255,7 +255,7 @@ def _emit_artifact(
     latency_ms: float,
     consent: str,
 ) -> None:
-    """Emit ai_artifact via the loop.py _emit helper pattern (mirrors T-H1)."""
+    """Emit ai_artifact via the loop.py _emit helper pattern."""
     if on_event is None:
         return
     artifact_id = hashlib.sha256(

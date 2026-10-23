@@ -276,7 +276,7 @@ stage_host_build() {
 # WASM build is a web-parity regression, so this stage is FATAL when the toolchain is
 # provisioned and the build breaks. SKIPs honestly when emsdk is absent. Stages into
 # $GATE_TMP/wasm-app via CHUDWARE_WEB_APP so build.sh's default web-app stage
-# (~/chudware-web/app) is never clobbered.
+# (host/build-wasm/app) is never clobbered.
 stage_wasm_smoke() {
     echo "=== WASM web-client build smoke ==="
     local emsdk_dir="${EMSDK:-$HOME/.emsdk}"

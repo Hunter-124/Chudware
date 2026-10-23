@@ -1,8 +1,8 @@
-"""``verification_report`` — the test / verification report (docx/pdf), a T-F15 template.
+"""``verification_report`` — the test / verification report (docx/pdf), an engineering template.
 
 The requirements-to-evidence document: each requirement joined to the measured evidence that
 verifies it, the measured value pulled from a tool result (contract §4), never asserted by the
-model. Until the T-BL09 requirements schema lands the criterion is a free-prose field; the join
+model. Until the requirements schema lands the criterion is a free-prose field; the join
 mechanics (measured value → provenance ref) are already enforced. Block types:
 
 - ``title``       — cover heading + body prose.

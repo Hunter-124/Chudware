@@ -13,15 +13,14 @@ users as-is.
 
 Registration: ``register_plm_tools(mcp)`` → adds plm_init, plm_open, plm_save,
 plm_checkpoint, plm_release, plm_history, plm_restore, plm_status, plm_compare,
-plm_set_ai_mode (T-R3), plm_item_set + plm_where_used (T-R4),
-plm_timeline + plm_rollback + plm_rollback_check (AI-VC), T-R7 remotes/locks,
+plm_set_ai_mode, plm_item_set + plm_where_used,
+plm_timeline + plm_rollback + plm_rollback_check (AI-VC), remotes/locks,
 and the authoritative live seam: plm_live_join/propose/poll/presence/leave.
 
-plm_where_used note: §7 reserves this name for T-R6's Hub; the T-R4 task card
-ships the thin envelope early ({ok, consumers} over the derived index in
-services/plm/whereused.py). Flagged in the T-R4 work note for integrator
-review — dropping to in-process-only is a two-line change if §7 is read
-strictly.
+plm_where_used note: §7 reserves this name for the Hub; this module ships
+the thin envelope early ({ok, consumers} over the derived index in
+services/plm/whereused.py). Dropping to in-process-only is a two-line change
+if §7 is read strictly.
 """
 from __future__ import annotations
 
@@ -582,7 +581,7 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(**{k: v for k, v in out.items() if k != "ok"})
 
     # ------------------------------------------------------------------
-    # T-R7 remotes / locks (folder kind)
+    # Remotes / locks (folder kind)
     # ------------------------------------------------------------------
 
     @mcp.tool()

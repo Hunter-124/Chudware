@@ -1,4 +1,4 @@
-"""services/browser/queue.py — background fetch/download queue (T-X4).
+"""services/browser/queue.py — background fetch/download queue.
 
 A persistent, thread-safe job queue for vendor searches + CAD model downloads
 that run in a daemon background thread inside the MCP server process.  Each job
@@ -10,8 +10,8 @@ Design contract
 - **State is in-process only** (no external message broker).  The MCP server
   process is long-lived (started once per app session); jobs survive normal RPC
   calls but are lost if the server restarts.  A persistent on-disk queue is a
-  phase-2 concern (T-X4 scope).
-- **Worker pool (T-PERF10), serialised per site** — a small pool of daemon
+  future enhancement.
+- **Worker pool, serialised per site** — a small pool of daemon
   threads drains the FIFO. Browser sessions stay single-threaded *within* a
   site (per-site lock + at most one RUNNING job per site). Independent sites
   run in parallel so a slow McMaster scrape cannot stall Digi-Key.
@@ -76,7 +76,7 @@ _lock   = threading.Lock()
 _jobs: list[ScrapeJob] = []
 _cond   = threading.Condition(_lock)
 _worker_started = False
-# T-PERF10: small worker pool (not a single thread). Per-site locks keep Playwright
+# Small worker pool (not a single thread). Per-site locks keep Playwright
 # sessions single-threaded within a site while independent sites run in parallel.
 _POOL_SIZE = 4
 _site_locks: dict[str, threading.Lock] = {}
@@ -252,7 +252,7 @@ def _claim_next_job() -> Optional[ScrapeJob]:
     """Oldest pending job whose site is not already being worked by another pool thread.
 
     Sites with an in-flight RUNNING job are skipped so two workers never share one
-    Playwright context. Other sites remain eligible in parallel (T-PERF10 pool).
+    Playwright context. Other sites remain eligible in parallel (worker pool).
     """
     with _lock:
         running_sites = {j.site for j in _jobs if j.status == JobStatus.RUNNING}

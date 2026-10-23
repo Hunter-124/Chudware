@@ -72,7 +72,7 @@ def make_ai_block(
     artifact_id: str | None,
     adapter: str | None = None,
 ) -> dict[str, Any]:
-    """The §3.4 ``ai`` attribution block (joins T-H1 telemetry). reversible=True in v1."""
+    """The §3.4 ``ai`` attribution block (joins agent telemetry). reversible=True in v1."""
     return {
         "provider": provider,
         "model": model,

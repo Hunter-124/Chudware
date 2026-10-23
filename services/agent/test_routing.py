@@ -1,7 +1,7 @@
 """Tests for services/agent/routing.py — validation authority for aicad.routing/1.
 
 Covers: schema/semantic validation, resolve() against symbolic tiers + pins,
-warn-never-block advisories, the view() GUI/T-W14 contract shape, round-trip
+warn-never-block advisories, the view() GUI/delegation contract shape, round-trip
 save/load, and the get/set CLI seam the C++ GUI shells.
 """
 from __future__ import annotations
@@ -202,7 +202,7 @@ def test_unsatisfiable_preference_warns():
     assert routing.warnings_for(d, "sketcher")
 
 
-# --- view (GUI / T-W14 contract) -------------------------------------------
+# --- view (GUI / delegation contract) -------------------------------------
 
 def test_view_shape():
     v = routing.view(_doc())

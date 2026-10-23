@@ -210,7 +210,7 @@ TEST_CASE("make_helix rejects degenerate parameters") {
 // DEV HARNESS (temporary): drive geom::cut_thread directly on an EXAGGERATED
 // coarse thread (steep ~45° helix) so profile/alignment/boolean errors that a
 // shallow M8 hides become obvious. Run with CHUDWARE_THREAD_DEBUG=1 for a stage
-// trace. Also asserts the two invariants Hunter flagged: the swept groove exists
+// trace. Also asserts the two invariants this guards: the swept groove exists
 // and the cut removes material to a VALID solid.
 // ---------------------------------------------------------------------------
 #include "geom/thread.h"
@@ -289,7 +289,7 @@ TEST_CASE("HARNESS: over-long thread run is clamped to the body (no floating thr
 }
 
 // INVARIANT: make_helix is exactly concentric with its axis — every sampled point sits at
-// `radius` from the axis (Hunter's "helix aligned to the cylinder's circular profile").
+// `radius` from the axis (the expected "helix aligned to the cylinder's circular profile").
 TEST_CASE("HARNESS: helix is concentric with the cylinder axis") {
     const double R = 10.0, pitch = 4.0, height = 40.0;
     TopoDS_Wire hl = geom::make_helix(pitch, height, R, 0.0, 0.0, false);

@@ -1,4 +1,4 @@
-"""test_agent_turn.py — T-W30 tool-executing agent turn.
+"""test_agent_turn.py — tool-executing agent turn.
 
 Proves tool dispatch, finish handling, sub-agent soft warnings and runaway
 ceilings, and that empty/forced turns never fabricate success.
@@ -145,7 +145,7 @@ def test_dispatch_error_fed_back_then_recovered():
 
 
 def test_turn_honours_max_tokens_cap():
-    """T-W30 finisher: the per-completion cap is passed through to the provider
+    """The per-completion cap is passed through to the provider
     (tier generation_headroom when the caller knows the tier; 2048 default)."""
     seen = {}
 
@@ -165,7 +165,7 @@ def test_turn_honours_max_tokens_cap():
 
 
 def test_turn_logs_every_tool_call_to_ledger():
-    """T-W30 DoD: ledger events for every turn — each dispatched tool call is
+    """Ledger events for every turn — each dispatched tool call is
     appended as an agent_turn event when a ledger is supplied."""
     provider = _ScriptedProvider([
         '```json\n{"tool": "measure_part", "args": {"doc_id": "d1"}}\n```',
@@ -193,7 +193,7 @@ def test_turn_logs_every_tool_call_to_ledger():
 
 
 # ---------------------------------------------------------------------------
-# T-W32 — directive parsing: nested args, unterminated fences, trailing prose
+# Directive parsing: nested args, unterminated fences, trailing prose
 # ---------------------------------------------------------------------------
 
 def test_parse_directive_nested_args():

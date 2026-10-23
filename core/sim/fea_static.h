@@ -305,7 +305,7 @@ struct FeaContactOptions {
 };
 
 // ── Small-strain J2 (von Mises) plasticity with isotropic hardening ─────────────
-// A frictionless linear-elastic contact cannot redistribute: on the ME 490 hinge
+// A frictionless linear-elastic contact cannot redistribute: on a rover hinge
 // saddle 1446 N funnelled through 12 node pairs on a sharp edge and the mean
 // bearing stress came out at 450 MPa against a 276 MPa yield, which is not a
 // result — it is the answer to a question about a material that does not exist.

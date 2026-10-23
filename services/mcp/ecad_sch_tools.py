@@ -644,7 +644,7 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
         ``category`` restricts the search to one family prefix (e.g. 'Device', 'MCU',
         'Regulator_Switching'); an unknown category errors with the valid list.
         """
-        from services.ecad.library import resolve as lib_resolve  # STAYS (T-RF20): no ecad_library RPC; pin-count lookup
+        from services.ecad.library import resolve as lib_resolve  # STAYS: no ecad_library RPC; pin-count lookup
         from services.ecad.library import substitute as _sub
 
         q = (query or "").strip()
@@ -2176,7 +2176,7 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
             components.append({"ref": c.get("ref"), "libid": c.get("libid"),
                                "value": c.get("value"), "footprint": c.get("footprint") or None,
                                "pins": c.get("pins"),
-                               # T-FIN8: per-component power (honest nulls when unknown —
+                               # Per-component power (honest nulls when unknown —
                                # contracts/ecad/boardphys.md)
                                "power_w": eng["power_w"] if eng else {"typ": None, "max": None}})
         power = _power_totals(comp_engs)
@@ -2276,7 +2276,7 @@ def register_ecad_sch_tools(mcp: FastMCP) -> None:
             next_actions.append("No footprints — place parts (ecad_find_part finds fpids).")
         if not doc.get("outline", {}).get("shapes"):
             next_actions.append("No board outline yet — set one with a pcb_set_outline op.")
-        # T-FIN8: per-footprint power + board total (honest nulls when unknown).
+        # Per-footprint power + board total (honest nulls when unknown).
         fp_engs = [_component_eng(libid=f.get("libid") or "", fpid=f.get("fpid") or "",
                                   overrides=_fp_overrides(f)) for f in fps]
         power = _power_totals(fp_engs)

@@ -231,7 +231,6 @@ void SimManager::restoreMotionHighlight(AppState &st) {
 }
 
 // ============================================================ Motion study
-// (T-SIM3/T-SIM4)
 //
 // Motion studies sample synchronized dimensional assembly mates through the existing native
 // simulate_motion RPC. AsyncRpc keeps both activation and solving off the UI thread. Only the

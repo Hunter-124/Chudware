@@ -3,7 +3,7 @@
 When a parametric document fails to rebuild, ``diagnose_failed_document`` runs the IP-18
 diagnosis (``services.agent.regen_diagnosis``), verifies the proposed fix against the live core
 when present, and returns a fix-preview card (``services.agent.regen_card``). The model call
-is logged as an IP-18 correction trace via T-H7's LoggingProvider.
+is logged as an IP-18 correction trace via the agent LoggingProvider.
 
 The model step is one tool-free completion through the Chudcode runtime
 (``providers.chudcode_provider.helper_provider``); an explicit offline/local-only
@@ -11,9 +11,9 @@ configuration binds an offline-safe provider instead. When the step cannot run, 
 still carries the detected failures and the runtime's reason.
 
 This is the shared surface the copilot / orchestrator call on a rebuild-failure event.
-LIVE SINCE T-BL22: ``add_features`` (cad_tools.py) invokes ``diagnose_failed_document`` on
+LIVE: ``add_features`` (cad_tools.py) invokes ``diagnose_failed_document`` on
 every rebuild failure and attaches the fix-preview card to its failure response, and
-``regen_resolve`` records the user's accept/edit/reject as a T-H1 ``ai_artifact_action``
+``regen_resolve`` records the user's accept/edit/reject as an ``ai_artifact_action``
 correction trace. When no caller-supplied event sink exists (the MCP tool path), events are
 journaled to ``CACHE/telemetry/events.jsonl`` (the spec_sheet_matcher precedent) so the
 "every LLM call is flywheel-logged" guarantee stays real.
@@ -125,7 +125,7 @@ def diagnose_failed_document(document: dict, *, provider=None,
             return _no_llm_result(
                 document, f"no model available for regen diagnosis: {type(e).__name__}: {e}")
     if on_event is None:
-        # T-BL22: no caller sink (the MCP tool path) -> journal the IP-18 correction trace
+        # No caller sink (the MCP tool path) -> journal the IP-18 correction trace
         # to CACHE/telemetry/events.jsonl instead of dropping it on the floor.
         on_event = _journal_sink()
 
@@ -149,7 +149,7 @@ def diagnose_failed_document(document: dict, *, provider=None,
 
 
 def register_regen_tools(mcp) -> None:
-    """Register the ``regen_diagnose`` MCP tool onto *mcp* (append-only, IP-18 / T-H11)."""
+    """Register the ``regen_diagnose`` MCP tool onto *mcp* (append-only, IP-18)."""
 
     @mcp.tool()
     def regen_diagnose(document_json: str, reference_json: str = "",
@@ -193,7 +193,7 @@ def register_regen_tools(mcp) -> None:
         ``"reject"``. ``edit_ops_json`` (edit only): the amended fix-ops JSON array, re-applied
         to the ORIGINAL corrupted document.
 
-        Emits the T-H1 ``ai_artifact_action`` correction trace (journaled to the telemetry
+        Emits the ``ai_artifact_action`` correction trace (journaled to the telemetry
         events log, correlated to the diagnosis's IP-18 artifact and carrying its verifier
         score). Returns ``{ok, action, document}`` — ``document`` is the fixed doc to load on
         accept/edit (null on reject, or when the card carries no document handles).

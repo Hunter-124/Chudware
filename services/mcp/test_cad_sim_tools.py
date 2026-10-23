@@ -2107,7 +2107,7 @@ def test_a_ladder_that_outruns_the_call_budget_keeps_solving_its_legs_in_order(
 
 
 # ------------------------------------------- a mechanism does not converge, however smooth
-# Measured live (ME490 front spine tube, O60 x 5.16 mm wall, tet10 at h = 16 mm): the solve
+# Measured live (a frame's front spine tube, O60 x 5.16 mm wall, tet10 at h = 16 mm): the solve
 # returned ok with max displacement 9.6e6 mm at an equilibrium error of 0.00042%. The
 # residual is tiny precisely BECAUSE a mechanism carries no load, so equilibrium can never
 # catch it — and a ladder built on such a leg reports a tidy delta over nonsense.

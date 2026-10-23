@@ -1,4 +1,4 @@
-// MCU family → Renode platform file lookup + capability matrix (T-RF15 port of
+// MCU family → Renode platform file lookup + capability matrix (C++ port of
 // engine_oracle/firmware/platform_db.py). The .repl files ship embedded
 // (firmware/templates_embedded.cpp); get_platform_file materializes them to a
 // cache dir so Renode's `LoadPlatformDescription @<file>` gets a real path.

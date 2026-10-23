@@ -66,7 +66,7 @@ def _to_markdown(text: str) -> str:
 def _try_browser_fallback(
     url: str,
 ) -> tuple[Optional[bytes], Optional[str], Optional[dict]]:
-    """On a 401/403 from a plain fetch, retry ``url`` via T-X1's authenticated browser
+    """On a 401/403 from a plain fetch, retry ``url`` via the authenticated browser
     session — ONLY when a matching site profile already exists (never triggers a login
     from this path; a missing profile just falls through to the existing degradation).
 
@@ -110,9 +110,9 @@ def _read_bytes(source: str) -> tuple[Optional[bytes], Optional[dict], Optional[
     """Load PDF bytes from a local path or URL.
 
     Returns ``(data, None, session_profile_used)`` on success or ``(None, degradation, None)``
-    on failure. ``session_profile_used`` is non-``None`` only when the T-X4 authenticated-
+    on failure. ``session_profile_used`` is non-``None`` only when the authenticated-
     browser fallback served the bytes (additive; ``None`` for the plain-fetch and local-file
-    paths, unchanged from before this task). When the fallback refuses with an actionable
+    paths). When the fallback refuses with an actionable
     reason (:data:`_ACTIONABLE_BROWSER_REASONS`) that envelope IS the degradation returned,
     so ``cooldown_active`` + ``retry_after_s`` survive to the tool boundary instead of being
     replaced by ``raise_for_status``'s "HTTP 403" a line later.

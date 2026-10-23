@@ -1,7 +1,7 @@
 // Engine-call watchdog policy (pure, header-only, dependency-free so it unit-tests trivially).
 //
 // The daemon runs OCCT engine calls per-client-thread; a doc is serialised by its own per-doc
-// mutex (T-PERF5 DocLock), so a single pathological rebuild wedges only THAT doc's thread — the
+// mutex (DocLock), so a single pathological rebuild wedges only THAT doc's thread — the
 // daemon keeps serving other docs/clients. But an OCCT call is non-interruptible in-process, so
 // a genuinely-hung call can never be reclaimed without ending the process. The watchdog bounds
 // exactly that: if a call runs past its ceiling the daemon force-restarts (systemd

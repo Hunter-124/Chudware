@@ -1,8 +1,6 @@
-// AI-ECAD UI scaffold (Wave D) — NOT yet build-verified; see docs/ECAD_UI_INTEGRATION.md
-//
 // EcadMirror — a read-only, in-process mirror of one open ECAD document, built from the JSON the
 // worker returns for `ecad_tree` / `ecad_apply_ops` (shape: {revision, kind, tree, compile}; see
-// engine/ecad/session.py::tree and docs/contracts/ecad/ecad_rpc.md §1). It is the ECAD analogue of
+// engine/ecad/session.py::tree and contracts/ecad/ecad_rpc.md §1). It is the ECAD analogue of
 // core::DocMirror — but where DocMirror keeps the raw doc JSON and lets the FeatureManager walk it,
 // EcadMirror PARSES the schematic / board document into flat typed vectors with WORLD coordinates
 // already computed, so the canvas can draw without re-deriving the rotate/mirror math every frame.

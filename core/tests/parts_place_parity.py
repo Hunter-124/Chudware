@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""T-RF19 place.py parity harness — drives the Python oracle
+"""place.py parity harness — drives the Python oracle
 (engine_oracle/parts_hub/place.py) and the C++ port (core/parts/place.cpp via
 test_parts_place --parity-dump) on the SAME fixture placements and diffs the
 PlacementResult envelopes + resulting document trees.

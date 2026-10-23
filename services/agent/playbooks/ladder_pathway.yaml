@@ -2,7 +2,7 @@
 schema: aicad.playbook/1
 id: ladder_pathway
 stage: layout
-# WI-3 capability plan-template slots (structural; enforcement in scaffolds.py):
+# Capability plan-template slots (structural; enforcement in scaffolds.py):
 # A rigid_template requires dimensions+datums+build_order+risks on plan handoff.
 # B structured_fields requires datums+build_order+risks.
 # C freeform: no template injection.

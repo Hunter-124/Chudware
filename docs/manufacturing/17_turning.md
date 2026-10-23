@@ -805,7 +805,7 @@ until a kind is in the contract's durable-result-kind table every append of it i
 the sixth of which *is* the capability kind — for the W1.1 accepted durable-result-kind set**, each
 carrying both `MFG-KIND-TWO-COLUMNS` columns plus its `supersede_with_parent` declaration and its
 `derived_from[]`, together with turning's permitted subject namespaces `{art:, job:, res:}` (§13.6). This
-is an append-only, integrator-owned contract edit landing in **W1.1**, and it is a hard predecessor of
+is an append-only, maintainer-owned contract edit landing in **W1.1**, and it is a hard predecessor of
 every later turning slice: no turning append, and no turning capability advertisement above
 `unsupported`, is admissible before it lands. `cam.turn.capability` is registered under
 `MFG-CAPABILITY-DURABLE-KIND` as turning's `<domain>.capability` kind, with
@@ -875,8 +875,8 @@ executable. It is an interpreter, not a controller — there is no device to own
 
 Licensing: LinuxCNC is GPL. It is **invoked**, never linked, never vendored, never redistributed. A
 hermetic test asserts that no `linuxcnc`/`rs274` header include or link appears anywhere under `core/**`
-or `host/**`, so the rule holds without editing the integrator-owned fast gate; appending the same rule
-there is a one-line belt-and-braces follow-up for the integrator.
+or `host/**`, so the rule holds without editing the maintainer-owned fast gate; appending the same rule
+there is a one-line belt-and-braces follow-up for the maintainer.
 
 ### Stage C — LinuxCNC sim lathe config (E3, manual)
 
@@ -963,7 +963,7 @@ Registered by appending to `core/CMakeLists.txt`, mirroring the existing pattern
 `core/CMakeLists.txt:516-519`: `add_executable(test_cam_turn tests/test_cam_turn.cpp)`,
 `target_include_directories(test_cam_turn PRIVATE ${doctest_SOURCE_DIR})`,
 `target_link_libraries(test_cam_turn PRIVATE chudware_cam)`, plus the new `core/cam/turn/*.cpp` sources
-appended to the `chudware_cam` source list. Both are pure appends; the integrator owns the merge.
+appended to the `chudware_cam` source list. Both are pure appends; the maintainer owns the merge.
 
 | # | Test | Defends |
 |---|---|---|
@@ -1131,7 +1131,7 @@ stock/tool/machine and the resolved_op/op_num helpers were not read for this des
 `CylinderOffset` asymmetric behaviour — if so it is asserting D-T13 and is updated with a comment
 recording that.
 
-**Appended (append-only, integrator-owned):** `core/CMakeLists.txt` (new sources + `test_cam_turn`
+**Appended (append-only, maintainer-owned):** `core/CMakeLists.txt` (new sources + `test_cam_turn`
 target); the **six** `cam.turn.*` rows of §13.5 in the contract's durable-result-kind table — one of
 which is the `cam.turn.capability` kind mandated by `MFG-CAPABILITY-DURABLE-KIND` — each with both
 mandatory columns plus its `supersede_with_parent` declaration and its `derived_from[]`, and turning's
@@ -1193,7 +1193,7 @@ ownership record for that line and is recorded identically in
 * **The `CylinderOffset` axial fix (D-T13) changes existing mill-with-cylinder-stock results** by
   `off_axial`. `model.h:82`'s documented meaning ("per end") is the correct target, so the fix lands and
   any test encoding the old asymmetry is updated with a comment naming it as the bug. This is the only
-  change in the plan that alters a non-turning result — flagged for the integrator.
+  change in the plan that alters a non-turning result — flagged for the maintainer.
 * **`post.cpp:487` is the one genuinely shared line in the batch, and it is now singly owned.** Turning's change
   deletes the `!g.lathe` condition so lathe programs stop the spindle; cutting's laser-condition
   adjustment is subsumed by that deletion and lands with it. One owner, one edit — see **Appendix A.2**.
@@ -1279,7 +1279,7 @@ turning's, which was false as written for `:487`.
 
 | finding | required correction (review) | how this document closes it | where |
 |---|---|---|---|
-| **B10** (P0) — turning's durable-result kinds are absent from the W1.1 table, so every durable append is refused `mfg_unregistered_result_kind` and the capability registration is refused `mfg_capability_requires_durable_kind` | Extend the accepted W1.1 set with turning's six `cam.turn.*` kinds plus `cam.turn.capability`; W1.1 is not green until the kind table is total over every domain that appends | The submitted set is the **six rows of §13.5**, one of which already *is* `cam.turn.capability` (the review counted it separately; §13.5's table always contained it, so "six plus capability" and "six including capability" name the same set and the registered total is six). All six are **submitted for the W1.1 accepted durable-result-kind set** as an append-only integrator contract edit, each with both `MFG-KIND-TWO-COLUMNS` columns, its `supersede_with_parent` declaration (`false` for `cam.turn.capability` per `MFG-CAPABILITY-NO-INHERIT`, `true` for `cam.turn.procedural_fact` per `MFG-PFACT-FOLLOWS-PARENT`) and its `derived_from[]`, plus the permitted subject namespaces `{art:, job:, res:}`. Registration is a hard predecessor of every later turning slice; gateway-side acceptance of the extended set is `GatewayDesignRecovery`'s edit | §13.5 "W1.1 registration"; §13.6; §18 |
+| **B10** (P0) — turning's durable-result kinds are absent from the W1.1 table, so every durable append is refused `mfg_unregistered_result_kind` and the capability registration is refused `mfg_capability_requires_durable_kind` | Extend the accepted W1.1 set with turning's six `cam.turn.*` kinds plus `cam.turn.capability`; W1.1 is not green until the kind table is total over every domain that appends | The submitted set is the **six rows of §13.5**, one of which already *is* `cam.turn.capability` (the review counted it separately; §13.5's table always contained it, so "six plus capability" and "six including capability" name the same set and the registered total is six). All six are **submitted for the W1.1 accepted durable-result-kind set** as an append-only maintainer contract edit, each with both `MFG-KIND-TWO-COLUMNS` columns, its `supersede_with_parent` declaration (`false` for `cam.turn.capability` per `MFG-CAPABILITY-NO-INHERIT`, `true` for `cam.turn.procedural_fact` per `MFG-PFACT-FOLLOWS-PARENT`) and its `derived_from[]`, plus the permitted subject namespaces `{art:, job:, res:}`. Registration is a hard predecessor of every later turning slice; gateway-side acceptance of the extended set is `GatewayDesignRecovery`'s edit | §13.5 "W1.1 registration"; §13.6; §18 |
 | **B15** (P1) — `post.cpp:487` requires a joint edit by two owners | Assign the footer line to exactly one owner for the wave (turning, since it deletes a condition cut only adjusts), have cut consume the result, and record it in the wave ownership table rather than one document's coordination note | Line assigned **exclusively to `cam.turn`**; cutting makes no edit and consumes the footer behaviour. Recorded as the wave ownership record in A.2, identical in both documents; §18's coordination note and §20's risk bullet now point at it instead of asserting a joint edit | A.2; §18; §20 |
 | **C9** (P3) — turning's fixtures diverge from the ratified `fixtures/mfg/**` root | `fixtures/mfg/turn/**` | Fixture root moved from `services/manufacturing/turning/fixtures/` to `fixtures/mfg/turn/**`, with the stale "no `fixtures/` directory exists" rationale deleted and every in-document reference re-rooted (§11's Tier-0 pin, §16.2's Tier-0 test, §18's New list) | §16.3; §11; §16.2; §18 |
 | **C10** (P3) — cross-reference drift on the two most load-bearing §24 rules (turning cited the flip scope as §24.6 and subject namespacing as §24.10; both point at unrelated rules) | Normalize cross-references and have the contract tests key on stable rule ids rather than section numbers | Every gateway section-number citation replaced by a stable rule id from the A.1 register, which restates the obligation in place so a later gateway renumbering cannot invalidate it; the two wrong citations are corrected to `MFG-PFACT-FLIP-SCOPE` and `MFG-SUBJECT-NS-DECLARED`, and the mis-attributed §24.8 uses are corrected to `MFG-PFACT-FOLLOWS-PARENT` / `MFG-CAPABILITY-NO-INHERIT` | A.1; §11; §13.3-§13.6; §14; §16.2 |

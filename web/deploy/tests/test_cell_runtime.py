@@ -2,9 +2,11 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -15,6 +17,7 @@ DEPLOY = Path(__file__).resolve().parents[1]
 CELL = DEPLOY / "cell"
 sys.path.insert(0, str(CELL))
 import cell_runtime as runtime
+from _cell_test_support import disposable_quota_plan, owner_roots
 
 
 def load(name):
@@ -51,6 +54,44 @@ def layout():
     private_json(config, cfg)
     yield tmp_path, cell, work, cell_id, cfg, config
     shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+@pytest.fixture
+def quota_layout():
+    """The disposable plan's first owner as a launchable cell; its second owner is the sibling tenant.
+
+    Kernel-quota admission needs root-provisioned evidence, never implicit sudo
+    or an admission bypass. Entries the test adds to plan directories are removed.
+    """
+    plan, proof_root = disposable_quota_plan()
+    key, work, state = owner_roots(plan["owners"][0])
+    _, sibling_work, sibling_state = owner_roots(plan["owners"][1])
+    cell = state.parent
+    metadata = cell / "cell.json"
+    previous = metadata.read_bytes() if metadata.exists() else None
+    touched = (cell, work, state, sibling_state)
+    before = {directory: set(os.listdir(directory)) for directory in touched}
+    base = Path(tempfile.mkdtemp(prefix="cw-", dir="/tmp")).resolve()
+    try:
+        cfg = {"schema": "chudware-cell-runtime-v1", "cells_root": str(cell.parent),
+               "allowed_roots": [str(work)], "egress_hosts": ["provider.example"],
+               "quota_proof_root": proof_root}
+        config = base / "runtime.json"
+        private_json(config, cfg)
+        private_json(metadata, {"schema": "chudware-cell-v1", "cell_id": cell.name,
+                                "workspace_key": key, "root": str(work)})
+        yield base, cell, work, cell.name, cfg, config, (sibling_work, sibling_state)
+    finally:
+        for directory in touched:
+            for name in set(os.listdir(directory)) - before[directory]:
+                path = directory / name
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+        if previous is not None:
+            metadata.write_bytes(previous)
+        shutil.rmtree(base, ignore_errors=True)
 
 
 @pytest.mark.parametrize("value", ["", "a" * 31, "A" * 32, "g" * 32, "../" + "a" * 32, "a" * 32 + ".socket", None])
@@ -281,3 +322,162 @@ def test_worker_environment_carries_no_operator_credentials_or_endpoints(monkeyp
                 "OPENAI_BASE_URL"} & environment.keys()
     assert environment["HTTP_PROXY"] == "http://127.0.0.1:18080"
     assert environment["NO_PROXY"] == environment["no_proxy"] == "127.0.0.1,localhost,::1"
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap absent")
+@pytest.mark.parametrize("access", ["ro", "rw"])
+def test_real_bwrap_cell_and_actor_escape_boundaries(quota_layout, access):
+    base, cell, work, cell_id, cfg, config, (sibling_work, sibling_state) = quota_layout
+    payload = base / "payload"
+    (payload / "bin").mkdir(parents=True)
+    for source in CELL.iterdir():
+        if source.is_file():
+            shutil.copy2(source, payload / "bin" / source.name)
+    actor = "a" * 32
+    other_actor = "b" * 32
+    (cell / "state/actors").mkdir(mode=0o700)
+    for actor_id in (actor, other_actor):
+        directory = cell / "state/actors" / actor_id
+        directory.mkdir(mode=0o700)
+        (directory / "secret").write_text(actor_id)
+    (sibling_state / "secret").write_text("sibling-cell")
+    gateway = base / "gateway-data"
+    gateway.mkdir()
+    (gateway / "secret").write_text("gateway")
+    for name, target in (("sibling", sibling_state / "secret"), ("gateway", gateway / "secret"),
+                         ("other-actor", cell / "state/actors" / other_actor / "secret")):
+        (work / name).symlink_to(target)
+    # These actual hostile links are refused at the quota boundary, not merely
+    # hidden by bwrap or masked by an unrelated missing-proof refusal.
+    from storage_quota import QuotaRefused, admit
+    with pytest.raises(QuotaRefused, match="symlink"):
+        admit(cell_id, str(work), str(cell / "state"), cfg["quota_proof_root"])
+    for name in ("sibling", "gateway", "other-actor"):
+        (work / name).unlink()
+    verified = admit(cell_id, str(work), str(cell / "state"), cfg["quota_proof_root"])
+    for descriptor in verified:
+        os.close(descriptor)
+    broker_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    # Plan directories may exceed the AF_UNIX path limit; bind through a descriptor.
+    cell_fd = os.open(cell, os.O_PATH | os.O_DIRECTORY)
+    try:
+        broker_socket.bind(f"/proc/self/fd/{cell_fd}/egress.sock")
+        listener.bind(f"/proc/self/fd/{cell_fd}/gw.sock")
+    finally:
+        os.close(cell_fd)
+    broker_socket.listen()
+    broker_socket.settimeout(5)
+    listener.listen()
+    other_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    other_socket.bind(str(base / "other.sock"))
+    other_socket.listen()
+    host_tcp = socket.socket()
+    host_tcp.bind(("127.0.0.1", 0))
+    host_tcp.listen()
+    host_port = host_tcp.getsockname()[1]
+    denied = [str(Path.home()), "/run/user", str(gateway), str(sibling_state.parent), str(sibling_work),
+              str(base / "other.sock"), str(cell / "gw.sock"), f"/proc/{os.getpid()}/environ"]
+    probe = f'''#!/usr/bin/python3 -I
+import errno, fcntl, os, pathlib, socket, struct, subprocess, sys
+assert "OPERATOR_ENV_SENTINEL" not in os.environ
+open_extra = []
+for descriptor in os.listdir("/proc/self/fd"):
+    fd = int(descriptor)
+    try:
+        os.fstat(fd)
+    except OSError:
+        continue
+    if fd > 2:
+        open_extra.append(fd)
+assert sorted(open_extra) == ([] if sys.argv[-1] == "actor" else [3]), open_extra
+# Even the owning actor cannot clear inheritance or change project IDs inside
+# a user namespace. Readonly Ask/Plan lanes may reject the ioctl earlier.
+quota_fd = os.open("/work", os.O_RDONLY | os.O_DIRECTORY)
+attributes = bytearray(28)
+fcntl.ioctl(quota_fd, 0x801C581F, attributes, True)
+fields = list(struct.unpack("=IIIII8s", attributes))
+assert fields[0] & 0x200 and fields[3] > 0
+fields[0] &= ~0x200
+fields[3] = 0
+try:
+    fcntl.ioctl(quota_fd, 0x401C5820, struct.pack("=IIIII8s", *fields))
+except OSError as exc:
+    assert exc.errno in (errno.EINVAL, errno.EPERM, errno.EACCES, errno.EROFS), exc
+else:
+    raise AssertionError("actor escaped project quota inheritance")
+after = bytearray(28)
+fcntl.ioctl(quota_fd, 0x801C581F, after, True)
+assert after == attributes
+os.close(quota_fd)
+for name in {denied!r} + ["/work/sibling", "/work/gateway", "/work/other-actor"]:
+    try:
+        pathlib.Path(name).read_bytes() if not pathlib.Path(name).is_dir() else list(pathlib.Path(name).iterdir())
+    except OSError:
+        pass
+    else:
+        raise AssertionError("host access: " + name)
+for address in [("127.0.0.1", {host_port}), ("8.8.8.8", 443)]:
+    sock = socket.socket(); sock.settimeout(.2)
+    assert sock.connect_ex(address) != 0
+    sock.close()
+result = subprocess.run(["/usr/bin/systemd-run", "--user", "--pipe", "/usr/bin/true"], capture_output=True)
+assert result.returncode != 0
+assert not pathlib.Path("/run/dbus/system_bus_socket").exists()
+if sys.argv[-1] == "actor":
+    assert not pathlib.Path("/state").exists()
+    assert pathlib.Path("/actor/secret").read_text() == {actor!r}
+    assert set(p.name for p in pathlib.Path("/dev").iterdir()) == {{"null", "zero", "urandom"}}
+    try:
+        pathlib.Path("/work/written").write_text("write")
+    except OSError:
+        assert {access!r} == "ro"
+    else:
+        assert {access!r} == "rw"
+    pathlib.Path("/actor/own-write").write_text("own")
+    proxy = socket.create_connection(("127.0.0.1", 18080), timeout=2)
+    proxy.sendall(b"CONNECT 127.0.0.1:443 HTTP/1.1\\r\\n\\r\\n")
+    assert proxy.recv(4096).startswith(b"HTTP/1.1 403")
+    proxy.close()
+    code = "import pathlib; assert not pathlib.Path('/state').exists(); assert pathlib.Path('/actor/secret').read_text()==" + repr({actor!r})
+    if {access!r} == "ro":
+        code += "; pathlib.Path('/work/nested-write').write_text('must-fail')"
+        nested = subprocess.run(["/opt/chudware/bin/chudware-actor-sandbox", {actor!r}, "rw", "--", "/usr/bin/python3", "-I", "-S", "-c", code], capture_output=True)
+        assert nested.returncode != 0 and b"Read-only file system" in nested.stderr
+    else:
+        subprocess.run(["/opt/chudware/bin/chudware-actor-sandbox", {actor!r}, "rw", "--", "/usr/bin/python3", "-I", "-S", "-c", code], check=True)
+else:
+    assert os.environ["HTTPS_PROXY"] == "http://127.0.0.1:18080"
+    assert os.environ["NO_PROXY"] == os.environ["no_proxy"] == "127.0.0.1,localhost,::1"
+    inherited = socket.socket(fileno=os.dup(3))
+    assert inherited.family == socket.AF_UNIX and inherited.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+    inherited.close()
+    subprocess.run(["/opt/chudware/bin/chudware-actor-sandbox", {actor!r}, {access!r}, "--", "/opt/chudware/bin/chudware-hostd", "actor"], check=True)
+print("escape-probe-passed", flush=True)
+'''
+    (payload / "bin/chudware-hostd").write_text(probe)
+    (payload / "bin/chudware-hostd").chmod(0o755)
+    def reject():
+        try:
+            connection, _ = broker_socket.accept()
+        except OSError:
+            return
+        with connection:
+            connection.recv(8192)
+            connection.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+    broker_thread = threading.Thread(target=reject)
+    broker_thread.start()
+    wrapper = "import os,sys;os.dup2(int(sys.argv[1]),3,inheritable=True);os.environ['LISTEN_PID']=str(os.getpid());os.execv(sys.argv[2],[sys.argv[2],sys.argv[3]])"
+    try:
+        result = subprocess.run([sys.executable, "-I", "-S", "-c", wrapper, str(listener.fileno()),
+            str(payload / "bin/chudware-cell-launch"), cell_id], pass_fds=(listener.fileno(),),
+            env={**os.environ, "CHUDWARE_CELL_CONFIG": str(config), "LISTEN_FDS": "1", "OPERATOR_ENV_SENTINEL": "must-not-leak"},
+            capture_output=True, text=True, timeout=20)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.count("escape-probe-passed") == 2
+        assert (cell / "state/actors" / actor / "own-write").read_text() == "own"
+        assert (work / "written").exists() == (access == "rw")
+    finally:
+        for sock in (broker_socket, listener, other_socket, host_tcp):
+            sock.close()
+        broker_thread.join(timeout=6)

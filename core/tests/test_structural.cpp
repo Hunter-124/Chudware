@@ -147,7 +147,7 @@ TEST_CASE("lumber section lookup") {
 // solver — hand-calc validations (mirrors the oracle's textbook checks)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("axial post 1 kN (DoD case)") {
+TEST_CASE("axial post 1 kN (acceptance case)") {
     const json out = rpc("struct_analyze", {{"doc_path", fixture_path("post_axial.json")}});
     const json* r = row_for(out["results"], "post1");
     REQUIRE(r != nullptr);
@@ -365,7 +365,7 @@ TEST_CASE("multi-combo run (list param)") {
 // D/C checks (mirrors test_checks.py + the oracle check rows)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("check_member steel LRFD hand-calc (W8x31 A992 DoD case)") {
+TEST_CASE("check_member steel LRFD hand-calc (W8x31 A992 acceptance case)") {
     const auto section = get_aisc_section("W8X31");
     REQUIRE(section.has_value());
     // φMy = 0.90 × Sx × 344.7; demand at 80% → dc_bending ≈ 0.800.
@@ -508,7 +508,7 @@ TEST_CASE("concrete footing takeoff uses plan area times depth") {
 TEST_CASE("error envelopes") {
     json result;
     std::string err;
-    // Unknown method falls through (integrator routes to the next layer).
+    // Unknown method falls through (the dispatcher routes to the next layer).
     CHECK(!chudware::structural::call("not_a_struct_method", json::object(), result, err));
     // Bad schema.
     result = rpc("struct_analyze", {{"doc", json::object({{"schema", "nope"}})}});

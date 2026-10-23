@@ -190,7 +190,7 @@ Convergence note: tet10 (2nd-order) elements used; re-run with finer mesh
 
 ---
 
-### `describe_assembly` (assemblies / multi-body parts) — T-F8
+### `describe_assembly` (assemblies / multi-body parts)
 
 Data sources (in call order):
 
@@ -228,7 +228,7 @@ FIT REPORT: <summary>
 (Source: asm_world_bodies, eval_interference, doc_solve_mates — numbers narrated, never recomputed)
 ```
 
-### `describe_board` (ECAD schematic / PCB) — T-F8
+### `describe_board` (ECAD schematic / PCB)
 
 Promotes `ecad_status` into the GSL narration layer. Reads directly from the ECAD Python
 engine modules — no extra RPC round-trip.
@@ -272,10 +272,10 @@ Caveats:
 (Source: engine.ecad.netlist, engine.ecad.erc — numbers narrated, never recomputed)
 ```
 
-### `describe_project` (DAG run) — T-F8
+### `describe_project` (DAG run)
 
 Narrates a caller-supplied DAG run dict; no engine RPC. The run dict is passed in by the
-caller (WS-A driver or dag_status()) — this tool is a formatter, not a reader.
+caller (DAG driver or dag_status()) — this tool is a formatter, not a reader.
 
 Data sources: `run` parameter dict matching `contracts/dag_schema.md`.
 

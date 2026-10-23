@@ -1,4 +1,4 @@
-"""CAD render + close-up inspection MCP tools (T-RF8 split of cad_tools.py): render_part, contact_sheet, render_views, inspect_part, look_around, inspect_feature."""
+"""CAD render + close-up inspection MCP tools (split out of cad_tools.py): render_part, contact_sheet, render_views, inspect_part, look_around, inspect_feature."""
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
@@ -1059,7 +1059,7 @@ def _load_resultant(load_specs: list, groups: list) -> tuple:
 
 
 def register_cad_render_tools(mcp: FastMCP) -> None:
-    """CAD render + close-up inspection MCP tools (T-RF8 split of cad_tools.py): render_part, contact_sheet, render_views, inspect_part, look_around, inspect_feature."""
+    """CAD render + close-up inspection MCP tools (split out of cad_tools.py): render_part, contact_sheet, render_views, inspect_part, look_around, inspect_feature."""
 
 
     @mcp.tool()

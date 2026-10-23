@@ -1,7 +1,7 @@
 """Model tier profiles — loader, budget enforcer, and provider tier detection.
 
 Contract: contracts/advisor.md §8 (tier budgets).
-Spec: docs/ADVISOR_ARCHITECTURE.md §2.9.
+Spec: docs/design/ADVISOR_ARCHITECTURE.md §2.9.
 
 What this module provides
 -------------------------
@@ -258,7 +258,7 @@ def load_local_models(*, path: Path | None = None) -> dict:
     Keys: ``gbnf_worker`` / ``fanout`` (bundled model ids) and
     ``parallel_slots`` (recommended llama-server ``--parallel``). Returns ``{}``
     when the block is absent (older tiers.yaml). Shipped defaults only —
-    routing.yaml role->model bindings and T-W28 user overrides always win.
+    routing.yaml role->model bindings and user overrides always win.
     """
     p = path or _TIERS_PATH
     data = yaml.safe_load(p.read_text())
@@ -377,7 +377,7 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     """Resolve the :class:`Provider` a *tier* should run on.
 
     This is the SINGLE tier->provider resolution seam shared by the DAG node
-    runner (``services.dag.node_runner``) and the gym bench (T-DP19's
+    runner (``services.dag.node_runner``) and the gym bench (its
     ``_provider_for_tier``) — both used to carry their own copy of this logic,
     which is exactly how the node_runner half of the bug went unfixed: the
     gym worked around it locally for gym cells only, while every OTHER caller
@@ -609,7 +609,7 @@ def grammar_for_tier(
     """Return the GBNF grammar string for the handoff schema, or ``None``.
 
     Only produces a grammar for ``structured_output: gbnf`` tiers (local-24k,
-    local-48k).  The grammar is built by ``roles.schema_to_gbnf`` (T-W7 emitter)
+    local-48k).  The grammar is built by ``roles.schema_to_gbnf``
     and passed to the provider as ``grammar=``.
 
     Import is deferred to avoid a circular import (roles → tiers → roles).

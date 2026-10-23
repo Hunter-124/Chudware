@@ -1,4 +1,4 @@
-"""services.plm — the PLM vault engine (Pillar 19, Workstream R, T-R2).
+"""services.plm — the PLM vault engine.
 
 Implements the frozen ``contracts/plm.md`` (``aicad.plm/1``): a hidden,
 git-backed, snapshot-based version-control vault at ``.aicadvault/`` per project.
@@ -11,7 +11,7 @@ Public API
 * :func:`services.plm.gitbind.open_binding` — the git binding (dulwich primary,
   subprocess-git optional accelerator; contract §7 OSS survey verdict).
 * :class:`services.plm.client.PLMVaultClient` — the in-process seam that
-  ``services/agent/plm_bridge.py`` (T-W18) imports (contract §7.1).
+  ``services/agent/plm_bridge.py`` imports (contract §7.1).
 
 The ``plm_*`` MCP tools live in ``services/mcp/plm_tools.py``.
 

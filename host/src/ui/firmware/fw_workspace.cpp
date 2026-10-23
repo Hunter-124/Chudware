@@ -1,11 +1,11 @@
-// Firmware workspace — unified Arduino-style embedded IDE view (T-FIN5 restructure).
+// Firmware workspace — unified Arduino-style embedded IDE view.
 //
 // Layout (full central band, same host window pattern as PLM/RevEng):
 //   target bar : Board/MCU, Toolchain and Port + Build/Flash/Debug/Monitor; rows wrap to the
 //                available central-band width and the bar grows to keep every action reachable.
 //   left  rail : project/board tree (fw_projects, ASYNC) + New Project + selected project's
 //                sources | Pinmap (pins observed in the last emulation trace) | Backend doctor
-//                (fw_status, T-FIN4) — honest gating: missing tools show a guidance banner
+//                (fw_status) — honest gating: missing tools show a guidance banner
 //                instead of a dead button.
 //   center     : tabs — Editor (read-only source preview) | Debug (fw_debug_gdb_* console:
 //                reset/halt/step, breakpoints, memory view) | Emulate (fw_sim_run scenario
@@ -69,7 +69,7 @@ struct FwProject {
 };
 
 struct FwState {
-    // ---- backend doctor (fw_status, T-FIN4) ----
+    // ---- backend doctor (fw_status) ----
     bool statusPending = false, statusLoaded = false;
     double lastStatusT = -1e9;
     bool canBuild = false, canEmulate = false, canFlash = false;
@@ -543,7 +543,7 @@ static void applySimResult(FwState& s, const nlohmann::json& j) {
 }
 
 // ---- tab disclosure probe ----------------------------------------------------
-// T-FIN24: the tab discloses when a firmware project EXISTS. fw_projects is a
+// The tab discloses when a firmware project EXISTS. fw_projects is a
 // Python-worker-only RPC (on Linux it dies with "worker not started" whenever the
 // GUI's worker pipe isn't up — slow boot, missing runtime, or the AsyncRpc dispatch
 // thread jammed behind startup calls), so an RPC-only probe hid the tab until the
@@ -1914,7 +1914,7 @@ void drawFirmwareWorkspace(AppState& st) { firmware::drawFirmwareWorkspaceBody(s
 bool firmwareTabVisible(AppState& st) {
     // Always offered once active (never trap the user out of the workspace they're in).
     if (st.activeWorkspace == AppState::Workspace::Firmware) return true;
-    // ECAD in play → firmware is the natural next step (T-FIN24 disclosure rule).
+    // ECAD in play → firmware is the natural next step (disclosure rule).
     if (st.activeWorkspace == AppState::Workspace::Electronics) return true;
 #ifdef __EMSCRIPTEN__
     // No project disk on web: never probe for tab disclosure.

@@ -1479,7 +1479,7 @@ bool PropertyManager::activeWellWantsAxis() const {
     return false;
 }
 
-// T-BL37: returns true when the active selector well accepts a point datum.
+// Returns true when the active selector well accepts a point datum.
 bool PropertyManager::activeWellWantsPoint() const {
     for (const auto& f : fields_)
         if (f.def->kind == PMFieldKind::SelectorWell && f.wellActive &&
@@ -1617,7 +1617,7 @@ bool PropertyManager::routeDatumPlane(const std::string& datumId, const std::str
     return true;
 }
 
-// T-BL37: route a point-datum (world origin or user-created point datum) into the active
+// Route a point-datum (world origin or user-created point datum) into the active
 // selector well.  Uses the {kind:"datum",feature:fid} selector so resolve_point in
 // compile_document() picks it up.  "point.origin" is the canonical world-origin id.
 bool PropertyManager::routeDatumPoint(const std::string& fid, const std::string& label) {
@@ -1656,7 +1656,7 @@ std::string PropertyManager::activeWellKindHint() const {
         if (k.body)   parts.push_back("bodies");
         if (k.plane)  parts.push_back("planes");
         if (k.axis)   parts.push_back("axes");
-        if (k.point)  parts.push_back("points");  // T-BL37
+        if (k.point)  parts.push_back("points");
         std::string s;
         for (size_t i = 0; i < parts.size(); ++i) {
             if (i) s += (i + 1 == parts.size()) ? " or " : ", ";
@@ -2393,7 +2393,7 @@ bool PropertyManager::applyPreview(AppState& st) {
                       feature.value("refs", nlohmann::json::object())
                           .value("edges", nlohmann::json::array()).size()));
 
-    // T-PERF1: async applyOps so typing stays live during a multi-second rebuild. Serialize
+    // Async applyOps so typing stays live during a multi-second rebuild. Serialize
     // in-flight previews so the first add_feature can learn targetId_ before a second batch
     // races a second add. Latest-wins on the mirror is handled by mutationGen inside
     // applyOpsAsync; we just refuse to queue a second while one is open.
@@ -2437,7 +2437,7 @@ bool PropertyManager::applyPreview(AppState& st) {
             firstPreviewDone_ = true;
 
             if (!resp.aicm_path.empty())
-                st.loadDocMeshAsync(resp.aicm_path);  // T-PERF3: parse off GL thread
+                st.loadDocMeshAsync(resp.aicm_path);  // parse off GL thread
 
             previewWarning_.clear();
             if (!targetId_.empty() && resp.feature_status.is_array()) {
@@ -2742,7 +2742,7 @@ static void pushTextColor(const float c[4]) {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], c[3]));
 }
 
-// T-G14: drawBody() pushes ImGuiCol_Text = surf.textPrimary (adaptive, DARK over the light
+// drawBody() pushes ImGuiCol_Text = surf.textPrimary (adaptive, DARK over the light
 // viewport) as the default so on-panel VALUE text tracks the frosted-glass tint. But a tooltip is
 // a SEPARATE popup window whose PopupBg is the THEME-toned glassBg (dark in the dark theme), so it
 // must use THEME-toned text (pal.text = light in the dark theme), not the adaptive backdrop tone —
@@ -2788,7 +2788,7 @@ static bool pmCompactLabel(const char* label, const char* suffix,
     std::string full = std::string(label) + (suffix ? suffix : "");
     if (inlineRow) {
         ImGui::AlignTextToFramePadding();
-        // T-G14: the field column starts at SameLine(labelW). If the label text is WIDER than the
+        // The field column starts at SameLine(labelW). If the label text is WIDER than the
         // column (e.g. "Tangent propagation"), the next widget lands ON TOP of the tail of the text
         // (the PM-tool-menu overlap). Truncate the drawn label to the column budget with an
         // ellipsis (full text stays in the hover tooltip, per this row's stated two-column intent)
@@ -2842,7 +2842,7 @@ static bool pmGroupDefaultOpen(const char* label) {
 
 // NOT a ui::kit::sectionHeader in disguise: this is the PM group's DISCLOSURE control — an
 // ImGui::CollapsingHeader whose open state it returns, with the app's shared glass row pill behind
-// it and the adaptive-surface ink T-G14 requires over the live viewport. The kit's sectionHeader is
+// it and the adaptive-surface ink required over the live viewport. The kit's sectionHeader is
 // a static caption and its collapsible primitive (cardBegin/cardEnd) is a paired container, which
 // this call site cannot be: the group card that follows is opened here and closed by the NEXT
 // group's header. Nothing below duplicates a kit painter.
@@ -2886,7 +2886,7 @@ static bool pmSectionHeader(const char* label, const Palette& pal) {  // gui-lin
     return open;
 }
 
-// T-G19: OK / Cancel command buttons, relocated ABOVE the PM into the left-pane top row (between
+// OK / Cancel command buttons, relocated ABOVE the PM into the left-pane top row (between
 // the Configurations tab and the collapse chevron). Rendered by layout.cpp from that
 // row while a form is active. Wider than the old 26dp squares, with regenerated ok_check / cancel_x
 // glyphs. The cluster is right-aligned to END at `rightX`, vertically centered on `centerY`. Clicking
@@ -3045,7 +3045,7 @@ void PropertyManager::draw(AppState& st) {
         ImGui::SetNextWindowPos(ImVec2(80.0f * ui::uiScale, 80.0f * ui::uiScale),
                                 ImGuiCond_Appearing);
         // Frosted-glass fill so the floating PropertyManager fallback joins the app-wide glass
-        // family (the docked FeatureManager keeps its solid panel chrome). T-G14: use the ADAPTIVE
+        // family (the docked FeatureManager keeps its solid panel chrome). Use the ADAPTIVE
         // tint for the intended window rect (NOT the theme-static pal.glassBg, which is dark in the
         // dark theme and gave black-on-black over the light viewport). drawBody's own pmSurf()
         // samples the same backdrop for text, so fill + text stay contrasting. Same panelId as the
@@ -3163,7 +3163,7 @@ void PropertyManager::drawBody(AppState& st) {
         ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.26f));
     ImGui::PushStyleColor(ImGuiCol_FrameBgActive,
         ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.30f));
-    // T-G14: value/default text must also track the live glass tint. Field VALUE widgets
+    // value/default text must also track the live glass tint. Field VALUE widgets
     // (SliderFloat/DragFloat/InputText "##dim", Int, Text) render with the DEFAULT ImGuiCol_Text,
     // which is the theme-static pal.text (light in dark theme). Over the light viewport the group
     // card + frame fills are the adaptive LIGHT tint, so theme-static light value text washed out
@@ -3256,7 +3256,7 @@ void PropertyManager::drawBody(AppState& st) {
         ImGui::TextUnformatted(title_.c_str());
         ImGui::PopStyleColor();
 
-        // T-G19: OK / Cancel buttons no longer live in this in-PM header strip. They were
+        // OK / Cancel buttons no longer live in this in-PM header strip. They were
         // relocated ABOVE the PM — into the left-pane top row, between the
         // Configurations tab and the collapse chevron — and are rendered by drawChromeButtons(),
         // which layout.cpp calls from that row while a form is active. The keyboard Enter/Esc commit
@@ -3381,7 +3381,7 @@ void PropertyManager::drawBody(AppState& st) {
         win->ContentRegionRect.Max.x = backupRegionMaxX;
         // PM group cards adopt the ADAPTIVE glass tint (surf.tint) — NOT the theme-static
         // pal.glassBg — so the card fill tracks the SAME live-backdrop surface the labels and
-        // values read against (surf.textPrimary/textSecondary). T-G14: pal.glassBg is dark in the
+        // values read against (surf.textPrimary/textSecondary). pal.glassBg is dark in the
         // dark theme, which over the light viewport gave dark card + dark adaptive label text
         // (black-on-black), and light-on-light when the tone flipped. surf.tint contrasts
         // surf.text* by construction in both themes and both regimes.

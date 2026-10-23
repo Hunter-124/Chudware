@@ -1,6 +1,6 @@
 """Mega-24 fixes — live thrash after S23/T23 (mega-23 a1).
 
-Grounded in mega-23 a1 (reports/runs/mega-23/) vs mega-22 a2 good:
+Grounded in mega-23 a1 vs mega-22 a2 good:
 
   Primary: mid-run xai spending-limit + openrouter 402 → both providers marked
            unavailable → BUILD nodes fell to ollama → no_code / max_iters thrash.

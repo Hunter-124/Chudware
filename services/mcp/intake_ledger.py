@@ -10,7 +10,7 @@ Because the store travels WITH the document (not with a cache path keyed on the
 engine's per-process ``doc_id`` — ``core/doc/session.cpp new_doc_id()`` mints a
 fresh ``doc-cpp%08llx`` on every open), a dimension confirmed in one session is
 never re-asked after the doc is saved and reopened, no matter what id the new
-process assigned it.  That is the T-BL25 cross-session no-re-ask guarantee.
+process assigned it.  That is the cross-session no-re-ask guarantee.
 
 This module deliberately does NOT import FastMCP: it must stay importable from
 ``services/agent/interaction.py``'s lazy default-ledger path without dragging

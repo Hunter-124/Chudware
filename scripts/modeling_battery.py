@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Modeling-op combination battery (T-BL19) — engine-level AI testing of feature
+"""Modeling-op combination battery — engine-level AI testing of feature
 tools and sequences.
 
-Erik can't hand-test every modeling feature and combination; this battery carries that
+Nobody can hand-test every modeling feature and combination; this battery carries that
 coverage headlessly. It drives the real C++ feature engine (libchudware.so) through the
 core_bridge doc RPCs (doc_new + doc_apply_ops), exercising every registered modeling op
 once (single-op pass) plus a curated pairwise/sequence matrix and a few realistic
@@ -14,11 +14,11 @@ recipes, and asserts on real geometry results:
   * body count        — split/pattern/copy add bodies; fuse removes them
   * feature overlap   — check_feature_overlap finds no bad boss/cut pairs (opt-in)
 
-NO-ALL-SKIP CONTRACT (fleet-recovery-patterns memory: the all-skip trap): a run where
+NO-ALL-SKIP CONTRACT (the all-skip trap): a run where
 every case skips (missing .so / missing dep) is a FAILURE, not a pass. `main()` exits
 non-zero if the engine is unavailable or zero cases execute.
 
-Report conventions mirror the T-BL01 V&V harness (`scripts/vv_benchmark.py`):
+Report conventions mirror the V&V harness (`scripts/vv_benchmark.py`):
 JSON results + Markdown report under `reports/modeling/`.
 
 Run:
@@ -230,7 +230,7 @@ add("boolean_fuse_touching_face", "structural", "single", ("boolean",),
                        "at": [10, 0, 0], "merge": False})],
     [feat("boolean", "Fuse", {"op": "fuse", "a": "f1", "b": "f2"})],
     expect_vol="==", expect_bodies=1,
-    note="the T-BL30 disjoint-fuse invariant's boundary: two boxes sharing an exact "
+    note="the disjoint-fuse invariant's boundary: two boxes sharing an exact "
          "coincident face (no overlap, no gap) is NOT disjoint — must weld into ONE "
          "solid (full combined volume), not be rejected")
 # intent
@@ -460,7 +460,7 @@ add("nc_disjoint_fuse", "negative", "negative", ("boolean",),
                        "at": [100, 0, 0], "merge": False})],
     [feat("boolean", "F", {"op": "fuse", "a": "f1", "b": "f2"})],
     expect_rebuild=False, expect_manifold=None,
-    note="documented contract: disjoint fuse must fail (issue #8, fixed by T-BL30)")
+    note="documented contract: disjoint fuse must fail (issue #8)")
 add("nc_disjoint_cut", "negative", "negative", ("boolean",),
     [feat("box", "A", {"length": dim(100), "width": dim(10), "height": dim(10)}),
      feat("box", "B", {"length": dim(20), "width": dim(20), "height": dim(20),
@@ -468,7 +468,7 @@ add("nc_disjoint_cut", "negative", "negative", ("boolean",),
     [feat("boolean", "F", {"op": "cut", "a": "f1", "b": "f2"})],
     expect_rebuild=False, expect_manifold=None,
     note="a full-cross-section tool slicing a body into two disconnected remnants must fail "
-         "(same disjoint-result invariant as nc_disjoint_fuse, T-BL30)")
+         "(same disjoint-result invariant as nc_disjoint_fuse)")
 
 
 # --------------------------------------------------------------------------- engine glue
@@ -691,7 +691,7 @@ def write_reports(results: list[dict], cov: dict, so_path: str, elapsed: float):
         "# Modeling-Op Combination Battery — Chudware Feature Engine",
         "",
         f"**Generated:** {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}  ",
-        "**Script:** `scripts/modeling_battery.py` (T-BL19)  ",
+        "**Script:** `scripts/modeling_battery.py`  ",
         f"**Engine:** `{so_path}`  ",
         "**Method:** each case drives the real C++ feature engine via core_bridge "
         "(doc_new + doc_apply_ops) and asserts on live geometry (rebuild status, "
@@ -730,8 +730,8 @@ def write_reports(results: list[dict], cov: dict, so_path: str, elapsed: float):
                      f"{r['verdict']} | {detail[:90]} |")
     lines += ["", "## No-all-skip contract", "",
               "This battery FAILS (non-zero exit) if the engine is unavailable or zero "
-              "cases execute — an all-skip run is a failure, not a pass "
-              "(fleet-recovery-patterns memory). Negative-control cases prove each check "
+              "cases execute — an all-skip run is a failure, not a pass. "
+              "Negative-control cases prove each check "
               "can actually fail.", ""]
     (REPORT_DIR / "modeling_report.md").write_text("\n".join(lines))
 

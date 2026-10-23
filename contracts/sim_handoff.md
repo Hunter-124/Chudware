@@ -1,6 +1,6 @@
 # Contract: `aicad.simhandoff/1` — cross-sim handoff & verify envelopes
 
-> **Frozen seam.** Append-only; changes require integrator sign-off + a version bump
+> **Frozen seam.** Append-only; changes require maintainer sign-off + a version bump
 > (see `contracts/README.md`). The executable form is `services/mcp/simhandoff.py`
 > (builders + structural validator). First conforming producer/consumer pair:
 > `piping_cfd_handoff` / `piping_verify_cfd` (`services/mcp/piping_tools.py`).
@@ -30,7 +30,7 @@ Known couplings this shape must carry (SIM_FW_FINALIZE_PLAN_2026-07-10 §3 — p
 | `motion_to_fea` | motion study joint reactions → static FEA | one condition per reaction force/moment; optional `case` labels group conditions into per-timestep/pose load cases |
 | `hydraulic_to_piping` | hydraulic circuit → piping network solve | doc-to-doc: `geometry` may be empty; a `geometry_ref` of `kind:"doc"` carries the generated piping document |
 | `thermal_to_cfd` | thermal FEA surface temps → conjugate CFD | `temperature`/`heat_flux` conditions on named faces; expectations compare temperatures |
-| `hydraulic_to_fea` | cylinder/actuator mount loads → static FEA | one force condition per case; `case` labels (`extend_max_pressure` / `retract_max_pressure`) group per-stroke load cases (shipped by `hydraulic_fea_handoff`, T-FIN22) |
+| `hydraulic_to_fea` | cylinder/actuator mount loads → static FEA | one force condition per case; `case` labels (`extend_max_pressure` / `retract_max_pressure`) group per-stroke load cases (shipped by `hydraulic_fea_handoff`) |
 
 Non-goals: this is a *data* contract, not an orchestration contract (DAG scheduling is
 `contracts/dag_schema.md`); it does not prescribe solver internals or mesh formats.
@@ -252,6 +252,5 @@ any tool module (and tests) can use it engine-less:
 | `validate_envelope(env) -> list[str]` | structural validation, both kinds |
 | `attach(result, env) -> result` | validate + embed under `result["simhandoff"]` (raises on invalid — a producer bug, never user input) |
 
-Downstream tasks T-FIN16 (ECAD→thermal), T-FIN19 (thermal→CFD), T-FIN20 (motion→FEA),
-T-FIN22 (hydraulic couplings) build and validate their envelopes exclusively through
-these helpers.
+Producers of the ECAD→thermal, thermal→CFD, motion→FEA, and hydraulic couplings build and
+validate their envelopes exclusively through these helpers.

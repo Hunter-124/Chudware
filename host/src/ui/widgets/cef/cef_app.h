@@ -27,7 +27,7 @@ int execute_subprocess(int argc, char** argv);
 // the argc/argv captured by stash_args (call that first). Returns false (and
 // init_failed()==true) if CEF failed to start; CefWebView::available() then
 // reports false so the sign-in wizard falls back to desktop login. Safe to call
-// once; also the T-PERF10 lazy-init entry — first CefWebView::open() calls this
+// once; also the lazy-init entry — first CefWebView::open() calls this
 // if main() did not (default). Force early init with CHUDWARE_CEF_EARLY=1.
 bool initialize();
 

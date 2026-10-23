@@ -578,7 +578,7 @@ bool AsmPanels::insertComponent(
 
     nlohmann::json op = {{"op", "asm_insert_component"}, {"source", {{"path", path}}}};
     if (!transform.is_null()) op["transform"] = transform;
-    // T-PERF1: async so large component inserts don't freeze the GL thread. aicmOut is filled
+    // Async so large component inserts don't freeze the GL thread. aicmOut is filled
     // only on the sync path for callers that need it immediately; the mesh reloads in the
     // drain callback either way. Capture targetDoc so a superseded completion can't load mesh
     // into a different document.
@@ -605,7 +605,7 @@ bool AsmPanels::insertComponent(
                 return;
             }
             if (st.docMirror.docId() == targetDoc && !r.aicm_path.empty())
-                st.loadDocMeshAsync(r.aicm_path);  // T-PERF3
+                st.loadDocMeshAsync(r.aicm_path);
             if (onComplete) onComplete(true, {});
         });
     return true;
@@ -1392,7 +1392,7 @@ void AsmPanels::kickExplodeAsync(AppState& st) {
 
 bool AsmPanels::setExplode(AppState& st, bool active, float factor) {
     if (!st.docMirror.hasDoc()) return false;
-    // T-PERF2: coalesce rapid slider samples to latest factor; never block GL.
+    // Coalesce rapid slider samples to latest factor; never block GL.
     explodePendingActive_ = active;
     explodePendingFactor_ = factor;
     explodePending_ = true;

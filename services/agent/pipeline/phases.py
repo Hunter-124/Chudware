@@ -36,8 +36,8 @@ class Phase(str, Enum):
     INTAKE = "intake"
     CLARIFY = "clarify"
     SPECIFY = "specify"
-    # T-DP1: the six-stage design-pipeline refinement of the SPECIFY→PLAN span
-    # (docs/AGENT_DESIGN_PIPELINE.md §2, contract design_pipeline.md §6). These four
+    # The six-stage design-pipeline refinement of the SPECIFY→PLAN span
+    # (docs/design/AGENT_DESIGN_PIPELINE.md §2, contract design_pipeline.md §6). These four
     # phases are feature-flagged (PipelineFlags.design_pipeline, default OFF) and are
     # skipped by next_phase when off — the existing pipeline is unchanged. Stage 0
     # (intent) = INTAKE/SPECIFY; Stage 5 (execution) = the existing BUILD phase.
@@ -59,7 +59,7 @@ PHASE_ORDER: tuple[Phase, ...] = (
     Phase.INTAKE,
     Phase.CLARIFY,
     Phase.SPECIFY,
-    # T-DP1 design-pipeline stages — skipped unless the design_pipeline flag is on.
+    # Design-pipeline stages — skipped unless the design_pipeline flag is on.
     Phase.DECOMPOSE,
     Phase.GEOMETRY,
     Phase.LINKAGE,
@@ -72,7 +72,7 @@ PHASE_ORDER: tuple[Phase, ...] = (
     Phase.DELIVER,
 )
 
-# T-DP1: the design-pipeline phases, in order — the set next_phase skips when the
+# The design-pipeline phases, in order — the set next_phase skips when the
 # design_pipeline flag is off.
 _DESIGN_PIPELINE_PHASES: frozenset[Phase] = frozenset({
     Phase.DECOMPOSE, Phase.GEOMETRY, Phase.LINKAGE, Phase.BUILDPATH,
@@ -93,7 +93,7 @@ class GateResult:
     ``reasons``  — human-readable reasons the gate failed (empty when passed).
     ``overseer`` — True if this gate fires an overseer audit trigger (doc §2);
                    the caller (or run_mission) is responsible for the actual
-                   audit call, feature-flagged on T-W13.
+                   audit call, feature-flagged on ``CHUDWARE_OVERSEER``.
     """
     passed: bool
     gate: str
@@ -120,23 +120,23 @@ class TransitionResult:
 class PipelineFlags:
     """Feature flags for the 1.3 org layer.
 
-    T-W22 landed: org_layer default is now ON (Phase 2.5 ORGANIZE is live).
-    build_council and overseer remain env-gated (T-W23 / T-W13 not merged).
+    org_layer defaults ON (Phase 2.5 ORGANIZE is live).
+    build_council and overseer remain env-gated (default OFF).
 
     Environment overrides (always respected):
       * ``CHUDWARE_ORG_LAYER=0``      → disable Phase 2.5 ORGANIZE (test/compat).
       * ``CHUDWARE_ORG_LAYER=1``      → explicit enable (no-op; already on by default).
       * ``CHUDWARE_BUILD_COUNCIL=1``  → require build-strategy council synthesis at the
         PLAN exit gate (contract §19).
-      * ``CHUDWARE_OVERSEER=1``       → overseer audit triggers are live (T-W13).
+      * ``CHUDWARE_OVERSEER=1``       → overseer audit triggers are live.
       * ``CHUDWARE_DESIGN_PIPELINE=1`` → run the six-stage design-pipeline refinement
-        (T-DP1: DECOMPOSE→GEOMETRY→LINKAGE→BUILDPATH between SPECIFY and PLAN).
+        (DECOMPOSE→GEOMETRY→LINKAGE→BUILDPATH between SPECIFY and PLAN).
         Default OFF — the existing pipeline is unchanged when off (contract §6).
     """
-    org_layer: bool = True   # T-W22 landed — ORGANIZE phase is live
+    org_layer: bool = True   # ORGANIZE phase is live by default
     build_council: bool = False
     overseer: bool = False
-    design_pipeline: bool = False   # T-DP1 — six-stage refinement, default OFF
+    design_pipeline: bool = False   # six-stage refinement, default OFF
 
     @classmethod
     def from_env(cls) -> "PipelineFlags":
@@ -146,10 +146,10 @@ class PipelineFlags:
                 return default
             return val in ("1", "true", "True")
         return cls(
-            org_layer=_on("CHUDWARE_ORG_LAYER", True),   # default ON (T-W22)
+            org_layer=_on("CHUDWARE_ORG_LAYER", True),   # default ON
             build_council=_on("CHUDWARE_BUILD_COUNCIL", False),
             overseer=_on("CHUDWARE_OVERSEER", False),
-            design_pipeline=_on("CHUDWARE_DESIGN_PIPELINE", False),  # default OFF (T-DP1)
+            design_pipeline=_on("CHUDWARE_DESIGN_PIPELINE", False),  # default OFF
         )
 
 
@@ -322,7 +322,7 @@ class PhaseMachine:
         for cand in PHASE_ORDER[idx + 1:]:
             if cand is Phase.CLARIFY and not context.get("has_blocking_ambiguity"):
                 continue
-            # T-DP1: the four design-pipeline phases are skipped unless the flag is on.
+            # The four design-pipeline phases are skipped unless the flag is on.
             # With the flag off, next_phase(SPECIFY) advances straight to ORGANIZE/PLAN
             # exactly as before — the existing pipeline is byte-for-byte unchanged.
             if cand in _DESIGN_PIPELINE_PHASES and not self.flags.design_pipeline:
@@ -418,11 +418,11 @@ def _gate_decompose(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
 
     Reads the ledger: passes when ≥1 ``feature`` event exists (``ctx['features']``,
     a pure read of ``state.features``). Semantic coverage (every requirement mapped)
-    is a T-DP2 checker that layers on top — this gate only requires presence.
+    is a coverage checker that layers on top — this gate only requires presence.
 
     When the caller supplies coverage findings (``ctx['untraced_features']`` or
     ``ctx['orphan_requirements']``), those are surfaced as additional gate reasons
-    without changing the gate name (``"features_present"``). This is the T-DP2
+    without changing the gate name (``"features_present"``). This is the
     "extend gate context, not gate signature" contract (design_pipeline.md §5).
     """
     reasons: list[str] = []
@@ -434,10 +434,10 @@ def _gate_decompose(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
         # No point surfacing coverage findings when there are no features.
         return GateResult(False, "features_present", reasons)
 
-    # T-DP2: optional coverage findings — present only when the caller ran
+    # Optional coverage findings — present only when the caller ran
     # ``functional_decomposition.gate_context_from_ledger`` (or supplied them
     # manually). The gate name stays "features_present" in all cases so the
-    # existing DP1 tests continue to pass unchanged.
+    # existing presence-only tests continue to pass unchanged.
     untraced = ctx.get("untraced_features") or []
     orphaned = ctx.get("orphan_requirements") or []
     if untraced:
@@ -482,12 +482,12 @@ def _gate_linkage(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
     """Stage 3 exit — ``linkage_present`` (contract §5).
 
     Reads the ledger: passes when ≥1 ``linkage`` event exists.  When the caller
-    supplies T-DP4 checker findings (``dangling_refs``, ``ref_cycles``,
+    supplies linkage checker findings (``dangling_refs``, ``ref_cycles``,
     ``datum_gaps``, ``interface_mismatches``) via
     ``linkage_integrity.gate_context_from_ledger``, those are surfaced as
     additional gate reasons without changing the gate name
     (``"linkage_present"``).  This is the "extend context, not gate signature"
-    rule (design_pipeline.md §5), mirroring ``_gate_decompose`` (T-DP2).
+    rule (design_pipeline.md §5), mirroring ``_gate_decompose``.
     """
     reasons: list[str] = []
     if not (ctx.get("linkages") or []):
@@ -497,7 +497,7 @@ def _gate_linkage(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
         )
         return GateResult(False, "linkage_present", reasons)
 
-    # T-DP4: optional checker findings — present only when the caller ran
+    # Optional checker findings — present only when the caller ran
     # ``linkage_integrity.gate_context_from_ledger`` (or supplied them manually).
     # Gate name stays "linkage_present" in all cases.
     dangling = ctx.get("dangling_refs") or []
@@ -575,7 +575,7 @@ def _gate_plan(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
     Uses the buildgraph validator (contract §13) result the caller supplies:
     ``build_graph_blockers`` is the list of blocker-severity findings (cycles are
     surfaced by the caller as a blocker string).  Council synthesis is required
-    only when the build-council flag is on (T-W23).
+    only when the build-council flag is on.
     """
     reasons: list[str] = []
     blockers = ctx.get("build_graph_blockers") or []
@@ -693,7 +693,7 @@ _GATES: dict[Phase, GateCheck] = {
     Phase.INTAKE: _gate_intake,
     Phase.CLARIFY: _gate_clarify,
     Phase.SPECIFY: _gate_specify,
-    # T-DP1 design-pipeline stage gates (contract design_pipeline.md §5)
+    # Design-pipeline stage gates (contract design_pipeline.md §5)
     Phase.DECOMPOSE: _gate_decompose,
     Phase.GEOMETRY: _gate_geometry,
     Phase.LINKAGE: _gate_linkage,

@@ -1,6 +1,6 @@
 """services.plm.cad_graph — deterministic CAD project graph (contracts/cad_graph.md v1).
 
-Graphify/Sourcegraph analogue over CAD projects: parts, features, sketches,
+Sourcegraph-style code-graph analogue over CAD projects: parts, features, sketches,
 bodies, mates, BOM lines, drawings, sim studies, boards, firmware.
 
 Nodes: ``{id, kind, label, path?, doc_id?, meta{}, origin}``
@@ -23,7 +23,7 @@ Walk policy
   shadow dir) are still walked — they are live design content.
 * Archive/stale dirs (``_archive_stale``, ``_archive``, ``archive``, ``.trash``
   by default; override via ``exclude_dirs`` / ``CHUDWARE_GRAPH_EXCLUDE_DIRS``) are
-  pruned from the walk so ME489-scale trees don't bloat the graph. Pass
+  pruned from the walk so large project trees don't bloat the graph. Pass
   ``include_archive=True`` to keep them (nodes then carry ``meta.archive``).
 
 Size guards
@@ -215,7 +215,7 @@ def build_graph(
         include_archive=include_archive, exclude_dirs=exclude_dirs)
 
     # Fast path: serve cache when fresher than every source mtime — avoids
-    # re-reading every .step+ container on ME489-scale trees. Skipped when
+    # re-reading every .step+ container on large project trees. Skipped when
     # open_docs are merged (those are ephemeral and not on disk).
     if (not force and root is not None
             and not (open_docs or {})):
@@ -1755,7 +1755,7 @@ def _collect_sources(
                     continue
                 pending.append((fp, rel, mtime))
         # …then read containers in parallel. zlib decompression releases the
-        # GIL, so threads give a real speedup on ME489-scale trees; map()
+        # GIL, so threads give a real speedup on large project trees; map()
         # preserves walk order so the source list stays deterministic.
         if pending:
             workers = min(8, (os.cpu_count() or 4), len(pending))
@@ -2081,7 +2081,7 @@ def _source_mtimes_fast(
 ) -> dict[str, float]:
     """Scan source container + file-node mtimes without reading zip contents.
 
-    Used by the cache fast-path so a warm ME489-scale tree can validate the
+    Used by the cache fast-path so a warm large project tree can validate the
     on-disk graph without re-parsing every .step+. File-node sources
     (contracts/cad_graph.md file-node addendum) share the ``file:<rel>`` key
     namespace — containers always end .step+/.ecad+, file nodes never do.
@@ -2134,7 +2134,7 @@ def _filter_matches(
     """True when cached filter policy matches this request.
 
     Caches written before the archive-exclusion addendum lack a ``filter``
-    block — treat those as a miss so ME489-scale trees rebuild without
+    block — treat those as a miss so large project trees rebuild without
     ``_archive_stale`` bloat rather than serving a stale 500MB+ payload.
     """
     filt = data.get("filter")

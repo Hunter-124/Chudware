@@ -1,7 +1,7 @@
 // Small-strain J2 (von Mises) plasticity gates — the material law that lets a
 // bearing edge REDISTRIBUTE.
 //
-// The defect these gates exist for is ME 490 O-28: a frictionless linear-elastic
+// The defect these gates exist for is a hinge-saddle contact study: a frictionless linear-elastic
 // contact funnelled 1446 N through 12 node pairs on a sharp saddle edge and reported
 // a mean bearing stress of 450 MPa against a 276 MPa yield. That is not a stress
 // state — a linear-elastic material cannot yield, so the load has nowhere to go and
@@ -182,7 +182,7 @@ double bar_mid_mean(const Mesh& m, const std::vector<double>& field, double leng
 // transversely INTO the side it rests on. The pin is placed eccentric by exactly the
 // clearance, so it TOUCHES at one line and the gap opens as c*(1 - cos(theta)) away
 // from it — quadratically, which is the geometry of a sharp bearing edge and the
-// shape of the ME 490 hinge saddle. The arc that carries load is therefore whatever
+// shape of the rover hinge saddle. The arc that carries load is therefore whatever
 // the pin's travel closes, and the whole question the plastic law answers is what
 // that arc does once the pressure on it exceeds the flow stress.
 struct PinBore {
@@ -347,7 +347,7 @@ TEST_CASE("plastic: a perfectly plastic bar at 1.2x its limit load is refused") 
 TEST_CASE("plastic: a yielding bearing edge grows its contact patch") {
     // 0.6 mm of radial clearance on a r 5 pin, so the seat opens quadratically away
     // from the touching line and the elastic patch is a narrow arc. 16 kN through it
-    // is 3.2x yield as an elastic mean pressure — the ME 490 hinge's own failure
+    // is 3.2x yield as an elastic mean pressure — the rover hinge's own failure
     // mode, at the same order of overstress (450 MPa on a 276 MPa yield).
     const double clearance = 0.6;
     const double F = 16000.0;

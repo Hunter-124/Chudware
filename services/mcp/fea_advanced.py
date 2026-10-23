@@ -12,7 +12,7 @@ Thermal and buckling studies use the built-in C++ solvers.
 
 CalculiX (``ccx``) is **GPL-2.0** → **subprocess-only, PATH-discovered, never
 linked or bundled** (contracts/licenses.md, same isolation posture as
-ngspice/Renode/QEMU; this generalises the T-BL20 ``bench_calculix`` seam from a
+ngspice/Renode/QEMU; this generalises the ``bench_calculix`` seam from a
 V&V-only cross-check into first-class MCP tools). When ``ccx`` is absent every
 CalculiX-backed tool degrades HONESTLY — ``{"ok": False, "skipped": True,
 "reason": ...}`` — and NEVER fabricates a result. The fatigue tool needs no
@@ -20,7 +20,7 @@ binary and always runs.
 
 The ``.inp`` generators here are CLEAN-ROOM: synthesized from our own geometry
 and loads in the Abaqus/CalculiX input syntax; no NAFEMS/ASME/CalculiX example
-text is reproduced (same fence as T-BL01/T-BL20).
+text is reproduced (same clean-room fence as the V&V benchmarks).
 
 Validation: see ``scripts/vv_benchmark.py`` FAMILY 10 (thermal 1-D bar, Euler
 buckling, Basquin fatigue) — each solver is hand-calc-checked against a cited
@@ -175,7 +175,7 @@ def run_ccx(inp_text: str, job: str = "job", timeout: float = 300.0,
             keep_dir: bool = False) -> dict:
     """Run a CalculiX job on a clean-room ``.inp`` string in an isolated temp dir.
 
-    Reusable seam (T-BL17 frequency-response may import this rather than build a
+    Reusable seam (frequency-response may import this rather than build a
     rival ccx runner). Returns
     ``{ok, returncode, workdir, dat_path, frd_path, sta_path, stdout, stderr}``
     or ``{ok: False, skipped: True, ...}`` when ccx is absent. The caller parses

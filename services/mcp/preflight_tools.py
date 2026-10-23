@@ -1,4 +1,4 @@
-"""MCP tools for preflight dry-run validation (aicad.preflight/1, T-W12).
+"""MCP tools for preflight dry-run validation (aicad.preflight/1).
 
 Registered onto the FastMCP instance by ``register_preflight_tools(mcp)``.
 

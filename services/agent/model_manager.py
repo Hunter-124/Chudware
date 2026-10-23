@@ -1,4 +1,4 @@
-"""Model manager for bundled llama.cpp GGUF integration — T-W26.
+"""Model manager for bundled llama.cpp GGUF integration.
 
 This module handles model registry, download (with resume), and path resolution
 for the two default GGUF models bundled with the Chudware agent service.
@@ -179,7 +179,7 @@ def _resolve_existing(entry: dict[str, Any]) -> Path | None:
 
     The bundled provisioner and some external tools drop the GGUF under a
     per-model subdirectory; this makes ``get_model_path`` find it either way
-    (T-W30 — the C1 proof run's qwen3-4b lives under ``models/qwen3-4b/``)."""
+    (the C1 proof run's qwen3-4b lives under ``models/qwen3-4b/``)."""
     flat = _model_dir() / entry["file"]
     if flat.exists():
         return flat
@@ -399,7 +399,7 @@ def structured_output_for(model_id: str, default: str = "gbnf") -> str:
     ``"prompted_json"`` — prompt for JSON and validate via
     ``roles.validate_handoff`` (retry on failure).
 
-    This is the ONE lookup the turn path uses to honour the T-W29 finding that
+    This is the ONE lookup the turn path uses to honour the benchmark finding that
     a tier's ``structured_output: gbnf`` setting must be downgraded per-model
     when the model's grammar path is broken (qwen3-4b). Unknown models fall back
     to *default* (the tier's own setting).
@@ -431,7 +431,7 @@ def capability_profile_for(model_id: str) -> str | None:
 def model_for_role_shape(shape: str) -> str | None:
     """Return the bundled model id shipped as the default for *role_shape*.
 
-    Shapes (T-W29 role x stage mapping): ``"gbnf_worker"`` (grammar-constrained
+    Shapes (role x stage mapping): ``"gbnf_worker"`` (grammar-constrained
     worker roles) -> gemma3-4b-qat; ``"fanout"`` (speed / parallel fan-out
     roles) -> qwen3-4b. Returns ``None`` for unknown shapes.
 

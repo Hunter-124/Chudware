@@ -1,13 +1,16 @@
-"""Behavioral admission tests plus an explicitly provisioned real-kernel smoke.
+"""Behavioral admission tests plus explicitly provisioned real-kernel smokes.
 
-The kernel tests NEVER mount a filesystem or gain privilege. They consume a
-reviewed root-owned disposable plan and the proof root provisioned for it with
-provision_cell_quota.py (CHUDWARE_TEST_QUOTA_PLAN, CHUDWARE_TEST_QUOTA_PROOF_ROOT).
-Pytest runs as the plan's service_uid. Missing explicit setup is an
-unavailable prerequisite, never a behavioral substitute for enforcement.
+The kernel tests NEVER mount a filesystem, invoke sudo, or gain privilege. They
+consume a reviewed root-owned disposable plan and the proof root provisioned for
+it with provision_cell_quota.py (CHUDWARE_TEST_QUOTA_PLAN,
+CHUDWARE_TEST_QUOTA_PROOF_ROOT). Admission tests run as the plan's service_uid;
+the provisioning refusal test runs the root tool, so it needs a separate
+real-root invocation. Missing explicit setup is an unavailable prerequisite,
+never a behavioral substitute for enforcement.
 """
 import copy
 import errno
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -16,6 +19,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -23,6 +27,7 @@ CELL = Path(__file__).resolve().parents[1] / "cell"
 sys.path.insert(0, str(CELL))
 import cell_runtime as runtime
 import storage_quota as quota
+from _cell_test_support import disposable_quota_plan, owner_roots
 
 
 def policy():
@@ -183,18 +188,7 @@ def test_unavailable_kernel_inspection_is_not_permission_fallback(code):
 
 @pytest.fixture
 def real_kernel_layout():
-    plan_path = os.environ.get("CHUDWARE_TEST_QUOTA_PLAN")
-    proof_root = os.environ.get("CHUDWARE_TEST_QUOTA_PROOF_ROOT")
-    if not plan_path and not proof_root:
-        pytest.skip("real kernel quota prerequisite unavailable: root must provision a disposable XFS/ext4 plan")
-    assert plan_path and proof_root, "both explicit real-kernel quota setup paths are required"
-    plan = quota.validate_policy(quota.read_authority(plan_path), quota.PLAN_SCHEMA)
-    assert plan.get("purpose") == "disposable-kernel-quota-smoke", "never exhaust real workspace storage"
-    assert os.getuid() == plan["service_uid"] != 0, "kernel smoke must run as the unprivileged cell service uid"
-    assert len(plan["owners"]) >= 2, "two independently charged owners required"
-    assert all(len(owner["groups"]) == 1 for owner in plan["owners"][:2]), "single scratch volume per owner required"
-    assert all(owner["groups"][0]["hard_bytes"] <= 1024 ** 3 for owner in plan["owners"][:2]), "bounded smoke budgets required"
-    return plan, proof_root
+    return disposable_quota_plan()
 
 
 def _create_write(fd, name, payload):
@@ -340,6 +334,65 @@ def test_real_kernel_proof_rejects_replaced_state_inode(real_kernel_layout):
     restored = quota.admit(quota.cell_id(key), workspace["path"], state["path"], proof_root)
     for fd in restored:
         os.close(fd)
+
+
+def test_real_kernel_helper_refuses_nonempty_uncharged_migration():
+    """The root quota tool never recursively charges an existing uncharged tree."""
+    plan, proof_root = disposable_quota_plan(root=True)
+    service_uid = plan["service_uid"]
+    _, workspace, _ = owner_roots(plan["owners"][0])
+    # Scratch beside the plan's first workspace: same filesystem, beneath no charged root.
+    parent = workspace.parent
+    assert parent.stat().st_dev == workspace.stat().st_dev, "scratch must share the disposable quota filesystem"
+    scratch = Path(tempfile.mkdtemp(prefix="qm-", dir=parent))
+    fresh_proof = None
+    descriptors = []
+    try:
+        # A fresh root-owned proof root holds no inventory, so only this request is judged.
+        fresh_proof = Path(tempfile.mkdtemp(prefix="qm-proof-", dir=proof_root))
+        key = "user:quota-migration-" + scratch.name
+        work = scratch / "work"
+        state = scratch / "cells" / quota.cell_id(key) / "state"
+        for path in (work, state):
+            path.mkdir(mode=0o700, parents=True)
+        for path in (scratch, work, scratch / "cells", state.parent, state):
+            os.chown(path, service_uid, -1)
+        roots = []
+        for kind, path in (("workspace", work), ("state", state)):
+            descriptors.append(quota.open_nofollow(str(path)))
+            info = path.stat()
+            roots.append({"workspace_key": key, "kind": kind, "path": str(path),
+                          "device": info.st_dev, "inode": info.st_ino})
+        before = [quota.inode_attributes(fd) for fd in descriptors]
+        assert before == [(0, False)] * 2, "scratch parent must not silently charge a foreign owner project"
+        project = 1 + max(group["project_id"] for owner in plan["owners"] for group in owner["groups"])
+        budget = 16 * 1024 * 1024
+        request = {"schema": quota.PLAN_SCHEMA, "service_uid": service_uid,
+                   "owners": [{"owner_key": key, "budget_bytes": budget, "budget_inodes": 1000,
+                               "groups": [{"project_id": project, "hard_bytes": budget,
+                                           "hard_inodes": 1000, "roots": roots}]}]}
+        spec = importlib.util.spec_from_file_location("provision_cell_quota", CELL.parent / "provision_cell_quota.py")
+        provisioner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(provisioner)
+        # Positive control: the same roots pass read-only inspection while empty,
+        # so the refusal below is the migration boundary, not absent capability.
+        report = provisioner.provision(request, str(fresh_proof))
+        assert report["mutated"] is False
+        assert report["projects"][0]["roots_requiring_inheritance"] == 2
+        marker = b"saved bytes must not be silently migrated"
+        _create_write(descriptors[0], "unprovisioned-save", marker)
+        os.chown("unprovisioned-save", service_uid, -1, dir_fd=descriptors[0])
+        with pytest.raises(quota.QuotaRefused, match="nonempty unsafe"):
+            provisioner.provision(request, str(fresh_proof), apply=True)
+        assert [quota.inode_attributes(fd) for fd in descriptors] == before
+        assert (work / "unprovisioned-save").read_bytes() == marker
+        assert os.listdir(fresh_proof) == [], "a refused migration must publish no inventory or proof"
+    finally:
+        for fd in descriptors:
+            os.close(fd)
+        shutil.rmtree(scratch)
+        if fresh_proof is not None:
+            shutil.rmtree(fresh_proof)
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap absent")

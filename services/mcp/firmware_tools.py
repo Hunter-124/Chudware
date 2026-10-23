@@ -1,7 +1,7 @@
-"""Firmware compile-loop MCP tools — ``fw_new_project`` / ``fw_build`` / ``fw_sources`` (T-C2).
+"""Firmware compile-loop MCP tools — ``fw_new_project`` / ``fw_build`` / ``fw_sources``.
 
 Thin FastMCP wrappers over the C++ core via :mod:`services.mcp.core_bridge` (flipped off
-the deleted ``engine.firmware.mcp_tools`` in T-RF15), mirroring ``services/mcp/ecad_tools.py``
+the deleted ``engine.firmware.mcp_tools``), mirroring ``services/mcp/ecad_tools.py``
 exactly: each ``@mcp.tool()`` returns a JSON string and calls the worker-RPC method.
 Registration is deferred behind :func:`register_firmware_tools` so ``server.py`` wires us
 in with a two-line block and the tools can be driven against a stub ``mcp`` in tests without the
@@ -254,7 +254,7 @@ def register_firmware_tools(mcp) -> None:
 
     @mcp.tool()
     def fw_status(project_id: str = "") -> str:
-        """Firmware provisioning doctor (T-FIN4) — call FIRST before any fw_* work.
+        """Firmware provisioning doctor — call FIRST before any fw_* work.
 
         Detects each firmware CLI (cmake, ninja, arm-none-eabi-gcc, renode,
         qemu-system-arm, probe-rs, esptool, idf.py, arduino-cli) and returns
@@ -264,7 +264,7 @@ def register_firmware_tools(mcp) -> None:
         - ``families`` = per-MCU-family rollup (``cortex-m`` / ``esp32`` / ``avr``)
           with ``can_build`` / ``can_emulate`` / ``can_flash`` booleans plus the
           ``missing`` tool list that would unlock each family.
-        - ``platforms`` = T-FIN2 Renode platform capability matrix (``stm32f4`` /
+        - ``platforms`` = Renode platform capability matrix (``stm32f4`` /
           ``stm32f1`` / ``nrf52`` / ``rp2040`` / ``esp32`` / ``cortex-m`` →
           ``{file, emulation, uart, gpio, gpio_observe, adc, i2c, spi, can, timers,
           timed_bus, electrical_bus, notes}``). ESP32 is build+flash only
@@ -469,13 +469,13 @@ def register_firmware_tools(mcp) -> None:
           ``CHUDWARE_GPIO_TRACE(pin, level, t_ms)`` macro from the project's ``chudware_trace.h``.
         - ``"gpio:<PIN>=<level>@><T>ms"`` (also ``@<`` / ``@``) — timeline assertion:
           a time-stamped event shows the pin at that level after/before/at-or-after T ms.
-        - ``"toggles:<PIN>>=<N>"`` (also <=, ==, >, <) — pin level changed N times (T-FIN3).
-        - ``"period:<PIN>=<P>ms±<TOL>ms"`` — mean rising-edge period within P±TOL (T-FIN3).
+        - ``"toggles:<PIN>>=<N>"`` (also <=, ==, >, <) — pin level changed N times.
+        - ``"period:<PIN>=<P>ms±<TOL>ms"`` — mean rising-edge period within P±TOL.
         - ``"uart_within:<text>@<T>ms"`` — text in an actually time-stamped UART event
           at or before T ms; inspect timing evidence, not host log arrival time.
         - plain string — treated as uart match.
 
-        ``scenario`` (T-FIN3, schema ``aicad.fwscenario/1``, contracts/firmware_rpc.md §9)
+        ``scenario`` (schema ``aicad.fwscenario/1``, contracts/firmware_rpc.md §9)
         binds declarative sensor/GPIO stimulus to the emulated peripherals. Pass a JSON
         object string or a fixture reference: ``"fixture:i2c_temp_tmp103"`` (I2C TMP103
         temp sensor with programmed temperature), ``"fixture:spi_imu_stub"``,
@@ -566,11 +566,11 @@ def register_firmware_tools(mcp) -> None:
         Respect all additional reported limitations; this is not full-flight,
         Windows/macOS or live-hardware proof.
 
-        T-FIN7: when the project is linked to an ECAD board (``board_doc_ref``) and a
+        When the project is linked to an ECAD board (``board_doc_ref``) and a
         trace was written, the result also carries ``power_profile_path`` — an
         ``aicad.powerprofile/1`` artifact (``<elf>.power.json``, contract §11): duty-
         cycle-weighted per-rail current profile (CPU run/sleep residency + per-pin GPIO
-        duty x the board's T-FIN8 ``eng.supply.rails`` currents). Bookkeeping, not
+        duty x the board's ``eng.supply.rails`` currents). Bookkeeping, not
         SPICE. Use fw_power_profile to derive one from an existing trace.
 
         On Renode, ``run_s`` is the TARGET virtual-time horizon in seconds (0 = native default,
@@ -681,7 +681,7 @@ def register_firmware_tools(mcp) -> None:
     def fw_verify_board(board_doc_ref: str, project_id: str = "",
                         sch_doc_ref: str = "", mcu_family: str = "",
                         trace_path: str = "", emulate: bool = False) -> str:
-        """Firmware↔board co-verification (T-FIN6): check the firmware BACK against the
+        """Firmware↔board co-verification: check the firmware BACK against the
         PCB before fab and return ERC/DRC-shaped findings.
 
         STATIC checks (always run): every firmware-referenced ``PIN_<NET>`` exists as a
@@ -689,7 +689,7 @@ def register_firmware_tools(mcp) -> None:
         ESP32 GPIO0/2/12/15/EN...) not repurposed as signals; firmware never drives a net
         that already has another push-pull driver or an input-only pin (needs
         ``sch_doc_ref`` for netlist pin types — skipped honestly without it); every MCU
-        supply rail has a decoupling capacitor (rails from the T-FIN8 eng metadata +
+        supply rail has a decoupling capacitor (rails from the eng metadata +
         power nets on the MCU's pads).
 
         DYNAMIC check: pass ``trace_path`` (an ``aicad.firmware.trace/1`` artifact from a
@@ -726,8 +726,8 @@ def register_firmware_tools(mcp) -> None:
     def fw_power_profile(trace_path: str, project_id: str = "",
                          board_doc_ref: str = "", mcu_family: str = "",
                          window_ms: float = 0.0) -> str:
-        """Derive an ``aicad.powerprofile/1`` power/duty-cycle profile (T-FIN7,
-        contracts/firmware_rpc.md §11) from an EXISTING emulation trace — no live
+        """Derive an ``aicad.powerprofile/1`` power/duty-cycle profile
+        (contracts/firmware_rpc.md §11) from an EXISTING emulation trace — no live
         emulation needed.
 
         ``trace_path`` is the ``aicad.firmware.trace/1`` artifact a previous fw_sim_run
@@ -738,7 +738,7 @@ def register_firmware_tools(mcp) -> None:
         - Per-pin GPIO/PWM duty cycles — time-stamped events integrated over the run
           window (unstamped Renode hook events → duty null + toggle count; no events →
           the final-snapshot level).
-        - Per-rail currents — each board component's T-FIN8 ``eng.supply.rails``
+        - Per-rail currents — each board component's ``eng.supply.rails``
           active/sleep currents (contracts/ecad/boardphys.md) weighted by its activity
           (MCU → CPU residency; loads on nets mapped to observed pins → pin duty; else
           assumed always active). Unknown currents stay null and are listed in
@@ -768,7 +768,7 @@ def register_firmware_tools(mcp) -> None:
         return _dumps(cb.call("fw_power_profile", p))
 
     # -----------------------------------------------------------------------
-    # Hardware path (T-C4): probe-rs flash/debug + esptool ESP32 flash
+    # Hardware path: probe-rs flash/debug + esptool ESP32 flash
     # -----------------------------------------------------------------------
 
     @mcp.tool()
@@ -842,7 +842,7 @@ def register_firmware_tools(mcp) -> None:
     def fw_sensor_scenario(profile: str = "", sensor_map: Optional[list] = None,
                            duration_s: float = 0.0, dt_s: float = 0.01,
                            name: str = "", sim_result: str = "") -> str:
-        """Build an ``aicad.fwscenario/1`` from a flight/CFD/kinematic profile (Wave-3 S1).
+        """Build an ``aicad.fwscenario/1`` from a flight/CFD/kinematic profile.
 
         Convert a time-series profile into modeled sensor register values (MPU6050 IMU,
         BMP280 baro, LIS3MDL mag, pitot/airspeed) as ``i2c_register_stream`` tracks and
@@ -973,7 +973,7 @@ def register_firmware_tools(mcp) -> None:
         and stops OpenOCD. ``openocd_cfg`` is the ``-f`` argument — usually a board config
         that pulls in both interface and target (e.g. ``"board/stm32f4discovery.cfg"``).
 
-        This is the GDB-remote fallback debug path (embedded-landscape.md): use it for chips
+        This is the GDB-remote fallback debug path: use it for chips
         probe-rs's target registry doesn't cover. FlashResult ``output`` carries the raw
         gdb/MI transcript. Each call is a fresh attach/detach cycle — safe for reset/halt
         because Cortex-M halt state is a hardware flag that survives disconnecting, but a
@@ -1050,7 +1050,7 @@ def register_firmware_tools(mcp) -> None:
         ``mi_commands`` (e.g. ``["-break-insert main", "-exec-continue"]``); ``output``
         carries the raw MI transcript.
 
-        Practical fallback for AVR *debug* per embedded-landscape.md: modern UPDI-part debug
+        Practical fallback for AVR *debug*: modern UPDI-part debug
         protocols (EDBG/mEDBG/PKOB nano) aren't GDB-exposed by an open tool, so simavr's own
         GDB server is the universal AVR debug path (real-hardware debugWIRE via avarice is
         legacy/rare, out of scope here).

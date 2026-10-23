@@ -1,4 +1,4 @@
-// Renode and QEMU emulator wrappers (T-RF15 port of
+// Renode and QEMU emulator wrappers (C++ port of
 // engine_oracle/firmware/emulator.py). Both backends are subprocess-only,
 // never linked; a missing binary is graceful (passed=false, uart_log carries
 // the reason), never a throw. See contracts/firmware_rpc.md §4/§7/§9.

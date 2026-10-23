@@ -188,7 +188,7 @@ def test_incremental_caches_do_not_cross_contaminate():
 def test_handoff_fragment_merge_unions_live_drops_dead(tmp_path, monkeypatch):
     """docs.json is merged from per-process fragments: live fragments union; a
     fragment whose PID is dead is dropped AND cleaned off disk."""
-    from services.mcp import cad_common as ct  # T-RF8: handoff/autosave internals moved
+    from services.mcp import cad_common as ct  # handoff/autosave internals moved
 
     alive_pid = ct._HANDOFF_PID
     dead_pid = 999999  # far above pid_max defaults; os.kill -> ProcessLookupError
@@ -225,7 +225,7 @@ def test_orphan_step_files_swept(tmp_path):
     import os
     import time
 
-    from services.mcp import cad_common as ct  # T-RF8: handoff/autosave internals moved
+    from services.mcp import cad_common as ct  # handoff/autosave internals moved
 
     alive_pid = ct._HANDOFF_PID
     now = time.time()
@@ -259,7 +259,7 @@ def test_orphan_step_files_swept(tmp_path):
 def test_autosave_filenames_are_session_prefixed(tmp_path, monkeypatch):
     """Two MCP processes both hold 'doc-cpp00000001'; their autosaves must land in
     DIFFERENT files (the pre-fix clobber), with the real doc_id kept in the sidecar."""
-    from services.mcp import cad_common as ct  # T-RF8: handoff/autosave internals moved
+    from services.mcp import cad_common as ct  # handoff/autosave internals moved
 
     stem = f"{ct._SESSION_ID}-doc-cpp00000001"
     # The naming contract the autosaver writes (cad_tools._autosave): session-prefixed
@@ -280,12 +280,12 @@ def test_publish_revision_skip_and_burst_coalescing(tmp_path, monkeypatch):
     instead of one full serialize per edit."""
     import time
 
-    from services.mcp import cad_common as ct  # T-RF8: handoff/autosave internals moved
+    from services.mcp import cad_common as ct  # handoff/autosave internals moved
 
     # The .step+ publish/throttle/coalesce path this test exercises is LEGACY-only:
     # in daemon mode (the Phase-8 default) _publish_current() short-circuits to None
     # because the GUI shares the daemon's docs live and ignores handoff files
-    # (cad_tools._publish_current + docs/HOSTD.md). Pin legacy mode so the throttle
+    # (cad_tools._publish_current + docs/reference/HOSTD.md). Pin legacy mode so the throttle
     # logic under test actually runs regardless of the process-wide engine mode.
     monkeypatch.setattr(ct.cb, "active_daemon_mode", lambda: False)
     monkeypatch.setattr(ct, "_handoff_dir", lambda: tmp_path)
@@ -333,7 +333,7 @@ def test_autosave_skips_unchanged_docs(tmp_path, monkeypatch):
     """The periodic autosave sweep must skip docs whose engine revision hasn't moved
     since their last autosave (idle sweep = no disk writes), and must save again
     after a real edit."""
-    from services.mcp import cad_common as ct  # T-RF8: handoff/autosave internals moved
+    from services.mcp import cad_common as ct  # handoff/autosave internals moved
 
     monkeypatch.setattr(ct, "_autosave_dir", lambda: tmp_path)
     did = cb.call("doc_new", {"name": "as_skip"})["doc_id"]

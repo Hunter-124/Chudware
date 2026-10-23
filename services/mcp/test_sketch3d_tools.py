@@ -8,7 +8,7 @@ Pure-Python helpers (curve mapping, arc tessellation, path sampling, narration) 
 tested without the engine; everything else is skip-guarded on libchudware availability.
 
 Run:
-  cd /home/hunter/Repositories/CAD
+  cd <repo root>
   python3 -m pytest services/mcp/test_sketch3d_tools.py -q
 """
 from __future__ import annotations
@@ -545,7 +545,7 @@ class TestSketch3dDocTools:
         m = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": 1.0})
         assert round(m["mass_g"] * 1000.0, 3) == v0, (m, v0)
 
-    # ── T-3DEQ: eq_curve3d ───────────────────────────────────────────────────
+    # ── eq_curve3d ──────────────────────────────────────────────────────────
 
     def test_add_eq_curve3d_helix(self):
         d = self._new_part("s3d_eqcurve")
@@ -572,7 +572,7 @@ class TestSketch3dDocTools:
             {"kind": "eq_curve3d", "xt": 5, "yt": "0", "zt": "0", "t1": 0, "t2": 1}]})
         assert r and r.get("ok") is False
 
-    # ── T-3DXREF: external vertex references ────────────────────────────────
+    # ── external vertex references ────────────────────────────────────────
 
     def test_ref_vertex_grounds_a_coincident_constraint(self):
         d = self._new_part("s3d_xref")

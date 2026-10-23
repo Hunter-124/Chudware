@@ -1,4 +1,4 @@
-"""ngspice backend gates (T-FIN14) — plain main()+asserts (house style).
+"""ngspice backend gates — plain main()+asserts (house style).
 
 Contract under test:
   * backend='mna' (default) is untouched and identical to the pre-seam behaviour.
@@ -19,7 +19,7 @@ import os
 import tempfile
 import time
 
-# T-RF20: engine.sim.circuit.simulate -> C++ sim_spice RPC via the ecad_common
+# engine.sim.circuit.simulate -> C++ sim_spice RPC via the ecad_common
 # facade; the ngspice subprocess backend (no C++ counterpart) lives in
 # services/installer/ngspice_backend.py.
 from services.mcp.ecad_common import _sim_run as simulate
@@ -199,7 +199,7 @@ def test_vendor_opamp_demo() -> None:
     simulates through ngspice (unity buffer -> V(OUT)=V(IN)); mna warns+ignores;
     auto routes to ngspice because the circuit needs the vendor model."""
     # Vendor-.subckt enrichment (xdevices/includes + "needs backend" warnings) is the
-    # ngspice leg, which STAYS Python (T-RF20); the C++ sim_netlist_to_circuit RPC does
+    # ngspice leg, which STAYS Python; the C++ sim_netlist_to_circuit RPC does
     # not carry it (tracked netlist.cpp gap).
     from services.sim.spice import netlist_to_spice_circuit
 

@@ -7,7 +7,7 @@ write_spice(circuit, study=None) -> str
 parse_spice_deck(text) -> (Circuit, study | None)
 netlist_to_spice_circuit(netlist, sim_params=None) -> (Circuit, list[str])
 
-Circuit shape is FROZEN per docs/contracts/ecad/sim.md §1:
+Circuit shape is FROZEN per contracts/ecad/sim.md §1:
     {
         "nodes":   list[str],
         "devices": list[Device],
@@ -1103,7 +1103,7 @@ def netlist_to_spice_circuit(
             sub_name = _resolve_subckt_name(model_upper, sim)
             sub_def = subckts.get(sub_name.upper())
             if sub_def is None:
-                # Vendor model attachment (T-FIN14): a component may carry a .lib/.subckt
+                # Vendor model attachment: a component may carry a .lib/.subckt
                 # FILE on sim["lib"]. The internal MNA solver can't expand it, but the
                 # optional ngspice backend can — record it as an additive X instance +
                 # .include so `simulate(..., backend='ngspice')` runs the real model.
@@ -1196,7 +1196,7 @@ def netlist_to_spice_circuit(
             models.setdefault(mname, dict(mparams))
 
     circuit = _make_circuit(devices, models, params)
-    # Additive optional keys (T-FIN14): vendor attachments for the ngspice backend.
+    # Additive optional keys: vendor attachments for the ngspice backend.
     # The MNA solver reads only nodes/devices/models/params, so these are transparent to it.
     if vendor_x:
         circuit["xdevices"] = vendor_x

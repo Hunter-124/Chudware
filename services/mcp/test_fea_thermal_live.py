@@ -4,7 +4,7 @@ truths, including the public tool on a meshed 6061 bar.
 Layers covered:
   * steady conduction (fea_thermal_solve via sim_run_thermal): slab linear profile,
     pin fin vs 1-D fin theory, singular pure-Neumann rejection;
-  * transient conduction (fea_thermal_transient, T-FIN18): slab quench vs the 1-D
+  * transient conduction (fea_thermal_transient): slab quench vs the 1-D
     Fourier-series decay, lumped-capacitance cooling, duty-schedule differential
     parity against engine_oracle/sim/fea_thermal_transient.py, malformed-schedule
     rejection;
@@ -136,7 +136,7 @@ def test_steady_pure_neumann_is_rejected_not_garbage():
 
 
 # ---------------------------------------------------------------------------
-# Transient conduction (T-FIN18)
+# Transient conduction
 # ---------------------------------------------------------------------------
 
 @needs_engine

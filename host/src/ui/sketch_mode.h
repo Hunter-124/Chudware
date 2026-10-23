@@ -102,7 +102,7 @@ struct SketchEntity {
     std::string type;            // line|circle|arc|slot|arc_slot|point|ellipse|spline
     std::string status;          // under|full|over (from the solver)
     bool construction = false;
-    // T-BL49 associative Convert Entities: owned by an external ref (distinct color);
+    // Associative Convert Entities: owned by an external ref (distinct color);
     // stale = the source no longer resolves (dashed + warning color, last-good geometry).
     bool external = false;
     bool externalStale = false;
@@ -190,7 +190,7 @@ public:
     bool drawAxisPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin, const ImVec2& imgMax,
                         int vw, int vh, bool imgHovered);
 
-    // T-BL37: while a feature PM is open with an active well that accepts a point (selKinds.point),
+    // While a feature PM is open with an active well that accepts a point (selKinds.point),
     // the world-origin point glyph (and any point-datum features) are hit-tested in screen space.
     // Hovering highlights the glyph and a left-click routes "point.origin" into the well via
     // routeDatumPoint(). Returns true while the cursor is within pick radius so model picking
@@ -616,7 +616,7 @@ private:
     std::string dragHandle_;
     bool dragging_ = false;
     int dragFrame_ = -1;             // last frame a sketch_drag sample was *queued* (UI throttle)
-    // T-PERF2: single-in-flight latest-wins sketch_drag. Each mouse sample overwrites
+    // Single-in-flight latest-wins sketch_drag. Each mouse sample overwrites
     // dragPendingExtra_; when no RPC is open, kickSketchDragAsync submits it. Completions with
     // gen != dragGen_ are dropped; a pending overwrite re-kicks after drain.
     int  dragGen_ = 0;

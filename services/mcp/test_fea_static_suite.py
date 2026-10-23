@@ -311,7 +311,7 @@ def test_native_curved_pressure_matches_lame():
 
 # ------------------------- stated element size + released field (the MCP tool boundary)
 # The engine has honoured study.target_size_mm and study.vtu_path for a long time; what
-# no tool could ASK for was the combination. Measured twice in one ME 490 analysis
+# no tool could ASK for was the combination. Measured twice in one frame analysis
 # session (2026-09-06):
 #   * run_fea_static took only mesh_fineness, so the leg a ladder released could not be
 #     re-solved on ITS mesh — every .vtu written afterwards was attributed to a

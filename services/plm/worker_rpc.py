@@ -1,4 +1,4 @@
-"""Worker-RPC bridge for the PLM vault — the in-editor GUI seam (T-R5).
+"""Worker-RPC bridge for the PLM vault — the in-editor GUI seam.
 
 Exposes the ``plm_*`` family as **engine-worker methods** so the C++/ImGui
 editor (history timeline panel, checkpoint/release toolbar, compare view,
@@ -7,8 +7,8 @@ through the same newline-delimited-JSON worker seam (``WorkerClient`` /
 ``AsyncRpc``, ``services/worker/``) it already uses for every other service —
 no bespoke transport.
 
-These are thin wrappers over :class:`services.plm.vault.Vault` and the T-R3/
-T-R4 modules — the SAME single implementation behind the ``plm_*`` MCP tools
+These are thin wrappers over :class:`services.plm.vault.Vault` and the change-
+intelligence/release modules — the SAME single implementation behind the ``plm_*`` MCP tools
 (``services/mcp/plm_tools.py``); no vault logic lives here. Responses are the
 contract §0 flat envelope as a dict: ``{ok: true, …}`` / ``{ok: false, reason,
 hint}`` — never a traceback (worker methods degrade gracefully when dulwich is
@@ -21,13 +21,13 @@ GUI extras beyond the MCP twins (additive, worker-seam only):
   ``thumbnail_file`` field, so the C++ timeline can texture-load real
   thumbnails without a second round trip.
 * ``plm_status`` adds ``part_number_prefix`` + ``next_part_number`` so the
-  release flow can pre-fill the suggested number (T-R5 locked decision).
+  release flow can pre-fill the suggested number.
 * ``plm_draft`` — checkpoint/release message drafting for the toolbar. The
-  LOCAL model tier phrases a message from the deterministic T-R3 change
+  LOCAL model tier phrases a message from the deterministic change
   summary when (and only when) a local, loopback-served model is provisioned;
   otherwise it reports ``source:"manual"`` and the GUI shows a plain manual
   box. Frontier/cloud providers are never used here.
-* ``plm_scheme_set`` / ``plm_discard_draft`` — the T-R5 vault seams
+* ``plm_scheme_set`` / ``plm_discard_draft`` — the vault seams
   (configurable part-number scheme; "back to rev X (discard draft)").
 
 Ease-of-use law (contract §8.1): no git vocabulary in any string a user could
@@ -195,7 +195,7 @@ def _plm_checkpoint(params: dict, _emit: Callable) -> dict:
 
 
 def _plm_release(params: dict, _emit: Callable) -> dict:
-    """Release an item: pre-flight, rev stamp, geometry + BOM freeze (T-R4)."""
+    """Release an item: pre-flight, rev stamp, geometry + BOM freeze."""
     def run(v: Any) -> dict:
         from services.plm import release as release_mod
 
@@ -547,7 +547,7 @@ def _plm_item_set(params: dict, _emit: Callable) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# T-R5 seams: scheme config + discard draft
+# Vault seams: scheme config + discard draft
 # ---------------------------------------------------------------------------
 
 def _plm_scheme_set(params: dict, _emit: Callable) -> dict:
@@ -567,7 +567,7 @@ def _plm_discard_draft(params: dict, _emit: Callable) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# plm_draft — LOCAL model tier message drafting (T-R5 locked decision)
+# plm_draft — LOCAL model tier message drafting
 # ---------------------------------------------------------------------------
 
 # Test seam: inject a fake local-model phrasing function (summary -> message).
@@ -632,7 +632,7 @@ def _plm_draft(params: dict, _emit: Callable) -> dict:
 
     Returns ``{ok, message, summary, source}`` where ``source`` is
     ``"local_model"`` (a provisioned local model phrased the message from the
-    deterministic T-R3 change summary) or ``"manual"`` (no local model — the
+    deterministic change summary) or ``"manual"`` (no local model — the
     GUI shows a plain manual box; ``summary`` is still returned for context).
     """
     mode = str((params or {}).get("mode", "checkpoint") or "checkpoint")
@@ -748,7 +748,7 @@ def _git_gh_auth_login(params, _emit):  return _git_rpc(params, _emit, "gh_auth_
 
 
 # ---------------------------------------------------------------------------
-# T-R7 remotes / locks (services.plm.remote)
+# Remotes / locks (services.plm.remote)
 # ---------------------------------------------------------------------------
 
 def _plm_add_remote(params: dict, _emit: Callable) -> dict:
@@ -1070,7 +1070,7 @@ WORKER_METHODS = {
 
 
 # ──── CAD project graph (contracts/cad_graph.md v1) ────
-# Folded in from engine_oracle/parts_hub/cad_graph_rpc.py (T-RF19) — a squatter
+# Folded in from engine_oracle/parts_hub/cad_graph_rpc.py — a squatter
 # with zero parts coupling; every function is a thin wrapper over services.plm.*.
 
 
@@ -1568,7 +1568,7 @@ CAD_GRAPH_METHODS: dict[str, Callable[..., Any]] = {
 
 
 # ──── Lightweight PLM branching (wave-2) ────
-# Folded in from engine_oracle/parts_hub/plm_branch_rpc.py (T-RF19). This is now
+# Folded in from engine_oracle/parts_hub/plm_branch_rpc.py. This is now
 # the single registration path (the parts_hub copy is deleted).
 
 

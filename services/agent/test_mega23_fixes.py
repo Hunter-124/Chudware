@@ -1,6 +1,6 @@
 """Mega-23 fixes — AC5 SPICE probe readback + AC1 measure_between scoring.
 
-Grounded in mega-22 a2 primary (reports/runs/mega-22/attempt-2-primary-graded-live7/):
+Grounded in mega-22 a2 primary:
 
   S23 / AC5 — circuit driven (device_count=2) but V(3V3) extracts null.
               Singular matrix from V- shorted to rail; also need case/format
@@ -94,8 +94,8 @@ def test_mega22_a2_ac1_fingerprint_soft_zero_measure_between():
 def test_resolve_node_case_insensitive():
     """Engine maps V(3v3)/v(3V3)/+3V3 aliases onto schematic net 3V3.
 
-    Retargeted 2026-07-22: engine.sim.circuit was deleted with the MNA stack
-    (T-RF20); the C++ spice (core/sim/spice.cpp resolve_node_tolerant) now
+    Retargeted 2026-07-22: engine.sim.circuit was deleted with the MNA stack;
+    the C++ spice (core/sim/spice.cpp resolve_node_tolerant) now
     owns the behavior. Asserted at the RPC level; internals are covered by
     core/tests/test_spice_netlist.cpp + test_spice_sweep.cpp."""
     from services.mcp import core_bridge as cb
@@ -117,7 +117,7 @@ def test_resolve_node_case_insensitive():
 
 
 def test_probe_eval_accepts_lower_case_v3v3():
-    """OP probe V(3v3) returns finite voltage when node is 3V3 (C++ spice, T-RF20)."""
+    """OP probe V(3v3) returns finite voltage when node is 3V3 (C++ spice)."""
     from services.mcp import core_bridge as cb
 
     circuit = {

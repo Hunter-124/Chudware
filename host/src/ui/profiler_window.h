@@ -5,7 +5,7 @@
 // uses (prof_start {hz,mode} / prof_stop {top,...} / prof_report {top,...}). The returned
 // report renders as module self-time + flat self/total tables, plus a flame graph parsed from
 // the report's "folded" stacks (cached, rebuilt only when a new report arrives). The host links
-// nothing new: everything goes through the already-loaded libchudware.{so,dll}. See docs/PROFILER.md.
+// nothing new: everything goes through the already-loaded libchudware.{so,dll}.
 #pragma once
 
 struct AppState;

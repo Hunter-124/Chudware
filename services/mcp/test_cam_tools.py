@@ -68,7 +68,7 @@ def _build_part_step() -> str:
 
 
 def _check_registry_foldin(check) -> None:
-    """DoD (T-M4): CuttingDB::builtin() loads the materials registry at RUNTIME (in-code fallback).
+    """CuttingDB::builtin() loads the materials registry at RUNTIME (in-code fallback).
 
     Discriminating check: point the core at a registry copy whose aluminum cam.sfm_mill is a value
     NOT in the in-code table, in a FRESH subprocess (builtin() is a cached singleton), and confirm
@@ -110,7 +110,7 @@ def _check_registry_foldin(check) -> None:
 
 
 def _check_add_setup_material_resolution(check) -> None:
-    """DoD (T-M4): cam_add_setup accepts any registry material ID (translated to a cutting group)."""
+    """cam_add_setup accepts any registry material ID (translated to a cutting group)."""
     try:
         from services.mcp.cam_tools import _resolve_cam_material
     except Exception as e:  # noqa: BLE001
@@ -128,13 +128,13 @@ def _check_add_setup_material_resolution(check) -> None:
 
 def _registry_path():
     # engine.materials.registry was deleted with the oracle; the bundled registry
-    # the core loads (T-M4) lives at core/data/materials/registry.json.
+    # the core loads lives at core/data/materials/registry.json.
     from pathlib import Path
     return Path(__file__).resolve().parents[2] / "core" / "data" / "materials" / "registry.json"
 
 
 def _check_hole_extraction(cb, check) -> None:  # noqa: ANN001 - cb module + check() closure
-    """T-M5 hole-extraction upgrade: real-geometry checks for counterbore/countersink/
+    """Hole-extraction upgrade: real-geometry checks for counterbore/countersink/
     tilted-hole records and the kind="sections"/"profile" extract modes.
 
     All ops go through the doc C ABI (doc_new/add_feature/doc_apply_ops/export_file),
@@ -235,7 +235,7 @@ def _check_hole_extraction(cb, check) -> None:  # noqa: ANN001 - cb module + che
                 pass
 
     # --- tilted hole -------------------------------------------------------------
-    # T-M5 upgrade: the extractor now accepts holes with |axis.Z()| >= 0.95 (tilt up
+    # Upgrade: the extractor now accepts holes with |axis.Z()| >= 0.95 (tilt up
     # to ~18deg) instead of the old >= 0.99 threshold. Build a hole tilted ~10deg
     # (cos(10deg) ~= 0.985 -- rejected by the OLD 0.99 threshold, accepted by the
     # NEW 0.95 one) by drilling normal to a sloped face made from a box's top face
@@ -350,7 +350,7 @@ def main() -> int:
     check(len(cb.call("cam_materials", {})["materials"]) >= 20, "cutting DB has >=20 materials")
     check(len(cb.call("cam_op_types", {})["op_types"]) == 28, "28 operation types")
 
-    # T-M4: the CuttingDB folds the engine materials registry's `cam` sub-sections at runtime.
+    # The CuttingDB folds the engine materials registry's `cam` sub-sections at runtime.
     _check_registry_foldin(check)
     _check_add_setup_material_resolution(check)
 
@@ -384,7 +384,7 @@ def main() -> int:
     check(res0["removed_volume_mm3"] > 0, "sim removed material")
     check(res0["cycle_time_s"] > 0, "sim cycle time > 0")
 
-    # T-M3: check_holder is accepted + forwarded to the core (holder/shank collision sim).
+    # check_holder is accepted + forwarded to the core (holder/shank collision sim).
     # Mirrors the plain cam_simulate call above -- param-plumbing check (DoD), not a claim
     # about tripping a real collision (needs geometry deep/narrow enough to snag the tool
     # body, out of scope here).
@@ -409,7 +409,7 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         check(False, f"cam_extract on a real STEP: {e}")
 
-    # T-M5: hole-extraction upgrade (counterbore/countersink/tilted holes) +
+    # Hole-extraction upgrade (counterbore/countersink/tilted holes) +
     # kind="sections"/"profile" extract modes, on real geometry.
     _check_hole_extraction(cb, check)
 

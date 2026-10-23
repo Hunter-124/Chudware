@@ -1259,7 +1259,7 @@ void SimManager::tick(AppState &st) {
   if (emStatus_ == 0 && !emProbeInflight_ &&
       st.activeWorkspace == AppState::Workspace::Simulate)
     probeEmStatus(st);
-  // T-FIN24: probe the multiphysics capability doctor (ccx / handoff seams) +
+  // Probe the multiphysics capability doctor (ccx / handoff seams) +
   // fw_status the same way — once, async, only while the Simulate workspace is
   // up.
   if (capsStatus_ == 0 && !capsInflight_ &&
@@ -1637,7 +1637,7 @@ void SimManager::drainSimClientJob(AppState &st) {
       s.hasResult = true;
       st.addLog("[sim] buckling done: " + s.summary);
     } else if (s.type == StudyType::ThermalFea) {
-      // Conduction solve (steady or T-FIN18 transient): numeric summary only —
+      // Conduction solve (steady or transient): numeric summary only —
       // the core returns the nodal temperature field but packages no display
       // overlay (honest gap; the summary + flux audit are shown in Results).
       s.nNodes = res.value("n_nodes", 0);

@@ -1,6 +1,6 @@
 """services.plm.client — the in-process VaultClient seam (contract §7.1).
 
-``services/agent/plm_bridge.py`` (T-W18) imports :class:`PLMVaultClient` lazily
+``services/agent/plm_bridge.py`` imports :class:`PLMVaultClient` lazily
 behind the bridge enablement gate and duck-types it against its
 ``VaultClient`` Protocol. This class is the AI-authored twin of the MCP
 ``plm_checkpoint`` tool: it is the ONLY path that writes the §3.4 ``ai``
@@ -101,7 +101,7 @@ class PLMVaultClient:
     def ai_mode_for_project(self, project_id: str) -> str | None:
         """The project's assist tier (manual|assisted|managed), or None when
         the project is unknown/unreadable. Used by the PLM bridge to honor the
-        tier before cutting AI entries (T-R3; plan §2)."""
+        tier before cutting AI entries."""
         project_dir = self._project_paths.get(project_id)
         if project_dir is None or not Path(project_dir).is_dir():
             return None
@@ -153,7 +153,7 @@ class PLMVaultClient:
             return {"ok": False, "reason": "invalid_project",
                     "hint": "that project could not be found"}
 
-        # Assist-tier floor (T-R3, plan §2 / contract §8.4): an AI-authored
+        # Assist-tier floor (contract §8.4): an AI-authored
         # entry may only be cut when the project opted into AI-managed mode.
         # Manual buttons (author_kind="user") are always available.
         if author_kind == "ai":

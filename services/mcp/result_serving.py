@@ -470,7 +470,7 @@ def project_ecad_status(payload: dict, opts: ServeOpts) -> dict:
                 "libid": c.get("libid"),
             }
             # power_w is two scalars — always keep when the producer attached it
-            # (FIN8 honesty: null typ/max must surface, never invented zeros).
+            # (Honesty rule: null typ/max must surface, never invented zeros).
             if "power_w" in c:
                 row["power_w"] = c["power_w"]
             if o.detail == "list" and c.get("footprint") is not None:

@@ -6,13 +6,12 @@
 // This header exposes the SAME shape (a JSON-RPC-style string-in / string-out
 // dispatch) from an in-process C++ DLL, so the host can route already-ported
 // methods here and fall through to Python for the rest. As each feature reaches
-// parity it gets cut over and its Python is deleted (see docs/REFACTOR_LOG.md,
-// T-RF20/T-RF21 zero-Python cutover).
+// parity it gets cut over and its Python is deleted (the zero-Python cutover).
 //
 // Why a flat C ABI (not C++ classes across the boundary): a C ABI is stable
 // across compilers / CRT versions, so the host (its own MSVC build) and this DLL
 // (linked against OCCT) can be built independently and the host can LoadLibrary
-// it at runtime. The user chose a SEPARATE libchudware.dll (not static-linked into
+// it at runtime. libchudware is a SEPARATE DLL (not static-linked into
 // the host exe) precisely so OCCT stays out of the host build and the link is
 // fully reversible during migration.
 //
@@ -73,7 +72,7 @@ CHUDWARE_API const char* chudware_abi_version(void);
 // The git-describe build id captured at CMake configure time (same value
 // chudware-hostd reports as its own build id — both are configured from ONE
 // version header, so a hostd/libchudware pair from the same build always match).
-// Drives the version drain-replace staleness check (see docs/HOSTD.md).
+// Drives the version drain-replace staleness check (see docs/reference/HOSTD.md).
 CHUDWARE_API const char* chudware_build_id(void);
 
 

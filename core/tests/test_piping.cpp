@@ -4,8 +4,7 @@
 // dispatch envelopes. Mirrors the Python oracle suites
 // engine_oracle/piping/{test_properties,test_schema,test_catalog,test_solve,
 // test_cfd_handoff}.py; the network-solve numbers are the same fixtures, so
-// these cases double as the unit half of the T-RF19 parity bar (the
-// byte-identical envelope diff lives in the /tmp harness driving rpc_cli).
+// these cases double as the unit half of the C++/Python parity bar.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 

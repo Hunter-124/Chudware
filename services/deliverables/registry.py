@@ -1,7 +1,7 @@
 """Artifact registry (contract §3) — JSON records persisted under the project dir.
 
-Each ``make_*`` appends one record; ``describe_project`` (T-F8), the preview pane (T-F16) and
-T-H1 telemetry read them. The record shape is the frozen §3 seam — do not change it without a
+Each ``make_*`` appends one record; ``describe_project``, the preview pane and
+telemetry read them. The record shape is the frozen §3 seam — do not change it without a
 version bump. Records live in ``<project>/artifacts/registry.json`` (a JSON list); reads return
 them newest-first.
 """

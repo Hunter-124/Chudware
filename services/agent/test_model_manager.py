@@ -1,4 +1,4 @@
-"""Tests for services/agent/model_manager.py — T-W26 model registry + provisioning.
+"""Tests for services/agent/model_manager.py — model registry + provisioning.
 
 Strategy (offline-ML-track discipline — no all-skip):
   * All download logic is tested via a tiny dummy-GGUF fixture served by an in-process
@@ -10,8 +10,6 @@ Strategy (offline-ML-track discipline — no all-skip):
 
 Live provisioning: marked skip unless CHUDWARE_PROVISION_LIVE is set, to avoid
 downloading multi-GB GGUFs in CI.
-
-Co-Authored-By: sonnet-pike <noreply@anthropic.com>
 """
 from __future__ import annotations
 

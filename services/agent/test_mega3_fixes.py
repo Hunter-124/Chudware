@@ -6,7 +6,7 @@ Defects (live mega-2-fc-rocket + MegaRun3 gap-2 probe):
 
 Defect 1 of that list, "phase gate vs DAG progress: specify_incomplete while
 BUILD/DELIVER done", is NOT covered here and no longer can be: its subject
-`services/agent/loop.py::_drive_phases_from_dag` was deleted by T-RF5 and nothing
+`services/agent/loop.py::_drive_phases_from_dag` was deleted with the Python loop and nothing
 re-implemented it. The `_drive` helper that monkeypatched it, and the manifest fixture
 only that helper used, were never reached — removed 2026-08-05.
 """

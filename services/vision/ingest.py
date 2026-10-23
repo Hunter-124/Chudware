@@ -4,7 +4,7 @@ Pure Pillow (already a runtime dep) — **no OpenCV here**, so the MCP server al
 this cleanly. Two jobs:
 
 * :func:`ingest_image` — hash a real file to a stable ``photo_id``, then emit a downscaled
-  *preview* that obeys the agent-facing cap from master-plan Pillar 10: **≤1024 px longest
+  *preview* that obeys the agent-facing cap: **≤1024 px longest
   side and <1 MB** (the Claude Desktop tool-result ceiling). The full-resolution original is
   never modified; its path rides along as the ``resource_link`` so the agent can pull full
   detail on demand.
@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 from PIL import Image
 
-#: Agent-facing caps (master plan Pillar 10). The preview the model actually looks at must
+#: Agent-facing caps. The preview the model actually looks at must
 #: fit both — the full-res original is linked, never inlined.
 PREVIEW_MAX_PX: int = 1024
 PREVIEW_MAX_BYTES: int = 1_000_000  # <1 MB

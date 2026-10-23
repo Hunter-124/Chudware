@@ -1,6 +1,6 @@
 """Tests for the deliverables tool family (contract ``deliverables/1``).
 
-Covers, per T-F14 DoD:
+Covers:
   (a) a 4B-model-shaped spec (contract §5.1) producing a valid file for EACH format;
   (b) a bare numeral in a load-bearing slot is a validation ERROR (``provenance_violation``);
   (c) ``slot_unresolved`` cases (missing result / missing key / ambiguous tool);

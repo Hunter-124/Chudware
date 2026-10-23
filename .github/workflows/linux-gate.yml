@@ -80,7 +80,7 @@ jobs:
         run: |
           set -euo pipefail
           venv="${RUNNER_TEMP}/gate-venv"
-          VENV_DIR="${venv}" PYTHON=python3.13 bash scripts/provision_venv.sh pytest==9.1.1 dvc==3.67.1
+          VENV_DIR="${venv}" PYTHON=python3.13 bash scripts/provision_venv.sh pytest==9.1.1
           {
             echo "CHUDWARE_GATE_PYTHON=${venv}/bin/python"
             echo "CHECK_PYTHON=${venv}/bin/python"

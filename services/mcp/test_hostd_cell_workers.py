@@ -48,6 +48,7 @@ void guardParentDeath(long parent) {
     if (getppid() != parent) _exit(125);
 }
 void closeInheritedFds(int lowest) { for (int fd = lowest; fd < 4096; ++fd) close(fd); }
+std::filesystem::path developerSourceRoot() { return {}; }
 }
 namespace chudware::security {
 IntegrityResult verifyInstalledPayload(const std::filesystem::path&, VerifyMode) {

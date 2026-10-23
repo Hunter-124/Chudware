@@ -1,4 +1,4 @@
-"""Tests for the sealing + raw-stock catalog adapters (T-CatalogStock).
+"""Tests for the sealing + raw-stock catalog adapters.
 
 Covers:
   - OringsAdapter (AS568B O-rings, domain "seal")

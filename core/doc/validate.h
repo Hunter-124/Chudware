@@ -5,7 +5,7 @@
 // validate_constraint / validate_dim / validate_selector / _validate_sel_or_datum /
 // _handle_targets_entity / validate_eq_curve_expr).
 //
-// This is the executable form of docs/contracts/doc_schema.md + feature_params.md:
+// This is the executable form of contracts/doc_schema.md + feature_params.md:
 // STRUCTURAL validation only (envelopes, types, arities, handles, selectors, dimension
 // values, expression grammar + name resolution). Geometric/semantic validation
 // (does the profile close, does the axis cross the profile) belongs to the compiler,

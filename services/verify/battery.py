@@ -21,7 +21,7 @@ import time
 from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
-# mega-15: argument adapters for checks that require non-doc_id args.
+# Argument adapters for checks that require non-doc_id args.
 # Unfulfillable checks honest-SKIP (omit from scores) — never signature-zero.
 # A check that CAN run MUST run with derived args (never weaken by skipping).
 # ---------------------------------------------------------------------------
@@ -527,7 +527,7 @@ def _check_all_sketches(fn: Any, doc_id: Optional[str], kwargs: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Canonical aicad.req/1 status constants (T-H3, services/requirements).
+# Canonical aicad.req/1 status constants (services/requirements).
 # Imported here so _gap_req_join doesn't carry its own stub copies.
 # ---------------------------------------------------------------------------
 from services.requirements.requirements import VALID_STATUSES as _REQ_VALID_STATUSES
@@ -543,8 +543,7 @@ _VERIFIED_STATUS: str = next(s for s in _REQ_VALID_STATUSES if s == "verified")
 # "pass" and "ok" are NOT in VALID_STATUSES; they are explicit aliases kept here so
 # older requirement documents don't silently fail.  The canonical anchor (_VERIFIED_STATUS)
 # is derived from the ladder — if the schema renames "verified", this tuple tracks it.
-# (T-BL23 DoD item 5, option (a).  Option (b) — drop aliases entirely — requires an
-# advisor ruling; see work/questions/T-BL23.md.)
+# (Dropping the legacy aliases entirely would be a schema-level change.)
 _REQ_MET_STATUSES: tuple[str, ...] = (_VERIFIED_STATUS, "pass", "ok")
 
 # ---------------------------------------------------------------------------
@@ -565,7 +564,7 @@ CHECKS: dict[str, tuple[str, str, str, str, str]] = {
     "draft_analysis":            ("cad",  "draft_analysis",            "seconds",   "any",   "findings"),
     "dfm_check":                 ("intake", "dfm_check",               "seconds",   "any",   "dfm"),
     "solve_mates":               ("cad",  "solve_mates",               "seconds",   "any",   "binary"),
-    # T-BL49: design-time interface alignment (hole patterns, coaxiality, contact planes,
+    # Design-time interface alignment (hole patterns, coaxiality, contact planes,
     # fastener pass-through) between mating components.  Implemented directly (gap) since it
     # lives in its own module; "findings" reward shape reads its `findings` list.
     "interface_check":           ("gap",  "interface_check",           "seconds",   "any",   "findings"),
@@ -596,9 +595,9 @@ CHECKS: dict[str, tuple[str, str, str, str, str]] = {
     "dim_coverage":              ("gap",  "dim_coverage",              "subsecond", "any",   "scalar"),
     "req_join":                  ("gap",  "req_join",                  "subsecond", "any",   "scalar"),
     "eval_check":                ("gap",  "eval_check_direct",         "subsecond", "any",   "binary"),
-    # T-BL50: layout-first critical-dim & interface coverage gate
+    # Layout-first critical-dim & interface coverage gate
     "layout_coverage":           ("gap",  "layout_coverage",           "subsecond", "any",   "scalar"),
-    # T-FIN23: system power/energy budget (rail tree + duty cycle + battery verdict).
+    # System power/energy budget (rail tree + duty cycle + battery verdict).
     # Runs only when a power_source kwarg is supplied; otherwise passes with a skip note.
     "power_budget":              ("gap",  "power_budget",              "subsecond", "any",   "findings"),
 }
@@ -668,7 +667,7 @@ def _gap_is_manifold(doc_id: str = None, **_) -> str:
     """Check: body is a closed manifold solid (no free-edge or error-severity issues).
 
     Reads the ``issues`` list from eval_check (OCCT BRepCheck) rather than the bare
-    ``free_edges`` scalar, which eval_check never emits on its own (T-BL19 finding).
+    ``free_edges`` scalar, which eval_check never emits on its own.
     Non-manifold = any issue with kind=="free_edges" OR severity=="error".
     tiny_edges warnings on curved seams/poles are cosmetic and do NOT fail manifold.
     Falls back to ``free_edges`` scalar if the issues list is absent (forward-compat).
@@ -706,7 +705,7 @@ def _gap_eval_check_direct(doc_id: str = None, **_) -> str:
 
     Reads the ``issues`` list from eval_check (OCCT BRepCheck) rather than the bare
     ``free_edges``/``invalid_faces`` scalars, which eval_check never emits on its own
-    (same latent bug T-BL23 fixed in ``_gap_is_manifold``; see T-BL19 finding).
+    (same latent bug fixed in ``_gap_is_manifold``).
     Not ok = any issue with kind=="free_edges" OR severity=="error".
     Falls back to the scalar fields if the issues list is absent (forward-compat).
     """
@@ -862,7 +861,7 @@ def _gap_dim_coverage(doc_id: str = None, source_doc_id: str = None, **_) -> str
     source part is known (source_doc_id, or recorded in the drawing), coverage =
     dims / features capped at 1.0; otherwise it degrades to "has any dims at all".
 
-    mega-15: when the mission has no drawing (mechanical doc / airframe), honest
+    When the mission has no drawing (mechanical doc / airframe), honest
     SKIP — not a zero-score FAIL. A check that CAN run (drawing open) still runs.
     """
     from services.mcp import core_bridge as cb
@@ -907,7 +906,7 @@ def _gap_dim_coverage(doc_id: str = None, source_doc_id: str = None, **_) -> str
         })
     except Exception as e:  # noqa: BLE001
         err = str(e)
-        # Drawing miss class → honest SKIP (mega-15 AC1 residual).
+        # Drawing miss class → honest SKIP.
         if "no open drawing" in err.lower() or "drawing" in err.lower():
             return _skip_json("dim_coverage", "no drawing in mission scope")
         return json.dumps({"ok": False, "error": err})
@@ -916,7 +915,7 @@ def _gap_dim_coverage(doc_id: str = None, source_doc_id: str = None, **_) -> str
 def _gap_req_join(doc_id: str = None, requirements: list = None, **_) -> str:
     """aicad.req/1 join — does each requirement's STATUS agree with its verifier EVIDENCE?
 
-    Status ladder from aicad.req/1 (T-H3, services/requirements):
+    Status ladder from aicad.req/1 (services/requirements):
     proposed | user_confirmed | verified | failed | waived (plus legacy aliases pass/ok).
     A "verified"/"pass" claim with an explicitly EMPTY trace.evidence list is
     INCONSISTENT — the exact failure this join exists to catch. "waived" is exempt
@@ -955,7 +954,7 @@ def _gap_req_join(doc_id: str = None, requirements: list = None, **_) -> str:
 
 
 def _gap_interface_check(doc_id: str = None, fastener: str = None, components: list = None, **_) -> str:
-    """T-BL49 interface alignment check — thin passthrough to the tool implementation.
+    """Interface alignment check — thin passthrough to the tool implementation.
 
     Returns the tool's stable JSON verbatim (ok + findings); the battery's "findings" reward
     shape reads the `findings` list. Kept as a gap fn because interface_check lives in its own
@@ -974,7 +973,7 @@ def _layout_coverage_cb():
 
 
 def _gap_layout_coverage(doc_id: str = None, **_) -> str:
-    """Layout-plan critical-dim & interface coverage gate (T-BL50).
+    """Layout-plan critical-dim & interface coverage gate.
 
     Reads the ``layout_plan`` doc-meta envelope (schema aicad.layout/1) to find which
     requirement IDs are flagged as critical_dim or interface, then checks each one in
@@ -1114,7 +1113,7 @@ def _gap_power_budget(doc_id: str = None, power_source: dict = None,
                       power_profile_path: str = None, power_board: dict = None,
                       power_profile: dict = None, power_scenario: str = "",
                       **_) -> str:
-    """T-FIN23 system power/energy budget as a verify check.
+    """System power/energy budget as a verify check.
 
     Delegates to services.mcp.power_budget.solve_power_budget: rail tree
     (source → converters → boardphys loads), duty-cycle weighting from an
@@ -1151,8 +1150,8 @@ GAP_FNS: dict[str, Any] = {
     "dim_coverage":      _gap_dim_coverage,
     "req_join":          _gap_req_join,
     "eval_check_direct": _gap_eval_check_direct,
-    "layout_coverage":   _gap_layout_coverage,  # T-BL50
-    "power_budget":      _gap_power_budget,     # T-FIN23
+    "layout_coverage":   _gap_layout_coverage,
+    "power_budget":      _gap_power_budget,
 }
 
 
@@ -1301,7 +1300,7 @@ def _extract_score(check_name: str, reward_shape: str, result_json: str | dict) 
             })
 
     else:  # "findings"
-        # interface_check (T-BL49) reports a `findings` list of {severity, detail, fix, ...};
+        # interface_check reports a `findings` list of {severity, detail, fix, ...};
         # only severity=="fail" entries should drive the score/fail (warns are advisory). Other
         # findings-shaped checks use pairs/violations/etc. and every listed item counts.
         if check_name == "interface_check" and r.get("ok") is not True:
@@ -1427,7 +1426,7 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
                     name, fn, doc_id, kwargs
                 )
                 if skip_payload is not None:
-                    # Honest SKIP: record reason, omit zero score (mega-15).
+                    # Honest SKIP: record reason, omit zero score.
                     skipped.append(name)
                     skip_obj = _parse_jsonish(skip_payload)
                     findings.append({

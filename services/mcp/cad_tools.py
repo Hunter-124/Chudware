@@ -1,4 +1,4 @@
-"""Mechanical CAD + simulation MCP tools — COMPAT FACADE (T-RF8).
+"""Mechanical CAD + simulation MCP tools — COMPAT FACADE.
 
 The tool implementations now live in per-family modules (cad_doc_tools, cad_eval_tools,
 cad_render_tools, cad_exchange_tools, cad_sim_tools, cad_asm_tools, cad_drawing_tools)

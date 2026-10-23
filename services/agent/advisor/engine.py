@@ -1,9 +1,9 @@
-"""Advisory engine ("foreman") — findings → aicad.advisory/1 items (T-W5).
+"""Advisory engine ("foreman") — findings → aicad.advisory/1 items.
 
 Contract: ``contracts/advisor.md`` §3 (advisory block, FROZEN) and §9 (precedence).
-Pillar 20: docs/ADVISOR_ARCHITECTURE.md §2.2.
+Pillar 20: docs/design/ADVISOR_ARCHITECTURE.md §2.2.
 
-Design (per the advisor review):
+Design:
 
   * The **engine is a pure function** over a *normalized observation* — it never
     sees ``res.fit`` or a raw RPC.  Two thin adapters (``adapters.py``) turn a
@@ -18,8 +18,7 @@ Engine invariant (contract §3): ``candidate_fixes`` may be empty ONLY for
 least one candidate fix.  This is enforced in :func:`build_advisory` and has a
 dedicated test — it is the easiest §3 rule to breach.
 
-Candidate-fix providers are feature-flagged individually (task note: "T-W2/T-W3
-may merge mid-task; feature-flag the candidate-fix providers individually") via
+Candidate-fix providers are feature-flagged individually via
 ``CHUDWARE_ADVISOR_FIX_<NAME>`` env vars, all default-on.
 """
 from __future__ import annotations
@@ -71,7 +70,7 @@ class Observation:
     seq: int = 0
     doc_id: str = ""
     user_override: bool = False     # §9.2: a live user instruction conflicts
-    # T-W21 trigger fields — all optional; default-empty keeps existing callers intact.
+    # Trigger fields — all optional; default-empty keeps existing callers intact.
     output_text: str = ""           # model/user text for keyword matching (§20)
     tool_names: list[str] = field(default_factory=list)   # tool calls this turn
     events: list[str] = field(default_factory=list)       # geometry events this turn
@@ -141,14 +140,14 @@ def _overlap_axis_from_bboxes(bbox_a: dict, bbox_b: dict) -> tuple[str, float]:
 def _fix_interference(f: Finding) -> tuple[list[dict], list[str]]:
     """Interference → targeted diagnosis with axis + magnitude + named fix.
 
-    T-DP6 upgrade: the finding now names the colliding bodies, the overlap
+    The finding names the colliding bodies, the overlap
     magnitude in mm³, the MTS (minimum-translation-separation) axis derived from
     the per-body AABBs already in the kernel return, and a targeted move/resize
     suggestion with a concrete distance.
 
     On the **doc path** the adapter may also carry cylindrical-face diameters
     (``bore_d`` / ``shaft_d`` / ``feature`` in ``f.extra``): when present we run
-    ``fit_calc`` (T-W3) and emit an ``edit_feature_param`` fix with real numbers.
+    ``fit_calc`` and emit an ``edit_feature_param`` fix with real numbers.
 
     On the **loop path** no diameters exist (``res.fit`` carries volume + names
     only), so we emit a heuristic move/resize fix and advertise ``fit_calc`` as a
@@ -247,7 +246,7 @@ def _fix_overlap(f: Finding) -> tuple[list[dict], list[str]]:
 
 
 def _fix_open_profile(f: Finding) -> tuple[list[dict], list[str]]:
-    """Open sketch profile → auto_constrain proposal (T-W2)."""
+    """Open sketch profile → auto_constrain proposal."""
     helper = ["sketch_auto_constrain", "sketch_health"]
     return [{
         "action": "auto_constrain",
@@ -373,7 +372,7 @@ def _fix_sim_divergence(f: Finding) -> tuple[list[dict], list[str]]:
 def _fix_wall_thickness(f: Finding) -> tuple[list[dict], list[str]]:
     """Thin wall → process-specific minimum wall advisory with resize hint.
 
-    T-DP6: emits the measured minimum, the process minimum, and a targeted
+    Emits the measured minimum, the process minimum, and a targeted
     param edit suggestion.  Numbers come from ``eval_thickness`` (kernel ray-cast)
     via the adapter — never invented.
     """
@@ -408,7 +407,7 @@ def _fix_wall_thickness(f: Finding) -> tuple[list[dict], list[str]]:
 def _fix_dfm(f: Finding) -> tuple[list[dict], list[str]]:
     """DFM check failure → per-issue targeted fix (wall or draft).
 
-    T-DP6: DFM issues carry a ``checks`` list (each with ``check``, ``value``,
+    DFM issues carry a ``checks`` list (each with ``check``, ``value``,
     ``limit``, ``note``).  We emit one fix per failed check so the fixer can
     apply them independently.  Numbers come from the DFM adapter — never invented.
     """
@@ -467,9 +466,9 @@ def _fix_dfm(f: Finding) -> tuple[list[dict], list[str]]:
 def _fix_interface_fitment(f: Finding) -> tuple[list[dict], list[str]]:
     """Interface alignment failure → per-check targeted fix.
 
-    T-DP6: interface_check findings carry a ``severity`` (fail/warn), a ``check``
+    interface_check findings carry a ``severity`` (fail/warn), a ``check``
     name (hole_pattern, coaxiality, contact_plane, fastener_passthrough), an
-    ``error_mm`` or ``detail``, and a pre-computed ``fix`` string (T-BL49 contract).
+    ``error_mm`` or ``detail``, and a pre-computed ``fix`` string.
     We lift the pre-computed fix into a candidate_fix so the fixer loop can apply
     it directly without re-running the checker.
     """
@@ -535,7 +534,7 @@ _FIX_PROVIDERS = {
     "sim_bc": _fix_sim_bc,
     "sim_margin": _fix_sim_margin,
     "sim_divergence": _fix_sim_divergence,
-    # T-DP6 diagnostic advisors
+    # Diagnostic advisors
     "wall_thickness": _fix_wall_thickness,
     "dfm": _fix_dfm,
     "interface_fitment": _fix_interface_fitment,
@@ -612,7 +611,7 @@ def build_advisory(obs: Observation) -> dict:
     policy).  Items are sorted highest-severity-first so the renderer drops from
     the tail.
 
-    ``failure_cards`` (T-W8): blocker-severity items are promoted to
+    ``failure_cards``: blocker-severity items are promoted to
     ``aicad.failure/1`` cards via :func:`failures.promote_advisory_blockers`.
     Cards are returned in the advisory block and are also available via
     :func:`build_advisory` for harness dispatch.  Non-blocker advisories are
@@ -628,7 +627,7 @@ def build_advisory(obs: Observation) -> dict:
 
     items.sort(key=lambda it: -SEVERITY_ORDER.get(it["severity"], 0))
 
-    # T-W21 §20: append trigger-based context items (severity=info, tail position
+    # §20: append trigger-based context items (severity=info, tail position
     # so the global drop-first policy drops them before findings).
     trigger_events: list[dict] = []
     if obs.output_text or obs.tool_names or obs.events:
@@ -656,7 +655,7 @@ def build_advisory(obs: Observation) -> dict:
         "trigger_events": trigger_events,
     }
 
-    # T-W8: promote blocker advisories to failure cards (harness-owned).
+    # Promote blocker advisories to failure cards (harness-owned).
     # Import locally to avoid circular import (failures.py imports nothing from engine.py).
     try:
         from .failures import promote_advisory_blockers

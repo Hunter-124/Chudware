@@ -1,4 +1,4 @@
-// Generated from engine_oracle/data/aisc_shapes/aisc_shapes_curated.json (T-RF19 leaf 5).
+// Generated from engine_oracle/data/aisc_shapes/aisc_shapes_curated.json.
 // Curated AISC section properties (dimensional facts; see sections.py posture note).
 // Units: mm / mm^2 / mm^3 / mm^4 / mm^6. DO NOT EDIT BY HAND.
 #pragma once

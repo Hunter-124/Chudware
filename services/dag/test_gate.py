@@ -1,4 +1,4 @@
-"""test_gate.py — Tests for T-A3: gate nodes, autonomy dial, interrupt/resume.
+"""test_gate.py — Tests for gate nodes, autonomy dial, interrupt/resume.
 
 Contract: contracts/dag_schema.md §6 (autonomy levels), §9 (checkpoint format).
 Interaction shape: contracts/interaction.md §1 kind=approval, §3 batch envelope.
@@ -8,7 +8,7 @@ Key DoD assertions:
   2. executor.resume() reloads checkpoint from a NEW SqliteSaver (app-restart simulation).
   3. Autonomy dial: auto skips gate, approve gates, manual gates.
   4. VERDICT_PAUSE referenced in gate context payloads (C++ seam).
-  5. Gate payload shaped as aicad.interaction/1 (T-F4 compat).
+  5. Gate payload shaped as aicad.interaction/1 (ask_user compat).
 
 NOTE: tests are pure Python (LangGraph + SQLite); they do NOT import core_bridge.
 The libchudware.so restage is a build-system obligation recorded separately.
@@ -106,7 +106,7 @@ def _mock_agent(request: str, context_pack: dict) -> Any:
 # ---------------------------------------------------------------------------
 
 class TestGatePayloadShape:
-    """Gate payloads must be shaped as aicad.interaction/1 approval batches (T-F4 seam)."""
+    """Gate payloads must be shaped as aicad.interaction/1 approval batches (ask_user seam)."""
 
     def test_schema_field(self):
         node = {"id": "g1", "name": "Gate 1", "type": "gate", "autonomy": "approve"}

@@ -627,10 +627,12 @@ std::string admin_worker_bin(bool& compiled, std::string& err) {
 #endif
 }
 
+// Developer worker cwd: CHUDWARE_REPO, else the source checkout this binary runs
+// from, else ".".
 std::string admin_worker_repo_root() {
     if (const char* env = std::getenv("CHUDWARE_REPO"); env && *env) return std::string(env);
-    const char* home_c = std::getenv("HOME");
-    return home_c ? std::string(home_c) + "/Repositories/CAD" : std::string(".");
+    const auto root = chudware::platform::developerSourceRoot();
+    return root.empty() ? std::string(".") : root.string();
 }
 
 // Spawns the services worker, sends ONE
@@ -1140,7 +1142,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     const int run_depth = options.value("run_depth", 0);
     const bool is_sub_run = options.value("is_sub_run", false) || run_depth > 0;
 
-    // Advisor seam: reserved. C++ has no foreman battery — leave empty (no fabricated
+    // Advisor seam: reserved. C++ has no advisory-engine battery — leave empty (no fabricated
     // advisories). Host/Python may later push text via options.advisory_text.
     // Nested runs inherit advisory_text if the parent set one for firm team seeds.
     clear_context_advisory();
@@ -1369,7 +1371,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     // ONE provider instance for the whole run (per-role scripted queues must persist).
     ProviderFn provider = make_provider(provider_cfg);
 
-    // T-H7: resolve consent early (same logic as post-run; consent_tier/load_config are
+    // Resolve consent early (same logic as post-run; consent_tier/load_config are
     // cheap and idempotent — we re-read at emit time too, but need it now for the wrapper).
     std::string run_consent = consent_tier(load_config());
     if (offline) run_consent = "off";  // offline hard-overrides to "off" (same as emit site)
@@ -2951,11 +2953,11 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     json tree_now = doc::doc_tree(doc_id);
     int revision = tree_now.value("revision", state.revision);
 
-    // T-H1 telemetry (contracts/telemetry.md): the design run's output is one AI
+    // Telemetry (contracts/telemetry.md): the design run's output is one AI
     // artifact; the run applies its ops to the live document as it goes, so a
     // completed run IS the apply — "applied" is inferred from completion
     // (buttonless v1; the GUI takes the result over the C-ABI bridge and has no
-    // core/agent linkage, so the emission lives here — see work/questions/T-H1.md).
+    // core/agent linkage, so the emission lives here).
     {
         std::string consent = consent_tier(load_config());
         if (offline) consent = "off";  // options-level offline flag: same hard override

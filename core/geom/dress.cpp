@@ -225,7 +225,7 @@ TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
     TopoDS_Shape all = build(good, recording ? &prov : nullptr);
     if (!all.IsNull()) return finish(all);
 
-    // T-PERF10: bisect over the edge list instead of O(E²) one-edge-at-a-time rebuilds.
+    // Bisect over the edge list instead of O(E²) one-edge-at-a-time rebuilds.
     // A crashing subset is indistinguishable from any other failed build, preserving the
     // established drop count and \"round what you can\" behavior.
     auto try_build = [&](const std::vector<TopoDS_Edge>& edges) -> bool {

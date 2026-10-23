@@ -1,4 +1,4 @@
-"""org_tools.py — MCP tool registrations for the org-layer tools (T-W22).
+"""org_tools.py — MCP tool registrations for the org-layer tools.
 
 Family: ``org``.  Risk class: ``write`` (mutates org state / ledger).
 
@@ -155,7 +155,7 @@ def register_org_tools(mcp) -> None:
         written as a decision event.  Dissents are registered in the mission's
         DissentsRegistry so the foreman can watch trigger_conditions.
 
-        T-DP8: ``stage`` and ``tier`` are optional — when omitted they are read
+        ``stage`` and ``tier`` are optional — when omitted they are read
         from the mission context automatically.  They drive the council policy
         engine (breadth / diverse-model selection).  Local tiers run wide (all 4
         seats); frontier runs narrow (1 seat, cost-minimising).
@@ -168,14 +168,14 @@ def register_org_tools(mcp) -> None:
         registry = (
             getattr(ctx, "dissents_registry", None) if ctx is not None else None
         )
-        # T-DP8: read stage/tier from mission context when not explicitly given.
+        # Read stage/tier from mission context when not explicitly given.
         ctx_stage: Optional[str] = (
             getattr(ctx, "stage", None) if ctx is not None else None
         )
         ctx_tier: Optional[str] = (
             getattr(ctx, "tier", None) if ctx is not None else None
         )
-        # Multiple providers for diverse-model selection (T-DP8).
+        # Multiple providers for diverse-model selection.
         ctx_providers: Optional[list] = (
             getattr(ctx, "providers", None) if ctx is not None else None
         )

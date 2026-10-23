@@ -7,14 +7,14 @@ Test coverage:
   * Budget accrual + revocation at exact exhaustion.
   * Routing fallthrough when a source is offline.
   * Resolution ledger events emitted on every resolve.
-  * Soft depth limit: advisory warning event emitted; spawn still succeeds (T-DP9).
+  * Soft depth limit: advisory warning event emitted; spawn still succeeds.
   * Single-source degenerate case (all roles collapse onto one model).
-  * resolve_assignments() returns the per-role map (T-W17 GUI API).
+  * resolve_assignments() returns the per-role map (settings GUI API).
   * delegate() tool returns correct dict on success + error dict on failure.
   * Sub-agent identities: each node gets a unique dg_ id (no shared mutable default).
-  * Budget meter: tree-wide token+agent tracking, always-current (T-DP9).
-  * Kill-switch: revokes all active nodes, sets killed=True, rejects further spawns (T-DP9).
-  * Soft-limit advisory events: depth_warning + agent_limit_warning (T-DP9).
+  * Budget meter: tree-wide token+agent tracking, always-current.
+  * Kill-switch: revokes all active nodes, sets killed=True, rejects further spawns.
+  * Soft-limit advisory events: depth_warning + agent_limit_warning.
   * delegation: block in routing.yaml drives soft_depth_limit + max_agents on RoutingTable.
 
 Offline discipline: mock providers, no network, no LLM, no all-skip.
@@ -297,7 +297,7 @@ class TestRoutingResolution(unittest.TestCase):
 
 
 class TestResolveAssignments(unittest.TestCase):
-    """resolve_assignments() — T-W17 settings GUI API."""
+    """resolve_assignments() — settings GUI API."""
 
     def test_all_roles_returned(self):
         rt = _two_source_routing()
@@ -908,7 +908,7 @@ class TestArtifactShape(unittest.TestCase):
         # depth_cap retained for backward compat with artifact readers.
         self.assertIn("depth_cap", art)
         self.assertEqual(art["depth_cap"], DEPTH_CAP)
-        # T-DP9 additive fields.
+        # Additive budget-meter / soft-limit fields.
         self.assertIn("soft_depth_limit", art)
         self.assertIn("budget_meter", art)
         self.assertIn("killed", art)
@@ -950,7 +950,7 @@ class TestArtifactShape(unittest.TestCase):
 
 
 class TestDocLeaseShape(unittest.TestCase):
-    """Docs field carries lease requests (T-W16 request shape only)."""
+    """Docs field carries lease requests (request shape only)."""
 
     def test_doc_leases_stored(self):
         tree = DelegationTree(run_id="r_docs", orchestrator_budget=5000)
@@ -983,7 +983,7 @@ class TestDocLeaseShape(unittest.TestCase):
 
 
 class TestOverseerProviderResolution(unittest.TestCase):
-    """overseer.resolve_overseer_provider with routing seam (T-W14)."""
+    """overseer.resolve_overseer_provider with routing seam."""
 
     def test_routing_preferred_over_fallback(self):
         from services.agent.advisor.overseer import resolve_overseer_provider
@@ -1021,12 +1021,12 @@ class TestOverseerProviderResolution(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# T-DP9: Budget meter tests
+# Budget meter tests
 # ---------------------------------------------------------------------------
 
 
 class TestBudgetMeter(unittest.TestCase):
-    """BudgetMeter: tree-wide token+agent tracking (T-DP9)."""
+    """BudgetMeter: tree-wide token+agent tracking."""
 
     def test_initial_meter_state(self):
         tree = DelegationTree(
@@ -1117,12 +1117,12 @@ class TestBudgetMeter(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# T-DP9: Kill-switch tests
+# Kill-switch tests
 # ---------------------------------------------------------------------------
 
 
 class TestKillSwitch(unittest.TestCase):
-    """kill(): halt the whole tree, set killed=True, reject subsequent spawns (T-DP9)."""
+    """kill(): halt the whole tree, set killed=True, reject subsequent spawns."""
 
     def _tree_with_active_nodes(self) -> tuple[DelegationTree, Any, Any]:
         ledger = _MockLedger()
@@ -1220,12 +1220,12 @@ class TestKillSwitch(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# T-DP9: Soft-limit advisory event tests
+# Soft-limit advisory event tests
 # ---------------------------------------------------------------------------
 
 
 class TestSoftLimitAdvisory(unittest.TestCase):
-    """Soft depth + agent count limits emit advisory events, not errors (T-DP9)."""
+    """Soft depth + agent count limits emit advisory events, not errors."""
 
     def test_depth_warning_event_at_soft_limit(self):
         ledger = _MockLedger()
@@ -1329,12 +1329,12 @@ class TestSoftLimitAdvisory(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# T-DP9: Routing delegation config tests
+# Routing delegation config tests
 # ---------------------------------------------------------------------------
 
 
 class TestRoutingDelegationConfig(unittest.TestCase):
-    """delegation: block in routing.yaml / load_routing dict drives RoutingTable (T-DP9)."""
+    """delegation: block in routing.yaml / load_routing dict drives RoutingTable."""
 
     def test_delegation_config_parsed_from_dict(self):
         cfg = {
@@ -1358,7 +1358,7 @@ class TestRoutingDelegationConfig(unittest.TestCase):
         self.assertEqual(rt.max_agents, 64)  # DEFAULT_MAX_AGENTS
 
     def test_routing_yaml_has_delegation_block(self):
-        """The canonical routing.yaml on disk must have a delegation: block (T-DP9)."""
+        """The canonical routing.yaml on disk must have a delegation: block."""
         rt = load_routing()  # reads the real routing.yaml next to the module
         self.assertIsInstance(rt.soft_depth_limit, int)
         self.assertGreater(rt.soft_depth_limit, 0)

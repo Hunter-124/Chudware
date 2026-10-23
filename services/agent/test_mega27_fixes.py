@@ -1,6 +1,6 @@
 """Mega-27 fixes — C27 board outline room + D27 clearance retry grow ladder.
 
-Grounded in mega-26 a1 fingerprints (reports/runs/mega-26/):
+Grounded in mega-26 a1 fingerprints:
 
   C27 / AC4 residual room — board_from_schematic AUTO-OUTLINE packs parts so
     the router cannot meet 0.2mm clearance even after B26 autoroute(pitch=0.3).
@@ -531,7 +531,7 @@ def test_b26_y25_s23_hold_sim_and_clearance_intent():
 
 def test_board_flow_outline_knobs_accepted():
     """Engine-side: board_flow._ensure_outline honors board_size / margin."""
-    # T-RF20: board_flow drives the C++-backed facade now (services.mcp.ecad_common).
+    # board_flow drives the C++-backed facade now (services.mcp.ecad_common).
     from services.mcp.ecad_common import ecad_session, schema
     from services.mcp import board_flow as bf
 
@@ -551,7 +551,7 @@ def test_board_flow_outline_knobs_accepted():
                       "size": [0.8, 0.8], "type": "smd", "layers": ["F.Cu"]}],
         },
     ]
-    ecad_session.swap_doc(pcb, pcb.doc)  # T-RF20: pcb.doc is a client copy — write back
+    ecad_session.swap_doc(pcb, pcb.doc)  # pcb.doc is a client copy — write back
     report: dict = {"steps": []}
     warnings: list = []
     bf._ensure_outline(

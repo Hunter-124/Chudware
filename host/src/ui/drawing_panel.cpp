@@ -374,7 +374,7 @@ static bool drawCall(AppState& st, const char* method, const nlohmann::json& par
     return false;
 }
 
-// T-PERF4: async drawing RPC for HLR-heavy ops (add/scale view, arrange, sheet size, title block).
+// Async drawing RPC for HLR-heavy ops (add/scale view, arrange, sheet size, title block).
 // Keeps the UI live; absorbs the returned drawing on drain. `then` runs after a successful absorb
 // (e.g. drawing_set_sheet -> drawing_arrange so the views refit the new paper).
 using DrawThen = std::function<void(AppState&, int tabIdx)>;
@@ -498,7 +498,7 @@ static void removeView(AppState& st, AppState::DocTab& tab, const std::string& v
 static void commitViewScale(AppState& st, AppState::DocTab& tab, const std::string& viewId,
                             double scale) {
     nlohmann::json params = {{"doc_id", tab.drawingDocId}, {"view_id", viewId}, {"scale", scale}};
-    // HLR re-project can be multi-second — async (T-PERF4).
+    // HLR re-project can be multi-second — async.
     drawCallAsync(st, "drawing_set_view", std::move(params), "Scale view");
 }
 
@@ -506,7 +506,7 @@ static void addStdView(AppState& st, AppState::DocTab& tab, const char* type, co
                        double px, double py) {
     nlohmann::json params = {{"doc_id", tab.drawingDocId}, {"type", type}, {"orientation", orient},
                              {"position", nlohmann::json::array({px, py})}};
-    // HLR for a new view is the expensive path — async (T-PERF4).
+    // HLR for a new view is the expensive path — async.
     drawCallAsync(st, "drawing_add_view", std::move(params), "Add view", /*needFit=*/true);
 }
 

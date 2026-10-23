@@ -29,7 +29,7 @@ using std::vector;
 // --------------------------------------------------------------------------- tables
 
 const std::set<string> RESERVED_DATUMS = {
-    "origin", "point.origin",  // T-BL37: "point.origin" is the canonical prefixed form; "origin" kept for back-compat
+    "origin", "point.origin",  // "point.origin" is the canonical prefixed form; "origin" kept for back-compat
     "plane.front", "plane.top", "plane.right",
     "axis.x", "axis.y", "axis.z",
 };
@@ -1359,7 +1359,7 @@ vector<string> validate_sketch3d_params(const json& params, const string& where,
 
     static const std::regex ENT_ID_RE("^e\\d+$");
     static const std::regex CON_ID_RE("^c\\d+$");
-    // T-3DXREF — bare "x<N>" (an external ref id) is also a valid whole-entity/point
+    // External refs: bare "x<N>" (an external ref id) is also a valid whole-entity/point
     // handle (it's always a fixed ground POINT — see resolve_handle in sketch3d.cpp,
     // which treats a whole "point" entity the same way).
     static const std::regex HANDLE_RE(
@@ -1403,7 +1403,7 @@ vector<string> validate_sketch3d_params(const json& params, const string& where,
                         errs.push_back(ew + ".points[" + std::to_string(k) +
                                        "]: must be [x,y,z]");
         } else if (t == "eq_curve3d") {
-            // T-3DEQ: x(t)/y(t)/z(t) expression strings + t1/t2 range. Reuses the same
+            // eq_curve3d: x(t)/y(t)/z(t) expression strings + t1/t2 range. Reuses the same
             // safe-expr grammar check as the 2D eq_curve (validate_eq_curve_expr).
             for (const char* key : {"xt", "yt", "zt"}) {
                 const json& v = get(e, key);
@@ -1423,7 +1423,7 @@ vector<string> validate_sketch3d_params(const json& params, const string& where,
         }
     }
 
-    // T-3DXREF — external_refs mint their own "x<N>" id space (bare ids double as fixed
+    // External refs mint their own "x<N>" id space (bare ids double as fixed
     // point handles usable in constraint refs, checked below alongside entity handles).
     std::set<string> xref_ids;
     const json& external_refs = get(params, "external_refs");

@@ -2204,7 +2204,7 @@ def test_new_part_fresh_still_mints_a_distinct_document():
 
 
 def test_new_part_resume_reports_the_feature_count_it_resumed_onto():
-    """The BUILT/UNBUILT split (docs/REFACTOR_LOG.md ~5274, ~5309): a same-named part is
+    """The BUILT/UNBUILT split: a same-named part is
     resumed either way, but a BUILT one must announce what it carries. Resuming a
     half-built body SILENTLY is what produced twelve "boss added no material (it is buried
     inside the body)" failures, so feature_count and the build-on-them note are the
@@ -2713,7 +2713,7 @@ def test_render_part_caption_pairs_image_with_text():
     assert "OVERLAY FAILED" not in caption, caption
 
 
-# ================================================================ T-BL16 motion/kinematics
+# ================================================================ motion/kinematics
 # simulate_motion: drive one dimensional mate over a range, re-solve the mate graph each step,
 # return per-body trajectory + swept interference (reuses solve_mates + check_interference).
 
@@ -2739,8 +2739,8 @@ def _mechanism(doc_id: str) -> dict:
 
 
 def _build_swinging_arm_assembly(tmp_path) -> tuple:
-    """A driven single-DOF planar CRANK mechanism (honestly named: not a full 4-bar; see
-    work/questions/T-BL16.md for the fidelity decision — the tool itself drives any dimensional
+    """A driven single-DOF planar CRANK mechanism (honestly named: not a full 4-bar —
+    the tool itself drives any dimensional
     mate, so 4-bar/cam-follower need no tool change; this is the minimal *stable* mechanism that
     regression-tests every simulate_motion behavior):
 
@@ -3160,7 +3160,7 @@ def test_simulate_motion_rejects_non_dimensional_mate(tmp_path):
 
 
 def test_simulate_motion_kinematics_only_has_no_dynamics_key(tmp_path):
-    """Regression contract (T-FIN20): the default (kinematics) result gains NO new key."""
+    """Regression contract: the default (kinematics) result gains NO new key."""
     asm, mate_id, _ = _build_swinging_arm_assembly(tmp_path)
     r, _ = _call("simulate_motion", {"doc_id": asm, "mate_id": mate_id,
                                      "start": 0.0, "stop": 30.0, "steps": 4,
@@ -3904,7 +3904,7 @@ def test_new_assembly_resolves_relative_sources_against_the_project(tmp_path, mo
     """Live 2026-10-10 (six-axis arm): the agent copied `source` objects from a SAVED
     assembly (`parts/redesign/claw_base.step+`, relative to its file) into a NEW unsaved
     assembly. The engine resolved them against hostd's cwd and failed
-    "doc_open: no such file: /home/hunter/parts/...". An unsaved assembly resolves a
+    "doc_open: no such file: /home/user/parts/...". An unsaved assembly resolves a
     relative source against the project folder; describe_assembly reports the absolute file."""
     project = tmp_path / "project"
     (project / "parts").mkdir(parents=True)

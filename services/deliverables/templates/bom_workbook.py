@@ -1,4 +1,4 @@
-"""``bom_workbook`` — the BOM / cost workbook (xlsx), a T-F15 engineering template.
+"""``bom_workbook`` — the BOM / cost workbook (xlsx), an engineering template.
 
 A bill of materials with **live cost formulas**: quantity × unit-cost extended cost and a
 per-level rollup that recompute when the sheet is opened (openpyxl real formulas, contract §5.3).
@@ -10,7 +10,7 @@ One sheet per assembly level. Fixed column order so load-bearing columns are una
 - ``Qty`` (col 1) and ``Unit Cost`` (col 2) are **load-bearing** — a bare numeral there is a
   ``provenance_violation``; they resolve from a BOM / sourced-part tool result (contract §4).
 - ``Ext Cost`` (col 3) is a live formula string like ``=B2*C2``; a rollup row uses ``=SUM(...)``.
-- ``Source`` (col 4) is free prose — a sourced-part link when WS-B data is present, blank without
+- ``Source`` (col 4) is free prose — a sourced-part link when sourcing data is present, blank without
   (graceful: the workbook still builds).
 
 Registered ``kind='workbook'`` → driven by the existing ``make_workbook`` tool, no contract

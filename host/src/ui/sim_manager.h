@@ -39,8 +39,8 @@ struct RpcResult;
 
 namespace ui {
 
-// T-FIN24: one Simulate workspace hosts EVERY study kind. Flow/Thermal are the OpenFOAM/LBM
-// CFD family; ThermalFea is the core conduction solver (sim_run_thermal, steady + T-FIN18
+// One Simulate workspace hosts EVERY study kind. Flow/Thermal are the OpenFOAM/LBM
+// CFD family; ThermalFea is the core conduction solver (sim_run_thermal, steady +
 // transient); Buckling is engine linear buckling; Contact is a CalculiX box proxy;
 // FreqResponse is modal superposition (core modal + worker vibration post-processing).
 enum class StudyType { Static, Modal, Flow, Fatigue, Thermal, Motion,
@@ -161,7 +161,7 @@ struct Study {
     // Static: which failure theory drives the headline FoS + the FoS plot field.
     FailureCriterion criterion = FailureCriterion::VonMises;
 
-    // ---- T-FIN24 study kinds -----------------------------------------------------------
+    // ---- Multiphysics study kinds -------------------------------------------------------
     // Contact (CalculiX two-block proxy): pressure on the upper block.
     float contactPressureMpa = 1.0f;
     // Frequency response (modal superposition over the core modal solve).
@@ -169,7 +169,7 @@ struct Study {
     float frZeta = 0.02f;           // modal damping ratio (assumption, echoed back)
     float frBaseG = 1.0f;           // harmonic base input amplitude (g)
     // Thermal FEA (core conduction solver): fixture faces = fixed temperature; loads =
-    // flux/convection; transient per T-FIN18 (backward Euler).
+    // flux/convection; transient via backward Euler.
     float thermK = 200.0f;          // conductivity W/(m K) (default ~aluminium)
     float thermCp = 900.0f;         // specific heat J/(kg K) — transient only
     float thermFixTempC = 20.0f;    // Dirichlet temperature on the fixture faces (C)
@@ -177,7 +177,7 @@ struct Study {
     float thermTEndS = 60.0f;       // transient horizon (s)
     float thermDtS = 0.0f;          // step (s); 0 = solver default
     float thermTInitC = 20.0f;      // initial temperature (C)
-    // Transient result payloads for the T-FIN24 kinds (never persisted). advResult holds
+    // Transient result payloads for the multiphysics kinds (never persisted). advResult holds
     // the raw worker/solver JSON (incl. any aicad.simhandoff/1 provenance under
     // "simhandoff"); frSweep/frAccel are the harmonic response plot arrays.
     nlohmann::json advResult;
@@ -819,7 +819,7 @@ private:
     void invalidateEmResults();
     void drawEmParameterEditor();
 
-    // ---- T-FIN24: multiphysics capability doctor + panels ----------------------------------
+    // ---- Multiphysics capability doctor + panels ------------------------------
     // sim_caps probe (worker multiphysics seam): CalculiX presence (contact), the
     // vibration post leg, and which cross-sim handoff endpoints are servable. Probed once
     // asynchronously when the Simulate workspace activates; drives honest gating (fw_status
@@ -902,7 +902,7 @@ private:
     void runEmulation(AppState& st);
 
     // Cross-sim handoff panel (aicad.simhandoff/1 seam): ECAD board -> thermal FEA
-    // (ecad_thermal_handoff worker mirror) + the T-FIN17 heatsink pick forward seam.
+    // (ecad_thermal_handoff worker mirror) + the heatsink pick forward seam.
     struct HandoffState {
         // Stable ECAD identity. The docTabs vector is presentation order only and may
         // reorder or reuse an index after the source board closes.
@@ -913,7 +913,7 @@ private:
         bool running = false;
         std::string error;
         nlohmann::json result;        // last ecad_thermal_handoff payload
-        nlohmann::json heatsink;      // last heatsink_select payload (T-FIN17)
+        nlohmann::json heatsink;      // last heatsink_select payload
         std::string heatsinkComponentRef;
         int heatsinkTargetKind = 0;   // 0 junction (Tj), 1 case (Tcase)
         float heatsinkTargetC = 0.0f;
@@ -937,7 +937,7 @@ private:
     void deriveHeatsinkTarget(const std::string& componentRef);
     std::string heatsinkSetupBlocker(const AppState& st) const;
 
-    // T-FIN24 runs.
+    // Multiphysics runs.
     void runThermalFea(AppState& st, Study& s);       // SimClient sim_run_thermal
     void runContact(AppState& st, Study& s);          // worker sim_run_contact (async rpc)
     void runFreqResponse(AppState& st, Study& s);     // modal solve, post in tick completion
@@ -946,10 +946,10 @@ private:
     bool advRunning_ = false;                          // an async worker study run in flight
     // Model bbox from the face-centroid cache (proxy dimensions for contact).
     bool modelBbox(AppState& st, float lo[3], float hi[3]) const;
-    // Draw the results block for the T-FIN24 kinds (tables + line plots, no overlay).
+    // Draw the results block for the multiphysics kinds (tables + line plots, no overlay).
     void drawAdvancedResults(AppState& st, Study& s);
     // One "Provenance: <coupling> — <domain>/<tool>" line when a result carries a
-    // simhandoff envelope (study provenance display, T-FIN24).
+    // simhandoff envelope (study provenance display).
     static void drawProvenance(const nlohmann::json& result);
 
     // Armed well for viewport picking: -1 none, 0 = fixtures, >=1 = loads[armId-1]. Tied to sel_.
@@ -1064,7 +1064,7 @@ private:
     // Mesh-preview state (built by previewMesh from sim_mesh; drawn in the viewport while setting up).
     std::vector<float> meshPreviewSegs_;   // flat GL_LINES xyz pairs (surface element edges)
     std::string meshPreviewStudyId_;       // study the preview belongs to ("" = none)
-    bool meshPreviewPending_ = false;      // T-PERF4: sim_mesh async in flight
+    bool meshPreviewPending_ = false;      // sim_mesh async in flight
     // Honest LOD bookkeeping for the wireframe above (0 = nothing built).
     size_t meshPreviewElemsTotal_ = 0;     // elements the mesher actually produced
     size_t meshPreviewElemsUsed_  = 0;     // elements this wireframe was derived from

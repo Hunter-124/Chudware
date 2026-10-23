@@ -1,8 +1,8 @@
-// T-BL28 regression: the ruled / fill / boundary surface ops must accept BODY-EDGE
+// Regression: the ruled / fill / boundary surface ops must accept BODY-EDGE
 // selectors — the exact refs the ribbon's K_EDGE wells emit — not just sketch/region
 // refs. Before the fix, `surf_sketch_wire()` funnelled every ref through require_sketch,
 // so a body-edge pick threw "… is a solid body, not a sketch" and the whole
-// "Curves & Patches" group was dead from the GUI (T-G20 audit, the one real wiring bug).
+// "Curves & Patches" group was dead from the GUI (found by a surfaces audit).
 //
 // These cases drive the DOCUMENT COMPILE path (compile_document) with the SAME selector
 // json that `make_selector` stamps for a viewport edge pick — harvested off the body's
@@ -90,7 +90,7 @@ json vertical_edge_selector_at(double W, double H, double D, double cx, double c
 //     front face: a planar patch at y=0 spanning x in [0,W], z in [0,D]. Pre-fix this
 //     threw "edge_a -> 'x1' is a solid body, not a sketch"; the feature must now build a
 //     surface body (the box survives alongside it -> 2 bodies).
-TEST_CASE("surf_ruled from two body edges builds a surface (T-BL28)") {
+TEST_CASE("surf_ruled from two body edges builds a surface") {
     const double W = 40.0, H = 30.0, D = 20.0;
 
     json ea = vertical_edge_selector_at(W, H, D, 0.0, 0.0);
@@ -121,7 +121,7 @@ TEST_CASE("surf_ruled from two body edges builds a surface (T-BL28)") {
 //     bounded by that face's perimeter. Same body-edge selectors, the fill/boundary code
 //     path (shares surf_sketch_wire). Proves the fix covers all three edge-fed forms, not
 //     just ruled. Uses the top-face edges (z=D) as a closed boundary loop.
-TEST_CASE("surf_fill from four body edges builds a patch (T-BL28)") {
+TEST_CASE("surf_fill from four body edges builds a patch") {
     const double W = 40.0, H = 30.0, D = 20.0;
 
     // Harvest the 4 top-face (z=D) edges, deduped by rounded centroid.
@@ -160,7 +160,7 @@ TEST_CASE("surf_fill from four body edges builds a patch (T-BL28)") {
 // (3) BACKWARD COMPAT: surf_ruled from two SKETCH refs still works after the fix (the
 //     change is additive — a sketch owner still routes to the whole-sketch wire path).
 //     Two parallel line-segment sketches on offset planes ruled into a strip.
-TEST_CASE("surf_ruled from two sketch refs still works (T-BL28 no regression)") {
+TEST_CASE("surf_ruled from two sketch refs still works (no regression)") {
     json doc;
     doc["features"] = json::array({
         seg_sketch("s1", "top", 0.0, 0.0, 40.0, 0.0),
@@ -180,9 +180,9 @@ TEST_CASE("surf_ruled from two sketch refs still works (T-BL28 no regression)") 
 
 // (4) surf_boundary from body edges. Shares the exact add_wire_edges -> surf_sketch_wire
 //     path as surf_fill, but the ref slot is dir1 (+ optional dir2) — cover it explicitly
-//     so the test literally exercises all three edge-fed forms (DoD "all three"). dir1 =
+//     so the test literally exercises all three edge-fed forms. dir1 =
 //     the four top-face edges as a boundary loop.
-TEST_CASE("surf_boundary from body edges builds a patch (T-BL28)") {
+TEST_CASE("surf_boundary from body edges builds a patch") {
     const double W = 40.0, H = 30.0, D = 20.0;
 
     TopoDS_Shape box = geom::make_box(W, H, D);

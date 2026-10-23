@@ -1,12 +1,12 @@
 """Overseer reroute routing — a targeted correction to the OWNING design-pipeline
-stage (T-DP5).
+stage.
 
-Contract: ``docs/AGENT_DESIGN_PIPELINE.md`` §3.1 (overseer audit + error correction:
+Contract: ``docs/design/AGENT_DESIGN_PIPELINE.md`` §3.1 (overseer audit + error correction:
 "route a *targeted correction back to the specific stage that owns it* — never a
 blind full retry") and ``contracts/design_pipeline.md`` §2/§4 (the frozen DP-stage ↔
 ledger-kind ↔ role table).  Additive amendment to ``contracts/advisor.md`` §11: the
 audit verdict now carries an optional ``targeted_reentry`` object (documented there;
-minor bump, DP9-precedent additive field — never mutate the frozen shape).
+minor bump, additive field — never mutate the frozen shape).
 
 What this module is
 -------------------
@@ -230,8 +230,8 @@ def route_audit(audit: dict, *, ledger: Any | None = None,
     Deterministic post-validation step (the model's reroute prose is stripped by
     ``validate_audit``; the harness computes the real target here).  Returns the same
     audit dict with each verdict's ``targeted_reentry`` filled in — per-verdict, since
-    each finding may own a different stage (DoD: "audit events {stage, finding,
-    targeted_reentry}").  ``ok`` verdicts get no reentry.  ``dp_active`` forces the
+    each finding may own a different stage (audit events carry ``{stage, finding,
+    targeted_reentry}``).  ``ok`` verdicts get no reentry.  ``dp_active`` forces the
     class-fallback branch on for an explicitly-DP run; otherwise a DP artifact in the
     ledger opens that gate (see ``route_verdict``).
     """
@@ -242,7 +242,7 @@ def route_audit(audit: dict, *, ledger: Any | None = None,
 
 
 def route_change(affected: Any, dispatch: list[dict]) -> list[dict]:
-    """Add DP-stage + feature re-entry to a change-request dispatch list (T-DP5 step 5).
+    """Add DP-stage + feature re-entry to a change-request dispatch list.
 
     change_request.py maps a user change onto EXECUTION roles (feature_modeler,
     assembly_fit_engineer) — the "who edits the doc" layer.  This adds the DESIGN-STAGE

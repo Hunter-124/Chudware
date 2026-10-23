@@ -1,6 +1,6 @@
 """layout_plan_tools.py — MCP tool: layout_plan capture before modeling.
 
-Addresses T-BL50: "ensure proper layout plans the first time; not miss critical dims."
+Goal: "ensure proper layout plans the first time; not miss critical dims."
 
 Design: layout_plan rides ON aicad.req/1 (contracts/requirements.md — frozen, no schema
 change).  We use existing fields:
@@ -25,9 +25,8 @@ The full aicad.req/1 doc (requirements, evidence, status) is stored separately i
 doc-meta key "requirements" (as normal by req_tools.py).
 
 Registered by: services/mcp/server.py (append-only).
-Coordination: T-BL09 (sonnet-vetch) touches battery/req seam — keep battery edits
-  additive. T-BL49 (opus-gill) delivers interface_check tool — we consume its output
-  as evidence; join point documented at bottom of this file.
+Coordination: keep battery/req seam edits additive. The interface_check tool's output
+  is consumed as evidence; join point documented at bottom of this file.
 """
 from __future__ import annotations
 
@@ -48,7 +47,7 @@ _INTERFACE_VERIFIERS = frozenset({
     "solve_mates",
     "measure_between",
     "fit_report",
-    "interface_check",  # T-BL49 (landed) — fitment/alignment checker
+    "interface_check",  # fitment/alignment checker
 })
 
 # Evidence verifier names accepted as proof for critical-dim requirements
@@ -406,9 +405,9 @@ def register_layout_plan_tools(mcp: "FastMCP") -> None:
 
 
 # ---------------------------------------------------------------------------
-# T-BL49 join point note
+# interface_check join point note
 # ---------------------------------------------------------------------------
-# When opus-gill lands interface_check (task/T-BL49-interface-fitment-checker):
+# Wiring interface_check in:
 #   1. Add "interface_check" to _INTERFACE_VERIFIERS above.
 #   2. In _gap_layout_coverage (battery.py), the evidence check already accepts any
 #      verifier — the join is automatic.

@@ -1,4 +1,4 @@
-// ui::webBuild / ui::webGapReason — web-build capability gaps (T-RF12).
+// ui::webBuild / ui::webGapReason — web-build capability gaps.
 //
 // The web app is this same host/src/ui tree compiled to WASM, talking to chudware-hostd
 // with NO Python worker and NO CEF. Surfaces that depend on either must degrade to an
@@ -8,8 +8,7 @@
 //
 // Gap ids are the affected surface's own identifier — ribbon cmd_ids ("ecad_ai_design")
 // or panel surface ids ("web_browser", "vendor_signin", "account_signin"). Python-only
-// method families mirror contracts/web_parity.md's web_unsupported list (integrator-owned);
-// each table entry names the task that removes it.
+// method families mirror contracts/web_parity.md's web_unsupported list.
 #pragma once
 #include <string>
 

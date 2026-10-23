@@ -52,7 +52,7 @@ def material_lookup(material: str, property: Optional[str] = None) -> dict:
     if not material or not str(material).strip():
         return fail("bad_query", "Provide a material name (e.g. '6061-T6', 'A36 steel').")
 
-    # engine_oracle/materials was ported to core (T-RF19); resolve via the C++ RPC.
+    # engine_oracle/materials was ported to core; resolve via the C++ RPC.
     from services.mcp import core_bridge as _cb  # noqa: PLC0415
     rec = _cb.call("material_get", {"name": material}).get("result")
     if rec is not None:
@@ -90,7 +90,7 @@ def material_lookup(material: str, property: Optional[str] = None) -> dict:
     # CHUDWARE_ENABLE_MATERIAL_WEB it returns parsed, cited property values for the
     # named alloy from a reachable materials-info site (MakeItFrom); disabled it
     # returns fail() with zero network I/O, so we fall straight through to the
-    # cited web_search candidates below. Owner-directed opt-in — see that module
+    # cited web_search candidates below. Explicit accepted-risk opt-in — see that module
     # and contracts/license_debt.md row 17. Never bypasses bot-walls (MatWeb).
     from .material_web_lookup import material_web_lookup
     web = material_web_lookup(material, property)

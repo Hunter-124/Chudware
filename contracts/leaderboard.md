@@ -1,6 +1,6 @@
 # Contract: Model Leaderboard (`aicad.leaderboard/1`)
 
-Append-only. Integrator-owned. Defines the data seam between the benchmark harness
+Append-only. Maintainer-owned. Defines the data seam between the benchmark harness
 (producer: `tools/flywheel/bench/gym/leaderboard.py` aggregator) and the GUI
 (consumers: Settings > AI leaderboard summary, AI workspace leaderboard pane).
 

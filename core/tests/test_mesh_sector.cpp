@@ -1,12 +1,12 @@
 // Cyclic-sector regression: a 90 deg sector of a wheel disc must mesh and
 // SOLVE at both element orders.
 //
-// Live defect (ME 490 phase 5D, R1 mass credit): the 90 deg sector of
+// Live defect (a wheel-disc mass study): the 90 deg sector of
 // CD-210-01 (Ø508 disc, 3.175 mm web, Ø25.4 bore, one lightening window) was
 // refused twice, at fineness 0.5 and 0.7, with
 //   "polyfea: mesh contains unsupported tet4 connectivity;
 //    Chudware studies currently require tet4 or tet10"
-// on a valid watertight solid, so R1's factor of safety was never measured.
+// on a valid watertight solid, so the disc's factor of safety was never measured.
 //
 // Three independent defects wore that one message, all invisible at order 1:
 //   * LEFT-HANDED cells (negative signed volume) on the wedge's sharp radial
@@ -26,8 +26,8 @@
 // MeshOut (reoriented_elems / degenerate_elems_repaired) — never a refusal.
 //
 // The witness here is the same geometry at quarter radii, which carries all
-// three at a size a gate can afford. Set CHUDWARE_ME490_SECTOR=1 to add the
-// full-size mission sector at fineness 0.5 (about 11 minutes, ~0.5M elements).
+// three at a size a gate can afford. Set CHUDWARE_MESH_SECTOR_FULL=1 to add the
+// full-size sector at fineness 0.5 (about 11 minutes, ~0.5M elements).
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
@@ -57,7 +57,7 @@ using nlohmann::json;
 
 namespace {
 
-// The mission's sector, from CD-210-01A_Slice_Light_90deg_Sector: an annular
+// The real sector, from CD-210-01A_Slice_Light_90deg_Sector: an annular
 // sector spanning 22.5..112.5 deg between the Ø25.4 bore and the Ø508 rim, web
 // 3.175 mm, with the 45..90 deg lightening window (R101.6..R203.2) cut through.
 // `scale` shrinks the radii only — the 3.175 mm web is what makes the aspect
@@ -269,12 +269,12 @@ TEST_CASE("a 90 deg wheel-disc sector meshes and solves at tet4 and tet10") {
   check_solve_leg(sector, step, target, order);
 }
 
-// The mission geometry itself, opt-in: ~0.5M elements per leg, ~11 minutes for
+// The full-size geometry itself, opt-in: ~0.5M elements per leg, ~11 minutes for
 // the three legs below.
 //
 // It stops at a tet4 solve deliberately. Both element orders MESH at fineness
 // 0.5 (467162 elements, 33 left-handed cells relabelled and 14 flat cells
-// inflated — this is the exact refusal ME 490 phase 5D hit), and tet4 solves.
+// inflated — this is the exact refusal the mass study hit), and tet4 solves.
 // The order-2 SOLVE of this part is out of reach of any machine this runs on,
 // and the two ways to get there are both refused for the right reason: at
 // fineness 0.5 the 2.08M-DOF tet10 system needs an estimated 39.1 GB against a
@@ -283,10 +283,10 @@ TEST_CASE("a 90 deg wheel-disc sector meshes and solves at tet4 and tet10") {
 // connected components, two of which reach no fixture. Neither is the mesher
 // defect this file exists for; asserting either would pin a machine, not a
 // contract.
-TEST_CASE("the full-size ME 490 wheel sector meshes at both orders") {
-  const char *enabled = std::getenv("CHUDWARE_ME490_SECTOR");
+TEST_CASE("the full-size wheel sector meshes at both orders") {
+  const char *enabled = std::getenv("CHUDWARE_MESH_SECTOR_FULL");
   if (enabled == nullptr || std::string(enabled) == "0") {
-    MESSAGE("skipped: set CHUDWARE_ME490_SECTOR=1 to mesh the Ø508 sector");
+    MESSAGE("skipped: set CHUDWARE_MESH_SECTOR_FULL=1 to mesh the Ø508 sector");
     return;
   }
   const Sector sector(1.0);

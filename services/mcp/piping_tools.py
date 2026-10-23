@@ -1,10 +1,10 @@
 """AI-Piping MCP tools — steady-state 1-D pipe-network hydraulic solve + pressure-drop report
 + 3D CFD handoff for pipe internals.
 
-Same design contract as ``ecad_tools`` (project owner: "the AI is extremely limited; its tools
+Same design contract as ``ecad_tools`` (design principle: "the AI is extremely limited; its tools
 must do the bookkeeping and return rich, actionable context"). Each tool returns a JSON string
 ``{ok, ...result, warnings:[], hint:"...", next_actions:[...]}`` produced by the C++ core
-(T-RF19/T-RF20: the 1-D solve / report / operating-point / fluid / CFD-BC / verify envelopes
+(the 1-D solve / report / operating-point / fluid / CFD-BC / verify envelopes
 are owned by ``core/piping`` behind the libchudware ``piping_*`` RPCs — reached via
 :mod:`services.mcp.core_bridge`); the MCP layer keeps input parsing, its tiny session state
 (so ``piping_report`` can reuse the document / result of the last ``piping_solve``), and the

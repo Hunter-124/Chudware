@@ -28,7 +28,7 @@
 #include "icons.h"              // getIcon / IconUV
 #include "anim.h"               // ui::anim::toward — resize-boundary hover fade
 #include "metrics.h"            // logical dp scaling
-#include "panel_collapse.h"     // ui::PanelCollapseAnim — shared vertical-collapse animation (T-G21)
+#include "panel_collapse.h"     // ui::PanelCollapseAnim — shared vertical-collapse animation
 #include "widgets/kit.h"         // ui::kit::elide
 
 #include <filesystem>
@@ -453,7 +453,7 @@ void drawLeftPane(AppState& st,
         st.leftPaneTab == kLeftPaneSimulation)
         st.leftPaneTab = kLeftPaneFeatureManager;
 
-    // Vertical-collapse state (T-G21): the column rolls UP to its header (tab row + collapse
+    // Vertical-collapse state: the column rolls UP to its header (tab row + collapse
     // chevron) instead of shrinking to a pill. Persisted in config.json (st.settings.fmCollapsed)
     // so a collapsed column stays collapsed across restarts; seeded once from the loaded setting
     // (loadSettings runs before the first frame, so this static local's initializer reads it).
@@ -526,7 +526,7 @@ void drawLeftPane(AppState& st,
     const bool railWs = (st.activeWorkspace == AppState::Workspace::Simulate && st.simManager) ||
                         st.activeWorkspace == AppState::Workspace::Manufacture ||
                         st.activeWorkspace == AppState::Workspace::Electronics;
-    // T-G21 screenshot hook: --ui-screenshot always resets the overlay columns for determinism
+    // Screenshot hook: --ui-screenshot always resets the overlay columns for determinism
     // (io.IniFilename is nulled in shot mode, so DockBuilderGetNode is always null and the reset
     // branch above always fires) — the persisted collapse setting can't survive that on its own.
     // CHUDWARE_FM_COLLAPSED forces the collapsed capture the same way CHUDWARE_COPILOT_NARROW forces
@@ -545,7 +545,7 @@ void drawLeftPane(AppState& st,
     // Position is pinned every frame; WIDTH is resized via the shared visible resize boundary on
     // the right edge (columnResizeEdge: hairline + grip + hover glow, EW cursor, double-click resets
     // to defW) and persisted in the imgui ini like any floating window. HEIGHT animates between the
-    // full column height and the header-strip height (T-G21: vertical collapse — rolls UP to the tab
+    // full column height and the header-strip height (vertical collapse — rolls UP to the tab
     // row + chevron instead of shrinking to a pill; see ui::PanelCollapseAnim). Default/min widths
     // reuse the HiDPI-damped targets of the old dock split.
     const float panelSc = 1.0f + (S - 1.0f) * 0.55f;
@@ -947,7 +947,7 @@ void drawLeftPane(AppState& st,
     // same top row as the horizontal icon rail (fix 1) but reserved out of its width (chevRsv
     // below) so the two never overlap. A resting glass background (not hover-only) makes it read as an
     // obvious button rather than a stray floating mark (fix 4). Drawn before the rail / body lay out;
-    // the cursor is restored so the flow below is unaffected. T-G21: position and glyph are
+    // the cursor is restored so the flow below is unaffected. Position and glyph are
     // unchanged from the old collapse-to-pill version — only the toggle now runs both directions
     // (the pill's separate re-expand control is gone; this one chip drives the vertical collapse).
     const float chevSz  = 26.0f * S;                 // square chip, matches the rail icon-button height
@@ -1009,7 +1009,7 @@ void drawLeftPane(AppState& st,
     const float rowPad     = 6.0f * S;
     const float railRowH   = rowPad + btn + rowPad;   // full top-row height (icons + top/bottom pad)
     const float paneInnerWFull = ImGui::GetContentRegionAvail().x;
-    // T-G19: the tab-strip child now spans ONLY the tab buttons (was the whole row minus the chevron).
+    // The tab-strip child now spans ONLY the tab buttons (was the whole row minus the chevron).
     // This frees the top row's right span — between the last tab (Configurations) and the collapse
     // chevron — for the relocated OK/Cancel command buttons rendered below while a form is active.
     const float tabsW = nTabs * btn + (nTabs - 1) * gap;
@@ -1067,7 +1067,7 @@ void drawLeftPane(AppState& st,
     }
     ImGui::EndChild();
 
-    // T-G21: the tab row IS the header strip a vertical collapse rolls up to — measure its height
+    // The tab row IS the header strip a vertical collapse rolls up to — measure its height
     // (cursor position right after the row, symmetric-padded) so PanelCollapseAnim knows the exact
     // collapsed target. Measured every frame (one-frame lag feeding next frame's window height, same
     // trick the Copilot composer already uses for s_composerH), so it tracks any future header change
@@ -1078,7 +1078,7 @@ void drawLeftPane(AppState& st,
     // column has animated down near the header height — gates real work (tree/PM/config bodies)
     // rather than just clipping it, so a collapsed column costs nothing per frame.
     if (s_anim.bodyVisible()) {
-        // T-G19: relocated OK/Cancel command buttons. They sit ABOVE the PM,
+        // Relocated OK/Cancel command buttons. They sit ABOVE the PM,
         // between the Configurations tab and the collapse chevron. Rendered on the pane window
         // (after the tab-strip child so their hit rect is clean), right-aligned to end just left
         // of the chevron, vertically centered on the chevron. The PropertyManager owns

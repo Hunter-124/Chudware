@@ -300,7 +300,7 @@ private:
                              int timeoutMs, const EventFn& onEvent);
 
     // Real backend-routing body; the public call() wraps callWithLiveRouting
-    // with the T-G9 parity trace (CHUDWARE_RPC_TRACE=<file>) so the trace still
+    // with the RPC parity trace (CHUDWARE_RPC_TRACE=<file>) so the trace still
     // records the caller-visible method, params, and unwrapped result.
     bool callImpl(const std::string& method, const nlohmann::json& params,
                   nlohmann::json& result, std::string& err, int timeoutMs,

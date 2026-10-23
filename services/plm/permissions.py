@@ -8,7 +8,7 @@ everything. When organizations land (linking people by account), this grows a
 role/policy lookup keyed on ``actor.kind == "org_member"``; the call sites do not
 change.
 
-Design intent (Hunter 2026-07-07): permissions must be EASY to set up — sensible
+Design intent (2026-07-07): permissions must be EASY to set up — sensible
 role presets, not a raw ACL editor — so the future policy model is coarse roles
 (viewer / contributor / maintainer / owner) over resource classes, resolved here.
 """

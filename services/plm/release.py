@@ -1,9 +1,9 @@
-"""services.plm.release — release orchestration (T-R4, contract §5).
+"""services.plm.release — release orchestration (contract §5).
 
 A release is atomic and does all of (contract §5): pre-flight → rev stamp →
 lifecycle transition → geometry freeze → BOM freeze/ref pinning. The vault
-engine (T-R2) already cuts the atomic release entry; this module adds the
-full T-R4 semantics around it:
+engine already cuts the atomic release entry; this module adds the
+full release semantics around it:
 
 * **Pre-flight** (§5.1) — unsaved working changes, stale references
   (superseded component pins, via :mod:`assist`), never-released components,
@@ -234,7 +234,7 @@ def release(vault: Any, item_id: str, message: str, *,
             confirm: bool = False,
             verify_hook: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
             geometry_step: bytes | None = None) -> dict[str, Any]:
-    """Release an item with full T-R4 semantics (pre-flight → pin → freeze →
+    """Release an item with full release semantics (pre-flight → pin → freeze →
     rev stamp → lifecycle → stamp orders).
 
     Pre-flight problems block unless ``confirm=True`` (explicit override —

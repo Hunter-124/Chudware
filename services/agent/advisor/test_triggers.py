@@ -1,6 +1,6 @@
-"""Tests for trigger-based context injection — aicad.trigger/1 (T-W21).
+"""Tests for trigger-based context injection — aicad.trigger/1.
 
-Covers (task step 5):
+Covers:
   * Keyword match → context item injected with prerun calc result present
   * M6x1.0 → tap_drill fires, answer.tap_drill_mm = 5.0 (real table lookup)
   * Cooldown suppression (second call within cooldown_turns → no item)

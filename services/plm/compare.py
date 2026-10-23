@@ -1,4 +1,4 @@
-"""services.plm.compare — two-revision compare views (T-R3, contract §7 plm_compare).
+"""services.plm.compare — two-revision compare views (contract §7 plm_compare).
 
 Orchestrates — never re-specifies — the two existing engines (contract §9):
 

@@ -16,7 +16,7 @@ from typing import Callable
 from PIL import Image, ImageDraw
 
 # ---------------------------------------------------------------------------
-# Contract inventory  (parsed from docs/contracts/icons.md — mirrored here so
+# Contract inventory  (parsed from contracts/icons.md — mirrored here so
 # we can assert at build-time that draw functions cover every name).
 # ---------------------------------------------------------------------------
 CONTRACT_NAMES: list[str] = [
@@ -88,7 +88,7 @@ CONTRACT_NAMES: list[str] = [
     # Sketch shape drop-ins (polygon dropdown variants + star) and airfoil
     "poly_triangle", "poly_square", "poly_pentagon", "poly_octagon", "poly_star",
     "airfoil",
-    # ---- T-BL34 (append-only): Manufacture toolpath tiles. The shipped art is the
+    # ---- (append-only): Manufacture toolpath tiles. The shipped art is the
     # photographic toolpath render from scripts/cam_toolpath_icons.py (real cam_generate
     # output); these drawers are line-art FALLBACKS so a cell is never blank.
     "cam_face", "cam_contour2d", "cam_pocket2d", "cam_adaptive2d", "cam_slot",
@@ -107,7 +107,7 @@ CONTRACT_NAMES: list[str] = [
     # ---- PLM Git tab (append-only) ----
     "git",
     "thread",
-    # ---- Chat context refs (Wave 4, append-only): composer attach + context picker ----
+    # ---- Chat context refs (append-only): composer attach + context picker ----
     "paperclip", "context_cube",
     # ---- Copilot modes (append-only): mode-picker Ask + Eng. Firm glyphs ----
     "ask", "eng_firm",
@@ -115,7 +115,7 @@ CONTRACT_NAMES: list[str] = [
     # row keeps its packed UVs). The app logged "unknown icon: 'ws_parts' /
     # 'ws_manufacture'" every run and fell through to procedural glyphs. ----
     "ws_parts", "ws_manufacture",
-    # ---- Copilot Artifacts + PLM Graph (Wave 0 overhaul, append-only; appended
+    # ---- Copilot Artifacts + PLM Graph (append-only; appended
     # LAST so every pre-existing row keeps its packed UVs). The Artifacts panel
     # drew one 2 px grey dot per row regardless of kind and borrowed `team` for
     # its tab header; the PLM Graph toolbar had no glyphs at all. ----
@@ -559,7 +559,7 @@ def draw_csys(d, cell, p):
 
 @icon("origin")
 def draw_origin(d, cell, p):
-    """Part origin: three RGB axis arrows fanning from one point (T-G18 regen)."""
+    """Part origin: three RGB axis arrows fanning from one point."""
     s = cell * SS
     lw = int(stroke_width(cell) * 1.35)
     ox, oy = s * 0.40, s * 0.60          # origin low-left so the axes read up/right
@@ -573,7 +573,7 @@ def draw_origin(d, cell, p):
 
 @icon("equations")
 def draw_equations(d, cell, p):
-    """Global variables / equations: a bold Σ with an equals sign (T-G18 regen)."""
+    """Global variables / equations: a bold Σ with an equals sign."""
     s = cell * SS
     lw = int(stroke_width(cell) * 1.7)
     # Bold sigma (zig-zag) on the left-center — deep middle vertex so it reads as Σ, not "["
@@ -588,7 +588,7 @@ def draw_equations(d, cell, p):
 
 @icon("material")
 def draw_material(d, cell, p):
-    """Glossy material swatch sphere (T-G18 regen; T-G15 screenshot preset icons supersede)."""
+    """Glossy material swatch sphere (the screenshot preset icons supersede it)."""
     s = cell * SS
     lw = stroke_width(cell)
     cx, cy, r = s * 0.50, s * 0.50, s * 0.32
@@ -2203,7 +2203,7 @@ def draw_orientation(d, cell, p):
 
 @icon("ok_check")
 def draw_ok_check(d, cell, p):
-    # T-G19: bold WHITE checkmark for the relocated PropertyManager OK button. The button supplies a
+    # Bold WHITE checkmark for the relocated PropertyManager OK button. The button supplies a
     # saturated statusOk-green fill in BOTH themes, so a white glyph reads cleanly on light + dark
     # (the old p.ok-green check was near-invisible on a green pill). Larger + thicker than before so
     # it stays legible in the wider chrome button.
@@ -2213,7 +2213,7 @@ def draw_ok_check(d, cell, p):
 
 @icon("cancel_x")
 def draw_cancel_x(d, cell, p):
-    # T-G19: bold WHITE X for the relocated PropertyManager Cancel button (the button fill supplies
+    # Bold WHITE X for the relocated PropertyManager Cancel button (the button fill supplies
     # the red — neutral at rest, statusErr on hover). White reads on both themes.
     s = cell * SS
     lw = max(2, int(round(stroke_width(cell) * 2.6)))
@@ -2289,7 +2289,7 @@ def draw_new_doc(d, cell, p):
 def draw_undo(d, cell, p):
     """Line-art counter-clockwise circular arrow. Uses the SAME 1x stroke as the neighbouring
     toolbar glyphs (save/open/new_doc) so undo/redo read as thin line icons, not the old bold
-    double-weight arrows Hunter asked to drop."""
+    double-weight arrows that were dropped."""
     s = cell * SS
     lw = stroke_width(cell)
     cx, cy = s*0.52, s*0.52
@@ -3372,7 +3372,7 @@ def draw_airfoil(d, cell, p):
 
 
 # ---------------------------------------------------------------------------
-# T-BL34 fallback drawers: Manufacture toolpath cells. Shipped art is the real
+# Fallback drawers: Manufacture toolpath cells. Shipped art is the real
 # cam_generate render (icon_pipeline.py); these read as "toolpath over stock".
 # ---------------------------------------------------------------------------
 
@@ -4000,7 +4000,7 @@ def draw_context_cube(d, cell, p):
             d.line([a, b], fill=_rgba(p.stroke, 180), width=nlw)
 
 # ---------------------------------------------------------------------------
-# Copilot Artifacts + PLM Graph (Wave 0 overhaul)
+# Copilot Artifacts + PLM Graph
 # ---------------------------------------------------------------------------
 # Every file_* glyph shares one page silhouette so a mixed artifact list scans
 # as a single family; only the motif inked into the lower two thirds differs.

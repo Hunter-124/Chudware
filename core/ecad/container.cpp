@@ -27,7 +27,7 @@ using nlohmann::json;
 namespace {
 
 constexpr const char* kContainer = "aicad.ecad+/1";
-constexpr const char* kAppVersion = "AI-ECAD/1";
+constexpr const char* kAppVersion = "Chudware/1";
 
 // All retained data is budgeted, including forward-compatible unknown entries.
 constexpr mz_uint kMaxEntries = 4096;

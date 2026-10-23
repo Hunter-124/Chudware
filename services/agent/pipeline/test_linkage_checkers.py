@@ -1,6 +1,6 @@
-"""Tests for pipeline/linkage_integrity.py — T-DP4.
+"""Tests for pipeline/linkage_integrity.py.
 
-Covers the T-DP4 Definition of Done:
+Covers:
   - reference-integrity checker: dangling ref caught; cycle caught; clean pass.
   - datum-completeness checker: undeclared datum_ref caught; clean pass.
   - interface-consistency checker: bore-diameter mismatch caught; clean pass.

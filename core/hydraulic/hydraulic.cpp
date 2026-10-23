@@ -297,7 +297,7 @@ ojson m_bom(const ojson& params) {
                               " component(s) missing MPN — add to sourcing fields.");
     out["next_actions"] = ojson::array(
         {"add mpn/manufacturer to unsourced components via hydraulic_add_component sourcing=",
-         "pass bom_lines to bom_rollup at B-chain merge time (T-E5 seam)"});
+         "pass bom_lines to bom_rollup at B-chain merge time"});
     return out;
 }
 

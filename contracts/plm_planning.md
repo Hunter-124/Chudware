@@ -5,7 +5,7 @@
 > untouched. New OPTIONAL fields are additive; changing an existing field's
 > meaning needs a version bump to `aicad.planning/2`.
 >
-> **Design source:** Pillar 19 / Workstream R (Hunter, 2026-07-07). Native
+> **Design source:** `docs/design/PLM_VERSION_CONTROL_PLAN.md` (2026-07-07). Native
 > planning is the ground-up default; external trackers (GitHub/Jira/…) are a
 > deferred import/sync seam (`services/plm/trackers.py`), not a dependency.
 

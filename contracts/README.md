@@ -57,7 +57,6 @@ Core document, wire, and event seams:
   from `libchudware` versus the Python worker fallback.
 - `cell_methods.json` — the method set a `chudware-hostd --cell` tenant cell admits for the
   browser app.
-- `geom_labels.md` — canonical per-face geometry labels (`chudware.geomlabel/1`).
 - `gsl_ser.md` — canonical GSL text serialization (`gsl-ser/v1`).
 
 Agent layer:

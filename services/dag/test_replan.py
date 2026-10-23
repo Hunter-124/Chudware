@@ -1,4 +1,4 @@
-"""test_replan.py — Tests for services/dag/replan.py (T-F12 DoD).
+"""test_replan.py — Tests for services/dag/replan.py.
 
 DoD coverage:
   - dag_replan rejects spliced nodes missing end_condition (ReplannError)
@@ -321,7 +321,7 @@ def test_template_passes_validate_graph(template_file):
     "reveng_single_photo.json",
 ])
 def test_template_all_nodes_have_end_condition(template_file):
-    """T-F12 style enforcement: all template nodes must declare end_condition."""
+    """Style enforcement: all template nodes must declare end_condition."""
     path = _template_path(template_file)
     graph = json.loads(path.read_text(encoding="utf-8"))
     for node in graph["nodes"]:

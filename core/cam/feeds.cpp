@@ -176,7 +176,7 @@ std::filesystem::path resolve_registry_path() {
 const CuttingDB& CuttingDB::builtin() {
     // Seed the in-code table (the byte-identical fallback), then fold the registry's cam
     // sections on top when the registry is reachable. Absent/unparseable registry -> the
-    // in-code table stands, so headless/offline builds are unaffected (T-M4 / Issue #2).
+    // in-code table stands, so headless/offline builds are unaffected.
     static CuttingDB db = [] {
         CuttingDB d;
         try {

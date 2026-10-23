@@ -1,4 +1,4 @@
-// Copilot cards (T-RF6 split of legacy_chat.cpp): the Plan/Objectives section (tiles + todos
+// Copilot cards: the Plan/Objectives section (tiles + todos
 // tree + subagents, plus the drawPlanSection adapter declared in
 // core/app_state.h), the clarify + plan-approve cards, the corporate-org cards
 // (aicad.corporate/1), the exec-mode cards (swarm waves / eng-firm bids+award+team+comms /

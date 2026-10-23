@@ -190,8 +190,8 @@ static void treeIcon(const char* name, const char* fallback, float size = 16.0f,
 }
 
 // ---- shared row hover paint (the ONE approved treatment, used panel-wide) ----
-// T-G18: the feature rows' hover — an accent-outline pill + a soft treeHover
-// wash, inset 2/1 dp, 4 dp corners — is the ratified look. Every row in the panel (feature
+// The feature rows' hover — an accent-outline pill + a soft treeHover
+// wash, inset 2/1 dp, 4 dp corners — is the standard look. Every row in the panel (feature
 // rows AND the filename/equations/material/bodies/origin/plane meta rows) now routes through
 // THIS one function so the hover is pixel-identical everywhere; the meta rows used to fall
 // through to ImGui's default HeaderHovered paint, which read as a visibly inconsistent hover.
@@ -230,7 +230,7 @@ static void fmRowSelectedPaint(ImDrawList* dl, ImVec2 rowMin, ImVec2 rowMax) {
 // covered the inter-row spacing bled into the next row / the section dividers and read as
 // stacked, overlapping slabs (visual-review fix).
 //
-// T-G18: fmRowPill()/fmRowPillEnd() bracket every meta/header row. fmRowPill pushes the SAME
+// fmRowPill()/fmRowPillEnd() bracket every meta/header row. fmRowPill pushes the SAME
 // FramePadding featureRow() uses (6dp x, 4dp y — so every row is the same height + text baseline) and the
 // SAME transparent HeaderHovered/HeaderActive (so ImGui's default hover never paints); the
 // returned rect feeds fmRowPillEnd(), which pops those styles and draws the shared hover on
@@ -708,7 +708,7 @@ static std::string nestedAgentLockReason(AppState& st, const std::string& source
 static void applyTreeOpsNow(AppState& st, const nlohmann::json& ops, const char* what) {
     if (!st.docMirror.hasDoc() || !st.workerStarted) return;
     if (refuseAgentLockedTreeDoc(st, st.docMirror.docId())) return;
-    // T-PERF1: async apply so suppress/reorder/delete never freezes the GL thread. Batch
+    // Async apply so suppress/reorder/delete never freezes the GL thread. Batch
     // multiple pending ops from one flush into a single doc_apply_ops (see flushPendingTreeOps).
     const std::string whatStr = what ? what : "tree op";
     ++st.rebuildsInFlight;
@@ -717,7 +717,7 @@ static void applyTreeOpsNow(AppState& st, const nlohmann::json& ops, const char*
             --st.rebuildsInFlight;
             if (!applied) return;
             if (resp.ok && !resp.aicm_path.empty()) {
-                st.loadDocMeshAsync(resp.aicm_path);  // T-PERF3
+                st.loadDocMeshAsync(resp.aicm_path);
             } else if (!resp.ok) {
                 if (resp.error_code == "dependency_exists") {
                     st.addLog(std::string("[warn] ") + whatStr +
@@ -745,7 +745,7 @@ static void flushPendingTreeOps(AppState& st) {
     if (s_pendingTreeOps.empty()) return;
     auto pending = std::move(s_pendingTreeOps);
     s_pendingTreeOps.clear();
-    // Batch every pending tree mutation from this frame into ONE applyOps (T-PERF1 DoD:
+    // Batch every pending tree mutation from this frame into ONE applyOps (i.e.
     // feature tree suppress/reorder/copy batched). Labels join for the toast/log.
     if (pending.size() == 1) {
         applyTreeOpsNow(st, pending[0].ops, pending[0].what.c_str());
@@ -1986,7 +1986,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
                                       c.type == "ref_point" || c.type == "csys" ||
                                       c.type == "coordinate_system" || c.type == "ref_csys";
                 toggleFeatureEye(st, fid, c.ownedBodies, shown, isPlane, isRefGeom);
-                // T-BL42: un-hiding an absorbed sketch selects + highlights it so it's easy
+                // Un-hiding an absorbed sketch selects + highlights it so it's easy
                 // to spot in the viewport (ghost goes visible; tree row gets selection card).
                 if (c.nested && !shown && c.type == "sketch") {
                     st.selectedFeatureId = fid;
@@ -3501,7 +3501,7 @@ static void doSaveDoc(AppState& st, bool forceDialog) {
         if (path.empty()) return;  // canceled
     }
 
-    // T-PERF4: never block GL on doc_save (large STEP+ embeds drawings + cache).
+    // Never block GL on doc_save (large STEP+ embeds drawings + cache).
     if (!st.docMirror.hasDoc() || !st.workerStarted) return;
     const std::string docId = st.docMirror.docId();
     const std::string pathCopy = path;
@@ -3862,7 +3862,7 @@ static void startAsyncOpen(AppState& st, const std::string& path, bool asSolid) 
 }
 
 // Native-dialog Open: pick a .step+ file, open it in the worker, apply it.
-// T-PERF4: doc_open runs on AsyncRpc so STEP import never freezes the GL thread.
+// doc_open runs on AsyncRpc so STEP import never freezes the GL thread.
 static void doOpenDoc(AppState& st) {
     if (fileDialogsDisabled()) {
         st.toast(ui::ToastLevel::Info,
@@ -4861,7 +4861,7 @@ void drawFeatureTreeBody(AppState& st,
                                                 ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                                 ImGuiTreeNodeFlags_SpanFullWidth |
                                                 ImGuiTreeNodeFlags_FramePadding;
-                        // T-G18: selection is shown by fmRowPill's glass card (like feature rows);
+                        // Selection is shown by fmRowPill's glass card (like feature rows);
                         // the ImGui Selected/Header paint on top read heavier than a feature row.
                         bool hidden = !planeShownPersist(pi);
                         // Pill FIRST (at the row's true left edge — drawing it after the icon left
@@ -5256,7 +5256,7 @@ void drawFeatureTreeBody(AppState& st,
                         bool isOriginPlane = selectedFeatureId == "plane.front" ||
                                              selectedFeatureId == "plane.top"   ||
                                              selectedFeatureId == "plane.right";
-                        // T-BL37: "point.origin" is a synthetic ref like the planes — not a feature.
+                        // "point.origin" is a synthetic ref like the planes — not a feature.
                         bool isOriginPoint = selectedFeatureId == "point.origin";
                         // W2-ref: default/auto/user axes listed under References (axisDatumIds).
                         bool isRefAxis = st.axisDatumIds.count(selectedFeatureId) > 0 ||
@@ -5644,7 +5644,7 @@ void drawFeatureTreeBody(AppState& st,
                             ImGui::SetScrollHereY(0.5f);
                             st.treeScrollToSelection = false;
                         }
-                        // T-G18: shared hover paint (identical to every meta/header row).
+                        // Shared hover paint (identical to every meta/header row).
                         fmRowHoverPaint(rowMin, rowMax, rr.hovered, sel);
 
                         // ---- rollback-bar drag hit-test (item 4) ----

@@ -1,4 +1,4 @@
-// Fault isolation for OCCT shape builders (T-BL61).
+// Fault isolation for OCCT shape builders.
 //
 // OCCT's fillet corner resolver does not throw when it fails on a convergent-blend
 // vertex — it dereferences into Geom2dAdaptor_Curve::D0 and segfaults, which killed
@@ -49,7 +49,7 @@ namespace {
 // So a TIMEOUT is treated as "fork is unusable here", not as "this geometry is bad": the build
 // is retried in-process (identical inputs, identical result) and isolation is disabled for the
 // rest of the process. A SIGNAL still means the geometry killed OCCT and is still contained -
-// which is the case T-BL61 exists for, and it is reported immediately, with no timeout.
+// which is the case this isolation exists for, and it is reported immediately, with no timeout.
 bool g_fork_unusable = false;
 // Private to the forked advisory child. Its outer boundary already contains all
 // nested geometry and must never inherit the ordinary blend fallback policy.

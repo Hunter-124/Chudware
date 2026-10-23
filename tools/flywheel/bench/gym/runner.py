@@ -363,7 +363,7 @@ def _actor_for(kind: str, dl_id: str) -> str:
     }.get(kind, "feature_modeler")
 
 
-# Tools that count as BUILD-stage mutating ops for GAP-INJECT (WI-6).
+# Tools that count as BUILD-stage mutating ops for GAP-INJECT.
 _BUILD_MUTATING_TOOLS: frozenset[str] = frozenset(
     {
         "add_features",
@@ -398,7 +398,7 @@ def _is_build_mutating_tool(tool: str) -> bool:
 
 
 def apply_inject_faults(ledger, challenge: Challenge) -> list[dict]:
-    """GAP-INJECT: apply ``challenge.inject_faults`` after N build tool_calls (WI-6).
+    """GAP-INJECT: apply ``challenge.inject_faults`` after N build tool_calls.
 
     Each fault dict: ``{after_build_calls: int, fault: str, feature?: dict, note?: str}``.
     Emits ledger events so C12 graders can observe the inject without editing runner.
@@ -530,7 +530,7 @@ class CellResult:
     mission_status: str = ""
     mission_phase: str = ""
     run_dir: str = ""
-    division: str = "local"  # "local" | "open" (WI-1)
+    division: str = "local"  # "local" | "open"
     # tools offered after division filter (LOCAL strips vision)
     tools_offered: list[str] = field(default_factory=list)
     cycle: str = ""
@@ -575,9 +575,9 @@ def run_cell(
     """Run one (challenge, division, tier, seed) cell end to end and grade + classify it.
 
     *runs_dir* overrides the output root (default ``reports/runs``); tests pass a tmp
-    dir so the suite never writes under the committed ``reports/`` tree.
+    dir so the suite never writes under the default ``reports/`` tree.
 
-    *division* is ``"local"`` or ``"open"`` (WI-1). Vision-eyes challenges refuse
+    *division* is ``"local"`` or ``"open"``. Vision-eyes challenges refuse
     LOCAL. LOCAL cells strip vision tools from the offered tools surface.
 
     *real* is explicit execution intent. ``False`` always produces a MOCK cell,
@@ -656,7 +656,7 @@ def run_cell(
         mission = _run_mission_safe(challenge, run_id)
         replay_turns_into_ledger(ledger, challenge, seed)
 
-    # GAP-INJECT (WI-6): after scripted/real build tool_calls, apply declared faults.
+    # GAP-INJECT: after scripted/real build tool_calls, apply declared faults.
     apply_inject_faults(ledger, challenge)
 
     # The gym run dir is a self-contained replay bundle, and its ledger.json is the
@@ -669,7 +669,7 @@ def run_cell(
     ledger_doc = {"events": list(ledger.events), "state": ledger.state}
     ledger_path.write_text(json.dumps(ledger_doc, indent=2), encoding="utf-8")
 
-    # Division HARD tool surface (WI-1.4): LOCAL never offers vision tools.
+    # Division HARD tool surface: LOCAL never offers vision tools.
     tools_offered = default_tools_for_division(division)
 
     # Independent grading + taxonomy classification.
@@ -1335,7 +1335,7 @@ def run_cycle(
     """Run the full challenge x division x tier x seed matrix and return the cycle result.
 
     *runs_dir* overrides the output root (tests pass a tmp dir; the CLI leaves it None
-    so the committed ``reports/runs`` tree is written for cycle-1).
+    so the default ``reports/runs`` tree is written).
 
     *divisions* restricts which divisions to schedule (default: derive per tier —
     local tiers → local; frontier/openrouter → open). Calibration challenges that

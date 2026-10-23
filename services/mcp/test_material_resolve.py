@@ -417,7 +417,7 @@ def test_family_word_needs_a_whole_word_match(monkeypatch):
 # The schema is {E_mpa, nu, density_g_cm3, yield_mpa} — one capitalized key
 # among lowercase siblings. A model writing the obvious `e_mpa` was told
 # "E_mpa must be > 0 (got 0.0)" about a dict that was entirely correct.
-# Observed live (k3-256k, T-W11 bracket):
+# Observed live (k3-256k, bracket test):
 #   {"name": "6061-T6", "e_mpa": 68900, "nu": 0.33, "yield_mpa": 276}
 
 

@@ -1,7 +1,7 @@
 """CI guard: consumer Claude/Gemini subscription-OAuth endpoints are allowlisted.
 
 Contract: contracts/providers.md §4.2 + §4.4. Subscription-auth provider modules under
-services/agent/providers/ are explicitly allowlisted (§4.4, owner-authorized 2026-07-07).
+services/agent/providers/ are explicitly allowlisted (§4.4, authorized 2026-07-07).
 Gemini consumer OAuth remains fully prohibited. This grep-level gate fails if any
 NON-ALLOWLISTED tracked source references a consumer OAuth token-reuse endpoint for
 Claude/Gemini. The BLESSED session login for non-subscription use is OpenRouter PKCE

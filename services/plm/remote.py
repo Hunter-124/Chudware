@@ -1,4 +1,4 @@
-"""services.plm.remote — folder/ssh/https remotes, sync, and advisory locks (T-R7, contract §6).
+"""services.plm.remote — folder/ssh/https remotes, sync, and advisory locks (contract §6).
 
 Team concurrency v1 = advisory locks + sync, no merging (``aicad.plm/1`` §6).
 The vault (``.aicadvault/``) is a plain git repo (dulwich primary), so every
@@ -98,7 +98,7 @@ def _hex(sha: bytes | str | None) -> str | None:
 
 
 def _ensure_branch_and_head(repo: Repo, commit_id: bytes | None = None) -> None:
-    """After seed/fetch, force ``refs/heads/master`` + symbolic HEAD (advisor Q3.3).
+    """After seed/fetch, force ``refs/heads/master`` + symbolic HEAD.
 
     Dulwich can leave a bare clone with a symbolic HEAD that does not resolve a
     branch tip; callers MUST set both explicitly.
@@ -411,7 +411,7 @@ def _fetch_folder(repo: Repo, remote_url: str, remote_name: str = "origin") -> d
     here; callers gate it before calling in.)
 
     Also imports tracking refs under ``refs/remotes/<name>/`` and ensures
-    ``refs/heads/*`` + HEAD are present after the fetch (advisor Q3.3).
+    ``refs/heads/*`` + HEAD are present after the fetch.
     """
     try:
         validate_location(remote_url)

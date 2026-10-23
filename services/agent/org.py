@@ -1,7 +1,7 @@
-"""org.py — Organization runtime (aicad.org/1, T-W22).
+"""org.py — Organization runtime (aicad.org/1).
 
 Contract: contracts/advisor.md §18 (FROZEN) + §12 ponder/kind amendment.
-Pipeline: docs/COPILOT_MISSION_PIPELINE.md Phase 2.5 (ORGANIZE).
+Pipeline: docs/design/COPILOT_MISSION_PIPELINE.md Phase 2.5 (ORGANIZE).
 
 ## What this module provides
 
@@ -12,8 +12,8 @@ Pipeline: docs/COPILOT_MISSION_PIPELINE.md Phase 2.5 (ORGANIZE).
 
 ``OrgState``
     Stateful org-runtime: channels, requests, and report cadence.  All mutations
-    emit ledger events (actor = dept id or "org").  Built on top of the ledger
-    (T-W1, MERGED); delegation seam (T-W14, MERGED); councils seam (T-W9, MERGED).
+    emit ledger events (actor = dept id or "org").  Built on top of the ledger,
+    the delegation seam, and the councils seam.
 
 Channel rules (§18):
     * Auto-created from manifest ``depends_on`` edges + layout interfaces.
@@ -44,7 +44,7 @@ Interface-change gating (§18 → advisor/stages.py):
 
 Feature-flagged seams:
     * Overseer concern feed is gated on ``CHUDWARE_OVERSEER=1`` (mirrors overseer.py).
-    * council_convene delegates to councils.council_convene (T-W9, MERGED, real).
+    * council_convene delegates to councils.council_convene.
 """
 from __future__ import annotations
 
@@ -198,7 +198,7 @@ class OrgState:
 
     Args:
         org_chart:   The ``aicad.org/1`` dict produced by ``build_org_chart``.
-        ledger:      Optional Ledger instance (T-W1, MERGED); mutations are
+        ledger:      Optional Ledger instance; mutations are
                      recorded as ledger events when present.
         report_every: Department-report cadence (node completions).
     """
@@ -603,7 +603,7 @@ class OrgState:
         if delegation_tree is None:
             return None
 
-        from services.agent.delegation import delegate as _delegate_fn  # MERGED (T-W14)
+        from services.agent.delegation import delegate as _delegate_fn
         node = _delegate_fn(
             "department_manager",
             brief or f"Manage department {dept_id}",

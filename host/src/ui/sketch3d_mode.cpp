@@ -1046,7 +1046,7 @@ void Sketch3DMode::updateDrag(AppState& st, const ImVec2& mouse, const ImVec2& i
     float t = dot(n, dragOrig_ - ro) / denom;
     if (t < 0) return;
     Vec3 target = ro + rd * t;
-    // T-PERF2: latest-wins async — viewport keeps last solved entities while RPCs catch up.
+    // Latest-wins async — viewport keeps last solved entities while RPCs catch up.
     queueSketch3dDrag(st, {{"handle", dragHandle_}, {"xyz", vj(target)}});
 }
 

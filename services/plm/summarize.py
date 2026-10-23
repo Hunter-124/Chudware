@@ -1,4 +1,4 @@
-"""services.plm.summarize — doc_diff → plain-language change summary (T-R3).
+"""services.plm.summarize — doc_diff → plain-language change summary.
 
 The narration layer that makes the timeline read like a story (plan §0.5, §1):
 every history entry gets a one-line, plain-language summary derived from the

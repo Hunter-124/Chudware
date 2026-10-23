@@ -33,8 +33,8 @@ struct WebGap {
     const char* reason;  // shown in the disabled tooltip / toast / panel body
 };
 
-// Keep in sync with contracts/web_parity.md (web_unsupported — do not edit; the
-// integrator owns it) and with the CEF-less WASM build (CHUDWARE_ENABLE_CEF off).
+// Keep in sync with contracts/web_parity.md (web_unsupported) and with the CEF-less WASM
+// build (CHUDWARE_ENABLE_CEF off).
 constexpr WebGap kWebGaps[] = {
     // CEF-dependent: no embedded Chromium in the browser build.
     {"web_browser",

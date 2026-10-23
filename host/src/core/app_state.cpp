@@ -476,7 +476,7 @@ void loadSettings(Settings& s) {
             else if (prov == "moonshot" && !s.moonshotKey[0]) copyStr(s.moonshotKey, sizeof(s.moonshotKey), activeKey);
             else if ((prov == "xai" || prov == "xai-sub") && !s.xaiKey[0]) copyStr(s.xaiKey, sizeof(s.xaiKey), activeKey);
         }
-        // Owner directive 2026-07-23: xAI/grok-4.5 was the default chat provider (and the target
+        // Design decision (2026-07-23): xAI/grok-4.5 was the default chat provider (and the target
         // of the Cursor migration just above), but most installs are NOT signed into xAI — no
         // console.x.ai API key and no completed SuperGrok/X Premium+ OAuth — so every fresh chat
         // opened straight to "xAI not configured". ZenMux's free x-ai/grok-4.5-free tier,
@@ -684,7 +684,7 @@ void loadSettings(Settings& s) {
                 rgb("secondary", s.accentSecondary);
             }
         }
-        // T-G21: pinned-column vertical-collapse state.
+        // Pinned-column vertical-collapse state.
         s.fmCollapsed = j.value("fm_collapsed", false);
         s.copilotCollapsed = j.value("copilot_collapsed", false);
         // Settings-modal progressive disclosure. Absent => false => the modal opens in its
@@ -1156,7 +1156,7 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         }
         if (!appJ.empty()) j["appearance"] = appJ;
     }
-    // T-G21: pinned-column vertical-collapse state.
+    // Pinned-column vertical-collapse state.
     j["fm_collapsed"] = s.fmCollapsed;
     j["copilot_collapsed"] = s.copilotCollapsed;
     // Settings-modal progressive disclosure. Omitted while false so a default config
@@ -1871,7 +1871,7 @@ static void clearPickBuffers(render::IdPass* idPass, render::Overlays* overlays)
     if (overlays) overlays->setDoc(empty, discard);
 }
 
-// T-PERF3: dedicated mesh-loader thread. Disk parse of AICM is the multi-100ms hit on big
+// Dedicated mesh-loader thread. Disk parse of AICM is the multi-100ms hit on big
 // docs; it runs here. GL upload + AppState cache commit stay on the GL thread in
 // drainMeshLoads / commitDocMeshFromParsed.
 namespace {
@@ -1945,7 +1945,7 @@ void stopMeshLoaderThread() {
 }
 }  // namespace
 
-// T-PERF3/10: join the loader before process exit. A joinable static std::thread
+// Join the loader before process exit. A joinable static std::thread
 // dtor calls std::terminate ("terminate called without an active exception") —
 // seen as a full-app crash when teardown races vendor-browser / CEF exit paths.
 void AppState::stopMeshLoader() { stopMeshLoaderThread(); }
@@ -2416,7 +2416,7 @@ void AppState::clearViewportForNewDoc() {
     // Origin point: VISIBLE by default on an empty doc (same rule as planes/axes). It is NOT
     // seeded into hiddenFeatures; applyDocDrivenVisibility inserts/erases it with hasSolidContent
     // (unless originUserToggled), so the FM eye — which reads hiddenFeatures — is correct from
-    // frame 0. (Replaces the old T-BL37 hidden-by-default seed.)
+    // frame 0. (Replaces the old hidden-by-default seed.)
     hiddenFeatures.erase("point.origin");
     // Default reference axes: visible on empty/sketch-only docs (FM eye OPEN).
     hiddenFeatures.erase("axis.x");

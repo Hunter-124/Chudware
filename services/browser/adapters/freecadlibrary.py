@@ -1,4 +1,4 @@
-"""services/browser/adapters/freecadlibrary.py — FreeCAD-library source adapter (T-X7).
+"""services/browser/adapters/freecadlibrary.py — FreeCAD-library source adapter.
 
 The FreeCAD-library GitHub repo (github.com/FreeCAD/FreeCAD-library) is an OPEN
 git repo of raw .stp/.step and .fcstd part files — the ONE truly-open, no-login,

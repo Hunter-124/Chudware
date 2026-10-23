@@ -50,7 +50,7 @@ bool validName(const char* s) {
 
 // Apply a single eq_* op, reloading the viewport mesh from the result aicm on success (so dependent
 // dimensions rebuild) and surfacing the engine error as a toast on failure. Returns true when the
-// op was *queued* (T-PERF1 async); toast/log still fire on the drained result.
+// op was *queued* (async); toast/log still fire on the drained result.
 bool applyEqOp(AppState& st, const nlohmann::json& op, const char* what) {
     if (!st.docMirror.hasDoc()) {
         st.toast(ui::ToastLevel::Warn, "No document open.");
@@ -74,7 +74,7 @@ bool applyEqOp(AppState& st, const nlohmann::json& op, const char* what) {
                           (r.error_code.empty() ? "" : " [" + r.error_code + "]"));
                 return;
             }
-            if (!r.aicm_path.empty()) st.loadDocMeshAsync(r.aicm_path);  // T-PERF3
+            if (!r.aicm_path.empty()) st.loadDocMeshAsync(r.aicm_path);
             st.markActiveTabDirty();
         });
     return true;

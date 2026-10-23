@@ -1,4 +1,4 @@
-"""services/browser/adapters/maxon.py — maxon source adapter (T-X7).
+"""services/browser/adapters/maxon.py — maxon source adapter.
 
 maxon (maxongroup.com) makes precision DC and BLDC motors, gearheads,
 encoders and controllers. Search is public; per-motor STEP/native CAD

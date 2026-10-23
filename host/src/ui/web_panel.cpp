@@ -15,7 +15,7 @@
 #include "ui_theme.h"
 #include "ui/layout.h"                 // ui::overlayBand
 #include "ui/web_panel.h"
-#include "ui/web_capabilities.h"  // ui::webGapReason (T-RF12: web-build "desktop only" copy)
+#include "ui/web_capabilities.h"  // ui::webGapReason (web-build "desktop only" copy)
 #include "ui/widgets/web_view_backend.h"
 
 namespace ui {
@@ -75,8 +75,8 @@ void drawWebBrowserPanel(AppState& st) {
                  ImGuiWindowFlags_NoSavedSettings);
 
     // If the backend can't host a browser, say so plainly instead of showing an inert
-    // black rectangle. Web (WASM) build: the gap table owns the "desktop only" copy
-    // (T-RF12). SDK-less desktop CI build → NullWebView: keep the build-flavor message.
+    // black rectangle. Web (WASM) build: the gap table owns the "desktop only" copy.
+    // SDK-less desktop CI build → NullWebView: keep the build-flavor message.
     if (!w.web->available()) {
         if (const char* why = ui::webGapReason("web_browser")) {
             ImGui::TextWrapped("%s", why);

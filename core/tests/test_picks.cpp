@@ -1009,16 +1009,16 @@ TEST_CASE("I3 side on rounded parts: top cap wins, curved face faces the side") 
     }
 }
 
-// (T-QG) The geom-query DIALECT gate. An LLM writes these queries, so the two ways it
-//        actually fails are a MISSING `of` and a PROSE `side` — both used to dead-end:
-//        1. `of` now DEFAULTS to "face". A live model called query_geometry with
-//           {"side":"+x"} and got `'of' must be "edge" or "face" (got '')`, a message that
-//           names no fix. Faces are what a query overwhelmingly means.
-//        2. Every rejection carries the FULL grammar, so one wrong guess teaches the whole
-//           vocabulary instead of prompting another wrong guess.
-//        3. A prose `side` gets a free-text-SPECIFIC message pointing at describe_part, with
-//           the echoed string truncated so a pasted sentence can't bloat the error.
-TEST_CASE("T-QG: geom query defaults of:face and teaches the grammar on rejection") {
+// The geom-query DIALECT gate. An LLM writes these queries, so the two ways it
+// actually fails are a MISSING `of` and a PROSE `side` — both used to dead-end:
+//   1. `of` now DEFAULTS to "face". A live model called query_geometry with
+//      {"side":"+x"} and got `'of' must be "edge" or "face" (got '')`, a message that
+//      names no fix. Faces are what a query overwhelmingly means.
+//   2. Every rejection carries the FULL grammar, so one wrong guess teaches the whole
+//      vocabulary instead of prompting another wrong guess.
+//   3. A prose `side` gets a free-text-SPECIFIC message pointing at describe_part, with
+//      the echoed string truncated so a pasted sentence can't bloat the error.
+TEST_CASE("geom query defaults of:face and teaches the grammar on rejection") {
     using chudware::doc::resolve_geom_query;
     using chudware::doc::QueryPicks;
 
@@ -1031,7 +1031,7 @@ TEST_CASE("T-QG: geom query defaults of:face and teaches the grammar on rejectio
     // --- 1. of-DEFAULTING: the EXACT live failure {"side":"+x"} must resolve to a face. ---
     {
         QueryPicks r = resolve_geom_query(box, json{{"side", "+x"}});
-        CHECK_MESSAGE(r.error.empty(), "T-QG: {\"side\":\"+x\"} must resolve, got: " << r.error);
+        CHECK_MESSAGE(r.error.empty(), "{\"side\":\"+x\"} must resolve, got: " << r.error);
         REQUIRE(r.faces.size() == 1);  // the +X face
         CHECK(r.edges.empty());        // defaulted to FACES, not edges
         CHECK(r.selectors.at(0)["centroid"][0].get<double>() ==
@@ -1074,7 +1074,7 @@ TEST_CASE("T-QG: geom query defaults of:face and teaches the grammar on rejectio
         CHECK(has(r.error, "solid"));        // names the rejected value...
         CHECK(has(r.error, "query keys:"));  // ...and the whole accepted grammar
         CHECK(has(r.error, "describe_part"));
-        MESSAGE("T-QG of:solid error: " << r.error);
+        MESSAGE("of:solid error: " << r.error);
     }
     // A NON-STRING `of` errors cleanly instead of throwing a nlohmann type_error.
     {
@@ -1093,7 +1093,7 @@ TEST_CASE("T-QG: geom query defaults of:face and teaches the grammar on rejectio
         CHECK(has(r.error, "describe_part"));  // the REAL exploration tool...
         CHECK_FALSE(has(r.error, "describe_faces"));  // ...not the C++-only symbol
         CHECK(has(r.error, "query keys:"));
-        MESSAGE("T-QG free-text side error: " << r.error);
+        MESSAGE("free-text side error: " << r.error);
     }
     // The echo is TRUNCATED — a pasted paragraph must not become the error message.
     {
@@ -1102,8 +1102,8 @@ TEST_CASE("T-QG: geom query defaults of:face and teaches the grammar on rejectio
         REQUIRE_FALSE(r.error.empty());
         CHECK(has(r.error, "got a free-text description"));
         CHECK_MESSAGE(r.error.find(std::string(100, 'q')) == std::string::npos,
-                      "T-QG: the echoed side value must be clipped");
-        CHECK_MESSAGE(r.error.size() < 800, "T-QG: error length " << r.error.size());
+                      "the echoed side value must be clipped");
+        CHECK_MESSAGE(r.error.size() < 800, "error length " << r.error.size());
     }
     // A SHORT unrecognised side word keeps the original teaching message (NOT the free-text
     // one) and gains the grammar tail.

@@ -3,8 +3,8 @@
 hostd retires an abandoned document to its crash-recovery ORPHAN tier when
 ``path.empty() || dirty || isAutosavePath(path)`` (core/hostd/server.cpp::gcCloseDoc), and
 every orphan is offered back through the GUI's "Recover unsaved parts?" prompt. Nothing
-closes the documents an agent run builds — T-RF5 deleted
-``services/agent/loop.py::_terminal_autosave_close_docs`` and the C++ mission path only
+closes the documents an agent run builds — ``services/agent/loop.py::_terminal_autosave_close_docs``
+was removed and the C++ mission path only
 saves the one doc a DAG node is on — so every agent doc without a real backing file
 eventually became a recovery row. Measured on the reporting user's machine 2026-08-05:
 eight retired in the same second at the 30-minute agent GC grace, then all eight opened as

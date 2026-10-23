@@ -129,7 +129,7 @@ CommandRouter buildRibbonCommandRouter(const RibbonCommandHooks& hooks) {
     r.registerPrefix("asm_", asmRule);
     r.registerExact("new_assembly", asmRule);
 
-    // Wave N: AI-ECAD commands (ecad_/sch_/pcb_) route to the ECAD editor. Always consumed.
+    // ECAD commands (ecad_/sch_/pcb_) route to the ECAD editor. Always consumed.
     auto ecadRule = [hooks](AppState& st, const std::string& cmd) {
         st.showPcbTools = true;
         hooks.ecadDispatch(st, cmd);

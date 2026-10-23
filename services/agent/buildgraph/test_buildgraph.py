@@ -1,7 +1,7 @@
 """test_buildgraph.py — Tests for aicad.buildgraph/1 planner, validator, executor.
 
 Contract: contracts/advisor.md §13 (FROZEN), §3 (advisory items).
-T-W15 Definition of Done requirements:
+Coverage:
 
   ✓ Rule inference on a bracket fixture (base→boss→bore-through-boss→fillet,
     4-hole pattern after base)

@@ -1,8 +1,6 @@
 """context_pack.py — Assemble a context pack for a DAG node's agent invocation.
 
 Contract: contracts/dag_schema.md §2 (node object, inputs, tools).
-Scaffold: T-A2.
-
 A context pack is a compact dict containing ONLY what the node needs:
   - part_description: GSL describe_part output for the primary doc_id (if any)
   - node_inputs:      the node's own 'inputs' dict

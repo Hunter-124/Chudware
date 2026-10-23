@@ -1,4 +1,4 @@
-"""services/browser/adapters/anaheimautomation.py — anaheimautomation source adapter (T-X7).
+"""services/browser/adapters/anaheimautomation.py — anaheimautomation source adapter.
 
 Anaheim Automation (anaheimautomation.com) makes stepper motors, drivers,
 controllers and linear actuators on a Magento storefront with clean product

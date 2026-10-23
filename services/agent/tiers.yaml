@@ -1,6 +1,6 @@
 # Tier profiles — aicad.tier/1
 # Contract: contracts/advisor.md §8 (tier budgets)
-# Spec: docs/ADVISOR_ARCHITECTURE.md §2.9
+# Spec: docs/design/ADVISOR_ARCHITECTURE.md §2.9
 #
 # Four profiles: local-24k, local-48k, mid, frontier.
 # Budget slots must satisfy: sum(slot budgets) + generation_headroom ≤ context_tokens.
@@ -20,12 +20,12 @@ schema: aicad.tier/1
 #   gemma4-e4b dropped (slower + larger than gemma3-qat, no upside);
 #   DiffusionGemma NO-GO on 12 GB (26B-A4B MoE, 16 GB min quant, draft-CLI only).
 # parallel_slots: recommended llama-server --parallel on the bundled CUDA
-# runtime (integrator smoke: -np 8 -c 32768 -> ~4.8 GB VRAM, 482 tok/s).
+# runtime (smoke test: -np 8 -c 32768 -> ~4.8 GB VRAM, 482 tok/s).
 #
 # SHIPPED DEFAULTS ONLY. Per-model capability data lives in
 # services/agent/model_manager._REGISTRY (structured_output / role_shape);
 # actual role->model bindings live in routing.yaml (contract advisor.md §14)
-# and user edits there always win (T-W28 override discipline).
+# and user edits there always win (override discipline).
 local_models:
   gbnf_worker: gemma3-4b-qat
   fanout: qwen3-4b
@@ -42,7 +42,7 @@ local_models:
 
 profiles:
   local-24k:
-    # Context: 24576 tokens. Layout per docs/ADVISOR_ARCHITECTURE.md §3 (local-24k reference).
+    # Context: 24576 tokens. Layout per docs/design/ADVISOR_ARCHITECTURE.md §3 (local-24k reference).
     # Budget sum: 2500+800+1500+600+2500+8000 = 15900 slots + 8000 generation = 23900 ≤ 24576 ✓
     context_tokens: 24576
     generation_headroom: 8000

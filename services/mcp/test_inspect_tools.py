@@ -44,7 +44,7 @@ def _extract_palette(caption: str) -> dict:
 
 from services.mcp import cad_tools as ct  # noqa: E402
 from services.mcp import cad_common as cc  # noqa: E402  _resolve_highlight_specs/_feature_roster
-from services.mcp import cad_render_tools as ct_render  # noqa: E402  T-RF8: inspect/render tools moved
+from services.mcp import cad_render_tools as ct_render  # noqa: E402  inspect/render tools live here
 from services.mcp.test_shot_planner import (  # noqa: E402  the planner's engine fake
     faces_from_matches,
     fake_view_metrics,

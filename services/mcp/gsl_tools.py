@@ -31,7 +31,7 @@ from services.mcp.cad_common import (_NON_BODY_FEATURE_TYPES, _face_attribution,
                                    placement_source_of, placement_warnings, require_list)
 from services.mcp.cad_asm_tools import resolve_component_source
 from services.mcp.cad_tools import _doc, _dumps, _err
-from services.mcp.fit_narration import _format_fit  # single home (T-F8); loop.py shares it
+from services.mcp.fit_narration import _format_fit  # single home; loop.py shares it
 
 
 def _axis_order(faces: list) -> Optional[dict]:
@@ -760,7 +760,7 @@ def _scene_caption(doc_id: str, views: list) -> str:
     return " ".join(parts)
 
 
-# ================================================================ narration helpers (T-F7)
+# ================================================================ narration helpers (geometry)
 
 
 def _gcode_digest(nc_text: str) -> dict:
@@ -1134,7 +1134,7 @@ def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str
             if isinstance(v, (int, float)):
                 lines.append(f'  {k}: {v}')
 
-    # T-W9: additive sim-advisor verdict (margin policy + beam anchor + suggestions).
+    # Additive sim-advisor verdict (margin policy + beam anchor + suggestions).
     # Only run for fea_static studies (beam-anchor comparison only meaningful for static).
     if stype == "fea_static":
         try:
@@ -1151,7 +1151,7 @@ def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str
     return _dumps({"ok": True, "text": "\n".join(lines)})
 
 
-# ================================================================ narration helpers (T-F8)
+# ================================================================ narration helpers (assembly/board/project)
 
 
 def _component_sources(doc_id: str) -> tuple:
@@ -1331,13 +1331,13 @@ def _describe_assembly_text(doc_id: str) -> str:
 
 
 def _board_power_lines(engs: list, label: str) -> list:
-    """Narration lines for per-component power + board total (T-FIN8, honest nulls).
+    """Narration lines for per-component power + board total (honest nulls).
 
     ``engs`` is [(name, normalized_eng_or_None), ...]. Components without power data are
     counted, never zero-filled (contracts/ecad/boardphys.md).
     """
     try:
-        from services.ecad import metadata as eng_meta  # STAYS (T-RF20): no C++ counterpart  # noqa: PLC0415
+        from services.ecad import metadata as eng_meta  # STAYS: no C++ counterpart  # noqa: PLC0415
     except ImportError:
         return []
     totals = eng_meta.power_totals([e for _n, e in engs if e])
@@ -1380,7 +1380,7 @@ def _describe_board_text(doc_id: str) -> str:
     2. engine.ecad.netlist.build_netlist → components, nets
     3. engine.ecad.erc.run_erc → ERC/DRC violation summary
     """
-    # T-RF20: the session/netlist facades route to the C++ core via core_bridge RPCs.
+    # The session/netlist facades route to the C++ core via core_bridge RPCs.
     from services.mcp.ecad_common import (  # noqa: PLC0415
         _ECAD, _compile_of, _unconnected_pins, ecad_session, netlist_mod,
     )
@@ -1439,7 +1439,7 @@ def _describe_board_text(doc_id: str) -> str:
             lines.append("\nNo footprints placed — use ecad_find_part then ecad_place_symbol.")
         if fps:
             try:
-                from services.ecad import metadata as eng_meta  # STAYS (T-RF20): no C++ counterpart  # noqa: PLC0415
+                from services.ecad import metadata as eng_meta  # STAYS: no C++ counterpart  # noqa: PLC0415
                 engs = [(f.get("ref") or f.get("id") or "?",
                          eng_meta.eng_for_footprint(f)) for f in fps]
                 lines.extend(_board_power_lines(engs, "Board"))
@@ -1482,10 +1482,10 @@ def _describe_board_text(doc_id: str) -> str:
     else:
         lines.append("\nNo components — add parts with ecad_find_part + ecad_place_symbol.")
 
-    # Per-component power + total (T-FIN8; honest nulls — contracts/ecad/boardphys.md)
+    # Per-component power + total (honest nulls — contracts/ecad/boardphys.md)
     if components:
         try:
-            from services.ecad import metadata as eng_meta  # STAYS (T-RF20): no C++ counterpart  # noqa: PLC0415
+            from services.ecad import metadata as eng_meta  # STAYS: no C++ counterpart  # noqa: PLC0415
             engs = [(c.get("ref") or "?",
                      eng_meta.resolve_eng(libid=c.get("libid") or "",
                                           fpid=c.get("footprint") or "",
@@ -1745,7 +1745,7 @@ def sketch_health_text(d: dict) -> str:
       3. Conflicts and redundant constraints (if any).
       4. Ordered relations-then-dimensions schedule.
 
-    T-DP7 DoD §4: this is the feedback channel that lets a no-vision local model SEE its work
+    This is the feedback channel that lets a no-vision local model SEE its work
     and know what to do next.
     """
     lines: list[str] = []
@@ -2358,7 +2358,7 @@ def register_gsl_tools(mcp: FastMCP) -> None:
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
-    # ---------------------------------------------------------------- narration (T-F7)
+    # ---------------------------------------------------------------- narration (geometry)
 
     @mcp.tool()
     def describe_toolpaths(job_id: Optional[str] = None, audit: bool = True) -> str:
@@ -2387,7 +2387,7 @@ def register_gsl_tools(mcp: FastMCP) -> None:
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
-    # ---------------------------------------------------------------- narration (T-F8)
+    # ---------------------------------------------------------------- narration (assembly/board/project)
 
     @mcp.tool()
     def describe_assembly(doc_id: Optional[str] = None) -> str:

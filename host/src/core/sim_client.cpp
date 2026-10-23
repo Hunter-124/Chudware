@@ -231,7 +231,7 @@ bool SimClient::ensureStarted(std::string& consoleNote) {
     }
 
     std::string err;
-    // No Python sim worker exists anymore (T-RF19: FEA + flow + cancel all route
+    // No Python sim worker exists anymore (FEA + flow + cancel all route
     // in-process to libchudware via routeSimToCpp; engine.sim.worker is deleted). Treat
     // the backend as ready if the core loads. sim_caps / multiphysics ride the
     // services-side worker (services.worker_main).

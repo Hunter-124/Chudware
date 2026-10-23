@@ -1,4 +1,4 @@
-"""ECAD -> thermal FEA handoff (T-FIN16) — one call from a routed board to a solved
+"""ECAD -> thermal FEA handoff — one call from a routed board to a solved
 board-level thermal study, conforming to ``aicad.simhandoff/1``.
 
 Same design contract as ``ecad_tools`` / ``piping_tools``: JSON-string results with
@@ -17,7 +17,7 @@ Tools:
 
 THE SOLVE PATH (documented honesty): the core steady kernel aggregates all flux loads
 into ONE magnitude per study (core/sim/fea_run.cpp), so distinct per-component powers
-require the TRANSIENT path (T-FIN18), which keeps per-load magnitudes + schedules. We
+require the TRANSIENT path, which keeps per-load magnitudes + schedules. We
 therefore run a transient integration to QUASI-STEADY state (t_end = 5 thermal time
 constants of the lumped board) and read the final frame as the steady answer, unless
 the caller passes an explicit ``transient`` spec (duty-cycle studies).
@@ -61,7 +61,7 @@ _THERMAL: dict = {
     "last_handoff": None,  # session state for ecad_verify_thermal
     "last_ctx": None,
 }  # solve context cache for heatsink_select
-# (T-FIN17): geometry/loads/mesh reuse.
+# geometry/loads/mesh reuse.
 
 
 def _dumps(payload: dict) -> str:
@@ -657,7 +657,7 @@ def theta_ja_checks(rows: list, t_amb_c: float, tolerance_pct: float) -> tuple:
 
 
 # --------------------------------------------------------------------------- shared impl
-# Session-free implementation of the ECAD -> thermal FEA handoff (T-FIN24). The MCP tool
+# Session-free implementation of the ECAD -> thermal FEA handoff. The MCP tool
 # below wraps it with the server's session lookup / output-dir conventions; the desktop
 # GUI's worker endpoint (engine_oracle/sim/multiphysics_rpc.py) wraps it with an
 # explicitly-passed board document. ONE pipeline, two transports — the fw_* pattern.
@@ -830,7 +830,7 @@ def thermal_handoff_impl(
         from services.ecad.threed import (
             board_to_fea_step,
             BoardGeometryError,
-        )  # STAYS (T-RF20): no C++ counterpart
+        )  # STAYS: no C++ counterpart
     except ImportError as exc:
         return _err_d(
             f"3D kernel unavailable (ImportError: {exc})",
@@ -1441,7 +1441,7 @@ def register_ecad_thermal_tools(mcp) -> None:
            quasi-steady transient (5 lumped time constants) because the steady kernel
            aggregates flux magnitudes; pass transient={"t_end_s":..., "dt_s":...,
            "schedules": {"U1": {"duty":0.25,"period_s":1.0}, ...}} for a true
-           duty-cycle study (schedules keyed by component ref, T-FIN18 shapes).
+           duty-cycle study (schedules keyed by component ref, transient-schedule shapes).
         6. Maps results back per component: case temp = max nodal T over the component
            body, Tj = Tcase + P*theta_jc when jc is known (honest null otherwise).
 
@@ -1626,10 +1626,10 @@ def register_ecad_thermal_tools(mcp) -> None:
 
 
 # =============================================================================
-# T-FIN19: board/enclosure airflow handoff — ECAD board -> OpenFOAM conjugate
-# heat transfer (CHT), verifying the T-FIN16 preset-h film-coefficient solve.
+# Board/enclosure airflow handoff — ECAD board -> OpenFOAM conjugate
+# heat transfer (CHT), verifying the preset-h film-coefficient thermal solve.
 #
-# COUPLING ID: ``ecad_to_cht`` (new, justified): nothing from the T-FIN16 FEA
+# COUPLING ID: ``ecad_to_cht`` (new, justified): nothing from the thermal FEA
 # *solution* is transferred to the CFD side — the CHT study is built directly
 # from the ECAD board (geometry + boardphys powers), exactly like
 # ``ecad_to_thermal_fea`` but with a different target solver. ``thermal_to_cfd``
@@ -2036,17 +2036,17 @@ def register_ecad_airflow_tools(mcp) -> None:
         (CHT) — the check for when convection PRESETS aren't enough (enclosures, fans).
 
         Pipeline:
-        1. Reuses the T-FIN16 FEA geometry (board_to_fea_step) for footprints/powers,
+        1. Reuses the thermal-handoff FEA geometry (board_to_fea_step) for footprints/powers,
            then exports the board slab + every POWERED component as separate watertight
            STL solids (world mm; components sunk 0.2 mm into the board so the regions
            couple). Components without power metadata get no solid (honesty).
         2. Air domain: open ambient by default; pass enclosure={"clearance_mm":10,
            "wall_mm":2} for a passive 4-wall duct open along the flow (+x) axis.
-        3. Runs chtMultiRegionFoam via the T-SIM5 seam (run_openfoam_tunnel thermal=
+        3. Runs chtMultiRegionFoam via the conjugate-CFD seam (run_openfoam_tunnel thermal=
            {mode:'conjugate', solids:[...]}) with the given inlet velocity/temperature;
            per-region volumetric heat sources carry each component's power_w.
         4. Maps per-region mean/peak temperatures back to component refs.
-        Then run ecad_verify_airflow() to quantify the T-FIN16 preset-h error
+        Then run ecad_verify_airflow() to quantify the preset-h thermal error
         ('was the film-coefficient assumption sane?').
 
         Without OpenFOAM (or with dry_run=True) it still returns the full case inputs
@@ -2107,7 +2107,7 @@ def register_ecad_airflow_tools(mcp) -> None:
             from services.ecad.threed import (
                 board_to_fea_step,
                 BoardGeometryError,
-            )  # STAYS (T-RF20): no C++ counterpart
+            )  # STAYS: no C++ counterpart
         except ImportError as e:
             return _err(
                 f"3D kernel unavailable (ImportError: {e})",
@@ -2195,7 +2195,7 @@ def register_ecad_airflow_tools(mcp) -> None:
             ),
         ]
 
-        # Expectations from the T-FIN16 preset-h solve, when one is in session.
+        # Expectations from the preset-h thermal solve, when one is in session.
         pre = _THERMAL.get("last_handoff")
         expectations = []
         preset_env: dict = {}
@@ -2322,7 +2322,7 @@ def register_ecad_airflow_tools(mcp) -> None:
                 )
             )
 
-        # ── live CHT via the T-SIM5 seam ────────────────────────────────────
+        # ── live CHT via the conjugate-CFD seam ─────────────────────────────────
         try:
             from services.sim.openfoam import run_openfoam_tunnel
 
@@ -2454,7 +2454,7 @@ def register_ecad_airflow_tools(mcp) -> None:
         preset_result: Union[str, dict, None] = None,
         tolerance_pct: float = 40.0,
     ) -> str:
-        """Was the T-FIN16 film-coefficient assumption sane? Compare the preset-h FEA
+        """Was the thermal handoff's film-coefficient assumption sane? Compare the preset-h FEA
         component temperatures against the CHT (airflow) solve, per component.
 
         Deviation is measured on the temperature RISE above each study's own ambient.

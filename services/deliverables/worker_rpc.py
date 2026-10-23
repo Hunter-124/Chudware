@@ -1,4 +1,4 @@
-"""Worker-RPC bridge for the deliverables preview seam (T-F16).
+"""Worker-RPC bridge for the deliverables preview seam.
 
 Exposes ``render_document`` + ``list_artifacts`` as **engine-worker methods** so the C++/ImGui GUI
 reaches them through the same newline-delimited-JSON worker seam (``WorkerClient`` / ``AsyncRpc``,

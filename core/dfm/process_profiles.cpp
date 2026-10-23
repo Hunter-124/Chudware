@@ -93,7 +93,7 @@ std::string repr_list(const std::vector<std::string>& items) {
     return out + "]";
 }
 
-// Density (g/cm^3) from the unified materials registry (T-F2), falling back to the
+// Density (g/cm^3) from the unified materials registry, falling back to the
 // oracle's literal when the registry is unreachable — Python's _reg_density.
 double reg_density(const std::string& name, double fallback) {
     const json d = materials::density(name);

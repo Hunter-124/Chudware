@@ -368,7 +368,7 @@ def register_em_tools(mcp) -> None:
                         ],
                         "hint": (openems_info or {}).get("install")
                                 or (openems_info or {}).get("install_hint")
-                                or "See docs/EM_SIMULATION.md for openEMS install recipes.",
+                                or "See docs/reference/EM_SIMULATION.md for openEMS install recipes.",
                         "next_actions": [
                             "em_driven(standard='WR-90', length_mm=50, solver='analytic-uniform')",
                             "em_status()  # inspect installed solvers",
@@ -452,7 +452,7 @@ def register_em_tools(mcp) -> None:
                         ],
                         "hint": (openems_info or {}).get("install")
                                 or (openems_info or {}).get("install_hint")
-                                or "See docs/EM_SIMULATION.md.",
+                                or "See docs/reference/EM_SIMULATION.md.",
                         "next_actions": [
                             "em_timedomain(standard='WR-90', solver='analytic-uniform')",
                             "em_status()",

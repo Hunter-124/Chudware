@@ -1,5 +1,5 @@
 // .step+ container reader/writer — C++ port of engine/doc/stepplus.py
-// (docs/contracts/stepplus.md).
+// (contracts/stepplus.md).
 //
 // A `.step+` is a ZIP container that travels like a STEP file: any CAD opens the
 // embedded `geometry.step`; Chudware gets the full parametric document back. This

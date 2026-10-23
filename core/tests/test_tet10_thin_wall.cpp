@@ -1,7 +1,7 @@
 // Thin-wall tet10 regression: a graded quadratic mesh on a tube whose wall is
 // thinner than the element size must still SOLVE.
 //
-// Live defect (ME490 tube frame, release case): an explicit sizes_mm ladder on a
+// Live defect (a vehicle tube frame, release case): an explicit sizes_mm ladder on a
 // O60.325 x 4.000 mm wall tube refused with
 //   "fea_static: invalid or folded quadratic boundary face"
 // so the release evidence had to be produced at tet4 — a stiff, lower-bound
@@ -39,7 +39,7 @@ using nlohmann::json;
 
 namespace {
 
-// The real ME490 section: O60.325 mm OD, 4.000 mm wall.
+// The real tube-frame section: O60.325 mm OD, 4.000 mm wall.
 constexpr double kOuterRadius = 60.325 / 2.0;
 constexpr double kWall = 4.0;
 constexpr double kInnerRadius = kOuterRadius - kWall;

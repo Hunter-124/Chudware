@@ -1,6 +1,6 @@
-"""Tests for PLM items & releases (T-R4, contract aicad.plm/1 §4/§5).
+"""Tests for PLM items & releases (contract aicad.plm/1 §4/§5).
 
-Covers the T-R4 DoD:
+Covers:
   * items auto-register on first entry; part numbers editable (unique);
     rev letters move ONLY at release; lifecycle transitions enforced
     (no edit-in-place of Released — "start a new revision" copies forward)

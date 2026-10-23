@@ -2352,8 +2352,8 @@ std::string SimManager::activeStudyId() const {
   return sel_ >= 0 && sel_ < (int)studies_.size() ? studies_[sel_].id : std::string();
 }
 
-// ============================================================ T-FIN24:
-// multiphysics Simulate tab
+// ============================================================
+// Multiphysics Simulate tab
 //
 // One Simulate workspace for every study kind. The pieces below add: the
 // sim_caps / fw_status capability probes (honest gating), the four new
@@ -2361,7 +2361,7 @@ std::string SimManager::activeStudyId() const {
 // CalculiX contact proxy + modal-superposition frequency response via the
 // worker's multiphysics seam), the stateless electronics-SPICE and firmware-
 // emulation panels, and the cross-sim handoff panel (aicad.simhandoff/1: ECAD
-// board -> thermal FEA + the T-FIN17 heatsink-pick forward seam). All async
+// board -> thermal FEA + the heatsink-pick forward seam). All async
 // work goes through st.rpc (callbacks drain on the GL thread) or the SimClient
 // job — never a sync worker.call in a draw path.
 

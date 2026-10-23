@@ -2,7 +2,7 @@
 
 Given a photo, a fitted :class:`~services.vision.fiducial.Detection`, and the two pixel endpoints
 a VLM picked, compute the **in-plane** distance in millimetres and score it. The score is
-*intrinsic to the optics*, exactly as master-plan Pillar 10 requires:
+*intrinsic to the optics*, by design:
 
 * marker pixel resolution (``px_per_mm``) sets the achievable tier — you cannot measure finer
   than the fiducial resolves;
@@ -24,7 +24,7 @@ from typing import Any, Optional
 from .calib_sheet import DEFAULT_BOARD, BoardSpec
 from .fiducial import detect_board, load_image, require_cv2
 
-#: UI honesty string (DoD step 5 / master plan Pillar 10). Shown wherever a photo dimension is.
+#: UI honesty string. Shown wherever a photo dimension is.
 #: The intake layer then applies its own policy on top: a photo dim feeding a tolerance-sensitive
 #: fit is downgraded one step and flagged (never treated as a typed ``measured`` value), and any
 #: out-of-plane / low-confidence read stays demanded.

@@ -1,13 +1,13 @@
-"""ECAD -> vibration reliability screening (T-FIN21) — one call from a routed board to
+"""ECAD -> vibration reliability screening — one call from a routed board to
 a mounted-board modal solve + excitation-band flagging + a deflection-based solder-joint
 risk screen, conforming to ``aicad.simhandoff/1``.
 
-Same design contract as ``ecad_thermal`` (T-FIN16): JSON-string results with
+Same design contract as ``ecad_thermal``: JSON-string results with
 ``{ok, ..., warnings, hint, next_actions}``, engine helpers called directly, pure
 helpers module-level and engine-free so tests can drive them without OCP/libchudware.
 
 Tool:
-  ecad_vibe_check   board -> fused board+components FEA solid (T-FIN16's
+  ecad_vibe_check   board -> fused board+components FEA solid (the thermal handoff's
                     services.ecad.threed.board_to_fea_step, reused as-is) -> mount-hole
                     detection (mounting-hole footprints / NPTH pads / user-passed
                     positions) -> fixed BCs at the mounts -> core modal solve
@@ -502,7 +502,7 @@ def register_ecad_reliability_tools(mcp) -> None:
         Steinberg deflection-based solder-joint risk screen. One call, zero manual BCs.
 
         Pipeline:
-        1. Reuses the T-FIN16 fused board+components FEA solid
+        1. Reuses the thermal-handoff fused board+components FEA solid
            (services.ecad.threed.board_to_fea_step). Component masses come from package
            dims x a mold-compound density assumption (eng mass metadata wins where
            present); ONE effective density is scaled so the solid carries the total
@@ -623,9 +623,9 @@ def register_ecad_reliability_tools(mcp) -> None:
         out_path = path or str(_default_out_dir(board_doc.get("name", "board"))
                                / "board_vibe.step")
 
-        # ── FEA solid (T-FIN16, reused) + mass-corrected material ───────────
+        # ── FEA solid (thermal handoff, reused) + mass-corrected material ───────────
         try:
-            from services.ecad.threed import board_to_fea_step, BoardGeometryError  # STAYS (T-RF20): no C++ counterpart
+            from services.ecad.threed import board_to_fea_step, BoardGeometryError  # STAYS: no C++ counterpart
         except ImportError as e:
             return _err(f"3D kernel unavailable (ImportError: {e})",
                         hint="OCP/build123d not installed — the FEA solid cannot be built.",
@@ -795,7 +795,7 @@ def register_ecad_reliability_tools(mcp) -> None:
         response: dict = {"available": False}
         response_error = None
         try:
-            from services.sim.vibration import miles_response  # STAYS (T-RF20): no C++ counterpart
+            from services.sim.vibration import miles_response  # STAYS: no C++ counterpart
             shapes = res.get("mode_shapes")
             n_nodes = res.get("n_nodes")
             if (not isinstance(shapes, list) or not shapes

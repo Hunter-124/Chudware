@@ -1,7 +1,7 @@
 // core/piping/cfd.h — piping → 3D CFD handoff, pure-computation half.
 // C++ port of engine_oracle/piping/cfd_handoff.py MINUS internal_volume
 // (the bore-solid STEP extraction needs the OCCT kernel sweep — that leg
-// stays with the kernel side; see docs/REFACTOR_LOG.md T-RF19). Ported here:
+// stays with the kernel side). Ported here:
 // cfd_boundary_from_solve (1D solve -> CFD inlet/outlet BCs) and
 // verify_pressure_drop (1D vs 3D dP cross-check + velocity-limit advisory).
 #pragma once

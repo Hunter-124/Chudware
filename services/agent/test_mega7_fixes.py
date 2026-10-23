@@ -8,7 +8,7 @@ Watch-list from mega-6 findings (owner cycle-7):
      deliver can auto_pick low-rank models at depth 0.
 
 Item 1 of that list, DELIVER-phase soft-join mortality, is NOT covered here and no longer
-can be: its subject `services/agent/loop.py::_drive_phases_from_dag` was deleted by T-RF5
+can be: its subject `services/agent/loop.py::_drive_phases_from_dag` was deleted
 and nothing re-implemented it, so `deliver_partial` has no producer left in the tree. The
 `_drive` helper that monkeypatched it was never called — removed 2026-08-05. The
 `_valid_manifest` fixture below survives because the task_class test at the bottom of this

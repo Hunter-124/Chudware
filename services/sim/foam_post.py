@@ -382,7 +382,7 @@ def postprocess_cht(case_dir: str, stl_path: str, info, residual: Optional[float
     t_min = t_max = t_mean = Tin_c
     regions = list(getattr(info, "solid_regions", None) or [info.solid_region])
 
-    # Aggregate solid temperatures over EVERY solid region (multi-solid CHT, T-FIN19),
+    # Aggregate solid temperatures over EVERY solid region (multi-solid CHT),
     # keeping a per-region summary for the notes.
     per_region: List[str] = []
     all_xyz: list = []

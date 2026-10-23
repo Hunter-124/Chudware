@@ -1,4 +1,4 @@
-// Firmware toolchain wrappers — build a firmware::Project (T-RF15 port of
+// Firmware toolchain wrappers — build a firmware::Project (C++ port of
 // engine_oracle/firmware/toolchains.py). Every backend drives an unmodified
 // external CLI as a subprocess (GPL-clean by aggregation,
 // contracts/firmware_rpc.md §1). build() NEVER throws: a missing CLI, non-zero

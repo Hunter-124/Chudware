@@ -197,7 +197,7 @@ TEST_CASE("asm_edit_component transform survives the rebuild it triggers") {
     fs::remove(pb);
 }
 
-// ME 490 phase 5D item 4, at the document layer. `rebuild_assembly` writes the solved
+// Grounded-frame drift, at the document layer. `rebuild_assembly` writes the solved
 // transforms back over the doc, so whatever the mate solve returns for the GROUNDED
 // component is what a save captures. The solver used to hand back the anchor's matrix
 // re-derived from (t, exp-map w) — and a merged import's placement is authored from
@@ -308,8 +308,8 @@ TEST_CASE("a mated component's transform edit stays solver-owned") {
     fs::remove(pb);
 }
 
-// A network no pose can satisfy must SAY SO, and say which mate. The ME 490 phase-5A
-// mission spent a working session bisecting a 20-mate rover assembly by hand because the
+// A network no pose can satisfy must SAY SO, and say which mate. A design
+// session once spent hours bisecting a 20-mate rover assembly by hand because the
 // rebuild reported only `mates: "ok"` / `"over"` and the poses had been scattered by the
 // solver's own restart escape, so there was nothing to read the failure off.
 TEST_CASE("an unsatisfiable mate network is reported, named and bounded") {

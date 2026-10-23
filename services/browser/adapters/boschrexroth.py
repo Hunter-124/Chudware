@@ -1,4 +1,4 @@
-"""services/browser/adapters/boschrexroth.py — Bosch Rexroth source adapter (T-X7).
+"""services/browser/adapters/boschrexroth.py — Bosch Rexroth source adapter.
 
 Bosch Rexroth (boschrexroth.com) publishes hydraulic pumps, valves and
 manifold blocks with CAD models (STEP/STP archives) through its media

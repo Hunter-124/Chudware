@@ -1,7 +1,7 @@
-"""Failure cards and bounded fixer loop (T-W8).
+"""Failure cards and bounded fixer loop.
 
 Schema: ``aicad.failure/1`` (frozen in contracts/advisor.md §5).
-Pillar 20: docs/ADVISOR_ARCHITECTURE.md §2.7.
+Pillar 20: docs/design/ADVISOR_ARCHITECTURE.md §2.7.
 
 Design
 ------
@@ -729,7 +729,7 @@ def _escalate_dag_replan(
 ) -> dict:
     """Splice a bounded fixer node into the running DAG sidecar.
 
-    The spliced node satisfies ``replan.py``'s DoD requirements:
+    The spliced node satisfies ``replan.py``'s splice requirements:
     - non-empty ``end_condition``
     - a retry back-edge with ``retry_budget`` matching the card's remaining budget
     """

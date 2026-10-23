@@ -1,7 +1,7 @@
-"""ECAD verification/physics pack regression tests (FIN workstream) on ONE reference board.
+"""ECAD verification/physics pack regression tests on ONE reference board.
 
 A small MCU-ish reference board is hand-built through the ecad session layer (the same
-fixture style as test_ecad_tools.py's FIN tests): 40x30 mm closed outline, a +5V power
+fixture style as test_ecad_tools.py's board tests): 40x30 mm closed outline, a +5V power
 net (connector J1 -> regulator U1 -> MCU U2 over a 1.0 mm trace), a GND zone, a 50-ohm
 candidate CLK trace, an edge-coupled CLK_P/CLK_N pair and a deliberately short SHORTNET
 for the length-match rule. Every pre-fab / physics pack is then driven against it:
@@ -81,7 +81,7 @@ def _assert_context(payload: dict, name: str) -> None:
 
 # ---------------------------------------------------------------------------- reference board
 
-# Rail metadata for the two active parts (aicad.boardphys/1 shapes, T-FIN8).
+# Rail metadata for the two active parts (aicad.boardphys/1 shapes).
 REG_ENG = {"power_w": {"typ": 2.0, "max": 3.0},
            "theta_c_per_w": {"ja": 40.0, "jc": 5.0},
            "limits_c": {"tj_max": 125.0, "ta_max": 85.0},
@@ -160,7 +160,7 @@ def build_reference_board(tools: dict, name: str = "ecad_packs_ref") -> str:
                           "p2": [10.0, 29.0], "width": 0.3, "net": "SHORTNET",
                           "layer": "F.Cu"})
 
-    # T-RF20: doc is a client copy of the C++ session doc — write the fixture back before
+    # The doc is a client copy of the C++ session doc — write the fixture back before
     # the tools read board state (outline for the zone polygon, copper for PDN/SI checks).
     _sess = ecad_session.get_session(doc_id)
     ecad_session.swap_doc(_sess, doc)
@@ -349,7 +349,7 @@ def test_check_diff_impedance_reversed_digitisation(tools):
          "width": 0.25, "net": "REV_N", "layer": "F.Cu"},
     ]
     _s = ecad_session.get_session(doc_id)
-    ecad_session.swap_doc(_s, doc)  # T-RF20: write the client-copy fixture back
+    ecad_session.swap_doc(_s, doc)  # write the client-copy fixture back
     doc_id = _s.doc_id
     fwd = _call(tools2, "ecad_check_diff_impedance", net_p="FWD_P", net_n="FWD_N",
                 doc_id=doc_id)
@@ -384,7 +384,7 @@ def test_hostcheck_seeded_sequencing_finding(tools):
         "eng_overrides": {"supply": {"rails": [{"name": "3V3", "voltage_v_nom": 3.3}],
                                      "sequencing": ["VCORE before VIO"]}},
     })
-    ecad_session.swap_doc(ecad_session.get_session(doc_id), doc)  # T-RF20 write-back
+    ecad_session.swap_doc(ecad_session.get_session(doc_id), doc)  # write-back
     r = _call(tools, "ecad_run_hostcheck", doc_id=doc_id)
     assert r["ok"], r
     rules = {g["rule"] for g in r["by_rule"]}
@@ -435,7 +435,7 @@ def test_stackup_solve_roundtrips_through_impedance_check(tools):
                           "p2": [25.0, 5.0], "width": w50, "net": "Z50",
                           "layer": "F.Cu"})
     _s = ecad_session.get_session(doc_id)
-    ecad_session.swap_doc(_s, doc)  # T-RF20: write the client-copy fixture back
+    ecad_session.swap_doc(_s, doc)  # write the client-copy fixture back
     doc_id = _s.doc_id
     chk = _call(tools, "ecad_check_impedance", net_or_ref="Z50", target=50.0,
                 doc_id=doc_id)

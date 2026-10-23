@@ -1,6 +1,6 @@
-"""Smoke tests for services/dag — T-A1 scaffold.
+"""Smoke tests for services/dag.
 
-Tests run against the stub handlers; real capability dispatch arrives in T-A2.
+Tests run against the stub handlers.
 All checkpoint files are written to a pytest tmp_path dir — never to the real runs dir.
 
 Run with:
@@ -21,7 +21,7 @@ from services.dag.graph_loader import GraphValidationError, validate_graph
 # ---------------------------------------------------------------------------
 # Deterministic agent_fn for executor-mechanics tests.
 #
-# T-W30: the node_runner default agent_fn is now a REAL tool-executing turn
+# The node_runner default agent_fn is now a REAL tool-executing turn
 # (config provider + agent_turn) — with no model server it honestly escalates
 # rather than fabricating success. These smoke tests exercise executor mechanics
 # (checkpoint DB, event emission, graph traversal), NOT the live agent, so they

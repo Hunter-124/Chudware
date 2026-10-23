@@ -102,7 +102,7 @@ public:
     // Row offsets / has_soft are re-finalized lazily on the next solve/analyze.
     void clear_soft_targets();
 
-    // Interactive-mode flag (T-PERF8). Dense LM steps use LDLT-first with an SVD
+    // Interactive-mode flag. Dense LM steps use LDLT-first with an SVD
     // fallback; damping trials honour the wall-clock deadline, and analyze()
     // attributes redundant rows via a single ColPivQR instead of growing QRs.
     // Large sparse steps use augmented QR in either mode; dense exact steps retain
@@ -110,7 +110,7 @@ public:
     void set_interactive(bool on) { interactive_ = on; }
     bool interactive() const { return interactive_; }
 
-    // Per-variable trust region for the LM step (T-MATE1). `limits` must be either
+    // Per-variable trust region for the LM step. `limits` must be either
     // empty (the default — unlimited, every existing caller bit-identical) or one
     // entry per variable giving the largest |dx_i| a single LM iteration may take;
     // a non-positive entry means that variable is unlimited. When any component of

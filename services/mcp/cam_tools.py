@@ -30,7 +30,7 @@ from .cad_tools import _CUR  # the "current part" doc_id (shared with the modeli
 # The "current CAM job" so single-argument calls just work.
 _CAM: dict = {"doc_id": None}
 
-# Point the C++ core at the bundled materials registry at IMPORT time (T-M4 / Issue #2):
+# Point the C++ core at the bundled materials registry at IMPORT time:
 # the CuttingDB folds the registry's ``cam`` sub-sections in, and material_cam_id /
 # material_resolve_key (used by _resolve_cam_material) read it. Import time matters — the
 # core caches the registry once per process, so the env must be set before the first
@@ -588,7 +588,7 @@ def _enrich_setup_sheet(result: Any, tree_response: Any) -> Any:
 def register_cam_tools(mcp: FastMCP) -> None:
     """Attach the CAM toolpath/post/sim tools to the FastMCP server."""
 
-    # Point the core's CuttingDB at the bundled materials registry (T-M4) before any cam RPC
+    # Point the core's CuttingDB at the bundled materials registry before any cam RPC
     # triggers the lazy CuttingDB::builtin() singleton, so cam_materials reflects the registry.
     _wire_materials_registry()
 
@@ -675,7 +675,7 @@ def register_cam_tools(mcp: FastMCP) -> None:
         router|lathe|millturn|laser|plasma|waterjet. `material` accepts any engine materials
         registry ID/alias (e.g. "aluminum_6061_t6", "6061") or a CuttingDB group id ("aluminum",
         "steel_mild") — a registry id is translated to the group whose feeds/speeds the calculator
-        uses (T-M4). `stock` is a stock dict (e.g. from cam_extract(kind="stock")["stock"]["box"]
+        uses. `stock` is a stock dict (e.g. from cam_extract(kind="stock")["stock"]["box"]
         -> {"type":"box","min":[...],"max":[...]}), defaulting to a box-offset of the model bbox.
         `machine_profile` (optional): id from cam_machines() (e.g. "haas_vf2") — merges the full
         machine envelope (travel, rapids, rpm/feed clamps, tool_change_s, accel) into the setup
@@ -1076,7 +1076,7 @@ def register_cam_tools(mcp: FastMCP) -> None:
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
-    # ------------------------------------------------------------------ T-W6 feeds/speeds tools
+    # ------------------------------------------------------------------ feeds/speeds tools
 
     @mcp.tool()
     def feeds_speeds(

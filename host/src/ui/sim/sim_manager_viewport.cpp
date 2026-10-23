@@ -303,7 +303,7 @@ void SimManager::previewMesh(AppState &st, Study &s) {
     st.toast(ui::ToastLevel::Info, "Mesh preview already in progress…");
     return;
   }
-  // T-PERF4: export + sim_mesh are long (up to 180s). AsyncRpc keeps the UI
+  // Export + sim_mesh are long (up to 180s). AsyncRpc keeps the UI
   // live. Daemon/WASM: empty path → hostd picks a server temp under
   // chudware_cpp_docs.
   const std::string stepPath =

@@ -1,4 +1,4 @@
-"""Tests for EventJournal (T-F17) — contracts/agent_events.md §1, §5."""
+"""Tests for EventJournal — contracts/agent_events.md §1, §5."""
 from __future__ import annotations
 
 import json

@@ -1,4 +1,4 @@
-"""``design_review`` — the design-review deck (pptx), a T-F15 engineering template.
+"""``design_review`` — the design-review deck (pptx), an engineering template.
 
 The slides a professional engineer presents at a design review, built from live project state
 (contract §4 — every load-bearing number resolved from an attached tool result, never typed):

@@ -678,7 +678,7 @@ void Server::docPublishThunk(const char* method, const char* paramsJson,
 
 std::string Server::detachSocketForFlockRelease() {
     // Close the listen fd so new connects fail, but leave the sock file for
-    // SingleInstance to unlink when it drops the flock (T-PERF10).
+    // SingleInstance to unlink when it drops the flock.
     std::string path = listener_.releasePath();
     listener_.close(/*unlink_path=*/false);
     return path;

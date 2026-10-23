@@ -1,4 +1,4 @@
-"""Tests for services/browser captcha/2FA hardening — T-X6.
+"""Tests for services/browser captcha/2FA hardening.
 
 No real Playwright, no real network, no real captcha: the detection classifier is
 pure (faked page HTML), and the session wiring is exercised through each function's

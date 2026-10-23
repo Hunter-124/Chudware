@@ -1,7 +1,7 @@
 """mcp_tools.py — MCP tool handlers for buildgraph_plan and buildgraph_status.
 
 Contract: contracts/advisor.md §13 (FROZEN).
-Registered by: services/mcp/server.py (append-only block — T-W15).
+Registered by: services/mcp/server.py (register_buildgraph_tools).
 MCP freshness: both tools must appear in server instructions (services/mcp/server.py).
 
 Tools:
@@ -409,7 +409,7 @@ def register_buildgraph_tools(mcp, runs_dir: Optional[Path] = None) -> None:
     """Register buildgraph_plan and buildgraph_status MCP tools onto *mcp*.
 
     Follows the same register_*_tools(mcp) pattern as services/dag/mcp_tools.py.
-    Appended to services/mcp/server.py by T-W15 (append-only block).
+    Called from services/mcp/server.py during tool registration.
 
     Args:
         mcp:       FastMCP / services.mcp instance.

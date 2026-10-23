@@ -12,7 +12,7 @@ the individual ``*_tools.py`` modules are never edited. ``server.py`` wraps each
      (never a traceback, never a silent success) instead of running.
 
 Default policy = everything allowed (no behavior change vs. today). The DAG node contract
-(T-A1 ``dag_schema``) passes explicit per-node ``tools:`` allow-lists that bind here later.
+(``dag_schema``) passes explicit per-node ``tools:`` allow-lists that bind here later.
 """
 from __future__ import annotations
 
@@ -49,14 +49,14 @@ _READ_EXACT = {"hover", "cad_guide", "intake_status", "ecad_status", "cam_job_tr
               "cam_materials", "cam_op_types", "cam_tool_types", "cam_post_dialects",
               "list_parts", "list_configurations", "list_world_bodies",
               "list_standard_parts",
-              # Design ledger (T-W1): ledger_get reads the ledger; the name starts with
+              # Design ledger: ledger_get reads the ledger; the name starts with
               # "ledger_" not "get_", so the prefix classifier misses it — explicit entry needed.
-              # T-DP11: ledger_events returns raw events for the GUI transparency stream.
+              # ledger_events returns raw events for the GUI transparency stream.
               "ledger_get", "ledger_events",
               # Typed manufacturing planning and cited-reference reads.
               "mfg_plan_get", "mfg_plan_check",
               "machining_ref_search", "machining_ref_get", "machining_ref_search_pdf",
-              # Workspace (T-W16): status/events are read-only poll tools.
+              # Workspace: status/events are read-only poll tools.
               "workspace_status", "workspace_doc_events",
               # ECAD symbol discovery is a pure library query — no document is touched. It
               # starts with "ecad_" so no prefix rule catches it. (ecad_netlist / ecad_bom /
@@ -611,7 +611,7 @@ def _guard(fn, name):
     declared it returns, so FastMCP's output-schema validation can never turn a refusal
     into a ``ToolError: 1 validation error`` crash (see _refusal_shaper).
 
-    T-W16 extension: mutating tools that carry a ``doc_id`` keyword argument are also
+    Workspace extension: mutating tools that carry a ``doc_id`` keyword argument are also
     checked against the active workspace lease registry.  Read tools are never checked
     (classify_risk fast-path).  If no workspace session is active the check is a no-op.
     """

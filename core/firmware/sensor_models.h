@@ -1,5 +1,5 @@
 // Physics-accurate multi-axis sensor models for firmware emulation stimulus
-// (T-RF15 port of engine_oracle/firmware/sensor_models.py). Pure, deterministic:
+// (C++ port of engine_oracle/firmware/sensor_models.py). Pure, deterministic:
 // kinematic time-series → raw device register bytes for MPU6050 / BMP280 /
 // LIS3MDL / NEO-6M (NMEA) / pitot. See the Python module docstring.
 #pragma once

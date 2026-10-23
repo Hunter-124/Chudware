@@ -1,4 +1,4 @@
-// Hardware flashing and debug wrappers (T-RF15 port of
+// Hardware flashing and debug wrappers (C++ port of
 // engine_oracle/firmware/hardware.py). probe-rs (MIT/Apache-2.0) and esptool
 // (GPL-2.0+) are SUBPROCESS tools — never linked. A missing binary is
 // graceful: FlashResult{success=false}, never an error envelope or a throw.

@@ -77,7 +77,7 @@ def test_cheatsheet_mentions_add_feature_and_box():
 
 
 def test_ecad_oracle_unknown_op_lists_closest():
-    """ECAD op errors come from the C++ core now (T-RF20): ecad_list_ops RPC for the
+    """ECAD op errors come from the C++ core now: ecad_list_ops RPC for the
     vocabulary, OpError (translated from the core's {code,message,detail} envelope by
     the session facade) for unknown-op suggestions."""
     from services.mcp import core_bridge as cb

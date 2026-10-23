@@ -365,7 +365,7 @@ def test_aero_upgrade() -> None:
 
         # Build + re-parse the model-bearing overlay.
         from services.sim import overlay
-        from services.sim import tessellate as tess  # T-RF20: re-homed from engine.doc
+        from services.sim import tessellate as tess  # re-homed from engine.doc
         ov_path = overlay.flow_overlay(stl, result)
         assert os.path.getsize(ov_path) > 0, "FAIL: empty overlay"
         parsed = tess.read_aicm(open(ov_path, "rb").read())

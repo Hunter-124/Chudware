@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "agent/paths.h"
-#include "agent/auth.h"  // T-RF4: in-process subscription token refresh
+#include "agent/auth.h"  // in-process subscription token refresh
 #include "agent/state.h"  // kContextTokenCap (the lean input-cap ceiling for big windows)
 
 namespace chudware {
@@ -36,7 +36,7 @@ int default_context_window(const std::string& name) {
 }
 
 // Read the ACTIVE account's access_token from config.subscription_auth[provider_id].
-// Token REFRESH lives in agent/auth.cpp (T-RF4): resolve_provider refreshes a stale
+// Token REFRESH lives in agent/auth.cpp: resolve_provider refreshes a stale
 // credential in-process via auth::ensure_fresh_for_run and reloads the store before
 // this reader runs, so the token returned here is fresh at run start. xAI rotates
 // refresh tokens on every exchange — refresh writes back atomically under the
@@ -392,7 +392,7 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
                 "' is not loopback, so it is refused before probing the server.");
     }
 
-    // T-RF4: refresh a stale subscription OAuth token IN-PROCESS (ported from the
+    // Refresh a stale subscription OAuth token IN-PROCESS (ported from the
     // Python subscription_ensure_fresh RPC) and re-read the store so the
     // subscription branches below resolve the rotated access token. Runs after the
     // offline refusals (no network in offline mode) and no-ops for non-subscription
@@ -528,7 +528,7 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
     } else if (name == "xai" || name == "xai-sub") {
         // xAI Grok: classic console.x.ai API key OR SuperGrok OAuth access_token.
         // Completions are OpenAI-compatible at https://api.x.ai/v1/chat/completions.
-        // A stale OAuth token was already refreshed in-process above (auth.cpp, T-RF4).
+        // A stale OAuth token was already refreshed in-process above (auth.cpp).
         std::string key = py_or(cfg_str(cfg, "api_key"), env_get(env, "XAI_API_KEY").value_or(""));
         if (key.empty() && cfg.contains("keys") && cfg["keys"].is_object() &&
             cfg["keys"].contains("xai") && cfg["keys"]["xai"].is_string())

@@ -1,4 +1,4 @@
-"""Unit tests for T-BL04 advanced FEA — fatigue / thermal / buckling / contact.
+"""Unit tests for advanced FEA — fatigue / thermal / buckling / contact.
 
 Split in two: the pure-Python `fea_advanced` math + .inp generators (always run,
 no CalculiX binary, no libchudware), and the MCP-tool degrade paths (need FastMCP

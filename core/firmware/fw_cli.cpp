@@ -1,4 +1,4 @@
-// fw_cli — standalone debug driver for the firmware RPC surface (T-RF15),
+// fw_cli — standalone debug driver for the firmware RPC surface,
 // mirroring sketch/sketch_cli.cpp. Takes the request JSON text
 // {"method": ..., "params": {...}} as argv[1] (or reads it from stdin when "-" or
 // absent) and prints the chudware::firmware::call result as one JSON line, or

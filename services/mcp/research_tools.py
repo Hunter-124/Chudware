@@ -1,4 +1,4 @@
-"""Research / look-it-up MCP tools — the Pillar 8 ``research_*`` family.
+"""Research / look-it-up MCP tools — the ``research_*`` family.
 
 Thin MCP adapter over ``services.research`` (the pure brain). Contract:
 ``contracts/research_tools.md``. v1 exposes ``web_search`` + ``fetch_page``; every helper
@@ -7,16 +7,16 @@ confidence, cached}``) so a limited model quotes it verbatim and a frontier mode
 it. Failures come back as the §6 degradation shape (``{ok:false, reason, hint}``), never a
 traceback — CI passes with no external keys/binaries.
 
-T-W3 adds ``fit_calc`` and ``recommend_fit`` (ISO 286 fit calculator, Pillar 20).
+``fit_calc`` and ``recommend_fit`` provide the ISO 286 fit calculator.
 These return the ``aicad.calc/1`` envelope (``contracts/advisor.md`` §7), not the §1
 research envelope — different schema, same "code does the maths" discipline.
 Call ``fit_calc`` BEFORE ``hole_sizing`` / bore-diameter decisions to get the ISO-table
 band; use ``recommend_fit`` first when the fit class itself is not yet decided.
 
-T-W4 adds ``research_eng_calc`` registry routing (beam, bolted_joint, thread_engagement,
-press_fit, wall_thickness, snap_fit) and a ``list_calcs`` discovery tool. The existing
-Pillar-8 ``research_eng_calc`` (axial_stress, hoop_stress, …) is preserved and extended:
-calc_ids not found in the new registry fall through to the legacy Pillar-8 formulas.
+``research_eng_calc`` adds registry routing (beam, bolted_joint, thread_engagement,
+press_fit, wall_thickness, snap_fit) and a ``list_calcs`` discovery tool. The original
+``research_eng_calc`` (axial_stress, hoop_stress, …) is preserved and extended:
+calc_ids not found in the new registry fall through to the legacy formulas.
 
 Input dialect
 ~~~~~~~~~~~~~
@@ -44,7 +44,7 @@ from pydantic import Field
 from services.mcp.cad_doc_tools import _dim_mm, _interpreted_notes
 from services.mcp.cad_tools import _dumps, _err
 from services import research
-import services.research.calcs as _calcs  # registers all T-W4 calculators
+import services.research.calcs as _calcs  # registers all registry calculators
 from services.research import fits as _fits
 from services.research import machining_reference as _machining_ref
 from services.research.material_lookup import _PROP_ALIASES, _PROP_UNITS
@@ -865,7 +865,7 @@ _ARITHMETIC = frozenset({
 _CALC_PARAM_SYMBOLS: dict = {
     ("l", "mm"): "length",      # L = span/length in every mechanics text
     ("p", "n"): "force",        # P = point load, in newtons
-    ("f", "n"): "force",        # F = force (the T-W4 `beam` calc spells it F_n)
+    ("f", "n"): "force",        # F = force (the registry `beam` calc spells it F_n)
     ("m", "nmm"): "moment",     # M = bending moment
     ("a", "mm2"): "area",       # A = cross-sectional area
     ("t", "mm"): "thickness",   # t = wall thickness (T_nm is torque — different unit)
@@ -1084,7 +1084,7 @@ def register_research_tools(mcp: FastMCP) -> None:
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
-    # --- T-F2 source helpers (same §1 answer envelope; bundled-first, provenance-stamped) ---
+    # --- Source helpers (same §1 answer envelope; bundled-first, provenance-stamped) ---
 
     @mcp.tool()
     def research_material_lookup(material: Optional[str] = None,
@@ -1231,12 +1231,12 @@ def register_research_tools(mcp: FastMCP) -> None:
                           **kwargs: _Extra) -> str:
         """Evaluate a named deterministic engineering formula in SI (code does the maths).
 
-        **T-W4 registry** (aicad.calc/1 envelope, contracts/advisor.md §7):
+        **Calculator registry** (aicad.calc/1 envelope, contracts/advisor.md §7):
         `beam`, `bolted_joint`, `thread_engagement`, `press_fit`,
         `wall_thickness`, `snap_fit`.  Call `list_calcs` for the full registry
         with input schemas.
 
-        **Pillar-8 legacy formulas** (fallback, §1 envelope):
+        **Legacy formulas** (fallback, §1 envelope):
         `axial_stress`, `bending_stress`, `hoop_stress`, `safety_factor`,
         `cantilever_end_deflection`, `circle_area`.
 
@@ -1338,7 +1338,7 @@ def register_research_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def list_calcs() -> str:
-        """Discover registered engineering calculators (T-W4 registry).
+        """Discover registered engineering calculators (calculator registry).
 
         Returns {calc_id: {input_schema, prefill_hints}} for all registered
         calculators.  Use calc_ids with ``research_eng_calc`` to compute results.
@@ -1361,7 +1361,7 @@ def register_research_tools(mcp: FastMCP) -> None:
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
-    # --- T-W3 ISO 286 fit calculator (aicad.calc/1 envelope, contracts/advisor.md §7) ---
+    # --- ISO 286 fit calculator (aicad.calc/1 envelope, contracts/advisor.md §7) ---
     # IMPORTANT: call fit_calc BEFORE making any hole-sizing or bore-diameter decisions.
     # The fit class (e.g. H7/g6) must be resolved first — use recommend_fit if unknown.
 

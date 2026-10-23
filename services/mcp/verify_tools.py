@@ -24,7 +24,7 @@ def register_verify_tools(mcp: FastMCP) -> None:
         round_trip_threshold: float = 99.0,
         # dim_coverage: the source PART doc backing a drawing doc
         source_doc_id: Optional[str] = None,
-        # power_budget (T-FIN23): system energy budget kwargs
+        # power_budget: system energy budget kwargs
         power_source: dict = None,
         power_converters: list = None,
         board_path: str = "",

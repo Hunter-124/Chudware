@@ -345,7 +345,7 @@ public:
     // a steady hover doesn't redraw every frame. The thumb FBO is lazily allocated on first use.
     // GL note: the texture origin is bottom-left (GL) — flip V when blitting with ImGui::Image.
     // ALL state the main pass relies on (bound FBO, viewport, program) is restored before return.
-    // transparentBg=true (T-G15 icon pipeline): clear the tile to RGBA(0,0,0,0) and SKIP the
+    // transparentBg=true (icon pipeline): clear the tile to RGBA(0,0,0,0) and SKIP the
     // studio-gradient fill, so the part is composited over transparency — the source for the
     // ribbon's photographic icon tiles. Part fragments stay opaque (uAlpha=1). Default false
     // preserves the View-Selector preview's solid studio background.
@@ -406,7 +406,7 @@ public:
     // value, or -1 "unknown" if none was ever read back). Default true.
     void setBackdropEnabled(bool on);
 
-    // ---- T-RF13 (R3a): adaptive quality ladder ----
+    // ---- Adaptive quality ladder ----
     // Four steps trading fill cost for fidelity, applied at the real cost sites: MSAA sample
     // count (GLES3 offscreen FBO), render scale (smaller render/resolve targets, upscaled by
     // the ImGui image stretch), and Kawase backdrop-blur passes. FULL is the historical
@@ -562,7 +562,7 @@ private:
     mutable bool lumaEverRead_ = false;  // averageLuminance() returns -1 (unknown) until this is true
     bool backdropEnabled_ = true;
 
-    // ---- T-RF13 adaptive quality ladder state ----
+    // ---- Adaptive quality ladder state ----
     void initQualityPolicy();   // platform defaults + env overrides; called by init()
     void applyQualityStep();    // push qualityStep_ into msaaRequest_/renderScale_/blurPasses_
     void setQualityStep(QualityStep s);  // realloc targets when MSAA/scale changed

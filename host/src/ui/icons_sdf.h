@@ -27,7 +27,7 @@ struct CellUV {
 // `rasterOnly` (atlas.json "raster_only", written by scripts/icon_pipeline.py) names glyphs that
 // must NEVER derive an SDF: photographic/screenshot tiles are shaded imagery whose neutral-grey
 // palette can pass the chroma gate, but an SDF re-raster would flatten them to a tinted
-// silhouette — they keep the multi-color raster path per the T-G15/T-G16 shared visual contract.
+// silhouette — they keep the multi-color raster path per contracts/icons.md.
 void build(const unsigned char* rgba, int atlasW, int atlasH,
            const std::unordered_map<std::string, CellUV>& cells,
            const std::unordered_set<std::string>& rasterOnly = {});

@@ -1,4 +1,4 @@
-"""services/parts/product_media.py (re-homed from engine_oracle/parts_hub/ in T-RF19) — product-media harvest (sourcing §2b).
+"""services/parts/product_media.py (re-homed from engine_oracle/parts_hub/) — product-media harvest (sourcing §2b).
 
 When the user accepts the ``reverse_engineer`` fallback from ``match_model``, the
 RE suite should open already loaded with everything fetchable about the product.

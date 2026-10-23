@@ -1,4 +1,4 @@
-"""Tests for the aicad.parts/1 parts library hub (T-P1).
+"""Tests for the aicad.parts/1 parts library hub.
 
 Covers:
   - PartRecord envelope validation

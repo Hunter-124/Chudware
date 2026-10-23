@@ -1,4 +1,4 @@
-"""AI-ECAD MCP tool tests — drive the tools as a WEAK MODEL would (house style: main()+asserts).
+"""ECAD MCP tool tests — drive the tools as a WEAK MODEL would (house style: main()+asserts).
 
 We register the tools against a tiny stub ``mcp`` that just collects the decorated functions (so we
 exercise the real ``register_ecad_tools`` wiring without importing the stdio server), then build a
@@ -71,11 +71,11 @@ def _register_tools() -> dict:
         "ecad_sweep", "ecad_design",
         # new tools
         "ecad_check_impedance", "ecad_tf", "ecad_make_board",
-        # Wave-L new tools
+        # DFM / diff-pair tools
         "ecad_run_dfm", "ecad_check_diff_impedance",
-        # T-FIN9
+        # host-board rule pack
         "ecad_run_hostcheck",
-        # T-FIN11 FPGA support pack
+        # FPGA support pack
         "ecad_fpga_check",
         # pack tools that live in register_ecad_tools (pdn/si/stackup/netclass)
         "ecad_run_pdn", "ecad_run_sicheck", "ecad_stackup_solve", "ecad_set_net_class",
@@ -719,7 +719,7 @@ def test_make_board(tools: dict) -> None:
     print("  [make_board] PASS")
 
 
-# --------------------------------------------------------------------------- Wave-L new tests
+# --------------------------------------------------------------------------- DFM / diff-pair tests
 
 
 def test_run_dfm_clean(tools: dict) -> None:
@@ -818,7 +818,7 @@ def test_autoroute_with_diff_pairs(tools: dict) -> None:
     for pad in fp_n.get("pads", []):
         pad["net"] = "CLK_N"
     # Pre-register nets so pcb_add_footprint's pads are valid.
-    # T-RF20: pcb.doc is a client copy of the C++ session doc — write the mutation back.
+    # pcb.doc is a client copy of the C++ session doc — write the mutation back.
     pcb.doc.setdefault("nets", [])
     pcb.doc["nets"].append({"name": "CLK_P", "class": "default"})
     pcb.doc["nets"].append({"name": "CLK_N", "class": "default"})
@@ -868,7 +868,7 @@ def test_check_diff_impedance(tools: dict) -> None:
     pcb.doc.setdefault("nets", [])
     pcb.doc["nets"].append({"name": "CLK_P", "class": "default"})
     pcb.doc["nets"].append({"name": "CLK_N", "class": "default"})
-    ecad_session.swap_doc(pcb, pcb.doc)  # T-RF20: write the client-copy mutation back
+    ecad_session.swap_doc(pcb, pcb.doc)  # write the client-copy mutation back
 
     # Add two parallel tracks representing the diff pair via ops.
     ecad_session.apply_ops(pcb, pcb.revision, [
@@ -1136,24 +1136,24 @@ def test_e9_noise_top_level_nonzero(tools: dict) -> None:
     print("  [e9_noise_top_level_nonzero] PASS")
 
 
-# ---------------------------------------------------------------- T-FIN9 host-board rule pack
+# ---------------------------------------------------------------- host-board rule pack
 
 
-def test_fin9_hostcheck_tool(tools: dict) -> None:
-    """T-FIN9: ecad_run_hostcheck runs on the active board, reports the metadata-driven
+def test_hostcheck_tool(tools: dict) -> None:
+    """ecad_run_hostcheck runs on the active board, reports the metadata-driven
     sequencing finding with a fix hint, and is clean on an empty board."""
     from services.mcp.ecad_common import ecad_session
 
     # clean empty board -> no findings, teaching payload intact
-    b = _call(tools, "ecad_new_pcb", name="FIN9_clean")
+    b = _call(tools, "ecad_new_pcb", name="HOSTCHECK_clean")
     clean = _call(tools, "ecad_run_hostcheck", doc_id=b["doc_id"])
     assert clean["ok"] and clean["errors"] == 0 and clean["violations"] == [], clean
     _assert_context(clean, "ecad_run_hostcheck")
 
-    # seeded board: a host whose T-FIN8 metadata demands 'VCORE before VIO' but no
+    # seeded board: a host whose eng metadata demands 'VCORE before VIO' but no
     # component sources VIO -> host_sequencing_unverifiable (no hardcoded part knowledge:
     # the requirement travels entirely in eng_overrides).
-    b2 = _call(tools, "ecad_new_pcb", name="FIN9_seeded")
+    b2 = _call(tools, "ecad_new_pcb", name="HOSTCHECK_seeded")
     sess = ecad_session.get_session(b2["doc_id"])
     # C++ schema validation (core/ecad/schema.cpp): a pad net must exist in board nets.
     sess.doc["nets"].append({"name": "3V3", "class": "default"})
@@ -1168,14 +1168,14 @@ def test_fin9_hostcheck_tool(tools: dict) -> None:
             "rails": [{"name": "3V3", "voltage_v_nom": 3.3}],
             "sequencing": ["VCORE before VIO"]}},
     })
-    ecad_session.swap_doc(sess, sess.doc)  # T-RF20: write the client-copy mutation back
+    ecad_session.swap_doc(sess, sess.doc)  # write the client-copy mutation back
     seeded = _call(tools, "ecad_run_hostcheck", doc_id=b2["doc_id"])
     assert seeded["ok"], seeded
     rules = {g["rule"] for g in seeded["by_rule"]}
     assert "host_sequencing_unverifiable" in rules, f"expected sequencing finding: {seeded}"
     assert seeded["fix_hints"], "findings must carry actionable fix hints"
-    print(f"  FIN9: clean board 0 findings; seeded board rules {sorted(rules)}")
-    print("  [fin9_hostcheck_tool] PASS")
+    print(f"  HOSTCHECK: clean board 0 findings; seeded board rules {sorted(rules)}")
+    print("  [hostcheck_tool] PASS")
 
 
 # --------------------------------------------------------------------------- runner
@@ -1183,13 +1183,13 @@ def test_fin9_hostcheck_tool(tools: dict) -> None:
 
 
 
-# ---------------------------------------------------------------- T-FIN8 engineering metadata
+# ---------------------------------------------------------------- engineering metadata
 
 
-def test_fin8_metadata_roundtrip(tools: dict) -> None:
-    """T-FIN8: library eng seeds + per-instance sim_params.eng overrides surface in
+def test_eng_metadata_roundtrip(tools: dict) -> None:
+    """Library eng seeds + per-instance sim_params.eng overrides surface in
     ecad_status per-component power_w and the board power totals."""
-    s = _call(tools, "ecad_new_schematic", name="FIN8_meta")
+    s = _call(tools, "ecad_new_schematic", name="ENG_meta")
     sid = s["doc_id"]
     # NE555 carries seeded power (typ 15 mW / max 225 mW) from the starter library.
     _call(tools, "ecad_place_symbol", libid="Timer:NE555", x=0, y=0, doc_id=sid)
@@ -1216,14 +1216,14 @@ def test_fin8_metadata_roundtrip(tools: dict) -> None:
     bad = _call(tools, "ecad_place_symbol", libid="Device:R", x=60, y=0,
                 doc_id=sid, sim_params="{not json")
     assert not bad["ok"] and "JSON" in bad["error"], f"bad sim_params must be rejected: {bad}"
-    print(f"  FIN8: U1 {u1['power_w']}, R1 {r1['power_w']}, total {tot}")
-    print("  [fin8_metadata_roundtrip] PASS")
+    print(f"  ENG: U1 {u1['power_w']}, R1 {r1['power_w']}, total {tot}")
+    print("  [eng_metadata_roundtrip] PASS")
 
 
-def test_fin8_missing_metadata_degrades(tools: dict) -> None:
-    """T-FIN8 honesty rule: parts without eng seeds report null power (never 0), and a board
+def test_eng_missing_metadata_degrades(tools: dict) -> None:
+    """Honesty rule: parts without eng seeds report null power (never 0), and a board
     where NOTHING has power data reports null totals."""
-    s = _call(tools, "ecad_new_schematic", name="FIN8_null")
+    s = _call(tools, "ecad_new_schematic", name="ENG_null")
     sid = s["doc_id"]
     _call(tools, "ecad_place_symbol", libid="Connector:Conn_2", x=0, y=0, doc_id=sid)
     st = _call(tools, "ecad_status", doc_id=sid)
@@ -1234,34 +1234,34 @@ def test_fin8_missing_metadata_degrades(tools: dict) -> None:
     assert tot["power_w_typ"] is None and tot["power_w_max"] is None, \
         f"no-data board total must be null, not 0: {tot}"
     assert tot["n_missing_power"] == 1 and tot["n_with_power"] == 0, tot
-    print(f"  FIN8: Conn_2 power {c['power_w']}, totals {tot}")
-    print("  [fin8_missing_metadata_degrades] PASS")
+    print(f"  ENG: Conn_2 power {c['power_w']}, totals {tot}")
+    print("  [eng_missing_metadata_degrades] PASS")
 
 
-def test_fin8_to_3d_boardphys_sidecar(tools: dict) -> None:
-    """T-FIN8: ecad_to_3d places component bodies from package dims and writes the
+def test_to_3d_boardphys_sidecar(tools: dict) -> None:
+    """ecad_to_3d places component bodies from package dims and writes the
     aicad.boardphys/1 sidecar mapping each solid to power/thermal metadata."""
     try:
         import build123d  # noqa: F401
     except ImportError:
-        print("  FIN8: build123d not installed — skipping to_3d sidecar test")
+        print("  ENG: build123d not installed — skipping to_3d sidecar test")
         return
     import os
     import tempfile
 
-    s = _call(tools, "ecad_new_schematic", name="FIN8_3d")
+    s = _call(tools, "ecad_new_schematic", name="ENG_3d")
     sid = s["doc_id"]
     _call(tools, "ecad_place_symbol", libid="Timer:NE555", x=0, y=0,
           footprint="Package_SO:SOIC-8", doc_id=sid)
     _call(tools, "ecad_place_symbol", libid="Device:R", x=40, y=0, value="1k",
           footprint="Resistor_SMD:R_0805", doc_id=sid)
     _call(tools, "ecad_wire", from_ref="U1", from_pin="8", to_ref="R1", to_pin="1", doc_id=sid)
-    mb = _call(tools, "ecad_make_board", pcb_name="FIN8_board", doc_id=sid)
+    mb = _call(tools, "ecad_make_board", pcb_name="ENG_board", doc_id=sid)
     # DRC errors on this throwaway 2-part board are fine — we only need a synced board
     # with a closed outline for the 3D export.
     assert mb.get("doc_id") and mb.get("footprints_placed", 0) >= 2, \
         f"make_board did not produce a populated board: {mb.get('reading')!r}"
-    out = os.path.join(tempfile.mkdtemp(prefix="fin8_"), "board.step")
+    out = os.path.join(tempfile.mkdtemp(prefix="eng_"), "board.step")
     r = _call(tools, "ecad_to_3d", path=out, doc_id=mb["doc_id"])
     if not r.get("ok") and "still" in str(r.get("error", "")).lower():
         r = _call(tools, "ecad_to_3d", path=out, doc_id=mb["doc_id"])  # kernel warm now
@@ -1292,19 +1292,19 @@ def test_fin8_to_3d_boardphys_sidecar(tools: dict) -> None:
     tot = phys["totals"]
     assert tot["power_w_typ"] is not None and tot["n_components"] == len(phys["components"])
     assert r.get("power"), "to_3d response must surface the power totals"
-    print(f"  FIN8: sidecar {os.path.basename(sidecar)} — {len(phys['components'])} comps, "
+    print(f"  ENG: sidecar {os.path.basename(sidecar)} — {len(phys['components'])} comps, "
           f"totals {tot}")
-    print("  [fin8_to_3d_boardphys_sidecar] PASS")
+    print("  [to_3d_boardphys_sidecar] PASS")
 
 
-def test_fin13_run_pdn(tools: dict) -> None:
-    """T-FIN13: ecad_run_pdn flags an undersized 3 A trace (drop + current density) and
+def test_run_pdn_ir_drop(tools: dict) -> None:
+    """ecad_run_pdn flags an undersized 3 A trace (drop + current density) and
     exports the I2R map as the boardphys `pdn` sidecar extension."""
     import os
     from services.mcp.ecad_common import ecad_session
     from services.mcp.ecad_tools import _ECAD
 
-    _call(tools, "ecad_new_pcb", name="fin13_pdn")
+    _call(tools, "ecad_new_pcb", name="pdn_demo")
     pcb = ecad_session.get_session(_ECAD["current_pcb"])
     doc = pcb.doc
     # hand-build a +5V net: connector source pad -> skinny 0.3mm trace -> hungry load
@@ -1329,7 +1329,7 @@ def test_fin13_run_pdn(tools: dict) -> None:
     doc["tracks"].append({"id": "t1", "kind": "segment", "p1": [0.0, 0.0],
                           "p2": [30.0, 0.0], "width": 0.3, "net": "+5V",
                           "layer": "F.Cu"})
-    ecad_session.swap_doc(pcb, doc)  # T-RF20: write the client-copy fixture back
+    ecad_session.swap_doc(pcb, doc)  # write the client-copy fixture back
 
     r = _call(tools, "ecad_run_pdn", net="+5V", source_refs="J1")
     _assert_context(r, "ecad_run_pdn")
@@ -1350,7 +1350,7 @@ def test_fin13_run_pdn(tools: dict) -> None:
     m = blk["nets"][0]["i2r_map"]
     assert m["columns"] == ["layer", "x_mm", "y_mm", "p_w"] and m["cells"]
     assert m["total_w"] > 0.1  # ~ I^2 R = 9 * ~0.05 ohm
-    print(f"  FIN13: verdict={r['verdict']!r} total_i2r={m['total_w']:.3f} W "
+    print(f"  PDN: verdict={r['verdict']!r} total_i2r={m['total_w']:.3f} W "
           f"hotspots={len(net['hotspots'])}")
     for kwargs in (
             {"sink_overrides": {"U1": -1.0}},
@@ -1378,19 +1378,19 @@ def test_fin13_run_pdn(tools: dict) -> None:
     doc["tracks"].append({"id": "t2", "kind": "segment", "p1": [0.0, 10.0],
                           "p2": [30.0, 10.0], "width": 3.0, "net": "+3V3",
                           "layer": "F.Cu"})
-    ecad_session.swap_doc(pcb, doc)  # T-RF20: write the client-copy fixture back
+    ecad_session.swap_doc(pcb, doc)  # write the client-copy fixture back
     r2 = _call(tools, "ecad_run_pdn", net="+3V3", source_refs="J2")
     assert r2["ok"] and not r2["violations"], f"clean net must pass: {r2.get('violations')}"
     u2 = next(d for d in r2["nets"][0]["drops"] if d["ref"] == "U2")
     assert u2["within_tolerance"] is True
-    print("  [fin13_run_pdn] PASS")
-def test_fin11_fpga_check_and_constraints(tools: dict) -> None:
-    """T-FIN11: place the iCE40 starter symbol, run the bank-aware checks, export
+    print("  [run_pdn_ir_drop] PASS")
+def test_fpga_check_and_constraints(tools: dict) -> None:
+    """Place the iCE40 starter symbol, run the bank-aware checks, export
     constraints (LPF + neutral CSV) — and confirm the no-FPGA guard teaches."""
     import os
     import tempfile
 
-    d = _call(tools, "ecad_new_schematic", name="fpga_fin11")
+    d = _call(tools, "ecad_new_schematic", name="fpga_demo")
     doc_id = d["doc_id"]
     # guard first: no FPGA on the sheet yet -> teaching error
     e = _call(tools, "ecad_fpga_check", doc_id=doc_id)
@@ -1406,7 +1406,7 @@ def test_fin11_fpga_check_and_constraints(tools: dict) -> None:
     assert r["devices"] and r["devices"][0]["device"] == "iCE40UP5K-SG48"
     # nothing wired -> CRESET_B (required config pin) must be flagged
     assert not r["ok"] and any(v["check"] == "config" for v in r["violations"]), r
-    print(f"  FIN11: check found {len(r['violations'])} violation(s) on the bare FPGA "
+    print(f"  FPGA: check found {len(r['violations'])} violation(s) on the bare FPGA "
           f"(config CRESET_B unwired) — as designed")
 
     with tempfile.TemporaryDirectory() as td:
@@ -1423,8 +1423,8 @@ def test_fin11_fpga_check_and_constraints(tools: dict) -> None:
         with open(csv_file, encoding="utf-8") as fh:
             head = fh.readline()
         assert head.startswith("pin,net,port,site,bank"), head
-    print("  FIN11: ecad_export('constraints') wrote LPF + CSV pinout")
-    print("  [fin11_fpga_check_and_constraints] PASS")
+    print("  FPGA: ecad_export('constraints') wrote LPF + CSV pinout")
+    print("  [fpga_check_and_constraints] PASS")
 
 
 def _disable_live_provider():
@@ -1469,10 +1469,10 @@ if pytest is not None:
         return _register_tools()
 
 
-# --------------------------------------------------------------------------- T-FIN16 thermal handoff
+# --------------------------------------------------------------------------- thermal handoff
 
 
-def _fin16_tools() -> dict:
+def _thermal_tools() -> dict:
     """Register the ECAD + thermal-handoff tools onto ONE stub (the handoff needs
     ecad session state)."""
     from services.mcp.ecad_thermal import register_ecad_thermal_tools
@@ -1482,7 +1482,7 @@ def _fin16_tools() -> dict:
     return stub.tools
 
 
-def _fin16_demo_board(tools: dict, name: str = "fin16_demo") -> str:
+def _thermal_demo_board(tools: dict, name: str = "thermal_demo") -> str:
     """Regulator (~2 W) + MCU (0.3 W) + passives demo board with a closed outline and
     a skinny +5V trace (for the PDN/trace-heating leg). Returns the pcb doc_id."""
     from services.mcp.ecad_common import ecad_session
@@ -1536,26 +1536,26 @@ def _fin16_demo_board(tools: dict, name: str = "fin16_demo") -> str:
     doc["tracks"].append({"id": "t1", "kind": "segment", "p1": [10.0, 15.0],
                           "p2": [30.0, 15.0], "width": 0.3, "net": "+5V",
                           "layer": "F.Cu"})
-    # T-RF20: doc is a client copy of the C++ session doc — write the fixture back.
+    # The doc is a client copy of the C++ session doc — write the fixture back.
     sess = ecad_session.get_session(doc_id)
     ecad_session.swap_doc(sess, doc)
     return sess.doc_id
 
 
-def test_fin16_dry_run_handoff() -> None:
-    """T-FIN16: dry-run handoff builds the fused FEA solid, per-component heat sources,
+def test_thermal_dry_run_handoff() -> None:
+    """Dry-run handoff builds the fused FEA solid, per-component heat sources,
     convection BCs and a VALID aicad.simhandoff/1 envelope; missing power metadata
     degrades honestly into the coverage note."""
     try:
         import build123d  # noqa: F401
     except ImportError:
-        print("  FIN16: build123d not installed — skipping dry-run handoff test")
+        print("  THERMAL: build123d not installed — skipping dry-run handoff test")
         return
     import os
     from services.mcp import simhandoff as sh
 
-    tools = _fin16_tools()
-    doc_id = _fin16_demo_board(tools)
+    tools = _thermal_tools()
+    doc_id = _thermal_demo_board(tools)
     r = _call(tools, "ecad_thermal_handoff", doc_id=doc_id, dry_run=True)
     _assert_context(r, "ecad_thermal_handoff")
     assert r["ok"] and r["dry_run"] and r["solved"] is False, r.get("error")
@@ -1581,21 +1581,21 @@ def test_fin16_dry_run_handoff() -> None:
     # theta_ja expectations for the verify hand calc.
     exp = {e["quantity"]: e for e in env.get("expectations", [])}
     assert "tj_U1_c" in exp and abs(exp["tj_U1_c"]["value"] - (25.0 + 2.0 * 40.0)) < 1e-6
-    print(f"  FIN16: dry run — {cov['n_heat_sources']} sources, "
+    print(f"  THERMAL: dry run — {cov['n_heat_sources']} sources, "
           f"k_eff {mat['k_w_mk']} W/mK, envelope valid")
-    print("  [fin16_dry_run_handoff] PASS")
+    print("  [thermal_dry_run_handoff] PASS")
 
 
-def test_fin16_trace_heating_toggle() -> None:
-    """T-FIN16: include_trace_heating pulls the ecad_run_pdn I2R map in as distributed
+def test_thermal_trace_heating_toggle() -> None:
+    """include_trace_heating pulls the ecad_run_pdn I2R map in as distributed
     flux — the load set and envelope visibly change."""
     try:
         import build123d  # noqa: F401
     except ImportError:
-        print("  FIN16: build123d not installed — skipping trace-heating test")
+        print("  THERMAL: build123d not installed — skipping trace-heating test")
         return
-    tools = _fin16_tools()
-    doc_id = _fin16_demo_board(tools, name="fin16_i2r")
+    tools = _thermal_tools()
+    doc_id = _thermal_demo_board(tools, name="thermal_i2r")
     p = _call(tools, "ecad_run_pdn", net="+5V", source_refs="U1", doc_id=doc_id)
     assert p["ok"] and p.get("boardphys_path"), f"pdn failed: {p.get('error')}"
     base = _call(tools, "ecad_thermal_handoff", doc_id=doc_id, dry_run=True)
@@ -1610,16 +1610,16 @@ def test_fin16_trace_heating_toggle() -> None:
     conds = {c["name"] for c in with_i2r["simhandoff"]["conditions"]}
     assert "trace_heating_i2r" in conds and \
         "trace_heating_i2r" not in {c["name"] for c in base["simhandoff"]["conditions"]}
-    print(f"  FIN16: I2R toggle — +{with_i2r['n_flux_loads'] - base['n_flux_loads']} "
+    print(f"  THERMAL: I2R toggle — +{with_i2r['n_flux_loads'] - base['n_flux_loads']} "
           f"flux loads, {ti['total_w']} W trace heat")
-    print("  [fin16_trace_heating_toggle] PASS")
+    print("  [thermal_trace_heating_toggle] PASS")
 
 
-def test_fin16_verify_thermal() -> None:
-    """T-FIN16: ecad_verify_thermal builds the Tj/limits margin table + the theta_ja
+def test_thermal_verify() -> None:
+    """ecad_verify_thermal builds the Tj/limits margin table + the theta_ja
     hand-calc verify envelope from a solved handoff payload (engine-less)."""
     from services.mcp import simhandoff as sh
-    tools = _fin16_tools()
+    tools = _thermal_tools()
     # Synthetic SOLVED handoff: U1 solved rise ~ hand-calc rise (2W x 40 C/W = 80 C);
     # U2 exceeds its 105 C limit.
     solved = {
@@ -1653,11 +1653,11 @@ def test_fin16_verify_thermal() -> None:
     # Dry-run / unsolved input is rejected honestly.
     bad = _call(tools, "ecad_verify_thermal", handoff_result={"ok": True, "solved": False})
     assert not bad["ok"] and "not solved" in bad["error"]
-    print(f"  FIN16: verify — verdict {v['verdict']!r}")
-    print("  [fin16_verify_thermal] PASS")
+    print(f"  THERMAL: verify — verdict {v['verdict']!r}")
+    print("  [thermal_verify] PASS")
 
 
-def test_fin16_conservation_and_incomplete_guards() -> None:
+def test_thermal_conservation_and_incomplete_guards() -> None:
     from services.mcp.ecad_thermal import (
         airflow_deviation_table, build_component_table, build_heat_loads,
         build_i2r_loads, map_component_temps, quasi_steady_transient,
@@ -1720,32 +1720,32 @@ def test_fin16_conservation_and_incomplete_guards() -> None:
     assert table[0]["deviation_pct"] == 40.0
     assert table[0]["verdict"].startswith("sane")
     assert airflow_checks[0]["pass"] is True
-    print("  [fin16_conservation_and_incomplete_guards] PASS")
+    print("  [thermal_conservation_and_incomplete_guards] PASS")
 
 
-def test_fin16_live_solve() -> None:
-    """T-FIN16 (live leg): full board -> solved temperature field with zero manual BC
+def test_thermal_live_solve() -> None:
+    """Live leg: full board -> solved temperature field with zero manual BC
     setup, when a sim-enabled libchudware is loadable. Honest skip otherwise."""
     try:
         import build123d  # noqa: F401
     except ImportError:
-        print("  FIN16: build123d not installed — skipping live solve")
+        print("  THERMAL: build123d not installed — skipping live solve")
         return
     try:
         from services.mcp import core_bridge as cb
         cb.call("ping", {})
     except Exception as e:  # noqa: BLE001
-        print(f"  FIN16: libchudware not loadable ({type(e).__name__}) — live solve SKIPPED "
+        print(f"  THERMAL: libchudware not loadable ({type(e).__name__}) — live solve SKIPPED "
               "(dry-run coverage above still exercises geometry/BC/envelope)")
         return
-    tools = _fin16_tools()
-    doc_id = _fin16_demo_board(tools, name="fin16_live")
+    tools = _thermal_tools()
+    doc_id = _thermal_demo_board(tools, name="thermal_live")
     r = _call(tools, "ecad_thermal_handoff", doc_id=doc_id, mesh_fineness=0.25)
     if not r.get("ok") or not r.get("solved"):
         # An FEA-disabled build degrades to an envelope-only result.
         why = r.get("error_solve") or r.get("error")
         assert "unavailable" in str(why) or r.get("simhandoff"), r
-        print(f"  FIN16: solver leg unavailable ({str(why)[:80]}) — live solve SKIPPED")
+        print(f"  THERMAL: solver leg unavailable ({str(why)[:80]}) — live solve SKIPPED")
         return
     amb = r["environment"]["t_amb_c"]
     assert r["board_max_temp_c"] > amb + 5.0, \
@@ -1757,16 +1757,16 @@ def test_fin16_live_solve() -> None:
     assert temps["U1"]["tj_c"] is not None, "theta_jc known -> Tj must be estimated"
     v = _call(tools, "ecad_verify_thermal")
     assert v["ok"] and v["table"], v
-    print(f"  FIN16: LIVE solve — board max {r['board_max_temp_c']} C, "
+    print(f"  THERMAL: LIVE solve — board max {r['board_max_temp_c']} C, "
           f"U1 case {temps['U1']['t_case_c']} C / Tj {temps['U1']['tj_c']} C; "
           f"verify: {v['verdict']!r}")
-    print("  [fin16_live_solve] PASS")
+    print("  [thermal_live_solve] PASS")
 
 
-# --------------------------------------------------------------------------- T-FIN17 heatsink selection
+# --------------------------------------------------------------------------- heatsink selection
 
 
-def _fin17_tools() -> dict:
+def _heatsink_tools() -> dict:
     """ECAD + thermal-handoff + heatsink tools on ONE stub (shared session state)."""
     from services.mcp.ecad_thermal import register_ecad_thermal_tools
     from services.mcp.heatsink import register_heatsink_tools
@@ -1777,7 +1777,7 @@ def _fin17_tools() -> dict:
     return stub.tools
 
 
-def test_fin17_tim_physics_guards() -> None:
+def test_heatsink_tim_physics_guards() -> None:
     """Invalid TIM physics must fail before ranking, never score as a cold winner."""
     from services.mcp.heatsink import (heatsink_select_from_params,
                                      tim_resistance_c_per_w)
@@ -1813,10 +1813,10 @@ def test_fin17_tim_physics_guards() -> None:
             "component_ref": "U1", "tj_target_c": 85.0, field: value})
         assert out["ok"] is False and "invalid TIM physics" in out["error"], out
         assert not ({"target_met", "winner", "best_achievable", "table"} & set(out)), out
-    print("  [fin17_tim_physics_guards] PASS")
+    print("  [heatsink_tim_physics_guards] PASS")
 
 
-def test_fin17_invalid_contact_area_fails_before_candidate_scoring() -> None:
+def test_heatsink_invalid_contact_area_fails_before_candidate_scoring() -> None:
     from services.mcp import ecad_thermal
     from services.mcp.heatsink import heatsink_select_from_params
 
@@ -1845,8 +1845,8 @@ def test_fin17_invalid_contact_area_fails_before_candidate_scoring() -> None:
     assert not ({"target_met", "winner", "best_achievable", "table"} & set(out)), out
 
 
-def test_fin17_parametric_generator() -> None:
-    """T-FIN17 (DoD): the parametric plain-finned-sink generator produces VALID
+def test_heatsink_parametric_generator() -> None:
+    """The parametric plain-finned-sink generator produces VALID
     geometry across its parameter range — every emitted spec passes structural
     validation, has physical mass/theta, and yields a well-formed engine op list;
     unbuildable specs are rejected."""
@@ -1881,13 +1881,13 @@ def test_fin17_parametric_generator() -> None:
                                "n_fins": 12, "fin_t_mm": 1.0, "fin_h_mm": 8}) != []
     assert validate_sink_spec({"base_l_mm": -5, "base_w_mm": 10, "base_t_mm": 2,
                                "n_fins": 4, "fin_t_mm": 1.0, "fin_h_mm": 8}) != []
-    print(f"  FIN17: parametric generator — {n_specs} specs across the range, "
+    print(f"  HEATSINK: parametric generator — {n_specs} specs across the range, "
           "all valid, invalid rejected")
-    print("  [fin17_parametric_generator] PASS")
+    print("  [heatsink_parametric_generator] PASS")
 
 
-def test_fin17_library_candidates() -> None:
-    """T-FIN17: the parts library serves heatsink candidates WITH thermal metadata
+def test_heatsink_library_candidates() -> None:
+    """The parts library serves heatsink candidates WITH thermal metadata
     (domain 'thermal'), and undersized sinks are filtered for a big component."""
     from services.mcp.heatsink import library_candidates
     cands, notice = library_candidates("still_air", 10.0, 6.0, 6.0)
@@ -1907,26 +1907,26 @@ def test_fin17_library_candidates() -> None:
     common = set(forced) & set(still)
     assert common and all(forced[i]["theta_sa_c_per_w"] < still[i]["theta_sa_c_per_w"]
                           for i in common)
-    print(f"  FIN17: library — {len(cands)} candidates with theta/mass/cost")
-    print("  [fin17_library_candidates] PASS")
+    print(f"  HEATSINK: library — {len(cands)} candidates with theta/mass/cost")
+    print("  [heatsink_library_candidates] PASS")
 
 
-def _fin17_board(tools: dict, name: str) -> str:
-    """FIN16 demo board with the regulator turned up to a ~3 W part."""
-    doc_id = _fin16_demo_board(tools, name=name)
+def _heatsink_board(tools: dict, name: str) -> str:
+    """Thermal-handoff demo board with the regulator turned up to a ~3 W part."""
+    doc_id = _thermal_demo_board(tools, name=name)
     from services.mcp.ecad_common import ecad_session
     doc = ecad_session.get_session(doc_id).doc
     for fp in doc["footprints"]:
         if fp["ref"] == "U1":
             fp["eng_overrides"]["power_w"] = {"typ": 3.0, "max": 3.5}
-    # T-RF20: write the client-copy mutation back into the C++ session.
+    # Write the client-copy mutation back into the C++ session.
     sess = ecad_session.get_session(doc_id)
     ecad_session.swap_doc(sess, doc)
     return sess.doc_id
 
 
-def test_fin17_heatsink_select() -> None:
-    """T-FIN17 (DoD demo): ~3 W regulator at an 85 C limit — heatsink_select ranks
+def test_heatsink_select() -> None:
+    """Demo: ~3 W regulator at an 85 C limit — heatsink_select ranks
     library + parametric candidates, the winner meets target in the re-solve (live
     FEA when libchudware is available, honest network_estimate otherwise), the ranked
     table carries {candidate, achieved_tj_c, delta_vs_target, mass_g, cost}, and the
@@ -1935,18 +1935,18 @@ def test_fin17_heatsink_select() -> None:
     try:
         import build123d  # noqa: F401
     except ImportError:
-        print("  FIN17: build123d not installed — skipping heatsink_select test")
+        print("  HEATSINK: build123d not installed — skipping heatsink_select test")
         return
     from services.mcp import simhandoff as sh
 
-    tools = _fin17_tools()
+    tools = _heatsink_tools()
     # No context yet -> honest error.
     from services.mcp import ecad_thermal as _et
     _et._THERMAL["last_ctx"] = None
     r0 = _call(tools, "heatsink_select", component_ref="U1", tj_target_c=85.0)
     assert not r0["ok"] and "ecad_thermal_handoff" in r0["error"]
 
-    doc_id = _fin17_board(tools, "fin17_demo")
+    doc_id = _heatsink_board(tools, "heatsink_demo")
     live = True
     try:
         from services.mcp import core_bridge as cb
@@ -2008,11 +2008,11 @@ def test_fin17_heatsink_select() -> None:
     sub = _call(tools, "heatsink_select", component_ref="U1", tj_target_c=20.0)
     assert not sub["ok"] and "ambient" in sub["error"]
 
-    print(f"  FIN17: {'LIVE FEA re-solve' if live else 'network estimate'} — "
+    print(f"  HEATSINK: {'LIVE FEA re-solve' if live else 'network estimate'} — "
           f"winner {w['candidate']!r} achieves {w['achieved_c']} C "
           f"(target 85), mass {w['mass_g']} g; impossible target honest "
           f"(best {imp['best_achievable']['achieved_c']} C)")
-    print("  [fin17_heatsink_select] PASS")
+    print("  [heatsink_select] PASS")
 
 
 
@@ -2147,7 +2147,7 @@ def test_simulate_tran_ac_no_series(tools: dict) -> None:
 
 
 def main() -> None:
-    print("AI-ECAD MCP tool tests")
+    print("ECAD MCP tool tests")
     _restore_provider = _disable_live_provider()
     try:
         _run_all()
@@ -2181,7 +2181,7 @@ def _run_all() -> None:
     test_check_impedance_no_tracks(tools)
     test_check_impedance_routed(tools)
     test_make_board(tools)
-    # Wave-L new tests
+    # DFM / diff-pair tests
     test_run_dfm_clean(tools)
     test_run_dfm_seeded(tools)
     test_autoroute_with_diff_pairs(tools)
@@ -2195,30 +2195,30 @@ def _run_all() -> None:
     test_e7_bogus_libid_rejected(tools)
     test_e8_temp_probe_surfaced(tools)
     test_e9_noise_top_level_nonzero(tools)
-    # T-FIN8 engineering metadata + boardphys sidecar
-    test_fin8_metadata_roundtrip(tools)
-    test_fin8_missing_metadata_degrades(tools)
-    test_fin8_to_3d_boardphys_sidecar(tools)
-    # T-FIN9 host-board rule pack
-    test_fin9_hostcheck_tool(tools)
-    # T-FIN13 PDN IR-drop
-    test_fin13_run_pdn(tools)
-    # T-FIN11 FPGA support pack
-    test_fin11_fpga_check_and_constraints(tools)
+    # engineering metadata + boardphys sidecar
+    test_eng_metadata_roundtrip(tools)
+    test_eng_missing_metadata_degrades(tools)
+    test_to_3d_boardphys_sidecar(tools)
+    # host-board rule pack
+    test_hostcheck_tool(tools)
+    # PDN IR-drop
+    test_run_pdn_ir_drop(tools)
+    # FPGA support pack
+    test_fpga_check_and_constraints(tools)
     # result-serving size gates
     test_status_summary_token_budget(tools)
     test_status_full_ref_set_equality(tools)
     test_simulate_tran_ac_no_series(tools)
-    # T-FIN16 ECAD -> thermal FEA handoff
-    test_fin16_dry_run_handoff()
-    test_fin16_trace_heating_toggle()
-    test_fin16_verify_thermal()
-    test_fin16_conservation_and_incomplete_guards()
-    test_fin16_live_solve()
-    # T-FIN17 heatsink selection loop
-    test_fin17_parametric_generator()
-    test_fin17_library_candidates()
-    test_fin17_heatsink_select()
+    # ECAD -> thermal FEA handoff
+    test_thermal_dry_run_handoff()
+    test_thermal_trace_heating_toggle()
+    test_thermal_verify()
+    test_thermal_conservation_and_incomplete_guards()
+    test_thermal_live_solve()
+    # heatsink selection loop
+    test_heatsink_parametric_generator()
+    test_heatsink_library_candidates()
+    test_heatsink_select()
     print("\nALL ECAD TOOL TESTS PASSED")
 
 
@@ -2226,12 +2226,12 @@ if __name__ == "__main__":
     main()
 
 
-# --------------------------------------------------------------------------- T-FIN19 airflow (CHT) handoff
+# --------------------------------------------------------------------------- airflow (CHT) handoff
 # Appended EOF (shared-file hygiene). pytest collects these; the __main__ runner above
 # predates them and only runs the older suite.
 
 
-def _fin19_tools() -> dict:
+def _airflow_tools() -> dict:
     from services.mcp.ecad_thermal import (register_ecad_thermal_tools,
                                          register_ecad_airflow_tools)
     stub = _StubMCP()
@@ -2241,7 +2241,7 @@ def _fin19_tools() -> dict:
     return stub.tools
 
 
-def _fin19_board_geo() -> tuple:
+def _airflow_board_geo() -> tuple:
     """Synthetic board_to_fea_step()-shaped blocks (engine-less)."""
     board = {"bbox_mm": [0.0, 0.0, 40.0, 30.0], "z_top_mm": 1.6, "z_bot_mm": 0.0,
              "thickness_mm": 1.6, "outline_area_mm2": 1200.0}
@@ -2261,7 +2261,7 @@ def _fin19_board_geo() -> tuple:
     return board, material, components
 
 
-def test_fin19_box_stl_watertight(tmp_path) -> None:
+def test_airflow_box_stl_watertight(tmp_path) -> None:
     """write_box_stl emits a closed 12-facet ASCII STL in world mm."""
     from services.mcp.ecad_thermal import write_box_stl
     p = write_box_stl(str(tmp_path / "b.stl"), 0, 0, 0, 4, 3, 2)
@@ -2275,16 +2275,16 @@ def test_fin19_box_stl_watertight(tmp_path) -> None:
         assert abs(m.volume - 24.0) < 1e-6
     except ImportError:
         pass
-    print("  [fin19_box_stl_watertight] PASS")
+    print("  [airflow_box_stl_watertight] PASS")
 
 
-def test_fin19_case_generation(tmp_path) -> None:
-    """Engine-less: build_airflow_solids produces the exact T-SIM5 solids seam shape —
+def test_airflow_case_generation(tmp_path) -> None:
+    """Engine-less: build_airflow_solids produces the exact conjugate-CFD solids seam shape —
     board (passive, homogenized k) + one region per POWERED component, unpowered
     components skipped honestly; enclosure adds 4 passive duct walls."""
     from services.mcp.ecad_thermal import build_airflow_solids, build_enclosure_walls
     import os as _os
-    board, material, components = _fin19_board_geo()
+    board, material, components = _airflow_board_geo()
     case = build_airflow_solids(board, material, components, str(tmp_path))
     names = [s["name"] for s in case["solids"]]
     assert names[0] == "board" and len(case["solids"]) == 3, names
@@ -2305,20 +2305,20 @@ def test_fin19_case_generation(tmp_path) -> None:
     walls, assum = build_enclosure_walls(board, {"clearance_mm": 8.0}, str(tmp_path))
     assert len(walls) == 4 and all(w["power_w"] == 0.0 for w in walls)
     assert any("bypass" in a for a in assum), "bypass-flow honesty note required"
-    print("  [fin19_case_generation] PASS")
+    print("  [airflow_case_generation] PASS")
 
 
-def test_fin19_region_parse() -> None:
+def test_airflow_region_parse() -> None:
     from services.mcp.ecad_thermal import parse_region_temps
     notes = ["chtMultiRegionFoam coupled solid+fluid; solid temperature 25-61 C.",
              "per-region: board: 41 C mean, 44 C peak; c_U1: 58 C mean, 61 C peak."]
     t = parse_region_temps(notes)
     assert t["board"] == {"mean_c": 41.0, "peak_c": 44.0}
     assert t["c_U1"]["peak_c"] == 61.0
-    print("  [fin19_region_parse] PASS")
+    print("  [airflow_region_parse] PASS")
 
 
-def test_fin19_deviation_table() -> None:
+def test_airflow_deviation_table() -> None:
     """Engine-less: the verify math — sane / optimistic / conservative verdicts, rise-
     based deviation, and effective-h guidance when the preset was optimistic."""
     from services.mcp.ecad_thermal import airflow_deviation_table
@@ -2337,14 +2337,14 @@ def test_fin19_deviation_table() -> None:
     assert checks[0]["deviation_pct"] == 100.0
     # effective-h guidance: h_eff = 10 * 40/80 = 5 W/m2-K
     assert guidance and "U1" in guidance[0] and "5.0" in guidance[0], guidance
-    print("  [fin19_deviation_table] PASS")
+    print("  [airflow_deviation_table] PASS")
 
 
-def test_fin19_verify_tool_and_envelope() -> None:
+def test_airflow_verify_tool_and_envelope() -> None:
     """ecad_verify_airflow builds the deviation table + a VALID ecad_to_cht verify
     envelope from explicit payloads (no engine, no OpenFOAM)."""
     from services.mcp import simhandoff as sh
-    tools = _fin19_tools()
+    tools = _airflow_tools()
     air = {"ok": True, "solved": True, "map_back_complete": True,
            "doc_id": "d1", "inlet": {"temp_c": 25.0, "speed_mps": 2.0},
            "components": [{"ref": "U1", "power_w": 2.0, "t_peak_c": 105.0,
@@ -2364,21 +2364,21 @@ def test_fin19_verify_tool_and_envelope() -> None:
     # no-airflow degrade is honest
     r2 = _call(tools, "ecad_verify_airflow", airflow_result={"solved": False})
     assert not r2["ok"] and "ecad_airflow_handoff" in str(r2["next_actions"])
-    print("  [fin19_verify_tool_and_envelope] PASS")
+    print("  [airflow_verify_tool_and_envelope] PASS")
 
 
-def test_fin19_handoff_dry_run() -> None:
+def test_airflow_handoff_dry_run() -> None:
     """Full-tool dry run on a real board doc: solids + envelope + honest skip; the LBM
     advisory is offered ONLY as a non-thermal render. Needs build123d (geometry leg)."""
     try:
         import build123d  # noqa: F401
     except ImportError:
-        print("  FIN19: build123d not installed — skipping dry-run handoff test")
+        print("  AIRFLOW: build123d not installed — skipping dry-run handoff test")
         return
     import os as _os
     from services.mcp import simhandoff as sh
-    tools = _fin19_tools()
-    doc_id = _fin16_demo_board(tools, name="fin19_dry")
+    tools = _airflow_tools()
+    doc_id = _thermal_demo_board(tools, name="airflow_dry")
     r = _call(tools, "ecad_airflow_handoff", doc_id=doc_id, dry_run=True,
               enclosure={"clearance_mm": 6.0})
     _assert_context(r, "ecad_airflow_handoff")
@@ -2394,11 +2394,11 @@ def test_fin19_handoff_dry_run() -> None:
     assert env["coupling"] == "ecad_to_cht"
     kinds = {c["kind"] for c in env["conditions"]}
     assert {"heat_source", "inlet_velocity", "inlet_temperature"} <= kinds
-    print(f"  FIN19: dry run — {len(names)} solids, envelope valid")
-    print("  [fin19_handoff_dry_run] PASS")
+    print(f"  AIRFLOW: dry run — {len(names)} solids, envelope valid")
+    print("  [airflow_handoff_dry_run] PASS")
 
 
-def _fin19_openfoam_available() -> bool:
+def _airflow_openfoam_available() -> bool:
     try:
         from services.sim.foam_runner import get_runner
         r = get_runner()
@@ -2407,12 +2407,12 @@ def _fin19_openfoam_available() -> bool:
         return False
 
 
-def test_fin19_live_cht_smoke(tmp_path) -> None:
-    """LIVE (gated): one tiny coarse CHT case through the T-SIM5 seam using the exact
+def test_airflow_live_cht_smoke(tmp_path) -> None:
+    """LIVE (gated): one tiny coarse CHT case through the conjugate-CFD seam using the exact
     multi-solid geometry/metadata shape build_airflow_solids emits. The test lowers only
     thermal mass so the same steady endpoint is reached quickly. Skips without OpenFOAM."""
-    if not _fin19_openfoam_available():
-        print("  FIN19: OpenFOAM not available — live CHT smoke SKIPPED")
+    if not _airflow_openfoam_available():
+        print("  AIRFLOW: OpenFOAM not available — live CHT smoke SKIPPED")
         return
     from services.mcp.ecad_thermal import build_airflow_solids, parse_region_temps
     from services.sim.openfoam import run_openfoam_tunnel
@@ -2437,8 +2437,8 @@ def test_fin19_live_cht_smoke(tmp_path) -> None:
     assert temps["c_U1"]["peak_c"] > 25.0 + 2.0, \
         f"2 W component must heat above inlet: {temps}"
     assert temps["c_U1"]["peak_c"] >= temps["board"]["mean_c"], temps
-    print(f"  FIN19: live CHT — board {temps['board']}, U1 {temps['c_U1']}")
-    print("  [fin19_live_cht_smoke] PASS")
+    print(f"  AIRFLOW: live CHT — board {temps['board']}, U1 {temps['c_U1']}")
+    print("  [airflow_live_cht_smoke] PASS")
 
 # ------------------------------------------------- schematic argument-dialect tolerance
 # ecad_place_symbol/ecad_wire used to accept exactly ONE rigid argument shape while their

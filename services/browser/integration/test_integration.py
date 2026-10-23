@@ -1,4 +1,4 @@
-"""Per-source browser integration tests — T-X6.
+"""Per-source browser integration tests.
 
 These exercise the REAL adapter code paths (search/acquire → browser_fetch under a
 saved login) against the REAL sites. They are OPT-IN only:
@@ -23,7 +23,7 @@ import pytest
 
 from services.browser import adapters
 
-#: Every source with real adapter code (T-X2/T-X7). Kept in sync with the registry.
+#: Every source with real adapter code. Kept in sync with the registry.
 EXPECTED_SITES = ("amazon", "grabcad", "jlcpcb", "mcmaster", "pcbway", "traceparts",
                   "misumi", "lcsc", "digikey", "snapeda", "3dcontentcentral",
                   # retail wave (Parts Library V2)

@@ -315,7 +315,7 @@ def _apply_buildgraph_splice(
                 "note": "recorded; no live splice (missing run_id/after_node/adds)"}
 
     # Build the splice edges: each added node needs a bounded retry back-edge
-    # (dag_replan DoD enforces this).  The proposal may supply them; otherwise we
+    # (dag_replan validation enforces this).  The proposal may supply them; otherwise we
     # synthesise a self-retry with a conservative budget so the splice validates.
     splice_edges = list(proposal.get("splice_edges") or [])
     have_back = {e.get("from") for e in splice_edges if "retry_budget" in e}

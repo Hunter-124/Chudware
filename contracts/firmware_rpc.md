@@ -99,7 +99,7 @@ The CMake template sets `CMAKE_EXPORT_COMPILE_COMMANDS ON`, so a real configure 
 it writes a synthetic `compile_commands.json` enumerating the template sources, which a later real
 configure overwrites. The artifact is always present after `fw_new_project`.
 
-## 7. Simulation trace artifact — `aicad.firmware.trace/1` (T-FIN1, appended)
+## 7. Simulation trace artifact — `aicad.firmware.trace/1` (appended)
 
 `fw_sim_run` now emits a structured JSON trace artifact next to the emulated ELF
 (`<elf>.trace.json`, atomic tmp+replace; best-effort — a write failure yields
@@ -154,7 +154,7 @@ only; when the pin has none, the assertion fails with detail
 `"no time-stamped events for pin '<PIN>'"`. The plain `gpio:<PIN>=<level>` form keeps its
 §4 meaning: end-of-run level.
 
-## 8. Worker endpoints — GUI seam (T-FIN5, appended)
+## 8. Worker endpoints — GUI seam (appended)
 
 The desktop Firmware workspace (host GUI) talks to the engine over the JSON-RPC worker
 (`contracts/worker_rpc.md`), not MCP. `core/firmware/firmware_rpc.cpp` registers a
@@ -168,14 +168,14 @@ plus two GUI conveniences:
 
 | method | params | result |
 |---|---|---|
-| `fw_status` | `{}` | the T-FIN4 provisioning doctor payload `{ok, tools, families, banners, missing}` — the GUI gates Build/Emulate/Flash/Debug buttons on `families.*.can_*` and shows `banners` verbatim as install guidance |
+| `fw_status` | `{}` | the provisioning doctor payload `{ok, tools, families, banners, missing}` — the GUI gates Build/Emulate/Flash/Debug buttons on `families.*.can_*` and shows `banners` verbatim as install guidance |
 | `fw_projects` | `{}` | `{projects: [FirmwareProject dict (§2) + "root_dir": absolute path]}`, newest first; unreadable sidecars skipped |
 
 Error posture is unchanged from §1: expected failures come back inside the result
 (`{code, message, detail}` envelope or `success=False` / `passed=False`), never a raised
 worker error.
 
-## 9. Sensor stimulus scenarios — `aicad.fwscenario/1` (T-FIN3, appended)
+## 9. Sensor stimulus scenarios — `aicad.fwscenario/1` (appended)
 
 The previously-reserved `scenario` param of `fw_sim_run` (§5) is now defined: a declarative
 set of time-series stimulus tracks bound to emulated peripherals, compiled into the generated
@@ -224,7 +224,7 @@ canned .resc-generation + schema tests carry coverage, per the §7 precedent.
 `toggles:`/`period:` require the `gpio_observe` capability (like `gpio:`);
 `uart_within:` requires `uart`.
 
-## 10. Firmware ↔ board co-verification — `fw_verify_board` (T-FIN6, appended)
+## 10. Firmware ↔ board co-verification — `fw_verify_board` (appended)
 
 Closes the §2 one-way board link: the board generated `pinmap.h`; `fw_verify_board` checks the
 firmware BACK against the board before fab. Engine handler `engine.firmware.mcp_tools.
@@ -244,7 +244,7 @@ envelope for an unresolvable board/project or missing sources).
   disagree. `strap` / `input_only` come from per-family tables in `mcu_pinouts`
   (`strap_pins()`: STM32 BOOT0/BOOT1/NRST, ESP32 EN/GPIO0/2/12/15, AVR RESET; input-only:
   ESP32 GPIO34–39). Direction expectations need `sch_doc_ref` (pin types live on symbol pins);
-  without it those checks are skipped honestly. Decoupling rails come from the T-FIN8 eng
+  without it those checks are skipped honestly. Decoupling rails come from the per-component eng
   metadata (`supply.rails`, `contracts/ecad/boardphys.md`) plus power-named nets on the MCU's
   own pads.
 - **Dynamic pass**: runs when `trace_path` points at a §7 `aicad.firmware.trace/1` artifact,
@@ -271,16 +271,16 @@ hint: `{rule, severity: "error"|"warning", net: str|null, pins: [str], xy: null,
 `summary` = `{n, errors, warnings, rules}`; `fw_pins` = the per-token scan
 `{reads, writes, refs, files}`; `dynamic` = `{ran, source: "trace"|"emulation"|null, reason?}`.
 
-## 11. Power/duty-cycle profile — `aicad.powerprofile/1` (T-FIN7, appended)
+## 11. Power/duty-cycle profile — `aicad.powerprofile/1` (appended)
 
 A duty-cycle-weighted per-rail current profile derived from a §7 emulation trace plus
-the T-FIN8 per-component rail metadata (`contracts/ecad/boardphys.md` `eng.supply.rails`).
+the per-component rail metadata (`contracts/ecad/boardphys.md` `eng.supply.rails`).
 **Bookkeeping, not SPICE** — datasheet envelope currents scaled by observed/derived
 activity; the artifact's `model` field states this. Producer:
 `core/firmware/powerprofile.cpp` (`build_power_profile`). Consumers: system power
-budget (T-FIN23); each rail's `schedule` is exactly the `{duty, period_s}` /
+budget; each rail's `schedule` is exactly the `{duty, period_s}` /
 `{points:[[t_s,scale]], period_s}` heat-load schedule shape the transient-thermal path
-accepts (T-FIN18) — no re-parsing of raw traces downstream.
+accepts — no re-parsing of raw traces downstream.
 
 Honesty rules (inherited from boardphys, binding): unknown currents stay `null`, never
 an invented 0 (gaps listed in `coverage.unknown_active_current`); every duty/residency
@@ -321,12 +321,12 @@ edges, else null.
 | `i_avg_a` | float \| null | Σ per-component `duty·i_active + (1−duty)·i_sleep`; a null `i_sleep` omits the sleep term (avg is then a floor, noted in provenance); null when no contributor has a known active current |
 | `i_peak_a` | float \| null | Σ known active currents (all contributors simultaneously active) |
 | `residency` | obj | `{active_frac, sleep_frac, active_s, sleep_s}` (nulls when unknowable) — rail-level mean of contributor duties |
-| `schedule` | obj \| null | `{duty, period_s}` — the T-FIN18 transient-thermal heat-load schedule shape (`{points, period_s}` reserved for future piecewise producers); `period_s` = dominant measured pin period, else 1.0 s (noted) |
+| `schedule` | obj \| null | `{duty, period_s}` — the transient-thermal heat-load schedule shape (`{points, period_s}` reserved for future piecewise producers); `period_s` = dominant measured pin period, else 1.0 s (noted) |
 | `provenance` | [str] | per-component lines: duty + its source heuristic + the currents used |
 
 Component→activity mapping: MCU footprints (`mcu_pinouts.component_family`) follow the
 CPU residency; a component whose pads sit on a net mapped to an observed trace pin
-(net name == pin name, or decoded pin-id equality via `pinmap.pin_model` — the T-FIN6
+(net name == pin name, or decoded pin-id equality via `pinmap.pin_model` — the §10
 rules) follows that pin's duty; everything else is assumed always active.
 
 Surfaces:
@@ -340,10 +340,9 @@ Surfaces:
   trace or unknown project). Explicit `board_doc_ref` beats the project link; with no
   board the activity half still returns (`rails: []`, coverage note).
 
-## 12. Embedded debugger/programmer/serial backends — avrdude, OpenOCD+GDB/MI, simavr, Renode, live serial monitor (S-FW-CORE, appended)
+## 12. Embedded debugger/programmer/serial backends — avrdude, OpenOCD+GDB/MI, simavr, Renode, live serial monitor (appended)
 
-Closes the three gaps `docs/omp-integration/research/verify-firmware-seam.md` and
-`embedded-landscape.md` identified: no AVR flash backend, no real GDB protocol/stub attach
+Closes three gaps in the firmware seam: no AVR flash backend, no real GDB protocol/stub attach
 point, no live physical-device serial/UART monitor (as opposed to the §7 emulator UART
 capture). Same toolchain posture as §1: every backend below is invoked as an **unmodified
 subprocess only** (avrdude GPL-2.0+, OpenOCD GPL-2.0, gdb/`arm-none-eabi-gdb`/`avr-gdb`
@@ -353,8 +352,7 @@ wrappers around `subprocess.cpp`'s `run_capture()`); dispatched via
 `core/firmware/firmware_rpc.cpp`'s `call()`; MCP tools registered inside the SAME
 `register_firmware_tools(mcp)` used for both the live agent surface (`server.py`, family
 `"ecad"`) and the DAG-verify battery surface (`verify.py`'s private `battery-firmware`
-FastMCP instance) — dual registration is automatic, no extra wiring, per
-`docs/omp-integration/research/verify-tool-gate.md` §4.
+FastMCP instance) — dual registration is automatic, no extra wiring.
 
 ### 12.1 GDB/MI as the uniform non-DAP adapter shape
 

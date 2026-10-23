@@ -1,4 +1,4 @@
-"""Tests for the T-FIN23 system power/energy budget (services/mcp/power_budget.py).
+"""Tests for the system power/energy budget (services/mcp/power_budget.py).
 
 Groups:
   1. Sensor-node fixture — sleep/wake duty cycle via an aicad.powerprofile/1 artifact;

@@ -360,7 +360,7 @@ def call(method: str, params: Optional[dict] = None) -> dict:
     # STICKY fallback: once an initial startup failure demotes us to the in-process
     # engine we stay there for the life of this process. Retrying the daemon
     # per-call re-pays the full connect/spawn budget (~15 s) on EVERY engine
-    # call — measured 150x slowdown (docs/review/PERF_AUDIT_2026-07-11.md §1) — and
+    # call — measured 150x slowdown (2026-07-11 perf audit) — and
     # switching back mid-session would strand doc_ids created in the in-process
     # engine. Recovery = restart the server (the warning says so).
     if _daemon_mode() and not _DAEMON_FALLBACK_WARNED:

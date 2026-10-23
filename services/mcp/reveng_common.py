@@ -626,7 +626,7 @@ def _make_pipeline_agent_fn(
     this dispatcher wires each node to the real vision backends, degrading honestly
     to a non-success result (which the node ESCALATES on per its on_fail) when a
     backend module or its provisioning is absent. It never re-invokes the reveng
-    MCP launch tools (that would recurse — see work/questions/RE-17.md Q1).
+    MCP launch tools (that would recurse).
 
     strategy:
         ``deterministic`` (default) — reverse_engineer with fit hints.

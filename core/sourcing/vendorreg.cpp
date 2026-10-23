@@ -3,7 +3,7 @@
 // spec-sheet registration uses): copy the CAD under vendor_parts/<slug>/<slug>/,
 // upsert the record in index.json (indent=2, sort_keys like the oracle), return the
 // asdict-shaped VendorPart record. The Python-only PartsHub FTS rebuild side effect
-// is NOT mirrored here (the hub is a reported remainder of T-RF18).
+// is NOT mirrored here.
 #include "sourcing/sourcing.h"
 
 #include <chrono>

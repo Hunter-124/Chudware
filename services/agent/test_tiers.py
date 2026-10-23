@@ -1,4 +1,4 @@
-"""Tests for services/agent/tiers.py — T-W10 tier profiles + budget enforcer.
+"""Tests for services/agent/tiers.py — tier profiles + budget enforcer.
 
 Contract: contracts/advisor.md §8 + 1.3 addendum.
 
@@ -260,11 +260,11 @@ class TestTierDetect:
 
 
 # ---------------------------------------------------------------------------
-# tier -> provider resolution (the node_runner / gym T-DP19 shared seam)
+# tier -> provider resolution (the node_runner / gym shared seam)
 
 class TestProviderForTier:
     """``provider_for_tier`` is the single tier->provider resolution seam shared
-    by services.dag.node_runner and the gym bench (T-DP19). It must:
+    by services.dag.node_runner and the gym bench. It must:
       * route local-* tiers to the bundled local model (never the ambient
         default), unless CHUDWARE_PROVIDER overrides;
       * leave every non-local tier (and no tier at all) on the ordinary

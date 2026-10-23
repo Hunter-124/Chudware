@@ -19,7 +19,7 @@ completion — see ``loop._phase_gate_context``). Instead the gym:
 HONESTY NOTE (read this before trusting a number). A genuine model-in-the-loop cycle
 needs (a) a real tool-executing agent_fn, (b) a provisioned model (a local model such
 as qwen3-4b, or a frontier key), and (c) the C++ core for real geometry checks. In this
-environment none of the three is present (see ``reports/`` cycle-1 for the exact probe).
+environment none of the three is present (the cycle-1 report records the exact probe).
 So Cycle 1 runs in MOCK mode: the agent_fn replays scripted per-role turns that emit
 ledger events. This proves the harness + classifier + report end to end and is labeled
 as mock everywhere. Scripted turns do not react to a dial change, so any pass-rate

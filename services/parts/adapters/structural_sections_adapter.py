@@ -1,4 +1,4 @@
-"""CatalogProvider adapter for structural sections (T-P2).
+"""CatalogProvider adapter for structural sections.
 
 Wraps engine_oracle/structural/sections.py + the clean-room data tables:
   - engine_oracle/data/aisc_shapes/aisc_shapes_curated.json  (AISC W/S/C sections)
@@ -24,7 +24,7 @@ from typing import Iterator
 
 log = logging.getLogger(__name__)
 
-# Data files re-homed to services/structural/data/ with the structural modules (T-RF20).
+# Data files re-homed to services/structural/data/ with the structural modules.
 _DATA = Path(__file__).resolve().parents[2] / "structural" / "data"
 _AISC_PATH = _DATA / "aisc_shapes" / "aisc_shapes_curated.json"
 _LUMBER_PATH = _DATA / "lumber_table.json"

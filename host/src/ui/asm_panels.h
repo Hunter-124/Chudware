@@ -192,7 +192,7 @@ private:
     bool explodeOpen_ = false, explodeFocus_ = false;
     bool explodeActive_ = false;
     float explodeFactor_ = 0.0f;
-    // T-PERF2: latest-wins async doc_set_explode_state (slider never blocks GL)
+    // Latest-wins async doc_set_explode_state (slider never blocks GL)
     int  explodeGen_ = 0;
     bool explodeInFlight_ = false;
     bool explodePending_ = false;

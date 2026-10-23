@@ -250,8 +250,8 @@ TEST_CASE("plan_for mid pressure scales workers between 1 and allotment") {
 }
 
 // ── The cgroup budget term ──────────────────────────────────────────────────────
-// Regression for the ME-490 phase-5A refusal: inside a
-// `systemd-run --scope -p MemoryMax=10G` holding the mission driver, its python
+// Regression for a live refusal on a tube-frame study: inside a
+// `systemd-run --scope -p MemoryMax=10G` holding the driver process, its python
 // worker and chudware-hostd, the term was computed as
 // `limit - (memory.current - own_rss)`. memory.current also charges the PAGE
 // CACHE (that scope had streamed STEP/VTU files), so it sat within a few hundred

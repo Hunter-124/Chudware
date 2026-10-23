@@ -1,5 +1,5 @@
 // core/dfm/process_profiles.h — manufacturing-process profiles + the rule-based
-// process resolver (FDM-default) with the ambiguity gate (T-RF19 leaf 6 C++ port of
+// process resolver (FDM-default) with the ambiguity gate (C++ port of
 // engine_oracle/dfm/process_profiles.py). The single owner of the DfM "fit brain":
 // process numbers, the ambiguity gate and the fit-clearance math are identical on
 // every path (MCP intake/dimension-scheme tools, the in-app agent geometry helpers).

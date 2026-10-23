@@ -1,4 +1,4 @@
-# Design for manufacturability pre-op (aicad.trigger/1 — T-DP6)
+# Design for manufacturability pre-op (aicad.trigger/1)
 
 **When this fires:** manufacturing intent is explicit, or the model calls `set_process`,
 `resolve_process`, `dfm_check`, or `wall_thickness`.

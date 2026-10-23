@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V&V Benchmark Harness — T-BL01.
+"""V&V Benchmark Harness.
 
 Systematic validation of Chudware simulation and analysis backends against
 INDEPENDENT analytic reference solutions (textbook cases, NAFEMS-style
@@ -28,7 +28,7 @@ Usage (full suite via pytest):
     CHUDWARE_RUN_VV=full CHUDWARE_LIBCHUDWARE=... pytest scripts/vv_benchmark.py -q
 
 Exit code: 0 if all executed checks within tolerance (or skip-with-reason); 1 on failure.
-Zero executed checks = failure (all-skip = failure, per sprint policy).
+Zero executed checks = failure (all-skip = failure).
 """
 from __future__ import annotations
 
@@ -765,7 +765,7 @@ def bench_structural() -> None:
 
 
 # ===========================================================================
-# T-BL20: shared in-process full-MCP-server dispatch for the C++ FEA cases below.
+# Shared in-process full-MCP-server dispatch for the C++ FEA cases below.
 #
 # sim_run_static / sim_run_modal are C++ plugins that expect a pre-resolved "study"
 # dict (mesh, fixed-node ids, nodal loads). Building that dict requires the face-query
@@ -813,7 +813,7 @@ def _missing_fea_capability(error) -> bool:
     return bool(error) and "unknown method" in str(error)
 
 def _polymesh_provenance() -> tuple[str, str]:
-    """Identify the exact linked solver binary and pinned private-fork mesher source."""
+    """Identify the exact linked solver binary and pinned mesher source."""
     lib_value = os.environ.get("CHUDWARE_LIBCHUDWARE", "")
     binary_revision = "not-present"
     if lib_value and Path(lib_value).is_file():
@@ -831,7 +831,7 @@ def _polymesh_provenance() -> tuple[str, str]:
                 if "set(POLYMESH_COMMIT" in line and '"' in line:
                     pin = line.split('"', 2)[1]
                     break
-    source = "Chudware core tet FEA + private-fork Polyhedral-FEA polymesh mesher"
+    source = "Chudware core tet FEA + pinned Polyhedral-FEA polymesh mesher"
     revision = f"polymesh-git:{pin or 'unresolved'};libchudware-sha256:{binary_revision}"
     return source, revision
 
@@ -907,7 +907,7 @@ def _fea2_rect_section_case() -> dict:
 def _fea3_uniform_pressure_case() -> dict:
     """FEA3: cantilever tip deflection under a uniform top-face pressure (Roark UDL case).
 
-    T-BL20 FINDING, now CLOSED: this case surfaced a real defect in the C++
+    FINDING, now CLOSED: this case surfaced a real defect in the C++
     pressure-load path (core/sim/fea_run.cpp, the `type == "pressure"` branch of
     fea_run_static), which lumped the whole face load onto corner nodes and read ~10x
     high, non-convergent with mesh density. The deposit is now the work-consistent
@@ -1006,7 +1006,7 @@ def bench_modal() -> None:
 
 
 # ===========================================================================
-# FAMILY 6b: TRANSIENT thermal — 1D slab quench (T-FIN18)
+# FAMILY 6b: TRANSIENT thermal — 1D slab quench
 # Reference: Incropera & DeWitt "Fundamentals of Heat and Mass Transfer" 7th ed
 # §5.5: series solution for a plane wall with sudden symmetric surface temperature.
 # ===========================================================================
@@ -1046,7 +1046,7 @@ def _thermal_transient_slab_case() -> dict:
 
 def bench_thermal_transient() -> None:
     """Transient conduction validation: analytic 1D slab quench vs the C++ backward-Euler
-    transient solver (T-FIN18), executed through the full MCP server (same access pattern
+    transient solver, executed through the full MCP server (same access pattern
     and graceful-skip rules as bench_fea_static)."""
     print("\n--- [thermal-transient] 1D slab quench (Incropera 7th §5.5) ---")
     case_name = "TT1-slab-quench-mid-T"
@@ -1176,7 +1176,7 @@ def bench_fea_static() -> None:
 
 
 # ===========================================================================
-# FAMILY 8b: private-fork Polyhedral-FEA / PolyMesh mesher + Chudware tet FEA
+# FAMILY 8b: pinned Polyhedral-FEA / PolyMesh mesher + Chudware tet FEA
 #
 # This is deliberately distinct from FAMILY 8.  It exercises the independently
 # implemented graded Cartesian PolyMesh discretization while retaining Chudware's
@@ -1221,7 +1221,7 @@ def _polymesh_static_case(case: str) -> dict:
 
 def bench_polymesh_fea() -> None:
     """Independent PolyMesh discretization checked against two clean-room references."""
-    print("\n--- [polymesh-fea] private-fork Polyhedral-FEA mesher + core tet FEA ---")
+    print("\n--- [polymesh-fea] pinned Polyhedral-FEA mesher + core tet FEA ---")
     cases = [
         ("PM1-cantilever-bending", "ENGINEERING",
          "Clean-room Euler-Bernoulli derivation: I=bh³/12; δ=PL³/(3EI)"),
@@ -1248,7 +1248,7 @@ def bench_polymesh_fea() -> None:
             error = result.get("error")
             if _missing_polymesh_capability(error):
                 _record("polymesh-fea", case, "N/A", "SKIP", None, None,
-                        f"private-fork PolyMesh backend unavailable: {error}", citation,
+                        f"PolyMesh backend unavailable: {error}", citation,
                         executed=False, solver_source=source, solver_revision=revision)
             else:
                 _record("polymesh-fea", case, "N/A", "FAIL", None, result["ref"],
@@ -1260,7 +1260,7 @@ def bench_polymesh_fea() -> None:
 
 
 # ===========================================================================
-# FAMILY 9: CalculiX (ccx) — second structural opinion (T-BL20)
+# FAMILY 9: CalculiX (ccx) — second structural opinion
 # GPL-2 -> subprocess isolation per contracts/licenses.md (same posture as the
 # ngspice/Renode/QEMU rows: PATH-discovered, never bundled, degrades gracefully).
 # Reference: same cantilever as FEA1 — Roark AND our own C++ FEA both get an
@@ -1273,7 +1273,7 @@ def _write_calculix_cantilever_inp(path: str, L: float, b: float, h: float, P: f
     """Generate a minimal Abaqus-format .inp for a C3D8 hex-mesh cantilever: fixed at
     x=0, a total force P (N, -Z) spread evenly over the x=L end nodes. Clean-room:
     synthesized directly from our own geometry/loads — no NAFEMS/ASME content is
-    reproduced (same fence as T-BL01)."""
+    reproduced (same fence as the rest of this harness)."""
     nnx, nny, nnz = nx + 1, ny + 1, nz + 1
 
     def nid(i: int, j: int, k: int) -> int:  # 1-based CalculiX node id
@@ -1404,14 +1404,14 @@ def bench_calculix() -> None:
 
 
 # ===========================================================================
-# FAMILY 10: Advanced FEA (T-BL04) — fatigue / thermal / buckling / contact
+# FAMILY 10: Advanced FEA — fatigue / thermal / buckling / contact
 # Fatigue is pure-Python (S-N life layer). Thermal/buckling use the engine;
 # only the legacy contact proxy uses the optional ccx subprocess from FAMILY 9.
 # Each case cites a closed-form reference with literal expected values + a tier.
 # ===========================================================================
 
 def bench_fatigue_life() -> None:
-    """T-BL04 fatigue: the host-mirrored S-N life layer vs a Shigley hand-calc."""
+    """Fatigue: the host-mirrored S-N life layer vs a Shigley hand-calc."""
     print("\n--- [fatigue] S-N (Basquin) life post-processing ---")
     try:
         from services.mcp import fea_advanced as fa
@@ -1504,7 +1504,7 @@ def bench_buckling_engine() -> None:
 
 
 def bench_contact_ccx() -> None:
-    """T-BL04 contact: NLGEOM two-block contact load-transfer conservation via ccx.
+    """Contact: NLGEOM two-block contact load-transfer conservation via ccx.
 
     This validates the box-proxy deck the frozen `sim_run_contact` worker RPC still
     ships. The MCP tool run_fea_contact no longer runs ccx at all: it solves real
@@ -1542,7 +1542,7 @@ def bench_contact_ccx() -> None:
 
 
 def bench_advanced_fea() -> None:
-    """T-BL04 FAMILY 10 driver — fatigue + thermal + buckling + contact."""
+    """FAMILY 10 driver — fatigue + thermal + buckling + contact."""
     bench_fatigue_life()
     bench_thermal_engine()
     bench_buckling_engine()
@@ -1572,7 +1572,7 @@ def _generate_report(elapsed: float) -> str:
         "# V&V Benchmark Report — Chudware Simulation Backends",
         "",
         f"**Generated:** {now}  ",
-        f"**Script:** `scripts/vv_benchmark.py` (T-BL01)  ",
+        f"**Script:** `scripts/vv_benchmark.py`  ",
         f"**Methodology:** Independent analytic reference solutions (textbook closed-form); "
         f"no reference values read from the engine under test.  ",
         f"**NAFEMS/ASME documents:** NOT bundled. Target values hand-typed with inline citation.  ",
@@ -1658,8 +1658,8 @@ def _generate_report(elapsed: float) -> str:
         "    pytest scripts/vv_benchmark.py -q",
         "```",
         "",
-        "Gate integration: `gate.sh` stage 4.5 runs the smoke subset when "
-        "`CHUDWARE_RUN_VV` is set (skipped by default, same pattern as `CHUDWARE_RUN_BENCH`).",
+        "Gate integration: `gate.sh` runs the smoke subset when "
+        "`CHUDWARE_RUN_VV` is set (skipped by default, like the other opt-in benches).",
     ]
 
     return "\n".join(lines)
@@ -1675,7 +1675,7 @@ def _generate_json() -> list[dict]:
 
 def main() -> int:
     print("=" * 70)
-    print("vv_benchmark.py — T-BL01 V&V Benchmark Harness")
+    print("vv_benchmark.py — V&V Benchmark Harness")
     print(f"Python: {sys.executable}")
     print(f"CHUDWARE_LIBCHUDWARE: {os.environ.get('CHUDWARE_LIBCHUDWARE', '(not set)')}")
     print(f"CHUDWARE_RUN_VV: {os.environ.get('CHUDWARE_RUN_VV', '(not set = smoke)')}")
@@ -1690,9 +1690,9 @@ def main() -> int:
     bench_modal()
     bench_fea_static()
     bench_polymesh_fea()
-    bench_thermal_transient()   # T-FIN18: transient conduction vs analytic slab quench
+    bench_thermal_transient()   # transient conduction vs analytic slab quench
     bench_calculix()
-    bench_advanced_fea()   # T-BL04: fatigue + thermal + buckling + contact
+    bench_advanced_fea()   # fatigue + thermal + buckling + contact
     bench_cfd_lbm_trend()
     elapsed = time.perf_counter() - t0
 
@@ -1912,7 +1912,7 @@ class TestSmoke:
         assert err < PRECISE, f"SS UDL δ err={err:.3f}% > {PRECISE}%"
 
     def test_calculix_inp_generator(self):
-        """CCX-gen (T-BL20): the CalculiX .inp generator emits self-consistent Abaqus
+        """CCX-gen: the CalculiX .inp generator emits self-consistent Abaqus
         syntax (node/element counts, boundary/load node sets) — checked without ccx
         itself, so this always runs in the gate even when the binary is absent."""
         import tempfile
@@ -1926,16 +1926,16 @@ class TestSmoke:
         assert meta["n_elements"] == 4 * 2 * 2
         assert len(meta["tip_nodes"]) == 3 * 3
 
-    def test_bl04_fatigue_life_handcalc(self):
-        """T-BL04 FAT1: the S-N life layer matches the Shigley hand-calc (no binary)."""
+    def test_adv_fea_fatigue_life_handcalc(self):
+        """FAT1: the S-N life layer matches the Shigley hand-calc (no binary)."""
         from services.mcp import fea_advanced as fa
         N = fa.sn_life(250.0, 200.0, 400.0)
         assert abs(N - 7.2627e4) / 7.2627e4 < 0.01, N
         assert fa.sn_life(150.0, 200.0, 400.0) == 1e6         # runout
         assert abs(fa.marin_ka(400.0, 1) - 0.9218) < 0.01     # machined ka
 
-    def test_bl04_fatigue_summarize(self):
-        """T-BL04: fatigue_summarize turns engine sa_eq into life + regime + fos."""
+    def test_adv_fea_fatigue_summarize(self):
+        """fatigue_summarize turns engine sa_eq into life + regime + fos."""
         from services.mcp import fea_advanced as fa
         theories = {"goodman": {"sa_eq_mpa": 250.0}, "gerber": {"sa_eq_mpa": 150.0}}
         out = fa.fatigue_summarize(theories, 200.0, 400.0, theory="goodman")
@@ -1944,8 +1944,8 @@ class TestSmoke:
         assert out["fos_endurance"] == round(200.0 / 250.0, 4)
 
 
-    def test_bl04_contact_inp_generator(self):
-        """T-BL04 CT1: contact .inp has NLGEOM + CONTACT PAIR + two disjoint blocks."""
+    def test_adv_fea_contact_inp_generator(self):
+        """CT1: contact .inp has NLGEOM + CONTACT PAIR + two disjoint blocks."""
         from services.mcp import fea_advanced as fa
         gen = fa.build_contact_block_inp(20.0, 20.0, 10.0, 200000.0, 0.29, 5.0,
                                          nx=3, ny=3, nz=2)
@@ -1956,8 +1956,8 @@ class TestSmoke:
         # node ids of the two blocks must not overlap
         assert min(gen["top_nodes"]) > max(gen["base_nodes"])
 
-    def test_bl04_ccx_absent_degrade(self):
-        """T-BL04: the ccx-absent path returns an honest skipped shape, never fake data."""
+    def test_adv_fea_ccx_absent_degrade(self):
+        """The ccx-absent path returns an honest skipped shape, never fake data."""
         from services.mcp import fea_advanced as fa
         r = fa._ccx_absent_result("thermal")
         assert r["ok"] is False and r["skipped"] is True and "reason" in r
@@ -2099,7 +2099,7 @@ class TestFull:
         assert err < ENGINEERING, f"RLC resonance freq err={err:.1f}% > {ENGINEERING}%"
 
     def test_fea_static_point_load(self):
-        """FEA1 (T-BL20): C++ static FEA cantilever tip deflection vs Roark — PRECISE."""
+        """FEA1: C++ static FEA cantilever tip deflection vs Roark — PRECISE."""
         ready, reason = _fea_ready()
         if not ready:
             pytest.skip(reason)
@@ -2111,7 +2111,7 @@ class TestFull:
         assert err < PRECISE, f"FEA1 δ err={err:.3f}% > {PRECISE}%"
 
     def test_fea_static_rect_section(self):
-        """FEA2 (T-BL20): rectangular-section strong-axis cantilever — PRECISE tier."""
+        """FEA2: rectangular-section strong-axis cantilever — PRECISE tier."""
         ready, reason = _fea_ready()
         if not ready:
             pytest.skip(reason)
@@ -2123,7 +2123,7 @@ class TestFull:
         assert err < PRECISE, f"FEA2 δ err={err:.3f}% > {PRECISE}%"
 
     def test_fea_static_uniform_pressure(self):
-        """FEA3 (T-BL20): uniform pressure-load cantilever — ENGINEERING tier."""
+        """FEA3: uniform pressure-load cantilever — ENGINEERING tier."""
         ready, reason = _fea_ready()
         if not ready:
             pytest.skip(reason)
@@ -2135,7 +2135,7 @@ class TestFull:
         assert err < ENGINEERING, f"FEA3 δ err={err:.3f}% > {ENGINEERING}%"
 
     def test_fea_modal_cantilever(self):
-        """M1 (T-BL20): C++ modal FEA first bending mode vs Rao — PRECISE tier."""
+        """M1: C++ modal FEA first bending mode vs Rao — PRECISE tier."""
         ready, reason = _fea_ready()
         if not ready:
             pytest.skip(reason)
@@ -2147,7 +2147,7 @@ class TestFull:
         assert err < PRECISE, f"M1 f1 err={err:.3f}% > {PRECISE}%"
 
     def test_fea_modal_rect_weak_axis(self):
-        """M2 (T-BL20): rectangular-section weak-axis first mode — PRECISE tier."""
+        """M2: rectangular-section weak-axis first mode — PRECISE tier."""
         ready, reason = _fea_ready()
         if not ready:
             pytest.skip(reason)
@@ -2159,7 +2159,7 @@ class TestFull:
         assert err < PRECISE, f"M2 f1 err={err:.3f}% > {PRECISE}%"
 
     def test_polymesh_fea_clean_room_references(self):
-        """PM1/PM2: private-fork PolyMesh meshes, core tet solver, independent references."""
+        """PM1/PM2: pinned PolyMesh meshes, core tet solver, independent references."""
         ready, reason = _fea_ready()
         if not ready:
             pytest.skip(reason)
@@ -2173,7 +2173,7 @@ class TestFull:
                 f"{case} err={err:.3f}% > {ENGINEERING}%")
 
     def test_calculix_cantilever(self):
-        """CCX1 (T-BL20): ccx second opinion on the FEA1 cantilever — ENGINEERING tier."""
+        """CCX1: ccx second opinion on the FEA1 cantilever — ENGINEERING tier."""
         res = _calculix_cantilever_case()
         if res.get("skipped"):
             pytest.skip(res["reason"])

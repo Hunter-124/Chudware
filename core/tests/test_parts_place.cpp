@@ -1,5 +1,5 @@
-// core/tests/test_parts_place.cpp — part_place placement router (T-RF19
-// place.py port). Mirrors the offline-capable legs of
+// core/tests/test_parts_place.cpp — part_place placement router (C++ port of
+// place.py). Mirrors the offline-capable legs of
 // services/parts/test_parts_hub_p3.py: every placer returns a PlacementResult
 // dict, success always has editable=true, and doc-mutating legs hand the
 // updated document back under result["doc"]. The hub lookup + doc-creating

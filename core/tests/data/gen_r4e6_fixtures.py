@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the golden parity fixtures for the T-RF19 leaf-6 ports.
+"""Generate the golden parity fixtures for the tolerance/mechanical/materials/dfm ports.
 
 Runs the LIVE Python oracle (engine_oracle via the root `engine` symlink) and writes
 canonical (sort_keys, indent=2) JSON goldens next to this script. The C++ doctests

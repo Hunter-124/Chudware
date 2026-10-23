@@ -2,10 +2,10 @@
 
 Frozen 2026-07-04; §10–§15 added same day (1.0 → 1.1), §16–§17 (1.1 → 1.2),
 §18–§21 org layer (1.2 → 1.3), §22 design cognition ladder (1.3 → 1.4),
-§23 harness effort presets & user overrides (1.4 → 1.5, T-W28),
-§12 T-DP9 recursion + budget_meter + kill-switch (1.5 → 1.6, additive),
-§11 T-DP5 verdict `targeted_reentry` reroute field (1.6 → 1.7, additive). All bumps additive. Companion to
-`docs/design/ADVISOR_ARCHITECTURE.md` (Pillar 20) and `docs/design/COPILOT_MISSION_PIPELINE.md`
+§23 harness effort presets & user overrides (1.4 → 1.5),
+§12 delegation recursion + budget_meter + kill-switch (1.5 → 1.6, additive),
+§11 verdict `targeted_reentry` reroute field (1.6 → 1.7, additive). All bumps additive. Companion to
+`docs/design/ADVISOR_ARCHITECTURE.md` and `docs/design/COPILOT_MISSION_PIPELINE.md`
 (pipeline operation).
 
 1.3 additive amendments to earlier sections:
@@ -16,7 +16,7 @@ Frozen 2026-07-04; §10–§15 added same day (1.0 → 1.1), §16–§17 (1.1 �
   ("what's the best datum scheme here?"); like every delegation kind, it auto-approves
   at every depth, and its result lands as a ledger note.
 - §8 tier profiles gain `deliberation: full|standard|minimal`. INVERTED DIAL
-  (Hunter 2026-07-04): local tiers default `full` (tokens are free — councils,
+  (design decision, 2026-07-04): local tiers default `full` (tokens are free — councils,
   ponders, trigger packs all on), frontier defaults `minimal` (tokens cost money;
   councils only where risk warrants).
 Additive changes bump the minor; breaking changes require a new
@@ -194,7 +194,7 @@ Enforcement per tier profile: `step_locked` (one step per turn, output validated
 
 ## §7 Calculator envelope (`aicad.calc/1`)
 
-Extends the Pillar 8 result contract. Every calculator returns:
+Extends the calculator result contract. Every calculator returns:
 
 ```json
 {
@@ -295,7 +295,7 @@ mandatory ask_user. Change-request trigger: every user-issued fix/change first
 produces an audit-scoped change plan (affected requirements/dimensions/features/
 parts listed with ledger refs) before any mutation is dispatched.
 
-**T-DP5 additive amendment (1.6 → 1.7):** each non-`ok` verdict gains an optional
+**Additive amendment (1.6 → 1.7):** each non-`ok` verdict gains an optional
 `targeted_reentry` object — the **owning design-pipeline stage** a correction routes
 back to, so a fix re-enters the stage that produced the error rather than triggering
 a blind full retry (doc §3.1). It is computed **deterministically by the harness**
@@ -326,7 +326,7 @@ dispatch rows (a user "thicker wall" re-enters GEOMETRY on the wall's geometry_s
 
 ## §12 Delegation tree (`aicad.delegation/1`)
 
-**T-DP9 amendment (1.5 → 1.6):** Removed hard depth cap; added recursive spawn,
+**Amendment (1.5 → 1.6):** Removed hard depth cap; added recursive spawn,
 human-visible budget meter, and kill-switch. `depth_cap` is retained for backward
 compatibility with artifact readers but is NO LONGER enforced as a hard limit.
 
@@ -370,7 +370,7 @@ The delegation-node `approval` object is deleted; every request immediately tran
 
 Rules:
 - Every delegation auto-approves at every depth.
-- **No hard depth cap (T-DP9, Hunter directive).** An overseer/lead may spawn
+- **No hard depth cap (design decision).** An overseer/lead may spawn
   sub-agents; those sub-agents may spawn their own recursively, with NO hard cap. The only
   rails are:
   1. `soft_depth_limit` (config, default 8): reaching this depth emits a
@@ -386,13 +386,13 @@ Rules:
 - `budget_meter` is the **human-visible meter**: tokens spent/remaining + agents
   spawned/remaining. Updated on every `accrue()` call and every new delegation node.
 - Budgets inherit: child spend accrues to every ancestor; a node whose ancestor's
-  remaining budget hits zero is auto-revoked by the harness (unchanged from pre-T-DP9).
+  remaining budget hits zero is auto-revoked by the harness (unchanged from 1.5).
 - Soft limits are in `routing.yaml` under the `delegation:` block:
   `soft_depth_limit: 8` and `max_agents: 64` (user-configurable, not hardcoded).
 - The tree lives in the ledger (`artifacts` kind `delegation`) and every transition
   and advisory warning is a ledger event.
 
-New ledger event kinds (T-DP9, additive):
+New ledger event kinds (1.6, additive):
 - `delegation_depth_warning`: emitted when a spawn reaches `depth >= soft_depth_limit`.
 - `delegation_agent_limit_warning`: emitted when `agents_spawned >= max_agents`.
 - `delegation_killed`: emitted when `kill()` is called; includes final `budget_meter`
@@ -427,7 +427,7 @@ the validator's findings are advisory items.
 ```yaml
 schema: aicad.routing/1
 sources:                      # user-configured in GUI settings
-  - id: anthropic_api        # provider seam per Pillar 12 (no consumer-OAuth reuse)
+  - id: anthropic_api        # provider seam (no consumer-OAuth reuse)
     kind: anthropic|openai|openrouter|lmstudio|llamacpp|ollama
     models: [{id: claude-sonnet-4-6, tier: frontier}, ...]
 assignments:                  # role -> ordered preference list, first available wins
@@ -444,7 +444,7 @@ GUI settings edit this file through a validated form, never free text. If only o
 source exists, all roles collapse onto it and delegation still works (same model,
 scoped contexts).
 
-ALL role assignments are user-owned (Hunter, 2026-07-04): every role listed in
+ALL role assignments are user-owned (design decision, 2026-07-04): every role listed in
 `assignments` — including `overseer` — appears as an editable row in the settings
 GUI. The values shipped in routing.yaml (overseer→strongest, sketcher→cheap_local,
 …) are INITIAL DEFAULTS only; no role→model binding may be hardcoded anywhere
@@ -462,7 +462,7 @@ never blocks — when a choice is likely to hurt (e.g. overseer on a 4B local mo
   "checkpoint_ref": "<workstream-R history entry id>",
   "run_id": "", "buildgraph_node": "bg_...",
   "trigger": "stage_exit|plan_ratified|part_done|mission_done|change_request",
-  "message": "plain-language, AI-drafted per Pillar 19 tier",
+  "message": "plain-language, AI-drafted per PLM tier",
   "ledger_events": [/* seqs folded into the history annotation */],
   "item_id": null,
   "item_artifacts": {"<PLM item id>": "<buildgraph participant node>"},
@@ -470,12 +470,12 @@ never blocks — when a choice is likely to hurt (e.g. overseer on a 4B local mo
 }
 ```
 
-Rules: agents never touch git directly — only Pillar 19 nouns (Project/History/
+Rules: agents never touch git directly — only PLM nouns (Project/History/
 Checkpoint). Checkpoint messages are drafted from ledger events (provenance rule) and
 carry the dimension rationales verbatim. When the R vault is unavailable the links
 queue in the ledger and flush on availability (no lost annotations).
 
-T-DP14 additive attribution: a design-pipeline boundary MAY carry
+Additive attribution: a design-pipeline boundary MAY carry
 `item_artifacts`, mapping every changed PLM item to the buildgraph node that
 produced it. The vault writes that node into the item's own §3.4 AI metadata, so
 one multi-part checkpoint retains participant attribution in every per-item
@@ -714,7 +714,7 @@ verbatim); the design_thinker role executes them.
 
 ```
 spec ─A→ function_map ─B→ geometry_plan ─C→ linkage_map ─D→ build_pathway ─compile→ buildgraph ─E→ execution
-         (what it DOES,    (what SHAPES     (how geometry   (what ORDER, what      (T-W15)        (Phase 4)
+         (what it DOES,    (what SHAPES     (how geometry   (what ORDER, what                     (Phase 4)
           what FEATURES)    realize each     REFERENCES      orientation, which
                             feature)         geometry)       plane each sketch on)
 ```
@@ -770,7 +770,7 @@ identical contexts either way (fresh-context rule is what matters).
 
 ## §23 Harness effort presets & user overrides (`aicad.effort/1`) — `services/agent/effort_presets.yaml`
 
-1.5 additive (T-W28). §8 tier profiles remain the SHIPPED defaults; this section
+1.5 additive. §8 tier profiles remain the SHIPPED defaults; this section
 adds USER OWNERSHIP of the dial. Same principle as the §14 addendum: shipped
 values are initial defaults only — nothing hardcoded outside user-editable
 config.
@@ -779,7 +779,7 @@ config.
   Simple-mode levels `eco | standard | deliberate | maximum`, each a set of knob
   overrides (`overrides.all`, then `overrides.<tier>`) applied over a baseline
   DERIVED at load time from tiers.yaml and the shipped code constants (ladder
-  MAX_BOUNCES, delegation soft_depth_limit/max_agents (T-DP9; was hard DEPTH_CAP),
+  MAX_BOUNCES, delegation soft_depth_limit/max_agents (1.6; was hard DEPTH_CAP),
   councils seat budgets/threshold, failure attempt budgets, overseer trigger points,
   trigger packs). `standard` is the
   identity preset — the §8 1.3 INVERTED DIAL survives untouched.
@@ -799,7 +799,7 @@ config.
   (`shipped | preset:<level> | override`).
 - Freedom rule: absurd combinations WARN with the reason (mirrors §14
   warn-never-block) and are stored verbatim — never blocked, never silently
-  clamped. Note: §12 DEPTH_CAP is NO LONGER a runtime hard cap (T-DP9); the
+  clamped. Note: §12 DEPTH_CAP is NO LONGER a runtime hard cap (since 1.6); the
   effective rail is soft_depth_limit (advisory) + max_agents (advisory) + kill().
 - Ledger: mission start appends one `kind: effort_profile` event with the fully
   resolved values + provenance for every tier (replayable).

@@ -549,7 +549,7 @@ Writers MUST continue to preserve unknown entries (existing rule).
 
 1. Optional `.chudware` alias.
 2. File-dialog preview via thumbnail only.
-3. Docs/manual update; `contracts/stepplus.md` append-only revision (integrator).
+3. Docs/manual update; `contracts/stepplus.md` append-only revision (maintainer).
 
 ### Suggested ownership
 
@@ -641,4 +641,4 @@ studies/<study_id>/results.npz
 
 ---
 
-*End of design doc. Implementation must land through append-only contract updates (`contracts/stepplus.md`, possibly `plm.md` explode notes) owned by the integrator; this file is the intent map only.*
+*End of design doc. Implementation must land through append-only contract updates (`contracts/stepplus.md`, possibly `plm.md` explode notes) owned by the maintainer; this file is the intent map only.*

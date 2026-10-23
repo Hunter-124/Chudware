@@ -1,16 +1,16 @@
 # contracts/design_pipeline.md — Design pipeline contract (`aicad.designpipe/1`)
 
-Frozen 2026-07-05 (T-DP1). This is the FROZEN seam for the guided design-thinking
-pipeline — workstream DP. Architecture of record: `docs/design/AGENT_DESIGN_PIPELINE.md`
-(Hunter, 2026-07-05). It **refines, it does not replace**, the existing phase machine
+Frozen 2026-07-05. This is the FROZEN seam for the guided design-thinking
+pipeline. Architecture of record: `docs/design/AGENT_DESIGN_PIPELINE.md`
+(2026-07-05). It **refines, it does not replace**, the existing phase machine
 (`services/agent/pipeline/phases.py`), the design ledger (`aicad.ledger/1`,
 `contracts/advisor.md` §2), the design-cognition ladder (`aicad.ladder/1`, §22), the
 trigger table (`aicad.trigger/1`, §20), and the effort presets (`aicad.effort/1`, §23).
 
 This contract **extends `aicad.ledger/1`** — exactly as §21 (dimension derivation) does.
 It adds four typed ledger event kinds and their stage IO schemas; it does **not** edit
-the frozen §2 ledger state schema. An integrator may fold a one-line cross-reference into
-advisor.md §2 on a version bump — that is an integrator action, not a leaf-agent edit.
+the frozen §2 ledger state schema. A one-line cross-reference may be folded into
+advisor.md §2 on a version bump of that contract.
 
 Additive changes bump the minor; breaking changes require a new major + a migration note
 here. All schemas are JSON; all lengths mm, angles deg, masses g (canonical units per the
@@ -20,12 +20,12 @@ interaction contract's `normalize_dimension`).
 
 ## §1 What this contract freezes
 
-Per `docs/design/AGENT_DESIGN_PIPELINE.md` §5, T-DP1 freezes exactly five things:
+Per `docs/design/AGENT_DESIGN_PIPELINE.md` §5, this contract freezes exactly five things:
 
 1. **Stage IO schemas** — the typed handoffs `feature`, `geometry_spec`, `linkage`,
    `build_node` (§3), written to the ledger as new event kinds (§4).
 2. **Stage-gate definitions** — what makes each stage "complete", **read from the
-   ledger, never from handoff prose** (§5). The universal W32 rule: a value that exists
+   ledger, never from handoff prose** (§5). The universal rule: a value that exists
    only in a model's chat does not exist.
 3. **How the six stages nest inside `phases.py`** and reuse its gates (§6).
 4. **Effort / auto-mode hooks** — which stages / councils / helpers each scaffold level
@@ -33,11 +33,11 @@ Per `docs/design/AGENT_DESIGN_PIPELINE.md` §5, T-DP1 freezes exactly five thing
 5. **Advisor trigger bindings** — geometry-kind → helper set, expressed as a mapping onto
    existing `aicad.trigger/1` ids (§8).
 
-Out of scope for T-DP1 (owned by later DP tasks): the `feature_architect` /
-`geometry_designer` / `linkage_planner` roles (T-DP2/3/4), the overseer reroute loop
-(T-DP5), the diagnostic-advisor expansion (T-DP6), the council policy engine (T-DP8),
-delegation recursion (T-DP9), and the auto-mode classifier itself (T-DP10). This contract
-freezes the **seams** those tasks build against.
+Out of scope for this contract (built on top of it): the `feature_architect` /
+`geometry_designer` / `linkage_planner` roles, the overseer reroute loop, the
+diagnostic-advisor expansion, the council policy engine, delegation recursion, and the
+auto-mode classifier itself. This contract freezes the **seams** those components build
+against.
 
 ---
 
@@ -72,7 +72,7 @@ All four are ledger event payloads (`{seq, ts, actor, kind, payload}` per §2). 
 are stable within a run. Provenance rules are stated per kind and enforced by the writer
 helpers (`services/agent/ledger.py`) and the mission-dispatch guard (`ledger_note`).
 
-### 3.1 `feature` — Stage 1 output (written by `feature_architect`, T-DP2)
+### 3.1 `feature` — Stage 1 output (written by `feature_architect`)
 
 One event per function/feature the part must perform. Mirrors §22 rung-A `features[]`.
 
@@ -89,12 +89,12 @@ One event per function/feature the part must perform. Mirrors §22 rung-A `featu
 - `id` — stable feature id (`FT<n>`).
 - `function` — verb-noun statement of what the feature DOES (§22 rung-A `statement`).
 - `driving_requirement` — the `req_id` (or `assumption:<id>`) this feature traces to.
-  **Coverage rule** (checked by the T-DP2 coverage checker, not this gate): every feature
+  **Coverage rule** (checked by the coverage checker, not this gate): every feature
   traces to a requirement or a recorded assumption; every requirement maps to ≥1 feature.
 - `interfaces_with` — feature ids this one shares an interface with (bore, mate, seal…).
 - `criticality` — `critical | important | nice` (§22 rung-A vocabulary).
 
-### 3.2 `geometry_spec` — Stage 2 output (written by `geometry_designer`, T-DP3)
+### 3.2 `geometry_spec` — Stage 2 output (written by `geometry_designer`)
 
 One event per feature (or feature cluster): the concrete geometry that realizes it, gated
 by material and process. Mirrors §22 rung-B `elements[]`. **Provenance-carrying** (see rule).
@@ -113,7 +113,7 @@ by material and process. Mirrors §22 rung-B `elements[]`. **Provenance-carrying
 
 - `id` — stable geometry-element id (`G<n>`).
 - `realizes` — feature ids (`FT…`) this element serves (§22 rung-B `realizes`). Orphan
-  geometry (realizes nothing) is a T-DP3 finding, not a gate failure here.
+  geometry (realizes nothing) is a geometry-designer finding, not a gate failure here.
 - `shapes` — the ops that build it (`extrude | revolve | loft | sweep | hole | pattern |
   shell | fillet | chamfer | …` — the doc-op vocabulary, `contracts/doc_ops.md`).
 - `nominal_dims` — critical dimensions. Each may carry a `dim_ref` to a ledger `dimension`
@@ -125,7 +125,7 @@ by material and process. Mirrors §22 rung-B `elements[]`. **Provenance-carrying
   `provenance` is rejected** (writer helper raises; `ledger_note` returns an error). This
   is the geometry-side twin of the §2 dimension provenance rule — never recall a number.
 
-### 3.3 `linkage` — Stage 3 output (written by `linkage_planner`, T-DP4)
+### 3.3 `linkage` — Stage 3 output (written by `linkage_planner`)
 
 The skeleton: how the geometry links. Mirrors §22 rung-C `linkage_map`. One event per run
 (upsert by `id`, default `LINK_MAIN`) OR one per datum/reference cluster.
@@ -141,11 +141,11 @@ The skeleton: how the geometry links. Mirrors §22 rung-C `linkage_map`. One eve
 
 - `datum_tree` — datums and their definitions (§22 rung-C `datums`).
 - `reference_edges` — directed reference relationships between geometry elements
-  (§22 rung-C `reference_tree` + `links`). **Integrity rules** (checked by the T-DP4
+  (§22 rung-C `reference_tree` + `links`). **Integrity rules** (checked by the
   reference-integrity checker, not this gate): no dangling refs, no cycles.
 - `shared_interfaces` — features sharing an interface must agree on the interface spec
-  (two features sharing a bore agree on Ø + tolerance). Interface-consistency is a T-DP4
-  check; this gate only requires the linkage artifact to EXIST.
+  (two features sharing a bore agree on Ø + tolerance). Interface-consistency is a
+  linkage-planner check; this gate only requires the linkage artifact to EXIST.
 
 ### 3.4 `build_node` — Stage 4 output (written by `build_strategist`, exists + buildgraph)
 
@@ -167,7 +167,7 @@ One event per ordered construction step. Mirrors §22 rung-D `steps[]`; lowers i
 - `id` — stable build-node id (`BN<n>`); becomes the buildgraph node id.
 - `op` — the doc op this step performs.
 - `deps` — build-node ids that must exist before this one (§22 rung-D sequencing rule:
-  every reference exists when built). Cycles / missing refs are a T-DP4/buildgraph
+  every reference exists when built). Cycles / missing refs are a linkage/buildgraph
   validator concern (advisor.md §13), surfaced to the PLAN gate as a blocker.
 - `orientation` / `sketch_plane` — the base-feature/orientation and sketch-plane choice.
 - `elements` — geometry-element ids (`G…`) this node builds.
@@ -211,9 +211,9 @@ Each design-pipeline stage has a deterministic exit gate that inspects **durable
 state only** — no model call. This is the W32 rule every stage inherits: the gate reads
 whether the typed artifact EXISTS in the ledger, not whether the model claimed it in chat.
 
-The gates are intentionally minimal for T-DP1: they check **artifact presence**, not
+The gates are intentionally minimal: they check **artifact presence**, not
 semantic quality. The semantic checkers (coverage, reference-integrity, interface-
-consistency, orphan-geometry) belong to T-DP2/3/4 and layer on top; when they land they
+consistency, orphan-geometry) belong to the stage roles and layer on top; they
 extend the gate context, not the gate signature.
 
 | stage | gate name | passes when (read from ledger) |
@@ -231,14 +231,14 @@ flexibility rule: stages are skippable checkpoints).
 Gate outputs are `GateResult(passed, gate, reasons, overseer)` — the exact type
 `phases.py` already returns; the design-pipeline gates set `overseer=True` on the GEOMETRY
 and BUILDPATH gates (the two the overseer audits per doc §3.1; the actual audit is
-feature-flagged on T-DP5, same pattern as the existing SPECIFY/PLAN gates).
+feature-flagged, same pattern as the existing SPECIFY/PLAN gates).
 
 ---
 
 ## §6 How the six stages nest inside `phases.py`
 
 The six stages refine the existing `SPECIFY → ORGANIZE → PLAN → BUILD` span (doc §2). They
-are wired as **flagged phases** — the exact ORGANIZE precedent (T-W22): new `Phase`
+are wired as **flagged phases** — the exact ORGANIZE precedent: new `Phase`
 members inserted into `PHASE_ORDER`, skipped by `next_phase` unless the flag is on, so the
 existing pipeline is byte-for-byte unchanged when the flag is off.
 
@@ -283,12 +283,12 @@ The mapping is expressed against existing knobs — nothing new is invented:
   design-pipeline stages run as discrete gated rungs or collapse to a single checkpoint.
   `design_pipeline` flag on + `ladder=mandatory` = full six-stage run.
 - **`council` / `council_seats`** (§19/§23) gate the per-stage councils (completeness /
-  regen-stability / build-strategy). The councils themselves are T-DP8; this contract only
+  regen-stability / build-strategy). The council engine is separate; this contract only
   binds *which* stages offer a council slot.
 - **`delegation_depth` / `worker_fan_out`** (§12/§23) govern Stage 5 fan-out (workers over
   independent DAG branches) — unchanged from the existing buildgraph execution.
 
-Auto-mode (a workflow router that classifies the task and self-selects depth) is **T-DP10**
+Auto-mode (a workflow router that classifies the task and self-selects depth) is separate
 and out of scope here; this contract freezes only the *level → enabled-set* binding it
 targets. The tuning loop (gym bench) learns the best level per task-class (doc §3.6).
 
@@ -315,13 +315,13 @@ calcs exactly as it does today.
 | general tolerance / fit callout | `tolerance_mention` | `fit_calc`, ISO 286 |
 
 Rules (inherited from §20, restated for the geometry stage):
-- The binding is **data** — the T-DP3 geometry_designer / T-DP6 advisory expansion may add
+- The binding is **data** — the geometry_designer / advisory expansion may add
   triggers (e.g. sheet-metal bend allowance, draft for molded) to `triggers.yaml`; this
-  table lists the geometry kinds T-DP1 confirms are already covered.
+  table lists the geometry kinds already covered.
 - Triggers are **offered, not imposed** — a frontier model may decline (flexibility rule).
 - Every firing is a ledger event (which trigger, what matched, tokens) — §20.
-- Geometry kinds with no existing trigger (e.g. sheet-metal bend, molded draft) are named
-  in the T-DP3 scope as *helpers to add* — this contract does not fabricate coverage it
+- Geometry kinds with no existing trigger (e.g. sheet-metal bend, molded draft) are
+  *helpers to add* for the geometry designer — this contract does not fabricate coverage it
   cannot cite.
 
 ---
@@ -329,7 +329,7 @@ Rules (inherited from §20, restated for the geometry stage):
 ## §9 Scoped-slice accessors (for the mission-dispatch layer)
 
 Fresh-context stages never see the whole ledger history — they get a **scoped slice**
-(doc §4, mission-dispatch T-W30/W32). This contract adds read-only slice accessors on
+(doc §4, mission dispatch). This contract adds read-only slice accessors on
 `services/agent/ledger.py` so the dispatch layer can hand each stage exactly its inputs:
 
 | accessor | returns | consumer |
@@ -364,7 +364,7 @@ Restated from doc §6 as contract invariants every DP task must honour:
 
 ---
 
-## §11 PLM stage-boundary history (T-DP14)
+## §11 PLM stage-boundary history
 
 When `PipelineFlags.design_pipeline` is enabled, every successful exit from
 `DECOMPOSE`, `GEOMETRY`, `LINKAGE`, and `BUILDPATH` emits one

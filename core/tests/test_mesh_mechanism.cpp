@@ -1,7 +1,7 @@
 // Mesh-mechanism gate: a static solve must REFUSE a mesh whose components do not
 // all reach a fixture, and must state its connectivity either way.
 //
-// Live defect (ME490 front spine tube, O60 x 5.16 mm wall, tet10 at h = 16 mm
+// Live defect (a vehicle tube frame's front spine tube, O60 x 5.16 mm wall, tet10 at h = 16 mm
 // ~ 3x the wall): fea_static returned ok with max displacement 9.6e6 mm and
 // equilibrium_error_pct 0.00042. The mesh had a mechanism, and the equilibrium
 // check structurally cannot see one — a mechanism carries no load, so the
@@ -327,7 +327,7 @@ TEST_CASE("nodes left behind by mesh repair are not unfixtured components") {
 }
 
 // ── Solids that interpenetrate are ONE body, and a real gap is named ─────────
-// The ME 490 caliper bracket (source body 201) is a welded rod-and-lug upright
+// A vehicle caliper bracket (source body 201) is a welded rod-and-lug upright
 // whose members were never unioned: `check_interference` records 9299.81 mm^3
 // of overlap against its neighbour alone. Separately meshed solids share no
 // nodes, so every such study was refused for rigid-body motion at every element

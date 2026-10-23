@@ -213,7 +213,7 @@ PlmGitRefRow parseGitRef(const nlohmann::json& x) {
     return r;
 }
 
-// ---- Team & Sync parsers (plm_status remotes/locks — contract §6, T-R7) -------
+// ---- Team & Sync parsers (plm_status remotes/locks — contracts/plm.md §6) -------
 
 PlmRemoteRow parseRemote(const nlohmann::json& x) {
     PlmRemoteRow r;
@@ -241,7 +241,7 @@ PlmRemoteRow parseRemote(const nlohmann::json& x) {
         r.canSync = !r.reserved;
     }
     // Live editing is kind + capability driven (manifest.remote_mode). A live
-    // remote's own snapshot capability is server-internal: T-R7 sync/locks against
+    // remote's own snapshot capability is server-internal: sync/locks against
     // it are refused (live_join_required), so never advertise those controls.
     r.canLive = r.canLive && r.kind == "plm-server";
     if (r.canLive) { r.canSync = false; r.canLock = false; }

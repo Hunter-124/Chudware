@@ -1,12 +1,11 @@
-# gsl-ser/v1 — canonical GSL text serialization (Pillar 13, stage 0)
+# gsl-ser/v1 — canonical GSL text serialization
 
-Status: **FROZEN** (v1). Append-only; a breaking change is `gsl-ser/v2` via an
-advisor-approved contract change, never an in-place edit of v1 semantics.
+Status: **FROZEN** (v1). Append-only; a breaking change is `gsl-ser/v2` via a
+versioned contract change, never an in-place edit of v1 semantics.
 
 Executable reference: `tools/translator/gsl_ser.py` (code is normative for behaviour,
-this file for wording). This is the biggest single lever in the learned-translator
-track: controlled studies swing small-model accuracy 5–60% on serialization choice
-alone (`docs/AI_TOOLING_MASTER_PLAN.md` §Pillar 13). The serialization is a lens over
+this file for wording). Serialization choice matters: controlled studies swing
+small-model accuracy 5–60% on serialization choice alone. The serialization is a lens over
 the numbers the deterministic describers already produce — it never recomputes a value
 (inherits `contracts/narration.md`).
 
@@ -19,8 +18,8 @@ the numbers the deterministic describers already produce — it never recomputes
 `_digest`-shaped payload (`services/mcp/gsl_tools.py:_digest`) extended with optional
 `sketch` / `cam` / `fea` / `ecad` sections — so it is engine-free and runs in CI with
 no `libchudware`. It is NOT a replacement for the human-facing narration in
-`contracts/narration.md`; it is the machine-parseable envelope the translator and the
-eval harness round-trip.
+`contracts/narration.md`; it is the machine-parseable envelope that round-trips through
+`extract_slots` (see the round-trip invariant below).
 
 The architecture boundary is binding: the learned layer **never invents a numeral**.
 Every numeral in any caption must trace to a slot enumerated from the state; numbers are
@@ -48,7 +47,7 @@ A **slot** is one atomic, verifiable fact: `(path, value, unit, kind)`.
 
 - **path** — a fully-qualified dotted key locating the fact in the state, e.g.
   `part.bbox.x`, `feat.Bolts.diameter`, `cam.op.Rough.machined`, `fea.min_fos`,
-  `ecad.trace.SW.impedance`. Paths are the alignment anchors the eval harness uses.
+  `ecad.trace.SW.impedance`. Paths are the alignment anchors for slot comparison.
 - **value** — the **canonical (serialized) value**: the raw number formatted at its
   unit's precision and re-parsed (`canon()`), so ground-truth and re-extracted slots
   agree to the last digit. Categorical slots carry a whitespace-free token.
@@ -73,7 +72,7 @@ A **slot** is one atomic, verifiable fact: `(path, value, unit, kind)`.
 
 `count` and `ratio` are **dimensionless**: they appear as bare numbers in prose (a bare
 integer/decimal is an acceptable candidate for them). All other numeric units MUST carry
-their unit token in prose. Unit *sanity* (the ksi/MPa 6.9× guard) is the T-H4 unit-sanity
+their unit token in prose. Unit *sanity* (the ksi/MPa 6.9× guard) is the unit-sanity
 verifier's job, not this serialization's — v1 only folds exact-equivalent spellings
 (`cm→mm`, `%→pct`, `ohms→ohm`, …) on extraction of free text.
 
@@ -128,7 +127,7 @@ only its own slots. Order is stable so re-extraction compares 1:1.
 
 ---
 
-## Round-trip invariant (DoD-1)
+## Round-trip invariant
 
 ```
 extract_slots(serialize(state)) == enumerate_slots(state)          # exact
@@ -136,18 +135,16 @@ extract_slots(serialize(state)) == enumerate_slots(state)          # exact
 
 `roundtrip_diff(state)` returns `[]` when this holds. Exactness is guaranteed because
 `Slot.value` is already the canonical rounded value, so serialize→parse is lossless.
-This is the re-extraction diff the definition of done requires and the eval harness
-asserts on every gold state.
+This is the re-extraction diff every serializer change must keep empty.
 
 ---
 
-## Groundedness seam (shared with T-H4)
+## Groundedness seam
 
 Extrinsic-hallucination detection (a caption numeral that grounds to no slot) is a
-groundedness question, owned by **T-H4**'s verifier battery. `gsl-ser/v1` defines only
+groundedness question, owned by the verifier battery. `gsl-ser/v1` defines only
 the seam (`tools/translator/groundedness.py`: the `GroundednessChecker` protocol +
-`check(text, state) -> [Verdict]`); the T-F10 slot-fidelity metric is independent of it
-for its primary SER score. See `work/questions/archive/T-F10.md` for the interface hand-off.
+`check(text, state) -> [Verdict]`); slot-fidelity scoring is independent of it.
 
 ---
 
@@ -155,7 +152,7 @@ for its primary SER score. See `work/questions/archive/T-F10.md` for the interfa
 
 v1 sections are additive (they do not change existing slots, so they are not a version
 bump). To add one: (1) extend `enumerate_slots`/`_domain_slots` with the new section's
-slots using existing units; (2) add gold examples under `tools/translator/eval/gold/`;
-(3) confirm `roundtrip_diff` is `[]` and the template scores 1.0. A NEW unit is a v1
+slots using existing units; (2) confirm `roundtrip_diff` is `[]` for representative
+states. A NEW unit is a v1
 extension only if it is dimensionless-or-additive; anything that changes an existing
 slot's unit/precision is a `gsl-ser/v2` change.

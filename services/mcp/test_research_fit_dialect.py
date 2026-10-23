@@ -1,7 +1,7 @@
 """Input-dialect regression for research_tools + intake_tools.fit_report.
 
 Every call in ``test_verified_failing_ledger_calls`` is a REAL argument shape mined from
-``tools/flywheel/bench/gym/reports/runs/**/ledger.json`` that used to be rejected before
+recorded agent-run ledgers that used to be rejected before
 the tool could run.  The rest pin the behaviour those widenings introduced: measured-mode
 arithmetic, the closest-ISO classification, the shaft-basis mirror, material-query
 splitting, eng_calc near-miss resolution, and fit_report's ad-hoc pair + teaching error.

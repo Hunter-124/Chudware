@@ -59,7 +59,7 @@ Eigen::VectorXd solve_pos_exact(const Eigen::MatrixXd& A, const Eigen::VectorXd&
     return lstsq(A, b);
 }
 
-// Interactive-path normal solve (T-PERF8a): LDLT-first for the common well-conditioned
+// Interactive-path normal solve: LDLT-first for the common well-conditioned
 // case, with an rcond gate + SVD fallback when the factor is unusable or ill-conditioned.
 // Faster constant factors on drag/edit solves; not used on the oracle parity path.
 Eigen::VectorXd solve_pos_interactive(const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
@@ -134,7 +134,7 @@ std::vector<int> dependent_rows(const Eigen::MatrixXd& J, int rank, double tol) 
     return dep;
 }
 
-// Interactive redundant-row attribution (T-PERF8c): one ColPivQR on J^T so the
+// Interactive redundant-row attribution: one ColPivQR on J^T so the
 // first `rank` pivot columns of J^T are the independent rows of J (in pivot order,
 // which is NOT chronological). To keep chronological blame ("later constraint is
 // redundant"), walk rows in registration order and mark a row dependent when it is
@@ -447,7 +447,7 @@ Eigen::VectorXd System::lm(const Eigen::VectorXd& x_in, const BlockSet& bs,
 
         bool accepted = false;
         for (int t = 0; t < 12; ++t) {
-            // T-PERF8(b): honour the wall-clock deadline inside the damping trial
+            // Honour the wall-clock deadline inside the damping trial
             // loop (interactive only — exact path keeps the outer-only check so
             // iteration counts stay oracle-identical when no budget is set).
             if (interactive_ && deadline_passed(deadline)) {
@@ -718,7 +718,7 @@ Analysis System::analyze(const Eigen::VectorXd& x, double tol) {
 
     const int rank = numeric_rank(J, tol);
     const int dof = n - rank;
-    // T-PERF8(c): interactive analyze uses a single ColPivQR attribution; the
+    // Interactive analyze uses a single ColPivQR attribution; the
     // exact path keeps the chronological growing-QR walk for oracle parity.
     std::vector<int> redundant = interactive_ ? dependent_rows_colpiv(J, rank, tol)
                                               : dependent_rows(J, rank, tol);

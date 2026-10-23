@@ -1,4 +1,4 @@
-// Copilot shared toolkit (T-RF6 split of legacy_chat.cpp): the shared small-UI helpers
+// Copilot shared toolkit: the shared small-UI helpers
 // (primaryButton/sectionHeader/dimText/toggleChip and the code/diff/prose/fit draw helpers
 // declared in core/app_state.h), the Liquid Glass v2 bubble toolkit (chatSurf/GlassBubble/
 // semanticOnGlass — host contract H5, GlassGroup::Copilot), the chat copy/paste affordances,

@@ -131,8 +131,8 @@ public:
     IpcConn accept(int timeoutMs);
 
     // Close the listen fd. By default also unlinks the socket path. Pass
-    // unlink_path=false to leave the sock file for a coordinated cleanup (T-PERF10:
-    // hostd defers unlink until the single-instance flock is released so clients
+    // unlink_path=false to leave the sock file for a coordinated cleanup
+    // (hostd defers unlink until the single-instance flock is released so clients
     // never see lock-held-but-no-sock during drain).
     void close(bool unlink_path = true);
 

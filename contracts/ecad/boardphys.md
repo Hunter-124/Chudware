@@ -12,7 +12,7 @@ This contract has two halves:
    `engine.ecad.threed.board_to_step` (surfaced by the `ecad_to_3d` MCP tool as a
    `*.boardphys.json` file next to the STEP), mapping every placed component solid to its
    power/thermal metadata. This is THE seam consumed by host-board rule packs, PDN checks,
-   thermal handoff, and power-budget tooling (T-FIN13/16/21/23).
+   thermal handoff, and power-budget tooling.
 
 ## Honesty rule (binding on every producer)
 
@@ -147,7 +147,7 @@ Field semantics:
 MCP surfaces: `ecad_to_3d` writes the sidecar and returns its path + totals;
 `ecad_status` and `describe_board` narrate per-component power and the board total.
 
-## 3. `pdn` extension (additive, T-FIN13)
+## 3. `pdn` extension (additive)
 
 Optional top-level key on the sidecar document — added under the append-only rule (new
 optional keys allowed; nothing above changes). Producer: `engine.ecad.pdn.solve_pdn`
@@ -155,7 +155,7 @@ via `attach_pdn()` (MCP: `ecad_run_pdn`, which merges into an existing
 `board.step.boardphys.json` when `ecad_to_3d` already wrote one, else writes a
 PDN-only sidecar `pdn.boardphys.json` carrying `schema`, `board`, empty
 `components`, a `note`, and this block). Consumer: the ECAD→thermal handoff
-(T-FIN16) — the `i2r_map` is the trace-heating source field.
+— the `i2r_map` is the trace-heating source field.
 
 ```json
 "pdn": {

@@ -1,4 +1,4 @@
-"""CatalogProvider adapter for board-level heatsinks (T-FIN17).
+"""CatalogProvider adapter for board-level heatsinks.
 
 Small curated catalog of common plain-finned aluminum heatsinks (TO-220 clip-ons +
 generic square SMD/push-pin extrusions) WITH thermal metadata, so the
@@ -98,7 +98,7 @@ def _make_record(designation: str, title: str, params: dict, cost_usd) -> dict:
                                    "fin_t_mm", "fin_h_mm")}},
         "sourcing":     [],
         "provenance":   ("Curated engineering nominal for a common commercial "
-                         "plain-finned aluminum heatsink family (T-FIN17 selection "
+                         "plain-finned aluminum heatsink family (heatsink selection "
                          "loop). theta_sa values are datasheet-class NATURAL-"
                          "convection nominals — verify the exact part's datasheet "
                          "before release."),

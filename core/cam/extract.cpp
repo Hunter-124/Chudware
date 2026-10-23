@@ -181,14 +181,14 @@ json mesh_json(const std::vector<TopoDS_Shape>& shapes, double defl) {
     return json{{"verts", verts}, {"tris", tris}};
 }
 
-// Hole extraction for auto-drill (T-M5, audit D7): recognizes plain holes, counterbores
+// Hole extraction for auto-drill: recognizes plain holes, counterbores
 // (coaxial cylinders of different diameter), countersinks (cone faces), and tilted holes.
 // Tilt allowance is 0.95 (was 0.99 = Z-only); the tilt angle is emitted so the caller can
 // decide whether a 3-axis machine can program it.
 json holes_json(const std::vector<TopoDS_Shape>& shapes) {
     constexpr double PI = 3.14159265358979323846;
     constexpr double AXIS_TOL = 0.95;  // |axis.Z()| >= this counts as a drillable (near-Z) hole
-    constexpr double XY_TOL = 1e-2;     // coaxial-grouping tolerance for axis XY (audit: "within tolerance")
+    constexpr double XY_TOL = 1e-2;     // coaxial-grouping tolerance for axis XY
 
     struct Cyl { double x, y, ztop, zbot, r, tilt; };
     struct Cone { double x, y, angle_deg, outer_dia; };

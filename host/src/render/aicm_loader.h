@@ -1,4 +1,4 @@
-// AICM v1 reader (contract: docs/contracts/mesh_format.md). C++ counterpart of the Python
+// AICM v1 reader (contract: contracts/mesh_format.md). C++ counterpart of the Python
 // reference writer/parser in engine/doc/tessellate.py. Parses a chunked AICM blob into a DocMesh:
 // per-body tessellation with the picking metadata (per-FACE triangle ranges, per-EDGE polyline
 // segments, B-rep VERTices) plus the SCLR/DISP/LINS overlay arrays. Unknown fourccs are skipped

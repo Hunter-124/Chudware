@@ -1,7 +1,6 @@
 """add_features ARGUMENT-SHAPE + validation-miss normalizer tests.
 
-Every case here is a real call shape mined from the recorded agent-run ledgers under
-``tools/flywheel/bench/gym/reports/runs/**`` — the ways frontier models actually phrase a
+Every case here is a real call shape mined from recorded agent-run ledgers — the ways frontier models actually phrase a
 build call, each of which used to burn a whole turn on a rejection. The normalizers are
 pure functions, so most of this runs without an engine; the end-to-end cases go through
 ``services.agent.agent_turn._bind_tool`` (the BUILT-IN agent's dispatch path, which calls

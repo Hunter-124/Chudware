@@ -1,4 +1,4 @@
-"""Geometry auto-prefill for engineering calculators (T-W4).
+"""Geometry auto-prefill for engineering calculators.
 
 Maps calc input slots (declared in ``services/research/calcs/registry``) to
 live geometry queries so the advisory engine can pass measured values to calcs

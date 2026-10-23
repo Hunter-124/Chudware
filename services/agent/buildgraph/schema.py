@@ -1,7 +1,6 @@
 """schema.py — Validator for aicad.buildgraph/1 graphs.
 
 Contract: contracts/advisor.md §13 (FROZEN — graph shape), §3 (advisory items).
-T-W15.
 
 validate_graph(graph) returns a list of aicad.advisory/1 items.
 An empty list means validation passed cleanly.

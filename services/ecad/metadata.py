@@ -1,4 +1,4 @@
-"""Component engineering-metadata layer (T-FIN8) — resolution + normalization.
+"""Component engineering-metadata layer — resolution + normalization.
 
 The bundled library (``library/starter.py``) carries optional ``eng`` blocks on symbol
 defs (electrical: power, supply rails, junction limits) and footprint defs (physical:

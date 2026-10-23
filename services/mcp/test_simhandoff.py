@@ -5,7 +5,7 @@ Groups:
   2. Validator — every structural rule fires on a targeted mutation.
   3. Piping conformance — piping_tools' envelope translators produce valid envelopes
      from mock solve/CFD dicts, and piping_verify_cfd embeds one with ZERO change to
-     its pre-existing fields (the T-FIN15 regression gate).
+     its pre-existing fields (the regression gate).
 
 Pure Python — no engine kernel, no FastMCP server required.
 

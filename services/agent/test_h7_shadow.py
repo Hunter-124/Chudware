@@ -24,7 +24,7 @@ if str(_ROOT) not in sys.path:
 # ---------------------------------------------------------------------------
 import types as _types
 
-# services.paths stub (T-RF19/20: engine/paths.py re-homed to services/paths.py) —
+# services.paths stub (engine/paths.py was re-homed to services/paths.py) —
 # import the real module when available and only fill in the paths attribute.
 try:
     import services as _services_pkg  # the real package
@@ -47,7 +47,7 @@ if not hasattr(_engine_paths, "DATA"):
 # services.agent.config stub — injected via a session-scoped autouse fixture
 # so sys.modules["services.agent.config"] is RESTORED after this module runs.
 # Previously this was a bare sys.modules.setdefault() at collection time, which
-# caused 5 pollution regressions in engine_oracle tests (RC#1 from T-V2 audit):
+# caused 5 pollution regressions in engine_oracle tests (RC#1 from an audit):
 #   - consent_tier() always returned "off" → broke 3 telemetry-consent tests
 #   - missing get_provider attr → AttributeError in spec_sheet_matcher tests
 # ---------------------------------------------------------------------------
@@ -70,7 +70,7 @@ def _patch_svc_agent_config():
     scope="module" means this runs once per test module, not once per test.
     The explicit save/restore guarantees other test modules (e.g. telemetry_consent,
     spec_sheet_matcher) see the real services.agent.config — fixing the 5 RC#1
-    pollution regressions identified in the T-V2 audit.
+    pollution regressions identified in the audit.
     """
     _SENTINEL = object()
     key = "services.agent.config"
@@ -78,7 +78,7 @@ def _patch_svc_agent_config():
     stub = _make_svc_agent_config_stub()
     sys.modules[key] = stub
     # ALSO patch the parent-package attribute: once the REAL config module has been
-    # imported anywhere earlier in the session (e.g. the T-W30 execute_dag path in
+    # imported anywhere earlier in the session (e.g. the execute_dag path in
     # pipeline tests imports it for provider resolution), ``from services.agent
     # import config`` resolves the *package attribute*, not sys.modules — so the
     # sys.modules stub alone silently stops taking effect (order-dependent flake).

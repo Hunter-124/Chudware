@@ -476,7 +476,7 @@ def error_detail_for_stop(
     )
 
 
-# T-W32: match the fenced BODY (not a brace pair) — the old r"\{.*?\}" non-greedy
+# Match the fenced BODY (not a brace pair) — the old r"\{.*?\}" non-greedy
 # pattern truncated at the FIRST closing brace, so any tool call with nested args
 # (e.g. {"tool": "x", "args": {"a": {...}}}) failed to parse and the model's valid
 # directive was dropped as free text (observed live in the r4 PLAN node).
@@ -1647,7 +1647,7 @@ _SYSTEM_BASE = (
 )
 
 
-# mega-25 / T-W21 §20: once-per-session cache for the static skills+role
+# mega-25 / contract §20: once-per-session cache for the static skills+role
 # catalog blocks (role_catalog.harness_context_block/format_role_catalog_block
 # + skills.catalog_block) — both are static within a mission but were being
 # rebuilt and resent on EVERY main turn (~900-1000 tokens/turn, ~15-20k/mission).
@@ -1669,7 +1669,7 @@ def _catalog_due(session_key: str | None) -> bool:
     return True
 
 
-# T-W21 §20 (Rules): cooldown + sequence state must OUTLIVE one run_turn()
+# Contract §20 (Rules): cooldown + sequence state must OUTLIVE one run_turn()
 # call. A GUI session sends many turns; a rule with cooldown_turns=8 that
 # re-fired on every message would re-bill its pack and re-draw a transcript
 # chip every time. Keyed by subagent_id/run_id, bounded so a long-lived worker
@@ -1701,7 +1701,7 @@ def _maybe_inject_trigger_advisory(
     events: list[str] | None = None,
     stage: str = "agent_turn",
 ) -> tuple[str | None, list[dict]]:
-    """T-W21 §20 / mega-25: render the context packs of every rule that matches
+    """Contract §20 / mega-25: render the context packs of every rule that matches
     this turn's signals, and report which rules actually fired.
 
     Returns ``(block, fired)``: the ``[ADVISORY]`` block to inject (``None``
@@ -2044,13 +2044,13 @@ def _run_turn_impl(
     dispatches against the live MCP registry via :func:`_dispatch_tool`.  Tests
     inject a deterministic dispatcher (no engine).
 
-    *mission_dispatch* (T-W32) is the run-scoped dispatch layer
+    *mission_dispatch* is the run-scoped dispatch layer
     (``services.agent.mission_dispatch.MissionDispatch``): consulted BEFORE the
     global registry so mission-context tools (ledger_get/ledger_note, dag_plan,
     ask_user, delegate, part_search) resolve against THIS run.  Ignored when a
     custom *tool_dispatch* is injected (the injector owns resolution).
 
-    *tools_text* (T-W32) is the rendered §9.1 tools slot (trimmed schemas for the
+    *tools_text* is the rendered §9.1 tools slot (trimmed schemas for the
     node's allowed tools — see ``services.agent.tool_schemas``).  When present it
     replaces the bare "Allowed tools:" name list, so the model sees real kwargs
     instead of guessing them.
@@ -2319,7 +2319,7 @@ def _run_turn_impl(
     # M20: agent-execution event stream. Emit `agent.tool_call` (with human `target`
     # + latency) with a per-turn root span so the GUI can build the execution DAG
     # tree. The DAG path threads an *already journal-wrapped* `on_event` (the executor
-    # does `EventJournal(run_id).wrap(emit)` in T-F17), so streaming through it also
+    # does `EventJournal(run_id).wrap(emit)`), so streaming through it also
     # persists to events.jsonl — we must NOT double-write with a second journal here.
     # A standalone journal is created ONLY when a run_id is given WITHOUT a live sink
     # (a headless caller that wants replay but no GUI). Best-effort: never blocks.
@@ -2679,7 +2679,7 @@ def _run_turn_impl(
                 _tasklist_pref = str(_fn_tl() or "off").strip().lower()
         except Exception:  # noqa: BLE001 — a preference read never breaks a turn
             _tasklist_pref = "off"
-    # T-W21 §20 (Rules): trigger-injection bookkeeping. Cooldown + sequence are
+    # Contract §20 (Rules): trigger-injection bookkeeping. Cooldown + sequence are
     # SESSION-scoped (keyed by subagent_id/run_id) so a rule that fired on the
     # user's previous message stays quiet for its cooldown_turns instead of
     # re-injecting its pack — and re-drawing a transcript chip — every turn.
@@ -3155,7 +3155,7 @@ def _run_turn_impl(
                     _subagent_last_runtime = runtime_key
             except Exception:  # noqa: BLE001
                 pass
-        # T-W21 §20 (Rules): inject the context packs of every rule matching the
+        # Contract §20 (Rules): inject the context packs of every rule matching the
         # user's request (first iteration) or the PREVIOUS iteration's model
         # output + tool calls, and stream one context chip per firing so the
         # injection is visible in the transcript. Effort-gated inside; cheap
@@ -6255,7 +6255,7 @@ def _loads_first_object(text: str) -> dict | None:
 
 def resolver_for(mission_dispatch: Any | None = None) -> Callable[[str], Any]:
     """Return a ``(tool_name) -> callable | None`` resolver mirroring run_turn's
-    dispatch order: mission-scoped layer first, then the global registry (T-W32).
+    dispatch order: mission-scoped layer first, then the global registry.
 
     The tool-schema renderer (``tool_schemas.render_tools_block``) uses this SAME
     resolver, so the schemas injected into the prompt are exactly the callables the

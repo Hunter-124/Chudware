@@ -144,7 +144,7 @@ json plan_state_items_from_mission(const json& tasks,
 // ---------------------------------------------------------------------------
 // Telemetry helpers — emit the standard ai_artifact / ai_artifact_action /
 // doc_semantic_diff event kinds.  Each stamps "consent" from the caller so
-// the exporter (T-H5) can filter.  These are pure wrappers over
+// the exporter can filter.  These are pure wrappers over
 // RunEvents::emit(); they do NOT upload anything.
 //
 // Note on consent levels:

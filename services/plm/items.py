@@ -1,4 +1,4 @@
-"""services.plm.items — item identity & lifecycle rules (T-R4, contract §0/§4).
+"""services.plm.items — item identity & lifecycle rules (contract §0/§4).
 
 The "P" in PLM, kept invisible until it helps (plan §3.4): every document in a
 project has a stable ``item_id`` and an auto-assigned, human-editable part
@@ -16,7 +16,7 @@ machine is fixed and minimal (contract §4):
   (edit-in-place of Released raises ``locked``).
 
 Registration itself (auto item_id + part number at first check-in) already
-lives in :mod:`manifest` (T-R2); this module adds the editing and transition
+lives in :mod:`manifest`; this module adds the editing and transition
 rules on top.
 """
 from __future__ import annotations

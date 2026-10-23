@@ -3,7 +3,7 @@ handoff validator, and a JSON-schema → GBNF grammar emitter.
 
 Contract: contracts/advisor.md §4 (role card `aicad.role/1`), §6 (playbook
 `aicad.playbook/1`), §9 (injection & precedence), §1 (stage vocabulary).
-Pipeline composition: docs/COPILOT_MISSION_PIPELINE.md.
+Pipeline composition: docs/design/COPILOT_MISSION_PIPELINE.md.
 
 Roles are authored data. Developer runs load ``services/agent/roles/*.yaml``;
 packaged workers load their deterministic build-generated representation. Their
@@ -28,14 +28,14 @@ What this module gives the hosts (services/dag node runner, services/agent loop)
     NOT expressed in the grammar (grammars can't count); ``validate_handoff`` enforces
     those post-parse.
 
-Design notes locked with the advisor:
+Design notes:
   * ``$ref`` (e.g. ``aicad.deliverables/1``) has no loadable JSON-Schema file — the
     schemas live as prose examples in the contract. The GBNF emitter treats an
     unresolved ``$ref`` as an opaque JSON object node (permissive); it never crashes.
-  * ``delegate`` is now a real registered tool (T-W14 landed,
-    services/mcp/delegation_tools.py). ``workspace_status`` is registered (T-W16).
-    The org-layer tools (channel_send, request_resolve, council_convene, request_raise)
-    are now registered via services/mcp/org_tools.py (T-W22 landed).
+  * ``delegate`` is a real registered tool (services/mcp/delegation_tools.py).
+    ``workspace_status`` is registered too. The org-layer tools (channel_send,
+    request_resolve, council_convene, request_raise) are registered via
+    services/mcp/org_tools.py.
 """
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ HANDOFF_SCHEMA = "aicad.handoff/1"
 
 # Stage vocabulary (contract §1) — frozen. Every stage_scope entry and every
 # playbook.stage must be one of these. Defined here from the contract rather than
-# imported from services/agent/advisor/stages.py (that module is T-W5 territory;
+# imported from services/agent/advisor/stages.py (that module owns stage logic;
 # the vocabulary itself is the frozen contract).
 STAGES = (
     "intake", "spec", "decompose", "layout", "sketch", "feature", "linkage",
@@ -102,15 +102,15 @@ _FAMILY_SEED_TOOLS: dict[str, tuple[str, ...]] = {
 # stays a gate rather than the silent truncation it once was.
 MAX_TOOLS_PER_ROLE = 16
 
-# Allowlist tools that do not yet resolve to a registered MCP tool — they land with
-# sibling W tasks (workspace status T-W23+). Reported by the loader as feature-flagged
-# rather than as errors, so the authored cards load cleanly.
-# NOTE: ``delegate`` was removed from this set when T-W14 landed
+# Allowlist tools that do not yet resolve to a registered MCP tool. Reported by
+# the loader as feature-flagged rather than as errors, so the authored cards load
+# cleanly.
+# NOTE: ``delegate`` is no longer in this set
 # (services/mcp/delegation_tools.py registers it in the catalog).
 FEATURE_FLAGGED_TOOLS = frozenset({
-    # delegate (T-W14) and workspace_status (T-W16) are registered now.
-    # org layer tools (channel_send, request_resolve, council_convene) landed with
-    # T-W22 (services/mcp/org_tools.py registers them in the catalog).
+    # delegate and workspace_status are registered now.
+    # org layer tools (channel_send, request_resolve, council_convene) are
+    # registered in the catalog by services/mcp/org_tools.py.
     # request_raise is also registered; it is not in department_manager's allowlist
     # but workers call it, so it must resolve.
 })
@@ -774,7 +774,7 @@ def system_prompt_for_capability(
     card: RoleCard,
     capability: Any = None,
 ) -> str:
-    """Role system prompt + per-capability SOFT phrasing block (WI-16).
+    """Role system prompt + per-capability SOFT phrasing block.
 
     *capability* is a letter ``"A"|"B"|"C"``, a CapabilityProfile, or None
     (defaults to C — frontier freedom, minimal SOFT block).
@@ -801,12 +801,12 @@ def assemble_context(
         state → ADVISORY block → playbook step (if step-locked) → history
 
     The advisory block and describer/stage-state renders are produced by the
-    foreman (T-W5) and the describer tools respectively — this assembler takes
+    foreman and the describer tools respectively — this assembler takes
     them as already-rendered strings so it stays headless and testable (no live
     CAD doc, no import of services/agent/advisor/). Empty slots are omitted; the
     ordering of present slots is invariant.
 
-    *capability* (WI-16): letter or CapabilityProfile selecting the SOFT
+    *capability*: letter or CapabilityProfile selecting the SOFT
     phrasing block appended to the role system prompt. Default None → C
     (minimal HARD-floor mirror only).
     """

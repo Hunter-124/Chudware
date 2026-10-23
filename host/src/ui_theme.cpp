@@ -461,7 +461,7 @@ void applyTheme(Theme t, float scale) {
     constexpr float kPopupFillA = 0.98f;
     c[ImGuiCol_PopupBg]             = ImVec4(p.glassBg[0], p.glassBg[1], p.glassBg[2],
                                              std::max(p.glassBg[3], kPopupFillA));
-    // T-G14: subwindow / popup OS-border. p.border is tuned for SEPARATORS (soft, low-contrast) and
+    // Subwindow / popup OS-border. p.border is tuned for SEPARATORS (soft, low-contrast) and
     // read as "fully transparent" on floating windows — especially in light mode where a light-grey
     // border sits on a near-white window over the light viewport. Give the WINDOW/POPUP border its
     // own higher-contrast value (separators stay on the softer p.border below) so every floating

@@ -242,7 +242,7 @@ def _curves_to_entities(curves: list, start_n: int = 0) -> list:
             entities.append({"id": _eid(), "type": "point", "construction": cons,
                              "p": pts[0]})
         elif kind == "eq_curve3d":
-            # Equation-driven 3D curve (T-3DEQ, doc_schema §3B): x(t)/y(t)/z(t) expression
+            # Equation-driven 3D curve (doc_schema §3B): x(t)/y(t)/z(t) expression
             # strings over t in [t1, t2] (degrees trig, doc equations — §4). 0 DOF —
             # equation-fixed, like the 2D eq_curve; endpoints (p1@t1, p2@t2) are usable as
             # coincident/point_on targets. e.g. a helix: xt="R*cos(t)", yt="R*sin(t)",
@@ -526,7 +526,7 @@ def _tmp(suffix: str) -> str:
 def _profile_plane_ops(start: list, tangent: list) -> tuple:
     """Ops placing a datum plane at the spine start, EXACTLY perpendicular to the tangent.
 
-    T-3DDATUM closed this gap: the datum "plane" feature now has a "point_normal" method
+    The datum "plane" feature now has a "point_normal" method
     (arbitrary origin + normal, core/doc/document.cpp) — this used to guess the nearest
     reserved axis plane and warn past ~30° tilt (SolidWorks users hit real skewed starts,
     e.g. an angled boss). point_normal makes the profile plane EXACT for every tangent, so
@@ -764,9 +764,9 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
     def sketch3d_ref_vertex(sketch3d_id: str, body_id: int = 1, topo_id: Optional[int] = None,
                             selector: Optional[dict] = None,
                             doc_id: Optional[str] = None) -> str:
-        """Ground a sketch3d constraint to a specific VERTEX on the built model (T-3DXREF).
+        """Ground a sketch3d constraint to a specific VERTEX on the built model.
 
-        Hunter's use case: "a spline that interacts with a specific corner on my part" — this
+        Motivating use case: "a spline that interacts with a specific corner on my part" — this
         mints an external reference (doc_schema §3B.1b) that tracks a model vertex across
         rebuilds. Pass EITHER:
           topo_id   the vertex pick id from a viewport click (kind="vertex") — same id space
@@ -1034,7 +1034,7 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
         Profile — pass exactly ONE of:
           diameter_mm: builds a circular profile automatically.  A datum plane is placed at
             the path START, EXACTLY perpendicular to the start tangent (point_normal datum
-            method — T-3DDATUM), with the circle centred exactly on the path start (the
+            method), with the circle centred exactly on the path start (the
             sweep pierce rule).  Works for any tangent direction, no axis-alignment needed.
           profile_sketch: an EXISTING 2D sketch feature id whose region is the profile
             (you are responsible for it sitting at the path start, ⟂ the tangent).

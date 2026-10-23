@@ -287,7 +287,7 @@ int renderContact(const std::string& stl, const std::string& out) {
 
 // Drive the Python worker: build a solid (from a .py file / inline code), then render the
 // resulting STL to a contact sheet — proving the whole native pipeline: host -> worker ->
-// build123d -> STL -> GL render -> PNG. (The --design mode was removed in T-RF5 with the
+// build123d -> STL -> GL render -> PNG. (The --design mode was removed along with the
 // legacy agent_design loop; the in-app copilot is the design path.)
 int buildAndRender(const std::string& src, const std::string& out) {
     std::string code = src;
@@ -599,7 +599,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (argv[i] && std::strcmp(argv[i], "--version") == 0) {
             std::printf("chudware %s\n", CHUDWARE_VERSION_LINE);
-            // Same hard-exit tail every other native exit uses (T-RF23, hard_exit()
+            // Same hard-exit tail every other native exit uses (hard_exit()
             // below), and for the same class of reason: a namespace-scope static in
             // ui/copilot/composer.cpp (g_agentCtl) spawns a DETACHED worker parked
             // forever on a condition_variable, so global destruction deadlocks in
@@ -775,7 +775,7 @@ int main(int argc, char** argv) {
         // destruction AFTER run_gui's teardown already completed (chat persisted, workers
         // stopped, shot written) — the gate's shot smoke then never exits. Exit directly,
         // skipping static dtors; the interactive exit path keeps the normal return (the
-        // underlying CEF exit hang is tracked as T-RF23).
+        // underlying CEF exit hang is a known open issue).
         std::fflush(stdout);
         std::fflush(stderr);
         std::_Exit(rc);
@@ -784,7 +784,7 @@ int main(int argc, char** argv) {
     // a user double-clicks a .step+ (or any registered CAD/ECAD file) — launches the GUI and opens
     // that document through the normal deferred open pump (NOT a headless mode). Anything starting
     // with '-' is a flag handled above; a non-flag arg that names an existing file is the doc to open.
-    // T-RF23: ALL native exits go through the same hard-exit tail as --ui-screenshot — Chromium
+    // ALL native exits go through the same hard-exit tail as --ui-screenshot — Chromium
     // threads outlive CefShutdown() on this build and hang static/AtExit destruction on the
     // interactive close path too. run_gui's teardown (chat persisted, workers stopped, docs
     // autosaved) has fully completed by the time it returns, so skipping static dtors is safe.

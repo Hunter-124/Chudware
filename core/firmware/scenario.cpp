@@ -21,7 +21,7 @@ namespace {
 const std::regex kPinRe(R"(^P([A-K])(\d{1,2})$)");
 
 // Memory-mapped ADC stub windows (Python peripheral) per family — upstream
-// Renode ships NO ADC model for any family in the T-FIN2 pack.
+// Renode ships NO ADC model for any family in the bundled platform pack.
 struct AdcStub {
     long long base;
     long long size;

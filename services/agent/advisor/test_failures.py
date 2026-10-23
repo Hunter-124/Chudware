@@ -1,4 +1,4 @@
-"""Tests for aicad.failure/1 card factory and bounded fixer loop (T-W8).
+"""Tests for aicad.failure/1 card factory and bounded fixer loop.
 
 Coverage:
   - All 8 class factories produce valid §5 cards with deterministic ``why`` where

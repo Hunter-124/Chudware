@@ -524,7 +524,7 @@ bool loadAicmFile(const std::string& path, DocMesh& out, std::string& err) {
 #else  // !__EMSCRIPTEN__
 
 bool loadAicmFile(const std::string& path, DocMesh& out, std::string& err) {
-    // T-PERF10: aicm-shm:// URIs (and same-process cache) via aicm_handoff. File paths
+    // aicm-shm:// URIs (and same-process cache) via aicm_handoff. File paths
     // still use the handoff map_file path so one code path covers both.
     chudware::aicm_handoff::Mapping m;
     if (!chudware::aicm_handoff::map(path, m, err)) return false;

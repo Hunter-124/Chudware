@@ -514,7 +514,7 @@ void sample_handler(int /*sig*/, siginfo_t* /*si*/, void* uc) {
     RingSlot& slot = g_ring[head & (kRingSize - 1)];
     // Leaf = the interrupted PC from ucontext (NOT sample_handler). Plain backtrace()
     // alone leaves every sample's self-time on the handler, which made the profiler
-    // look "symbolized but blind" (T-PERF10 / PERF_AUDIT §2).
+    // look "symbolized but blind".
     int n = 0;
 #if defined(__x86_64__)
     if (uc) {
@@ -570,7 +570,7 @@ void drain_ring() {
 }
 
 void sampler_main() {
-    // Absolute-time cadence (T-PERF10): sleep_for under load drifts badly (observed ~1.7 Hz
+    // Absolute-time cadence: sleep_for under load drifts badly (observed ~1.7 Hz
     // instead of 1 kHz). clock_nanosleep(TIMER_ABSTIME) keeps the schedule even when the
     // box is busy; catch-up is capped so a long stall does not storm-signal.
     using clock = std::chrono::steady_clock;
@@ -768,7 +768,7 @@ std::string resolve_addr(uintptr_t a, unsigned long long* unresolved) {
     if (dladdr(reinterpret_cast<void*>(a), &info) && info.dli_fname) {
         std::string mod = clean_module(info.dli_fname);
         std::string sname = info.dli_sname ? std::string(info.dli_sname) : std::string();
-        // T-PERF10: dladdr only sees .dynsym. Walk .symtab for static / hidden frames
+        // dladdr only sees .dynsym. Walk .symtab for static / hidden frames
         // so unstripped libchudware.so reports real function names instead of chudware!0x….
         if (sname.empty()) sname = elf_lookup(info.dli_fname, info.dli_fbase, a);
         if (!sname.empty()) {
@@ -1026,7 +1026,7 @@ json report(const json& opts) {
                           [](uintptr_t a, unsigned long long* u) -> std::string {
                               return resolve_addr(a, u);
                           });
-    // Cadence diagnostics (T-PERF10): ticks = sampler wakeups, ticks_with_target =
+    // Cadence diagnostics: ticks = sampler wakeups, ticks_with_target =
     // wakeups that found a registered work thread, dropped = ring overflows.
     if (r.contains("summary") && r["summary"].is_object()) {
         r["summary"]["ticks"] = g_ticks.load();

@@ -32,7 +32,7 @@ The ``run`` command executes the matrix, writes the per-cycle markdown+JSON repo
 ``reports/``, then runs the ASSESS-ADJUST-RERUN step: it applies the in-scope
 (config/data only) dial adjustments and re-runs the affected cells, reporting deltas
 honestly (see ``adjust_and_rerun``). Prompt-wording findings are filed in the report's
-``lead_findings`` for the lead, never applied.
+``lead_findings`` for human review, never applied.
 """
 
 from __future__ import annotations

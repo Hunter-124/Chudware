@@ -636,7 +636,7 @@ It is not yet a closed lifecycle product. Gaps below cite live symbols.
 | 1 | Auto-activate at mission start when mode on and ≥2 depts | **DONE** — `auto_activate_corporate` + `run_mission` graph hook + `MissionDispatch.maybe_auto_activate_corporate` / `corporate_activate(seat_heads=True)` | closed | — | **L** |
 | 2 | Heads are live hired agents with models | **DONE** — `OrgChart.seat_heads` + node_runner re-hire via `delegate` when tree bound; department_manager preamble | closed | — | **L** |
 | 3 | Director LLM steering when `needs_llm` | **DONE** — `_llm_director_steering` via role_models advisor/orchestrator + ONE `complete()`; template fallback | closed | — | **M** |
-| 4 | Stream events for GUI (`corporate.*`) | **DONE** — `kind=corporate` + `corp_event` ∈ org_built/hire/team_lead/meeting/steering/route_rejected/wind_down on agent event stream | closed | contracts append (integrator) | **L** |
+| 4 | Stream events for GUI (`corporate.*`) | **DONE** — `kind=corporate` + `corp_event` ∈ org_built/hire/team_lead/meeting/steering/route_rejected/wind_down on agent event stream | closed | contracts append (maintainer) | **L** |
 | 5 | Org chart / meeting cards in UI | Settings box + CorporateUI Activity cards consume events | partial | polish only | **L** |
 | 6 | Auto-relay steering head→workers | **DONE** for blockage/needs_llm in `_hold_meeting_unlocked` | closed | — | **S** |
 | 7 | Wind-down / teardown | **DONE** — `wind_down` / `wind_down_corporate` + `{run_id}.corporate.json` + drop registry; hooked at mission end | closed | — | **M** |

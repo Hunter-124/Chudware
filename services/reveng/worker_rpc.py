@@ -29,7 +29,7 @@ the bridged tools instead of reimplementing session logic.
 Envelopes always degrade to ``{ok: false, reason, hint}`` — never a traceback, never
 an escaping exception. Registered from ``services/worker_main.py`` (same try/except
 pattern as the parts + embed method tables). (Moved from engine_oracle/reveng_rpc.py
-to services/reveng/ in T-RF19.)
+to services/reveng/.)
 """
 from __future__ import annotations
 

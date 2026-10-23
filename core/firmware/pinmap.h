@@ -1,4 +1,4 @@
-// ECAD netlist → firmware pin-map header (T-RF15 port of
+// ECAD netlist → firmware pin-map header (C++ port of
 // engine_oracle/firmware/pinmap.py). See contracts/firmware_rpc.md §2 and the
 // Python module docstring.
 #pragma once

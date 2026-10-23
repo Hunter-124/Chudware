@@ -23,7 +23,7 @@
     {
       "name": "windows-core",
       "displayName": "Windows core (libchudware, Ninja + MSVC, OCCT off)",
-      "description": "Configure the C++ core with MSVC. Run from an 'x64 Native Tools Command Prompt for VS 2022' (or after vcvars64.bat) so cl/link are on PATH. OCCT off = the self-contained fast build; verified on Win11 + MSVC 14.44. See docs/BUILD_WINDOWS.md.",
+      "description": "Configure the C++ core with MSVC. Run from an 'x64 Native Tools Command Prompt for VS 2022' (or after vcvars64.bat) so cl/link are on PATH. OCCT off = the self-contained fast build; verified on Win11 + MSVC 14.44. See docs/reference/BUILD_WINDOWS.md.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-core",
       "cacheVariables": {

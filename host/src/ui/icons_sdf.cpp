@@ -41,7 +41,7 @@ struct Pt { int dx, dy; };
 // field filled with negative distSq, sqrt() of it produced NaN, the encoded SDF collapsed and
 // every qualifying glyph rasterized to alpha=0 — i.e. all SDF-path icons (weld_gusset,
 // display_hlr, appr_metal/appr_glass, display_edges, view_cube) were silently INVISIBLE in the
-// ribbon (T-G12 round-1 "not showing" report; root-caused in T-G15). 1<<12 = 4096 px is far
+// ribbon. 1<<12 = 4096 px is far
 // beyond any atlas cell (<=64 px) and its distSq (2*(4096+1)^2 ~ 3.4e7) fits int comfortably.
 constexpr int kFar = 1 << 12;
 inline int distSq(Pt p) { return p.dx * p.dx + p.dy * p.dy; }
@@ -294,7 +294,7 @@ void build(const unsigned char* rgba, int atlasW, int atlasH,
     std::vector<Candidate> candidates;
     candidates.reserve(by32.size());
     auto tryAdd = [&](const std::string& base, const CellUV& uv) {
-        // Photographic/screenshot tiles (T-G15): explicit raster-only opt-out — their neutral-grey
+        // Photographic/screenshot tiles: explicit raster-only opt-out — their neutral-grey
         // shading can pass the chroma gate, but an SDF re-raster would flatten them to a tinted
         // silhouette (contract: photographic icons stay multi-color raster).
         if (rasterOnly.count(base)) return;

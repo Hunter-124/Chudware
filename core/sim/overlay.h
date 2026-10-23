@@ -68,7 +68,7 @@ std::vector<double> map_to_surface(const std::vector<double>& surf_xyz,
                                    const std::vector<double>& vol_xyz,
                                    const std::vector<double>& vol_values, int dim);
 
-// Size cap (T-SIM2): the boundary surface these writers emit is uploaded to a single GL
+// Size cap: the boundary surface these writers emit is uploaded to a single GL
 // VBO, CPU-re-deformed on every deform-scale change, and carries ~15 per-node scalar
 // fields per vertex. When the extracted surface exceeds kMaxOverlayTris (~1.5M boundary
 // triangles) the writer returns "" instead of emitting an overlay — a HARD GUARD, not a

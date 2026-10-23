@@ -1,4 +1,4 @@
-"""Tests for services.piping.cfd_handoff (T-E4: 3D CFD handoff for pipe internals).
+"""Tests for services.piping.cfd_handoff (3D CFD handoff for pipe internals).
 
 Test groups:
   1. internal_volume — bore solid extraction (kernel-skipped when build123d absent).
@@ -31,7 +31,7 @@ from services.piping import cfd_handoff as ch
 def _have_kernel() -> bool:
     """Evaluate lazily each time — not at module load.
 
-    RC#3 from T-V2 audit: module-load-time HAVE_KERNEL=False (build123d absent at
+    Root cause: module-load-time HAVE_KERNEL=False (build123d absent at
     collection) but call-time _have_kernel() returns True (build123d appears in
     sys.modules from a prior import in the combined run), causing
     test_internal_volume_no_kernel_raises_piping_cfd_error to run but not raise.
@@ -180,7 +180,7 @@ def test_internal_volume_no_kernel_raises_piping_cfd_error():
     This test only runs when build123d is absent; if the kernel IS present it is skipped
     (we can't uninstall build123d in a live session).
 
-    RC#3 fix (T-V2 audit): call _have_kernel() lazily here (not the module-level
+    Fix: call _have_kernel() lazily here (not the module-level
     constant) so combined-run sys.modules state doesn't cause a mismatch between
     the skip decision and what internal_volume() actually does at call time.
     """

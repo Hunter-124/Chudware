@@ -1,7 +1,7 @@
 """Advanced FEA regression tests — CalculiX contact and engine fatigue.
 
 Two legs (simsuite fea_ccx_advanced domain; anchors: core/tests/test_fatigue.cpp,
-scripts/vv_benchmark.py FAMILY 10, engine_oracle/sim/multiphysics_rpc.py T-FIN24):
+scripts/vv_benchmark.py FAMILY 10, engine_oracle/sim/multiphysics_rpc.py):
 
 1. CONTACT — the two-block *NLGEOM *CONTACT PAIR proxy: base reaction must equal
    the applied load (static equilibrium / Newton III), and the slave-interface

@@ -1,4 +1,4 @@
-"""services/browser/adapters/igus.py — igus source adapter (T-X7).
+"""services/browser/adapters/igus.py — igus source adapter.
 
 igus (igus.com) makes plain & linear bearings, energy chains (e-chains) and
 polymer motion components, with a native "3-step" CAD downloader (STEP).

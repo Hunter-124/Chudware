@@ -28,7 +28,7 @@
       "type": "gate",
       "name": "Freeze scope, disjoint write-sets, and user decisions D1..D4",
       "inputs": {
-        "request": "Confirm the four user decisions before execution: D1 execution model (subagent waves committing to master vs in-app dag_run), D2 external heavy binaries (install openEMS/Renode vs stay builtin-FDFD/analytic+QEMU honest-skip with REAL-when-present design), D3 GPU/parallel depth (opportunistic vs deep vs defer), D4 benchmark sequencing (foundation->ECAD->flight-computer->charger). Freeze disjoint write-sets so waves run in parallel. Preserve uncommitted host GUI edits (app_state.h, sketch_mode.cpp, viewport_panel.cpp). contracts/* and core/api/libchudware.h are APPEND-ONLY and integrator-owned.",
+        "request": "Confirm the four user decisions before execution: D1 execution model (subagent waves committing to master vs in-app dag_run), D2 external heavy binaries (install openEMS/Renode vs stay builtin-FDFD/analytic+QEMU honest-skip with REAL-when-present design), D3 GPU/parallel depth (opportunistic vs deep vs defer), D4 benchmark sequencing (foundation->ECAD->flight-computer->charger). Freeze disjoint write-sets so waves run in parallel. Preserve uncommitted host GUI edits (app_state.h, sketch_mode.cpp, viewport_panel.cpp). contracts/* and core/api/libchudware.h are APPEND-ONLY.",
         "decisions": ["D1_execution_model", "D2_external_binaries", "D3_gpu_depth", "D4_bench_sequencing"]
       },
       "tools": null,
@@ -297,7 +297,7 @@
       "id": "n_report",
       "type": "report",
       "name": "Report + land + graph update",
-      "inputs": {"request": "Log files changed, new capabilities (sim cache, nested profiler, dynamic governor, ECAD placement/trace-opt/antenna/board-flow, sensor bridge, GPU paths, both benchmarks + harness), verification commands + results, and honest limitations in docs/REFACTOR_LOG.md. Commit per verified domain and push to master as each unit goes green; graphify update."},
+      "inputs": {"request": "Log files changed, new capabilities (sim cache, nested profiler, dynamic governor, ECAD placement/trace-opt/antenna/board-flow, sensor bridge, GPU paths, both benchmarks + harness), verification commands + results, and honest limitations in the run summary report. Commit per verified domain and push to master as each unit goes green."},
       "tools": null,
       "end_condition": "Every claim reproducible; verified units landed on master; graph refreshed.",
       "verify": null,

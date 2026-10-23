@@ -243,7 +243,7 @@ ojson clarify(const std::string& request, const ojson& doc, const std::string& d
     // ready = explicit truthy `ready`, OR there are no questions to ask.
     bool ready = (parsed.contains("ready") && truthy(parsed["ready"])) || questions.empty();
 
-    // T-F4 + v1.1: additive aicad.interaction/1 mirror (contracts/interaction.md §1, §3, §12).
+    // v1.1: additive aicad.interaction/1 mirror (contracts/interaction.md §1, §3, §12).
     // Emits interaction kinds (dimension/text/choice/approval/geometry_select) alongside
     // the legacy {key, ask, unit, suggested} fields — existing callers (drawClarifyCard,
     // ClarifyState) keep working; the host prefers the interaction envelope when present.

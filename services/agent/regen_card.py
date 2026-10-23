@@ -2,16 +2,15 @@
 
 When a rebuild fails and ``regen_diagnosis.diagnose`` proposes a fix, the user is shown a card:
 the one-line diagnosis, the editable fix ops (R1 editability — doc-ops, not an opaque script),
-and a T-H2 ``doc_diff`` of what the fix changes, alongside the verifier verdict (did it rebuild
+and a ``doc_diff`` of what the fix changes, alongside the verifier verdict (did it rebuild
 + compare ≈100%?). Accept applies the fix; reject discards it; edit lets the user amend the ops
-first. Each choice emits a T-H1 ``ai_artifact_action`` event correlated to the diagnosis's IP-18
+first. Each choice emits an ``ai_artifact_action`` event correlated to the diagnosis's IP-18
 ``ai_artifact`` — so the accepted/edited/rejected outcome (with its verifier score) becomes part
 of the same correction trace the model call was logged as.
 
-This is a STANDALONE, headless-testable surface (the T-F16 precedent): it builds the card as a
-plain dict and emits actions through the same ``on_event`` sink the copilot uses, so the copilot
-UI (T-F17 / T-G7 territory — see work/questions/T-H11.md) binds to it without this task editing
-the contested agent panel. No C++ core and no GUI are required to exercise it.
+This is a STANDALONE, headless-testable surface: it builds the card as a plain dict and emits
+actions through the same ``on_event`` sink the copilot uses, so the copilot UI binds to it
+without changes to the agent panel. No C++ core and no GUI are required to exercise it.
 """
 from __future__ import annotations
 
@@ -55,7 +54,7 @@ def build_fix_preview(corrupted_document: dict, diagnosis: Diagnosis, *,
     # editable fix ops (R1 parity — the user sees exactly which doc-ops will apply).
     changes = [_op_summary(op) for op in diagnosis.fix_ops]
 
-    # Optional enrichment: T-H2 semantic doc_diff. Imported lazily and degraded gracefully —
+    # Optional enrichment: semantic doc_diff. Imported lazily and degraded gracefully —
     # doc_diff_tools hard-imports FastMCP at module top, which isn't always importable.
     try:
         from services.mcp.doc_diff_tools import doc_diff
@@ -73,7 +72,7 @@ def build_fix_preview(corrupted_document: dict, diagnosis: Diagnosis, *,
         "fix_ops": diagnosis.fix_ops,          # editable — the user may amend before accepting
         "changes": changes,                    # plain-English per-op preview (always present)
         "n_applied": diagnosis.n_applied,
-        "semantic_diff": semantic_diff,        # T-H2 doc_diff when available (enrichment)
+        "semantic_diff": semantic_diff,        # doc_diff when available (enrichment)
         "verifier": {
             "score": verifier_score,
             "passed": (verifier_score is not None and verifier_score >= 1.0),
@@ -90,10 +89,10 @@ def emit_action(card: dict, action: str, on_event: Optional[Callable[[dict], Non
                 consent: str = "meta", revision: int = 0, dwell_ms: int = 0,
                 edit_ops: Optional[list] = None, edit_ops_ref: str = "",
                 note: str = "") -> dict:
-    """Emit a T-H1 ``ai_artifact_action`` for the user's choice on ``card`` and return the event.
+    """Emit an ``ai_artifact_action`` for the user's choice on ``card`` and return the event.
 
     Correlates to the diagnosis's IP-18 ``ai_artifact`` via ``artifact_id`` so the exporter
-    (T-H5) can stitch the (model call → verifier score → human accept/reject) correction trace.
+    can stitch the (model call → verifier score → human accept/reject) correction trace.
     The verifier score rides on the action (DoD: apply/reject logged as artifact actions WITH
     verifier scores). At meta/off consent, ``edit_ops_ref`` must already be empty (no bodies
     leave the machine) — the caller passes refs only at full consent.
@@ -113,7 +112,7 @@ def emit_action(card: dict, action: str, on_event: Optional[Callable[[dict], Non
         "note": note,
         "consent": consent,
         # verifier score attached to the outcome (not in the C++ signature's positional args,
-        # additive here; the exporter ignores unknown keys, T-H5 reads it for reward labels).
+        # additive here; the exporter ignores unknown keys and reads it for reward labels).
         "verifier_scores": {"regen_fix": card.get("verifier", {}).get("score")},
     }
     if action == EDIT and edit_ops is not None:

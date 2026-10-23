@@ -20,7 +20,7 @@ namespace chudware::sim {
 
 namespace {
 
-// ── Result-overlay size cap (T-SIM2) ──────────────────────────────────────────
+// ── Result-overlay size cap ───────────────────────────────────────────────────
 // The result overlay is the FEA BOUNDARY surface: its triangles are uploaded to a
 // single GL VBO, re-deformed on the CPU on every deform-scale change, and each vertex
 // carries ~15 per-node scalar fields. That triangle budget is what bounds interactive

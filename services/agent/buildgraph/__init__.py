@@ -1,7 +1,6 @@
 """services/agent/buildgraph — Build-order DAG planner for aicad.buildgraph/1.
 
 Contract: contracts/advisor.md §13 (FROZEN), §3 (advisory items).
-T-W15.
 
 Public surface
 --------------

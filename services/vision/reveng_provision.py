@@ -135,7 +135,7 @@ REVENG_DESCRIPTORS: dict[str, dict] = {
     # License UNVERIFIED offline: some Meta model releases are CC-BY-NC
     # (non-commercial), which would bar bundling/commercial fetch. Descriptor
     # is discovery-only (mode="env") pending a confirmed SPDX + licenses.md
-    # entry. See work/questions/RE-06.md.
+    # entry.
     "vggt": {
         "kind": "weights",
         "capability": "sparse",
@@ -176,7 +176,7 @@ REVENG_DESCRIPTORS: dict[str, dict] = {
         "sha256": SHA_PENDING,
         "note": (
             "ML mesh→CadQuery parametric rebuild (filapro/cad-recode-v1.5). "
-            "CC-BY-NC-4.0 — licensing deferred (license_debt.md). "
+            "CC-BY-NC-4.0 (non-commercial) — documented exception in THIRD_PARTY_NOTICES.md. "
             "Provision: python -c \"from huggingface_hub import snapshot_download; "
             "snapshot_download('filapro/cad-recode-v1.5')\" "
             "or set CAD_RECODE_WEIGHTS. Needs torch+transformers; ~4GB VRAM bf16."

@@ -1816,7 +1816,7 @@ TEST_CASE("extrude from a reference plane -> profile starts at the plane") {
     CHECK(hi[2] == doctest::Approx(START + D).epsilon(1e-4));
 }
 
-// 11b. T-3DDATUM — datum plane method "point_normal" (arbitrary origin + normal;
+// 11b. Datum plane method "point_normal" (arbitrary origin + normal;
 //      closes the sketch3d_pipe auto-profile gap, MCP _profile_plane_ops). An
 //      on-axis case must match the equivalent "offset" plane exactly (z=START); an
 //      off-axis normal must still produce a valid extrude of the SAME volume
@@ -5847,7 +5847,7 @@ TEST_CASE("doc_new without resume_if_open still uniquifies (the fresh=True path)
     CHECK_FALSE(b.value("reused", false));
 }
 
-// The BUILT/UNBUILT split (docs/REFACTOR_LOG.md ~5274, ~5309): resuming a same-named
+// The BUILT/UNBUILT split: resuming a same-named
 // part is right for the respawn case, but inheriting a stranger's HALF-BUILT body
 // silently is worse than a duplicate tab — twelve sibling tests once died on "boss
 // added no material (it is buried inside the body)" because of it. The resume is

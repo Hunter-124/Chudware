@@ -1,4 +1,4 @@
-# Interference pre-op context pack (aicad.trigger/1 — T-DP6)
+# Interference pre-op context pack (aicad.trigger/1)
 
 **When this fires:** the model is about to place, assemble, mate, or move a body.
 

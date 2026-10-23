@@ -8,7 +8,7 @@ ROOT + top-N hot children within a token budget, with ``path`` drill-down and a
   * ``prof_phases_tree``  — nested study -> phase -> subphase (wall-clock ms)
 
 Registration is deferred behind :func:`register_profile_tools` so ``server.py`` wires
-us in with a one-line call (integrator-owned).
+us in with a one-line call.
 """
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""test_verify.py — Tests for verify.py (T-A4 DoD).
+"""test_verify.py — Tests for verify.py.
 
 Runs without the C++ engine (mock tool_fn_override).
 One integration-smoke test with the real engine is included and skipped
@@ -9,7 +9,7 @@ DoD coverage:
   - DONE on pass, RETRY on fail (budget > 0), ESCALATE on fail (budget exhausted)
   - ESCALATE on backend_unavailable / tool_error / predicate_error
   - end_condition predicate evaluated correctly
-  - DISPATCH_TABLE is importable (T-F12 reuse contract)
+  - DISPATCH_TABLE is importable (design_review reuse contract)
 """
 from __future__ import annotations
 
@@ -64,17 +64,17 @@ def _tool_err(**fields) -> str:
 
 
 # ---------------------------------------------------------------------------
-# DISPATCH_TABLE contract (T-F12 reuse)
+# DISPATCH_TABLE contract (design_review reuse)
 # ---------------------------------------------------------------------------
 
 def test_dispatch_table_contains_all_check_types():
     expected = {"interference", "erc", "drc", "firmware", "dc_ratio", "budget",
-                # T-BL04 advanced-FEA verify nodes.
+                # Advanced-FEA verify nodes.
                 "fatigue", "thermal", "buckling", "contact",
-                "vibration",  # vibration: T-BL17 run_fea_frequency_response gate
-                "reveng_deviation"}  # RE-17 reverse-engineering mesh-vs-B-Rep deviation gate
+                "vibration",  # vibration: run_fea_frequency_response gate
+                "reveng_deviation"}  # reverse-engineering mesh-vs-B-Rep deviation gate
     assert expected == set(DISPATCH_TABLE.keys()), (
-        "DISPATCH_TABLE must cover every check type (T-F12 reuses this verbatim)"
+        "DISPATCH_TABLE must cover every check type (design_review reuses this verbatim)"
     )
 
 

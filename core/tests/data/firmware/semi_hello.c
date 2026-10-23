@@ -1,4 +1,4 @@
-/* Semihosting hello-and-exit test fixture (T-RF15) — a minimal bare-metal
+/* Semihosting hello-and-exit test fixture — a minimal bare-metal
  * Cortex-M image that prints two lines over the ARM semihosting console and
  * exits cleanly via SYS_EXIT, so the QEMU leg of fw_sim_run can be exercised
  * LIVE in tests (qemu-system-arm -M mps2-an385 -semihosting) without relying

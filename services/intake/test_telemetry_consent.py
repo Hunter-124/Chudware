@@ -1,4 +1,4 @@
-"""Tests for T-H1 telemetry: consent_tier resolution and intake audit fields."""
+"""Tests for telemetry: consent_tier resolution and intake audit fields."""
 from __future__ import annotations
 
 import pytest

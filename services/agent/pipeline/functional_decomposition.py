@@ -1,4 +1,4 @@
-"""functional_decomposition.py — Stage 1 helpers for T-DP2.
+"""functional_decomposition.py — Stage 1 (functional decomposition) helpers.
 
 Two independent pieces:
 
@@ -18,7 +18,7 @@ The DECOMPOSE gate (phases.py ``_gate_decompose``) reads pre-computed coverage
 findings from the context dict rather than calling this module directly; use
 ``gate_context_from_ledger`` to build that dict.
 
-Contract: design_pipeline.md §3.1 + §5 (T-DP2 coverage layer).
+Contract: design_pipeline.md §3.1 + §5 (coverage layer).
 """
 from __future__ import annotations
 

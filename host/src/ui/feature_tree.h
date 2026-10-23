@@ -19,7 +19,7 @@ namespace render { struct PickHit; }
 
 namespace ui {
 
-// ---- Shared FeatureManager row styling (the panel-wide ratified look) ----
+// ---- Shared FeatureManager row styling (the panel-wide standard look) ----
 // Exported so sibling left-pane tabs (file_explorer.cpp Explorer) draw rows/icons/section rules
 // PIXEL-IDENTICAL to the FeatureManager reference: frosted row pill + accent selection (soft fill
 // + glow border) + accent-outline hover, 16px atlas icons vertically centered in the leaf-arrow

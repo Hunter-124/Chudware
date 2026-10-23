@@ -1,4 +1,4 @@
-// Sensor stimulus scenarios — aicad.fwscenario/1 (T-RF15 port of
+// Sensor stimulus scenarios — aicad.fwscenario/1 (C++ port of
 // engine_oracle/firmware/scenario.py + the fixtures library). Declarative
 // time-series stimulus tracks compiled into Renode monitor commands spliced
 // into the generated .resc. Pure parsing/validation/planning; the only I/O is
@@ -46,7 +46,7 @@ std::vector<int> waveform_samples(const nlohmann::json& wf, double sample_ms = 1
                                   int n = 256);
 
 // Compile a validated scenario into Renode monitor lines + aux files.
-// `caps` is the T-FIN2 capability entry (platform_db.get_capabilities);
+// `caps` is the capability entry (platform_db.get_capabilities);
 // `platform_text` the .repl content. Pure — aux files returned as content.
 ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann::json& caps,
                                  const std::string& platform_text, double horizon_ms = 0);

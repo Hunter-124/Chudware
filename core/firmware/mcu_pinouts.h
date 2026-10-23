@@ -1,4 +1,4 @@
-// MCU family lookup + net-name → pin-number decoding (T-RF15 port of
+// MCU family lookup + net-name → pin-number decoding (C++ port of
 // engine_oracle/firmware/mcu_pinouts.py). Pure JSON in/out; see the Python
 // module docstring for the two concerns (BOM → mcu_family, positional net
 // names → stable pin ids).

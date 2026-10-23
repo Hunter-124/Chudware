@@ -1,4 +1,4 @@
-"""services/browser/adapters/amazon.py — Amazon source adapter (T-X7).
+"""services/browser/adapters/amazon.py — Amazon source adapter.
 
 Amazon is COMMERCE, not a CAD source: there is no downloadable file here, only
 a structured price/availability record copied from the product page with

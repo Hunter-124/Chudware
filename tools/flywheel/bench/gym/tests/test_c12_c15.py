@@ -1,4 +1,4 @@
-"""Unit tests for C12–C15 ground-truth ACs against scripted seeds (WI-6..9).
+"""Unit tests for C12–C15 ground-truth ACs against scripted seeds.
 
 Builds synthetic ledgers from each challenge's scripts (same shape the gym runner
 replays via ledger.append) and asserts every AC for seed1 PASS, plus labeled

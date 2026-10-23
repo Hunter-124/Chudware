@@ -1,7 +1,7 @@
-"""services.plm.assist — assist tiers, checkpoint heuristics, stale refs (T-R3).
+"""services.plm.assist — assist tiers, checkpoint heuristics, stale refs.
 
-The policy layer for Pillar 19's three assist tiers (plan §2, contract §4
-``ai_mode``), with **manual always primary** (contract §8.4):
+The policy layer for the PLM's three assist tiers (contract §4 ``ai_mode``),
+with **manual always primary** (contract §8.4):
 
 * ``manual``   — buttons only. Auto-history still runs (safety, not policy;
   contract §8.5). No drafting, no suggestions, no AI-cut entries.
@@ -14,7 +14,7 @@ The policy layer for Pillar 19's three assist tiers (plan §2, contract §4
 
 Everything here is deterministic policy — no learned calls. The only AI-ish
 output is the templated message drafting in :mod:`summarize`, which is itself
-deterministic (Pillar 13).
+deterministic.
 """
 from __future__ import annotations
 
@@ -121,8 +121,8 @@ def stale_refs(m: dict[str, Any]) -> list[dict[str, Any]]:
 
     Contract §5.1: a stale ref is "an assembly using a superseded component
     rev". The authoritative pin data is ``manifest.bom_freezes`` (written at
-    assembly release, T-R4). **Capability-checked:** on a manifest without
-    T-R4 freeze data this returns ``[]`` rather than guessing.
+    assembly release). **Capability-checked:** on a manifest without
+    release freeze data this returns ``[]`` rather than guessing.
 
     Returns records::
 

@@ -1,4 +1,4 @@
-"""Acceptance tests for gym challenges C9, C10, C11 (bench divisions WI-3..5, WI-13).
+"""Acceptance tests for gym challenges C9, C10, C11.
 
 Grades scripted seed ledgers directly (no full runner / network). Seed1 must PASS
 every AC; seed2/3 must produce the expected FAIL criteria and/or taxonomy classes.

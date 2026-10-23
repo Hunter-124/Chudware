@@ -1,4 +1,4 @@
-"""services/browser/adapters/lcsc.py — LCSC source adapter (T-X7).
+"""services/browser/adapters/lcsc.py — LCSC source adapter.
 
 LCSC (lcsc.com) is the electronic-components distributor behind JLCPCB's
 parts library. Search/pricing/stock pages are public (no login for browse);
@@ -8,7 +8,7 @@ matching — plus the part's datasheet PDF when the detail page links one
 (the one downloadable artifact LCSC exposes here).
 
 NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live LCSC session (T-X6 gates the real per-source integration
+against a live LCSC session (the gated integration suite covers the real per-source integration
 tests behind an env flag).
 """
 from __future__ import annotations

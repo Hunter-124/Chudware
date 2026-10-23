@@ -6,10 +6,10 @@ dimensions/features/parts listed with ledger refs — BEFORE any mutation is
 dispatched) and §17 (scope→approver routing).  Role prompt: overseer.yaml
 "CHANGE REQUESTS".
 
-Scope boundary (task step 5): this module implements ONLY the **user change-request
+Scope boundary: this module implements ONLY the **user change-request
 path** — user asks for a fix/change → map onto ledger refs → scoped change plan →
 audit → dispatch recommendation.  Role-emitted ``replan_request`` routing (§17,
-``aicad.replan/1``) overlaps T-W19's scope and is left to T-W19.
+``aicad.replan/1``) is handled separately by ``services/agent/pipeline/replan.py``.
 
 The mapping is the whole game (role card rule): a change routed to the wrong scope
 becomes two bugs.  So the affected-set is derived **deterministically from the
@@ -387,7 +387,7 @@ def route_change_request(
     text, we render a compact view here as a fallback.
     """
     plan_obj = draft_change_plan(text, ledger_state)
-    # T-DP5: add the DESIGN-STAGE re-entry (which DP stage/feature the change
+    # Add the DESIGN-STAGE re-entry (which DP stage/feature the change
     # re-derives from) onto each dispatch row, on top of the existing execution-role
     # mapping.  A "thicker wall" then re-enters GEOMETRY on the wall's geometry_spec
     # rather than being blindly re-modeled (doc §3.1 user-change → stage mapping).

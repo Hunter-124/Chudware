@@ -1,7 +1,6 @@
 // Embedded firmware project templates (cmake_arm) + Renode platform files —
-// generated from engine_oracle/firmware/templates (T-RF15 port; byte-identical
-// contents). Regenerate by re-running the generator recorded in
-// docs/REFACTOR_LOG.md if the Python template tree changes during the overlap window.
+// generated from the former Python engine_oracle/firmware/templates tree
+// (byte-identical contents).
 #include "firmware/templates.h"
 
 namespace chudware::firmware {
@@ -25,11 +24,11 @@ project(firmware C ASM)
 set(CMAKE_C_STANDARD 11)
 
 # MCU flags default to Cortex-M4; override -DMCU_FLAGS="..." for another core.
-# T-C5 fix: this MUST be a CMake list (semicolon-separated), not a space-separated string — a
+# Fix: this MUST be a CMake list (semicolon-separated), not a space-separated string — a
 # CACHE STRING containing spaces is passed to add_compile_options()/add_link_options() as ONE
 # argument, so GCC saw the literal token "-mcpu=cortex-m4 -mthumb" and rejected it outright
 # (confirmed live: `arm-none-eabi-gcc: error: unrecognized -mcpu target: cortex-m4 -mthumb`) —
-# this had never been build-tested against a real arm-none-eabi-gcc before T-C5.
+# this had never been build-tested against a real arm-none-eabi-gcc before.
 set(MCU_FLAGS "-mcpu=cortex-m4;-mthumb" CACHE STRING "MCU architecture flags")
 
 add_compile_options(
@@ -38,9 +37,9 @@ add_compile_options(
     -Wall -Wextra
     -Og -g
 )
-# T-C5: linker.ld places .isr_vector/.text/.data/.bss at the addresses startup.c's Reset_Handler
+# linker.ld places .isr_vector/.text/.data/.bss at the addresses startup.c's Reset_Handler
 # and this template's MCU_FLAGS/platform assume (default: STM32F4 map, matches
-# templates/renode_platforms/stm32f4_discovery.repl). Without it (as before T-C5) the link
+# templates/renode_platforms/stm32f4_discovery.repl). Without it (as before) the link
 # succeeds but nothing can boot — there's no vector table placement or RAM/flash split.
 add_link_options(
     ${MCU_FLAGS}
@@ -54,7 +53,7 @@ add_executable(${CMAKE_PROJECT_NAME}.elf
     src/main.c
     src/startup.c
 )
-# T-C5 fix: engine.firmware.pinmap.write_pinmap() writes the generated pin-map header to
+# Fix: engine.firmware.pinmap.write_pinmap() writes the generated pin-map header to
 # <project_root>/<build_dir>/include/pinmap.h — i.e. ${CMAKE_BINARY_DIR}/include when configured
 # the documented way (`cmake -S . -B build`) — but that path was never added here, so any source
 # that #includes "pinmap.h" failed to compile (confirmed live: `fatal error: pinmap.h: No such
@@ -83,7 +82,7 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 )CHUDWARE_TMPL"},
-        {"include/chudware_trace.h", R"CHUDWARE_TMPL(/* chudware_trace.h — firmware-side pin-event shim for the QEMU emulation fallback (T-FIN1).
+        {"include/chudware_trace.h", R"CHUDWARE_TMPL(/* chudware_trace.h — firmware-side pin-event shim for the QEMU emulation fallback.
  *
  * QEMU (mps2-an385) has no external GPIO observer the host can poll, so the firmware
  * reports its own pin transitions over a firmware-configured UART in a
@@ -112,7 +111,7 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 #define CHUDWARE_GPIO_TRACE_NT(pin_str, level) \
     printf("CHUDWARE_GPIO_EVT %s=%d\n", (pin_str), ((level) ? 1 : 0))
 
-/* CPU run/sleep residency markers (T-FIN7, optional). Print around sleep entry/exit
+/* CPU run/sleep residency markers (optional). Print around sleep entry/exit
  * (e.g. before/after __WFI()) so the power-profile derivation (aicad.powerprofile/1)
  * can integrate measured run/sleep residency instead of assuming always-active:
  *
@@ -218,7 +217,7 @@ int main(void)
  * A real target's CMSIS device pack supplies the full vector table (every NVIC IRQ) + a fuller
  * startup; this covers just the fixed Cortex-M core exceptions (enough to boot and run on any
  * Cortex-M without peripheral interrupts) so a configure/compile/link is genuinely load-complete
- * against linker.ld (T-C5: the prior version had no .isr_vector at all, so nothing could boot on
+ * against linker.ld (the prior version had no .isr_vector at all, so nothing could boot on
  * real hardware or in an emulator — this is the fix). Replaced/extended per MCU by the agent when
  * peripheral interrupts are needed.
  */
@@ -306,10 +305,10 @@ is not vendored or linked into this project.
 // Minimal: flash + SRAM + CPU + NVIC only; no other peripheral mapping.
 // License: MIT — see templates/renode_platforms/LICENSE
 //
-// T-C5 fix: Renode's CPU.CortexM constructor requires an `nvic` (IRQControllers.NVIC) reference
+// Fix: Renode's CPU.CortexM constructor requires an `nvic` (IRQControllers.NVIC) reference
 // — this file never declared one, so `machine LoadPlatformDescription` failed outright
 // ("Could not find suitable constructor... Could not find corresponding attribute for parameter
-// 'nvic'"), confirmed live. Never actually loaded in Renode before T-C5 (T-C3's tests mock the
+// 'nvic'"), confirmed live. Never actually loaded in Renode before this fix (earlier tests mocked the
 // subprocess). Syntax mirrors Renode's own bundled platforms/cpus/stm32f4.repl.
 
 nvic: IRQControllers.NVIC @ sysbus 0xE000E000
@@ -330,7 +329,7 @@ sram: Memory.MappedMemory @ sysbus 0x20000000
         {"esp32_stub.repl", R"CHUDWARE_TMPL(// ESP32 stub platform description for Renode (MIT)
 // License: MIT — see templates/renode_platforms/LICENSE
 //
-// T-FIN2 DECISION — ESP32 is BUILD + FLASH ONLY, no emulation.
+// Design decision — ESP32 is BUILD + FLASH ONLY, no emulation.
 // Renode's Xtensa/ESP32 support is experimental and ships no usable UART/GPIO
 // peripheral models; QEMU-xtensa (espressif fork) is not packaged for our
 // supported distros. platform_db reports esp32 with emulation="none" and
@@ -352,7 +351,7 @@ sram: Memory.MappedMemory @ sysbus 0x3FFB0000
 // https://github.com/renode/renode/blob/master/platforms/cpus/nrf52840.repl
 // License: MIT — see templates/renode_platforms/LICENSE and upstream renode LICENSE.
 //
-// T-FIN2: adopted upstream verbatim (UART0/1, GPIO0/1 + GPIOTE, TWI(I2C)0/1, SPI2,
+// Adopted upstream verbatim (UART0/1, GPIO0/1 + GPIOTE, TWI(I2C)0/1, SPI2,
 // TIMER0-4, RTC0-2, radio, RNG, ...) with ONE local change: the ApplySVD (network SVD fetch)
 // sysbus init line is removed (network fetch at load time; runs must be offline-safe).
 // [~] live-verify: renode is not installed on this machine; structure tests only.
@@ -478,7 +477,7 @@ sysbus:
         {"rp2040.repl", R"CHUDWARE_TMPL(// RP2040 (Raspberry Pi Pico) minimal platform description for Renode (MIT)
 // License: MIT — see templates/renode_platforms/LICENSE
 //
-// T-FIN2 HONESTY NOTE: stock Renode ships NO RP2040 SoC model (checked upstream
+// NOTE: stock Renode ships NO RP2040 SoC model (checked upstream
 // renode/renode platforms/ 2026-07-10). The maintained community model
 // (github.com/matgla/Renode_RP2040) needs custom C# peripherals compiled into
 // Renode, so it cannot be bundled here. This file is therefore a MINIMAL,

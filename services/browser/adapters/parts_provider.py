@@ -1,6 +1,6 @@
-"""services/browser/adapters/parts_provider.py — CatalogProvider wrapper (T-X3).
+"""services/browser/adapters/parts_provider.py — CatalogProvider wrapper.
 
-Presents a T-X2 :class:`services.browser.adapters.SourceAdapter` (search/
+Presents a :class:`services.browser.adapters.SourceAdapter` (search/
 acquire) as a ``services.parts.hub`` ``CatalogProvider``
 (``contracts/parts.md`` §3): live-search-only (``count``/``iter_records``
 raise ``NotImplementedError``), domain
@@ -9,7 +9,7 @@ catalog providers" (TraceParts/Werk24). This is the user-authenticated
 browser-session mechanism for the same catalogs instead of a paid API; both
 can coexist behind the same ``CatalogProvider`` protocol.
 
-Zero-profile behavior (T-X3 DoD): when no browser login profile exists for
+Zero-profile behavior: when no browser login profile exists for
 this adapter's site, :meth:`search`/:meth:`get` return empty/``None``
 SILENTLY — the provider contributes nothing, exactly like a live vendor
 provider with no configured API key (``contracts/parts.md`` §3, "degrade
@@ -26,13 +26,13 @@ from . import SourceAdapter
 
 
 class BrowserCatalogAdapter:
-    """``CatalogProvider`` wrapping one T-X2 ``SourceAdapter`` instance.
+    """``CatalogProvider`` wrapping one ``SourceAdapter`` instance.
 
     ``part_id`` scheme: ``"catalog:<site>::<url>"``. Colons inside a
     ``catalog_id`` are allowed per ``contracts/parts.md`` §0 (split on the
     FIRST colon only) so ``catalog_id`` is simply ``"<site>::<url>"``.
 
-    Search results are cached in-memory (``part_id`` -> the T-X2 result
+    Search results are cached in-memory (``part_id`` -> the adapter's result
     stub) so a subsequent :meth:`get` in the same process can re-run
     ``acquire()`` without re-searching. A ``get`` for a ``part_id`` from a
     prior process (cache miss) still works — the URL is recovered from the
@@ -116,8 +116,8 @@ class BrowserCatalogAdapter:
             enriched.setdefault("title", result.get("title", ""))
             return enriched
         # Fold the acquire envelope's vendor-specific extras (sku / price / availability / asin /
-        # lcsc / stock / ... — everything beyond the standard T-X2 envelope keys) into params so
-        # they land on the part record. T-X7 item 3: vendor(site)/SKU/URL/fetched-at metadata for
+        # lcsc / stock / ... — everything beyond the standard envelope keys) into params so
+        # they land on the part record: vendor(site)/SKU/URL/fetched-at metadata for
         # BOM & sourcing. Additive — never renames the existing site/url keys.
         _ENVELOPE_KEYS = {"ok", "source_url", "fetched_ts", "session_profile_used",
                           "license_note", "artifact_path", "title"}

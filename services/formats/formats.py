@@ -90,7 +90,7 @@ class FormatInfo:
                 "can_import": self.can_import, "can_export": self.can_export}
 
 
-# FORMAT_REGISTRY removed 2026-07-22 (T-RF19) — C++ owns the matrix
+# FORMAT_REGISTRY removed 2026-07-22 — C++ owns the matrix
 # (core/doc/formats.cpp). _detect_format/_EXT_TO_FORMAT stay for the import/export helpers.
 
 

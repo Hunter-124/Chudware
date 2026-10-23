@@ -159,7 +159,7 @@ def run_openfoam_cht(stl_path, direction, speed_mps, preset, on_progress,
             inlet_temp_c=float(thermal.get("inlet_temp_c", 20.0)),
             solid_kappa=float(thermal.get("solid_kappa", 200.0)),
             power_w=float(thermal.get("power_w", 20.0)),
-            # T-FIN19 seam: optional list of solid regions with per-solid heat sources
+            # Multi-solid seam: optional list of solid regions with per-solid heat sources
             # [{name, stl_path, kappa_w_mk, power_w}, ...]; overrides the single-solid form.
             solids=thermal.get("solids"))
         runner = _require_runner()

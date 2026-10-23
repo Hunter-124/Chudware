@@ -548,7 +548,7 @@ TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog) {
         if (forceDialog || (path.empty() && !is_foreign(t.path))) {
             std::string suggest = t.displayTitle();
             path = ui::saveFileDialog(
-                "AI-ECAD design (*.ecad+)\0*.ecad+\0All files (*.*)\0*.*\0", "ecad+",
+                "Chudware ECAD design (*.ecad+)\0*.ecad+\0All files (*.*)\0*.*\0", "ecad+",
                 suggest.empty() ? "design" : suggest.c_str());
             if (path.empty()) return TabSaveResult::Cancelled;
         }

@@ -34,7 +34,7 @@ def test_card_has_diagnosis_diff_and_verifier():
     assert card["diagnosis"]
     assert card["fix_ops"]                          # editable ops shown
     assert card["changes"] and card["changes"][0]["text"]   # plain-English preview (always present)
-    assert "semantic_diff" in card                  # T-H2 doc_diff slot (may be enrichment/unavailable)
+    assert "semantic_diff" in card                  # doc_diff slot (may be enrichment/unavailable)
     assert card["verifier"]["score"] == 1.0 and card["verifier"]["passed"] is True
     assert set(card["actions"]) == {"accept", "edit", "reject"}
 

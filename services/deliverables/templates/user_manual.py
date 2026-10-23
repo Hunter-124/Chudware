@@ -1,4 +1,4 @@
-"""``user_manual`` — the auto-generated end-user manual (docx/pdf), a T-Q4 template.
+"""``user_manual`` — the auto-generated end-user manual (docx/pdf), a deliverable template.
 
 Ships the manual :mod:`tools.manual_gen` composes from the ribbon inventory, the ``cad_guide``
 topic prose, and a contracts summary — ``title`` + ``section`` blocks only, ALL free prose (no

@@ -191,7 +191,7 @@
       "id": "n_report",
       "type": "report",
       "name": "Report + land + graph update",
-      "inputs": {"request": "Log files changed, bugs fixed, new capabilities (EM MCP, providers, essentials pack, compact serving), verification commands + results, honest limitations, in docs/REFACTOR_LOG.md; commit per verified domain and push; graphify update."},
+      "inputs": {"request": "Log files changed, bugs fixed, new capabilities (EM MCP, providers, essentials pack, compact serving), verification commands + results, honest limitations, in the run summary report; commit per verified domain and push."},
       "tools": null,
       "end_condition": "Every claim reproducible; verified units landed on master; graph refreshed.",
       "verify": null,

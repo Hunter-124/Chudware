@@ -1,4 +1,4 @@
-// Copilot composer (T-RF6 split of legacy_chat.cpp): the auto-growing wrapping chat input,
+// Copilot composer: the auto-growing wrapping chat input,
 // file attachments + context refs, the single agent-turn launch, the session slash commands
 // (/compact /shake /handoff /btw /prewalk /rule /skills /help), slash-menu autocomplete
 // (commands + skills), the submitTurn send path, and the composer chrome (runtime banner,

@@ -6,7 +6,7 @@ session-envelope record ``{consent, origin, app_version, os}`` followed by one
 verdict, and the taxonomy classes with their evidence refs, then a
 ``gym.cycle_summary`` record.
 
-Origin is ``team`` (internal dogfood runs) → default consent ``full``; if the resolved
+Origin is ``team`` (internal development runs) → default consent ``full``; if the resolved
 app config has ``offline_enabled`` the tier is hard-forced to ``off`` at the emitter.
 We do not re-resolve config here (the gym is a dev tool); we stamp ``full``/``team`` and
 leave re-verification to any downstream consumer, which is the contract's audit model.
@@ -21,7 +21,7 @@ from typing import Any
 
 def _session_envelope() -> dict[str, Any]:
     return {
-        "consent": "full",          # team dogfood default; consumers re-verify
+        "consent": "full",          # team development default; consumers re-verify
         "origin": "team",
         "app_version": "gym",
         "os": platform.system().lower(),

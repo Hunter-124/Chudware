@@ -2,8 +2,7 @@
 
 Thin FastMCP wrappers over :mod:`engine_oracle.ecad.antenna` and
 :mod:`engine_oracle.sim.em.antenna_bridge`. Registration is deferred behind
-:func:`register_antenna_tools` so ``server.py`` wires us in with a one-line call
-(integrator-owned — do not edit server.py from the worker).
+:func:`register_antenna_tools` so ``server.py`` wires us in with a one-line call.
 
 Tools return compact JSON envelopes ``{ok, warnings, hint, next_actions, ...}``
 matching :mod:`services.mcp.em_tools`. openEMS-absent full-wave analysis is an
@@ -13,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from services.ecad import antenna as antenna_mod  # STAYS (T-RF20): no C++ counterpart
+from services.ecad import antenna as antenna_mod  # STAYS: no C++ counterpart
 from services.mcp._envelopes import analysis_envelope
 from services.sim.em import antenna_bridge as bridge
 

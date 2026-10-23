@@ -218,7 +218,7 @@ struct Sketch3DResult {
 using FeatureResult = std::variant<SketchResult, SolidResult, PlaneResult, AxisResult,
                                    PointResult, CurveResult, Sketch3DResult>;
 
-// Shared feature-result slot (T-PERF6a). Checkpoints share unchanged entries via
+// Shared feature-result slot. Checkpoints share unchanged entries via
 // shared_ptr so capture_ckpt is O(entries) pointer traffic, not O(N²) value-copies
 // of SketchResult json / shape vectors. Mutable (non-const) so sanitize_solid can
 // heal an inverted solid in place before the result is frozen into a checkpoint.
@@ -265,20 +265,20 @@ private:
     map_t m_;
 };
 
-// Import-cache key: FNV-1a of the embedded_brep blob (T-PERF6a). Keying by the
+// Import-cache key: FNV-1a of the embedded_brep blob. Keying by the
 // multi-MB blob string itself forced every checkpoint map node to carry a full
 // copy of the key; a 64-bit hash is enough for content-addressing within one
 // compile (identical blobs → identical shapes).
 using ImportCache = std::map<uint64_t, std::vector<TopoDS_Shape>>;
 
-// Per-solid face/edge owner maps (T-PERF7a): sid -> (topo_index -> owning feature id).
+// Per-solid face/edge owner maps: sid -> (topo_index -> owning feature id).
 // Folded into CompileCkpt so incremental rebuilds don't re-diff the whole history.
 using OwnerTopoMap = std::map<std::string, std::map<int, std::string>>;
 
 // ------------------------------------------------ incremental-rebuild prefix cache
 // One checkpoint = the compiler's complete loop-carried state after feature i ran.
 // Results / statuses / import_cache / owner maps are shared_ptr-backed so a checkpoint
-// capture is O(entries) pointer-sized copies of UNCHANGED slots (T-PERF6a / T-PERF7a).
+// capture is O(entries) pointer-sized copies of UNCHANGED slots.
 // If compile_document grows a NEW piece of loop-carried state, it MUST be added here
 // and to the capture/restore sites below — that invariant is what keeps a restored
 // prefix bit-identical to re-executing it.
@@ -298,12 +298,12 @@ struct CompileCkpt {
     std::vector<::geom::BendRecord> bend_records;
     ImportCache import_cache;
     // Per-status shared_ptr so appending status N does not re-copy statuses 0..N-1
-    // into every subsequent checkpoint (T-PERF6a).
+    // into every subsequent checkpoint.
     std::vector<std::shared_ptr<const FeatureStatus>> statuses;
     std::vector<ToolRec> tool_recs;
     nlohmann::json weld_members;
     nlohmann::json sheet_metal_flat;
-    // Incremental owner maps (T-PERF7a) — face/edge attribution per solid id.
+    // Incremental owner maps — face/edge attribution per solid id.
     OwnerTopoMap face_owners;
     OwnerTopoMap edge_owners;
 };
@@ -1694,7 +1694,7 @@ std::optional<Eigen::Vector3d> parse_signed_axis(const json& j) {
     return std::nullopt;
 }
 
-// SCHEMA CONVERGENCE (docs/REFACTOR_LOG.md, T-RF20/T-RF21): accept BOTH the host's
+// SCHEMA CONVERGENCE: accept BOTH the host's
 // canonical feature shape — {id, type, params:{...}, refs:{slot:<sel|datum>}} per
 // contracts/doc_schema.md — and the simplified flat shape the early C++ tests use.
 // We normalize to the flat shape the per-feature compilers already read: params
@@ -2183,7 +2183,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
 
     // The shared rebuild context: per-feature results keyed by id, plus the set of
     // solids consumed by a later feature (they no longer survive as standalone bodies).
-    // FeatureResultMap = shared_ptr slots so checkpoints share unchanged entries (T-PERF6a).
+    // FeatureResultMap = shared_ptr slots so checkpoints share unchanged entries.
     FeatureResultMap results;
     std::set<std::string> consumed;
     // Lineage of an in-place transform: when a `copy:false` transform CONSUMES a source body
@@ -2511,13 +2511,13 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         return ep.edges.front();
     };
     // Resolve a curve ref for the ruled/fill/boundary surface forms to a wire. Two ref
-    // shapes are accepted (T-BL28):
+    // shapes are accepted:
     //   (1) a SKETCH/region ref (bare sketch id or {kind:region,sketch:fN}) — build a
     //       wire from the whole solved sketch (the MCP path + profile-well GUI picks);
     //   (2) a BODY-EDGE selector (the K_EDGE ribbon wells emit these) — resolve the
     //       picked edge against its body and lift it into a single-edge wire. This is the
     //       SolidWorks-style "ruled/boundary surface between body edges" UX the forms
-    //       advertise; before T-BL28 the engine rejected it ("… is a solid body, not a
+    //       advertise; previously the engine rejected it ("… is a solid body, not a
     //       sketch"). Edge resolution reuses resolve_edge_sel (geom-query + dangling
     //       errors + last_body_shape), so cross-body picks resolve against the most-recent
     //       body — the v1 limit; a single-body ruled/fill/boundary is the common case.
@@ -2835,14 +2835,14 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                                     active_cfg);
 
     // Per-compile cache of deserialized embedded-BREP imports, keyed by FNV-1a of the
-    // blob (T-PERF6a) — not the multi-MB blob string itself. An assembly that imports
+    // blob — not the multi-MB blob string itself. An assembly that imports
     // the same part N times (e.g. 4 identical wheels) carries N byte-identical blobs;
     // deserializing once and SHARING the resulting TShape across all N imports means
     // the later transform/tessellate/mass-prop steps operate on shared geometry and
     // dedup automatically. The shapes are only ever read or rigidly relocated
     // downstream (never mutated in place), so sharing is safe.
     ImportCache import_cache;
-    // Incremental owner maps (T-PERF7a) — rebuilt only for solids produced by executed
+    // Incremental owner maps — rebuilt only for solids produced by executed
     // features; restored from the checkpoint for the reused prefix.
     OwnerTopoMap face_owners, edge_owners;
     // Status chain as shared_ptrs so capture_ckpt does not re-copy prior statuses.
@@ -3013,7 +3013,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         }
         return out;
     };
-    // T-PERF7a: owner attribution for one solid id against source_of[sid]. Idempotent —
+    // Owner attribution for one solid id against source_of[sid]. Idempotent —
     // re-running for a re-executed solid overwrites face_owners[sid]/edge_owners[sid]. The
     // checkpoint carries only the resulting maps; histories never outlive their feature.
     auto update_owners_for = [&](const std::string& sid,
@@ -3048,7 +3048,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         edge_owners[sid] = std::move(eo);
     };
 
-    // Capture is O(map size) of SHARED pointers for results/statuses (T-PERF6a) —
+    // Capture is O(map size) of SHARED pointers for results/statuses —
     // unchanged FeatureResult entries are not deep-copied into each checkpoint.
     auto capture_ckpt = [&](std::size_t after_idx) {
         if (!use_cache) return;
@@ -3162,7 +3162,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // face (extrude/revolve) raises if faces is empty.
                 results[id] = SketchResult{std::move(faces), plane, sol.entities};
                 st.ok = true;
-                // T-BL49 — associative Convert Entities: a stale external ref (source
+                // Associative Convert Entities: a stale external ref (source
                 // selector no longer resolves; last-good projected geometry kept) is a
                 // WARNING, never a failure — the sketch still compiles and downstream
                 // features build on the last-good converted curves.
@@ -3189,7 +3189,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 json sk;
                 sk["entities"] = feat.value("entities", json::array());
                 sk["constraints"] = feat.value("constraints", json::array());
-                // External model references (T-3DXREF, doc_schema §3B): each
+                // External model references (doc_schema §3B): each
                 // resolved external_ref (refresh_sketch3d_external_refs already
                 // wrote last_point/stale onto the DOC before this compile ran —
                 // see session.cpp) becomes a fixed construction point entity with
@@ -3345,7 +3345,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     results[id] = PlaneResult{p};
 
                 } else if (method == "point_normal") {
-                    // Arbitrary origin + normal (NEW — T-3DDATUM): the direct SolidWorks-
+                    // Arbitrary origin + normal: the direct SolidWorks-
                     // style "plane through a point, normal to a vector" constructor. No
                     // existing method covered this exactly (three_point needs 3 points;
                     // parallel_point inherits its orientation from a base plane/face). This
@@ -4356,7 +4356,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 const std::string embedded = str_field(feat, "embedded_brep", "");
                 if (!embedded.empty()) {
                     src_desc = "embedded geometry";
-                    // Key by content hash, not the multi-MB blob string (T-PERF6a).
+                    // Key by content hash, not the multi-MB blob string.
                     const uint64_t emb_key = cc_fnv1a(embedded);
                     auto cit = import_cache.find(emb_key);
                     if (cit != import_cache.end()) {
@@ -5186,7 +5186,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
 
                 // Build the revolve tool. Single region: one MakeRevol (no boolean). Multi-
                 // region: revolve each face then fuse_many in ONE BOPDS pass (not pairwise
-                // O(N²) fuse fold — same T-PERF pattern as hole/bolt_circle tool unions).
+                // O(N²) fuse fold — same pattern as hole/bolt_circle tool unions).
                 // Normalize axis once for thin offset + revolve_face (revolve_face also
                 // normalizes, but we need the unit for the thin radial shift).
                 const Eigen::Vector3d axis_dir_u = axis_dir.normalized();
@@ -5652,7 +5652,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 const TopoDS_Shape& b = require_solid(results, b_id, "b");
 
                 TopoDS_Shape out;
-                if (op == "fuse")        out = ::geom::fuse_unify(a, b);  // T-PERF10: skip unify if no section edges
+                if (op == "fuse")        out = ::geom::fuse_unify(a, b);  // skip unify if no section edges
                 else if (op == "cut")    out = ::geom::cut_unify(a, b);
                 else if (op == "common") out = ::geom::common(a, b);
                 else throw std::runtime_error(
@@ -9506,7 +9506,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     std::chrono::steady_clock::now() - _feat_t0).count();
         status_ptrs.push_back(std::make_shared<const FeatureStatus>(st));
         result.statuses.push_back(std::move(st));
-        // T-PERF7a: attribute owners only for solids THIS feature produced (the
+        // Attribute owners only for solids THIS feature produced (the
         // reused prefix already carries face_owners/edge_owners from its checkpoint).
         // A plain geometry-only component compilation never consumes picking ownership.
         if (attribute_owners && st.ok) {
@@ -9618,7 +9618,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             }
 
             if (hit) {
-                // Reuse: COW mesh buffers (T-PERF6c) — assignment shares pos/nrm/idx;
+                // Reuse: COW mesh buffers — assignment shares pos/nrm/idx;
                 // only body_id/name are re-stamped (cheap scalars/string).
                 aicm::AicmBody b = hit->body;
                 b.body_id = body_num;
@@ -9673,8 +9673,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (!is_surface) {
                     GProp_GProps gp;
                     // Prefer triangulation written by tessellate_body just above:
-                    // ~3× faster than exact Gauss VolumeProperties on meshed solids
-                    // (see reports/profiling/2026-07-15). Falls back to exact geometry
+                    // ~3× faster than exact Gauss VolumeProperties on meshed solids.
+                    // Falls back to exact geometry
                     // when no triangulation is attached. Relative error ≪ 0.1% —
                     // display/stats only; mass eval still uses exact VolumeProperties.
                     BRepGProp::VolumeProperties(shape, gp,
@@ -9722,7 +9722,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     const auto _owner_t0 = std::chrono::steady_clock::now();
 
     // -------------------------------------------------- owner map (host picking)
-    // face_owners / edge_owners are maintained incrementally (T-PERF7a) and restored
+    // face_owners / edge_owners are maintained incrementally and restored
     // from CompileCkpt for the reused prefix — this phase only INVERTS them into the
     // host-facing {fid:{bodies,faces,edges}} map for surviving AICM bodies. On a
     // pure-prefix edit owner_ms collapses to this cheap inversion.

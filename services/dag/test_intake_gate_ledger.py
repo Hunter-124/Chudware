@@ -1,4 +1,4 @@
-"""test_intake_gate_ledger.py — Cross-mechanism no-re-ask test (T-F4 DoD §3).
+"""test_intake_gate_ledger.py — Cross-mechanism no-re-ask test.
 
 Contract: contracts/interaction.md §5 (replay on resume).
 
@@ -78,7 +78,7 @@ class TestSharedLedgerReplay:
 
     @pytest.mark.skip(
         reason=(
-            "T-V3: services/mcp shadows the installed mcp SDK as a PEP-420 namespace package "
+            "services/mcp shadows the installed mcp SDK as a PEP-420 namespace package "
             "when pytest runs from repo root — 'mcp.server is not a package'. "
             "intake_tools.py imports FastMCP at module level so the whole module is "
             "unimportable under this runner configuration. "
@@ -115,7 +115,7 @@ class TestSharedLedgerReplay:
 
     @pytest.mark.skip(
         reason=(
-            "T-V3: services/mcp shadows the installed mcp SDK as a PEP-420 namespace package "
+            "services/mcp shadows the installed mcp SDK as a PEP-420 namespace package "
             "when pytest runs from repo root — 'mcp.server is not a package'. "
             "intake_tools.py imports FastMCP at module level so the whole module is "
             "unimportable under this runner configuration. "
@@ -311,7 +311,7 @@ class TestAskUserReplay:
 
 
 # ---------------------------------------------------------------------------
-# §5 — Doc-scoped IntakeLedger: cross-session no-re-ask (T-BL25 DoD)
+# §5 — Doc-scoped IntakeLedger: cross-session no-re-ask
 #
 # The store is the doc's IntakeState meta record ("intake" key), round-tripped
 # as JSON into the .step+ (contract §5 — answers travel WITH the document, so

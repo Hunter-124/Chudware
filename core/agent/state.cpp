@@ -14,7 +14,7 @@ namespace chudware {
 namespace agent {
 
 
-// Advisor inject seam (mode overhaul D). C++ has no foreman battery; run.cpp may
+// Advisor inject seam. C++ has no advisory-engine battery; run.cpp may
 // set a non-empty advisory text when options.advisor is true AND an advisory is
 // available. Empty = no-op (byte-identical context to pre-overhaul).
 // thread_local: concurrent agent runs must not bleed advisory text across threads.

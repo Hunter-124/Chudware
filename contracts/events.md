@@ -8,7 +8,7 @@
 
 `status {phase, text?}` · `iteration {index, ok, done, notes, thinking, code, diff, dims, error,
 contact_sheet, stl_path, is_assembly, parts, fit}` · `plan {plan, raw}` — formerly emitted by
-`agent_design` (removed 2026-07-22, T-RF5); shapes kept here for historical reference.
+`agent_design` (removed 2026-07-22); shapes kept here for historical reference.
 
 ## 2. Document & simulation
 
@@ -17,7 +17,7 @@ contact_sheet, stl_path, is_assembly, parts, fit}` · `plan {plan, raw}` — for
 | `doc_progress` | `{stage: "rebuild"\|"tessellate", feature_id?, index?, total?, pct}` — emitted when a rebuild exceeds ~300 ms |
 | `sim_progress` | `{job_id, stage: "voxelize"\|"mesh"\|"assemble"\|"solve"\|"stream"\|"post", pct, text, trace_point?: {step, drag}}` |
 
-## 3. Orchestrator hierarchy (M9)
+## 3. Orchestrator hierarchy
 
 | kind | data |
 |---|---|
@@ -33,7 +33,7 @@ Every orchestrator event is ALSO appended to
 sidecar files `attempt_<stage>_<n>.txt`) — the Activity panel replays from this after restart,
 and tests assert against it.
 
-## 4. Telemetry — AI artifact capture (T-H1)
+## 4. Telemetry — AI artifact capture
 
 Extends the same `events.jsonl` stream. Full schema in `contracts/telemetry.md`.
 
@@ -44,8 +44,8 @@ Extends the same `events.jsonl` stream. Full schema in `contracts/telemetry.md`.
 | `doc_semantic_diff` | `{artifact_id, from_revision, to_revision, diff_ref, consent}` — emitted alongside `edited` action to record feature-level changes |
 
 Rules specific to telemetry events:
-- `consent` is stamped by the emitter from `consent_tier(cfg)`; the exporter (T-H5) re-checks.
-- `consent:"off"` events are written locally only; the exporter refuses to export them.
+- `consent` is stamped by the emitter from `consent_tier(cfg)`.
+- `consent:"off"` events are written locally only and are never exported.
 - `offline_enabled(cfg) ⇒ consent:"off"` — hard override, checked at config-resolution time.
 - `meta` tier: `input_ref`, `output_ref`, `edit_ops_ref` fields must be empty strings.
 

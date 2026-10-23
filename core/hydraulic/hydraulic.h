@@ -1,6 +1,6 @@
 // core/hydraulic/hydraulic.h — single dispatch entry for the hydraulic
 // worker surface. C++ port of the services/mcp/hydraulic_tools.py tool
-// envelopes (which the MCP server flips to core_bridge in T-RF20): each
+// envelopes (which the MCP server routes through core_bridge): each
 // method takes the tool's arguments as a params object and returns the
 // tool's result envelope, byte-identical to the Python handler for the same
 // inputs. Session state (the _HYD active-document / last-handoff

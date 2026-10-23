@@ -8,8 +8,7 @@
 //                    surviving bodies' AICM (aicm_handoff, or an explicit
 //                    params["aicm_out"] file), and returns the per-feature statuses
 //                    + body count + the AICM path. This is the strangler's
-//                    parity probe (Step 2 of the strangler migration recorded in
-//                    docs/REFACTOR_LOG.md): the host can
+//                    parity probe (Step 2 of the strangler migration): the host can
 //                    feed the SAME tree it sends to the Python worker and diff the
 //                    results, WITHOUT changing the production Python path.
 //
@@ -1136,7 +1135,7 @@ static json parts_make_impl(const json& params, int& rc) {
     }
 }
 
-// --- T-RF18: sourcing seams (production defaults for core/sourcing) ------------
+// --- sourcing seams (production defaults for core/sourcing) ------------
 // The sourcing lib is pure; every side effect is injected here: assembly/board
 // loading via the doc/ecad sessions, vendor index reads, model building via
 // parts+doc, and HTTP via the agent transport (8s cap; providers fail closed
@@ -3068,7 +3067,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             return emit(std::move(res), out_json, 0);
         }
         if (m == "sim_run_thermal") {
-            // T-SIM1: combined mesh + BC-resolve + steady-state heat-conduction solve
+            // Combined mesh + BC-resolve + steady-state heat-conduction solve
             // (fea_run_thermal on top of the fea_thermal kernel). Params: {"study": {...}}
             // where the study is step_path|points/tets, material.k_w_mk, fixtures with
             // temp_c (Dirichlet), loads of type "flux"/"convection". Returns {ok,
@@ -3517,7 +3516,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 fp.cells = params.value("cells", 96);
                 fp.n_steps = params.value("n_steps", 2000);
                 fp.progress_path = params.value("progress_path", std::string());
-                fp.job_id = params.value("job_id", std::string());  // T-RF16: sim_cancel registry key
+                fp.job_id = params.value("job_id", std::string());  // sim_cancel registry key
                 double re = 0.0;
                 chudware::sim::LbmResult r = chudware::sim::run_wind_tunnel(bp, bi, fp, &re);
                 if (!r.ok)
@@ -3614,7 +3613,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(std::move(r), out_json, 0);
             }
             if (m == "sim_cancel") {
-                // T-RF16: cancel a registered sim job (core/sim/sim_cancel.cpp — same
+                // Cancel a registered sim job (core/sim/sim_cancel.cpp — same
                 // registry semantics as agent cancel: idempotent, miss = cancelled:false).
                 json result = chudware::sim::sim_cancel(params.value("job_id", std::string()),
                                                       revokeThrough);
@@ -3707,7 +3706,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.value("sketch", std::string()),
                                 params.contains("action") ? params["action"] : json::object()),
                             out_json, 0);
-            // T-W2 sketch completion suite.
+            // Sketch completion suite.
             if (m == "sketch_auto_constrain")
                 return emit(chudware::doc::doc_sketch_auto_constrain(
                                 params.value("doc_id", std::string()),
@@ -4559,7 +4558,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
         } catch (const chudware::cam::OpError& oe) {
             return emit(oe.envelope(), out_json, 3);
         }
-        // --- T-RF18: sourcing/BOM/cost/spec-match (core/sourcing) ---
+        // --- sourcing/BOM/cost/spec-match (core/sourcing) ---
         // sourcing::call returns false for methods it does not own (fall through).
         {
             json src_result;
@@ -4567,7 +4566,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(std::move(src_result), out_json, 0);
             }
         }
-        // --- T-RF19: parts placement (core/parts/place) ---
+        // --- parts placement (core/parts/place) ---
         // The parts hub FTS stays Python — callers pass `record` (get_record seam is a
         // null fallback). parts_make/import_file/build_model wire to in-core paths.
         {
@@ -4632,7 +4631,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             }
             params["obstacles"] = std::move(obstacles);
         }
-        // --- T-RF19 leaf 4: hydraulic + piping (core/hydraulic, core/piping) ---
+        // --- hydraulic + piping (core/hydraulic, core/piping) ---
         // ojson preserves dict-insertion-order fidelity the Python envelopes rely on;
         // dump/parse conversion is shortest-round-trip exact.
         {
@@ -4644,7 +4643,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(json::parse(fp_result.dump()), out_json, 0);
             }
         }
-        // --- T-RF19 leaf 5: structural (core/structural) ---
+        // --- structural (core/structural) ---
         {
             json st_result;
             std::string st_err;
@@ -4652,7 +4651,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(std::move(st_result), out_json, 0);
             }
         }
-        // --- T-RF19 leaf 6: tolerance / mechanical / materials / dfm ---
+        // --- tolerance / mechanical / materials / dfm ---
         {
             json sm_result;
             std::string sm_err;
@@ -4663,7 +4662,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(std::move(sm_result), out_json, 0);
             }
         }
-        // --- T-RF15: firmware engine surface (core/firmware) ---
+        // --- firmware engine surface (core/firmware) ---
         // firmware::call returns false for methods still owned by the Python
         // oracle (fw_sim_run / fw_power_profile / fw_sensor_scenario).
         {

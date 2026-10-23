@@ -1,5 +1,5 @@
-"""Python oracle for the C++ transient thermal FEA kernel (core/sim/fea_thermal.cpp,
-T-FIN18) — the sim-stack differential-parity reference.
+"""Python oracle for the C++ transient thermal FEA kernel (core/sim/fea_thermal.cpp)
+— the sim-stack differential-parity reference.
 
 Scope (kept deliberately minimal, like the lbm.py oracle): tet4 elements, isotropic
 conductivity, Dirichlet fixed temperatures, per-load surface heat flux with a

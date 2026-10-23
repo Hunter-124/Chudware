@@ -1,5 +1,5 @@
-"""Shared session state + helpers for the ECAD MCP tool family modules (T-RF8 split of the
-former ecad_tools.py god file): the _ECAD session registry, autosave/recovery, provider
+"""Shared session state + helpers for the ECAD MCP tool family modules (split out of the
+former monolithic ecad_tools.py): the _ECAD session registry, autosave/recovery, provider
 budgets, symbol/pin/net helpers, ERC formatting, and the module-level sim summarizers.
 Imported by the ecad_*_tools family modules; re-exported through the ecad_tools facade."""
 
@@ -14,17 +14,17 @@ from typing import Any, Optional, Union
 from services.mcp import result_serving as _rs
 from services.mcp import core_bridge as cb
 
-# T-RF20: the ECAD document/session/netlist/ERC/DRC kernel now lives in the C++ core
+# The ECAD document/session/netlist/ERC/DRC kernel now lives in the C++ core
 # (core/ecad/*, dispatched via the ecad_*/sim_* RPCs — see worker_client.cpp). The direct
 # engine.ecad.{session,netlist,schema,ops} imports are replaced by the RPC-backed shims
 # below (ecad_session facade, netlist_mod facade, schema facade, OpError). Modules with NO
-# C++ counterpart stay as direct imports (re-homed by another T-RF leaf):
+# C++ counterpart stay as direct imports (re-homed under services/):
 #   - services.ecad.library.search/resolve (no ecad_library RPC; reads starter/kicad_sym data)
 #   - services.ecad.metadata (advisory eng-metadata layer, Python-only)
 #   - services.ecad.autosave (lazy, crash-recovery; Python-only)
 from services.ecad.library import search as lib_search  # STAYS: no ecad_library RPC surface
 
-try:  # T-FIN8 engineering-metadata layer — advisory, must never break the tools
+try:  # engineering-metadata layer — advisory, must never break the tools
     from services.ecad import metadata as _eng_metadata  # STAYS: no C++ counterpart
 except Exception:  # noqa: BLE001
     _eng_metadata = None  # type: ignore[assignment]
@@ -33,7 +33,7 @@ except Exception:  # noqa: BLE001
 class OpError(Exception):
     """A structured op error (ecad_ops.md §7). Carries ``code`` + ``detail`` for the RPC envelope.
 
-    Local home after T-RF20: raised by tool code exactly like engine.ecad.ops.OpError, and
+    Local home after the C++ port: raised by tool code exactly like engine.ecad.ops.OpError, and
     translated from core_bridge.CoreError (the C++ core's {code,message,detail} envelope) by
     ``_rpc`` so the family modules keep a single except type.
     """
@@ -206,7 +206,7 @@ class _SessionFacade:
         called autosave_session; no-op unless armed). engine.ecad.autosave STAYS (no C++
         counterpart)."""
         try:
-            from services.ecad import autosave as _eauto  # STAYS (T-RF20): no C++ counterpart
+            from services.ecad import autosave as _eauto  # STAYS: no C++ counterpart
             _eauto.autosave_session(session)
         except Exception:  # noqa: BLE001
             pass
@@ -294,7 +294,7 @@ class _SessionFacade:
 
     def swap_doc(self, session: EcadSession, new_doc: dict, *, base_revision: int | None = None,
                  warnings: list[str] | None = None, emit=None) -> dict:
-        """Wholesale doc replacement via the ecad_swap_doc RPC (T-RF21): validate ->
+        """Wholesale doc replacement via the ecad_swap_doc RPC: validate ->
         undo snapshot -> swap -> revision+1 -> compile, all inside the C++ session, so
         doc_id and undo history survive (the pre-RPC re-mint restarted both)."""
         resp = _rpc("ecad_swap_doc", {
@@ -313,7 +313,7 @@ ecad_session = _SessionFacade()
 
 
 def _attach_lib_defs(session: EcadSession, ops: list[dict]) -> list[dict]:
-    """Inline resolved symbol/footprint defs on add ops that lack one (T-RF20).
+    """Inline resolved symbol/footprint defs on add ops that lack one.
 
     The Python op handlers fell back to engine.ecad.library when an op carried no ``def``;
     the C++ core has NO library server-side (core/ecad/ops.cpp ensure_lib_def / resolve_fp_def
@@ -407,7 +407,7 @@ class _NetlistFacade:
         #    "?" nodes and simulates to garbage. Only an UNAMBIGUOUS name (one pin of the
         #    placed unit carries it) is aliased; a name never shadows a number key.
         #  - per-symbol sim_params extras (netlist.py:478-487): ac_mag/ac_phase (AC sweep
-        #    stimulus, Bug E-1) and eng_overrides (T-FIN8 metadata).
+        #    stimulus, Bug E-1) and eng_overrides (engineering metadata).
         by_ref = {sym.get("ref"): sym for sym in doc.get("symbols", [])}
         cache = doc.get("lib_cache", {}) or {}
         for comp in nl.get("components", []) or []:
@@ -513,7 +513,7 @@ def _is_power_component(comp: dict) -> bool:
 
 
 def _library():
-    """The Python ECAD library module, or None. STAYS (T-RF20): no ecad_library RPC."""
+    """The Python ECAD library module, or None. STAYS: no ecad_library RPC."""
     try:
         from services.ecad import library as _lib
         return _lib
@@ -675,7 +675,7 @@ def _update_from_sch(board_session, sch_session, *, prune: bool = False,
         raise OpError("engine_error",
                       "ecad_update_from_sch: sync returned no mutated_board", {})
     # C++ sync.cpp::new_footprint drops the component's fields/libid/eng_overrides
-    # (engine/ecad/sync.py:230-241, T-FIN8 parity gap) — backfill them from the netlist so
+    # (engine/ecad/sync.py:230-241 parity gap) — backfill them from the netlist so
     # board-side metadata resolution (engine.ecad.metadata) works from the board alone.
     comps_by_ref = {c.get("ref"): c for c in netlist.get("components", []) or []}
     for fp in mutated.get("footprints", []) or []:
@@ -777,7 +777,7 @@ def _sim_run(circuit: dict, study: dict, backend: str = "mna") -> dict:
     out to the ngspice binary) — that leg STAYS a direct import, mirroring
     circuit.simulate's resolve_backend dispatch so every backend choice degrades honestly.
     """
-    # STAYS (T-RF20): no C++ counterpart; re-homed from engine.sim to services/installer.
+    # STAYS: no C++ counterpart; re-homed from engine.sim to services/installer.
     from services.installer import ngspice_backend as _ng
 
     choice, note = _ng.resolve_backend(backend, circuit, study)
@@ -879,7 +879,7 @@ def enable_ecad_autosave() -> None:
     """Arm ECAD crash-recovery autosave for this server process. Called once from
     server._warm_core at startup. Best-effort.
 
-    NOTE (T-RF20): with ECAD sessions in the C++ core, autosave is no longer mutation-hooked
+    NOTE: with ECAD sessions in the C++ core, autosave is no longer mutation-hooked
     (the Python session drove it before); it fires from _autosave_all_open_ecad — the pre-heavy-op
     sweep — and from recovery. The OpenECAD docs remain invisible to the daemon's own part-doc
     autosave (core/hostd/autosave.cpp), so this stays armed in both engine modes."""
@@ -895,7 +895,7 @@ def recover_ecad_autosaved(scope: str = "recent"):
     and re-point _ECAD['current_*'] at the recovered docs so default-doc tool calls work. Returns
     the recovery list. Best-effort — never raises into startup.
 
-    T-RF20: the autosave FILES are still written by services.ecad.autosave (no C++ counterpart —
+    The autosave FILES are still written by services.ecad.autosave (no C++ counterpart —
     the direct import stays), but recovery now re-mints the doc into the C++ session registry
     (temp .ecad+ container + ecad_open) instead of the deleted Python session registry.
 
@@ -2102,7 +2102,7 @@ def _summarize_sweep_steps(runs: list, atype: str, probe: Optional[str],
     final transient value, or the peak AC magnitude) and build a plain-English 'rises/falls/holds'
     sentence so a weak model can read the trend without parsing the raw runs.
 
-    ``probe_order`` (T-RF20): the study's probe list. The C++ core returns result dicts with
+    ``probe_order``: the study's probe list. The C++ core returns result dicts with
     alphabetically-ordered keys (nlohmann::json), which scrambled the old insertion-order-based
     "first finite probe" heuristic (it could pick the stiff source net over the probed output);
     the caller's probe order restores the intended priority."""

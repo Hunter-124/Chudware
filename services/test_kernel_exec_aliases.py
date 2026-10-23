@@ -8,7 +8,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-# T-RF20: executor re-homed to services (see services/kernel_exec.py).
+# The executor was re-homed to services (see services/kernel_exec.py).
 from services.kernel_exec import run_code
 
 

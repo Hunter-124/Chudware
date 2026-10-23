@@ -11,7 +11,7 @@ its own files, so the manifest contract is untouched (contract `plm.md` top:
 additive sibling dirs readers MUST ignore). This module owns the shapes + pure
 helpers; the vault does the shadow-tree I/O.
 
-Future-proofing (Hunter 2026-07-07): every *actor* (creator/assignee) is an
+Future-proofing (2026-07-07): every *actor* (creator/assignee) is an
 object ``{kind, id, display}`` with ``kind:"profile"`` today; an ``org_member``
 kind attaches later with no migration. Every mutation is routed through
 :mod:`permissions` (allow-all today) so organization permissions bolt on at one

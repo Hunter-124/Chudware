@@ -1,7 +1,6 @@
 """Mega-20 fixes — A20 rail rebond (no #PWR ref), B20 board doc_id on DRC.
 
-Grounded in mega-19 a2 live ledger
-(reports/runs/mega-19/attempt-2-primary-graded-wire-zero/ledger.json):
+Grounded in the mega-19 a2 live ledger:
 
   A20 — ecad_add_power returns no symbol ref; forced wires cannot target rails.
         power_not_driven persists until ports sit on power_in pin xy.

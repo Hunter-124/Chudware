@@ -1,4 +1,4 @@
-"""Tests for the parts-library worker-RPC bridge (T-U2).
+"""Tests for the parts-library worker-RPC bridge.
 
 Validates the worker_rpc.WORKER_METHODS shim:
   - part_search  → populates results, degrades gracefully when hub unavailable

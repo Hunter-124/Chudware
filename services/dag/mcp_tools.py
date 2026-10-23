@@ -1,8 +1,8 @@
 """mcp_tools.py — MCP tool handlers for the five DAG orchestrator tools.
 
 Contract: contracts/dag_schema.md §9–§11.
-Registered by: services/mcp/server.py (append-only block — T-A4).
-Wired by: T-A4. Resume path is executor.resume() — ONE implementation (driver notes).
+Registered by: services/mcp/server.py (append-only block).
+Resume path is executor.resume() — ONE implementation.
 
 Tools:
   dag_plan    Run the mission-planner node and return a graph JSON that the caller
@@ -92,8 +92,8 @@ def _load_run_status(run_id: str, runs_dir: Path) -> dict[str, Any] | None:
 
     Honest caveat: node-level status comes from the last executor.run()/resume()
     return value, which is NOT persisted by dag_status itself.  Only the graph
-    topology is restart-safe; per-node verdicts are in-session only unless
-    T-F17 adds a narration DB.  dag_status documents this limitation.
+    topology is restart-safe; per-node verdicts are in-session only until
+    a narration DB is added.  dag_status documents this limitation.
     """
     if in_cell():
         record = resolve_run(run_id)
@@ -417,7 +417,7 @@ def register_dag_tools(mcp) -> None:
     """Register the five DAG orchestrator MCP tools onto *mcp*.
 
     Follows the same register_*_tools(mcp) pattern as hydraulic_tools / cost_tools.
-    Appended to services/mcp/server.py by T-A4 (append-only).
+    Appended to services/mcp/server.py (append-only).
     """
 
     @mcp.tool()
@@ -839,8 +839,8 @@ def register_dag_tools(mcp) -> None:
 
         NOTE: per-node status verdicts are only fully available in the same session
         as the run/resume call; dag_status reports topology from the graph sidecar
-        and checkpoint existence from the DB.  T-F17 mission-control UX will add a
-        narration DB for full cross-restart node verdicts.
+        and checkpoint existence from the DB.  A future mission-control
+        narration DB will provide full cross-restart node verdicts.
 
         Args:
             run_id:    UUID4 of the run to inspect.  Omit it to inspect the most
@@ -1164,7 +1164,7 @@ def register_dag_tools(mcp) -> None:
 def register_dag_replan_tools(mcp) -> None:
     """Register the dag_replan MCP tool onto *mcp*.
 
-    Appended by T-F12 (append-only per server.py contract).
+    Appended per the server.py append-only contract.
     """
 
     @mcp.tool()
@@ -1184,7 +1184,7 @@ def register_dag_replan_tools(mcp) -> None:
         with retry_budget), merges the new nodes into the persisted graph sidecar,
         then resumes the run via executor.resume().
 
-        Answered gate questions are NOT re-asked: the T-F4 ledger is stored in the
+        Answered gate questions are NOT re-asked: the interaction ledger is stored in the
         SqliteSaver checkpoint and replayed automatically on resume.
 
         Args:

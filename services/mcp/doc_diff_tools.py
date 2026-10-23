@@ -18,7 +18,7 @@ schema and delegated to :func:`services.plm.ecad_diff.ecad_diff`, which returns 
 id-keyed nets/components/footprints/tracks shape documented there instead of the
 feature-tree shape above.
 
-Consumers: T-H1 correction traces, T-F17 change cards, T-BL10 PDM-lite, GSL diff().
+Consumers: correction traces, change cards, PDM-lite, GSL diff().
 
 Registration: register_doc_diff_tools(mcp) → adds tool ``doc_diff``.
 """

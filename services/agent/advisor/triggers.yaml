@@ -214,7 +214,7 @@ triggers:
     budget_tokens: 200
     cooldown_turns: 10
 
-  # T-DP6 pre-op advisory injection triggers (append-only, per DP3 coordination note)
+  # Pre-op advisory injection triggers (append-only)
   # These inject context BEFORE the model operates on geometry, so relevant
   # process/clearance facts are in context when the op executes.
 
@@ -281,7 +281,7 @@ triggers:
     budget_tokens: 200
     cooldown_turns: 8
 
-  # T-DP3: sheet-metal bend — contract design_pipeline.md §8 "helper to add".
+  # Sheet-metal bend — contract design_pipeline.md §8 "helper to add".
   # Fires the bend_allowance calc so a folded flange's flat length is computed,
   # never recalled. Numbers: services/research/calcs/bend_allowance.py.
   - id: sheet_bend
@@ -310,7 +310,7 @@ triggers:
     budget_tokens: 250
     cooldown_turns: 8
 
-  # T-DP3: molded draft — contract design_pipeline.md §8 "helper to add".
+  # Molded draft — contract design_pipeline.md §8 "helper to add".
   # Fires the draft_check calc so a molded wall gets a mandatory release draft
   # sized to its draw depth. Numbers: process_profiles.py injection + draft_check.py.
   - id: molded_draft

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """oracle_import_audit — no authored Python may import the deleted engine package.
 
-The Python->C++ migration is complete (T-RF21): ``engine_oracle/`` and its repo-root
+The Python->C++ migration is complete: ``engine_oracle/`` and its repo-root
 ``engine`` symlink are deleted, so any
 
     from engine... import ...   /   import engine...

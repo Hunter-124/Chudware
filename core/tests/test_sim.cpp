@@ -997,7 +997,7 @@ TEST_CASE("LBM CUDA failure observes pending cancellation before CPU fallback") 
 #endif
 
 
-// ── sim_cancel: run/cancel registry + cooperative LBM cancel (T-RF16) ───────────
+// ── sim_cancel: run/cancel registry + cooperative LBM cancel ────────────────────
 
 TEST_CASE("sim_cancel registry: running job cancels, unknown/finished reports cleanly") {
     using chudware::sim::sim_cancel;

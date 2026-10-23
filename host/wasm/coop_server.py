@@ -4,7 +4,7 @@
 Usage:
   python3 host/wasm/coop_server.py [port] [directory]
 
-Defaults: port 8765, directory ~/chudware-web/app
+Defaults: port 8765, directory host/build-wasm/app (where `./build.sh wasm` stages)
 """
 from __future__ import annotations
 
@@ -27,7 +27,8 @@ class CoopHandler(http.server.SimpleHTTPRequestHandler):
 
 def main() -> int:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
-    directory = os.path.expanduser(sys.argv[2] if len(sys.argv) > 2 else "~/chudware-web/app")
+    default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build-wasm", "app")
+    directory = os.path.abspath(os.path.expanduser(sys.argv[2] if len(sys.argv) > 2 else default_dir))
     os.chdir(directory)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), CoopHandler)
     print(f"[coop_server] serving {directory} on http://127.0.0.1:{port}/  (COOP/COEP on)")

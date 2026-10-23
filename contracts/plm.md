@@ -2,26 +2,25 @@
 
 > **Frozen — changes require a version bump to `aicad.plm/2`.** Append-only per
 > the `contracts/README.md` frozen-seam policy; any change to an existing field's
-> meaning, or to the lock/remote protocol, needs integrator sign-off and a new
+> meaning, or to the lock/remote protocol, needs maintainer sign-off and a new
 > schema string. New OPTIONAL fields and new `reserved` tool slots are additive
 > and do not bump the string.
 >
 > **Contract-first.** This file is frozen BEFORE the storage engine
-> (`services/plm/`, T-R2) and the `plm_*` MCP tools. Design source of truth:
-> [docs/design/PLM_VERSION_CONTROL_PLAN.md](../docs/design/PLM_VERSION_CONTROL_PLAN.md)
-> (Pillar 19, Workstream R). Supersedes backlog T-BL15 + T-BL10.
+> (`services/plm/`) and the `plm_*` MCP tools. Design source of truth:
+> [docs/design/PLM_VERSION_CONTROL_PLAN.md](../docs/design/PLM_VERSION_CONTROL_PLAN.md).
+> Supersedes the earlier PDM-lite design.
 >
-> **Builds on `contracts/doc_schema.md`.** History snapshots are the T-H2
+> **Builds on `contracts/doc_schema.md`.** History snapshots are the
 > **canonical `document.json`** (Appendix A: sorted keys, lossless numbers, **no
 > timestamps**, indent=2, UTF-8 no-BOM). Semantic diffing reuses the existing
 > `doc_diff` tool; visual compare reuses `eval_compare`. This contract does NOT
 > re-specify either — it specifies only the vault, manifest, history, lock, and
 > remote seams around them.
 >
-> **OSS-first.** Git binding chosen in
-> [docs/review/PLM_OSS_SURVEY.md](../docs/review/PLM_OSS_SURVEY.md): **dulwich (Apache-2.0
+> **OSS-first.** Git binding: **dulwich (Apache-2.0
 > arm), primary; subprocess `git` optional accelerator; pygit2 declined.**
-> Machine-checked by `services/plm/canonical.py` (T-R2); fixtures in
+> Machine-checked by `services/plm/canonical.py`; fixtures in
 > `contracts/fixtures/plm/`.
 
 ## 0. Conventions & the byte-stability law
@@ -101,7 +100,7 @@ items/<item_id>/geometry.step    # frozen B-rep — PRESENT ONLY IN RELEASE COMM
 ### 3.1 When a commit is cut
 
 - **On every explicit user save** (not autosave — autosave keeps its separate
-  T-Q2 crash-recovery ring, plan §3.5). One commit covers the **entire** shadow
+  crash-recovery ring, plan §3.5). One commit covers the **entire** shadow
   tree at that instant.
 - Commit **kind** is recorded in the commit metadata and mirrored into
   `meta.json` (§3.4); it is one of **`auto` | `checkpoint` | `release` |
@@ -131,7 +130,7 @@ delete, amend, or reorder history.**
   "item_id": "i0a1b2c3",
   "entry_kind": "checkpoint",
   "authored_at": "2026-07-03T18:20:05Z",
-  "author": {"kind": "user", "id": "hunter", "display": "Hunter"},
+  "author": {"kind": "user", "id": "alex", "display": "Alex"},
   "message": "Increased wall 3→5 mm, added 4× M6 bolt circle",
   "ai": null,
   "doc_uuid": "6f0c…",
@@ -149,7 +148,7 @@ delete, amend, or reorder history.**
        "run_id": "run_…", "artifact_id": "a7f3…", "reversible": true}
 ```
 
-  `artifact_id`/`run_id` join to the T-H1 telemetry `ai_artifact` envelope so
+  `artifact_id`/`run_id` join to the telemetry `ai_artifact` envelope so
   every AI action is attributed and one-click reversible (§8). `reversible` is
   always `true` in v1 (every entry is discardable by restore).
 - Timestamps live **only** here (and in git commit metadata), never in
@@ -219,7 +218,7 @@ A **release** (`kind:"release"` commit) is atomic and does all of:
    no stale refs (assembly using a superseded component rev), verify battery not
    failing, no unsaved working changes.
 2. **Rev stamp.** `manifest.items[item].rev` increments (`A` on first release);
-   the rev letter is stamped on the drawing title block (T-R4).
+   the rev letter is stamped on the drawing title block.
 3. **Lifecycle.** Item → `Released`; the prior released rev → `Superseded`.
 4. **Geometry freeze.** `items/<item_id>/geometry.step` is written into this
    commit (the only commits that carry it) — a released rev is byte-exact
@@ -333,30 +332,30 @@ story in v1 — there is no merge UI and no conflict markers.
 
 ## 7. `plm_*` MCP tool surface
 
-All registered by `services/mcp/server.py` (T-R2/R4/R7), all returning the §0
+All registered by `services/mcp/server.py`, all returning the §0
 envelope. Signatures take one object; responses are the shape shown.
 
-| tool | request | success response | role / task |
+| tool | request | success response | role |
 |---|---|---|---|
-| `plm_init` | `{path}` | `{ok, project_id, manifest}` | Zero-config: create `.aicadvault/`, seed `manifest.json`, register existing docs. Idempotent (re-init on an existing vault just opens). **T-R2** |
-| `plm_open` | `{path}` | `{ok, project_id, manifest}` | Open a project folder; auto-`plm_init` if no vault exists (zero-config, §8). **T-R2** |
-| `plm_save` | `{project_id, kind?}` | `{ok, commit, entry}` | Cut a history entry over the whole shadow tree. `kind` ∈ `auto|checkpoint` (default `auto`). **`release` is NOT accepted here** — releases require an item + note and go through `plm_release`; passing `kind:"release"` returns `{ok:false, reason:"invalid_mode"}`. **T-R2** |
-| `plm_checkpoint` | `{project_id, message?, item_id?}` | `{ok, commit, entry}` | Convenience for `plm_save kind:"checkpoint"`; drafts `message` from `doc_diff` if omitted. **T-R2** |
-| `plm_release` | `{project_id, item_id, message}` | `{ok, commit, rev, bom_freeze?}` | Run pre-flight (§5), freeze geometry+BOM, stamp rev+lifecycle. **T-R4** |
-| `plm_history` | `{project_id, item_id?, limit?}` | `{ok, entries:[…]}` | The timeline (filtered per item if given): each entry = `{commit, kind, authored_at, author, message, thumbnail_ref, summary}`. **T-R2** |
-| `plm_restore` | `{project_id, commit, item_id?}` | `{ok, commit, entry}` | Forward-only restore (§3.3). **T-R2** |
-| `plm_compare` | `{project_id, commit_a, commit_b, item_id}` | `{ok, doc_diff, eval_compare?}` | **Reuses** `doc_diff` (semantic) + `eval_compare` (visual); this tool orchestrates, it does not re-specify diffing. **T-R3/R5** |
-| `plm_status` | `{project_id}` | `{ok, items:[…], head, dirty, ai_mode, remotes, locks}` | Project state for the Hub/badges. **T-R2** |
-| `plm_set_ai_mode` | `{project_id, mode}` | `{ok, ai_mode}` | `mode` ∈ `manual|assisted|managed` (§4). **T-R3** |
-| `plm_add_remote` | `{project_id, kind, url?, name}` | `{ok, remote}` | Register a remote profile (§6.1); `chudware-cloud` accepted config-only. **T-R7** |
-| `plm_sync` | `{project_id, remote_id}` | `{ok, pulled, pushed, conflicts_copied:[…]}` | One-button sync (§6.3–6.4). `chudware-cloud` → `reserved_remote`. **T-R7** |
-| `plm_lock` | `{project_id, item_id, remote_id}` | `{ok, lock}` | Advisory lock via CAS (§6.3). **T-R7** |
-| `plm_unlock` | `{project_id, item_id, remote_id}` | `{ok}` | Release a lock via CAS. **T-R7** |
+| `plm_init` | `{path}` | `{ok, project_id, manifest}` | Zero-config: create `.aicadvault/`, seed `manifest.json`, register existing docs. Idempotent (re-init on an existing vault just opens). |
+| `plm_open` | `{path}` | `{ok, project_id, manifest}` | Open a project folder; auto-`plm_init` if no vault exists (zero-config, §8). |
+| `plm_save` | `{project_id, kind?}` | `{ok, commit, entry}` | Cut a history entry over the whole shadow tree. `kind` ∈ `auto|checkpoint` (default `auto`). **`release` is NOT accepted here** — releases require an item + note and go through `plm_release`; passing `kind:"release"` returns `{ok:false, reason:"invalid_mode"}`. |
+| `plm_checkpoint` | `{project_id, message?, item_id?}` | `{ok, commit, entry}` | Convenience for `plm_save kind:"checkpoint"`; drafts `message` from `doc_diff` if omitted. |
+| `plm_release` | `{project_id, item_id, message}` | `{ok, commit, rev, bom_freeze?}` | Run pre-flight (§5), freeze geometry+BOM, stamp rev+lifecycle. |
+| `plm_history` | `{project_id, item_id?, limit?}` | `{ok, entries:[…]}` | The timeline (filtered per item if given): each entry = `{commit, kind, authored_at, author, message, thumbnail_ref, summary}`. |
+| `plm_restore` | `{project_id, commit, item_id?}` | `{ok, commit, entry}` | Forward-only restore (§3.3). |
+| `plm_compare` | `{project_id, commit_a, commit_b, item_id}` | `{ok, doc_diff, eval_compare?}` | **Reuses** `doc_diff` (semantic) + `eval_compare` (visual); this tool orchestrates, it does not re-specify diffing. |
+| `plm_status` | `{project_id}` | `{ok, items:[…], head, dirty, ai_mode, remotes, locks}` | Project state for the Hub/badges. |
+| `plm_set_ai_mode` | `{project_id, mode}` | `{ok, ai_mode}` | `mode` ∈ `manual|assisted|managed` (§4). |
+| `plm_add_remote` | `{project_id, kind, url?, name}` | `{ok, remote}` | Register a remote profile (§6.1); `chudware-cloud` accepted config-only. |
+| `plm_sync` | `{project_id, remote_id}` | `{ok, pulled, pushed, conflicts_copied:[…]}` | One-button sync (§6.3–6.4). `chudware-cloud` → `reserved_remote`. |
+| `plm_lock` | `{project_id, item_id, remote_id}` | `{ok, lock}` | Advisory lock via CAS (§6.3). |
+| `plm_unlock` | `{project_id, item_id, remote_id}` | `{ok}` | Release a lock via CAS. |
 
 **Reserved (named, NOT specified by `aicad.plm/1`)** — slots so the tool family +
 enums are stable; do not implement under this contract:
 `plm_branch`, `plm_merge`, `plm_where_used` (where-used is derived; its dedicated
-tool is reserved for T-R6's Hub), `plm_cloud_login` (Pillar-12 gate).
+tool is reserved for the project Hub), `plm_cloud_login` (Pillar-12 gate).
 
 **Reason codes** (`reason` field): `no_vault`, `invalid_project`, `invalid_item`,
 `preflight_failed`, `stale_ref`, `unsaved_changes`, `locked`, `contended`,
@@ -366,16 +365,16 @@ tool is reserved for T-R6's Hub), `plm_cloud_login` (Pillar-12 gate).
 
 The `plm_*` MCP tools in §7 are the **user/agent-driven** surface (one object in,
 the envelope out). Separately, in-process AI machinery — specifically the
-**T-W18 PLM bridge** (`services/agent/plm_bridge.py`, contract
+**PLM bridge** (`services/agent/plm_bridge.py`, contract
 `advisor.md §15 aicad.plmlink/1`) — needs a thin Python client, **not** a round
 trip through MCP, to land AI-authored milestone checkpoints with full attribution.
-That client is a normative seam of `aicad.plm/1` so T-R2 builds exactly what the
+That client is a normative seam of `aicad.plm/1` so the vault provides exactly what the
 already-shipped bridge imports; it is not a parallel API.
 
 - **Class + import path (frozen):** `services.plm.client.PLMVaultClient`. The
   bridge imports it lazily behind the `CHUDWARE_PLM_BRIDGE=1` feature flag and falls
-  back to its in-memory `MockVault` when the import fails (T-R2 not yet merged) or
-  the flag is unset. T-R2 MUST provide `PLMVaultClient` at exactly this dotted
+  back to its in-memory `MockVault` when the import fails (vault unavailable) or
+  the flag is unset. `services/plm` MUST provide `PLMVaultClient` at exactly this dotted
   path with the surface below; renaming either is a breaking change (version bump).
 - **Surface (frozen — must satisfy the `VaultClient` Protocol in `plm_bridge.py`
   verbatim):**
@@ -397,7 +396,7 @@ class PLMVaultClient:  # duck-types services.agent.plm_bridge.VaultClient
   and additionally, when `author_kind=="ai"`, stamps `meta.json.author.kind:"ai"`
   and the `ai` block (§3.4) from `run_id` (→ `ai.run_id`) and `artifact_id`
   (→ `ai.artifact_id`; the bridge passes the `buildgraph_node` here), joining the
-  T-H1 telemetry envelope. It returns the **same success shape as
+  telemetry envelope. It returns the **same success shape as
   `plm_checkpoint`**: `{ok, commit, entry}` where `entry` carries at minimum
   `{commit, kind, authored_at, author, message}` (and the `ai` block for AI
   entries). Failure returns the §0 envelope `{ok:false, reason, hint}`.
@@ -414,7 +413,7 @@ class PLMVaultClient:  # duck-types services.agent.plm_bridge.VaultClient
 - **`project_id_for_run(run_id)` is BEST-EFFORT, not a mandated registry.** v1
   MAY return `None`; there is no required run→project backing store in
   `aicad.plm/1`. The bridge's primary path passes `project_id` explicitly to
-  `on_milestone(...)`, and `project_id_for_run` is only the fallback lookup. T-R2
+  `on_milestone(...)`, and `project_id_for_run` is only the fallback lookup. The vault
   MAY back it with an in-vault run→project map if convenient, but callers MUST NOT
   depend on it resolving; a `None` return with no explicit `project_id` simply
   queues the link. Making this a mandatory registry is a future (`aicad.plm/2`)
@@ -453,7 +452,7 @@ control").
 
 4. **AI actions are attributed and reversible. MUST.** Every history entry cut by
    AI (AI-managed mode, or a copilot task) MUST carry `author.kind:"ai"` + the
-   `ai` attribution block (§3.4) joining to the T-H1 telemetry envelope, MUST be
+   `ai` attribution block (§3.4) joining to the telemetry envelope, MUST be
    visibly marked as AI-authored in the timeline, and MUST be reversible in one
    step (restore of the prior entry). AI versioning is an **assist tier layered
    on the manual buttons, never an exclusive mode** (plan §2); manual controls
@@ -465,7 +464,7 @@ control").
 
 ## 9. Relationship to existing contracts (no regressions)
 
-- **`doc_schema.md` Appendix A (T-H2):** snapshots ARE the canonical
+- **`doc_schema.md` Appendix A:** snapshots ARE the canonical
   `document.json`; the byte-stability law (§0) is inherited verbatim. No conflict
   — this contract only adds sibling files (`meta.json`, `manifest.json`) that are
   explicitly exempt from byte-stability (they carry timestamps, as Appendix A
@@ -474,13 +473,13 @@ control").
 - **`doc_ops.md`:** ops remain transient (no persistent op log); PLM is
   snapshot-based (plan §3.1). Undo/redo stay session-scoped and are NOT PLM
   history (plan §3.5).
-- **Autosave (T-Q2):** unchanged crash-recovery ring; PLM entries cut on explicit
+- **Autosave:** unchanged crash-recovery ring; PLM entries cut on explicit
   save only, so the timeline stays curated (plan §3.5).
 - **Configurations (`doc_schema.md §9`):** remain the variants mechanism; PLM
   versions the whole document including its configurations (plan §3.5, §6).
-- **Telemetry (`telemetry.md` / T-H1):** AI PLM actions route through the existing
+- **Telemetry (`telemetry.md`):** AI PLM actions route through the existing
   `ai_artifact` envelope; §3.4 `ai` block references its `artifact_id`/`run_id`.
-- **PLM bridge (`advisor.md §15` `aicad.plmlink/1` / T-W18):** the already-shipped
+- **PLM bridge (`advisor.md §15` `aicad.plmlink/1`):** the already-shipped
   `services/agent/plm_bridge.py` is a **consumer** of this contract, not a parallel
   one. Its agent milestone checkpoints (`plan_ratified`, `part_done`,
   `mission_done`, `stage_exit:{part_verify,assembly,sim}`, `change_request`) land
@@ -663,7 +662,7 @@ unaffected: it still returns one entry per scope-matching commit.
 §1 called the vault history "the git commit DAG (**linear in v1**)" and §7 reserved
 `plm_branch`/`plm_merge` as *do not implement*. Reality diverged: `services/plm/branches.py`
 writes genuine two-parent merge commits into `refs/aicad/branches/<name>`, and the GUI has
-exposed branch create/switch/merge from the PLM overview panel since T-R7. This appendix
+exposed branch create/switch/merge from the PLM overview panel. This appendix
 records the surface that already exists and the additive reader/decoration layer built on
 top of it. It changes no existing signature and no existing response key.
 
@@ -726,7 +725,7 @@ entries ignore the map. `Vault.save`/`Vault.checkpoint` carry this internally as
 `ai_by_item`; it is not written into `document.json` and therefore preserves the
 byte-stability law.
 
-This is the T-DP14 multi-part rule: a shared design-pipeline boundary may produce
+This is the multi-part rule: a shared design-pipeline boundary may produce
 one Project History point while each changed item's timeline still joins to the
 participant buildgraph node that produced it.
 

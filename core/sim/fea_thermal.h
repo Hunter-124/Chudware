@@ -27,7 +27,7 @@
 // so that ∫k∇N∇N dV, ∫q N dS and h∫N N dS all come out in W/K · K = W consistently. The
 // resulting nodal temperatures are in the same K/°C scale as T_fixed / T_amb.
 //
-// TRANSIENT (T-FIN18). fea_thermal_transient() adds the capacitance term
+// TRANSIENT. fea_thermal_transient() adds the capacitance term
 //
 //     C dT/dt + K T = f(t),    C_ij = ∫_V rho·cp N_i N_j dV
 //
@@ -106,15 +106,15 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
                                 const std::vector<ThermalConvection>& convections,
                                 int nodes_per_elem = 4);
 
-// ── Transient (T-FIN18) ──────────────────────────────────────────────────────────────────
+// ── Transient ────────────────────────────────────────────────────────────────────────────
 
 // A piecewise-constant (sample-and-hold) load schedule s(t): scale s = scales[i] holds on
 // [times[i], times[i+1]) — times ascending, times[0] == 0, sizes equal. The last scale holds
 // to t_end (or, when period > 0, to the end of the period, after which the whole pattern
 // repeats: s(t) = s(fmod(t, period))). An EMPTY schedule means s(t) = 1 (always on).
 //
-// This shape is a direct target for the aicad.powerprofile/1 per-rail duty-cycle profiles
-// (T-FIN7): a rail with duty d and period p maps to {times:[0, d*p], scales:[1, 0],
+// This shape is a direct target for the aicad.powerprofile/1 per-rail duty-cycle profiles:
+// a rail with duty d and period p maps to {times:[0, d*p], scales:[1, 0],
 // period:p}; an arbitrary residency timeline maps to its own breakpoint list.
 struct ThermalSchedule {
     std::vector<double> times;   // ascending breakpoints, starting at 0 (seconds)

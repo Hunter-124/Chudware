@@ -1,4 +1,4 @@
-// Emulation power/duty-cycle profile — aicad.powerprofile/1 (T-RF15 port of
+// Emulation power/duty-cycle profile — aicad.powerprofile/1 (C++ port of
 // engine_oracle/firmware/powerprofile.py). BOOKKEEPING, not SPICE: datasheet
 // envelope currents scaled by observed/derived duty cycles; every figure names
 // its source heuristic; unknown currents stay null. contracts/firmware_rpc.md

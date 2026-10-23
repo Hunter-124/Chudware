@@ -293,7 +293,7 @@ std::vector<double> cylinder_band(double cx, double cz, double r, double y0,
     return points;
 }
 
-// PART 4 — the nested-cylinder SADDLE of the ME 490 hinge latch: a 62 deg
+// PART 4 — the nested-cylinder SADDLE of a rover hinge latch: a 62 deg
 // cylindrical shell segment (bore Ø12.6, back Ø16) seated coaxially over a
 // Ø12.0 pin, so the clearance is 0.300 mm everywhere and the arc ends in two
 // SHARP radial edges. It is the shape a bisection wave handles worst — the
@@ -352,7 +352,7 @@ void check_local_region(const MeshOut& m, double requested,
                  << (m.local_refine_resplit ? ", re-split" : ""));
     REQUIRE_MESSAGE(m.local_refine_waves > 0,
                     what << ": no bisection wave ran, so nothing under test");
-    // The two capability gaps the ME 490 hinge packet named: a region that is
+    // The two capability gaps the hinge-latch study exposed: a region that is
     // fine AT the interface and shredded one layer out.
     CHECK_MESSAGE(m.local_refine_cells_below_floor_after == 0u, what);
     CHECK_MESSAGE(m.local_refine_jacobian_min_after >= jacobian_floor, what);
@@ -551,8 +551,8 @@ TEST_CASE("contact: interface_size_mm beats the fill's own size floor or refuses
 // request coarser than the background used to fail the whole mesh with
 // "GradedSizing: need 0 < h_min <= h_max" — while every request AT or below the
 // background that bisection could not reach was refused as undeliverable. That
-// pair closed the box on the O-22 hinge saddle
-// (CONTACT_BLOCKED_2026-09-06b §4: "No legal value exists"), because the
+// pair closed the box on a rover hinge saddle
+// ("No legal value exists"), because the
 // undeliverable refusal's own advice was a size above the background.
 //
 // "No coarser than 12 mm" inside an 8 mm mesh is already true everywhere, so the
@@ -762,7 +762,7 @@ TEST_CASE("contact: a sub-mm interface on a tight curved bore is delivered") {
 }
 
 // ── A locally-refined region has to be a MESH, not just a fine interface ─────
-// The ME 490 hinge-latch packet (CONTACT_RESOLVED_2026-09-06b) shipped a
+// A hinge-latch study shipped a
 // contact study whose interface size was exactly what was asked for and whose
 // mesh AWAY from the interface was debris: `aspect_max` 263, `jacobian_min`
 // 0.0029, 50 cells under polymesh's 0.02 shape floor. That is not a sizing

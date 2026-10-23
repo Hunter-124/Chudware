@@ -87,7 +87,7 @@ struct AsmMateStatus {
 
 // One RESOLVED mate reference: which component owns it + the local-frame geometry
 // its selector resolved to. Exposed on AssemblyResult so downstream consumers (the
-// motion-dynamics joint builder, T-FIN20) can anchor joint reactions at real mate
+// motion-dynamics joint builder) can anchor joint reactions at real mate
 // geometry without re-running selector resolution.
 struct AsmMateRefGeom {
     int ref_index = 0;                       // 0 or 1 (mate refs order)
@@ -110,7 +110,7 @@ struct AssemblyResult {
     std::string dof_summary;
     std::map<std::string, std::vector<double>> transforms;  // component_id -> 16f (solved)
     chudware::mate::WarmMap warm;                               // component_id -> (t,w)
-    // mate_id -> its resolved refs (only refs whose selector resolved; T-FIN20 dynamics)
+    // mate_id -> its resolved refs (only refs whose selector resolved; used by dynamics)
     std::map<std::string, std::vector<AsmMateRefGeom>> mate_geometry;
 };
 

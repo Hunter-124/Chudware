@@ -1,5 +1,5 @@
-// core/parts/place.h — universal standard-part insertion router (T-RF19:
-// place.py port). C++ port of engine_oracle/parts_hub/place.py: routes a
+// core/parts/place.h — universal standard-part insertion router.
+// C++ port of engine_oracle/parts_hub/place.py: routes a
 // PartRecord.geometry_ref to the correct domain insertion path, landing an
 // EDITABLE document-schema op in every case (R1 parity — never an opaque body).
 //

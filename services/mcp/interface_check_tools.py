@@ -1,6 +1,6 @@
-"""interface_check_tools.py — MCP tool: design-time interface alignment checker (T-BL49).
+"""interface_check_tools.py — MCP tool: design-time interface alignment checker.
 
-Cut 2026-07-04 from a live directive: give the AI the tooling to check that component
+Purpose: give the AI the tooling to check that component
 interfaces in an assembly LINE UP — the class of layout error that passes interference
 (nothing overlaps) but is still wrong: bolt holes that don't register, mating bores that
 aren't coaxial, contact faces that aren't flush, a screw that can't pass the stack.
@@ -8,22 +8,22 @@ aren't coaxial, contact faces that aren't flush, a screw that can't pass the sta
 Contract / registration:
   * Registered by services/mcp/server.py (append-only) as `interface_check`.
   * Wired into the design_review battery + services/verify/battery.py so verify_battery /
-    design_review can run it, and cad_guide('review') mentions it (WORKFLOW.md §6 freshness).
-  * JSON output shape is STABLE and documented below — T-BL50 (plan-first workflow) consumes it.
+    design_review can run it, and cad_guide('review') mentions it (MCP freshness rule).
+  * JSON output shape is STABLE and documented below — the plan-first layout workflow (layout_plan_tools) consumes it.
 
-Reuse, not fork (binding, from the task):
+Reuse, not fork:
   * `doc_query` (query_geometry) — per-body cylindrical/planar face interrogation. The engine's
-    doc_query gained an optional 1-based `body_id` (T-BL49, mirrors eval_measure/eval_mass) so we
+    doc_query gained an optional 1-based `body_id` (mirrors eval_measure/eval_mass) so we
     can read EACH component's faces in their WORLD placement instead of only the last body.
   * `asm_world_bodies` (list_world_bodies) — enumerates the placed bodies/components + bboxes.
-  * `cam_extract(kind="holes")` — T-M5 OCCT hole grouping (minor/counterbore/countersink), used
+  * `cam_extract(kind="holes")` — OCCT hole grouping (minor/counterbore/countersink), used
     as a cross-check / richer hole classification on the whole doc.
   * `research.thread_spec` — nominal fastener major diameter for the pass-through clearance check
     (no new fit tables invented).
   * `check_interference` remains the separate hard-clash gate; this tool is its alignment complement.
 
 --------------------------------------------------------------------------------------------
-JSON CONTRACT  (interface_check return — consumed by T-BL50; keep stable)
+JSON CONTRACT  (interface_check return — consumed by layout_plan_tools; keep stable)
 --------------------------------------------------------------------------------------------
 {
   "ok": bool,                     # True when the check ran; ok=false only for a refusal/error

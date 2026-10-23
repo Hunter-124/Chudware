@@ -1,6 +1,6 @@
-"""services/browser/session.py — persistent per-site browser sessions (T-X1).
+"""services/browser/session.py — persistent per-site browser sessions.
 
-Two entry points only; every source adapter (T-X2+) calls these and never
+Two entry points only; every source adapter calls these and never
 imports Playwright directly:
 
 - :func:`browser_login` — opens a HEADED, persistent-profile Chromium window so
@@ -13,7 +13,7 @@ imports Playwright directly:
   use our own CEF daemon; Darwin uses the Playwright fallback selected by
   :mod:`.driver` because its host ships CEF off. Returns rendered HTML through
   the same backend-independent envelope.
-- :func:`browser_download` (T-X2) — fetches a URL's raw bytes under the same
+- :func:`browser_download` — fetches a URL's raw bytes under the same
   saved session through the selected headless backend. It has the same
   rate-limiting and degradation posture as ``browser_fetch``.
 
@@ -24,7 +24,7 @@ Phase 2b). The CEF daemon is lazily spawned and idle-exits, and all three
 functions degrade to the ``services.research`` §6 failure shape
 (``contracts/research_tools.md``) instead of raising.
 
-Captcha/2FA (T-X6): this module DETECTS these states (see :mod:`.challenge`) but
+Captcha/2FA: this module DETECTS these states (see :mod:`.challenge`) but
 never attempts to solve or bypass them. The rule is the same regardless — hand
 control back to the user: ``browser_login`` (headed) surfaces a clear "complete it
 yourself" message and keeps the window open; ``browser_fetch`` (headless) aborts

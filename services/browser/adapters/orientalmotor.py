@@ -1,11 +1,11 @@
-"""services/browser/adapters/orientalmotor.py — orientalmotor source adapter (T-X7).
+"""services/browser/adapters/orientalmotor.py — orientalmotor source adapter.
 
 Oriental Motor (orientalmotor.com) makes stepper motors, BLDC motors,
 gearmotors and drivers. Search and most STEP/native CAD downloads are open;
 `acquire` lands the STEP model with provenance for part_search / part_place.
 
 NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live orientalmotor session (T-X6 gates the real per-source
+against a live orientalmotor session (the gated integration suite covers the real per-source
 integration tests behind an env flag).
 """
 from __future__ import annotations

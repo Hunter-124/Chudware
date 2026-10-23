@@ -1,9 +1,9 @@
 # Contract: Requirements layer — `aicad.req/1`
 
-> Normative v1. Promoted from `docs/review/CUSTOM_MODEL_INTEGRATION_SURVEY.md` §3.5 by T-H3.
+> Normative v1.
 > Changes require a schema-string bump and a migration note here.
-> Consumed by: IP-12 (elicitation), T-F17 (design-brief sign-off), WS-A (verify nodes),
-> T-H8 (spec→sketch/part benchmarks).
+> Consumed by: elicitation (insertion point `IP-12`), design-brief sign-off, DAG verify
+> nodes, and spec→sketch/part benchmarks.
 
 ---
 
@@ -137,7 +137,7 @@ Transition rules:
 ## 3. Valid verifiers (VALID_VERIFIERS)
 
 The canonical list of MCP tool names that may appear in `verify_by[].verifier`.
-Owners: T-H3 defines this list; T-H4 verifier battery may extend it via contract amendment.
+Owners: this contract defines the list; the verifier battery may extend it via contract amendment.
 
 ```
 check_sketch

@@ -2,7 +2,7 @@
 //
 // A single PM host occupies the FeatureManager tree's dock slot while a ribbon command (or a
 // tree "Edit") is active; the tree returns when the PM closes (OK/Cancel). Forms are DATA-DRIVEN:
-// each feature type maps to a list of FieldDef rows (matching docs/contracts/feature_params.md
+// each feature type maps to a list of FieldDef rows (matching contracts/feature_params.md
 // field order), so adding a feature later is a table edit, not new draw code.
 //
 // Field widgets:
@@ -52,7 +52,7 @@ enum class PMFieldKind { Dim, SelectorWell, Combo, Check, Int, DatumRef, Feature
 // — the SolidWorks "click a reference plane" interaction reused outside the new-sketch flow.
 struct PMSelKinds {
     bool face = false, edge = false, vertex = false, body = false, plane = false, axis = false;
-    bool point = false;  // T-BL37: world-origin point ("point.origin") or point-datum feature
+    bool point = false;  // world-origin point ("point.origin") or point-datum feature
 };
 
 // One row of a feature form (data-driven; one per param/ref in feature_params order).
@@ -289,7 +289,7 @@ public:
     // (the LeftPane container child, or draw()'s dock/floating window). No-op unless active().
     void drawBody(AppState& st);
 
-    // T-G19: OK / Cancel command buttons, relocated ABOVE the PM into the left-pane top row
+    // OK / Cancel command buttons, relocated ABOVE the PM into the left-pane top row
     // (between the Configurations tab and the collapse chevron). layout.cpp calls this from that row
     // while a form is active; the cluster is right-aligned so it ENDS at `rightX` and is vertically
     // centered on `centerY` (both screen-space px). Clicking OK commits (commit() guards readiness);
@@ -368,9 +368,9 @@ public:
     // host-only auto plane-intersection axes store explicit {"kind":"axis",point,axis} geometry
     // (document.cpp axis_from_explicit). Re-picking the same axis toggles it off.
     bool routeDatumAxis(AppState& st, const std::string& fid, const std::string& label);
-    // T-BL37: route origin/point-datum into a SelectorWell that has selKinds.point=true.
+    // Route origin/point-datum into a SelectorWell that has selKinds.point=true.
     bool routeDatumPoint(const std::string& fid, const std::string& label = "");
-    bool activeWellWantsPoint() const;  // T-BL37
+    bool activeWellWantsPoint() const;
 
     // Human phrase for the active well's accepted topology ("edges", "faces or edges", …), or ""
     // when no selector well is active. Used to toast feedback when a pick is rejected for the
@@ -482,7 +482,7 @@ private:
     bool dirty_ = false;           // a field changed since last preview
     double lastEditTime_ = 0.0;    // ImGui::GetTime() of the last field change (debounce)
     bool firstPreviewDone_ = false;
-    bool previewInFlight_ = false; // T-PERF1: async applyOps in flight (serialize first add_feature)
+    bool previewInFlight_ = false; // async applyOps in flight (serialize first add_feature)
 
     // C37-F: checkpoint id taken at open (before any preview). Empty = checkpoint failed at open
     // (fallback: undo loop). revert(checkpointId_) is the single cancel call.

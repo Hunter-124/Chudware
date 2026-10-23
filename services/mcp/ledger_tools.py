@@ -92,7 +92,7 @@ def register_ledger_tools(mcp) -> None:
         ``limit`` caps the number of events returned (default 200).
 
         Each event has: seq, ts, actor, kind, payload.
-        The GUI transparency panel (T-DP11) uses this to render the live
+        The GUI transparency panel uses this to render the live
         action stream: advisory/audit/tool events, council votes, delegation
         transitions, and auto-applied fixes.
         """

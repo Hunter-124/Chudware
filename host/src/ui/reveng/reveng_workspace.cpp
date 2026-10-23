@@ -7,7 +7,7 @@
 //   center : source-lane SegmentedControl, then THE STAGE STEPPER (kit::StepTrack) pinned at
 //            the TOP where a wizard's progress indicator belongs, then the active stage body.
 //   right  : properties column with three tabs — Details / Capabilities / Provenance.
-// Both side columns collapse to a header strip + chevron (T-G21 affordance, see below).
+// Both side columns collapse to a header strip + chevron (see below).
 //
 // Why the stepper moved: it used to live at the BOTTOM of the workspace, below the stage body,
 // so the one control that tells you where you are in a six-step pipeline was the last thing you
@@ -70,7 +70,7 @@ namespace {
 // Panel-local state lives in this TU, not in reveng_internal.h (which is the CROSS-panel
 // contract). Everything here is derived/presentational: caches, animation, wall-clock.
 struct ShellState {
-    // Column roll animation (T-G21). Negative = uninitialised, snaps on the first frame.
+    // Column roll animation. Negative = uninitialised, snaps on the first frame.
     float railW = -1.0f;
     float propW = -1.0f;
     // Width the two side columns may share while the stage body keeps its minimum — published by
@@ -2219,11 +2219,11 @@ void drawPropertiesBody(AppState& st) {
 }
 
 // ================================================================================
-// Columns (T-G21 collapse)
+// Columns (collapse)
 // ================================================================================
 
 // A collapsed side column rolls back to a thin full-height header strip carrying the chevron and
-// a vertical caption, and the freed width goes to the stage body. This is the T-G21 affordance
+// a vertical caption, and the freed width goes to the stage body. This is the pinned-column affordance
 // (roll to the header strip, NEVER shrink to a floating pill) rotated to the horizontal axis the
 // three RE columns are laid out on — the pinned columns in layout.cpp roll UP because they stack
 // vertically; these roll SIDEWAYS because they stack horizontally. Returns true when the expand

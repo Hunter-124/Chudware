@@ -1,4 +1,4 @@
-"""test_reviewer_exec.py — T-W30 deterministic acceptance-criteria verifier.
+"""test_reviewer_exec.py — deterministic acceptance-criteria verifier.
 
 Proves the reviewer runs each AC's named check tool and derives an HONEST verdict:
 PASS only on a mechanical match, NOT-CHECKED on prose rules / unresolved tools,

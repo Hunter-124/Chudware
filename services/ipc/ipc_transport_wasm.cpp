@@ -5,7 +5,7 @@
 //   ws(s)://location.host/engine
 // (ws:// when location.protocol is "http:", else wss://).
 //
-// Link requirement (integrator): -lwebsocket.js
+// Link requirement: -lwebsocket.js
 //
 // Current model (main-thread ImGui + ASYNCIFY): WS callbacks run on the main
 // runtime thread; connect/readLine yield with emscripten_sleep (NOT condvar park)

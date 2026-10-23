@@ -1,9 +1,9 @@
-"""SQLite FTS5 search index for the parts library — aicad.parts/1 (T-P1).
+"""SQLite FTS5 search index for the parts library — aicad.parts/1.
 
 Uses only stdlib sqlite3 (FTS5 module). The live index is always an in-memory
 database (fast, lock-free reads); it is also the lookup store for get() calls.
 
-Persistence (T-PL4)
+Persistence
 -------------------
 When constructed with a ``path`` the index can be snapshotted to / restored from
 an on-disk sqlite file, keyed by a caller-supplied *fingerprint* of everything

@@ -370,7 +370,7 @@ class TestOpenEmsPipeline(unittest.TestCase):
         ad = OpenEmsAdapter()
         if not ad.available()["installed"]:
             self.skipTest("openEMS not installed on this machine (adapter is "
-                          "mock-proven above; see docs/EM_SIMULATION.md to install)")
+                          "mock-proven above; see docs/reference/EM_SIMULATION.md to install)")
         res = ad.driven({"standard": "WR-90", "length_mm": 60,
                          "f_start_ghz": 7, "f_stop_ghz": 12, "n_freq": 51})
         f = np.array(res["freq_ghz"])

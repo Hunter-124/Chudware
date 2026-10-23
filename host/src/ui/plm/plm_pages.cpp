@@ -1,7 +1,7 @@
 // PLM Project Hub — page bodies.
 //
 // Overview (dashboard + quick checkpoint), Files (items grid + track/link) and
-// Team & Sync (remotes, one-button sync, advisory locks — T-R7) are implemented
+// Team & Sync (remotes, one-button sync, advisory locks) are implemented
 // here. Every page reads only the cached rows on g_plmHub (filled by
 // plm_state.cpp) and mutates via async st.rpc; on a successful mutation it bumps
 // the generation so caches refetch.

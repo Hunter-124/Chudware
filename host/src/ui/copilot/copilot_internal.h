@@ -1,4 +1,4 @@
-// Copilot internals shared across the ui/copilot/* translation units (T-RF6 split of the old
+// Copilot internals shared across the ui/copilot/* translation units (split out of the old
 // legacy_chat.cpp monolith). NOT a public header: everything below was a file-static of the
 // monolith and is now defined in exactly one copilot TU and declared here for the sibling TUs.
 // Public API lives in copilot.h (and core/app_state.h for the shared small-UI helpers).
@@ -58,7 +58,7 @@
 
 #include "copilot.h"
 #include "ui/layout.h"          // ui::overlayBand / takeOverlayColumnReset — pinned-column geometry
-#include "ui/panel_collapse.h"  // ui::PanelCollapseAnim — shared vertical-collapse animation (T-G21)
+#include "ui/panel_collapse.h"  // ui::PanelCollapseAnim — shared vertical-collapse animation
 #include "ui/doc_tabs.h"        // ui::docTabStripHeight — top inset so the column clears the tab band
 #include "ui/model_registry.h"  // ui::ModelInfo / capability flags / provider mapping
 #include "ui/metrics.h"         // ui::metrics::px/U/asmHeaderIconGap
@@ -281,7 +281,7 @@ std::string timelineProseTail(const ChatMsg& m);
 // after "\n\x1eERR\x1e\n", the image caption after "\n\x1eCAP\x1e\n", artifact paths after
 // "\n\x1eART\x1e\n", and a per-call META trailer after "\n\x1eMETA\x1e\n" ("<epoch-ts>\t
 // <cache-read-tokens>" — the timestamp + prompt-cache read of the completion that produced the
-// call). ActivityItem gains no fields — app_state.h is integrator-owned. chatActivityCopyText
+// call). ActivityItem gains no fields — app_state.h stays unchanged. chatActivityCopyText
 // (ui_common) splits the same way so a clipboard copy never carries the raw \x1e marker bytes.
 struct ToolRowDetail {
     std::string args;

@@ -1,4 +1,4 @@
-"""Worker-RPC bridge for the parts-library seam (T-U2).
+"""Worker-RPC bridge for the parts-library seam.
 
 Exposes ``part_search``, ``part_get``, and ``part_place`` as **engine-worker methods** so the
 C++/ImGui GUI reaches them through the same newline-delimited-JSON worker seam (``WorkerClient``
@@ -9,7 +9,7 @@ transport. These are thin wrappers over :mod:`services.parts` and
 Each method degrades gracefully when the backing data is absent (returns an empty result list /
 ok:false envelope, never raises). Registered append-only in ``engine_oracle/worker.py``.
 
-Re-homed from ``engine_oracle/parts_hub/worker_rpc.py`` in T-RF19. The squatter
+Re-homed from ``engine_oracle/parts_hub/worker_rpc.py``. The squatter
 RPC tables that used to be folded in here (subscription/session/skills/triggers/
 role_models/bench) now live in :mod:`services.agent.worker_rpc`, and the PLM
 tables (cad_graph/plm_branch) in :mod:`services.plm.worker_rpc`; each is
@@ -51,7 +51,7 @@ def _part_get(params: dict, _emit: Callable) -> dict:
 def _part_place(params: dict, _emit: Callable) -> dict:
     """Worker method ``part_place`` → PlacementResult (editable, R1).
 
-    place.py was ported to core/parts (T-RF19) — the hub lookup stays here
+    place.py was ported to core/parts — the hub lookup stays here
     (Python FTS), the placement runs in the C++ core."""
     try:
         from services.mcp import core_bridge as cb
@@ -90,7 +90,7 @@ except Exception:  # noqa: BLE001 — GUI seam is optional; agent tools above st
 # Embedded-browser seam (Parts Library V2 workstream 3, generic/reusable) —
 # browser_start_url + login_wizard_*. Thin wrappers over services.browser.embed
 # (in-process CEF browser); degrade to ok:false envelopes when Playwright isn't
-# provisioned. Re-homed from engine_oracle/embed_rpc.py in T-RF19.
+# provisioned. Re-homed from engine_oracle/embed_rpc.py.
 try:
     from .embed_rpc import EMBED_WORKER_METHODS as _EMBED_METHODS
     WORKER_METHODS.update(_EMBED_METHODS)

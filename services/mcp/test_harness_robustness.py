@@ -1,8 +1,7 @@
 """Harness-robustness tests: preflight cost gate, buildgraph input dialect,
 buildgraph_status discoverability, and the two "advertised but impossible" tools.
 
-Every case here mirrors a real failure mined from
-``tools/flywheel/bench/gym/reports/runs/**/ledger.json``.
+Every case here mirrors a real failure mined from recorded agent-run ledgers.
 """
 from __future__ import annotations
 

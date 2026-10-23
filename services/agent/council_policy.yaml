@@ -1,6 +1,6 @@
-# council_policy.yaml — Per-(stage, tier) council policy defaults (T-DP8)
+# council_policy.yaml — Per-(stage, tier) council policy defaults
 #
-# Contract: docs/AGENT_DESIGN_PIPELINE.md §3.3 (councils at every stage,
+# Contract: docs/design/AGENT_DESIGN_PIPELINE.md §3.3 (councils at every stage,
 # configurable, per-tier, diverse-model).
 #
 # Key design decisions:

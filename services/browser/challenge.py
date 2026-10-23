@@ -1,4 +1,4 @@
-"""services/browser/challenge.py — captcha / 2FA / interstitial detection (T-X6).
+"""services/browser/challenge.py — captcha / 2FA / interstitial detection.
 
 Detection is a **data-quality signal**, not a stop sign. The browser fetches the
 user's OWN authenticated sessions with a consistent, non-automation fingerprint

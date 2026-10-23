@@ -1,8 +1,8 @@
 schema: aicad.playbook/1
 id: sketch_profile
 stage: sketch
-# Verbatim from docs/ADVISOR_ARCHITECTURE.md §2.4 (the canonical worked example).
-# Helper tool names align with the sketcher role allowlist and T-W2/T-W3 contracts
+# Verbatim from docs/design/ADVISOR_ARCHITECTURE.md §2.4 (the canonical worked example).
+# Helper tool names align with the sketcher role allowlist and the sketch-tool contracts
 # (sketch_health, suggest_dimension_scheme).
 steps:
   - id: datums

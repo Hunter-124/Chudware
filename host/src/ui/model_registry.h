@@ -29,7 +29,7 @@ enum ProviderIndex {
     PROV_CURSOR = 7,      // Cursor (Composer + proxied Anthropic/OpenAI models)
     PROV_KIMISUB = 8,     // Kimi Code — online auth/execution through Chudcode.
     PROV_ZENMUX = 9,      // ZenMux — online auth/execution through Chudcode. Default provider
-                          // (owner directive 2026-07-23: free x-ai/grok-4.5-free tier works
+                          // (design decision 2026-07-23: free x-ai/grok-4.5-free tier works
                           // without an xAI sign-in).
     PROV_FREELLMAPI = 10, // Free AI (FreeLLMAPI, github.com/tashfeenahmed/freellmapi) — a
                           // self-hosted OpenAI-compatible router stacking ~28 providers' free
@@ -191,7 +191,7 @@ inline const char* providerLabelForEndpoint(int provider, const char* base_url) 
 // (a local endpoint can serve any GGUF), so they are NOT listed here — the probe fills them.
 inline const std::vector<ModelInfo>& builtinModels() {
     static const std::vector<ModelInfo> kModels = {
-        // ZenMux; owner directive 2026-07-23 default. Free x-ai/grok-4.5-free tier needs only a
+        // ZenMux; default since 2026-07-23. Free x-ai/grok-4.5-free tier needs only a
         // ZenMux sign-in through Chudcode, not an xAI credential.
         {PROV_ZENMUX, "x-ai/grok-4.5-free", "Grok 4.5 (default, free via ZenMux)", true, true},
         {PROV_ZENMUX, "moonshotai/kimi-k3", "Kimi K3 (via ZenMux)", true, true},

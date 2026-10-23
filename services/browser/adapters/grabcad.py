@@ -1,4 +1,4 @@
-"""services/browser/adapters/grabcad.py — GrabCAD source adapter (T-X2).
+"""services/browser/adapters/grabcad.py — GrabCAD source adapter.
 
 GrabCAD Community requires a free account to search/download most models.
 This adapter is DATA-heavy: the site config below (URLs, result/download

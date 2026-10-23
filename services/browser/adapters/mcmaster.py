@@ -1,4 +1,4 @@
-"""services/browser/adapters/mcmaster.py — McMaster-Carr source adapter (T-X7).
+"""services/browser/adapters/mcmaster.py — McMaster-Carr source adapter.
 
 McMaster-Carr is the canonical MRO/hardware catalog: unlike the commerce-only
 Amazon adapter, McMaster has real per-SKU CAD downloads (STEP) behind the

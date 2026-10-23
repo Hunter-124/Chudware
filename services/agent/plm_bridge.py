@@ -1,13 +1,13 @@
 """PLM bridge — agent milestone checkpoints, ledger-annotated history.
 
 Contract: contracts/advisor.md §15 (aicad.plmlink/1, FROZEN).
-Vault API: contracts/plm.md (aicad.plm/1) drafted by T-R1; matched here
+Vault API: contracts/plm.md (aicad.plm/1); matched here
 against the plm_checkpoint / plm_history envelopes in §7.
 
 Design decisions
 ----------------
 * Thin ``VaultClient`` Protocol — realignment to the frozen plm.md is a
-  one-file change when T-R2 ships.
+  one-file change.
 * Enablement precedence (default OFF):
     1. project manifest ``ai_mode == "managed"`` → real PLMVaultClient
        (agent CAD-touching milestones auto-checkpoint; no env needed)
@@ -24,7 +24,7 @@ Design decisions
 * Verbatim-splice policy: dimension rationales come from ledger.events
   (NOT ledger.state — provenance is stripped from materialized state).
   Decision rationale text is copied verbatim without paraphrasing.
-* Pillar 19 locked intent: NO git vocabulary in user-facing messages;
+* Locked intent: NO git vocabulary in user-facing messages;
   Project/History/Checkpoint nouns only.  Message vocabulary test included
   in test_plm_bridge.py.
 """
@@ -36,11 +36,11 @@ import uuid
 from typing import Any, Protocol, runtime_checkable
 
 # ---------------------------------------------------------------------------
-# Trigger configuration table (normative — per T-W18 step 2)
+# Trigger configuration table (normative)
 # ---------------------------------------------------------------------------
 
 # Which (trigger, stage_exit_value) pairs create a PLM checkpoint by default.
-# Besides verification milestones, T-DP14 checkpoints the four typed design
+# Besides verification milestones, the design pipeline checkpoints the four typed design
 # stages whose ledger slices form the Project History design narrative.
 CHECKPOINT_TRIGGERS: dict[str, bool] = {
     "plan_ratified": True,
@@ -61,7 +61,7 @@ CHECKPOINT_TRIGGERS: dict[str, bool] = {
     "stage_exit:planning": False,
 }
 
-# Forbidden words in user-facing checkpoint messages (Pillar 19, §8.1 of plm.md)
+# Forbidden words in user-facing checkpoint messages (contracts/plm.md §8.1)
 _GIT_VOCAB = frozenset({
     "git", "commit", "repository", "repo", "branch", "merge",
     "rebase", "head", "ref", "stage", "staging", "push", "pull",
@@ -71,16 +71,16 @@ _GIT_VOCAB = frozenset({
 SCHEMA = "aicad.plmlink/1"
 
 # ---------------------------------------------------------------------------
-# VaultClient Protocol — thin seam to services/plm/ (T-R2)
+# VaultClient Protocol — thin seam to services/plm/
 # ---------------------------------------------------------------------------
 
 
 @runtime_checkable
 class VaultClient(Protocol):
-    """Minimal surface T-W18 uses from the PLM vault (aicad.plm/1 §7).
+    """Minimal surface the bridge uses from the PLM vault (aicad.plm/1 §7).
 
-    Implemented by MockVault (tests/feature-flag-off) and by a real thin
-    wrapper around services/plm/ once T-R2 is merged.
+    Implemented by MockVault (tests/feature-flag-off) and by the real thin
+    wrapper around services/plm/ (``services.plm.client.PLMVaultClient``).
     """
 
     def is_available(self) -> bool:
@@ -338,7 +338,7 @@ def draft_checkpoint_message(
 ) -> str:
     """Draft a plain-language checkpoint message from ledger event provenance.
 
-    Verbatim-splice policy (contract §15 + Pillar 19):
+    Verbatim-splice policy (contract §15 + the PLM no-git-vocabulary rule):
     - Decision rationale text is copied VERBATIM from the event payload.
     - Dimension provenance is copied from ledger.events (not ledger.state,
       which strips the provenance field).
@@ -512,7 +512,7 @@ class PLMBridge:
        to the vault when available.
 
     The bridge never surfaces git concepts to users.  All user-facing text
-    uses Pillar 19 nouns: Project, History, Checkpoint.
+    uses the PLM user nouns: Project, History, Checkpoint.
     """
 
     def __init__(
@@ -557,7 +557,7 @@ class PLMBridge:
 
         Args:
             trigger:            One of the CHECKPOINT_TRIGGERS keys.
-            buildgraph_node:    The bg_... node id from T-W15 executor.
+            buildgraph_node:    The bg_... node id from the buildgraph executor.
             stage:              For stage_exit triggers, the stage name.
             audit_id:           For change_request triggers, the audit id.
             modifies_checkpoint: The checkpoint the CR modifies (for timeline).
@@ -578,8 +578,8 @@ class PLMBridge:
         if resolved_project_id is None and self._vault is not None:
             resolved_project_id = self._vault.project_id_for_run(self.run_id)
 
-        # Assist-tier gate (T-R3, plan §2): the copilot cuts checkpoints BY
-        # ITSELF only in AI-managed mode. When the vault can report the
+        # Assist-tier gate (docs/design/PLM_VERSION_CONTROL_PLAN.md §2): the
+        # copilot cuts checkpoints BY ITSELF only in AI-managed mode. When the vault can report the
         # project's tier and it is not "managed", do nothing — no cut, no
         # queue (the user has not opted into AI-cut entries). Vaults that
         # cannot report a tier (mock/legacy) keep the previous behavior.
@@ -596,7 +596,7 @@ class PLMBridge:
             stage=stage,
         )
 
-        # Pillar 19 vocabulary guard
+        # User-facing vocabulary guard (no git terms)
         bad_words = _scan_git_vocab(message)
         if bad_words:
             # Replace message — never emit forbidden vocab
@@ -650,7 +650,7 @@ class PLMBridge:
         return plmlink
 
     def _managed_mode_allows(self, project_id: str) -> bool:
-        """True unless the vault reports a non-managed assist tier (T-R3).
+        """True unless the vault reports a non-managed assist tier.
 
         Duck-typed: vaults without ``ai_mode_for_project`` (MockVault, older
         clients) cannot report a tier, so the gate stays open for them.
@@ -810,7 +810,7 @@ class PLMBridge:
 
 
 # ---------------------------------------------------------------------------
-# Buildgraph executor hook (T-W15 seam)
+# Buildgraph executor hook
 # ---------------------------------------------------------------------------
 
 def make_buildgraph_node_emit_hook(bridge: "PLMBridge", graph: dict[str, Any]) -> Any:
@@ -912,7 +912,7 @@ def maybe_vault_checkpoint_on_tool(
 
         rid = run_id or "agent"
         bridge = bridge_for_run(rid, project_dir=resolved_dir, ledger=ledger)
-        # part_done trigger drafts a Pillar-19 message; buildgraph_node tags the tool.
+        # part_done trigger drafts a git-free checkpoint message; buildgraph_node tags the tool.
         return bridge.on_milestone(
             trigger="part_done",
             buildgraph_node=f"tool:{tool}",

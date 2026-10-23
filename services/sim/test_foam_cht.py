@@ -1,7 +1,7 @@
 """Offline tests for the CHT case generator (services.sim.foam_cht).
 
 No OpenFOAM required — these verify the written case dictionaries, including the
-multi-solid seam (T-FIN19: board + component volumetric heat sources).
+multi-solid seam (board + component volumetric heat sources).
 """
 
 from __future__ import annotations

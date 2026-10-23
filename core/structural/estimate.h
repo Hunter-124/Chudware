@@ -1,4 +1,4 @@
-// Structural cost takeoff (T-RF19 leaf 5) — C++ port of
+// Structural cost takeoff — C++ port of
 // engine_oracle/structural/estimate.py: board-feet, steel weight, fastener
 // count, and the line-item estimate against the ENR Q4-2025 rate table.
 //

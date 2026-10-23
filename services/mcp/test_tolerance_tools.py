@@ -1,4 +1,4 @@
-"""MCP envelope tests for stackup_analyze (T-BL08).
+"""MCP envelope tests for stackup_analyze.
 
 Covers tool shape, honest-degrade behavior (assumed dims), mode scoping,
 and error envelopes.  Pure-math validation is in engine/tolerance/test_stackup.py.

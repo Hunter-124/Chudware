@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""T-BL34: Manufacture ribbon icons rendered from REAL generated toolpaths.
+"""Manufacture ribbon icons rendered from REAL generated toolpaths.
 
-Hunter directive (2026-07-04): the Manufacture icons must showcase the GENERATED
+Design decision (2026-07-04): the Manufacture icons must showcase the GENERATED
 TOOLPATHS the tools produce, not screenshots of the shape types they're used on.
 
 Each tile is produced by driving the actual CAM engine chain through the same
@@ -444,7 +444,7 @@ CAM_SPECS: list[dict] = [
             "geometry": {"points": [[-14, 0, -3], [14, 0, -3], [0, -14, -3],
                                     [0, 14, -3]]},
             "feed": 200.0, "plunge": 100.0}},
-    # ---- Workspace-tab exemplar (title-bar Manufacture tab, T-BL-wsicons) --------
+    # ---- Workspace-tab exemplar (title-bar Manufacture tab) ------------------------
     # A concentric 2D pocket over rectangular stock -- the ringed cutter passes read
     # unmistakably as "CNC toolpath" at 32px, the clearest small-size Manufacture cue.
     # Clone of cam_pocket2d with a dedicated cell so the title bar can blit it directly.

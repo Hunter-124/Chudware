@@ -1,4 +1,4 @@
-"""``assembly_manual`` — assembly instructions + user manual (docx/pdf), a T-F15 template.
+"""``assembly_manual`` — assembly instructions + user manual (docx/pdf), an engineering template.
 
 The build-and-operate document: numbered assembly steps with exploded / step renders and
 torque-and-fastener callouts, plus user-manual sections. Fastener torque, counts and gaps are
@@ -10,8 +10,8 @@ load-bearing — pulled from the assembly / fastening data (contract §4), never
                 render path — embedded if the file exists, else a caption), ``body`` instruction
                 text. Load-bearing slots: ``torque``, ``fastener_count``, ``gap``, ``preload``.
 
-Ships as a ``make_report`` template (docx/pdf) rather than the reserved ``make_manual`` tool —
-see ``work/questions/T-F15.md``: manuals need no new tool seam, so ``make_manual`` stays reserved
+Ships as a ``make_report`` template (docx/pdf) rather than the reserved ``make_manual`` tool:
+manuals need no new tool seam, so ``make_manual`` stays reserved
 in ``deliverables/1`` and no contract change is required. Rendered from the shared :mod:`._doc`
 model.
 """

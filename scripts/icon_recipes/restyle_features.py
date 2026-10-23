@@ -1,6 +1,6 @@
 """Icon recipes: the Feature/Dress-up/Multi-body/SheetMetal/Weldment/Workspace tiles.
 
-Style law (Hunter, T-BL34 follow-up, re-cut for the two-role accent scheme):
+Style law (re-cut for the two-role accent scheme):
   * steel grey     = the base/stock material the tool acted on,
   * PRIMARY orange = what the operation PRODUCED,
   * SECONDARY blue = the direction of the action, built as REAL 3D geometry (arrow3d /
@@ -41,7 +41,7 @@ RECIPES: dict[str, dict] = {
     # -------------------------------------------------------------- 3D Body
     # extrude_boss: thin GREY sketch-plane plate, ORANGE block grown out of it, and a real
     # 3D BLUE arrow continuing along the extrude direction so the tile shows which way the
-    # material went (Hunter: "arrows in 3d pointing out of them in the direction").
+    # material went (3D arrows pointing out of the part in the direction of the action).
     "extrude_boss": {"yaw": 35, "pitch": 26, "steps": [
         *sketch_with_id(rect(-22, -18, 22, 18, "pl"), plane="plane.top",
                         name="PlateSk", fid="f1"),
@@ -420,7 +420,7 @@ RECIPES: dict[str, dict] = {
     # the copy can carry the PRIMARY accent.  The dashed symmetry trace (ANN) stays: the
     # plane itself is a marker, not a direction, and has no 3-space form to shade.
     #
-    # Why the `mirror` feature is not used: it only survives on a MERGED body (T-BL34), and
+    # Why the `mirror` feature is not used: it only survives on a MERGED body, and
     # the instance it makes fuses into the seed -- one body, one appearance, so the copy is
     # indistinguishable from the original in the render, which is the only thing this icon
     # has to say.  Same trade as the rib tile's hand-built web.

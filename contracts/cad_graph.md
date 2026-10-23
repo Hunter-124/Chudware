@@ -1,6 +1,6 @@
 # Contract: CAD Project Graph — v1
 
-Append-only. Integrator-owned. Producer: `services/plm/cad_graph.py` (+ `services/mcp/graph_tools.py`).
+Append-only. Maintainer-owned. Producer: `services/plm/cad_graph.py` (+ `services/mcp/graph_tools.py`).
 Consumers: PLM workspace graph tab (GUI), copilot traversal tools (MCP), documentation helpers.
 
 Graphify/Sourcegraph analogue over CAD projects: how parts/features/mates/BOM/docs link.

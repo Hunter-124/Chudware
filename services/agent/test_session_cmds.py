@@ -66,7 +66,7 @@ Implement session command RPCs for /handoff and /btw.
 
 ## Critical Context
 - services/agent/session_cmds.py
-- services/agent/worker_rpc.py (folded from engine_oracle/parts_hub/session_rpc.py in T-RF19)
+- services/agent/worker_rpc.py (folded from engine_oracle/parts_hub/session_rpc.py)
 
 ## Next Steps
 1. Register SESSION_METHODS in worker_rpc.py

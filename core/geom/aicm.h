@@ -54,7 +54,7 @@ struct AppearanceRegion {
 };
 
 // Copy-on-write vector: AicmBody assignment / cache-hit reuse is O(1) pointer
-// traffic until a mutator (push_back/resize/…) detaches. T-PERF6(c).
+// traffic until a mutator (push_back/resize/…) detaches.
 template <typename T>
 class CowVec {
 public:

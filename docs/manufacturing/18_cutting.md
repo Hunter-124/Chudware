@@ -508,7 +508,7 @@ declares *both* an epoch policy (`falsify | reestablish | epoch_invariant`) *and
 invalidation triggers — they are different axes, and declaring only one is a schema
 rejection. Cutting owns **no probed transport**, so every kind below is `epoch_invariant`:
 its durable state survives a gateway restart intact and is only ever invalidated mid-epoch by
-a content change. Registering these is an append-only, integrator-owned contract edit
+a content change. Registering these is an append-only, maintainer-owned contract edit
 requested as part of Wave 1. Permitted subject namespaces for `domain_id="cam.cut"` are
 declared at registration as **`art:`, `job:`, `res:`** — never `dev:` and never `src:`
 (`MFG-SUBJECT-NS-DECLARED`); an out-of-set append is refused `mfg_subject_namespace_not_permitted`, which
@@ -556,7 +556,7 @@ silently. The consequences of a gap are total, not cosmetic: per `MFG-KIND-MUST-
 of any unlisted kind is refused `mfg_unregistered_result_kind` and this domain's durable surface does
 nothing, and per `MFG-CAPABILITY-DURABLE-KIND` advertising any level above `unsupported` without the
 registered capability kind is refused `mfg_capability_requires_durable_kind` outright. Registration is the
-append-only, integrator-owned contract edit in **wave 1** (§12 step 1) and is a hard predecessor of every
+append-only, maintainer-owned contract edit in **wave 1** (§12 step 1) and is a hard predecessor of every
 later cut slice. Each row carries both `MFG-KIND-TWO-COLUMNS` columns, its `derived_from[]`, and its
 `supersede_with_parent` declaration with the one-line reason `MFG-SUPERSESSION-DECLARED` requires —
 `true` for `cam.cut.procedural_fact` (`MFG-PFACT-FOLLOWS-PARENT`), **false** for `cam.cut.capability`

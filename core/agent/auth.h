@@ -1,4 +1,4 @@
-// core/agent/auth.h — subscription token store + pre-run refresh (T-RF4).
+// core/agent/auth.h — subscription token store + pre-run refresh.
 //
 // C++ port of the Python subscription-auth layer (services/agent/providers/
 // sub_auth.py + subscription_login.py ensure_fresh). The C++ agent used to ask
@@ -7,7 +7,7 @@
 // "subscription_auth" store, using the same on-disk shapes, the same
 // <config.json>.lock advisory file lock (flock / LockFileEx), and the same
 // atomic tmp+replace write-back — so Python (which keeps read/write access to
-// the store until T-RF20) and C++ refreshes cannot race. xAI rotates refresh
+// the store) and C++ refreshes cannot race. xAI rotates refresh
 // tokens on EVERY exchange: refresh re-reads the credential under the lock
 // before POSTing and writes the rotated token back atomically in the same
 // critical section.

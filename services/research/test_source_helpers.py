@@ -61,7 +61,7 @@ _AGENT_INTERACTION_AVAILABLE = importlib.util.find_spec("services.agent.interact
 
 @pytest.mark.skipif(
     not _AGENT_INTERACTION_AVAILABLE,
-    reason="services.agent.interaction not present in this tree (pre T-F3 merge)",
+    reason="services.agent.interaction not importable",
 )
 def test_unit_convert_uses_canonical_normalizer_when_agent_interaction_lands():
     assert normalizer_source() == "services.agent.interaction"
@@ -70,8 +70,8 @@ def test_unit_convert_uses_canonical_normalizer_when_agent_interaction_lands():
 
 
 def test_unit_convert_normalizer_source_is_a_known_seam():
-    # Always-on counterpart to the skipif test above: whichever side of the T-F3 seam
-    # we're on, the normalizer must be one of the two known sources.
+    # Always-on counterpart to the skipif test above: whichever side of the normaliser
+    # seam we're on, the normalizer must be one of the two known sources.
     assert normalizer_source() in {"services.agent.interaction", "fallback"}
 
 
@@ -257,7 +257,7 @@ def test_datasheet_fetch_missing_local_file():
     assert out["reason"] in {"no_pdf_tool", "bad_url"}
 
 
-# ------------------------------------------------------- datasheet_fetch: T-X4 browser fallback
+# ----------------------------------------------------------- datasheet_fetch: browser fallback
 
 class _FakeHttpResponse:
     """Stands in for ``httpx.Response`` — just enough for datasheet_fetch's usage."""
@@ -274,7 +274,7 @@ class _FakeHttpResponse:
 @pytest.fixture()
 def fake_pdf_extractor(monkeypatch):
     """Force a working PDF extractor so these tests don't depend on pdfminer.six being
-    installed — isolates the T-X4 fallback logic from the unrelated "no_pdf_tool"
+    installed — isolates the browser-fallback logic from the unrelated "no_pdf_tool"
     degradation already covered above."""
     monkeypatch.setattr(datasheet_fetch_mod, "_load_extractor",
                         lambda: (lambda data: "hello datasheet", "fake-extractor"))

@@ -1,4 +1,4 @@
-"""Tests for the second wave of source adapters (T-X7) —
+"""Tests for the second wave of source adapters —
 misumi, lcsc, digikey_web, snapeda, content3d.
 
 Same offline style as test_adapters.py: no real Playwright, no real network —

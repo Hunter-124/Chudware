@@ -1,4 +1,4 @@
-"""Tests for the vLLM adapter provider + config wiring (T-H9).
+"""Tests for the vLLM adapter provider + config wiring.
 
 Run: python -m pytest services/agent/test_vllm_provider.py -q
 

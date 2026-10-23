@@ -212,7 +212,7 @@ SECTION_ALIASES: dict[str, str] = {
 
 # ------------------------------------------------------------------- kinds
 #: The event kinds ``ledger_note`` accepts (mirrors ``services.agent.ledger``
-#: materialization; T-DP1 added the four design-pipeline stage kinds).
+#: materialization, including the four design-pipeline stage kinds).
 LEDGER_NOTE_KINDS: frozenset[str] = frozenset({
     "brief", "decision", "dimension", "question", "requirement", "stage",
     "artifact", "note", "feature", "geometry_spec", "linkage", "build_node",

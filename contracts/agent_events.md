@@ -1,6 +1,6 @@
 # Contract: Agent Events — `aicad.agent_events/2`
 
-> **Frozen `/1` by T-F17 (2026-07-03). Bumped to `/2` by M20 (2026-07-07).**
+> **Frozen `/1` on 2026-07-03. Bumped to `/2` on 2026-07-07.**
 > Append-only; schema-string bump required for any field change or new enum value.
 > This is the single event vocabulary shared by two producers (the DAG executor and
 > the built-in agent loop) and two sinks (the mission-control UI live stream and the
@@ -25,7 +25,7 @@
 > **Binding relationships:**
 > - DAG-side events (`dag.*`) bind to the 8-event table in `contracts/dag_schema.md §11`.
 >   Field names here MUST match exactly.
-> - Thought / tool_call / artifact kinds reuse the T-H1 telemetry vocabulary
+> - Thought / tool_call / artifact kinds reuse the telemetry vocabulary
 >   (`contracts/telemetry.md`) for the overlapping fields so one pipeline has two sinks.
 >   The `/2` additions (`target`, `id`/`parent_id`, `actor`) are **superset fields**:
 >   they are new to this contract and are NOT part of the bound telemetry vocabulary,
@@ -41,7 +41,7 @@
 or `%APPDATA%\Chudware\cache\runs\<run_id>\events.jsonl` (Windows).
 
 One JSON object per line. The DAG executor writes this file via its `emit` callback
-using `EventJournal` (services/dag/event_journal.py — created by T-F17). The built-in
+using `EventJournal` (services/dag/event_journal.py). The built-in
 agent loop (services/agent/loop.py) already writes to the same path pattern via
 `contracts/events.md`; future versions SHOULD also emit the DAG-vocabulary events when
 wrapping a DAG run.
@@ -108,10 +108,10 @@ Consumers tolerate a missing `parent_id` (treat as root) and a missing `id` on a
 `node_states` in `dag.run.done` is `{node_id: {"status": NodeState}}` — a compact
 summary for the panel's final-state rendering (not the full output dict).
 
-### 3.2 Agent thought & action (T-H1 telemetry vocabulary — reused)
+### 3.2 Agent thought & action (telemetry vocabulary — reused)
 
 These are emitted by node runners that call an agent loop. They share fields with the
-T-H1 `ai_artifact` / `ai_artifact_action` event kinds so a single telemetry sink can
+telemetry `ai_artifact` / `ai_artifact_action` event kinds so a single telemetry sink can
 consume both vocabularies. **All carry the §2.1 parent-linkage fields (`id`,
 `parent_id`, `actor`).**
 
@@ -148,7 +148,7 @@ paths, NOT the DAG executor.
 These are NOT written to `events.jsonl` (they are inbound commands, not log entries).
 They are documented here for discoverability; the actual wire format is the worker RPC
 (see §4 / `contracts/worker_rpc.md` for the `dag_approve` / `dag_resume` / `dag_pause`
-/ `dag_inject` methods registered by T-F17).
+/ `dag_inject` methods).
 
 | Steering action | RPC method | Payload |
 |----------------|------------|---------|
@@ -157,21 +157,21 @@ They are documented here for discoverability; the actual wire format is the work
 | Inject an instruction | `dag_inject` | `{run_id, instruction, at_node_boundary: true}` |
 | Change autonomy dial | `dag_set_autonomy` | `{run_id, level: "auto"\|"approve"\|"manual"}` |
 
-These methods are implemented in `services/dag/worker_rpc.py` (T-F17).
+These methods are implemented in `services/dag/worker_rpc.py`.
 
 ---
 
 ## 4. Design-brief event (Elicitation gold — `contracts/telemetry.md §5.4`)
 
-The design-brief flow produces two additional events consumed by the telemetry exporter:
+The design-brief flow produces two additional events for the telemetry journal:
 
 | kind | Fields | When |
 |------|--------|------|
 | `mission.brief.proposed` | `run_id`, `batch_id`, `brief_ref` (path to aicad.req/1 doc) | Agent proposed a design brief via `ask_user` approval |
 | `mission.brief.signed` | `run_id`, `batch_id`, `brief_ref`, `signed_ref` (path to final brief) | User approved / edited and signed the brief |
 
-These ride the same `events.jsonl` stream. The telemetry exporter (T-H5) uses them to
-derive elicitation-gold training pairs per `contracts/telemetry.md §5.4`.
+These ride the same `events.jsonl` stream and mark the elicitation-gold pair defined in
+`contracts/telemetry.md §5.4`.
 
 ---
 
@@ -203,7 +203,7 @@ A conforming consumer MUST:
 
 ## Early-stop detail (2026-07-16, additive)
 On `run_finished` / terminal `status` (phase done|error|failed|cancelled) and the
-agent run RPC result (`agent_run_v2`; formerly also `agent_design`, removed T-RF5),
+agent run RPC result (`agent_run_v2`; formerly also `agent_design`, removed 2026-07-22),
 optional additive fields:
 - `stop_reason` — short enum-ish string (confirmed|stabilized|refine_cap|max_iters|no_code|failed|provider_error|provider_auth|provider_unavailable|provider_refused|phase_step_cap|terminated_by_user|…)
 - `error_detail` — human sentence, secret-scrubbed, ≤~300 chars; empty on normal completion. Prefer over legacy `error`.
@@ -263,7 +263,7 @@ Producers: core/agent/machine.cpp (build_plan after plan pass; checklist from pl
 Python producer (2026-07-29, additive): `services/agent/task_list.py` publishes shape=`checklist` with `task:<n>`-namespaced ids on behalf of the `task_list` tool, streamed through `worker_rpc._agent_admin_turn`'s `_emit` and relayed verbatim by `core/agent/run.cpp`'s admin-turn branch. This is the ONLY plan_state producer reachable from the general lane (the universal online entry), which never enters the C++ machine/mission loops. Full-snapshot semantics: each publish restates every item, and the host's scoped-prune (common `task:` id prefix) drops rows the writer omitted.
 
 ## options.mode — copilot mode overhaul (Agent/Plan/Swarm/Edit/Ask)
-`options` on agent_run/agent_run_v2/agent_mission_v1 (agent_design removed T-RF5):
+`options` on agent_run/agent_run_v2/agent_mission_v1 (agent_design removed 2026-07-22):
 | key | type | default | meaning |
 |-----|------|---------|--------|
 | mode | agent|plan|swarm|edit|ask | agent | copilot composer mode (persisted host-side as config copilot_mode) |

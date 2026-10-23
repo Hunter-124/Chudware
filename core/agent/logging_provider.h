@@ -1,4 +1,4 @@
-// core/agent/logging_provider.h — thin C++ logging wrapper for provider calls (T-H7).
+// core/agent/logging_provider.h — thin C++ logging wrapper for provider calls.
 //
 // Provides LoggingProviderState — a lightweight struct the caller uses to:
 //   1. Receive per-call timing (last_latency_ms).
@@ -9,13 +9,13 @@
 // defined locally in run.cpp and forwarded via template so this header stays
 // self-contained.
 //
-// Offline + sidecar write policy (mirrors contracts/providers.md §5 and T-H7 design):
+// Offline + sidecar write policy (mirrors contracts/providers.md §5):
 //   - consent == "full" : request + response bodies written to run_dir/sidecars/
 //   - consent == "meta" : timing recorded, no bodies written
 //   - consent == "off"  : timing recorded, no bodies written
 //
 // The wrapper never makes network calls and never changes the return value.
-// GUI target must NOT link core/agent directly (C-ABI bridge only — see T-H1).
+// GUI target must NOT link core/agent directly (C-ABI bridge only).
 #pragma once
 
 #include <atomic>

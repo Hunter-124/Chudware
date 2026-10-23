@@ -461,7 +461,7 @@ TEST_CASE("fillet: isolated OCCT fault is a failed feature and process survives"
 #endif
 }
 
-// T-BL61: does fork-based blend isolation survive a MULTITHREADED process?
+// Does fork-based blend isolation survive a MULTITHREADED process?
 //
 // fork() hands the child a snapshot of every lock, so if another thread held the malloc arena
 // at fork time the child deadlocks on its first allocation - and OCCT allocates immediately.

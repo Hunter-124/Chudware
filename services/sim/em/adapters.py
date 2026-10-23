@@ -344,7 +344,7 @@ class _ScaffoldAdapter(EmAdapter):
 
 
 class GetdpAdapter(_ScaffoldAdapter):
-    """Gmsh + GetDP FEM (frequency-domain / eigenmode) — scaffold, T-SIM11."""
+    """Gmsh + GetDP FEM (frequency-domain / eigenmode) — scaffold."""
 
     name = "gmsh-getdp"
     kind = "fem"
@@ -352,32 +352,32 @@ class GetdpAdapter(_ScaffoldAdapter):
     linkage = "external-process"
     capabilities = ()              # planned: ("eigenmode", "driven")
     install_hint = ("pip install gmsh; GetDP: sudo dnf install getdp "
-                    "(or https://getdp.info binary) — adapter tracked in T-SIM11")
+                    "(or https://getdp.info binary) — adapter not yet implemented")
     _modules = ("gmsh",)
     _binaries = ("getdp", "gmsh")
 
 
 class MeepAdapter(_ScaffoldAdapter):
-    """MIT Meep FDTD — scaffold alternative to openEMS, T-SIM11."""
+    """MIT Meep FDTD — scaffold alternative to openEMS."""
 
     name = "meep"
     kind = "fdtd"
     license = "GPL-2+ (python module in separate worker process only)"
     linkage = "python-module"
     capabilities = ()              # planned: ("driven", "timedomain")
-    install_hint = "conda install -c conda-forge pymeep — adapter tracked in T-SIM11"
+    install_hint = "conda install -c conda-forge pymeep — adapter not yet implemented"
     _modules = ("meep",)
 
 
 class ElmerAdapter(_ScaffoldAdapter):
-    """Elmer FEM (VectorHelmholtz) — scaffold, T-SIM11."""
+    """Elmer FEM (VectorHelmholtz) — scaffold."""
 
     name = "elmer"
     kind = "fem"
     license = "GPL-2+ w/ LGPL ElmerSolver library (external process only)"
     linkage = "external-process"
     capabilities = ()              # planned: ("driven", "eigenmode")
-    install_hint = "sudo dnf install elmerfem — adapter tracked in T-SIM11"
+    install_hint = "sudo dnf install elmerfem — adapter not yet implemented"
     _binaries = ("ElmerSolver",)
 
 

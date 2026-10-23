@@ -2,7 +2,7 @@
 
 One per format, proving the seam end-to-end: ``smoke_deck`` (pptx), ``smoke_report``
 (docx/pdf), ``smoke_workbook`` (xlsx, with a live formula). Moved verbatim from the original
-flat ``templates.py`` when the package was split for the T-F15 engineering templates.
+flat ``templates.py`` when the package was split for the engineering templates.
 """
 from __future__ import annotations
 

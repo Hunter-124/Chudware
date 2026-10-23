@@ -208,7 +208,7 @@ def test_marker_at_home_or_fs_root_is_ignored(tmp_path, monkeypatch):
 
     from services.agent import project_context as pc
 
-    home = tmp_path / "home" / "hunter"
+    home = tmp_path / "home" / "user"
     (home / ".plm").mkdir(parents=True)
     work = home / "work" / "widget"
     work.mkdir(parents=True)

@@ -1,7 +1,7 @@
 {
   "_doc": {
     "schema": "aicad.margin_policy/1",
-    "description": "Per-material-class safety factors for sim margin verdicts (T-W9).",
+    "description": "Per-material-class safety factors for sim margin verdicts.",
     "source": "Shigley's Mechanical Engineering Design, 10th ed., §6 (fatigue) and §2 (static); AISC LRFD Table B4.1 (structural); ASME VIII-1 §UG-23 (pressure).",
     "fields": {
       "sf_yield": "Static design safety factor on yield strength (max_stress × sf_yield ≤ yield_mpa).",

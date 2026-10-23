@@ -1,6 +1,6 @@
-"""pipeline/linkage_integrity.py — Stage-3 linkage checkers (T-DP4).
+"""pipeline/linkage_integrity.py — Stage-3 linkage checkers.
 
-Three checkers for the LINKAGE phase (docs/AGENT_DESIGN_PIPELINE.md §2 Stage 3,
+Three checkers for the LINKAGE phase (docs/design/AGENT_DESIGN_PIPELINE.md §2 Stage 3,
 contract design_pipeline.md §3.3):
 
   check_reference_integrity   — no dangling refs, no cycles in reference_edges

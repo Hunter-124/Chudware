@@ -1,4 +1,4 @@
-"""Tests for ssh/https remote transports (contract §6, T-R7 follow-up).
+"""Tests for ssh/https remote transports (contract §6).
 
 Folder remotes already have full coverage in ``test_remote.py`` (seed/clone,
 linear sync, diverge → copy-as-variant, lock CAS, author injection). This file

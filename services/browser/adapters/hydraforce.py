@@ -1,4 +1,4 @@
-"""services/browser/adapters/hydraforce.py — HydraForce source adapter (T-X7).
+"""services/browser/adapters/hydraforce.py — HydraForce source adapter.
 
 HydraForce (hydraforce.com) makes hydraulic cartridge valves and custom
 manifolds, with clean per-part CAD (STEP/STP archives) available behind a

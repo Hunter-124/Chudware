@@ -1,5 +1,5 @@
-// Structural RPC dispatch (T-RF19 leaf 5) — the single entry the libchudware
-// integrator wires into core/api/libchudware.cpp. Mirrors the frozen surface of
+// Structural RPC dispatch — the single entry core/api/libchudware.cpp
+// dispatches to. Mirrors the frozen surface of
 // contracts/structural_schema.md §3 as implemented by
 // engine_oracle/structural/{analysis,checks,estimate}.py behind
 // services/mcp/structural_tools.py: dict in → dict out, expected failures come

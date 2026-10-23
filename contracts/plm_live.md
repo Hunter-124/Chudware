@@ -1,10 +1,10 @@
 # PLM live-session protocol — `aicad.plm-live/1`
 
-Status: **FROZEN v1** (T-R8, 2026-08-27).
+Status: **FROZEN v1** (2026-08-27).
 
 This is an additive live-editing extension to `contracts/plm.md`. It applies
 only when a project remote profile has `kind:"plm-server"` and capability
-`"live_coedit"`. Folder, SSH, and HTTPS snapshot remotes continue to use T-R7
+`"live_coedit"`. Folder, SSH, and HTTPS snapshot remotes continue to use `aicad.plm/1`
 advisory locks and copy-as-variant collision preservation without behavioral
 change.
 
@@ -232,9 +232,9 @@ A leave/timeout broadcasts `presence_left`.
 ```
 
 - Token material is external to this object.
-- `live_coedit` suppresses T-R7 advisory-lock actions only while an item is
+- `live_coedit` suppresses `aicad.plm/1` advisory-lock actions only while an item is
   joined live. Snapshot sync/checkpoints still use the vault.
-- Missing `live_coedit` means the client MUST use T-R7 locks even if the URL
+- Missing `live_coedit` means the client MUST use `aicad.plm/1` advisory locks even if the URL
   happens to point at a live-capable service.
 - `chudware-cloud` remains reserved/unavailable and does not imply this kind.
 
@@ -262,6 +262,6 @@ A conforming implementation MUST prove:
 2. late join and reconnect catch up without duplicate application;
 3. no client installs a partial batch snapshot;
 4. simultaneous last-leave writes one checkpoint attributed to all committers;
-5. dumb remote profiles still require T-R7 advisory locks;
+5. dumb remote profiles still require `aicad.plm/1` advisory locks;
 6. authentication, message-size, invalid-schema, sequence-gap, duplicate-id,
    and path-scope failures are fail-closed and plain-language.

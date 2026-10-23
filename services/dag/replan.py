@@ -1,6 +1,6 @@
 """replan.py — dag_replan: splice new nodes into a running (checkpointed) DAG run.
 
-Contract: contracts/dag_schema.md §0 (seam reserved for T-F12).
+Contract: contracts/dag_schema.md §0 (replan seam).
 Called by: services/dag/mcp_tools.py dag_replan MCP tool.
 
 Design intent
@@ -15,7 +15,7 @@ structural mutations to an in-progress run's compiled graph).  Instead it:
    persisted .graph.json sidecar).
 3. Writes the merged graph back to the sidecar so executor.resume() picks it
    up on the next resume call.
-4. Does NOT replay answered gate questions — the T-F4 ledger lives in
+4. Does NOT replay answered gate questions — the interaction ledger lives in
    SqliteSaver checkpoint state and is replayed automatically by
    executor.resume() → gate.run_gate() → interaction.answer().
 
@@ -74,7 +74,7 @@ def _validate_splice(
     splice_edges: list[dict[str, Any]],
     after_node_id: str,
 ) -> None:
-    """Enforce T-F12 DoD splice rules.
+    """Enforce the splice rules.
 
     Raises ReplannError on any violation.  All checks must pass before
     the merged graph is written.
@@ -111,7 +111,7 @@ def _validate_splice(
         if not end_condition or not str(end_condition).strip():
             raise ReplannError(
                 f"Spliced node {nid!r} is missing 'end_condition'. "
-                "Every spliced node must declare when it is done (T-F12 DoD)."
+                "Every spliced node must declare when it is done."
             )
 
     # Build set of spliced nodes that appear as back-edge "from"
@@ -128,7 +128,7 @@ def _validate_splice(
             raise ReplannError(
                 f"Spliced node {nid!r} has no retry back-edge (an edge with "
                 "'retry_budget' where 'from'={nid!r}). "
-                "Every spliced node requires a bounded retry cycle (T-F12 DoD)."
+                "Every spliced node requires a bounded retry cycle."
             )
 
     # Validate edge references
@@ -216,7 +216,7 @@ def dag_replan(
     new topology.
 
     The spliced nodes must NOT bypass gate questions already answered by the
-    T-F4 ledger — answered questions are replayed automatically by
+    interaction ledger — answered questions are replayed automatically by
     gate.run_gate() on resume, because the answers are stored in the
     SqliteSaver checkpoint, not in this module.
 

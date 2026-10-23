@@ -1,4 +1,4 @@
-// Structural document model (T-RF19 leaf 5) — C++ port of the data half of
+// Structural document model — C++ port of the data half of
 // engine_oracle/structural/: elements.py (aicad.structure/1 schema), plus the
 // material / section-property / load-combo helpers from analysis.py and
 // load_cases.py that the solver and the D/C checks consume.

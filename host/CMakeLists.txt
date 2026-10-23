@@ -144,12 +144,12 @@ target_include_directories(chudware_host_miniz PUBLIC "${miniz_SOURCE_DIR}" "${m
 set(CHUDWARE_CORE_SOURCES
   src/main.cpp
   src/app.cpp
-  src/app_commands.cpp   # T-RF11: ribbon command router + family handlers (extracted from app.cpp)
+  src/app_commands.cpp   # ribbon command router + family handlers (extracted from app.cpp)
   src/ui/scenarios.cpp   # scripted screenshot/test scenarios (extracted from app.cpp)
   src/core/app_state.cpp
   src/core/jobs.cpp
   src/core/context_ref.cpp  # context-picker chip record + wire/prompt forms (GL-free; unit-tested)
-  # --- AI Copilot (T-RF6: split of the legacy_chat.cpp monolith — one chat impl, two hosts) ---
+  # --- AI Copilot (one chat impl, two hosts) ---
   src/ui/copilot/ui_common.cpp          # glass/bubble toolkit + shared small-UI helpers
   src/ui/copilot/chat_log.cpp           # message list rendering + stick-to-bottom
   src/ui/copilot/activity_timeline.cpp  # per-turn typed-block activity timeline
@@ -178,7 +178,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/chudcode_descriptors.cpp       # Chudcode worker payload parsing (GL-free; unit-tested)
   src/ui/chudcode_session_actions.cpp   # Chudcode session recovery actions + link (GL-free; unit-tested)
   src/ui/oauth_capture.cpp  # in-app xAI multi-account CEF OAuth (Settings → Accounts)
-  src/ui/web_capabilities.cpp  # T-RF12: WASM-build gap table (ui::webBuild / ui::webGapReason)
+  src/ui/web_capabilities.cpp  # WASM-build gap table (ui::webBuild / ui::webGapReason)
   src/ui/console_panel.cpp
   # --- W1-B: core infrastructure (toast / cursor manager / shared appearance picker) ---
   src/ui/toast.cpp
@@ -193,7 +193,7 @@ set(CHUDWARE_CORE_SOURCES
   src/renderer.cpp
   # --- C15: AICM loader + ID-buffer picking + overlays + selection ---
   src/render/aicm_loader.cpp
-  ../core/util/aicm_handoff.cpp   # T-PERF10: aicm-shm:// map for loadAicmFile
+  ../core/util/aicm_handoff.cpp   # aicm-shm:// map for loadAicmFile
   src/render/id_pass.cpp
   src/render/overlays.cpp
   src/render/doc_thumbnail.cpp      # offscreen shaded DocMesh previews (AI Active Work cards)
@@ -278,11 +278,11 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/equations_dialog.cpp
   src/ui/profiler_window.cpp   # in-app sampling-profiler window (text report + flamegraph)
   src/ui/command_search.cpp    # unified settings + modeling-tools search popup
-  # --- Wave N: AI-ECAD 2D GUI (schematic / PCB editor) ---
+  # --- ECAD 2D GUI (schematic / PCB editor) ---
   src/ui/ecad/ecad_mirror.cpp
   src/ui/ecad/ecad_canvas.cpp
   src/ui/ecad/ecad_panel.cpp
-  # --- end Wave N ---
+  # --- end ECAD ---
   # --- CAM (computer-aided machining) workspace: toolpaths / post / sim ---
   src/ui/cam/cam_mirror.cpp
   src/ui/cam/cam_panel.cpp
@@ -362,7 +362,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/ai/docs_panel.cpp      # AI-tab document attach / preview / edit panel
   src/ui/ai/rules_authoring.cpp  # Settings->AI->Rules authoring popup (skill/context pack/rule)
   src/ui/reveng/reveng_workspace.cpp  # RE-03 Reverse Engineering workspace shell
-  src/ui/firmware/fw_workspace.cpp    # T-FIN5 Firmware workspace (projects/build/emulation/trace)
+  src/ui/firmware/fw_workspace.cpp    # Firmware workspace (projects/build/emulation/trace)
   src/ui/reveng/dim_review.cpp        # RE-22 dim-confirm review + deviation panels
   src/ui/reveng/img_tex.cpp          # RE-08 JPEG/PNG->GL texture (shared by RE-19 gallery)
   src/ui/reveng/image_gallery.cpp    # RE-19 thumbnail grid + drag-drop gallery

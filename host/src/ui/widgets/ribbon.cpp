@@ -14,7 +14,7 @@
 #include "../metrics.h"       // ui::metrics::px/U/stroke/rounding + ribbon tokens
 #include "../appearance_common.h"  // ui::kMaterials (material swatch colors)
 #include "../layout.h"        // ui::setEvalRibbonDock (Evaluate-tab inspector dock strip)
-#include "../web_capabilities.h"  // ui::webGapReason (T-RF12: WASM-build ribbon gating)
+#include "../web_capabilities.h"  // ui::webGapReason (WASM-build ribbon gating)
 #include "kit.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -127,7 +127,7 @@ static int s_workspace = 0;
 // disabled with s_disabledReason in their tooltip (instead of the static reserved-row reason). Used by
 // SimManager to grey the EM tools while the em_* solver backend is not installed. A second
 // consumer exists: ribbon_dynDisabledReason also falls through to ui::webGapReason(cmd_id),
-// which greys web-unsupported commands in the WASM build (T-RF12, data-driven from
+// which greys web-unsupported commands in the WASM build (data-driven from
 // ui/web_capabilities.cpp — no per-command state here).
 static std::string s_disabledPrefix;
 static std::string s_disabledReason;
@@ -158,7 +158,7 @@ static const char* ribbon_dynDisabledReason(const char* cmd_id) {
     const char* why = nullptr;
     if (ui::ribbonStudyGate(cmd_id, ribbon_studyCtx(), &why) == ui::RibbonStudyGate::Disabled)
         return why;
-    // T-RF12: web-build capability gaps (ui/web_capabilities.cpp; folds to nullptr on
+    // Web-build capability gaps (ui/web_capabilities.cpp; folds to nullptr on
     // native, so desktop rendering/tooltips are unchanged).
     return ui::webGapReason(cmd_id);
 }
@@ -2094,7 +2094,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     // Translucent chrome base so the glassBackground layers below actually read as glass — the
     // tooltip does the same via a transparent PopupBg. Keep the chrome-tint hue (so the band still
     // follows the Global glass tint) but drop its alpha; the glass fill/shine/border supply the
-    // surface. See SHARED VISUAL CONTRACT in work/tasks/T-G15.md.
+    // surface. See docs/dev/gui-theme-layout.md.
     ImVec4 ribbonBase = ribbon_chromeTint(palette.ribbonBg);
     ribbonBase.w = 0.0f;
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ribbonBase);
@@ -2109,8 +2109,8 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     // Liquid-glass chrome: paint the shared glass material (the SAME glassBackground helper the
     // tooltips use) over the band so the ribbon matches the rest of the app. Full-width flush band
     // -> rounding 0 (rounded corners would gap at the window edges); the glass READ comes from the
-    // translucent fill + inner shine + hairline border. See SHARED VISUAL CONTRACT in
-    // work/tasks/T-G15.md (opus-gleam, 2026-07-03).
+    // translucent fill + inner shine + hairline border. See
+    // docs/dev/gui-theme-layout.md.
     {
         ImVec2 wSize = ImGui::GetWindowSize();
         ui::glassBackground(dl, wPos, ImVec2(wPos.x + wSize.x, wPos.y + wSize.y), 0.0f);

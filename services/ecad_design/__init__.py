@@ -1,6 +1,6 @@
 """services/ecad_design — the autonomous ECAD design orchestrator (thin LLM orchestration).
 
-Re-homed from ``engine_oracle/ecad/orchestrator.py`` in T-RF20 (thin-client flip): the
+Re-homed from ``engine_oracle/ecad/orchestrator.py`` (thin-client flip): the
 orchestrator is a prompt/validate/retry state machine over an LLM provider — services-side
 agent tooling, NOT engine logic. The deterministic ECAD machinery it drives (session, ops,
 recipe fallback, netlist, SPICE sim) remains in the transitional ``engine.ecad`` /

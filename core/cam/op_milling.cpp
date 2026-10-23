@@ -162,7 +162,7 @@ GenResult gen_pocket2d(const Operation& opIn, const OpContext& ctx) {
             else {
                 // straight-plunge entry: rapid over the entry point at clearance FIRST,
                 // then plunge — else the tool plunges from wherever the previous loop/level
-                // ended, air-cutting or diving into a wall (audit D3). rapid_xy retracts to
+                // ended, air-cutting or diving into a wall. rapid_xy retracts to
                 // the clearance plane internally before the XY traverse.
                 pb.rapid_xy(entry);
                 pb.plunge_to(z);

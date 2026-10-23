@@ -1,7 +1,7 @@
 """MCP antenna tools — design + analyze envelopes, openEMS skip.
 
 Run:
-  /home/hunter/.local/share/Chudware/mcp-venv/bin/python -X utf8 -m pytest \\
+  python -X utf8 -m pytest \\
       services/mcp/test_antenna_tools.py -q
 """
 from __future__ import annotations
@@ -128,7 +128,7 @@ class TestAntennaMcpTools(unittest.TestCase):
 
     def test_analyze_monkeypatch_skip_envelope(self):
         t0 = time.perf_counter()
-        from services.sim.em import antenna_bridge as bridge  # T-RF20: em re-homed services-side
+        from services.sim.em import antenna_bridge as bridge  # em lives services-side
         real = bridge.openems_available
 
         def _gone():

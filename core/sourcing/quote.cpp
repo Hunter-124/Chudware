@@ -2,7 +2,7 @@
 // engine_oracle/quote_providers.py: approved instant-quote APIs with the customer's
 // own credentials (config.json "quote_providers" section or env fallback), §0
 // degraded shapes when keyless — never a network call without a key. The JLCPCB
-// Open API HMAC-SHA256 request signing (T-BL24) is ported verbatim and pinned
+// Open API HMAC-SHA256 request signing is ported verbatim and pinned
 // against the oracle's known-signature fixture. HTTP via the Seams injection
 // point; SHA-256 is the shared header-only util/sha256.h implementation.
 #include "sourcing/sourcing.h"
@@ -214,7 +214,7 @@ json normalize_result(const std::string& provider, int quantity, const json& raw
     return out;
 }
 
-// ---- JLCPCB signing (T-BL24) ----------------------------------------------------------------------
+// ---- JLCPCB signing ----------------------------------------------------------------------------
 
 std::string upper(std::string s) {
     for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));

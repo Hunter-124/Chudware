@@ -6,7 +6,7 @@ This loader reads the small, documented YAML subset under ``services/parts/data/
 ``core/parts`` catalog family so the spec-sheet matcher can build real geometry.
 
 The bundled data is clean-room ISO/DIN dimensional data (NOT the BOLTS project's GPL data —
-see ``contracts/licenses.md`` and ``work/questions/T-B4.md``). The parser accepts the
+see ``contracts/licenses.md``). The parser accepts the
 BOLTS ``.blt`` *concept* (collection → standards → size table), so a user who points
 ``load_bolts_tables`` at their own installed BOLTS checkout is supported by the same code
 without us redistributing GPL data.

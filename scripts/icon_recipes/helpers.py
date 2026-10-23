@@ -49,7 +49,7 @@ ACCENT_RGB = PRIMARY_RGB
 
 def accent(body_id: str = "b1") -> dict:
     """Color a body with the PRIMARY accent so the tile highlights what the operation
-    produced (T-BL34 per-body emphasis)."""
+    produced (per-body emphasis)."""
     return {"op": "set_appearance", "id": body_id, "color": list(PRIMARY_RGB),
             "metallic": 0.05, "roughness": 0.45}
 
@@ -73,7 +73,7 @@ def sketch(entities: list, plane: str = "plane.front", name: str = "Sk",
     """Returns a LIST of iconpipe steps: one empty add_feature + one sketch_add_entity
     per entity.  The runner applies each step as its own applyOps call; inline
     params.entities is NOT supported by the engine (the sketch is always created empty,
-    then entities are added via sketch_add_entity — proven empirically, see T-BL29 log).
+    then entities are added via sketch_add_entity — verified empirically).
     sketch_id is the persistent feature id the engine will assign (e.g. 'f1') — used so
     sketch_add_entity steps reference the right sketch.  If omitted, callers must pass
     the id via the recipe's steps directly."""

@@ -346,7 +346,7 @@ SimResult run_renode(const std::string& elf_path, const std::string& platform_fi
     const auto copied_elf = inputs.copy(elf_path, "firmware.elf");
     const auto copied_platform = inputs.copy(platform_file, "platform.repl");
 
-    // Compile the scenario (T-FIN3) — pure plan first, then aux files on disk.
+    // Compile the scenario — pure plan first, then aux files on disk.
     std::vector<std::string> scenario_setup;
     std::vector<std::pair<double, std::string>> scenario_timeline;
     std::string scenario_dir;

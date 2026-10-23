@@ -1,4 +1,4 @@
-"""Test suite for node_runner.py and context_pack.py — T-A2.
+"""Test suite for node_runner.py and context_pack.py.
 
 All tests use injected mock agent functions (no live LLM, no engine build).
 
@@ -672,7 +672,7 @@ class TestSection14NarrationFields:
 
 
 # ---------------------------------------------------------------------------
-# Role card wiring (T-W7): a node's ``role:`` field applies the card
+# Role card wiring: a node's ``role:`` field applies the card
 # ---------------------------------------------------------------------------
 
 
@@ -748,7 +748,7 @@ class TestRoleCardWiring:
 
 
 # ---------------------------------------------------------------------------
-# T-W30 finisher — default agent_fn: ledger threading + tier budget seam
+# Default agent_fn: ledger threading + tier budget seam
 # ---------------------------------------------------------------------------
 
 
@@ -1047,7 +1047,7 @@ class TestDispatchLaneParity:
 
 
 class TestMissionRoleCardWiring:
-    """T-W30 real-run regressions: mission-graph nodes carry role in inputs.role
+    """Real-run regressions: mission-graph nodes carry role in inputs.role
     (mission_template._node); the runner must resolve the card from there and must
     apply the card allowlist when the context pack's allowed_tools is OPEN (None).
     Both were silently broken (node['role'] only + setdefault on a present key) —
@@ -1109,7 +1109,7 @@ class TestMissionRoleCardWiring:
 
 
 class TestMissionNodeRequests:
-    """T-W30: mission node requests must EMBED the manifest content (verbatim
+    """Mission node requests must EMBED the manifest content (verbatim
     request + deliverable + acceptance criteria), not reference an absent brief."""
 
     def _manifest(self):
@@ -1159,7 +1159,7 @@ class TestMissionNodeRequests:
 
 
 def test_role_policy_is_scoped_to_the_turn():
-    """T-W30 gate-sweep regression: applying a role card's allowlist must NOT
+    """Gate-sweep regression: applying a role card's allowlist must NOT
     leak into the process-global tool_registry after the node turn returns
     (it broke ~78 unrelated cad/gsl tool tests in the combined sweep)."""
     from services.mcp import tool_registry as reg
@@ -1183,7 +1183,7 @@ def test_role_policy_is_scoped_to_the_turn():
 
 
 # ---------------------------------------------------------------------------
-# T-W32 — tool-schema injection + run-scoped dispatcher wiring
+# Tool-schema injection + run-scoped dispatcher wiring
 # ---------------------------------------------------------------------------
 
 

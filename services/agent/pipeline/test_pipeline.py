@@ -1,6 +1,6 @@
-"""test_pipeline.py — T-W19 mission pipeline glue.
+"""test_pipeline.py — Mission pipeline glue.
 
-Covers, per the task DoD:
+Covers:
   * manifest validator rule-by-rule (a fixture per contract §16 rule);
   * phase gate enforcement (cannot enter BUILD with an unratified plan);
   * replan routing matrix (§17, incl. criteria-change → user, scope=org);
@@ -273,7 +273,7 @@ def test_plan_gate_blocks_when_not_ratified():
 
 
 def test_cannot_enter_build_from_unratified_plan():
-    """The load-bearing DoD case: BUILD is unreachable while PLAN's gate fails."""
+    """The load-bearing case: BUILD is unreachable while PLAN's gate fails."""
     machine = PhaseMachine()
     machine.enter(Phase.PLAN)
     plan_gate = machine.run_gate(Phase.PLAN, {
@@ -358,7 +358,7 @@ def test_clarify_skipped_without_blocking_ambiguity():
 
 
 def test_organize_skipped_unless_flag_on():
-    # T-W22: org_layer=True is now the default. Explicit False skips ORGANIZE.
+    # org_layer=True is the default. Explicit False skips ORGANIZE.
     off = PhaseMachine(flags=PipelineFlags(org_layer=False))
     assert off.next_phase(Phase.SPECIFY, {}) is Phase.PLAN  # ORGANIZE skipped
     on = PhaseMachine(flags=PipelineFlags(org_layer=True))
@@ -366,7 +366,7 @@ def test_organize_skipped_unless_flag_on():
 
 
 def test_organize_is_default_on():
-    """T-W22: PipelineFlags() default now has org_layer=True."""
+    """PipelineFlags() defaults to org_layer=True."""
     flags = PipelineFlags()
     assert flags.org_layer is True
     m = PhaseMachine()
@@ -406,7 +406,7 @@ def test_correct_loop_reentry_is_legal():
 
 
 # ===========================================================================
-# 2b. T-DP1 design-pipeline stages (flagged refinement, contract design_pipeline.md)
+# 2b. Design-pipeline stages (flagged refinement, contract design_pipeline.md)
 # ===========================================================================
 
 def test_design_pipeline_default_off_specify_advances_as_before():
@@ -432,7 +432,7 @@ def test_design_pipeline_flag_on_visits_four_stages():
 
 
 def test_design_pipeline_exits_checkpoint_typed_ledger_story(tmp_path):
-    """T-DP14: every typed boundary cuts one attributed History entry."""
+    """Every typed boundary cuts one attributed History entry."""
     from services.agent.ledger import Ledger
     from services.agent.plm_bridge import MockVault, PLMBridge
 
@@ -808,7 +808,7 @@ def test_end_to_end_all_phases_mock(tmp_path):
     run_id = f"t_w19_e2e_{uuid.uuid4().hex[:8]}"
     ledger = Ledger.load(run_id, path=tmp_path / "ledger.json")
     # Use org_layer=False for this focused 8-phase dry run (avoids needing a real
-    # org chart fixture here; the org-layer e2e is covered in test_org.py T-W22).
+    # org chart fixture here; the org-layer e2e is covered in test_org.py).
     machine = PhaseMachine(ledger=ledger, flags=PipelineFlags(org_layer=False))
 
     manifest = _valid_manifest()
@@ -872,7 +872,7 @@ def test_end_to_end_all_phases_mock(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T-W30 — honest VERIFY gate (reviewer results, not fabricated PASS)
+# Honest VERIFY gate (reviewer results, not fabricated PASS)
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

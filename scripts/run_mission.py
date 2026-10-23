@@ -367,8 +367,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prompt-file", required=True, help="file holding the prompt")
     parser.add_argument("--role", default="general_agent")
     # A headless mission has nobody to check with: the interactive `work_style` preference
-    # (default check_with_me → plan mode) must not govern it. Three ME 490 turns produced
-    # nothing but blocked_by_mode refusals when it did (2026-09-07).
+    # (default check_with_me → plan mode) must not govern it. Three headless mission turns
+    # produced nothing but blocked_by_mode refusals when it did (2026-09-07).
     parser.add_argument("--mode", default="agent", choices=("agent", "plan", "ask"),
                         help="copilot mode for this turn (headless default: agent)")
     parser.add_argument("--resume", default="", help="chudcode_session_file to resume")

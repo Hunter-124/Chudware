@@ -1,6 +1,6 @@
 """Mega-22 fixes — P22 SPICE driven rail, Q22 board→optimize→DRC, R22 measure faces.
 
-Grounded in mega-21 a1 fingerprints (reports/runs/mega-21/):
+Grounded in mega-21 a1 fingerprints:
 
   P22 / AC5 — resolved_net=3V3 but V(3V3)=0.0; device_count=1; U1 skipped
               (no sim model). Source V + load R never both attached to the

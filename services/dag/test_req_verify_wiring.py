@@ -1,7 +1,7 @@
 """End-to-end test: requirement with verify_by: run_fea_static gets auto-verified
 when the DAG orchestrator runs a verify node with check_type='requirement'.
 
-T-BL09 DoD — the binding demo.
+The binding demo.
 No C++ engine needed: the verifier tool is injected as a mock via tool_fn_override.
 The req doc is persisted as a .req.json file (standalone, engine-free).
 """
@@ -243,7 +243,7 @@ class TestReqVerifyWiring:
 
 
 class TestDesignReviewReqWiring:
-    """design_review battery accepts requirement IDs (T-BL09 DoD item 2)."""
+    """design_review battery accepts requirement IDs."""
 
     def test_design_review_verifies_requirement(self, req_file):
         from services.mcp.design_review_tools import _run_design_review

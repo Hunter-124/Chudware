@@ -1,4 +1,4 @@
-"""CatalogProvider adapter for ISO 1219 hydraulic components (T-P2).
+"""CatalogProvider adapter for ISO 1219 hydraulic components.
 
 Enumerates the HYD_COMPONENT_TYPES enum (now core/hydraulic/schema.cpp).
 One PartRecord per component type. Domain: "hydraulic".

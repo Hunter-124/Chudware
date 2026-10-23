@@ -2,7 +2,7 @@
 // engine/sim/subckt.py (.subckt/.ends collection + X-instance expansion).
 //
 // parse_netlist(text) tokenizes a SPICE deck into the FROZEN Circuit dict
-// (docs/contracts/ecad/sim.md §1):
+// (contracts/ecad/sim.md §1):
 //     {nodes:[...], devices:[{kind,name,nodes,value,model,params}],
 //      models:{name:{type,...}}, params:{TEMP:27,...}}
 // matching the Python oracle's output byte-for-byte (modulo JSON key order +

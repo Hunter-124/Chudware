@@ -1,4 +1,4 @@
-"""T-SIM4 live FEA bridge integration test — cantilever static + modal vs beam theory.
+"""Live FEA bridge integration test — cantilever static + modal vs beam theory.
 
 Drives the real Polyhedral-FEA-enabled engine exactly like a user session would, on the
 raw core bridge (no full MCP server needed).
@@ -19,8 +19,8 @@ Assertions are BEAM-THEORY ANCHORS with physical-sanity bounds, not exact floats
     the FEA peak von Mises must sit ABOVE it (clamped-face stress concentration)
     but within a sane multiple.
   * First bending mode f₁ = (β₁L)²/(2πL²)·√(EI/ρA) = 40.77 Hz — the "40.8 Hz"
-    anchor documented in work/audits/SIM_AUDIT.md and reproduced live to 0.215%
-    in reports/vv/vv_report.md M1 (Rao, Mechanical Vibrations, 5th ed., §8.2
+    anchor, reproduced live to 0.215% by the V&V benchmark
+    (scripts/vv_benchmark.py M1; Rao, Mechanical Vibrations, 5th ed., §8.2
     Table 8.1: β₁L = 1.87510). A square section must also give a near-degenerate
     second mode (two orthogonal bending planes).
 

@@ -21,7 +21,7 @@ import tempfile
 from pathlib import Path
 
 # Allow running as a plain script or as a module. Shared assets were de-duped out of host/ into
-# the top-level assets/ (T-G11), so make_icons now lives alongside this file.
+# the top-level assets/, so make_icons now lives alongside this file.
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
 sys.path.insert(0, str(REPO_ROOT))

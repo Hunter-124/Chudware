@@ -1,4 +1,4 @@
-"""services/browser/adapters/componentsearchengine.py — Component Search Engine adapter (T-X7).
+"""services/browser/adapters/componentsearchengine.py — Component Search Engine adapter.
 
 Component Search Engine (componentsearchengine.com), the SamacSys / Supplyframe
 library portal, hosts schematic symbols, PCB footprints and 3D STEP models per

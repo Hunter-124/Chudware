@@ -280,7 +280,7 @@ TEST_CASE("drag3 soft-targets a handle and honors constraints") {
     CHECK(bad["entities"].contains("e1"));
 }
 
-// ---- eq_curve3d (T-3DEQ) ------------------------------------------------------
+// ---- eq_curve3d ----------------------------------------------------------------
 
 TEST_CASE("eq_curve3d: helix endpoints match x(t1)/y(t1)/z(t1) and x(t2)/y(t2)/z(t2)") {
     json sk;

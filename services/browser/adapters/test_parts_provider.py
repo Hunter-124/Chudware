@@ -1,4 +1,4 @@
-"""Tests for services/browser/adapters/parts_provider.py — T-X3.
+"""Tests for services/browser/adapters/parts_provider.py.
 
 No real Playwright/network: a fake SourceAdapter stands in for GrabCAD/TraceParts.
 """
@@ -176,7 +176,7 @@ def test_get_propagates_and_enriches_acquire_failure(provider_mods):
 
 
 def test_get_folds_vendor_extras_into_params(provider_mods):
-    """T-X7 item 3: acquire-envelope extras (e.g. McMaster sku + price) land in params
+    """Acquire-envelope extras (e.g. McMaster sku + price) land in params
     alongside site/url/fetched_ts, so vendor/SKU/URL/fetched-at ride on the part record."""
     profiles, parts_provider = provider_mods
     profiles.profile_dir("fakesite").mkdir(parents=True)

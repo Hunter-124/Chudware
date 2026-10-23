@@ -1,9 +1,9 @@
-"""Unified parts library hub — `aicad.parts/1` (T-P1).
+"""Unified parts library hub — `aicad.parts/1`.
 
 Federated search across all standard-parts catalogs via the CatalogProvider protocol
-(contracts/parts.md). T-P1 ships two adapters (bolts/bearings + core_families).
+(contracts/parts.md).
 
-Re-homed from ``engine_oracle/parts_hub/`` to ``services/parts/`` in T-RF19
+Re-homed from ``engine_oracle/parts_hub/`` to ``services/parts/``
 (catalog orchestration — SQLite FTS5 + JSON taxonomy, no geometry — is a
 service, not engine kernel). ``engine_oracle/parts_hub/__init__.py`` remains as
 a thin compatibility shim re-exporting this package's public API while

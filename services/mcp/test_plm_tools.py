@@ -1,4 +1,4 @@
-"""End-to-end tests for the plm_* MCP tools (T-R2, contract §7).
+"""End-to-end tests for the plm_* MCP tools (contract §7).
 
 Exercises the registered tools through a FastMCP instance the way an MCP client
 would, asserting the §0 envelope shape and the ease-of-use invariants (§8).

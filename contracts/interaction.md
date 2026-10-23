@@ -8,9 +8,9 @@
 > the agent can propose a decision (auto-accept the default) instead of stalling or
 > silently guessing.
 
-Frozen-seam policy applies (see `README.md`): append-only, integrator sign-off + version
+Frozen-seam policy applies (see `README.md`): append-only, maintainer sign-off + version
 bump to change an existing field. The three legacy mechanisms become *callers* of this
-contract (T-F4); this contract does not break them.
+contract; this contract does not break them.
 
 ## 1. Question kinds
 
@@ -137,7 +137,7 @@ core, not the transport.
 | in-app dialog | desktop GUI | ImGui PropertyManager-style modal form built from the batch (`ui/abstract` form model + `ui/imgui` component) |
 | MCP elicitation | external MCP clients | `mcp` 1.27.2 `Context.elicit(message, schema)` — the client prompts its own user (spec-stable; NOT sampling) |
 | CLI | headless / CI | stdin/stdout prompts |
-| DAG gate | orchestrator | WS-A `interrupt()` node raises a batch (future caller, T-A3) |
+| DAG gate | orchestrator | DAG `interrupt()` node raises a batch (future caller) |
 
 ## 9. Proactive path (verify → ask, don't retry)
 

@@ -1,10 +1,10 @@
 """mission_template.py — turn a validated deliverable manifest into an
-``aicad.dag/1`` mission graph whose nodes carry role assignments (T-W19).
+``aicad.dag/1`` mission graph whose nodes carry role assignments.
 
 The mission DAG is the executable form of the phase sequence
 (docs/COPILOT_MISSION_PIPELINE.md §1).  Each phase becomes one or more DAG nodes;
 each node names the ROLE that runs it.  Role system prompts are loaded VERBATIM
-from ``services/agent/roles/*.yaml`` via the T-W7 loader — never inlined in code
+from ``services/agent/roles/*.yaml`` via the role-card loader — never inlined in code
 (contract rule; docs §5).  The node's ``inputs.role`` + ``inputs.role_prompt``
 carry the card to the node runner, which applies the role's tool allowlist.
 
@@ -48,7 +48,7 @@ _TYPE_VERIFY = "verify"
 _TYPE_DELIVER = "report"
 
 # Role assignment by deliverable kind (BUILD + DELIVER phases).
-# mega-11: analysis deliverables split into producing ECAD/firmware roles
+# Analysis deliverables split into producing ECAD/firmware roles
 # (name-keyed) so they leave sim_engineer (FEA-only) and stop dying as one-shot
 # ollama DELIVER leaves with zero schematic/board/fw artifacts.
 _BUILD_ROLE_BY_KIND = {
@@ -71,7 +71,7 @@ _DELIVER_ROLE_BY_KIND = {
     "weldment_traveler": "general_agent",
 }
 
-# mega-7: map deliverable kind → role_models TaskClass so depth-0 leaf nodes
+# Map deliverable kind → role_models TaskClass so depth-0 leaf nodes
 # (VERIFY/DELIVER/INTAKE) can auto_pick cheap models. Without this stamp every
 # node defaults to unknown→min_rank=3→frontier and cheap-share stays 0%.
 _KIND_TASK_CLASS = {
@@ -98,7 +98,7 @@ _BUILDABLE_KINDS = frozenset({
 
 
 def _role_prompt(role_id: str) -> str:
-    """Load a role card's system prompt VERBATIM (T-W7 loader).  Best-effort: a
+    """Load a role card's system prompt VERBATIM.  Best-effort: a
     missing card leaves the prompt empty so the node runner falls back to the
     default — the mission still runs (a role prompt is an enhancement, not a hard
     dependency of the DAG shape)."""
@@ -112,7 +112,7 @@ def _role_prompt(role_id: str) -> str:
 def _mission_context(manifest: dict[str, Any]) -> str:
     """The mission request VERBATIM — the context every node request embeds.
 
-    T-W30: the real C1 run proved the synthesized node requests referenced 'the
+    A real C1 run proved the synthesized node requests referenced 'the
     project brief' without CONTAINING it, so the model (correctly) stalled asking
     for it. Every node request now carries the manifest's request_verbatim —
     nothing invented, just the §16 content the mission was compiled from."""
@@ -455,7 +455,7 @@ def _task_class_for(
 def _resolve_build_role(d: dict[str, Any]) -> str:
     """Pick the BUILD worker role for a deliverable.
 
-    mega-11: schematic/SPICE analysis → ``ecad_engineer``; PCB/board/antenna
+    Schematic/SPICE analysis → ``ecad_engineer``; PCB/board/antenna
     analysis → ``pcb_engineer``. A mixed schematic+board deliverable starts in
     ``ecad_engineer`` and uses its explicit handoff/delegate path to pcb_engineer.
     Firmware/sensor_loop → ``firmware_engineer``; generic analysis → sim_engineer.
@@ -498,14 +498,14 @@ def _resolve_build_role(d: dict[str, Any]) -> str:
 
 
 def _resolve_deliver_role(d: dict[str, Any]) -> str:
-    """DELIVER role by kind. Producing happens on BUILD (mega-11); DELIVER
+    """DELIVER role by kind. Producing happens on BUILD; DELIVER
     stays a cheap report/reviewer so one-shot leaves do not re-invent tools."""
     kind = d.get("kind") or ""
     return _DELIVER_ROLE_BY_KIND.get(kind, "reviewer")
 
 
 def _build_job_for(d: dict[str, Any], role: str) -> str:
-    """Concrete BUILD job text naming deliverable + entry tools (mega-11 legs)."""
+    """Concrete BUILD job text naming deliverable + entry tools."""
     if role == "ecad_engineer":
         return (
             "PRODUCE this deliverable's schematic artifacts with the engine "
@@ -590,7 +590,7 @@ def _build_job_for(d: dict[str, Any], role: str) -> str:
             "procedure, fit-up, sequence, process variables and inspection/signoff "
             "hold points. Return the artifact path; prose alone is not done."
         )
-    # Mechanical / default BUILD — concrete airframe geometry guidance (mega-13 AC1)
+    # Mechanical / default BUILD — concrete airframe geometry guidance
     name = str(d.get("name") or d.get("id") or "").lower()
     desc = str(d.get("description") or "").lower()
     blob = f"{name} {desc}"
@@ -705,7 +705,7 @@ def build_mission_graph(
                          When ``None``, inferred from the presence of an
                          ``assembly``-kind deliverable.
         org_layer:       insert the ORGANIZE (department_manager) node (Phase 2.5,
-                         feature-flagged on T-W22/T-W23).
+                         feature-flagged).
         default_autonomy: node autonomy floor ("auto" | "approve" | "manual").
         tier:            optional model tier (``local-24k`` / ``local-48k`` / ``mid`` /
                          ``frontier``) recorded on EVERY node's ``inputs.tier``. This is
@@ -714,7 +714,7 @@ def build_mission_graph(
                          over MCP, followed by ``dag_run``): ``services.dag.node_runner``
                          reads ``inputs.tier`` and resolves it via
                          ``services.agent.tiers.provider_for_tier`` — the same seam the
-                         gym bench (T-DP19) uses — instead of silently falling through
+                         gym bench uses — instead of silently falling through
                          to the ambient config.json / ``CHUDWARE_PROVIDER`` default.
                          ``None`` (the default) leaves every node's ``inputs`` exactly
                          as before — no behaviour change for callers that don't pass it.
@@ -734,7 +734,7 @@ def build_mission_graph(
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
 
-    # T-W30: every node request EMBEDS the mission/deliverable content (verbatim
+    # Every node request EMBEDS the mission/deliverable content (verbatim
     # manifest data) — a synthesized request that merely references 'the project
     # brief' stalls a real model turn (proved by the C1 real run).
     mission_ctx = _mission_context(manifest)
@@ -780,7 +780,7 @@ def build_mission_graph(
     # A join point so the following phases depend on ALL specs.  It is a plan-type
     # node (role overseer) rather than a DAG 'gate' node: the SPECIFY exit gate is
     # enforced by the pipeline PhaseMachine (deterministic), and the overseer AUDIT
-    # is a feature-flagged trigger (T-W13) — neither should hard-pause an
+    # is a feature-flagged trigger — neither should hard-pause an
     # autonomous run.  The run-level autonomy_default still applies (raise the whole
     # run to approve/manual to gate every node, including this one).
     spec_join = "n_spec_done"
@@ -827,7 +827,7 @@ def build_mission_graph(
     edges.append({"from": tail, "to": plan_id})
 
     # --- Phase 4: BUILD (fan-out per buildable deliverable) ----------------
-    # mega-11: analysis (ECAD/firmware) is buildable so legs get tool-capable
+    # Analysis (ECAD/firmware) is buildable so legs get tool-capable
     # nodes instead of jumping SPECIFY → one-shot DELIVER with zero artifacts.
     build_ids: dict[str, str] = {}
     buildable = [d for d in deliverables if d.get("kind") in _BUILDABLE_KINDS]
@@ -959,7 +959,7 @@ def build_mission_graph(
         for n in nodes:
             n.setdefault("inputs", {})["tier"] = tier
 
-    # mega-7 safety net: every node must carry task_class for auto_pick.
+    # Safety net: every node must carry task_class for auto_pick.
     for n in nodes:
         ni = n.setdefault("inputs", {})
         if not ni.get("task_class"):

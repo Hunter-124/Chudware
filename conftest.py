@@ -89,7 +89,7 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Sub-agent registry isolation (Phase 4, M11): services/agent/subagent_registry.py
+# Sub-agent registry isolation: services/agent/subagent_registry.py
 # is file-backed under ~/.local/share/Chudware/cache/subagents by default, and
 # DelegationTree.request_delegation registers a session on EVERY spawn — so any
 # delegation-exercising test would pollute the real user registry (and the GUI's
@@ -377,8 +377,8 @@ def _restore_path_configuration():
 
 @_pytest.fixture(autouse=True)
 def _reset_core_bridge_daemon_fallback():
-    """core_bridge's daemon→legacy fallback is sticky for the process by design
-    (docs/PERF_AUDIT_2026-07-10.md §1); in a pytest process that stickiness makes
+    """core_bridge's daemon→legacy fallback is sticky for the process by design;
+    in a pytest process that stickiness makes
     suite outcomes order-dependent (one intentionally-broken daemon strands every
     later test in legacy mode). Reset it on the canonical loaded module identity."""
     yield

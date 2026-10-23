@@ -1,4 +1,4 @@
-"""services/browser/adapters/content3d.py — 3D ContentCentral source adapter (T-X7).
+"""services/browser/adapters/content3d.py — 3D ContentCentral source adapter.
 
 3D ContentCentral (3dcontentcentral.com, Dassault/SOLIDWORKS) hosts free
 supplier-certified and community CAD models. Search is public; downloads
@@ -9,7 +9,7 @@ Site key is "3dcontentcentral" (the registry and profiles.slug() both accept
 digits); the friendly display label is "3D ContentCentral".
 
 NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live logged-in 3D ContentCentral session (T-X6 gates the real
+against a live logged-in 3D ContentCentral session (the gated integration suite covers the real
 per-source integration tests behind an env flag).
 """
 from __future__ import annotations

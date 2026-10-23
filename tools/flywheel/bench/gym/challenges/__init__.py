@@ -48,7 +48,7 @@ TEXT_EYE_TOOLS: frozenset[str] = frozenset({
     "measure_part", "query_geometry", "sketch_health",
 })
 
-# C1–C8 text-solvable calibration subset (WI-1 / WI-2). C2 is dual-division but not
+# C1–C8 text-solvable calibration subset. C2 is dual-division but not
 # in the bridge subset (spec lists C1,C3,C6,C7 + C4/C5/C8 when vision-free graded).
 _DEFAULT_CALIBRATION_IDS: frozenset[str] = frozenset({
     "C1", "C3", "C4", "C5", "C6", "C7", "C8",
@@ -78,11 +78,11 @@ class Challenge:
     # a modification challenge names the base challenge whose output it edits.
     modifies: str | None = None
     notes: str = ""
-    # --- two-division fields (WI-1); defaults preserve C1–C8 dual-division behavior ---
+    # --- two-division fields; defaults preserve C1–C8 dual-division behavior ---
     divisions: tuple[str, ...] = ("local", "open")
     calibration: bool = False
     eyes: str = "either"              # "text" | "vision" | "either"
-    # GAP-INJECT (WI-6): runner applies each dict after N build tool_calls.
+    # GAP-INJECT: runner applies each dict after N build tool_calls.
     # Shape: {after_build_calls: int, fault: str, feature?: dict, note?: str}
     inject_faults: list[dict] = field(default_factory=list)
 
@@ -149,7 +149,7 @@ def load_challenge(cid: str) -> Challenge:
 
 
 def tools_for_division(division: str, tools: list[str] | None = None) -> list[str]:
-    """Filter a tool list for the division HARD surface (WI-1.4).
+    """Filter a tool list for the division HARD surface.
 
     LOCAL never offers vision tools. OPEN is unrestricted.
     """
@@ -160,7 +160,7 @@ def tools_for_division(division: str, tools: list[str] | None = None) -> list[st
 
 
 def assert_division_eyes_allowed(challenge: Challenge, division: str) -> None:
-    """Refuse vision-eyes challenges under the LOCAL division (WI-1.3)."""
+    """Refuse vision-eyes challenges under the LOCAL division."""
     if division == "local" and challenge.eyes == "vision":
         raise ValueError(
             f"challenge {challenge.id} requires eyes='vision' and cannot run "

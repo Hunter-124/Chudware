@@ -247,7 +247,7 @@ def test_rlc_resonance_peak():
 @pytest.mark.xfail(
     reason="C++ spice eval_probe lacks the two-terminal junction-current branch (I(D1)) "
            "— documented core/sim/spice.cpp:888 gap; needs a core port, the MCP seam "
-           "cannot evaluate probes client-side (T-RF20)",
+           "cannot evaluate probes client-side",
     strict=False)
 def test_diode_rectifier_current_probe():
     """Half-wave rectifier with a SIN source: I(D1) probe finite (NaN regression) and

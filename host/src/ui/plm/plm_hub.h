@@ -55,7 +55,7 @@ struct PlmWhereUsedRow {
     int count = 1;                                     // reference multiplicity
 };
 
-// ---- Team & Sync row shapes (parsed from plm_status — contract §6, T-R7) -------
+// ---- Team & Sync row shapes (parsed from plm_status — contracts/plm.md §6) -------
 
 // One shared location the project can sync with (manifest.remotes[] §6.1). The
 // optional identity is how THIS machine appears to the team on that location;
@@ -67,7 +67,7 @@ struct PlmRemoteRow {
     bool canSync = false;              // capabilities: "snapshot_sync"
     bool canLock = false;              // capabilities: "advisory_locks"
     bool canLive = false;              // capabilities: "live_coedit" (kind "plm-server") —
-                                       // live editing replaces T-R7 Sync/lock controls entirely
+                                       // live editing replaces Sync/lock controls entirely
 };
 
 // One advisory lock (§6.2) — a courtesy presence signal, never a hard block.
@@ -369,7 +369,7 @@ std::string plmNiceTime(const std::string& iso);   // "2026-07-07T19:54:28Z" -> 
 std::string plmTeamFriendlyError(const std::string& reason, const std::string& hint);
 // ---- live co-editing (plm-server profiles — defined in plm_state.cpp) ----------
 // The first live-capable shared location (kind "plm-server" advertising
-// live_coedit). nullptr = none configured. Live remotes never offer T-R7
+// live_coedit). nullptr = none configured. Live remotes never offer
 // Sync/lock controls — the session replaces both.
 const PlmRemoteRow* plmTeamLiveRemote();
 // True while this GUI holds the live session for that item.

@@ -1,4 +1,4 @@
-"""CAD 2D-drawing MCP tools (T-RF8 split of cad_tools.py): make_drawing, export_drawing, review_drawing, view/section/detail/dimension/gdt/datum/surface-finish/titleblock tools."""
+"""CAD 2D-drawing MCP tools (split out of cad_tools.py): make_drawing, export_drawing, review_drawing, view/section/detail/dimension/gdt/datum/surface-finish/titleblock tools."""
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
@@ -1956,7 +1956,7 @@ def _audit_standards(full: dict, rows: list[dict]) -> dict:
 
 
 def register_cad_drawing_tools(mcp: FastMCP) -> None:
-    """CAD 2D-drawing MCP tools (T-RF8 split of cad_tools.py): make_drawing, export_drawing, review_drawing, view/section/detail/dimension/gdt/datum/surface-finish/titleblock tools."""
+    """CAD 2D-drawing MCP tools (split out of cad_tools.py): make_drawing, export_drawing, review_drawing, view/section/detail/dimension/gdt/datum/surface-finish/titleblock tools."""
 
 
     # ---------------------------------------------------------------- drawings & parts

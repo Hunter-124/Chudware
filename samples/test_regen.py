@@ -1,5 +1,5 @@
 """
-samples/test_regen.py — T-Q3 DoD: regen + open + tree/solve asserts for all gallery samples.
+samples/test_regen.py — regen + open + tree/solve asserts for all gallery samples.
 
 Usage (from repo root):
   CHUDWARE_LIBCHUDWARE=<path>/libchudware.so python -m pytest samples/test_regen.py -v

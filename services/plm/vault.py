@@ -1,6 +1,6 @@
 """services.plm.vault — the PLM vault engine (contract §2–§5, aicad.plm/1).
 
-The storage engine behind Pillar 19. A *project* is a folder; the *vault* is a
+The storage engine behind PLM version history. A *project* is a folder; the *vault* is a
 hidden git repo at ``.aicadvault/`` (contract §2). This class ties the pieces
 together:
 
@@ -52,7 +52,7 @@ _CARRY_FORWARD_TOPLEVEL = frozenset({"planning"})
 # doc-kind inference from container extension (best-effort; refined by document.json)
 _SUFFIX_KIND = {".step+": "part", ".ecad+": "ecad"}
 
-# authoritative doc-kind from the document's schema string (T-R4: drawings and
+# authoritative doc-kind from the document's schema string (drawings and
 # CAM jobs share the .step+ container, so the suffix alone is not enough)
 _SCHEMA_KIND = {
     "aicad.part": "part",
@@ -420,7 +420,7 @@ class Vault:
 
         When *item_id* is omitted (hub overview / full timeline), entry views are
         built from a few path-direct blob reads per commit instead of flattening
-        the whole shadow tree — ME489-scale trees are hundreds of blobs.
+        the whole shadow tree — large project trees are hundreds of blobs.
 
         When *item_id* is given the answer must mean "the versions of THIS
         file". A commit belongs in an item's timeline iff the item **exists**
@@ -513,7 +513,7 @@ class Vault:
         )
         for _attempt in range(6):
             m = self.manifest()
-            # T-R4 lifecycle rule (contract §4): no edit-in-place of a Released
+            # Lifecycle rule (contract §4): no edit-in-place of a Released
             # item — "start a new revision" first. Restore is exempt (§8.3: you
             # can always go back).
             files = self._explode_project_into_shadow(
@@ -559,7 +559,7 @@ class Vault:
             participants=participants,
         )
 
-    # -- assist tier (T-R3, contract §4 ai_mode) ----------------------------
+    # -- assist tier (contract §4 ai_mode) -----------------------------------
 
     def ai_mode(self) -> str:
         """The project's assist tier: manual | assisted | managed (§4)."""
@@ -598,7 +598,7 @@ class Vault:
         self._commit_manifest_change(m)
         return bool(enabled)
 
-    # -- item registry (T-R4, contract §4) ----------------------------------
+    # -- item registry (contract §4) ----------------------------------------
 
     def set_part_number(self, item_id: str, part_number: str) -> dict[str, Any]:
         """Edit an item's part number (auto-assigned, user-editable; unique
@@ -625,7 +625,7 @@ class Vault:
                 "working_rev": out["working_rev"]}
 
     def set_part_number_prefix(self, prefix: str) -> dict[str, Any]:
-        """Configure the part-number scheme (T-R5 locked decision: numbers
+        """Configure the part-number scheme (design decision: numbers
         auto-suggest from a configurable scheme, e.g. ``PRJ-00042``).
 
         Only the prefix is configurable in v1; the counter stays the
@@ -647,7 +647,7 @@ class Vault:
 
     def discard_working_rev(self, item_id: str) -> dict[str, Any]:
         """Undo a "start rev C" draft: return the working file to the item's
-        last released form and mark it Released again (T-R5 locked decision —
+        last released form and mark it Released again (design decision —
         the auto-branch toast's "back to rev B (discard draft)" affordance).
 
         Forward-only like everything else: the return itself is a new history
@@ -863,7 +863,7 @@ class Vault:
         dirty = self._dirty_items(m)
         head = self._bind.head_commit()
         # Path-direct blob reads — do not flatten the whole HEAD tree just for
-        # three planning JSON files (ME489-scale trees are hundreds of blobs).
+        # three planning JSON files (large project trees are hundreds of blobs).
         def _plan_blob(name: str) -> bytes | None:
             if head is None:
                 return None
@@ -935,13 +935,13 @@ class Vault:
         commit = self._bind.commit_tree(files, emeta)
         return commit
 
-    # -- deterministic message drafting (T-R3) ------------------------------
+    # -- deterministic message drafting -------------------------------------
 
     def draft_message(self, item_id: str | None = None) -> str:
         """Deterministic plain-language draft of "what changed since the last
         entry" — the template behind Copilot-drafted checkpoint messages.
 
-        Numbers are copied from the semantic diff, never invented (Pillar 13).
+        Numbers are copied from the semantic diff, never invented.
         Returns ``""`` when nothing changed (an empty draft, not filler).
         """
         m = self.manifest()
@@ -1031,7 +1031,7 @@ class Vault:
         """Release an item (contract §5): rev stamp + lifecycle + geometry
         freeze + (for assemblies) the BOM freeze pin set.
 
-        This is the atomic release ENTRY. The full T-R4 flow — pre-flight
+        This is the atomic release ENTRY. The full release flow — pre-flight
         battery, component-pin computation, stamp orders — is orchestrated by
         :func:`services.plm.release.release`, which passes ``bom_pins`` here.
         The In-work → Released transition is enforced: releasing an
@@ -1391,7 +1391,7 @@ class Vault:
                 ai=(item_ai_blocks or {}).get(iid, ai_block),
                 participants=participants,
             )
-            # plain-language change summary per entry (T-R3, contract §2
+            # plain-language change summary per entry (contract §2
             # summary.txt): deterministic, numerals copied from doc_diff.
             prev_raw = head_tree.get(snapshot.item_prefix(iid) + "document.json")
             if (enforce_released_lock and prev_raw is not None

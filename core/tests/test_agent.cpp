@@ -747,7 +747,7 @@ TEST_CASE("role sniffing") {
     CHECK(RoleScriptedProvider::role_of("nope") == "?");
 }
 
-// T-F4: clarify() interaction/1 shape-mirror tests.
+// clarify() interaction/1 shape-mirror tests.
 // The existing {ready, questions, assumptions} output must be preserved (additive only).
 // The new "interaction" field must conform to aicad.interaction/1 (contracts/interaction.md).
 #include "agent/clarify.h"
@@ -773,7 +773,7 @@ TEST_CASE("clarify: interaction field present and schema correct") {
     CHECK(result["questions"][0]["ask"] == "Shaft diameter?");
     CHECK(result["questions"][0]["key"] == "shaft_dia");
 
-    // New T-F4 interaction field.
+    // New interaction field.
     CHECK(result.contains("interaction"));
     const auto& ia = result["interaction"];
     CHECK(ia["schema"] == "aicad.interaction/1");

@@ -1,4 +1,4 @@
-// Generated from engine_oracle/data/lumber_table.json (T-RF19 leaf 5).
+// Generated from engine_oracle/data/lumber_table.json.
 // Nominal-to-actual dressed (S4S) lumber dims per NDS / PS 20 (public standard).
 // Units: mm / mm^2 / mm^3 / mm^4. DO NOT EDIT BY HAND.
 #pragma once

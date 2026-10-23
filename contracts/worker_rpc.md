@@ -22,7 +22,7 @@ for, and shows the repair-runtime flow. Workers tolerate unknown OPTIONAL params
 ### Legacy (unchanged, frozen)
 `ping` · `run_model {code, name?}` · `get_prompts` · `shutdown`
 
-> `agent_design` was REMOVED 2026-07-22 (T-RF5): the C++ `agent_run_v2` covers its
+> `agent_design` was REMOVED 2026-07-22: the C++ `agent_run_v2` covers its
 > surface; the method now returns "unknown method" everywhere.
 
 ### Documents
@@ -454,7 +454,7 @@ the app data vendor cache for local AI workflows.
 | `vendor_part_context` | `{limit?, query?}` → `{count, parts, llm_context, capabilities}` compact enough to inject into local-model prompts. |
 | `vendor_part_insert` | `{supplier, part_number, doc_id?/into?, base_revision?, name?}` → normal doc ops response after adding an `import` feature with vendor metadata preserved in feature params. |
 
-### Recognition & overlap (AI-experience wave — appended; see docs/review/GEOMETRY_LLM_REPRESENTATION_REVIEW.md)
+### Recognition & overlap (appended)
 
 | method | params → result |
 |---|---|
@@ -563,7 +563,7 @@ unless env `CHUDWARE_UNDO_AGENTS=1` is set (kill-switch restoring free undo for 
 `doc_checkpoint` / `doc_revert` and PLM rollback for intentional rollback.
 
 
-## 6. Sub-agent control plane (append-only, 2026-08-03 — T-DP16)
+## 6. Sub-agent control plane (append-only, 2026-08-03)
 
 Worker methods served by `services/agent/subagent_rpc.py` over the file-backed registry
 `services/agent/subagent_registry.py`. Every control is **advisory and turn-boundary bound**:

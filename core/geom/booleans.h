@@ -60,7 +60,7 @@ TopoDS_Shape common(const TopoDS_Shape& a, const TopoDS_Shape& b);
 TopoDS_Shape unify_same_domain(const TopoDS_Shape& s);
 
 // Fuse then UnifySameDomain, skipping the unify pass when the BOP reports no
-// section edges (T-PERF10). Disjoint / non-touching operands produce an empty
+// section edges. Disjoint / non-touching operands produce an empty
 // section-edge list — UnifySameDomain is pure overhead there. Intersecting or
 // flush-touching fuses keep the clean() face-merge. Empty on kernel failure.
 TopoDS_Shape fuse_unify(const TopoDS_Shape& a, const TopoDS_Shape& b);

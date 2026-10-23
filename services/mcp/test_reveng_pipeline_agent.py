@@ -1,6 +1,6 @@
-"""RE pipeline agent_fn + unstubbed MCP tools (Wave-1 photogrammetry real wiring).
+"""RE pipeline agent_fn + unstubbed MCP tools (photogrammetry real wiring).
 
-Monkeypatches vision backends (RE-34 research_ingest seam pattern) to prove:
+Monkeypatches vision backends (research_ingest seam pattern) to prove:
 
   1. Sparse registration falls back when weak; only OpenMVS produces the CAD mesh.
   2. n_fit calls segment_fit(mesh_path, session_id=…) and persists fits.json.
@@ -21,7 +21,7 @@ import pytest
 
 
 from services.mcp import reveng_tools as rt  # noqa: E402
-from services.mcp import reveng_common as rc  # noqa: E402  T-RF8: pipeline internals moved
+from services.mcp import reveng_common as rc  # noqa: E402  pipeline internals moved
 from services.mcp import reveng_build_tools as rb  # noqa: E402
 from services.mcp import reveng_session_tools as rs  # noqa: E402
 

@@ -35,7 +35,7 @@ void drawGaussianPanel(AppState& st);
 // device + its preview texture (ui::reveng::webcamCaptureShutdown) and the session-rail
 // thumbnail index.
 //
-// INTEGRATOR SEAM: app.cpp has no "workspace closed" callback, so nothing calls this on the edge
+// INTEGRATION SEAM: app.cpp has no "workspace closed" callback, so nothing calls this on the edge
 // where the user leaves the Reverse Eng tab; drawRevEngWorkspace self-heals by running it on
 // re-entry after a frame gap, which reclaims the camera one frame late. Call it from app.cpp
 // when activeWorkspace transitions AWAY from Workspace::ReverseEng (and once at shutdown, before

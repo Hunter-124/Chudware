@@ -1,4 +1,4 @@
-"""test_intake_ledger.py — REAL reopen test for the doc-scoped IntakeLedger (T-BL25).
+"""test_intake_ledger.py — REAL reopen test for the doc-scoped IntakeLedger.
 
 Contract: contracts/interaction.md §5 scope=doc — answers persist in the document's
 IntakeState record, round-tripped as JSON into the .step+, so a dimension confirmed

@@ -1,7 +1,7 @@
 {
   "_schema": "aicad.fit_recommendations/1",
   "_citation": "ISO 286-2:2010, Shigley's Mechanical Engineering Design (10th ed.), Machinery's Handbook (31st ed.)",
-  "_note": "Maps functional keywords to recommended ISO 286 fit classes with rationale. Append-friendly for future expansions (T-W6 feeds/speeds will sit beside this).",
+  "_note": "Maps functional keywords to recommended ISO 286 fit classes with rationale. Append-friendly for future expansions (feeds/speeds data sits beside this).",
 
   "fits": [
     {

@@ -531,7 +531,7 @@ def test_typography_stays_bounded_and_footer_fields_do_not_overlap(tmp_path, siz
     w, h = size
     card = tmp_path / "card.png"
     anim._caption_card(w, h, [
-        "ME 490 measured folding mechanism presentation",
+        "Sample measured folding mechanism presentation",
         "A long result path is kept readable rather than clipped: " + "/measured/geometry" * 8,
         "Samples describe measured poses, not swept-clearance approval."], str(card))
     with Image.open(card) as image:
@@ -545,7 +545,7 @@ def test_typography_stays_bounded_and_footer_fields_do_not_overlap(tmp_path, siz
     Image.new("RGB", (w, scene_h), (50, 90, 120)).save(png)
     anim._stamp_footer(str(png),
                        "chudware 0123456789abcdef | polymesh abcdef012345 | "
-                       "me490_folding_mechanism | sample 300/300",
+                       "proto_folding_mechanism | sample 300/300",
                        "Measured: " + "long_filename/" * 12, height=h - scene_h)
     with Image.open(png) as image:
         assert image.size == size
@@ -571,7 +571,7 @@ def test_fontconfig_fallback_preserves_requested_glyph_size(monkeypatch):
     try:
         small, large = anim._font(True, 24), anim._font(True, 48)
         assert large.getlength("Measured geometry") > 1.9 * small.getlength("Measured geometry")
-        assert large.getbbox("ME 490")[3] - large.getbbox("ME 490")[1] >= 30
+        assert large.getbbox("AB 490")[3] - large.getbbox("AB 490")[1] >= 30
     finally:
         anim._font.cache_clear()
 

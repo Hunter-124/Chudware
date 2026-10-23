@@ -1,4 +1,4 @@
-// Section library lookups for the structural workstream (T-RF19 leaf 5).
+// Section library lookups for the structural workstream.
 //
 // C++ port of engine_oracle/structural/sections.py: AISC W/S/C steel section
 // properties and dressed (S4S) lumber section properties, from the curated

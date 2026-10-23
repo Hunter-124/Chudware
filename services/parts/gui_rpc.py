@@ -76,8 +76,8 @@ _SITE_LABELS: dict[str, str] = {
     "makerworld":       "MakerWorld",
 }
 
-# API pricing providers (the engine_oracle/parts_providers.py chain was deleted in
-# T-RF18 — the C++ sourcing RPC owns pricing; this pane still shows/configures the
+# API pricing providers (the engine_oracle/parts_providers.py chain was deleted —
+# the C++ sourcing RPC owns pricing; this pane still shows/configures the
 # credential slots) and the credential fields each needs. Shown in the vendor pane as
 # "API" sources so the user can configure them in-app instead of hand-editing config.json.
 _API_PROVIDERS: dict[str, dict[str, Any]] = {
@@ -94,7 +94,7 @@ _API_PROVIDERS: dict[str, dict[str, Any]] = {
 def _resolve_creds(key: str, env_map: dict[str, str]) -> dict[str, str]:
     """Resolve provider credentials from config first, then environment fallback.
 
-    Local home after parts_providers.py was deleted (T-RF18): config.json →
+    Local home after parts_providers.py was deleted: config.json →
     ``parts_providers.<key>`` (same section ``_vendor_creds_set`` writes), then env.
     Absent credentials resolve to empty strings.
     """
@@ -1208,7 +1208,7 @@ def _parts_import_artifact(params: dict, _emit: Callable) -> dict:
 
 def _parts_insert_into_doc(params: dict, _emit: Callable) -> dict:
     try:
-        from services.mcp import core_bridge as cb  # place.place ported to core (T-RF19)
+        from services.mcp import core_bridge as cb  # place.place ported to core
         from services.parts import get as _hub_get
         part_id = str((params or {}).get("item_id", "")).strip()
         if not part_id:

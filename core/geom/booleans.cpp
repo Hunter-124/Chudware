@@ -28,7 +28,7 @@ namespace geom {
 // so a later SetRunParallel would be a no-op. Parallel mode lets the BOPDS face-face
 // intersection use the OCCT thread pool — a real win for tool-heavy ops like a bolt-circle
 // cut. SMALL ops (box×box, single hole) stay serial: multi-agent boxes oversubscribe TBB
-// when every tiny cut spins a pool (PERF_AUDIT 2026-07-11 P1 — ~35% self-time in
+// when every tiny cut spins a pool (profiling showed ~35% self-time in
 // syscall/lock/yield under load-16). Gate on total face count / tool count.
 //
 // NON-DESTRUCTIVE: without it an OCCT BOP may mutate its ARGUMENT shapes in place
@@ -95,7 +95,7 @@ TopoDS_Shape fuse(const TopoDS_Shape& a, const TopoDS_Shape& b) {
 }
 
 TopoDS_Shape fuse_unify(const TopoDS_Shape& a, const TopoDS_Shape& b) {
-    // T-PERF10: run fuse with the deferred API so we can inspect SectionEdges
+    // Run fuse with the deferred API so we can inspect SectionEdges
     // before paying for UnifySameDomain (no-op / expensive walk when disjoint).
     if (b.IsNull()) return a;
     if (a.IsNull()) return TopoDS_Shape();
@@ -111,14 +111,14 @@ TopoDS_Shape fuse_unify(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     if (!op.IsDone()) return TopoDS_Shape();
     if (op_history_recording()) op_history_record(op.History());
     TopoDS_Shape out = op.Shape();
-    // T-PERF10 skipped unify when SectionEdges() was empty, but that shortcut misses the
+    // An earlier version skipped unify when SectionEdges() was empty, but that shortcut misses the
     // FLUSH-WELD case: two solids sharing a coincident coplanar face (e.g. mirroring a body
     // about its own +X face) merge into one solid yet produce NO section edges — coincident
     // faces are "same domain", not a transversal intersection. That is exactly the case whose
     // now-coplanar side faces need collapsing. Gate on whether a weld actually happened: unify
     // iff the fuse reduced the solid count (flush contact OR overlap) or reported section
     // edges. Genuinely disjoint operands keep their solid count (compound of N) and still skip
-    // the unify walk, so T-PERF10's perf win survives.
+    // the unify walk, so the skip-unify perf win survives.
     const TopTools_ListOfShape& se = op.SectionEdges();
     const bool merged = solid_count(out) < solid_count(a) + solid_count(b);
     if (se.IsEmpty() && !merged) return out;

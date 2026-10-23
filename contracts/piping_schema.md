@@ -1,6 +1,6 @@
 # Contract: `aicad.piping/1` document schema
 
-> **Frozen seam.** Append-only; changes require integrator sign-off + a version bump
+> **Frozen seam.** Append-only; changes require maintainer sign-off + a version bump
 > (see `contracts/README.md`). This is the executable-backed schema for the piping
 > discipline module, a sibling of `engine.doc` / `engine.ecad`. The executable form is
 > `services/piping/schema.py` (structural validation only — geometry realizability and

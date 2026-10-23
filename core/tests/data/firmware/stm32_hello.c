@@ -1,4 +1,4 @@
-/* Renode live-test fixture (T-RF15) — bare-metal STM32F4 image that writes
+/* Renode live-test fixture — bare-metal STM32F4 image that writes
  * "hello renode" to USART1 and drives PA5 high, so the Renode leg of
  * fw_sim_run can be exercised LIVE in tests (stm32f4_discovery.repl declares
  * usart1 + gpioPortA). Compiled in-test with arm-none-eabi-gcc when present;

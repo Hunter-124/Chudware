@@ -1,7 +1,7 @@
-"""Stage vocabulary, tool→stage inference, check batteries, exit gates (T-W5).
+"""Stage vocabulary, tool→stage inference, check batteries, exit gates.
 
 Contract: ``contracts/advisor.md`` §1 (stage vocabulary, FROZEN) and §9 (precedence).
-Pillar 20: docs/ADVISOR_ARCHITECTURE.md §2.2 (the "foreman").
+Pillar 20: docs/design/ADVISOR_ARCHITECTURE.md §2.2 (the "foreman").
 
 This module is **pure data + pure functions** — no I/O, no LLM, no doc handles.  It
 defines *what the process stages are* and *which read-only checks each stage would
@@ -15,7 +15,7 @@ source, not the stage:
   - In the **doc path** (``advise(doc_id)`` MCP tool and DAG nodes carrying a
     doc_id), the full batteries run against ``doc_eval_*`` / ``sketch_health``.
 
-The full vocabulary is defined here regardless, because T-W7 (roles), the mission
+The full vocabulary is defined here regardless, because the role cards, the mission
 pipeline, and the exit-gate machinery all cite these stage names and batteries.
 """
 from __future__ import annotations
@@ -155,10 +155,10 @@ CHECK_SIM_DIVERGENCE = "sim_divergence"
 CHECK_SIM_MESH = "sim_mesh"
 CHECK_CAM_SIM = "cam_sim"
 CHECK_OPEN_PROFILE = "open_profile"
-# T-W22 org-layer: sender's stage exit is blocked until recipients ack
+# Org layer: sender's stage exit is blocked until recipients ack
 # every interface_change the sender posted (§18).
 CHECK_INTERFACE_CHANGE = "interface_change_acked"
-# T-DP6: diagnostic advisor checks — DFM, wall thickness, interface alignment
+# Diagnostic advisor checks — DFM, wall thickness, interface alignment
 CHECK_DFM = "dfm"
 CHECK_WALL_THICKNESS = "wall_thickness"
 CHECK_INTERFACE_FITMENT = "interface_fitment"
@@ -173,7 +173,7 @@ CHECK_INTERFACE_FITMENT = "interface_fitment"
 # ``exit_gate``      : checks that must PASS before the orchestrator advances.
 #                      A ``blocker`` on any exit-gate check gates stage exit
 #                      (§9.3) — it does NOT block the model's next action.
-# ``playbook_default``: the playbook a role defaults to at this stage (T-W7).
+# ``playbook_default``: the playbook a role defaults to at this stage.
 
 _STAGE_SPEC: dict[str, dict] = {
     "intake": {
@@ -209,7 +209,7 @@ _STAGE_SPEC: dict[str, dict] = {
         "playbook_default": None,
     },
     "part_verify": {
-        # T-DP6: wall_thickness (fast ray-cast) and DFM (process gate) run at part_verify;
+        # wall_thickness (fast ray-cast) and DFM (process gate) run at part_verify;
         # both are advisory — they never block exit (wall_thickness → action, DFM → blocker
         # only on a hard process failure). CHECK_PART_VERIFY is the legacy verify_battery gate.
         "check_battery": [CHECK_PART_VERIFY, CHECK_WALL_THICKNESS, CHECK_DFM],
@@ -218,7 +218,7 @@ _STAGE_SPEC: dict[str, dict] = {
         "playbook_default": None,
     },
     "assembly": {
-        # T-DP6: interface_fitment (hole-pattern / coaxiality / contact-plane) runs at assembly
+        # interface_fitment (hole-pattern / coaxiality / contact-plane) runs at assembly
         # alongside the hard-clash interference gate.
         "check_battery": [CHECK_INTERFERENCE, CHECK_INTERFACE_FITMENT],
         "helper_tools": ["check_interference", "fit_calc", "measure_between",
@@ -296,7 +296,7 @@ def next_stage(stage: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Org-layer exit-gate helper (T-W22, §18)
+# Org-layer exit-gate helper (§18)
 # ---------------------------------------------------------------------------
 
 def check_interface_change_gate(

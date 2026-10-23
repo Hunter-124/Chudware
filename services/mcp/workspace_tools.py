@@ -1,4 +1,4 @@
-"""workspace_tools.py — MCP tools for the multi-doc workspace (T-W16).
+"""workspace_tools.py — MCP tools for the multi-doc workspace.
 
 Family: ``workspace``.
 Risk: ``workspace_status`` → read (added to _READ_EXACT in tool_registry);

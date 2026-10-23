@@ -1,4 +1,4 @@
-// Copilot chat log (T-RF6 split of legacy_chat.cpp): message-list rendering — the user block
+// Copilot chat log: message-list rendering — the user block
 // (bubble + rewind/edit row), the provider log, the assistant turn (prose + activity timeline
 // + cards), and the windowed log (height-cached spacer rows for off-screen turns) with
 // stick-to-bottom autoscroll. Card/timeline bodies live in cards.cpp / activity_timeline.cpp.

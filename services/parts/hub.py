@@ -1,17 +1,17 @@
-"""PartsHub — the orchestrator for aicad.parts/1 (T-P1 + T-P2 + T-P3).
+"""PartsHub — the orchestrator for aicad.parts/1.
 
 Ties together the ProviderRegistry, the FTS index, and the provider lookup.
 Bootstrap auto-registers all adapters:
-  T-P1: bolts/bearings + core_families
-  T-P2: structural_sections, piping_fittings, hydraulic_components,
-         ecad_kicad (indexable)
+  core:   bolts/bearings + core_families
+  domain: structural_sections, piping_fittings, hydraulic_components,
+          ecad_kicad (indexable)
 
-Live-vendor fallback (T-P2): when the local FTS index returns no results for a
+Live-vendor fallback: when the local FTS index returns no results for a
 query, any registered live-only provider (iter_records raises NotImplementedError)
 is queried directly. Results from live providers carry source:"live" and are
 NEVER indexed.
 
-Provider-overlap deduplication (T-P3, contract-additive):
+Provider-overlap deduplication (contract-additive):
   For standard threaded hardware (fasteners / bearings / nuts / washers), the
   BoltsAdapter (domain="fastener") and CoreFamiliesAdapter (domain="mech_family")
   both emit records for the same designation (e.g. "M8").  After ranking, the hub:
@@ -58,7 +58,7 @@ def worker_activity() -> dict:
 # value (CHUDWARE_PARTS_LIVE_SITE_BUDGET_S) so one stall cannot dominate the call.
 _DEFAULT_LIVE_BUDGET_S = 4.0
 
-# ── Persistent index cache (T-PL4) ───────────────────────────────────────────
+# ── Persistent index cache ───────────────────────────────────────────────────
 
 # Bumped BY HAND whenever adapter code changes the shape/content of emitted
 # PartRecords. It is mixed into the fingerprint, so bumping it invalidates every
@@ -101,16 +101,16 @@ class PartsHub:
             self._index_built = False
 
     def bootstrap(self) -> None:
-        """Auto-register all built-in adapters (T-P1 + T-P2 + local library)."""
-        # T-P1 adapters
+        """Auto-register all built-in adapters (core + domain + local library)."""
+        # Core adapters
         from .adapters.bolts_adapter import BoltsAdapter
         from .adapters.core_families_adapter import CoreFamiliesAdapter
-        # T-P2 domain adapters (indexable)
+        # Domain adapters (indexable)
         from .adapters.structural_sections_adapter import StructuralSectionsAdapter
         from .adapters.piping_fittings_adapter import PipingFittingsAdapter
         from .adapters.hydraulic_components_adapter import HydraulicComponentsAdapter
         from .adapters.ecad_kicad_adapter import EcadKicadAdapter
-        # T-FIN17 curated heatsink catalog (thermal metadata for heatsink_select)
+        # Curated heatsink catalog (thermal metadata for heatsink_select)
         from .adapters.heatsinks_adapter import HeatsinksAdapter
         # T-PL-motion coverage adapters (stepper motors, belts/pulleys, shaft couplings)
         from .adapters.stepper_motors_adapter import StepperMotorsAdapter
@@ -142,7 +142,7 @@ class PartsHub:
         self._ensure_index()
 
     def _register_browser_catalog_adapters(self) -> None:
-        """T-X3: register each services/browser SourceAdapter as a live CatalogProvider
+        """Register each services/browser SourceAdapter as a live CatalogProvider
         (domain="catalog") — the contracts/parts.md §6.3 seam reserved for "paid catalog
         providers" (TraceParts/Werk24), populated here by the browser-session mechanism
         instead. Best-effort: services/browser is an optional peer package (Playwright is
@@ -531,7 +531,7 @@ class PartsHub:
         rec = self._index.get(part_id)
         if rec is not None:
             return rec
-        # Fall back to individual providers (handles non-indexable live providers in T-P2).
+        # Fall back to individual providers (handles non-indexable live providers).
         for provider in self._registry.providers():
             if callable(getattr(provider, "get", None)):
                 try:
@@ -718,7 +718,7 @@ def _library_walk_signature(root: Path | None) -> tuple[int, int, int, bool]:
     return (count, max_mtime_ns, total_size, partial)
 
 
-# ── Provider-overlap deduplication (T-P3 — contract-additive) ────────────────
+# ── Provider-overlap deduplication (contract-additive) ──────────────────────
 
 # Domains that may emit the same physical hardware designation.
 _OVERLAP_DOMAINS = frozenset({"fastener", "bearing", "mech_family"})

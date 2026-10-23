@@ -1,6 +1,6 @@
-"""Tests for the advisory engine / foreman (T-W5).
+"""Tests for the advisory engine / foreman.
 
-Covers (task step 7):
+Covers:
   * stage inference sequences (tool-call history → stage)
   * interference → fit fix on a two-body doc fixture (real fit_calc numbers)
   * budget rendering drops lowest-severity-first with a never-silent drop line
@@ -356,7 +356,7 @@ def test_stage_set_records_override(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# dag node runner injection — output_state["advisory"] populated (DoD: both hosts)
+# dag node runner injection — output_state["advisory"] populated (both hosts)
 # ---------------------------------------------------------------------------
 
 def _fake_overlap_rpc(method, **kw):

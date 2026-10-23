@@ -1,6 +1,6 @@
 """Mega-26 fixes — A26 source-on-measured-net + B26 clearance retry fire.
 
-Grounded in mega-25 a2 fingerprints (reports/runs/mega-25/):
+Grounded in mega-25 a2 fingerprints:
 
   A26 / AC5 — sim on schematic, device_count=2, V(3V3)=0.0.
               Root causes:

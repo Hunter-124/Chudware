@@ -1,6 +1,6 @@
-"""Tests for the overseer plan-audit engine + change-request routing (T-W13).
+"""Tests for the overseer plan-audit engine + change-request routing.
 
-Covers task step 7:
+Covers:
   * trigger debounce (one audit per trigger point);
   * verdict validation — malformed aicad.audit/1 is rejected, not accepted;
   * repeat-blocker escalation fires at EXACTLY 2 matching blockers;
@@ -447,7 +447,7 @@ def test_resolve_overseer_collapses_onto_only_source():
 
 
 # ---------------------------------------------------------------------------
-# Change-request mapping — the fixture case (task step 7)
+# Change-request mapping — the fixture case
 #   "make the bore fit a 25mm shaft" → bore dim + fit recalc + interference
 #   recheck, and NOTHING else.
 # ---------------------------------------------------------------------------
@@ -619,7 +619,7 @@ def test_change_request_empty_scope_asks_user(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# In-app entry points (overseer_tools) — the pivot's acceptance surface:
+# In-app entry points (overseer_tools) — the in-app acceptance surface:
 # the capability working through the IN-APP path (loads run ledger + buildgraph
 # sidecar, resolves provider, returns JSON-serializable dicts).
 # ---------------------------------------------------------------------------

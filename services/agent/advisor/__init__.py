@@ -1,8 +1,8 @@
 # services/agent/advisor — Pillar 20 foreman + preflight helpers.
 #
-# T-W12: preflight (dry-run plan validation on shadow doc clones).
-# T-W5:  advisory engine — stages, engine, render, adapters (the "foreman").
-# T-W13: overseer plan-audit engine + change-request routing (the judgment layer).
+# preflight: dry-run plan validation on shadow doc clones.
+# advisory engine: stages, engine, render, adapters (the "foreman").
+# overseer: plan-audit engine + change-request routing (the judgment layer).
 #
 # Public surface:
 #   from services.agent.advisor import stages, engine, render, adapters

@@ -1,7 +1,7 @@
 # Clean-room standard-part specification tables (`services/parts/data/bolts/`)
 
 These YAML tables are the deterministic spec-sheet lookup source for the
-standard-part matcher in `core/parts/` (task T-B4). They map a standard designation
+standard-part matcher in `core/parts/`. They map a standard designation
 (ISO 4762 M3, deep-groove bearing 608, …) to nominal dimensions and to a
 `core/parts` catalog **family + size**, so a normalized manufacturer part number can
 resolve to real, editable geometry via the `parts_make` RPC.
@@ -10,9 +10,8 @@ resolve to real, editable geometry via the `parts_make` RPC.
 
 **These tables are NOT copied from the BOLTS project.** BOLTS
 (github.com/boltsparts/BOLTS) is **GPL-3.0**, and the project's clean-room /
-GPL-clean posture (`contracts/licenses.md`) forbids vendoring GPL data. The
-foreman standing ruling for T-B4 requires a question file before bundling any GPL
-data — see `work/questions/T-B4.md`.
+GPL-clean posture (`contracts/licenses.md`) forbids vendoring GPL data. Bundling
+any GPL data would require an explicit licensing review first.
 
 Instead these values are transcribed from the project's own single source of truth
 for hardware dimensions — `services/agent/prompts/shared/cheatsheets/hardware.md` and the

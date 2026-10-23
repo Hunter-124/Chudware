@@ -1,4 +1,4 @@
-"""T-DP3 — geometry_designer role + proactive op-aware helper/calculator registry.
+"""geometry_designer role + proactive op-aware helper/calculator registry.
 
 Covers the Definition of Done:
   * the helper registry has ≥8 geometry kinds, each trigger-bound;

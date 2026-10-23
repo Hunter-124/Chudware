@@ -488,7 +488,7 @@ void Renderer::setGroundShadow(float r, float g, float b, float maxAlpha) {
 
 bool Renderer::init(int width, int height, std::string& err) {
     w_ = width; h_ = height;
-    initQualityPolicy();  // T-RF13: sets rw_/rh_/sw_/sh_ + msaaRequest_/blurPasses_ for the step
+    initQualityPolicy();  // sets rw_/rh_/sw_/sh_ + msaaRequest_/blurPasses_ for the step
 
     prog_ = linkProgram(kVert, kFrag);
     edgeProg_ = linkProgram(kEdgeVert, kEdgeFrag);
@@ -625,7 +625,7 @@ void Renderer::cacheUniformLocations() {
     uKawase_.offset   = glGetUniformLocation(kawaseProg_, "uOffset");
 }
 
-// ---- T-RF13 (R3a): adaptive quality ladder ----
+// ---- Adaptive quality ladder ----
 namespace {
 struct QualitySpec { int msaa; float scale; int blur; };
 QualitySpec qualitySpecFor(Renderer::QualityStep s) {
@@ -1830,11 +1830,11 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px, boo
     glViewport(0, 0, px, px);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
-    if (transparentBg) glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // T-G15: transparent icon tile
+    if (transparentBg) glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // transparent icon tile
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     if (transparentBg) {
-        // T-G15 icon pipeline: no studio fill — leave the tile transparent so the lit part
+        // Icon pipeline: no studio fill — leave the tile transparent so the lit part
         // composites over alpha=0. Part fragments are opaque (uAlpha=1 below); silhouettes are
         // hard-edged (no supersample) so alpha stays a clean 0/255 mask.
         glDisable(GL_BLEND);
@@ -1933,7 +1933,7 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px, boo
     return thumbTex_;
 }
 
-// T-G15: read back the thumbnail FBO (the last renderThumbnail target) as px*px RGBA, flipped to
+// Read back the thumbnail FBO (the last renderThumbnail target) as px*px RGBA, flipped to
 // top-left origin — the clean, transparent-capable icon capture the pipeline saves as a PNG.
 std::vector<unsigned char> Renderer::readThumbnailRGBA(int px) const {
     if (px < 16) px = 16;

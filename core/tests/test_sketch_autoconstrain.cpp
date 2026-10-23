@@ -1,8 +1,8 @@
-// T-W2 sketch completion suite — auto-coincident pass + sketch_health, exercised through
+// Sketch completion suite — auto-coincident pass + sketch_health, exercised through
 // the doc RPC path (doc_new -> doc_apply_ops -> doc_sketch_auto_constrain / doc_sketch_health).
 // The ui/imgui sketch entry is NOT wired, so everything here is headless RPC, never the GUI.
 //
-// Covered (mirrors the task DoD):
+// Covered:
 //   1. An open rectangle whose four corners TOUCH (line endpoints coincide geometrically but
 //      carry no coincident constraint) gains 4 coincident constraints and the profile closes
 //      into one material region — proving the auto pass keeps REDUNDANT coincidents (a closed

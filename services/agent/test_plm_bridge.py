@@ -131,7 +131,7 @@ FIXTURE_EVENTS = [
             "driver": "sliding fit on shaft S1 (H7/g6)",
             "provenance": "ISO 286-2 table lookup for 20 mm H7",
             "tolerance": {"fit": "H7", "upper": 0.021, "lower": 0.0},
-            "status": "confirmed", "confirmed_by": "hunter",
+            "status": "confirmed", "confirmed_by": "user",
         },
     },
     {
@@ -607,12 +607,11 @@ class TestProvenanceFromEvents:
 
 class TestRealExecutorIntegration:
     """Prove the bridge seam against the actual BuildGraphExecutor, not a
-    hand-crafted payload.  Uses run_sync from executor.py (T-W15) so the emit
+    hand-crafted payload.  Uses run_sync from executor.py so the emit
     contract is exercised end-to-end.
 
-    Note: live loop.py wiring lands with T-W16's executor driver (T-W16
-    calls ready_nodes() and dispatches sub-agents).  Until T-W16 merges,
-    run_sync is the correct single-process path for integration testing.
+    run_sync is the correct single-process path for integration testing;
+    the live mission path dispatches sub-agents via ready_nodes() instead.
     """
 
     def _make_fixture_graph(self) -> dict:

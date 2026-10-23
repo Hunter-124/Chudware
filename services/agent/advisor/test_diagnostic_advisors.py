@@ -1,4 +1,4 @@
-"""Tests for T-DP6 diagnostic advisors — interference axis, DFM, wall_thickness,
+"""Tests for the diagnostic advisors — interference axis, DFM, wall_thickness,
 interface_fitment.
 
 Contract: contracts/advisor.md §3 (advisory item shape, FROZEN), §5 (failure card), §20 (triggers).

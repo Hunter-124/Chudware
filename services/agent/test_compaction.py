@@ -1,7 +1,7 @@
 """OMP-port compaction engines (agent.compaction) — pure / offline.
 
-(The legacy loop.py overflow-helper tests that used to live here were removed in
-T-RF5 with the loop itself.)
+(The legacy loop.py overflow-helper tests that used to live here were removed
+with the loop itself.)
 """
 
 from __future__ import annotations

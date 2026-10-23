@@ -172,7 +172,7 @@ struct Compatibility {
 };
 Compatibility check_compatibility(const Settings &);
 // Machine-readable method x physics x objective x limit x formulation matrix
-// for topology_capabilities() (the integrator merges physics availability).
+// for topology_capabilities() (the caller merges physics availability).
 nlohmann::json optimizer_capabilities();
 
 // ── Termination, history, restartable state

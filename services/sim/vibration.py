@@ -1,6 +1,6 @@
 """Vibration frequency-response solver — modal superposition (harmonic) + Miles' equation (random PSD).
 
-T-BL17. Builds on the C++ modal solver's output (``sim_run_modal`` → natural frequencies +
+Builds on the C++ modal solver's output (``sim_run_modal`` → natural frequencies +
 unit-max-normalized mode shapes) — NO new solver dependency. Pure Python + numpy.
 
 Method
@@ -47,11 +47,11 @@ Density arrives as g/cm^3 (material dict convention) → 1 g/cm^3 = 1e-6 kg/mm^3
 
 Known limitations (stated honestly in every result payload):
   * Lumped mass = total mass / n_nodes (equal distribution). Exact total mass; for
-    uniform-density single bodies the participation estimate is reasonable. The seam
-    for consistent-mass recovery is documented in work/questions/T-BL17.md.
+    uniform-density single bodies the participation estimate is reasonable. Consistent-mass
+    recovery is a future seam.
   * Mode shapes are unit-max-normalized, NOT mass-normalized — physical displacement /
     stress amplitudes are NOT recovered (that is the CalculiX *STEADY STATE DYNAMICS
-    seam, T-BL04). Response is reported as acceleration amplification only.
+    seam). Response is reported as acceleration amplification only.
   * SRSS modal combination assumes well-separated modes.
 """
 from __future__ import annotations

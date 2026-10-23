@@ -1,5 +1,5 @@
 // Selectors — stable geometric references into B-rep topology (C++ port of the
-// Python oracle engine/doc/selectors.py; implements docs/contracts/selectors.md).
+// Python oracle engine/doc/selectors.py; implements contracts/selectors.md).
 //
 // WHY this layer exists:
 //   A document references "that face" / "that edge" across rebuilds. Persistent
@@ -21,7 +21,7 @@
 //   bit-for-bit (weights 0.4/0.3/0.2/0.1 with-axis, 0.55/0.3/0.15 without; accept
 //   iff best<0.35 AND (second-best)>0.05; tiebreak by nearest hint_index).
 //
-// See docs/contracts/selectors.md (§1 object, §2 creation, §3 normative algorithm,
+// See contracts/selectors.md (§1 object, §2 creation, §3 normative algorithm,
 // §5 torture suite) and engine/doc/selectors.py (the oracle this ports).
 #pragma once
 

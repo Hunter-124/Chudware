@@ -40,7 +40,7 @@ All entities: `id` (`"e<N>"`, unique in the sketch), `type`, `construction:bool`
 - `point` entities never form edges/wires (annotation/skeleton anchors, constraint targets).
 - `construction:true` entities never join wire chains.
 
-### 1a. `eq_curve3d` (T-3DEQ, equation-driven curve)
+### 1a. `eq_curve3d` (equation-driven curve)
 
 ```json
 {"id":"e5","type":"eq_curve3d","construction":false,
@@ -60,7 +60,7 @@ All entities: `id` (`"e<N>"`, unique in the sketch), `type`, `construction:bool`
 - Display: use the compiled wire's tessellation for the curve shape; do not attempt to derive
   a closed form from `xt/yt/zt` in the GUI.
 
-## 1b. External model references (T-3DXREF — ground a constraint to a model vertex)
+## 1b. External model references (ground a constraint to a model vertex)
 
 ```json
 "external_refs": [
@@ -266,7 +266,7 @@ Semantics (mirrors 2D `sketch_drag`):
    optimization, API-compatible.
 6. MCP `sketch3d_*` tools (services/mcp/sketch3d_tools.py) still speak the SESSION-scoped
    Python store, not this feature — re-pointing map in that file's header TODO.
-7. External refs (T-3DXREF, §1b): only `source.kind:"vertex"` resolves in v1; `"edge"`/`"face"`
+7. External refs (§1b): only `source.kind:"vertex"` resolves in v1; `"edge"`/`"face"`
    sources are schema-legal but always report `stale:true` — a documented v1 gate, not a bug.
 8. External-ref resolution targets the document's FINAL compiled body/bodies (not strictly
    "the body as of this sketch3d's position in the feature tree") — see doc_schema §3B.1b for

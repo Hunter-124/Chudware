@@ -1,9 +1,9 @@
-"""Tests for T-FIN22 — hydraulic→piping and hydraulic→FEA couplings on the
+"""Tests for hydraulic→piping and hydraulic→FEA couplings on the
 aicad.simhandoff/1 seam (contracts/sim_handoff.md).
 
 Groups:
   1. Translators — the hoses→piping network with exact hose bores (driven through
-     the flipped tool: the translator lives in the C++ core since T-RF20, so these
+     the flipped tool: the translator lives in the C++ core, so these
      need libchudware and skip cleanly without it); estimate_line_dp physics sanity.
   2. Envelopes — handoff/verify envelopes for both couplings validate structurally
      and cross-checks fire correctly on mock solve results (the pure-Python

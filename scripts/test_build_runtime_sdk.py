@@ -1,4 +1,4 @@
-"""Offline approved-source/toolchain boundaries; no private SDK source builds run implicitly.
+"""Offline approved-source/toolchain boundaries; no SDK source builds run implicitly.
 
 The optional real setuptools regression uses an already available independently
 hashed public wheel. It never downloads it. All source/approval records are

@@ -49,7 +49,7 @@ struct ToolOutcomeInfo {
     bool executed = false;
 };
 
-// ActivityItem is an integrator-owned type without taxonomy fields. Keep the structured values in
+// ActivityItem is a shared core type without taxonomy fields. Keep the structured values in
 // the same private detail-trailer channel already used by ERR/ART/META, so live and persisted rows
 // retain the distinction without exposing marker bytes to copy/render paths.
 inline constexpr std::string_view kToolOutcomeMark = "\n\x1eOUT\x1e\n";

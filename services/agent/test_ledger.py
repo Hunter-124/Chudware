@@ -1,6 +1,6 @@
 """Tests for services/agent/ledger.py — aicad.ledger/1.
 
-DoD coverage:
+Coverage:
   - append / replay round-trip: state reconstructible from events alone
   - ledger_render determinism + budget compliance at 200/800/4000 tokens
   - provenance required on dimension events
@@ -106,7 +106,7 @@ class TestAppendReplay(unittest.TestCase):
         self.assertEqual(seqs, list(range(7)))
 
     def test_replay_state_equals_materialized(self):
-        """Core DoD: state rebuilt from events equals the live state."""
+        """Core invariant: state rebuilt from events equals the live state."""
         run_id, path = _fresh("replay")
         ledger = Ledger(run_id, path)
         self._populate(ledger)
@@ -643,7 +643,7 @@ class TestMCPTools(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# T-DP1  Design-pipeline stage artifacts (contract design_pipeline.md §3/§4/§9)
+# Design-pipeline stage artifacts (contract design_pipeline.md §3/§4/§9)
 # ---------------------------------------------------------------------------
 
 class TestDesignPipelineKinds(unittest.TestCase):
@@ -692,7 +692,7 @@ class TestDesignPipelineKinds(unittest.TestCase):
         self.assertEqual(ledger.events, [])
 
     def test_roundtrip_replay_and_disk(self):
-        """Core DoD: the four new kinds survive replay + a disk reload."""
+        """The four design-pipeline kinds survive replay + a disk reload."""
         run_id, path = _fresh("dp_roundtrip")
         ledger = Ledger(run_id, path)
         self._populate(ledger)

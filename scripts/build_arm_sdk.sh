@@ -19,8 +19,8 @@
 # executes under QEMU). Completed caches must pass the same checks before reuse.
 #
 # Contents (all target-architecture objects):
-#   OCCT       V7_9_3 @ a016080b, the commit the native Linux guest builds
-#              (CloudCastle provision-nvme-linux-ci.sh OCCT_TAG/OCCT_COMMIT);
+#   OCCT       V7_9_3 @ a016080b, the same commit the native Linux CI builds
+#              (OCCT_TAG/OCCT_COMMIT below);
 #              shared, FreeType + RapidJSON on. Built without Xlib/OpenGL/Tk/
 #              Draw (core links none of TKOpenGl/TKDraw) and without TBB
 #              (OCCT then uses its own OSD_ThreadPool).

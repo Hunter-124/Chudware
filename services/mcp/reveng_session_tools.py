@@ -1,4 +1,4 @@
-"""Reverse-engineering session + ingest MCP tools (T-RF8 split of reveng_tools.py): session CRUD/status/coverage/deviation, images/video/datasheet ingest, scale setting, scale-mat print."""
+"""Reverse-engineering session + ingest MCP tools (split out of reveng_tools.py): session CRUD/status/coverage/deviation, images/video/datasheet ingest, scale setting, scale-mat print."""
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
@@ -776,7 +776,7 @@ def _source_image_gallery(session_id: str, session: dict) -> list:
 
 
 def register_reveng_session_tools(mcp: FastMCP) -> None:
-    """Reverse-engineering session + ingest MCP tools (T-RF8 split of reveng_tools.py): session CRUD/status/coverage/deviation, images/video/datasheet ingest, scale setting, scale-mat print."""
+    """Reverse-engineering session + ingest MCP tools (split out of reveng_tools.py): session CRUD/status/coverage/deviation, images/video/datasheet ingest, scale setting, scale-mat print."""
 
 
     # ── §8.1 READ ────────────────────────────────────────────────────────────

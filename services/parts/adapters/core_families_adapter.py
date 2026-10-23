@@ -1,4 +1,4 @@
-"""CatalogProvider adapter for the core/parts parametric families (T-P1).
+"""CatalogProvider adapter for the core/parts parametric families.
 
 Wraps the `parts_catalog_list` core RPC (same call as the `list_standard_parts`
 MCP tool in cad_tools.py). Domain = 'mech_family'.
@@ -20,7 +20,7 @@ class CoreFamiliesAdapter:
     """CatalogProvider wrapping the C++ core/parts catalog via the parts_make RPC.
 
     Enumerates every family+size combination returned by `parts_catalog_list`.
-    Each record's geometry_ref carries a 'core_family' recipe so T-P3 can call
+    Each record's geometry_ref carries a 'core_family' recipe so the hub can call
     `parts_make` to instantiate it.
     """
 

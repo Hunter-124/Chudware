@@ -1,4 +1,4 @@
-"""Integration tests for the run_fea_frequency_response MCP tool (T-BL17).
+"""Integration tests for the run_fea_frequency_response MCP tool.
 
 Engine-free: the C++ bridge (cb.call) is monkeypatched with a canned modal result,
 so these run in CI without libchudware.so. The physics itself is validated separately
@@ -24,7 +24,7 @@ if _REPO_ROOT not in sys.path:
 import pytest
 
 from services.mcp import cad_tools
-from services.mcp import cad_sim_tools  # T-RF8: run_fea_* tools live here now
+from services.mcp import cad_sim_tools  # run_fea_* tools live here now
 
 
 # ---------------------------------------------------------------------------

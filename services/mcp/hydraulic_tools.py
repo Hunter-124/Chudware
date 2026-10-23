@@ -1,9 +1,9 @@
 """AI-Hydraulic MCP tools — ISO 1219 hydraulic circuit design + component sizing.
 
-Same design contract as ``piping_tools`` (project owner: "the AI is extremely limited; its tools
+Same design contract as ``piping_tools`` (design principle: "the AI is extremely limited; its tools
 must do the bookkeeping and return rich, actionable context"). Each tool returns a JSON string
 ``{ok, ...result, warnings:[], hint:"...", next_actions:[...]}`` produced by the C++ core
-(T-RF19/T-RF20: the tool envelopes are owned by ``core/hydraulic`` behind the libchudware RPCs
+(the tool envelopes are owned by ``core/hydraulic`` behind the libchudware RPCs
 ``hydraulic_*`` — reached via :mod:`services.mcp.core_bridge`); the MCP layer keeps only input
 parsing and its tiny session state so tools can reuse the last active circuit document.
 
@@ -552,12 +552,12 @@ def rating_check(circuit: dict, res: dict) -> dict:
 
 # ── hydraulic → piping / FEA handoff helpers (module-level: engine-less testable) ──
 #
-# The translators/verifies the tools used pre-T-RF20 now live in the C++ core
+# The translators/verifies the tools used before the C++ port now live in the C++ core
 # (core/hydraulic/handoff.cpp — estimate_line_dp, hoses_to_piping, both envelope
 # builders, the margin feedback); the tool bodies below are thin core_bridge
 # wrappers. The pure-Python copies kept here are the simhandoff-envelope
 # compositions the MCP test suite exercises engine-less (same shapes the core
-# emits — byte-parity proven by the T-RF19 harness).
+# emits — byte-parity proven by the port parity harness).
 
 # ISO VG32 mineral hydraulic oil at ~40 °C — the default working fluid for line-loss
 # estimates and the piping solve (ν = 32 cSt, ρ = 870 kg/m³ → μ = ρ·ν ≈ 0.0278 Pa·s).

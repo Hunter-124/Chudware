@@ -658,7 +658,7 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
                              convections, nodes_per_elem);
 }
 
-// ═════════════════════════════ Transient (T-FIN18) ═══════════════════════════════════════
+// ═════════════════════════════ Transient ═════════════════════════════════════════════════
 //
 // Conductivity and surface assembly intentionally mirror the steady solver so the same
 // element and exterior-face rules apply to both paths.
@@ -947,7 +947,7 @@ ThermalTransientResult fea_thermal_transient(
     // adaptive route refines through (detail::repair_lonely_nodes), so a repaired mesh
     // can carry a few nodes that belong to no element at all. Their rows in the
     // iteration matrix are exactly zero, which makes it singular however it is factored:
-    // the fin25 sensor board arrived with 9 such nodes out of 50,550 and CHOLMOD, LDLT
+    // the sensor-node demo board arrived with 9 such nodes out of 50,550 and CHOLMOD, LDLT
     // and SparseLU all failed in turn ("iteration-matrix factorization failed").
     // Eliminating them is exact rather than an approximation — nothing couples them, so
     // they cannot influence any other DOF — and it is the same rule fea_static already

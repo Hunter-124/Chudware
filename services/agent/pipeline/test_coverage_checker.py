@@ -1,8 +1,8 @@
-"""tests for functional_decomposition.check_requirement_coverage (T-DP2).
+"""tests for functional_decomposition.check_requirement_coverage.
 
 Also contains a regression test confirming the DECOMPOSE gate extension:
 - presence-only path still returns gate name "features_present" and passes;
-- coverage findings from T-DP2 extend gate reasons without changing gate name.
+- coverage findings extend gate reasons without changing gate name.
 """
 from __future__ import annotations
 
@@ -177,12 +177,12 @@ class TestGateContext:
 
 
 # ---------------------------------------------------------------------------
-# DECOMPOSE gate — regression: presence-only path unchanged (DP1 compat)
+# DECOMPOSE gate — regression: presence-only path unchanged
 # ---------------------------------------------------------------------------
 
 class TestDecomposeGateRegression:
     def test_presence_only_passes(self):
-        """DP1 test: presence-only ctx (no coverage keys) still passes with
+        """Presence-only ctx (no coverage keys) still passes with
         gate name 'features_present'."""
         m = PhaseMachine()
         g = m.run_gate(Phase.DECOMPOSE, {"features": [{"id": "FT1"}]})
@@ -197,7 +197,7 @@ class TestDecomposeGateRegression:
         assert g.gate == "features_present"
 
     def test_coverage_findings_added_as_reasons(self):
-        """T-DP2: untraced features surface as gate reasons, gate still
+        """Untraced features surface as gate reasons, gate still
         returns 'features_present' (name unchanged, signature unchanged)."""
         m = PhaseMachine()
         ctx = {
@@ -211,7 +211,7 @@ class TestDecomposeGateRegression:
         assert any("FT-01" in r for r in g.reasons)
 
     def test_orphan_requirements_added_as_reasons(self):
-        """T-DP2: orphan requirements surface as gate reasons."""
+        """Orphan requirements surface as gate reasons."""
         m = PhaseMachine()
         ctx = {
             "features": [{"id": "FT-01"}],
@@ -224,7 +224,7 @@ class TestDecomposeGateRegression:
         assert any("R-99" in r for r in g.reasons)
 
     def test_full_coverage_passes(self):
-        """T-DP2: features present + no coverage findings → gate passes."""
+        """Features present + no coverage findings → gate passes."""
         m = PhaseMachine()
         ctx = {
             "features": [{"id": "FT-01"}, {"id": "FT-02"}],

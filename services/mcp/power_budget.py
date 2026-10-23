@@ -1,10 +1,10 @@
-"""System power/energy budget — rail tree + duty cycle + battery verdict (T-FIN23).
+"""System power/energy budget — rail tree + duty cycle + battery verdict.
 
 ``aicad.powerbudget/1``: a rail-tree bookkeeping model that unifies the power story:
 
     source (battery or bench supply)
       → converters (LDO / buck / boost, data-driven efficiency)
-        → per-rail loads (T-FIN8 boardphys component supply metadata)
+        → per-rail loads (boardphys component supply metadata)
 
 Duty-cycle weighting comes from an ``aicad.powerprofile/1`` artifact
 (``contracts/firmware_rpc.md`` §11, produced by ``fw_sim_run`` / ``fw_power_profile``)

@@ -24,9 +24,9 @@
 #include <cstring>
 
 #include "../ipc/ipc_client.h"
-#include <cstdio> // T-G9 parity trace (CHUDWARE_RPC_TRACE) file append
+#include <cstdio> // RPC parity trace (CHUDWARE_RPC_TRACE) file append
 #include <cstdlib>
-#include <functional> // T-G9 parity trace secret redaction
+#include <functional> // RPC parity trace secret redaction
 #include <cwchar> // _wcsnicmp for the Win32 child env block
 #include <string>
 #include <shared_mutex>
@@ -259,7 +259,7 @@ bool callAgentStreaming(const std::string &coreMethod, const json &p,
 // subsequent doc_* call carrying that id routes to the C++ core too — the id
 // prefix IS the commit-at-doc_new marker, giving an all-or-nothing-per-document
 // binding with no separate routing state. The C++ doc engine is the only
-// document backend (R5a/T-RF21; parity-complete since 2026-06-19), so the
+// document backend (parity-complete since 2026-06-19), so the
 // native agent seam below drives the same doc-cpp sessions.
 
 // Methods that MINT a new document (vs. operate on an existing one). hostd
@@ -287,7 +287,7 @@ bool routeDocToCpp(const std::string &method, const json &params) {
   // so always route to the core.
   if (method == "parts_catalog_list" || method == "parts_make")
     return true;
-  // T-RF19: doc_formats (the import/export format matrix) is C++-only
+  // doc_formats (the import/export format matrix) is C++-only
   // (core/doc/formats).
   if (method == "doc_formats") {
     if (!engine::available()) {
@@ -297,7 +297,7 @@ bool routeDocToCpp(const std::string &method, const json &params) {
     }
     return true;
   }
-  // T-RF19 leaves 4-6:
+  // Ported engine families:
   // hydraulic/piping/structural/tolerance/mechanical/materials/dfm ported to
   // core/ (dispatch in libchudware.cpp). Route the ported sets.
   static const char *const kR4e6[] = {
@@ -376,7 +376,7 @@ bool routeDocToCpp(const std::string &method, const json &params) {
       return true;
     }
   }
-  // T-RF18: sourcing/BOM/cost/spec-match ported to core/sourcing (dispatch in
+  // sourcing/BOM/cost/spec-match ported to core/sourcing (dispatch in
   // libchudware.cpp with production seams). Route the ported set; the vendor
   // registry read methods and parts_hub stay Python until their cutover.
   if (method == "bom_rollup" || method == "bom_price" ||
@@ -409,7 +409,7 @@ bool routeDocToCpp(const std::string &method, const json &params) {
     // to a doc) binds the call to a C++-backed document. A part/assembly
     // carries a "doc-cpp" id; a 2D DRAWING session (drawing_new / drawing_add_*
     // / drawing_get / drawing_bom / export_drawing) carries a "dwg-cpp" id —
-    // both route to the C++ core. eval_compare (WS-C reverse-engineering:
+    // both route to the C++ core. eval_compare (reverse-engineering:
     // params {doc_a, doc_b, ...}, no "doc_id") is the one eval_* RPC that does
     // NOT carry a plain "doc_id" -- without doc_a/doc_b here it would silently
     // miss this C++-only RPC and fall through to the (nonexistent, in this
@@ -516,9 +516,8 @@ bool routeAgentToCpp(const std::string &method, const json &params) {
 // --- C++ SIM (FEA/flow) routing ---------------------------------------------
 // Route the host's simulation RPCs (sim_mesh / sim_run_static / sim_run_adaptive /
 // sim_run_modal / sim_run_fatigue / sim_run_thermal / sim_run_flow / sim_cancel) to the
-// pure-C++ core (libchudware); FEA and flow run on the C++ core only
-// (R5a/T-RF21). sim_cancel is C++-dispatched in core (T-RF16,
-// core/sim/sim_cancel.cpp).
+// pure-C++ core (libchudware); FEA and flow run on the C++ core only.
+// sim_cancel is C++-dispatched in core (core/sim/sim_cancel.cpp).
 //
 // The host's send-shape for sim_run_static/sim_run_modal is already the C++
 // contract
@@ -574,7 +573,7 @@ bool routeSimToCpp(const std::string &method, const json & /*params*/) {
 // MCP bridge could serve them. Keep both the document-bound and documentless
 // allowlists synchronized with the libchudware ECAD dispatch region.
 bool cppEcadFlag() {
-  // R5a (T-RF21): the CHUDWARE_CPP_ECAD escape hatch is removed — the C++ core is
+  // The CHUDWARE_CPP_ECAD escape hatch is removed — the C++ core is
   // the only ECAD backend on every platform (the Python ECAD worker is deleted
   // at closeout; Windows' Python default goes with it).
   return true;
@@ -636,14 +635,14 @@ bool routeEcadToCpp(const std::string &method, const json &params) {
   }
   return true;
 }
-// --- C++ firmware routing (T-RF15) ------------------------------------------
+// --- C++ firmware routing ---------------------------------------------------
 // Route the ported fw_* methods to core/firmware (libchudware). DEFAULT ON on
 // Linux/macOS (the platforms the C++ module is verified on);
 // CHUDWARE_CPP_FIRMWARE overrides. The three emulator-leg methods (fw_sim_run /
 // fw_power_profile / fw_sensor_scenario) stay Python until the Renode leg
 // lands.
 bool cppFirmwareFlag() {
-  // R5a (T-RF21): the CHUDWARE_CPP_FIRMWARE escape hatch is removed —
+  // The CHUDWARE_CPP_FIRMWARE escape hatch is removed —
   // core/firmware owns the fw_* surface (POSIX-verified; Windows path is
   // best-effort C++).
   return true;
@@ -655,7 +654,7 @@ bool routeFirmwareToCpp(const std::string &method, const json & /*params*/) {
       "fw_verify_board",    "fw_flash",          "fw_debug_start",
       "fw_debug_halt",      "fw_debug_read_mem", "fw_status",
       "fw_projects",        "fw_sim_run",        "fw_power_profile",
-      "fw_sensor_scenario", // T-RF15 emulator leg
+      "fw_sensor_scenario", // emulator leg
   };
   if (!cppFirmwareFlag())
     return false;
@@ -1703,7 +1702,7 @@ bool WorkerClient::callWithLiveRouting(const std::string &method,
   return true;
 }
 
-// T-G9 parity trace: with CHUDWARE_RPC_TRACE=<file> set, every call() appends one
+// RPC parity trace: with CHUDWARE_RPC_TRACE=<file> set, every call() appends one
 // JSONL record {method, params, ok, result|err}. This is the single funnel all
 // panel RPCs pass through regardless of routing (Python worker subprocess,
 // in-process libchudware doc/CAM core, ECAD/agent C++ paths), so tools/gui_parity/

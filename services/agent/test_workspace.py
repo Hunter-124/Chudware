@@ -1,4 +1,4 @@
-"""test_workspace.py — Tests for T-W16 multi-document workspace.
+"""test_workspace.py — Tests for the multi-document workspace.
 
 Covers:
 - Lease contention: two agents, one doc → second rejected with owner named.

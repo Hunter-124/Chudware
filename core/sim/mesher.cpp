@@ -610,7 +610,7 @@ bool default_feature_refine(const MeshOptions &options) {
 // Why the number exists: a wall meshed ONE element thick has no interior node,
 // so the element cannot bend — the assembled system is a mechanism, and the
 // solver returns a "converged" displacement of nonsense magnitude rather than
-// an error (live, ME490 front spine: an O60 x 5.16 mm wall tube at h = 16 mm
+// an error (live, a tube-frame spine: an O60 x 5.16 mm wall tube at h = 16 mm
 // reported max displacement 9.6e6 mm at an equilibrium error of 0.0004%). A
 // ratio below 1 says exactly that, before anyone reads a stress off it.
 //
@@ -887,7 +887,7 @@ constexpr int kLebWaves = 18;
 // is a SHIP-QUALITY target, and judging a whole wave by it is what stalled the
 // live keyway at 2.434 mm: bisection legitimately produces cells under 0.02 on
 // an anisotropic wedge, and the fill itself ships some (33 left-handed and 2
-// flat cells on the ME 490 sector), so a single such cell — pre-existing or
+// flat cells on the rover wheel sector), so a single such cell — pre-existing or
 // new — vetoed every remaining wave and the study was refused on a mesh the
 // solver would have taken. Cells between this floor and 0.02 are COUNTED and
 // reported instead of being fatal.
@@ -955,7 +955,7 @@ double seed_spacing_mm(const std::vector<Eigen::Vector3d> &seeds) {
 // that keeps a projection can still leave the star around it skewed: LEPP
 // closure has to bisect a whole chain of neighbours to stay conforming, and it
 // pays for that with stretched cells one size class out from the interface. The
-// ME 490 hinge saddle came back with a delivered interface exactly as asked and
+// rover hinge saddle came back with a delivered interface exactly as asked and
 // an `aspect_max` of 263, a `jacobian_min` of 0.0029 and 50 cells under the
 // ship floor away from it. Both are per-CELL and per-NODE facts, so they get
 // per-node and per-cell decisions here rather than the per-wave,
@@ -2993,8 +2993,8 @@ void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &option
 // 6*V_signed. So it silently declined exactly the left-handed cells, left them
 // kTet4 inside an otherwise kTet10 mesh, and the fixed-stride extract below
 // then refused the entire study with "unsupported tet4 connectivity" — on a
-// perfectly valid solid. Measured on the ME 490 wheel-disc 90 deg cyclic
-// sector (phase 5D, R1 mass credit) at fineness 0.5: 33 left-handed cells out
+// perfectly valid solid. Measured on a rover wheel-disc 90 deg cyclic
+// sector at fineness 0.5: 33 left-handed cells out
 // of 467162, all against the wedge's sharp radial faces, where the graded
 // fill's boundary snapping flips a lattice tet. Order 1 never noticed; order 2
 // lost the study.
@@ -3043,7 +3043,7 @@ inline constexpr double kMaxRepairMoveFrac = 0.05;
 // the exact-BRep placement. In a thin web every node of a boundary sliver IS a
 // boundary node, so the gate has nothing to move, ships the cell, and says so
 // in its note ("ship_gate N non-integrable cells (det J <= 0 at a quadrature
-// point)"). Measured on the ME 490 wheel-disc 90 deg sector at h_bulk
+// point)"). Measured on a rover wheel-disc 90 deg sector at h_bulk
 // 8.898 mm: 29 of 152591 cells at shape quality 7e-17 and signed volume
 // 2e-15 mm3 — flat to machine precision, on the wedge's sharp radial faces,
 // in a fill whose own boundary snap already moved nodes by up to 1.59 mm.
@@ -3527,7 +3527,7 @@ bool build_mesh(const LoadedModel &loaded, const MeshOptions &options, double h,
     // A dissolve is a REPAIR only while it stays a minority correction. Its
     // premise is that a fragment reaching the body through one node or edge is a
     // DEFECT — and a defect is rare: the wheel-radial case that motivated the
-    // rule dropped 2 elements, and the fin25 board drops 3 of 240,469 (0.001%).
+    // rule dropped 2 elements, and the sensor-node demo board drops 3 of 240,469 (0.001%).
     // When the same rule fires on most of the fill the premise is simply false
     // for that mesh, and "repairing" it means handing back a part that is no
     // longer the part: measured on this board at h=1.54 mm the pass dissolved
@@ -3858,7 +3858,7 @@ bool fill_with_recovery(const LoadedModel &loaded, const MeshOptions &options,
     // Next lever: every refusal names the element size that resolves the
     // feature it tripped on ("reduce -h to <= ..."), and resolving that one can
     // uncover a SMALLER feature with a new, smaller hint — measured on the
-    // fin25 board, 4.46 mm -> 2.68 mm -> 1.57 mm, one CAD face at a time. So
+    // sensor-node demo board, 4.46 mm -> 2.68 mm -> 1.57 mm, one CAD face at a time. So
     // the hint is a ladder, not a single bound. It is bounded twice over: at
     // most kHintSteps rungs, and never below the study's own element-size band
     // floor, because that floor is what keeps the descent inside the memory
@@ -3946,7 +3946,7 @@ bool fill_with_recovery(const LoadedModel &loaded, const MeshOptions &options,
 // So the coarsening is verified on the RESULT rather than predicted from the
 // geometry: which thin section a fill can still resolve is not decidable from a
 // bounding box (nor from a section probe — mesh_size_band.cpp records why that
-// was rejected: it withdraws the coarsening the fin25 board depends on), but
+// was rejected: it withdraws the coarsening the sensor-node demo board depends on), but
 // "came back in more pieces than the shape has solids" is decidable, already
 // computed by fill_quality, and is exactly the defect that makes the mesh
 // unsolvable. A genuinely multi-solid compound reports its own solid count and
@@ -4230,7 +4230,7 @@ std::vector<TopoDS_Shape> model_solids(const LoadedModel &loaded) {
 // so they share no node BY CONSTRUCTION: every pair is a separate stiffness
 // system whatever the CAD does. That is correct for an assembly with real
 // clearances and wrong for the far more common import — a welded frame or a
-// rod-and-lug upright whose members were never unioned. The ME 490 rover
+// rod-and-lug upright whose members were never unioned. A rover model
 // records 9299.81 mm3 of interpenetration between source bodies 200 and 201
 // alone; such a study is refused for rigid-body motion at every element size,
 // and until now the refusal named no remedy.

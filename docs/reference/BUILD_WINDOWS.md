@@ -1,10 +1,9 @@
 # Building Chudware on Windows
 
 The `windows-core` (OCCT off) and `windows-occt` (OCCT + Polyhedral-FEA) presets configure
-MSVC + Ninja builds in `CMakePresets.json`. The self-hosted Windows CI row
-(`.github/workflows/native-build.yml`, `v*` tags and manual dispatch) is configured to build
-`windows-occt` plus the `host/` GUI and run both CTest trees. That wiring is not itself
-a claim that the latest run passed.
+MSVC + Ninja builds in `CMakePresets.json`. The Windows CI row
+(`.github/workflows/native-build.yml`, GitHub-hosted) builds `windows-occt` plus the
+`host/` GUI and runs both CTest trees.
 The GUI on every desktop platform is the **`host/` tree** (CMake target `Chudware`,
 output binary `chudware.exe`).
 Pass/fail state is whatever the latest CI run reports — this page records no pass counts.
@@ -109,8 +108,9 @@ are content-stable across unchanged configuration, so reconfiguring does not
 invalidate their consumers or force an otherwise unnecessary engine relink.
 
 Developer staging (`scripts/stage_windows.ps1`) requires the complete engine/host
-binaries and refuses missing prerequisites before changing `dist`. It copies the optional
-runtime wheel lock and offline wheelhouse only when they are present (see §5).
+binaries and refuses missing prerequisites before changing `dist`. The runtime wheel lock
+and offline wheelhouse are optional: it stages them only when both are present, and fails if
+only one is (see §5). Without them the dist runs from the `CHUDWARE_PYTHON` venv.
 `robocopy` statuses 0–7 are successful; failure statuses are fatal. Staging success is not
 qualification of an installed release.
 

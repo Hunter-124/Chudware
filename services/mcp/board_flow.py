@@ -23,11 +23,11 @@ from __future__ import annotations
 
 from typing import Any, Optional, Union
 
-# T-RF20: session/schema/drc/sync/autoroute are C++-dispatched — consumed here via the
+# session/schema/drc/sync/autoroute are C++-dispatched — consumed here via the
 # core_bridge-backed facades in ecad_common. place/trace_opt have NO C++ counterpart
-# (re-homed to services/ by another T-RF leaf) — the direct imports STAY.
-from services.ecad import place as place_mod  # STAYS (T-RF20): no C++ counterpart
-from services.ecad import trace_opt as trace_opt_mod  # STAYS (T-RF20): no C++ counterpart
+# (they live under services/) — the direct imports STAY.
+from services.ecad import place as place_mod  # STAYS: no C++ counterpart
+from services.ecad import trace_opt as trace_opt_mod  # STAYS: no C++ counterpart
 
 from services.mcp.ecad_common import (
     OpError,
@@ -101,7 +101,7 @@ def _resolve_pcb(opts: dict) -> ecad_session.EcadSession:
 def _drc_residuals(session) -> list[dict]:
     """Compact residual DRC violations (errors first). Never suppress.
 
-    Takes the board SESSION (T-RF20): the C++ session compile runs engine.ecad.drc on
+    Takes the board SESSION: the C++ session compile runs engine.ecad.drc on
     every apply/tree, so the residual read is one ecad_tree RPC."""
     try:
         viols = _compile_of(session).get("drc") or []
@@ -659,7 +659,7 @@ def autoplace_board(pcb_session_or_doc: Any, opts: Optional[dict] = None) -> dic
     """Connectivity-aware placement on an active board (standalone tool helper).
 
     Accepts a PCB session (:class:`services.mcp.ecad_common.EcadSession`) or ``doc_id``.
-    Pure :func:`engine.ecad.place.place_board` + ``swap_doc`` write-back (T-RF20: the
+    Pure :func:`engine.ecad.place.place_board` + ``swap_doc`` write-back (the
     write-back goes through the C++-backed session facade).
     """
     opts = dict(opts or {})
@@ -678,7 +678,7 @@ def autoplace_board(pcb_session_or_doc: Any, opts: Optional[dict] = None) -> dic
         raise OpError("invalid_op", "autoplace_board requires a pcb document",
                       {"reason": "wrong doc kind", "doc_id": session.doc_id})
 
-    # engine.ecad.place.autoplace inlined (T-RF20): it wrote back through the deleted
+    # engine.ecad.place.autoplace inlined: it wrote back through the deleted
     # Python session registry; here place_board (pure) + the C++-backed facade swap_doc.
     _pl = place_mod.place_board(session.doc, opts)
     place_rep = dict(_pl.get("report") or {})

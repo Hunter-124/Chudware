@@ -286,7 +286,7 @@ def test_browser_login_creates_profile_and_metadata(browser_mods):
 def test_browser_login_degrades_when_playwright_missing(browser_mods, monkeypatch):
     _profiles, _ratelimit, session = browser_mods
 
-    # Playwright IS installed in this dev venv (T-X1 installs it), so force the
+    # Playwright IS installed in this dev venv, so force the
     # internal import seam to fail to exercise the "not installed" degradation
     # path a bare-box checkout would actually hit.
     def _raise_import():

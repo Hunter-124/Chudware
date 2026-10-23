@@ -1,4 +1,4 @@
-"""CatalogProvider adapter for piping fittings (T-P2).
+"""CatalogProvider adapter for piping fittings.
 
 Wraps the bundled B16 fittings catalog in services/piping/catalog.py
 (``services/piping/data/fittings.csv``). Pipes are NOT enumerated here —
@@ -80,7 +80,7 @@ class PipingFittingsAdapter:
 
 def _get_rows() -> tuple:
     try:
-        from services.piping.catalog import _load_rows  # T-RF20: re-homed from engine_oracle
+        from services.piping.catalog import _load_rows  # re-homed from engine_oracle
         return _load_rows()
     except Exception as exc:  # noqa: BLE001
         log.debug("PipingFittingsAdapter: catalog unavailable: %s", exc)

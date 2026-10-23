@@ -3,7 +3,7 @@
 The fiducial the user lays in-frame. ChArUco (a chessboard fused with ArUco markers) gives
 sub-pixel corner localisation *and* unambiguous identity, so a single flat sheet fixes the
 pixel→mm homography that :mod:`~services.vision.measure` needs. ArUco lives in **core OpenCV
-``objdetect``** (Apache-2.0) — no ``opencv-contrib``, no GPU (master plan Pillar 10).
+``objdetect``** (Apache-2.0) — no ``opencv-contrib``, no GPU.
 
 ``cv2`` is imported lazily inside each function so importing this module never fails on a box
 without OpenCV; callers hit :class:`~services.vision.fiducial.VisionUnavailable` only when they

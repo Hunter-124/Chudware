@@ -83,10 +83,10 @@ mechanism, never a runtime dependency, never redistributed, never linked.
 
 | Rule | Enforcement |
 |---|---|
-| No OpenPnP source, jar, class file, or vendored copy in the repo | `test_licensing_boundary.py` + append patterns to the existing DoD §17 fast gate (integrator-applied): reject `**/openpnp*.jar`, `vendor/**/openpnp/**`, any `*.jar` under the repo, `import org.openpnp`, `org.openpnp.` string references in build files |
+| No OpenPnP source, jar, class file, or vendored copy in the repo | `test_licensing_boundary.py` + append patterns to the existing DoD §17 fast gate (maintainer-applied): reject `**/openpnp*.jar`, `vendor/**/openpnp/**`, any `*.jar` under the repo, `import org.openpnp`, `org.openpnp.` string references in build files |
 | No JVM in-process | No JNI, no JPype, no `jpype`/`py4j` dependency; the only permitted interaction is `subprocess` with an absolute path from env |
 | The OpenPnP-format writer contains no OpenPnP code | Writer is schema-driven from a hand-authored profile (§6.3); the golden expected output is *configuration data*, not program text |
-| Distribution artifacts unaffected | PnP adds no bundled binary; `scripts/qualify_pnp_q1.sh` is a developer/integrator script, excluded from packaging |
+| Distribution artifacts unaffected | PnP adds no bundled binary; `scripts/qualify_pnp_q1.sh` is a developer script, excluded from packaging |
 | The boundary is documented at the user surface | `describe_pnp_capabilities` and the GUI capability table both state "OpenPnP is not included; Lane B requires your own GPLv3 install" |
 
 **Deliberate deferral, stated in the product surface:** embedding OpenPnP, linking it, or shipping a

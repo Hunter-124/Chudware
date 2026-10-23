@@ -1,4 +1,4 @@
-"""services/browser/adapters/misumi.py — MISUMI source adapter (T-X7).
+"""services/browser/adapters/misumi.py — MISUMI source adapter.
 
 MISUMI (misumi-ec.com) is a configurable mechanical-components catalog
 (shafts, linear guides, plates, fasteners) with per-part-number CAD downloads

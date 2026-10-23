@@ -49,7 +49,7 @@ Full Linux gate, inside the same container CI uses:
 ```bash
 podman run --rm -it -v "$PWD:/src:Z" -w /src fedora:44 bash
 bash .github/scripts/install-fedora-deps.sh gate
-VENV_DIR=/tmp/gate-venv PYTHON=python3.13 bash scripts/provision_venv.sh pytest==9.1.1 dvc==3.67.1
+VENV_DIR=/tmp/gate-venv PYTHON=python3.13 bash scripts/provision_venv.sh pytest==9.1.1
 CHUDWARE_GATE_PYTHON=/tmp/gate-venv/bin/python CHECK_PYTHON=/tmp/gate-venv/bin/python bash scripts/gate.sh
 ```
 

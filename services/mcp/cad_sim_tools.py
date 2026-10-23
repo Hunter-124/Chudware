@@ -1,4 +1,4 @@
-"""CAD simulation MCP tools (T-RF8 split of cad_tools.py): run_fea_* + run_cfd_*."""
+"""CAD simulation MCP tools (split out of cad_tools.py): run_fea_* + run_cfd_*."""
 
 from __future__ import annotations
 
@@ -4042,7 +4042,7 @@ def _backend_missing(exc: Exception, method: str) -> bool:
 
 
 def register_cad_sim_tools(mcp: FastMCP) -> None:
-    """CAD simulation MCP tools (T-RF8 split of cad_tools.py): run_fea_* + run_cfd_*."""
+    """CAD simulation MCP tools (split out of cad_tools.py): run_fea_* + run_cfd_*."""
 
     # ---------------------------------------------------------------- simulation
 
@@ -5439,7 +5439,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     # ================================================================
-    # T-BL04 — fatigue / thermal / buckling / contact FEA
+    # Advanced FEA — fatigue / thermal / buckling / contact FEA
     # These tools solve on the real CAD mesh through the C++ engine.
     # fea_advanced retains fatigue post-processing and the legacy ccx contact
     # worker/V&V helpers, not a thermal or buckling proxy.

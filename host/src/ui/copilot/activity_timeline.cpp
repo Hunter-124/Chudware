@@ -1,4 +1,4 @@
-// Copilot activity timeline (T-RF6 split of legacy_chat.cpp): the per-turn typed-block
+// Copilot activity timeline: the per-turn typed-block
 // timeline — thinking blocks, action cards, the inline transparency rows
 // (context chips, thought boxes, tool-call rows), artifact file actions, and
 // drawAgentTimeline which sequences a turn's ActivityItems. Cards it delegates to live in
@@ -2488,7 +2488,7 @@ void drawCostStrip(const std::vector<StageCost>& stages, int totalTokens) {
     }
 }
 
-// Receipt disclosure state. NOT a ChatMsg field — app_state.h is integrator-owned — so it keys off
+// Receipt disclosure state. NOT a ChatMsg field — app_state.h stays unchanged — so it keys off
 // the message id scope, which is stable per turn and per conversation.
 std::unordered_map<ImGuiID, bool> g_receiptOpen;
 

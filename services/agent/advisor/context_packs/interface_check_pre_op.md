@@ -1,10 +1,10 @@
-# Interface alignment pre-op context pack (aicad.trigger/1 — T-DP6)
+# Interface alignment pre-op context pack (aicad.trigger/1)
 
 **When this fires:** the model mentions interface, alignment, hole patterns, bolt holes,
 coaxiality, contact faces, fasteners, or calls `interface_check`, `part_place`.
 
 **Key facts:**
-- `interface_check` (T-BL49) catches layout errors that **pass** `check_interference`
+- `interface_check` catches layout errors that **pass** `check_interference`
   (nothing overlaps) but are still wrong: bolt holes that don't register, bores that
   aren't coaxial, contact faces not flush, a screw that can't pass the stack.
 - Returns `{findings:[{severity, check, detail, error_mm, fix}], summary}`.

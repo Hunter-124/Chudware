@@ -1,4 +1,4 @@
-"""Trigger-injection wiring — agent_turn.run_turn's production seam (T-W21 §20 / mega-25).
+"""Trigger-injection wiring — agent_turn.run_turn's production seam (§20 / mega-25).
 
 Contract: contracts/advisor.md §20 (triggers, FROZEN).
 

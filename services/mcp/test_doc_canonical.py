@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 # tool registration. The pure-Python doc_diff logic doesn't need FastMCP at all, so when the
 # real `mcp` SDK genuinely isn't installed, inject a minimal stub rather than fail collection.
 #
-# T-V3 fix: this used to stub unconditionally whenever "mcp.server.fastmcp" wasn't ALREADY in
+# Fix: this used to stub unconditionally whenever "mcp.server.fastmcp" wasn't ALREADY in
 # sys.modules — i.e. whenever this file happened to be the first to touch `mcp` in the
 # process — permanently replacing FastMCP with the bare `object` class in sys.modules for
 # every test collected afterward in the same session (confirmed live:

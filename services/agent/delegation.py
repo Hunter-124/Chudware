@@ -14,7 +14,7 @@ What this module provides
 
 ``DelegationNode``
     One spawned sub-agent slot: role + model (resolved via routing) + brief +
-    budget + docs lease requests (T-W16).
+    budget + docs lease requests.
 
 ``BudgetMeter``
     Human-visible tree-wide meter: tokens spent vs granted across ALL nodes, plus
@@ -39,7 +39,7 @@ Recursion rails
          switch is the human-controlled stop.
       3. ``budget_meter``: tree-wide token spend vs grant + agent count, always
          visible in the artifact.  Token exhaustion of any ancestor auto-revokes
-         the subtree (unchanged from pre-T-DP9).
+         the subtree.
       4. ``kill()`` method: human-visible kill-switch — revokes the whole tree from
          root, sets ``killed=True``, and rejects all subsequent spawn requests.
 
@@ -63,7 +63,8 @@ Offline discipline
     Tests inject mocks; no all-skip.
 
 Doc leases
-    The ``docs`` field carries lease requests for T-W16 (request shape only here).
+    The ``docs`` field carries lease requests (request shape only here; leasing
+    itself lives in ``workspace.py``).
     Shape: ``[{"doc_id": str, "lease": "write"|"read"}]``.
 """
 from __future__ import annotations
@@ -108,7 +109,7 @@ STATUSES = frozenset({"pending", "approved", "running", "done", "failed", "revok
 
 @dataclass
 class DocLease:
-    """A doc lease request (T-W16 implements the actual lease; this is the shape)."""
+    """A doc lease request (``workspace.py`` implements the actual lease; this is the shape)."""
     doc_id: str
     lease: str  # "write" | "read"
 
@@ -158,7 +159,7 @@ class Budget:
 
 @dataclass
 class BudgetMeter:
-    """Human-visible tree-wide budget meter (T-DP9).
+    """Human-visible tree-wide budget meter.
 
     ``tokens_granted``  — root orchestrator grant.
     ``tokens_spent``    — total tokens accrued across all nodes (mirrors root.budget.tokens_spent).
@@ -391,7 +392,7 @@ class DelegationTree:
     ``ledger`` and ``routing`` are injected (test-mockable).  Both may be None:
     a None ledger means events are captured in ``_pending_events`` only; a None
     routing means model assignment is deferred (unresolved).
-    T-DP9 rails + hard nesting cap:
+    Delegation rails + hard nesting cap:
       ``max_subagent_depth`` — hard cap from agent.max_subagent_depth (default 2).
           Spawns whose child depth would exceed this raise DelegationError with a
           clear refusal: "max subagent nesting depth (N) reached".
@@ -446,7 +447,7 @@ class DelegationTree:
             except Exception:  # noqa: BLE001
                 self._ev_journal = None
 
-        # Tree-wide budget meter (T-DP9) — always current, serialised in every flush.
+        # Tree-wide budget meter — always current, serialised in every flush.
         # Hard nesting cap: explicit kwarg > config.json agent.max_subagent_depth > default.
         if max_subagent_depth is None:
             try:
@@ -514,8 +515,8 @@ class DelegationTree:
 
         *parent_id*: defaults to the root orchestrator node.
         *kind*: "worker" (default) or "ponder" (read-only).
-        *docs*: list of ``{"doc_id": str, "lease": "write"|"read"}`` requests (T-W16
-                request shape only — actual leasing lives in T-W16).
+        *docs*: list of ``{"doc_id": str, "lease": "write"|"read"}`` requests
+                (request shape only — actual leasing lives in workspace.py).
         *availability*: passed to routing for source availability probing.
         *effort*: optional low|medium|high reasoning effort for the subagent when
                  its role thinking is Auto (dispatcher assignment).
@@ -588,7 +589,7 @@ class DelegationTree:
         if len(brief) > 500:
             brief = brief[:499].rstrip() + "…"
 
-        # Kill-switch guard (T-DP9): reject all spawns after kill().
+        # Kill-switch guard: reject all spawns after kill().
         if self._meter.killed:
             raise DelegationError(
                 "delegation tree has been killed; no new sub-agents can be spawned",
@@ -621,7 +622,7 @@ class DelegationTree:
                 reason="max_subagent_depth",
             )
 
-        # Soft depth advisory (T-DP9): emit warning event but allow the spawn.
+        # Soft depth advisory: emit warning event but allow the spawn.
         if depth >= self._meter.soft_depth_limit:
             self._emit_event(
                 actor=role,
@@ -864,7 +865,7 @@ class DelegationTree:
         self._flush_artifact()
 
     def kill(self) -> None:
-        """Human kill-switch (T-DP9): halt the entire delegation tree.
+        """Human kill-switch: halt the entire delegation tree.
 
         Revokes all active nodes from the root down (cascading), sets
         ``meter.killed = True`` so every subsequent ``request_delegation``
@@ -905,7 +906,7 @@ class DelegationTree:
     def to_artifact(self) -> dict:
         """Serialize the tree to the aicad.delegation/1 ledger artifact shape.
 
-        T-DP9 additive fields (backward-compatible):
+        Additive fields (backward-compatible):
           ``budget_meter``     — tree-wide token+agent meter snapshot.
           ``soft_depth_limit`` — config advisory depth threshold.
           ``max_subagent_depth`` — hard nesting cap (agent.max_subagent_depth).
@@ -1103,7 +1104,7 @@ def delegate(
 # ---------------------------------------------------------------------------
 
 def register_delegation_tools(registry: Any, tree: DelegationTree | None = None) -> None:
-    """Register delegation tools with an MCP tool registry (T-DP9).
+    """Register delegation tools with an MCP tool registry.
 
     The registry is the one from services/mcp/tool_registry.py.  This makes
     ``delegate`` and ``kill_delegation_tree`` real registered tools.
@@ -1189,7 +1190,7 @@ def register_delegation_tools(registry: Any, tree: DelegationTree | None = None)
                     "parent_id": {"type": "string",
                                   "description": "Parent node id (defaults to orchestrator root)"},
                     "docs": {"type": "array",
-                             "description": "Doc lease requests [{doc_id, lease}] (T-W16)"},
+                             "description": "Doc lease requests [{doc_id, lease}]"},
                     "effort": {
                         "type": "string",
                         "enum": ["low", "medium", "high"],

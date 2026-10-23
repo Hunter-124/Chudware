@@ -1,4 +1,4 @@
-"""Structural analysis MCP tools (T-D2 + T-D3) — member forces, deflections, D/C ratios.
+"""Structural analysis MCP tools — member forces, deflections, D/C ratios.
 
   struct_analyze(doc_path, load_combo)          -> member forces, deflections, reactions
   struct_check(doc_path, load_combo)            -> strength + deflection utilization

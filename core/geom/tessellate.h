@@ -16,7 +16,7 @@ class gp_Trsf;
 
 namespace geom {
 
-// Size-relative default linear deflection (T-PERF7b, perf audit §4 P2):
+// Size-relative default linear deflection:
 // clamp(bbox_diag * 6e-4, 0.02 mm, 1.0 mm). A ~50 mm part (diag ~86.6 mm) lands
 // on ~0.05 mm — the old fixed default — so small/medium parts keep their prior
 // mesh density, while multi-metre parts no longer mesh at millions of triangles.

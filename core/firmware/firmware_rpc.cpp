@@ -194,7 +194,7 @@ nlohmann::json rpc_sim_run(const nlohmann::json& params) {
         for (const auto& a : params["assertions"])
             if (a.is_string()) assertions.push_back(a.get<std::string>());
 
-    // Scenario (T-FIN3): dict, JSON string, or fixture reference → validated dict.
+    // Scenario: dict, JSON string, or fixture reference → validated dict.
     nlohmann::json scenario_input=params.contains("scenario")?params["scenario"]:nlohmann::json();
     const std::string scenario_path=jstr(params,"scenario_path");
     if(!scenario_path.empty()) {
@@ -222,7 +222,7 @@ nlohmann::json rpc_sim_run(const nlohmann::json& params) {
                                       params.value("run_s",0.0),params.value("backend",std::string("auto")));
     nlohmann::json out = result.to_dict();
 
-    // T-FIN7: emit the aicad.powerprofile/1 artifact when the project is linked
+    // Emit the aicad.powerprofile/1 artifact when the project is linked
     // to a board and a trace was written. Best-effort — never fails the sim.
     if (result.trace_path && project.board_doc_ref) {
         try {

@@ -1,7 +1,7 @@
-"""Sourcing MCP tools: unified BOM roll-up + provider-resolved pricing (workstream B).
+"""Sourcing MCP tools: unified BOM roll-up + provider-resolved pricing.
 
 Thin MCP adapter over the C++ core (libchudware ``bom_rollup`` / ``bom_price`` RPCs via
-:mod:`services.mcp.core_bridge`, T-RF18). ``bom_rollup`` walks an assembly document (and any
+:mod:`services.mcp.core_bridge`). ``bom_rollup`` walks an assembly document (and any
 linked ECAD board) into a unified made/bought BOM; ``bom_price`` additionally resolves the
 bought lines' prices through the approved-provider chain (Nexar→Digi-Key→Mouser). Both return
 JSON-serializable BOM lines (``aicad.sourcing/1`` §3). No scraping, no network without configured

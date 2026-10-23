@@ -26,7 +26,7 @@ def _png(tmp_path):
 # ------------------------------------------------------------------ neutral schema (§1)
 def test_neutral_part_and_message_helpers():
     assert base.text_part("hi") == {"type": "text", "text": "hi"}
-    # T-F5: image parts carry a mime slot (photo ingestion); png is the default.
+    # Image parts carry a mime slot (photo ingestion); png is the default.
     assert base.image_part("/x/y.png") == {
         "type": "image",
         "path": "/x/y.png",

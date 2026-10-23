@@ -1,4 +1,4 @@
-"""Tests for services.ecad.si_rules — the T-FIN10 high-speed/SI rule pack.
+"""Tests for services.ecad.si_rules — the high-speed/SI rule pack.
 
 Fixture boards (built programmatically, mirroring test_drc.py style):
   * DDR-ish match-group board — 4 byte-lane nets, one routed short → si_match_length fires

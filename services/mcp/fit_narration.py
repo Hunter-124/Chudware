@@ -1,5 +1,5 @@
 """Shared fit/clearance narration (contracts/narration.md) — the single home of
-``_format_fit`` (T-F8).
+``_format_fit``.
 
 Kept free of any ``mcp`` SDK import on purpose: the agent build loop
 (``services/agent/loop.py``) imports this module, and under pytest the sibling

@@ -1,4 +1,4 @@
-// app_commands.h — T-RF11 (node R2b): ribbon command router.
+// app_commands.h — ribbon command router.
 //
 // Replaces the monolithic dispatch if-chain that used to live in app.cpp's dispatchCmd lambda.
 // Workspace families register ordered rules (exact id / id prefix / match-any) mapping a command
@@ -58,7 +58,7 @@ struct RibbonCommandHooks {
     CommandHandler appearance;        // Appearance tab: Material group
     CommandHandler flatPattern;       // W16: one-click Flatten
     CommandHandler flatDxf;           // W14: flat-pattern DXF
-    void (*ecadDispatch)(AppState&, const std::string& cmd);  // Wave N: AI-ECAD routing
+    void (*ecadDispatch)(AppState&, const std::string& cmd);  // ECAD command routing
 };
 
 // Builds the ribbon command table. Rule registration order reproduces the original dispatchCmd

@@ -1,4 +1,4 @@
-// Firmware ↔ board co-verification (T-RF15 port of
+// Firmware ↔ board co-verification (C++ port of
 // engine_oracle/firmware/coverify.py). Static pin checks + emulated-trace diff,
 // findings in the ERC violation shape extended with a "fix" hint. Pure +
 // advisory: deterministic ordering, never throws on a bad design. Rule catalog:

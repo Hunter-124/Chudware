@@ -2150,7 +2150,7 @@ void op_pcb_update_from_sch(json& doc, const json& op, int index, json& warnings
     doc["linked_sch"] = sch_id;
     warnings.push_back("op[" + std::to_string(index) + "]: pcb_update_from_sch recorded linked_sch='" +
                        sch_id + "' but is a best-effort stub — the netlist-driven reconciliation runs "
-                       "at the integrator (session/worker) layer where the schematic doc + netlist "
+                       "at the session/worker layer where the schematic doc + netlist "
                        "are available");
 }
 

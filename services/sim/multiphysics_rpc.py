@@ -1,4 +1,4 @@
-"""Multi-physics worker endpoints (T-FIN24) — the GUI-facing mirror of the advanced
+"""Multi-physics worker endpoints — the GUI-facing mirror of the advanced
 simulation + cross-sim-handoff MCP tools.
 
 Registered into the JSON-RPC worker (``engine_oracle/worker.py``) so the desktop
@@ -10,7 +10,7 @@ Endpoints:
   sim_caps            capability doctor for the Simulate tab's honest gating: CalculiX
                       presence (contact proxy), vibration post-processing (numpy),
                       and which cross-sim handoff endpoints are actually servable —
-                      including a forward probe for the T-FIN17 heatsink picker so the
+                      including a forward probe for the heatsink picker so the
                       GUI button lights up the moment that tool lands.
   sim_run_contact     CalculiX nonlinear contact two-block proxy (run_fea_contact).
   sim_freq_response   modal-superposition harmonic + Miles random post-processing over
@@ -73,11 +73,11 @@ def _positive_int_param(params: dict, key: str, default: int) -> int:
 # --------------------------------------------------------------------------- capability doctor
 
 def _heatsink_endpoint() -> Optional[Callable]:
-    """Forward probe for the T-FIN17 heatsink selection loop. Returns the callable
+    """Forward probe for the heatsink selection loop. Returns the callable
     when the tool has landed as an importable impl, else None — the GUI's 'Pick
-    heatsink' button is wired behind this check and lights up when T-FIN17 merges.
+    heatsink' button is wired behind this check and lights up when the tool is present.
 
-    Prefers services.mcp.heatsink (where T-FIN17 actually landed) over a historical
+    Prefers services.mcp.heatsink (where the tool actually lives) over a historical
     probe on ecad_thermal. Worker adapters accept a params-dict and return a dict.
     """
     try:
@@ -153,7 +153,7 @@ def _sim_caps(params: dict) -> dict:
         "ecad_thermal": {"available": ecad_ok, "hint": ecad_hint},
         "heatsink_select": {"available": _heatsink_endpoint() is not None,
                             "hint": "" if _heatsink_endpoint() is not None else
-                            "heatsink selection loop (T-FIN17) not installed yet"},
+                            "heatsink selection loop not installed yet"},
         # motion_fea_handoff needs the MCP session's motion+static chaining; no worker
         # mirror yet — the GUI shows honest guidance instead of a dead button.
         "motion_fea": {"available": False,
@@ -325,8 +325,8 @@ def _heatsink_select(params: dict) -> dict:
     fn = _heatsink_endpoint()
     if fn is None:
         return {"ok": False, "skipped": True,
-                "error": "heatsink selection loop (T-FIN17) not installed yet",
-                "hint": "the 'Pick heatsink' action lights up when T-FIN17 lands"}
+                "error": "heatsink selection loop not installed yet",
+                "hint": "the 'Pick heatsink' action lights up when the heatsink tool is installed"}
     out = fn(params or {})
     if isinstance(out, str):
         try:

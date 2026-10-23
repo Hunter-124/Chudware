@@ -1,13 +1,13 @@
-"""Advisory block rendering — budgeted, §9 precedence, no silent truncation (T-W5).
+"""Advisory block rendering — budgeted, §9 precedence, no silent truncation.
 
 Contract: ``contracts/advisor.md`` §3 (block format + drop policy) and §9
-(injection & precedence).  Layout follows docs/ADVISOR_ARCHITECTURE.md §3
+(injection & precedence).  Layout follows docs/design/ADVISOR_ARCHITECTURE.md §3
 (local-24k reference: advisory slot = 600 tokens).
 
 Rules implemented here:
   * Delimited block: ``[ADVISORY seq=.. stage=.. severity=..] ... [/ADVISORY]``.
-  * Token budget from the tier profile (hardcoded default until T-W10 ships
-    ``tiers.yaml``; the value is read from :data:`DEFAULT_ADVISORY_BUDGET`).
+  * Token budget from the tier profile (callers pass the ``tiers.yaml`` advisory
+    budget; the fallback default is :data:`DEFAULT_ADVISORY_BUDGET`).
   * Items dropped **lowest-severity-first** (the engine already sorted
     highest-first, so we drop from the tail).
   * A dropped-count line is **always** appended when anything was dropped — no
@@ -25,7 +25,7 @@ from .engine import SEVERITY_ORDER
 
 _CHARS_PER_TOKEN = 4  # repo-wide heuristic (matches ledger.py)
 
-# Hardcoded until T-W10 tiers.yaml; docs §3 local-24k advisory slot = 600 tokens.
+# Fallback when no tier budget is passed; docs §3 local-24k advisory slot = 600 tokens.
 DEFAULT_ADVISORY_BUDGET = 600
 
 _FACT_CONFIDENCE = frozenset({"kernel", "table"})

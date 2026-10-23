@@ -1,6 +1,6 @@
 """``suggest_dimension_scheme`` MCP tool — process-aware dimension planning for sketches.
 
-T-W3 / Pillar 20: given a sketch entity roster (from ``describe_sketch`` / doc RPCs),
+Given a sketch entity roster (from ``describe_sketch`` / doc RPCs),
 a manufacturing process, and an optional material hint, emit an ordered dimension plan
 that tells the model which dimensions to drive, why they are critical, and what default
 tolerance to apply.
@@ -144,7 +144,7 @@ except Exception:
 
 # Documented map: process canonical id → default IT grade for dimension tolerances.
 # Derived from process_profiles.tolerance_band_mm vs ISO 286 IT grade bands.
-# Source: ISO 286-1 Table 1 + DFM profile values; see T-W3 work order step 5.
+# Source: ISO 286-1 Table 1 + DFM profile values.
 _PROCESS_IT_GRADE: dict[str, int] = {
     "cnc_mill":   7,   # ±0.010–0.025 mm achievable; IT7 ≈ 0.012–0.025 mm
     "lathe":      7,   # same capability as CNC mill for turned diameters

@@ -2,7 +2,7 @@
 //
 // The Python engine ships the cmake_arm template tree on disk next to the
 // module; the C++ core embeds the same files (templates_embedded.cpp, generated
-// from the Python tree at the T-RF15 cutover) so libchudware has no runtime data
+// from the Python tree when the module was ported) so libchudware has no runtime data
 // path to resolve.
 #pragma once
 

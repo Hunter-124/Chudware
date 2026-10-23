@@ -1,4 +1,4 @@
-"""services/browser/adapters/cadenas.py — CADENAS PARTcommunity / 3Dfindit adapter (T-X7).
+"""services/browser/adapters/cadenas.py — CADENAS PARTcommunity / 3Dfindit adapter.
 
 3Dfindit.com / PARTcommunity is the CADENAS white-label CAD portal engine behind
 thousands of manufacturer catalogs — the STEP/native geometry only emerges after

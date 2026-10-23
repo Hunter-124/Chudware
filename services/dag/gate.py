@@ -2,7 +2,7 @@
 
 Contract: contracts/dag_schema.md §6 (autonomy levels), §11 (events).
 Interaction shape: contracts/interaction.md §1 (kind=approval), §3 (batch envelope).
-Wired by: T-A3. Migration seam for T-F4 (thin adapter, not a rewrite).
+Migration seam for the ask_user transport (thin adapter, not a rewrite).
 
 The gate node calls LangGraph interrupt() to suspend execution; the user resumes via
 executor.resume(run_id, decision).  The decision is one of:
@@ -53,7 +53,7 @@ def make_gate_payload(
     """Build the interrupt payload shaped as an aicad.interaction/1 approval batch.
 
     The shape follows contracts/interaction.md §1 (kind=approval) and §3 (batch
-    envelope) so T-F4's migration to the full ask_user transport is a thin adapter.
+    envelope) so migration to the full ask_user transport is a thin adapter.
 
     Args:
         node:      The DAG node dict (id, name, type, inputs, autonomy, …).
@@ -194,7 +194,7 @@ def run_gate(
     run_id  = state.get("run_id", "unknown")
     node_id = node["id"]
 
-    # Build the interaction payload (aicad.interaction/1 shape for T-F4 compat).
+    # Build the interaction payload (aicad.interaction/1 shape for ask_user compat).
     payload = make_gate_payload(node, run_id, autonomy=autonomy)
     question_id = payload["questions"][0]["id"]  # "gate.<node_id>"
 
@@ -204,9 +204,9 @@ def run_gate(
     # an approval for this gate id via ask_user(scope="run")).  If yes, skip
     # the interrupt() entirely so the run never re-asks.
     #
-    # This is approach (a) from work/questions/T-F4.md: an explicit replay-check
+    # Design decision: an explicit replay-check
     # here rather than wrapping interrupt() as an ask_user transport, which would
-    # risk re-entering _emit() and breaking the event-dedup contract (T-A3).
+    # risk re-entering _emit() and breaking the event-dedup contract.
     led = _gate_ledger(run_id, ledger)
     prior = led.answered(question_id)
     if prior is not None:

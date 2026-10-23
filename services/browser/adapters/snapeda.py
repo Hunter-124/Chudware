@@ -1,4 +1,4 @@
-"""services/browser/adapters/snapeda.py — SnapEDA source adapter (T-X7).
+"""services/browser/adapters/snapeda.py — SnapEDA source adapter.
 
 SnapEDA (snapeda.com) hosts ECAD symbols, footprints and 3D models for
 electronic parts. Search is public; downloads require the user's own free
@@ -6,7 +6,7 @@ SnapEDA account. `acquire` lands the symbol/footprint archive (zip) or 3D
 model (STEP) with provenance for ecad_find_part / ecad_place_symbol.
 
 NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live logged-in SnapEDA session (T-X6 gates the real per-source
+against a live logged-in SnapEDA session (the gated integration suite covers the real per-source
 integration tests behind an env flag).
 """
 from __future__ import annotations

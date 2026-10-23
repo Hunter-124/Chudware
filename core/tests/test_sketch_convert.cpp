@@ -1,4 +1,4 @@
-// Regression tests for T-BL43 — Convert Entities / external sketch references.
+// Regression tests for Convert Entities / external sketch references.
 //
 // THE BUG(S): contracts/doc_ops.md contracted a `sketch_convert` op in C53 and BOTH GUIs
 // (host sketch_mode.cpp applyConvertRef + ui/imgui sketch_overlay.cpp) emit it, but the C++
@@ -7,7 +7,7 @@
 // line/axis-parallel-circle only: faces projected to a bare plane-intersection line and an
 // OBLIQUE circular edge was rejected outright.
 //
-// THE FIX (see doc_ops.md's dated T-BL43 amendment): op_sketch_convert (session.cpp) +
+// THE FIX (see the dated `sketch_convert` amendment in doc_ops.md): op_sketch_convert (session.cpp) +
 // chudware::doc::project_edges_to_plane (recon.cpp) — true orthographic projection along the
 // sketch normal via GeomProjLib::ProjectOnPlane, then classification of the PROJECTED curve,
 // so the result is correct by construction:
@@ -16,7 +16,7 @@
 //   * edge (near-)perpendicular to the plane -> a single "point";
 //   * a face ref projects ALL its boundary wires, appended as REAL (non-construction)
 //     fix-pinned sketch entities the user can extrude (SolidWorks Convert Entities).
-// ONE-SHOT projection — no associative link to the source (follow-up: T-BL49).
+// ONE-SHOT projection — no associative link to the source (associative refs: see below).
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 // MSVC only exposes M_PI from <cmath> when _USE_MATH_DEFINES is set (before the include).
 #define _USE_MATH_DEFINES
@@ -223,7 +223,7 @@ TEST_CASE("op: sketch_convert projects a face loop as REAL entities and they ext
 }
 
 // ---------------------------------------------------------------------------
-// T-BL49 — ASSOCIATIVE external references
+// ASSOCIATIVE external references
 // ---------------------------------------------------------------------------
 
 namespace {

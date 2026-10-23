@@ -1,6 +1,6 @@
-// Regression suite for geom::surf_replace_face_solid (T-BL27).
+// Regression suite for geom::surf_replace_face_solid.
 //
-// Found during the T-G20 surfaces audit (work/questions/T-G20-surfaces-audit.md):
+// Found during a surfaces audit:
 // surf_replace_face_solid BOP-splits the solid by the replacement surface and bails
 // with "could not heal" unless that split yields >=2 positive-volume pieces. A
 // replacement genuinely cutting through the solid works; the intuitive pick — a

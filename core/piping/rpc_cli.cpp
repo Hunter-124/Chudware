@@ -1,7 +1,7 @@
 // core/piping/rpc_cli.cpp — dev harness driver (mirrors firmware/fw_cli.cpp):
 // reads one {"method","params"} JSON object per line on stdin, dispatches to
 // the hydraulic then piping cores, and prints the result as one JSON line.
-// Used by the T-RF19 parity harness (/tmp) to diff C++ envelopes against the
+// Used by a parity harness to diff C++ envelopes against the
 // Python oracle — not linked into libchudware.
 #include <iostream>
 #include <string>

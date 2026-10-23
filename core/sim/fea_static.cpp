@@ -91,7 +91,7 @@ nlohmann::json fea_iterative_report_json(const FeaStaticResult& r) {
 namespace {
 
 // Cap the solver's worker threads so a long solve never eats every core — the GUI/render
-// threads must keep running (Hunter: "let the GUI continue on at least 1 thread"). Caps both
+// threads must keep running (the GUI keeps at least one thread). Caps both
 // CHOLMOD's own OpenMP loops and the OpenMP-based system BLAS (FlexiBLAS/OpenBLAS) it calls.
 // Env CHUDWARE_FEA_THREADS overrides; default = governor plan capped at hw-2 / 8.
 // Size-adaptive: tiny systems stay serial (thread spawn costs more than the work).

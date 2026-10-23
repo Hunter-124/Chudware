@@ -381,7 +381,7 @@ std::string iso_utc_now() {
 
 // ------------------------------------------------------------------ canonical JSON
 //
-// Policy (T-H2 / contracts/doc_schema.md §Canonical dump):
+// Policy (contracts/doc_schema.md §Canonical dump):
 //   - JSON numbers retain their full round-trip precision. Rounding dimensionless
 //     axes or rigid transforms changes the constraints when a document is reopened.
 //   - nlohmann::json uses std::map → keys are already sorted alphabetically.

@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .errors import DeliverableError
 
-# Preview caps (contract §5.4 / driver notes): ≤ 1024 px long edge, < 1 MB.
+# Preview caps (contract §5.4): ≤ 1024 px long edge, < 1 MB.
 MAX_LONG_EDGE = 1024
 MAX_BYTES = 1_000_000
 
@@ -147,8 +147,8 @@ def text_to_png(src: Path, dest_dir: Path, stem: str) -> list[dict]:
 def svg_to_pngs(src: Path, dest_dir: Path, stem: str) -> list[dict]:
     """Best-effort SVG preview: cairosvg if importable, else LibreOffice office path.
 
-    The frozen §7 engine set has no permissive in-process SVG rasterizer (see
-    ``work/questions/T-F14.md``); this degrades to ``converter_missing`` when neither an
+    The frozen §7 engine set has no permissive in-process SVG rasterizer; this
+    degrades to ``converter_missing`` when neither an
     optional cairosvg nor LibreOffice is available, so CI stays green.
     """
     try:  # optional, not a declared dep — used only if the environment already has it.

@@ -500,7 +500,7 @@ TEST_CASE("doc_simulate_motion: offset revolute pose survives rebuilds and save 
 
     check_tree_pose(added, 0.0);
     for (double degrees : {-1.5, -4.0}) {
-        // The first ME490 input-yoke edit was -1.5 degrees. Recompiling its
+        // The first input-yoke edit in a vehicle model was -1.5 degrees. Recompiling its
         // solved pose used to silently turn that into -3 despite zero residuals.
         const auto edited = doc::doc_apply_ops(did, -1, json::array({
             {{"op", "asm_edit_mate"}, {"id", mid}, {"value", angle_value(degrees)}}

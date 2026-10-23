@@ -1,4 +1,4 @@
-"""Reverse-engineering reconstruction MCP tools (T-RF8 split of reveng_tools.py): reconstruct, single_photo, fit_primitives, build_parametric, attach_result, scan-mesh import, bundle export, make_part_from_library, research_source."""
+"""Reverse-engineering reconstruction MCP tools (split out of reveng_tools.py): reconstruct, single_photo, fit_primitives, build_parametric, attach_result, scan-mesh import, bundle export, make_part_from_library, research_source."""
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
@@ -91,7 +91,7 @@ def _persist_build_result(session_id: str, *, strategy: str, state: str,
     return block
 
 def register_reveng_build_tools(mcp: FastMCP) -> None:
-    """Reverse-engineering reconstruction MCP tools (T-RF8 split of reveng_tools.py): reconstruct, single_photo, fit_primitives, build_parametric, attach_result, scan-mesh import, bundle export, make_part_from_library, research_source."""
+    """Reverse-engineering reconstruction MCP tools (split out of reveng_tools.py): reconstruct, single_photo, fit_primitives, build_parametric, attach_result, scan-mesh import, bundle export, make_part_from_library, research_source."""
 
     @mcp.tool()
     def reveng_start_splat(

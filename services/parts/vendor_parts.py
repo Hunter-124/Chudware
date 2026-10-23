@@ -45,7 +45,7 @@ class VendorPart:
     # Optional: mtime of the on-disk source file when last registered. Used by the watched
     # parts-library scanner to skip unchanged files (idempotent re-scan). C++ core ignores it.
     source_mtime: float = 0.0
-    # --- Sourcing/pricing fields (T-B1a, additive; see contracts/sourcing_schema.md). ---
+    # --- Sourcing/pricing fields (additive; see contracts/sourcing_schema.md). ---
     # All optional so records registered without a price feed remain valid and unchanged. A
     # provider that returns pricing populates these; consumers must treat None as "unknown".
     unit_price: float | None = None          # price for a single unit at qty 1, in `currency`
@@ -281,10 +281,10 @@ def _vendor_part_scan_library(params: dict, emit: EmitFn) -> dict:
 
 
 def _vendor_part_fetch(params: dict, emit: EmitFn) -> dict:
-    # parts_providers was deleted (T-RF18) — the C++ sourcing RPC owns the fetch path
+    # parts_providers was deleted — the C++ sourcing RPC owns the fetch path
     # (routed via worker_client.cpp); this Python endpoint degrades honestly.
-    return {"ok": False, "error": "vendor_part_fetch moved to the C++ core "
-            "(T-RF18); the Python provider chain was deleted"}
+    return {"ok": False, "error": "vendor_part_fetch moved to the C++ core; "
+            "the Python provider chain was deleted"}
 
 
 # vendor_part_insert moved to the C++ core (doc_vendor_part_insert): it mutates a doc by applying

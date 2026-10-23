@@ -351,7 +351,7 @@ struct RevEngState {
     int propsTab = 0;
 
     // User intent for the two side columns (rail / properties). The stage body always stays
-    // visible; collapsing rolls a column to a header strip + chevron (T-G21 affordance).
+    // visible; collapsing rolls a column to a header strip + chevron (same affordance as the pinned columns).
     // Auto follows the layout, which folds Properties then Sessions when the body is too narrow
     // for three columns at their minimum widths. That fold is a per-frame LAYOUT decision in the
     // shell and never written here, so an explicit Expanded survives any window/scale change.

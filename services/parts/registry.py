@@ -1,4 +1,4 @@
-"""CatalogProvider registry — aicad.parts/1 (T-P1).
+"""CatalogProvider registry — aicad.parts/1.
 
 Maintains an ordered list of registered CatalogProvider adapters.
 Thread-safe for read after initial setup; not designed for concurrent mutation.

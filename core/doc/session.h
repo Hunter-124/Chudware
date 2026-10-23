@@ -46,7 +46,7 @@ struct OpError : std::runtime_error {
 };
 
 // CRASH RECOVERY (P0 deadlock fix). Every doc_* RPC takes the target document's
-// per-doc mutex via DocLock (T-PERF5), which releases correctly when a C++
+// per-doc mutex via DocLock, which releases correctly when a C++
 // exception (e.g. OpError from a rejected op batch) unwinds the stack. But a
 // WINDOWS STRUCTURED EXCEPTION (an access violation — null deref reading 0x60 —
 // raised deep inside compile_document while the lock is held) does NOT run C++
@@ -689,7 +689,7 @@ nlohmann::json doc_sketch_exit(const std::string& doc_id, const std::string& ske
 nlohmann::json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
                                 const nlohmann::json& action);
 
-// T-W2 sketch completion suite.
+// Sketch completion suite.
 //
 // doc_sketch_auto_constrain: deterministic auto-coincident pass. Scans entity
 //   endpoints, pairs those within tol_mm (default 1e-4) that are not already
@@ -739,7 +739,7 @@ nlohmann::json doc_sketch3d_drag(const std::string& doc_id, const std::string& s
 nlohmann::json doc_sketch_project_ref(const std::string& doc_id, const std::string& sketch_fid,
                                       const nlohmann::json& ref);
 
-// sketch_project_entities (T-BL43 "Convert Entities" / external references): project a LIST of
+// sketch_project_entities ("Convert Entities" / external references): project a LIST of
 // external refs (datum plane / face / model edge) onto the active sketch's (u,v) plane and
 // return ready-to-insert doc-schema §3.1 REFERENCE entities (construction:true). Uses OCCT
 // orthographic projection (GeomProjLib) + recon.cpp's curve classifier, so faces project all
@@ -835,7 +835,7 @@ nlohmann::json doc_simulate_motion(const std::string& doc_id,
                                    const nlohmann::json& dynamics = nlohmann::json(nullptr),
                                    const nlohmann::json& drivers = nlohmann::json(nullptr));
 
-// --- doc-lock contention meters (Phase 1b + T-PERF5 per-doc locking) ---------------
+// --- doc-lock contention meters (per-doc locking) ----------------------------------
 // Each modeling RPC locks the target document (DocLock → per-session mutex). Meters
 // measure lock wait/hold/queue-depth. Cross-doc ops multi-lock in doc_id order; the
 // registry mutex is short-lived (map pin only). Still the primary bottleneck signal

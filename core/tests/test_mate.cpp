@@ -312,7 +312,7 @@ TEST_CASE("a fixed component's transform beats a stale warm entry") {
     CHECK(std::abs(k2[7] - 7.0) < 1e-9);
 }
 
-// ME 490 phase 5A: a 20-mate network over 9 components at rover scale (~2 m) "diverged",
+// Live defect: a 20-mate network over 9 components at rover scale (~2 m) "diverged",
 // components landing thousands of mm from where they were authored, and the reply said
 // only that the solve had not converged. The mechanism was the random-restart escape:
 // when ANY mate was unsatisfiable the escape perturbed the rotation of EVERY free
@@ -453,7 +453,7 @@ TEST_CASE("the convergence tolerance scales with the assembly") {
     CHECK(big["max_residual"].get<double>() <= big["tolerance"].get<double>());
 }
 
-// ME 490 phase 5D item 4: the merged rover's GROUNDED frame (fixed:true) came back from the
+// Live defect: the merged rover's GROUNDED frame (fixed:true) came back from the
 // mate solve ~0.046 mm off its authored placement, which showed up as a 73.7 mm3 frame<->hub
 // overlap per corner that vanished when the same two solids were placed by transform. A
 // fixed component is a HARD CONSTRAINT, not six variables with a stiff spring: it must be
@@ -593,7 +593,7 @@ TEST_CASE("the convergence threshold is absolute in mm however big the assembly"
     CHECK(small["converged"].get<bool>());
 }
 
-// ME 490 phase 5F item 5: the steer joint's angle mate could not be driven at all. At
+// Live defect: the steer joint's angle mate could not be driven at all. At
 // exactly 0 deg it came back `status: redundant` with residual 0 — `da . db - cos(target)`
 // has derivative -sin(theta) in the angle it controls, so at 0 deg (and at 180 deg) its
 // Jacobian row is EXACTLY ZERO and the mate adds no rank: the solver cannot drive it.

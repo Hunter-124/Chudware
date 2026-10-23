@@ -2512,7 +2512,7 @@ class ChudcodeSessionHost:
             # code devices (security_scan, debug, firmware, cpp_*, ast_*, github ...):
             # 106 KB of prompt + tool schema, 72 KB after (measured with get_state).
             kwargs["no_skills"] = True
-            # The user's Chudcode MCP servers (stripe, graphify ...) are not CAD tools.
+            # The user's own Chudcode MCP servers are not CAD tools.
             extra: tuple[str, ...] = ("--no-lsp",)
             if binary is not None and _binary_supports_flag(binary, "--no-mcp"):
                 extra += ("--no-mcp",)

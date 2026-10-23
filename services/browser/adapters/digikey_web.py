@@ -1,4 +1,4 @@
-"""services/browser/adapters/digikey_web.py — DigiKey WEBSITE source adapter (T-X7).
+"""services/browser/adapters/digikey_web.py — DigiKey WEBSITE source adapter.
 
 The browser fallback for DigiKey (digikey.com) parts search — DISTINCT from
 the native sourcing API path in ``core/sourcing/``, which is the

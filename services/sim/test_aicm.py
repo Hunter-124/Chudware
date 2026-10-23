@@ -24,7 +24,6 @@ from services.sim.tessellate import (
 )
 
 # Repo-relative path to golden fixture
-# contracts/ moved top-level in the N0c consolidation (was docs/contracts/)
 _FIXTURE = Path(__file__).resolve().parents[2] / "contracts" / "fixtures" / "box.aicm"
 
 

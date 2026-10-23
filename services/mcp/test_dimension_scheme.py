@@ -1,4 +1,4 @@
-"""Tests for suggest_dimension_scheme (T-W3).
+"""Tests for suggest_dimension_scheme.
 
 Tests run in offline mode (no bridge / no live doc) using the built-in 4-hole
 plate sketch fixture.  The bridge-unavailable path returns a synthetic entity
@@ -96,7 +96,7 @@ def _install_stubs():
     eng = types.ModuleType("engine")
     eng_materials = types.ModuleType("engine.materials")
     eng_materials.density = lambda name: None
-    # T-RF19/20: paths re-homed to services.paths — stub it there (sys.modules
+    # paths re-homed to services.paths — stub it there (sys.modules
     # fallback covers `from services import paths`).
     eng_paths = types.ModuleType("services.paths")
     import pathlib
@@ -158,7 +158,7 @@ def get_profile(name: str) -> dict:
 
 
 class TestBoltPatternRule(unittest.TestCase):
-    """The core T-W3 rule: bolt patterns use datum-offset + centre-to-centre only."""
+    """The core rule: bolt patterns use datum-offset + centre-to-centre only."""
 
     def setUp(self):
         # 4-hole plate: 40mm spacing, 5mm holes
@@ -300,7 +300,7 @@ class TestFitsIntegration(unittest.TestCase):
 
 
 class TestProcessDifferentiation(unittest.TestCase):
-    """DoD 3 — T-DP7: machined bore vs printed hole produce different dimension schemes.
+    """DoD 3: machined bore vs printed hole produce different dimension schemes.
 
     The differences are sourced from engine_oracle/dfm/process_profiles.py:
     - cnc_mill: hole_comp_mm=0.0, IT grade 7 (±~0.010 mm at 20mm)
@@ -456,7 +456,7 @@ class TestProcessDifferentiation(unittest.TestCase):
 
 
 class TestSketchHealthText(unittest.TestCase):
-    """DoD 4 (offline portion) — T-DP7: sketch_health_text() renders the three key states.
+    """DoD 4 (offline portion): sketch_health_text() renders the three key states.
 
     The live-bridge tests (≥3 states against real engine) are in test_gsl_tools.py.
     These offline tests verify the renderer logic using synthetic health dicts.

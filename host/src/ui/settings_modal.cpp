@@ -42,7 +42,7 @@
 #ifndef __EMSCRIPTEN__
 #include "../update/updater.h"
 #endif
-#include "web_capabilities.h"  // ui::webGapReason (T-RF12: sign-in is desktop-only on web)
+#include "web_capabilities.h"  // ui::webGapReason (sign-in is desktop-only on web)
 #include "../core/async_rpc.h"  // core::RpcResult for skills/triggers RPCs
 #include "widgets/interwebz.h"  // Skills/Rules two-column editors
 #include "ui/provider_logos.h"  // ui::drawProviderLogo/providerBrandColor (Providers list badges)
@@ -1170,7 +1170,7 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
             ui::providerUsagePollAccounts(st, kAccountsPollIntervalSec, true);
         } else {
             // First account vs multi-account: label makes "already signed in" obvious.
-            // T-RF12: on the web (WASM) build the token store + OAuth flows live in the
+            // On the web (WASM) build the token store + OAuth flows live in the
             // desktop engine worker, so the button renders disabled with the gap reason
             // as its tooltip instead of firing an RPC that can only fail.
             const char* webWhy = ui::webGapReason("account_signin");
@@ -7097,7 +7097,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 // Theme moved to the Appearance page (the canonical control); engine routing +
                 // profiler are status/launchers, folded under one System section (audit P2).
                 settingsGlassSectionBegin("##gen_system", "System");
-                // R5a (T-RF21): routing is unconditional — the C++ core IS the engine
+                // Routing is unconditional — the C++ core IS the engine
                 // (the CHUDWARE_CPP_* escape hatches were removed with the Python oracle).
                 if (core::cpp_core().available()) {
                     ImGui::TextUnformatted("Active engine: C++ core (libchudware)");

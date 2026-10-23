@@ -70,7 +70,7 @@ class TestAskUserBinding:
         Two correct behaviours conspire against a naive re-run of this test:
         ``new_part`` RESUMES an already-open part of the same name instead of
         minting a duplicate, and doc-scoped answers persist inside the document
-        (contract §5 / T-BL25 cross-session no-re-ask).  So against a live
+        (contract §5 cross-session no-re-ask).  So against a live
         daemon the second run of this test inherits the first run's answer and
         sees ``resumed`` on the very FIRST ask.  Clear the record so the two
         asks below are genuinely the first and the second.

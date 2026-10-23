@@ -49,8 +49,7 @@ core/
     cmake/    Provision*.cmake auto-provisioners (OCCT, Polyhedral-FEA, OpenNURBS, lib3mf, …)
     data/     bundled data (materials)
     third_party/ vendored sources (rhino3dm-src)
-    docs/     kicad_reference.md; wave2_occt_plan.md is a historical record (landed —
-              keep for rationale; its setup steps are superseded by cmake/ProvisionOCCT.cmake)
+    docs/     kicad_reference.md
   Tests
     tests/    doctest suites: test_nsolve.cpp, test_sketch.cpp, plus ~100 subsystem tests
   CMakeLists.txt            build: Eigen + doctest + nlohmann/json via FetchContent;

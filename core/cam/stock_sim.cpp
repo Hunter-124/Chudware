@@ -216,7 +216,7 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
     // A top-down Z-dexel can't represent diameter reduction (removal is radial, the
     // dexel's height axis is the spindle axis). For a lathe + cylindrical stock, model
     // the stock as a radius profile R(z) and lower it as each turning pass cuts; removed
-    // volume integrates π(R0²−R(z)²)dz along the axis (audit G4).
+    // volume integrates π(R0²−R(z)²)dz along the axis.
     if (setup.machine.kind == MachineKind::Lathe && cylinder) {
         int nz = std::max(2, (int)std::ceil((top - bottom) / res_mm));
         double dz = (top - bottom) / nz;
@@ -348,7 +348,7 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
         }
         const Tool* tl = tools.find(tp.tool_number);
         double r = tl ? tl->effective_radius() : 1.0;
-        // non-cutting tool body for holder/shank collision (audit T-M3): the flutes cut
+        // non-cutting tool body for holder/shank collision: the flutes cut
         // to tip_z..tip_z+flute_length at radius r; above that the (wider) shank runs to
         // the shoulder and the holder above that. Any remaining stock that rises into
         // those non-cutting zones is a crash the tip-only sim misses.
@@ -427,7 +427,7 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
             if (m.kind == MoveKind::Arc) {
                 // sweep the TRUE arc (center+radius carried on the Move), not the chord:
                 // a chord bows inside a convex arc and under-removes near the midpoint,
-                // which false-negatives the gouge check on curved passes (audit D8).
+                // which false-negatives the gouge check on curved passes.
                 double cx = m.center.x, cy = m.center.y;
                 double rad = std::hypot(prev.x - cx, prev.y - cy);
                 double a0 = std::atan2(prev.y - cy, prev.x - cx);

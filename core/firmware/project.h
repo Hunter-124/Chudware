@@ -1,4 +1,4 @@
-// Firmware project record — create/save/load (T-RF15 port of
+// Firmware project record — create/save/load (C++ port of
 // engine_oracle/firmware/project.py). A project is a directory on disk
 // (<firmware_root>/<project_id>/) seeded from the embedded cmake_arm template
 // plus a project.json sidecar (schema aicad.firmware.project/1, atomic

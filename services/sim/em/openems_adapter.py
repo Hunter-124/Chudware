@@ -18,7 +18,7 @@ replaced by an analytic synthesiser (mock-proven, not all-skip): the plan
 builder, S-parameter math and result shaping are all exercised for real.
 
 Not installed on this machine?  ``available()`` says so and points at the
-install recipe (docs/EM_SIMULATION.md).  openEMS has no PyPI wheel — it is a
+install recipe (docs/reference/EM_SIMULATION.md).  openEMS has no PyPI wheel — it is a
 source build (CSXCAD + openEMS C++ libs + python bindings) or a distro package.
 """
 
@@ -45,7 +45,7 @@ _INSTALL = ("no PyPI wheel — build from source: "
             "https://docs.openems.de/install (Fedora: dnf install cmake gcc-c++ "
             "tinyxml-devel hdf5-devel vtk-devel boost-devel CGAL-devel, then "
             "`pip install .` in CSXCAD/python and openEMS/python), "
-            "or use the openSUSE/Ubuntu packages; see docs/EM_SIMULATION.md")
+            "or use the openSUSE/Ubuntu packages; see docs/reference/EM_SIMULATION.md")
 
 
 class OpenEmsAdapter(EmAdapter):
@@ -85,7 +85,7 @@ class OpenEmsAdapter(EmAdapter):
         cs = resolve_cross_section(spec)
         if cs["shape"] != "rectangular":
             raise EmSolverError("openems adapter v1 handles rectangular guides "
-                                "(circular ports tracked in T-SIM11)")
+                                "(circular ports are not yet supported)")
         md = dominant_mode(cs, spec.get("mode"))
         fc_hz = md["fc_hz"]
         length_mm = _finite_float(spec.get("length_mm", 50.0), "length_mm", positive=True)
@@ -227,7 +227,7 @@ class OpenEmsAdapter(EmAdapter):
         elif geom:
             raise EmSolverError(
                 "unsupported geometry spec — v1 supports {'stl_path': ...} (export the "
-                "doc body via export_part first); direct doc tess intake tracked in T-SIM11")
+                "doc body via export_part first); direct doc tess intake is not yet supported")
         return plan
 
     # ------------------------------------------------------------ solver seam

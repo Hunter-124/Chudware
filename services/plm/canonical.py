@@ -1,4 +1,4 @@
-"""Lossless canonical document JSON serialization (T-H2).
+"""Lossless canonical document JSON serialization.
 
 Mirrors core/doc/stepplus.cpp: preserve numeric values, sort object keys, and
 indent by two spaces. Rounding axes or transforms changes saved constraints.

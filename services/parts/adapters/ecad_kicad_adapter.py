@@ -1,4 +1,4 @@
-"""CatalogProvider adapter for KiCad symbol/footprint libraries (T-P2).
+"""CatalogProvider adapter for KiCad symbol/footprint libraries.
 
 Indexable domain adapter (domain="ecad") that enumerates:
   1. The clean-room starter symbol + footprint library (engine/ecad/library/starter).

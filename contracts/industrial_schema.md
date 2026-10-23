@@ -1,6 +1,6 @@
 # Contract: industrial process sizing RPCs (`vessel_size`, `duct_size`)
 
-> **Frozen seam.** Append-only; changes require integrator sign-off (see
+> **Frozen seam.** Append-only; changes require maintainer sign-off (see
 > `contracts/README.md`). Executable form: `core/piping/vessel.cpp` and
 > `core/piping/duct.cpp` (library `chudware_piping`), dispatched by the piping
 > method table; tests in `core/tests/test_industrial.cpp` (ctest `industrial`).

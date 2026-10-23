@@ -1,6 +1,6 @@
-"""tool_schemas.py — trimmed tool-schema rendering for the turn prompt (T-W32).
+"""tool_schemas.py — trimmed tool-schema rendering for the turn prompt.
 
-T-W30's REAL gym cycles diagnosed *tool-schema blindness* as the top lever: the
+Benchmark gym cycles diagnosed *tool-schema blindness* as the top lever: the
 turn prompt carried tool NAMES only, so the model called real tools but guessed
 kwargs ("unexpected keyword argument" on every mutating call).  This module renders
 the §9.1 **tools slot**: for exactly the node's allowed tools, a compact signature +

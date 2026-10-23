@@ -5,7 +5,7 @@ Companion to scripts/fea_result_icons.py (the single ws_simulate workspace tile)
 scripts/cam_toolpath_icons.py (Manufacture tiles from real toolpaths). Where those cover
 one cell each, this drives the modeling + meshing + FEA core to produce the whole
 **Simulation ribbon** icon family — every tile is the solver's/mesher's own output, never
-a stylized glyph, exactly the T-BL34 directive ("showcase what the engine actually does").
+a stylized glyph, the same rule as the Manufacture tiles ("showcase what the engine actually does").
 
 Icon families (contracts/icons.md, Simulation tab + extended + mesh types):
 

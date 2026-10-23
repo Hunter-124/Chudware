@@ -1,6 +1,6 @@
 """Smoke test for the gym runner end to end.
 
-Runs cells into a TMP runs_dir (never the committed reports/ tree) and asserts the
+Runs cells into a TMP runs_dir (never the default reports/ tree) and asserts the
 harness produces replayable run dirs, an independent grading, a classification pass, and
 a real mission INTAKE.
 """

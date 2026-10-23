@@ -171,7 +171,7 @@ def test_imported_file_stem_resumes_the_imported_doc(engine):
     fake = engine([
         {"doc_id": "doc-cpp00000005", "name": "Part1", "revision": 1,
          "feature_count": 1,
-         "path": "/home/hunter/Projects/Testing/mudbucket.step+"},
+         "path": "/home/user/Projects/Testing/mudbucket.step+"},
     ])
     r = _new_part(name="mudbucket")
 
@@ -187,9 +187,9 @@ def test_ambiguous_file_stems_are_not_guessed(engine):
     part is worse than one extra document, so this falls through to the mint path."""
     fake = engine([
         {"doc_id": "doc-cpp00000005", "name": "Part1", "revision": 1,
-         "path": "/home/hunter/Projects/Testing/mudbucket.step+"},
+         "path": "/home/user/Projects/Testing/mudbucket.step+"},
         {"doc_id": "doc-cpp00000006", "name": "Part2", "revision": 1,
-         "path": "/home/hunter/Projects/Archive/mudbucket.stl+"},
+         "path": "/home/user/Projects/Archive/mudbucket.stl+"},
     ])
     r = _new_part(name="mudbucket")
 

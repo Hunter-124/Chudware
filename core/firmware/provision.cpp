@@ -75,7 +75,7 @@ const std::vector<std::pair<std::string, std::vector<std::pair<std::string, Fami
           {"can_debug_gdb", {{"openocd", "arm-none-eabi-gdb"}, {}}}}},
         {"esp32",
          {{"can_build", {{"idf.py"}, {}}},
-          {"can_emulate", {{}, {}}},  // no emulation path for ESP32 (T-FIN2 decision)
+          {"can_emulate", {{}, {}}},  // no emulation path for ESP32 (design decision)
           {"can_flash", {{"esptool"}, {}}}}},
         {"avr",
          {{"can_build", {{"arduino-cli"}, {}}},

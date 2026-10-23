@@ -436,7 +436,7 @@ class IntakeState:
     pending_request_id: Optional[str] = None
     doc_id: Optional[str] = None
     revision: int = 0
-    # Doc-scoped interaction Q/A records (contracts/interaction.md §5, T-BL25):
+    # Doc-scoped interaction Q/A records (contracts/interaction.md §5):
     # {"questions": [<question dict>...], "answers": {qid: <answer dict>}}.
     # Same records as the run-scoped FileLedger; different store — persisted
     # with this state into the .step+ so a confirmed answer survives reopen.

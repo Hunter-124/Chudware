@@ -15,7 +15,7 @@ services.mcp.core_bridge) exactly like the MCP tools do:
     silently substituted elastic modes into the "lowest n" list (observed raw
     sim_run_modal n_modes=8 -> 3 rigid + 5 elastic). run_fea_modal now over-requests
     + verifies + truncates; the tool-level test locks that in.
-  * Frequency response (T-FIN24 multiphysics worker path,
+  * Frequency response (multiphysics worker path,
     engine_oracle/sim/multiphysics_rpc.sim_freq_response): the harmonic response
     must peak at the first natural frequency, rigid-body modes must not amplify,
     and Miles' random leg + spec verdict must be wired.
@@ -259,7 +259,7 @@ def test_run_fea_modal_free_free_small_n_reports_rigid_modes():
 
 
 # ---------------------------------------------------------------------------
-# Frequency response — T-FIN24 multiphysics worker path
+# Frequency response — multiphysics worker path
 # ---------------------------------------------------------------------------
 
 def _freq_response(res: dict, **over):

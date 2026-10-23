@@ -1,10 +1,10 @@
 """The autonomous ECAD design orchestrator -- natural language -> VERIFIED schematic.
 
-Re-homed from ``engine_oracle/ecad/orchestrator.py`` to ``services/ecad_design/`` in T-RF20:
+Re-homed from ``engine_oracle/ecad/orchestrator.py`` to ``services/ecad_design/``:
 this is THIN LLM ORCHESTRATION (a prompt/validate/retry state machine over a provider), not
 engine logic, so it lives services-side. The deterministic machinery it drives — the ECAD
 session/ops, the recipe fallback library, netlist + SPICE simulation — is C++-dispatched and
-consumed via the core_bridge-backed facades in ``services.mcp.ecad_common`` (T-RF20); only
+consumed via the core_bridge-backed facades in ``services.mcp.ecad_common``; only
 ``services.ecad.library.starter`` / ``library.resolve`` remain direct imports (no ecad_library
 RPC surface).
 
@@ -54,7 +54,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Optional
 
-# T-RF20: netlist/schema/session/ops/recipes and the SPICE stack are C++-dispatched
+# netlist/schema/session/ops/recipes and the SPICE stack are C++-dispatched
 # (core/ecad/*, core/sim/spice.cpp) — consumed here via the core_bridge-backed facades in
 # services.mcp.ecad_common and the ecad_recipe/ecad_closest_recipe/sim_* RPCs.
 # services.ecad.library.starter + library.resolve have NO ecad_library RPC surface — those
@@ -197,7 +197,7 @@ def _catalog_lines() -> list[str]:
     Bounded by construction: only the handful of parts a small analog design needs, one line each,
     so the planner context stays tiny. Pin NUMBERS are shown because nets reference pins by number.
     """
-    from services.ecad.library.starter import SYMBOLS  # STAYS (T-RF20): no ecad_library RPC
+    from services.ecad.library.starter import SYMBOLS  # STAYS: no ecad_library RPC
 
     wanted = [
         "Simulation_SPICE:V_source", "Simulation_SPICE:I_source",
@@ -280,7 +280,7 @@ def validate_design(design: Any) -> tuple[bool, list[str]]:
     real pin number on that component's resolved SymbolDef; study has a usable analysis + expect.
     Returns (ok, errors). Pure; never raises.
     """
-    from services.ecad.library import resolve as lib_resolve  # STAYS (T-RF20): no ecad_library RPC
+    from services.ecad.library import resolve as lib_resolve  # STAYS: no ecad_library RPC
 
     errs: list[str] = []
     if not isinstance(design, dict):
@@ -554,7 +554,7 @@ def _remap_pins_by_name(netlist: dict) -> None:
     Adding name-keyed aliases lets those subckt-backed parts resolve their nodes correctly. A no-op
     for parts whose pin_order already uses numbers (R/C/L/V). Read-only use of the library.
     """
-    from services.ecad.library.starter import SYMBOLS  # STAYS (T-RF20): no ecad_library RPC
+    from services.ecad.library.starter import SYMBOLS  # STAYS: no ecad_library RPC
 
     for comp in netlist.get("components", []):
         sdef = SYMBOLS.get(comp.get("libid"))

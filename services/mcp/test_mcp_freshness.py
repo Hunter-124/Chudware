@@ -1,4 +1,4 @@
-"""MCP freshness consistency test (T-BL26).
+"""MCP freshness consistency test.
 
 Verifies that every registered MCP tool family (and all individual tool names)
 appears in EITHER the server instructions string OR a cad_guide topic, so future
@@ -260,9 +260,9 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
     },
     "parts": {
         "part_search", "part_get", "part_place",
-        # Parts Library V2 (workstream 5)
+        # Parts Library V2
         "parts_taxonomy", "part_source", "vendors_health", "cam_tool_import",
-        # vendor-source + profile manager + scrape queue tools (T-X2/T-X4/T-X5/T-X7)
+        # vendor-source + profile manager + scrape queue tools
         "vendor_status", "vendor_login", "browser_profiles",
         "scrape_enqueue", "scrape_queue_status", "import_artifact",
     },

@@ -132,7 +132,7 @@ std::vector<std::string> external_strong_drivers(const nlohmann::json& sch,
     return out;
 }
 
-// Supply-rail names for an MCU footprint (T-FIN8 eng metadata subset — the
+// Supply-rail names for an MCU footprint (eng metadata subset — the
 // only eng key coverify consumes). Shared with powerprofile via
 // firmware/eng_rails.* (embedded starter-library table + instance overrides,
 // metadata.resolve_eng precedence).

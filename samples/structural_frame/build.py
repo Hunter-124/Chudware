@@ -3,7 +3,7 @@ samples/structural_frame/build.py — build a simple welded steel frame.
 
 Generates:
   samples/structural_frame/frame.aicm    (native doc)
-  samples/structural_frame/thumbnail.png  (headless shot)
+  samples/structural_frame/thumbnail.png  (engine render)
 
 The part: rectangular portal frame (two uprights + top beam) made from 40×40×2 square
 tube (rect_tube profile). Uses the weld_member feature with a 3-segment sketch path.
@@ -14,8 +14,6 @@ Verify contract:
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -108,9 +106,7 @@ def build_frame(cb) -> dict:
 
     # ── Save ──────────────────────────────────────────────────────────────────
     cb.call("doc_save", {"doc_id": doc_id, "path": str(OUTPUT_AICM)})
-    # Engine-rendered thumbnail while the doc is still open (doc_render_png).
-    # The old GUI-shot path captured an EMPTY shell 3x: AI-CAD2 has no
-    # CHUDWARE_OPEN_FILE support, so --shot never loaded the doc (foreman fix).
+    # Engine-rendered thumbnail while the doc is still open.
     cb.call("doc_render_png", {"doc_id": doc_id, "out_path": str(OUTPUT_PNG)})
     cb.call("doc_close", {"doc_id": doc_id})
 
@@ -123,48 +119,6 @@ def build_frame(cb) -> dict:
         "aicm_path": str(OUTPUT_AICM),
         "rebuild": r.get("rebuild", {}),
     }
-
-
-def _find_binary() -> "Path | None":
-    candidates = [
-        REPO / "ui" / "imgui" / "build" / "bin" / "AI-CAD2",
-        REPO / "build" / "linux-app" / "bin" / "AI-CAD2",
-        REPO.parent / "CAD" / "ui" / "imgui" / "build" / "bin" / "AI-CAD2",
-        REPO.parent / "CAD" / "build" / "linux-app" / "bin" / "AI-CAD2",
-    ]
-    return next((b for b in candidates if b.exists()), None)
-
-
-def make_thumbnail() -> bool:
-    if OUTPUT_PNG.exists():
-        return True  # engine-rendered during build; GUI shot cannot load docs
-    binary = _find_binary()
-    if binary is None:
-        print("  [SKIP] AI-CAD2 binary not found")
-        return False
-    env = os.environ.copy()
-    so_candidates = [
-        REPO / "core" / "build-linux" / "bin" / "libchudware.so",
-        REPO.parent / "CAD" / "core" / "build-linux" / "bin" / "libchudware.so",
-    ]
-    so = next((s for s in so_candidates if s.exists()), None)
-    if so:
-        env.setdefault("CHUDWARE_LIBCHUDWARE", str(so))
-    env["CHUDWARE_NO_FILE_DIALOGS"] = "1"
-    env["CHUDWARE_OPEN_FILE"] = str(OUTPUT_AICM)
-    try:
-        subprocess.run(
-            ["xvfb-run", "-a", str(binary), "--shot", str(OUTPUT_PNG)],
-            env=env, capture_output=True, timeout=60,
-        )
-        if OUTPUT_PNG.exists():
-            print(f"  [OK] thumbnail → {OUTPUT_PNG}")
-            return True
-        print("  [WARN] shot ran but no PNG written")
-        return False
-    except Exception as e:
-        print(f"  [WARN] thumbnail failed: {e}")
-        return False
 
 
 def regen_and_verify() -> dict:
@@ -192,6 +146,5 @@ if __name__ == "__main__":
     print(f"  body_count:    {result['body_count']}")
     print(f"  feature_count: {result['feature_count']}")
     print(f"  aicm:          {result['aicm_path']}")
-    print("Rendering thumbnail...")
-    make_thumbnail()
+    print(f"  thumbnail:     {OUTPUT_PNG}")
     print("Done.")

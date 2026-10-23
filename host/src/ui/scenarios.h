@@ -169,7 +169,7 @@ private:
     // ---------- C19 FEA scenario (CHUDWARE_SHOT=fea) ----------
     int feaStep = 0, feaSettle = 0, feaWaitFrames = 0;
 
-    // ---------- T-FIN24 disclosure-matrix scenario (CHUDWARE_SHOT=simdisc_mech|simdisc_ecad) ----------
+    // ---------- Disclosure-matrix scenario (CHUDWARE_SHOT=simdisc_mech|simdisc_ecad) ----------
     int sdStep = 0, sdSettle = 0;
 
     // ---------- external-flow scenario (CHUDWARE_SHOT=flow) ----------
@@ -204,7 +204,7 @@ private:
     std::string obSavePath, obCapture;
     bool obDirReady = false;
 
-    // ---------- T-G15 icon pipeline (CHUDWARE_SHOT=iconpipe) ----------
+    // ---------- Icon pipeline (CHUDWARE_SHOT=iconpipe) ----------
     // Recipe-driven clean-viewport icon generator: read a JSON recipe list (env CHUDWARE_ICON_RECIPES),
     // and for each recipe build a demo part (newPart + applyOps), render it through the renderer's
     // transparent thumbnail path (no chrome, no gizmo, alpha=0 background) at the recipe camera, and

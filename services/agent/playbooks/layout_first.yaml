@@ -2,11 +2,11 @@ schema: aicad.playbook/1
 id: layout_first
 stage: layout
 # Owning role: layout_engineer. Helper tools ⊆ layout_engineer.tool_allowlist.
-# Aligns with the T-BL50 layout-first planning helper (docs/COPILOT_MISSION_PIPELINE.md
+# Aligns with the layout-first planning helper (docs/design/COPILOT_MISSION_PIPELINE.md
 # Phase 3): this is the structured checklist an agent follows to build the skeleton;
 # the deterministic fitment reference every part cites. No duplicate skeleton logic —
 # the layout_engineer role prompt is the behavioural guide, this is its step scaffold.
-# WI-3 capability plan-template slots (structural; see scaffolds.validate_plan_slots).
+# Capability plan-template slots (structural; see scaffolds.validate_plan_slots).
 capability_plan_slots:
   rigid: [name, parts, dimensions, datums, build_order, risks]
   structured: [datums, build_order, risks]

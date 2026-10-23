@@ -1,4 +1,3 @@
-// AI-ECAD UI scaffold (Wave D) — NOT yet build-verified; see docs/ECAD_UI_INTEGRATION.md
 #include "ecad_mirror.h"
 
 #include <algorithm>

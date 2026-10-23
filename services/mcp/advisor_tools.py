@@ -1,4 +1,4 @@
-"""Advisory MCP tools — ``advise``, ``stage_set``, ``advisory_dispute`` (T-W5).
+"""Advisory MCP tools — ``advise``, ``stage_set``, ``advisory_dispute``.
 
 Family: ``advisor``.  Risk classes auto-detected from tool names:
   - ``advise``           → ``read``  (on-demand battery; no mutation)

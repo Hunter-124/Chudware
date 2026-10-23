@@ -1,18 +1,18 @@
 """services/agent/routing.py — Model routing table (aicad.routing/1).
 
 Contract: contracts/advisor.md §14 (FROZEN).
-Hunter directive 2026-07-04: routing.yaml is the ONLY place role→model bindings
+Design decision (2026-07-04): routing.yaml is the ONLY place role→model bindings
 live. No hardcoded role→model choices anywhere, no special-casing the overseer
 in code.
 
 This module serves two integrated consumers:
 
-1. **Delegation engine (T-W14)** — ``RoutingTable`` class:
+1. **Delegation engine** — ``RoutingTable`` class:
    ``resolve()`` + ``resolve_assignments()`` so the overseer, delegation engine,
    and settings GUI can ask "what model resolves for this role right now?"
    Ledger events emitted on every resolution.
 
-2. **C++ GUI settings panel (T-W17)** — module-level functions:
+2. **C++ GUI settings panel** — module-level functions:
    ``load`` / ``loads`` / ``validate`` / ``resolve`` / ``warnings_for`` /
    ``view`` / ``dump`` / ``save`` + a ``get|set|validate`` CLI (JSON in/out).
    The C++ panels shell out to this CLI — it is the seam, not an import.
@@ -23,8 +23,8 @@ constants. No parallel resolver — §14 lives here once.
 Tier vocabulary (data, not code) — ``_TIER_RANK``:
   frontier > strong > local_large > cheap_local/local > cheap
 
-  W14 canonical tokens (frontier, strong, cheap_local) are the delegation-engine
-  preference vocabulary.  W17 adds local_large / local / cheap for real-world
+  Canonical tokens (frontier, strong, cheap_local) are the delegation-engine
+  preference vocabulary.  local_large / local / cheap are added for real-world
   model declarations; these rank consistently within the same table.
 
 Pin-token formats:
@@ -54,18 +54,18 @@ import yaml
 # ---------------------------------------------------------------------------
 
 ROUTING_SCHEMA = "aicad.routing/1"
-SCHEMA = ROUTING_SCHEMA  # alias for module-level / W17 consumers
+SCHEMA = ROUTING_SCHEMA  # alias for module-level / GUI consumers
 
 # Tier ranking — higher value = more capable.
-# W14 canonical tokens (frontier, strong, cheap_local) are the delegation-engine
-# preference vocabulary. W17 adds local_large / local / cheap for source
+# Canonical tokens (frontier, strong, cheap_local) are the delegation-engine
+# preference vocabulary. local_large / local / cheap are added for source
 # declarations; they rank within the same table for consistent resolution.
 _TIER_RANK: dict[str, int] = {
     "frontier":    40,  # large cloud flagship
     "strong":      30,  # mid-tier cloud or >=70 B local
     "local_large": 20,  # large local (>=30 B)
-    "cheap_local": 15,  # small/fast local (W14 canonical preference token)
-    "local":       10,  # small local (W17 source declaration alias)
+    "cheap_local": 15,  # small/fast local (canonical preference token)
+    "local":       10,  # small local (source declaration alias)
     "cheap":        5,  # smallest / cheapest
 }
 
@@ -256,7 +256,7 @@ def load_routing(path: Path | None = None) -> "RoutingTable":
     assignments: dict[str, list[str]] = {}
     for role, pref_raw in raw_assignments.items():
         assignments[str(role)] = _parse_preference_list(str(role), pref_raw)
-    # T-DP9: parse the delegation: block for soft rails config.
+    # Parse the delegation: block for soft rails config.
     raw_delegation = data.get("delegation") or {}
     delegation_config: dict[str, int] = {
         "soft_depth_limit": int(raw_delegation.get("soft_depth_limit", 8)),
@@ -267,7 +267,7 @@ def load_routing(path: Path | None = None) -> "RoutingTable":
 
 
 # ---------------------------------------------------------------------------
-# RoutingTable — delegation engine resolver (T-W14 authority)
+# RoutingTable — delegation engine resolver (authoritative)
 # ---------------------------------------------------------------------------
 
 class RoutingTable:
@@ -282,7 +282,7 @@ class RoutingTable:
         self._sources: list[Source] = list(sources)
         self._by_id: dict[str, Source] = {s.id: s for s in sources}
         self._assignments: dict[str, list[str]] = dict(assignments)
-        # T-DP9: soft rails from routing.yaml delegation: block.
+        # Soft rails from routing.yaml delegation: block.
         _dc = delegation_config or {}
         self.soft_depth_limit: int = int(_dc.get("soft_depth_limit", 8))
         self.max_agents: int = int(_dc.get("max_agents", 64))
@@ -425,14 +425,14 @@ class RoutingTable:
             model_tier=m_match.tier, preference=pref, fallthrough=fallthrough,
         )
 
-    # -- resolve_assignments: settings GUI API (T-W17) -----------------------
+    # -- resolve_assignments: settings GUI API -------------------------------
 
     def resolve_assignments(
         self, *, availability: dict[str, bool] | None = None
     ) -> dict[str, Optional[Resolution]]:
         """Return the resolved model for every role in ``assignments``.
 
-        Used by the T-W17 settings GUI to display live resolution consequences.
+        Used by the settings GUI to display live resolution consequences.
         Returns ``None`` for any role that cannot be resolved.
         """
         return {
@@ -484,7 +484,7 @@ def get_routing_table(path: Path | None = None, *, reload: bool = False) -> Rout
 
 
 # ---------------------------------------------------------------------------
-# Module-level API  (T-W17 / GUI / C++ CLI contract)
+# Module-level API  (GUI / C++ CLI contract)
 #
 # These functions operate on raw dicts (the YAML document as parsed) rather
 # than RoutingTable instances.  They are the boundary the C++ GUI shells
@@ -679,11 +679,11 @@ def warnings_for(data: dict[str, Any], role: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# View (GUI + T-W14 handoff contract)
+# View (GUI + delegation-engine handoff contract)
 # ---------------------------------------------------------------------------
 
 def view(data: dict[str, Any]) -> dict[str, Any]:
-    """The JSON the GUI renders and the T-W14 driver consumes.
+    """The JSON the GUI renders and the delegation driver consumes.
 
     Shape::
 

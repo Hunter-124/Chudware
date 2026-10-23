@@ -1,4 +1,4 @@
-"""Mechanical engineering MCP tools (T-BL18) — AGMA gear tooth stress + ISO 281 bearing life.
+"""Mechanical engineering MCP tools — AGMA gear tooth stress + ISO 281 bearing life.
 
   gear_check(...)   -> AGMA bending + contact stress, safety factors, disclaimer
   bearing_life(...) -> ISO 281 L10 life from load + speed + dynamic load rating (C)

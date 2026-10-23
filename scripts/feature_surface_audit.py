@@ -21,7 +21,7 @@ RIBBON = REPO / "host" / "src" / "ui" / "ribbon_def.cpp"
 
 HANDLER_FILES = [
     REPO / "host" / "src" / "app.cpp",
-    REPO / "host" / "src" / "app_commands.cpp",  # T-RF11: the command-router table
+    REPO / "host" / "src" / "app_commands.cpp",  # the command-router table
     REPO / "host" / "src" / "ui" / "pm_forms.cpp",
     REPO / "host" / "src" / "ui" / "sketch_mode.cpp",
     REPO / "host" / "src" / "ui" / "sketch3d_mode.cpp",  # sk3d_* + sketch3d_new/exit commands
@@ -85,8 +85,8 @@ def handled_commands() -> set[str]:
 
 
 def main() -> int:
-    # This audit parses host/ ribbon_def.cpp. ui/imgui and ui/abstract are retired
-    # (see docs/PORT_LEDGER.md). Skip cleanly when ribbon_def.cpp is absent.
+    # This audit parses host/ ribbon_def.cpp. ui/imgui and ui/abstract are retired.
+    # Skip cleanly when ribbon_def.cpp is absent.
     if not RIBBON.exists():
         print("feature_surface_audit: SKIPPED — ribbon_def.cpp not found; audit targets "
               "host/src/ ribbon (ui/imgui + ui/abstract retired).")

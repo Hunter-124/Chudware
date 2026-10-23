@@ -1,8 +1,8 @@
 """verify.py — Verify node runner for the aicad.dag/1 orchestrator.
 
 Contract: contracts/dag_schema.md §3 (node type "verify"), §8 (NodeState).
-Wired by: T-A4. Called from graph_loader.py instead of the T-A3 stub.
-Reused by: T-F12's design_review() battery (DISPATCH_TABLE is the public API).
+Called from graph_loader.py.
+Reused by: the design_review() battery (DISPATCH_TABLE is the public API).
 
 Each verify node specifies a ``check_type`` in its ``inputs`` dict and (optionally) an
 ``end_condition`` predicate string that is evaluated against the tool result.  The runner
@@ -24,9 +24,9 @@ Mapping (check_type → MCP tool name, module_key for battery._get_fn):
   firmware       → fw_sim_run             (firmware)  [~] may be absent on base
   dc_ratio       → struct_check           (structural) [~] may be absent on base
   budget         → bom_price             (sourcing)   [~] may be absent on base
-  fatigue        → run_fea_fatigue        (cad)       [T-BL04] infinite-life gate
-  thermal        → run_fea_thermal        (cad)       [T-BL04] ccx subprocess
-  buckling       → run_fea_buckling       (cad)       [T-BL04] load-factor≥1 gate
+  fatigue        → run_fea_fatigue        (cad)       infinite-life gate
+  thermal        → run_fea_thermal        (cad)       ccx subprocess
+  buckling       → run_fea_buckling       (cad)       load-factor≥1 gate
   contact        → run_fea_contact        (cad)       engine unilateral-contact gate
 
 [~] = backend may be absent on non-merged base branches; calls degrade to ESCALATE
@@ -41,7 +41,7 @@ import warnings
 from typing import Any, Callable, Optional
 
 # Re-use the battery's private MCP singleton (one registry per module_key, built once).
-# This keeps T-F12's design_review from building a second, divergent registry.
+# This keeps design_review from building a second, divergent registry.
 from services.verify.battery import _get_fn as _battery_get_fn
 
 # Verdicts (same names as node_runner so graph_loader routes identically).
@@ -52,7 +52,7 @@ VERDICT_ESCALATE = "escalate"
 EmitFn = Optional[Callable[[str, dict[str, Any]], None]]
 
 # ---------------------------------------------------------------------------
-# Dispatch table — PUBLIC API for T-F12 reuse
+# Dispatch table — PUBLIC API (reused by design_review)
 #
 # Each entry:
 #   check_type → (module_key, tool_fn_name, default_predicate_fn)
@@ -101,7 +101,7 @@ def _check_budget_default(r: dict) -> bool:
     return bool(r.get("ok", False))
 
 def _check_vibration_default(r: dict) -> bool:
-    """Pass when ok=True AND the tool's own spec verdict passed (T-BL17).
+    """Pass when ok=True AND the tool's own spec verdict passed.
 
     run_fea_frequency_response returns verdict=None when the node supplied no
     vibration_spec — that is NOT a pass (fail-closed: the caller must state the
@@ -115,7 +115,7 @@ def _check_vibration_default(r: dict) -> bool:
     return bool(verdict.get("passed", False))
 
 
-# T-BL04 advanced-FEA default predicates (fail-closed; caller supplies an
+# Advanced-FEA default predicates (fail-closed; caller supplies an
 # end_condition for a real numeric gate). A "skipped" result (backend absent)
 # is NOT a pass — it escalates, never silently green.
 def _check_fatigue_default(r: dict) -> bool:
@@ -177,7 +177,7 @@ def _check_reveng_deviation_default(r: dict) -> bool:
         return False
 
 
-# DISPATCH_TABLE is the T-F12-reusable public symbol.
+# DISPATCH_TABLE is the reusable public symbol.
 # check_type 'requirement' is handled separately (see _run_requirement_verify) — not in this table.
 DISPATCH_TABLE: dict[str, tuple[str, str, Callable[[dict], bool]]] = {
     "interference": ("cad",        "check_interference",   _check_interference_default),
@@ -186,7 +186,7 @@ DISPATCH_TABLE: dict[str, tuple[str, str, Callable[[dict], bool]]] = {
     "firmware":     ("firmware",   "fw_sim_run",           _check_firmware_default),
     "dc_ratio":     ("structural", "struct_check",         _check_dc_ratio_default),
     "budget":       ("sourcing",   "bom_price",            _check_budget_default),
-    # T-BL04 — advanced FEA verify nodes (module_key "cad", tools in cad_tools.py).
+    # Advanced FEA verify nodes (module_key "cad", tools in cad_tools.py).
     "fatigue":      ("cad",        "run_fea_fatigue",      _check_fatigue_default),
     "thermal":      ("cad",        "run_fea_thermal",      _check_thermal_default),
     "buckling":     ("cad",        "run_fea_buckling",     _check_buckling_default),
@@ -226,19 +226,19 @@ def _get_fn(module_key: str, fn_name: str):
                 from services.mcp.firmware_tools import register_firmware_tools
                 register_firmware_tools(_mcp)
             except ImportError:
-                pass  # [~] WS-C may not be merged yet
+                pass  # [~] optional module
         elif module_key == "structural":
             try:
                 from services.mcp.structural_tools import register_structural_tools
                 register_structural_tools(_mcp)
             except ImportError:
-                pass  # [~] WS-D
+                pass  # [~] optional module
         elif module_key == "sourcing":
             try:
                 from services.mcp.sourcing_tools import register_sourcing_tools
                 register_sourcing_tools(_mcp)
             except ImportError:
-                pass  # [~] WS-B
+                pass  # [~] optional module
         elif module_key == "reveng":
             # RE-17 — get_reveng_deviation for the reveng_deviation verify node.
             try:
@@ -319,7 +319,7 @@ def _build_tool_kwargs(check_type: str, node_inputs: dict[str, Any]) -> dict[str
         if "doc_path" in node_inputs:
             kwargs["doc_path"] = node_inputs["doc_path"]
         return kwargs
-    # T-BL04 advanced FEA verify nodes — pass through the tool's own kwargs.
+    # Advanced FEA verify nodes — pass through the tool's own kwargs.
     if check_type == "fatigue":
         return {k: node_inputs[k] for k in (
             "fixtures", "loads", "material", "load_type", "load_ratio", "surface",
@@ -609,7 +609,7 @@ def _make_output(
         "summary": summary,
         "data": data,
         "retry_remaining": retry_remaining,
-        # T-F12 reads "evidence" to fill the design_review verdict card.
+        # design_review reads "evidence" to fill the design_review verdict card.
         "evidence": result,
         "doc_id": node_inputs.get("doc_id"),
     }

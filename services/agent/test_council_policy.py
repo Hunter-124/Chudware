@@ -1,4 +1,4 @@
-"""test_council_policy.py — Offline tests for the T-DP8 council policy engine.
+"""test_council_policy.py — Offline tests for the council policy engine.
 
 Discipline: mock provider only (no API key, no all-skip).  Every test runs the
 real council_policy code path using the shipped council_policy.yaml.
@@ -319,7 +319,7 @@ def test_backward_compat_no_policy_args():
 
 
 # ---------------------------------------------------------------------------
-# 13. regen_diagnosis fix-stage council wiring (T-DP8 stage 2)
+# 13. regen_diagnosis fix-stage council wiring
 # ---------------------------------------------------------------------------
 
 def test_diagnose_fix_council_local_tier():

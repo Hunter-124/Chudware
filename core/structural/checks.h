@@ -1,4 +1,4 @@
-// Demand/Capacity ratio post-processor (T-RF19 leaf 5) — C++ port of
+// Demand/Capacity ratio post-processor — C++ port of
 // engine_oracle/structural/checks.py: simplified AISC LRFD (steel) and NDS
 // ASD (wood) member checks consuming solver output.
 //

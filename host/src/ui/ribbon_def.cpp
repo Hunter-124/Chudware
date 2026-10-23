@@ -328,7 +328,7 @@ static const RibbonCmd kCmds[] = {
     { "weld_end_cap",        "End Cap",         "weld_end_cap",     "Weldments",   "Dress",       true,  nullptr,          false },
 
     // =========================================================================
-    // Tab: PCB Design  (Wave N — AI-ECAD board layout: footprints, routing, DRC, outputs)
+    // Tab: PCB Design  (ECAD board layout: footprints, routing, DRC, outputs)
     // NOTE: the old single "PCB" tab was split into two dedicated tabs — "PCB Design"
     // (this one, board/layout tools) and "Schematic" (symbols/nets/ERC/analog sim, below).
     // Both share the Electronics workspace. The shared entry commands (AI Design / Open /
@@ -460,8 +460,8 @@ static const RibbonCmd kCmds[] = {
     { "dwg_bom_table",    "Bill of Mat.",  "bom",           "Annotation", "Tables", true,  nullptr, false },
 
     // --- Tab: Evaluate, Group: Performance --- sampling profiler for modeling perf.
-    // Toggles the in-process stack sampler in libchudware (prof_start/prof_stop). See
-    // docs/PROFILER.md. Click to start; model; click again to stop + save a report.
+    // Toggles the in-process stack sampler in libchudware (prof_start/prof_stop).
+    // Click to start; model; click again to stop + save a report.
     { "prof_toggle",      "Profiler",      "results",       "Evaluate", "Performance",   true,  nullptr, false, CommandCapability::Inspect },
 
     // =========================================================================

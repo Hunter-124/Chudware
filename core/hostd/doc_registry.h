@@ -221,7 +221,7 @@ private:
         // owner_map + datums + feature_status). Served verbatim by doc_snapshot.
         // WHY it is kept: a GUI mirror tab that has not yet received a push had no way
         // to populate itself except doc_activate, which takes the doc's per-doc engine
-        // mutex (T-PERF5 DocLock) and therefore QUEUES BEHIND THE AGENT'S WRITE BURST.
+        // mutex (DocLock) and therefore QUEUES BEHIND THE AGENT'S WRITE BURST.
         // Measured on a live run: 142.9 s for one tab switch onto the part the agent was
         // building. This copy costs one tree per doc and is served without touching the
         // engine at all, so spectating a doc can never wait on the client writing it.

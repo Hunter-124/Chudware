@@ -1,9 +1,9 @@
-"""Provenance joins — the layer between raw engine tool results and a deliverable spec (T-F15).
+"""Provenance joins — the layer between raw engine tool results and a deliverable spec.
 
 A deliverable is only trustworthy if every load-bearing number traces to a tool result
 (contract §4). This module is the *join*: it takes the results an agent already has — from
 ``describe_part`` / ``measure_part``, ``run_fea_static``, a material-data answer (Pillar 8),
-BOM + sourced-part cost data (WS-B), CAM setup sheets, drawing exports — and produces
+BOM + sourced-part cost data, CAM setup sheets, drawing exports — and produces
 
   1. **attached_results** entries in the frozen ``{tool, ts, payload}`` shape (contract §4.1),
      the model's evidence bag; and
@@ -160,11 +160,11 @@ def drawing_export(result: dict, result_id: str = "dwg1", ts: str | None = None)
 
 
 def bom_rollup(items: list[dict], *, level: str = "Top", result_prefix: str = "bom") -> dict:
-    """Join a BOM parts list (+ optional WS-B sourced-part cost) into a workbook sheet block.
+    """Join a BOM parts list (+ optional sourced-part cost) into a workbook sheet block.
 
     Each ``item`` is ``{item, qty, unit_cost?, source?}``. ``qty`` and ``unit_cost`` are
     engineering values, so they become **attached results** and the sheet cells reference them
-    (never typed). ``unit_cost`` / ``source`` are optional — a BOM without WS-B sourcing still
+    (never typed). ``unit_cost`` / ``source`` are optional — a BOM without sourcing data still
     produces a valid sheet (cost cells blank), degrading gracefully (contract step 3).
 
     Returns ``{"block": <sheet block for the spec outline>, "attached": <attached_results map>}``

@@ -5,14 +5,14 @@ an impossible parameter, a broken selector, a circular equation) the model is ha
 failure signal + the feature tree + the valid vocabulary, and returns a list of **doc-ops**
 that repair the document. The ops are ordinary editable document mutations — never opaque
 scripts — so R1 editability parity holds (the user can inspect/edit/reject every proposed
-change; §6 of docs/CUSTOM_MODEL_INTEGRATION_SURVEY.md and the T-H11 driver notes).
+change).
 
 Two things make this the FRONTIER-FIRST ship of IP-18:
 
 1. The failure signal is derived **structurally from the corrupted document itself** (or the
    real engine feature_status error in the live flow) — never from any bench label. Peeking
    at ground-truth (mutation_class / target) would invalidate the regen_fix bench.
-2. Every provider call is routed through T-H7's ``LoggingProvider(insertion_point="IP-18")``
+2. Every provider call is routed through ``LoggingProvider(insertion_point="IP-18")``
    so each real failure->fix becomes a correction trace for the later SFT (Pillar 16). The
    migration to a local model is a LATER, bench-gated phase; this module ships the frontier
    path and the logging seam.
@@ -396,7 +396,7 @@ def build_diagnosis_prompt(document: dict, failures: list[Failure],
 
 
 # ---------------------------------------------------------------------------
-# The diagnosis call (frontier, logged through T-H7)
+# The diagnosis call (frontier, logged through LoggingProvider)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -409,7 +409,7 @@ class Diagnosis:
     raw_reply: str = ""
     artifact_id: Optional[str] = None   # the IP-18 ai_artifact this fix belongs to (for action
     run_id: Optional[str] = None        # events to correlate against; from the logged emit)
-    council_record: Optional[dict] = None  # T-DP8: fix-stage council record (None if skipped)
+    council_record: Optional[dict] = None  # fix-stage council record (None if skipped)
 
 
 def _parse_reply(reply: str) -> tuple[str, list[dict]]:
@@ -444,7 +444,7 @@ def diagnose(document: dict, provider: Provider, *,
     online, or an offline-safe provider offline. Unless ``wrap_logging`` is False,
     LoggingProvider records the IP-18 correction trace without owning model requests.
 
-    T-DP8: When ``council_tier`` is provided, a council is convened at the ``fix`` stage
+    When ``council_tier`` is provided, a council is convened at the ``fix`` stage
     after diagnosis to deliberate on the proposed fix_ops — giving multi-angle validation
     before the fix is applied.  The council policy (breadth / diverse-model selection) is
     resolved from ``council_policy.yaml`` for (stage="fix", tier=council_tier).
@@ -456,7 +456,7 @@ def diagnose(document: dict, provider: Provider, *,
     prompt = build_diagnosis_prompt(document, failures, engine_error=engine_error)
 
     # Capture the logged IP-18 ai_artifact's id/run_id so a downstream accept/reject action
-    # (regen_card.emit_action) can correlate against it in the exporter (T-H5).
+    # (regen_card.emit_action) can correlate against it in the exporter.
     captured: dict = {"artifact_id": None, "run_id": run_id}
 
     def _sink(ev: dict) -> None:
@@ -482,7 +482,7 @@ def diagnose(document: dict, provider: Provider, *,
     diagnosis_text, fix_ops = _parse_reply(reply)
     fixed_doc, n_applied = apply_fix_ops(document, fix_ops)
 
-    # T-DP8: optional fix-stage council — deliberates on proposed fix_ops.
+    # Optional fix-stage council — deliberates on proposed fix_ops.
     council_record: Optional[dict] = None
     if council_tier is not None:
         council_record = _maybe_convene_fix_council(

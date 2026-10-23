@@ -1,6 +1,6 @@
-"""Unified parts-library MCP tools — aicad.parts/1 (T-P1 + T-P2 + T-P3 + T-X3 + V2).
+"""Unified parts-library MCP tools — aicad.parts/1.
 
-Parts Library V2 additions (workstream 5): ``parts_taxonomy`` (category browse w/
+Parts Library V2 additions: ``parts_taxonomy`` (category browse w/
 effective facets), ``part_search`` faceted/taxonomy-routed upgrade, ``part_source``
 (deterministic sourcing fan-out — services/parts/source.py),
 ``vendors_health`` (adapter canary sweep) and ``cam_tool_import`` (cutting-tool
@@ -12,16 +12,16 @@ dispatch reuses them directly.
 Exposes these tools over the federated parts hub:
 
 - ``part_search(query, domain?, limit?)`` — FTS5-ranked search across all indexed providers.
-  T-P2: domain filter extended to section | fitting | hydraulic | ecad.
-  T-X3: domain "catalog" added — GrabCAD/TraceParts results via the user's own
+  Domain filter covers to section | fitting | hydraulic | ecad.
+  Domain "catalog" — GrabCAD/TraceParts results via the user's own
   authenticated browser session (services/browser/adapters, contracts/parts.md §6.3's
   reserved "paid catalog provider" seam, browser-session mechanism instead).
   Live vendor results (ecad_vendor, browser catalog adapters) carry source:"live" in each
   PartRecord and are returned as a fallback when the local index has no hits.
 - ``part_get(part_id)`` — retrieve a single PartRecord by its stable part_id. For a
-  "catalog" part_id this is also what triggers the actual browser download (T-X3);
+  "catalog" part_id this is also what triggers the actual browser download;
   search() only returns lightweight not-yet-downloaded stubs.
-- ``part_place(part_id, doc?, params?)`` — T-P3: insert a standard part into a doc,
+- ``part_place(part_id, doc?, params?)`` — insert a standard part into a doc,
   routing geometry_ref to the correct domain path.  Always returns editable doc-schema
   ops (R1 parity).  Every domain: core_family/generate_model/import_file → new mech part
   doc; symbol_footprint → sch_add_symbol; section_profile → structural element;
@@ -30,8 +30,8 @@ Exposes these tools over the federated parts hub:
 The hub is lazy-initialized on the first call; subsequent calls reuse the in-memory FTS index.
 No network, no keys, no core dependency for the fastener/bearing adapter (they run on the
 bundled clean-room YAML tables). The core-families adapter degrades gracefully when libchudware
-is absent. All T-P2 adapters degrade gracefully (empty results, not tracebacks) when their
-backing data or credentials are absent — CI-safe. T-X3's browser catalog providers degrade
+is absent. All adapters degrade gracefully (empty results, not tracebacks) when their
+backing data or credentials are absent — CI-safe. The browser catalog providers degrade
 the SAME way: no saved browser login profile for a site = that provider contributes zero
 results, silently — existing part_search/part_place behavior when no profile exists is
 unchanged.
@@ -1058,7 +1058,7 @@ def vendors_health_impl(sites: str = "") -> dict:
         from services.browser.health import run_health_check as _run
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"vendor health module unavailable: {exc}",
-                "hint": "services/browser/health.py ships with the browser workstream."}
+                "hint": "services/browser/health.py ships with the browser acquisition layer."}
     try:
         site_list = [s.strip().lower() for s in (sites or "").split(",") if s.strip()] or None
         rows = _run(sites=site_list) or []
@@ -1602,9 +1602,9 @@ def place_parametric_impl(part_id: str, record: dict, params: dict | None = None
 def register_parts_tools(mcp: FastMCP) -> None:
     """Register part_search, part_get, and part_place MCP tools (append-only).
 
-    T-X3's browser catalog providers register themselves lazily, inside
+    The browser catalog providers register themselves lazily, inside
     ``services.parts.hub.PartsHub.bootstrap()`` (same timing as every
-    other provider, including T-P2's live-vendor adapter) — NOT here, so this
+    other provider, including the live-vendor adapter) — NOT here, so this
     function keeps the hub's existing "first real call" laziness intact.
     """
 
@@ -1987,7 +1987,7 @@ def register_parts_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def part_place(part_id: str = "", doc="", params="",
                    **kwargs: _VarKw) -> str:
-        """Place a standard part into a document — universal insertion across all domains (T-P3).
+        """Place a standard part into a document — universal insertion across all domains.
 
         Looks up the PartRecord for ``part_id``, reads its geometry_ref.kind, and routes
         to the correct domain insertion path.  ALWAYS returns an editable document-schema
@@ -2084,7 +2084,7 @@ def register_parts_tools(mcp: FastMCP) -> None:
             return _err(f"doc must be a document object or a JSON string, got "
                         f"{type(doc).__name__}.", _PLACE_DOC_HINT)
 
-        # place.py was ported to core/parts (T-RF19): look the record up via the
+        # place.py was ported to core/parts: look the record up via the
         # (Python) hub and hand it to the C++ placement dispatcher.
         from services.parts import get as _hub_get
         from . import core_bridge as cb
@@ -2144,7 +2144,7 @@ def register_parts_tools(mcp: FastMCP) -> None:
                 out["interpreted"] = _interpreted_notes(notes)
             return json.dumps(out, ensure_ascii=False)
 
-    # ---- Vendor-source and browser-profile tools (T-X2 / T-X5 / T-X7) ----
+    # ---- Vendor-source and browser-profile tools ----
     # These expose the services/browser acquisition layer to parts sourcing clients.
 
     @mcp.tool()
@@ -2343,7 +2343,7 @@ def register_parts_tools(mcp: FastMCP) -> None:
         except Exception as exc:  # noqa: BLE001
             return _err(f"browser_profiles failed: {exc}")
 
-    # ---- Scrape/download queue tools (T-X4) ----
+    # ---- Scrape/download queue tools ----
     # Background queue: search a vendor site + download the first CAD artifact found,
     # running in a daemon thread so the GUI stays responsive.
 
@@ -2469,7 +2469,7 @@ def register_parts_tools(mcp: FastMCP) -> None:
         if source_data is None:
             source_data = _queue_source_for_artifact(path)
         try:
-            # _place_import_file was ported to core/parts (T-RF19).
+            # _place_import_file was ported to core/parts.
             from . import core_bridge as cb
             imported = cb.call("part_import_file", {"path": path})
         except Exception as exc:  # noqa: BLE001

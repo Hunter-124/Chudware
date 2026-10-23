@@ -4,7 +4,7 @@
 > it: the Python adapters (`services/agent/providers/`), the C++ port
 > (`core/agent/providers.{h,cpp}` + `core/agent/run.cpp`), and external MCP clients that
 > ride the user's own subscription. Adding a provider = one contract-conformant adapter.
-> Append-only: any change to a frozen section needs integrator sign-off + a version bump
+> Append-only: any change to a frozen section needs maintainer sign-off + a version bump
 > (see `contracts/README.md`). The **Prohibited auth** list below is binding and CI-tested.
 
 ## 1. Message schema (frozen)

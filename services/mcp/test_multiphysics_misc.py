@@ -38,7 +38,7 @@ import pytest
 from services.mcp.cad_tools import register_cad_tools as _register_cad_tools  # noqa: F401
 
 # engine_oracle/hydraulic + engine/piping/{solve,properties} were ported to core
-# (T-RF19) and deleted; these shims drive the same methods over the core bridge.
+# and deleted; these shims drive the same methods over the core bridge.
 from services.mcp import core_bridge as _cb_hyd
 
 
@@ -426,7 +426,7 @@ def test_hydraulic_piping_handoff_feeds_piping_solve():
     """Cross-seam chain: hydraulic_piping_handoff produces a handoff envelope whose
     inline piping doc + meta boundary/fluid piping_solve consumes directly, and the
     solve result records the handoff_id (provenance chain closed)."""
-    # engine.hydraulic.schema was ported to core (T-RF19): build the circuit doc
+    # engine.hydraulic.schema was ported to core: build the circuit doc
     # through the C++ RPCs (component ids c1/c2 come from next_id in order).
     htools = _hydraulic_tools()
     ptools = _piping_tools()

@@ -2,12 +2,12 @@
 ``contracts/research_tools.md`` §1 (the answer envelope). Pillar 8 principle: **code
 converts units, never the model** (ksi/MPa is the classic silent 6.9x error).
 
-SUPERVISOR RULING (T-F3 Q2): the canonical unit normaliser is
+Design decision: the canonical unit normaliser is
 ``services.agent.interaction.normalize_dimension``. This helper does **not**
 parallel-implement it — it *imports and delegates* to it when the ``agent`` package is
 importable, and falls back to a minimal local table (same reject-never-coerce semantics,
-same ``{value, unit}`` return shape) only until ``interaction.py`` lands in-tree. Both
-paths share this module's envelope wrapper, so behaviour is identical once merged.
+same ``{value, unit}`` return shape) when that package is not importable. Both
+paths share this module's envelope wrapper, so behaviour is identical.
 """
 from __future__ import annotations
 
@@ -17,15 +17,15 @@ from typing import Any
 from .common import BUNDLED, envelope, fail
 
 # --- normaliser seam -------------------------------------------------------------------
-# Prefer the canonical agent normaliser; fall back to a local mirror until T-F3 merges.
-try:  # pragma: no cover - exercised via the skipif test on the F3 branch
+# Prefer the canonical agent normaliser; fall back to a local mirror when unavailable.
+try:  # pragma: no cover - exercised via the skipif test
     from services.agent.interaction import (  # type: ignore
         InteractionError as _InteractionError,
     )
     from services.agent.interaction import normalize_dimension as _canonical_normalize
 
     _HAVE_CANONICAL = True
-except Exception:  # noqa: BLE001 - agent package not in this tree until T-F3 merges
+except Exception:  # noqa: BLE001 - agent package not importable
     _canonical_normalize = None  # type: ignore
     _HAVE_CANONICAL = False
 
@@ -33,9 +33,9 @@ except Exception:  # noqa: BLE001 - agent package not in this tree until T-F3 me
         """Local stand-in mirroring ``services.agent.interaction.InteractionError``."""
 
 
-# TODO(T-F3 merge): fallback until interaction.py lands. Keep these tables byte-for-byte
-# aligned with ``services/agent/interaction.py`` (_LENGTH_TO_MM / _ANGLE_TO_DEG); when F3
-# merges, delete this block — the import above takes over with zero behaviour change.
+# Fallback used only when the agent package is not importable. Keep these tables
+# byte-for-byte aligned with ``services/agent/interaction.py`` (_LENGTH_TO_MM /
+# _ANGLE_TO_DEG) so both paths behave identically.
 _LENGTH_TO_MM = {
     "mm": 1.0, "millimeter": 1.0, "millimetre": 1.0,
     "cm": 10.0, "centimeter": 10.0, "centimetre": 10.0,
@@ -77,7 +77,7 @@ def _fallback_normalize(value: float, unit: str, family: str = "length") -> dict
 
 
 def normalizer_source() -> str:
-    """Which normaliser is live — ``"services.agent.interaction"`` once F3 merges, else
+    """Which normaliser is live — ``"services.agent.interaction"`` when importable, else
     ``"fallback"``. Surfaced on the envelope so a caller can see the seam."""
     return "services.agent.interaction" if _HAVE_CANONICAL else "fallback"
 

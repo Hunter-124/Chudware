@@ -1,4 +1,4 @@
-"""``calc_package`` — the engineering calculation package (docx/pdf), a T-F15 template.
+"""``calc_package`` — the engineering calculation package (docx/pdf), an engineering template.
 
 The signed calc set an engineer files: the equations used, the assumptions behind them, the
 material data they rely on **with its citation** (Pillar 8 answer-contract fields: ``source`` +

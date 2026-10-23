@@ -1,4 +1,4 @@
-// T-RF17 — KiCad importers (ecad/kicad.cpp) + the ecad_open extension dispatch.
+// KiCad importers (ecad/kicad.cpp) + the ecad_open extension dispatch.
 // Mirrors engine/ecad/test_formats.py tests 3-6 (import_kicad_sch /
 // import_kicad_pcb / file-based import / open dispatch) against the same inline
 // fixtures. Pure JSON, OCCT-free; links chudware_ecad only.
@@ -25,7 +25,7 @@ namespace {
 
 // engine/ecad/test_formats.py::_MINIMAL_SCH (verbatim)
 const char* kMinimalSch = R"KICAD(
-(kicad_sch (version 20221018) (generator AI-ECAD-test)
+(kicad_sch (version 20221018) (generator chudware-test)
   (lib_symbols
     (symbol "Device:R"
       (symbol "R_0_1"
@@ -67,7 +67,7 @@ const char* kMinimalSch = R"KICAD(
 
 // engine/ecad/test_formats.py::_MINIMAL_PCB (verbatim)
 const char* kMinimalPcb = R"KICAD(
-(kicad_pcb (version 20221018) (generator AI-ECAD-test)
+(kicad_pcb (version 20221018) (generator chudware-test)
   (general (thickness 1.6))
   (layers
     (0 "F.Cu" signal)

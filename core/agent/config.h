@@ -60,7 +60,7 @@ bool provider_offline_safe(const json& provider);
 // fall back to the real getenv. Returns a descriptor; on an offline refusal (or
 // unknown provider) the returned object carries an "error" string instead.
 // `cfg` is taken by value: for subscription providers the resolver may refresh a
-// stale OAuth token in-process (agent/auth.cpp, T-RF4) and swap in the reloaded
+// stale OAuth token in-process (agent/auth.cpp) and swap in the reloaded
 // config before reading tokens.
 json resolve_provider(const std::optional<std::string>& name, json cfg, const json& env);
 

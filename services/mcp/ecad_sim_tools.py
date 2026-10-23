@@ -1,4 +1,4 @@
-"""ECAD simulation/analysis MCP tools (T-RF8 split of ecad_tools.py): ecad_simulate, run_pdn, sweep, fpga_check, impedance checks, run_sicheck, tf, design."""
+"""ECAD simulation/analysis MCP tools (split out of ecad_tools.py): ecad_simulate, run_pdn, sweep, fpga_check, impedance checks, run_sicheck, tf, design."""
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
@@ -234,7 +234,7 @@ def _diff_pair_z0(*, w: float, s: float, h: float, t: float, er: float, kind: st
                                    "er": er, "kind": kind})
 
 def register_ecad_sim_tools(mcp: FastMCP) -> None:
-    """ECAD simulation/analysis MCP tools (T-RF8 split of ecad_tools.py): ecad_simulate, run_pdn, sweep, fpga_check, impedance checks, run_sicheck, tf, design."""
+    """ECAD simulation/analysis MCP tools (split out of ecad_tools.py): ecad_simulate, run_pdn, sweep, fpga_check, impedance checks, run_sicheck, tf, design."""
 
 
     # ---------------------------------------------------------------- simulate
@@ -246,7 +246,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
         """Build the netlist -> SPICE circuit -> run the simulator, and return the KEY
         results with a plain-English reading.
 
-        ``backend`` picks the solver (T-FIN14):
+        ``backend`` picks the solver:
           'mna'     -- the validated internal MNA solver (DEFAULT, deterministic)
           'ngspice' -- an installed ngspice binary as a subprocess; unlocks vendor
                        .SUBCKT/.MODEL libraries (real op-amps/regulators). If ngspice is
@@ -467,7 +467,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
 
 
 
-    # ---------------------------------------------------------------- PDN (T-FIN13)
+    # ---------------------------------------------------------------- PDN
 
     @mcp.tool()
     def ecad_run_pdn(net: str = "", vsrc: float = 0.0,
@@ -483,7 +483,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
         from ``power_out`` symbol pins, or pass ``source_refs='U3,J1'``) held at ``vsrc``
         (default: the rail's ``voltage_v_nom`` metadata, else parsed from names like
         '+3V3'). Sinks = per-component supply currents from the aicad.boardphys/1 rail
-        metadata (T-FIN8); override/provide with ``sink_overrides='{"U2": 0.35}'`` (amps).
+        metadata; override/provide with ``sink_overrides='{"U2": 0.35}'`` (amps).
 
         ``net`` may be one net name, a comma list, or empty = every net with a detected
         source (GND excluded). Reports per-component voltage drop vs the rail's
@@ -537,7 +537,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
             return _err(f"invalid PDN setup: {e}",
                         hint="Use finite SI-facing values: volts, amps, mm, and A/mm^2.")
         try:
-            from services.ecad import pdn as pdn_mod  # STAYS (T-RF20): no C++ counterpart; lazy import (pulls scipy)
+            from services.ecad import pdn as pdn_mod  # STAYS: no C++ counterpart; lazy import (pulls scipy)
         except Exception as e:  # noqa: BLE001
             return _err(f"PDN engine unavailable: {e}",
                         hint="numpy/scipy are required for the sparse solve.",
@@ -803,11 +803,11 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
 
 
 
-    # ---------------------------------------------------------------- FPGA (T-FIN11)
+    # ---------------------------------------------------------------- FPGA
 
     @mcp.tool()
     def ecad_fpga_check(ref: str = "", io: Optional[Union[dict, str]] = None, doc_id: str = "") -> str:
-        """Bank-aware FPGA design checks on the active schematic (T-FIN11).
+        """Bank-aware FPGA design checks on the active schematic.
 
         Finds every placed FPGA (a symbol whose value/libid matches an
         ``aicad.fpga_device/1`` seed — 'FPGA:iCE40UP5K-SG48' ships full; ECP5 CABGA256
@@ -835,7 +835,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
             io = require_mapping(io, "io",
                                  'a {net_name: {"iostandard": "LVCMOS18"}} map')
         try:
-            from services.ecad import fpga  # STAYS (T-RF20): no C++ counterpart
+            from services.ecad import fpga  # STAYS: no C++ counterpart
         except Exception as e:  # noqa: BLE001
             return _err(f"fpga module unavailable ({type(e).__name__}: {e})")
         nl = netlist_mod.build_netlist(session.doc)
@@ -1547,7 +1547,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
             return _err(e.message, hint="Open a board first.",
                         next_actions=["ecad_new_pcb('myboard')"])
         try:
-            from services.ecad import si_rules as si_mod  # STAYS (T-RF20): no C++ counterpart
+            from services.ecad import si_rules as si_mod  # STAYS: no C++ counterpart
             res = si_mod.run_sicheck(session.doc)
         except Exception as e:  # noqa: BLE001
             return _err(f"SI check engine error: {e}", hint="Inspect with ecad_status().")

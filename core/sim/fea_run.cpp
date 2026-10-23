@@ -213,7 +213,7 @@ struct MeshQualityFacts {
     json governor;
     // ── The refined region's own quality (mesher.h MeshOut) ──────────────────
     // A local size contract is delivered by conforming bisection, which is
-    // shapely nowhere except at the interface it was asked for: the ME 490
+    // shapely nowhere except at the interface it was asked for: a rover
     // hinge-latch packet shipped a study whose interface was exactly the
     // requested size and whose mesh one layer out carried aspect_max 263 and
     // jacobian_min 0.0029. So the mesher runs a bounded quality pass over that
@@ -821,7 +821,7 @@ json contact_resolution_json(const ContactResolution& r) {
              {"required_interface_size_mm", round_nd(r.required_interface_size_mm, 4)},
              // Where gap_mm came from, and what the mesh alone would have said.
              // On a curved fit those are different numbers and the difference is
-             // the whole reason the guard used to be unsatisfiable: the ME 490
+             // the whole reason the guard used to be unsatisfiable: the rover
              // hinge's 0.300 mm saddle clearance read 0.03665 mm on the facets
              // and demanded an interface size no mesher could deliver
              // (fea_contact.h ContactGapProbe). `gap_source` is "cad_faces" when
@@ -1052,12 +1052,12 @@ bool resolve_mesh(const json &study, std::vector<double> &points,
             // `interface_size_mm` becomes the h_min of the mesher's own graded
             // size field, whose h_max is the background, so a request ABOVE the
             // background is not a coarser request — it is an illegal one
-            // (`GradedSizing: need 0 < h_min <= h_max`, reproduced on the O-22
+            // (`GradedSizing: need 0 < h_min <= h_max`, reproduced on a rover
             // hinge saddle at a 1.2 mm background). Advising "pass `achieved` or
             // coarser" when `achieved` exceeded the background therefore closed
             // the box: every request at or below the background was refused as
             // undeliverable and every request above it mesh-FAILED, which is the
-            // "no legal value exists" that stopped CONTACT_BLOCKED_2026-09-06b.
+            // "no legal value exists" dead end for contact studies.
             // The field now clamps h_min to the background (mesher.cpp
             // local_size_field), so a coarse request is legal and trivially met;
             // this text must still only ever name a value inside (0, background].
@@ -3406,7 +3406,7 @@ static nlohmann::json fea_run_static_impl(
     //
     // Whatever the ties, a component that reaches NO fixture is free to translate
     // and rotate: the stiffness matrix is singular in those six directions and any
-    // number the solver prints for it is arbitrary. Live (ME490 front spine tube,
+    // number the solver prints for it is arbitrary. Live (a tube-frame spine tube,
     // O60 x 5.16 mm wall, tet10 at h = 16 mm): max displacement 9.6e6 mm at an
     // equilibrium error of 0.00042% — the residual is tiny precisely BECAUSE the
     // mechanism carries no load, so equilibrium can never catch this. Only
@@ -3565,7 +3565,7 @@ static nlohmann::json fea_run_static_impl(
             // ── The clearance a fit has is a CAD fact, so measure it on the CAD ──
             // The pairing stays a mesh question; the GAP does not. A candidate is
             // two boundary nodes, so its facet gap is r_bore*cos(dtheta) - r_pin
-            // for whatever dtheta the two meshes sampled — on the ME 490 hinge
+            // for whatever dtheta the two meshes sampled — on a rover hinge
             // saddle that read 0.03665 mm of a real 0.300 mm clearance and made
             // the resolution guard unsatisfiable at every mesh size
             // (fea_contact.h ContactGapProbe). The probe outlives the candidate
@@ -4721,7 +4721,7 @@ static nlohmann::json fea_run_static_impl(
                   {"min_fos_rankine", round_nd(min_fos_rankine, 4)},
                   {"max_tresca_mpa", round_nd(max_tresca, 4)},
                   {"max_abs_principal_mpa", round_nd(max_abs_principal, 4)},
-                  // ── What these scalars are a reduction of (T-EV: the 3.7x gap) ──
+                  // ── What these scalars are a reduction of ──
                   // max_von_mises_mpa and the FoS/principal/shear extrema beside it
                   // are taken over the nodes OUTSIDE two element rings of an ideal
                   // fixed constraint (a clamp singularity is mesh-dependent, not a
@@ -4946,7 +4946,7 @@ nlohmann::json fea_run_static_with_cancel_token(
 // problem whose critical multiplier is defined only for a linear pre-buckling
 // response. Accepting material.plasticity on any of them and silently ignoring it
 // would report an elastic answer under a plastic label, which is the exact failure
-// mode ME 490 O-28 was: a number that looks like the material's and is not.
+// mode this guards against: a number that looks like the material's and is not.
 static bool plasticity_requested(const nlohmann::json& study) {
     if (!study.is_object() || !study.contains("material") ||
         !study["material"].is_object())
@@ -5788,7 +5788,7 @@ bool resolve_mechanical_load_case(const json& loads, const PreparedMesh& mesh,
 
 namespace {
 
-// Parse a per-load time schedule (T-FIN18). Accepts the duty-cycle shorthand
+// Parse a per-load time schedule. Accepts the duty-cycle shorthand
 // {duty, period_s} — the direct mapping for an aicad.powerprofile/1 rail — or the general
 // piecewise form {points:[[t_s,scale],...], period_s?}. An absent/empty schedule = always
 // on. Returns false + err on a malformed schedule.
@@ -6167,7 +6167,7 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                               "an active non-zero heat flux"}};
     if (job.cancelled())
         return json{{"ok", false}, {"error", "fea_thermal: cancelled"}};
-    // ── Transient branch (T-FIN18); the steady branch follows below. ─────────────────────
+    // ── Transient branch; the steady branch follows below. ─────────────────────────────
     if (transient) {
         const json& tr = study["transient"];
         const json* cp_node =

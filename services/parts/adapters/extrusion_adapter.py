@@ -1,5 +1,4 @@
-"""CatalogProvider adapter for T-slot aluminum extrusion profiles
-(T-CatalogStock).
+"""CatalogProvider adapter for T-slot aluminum extrusion profiles.
 
 Covers the standard 80/20-style T-slot framing profile sizes: metric
 20x20 / 20x40 / 30x30 / 30x60 / 40x40 / 40x80, and imperial fractional

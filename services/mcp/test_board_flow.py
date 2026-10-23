@@ -15,7 +15,7 @@ Coverage
 
 Run::
 
-    /home/hunter/.local/share/Chudware/mcp-venv/bin/python -X utf8 \\
+    python -X utf8 \\
         -m pytest services/mcp/test_board_flow.py -q
 """
 from __future__ import annotations

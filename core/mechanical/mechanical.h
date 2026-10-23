@@ -1,6 +1,6 @@
 // core/mechanical/mechanical.h — AGMA spur-gear tooth stress + ISO 281 bearing life
-// (T-RF19 leaf 6 C++ port of engine_oracle/mechanical/{gear_check,bearing_life}.py,
-// T-BL18). Clean-room re-implementation of equations published in open textbooks
+// (C++ port of engine_oracle/mechanical/{gear_check,bearing_life}.py).
+// Clean-room re-implementation of equations published in open textbooks
 // (Shigley's Mechanical Engineering Design, 10th ed., Ch. 14 / Ch. 11) — not a copy
 // of AGMA 2001-D04 or ISO 281:2007. PURE: no OCCT, no doc/agent linkage. Envelopes
 // byte-identical to services/mcp/mechanical_tools.py.

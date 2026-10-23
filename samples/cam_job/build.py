@@ -4,7 +4,7 @@ samples/cam_job/build.py — build the "Enclosure Lid" CAM sample.
 Generates:
   samples/cam_job/lid.aicm          (native doc)
   samples/cam_job/lid_cam.json      (CAM tree + G-code summary, JSON)
-  samples/cam_job/thumbnail.png     (headless shot)
+  samples/cam_job/thumbnail.png     (engine render)
 
 The part: 80×60×6 mm aluminium plate lid with a centred pocket and 4 corner holes.
 CAM: face mill + pocket + contour2d, GRBL post.
@@ -15,8 +15,6 @@ Verify contract:
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -87,9 +85,7 @@ def build_lid(cb) -> dict:
 
     # ── Save part .aicm ───────────────────────────────────────────────────────
     cb.call("doc_save", {"doc_id": doc_id, "path": str(OUTPUT_AICM)})
-    # Engine-rendered thumbnail while the doc is still open (doc_render_png).
-    # The old GUI-shot path captured an EMPTY shell 3x: AI-CAD2 has no
-    # CHUDWARE_OPEN_FILE support, so --shot never loaded the doc (foreman fix).
+    # Engine-rendered thumbnail while the doc is still open.
     cb.call("doc_render_png", {"doc_id": doc_id, "out_path": str(OUTPUT_PNG)})
 
     # ── CAM: fast-path deterministic program ──────────────────────────────────
@@ -132,48 +128,6 @@ def build_lid(cb) -> dict:
     }
 
 
-def _find_binary() -> Path | None:
-    candidates = [
-        REPO / "ui" / "imgui" / "build" / "bin" / "AI-CAD2",
-        REPO / "build" / "linux-app" / "bin" / "AI-CAD2",
-        REPO.parent / "CAD" / "ui" / "imgui" / "build" / "bin" / "AI-CAD2",
-        REPO.parent / "CAD" / "build" / "linux-app" / "bin" / "AI-CAD2",
-    ]
-    return next((b for b in candidates if b.exists()), None)
-
-
-def make_thumbnail() -> bool:
-    if OUTPUT_PNG.exists():
-        return True  # engine-rendered during build; GUI shot cannot load docs
-    binary = _find_binary()
-    if binary is None:
-        print("  [SKIP] AI-CAD2 binary not found")
-        return False
-    env = os.environ.copy()
-    so_candidates = [
-        REPO / "core" / "build-linux" / "bin" / "libchudware.so",
-        REPO.parent / "CAD" / "core" / "build-linux" / "bin" / "libchudware.so",
-    ]
-    so = next((s for s in so_candidates if s.exists()), None)
-    if so:
-        env.setdefault("CHUDWARE_LIBCHUDWARE", str(so))
-    env["CHUDWARE_NO_FILE_DIALOGS"] = "1"
-    env["CHUDWARE_OPEN_FILE"] = str(OUTPUT_AICM)
-    try:
-        subprocess.run(
-            ["xvfb-run", "-a", str(binary), "--shot", str(OUTPUT_PNG)],
-            env=env, capture_output=True, timeout=60,
-        )
-        if OUTPUT_PNG.exists():
-            print(f"  [OK] thumbnail → {OUTPUT_PNG}")
-            return True
-        print("  [WARN] shot ran but no PNG written")
-        return False
-    except Exception as e:
-        print(f"  [WARN] thumbnail failed: {e}")
-        return False
-
-
 def regen_and_verify() -> dict:
     """Entry point called by samples/test_regen.py."""
     from services.mcp import core_bridge as cb
@@ -207,6 +161,5 @@ if __name__ == "__main__":
     print(f"  op_count:      {result['op_count']}")
     print(f"  aicm:          {result['aicm_path']}")
     print(f"  cam_json:      {OUTPUT_CAM_JSON}")
-    print("Rendering thumbnail...")
-    make_thumbnail()
+    print(f"  thumbnail:     {OUTPUT_PNG}")
     print("Done.")

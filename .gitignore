@@ -58,6 +58,7 @@ node_modules/
 scratch/
 /preflight_events.jsonl
 /runs/
+/reports/
 /*.step+
 benchmarks/simsuite/results/
 tools/flywheel/bench/gym/reports/

@@ -1,8 +1,6 @@
 """node_runner.py — Wrap the agent loop for DAG node execution.
 
 Contract: contracts/dag_schema.md §2–§3, §11.
-Scaffold: T-A2.
-
 Each node in an aicad.dag/1 graph is executed by calling
 ``node_runner.run(node, context_pack, ...)`` which:
 
@@ -39,7 +37,7 @@ import time
 from typing import Any, Callable, Optional
 
 
-# Advisory engine / foreman (T-W5, Pillar 20): after a node step, the foreman runs
+# Advisory engine / foreman: after a node step, the foreman runs
 # the stage battery over the node's doc (if it carries one) and the advisory block
 # is attached to output_state["advisory"] for injection into the next node's
 # context pack.  Gated by CHUDWARE_ADVISOR (default on); best-effort.
@@ -541,7 +539,7 @@ def run(
     node_inputs: dict[str, Any] = context_pack.get("node_inputs") or {}
     retry_remaining: int = context_pack.get("retry_remaining", 1)
 
-    # Role card (T-W7): a node may carry a ``role:`` field naming a predefined role
+    # Role card: a node may carry a ``role:`` field naming a predefined role
     # card in services/agent/roles/*.yaml. When present, the card's system prompt +
     # tool allowlist govern the node's agent turn. Applying the card is best-effort:
     # a missing card or import failure must never break node execution (it just runs
@@ -574,7 +572,7 @@ def run(
             context_pack["role_system_prompt"] = role_card.system_prompt
         # The node's tools: allowlist and the card's allowlist should agree; the card
         # is authoritative for a role-typed node, so expose its concrete tools.
-        # T-W30: context_pack.assemble() ALWAYS sets "allowed_tools" (None = open),
+        # context_pack.assemble() ALWAYS sets "allowed_tools" (None = open),
         # so the old setdefault() never fired and the card allowlist was silently
         # dropped — the real C1 run showed the model free-inventing tool names
         # because its prompt listed none. The card fills the OPEN case only; an
@@ -667,7 +665,7 @@ def run(
         except Exception:  # noqa: BLE001
             pass
 
-    # mega-8 (advisor Q2): multi-domain PLAN/BUILD soft gate — auto-complete
+    # Multi-domain PLAN/BUILD soft gate — auto-complete
     # blocks until a real delegate call OR a TYPED refusal envelope
     # {reason, domains_considered, why_flat}. Free-form ledger_note does NOT
     # satisfy. Only when depth < max_spawn_depth.
@@ -710,13 +708,13 @@ def run(
     final_code: str | None = getattr(agent_result, "final_code", None)
     agent_result_dict: dict | None = getattr(agent_result, "result", None)
     doc_id = node_inputs.get("doc_id")
-    # mega-9 a2: BUILD often creates the part via new_part without stamping
+    # BUILD often creates the part via new_part without stamping
     # inputs.doc_id — lift it from the agent result so VERIFY/battery can target
     # the mission-built doc when ≥2 parts are open.
     if not doc_id:
         doc_id = _extract_doc_id_from_agent_result(agent_result_dict)
 
-    # mega-8 a4: SqliteSaver raised "string or blob too big" when node_states
+    # SqliteSaver raised "string or blob too big" when node_states
     # accumulated full tool results / handoffs. Keep a compact agent_result for
     # checkpointing (ledger already has full tool_call trails).
     compact_ar = _compact_agent_result(agent_result_dict)
@@ -735,12 +733,12 @@ def run(
         "doc_id": doc_id,
     }
 
-    # Foreman advisory pass (T-W5, §9.1): run the stage battery over the node's doc
+    # Foreman advisory pass (§9.1): run the stage battery over the node's doc
     # and attach the rendered block for the next node's context pack.  Best-effort.
     # NOTE: unlike the loop.py seam, the DAG path has no run_id/ledger handle here,
     # so DAG-path advisories are injected but NOT yet logged to the ledger event
     # stream — offline replay of DAG-injected blocks (§3/§9.4) is deferred until a
-    # ledger handle is threaded through the context pack (tracked for T-W19 glue).
+    # ledger handle is threaded through the context pack.
     adv_block = _run_advisory(node_type, doc_id, seq=retry_remaining)
     if adv_block:
         output_state["advisory"] = adv_block
@@ -790,7 +788,7 @@ def run(
 
 
 # ---------------------------------------------------------------------------
-# Role card application (T-W7)
+# Role card application
 # ---------------------------------------------------------------------------
 
 
@@ -800,7 +798,7 @@ def _resolve_role_card(node: dict[str, Any]) -> Any:
     Best-effort: any failure (no role field, unknown role, roles module unavailable)
     returns None so the node runs with default behaviour.
 
-    T-W30: the mission compiler (services/dag/mission_template._node) carries the
+    The mission compiler (services/dag/mission_template._node) carries the
     role in ``inputs.role`` — accept it as well as a top-level ``role`` field.
     Reading only ``node['role']`` meant NO mission-graph node ever resolved its
     card, so role prompts + tool allowlists were silently dropped (the real C1
@@ -855,7 +853,7 @@ def _build_request(
     if allowed is not None:
         parts.append(f"\nAvailable tools (only): {', '.join(allowed)}")
 
-    # mega-8 F9: multi-domain PLAN/BUILD must see the typed-refusal escape
+    # Multi-domain PLAN/BUILD must see the typed-refusal escape
     # hatch in the request (gate kills free-form auto-complete otherwise).
     try:
         from services.agent.role_models import (  # noqa: PLC0415
@@ -969,7 +967,7 @@ def _extract_doc_id_from_agent_result(agent_result_dict: Any) -> str | None:
 
 
 def _compact_agent_result(agent_result_dict: Any) -> Any:
-    """Shrink agent_result for SqliteSaver node_states (mega-8 a4 blob crash).
+    """Shrink agent_result for SqliteSaver node_states (avoids the oversized-blob crash).
 
     Keep stop/handoff summary + tool names/ok flags; drop large result bodies.
     """
@@ -1100,7 +1098,7 @@ def _build_summary(
 
 
 def _run_advisory(node_type: str, doc_id: str | None, seq: int = 0) -> str:
-    """Run the foreman over *doc_id* and return an [ADVISORY] block (T-W5).
+    """Run the foreman over *doc_id* and return an [ADVISORY] block.
 
     The DAG path DOES carry a doc_id, so the full stage battery (interference,
     overlap, sketch health, rebuild) can fire against the live doc via the core
@@ -1167,7 +1165,7 @@ def _run_overseer_stage_exit(
 
 
 # ---------------------------------------------------------------------------
-# mega-8: multi-domain PLAN/BUILD typed-refusal / delegate soft gate
+# Multi-domain PLAN/BUILD typed-refusal / delegate soft gate
 # ---------------------------------------------------------------------------
 
 
@@ -1281,11 +1279,11 @@ def _multi_domain_delegate_gate(
         info["typed_refusal_errors"] = errs
 
     # Free-form ledger_note / bare handoff does NOT satisfy.
-    # mega-24 a1 residual: pure plan-read thrash (N× ledger_get, no writes)
+    # Pure plan-read thrash (N× ledger_get, no writes)
     # finished DONE then escalated as delegate_or_typed_refusal_required —
     # thrash-kill at 4 node fails. Soft-pass ONLY for read-only productive
     # turns (layout skeleton class). Free-form "doing it myself" with
-    # ledger_note/buildgraph_plan still blocks (mega-8 contract).
+    # ledger_note/buildgraph_plan still blocks (soft-gate contract).
     try:
         calls = result.get("calls") if isinstance(result, dict) else None
         if not isinstance(calls, list):
@@ -1327,7 +1325,7 @@ def _multi_domain_delegate_gate(
             ],
             "why_flat": (
                 "Node only performed plan-read tools (ledger_get/describe/…); "
-                "mega-24 soft-pass via synthesised typed_refusal."
+                "soft-pass via synthesised typed_refusal."
             ),
         }
         try:

@@ -39,7 +39,7 @@ __all__ = [
     "knowledge_root",
     "common",
     "providers",
-    # T-W6: feeds/speeds + tap drill (aicad.calc/1 + aicad.advisory/1)
+    # feeds/speeds + tap drill (aicad.calc/1 + aicad.advisory/1)
     "feeds_speeds",
     "tap_drill",
     "check_envelope",

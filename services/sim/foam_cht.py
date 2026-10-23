@@ -14,7 +14,7 @@ Workflow:
   4. chtMultiRegionFoam   solve the coupled energy equation with a volumetric heat source in
      each powered solid.
 
-MULTI-SOLID SEAM (T-FIN19 board/enclosure handoff): ``build_cht_case`` accepts a ``solids``
+MULTI-SOLID SEAM (board/enclosure handoff): ``build_cht_case`` accepts a ``solids``
 list — one entry per solid region::
 
     solids=[{"name": "board", "stl_path": ".../board.stl", "kappa_w_mk": 8.0,  "power_w": 0.0},
@@ -85,7 +85,7 @@ class CHTInfo:
     app: str = "chtMultiRegionFoam"
     thermal: bool = True
     conjugate: bool = True
-    # T-FIN19 seam: every solid region, in build order.
+    # Multi-solid seam: every solid region, in build order.
     solid_regions: Tuple[str, ...] = ("part",)
     solids: Tuple[dict, ...] = ()       # normalized {name, kappa_w_mk, power_w} per region
 
@@ -143,7 +143,7 @@ def build_cht_case(case_dir: str, stl_path: Optional[str] = None,
     """Write a complete chtMultiRegionFoam case; return its :class:`CHTInfo`.
 
     Single solid: pass ``stl_path`` (+ ``solid_kappa`` / ``power_w``) as before.
-    Multi solid (T-FIN19): pass ``solids=[{name, stl_path, kappa_w_mk, power_w}, ...]``.
+    Multi solid: pass ``solids=[{name, stl_path, kappa_w_mk, power_w}, ...]``.
     """
     if preset not in _PRESETS:
         raise ValueError(f"unknown OpenFOAM preset {preset!r}")

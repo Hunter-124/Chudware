@@ -93,7 +93,7 @@ inline void wasmBootReady() {
 #include <unistd.h>
 #endif
 
-#include "app_commands.h" // T-RF11: ribbon command router (dispatchCmd family table)
+#include "app_commands.h" // ribbon command router (dispatchCmd family table)
 #include "bootstrap.h"
 #include "mesh.h"
 #include "renderer.h"
@@ -133,14 +133,14 @@ inline void wasmBootReady() {
 #include "ui/design_table_panel.h" // Design Table (SolidWorks editable config grid)
 #include "ui/doc_tabs.h"
 #include "ui/drawing_panel.h" // W17: drawing ribbon command dispatch (drawingHandleCommand)
-#include "ui/ecad/ecad_mirror.h" // Wave N: complete type for EcadMirror::setDocId
-#include "ui/ecad/ecad_panel.h" // Wave N: AI-ECAD 2D editor
+#include "ui/ecad/ecad_mirror.h" // complete type for EcadMirror::setDocId
+#include "ui/ecad/ecad_panel.h" // ECAD 2D editor
 #include "ui/metrics.h" // ECAD command modals use the shared DPI-scaled size tokens
 #include "ui/feature_tree.h"
 #include "ui/file_dialog.h" // Wave Y: native Save As / Open dialogs for .ecad+
 #include "ui/file_dialog.h" // W14: native Save-As for 2D export (flat-pattern DXF)
 #include "ui/file_explorer.h" // Wave 3: File Explorer + workspace/recent helpers
-#include "ui/firmware/fw_workspace.h" // T-FIN5 Firmware workspace (drawFirmwareWorkspace + shot fixture)
+#include "ui/firmware/fw_workspace.h" // Firmware workspace (drawFirmwareWorkspace + shot fixture)
 #include "ui/manufacture/manufacture_panel.h" // P4 manufacturing operator surface + RPC dispatch
 #include "ui/manufacture/mfg_mirror.h" // complete read-only manufacturing mirror type
 #include "ui/anim.h" // shared motion language + the continuous-redraw frame request
@@ -185,7 +185,7 @@ inline void wasmBootReady() {
 #include "ui/plm/plm_workspace.h"
 #include "ui/provider_logos.h" // per-frame provider brand-icon fetch/upload pump
 
-#include <filesystem> // Wave N: ecad export output dir + W14: flat-pattern DXF export
+#include <filesystem> // ecad export output dir + W14: flat-pattern DXF export
 
 #ifndef __EMSCRIPTEN__
 // main.cpp — single-instance guard. True exactly once per "raise yourself" poke sent by a second
@@ -298,7 +298,7 @@ void applyModelAppearance(AppState &st, const float *color, float metallic,
         if (!applied)
           return;
         if (resp.ok && !resp.aicm_path.empty()) {
-          st.loadDocMeshAsync(resp.aicm_path); // T-PERF3
+          st.loadDocMeshAsync(resp.aicm_path);
         } else if (!resp.ok) {
           st.addLog("[err] set_appearance: " + resp.error_message);
         }
@@ -663,7 +663,7 @@ void ecadSaveDoc(AppState &st) {
   // yet acquired a tab.
   const std::string name = ui::ecadEditorMirror().name();
   const std::string path = ui::saveFileDialog(
-      "AI-ECAD design (*.ecad+)\0*.ecad+\0All files (*.*)\0*.*\0", "ecad+",
+      "Chudware ECAD design (*.ecad+)\0*.ecad+\0All files (*.*)\0*.*\0", "ecad+",
       name.empty() ? "design" : name.c_str());
   if (path.empty())
     return; // cancelled
@@ -724,7 +724,7 @@ void ecadOpenPath(AppState &st, const std::string &path) {
 void ecadOpenDoc(AppState &st) {
   const std::string path = ui::openFileDialog(
       "ECAD / KiCad files\0*.ecad+;*.ecad;*.json;*.kicad_sch;*.kicad_pcb\0"
-      "AI-ECAD design (*.ecad+)\0*.ecad+\0KiCad schematic "
+      "Chudware ECAD design (*.ecad+)\0*.ecad+\0KiCad schematic "
       "(*.kicad_sch)\0*.kicad_sch\0"
       "KiCad board (*.kicad_pcb)\0*.kicad_pcb\0All files (*.*)\0*.*\0");
   if (path.empty())
@@ -1695,7 +1695,7 @@ static void applyFlatPattern(AppState &st) {
         if (!applied)
           return;
         if (r.ok && !r.aicm_path.empty()) {
-          st.loadDocMeshAsync(r.aicm_path); // T-PERF3
+          st.loadDocMeshAsync(r.aicm_path);
           st.toast(ui::ToastLevel::Info, "Flat pattern created");
         } else if (!r.ok) {
           st.toast(ui::ToastLevel::Warn, r.error_message.empty()
@@ -1770,7 +1770,7 @@ static void exportFlatDxf(AppState &st) {
 }
 
 // ---------------------------------------------------------------------------
-// T-RF11: app-level ribbon command handlers. These were inline blocks in
+// App-level ribbon command handlers. These were inline blocks in
 // dispatchCmd's if-chain; they stay here (app-level policy) and are registered
 // into the CommandRouter (app_commands.cpp) through RibbonCommandHooks, in the
 // original chain order.
@@ -2637,7 +2637,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // via the WndProc in chrome::install.)
   glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
 #endif
-  // T-G15 dev/test hook: CHUDWARE_HIDDEN=1 creates the window unmapped so
+  // Dev/test hook: CHUDWARE_HIDDEN=1 creates the window unmapped so
   // headless shot runs never enter the compositor's present path (on an
   // unattended desktop the compositor can starve a new window's swaps
   // indefinitely — observed as multi-minute drmSyncobjTimelineWait stalls). GL
@@ -2736,7 +2736,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   }
 
   // Theme: honour CHUDWARE_THEME env override, then persisted setting, then LIGHT
-  // default (owner default 2026-07-14). Applied once here; the settings load at
+  // default (since 2026-07-14). Applied once here; the settings load at
   // first frame re-applies the persisted choice, and the View-menu toggle calls
   // applyTheme() again.
   {
@@ -2924,7 +2924,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   //   - App-level policy stays here: prof_toggle, the Simulation lockout (runs
   //   before family
   //     routing), PM-cancel-on-sketch_new, and the unhandled-stub log.
-  //   - T-RF11: every command FAMILY (sketch, edit_*, dwg_, display_/appr_,
+  //   - every command FAMILY (sketch, edit_*, dwg_, display_/appr_,
   //   asm_, ecad_/sch_/pcb_,
   //     cam_, reveng_, PM forms, sm_, sim_, eval_) lives in an ordered rule
   //     table built by buildRibbonCommandRouter (app_commands.cpp);
@@ -2983,7 +2983,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // Esc couldn't untangle it.
     if (st.propertyManager->active() && std::strcmp(cmd_id, "sketch_new") == 0)
       st.propertyManager->cancelEdits(st);
-    // T-RF11: family routing lives in the ordered rule table
+    // Family routing lives in the ordered rule table
     // (app_commands.cpp). Built once; the rules are stateless and resolve every
     // subsystem through the AppState& at call time. The app-level family
     // handlers (cmdEdit*/cmdDisplayStyle/cmdAppearance/...) stay in this file
@@ -3383,7 +3383,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         rd.name = d.value("name", std::string());
         rds.push_back(rd);
       }
-      // T-BL37: inject the synthetic world-origin point datum so the renderer
+      // Inject the synthetic world-origin point datum so the renderer
       // draws a point glyph at (0,0,0). Eye-toggle in the FeatureManager
       // hides/shows it via hiddenFeatures — same mechanism as every
       // user-created datum feature.
@@ -3840,7 +3840,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     st.activeTab = 7;
   }
   st.wantEcad = shot && shotMode &&
-                std::strcmp(shotMode, "ecad") == 0; // Wave N: ECAD GUI shot
+                std::strcmp(shotMode, "ecad") == 0; // ECAD GUI shot
   if (st.wantEcad) {
     st.showPcbTools = true;
     st.showRibbon = true;
@@ -3863,7 +3863,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   }
   st.wantFea =
       shot && shotMode && std::strcmp(shotMode, "fea") == 0; // C19 static study
-  // T-FIN24 disclosure-matrix shots (Simulate workspace study picker).
+  // Disclosure-matrix shots (Simulate workspace study picker).
   st.wantSimDisc = shot && shotMode &&
                    (std::strcmp(shotMode, "simdisc_mech") == 0 ||
                     std::strcmp(shotMode, "simdisc_ecad") == 0);
@@ -3896,7 +3896,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   st.wantEvalMass = shot && shotMode &&
                     std::strcmp(shotMode, "evalmass") == 0; // C19 mass props
   st.wantIconPipe = shot && shotMode &&
-                    std::strcmp(shotMode, "iconpipe") == 0; // T-G15 icon render
+                    std::strcmp(shotMode, "iconpipe") == 0; // icon render
   if (st.wantFea || st.wantFlow) {
     st.showSimulationTools = true;
     st.showRibbon = true;
@@ -3925,7 +3925,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   }
   // CHUDWARE_SHOT=firmware: open the Firmware workspace with the canned project +
   // build console + emulation UART log + GPIO trace fixture — headless visual
-  // verification of T-FIN5 (project visible, build console output, emulation
+  // verification of the Firmware workspace (project visible, build console output, emulation
   // trace rendered). fw_status / fw_projects still hit the live worker, so the
   // backend rail shows the REAL doctor state.
   if (shot && shotMode && std::strcmp(shotMode, "firmware") == 0) {
@@ -4119,9 +4119,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       if (t >= 0 && t <= AppState::RT_Manufacture)
         st.ribbonTab = t;
     }
-    // T-G15: named alias for CHUDWARE_TAB so in-context icon verification reads
+    // Named alias for CHUDWARE_TAB so in-context icon verification reads
     // self-documenting (e.g. CHUDWARE_RIBBON_TAB=appearance). Also unblocks
-    // T-G16's per-tab ribbon-glass captures.
+    // per-tab ribbon-glass captures.
     if (const char *tn = std::getenv("CHUDWARE_RIBBON_TAB")) {
       const std::string t = tn;
       int idx = -1;
@@ -4164,7 +4164,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     st.showRibbon = true;
     st.showFeatureTree =
         true; // ensure the left pane (which hosts the PM tab) is visible
-    // T-G14 verification harness: optionally load a part into the viewport so
+    // Verification harness: optionally load a part into the viewport so
     // the docked panels sample a LIVE (light) backdrop — that regime (adaptive
     // DARK text over the light viewport) is where the dark-mode
     // black-on-black actually manifests; without a loaded doc the panes fall
@@ -4676,7 +4676,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     }
     wasmDrainHudCommands(st);
 #endif
-    // T-PERF10: idle render throttle. When nothing needs continuous redraw (no
+    // Idle render throttle. When nothing needs continuous redraw (no
     // animation, no async RPCs, no camera tween, no headless shot), wait up to
     // 50ms for an event instead of spinning at full vsync and burning a core.
     // Input still wakes immediately. CEF's pump_if_due below still runs every
@@ -4857,7 +4857,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // Manufacturing panels enqueue intent only. Dispatch after the prior frame's
     // callbacks drain, before hostd events update the read-only mirror.
     ui::dispatchManufactureRequests(st);
-    // T-PERF3: commit mesh loads that finished disk-parse on the loader thread
+    // Commit mesh loads that finished disk-parse on the loader thread
     // (GL upload only here; stale gens dropped so keep-last-good stays on
     // screen).
     st.drainMeshLoads();
@@ -5341,7 +5341,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                       if (aicmPath.empty())
                         aicmPath = r.result.value("aicm_path", "");
                       if (!aicmPath.empty())
-                        st.loadDocMeshAsync(aicmPath); // T-PERF3
+                        st.loadDocMeshAsync(aicmPath);
                     }
                     st.addLog(
                         "[v2] doc_activate + resync after run: rev=" +
@@ -7696,7 +7696,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         st.wantFocusEcad--;
       }
       if (wsShowEcad)
-        ui::drawEcadEditor(st); // Wave N: AI-ECAD 2D editor
+        ui::drawEcadEditor(st); // ECAD 2D editor
     }
 
 
@@ -7789,7 +7789,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         ImGui::End();
       }
     } else if (!webActive && ws == WS::Firmware) {
-      // T-FIN5: full-body Firmware workspace (project rail |
+      // Full-body Firmware workspace (project rail |
       // build/emulation/trace | fw_status-gated backend rail). Same borderless
       // central-band host as PLM/RevEng.
       const ui::OverlayBand &band = ui::overlayBand();
@@ -8568,7 +8568,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       if (partsShotAt < 0 && st.frame > 6 && ui::partsLibrarySettled(st)) partsShotAt = st.frame + 8;
       shotFrame = partsShotAt > 0 ? partsShotAt : 900;
     }
-    // T-G15 iconpipe: keep the loop alive (offscreen icon renders happen in
+    // iconpipe: keep the loop alive (offscreen icon renders happen in
     // tick()) until every recipe is captured, then exit promptly — the --shot
     // backbuffer capture is a throwaway.
     // chat_context: capture a few frames after the chips bind to the live doc (ceiling 300).
@@ -8714,7 +8714,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   ui::destroyCursors(); // W1-B: free the GLFW standard cursors
   if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))
     std::fprintf(stderr, "[td] stopMeshLoader\n");
-  st.stopMeshLoader(); // T-PERF3: join mesh thread before static dtors (avoid
+  st.stopMeshLoader(); // join mesh thread before static dtors (avoid
                        // terminate)
   if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))
     std::fprintf(stderr, "[td] worker.stop\n");

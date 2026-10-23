@@ -5,9 +5,9 @@
 > joists, stud walls, footings) plus load cases; every element compiles to an OCCT B-rep solid
 > (`engine.structural.brep.element_to_brep`) so it renders in the normal viewport alongside CAD
 > bodies. Mirrors the ECAD precedent (`ecad_rpc.md` / `pcb_schema.md`): a self-contained engine
-> module owns schema + geometry; the C++ host and MCP bridge (registered **day 3**) call it directly.
+> module owns schema + geometry; the C++ host and MCP bridge call it directly.
 >
-> **Frozen day 1** because T-D5 (cost takeoff) → T-B2 (BOM rollup) reads element `material` +
+> **Frozen first** because cost takeoff → BOM rollup reads element `material` +
 > `section_name` specs; those field names are stable from here.
 
 ## 1. Document — `aicad.structure/1`
@@ -81,8 +81,8 @@ hollow forms — and extrudes it along +Z by `length_mm`, then applies `transfor
 | form | example | profile |
 |---|---|---|
 | `WxH` (2 dims, mm) | `100x100`, `38x235` | solid rectangle (lumber / generic) |
-| `RHS WxHxT` / `HSS WxHxT` / `WxHxT` | `RHS100x50x5`, `HSS100x100x6` | rectangular hollow → true outer-minus-inner prism, wall thickness `T` (T-BL21; falls back to a solid outer rectangle if `T` doesn't physically fit the envelope) |
-| `CHS ODxT` / `PIPE ODxT` | `CHS114.3x6.02` | circular hollow (pipe/tube) → true annulus prism, wall thickness `T` (T-BL21) |
+| `RHS WxHxT` / `HSS WxHxT` / `WxHxT` | `RHS100x50x5`, `HSS100x100x6` | rectangular hollow → true outer-minus-inner prism, wall thickness `T` (falls back to a solid outer rectangle if `T` doesn't physically fit the envelope) |
+| `CHS ODxT` / `PIPE ODxT` | `CHS114.3x6.02` | circular hollow (pipe/tube) → true annulus prism, wall thickness `T` |
 | `I HxBxTWxTF` / AISC `W…` | `I200x100x6x10`, `W200x100` | I-shape wire (12-point; solid open-thin-wall profile, not voided) |
 
 Unknown/empty names fall back to a sensible default rectangle for the element type so

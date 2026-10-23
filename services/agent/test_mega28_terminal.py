@@ -1,13 +1,13 @@
 """Mega-28 live fingerprint: the run graded 9/9 PASS yet reported a blocked terminal.
 
-Live mega-28 (reports/runs/mega-28/) graded 9/9 PASS while the mission terminal said
+Live mega-28 graded 9/9 PASS while the mission terminal said
 ``status=blocked, phase=deliver, stop_reason=deliver_partial`` — soft-join deliver
 treated incomplete sibling deliver nodes as partial even after every acceptance
 criterion passed. This file pins that FINGERPRINT against the archived run artifacts, so
 the historical shape stays readable and a future reader can tell the grade from the
 terminal.
 
-It does NOT test the terminal classifier. T-RF5 deleted the Python mission loop
+It does NOT test the terminal classifier. The Python mission loop was deleted
 (``services/agent/loop.py`` ``run``/``run_mission``/``_drive_phases_from_dag``) and the
 C++ ``agent_mission_v1`` is the only live mission entry, so the classifier is no longer
 reachable from Python. A ``_drive`` helper here used to monkeypatch those deleted
@@ -40,7 +40,7 @@ def _load_json(path: Path) -> dict:
 
 
 def test_mega28_live_fingerprint_all_ac_pass_but_deliver_partial():
-    """Document the bug shape from reports/runs/mega-28 (grading vs terminal)."""
+    """Document the bug shape from the mega-28 run (grading vs terminal)."""
     report = _load_json(_MEGA28_STATUS)
     mission = _load_json(_MEGA28_MISSION)
     term = report.get("terminal") or {}

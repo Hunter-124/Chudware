@@ -699,7 +699,7 @@ def test_assembly_advice_clean():
 
 
 # ---------------------------------------------------------------------------
-# ME489-scale: archive exclusion, truncation, cache fast-path
+# Large-tree scale: archive exclusion, truncation, cache fast-path
 # ---------------------------------------------------------------------------
 
 

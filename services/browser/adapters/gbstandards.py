@@ -1,4 +1,4 @@
-"""services/browser/adapters/gbstandards.py — GB national-standards adapter (T-X7).
+"""services/browser/adapters/gbstandards.py — GB national-standards adapter.
 
 openstd.samr.gov.cn (国家标准全文公开, "National Standards Full-Text Public
 Disclosure") is the one FREE full-text portal for Chinese national standards

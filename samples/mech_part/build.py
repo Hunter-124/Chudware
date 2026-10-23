@@ -3,7 +3,7 @@ samples/mech_part/build.py — build the "Bracket" sample mechanical part.
 
 Generates:
   samples/mech_part/bracket.aicm    (native tessellation file, tracked)
-  samples/mech_part/thumbnail.png   (headless shot, tracked)
+  samples/mech_part/thumbnail.png   (engine render, tracked)
 
 Verify contract (called by samples/test_regen.py):
   regen_and_verify() -> dict with keys: ok, volume_mm3, body_count, feature_count
@@ -14,9 +14,7 @@ Usage:
 from __future__ import annotations
 
 import json
-import os
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -122,9 +120,7 @@ def build_bracket(cb) -> dict:
 
     # ── Step 6: save native .aicm ─────────────────────────────────────────────
     cb.call("doc_save", {"doc_id": doc_id, "path": str(OUTPUT_AICM)})
-    # Engine-rendered thumbnail while the doc is still open (doc_render_png).
-    # The old GUI-shot path captured an EMPTY shell 3x: AI-CAD2 has no
-    # CHUDWARE_OPEN_FILE support, so --shot never loaded the doc (foreman fix).
+    # Engine-rendered thumbnail while the doc is still open.
     cb.call("doc_render_png", {"doc_id": doc_id, "out_path": str(OUTPUT_PNG)})
     cb.call("doc_close", {"doc_id": doc_id})
 
@@ -144,55 +140,6 @@ def _count_ok_features(r: dict) -> int:
     if not statuses:
         statuses = r.get("features", [])
     return sum(1 for f in statuses if f.get("ok", True))
-
-
-def make_thumbnail() -> bool:
-    """
-    Render a headless thumbnail by loading the saved .aicm into AI-CAD2
-    via the --shot flag.  Returns True if the PNG was written.
-    """
-    if OUTPUT_PNG.exists():
-        return True  # engine-rendered during build; GUI shot cannot load docs
-    # Try multiple known binary locations (worktree and main repo)
-    candidates = [
-        REPO / "ui" / "imgui" / "build" / "bin" / "AI-CAD2",
-        REPO / "build" / "linux-app" / "bin" / "AI-CAD2",
-        # The main CAD checkout when running from a worktree
-        REPO.parent / "CAD" / "ui" / "imgui" / "build" / "bin" / "AI-CAD2",
-        REPO.parent / "CAD" / "build" / "linux-app" / "bin" / "AI-CAD2",
-    ]
-    binary = next((b for b in candidates if b.exists()), None)
-    if binary is None:
-        print(f"  [SKIP] AI-CAD2 binary not found — skipping thumbnail")
-        return False
-
-    env = os.environ.copy()
-    so_candidates = [
-        REPO / "core" / "build-linux" / "bin" / "libchudware.so",
-        REPO.parent / "CAD" / "core" / "build-linux" / "bin" / "libchudware.so",
-    ]
-    so = next((s for s in so_candidates if s.exists()), None)
-    if so:
-        env.setdefault("CHUDWARE_LIBCHUDWARE", str(so))
-    env["CHUDWARE_NO_FILE_DIALOGS"] = "1"
-    env["CHUDWARE_OPEN_FILE"] = str(OUTPUT_AICM)
-
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["xvfb-run", "-a", str(binary), "--shot", str(OUTPUT_PNG)],
-            env=env, capture_output=True, timeout=60,
-        )
-        if OUTPUT_PNG.exists():
-            print(f"  [OK] thumbnail → {OUTPUT_PNG}")
-            return True
-        else:
-            print(f"  [WARN] shot exited {result.returncode} but no PNG written")
-            print(result.stderr.decode()[-500:] if result.stderr else "")
-            return False
-    except Exception as e:
-        print(f"  [WARN] thumbnail failed: {e}")
-        return False
 
 
 def regen_and_verify() -> dict:
@@ -241,8 +188,6 @@ if __name__ == "__main__":
     print(f"  body_count:    {bc}")
     print(f"  feature_count: {fc}")
     print(f"  aicm:          {aicm}")
-
-    print("Rendering thumbnail...")
-    make_thumbnail()
+    print(f"  thumbnail:     {OUTPUT_PNG}")
 
     print("Done.")

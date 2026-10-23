@@ -7,7 +7,7 @@
 // host stays buildable/launchable even when the core isn't present.
 //
 // Today this drives the production doc/agent/sim routing seam (see worker_client.cpp) —
-// unconditional since R5a (T-RF21): the C++ core is the only engine backend.
+// unconditional: the C++ core is the only engine backend.
 #pragma once
 
 #include <mutex>

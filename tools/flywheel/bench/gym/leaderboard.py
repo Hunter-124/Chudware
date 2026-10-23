@@ -448,7 +448,7 @@ def aggregate(
 
         axes = _axis_scores_for_model(diag, mid, tier)
 
-        # --- additive division / discipline keys (WI-12) ---
+        # --- additive division / discipline keys ---
         def _div_stats(div: str) -> dict:
             dcells = [c for c in mcells if (c.get("division") or "local") == div]
             nt = len(dcells)

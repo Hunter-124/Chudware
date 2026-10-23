@@ -1,4 +1,4 @@
-"""Copper zone-fill tests — the copper-pour geometry of the AI-ECAD PCB module.
+"""Copper zone-fill tests — the copper-pour geometry of the ECAD PCB module.
 
 House style: ``from __future__ import annotations``, plain ``main()`` + asserts, run as a module.
 Fixtures are self-contained — a small board built inline from :func:`schema.new_board` with a
@@ -309,7 +309,7 @@ def test_wellformed_polys():
 
 def main() -> None:
     print("=" * 60)
-    print("AI-ECAD COPPER ZONE-FILL TESTS")
+    print("ECAD COPPER ZONE-FILL TESTS")
     print("=" * 60)
     test_clearance_gap()
     test_thermal_relief()

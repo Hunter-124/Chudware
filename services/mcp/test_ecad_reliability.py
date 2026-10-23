@@ -1,4 +1,4 @@
-"""T-FIN21 ecad_vibe_check tests (house style: main()+asserts, honest skips).
+"""ecad_vibe_check tests (house style: main()+asserts, honest skips).
 
 Coverage:
   * pure helpers (engine-free): mount-hole detection modes, Steinberg screen
@@ -49,7 +49,7 @@ def _tools() -> dict:
 # --------------------------------------------------------------------------- fixtures
 
 
-def _demo_board(tools: dict, name: str = "fin21_demo", heavy: bool = False,
+def _demo_board(tools: dict, name: str = "vibe_demo", heavy: bool = False,
                 with_mounts: bool = True) -> str:
     """40x30 board, 4 corner NPTH mounting holes, an MCU + regulator; ``heavy=True``
     adds a large transformer-class body at the board center."""
@@ -97,7 +97,7 @@ def _demo_board(tools: dict, name: str = "fin21_demo", heavy: bool = False,
                            "type": "np_tht", "layers": ["F.Cu", "B.Cu"],
                            "drill": {"diameter": 3.2}, "net": None}]})
     doc["footprints"].extend(fps)
-    # T-RF20: doc is a client copy of the C++ session doc — write the fixture back.
+    # The doc is a client copy of the C++ session doc — write the fixture back.
     _sess = ecad_session.get_session(doc_id)
     ecad_session.swap_doc(_sess, doc)
     return _sess.doc_id
@@ -244,7 +244,7 @@ def test_dry_run() -> None:
     try:
         import build123d  # noqa: F401
     except ImportError:
-        print("  FIN21: build123d not installed — skipping dry-run test")
+        print("  VIBE: build123d not installed — skipping dry-run test")
         return
     import os
     from services.mcp import simhandoff as sh
@@ -273,19 +273,19 @@ def test_dry_run() -> None:
     assert env["coupling"] == "ecad_to_structural_fea"
     kinds = [c["kind"] for c in env["conditions"]]
     assert kinds.count("fixed_support") == 4 and "base_excitation" in kinds
-    print(f"  FIN21: dry run — {len(r['mount_holes'])} mounts, "
+    print(f"  VIBE: dry run — {len(r['mount_holes'])} mounts, "
           f"total mass {mm['total_mass_g']} g, envelope valid")
-    print("  [fin21_dry_run] PASS")
+    print("  [vibe_dry_run] PASS")
 
 
 def test_no_mounts_error() -> None:
     try:
         import build123d  # noqa: F401
     except ImportError:
-        print("  FIN21: build123d not installed — skipping no-mounts test")
+        print("  VIBE: build123d not installed — skipping no-mounts test")
         return
     tools = _tools()
-    doc_id = _demo_board(tools, name="fin21_nomount", with_mounts=False)
+    doc_id = _demo_board(tools, name="vibe_nomount", with_mounts=False)
     r = _call(tools, "ecad_vibe_check", doc_id=doc_id, dry_run=True)
     assert not r["ok"] and "no mounting holes" in r["error"]
     assert any("mount_holes" in a for a in r["next_actions"])
@@ -294,7 +294,7 @@ def test_no_mounts_error() -> None:
                mount_holes=[[3, 3], [37, 3], [37, 27], [3, 27]])
     assert r2["ok"] and len(r2["mount_holes"]) == 4
     assert all(h["source"] == "user" for h in r2["mount_holes"])
-    print("  [fin21_no_mounts_error] PASS")
+    print("  [vibe_no_mounts_error] PASS")
 
 
 def test_live_solve_and_heavy_regression() -> None:
@@ -304,22 +304,22 @@ def test_live_solve_and_heavy_regression() -> None:
     try:
         import build123d  # noqa: F401
     except ImportError:
-        print("  FIN21: build123d not installed — skipping live solve")
+        print("  VIBE: build123d not installed — skipping live solve")
         return
     try:
         from services.mcp import core_bridge as cb
         cb.call("ping", {})
     except Exception as e:  # noqa: BLE001
-        print(f"  FIN21: libchudware not loadable ({type(e).__name__}) — live solve "
+        print(f"  VIBE: libchudware not loadable ({type(e).__name__}) — live solve "
               "SKIPPED (dry-run coverage above still exercises mounts/mass/envelope)")
         return
     tools = _tools()
-    doc_id = _demo_board(tools, name="fin21_live")
+    doc_id = _demo_board(tools, name="vibe_live")
     r = _call(tools, "ecad_vibe_check", doc_id=doc_id, mesh_fineness=0.3)
     if not r.get("ok") or not r.get("solved"):
         why = r.get("error_solve") or r.get("error")
         assert "unavailable" in str(why) or r.get("simhandoff"), r
-        print(f"  FIN21: solver leg unavailable ({str(why)[:80]}) — live solve SKIPPED")
+        print(f"  VIBE: solver leg unavailable ({str(why)[:80]}) — live solve SKIPPED")
         return
     # Modes reported, physically sane, band verdict present.
     assert r["modes"] and r["f1_hz"] and r["f1_hz"] > 0, r["modes"]
@@ -334,21 +334,21 @@ def test_live_solve_and_heavy_regression() -> None:
     checked = [e for e in ds["table"] if e["pass"] is not None]
     assert checked and all(isinstance(e["margin"], (int, float)) for e in checked)
     # Sanity regression: the heavy transformer LOWERS f1.
-    doc_heavy = _demo_board(tools, name="fin21_heavy", heavy=True)
+    doc_heavy = _demo_board(tools, name="vibe_heavy", heavy=True)
     rh = _call(tools, "ecad_vibe_check", doc_id=doc_heavy, mesh_fineness=0.3)
     assert rh.get("ok") and rh.get("solved"), rh.get("error_solve") or rh.get("error")
     assert rh["mass_model"]["total_mass_g"] > 1.5 * r["mass_model"]["total_mass_g"], \
         "heavy fixture must add real mass"
     assert rh["f1_hz"] < r["f1_hz"], \
         f"heavy board f1 {rh['f1_hz']} must be below bare f1 {r['f1_hz']}"
-    print(f"  FIN21: LIVE — bare f1 {r['f1_hz']} Hz ({r['band']['verdict'][:5]}), "
+    print(f"  VIBE: LIVE — bare f1 {r['f1_hz']} Hz ({r['band']['verdict'][:5]}), "
           f"heavy f1 {rh['f1_hz']} Hz; deflection z3 {ds['z_3sigma_mm']} mm, "
           f"screen {'PASS' if ds['pass'] else 'FAIL'}")
-    print("  [fin21_live_solve_and_heavy_regression] PASS")
+    print("  [vibe_live_solve_and_heavy_regression] PASS")
 
 
 def main() -> None:
-    print("T-FIN21 ecad_vibe_check tests")
+    print("ecad_vibe_check tests")
     test_detect_mount_holes()
     test_steinberg_screen_pure()
     test_band_and_deflection_math()
@@ -356,7 +356,7 @@ def main() -> None:
     test_dry_run()
     test_no_mounts_error()
     test_live_solve_and_heavy_regression()
-    print("all T-FIN21 tests passed (or honestly skipped)")
+    print("all ecad_vibe_check tests passed (or honestly skipped)")
 
 
 if __name__ == "__main__":

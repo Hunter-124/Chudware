@@ -1,9 +1,9 @@
 """Overseer plan-audit engine (`aicad.audit/1`) — the judgment layer of Pillar 20.
 
 Contract: ``contracts/advisor.md`` §11 (audit record, FROZEN) and §17 (replan
-routing).  Pillar 20: docs/ADVISOR_ARCHITECTURE.md §2.11, docs/COPILOT_MISSION_
-PIPELINE.md §2 ("the overseer's watch") + Phase 6.  Role prompt (already authored
-by the lead): ``services/agent/roles/overseer.yaml``.
+routing).  Pillar 20: docs/design/ADVISOR_ARCHITECTURE.md §2.11,
+docs/design/COPILOT_MISSION_PIPELINE.md §2 ("the overseer's watch") + Phase 6.
+Role prompt: ``services/agent/roles/overseer.yaml``.
 
 What this module is
 -------------------
@@ -14,7 +14,7 @@ NOT re-author the prompt — it:
     override, change request, manual) and debounces one audit per trigger;
   * assembles **budgeted evidence** — ledger_render + active buildgraph slice +
     last-N handoffs + advisory/audit history fingerprints.  Never raw worker chat:
-    handoffs (with their reasoning summaries, per the T-W7 handoff schema) and the
+    handoffs (with their reasoning summaries, per the role handoff schema) and the
     ledger are the audit surface — that is what makes CoT auditing feasible;
   * calls the strongest configured provider (routing seam, §14) with the role
     card's system prompt + the evidence;
@@ -34,7 +34,7 @@ all-skip).  Every audit record logs ``tokens`` (cost control: audits are
 frontier-model calls).
 
 Routing seam (§14): overseer binds to ``strongest``. :func:`resolve_overseer_provider`
-resolves that assignment from routing.yaml (T-W14) when a routing table is passed,
+resolves that assignment from routing.yaml when a routing table is passed,
 falling back to a hardcoded provider-preference list only when routing.yaml has no
 configured sources.
 """
@@ -89,14 +89,14 @@ _BLOCKER_ESCALATE_AT = 2
 
 
 # ---------------------------------------------------------------------------
-# Role-card loader — delegates to the canonical T-W7 role loader
+# Role-card loader — delegates to the canonical role loader
 # (services/agent/roles.py) so the overseer reads the same card — including
 # Settings → Prompts overrides — as every other role consumer.
 # ---------------------------------------------------------------------------
 
 
 def load_role_card(role_id: str = "overseer", roles_dir: Path | None = None) -> dict:
-    """Load a role card YAML into a dict with ``system_prompt`` (via the T-W7 loader).
+    """Load a role card YAML into a dict with ``system_prompt`` (via the role loader).
 
     Returns ``{}`` if the card is missing or unparseable — the caller degrades to
     a built-in fallback system prompt rather than crashing a mission.
@@ -123,7 +123,7 @@ _FALLBACK_SYSTEM = (
 
 
 # ---------------------------------------------------------------------------
-# Routing seam (§14) — resolved via routing.yaml 'overseer: [strongest]' (T-W14).
+# Routing seam (§14) — resolved via routing.yaml 'overseer: [strongest]'.
 # ---------------------------------------------------------------------------
 
 # Fallback preference order used when routing.yaml is unavailable or has no sources
@@ -270,9 +270,9 @@ def _slice_buildgraph(graph: dict, scope: AuditScope, budget_chars: int) -> str:
 def _render_handoffs(handoffs: list[dict], budget_chars: int, max_n: int) -> str:
     """Render the last *max_n* role handoffs, budget-bounded, newest last.
 
-    Handoffs carry each role's reasoning summary (T-W7 handoff schema).  If a
+    Handoffs carry each role's reasoning summary (role handoff schema).  If a
     handoff lacks a ``reasoning_summary`` we note the gap so a cot_error audit
-    cannot be silently starved of the field it needs (task hint).
+    cannot be silently starved of the field it needs.
     """
     if not handoffs:
         return ""
@@ -341,7 +341,7 @@ def _render_history(
 def render_master_intent(
     brief: dict | None, requirements: list[dict] | None, *, max_reqs: int = 12
 ) -> str:
-    """Render the PINNED, non-truncatable master-intent block (T-DP5 §3.1).
+    """Render the PINNED, non-truncatable master-intent block (design pipeline §3.1).
 
     The overseer "holds and re-grounds the master intent so fresh-context stages
     never drift" (doc §3.1).  Master intent = the brief + the requirements.  It rides
@@ -398,12 +398,12 @@ def assemble_evidence(
     ``master_intent`` — the PINNED, non-truncatable brief+requirements block
     (``render_master_intent``).  It is placed FIRST and never budget-dropped, so the
     auditor always sees the goal even on a tiny local context where ``ledger_text``
-    truncates (T-DP5 §3.1 re-grounding).
+    truncates (AGENT_DESIGN_PIPELINE §3.1 re-grounding).
 
     ``org_concerns`` — list of unresolved-concern context dicts from
     ``org.unresolved_concern_contexts()``.  When non-empty the concerns are
     appended as an [ORG-CONCERNS] block so the auditor can flag long-running
-    worker issues (T-W22, §18 concern-aging rule).
+    worker issues (§18 concern-aging rule).
     """
     budget = budget or EvidenceBudget()
     parts: list[str] = [
@@ -579,7 +579,7 @@ def _fingerprint(verdict: dict) -> str:
     """Stable fingerprint for the repeat-misroute counter.
 
     Keyed on the DETERMINISTIC reentry decision the routing engine already
-    computed (target stage/role/feature from ``targeted_reentry``, T-DP5) —
+    computed (target stage/role/feature from ``targeted_reentry``) —
     never the model's free-text finding prose, so a repeatedly-misrouted
     correction still counts as a repeat when the LLM just rewords its finding
     (or picks a different severity). Falls back to class+finding only when no
@@ -793,7 +793,7 @@ class Overseer:
 
         ``org_concerns`` — optional list of aged unresolved concerns from
         ``org.unresolved_concern_contexts()``.  Forwarded to ``assemble_evidence``
-        so the [ORG-CONCERNS] block is visible to the auditor (T-W22, §18).
+        so the [ORG-CONCERNS] block is visible to the auditor (§18).
         """
         if trigger not in TRIGGERS:
             return AuditResult(
@@ -923,7 +923,7 @@ class Overseer:
         if not audit["tokens"]:
             audit["tokens"] = _estimate_tokens(self._system, user_msg, reply)
 
-        # T-DP5 reroute: attach the deterministic ``targeted_reentry`` (owning DP
+        # Reroute: attach the deterministic ``targeted_reentry`` (owning DP
         # stage + role) to every non-ok verdict BEFORE persisting, so the ledger
         # ``audit`` event records where each finding routes (never a blind restart).
         # Computed from the evidence ledger-kinds, not the model's prose (validate

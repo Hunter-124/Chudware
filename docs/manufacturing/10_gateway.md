@@ -98,7 +98,7 @@ Rules that make this boundary real:
   `if (method.rfind("mfg_", 0) == 0) return false;` plus the same early-`false` in
   `routeSimToCpp` / `routeEcadToCpp` / `routeFirmwareToCpp` and exclusion from the `engineBound`
   predicate at lines 1044-1048. So a `mfg_*` call always reaches the Python bridge, never
-  `engine::call`. This is 5 added lines in an existing integrator-owned file — no behavior change for
+  `engine::call`. This is 5 added lines in an existing maintainer-owned file — no behavior change for
   any existing method.
 - **The Python bridge is a proxy, not a decision maker.** `services/manufacturing/rpc/gateway_rpc.py`
   exports `WORKER_METHODS` (same registration pattern `services/worker_main.py` uses per
@@ -153,7 +153,7 @@ host/src/ui/manufacture/approval_dialog.h|.cpp     approval authoring (renders f
 fixtures/mfg/gateway/**                     golden Grbl/Moonraker/OctoPrint transcripts, journals
 ```
 
-Existing files touched, **append-only, integrator-owned**. Every row names exactly one owning wave and
+Existing files touched, **append-only, maintainer-owned**. Every row names exactly one owning wave and
 one owning slice, and a file in this table is edited by no other domain in that wave; §2.1 carries the
 batch-wide ownership assignments, including the two shared files this document does not itself edit:
 
@@ -506,13 +506,13 @@ confirmation for this resume. Violate any → the run goes `abandoned`.
              "established_by":"res:preflight_evidence:01J…"}},
  "preflight":{"evidence":["res:preflight_evidence:01J…","res:post_check:01J…"],
               "gate_report":"res:gate_report:01J…"},
- "approver":{"identity":"hunter","auth":"os_seat+pin","at_mono_ns":…},
+ "approver":{"identity":"alex","auth":"os_seat+pin","at_mono_ns":…},
  "expiry":{"t_mono_ns":…,"ttl_ms":3600000},
  "exercisable_by":"human_only",
  "nonce":{"value":"…","state":"unburned|burned|void","burned_at_seq":null},
  "max_starts":1,
  "initiator":null,
- "attendance":{"mode":"physical_attended","attested_by":"hunter","at_seq":918099},
+ "attendance":{"mode":"physical_attended","attested_by":"alex","at_seq":918099},
  "spindle_authority":"manual_confirmed"}
 ```
 
@@ -682,7 +682,7 @@ Evidence outside the first two is a **named refusal** recorded in the gate repor
            {"guard":"spindle_authority_satisfied","verdict":"fail",
             "why":"authority=manual_confirmed and no confirmation for run:01J…"},
            {"guard":"interlock_engaged","omitted":"machine_class=open_frame_router"}],
- "required_set":["…"],"waivers":[{"guard":"…","by":"hunter","reason":"…","at_seq":918098}],
+ "required_set":["…"],"waivers":[{"guard":"…","by":"alex","reason":"…","at_seq":918098}],
  "verdict":"fail","rejecting":["stage1:probe_evidence","stage2:spindle_authority_satisfied"]}
 ```
 
@@ -1031,8 +1031,8 @@ gateway-owned, both in **W1.1**, ahead of every MCP-registration wave in this ba
 Enabling `manufacture` is then a human settings act — an explicit `agent.tool_families.manufacture =
 true`, or a role assignment — and the self-enable path (`enable_tools`) cannot silently add motion
 surface, because a default-off family is not something a model can grant itself.
-`RobotArchitecture` found this and keeps the analysis credit; it does not keep the ownership, because
-its wave is not first (§2.1). `services/agent/test_manufacture_family_default_off.py` asserts the
+The robot design identified this gap; the gateway owns the fix because its wave is first
+(§2.1). `services/agent/test_manufacture_family_default_off.py` asserts the
 property three ways and is, with the two edits, a **hard predecessor of W4.3 and of every peer's
 MCP-registration wave** (§19). Without it, the whole Manufacture surface — including the three
 motion-class tools below — would ship enabled by default the moment any MCP wave landed, and the only
@@ -1909,7 +1909,7 @@ exists, is closed here and named. Nothing is deferred: every row names a documen
 | B8 additive mints its own durable `seq` | P1 | **owned elsewhere**; `MFG-SEQ-1` is unchanged and additive's kind table — with the file-local ordinal renamed `record_index` — is now a W1.1 exit criterion | §24 rule 1, §24.3(iii); additive §3.6/§8.4 → additive owner |
 | B9 metrology computes its own closure and keeps a second store | P1 | **owned elsewhere**; `MFG-CLOSURE-1` and the mirror-only status of a domain ledger are unchanged here | §24.1, §24.2; metrology §6.3 → metrology owner |
 | B10 four domains' durable kinds absent from the W1.1 table | P0 | **closed here** — the table is total over ten domains: turning's six `cam.turn.*` plus `cam.turn.capability` accepted as submitted, and metrology, additive and perception must submit both-column tables plus a capability kind before W1.1 closes. W1.1 does not close until totality holds | §24.3(iii), §24.11(1) (`MFG-KIND-3`, `MFG-CAPKIND-1`) |
-| B11 family-off-by-default has no owner and no wave | P0 | **closed here** — the two `services/agent/config.py` edits plus `test_manufacture_family_default_off.py` are gateway-owned, listed in §2 as an integrator seam, land in **W1.1**, and are a hard predecessor of W4.3 and of every peer's MCP-registration wave; robot keeps the analysis credit, not the ownership | §2, §2.1, §17, §19, §20 test 13 (`MFG-FAM-1`) |
+| B11 family-off-by-default has no owner and no wave | P0 | **closed here** — the two `services/agent/config.py` edits plus `test_manufacture_family_default_off.py` are gateway-owned, listed in §2 as a shared seam, land in **W1.1**, and are a hard predecessor of W4.3 and of every peer's MCP-registration wave; robot keeps the analysis credit, not the ownership | §2, §2.1, §17, §19, §20 test 13 (`MFG-FAM-1`) |
 | B12 second/unnamed MCP families | P1 | **gateway half closed here** — §17's ruling enumeration is now total over ten domains and states plainly that a separate or unnamed family ships **enabled**; perception, additive and metrology register through `view(mcp, "manufacture")` in their own documents, and §20 test 12 asserts no second manufacturing family id exists | §17 (`MFG-FAM-2`), §20 test 12; perception §4.7/§10.2, additive §5.3, metrology §10 → their owners |
 | B13 `worker_rpc.md` §7 claimed twice; events amendment unowned | P1 | **closed here** — one section per domain allocated and published (gateway §7, monitoring §8, then cut, turn, PnP, robot, twin, additive, metrology, perception); the `contracts/events.md` §5 subscription-lane rule and the `observer` client kind are gateway-owned, and their **text lands in W1.1** so monitoring's W2 stream is never degraded to poll-only, with the streaming implementations still in W4.1 | §2, §2.1, §15, §19 (`MFG-SECT-1`, `MFG-SUB-1`, `MFG-OBS-1`) |
 | B14 `tool_registry.py` has five claimants | P1 | **closed here** — Gateway is sole owner for the risk-class change in one wave; the other four claimants' rows land as data supplied to that owner or in a strictly later wave; the unchanged-`classify_risk` assertion is the shared acceptance check for all five | §2, §2.1, §20 test 12 (`MFG-OWN-1`) |

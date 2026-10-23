@@ -709,7 +709,7 @@ struct PushPullDrag {
     std::string param;                // e.g. "depth"
     double      newValue  = 0.0;
     bool        clamped   = false;
-    // T-PERF2: single-in-flight latest-wins (revert+push_pull pair on AsyncRpc FIFO).
+    // Single-in-flight latest-wins (revert+push_pull pair on AsyncRpc FIFO).
     uint64_t  gen         = 0;
     bool      inFlight    = false;
     bool      pending     = false;    // curDist changed while a sample was open
@@ -796,7 +796,7 @@ struct AsmDrag {
     float       worldPerPx = 1.0f;    // world(mm) per screen pixel at the component depth (at press)
     ImVec2      lastSent = {1e30f, 1e30f};  // last cursor sample actually kicked (throttle)
     ImVec2      curPos   = {0, 0};    // latest mouse (for pending)
-    // T-PERF2: single-in-flight latest-wins (revert + doc_solve_mates pair).
+    // Single-in-flight latest-wins (revert + doc_solve_mates pair).
     uint64_t    gen      = 0;
     bool        inFlight = false;
     bool        pending  = false;
@@ -1411,7 +1411,7 @@ static void normalToSelectionOrNearestAxis(AppState& st, bool inSketch) {
             if (!selItem.selector.empty()) {
                 try {
                     auto sj = nlohmann::json::parse(selItem.selector);
-                    // Selector format per docs/contracts/selectors.md: for cylinder/cone the
+                    // Selector format per contracts/selectors.md: for cylinder/cone the
                     // selector carries "axis": [x,y,z] (unit vector along the axis).
                     if (sj.contains("axis") && sj["axis"].is_array() && sj["axis"].size() == 3) {
                         axNx = sj["axis"][0].get<float>();
@@ -1846,7 +1846,7 @@ static bool ppHandleGeometry(AppState& st, const Renderer& renderer, const ImVec
     return true;
 }
 
-// T-PERF2: queue a latest-wins push-pull sample. The kick issues doc_revert then doc_push_pull
+// Queue a latest-wins push-pull sample. The kick issues doc_revert then doc_push_pull
 // back-to-back on AsyncRpc FIFO so the checkpoint envelope stays paired without blocking GL.
 static void ppKickAsync(AppState& st);
 
@@ -2074,7 +2074,7 @@ static void addComponentContextRef(AppState& st, const std::string& cid,
 }
 
 
-// T-PERF2: latest-wins async move-component (revert + doc_solve_mates pair on AsyncRpc FIFO).
+// Latest-wins async move-component (revert + doc_solve_mates pair on AsyncRpc FIFO).
 static void asmDragKickAsync(AppState& st);
 
 static void asmDragAbandon(AppState& st) {
@@ -2499,7 +2499,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         s_clearMin = clr0;
         s_clearMax = clr1;
         const ImVec2 clrC((clr0.x + clr1.x) * 0.5f, (clr0.y + clr1.y) * 0.5f);
-        // T-RF13: feed the adaptive quality ladder this frame's cadence (io.DeltaTime carries
+        // Feed the adaptive quality ladder this frame's cadence (io.DeltaTime carries
         // the vsync-cliff signal the ladder keys on). No-op unless adaptive is enabled.
         renderer.noteFrame(ImGui::GetIO().DeltaTime * 1000.0f);
         // C18: lock the camera normal to the sketch plane while editing a sketch — UNTIL the user
@@ -2545,7 +2545,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             if (inSketch || st.sketchPlanePickActive || ppPmNow) {
                 ppCancel(st);
             } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) && !s_pp.finishing) {
-                // T-PERF2: async commit; active clears when the commit sample drains.
+                // Async commit; active clears when the commit sample drains.
                 ppQueueSample(st, s_pp.curDist, /*commit=*/true);
             }
         }
@@ -2576,7 +2576,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             if (inSketch || st.sketchPlanePickActive || asmPmNow || !docIsAssembly(st)) {
                 asmDragCancel(st);
             } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) && !s_asmDrag.finishing) {
-                // T-PERF2: async commit; active clears when the commit sample drains.
+                // Async commit; active clears when the commit sample drains.
                 asmDragQueue(st, io.MousePos, /*commit=*/true);
             }
         }
@@ -2929,7 +2929,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             st.overlays->setSectionClip(clipCount, clipN, clipOff);
             // HiDPI: overlay line/point widths are authored in logical px; the overlays draw into
             // the supersampled FBO, so fold BOTH the supersample factor and the UI scale in.
-            // T-RF13: renderScale (adaptive quality) shrinks the FBO below display res — fold
+            // renderScale (adaptive quality) shrinks the FBO below display res — fold
             // that in too so authored widths stay constant in screen px after the upscale.
             st.overlays->setWidthScale((float)renderer.supersample() * renderer.renderScale() *
                                        ui::uiScale);
@@ -3451,7 +3451,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // view so the live edits are clearly attributed to the AI (not the user). Same run-lifecycle
         // signal as the Activity panel; non-intrusive top-center pill.
         if (st.agentV2Running) drawAiActivityBadge(cr0, cr1, st.agentV2Status);
-        // T-RF13: subtle quality readout while the adaptive ladder is holding a reduced step
+        // Subtle quality readout while the adaptive ladder is holding a reduced step
         // (hidden at FULL or when adaptive is off — native default). Bottom-right, dim text.
         if (renderer.adaptiveQuality() && renderer.qualityStep() != Renderer::QualityStep::Full) {
             char qbuf[64];
@@ -3638,7 +3638,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
 
                 // Drag: project cursor motion to a world target and solve (throttled ~3px;
-                // T-PERF2 latest-wins async — at most one pair in flight).
+                // latest-wins async — at most one pair in flight).
                 if (s_asmDrag.active && !s_asmDrag.finishing &&
                     ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                     st.requestCursor(ui::CursorKind::Hand);
@@ -3736,7 +3736,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
 
                 // Drag: convert cursor motion to a cumulative signed distance and queue a sample
-                // (T-PERF2 latest-wins async; ~0.05mm throttle so steady holds don't spam).
+                // (latest-wins async; ~0.05mm throttle so steady holds don't spam).
                 // Screen direction is re-derived every frame from the drawn arrow endpoints
                 // (tipPos - centroid) so the handle always moves WITH the cursor — single source
                 // of truth for sign (no separate probe-normal projection that can invert).
@@ -5672,7 +5672,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
             }
         }
-        // T-G19: The far-right "Active Feature" dimension readout panel that used to be pinned
+        // The far-right "Active Feature" dimension readout panel that used to be pinned
         // top-right (left of the Copilot column) was REMOVED. It mirrored the PM's dimension
         // fields (Depth, Draft angle, radii, …) for EVERY feature via dimCandidates(activeFid),
         // producing a depth/draft double-display (once in the PM, once behind the

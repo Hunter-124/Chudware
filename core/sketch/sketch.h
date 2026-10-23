@@ -60,7 +60,7 @@ struct SketchSolution {
 // that run under the global doc lock (the apply_ops auto-coincident pass); parity /
 // oracle-facing callers (check_sketch, the compile pipeline) leave it unset so their
 // convergence behavior is unchanged.
-// `interactive` (T-PERF8) enables LDLT-first LM steps, in-trial deadline checks,
+// `interactive` enables LDLT-first LM steps, in-trial deadline checks,
 // single-QR redundancy attribution, and spline-tangency (p,q) warm-start. Default
 // false keeps the exact Python-oracle parity path byte-identical.
 SketchSolution solve_sketch(const nlohmann::json& sketch, const nlohmann::json& env);
@@ -100,7 +100,7 @@ std::optional<double> measure_constraint(const nlohmann::json& constraint,
 std::map<std::string, std::string> warm_gate_decision(const nlohmann::json& sketch,
                                                       const SolveState& warm);
 
-// ---- T-W2 sketch completion suite ------------------------------------------
+// ---- sketch completion suite -----------------------------------------------
 //
 // Free-variable narration and endpoint enumeration reused by the doc-layer
 // doc_sketch_health / doc_sketch_auto_constrain RPCs. Both are read-only scans over

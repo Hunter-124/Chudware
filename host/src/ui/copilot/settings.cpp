@@ -1,4 +1,4 @@
-// Copilot AI settings (T-RF6 split of legacy_chat.cpp): the shared AI settings sections
+// Copilot AI settings: the shared AI settings sections
 // (provider/model/auth, generation, privacy, manage-models — ui::drawAiSettingsSection, called
 // once per section by the Settings modal's Providers tab), the searchable model dropdown, model
 // availability probing, and provider-usability gating (providerUsable / cloud+moonshot key

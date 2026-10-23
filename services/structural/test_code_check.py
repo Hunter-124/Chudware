@@ -301,7 +301,7 @@ class TestAgenticRAG:
         """Without a provider, agentic_rag returns a list (graceful no-op for missing corpus)."""
         # CHUDWARE_CODE_CORPUS_PATH points to a non-existent dir → advisory citation returned
         import os
-        os.environ.setdefault("CHUDWARE_CODE_CORPUS_PATH", "/tmp/does_not_exist_T-D4-test")
+        os.environ.setdefault("CHUDWARE_CODE_CORPUS_PATH", "/tmp/does_not_exist_code_corpus_test")
         result = agentic_rag("deflection", "CA")
         assert isinstance(result, list)
         assert len(result) >= 1

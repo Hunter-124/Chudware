@@ -1,6 +1,6 @@
 # Contracts Summary
 
-52 frozen contracts under `contracts/`:
+51 frozen contracts under `contracts/`:
 
 - `README.md` — contracts/ — frozen interface seams
 - `advisor.md` — contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.7)
@@ -21,8 +21,7 @@
 - `fabrication_services.md` — Contract: Fabrication Services — quote-your-own-geometry (`aicad.fab/1`)
 - `feature_params.md` — Contract: Feature Parameters — v1
 - `firmware_rpc.md` — Contract: Firmware Toolchain RPC — v1
-- `geom_labels.md` — chudware.geomlabel/1 — canonical per-face geometry labels (ViewNet)
-- `gsl_ser.md` — gsl-ser/v1 — canonical GSL text serialization (Pillar 13, stage 0)
+- `gsl_ser.md` — gsl-ser/v1 — canonical GSL text serialization
 - `hydraulic_schema.md` — Contract: `aicad.hydraulic/1` — ISO 1219 Hydraulic Circuit Schema
 - `icons.md` — Contract: Icon Pipeline — v1
 - `industrial_schema.md` — Contract: industrial process sizing RPCs (`vessel_size`, `duct_size`)

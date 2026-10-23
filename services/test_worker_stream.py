@@ -1,7 +1,7 @@
 """Worker-layer tests: run_model assembly detection + the streaming event wire format.
 
-(T-RF5 removed the agent_design session-reuse / plan / provider-override tests with the
-agent_design RPC itself.)
+(The agent_design session-reuse / plan / provider-override tests were removed along
+with the agent_design RPC itself.)
 """
 from __future__ import annotations
 

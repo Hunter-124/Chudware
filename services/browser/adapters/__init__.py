@@ -1,7 +1,7 @@
-"""services/browser/adapters — the SourceAdapter contract + registry (T-X2).
+"""services/browser/adapters — the SourceAdapter contract + registry.
 
 Every adapter searches a source site (under the user's own saved browser
-session, T-X1) for candidate parts/documents and acquires a chosen result,
+session) for candidate parts/documents and acquires a chosen result,
 landing the file locally with a provenance envelope styled on the
 ``aicad.calc/1`` envelope (``contracts/advisor.md`` §7) and the ``research_*``
 answer envelope (``contracts/research_tools.md`` §1): every acquired artifact
@@ -12,8 +12,8 @@ GrabCAD and TraceParts lives in each module's site config (URLs, regexes,
 license note), not in divergent control flow. No adapter imports Playwright
 directly; only :mod:`services.browser.session`'s three entry points.
 
-This package intentionally does NOT import ``services.agent`` (workstream W's
-surface, out of scope here) — the ``login_required`` question below matches
+This package intentionally does NOT import ``services.agent`` (the agent
+layer's surface) — the ``login_required`` question below matches
 the frozen ``contracts/interaction.md`` §1/§2 shape by hand so adapters stay
 decoupled from the agent loop's implementation.
 """
@@ -101,7 +101,7 @@ def login_wizard_sites() -> list[str]:
 def provenance_envelope(*, source_url: str, session_profile_used: str, license_note: str,
                         artifact_path: str | None = None, fetched_ts: str | None = None,
                         **extra: Any) -> dict:
-    """The T-X2 acquisition envelope. Additive fields pass through ``extra`` and sit
+    """The acquisition envelope. Additive fields pass through ``extra`` and sit
     alongside the required four, matching the "helpers add fields, never rename them"
     rule shared by ``contracts/advisor.md`` §7 and ``contracts/research_tools.md`` §1."""
     env: dict[str, Any] = {
@@ -155,7 +155,7 @@ def distributor_only_sites() -> list[str]:
 
 def terms_confirmation_required(site: str, url: str, terms_summary: str) -> dict:
     """Same shape as :func:`login_required` for a per-download terms click-through this
-    adapter must not accept on the user's behalf (T-X2 TraceParts case)."""
+    adapter must not accept on the user's behalf (e.g. TraceParts)."""
     question = {
         "id": f"browser_terms.{slug(site)}",
         "kind": "approval",
@@ -173,7 +173,7 @@ def is_login_wall(content: str, markers: tuple[str, ...]) -> bool:
     """True when fetched HTML looks like a login page rather than the requested content.
 
     A simple substring heuristic (each site config supplies its own marker
-    strings) — real markup verification is T-X6's gated integration-test job,
+    strings) — real markup verification is the gated integration suite's job,
     not something this v1 can confirm against a live site without a login.
     """
     return any(marker in content for marker in markers)
@@ -241,7 +241,7 @@ from . import (acehardware, fastenal, grainger, harborfreight, homedepot,  # noq
                lowes, metalsdepot, onlinemetals, tractorsupply)
 # Wave 3 (2026-07-07): supplier expansion — hydraulics/fluid-power, Chinese &
 # foreign electronics, materials, engineered-products CAD portals + the RE-feed
-# datasheet/standards DBs (see docs/review/parts_supplier_research.md).
+# datasheet/standards DBs.
 from . import (boschrexroth, hydraforce, parker,  # hydraulics CAD  # noqa: E402,F401
                speedymetals, coremarkmetals, professionalplastics,  # metals/plastics
                rockwest, acpcomposites, fibreglast,  # composites

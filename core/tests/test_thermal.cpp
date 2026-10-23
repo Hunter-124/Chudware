@@ -257,7 +257,7 @@ TEST_CASE("thermal: pure-Neumann (no fixed-T, no convection) is reported singula
     CHECK(!r.error.empty());
 }
 
-// ═══════════════════════════ Transient cases (T-FIN18) ══════════════════════════════════
+// ═══════════════════════════ Transient cases ════════════════════════════════════════════
 
 // ── Case T1: 1D slab quench vs the analytic Fourier series (tet4, lumped C). ────────────
 // A slab 0..L at uniform T0 has both faces suddenly held at 0. Analytic (Incropera §5.5):
@@ -632,7 +632,7 @@ TEST_CASE("thermal: a pre-cancelled token aborts before assembly") {
 // numbering 1:1 with the polymesh mesh the adaptive route refines through, so a repaired
 // mesh reaches the solvers with a few nodes that belong to no element (fea_static
 // documents and eliminates exactly this). Their rows are identically zero, so the system
-// is singular however it is factored: the fin25 sensor board arrived with 9 such nodes
+// is singular however it is factored: the sensor-node demo board arrived with 9 such nodes
 // out of 50,550 and CHOLMOD, SimplicialLDLT and SparseLU all failed in turn
 // ("iteration-matrix factorization failed"). Both thermal entry points must eliminate
 // them, keep the physics of the remaining domain EXACT, and leave them out of the

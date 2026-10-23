@@ -1,7 +1,7 @@
 """
 samples/tours/bracket_tour.py — Guided tour: "Designing a Mounting Bracket"
 
-This is the T-Q3 "scripted copilot conversation" tour. It uses the same
+This is the "scripted copilot conversation" tour. It uses the same
 core_bridge + cam_program surface as the gallery samples — no live MCP server
 or human in the loop needed. Runs end-to-end headless.
 

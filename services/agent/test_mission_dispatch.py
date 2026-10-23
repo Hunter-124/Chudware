@@ -1,4 +1,4 @@
-"""Tests for mission_dispatch.py + the agent_turn dispatch order (T-W32).
+"""Tests for mission_dispatch.py + the agent_turn dispatch order.
 
 DoD coverage: the run-scoped dispatcher resolves the six named tool families
 (ledger_get/ledger_note, dag_plan, ask_user, delegate, part_search) with mission
@@ -241,7 +241,7 @@ class TestLedgerTools:
         assert out["ok"] is False and "provenance" in out["error"]
 
     def test_geometry_spec_requires_provenance(self, md):
-        # T-DP1: geometry_spec is the geometry-side twin of the dimension rule —
+        # geometry_spec is the geometry-side twin of the dimension rule —
         # the mission-dispatch back door enforces provenance too.
         out = md.ledger_note(
             kind="geometry_spec", payload={"id": "G1", "realizes": ["FT1"]}
@@ -254,7 +254,7 @@ class TestLedgerTools:
         assert ok["ok"] is True
 
     def test_dp_kinds_accepted_and_readable(self, md):
-        # T-DP1: the four design-pipeline kinds write and read back through dispatch.
+        # The four design-pipeline kinds write and read back through dispatch.
         assert md.ledger_note(
             kind="feature",
             payload={"id": "FT1", "function": "mount", "driving_requirement": "R1"},

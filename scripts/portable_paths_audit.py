@@ -3,7 +3,7 @@
 
 This gate exists because of a real outage, not a hypothetical one. On
 2026-08-10 the first Windows CI run of this repository could not even start:
-84 files under ``tools/flywheel/bench/gym/reports/runs/`` sat in directories
+84 files under the design gym's run-report directory sat in directories
 named after model ids — ``C1_open_xai:grok-4-5_s1``,
 ``C1_local_ollama:llama3.2:latest_s1``,
 ``C1_open_openrouter:deepseek/deepseek-chat-v3.1_s1``. NTFS reserves ``:`` for

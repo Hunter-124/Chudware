@@ -135,9 +135,9 @@ zero-length `dir` raise `invalid_op`. A reference that cannot be projected raise
 the `unsupported_ref` it bubbles up). Like all op errors these reject the whole batch with no state
 change (§2).
 
-> **Amendment (T-BL43, 2026-07-04) — `sketch_convert` projection math upgraded.** The op is now
-> implemented in the C++ engine (it was contracted in C53 but had no engine handler — every GUI
-> Convert Entities click failed with `unsupported`). Per Hunter's 2026-07-03 direction the
+> **Amendment (2026-07-04) — `sketch_convert` projection math upgraded.** The op is now
+> implemented in the C++ engine (it was contracted above but had no engine handler — every GUI
+> Convert Entities click failed with `unsupported`). Per a 2026-07-03 design decision the
 > projection is now true orthographic projection along the sketch normal (OCCT `GeomProjLib`),
 > superseding the "same math as `sketch_project_ref`" bullet above for this op:
 > a **face** Ref projects ALL its boundary wires (outer + hole loops) as entities — not just a
@@ -152,7 +152,7 @@ change (§2).
 > read-only companion is `sketch_project_entities` `{doc_id, sketch, refs:[Ref…]}` →
 > `{ok, entities (no ids, construction:true), approx, sources, plane_frame}`.
 
-> **Amendment (T-BL49, 2026-07-07) — `sketch_convert` is now ASSOCIATIVE by default.** New
+> **Amendment (2026-07-07) — `sketch_convert` is now ASSOCIATIVE by default.** New
 > optional field `associative:bool` (default `true`): each Ref is also recorded on the sketch as
 > a persistent external reference (`params.external_refs[]`, id family `x<N>` — see
 > doc_schema.md §3.5) owning the entities it produced. On EVERY later rebuild (any mutating
@@ -179,7 +179,7 @@ change (§2).
 > at CREATION time still fails the op (`convert_failed`/`unsupported_ref`) — staleness only
 > applies to later rebuilds.
 
-> **Amendment (T-BL51, 2026-08-03) — external-ref re-projection is part of the edit's undo
+> **Amendment (2026-08-03) — external-ref re-projection is part of the edit's undo
 > step.** The refresh runs on the batch's working tree BEFORE the undo snapshot is committed,
 > so `doc_undo` restores the source geometry AND the projection that belonged to it in one
 > step (converted entities never linger at coordinates their source no longer has); `doc_redo`

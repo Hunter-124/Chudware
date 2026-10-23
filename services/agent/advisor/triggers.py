@@ -1,4 +1,4 @@
-"""Trigger-based context injection — aicad.trigger/1 (T-W21).
+"""Trigger-based context injection — aicad.trigger/1.
 
 Contract: ``contracts/advisor.md`` §20 (FROZEN).
 
@@ -235,7 +235,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "budget_tokens": 200,
         "cooldown_turns": 10,
     },
-    # T-DP6 pre-op advisory injection triggers (append-only per DP3 coordination note).
+    # Pre-op advisory injection triggers (append-only).
     # Each fires BEFORE the model operates so relevant facts are in context at op time.
     {
         "id": "interference_pre_op",
@@ -303,7 +303,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "cooldown_turns": 8,
     },
     {
-        # T-DP3: sheet-metal bend — contract design_pipeline.md §8 "helper to add".
+        # Sheet-metal bend — contract design_pipeline.md §8 "helper to add".
         "id": "sheet_bend",
         "match": {
             "keywords": [
@@ -326,7 +326,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "cooldown_turns": 8,
     },
     {
-        # T-DP3: molded draft — contract design_pipeline.md §8 "helper to add".
+        # Molded draft — contract design_pipeline.md §8 "helper to add".
         "id": "molded_draft",
         "match": {
             "keywords": [

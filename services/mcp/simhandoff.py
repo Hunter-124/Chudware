@@ -16,8 +16,8 @@ Design rules (mirroring the contract):
   * Units and provenance are explicit, always.
 
 First conforming pair: ``piping_cfd_handoff`` / ``piping_verify_cfd``
-(services/mcp/piping_tools.py). Future consumers: T-FIN16 (ECAD→thermal FEA),
-T-FIN19 (thermal→CFD conjugate), T-FIN20 (motion→FEA reactions), T-FIN22 (hydraulic).
+(services/mcp/piping_tools.py). Further consumers: ECAD→thermal FEA,
+thermal→CFD conjugate, motion→FEA reactions, hydraulic.
 """
 
 from __future__ import annotations

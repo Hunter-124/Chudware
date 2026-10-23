@@ -1,4 +1,4 @@
-"""CAD document-lifecycle MCP tools (T-RF8 split of cad_tools.py): new_part, add_features, get_part, undo/redo, save/close/recover, configurations, material, engine_profile, cad_guide."""
+"""CAD document-lifecycle MCP tools (split out of cad_tools.py): new_part, add_features, get_part, undo/redo, save/close/recover, configurations, material, engine_profile, cad_guide."""
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
@@ -7184,7 +7184,7 @@ _SUMMARY_LIST_KEEP = 16
 
 
 def register_cad_doc_tools(mcp: FastMCP) -> None:
-    """CAD document-lifecycle MCP tools (T-RF8 split of cad_tools.py): new_part, add_features, get_part, undo/redo, save/close/recover, configurations, material, engine_profile, cad_guide."""
+    """CAD document-lifecycle MCP tools (split out of cad_tools.py): new_part, add_features, get_part, undo/redo, save/close/recover, configurations, material, engine_profile, cad_guide."""
 
 
     # ---------------------------------------------------------------- knowledge
@@ -7227,7 +7227,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         "code_compliance" (code_check — building-code compliance with RAG citations),
         "design_review" (design_review — one-call geometry battery narrated verdict),
         "doc_diff" (doc_diff_tool — semantic feature-level diff between two revisions),
-        "plm" (project-vault versioning stub — T-R2 fills this),
+        "plm" (project-vault versioning),
         "tolerance_stackup" (stackup_analyze — 1D worst-case + RSS tolerance stack-up),
         "sketch3d" (sketch3d_new/add_curves/get/as_sweep_guide + render_sketch/
         sketch_preview_text/doc_sketch_contact_sheet — 3D free-space sketch curves
@@ -7290,7 +7290,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         breakdown also rides along on "stop"/"report" under "phases".
           "reset_phases"  clear the phase registry (call before a measured run).
 
-        top/min_samples/write_folded/write_speedscope tune the sampling report (see PROFILER.md).
+        top/min_samples/write_folded/write_speedscope tune the sampling report.
         """
         try:
             a = (action or "status").strip().lower()
@@ -7350,7 +7350,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         row — both carry doc_id / name / revision / feature_count. A resumed part that
         ALREADY CARRIES features says so in the note: inheriting a half-built body
         silently is what produced twelve "boss added no material (it is buried inside the
-        body)" failures (docs/REFACTOR_LOG.md ~5309), so the count always travels."""
+        body)" failures, so the count always travels."""
         did = entry["doc_id"]
         _CUR["doc_id"] = did
         note_touched_doc(did)
@@ -8099,7 +8099,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 before_hist = _face_hist(d)
                 before_vol = _LAST_VOLUME.get(d)
 
-                # T-W12 auto-preflight: dry-run on shadow clone before mutating.
+                # Auto-preflight: dry-run on shadow clone before mutating.
                 # Freedom rule: fail verdict never blocks — we proceed regardless;
                 # if verdict==fail we log a preflight_overridden event after apply.
                 _pf_result: dict = {}
@@ -8225,8 +8225,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                             f'(plm_checkpoint / plm_timeline); this document was minted '
                             f'as "{mint_actual_name}", so keep calling it '
                             f'"{mint_actual_name}" from now on')
-                    # T-BL22: rebuild failure -> IP-18 regen_diagnose fix-preview card
-                    # (T-H11 seam). Diagnoses the FAILED tree from the ops response (the
+                    # Rebuild failure -> IP-18 regen_diagnose fix-preview card.
+                    # Diagnoses the FAILED tree from the ops response (the
                     # doc itself was already rolled back above), logs the model call as an
                     # IP-18 correction trace, and attaches the accept/edit/reject card to
                     # the failure response for the copilot/caller to surface. Best-effort:
@@ -8368,7 +8368,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     saved = _project_save(d)
                     if saved:
                         out["saved_path"] = saved
-                # T-W12: attach preflight advisory items and log override event.
+                # Attach preflight advisory items and log override event.
                 if _pf_result:
                     adv_items = _pf_result.get("advisory_items") or []
                     if adv_items:

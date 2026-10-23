@@ -1,4 +1,4 @@
-"""Tests for the PLM worker-RPC seam (T-R5, services/plm/worker_rpc.py).
+"""Tests for the PLM worker-RPC seam (services/plm/worker_rpc.py).
 
 Covers the in-editor GUI surface:
   * every worker method returns the contract §0 dict envelope (never raises)
@@ -243,7 +243,7 @@ def test_compare_semantic(project):
 
 
 # ---------------------------------------------------------------------------
-# release -> auto-branch draft -> discard (the T-R5 toast round trip)
+# release -> auto-branch draft -> discard (the toast round trip)
 # ---------------------------------------------------------------------------
 
 def test_release_then_start_rev_then_discard(project):
@@ -332,7 +332,7 @@ def test_draft_manual_fallback_without_local_model(project, monkeypatch):
     assert out["ok"]
     assert out["source"] == "manual"
     assert out["message"] == ""          # plain manual box in the GUI
-    assert out["summary"]                # T-R3 context still shown
+    assert out["summary"]                # change-summary context still shown
     _assert_no_git_vocab(out["summary"])
 
 

@@ -1,6 +1,6 @@
 """Mega-25 fixes — Y25 simulate schematic doc + Z25 clearance-aware board chain.
 
-Grounded in mega-24 a3 fingerprints (reports/runs/mega-24/):
+Grounded in mega-24 a3 fingerprints:
 
   Y25 / AC5 — forced/model/reviewer ecad_simulate received PCB board
               doc 767f0f0fa678, not schematic a6e440d0e2fc

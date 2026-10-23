@@ -57,7 +57,7 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
                           const std::vector<std::vector<uint32_t>>& body_idx,
                           const FlowParams& fp, double* reynolds_out = nullptr);
 
-// ── sim_run_flow_stl (host sim-panel flow path; T-RF wave: kills the Python sim worker) ──
+// ── sim_run_flow_stl (host sim-panel flow path; replaces the Python sim worker) ──
 //
 // JSON-in/JSON-out front-end mirroring the retired Python sim worker's sim_run_flow envelope
 // (engine_oracle/sim/worker.py). Params (all optional except stl_path):

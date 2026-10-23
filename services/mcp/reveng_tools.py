@@ -1,4 +1,4 @@
-"""Reverse Engineering MCP tools — COMPAT FACADE (T-RF8). Family ``reveng``
+"""Reverse Engineering MCP tools — COMPAT FACADE. Family ``reveng``
 (contracts/reveng.md §8).
 
 The tool implementations now live in reveng_session_tools + reveng_build_tools over the

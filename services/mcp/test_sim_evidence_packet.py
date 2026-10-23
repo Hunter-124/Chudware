@@ -1,6 +1,6 @@
 """Evidence packets are never overwritten, and a packet is checkable before it is cited.
 
-Both behaviours are regressions of a live failure (2026-09-05, ME 490 phase 5B): a mission
+Both behaviours are regressions of a live failure (2026-09-05): a mission
 re-ran FRAME-PEDAL-BRAKE into the folder that already held the released bonded packet, and
 `result.json` / `inputs.json` / `provenance.json` from the earlier run were gone. The
 never-overwrite rule lived only in the project's runbook, so the only thing enforcing it

@@ -1,4 +1,4 @@
-"""services.ecad.session — compat shim over the C++-backed session facade (T-RF20).
+"""services.ecad.session — compat shim over the C++-backed session facade.
 
 The session machinery (doc registry, apply_ops, undo/revisions, compile fields)
 now lives in the C++ core behind RPC; :class:`services.mcp.ecad_common._SessionFacade`

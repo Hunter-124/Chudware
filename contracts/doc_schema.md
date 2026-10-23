@@ -208,7 +208,7 @@ The solver reports per-entity status (`under` | `full` | `over`) and sketch DOF;
 never persists solve state. Entity coordinates stored in the document are the **last solved**
 positions (so documents open without solving).
 
-### 3.5 External references (associative Convert Entities — T-BL49, 2026-07-07)
+### 3.5 External references (associative Convert Entities — 2026-07-07)
 
 A sketch may additionally carry `params.external_refs: [ExternalRef…]` — the persistent record
 behind associative `sketch_convert` (doc_ops.md):
@@ -260,7 +260,7 @@ A `sketch3d` is a feature (`type:"sketch3d"`) with **no refs** and
 | `line` | `p1:[x,y,z]`, `p2:[x,y,z]` |
 | `arc` | `p1:[x,y,z]`, `pm:[x,y,z]`, `p2:[x,y,z]` — **THREE-POINT** arc: start / interior "through" point / end. (Chosen over center+normal+radius+angles: uniform point parameterization — no unit-normal normalization in the solve, natural endpoint handles for chaining, 1:1 GUI point drags. Collinear `p1`/`pm`/`p2` is degenerate and fails edge compile.) |
 | `spline` | `points:[[x,y,z],…]` (≥ 2; cubic interpolation through every point, like the 2D `spline`) |
-| `eq_curve3d` (T-3DEQ) | `xt:str`, `yt:str`, `zt:str`, `t1`, `t2` — parametric `x(t)/y(t)/z(t)` expression strings over `t∈[t1,t2]`, evaluated against the document equation grammar (§4 — degrees trig, globals; `t` is bound per-sample, not a global name). Compiled by sampling 33 points and interpolating a cubic BSpline through them (mirrors the 2D `eq_curve`'s sample-to-spline compile). **Solver: 0 DOF — equation-fixed** (rigid, like the 2D `eq_curve`): `p1`/`p2` (the endpoints at `t1`/`t2`) are pinned by an implicit fix residual right after allocation, so they are usable as `coincident`/`distance`/`point_on` targets for chaining but never move under any other constraint. Use for helices, sinusoidal routing runs, etc. — e.g. a helix: `xt:"R*cos(t)"`, `yt:"R*sin(t)"`, `zt:"P*t/360"`, `t1:0`, `t2:"720"` (two turns, `P`=pitch/turn, degrees). |
+| `eq_curve3d` | `xt:str`, `yt:str`, `zt:str`, `t1`, `t2` — parametric `x(t)/y(t)/z(t)` expression strings over `t∈[t1,t2]`, evaluated against the document equation grammar (§4 — degrees trig, globals; `t` is bound per-sample, not a global name). Compiled by sampling 33 points and interpolating a cubic BSpline through them (mirrors the 2D `eq_curve`'s sample-to-spline compile). **Solver: 0 DOF — equation-fixed** (rigid, like the 2D `eq_curve`): `p1`/`p2` (the endpoints at `t1`/`t2`) are pinned by an implicit fix residual right after allocation, so they are usable as `coincident`/`distance`/`point_on` targets for chaining but never move under any other constraint. Use for helices, sinusoidal routing runs, etc. — e.g. a helix: `xt:"R*cos(t)"`, `yt:"R*sin(t)"`, `zt:"P*t/360"`, `t1:0`, `t2:"720"` (two turns, `P`=pitch/turn, degrees). |
 
 All entities carry `construction:bool` (construction geometry never joins wire chains).
 
@@ -271,10 +271,10 @@ also uses `p1`/`p2` for its `t1`/`t2` endpoints; aliases `"e3.start"`/`"e3.end"`
 `"e3.pm"` (arc through-point; alias `"e3.mid"`); `"e3.p0"…"e3.pN"` (spline points). Grammar:
 `^e\d+(\.(p|p1|p2|pm|start|end|mid|p\d+))?$`.
 
-### 3B.1b External model references (T-3DXREF, v1)
+### 3B.1b External model references (v1)
 
 A `sketch3d` feature may additionally carry `external_refs: [ExternalRef3…]` — persistent
-records that ground a constraint against a **vertex on the built model** (Hunter's ask: "a
+records that ground a constraint against a **vertex on the built model** (use case: "a
 spline that interacts with a specific corner on my part"), mirroring the 2D §3.5 external-ref
 semantics but at the doc-feature level (not nested under a sketch plane).
 
@@ -541,11 +541,11 @@ Implemented + machine-checked by `core/doc/validate.cpp::_validate_configuration
 `_config_effective_features`). The `config_*` worker RPCs
 that drive configurations live in [worker_rpc.md §Configurations](worker_rpc.md).
 
-## Appendix A — Canonical `document.json` dump policy (T-H2)
+## Appendix A — Canonical `document.json` dump policy
 
 **Goal:** serializing the same document tree repeatedly must yield byte-identical
-`document.json` without changing its numeric values. PDM-lite (T-BL10), correction
-traces (T-H1), and `doc_diff` must retain even small changes to axes and transforms.
+`document.json` without changing its numeric values. PLM history snapshots, correction
+traces (AI telemetry), and `doc_diff` must retain even small changes to axes and transforms.
 
 ### Rules (normative for every `document.json` producer)
 

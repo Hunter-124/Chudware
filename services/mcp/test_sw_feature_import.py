@@ -1,6 +1,6 @@
 """End-to-end test for SolidWorks feature-tree import (services.sw_import.sw_feature_import + sw_translate).
 
-Reconstructs the owner's reference SolidWorks parts into the C++ engine and checks the resulting
+Reconstructs a set of reference SolidWorks parts into the C++ engine and checks the resulting
 volume matches what SolidWorks itself reports — proving the feature tree (sketches with relations,
 reference planes, extrude/cut/loft) was rebuilt faithfully, not just imported as a frozen body.
 
@@ -8,8 +8,8 @@ Requirements (else the whole module SKIPS): SOLIDWORKS installed + pywin32 (COM 
 staged ``dist/Chudware/libchudware.dll`` (the engine). Runnable two ways:
     python -m services.mcp.test_sw_feature_import      # script style, prints a table
     pytest services/mcp/test_sw_feature_import.py       # parametrised
-The sample parts are the owner's (not in the repo); set CHUDWARE_SW_SAMPLES to the folder holding
-them, or it defaults to the known dev path. Missing files are skipped individually.
+The sample parts are not in the repo; set CHUDWARE_SW_SAMPLES to the folder holding them.
+When it is unset, or a file is missing, the affected tests skip individually.
 """
 
 from __future__ import annotations
@@ -22,8 +22,7 @@ from services.sw_import.sw_feature_import import solidworks_available
 from services.sw_import.sw_translate import resolve
 from services.mcp import core_bridge as cb
 
-_SAMPLES = os.environ.get(
-    "CHUDWARE_SW_SAMPLES", r"C:\Users\dev\Desktop\AI-opencad\sldprt reversing")
+_SAMPLES = os.environ.get("CHUDWARE_SW_SAMPLES", "")
 
 # file name -> volume (mm^3) SolidWorks reports for it (ground truth, captured via COM).
 _PART_VOLUMES = {

@@ -1,6 +1,6 @@
 {
   "_comment": "Curated AISC W/S/C section properties — dimensional facts only (not the AISC database compilation).",
-  "_source": "Property values from public-domain structural engineering references: AISC Steel Construction Manual Table 1-1 (values widely reproduced in open textbooks), NSAI, CISC Handbook. Cross-checked against Salmon & Johnson 'Steel Structures: Design and Behavior' (5th ed), Segui 'LRFD Steel Design'. All values are SI-converted from published imperial dimensions (1 in = 25.4 mm, 1 in² = 645.16 mm², 1 in³ = 16387.1 mm³, 1 in⁴ = 416231 mm⁴). These are physical facts, not a copyrighted compilation — see work/questions/T-D3.md Q1.",
+  "_source": "Property values from public-domain structural engineering references: AISC Steel Construction Manual Table 1-1 (values widely reproduced in open textbooks), NSAI, CISC Handbook. Cross-checked against Salmon & Johnson 'Steel Structures: Design and Behavior' (5th ed), Segui 'LRFD Steel Design'. All values are SI-converted from published imperial dimensions (1 in = 25.4 mm, 1 in² = 645.16 mm², 1 in³ = 16387.1 mm³, 1 in⁴ = 416231 mm⁴). These are physical facts, not a copyrighted compilation — see contracts/licenses.md.",
   "_license_posture": "clean-room curated table; see contracts/licenses.md row 'AISC shapes curated table'",
   "_units": {
     "A": "mm²",

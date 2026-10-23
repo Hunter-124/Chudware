@@ -1,5 +1,5 @@
-// core/tolerance/stackup.h — 1D tolerance stack-up analysis (T-RF19 leaf 6 C++ port of
-// engine_oracle/tolerance/stackup.py, T-BL08). Worst-case + RSS over a dimension chain
+// core/tolerance/stackup.h — 1D tolerance stack-up analysis (C++ port of
+// engine_oracle/tolerance/stackup.py). Worst-case + RSS over a dimension chain
 // (Fischer, "Mechanical Tolerance Stackup and Analysis," 2nd ed., CRC 2011, Ch. 3).
 // PURE: no OCCT, no doc/agent linkage. Result envelopes are byte-identical to the MCP
 // stackup_analyze tool (services/mcp/tolerance_tools.py).

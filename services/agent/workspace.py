@@ -1,8 +1,8 @@
 """workspace.py — Multi-document agent workspace.
 
-T-W16: doc leases, buildgraph fan-out, per-doc event streams.
+Doc leases, buildgraph fan-out, per-doc event streams.
 Contract: contracts/advisor.md §12 (delegation docs/lease field) §13 (buildgraph).
-Architecture: docs/ADVISOR_ARCHITECTURE.md §2.14.
+Architecture: docs/design/ADVISOR_ARCHITECTURE.md §2.14.
 
 Key design decisions (locked)
 ------------------------------
@@ -10,14 +10,14 @@ Key design decisions (locked)
 * Steal is HARNESS-ONLY — agents never call steal() directly.  A model trying
   steal() must be rejected (WorkspaceError raised at the call site).
 * Every lease transition is a ledger event (kind="workspace_lease") so the GUI
-  (T-W17) can replay the full ownership history.
+  can replay the full ownership history.
 * Per-doc event streams are append-only JSONL files under the run dir:
       <cache>/runs/<run_id>/docs/<doc_id>/events.jsonl
   Each line is one JSON event.  The GUI polls or tails these files; no engine
-  coupling required here (T-W17 concern).
+  coupling required here (a GUI concern).
 * Fan-out: BuildGraphExecutor.ready_nodes() drives parallel part dispatch.
   The harness wires the real spawn via the ``spawn_modeler`` callable
-  (T-W14 delegation lives in services/agent/delegation.py); the default is an
+  (delegation lives in services/agent/delegation.py); the default is an
   honest no-op that records an advisory (see _default_spawn_modeler).
 * workspace_status() is the single-call poll target for the GUI until a push
   channel exists.
@@ -447,7 +447,7 @@ def check_write_lease(doc_id: str, tool_name: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Fan-out executor (T-W16 core)
+# Fan-out executor (workspace core)
 # ---------------------------------------------------------------------------
 
 # Type alias for the modeler spawn callable.

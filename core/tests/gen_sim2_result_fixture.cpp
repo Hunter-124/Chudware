@@ -1,4 +1,4 @@
-// gen_sim2_result_fixture — regenerate the committed T-SIM2 result-contour AICM fixture.
+// gen_sim2_result_fixture — regenerate the committed result-contour AICM fixture.
 //
 // The CHUDWARE_SHOT=fea_overlay headless scenario renders a color-mapped FEA
 // contour from a precomputed result AICM. This generator uses a deterministic

@@ -1,4 +1,4 @@
-// Analytic V&V for the motion inverse-dynamics module (T-FIN20).
+// Analytic V&V for the motion inverse-dynamics module.
 //
 // Two closed-form mechanics cross-checks on SYNTHETIC prescribed trajectories
 // (no OCCT, no doc session — this exercises exactly the math that

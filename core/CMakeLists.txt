@@ -101,7 +101,7 @@ endif()
 # Wave 2: provision + link the OCCT 3D B-rep kernel. OFF keeps the fast solver
 # build (Wave 1) self-contained; -DCHUDWARE_WITH_OCCT=ON auto-downloads OCCT and
 # builds the geometry kernel + smoke test (see cmake/ProvisionOCCT.cmake).
-option(CHUDWARE_WITH_OCCT "Provision + link the OCCT geometry kernel (Wave 2)" OFF)
+option(CHUDWARE_WITH_OCCT "Provision + link the OCCT geometry kernel" OFF)
 
 # MSVC: <windows.h> (pulled in transitively by OCCT headers) defines min()/max() macros that
 # clobber std::min / std::max / std::numeric_limits<>::min, breaking e.g. core/api/libchudware.cpp.
@@ -220,7 +220,7 @@ target_link_libraries(chudware_geom PUBLIC Eigen3::Eigen)
 # --- libchudware util (dimension-expression arithmetic evaluator + AICM handoff) -
 # expr: the dimension-expression evaluator (the `evaluate` entry point) the sketch
 # solver's resolve_dim() uses for expr:"A*B"-style dims.
-# aicm_handoff: POSIX shm / Win named mapping for tess mesh (T-PERF10).
+# aicm_handoff: POSIX shm / Win named mapping for tess mesh.
 # platform_paths / parent_death: the one spelling per OS of "where am I", "is that
 # pid alive", and "bind this child's life to mine" — see util/platform_paths.h.
 add_library(chudware_util STATIC
@@ -414,7 +414,7 @@ set_target_properties(test_autoroute PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME autoroute COMMAND test_autoroute)
 
-# T-RF15 (node R4a): firmware engine surface — project scaffold + pin-map +
+# Firmware engine surface — project scaffold + pin-map +
 # toolchain/build wrappers + probe-rs/esptool hardware path + co-verification +
 # the Renode/QEMU emulator leg (fw_sim_run incl. §7 trace + §9 scenarios,
 # fw_power_profile, fw_sensor_scenario) + the fw_* RPC dispatch
@@ -475,13 +475,13 @@ set_tests_properties(firmware PROPERTIES RUN_SERIAL TRUE TIMEOUT 600)
 
 # fw_cli: manual debugging CLI — reads {"method","params"} and prints the
 # firmware::call result as one JSON line. Built for hand diagnosis; no test or
-# script drives it (its T-RF15 Python parity harness is retired).
+# script drives it (its Python parity harness is retired).
 add_executable(fw_cli firmware/fw_cli.cpp)
 target_link_libraries(fw_cli PRIVATE chudware_firmware)
 set_target_properties(fw_cli PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
-# T-RF17: KiCad importers (import_kicad_sch / import_kicad_pcb) + the ecad_open
+# KiCad importers (import_kicad_sch / import_kicad_pcb) + the ecad_open
 # .kicad_* extension dispatch (cases carried over from the retired Python engine).
 add_executable(test_kicad_import tests/test_kicad_import.cpp)
 target_include_directories(test_kicad_import PRIVATE ${doctest_SOURCE_DIR})
@@ -519,7 +519,7 @@ set_target_properties(test_drc_geometry PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME drc_geometry COMMAND test_drc_geometry)
 
-# T-RF19 (leaf 5): structural engine surface — aicad.structure/1 document model,
+# Structural engine surface — aicad.structure/1 document model,
 # the direct-stiffness 3D frame solver (PyNite-equivalent subset: global-
 # direction point/distributed member loads, fully-fixed supports, ASCE 7
 # combos, beam-segmentation member-force/deflection extraction), the AISC +
@@ -550,7 +550,7 @@ add_test(NAME structural COMMAND test_structural)
 
 # struct_cli: manual debugging CLI — reads {"method","params"} and prints the
 # structural::call result as one JSON line. No test or script drives it (its
-# T-RF19 PyNite parity harness is retired).
+# PyNite parity harness is retired).
 add_executable(struct_cli structural/struct_cli.cpp)
 target_link_libraries(struct_cli PRIVATE chudware_structural)
 set_target_properties(struct_cli PROPERTIES
@@ -583,7 +583,7 @@ set_target_properties(test_tet10 PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME tet10 COMMAND test_tet10)
 
-# T-SIM1: steady-state thermal (heat-conduction) FEA gate — validates the conduction
+# Steady-state thermal (heat-conduction) FEA gate — validates the conduction
 # kernel against the closed-form 1D plane-wall (Dirichlet) and wall+convection (Robin)
 # solutions, on tet4 and tet10. OCCT-/mesher-free (inline structured box meshes), so it
 # links only chudware_sim like test_sim / test_modal.
@@ -621,7 +621,7 @@ add_executable(test_cam
   tests/test_cam.cpp)
 target_include_directories(test_cam PRIVATE ${doctest_SOURCE_DIR})
 target_link_libraries(test_cam PRIVATE chudware_cam)
-# T-M4: the byte-identical feeds test reads the source-tree registry.json (the CAM fold-in
+# The byte-identical feeds test reads the source-tree registry.json (the CAM fold-in
 # ground truth); pass its absolute path so the test runs from the build dir.
 target_compile_definitions(test_cam PRIVATE
   CHUDWARE_TEST_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/data/materials/registry.json"
@@ -928,7 +928,7 @@ add_test(NAME aicm COMMAND test_aicm)
 # (only JSON; the doc engine compiles the geometry). The numbers mirror
 # services/agent/prompts/shared/cheatsheets/hardware.md. Linked into the libchudware DLL below
 # (parts_make / parts_catalog_list RPCs) and unit-tested in both configs.
-# parts/place.cpp (T-RF19 place.py port) is the part_place / part_import_file
+# parts/place.cpp (C++ port of place.py) is the part_place / part_import_file
 # placement router: the symbol_footprint leg drives chudware_ecad's apply_ops and
 # the fitting_id / fmu_component legs use the chudware_piping / chudware_hydraulic
 # schema factories — all still pure JSON / OCCT-free (the doc-creating RPCs and
@@ -956,7 +956,7 @@ set_target_properties(test_parts_place PROPERTIES
 add_test(NAME parts_place COMMAND test_parts_place)
 
 # --- libchudware sourcing (BOM roll-up / cost model / spec-match / providers) -------
-# T-RF18: C++ port of the retired Python {bom,cost_model,spec_sheet_matcher,parts_providers,
+# C++ port of the retired Python {bom,cost_model,spec_sheet_matcher,parts_providers,
 # quote_providers}.py backing the worker methods bom_rollup / bom_price /
 # request_quote / match_part_number / vendor_part_fetch and the MCP spec_sheet_match
 # lane. PURE (OCCT-free, no doc/ecad/agent linkage): every side effect — assembly /
@@ -982,7 +982,7 @@ set_target_properties(test_sourcing PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME sourcing COMMAND test_sourcing)
 
-# --- libchudware tolerance / mechanical / materials / dfm (T-RF19 leaf 6) ------------
+# --- libchudware tolerance / mechanical / materials / dfm ---------------------------
 # C++ ports of the retired Python {tolerance/stackup, mechanical/{gear_check,bearing_life},
 # materials/registry, dfm/process_profiles} modules behind
 # the MCP stackup_analyze / gear_check / bearing_life tools, the CAM materials seam,
@@ -1054,7 +1054,7 @@ set_target_properties(test_dfm PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME dfm COMMAND test_dfm)
 
-# --- libchudware piping + hydraulic (T-RF19 leaf 4) ------------------------------
+# --- libchudware piping + hydraulic ----------------------------------------------
 # C++ ports of the retired Python piping modules (1-D liquid + gas network solver, fluid
 # properties, B36 schedule catalog, CFD handoff math) and
 # hydraulic modules (ISO 1219 circuit schema, cylinder/pump/accumulator/
@@ -1125,7 +1125,7 @@ set_target_properties(test_hydraulic PROPERTIES
 add_test(NAME hydraulic COMMAND test_hydraulic)
 
 # rpc_cli: manual debugging CLI — {"method","params"} per line on stdin -> dispatch
-# result per line. No test or script drives it (its T-RF19 parity harness is retired).
+# result per line. No test or script drives it (its parity harness is retired).
 add_executable(rpc_cli piping/rpc_cli.cpp)
 target_link_libraries(rpc_cli PRIVATE chudware_hydraulic chudware_piping)
 set_target_properties(rpc_cli PROPERTIES
@@ -1298,7 +1298,7 @@ if(CHUDWARE_WITH_OCCT)
   target_link_libraries(chudware_geom_occt PUBLIC
     chudware_geom
     chudware_prof   # per-phase sim timers (sim/overlay.cpp overlay_* studies)
-    chudware_util   # aicm_handoff publish for sim/overlay AICM (T-PERF10)
+    chudware_util   # aicm_handoff publish for sim/overlay AICM
     chudware_ecad   # ecad/schema.h pad_world + ecad/ops.h OpError for geom/ecad_3d.cpp
     nlohmann_json::nlohmann_json
     TKernel TKMath TKG2d TKG3d TKGeomBase TKGeomAlgo
@@ -1431,12 +1431,12 @@ if(CHUDWARE_WITH_OCCT)
     set_tests_properties(mesh_mechanism PROPERTIES RUN_SERIAL TRUE
       ENVIRONMENT_MODIFICATION "${_fea_envmod}")
 
-    # Cyclic-sector gate: a 90 deg sector of the ME 490 wheel disc must mesh AND
+    # Cyclic-sector gate: a 90 deg sector of a wheel disc must mesh AND
     # solve at tet4 and tet10, at an automatic size and at an explicit one. The
     # live defect it pins: polymesh's graded fill emits left-handed tet4 cells on
     # a sector's sharp wedge edges, promote_to_quadratic declines exactly those,
     # and the extract stage then refused the whole study with "unsupported tet4
-    # connectivity" on a valid solid (phase 5D, R1 mass credit).
+    # connectivity" on a valid solid.
     add_executable(test_mesh_sector tests/test_mesh_sector.cpp)
     target_include_directories(test_mesh_sector PRIVATE
       ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
@@ -1475,7 +1475,7 @@ if(CHUDWARE_WITH_OCCT)
   set_tests_properties(overlay_surface PROPERTIES
     ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
-  # T-SIM2: regenerator for the committed result-contour AICM fixture used by the
+  # Regenerator for the committed result-contour AICM fixture used by the
   # CHUDWARE_SHOT=fea_overlay headless scenario. Builds a structured cantilever tet mesh in
   # code, runs the real solver, and skins/maps it through the production overlay path.
   # Run by hand to refresh contracts/fixtures/sim2_cantilever_result.aicm.
@@ -1485,9 +1485,9 @@ if(CHUDWARE_WITH_OCCT)
   set_target_properties(gen_sim2_result_fixture PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
-  # T-BL27: surf_replace_face_solid heal regression (cut-through + coincident-patch cases).
-  # Own file/target (test_surfacing / core/tests/test_surfacing.cpp is T-BL28's ruled/fill/
-  # boundary body-edge-selector suite — landed independently, same insertion point).
+  # surf_replace_face_solid heal regression (cut-through + coincident-patch cases).
+  # Own file/target (test_surfacing / core/tests/test_surfacing.cpp is the separate
+  # ruled/fill/boundary body-edge-selector suite).
   add_executable(test_surf_replace_face_heal tests/test_surf_replace_face_heal.cpp)
   target_include_directories(test_surf_replace_face_heal PRIVATE
     ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
@@ -1793,7 +1793,7 @@ if(CHUDWARE_WITH_OCCT)
   add_test(NAME op_registry COMMAND test_op_registry)
   set_tests_properties(op_registry PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
-  # --- Format-registry lockstep (T-RF19): doc_formats payload vs the frozen dump of the
+  # --- Format-registry lockstep: doc_formats payload vs the frozen dump of the
   # retired Python engine's list_formats + detect_format. ---------------------------
   add_executable(test_formats_registry
     tests/test_formats_registry.cpp)
@@ -1855,7 +1855,7 @@ if(CHUDWARE_WITH_OCCT)
   add_test(NAME sketch_drag_rpc COMMAND test_sketch_drag_rpc)
   set_tests_properties(sketch_drag_rpc PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
-  # --- T-W2 sketch completion suite (auto-coincident + sketch_health) ----------
+  # --- sketch completion suite (auto-coincident + sketch_health) ----------------
   # Auto-coincident closes touching-corner profiles (default on, rollback-safe on
   # conflict) and doc_sketch_health narrates closure / DOF free variables / advisory.
   # RPC-level (doc_new -> doc_apply_ops -> doc_sketch_auto_constrain / _health), headless.
@@ -1870,7 +1870,7 @@ if(CHUDWARE_WITH_OCCT)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME sketch_autoconstrain COMMAND test_sketch_autoconstrain)
   set_tests_properties(sketch_autoconstrain PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
-  # --- T-BL43 Convert Entities / external sketch references --------------------
+  # --- Convert Entities / external sketch references ---------------------------
   # Kernel: project_edges_to_plane (recon.cpp) — orthographic GeomProjLib projection then
   # classify (oblique circle -> ellipse, in-plane circle -> circle, perpendicular edge ->
   # point). Op: sketch_convert (session.cpp) — the op both GUIs emit; was contracted in
@@ -2234,7 +2234,7 @@ if(CHUDWARE_WITH_OCCT)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(picks PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
-  # T-BL28: ruled/fill/boundary surface ops must accept body-edge selectors (the
+  # Ruled/fill/boundary surface ops must accept body-edge selectors (the
   # K_EDGE-well refs the ribbon emits), not just sketch refs. Drives compile_document
   # directly (no host loader needed — asserts on CompileResult status/body_count).
   add_executable(test_surfacing
@@ -2567,7 +2567,7 @@ if(TARGET test_nsolve)
     endif()
   endif()
 
-  # Motion inverse dynamics (T-FIN20): OCCT-free analytic V&V — pendulum + slider-crank
+  # Motion inverse dynamics: OCCT-free analytic V&V — pendulum + slider-crank
   # joint-reaction cross-checks against closed-form mechanics on synthetic trajectories.
   add_executable(test_motion_dynamics
     tests/test_motion_dynamics.cpp

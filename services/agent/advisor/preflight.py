@@ -37,12 +37,12 @@ _REBUILD_BUDGET_MS = 10_000
 
 # ------------------------------------------------------------------ ledger shim
 #
-# If T-W1 (design-ledger) is merged, import its append function.  Until then use
-# a local JSONL shim with the same aicad.ledger/1 event shape so T-W13/W5 can
-# consume records without coupling to the merge order.
+# Use the design-ledger ``append_event`` hook when it is importable; otherwise
+# fall back to a local JSONL shim with the same aicad.ledger/1 event shape so the
+# overseer and advisory engine can consume records either way.
 
 def _ledger_append(event: dict) -> None:
-    """Append one ledger event.  Swapped for the real ledger once T-W1 merges."""
+    """Append one ledger event (ledger hook if available, else the local JSONL shim)."""
     try:
         from services.mcp.intake_ledger import append_event  # type: ignore[import]
         append_event(event)

@@ -182,7 +182,7 @@ private:
     ImVec2 dragDownPos_{0, 0};
     int dragFrame_ = -1;
     nlohmann::json dragEntities_;       // last sketch3d_drag response entities (commit payload)
-    // T-PERF2: single-in-flight latest-wins sketch3d_drag
+    // Single-in-flight latest-wins sketch3d_drag
     int  dragGen_ = 0;
     bool dragInFlight_ = false;
     bool dragPending_ = false;

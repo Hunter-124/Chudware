@@ -10,7 +10,7 @@ feature tree, verified against the source solid by boolean comparison.
   convert_face_to_sketch(face)    -> "convert entities": one planar face's wire loops as a new
                                      editable sketch feature ON that face.
 
-Design contract (docs/GEOMETRY_LLM_REPRESENTATION_REVIEW.md §3.4/§3.6): DETERMINISTIC passes
+Design contract: DETERMINISTIC passes
 first; heuristics never suppress the raw face list — unclaimed faces are always reported, and
 every applied batch is verified against the source solid (regression -> revert -> `rejected`).
 
@@ -46,7 +46,7 @@ from services.mcp.cad_tools import _CUR, _doc, _dumps, _err, _publish_current, _
 from services.mcp.gsl_tools import _axis_order
 
 # ---------------------------------------------------------------------------
-# T-F13: hypothesis-ranker hook (flag-gated, default OFF)
+# Hypothesis-ranker hook (flag-gated, default OFF)
 #
 # Set env var CHUDWARE_RECON_RANKER=1 to enable.  The ranker re-orders the
 # `candidates` list only — it never generates new candidates.  Falls back to
@@ -1677,7 +1677,7 @@ def register_recon_tools(mcp: FastMCP) -> None:
             except Exception:  # noqa: BLE001
                 pass
 
-            # T-F13: re-order candidates by ranker score (flag-gated, default OFF)
+            # Re-order candidates by ranker score (flag-gated, default OFF)
             _bbox = plan.get("bbox_mm") or [1.0, 1.0, 1.0]
             _diag = math.sqrt(sum(float(s) ** 2 for s in _bbox)) or 1.0
             candidates = _reorder_candidates(candidates, ref_faces, _diag)
@@ -2012,7 +2012,7 @@ def register_recon_tools(mcp: FastMCP) -> None:
             return _err(e)
 
 
-# ---------------------------------------------------------------- photo-capture + photogrammetry entry path (T-F6)
+# ---------------------------------------------------------------- photo-capture + photogrammetry entry path
 
 _SESSIONS: dict = {}  # port -> CaptureSession; module-level, no global state leaks
 

@@ -588,7 +588,7 @@ def test_extract_score_interface_check_refusal_is_not_a_pass():
 
 
 
-# ── T-BL23: CAM scoring keys (machined_fraction + gouges) ───────────────────
+# ── CAM scoring keys (machined_fraction + gouges) ───────────────────────────
 
 def test_extract_score_machined_fraction_clean():
     """machined_fraction 0..1 maps 1:1 when gouges==0."""
@@ -601,7 +601,7 @@ def test_extract_score_machined_fraction_clean():
 
 
 def test_extract_score_machined_fraction_gouge_gates_to_zero():
-    """Any gouge forces score=0.0 even when machined_fraction is high (T-BL23 DoD item 2)."""
+    """Any gouge forces score=0.0 even when machined_fraction is high."""
     from services.verify.battery import _extract_score
     score, findings = _extract_score(
         "cam_simulate", "scalar",
@@ -684,7 +684,7 @@ def test_extract_score_string_summary_is_not_treated_as_metrics():
     assert score == pytest.approx(1.0)   # bare-ok fallback, no crash
 
 
-# ── T-BL23: _gap_is_manifold issues-list fix ─────────────────────────────────
+# ── _gap_is_manifold issues-list fix ────────────────────────────────────────
 
 def test_gap_is_manifold_issues_free_edges_fails(monkeypatch):
     """A free_edges issue in the issues list → non-manifold (not watertight)."""
@@ -704,7 +704,7 @@ def test_gap_is_manifold_issues_free_edges_fails(monkeypatch):
 
 
 def test_gap_is_manifold_tiny_edges_only_is_manifold(monkeypatch):
-    """tiny_edges warnings alone (curved seam/pole) do NOT fail manifold (T-BL19 finding)."""
+    """tiny_edges warnings alone (curved seam/pole) do NOT fail manifold."""
     import services.verify.battery as bat
 
     def fake_cb_call(op, args):
@@ -766,7 +766,7 @@ def test_gap_is_manifold_error_severity_fails(monkeypatch):
 
 
 
-# ── _gap_eval_check_direct issues-list fix (same latent bug T-BL23 fixed in
+# ── _gap_eval_check_direct issues-list fix (same latent bug fixed in
 #    _gap_is_manifold: eval_check emits an `issues` list, not bare scalars) ──
 
 def test_gap_eval_check_direct_issues_free_edges_fails(monkeypatch):

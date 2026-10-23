@@ -1,4 +1,4 @@
-// Copilot activity feed (T-RF6 split of legacy_chat.cpp): feedTurnActivity — folds streamed
+// Copilot activity feed: feedTurnActivity — folds streamed
 // orchestrator events (stage/agent/plan/mission/corporate kinds) into a turn's ActivityItem
 // timeline, plus the stream:out ops-JSON detection and the chat-history dirty flag the
 // persistence debounce (conversations.cpp) reads. Pure state folding, no drawing.
@@ -26,7 +26,7 @@ static std::string friendlyStageTitle(const std::string& stage) {
 // ============================ Corporate Roles (aicad.corporate/1) ============================
 // Additive kind="corporate" events (corp_event ∈ org_built|hire|team_lead|meeting|steering|
 // route_rejected|wind_down). Stored as ActivityItem rows with rowKind 4–8 so we never touch
-// integrator-owned app_state.h. Org chart updates in place; meetings/steering are compact cards;
+// the shared app_state.h. Org chart updates in place; meetings/steering are compact cards;
 // route rejections are muted one-liners. Missing fields degrade silently.
 //
 // rowKind 4 = org chart (stage "corp:org", detail = JSON snapshot)
@@ -1341,7 +1341,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             std::string raw = jstr(data, "raw");
             if (!raw.empty()) a->detail = raw;     // keep the latest attempt's thoughts/output
             // Pack sent prompt after a delimiter so drawActionCard can expand it without new
-            // ActivityItem fields (app_state.h is integrator-owned). Same pattern as ART packing.
+            // ActivityItem fields (app_state.h stays unchanged). Same pattern as ART packing.
             std::string sent = jstr(data, "sent");
             if (!sent.empty()) {
                 // Strip any previous SENT trailer before re-packing (latest attempt wins).
@@ -1761,7 +1761,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         ui::copilot::appendToolOutcomeTrailer(ni.detail, outcome, executed);
         // Optional error_preview (capped failure text) — packed after the args body with the
         // same delimiter convention as artifacts below so drawToolCallRow can split it back
-        // out without a new ActivityItem field (app_state.h is integrator-owned).
+        // out without a new ActivityItem field (app_state.h stays unchanged).
         if (ni.status != "done") {
             const std::string errText = jstr(data, "error_preview");
             if (!errText.empty()) {
@@ -1771,8 +1771,8 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             }
         }
         // Optional artifacts:[{path,kind}] — pack image paths into detail after a delimiter so
-        // drawToolCallRow can expand them without new ActivityItem fields (app_state.h is
-        // integrator-owned). Delimiter is unlikely in args JSON: "\n\x1eART\x1e\n".
+        // drawToolCallRow can expand them without new ActivityItem fields (app_state.h
+        // stays unchanged). Delimiter is unlikely in args JSON: "\n\x1eART\x1e\n".
         // image_caption — the text the tool returned WITH its images (what the agent read beside
         // the pixels) — rides just ahead of ART after "\n\x1eCAP\x1e\n". It precedes ART so the
         // session-artifact scan (conversations.cpp, ART to end of detail) never reads caption
@@ -1835,7 +1835,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
     } else if (kind == "provider_call") {
         // In-depth provider HTTP call log (InAppDiag / core agent). One row per attempt.
         // rowKind 9; fields packed into existing ActivityItem slots so we never touch
-        // integrator-owned app_state.h:
+        // the shared app_state.h:
         //   title      = "provider · model" (display)
         //   reason     = single-line summary (status + latency + endpoint snippet)
         //   detail     = full copyable line (+ error_excerpt when present)

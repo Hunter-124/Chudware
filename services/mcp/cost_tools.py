@@ -1,9 +1,9 @@
-"""Cost-out MCP tools: made-part cost estimate + on-demand manufacturing quotes (workstream B).
+"""Cost-out MCP tools: made-part cost estimate + on-demand manufacturing quotes.
 
 Thin MCP adapters over the C++ core (libchudware ``request_quote`` RPC via
 :mod:`services.mcp.core_bridge`). ``cam_cost_estimate`` still rides the oracle
 cost_model — the C++ port (core/sourcing/cost.cpp) dispatched via the
-``estimate_made_cost`` worker-RPC method (T-RF18); the oracle module was deleted.
+``estimate_made_cost`` worker-RPC method; the oracle module was deleted.
 RPC method yet (see the call-site comment).
 
 - ``cam_cost_estimate(doc_path)`` opens a doc that carries CAM operations, reads its solid volume,
@@ -79,7 +79,7 @@ def register_cost_tools(mcp: FastMCP) -> None:
         "unit_cost": null} (price unknown), never a fabricated number. Returns {ok, cost}.
         """
         try:
-            # estimate_made_cost is C++-dispatched via the sourcing RPC (T-RF18).
+            # estimate_made_cost is C++-dispatched via the sourcing RPC.
             opened = cb.call("doc_open", {"path": str(doc_path)})
             doc_id = opened.get("doc_id") if isinstance(opened, dict) else None
             volume = opened.get("volume") if isinstance(opened, dict) else None
@@ -136,7 +136,7 @@ def register_cost_tools(mcp: FastMCP) -> None:
                         part_file = step
                 except Exception:  # noqa: BLE001 (export unavailable -> pass the doc path through)
                     part_file = str(doc_path)
-            # T-RF18: the quote providers live in the C++ core (core/sourcing/quote.cpp);
+            # The quote providers live in the C++ core (core/sourcing/quote.cpp);
             # the RPC envelope mirrors the Python worker wrapper ({ok, quote} on success,
             # {ok:false, reason, hint} on a hard failure). Unwrap to the historical tool
             # shape {ok, quote} — a keyless/vendor-down quote is the contract §0 shape

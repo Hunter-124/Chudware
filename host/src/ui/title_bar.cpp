@@ -28,7 +28,7 @@
 #include "metrics.h"           // ui::metrics::stroke / titleFramePad tokens
 #include "doc_tabs.h"          // ui::openNewDocChooser (File > New)
 #include "file_dialog.h"       // ui::openFolderDialog (File > Open Project Folder)
-#include "firmware/fw_workspace.h"  // T-FIN5: ui::firmwareTabVisible
+#include "firmware/fw_workspace.h"  // ui::firmwareTabVisible
 #include "feature_tree.h"      // ui::featureTreeActivePath (Save vs. Save As gating)
 #include "property_manager.h"  // PropertyManager::active() (used in View sub-menu)
 #include "plm/plm_hub.h"       // ui::plmProjectName (active-project status control)
@@ -115,7 +115,7 @@ static ImVec4 titleBar_chromeTint(const float base[4]) {
 enum class TbIcon {
     File, Search, Settings, Web,
     Model, Drawing, Simulate, Electronics, Manufacture, PLM, PartsLibrary, AI,
-    Firmware,   // T-FIN5: firmware workspace tab (progressive disclosure)
+    Firmware,   // firmware workspace tab (progressive disclosure)
 };
 
 static void drawTbIcon(ImDrawList* dl, TbIcon icon, ImVec2 c, float sz, ImU32 col) {
@@ -959,7 +959,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         // workspace they cannot REACH (the tab strip is the only mouse route to it), so
         // the strip must never silently drop one: when labels don't fit, every chip
         // except the active one collapses to icon-only and gains a name tooltip.
-        const bool fwTabVisible = ui::firmwareTabVisible(st);   // T-FIN5 disclosure
+        const bool fwTabVisible = ui::firmwareTabVisible(st);   // progressive disclosure
         auto tabVisible = [&](int i) {
             return kTabs[i].ws != AppState::Workspace::Firmware || fwTabVisible;
         };
@@ -1029,7 +1029,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         bool drewPrevTab = false;         // gate the between-tab dividers
 
         for (int i = 0; i < kTabCount; ++i) {
-            // T-FIN5 progressive disclosure: the Firmware tab is offered only when a
+            // Progressive disclosure: the Firmware tab is offered only when a
             // firmware project exists / ECAD is in play (Simulate-tab disclosure rules).
             if (!tabVisible(i))
                 continue;

@@ -16,8 +16,8 @@ Key invariants
   ``doc_apply_ops``, records ``linked.eq_id`` on the ledger entry, and verifies
   the round-trip by reading back the geometry value.
 
-T-W13 change-plan routing is feature-flagged: set env var
-``CHUDWARE_CHANGE_PLAN_T_W13=1`` to route the impact report through the T-W13
+Change-plan routing is feature-flagged: set env var
+``CHUDWARE_CHANGE_PLAN=1`` to route the impact report through the
 change-plan path.  Default: returns the report dict directly.
 """
 from __future__ import annotations
@@ -256,8 +256,8 @@ def mark_faulty(
            affected_checks, recommended}``.
 
     The report is routed as a change plan (§11) — assessed, not auto-executed.
-    When env var ``CHUDWARE_CHANGE_PLAN_T_W13=1`` is set, it is forwarded through
-    the T-W13 change-plan path; otherwise it is returned directly.
+    When env var ``CHUDWARE_CHANGE_PLAN=1`` is set, it is forwarded through
+    the change-plan path; otherwise it is returned directly.
     """
     dag = build_dag(ledger)
     check_cycle(dag)
@@ -319,17 +319,17 @@ def mark_faulty(
         "recommended": recommended,
     }
 
-    # T-W13 feature-flag routing
-    if os.environ.get("CHUDWARE_CHANGE_PLAN_T_W13") == "1":
+    # Change-plan feature-flag routing
+    if os.environ.get("CHUDWARE_CHANGE_PLAN") == "1":
         return _route_change_plan(report)
     return report
 
 
 def _route_change_plan(report: dict) -> dict:
-    """Forward impact report to the T-W13 change-plan path (stub for when merged).
+    """Forward impact report to the change-plan path.
 
-    T-W13 is still in 'doing' — this is the feature-flagged seam.
-    When T-W13 merges, replace this with the real routing call.
+    This is the feature-flagged seam: the report is wrapped in an
+    ``aicad.change_plan/1`` envelope pending assessment.
     """
     # Stub: wrap in change-plan envelope and return
     return {

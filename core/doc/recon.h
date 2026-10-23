@@ -63,7 +63,7 @@ nlohmann::json compare_shapes(const TopoDS_Shape& a, const TopoDS_Shape& b);
 // Throws OpError("invalid_op", ...) if `face` is not planar.
 nlohmann::json face_wires(const TopoDS_Face& face);
 
-// C3 — "Convert Entities" / external-reference projection (T-BL43). Project arbitrary external
+// C3 — "Convert Entities" / external-reference projection. Project arbitrary external
 // model edges ORTHOGRAPHICALLY onto a TARGET sketch plane (drop along the plane normal), then
 // classify the projected 2D image as doc-schema §3.1 sketch entities. Unlike face_wires (which
 // converts a face's OWN in-plane boundary), the source edges here can sit on ANY plane relative

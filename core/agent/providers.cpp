@@ -1717,7 +1717,7 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
     // OpenAI-compatible family: openai / llamacpp / xai / xai-sub / moonshot / freellmapi.
     // chudware's Python XAISubProvider posts to /v1/chat/completions with Bearer
     // (OAuth access_token or API key). OAuth tokens arrive already refreshed
-    // (auth::ensure_fresh_for_run at resolve time, T-RF4).
+    // (auth::ensure_fresh_for_run at resolve time).
     if (provider == "openai" || provider == "llamacpp" || provider == "xai" ||
         provider == "xai-sub" || provider == "moonshot" || provider == "freellmapi") {
         std::string def = (provider == "llamacpp") ? std::string("local-gguf")

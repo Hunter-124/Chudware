@@ -411,7 +411,7 @@ nlohmann::json build_power_profile(const nlohmann::json& trace, const nlohmann::
         }
         if (rails_out.empty()) {
             notes.push_back("board resolved but no component carries eng.supply.rails metadata "
-                            "(T-FIN8) — rails empty; seed the library or add per-instance "
+                            "— rails empty; seed the library or add per-instance "
                             "sim_params.eng overrides");
         }
     } else {

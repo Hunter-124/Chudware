@@ -1,4 +1,4 @@
-"""Jurisdiction adoption metadata for building-code compliance (T-D4).
+"""Jurisdiction adoption metadata for building-code compliance.
 
 Bundles edition-adoption facts (IBC/ASCE 7/NDS edition numbers + residential code) for
 US states.  **No code text is stored here** — only which edition a jurisdiction has

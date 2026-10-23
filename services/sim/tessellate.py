@@ -1,4 +1,4 @@
-"""AICM v1 tessellation writer and parser (contract: docs/contracts/mesh_format.md).
+"""AICM v1 tessellation writer and parser (contract: contracts/mesh_format.md).
 
 Exports:
   tessellate_body(shape, body_id, name, color, lin_deflection, ang_deflection) -> BodyTess

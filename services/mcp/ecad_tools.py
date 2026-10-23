@@ -1,4 +1,4 @@
-"""AI-ECAD MCP tools — COMPAT FACADE (T-RF8).
+"""ECAD MCP tools — COMPAT FACADE.
 
 The tool implementations now live in per-family modules (ecad_sch_tools, ecad_pcb_tools,
 ecad_sim_tools) over the shared ecad_common session/helper layer. This module re-exports
@@ -74,7 +74,7 @@ from .ecad_sim_tools import register_ecad_sim_tools  # noqa: F401
 
 
 def register_ecad_tools(mcp: FastMCP) -> None:
-    """Register every AI-ECAD tool on the given FastMCP instance."""
+    """Register every ECAD tool on the given FastMCP instance."""
     register_ecad_sch_tools(mcp)
     register_ecad_pcb_tools(mcp)
     register_ecad_sim_tools(mcp)

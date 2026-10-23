@@ -2,7 +2,7 @@
 """GUI sizing / icon / theme linter for the Chudware host (Dear ImGui, C++).
 
 A lightweight "typechecker" for the GUI sizing standard in host/src/ui/metrics.h (all GUI dimensions,
-DPI-scaled) and the rules in .claude/skills/gui-theme-layout/SKILL.md. It catches the exact bug classes
+DPI-scaled) and the rules in docs/dev/gui-theme-layout.md. It catches the exact bug classes
 the 2026-06 GUI audit found, so they cannot silently ship again and so the sizing backlog can be
 cleared (and kept clear) deterministically:
 
@@ -39,7 +39,7 @@ import re
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ATLAS = os.path.join(REPO, "assets", "icons", "atlas.json")  # T-G11 de-dup: icons moved host/assets -> shared assets/
+ATLAS = os.path.join(REPO, "assets", "icons", "atlas.json")  # icons are shared under the top-level assets/
 DEFAULT_ROOTS = [
     os.path.join(REPO, "host", "src"),
 ]
@@ -80,7 +80,7 @@ PIXEL_MIN = 2.0
 # do not fail the gate. (Chrome exceptions inside these files can still be fixed; add a per-line
 # "// gui-lint: allow" if a specific art literal is mis-flagged elsewhere.)
 SCALE_WORLDSPACE_FILES = {
-    # ui/imgui (retired, see docs/PORT_LEDGER.md) — these paths are inert but kept for
+    # ui/imgui (retired) — these paths are inert but kept for
     # historical reference in case ui/imgui commits are inspected via git show.
     # host/ equivalents should be added here when known.
 }

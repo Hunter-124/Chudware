@@ -202,7 +202,7 @@ SizeBand resolve_size_band(const TopoDS_Shape &shape,
   // exact prediction, is ELEMENTS ACROSS THE THINNEST BBOX DIRECTION — not the
   // raw side length:
   //
-  //   fin25 sensor board 50 x 40 x 2.6 mm : 2.60 -> 4.46 mm (0.6 across) —
+  //   sensor-node board  50 x 40 x 2.6 mm : 2.60 -> 4.46 mm (0.6 across) —
   //       polymesh REFUSED the fill outright ("feature unresolved at h=...:
   //       CAD face 29 has no aligned delivered boundary patch")
   //   plate with hole  120 x 60 x 3 mm    : 3.01 -> 8.80 mm (0.3 across) —
@@ -221,7 +221,7 @@ SizeBand resolve_size_band(const TopoDS_Shape &shape,
   // 27,690 elements at 9.25 mm and 76,562 (in 38 components) at 6.00 mm against
   // 21,764 at the honest 3.93 mm, because the fill spends its budget on feature
   // seeds trying to resolve a plate and bores it cannot fit an element into.
-  // Measuring the section here instead was tried and REJECTED: the fin25 board's
+  // Measuring the section here instead was tried and REJECTED: the sensor-node board's
   // own thinnest section is its 1.6 mm FR4 core (its opposed 50 x 40 faces), so
   // a section-based floor of 0.4 mm is below that study's 0.5 mm base size,
   // which withdraws the coarsening 0.5 -> 0.65 mm the board depends on and
@@ -247,7 +247,7 @@ SizeBand resolve_size_band(const TopoDS_Shape &shape,
   // Why the MEMORY rung yields as well, when it is otherwise the hard one:
   //   * the automatic element size must be a function of geometry and the
   //     study's own controls, nothing else. Letting the governor push it past
-  //     the floor made the fin25 board mesh at 0.69 / 0.73 / 0.90 mm (131k,
+  //     the floor made the sensor-node board mesh at 0.69 / 0.73 / 0.90 mm (131k,
   //     121k, 244k elements, 72 s to 525 s) across three IDENTICAL runs minutes
   //     apart, purely because free RAM moved — and two of them then failed
   //     downstream with "flux selection contains no exterior mesh face" while

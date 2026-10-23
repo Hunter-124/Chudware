@@ -76,15 +76,15 @@ services/manufacturing/twin/                # non-GUI service side only
 docs/TWIN.md                                # fidelity table + determinism contract, human-facing
 ```
 
-### 1.2 Existing files modified, at named append-only seams (integrator applies)
+### 1.2 Existing files modified, at named append-only seams (maintainer applies)
 
 | File | Change | Why the seam is contained |
 |---|---|---|
 | `core/cam/stock_step.h`, `core/cam/stock_step.cpp` | **New**, but inside CAM's directory: pure extraction of `dist_point_seg` (`stock_sim.cpp:24-30`), the `sweep_seg` lambda (`:339-359`) and the `holder_hit_seg` lambda (`:364-388`) into free functions over an explicit context struct. | One implementation, two callers. No behavior change intended; `test_cam` is the regression oracle. |
 | `core/cam/stock_sim.cpp` | `simulate_setup` calls `cam::stock_step` instead of its local lambdas. Signature, options, results, warnings, frame logic and the lathe branch (`:197-245`) untouched. | Coordinated with `TurningArchitecture`, which extends the lathe branch and `model.h`; the two edits do not overlap. |
-| `core/CMakeLists.txt` | Append `add_library(chudware_twin STATIC ...)`, `cam/stock_step.cpp` into the existing `chudware_cam` source list (after `cam/stock_sim.cpp`, currently line 291), the eleven `test_twin_*` executables, and the optional `twin_cli`. | Append-only, integrator-owned. `chudware_twin` links `chudware_cam chudware_mate chudware_firmware chudware_device nlohmann_json::nlohmann_json` and needs `_USE_MATH_DEFINES` like `chudware_cam`. |
+| `core/CMakeLists.txt` | Append `add_library(chudware_twin STATIC ...)`, `cam/stock_step.cpp` into the existing `chudware_cam` source list (after `cam/stock_sim.cpp`, currently line 291), the eleven `test_twin_*` executables, and the optional `twin_cli`. | Append-only, maintainer-owned. `chudware_twin` links `chudware_cam chudware_mate chudware_firmware chudware_device nlohmann_json::nlohmann_json` and needs `_USE_MATH_DEFINES` like `chudware_cam`. |
 | `contracts/README.md` | One registry row per new `aicad.twin_*` contract. | Append-only. |
-| `scripts/gate.sh` | Twin test executables appended to the existing test list. The twin adds **no new SKIP**: every suite is dependency-free. | Append-only, integrator-owned. |
+| `scripts/gate.sh` | Twin test executables appended to the existing test list. The twin adds **no new SKIP**: every suite is dependency-free. | Append-only, maintainer-owned. |
 | `docs/manufacturing/README.md` as-built map, developer docs | One update per twin wave, in the same green commit (DoD v4 §20). | Required. |
 
 ### 1.3 Explicit non-ownership

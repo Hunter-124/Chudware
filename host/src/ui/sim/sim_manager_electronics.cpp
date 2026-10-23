@@ -1871,7 +1871,7 @@ void SimManager::drawHandoffPanel(AppState &st) {
     drawProvenance(ho_.result);
   }
 
-  // ---- heatsink pick (T-FIN17 forward seam): bound to a stable component
+  // ---- heatsink pick (forward seam): bound to a stable component
   // reference from this board's solved handoff; the target stays editable
   // because a part limit is not always present in ECAD metadata.
   const bool hsUp =

@@ -490,7 +490,7 @@ def _proxy_shape(fp: dict):
 
 
 def _package_shape(fp: dict, eng: dict):
-    """Component body from the library package dims (T-FIN8), or None when unknown.
+    """Component body from the library package dims, or None when unknown.
 
     ``eng`` is the normalized metadata dict (services.ecad.metadata.eng_for_footprint).
     Box packages need l/w/h; cylinder packages need d/h. Shapes sit on z=0, growing +z,
@@ -564,7 +564,7 @@ def _build_components(board: dict, opts: BoardToStepOpts, thickness: float, zb: 
                       summary: _Summary, phys: list | None = None):
     """One world-placed body per on_board footprint.
 
-    Body preference (T-FIN8): real ``model_3d`` STEP > library package box/cylinder
+    Body preference: real ``model_3d`` STEP > library package box/cylinder
     (services.ecad.metadata package dims) > pad-extent box proxy. When ``phys`` is a list,
     one ``aicad.boardphys/1`` component record is appended per placed body (and per
     skipped footprint, with ``solid_label: null``) — see contracts/ecad/boardphys.md.
@@ -736,7 +736,7 @@ def board_to_part_doc(board: dict, step_path: str) -> dict:
     }
 
 
-# --------------------------------------------------------------------------- FEA variant (T-FIN16)
+# --------------------------------------------------------------------------- FEA variant
 #
 # ``board_to_fea_step`` is the thermal-FEA-ready sibling of :func:`board_to_step`:
 # ONE fused solid (substrate + simplified component bodies) that the tet mesher can

@@ -359,7 +359,7 @@ register_recon_tools(_reg.view(mcp, "recon"))
 from services.mcp.intake_tools import register_intake_tools
 register_intake_tools(_reg.view(mcp, "intake"))
 
-# Interaction — the ONE ask_user seam (Pillar 9, contracts/interaction.md): typed questions
+# Interaction — the ONE ask_user seam (contracts/interaction.md): typed questions
 # with suggested defaults surface as MCP elicitations; answers persist + replay via the shared
 # interaction core (services/agent/interaction.py) that intake clarify and DAG gates share.
 from services.mcp.interaction_tools import register_interaction_tools
@@ -417,7 +417,7 @@ register_mfg_tools(_reg.view(mcp, "manufacture"))
 # Doc diff — semantic feature-level diff between two document revisions.
 from services.mcp.doc_diff_tools import register_doc_diff_tools
 register_doc_diff_tools(_reg.view(mcp, "cad"))
-# PLM vault (Pillar 19, aicad.plm/1): hidden git-backed version history —
+# PLM vault (aicad.plm/1): hidden git-backed version history —
 # Project/History/Checkpoint/Release/Restore. Schema: contracts/plm.md.
 # Engine: services/plm/. Zero user-facing git vocabulary (contract §8).
 from services.mcp.plm_tools import register_plm_tools
@@ -460,7 +460,7 @@ register_mfg_plan_tools(_reg.view(mcp, "cad"))
 from services.mcp.verify_tools import register_verify_tools
 register_verify_tools(_reg.view(mcp, "cad"))
 
-# Research (Pillar 8): look-it-up-instead-of-recall. web_search + fetch_page return the
+# Research: look-it-up-instead-of-recall. web_search + fetch_page return the
 # provenance-stamped answer envelope; per-user local cache; offline-safe degradation.
 # Also registers fit_calc + recommend_fit (ISO 286, aicad.calc/1 envelope).
 # Rule: call fit_calc BEFORE hole_sizing / bore decisions; recommend_fit to choose the class.
@@ -480,15 +480,15 @@ register_dimension_scheme_tools(_reg.view(mcp, "cad"))
 from services.deliverables import register_deliverables_tools
 register_deliverables_tools(_reg.view(mcp, "cad"))
 
-# Sourcing — unified BOM roll-up (made/bought) + approved-provider price resolution (workstream B).
+# Sourcing — unified BOM roll-up (made/bought) + approved-provider price resolution.
 from services.mcp.sourcing_tools import register_sourcing_tools
 register_sourcing_tools(_reg.view(mcp, "parts"))
 
-# Cost-out — made-part cost model (material + machining) + approved quote-out APIs (workstream B).
+# Cost-out — made-part cost model (material + machining) + approved quote-out APIs.
 from services.mcp.cost_tools import register_cost_tools
 register_cost_tools(_reg.view(mcp, "parts"))
 
-# Spec-sheet matching — deterministic part-number → standard-part model (BOLTS/KiCad, workstream B).
+# Spec-sheet matching — deterministic part-number → standard-part model (BOLTS/KiCad).
 from services.mcp.spec_tools import register_spec_tools
 register_spec_tools(_reg.view(mcp, "parts"))
 
@@ -509,7 +509,7 @@ register_civil_hydro_tools(_reg.view(mcp, "sim"))
 from services.mcp.civil_link_tools import register_civil_link_tools
 register_civil_link_tools(_reg.view(mcp, "sim"))
 
-# Photo capture + photogrammetry entry path for reverse_engineer (Pillar 10 v2).
+# Photo capture + photogrammetry entry path for reverse_engineer.
 # DEFAULT OFF — start_capture_session MCP tool starts the local listener on demand.
 from services.mcp.recon_tools import register_photo_recon_tools
 register_photo_recon_tools(_reg.view(mcp, "recon"))

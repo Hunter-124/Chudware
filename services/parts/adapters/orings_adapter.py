@@ -1,4 +1,4 @@
-"""CatalogProvider adapter for standard AS568 O-rings (T-CatalogStock).
+"""CatalogProvider adapter for standard AS568 O-rings.
 
 Generates the SAE AS568B dash-number series in four common elastomer
 compounds. Domain: "seal" — the existing reserved domain (contracts/parts.md

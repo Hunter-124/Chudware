@@ -7,7 +7,7 @@ Covers mega-7 TOP-5 items owned by RoleSurface:
   3. Cheap-leaf one-shot envelope — validates, falls back, increments leaf_miss.
 
 Item 4 of that list, "clean terminal status — soft-join deliver → done|blocked +
-stop_reason deliver_partial", is NOT covered here and no longer can be: T-RF5 deleted
+stop_reason deliver_partial", is NOT covered here and no longer can be: the refactor deleted
 ``services/agent/loop.py::_drive_phases_from_dag`` and nothing re-implemented it, so
 ``deliver_partial`` has no producer anywhere in the tree (grep services/ core/: comments,
 docstrings and tests only). A ``_drive`` helper here monkeypatched that deleted function

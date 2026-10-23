@@ -1,4 +1,4 @@
-"""services/worker_main.py — the services-side stdio JSON-RPC worker (T-RF20/R5a).
+"""services/worker_main.py — the services-side stdio JSON-RPC worker.
 
 This is the Python worker that survives the engine_oracle/ deletion: every ENGINE method
 (doc/sketch/sim/ecad/cam/sourcing/hydraulic/piping/structural/firmware/parts-placement)
@@ -9,7 +9,7 @@ Python:
   run_model (build123d script execution — needs an interpreter by nature),
   editable prompts, the persistent Chudcode agent host and its private control lane,
   vendor-parts registry, deliverables, parts hub FTS, agent GUI seams, reveng,
-  dag steering, subagent RPC, PLM vault, EM (T-SIM11 hold), multi-physics seam,
+  dag steering, subagent RPC, PLM vault, EM (on hold), multi-physics seam,
   manufacturing printer adapters.
 
 The agent GUI seams and subagent RPC tables are REQUIRED: if either cannot import, the
@@ -163,7 +163,7 @@ _register("subagent", "services.agent.subagent_rpc", "WORKER_METHODS", required=
 # ---- PLM vault ----
 _register("plm", "services.plm.worker_rpc", "WORKER_METHODS")
 
-# ---- EM (T-SIM11 hold — moved, not worked) ----
+# ---- EM (on hold — moved, not worked) ----
 _register("em", "services.sim.em.worker_rpc", "WORKER_METHODS")
 
 # ---- Multi-physics seam ----

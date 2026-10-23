@@ -1,4 +1,4 @@
-"""ECAD PCB MCP tools (T-RF8 split of ecad_tools.py): ecad_new_pcb, run_drc, run_hostcheck, run_dfm, autoroute, zones, export, to_3d, net classes, stackup, make_board, board_from_schematic, autoplace, optimize_traces."""
+"""ECAD PCB MCP tools (split out of ecad_tools.py): ecad_new_pcb, run_drc, run_hostcheck, run_dfm, autoroute, zones, export, to_3d, net classes, stackup, make_board, board_from_schematic, autoplace, optimize_traces."""
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
@@ -236,7 +236,7 @@ def _class_track_width(doc: dict, net: str):
 
 
 def register_ecad_pcb_tools(mcp: FastMCP) -> None:
-    """ECAD PCB MCP tools (T-RF8 split of ecad_tools.py): ecad_new_pcb, run_drc, run_hostcheck, run_dfm, autoroute, zones, export, to_3d, net classes, stackup, make_board, board_from_schematic, autoplace, optimize_traces."""
+    """ECAD PCB MCP tools (split out of ecad_tools.py): ecad_new_pcb, run_drc, run_hostcheck, run_dfm, autoroute, zones, export, to_3d, net classes, stackup, make_board, board_from_schematic, autoplace, optimize_traces."""
 
 
     @mcp.tool()
@@ -309,7 +309,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def ecad_run_hostcheck(doc_id: str = "") -> str:
-        """Run the MCU/FPGA host-board rule pack (T-FIN9) on the active board — the
+        """Run the MCU/FPGA host-board rule pack on the active board — the
         device-level checks that brick a host board even when DRC/ERC are clean.
 
         Rule families (stable ids, all findings carry an actionable fix hint):
@@ -317,7 +317,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                                              distance budget, same-side/via-quality heuristic)
           host_bulk_cap                      bulk capacitance (>= 4.7 uF) per supply rail
           host_sequencing[/_unparsed/_unverifiable]  power-sequencing requirements from the
-                                             component's T-FIN8 eng metadata
+                                             component's eng metadata
                                              (contracts/ecad/boardphys.md — 'VCORE before VIO')
                                              validated against the board's actual enable/PGOOD
                                              chains; NO hardcoded part knowledge
@@ -327,7 +327,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
           host_bootstrap_float/_shared       boot-strap pins strapped to a valid level and not
                                              shared with an actively-driven signal
 
-        Advisory, like DRC. Hosts are found via T-FIN8 metadata (eng.supply.rails) or
+        Advisory, like DRC. Hosts are found via eng metadata (eng.supply.rails) or
         power_in pins; seed metadata via the library or per-instance sim_params.eng
         overrides. Thresholds can be tuned per board via board rules 'hostcheck'
         (decoupling_dist_mm, decoupling_min_f/max_f, bulk_min_f, xtal_loop_dist_mm,
@@ -340,7 +340,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                         next_actions=["ecad_new_pcb('myboard')"])
         doc = session.doc
         try:
-            from services.ecad import hostboard_rules as hb_mod  # STAYS (T-RF20): no C++ counterpart
+            from services.ecad import hostboard_rules as hb_mod  # STAYS: no C++ counterpart
             violations = hb_mod.run_hostcheck(doc)
         except Exception as e:  # noqa: BLE001
             return _err(f"hostcheck engine error: {e}", hint="Inspect with ecad_status().")
@@ -1081,7 +1081,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                             next_actions=["ecad_new_schematic('myfpga')",
                                           "ecad_place_symbol('FPGA:iCE40UP5K-SG48', 100, 100)"])
             try:
-                from services.ecad import fpga  # STAYS (T-RF20): no C++ counterpart
+                from services.ecad import fpga  # STAYS: no C++ counterpart
             except Exception as e:  # noqa: BLE001
                 return _err(f"fpga module unavailable ({type(e).__name__}: {e})")
             nl = netlist_mod.build_netlist(session.doc)
@@ -1220,7 +1220,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         _autosave_all_open_ecad()
 
         def _build():
-            from services.ecad.threed import board_to_step  # STAYS (T-RF20): no C++ counterpart; lazy import (OCP/build123d)
+            from services.ecad.threed import board_to_step  # STAYS: no C++ counterpart; lazy import (OCP/build123d)
             return board_to_step(doc, out_path)
 
         bstatus, bval = _run_with_budget(_build)
@@ -1253,7 +1253,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         step_path = result.get("step_path", out_path)
         summary   = result.get("summary", {})
         _ECAD["out_dir"] = os.path.dirname(step_path)
-        # T-FIN8: persist the aicad.boardphys/1 sidecar next to the STEP.
+        # Persist the aicad.boardphys/1 sidecar next to the STEP.
         boardphys = result.get("boardphys")
         sidecar_path = None
         sidecar_warnings: list = []
@@ -1297,7 +1297,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
 
 
 
-    # ---------------------------------------------------------------- SI rule pack (T-FIN10)
+    # ---------------------------------------------------------------- SI rule pack
 
     @mcp.tool()
     def ecad_set_net_class(name: str, params: Optional[Union[dict, str]] = None,
@@ -1351,7 +1351,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                     return _err(f"nets is not a valid list: {nets!r}")
         try:
             import copy as _copy
-            from services.ecad import si_rules as si_mod  # STAYS (T-RF20): no C++ counterpart
+            from services.ecad import si_rules as si_mod  # STAYS: no C++ counterpart
             new_doc = _copy.deepcopy(session.doc)
             res = si_mod.set_net_class(new_doc, str(name), params or {}, nets or [])
             ecad_session.swap_doc(session, new_doc)
@@ -1405,7 +1405,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         min_space).
         """
         try:
-            from services.ecad import stackup as stackup_mod  # STAYS (T-RF20): no C++ counterpart; lazy import
+            from services.ecad import stackup as stackup_mod  # STAYS: no C++ counterpart; lazy import
         except ImportError as e:  # noqa: BLE001
             return _err(f"stackup engine unavailable ({e})",
                         hint="engine.ecad.stackup could not be imported.",
@@ -1717,7 +1717,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             hb_errors = 0; hb_warnings = 0; hb_lines: list[str] = []
             if hostcheck:
                 try:
-                    from services.ecad import hostboard_rules as hb_mod  # STAYS (T-RF20): no C++ counterpart
+                    from services.ecad import hostboard_rules as hb_mod  # STAYS: no C++ counterpart
                     hb_v = hb_mod.run_hostcheck(pcb_sess.doc)
                     hb_sum = _erc_summary(hb_v)
                     hb_errors = hb_sum["errors"]

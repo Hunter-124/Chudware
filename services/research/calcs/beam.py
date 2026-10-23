@@ -3,9 +3,9 @@
 Supports cantilever and simply-supported beams with point load or UDL.
 Section types: rect (rectangular), round (solid circle), tube (hollow circle).
 
-This module is also the **cross-check primitive for T-W9 FEA verification**.
+This module is also the **cross-check primitive for FEA verification**.
 The pure compute functions (``section_props``, ``beam_calc_raw``) return plain
-numbers; call them directly from T-W9 without parsing an envelope.
+numbers; call them directly from FEA verification without parsing an envelope.
 
 Reference: Shigley's Mechanical Engineering Design, 10th ed., §3-4 (Beam
 deflection formulas) and §4-1 (area moment of inertia). Roark's Formulas for
@@ -75,7 +75,7 @@ def section_props(section: str, **dims) -> tuple[float, float]:
 
 
 # ---------------------------------------------------------------------------
-# Pure beam compute function (T-W9 callable interface)
+# Pure beam compute function (FEA cross-check callable interface)
 # ---------------------------------------------------------------------------
 
 def beam_calc_raw(
@@ -90,7 +90,7 @@ def beam_calc_raw(
 ) -> dict:
     """Compute beam deflection and bending stress; returns plain-number dict.
 
-    This is the T-W9 cross-check primitive — call it without parsing an envelope.
+    This is the FEA cross-check primitive — call it without parsing an envelope.
 
     Parameters
     ----------

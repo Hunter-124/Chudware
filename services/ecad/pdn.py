@@ -1,4 +1,4 @@
-"""PDN v1 — resistive DC IR-drop solve of power-net copper (T-FIN13).
+"""PDN v1 — resistive DC IR-drop solve of power-net copper.
 
 Meshes the copper of ONE power net (zone pours, track segments, pads, via barrels) into a
 2.5D resistor network and solves the DC node voltages with a sparse linear solve
@@ -16,7 +16,7 @@ Model
   length taken from the dielectric thicknesses between the spanned copper layers.
 * Regulator output pads (auto-detected via ``power_out`` pin etype on the placed
   symbol def, or passed explicitly) are Dirichlet sources held at ``vsrc``.
-* Component supply currents (aicad.boardphys/1 ``supply.rails`` metadata, T-FIN8;
+* Component supply currents (aicad.boardphys/1 ``supply.rails`` metadata;
   overridable per ref) are constant-current sinks injected at the component's pads on
   the net.
 
@@ -30,7 +30,7 @@ Outputs
 ``voltage_v_min`` tolerance, current-density hotspots (J in A/mm² vs a configurable
 limit), and the per-element I²R dissipation map. :func:`i2r_map_block` shapes that map
 into the ``pdn`` boardphys sidecar extension (schema ``aicad.pdn/1``) consumed by the
-ECAD→thermal handoff (T-FIN16); :func:`attach_pdn` merges one or more net results onto
+ECAD→thermal handoff; :func:`attach_pdn` merges one or more net results onto
 an ``aicad.boardphys/1`` sidecar document.
 
 Deliberate v1 scope: DC only (no plane inductance / AC impedance), arc tracks ignored
@@ -738,7 +738,7 @@ def solve_pdn(board: dict, net: str, *,
     }
 
 
-# ── boardphys sidecar extension (consumed by T-FIN16 thermal handoff) ────────────
+# ── boardphys sidecar extension (consumed by the thermal handoff) ────────────────
 
 def pdn_block(results: list[dict]) -> dict:
     """Shape solved nets into the boardphys `pdn` extension block (aicad.pdn/1)."""

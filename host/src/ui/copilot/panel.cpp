@@ -1,4 +1,4 @@
-// Chudware Copilot pane (T-RF6 split of legacy_chat.cpp — this file is the pane host).
+// Chudware Copilot pane — the pane host.
 //
 // A PINNED, full-height, rounded liquid-glass column overlaid on the viewport's right edge with
 // ~12dp margins (geometry from ui::viewportBackdrop(); visible left-edge resize boundary + grip;
@@ -38,7 +38,7 @@ namespace ui {
 
 // ---- header: collapse + [brand | Chat Tasks Artifacts ... gear] / [Sessions ... + New chat] ----
 // Copilot vertical-collapse state (file scope so the header's collapse chevron and drawAIPanel's
-// height animation share it). Mirrors the FeatureManager collapse (T-G21: rolls UP to this header
+// height animation share it). Mirrors the FeatureManager collapse (rolls UP to this header
 // strip instead of shrinking to a pill in both axes). Seeded from st.settings.copilotCollapsed on
 // drawAIPanel's first call (see s_cpInited there) so a collapsed column stays collapsed across
 // restarts.
@@ -46,7 +46,7 @@ static bool s_cpCollapsed = false;
 // The header's tabs are a RADIO set, not independent toggles: exactly one of Chat / Tasks /
 // Artifacts / Sessions / Settings is showing, and Chat is "no overlay". Sessions lives on the
 // second header row but belongs to the same set. AppState carries it as four bools
-// (integrator-owned), so funnel every read and write through these two so a new surface can
+// (a shared core type), so funnel every read and write through these two so a new surface can
 // never leave two of them true — or, worse, set one without clearing the rest.
 enum class CpTab { Chat, Tasks, Artifacts, Sessions, Settings };
 
@@ -2050,7 +2050,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
 
     static float s_paneW = 0.0f;                    // column width (px), session-persistent
     // s_cpCollapsed is file-scoped (shared with drawCopilotHeader's collapse chevron). Seed it
-    // once from the persisted setting (T-G21: a collapsed Copilot column stays collapsed across
+    // once from the persisted setting (a collapsed Copilot column stays collapsed across
     // restarts) — can't do this at s_cpCollapsed's own file-scope initializer since that runs
     // before loadSettings, so seed lazily on this function's first call instead.
     static bool s_cpInited = false;
@@ -2094,12 +2094,12 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             saveSettings(st.settings);
         }
         if (s_paneW <= 0.0f) s_paneW = ui::metrics::dockRightTarget();
-        if (std::getenv("CHUDWARE_COPILOT_NARROW"))       // T-G17 shot: capture the narrowest column
+        if (std::getenv("CHUDWARE_COPILOT_NARROW"))       // shot: capture the narrowest column
             s_paneW = ui::metrics::dockRightMin();
         if (st.shot)
             if (const char* width = std::getenv("CHUDWARE_COPILOT_WIDTH"))
                 s_paneW = ui::metrics::px(std::atof(width));
-        // T-G21 shot: mirrors CHUDWARE_FM_COLLAPSED — --ui-screenshot always resets the overlay
+        // Shot: mirrors CHUDWARE_FM_COLLAPSED — --ui-screenshot always resets the overlay
         // columns for determinism (see the reset branch above), which clobbers the persisted
         // collapse setting before it can render; force it back for the collapsed capture.
         if (std::getenv("CHUDWARE_COPILOT_COLLAPSED")) {
@@ -2114,7 +2114,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
                                   : std::min(std::max(s_paneW, ui::metrics::dockRightMin()), maxW);
         if (!mobile) s_paneW = paneW;
 
-        // T-G21: vertical collapse — the column rolls UP to its header row (drawCopilotHeader)
+        // Vertical collapse — the column rolls UP to its header row (drawCopilotHeader)
         // instead of shrinking to a pill in both axes (mirrors the FeatureManager column; see
         // ui::PanelCollapseAnim). Width is unaffected by collapse.
         const float animatedH = s_cpAnim.tick(s_cpCollapsed, colH);
@@ -2192,7 +2192,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     syncChatToDoc(st);
     maybePersistChatHistoryDebounced(st, /*force=*/false);
 
-    // T-G17 screenshot hook: CHUDWARE_COPILOT_VIEW forces a Copilot sub-view (and tops up a couple of
+    // Screenshot hook: CHUDWARE_COPILOT_VIEW forces a Copilot sub-view (and tops up a couple of
     // demo sessions) so the sessions/settings layouts can be captured headless in both themes. Runs
     // AFTER syncChatToDoc (which loads/ensures the resident sessions) and re-tops-up each frame so
     // the demo rows survive to the capture frame. Screenshot-only — gated on the env var, no effect
@@ -2223,7 +2223,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     }
     ImGui::Separator();
 
-    // T-G21: the title row + separator above IS the header strip a vertical collapse rolls up to
+    // The title row + separator above IS the header strip a vertical collapse rolls up to
     // — measure it (cursor position right after, symmetric-padded) so PanelCollapseAnim knows the
     // exact collapsed target, same one-frame-lag trick as s_composerH below. Everything from the
     // runtime banner down is gated on bodyVisible() so a collapsed column costs nothing per frame.

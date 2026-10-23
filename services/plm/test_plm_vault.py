@@ -1,6 +1,6 @@
-"""Tests for the PLM vault engine (T-R2, contract aicad.plm/1).
+"""Tests for the PLM vault engine (contract aicad.plm/1).
 
-Covers the T-R2 DoD:
+Covers:
   * zero-config init (open == create, silent, no visible files beyond .aicadvault/)
   * auto-history on save; checkpoint(message); release() per contract
   * release freezes geometry.step; restore rebuilds working container + APPENDS
@@ -249,7 +249,7 @@ def test_release_requires_note(tmp_path):
     _write(tmp_path, "Bracket.step+", _part())
     v = Vault.open(tmp_path)
     try:
-        # T-R3: in assisted/managed tiers an omitted note is drafted
+        # In assisted/managed tiers an omitted note is drafted
         # deterministically; the "a release needs a note" rule is enforced
         # whenever no draft is available — pin the manual tier to prove it.
         v.set_ai_mode("manual")
@@ -389,7 +389,7 @@ def test_second_release_supersedes_prior(tmp_path):
     try:
         iid = v.status()["items"][0]["item_id"]
         v.release(iid, "rev A")
-        # T-R4 lifecycle rule: a Released item is never edited in place —
+        # Lifecycle rule: a Released item is never edited in place —
         # "start a new revision" first, then the edit + next release.
         v.start_new_rev(iid)
         _write(tmp_path, "Bracket.step+", _part(5.0))
@@ -547,7 +547,7 @@ def test_client_checkpoint_writes_ai_attribution(tmp_path):
     _write(tmp_path, "Bracket.step+", _part())
     v = Vault.open(tmp_path)
     pid = v.status()["project_id"]
-    # T-R3 assist-tier floor: AI-authored entries require the managed tier
+    # Assist-tier floor: AI-authored entries require the managed tier
     v.set_ai_mode("managed")
     v.close()
 
@@ -573,7 +573,7 @@ def test_client_invalid_project_is_reason_envelope():
 
 
 def test_client_satisfies_bridge_protocol():
-    # the client must duck-type the T-W18 VaultClient Protocol (contract §7.1)
+    # the client must duck-type the VaultClient Protocol (contract §7.1)
     from services.agent.plm_bridge import VaultClient
     assert isinstance(PLMVaultClient(), VaultClient)
 

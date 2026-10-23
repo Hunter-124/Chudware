@@ -3,7 +3,7 @@
 // data (dimensions are facts; no ASME text). Only the schedules the aicad.piping/1
 // schema enumerates are vendored (STD/XS are aliased to 40/80 by the catalog).
 // Arrays are in mm, ascending NPS, exactly as fluids' NPS_lookup consumes them.
-// Regenerate with /tmp/rf19/gen_tables.py (do not hand-edit).
+// Regenerate from fluids' schedule tables (do not hand-edit).
 #pragma once
 
 namespace chudware { namespace piping { namespace tables {

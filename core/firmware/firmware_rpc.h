@@ -1,5 +1,5 @@
-// Firmware RPC dispatch (T-RF15) — the single entry the libchudware integrator
-// wires into core/api/libchudware.cpp. Mirrors the frozen surface of
+// Firmware RPC dispatch — the single entry core/api/libchudware.cpp
+// dispatches to. Mirrors the frozen surface of
 // contracts/firmware_rpc.md §5/§8 as implemented by
 // engine_oracle/firmware/mcp_tools.py + worker_rpc.py: dict in → dict out,
 // expected failures come back INSIDE the result as the {code, message, detail}

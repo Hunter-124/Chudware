@@ -36,7 +36,7 @@ Gates:
   - ui_shared_audit       : frozen UI vocabulary, icons and font assets agree with their manifest.
 
 The Python service suites are NOT run here; scripts/gate.sh runs them per unit under services/,
-tools/ and training/ with the runtime venv, e.g.:
+tools/, scripts/ and assets/ with the runtime venv, e.g.:
     .venv-mcp/bin/python -X utf8 -m pytest services/agent -q
 Pre-commit install: see scripts/hooks/pre-commit.
 """

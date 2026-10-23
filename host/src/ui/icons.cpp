@@ -198,7 +198,7 @@ void loadIcons(const std::string& assetsDir) {
             c.v1 = (float)(y + h) / ah;
             gAtlas.cells[it.key()] = c;
         }
-        // T-G15: photographic/screenshot tiles opt out of SDF derivation (see icons_sdf.h).
+        // photographic/screenshot tiles opt out of SDF derivation (see icons_sdf.h).
         if (jroot.contains("raster_only") && jroot["raster_only"].is_array())
             for (const auto& n : jroot["raster_only"])
                 if (n.is_string()) rasterOnly.insert(n.get<std::string>());

@@ -838,10 +838,10 @@ class ChudcodeEventMapperTests(unittest.TestCase):
                 "type": "extension_ui_request",
                 "id": "n",
                 "method": "notify",
-                "message": "Signed in as hunter",
+                "message": "Signed in as user",
             }
         )
-        self.assertEqual(row["purpose"], "Signed in as hunter")
+        self.assertEqual(row["purpose"], "Signed in as user")
         self.assertEqual(row["status"], "done")
 
     def test_command_output_and_error_frames(self):

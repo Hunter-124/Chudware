@@ -1,6 +1,6 @@
 # Contract: AI-VC (silent agent version control) — v1
 
-Append-only. Integrator-owned. Producer: `services/plm/ai_vc.py` (+ hooks in
+Append-only. Maintainer-owned. Producer: `services/plm/ai_vc.py` (+ hooks in
 `agent_turn` and `guardrails.take_auto_checkpoint`, `assist.ai_vc_on_mutate`).
 Consumers: copilot chat rollback UI, MCP agents, PLM workspace.
 
@@ -23,7 +23,7 @@ MCP tools + worker RPCs (identical shapes):
 
 Config: `plm.ai_vc: {keep_last: 0 (= keep all in session), full_every: 8, enabled: true}`.
 
-## v2 — prompt/tool-call granularity (2026-07-14, owner directive)
+## v2 — prompt/tool-call granularity (2026-07-14)
 - Checkpoint BEFORE every user prompt turn starts (`kind:"prompt"`, labeled with the prompt's
   first ~60 chars) and BEFORE every mutating tool call (`kind:"tool"`, labeled with tool name),
   still delta-encoded + deduped by content hash — same storage rules as v1.

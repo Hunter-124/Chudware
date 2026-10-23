@@ -1,4 +1,4 @@
-"""CAD import/export + standard-parts MCP tools (T-RF8 split of cad_tools.py): export_part, import_part, list_standard_parts, make_standard_part."""
+"""CAD import/export + standard-parts MCP tools (split out of cad_tools.py): export_part, import_part, list_standard_parts, make_standard_part."""
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
@@ -25,7 +25,7 @@ from .cad_common import (
 )
 
 def register_cad_exchange_tools(mcp: FastMCP) -> None:
-    """CAD import/export + standard-parts MCP tools (T-RF8 split of cad_tools.py): export_part, import_part, list_standard_parts, make_standard_part."""
+    """CAD import/export + standard-parts MCP tools (split out of cad_tools.py): export_part, import_part, list_standard_parts, make_standard_part."""
 
 
     @mcp.tool()

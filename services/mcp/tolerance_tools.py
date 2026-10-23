@@ -1,4 +1,4 @@
-"""Tolerance stack-up MCP tool (T-BL08).
+"""Tolerance stack-up MCP tool.
 
   stackup_analyze(dims, mode)  -> 1D worst-case + RSS tolerance stack-up report
 
@@ -8,7 +8,7 @@ MCP wrapper.
 
 Registration note: append-only in ``server.py`` (sibling to structural_tools).
 This module is named ``tolerance_tools.py`` (not structural_tools.py) so its
-registration line is independent of the concurrent T-BL04/16/17/18 appends.
+registration line is independent of the other structural/FEA tool appends.
 """
 from __future__ import annotations
 

@@ -1,5 +1,5 @@
 // core/materials/materials.h — the unified, provenance-stamped material registry
-// (T-RF19 leaf 6 C++ port of engine_oracle/materials/registry.py, T-F2). One
+// (C++ port of engine_oracle/materials/registry.py). One
 // first-party fact table (registry.json) read by the FEA seam, the DfM density
 // defaults, the CAM CuttingDB fold-in and the material_lookup research helper.
 // PURE: no OCCT, no doc/agent linkage; reads the SAME registry.json the Python

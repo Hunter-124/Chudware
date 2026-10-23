@@ -1,4 +1,4 @@
-"""services/browser/adapters/pcbway.py — PCBWay source adapter (T-X7).
+"""services/browser/adapters/pcbway.py — PCBWay source adapter.
 
 PCBWay is a PCB fab + parts source, same shape as jlcpcb.py: no CAD file for
 a parts-library hit, only a STRUCTURED price/stock record for ECAD BOM

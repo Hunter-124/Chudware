@@ -1,4 +1,4 @@
-"""Tests for T-R7 folder remotes, sync, locks, and author injection.
+"""Tests for folder remotes, sync, locks, and author injection.
 
 Covers (acceptance):
   * seed + clone round-trip
@@ -412,12 +412,12 @@ def test_author_env_injection_in_history(tmp_path, monkeypatch):
     project.mkdir()
     _write_part(project, "Bracket.step+")
 
-    monkeypatch.setenv("CHUDWARE_USER_ID", "sarah@ua.edu")
+    monkeypatch.setenv("CHUDWARE_USER_ID", "sarah@example.com")
     monkeypatch.setenv("CHUDWARE_USER_DISPLAY", "Sarah")
     monkeypatch.delenv("CHUDWARE_ACCOUNT_ID", raising=False)
     assert _user_author() == {
         "kind": "user",
-        "id": "sarah@ua.edu",
+        "id": "sarah@example.com",
         "display": "Sarah",
         "account_id": None,
     }
@@ -428,7 +428,7 @@ def test_author_env_injection_in_history(tmp_path, monkeypatch):
         v.save(message="sarah edit")
         entries = v.history()
         authored = [
-            e for e in entries if e["author"].get("id") == "sarah@ua.edu"
+            e for e in entries if e["author"].get("id") == "sarah@example.com"
         ]
         assert authored, entries
         assert authored[0]["author"]["display"] == "Sarah"

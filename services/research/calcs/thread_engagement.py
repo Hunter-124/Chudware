@@ -18,7 +18,7 @@ For two components of the same material this simplifies to the rule of thumb
 L_e ≈ 1.0 · d (for steel–steel) or L_e ≈ 1.5 · d (for aluminium–aluminium).
 This calculator implements the full formula so it works for any material pairing.
 
-Special case (work-order anchor):
+Reference case:
     M6 × 1.0, class 8.8 bolt into 6061-T6 aluminium:
     A_t = 20.1 mm²  (Shigley Eq. 8-2)
     S_p = 600 MPa

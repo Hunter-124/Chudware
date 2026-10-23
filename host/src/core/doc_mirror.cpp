@@ -628,7 +628,7 @@ bool DocMirror::activate(WorkerClient& w, const std::string& docId, std::string&
 }
 
 
-// T-PERF4: adopt a finished doc_rebuild response (AsyncRpc) as activate() would.
+// Adopt a finished doc_rebuild response (AsyncRpc) as activate() would.
 bool DocMirror::adoptActivateResponse(const std::string& docId, const nlohmann::json& res,
                                       std::string& aicmPath, std::string& err) {
     aicmPath.clear();

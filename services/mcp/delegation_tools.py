@@ -1,9 +1,9 @@
-"""Delegation MCP tools — ``delegate`` (aicad.delegation/1, T-W14).
+"""Delegation MCP tools — ``delegate`` (aicad.delegation/1).
 
 Family: ``delegation``.  Risk class: ``write`` (spawns a sub-agent with a budget).
 
 Contract: contracts/advisor.md §12 (FROZEN).
-Hunter directive 2026-07-04: the ``delegate`` tool is the ONLY mechanism by which
+Design decision (2026-07-04): the ``delegate`` tool is the ONLY mechanism by which
 role cards spawn sub-agents.  It is listed in role card tool_allowlists for
 orchestrator and department_manager.  Registering it here makes it a real resolved
 tool (no longer feature-flagged in roles.py FEATURE_FLAGGED_TOOLS).
@@ -71,7 +71,7 @@ def register_delegation_tools(mcp) -> None:
             budget_tokens: Token budget for the sub-agent (inherited by ancestors).
             kind: 'worker' (default) or 'ponder' (read-only, auto-approved any depth).
             parent_id: Parent delegation node id (defaults to orchestrator root).
-            docs: Doc lease requests [{doc_id, lease}] for T-W16 (request shape only).
+            docs: Doc lease requests [{doc_id, lease}] for the multi-doc workspace (request shape only).
 
         Returns:
             Delegation node dict with id, status, model, budget.

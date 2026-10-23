@@ -1,8 +1,6 @@
 # Contract: Telemetry — AI-Artifact Envelope & Consent Tiers — v1
 
 > **Scope anchor:** extends `contracts/events.md` v2. Defines capture semantics only.
-> Upload mechanics, exporter implementation, and `flywheel export` CLI are T-H5.
-> Cut ticket: T-H1. Survey source: `docs/review/CUSTOM_MODEL_INTEGRATION_SURVEY.md` §2.3–2.4.
 
 ---
 
@@ -10,13 +8,13 @@
 
 This contract governs **what is captured locally** when Chudware produces an AI artifact,
 how users react to it, and how semantic document deltas are recorded. It does **not**
-specify upload code, scheduling, or staging — those are T-H5 responsibilities.
+specify upload code, scheduling, or staging.
 
 **Principles:**
 
 1. **Capture always; export conditionally.** Every event is written to the local
-   `events.jsonl` sidecar regardless of consent tier. The exporter (T-H5) enforces
-   tier-based filtering at export time. This preserves the user's own replay history.
+   `events.jsonl` sidecar regardless of consent tier. Any export enforces tier-based
+   filtering (§4). This preserves the user's own replay history.
 
 2. **Persist-then-callback ordering.** The local sidecar write is committed before any
    in-process callback or UI notification fires. If the process crashes after write but
@@ -27,12 +25,12 @@ specify upload code, scheduling, or staging — those are T-H5 responsibilities.
    Producers follow the same rules: emit before final response, tolerate unknown keys.
 
 4. **Consent stamped at emission.** The emitter reads the resolved consent tier and
-   stamps it into every record before writing. The exporter does its own re-check; the
+   stamps it into every record before writing. Any downstream consumer re-checks; the
    stamp in the record is informational and audit-traceable, not the authoritative gate.
 
 5. **Undo journal is a prerequisite.** `edited` and `undone` action derivations require
-   the per-doc undo/ops journal persisted to disk. Persisting that journal is a T-H1
-   DoD item; correction traces cannot be derived without it.
+   the per-doc undo/ops journal persisted to disk; correction traces cannot be derived
+   without it.
 
 ---
 
@@ -61,7 +59,7 @@ subsequent action events for this artifact.
 | `kind` | `"ai_artifact"` | yes | Event discriminator |
 | `artifact_id` | string (UUID) | yes | Stable ID for this artifact; referenced by `ai_artifact_action` and `doc_semantic_diff` |
 | `run_id` | string | yes | Orchestrator run that produced this artifact; matches `run_started.run_id` in `events.md` §3 |
-| `insertion_point` | string | yes | IP label from the survey (e.g. `"IP-13"`); determines training derivation path |
+| `insertion_point` | string | yes | Insertion-point label (e.g. `"IP-13"`); determines training derivation path |
 | `model` | object | yes | See model sub-object below |
 | `model.provider` | string | yes | Model provider slug (e.g. `"anthropic"`, `"local"`) |
 | `model.model` | string | yes | Model name/ID (e.g. `"claude-fable-5"`) |
@@ -157,7 +155,7 @@ artifact's application and any subsequent user edits. Captures the feature-level
 | `artifact_id` | string (UUID) | yes | The artifact whose application initiated this diff span |
 | `from_revision` | int | yes | Starting revision (exclusive lower bound; the state before the artifact was applied) |
 | `to_revision` | int | yes | Ending revision (inclusive upper bound; final state after all user edits in this trace) |
-| `diff_ref` | string | yes | Path to sidecar file containing the feature-level diff (format per §3.3 of the survey) |
+| `diff_ref` | string | yes | Path to sidecar file containing the feature-level diff (format per `contracts/doc_ops.md` §3.3) |
 | `consent` | string | yes | Resolved consent tier at emission time (stamped by emitter; see §4) |
 
 #### Validation rules
@@ -170,7 +168,7 @@ artifact's application and any subsequent user edits. Captures the feature-level
 
 ## 3. Session Envelope
 
-Every export bundle and every local session directory contains one session envelope
+Every local session directory contains one session envelope
 record, written at session open and updated at session close.
 
 #### Wire format
@@ -184,7 +182,7 @@ record, written at session open and updated at session close.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `consent` | string enum | yes | Resolved consent tier for this session: `"off"` \| `"meta"` \| `"full"` |
-| `origin` | string enum | yes | `"team"` for internal dogfood installs; `"external"` for all other users |
+| `origin` | string enum | yes | `"team"` for internal development installs; `"external"` for all other users |
 | `app_version` | string | yes | Application version string (semver or build tag) |
 | `os` | string | yes | Operating system identifier (e.g. `"win32"`, `"linux"`, `"darwin"`) |
 
@@ -198,7 +196,7 @@ record, written at session open and updated at session close.
 #### Offline / ITAR override
 
 If `offline_enabled` is `true` in the resolved application config, the consent tier
-is **hard-forced to `"off"`** and the exporter is disabled entirely. This override is
+is **hard-forced to `"off"`** and nothing is exported. This override is
 applied at config-resolution time, before the session envelope is written. No UI toggle
 can override it while `offline_enabled` is active.
 
@@ -206,22 +204,22 @@ can override it while `offline_enabled` is active.
 
 ## 4. Consent Stamping Rules
 
-The emitter (not the exporter) resolves and stamps the consent tier into every event
-record before writing to the local `events.jsonl`. The exporter re-verifies at export
-time; the stamp is for audit traceability.
+The emitter resolves and stamps the consent tier into every event
+record before writing to the local `events.jsonl`. Any export re-verifies the tier;
+the stamp is for audit traceability.
 
 ### Tier: `off`
 
 - **Who:** external users (default); any user with `offline_enabled = true` (hard override).
 - **Events written locally:** yes — full fidelity, unchanged from current behavior.
-- **Exporter behavior:** refuses all records from this session. Records never leave the device.
+- **Export behavior:** no records from this session are exported. Records never leave the device.
 - **Fields included in local write:** all fields (no scrubbing at write time).
 
 ### Tier: `meta`
 
 - **Who:** users who opt in to meta-level sharing.
 - **Events written locally:** yes — full fidelity.
-- **Exporter behavior:** strips before export:
+- **Export behavior:** strips before export:
   - `input_ref` and `output_ref` sidecar contents are not uploaded (paths are nulled in export).
   - `edit_ops_ref` sidecar contents are not uploaded.
   - `diff_ref` sidecar contents are not uploaded.
@@ -236,11 +234,11 @@ time; the stamp is for audit traceability.
 
 ### Tier: `full`
 
-- **Who:** team dogfood installs (default); external users who explicitly opt in globally
+- **Who:** internal development installs (default); external users who explicitly opt in globally
   **and** have per-project opt-in enabled for the open project.
 - **Events written locally:** yes — full fidelity.
-- **Exporter behavior:** exports all fields. Sidecar files are bundled.
-- **Scrubbing still applied by exporter:**
+- **Export behavior:** exports all fields. Sidecar files are bundled.
+- **Scrubbing still applied on export:**
   - API keys, filesystem paths outside the project dir, and usernames are stripped from
     sidecar text content.
   - Machine IDs are hashed (not raw).
@@ -260,7 +258,7 @@ time; the stamp is for audit traceability.
 
 ## 5. Derivation Rules
 
-These derivations are computed mechanically by the exporter (T-H5) from the local
+These derivations are computed mechanically, after capture, from the local
 `events.jsonl`. They are not computed at capture time. All derivations require
 `consent != "off"` for the session.
 
@@ -304,7 +302,7 @@ Three sub-cases, all producing `(rejected_output, chosen_output)` pairs:
 - The undone artifact's `output_ref` is marked negative.
 - Any later artifact for the same logical request that receives `accepted`/`applied`
   becomes the positive (chosen).
-- K (the undo-window op count threshold) is a tunable exporter parameter; default = 5.
+- K (the undo-window op count threshold) is a tunable derivation parameter; default = 5.
 
 ---
 
@@ -325,7 +323,7 @@ the journal, `edit_ops_ref` cannot be populated and this derivation produces no 
 
 ### 5.4 Elicitation Gold
 
-**Trigger:** Design-brief sign-off event from T-F17's sign-off flow.
+**Trigger:** Design-brief sign-off event (`mission.brief.signed`, `contracts/agent_events.md` §4).
 
 **Output:** `(model_draft_ref, user_signed_brief_ref)` diff pair:
 - `model_draft_ref`: the `output_ref` of the IP-12 elicitation artifact.
@@ -362,7 +360,7 @@ persisted to disk alongside the document. This section defines the persistence c
 When the snapshot count exceeds the bound, the oldest snapshot is evicted (FIFO).
 Evicted snapshots that are referenced by an unexported `edit_ops_ref` or
 `undo_within_ops` event should be flagged in the event as `journal_evicted: true`
-to signal to the exporter that the correction trace is incomplete.
+to signal that the correction trace is incomplete.
 
 ### Contents
 
@@ -408,13 +406,10 @@ notification is fired. This is the same guarantee already required by the existi
 orchestrator events (`run_started`, `agent_output`, etc.). No new mechanism is needed;
 the existing write path must be used for these new event kinds.
 
-### 7.3 Exporter is T-H5
+### 7.3 Capture only
 
-This contract defines **capture semantics only**. The exporter — including the
-`flywheel export` CLI, the local staging directory, the upload transport, the consent
-re-verification pass, the scrubbing pipeline, and the per-project opt-in gate — is
-specified and implemented under T-H5. Nothing in this contract implies any network call
-or background process.
+This contract defines **capture semantics only**. Nothing in this contract implies any
+network call or background process.
 
 ### 7.4 No new event system
 
@@ -438,8 +433,8 @@ are stored in the run's sidecar directory:
   artifact_<artifact_id>_diff.jsonl
 ```
 
-Paths stored in `*_ref` fields are relative to the run directory. The exporter resolves
-them against the run directory when bundling for upload.
+Paths stored in `*_ref` fields are relative to the run directory; consumers resolve them
+against the run directory.
 
 ### 7.6 Timestamps
 
@@ -449,13 +444,13 @@ a `ts` field even though the base contract does not require it.
 
 ### 7.7 Provenance field requirement
 
-Every training record derived by the exporter (§5) must carry a `provenance` field:
+Every training record derived per §5 must carry a `provenance` field:
 
 ```json
 {"provenance": {"source": "telemetry", "session_id": "…", "artifact_id": "…",
                 "consent": "full", "app_version": "…", "ts_derived": "…"}}
 ```
 
-This satisfies the legal cleanliness constraint from §2.4: corpus = consented telemetry
+Legal cleanliness constraint: corpus = consented telemetry
 + synthetic factory + licensed/OSS datasets; every record must be traceable to its
 consent grant.

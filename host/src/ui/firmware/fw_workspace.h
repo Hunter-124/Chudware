@@ -1,7 +1,7 @@
-// Firmware workspace (T-FIN5) — full-viewport body for the "Firmware" title-bar tab.
+// Firmware workspace — full-viewport body for the "Firmware" title-bar tab.
 // Project browser + sources | build console (parsed warnings) + emulation run panel with
-// live UART console | GPIO/waveform trace viewer (aicad.firmware.trace/1, T-FIN1) |
-// fw_status-gated Flash/Debug rail (honest gating: missing backend shows the T-FIN4
+// live UART console | GPIO/waveform trace viewer (aicad.firmware.trace/1) |
+// fw_status-gated Flash/Debug rail (honest gating: missing backend shows the
 // doctor guidance, never a dead button).
 //
 // GL-thread only. ALL engine traffic goes through ASYNC st.rpc.call — never a sync
@@ -19,7 +19,7 @@ namespace ui {
 // (same pattern as drawPlmWorkspace / drawRevEngWorkspace).
 void drawFirmwareWorkspace(AppState& st);
 
-// Progressive disclosure (T-FIN24 rules): the title-bar tab is offered when a firmware
+// Progressive disclosure rules: the title-bar tab is offered when a firmware
 // project exists, an ECAD workspace/doc is in play, or the workspace is already active.
 // Cheap to call per frame — "project exists" is a throttled LOCAL disk probe of
 // firmware_root() (worker-independent, so the tab discloses at startup even before the

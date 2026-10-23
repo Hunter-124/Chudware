@@ -65,10 +65,10 @@ Back-edges (retry loops) **must** carry `retry_budget`:
    output as another's input. The executor resolves these at runtime.
 8. **`tools`:** list only the MCP tools the node needs. Omit (or set `null`) to
    allow all tools (maximum autonomy). Always restrict for `gate` and `verify` nodes.
-9. **`verify`:** always `null` for now (T-A4 owns the verifier battery).
+9. **`verify`:** always `null` for now (reserved for the verifier battery).
 10. **Gate nodes** must have `autonomy: "approve"` or `autonomy: "manual"` — never
     `"auto"`.
-11. **Layout-first (T-BL50 — MANDATORY for any design node):** The FIRST node of any
+11. **Layout-first (MANDATORY for any design node):** The FIRST node of any
     graph that contains a `design`, `structural`, or `simulate` node MUST call
     `layout_plan(doc_id, envelope_x_mm, envelope_y_mm, envelope_z_mm, critical_dims,
     interfaces)` to capture the overall envelope, every interface between components,

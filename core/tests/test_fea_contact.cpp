@@ -1228,7 +1228,7 @@ TEST_CASE("contact: the load path decides whether the pressure is reliable") {
 }
 
 // ── (k) The clearance is the SURFACES', not the facets' ─────────────────────────
-// The ME 490 hinge case. A Ø12.000 pin sits in a Ø12.600 saddle: a 0.300 mm radial
+// The rover hinge case. A Ø12.000 pin sits in a Ø12.600 saddle: a 0.300 mm radial
 // clearance, confirmed analytically by check_interference to 5e-8 mm. Meshed at
 // ~3 mm the interface reported a closest approach of 0.03665 mm and the resolution
 // guard — correctly, on that number — demanded an interface element size of

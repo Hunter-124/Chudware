@@ -6,9 +6,10 @@
 // Darwin (there is no /proc there) and three of them re-implemented the same
 // UTF-16 -> UTF-8 conversion on Windows. Route every call site through here.
 //
-// Both functions are pure queries: they never throw, never log, and report
-// failure by value ("" / false).
+// All functions are pure queries: they never throw, never log, and report
+// failure by value ("" / false / empty path).
 
+#include <filesystem>
 #include <string>
 
 namespace chudware::platform {
@@ -28,5 +29,11 @@ std::string executablePath();
 // slot. Zombies are excluded — that is what the /proc/<pid>/stat state check
 // bought on Linux and what sysctl(KERN_PROC_PID) buys on Darwin.
 bool processAlive(long pid);
+
+// Developer-build source checkout: the nearest ancestor of the executable's
+// directory, then of the current directory, that contains
+// services/worker_main.py. Empty when neither lies inside a checkout (always
+// empty in the browser).
+std::filesystem::path developerSourceRoot();
 
 }  // namespace chudware::platform

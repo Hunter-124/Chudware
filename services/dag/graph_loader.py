@@ -1,7 +1,6 @@
 """graph_loader.py — Validate and build an aicad.dag/1 graph as a LangGraph StateGraph.
 
 Contract: contracts/dag_schema.md
-Scaffold: T-A1. Node handler dispatch wired in T-A2.
 """
 from __future__ import annotations
 
@@ -67,7 +66,7 @@ class DagState(TypedDict, total=False):
     """Mission DAG state with reducers on every key that parallel nodes may write.
 
     Without Annotated reducers, two parallel ``n_spec_DL*`` completions raise
-    ``INVALID_CONCURRENT_GRAPH_UPDATE`` on the shared channel (mega-1 stop_reason).
+    ``INVALID_CONCURRENT_GRAPH_UPDATE`` on the shared channel.
     """
     run_id: Annotated[str, _last_value]
     session_id: Annotated[str, _last_value]
@@ -171,7 +170,7 @@ def _classify_edges(
 
 
 # ---------------------------------------------------------------------------
-# Node handler — real dispatch via node_runner (T-A2)
+# Node handler — real dispatch via node_runner
 # ---------------------------------------------------------------------------
 
 def _make_node_handler(
@@ -184,11 +183,10 @@ def _make_node_handler(
 ) -> Callable[[DagState], DagState]:
     """Return a LangGraph node function with real capability dispatch.
 
-    T-A2 replaces the T-A1 stub: instead of a hardcoded "done" output,
-    each node is executed via node_runner.run(), which wraps the agent loop
+    Each node is executed via node_runner.run(), which wraps the agent loop
     with an isolated context pack (inputs, allowed tools, retry budget).
 
-    T-A3 wires real interrupt() for approve/manual autonomy via gate.run_gate().
+    Real interrupt() is wired for approve/manual autonomy via gate.run_gate().
     The verdict returned by node_runner ("done" | "retry" | "escalate") is
     written into the node state so the conditional router built by
     build_state_graph() can route accordingly.
@@ -210,7 +208,7 @@ def _make_node_handler(
         # serialised by the LangGraph checkpoint serde).
         _emit: EmitFn = emit
 
-        # --- autonomy gate (T-A3: real interrupt()) --------------------------
+        # --- autonomy gate (real interrupt()) ---------------------------------
         # NOTE on events: dag.node.paused / dag.node.approval_required /
         # dag.node.manual_required are NOT emitted here.  On resume, LangGraph
         # re-executes this handler from the top before interrupt() returns the
@@ -277,7 +275,7 @@ def _make_node_handler(
                                 node_id: node_entry},
             }
 
-        # --- verify node (T-A4: deterministic dispatch via verify.run) --------
+        # --- verify node (deterministic dispatch via verify.run) --------------
         # Only intercept verify nodes that declare a check_type in inputs.
         # Without check_type the node falls through to node_runner (agent path)
         # for backward compatibility with agent-driven verify nodes.
@@ -322,7 +320,7 @@ def _make_node_handler(
         if "retry_remaining" not in current_node_state:
             current_node_state = {**current_node_state, "retry_remaining": initial_retry_budget}
         pack = cp.assemble(node, current_node_state)
-        # mega-8: seed run_id from LangGraph state so agent_turn op-vocab
+        # Seed run_id from LangGraph state so agent_turn op-vocab
         # cheatsheet keys once-per-mission, overseer/leaf telemetry share the
         # same id, and context_pack.get("run_id") is never silently None.
         rid = state.get("run_id")
@@ -534,7 +532,7 @@ def build_state_graph(
             # Build a conditional router: retry → back_target; else → forward.
             # Only the first back-edge is supported per node in this version
             # (multiple retry loops from one node is an unusual pattern; if
-            # needed, file a contract change via T-A2.md questions).
+            # needed, propose a contract change).
             be = be_list[0]
             back_target = be["to"]
             # The forward target: first forward successor, or END.
@@ -593,7 +591,7 @@ def build_state_graph(
     if len(entry_nodes) == 1:
         sg.set_entry_point(entry_nodes[0])
     else:
-        # Multiple entry nodes: create a synthetic START fan-out (scaffold; T-A2 may refine)
+        # Multiple entry nodes: create a synthetic START fan-out
         warnings.warn(
             f"Graph has {len(entry_nodes)} entry nodes {entry_nodes!r}; "
             "only the first is used as the LangGraph entry point in this scaffold.",

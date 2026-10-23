@@ -1,4 +1,4 @@
-"""services/browser/adapters/thk.py — THK source adapter (T-X7).
+"""services/browser/adapters/thk.py — THK source adapter.
 
 THK (thk.com) makes linear motion guides, ball screws and actuators. Search
 is public; per-part CAD (STEP) downloads sit behind the user's own THK
@@ -9,7 +9,7 @@ NOTE: search() is verified against a saved real THK site-search page (the
 "popfind" widget renders result cards as <div class="_item"> with a
 <div class="_title"><a href=...> and a sibling <div class="_thumbnail">).
 The acquire() download markers remain a best-effort shape, not verified
-against a live logged-in THK session (T-X6 gates the real per-source
+against a live logged-in THK session (the gated integration suite covers the real per-source
 integration tests behind an env flag).
 """
 from __future__ import annotations

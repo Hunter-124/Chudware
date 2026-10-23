@@ -1,8 +1,6 @@
 """executor.py — Run an aicad.dag/1 graph with SQLite-persisted checkpoints.
 
 Contract: contracts/dag_schema.md §9–§11
-Scaffold: T-A1. Real capability dispatch in T-A2; interrupt() in T-A3; verify in T-A4.
-
 Usage:
     from services.dag import executor
     result = executor.run(graph_json, initial_state={})
@@ -37,8 +35,8 @@ def default_runs_dir() -> Path:
     - Linux/macOS: $XDG_DATA_HOME/Chudware/runs/  (default ~/.local/share/Chudware/runs/)
     - Windows:     %APPDATA%\\Chudware\\runs\\
 
-    Note: services/paths.py does not have a Linux XDG branch (known issue, out of scope
-    for T-A1).  This function is the authoritative runs-dir resolver for services/dag.
+    Note: services/paths.py does not have a Linux XDG branch (known issue).
+    This function is the authoritative runs-dir resolver for services/dag.
     Override via the runs_dir parameter to run() for hermetic tests.
     """
     if in_cell():
@@ -118,7 +116,7 @@ def run(
     if not graph_json_path.exists():
         graph_json_path.write_text(json.dumps(graph_json), encoding="utf-8")
 
-    # T-F17: wrap the caller's emit with an EventJournal so every dag.* event is
+    # Wrap the caller's emit with an EventJournal so every dag.* event is
     # persisted to events.jsonl for mission-control replay-on-reopen.
     # The journal's cache/runs dir is intentionally separate from the checkpoint db_path
     # (which lives in runs/) per contracts/agent_events.md §1.
@@ -187,7 +185,7 @@ def run(
     # §14 narration fields: describe_project(run=...) in gsl_tools.py reads
     # "name"/"project", "open_questions", and "budget" via .get().  Populate the
     # two we can reliably source; budget is omitted (loop.py carries no token
-    # usage surface — T-F17 may add it later; the contract degrades gracefully).
+    # usage surface — it may be added later; the contract degrades gracefully).
     return {
         "run_id": run_id,
         "name": graph_json.get("name", ""),          # §14: project name for narration
@@ -273,7 +271,7 @@ def resume(
 
     validate_graph(graph_json)
 
-    # T-F17: wrap the caller's emit with the journal so resume events are also persisted.
+    # Wrap the caller's emit with the journal so resume events are also persisted.
     journal = EventJournal(run_id)
     emit = journal.wrap(emit)
 

@@ -1,18 +1,18 @@
 """Tests for services/agent/roles.py — role cards, playbooks, handoff machinery.
 
-Covers the T-W7 Definition of Done:
+Covers:
   - the 13 AUTHORED role cards + 6 playbooks all load and validate (zero errors);
   - allowlists are enforced through the MCP tool_registry (an out-of-scope tool call
     is refused) and are ≤14 tools per role;
   - structured handoffs validate against the card schema and round-trip through the
-    design ledger (T-W1);
+    design ledger;
   - the context assembler respects the §9.1 injection order and describer budgets;
   - the GBNF emitter produces a grammar that PARSES a valid handoff and rejects a
     malformed one (proven with a self-contained GBNF acceptor — no new dependency);
-  - the sketch_profile playbook matches docs/ADVISOR_ARCHITECTURE.md §2.4;
-  - ``delegate`` is now registered (T-W14); ``workspace_status`` registered (T-W16).
-    The org-layer tools (channel_send, request_resolve, council_convene, request_raise)
-    are now registered via services/mcp/org_tools.py (T-W22). FEATURE_FLAGGED_TOOLS is empty.
+  - the sketch_profile playbook matches docs/design/ADVISOR_ARCHITECTURE.md §2.4;
+  - ``delegate`` and ``workspace_status`` are registered. The org-layer tools
+    (channel_send, request_resolve, council_convene, request_raise) are registered
+    via services/mcp/org_tools.py. FEATURE_FLAGGED_TOOLS is empty.
 
 Runs headless: no FastMCP, no libchudware, no network, no LLM. The tool catalog is
 built by registering the MCP tool modules against a stub (the same pattern
@@ -151,7 +151,7 @@ class _Gbnf:
         # Repetition suffixes. A quoted literal always ends with '"', so a token
         # ending in * or ? is a suffix — including an OPTIONAL quoted literal like
         # `"-"?` (used by the integer/number rules); the old `not startswith('"')`
-        # guard wrongly excluded that case and broke integer handoffs (T-DP2/DP3).
+        # guard wrongly excluded that case and broke integer handoffs.
         if tok.endswith("*") or tok.endswith("+"):
             plus = tok.endswith("+")
             base = tok[:-1]
@@ -310,10 +310,10 @@ def _class_match(tok, ch):
 class TestLoadAndValidate(unittest.TestCase):
     def test_all_roles_load(self):
         # 13 pipeline roles + department_manager + design_thinker (org/ladder
-        # layers) + feature_architect (design-pipeline Stage 1, T-DP2) +
-        # geometry_designer (design-pipeline Stage 2, T-DP3) +
-        # linkage_planner (design-pipeline Stage 3, T-DP4) +
-        # sourcing_specialist (Parts Library V2 workstream 5).
+        # layers) + feature_architect (design-pipeline Stage 1) +
+        # geometry_designer (design-pipeline Stage 2) +
+        # linkage_planner (design-pipeline Stage 3) +
+        # sourcing_specialist (Parts Library V2).
         # council_seats.yaml is data, not a card.
         cards = roles.load_all_roles()
         self.assertGreaterEqual(len(cards), 19, sorted(cards))
@@ -344,8 +344,8 @@ class TestLoadAndValidate(unittest.TestCase):
         findings = roles.validate_suite(tool_names=_CATALOG)
         flagged = {f.message.split("'")[1] for f in roles.flags(findings)
                    if "not yet registered" in f.message}
-        # T-W14: delegate registered. T-W16: workspace_status registered.
-        # T-W22: channel_send, request_resolve, council_convene registered via org_tools.
+        # delegate and workspace_status are registered; channel_send,
+        # request_resolve, council_convene are registered via org_tools.
         # All org-layer tools now registered → empty set expected.
         self.assertEqual(flagged, set())
 
@@ -375,7 +375,7 @@ class TestLoadAndValidate(unittest.TestCase):
 
 
 class TestSketchProfileVerbatim(unittest.TestCase):
-    """sketch_profile must match docs/ADVISOR_ARCHITECTURE.md §2.4."""
+    """sketch_profile must match docs/design/ADVISOR_ARCHITECTURE.md §2.4."""
 
     def test_steps_and_helpers(self):
         pb = roles.load_playbook("sketch_profile")
@@ -388,7 +388,7 @@ class TestSketchProfileVerbatim(unittest.TestCase):
         self.assertEqual(pb.exit_gate,
                          ("sketch_fully_constrained", "profile_closed",
                           "no_conflicting_tags"))
-        # helper tool names from the §2.4 spec / T-W2/T-W3 contracts
+        # helper tool names from the §2.4 spec / sketch-tool contracts
         helpers = {h for s in pb.steps for h in s.helper_tools}
         self.assertIn("sketch_health", helpers)
         self.assertIn("suggest_dimension_scheme", helpers)

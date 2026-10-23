@@ -37,7 +37,7 @@ def _status(params: dict, _emit: Optional[Callable] = None) -> dict:
             "analyses": ["eigenmode", "driven", "timedomain"],
             "note": ("openEMS is the full-wave FDTD engine; builtin-fdfd (real 2-D "
                      "eigensolver) and analytic-uniform (closed-form straight sections) "
-                     "always work. See docs/EM_SIMULATION.md for install recipes.")}
+                     "always work. See docs/reference/EM_SIMULATION.md for install recipes.")}
 
 
 def _run(analysis: str, params: dict) -> dict:

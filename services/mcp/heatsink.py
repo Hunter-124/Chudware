@@ -1,5 +1,5 @@
-"""Heatsink selection loop (T-FIN17) — parts-library + parametric candidates solved
-to a Tj (or case-temp) target on top of the T-FIN16 ECAD->thermal pipeline.
+"""Heatsink selection loop — parts-library + parametric candidates solved
+to a Tj (or case-temp) target on top of the ECAD->thermal pipeline.
 
 Tool:
   heatsink_select   given a hot component ref + a target from the last
@@ -294,7 +294,7 @@ def heatsink_select_impl(component_ref: str,
                          handoff_id: Optional[str] = None) -> dict:
     """Pick a heatsink for a hot component: candidates re-solved to a Tj target.
 
-    Returns a dict (not JSON). Worker seam (T-FIN24 multiphysics_rpc) and the MCP
+    Returns a dict (not JSON). Worker seam (multiphysics_rpc) and the MCP
     tool both call this; the MCP tool wraps with json.dumps.
 
     Optional worker ownership: doc_id and handoff_id (the source result.simhandoff.id)

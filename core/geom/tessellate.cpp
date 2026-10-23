@@ -131,7 +131,7 @@ double bbox_relative_deflection(const TopoDS_Shape& shape, double rel, double fl
 
 }  // namespace
 
-// Size-relative default linear deflection (T-PERF7b, perf audit §4 P2). A fixed
+// Size-relative default linear deflection. A fixed
 // absolute 0.05 mm meshed multi-metre imports at millions of triangles; scale the
 // chord tolerance with the part instead:
 //   lin = clamp(bbox_diag * kAutoRel, kAutoFloor, kAutoCeil)

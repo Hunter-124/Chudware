@@ -30,7 +30,7 @@
 
 #include "../core/app_state.h"
 #include "../core/sim_client.h"  // simaudit: mesh-preview idle wait (SimClient::busy)
-#include "../renderer.h"  // T-G15 iconpipe: transparent thumbnail render + FBO readback
+#include "../renderer.h"  // iconpipe: transparent thumbnail render + FBO readback
 #include "../render/splat_renderer.h"  // RE-28: 3DGS splat renderer
 #include "cam/cam_panel.h"  // camLoadJob (CAM copilot fast-path scenario)
 #include "asm_panels.h"
@@ -1359,7 +1359,7 @@ void demoReviewTick(AppState& st) {
         D.report["opened_copy"] = D.copy;
         // The selected root is the SOURCE demo's folder; the copy lives outside it (scratch), so
         // opening it must not move the root. Assigned in memory only — the shot never saves
-        // settings, so the owner's persisted working folder is untouched.
+        // settings, so the user's persisted working folder is untouched.
         D.root = std::filesystem::path(doc).parent_path().string();
         st.workspaceDir = D.root;
         D.report["workspace_root"] = D.root;
@@ -2042,18 +2042,18 @@ bool dwgOpenEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, b
 
 // ---------- project-scoped chat scenario (CHUDWARE_SHOT=projectchat) ----------
 // The selected root (st.workspaceDir) is the sole chat authority. Seeds the shot's PRIVATE session
-// store with an ME-490 session and a Demo-SpaceX session plus an index whose global `active` and
+// store with a Bracket session and a Demo-SpaceX session plus an index whose global `active` and
 // polluted `active_by_project` (old builds keyed the on-screen session under the current root)
-// both name the ME-490 one, then reloads that store under Demo-SpaceX the way startup does.
+// both name the Bracket one, then reloads that store under Demo-SpaceX the way startup does.
 // Checks, each driven through the real frame loop (Copilot column + Sessions list):
 //   startup: the active session reconciles to Demo-SpaceX's own; the rewritten index carries no
 //     cross-project entry; Sessions shows Demo-SpaceX.
-//   root A/B/C: with a (simulated) run live in Demo-SpaceX's session, selecting ME-490 restores
-//     ME-490's session and parks the run untouched; an empty root opens a new session there;
+//   root A/B/C: with a (simulated) run live in Demo-SpaceX's session, selecting Bracket restores
+//     Bracket's session and parks the run untouched; an empty root opens a new session there;
 //     returning restores the still-running Demo-SpaceX session; Sessions follows each root.
 //   outside document: a part saved outside the root opens through File > Open and tab
 //     switches between it and an in-root part never move the root, plmProjectPath() or the chat.
-//   explicit pick: opening the ME-490 session from Sessions keeps it open under Demo-SpaceX
+//   explicit pick: opening the Bracket session from Sessions keeps it open under Demo-SpaceX
 //     without claiming Demo-SpaceX's remembered slot; Sessions still shows the root.
 // Root switches assign st.workspaceDir in memory only (no settings save). Refuses to run against
 // a named CHUDWARE_SESSIONS_DIR. Captures + projectchat_report.json land in
@@ -2068,7 +2068,7 @@ struct ProjectChatShot {
 };
 ProjectChatShot g_pchat;
 
-constexpr const char* kPcSessA = "pc_me490";
+constexpr const char* kPcSessA = "pc_bracket";
 constexpr const char* kPcSessB = "pc_demo_spacex";
 
 void pchatFail(const std::string& code, const nlohmann::json& evidence) {
@@ -2179,7 +2179,7 @@ void projectChatTick(AppState& st) {
                       {{"reason", "projectchat rewrites its session store; unset CHUDWARE_SESSIONS_DIR"}});
             return;
         }
-        P.rootA = P.dir + "/ME-490";
+        P.rootA = P.dir + "/Bracket";
         P.rootB = P.dir + "/Demo-SpaceX";
         P.rootC = P.dir + "/Fresh-Project";
         P.outsidePath = P.dir + "/Outside/outside_bracket.step+";
@@ -2198,7 +2198,7 @@ void projectChatTick(AppState& st) {
                                                 {{"u", false}, {"t", reply}, {"ts", 1.7e9 + 5}}})}};
             std::ofstream(store + "/" + id + ".json", std::ios::trunc) << js.dump(1);
         };
-        session(kPcSessA, "ME-490 bracket revision", P.rootA, "Thicken the ME-490 bracket web",
+        session(kPcSessA, "Bracket revision", P.rootA, "Thicken the bracket web",
                 "The web is now 6 mm.");
         session(kPcSessB, "Demo-SpaceX HPU cooling", P.rootB, "Size the HPU cooling loop",
                 "The loop needs 38 L/min.");
@@ -2218,7 +2218,7 @@ void projectChatTick(AppState& st) {
         next(1);
         return;
     }
-    case 1: {  // startup reconciled to the root; the index no longer lets ME-490 claim it
+    case 1: {  // startup reconciled to the root; the index no longer lets Bracket claim it
         if (!pchatCheck("startup_active_is_root_session",
                         idxA >= 0 && idxB >= 0 && st.activeConvId() == kPcSessB &&
                             pchatActiveKey(st) == P.keyB,
@@ -2239,7 +2239,7 @@ void projectChatTick(AppState& st) {
         shoot("01_startup_sessions");
         next(3, 0);
         return;
-    case 3: {  // a live turn in Demo-SpaceX's session, then select ME-490 as the root
+    case 3: {  // a live turn in Demo-SpaceX's session, then select Bracket as the root
         ChatMsg user;
         user.fromUser = true;
         user.text = "Check the HPU return line velocity";
@@ -2273,7 +2273,7 @@ void projectChatTick(AppState& st) {
     }
     case 5:
         if (!sessionsShow(P.keyA, "sessions_follow_root_a")) return;
-        shoot("02_root_me490");
+        shoot("02_root_bracket");
         st.workspaceDir = P.rootC;
         next(6);
         return;
@@ -2366,8 +2366,8 @@ void projectChatTick(AppState& st) {
         shoot("04_outside_document");
         next(14, 0);
         return;
-    case 14:  // the user explicitly opens ME-490's session from the Sessions list
-        if (idxA < 0) { pchatFail("me490_session_missing", pchatState(st)); return; }
+    case 14:  // the user explicitly opens Bracket's session from the Sessions list
+        if (idxA < 0) { pchatFail("bracket_session_missing", pchatState(st)); return; }
         ui::switchConversation(st, idxA);
         next(15);
         return;
@@ -8170,7 +8170,7 @@ void ScenarioRunner::tick(AppState& st) {
                     if (r.feature_status.is_array() && !r.feature_status.empty())
                         exok = r.feature_status.back().value("ok",false);
                     st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
-                    // T-WIN1: reset residual pan before the headless capture. Entering the sketch
+                    // Reset residual pan before the headless capture. Entering the sketch
                     // animates a Normal-To that leaves st.pan offset, so zoom=1 alone frames the
                     // scene radius but off-CENTRE -> the solid falls outside the shot. ZoomFit fixes
                     // this via kZeroPan; do the same directly here. Capture-only, platform-agnostic.
@@ -8743,7 +8743,7 @@ void ScenarioRunner::tick(AppState& st) {
         }
     }
 
-    // ---------- T-FIN24 disclosure-matrix scenario (CHUDWARE_SHOT=simdisc_mech|simdisc_ecad) ----------
+    // ---------- Disclosure-matrix scenario (CHUDWARE_SHOT=simdisc_mech|simdisc_ecad) ----------
     // Proves the Simulate tab's progressive disclosure: mech-only -> no electronics study
     // kinds in the "+ New Study" picker; with a PCB tab open -> electronics simulation +
     // firmware emulation rows appear. The picker is held open for the capture via the
@@ -8995,10 +8995,10 @@ void ScenarioRunner::tick(AppState& st) {
             case 1: {
                 st.evaluateDialogs->handleCommand(st, "eval_mass_props");
                 std::printf("evalmass: mass properties window opened\n"); std::fflush(stdout);
-                // T-G14: the eval runs async on the dispatch thread; give it frames to drain so the
+                // The eval runs async on the dispatch thread; give it frames to drain so the
                 // result (mass/volume/CoM/inertia rows) populates before capture. Without this the
                 // window is captured while still "Computing" (or 1 frame after), so it never shows
-                // the auto-size-to-content behaviour the T-G14 fix restores.
+                // the auto-size-to-content behaviour the adaptive-ink fix restores.
                 evalSettle = 40; ++evalStep; break;
             }
             default:
@@ -9024,7 +9024,7 @@ void ScenarioRunner::tick(AppState& st) {
     // ---------- first-run onboarding scenario (CHUDWARE_SHOT=onboarding) ----------
     runOnboarding(st);
 
-    // ---------- T-G15 icon pipeline (CHUDWARE_SHOT=iconpipe) ----------
+    // ---------- Icon pipeline (CHUDWARE_SHOT=iconpipe) ----------
     runIconPipe(st);
 
     // ---------- RE-28 3DGS splat scenario (CHUDWARE_SHOT=reveng_splat) ----------
@@ -9127,7 +9127,7 @@ void ScenarioRunner::runOnboarding(AppState& st) {
     std::fflush(stdout);
 }
 
-// T-G15 icon pipeline (CHUDWARE_SHOT=iconpipe). Recipe-driven clean-viewport icon generator: reads a
+// Icon pipeline (CHUDWARE_SHOT=iconpipe). Recipe-driven clean-viewport icon generator: reads a
 // JSON recipe list from CHUDWARE_ICON_RECIPES { out_dir?, px?, recipes:[{name,yaw,pitch,ops:[...]}] }
 // and, one recipe per pass, builds the demo part (newPart + applyOps — the SAME engine contract the
 // other scenarios use) then renders it through the renderer's transparent thumbnail path (no chrome,
@@ -10038,7 +10038,7 @@ void ScenarioRunner::runDrawing(AppState& st) {
                 "drawing_set_titleblock",
                 {{"doc_id", tab.drawingDocId}, {"sheet_id", "s1"},
                  {"fields", {{"title", "MOUNTING PLATE"}, {"part_number", "CW-PLT-0042"},
-                             {"drawn_by", "H. Hunter"}, {"checked_by", "QA"},
+                             {"drawn_by", "Designer"}, {"checked_by", "QA"},
                              {"material", "AL 6061-T6"}, {"finish", "ANODISE CLEAR"},
                              {"general_tolerance", "ISO 2768-m"}, {"company", "CHUDWARE"},
                              {"rev", "A"}}}},

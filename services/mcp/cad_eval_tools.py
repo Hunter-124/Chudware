@@ -1,4 +1,4 @@
-"""CAD query/measure/check MCP tools (T-RF8 split of cad_tools.py): query_geometry, check_sketch, measure*, interference/overlap/symmetry/section/wall/draft checks."""
+"""CAD query/measure/check MCP tools (split out of cad_tools.py): query_geometry, check_sketch, measure*, interference/overlap/symmetry/section/wall/draft checks."""
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
@@ -692,7 +692,7 @@ def _teach_unknown_sketch(e: Exception, doc_id: Optional[str]) -> Exception:
 
 
 def register_cad_eval_tools(mcp: FastMCP) -> None:
-    """CAD query/measure/check MCP tools (T-RF8 split of cad_tools.py): query_geometry, check_sketch, measure*, interference/overlap/symmetry/section/wall/draft checks."""
+    """CAD query/measure/check MCP tools (split out of cad_tools.py): query_geometry, check_sketch, measure*, interference/overlap/symmetry/section/wall/draft checks."""
 
 
     @mcp.tool()

@@ -573,7 +573,7 @@ private:
     // to control, so at 0 deg and at 180 deg its Jacobian row is exactly ZERO: the mate
     // adds no rank (reported `redundant`, residual 0, the solver cannot drive it) and a
     // mate authored a few degrees off zero has a first-order-flat residual the LM stalls
-    // on (ME 490 phase 5F: a steer joint stuck at 3.589e-03 across three passes). A dot
+    // on (a rover steer joint stuck at 3.589e-03 across three passes). A dot
     // product also cannot tell +30 deg from -30 deg, so a sweep folds at zero instead of
     // passing through it.
     //
@@ -1848,7 +1848,7 @@ MateSolveResult solve_mates(const json& components, const json& mates,
     // and never past kMaxAbsTolMm, because the positional rows are LENGTHS IN MM and
     // no assembly size makes a nanometre of misplacement a converged mate. Without the
     // ceiling the threshold grows without bound with the model, so a big enough
-    // assembly would accept a visible gap as "seated"; the ME 490 rover's own
+    // assembly would accept a visible gap as "seated"; a test rover's own
     // ~0.046 mm micro-pose is 46 000 times this ceiling.
     constexpr double kMaxAbsTolMm = 1e-6;
     const double eff_tol = std::min(tol * (scale / 100.0), std::max(tol, kMaxAbsTolMm));
@@ -1932,7 +1932,7 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         CompFrame& frame = frames[cid];
         if (frame.fixed) {
             // Bit-identical echo. Re-deriving the anchor's matrix from (t,w) put the
-            // grounded ME 490 rover frame ~0.046 mm off its authored placement — the
+            // grounded rover frame ~0.046 mm off its authored placement — the
             // exp-map round trip cannot represent a measured 3x3 block exactly, and a
             // fixed component is a constraint, not a 6-variable pose with a stiff spring.
             out.transforms[cid] = frame.tf0.size() == 16 ? frame.tf0 : kIdentity16;

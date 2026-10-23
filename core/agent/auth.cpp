@@ -1,7 +1,7 @@
 // core/agent/auth.cpp — see auth.h. Ports services/agent/providers/sub_auth.py
 // (credential store) + subscription_login.py ensure_fresh + the five providers'
-// refresh() HTTP exchanges. Python stays a reader/writer of the same store
-// until T-RF20, so every mutation mirrors sub_auth.py: process lock + advisory
+// refresh() HTTP exchanges. Python remains a reader/writer of the same store,
+// so every mutation mirrors sub_auth.py: process lock + advisory
 // file lock on <config.json>.lock, re-read disk inside the lock, patch only the
 // touched (provider, account) slot, atomic tmp+replace write-back.
 #include "agent/auth.h"

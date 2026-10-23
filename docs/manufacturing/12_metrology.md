@@ -210,7 +210,7 @@ measurement a thousand times yields a thousand advisory measurements.
 ## 3. Schemas
 
 Contract: `contracts/manufacturing_metrology.md`, under the existing frozen-seam policy in
-`contracts/README.md` (append-only, integrator sign-off, version bump). Schema ids use the
+`contracts/README.md` (append-only, maintainer sign-off, version bump). Schema ids use the
 established `aicad.<name>/1` form from `contracts/cam.md`.
 
 Every field the GUI paints is wrapped in UX's `FreshValue<T>`, verbatim, per the project ruling and

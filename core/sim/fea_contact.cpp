@@ -679,7 +679,7 @@ ContactResolution fea_contact_resolution(const ContactCandidateSet& candidates) 
     // the geometric size is finer than h by construction (ratio > max_ratio means
     // h > max_ratio*gap) and it is exactly the size that makes the interface
     // legal; halving h on top asks for resolution the criterion does not need. On
-    // the ME 490 hinge that difference is the whole answer: a 0.300 mm clearance
+    // the rover hinge that difference is the whole answer: a 0.300 mm clearance
     // at h = 1.775 mm needs 1.200 mm, and h/2 = 0.887 mm would have been a demand
     // for twice the resolution the physics asks for on a fit whose mesher is
     // already at its cell-shape floor.

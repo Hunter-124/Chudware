@@ -260,7 +260,7 @@ TEST_CASE("feeds: merge_cam overwrites only the feeds fields, preserves identity
 }
 
 #ifdef CHUDWARE_TEST_REGISTRY
-TEST_CASE("feeds: registry cam fold-in reproduces the in-code table byte-identically (T-M4)") {
+TEST_CASE("feeds: registry cam fold-in reproduces the in-code table byte-identically") {
     std::ifstream fh(CHUDWARE_TEST_REGISTRY);
     REQUIRE_MESSAGE(fh.good(), "registry.json not found at CHUDWARE_TEST_REGISTRY");
     json doc = json::parse(fh, nullptr, /*allow_exceptions=*/false);
@@ -785,10 +785,10 @@ TEST_CASE("post: setup sheet lists tools + operations + time") {
     CHECK(has(s.text, "machining time"));
 }
 
-// ── T-M1: machine-safety post-processor correctness (audit D2, D4, D9) ────────
+// ── machine-safety post-processor correctness ─────────────────────────────────
 
-// D4: extended work offsets (G54.1 P<n>) must be emitted, not silently collapsed to G54.
-TEST_CASE("post: extended work offset emits G54.1 P<n> (T-M1 D4)") {
+// Extended work offsets (G54.1 P<n>) must be emitted, not silently collapsed to G54.
+TEST_CASE("post: extended work offset emits G54.1 P<n>") {
     Built b = build_mill_job();
     // put the drill op on an extended offset G55.1 P3; leave origin/axes identity so
     // only the register word changes (no coordinate shift).
@@ -803,9 +803,9 @@ TEST_CASE("post: extended work offset emits G54.1 P<n> (T-M1 D4)") {
     CHECK_FALSE(has(r.gcode, "G55\n"));
 }
 
-// D2: canned-cycle drill points must be transformed into a per-op work frame, else the
+// Canned-cycle drill points must be transformed into a per-op work frame, else the
 // holes land at the wrong XY when the op overrides the setup WCS origin.
-TEST_CASE("post: canned drill points transform through per-op WCS (T-M1 D2)") {
+TEST_CASE("post: canned drill points transform through per-op WCS") {
     Built b = build_mill_job();
     // holes authored in world space at (0,0) and (10,0); shift the op's program origin
     // by +10 in X so they become (-10,0) and (0,0) in the work frame.
@@ -818,9 +818,9 @@ TEST_CASE("post: canned drill points transform through per-op WCS (T-M1 D2)") {
     CHECK_FALSE(has(r.gcode, "X10.000 Y0.000"));  // raw (untransformed) coord is gone
 }
 
-// D2 corollary: with no per-op WCS override the points pass through unchanged (guards
+// Corollary: with no per-op WCS override the points pass through unchanged (guards
 // against a transform accidentally applying to the common single-fixture case).
-TEST_CASE("post: drill points unchanged without a per-op WCS (T-M1 D2 no-op)") {
+TEST_CASE("post: drill points unchanged without a per-op WCS (no-op)") {
     Built b = build_mill_job();
     PostResult r = post_setup(b.setup, b.tools, "fanuc", b.tps);
     REQUIRE(r.ok);
@@ -851,9 +851,9 @@ static Built build_lathe_job() {
     return b;
 }
 
-// D9: G50 S<max> must clamp the spindle BEFORE G96 CSS engages, or the spindle
+// G50 S<max> must clamp the spindle BEFORE G96 CSS engages, or the spindle
 // overspeeds as the diameter approaches zero on a facing/parting pass.
-TEST_CASE("post: lathe CSS clamps spindle with G50 before G96 (T-M1 D9)") {
+TEST_CASE("post: lathe CSS clamps spindle with G50 before G96") {
     Built b = build_lathe_job();
     PostOptions opt; opt.overrides = json{{"lathe", true}};
     PostResult r = post_setup(b.setup, b.tools, "fanuc", b.tps, opt);
@@ -868,9 +868,9 @@ TEST_CASE("post: lathe CSS clamps spindle with G50 before G96 (T-M1 D9)") {
     CHECK(pg50 < pg96);
 }
 
-// D9 corollary: dialects may name a different clamp word (Siemens LIMS); an empty
+// Corollary: dialects may name a different clamp word (Siemens LIMS); an empty
 // clamp word suppresses the line entirely without dropping the G96.
-TEST_CASE("post: lathe CSS clamp word is dialect-configurable (T-M1 D9)") {
+TEST_CASE("post: lathe CSS clamp word is dialect-configurable") {
     Built b = build_lathe_job();
     PostOptions opt; opt.overrides = json{{"lathe", true}, {"css_clamp", "G92"}};
     PostResult r = post_setup(b.setup, b.tools, "fanuc", b.tps, opt);
@@ -880,9 +880,9 @@ TEST_CASE("post: lathe CSS clamp word is dialect-configurable (T-M1 D9)") {
     CHECK_FALSE(has(r.gcode, "G50"));   // default clamp word not used
 }
 
-// T-M1: the four thinly-tested dialects (Haas, Mach3, Siemens, Centroid) get real
+// The four thinly-tested dialects (Haas, Mach3, Siemens, Centroid) get real
 // content assertions, not just enumeration coverage.
-TEST_CASE("post: Haas emits program-begin safety block + canned cycle (T-M1)") {
+TEST_CASE("post: Haas emits program-begin safety block + canned cycle") {
     Built b = build_mill_job();
     PostResult r = post_setup(b.setup, b.tools, "haas", b.tps);
     REQUIRE(r.ok);
@@ -895,7 +895,7 @@ TEST_CASE("post: Haas emits program-begin safety block + canned cycle (T-M1)") {
     CHECK(has(r.gcode, "M30"));          // program end
 }
 
-TEST_CASE("post: Mach3 emits canned cycles with no percent wrap (T-M1)") {
+TEST_CASE("post: Mach3 emits canned cycles with no percent wrap") {
     Built b = build_mill_job();
     PostResult r = post_setup(b.setup, b.tools, "mach3", b.tps);
     REQUIRE(r.ok);
@@ -907,7 +907,7 @@ TEST_CASE("post: Mach3 emits canned cycles with no percent wrap (T-M1)") {
     CHECK(has(r.gcode, "G80"));          // cycle cancel
 }
 
-TEST_CASE("post: Siemens emits N-lines, semicolon comments, canned cycle (T-M1)") {
+TEST_CASE("post: Siemens emits N-lines, semicolon comments, canned cycle") {
     Built b = build_mill_job();
     PostResult r = post_setup(b.setup, b.tools, "siemens", b.tps);
     REQUIRE(r.ok);
@@ -920,7 +920,7 @@ TEST_CASE("post: Siemens emits N-lines, semicolon comments, canned cycle (T-M1)"
     CHECK(has(r.gcode, "G43"));          // length offset
 }
 
-TEST_CASE("post: Centroid/Tormach emits %, canned cycle, work offset (T-M1)") {
+TEST_CASE("post: Centroid/Tormach emits %, canned cycle, work offset") {
     Built b = build_mill_job();
     PostResult r = post_setup(b.setup, b.tools, "centroid", b.tps);
     REQUIRE(r.ok);
@@ -1000,12 +1000,12 @@ TEST_CASE("sim: rapid through stock is flagged") {
     CHECK(r.rapid_collisions > 0);
 }
 
-// ── T-M6: pocket entry + arc-true stock sim + turning sim (audit D3, D8, G4) ──
+// ── pocket entry + arc-true stock sim + turning sim ───────────────────────────
 
-// D3: a straight-plunge pocket entry must rapid over the entry XY before plunging,
+// A straight-plunge pocket entry must rapid over the entry XY before plunging,
 // else the tool plunges from wherever the previous loop/level ended (air-cut or dive
 // into a wall). Every Plunge must be immediately preceded by a Rapid at its own XY.
-TEST_CASE("op: pocket non-helix entry rapids over the hole before plunging (T-M6 D3)") {
+TEST_CASE("op: pocket non-helix entry rapids over the hole before plunging") {
     OpContext ctx = mill_ctx(6.0);
     Operation op;
     op.id = "pd3"; op.type = OpType::Pocket2D; op.tool_number = 1;
@@ -1028,10 +1028,10 @@ TEST_CASE("op: pocket non-helix entry rapids over the hole before plunging (T-M6
     CHECK(plunges > 0);
 }
 
-// D8: an Arc move must be swept along the true arc, not the chord. A chord bows inside
+// An Arc move must be swept along the true arc, not the chord. A chord bows inside
 // a convex arc; cells near the arc's mid-bulge (>tool-radius from the chord) go
 // un-removed under the old approximation, false-negativing the gouge check.
-TEST_CASE("sim: arc removal follows the true arc, not the chord (T-M6 D8)") {
+TEST_CASE("sim: arc removal follows the true arc, not the chord") {
     Setup su;
     su.machine.kind = MachineKind::Mill3;
     su.stock.type = StockType::Box;
@@ -1056,9 +1056,9 @@ TEST_CASE("sim: arc removal follows the true arc, not the chord (T-M6 D8)") {
     CHECK(r.removed_volume_mm3 > 0);
 }
 
-// G4: turning-sim coverage. A lathe roughing pass on cylindrical stock must register
+// Turning-sim coverage. A lathe roughing pass on cylindrical stock must register
 // real radial removal (the top-down dexel can't; the axisymmetric branch does).
-TEST_CASE("sim: turning roughing removes stock volume (T-M6 G4)") {
+TEST_CASE("sim: turning roughing removes stock volume") {
     Setup su;
     su.machine.kind = MachineKind::Lathe;
     su.stock.type = StockType::Cylinder;
@@ -1081,7 +1081,7 @@ TEST_CASE("sim: turning roughing removes stock volume (T-M6 G4)") {
     CHECK(r.remaining_volume_mm3 < r.stock_volume_mm3);
 }
 
-// ── T-M3: holder/shank collision (audit §3.2, §T-M3) ─────────────────────────
+// ── holder/shank collision ────────────────────────────────────────────────────
 
 // build a deep narrow-pocket job whose walls out-reach the tool's flute length, so
 // the non-cutting shank/holder must crash into them.
@@ -1104,7 +1104,7 @@ static std::vector<Toolpath> deep_pocket_job(Setup& su, ToolLibrary& lib, double
 
 // deep pocket: 30mm > the 25mm shoulder, so the 32mm holder dips below the stock top
 // and hits the surrounding walls — a crash the tip-only sim (check_holder off) misses.
-TEST_CASE("sim: holder collides on a deep narrow pocket (T-M3)") {
+TEST_CASE("sim: holder collides on a deep narrow pocket") {
     Setup su; ToolLibrary lib;
     auto tps = deep_pocket_job(su, lib, 30.0);
 
@@ -1122,7 +1122,7 @@ TEST_CASE("sim: holder collides on a deep narrow pocket (T-M3)") {
 }
 
 // shallow pocket: 4mm « 20mm flute length, the whole non-cutting body stays clear.
-TEST_CASE("sim: holder clears a shallow pocket (T-M3 no false positive)") {
+TEST_CASE("sim: holder clears a shallow pocket (no false positive)") {
     Setup su; ToolLibrary lib;
     auto tps = deep_pocket_job(su, lib, 4.0);
     SimOptions so; so.check_holder = true;

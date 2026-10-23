@@ -69,7 +69,7 @@ except Exception:  # noqa: BLE001
     _vz = None
 
 # Interaction contract (contracts/interaction.md).  Lazy import: the mcp.server namespace
-# collision (T-V3) must not prevent process_profiles / intake from loading.  The ask_user
+# collision must not prevent process_profiles / intake from loading.  The ask_user
 # path is only exercised at call time via _ask_via_contract(), never at module import.
 def _ask_via_contract(questions: list, run_id: Optional[str], transport=None,
                       ledger=None, doc_id: Optional[str] = None) -> dict:
@@ -82,7 +82,7 @@ def _ask_via_contract(questions: list, run_id: Optional[str], transport=None,
 
     When ``doc_id`` is supplied (and no ``run_id``), uses IntakeLedger(doc_id) so
     answers persist inside the document's IntakeState meta record, round-tripped
-    as JSON into the .step+ via doc_set_meta (contract §5 "scope=doc" — T-BL25).
+    as JSON into the .step+ via doc_set_meta (contract §5 "scope=doc").
     The store travels WITH the document, so a dimension confirmed in one session
     is never re-asked after the doc is saved and reopened — even though the
     engine mints a fresh doc_id on every open (core/doc/session.cpp new_doc_id).
@@ -109,7 +109,7 @@ def _ask_via_contract(questions: list, run_id: Optional[str], transport=None,
 
     # Determine scope: run-scoped when run_id is known; doc-scoped when doc_id is
     # known; fall back to "run" scope with MemoryLedger for legacy callers that
-    # supply neither (non-persisting session-local path, same as before T-BL25).
+    # supply neither (non-persisting session-local path, same as before doc-scoped ledgers).
     if run_id:
         scope, effective_run_id, effective_doc_id = "run", run_id, None
     elif doc_id:
@@ -1015,7 +1015,7 @@ def register_intake_tools(mcp: FastMCP) -> None:
         """Measure ONE in-plane dimension between two pixel points against a ChArUco fiducial.
 
         You pick the two pixel endpoints on a registered photo; DETERMINISTIC code does the
-        measuring (VLMs pick pixels, code measures — master plan Pillar 10). A printed ChArUco/ArUco
+        measuring (VLMs pick pixels, code measures). A printed ChArUco/ArUco
         sheet lying flat in the feature's plane fixes the pixel→mm scale via homography. `px_a`/`px_b`
         are [x, y] pixel coords in the FULL-RES image; register it first with
         submit_part_photos(photos=[...]) and pass the returned `photo_id`. `feature`/`dim` name where
@@ -1098,7 +1098,7 @@ def register_intake_tools(mcp: FastMCP) -> None:
             # - When run_id is supplied: persists to the run-scoped FileLedger so a
             #   DAG gate for the same run_id never re-asks (cross-mechanism no-re-ask).
             # - Otherwise: persists to the doc's IntakeLedger (IntakeState meta,
-            #   rides the .step+) so the answer survives save/reopen (§5 — T-BL25).
+            #   rides the .step+) so the answer survives save/reopen (§5).
             #   `d` is the RESOLVED doc-id string (cad_tools._doc raises when there
             #   is no doc), the same identity the _K_LEDGER write above targets —
             #   so a confirmation always has a valid persistence target here.

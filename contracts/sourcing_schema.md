@@ -2,7 +2,7 @@
 
 > Version 1 (FROZEN, workstream B day 1). This is the canonical shape of priced BOM lines,
 > the supplier-provider interface, and quote records. Append-only per `contracts/README.md`:
-> changes to an existing field's meaning require integrator sign-off + a version bump. New
+> changes to an existing field's meaning require maintainer sign-off + a version bump. New
 > OPTIONAL fields may be added additively without a bump.
 >
 > Producers: `core/sourcing/providers.cpp` (providers), the BOM roll-up, quote adapters
@@ -208,7 +208,7 @@ A `QuoteResult` can be folded into a `made` `BomLine` (§3): `unit_price`→`uni
 ```
 
 
-## Amendment — 2026-08-03 — T-X7b
+## Amendment — 2026-08-03
 
 ### `vendor_part_register`
 

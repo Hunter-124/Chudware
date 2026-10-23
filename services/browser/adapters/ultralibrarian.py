@@ -1,4 +1,4 @@
-"""services/browser/adapters/ultralibrarian.py — Ultra Librarian source adapter (T-X7).
+"""services/browser/adapters/ultralibrarian.py — Ultra Librarian source adapter.
 
 Ultra Librarian (ultralibrarian.com) is a free ECAD library portal offering
 symbols, footprints and 3D STEP models for electronic parts across 30+ CAD
@@ -7,7 +7,7 @@ user's own free Ultra Librarian account. `acquire` lands the ECAD archive (zip)
 or 3D model (STEP) with provenance for ecad_find_part / ecad_place_symbol.
 
 NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live logged-in Ultra Librarian session (T-X6 gates the real
+against a live logged-in Ultra Librarian session (the gated integration suite covers the real
 per-source integration tests behind an env flag).
 """
 from __future__ import annotations

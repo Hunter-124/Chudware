@@ -1,11 +1,11 @@
-"""Building-code compliance MCP tools (T-D4).
+"""Building-code compliance MCP tools.
 
 Registers:
   code_check(doc_path, jurisdiction, load_combo, rag_query,
              post_size, post_load_kn, connection_type) -> dict
     Deterministic rule checks (deflection L/360, post compression, fastener schedule) +
     agentic RAG citations from the user's local code corpus.  Never scrapes copyrighted
-    public code viewers — see ``work/questions/T-D4.md`` for the copyright fence ruling.
+    public code viewers.
 
 Logic lives in ``engine_oracle/structural/code_check.py`` (stays Python — its
 agentic_rag/UserCorpusProvider is corpus retrieval, not ported); this file is thin
@@ -48,7 +48,7 @@ def register_code_compliance_tools(mcp: FastMCP) -> None:
           AISC 360).  Requires ``doc_path`` to be an ``aicad.structure/1`` JSON document.
         * **post_compression_NDS_ASD** — simplified NDS ASD compression check for lumber
           posts (no Cp in v1).  Uses Douglas Fir-Larch No.2 Fc = 9.31 MPa with dressed
-          section areas from the T-D3 lumber table.  Runs when ``post_size`` is given.
+          section areas from the structural lumber table.  Runs when ``post_size`` is given.
         * **fastener_schedule** — looks up the connection type in the encoded fastener
           schedule with IBC/NDS clause citations.
 

@@ -62,15 +62,12 @@ scratch/
 /*.step+
 
 
-# Marketing site (Astro). SOURCE under Webservice/public-site/src, public/ and the
-# pinned package.json + package-lock.json ARE tracked — the lockfile is what makes
-# `npm ci` reproducible in CI. Installed deps and build output are not: node_modules
-# is ~7,000 files of third-party code that would bloat every clone, drown every diff,
-# and quietly import a pile of unaudited licenses into a repository that keeps a
-# license ledger.
-Webservice/public-site/node_modules/
-Webservice/public-site/dist/
-Webservice/public-site/.astro/
+# Promotional website (Astro). Source, public/ and the pinned package.json +
+# package-lock.json are tracked; installed deps and build output are not.
+website/node_modules/
+website/dist/
+website/.astro/
+website/.wrangler/
 
 # Claude Code project state — CLAUDE.md, settings.json (shared graphify hook),
 # commands/, skills/ ARE tracked (team-shared config); only per-machine state is ignored.
@@ -127,13 +124,12 @@ extern/cef/
 benchmarks/simsuite/results/
 
 # never commit credentials
-Webservice/Cloudflare-info.txt
-Webservice/secrets/
-Webservice/image/stage/
-Webservice/gateway/.venv/
+web/Cloudflare-info.txt
+web/secrets/
+web/gateway/.venv/
 # per-deployment env files hold live secrets — never commit
-Webservice/**/*.env
-!Webservice/gateway/config.example.env
+web/**/*.env
+!web/gateway/config.example.env
 
 # local artifacts — never commit
 # `reports/runs/` alone is root-anchored (the mid-pattern slash), so it never matched the
@@ -147,10 +143,6 @@ repomix-output.*
 
 # Per-project agent memory (mnemopi SQLite) — runtime state, created on demand.
 .plm/
-
-# Cloudflare wrangler local state (tmp/ + cache/) for the public site — regenerated
-# on every build, never source.
-Webservice/public-site/.wrangler/
 
 # Convenience symlink for the Kimi CLI harness: it points at .claude/skills, and a
 # committed symlink does not survive a Windows checkout (portable_paths_audit).

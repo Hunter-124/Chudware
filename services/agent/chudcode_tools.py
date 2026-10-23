@@ -1650,6 +1650,19 @@ def _binding_context_refusal(binding: HostToolBinding) -> dict[str, Any] | None:
     ):
         return {"ok": False, "reason": "not_found", "code": "not_found"}
     if trusted.get("cell") and not binding.project_root:
+        if binding.name == "dag_run":
+            # Match dag_run's authority check before disclosing root state.
+            # Bindings with roots are checked by the tool itself.
+            from services.agent.chudcode_host import get_default_chudcode_host
+
+            session_id = _ctx(binding.context, "session_id", None)
+            if not session_id:
+                return {"ok": False, "reason": "not_found", "code": "not_found"}
+            with tenancy.bind_context(trusted):
+                try:
+                    get_default_chudcode_host().session_launch_params(session_id)
+                except KeyError:
+                    return {"ok": False, "reason": "not_found", "code": "not_found"}
         return {
             "ok": False, "reason": "workspace_root_unavailable",
             "error": "The owning turn has no project root; ambient roots are not available.",

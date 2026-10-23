@@ -318,7 +318,10 @@ def test_the_online_role_prompt_carries_the_skills_catalog_and_its_fetch_verb(
         assert 'value={"value": 0,' in system_prompt
         assert '"axis_point":' in system_prompt
         assert "mate EVERY joint" in system_prompt
-        assert "never use hand-rolled kinematics or throwaway pose assemblies" in system_prompt
+        # YAML's literal block preserves wrapping; the policy is a sentence,
+        # not a requirement on where the role card breaks its lines.
+        assert "Never use hand-rolled kinematics or throwaway pose assemblies" in (
+            " ".join(system_prompt.split()))
         assert "few minutes deliberating without producing a file or a CAD change" in system_prompt
 
 

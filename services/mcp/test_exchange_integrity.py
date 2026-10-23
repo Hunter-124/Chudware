@@ -251,16 +251,23 @@ def test_detached_native_import_is_reproducible_and_saves_edits_in_place(
     _call("verify_battery", {"doc_id": did})
     row = next(e for e in cb.call("doc_list", {})["docs"] if e["doc_id"] == did)
     assert row["path"] is None
+    assert row["native_source_path"] == str(destination)
+    assert row["native_source_edited"] is False
     assert row["reproducible_from"] == [str(destination)]
     swept = C.save_touched_docs()
     assert any(e["doc_id"] == did and e["reason"] == "reproducible_import"
                for e in swept["skipped"])
     assert destination.read_bytes() == before
     assert not list(tmp_path.glob("*.step+"))
+    # Unedited provenance is reproducible scratch, not source-overwrite authority.
     saved, _ = _call("save_part", {"doc_id": did})
-    assert saved["path"] == str(destination)
+    assert saved["ok"], saved
+    detached_path = tmp_path / "base_revD.step+"
+    assert saved["path"] == str(detached_path)
+    assert detached_path.is_file()
+    assert destination.read_bytes() == before
 
-    # Reimport independently, then mutate: automatic saves must also stay in place.
+    # Non-study authored changes retain automatic source-save behavior.
     again, _ = _call("import_part", {"path": str(destination)})
     edited = again["doc_id"]
     docs.append(edited)
@@ -269,7 +276,7 @@ def test_detached_native_import_is_reproducible_and_saves_edits_in_place(
         {"type": "transform", "body": "f1", "translate": [40, 0, 0]}]})
     assert moved["ok"], moved
     assert moved["saved_path"] == str(destination)
-    assert not list(tmp_path.glob("*.step+"))
+    assert list(tmp_path.glob("*.step+")) == [detached_path]
     reopened = cb.call("doc_open", {"path": str(destination)})["doc_id"]
     docs.append(reopened)
     assert cb.call("eval_mass", {"doc_id": reopened})["com"] == pytest.approx(

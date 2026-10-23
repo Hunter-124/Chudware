@@ -1,4 +1,4 @@
-"""test_mcp_tools.py — Tests for services/dag/mcp_tools.py (T-A4 DoD).
+"""test_mcp_tools.py — Tests for services/dag/mcp_tools.py.
 
 Uses a MagicMock-based FastMCP stub (same pattern as test_req_tools.py) to avoid
 the services/mcp/ directory shadowing the real `mcp` package when conftest.py
@@ -444,3 +444,43 @@ def test_actual_fastmcp_dag_run_and_native_schema_do_not_expose_session_authorit
             assert sdk_tool["execute"](args, SimpleNamespace(cancelled=False))["details"] == expected
             assert tenancy.current_context() == ctx
         assert storage.list_run_ids() == []
+
+
+@pytest.mark.parametrize("session_owner", [None, "bob", "alice"])
+def test_dag_run_root_refusal_follows_session_authorization(monkeypatch, session_owner):
+    import hashlib
+    from types import SimpleNamespace
+    from services.agent import chudcode_host, request_context as tenancy
+    from services.agent.chudcode_tools import HostToolBinding, dispatch_host_tool
+
+    ctx = {"cell": True, "workspace_key": "team:dag/scope", "actor_key": "alice",
+           "actor_hex": hashlib.sha256(b"alice").hexdigest()[:32], "right": "editor", "epoch": 1}
+    host = chudcode_host.ChudcodeSessionHost()
+    monkeypatch.setattr(chudcode_host, "get_default_chudcode_host", lambda: host)
+    if session_owner is not None:
+        owner_ctx = {**ctx, "actor_key": session_owner,
+                     "actor_hex": hashlib.sha256(session_owner.encode()).hexdigest()[:32]}
+        with tenancy.bind_context(owner_ctx):
+            host._sessions[tenancy.scoped_key("parent")] = chudcode_host._Session(
+                "parent", client=None, resume_file=None, workspace_dir=None,
+            )
+
+    def forbidden(**kwargs):
+        pytest.fail("a rootless DAG invocation reached the tool body")
+
+    with tenancy.bind_context(ctx):
+        binding = HostToolBinding(
+            name="dag_run", description="Run a DAG", input_schema={"type": "object"},
+            handler=forbidden, context={"session_id": "parent"}, project_root="", save_root="",
+        )
+    expected = (
+        {"ok": False, "reason": "workspace_root_unavailable",
+         "error": "The owning turn has no project root; ambient roots are not available."}
+        if session_owner == "alice"
+        else {"ok": False, "reason": "not_found", "code": "not_found"}
+    )
+    # SDK threads have no active owner; authorization must use the captured one.
+    assert dispatch_host_tool(binding, {}, None, None) == expected
+    sdk_tool = binding.to_host_tool(lambda **kwargs: kwargs)
+    assert sdk_tool["execute"]({}, SimpleNamespace(cancelled=False))["details"] == expected
+    assert tenancy.current_context() == {}

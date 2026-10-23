@@ -1,6 +1,6 @@
 # Full-wave electromagnetic simulation (EM sim family)
 
-New simulation family (2026-07-07, Hunter spec): eigenmode/modal analysis of waveguide
+Simulation family added 2026-07-07: eigenmode/modal analysis of waveguide
 cross-sections, frequency-domain driven S-parameters, and broadband time-domain response —
 behind a pluggable solver adapter layer with openEMS (FDTD) as the primary full-wave engine.
 
@@ -10,20 +10,20 @@ behind a pluggable solver adapter layer with openEMS (FDTD) as the primary full-
   exposed to agents as the same-named tools
 - Tests: `python3 -m pytest services/sim/em/test_em.py` (the 2026-07-07 landing recorded
   21 real + 1 gated live test; current count not re-verified here)
-- Follow-ups: `work/tasks/T-SIM11.md`
+- Planned follow-ups: FEM and Meep adapters, direct document-solid intake, open-radiation MoM
 - License containment: `contracts/license_debt.md` row 9
 
 ## Solver matrix (capability x solver x status; status column as recorded 2026-07-07)
 
 | Solver | Method | Eigenmode | Driven (S-params) | Time-domain | Linkage | License | Status on this repo |
 |--------|--------|-----------|-------------------|-------------|---------|---------|---------------------|
-| **openems** | 3-D FDTD | — (delegated to FDFD) | yes | yes | python-module (lazy, sim-worker only) | GPLv3 | **Adapter implemented, mock-proven**; binary not installed on dev machine (no PyPI wheel) |
+| **openems** | 3-D FDTD | — (delegated to FDFD) | yes | yes | python-module (lazy, sim-worker only) | GPLv3 | **Adapter implemented, mock-proven**; openEMS has no PyPI wheel and must be installed separately |
 | **builtin-fdfd** | 2-D FDFD scalar Helmholtz (numpy/scipy) | yes (rectangular + circular hollow guides) | — | — | builtin | in-repo | **Real + validated** (WR-90 TE10 within 0.006 %) |
 | **analytic-uniform** | closed-form hollow-guide model | yes (cutoff tables) | uniform straight sections only (refuses geometry) | uniform sections via dispersive IFFT | builtin | in-repo | **Real + validated** |
-| gmsh-getdp | FEM (freq-domain, eigenmode, curved geometry) | planned | planned | — | external-process | GPL-2+ | Scaffold: detection + install hint only (T-SIM11) |
-| meep | 3-D FDTD | — | planned | planned | python-module | GPL-2+ | Scaffold: detection only (T-SIM11) |
-| elmer | FEM (VectorHelmholtz) | planned | planned | — | external-process | GPL-2+ (LGPL lib) | Scaffold: detection only (T-SIM11) |
-| MoM (open radiation / antennas) | — | — | — | — | — | — | Deferred entirely (T-SIM11; low priority for closed waveguides) |
+| gmsh-getdp | FEM (freq-domain, eigenmode, curved geometry) | planned | planned | — | external-process | GPL-2+ | Detection + install hint only; adapter planned |
+| meep | 3-D FDTD | — | planned | planned | python-module | GPL-2+ | Detection only; adapter planned |
+| elmer | FEM (VectorHelmholtz) | planned | planned | — | external-process | GPL-2+ (LGPL lib) | Detection only; adapter planned |
+| MoM (open radiation / antennas) | — | — | — | — | — | — | Deferred (low priority for closed waveguides) |
 
 Auto-selection (`solver: "auto"` or omitted): registry preference order is
 openems → builtin-fdfd → analytic-uniform → scaffolds; the first *installed* adapter
@@ -89,7 +89,7 @@ em_timedomain { standard|waveguide, length_mm?, mode?, f0_ghz?, bw_ghz?, solver?
 
 Geometry intake v1: `geometry.stl_path` feeds openEMS as a PEC polyhedron
 (CSXCAD `AddPolyhedronReader`) — export the doc body with `export_part` first.
-Direct doc solids/tess + material assignment intake is deferred (T-SIM11).
+Direct doc solids/tess + material assignment intake is planned.
 
 ## Validation results (dated record, 2026-07-07 — not re-measured since)
 
@@ -127,8 +127,9 @@ sudo dnf install elmerfem              # ElmerSolver
 conda install -c conda-forge pymeep    # Meep FDTD (conda-only distribution)
 ```
 
-`em_status` picks any of these up automatically once importable/on PATH (scaffold adapters
-report `installed: true, detail: "adapter not implemented yet"` until T-SIM11 lands them).
+`em_status` picks any of these up automatically once importable/on PATH (detection-only
+adapters report `installed: true, detail: "adapter not implemented yet"` until their
+adapters land).
 
 ## GUI wiring
 

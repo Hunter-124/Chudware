@@ -39,16 +39,6 @@
 #include <emscripten.h>
 #include "fs_backend.h"
 #endif
-#ifndef __EMSCRIPTEN__
-#include "util/entitlement.h"
-#include "security/containment.h"
-#include "security/integrity.h"
-#include "security/runtime_guard.h"
-#include "util/platform_paths.h"
-extern "C" {
-#include "util/tweetnacl.h"
-}
-#endif
 
 #include "../bootstrap.h"
 #include "cpp_core.h"  // in-process C++ core (libchudware) — the backend when no Python runtime
@@ -383,11 +373,6 @@ std::string defaultWorkspaceDir() {
 }
 const char* kDefaultLlamaModelPath = "%APPDATA%\\Chudware\\models\\model.gguf";
 
-// User-provided Gemini key, seeded as the out-of-box default so the copilot works on first
-// launch. Replaceable in Settings → AI. (Stored plaintext in %APPDATA%/Chudware/config.json,
-// same as every other provider key.)
-const char* kSeededGeminiKey = "AQ.Ab8RN6KgQVaemw7y3lReGzhLlD4VpUnyCYCxgT7ABxbNe1QKbA";
-
 static void copyStr(char* dst, size_t cap, const std::string& v) {
     std::strncpy(dst, v.c_str(), cap - 1);
     dst[cap - 1] = '\0';
@@ -398,9 +383,6 @@ static void copyStr(char* dst, size_t cap, const std::string& v) {
 static const char* kGlassGroupKey[] = {"global", "feature_manager", "copilot", "hud"};
 
 void loadSettings(Settings& s) {
-    // Seed the shipped Gemini key by default; an on-disk config overrides it below. Done
-    // before the file check so a fresh install (no config.json yet) still has a working key.
-    if (!s.geminiKey[0]) copyStr(s.geminiKey, sizeof(s.geminiKey), kSeededGeminiKey);
     std::ifstream f(configPath());
     if (!f) {
 #ifdef __EMSCRIPTEN__
@@ -519,8 +501,6 @@ void loadSettings(Settings& s) {
                 copyStr(s.model, sizeof(s.model), model);
             }
         }
-        // Seed the shipped Gemini key on first run so the copilot works out of the box.
-        if (!s.geminiKey[0]) copyStr(s.geminiKey, sizeof(s.geminiKey), kSeededGeminiKey);
         copyStr(s.reasoningEffort, sizeof(s.reasoningEffort), j.value("reasoning_effort", std::string("high")));
         if (s.provider == 3) {
             std::string lbase = llama.value("base_url", "http://127.0.0.1:1234/v1");
@@ -3139,57 +3119,6 @@ std::string AppState::pickLabel(const render::PickHit& h) const {
     }
     return std::string(kind) + " " + std::to_string(h.topo_id) + " of Body" +
            std::to_string(h.body_id);
-}
-
-bool AppState::verifyEntitlementForAi() {
-#ifdef __EMSCRIPTEN__
-    return true;
-#else
-    if (entitlementReadOnly) {
-        toast(ui::ToastLevel::Warn,
-              "Read-only mode — sign in or manage your subscription to use AI");
-        return false;
-    }
-    chudware::entitlement::TokenPayload tokenPayload;
-    std::string tokenError;
-    if (!chudware::entitlement::verifyEmbeddedToken(entitlementToken, tokenPayload, &tokenError)) {
-        entitlementReadOnly = true;
-        entitlementSignedIn = false;
-        entitlementStatus = "Entitlement verification failed; sign in again";
-        toast(ui::ToastLevel::Warn, entitlementStatus);
-        return false;
-    }
-    const auto enforcement = chudware::security::loadEmbeddedEnforcementState(
-        appdataAppDir(), tokenPayload.subject,
-        static_cast<std::int64_t>(std::chrono::system_clock::to_time_t(
-            std::chrono::system_clock::now())));
-    if (!enforcement.active()) {
-        entitlementReadOnly = true;
-        entitlementStatus = "Protected operation blocked: entitlement_signature_invalid";
-        toast(ui::ToastLevel::Warn, entitlementStatus);
-        return false;
-    }
-    const auto executable = chudware::platform::executablePath();
-    const auto integrity = chudware::security::verifyInstalledPayload(
-        executable, chudware::security::VerifyMode::ProtectedOperation);
-    if (!integrity.ok) {
-        entitlementReadOnly = true;
-        entitlementStatus = "Protected operation blocked: protected_file_hash_mismatch";
-        toast(ui::ToastLevel::Warn, entitlementStatus);
-        return false;
-    }
-    const auto decision = chudware::security::inspectAndPersistRuntime(
-        chudware::security::SecurityCheckpoint::BeforeAi,
-        integrity.root, integrity.files, appdataAppDir());
-    if (!decision.allowed()) {
-        entitlementReadOnly = true;
-        entitlementStatus = "Protected operation blocked: " + decision.denialReason;
-        toast(ui::ToastLevel::Warn, entitlementStatus);
-        return false;
-    }
-    entitlementAiVerified = true;
-    return true;
-#endif
 }
 
 void setActiveProjectDir(AppState& st, const std::string& absDir) {

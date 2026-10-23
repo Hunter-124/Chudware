@@ -2,10 +2,10 @@
 """Inspect, or explicitly provision, offline XFS/ext4 cell project quotas.
 
 Run as real root with a reviewed root-owned plan; never read gateway cell.json
-as quota authority. Each plan is the complete owner-budget inventory. Personal
-workspace, cell-state, and bucket roots must be listed. Teams use their bucket
-as the workspace. All roots for one owner on one filesystem share a project;
-fixed limits across filesystems must sum to at most that owner's budget.
+as quota authority. Each plan is the complete owner-budget inventory. Every
+workspace lists both its workspace root and its cell-state root. All roots for
+one owner on one filesystem share a project; fixed limits across filesystems
+must sum to at most that owner's budget.
 
 Root paths must already exist, have their reviewed device/inode identities,
 and be empty or wholly consistent with the existing project. This tool never

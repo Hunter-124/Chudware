@@ -29,7 +29,7 @@ from mcp.server.fastmcp import FastMCP
 
 # Profile selects how much scaffolding the server exposes + how prescriptive its instructions
 # are. `full` (default) is the supervised experience tuned for small local models: the long
-# how-to instructions plus the DAG/mission/buildgraph/foreman/ledger/workspace orchestration
+# how-to instructions plus the DAG/mission/buildgraph/advisory/ledger/workspace orchestration
 # families. `lite` is for capable models (e.g. mythos) that drive themselves: it keeps EVERY
 # capability + calculator + sourcing helper but drops the orchestration/supervision families
 # and swaps in a short, non-prescriptive instruction block, so the model runs freer and we
@@ -271,7 +271,7 @@ _FULL_INSTRUCTIONS = (
         "All cad_guide topics: overview, simulation, review, intake, gsl, cam, narration, parts, "
         "reverse, reveng, deliverables, requirements, dag, verify, interaction, sourcing, cost, "
         "spec, piping, industrial, hydraulic, firmware, structural, regen, code_compliance, "
-        "serving, design_review, doc_diff, plm, tolerance_stackup, sketch3d.\n"
+        "design_review, doc_diff, plm, tolerance_stackup, sketch3d.\n"
         "REBUILD FAILURE? A failed add_features batch may carry a `regen_diagnosis` fix-preview "
         "card (diagnosis + editable fix_ops + verifier verdict). Record your verdict with "
         "regen_resolve(card, 'accept'|'edit'|'reject') — accept/edit returns the fixed document; "
@@ -279,9 +279,9 @@ _FULL_INSTRUCTIONS = (
         "ECAD (schematic/PCB) tools are also available (ecad_*). Pre-fab host-board verification: "
         "ecad_run_hostcheck / ecad_run_sicheck / ecad_fpga_check / ecad_run_pdn; cross-sim handoffs "
         "via cad_guide('simulation') (ecad_thermal_handoff, heatsink_select, power_budget).\n"
-        "CONTENT GOLDEN DEMO: scripts/demo_sensor_node.py is the living E2E worked "
+        "SENSOR-NODE DEMO: scripts/demo_sensor_node.py is the end-to-end worked "
         "example (sensor-node board → verify ladder → firmware → thermal → heatsink → budget → "
-        "make_report); see docs/reference/FIN25_SENSOR_NODE_GOLDEN_DEMO.md and "
+        "make_report); see docs/reference/SENSOR_NODE_DEMO.md and "
         "cad_guide('simulation').\n"
         + _soft_tail_for_profile()
 )
@@ -298,7 +298,7 @@ mcp = FastMCP(
 from services.mcp import tool_registry as _reg
 
 # Mechanical CAD + simulation (C++ feature engine via libchudware.dll).
-# Per-family modules (T-RF8 split of the former cad_tools.py god file); all register
+# Per-family modules (split out of the former cad_tools.py); all register
 # under the stable registry family "cad" EXCEPT cad_sim_tools (FEA/CFD solves), which
 # is genuinely "sim" so the Settings -> AI -> Tools toggle matches real ownership.
 from services.mcp.cad_doc_tools import register_cad_doc_tools
@@ -361,12 +361,11 @@ register_intake_tools(_reg.view(mcp, "intake"))
 
 # Interaction — the ONE ask_user seam (Pillar 9, contracts/interaction.md): typed questions
 # with suggested defaults surface as MCP elicitations; answers persist + replay via the shared
-# interaction core (services/agent/interaction.py). Callers (intake clarify, DAG gates) migrate
-# onto this in T-F4.
+# interaction core (services/agent/interaction.py) that intake clarify and DAG gates share.
 from services.mcp.interaction_tools import register_interaction_tools
 register_interaction_tools(_reg.view(mcp, "intake"))
 
-# ECAD (schematic / PCB / native circuit sim) — per-family modules (T-RF8 split of the
+# ECAD (schematic / PCB / native circuit sim) — per-family modules (split out of the
 # former ecad_tools.py god file); all register under the stable registry family "ecad".
 from services.mcp.ecad_sch_tools import register_ecad_sch_tools
 from services.mcp.ecad_pcb_tools import register_ecad_pcb_tools
@@ -378,22 +377,22 @@ register_ecad_sim_tools(_reg.view(mcp, "ecad"))
 from services.mcp.ecad_qa_tools import register_ecad_qa_tools
 register_ecad_qa_tools(_reg.view(mcp, "ecad"))
 
-# ECAD -> thermal FEA handoff (T-FIN16, aicad.simhandoff/1 coupling ecad_to_thermal_fea):
+# ECAD -> thermal FEA handoff (aicad.simhandoff/1 coupling ecad_to_thermal_fea):
 # one call from a routed board to a solved board-level thermal study + Tj/limits verify.
 from services.mcp.ecad_thermal import register_ecad_thermal_tools
 register_ecad_thermal_tools(_reg.view(mcp, "ecad"))
 
-# ECAD -> CHT airflow handoff (T-FIN19, aicad.simhandoff/1 coupling ecad_to_cht):
+# ECAD -> CHT airflow handoff (aicad.simhandoff/1 coupling ecad_to_cht):
 # board + powered components as separate CHT solid regions -> OpenFOAM conjugate heat
-# transfer, verifying the T-FIN16 preset-h film-coefficient assumption.
+# transfer, verifying the thermal handoff's preset-h film-coefficient assumption.
 from services.mcp.ecad_thermal import register_ecad_airflow_tools
 register_ecad_airflow_tools(_reg.view(mcp, "ecad"))
-# ECAD -> vibration reliability screen (T-FIN21, aicad.simhandoff/1 coupling
+# ECAD -> vibration reliability screen (aicad.simhandoff/1 coupling
 # ecad_to_structural_fea): mounted-board modal solve + excitation-band flagging +
 # Steinberg deflection-limit solder-joint risk screen (cited heuristic).
 from services.mcp.ecad_reliability import register_ecad_reliability_tools
 register_ecad_reliability_tools(_reg.view(mcp, "ecad"))
-# Heatsink selection loop (T-FIN17): parts-library + parametric candidates re-solved
+# Heatsink selection loop: parts-library + parametric candidates re-solved
 # to a Tj/case target on the cached ecad_thermal_handoff study (verify envelope
 # coupling ecad_heatsink_to_thermal_fea).
 from services.mcp.heatsink import register_heatsink_tools
@@ -415,7 +414,7 @@ register_print_tools(_reg.view(mcp, "cam"))
 from services.mcp.mfg_tools import register_mfg_tools
 register_mfg_tools(_reg.view(mcp, "manufacture"))
 
-# Doc diff — semantic feature-level diff between two document revisions (T-H2).
+# Doc diff — semantic feature-level diff between two document revisions.
 from services.mcp.doc_diff_tools import register_doc_diff_tools
 register_doc_diff_tools(_reg.view(mcp, "cad"))
 # PLM vault (Pillar 19, aicad.plm/1): hidden git-backed version history —
@@ -447,7 +446,7 @@ register_graph_tools(_reg.view(mcp, "cad"))
 from services.mcp.req_tools import register_req_tools
 register_req_tools(_reg.view(mcp, "cad"))
 
-# Layout-first planning helper (T-BL50) — capture envelope + critical dims + interfaces
+# Layout-first planning helper — capture envelope + critical dims + interfaces
 # BEFORE modeling; coverage gate (layout_coverage) surfaces in design_review.
 from services.mcp.layout_plan_tools import register_layout_plan_tools
 register_layout_plan_tools(_reg.view(mcp, "cad"))
@@ -457,18 +456,18 @@ register_layout_plan_tools(_reg.view(mcp, "cad"))
 from services.mcp.mfg_plan_tools import register_mfg_plan_tools
 register_mfg_plan_tools(_reg.view(mcp, "cad"))
 
-# Verify battery (T-H4) — deterministic check dispatcher for RL reward + CI gate.
+# Verify battery — deterministic check dispatcher for RL reward + CI gate.
 from services.mcp.verify_tools import register_verify_tools
 register_verify_tools(_reg.view(mcp, "cad"))
 
 # Research (Pillar 8): look-it-up-instead-of-recall. web_search + fetch_page return the
 # provenance-stamped answer envelope; per-user local cache; offline-safe degradation.
-# T-W3: also registers fit_calc + recommend_fit (ISO 286, aicad.calc/1 envelope).
+# Also registers fit_calc + recommend_fit (ISO 286, aicad.calc/1 envelope).
 # Rule: call fit_calc BEFORE hole_sizing / bore decisions; recommend_fit to choose the class.
 from services.mcp.research_tools import register_research_tools
 register_research_tools(_reg.view(mcp, "research"))
 
-# Dimension scheme planner (T-W3 / Pillar 20): suggest_dimension_scheme reads a sketch
+# Dimension scheme planner: suggest_dimension_scheme reads a sketch
 # entity roster and emits an ordered process-aware dimension plan (IT-grade tolerances,
 # bolt-pattern datum rules, needs_user_confirm flags for function-critical dims).
 from services.mcp.dimension_scheme_tools import register_dimension_scheme_tools
@@ -516,8 +515,8 @@ from services.mcp.recon_tools import register_photo_recon_tools
 register_photo_recon_tools(_reg.view(mcp, "recon"))
 
 # Firmware (embedded compile loop): fw_new_project / fw_build / fw_sources / fw_sim_run — auto-selects
-# the MCU target, generates a pinmap.h header from the linked ECAD board's netlist (T-C2), and runs
-# the ELF through Renode or QEMU with assertion checks (T-C3).
+# the MCU target, generates a pinmap.h header from the linked ECAD board's netlist, and runs
+# the ELF through Renode or QEMU with assertion checks.
 from services.mcp.firmware_tools import register_firmware_tools
 register_firmware_tools(_reg.view(mcp, "ecad"))
 
@@ -536,34 +535,29 @@ register_antenna_tools(_reg.view(mcp, "em"))
 from services.mcp.power_budget import register_power_budget_tools
 register_power_budget_tools(_reg.view(mcp, "ecad"))
 
-# Structural (T-D2): PyNite member forces & deflections for aicad.structure/1 docs.
+# Structural: PyNite member forces & deflections for aicad.structure/1 docs.
 from services.mcp.structural_tools import register_structural_tools
 register_structural_tools(_reg.view(mcp, "sim"))
 
-# Preflight (T-W12, Pillar 20 §2.10): dry-run plan validation on shadow doc clones.
+# Preflight: dry-run plan validation on shadow doc clones.
 # preflight_ops is read-only; never mutates the live doc.
 from services.mcp.preflight_tools import register_preflight_tools
 register_preflight_tools(_reg.view(mcp, "cad"))
 
-# Unified parts library (T-P1): federated search across all standard-parts catalogs.
+# Unified parts library: federated search across all standard-parts catalogs.
 # part_search / part_get over the aicad.parts/1 FTS hub (contracts/parts.md).
 from services.mcp.parts_tools import register_parts_tools
 register_parts_tools(_reg.view(mcp, "parts"))
-# Adapter serving (T-H9): per-insertion-point LoRA routing table — status ("which brain
-# answered"), canary dial, always-safe rollback, and the Erik-ratified gated promotion
-# (evidence + human sign-off; no auto-promote). Pure-Python, no core dependency.
-from services.mcp.serving_tools import register_serving_tools
-register_serving_tools(_reg.view(mcp, "advisor"))
-# Regen diagnosis (T-H11 / IP-18): on a rebuild failure, diagnose + propose editable fix-ops as
-# an accept/edit/reject card, logged as an IP-18 correction trace. LIVE since T-BL22:
+# Regen diagnosis (IP-18): on a rebuild failure, diagnose + propose editable fix-ops as
+# an accept/edit/reject card, logged as an IP-18 correction trace. Live:
 # add_features attaches the card on rebuild failure; regen_resolve records the accept/edit/
 # reject action trace (journaled to CACHE/telemetry/events.jsonl).
 from services.mcp.regen_tools import register_regen_tools
 register_regen_tools(_reg.view(mcp, "cad"))
-# Code compliance (T-D4): deterministic rule engine + agentic RAG for building-code checks.
+# Code compliance: deterministic rule engine + agentic RAG for building-code checks.
 from services.mcp.code_compliance_tools import register_code_compliance_tools
 register_code_compliance_tools(_reg.view(mcp, "cad"))
-# Design ledger (T-W1, Pillar 20): persistent mission state (aicad.ledger/1).
+# Design ledger: persistent mission state (aicad.ledger/1).
 # ledger_get / ledger_note let any agent role read or write the design ledger without
 # holding the full chat history — the anti-context-loss mechanism for 24k local models.
 # ledger_get is risk-class READ; ledger_note is WRITE (auto-classified by tool_registry).
@@ -580,42 +574,42 @@ from services.mcp.ledger_tools import register_ledger_tools
 register_ledger_tools(_reg.view(mcp, "ledger"))
 # ---------------------------------------------------------------------------
 # Orchestration / supervision families — the DAG supervisor, mission phase
-# machine, build-order planner, foreman, and workspace lease registry.
+# machine, build-order planner, advisory engine, and workspace lease registry.
 # These are the "pre-designed plans / workflows" scaffolding tuned for small
 # local models. The `lite` profile omits them so a capable self-driving model
 # runs unconstrained (all real capabilities above stay registered).
 # ---------------------------------------------------------------------------
 if not _LITE:
-    # DAG orchestrator MCP tools (T-A4): dag_plan / dag_run / dag_status / dag_approve / dag_abort.
+    # DAG orchestrator MCP tools: dag_plan / dag_run / dag_status / dag_approve / dag_abort.
     # These five tools expose the services/dag executor to MCP clients so a model or UI can
     # start/resume/inspect/gate DAG missions without a bespoke integration layer.
     from services.dag.mcp_tools import register_dag_tools
     register_dag_tools(_reg.view(mcp, "mission"))
-    # DAG replan (T-F12): dag_replan splices new nodes into a running checkpointed DAG run.
+    # DAG replan: dag_replan splices new nodes into a running checkpointed DAG run.
     # Validates end_condition + retry_budget on every spliced node (DoD enforcement), merges
     # into the persisted graph sidecar, and resumes via executor.resume().
     from services.dag.mcp_tools import register_dag_replan_tools
     register_dag_replan_tools(_reg.view(mcp, "mission"))
-    # Mission pipeline (T-W19): mission_start / mission_status / replan_request.
+    # Mission pipeline: mission_start / mission_status / replan_request.
     # The copilot's mission front door — INTAKE→DELIVER phase machine on top of the
     # ledger + roles + buildgraph + DAG.  mission_status renders phase state from the
     # ledger stage_log (what mission control + the GUI consume); replan_request routes
     # an aicad.replan/1 request per contract §17.
     from services.mcp.mission_tools import register_mission_tools
     register_mission_tools(_reg.view(mcp, "mission"))
-    # Build-order DAG planner (T-W15): buildgraph_plan / buildgraph_status.
+    # Build-order DAG planner: buildgraph_plan / buildgraph_status.
     # LLM-free planner converts BUILD PLAN / dag/1 mission into aicad.buildgraph/1 graph
     # with prerequisite edges; validator findings are aicad.advisory/1 items.
-    # ready_nodes() surface for T-W16 multi-doc fan-out.
+    # ready_nodes() surface for multi-doc fan-out.
     from services.agent.buildgraph.mcp_tools import register_buildgraph_tools
     register_buildgraph_tools(_reg.view(mcp, "mission"))
-    # Advisory engine / foreman (T-W5, Pillar 20): advise / stage_set / advisory_dispute.
+    # Advisory engine: advise / stage_set / advisory_dispute.
     # advise runs a stage's read-only check battery over a doc on demand (aicad.advisory/1);
-    # the dag node runner already runs the foreman automatically after each node. advise is
+    # the dag node runner already runs the advisory engine automatically after each node. advise is
     # risk-class READ; stage_set / advisory_dispute are WRITE (ledger-logged, §9.3).
     from services.mcp.advisor_tools import register_advisor_tools
     register_advisor_tools(_reg.view(mcp, "advisor"))
-    # Workspace (T-W16, Pillar 20 §2.14): multi-doc lease registry + per-doc event streams.
+    # Workspace: multi-doc lease registry + per-doc event streams.
     # workspace_status / workspace_doc_events are risk-class READ (named in _READ_EXACT);
     # no write-lease required to poll status.
     from services.mcp.workspace_tools import register_workspace_tools
@@ -640,7 +634,7 @@ if not _LITE:
     # binds a run_id + ledger + delegation tree for a client that has none, which is a
     # design task, not a wiring one.
 
-# Design review battery (T-F12): one-call battery dispatching through DISPATCH_TABLE
+# Design review battery: one-call battery dispatching through DISPATCH_TABLE
 # (verify.py) + battery._get_fn for feature_overlap/dfm.  Returns a narrated verdict
 # card per contracts/narration.md — never a raw JSON dump.  On-demand helper (kept in lite).
 from services.mcp.design_review_tools import register_design_review_tools
@@ -673,17 +667,17 @@ register_bugreport_tools(_reg.view(mcp, "workspace"))
 from services.mcp.task_list_tools import register_task_list_tools
 register_task_list_tools(_reg.view(mcp, "workspace"))
 
-# Interface alignment checker (T-BL49): interface_check inspects mating component pairs for
+# Interface alignment checker: interface_check inspects mating component pairs for
 # hole-pattern registration, bore coaxiality, contact-plane flushness, and fastener pass-through
 # — the layout errors that pass check_interference (no clash) but are still wrong.  Reuses
 # doc_query (per-body faces), asm_world_bodies, cam_extract holes, research_thread_spec.
 from services.mcp.interface_check_tools import register_interface_check_tools
 register_interface_check_tools(_reg.view(mcp, "cad"))
-# Tolerance stack-up analysis (T-BL08): 1D worst-case + RSS over a chain of feature
+# Tolerance stack-up analysis: 1D worst-case + RSS over a chain of feature
 # dimensions.  Pure-Python; no C++ engine required.  See cad_guide('tolerance_stackup').
 from services.mcp.tolerance_tools import register_tolerance_tools
 register_tolerance_tools(_reg.view(mcp, "cad"))
-# Mechanical engineering checks (T-BL18): AGMA gear tooth stress + ISO 281 bearing life.
+# Mechanical engineering checks: AGMA gear tooth stress + ISO 281 bearing life.
 from services.mcp.mechanical_tools import register_mechanical_tools
 register_mechanical_tools(_reg.view(mcp, "sim"))
 # 3D sketch + sketch preview tools: sketch3d_new/add_curves/get/clear/as_sweep_guide,
@@ -698,14 +692,14 @@ register_sketch3d_tools(_reg.view(mcp, "cad"))
 from services.mcp.ascii2d import register_ascii2d_tools
 register_ascii2d_tools(_reg.view(mcp, "gsl"))
 
-# Reverse Engineering MCP family (contracts/reveng.md §8) — per-family modules (T-RF8
-# split of the former reveng_tools.py god file); both register under "reveng".
+# Reverse Engineering MCP family (contracts/reveng.md §8) — per-family modules (split out
+# of the former reveng_tools.py); both register under "reveng".
 from services.mcp.reveng_session_tools import register_reveng_session_tools
 from services.mcp.reveng_build_tools import register_reveng_build_tools
 register_reveng_session_tools(_reg.view(mcp, "reveng"))
 register_reveng_build_tools(_reg.view(mcp, "reveng"))
 
-# Org layer (T-W22, aicad.org/1 §18): channel_send / request_raise / request_resolve /
+# Org layer (aicad.org/1 §18): channel_send / request_raise / request_resolve /
 # council_convene. These were previously registered ONLY lazily — reviewer_exec activates
 # org_tools on demand, and tool_registry.warm_catalog() faked a registration against a
 # throwaway MCP. Consequence: the family never reached this server's FastMCP registry or
@@ -1122,7 +1116,7 @@ def _warm_core() -> None:
     """Load libchudware.dll up front (in the background) so the FIRST tool call doesn't eat the
     cold load (DLL + OCCT/gmsh deps can take many seconds) inside the client's call timeout."""
     # Arm ECAD autosave + recover any ECAD docs from a previous (possibly killed) session FIRST.
-    # ECAD sessions live in the C++ core now (T-RF20), but recovery reads plain-JSON autosave files
+    # ECAD sessions live in the C++ core now, but recovery reads plain-JSON autosave files
     # and re-mints sessions via ecad_open, so it never blocks on the full DLL warm and an ECAD
     # recovery succeeds even if the heavy OCCT deps are slow. ECAD docs live only in memory, so a
     # transport-timeout kill of a heavy ecad_* tool would otherwise lose every open schematic/board.
@@ -1137,11 +1131,11 @@ def _warm_core() -> None:
     # window. This matters more than usual here: a cold-import overrun trips -32001, which KILLS the
     # server, so the import never gets cached — every retry re-pays it and times out again (a vicious
     # loop). Importing them once in the background breaks that. Best-effort; never blocks the DLL warm.
-    # T-RF20: the SPICE simulator is C++ now (sim_netlist_to_circuit / sim_spice RPCs) — no
+    # The SPICE simulator is C++ now (sim_netlist_to_circuit / sim_spice RPCs) — no
     # Python warm needed here; the core_bridge warm below covers the DLL + dispatch.
     try:
         # OCP/build123d 3D kernel (ecad_to_3d) — can be many seconds cold.
-        from services.ecad.threed import board_to_step  # noqa: F401  # STAYS (T-RF20): no C++ counterpart
+        from services.ecad.threed import board_to_step  # noqa: F401  # no C++ counterpart
     except Exception:
         pass
     try:

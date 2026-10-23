@@ -230,39 +230,20 @@ add_library(chudware_util STATIC
   util/thread_pool.cpp
   util/platform_paths.cpp
   util/parent_death.cpp
-  util/device_identity.cpp
-  util/entitlement.cpp
-  util/secret_store.cpp
-  security/containment.cpp
-  security/runtime_guard.cpp
-  security/event_queue.cpp
   security/integrity.cpp
   util/randombytes.cpp
   util/tweetnacl.c)
 target_include_directories(chudware_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(chudware_util PUBLIC Threads::Threads nlohmann_json::nlohmann_json chudware_miniz)
+target_link_libraries(chudware_util PUBLIC Threads::Threads nlohmann_json::nlohmann_json)
 if(WIN32)
-  target_link_libraries(chudware_util PUBLIC bcrypt crypt32)
+  target_link_libraries(chudware_util PUBLIC bcrypt)
 elseif(APPLE)
-  # secret_store.cpp calls CoreFoundation directly (CFRelease et al.); Security
-  # alone does not satisfy those symbols for a static-lib link order.
-  target_link_libraries(chudware_util PUBLIC "-framework CoreFoundation" "-framework Security")
+  # randombytes.cpp draws from SecRandomCopyBytes.
+  target_link_libraries(chudware_util PUBLIC "-framework Security")
 elseif(UNIX)
   # shm_open/shm_unlink live in librt on older glibc; harmless empty on new glibc.
   target_link_libraries(chudware_util PUBLIC rt)
 endif()
-
-add_executable(test_entitlement tests/test_entitlement.cpp)
-target_link_libraries(test_entitlement PRIVATE chudware_util)
-add_test(NAME entitlement COMMAND test_entitlement)
-set_target_properties(test_entitlement PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-
-add_executable(test_security tests/test_security.cpp)
-target_link_libraries(test_security PRIVATE chudware_util)
-add_test(NAME security COMMAND test_security)
-set_target_properties(test_security PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # --- libchudware sim (simulation solvers) ---------------------------------------
 # FEA static linear elasticity first (tet4 + Eigen::SparseLU, ported from the retired

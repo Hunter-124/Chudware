@@ -1,17 +1,16 @@
 # gsl_dataset — synthetic GSL corpus (labels for free)
 
-Procedurally generated parametric parts with per-face supervision, per
-`docs/review/GEOMETRY_LLM_REPRESENTATION_REVIEW.md` §3.4 ("synthetic-label factory":
-the feature op that created a face labels that face — zero hand-labeling).
+Procedurally generated parametric parts with per-face supervision: the feature op
+that created a face labels that face — zero hand-labeling.
 
 Samples are **regenerable artifacts and are NOT committed** (see `.gitignore`).
 
 ## Regenerate
 
 ```
-python3 tools/gsl_dataset_gen.py --count 50            # 50 samples per family
-python3 tools/gsl_dataset_gen.py --count 5 --families plate_bolt_circle,turned_shaft
-python3 tools/gsl_dataset_gen.py --count 5 --render    # + render.png per sample
+python3 -m tools.gsl_dataset_gen --count 50            # 50 samples per family
+python3 -m tools.gsl_dataset_gen --count 5 --families plate_bolt_circle,turned_shaft
+python3 -m tools.gsl_dataset_gen --count 5 --render    # + render.png per sample
 ```
 
 Run from the repo root; requires the built C++ core (`libchudware.so` under
@@ -53,7 +52,5 @@ its `ord` is that body's describe_faces index, so on a multi-body sample
 
 ## Consumers
 
-- `tools/gsl_eval.py` — recognition measured-residual harness
-  (`docs/review/RECOGNITION_RESIDUAL.md`).
-- `tools/gsl_gnn/` — gated GNN adapter scaffold (train only where the residual
-  report justifies it).
+- `tools/gsl_gnn/train_ranker.py` — retrains the candidate-ranker weights
+  (`tools/gsl_gnn/ranker_weights.json`) from `faces.json`.

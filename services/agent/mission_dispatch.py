@@ -414,7 +414,6 @@ class MissionDispatch:
         corporate_force: bool | None = None,
         plan_only: bool | None = None,
         advisor: bool | None = None,
-        chudware_actor: Any | None = None,
     ) -> None:
         self.run_id = run_id
         self.ledger = ledger
@@ -427,7 +426,6 @@ class MissionDispatch:
         # provider for an explicit ``options={"offline": True}`` run.
         self.provider = provider
         self.on_event = on_event
-        self.chudware_actor = chudware_actor
         # Capability dials (WI-2/4/…): optional profile or tier for scaffolds.
         self.capability = capability
         self.tier = tier
@@ -1780,7 +1778,6 @@ class MissionDispatch:
                     capability=self.capability,
                     max_tokens=LINEAR_ROLE_MAX_OUTPUT_TOKENS,
                     max_total_tokens=granted or None,
-                    actor=self.chudware_actor,
                     close_session=False,
                 )
             finally:
@@ -2976,7 +2973,6 @@ def run_linear_role_turn(
     options: dict | None = None,
     history: list[dict] | None = None,
     attachments: list[dict] | None = None,
-    chudware_actor: Any | None = None,
 ) -> dict[str, Any]:
     """Run one bounded explicit-offline legacy role turn.
 
@@ -3024,7 +3020,6 @@ def run_linear_role_turn(
                 provider=provider,
                 on_event=on_event,
                 delegation_tree=tree,
-                chudware_actor=chudware_actor,
                 capability=capability,
                 tier=tier,
             )
@@ -3100,7 +3095,6 @@ def run_linear_role_turn(
             provider,
             name=role,
             actor=role,
-            credit_actor=chudware_actor,
             system_prompt=system_prompt,
             allowed_tools=allowed,
             tools_text=tools_text,

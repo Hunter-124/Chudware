@@ -65,10 +65,6 @@ static bool isDocumentReadOnlyMethod(const std::string& m) {
     return false;
 }
 
-bool DocRegistry::isDesktopReadOnlyMethod(const std::string& m) {
-    return isDocumentReadOnlyMethod(m);
-}
-
 bool DocRegistry::isReadOnlyMethod(const std::string& m) {
     // Cell authorization must not treat whole agent/sim/export families as reads.
     // Keep desktop document-only semantics separate from this security allowlist.

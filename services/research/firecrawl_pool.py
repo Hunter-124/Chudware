@@ -18,13 +18,12 @@ Key sources (merged, deduped, first occurrence wins):
    Tenant cells use only their actor's BYOK environment keys, never config merging.
 
 Cooldown state is persisted to a small JSON file (keyed by *hash* of the key, never the
-key itself) so separate processes — the GUI agent, the MCP server, ``scrape_knowledge``,
-the omp CLI — share one view of which keys are hot. ``FIRECRAWL_POOL_STATE`` overrides the
+key itself) so separate processes — the GUI agent and the MCP server — share one view
+of which keys are hot. ``FIRECRAWL_POOL_STATE`` overrides the
 state-file path (tests); ``FIRECRAWL_POOL_MAX_WAIT_S`` overrides the default wait cap.
 
-Stdlib-only on purpose: ``tools/firecrawl_pool.py`` is the CLI wrapper for this
-``services/research/firecrawl_pool.py`` implementation; scripts and custom tools
-can import it without the runtime venv. ``request()`` takes an injectable
+Stdlib-only on purpose: scripts and custom tools can import it without the runtime
+venv. ``request()`` takes an injectable
 ``transport`` so tests never touch the network.
 """
 from __future__ import annotations

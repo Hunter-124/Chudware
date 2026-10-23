@@ -7,9 +7,9 @@ theme/DPI misuse, not literal colors. The live widget kit is
 `host/src/ui/widgets/kit.{h,cpp}`; palette and glass APIs live in
 `host/src/ui_theme.{h,cpp}`.
 
-**Design versus current API:** the restyle sections below retain the original task
-names, proposed signatures and layout targets. Consult
-[gui-theme-layout](../../.claude/skills/gui-theme-layout/SKILL.md) and the named
+**Design versus current API:** the restyle sections below retain the original
+proposed signatures and layout targets. Consult
+[GUI theme and layout](../dev/gui-theme-layout.md) and the named
 `ui_theme` / `kit` symbols for current signatures and panel rules; this is not a
 fresh visual-acceptance report. Old `platform/dpi` references are design-era paths:
 current logical sizing uses `ui::uiScale` and `host/src/ui/metrics.h`.
@@ -56,7 +56,7 @@ All layout constants are multiples of **8px** logical (@1.0× DPI; scale via `pl
 | `space.lg` | 24px | Panel header/footer bands |
 | `space.xl` | 32px | Modal outer margin |
 
-Extend `theme::Metrics` in `tokens.h`: set `grid = 8.f` (was 4.f) during F2.
+Extend `theme::Metrics` in `tokens.h`: set `grid = 8.f` (was 4.f) with the glass APIs.
 
 ---
 
@@ -77,11 +77,11 @@ light text on dark model).
 
 ---
 
-## 5. Core theme APIs (F2 implements)
+## 5. Core theme APIs
 
 ### `glassPanel(ImDrawList*, ImRect, MaterialLevel, float rounding)`
 
-1. Sample blurred viewport texture UV-mapped to `rect` (from F1 `ViewportBackdrop`).
+1. Sample blurred viewport texture UV-mapped to `rect` (from the `ViewportBackdrop` blur pass).
 2. Tint with material alpha + `adaptiveSurface(luminance).tint`.
 3. Draw 1px specular top edge (`glassHighlight` at 0.09–0.14 alpha).
 4. Continuous-corner rounding (`roundingLg` = 10px for panels, `rounding` = 6px for rows).
@@ -117,7 +117,7 @@ Row pill for FM, Explorer, Copilot composer rows:
 - Selected: **0.42**
 - Faint border: `palette.line` at 0.25 alpha
 
-### Kawase blur (F1, consumed by F2)
+### Kawase blur (consumed by the glass APIs)
 
 Downsample viewport color to ¼ resolution; 4-tap Kawase passes per material level.
 Expose texture ID + UV transform on `IViewport::backdrop()`.
@@ -126,7 +126,7 @@ Expose texture ID + UV transform on `IViewport::backdrop()`.
 
 ## 6. Per-panel rules
 
-### Feature Manager (C1)
+### Feature Manager
 
 - ONE UltraThin true-glass surface per over-viewport pane (`browser_glass`, painted once by
   left_dock; `agent_glass`, `doctabs_glass` likewise) — row pills on top. (The old "no full-panel
@@ -135,55 +135,55 @@ Expose texture ID + UV transform on `IViewport::backdrop()`.
 - Tree rows: `fmRowPill()` → `glassRowBackground` with `GetFrameHeightWithSpacing()`.
 - Origin → nested planes hierarchy; datum icons use `ref_plane`.
 
-### Copilot / agent panel (C3)
+### Copilot / agent panel
 
 - Sessions toggle in header; composer **prelude** row (Design | Permissions + context meter).
 - Composer **toolbar** row (model | thinking | gear | send) as pills.
 - Assistant message body on frosted row pill (`thin` material), not full-panel wash.
 - User bubbles: `regular` material with accent border.
 
-### Viewport HUD (C4)
+### Viewport HUD
 
 - **Per-button pills** top-right (not one full-width bar).
 - Icon size 22dp; idle **auto-fade** (ramps on hover / zoom rect / open popup).
 - `adaptiveSurface()` on each pill from luminance under button rect.
 
-### Dock / layout (S1)
+### Dock / layout
 
 - `DockingEmptyBg` fully transparent.
 - Left tab rail: persistent frosted pill per icon (0.20 idle / 0.32 hover / 0.40 selected).
 - **Splitter lines**: 1px `palette.line` at 0.35 alpha between dock splits (fix invisible splitters).
 
-### Title bar + doc tabs (S2)
+### Title bar + doc tabs
 
 - Doc-tab band: **semi-opaque** `mat.thin` wash (not fully opaque chrome) — tabs readable over viewport.
 - Active tab: accent underline + `mat.regular` fill.
 - Inactive tabs: `ultraThin` glass.
 
-### Ribbon + context toolbar (S3)
+### Ribbon + context toolbar
 
 - Ribbon background: `mat.thin` over viewport region only; solid `ribbonBg` when over chrome.
 - Big tool buttons: 52dp squares with hover pill.
 
-### Status / toast (S4)
+### Status / toast
 
 - Status bar: solid `statusBg` (not glass — always legible).
 - Toasts: `glassPanel(regular)` + alpha animation via `glassBackground(..., alpha)`.
 
-### Property Manager (C2)
+### Property Manager
 
 - Form body: `mat.regular` glass card inside PM tab.
 - Field rows: standard ImGui frames; no nested full washes.
 
-### Settings modal (S6)
+### Settings modal
 
 - Full modal: `mat.thick` + blocking dim scrim (0.45 alpha black).
 
 ---
 
-## 7. Known shortcomings (fix in P1)
+## 7. Known shortcomings
 
-Carried from `docs/REFACTOR_LOG.md` — must be cleared before G5:
+Shortcomings recorded before the restyle; all had to be cleared for acceptance:
 
 | ID | Issue | Status (liquid-glass v2, 2026-07) |
 |----|-------|-----------------------------------|
@@ -196,11 +196,11 @@ Carried from `docs/REFACTOR_LOG.md` — must be cleared before G5:
 
 ---
 
-## 8. P1 acceptance criteria
+## 8. Acceptance criteria
 
-P1 is done when integrator signs off on all of:
+The restyle is done when all of the following hold:
 
-1. **Screenshot spot-check** — `tree`, `chat`, `pick`, `multidoc` on AI-CAD2: glass reads as
+1. **Screenshot spot-check** — `tree`, `chat`, `pick`, `multidoc` scenarios: glass reads as
    frosted over viewport (blur visible on model edges through panels).
 2. **Lint** — `python3 scripts/check.py gui_lint theme` PASS (zero hardcoded colors in `host/src/ui/**`).
 3. **Shortcomings table** — all six IDs in §7 resolved.
@@ -220,18 +220,18 @@ P1 is done when integrator signs off on all of:
 | Doc tabs | Opaque band | `thin` glass band over viewport |
 | Tooltips | `pushGlassTooltipStyle` | `glassPanel(ultraThin)` + UV blur |
 
-Host baselines: `scratch/gui_baseline/<scenario>.png` (G0). Styling on AI-CAD2 should be
+Host baselines were captured per scenario before the restyle. The restyled GUI should be
 **intentionally better** (more glass, better contrast) while preserving layout parity.
 
 ---
 
-## 10. File ownership
+## 10. Code map
 
-| Concern | Owner node | Path |
-|---------|------------|------|
-| Blur FBO + luminance | F1 | `host/src/ui_theme.{h,cpp}` |
-| Tokens + glass APIs | F2 | `host/src/ui_theme.{h,cpp}` |
-| Panel consumption | S*, C*, H*, P1 | `host/src/ui/*` |
-| Lint enforcement | G5 | `scripts/check.py` |
+| Concern | Path |
+|---------|------|
+| Blur FBO + luminance | `host/src/ui_theme.{h,cpp}` |
+| Tokens + glass APIs | `host/src/ui_theme.{h,cpp}` |
+| Panel consumption | `host/src/ui/*` |
+| Lint enforcement | `scripts/check.py` |
 
 Do not add literal `ImVec4{...}` or `IM_COL32(...)` in panel files — only `theme::` / `palette.` accessors.

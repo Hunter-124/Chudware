@@ -1,0 +1,72 @@
+name: Bug report
+description: Something in Chudware does not work as expected.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem. Please search the existing issues first.
+        Security vulnerabilities must not be reported here; use a private security advisory instead.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: A clear description of the problem, including any error message.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence of steps that triggers the problem. Attach a sample part file if relevant.
+      placeholder: |
+        1. Create a new part
+        2. Sketch a rectangle and extrude it
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Chudware version
+      description: Shown in Help > About, or the release tag / commit you built from.
+      placeholder: v0.2.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Windows
+        - macOS
+        - Linux (AppImage)
+        - Linux (.deb / .rpm)
+        - Built from source
+        - Browser (web app)
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and GPU
+      placeholder: Windows 11 24H2, NVIDIA RTX 4070
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and screenshots
+      description: Relevant log output or screenshots. Remove anything private before posting.
+      render: text

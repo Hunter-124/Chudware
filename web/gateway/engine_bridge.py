@@ -1,8 +1,14 @@
-"""Strict browser RPC admission to OS-isolated, workspace-owned tenant cells."""
+"""WS /engine: strict browser RPC admission to the operator's engine cell.
+
+Each browser frame is parsed as one strict JSON-RPC object, admitted only if
+contracts/cell_methods.json allows the method for the principal's right, and
+forwarded to the cell's hostd as one newline-delimited line. Replies and events
+from the cell are re-validated before they reach the browser; document events
+are forwarded only for documents this connection opened.
+"""
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import math
@@ -17,17 +23,11 @@ import anyio
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
 try:
-    from . import accounts, authn, cells, orgs, provider_broker
-    from .auth import AuthError, revalidate_websocket_user
+    from . import cells
     from .config import settings
-    from .limits import enforce_disk_quota, storage_write_lock
-    from .plans import limits_for
-except ImportError:
-    import accounts, authn, cells, orgs, provider_broker
-    from auth import AuthError, revalidate_websocket_user
+except ImportError:  # uvicorn app:app from the package directory
+    import cells
     from config import settings
-    from limits import enforce_disk_quota, storage_write_lock
-    from plans import limits_for
 
 log = logging.getLogger("chudware-web.engine")
 router = APIRouter()
@@ -36,11 +36,10 @@ _MAX_PENDING_REQUESTS = 32
 _INTERNAL_HELLO = -(2**31)
 _bridge_lock = threading.Lock()
 _active_bridges = 0
-_bridge_owners: dict[str, int] = {}
 _MESH_GRANT_TTL = 24 * 60 * 60
 _MESH_GRANT_LIMIT = 8192
 _mesh_grants_lock = threading.Lock()
-_mesh_grants: OrderedDict[tuple[str, str, str], tuple[float, cells.CellPrincipal, Path | None, str]] = OrderedDict()
+_mesh_grants: OrderedDict[tuple[str, str], tuple[float, Path | None, str]] = OrderedDict()
 _DOC_EVENTS = frozenset({"doc.opened", "doc.changed", "doc.closed", "doc.lease_change",
                          "doc.studies_changed", "doc.history_cleared"})
 _ACTOR_EVENTS = frozenset({"agent.event", "agent.message", "agent.tool_call", "agent.context",
@@ -48,6 +47,11 @@ _ACTOR_EVENTS = frozenset({"agent.event", "agent.message", "agent.tool_call", "a
                           "agent.session", "agent.spawn", "agent.model_assignment",
                           "agent.context_injected", "agent.progress_nudge", "sim.progress",
                           "sim.completed", "job.progress", "job.completed", "dag.event"})
+# Identity and credential fields are attached by trusted code only; a browser
+# frame carrying any of them is refused rather than stripped.
+_RESERVED_FIELDS = frozenset({"principal", "ctx", "_chudware_actor", "api_key", "_subscription",
+                              "_pool", "provider_grant", "web_provider_grant", "web_credential",
+                              "byok_key", "_byok_key_sha256", "_provider_catalog"})
 
 
 class InvalidRequest(ValueError):
@@ -83,9 +87,7 @@ def _check_value(value, depth=0, *, request=False):
             raise ValueError("object too large")
         for key, item in value.items():
             _check_value(key, depth + 1, request=request)
-            if request and key in {"principal", "ctx", "_chudware_actor", "api_key", "_subscription",
-                                   "_pool", "provider_grant", "web_provider_grant", "web_credential",
-                                   "byok_key", "_byok_key_sha256", "_provider_catalog"}:
+            if request and key in _RESERVED_FIELDS:
                 raise ValueError("reserved identity/credential field")
             _check_value(item, depth + 1, request=request)
     elif isinstance(value, list):
@@ -178,10 +180,11 @@ def _mesh_location(principal, path):
 
 
 def grant_mesh_document(principal: cells.CellPrincipal, doc_id: str, path: str | None = None) -> None:
+    """Record that this workspace's cell published ``doc_id``'s mesh at ``path``."""
     if not isinstance(doc_id, str) or not 0 < len(doc_id) <= 180:
         return
     root, relative = _mesh_location(principal, path)
-    key = (principal.account_uid, principal.workspace_key, doc_id)
+    key = (principal.workspace_key, doc_id)
     now = time.monotonic()
     with _mesh_grants_lock:
         for old, row in list(_mesh_grants.items()):
@@ -189,49 +192,20 @@ def grant_mesh_document(principal: cells.CellPrincipal, doc_id: str, path: str |
                 _mesh_grants.pop(old)
         existing = _mesh_grants.pop(key, None)
         if root is None and existing:
-            root, relative = existing[2:]
-        _mesh_grants[key] = (now + _MESH_GRANT_TTL, principal, root, relative)
+            root, relative = existing[1:]
+        _mesh_grants[key] = (now + _MESH_GRANT_TTL, root, relative)
         while len(_mesh_grants) > _MESH_GRANT_LIMIT:
             _mesh_grants.popitem(last=False)
 
 
-def invalidate_mesh_grants(keys: set) -> None:
+def mesh_document_open(workspace_key, doc_id, *, max_bytes=None):
+    """Open a granted mesh through a pinned descriptor, or None."""
     with _mesh_grants_lock:
-        for key in list(_mesh_grants):
-            if (key[1], key[0]) in keys:
-                del _mesh_grants[key]
-
-
-def _mesh_grant(uid, workspace_key, doc_id):
-    with _mesh_grants_lock:
-        row = _mesh_grants.get((uid, workspace_key, doc_id))
-    if not row or row[0] <= time.monotonic():
-        return None
-    principal = row[1]
-    try:
-        with cells.tx() as cur:
-            cur.execute("SELECT email,status FROM accounts WHERE uid=%s", (uid,))
-            account = cur.fetchone()
-        if not account or account["status"] != "active":
-            return None
-        current = cells.resolve_workspace(account["email"], principal.team_id)
-        if current.workspace_key != workspace_key or current.epoch != principal.epoch:
-            return None
-    except HTTPException:
-        return None
-    return row
-
-
-def mesh_document_authorized(account_uid, workspace_key, doc_id) -> bool:
-    return _mesh_grant(account_uid, workspace_key, doc_id) is not None
-
-
-def mesh_document_open(account_uid, workspace_key, doc_id, *, max_bytes=None):
-    row = _mesh_grant(account_uid, workspace_key, doc_id)
-    if not row or row[2] is None:
+        row = _mesh_grants.get((workspace_key, doc_id))
+    if not row or row[0] <= time.monotonic() or row[1] is None:
         return None
     try:
-        return cells.open_beneath(row[2], row[3], max_bytes=max_bytes or settings.max_upload_bytes)
+        return cells.open_beneath(row[1], row[2], max_bytes=max_bytes or settings.max_upload_bytes)
     except HTTPException:
         return None
 
@@ -262,111 +236,42 @@ def active_bridge_count():
         return _active_bridges
 
 
-def _reserve_bridge(uid):
+def _reserve_bridge():
     global _active_bridges
     with _bridge_lock:
-        count = _bridge_owners.get(uid, 0)
-        if count >= settings.max_engine_bridges_per_user:
-            return False, count
-        _bridge_owners[uid] = count + 1
+        if _active_bridges >= settings.max_engine_bridges:
+            return False
         _active_bridges += 1
-        return True, count + 1
+        return True
 
 
-def _release_bridge(uid):
+def _release_bridge():
     global _active_bridges
     with _bridge_lock:
-        count = _bridge_owners[uid] - 1
-        if count:
-            _bridge_owners[uid] = count
-        else:
-            del _bridge_owners[uid]
         _active_bridges -= 1
-        return count, _active_bridges
 
 
 def _error(request_id, code, message):
     return json.dumps({"id": request_id, "error": {"code": code, "message": message}}, separators=(",", ":"))
 
 
-async def _principal_control(principal, epoch, current=None):
-    updated = cells.CellPrincipal(principal.account_uid, principal.workspace_key, principal.actor_key,
-                                  current.right if current else principal.right, epoch, principal.cell_id,
-                                  principal.root, principal.team_id, principal.plan)
-    writer = None
-    try:
-        reader, writer = await cells.connect_cell(updated, activate=False)
-        writer.write(json.dumps({"id": _INTERNAL_HELLO, "method": "hello", "params": {
-            "client": "control", "proto": 1, "principal": updated.hello()}}).encode() + b"\n")
-        await writer.drain()
-        async with asyncio.timeout(10):
-            raw = await reader.readline()
-            hello = parse_cell_frame(raw)
-            if (hello is None or hello.get("id") != _INTERNAL_HELLO or "error" in hello
-                    or not isinstance(hello.get("result"), dict)):
-                return
-        method = "principal_update" if current else "principal_revoke"
-        params = {"actor_key": updated.actor_key, "epoch": epoch}
-        if current:
-            params["right"] = current.right
-        writer.write(json.dumps({"id": 1, "method": method, "params": params}).encode() + b"\n")
-        await writer.drain()
-        async with asyncio.timeout(10):
-            await reader.readline()
-    except (OSError, HTTPException, ValueError, TimeoutError):
-        log.warning("cell principal control unavailable for %s", principal.cell_id)
-    finally:
-        if writer:
-            writer.close()
-
-
 @router.websocket("/engine")
 async def engine_ws(ws: WebSocket):
-    user = ws.state.user
     try:
-        team = orgs.selected_workspace_team(ws, user.email)
-        principal = cells.resolve_workspace(user.email, team)
-        account = accounts.get_account(user.email)
-        university_access = bool(team and team == settings.university_team_id and orgs.university_eligible(user.email))
-        if not limits_for(account.plan).cloud and not university_access:
-            raise HTTPException(403, "plan_no_cloud")
-        if account.plan == "trial" and authn.trial_expired(user.email) and not university_access:
-            raise HTTPException(403, "plan_no_cloud")
-    except (HTTPException, ValueError):
+        principal = cells.resolve_workspace()
+    except HTTPException:
         await ws.close(code=4403, reason="workspace unavailable")
         return
-    reserved, _ = _reserve_bridge(principal.account_uid)
-    if not reserved:
+    if not _reserve_bridge():
         await ws.close(code=4429, reason="too many engine connections")
         return
     writer = None
     tasks = []
-    revoke_tasks = set()
-    token = None
     pending = {}
     docs = set()
     nonce = principal.hello()
-    async def revoked(epoch):
-        await ws.close(code=4403, reason="revoked")
-        if writer:
-            writer.close()
-    def revoke_callback(epoch):
-        task = asyncio.create_task(revoked(epoch))
-        revoke_tasks.add(task)
-        task.add_done_callback(revoke_tasks.discard)
-    async def authorized():
-        try:
-            revalidate_websocket_user(ws.scope, require_cloud=False)
-            current = cells.resolve_workspace(user.email, team)
-            if current.epoch != principal.epoch or current.right != principal.right:
-                raise HTTPException(403, "revoked")
-            return True
-        except (AuthError, HTTPException):
-            await ws.close(code=4403, reason="revoked")
-            return False
     try:
         await ws.accept()
-        token = cells.register(principal, revoke_callback)
         try:
             reader, writer = await cells.connect_cell(principal)
             writer.write(json.dumps({"id": _INTERNAL_HELLO, "method": "hello", "params": {
@@ -391,45 +296,10 @@ async def engine_ws(ws: WebSocket):
                 if frame_size > settings.ws_max_message_bytes:
                     await ws.close(code=1009, reason="frame too large")
                     return
-                if not await authorized():
-                    return
                 try:
                     request = parse_browser_request(frame, right=principal.right)
-                    policy = cells.method_policy()[request["method"]]
-                    if principal.team_id and policy["right"] != "read":
-                        orgs.resolve_team_bucket(user.email, principal.team_id, write=True)
-                    if policy["right"] != "read":
-                        # Interim native/worker accounting: every write/run admission
-                        # measures actual cell workspace usage, rather than cached upload usage.
-                        with storage_write_lock(principal.root):
-                            enforce_disk_quota(user.email, principal.plan, principal.root)
                     if request["method"] == "hello":
                         request["params"] = {"client": "gui", "proto": 1, "principal": nonce}
-                    if request["method"] in {"agent_admin_turn", "agent_cancel", "agent_steer",
-                                              "agent_answer", "chudcode_close_session"}:
-                        try:
-                            from .credits import actor_for
-                        except ImportError:
-                            from credits import actor_for
-                        params = request["params"]
-                        actor = actor_for(user.email)
-                        actor["key_source"] = "byok"
-                        params["_chudware_actor"] = actor
-                        if request["method"] == "agent_admin_turn":
-                            try:
-                                params["provider_grant"] = provider_broker.mint_grant(
-                                    user.email, principal, params.get("provider", ""))
-                            except provider_broker.BrokerRefusal:
-                                raise InvalidRequest("credential_isolation_unsupported",
-                                                     "BYOK provider key required", request["id"]) from None
-                    if request["method"] == "chudcode_models_list":
-                        catalog = {}
-                        for provider in sorted(provider_broker.SUPPORTED_PROVIDERS):
-                            try:
-                                catalog[provider] = provider_broker.mint_grant(user.email, principal, provider)
-                            except provider_broker.BrokerRefusal:
-                                continue  # This actor has no currently usable broker source.
-                        request["params"]["_provider_catalog"] = catalog
                     ident = request["id"]
                     if ident in pending or len(pending) >= _MAX_PENDING_REQUESTS:
                         await ws.close(code=4429, reason="too many or duplicate pending requests")
@@ -440,8 +310,7 @@ async def engine_ws(ws: WebSocket):
                 except InvalidRequest as exc:
                     await ws.send_text(_error(exc.request_id, exc.code, str(exc)))
                 except HTTPException as exc:
-                    await ws.send_text(_error(request.get("id") if "request" in locals() else None,
-                                              "forbidden_right", str(exc.detail)))
+                    await ws.send_text(_error(None, "cell_refused", str(exc.detail)))
 
         async def outbound():
             while True:
@@ -455,8 +324,6 @@ async def engine_ws(ws: WebSocket):
                 reply = parse_cell_frame(raw)
                 if not reply:
                     continue
-                if not await authorized():
-                    return
                 inherited_doc = ""
                 if "event" in reply:
                     data = reply["data"]
@@ -483,46 +350,29 @@ async def engine_ws(ws: WebSocket):
                             result["web_rpc_methods"] = sorted(name for name, rule in cells.method_policy().items()
                                                                  if rule["cell"] == "allow" and rule["right"] in cells.RIGHTS[principal.right])
                             reply["result"] = result
-                    policy = cells.method_policy().get(request["method"])
-                    if policy and policy["right"] != "read":
-                        try:
-                            with storage_write_lock(principal.root):
-                                enforce_disk_quota(user.email, principal.plan, principal.root)
-                        except HTTPException:
-                            await ws.send_text(_error(reply["id"], "quota_exceeded", "cell workspace storage quota exceeded"))
-                            continue
                 _publish_mesh(principal, reply, docs, inherited_doc)
                 await ws.send_text(json.dumps(reply, separators=(",", ":"), allow_nan=False))
 
-        async def epoch_watch():
-            # Observers stay revoked even across another gateway process; this is
-            # not an agent run cap, only live authorization revalidation.
-            while True:
-                await asyncio.sleep(1)
-                if not await authorized():
-                    return
-        tasks = [asyncio.create_task(inbound()), asyncio.create_task(outbound()), asyncio.create_task(epoch_watch())]
+        tasks = [asyncio.create_task(inbound()), asyncio.create_task(outbound())]
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             if task.cancelled():
                 continue
             error = task.exception()
             if error and not isinstance(error, (WebSocketDisconnect, ConnectionError, RuntimeError)):
-                log.warning("tenant bridge ended for %s", principal.cell_id)
+                log.warning("engine bridge ended for cell %s", principal.cell_id)
     finally:
         # Reclaim admission state synchronously even if ASGI cancels shutdown.
-        if token:
-            cells.unregister(principal, token)
         if writer:
             writer.close()
-        _release_bridge(principal.account_uid)
-        for task in [*tasks, *revoke_tasks]:
+        _release_bridge()
+        for task in tasks:
             task.cancel()
         # AnyIO's disconnect scope otherwise repeatedly cancels cleanup awaits,
         # leaving child tasks alive and exposing cancellation to WS clients.
         with anyio.CancelScope(shield=True):
-            if tasks or revoke_tasks:
-                await asyncio.gather(*tasks, *revoke_tasks, return_exceptions=True)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             if writer:
                 await writer.wait_closed()
             try:

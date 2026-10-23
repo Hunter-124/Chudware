@@ -1,129 +1,122 @@
 # Contributing to Chudware
 
-Solo dev + AI agents, trunk-based, fast cycles. Read this (and AGENTS.md) before touching
-anything.
+Thanks for your interest in improving Chudware. This guide covers how to propose changes,
+the checks a change must pass, and the project's code and dependency rules. By
+participating you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
-## Prerequisites
+## Issues
 
-- CMake + Ninja + a C++ toolchain with C++20 support (C++17 baseline; the mesh,
-  manufacturing, twin, and print layers need C++20) — GCC/Clang on Linux, MSVC/VS 2022 on
-  Windows. CUDA is optional (`CHUDWARE_WITH_CUDA`, default OFF).
-- Python 3.11 for services/agent/MCP work. The gate resolves the service venv (default
-  `~/.local/share/Chudware/mcp-venv/`; override with `CHUDWARE_GATE_PYTHON`).
-- The repo knowledge graph (`graphify`; see AGENTS.md workflow item 1).
+- Search existing issues before opening a new one.
+- For bugs, include the version or commit, the platform, steps to reproduce, and what you
+  expected versus what happened. A small `.step+` file or a screenshot helps.
+- For feature requests, describe the workflow you are trying to accomplish.
+- Report security vulnerabilities privately as described in [SECURITY.md](SECURITY.md),
+  never in a public issue.
 
----
+## Pull requests
 
-## Workflow
+1. Fork the repository and create a topic branch from the default branch.
+2. Keep each pull request focused on one change. Large or cross-cutting changes (a new
+   module, a contract change, a new dependency) are easier to land after a short design
+   discussion in an issue.
+3. Add or update tests for the behavior you change, and update the docs that describe it.
+4. Run the checks below and make sure they pass.
+5. Open the pull request with a description of what changed and why, and link the issue it
+   addresses.
 
-### 1. Pick a task
+## Development setup
+
+Follow [Building from source](README.md#building-from-source) to create the Python service
+environment (`.venv-mcp`) and build the native targets. Requirements in short: CMake 3.24+,
+Ninja, a C++20 toolchain (GCC/Clang on Linux, AppleClang on macOS, Visual Studio 2022 on
+Windows), OCCT 7.9, and Python 3.13 (3.12 also works). C++17 is the baseline; the mesh,
+manufacturing, twin, and print layers require C++20. CUDA is an optional LBM backend
+(`CHUDWARE_WITH_CUDA`, default OFF). Windows specifics are in
+[docs/reference/BUILD_WINDOWS.md](docs/reference/BUILD_WINDOWS.md).
+
+Enable the repository's pre-commit hook once per clone:
 
 ```bash
-python3 work/tools/work.py ready      # unblocked tasks, priority order
-python3 work/tools/work.py board      # the full board
+git config core.hooksPath scripts/hooks
 ```
 
-Tasks are markdown files with flat YAML front matter in `work/tasks/` + `work/backlog/`
-(`status`, `priority`, `lane`, `kind`, `depends_on`, `deferred`, …) and body sections
-including "Files / areas touched" and "Definition of done". Board policy:
-[work/WORKFLOW.md](work/WORKFLOW.md); task format and lifecycle:
-[work/README.md](work/README.md).
-
-### 2. Do the work, gate, close
+## Checks
 
 ```bash
-bash scripts/gate.sh        # check.py + core build/ctest + host build + WASM smoke + smokes
-graphify update .           # after code changes (AST-only, no API cost)
+.venv-mcp/bin/python scripts/check.py                            # fast source and audit gate
+CHUDWARE_GATE_PYTHON=.venv-mcp/bin/python bash scripts/gate.sh   # full Linux gate
 ```
 
-Do not merge work that fails the gate. Environment SKIPs (no OCCT, no venv, no xvfb) are
-honest SKIPs, not failures. Fast source/audit gate: `python3 scripts/check.py` — not
-stdlib-only; the interpreter needs the pinned audit packages (`CHECK_PYTHON` overrides;
-see [docs/reference/CI_RUNNERS.md](docs/reference/CI_RUNNERS.md)).
+- `scripts/check.py` runs the deterministic source-level audits: GUI lint, ribbon command
+  routing, SolidWorks-parity evidence pointers, agent event kinds, the no-Python-engine
+  import ratchet, generated tool tables, advertised MCP tools, portable paths, and the
+  shared-UI manifest. It needs no native build, but some audits import the MCP tool
+  catalog, so run it with the service environment (`CHECK_PYTHON` selects another
+  interpreter).
+- `scripts/gate.sh` is the full Linux gate; its header comment is the authoritative stage
+  list. It runs `check.py`, the core build and ctest, the GUI build, a WASM build smoke when
+  emsdk is installed, the `chudware-hostd` lifecycle smoke and web-parity probe, the Python
+  suites, and headless screenshot smokes. Stages whose environment is missing (no OCCT, no
+  `xvfb-run`, no emsdk) report SKIP rather than failing; `CHUDWARE_GATE_STRICT=1` makes
+  them fatal, as CI does.
+- Targeted runs while iterating:
+  - C++ core: `ctest --test-dir core/build-linux` (gate tree) or
+    `ctest --test-dir build/<preset>/core` (preset tree).
+  - Python: `.venv-mcp/bin/python -X utf8 -m pytest services/agent -q` (any package dir).
+  - GUI: the headless screenshot harness, `CHUDWARE_SHOT=<scenario>` under `xvfb-run`.
 
-The gate sweeps service units, scripts, assets, tools and training with the selected
-runtime interpreter; its packaging stage covers distro artifacts,
-release signing, evidence and finalization with that same interpreter. The fast audit
-also checks the frozen shared-UI manifest and assets.
+Continuous integration runs the same checks on every pull request; see
+[docs/reference/CI.md](docs/reference/CI.md).
 
-The public site's `.astro/` directory is generated local state, not source. Astro
-regenerates its content metadata and types during `npm run dev` or `npm run build`;
-keep `src/content.config.ts`, authored content and the package lockfile committed.
+## Code guidelines
 
----
+- **New engine functionality lands in `core/` (C++)** behind the RPC surface. There is no
+  Python CAD engine; `scripts/check.py`'s `oracle_import_audit` fails on any `engine.*` /
+  `engine_oracle.*` import under `services/`, `scripts/`, or `tools/`. Python under
+  `services/` is for the MCP server, the agent host and policy, and helpers with no C++
+  counterpart.
+- **Contracts first.** Interfaces between components are frozen in
+  [contracts/](contracts/README.md). A new module ships its contract in the same change; a
+  change to a frozen section bumps its version as described in `contracts/README.md`.
+- **Keep the MCP surface consistent.** A change to an agent-facing tool, prompt, or
+  workflow updates the server instructions in `services/mcp/server.py` and the matching
+  `cad_guide` topics in the same change.
+- **Match the surrounding code.** Follow the existing naming, comment density, and idioms
+  of the file you are editing. Code, comments, and docs are in English.
+- **Keep changes minimal.** A bug fix does not reformat or refactor unrelated code. Build
+  what the change needs: no speculative options, extension points, or single-use
+  abstractions. Delete dead code instead of commenting it out.
+- **GUI code** lives in `host/`, the single GUI source tree for the native and WASM builds.
+  Platform-specific behavior belongs behind build conditionals in the existing seams, not
+  in a second GUI. Sizing and theming go through the shared metrics and theme tokens.
+- Subsystem conventions and invariants are collected in [docs/dev/](docs/dev/README.md);
+  some directories also carry a local `AGENTS.md` with notes for that subsystem.
 
-## Rules
+## Dependencies and licensing
 
-**Contracts first.** Any new module ships a `contracts/*.md` the same day the module is
-created. Contracts are append-only and integrator-owned: hand the draft to the integrator.
+The authoritative dependency ledger is [contracts/licenses.md](contracts/licenses.md); open
+compliance items are tracked in [contracts/license_debt.md](contracts/license_debt.md), and
+the notices that ship with the app are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-**Scoped write-sets.** A task's "Files / areas touched" section defines what it may touch;
-parallel tasks must have disjoint write-sets. Extending a shared/append-only file
-(`contracts/*`, top-level CMake, `core/api/libchudware.h`, `AGENTS.md`, `scripts/gate.sh`)
-is the integrator's job — coordinate first.
+- **Ledger row before use.** Every new dependency (vendored code, Python package, CMake
+  fetch, external binary, or model weights) gets a ledger row with its SPDX license, role,
+  and posture in the same pull request. Prefer an existing in-repo capability over a new
+  dependency.
+- **In-process only when license-compatible.** Linked or imported dependencies must be
+  permissively licensed, or LGPL linked dynamically (as for OCCT).
+- **Copyleft tools stay out of process.** GPL and AGPL tools are invoked as user-installed
+  subprocesses and are never linked, imported in-process, vendored, or bundled; when such a
+  tool is missing, the feature that needs it degrades gracefully.
+- **Excluded stays excluded.** A dependency the ledger marks excluded is not used.
 
-**New engine functionality lands in `core/` (C++).** There is no Python engine;
-`scripts/check.py`'s `oracle_import_audit` fails on any `engine.*` / `engine_oracle.*`
-import under `services/`, `scripts/`, or `tools/`.
+If a dependency's license is unclear, raise it in the pull request before relying on it.
 
-**Log discovered work, don't absorb it.** Found something out of scope? File a task and
-stop. Scope creep creates overlapping write-sets and merge conflicts.
+**Format reverse engineering must be clean-room.** Interoperability reverse engineering is
+protected (for example under DMCA §1201(f) and Article 6 of the EU Software Directive) only
+when no competitor source code, SDK, or EULA-restricted tooling is used. Do not contribute
+code derived from such material.
 
-**One gate, no exceptions.** `bash scripts/gate.sh` must be green before merging to master.
+## License of contributions
 
----
-
-## License guardrails
-
-The product is commercial closed-source. License discipline is non-negotiable. The
-authoritative ledger is [contracts/licenses.md](contracts/licenses.md): its row for a
-dependency decides that dependency's posture, and its header records the current
-distribution posture and open audit items. Open license debts and pending legal reviews are
-tracked in [contracts/license_debt.md](contracts/license_debt.md). The ledger's rules:
-
-- **Ledger row before use.** Every dependency — vendored, pip, CMake, external binary, or
-  model weights — gets a row (SPDX identifier, role, posture) before it lands. No row means
-  no classification: do not infer one.
-- **In-process only when license-clean.** Linked or imported dependencies are permissive,
-  or LGPL linked dynamically (as the ledger records for OCCT and Netgen).
-- **Copyleft tools are isolated.** GPL tools are subprocess-only: user-installed or
-  PATH-discovered, never linked, imported in-process, vendored, or bundled; a missing tool
-  degrades gracefully instead of breaking unrelated features.
-- **Excluded rows stay excluded.** A dependency the ledger marks EXCLUDED or RULED OUT
-  (for example AGPL in-process libraries or non-commercial model licenses) is not used.
-
-If a dependency's posture is uncertain, ask before merging.
-
-For format reverse-engineering: interoperability RE is protected under DMCA §1201(f) and
-EU Software Directive Art. 6 **only if clean-room** — the person documenting a format and
-the person writing the parser must never share competitor source, SDKs, or EULA-bound
-tooling.
-
----
-
-## AI-tooling
-
-AI agents (Claude Code, the in-app copilot) are first-class contributors. Same rules apply.
-
-**Start every task with a graph query:**
-```bash
-graphify query "<what you are about to build>"
-graphify path "<ModuleA>" "<ModuleB>"   # cross-file relationships
-graphify explain "<concept>"            # focused concept lookup
-```
-
-**Use the in-repo MCP server** to drive design work from an external agent:
-`python3 services/installer/setup_mcp_clients.py` (Windows: `mcp_setup.bat`) registers it
-with Claude Code, Cursor, VS Code, opencode.
-
-**Work order format for agents:** `python3 work/tools/work.py prompt <ID>` emits the task as
-a self-contained work order; its "Files / areas touched" section is the scope and its
-"Definition of done" checklist is the finish line.
-
----
-
-## Getting help
-
-- Architecture: [ARCHITECTURE.md](ARCHITECTURE.md) + [AGENTS.md](AGENTS.md)
-- Frozen interface contracts: [contracts/](contracts/)
-- Task system: [work/README.md](work/README.md)
+Chudware is licensed under the [MIT License](LICENSE). By submitting a contribution, you
+agree that it is licensed under the same terms and that you have the right to submit it.

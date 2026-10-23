@@ -92,7 +92,7 @@ def validate_request(kind: str, request: bytes) -> None:
         # Exactly the preimage every builder emits and every verifier recomputes:
         # key id, version, platform, arch, lowercase sha256 of the artifact bytes
         # (packaging/linux/build_appimage.sh, services/installer/build_release.py,
-        # packaging/finalize_release.py, Webservice/gateway/releases.py,
+        # packaging/finalize_release.py, packaging/github_release_manifest.py,
         # host/src/update/updater.cpp). A short request here would sign an identity
         # nothing can verify.
         parts = request[len(domain):].split(b"\0")

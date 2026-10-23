@@ -1,6 +1,6 @@
 # Commands Reference
 
-Every ribbon command (516 total), grouped by tab and ribbon group.
+Every ribbon command (518 total), grouped by tab and ribbon group.
 
 ## Annotation
 
@@ -1758,7 +1758,15 @@ _Available from the Sketch ▸ Draw ribbon group._
 
 _Available from the Sketch ▸ Relations ribbon group._
 
+#### Fully Define
+
+_Available from the Sketch ▸ Relations ribbon group._
+
 #### Relations
+
+_Available from the Sketch ▸ Relations ribbon group._
+
+#### Show Relations
 
 _Available from the Sketch ▸ Relations ribbon group._
 

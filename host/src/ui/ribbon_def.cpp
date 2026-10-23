@@ -159,8 +159,8 @@ static const RibbonCmd kCmds[] = {
     // =========================================================================
     // Pseudo-tab: "Sketch3D" — the 3D free-space sketcher's ribbon tool set. NOT one of
     // kRibbonTabs (never shown by normal tab iteration); ribbon.cpp swaps the Sketch tab's
-    // command source to these rows while a sketch3d feature is being edited (Hunter red-pen
-    // item 1 — 3D tools belong in the ribbon, not the sketch3d_mode.cpp floating overlay).
+    // command source to these rows while a sketch3d feature is being edited (3D tools
+    // belong in the ribbon, not the sketch3d_mode.cpp floating overlay).
     // =========================================================================
 
     { "sketch3d_exit",      "Exit Sketch",   "ok_check",        "Sketch3D", "Sketch",          true,  nullptr,          false },
@@ -576,7 +576,7 @@ static const RibbonCmd kCmds[] = {
     { "cam_flavor",        "Flavor",      "settings",        "Manufacture", "Output",    false, nullptr, false },
 
     // =========================================================================
-    // sim-gui rework (Hunter red-pen): per-simulation-type ribbon tabs, one per study kind,
+    // sim-gui rework: per-simulation-type ribbon tabs, one per study kind,
     // shown ONLY in the Simulate workspace (ribbon.cpp ribbon_tabVisible, tabs 13..19).
     // Each tab carries JUST the tools for its study type — the first button is always
     // "+ New <type> Study", then the type's setup tools, Run/Results, and the shared
@@ -662,7 +662,7 @@ static const RibbonCmd kCmds[] = {
     // --- Tab: EM (electromagnetics — backed by the em_* worker RPCs, parallel agent).
     // SimManager gates every sim_em_* command on an em_status probe: when the solver backend is
     // not installed the whole set renders disabled with an honest "EM solver not installed"
-    // tooltip (ui::setRibbonDisabledPrefix). Study-kind buttons per Hunter's spec: Eigenmode,
+    // tooltip (ui::setRibbonDisabledPrefix). Study-kind buttons per the spec: Eigenmode,
     // Frequency Sweep (S-parameters), Time Domain; setup tools: ports / boundaries / freq range.
     { "sim_em_eigen",      "Eigenmode",   "study_modal",     "EM",      "Study",     true,  nullptr, false },
     { "sim_em_sweep",      "Freq Sweep",  "study_flow",      "EM",      "Study",     true,  nullptr, false },

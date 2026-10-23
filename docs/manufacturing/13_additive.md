@@ -1,8 +1,8 @@
 # Additive Manufacturing — Architecture Contract & Execution Plan
 
-**Owner:** AdditiveArchitecture · **Wave:** design-only, 2026-08-08 · **No repository files edited.**
+**Owner:** AdditiveArchitecture · **Wave:** design-only, 2026-08-08.
 
-Domain names, corrected against Main's path/prefix ruling (`GW-PATHS-ROOTS`): wire RPC
+Domain names, corrected against the project path/prefix ruling (`GW-PATHS-ROOTS`): wire RPC
 `mfg_print_*`, events `mfg.print.*`, MCP family `manufacture`, contract
 `contracts/manufacturing_print.md`, doc schemas `chudware.print_*/1`, document extension
 `.print+`, C++ namespace `chudware::print`, GUI tree `host/src/ui/manufacture/print/`, service
@@ -16,7 +16,7 @@ Consumed verbatim, never redefined:
   `ControllerSnapshot`/`ControllerEvent` + its additive extension slot, event envelope,
   idempotent command ids, multi-client leases, alarm enum.
 - **UX `FreshValue<T>`** — `{v, state, t_mono_ns, seq, age_ms, ttl_ms, src, why, last_ok?}`,
-  the single external/UI/event value shape per Main's ruling. `v == null` unless
+  the single external/UI/event value shape per the project ruling. `v == null` unless
   `state=="ok"`; `last_ok` never gates; a sequence gap flips fields to `unknown`, never to last
   value; `age_ms > ttl_ms` renders stale regardless of `state`. A durable authored row is
   journaled **and** published wrapped, with `state:"ok"` and `ttl_ms:null` for rows that do not
@@ -25,7 +25,7 @@ Consumed verbatim, never redefined:
   (`state=="ok" && src=="probed"`, plus `CapabilityTruth.truth=="verified"` for an execute-side
   subject) and `procedural_fact` (a seq-stamped recorded computation bound to an `art:`/`job:`/
   `res:` subject, never admissible for an execute-side subject). Admission only **ADMITS** a value
-  into gate evaluation; failing Stage 1 fails the gate closed, always. Stage 2 (domain, mine) —
+  into gate evaluation; failing Stage 1 fails the gate closed, always. Stage 2 (domain, additive) —
   the named guards of §8.2 decide pass/fail and render **by name**. A Stage-1 pass is never a
   verdict, and approvability is never inferred from freshness alone. No second envelope, no
   per-field translation table.
@@ -34,7 +34,7 @@ Consumed verbatim, never redefined:
   observation `src`, never a truth value (§10).
 - **UX `AppState::mfg.mode`** (Offline-Simulation vs Live Machine).
 
-**Authoring vs device, held absolutely** (ExecutionPlanner ruling 3): every additive method —
+**Authoring vs device, held absolutely** (execution-plan ruling 3): every additive method —
 `mfg_print_*` on the wire, `print_*` in the C ABI — is document/authoring/slice/preflight/
 artifact. **No additive method may open a transport, take a lease, upload, or start anything**,
 and as of this revision that is asserted structurally by the strengthened `mfg-abi` smoke rather
@@ -130,7 +130,7 @@ services/manufacturing/slicer/           # sidecar orchestration (Python — sub
 
 fixtures/mfg/print/                      # ratified fixtures root; every entry is manifest-marked virtual
   fake_slicer.py                         # argv-contract-honoring fake binary
-  fake_moonraker.py  fake_octoprint.py   # printer-lane E4/E5 fixtures (my spec, Gateway-run)
+  fake_moonraker.py  fake_octoprint.py   # printer-lane E4/E5 fixtures (additive spec, Gateway-run)
   goldens/                               # owned golden projects + expected invariants
 
 services/manufacturing/slicer/sidecar.py                   # separate process, one job in flight (services/sim/job_worker.py pattern)
@@ -160,7 +160,7 @@ contracts/manufacturing_print.md
 the pin, the patch queue, our profiles and the notices. The source boundary is as visible in
 the filesystem as it is in the process table.
 
-### Existing files modified (collision list; serialized by ExecutionPlanner)
+### Existing files modified (collision list; serialized by the execution plan)
 
 `core/CMakeLists.txt` (source block ~L278; 6 new ctest targets) · `core/api/libchudware.cpp`
 (method table ~L4105, appended after the `cam_*` block) · `core/hostd/doc_registry.cpp` (~L45
@@ -172,8 +172,8 @@ regenerated via `tools/gen_tool_panel_tables.py`, never hand-edited, pair moves 
 `host/src/ui/viewport_panel.cpp` (one draw call site) · `host/src/ui/scenarios.cpp`
 (`CHUDWARE_SHOT=print`) · `host/CMakeLists.txt` · `contracts/worker_rpc.md` (append **only** to
 the section Gateway allocates to additive in W1.1 — no section number is claimed here) ·
-`contracts/README.md` · `contracts/licenses.md` · `contracts/license_debt.md` (append below the
-RE-ANCHOR line) · `scripts/check.py` · `scripts/gate.sh`.
+`contracts/README.md` · `contracts/licenses.md` · `contracts/license_debt.md` ·
+`scripts/check.py` · `scripts/gate.sh`.
 
 **Not edited by additive, though additive depends on them:** `services/mcp/tool_registry.py`
 (Gateway is the single owner for the wave; additive's risk rows land as data that owner appends),
@@ -181,7 +181,7 @@ RE-ANCHOR line) · `scripts/check.py` · `scripts/gate.sh`.
 additive's MCP wave), and `contracts/manufacturing_gateway.md` (Gateway records additive's
 C-ABI naming exception there).
 
-Shared-file collisions, per ExecutionPlanner: `app_state.h/.cpp`, `ribbon_def.cpp`,
+Shared-file collisions, per the execution plan: `app_state.h/.cpp`, `ribbon_def.cpp`,
 `viewport_panel.cpp`, `scenarios.cpp` with UX (UX lands `app_state.h` + `mfg.mode` first);
 `tool_panel_tables.*` with Twin. `host/src/ui/manufacture/**` is UX's shell — additive owns only
 the `print/` subdirectory of it and calls UX's entry points rather than reimplementing them.
@@ -356,7 +356,7 @@ registered kind (§10.1), because that append is the only way any domain obtains
 (`GW-SEQ-SOLE-STAMP`). Additive's earlier "monotonically increasing `seq`" spelling created a
 second `seq` namespace over the same run — precisely the ordering ambiguity DoD 9's
 `seq <= at_seq` scoping depends on not existing. Offered to Gateway; if Gateway prefers to own the
-file, I emit the join record into theirs and keep none.
+file, additive emits the join record into Gateway's and keeps none.
 
 ### 3.7 Media — discovery only, never pixels
 
@@ -367,9 +367,9 @@ MediaSourceRef { media_id, device_id, kind:"mjpeg"|"snapshot"|"rtsp"|"webrtc"|"n
                  credentials_ref, transport_secure:bool, verified_at }
 ```
 
-`EvidenceClip` is **PerceptronArchitecture's record, not mine** — the ring buffer, retention
+`EvidenceClip` is **PerceptronArchitecture's record, not additive's** — the ring buffer, retention
 decision and truncation truth live in one slice, so splitting it would fork the source of
-truth. I own only the identity fields it carries verbatim —
+truth. Additive owns only the identity fields it carries verbatim —
 `{clip_id, run_id, device_id, trigger_event_id, t_start, t_end, sha256, retention_class}` —
 content-addressed, immutable and run-bound, with corrections emitting a new record carrying
 `supersedes`. Perception adds `{truncated, media_id, transport_secure, synthetic, bytes, codec}`.
@@ -478,7 +478,7 @@ own configuration wizard on a different cadence from code; ours are owned files 
 
 ### 4.4 Why PrusaSlicer, and what was rejected
 
-Per `agent://SlicerStrategy` (checked 2026-08-08): `libslic3r` has no independent release train,
+Per the slicer-strategy research (checked 2026-08-08): `libslic3r` has no independent release train,
 no stable ABI and no compatibility policy — consuming it means pinning the whole application
 source. CuraEngine is architecturally the cleanest headless engine (console CLI, `slice` verb,
 Conan packaging, alpha `0.1.0-alpha` gRPC plugin slots) but is **also AGPL**, so it buys no
@@ -500,19 +500,18 @@ verified by `scripts/check.py`:
 3. `MODIFICATIONS.md` — per-patch subject, author and date (AGPL §5(a) modification notices).
 4. `THIRD_PARTY_NOTICES.txt` — including the full AGPL-3.0 text.
 5. In-product: Help → About → "Slicer source" opens `corresponding_source_url`, **and**
-   `mfg_print_sidecar_status` returns it so any network/API surface can expose it — the §13 posture
+   `mfg_print_sidecar_status` returns it so any network or API surface can expose it — the §13 posture
    should a modified slicer ever be reachable remotely. A visible link, not a buried legal page.
 6. `contracts/licenses.md` — a dependency row: *PrusaSlicer fork · AGPL-3.0-or-later · FFF
    slicing · **subprocess-only, never linked or bundled into libchudware**, replaceable binary,
    corresponding source archived per build* — matching the ngspice / LibreDWG / OpenFOAM
    isolation posture already recorded there.
-7. `contracts/license_debt.md` — appended below the existing `RE-ANCHOR` comment at the next
-   free numbers: (a) the AGPL fork and its corresponding-source obligation with the
-   required-before-SaaS action, (b) the §13 network-source obligation should the modified slicer
-   ever be exposed as a service.
+7. `contracts/license_debt.md` — open items for (a) the AGPL fork and its corresponding-source
+   obligation, to be met before any distribution of the sidecar, and (b) the §13
+   network-source obligation should the modified slicer ever be exposed as a service.
 
 *Not legal advice; process separation is not a guaranteed copyleft firewall. Counsel review is a
-named prerequisite before commercial distribution, recorded in the debt register rather than
+named prerequisite before distributing any build that bundles the slicer sidecar, recorded in the debt register rather than
 assumed away.*
 
 ---
@@ -633,7 +632,7 @@ message naming the accepted set. No aliasing to a "near" value.
 
 **Gateway owns the adapter code and the one-command-owner arbiter.** This section is the
 additive family spec Gateway implements, plus the vendor→normalized mapping tables, which are
-mine to supply as data.
+additive's to supply as data.
 
 ### 6.1 Family rules
 
@@ -689,7 +688,7 @@ consumer API. Direct Marlin serial is deferred (§13).
 Every adapter is an independent clean protocol client written from public documentation. Nothing
 GPL/AGPL/`Freeware` is copied, bundled, linked or modified into the product tree.
 
-### 6.5 Alarm mapping (I supply the table; Gateway owns the enum)
+### 6.5 Alarm mapping (additive supplies the table; Gateway owns the enum)
 
 | Source | Raw | → Gateway alarm class |
 |---|---|---|
@@ -723,7 +722,7 @@ anomaly (advisory, Perception's).
   (`EvidenceClip`, §3.7); Perception's pull worker holds an independent rate/bytes budget and
   backpressures to snapshot polling rather than ever competing with the control lane.
 - `transport_secure:false` (e.g. Buddy3D RTSP) is surfaced, not hidden.
-- Vision-based failure detection is Perception's, not mine (§13).
+- Vision-based failure detection is Perception's, not additive's (§13).
 
 ---
 
@@ -961,7 +960,7 @@ it is called. Check any new state against that test before adding it.
 as policy rather than a bug. The table carries the **pass-direction question as a column**, so the
 check happens when a guard is *added* rather than when someone next remembers to audit.
 
-**A live defect this audit found in my own design.** Five guards as originally specified compared
+**A live defect this audit found in the additive design.** Five guards as originally specified compared
 an artifact fact against a **printer/material/process profile** value — and a profile is
 `declared`, never `probed`. A conclusive gate sourced from a declared value can never pass Stage 1,
 so all five were unsatisfiable, exactly the `machine_envelope` shape. They are re-specified as
@@ -1128,7 +1127,7 @@ event tick, so within a single frame an RPC response is applied *before* a lane 
 caused by that same call — and an unscoped invalidation would clear the result the call had
 just legitimately produced. Seq-scoping makes application order-independent and idempotent,
 with three consequences additive takes advantage of: no producer-side synchronous hold is
-required for ordering (my earlier "emits synchronously" requirement is **dropped**, retained
+required for ordering (the earlier "emits synchronously" requirement is **dropped**, retained
 only as promptness, not as an ordering mechanism); replaying an invalidation is safe; and
 crash-recovery drain paths become safe rather than dangerous.
 
@@ -1139,7 +1138,7 @@ later adds an invalidation path to them out of symmetry.
 **Guard audit — three checks, and they are separately owned.** All three fail in different
 directions and none catches the others.
 
-*(i) Producer-side — could any value additive produces ever PASS this guard?* **Mine.** If no,
+*(i) Producer-side — could any value additive produces ever PASS this guard?* **Additive's.** If no,
 the guard is not defined and the absence is documented below with reasoning. An unsatisfiable
 guard is *maximally* drivable to fail, so check (iii) would certify it with a clean bill of
 health. It is worse than a dead guard: it blocks approval forever, therefore gets waived on
@@ -1151,12 +1150,12 @@ can pass on real inputs. Five earlier guards that could NOT were re-specified as
 than kept (§8.2), and one (`build_plate_confirmed`) exists only because a sensor-only formulation
 would have been unsatisfiable.
 
-*(ii) Gate-side — can at least one of a gate's evidence sources pass Stage 1?* **NOT mine, and
+*(ii) Gate-side — can at least one of a gate's evidence sources pass Stage 1?* **Not additive's, and
 deliberately so.** Unsatisfiability is a property of a gate's whole *source set*, and nobody who
 owns a single source can see the set — which is exactly how a gate can sit unsatisfiable on the
 approval path while every producer has answered its own audit truthfully. This check belongs to
 the approval-path owner: Gateway for the arbiter-side preflight set, UX for the run-approval
-rows. My twelve guards in §8.2 **are** additive's contribution to the arbiter-side preflight set,
+rows. The twelve guards in §8.2 **are** additive's contribution to the arbiter-side preflight set,
 and each supplies a Stage-1-admissible source under a named class: nine under `procedural_fact`
 (artifact bytes, document data and our own binary hash, gateway-recorded and bound to
 `artifact_id` + `config_epoch`), one under `probed_evidence` (`artifact_staged`), and two compound
@@ -1165,7 +1164,7 @@ conclusion, and none offers a `procedural_fact` for an execute-side subject
 (`GW-ADMIT-NO-PROC-EXEC`). That statement is input to Gateway's (ii) audit; it does not discharge
 it.
 
-*(iii) Liveness — can it ever FAIL?* **Mine.** A guard that can never fail is indistinguishable
+*(iii) Liveness — can it ever FAIL?* **Additive's.** A guard that can never fail is indistinguishable
 from one that is broken, and it dilutes the named-guard rendering Stage 2 depends on. All twelve
 guards can fail on real inputs, and `test_print_invalidation.cpp` drives each to `fail` so this
 is a standing invariant rather than a one-time act.
@@ -1228,7 +1227,7 @@ the `seq` returned by `mfg_event_append` against the row's registered kind (§10
 ## 9. GUI boundaries
 
 Mirrors the CAM split exactly, so there is one convention rather than two. Two owners, one
-surface, an explicit function seam: I own `host/src/ui/manufacture/print/**`; UX's
+surface, an explicit function seam: additive owns `host/src/ui/manufacture/print/**`; UX's
 `host/src/ui/manufacture/**` shell *calls* these entry points and reimplements nothing. **There
 is no `host/src/ui/print/` tree** — production GUI additions live only under
 `host/src/ui/manufacture/**` (`GW-PATHS-ROOTS`), and additive claims the `print/` subdirectory of
@@ -1374,7 +1373,7 @@ graph LR
 | 2 | **D** sidecar + slice worker · **E** RPC dispatch + CMake + doc_registry | A, B | each other |
 | 2 | **C** preflight + capability | Gateway publishing `CapabilityTruth`, `ApprovalRecord`, run identity **and** the two Stage-1 admission classes; K accepted | D, E |
 | 3 | **G** MCP tools · **F** GUI mirror/panel/preview | G ← D, E and Gateway's `manufacture`-family-default edit · F ← E, D and UX's `app_state.h`+`mfg.mode` | each other |
-| 3 | **H** additive adapters (Gateway's tree, my family spec) | C, D | F, G |
+| 3 | **H** additive adapters (Gateway's tree, additive family spec) | C, D | F, G |
 | 4 | **I** run records, approval binding, evidence clips | H | — |
 | 4 | **J** `scripts/check.py` audit + `gate.sh` stage + the `mfg-abi` clause of §12 | F, H | I |
 | 5.2 | **E4/E5** printer qualification, `scripts/qualify_print_e{4,5}.sh`, excluded from `gate.sh` | H | — |
@@ -1384,7 +1383,7 @@ Critical path: Gateway's W1.1 amendment (kind table, admission classes, `manufac
 default, `contracts/worker_rpc.md` section allocation) → C → H → I. A, B and K start immediately.
 Shared-file serialization (UX first on `app_state.h`; `tool_panel_tables.*` regenerated, never
 hand-edited; `services/mcp/tool_registry.py` Gateway-owned, additive's risk rows appended by that
-owner) is ExecutionPlanner's to sequence.
+owner) is sequenced by the execution plan.
 
 ---
 
@@ -1484,9 +1483,9 @@ call), `test_print_invalidation.cpp`'s guard-liveness leg (a guard reachable onl
   unpinned binary stamps `pin_status:"unpinned"`; corresponding-source URL and hash present on
   every artifact; `--source-bundle` produces all five release artifacts of §4.5.
 
-### Virtual printers (`fixtures/mfg/print/**` — my spec, run by Gateway's qualification scripts)
+### Virtual printers (`fixtures/mfg/print/**` — additive spec, run by Gateway's qualification scripts)
 
-Emulator-first progression, per `agent://PrinterMonitoring`. **None of these raises a capability
+Emulator-first progression, per the printer-monitoring research (`90_research_printers.md`). **None of these raises a capability
 level.** Every endpoint below is recorded in the fixture manifest as virtual, so
 `GW-PROV-VIRTUAL-SIM` forces `src:"simulated"`; they qualify protocol handling, and E6 on a pilot
 printer remains the only thing that unlocks `execute`.
@@ -1556,7 +1555,7 @@ of relying on everyone remembering it:
 2. `scripts/vendor_slicer.py --verify` — every patch hash matches the lock, every lock field
    non-empty, patch count ≤ 12.
 3. Release-artifact check: for a build marked distributable, all five §4.5 artifacts exist with
-   matching hashes and a non-empty customer-facing source URL.
+   matching hashes and a non-empty user-facing source URL.
 4. `tools/gen_tool_panel_tables.py --check` already gates the generated
    `tool_panel_tables.h`/`.snapshot.json` pair; the print rows go through it.
 5. Path/prefix check (`GW-PATHS-ROOTS`): no `host/src/ui/print/`, no `services/slicer/`, no
@@ -1596,7 +1595,7 @@ unreachable until E6 on a pilot printer, attended.
    DED/WAAM and binder jetting are out of this wave — schema hooks, no implementation.
 4. **No direct Marlin serial transport.** Serial framing, line numbers/checksums/resends, command
    queues, compile-time feature variance and host-vs-SD continuity stay OctoPrint's job until a
-   named customer requires otherwise.
+   concrete use case requires otherwise.
 5. **No Prusa Connect, no Bambu cloud, no Bambu non-free networking plugin.** Local APIs only.
 6. **No continuous video recording and no cloud media upload.** Short rolling buffer plus
    event-centric evidence clips.
@@ -1629,7 +1628,7 @@ unreachable until E6 on a pilot printer, attended.
 ## 14. Review closure — exact corrected paths, prefixes and kinds
 
 Every row below is a reconciliation applied in this revision against
-`local://manufacturing-plan-review.md`. Nothing here changes accepted product scope: additive
+the architecture plan review. Nothing here changes accepted product scope: additive
 remains in scope exactly as accepted, and physical execution stays deferred behind E6.
 
 ### 14.1 Findings closed in this document

@@ -1,15 +1,16 @@
 ---
 import BaseLayout from '../../layouts/BaseLayout.astro';
 ---
-<BaseLayout title="Privacy Policy" description="How Chudware collects, uses, shares, retains, and protects account and service data.">
-  <div class="wrap legal-shell"><header><p class="eyebrow">Legal</p><h1>Privacy Policy</h1><p class="effective">Effective August 10, 2026</p></header><div class="prose">
-    <h2>What we collect</h2><p>We collect account details such as email address, authentication identifiers, plan status, and security-session records. If you pay, our payment processor handles card details and returns billing identifiers, invoices, and payment status to us. We collect service-operation data such as storage totals, entitlement check-ins, device labels you provide, support messages, and security logs.</p>
-    <p>Project content enters our systems when you use the hosted workspace, upload a project, or direct a copilot request through the service. Provider account credentials and API keys you add are treated as secrets and used only to make the requests you direct. The public marketing site does not use advertising trackers.</p>
-    <h2>How we use data</h2><p>We use data to authenticate you, provide and secure the Services, process subscriptions, enforce limits, deliver service email, troubleshoot requests, prevent abuse, and meet legal obligations. We do not sell personal information or use project content to train a public model.</p>
-    <h2>Service providers</h2><p>We share only the data needed with infrastructure, email, payment, identity, and AI providers that perform a service on our behalf or at your direction. If you choose Google or GitHub sign-in, that provider supplies the verified identity information you authorize. When you select an AI provider, the prompt and necessary project context are processed under that provider's terms, privacy policy, retention policy, and billing arrangement.</p>
-    <h2>Retention</h2><p>We retain account and billing records while your account is active and as needed for tax, fraud, dispute, and legal obligations. Session and security logs are kept for a limited operational period. Deleting hosted project content removes it from active systems; encrypted backups expire on their rotation schedule.</p>
-    <h2>Your choices</h2><p>You can review account data, revoke sessions and devices, remove provider connections, export project files, and request account deletion. Some transaction and security records must be retained where law or legitimate fraud-prevention needs require it. Contact <a href="mailto:privacy@chudware.com">privacy@chudware.com</a> to make a privacy request.</p>
-    <h2>Security and transfers</h2><p>We use access controls, encrypted transport, password hashing, secret isolation, and operational monitoring designed to protect data. No system can guarantee absolute security. Service providers may process data in jurisdictions different from yours under their applicable safeguards.</p>
-    <h2>Children and changes</h2><p>The Services are not directed to children under 13. We will post material changes on this page and update the effective date. Questions may be sent to <a href="mailto:privacy@chudware.com">privacy@chudware.com</a>.</p>
+<BaseLayout title="Privacy" description="What chudware.com and the Chudware desktop app collect and send: no accounts, no trackers, and a short list of network requests.">
+  <div class="wrap legal-shell"><header><p class="eyebrow">Legal</p><h1>Privacy</h1><p class="effective">Effective October 22, 2026</p></header><div class="prose">
+    <h2>This website</h2><p>chudware.com is a static website. It has no accounts, no forms, no analytics, and no advertising or tracking scripts. The hosting provider processes standard request data, such as IP addresses, to deliver pages and protect the site. Links to GitHub and other sites are governed by those sites' own policies.</p>
+    <h2>The desktop app</h2><p>Chudware has no accounts and sends no telemetry. Your projects are saved as local files on your machine. The app contacts other services only in these cases:</p>
+    <ul>
+      <li><strong>Update checks.</strong> The app fetches the signed update manifest for your platform from the project's GitHub releases, and downloads an update from GitHub when one is available. GitHub receives the request under its own privacy terms.</li>
+      <li><strong>AI providers you configure.</strong> When you use the copilot, the prompt, the project context, and the tool results needed for that turn go to the provider you selected, under that provider's terms. Provider credentials are stored on your machine and sent only to that provider.</li>
+      <li><strong>Sites and downloads you request.</strong> Parts Library vendor searches, web lookups the copilot runs at your request, and optional components you install, such as the agent runtime or model weights, are fetched directly from the vendor's or publisher's site.</li>
+    </ul>
+    <p>Chudware does not run a server that receives your projects, prompts, or credentials.</p>
+    <h2>Questions</h2><p>Send privacy questions to <a href="mailto:support@chudware.com">support@chudware.com</a>. We will post material changes on this page and update the effective date.</p>
   </div></div>
 </BaseLayout>

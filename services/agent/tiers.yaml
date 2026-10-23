@@ -9,9 +9,8 @@
 
 schema: aicad.tier/1
 
-# Bundled local-model defaults per role shape — T-W31, applying the T-W29
-# tokenmaxx bench (benchmarks/tokenmaxx/REPORT.md "RECOMMENDATION — role x stage
-# mapping"; integrator-approved; numbers copied, never re-derived):
+# Bundled local-model defaults per role shape, from the local-model throughput and
+# grammar benchmark (numbers copied, never re-derived):
 #   gbnf_worker: gemma3-4b-qat — 100% schema_to_gbnf grammar compliance,
 #                smallest footprint (3086 MB), 332 tok/s aggregate @ N=8.
 #   fanout:      qwen3-4b — fastest single-stream (175 tok/s) and best parallel

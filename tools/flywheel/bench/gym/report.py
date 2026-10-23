@@ -1,16 +1,16 @@
-"""Per-cycle gym report (T-W27): markdown + JSON.
+"""Per-cycle gym report: markdown + JSON.
 
 Consumes a :class:`~tools.flywheel.bench.gym.runner.CycleResult` and produces:
   * pass rates per challenge x tier (and per seed),
   * taxonomy counts with the evidence refs that fired them,
   * RECOMMENDED DIAL ADJUSTMENTS — each mapped to a CONCRETE config/data knob
-    (never a prompt-wording change; those are lead-owned and filed as work notes).
+    (never a prompt-wording change; those are lead-owned and surfaced as findings).
 
-Dial knobs the recommender may touch (all config/data, per the discipline rule):
+Dial knobs the recommender may touch (all config/data):
   * ``CHUDWARE_COUNCIL_FEATURE_THRESHOLD`` env / councils._DEFAULT_FEATURE_THRESHOLD
   * tiers.yaml per-slot ``budgets`` (advisory/ledger/state), ``deliberation``,
     ``playbook_enforcement``, ``max_tools_per_role``
-  * trigger-pack enablement (foreman advisory injection)
+  * trigger-pack enablement (advisor advisory injection)
   * gym ``grind_threshold`` (anti-grind sensitivity)
 
 Prompt/workflow/role-card changes are NOT recommended here — they are surfaced in the
@@ -60,7 +60,7 @@ CLASS_TO_DIAL: dict[str, dict[str, str]] = {
     },
     "advisory_ignored": {
         "knob": "trigger-pack enablement + advisory slot budget",
-        "action": "keep the foreman advisory injection on (deliberation=full) and ensure "
+        "action": "keep the advisor's advisory injection on (deliberation=full) and ensure "
                   "the advisory slot budget is not shrunk below its floor",
     },
     "execution_stall": {
@@ -68,7 +68,7 @@ CLASS_TO_DIAL: dict[str, dict[str, str]] = {
         "action": "verify the turn prompt carries trimmed schemas for the node's full "
                   "allowlist (no tools omitted for budget — raise budgets.tools if the "
                   "tools_slot event reports omissions) and that every allowlisted tool "
-                  "resolves (mission-scoped dispatcher + registry fallback, T-W32)",
+                  "resolves (mission-scoped dispatcher + registry fallback)",
     },
 }
 

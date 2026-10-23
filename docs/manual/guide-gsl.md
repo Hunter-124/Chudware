@@ -18,12 +18,16 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
   sketch_health(id)      the narrated constraint read: WHICH free variables remain (dof in plain
                          words), open chain endpoints, per-entity under/full/over, redundant/
                          conflicting with removal hints, and an ORDERED schedule (relations first,
-                         then driving dims) to reach dof 0 — the sketch loop is edit -> sketch_health
-                         -> add the scheduled relations / sketch_auto_constrain -> repeat.
+                         then driving dims). Draw roughly -> relations -> critical dimensions ->
+                         sketch_fully_define -> check_sketch: dof 0 and not pinned_only.
   sketch_auto_constrain(id)  stitch near-touching endpoints coincident (apply=True, default) or
                          just propose them (apply=False); each add is rollback-safe (skips any that
                          would conflict) and it reports which chains closed. Runs automatically after
                          edits when doc meta sketch.auto_coincident is on (default).
+  sketch_fully_define(id) infer residual editable relations/dimensions (never blanket fix).
+                         relations=True, dimensions=True, anchor="origin"|"none", entities=[ids]
+                         optionally limit it. add_features runs this in the same revision after
+                         NEW sketches / sketch_add_entity batches; auto_define:false opts out.
   describe_scene(views)  the TEXT equivalent of render_part/contact_sheet for a model with no
                          vision: per requested view (default front/right/top/iso), which faces
                          face the camera (by sid/surf/side/dims) plus the part bbox — computed

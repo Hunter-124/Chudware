@@ -68,7 +68,6 @@ def record_usage(
     context_tokens: int | None = None,
     raw: dict | None = None,
     source: str = "api",
-    actor: Any | None = None,
 ) -> dict[str, Any]:
     """Normalize + stash one completion's usage; accumulate into the turn total.
 
@@ -126,9 +125,6 @@ def record_usage(
         # Keep a tiny raw slice for debug; never large bodies.
         row["raw_keys"] = sorted(str(k) for k in list(raw.keys())[:12])
 
-    # Identity is intentionally absent: the authenticated gateway attributes
-    # this event to its WebSocket. A worker-supplied email would cross the trust
-    # boundary in the wrong direction.
     _last_usage.set(dict(row))
     # Count records, not sink deliveries.  ``agent_turn`` snapshots this around
     # provider.complete() to distinguish a genuinely silent provider from one

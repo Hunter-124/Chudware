@@ -210,7 +210,7 @@ bool findPayload(Payload &p) {
 
 
 // Reuse requires the full lock/target and installed PEP 610 identities, not
-// merely a matching declaration hash or an importable private-package version.
+// merely a matching declaration hash or an importable package version.
 bool installedVenvFresh() {
   Payload pl;
   if (!findPayload(pl) || pl.wheelhouse.empty() ||
@@ -245,8 +245,10 @@ bool provisionRuntime(bool force, std::string &log) {
   if (pl.wheelhouse.empty() ||
       !fileExists(pl.srcDir + "\\vendor\\python\\RUNTIME_WHEELS.lock") ||
       !fileExists(pl.srcDir + "\\vendor\\chudcode\\CHUDCODE_ARTIFACT.lock")) {
-    log = "reviewed runtime wheelhouse/lock missing; authenticate all runtime wheels "
-          "and vendor/python/RUNTIME_WHEELS.lock before provisioning.";
+    log = "no reviewed runtime wheelhouse (wheelhouse\\ + vendor\\python\\RUNTIME_WHEELS.lock) "
+          "to provision from. For a source checkout, create a venv with "
+          "`py -3.13 -m venv .venv-mcp` and `.venv-mcp\\Scripts\\python -m pip install -r "
+          "requirements.txt`, then set CHUDWARE_PYTHON to .venv-mcp\\Scripts\\python.exe.";
     return false;
   }
   std::string base = resolveBasePython();
@@ -575,8 +577,9 @@ bool provisionRuntime(bool force, std::string &log) {
   if (pl.wheelhouse.empty() ||
       !fileExists((fs::path(pl.srcDir) / "vendor/python/RUNTIME_WHEELS.lock").string()) ||
       !fileExists((fs::path(pl.srcDir) / "vendor/chudcode/CHUDCODE_ARTIFACT.lock").string())) {
-    log = "reviewed runtime wheelhouse/lock missing; authenticate all runtime wheels "
-          "and vendor/python/RUNTIME_WHEELS.lock before provisioning.";
+    log = "no reviewed runtime wheelhouse (wheelhouse/ + vendor/python/RUNTIME_WHEELS.lock) "
+          "to provision from. For a source checkout, run scripts/provision_venv.sh and set "
+          "CHUDWARE_PYTHON to .venv-mcp/bin/python.";
     return false;
   }
   std::string base = resolveBasePython();

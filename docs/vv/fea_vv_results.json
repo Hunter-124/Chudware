@@ -2,9 +2,9 @@
  "generated_utc": "2026-09-05T21:38:12Z",
  "elapsed_s": 5099.1,
  "provenance": {
-  "ccx_path": "/home/hunter/.local/bin/ccx",
+  "ccx_path": "~/.local/bin/ccx",
   "ccx_version": "CalculiX ccx 2.23",
-  "polymesh_binary": "/home/hunter/Repositories/CAD/core/build-occt-linux/bin/polymesh",
+  "polymesh_binary": "core/build-occt-linux/bin/polymesh",
   "polymesh_commit": "955457901e5fe9ba7d46c4cafee710000df9f4bd",
   "engine": {
    "engine_build_id": "beta-0.1.2-beta.41-80-gfac9a08ab-dirty",
@@ -4451,255 +4451,6 @@
    "engine_build_id": "beta-0.1.2-beta.41-80-gfac9a08ab-dirty"
   }
  ],
- "tier2b_me490": [
-  {
-   "case": "FRAME-GLOBAL-3G",
-   "element": "tet4",
-   "h_req_mm": 9.0,
-   "h_eff_mm": 3.935396755272895,
-   "n_nodes": 48156,
-   "n_elems": 187714,
-   "n_dof": 144468,
-   "bc_source": "released face sids",
-   "max_disp_mm": 5.74914,
-   "max_von_mises_mpa": 31.2047,
-   "vm_field_peak_mpa": 32.12700382471622,
-   "min_fos": 8.8448,
-   "equilibrium_error_pct": 0.0,
-   "released_leg": "tet4 h=4.5 mm, 194828 elems, 150882 dof, max_disp 5.764664 mm",
-   "engine_build_id": "beta-0.1.2-beta.41-80-gfac9a08ab-dirty",
-   "chudware_solver": "chudware/fea_static [CholmodSupernodalLLT]",
-   "seconds": 331.1,
-   "verdict": "PASS",
-   "disp_l2_rel": 8.110729686734054e-08,
-   "disp_linf_rel": 8.723699680163796e-08,
-   "max_disp_ccx_mm": 5.749139983920433,
-   "max_disp_rel": 4.296923470443628e-08,
-   "reaction_chud_n": [
-    1.6529623784317105e-08,
-    -4.365737823856797e-08,
-    506.5800001002677
-   ],
-   "reaction_ccx_n": [
-    -7.493550008935853e-05,
-    -2.2354758134494684e-09,
-    506.57986888499994
-   ],
-   "reaction_rel": 2.590218646426714e-07,
-   "vm_peak_chud_mpa": 32.12700382471622,
-   "vm_peak_ccx_mpa": 31.635303502498594,
-   "vm_peak_rel": 0.01554277240231913,
-   "print_precision_floor_l2": 8.095340116906276e-08,
-   "ccx_elements": "C3D4",
-   "ccx_seconds": 3.3,
-   "tol": 0.0001
-  },
-  {
-   "case": "FRAME-GLOBAL-3G",
-   "element": "tet4",
-   "h_req_mm": 6.5,
-   "h_eff_mm": 3.9447477888533573,
-   "n_nodes": 47848,
-   "n_elems": 186398,
-   "n_dof": 143544,
-   "bc_source": "released face sids",
-   "max_disp_mm": 5.751109,
-   "max_von_mises_mpa": 31.2107,
-   "vm_field_peak_mpa": 31.51230148274665,
-   "min_fos": 8.8431,
-   "equilibrium_error_pct": 0.0,
-   "released_leg": "tet4 h=4.5 mm, 194828 elems, 150882 dof, max_disp 5.764664 mm",
-   "engine_build_id": "beta-0.1.2-beta.41-80-gfac9a08ab-dirty",
-   "chudware_solver": "chudware/fea_static [CholmodSupernodalLLT]",
-   "seconds": 337.2,
-   "verdict": "solved"
-  },
-  {
-   "case": "FRAME-GLOBAL-3G",
-   "element": "tet4",
-   "h_req_mm": 4.5,
-   "h_eff_mm": 3.9370256108730035,
-   "n_nodes": 48092,
-   "n_elems": 187482,
-   "n_dof": 144276,
-   "bc_source": "released face sids",
-   "max_disp_mm": 5.749139,
-   "max_von_mises_mpa": 31.2047,
-   "vm_field_peak_mpa": 32.12669787913379,
-   "min_fos": 8.8448,
-   "equilibrium_error_pct": 0.0,
-   "released_leg": "tet4 h=4.5 mm, 194828 elems, 150882 dof, max_disp 5.764664 mm",
-   "engine_build_id": "beta-0.1.2-beta.41-80-gfac9a08ab-dirty",
-   "chudware_solver": "chudware/fea_static [CholmodSupernodalLLT]",
-   "seconds": 314.9,
-   "verdict": "solved"
-  },
-  {
-   "case": "WHEEL-RADIAL",
-   "order": 1,
-   "h_req_mm": 8.0,
-   "verdict": "FAIL",
-   "note": "fea_static: mesh has 1 connected component(s) with no fixture: rigid-body motion \u2014 refine the mesh (h <= wall thickness) or fix the island"
-  },
-  {
-   "case": "WHEEL-RADIAL",
-   "order": 1,
-   "h_req_mm": 5.0,
-   "verdict": "FAIL",
-   "note": "fea_static: mesh has 1 connected component(s) with no fixture: rigid-body motion \u2014 refine the mesh (h <= wall thickness) or fix the island"
-  },
-  {
-   "case": "WHEEL-RADIAL",
-   "order": 2,
-   "h_req_mm": 10.0,
-   "verdict": "FAIL",
-   "note": "mesh failed: polymesh mesher failed: feature unresolved at h=18.8744 m: CAD face 19 has no aligned delivered boundary patch within 5.66231 m (sampled CAD-to-mesh max distance 29.8049 m); mesh/BRep vol"
-  },
-  {
-   "case": "WHEEL-RADIAL",
-   "element": "tet4",
-   "h_req_mm": 12.0,
-   "h_eff_mm": 2.9666579808021307,
-   "n_nodes": 67721,
-   "n_elems": 316466,
-   "n_dof": 203163,
-   "bc_source": "released face sids",
-   "max_disp_mm": 0.032202,
-   "max_von_mises_mpa": 1.294,
-   "vm_field_peak_mpa": 1.496231889761737,
-   "min_fos": 15.0,
-   "equilibrium_error_pct": 0.0,
-   "released_leg": "tet10 h=4.0 mm, 220834 elems, 1075044 dof, max_disp 0.00259 mm",
-   "engine_build_id": "beta-0.1.2-beta.41-80-gfac9a08ab-dirty",
-   "chudware_solver": "chudware/fea_static [SimplicialLDLT(AMD) (fallback after CholmodSupernodalLLT, SimplicialLDLT(AMD))]",
-   "seconds": 358.1,
-   "verdict": "FAIL",
-   "disp_l2_rel": 0.16683034101731156,
-   "disp_linf_rel": 2.6513063030139126,
-   "max_disp_ccx_mm": 0.01593703696940435,
-   "max_disp_rel": 1.0205537545277343,
-   "reaction_chud_n": [
-    -2.1069923583638683e-11,
-    473.499999998897,
-    -8.604184031923978e-11
-   ],
-   "reaction_ccx_n": [
-    -4.500000102495433e-08,
-    473.500004,
-    -4.4970000246330745e-08
-   ],
-   "reaction_rel": 8.450059019641626e-09,
-   "vm_peak_chud_mpa": 1.496231889761737,
-   "vm_peak_ccx_mpa": 1.4750439016705539,
-   "vm_peak_rel": 0.014364310151844842,
-   "print_precision_floor_l2": 1.410472288208166e-07,
-   "ccx_elements": "C3D4",
-   "ccx_seconds": 6.8,
-   "tol": 0.0001
-  },
-  {
-   "case": "FRAME-PEDAL-BRAKE",
-   "element": "tet4",
-   "h_req_mm": 12.0,
-   "h_eff_mm": 2.489735240920338,
-   "n_nodes": 20694,
-   "n_elems": 88428,
-   "n_dof": 62082,
-   "bc_source": "released face sids",
-   "max_disp_mm": 0.420385,
-   "max_von_mises_mpa": 90.82,
-   "vm_field_peak_mpa": 202.77538859812313,
-   "min_fos": 3.039,
-   "equilibrium_error_pct": 0.0,
-   "released_leg": "tet10 h=4.2 mm, 192748 elems, 917400 dof, max_disp 0.441113 mm",
-   "engine_build_id": "beta-0.1.2-beta.41-80-gfac9a08ab-dirty",
-   "chudware_solver": "chudware/fea_static [CholmodSupernodalLLT]",
-   "seconds": 149.4,
-   "verdict": "solved"
-  },
-  {
-   "case": "FRAME-PEDAL-BRAKE",
-   "element": "tet4",
-   "h_req_mm": 8.0,
-   "h_eff_mm": 2.069730885461691,
-   "n_nodes": 35796,
-   "n_elems": 154992,
-   "n_dof": 107388,
-   "bc_source": "released face sids",
-   "max_disp_mm": 0.419857,
-   "max_von_mises_mpa": 115.5011,
-   "vm_field_peak_mpa": 326.2089476032788,
-   "min_fos": 2.3896,
-   "equilibrium_error_pct": 0.0,
-   "released_leg": "tet10 h=4.2 mm, 192748 elems, 917400 dof, max_disp 0.441113 mm",
-   "engine_build_id": "beta-0.1.2-beta.41-80-gfac9a08ab-dirty",
-   "chudware_solver": "chudware/fea_static [CholmodSupernodalLLT]",
-   "seconds": 290.7,
-   "verdict": "solved"
-  },
-  {
-   "case": "FRAME-PEDAL-BRAKE",
-   "element": "tet4",
-   "h_req_mm": 5.0,
-   "h_eff_mm": 1.9219621937048283,
-   "n_nodes": 46224,
-   "n_elems": 193236,
-   "n_dof": 138672,
-   "bc_source": "released face sids",
-   "max_disp_mm": 0.428495,
-   "max_von_mises_mpa": 95.2641,
-   "vm_field_peak_mpa": 224.54497095535206,
-   "min_fos": 2.8972,
-   "equilibrium_error_pct": 0.0,
-   "released_leg": "tet10 h=4.2 mm, 192748 elems, 917400 dof, max_disp 0.441113 mm",
-   "engine_build_id": "beta-0.1.2-beta.41-80-gfac9a08ab-dirty",
-   "chudware_solver": "chudware/fea_static [CholmodSupernodalLLT]",
-   "seconds": 275.2,
-   "verdict": "PASS",
-   "disp_l2_rel": 1.0798615171619826e-07,
-   "disp_linf_rel": 1.1757410526373022e-07,
-   "max_disp_ccx_mm": 0.4284950533928017,
-   "max_disp_rel": 7.793589420647114e-08,
-   "reaction_chud_n": [
-    -2.744844351809661e-09,
-    -6.196478885556189e-10,
-    1500.0000000016112
-   ],
-   "reaction_ccx_n": [
-    8.53447458e-09,
-    9.623030978434211e-08,
-    1499.9996300000003
-   ],
-   "reaction_rel": 2.4666780145660766e-07,
-   "vm_peak_chud_mpa": 224.54497095535206,
-   "vm_peak_ccx_mpa": 221.90282982314324,
-   "vm_peak_rel": 0.011906748256949266,
-   "print_precision_floor_l2": 1.0896405972733798e-07,
-   "ccx_elements": "C3D4",
-   "ccx_seconds": 3.8,
-   "tol": 0.0001
-  },
-  {
-   "case": "FRAME-PEDAL-BRAKE",
-   "element": "tet10",
-   "h_req_mm": 10.0,
-   "h_eff_mm": 2.300770751130742,
-   "n_nodes": 176574,
-   "n_elems": 112708,
-   "n_dof": 529722,
-   "bc_source": "released face sids",
-   "max_disp_mm": 0.441548,
-   "max_von_mises_mpa": 90.4357,
-   "vm_field_peak_mpa": 251.86098341072432,
-   "min_fos": 3.0519,
-   "equilibrium_error_pct": 0.0,
-   "released_leg": "tet10 h=4.2 mm, 192748 elems, 917400 dof, max_disp 0.441113 mm",
-   "engine_build_id": "beta-0.1.2-beta.41-80-gfac9a08ab-dirty",
-   "chudware_solver": "chudware/fea_static [CholmodSupernodalLLT]",
-   "seconds": 144.2,
-   "verdict": "solved"
-  }
- ],
  "tier3_polymesh": [
   {
    "case": "BAR-AXIAL",
@@ -4714,7 +4465,7 @@
    "tol": 0.1,
    "verdict": "PASS",
    "citation": "delta = PL/(EA)",
-   "cmd": "/home/hunter/Repositories/CAD/core/build-occt-linux/bin/polymesh solve /home/hunter/.cache/tmp/vv_pm_n0life86/BAR-AXIAL.step -o /home/hunter/Repositories/CAD/scratch/vvwork/pm_BAR-AXIAL_20.vtu -h 0.02 -E 2e+11 -nu 0.3 --scale 0.001 --max-elems 20000 --max-dof 80000 --no-curved --no-spectral --fix-box -0.1011 -1 -1 -0.0989 1 1 --load-box 0.0989 -1 -1 0.1011 1 1 --load-dir 1 0 0 --force 20000",
+   "cmd": "core/build-occt-linux/bin/polymesh solve ~/.cache/tmp/vv_pm_n0life86/BAR-AXIAL.step -o scratch/vvwork/pm_BAR-AXIAL_20.vtu -h 0.02 -E 2e+11 -nu 0.3 --scale 0.001 --max-elems 20000 --max-dof 80000 --no-curved --no-spectral --fix-box -0.1011 -1 -1 -0.0989 1 1 --load-box 0.0989 -1 -1 0.1011 1 1 --load-dir 1 0 0 --force 20000",
    "seconds": 4.9,
    "field_names": [
     "displacement",
@@ -4735,7 +4486,7 @@
    "tol": 0.1,
    "verdict": "PASS",
    "citation": "Timoshenko PL^3/(3EI)+PL/(kGA)",
-   "cmd": "/home/hunter/Repositories/CAD/core/build-occt-linux/bin/polymesh solve /home/hunter/.cache/tmp/vv_pm_5qtjl3za/CANT-TIP.step -o /home/hunter/Repositories/CAD/scratch/vvwork/pm_CANT-TIP_20.vtu -h 0.02 -E 2e+11 -nu 0.3 --scale 0.001 --max-elems 20000 --max-dof 80000 --no-curved --no-spectral --fix-box -0.0761 -1 -1 -0.0739 1 1 --load-box 0.0739 -1 -1 0.0761 1 1 --load-dir 0 0 -1 --force 2000",
+   "cmd": "core/build-occt-linux/bin/polymesh solve ~/.cache/tmp/vv_pm_5qtjl3za/CANT-TIP.step -o scratch/vvwork/pm_CANT-TIP_20.vtu -h 0.02 -E 2e+11 -nu 0.3 --scale 0.001 --max-elems 20000 --max-dof 80000 --no-curved --no-spectral --fix-box -0.0761 -1 -1 -0.0739 1 1 --load-box 0.0739 -1 -1 0.0761 1 1 --load-dir 0 0 -1 --force 2000",
    "seconds": 2.3,
    "field_names": [
     "displacement",
@@ -4749,11 +4500,6 @@
    "case": "CYL-LAME (pressure sign)",
    "finding": "study/tool `pressure` is documented \"MPa, inward\" but a POSITIVE magnitude loads the surface along its OUTWARD normal, so on a bore +p is EXTERNAL pressurisation; internal pressure needs a negative magnitude",
    "evidence": "same model/mesh (tet4 h=24, 18336 elems): pressure=+20 MPa on the bore gives sigma_hoop=-29.584 MPa (hoop COMPRESSION) and u_r=-0.0027582221442732577 mm, against Lame's +33.333 MPa for internal pressure. Deposit is p*integral(N_i n_outward)dA in core/sim/fea_run.cpp; the docstring in services/mcp/cad_sim_tools.py run_fea_static says \"inward\""
-  },
-  {
-   "case": "WHEEL-RADIAL",
-   "finding": "same-mesh displacement disagreement L2=1.668e-01",
-   "evidence": "n_dof=203163, Linf=2.651e+00"
   }
  ],
  "skips": [
@@ -4778,28 +4524,13 @@
    "reason": "polymesh exit 1: scale: 0.001 (model units x factor)\nrefine: 16 geometry + 4 BC seeds \u2192 20 seeds, band=0.018 m, h_fine=0.0018 m, geo_curv=brep\n"
   }
  ],
- "executed_checks": 61,
- "failed_checks": 6,
+ "executed_checks": 55,
+ "failed_checks": 2,
  "corroborated_findings": [
-  {
-   "case": "WHEEL-RADIAL (mesh mechanism)",
-   "finding": "CHOLMOD reported the reduced stiffness NOT positive definite on the released wheel-slice geometry (tet4, target_size_mm=12, 316466 elems / 203163 DOF). The mesh, not the solver, is the defect: the mesh is a mechanism at solver precision while passing every connectivity check.",
-   "evidence": "Independent triplet+SparseLU re-assembly of the exact exported system (scratch/vvwork/wheel-radial_o1_h12_system.json) was symmetric to 1.86e-9 with all diagonals positive and a single connected component containing the fixture, but lambda_max/lambda_min = 2.25e7 / 5.6e-27 = condition number 4.0e33, with the soft mode localised on nodes 7724 / 42274 / 42273. Root cause: 2 HANGING elements sharing two corners or fewer with the rest of the mesh, which rotate at zero strain energy (a tet apex used by exactly one element is NOT a defect \u2014 45 of the 51 single-element tips in that mesh are healthy). Independent SparseLU on the same matrix returned max_disp 5.23e10 mm where the shipped LDLT rung returned 0.0322 mm, so a pivoting solver is not the safe fallback here \u2014 it returns garbage silently. Measured and fixed by SolverPerf; the mesher now dissolves hanging elements, the solve REFUSES any that remain, and mesh_quality gains lonely_nodes_repaired / lonely_nodes_remaining / hanging_elems_dropped."
-  },
-  {
-   "case": "WHEEL-RADIAL (equilibrium check is not a certificate)",
-   "finding": "equilibrium_error_pct = 0.0 does NOT certify a displacement when the stiffness carries a near-null mode: the residual is small precisely in the directions the load excites, while the unconstrained direction contributes nothing to it.",
-   "evidence": "The leg above reported equilibrium_error_pct 0.0 and max_disp 0.032202 mm on a matrix with condition number 4.0e33. Any released leg whose solver_notes now carry the CONDITIONING WARNING line is subject to the same caveat."
-  },
-  {
-   "case": "All cases (summary.max_von_mises_mpa is masked)",
-   "finding": "summary.max_von_mises_mpa is a fixture-ring-MASKED reduction, not the field peak: a two-element ring around the fixed nodes is excluded. On a model whose fixtures ARE the highly stressed feature the summary scalar is far below the field maximum, so a FoS quoted from it is a margin AWAY from the fixture, not at it.",
-   "evidence": "FRAME-PEDAL-BRAKE (fixtures are the keyway bolt-hole faces): summary 109.7342 MPa vs unmasked nodal field peak 402.9265 MPa (3.67x) sitting ON a fixed node of the bolt hole; min_fos 2.5152 vs min_fos_raw 0.685. Measured by VtuStress, who added summary_node / max_von_mises_raw_mpa / min_fos_raw so both reductions are visible. The Tier-2 comparison in this report already uses Chudware's RAW nodal von Mises array against CalculiX's unmasked field peak, so its stress rows are apples-to-apples; the masked value is carried separately as vm_summary_chud_mpa."
-  },
   {
    "case": "pressure load sign (FIXED)",
    "finding": "The `pressure` load was documented \"MPa, inward\" but a POSITIVE magnitude loaded the surface along its OUTWARD normal, so on a bore +p was EXTERNAL pressurisation and internal pressure needed a negative magnitude. The code was wrong, not the docs: +p pushing INTO the surface is the universal convention, is what run_fea_static / cad_guide document, and is what the render annotation already quotes (p*A \"N inward\").",
-   "evidence": "Measured on the Lame cylinder (a=15, b=30, L=90 mm, tet4): pressure=+20 MPa on the bore gave sigma_hoop = -29.6 MPa (hoop COMPRESSION) and u_r < 0 against Lame's +33.33 MPa; pressure=-20 MPa on the identical model reproduced the closed form. Root cause: the deposit was +p*integral(N_i n_outward)dA in core/sim/fea_run.cpp (fea_run_static_impl, the `type == \"pressure\"` branch) with the outward orientation explicitly enforced. Fixed by PressureSign (2026-09-05): the deposit is now -p*integral(N_i n_outward)dA, so +p acts inward, and this case passes +p. Force loads were never affected, which is why no released ME-490 case was."
+   "evidence": "Measured on the Lame cylinder (a=15, b=30, L=90 mm, tet4): pressure=+20 MPa on the bore gave sigma_hoop = -29.6 MPa (hoop COMPRESSION) and u_r < 0 against Lame's +33.33 MPa; pressure=-20 MPa on the identical model reproduced the closed form. Root cause: the deposit was +p*integral(N_i n_outward)dA in core/sim/fea_run.cpp (fea_run_static_impl, the `type == \"pressure\"` branch) with the outward orientation explicitly enforced. Fixed on 2026-09-05: the deposit is now -p*integral(N_i n_outward)dA, so +p acts inward, and this case passes +p. Force loads were never affected."
   },
   {
    "case": "PLATE-HOLE (tet4 stress recovery at a concentration)",
@@ -4809,17 +4540,17 @@
   {
    "case": "CYL-LAME (reaction resultant is degenerate for a self-equilibrated load)",
    "finding": "The reaction-resultant cross-check is meaningless when the applied load has zero resultant, and on those legs the ccx RF sum over the fixed set is non-zero and mesh-dependent while Chudware reports exactly zero. Left as an OPEN reaction-bookkeeping question, not a solution difference.",
-   "evidence": "Internal pressure on a bore is purely radial, so the true resultant is 0. Chudware reaction_force_n = [0,0,0] on all four tet4 legs and both tet10 legs; the ccx *NODE PRINT RF sum over NFIX gives Fz = -182.85, 0.54, 250.27, 192.86 N (tet4 h=24/20/13/9.5) and 15.14, 0.00 N (tet10 h=24/20) \u2014 erratic in mesh, so it is not a load the model carries. The displacement fields on those SAME meshes agree node-for-node at |u| L2 1.63e-07..1.72e-07, i.e. at ccx's own print precision, so the solutions are identical and the discrepancy lives in the reaction reporting (or in this harness's parse of ccx's RF table), not in the solve. On the 21 force-loaded meshes the same comparison agrees to 1.88e-07 worst case, and on the three ME-490 cases to 2.6e-07 / 8.5e-09 / 2.5e-07, which is why the metric is kept."
+   "evidence": "Internal pressure on a bore is purely radial, so the true resultant is 0. Chudware reaction_force_n = [0,0,0] on all four tet4 legs and both tet10 legs; the ccx *NODE PRINT RF sum over NFIX gives Fz = -182.85, 0.54, 250.27, 192.86 N (tet4 h=24/20/13/9.5) and 15.14, 0.00 N (tet10 h=24/20) \u2014 erratic in mesh, so it is not a load the model carries. The displacement fields on those SAME meshes agree node-for-node at |u| L2 1.63e-07..1.72e-07, i.e. at ccx's own print precision, so the solutions are identical and the discrepancy lives in the reaction reporting (or in this harness's parse of ccx's RF table), not in the solve. On the 21 force-loaded meshes the same comparison agrees to 1.88e-07 worst case, which is why the metric is kept."
   },
   {
    "case": "PLATE-HOLE / tet10 stress recovery (ROOT-CAUSED, FIXED, RE-MEASURED)",
    "finding": "The tet10 hole-rim SCF under-recovery first reported as an open finding was a real defect in tet10 Gauss-point -> nodal stress recovery, not a mesh-resolution limit: the recovery collapsed the 4 Gauss points of a tet10 to an ELEMENT CONSTANT before nodal averaging, which is why tet10 read WORSE than tet4 at the rim on the same geometry. Recovery now extrapolates the 4 Gauss-point tensors to the corner nodes (the mid-edge nodes take the mean of their two corners) \u2014 the same recovery CalculiX uses for C3D10. tet4 and hex8 are untouched and their numbers are unchanged.",
-   "evidence": "Diagnosed by StressRecovery off this harness's Tier-2 lane, which hands CalculiX the identical mesh. BEFORE / AFTER / ccx C3D10 on the SAME mesh, rim SCF: h_eff 3.445 (20664 elems) 1.46607 / 2.22806 / 2.2280; h_eff 2.870 (35744) 1.75700 / 2.57926 / 2.5792; h_eff 2.586 (48880) 2.43741 / 3.44426 / 3.4442; and on the old finest mesh (73072 elems, h_eff 2.261) 2.17568 / 3.16604 / 3.1660. After the fix Chudware reproduces ccx's own C3D10 nodal stress to its 6-digit print floor on every one of those meshes, and tet4 was already exact against C3D4 (1.6153 both), which localised the defect to the quadratic recovery path alone. The re-run finest tet10 leg (81928 elems, h_eff 2.177, a slightly finer mesh than the old run, whose leg was coarsened by a tighter memory envelope) reads SCF 3.08792 against ccx 3.08790 on that mesh: 2.9% from Kirsch 3.00 and 1.9% from Howland 3.03, so the row PASSES, and the error against the finite-width reference now falls at EVERY refinement (0.265 -> 0.149 -> 0.137 -> 0.019, monotone=True). The displacement rows were never affected (Tier 2 agreed to ~1e-07 on these same meshes) \u2014 only nodal STRESS at a gradient was wrong. Fixed in core/sim/fea_static.cpp; pinned by the core ctest `sim` case \"tet10 nodal stress recovery reports the extreme-fibre bending stress\", which reads 301.4 MPa against M c/I = 300 MPa where the element-constant recovery read 247.7 MPa."
+   "evidence": "Diagnosed off this harness's Tier-2 lane, which hands CalculiX the identical mesh. BEFORE / AFTER / ccx C3D10 on the SAME mesh, rim SCF: h_eff 3.445 (20664 elems) 1.46607 / 2.22806 / 2.2280; h_eff 2.870 (35744) 1.75700 / 2.57926 / 2.5792; h_eff 2.586 (48880) 2.43741 / 3.44426 / 3.4442; and on the old finest mesh (73072 elems, h_eff 2.261) 2.17568 / 3.16604 / 3.1660. After the fix Chudware reproduces ccx's own C3D10 nodal stress to its 6-digit print floor on every one of those meshes, and tet4 was already exact against C3D4 (1.6153 both), which localised the defect to the quadratic recovery path alone. The re-run finest tet10 leg (81928 elems, h_eff 2.177, a slightly finer mesh than the old run, whose leg was coarsened by a tighter memory envelope) reads SCF 3.08792 against ccx 3.08790 on that mesh: 2.9% from Kirsch 3.00 and 1.9% from Howland 3.03, so the row PASSES, and the error against the finite-width reference now falls at EVERY refinement (0.265 -> 0.149 -> 0.137 -> 0.019, monotone=True). The displacement rows were never affected (Tier 2 agreed to ~1e-07 on these same meshes) \u2014 only nodal STRESS at a gradient was wrong. Fixed in core/sim/fea_static.cpp; pinned by the core ctest `sim` case \"tet10 nodal stress recovery reports the extreme-fibre bending stress\", which reads 301.4 MPa against M c/I = 300 MPa where the element-constant recovery read 247.7 MPa."
   },
   {
    "case": "CYL-LAME post-fix spot measurement (supersedes the Lame rows in the tables)",
    "finding": "With BOTH fixes in (pressure sign + tet10 Gauss-point stress recovery) the Lame case is far more accurate than the tables in this report show, and the sign question is settled by measurement: pressure=+p IS internal pressurisation on a bore. The tables above were measured before either fix; the numbers here are the current engine.",
-   "evidence": "Measured by PressureSign through this harness's own chud_solve/extract on the identical CYL-LAME model (a=15, b=30, L=90 mm), engine carrying StressRecovery's tet10 recovery. tet10 h_req=16 (56840 elems), pressure=+p: hoop inner +33.0205 MPa vs Lame +33.3333 (-0.94%), hoop outer +13.2720 vs +13.3333 (-0.46%), u_r inner +0.00291 mm (-1.39%). The -p probe mirrors it exactly negative (-33.0205 / -13.2720), which is the sign convention pinned as data rather than read off a docstring. tet4 h=20: hoop outer +13.3678 (+0.26%), hoop inner +27.23 (-18.3%) \u2014 the tet4 rim under-read, NOT a sign error. Compare the pre-fix tet10 rows in Tier 1 (hoop inner 8.55% low): that gap was the tet10 recovery defect, not the Lame model or the mesh. Engine convention is now f_i = -p*integral(N_i n_outward) dA, i.e. +p pushes INTO the face as its contract always claimed."
+   "evidence": "Measured through this harness's own chud_solve/extract on the identical CYL-LAME model (a=15, b=30, L=90 mm), engine carrying the tet10 recovery fix. tet10 h_req=16 (56840 elems), pressure=+p: hoop inner +33.0205 MPa vs Lame +33.3333 (-0.94%), hoop outer +13.2720 vs +13.3333 (-0.46%), u_r inner +0.00291 mm (-1.39%). The -p probe mirrors it exactly negative (-33.0205 / -13.2720), which is the sign convention pinned as data rather than read off a docstring. tet4 h=20: hoop outer +13.3678 (+0.26%), hoop inner +27.23 (-18.3%) \u2014 the tet4 rim under-read, NOT a sign error. Compare the pre-fix tet10 rows in Tier 1 (hoop inner 8.55% low): that gap was the tet10 recovery defect, not the Lame model or the mesh. Engine convention is now f_i = -p*integral(N_i n_outward) dA, i.e. +p pushes INTO the face as its contract always claimed."
   },
   {
    "case": "provenance.engine_build_id is NOT unique per build (harness/provenance defect)",
@@ -4828,8 +4559,8 @@
   },
   {
    "case": "Mixed-recovery stress columns in this report (read-me-first caveat)",
-   "finding": "After the targeted PLATE-HOLE re-run, this report's nodal-STRESS columns are no longer all from one recovery implementation: PLATE-HOLE Tier-1 tet10 rows are post-fix, while tet10 nodal-stress columns elsewhere (Tier-2 peak von Mises, Tier 2b ME-490 vm_field_peak_mpa) still reflect the OLD element-constant recovery and will move UP on a full refresh. Displacements and reactions are unaffected anywhere.",
-   "evidence": "Confirmed by StressRecovery, who made the fix and the targeted re-run. The fix extrapolates the 4 Gauss-point tensors to corner nodes (corner_i = sqrt(5)*(g[i] - b*sum g), mid-edges as the mean of their two corners) \u2014 CalculiX's own C3D10 recovery \u2014 and tet4/hex8 are bit-identical. Same-mesh agreement on STRESS is now essentially exact: Chudware 2.22806/2.57926/3.44426/3.08792 vs ccx 2.2280/2.5792/3.4442/3.08790 at h_eff 3.445/2.870/2.586/2.177, so the finest tet10 SCF row PASSES (2.9% vs Kirsch 3.0, 1.9% vs Howland 3.03) and the Howland error now falls at every refinement. A regression case in core/tests/test_sim.cpp pins tet10 extreme-fibre nodal sigma_xx 301.4 vs M c/I 300 (the old recovery read 247.7)."
+   "finding": "After the targeted PLATE-HOLE re-run, this report's nodal-STRESS columns are no longer all from one recovery implementation: PLATE-HOLE Tier-1 tet10 rows are post-fix, while tet10 nodal-stress columns elsewhere (Tier-2 peak von Mises) still reflect the OLD element-constant recovery and will move UP on a full refresh. Displacements and reactions are unaffected anywhere.",
+   "evidence": "Confirmed by the targeted re-run. The fix extrapolates the 4 Gauss-point tensors to corner nodes (corner_i = sqrt(5)*(g[i] - b*sum g), mid-edges as the mean of their two corners) \u2014 CalculiX's own C3D10 recovery \u2014 and tet4/hex8 are bit-identical. Same-mesh agreement on STRESS is now essentially exact: Chudware 2.22806/2.57926/3.44426/3.08792 vs ccx 2.2280/2.5792/3.4442/3.08790 at h_eff 3.445/2.870/2.586/2.177, so the finest tet10 SCF row PASSES (2.9% vs Kirsch 3.0, 1.9% vs Howland 3.03) and the Howland error now falls at every refinement. A regression case in core/tests/test_sim.cpp pins tet10 extreme-fibre nodal sigma_xx 301.4 vs M c/I 300 (the old recovery read 247.7)."
   }
  ],
  "reruns": [
@@ -4847,7 +4578,7 @@
     "CHUDWARE_HEADROOM_GB": "6",
     "CHUDWARE_SIM_THREADS": "4"
    },
-   "note": "Only the PLATE-HOLE tier1_analytic rows and corroborated_findings were replaced; tier2_calculix / tier2b_me490 / tier3_polymesh and every other case predate the fix, so a tet10 nodal-STRESS column there still reflects the old recovery. Displacement, reaction and all tet4/hex8 numbers are unaffected: the tet4 PLATE-HOLE legs re-measured bit-identical.",
+   "note": "Only the PLATE-HOLE tier1_analytic rows and corroborated_findings were replaced; tier2_calculix / tier3_polymesh and every other case predate the fix, so a tet10 nodal-STRESS column there still reflects the old recovery. Displacement, reaction and all tet4/hex8 numbers are unaffected: the tet4 PLATE-HOLE legs re-measured bit-identical.",
    "ccx_same_mesh_rim_scf": [
     {
      "h_req_mm": 15.0,

@@ -2,6 +2,9 @@
 # hostd with -DCHUDWARE_DEVELOPER_BUILD=OFF first, and generate protected assets under
 # host/build-win/generated/protected-assets. Pass outputs via --worker-bin/--mcp-bin/
 # --chud-bin before hashing the immutable Windows payload.
+# -Python / CHUDWARE_RELEASE_PYTHON is the release compiler venv interpreter (requirements.txt +
+# packaging/requirements-release.txt). When CHUDWARE_WHEELHOUSE names a reviewed offline
+# wheelhouse, -BasePython / CHUDWARE_BASE_PYTHON authenticates that venv against it first.
 param(
     [Parameter(Mandatory = $true)]
     [string]$OutputDir,
@@ -31,9 +34,6 @@ if (-not (Test-Path -LiteralPath $OutputDir -PathType Container)) {
     New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 }
 if (-not $BasePython) { $BasePython = $env:CHUDWARE_CI_BASE_PYTHON }
-if (-not $BasePython -or -not [IO.Path]::IsPathRooted($BasePython)) {
-    throw "CHUDWARE_BASE_PYTHON must identify a separately authenticated absolute base Python"
-}
 if (-not $Python) { $Python = Join-Path $Root ".venv\Scripts\python.exe" }
 $Python = [IO.Path]::GetFullPath($Python)
 
@@ -59,13 +59,17 @@ function Invoke-ReleasePython([string[]]$Arguments) {
         $Root, (Join-Path $ProtectedAssetsOut "python")) + $Arguments)
 }
 
-# The trusted base inspects candidate executable/config/platform libraries and
-# complete package bytes before ANY candidate startup, including asset generation.
-$compilerVenv = Split-Path -Parent (Split-Path -Parent $Python)
-$wheelhouse = if ($env:CHUDWARE_WHEELHOUSE) { $env:CHUDWARE_WHEELHOUSE } else { Join-Path $Root "wheelhouse" }
-Invoke-Checked $BasePython @("-I", "-S", "-c",
-    "import sys;sys.path.insert(0,sys.argv[1]);from services.installer.provision import main;sys.exit(main(sys.argv[2:]))",
-    $Root, "--check-inputs", "--base-python", $BasePython, "--venv-dir", $compilerVenv, "--wheelhouse", $wheelhouse)
+if ($env:CHUDWARE_WHEELHOUSE) {
+    if (-not $BasePython -or -not [IO.Path]::IsPathRooted($BasePython)) {
+        throw "CHUDWARE_BASE_PYTHON must identify a separately authenticated absolute base Python"
+    }
+    # The trusted base inspects candidate executable/config/platform libraries and
+    # complete package bytes before ANY candidate startup, including asset generation.
+    $compilerVenv = Split-Path -Parent (Split-Path -Parent $Python)
+    Invoke-Checked $BasePython @("-I", "-S", "-c",
+        "import sys;sys.path.insert(0,sys.argv[1]);from services.installer.provision import main;sys.exit(main(sys.argv[2:]))",
+        $Root, "--check-inputs", "--base-python", $BasePython, "--venv-dir", $compilerVenv, "--wheelhouse", $env:CHUDWARE_WHEELHOUSE)
+}
 
 
 function Assert-ProductionCache([string]$BuildDir, [string]$Label) {

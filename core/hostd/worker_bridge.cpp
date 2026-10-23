@@ -16,7 +16,6 @@
 
 #include "hostd_log.h"
 #include "security/integrity.h"
-#include "security/runtime_guard.h"
 #include "util/platform_paths.h"
 
 namespace hostd {
@@ -1180,12 +1179,7 @@ bool allowWorkerSpawn(std::string& err) {
         err = "worker spawn blocked: protected_file_hash_mismatch";
         return false;
     }
-    const auto decision = chudware::security::inspectAndPersistRuntime(
-        chudware::security::SecurityCheckpoint::BeforeWorkerSpawn,
-        integrity.root, integrity.files, chudware::security::runtimeGuardStateDir().string());
-    if (decision.allowed()) return true;
-    err = "worker spawn blocked: " + decision.denialReason;
-    return false;
+    return true;
 }
 
 #ifdef _WIN32

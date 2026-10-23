@@ -51,6 +51,10 @@ using Clock = std::chrono::steady_clock;
 constexpr auto kCheckInterval = std::chrono::hours(24);
 constexpr auto kInitialBackoff = std::chrono::minutes(5);
 constexpr auto kMaxBackoff = std::chrono::hours(6);
+// Every release publishes one signed manifest per target as a GitHub release
+// asset; `latest` resolves to the newest non-prerelease release.
+constexpr std::string_view kReleaseManifestBase =
+    "https://github.com/Hunter-124/Chudware/releases/latest/download/";
 
 struct SemVer {
     std::uint64_t major = 0, minor = 0, patch = 0;
@@ -494,6 +498,18 @@ bool verifyInnerPayload(const std::filesystem::path& artifact, const Manifest& o
 
 }  // namespace
 
+std::string releaseManifestUrl(std::string_view platform, std::string_view arch) {
+    std::string url(kReleaseManifestBase);
+    url.append("update-").append(platform).append("-").append(arch).append(".json");
+    return url;
+}
+
+std::string manifestUrl() {
+    const char* endpoint = std::getenv("CHUDWARE_UPDATE_MANIFEST_URL");
+    return endpoint && *endpoint ? std::string(endpoint)
+                                 : releaseManifestUrl(platformName(), architectureName());
+}
+
 int compareVersions(const std::string& lhs, const std::string& rhs) {
     const auto a = parseVersion(lhs), b = parseVersion(rhs);
     if (!a || !b) return a ? 1 : b ? -1 : 0;
@@ -517,49 +533,12 @@ struct Updater::Impl {
     std::string currentVersion;
     std::filesystem::path dataDir;
     std::filesystem::path executablePath;
-    std::string token;
     Snapshot status;
     std::unordered_set<std::string> reported;
 
     std::filesystem::path updateDir() const { return dataDir / "updates"; }
     std::filesystem::path reportsPath() const { return updateDir() / "reported-rejections.txt"; }
     std::filesystem::path stagedMetadata() const { return updateDir() / "staged.json"; }
-
-    // The manifest endpoint the update check uses. Shared with the download so
-    // both agree on the single origin allowed to see the entitlement.
-    static std::string manifestEndpoint() {
-        const char* endpoint = std::getenv("CHUDWARE_UPDATE_MANIFEST_URL");
-        return endpoint && *endpoint ? endpoint
-                                     : "https://app.chudware.com/api/releases/latest";
-    }
-
-    static std::string originOf(const std::string& url) {
-        const auto scheme = url.find("://");
-        if (scheme == std::string::npos) return {};
-        const auto slash = url.find('/', scheme + 3);
-        std::string origin = url.substr(0, slash == std::string::npos ? url.size() : slash);
-        std::transform(origin.begin(), origin.end(), origin.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
-        return origin;
-    }
-
-    // The gateway's own artifact route is entitlement-gated (a presigned CDN
-    // URL is not), so a self-hosted download must carry the same credential
-    // the manifest check used or it is answered 403 and no build ever
-    // installs. The credential goes back ONLY to the origin that issued the
-    // manifest: never to third-party storage.
-    std::string entitlementHeader(const std::string& url) const {
-        std::string value;
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            value = token;
-        }
-        if (value.empty()) return {};
-        const std::string origin = originOf(url);
-        if (origin.empty() || origin != originOf(manifestEndpoint())) return {};
-        return "X-Chudware-Entitlement: " + value;
-    }
 
     void setStatus(State state, const Manifest* manifest, std::string message,
                    std::string url = {}) {
@@ -798,19 +777,10 @@ struct Updater::Impl {
         Handle connection{session ? WinHttpConnect(session, host.c_str(), uc.nPort, 0) : nullptr};
         Handle request{connection ? WinHttpOpenRequest(connection, L"GET", path.c_str(), nullptr,
             WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr};
-        // Credentialed downloads must not chase a redirect: WinHTTP replays
-        // request headers on the hop, and the entitlement belongs to this
-        // origin only.
-        const std::wstring extraHeaders = widen(entitlementHeader(manifest.url));
-        if (request && !extraHeaders.empty()) {
-            DWORD disable = WINHTTP_DISABLE_REDIRECTS;
-            WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE, &disable, sizeof(disable));
-        }
+        // WinHTTP follows the release-asset redirect to GitHub's object storage
+        // by default and refuses any HTTPS-to-HTTP downgrade on the way.
         if (!session || !connection || !request ||
-            !WinHttpSendRequest(request,
-                                extraHeaders.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS
-                                                     : extraHeaders.c_str(),
-                                extraHeaders.empty() ? 0 : static_cast<DWORD>(extraHeaders.size()),
+            !WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
             !WinHttpReceiveResponse(request, nullptr)) {
             error = "WinHTTP update download failed"; return false;
@@ -843,6 +813,10 @@ struct Updater::Impl {
         if (!curl) { error = "libcurl initialization failed"; return false; }
         CurlSink sink{&out, 0, manifest.size, false, this};
         curl_easy_setopt(curl, CURLOPT_URL, manifest.url.c_str());
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "chudware-updater/1");
+        // GitHub answers a release-asset URL with a redirect to its object
+        // storage. Integrity rests on the size, SHA-256 and Ed25519 checks, not
+        // on the serving origin; redirects stay HTTPS-only.
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
@@ -858,23 +832,10 @@ struct Updater::Impl {
         if (const char* caFile = std::getenv("CHUDWARE_UPDATE_CA_FILE"); caFile && *caFile)
             curl_easy_setopt(curl, CURLOPT_CAINFO, caFile);
 #endif
-        // libcurl replays custom headers on every redirect hop and has no
-        // same-origin restriction for them, so a credentialed download refuses
-        // to follow redirects at all. The gateway's artifact route answers with
-        // the bytes; only a presigned CDN URL redirects, and that carries its
-        // own authorization instead of this header.
-        const std::string entitlement = entitlementHeader(manifest.url);
-        curl_slist* requestHeaders = nullptr;
-        if (!entitlement.empty()) {
-            requestHeaders = curl_slist_append(requestHeaders, entitlement.c_str());
-            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, requestHeaders);
-            curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
-        }
         const CURLcode rc = curl_easy_perform(curl);
         long status = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
         curl_easy_cleanup(curl);
-        curl_slist_free_all(requestHeaders);
         if (rc != CURLE_OK || status < 200 || status >= 300) {
             error = sink.overflow
                 ? "integrity: downloaded update exceeds manifest size"
@@ -895,27 +856,18 @@ struct Updater::Impl {
     }
 
     bool checkOnce() {
-        std::string version, entitlementToken;
+        std::string version;
         std::filesystem::path executable;
         {
             std::lock_guard<std::mutex> lock(mutex);
             version = currentVersion;
-            entitlementToken = token;
             executable = executablePath;
         }
-        const char* channelEnv = std::getenv("CHUDWARE_UPDATE_CHANNEL");
-        const std::string channel = channelEnv && std::strcmp(channelEnv, "beta") == 0
-            ? "beta" : "stable";
-        const std::string endpoint = manifestEndpoint();
-        const std::string url = endpoint + "?channel=" + channel + "&platform=" +
-            platformName() + "&arch=" + architectureName();
-        std::vector<std::pair<std::string, std::string>> headers;
-        if (!entitlementToken.empty()) headers.emplace_back("X-Chudware-Entitlement", entitlementToken);
-        const auto response = agent::http_get(url, headers, 8000);
+        const auto response = agent::http_get(manifestUrl(), {}, 8000);
         if (response.status == 404) {
-            // No manifest on this channel at all. That is "nothing newer
-            // exists", not a failure — never surface an HTTP status to the
-            // user for the normal empty-channel case.
+            // No release manifest for this target has been published. That is
+            // "nothing newer exists", not a failure: never surface an HTTP
+            // status to the user for it.
             setStatus(State::Current, nullptr, "Chudware is up to date");
             return true;
         }
@@ -1126,14 +1078,6 @@ void Updater::stop() {
         impl_->wake.notify_all();
     }
     if (impl_->worker.joinable()) impl_->worker.join();
-}
-
-void Updater::setEntitlementToken(std::string token) {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (impl_->token == token) return;
-    impl_->token = std::move(token);
-    impl_->forceCheck = true;
-    impl_->wake.notify_all();
 }
 
 void Updater::requestCheckNow() {

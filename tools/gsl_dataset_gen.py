@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
-"""GSL synthetic dataset factory — labels-for-free training/eval corpus generator.
+"""GSL synthetic dataset factory — engine-labelled corpus generator.
 
-Per docs/GEOMETRY_LLM_REPRESENTATION_REVIEW.md §3.4: before any learned model is justified,
-build a deterministic-engine-labelled corpus and measure where deterministic recognition
-actually fails. This script builds that corpus: seven parametric family templates, each a
-function ``(rng: random.Random) -> list[op dict]`` that emits a randomized, VALID
-aicad.part/1 ops batch (the same op vocabulary documented in
+Builds a deterministic-engine-labelled corpus for measuring where deterministic feature
+recognition fails and for training the candidate ranker: seven parametric family
+templates, each a function ``(rng: random.Random) -> list[op dict]`` that emits a
+randomized, VALID aicad.part/1 ops batch (the same op vocabulary documented in
 ``services/agent/prompts/shared/ops_cheatsheet.md`` and built with the ``dim``/``feat``
 helpers from ``services/mcp/core_bridge.py``).
 
 Every sample is built on the REAL C++ engine (``core_bridge`` -> ``libchudware``), so every
 face/edge/feature label comes for free from the engine's own feature tree and owner_map —
-no manual annotation, no learned model. This is exactly the "free synthetic labels" the
-review doc names in §3.4.
+no manual annotation, no learned model.
 
 Usage from the repo root (module execution keeps canonical packages importable):
 
@@ -20,12 +18,8 @@ Usage from the repo root (module execution keeps canonical packages importable):
     python3 -m tools.gsl_dataset_gen --count 10 --families plate_bolt_circle,turned_shaft
     python3 -m tools.gsl_dataset_gen --count 5 --render --out corpora/gsl_dataset --seed 1000
 
-Consumers (downstream, not built by this script):
-  - tools/gsl_eval.py       — measured-residual reverse-engineering eval harness (WS-D D2).
-  - tools/gsl_gnn/          — GraphSAGE adapter scaffold trained on faces.json + adjacency.json
-                              (WS-D D3), gated on tools/gsl_eval.py's verdict.
-
-See corpora/gsl_dataset/README.md for the on-disk layout and label semantics.
+The generated corpus feeds ``tools/gsl_gnn/train_ranker.py``. See
+corpora/gsl_dataset/README.md for the on-disk layout and label semantics.
 """
 from __future__ import annotations
 
@@ -231,19 +225,18 @@ FAMILIES: dict[str, Callable[[random.Random], list[dict]]] = {
 }
 
 
-# ==================================================== Pillar-13 translator-pair factory
+# ==================================================== translator-pair factory
 #
-# Stage-0 dataset extension (docs/AI_TOOLING_MASTER_PLAN.md §Pillar 13): the deterministic
-# describers are the FREE label source, so a translator training pair is
-# (gsl-ser/v1 serialization, grounded caption). This factory emits the §Pillar-13 DOMAIN
-# MIX, paraphrase-augments each caption, then RE-VERIFIES every pair through the
-# groundedness seam AND the round-trip re-extraction diff before it may enter the set —
-# never trust the paraphraser (the master plan's binding rule). It is engine-FREE: it
+# Dataset extension: the deterministic describers are the FREE label source, so a
+# translator pair is (gsl-ser/v1 serialization, grounded caption). This factory emits
+# the DOMAIN_MIX below, paraphrase-augments each caption, then RE-VERIFIES every pair
+# through the groundedness seam AND the round-trip re-extraction diff before it may
+# enter the set — never trust the paraphraser. It is engine-FREE: it
 # builds gsl-ser/v1 STATE dicts directly (the `_digest`/domain shape), so the mix runs in
 # CI with no libchudware. When the engine IS available, real B-rep digests can be substituted
 # for `synth_brep_state` without changing the pipeline.
 
-# §Pillar-13 data-mix table (fractions sum to 1.0). B-rep dominates; the "what changed"
+# Data-mix table (fractions sum to 1.0). B-rep dominates; the "what changed"
 # contrastive + correction pairs are the 10% that teaches task-conditioned narration.
 DOMAIN_MIX: dict[str, float] = {
     "brep": 0.40,
@@ -603,7 +596,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--seed", type=int, default=0, help="base seed; sample i uses seed base+i")
     ap.add_argument("--translator-pairs", type=int, default=None, metavar="N",
                     help="ENGINE-FREE: emit N verified gsl-ser/v1 translator pairs following "
-                         "the §Pillar-13 DOMAIN_MIX (paraphrased + groundedness re-checked) "
+                         "the DOMAIN_MIX table (paraphrased + groundedness re-checked) "
                          "to --pairs-out, then exit (no libchudware needed).")
     ap.add_argument("--pairs-out", type=str, default="corpora/translator_pairs.jsonl",
                     help="output JSONL for --translator-pairs")

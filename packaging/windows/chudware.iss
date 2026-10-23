@@ -69,7 +69,11 @@
 AppId={{6B9E2E6B-6B7B-4B7B-9B7B-AICADSETUP01}
 AppName=Chudware
 AppVersion={#AppVersion}
-AppPublisher=Chudware
+AppPublisher=Chudware contributors
+AppPublisherURL=https://chudware.com
+AppSupportURL=https://github.com/Hunter-124/Chudware/issues
+AppUpdatesURL=https://github.com/Hunter-124/Chudware/releases
+AppCopyright=Copyright (c) 2026 Hunter Edmonds and Chudware contributors
 ; The per-user location is deliberate: it avoids elevation/profile substitution and is the
 ; canonical root recorded in HKCU Programs-and-Features. The native uninstall helper requires
 ; this exact registered identity before it opens any manifest-owned child.
@@ -83,7 +87,7 @@ Compression=lzma2
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-LicenseFile=..\..\LICENSE-EULA.txt
+LicenseFile=..\..\LICENSE
 WizardStyle=modern
 ; Ask Windows Restart Manager to close apps holding files under {app} before uninstall.
 ; Release staging rejects PDBs/source, and the protected sidecars below are explicit so ISCC

@@ -43,14 +43,12 @@ void testOnlineNormalRoute() {
          {{"role", "assistant"}, {"text", "second"}}});
     const nlohmann::json attachments = nlohmann::json::array(
         {{{"path", "/tmp/example.png"}, {"name", "example.png"}, {"kind", "image"}}});
-    const nlohmann::json actor = {{"kind", "user"}, {"id", "acct-7"}};
     const nlohmann::json extra = {
         {"provider", "xai"},
         {"model", "grok-4.5"},
         {"reasoning_effort", "high"},
         {"attachments", attachments},
         {"context_refs", nlohmann::json::array({{{"kind", "face"}, {"id", "Face12"}}})},
-        {"_chudware_actor", actor},
         {"options",
          {{"session_id", "session-17"},
           {"sessions_dir", "/tmp/sessions"},
@@ -78,7 +76,6 @@ void testOnlineNormalRoute() {
           "workspace directory flattened");
     check(route.params["history"] == history, "history flattened without request injection");
     check(route.params["attachments"] == attachments, "attachments preserved");
-    check(route.params["_chudware_actor"] == actor, "actor preserved");
     check(route.params.contains("context_refs"), "context refs preserved");
     check(route.params["options"].value("corporate_mode", false),
           "normal corporate preference preserved");

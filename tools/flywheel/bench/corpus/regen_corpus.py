@@ -1,7 +1,7 @@
 """Corruption-corpus generator for the regen-fix bench (IP-18).
 
 Mutates known-good `aicad.part/1` documents into ones whose rebuild fails, across the five
-mutation classes the survey + T-H8 driver notes call out:
+mutation classes the bench targets:
 
     dangling_ref        a selector / profile / pattern points at a feature id that is gone
     param_out_of_range  a numeric parameter is driven to an impossible value
@@ -10,16 +10,16 @@ mutation classes the survey + T-H8 driver notes call out:
     bad_selector        a selector's `kind` is corrupted to an invalid token
 
 This is a JSON→JSON transform: it needs **no C++ core** to produce the corpus, so the whole
-≥500-doc corpus is reproducible from a git-committed seed + a fixed RNG seed on any OS
-(the reproducibility DoD). The core is only needed later to *verify* a proposed fix rebuilds
+≥500-doc corpus is reproducible from a git-committed seed + a fixed RNG seed on any OS.
+The core is only needed later to *verify* a proposed fix rebuilds
 (the regen_fix scorer's live path).
 
 Each example records ground truth including `det_fixable` — whether the deterministic
 kill-switch baseline can repair that class. The classes it cannot (`dangling_ref`,
-`bad_selector`) are the measured RECOGNITION_RESIDUAL a model must beat.
+`bad_selector`) are the measured residual a model must beat.
 
 Held-out split: the STRUCTURE key is the seed variant, so every mutation of one variant
-stays on the same side of a train/test split (P13: hold out structures, not samples).
+stays on the same side of a train/test split (hold out structures, not samples).
 """
 from __future__ import annotations
 

@@ -2,7 +2,7 @@
 
 No fixture represents a production approval. The smoke uses the real preparation
 CLI, base Python venv/ensurepip, pip --no-index/--require-hashes and installed-byte
-validation. Run centrally; this file does not fetch or build private source.
+validation. Run centrally; this file does not fetch or build the chudcode-rpc SDK.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from services.installer import wheelhouse
 
 SCRIPT = Path(preparation.__file__)
 BASE = str(Path(sys._base_executable).absolute())
-SOURCE = {"repository": "https://github.com/Hunter-124/chudcode.git", "repository_commit": "1" * 40}
+SOURCE = {"repository": wheelhouse.CHUDCODE_REPOSITORY, "repository_commit": "1" * 40}
 
 
 def _wheel(directory, name, version="1.0", dependencies=(), *, tag="py3-none-any", files=None):
@@ -183,7 +183,7 @@ def test_invalid_operator_review_rejected_before_copy(inputs, monkeypatch, failu
     _unchanged_failure(args, "approval|digest|duplicate review key|source identity")
 
 
-@pytest.mark.parametrize("failure", ["changed-root", "changed-release", "omitted-gate", "reordered-additional", "native-changed", "private-source", "target-environment", "target-tags"])
+@pytest.mark.parametrize("failure", ["changed-root", "changed-release", "omitted-gate", "reordered-additional", "native-changed", "sdk-source", "target-environment", "target-tags"])
 def test_reviewed_declarations_source_and_exact_target_cannot_be_substituted(inputs, failure):
     args, manifest = inputs
     if failure == "changed-root":
@@ -196,7 +196,7 @@ def test_reviewed_declarations_source_and_exact_target_cannot_be_substituted(inp
         args.additional_requirements.reverse()
     elif failure == "native-changed":
         args.chudcode_lock.write_bytes(preparation.canonical({**SOURCE, "repository_commit": "2" * 40}))
-    elif failure == "private-source":
+    elif failure == "sdk-source":
         manifest["target"]["wheels"][0]["source"]["repository_commit"] = "2" * 40
         _rewrite(args, manifest)
     elif failure == "target-environment":
@@ -221,15 +221,15 @@ def test_missing_target_root_transitive_extra_or_gate_closure_is_rejected(inputs
 @pytest.mark.parametrize("failure", ["absent", "tampered", "duplicate-identity", "unreviewed-extra", "wheel-symlink", "ancestor-symlink", "incompatible-tag", "archive-traversal", "archive-duplicate", "archive-symlink", "overlapping-payload", "wheel-header-tags"])
 def test_unapproved_ambiguous_unsafe_and_incompatible_wheel_inputs_fail_atomically(inputs, tmp_path, failure):
     args, manifest = inputs
-    private = manifest["target"]["wheels"][0]
-    path = args.wheel_directory / private["filename"]
+    sdk_wheel = manifest["target"]["wheels"][0]
+    path = args.wheel_directory / sdk_wheel["filename"]
     if failure == "absent":
         path.unlink()
     elif failure == "tampered":
         with path.open("ab") as stream:
             stream.write(b"unreviewed substitution")
     elif failure == "duplicate-identity":
-        manifest["target"]["wheels"].append(deepcopy(private))
+        manifest["target"]["wheels"].append(deepcopy(sdk_wheel))
     elif failure == "unreviewed-extra":
         _wheel(args.wheel_directory, "unreviewed-extra")
     elif failure == "wheel-symlink":
@@ -256,7 +256,7 @@ def test_unapproved_ambiguous_unsafe_and_incompatible_wheel_inputs_fail_atomical
         with zipfile.ZipFile(path, "w") as archive:
             for name, value in members.items():
                 archive.writestr(name, value)
-        private["sha256"] = wheelhouse._digest(path)
+        sdk_wheel["sha256"] = wheelhouse._digest(path)
     else:
         with zipfile.ZipFile(path, "a") as archive:
             if failure == "archive-traversal":
@@ -269,7 +269,7 @@ def test_unapproved_ambiguous_unsafe_and_incompatible_wheel_inputs_fail_atomical
                 entry.create_system = 3
                 entry.external_attr = (stat.S_IFLNK | 0o777) << 16
                 archive.writestr(entry, "../../outside.py")
-        private["sha256"] = wheelhouse._digest(path)
+        sdk_wheel["sha256"] = wheelhouse._digest(path)
     _rewrite(args, manifest)
     _unchanged_failure(args, "missing|hash mismatch|duplicate|unexpected|symlink|support selected|unsafe wheel|overlapping|header/tags")
     assert not (tmp_path / "outside.py").exists()

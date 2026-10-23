@@ -3,7 +3,7 @@ import BaseLayout from '../layouts/BaseLayout.astro';
 import TesseractHero from '../components/TesseractHero.astro';
 import '../styles/company.css';
 ---
-<BaseLayout title="About Chudware" description="Why Chudware combines exact parametric CAD, manufacturing, simulation, product data, reverse engineering, and an AI copilot in one engineering workspace.">
+<BaseLayout title="About Chudware" description="Why Chudware combines exact parametric CAD, manufacturing, simulation, product data, reverse engineering, and an AI copilot in one open-source engineering workspace.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">About</p>
@@ -21,15 +21,16 @@ import '../styles/company.css';
 
         <h2>Files and delivery</h2>
         <p>The native <code>.step+</code> container keeps the neutral STEP body alongside Chudware feature, parameter, material, study, drawing, and integrity data. The STEP payload can be extracted or exported for exchange even when another system cannot read Chudware's feature history.</p>
-        <p>The browser workspace and the desktop app are the same product. Signed x86-64 builds for Windows, Linux, and macOS are on the <a class="text-link" href="https://app.chudware.com/#downloads">account download page</a>.</p>
+        <p>Desktop builds for Windows, Linux, and macOS (x86-64) are published on GitHub Releases. The <a class="text-link" href="/download/">download page</a> explains which file to pick.</p>
+
+        <h2>Open source</h2>
+        <p>Chudware is open source under the MIT License. The source code, issue tracker, and release builds live in the <a class="text-link" href="https://github.com/Hunter-124/Chudware">Chudware repository on GitHub</a>. There are no Chudware accounts, license keys, or fees, and your designs stay on your machine unless you send project context to an AI provider you configured.</p>
+        <p>The project is under active development. Core workflows are usable today; advanced capabilities and packaging are still changing. Test it on representative files, studies, and CAM handoffs before relying on it for production work.</p>
 
         <h2>Open-source meshing</h2>
         <p>Chudware builds a pinned revision of the BSD-3-Clause <a class="text-link" href="https://github.com/Hunter-124/Polyhedral-FEA">PolyMesh project</a> into its FEA meshing path. Chudware owns study setup, resource admission, result packaging, and its engine solvers; the public PolyMesh repository independently includes its mesher, linear-elastostatics solver, validation material, CLI, and study applications. <a class="text-link" href="/open-source/">Read the integration boundary</a>.</p>
 
-        <h2>Commercial preview</h2>
-        <p>Chudware is in commercial preview. Core workflows are ready; advanced capabilities and packaging are still changing. Use the 14-day trial on representative files, studies, and CAM handoffs before moving production work.</p>
-
-        <p><a class="text-link" href="https://www.linkedin.com/in/hunter-edmonds/" rel="me">Hunter Edmonds on LinkedIn</a></p>
+        <p>Chudware was created by Hunter Edmonds. <a class="text-link" href="https://www.linkedin.com/in/hunter-edmonds/" rel="me">Hunter Edmonds on LinkedIn</a></p>
       </div>
 
       <aside class="co-aside" aria-labelledby="co-posture">
@@ -40,7 +41,7 @@ import '../styles/company.css';
           <li><h3>Keep results inspectable</h3><p>Feature history, study setup, mesh evidence, and revisions remain available for review.</p></li>
           <li><h3>Keep physical actions deliberate</h3><p>Toolpaths and machine output require explicit engineering and operator review.</p></li>
           <li><h3>Keep an exchange path</h3><p>Neutral geometry and documented exports prevent a project from depending on one opaque file.</p></li>
-          <li><h3>Understand the limits</h3><p>Review preview status, solver assumptions, and supported workflows before committing a project.</p></li>
+          <li><h3>Understand the limits</h3><p>Review release notes, solver assumptions, and supported workflows before committing a project.</p></li>
         </ol>
       </aside>
     </div>
@@ -51,11 +52,11 @@ import '../styles/company.css';
       <header class="section-heading">
         <p class="eyebrow">Evaluate the product</p>
         <h2 id="co-evaluate" class="co-anchor">Evaluate it on a project that looks like yours.</h2>
-        <p class="lede">Compare worked examples with your requirements, follow the workflow guides, and review security controls before introducing restricted project data.</p>
+        <p class="lede">Compare worked examples with your requirements, follow the workflow guides, and read the source before introducing restricted project data.</p>
       </header>
       <div class="co-note">
         <p class="eyebrow">Start with evidence</p>
-        <p><a class="text-link" href="/gallery/">Gallery</a> · <a class="text-link" href="/docs/">Documentation</a> · <a class="text-link" href="/changelog/">Changelog</a> · <a class="text-link" href="/security/">Security</a></p>
+        <p><a class="text-link" href="/gallery/">Gallery</a> · <a class="text-link" href="/docs/">Documentation</a> · <a class="text-link" href="/changelog/">Changelog</a> · <a class="text-link" href="https://github.com/Hunter-124/Chudware">Source code</a></p>
       </div>
     </div>
   </section>
@@ -63,9 +64,9 @@ import '../styles/company.css';
   <section class="section cta-band">
     <div class="wrap section-heading">
       <p class="eyebrow">Evaluate Chudware</p>
-      <h2>Open it in the browser, or install the desktop app.</h2>
-      <p class="lede">Start the trial, then test the workflows that matter to you.</p>
-      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/gallery/">View worked examples</a></div>
+      <h2>Install the desktop app, or build it from source.</h2>
+      <p class="lede">Free and open source under the MIT License. Test the workflows that matter to you.</p>
+      <div class="actions"><a class="button" href="/download/">Download</a><a class="button button-secondary" href="https://github.com/Hunter-124/Chudware">View on GitHub</a></div>
     </div>
   </section>
 </BaseLayout>

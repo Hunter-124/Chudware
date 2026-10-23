@@ -1,9 +1,8 @@
 # Chudware — Architecture
 
 The C++ kernel **`libchudware`** is the engine; there is no Python CAD engine. Canonical
-interface seams live in [contracts/](contracts); the current handoff log is
-[docs/REFACTOR_LOG.md](docs/REFACTOR_LOG.md) (older entries under
-[docs/refactor-log/](docs/refactor-log)).
+interface seams live in [contracts/](contracts); engineering conventions for working in
+each subsystem are in [docs/dev/](docs/dev/README.md).
 
 ## Components
 
@@ -18,7 +17,10 @@ happens here.
 ### `chudware-hostd` — engine-host daemon
 Shared daemon (`core/hostd/`) that dlopens `libchudware` and serves it over local IPC to
 any number of clients (desktop GUI, WASM-side bridge, tools). Lifecycle, env vars, and
-troubleshooting: [docs/reference/HOSTD.md](docs/reference/HOSTD.md).
+troubleshooting: [docs/reference/HOSTD.md](docs/reference/HOSTD.md). For the experimental
+browser app, `chudware-hostd --cell` runs a tenant cell: a POSIX-only, socket-activated
+instance that serves one gateway listen fd with its own private state and work directories;
+the method set a cell admits is pinned by `contracts/cell_methods.json`.
 
 ### `host/` — the sole GUI target (native + WASM)
 Ribbon UI, FeatureManager tree, PropertyManager, constraint-solver sketcher UX, copilot
@@ -27,8 +29,8 @@ the `.aicm` mesh loader `host/src/render/aicm_loader.*`, which core tests compil
 Binary: `host/build-linux/bin/chudware`. The host reaches the engine through the C++
 routing/IPC seam it compiles from `services/worker/` (`worker_client`, `engine_backend`,
 `cpp_core`: in-process libchudware or hostd) and `services/ipc/` (client, transport,
-discovery). The **same `host/src/ui` tree compiles to WASM** under Emscripten for the web
-app ([Webservice/README.md](Webservice/README.md)). The hostd method set the WASM client
+discovery). The **same `host/src/ui` tree compiles to WASM** under Emscripten for the
+experimental browser app ([web/README.md](web/README.md)). The hostd method set the WASM client
 may rely on is pinned by `contracts/web_parity.md` and checked by
 `scripts/web_parity_probe.py` (a gate stage that probes a scratch hostd with the Python
 worker bridge disabled — what the WASM client faces).
@@ -36,9 +38,8 @@ worker bridge disabled — what the WASM client faces).
 ### `services/` — Python services
 No engine code; Python lives here only where there is no C++ counterpart:
 - `services/mcp/` — MCP server, stdio/JSON-RPC, so external agents (Claude Code,
-  Cursor, …) drive the same document as the GUI. Server id `chudware` (registration
-  leaves legacy `ai-cad` client entries in place). The `cad_guide` tool carries
-  modeling/CAM/ECAD guidance.
+  Cursor, …) drive the same document as the GUI. Server id `chudware`. The `cad_guide`
+  tool carries modeling/CAM/ECAD guidance.
 - `services/worker_main.py` — the persistent services worker hostd spawns for
   services-side methods and online agent turns.
 - `services/agent/` — the Chudcode session host (`chudcode_host.py`), host-tool
@@ -47,16 +48,19 @@ No engine code; Python lives here only where there is no C++ counterpart:
 - `services/installer/` — provisioning, MCP registration, packaging.
 - Pure helpers with no C++ counterpart: `services/ecad/`, `services/sim/`,
   `services/structural/`, `services/piping/`, `services/formats/`, `services/paths.py`,
-  plus `dag/`, `deliverables/`, `plm/`, `browser/`, `serving/`, `verify/`.
+  plus `dag/`, `deliverables/`, `plm/`, `browser/`, `verify/`.
 
 ### Agent runtime
-- **Online:** the embedded Chudcode RPC runtime (`chud --mode rpc`, pinned by
-  `vendor/chudcode/CHUDCODE_ARTIFACT.lock`) owns every online provider call, auth, model
-  catalog, session history, memory, and compaction. Chudware owns CAD tools and schemas,
-  documents/workspaces, roles, missions, approvals, guardrails, and event presentation.
+- **Online:** the embedded Chudcode RPC runtime (`chud --mode rpc`, an MIT-licensed agent
+  runtime from [github.com/Hunter-124/chudcode](https://github.com/Hunter-124/chudcode),
+  pinned by `vendor/chudcode/CHUDCODE_ARTIFACT.lock`) owns every online provider call,
+  provider authentication, model catalog, session history, memory, and compaction.
+  Chudware owns CAD tools and schemas, documents/workspaces, roles, missions, approvals,
+  guardrails, and event presentation. Users bring their own provider credentials; there is
+  no Chudware account.
 - **Offline:** `core/agent/run.cpp` runs the native fallback with offline-safe local
   providers only.
-- Boundary and lifecycle rules: `.claude/skills/cad-chudcode-integration/SKILL.md`.
+- Boundary and lifecycle rules: [docs/dev/chudcode-integration.md](docs/dev/chudcode-integration.md).
 
 ## RPC seams (frozen contracts)
 
@@ -65,7 +69,7 @@ No engine code; Python lives here only where there is no C++ counterpart:
 - `contracts/web_parity.md` — which methods the WASM client may rely on (hostd-only).
 - `contracts/doc_schema.md` / `contracts/doc_ops.md` — the document model and its ops.
 
-Append-only; integrator-owned (see the multi-agent operating rules in AGENTS.md).
+Contracts are append-only; versioning rules are in [contracts/README.md](contracts/README.md).
 
 ## Data flow
 
@@ -94,11 +98,7 @@ external agent ──MCP/stdio──▶ services/mcp      │                   
 
 The Python engine (`engine_oracle/`) is deleted; `scripts/check.py`'s
 `oracle_import_audit` fails on any new `engine.*` / `engine_oracle.*` import in
-`services/`, `scripts/`, or `tools/`. The consolidation refactor (`T-RF1`..`T-RF23`,
-including the zero-Python cutover T-RF21) is recorded in
-[docs/refactor-log/2026-07-and-earlier.md](docs/refactor-log/2026-07-and-earlier.md); its
-plan is [docs/plans/2026-07-22-consolidation-refactor-dag.md](docs/plans/2026-07-22-consolidation-refactor-dag.md).
-Current follow-ups live on the work board ([work/](work)).
+`services/`, `scripts/`, or `tools/`.
 
 ## Build & test
 

@@ -36,7 +36,6 @@
 #include <filesystem>
 #endif
 #include "security/integrity.h"
-#include "security/runtime_guard.h"
 #include "util/platform_paths.h"
 
 #include "bootstrap.h"
@@ -1138,12 +1137,7 @@ bool allowWorkerSpawn(std::string& err) {
     err = "worker spawn blocked: protected_file_hash_mismatch";
     return false;
   }
-  const auto decision = chudware::security::inspectAndPersistRuntime(
-      chudware::security::SecurityCheckpoint::BeforeWorkerSpawn,
-      integrity.root, integrity.files, chudware::security::runtimeGuardStateDir().string());
-  if (decision.allowed()) return true;
-  err = "worker spawn blocked: " + decision.denialReason;
-  return false;
+  return true;
 }
 }  // namespace
 bool WorkerClient::start(std::string &err, const std::string &module) {

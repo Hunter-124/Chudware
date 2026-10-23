@@ -160,13 +160,13 @@ class TestRegistry(unittest.TestCase):
 
 
 class TestW29RoleMapping(unittest.TestCase):
-    """T-W31: the W29 tokenmaxx role-model mapping shipped as registry data.
+    """The local-model benchmark's role-model mapping shipped as registry data.
 
-    Numbers/verdicts from benchmarks/tokenmaxx/REPORT.md (copied, not re-derived):
+    Numbers/verdicts copied from the benchmark, not re-derived:
     qwen3-4b GBNF broken -> prompted_json fan-out; gemma3-4b-qat GBNF 100% ->
     gbnf_worker; gemma4-e4b registered as a comparison-only GBNF backup (not a
-    shipped role_shape default, see test_gemma4_e4b_registered_but_not_a_shipped_default,
-    2026-07-07 tokenmaxxing); DiffusionGemma NO-GO.
+    shipped role_shape default, see
+    test_gemma4_e4b_registered_but_not_a_shipped_default); DiffusionGemma NO-GO.
     """
 
     def test_qwen3_is_prompted_json_fanout(self) -> None:

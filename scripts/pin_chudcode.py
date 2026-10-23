@@ -40,11 +40,13 @@ DEFAULT_NOTICE_DIR = DEFAULT_LOCK.parent
 SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$")
 SUPPORTED_TARGETS = (
     "linux-x86_64",
+    "macos-arm64",
     "macos-x86_64",
     "windows-x86_64",
 )
-# Targets present in locks pinned before the release matrix became x64-only.
-LEGACY_TARGETS = ("linux-aarch64", "macos-arm64")
+# Targets that older retained locks may still list; they load for verification
+# but are never published.
+LEGACY_TARGETS = ("linux-aarch64",)
 CANONICAL_NAMES = {target: ("chud.exe" if target.startswith("windows-") else "chud") for target in SUPPORTED_TARGETS}
 
 
@@ -157,9 +159,8 @@ def load_lock(
     artifacts = lock["artifacts"]
     if not isinstance(artifacts, dict) or not set(SUPPORTED_TARGETS) <= set(artifacts):
         raise ArtifactLockError("artifact lock must define every supported platform target")
-    # Locks written before the x64-only matrix also carry these targets, and
-    # retained releases keep their own lock: rollback and recovery must still
-    # verify them. Only publication (pin/check-lock) demands the exact set.
+    # Older retained locks may also list legacy targets; verification still loads
+    # them. Only publication (pin/check-lock) demands the exact set.
     extra = set(artifacts) - set(SUPPORTED_TARGETS)
     if extra and (strict_targets or not extra <= set(LEGACY_TARGETS)):
         raise ArtifactLockError(
@@ -448,74 +449,55 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _github_asset_response(url: str, token: str):
-    """Resolve one pinned GitHub asset without forwarding auth to its CDN."""
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+_GITHUB_ASSET_HOSTS = frozenset({"objects.githubusercontent.com", "release-assets.githubusercontent.com"})
+
+
+def _is_github_release_download(url: str) -> bool:
     parsed = urllib.parse.urlparse(url)
     parts = parsed.path.split("/")
-    if (parsed.scheme != "https" or parsed.netloc != "github.com"
-            or len(parts) != 7 or parts[3:5] != ["releases", "download"]
-            or parsed.query or parsed.fragment):
-        raise ArtifactLockError("authenticated fetch requires a GitHub release asset URL")
-    owner, repo, tag, name = parts[1], parts[2], parts[5], urllib.parse.unquote(parts[6])
-    api = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"
-    headers = {"Authorization": f"Bearer {token}",
-               "Accept": "application/vnd.github+json"}
+    return (parsed.scheme == "https" and parsed.netloc == "github.com"
+            and len(parts) == 7 and parts[3:5] == ["releases", "download"]
+            and not parsed.query and not parsed.fragment)
+
+
+def _open_pinned_url(url: str):
+    """Open a pinned artifact URL without credentials.
+
+    GitHub serves a release download through exactly one redirect to its asset
+    CDN; that hop is followed and every other redirect is refused. The lock's
+    SHA-256, not the transport, authenticates the downloaded bytes.
+    """
     opener = urllib.request.build_opener(_NoRedirect())
-    with opener.open(urllib.request.Request(api, headers=headers), timeout=120) as response:
-        release = json.load(response)
-    assets = [asset for asset in release["assets"] if asset["name"] == name]
-    if len(assets) != 1 or not isinstance(assets[0]["id"], int):
-        raise ArtifactLockError(f"pinned GitHub release asset is missing: {name}")
-    asset_url = f"https://api.github.com/repos/{owner}/{repo}/releases/assets/{assets[0]['id']}"
-    headers["Accept"] = "application/octet-stream"
     try:
-        return opener.open(urllib.request.Request(asset_url, headers=headers), timeout=120)
+        return opener.open(url, timeout=120)
     except urllib.error.HTTPError as exc:
-        if exc.code != 302:
+        if exc.code not in _REDIRECT_CODES:
             raise
         location = exc.headers.get("Location", "")
         exc.close()
-        destination = urllib.parse.urlparse(location)
-        if (destination.scheme != "https"
-                or destination.netloc != "release-assets.githubusercontent.com"
-                or destination.username or destination.password):
-            raise ArtifactLockError("GitHub asset redirected outside its HTTPS release CDN")
-        # A fresh request carries no Authorization header. Refuse any further
-        # redirect instead of leaking credentials or following an untrusted URL.
-        return opener.open(location, timeout=120)
+    if not _is_github_release_download(url):
+        raise ArtifactLockError("Chudcode artifact URL redirected; pin the final immutable URL")
+    destination = urllib.parse.urlparse(location)
+    if (destination.scheme != "https" or destination.hostname not in _GITHUB_ASSET_HOSTS
+            or destination.username or destination.password):
+        raise ArtifactLockError("GitHub release asset redirected outside its HTTPS asset CDN")
+    return opener.open(location, timeout=120)
 
 
 def fetch_artifact(
     destination: Path, target: str, *, lock_path: Path | None = None,
-    github_token: str | None = None, github_mirror_repository: str | None = None,
 ) -> dict[str, Any]:
     lock_path = lock_path or DEFAULT_LOCK
     lock = load_lock(lock_path, require_pinned=False)
     artifact = _pinned_artifact(lock, target)
-    download_url = artifact["url"]
-    if github_mirror_repository:
-        if not github_token:
-            raise ArtifactLockError("a GitHub release mirror requires --github-token-env")
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", github_mirror_repository):
-            raise ArtifactLockError("GitHub mirror repository must be OWNER/REPO")
-        name = urllib.parse.urlparse(download_url).path.rsplit("/", 1)[-1]
-        download_url = (f"https://github.com/{github_mirror_repository}/releases/download/"
-                        f"chudcode-runtime-v{lock['version']}/{name}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         prefix="chudcode-", delete=False, dir=destination.parent
     ) as stream:
         temporary = Path(stream.name)
         try:
-            response_stream = (
-                _github_asset_response(download_url, github_token)
-                if github_token else urllib.request.urlopen(download_url, timeout=120)
-            )
-            with response_stream as response:
-                if not github_token and response.geturl() != download_url:
-                    raise ArtifactLockError(
-                        "Chudcode artifact URL redirected; pin the final immutable URL"
-                    )
+            with _open_pinned_url(artifact["url"]) as response:
                 shutil.copyfileobj(response, stream)
         except Exception:
             temporary.unlink(missing_ok=True)
@@ -530,8 +512,7 @@ def fetch_artifact(
 
 def ensure_artifact(
     cache_dir: Path, target: str, *, source: Path | None = None,
-    lock_path: Path | None = None, github_token: str | None = None,
-    github_mirror_repository: str | None = None,
+    lock_path: Path | None = None,
 ) -> dict[str, Any]:
     """Use an explicit verified input or a digest-keyed, verified download."""
     lock_path = lock_path or DEFAULT_LOCK
@@ -544,8 +525,7 @@ def ensure_artifact(
         # A damaged cache is a failure, not permission to replace an explicit
         # installation or execute untrusted bytes. Remove it deliberately first.
         return verify_binary(destination, target, lock_path=lock_path)
-    fetch_artifact(destination, target, lock_path=lock_path, github_token=github_token,
-                   github_mirror_repository=github_mirror_repository)
+    fetch_artifact(destination, target, lock_path=lock_path)
     return verify_binary(destination, target, lock_path=lock_path)
 
 
@@ -648,11 +628,6 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--input", type=Path, required=True)
         if name not in ("verify", "ensure"):
             command.add_argument("--output", type=Path, required=True)
-        if name in ("fetch", "ensure"):
-            command.add_argument("--github-token-env",
-                                 help="environment variable holding a private GitHub release read token")
-            command.add_argument("--github-mirror-repository",
-                                 help="OWNER/REPO containing chudcode-runtime-v<VERSION>; lock digest remains authoritative")
         if name == "ensure":
             command.add_argument("--cache-dir", type=Path, required=True)
             command.add_argument("--input", type=Path)
@@ -724,19 +699,12 @@ def main(argv: list[str] | None = None) -> int:
                 result = verify_binary(args.input, target, lock_path=args.lock)
             elif args.command == "stage":
                 result = stage_binary(args.input, args.output, target, lock_path=args.lock)
+            elif args.command == "ensure":
+                result = ensure_artifact(
+                    args.cache_dir, target, source=args.input, lock_path=args.lock,
+                )
             else:
-                token = (os.environ.get(args.github_token_env)
-                         if args.github_token_env else None)
-                if args.command == "ensure":
-                    result = ensure_artifact(
-                        args.cache_dir, target, source=args.input, lock_path=args.lock,
-                        github_token=token, github_mirror_repository=args.github_mirror_repository,
-                    )
-                else:
-                    result = fetch_artifact(
-                        args.output, target, lock_path=args.lock, github_token=token,
-                        github_mirror_repository=args.github_mirror_repository,
-                    )
+                result = fetch_artifact(args.output, target, lock_path=args.lock)
     except (ArtifactLockError, OSError, urllib.error.URLError) as exc:
         print(f"pin_chudcode: error: {exc}", file=sys.stderr)
         return 1

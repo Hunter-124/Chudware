@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace chudware::update {
 
@@ -55,6 +56,14 @@ int compareVersions(const std::string& lhs, const std::string& rhs);
 bool requiresMandatoryUpdate(const std::string& current,
                              const std::string& minSupported);
 
+// The signed release manifest one target polls: the `update-<platform>-<arch>.json`
+// asset of the latest GitHub release. `platform` is windows|macos|linux and
+// `arch` is x86_64|arm64, the same identity the manifest's signature covers.
+std::string releaseManifestUrl(std::string_view platform, std::string_view arch);
+// The manifest the update check fetches: CHUDWARE_UPDATE_MANIFEST_URL verbatim
+// when set, otherwise releaseManifestUrl() for this build's platform and arch.
+std::string manifestUrl();
+
 class Updater {
 public:
     Updater();
@@ -67,7 +76,6 @@ public:
     ApplyResult applyStagedBeforeWindow();
     void start();
     void stop();
-    void setEntitlementToken(std::string token);
     // Wakes the polling worker so a manual "Check now" does not have to wait out
     // the remaining poll interval. No-op when no worker is running.
     void requestCheckNow();

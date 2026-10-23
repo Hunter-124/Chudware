@@ -2,11 +2,10 @@
 
 Research snapshot: 2026-08-08.
 
-## Working product decisions
+## Product decisions
 
-The interactive decision round timed out and selected the recommended defaults. Treat these as the execution baseline unless Hunter overrides them during the run.
+These are the execution baseline for the manufacturing overhaul.
 
-- Baseline: audit and land the existing dirty tree as Wave 0, separating coherent units and preserving unrelated work.
 - Machine authority: approved-job autonomy. A human approves an immutable job/setup; the deterministic arbiter may then start, hold, monitor, and notify. Alarm recovery, changed inputs, and resume require fresh approval. Software commands never substitute for E-stop/interlocks.
 - Controller rollout: Shapeoko 3 XL / Grbl 1.1 first; FluidNC and grblHAL next; proprietary controllers remain post/file-only until explicit vendor support.
 - Twin: deterministic engineering twin with fixed integer ticks, controller state, 3-axis kinematics, fixtures, stock removal, collision events, virtual sensors/cameras, fault injection, snapshot/restore, and replay. It is not safety certification.
@@ -29,16 +28,3 @@ The interactive decision round timed out and selected the recommended defaults. 
 - Missing/stale/unknown telemetry fails closed.
 - Camera perception is advisory until separately validated; it never serves as a guarding or E-stop function.
 - Copyleft components remain out-of-process behind coarse documented contracts unless the product deliberately adopts compatible licensing.
-
-## Source corpus
-
-- agent://CamKernelAudit
-- agent://CamGuiAudit
-- agent://TwinReuseAudit
-- agent://VisionMetrologyAudit
-- agent://AgentControlAudit
-- agent://SlicerStrategy
-- agent://ControllerEcosystem
-- agent://PrinterMonitoring
-- agent://LocalPerceptionPlan
-- agent://ManufacturingBreadth

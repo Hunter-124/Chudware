@@ -249,7 +249,6 @@ def _assemble_role_runtime(
     options: Mapping[str, Any],
     tier: Any,
     capability: Any,
-    actor: Any,
     on_event: Callable[..., None] | None,
 ) -> tuple[str, list[str], list[Any], Any, dict[str, Any]]:
     from services.agent.mission_dispatch import MissionDispatch, role_prompt
@@ -269,7 +268,6 @@ def _assemble_role_runtime(
             phase=_text(options.get("phase")) or None,
             task_class=_text(options.get("task_class")) or None,
             options=dict(options),
-            chudware_actor=actor,
         )
     system_prompt, role_allowed_tools = role_prompt(
         role,
@@ -317,7 +315,6 @@ def _assemble_role_runtime(
         "capability": capability,
         "tier": tier,
         "actor": role,
-        "chudware_actor": actor,
         "ledger": options.get("ledger", getattr(mission_dispatch, "ledger", None)),
         "run_id": run_id,
         "session_id": options.get("session_id"),
@@ -513,7 +510,7 @@ def _bounded_tool_calls(records: Any) -> tuple[list[dict[str, Any]], int]:
     return bounded, len(records)
 
 
-def _record_provider_usage(payload: Mapping[str, Any], actor: Any) -> None:
+def _record_provider_usage(payload: Mapping[str, Any]) -> None:
     from services.agent.providers import token_usage
 
     token_usage.record_usage(
@@ -524,7 +521,6 @@ def _record_provider_usage(payload: Mapping[str, Any], actor: Any) -> None:
         total_tokens=payload.get("total_tokens"),
         context_tokens=payload.get("context_tokens"),
         source=_text(payload.get("source")) or "api",
-        actor=actor,
     )
 
 
@@ -550,7 +546,7 @@ def _terminal_text(host_result: Mapping[str, Any]) -> str:
 
 
 def _offline_provider(
-    role: str, options: Mapping[str, Any], settings: Mapping[str, Any], actor: Any
+    role: str, options: Mapping[str, Any], settings: Mapping[str, Any]
 ) -> Any:
     from services.agent import config as agent_config
 
@@ -573,7 +569,6 @@ def _offline_provider(
             name=provider_name or None,
             cfg=cfg,
             role=role,
-            **({"actor": actor} if actor is not None else {}),
         )
     if not agent_config.provider_offline_safe(provider):
         raise agent_config.OfflineModeError(
@@ -597,14 +592,13 @@ def _run_offline(
     capability: Any,
     max_tokens: int | None,
     max_total_tokens: int | None,
-    actor: Any,
     settings: Mapping[str, Any],
 ) -> dict[str, Any]:
     from services.agent.mission_dispatch import run_linear_role_turn
     from services.agent.providers import token_usage
 
     try:
-        provider = _offline_provider(role, options, settings, actor)
+        provider = _offline_provider(role, options, settings)
     except Exception as exc:  # noqa: BLE001 - offline refusal is result data
         return _failure(
             role,
@@ -643,7 +637,6 @@ def _run_offline(
                 if isinstance(attachments, list)
                 else None
             ),
-            chudware_actor=actor,
         )
     except Exception as exc:  # noqa: BLE001 - nested role turns return failures
         return _failure(
@@ -698,7 +691,6 @@ def run_role_turn(
     capability: Any = None,
     max_tokens: int | None = None,
     max_total_tokens: int | None = None,
-    actor: Any = None,
     close_session: bool = False,
 ) -> dict[str, Any]:
     """Run one CAD role turn through Chudcode, or the explicit local fallback.
@@ -726,11 +718,9 @@ def run_role_turn(
     opts = dict(options) if isinstance(options, Mapping) else {}
     if tenancy.in_cell() and opts.get("offline"):
         return _failure(role_name, "credential_isolation_unsupported", "credential_isolation_unsupported")
-    if tenancy.in_cell() and any(key in opts for key in ("api_key", "web_credential", "byok_key")):
+    if tenancy.in_cell() and any(key in opts for key in ("api_key", "byok_key")):
         return _failure(role_name, "credential_isolation_unsupported", "credential_isolation_unsupported")
-    if opts.get("offline") is not True and (
-        tenancy.in_cell() or not any(key in opts for key in ("web_key_source", "byok_key"))
-    ):
+    if opts.get("offline") is not True and (tenancy.in_cell() or "byok_key" not in opts):
         host = get_default_chudcode_host()
         inherit = getattr(host, "session_launch_params", None)
         if callable(inherit):
@@ -738,10 +728,8 @@ def run_role_turn(
                 inherited = inherit(parent_session)
                 opts = {**inherited, **opts}
                 if tenancy.in_cell():
-                    for key in ("workspace_dir", "web_actor", "web_key_source", "web_tenant",
-                                "web_provider", "web_provider_grant"):
-                        if key in inherited:
-                            opts[key] = inherited[key]
+                    if "workspace_dir" in inherited:
+                        opts["workspace_dir"] = inherited["workspace_dir"]
                     if inherited.get("plan_only") or inherited.get("mode") in ("ask", "plan"):
                         if inherited.get("mode") == "ask" or opts.get("mode") not in ("ask", "plan"):
                             opts["mode"] = inherited.get("mode") or "plan"
@@ -806,7 +794,6 @@ def run_role_turn(
             capability=effective_capability,
             max_tokens=max_tokens,
             max_total_tokens=max_total_tokens,
-            actor=actor,
             settings=settings,
         )
 
@@ -825,7 +812,6 @@ def run_role_turn(
             opts,
             effective_tier,
             effective_capability,
-            actor,
             on_event,
         )
     except Exception as exc:  # noqa: BLE001 - prompt/tool failures are clean results
@@ -871,8 +857,6 @@ def run_role_turn(
         "host_uris",
         "images",
         "mode", "plan_only", "turn_preferences",
-        "web_actor", "web_key_source", "web_tenant", "web_provider", "web_credential",
-        "web_provider_grant",
         "byok_key", "byok_tenant", "byok_provider",
     ):
         if key in opts and opts[key] is not None:
@@ -905,7 +889,7 @@ def run_role_turn(
                 payload["control_delegate"] = dict(raw["control_delegate"])
             if kind == "agent.provider_usage":
                 _add_usage(usage, payload)
-                _record_provider_usage(payload, actor)
+                _record_provider_usage(payload)
             _emit(on_event, kind, payload)
 
     host = None
@@ -976,7 +960,7 @@ def run_role_turn(
         if close_session:
             try:
                 if host is not None:
-                    if any(key in host_params for key in ("web_key_source", "byok_key")):
+                    if "byok_key" in host_params:
                         host.close_session(child_session, credential_params=host_params)
                     else:
                         host.close_session(child_session)

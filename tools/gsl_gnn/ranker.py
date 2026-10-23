@@ -3,7 +3,7 @@
 Ranks a list of ``candidate`` dicts emitted by the 5-pass recogniser.
 The ranker re-orders only — it never generates new candidates.
 
-``torch`` is imported lazily (same pattern as model.py / dataset.py) so this
+``torch`` is imported lazily (only training needs it) so this
 module stays importable and ``py_compile``-clean without torch installed.
 ``numpy_forward`` is pure-numpy only and never touches torch at all.
 """
@@ -14,7 +14,7 @@ import math
 from pathlib import Path
 from typing import Optional
 
-# --- feature vocabularies (copied from dataset.py — no cross-import) --------
+# --- feature vocabularies (match the corpus labels in corpora/gsl_dataset) --
 
 SURF_KINDS = ["plane", "cylinder", "cone", "sphere", "torus", "bspline", "other"]
 CONCAVITY_KINDS = ["bore", "boss", "none"]
@@ -41,15 +41,15 @@ def _require_torch():
         import torch.nn as nn
     except ImportError as exc:  # pragma: no cover
         raise ImportError(
-            "tools/gsl_gnn ranker requires torch. Install with "
-            "`pip install -r tools/gsl_gnn/requirements.txt`. "
+            "tools/gsl_gnn ranker requires torch for this call. Install it from "
+            "https://pytorch.org/get-started/locally/. "
             f"Original import error: {exc}"
         ) from exc
     return torch, nn
 
 
 # ---------------------------------------------------------------------------
-# Feature helpers (exact copies from dataset.py)
+# Feature helpers
 # ---------------------------------------------------------------------------
 
 def _one_hot(value: Optional[str], vocab: list) -> list:

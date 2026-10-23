@@ -31,6 +31,9 @@ MAX_WHEEL_BYTES = 1024 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 2 * MAX_WHEEL_BYTES
 MAX_METADATA_BYTES = 1024 * 1024
 MAX_IDENTITY_BYTES = 4 * 1024 * 1024
+# The public repository the chudcode-rpc SDK wheel is built from (python/chudcode-rpc),
+# at the commit vendor/chudcode/CHUDCODE_ARTIFACT.lock pins for the native runtime.
+CHUDCODE_REPOSITORY = "https://github.com/Hunter-124/chudcode.git"
 
 
 def local_path(path: Path) -> Path:
@@ -114,7 +117,7 @@ def _archive_members(archive, filename: str) -> list[str]:
     return members
 
 
-def _source_identity(value: dict, private: bool, native_source: dict) -> None:
+def _source_identity(value: dict, sdk: bool, native_source: dict) -> None:
     """Source identities are reviewer assertions, never inferred from wheel bytes."""
     if not isinstance(value, dict):
         raise WheelhouseError("wheel source identity requires explicit review")
@@ -123,13 +126,14 @@ def _source_identity(value: dict, private: bool, native_source: dict) -> None:
         if not re.fullmatch(r"[0-9a-f]{40}", str(value["repository_commit"])):
             raise WheelhouseError("wheel source requires an immutable repository commit")
         url = value["repository"]
-        if private and {key: value[key] for key in native_source} != native_source:
-            raise WheelhouseError("private RPC wheel source differs from reviewed Chudcode commit")
-    elif not private and value.get("kind") == "archive":
+        if sdk and {key: value[key] for key in native_source} != native_source:
+            raise WheelhouseError("chudcode-rpc wheel source differs from the reviewed Chudcode commit")
+    elif not sdk and value.get("kind") == "archive":
         _keys(value, {"kind", "url"}, "wheel source")
         url = value["url"]
     else:
-        raise WheelhouseError("private RPC wheel requires reviewed immutable VCS provenance")
+        raise WheelhouseError("chudcode-rpc requires reviewed immutable VCS provenance; "
+                              "other wheels need a reviewed VCS or archive source")
     from urllib.parse import urlsplit
     if not isinstance(url, str) or len(url) > 2048 or any(ord(char) < 33 for char in url):
         raise WheelhouseError("invalid reviewed source URL")
@@ -261,11 +265,14 @@ def target_key(environment: dict) -> str:
     return f"{environment['sys_platform']}-{machine}-cp{environment['python_version'].replace('.', '')}"
 
 
-def _declarations(path: Path, environment: dict) -> list:
-    _, requirements, _, _, _, _ = _packaging()
+def _declarations(path: Path, environment: dict, chudcode_source: dict) -> list:
+    _, requirements, utils, _, _, _ = _packaging()
+    pinned_sdk = f"git+{chudcode_source['repository']}@{chudcode_source['repository_commit']}"
     result = []
     for raw in _bytes(path).decode("utf-8").splitlines():
-        line = raw.split("#", 1)[0].strip()
+        # pip's comment rule: '#' starts a comment only at line start or after
+        # whitespace, so a URL fragment such as #subdirectory= survives.
+        line = re.sub(r"(^|\s+)#.*$", "", raw).strip()
         if not line or line in ("--no-index", "--only-binary=:all:"):
             continue
         try:
@@ -273,7 +280,12 @@ def _declarations(path: Path, environment: dict) -> list:
         except ValueError as exc:
             raise WheelhouseError(f"invalid runtime requirement: {line}") from exc
         if req.url:
-            raise WheelhouseError("runtime declarations cannot supply unreviewed direct URLs")
+            # Developers build the SDK from this direct reference; the reviewed
+            # chudcode-rpc wheel from the same commit satisfies it here.
+            if (utils.canonicalize_name(req.name) != "chudcode-rpc"
+                    or req.url.split("#", 1)[0] != pinned_sdk):
+                raise WheelhouseError("runtime declarations cannot supply unreviewed direct URLs")
+            req = requirements.Requirement("chudcode-rpc" + (f"; {req.marker}" if req.marker else ""))
         if not req.marker or req.marker.evaluate(environment):
             result.append(req)
     return result
@@ -305,13 +317,13 @@ def verified_wheelhouse(wheelhouse: Path, requirements: Path, lock_path: Path,
                   [additional_requirements] if isinstance(additional_requirements, (str, Path)) else
                   list(additional_requirements))
     source = lock["chudcode_source"]
-    _keys(source, {"repository", "repository_commit"}, "private source")
+    _keys(source, {"repository", "repository_commit"}, "Chudcode source")
     native = _json(chudcode_lock)
     if source != {key: native.get(key) for key in source}:
-        raise WheelhouseError("private RPC wheel source differs from reviewed Chudcode commit")
-    if (source["repository"] != "https://github.com/Hunter-124/chudcode.git"
+        raise WheelhouseError("chudcode-rpc wheel source differs from the reviewed Chudcode commit")
+    if (source["repository"] != CHUDCODE_REPOSITORY
             or not re.fullmatch(r"[0-9a-f]{40}", str(source["repository_commit"]))):
-        raise WheelhouseError("private RPC wheel lacks immutable source provenance")
+        raise WheelhouseError("chudcode-rpc wheel lacks immutable source provenance")
     key = target_key(environment)
     if not isinstance(lock["targets"], dict) or key not in lock["targets"]:
         raise WheelhouseError(f"reviewed complete runtime wheel set unavailable for {key}")
@@ -406,9 +418,9 @@ def verified_wheelhouse(wheelhouse: Path, requirements: Path, lock_path: Path,
             lines.append(f"{copied.as_uri()} --hash=sha256:{digest}\n")
         if installed.get("chudcode-rpc", (None,))[0] != "0.3.1":
             raise WheelhouseError("reviewed chudcode-rpc==0.3.1 wheel is required")
-        pending = _declarations(requirements, environment)
+        pending = _declarations(requirements, environment, source)
         for path in additional:
-            pending.extend(_declarations(Path(path), environment))
+            pending.extend(_declarations(Path(path), environment, source))
         # Even additional reviewed wheels must have a complete dependency closure.
         pending.extend(req_parser.Requirement(f"{name}=={value[0]}") for name, value in installed.items())
         visited = set()

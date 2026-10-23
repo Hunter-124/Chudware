@@ -9,8 +9,6 @@ import time
 import textwrap
 from pathlib import Path
 import hashlib
-import queue
-import uuid
 
 import pytest
 from services.agent import chudcode_host as chudcode_host_module
@@ -405,37 +403,6 @@ def test_byok_process_isolated_and_live_session_rejects_credential_switch(
     assert next_turn["ok"] is True
     assert len(factory.clients) == 2
     assert factory.clients[1].kwargs["session_dir"] != client.kwargs["session_dir"]
-    host.shutdown()
-
-def test_web_subscription_pool_and_desktop_process_boundaries(tmp_path, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "operator-key")
-    monkeypatch.setenv("ANTHROPIC_OAUTH_TOKEN", "operator-oauth")
-    monkeypatch.setenv("OPENAI_API_KEY", "operator-openai")
-    factory = FakeFactory()
-    host = ChudcodeSessionHost(client_factory=factory)
-    shared = {"chudcode_session_dir": str(tmp_path), "web_actor": True,
-              "web_tenant": "tenant@example.test"}
-    subscription = {**shared, "web_key_source": "subscription",
-                    "web_provider": "anthropic-sub", "web_credential": "tenant-oauth"}
-    assert run(host, "sub", "sub-1", **subscription)[0]["ok"]
-    sub_env = factory.clients[0].kwargs["env"]
-    assert sub_env["ANTHROPIC_OAUTH_TOKEN"] == "tenant-oauth"
-    assert sub_env["ANTHROPIC_API_KEY"] == ""
-    assert sub_env["OPENAI_API_KEY"] == ""
-    assert factory.clients[0].kwargs["session_dir"].startswith(str(tmp_path / "subscription-"))
-    assert not run(host, "sub", "sub-switch", **{**subscription, "web_credential": "different"})[0]["ok"]
-    assert not run(host, "codex", "codex-1", **{**subscription, "web_provider": "openai-codex"})[0]["ok"]
-    assert not run(host, "invalid", "invalid-1", web_actor=True)[0]["ok"]
-    pool = {**shared, "web_key_source": "pool", "web_provider": "openrouter",
-            "web_credential": "operator-pool"}
-    assert run(host, "pool", "pool-1", **pool)[0]["ok"]
-    pool_env = factory.clients[1].kwargs["env"]
-    assert pool_env["OPENROUTER_API_KEY"] == "operator-pool"
-    assert pool_env["ANTHROPIC_API_KEY"] == ""
-    assert pool_env["ANTHROPIC_OAUTH_TOKEN"] == ""
-    assert factory.clients[1].kwargs["session_dir"].startswith(str(tmp_path / "pool-"))
-    assert run(host, "desktop", "desktop-1")[0]["ok"]
-    assert "env" not in factory.clients[2].kwargs
     host.shutdown()
 
 
@@ -3166,15 +3133,14 @@ def test_scoped_online_tool_helper_inherits_exact_model_credentials_and_policy(t
     monkeypatch.setenv("OPENAI_API_KEY", "operator-openai-secret")
     try:
         result, events = run(
-            host, "web-helper", host_tools=[binding],
+            host, "byok-helper", host_tools=[binding],
             chudcode_session_dir=str(tmp_path), provider="openai", model="selected-model",
-            web_actor=True, web_key_source="byok", web_tenant="alice", web_provider="openai",
-            web_credential="alice-private-token",
+            byok_key="alice-private-token", byok_provider="openai", byok_tenant="alice",
             settings={"compaction_settings": {"methodOrder": ["soft"]},
                       "thinking": "low", "auto_retry": False})
         assert result["ok"]
         helper = factory.clients[1]
-        assert helper.kwargs["provider_session_id"] == "web-helper"
+        assert helper.kwargs["provider_session_id"] == "byok-helper"
         assert helper.kwargs["env"]["OPENAI_API_KEY"] == "alice-private-token"
         assert helper.kwargs["env"]["ANTHROPIC_API_KEY"] == ""
         assert ("set_model", {"provider": "openai", "modelId": "selected-model"}) in helper.calls
@@ -3186,15 +3152,14 @@ def test_scoped_online_tool_helper_inherits_exact_model_credentials_and_policy(t
         assert "helper_runtime" not in binding.context
         serialized = json.dumps([result, events, records])
         assert "alice-private-token" not in serialized and "operator-secret" not in serialized
-        assert "web_credential" not in serialized
     finally:
         host.shutdown()
 
 
-def test_web_helper_missing_scope_fails_before_spawning_or_using_desktop_auth(helper_runtime):
+def test_helper_unsupported_byok_provider_fails_before_spawning(helper_runtime):
     host, factory = helper_runtime
-    with pytest.raises(chudcode_host_module.HelperCompletionError, match="web_credential_source_invalid"):
-        host.complete_text("", "repair", runtime_params={"web_actor": True})
+    with pytest.raises(chudcode_host_module.HelperCompletionError, match="byok_unsupported_online"):
+        host.complete_text("", "repair", runtime_params={"byok_key": "sk-test", "byok_provider": "unknown"})
     assert not factory.clients
 
 
@@ -3408,662 +3373,56 @@ def _cell_context(actor, workspace="team:fixture/workspace"):
     }
 
 
-def _cell_credentials(actor):
-    return {
-        "web_actor": True, "web_key_source": "byok", "web_tenant": actor,
-        "web_provider": "openai", "web_provider_grant": f"cpg1.fixture-{actor}.fixture-signature",
-        "workspace_dir": "/work",
-        "provider": "openai", "model": "fixture-model",
-    }
-
-
-class CellLaunchClient(QueueingClient):
-    """Record the real launch argv, persistent history, and SDK reader-thread events."""
-
-    def __init__(self, factory, **kwargs):
-        super().__init__(factory, **kwargs)
-        self.session_file = str(Path(kwargs["session_dir"]) / f"{uuid.uuid4().hex}.jsonl")
-        Path(self.session_file).touch()
-
-    def prompt(self, message, *, images=None):
-        with Path(self.session_file).open("a") as history:
-            history.write(message + "\n")
-        super().prompt(message, images=images)
-
-    def wait_for_idle(self, timeout=None):
-        self.idle_timeouts.append(timeout)
-        if not self.release.wait(2):
-            raise TimeoutError("fixture turn was not released")
-        failures = []
-
-        def notify():
-            try:
-                for frame in self.events:
-                    for listener in tuple(self.listeners):
-                        listener(frame)
-            except BaseException as exc:
-                failures.append(exc)
-
-        reader = threading.Thread(target=notify)
-        reader.start()
-        reader.join(2)
-        assert not reader.is_alive()
-        if failures:
-            raise failures[0]
-        return tuple(self.events)
-
-
-class CellLaunchFactory(FakeFactory):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.created = queue.Queue()
-
-    def __call__(self, **kwargs):
-        assert kwargs["command"][0] == "/opt/chudware/bin/chudware-actor-sandbox"
-        client = CellLaunchClient(self, **kwargs)
-        self.clients.append(client)
-        self.created.put(client)
-        return client
-
-
 @pytest.fixture
-def cell_launch_runtime(monkeypatch, tmp_path):
-    pytest.importorskip("chudcode_rpc")
+def cell_runtime(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "actor-data"))
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "desktop-credential-never-inherited")
-    monkeypatch.setattr(ChudcodeSessionHost, "_resolve_binary",
-                        lambda self, required: "/opt/chudware/bin/chud")
-    monkeypatch.setattr(chudcode_host_module, "_binary_supports_flag", lambda *args: True)
-    monkeypatch.setattr(chudcode_host_module, "_binary_has_memory_backend", lambda *args: True)
+    monkeypatch.setattr(ChudcodeSessionHost, "_resolve_binary", lambda self, required: None)
     return tmp_path
 
 
-def test_cell_launch_modes_preserve_exact_sdk_argv_and_session_history(cell_launch_runtime):
-    from chudcode_rpc import RpcClient
-    from services.agent import request_context as tenancy
-
-    factory = CellLaunchFactory()
-    host = ChudcodeSessionHost(client_factory=factory)
-    ctx = _cell_context("alice")
-    try:
-        with tenancy.bind_context(ctx), tenancy.bind_roots("/work", "/work/saved"):
-            params = _cell_credentials("alice")
-            assert run(host, "same-handle", "first", mode="ask", **params)[0]["ok"]
-            original = factory.clients[0]
-            history = original.session_file
-            for mode, expected_class in (("ask", "ro"), ("plan", "ro"), ("agent", "rw")):
-                result, _ = run(host, "same-handle", f"mode-{mode}", mode=mode, **params)
-                assert result["ok"]
-                client = factory.clients[-1]
-                command = client.kwargs["command"]
-                assert command[:4] == [
-                    "/opt/chudware/bin/chudware-actor-sandbox",
-                    ctx["actor_hex"], expected_class, "--",
-                ]
-                sdk_kwargs = {k: v for k, v in client.kwargs.items() if k != "command"}
-                assert command[4:] == list(RpcClient(**sdk_kwargs).command)
-                overlay_index = command.index("--config")
-                overlay = Path(command[overlay_index + 1]).read_text()
-                assert "browser.enabled: false" in overlay
-                assert "computer.enabled: false" in overlay
-                assert client.kwargs["env"]["CHUDWARE_PROVIDER_GRANT"] == params["web_provider_grant"]
-                assert client.kwargs["env"]["ANTHROPIC_API_KEY"] == ""
-                assert client.session_file == history
-            assert len(factory.clients) == 2
-            assert original.stop_count == 1
-            assert ("switch_session", {"sessionPath": history}) in factory.clients[1].calls
-            assert "Do the work" in Path(history).read_text()
-            assert host.release_session("same-handle") == {"ok": True, "released": True}
-        # A fresh worker recovers via the actor-private handle mapping, with no client path.
-        restarted = ChudcodeSessionHost(client_factory=factory)
-        with tenancy.bind_context(ctx):
-            assert run(restarted, "same-handle", "after-restart", **params)[0]["ok"]
-            assert factory.clients[-1].session_file == history
-            assert ("switch_session", {"sessionPath": history}) in factory.clients[-1].calls
-        restarted.shutdown()
-    finally:
-        host.shutdown()
-
-
-def test_cell_two_actor_controls_events_and_carried_steers_do_not_collide(cell_launch_runtime):
-    from services.agent import request_context as tenancy
-
-    factory = CellLaunchFactory(block=True)
-    host = ChudcodeSessionHost(client_factory=factory)
-    outputs, frames = {}, {"alice": [], "bob": []}
-    threads = []
-
-    def start(actor):
-        def turn():
-            with tenancy.bind_context(_cell_context(actor)), tenancy.bind_roots("/work", "/work/saved"):
-                outputs[actor] = host.run_turn({
-                    "request": actor, "session_id": "shared-session", "run_id": "shared-run",
-                    **_cell_credentials(actor),
-                }, lambda frame: frames[actor].append((tenancy.owner_key(), frame)))
-        thread = threading.Thread(target=turn)
-        threads.append(thread)
-        thread.start()
-        client = factory.created.get(timeout=2)
-        assert client.prompted.wait(2)
-        return client
-
-    try:
-        alice = start("alice")
-        bob = start("bob")
-        with tenancy.bind_context(_cell_context("foreign")):
-            absent = {"ok": False, "reason": "not_found", "code": "not_found"}
-            assert host.status(run_id="shared-run") == absent
-            assert host.status(run_id="missing") == absent
-            assert host.status(session_id="shared-session") == absent
-            assert host.cancel("shared-run") == absent
-            assert host.steer("shared-run", "foreign", attachments=[{"path": "/missing"}]) == absent
-            assert host.answer("shared-run", "question", {}) == absent
-            assert host.close_session("shared-session") == absent
-            assert host.release_session("shared-session") == absent
-            assert host.status()["sessions"] == host.status()["active_runs"] == 0
-            assert host.session_call("shared-session", "get_state") == absent
-        with tenancy.bind_context(_cell_context("alice")):
-            assert host.status()["sessions"] == host.status()["active_runs"] == 1
-            assert host.steer("shared-run", "alice-carried", steer_id="own-steer")["steered"]
-            stopped = host.cancel("")
-            assert stopped["ok"]
-            assert len(stopped["cancelled_runs"]) == 1
-            assert stopped["cancelled_runs"][0]["carried_steer_ids"] == ["own-steer"]
-        threads[0].join(2)
-        assert not threads[0].is_alive()
-        assert outputs["alice"]["cancelled"]
-        with tenancy.bind_context(_cell_context("bob")):
-            assert host.status(run_id="shared-run")["active"]
-            assert "abort" not in call_names(bob)
-            assert host.release_session("shared-session")["reason"] == "session_busy"
-        bob.release.set()
-        threads[1].join(2)
-        assert not threads[1].is_alive()
-        assert not outputs["bob"]["cancelled"]
-        for actor in ("bob", "alice"):
-            with tenancy.bind_context(_cell_context(actor)):
-                assert run(host, "shared-session", "next", request="continue",
-                           **_cell_credentials(actor))[0]["ok"]
-        assert [p["message"] for n, p in alice.calls if n == "prompt"][-1] == "alice-carried\n\ncontinue"
-        assert [p["message"] for n, p in bob.calls if n == "prompt"][-1] == "continue"
-        for actor, emitted in frames.items():
-            assert emitted
-            assert all(owner == (_cell_context(actor)["workspace_key"], actor) for owner, _ in emitted)
-    finally:
-        host.shutdown()
-        for thread in threads:
-            thread.join(2)
-
-
-@pytest.mark.parametrize("control", ["cancel", "steer", "answer", "status", "close", "release"])
-def test_cell_controls_check_explicit_provider_identity(cell_launch_runtime, control):
-    from services.agent import request_context as tenancy
-
-    factory = CellLaunchFactory(block=True)
-    host = ChudcodeSessionHost(client_factory=factory)
-    thread = None
-    try:
-        with tenancy.bind_context(_cell_context("alice")):
-            params = _cell_credentials("alice")
-            thread = threading.Thread(target=chudcode_host_module._context_callback(
-                lambda: run(host, "conversation", "controlled", **params),
-            ))
-            thread.start()
-            client = factory.created.get(timeout=2)
-            assert client.prompted.wait(2)
-            bad = {**params, "web_provider": "anthropic"}
-            controls = {
-                "cancel": lambda: host.cancel("controlled", credential_params=bad),
-                "steer": lambda: host.steer("controlled", "x", credential_params=bad),
-                "answer": lambda: host.answer("controlled", "q", {}, credential_params=bad),
-                "status": lambda: host.status(run_id="controlled", credential_params=bad),
-                "close": lambda: host.close_session("conversation", credential_params=bad),
-                "release": lambda: host.release_session("conversation", credential_params=bad),
-            }
-            assert controls[control]() == {"ok": False, "reason": "not_found", "code": "not_found"}
-            assert run(host, "conversation", "changed-key", **bad)[0]["reason"] == "not_found"
-            assert len(factory.clients) == 1
-    finally:
-        host.shutdown()
-        if thread is not None:
-            thread.join(2)
-            assert not thread.is_alive()
-
-
-@pytest.mark.parametrize("source", ["pool", "subscription", None])
-def test_cell_credentials_refuse_fallback_before_launch(cell_launch_runtime, source):
-    from services.agent import request_context as tenancy
-
-    factory = CellLaunchFactory()
-    host = ChudcodeSessionHost(client_factory=factory)
-    with tenancy.bind_context(_cell_context("alice")):
-        params = _cell_credentials("alice")
-        if source is None:
-            params = {}
-        else:
-            params["web_key_source"] = source
-        result, emitted = run(host, "conversation", "run", **params)
-        assert result["reason"] == (
-            "provider_grant_missing" if source is None else "credential_isolation_unsupported"
-        )
-        assert not factory.clients and not emitted
-    host.shutdown()
-
-
-def test_cell_prestart_cancel_and_client_session_paths_fail_closed(cell_launch_runtime):
-    from services.agent import request_context as tenancy
-
-    factory = CellLaunchFactory()
-    host = ChudcodeSessionHost(client_factory=factory)
-    try:
-        with tenancy.bind_context(_cell_context("alice")):
-            session = tenancy.mint_handle("session")
-            run_id = tenancy.mint_handle("run", parent=session)
-            assert host.cancel(run_id)["cancelled"]
-            result, _ = run(host, session, run_id, **_cell_credentials("alice"))
-            assert result["ok"] and result["cancelled"]
-            assert "prompt" not in call_names(factory.clients[0])
-            result, _ = run(host, session, "path-run", **_cell_credentials("alice"),
-                            chudcode_session_file="/actor/another-history.jsonl")
-            assert result["code"] == "cell_refused"
-        with tenancy.bind_context(_cell_context("bob")):
-            assert host.cancel(run_id)["code"] == "not_found"
-    finally:
-        host.shutdown()
-
-
-def test_cell_toolfree_helper_launches_readonly_with_parent_byok(cell_launch_runtime):
+def test_cell_has_no_credential_route_and_never_launches(cell_runtime):
     from services.agent import request_context as tenancy
 
     factory = FakeFactory()
-    factory.reply = "isolated helper answer"
-
-    def make(**kwargs):
-        client = HelperClient(factory, **kwargs)
-        factory.clients.append(client)
-        return client
-
-    host = ChudcodeSessionHost(client_factory=make)
+    host = ChudcodeSessionHost(client_factory=factory)
     try:
         with tenancy.bind_context(_cell_context("alice")):
-            # Prime the private state root just as the owning turn does.
             tenancy.actor_state_root().mkdir(parents=True)
-            assert host.complete_text(
-                "system", "diagnose", provider="openai", model="fixture-model",
-                runtime_params=_cell_credentials("alice"),
-            ) == "isolated helper answer"
-            client = factory.clients[0]
-            assert client.kwargs["command"][:4] == [
-                "/opt/chudware/bin/chudware-actor-sandbox",
-                _cell_context("alice")["actor_hex"], "ro", "--",
-            ]
-            assert "--no-tools" in client.kwargs["command"]
-            assert client.kwargs["env"]["CHUDWARE_PROVIDER_GRANT"] == "cpg1.fixture-alice.fixture-signature"
-            assert client.stop_count == 1
-            with pytest.raises(chudcode_host_module.HelperCompletionError, match="provider_grant_missing"):
-                host.complete_text("system", "no key", runtime_params={})
-            assert len(factory.clients) == 1
+            for params in ({}, {"byok_key": "upstream-key-forbidden", "byok_provider": "openai"}):
+                result, emitted = run(host, "conversation", "run", **params)
+                assert result["code"] == "credential_isolation_unsupported"
+                assert not emitted
+            with pytest.raises(chudcode_host_module.HelperCompletionError,
+                               match="credential_isolation_unsupported"):
+                host.complete_text("system", "diagnose", runtime_params={})
+        assert not factory.clients
     finally:
         host.shutdown()
 
 
-def test_cell_capacity_never_evicts_another_actor(cell_launch_runtime, monkeypatch):
+def test_cell_prestart_controls_and_client_session_paths_fail_closed(cell_runtime):
     from services.agent import request_context as tenancy
 
-    monkeypatch.setenv("CHUDWARE_CHUDCODE_MAX_SESSIONS", "1")
-    factory = CellLaunchFactory()
+    factory = FakeFactory()
     host = ChudcodeSessionHost(client_factory=factory)
-    try:
-        with tenancy.bind_context(_cell_context("alice")):
-            assert run(host, "alice-chat", "alice-run", **_cell_credentials("alice"))[0]["ok"]
-        alice = factory.clients[0]
-        with tenancy.bind_context(_cell_context("bob")):
-            assert run(host, "bob-chat", "bob-run", **_cell_credentials("bob"))[0]["ok"]
-            bob = factory.clients[-1]
-            assert run(host, "new-bob-chat", "new-bob-run", **_cell_credentials("bob"))[0]["ok"]
-            assert bob.stop_count == 1
-            assert host.status()["sessions"] == 1
-        with tenancy.bind_context(_cell_context("alice")):
-            assert alice.stop_count == 0
-            assert host.status(session_id="alice-chat")["live_session"]
-    finally:
-        host.shutdown()
-
-
-def test_cell_branch_rebinds_private_history_without_client_paths(cell_launch_runtime):
-    from services.agent import request_context as tenancy
-
-    factory = CellLaunchFactory()
-    host = ChudcodeSessionHost(client_factory=factory)
-    try:
-        with tenancy.bind_context(_cell_context("alice")):
-            params = _cell_credentials("alice")
-            assert run(host, "conversation", "before-branch", **params)[0]["ok"]
-            original = factory.clients[-1]
-            parent = Path(original.session_file)
-
-            def branch(entry_id):
-                original.calls.append(("branch", {"entryId": entry_id}))
-                child = parent.parent / f"{uuid.uuid4().hex}.jsonl"
-                child.write_text(parent.read_text())
-                original.session_id = "new-private-runtime-session"
-                original.session_file = str(child)
-                return {"text": "branch", "cancelled": False}
-
-            original.branch = branch
-            result = host.branch_session("conversation", "runtime-entry")
-            assert result["ok"] and original.stop_count == 1
-            child = result["chudcode_session_file"]
-            assert parent.is_file()
-            assert run(host, "conversation", "after-branch", **params)[0]["ok"]
-            assert factory.clients[-1].session_file == child
-            assert ("switch_session", {"sessionPath": child}) in factory.clients[-1].calls
-        with tenancy.bind_context(_cell_context("bob")):
-            assert host.branch_session("conversation", "runtime-entry")["code"] == "not_found"
-            assert host.rewind_session("conversation", "typed", 0)["code"] == "not_found"
-    finally:
-        host.shutdown()
-
-
-@pytest.mark.parametrize("key", ["api_key", "web_credential", "byok_key"])
-def test_cell_refuses_upstream_key_fields_before_launch(cell_launch_runtime, key):
-    from services.agent import request_context as tenancy
-
-    factory = CellLaunchFactory()
-    host = ChudcodeSessionHost(client_factory=factory)
-    try:
-        with tenancy.bind_context(_cell_context("alice")):
-            params = {**_cell_credentials("alice"), key: "upstream-key-forbidden"}
-            result, _ = run(host, "conversation", "run", **params)
-            assert result["reason"] == "credential_isolation_unsupported"
-            assert not factory.clients
-    finally:
-        host.shutdown()
-
-
-
-def test_cell_manager_stop_is_cancel_only_without_byok_and_audited(cell_launch_runtime):
-    from services.agent import request_context as tenancy
-
-    factory = CellLaunchFactory(block=True)
-    host = ChudcodeSessionHost(client_factory=factory)
-    owner_ctx = _cell_context("victim")
-    delegate = {"actor_key": "manager", "right": "manager", "action": "cancel"}
-    delegated_ctx = {**owner_ctx, "control_delegate": delegate}
-    output, frames = {}, []
-    thread = None
-    try:
-        with tenancy.bind_context(owner_ctx):
-            thread = threading.Thread(target=chudcode_host_module._context_callback(
-                lambda: output.setdefault("result", host.run_turn({
-                    "request": "work", "session_id": "victim-chat", "run_id": "victim-run",
-                    **_cell_credentials("victim"),
-                }, frames.append)),
-            ))
-            thread.start()
-            client = factory.created.get(timeout=2)
-            assert client.prompted.wait(2)
-            assert host.steer("victim-run", "private queued instruction",
-                              steer_id="private-steer-id")["steered"]
-        # Merely being a manager never confers access to a foreign worker registry.
-        with tenancy.bind_context({**_cell_context("manager"), "right": "manager"}):
-            assert host.cancel("victim-run")["code"] == "not_found"
-            assert host.cancel("victim-run", credential_params={
-                "control_delegate": delegate, **_cell_credentials("victim"),
-            })["code"] == "not_found"
-        with tenancy.bind_context(delegated_ctx):
-            denied = {"ok": False, "reason": "forbidden_right", "code": "forbidden_right"}
-            assert host.status(run_id="victim-run") == denied
-            assert host.steer("victim-run", "manager injection") == denied
-            assert host.answer("victim-run", "question", {}) == denied
-            assert host.close_session("victim-chat") == denied
-            assert host.release_session("victim-chat") == denied
-            assert host.session_call("victim-chat", "get_state") == denied
-            assert host.export_session("victim-chat") == denied
-            assert host.branch_session("victim-chat", "entry") == denied
-            assert host.repair_session("victim-chat") == denied
-            assert host.rewind_session("victim-chat", "work", 0) == denied
-            assert host.cancel("") == denied
-            # Trusted delegation permits Stop with no victim key or grant.
-            stopped = host.cancel("victim-run")
-            assert stopped["ok"] and stopped["cancelled"]
-            assert stopped["reason"] == "manager_stop"
-            assert stopped["control_delegate"] == delegate
-            assert "carried_steer_ids" not in stopped
-        thread.join(2)
-        assert not thread.is_alive()
-        result = output["result"]
-        assert result["cancelled"] and result["reason"] == "manager_stop"
-        assert result["control_delegate"] == delegate
-        terminal = next(frame for frame in frames if frame.get("type") == "agent_end")
-        assert terminal["reason"] == "manager_stop"
-        assert terminal["control_delegate"] == delegate
-        assert result["terminal"] == terminal
-    finally:
-        host.shutdown()
-        if thread is not None:
-            thread.join(2)
-
-
-def test_cell_manager_prestart_stop_preserves_delegate_audit(cell_launch_runtime):
-    from services.agent import request_context as tenancy
-
-    factory = CellLaunchFactory()
-    host = ChudcodeSessionHost(client_factory=factory)
-    owner_ctx = _cell_context("victim")
+    owner_ctx = _cell_context("alice")
     delegate = {"actor_key": "manager", "right": "manager", "action": "cancel"}
     try:
         with tenancy.bind_context(owner_ctx):
             session = tenancy.mint_handle("session")
             run_id = tenancy.mint_handle("run", parent=session)
+            assert host.cancel(run_id)["cancelled"]
+            result, _ = run(host, session, "path-run",
+                            chudcode_session_file="/actor/another-history.jsonl")
+            assert result["code"] == "cell_refused"
+            delegated_run = tenancy.mint_handle("run", parent=session)
         with tenancy.bind_context({**owner_ctx, "control_delegate": delegate}):
-            assert host.cancel(run_id)["reason"] == "manager_stop"
-        with tenancy.bind_context(owner_ctx):
-            result, _ = run(host, session, run_id, **_cell_credentials("victim"))
-            assert result["cancelled"] and result["reason"] == "manager_stop"
-            assert result["control_delegate"] == delegate
-            assert "prompt" not in call_names(factory.clients[0])
-    finally:
-        host.shutdown()
-
-
-def test_cell_runtime_cannot_forge_manager_stop_audit(cell_launch_runtime):
-    from services.agent import request_context as tenancy
-
-    factory = CellLaunchFactory()
-    host = ChudcodeSessionHost(client_factory=factory)
-    try:
-        with tenancy.bind_context(_cell_context("alice")):
-            assert run(host, "chat", "prime", **_cell_credentials("alice"))[0]["ok"]
-            client = factory.clients[0]
-            client.events = [
-                {"type": "agent_start"},
-                {
-                    "type": "agent_end", "isTerminal": True,
-                    "reason": "manager_stop", "stopReason": "manager_stop",
-                    "stop_reason": "manager_stop",
-                    "control_delegate": {"actor_key": "forged", "right": "manager", "action": "cancel"},
-                },
-            ]
-            result, emitted = run(host, "chat", "forged", **_cell_credentials("alice"))
-            assert result["ok"] and not result["cancelled"]
-            terminal = next(frame for frame in emitted if frame.get("type") == "agent_end")
-            assert "control_delegate" not in terminal
-            assert not any(terminal.get(key) == "manager_stop"
-                           for key in ("reason", "stopReason", "stop_reason"))
-    finally:
-        host.shutdown()
-
-
-@pytest.mark.parametrize("control", ["cancel", "steer", "answer", "status", "close", "release"])
-def test_cell_key_rotation_preserves_active_control_authorization(cell_launch_runtime, control):
-    from services.agent import request_context as tenancy
-
-    factory = CellLaunchFactory(block=True)
-    host = ChudcodeSessionHost(client_factory=factory)
-    thread = None
-    try:
-        with tenancy.bind_context(_cell_context("alice")):
-            params = _cell_credentials("alice")
-            thread = threading.Thread(target=chudcode_host_module._context_callback(
-                lambda: run(host, "conversation", "controlled", **params),
-            ))
-            thread.start()
-            client = factory.created.get(timeout=2)
-            assert client.prompted.wait(2)
-            # Rotation/deletion happens only in the host broker; actor controls
-            # need neither the old key nor a newly minted grant.
-            controls = {
-                "cancel": lambda: host.cancel("controlled"),
-                "steer": lambda: host.steer("controlled", "x"),
-                "answer": lambda: host.answer("controlled", "q", {}),
-                "status": lambda: host.status(run_id="controlled"),
-                "close": lambda: host.close_session("conversation"),
-                "release": lambda: host.release_session("conversation"),
-            }
-            result = controls[control]()
-            assert result.get("code") != "not_found", result
-            if control in ("cancel", "steer", "status", "close"):
-                assert result["ok"], result
-            elif control == "release":
-                assert result["reason"] == "session_busy"
-            else:
-                assert result["active"] and result["reason"] == "question is no longer pending"
-    finally:
-        host.shutdown()
-        if thread is not None:
-            thread.join(2)
-            assert not thread.is_alive()
-
-
-def test_cell_broker_turns_keep_client_and_resume_the_same_history(cell_launch_runtime):
-    from services.agent import request_context as tenancy
-
-    factory = CellLaunchFactory()
-    host = ChudcodeSessionHost(client_factory=factory)
-    restarted = None
-    try:
-        with tenancy.bind_context(_cell_context("alice")):
-            params = _cell_credentials("alice")
-            assert run(host, "conversation", "first", request="first", **params)[0]["ok"]
-            original = factory.clients[0]
-            history = original.session_file
-            identity = chudcode_host_module._credential_identity(params)
-            rotated = dict(params)
-            assert chudcode_host_module._credential_identity(rotated) == identity
-            assert run(host, "conversation", "second", request="second", **rotated)[0]["ok"]
-            assert factory.clients == [original]
-            assert original.stop_count == 0
-            assert original.kwargs["env"]["CHUDWARE_PROVIDER_GRANT"] == params["web_provider_grant"]
-            assert "switch_session" not in call_names(original)
-            assert Path(history).read_text().splitlines() == ["first", "second"]
-            assert host.release_session("conversation", credential_params=rotated)["released"]
-            host.shutdown()
-            restarted = ChudcodeSessionHost(client_factory=factory)
-            assert run(restarted, "conversation", "third", request="third", **rotated)[0]["ok"]
-            assert factory.clients[-1].session_file == history
-            assert Path(history).read_text().splitlines() == ["first", "second", "third"]
-    finally:
-        host.shutdown()
-        if restarted is not None:
-            restarted.shutdown()
-
-
-def test_cell_cancel_before_first_persist_preserves_same_client(cell_launch_runtime):
-    from services.agent import request_context as tenancy
-
-    class FirstExchangeUnpersistedFactory(CellLaunchFactory):
-        def __call__(self, **kwargs):
-            client = super().__call__(**kwargs)
-            if len(self.clients) == 1:
-                Path(client.session_file).unlink()
-                client.prompt = lambda message, images=None: QueueingClient.prompt(
-                    client, message, images=images,
-                )
-            return client
-
-    factory = FirstExchangeUnpersistedFactory(block=True)
-    host = ChudcodeSessionHost(client_factory=factory)
-    thread = None
-    completed = {}
-    try:
-        with tenancy.bind_context(_cell_context("alice")):
-            params = _cell_credentials("alice")
-            thread = threading.Thread(target=chudcode_host_module._context_callback(
-                lambda: completed.update(result=run(host, "conversation", "first", **params)[0]),
-            ))
-            thread.start()
-            original = factory.created.get(timeout=2)
-            assert original.prompted.wait(2)
-            assert host.cancel("first")["cancelled"]
-            thread.join(2)
-            assert not thread.is_alive()
-            assert completed["result"]["cancelled"]
-            assert not Path(original.session_file).exists()
-            original.prompt = lambda message, images=None: (
-                Path(original.session_file).write_text(message + "\n"),
-                QueueingClient.prompt(original, message, images=images),
-            )[-1]
-            result = run(host, "conversation", "second", request="second", **params)[0]
-            assert result["ok"], result
-            assert result["session_id"] == "conversation"
-            replacement = factory.clients[-1]
-            assert replacement is original and original.stop_count == 0
-            assert replacement.kwargs["env"]["CHUDWARE_PROVIDER_GRANT"] == params["web_provider_grant"]
-            assert "switch_session" not in call_names(replacement)
-            assert Path(replacement.session_file).read_text().splitlines() == ["second"]
-    finally:
-        host.shutdown()
-        if thread is not None:
-            thread.join(2)
-            assert not thread.is_alive()
-
-
-@pytest.mark.parametrize("provider,native", [
-    ("anthropic", "anthropic"), ("openai", "openai"), ("xai", "xai"),
-    ("openrouter", "openrouter"), ("gemini", "google"),
-])
-def test_cell_broker_config_uses_native_catalog_and_only_opaque_grant(
-    cell_launch_runtime, provider, native
-):
-    from services.agent import request_context as tenancy
-    factory = CellLaunchFactory()
-    host = ChudcodeSessionHost(client_factory=factory)
-    try:
-        with tenancy.bind_context(_cell_context("alice")):
-            params = {**_cell_credentials("alice"), "web_provider": provider,
-                      "provider": native}
-            assert run(host, "conversation", "run", **params)[0]["ok"]
-            env = factory.clients[0].kwargs["env"]
-            model_path = Path(env["PI_CODING_AGENT_DIR"]) / "models.yml"
-            providers = json.loads(model_path.read_text())["providers"]
-            assert set(providers) == {native}
-            override = providers[native]
-            assert override["baseUrl"] == chudcode_host_module._CELL_PROVIDER_BASES[provider]
-            assert override["apiKey"] == "CHUDWARE_PROVIDER_GRANT"
-            assert "models" not in override
-            assert env["CHUDWARE_PROVIDER_GRANT"] == params["web_provider_grant"]
-            assert all(not value for key, value in env.items() if key.endswith("_API_KEY"))
-            assert model_path.stat().st_mode & 0o777 == 0o600
-            assert params["web_provider_grant"] not in model_path.read_text()
-            if provider == "anthropic":
-                assert override["compat"] == {
-                    "supportsEagerToolInputStreaming": True, "replayUnsignedThinking": False,
-                }
-    finally:
-        host.shutdown()
-
-
-@pytest.mark.parametrize("data", [None, "", "upstream-key", "cpg1.a.b\n", "cpg1." + "a" * 4096 + ".b"])
-def test_cell_invalid_grant_is_refused_before_client_creation(cell_launch_runtime, data):
-    from services.agent import request_context as tenancy
-    factory = CellLaunchFactory()
-    host = ChudcodeSessionHost(client_factory=factory)
-    try:
-        with tenancy.bind_context(_cell_context("alice")):
-            params = {**_cell_credentials("alice"), "web_provider_grant": data}
-            assert run(host, "conversation", "run", **params)[0]["reason"] == "provider_grant_missing"
-            assert not factory.clients
+            stopped = host.cancel(delegated_run)
+            assert stopped["reason"] == "manager_stop"
+            assert stopped["control_delegate"] == delegate
+        with tenancy.bind_context(_cell_context("bob")):
+            assert host.cancel(run_id)["code"] == "not_found"
+        assert not factory.clients
     finally:
         host.shutdown()
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/gate.sh — the Linux build + test gate for Chudware.
 #
-# Every DAG node must leave this gate green before close. Stages, in execution order:
+# Run it before pushing; CI runs it with CHUDWARE_GATE_STRICT=1. Stages, in execution order:
 #   check.py           — source/audit gate using the provisioned runtime interpreter. FATAL.
 #   manual regen clean — docs/manual/*.md drift vs tools/manual_gen (advisory).
 #   core build         — libchudware with -DCHUDWARE_WITH_OCCT=ON. Environment SKIP when the
@@ -15,14 +15,15 @@
 #                        bridge disabled (scripts/web_parity_probe.py).
 #   appimage smoke     — opt-in (CHUDWARE_GATE_APPIMAGE=1), advisory.
 #   linux packages     — packaging suite (distro artifacts, signing, evidence, finalization).
-#   pytest             — per-unit sweep of services/*, services/test_*.py, scripts, assets,
-#                        tools and training with the service venv. Failures are FATAL.
+#   pytest             — per-unit sweep of services/*, services/test_*.py, scripts, assets
+#                        and tools with the service venv. Failures are FATAL.
 #   vv-bench, modeling — opt-in (CHUDWARE_RUN_VV, CHUDWARE_RUN_MODELING).
-#   fin25 golden demo  — T-FIN25 sensor-node sim/fw content smoke (scripts/demo_sensor_node.py);
-#                        default on, Renode/OpenFOAM-gated legs SKIP honestly via marker files.
+#   sensor-node demo   — STM32 sensor-node board/firmware/thermal/power demo
+#                        (scripts/demo_sensor_node.py); default on, Renode/OpenFOAM-gated
+#                        legs SKIP honestly via marker files.
 #   E2E benches        — opt-in (CHUDWARE_RUN_BENCH_FC, CHUDWARE_RUN_BENCH_CHG).
 #   host shot          — CHUDWARE_SHOT=m1 + copilot_slash headless screenshots via xvfb-run.
-#   bench, perf        — opt-in (CHUDWARE_RUN_BENCH, CHUDWARE_RUN_PERF).
+#   perf               — opt-in (CHUDWARE_RUN_PERF).
 # Then a PASS/SKIP/FAIL summary; exit 1 on any fatal stage failure.
 #
 # SKIP semantics: OCCT-absent, emsdk-absent and venv-absent are environment SKIPs, not
@@ -94,12 +95,10 @@ skip_stage() {
 }
 
 # ---- Runtime python discovery ------------------------------------------------
-# The provisioned service venv has moved with the product's rebrands (AI-CAD -> Billet ->
-# Chudware) and a repo-local .venv-mcp also exists on dev boxes. Every stage below used to
-# hardcode ONLY the Chudware path, so on a box where the venv still lives under the legacy
-# AI-CAD name the pytest stage reported SKIP and the gate went green without running a
-# single Python test — a false green. Probe the whole ladder, newest name first, and export
-# the answer once so every stage agrees on the runner.
+# Probe the provisioned service venv, then a repo-local .venv-mcp and the conventional
+# local venv names, and export the answer once so every stage agrees on the runner. A
+# stage that hardcoded a single path would SKIP on a box whose venv lives elsewhere and
+# the gate would go green without running a single Python test — a false green.
 #
 # Override with CHUDWARE_GATE_PYTHON=/path/to/python to pin a specific interpreter.
 GATE_PY=""
@@ -110,8 +109,6 @@ resolve_gate_python() {
     for cand in \
         "${CHUDWARE_GATE_PYTHON:-}" \
         "$HOME/.local/share/Chudware/mcp-venv/bin/python" \
-        "$HOME/.local/share/Billet/mcp-venv/bin/python" \
-        "$HOME/.local/share/AI-CAD/mcp-venv/bin/python" \
         "$REPO/.venv-mcp/bin/python" \
         runtime/venv/bin/python .venv/bin/python venv/bin/python
     do
@@ -160,7 +157,7 @@ stage_check() {
     fi
 }
 
-# ---- manual regen clean (advisory, T-Q4) --------------------------------------
+# ---- manual regen clean (advisory) --------------------------------------------
 # Drift check for the auto-generated docs/manual/*.md (tools/manual_gen.py): regenerates the
 # manual in-memory from the ribbon inventory + cad_guide prose + contracts summary and byte-
 # compares it against the committed baseline. Advisory — never sets fail_fatal —
@@ -219,7 +216,7 @@ stage_core_build() {
     # builds -O0 (the -O3/-DNDEBUG live in CMAKE_CXX_FLAGS_RELEASE, only applied for a Release
     # build type), and the `--config Release` on the build/ctest lines below is a NO-OP on
     # single-config Ninja. Omitting it shipped an unoptimized libchudware — the FEA solver ran
-    # ~16x slower (sim ctests 34s -> 2s once Release was set). See docs/REFACTOR_LOG.md.
+    # ~16x slower (sim ctests 34s -> 2s once Release was set).
     if ! CCACHE_DISABLE=1 cmake -S core -B "$build_dir" -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_WITH_OCCT=ON -G Ninja > ${GATE_TMP}/cfg.out 2>&1; then
         record "core build          FAIL    cmake configure failed (see ${GATE_TMP}/cfg.out)"
         echo "  FAIL: configure"
@@ -274,12 +271,12 @@ stage_host_build() {
     HOST_BUILD_OK=1
 }
 
-# ---- wasm build: WASM web-client build smoke (T-RF3) --------------------------
+# ---- wasm build: WASM web-client build smoke ----------------------------------
 # The web app is the same host/ tree compiled by Emscripten; a native-only break of the
 # WASM build is a web-parity regression, so this stage is FATAL when the toolchain is
 # provisioned and the build breaks. SKIPs honestly when emsdk is absent. Stages into
-# $GATE_TMP/wasm-app via CHUDWARE_WEB_APP so a live web deploy (~/chudware-web/app) is
-# never clobbered.
+# $GATE_TMP/wasm-app via CHUDWARE_WEB_APP so build.sh's default web-app stage
+# (~/chudware-web/app) is never clobbered.
 stage_wasm_smoke() {
     echo "=== WASM web-client build smoke ==="
     local emsdk_dir="${EMSDK:-$HOME/.emsdk}"
@@ -345,7 +342,7 @@ stage_hostd_smoke() {
     fi
 }
 
-# ---- web parity probe (contracts/web_parity.md, T-RF3) ------------------------
+# ---- web parity probe (contracts/web_parity.md) -------------------------------
 # Spawns a scratch chudware-hostd with the Python worker bridge disabled (exactly what the
 # WASM web client faces) and asserts contracts/web_parity.md: web_required methods are
 # libchudware-served, web_unsupported gaps fail loud. FATAL when a hostd binary exists —
@@ -443,7 +440,7 @@ stage_appimage_smoke() {
 # ---- linux packages: Linux distro packaging -----------------------------------
 # packaging/test_linux_packages.py builds .deb and .rpm from a small synthetic
 # AppDir and asserts the ar member order, the control/spec metadata, the
-# prerelease version sanitisation the gateway's _canonical_artifact() agrees
+# prerelease version sanitisation packaging/artifact_names.py's canonical_artifact() agrees
 # with, byte-for-byte determinism, and that packaging never mutates the signed
 # payload. No network, ~2s. Unlike the AppImage smoke above this needs no GUI,
 # no Xvfb and no real build tree, so it runs by default rather than opt-in.
@@ -472,9 +469,9 @@ stage_linux_packages() {
 }
 
 # ---- pytest: per-unit Python sweep --------------------------------------------
-# Uses the service venv discovered by resolve_gate_python() (Chudware, then the legacy
-# Billet/AI-CAD names, then the repo-local .venv-mcp). Emits a loud environment SKIP when
-# none is found so engineers know the gate is not running real suites.
+# Uses the service venv discovered by resolve_gate_python() (the provisioned Chudware
+# venv, then the repo-local .venv-mcp). Emits a loud environment SKIP when none is found
+# so engineers know the gate is not running real suites.
 #
 # CHUDWARE_LIBCHUDWARE is set to the built libchudware.so when it exists and the caller
 # has not already set it. Without a loadable .so core-calling tests skip or deselect; the
@@ -555,8 +552,7 @@ stage_pytest() {
             [ -f "$f" ] && dirs+=("$f")
         done
     fi
-    dirs+=("tools" "training")
-    dirs+=("scripts" "assets")
+    dirs+=("tools" "scripts" "assets")
 
     # Coverage guard: every test file under services/ must be reachable from exactly
     # one unit above. If the glob enumeration ever loses a suite (renamed subpackage,
@@ -756,33 +752,9 @@ stage_host_shot() {
     fi
 }
 
-# ---- bench (T-H8): model-eval bench smoke -------------------------------------
-# Optional, env-gated SKIP like the OCCT stages: runs the product-task eval benches at
-# smoke size. Default is SKIP (stays green) so the gate does not depend on the flywheel;
-# set CHUDWARE_RUN_BENCH=1 to opt in, and then a bench error DOES fail the gate. The bench
-# framework is stdlib-only, so it needs nothing but python3.
-stage_bench() {
-    echo "=== model-eval bench smoke (T-H8) ==="
-    if [ "${CHUDWARE_RUN_BENCH:-0}" != "1" ]; then
-        skip_stage optin "bench (T-H8)" "set CHUDWARE_RUN_BENCH=1 to run smoke-size eval benches" "CHUDWARE_RUN_BENCH not set"
-        return 0
-    fi
-    if ! command -v python3 >/dev/null 2>&1; then
-        skip_stage env "bench (T-H8)" "python3 not on PATH" "python3 not installed"
-        return 0
-    fi
-    if ! python3 -m tools.flywheel.bench.runner --smoke --all --no-write > ${GATE_TMP}/bench.out 2>&1; then
-        record "bench (T-H8)        FAIL    a smoke bench errored (see ${GATE_TMP}/bench.out)"
-        echo "  FAIL: bench smoke"; tail -n 15 ${GATE_TMP}/bench.out | sed 's/^/    /'
-        fail_fatal=1
-        return 0
-    fi
-    record "bench (T-H8)        PASS    smoke benches ran ($(rg -c 'baselines\[' ${GATE_TMP}/bench.out 2>/dev/null || echo '?') reported)"
-    echo "  PASS"; tail -n 8 ${GATE_TMP}/bench.out | sed 's/^/    /'
-}
-
 # ---- perf-regression: modeling perf (tools/perf_regression.py) ----------------
-# Times the kernel against CHUDWARE_PERF_BASELINE (default tools/perf_baseline.json).
+# Times the kernel against CHUDWARE_PERF_BASELINE (default tools/perf_baseline.json, a
+# machine-local record the first run creates; it is never committed).
 # Env-gated (perf timings are machine + load sensitive, so this is NOT a hard blocker by
 # default): set CHUDWARE_RUN_PERF=1 to run. A regression is RECORDED (non-fatal) unless
 # CHUDWARE_PERF_FATAL=1. Needs a loadable .so — prefers this gate's core/build-linux
@@ -824,7 +796,7 @@ stage_perf() {
     fi
 }
 
-# ---- vv-bench (T-BL01): V&V benchmark smoke -----------------------------------
+# ---- vv-bench: V&V benchmark smoke --------------------------------------------
 # Optional, env-gated SKIP: runs the V&V benchmark harness in smoke mode. Smoke needs no
 # .so; its native-RPC cases (hydraulic/piping/ECAD) skip with the loader reason unless a
 # libchudware.so is found (the stage wires core/build-linux when CHUDWARE_LIBCHUDWARE is unset).
@@ -833,13 +805,13 @@ stage_perf() {
 # - CHUDWARE_RUN_VV=smoke  → pytest scripts/vv_benchmark.py::TestSmoke  (fast; .so optional)
 # - CHUDWARE_RUN_VV=full   → pytest scripts/vv_benchmark.py  (all suites, needs .so + deps)
 stage_vv() {
-    echo "=== V&V benchmark smoke (T-BL01) ==="
+    echo "=== V&V benchmark smoke ==="
     if [ -z "${CHUDWARE_RUN_VV:-}" ]; then
-        skip_stage optin "vv-bench (T-BL01)" "set CHUDWARE_RUN_VV=smoke or =full to run V&V harness" "CHUDWARE_RUN_VV not set"
+        skip_stage optin "vv-bench" "set CHUDWARE_RUN_VV=smoke or =full to run V&V harness" "CHUDWARE_RUN_VV not set"
         return 0
     fi
     if ! command -v python3 >/dev/null 2>&1; then
-        skip_stage env "vv-bench (T-BL01)" "python3 not on PATH" "python3 not installed"
+        skip_stage env "vv-bench" "python3 not on PATH" "python3 not installed"
         return 0
     fi
 
@@ -866,14 +838,14 @@ stage_vv() {
             "${pytest_args[@]}" -q --tb=short > ${GATE_TMP}/vv.out 2>&1; then
         local summary_line
         summary_line="$(grep -E '[0-9]+ passed' ${GATE_TMP}/vv.out | tail -1 || echo 'ok')"
-        record "vv-bench (T-BL01)   PASS    $summary_line"
+        record "vv-bench            PASS    $summary_line"
         echo "  PASS ($summary_line)"
     else
         local rc=$?
         if [ "$rc" -eq 5 ]; then
-            skip_stage env "vv-bench (T-BL01)" "no tests collected (check venv + deps)" "no tests collected"
+            skip_stage env "vv-bench" "no tests collected (check venv + deps)" "no tests collected"
         else
-            record "vv-bench (T-BL01)   FAIL    pytest exit $rc (see ${GATE_TMP}/vv.out)"
+            record "vv-bench            FAIL    pytest exit $rc (see ${GATE_TMP}/vv.out)"
             echo "  FAIL: V&V suite (see ${GATE_TMP}/vv.out):"
             tail -n 15 ${GATE_TMP}/vv.out | sed 's/^/    /'
             fail_fatal=1
@@ -881,7 +853,7 @@ stage_vv() {
     fi
 }
 
-# ---- modeling (T-BL19): modeling-op combination battery -----------------------
+# ---- modeling: modeling-op combination battery --------------------------------
 # Optional, env-gated SKIP: drives the C++ feature engine through every registered
 # modeling op + a pairwise/sequence matrix and asserts on live geometry. Default is
 # SKIP (stays green) so the normal gate never depends on the OCCT .so; opt in with:
@@ -890,13 +862,13 @@ stage_vv() {
 # NOTE: full mode needs the OCCT geometry kernel (core/build-occt-linux/bin/libchudware.so);
 # the plain build-linux .so has no geometry and would ALL-SKIP (which the battery fails).
 stage_modeling() {
-    echo "=== Modeling-op combination battery (T-BL19) ==="
+    echo "=== Modeling-op combination battery ==="
     if [ -z "${CHUDWARE_RUN_MODELING:-}" ]; then
-        skip_stage optin "modeling (T-BL19)" "set CHUDWARE_RUN_MODELING=smoke or =full" "CHUDWARE_RUN_MODELING not set"
+        skip_stage optin "modeling" "set CHUDWARE_RUN_MODELING=smoke or =full" "CHUDWARE_RUN_MODELING not set"
         return 0
     fi
     if ! command -v python3 >/dev/null 2>&1; then
-        skip_stage env "modeling (T-BL19)" "python3 not on PATH" "python3 not installed"
+        skip_stage env "modeling" "python3 not on PATH" "python3 not installed"
         return 0
     fi
 
@@ -924,14 +896,14 @@ stage_modeling() {
             "${pytest_args[@]}" -q --tb=short > ${GATE_TMP}/modeling.out 2>&1; then
         local summary_line
         summary_line="$(grep -E '[0-9]+ passed' ${GATE_TMP}/modeling.out | tail -1 || echo 'ok')"
-        record "modeling (T-BL19)   PASS    $summary_line"
+        record "modeling            PASS    $summary_line"
         echo "  PASS ($summary_line)"
     else
         local rc=$?
         if [ "$rc" -eq 5 ]; then
-            skip_stage env "modeling (T-BL19)" "no tests collected (check venv + deps)" "no tests collected"
+            skip_stage env "modeling" "no tests collected (check venv + deps)" "no tests collected"
         else
-            record "modeling (T-BL19)   FAIL    pytest exit $rc (see ${GATE_TMP}/modeling.out)"
+            record "modeling            FAIL    pytest exit $rc (see ${GATE_TMP}/modeling.out)"
             echo "  FAIL: modeling battery (see ${GATE_TMP}/modeling.out):"
             tail -n 15 ${GATE_TMP}/modeling.out | sed 's/^/    /'
             fail_fatal=1
@@ -939,25 +911,25 @@ stage_modeling() {
     fi
 }
 
-# ---- fin25 golden demo: T-FIN25 sensor-node sim/fw content smoke --------------
+# ---- sensor-node demo: STM32 sensor-node board/firmware/thermal/power ---------
 # Default ON (bounded <5 min). Legs that need Renode/OpenFOAM write SKIP markers
-# when those binaries are absent — never fake a pass. Opt out with CHUDWARE_SKIP_FIN25=1.
-# Fast dry thermal: CHUDWARE_FIN25_THERMAL_DRY=1. Artifacts under $GATE_TMP/fin25/.
-stage_fin_content() {
-    echo "=== T-FIN25 sensor-node golden demo ==="
-    if [ "${CHUDWARE_SKIP_FIN25:-}" = "1" ]; then
-        skip_stage optin "fin25 golden demo" "CHUDWARE_SKIP_FIN25=1" "CHUDWARE_SKIP_FIN25=1"
+# when those binaries are absent — never fake a pass. Opt out with CHUDWARE_SKIP_SENSOR_DEMO=1.
+# Fast dry thermal: CHUDWARE_SENSOR_DEMO_THERMAL_DRY=1. Artifacts under $GATE_TMP/sensor_node_demo/.
+stage_sensor_node_demo() {
+    echo "=== sensor-node demo ==="
+    if [ "${CHUDWARE_SKIP_SENSOR_DEMO:-}" = "1" ]; then
+        skip_stage optin "sensor-node demo" "CHUDWARE_SKIP_SENSOR_DEMO=1" "CHUDWARE_SKIP_SENSOR_DEMO=1"
         return 0
     fi
     if [ ! -f "$REPO/scripts/demo_sensor_node.py" ]; then
-        skip_stage env "fin25 golden demo" "scripts/demo_sensor_node.py missing" "demo script missing"
+        skip_stage env "sensor-node demo" "scripts/demo_sensor_node.py missing" "demo script missing"
         return 0
     fi
 
     local venv_py=""
     venv_py="$(gate_python_or_system)"
     if [ -z "$venv_py" ]; then
-        skip_stage env "fin25 golden demo" "no python3" "python3 not installed"
+        skip_stage env "sensor-node demo" "no python3" "python3 not installed"
         return 0
     fi
 
@@ -969,16 +941,16 @@ stage_fin_content() {
         done
     fi
 
-    local out="${GATE_TMP}/fin25"
+    local out="${GATE_TMP}/sensor_node_demo"
     mkdir -p "$out"
-    export CHUDWARE_FIN25_OUT="$out"
-    export CHUDWARE_FIN25_MARKERS="$out/markers"
+    export CHUDWARE_SENSOR_DEMO_OUT="$out"
+    export CHUDWARE_SENSOR_DEMO_MARKERS="$out/markers"
     export CHUDWARE_PROJECT_DIR="${CHUDWARE_PROJECT_DIR:-$out/project}"
 
     local rc=0
     PYTHONPATH="$REPO:${PYTHONPATH:-}" \
             "$venv_py" "$REPO/scripts/demo_sensor_node.py" \
-            > "${GATE_TMP}/fin25.out" 2>&1 || rc=$?
+            > "${GATE_TMP}/sensor_node_demo.out" 2>&1 || rc=$?
 
     # Summarise per-leg markers (PASS/FAIL/SKIP) for the gate line.
     local n_pass=0 n_fail=0 n_skip=0
@@ -987,15 +959,15 @@ stage_fin_content() {
         n_fail=$(grep -l '^FAIL' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ' || true)
         n_skip=$(grep -l '^SKIP' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ' || true)
     fi
-    local detail="pass=$n_pass fail=$n_fail skip=$n_skip (see ${GATE_TMP}/fin25.out)"
+    local detail="pass=$n_pass fail=$n_fail skip=$n_skip (see ${GATE_TMP}/sensor_node_demo.out)"
 
     if [ "$rc" -eq 0 ] && [ "$n_fail" = "0" ]; then
-        record "fin25 golden demo   PASS    $detail"
+        record "sensor-node demo    PASS    $detail"
         echo "  PASS ($detail)"
     else
-        record "fin25 golden demo   FAIL    exit=$rc $detail"
-        echo "  FAIL: fin25 golden demo (see ${GATE_TMP}/fin25.out):"
-        tail -n 20 "${GATE_TMP}/fin25.out" | sed 's/^/    /'
+        record "sensor-node demo    FAIL    exit=$rc $detail"
+        echo "  FAIL: sensor-node demo (see ${GATE_TMP}/sensor_node_demo.out):"
+        tail -n 20 "${GATE_TMP}/sensor_node_demo.out" | sed 's/^/    /'
         fail_fatal=1
     fi
 }
@@ -1072,11 +1044,10 @@ stage_linux_packages
 stage_pytest
 stage_vv
 stage_modeling
-stage_fin_content
+stage_sensor_node_demo
 stage_bench_flight_computer
 stage_bench_battery_charger
 stage_host_shot
-stage_bench
 stage_perf
 
 echo

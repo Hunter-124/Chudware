@@ -2663,7 +2663,7 @@ void drawEcadEditor(AppState& st) {
     prevHadDoc = hasDocNow;
 
     // Zero window padding so the PCB canvas is full-bleed like the 3D viewport — its edges reach the
-    // ribbon, the window sides, and the status bar (Hunter round: extend the grid flush to the frame
+    // ribbon, the window sides, and the status bar (the grid extends flush to the frame
     // so the PCB Manager / file strip / copilot get their proper spacing around it).
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     const bool ecadOpen = ImGui::Begin("ECAD");
@@ -2718,7 +2718,7 @@ void drawEcadEditor(AppState& st) {
 
     // PCB reclaims the WHOLE height — the DRC/unrouted readout moved to the ribbon band's dead space
     // (drawEcadRibbonStatus, called from app.cpp), so the board canvas now reaches the bottom of the
-    // screen exactly like the Model tab's 3D viewport (Hunter red-pen). The schematic keeps a bottom
+    // screen exactly like the Model tab's 3D viewport. The schematic keeps a bottom
     // strip: it hosts the ERC list AND the simulation waveform plot, which have nowhere else to live.
     const float bottomH = ecadBottomStripHeight(st, es.mirror);
     const ImVec2 avail = ImGui::GetContentRegionAvail();

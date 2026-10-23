@@ -4,7 +4,7 @@
 
 10 engine commits, 660 tests green (0 failed). Summary of jumps:
 
-- **Surfacing**: 0% → 47% — all 15 surface features implemented in engine (surf_planar / extrude / revolve / sweep / loft / offset / ruled / boundary / fill / knit / thicken / trim / untrim / delete_face / replace_face) plus the surface-body foundation (body `kind`, two-sided render, area mass). Host ribbon/PM forms not yet wired — all 18 changed rows are `partial` pending the host rework agent.
+- **Surfacing**: 0% → 47% — all 15 surface features implemented in engine (surf_planar / extrude / revolve / sweep / loft / offset / ruled / boundary / fill / knit / thicken / trim / untrim / delete_face / replace_face) plus the surface-body foundation (body `kind`, two-sided render, area mass). Host ribbon/PM forms not yet wired — all 18 changed rows are `partial` pending the host GUI work.
 - **Part Features**: 46% → 51% — full SW option matrix added to engine (extrude end conditions + Dir2 + thin; revolve Dir2/mid/up-to-surface/thin/centerline; sweep guides/twist/orientation/thin; loft guides/centerline/tangency/thin; fillet face-fillet/conic/tangent-prop; chamfer angle×distance/vertex; shell multi-thickness; draft parting-line/step; rib explicit drop dir; hole ANSI/UNC/BSP/NPT tables + cosmetic-thread record + sketch-point positions; linear/circular pattern skip/vary/bidirectional; mirror bodies+merge; reference plane/axis/point extra methods; helix variable-pitch + flat spiral; non-planar split). All host PM forms pending — new rows stay `partial`.
 - **Sketcher**: 80% → 81% — curve↔curve tangent constraint now covers all arc/spline/conic combinations (test_sketch_tangent.py); the P0 gap is closed.
 - **Drawings**: 33% → 37% — radial, diameter, angular dimensions + center marks/lines added to engine (test_drawing_dims_ext.py) via arc extraction through HLR projection; host rendering annotation polish pending.
@@ -21,7 +21,9 @@ current test results or current source paths.
 
 **Scope:** Mechanical CAD parity is measured against SolidWorks 2020–2025. The ECAD /
 Electronics area has no SolidWorks analog and is measured against a KiCad-class baseline;
-every ECAD item is a beyond-SW differentiator by definition.
+every ECAD item is a beyond-SW differentiator by definition. SOLIDWORKS is a trademark of
+Dassault Systèmes and KiCad is a trademark of the KiCad project; both are named only to
+identify the comparison baselines. Chudware is not affiliated with or endorsed by either.
 
 **Status vocabulary**
 - **done** — the SW acceptance condition is met with concrete, named evidence (engine + host where a UI is implied).
@@ -141,7 +143,7 @@ Rotate Entities now has a dedicated selection/center/angle tool.
 | Along X / Along Y distance | H/V component variants of distance dim | done | axis='h'/'v'; dimAxis_ |
 | Dimension to a datum plane | Reference dim to front/top/right plane | done | addPlaneDimRef(); sketch_project_ref |
 | Offset with caps / bi-directional | End caps + two-sided offset | **missing** | offset_chain has no cap/bidirectional param |
-| Instant3D sketch dim handle drag | Drive dim from 3D view (not in sketch) | done | doc_push_pull/doc_instant3d (W9) |
+| Instant3D sketch dim handle drag | Drive dim from 3D view (not in sketch) | done | doc_push_pull/doc_instant3d |
 
 ---
 
@@ -499,7 +501,7 @@ mesh-quality, probe or coordinate-system acceptance condition.
 | Draft Analysis | Pull direction + threshold color map | done | rpc `eval_draft`; `host/src/ui/evaluate_dialogs.cpp` Pull X/Y/Z/-Z and angle controls |
 | Thickness Analysis | Per-vertex wall thickness color map | done | rpc `eval_thickness`; `core/doc/session.cpp`; host field overlay |
 | Curvature Analysis | Mean/Gaussian/max curvature color map | done | rpc `eval_curvature`; `host/src/ui/evaluate_dialogs.cpp` mean/Gaussian/max/min controls |
-| Zebra Stripes | Reflected stripes for G1/G2 inspection | done | setZebra; GLSL zebra (W23c) |
+| Zebra Stripes | Reflected stripes for G1/G2 inspection | done | setZebra; GLSL zebra |
 | Symmetry Check | (SW has none) mirror-and-diff symmetry test | **beyond** | rpc `eval_symmetry`; `core/doc/session.cpp`; `host/src/ui/evaluate_dialogs.cpp` Front/Top/Right plane picker |
 | Dynamic Section View | Up to 3 planes, drag offset, hatch, save view | **partial** | `host/src/ui/section_tool.cpp` SectionTool; full multi-plane/drag/hatch/saved-view acceptance remains unverified |
 | Linear Static FEA | Material/fixtures/loads/mesh + von-Mises/principal/disp/strain/FoS/reactions/probe | **partial** | rpc `sim_run_static`/`sim_run_adaptive`; `core/sim/fea_static.cpp`; tet4/tet10, material and reaction paths exist; full picked-node probe/UI acceptance remains unverified |

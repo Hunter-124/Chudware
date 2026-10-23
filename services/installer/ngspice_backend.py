@@ -1,4 +1,4 @@
-"""Optional ngspice subprocess backend for the circuit simulator (T-FIN14).
+"""Optional ngspice subprocess backend for the circuit simulator.
 
 The validated MNA solver (C++ ``sim_spice``; formerly :mod:`engine.sim.circuit`)
 stays the deterministic DEFAULT. This module runs the SAME Circuit dict + study through a

@@ -1,9 +1,9 @@
 """View-SET features for the ViewNet utility model (numpy only).
 
 This module is the ONE source of utility features: the planner scores candidate sets with it at
-inference and the trainer (training/viewpoint/utility) imports it to build its tensors, so the
-two can never drift. Anything that changes a feature's meaning bumps FEATURE_SCHEMA, and a
-model trained against another schema is refused (model.UtilityModel.load).
+inference, and any trained weights must be produced from the same tensors, so the two can never
+drift. Anything that changes a feature's meaning bumps FEATURE_SCHEMA, and a model trained
+against another schema is refused (model.UtilityModel.load).
 
 Input is the measured `doc_view_metrics` response as returned by
 services.mcp.shot_planner.view_metrics: a doc-wide face table (joined to doc_query ordinals),

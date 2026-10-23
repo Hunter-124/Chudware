@@ -172,11 +172,9 @@ public:
     // attachments, no in-flight call and no recent traffic is a PARKED connection, not
     // work: Server::idleExpired refuses to let one pin the daemon forever.
     bool hasAttachments(int clientId);
-    // Shared fail-closed classification used by daemon containment. Methods not
+    // Fail-closed read classification for cell (tenant) authorization. Methods not
     // listed here are treated as protected even when the engine does not know them.
     static bool isReadOnlyMethod(const std::string& method);
-    // Original document-only predicate for desktop entitlement and edit policy.
-    static bool isDesktopReadOnlyMethod(const std::string& method);
 
 
 private:

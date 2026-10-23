@@ -190,10 +190,9 @@ void parseBridgeWindows(const nlohmann::json& wins, std::vector<UsageWindow>& ou
 // ---- polling -----------------------------------------------------------------------------------
 
 // Subscription accounts and usage describe the OPERATOR's subscriptions: on web there is one
-// shared engine process, so the gateway refuses subscription_* for any non-admin account
-// (Webservice/gateway/engine_bridge.py). Returning here keeps the browser from re-asking on every
-// TTL tick and logging a refusal each time; the surfaces that consume this model already render
-// their "unavailable" path on an empty model.
+// shared engine process and the browser build has no provider credential path, so the web client
+// never polls them. The surfaces that consume this model already render their "unavailable" path
+// on an empty model.
 void providerUsagePollUsage(AppState& st, bool force) {
     if (g.rpcMissing || webBuild()) return;
     if (!force && !startupPollReady(st)) return;
@@ -258,7 +257,7 @@ void providerUsagePollBridge(AppState& st, const char* bridgeProviderId, bool fo
 }
 
 void providerUsagePollAccounts(AppState& st, double ttlSec, bool force) {
-    if (webBuild()) return;  // operator-owned; refused for non-admins over the web bridge
+    if (webBuild()) return;  // operator-owned; the web client has no provider credential path
     if (!force && !startupPollReady(st)) return;
     providerUsagePollStatus(st, ttlSec, force);
     const double now = ImGui::GetTime();

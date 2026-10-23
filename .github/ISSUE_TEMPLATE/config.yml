@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Hunter-124/Chudware/security/advisories/new
+    about: Please report security issues privately rather than in a public issue.
+  - name: Chudware website
+    url: https://chudware.com
+    about: Downloads, documentation and project news.

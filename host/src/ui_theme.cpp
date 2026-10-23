@@ -1375,7 +1375,7 @@ void drawScrollPill(ImDrawList* dl, const ImVec2& trackMin, const ImVec2& trackM
                     const AdaptiveSurface& surf, float thickness) {
     const float s = ui::uiScale;
     // A thin track runs down the CENTER of the band; the thumb is the SAME thickness as the track
-    // (no fatter oval bulge — Hunter's program-wide default), just a brighter, rounded segment of
+    // (no fatter oval bulge — the program-wide default), just a brighter, rounded segment of
     // the same line so it reads as a minimal hairline scrollbar. Callers may widen both together.
     const float trackThin = thickness > 0.0f ? thickness * s : 2.0f * s;
     const float pillThick = trackThin;

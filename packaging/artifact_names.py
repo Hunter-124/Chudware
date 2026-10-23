@@ -1,15 +1,11 @@
 """Canonical Chudware release artifact filenames — the single source of truth.
 
-Deliberately stdlib-only and free of every gateway dependency (no fastapi, no
-boto3, no psycopg, no config import). Two independent programs have to agree
-byte-for-byte about these names: the Linux packaging CI that WRITES the files
-and the gateway that VALIDATES what CI staged. When they disagree a nightly
-publish fails with "staged artifact is missing from incoming/" and gives no hint
-which side is wrong, so there is exactly one implementation and both sides use
-it. A build runner calls this module with a bare ``python3`` (importing
-``releases`` would require the whole gateway virtualenv); the gateway's
-``releases._canonical_artifact`` is a thin wrapper that turns ``ValueError``
-into an HTTP 422.
+Deliberately stdlib-only so a build runner can call it with a bare ``python3``.
+Every producer and consumer of a release file name asks this module instead of
+formatting one by hand: the Linux package builder
+(packaging/linux/build_linux_packages.sh), the GitHub Releases update-manifest
+writer (packaging/github_release_manifest.py), and the updater's own expectation
+in host/src/update/updater.cpp, which this module must keep matching.
 
 Debian and RPM both refuse '-' in a version field, so a prerelease has to be
 re-spelled — and the two systems disagree about how:
@@ -26,7 +22,7 @@ guideline and orders correctly everywhere.
 
 AppImage and tarball names keep the RAW version, prerelease suffix and all:
 nothing parses them as a package version, and rewriting them would make the
-filename disagree with the ``releases.version`` column it is published under.
+filename disagree with the release version it is published under.
 """
 
 from __future__ import annotations
@@ -35,15 +31,12 @@ import argparse
 import re
 import sys
 
-# Declared API vocabulary. ``default`` stays first because it is the backwards-
-# compatible query default; catalogue presentation has a platform-specific
-# order (Windows puts MSI first) in releases._fetch_available.
+# Package formats. ``default`` is the platform's primary artifact: the AppImage on
+# Linux, the Inno Setup installer on Windows and the zipped app bundle on macOS.
 FORMATS: tuple[str, ...] = ("default", "deb", "rpm", "tar", "msi")
 
-# The same shape releases._PRERELEASE_SEMVER_RE accepts, duplicated here rather
-# than imported because this module must not depend on the gateway. A filename
-# is derived from this string, so validating it here is what stops a hostile or
-# malformed version from naming a file something else entirely.
+# A filename is derived from this string, so validating it here is what stops a
+# hostile or malformed version from naming a file something else entirely.
 _VERSION_RE = re.compile(
     r"(?P<triple>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))"
     r"(?:-(?P<prerelease>[0-9A-Za-z.-]+))?"
@@ -52,7 +45,7 @@ _VERSION_RE = re.compile(
 _FIELDS = ("filename", "deb-version", "rpm-version", "rpm-release")
 
 
-def _split_version(version: str) -> tuple[str, str]:
+def split_version(version: str) -> tuple[str, str]:
     """``("0.1.0", "beta.21")`` for ``0.1.0-beta.21``; prerelease may be ""."""
     match = _VERSION_RE.fullmatch(version or "")
     if match is None:
@@ -64,7 +57,7 @@ def _split_version(version: str) -> tuple[str, str]:
 
 def deb_version(version: str) -> str:
     """The Debian ``Version:`` field. Every '-' becomes '~'."""
-    triple, prerelease = _split_version(version)
+    triple, prerelease = split_version(version)
     if not prerelease:
         return triple
     # A prerelease may itself contain '-' (0.1.0-beta-21); each one has to
@@ -74,7 +67,7 @@ def deb_version(version: str) -> str:
 
 def rpm_version_release(version: str) -> tuple[str, str]:
     """The RPM ``Version:`` and ``Release:`` fields."""
-    triple, prerelease = _split_version(version)
+    triple, prerelease = split_version(version)
     if not prerelease:
         return triple, "1"
     return triple, f"0.{prerelease}"
@@ -85,13 +78,12 @@ def canonical_artifact(
 ) -> str:
     """The one filename a (version, platform, arch, format) may be published as.
 
-    Raises ``ValueError`` — the gateway wrapper converts it to a 422 — for an
-    unknown format, malformed version, unsupported platform/architecture pair,
-    or package format requested for the wrong platform.
+    Raises ``ValueError`` for an unknown format, malformed version, unsupported
+    platform/architecture pair, or package format requested for the wrong platform.
     """
     if fmt not in FORMATS:
         raise ValueError(f"format must be one of {', '.join(FORMATS)}")
-    _split_version(version)
+    split_version(version)
     if platform == "linux" and arch == "x86_64":
         if fmt == "msi":
             raise ValueError("msi is a Windows package format")

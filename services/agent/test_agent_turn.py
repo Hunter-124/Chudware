@@ -362,8 +362,7 @@ def test_replay_grok45_specify_transcript_passes_gate():
     specify_incomplete. Post-fix: confirmed with auto_complete after ledger
     write, so n_spec_* reaches status=done and the phase can exit.
 
-    Transcript source:
-    tools/flywheel/bench/gym/reports/runs/grok45-1/C1_open_xai:grok-4-5_s2/ledger.json
+    Transcript source: a captured grok-4.5 benchmark run ledger,
     actor='SPECIFY DL1: flanged bushing' tool_call events.
     """
     # Captured tool sequence (7 calls). Cap budget at 7 so the turn exhausts

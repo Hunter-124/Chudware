@@ -1,11 +1,11 @@
 # Pick-and-Place (OpenPnP virtual / job-interchange) — Implementation-Ready Architecture
 
-Track owner: `PnpArchitecture`. Design-only; no repository file was edited to produce this.
+Track owner: `PnpArchitecture`. Design-only.
 Sources read: `services/mcp/server.py`, `services/mcp/tool_registry.py`, `host/src/ui/cam/cam_panel.h`,
-`core/cam/model.h`, `contracts/worker_rpc.md`, `agent://ManufacturingBreadth`,
-`local://manufacturing-decisions.md`, `local://manufacturing-dod-v4.md`.
+`core/cam/model.h`, `contracts/worker_rpc.md`, the manufacturing-breadth research,
+`00_decisions.md`, `01_definition_of_done.md`.
 
-Path ruling adopted from `Main`: production GUI only under `host/src/ui/manufacture/**`; cross-domain
+Path ruling adopted: production GUI only under `host/src/ui/manufacture/**`; cross-domain
 service root `services/manufacturing/**`; RPC/events `mfg_*` / `mfg.*`; `host/src/ui/cam/**` untouched.
 
 ---
@@ -63,7 +63,7 @@ implicit. No OpenPnP source, jar, JVM binding, or derived code enters the reposi
 
 ## 1. Licensing boundary (decided first, because it constrains every other choice)
 
-OpenPnP is GPLv3 (breadth audit, `openpnp/LICENSE.txt`). The commercial core stays license-clean via a
+OpenPnP is GPLv3 (breadth audit, `openpnp/LICENSE.txt`). Per the project license policy, the permissively licensed core links no GPL code, via a
 **two-lane split**, and the lanes never merge:
 
 ### Lane A — native interchange (always available, zero third-party dependency)
@@ -143,7 +143,7 @@ scripts/qualify_pnp_q1.sh
 contracts/mfg_pnp.md       # NEW contract file (new file, so not an append-only violation)
 ```
 
-### Integrator-owned append-only edits (I do not make these; each is exactly one appended block)
+### Integrator-owned append-only edits (not made by the PnP track; each is exactly one appended block)
 
 1. `contracts/worker_rpc.md` — append `### Manufacturing — Pick & Place (mfg_pnp_*, append-only, <date>)`
    pointing at `contracts/mfg_pnp.md` as the normative schema, in the style of §5/§6 of that file.
@@ -276,7 +276,7 @@ decay; it is superseded or falsified, never aged out"*. `age_ms` is informationa
 no consumer branches on it. A row whose `state` is anything but `ok` paints as unknown/stale exactly
 like a telemetry row, and never paints `last_ok` as live.
 
-My earlier §4.1 said durable artifacts carry "not a freshness envelope". That was wider than the
+The earlier §4.1 said durable artifacts carry "not a freshness envelope". That was wider than the
 argument it was making, and it collided with `GW-FRESHVALUE-PUBLISH`: `pnp.capability` is a durable row
 the GUI paints (§8.1, §9.4), so the old wording would have left the most truth-bearing surface in the
 track as the one unwrapped thing on screen — the same class of hole as the missing `pnp.capability`
@@ -301,7 +301,7 @@ it, through the gateway-owned helper `services/manufacturing/rpc/journal_client.
 
 `mfg_event_append{domain_id:"pnp", kind, subject, result_kind, body, raw?, admission?} -> {seq, epoch, ref}`.
 `src`/`admission` are computed by the gateway and never accepted from the caller (`GW-SRC-3`), so the
-honest classification of PnP evidence is enforced by the daemon rather than by my own good behaviour.
+honest classification of PnP evidence is enforced by the daemon rather than by the domain's own good behaviour.
 
 **Durable result kinds (`GW-KIND-2`, schema per `GW-KIND-COLUMNS`).** A `result_kind` must already exist in
 the durable-result-kind table, else the append is refused `mfg_unregistered_result_kind` — a domain
@@ -334,17 +334,17 @@ for any kind whose id ends in `procedural_fact`, and `GW-CAP-NO-INHERIT` forbids
 | `pnp.q1_procedural_fact` | `epoch_invariant` | **falsified** on a failing re-run | `export_artifact` | **yes, mandatory** (`GW-PF-FOLLOWS-PARENT`) — it is what could flip a level; leaving it standing under a superseded bundle would keep a claim verified after the check it cites was re-run |
 | `pnp.capability` | `epoch_invariant` | re-derived and re-appended whenever any cited evidence row is falsified or superseded | the evidence rows it cites | **no, forbidden** (`GW-CAP-NO-INHERIT`) — capability re-derives from its own evidence and never inherits a parent's supersession |
 
-`pnp.capability` was missing from my earlier submission and is a real gap, not a formality: the GUI
+`pnp.capability` was missing from the earlier submission and is a real gap, not a formality: the GUI
 paints the capability table (§9.4), and DoD #10 requires a gateway-stamped durable row for **every**
 durable result a UI may paint, not only telemetry. Without it the most truth-bearing surface in the
 track would have been the one unjournaled thing on screen.
 
 **Subject namespaces (`GW-SUBJECT-NS`, `GW-GUARD-ACCEPTS`).** PnP declares exactly `art:` · `job:` · `res:` at registration.
 It declares **no** `dev:` and **no** `src:`, so an append naming a device or monitor subject is refused
-`mfg_subject_namespace_not_permitted` by the daemon rather than by my discipline. Every PnP Stage-2
+`mfg_subject_namespace_not_permitted` by the daemon rather than by domain discipline. Every PnP Stage-2
 guard declares `accepts{subject_ns:["art:","job:","res:"], admission:["procedural_fact"]}`, so
 `gates::evaluate` refuses out-of-set evidence by name — including a fresh `probed` `src:` observation,
-which is exactly the cross-lane case I raised and which is now a mechanism instead of prose.
+which is exactly the cross-lane case PnP raised and which is now a mechanism instead of prose.
 
 PnP declares no `retain_as_last_ok` row: that flag exists for transport-bound observations whose value
 clears while `FreshValue.last_ok` stays display-only, and PnP publishes no such observation.
@@ -365,7 +365,7 @@ truth. Producers push; nothing waits for polling or staleness.
 
 **PnP does not compute `affected[]`.** Per `GW-CLOSURE`, `mfg_event_append` carries `derived_from[]`
 (the edges declared in §4.2) and `mfg_result_invalidate` computes the transitive closure, so `affected`
-is the gateway's closure rather than my best guess — which removes the most likely correctness bug in
+is the gateway's closure rather than the domain's best guess — which removes the most likely correctness bug in
 the whole track, since a hand-maintained affected-set silently under-invalidates the moment someone
 adds a derived row. `falsified` propagates along `derived_from`; `superseded` propagates only into rows
 declaring `supersede_with_parent`, which is why the job/sim/gate/export/Q1 chain sets it and the
@@ -471,7 +471,7 @@ not invented.
 
 ### 6.3 The OpenPnP writer, without fabricating a schema
 
-I will not invent OpenPnP XML element names. `export_openpnp.py` is **schema-profile driven**:
+The design does not invent OpenPnP XML element names. `export_openpnp.py` is **schema-profile driven**:
 
 - `fixtures/mfg/pnp/openpnp_schema/<version>.profile.json` is a hand-authored, human-verified mapping
   from our model fields to that OpenPnP version's element/attribute names, carrying
@@ -484,7 +484,7 @@ I will not invent OpenPnP XML element names. `export_openpnp.py` is **schema-pro
 - The bundle is stamped `openpnp_load_verified: false` until a Q1 run (§7) proves an actual OpenPnP
   binary loaded it. Export never claims verification it does not have.
 
-This is the honest construction: the emitter is real and complete, and the one fact I cannot obtain from
+This is the honest construction: the emitter is real and complete, and the one fact that cannot be obtained from
 repo context — the exact element names of a specific OpenPnP release — is a named, human-supplied,
 verifiable input rather than a guess baked into code.
 
@@ -505,7 +505,7 @@ dependency-free and moving the third-party stage out of the gate entirely under 
 | E3 | canonical run/evidence + gate integration | yes | every evidence record emitted with a gateway seq; two-stage gate evaluation matches the expected table; guard liveness proven |
 | **Q1** | external OpenPnP conformance | **no — `scripts/qualify_pnp_q1.sh` only** | a user-supplied OpenPnP binary loads a bundle we wrote |
 
-No new SKIP class is introduced, so DoD #1 is untouched — and this matches Main's final ruling that
+No new SKIP class is introduced, so DoD #1 is untouched — and this matches the final project ruling that
 optional OpenPnP/ROS sidecars are opt-in qualification only and add **no** normal-gate SKIP. Per
 Gateway's corrected tally the whole manufacturing batch now requests **zero** new SKIPs and the
 documented list stays the DoD #1 five (`GW-ZERO-NEW-SKIP`). Absence of the optional binary is a
@@ -537,7 +537,7 @@ stage so it cannot be mistaken for something the gate owes.
    provenance, not self-asserted: `serial|tcp|websocket|http_adapter -> probed`, `emulator -> simulated`,
    `profile/config -> declared`, `camera/model -> advisory`. A subprocess that loads a config file is
    **none of the probed transports**, so **Q1 can never yield `probed` evidence** — not in the
-   `headless_script` path either. My earlier framing of headless Q1 as `probed` was wrong and is
+   `headless_script` path either. The earlier framing of headless Q1 as `probed` was wrong and is
    withdrawn. Both Q1 paths produce `declared`-class procedural facts; the difference between them is
    *auditability* (a binary's own exit code and parsed counts vs. a human's attestation), never truth
    level. `capability.py` therefore caps the `openpnp_interop` sub-capability at `declared` in **both**
@@ -607,8 +607,8 @@ action entry point before any proposal exists. PnP ships its rows as a **declara
 `services/manufacturing/pnp/tier0.py` and registers them at domain init through the gateway-owned
 `journal_client.register_tier0`, which calls
 `mfg_tier0_register{domain_id:"pnp", schema_version, rows[]} -> {registered, rejected[{row_index,why}],
-totality{covered, missing[{action,artifact_kind,machine_class}]}, at_seq}` (`GW-TIER0-REGISTER`, closing my
-earlier open item — Gateway took both options I offered and combined them). Registration is **atomic
+totality{covered, missing[{action,artifact_kind,machine_class}]}, at_seq}` (`GW-TIER0-REGISTER`, closing PnP's
+earlier open item — Gateway took both proposed options and combined them). Registration is **atomic
 and idempotent** per `(domain_id, action, prerequisite, hash(applies_when))`: a partially invalid batch
 registers nothing and reports per-row reasons, and any `class` other than `PREREQ` is rejected outright.
 Gateway owns the type, runs the totality check over `action × artifact_kind × machine_class`, returns
@@ -725,7 +725,7 @@ journal-stamped one returned by the append, never a locally chosen number.
 
 ### 9.2 MCP tools — shared family `"manufacture"`
 
-Per Main's final ruling, the entire manufacturing overhaul registers under **one** shared family id
+Per the final project ruling, the entire manufacturing overhaul registers under **one** shared family id
 `"manufacture"` — the product term, not the `mfg` wire prefix — and that family is **OFF by default in
 `agent.tool_families`** until commissioning, so `enable_tools` cannot silently self-add manufacturing
 surface. Default-off is **not** achieved by omission: an unlisted family resolves *enabled*, so the
@@ -733,7 +733,7 @@ mechanism is the `DEFAULT_TOOL_FAMILIES` + `DEFAULT_OFF_TOOL_FAMILIES` pair in
 `services/agent/config.py`. That file and `test_manufacture_family_default_off.py` are **Gateway-owned
 in W1.1** and are a hard predecessor of this registration (`GW-FAMILY-MANUFACTURE`); PnP edits neither
 and asserts the resulting property from the outside (§11, `test_mcp_registration.py`). Per-tool toggles retain granularity via the existing `get_tool_options` path, so nothing is
-lost by collapsing the family. My earlier per-domain family `"pnp"` is withdrawn. Registered via
+lost by collapsing the family. The earlier per-domain family `"pnp"` is withdrawn. Registered via
 `register_pnp_tools(_reg.view(mcp, "manufacture"))`. Risk classes are chosen so
 `tool_registry.classify_risk` yields the intended value from the name alone, with three explicit
 overrides where it would not:
@@ -889,26 +889,26 @@ All under `services/manufacturing/pnp/`, pure Python, no native build, no networ
 
 ## 12. Dependencies on peer tracks
 
-| Peer | What I need | What I give |
+| Peer | What PnP needs | What PnP gives |
 |---|---|---|
 | `GatewayDesignRecovery` | **ACCEPTED, closed — no open items.** Owns `CapabilityTruth`/`CapabilityReport` (`core/device/capability.h`), the Tier-0 register row (`core/manufacturing/tier0.h`), the journal (`mfg_event_append`), Tier-0 registration (`mfg_tier0_register`), invalidation (`mfg_result_invalidate`), the shared `journal_client.py`, the `FreshValue<T>` publisher, and the run/evidence registry | a producer that pushes invalidations, never polls, mints no `seq`, sends no `src`/`admission`, and constructs no probed-class transport |
 | `TwinDesignRecovery` | the shared integer-tick convention and snapshot/restore semantics if published; otherwise `VirtualPnpMachine` is self-contained at 1 kHz | a second conforming tick-domain producer |
-| `MonitoringArchitecture` | nothing at runtime | if a PnP machine is ever surfaced through MTConnect/OPC UA it is their `ObservationRecord` over their `IReadTransport`, and post-refinement it is genuinely `src=probed` — not "context only". It still cannot lift a PnP capability level or enter a PnP gate, but by **subject mismatch, not evidential weakness**: it measures a physical-machine subject, whereas every PnP Stage-1 row is `admission:"procedural_fact"` bound to an artifact hash, and PnP's `monitor` level is `unsupported` because *PnP* owns no observation source. I never widen such an observation past its own measured subject |
-| `TurningArchitecture`, `CuttingProcessArchitecture` | nothing; I touch no `core/cam/**` file and no `cam_tools.py` seam | shared `CapabilityTruth` + Tier-0 row consumption, so the four tracks render identically |
+| `MonitoringArchitecture` | nothing at runtime | if a PnP machine is ever surfaced through MTConnect/OPC UA it is their `ObservationRecord` over their `IReadTransport`, and post-refinement it is genuinely `src=probed` — not "context only". It still cannot lift a PnP capability level or enter a PnP gate, but by **subject mismatch, not evidential weakness**: it measures a physical-machine subject, whereas every PnP Stage-1 row is `admission:"procedural_fact"` bound to an artifact hash, and PnP's `monitor` level is `unsupported` because *PnP* owns no observation source. PnP never widens such an observation past its own measured subject |
+| `TurningArchitecture`, `CuttingProcessArchitecture` | nothing; PnP touches no `core/cam/**` file and no `cam_tools.py` seam | shared `CapabilityTruth` + Tier-0 row consumption, so the four tracks render identically |
 | `RobotArchitecture` | nothing | the same "planning/emulation only, no device path" posture, so the two `Next`-tier tracks stay consistent |
 
 ### 12.1 Cross-track types and the journal seam — resolved, no open items
 
-`GatewayDesignRecovery` accepted ownership of the shared types (`GW-TYPES-OWNED`) and then closed my
+`GatewayDesignRecovery` accepted ownership of the shared types (`GW-TYPES-OWNED`) and then closed PnP's
 one remaining blocker (`GW-TIER0-REGISTER`, `GW-CLIENT-5`, `GW-SEQ-1`). PnP **composes, never re-declares**: `CapabilityTruth` /
 `CapabilityReport` from `core/device/capability.h`, and the Tier-0 register row from
 `core/manufacturing/tier0.h`. Four tracks (pnp, twin, cut, turn) now compose rather than duplicate,
 which is what makes the DoD truthfulness rules mechanically enforceable instead of per-track prose.
 
-**Blocker closed.** I had refused to reimplement `registerRows` or the `seq` stamp on the Python side,
+**Blocker closed.** PnP refused to reimplement `registerRows` or the `seq` stamp on the Python side,
 because that would recreate the duplication the ownership decision eliminated and a locally minted
-`seq` would violate `GW-SEQ-1` outright. Gateway resolved it by combining both options I
-offered: a declarative Python table registered through the service seam PnP already calls. PnP now
+`seq` would violate `GW-SEQ-1` outright. Gateway resolved it by combining both proposed options:
+a declarative Python table registered through the service seam PnP already calls. PnP now
 ships `services/manufacturing/pnp/tier0.py` as data and calls the gateway-owned
 `services/manufacturing/rpc/journal_client.py` (`append` / `invalidate` / `register_tier0`) at domain
 init. That helper is gateway-owned and is imported, never copied per domain — `test_evidence.py`
@@ -916,9 +916,9 @@ asserts no vendored copy exists under the PnP tree.
 
 **The part worth keeping visible:** `GW-SRC-3` makes `src`/`admission` gateway-computed and
 caller-unsettable, with `probed` reachable only from transport code inside the daemon holding an open
-`ITransport`. That means a pure-Python domain **structurally cannot** produce probed evidence. My
+`ITransport`. That means a pure-Python domain **structurally cannot** produce probed evidence. The
 withdrawn Q1-as-probed claim is now impossible to reintroduce by accident rather than merely
-documented as wrong — which is a strictly better outcome than the correction I made by hand, and the
+documented as wrong — which is a strictly better outcome than a correction made by hand, and the
 reason it was worth reporting the error rather than quietly fixing the prose.
 
 ---
@@ -954,10 +954,9 @@ reason it was worth reporting the error rather than quietly fixing the prose.
 
 ---
 
-## 14. Review closure — `local://manufacturing-plan-review.md`
+## 14. Review closure — architecture plan review
 
-Every row below is a change **already applied in this document**, not a plan. Design-only: no repository
-file was edited and no git, build, gate, linter, formatter or test command was run to produce it.
+Every row below is a change **already applied in this document**, not a plan.
 
 | finding | applies to PnP? | how it is closed here | where |
 |---|---|---|---|

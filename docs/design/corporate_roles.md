@@ -5,7 +5,7 @@
 > layout below refer to that snapshot. It does not establish that the listed gaps remain
 > open or that all proposed org behavior shipped. Current governance is in
 > `services/agent/corporate.py` / `mission_dispatch.py`; online turns and nested agents
-> follow [Chudcode integration](../../.claude/skills/cad-chudcode-integration/SKILL.md).
+> follow [Chudcode integration](../dev/chudcode-integration.md).
 > Preserve the distinction from `services/agent/org.py`; do not replace either capability
 > on the strength of this historical prose.
 
@@ -650,7 +650,7 @@ It is not yet a closed lifecycle product. Gaps below cite live symbols.
 | 15 | Merge affinity / smarter capping | Overflow merges to `general` or last kept (`derive_departments`) | Odd depts collapse poorly | `MERGE_AFFINITY` table; task-count weights | **S** |
 | 16 | Director is root persona, not dual process | Director seat id exists; root uses it when `corporate_agent_id` unset | OK as design; root may lack director preamble until activate | Ensure root turn injects director preamble when chart active | **M** |
 | 17 | Evaluation harness | Unit tests in `test_corporate.py` (routing, cadence, depth, flat-off, auto-activate, wind-down, LLM steering) | No multi-domain vs flat benchmark | Scenario suite §9 in gym/benchmarks | **L** |
-| 18 | Contract event enumeration | Stream events implemented; `contracts/agent_events.md` still integrator-owned | GUI/backend event contract incomplete | Expand aicad.corporate/1 section with event kinds (append text below) | **S** |
+| 18 | Contract event enumeration | Stream events implemented; `contracts/agent_events.md` section not yet expanded | GUI/backend event contract incomplete | Expand aicad.corporate/1 section with event kinds (append text below) | **S** |
 | 19 | Integration with `org.py` | Explicitly complementary in module docstring; no code bridge | Dual "org" concepts confuse | Doc + optional mapping layer later; no merge yet | **S** (doc) / **L** (bridge) |
 | 20 | Worker completion without being seated | `record_worker_completion` counts even if post rejected (`posted=False`) — tested | Good for robustness; can inflate cadence from ghosts | Optionally require seated worker_id to count (config) | **S** |
 ### 11.1 What the first cut already does well

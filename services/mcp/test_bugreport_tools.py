@@ -192,7 +192,7 @@ def test_linear_turn_advertises_the_tool_only_when_enabled(tmp_path, monkeypatch
 
         _, allowed, _, _, _ = _assemble_role_runtime(
             load_role("general_agent"), "general_agent", "bug-report-turn", "",
-            {}, None, None, None, None,
+            {}, None, None, None,
         )
         return allowed
 

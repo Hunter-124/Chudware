@@ -253,7 +253,7 @@ def load_all_tiers(*, path: Path | None = None) -> dict[str, TierProfile]:
 
 def load_local_models(*, path: Path | None = None) -> dict:
     """Return tiers.yaml's ``local_models`` block — the shipped bundled-model
-    defaults per role shape (T-W31, applying the T-W29 tokenmaxx bench).
+    defaults per role shape, from the local-model benchmark.
 
     Keys: ``gbnf_worker`` / ``fanout`` (bundled model ids) and
     ``parallel_slots`` (recommended llama-server ``--parallel``). Returns ``{}``
@@ -273,13 +273,12 @@ def load_local_models(*, path: Path | None = None) -> dict:
 
 # --------------------------------------------------------------------------- tier -> provider
 
-# Tokenmaxxing (Hunter, 2026-07-07): three local models are bundled/served via
-# llama.cpp (services/installer/llamacpp.py, model_manager._REGISTRY,
-# benchmarks/tokenmaxx/REPORT.md). A tier listed here pins a SPECIFIC model instead
-# of always falling to tiers.yaml's local_models.fanout — this is what lets gym
-# tiers like "local-24k-gemma3-qat" actually route to gemma3-4b-qat rather than
-# collapsing to qwen3-4b (the fanout default). A tier not listed here keeps the
-# historical fanout-based resolution — no behavior change for existing callers.
+# Three local models are bundled/served via llama.cpp (services/installer/llamacpp.py,
+# model_manager._REGISTRY). A tier listed here pins a SPECIFIC model instead of always
+# falling to tiers.yaml's local_models.fanout — this is what lets gym tiers like
+# "local-24k-gemma3-qat" actually route to gemma3-4b-qat rather than collapsing to
+# qwen3-4b (the fanout default). A tier not listed here keeps the historical
+# fanout-based resolution — no behavior change for existing callers.
 LOCAL_TIER_MODELS: dict[str, str] = {
     "local-24k-gemma3-qat": "gemma3-4b-qat",  # smallest footprint, full GBNF grammar
     "local-24k-gemma4-e4b": "gemma4-e4b",  # larger/slower GBNF backup, comparison-only
@@ -392,7 +391,7 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     tier run is meaningless (it silently answers from a cloud model). A tier
     listed in ``LOCAL_TIER_MODELS`` (e.g. ``local-24k-gemma3-qat``) pins that
     specific bundled model instead of the fanout default — this is the
-    tokenmaxx benchmark's per-model tier matrix (T-W29/T-DP19).
+    local-model benchmark's per-model tier matrix.
 
     Parameterized paid tiers remain a benchmark-harness surface. Ordinary online
     Chudware turns do not enter this factory; Chudcode owns their provider and

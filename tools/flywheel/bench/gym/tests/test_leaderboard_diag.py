@@ -640,11 +640,10 @@ class TestDiagRunnerAndLeaderboard:
         assert cells[0]["model"] == "anthropic/model"
         assert cells[0]["run_id"] == "gym_C1_open_openrouter:anthropic/model_s1"
 
-    def test_build_and_write_from_existing_reports(self, tmp_path):
-        """Smoke: aggregate real cycle-1 reports + mock diag → valid leaderboard."""
-        reports = Path("tools/flywheel/bench/gym/reports")
-        if not reports.is_dir():
-            pytest.skip("no gym reports tree")
+    def test_build_and_write_from_empty_reports(self, tmp_path):
+        """Smoke: aggregate an empty reports tree + mock diag → valid leaderboard."""
+        reports = tmp_path / "reports"
+        reports.mkdir()
         diag = run_diag(
             ["local-24k"],
             seed=1,
@@ -664,7 +663,7 @@ class TestDiagRunnerAndLeaderboard:
         assert doc["schema"] == SCHEMA
         assert "-MOCK" in doc["task_suite"]
         assert isinstance(doc["models"], list)
-        # Existing cycle-1 cells should produce at least the local model.
+        # No cycle reports: only diag-derived entries (local tiers) or none at all.
         assert any(m["kind"] == "local" for m in doc["models"]) or doc["models"] == []
 
 

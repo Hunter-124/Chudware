@@ -18,7 +18,8 @@ Usage:
 --update replaces the selected baseline with this successful run. A missing baseline is
 created as before, explicitly without a comparison. Existing legacy/incompatible/empty
 baselines are refused; open_cold is never aliased to open_warm. The default baseline path
-remains tools/perf_baseline.json. Use a scratch baseline for machine-local investigations.
+is tools/perf_baseline.json; it is machine-local (a run compares only against a record from
+the same machine/thread environment), so it is created by the first run and never committed.
 
 CHUDWARE_LIBCHUDWARE selects the library; daemon mode is forcibly disabled, including its
 live-endpoint liveness probe. No user documents or shared daemon sessions are used.

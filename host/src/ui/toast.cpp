@@ -1,5 +1,5 @@
 // Toast notification renderer (W1-B). See toast.h.
-// Hunter review 2026-07-06: restyled from the glass-card + left-accent-bar look to the app-wide
+// Restyled from the glass-card + left-accent-bar look to the app-wide
 // active-indicator rule — opaque popupBg card with a BOLD severity-colored OUTLINE around the
 // whole bounding box (error=statusErr, warn=statusWarn, success=statusOk, info=neutral textDim),
 // a small drawn severity icon, single-click-anywhere dismiss (click swallowed so it doesn't fall

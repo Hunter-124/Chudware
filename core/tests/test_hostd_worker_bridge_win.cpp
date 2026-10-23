@@ -40,11 +40,6 @@ namespace chudware::security {
 IntegrityResult verifyInstalledPayload(const std::filesystem::path&, VerifyMode) {
     IntegrityResult result; result.ok = true; return result;
 }
-RuntimeGuardProbes platformRuntimeGuardProbes() { return {}; }
-RuntimeGuardDecision inspectAndPersistRuntime(SecurityCheckpoint,
-    const std::filesystem::path&, const std::vector<FileVerdict>&,
-    std::string_view, RuntimeGuardProbes, std::int64_t) { return {}; }
-std::filesystem::path runtimeGuardStateDir() { return {}; }
 }
 
 namespace {

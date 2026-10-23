@@ -1,15 +1,15 @@
 # Read-Only Industrial Monitoring Architecture
 
-Owner: `MonitoringArchitecture`. Design-only; no repository file was edited. Status: implementation-ready.
-**Amended 2026-08-08** to close `ArchitectureConsistencyReviewer`'s findings C4 and C8 and to adopt the late
+Owner: `MonitoringArchitecture`. Design-only. Status: implementation-ready.
+**Amended 2026-08-08** to close the architecture plan review's findings C4 and C8 and to adopt the late
 Gateway corrections; the amendment is itemized in §15 and every citation now uses the stable rule ids of §0.
 
 Inputs read: `services/mcp/daemon_bridge.py`, `services/mcp/tool_registry.py`, `host/src/ui/status_bar.cpp`,
-`contracts/events.md`, `contracts/worker_rpc.md`, `agent://ManufacturingBreadth`,
-`local://manufacturing-decisions.md`, `local://manufacturing-dod-v4.md`; for the amendment,
-`local://manufacturing-plan-review.md` and `local://manufacturing-gateway-final.md` as read-only evidence.
+`contracts/events.md`, `contracts/worker_rpc.md`, the manufacturing-breadth research,
+`00_decisions.md`, `01_definition_of_done.md`; for the amendment, the architecture plan review and
+`10_gateway.md` as read-only evidence.
 
-Path/naming ruling applied (from `Main`, plus `GatewayDesignRecovery` corrections): production GUI additions live
+Path/naming ruling applied (project-wide, plus `GatewayDesignRecovery` corrections): production GUI additions live
 only under `host/src/ui/manufacture/**` — no `ui/mfg`, no new canvas; cross-domain services live under
 `services/manufacturing/**`; fixtures under `fixtures/mfg/**`; RPCs/events stay `mfg_*` / `mfg.*`;
 `host/src/ui/cam/**` remains the offline-CAM owner and is not touched by this lane.
@@ -23,7 +23,7 @@ Gateway cross-references in this document are **stable rule ids**, never gateway
 Gateway is minting the register in its §25; the ids below are Gateway's own tokens and are what this lane's
 contract tests key on (`test_capability_truth.py`, `test_invalidation.py`, `test_readonly_surface.py`,
 `test_tier0_rows.py`). No other line of this document cites a gateway section number, because gateway
-numbering moved twice during this thread and §20's contract tests are specified per rule. The right-hand
+numbering moved twice during the design rounds and §20's contract tests are specified per rule. The right-hand
 column is traceability only — if Gateway renames a token, this table is the single place that changes.
 
 | rule id | rule as ratified | gateway text today |
@@ -89,7 +89,7 @@ separate service/process. Therefore:
   `threading.Lock`, reconnect-once-on-EOF, `hello {client, pid, proto}` handshake, spawn cooldown with doubling
   backoff (`SPAWN_COOLDOWN_S` → `SPAWN_COOLDOWN_MAX_S`), `_SPAWNED` child reaping.
 - The OPC UA collector is a **further** out-of-process executable (§4.2) so `open62541` (MPL-2.0, file-level
-  obligations) never links into the commercial core, and so the read-only symbol gate has one concrete binary to
+  obligations) never links into the core libraries, and so the read-only symbol gate has one concrete binary to
   inspect.
 
 ```mermaid
@@ -834,7 +834,7 @@ demo source — never linked, never embedded. No GPL/AGPL artifact enters this l
 - Endpoints come only from an operator-authored allowlist in `MonitorSourceConfig`; a URL is never accepted from
   model output or an MCP parameter.
 - Response byte cap, read timeout, per-source request-rate cap, bounded in-memory buffer.
-- XML hardened: DTD processing off, entity expansion off, no network/external entity resolution, element-depth and
+- XML hardened: DTD processing off, entity expansion off, no network or external entity resolution, element-depth and
   element-count caps. `xxe_entity.xml` proves the guard fails when it should.
 - `nextSequence` monotonicity checked; a regression is a buffer roll, not something to silently follow.
 
@@ -998,7 +998,7 @@ never a substitute. Missing evidence **fails**; it is never `not_applicable`.
 | **W3** | OPC UA: `collector_opcua/**`, the `opcua_read` `IReadTransport`, `collector_bridge`, `profiles/**`, `profile_registry`, security, OPC UA NDJSON fixtures, `scripts/mfg_monitor_readonly_gate.sh`, stage E2 | `nm -uC` over the built collector | zero forbidden symbols; `policy_none_remote`, `cert_rejected`, `user_access_denied` all ⇒ `refused` |
 | **W4** | invalidation + epoch reconciliation end to end through `mfg_event_append`/`mfg_result_invalidate`, all **five** durable result kinds including `monitor_capability` and its `derived_from` re-derivation, `mfg_tier0_register` with a clean `totality.missing`, guard-liveness negatives, waiver-rate visibility, capability↔stage binding, `read_only_proof` wiring | invalidation fixtures + Tier-0 registration round-trip + the §2.3 capability falsification test | falsify clears and supersede retains, both scoped to `seq <= at_seq` using gateway-stamped seq; a `monitor_source_state` row never survives a lane epoch as `ok` and never retains `last_ok`; revoking certificate trust drops `monitor` from `verified` to `assumed` in the same closure that marks the source `unknown`; every guard demonstrably passes for one input and fails for another |
 
-Every wave: `scripts/gate.sh` green, `docs/REFACTOR_LOG.md` appended, relevant maintained skills/maps updated in
+Every wave: `scripts/gate.sh` green, the as-built map in `docs/manufacturing/README.md` and the relevant developer docs updated in
 the same green commit (DoD v4 §20).
 
 Three exits added by this amendment pass, one per closed finding, because a correction nobody tests is a
@@ -1081,7 +1081,7 @@ If the subscription-lane amendment is declined, W2 degrades to poll-only via `mf
 
 ---
 
-## 15. Review closure (`ArchitectureConsistencyReviewer`, `local://manufacturing-plan-review.md`)
+## 15. Review closure (architecture plan review)
 
 Every row below is a reconciliation of statements already in the accepted corpus. No product scope changed: all
 six read-only monitoring surfaces, both protocols, all four waves, all five durable kinds and the four E-stages

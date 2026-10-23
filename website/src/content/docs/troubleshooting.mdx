@@ -1,12 +1,12 @@
 ---
 title: Troubleshooting
-description: Resolve common launch, graphics, modeling, sign-in, and copilot problems.
+description: Resolve common launch, graphics, modeling, copilot, and macOS Parts Library problems.
 section: Reference
 order: 100
 ---
 ## The desktop app does not start
 
-All native builds are 64-bit and need a graphics driver capable of a modern hardware-accelerated 3D context; update the GPU driver first if the app exits at launch. Reinstalling from the [download page](https://app.chudware.com/#downloads) replaces a corrupted install. The browser workspace requires no download and is the quickest cross-check.
+All native builds are 64-bit and need a graphics driver capable of a modern hardware-accelerated 3D context; update the GPU driver first if the app exits at launch. Reinstalling the current build from the [latest GitHub release](https://github.com/Hunter-124/Chudware/releases/latest) replaces a corrupted install.
 
 ## The viewport is blank or slow
 
@@ -16,16 +16,20 @@ Update the GPU driver, then restart Chudware. Avoid remote-desktop sessions that
 
 Return to the first failed feature in the tree. Check its sketch state and references before editing later features. Fillets commonly fail when the radius is larger than a neighboring face; cuts fail when they no longer intersect a body.
 
-## Sign-in or license check fails
-
-Check system time, internet access, and whether `app.chudware.com` is reachable. A paid desktop license has an offline grace period, but initial activation requires sign-in.
-
 ## The copilot cannot run
 
-Open **Settings → Providers** and confirm that a supported provider account is connected or that your API key passes its connection test. Check the selected provider's plan, API billing, and usage limits. Read the concrete error in the copilot feed before retrying, and inspect the feature tree for any tool actions that completed earlier in the turn. Enter provider credentials only in Provider settings, never in chat or project notes.
+Open **Settings → Providers** and confirm that a supported provider account is connected or that your API key passes its connection test. Check the selected provider's plan, API limits, and usage. Read the concrete error in the copilot feed before retrying, and inspect the feature tree for any tool actions that completed earlier in the turn. Enter provider credentials only in Provider settings, never in chat or project notes.
 
-## Using Chudware from macOS
+## Using Chudware on macOS
 
-The macOS build is downloaded from your account like the others; on Apple silicon the Intel build runs through Rosetta 2. If you prefer not to install anything, use the browser workspace from your Mac. Do not download an unofficial installer.
+The macOS build is published on GitHub Releases like the others; on Apple silicon the Intel build runs through Rosetta 2. It does not include the embedded browser used on Windows and Linux, so provider and vendor sign-in opens in your system browser. Do not download an unofficial installer.
 
-For account help, email [support@chudware.com](mailto:support@chudware.com) without including passwords, provider keys, or private project files.
+## macOS Parts Library vendor access
+
+On macOS, the Parts Library fetches vendor pages through Playwright instead of the embedded browser daemon used on Linux and Windows. Vendors that fingerprint browser automation can refuse those requests. When that happens, Chudware reports that the request was blocked by the vendor instead of hanging; the local catalog and vendors that tolerate Playwright continue to work. This is a known platform difference, not a bug, and Parts Library fetching on Linux and Windows is unaffected.
+
+If a vendor blocks a search on macOS, use the local catalog, or run the vendor search from Chudware on a Linux or Windows machine.
+
+## Still stuck?
+
+Search the [GitHub issues](https://github.com/Hunter-124/Chudware/issues) and open a new one if nobody has reported the problem. Include your OS, the Chudware version, what you did, and the exact error text, but never passwords, provider keys, or private project files.

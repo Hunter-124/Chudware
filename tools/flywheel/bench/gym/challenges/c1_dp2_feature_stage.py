@@ -1,4 +1,4 @@
-"""C1-DP2 — flanged bushing: Stage 1 feature-architect gym run (T-DP2).
+"""C1-DP2 — flanged bushing: Stage 1 feature-architect gym run.
 
 Exercises the feature_architect role and the DECOMPOSE gate for the C1 flanged
 bushing.  Scripted turns produce REAL ledger ``feature`` events; the gym grades:

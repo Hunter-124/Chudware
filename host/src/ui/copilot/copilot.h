@@ -127,8 +127,8 @@ std::string bridgeModelCostDetail(const BridgeModelMeta& m);
 // catalog data is available.
 void drawSessionCostStrip(AppState& state);
 
-// Cloud OpenAI-compat / Moonshot key presence: local settings OR host-shared keys on web
-// (GET /api/providers). Used by picker sections that gate rows on cloudKey/moonshotKey.
+// Cloud OpenAI-compat / Moonshot key presence in local settings. Used by picker sections that
+// gate rows on cloudKey/moonshotKey.
 bool cloudCompatKeyPresent(AppState& state);
 bool moonshotKeyPresent(AppState& state);
 

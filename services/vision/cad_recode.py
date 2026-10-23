@@ -1,3 +1,9 @@
+# SPDX-License-Identifier: MIT AND CC-BY-NC-4.0
+#
+# The model classes ``FourierPointEncoder`` and ``CADRecode`` in this file are derived
+# from filaPro/cad-recode (https://github.com/filaPro/cad-recode) and remain under the
+# Creative Commons Attribution-NonCommercial 4.0 International license (CC-BY-NC-4.0);
+# they are not covered by Chudware's MIT license. The rest of this file is MIT-licensed.
 """CAD-Recode v1.5 ML parametric-rebuild backend.
 
 Translates a mesh / point cloud into executable CadQuery source via the
@@ -10,9 +16,10 @@ upstream demo notebook:
 
     https://github.com/filaPro/cad-recode/blob/main/demo.ipynb
 
-Licensing is consciously deferred (CC-BY-NC-4.0 on the weights); see
-``contracts/license_debt.md``. ALL heavy imports (torch, transformers,
-trimesh, cadquery, pytorch3d) are lazy — importing this module is dep-free.
+The ported classes and the weights are CC-BY-NC-4.0 (non-commercial use only), a documented
+exception to the project license; see ``contracts/license_debt.md`` item 19. ALL heavy
+imports (torch, transformers, trimesh, cadquery, pytorch3d) are lazy — importing this
+module is dep-free.
 
 Public API::
 

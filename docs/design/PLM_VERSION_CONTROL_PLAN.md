@@ -1,29 +1,25 @@
-# PLM Version Control Plan (Pillar 19, Workstream R)
+# PLM Version Control Plan
 
-Status: ADOPTED design record. On the board, `T-R1` through `T-R8` are all
-`status: done` (`work/tasks/done/`); that records scoped closure, not fresh GUI or
-deployment acceptance. The implementation lives in `services/plm/`, and the frozen
-schemas live in `contracts/plm.md` (plus `contracts/plm_live.md` for T-R8). This document
-remains the design-intent record, not an as-built spec. Two places where reality moved past
-it:
+Status: adopted design record (2026-07-03). The implementation lives in `services/plm/`,
+and the frozen schemas live in [`contracts/plm.md`](../../contracts/plm.md) (`aicad.plm/1`,
+plus [`contracts/plm_live.md`](../../contracts/plm_live.md) for live co-editing). This
+document remains the design-intent record, not an as-built spec. Two places where reality
+moved past it:
 
-- **Post-v1 live co-editing.** `T-R8` records self-hosted PLM server + live co-editing
-  after v1, beyond the §6 "Real-time co-editing" v1 non-goal.
-- **Chudware Cloud remote.** The remote is still only the reserved seam. `services/plm/remote.py`
-  answers `reserved_remote` ("Chudware Cloud is not available yet").
+- **Post-v1 live co-editing.** A self-hosted PLM server with live co-editing landed after
+  v1, beyond the §6 "Real-time co-editing" v1 non-goal.
+- **Hosted remote.** A Chudware-hosted remote is only a reserved configuration seam and is
+  not implemented; `services/plm/remote.py` answers `reserved_remote`. Sharing uses
+  filesystem or self-hosted git remotes.
 
-Original status: DESIGN APPROVED FOR TASK CUT — Hunter directive 2026-07-03.
-The original approval superseded backlog proposals T-BL15 (in-app document version
-control) and T-BL10 (PDM-lite). The original text answers T-BL15's open questions and
-records workstream R's intent, UX model and architecture direction; detailed schemas
-are frozen in `contracts/plm.md` (T-R1), not replaced by this design record.
+This design replaced two earlier proposals (in-app document version control and a
+PDM-lite) and answers their open questions; detailed schemas are frozen in
+`contracts/plm.md`, not replaced by this record.
 
-> **T-R1 CONTRACT FROZEN (2026-07-03).** The detailed schemas are now frozen in
-> [`contracts/plm.md`](../../contracts/plm.md) (`aicad.plm/1`). The OSS survey +
-> git-binding verdict live in [`docs/review/PLM_OSS_SURVEY.md`](../review/PLM_OSS_SURVEY.md):
-> **git binding = dulwich (Apache-2.0 arm) primary, subprocess `git` optional
-> accelerator, pygit2 declined** (lightweight + cross-platform + Fedora/Windows
-> parity, no per-platform native wheel, in-process-clean under the guardrails).
+> **Git binding (resolved 2026-07-03).** An OSS survey of git bindings and CAD-PDM prior
+> art selected **dulwich (Apache-2.0 arm) as the primary binding, subprocess `git` as an
+> optional accelerator, pygit2 declined** (lightweight + cross-platform + Fedora/Windows
+> parity, no per-platform native wheel, in-process-clean under the license guardrails).
 > §3.1 below stands; this note records the resolved binding.
 
 ## 0. Design principles (ordered — #1 wins conflicts)
@@ -36,14 +32,12 @@ are frozen in `contracts/plm.md` (T-R1), not replaced by this design record.
    folder, the vault is built in, there is nothing to set up.
 2. **Manual controls first, AI assist behind them.** The buttons are the
    primary interface. AI (Copilot) can draft, suggest, and — if the user turns
-   it on — manage versioning automatically, but every AI action is visible,
-   attributed, and reversible (Pillar-14 transparency rule; autonomy dial
+   attributed, and reversible (agent transparency rule; autonomy dial
    precedent). AI-managed mode is an assist tier, never an exclusive mode.
 3. **Local-first, lightweight.** Full functionality with no account, no server,
    no network. A project's entire history lives in a hidden per-project store.
    Self-hosting = pointing a project at any git remote the user controls.
-   A company-hosted (SaaS) remote is the same seam, later, behind the
-   Pillar-12 human gate.
+   A hosted remote would use the same seam; none is implemented.
 4. **One obvious structure.** The tool imposes the layout; users never design
    a vault. No configurable lifecycle state machines, no admin screens, no
    check-in policies to author.
@@ -62,7 +56,7 @@ Three nouns, two verbs. Nothing else in v1.
 - **History** — automatic. Every explicit save silently records a restorable
   state. Baseline promise: *"you can always go back."* No init, no staging,
   no tracked-file decisions. (Autosave keeps its existing separate
-  crash-recovery ring from T-Q2 — history entries are cut on explicit save,
+  crash-recovery ring — history entries are cut on explicit save,
   so history stays meaningful, not noisy.)
 - **Checkpoint** — *"this state matters."* One button, one optional text box.
   Copilot pre-drafts the description from the semantic diff ("Increased wall
@@ -97,9 +91,9 @@ Default ships as **AI-assisted** (suggestions only); user can dial up to
   edit session) and keeps descriptions current. Every AI-cut entry is labeled
   with the AI attribution mark in the timeline and is one click to discard.
 
-All three tiers use the same seam: `plm_*` MCP tools (T-R2), so the built-in
+All three tiers use the same seam: `plm_*` MCP tools, so the built-in
 copilot and external MCP clients get identical capability. AI actions route
-through the existing telemetry envelope (T-H1) like any other AI artifact.
+through the existing telemetry envelope like any other AI artifact.
 
 ## 3. Architecture
 
@@ -108,7 +102,7 @@ through the existing telemetry envelope (T-H1) like any other AI artifact.
 Decision: **snapshot-based versioning on the canonical serialization, stored
 in a per-project git repository the user never sees.** Not op-log replay:
 `contracts/doc_ops.md` ops are transient (no persistent op log; geometry is
-derived; sessions carry state), while T-H2 gave every doc kind a canonical,
+derived; sessions carry state), while every doc kind already has a canonical,
 diff-stable JSON form — snapshots are already cheap and semantic diff already
 exists. Op-log capture can be layered later for finer-grained history without
 changing the user model.
@@ -116,8 +110,8 @@ changing the user model.
 Why git (hidden): content-addressed dedup + delta compression on canonical
 JSON is excellent; sync to *any* remote gives self-hosting for free; battle-
 tested; zero server required locally. The user-facing vocabulary never says
-git. T-R1's OSS survey picks the binding (subprocess git vs pygit2/libgit2 vs
-dulwich — CONTRIBUTING.md license guardrails apply) and surveys prior art
+git. The OSS survey picked the binding (subprocess git vs pygit2/libgit2 vs
+dulwich — CONTRIBUTING.md license guardrails apply) and surveyed prior art
 (Ondsel/FreeCAD PDM attempts, DVC, git-LFS locking) before code.
 
 ### 3.2 Project layout
@@ -151,10 +145,10 @@ BOM so a released rev is exact even if the rebuild engine evolves.
 
 | Tier | What it is | v1? |
 |---|---|---|
-| Local | per-project hidden vault, no network | yes (T-R2) |
-| Shared folder / USB | vault sync to a filesystem remote | yes (T-R7) |
-| Self-hosted | any git remote the user controls (bare repo over SSH, Gitea, GitHub…) | yes (T-R7) |
-| Chudware Cloud | our hosted remote + accounts + web view | seam only (config entry), Pillar-12 human gate before any implementation |
+| Local | per-project hidden vault, no network | yes |
+| Shared folder / USB | vault sync to a filesystem remote | yes |
+| Self-hosted | any git remote the user controls (bare repo over SSH, Gitea, GitHub…) | yes |
+| Hosted remote | a Chudware-hosted remote | reserved seam only (config entry); not implemented |
 
 Team concurrency v1 = **advisory edit locks + sync, no merging** (merging
 feature trees is where every PLM gets complicated). "Sync" is one button:
@@ -174,18 +168,18 @@ set is pinned to exact revs (BOM freeze snapshot, feeding the existing
 jobs consume this item) is derived from the manifest and powers stale-ref
 flags and the Project Hub explorer.
 
-### 3.5 Relationship to existing state (T-BL15's open questions, answered)
+### 3.5 Relationship to existing state (open questions, answered)
 
 - **Undo/redo** (`doc_undo`/`doc_redo`): session-scoped, unchanged. History
   persists across sessions; undo does not. The history panel makes the
   distinction visible ("Session changes" vs "Project history").
 - **Session `revision` counter / `doc_checkpoint` RPC:** transient rebuild
-  plumbing; not reused as storage. Vault snapshots serialize via the T-H2
+  plumbing; not reused as storage. Vault snapshots serialize via the
   canonical writers.
 - **DAG orchestrator checkpoint store:** separate concern (agent-run state,
   not user-doc history). They share the canonical serialization contract,
   nothing else.
-- **Autosave (T-Q2):** unchanged as the crash-recovery ring; history entries
+- **Autosave:** unchanged as the crash-recovery ring; history entries
   are cut on explicit save so the timeline stays curated. Recovery flow can
   offer "restore from history" alongside "recover autosave."
 - **Configurations:** remain the variants mechanism; PLM versions the whole
@@ -193,10 +187,10 @@ flags and the Project Hub explorer.
 
 ## 4. GUI surfaces
 
-Two integration levels, both on the T-U1 style kit:
+Two integration levels, both on the shared UI style kit:
 
-**In every editor (T-R5)** — part studio, assembly, drawing, ECAD
-schematic/PCB, CAM workspace, and the U7 viewers (piping/hydraulic/
+**In every editor** — part studio, assembly, drawing, ECAD
+schematic/PCB, CAM workspace, and the discipline viewers (piping/hydraulic/
 structural):
 - **History panel:** vertical timeline — thumbnail, when, who (user/AI),
   plain-language summary; hover = larger preview; right-click = restore /
@@ -208,7 +202,7 @@ structural):
 - **Compare view:** side-by-side 3D (`eval_compare` overlays) + change list;
   drawings/ECAD compare as overlaid 2D.
 
-**Project Hub (T-R6)** — the master GUI, a full-screen workspace (a doc-tab
+**Project Hub** — the master GUI, a full-screen workspace (a doc-tab
 kind of its own, like the CAM workspace) and the app's landing surface when a
 project is open:
 - item grid with live thumbnails, part numbers, rev + lifecycle chips
@@ -219,24 +213,25 @@ project is open:
 - team presence + lock indicators, Sync button (when a remote is configured)
 - Copilot dock for AI-managed actions and "what changed since Tuesday?" queries
 
-Onboarding: a guided tour (T-Q3 machinery) + auto-manual section (T-Q4) ship
-with T-R6; the empty-state of the Hub teaches the three nouns in one sentence
+Onboarding: a guided tour + auto-generated manual section ship with the
+Project Hub; the empty-state of the Hub teaches the three nouns in one sentence
 each.
 
-## 5. Workstream R task map
+## 5. Implementation map
 
-| Task | Content | Depends on |
+| Component | Content | Depends on |
 |---|---|---|
-| T-R1 | OSS survey (git binding, LFS/locks, prior CAD-PDM art) + freeze `contracts/plm.md` (aicad.plm/1 manifest, shadow-tree layout, lifecycle, lock + remote protocol, AI-assist seams) | — |
-| T-R2 | Vault core: `services/plm/` — project init/open, auto-history on save, checkpoint/release/restore, exploded-container storage, `plm_*` MCP tools | T-R1 |
-| T-R3 | Change intelligence: doc_diff→plain-language summaries, Copilot-drafted messages, AI-assist/AI-managed policies, compare (semantic + eval_compare visual), stale-ref detection | T-R2 |
-| T-R4 | Items & releases: part numbers/rev letters, release pinning + BOM freeze, where-used index, drawing title-block rev stamp | T-R2 |
-| T-R5 | In-editor GUI: history panel, rev badges, checkpoint/release toolbar, compare view — every doc kind, on the T-U1 kit | T-R2, T-R3, T-U1 |
-| T-R6 | Project Hub: full-screen master workspace (grid, activity, release board, where-used, Copilot dock) + guided tour + manual section | T-R4, T-R5 |
-| T-R7 | Sharing & team sync v1: remote profiles (folder/SSH/any git host), one-button Sync, advisory locks, copy-as-variant conflict guard, SaaS remote seam (config-only, Pillar-12 gate) | T-R2, T-R4 |
+| Contract | OSS survey (git binding, LFS/locks, prior CAD-PDM art) + freeze `contracts/plm.md` (aicad.plm/1 manifest, shadow-tree layout, lifecycle, lock + remote protocol, AI-assist seams) | — |
+| Vault core | `services/plm/` — project init/open, auto-history on save, checkpoint/release/restore, exploded-container storage, `plm_*` MCP tools | contract |
+| Change intelligence | doc_diff→plain-language summaries, Copilot-drafted messages, AI-assist/AI-managed policies, compare (semantic + eval_compare visual), stale-ref detection | vault core |
+| Items & releases | part numbers/rev letters, release pinning + BOM freeze, where-used index, drawing title-block rev stamp | vault core |
+| In-editor GUI | history panel, rev badges, checkpoint/release toolbar, compare view — every doc kind | vault core, change intelligence |
+| Project Hub | full-screen master workspace (grid, activity, release board, where-used, Copilot dock) + guided tour + manual section | items & releases, in-editor GUI |
+| Sharing & team sync v1 | remote profiles (folder/SSH/any git host), one-button Sync, advisory locks, copy-as-variant conflict guard, hosted-remote seam (config-only) | vault core, items & releases |
 
-Sequencing intent: R1→R2 are the spine; R3/R4 parallelize after R2; R5 after
-R3; R6 is the capstone; R7 can run parallel to R5/R6.
+Sequencing intent: contract → vault core is the spine; change intelligence and items &
+releases parallelize after the vault core; the in-editor GUI follows change intelligence;
+the Project Hub is the capstone; sharing can run parallel to the GUI work.
 
 ## 6. Non-goals (v1)
 
@@ -245,5 +240,4 @@ R3; R6 is the capstone; R7 can run parallel to R5/R6.
 - Custom lifecycle states, approval workflows, e-signatures (later, behind
   Advanced, if ever)
 - ECO/change-order management
-- Server implementation for Chudware Cloud (seam reserved only; Pillar-12 human
-  gate before any build)
+- Server implementation for a hosted remote (seam reserved only)

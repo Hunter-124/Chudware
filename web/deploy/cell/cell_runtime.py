@@ -24,24 +24,11 @@ BASE_ENV = {"PATH": "/opt/chudware/bin:/opt/chudware/venv/bin:/usr/bin:/bin", "L
             "NO_PROXY": "127.0.0.1,localhost,::1", "no_proxy": "127.0.0.1,localhost,::1"}
 ACTOR_ENV = frozenset({"CHUDWARE_ACTOR_KEY", "CHUDWARE_WORKSPACE_KEY", "CHUDWARE_ACTOR_HEX",
     "CHUDWARE_CELL_RIGHT", "CHUDWARE_CELL_EPOCH", "CHUDWARE_HOSTD_WORKER_LANE", "CHUDWARE_WRITER_GROUP"})
-PROVIDER_ENDPOINT_ENV = frozenset({"ANTHROPIC_BASE_URL", "ANTHROPIC_SEARCH_BASE_URL"})
 
 
 def actor_environment():
-    """Only scoped grants and fixed broker endpoints may cross an actor boundary."""
-    values = {key: os.environ[key] for key in ACTOR_ENV if key in os.environ}
-    grant = os.environ.get("CHUDWARE_PROVIDER_GRANT")
-    if grant is not None:
-        if not re.fullmatch(r"cpg1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}", grant) or len(grant) > 4096:
-            raise ValueError("invalid provider grant environment")
-        values["CHUDWARE_PROVIDER_GRANT"] = grant
-    for key in PROVIDER_ENDPOINT_ENV:
-        value = os.environ.get(key)
-        if value is not None:
-            if value != "http://127.0.0.1:18081/anthropic/v1" or grant is None:
-                raise ValueError("provider endpoint outside scoped broker")
-            values[key] = value
-    return values
+    """Only the actor's scoped identity may cross an actor boundary."""
+    return {key: os.environ[key] for key in ACTOR_ENV if key in os.environ}
 
 
 def hex_id(value):

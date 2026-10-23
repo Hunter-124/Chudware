@@ -1,11 +1,11 @@
-"""Design-gym challenge suite v1 (T-W27) + two-division extension.
+"""Design-gym challenge suite v1 + two-division extension.
 
 Each challenge is a Python module exposing a module-level ``CHALLENGE`` :class:`Challenge`.
 A challenge is a deliverable-manifest fixture (contract §16) plus DETERMINISTIC
 ground-truth acceptance-criteria graders the gym runs ITSELF against the produced
 ledger/artifacts — never trusting the mission pipeline's own PASS floor.
 
-The suite (task spec):
+The suite:
   C1  flanged bushing         — fit bore + bolt circle
   C2  clamshell enclosure     — snap lid, PETG
   C3  bearing block           — 6202 seat + FEA margin under load

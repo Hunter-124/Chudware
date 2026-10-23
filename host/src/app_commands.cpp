@@ -1,5 +1,4 @@
-// app_commands.cpp — T-RF11 (node R2b): ribbon command table construction.
-#include <chrono>
+// app_commands.cpp — ribbon command table construction.
 //
 // Each family that used to be an inline block in app.cpp's dispatchCmd lambda is now a rule in an
 // ordered table. Workspace families route to the owning module's existing entry point
@@ -9,14 +8,12 @@
 // Make Drawing, Display style, Appearance presets, Sheet Metal one-clicks) are implemented in
 // app.cpp and arrive via RibbonCommandHooks.
 //
-#include "security/event_queue.h"
 // REGISTRATION ORDER IS THE SEMANTICS. buildRibbonCommandRouter registers rules in exactly the
 // order the original if-chain tested them, and CommandRouter::dispatch stops at the first rule
 // that matches AND consumes (returns true). Rules that may decline a command (dwg_, asm_,
 // reveng_, sim_, eval_, the sketch hooks, the PM form opener) fall through to later rules just
 // like the original `if (prefix && handler(...)) return;` blocks did.
 #include "app_commands.h"
-#include <algorithm>
 #include <string_view>
 
 #include "core/app_state.h"
@@ -30,65 +27,6 @@
 #include "ui/sketch3d_mode.h"            // 3D free-space sketcher
 #include "ui/sketch_mode.h"              // C18 sketch mode
 #include "ui/ribbon_def.h"
-#include "security/integrity.h"
-#include "security/runtime_guard.h"
-#include "util/platform_paths.h"
-#include "util/entitlement.h"
-extern "C" {
-#include "util/tweetnacl.h"
-}
-
-namespace {
-
-std::vector<unsigned char> mutationDecode64(std::string_view value) {
-    auto cv = [](unsigned char c) -> int {
-        if (c >= 'A' && c <= 'Z') return c - 'A';
-        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-        if (c >= '0' && c <= '9') return c - '0' + 52;
-        if (c == '-') return 62;
-        if (c == '_') return 63;
-        return -1;
-    };
-    if (value.empty() || value.find('=') != std::string_view::npos || value.size() % 4 == 1)
-        return {};
-    std::vector<unsigned char> out;
-    unsigned int acc = 0;
-    int bits = 0;
-    for (unsigned char c : value) {
-        const int v = cv(c);
-        if (v < 0) return {};
-        acc = (acc << 6) | static_cast<unsigned int>(v);
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out.push_back(static_cast<unsigned char>((acc >> bits) & 255));
-        }
-    }
-    return out;
-}
-
-// First document mutation independently calls TweetNaCl. It deliberately does
-// not share the launch or first-AI verifier; this is a scope-bounded speed bump,
-// not an anti-tamper claim.
-bool verifyMutationToken(std::string_view token) {
-    const std::size_t dot = token.find('.');
-    if (dot == std::string_view::npos || token.find('.', dot + 1) != std::string_view::npos)
-        return false;
-    const std::string_view encoded = token.substr(0, dot);
-    const auto signature = mutationDecode64(token.substr(dot + 1));
-    if (signature.size() != crypto_sign_BYTES) return false;
-    std::vector<unsigned char> signedMessage(signature.size() + encoded.size());
-    std::copy(signature.begin(), signature.end(), signedMessage.begin());
-    std::copy(encoded.begin(), encoded.end(), signedMessage.begin() + signature.size());
-    std::vector<unsigned char> opened(signedMessage.size());
-    unsigned long long openedLength = 0;
-    return crypto_sign_open(opened.data(), &openedLength, signedMessage.data(),
-                            static_cast<unsigned long long>(signedMessage.size()),
-                            chudware::entitlement::kEmbeddedPublicKey.data()) == 0 &&
-           openedLength == encoded.size();
-}
-
-}  // namespace
 
 // ---------------------------------------------------------------------------
 // CommandRouter
@@ -106,71 +44,6 @@ void CommandRouter::registerAny(Handler h) {
     rules_.push_back({Kind::Any, std::string(), std::move(h)});
 }
 
-namespace {
-
-#if !defined(__EMSCRIPTEN__)
-std::string boundedRuntimeReason(const chudware::security::SecuritySnapshot& snapshot) {
-    return snapshot.reasonCodes.empty() ? std::string("protected_file_hash_mismatch")
-                                        : snapshot.reasonCodes.front();
-}
-
-bool durablyReportRuntimeReasons(const chudware::security::SecuritySnapshot& snapshot) {
-    chudware::security::SecurityReporter reporter(appdataAppDir());
-    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    for (const auto& reason : snapshot.reasonCodes) {
-        if (chudware::security::approvedSecurityReason(reason) &&
-            chudware::security::securityEventScore(reason) > 0 && !reporter.report(reason, now))
-            return false;
-    }
-    return true;
-}
-#endif
-
-bool runtimeAllowsMutation(AppState& st) {
-#if defined(__EMSCRIPTEN__)
-    // The browser build is a server-authorized web surface, not a packaged
-    // customer executable. Native payload/runtime attestation is inapplicable;
-    // entitlement token verification below remains mandatory for mutations.
-    (void)st;
-    return true;
-#else
-    const auto executable = chudware::platform::executablePath();
-    const auto integrity = chudware::security::verifyInstalledPayload(
-        executable, chudware::security::VerifyMode::ProtectedOperation);
-    if (!integrity.ok) {
-        chudware::security::SecurityReporter reporter(appdataAppDir());
-        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        if (!reporter.report("protected_file_hash_mismatch", now)) {
-            st.entitlementReadOnly = true;
-            st.entitlementStatus = "Protected operation blocked: security evidence could not be persisted";
-            st.toast(ui::ToastLevel::Warn, st.entitlementStatus);
-            return false;
-        }
-        st.entitlementReadOnly = true;
-        st.entitlementStatus = "Protected operation blocked: protected_file_hash_mismatch";
-        st.toast(ui::ToastLevel::Warn, st.entitlementStatus);
-        return false;
-    }
-    const auto snapshot = chudware::security::inspectRuntime(
-        chudware::security::SecurityCheckpoint::BeforeMutation,
-        integrity.root, integrity.files);
-    if (snapshot.ok()) return true;
-    if (!durablyReportRuntimeReasons(snapshot)) {
-        st.entitlementReadOnly = true;
-        st.entitlementStatus = "Protected operation blocked: security evidence could not be persisted";
-        st.toast(ui::ToastLevel::Warn, st.entitlementStatus);
-        return false;
-    }
-    st.entitlementReadOnly = true;
-    st.entitlementStatus = "Protected operation blocked: " + boundedRuntimeReason(snapshot);
-    st.toast(ui::ToastLevel::Warn, st.entitlementStatus);
-    return false;
-#endif
-}
-
-}  // namespace
 bool CommandRouter::authorize(AppState& st, const char* cmdId) const {
     if (ui::ribbonCommandCapability(cmdId) != ui::CommandCapability::Mutate) return true;
     const std::string_view cmd = cmdId ? cmdId : "";
@@ -180,22 +53,6 @@ bool CommandRouter::authorize(AppState& st, const char* cmdId) const {
             cmd == "sketch_cancel" || cmd == "sketch3d_cancel") return true;
         st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
         return false;
-    }
-    if (!runtimeAllowsMutation(st)) return false;
-    if (st.entitlementReadOnly) {
-        st.toast(ui::ToastLevel::Warn,
-                 "Read-only mode — sign in or manage your subscription to edit");
-        return false;
-    }
-    if (!st.entitlementMutationVerified) {
-        if (!verifyMutationToken(st.entitlementToken)) {
-            st.entitlementReadOnly = true;
-            st.entitlementSignedIn = false;
-            st.entitlementStatus = "Entitlement verification failed; sign in again";
-            st.toast(ui::ToastLevel::Warn, st.entitlementStatus);
-            return false;
-        }
-        st.entitlementMutationVerified = true;
     }
     return true;
 }

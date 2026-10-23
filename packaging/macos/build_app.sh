@@ -4,6 +4,10 @@
 # --finalize-signing SIG --release-public-key KEY seals and archives that exact retained bundle.
 # Release configure: generate into host/build-macos-<arch>/generated/protected-assets, then
 # configure host and core/hostd with -DCHUDWARE_DEVELOPER_BUILD=OFF -DCHUDWARE_LTO=ON.
+# Env: CHUDWARE_RELEASE_PYTHON (required) is the absolute interpreter of the release compiler
+# venv (requirements.txt + packaging/requirements-release.txt). When CHUDWARE_WHEELHOUSE names a
+# reviewed offline wheelhouse, CHUDWARE_BASE_PYTHON must name the separate base interpreter that
+# authenticates that venv first.
 set -euo pipefail
 for name in "${!PYTHON@}" "${!LD_@}" "${!DYLD_@}"; do
     [ -z "$name" ] || unset "$name"
@@ -61,12 +65,14 @@ else
         echo "error: --release-public-key is required with --finalize-signing" >&2; exit 2;
     }
 fi
-case "$TRUSTED_BASE" in /*) ;; *) echo "error: CHUDWARE_BASE_PYTHON must identify a separately authenticated absolute base Python" >&2; exit 1 ;; esac
-case "$RELEASE_PYTHON" in /*) ;; *) echo "error: CHUDWARE_RELEASE_PYTHON must identify the managed compiler runtime" >&2; exit 1 ;; esac
-COMPILER_VENV="$(dirname "$(dirname "$RELEASE_PYTHON")")"
-"$TRUSTED_BASE" -I -S -c 'import sys;sys.path.insert(0,sys.argv[1]);from services.installer.provision import main;sys.exit(main(sys.argv[2:]))' \
-    "$REPO" --check-inputs --base-python "$TRUSTED_BASE" --venv-dir "$COMPILER_VENV" \
-    --wheelhouse "${CHUDWARE_WHEELHOUSE:-$REPO/wheelhouse}"
+case "$RELEASE_PYTHON" in /*) ;; *) echo "error: CHUDWARE_RELEASE_PYTHON must identify the release compiler runtime (absolute path)" >&2; exit 1 ;; esac
+if [ -n "${CHUDWARE_WHEELHOUSE:-}" ]; then
+    case "$TRUSTED_BASE" in /*) ;; *) echo "error: CHUDWARE_BASE_PYTHON must identify a separately authenticated absolute base Python" >&2; exit 1 ;; esac
+    COMPILER_VENV="$(dirname "$(dirname "$RELEASE_PYTHON")")"
+    "$TRUSTED_BASE" -I -S -c 'import sys;sys.path.insert(0,sys.argv[1]);from services.installer.provision import main;sys.exit(main(sys.argv[2:]))' \
+        "$REPO" --check-inputs --base-python "$TRUSTED_BASE" --venv-dir "$COMPILER_VENV" \
+        --wheelhouse "$CHUDWARE_WHEELHOUSE"
+fi
 
 release_python() {
     "$RELEASE_PYTHON" -I -c 'import sys;sys.path.insert(0,sys.argv[1]);from services.installer.provision import run_python_entry;run_python_entry(sys.argv[1],sys.argv[2],sys.argv[3:])' \
@@ -377,7 +383,8 @@ if [ "$MODE" = prepare ]; then
 sed "s/@CHUDWARE_VERSION@/$VERSION/g" "$REPO/packaging/macos/Info.plist" > "$CONTENTS/Info.plist"
 plutil -lint "$CONTENTS/Info.plist" >/dev/null
 cp "$REPO/packaging/macos/Chudware.icns" "$RESOURCES/Chudware.icns"
-cp "$REPO/LICENSE-EULA.txt" "$RESOURCES/LICENSE-EULA.txt"
+cp "$REPO/LICENSE" "$RESOURCES/LICENSE"
+cp "$REPO/THIRD_PARTY_NOTICES.md" "$RESOURCES/THIRD_PARTY_NOTICES.md"
 cp "$REPO/packaging/macos/RELEASE_NOTES.md" "$RESOURCES/RELEASE_NOTES.md"
 cp "$BIN" "$MACOS/Chudware-bin"
 chmod +x "$MACOS/Chudware-bin"
@@ -541,27 +548,11 @@ cat > "$MACOS/Chudware" <<'LAUNCHER'
 #!/bin/sh
 set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-EULA="$HERE/../Resources/LICENSE-EULA.txt"
-STATE="$HOME/Library/Application Support/Chudware/eula-@CHUDWARE_VERSION@.accepted"
-if [ ! -f "$STATE" ]; then
-    while :; do
-        choice=$(osascript <<'APPLESCRIPT'
-button returned of (display dialog "Please review the Chudware End User License Agreement before using Chudware. By selecting Accept, you agree to its terms." with title "Chudware License Agreement" buttons {"Decline", "View License", "Accept"} default button "Accept" cancel button "Decline" with icon caution)
-APPLESCRIPT
-        ) || exit 1
-        case "$choice" in
-            "Accept") mkdir -p "$(dirname "$STATE")"; printf '%s\n' accepted > "$STATE"; break ;;
-            "View License") open "$EULA" ;;
-            *) exit 1 ;;
-        esac
-    done
-fi
 export CHUDWARE_LIBCHUDWARE="$HERE/../Frameworks/libchudware.dylib"
 if [ -x "$HERE/chudware-hostd" ]; then export CHUDWARE_HOSTD_BIN="$HERE/chudware-hostd"; fi
 if [ -x "$HERE/chud" ]; then export CHUDWARE_CHUDCODE_BIN="$HERE/chud"; fi
 exec "$HERE/Chudware-bin" "$@"
 LAUNCHER
-sed -i '' "s/@CHUDWARE_VERSION@/$VERSION/g" "$MACOS/Chudware"
 chmod +x "$MACOS/Chudware"
 
 

@@ -1,4 +1,4 @@
-"""Design-gym runner (T-W27).
+"""Design-gym runner.
 
 Runs each challenge through the real DAG pipeline per seed on the configured
 tier and:
@@ -55,7 +55,7 @@ class ExecProbe:
     frontier_key: bool
     local_model: bool
     real_agent_fn: bool
-    # T-DP19: is the DAG executor's checkpoint dependency importable in THIS
+    # Is the DAG executor's checkpoint dependency importable in THIS
     # interpreter? run_mission's PLAN phase imports services.dag.executor, whose
     # top-level `from langgraph.checkpoint.sqlite import SqliteSaver` raises under an
     # interpreter that lacks it (system python3). Without this gate the probe reports
@@ -185,16 +185,15 @@ def execution_probe() -> ExecProbe:
 
 
 # ---------------------------------------------------------------------------
-# Interpreter guard (T-DP19) — the gym real-run path runs run_mission IN-PROCESS,
+# Interpreter guard — the gym real-run path runs run_mission IN-PROCESS,
 # whose PLAN phase imports services.dag.executor → `from langgraph.checkpoint.sqlite
 # import SqliteSaver` at module load. Launched under an interpreter lacking that
 # package (system python3), execute_dag raises ImportError, the mission dies at PLAN,
 # and every tuning cell ties at win_rate 0.00. The deps live in the shared mcp-venv;
 # re-exec into a capable interpreter AT ENTRY so real runs actually reach BUILD.
 #
-# NOTE: the T-DP19 work order framed this as "propagate sys.executable across a
-# subprocess boundary" — but the whole mission→DAG path is in-process, so the correct
-# fix is a re-exec-at-entry guard, not interpreter propagation across a spawn.
+# The whole mission→DAG path is in-process, so the fix is a re-exec-at-entry guard,
+# not interpreter propagation across a subprocess spawn.
 # ---------------------------------------------------------------------------
 
 _REEXEC_SENTINEL = "_CHUDWARE_GYM_REEXEC"
@@ -258,7 +257,7 @@ def ensure_capable_interpreter(module: str) -> None:
     print(
         f"[gym] re-exec into {target}\n"
         f"      (this interpreter lacks langgraph.checkpoint.sqlite; real DAG runs "
-        f"would die at PLAN — see T-DP19)",
+        f"would die at PLAN)",
         file=sys.stderr,
         flush=True,
     )
@@ -740,9 +739,8 @@ def run_cell(
 _LOCAL_PROVIDER_CACHE: dict[str, Any] = {}
 _DEFAULT_LOCAL_MODEL = "qwen3-4b"  # the bundled CUDA model the tuning loop benchmarks (tiers.yaml local_models.fanout)
 
-# Tokenmaxxing (Hunter, 2026-07-07): three local models are production-ready and
-# bundled/served via llama.cpp (services/installer/llamacpp.py, model_manager._REGISTRY,
-# benchmarks/tokenmaxx/REPORT.md). New tier names are suffixed variants of the existing
+# Local tiers: three local models are bundled/served via llama.cpp
+# (services/installer/llamacpp.py, model_manager._REGISTRY). Tier names are suffixed variants of the existing
 # "local-24k" tiers.yaml profile (same 24k budget/context class — effort.normalize_tier
 # prefix-matches "local-24k" against them), matching the "frontier-200k" alias convention:
 #
@@ -1016,10 +1014,8 @@ def _drive_mission_pipeline(
 ) -> dict:
     """Drive the mission pipeline for ONE gym cell and return its mission record.
 
-    T-RF5 deleted the Python mission front door (``services.agent.loop.run_mission``)
-    in favour of the C++ core's ``agent_mission_v1``, but the gym kept calling it —
-    so every cell's mission record had been the string
-    ``AttributeError: module 'services.agent.loop' has no attribute 'run_mission'``.
+    The Python mission front door (``services.agent.loop.run_mission``) was removed in
+    favour of the C++ core's ``agent_mission_v1``.
     The gym grades the PYTHON ledger the pipeline writes, so it cannot go through the
     core RPC; it composes the surviving deterministic primitives itself, in the same
     order and with the same phase/status vocabulary the deleted front door used:

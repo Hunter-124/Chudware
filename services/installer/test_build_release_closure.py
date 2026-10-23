@@ -112,6 +112,8 @@ def test_windows_stage_and_manifest_own_complete_runtime_closure(
         "CHUDCODE-NOTICE",
         "CHUDCODE-THIRD-PARTY-NOTICES.txt",
         "chudware-uninstall-helper.exe",
+        "LICENSE",
+        "THIRD_PARTY_NOTICES.md",
     }
     actual = {p.relative_to(dst).as_posix() for p in dst.rglob("*") if p.is_file()}
     assert actual == expected

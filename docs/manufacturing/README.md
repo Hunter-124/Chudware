@@ -1,9 +1,9 @@
 # Manufacturing / CNC / Additive overhaul — master index
 
 Design corpus for the Manufacture overhaul: real machine control, a deterministic physical
-twin, additive manufacturing with an internally modifiable slicer, probing/metrology, a
-home-grown predictive perception model, and the breadth tracks (industrial monitoring,
-turning, laser/plasma/waterjet, pick-and-place, robot offline planning).
+twin, additive manufacturing with an internally modifiable slicer, probing/metrology, and the
+breadth tracks (industrial monitoring, turning, laser/plasma/waterjet, pick-and-place, robot
+offline planning).
 
 Read in this order. `01_definition_of_done.md` is the authority when two documents disagree;
 `10_gateway.md` owns every shared schema and the stable rule ids (`MFG-*`) the other
@@ -14,40 +14,25 @@ layout; [As-built map](#as-built-map) below records, per document, what exists a
 contracts, trees and tests were never built. A path a design doc names that the map lists as not
 built is a proposal, not a missing file to go looking for.
 
-**Session references are dated evidence, not retrievable specs.** Documents 00, 02, 10–20 and 23
-cite `local://…`, `agent://…` and `history://…` URIs. Those were non-persistent artifacts of the
-authoring agent sessions (some were already empty when cited, e.g. `agent://PrinterMonitoring` in
-`10_gateway.md`); they cannot be opened from the repository. The checked-in documents carry
-everything that survived.
+The decision record (`00_decisions.md`, `01_definition_of_done.md`) also covers a camera-based
+predictive perception model. That research track is not part of this repository; the rules it
+imposes on the rest of the system — perception is advisory and never satisfies an execute-side
+gate — still apply to any future perception input.
 
 | file | what it is |
 |---|---|
 | `00_decisions.md` | locked product decisions (autonomy, controllers, slicer, printers, model, retention) |
 | `01_definition_of_done.md` | the 20 acceptance criteria every wave is measured against |
-| `02_plan_review.md` | the independent architecture review; each finding is closed in the owning doc |
 | `10_gateway.md` | **foundation** — identities, `FreshValue<T>`, capability truth, journal/seq, invalidation, Tier-0, gates, approval, arbiter, lease, Grbl boundary, printer adapters, MCP risk gating, stable rule ids |
 | `11_twin.md` | deterministic engineering twin (tick clock, Grbl emulation, stock/collision, virtual sensors, replay, training wrapper) |
 | `12_metrology.md` | probing + quality: evidence classes, accuracy tiers, offsets, inspection |
 | `13_additive.md` | additive as a sibling domain + the AGPL PrusaSlicer sidecar fork contract |
-| `14_perception.md` | Forecast-to-Compress MLDP: the predictive model, datasets, training, ONNX deployment |
 | `15_ux.md` | the operator surfaces, Offline vs Live truth boundary, gate/waiver rendering |
 | `16_monitoring.md` | read-only MTConnect then OPC UA telemetry |
 | `17_turning.md` | single-spindle XZ turning |
 | `18_cutting.md` | laser / plasma / waterjet process profiles |
 | `19_pnp.md` | OpenPnP virtual + job interchange |
 | `20_robot.md` | ROS 2 / MoveIt offline planning |
-| `21_qualification.md` | hermetic E3 gateway and virtual-printer qualification procedures |
-| `22_perception_model.md` | Forecast-to-Compress evaluation protocol and measured publication limits |
-| `23_security_review.md` | manufacturing/perception security-review baseline and findings |
-| `24_code_review.md` | implementation code-review baseline and hardware-pilot blockers |
-| `25_viewpoint_model.md` | learned viewpoint policy evaluation against limited-information baselines and the oracle |
-| `26_viewpoint_feedback.md` | Stage-2 consumer-feedback protocol for viewpoint usefulness labels |
-| `27_viewpoint_render.md` | viewpoint pose-to-image and physical-camera bridge |
-| `28_viewpoint_observation.md` | information-limited viewpoint observation contract |
-| `29_viewpoint_accel.md` | optional Torch acceleration for the frozen viewpoint oracle |
-| `30_viewpoint_pixels.md` | rendered-pixel corpus for the learned viewpoint encoder |
-| `31_viewpoint_usefulness.md` | task-grounded viewpoint usefulness benchmark |
-| `32_viewpoint_flywheel.md` | opt-in judgement and outcome-data flywheel |
 | `90_research_printers.md` | primary-source printer-integration research |
 
 ## Non-negotiables (short form)
@@ -70,14 +55,13 @@ Cross-domain phases. Gateway-internal wave ids (`W1.1` …) are `10_gateway.md` 
 
 | phase | status | contents |
 |---|---|---|
-| **P0** | landed | baseline (`scripts: scope hostd staleness inputs`, `docs: restore refactor log ordering`) |
+| **P0** | landed | baseline: the pre-overhaul tree landed in coherent units |
 | **P1** | landed | `contracts/manufacturing_gateway.md`, `core/device/*.h`, `FreshValue<T>`, journal + durable seq + ten-domain result registry + invalidation, `manufacture` family default-off, contract section allocation |
-| **P2** | landed | `grbl_protocol`, twin core, additive model, slicer sidecar, metrology core, perception + training core, MTConnect monitor, turning, cutting, PnP, robot |
+| **P2** | landed | `grbl_protocol`, twin core, additive model, slicer sidecar, metrology core, MTConnect monitor, turning, cutting, PnP, robot |
 | **P3** | landed | `tier0` + `policy`, `gates`, `approval` + `lease` + `arbiter`, `grbl_adapter` + `emulator_transport` (E1–E3) |
 | **P4** | landed | `core/hostd/mfg_lane` serving the `mfg_*` surface, `services/mcp/mfg_tools.py` + motion/safety risk classes, `host/src/ui/manufacture/**` operator surfaces |
-| **P5** | landed | serial/TCP/WebSocket transports behind a deny-by-default commissioning allowlist, Moonraker/OctoPrint/PrusaLink adapters, durable attention + notification path, perception capture, and the lane transport-selection seam |
-| **P6** | next | perception capture on real jobs, training runs, published model + training core |
-| **P7** | blocked on hardware | E4–E6 pilot campaign, then and only then `execute` advertisement |
+| **P5** | landed | serial/TCP/WebSocket transports behind a deny-by-default commissioning allowlist, Moonraker/OctoPrint/PrusaLink adapters, durable attention + notification path, and the lane transport-selection seam |
+| **P6** | blocked on hardware | E4–E6 pilot campaign, then and only then `execute` advertisement |
 
 **Two deliberate deviations from the design, both standing:**
 
@@ -91,7 +75,7 @@ Cross-domain phases. Gateway-internal wave ids (`W1.1` …) are `10_gateway.md` 
    its cost. The lane still owns claims, approval, durable seq and events, and strips any authority a
    worker result tries to assert.
 
-`P7` is operator-attended and hardware-gated by design: nothing before it may advertise
+`P6` is operator-attended and hardware-gated by design: nothing before it may advertise
 `execute` on a physical machine.
 
 Phase status above records the cross-domain phase closing; it does not mean every artifact a design
@@ -122,15 +106,12 @@ name that do not exist; design docs are not rewritten to match.
 | `11_twin.md` | `core/twin/{twin.h,twin.cpp,wide_math.h}` (`chudware_twin`, linked to the shared Grbl codec); `core/tests/test_twin.cpp`; `fixtures/mfg/twin/` | `contracts/manufacturing_twin.md`; split headers `core/twin/{clock,entity,state,faults,grbl_emu,record,vsensor,vcamera}.h`; `core/cam/stock_step.*`; `docs/TWIN.md`; the eleven `test_twin_*` executables; `services/manufacturing/twin/` |
 | `12_metrology.md` | Python only: `services/manufacturing/metrology/` (evidence, tiers, probe, registration, offsets, transform, limits, inspection) with `test_metrology.py`; `fixtures/mfg/metrology/` | `contracts/manufacturing_metrology.md`; `core/metrology/**` (incl. `offsets.cpp`, `session.cpp`); `services/mcp/metrology_tools.py`; `contracts/fixtures/metrology/`; `core/tests/test_metrology_frames.cpp`; `host/src/ui/manufacture/inspectors.cpp` |
 | `13_additive.md` | `core/print/model.{h,cpp}` (`chudware_print`) + `core/tests/test_print_model.cpp`; `services/manufacturing/slicer/` (arms-length argv/file/subprocess seam to an installed PrusaSlicer, vendor-bundle reader, G-code checks); `services/manufacturing/printers/` (Moonraker, OctoPrint, PrusaLink adapters + `worker_rpc.py`); `services/manufacturing/print_media.py`; `fixtures/mfg/{print,printers}/` | `contracts/manufacturing_print.md`; vendored slicer fork (`vendor/slicer/`, `scripts/vendor_slicer.py`); `core/print/gcode_parse`; host print UI (`host/src/ui/print/**`, `host/src/ui/manufacture/print/**`); `services/mcp/mfg_print_tools.py`; `services/gateway/` |
-| `14_perception.md`, `22_perception_model.md` | `services/perception/` (`packet`, `reference`, `config`, `capture/`); `training/perception/` (data, model, train, evaluate, ONNX export, manifest); `fixtures/mfg/perception/` | `contracts/manufacturing_perception.md`; `services/mcp/perception_tools.py`; `services/perception/{service,source,ringbuf,eventizer,grounding,retention}.py`; `core/twin/vcamera.h`; `training/jobs/perception_mldp_*.md`, `training/corpora/perception/` |
 | `15_ux.md` | `host/src/ui/manufacture/` (`manufacture_panel`, `device_panel`, `run_panel`, `approval_dialog`, `attention_panel`, `mfg_mirror`) | `contracts/manufacturing_ux.md`; `manufacture_workspace.cpp`; `host/tests/test_mfg_{fresh,mirror}.cpp`; per-domain panels (print, monitor, turning, cut, PnP, robot) |
 | `16_monitoring.md` | `services/manufacturing/monitor/` (`mtconnect`, `normalize`, `replay`, `opcua/` client/codec/protocol/machine tools/fake server) with tests; `fixtures/mfg/monitor/` | `services/mcp/mfg_monitor_tools.py`; monitor `service`/`model`/`tier0` modules; `collector_opcua/`; `services/manufacturing/rpc/journal_client.py`; host monitor panel; `scripts/mfg_monitor_readonly_gate.sh`, `scripts/qualify_monitor_e{1,2}.sh` |
 | `17_turning.md` | `core/cam/turn/process.{h,cpp}`; `core/tests/test_cam_processes.cpp`; `fixtures/mfg/turn/` | split modules (`turn_profile`, `turn_tool`, `turn_semantics`, `workholding`, `post_turn`, `turn_tier0`); `core/cam/stock_step.*`; `services/manufacturing/turning/`; turning panel; `core/tests/test_cam_turn.cpp`; `scripts/qualify_turn_e2.sh` |
 | `18_cutting.md` | `core/cam/cut/process.{h,cpp}`; `core/tests/test_cam_processes.cpp`; `fixtures/mfg/cut/` | per-process modules (`op_laser`, `op_plasma`, `op_waterjet`, `recipe`, `vector_plan`, `plasma_state`, `parse_gcode`, `post_cut`, `cut_sim`, `emulator`); cut process panel |
 | `19_pnp.md` | Python only: `services/manufacturing/pnp/` (`capability`, `model`, `openpnp`, `simulator`) with tests; `fixtures/mfg/pnp/` | `contracts/mfg_pnp.md`; `core/pnp/**`; `pnp/{rpc,tier0,evidence}.py`; `services/manufacturing/rpc/`; PnP panel; `scripts/qualify_pnp_q1.sh`, `scripts/smoke_pnp_offline.sh` |
 | `20_robot.md` | Python only: `services/manufacturing/robot/` (`capability`, `model`, `urdf`, `kinematics`, `collision`, `trajectory`, `safety_boundary`) with tests; `fixtures/mfg/robot/` | `contracts/mfg_robot.md`; `core/robot/**`; robot panel and mirror; further robot modules (`cell`, `collide`, `determinism`, `evidence`, `export_traj`, `mesh_io`, …); `scripts/qualify_robot_e3.sh` |
-| `21_qualification.md` | `scripts/qualify_mfg_e3.{py,sh}`, `scripts/qualify_mfg_printer.{py,sh}` | — |
-| `25`–`32` viewpoint | `services/viewpoint/**`; `training/viewpoint/**`; `fixtures/viewpoint/` | — |
 
-`00`–`02`, `23`, `24` and `90` are decision, review and research records; they describe no
+`00`, `01` and `90` are decision and research records; they describe no
 separate implementation tree.

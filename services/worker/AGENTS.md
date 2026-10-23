@@ -3,9 +3,8 @@
 Single client-side dispatch point for every host→engine call. It routes each call either to
 `libchudware` (through the `chudware-hostd` daemon by default, or in-process) or to the
 services worker. Wire contract: `contracts/worker_rpc.md`. Ongoing guidance:
-- Repo rules, build and gate: `.claude/skills/chudware-dev/SKILL.md`.
-- Agent lane and Chudcode turns: `.claude/skills/cad-chudcode-integration/SKILL.md`.
-- Source map: `work/context/worker-bridge.md` (`/ctx-worker-bridge`).
+- Repo rules, build and gate: `docs/dev/engineering-notes.md`.
+- Agent lane and Chudcode turns: `docs/dev/chudcode-integration.md`.
 
 ## Modules (these three only)
 
@@ -35,11 +34,12 @@ Compiled by:
 GUI document/job/bootstrap state lives in `host/src/core/*` and
 `host/src/bootstrap.cpp`; do not duplicate it in this transport seam.
 
-## Write-set rules
+## Change rules
 
-- The routing predicates in `worker_client.cpp` are shared and integrator-merged. A new
-  stateful agent RPC family also needs hostd's agent-lane prefix list
-  (`WorkerBridge::forMethod`, `core/hostd/worker_bridge.cpp`).
+- The routing predicates in `worker_client.cpp` are shared by every panel; change them
+  deliberately and keep `contracts/worker_rpc.md` in step. A new stateful agent RPC family
+  also needs hostd's agent-lane prefix list (`WorkerBridge::forMethod`,
+  `core/hostd/worker_bridge.cpp`).
 - Depends on `core/api/libchudware.h` and `services/ipc/*` (IPC transport/discovery).
 - `worker_client.cpp` includes `bootstrap.h` from `host/src`, where runtime provisioning
   lives. Do not reintroduce a local copy.

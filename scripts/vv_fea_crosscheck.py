@@ -30,13 +30,13 @@ Eigen tet4/tet10 solver, i.e. exactly what ``run_fea_static`` runs):
   TIER 3  INDEPENDENT SOLVER.  ``polymesh solve`` — Polyhedral-FEA's own solver on its
           own mesh — against the same closed forms, at a coarse h it can afford.
 
-Usage (real run; every native binary must be process-isolated on this host):
+Usage (real run; keep every native solve inside a memory-capped slice):
     systemd-run --user --pipe --wait -q --collect -p MemoryMax=3G bash -c '
-      ulimit -c 0; cd /home/hunter/Repositories/CAD &&
+      ulimit -c 0; cd <repo root> &&
       CHUDWARE_LIBCHUDWARE=$PWD/core/build-occt-linux/bin/libchudware.so \\
       CHUDWARE_ENGINE_DAEMON=0 CHUDWARE_MEM_FRAC=0.07 CHUDWARE_HEADROOM_GB=12 \\
       CHUDWARE_SIM_THREADS=2 \\
-      ~/.local/share/AI-CAD/mcp-venv/bin/python scripts/vv_fea_crosscheck.py --all'
+      ~/.local/share/Chudware/mcp-venv/bin/python scripts/vv_fea_crosscheck.py --all'
 
 Usage (pytest smoke — no .so, no ccx, no engine):
     pytest scripts/vv_fea_crosscheck.py -q
@@ -72,8 +72,6 @@ if str(_PROJECT_ROOT) not in sys.path:
 os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
 
 DOCS_DIR = _PROJECT_ROOT / "docs" / "vv"
-ME490_DIR = Path("/home/hunter/Documents/ME-490/Engineering/Verification")
-ME490_CASE_DIR = Path("/home/hunter/Documents/ME-490/Engineering/Simulation_Output")
 
 # ---------------------------------------------------------------------------
 # Tolerance tiers (relative, fraction — not percent)
@@ -85,8 +83,6 @@ TOL_ENGINEERING = 0.10  # coarse-mesh / boundary-layer-limited analytic referenc
 
 STEEL = {"name": "vv-steel", "E_mpa": 200000.0, "nu": 0.3,
          "density_g_cm3": 7.85, "yield_mpa": 250.0}
-AL6061 = {"name": "6061-T6", "E_mpa": 68900.0, "nu": 0.33,
-          "density_g_cm3": 2.7, "yield_mpa": 276.0}
 
 # Chudware/gmsh MSH_TET_10 mid-edge slots are {0,1},{1,2},{2,0},{3,0},{3,2},{3,1}
 # (core/sim/mesher.cpp kTet10PolymeshToChudware and core/sim/fea_run.cpp kTetFaces).
@@ -105,50 +101,6 @@ C3D4_FLIP = [1, 0, 2, 3]
 # owners of the affected code, with their measurements. They are carried in the report
 # because a V&V document whose findings evaporate between runs is not a record.
 CORROBORATED_FINDINGS = [
-    {"case": "WHEEL-RADIAL (mesh mechanism)",
-     "finding": "CHOLMOD reported the reduced stiffness NOT positive definite on the "
-                "released wheel-slice geometry (tet4, target_size_mm=12, 316466 elems / "
-                "203163 DOF). The mesh, not the solver, is the defect: the mesh is a "
-                "mechanism at solver precision while passing every connectivity check.",
-     "evidence": "Independent triplet+SparseLU re-assembly of the exact exported system "
-                 "(scratch/vvwork/wheel-radial_o1_h12_system.json) was symmetric to "
-                 "1.86e-9 with all diagonals positive and a single connected component "
-                 "containing the fixture, but lambda_max/lambda_min = 2.25e7 / 5.6e-27 "
-                 "= condition number 4.0e33, with the soft mode localised on nodes "
-                 "7724 / 42274 / 42273. Root cause: 2 HANGING elements sharing two "
-                 "corners or fewer with the rest of the mesh, which rotate at zero "
-                 "strain energy (a tet apex used by exactly one element is NOT a "
-                 "defect — 45 of the 51 single-element tips in that mesh are healthy). "
-                 "Independent SparseLU on the same matrix returned max_disp 5.23e10 mm "
-                 "where the shipped LDLT rung returned 0.0322 mm, so a pivoting solver "
-                 "is not the safe fallback here — it returns garbage silently. "
-                 "Measured and fixed by SolverPerf; the mesher now dissolves hanging "
-                 "elements, the solve REFUSES any that remain, and mesh_quality gains "
-                 "lonely_nodes_repaired / lonely_nodes_remaining / hanging_elems_dropped."},
-    {"case": "WHEEL-RADIAL (equilibrium check is not a certificate)",
-     "finding": "equilibrium_error_pct = 0.0 does NOT certify a displacement when the "
-                "stiffness carries a near-null mode: the residual is small precisely in "
-                "the directions the load excites, while the unconstrained direction "
-                "contributes nothing to it.",
-     "evidence": "The leg above reported equilibrium_error_pct 0.0 and max_disp "
-                 "0.032202 mm on a matrix with condition number 4.0e33. Any released "
-                 "leg whose solver_notes now carry the CONDITIONING WARNING line is "
-                 "subject to the same caveat."},
-    {"case": "All cases (summary.max_von_mises_mpa is masked)",
-     "finding": "summary.max_von_mises_mpa is a fixture-ring-MASKED reduction, not the "
-                "field peak: a two-element ring around the fixed nodes is excluded. On "
-                "a model whose fixtures ARE the highly stressed feature the summary "
-                "scalar is far below the field maximum, so a FoS quoted from it is a "
-                "margin AWAY from the fixture, not at it.",
-     "evidence": "FRAME-PEDAL-BRAKE (fixtures are the keyway bolt-hole faces): summary "
-                 "109.7342 MPa vs unmasked nodal field peak 402.9265 MPa (3.67x) "
-                 "sitting ON a fixed node of the bolt hole; min_fos 2.5152 vs "
-                 "min_fos_raw 0.685. Measured by VtuStress, who added summary_node / "
-                 "max_von_mises_raw_mpa / min_fos_raw so both reductions are visible. "
-                 "The Tier-2 comparison in this report already uses Chudware's RAW "
-                 "nodal von Mises array against CalculiX's unmasked field peak, so its "
-                 "stress rows are apples-to-apples; the masked value is carried "
-                 "separately as vm_summary_chud_mpa."},
     {"case": "pressure load sign (FIXED)",
      "finding": "The `pressure` load was documented \"MPa, inward\" but a POSITIVE "
                 "magnitude loaded the surface along its OUTWARD normal, so on a bore "
@@ -163,10 +115,9 @@ CORROBORATED_FINDINGS = [
                  "on the identical model reproduced the closed form. Root cause: the "
                  "deposit was +p*integral(N_i n_outward)dA in core/sim/fea_run.cpp "
                  "(fea_run_static_impl, the `type == \"pressure\"` branch) with the "
-                 "outward orientation explicitly enforced. Fixed by PressureSign "
-                 "(2026-09-05): the deposit is now -p*integral(N_i n_outward)dA, so +p "
-                 "acts inward, and this case passes +p. Force loads were never "
-                 "affected, which is why no released ME-490 case was."},
+                 "outward orientation explicitly enforced. Fixed on 2026-09-05: the "
+                 "deposit is now -p*integral(N_i n_outward)dA, so +p acts inward, and "
+                 "this case passes +p. Force loads were never affected."},
     {'case': 'PLATE-HOLE (tet4 stress recovery at a concentration)',
      'finding': 'On tet4 — whose element stress really is constant, so nodal averaging '
                 'is the only recovery available — nodal stress under-recovers the '
@@ -204,8 +155,7 @@ CORROBORATED_FINDINGS = [
                  'precision, so the solutions are identical and the discrepancy lives '
                  "in the reaction reporting (or in this harness's parse of ccx's RF "
                  'table), not in the solve. On the 21 force-loaded meshes the same '
-                 'comparison agrees to 1.88e-07 worst case, and on the three ME-490 '
-                 'cases to 2.6e-07 / 8.5e-09 / 2.5e-07, which is why the metric is '
+                 'comparison agrees to 1.88e-07 worst case, which is why the metric is '
                  'kept.'},
     {'case': 'PLATE-HOLE / tet10 stress recovery (ROOT-CAUSED, FIXED, RE-MEASURED)',
      'finding': 'The tet10 hole-rim SCF under-recovery first reported as an open '
@@ -217,7 +167,7 @@ CORROBORATED_FINDINGS = [
                 'the corner nodes (the mid-edge nodes take the mean of their two '
                 'corners) — the same recovery CalculiX uses for C3D10. tet4 and hex8 '
                 'are untouched and their numbers are unchanged.',
-     'evidence': "Diagnosed by StressRecovery off this harness's Tier-2 lane, which "
+     'evidence': "Diagnosed off this harness's Tier-2 lane, which "
                  'hands CalculiX the identical mesh. BEFORE / AFTER / ccx C3D10 on the '
                  'SAME mesh, rim SCF: h_eff 3.445 (20664 elems) 1.46607 / 2.22806 / '
                  '2.2280; h_eff 2.870 (35744) 1.75700 / 2.57926 / 2.5792; h_eff 2.586 '
@@ -247,9 +197,9 @@ CORROBORATED_FINDINGS = [
                 'pressure=+p IS internal pressurisation on a bore. The tables above '
                 'were measured before either fix; the numbers here are the current '
                 'engine.',
-     'evidence': "Measured by PressureSign through this harness's own "
+     'evidence': "Measured through this harness's own "
                  'chud_solve/extract on the identical CYL-LAME model (a=15, b=30, L=90 '
-                 "mm), engine carrying StressRecovery's tet10 recovery. tet10 h_req=16 "
+                 "mm), engine carrying the tet10 recovery fix. tet10 h_req=16 "
                  '(56840 elems), pressure=+p: hoop inner +33.0205 MPa vs Lame +33.3333 '
                  '(-0.94%), hoop outer +13.2720 vs +13.3333 (-0.46%), u_r inner '
                  '+0.00291 mm (-1.39%). The -p probe mirrors it exactly negative '
@@ -286,12 +236,12 @@ CORROBORATED_FINDINGS = [
      'finding': "After the targeted PLATE-HOLE re-run, this report's nodal-STRESS "
                 'columns are no longer all from one recovery implementation: '
                 'PLATE-HOLE Tier-1 tet10 rows are post-fix, while tet10 nodal-stress '
-                'columns elsewhere (Tier-2 peak von Mises, Tier 2b ME-490 '
-                'vm_field_peak_mpa) still reflect the OLD element-constant recovery '
+                'columns elsewhere (Tier-2 peak von Mises) still reflect the OLD '
+                'element-constant recovery '
                 'and will move UP on a full refresh. Displacements and reactions are '
                 'unaffected anywhere.',
-     'evidence': 'Confirmed by StressRecovery, who made the fix and the targeted '
-                 're-run. The fix extrapolates the 4 Gauss-point tensors to corner '
+     'evidence': 'Confirmed by the targeted re-run. The fix extrapolates the 4 '
+                 'Gauss-point tensors to corner '
                  'nodes (corner_i = sqrt(5)*(g[i] - b*sum g), mid-edges as the mean of '
                  "their two corners) — CalculiX's own C3D10 recovery — and tet4/hex8 "
                  'are bit-identical. Same-mesh agreement on STRESS is now essentially '
@@ -307,7 +257,7 @@ CORROBORATED_FINDINGS = [
 # Result accumulation
 # ===========================================================================
 
-_RESULTS: dict[str, list[dict]] = {"tier1": [], "tier2": [], "tier3": [], "me490": []}
+_RESULTS: dict[str, list[dict]] = {"tier1": [], "tier2": [], "tier3": []}
 _FINDINGS: list[dict] = []
 _SKIPS: list[dict] = []
 _PROVENANCE: dict[str, Any] = {}
@@ -1801,7 +1751,7 @@ def run_tier3(workdir: Path, pm: str) -> None:
                    "n_nodes": len(pts), "ref": spec["ref"], "got": got,
                    "rel_err": e, "tol": spec["tol"],
                    "verdict": verdict(e, spec["tol"]) if e is not None else "INFO",
-                   "citation": spec["citation"], "cmd": res["cmd"],
+                   "citation": spec["citation"], "cmd": _display_path(res["cmd"]),
                    "seconds": round(res["seconds"], 1),
                    "field_names": res["field_names"]}
             vm = pm_scalar(res, ("von_mises", "vonmises", "sigma_vm", "vm"))
@@ -1811,173 +1761,6 @@ def run_tier3(workdir: Path, pm: str) -> None:
             _log(f"  [{row['verdict']}] {spec['id']} h={h_mm:g}mm n={len(pts)} "
                  f"got={got} ref={spec['ref']} rel="
                  f"{'n/a' if e is None else f'{e:.3e}'} ({res['seconds']:.0f}s)")
-
-
-# ===========================================================================
-# ME490 real cases
-# ===========================================================================
-
-ME490_CASES = [
-    {"id": "FRAME-GLOBAL-3G",
-     "step": str(ME490_CASE_DIR / "FRAME-GLOBAL-3G/geometry/"
-                 "CD-101_Front_Spine_Isolate.step"),
-     "keep_bodies": None,
-     "fixtures": ["Fd58176"], "fixture_fallback": [{"of": "face", "side": "right"}],
-     "loads": [{"face": "Fe1292d", "force": [0.0, 0.0, -506.58]}],
-     "load_fallback": [{"face": {"of": "face", "side": "left"},
-                        "force": [0.0, 0.0, -506.58]}],
-     "released": "tet4 h=4.5 mm, 194828 elems, 150882 dof, max_disp 5.764664 mm",
-     # The released ladder itself: 9.0 / 6.5 / 4.5 mm tet4 (convergence.md).  The
-     # released leg is 4.5 mm and it fits, so this case is cross-solved at exactly the
-     # discretization the packet reports.
-     "ladder": [(1, 9.0), (1, 6.5), (1, 4.5)]},
-    {"id": "WHEEL-RADIAL",
-     "step": str(ME490_CASE_DIR / "WHEEL-RADIAL/geometry/"
-                 "CD-210-01_Wheel_Slice.step"),
-     "keep_bodies": None,
-     "fixtures": ["F671af0"],
-     "fixture_fallback": [{"of": "face", "surf": "cylindrical", "pick": "inner"}],
-     "loads": [{"face": "Fe6956a", "force": [0.0, -473.5, 0.0]}],
-     "load_fallback": [{"face": {"of": "face", "surf": "cylindrical",
-                                 "pick": "outer"}, "force": [0.0, -473.5, 0.0]}],
-     "released": "tet10 h=4.0 mm, 220834 elems, 1075044 dof, max_disp 0.00259 mm",
-     "ladder": [(1, 12.0), (1, 8.0), (1, 5.0), (2, 10.0)]},
-    {"id": "FRAME-PEDAL-BRAKE",
-     "step": str(ME490_CASE_DIR / "MECHANISM/geometry/_src_B.step"),
-     "keep_bodies": [715],
-     "fixtures": ["F957fc6", "Fdfb997"],
-     "fixture_fallback": None,
-     "loads": [{"face": "F8fd7b4", "force": [0.0, 0.0, -1500.0]}],
-     "load_fallback": None,
-     "released": "tet10 h=4.2 mm, 192748 elems, 917400 dof, max_disp 0.441113 mm",
-     "ladder": [(1, 12.0), (1, 8.0), (1, 5.0), (2, 10.0)]},
-]
-
-
-def run_me490(workdir: Path, ccx: Optional[str], do_ccx: bool) -> None:
-    _log("\n=== ME490 real cases (same-mesh CalculiX cross-solve) ===")
-    for spec in ME490_CASES:
-        _log(f"\n--- {spec['id']}")
-        if not Path(spec["step"]).exists():
-            skip("me490", spec["id"], f"geometry missing: {spec['step']}")
-            continue
-        cb = _cb()
-        params = {"source_path": spec["step"], "format": "step"}
-        if spec["keep_bodies"]:
-            params["keep_bodies"] = spec["keep_bodies"]
-        try:
-            t0 = time.time()
-            doc = build_doc(f"vv_{spec['id'].lower().replace('-', '_')}",
-                            [cb.feat("import", "Src", params)])
-            _log(f"  imported in {time.time() - t0:.1f}s")
-        except Exception as exc:  # noqa: BLE001
-            skip("me490", spec["id"], f"import failed: {str(exc)[:300]}")
-            continue
-        ctx = None
-        used = "released face sids"
-        for fixtures, loads, label in (
-                (spec["fixtures"], spec["loads"], "released face sids"),
-                (spec["fixture_fallback"], spec["load_fallback"],
-                 "geometric fallback query")):
-            if fixtures is None or loads is None:
-                continue
-            try:
-                ctx = make_study(doc, fixtures, loads, AL6061)
-                used = label
-                break
-            except Exception as exc:  # noqa: BLE001
-                _log(f"  BC resolve via {label} failed: {str(exc)[:200]}")
-        if ctx is None:
-            skip("me490", spec["id"], "neither the released face sids nor the "
-                                      "geometric fallback resolved")
-            continue
-        _log(f"  BCs resolved via {used}")
-        solved: list[tuple] = []
-        for order, h in spec["ladder"]:
-            tag = f"{spec['id'].lower()}_o{order}_h{h:g}".replace(".", "p")
-            run = chud_solve(ctx, order, h, workdir, tag)
-            if not run["ok"]:
-                note = refusal_note(run["error"])
-                _log(f"  tet{4 if order == 1 else 10} h={h:g}: refused/failed: {note}")
-                record("me490", {"case": spec["id"], "order": order, "h_req_mm": h,
-                                 "verdict": "REFUSED"
-                                 if is_memory_refusal(run["error"]) else "FAIL",
-                                 "note": note})
-                if is_memory_refusal(run["error"]):
-                    break
-                continue
-            eqp = run["reactions"].get("equilibrium_error_pct")
-            _log(f"  tet{4 if order == 1 else 10} h_req={h:g} "
-                 f"h_eff={run['h_eff_mm']:.3f} n_elems={run['n_elems']} "
-                 f"n_dof={run['n_dof']} max_disp={run['summary'].get('max_disp_mm')} "
-                 f"vm={run['summary'].get('max_von_mises_mpa')} eq%={eqp} "
-                 f"({run['seconds']:.0f}s)")
-            _PROVENANCE.setdefault("engine", run["provenance"])
-            solved.append((order, h, run))
-        if not solved:
-            skip("me490", spec["id"], "no ladder leg fitted the memory slice")
-            continue
-        # Cross-solve the finest leg CalculiX can carry in the same slice: ccx's own
-        # factorization is not governed by anything, so a 900k-DOF C3D10 deck would
-        # take the slice down. Every solved leg is still reported.
-        ccx_dof_cap = int(os.environ.get("VV_CCX_MAX_DOF", 400000))
-        eligible = [s for s in solved if s[2]["n_dof"] <= ccx_dof_cap]
-        ccx_leg = max(eligible, key=lambda s: s[2]["n_dof"]) if eligible else None
-        for order, h, run in solved:
-            is_ccx_leg = ccx_leg is not None and run is ccx_leg[2]
-            row = {"case": spec["id"],
-                   "element": "tet4" if order == 1 else "tet10",
-                   "h_req_mm": h, "h_eff_mm": run["h_eff_mm"],
-                   "n_nodes": run["n_nodes"], "n_elems": run["n_elems"],
-                   "n_dof": run["n_dof"], "bc_source": used,
-                   "max_disp_mm": run["summary"].get("max_disp_mm"),
-                   "max_von_mises_mpa": run["summary"].get("max_von_mises_mpa"),
-                   "vm_field_peak_mpa": (max(run["fields"]["von_mises"])
-                                         if run["fields"].get("von_mises") else None),
-                   "min_fos": run["summary"].get("min_fos"),
-                   "equilibrium_error_pct": run["reactions"].get(
-                       "equilibrium_error_pct"),
-                   "released_leg": spec["released"],
-                   "engine_build_id": run["provenance"].get("engine_build_id"),
-                   "chudware_solver": run.get("solver_label"),
-                   "seconds": round(run["seconds"], 1),
-                   "verdict": "solved"}
-            if do_ccx and ccx and is_ccx_leg:
-                cmp_ = ccx_cross_solve(ccx, run, workdir,
-                                       f"{spec['id'].lower()}_x_{h:g}".replace(".", "p"))
-                if cmp_.get("ok"):
-                    row.update({
-                        "disp_l2_rel": cmp_["l2_rel"],
-                        "disp_linf_rel": cmp_["linf_rel"],
-                        "max_disp_ccx_mm": cmp_["max_disp_ccx_mm"],
-                        "max_disp_rel": cmp_["max_disp_rel"],
-                        "reaction_chud_n": cmp_["reaction_chud_n"],
-                        "reaction_ccx_n": cmp_["reaction_ccx_n"],
-                        "reaction_rel": cmp_["reaction_rel"],
-                        "vm_peak_chud_mpa": cmp_["vm_peak_chud_mpa"],
-                        "vm_peak_ccx_mpa": cmp_["vm_peak_ccx_mpa"],
-                        "vm_peak_rel": rel(cmp_["vm_peak_chud_mpa"],
-                                           cmp_["vm_peak_ccx_mpa"]),
-                        "print_precision_floor_l2":
-                            cmp_["print_precision_floor_l2"],
-                        "ccx_elements": f"C3D{cmp_['meta']['nodes_per_elem']}",
-                        "ccx_seconds": round(cmp_["seconds"], 1),
-                        "tol": TOL_CODE_TO_CODE,
-                        "verdict": verdict(cmp_["l2_rel"], TOL_CODE_TO_CODE)})
-                    _log(f"  [{row['verdict']}] ccx same-mesh at h={h:g} "
-                         f"({run['n_dof']} dof): L2 rel={cmp_['l2_rel']:.3e} "
-                         f"Linf rel={cmp_['linf_rel']:.3e}")
-                    if row["verdict"] == "FAIL":
-                        finding(spec["id"],
-                                f"same-mesh displacement disagreement L2="
-                                f"{cmp_['l2_rel']:.3e}",
-                                f"n_dof={run['n_dof']}, "
-                                f"Linf={cmp_['linf_rel']:.3e}")
-                else:
-                    row["verdict"] = "FAIL"
-                    row["note"] = cmp_.get("error", "")[:300]
-                    _log(f"  [FAIL] ccx cross-solve: {row['note'][:200]}")
-            record("me490", row)
 
 
 # ===========================================================================
@@ -2001,6 +1784,13 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
            "|" + "|".join("---" for _ in headers) + "|"]
     out += ["| " + " | ".join(r) + " |" for r in rows]
     return "\n".join(out)
+
+
+def _display_path(text: str) -> str:
+    """Render repo-local and home-relative paths portably for the committed report."""
+    text = text.replace(str(_PROJECT_ROOT) + os.sep, "")
+    home = str(Path.home())
+    return text.replace(home, "~") if home and home != os.sep else text
 
 
 def make_figures(outdir: Path) -> list[str]:
@@ -2044,7 +1834,6 @@ def make_figures(outdir: Path) -> list[str]:
         plt.close(fig)
         written.append(p.name)
     t2 = [r for r in _RESULTS["tier2"] if r.get("disp_l2_rel") is not None]
-    t2 += [r for r in _RESULTS["me490"] if r.get("disp_l2_rel") is not None]
     if t2:
         fig, ax = plt.subplots(figsize=(max(7.0, 0.75 * len(t2)), 4.2))
         labels = [f"{r['case']}\n{r.get('element','')} h={_fmt(r.get('h_req_mm'),3)}"
@@ -2088,7 +1877,7 @@ def build_report(elapsed: float, figures: list[str]) -> str:
         ["polymesh binary", f"`{_PROVENANCE.get('polymesh_binary', 'n/a')}`"],
         ["CalculiX", f"`{_PROVENANCE.get('ccx_version', 'not found')}`"],
         ["ccx binary", f"`{_PROVENANCE.get('ccx_path', 'n/a')}`"],
-        ["libchudware", f"`{os.environ.get('CHUDWARE_LIBCHUDWARE', 'n/a')}`"],
+        ["libchudware", f"`{_display_path(os.environ.get('CHUDWARE_LIBCHUDWARE', 'n/a'))}`"],
         ["memory envelope",
          f"`CHUDWARE_MEM_FRAC={os.environ.get('CHUDWARE_MEM_FRAC', 'default')}`, "
          f"`CHUDWARE_HEADROOM_GB={os.environ.get('CHUDWARE_HEADROOM_GB', 'default')}`, "
@@ -2250,56 +2039,6 @@ def build_report(elapsed: float, figures: list[str]) -> str:
         A("_No Tier-2 rows were executed._")
     A("")
 
-    # ---- ME490
-    A("## Tier 2b — the real ME-490 rover cases, same-mesh cross-solve")
-    A("")
-    A("These are the released case IDs solved from their own frozen geometry, "
-      "material and boundary conditions, at the face SIDs the packet's load rationale "
-      "names. Every leg that solved is listed; the CalculiX cross-solve is run on the "
-      "FINEST leg whose DOF count CalculiX can also carry inside the same memory "
-      "slice, because ccx's factorization is not governed by anything and a "
-      "900k-DOF C3D10 deck would take the slice down. For FRAME-GLOBAL-3G that is the "
-      "released discretization itself (tet4, h=4.5 mm); where the cross-solved leg is "
-      "coarser than the released one, the row is a code-to-code check on an identical "
-      "mesh, not a restatement of the released result, and the released leg is quoted "
-      "beside it for context.")
-    A("")
-    me = _RESULTS["me490"]
-    solved = [r for r in me if r.get("n_dof")]
-    if solved:
-        A(_table(["case", "elem", "h_req", "h_eff", "n_elems", "n_dof",
-                  "BC source", "max|u| Chudware", "max|u| ccx", "|u| L2 rel",
-                  "|u| Linf rel", "reaction rel", "peak vM Chudware", "peak vM ccx",
-                  "equil %", "verdict", "released leg"],
-                 [[r["case"], r.get("element", ""), _fmt(r.get("h_req_mm"), 3),
-                   _fmt(r.get("h_eff_mm"), 3), _fmt(r.get("n_elems")),
-                   _fmt(r.get("n_dof")), r.get("bc_source", ""),
-                   _fmt(r.get("max_disp_mm")), _fmt(r.get("max_disp_ccx_mm")),
-                   (f"{r['disp_l2_rel']:.3e}" if r.get("disp_l2_rel") is not None
-                    else "—"),
-                   (f"{r['disp_linf_rel']:.3e}" if r.get("disp_linf_rel") is not None
-                    else "—"),
-                   (f"{r['reaction_rel']:.2e}" if r.get("reaction_rel") is not None
-                    else "—"),
-                   _fmt(r.get("max_von_mises_mpa"), 5),
-                   _fmt(r.get("vm_peak_ccx_mpa"), 5),
-                   _fmt(r.get("equilibrium_error_pct"), 3),
-                   r.get("verdict", "") + (f" ({r['note'][:60]})" if r.get("note")
-                                           else ""),
-                   r.get("released_leg", "")] for r in solved]))
-    else:
-        A("_No ME-490 case produced a solved leg._")
-    refused = [r for r in me if not r.get("n_dof")]
-    if refused:
-        A("")
-        A("Legs attempted and refused/failed:")
-        A("")
-        A(_table(["case", "order", "h_req", "outcome", "detail"],
-                 [[r["case"], _fmt(r.get("order")), _fmt(r.get("h_req_mm"), 3),
-                   r.get("verdict", ""), (r.get("note", "") or "")[:150]]
-                  for r in refused]))
-    A("")
-
     # ---- Tier 3
     A("## Tier 3 — polymesh (Polyhedral-FEA's own solver) vs the same closed forms")
     A("")
@@ -2317,7 +2056,7 @@ def build_report(elapsed: float, figures: list[str]) -> str:
     A("")
 
     # ---- findings / skips
-    A("## Corroborated findings (root-caused with the owning agent's measurements)")
+    A("## Corroborated findings (root-caused, with the measurements)")
     A("")
     A(_table(["case", "finding", "evidence"],
              [[f["case"], f["finding"], f["evidence"]]
@@ -2354,7 +2093,7 @@ def build_report(elapsed: float, figures: list[str]) -> str:
 
 
 def _conclusion() -> str:
-    t2 = [r["disp_l2_rel"] for r in _RESULTS["tier2"] + _RESULTS["me490"]
+    t2 = [r["disp_l2_rel"] for r in _RESULTS["tier2"]
           if r.get("disp_l2_rel") is not None]
     exact = [r for r in _RESULTS["tier1"]
              if r.get("tol") == TOL_EXACT and r.get("rel_err") is not None]
@@ -2362,8 +2101,8 @@ def _conclusion() -> str:
     if t2:
         worst = max(t2)
         bits.append(
-            f"On {len(t2)} different meshes — four textbook parts plus the real rover "
-            f"cases, tet4 and tet10 — CalculiX was handed the exact system Chudware "
+            f"On {len(t2)} different meshes — four textbook parts, tet4 and tet10 — "
+            f"CalculiX was handed the exact system Chudware "
             f"solved and produced the same displacement field to within "
             f"{worst:.1e} relative in the worst case. That is code-to-code agreement at "
             f"the level of arithmetic round-off: the element formulation, the assembly "
@@ -2410,7 +2149,6 @@ def write_outputs(elapsed: float) -> dict:
                        "precise": TOL_PRECISE, "engineering": TOL_ENGINEERING},
         "tier1_analytic": _RESULTS["tier1"],
         "tier2_calculix": _RESULTS["tier2"],
-        "tier2b_me490": _RESULTS["me490"],
         "tier3_polymesh": _RESULTS["tier3"],
         "findings": _FINDINGS,
         "skips": _SKIPS,
@@ -2421,113 +2159,7 @@ def write_outputs(elapsed: float) -> dict:
     (DOCS_DIR / "fea_vv_results.json").write_text(json.dumps(payload, indent=1))
     written = [str(DOCS_DIR / "FEA_VV_REPORT.md"),
                str(DOCS_DIR / "fea_vv_results.json")]
-
-    # ME490-specific copy: the rover cases plus the analytic evidence that backs them.
-    try:
-        ME490_DIR.mkdir(parents=True, exist_ok=True)
-        me_md = _me490_report(elapsed, figures)
-        (ME490_DIR / "FEA_VERIFICATION_2026-09-05.md").write_text(me_md)
-        me_payload = dict(payload)
-        me_payload["scope"] = ("ME-490 rover FEA verification: the analytic and "
-                               "code-to-code evidence for the solver used by the "
-                               "released simulation packets")
-        (ME490_DIR / "FEA_VERIFICATION_2026-09-05.json").write_text(
-            json.dumps(me_payload, indent=1))
-        written += [str(ME490_DIR / "FEA_VERIFICATION_2026-09-05.md"),
-                    str(ME490_DIR / "FEA_VERIFICATION_2026-09-05.json")]
-        for fig in figures:
-            src = DOCS_DIR / fig
-            if src.exists():
-                dst = ME490_DIR / f"FEA_VERIFICATION_2026-09-05_{fig}"
-                dst.write_bytes(src.read_bytes())
-                written.append(str(dst))
-    except OSError as exc:
-        _log(f"  [SKIP] ME-490 copy: {exc}")
     return {"written": written, "payload": payload}
-
-
-def _me490_report(elapsed: float, figures: list[str]) -> str:
-    eng = _PROVENANCE.get("engine", {})
-    lines: list[str] = []
-    A = lines.append
-    A("# ME-490 — FEA solver verification for the released simulation packets")
-    A("")
-    A(f"Generated {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} by "
-      f"`scripts/vv_fea_crosscheck.py` (Chudware repo). Engine build "
-      f"`{eng.get('engine_build_id', 'n/a')}`, mesher `{eng.get('mesher', 'n/a')}`, "
-      f"polymesh commit `{_PROVENANCE.get('polymesh_commit', 'n/a')}`, cross-solver "
-      f"`{_PROVENANCE.get('ccx_version', 'not found')}`.")
-    A("")
-    A("## Why this document exists")
-    A("")
-    A("Every FoS in the ME-490 simulation packets comes out of one solver. This is the "
-      "evidence that the solver is right: it is checked against hand-calculable "
-      "textbook answers, and it is checked against an independent, widely used "
-      "finite-element code (CalculiX) handed the *identical* mesh and boundary "
-      "conditions, node for node.")
-    A("")
-    A("## The rover cases, cross-solved against CalculiX on the identical mesh")
-    A("")
-    me = [r for r in _RESULTS["me490"] if r.get("n_dof")]
-    if me:
-        A(_table(["case", "elem", "h (mm)", "n_dof", "max|u| Chudware (mm)",
-                  "max|u| CalculiX (mm)", "|u| L2 rel", "reaction rel", "verdict",
-                  "released leg (for context)"],
-                 [[r["case"], r.get("element", ""), _fmt(r.get("h_req_mm"), 3),
-                   _fmt(r.get("n_dof")), _fmt(r.get("max_disp_mm")),
-                   _fmt(r.get("max_disp_ccx_mm")),
-                   (f"{r['disp_l2_rel']:.3e}" if r.get("disp_l2_rel") is not None
-                    else "—"),
-                   (f"{r['reaction_rel']:.2e}" if r.get("reaction_rel") is not None
-                    else "—"),
-                   r.get("verdict", ""), r.get("released_leg", "")] for r in me]))
-        A("")
-        A("The mesh leg here is the coarsest one that fits in the 3 GB memory slice "
-          "this verification runs in; the released legs need 11+ GB. That does not "
-          "weaken the claim, because this table is not re-deriving the released "
-          "numbers — it is proving that on a given mesh the solver produces the same "
-          "answer an independent code produces.")
-    else:
-        A("_No rover case produced a solved leg in this run._")
-    A("")
-    A("## The textbook checks behind it")
-    A("")
-    t1 = [r for r in _RESULTS["tier1"] if r.get("kind") != "convergence"
-          and r.get("metric") != "solve" and r.get("verdict")]
-    if t1:
-        best: dict[tuple, dict] = {}
-        for r in t1:
-            key = (r["case"], r["metric"], r.get("element"))
-            cur = best.get(key)
-            if cur is None or (r.get("h_eff_mm") or 1e9) < (cur.get("h_eff_mm") or 1e9):
-                best[key] = r
-        A(_table(["case", "what is checked", "elem", "finest h (mm)", "reference",
-                  "Chudware", "rel err", "verdict"],
-                 [[r["case"], r["metric"], r.get("element", ""),
-                   _fmt(r.get("h_eff_mm"), 3), _fmt(r.get("ref")), _fmt(r.get("got")),
-                   (f"{r['rel_err']:.3e}" if isinstance(r.get("rel_err"), float)
-                    else "—"),
-                   r.get("verdict", "")] for r in best.values()]))
-    else:
-        A("_No analytic row was executed in this run._")
-    A("")
-    if _FINDINGS:
-        A("## Open findings")
-        A("")
-        A(_table(["case", "finding", "evidence"],
-                 [[f["case"], f["finding"], f["evidence"]] for f in _FINDINGS]))
-        A("")
-    for fig in figures:
-        A(f"![{fig}](FEA_VERIFICATION_2026-09-05_{fig})")
-        A("")
-    A("## One-slide conclusion")
-    A("")
-    A(_conclusion())
-    A("")
-    A(f"_Full report, all tiers and the machine-readable results: "
-      f"`docs/vv/FEA_VV_REPORT.md` and `docs/vv/fea_vv_results.json` in the Chudware "
-      f"repo; this run took {elapsed / 60.0:.1f} min._")
-    return "\n".join(lines)
 
 
 # ===========================================================================
@@ -2537,18 +2169,17 @@ def _me490_report(elapsed: float, figures: list[str]) -> str:
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--all", action="store_true", help="every tier + the ME490 cases")
+    ap.add_argument("--all", action="store_true", help="every tier")
     ap.add_argument("--tier1", action="store_true", help="analytic tier only")
     ap.add_argument("--tier2", action="store_true",
                     help="analytic tier + the same-mesh CalculiX cross-solve")
     ap.add_argument("--tier3", action="store_true", help="polymesh tier only")
-    ap.add_argument("--me490", action="store_true", help="the three rover cases only")
     ap.add_argument("--case", action="append", default=None,
                     help="restrict the analytic tier to these case ids")
     ap.add_argument("--workdir", default=None,
                     help="scratch directory for exported systems and ccx jobs")
     args = ap.parse_args(argv)
-    if not any((args.all, args.tier1, args.tier2, args.tier3, args.me490)):
+    if not any((args.all, args.tier1, args.tier2, args.tier3)):
         args.all = True
 
     ready, reason = engine_ready()
@@ -2557,10 +2188,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     ccx = find_ccx()
-    _PROVENANCE["ccx_path"] = ccx or "not found"
+    _PROVENANCE["ccx_path"] = _display_path(ccx) if ccx else "not found"
     _PROVENANCE["ccx_version"] = ccx_version(ccx) if ccx else "not found"
     pm = polymesh_binary()
-    _PROVENANCE["polymesh_binary"] = pm or "not found"
+    _PROVENANCE["polymesh_binary"] = _display_path(pm) if pm else "not found"
     _PROVENANCE["polymesh_commit"] = polymesh_commit()
     _log(f"ccx: {_PROVENANCE['ccx_version']} ({_PROVENANCE['ccx_path']})")
     _log(f"polymesh: {_PROVENANCE['polymesh_binary']} @ "
@@ -2574,14 +2205,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     _log(f"workdir: {workdir}")
 
     t0 = time.time()
-    do_ccx = bool(ccx) and (args.all or args.tier2 or args.me490)
-    if not ccx and (args.all or args.tier2 or args.me490):
+    do_ccx = bool(ccx) and (args.all or args.tier2)
+    if not ccx and (args.all or args.tier2):
         skip("tier2", "all", "ccx binary not found on PATH or in ~/.local/bin")
 
     if args.all or args.tier1 or args.tier2:
         run_tier1_and_2(workdir, ccx, args.case, do_ccx)
-    if args.all or args.me490:
-        run_me490(workdir, ccx, do_ccx)
     if args.all or args.tier3:
         if pm:
             run_tier3(workdir, pm)

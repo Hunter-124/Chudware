@@ -1,8 +1,7 @@
 ---
 /**
- * Canonical Chudware icon set — the 24×24 path data from the customer-surface
- * design contract (§3), held once for the whole marketing site. Line icons
- * render with the shared stroke attributes; the three OS marks render solid.
+ * Canonical Chudware icon set: 24×24 path data held once for the whole site.
+ * Line icons render with the shared stroke attributes; the three OS marks render solid.
  *
  * Icons are decorative: every instance is `aria-hidden="true"` and the
  * adjacent text carries the meaning. An icon-only control puts `aria-label`
@@ -18,10 +17,6 @@ const LINE: Record<string, string> = {
   team: '<circle cx="9" cy="8.2" r="3.3"/><path d="M3.2 20c.5-3.8 2.7-5.9 5.8-5.9s5.3 2.1 5.8 5.9"/><path d="M16.3 11.4a2.7 2.7 0 1 0 0-5.4"/><path d="M17.1 14.3c2.2.3 3.5 2.1 3.9 5.7"/>',
   download: '<path d="M12 3.6v10.6M7.8 10.4 12 14.6l4.2-4.2"/><path d="M4.2 16.4v2.2A1.8 1.8 0 0 0 6 20.4h12a1.8 1.8 0 0 0 1.8-1.8v-2.2"/>',
   ai: '<path d="M12 3v4.2M12 16.8V21M3 12h4.2M16.8 12H21"/><path d="M5.6 5.6l3 3M15.4 15.4l3 3M18.4 5.6l-3 3M8.6 15.4l-3 3"/><circle cx="12" cy="12" r="2.5"/>',
-  usage: '<path d="M4 4v16h16"/><path d="M8.4 20v-5.6M12.6 20v-9.6M16.8 20v-3.6"/>',
-  billing: '<rect x="3" y="5.6" width="18" height="12.8" rx="2.2"/><path d="M3 10.2h18M6.6 14.6h4.2"/>',
-  account: '<path d="M12 3.2l7 2.5v5.5c0 4.3-2.8 7.4-7 8.6-4.2-1.2-7-4.3-7-8.6V5.7z"/><path d="M9.1 11.9l2.2 2.2 4.1-4.4"/>',
-  devices: '<rect x="4.2" y="4.8" width="15.6" height="10.4" rx="1.8"/><path d="M2.4 18.8h19.2"/>',
   'chevron-right': '<path d="M9.6 5.4 16.2 12l-6.6 6.6"/>',
   'chevron-down': '<path d="M5.4 9.6 12 16.2l6.6-6.6"/>',
   'arrow-right': '<path d="M4 12h14.6M13 6.4 18.6 12 13 17.6"/>',
@@ -44,11 +39,11 @@ const LINE: Record<string, string> = {
   spinner: '<circle cx="12" cy="12" r="8.4" stroke-opacity=".22"/><path d="M20.4 12a8.4 8.4 0 0 0-8.4-8.4"/>',
 };
 
-// Solid OS marks — verified by render in the design contract; do not redraw.
+// Solid OS marks: hand-tuned paths; do not redraw.
 const SOLID: Record<string, string> = {
   windows: '<path d="M3.4 6.2 10.3 5.25v6.29H3.4zM11.35 5.1 20.6 3.84v7.7h-9.25zM3.4 12.46h6.9v6.29L3.4 17.8zM11.35 12.46h9.25v7.7l-9.25-1.26z"/>',
   apple: '<path d="M17.02 12.62c.02-2.2 1.8-3.25 1.88-3.3-1.03-1.5-2.62-1.71-3.18-1.74-1.35-.14-2.64.79-3.32.79-.69 0-1.74-.77-2.87-.75-1.48.02-2.85.86-3.6 2.19-1.54 2.67-.4 6.62 1.1 8.79.74 1.06 1.61 2.24 2.77 2.2 1.1-.04 1.53-.71 2.87-.71 1.33 0 1.71.71 2.87.69 1.19-.02 1.95-1.08 2.69-2.14.85-1.23 1.2-2.42 1.22-2.48-.03-.01-2.34-.9-2.36-3.54z"/><path d="M14.86 5.9c.6-.73 1.01-1.75.9-2.77-.87.04-1.93.58-2.56 1.31-.56.65-1.05 1.69-.92 2.68.97.08 1.96-.49 2.58-1.22z"/>',
-  // Tux: one path, subpaths in contract order (feet, body, face patch, both pupils, beak).
+  // Tux: one path; subpaths are feet, body, face patch, both pupils, beak.
   linux: '<path fill-rule="evenodd" d="M8.55 19.75c.72.2 1.05 1.05.74 1.9-.31.85-1.15 1.3-1.87 1.05-.72-.25-.99-1.1-.62-1.93.37-.83 1.03-1.22 1.75-1.02zM15.45 19.75c-.72.2-1.05 1.05-.74 1.9.31.85 1.15 1.3 1.87 1.05.72-.25.99-1.1.62-1.93-.37-.83-1.03-1.22-1.75-1.02z M12 2.4c-2.52 0-4.18 1.76-4.18 4.32 0 .74.06 1.38.06 1.92 0 .95-.6 1.76-1.46 2.96-1.03 1.44-1.84 2.66-2.2 4.16-.37 1.53.26 2.5 1.44 2.5.23 0 .36.17.46.62.4 1.68 2.33 3.08 5.88 3.08s5.48-1.4 5.88-3.08c.1-.45.23-.62.46-.62 1.18 0 1.81-.97 1.44-2.5-.36-1.5-1.17-2.72-2.2-4.16-.86-1.2-1.46-2.01-1.46-2.96 0-.54.06-1.18.06-1.92 0-2.56-1.66-4.32-4.18-4.32z M12 4.85c1.83 0 3.32 1.4 3.32 3.13 0 1.72-1.49 3.12-3.32 3.12S8.68 9.7 8.68 7.98c0-1.73 1.49-3.13 3.32-3.13z M10.62 6.55c.5 0 .9.52.9 1.16s-.4 1.16-.9 1.16-.9-.52-.9-1.16.4-1.16.9-1.16z M13.38 6.55c.5 0 .9.52.9 1.16s-.4 1.16-.9 1.16-.9-.52-.9-1.16.4-1.16.9-1.16z M12 8.6l1.35 1.05L12 10.7l-1.35-1.05z"/>',
 };
 

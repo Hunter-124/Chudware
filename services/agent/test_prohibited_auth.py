@@ -32,20 +32,15 @@ PROHIBITED = [
     re.compile(r"oauth2\.googleapis\.com/token.*gemini", re.I),
 ]
 
-# This test file, the contract, the master plan, and the subscription-auth provider
-# modules (§4.4) legitimately reference these endpoints.
+# This test file, the contract, and the subscription-auth provider modules (§4.4)
+# legitimately reference these endpoints.
 ALLOWLIST = {
     "services/agent/test_prohibited_auth.py",
     "contracts/providers.md",
-    "docs/AI_TOOLING_MASTER_PLAN.md",
     "services/agent/providers/sub_auth.py",
     "services/agent/providers/codex_sub_provider.py",
     "services/agent/providers/anthropic_sub_provider.py",
     "services/agent/providers/cursor_sub_provider.py",
-    # Multi-tenant web implementation of the owner-authorized §4.4 Anthropic
-    # flow; credentials are tenant-scoped in PostgreSQL rather than desktop config.
-    "Webservice/gateway/provider_accounts.py",
-    "Webservice/gateway/tests/test_provider_accounts.py",
 }
 SCAN_EXT = {".py", ".cpp", ".h", ".hpp", ".ps1", ".js", ".ts", ".json", ".toml", ".cfg"}
 

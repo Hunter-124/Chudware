@@ -1,8 +1,8 @@
-"""Frozen result contract for the T-H8 product-task eval benches.
+"""Frozen result contract for the product-task eval benches.
 
 Every bench emits example-level scores (ROC-AUC-style), never only a corpus average,
-and records the held-out STRUCTURE each example belongs to (P13: hold out structures,
-not just samples). See tools/flywheel/bench/DESIGN.md.
+and records the held-out STRUCTURE each example belongs to (hold out structures,
+not just samples, so scores measure generalization).
 
 Pure stdlib. These dataclasses are the on-disk report schema — keep them append-only /
 additive so old reports stay readable (mirror the contract discipline of contracts/).
@@ -45,7 +45,7 @@ class BaselineRow:
 
     kind: 'deterministic' (kill-switch comparator, computed offline) or 'frontier'
           (model-backed; offline/CI records status='pending' with no scores — honest
-          stub until T-H7 logging + credentials exist).
+          stub until frontier-provider logging + credentials exist).
     """
     name: str
     kind: str  # 'deterministic' | 'frontier'

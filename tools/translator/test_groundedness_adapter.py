@@ -4,8 +4,8 @@ Proves that both implementations agree on .grounded for two canonical cases:
   1. A numeral that IS grounded (present in the gsl-ser state within ±5% tolerance).
   2. A numeral that is NOT grounded (not present in state — spurious).
 
-These tests exercise the adapter seam described in work/questions/align-post-merge.md
-and the FOREMAN merge-plan §6 alignment item. They do NOT require the engine.
+These tests exercise the GroundednessChecker seam (set_checker / get_checker / is_stub)
+with the adapter installed. They do NOT require the engine.
 
 Enumerator note: _MembershipStub uses gsl_ser.enumerate_slots (requires a gsl-ser
 shaped state); H4GroundednessAdapter uses _flatten (works on plain dicts).  Agreement

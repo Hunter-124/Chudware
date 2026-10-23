@@ -444,7 +444,7 @@ void drawLeftPane(AppState& st,
                   const std::function<void(const std::string& featureId)>& editCallback) {
     PropertyManager* pm = st.propertyManager;
 
-    // [sim-gui rework, Hunter red-pen] The simulation setup tree exists ONLY in the Simulate
+    // [sim-gui rework] The simulation setup tree exists ONLY in the Simulate
     // workspace. SimManager::handleCommand parks st.leftPaneTab on LP_Simulation; if the user
     // then switches to Model/Drawing (or any non-Simulate workspace) clamp it back to the
     // FeatureManager so no Simulation pane state leaks into the modeling views (the inverse of
@@ -559,8 +559,8 @@ void drawLeftPane(AppState& st,
     const float minW = mobile ? std::min(availableW, 250.0f * panelSc)
                              : (mfgWs ? 360.0f : 250.0f) * panelSc;
     // Electronics (PCB/Schematic Manager) runs a little wider than the Model FeatureManager — its
-    // layer/net rows carry a swatch + label + eye toggle, so the extra width keeps them uncramped
-    // (Hunter red-pen). Forced (Always) on that workspace so it reliably applies to the shared,
+    // layer/net rows carry a swatch + label + eye toggle, so the extra width keeps them uncramped.
+    // Forced (Always) on that workspace so it reliably applies to the shared,
     // otherwise user-resized column; the doc-tab strip re-anchors to this edge each frame, so a wider
     // Electronics column just pushes its own tabs right — Model stays at its own persisted width.
     const bool ecadWs = (st.activeWorkspace == AppState::Workspace::Electronics);
@@ -663,13 +663,13 @@ void drawLeftPane(AppState& st,
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
     // [workspace-tabs seam] Simulate workspace: show ONLY the simulation setup tree.
-    // Hunter hard requirement: no feature/model tree, no Explorer/Configurations tabs.
+    // Requirement: no feature/model tree, no Explorer/Configurations tabs.
     // Entire tab strip + normal body is suppressed; only SimManager::drawTreeBody runs,
     // styled to fill the full column width with the same glass row discipline.
     if (st.activeWorkspace == AppState::Workspace::Simulate && st.simManager) {
         const float S = ui::uiScale;
         // Explorer + Simulation Manager two-button rail — same chrome as the Electronics rail so
-        // every workspace column shares one navigation pattern (Hunter directive).
+        // every workspace column shares one navigation pattern.
         static int s_simTab = 1;   // 0 = Explorer, 1 = Simulation Manager
         if (st.revealSimManager) { s_simTab = 1; st.revealSimManager = false; }
         const float ebtn = 30.0f * S, eglyph = 18.0f * S, egap = 6.0f * S, erowPad = 6.0f * S;
@@ -863,8 +863,8 @@ void drawLeftPane(AppState& st,
     // frame — see doc_tabs.cpp's overlayColumnEdge(0) consumer).
     if (st.activeWorkspace == AppState::Workspace::Electronics) {
         // Electronics gets its own icon-tab rail (Explorer + PCB Manager) across the column top —
-        // same geometry + drawManagerTabButton chrome as the Model FeatureManager rail (Hunter
-        // red-pen: those tab buttons were missing here). No Configurations tab. PCB Manager uses the
+        // same geometry + drawManagerTabButton chrome as the Model FeatureManager rail (those tab
+        // buttons were previously missing here). No Configurations tab. PCB Manager uses the
         // Feature Manager tree glyph (useTreeGlyph=true); Explorer uses the folder icon and hosts the
         // workspace file browser. Selection is a local static (no AppState churn) — a pure UI toggle.
         static int s_ecadTab = 1;   // 0 = Explorer, 1 = PCB Manager
@@ -1078,7 +1078,7 @@ void drawLeftPane(AppState& st,
     // column has animated down near the header height — gates real work (tree/PM/config bodies)
     // rather than just clipping it, so a collapsed column costs nothing per frame.
     if (s_anim.bodyVisible()) {
-        // T-G19: relocated OK/Cancel command buttons. Erik round-1 asked for them ABOVE the PM,
+        // T-G19: relocated OK/Cancel command buttons. They sit ABOVE the PM,
         // between the Configurations tab and the collapse chevron. Rendered on the pane window
         // (after the tab-strip child so their hit rect is clean), right-aligned to end just left
         // of the chevron, vertically centered on the chevron. The PropertyManager owns
@@ -1088,7 +1088,7 @@ void drawLeftPane(AppState& st,
             const float rowCenterY = lpPaneRect.Min.y + 8.0f * S + chevSz * 0.5f;
             pm->drawChromeButtons(st, chevLeftX - 8.0f * S, rowCenterY);
         } else {
-            // Pane title INLINE with the square tab buttons (Hunter): right-aligned in the header
+            // Pane title INLINE with the square tab buttons: right-aligned in the header
             // row, vertically centered on the button row, NO icon — the highlighted tab button
             // already carries the glyph. Its owned band begins after the last tab and ends before
             // the collapse chip; elide within that measured span rather than painting through
@@ -1189,7 +1189,7 @@ void drawLeftPane(AppState& st,
                 if (pmActive) {
                     pm->drawBody(st);
                 } else {
-                    // [sim-gui rework, Hunter red-pen] The simulation study tree does NOT render
+                    // [sim-gui rework] The simulation study tree does NOT render
                     // here any more: it exists ONLY in the Simulate workspace (the early-return
                     // Simulate branch above owns it). Model/Drawing show the feature tree alone.
                     drawFeatureTreeBody(st, editCallback);

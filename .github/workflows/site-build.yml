@@ -1,13 +1,17 @@
-# Build the zero-runtime marketing/docs site and publish the exact static output
-# to the existing Cloudflare Pages project. This private repository has a $0 CI
-# budget, so every job stays on the named self-hosted Linux builder.
+# Build the static chudware.com site (website/) on every change and publish the
+# exact build output to Cloudflare Pages on pushes to master. Pull requests
+# only build; they never see the deploy credentials.
 name: site-build
 
 on:
   push:
     branches: [master]
     paths:
-      - 'Webservice/public-site/**'
+      - 'website/**'
+      - '.github/workflows/site-build.yml'
+  pull_request:
+    paths:
+      - 'website/**'
       - '.github/workflows/site-build.yml'
   workflow_dispatch:
 
@@ -15,44 +19,38 @@ permissions:
   contents: read
 
 concurrency:
-  group: site-build-${{ github.ref }}
-  cancel-in-progress: false
+  group: site-build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  build-and-deploy:
-    name: Build and deploy Cloudflare Pages site
-    if: ${{ github.ref_protected && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
-    environment: chudware-control-protected
-    runs-on:
-      group: chudware-trusted-protected
-      labels: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-build]
-    timeout-minutes: 30
+  build:
+    name: Build site
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: website
     steps:
       - name: Check out repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Verify CI workflow policy
-        shell: bash
-        run: python3 scripts/verify-ci-workflows.py
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: website/package-lock.json
 
       - name: Build static site
-        shell: bash
-        working-directory: Webservice/public-site
         run: |
-          set -euo pipefail
-          node --version
-          npm --version
           npm ci
           npm run build
 
       - name: Deploy to Cloudflare Pages
-        shell: bash
-        working-directory: Webservice/public-site
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-          ./node_modules/.bin/wrangler pages deploy dist --project-name chudware-site --branch master
+        run: ./node_modules/.bin/wrangler pages deploy dist --project-name chudware-site --branch master

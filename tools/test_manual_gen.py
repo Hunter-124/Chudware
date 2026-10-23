@@ -1,4 +1,4 @@
-"""tools/test_manual_gen.py — T-Q4 user-manual generator tests.
+"""tools/test_manual_gen.py — user-manual generator tests.
 
 Collects from the real repo truth sources (ribbon inventory, cad_guide prose, contracts/*.md)
 read-only; every write goes to a tmp directory — the committed docs/manual/ is never touched.

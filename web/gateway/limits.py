@@ -1,170 +1,40 @@
-"""Shared abuse controls: per-user rate limits, upload caps, and disk quotas.
+"""Request-size admission and descriptor-pinned file I/O shared by the routes.
 
-Every multi-tenant guard in the gateway routes through this module so the
-policy lives in one place. The gateway is a single uvicorn process, so plain
-in-process dictionaries are the correct storage — no Redis, no shared state
-across workers to keep coherent.
+Every byte ceiling is enforced before a parser buffers input, and every file
+operation runs through no-follow directory descriptors so a symlink planted in
+the workspace cannot redirect a read or write outside it.
 """
 
 from __future__ import annotations
 
-import hashlib
-import ipaddress
 import os
 import secrets
-import threading
-import time
 import stat
-from collections import OrderedDict, deque
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Deque
 from urllib.parse import quote
 
 from fastapi import HTTPException, Request
-from starlette.formparsers import MultiPartException
 from starlette.background import BackgroundTask
+from starlette.formparsers import MultiPartException
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 try:
     from .config import settings
-    from .plans import limits_for
-except ImportError:  # uvicorn app:app from the package dir
+except ImportError:  # uvicorn app:app from the package directory
     from config import settings
-    from plans import limits_for
-
-
-class RateLimiter:
-    """Sliding-window request counter keyed by an arbitrary string.
-
-    Buckets are pruned lazily, with a strict LRU key cap. Even fresh keys are
-    evicted under churn, so rotating submitted identities cannot exhaust memory
-    or trigger a full-table sweep on every request.
-    """
-
-    __slots__ = ("limit", "window", "max_keys", "_hits", "_lock")
-
-    def __init__(self, limit: int, window_sec: float, max_keys: int = 4096) -> None:
-        self.limit = limit
-        self.window = window_sec
-        self.max_keys = max(1, max_keys)
-        self._hits: OrderedDict[str, Deque[float]] = OrderedDict()
-        self._lock = threading.Lock()
-
-    def _prune(self, bucket: Deque[float], now: float) -> None:
-        cutoff = now - self.window
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-
-    def check(self, key: str) -> bool:
-        """Record a hit for ``key``. False once the window budget is spent."""
-        with self._lock:
-            now = time.monotonic()
-            bucket = self._hits.get(key)
-            if bucket is None:
-                if len(self._hits) >= self.max_keys:
-                    self._hits.popitem(last=False)
-                bucket = deque()
-                self._hits[key] = bucket
-            else:
-                self._hits.move_to_end(key)
-            self._prune(bucket, now)
-            if len(bucket) >= self.limit:
-                return False
-            bucket.append(now)
-            return True
-
-    def retry_after(self, key: str) -> int:
-        """Whole seconds until ``key`` regains budget (>= 1 when throttled)."""
-        with self._lock:
-            bucket = self._hits.get(key)
-            if not bucket:
-                return 0
-            return max(1, int(self.window - (time.monotonic() - bucket[0])) + 1)
-
-    def allowed(self, key: str) -> bool:
-        """Inspect remaining budget without charging a successful login."""
-        with self._lock:
-            bucket = self._hits.get(key)
-            if bucket is None:
-                return self.limit > 0
-            self._prune(bucket, time.monotonic())
-            self._hits.move_to_end(key)
-            return len(bucket) < self.limit
-
-    def clear(self, key: str) -> None:
-        with self._lock:
-            self._hits.pop(key, None)
-
-    def enforce(self, key: str, what: str = "requests") -> None:
-        """Raise 429 when ``key`` is over budget."""
-        if not self.check(key):
-            raise HTTPException(
-                status_code=429,
-                detail=f"too many {what} — slow down",
-                headers={"Retry-After": str(self.retry_after(key))},
-            )
-
-
-# Shared limiters. Keys are always the authenticated email, never a client-
-# supplied value, so one account cannot exhaust another's budget.
-api_writes = RateLimiter(settings.rate_writes_per_min, 60.0)
-uploads = RateLimiter(settings.rate_uploads_per_min, 60.0)
-chat_messages = RateLimiter(settings.rate_chat_per_min, 60.0)
-
-# Pre-authentication IP budgets use request_network: exact IPv4 and IPv6 /64.
-# The email budget records only failed logins and includes the client network;
-# a caller elsewhere cannot spend an account owner's sign-in budget.
-login_by_email = RateLimiter(5, 900.0)
-login_by_ip = RateLimiter(20, 900.0)
-
-
-def client_network(address: str) -> str:
-    """A stable abuse-control key; rotating IPv6 interface IDs gains no budget."""
-    try:
-        ip = ipaddress.ip_address(address)
-    except ValueError:
-        return "unknown"
-    if isinstance(ip, ipaddress.IPv4Address):
-        return str(ip)
-    return str(ipaddress.ip_network((ip, 64), strict=False))
-
-
-def request_network(request: Request) -> str:
-    """Trust Cloudflare's client address only over the loopback tunnel hop."""
-    peer = request.client.host if request.client else ""
-    if peer in {"127.0.0.1", "::1"}:
-        forwarded = request.headers.get("cf-connecting-ip", "").strip()
-        try:
-            ipaddress.ip_address(forwarded)
-        except ValueError:
-            pass
-        else:
-            return client_network(forwarded)
-    return client_network(peer)
 
 
 # Wire-byte ceilings apply before FastAPI parses JSON or multipart data.
-# Security events keep their separate 512 KiB *expanded* gzip cap in security.py.
 SMALL_REQUEST_BYTES = 64 * 1024
-BILLING_WEBHOOK_BYTES = 1024 * 1024
-RELEASE_UPLOAD_BYTES = 2 * 1024**3
 WORKSPACE_CHAT_BYTES = 5 * 1024 * 1024
 
 
 def request_body_cap(path: str) -> int:
-    if path == "/api/billing/webhook":
-        return BILLING_WEBHOOK_BYTES
-    if path in {"/workspace/upload", "/api/bucket/upload"}:
+    if path == "/workspace/upload":
         return settings.max_upload_bytes
-    if path.startswith("/api/releases/ci/upload/"):
-        return RELEASE_UPLOAD_BYTES
-    if path == "/api/admin/releases/upload":
-        return RELEASE_UPLOAD_BYTES + SMALL_REQUEST_BYTES
-    if (path.startswith("/api/studio/listings/") and path.endswith("/assets")
-            and len(path.split("/")) == 6):
-        return settings.marketplace_max_asset_bytes + SMALL_REQUEST_BYTES
     if path == "/workspace/chat":
         return WORKSPACE_CHAT_BYTES
     return SMALL_REQUEST_BYTES
@@ -181,10 +51,9 @@ class _RequestBodyTooLarge(HTTPException, MultiPartException):
 class RequestBodyLimitMiddleware:
     """Outermost pure ASGI guard, including Content-Length-free/chunked input.
 
-    No body is prebuffered here: authenticated uploads still authorize before
-    reading. Oversized chunks never reach a parser. Multipart parsing translates
-    MultiPartException to 400, so send also preserves the authoritative 413.
-    WebSocket and lifespan scopes are deliberately untouched.
+    No body is prebuffered here. Oversized chunks never reach a parser.
+    Multipart parsing translates MultiPartException to 400, so send also
+    preserves the authoritative 413. WebSocket and lifespan scopes pass through.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -239,29 +108,6 @@ class RequestBodyLimitMiddleware:
         except _RequestBodyTooLarge:
             if not replied:
                 await JSONResponse({"detail": "request body too large"}, 413)(scope, receive, send)
-
-
-def user_slug(email: str) -> str:
-    """Return a filesystem-safe, human-diagnosable account slug.
-
-    Existing escaped slugs up to 120 characters remain unchanged. Longer
-    identities retain a readable prefix plus a full digest of the complete
-    normalized address, so truncation cannot merge colliding prefixes.
-    """
-    normalized = email.strip().lower()
-    out = []
-    for ch in normalized:
-        if ch.isalnum() or ch in "._-":
-            out.append(ch)
-        else:
-            out.append(f"~{ord(ch):02x}")
-    readable = "".join(out)
-    if not readable or readable in {".", ".."}:
-        raise HTTPException(status_code=400, detail="invalid account identity")
-    if len(readable) <= 120:
-        return readable
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-    return f"{readable[:54]}~z{digest}"
 
 
 def enforce_upload_size(content_length: int | None) -> int:
@@ -325,82 +171,18 @@ async def bounded_form(request: Request, cap: int, *, max_files: int = 1, max_fi
         raise
 
 
-def dir_size_bytes(root: Path, *, cap: int | None = None) -> int:
-    """Recursive on-disk size of ``root``, short-circuiting once past ``cap``.
-
-    Symlinks are never followed, so a user cannot make their own quota appear
-    small by pointing at an empty directory, nor make a scan walk the host.
-    """
-    # Lazy import keeps cells' identity helpers free to import the rate policy.
-    try:
-        from . import cells
-    except ImportError:
-        import cells
-    try:
-        first = cells.directory_beneath(root)
-    except HTTPException as exc:
-        if exc.status_code == 404:
-            return 0
-        raise
-    total = 0
-    stack = [first]
-    try:
-        while stack:
-            current = stack.pop()
-            try:
-                with os.scandir(current) as it:
-                    for entry in it:
-                        try:
-                            info = entry.stat(follow_symlinks=False)
-                            if stat.S_ISDIR(info.st_mode):
-                                stack.append(os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY |
-                                                     os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=current))
-                            elif stat.S_ISREG(info.st_mode):
-                                total += info.st_size
-                        except OSError:
-                            continue
-            finally:
-                os.close(current)
-            if cap is not None and total > cap:
-                return total
-        return total
-    finally:
-        for fd in stack:
-            os.close(fd)
-
-
-# Bounded stripes avoid an ever-growing lock table for arbitrary account roots.
-# This serializes this gateway process, not external Box/native filesystem writers.
+# A fixed pool of locks avoids an ever-growing lock table. This serializes this
+# gateway process only; the engine cell writes the same tree independently.
 _STORAGE_WRITE_LOCKS = tuple(threading.RLock() for _ in range(64))
 
 
 def storage_write_lock(root: Path):
-    """Hold across quota preflight, mutation and final accounting of one root."""
+    """Hold across the validation and mutation of one workspace root."""
     return _STORAGE_WRITE_LOCKS[hash(root) % len(_STORAGE_WRITE_LOCKS)]
 
 
-def enforce_disk_quota(
-    email: str,
-    plan: str,
-    root: Path,
-    incoming_bytes: int = 0,
-    replaced_bytes: int = 0,
-) -> None:
-    """Raise 507 when an account's tree would exceed its plan storage limit."""
-    quota = limits_for(plan).storage_quota_bytes
-    used = dir_size_bytes(root, cap=quota + max(0, replaced_bytes))
-    if used + max(0, incoming_bytes) - max(0, replaced_bytes) > quota:
-        raise HTTPException(
-            status_code=507,
-            detail=(
-                f"storage quota exceeded for {email} — "
-                f"{quota // (1024 * 1024)} MiB on {plan} "
-                f"({used // (1024 * 1024)} MiB used)"
-            ),
-        )
-
 def list_open_directory(fd: int, prefix: str, cap: int) -> tuple[list[dict], list[dict]]:
-    """List bounded non-symlink entries using an authorized directory fd."""
+    """List bounded non-symlink entries using an already pinned directory fd."""
     entries: list[tuple[str, os.stat_result]] = []
     try:
         with os.scandir(fd) as scan:
@@ -430,7 +212,7 @@ def list_open_directory(fd: int, prefix: str, cap: int) -> tuple[list[dict], lis
 
 def stream_open_file(fd: int, st: os.stat_result, *, filename: str = "",
                      headers: dict[str, str] | None = None) -> StreamingResponse:
-    """Stream an already authorized descriptor, never reopen a raceable path."""
+    """Stream an already pinned descriptor, never reopen a raceable path."""
     file = os.fdopen(fd, "rb")
     response_headers = dict(headers or {})
     response_headers["Content-Length"] = str(st.st_size)
@@ -453,12 +235,11 @@ def stream_open_file(fd: int, st: os.stat_result, *, filename: str = "",
                              headers=response_headers, background=BackgroundTask(file.close))
 
 
-def store_upload(root: Path, relative: str, upload, *, cap: int, email: str,
-                 plan: str, total: int = 0, create_parents: bool = False) -> int:
-    """Quota-check and atomically publish an upload through no-follow dir fds.
+def store_upload(root: Path, relative: str, upload, *, cap: int) -> int:
+    """Atomically publish an upload through no-follow directory descriptors.
 
-    Caller holds storage_write_lock across a batch. Tenant code may mutate
-    subdirectories concurrently, so no path-based reopen is safe here.
+    The caller holds storage_write_lock. The engine may mutate subdirectories
+    concurrently, so no path-based reopen is safe here.
     """
     try:
         from . import cells
@@ -467,29 +248,17 @@ def store_upload(root: Path, relative: str, upload, *, cap: int, email: str,
     parts = relative.split("/")
     if relative.startswith("/") or "\\" in relative or any(p in {"", ".", ".."} for p in parts):
         raise HTTPException(400, "bad relative path")
-    parent = cells.directory_beneath(root)
+    parent = cells.directory_beneath(root, "/".join(parts[:-1]))
     temporary = ""
     try:
-        for component in parts[:-1]:
-            if create_parents:
-                try:
-                    os.mkdir(component, mode=0o700, dir_fd=parent)
-                except FileExistsError:
-                    pass
-            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                            dir_fd=parent)
-            os.close(parent)
-            parent = child
         name = parts[-1]
         try:
-            previous_info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            previous = os.stat(name, dir_fd=parent, follow_symlinks=False)
         except FileNotFoundError:
-            previous = 0
+            pass
         else:
-            if not stat.S_ISREG(previous_info.st_mode):
+            if not stat.S_ISREG(previous.st_mode):
                 raise HTTPException(400, "not a regular file")
-            previous = previous_info.st_size
-        enforce_disk_quota(email, plan, root, incoming_bytes=upload.size or 0, replaced_bytes=previous)
         temporary = ".upload-" + secrets.token_hex(16)
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                      0o600, dir_fd=parent)
@@ -497,10 +266,9 @@ def store_upload(root: Path, relative: str, upload, *, cap: int, email: str,
         with os.fdopen(fd, "wb") as file:
             while chunk := upload.file.read(1 << 20):
                 size += len(chunk)
-                if total + size > cap:
+                if size > cap:
                     raise HTTPException(413, "upload too large")
                 file.write(chunk)
-        enforce_disk_quota(email, plan, root, replaced_bytes=previous)
         os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
         return size
     except OSError:
@@ -514,30 +282,16 @@ def store_upload(root: Path, relative: str, upload, *, cap: int, email: str,
         os.close(parent)
 
 
-
 __all__ = [
-    "RateLimiter",
     "RequestBodyLimitMiddleware",
     "SMALL_REQUEST_BYTES",
-    "BILLING_WEBHOOK_BYTES",
-    "RELEASE_UPLOAD_BYTES",
     "WORKSPACE_CHAT_BYTES",
-    "client_network",
-    "request_network",
+    "bounded_form",
+    "enforce_upload_size",
+    "list_open_directory",
+    "read_bounded_body",
     "request_body_cap",
     "storage_write_lock",
-    "api_writes",
-    "uploads",
-    "chat_messages",
-    "login_by_email",
-    "login_by_ip",
-    "user_slug",
-    "enforce_upload_size",
-    "dir_size_bytes",
-    "enforce_disk_quota",
-    "read_bounded_body",
-    "bounded_form",
-    "stream_open_file",
-    "list_open_directory",
     "store_upload",
+    "stream_open_file",
 ]

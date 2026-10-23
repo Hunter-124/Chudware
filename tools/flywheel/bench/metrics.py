@@ -2,7 +2,7 @@
 
 Example-level metrics (ROC-AUC, precision/recall, coverage) so benches report ranking
 quality, not just a corpus mean. No numpy — the suite must run parity-clean on any box
-with only the stdlib (DoD: reproducible on a second machine/OS).
+with only the stdlib, so results are reproducible on a second machine/OS.
 """
 from __future__ import annotations
 
@@ -64,10 +64,10 @@ def coverage(found: Sequence[bool]) -> float:
 
 
 def residual(candidate_mean: float, baseline_mean: float) -> dict[str, float]:
-    """RECOGNITION_RESIDUAL: margin a candidate/human beats the deterministic baseline by.
+    """Residual: the margin by which a candidate beats the deterministic baseline.
 
-    A training task for the insertion point may only start once this residual is a real,
-    measured positive margin on the frozen set.
+    A model-backed path is only justified over the deterministic one when this residual
+    is a real, measured positive margin on the frozen set.
     """
     return {
         "candidate_mean": candidate_mean,

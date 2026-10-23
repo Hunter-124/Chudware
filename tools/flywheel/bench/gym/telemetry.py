@@ -1,18 +1,15 @@
-"""Gym -> Pillar 16 telemetry wiring (T-W27 DoD step 6).
+"""Gym telemetry wiring: one ``events.jsonl`` per gym cycle.
 
-Every gym cycle is training signal. This writes an ``events.jsonl`` per cycle in the
-telemetry wire format (contracts/telemetry.md §3/§5): a leading session-envelope record
-``{consent, origin, app_version, os}`` followed by one ``gym.cell`` event per cell
-carrying the challenge/tier/seed, the independent grading verdict, and the taxonomy
-classes with their evidence refs. The existing flywheel exporter (tools/flywheel/export.py)
-iterates run dirs by this exact shape, so a gym cycle is exportable as SFT/correction
-signal with no exporter change.
+Writes the telemetry wire format (contracts/telemetry.md §3/§5): a leading
+session-envelope record ``{consent, origin, app_version, os}`` followed by one
+``gym.cell`` event per cell carrying the challenge/tier/seed, the independent grading
+verdict, and the taxonomy classes with their evidence refs, then a
+``gym.cycle_summary`` record.
 
-Origin is ``team`` (dogfood corpus, per the Pillar 16 team-dogfood decision) → default
-consent ``full``; if the resolved app config has ``offline_enabled`` the tier is
-hard-forced to ``off`` at the emitter (mirrors export.py `_offline_enabled`). We do not
-re-resolve config here (the gym is a dev tool); we stamp ``full``/``team`` and let the
-exporter re-verify, which is the contract's audit model.
+Origin is ``team`` (internal dogfood runs) → default consent ``full``; if the resolved
+app config has ``offline_enabled`` the tier is hard-forced to ``off`` at the emitter.
+We do not re-resolve config here (the gym is a dev tool); we stamp ``full``/``team`` and
+leave re-verification to any downstream consumer, which is the contract's audit model.
 """
 from __future__ import annotations
 
@@ -24,9 +21,9 @@ from typing import Any
 
 def _session_envelope() -> dict[str, Any]:
     return {
-        "consent": "full",          # team dogfood default; exporter re-verifies
+        "consent": "full",          # team dogfood default; consumers re-verify
         "origin": "team",
-        "app_version": "gym-T-W27",
+        "app_version": "gym",
         "os": platform.system().lower(),
     }
 

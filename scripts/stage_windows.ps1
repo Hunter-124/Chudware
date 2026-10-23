@@ -1,5 +1,10 @@
 # Stage Windows engine + host into dist\Chudware.
 # Usage: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\stage_windows.ps1
+#
+# With a reviewed offline wheelhouse (wheelhouse\ plus vendor\python\RUNTIME_WHEELS.lock)
+# the staged dist provisions its own runtime on first launch. Without both, it is a
+# developer dist: run it with CHUDWARE_PYTHON pointing at a venv provisioned from
+# requirements.txt (see services/installer/install.ps1 for the reviewed path).
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 
@@ -48,13 +53,20 @@ try {
 
     $req = Join-Path $Root "requirements.txt"
     if (-not (Test-Path -LiteralPath $req -PathType Leaf)) { throw "runtime declarations missing: $req" }
-    $identities = @("vendor/python/RUNTIME_WHEELS.lock", "vendor/chudcode/CHUDCODE_ARTIFACT.lock")
-    foreach ($identity in $identities) {
-        $source = Join-Path $Root $identity
-        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "reviewed runtime identity missing: $source" }
+    $chudcodeLock = "vendor/chudcode/CHUDCODE_ARTIFACT.lock"
+    if (-not (Test-Path -LiteralPath (Join-Path $Root $chudcodeLock) -PathType Leaf)) {
+        throw "Chudcode artifact lock missing: $(Join-Path $Root $chudcodeLock)"
     }
+    $wheelLock = "vendor/python/RUNTIME_WHEELS.lock"
     $wheelhouse = Join-Path $Root "wheelhouse"
-    if (-not (Test-Path -LiteralPath $wheelhouse -PathType Container)) { throw "reviewed offline runtime wheelhouse missing: $wheelhouse" }
+    $hasWheelLock = Test-Path -LiteralPath (Join-Path $Root $wheelLock) -PathType Leaf
+    $hasWheelhouse = Test-Path -LiteralPath $wheelhouse -PathType Container
+    if ($hasWheelLock -ne $hasWheelhouse) {
+        throw "a reviewed runtime needs both $wheelLock and wheelhouse\; found only one"
+    }
+    $reviewedRuntime = $hasWheelLock -and $hasWheelhouse
+    $identities = @($chudcodeLock)
+    if ($reviewedRuntime) { $identities += $wheelLock }
     $servicesSrc = Join-Path $Root "services"
     if (-not (Test-Path -LiteralPath $servicesSrc -PathType Container)) { throw "runtime services missing: $servicesSrc" }
 
@@ -105,7 +117,9 @@ try {
         New-Item -ItemType Directory -Force -Path (Split-Path $destination -Parent) | Out-Null
         Copy-Item -Force -LiteralPath $source -Destination $destination
     }
-    Invoke-Robocopy $wheelhouse (Join-Path $Dist "wheelhouse") /MIR /R:1 /W:1 /NFL /NDL /NJH /NJS /NP
+    if ($reviewedRuntime) {
+        Invoke-Robocopy $wheelhouse (Join-Path $Dist "wheelhouse") /MIR /R:1 /W:1 /NFL /NDL /NJH /NJS /NP
+    }
     $assets = Join-Path $Root "assets"
     if (Test-Path -LiteralPath $assets -PathType Container) {
         Invoke-Robocopy $assets (Join-Path $Dist "assets") /MIR /XD __pycache__ /R:1 /W:1 /NFL /NDL /NJH /NJS /NP
@@ -119,6 +133,9 @@ try {
     Write-Host ""
     Write-Host "[stage] DONE"
     Write-Host ("  Run : " + (Join-Path $Dist "chudware.exe"))
+    if (-not $reviewedRuntime) {
+        Write-Host "  No reviewed wheelhouse staged: set CHUDWARE_PYTHON to a venv python provisioned from requirements.txt"
+    }
 } finally {
     Pop-Location
 }

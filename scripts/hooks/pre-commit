@@ -1,11 +1,13 @@
 #!/bin/sh
-# AI-CAD pre-commit gate — runs the deterministic source-level standards checks (gui_lint,
-# feature_surface_audit, parity_audit). Stdlib-only, ~1s; does NOT run the pytest suites.
+# Pre-commit gate: runs the deterministic source-level standards checks (scripts/check.py:
+# gui_lint, feature_surface_audit, parity_audit, ...). About a second; does NOT run the
+# pytest suites.
 #
-# Install:  cp scripts/hooks/pre-commit .git/hooks/pre-commit   (or: git config core.hooksPath scripts/hooks)
+# Install:  git config core.hooksPath scripts/hooks   (or copy this file to .git/hooks/)
 #
-# Pick a python: prefer the dev venv if present, else PATH python.
-PY="$APPDATA/AI-CAD/runtime/venv/Scripts/python.exe"
+# Prefer the development venv (scripts/provision_venv.sh), else python3 on PATH.
+PY=".venv-mcp/bin/python"
+[ -x "$PY" ] || PY=".venv-mcp/Scripts/python.exe"
 [ -x "$PY" ] || PY="$(command -v python3 || command -v python)"
 
 "$PY" scripts/check.py || {

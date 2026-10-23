@@ -661,7 +661,7 @@ def provider_usage_event(
     context_tokens: int = 0,
     source: str = "api",
 ) -> tuple[str, dict]:
-    """Commercial usage report. Attribution is gateway-owned, never payload data."""
+    """Per-call provider token usage; feeds the local context meter and turn totals."""
     return "agent.provider_usage", {
         "provider": str(provider or ""),
         "model": str(model or ""),

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gsl-ser/v1 — the frozen canonical GSL text serialization (Pillar 13, stage 0).
+"""gsl-ser/v1 — the frozen canonical GSL text serialization.
 
 This module is the EXECUTABLE reference for `contracts/gsl_ser.md`. The contract prose
 is normative for wording; this code is normative for behaviour. Two directions:
@@ -9,23 +9,22 @@ is normative for wording; this code is normative for behaviour. Two directions:
     enumerate_slots(state)   state dict  -> ordered list[Slot]         (ground-truth slots)
     render_caption(state)    state dict  -> deterministic prose caption (the GSL template)
 
-The round-trip invariant that DoD-1 asserts:
+The round-trip invariant the tests assert:
 
     extract_slots(serialize(state)) == enumerate_slots(state)
 
 holds exactly because both sides carry the *canonical rounded* value (`Slot.value` is the
 value AS SERIALIZED, at the narration.md precision for its unit — never the raw float).
 
-Design boundary (docs/AI_TOOLING_MASTER_PLAN.md §Pillar 13): the learned layer never
-invents a numeral; every numeral in a caption must trace to a Slot enumerated here.
-The eval harness (`tools/translator/eval/`) scores captions against `enumerate_slots`;
-the groundedness seam (`tools/translator/groundedness.py`, T-H4-owned impl) gates
+Design boundary: model-produced text never invents a numeral; every numeral in a
+caption must trace to a Slot enumerated here. The groundedness checker
+(`tools/translator/groundedness.py`) scores text against these slots and flags
 extrinsic (invented) numerals. This file is engine-free: it operates on state DICTS
 (the `_digest`-shaped payload the deterministic describers already produce), so it runs
 in CI with no libchudware.
 
 Versioning: the header line `#gsl-ser/v1 ...` is tagged in every serialization AND must
-be tagged in every prompt (per the spec). Bump to `/v2` only via an advisor-approved
+be tagged in every prompt (per the spec). Bump to `/v2` only via a versioned
 contract change; extractors accept any `gsl-ser/vN` header they know.
 """
 from __future__ import annotations
@@ -66,9 +65,9 @@ _UNIT_FMT: dict[str, str] = {
 _BARE_UNITS = ("count", "ratio")
 
 # Aliases normalised on extraction of FREE text (captions/paraphrases). The strict
-# serialization only ever emits canonical units; the eval harness tolerates a model
-# that writes an equivalent unit. Unit *sanity* (ksi/MPa 6.9x etc.) is T-H4's
-# unit-sanity verifier, not this file — we only fold exact-equivalent spellings.
+# serialization only ever emits canonical units; free-text extraction tolerates a model
+# that writes an equivalent unit. Unit *sanity* (ksi/MPa 6.9x etc.) is the verify
+# battery's unit_sanity check, not this file — we only fold exact-equivalent spellings.
 _UNIT_ALIAS: dict[str, tuple[str, float]] = {
     "mm": ("mm", 1.0), "millimeter": ("mm", 1.0), "millimeters": ("mm", 1.0),
     "cm": ("mm", 10.0), "m": ("mm", 1000.0),
@@ -219,7 +218,7 @@ def enumerate_slots(state: dict) -> list[Slot]:
 
 
 def _domain_slots(state: dict, out: list[Slot]) -> None:
-    """Sketch / CAM / FEA / ECAD domain slots (§Pillar-13 mix). Each section is optional;
+    """Sketch / CAM / FEA / ECAD domain slots. Each section is optional;
     the shapes mirror the deterministic describers (narration.md / gsl_tools)."""
     sk = state.get("sketch")
     if isinstance(sk, dict):
@@ -390,7 +389,7 @@ def slots_equal(a: Iterable[Slot], b: Iterable[Slot]) -> bool:
     (path, unit, value). `kind` is a semantic annotation (dim vs tolerance, material vs
     enum) that is deliberately NOT written to the text and cannot be recovered from
     "250MPa" or "6061_T6" alone, so it is not part of the round-trip guarantee; the
-    extractor infers a best-effort kind for downstream use only. This is the DoD-1
+    extractor infers a best-effort kind for downstream use only. This is the
     round-trip check and matches `roundtrip_diff` (which compares tokens)."""
     la, lb = list(a), list(b)
     if len(la) != len(lb):

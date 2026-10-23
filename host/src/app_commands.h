@@ -33,8 +33,9 @@ public:
     void registerPrefix(const char* prefix, Handler h); // matches cmd starting with prefix
     void registerAny(Handler h);                        // matches every command (try-first hooks)
 
-    // Entitlement choke point shared by ribbon, shortcut bar, and gesture wheel.
-    // Unknown commands classify as mutating and therefore fail closed.
+    // Agent-lock choke point shared by ribbon, shortcut bar, and gesture wheel: mutating
+    // commands are refused while an agent owns the active document. Unknown commands
+    // classify as mutating and therefore fail closed.
     bool authorize(AppState& st, const char* cmdId) const;
 
     // Walks rules in registration order; returns true when a rule consumed the command.

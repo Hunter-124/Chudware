@@ -42,8 +42,8 @@ core/
     hostd/    chudware-hostd daemon: server, doc registry, worker bridge, mfg lane
     device/   machine transports: GRBL protocol/adapter, emulator, capability
   Infrastructure
-    util/     paths, process isolation, entitlement, secret store, AICM handoff
-    security/ integrity, runtime guard, containment, event queue
+    util/     paths, process isolation, resource governor, AICM handoff, Ed25519 (TweetNaCl)
+    security/ signed payload-manifest integrity, release signing keys
     manufacturing/ authorization arbiter, gates, leases, journal
     prof/     profiling: phase timers, tree, sampler
     cmake/    Provision*.cmake auto-provisioners (OCCT, Polyhedral-FEA, OpenNURBS, lib3mf, …)

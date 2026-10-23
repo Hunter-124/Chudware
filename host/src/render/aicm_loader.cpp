@@ -482,8 +482,8 @@ AicmLru& aicmLru() {
 }  // namespace
 
 bool loadAicmFile(const std::string& path, DocMesh& out, std::string& err) {
-    // The gateway binds this document grant to the authenticated actor, workspace
-    // and epoch. Never turn a daemon file path or shared-memory name into a fetch.
+    // The gateway binds this document grant to the workspace and epoch. Never turn a
+    // daemon file path or shared-memory name into a fetch.
     constexpr const char* prefix = "aicm-cell:";
     if (path.compare(0, std::strlen(prefix), prefix) != 0) {
         err = "AICM requires a workspace document grant";

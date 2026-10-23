@@ -1,17 +1,17 @@
 ---
 title: Install on macOS
-description: Download the signed Chudware desktop app for macOS, or use the browser workspace.
+description: Download the Chudware desktop app for macOS from GitHub Releases and install it.
 section: Installation
 order: 30
 ---
 ## Download the app
 
-Sign in at [app.chudware.com](https://app.chudware.com/#downloads) and open the download page. It issues the signed macOS zip archive for your account; unpack it and drag Chudware into Applications.
+Open the [latest release on GitHub](https://github.com/Hunter-124/Chudware/releases/latest) and download the macOS zip archive (`Chudware-<version>-macos-x86_64.zip`). No account is needed. GitHub shows a SHA-256 digest beside each asset; compare it with the output of `shasum -a 256` before you open the app.
 
-On Apple silicon the published Intel build runs through Rosetta 2. A native Apple-silicon build is not published yet.
+Unpack the archive and drag Chudware into Applications. On Apple silicon the Intel build runs through Rosetta 2. A native Apple-silicon build is not published yet.
 
-Do not download an unofficial package or bypass macOS quarantine for a file presented as Chudware; the download page in your account is the only official source.
+If a build is not yet signed and notarized with an Apple Developer ID, Gatekeeper warns on first launch. Only open a file you downloaded from the project's GitHub releases and whose digest you checked.
 
-## Or skip the install
+## Platform differences
 
-The browser client requires no desktop installation. [Create an account](https://app.chudware.com/signup) to use Chudware from a tab.
+The macOS build does not include the embedded browser used on Windows and Linux, so sign-in to AI providers and parts vendors opens in your system browser. See [macOS Parts Library vendor access](/docs/troubleshooting/#macos-parts-library-vendor-access) for how vendor searches behave on macOS.

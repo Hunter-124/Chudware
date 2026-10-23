@@ -117,7 +117,7 @@ _CCX_NAMES = ("ccx", "ccx_2.20", "ccx_2.21", "ccx_2.19", "calculix")
 #       (build_contact_block_inp measured 0.9 ms on the 7600X3D), so the
 #       margin is sized for what actually dominates — the mesh build and the
 #       autosave/STEP round trip. A cold bench mesh is 0.982 s and a 54k-DOF
-#       modal assembly 2.0 s (benchmarks/simsuite/DAG_PLAN.md P4/P2, same box),
+#       modal assembly 2.0 s (simsuite bench measurements, same box),
 #       so 120 s covers pre-solve work two orders of magnitude heavier than the
 #       bench parts.
 #   HARNESS_CCX_TIMEOUT_S = 420 - 120 = 300 s — the solver budget the harness

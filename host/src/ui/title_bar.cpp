@@ -375,8 +375,8 @@ static ChipResult drawChipAt(const char* btnId,
 }
 
 // ---- Active-project status control (title bar) --------------------------
-// Distinct from the modeling-tab chips on purpose: this selects a personal/team
-// workspace on web or a project folder on desktop, rather than a modeling page.
+// Distinct from the modeling-tab chips on purpose: this selects a project folder on desktop
+// or reveals the workspace file browser on web, rather than a modeling page.
 // It reads as a compact recessed "field" — tight corners, a leading status dot, an elided label
 // and a trailing chevron that signals "click opens a switcher" — where the tabs
 // are borderless pills that only wash on hover/active.
@@ -388,242 +388,13 @@ static ChipResult drawChipAt(const char* btnId,
 //
 // "Project Folder" affordance (File > Open Project Folder..., and the title-bar
 // active-project chip below) — same trigger, platform-appropriate target:
-//   - Native: an OS folder picker choosing the CAD workspace dir (unchanged).
-//   - Web: a centered overlay mounts the portable bucket UI for choosing a
-//     personal or team workspace and browsing its files. Opening a workspace
-//     reloads CAD through /app/ after the surface confirms with the user.
-//     NOT an <iframe src="/bucket">: Cloudflare Access refuses to let its own
-//     protected app be framed at all — even same-origin — which is the
-//     "chudware.com refused to connect" error an iframe here produces.
-//     Instead this does a normal same-page fetch('/bucket') (a plain AJAX
-//     request, not a nested browsing context, so Access allows it exactly
-//     like every other /api/* call this app already makes).
-//
-//     ASSET DISCOVERY. bucket.html is the single source of truth for its own
-//     assets: its stylesheet and script are content-hashed filenames under
-//     /portal-assets/ that change every time that CSS/JS changes. Nothing here
-//     may hardcode one (a stale /static/bucket.js path is exactly why the
-//     embedded bucket rendered unstyled and dead). The fetched document is
-//     parsed and its <link rel=stylesheet> + <script src> are read off the
-//     markup. There is no inline <style> to scrape any more, and no scoping
-//     rewrite: every bucket rule is authored under the .bucket-surface root, so
-//     the stylesheet is safe to link into this document as-is.
-//
-//     MOUNTING. The parsed .bucket-surface node (which carries the file list,
-//     the toolbar AND the rename/confirm <dialog>s) is kept detached as a
-//     template and a fresh clone is inserted on every open, so element ids are
-//     never duplicated. bucket.js is appended ONCE per document lifetime: it
-//     auto-binds the surface present when it runs and exports
-//     window.ChudwareBucket.mount(root) for later clones, and it installs its
-//     document-level drag/drop listeners internally exactly once. Assets are
-//     memoized by absolute URL so reopening never re-adds a <link>/<script>.
-//     No path is picked/returned, so no Asyncify or setActiveProjectDir() call:
-//     the portable surface owns workspace navigation; browsing files alone
-//     does not switch the active CAD workspace.
+//   - Native: an OS folder picker choosing the CAD workspace dir.
+//   - Web: the server hosts a single workspace, so this reveals the left pane's
+//     Explorer tab, which browses that workspace's files.
 static void openProjectFolderAction(AppState& st) {
 #ifdef __EMSCRIPTEN__
-    (void)st;
-    EM_ASM({
-        var st = window.__chudwareBucket;
-        if (!st) {
-            st = {};
-            st.assets = {};      // absolute asset URL -> load Promise (dedupe)
-            st.template = null;  // detached .bucket-surface node, cloned per open
-            st.css = null;
-            st.js = null;
-            st.loading = false;
-            window.__chudwareBucket = st;
-        }
-
-        var overlay = document.getElementById('chudware-bucket-modal');
-        function hide() { overlay.style.display = 'none'; }
-
-        if (!overlay) {
-            overlay = document.createElement('div');
-            overlay.id = 'chudware-bucket-modal';
-            overlay.setAttribute('role', 'dialog');
-            overlay.setAttribute('aria-modal', 'true');
-            overlay.setAttribute('aria-label', 'Workspaces and files');
-            overlay.style.cssText =
-                'position:fixed;inset:0;z-index:999999;background:rgba(4,7,11,0.62);' +
-                'display:flex;align-items:center;justify-content:center;font-family:' +
-                'system-ui,-apple-system,Segoe UI,Roboto,sans-serif;';
-
-            var panel = document.createElement('div');
-            // max-height, never height: the bucket surface is content-sized (an empty
-            // personal destination is ~555px), and pinning the shell to 800px left a
-            // ~200px band of dead panel below the card. Capping instead lets the panel
-            // hug its content and still scroll (bodyEl owns overflow) once a long file
-            // listing exceeds the cap.
-            panel.style.cssText =
-                'background:#0b1014;color:#e8ecf2;border-radius:12px;' +
-                'width:min(1180px,94vw);max-height:min(800px,90vh);' +
-                'display:flex;flex-direction:column;overflow:hidden;' +
-                'box-shadow:0 24px 64px rgba(0,0,0,0.55);border:1px solid #22303b;';
-
-            var titleBar = document.createElement('div');
-            titleBar.style.cssText =
-                'padding:11px 14px;font-weight:600;font-size:13px;letter-spacing:0.02em;' +
-                'border-bottom:1px solid #1b2630;flex:0 0 auto;' +
-                'display:flex;align-items:center;';
-            var titleLbl = document.createElement('span');
-            titleLbl.textContent = 'Workspaces and files';
-            var spacer = document.createElement('span');
-            spacer.style.cssText = 'flex:1 1 auto;';
-            var closeBtn = document.createElement('button');
-            closeBtn.type = 'button';
-            closeBtn.textContent = '\u00d7';
-            closeBtn.setAttribute('aria-label', 'Close');
-            closeBtn.style.cssText =
-                'background:transparent;color:#9fb0c0;border:none;font-size:20px;' +
-                'line-height:1;cursor:pointer;padding:2px 9px;border-radius:7px;';
-            closeBtn.onmouseenter = function () { closeBtn.style.background = '#1a242e'; };
-            closeBtn.onmouseleave = function () { closeBtn.style.background = 'transparent'; };
-            closeBtn.onclick = hide;
-            titleBar.appendChild(titleLbl);
-            titleBar.appendChild(spacer);
-            titleBar.appendChild(closeBtn);
-
-            var bodyEl = document.createElement('div');
-            bodyEl.id = 'chudware-bucket-body';
-            bodyEl.style.cssText = 'flex:1 1 auto;overflow:auto;';
-
-            panel.appendChild(titleBar);
-            panel.appendChild(bodyEl);
-            overlay.appendChild(panel);
-            overlay.addEventListener('mousedown', function (e) {
-                if (e.target === overlay) hide();
-            });
-            document.body.appendChild(overlay);
-
-            // ONE document-level Escape handler, installed with the overlay (built
-            // exactly once), so repeat opens can never stack handlers. It defers to an
-            // open <dialog> inside the surface: the browser closes that first and the
-            // same key must not also tear down the whole modal.
-            document.addEventListener('keydown', function (e) {
-                if (e.key !== 'Escape') return;
-                if (overlay.style.display === 'none') return;
-                if (overlay.querySelector('dialog[open]')) return;
-                hide();
-            });
-        }
-
-        var body = document.getElementById('chudware-bucket-body');
-        overlay.style.display = 'flex';
-
-        function status(msg, tone) {
-            body.replaceChildren();
-            var note = document.createElement('div');
-            note.style.cssText = 'padding:26px 24px;font-size:13px;line-height:1.55;';
-            note.style.color = tone === 'error' ? '#f2a3ae' : '#93a5b6';
-            note.textContent = msg;
-            body.appendChild(note);
-            return note;
-        }
-
-        function fail(err) {
-            st.loading = false;
-            var msg = (err && err.message) ? err.message : String(err);
-            var note = status('Workspaces and files did not load: ' + msg, 'error');
-            var retry = document.createElement('button');
-            retry.type = 'button';
-            retry.textContent = 'Try again';
-            retry.style.cssText =
-                'margin-top:14px;display:block;padding:6px 13px;border-radius:7px;' +
-                'cursor:pointer;background:#182430;color:#e8ecf2;' +
-                'border:1px solid #294050;font:inherit;';
-            retry.onclick = function () { load(); };
-            note.appendChild(retry);
-        }
-
-        // Memoized by absolute URL: the stylesheet and the script are appended to <head>
-        // at most once per document lifetime, no matter how often the modal is opened.
-        // A failed asset drops out of the cache so "Try again" can genuinely retry.
-        function asset(kind, url) {
-            if (st.assets[url]) return st.assets[url];
-            var p = new Promise(function (resolve, reject) {
-                var el;
-                if (kind === 'css') {
-                    el = document.createElement('link');
-                    el.rel = 'stylesheet';
-                    el.href = url;
-                } else {
-                    el = document.createElement('script');
-                    el.src = url;
-                }
-                el.setAttribute('data-chudware-bucket-asset', kind);
-                el.onload = function () { resolve(url); };
-                el.onerror = function () {
-                    delete st.assets[url];
-                    if (el.parentNode) el.parentNode.removeChild(el);
-                    reject(new Error('asset failed to load: ' + url));
-                };
-                document.head.appendChild(el);
-            });
-            st.assets[url] = p;
-            return p;
-        }
-
-        function assetUrls(doc, sel, attr) {
-            var out = [];
-            Array.prototype.forEach.call(doc.querySelectorAll(sel), function (el) {
-                var raw = el.getAttribute(attr);
-                if (!raw) return;
-                var abs = new URL(raw, location.href).href;
-                if (out.indexOf(abs) < 0) out.push(abs);
-            });
-            return out;
-        }
-
-        // A fresh clone every open: the previous surface is discarded first so element
-        // ids are never duplicated, and bucket.js re-binds the new nodes via mount().
-        // On the very first open the script has not run yet — it auto-binds whatever
-        // .bucket-surface it finds — so mount() is only called once the export exists.
-        function mountSurface() {
-            body.replaceChildren();
-            var root = st.template.cloneNode(true);
-            body.appendChild(root);
-            var api = window.ChudwareBucket;
-            if (api && typeof api.mount === 'function') api.mount(root);
-        }
-
-        // CSS before markup (no unstyled flash), markup before script.
-        function activate() {
-            var css = st.css.map(function (u) { return asset('css', u); });
-            Promise.all(css).then(function () {
-                mountSurface();
-                return st.js.reduce(function (chain, u) {
-                    return chain.then(function () { return asset('js', u); });
-                }, Promise.resolve());
-            }).then(function () {
-                st.loading = false;
-            }).catch(fail);
-        }
-
-        function load() {
-            if (st.loading) return;
-            st.loading = true;
-            status('Loading workspaces and files\u2026', 'info');
-            if (st.template) { activate(); return; }
-            fetch('/bucket', { credentials: 'same-origin' }).then(function (r) {
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                return r.text();
-            }).then(function (html) {
-                var doc = new DOMParser().parseFromString(html, 'text/html');
-                var root = doc.querySelector('.bucket-surface');
-                if (!root) throw new Error('bucket page has no .bucket-surface root');
-                st.template = document.importNode(root, true);
-                st.template.classList.add('bucket-surface');
-                st.css = assetUrls(doc, 'link[rel~="stylesheet"][href]', 'href');
-                st.js = assetUrls(doc, 'script[src]', 'src');
-                if (!st.css.length) throw new Error('bucket page links no stylesheet');
-                if (!st.js.length) throw new Error('bucket page links no script');
-                activate();
-            }).catch(fail);
-        }
-
-        load();
-    });
+    st.showFeatureTree = true;
+    st.leftPaneTab = AppState::LP_Explorer;
 #else
     std::string abs = ui::openFolderDialog();
     if (!abs.empty()) setActiveProjectDir(st, abs);
@@ -735,7 +506,7 @@ static ChipResult drawActiveProjectControl(AppState& st, ImVec2 p0, float h, ImF
     // so the tooltip always names the destination in full plus the action.
     if (hovered) {
 #ifdef __EMSCRIPTEN__
-        ImGui::SetTooltip("Choose a personal or team workspace and browse files");
+        ImGui::SetTooltip("Browse workspace files");
 #else
         if (hasProject)
             ImGui::SetTooltip("Active project folder\n%s\n\nClick to change it", project.c_str());
@@ -765,7 +536,7 @@ struct FilMenuDrawer {
     bool hasDoc;
     GLFWwindow* win;
     void draw() const {
-        if (ImGui::BeginMenu("New", !st.entitlementReadOnly)) {
+        if (ImGui::BeginMenu("New")) {
             if (ImGui::MenuItem("Part", "Ctrl+N")) ui::createNewDoc(st, 0);
             if (ImGui::MenuItem("Assembly"))       ui::createNewDoc(st, 1);
             const bool canDraw = st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
@@ -783,9 +554,9 @@ struct FilMenuDrawer {
             openProjectFolderAction(st);
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Save", "Ctrl+S", false, hasDoc && !st.entitlementReadOnly)) st.requestSave = true;
-        if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, hasDoc && !st.entitlementReadOnly)) st.requestSaveAs = true;
-        if (ImGui::MenuItem("Save All", nullptr, false, hasDoc && !st.entitlementReadOnly)) st.requestSaveAll = true;
+        if (ImGui::MenuItem("Save", "Ctrl+S", false, hasDoc)) st.requestSave = true;
+        if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, hasDoc)) st.requestSaveAs = true;
+        if (ImGui::MenuItem("Save All", nullptr, false, hasDoc)) st.requestSaveAll = true;
         ImGui::Separator();
         const bool canExport3d = hasDoc && !st.activeTabIsDrawing() && !st.activeTabIsEcad();
         auto openMeshExport = [&](const char* fmt) {

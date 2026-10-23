@@ -291,7 +291,7 @@ static constexpr float kTabH        = 28.0f;
 static constexpr float kBigIconSz   = 36.0f;
 static constexpr float kSmIconSz    = 20.0f;
 static constexpr float kBigBtnW     = 52.0f;
-// N1-N5 (Hunter, 2026-07-07): raised from 96 so long variant labels that can't wrap
+// N1-N5: raised from 96 so long variant labels that can't wrap
 // (no space — e.g. "Parallelogram") fit inside a split button's face without clipping.
 static constexpr float kBigBtnMaxW  = 120.0f;
 static constexpr float kBigLblPad   = 6.0f;
@@ -403,8 +403,8 @@ struct SmColumn {
 //
 // Spreading the same rows over the same number of columns costs nothing -- the column count is
 // already ceil(n / rowsPerCol) either way, so this never widens a group -- and it turns 3+1
-// into 2+2. Short groups get shorter and wider, which is the horizontal reading Hunter asked
-// for, and no column is ever taller than the body zone allows.
+// into 2+2. Short groups get shorter and wider, giving a horizontal reading,
+// and no column is ever taller than the body zone allows.
 //
 // Remainder goes to the LEADING columns so heights are non-increasing left to right; a group
 // that steps down reads as deliberate where one that steps up reads as a wrap.
@@ -708,7 +708,7 @@ static bool ribbon_hasSubs(const RibbonGroup& grp, const ui::RibbonCmd* cmd) {
     return false;
 }
 
-// N1-N5 (Hunter, 2026-07-07): a split/variant big button's FACE label changes with the selected
+// N1-N5: a split/variant big button's FACE label changes with the selected
 // variant (resolveFace swaps in the sub's label). Sizing to the CURRENT face label made the button
 // reflow every switch — too narrow for long variants (clipping: N1 "3-Pt Arc", N3 cut variants) and
 // bleeding into the neighbor when a wide variant like "Parallelogram" drew past the parent-label
@@ -1375,7 +1375,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0,0,0,0));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0,0,0,0));
 
-    // Split-button geometry (Hunter, 2026-07-07): the dropdown arrow lives in a short BOTTOM strip,
+    // Split-button geometry: the dropdown arrow lives in a short BOTTOM strip,
     // tucked into the bottom-RIGHT corner (under the icon, right side). The button keeps its natural
     // width (never fattened) and the taller body (kBodyH bump) gives the 2-line caption room so it is
     // no longer clipped by the strip.
@@ -1700,7 +1700,7 @@ static const char* ribbon_flyoutPopup(const char* parentId,
             rows.push_back(&defaultRow);
         }
 
-        // N4 FIX (Hunter, 2026-07-07): a split button whose PARENT is itself a functional command
+        // N4 FIX: a split button whose PARENT is itself a functional command
         // (revolve_boss/sweep_boss/loft_boss, sk_rect_corner, sk_arc_3pt, ...) had no flyout row for
         // the parent, so once a *_cut / variant was picked (last-used) the user was stuck one-way —
         // there was no way to switch BACK to the boss/base variant. Inject the parent itself as the
@@ -2228,7 +2228,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     };
 
     // A 3D sketch being edited swaps the WHOLE Sketch-tab command source to the "Sketch3D"
-    // pseudo-tab (ribbon_def.cpp) instead of the normal 2D tool rows (Hunter red-pen item 1).
+    // pseudo-tab (ribbon_def.cpp) instead of the normal 2D tool rows.
     const bool onSketchTab   = std::strcmp(actTabName, "Sketch") == 0;
     const char* srcTabName   = (onSketchTab && s_sketch3dActive) ? "Sketch3D" : actTabName;
 
@@ -2620,7 +2620,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     dl->PopClipRect();   // group-chrome clip pushed right after BeginChild
 
     // Evaluate-tab inspector dock: publish the dead space to the RIGHT of the last group so the
-    // Zebra / Symmetry windows pin INSIDE the ribbon strip (Hunter red-pen: dock, don't float).
+    // Zebra / Symmetry windows pin INSIDE the ribbon strip (dock, don't float).
     // curX is the last group's right edge (child-local); the child spans vp->Size.x - 8*s.
     if (!mobile && std::strcmp(actTabName, "Evaluate") == 0) {
         const ImVec2 cwp = ImGui::GetWindowPos();

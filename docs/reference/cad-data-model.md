@@ -1,7 +1,7 @@
 # The CAD Data Model (DWG/DXF-family)
 
-> **Provenance:** folded in from the sibling clean-room project "Clean Engine"
-> (`D:\Clean Engine\ODA\02-cad-data-model.md`). This describes the object model
+> **Provenance:** folded in from the separate clean-room research project "Clean Engine"
+> (its CAD data-model note). This describes the object model
 > shared by AutoCAD-lineage tools, as **publicly documented** by the DXF Reference
 > (DXF is the readable serialization of exactly these objects) and mirrored by the
 > Open Design Alliance's public `Db*/Ge/Gi/Gs` API naming convention. Nothing here
@@ -84,7 +84,7 @@ wires) or reference wires (open). INSERT, TEXT/MTEXT, DIMENSION, HATCH, POINT an
 mesh entities are skipped and counted, not converted. The Python helper
 `services/formats/formats_dxf.py` (ezdxf, MIT) is the parity oracle and additionally
 explodes INSERT block references; production does not. See `cad-file-formats.md` §2
-for the format-level summary and `work/backlog/T-BL02.md` for the interop roadmap.
+for the format-level summary and `README.md` for planned format work.
 
 ## Geometry (Ge) — the math layer
 

@@ -1,13 +1,12 @@
 # Simulation Optimizer Program
 
-**Program baseline:** 2026-08-24  
-**Executable registry:** `training/simulation/registry.json`  
-**Validator:** `python3 training/simulation/registry.py`
+**Program baseline:** 2026-08-24
 
-The validator checks every registered baseline digest against the current source
-bytes. After an integrated source change, run
-`python3 training/simulation/registry.py --refresh-baseline-hashes`; the same
-command then revalidates the rewritten registry and source hashes.
+This program defines how learned simulation optimizers may be admitted into Chudware. The
+per-family track registry, its source-hash validator, and the training corpora were
+research tooling and are not part of the public tree; the rules, gates and current
+decisions below are the record. Any future registry must check every registered baseline
+digest against the current source bytes and revalidate after a refresh.
 
 ## Authority boundary
 
@@ -15,7 +14,7 @@ An optimizer may advise mesh sizing, order, adaptation, iteration controls, time
 
 The deterministic mesher, solver, error estimator, convergence checks, conservation checks, resource governor, and family-specific safety vetoes remain authoritative. A veto always wins. An unavailable, out-of-distribution, over-budget, unsupported, or failed optimizer falls back to the registered deterministic baseline and says why.
 
-In particular, Chudware's current structural interface accepts tet4/tet10 connectivity. The private PolyMesh advisor may rank actions such as hex or hybrid meshes that its own runtime supports; Chudware must refuse those actions rather than translate them into a different solve or claim that VEM, hybrid, hex, or polyhedral elements ran. Static and adaptive FEA share one optimizer track because they advise the same starting mesh/action space, but adaptive convergence remains a solver-side decision.
+In particular, Chudware's current structural interface accepts tet4/tet10 connectivity. The PolyMesh advisor (from the pinned Polyhedral-FEA fork, see [`contracts/licenses.md`](../../contracts/licenses.md)) may rank actions such as hex or hybrid meshes that its own runtime supports; Chudware must refuse those actions rather than translate them into a different solve or claim that VEM, hybrid, hex, or polyhedral elements ran. Static and adaptive FEA share one optimizer track because they advise the same starting mesh/action space, but adaptive convergence remains a solver-side decision.
 
 All evidence in this program is internal verification and validation (V&V). It is not third-party accreditation, regulatory approval, or external certification.
 

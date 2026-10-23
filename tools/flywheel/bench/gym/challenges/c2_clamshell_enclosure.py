@@ -11,7 +11,7 @@ Ground-truth ACs the gym grades ITSELF:
   AC4  verify_battery PASS                — battery artifact verdict PASS
 
 The scripted agent turns (seeds 1..3) exercise: a clean pass (seed 1), an
-advisory_ignored variant (seed 2 proceeds past a foreman PETG-snap warning without
+advisory_ignored variant (seed 2 proceeds past an advisor PETG-snap warning without
 replan/dispute), and an abstraction_skip variant (seed 3 emits a ladder_bounce with
 geometry before the function_map checklist). Grading stays PASS on all three; the
 extra turns are LABELED classifier signal, not graded-as-model.
@@ -135,7 +135,7 @@ def _base_turns() -> list[dict]:
 def _seed_scripts() -> dict[int, dict[str, list[dict]]]:
     clean = _base_turns()
 
-    # seed 2: advisory_ignored — foreman warns PETG snap is marginal, agent proceeds
+    # seed 2: advisory_ignored — the advisor warns PETG snap is marginal, agent proceeds
     # WITHOUT a replan or dispute. Grading still PASS (geometry unchanged).
     ignored = [dict(t) for t in _base_turns()]
     ignored.append({"_kind": "advisory", "id": "ADV1", "topic": "petg_snap_marginal",

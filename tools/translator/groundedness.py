@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
-"""Groundedness seam — SHARED with T-H4 (verifier battery). ONE implementation, two callers.
+"""Numeric groundedness checking: does every numeral in a text trace to the state?
 
-    HOT-SPOT: the production groundedness checker is OWNED BY T-H4
-    (task/T-H4-verifier-battery). This file defines ONLY the interface the T-F10 eval
-    harness needs, plus a minimal deterministic membership stub so the harness runs
-    end-to-end today. When T-H4 lands, its checker implements `GroundednessChecker`
-    and `set_checker()` swaps it in — no eval-harness change required.
+Two surfaces share one matching core:
 
-The contract (text + state -> per-numeral grounded/ungrounded verdicts):
+  * `check_groundedness(model_text, state)` — dict result ({matched, spurious, ...})
+    used by the `groundedness` gap check in `services/verify/battery.py`.
+  * the pluggable `GroundednessChecker` seam — module-level `check()` delegates to the
+    active checker, `set_checker()` swaps it. The process-start default is
+    `_MembershipStub` (exact slot membership over `gsl_ser.enumerate_slots`);
+    `H4GroundednessAdapter` wraps the `check_groundedness()` matching logic and can be
+    installed with `set_checker(H4GroundednessAdapter())`.
+
+The checker contract (text + state -> per-numeral grounded/ungrounded verdicts):
 
     checker.check(text, state) -> list[Verdict]
 
 where every numeral found in `text` gets a Verdict {value, unit, grounded, matched_path}.
 `grounded` == the numeral is supported by some slot of `state` (extrinsic hallucination
-== an ungrounded numeral). The T-F10 slot-fidelity eval is INDEPENDENT of this seam for
-its primary metric (SER slot accuracy over `enumerate_slots`); it consults the checker
-only to attribute EXTRINSIC (invented-feature) hallucination, which is a groundedness
-question by definition.
-
-Interface open questions for T-H4 are logged in work/questions/T-F10.md.
+== an ungrounded numeral).
 """
 from __future__ import annotations
 
@@ -40,21 +39,20 @@ class Verdict:
 
 @runtime_checkable
 class GroundednessChecker(Protocol):
-    """The seam T-H4 implements. `check` returns one Verdict per numeral in `text`."""
+    """The checker protocol. `check` returns one Verdict per numeral in `text`."""
 
     def check(self, text: str, state: dict) -> list[Verdict]:
         ...
 
 
 class _MembershipStub:
-    """# SEAM(T-H4): groundedness implementation lands with T-H4.
+    """Default checker: exact slot membership.
 
-    Minimal deterministic stand-in: a numeral is grounded iff it unit-normalises to
-    some `enumerate_slots(state)` value (the same `Slot.matches` comparison the slot
-    harness uses). This is intentionally the FLOOR of groundedness (exact slot
-    membership only) — T-H4's checker adds the richer verify-battery semantics
-    (unit-sanity ranges, tolerance-stack awareness, the IP-7 inference output gate).
-    Do NOT grow this stub into that checker; extend T-H4 instead.
+    Minimal deterministic checker: a numeral is grounded iff it unit-normalises to
+    some `enumerate_slots(state)` value (the same `Slot.matches` comparison used for
+    slot round-trips). This is intentionally the FLOOR of groundedness (exact slot
+    membership only); `H4GroundednessAdapter` provides the tolerance-aware matching
+    the verify battery uses. Keep this checker minimal.
     """
 
     def check(self, text: str, state: dict) -> list[Verdict]:
@@ -71,7 +69,7 @@ _CHECKER: GroundednessChecker = _MembershipStub()
 
 
 def set_checker(checker: GroundednessChecker) -> None:
-    """Swap the active groundedness checker (T-H4 calls this to install the real one)."""
+    """Swap the active groundedness checker (e.g. to install H4GroundednessAdapter)."""
     global _CHECKER
     if not isinstance(checker, GroundednessChecker):
         raise TypeError("checker must implement the GroundednessChecker protocol")
@@ -88,7 +86,7 @@ def check(text: str, state: dict) -> list[Verdict]:
 
 
 def is_stub() -> bool:
-    """True while the T-H4 implementation has not been installed (report provenance)."""
+    """True while the default _MembershipStub is the active checker (report provenance)."""
     return isinstance(_CHECKER, _MembershipStub)
 
 
@@ -97,12 +95,9 @@ __all__ = ["Verdict", "GroundednessChecker", "H4GroundednessAdapter",
 
 
 # ===========================================================================
-# T-H4 implementation (merged 2026-07-02). check_groundedness() below is the
-# production checker used by the verify battery. ALIGNMENT TODO (recorded in
-# FOREMAN merge plan + work/questions/T-F10.md ruling): wrap it in a class
-# implementing GroundednessChecker above (per-numeral Verdicts) and make
-# set_checker() install it as the default, retiring _MembershipStub. Until
-# then the two callers use their respective surfaces and both test suites run.
+# Verify-battery groundedness: check_groundedness() is the checker used by
+# services/verify/battery.py. H4GroundednessAdapter (below) exposes the same
+# matching logic through the GroundednessChecker protocol (per-numeral Verdicts).
 # ===========================================================================
 
 
@@ -263,17 +258,13 @@ def _verdicts_from_state(model_text: str, state_dict: dict) -> tuple[
 
 
 class H4GroundednessAdapter:
-    """GroundednessChecker implementation wrapping the T-H4 check_groundedness() logic.
+    """GroundednessChecker implementation wrapping the check_groundedness() logic.
 
     Implements the GroundednessChecker Protocol (one Verdict per numeral in `text`)
     by delegating to _verdicts_from_state(), the same core used by check_groundedness().
     Install via set_checker(H4GroundednessAdapter()) to upgrade the module default from
-    the _MembershipStub floor to the full T-H4 verify-battery semantics.
-
-    NOTE (alignment TODO): test_groundedness_is_stub_by_default in the T-F10 suite
-    asserts is_stub() is True, pinning _MembershipStub as the process-start default.
-    Until that test is updated to accept the adapter as default, the module-level
-    default remains _MembershipStub. See work/questions/align-post-merge.md.
+    the _MembershipStub floor to the verify-battery semantics (unit normalisation and
+    tolerance matching). The module-level default remains _MembershipStub.
     """
 
     def check(self, text: str, state: dict) -> list[Verdict]:

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Exercise hostile updater artifacts over a real loopback TLS connection."""
+"""Exercise hostile updater artifacts over a real loopback TLS connection.
+
+Release assets are served the way GitHub serves them: the asset URL answers
+with a redirect to object storage, so the download must follow it and still
+reject bytes that fail size, SHA-256 or Ed25519 verification.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +26,18 @@ _ARTIFACT = b"signed artifact bytes\n"
 
 class _Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
-        if self.path not in ("/corrupt", "/wrong-key"):
+        if self.path.startswith("/releases/download/"):
+            self.send_response(302)
+            self.send_header("Location", "/objects/" + self.path.rsplit("/", 1)[-1])
+            self.end_headers()
+            return
+        if self.path == "/redirect-plaintext":
+            port = self.server.server_address[1]
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{port}/objects/corrupt")
+            self.end_headers()
+            return
+        if self.path not in ("/objects/corrupt", "/objects/wrong-key"):
             self.send_error(404)
             return
         self.send_response(200)
@@ -83,49 +99,62 @@ def main() -> int:
                 fixture = root / kind
                 subprocess.run(
                     [str(args.test_updater), "--served", kind,
-                     f"https://localhost:{port}/{kind}", str(fixture)],
+                     f"https://localhost:{port}/releases/download/v1.2.0/{kind}",
+                     str(fixture)],
                     env=env, check=True,
                 )
                 assert not (fixture / "data" / "updates" / "staged.json").exists()
 
             # Even with the developer CA override, libcurl's protocol allowlist must
-            # reject plaintext HTTP before accepting response bytes.
-            plaintext = root / "plaintext"
-            failed = subprocess.run(
-                [str(args.test_updater), "--served", "corrupt",
-                 f"http://127.0.0.1:{port}/corrupt", str(plaintext)],
-                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            )
-            if failed.returncode == 0:
-                raise AssertionError("updater accepted a plaintext HTTP artifact URL")
-            if (plaintext / "data" / "updates" / "staged.json").exists():
-                raise AssertionError("plaintext HTTP artifact was staged")
+            # reject plaintext HTTP before accepting response bytes, whether it is
+            # the artifact URL itself or a redirect target.
+            for name, url in (
+                ("plaintext", f"http://127.0.0.1:{port}/objects/corrupt"),
+                ("redirect-plaintext", f"https://localhost:{port}/redirect-plaintext"),
+            ):
+                fixture = root / name
+                failed = subprocess.run(
+                    [str(args.test_updater), "--served", "corrupt", url, str(fixture)],
+                    env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                if failed.returncode == 0:
+                    raise AssertionError(f"updater accepted a plaintext HTTP artifact ({name})")
+                if (fixture / "data" / "updates" / "staged.json").exists():
+                    raise AssertionError(f"plaintext HTTP artifact was staged ({name})")
 
-            # An empty channel (404 manifest) is the normal pre-release state and
+            # A missing release manifest (404) is the normal pre-release state and
             # must read as a quiet "up to date", not an HTTP error. The manifest
-            # fetch goes over plain loopback here: only artifact downloads are
-            # pinned to TLS, and the manifest carries no secrets.
-            class _Empty(http.server.BaseHTTPRequestHandler):
+            # URL redirects first, exactly like GitHub's releases/latest/download.
+            # The manifest fetch goes over plain loopback here: only artifact
+            # downloads are pinned to TLS, and the manifest carries no secrets.
+            class _NoRelease(http.server.BaseHTTPRequestHandler):
                 def do_GET(self) -> None:  # noqa: N802
+                    if self.path.startswith("/releases/latest/download/"):
+                        self.send_response(302)
+                        self.send_header("Location", "/releases/download/v0/missing.json")
+                        self.end_headers()
+                        return
                     self.send_error(404)
 
                 def log_message(self, *_args: object) -> None:
                     pass
 
-            empty_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Empty)
-            empty_thread = threading.Thread(target=empty_server.serve_forever, daemon=True)
-            empty_thread.start()
+            manifest_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _NoRelease)
+            manifest_thread = threading.Thread(target=manifest_server.serve_forever, daemon=True)
+            manifest_thread.start()
             try:
+                manifest_port = manifest_server.server_address[1]
                 subprocess.run(
                     [str(args.test_updater), "--check-once",
-                     f"http://127.0.0.1:{empty_server.server_address[1]}/latest",
-                     str(root / "empty-channel")],
+                     f"http://127.0.0.1:{manifest_port}"
+                     "/releases/latest/download/update-linux-x86_64.json",
+                     str(root / "no-release")],
                     env=env, check=True,
                 )
             finally:
-                empty_server.shutdown()
-                empty_thread.join()
-                empty_server.server_close()
+                manifest_server.shutdown()
+                manifest_thread.join()
+                manifest_server.server_close()
         finally:
             server.shutdown()
             thread.join()

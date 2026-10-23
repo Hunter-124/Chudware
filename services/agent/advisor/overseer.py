@@ -871,7 +871,6 @@ class Overseer:
                 on_event=self.on_event,
                 options=turn_options,
                 max_tokens=self.max_tokens,
-                actor="overseer",
                 close_session=True,
             )
         except Exception as exc:  # noqa: BLE001 — auditor failure never blocks mission

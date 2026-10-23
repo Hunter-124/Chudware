@@ -7,7 +7,7 @@
   -->
   <Package
       Name="Chudware"
-      Manufacturer="Chudware"
+      Manufacturer="Chudware contributors"
       Version="$(var.ProductVersion)"
       ProductCode="$(var.ProductCode)"
       UpgradeCode="{F408B3F7-9CBE-50D6-BE21-52D0C3CA48F5}"
@@ -23,6 +23,8 @@
         DowngradeErrorMessage="A newer version of Chudware is already installed."
         Schedule="afterInstallInitialize" />
     <MediaTemplate EmbedCab="yes" />
+    <Property Id="ARPURLINFOABOUT" Value="https://chudware.com" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/Hunter-124/Chudware/issues" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Chudware">

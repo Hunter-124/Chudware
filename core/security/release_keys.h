@@ -13,9 +13,9 @@ struct Key {
     std::array<unsigned char, kPublicKeyBytes> publicKey;
 };
 
-// Release keys are intentionally owned by this trust ring rather than the
-// entitlement verifier. Rotation adds the new key before publishers switch,
-// then removes the old key only after older clients are no longer supported.
+// Release keys verify signed payload manifests and update manifests. Rotation
+// adds the new key before publishers switch, then removes the old key only
+// after older clients are no longer supported.
 inline constexpr std::array kKeys = {
     Key{
         "release-v1",

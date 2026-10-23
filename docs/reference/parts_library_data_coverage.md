@@ -1,7 +1,7 @@
 # Parts Library data coverage — what it provides vs. what design validation needs
 
 Cached findings (2026-07-08) from Parts Library Phase 2 spot-checks. Answers two
-questions: (1) do we already have proper alloy-property lookups without MatWeb,
+questions: (1) are proper alloy-property lookups available without MatWeb,
 and (2) are `part_search` records sufficient to feed the mechanical/structural
 validators without manual re-entry.
 
@@ -10,7 +10,7 @@ validators without manual re-entry.
 `research_material_lookup` (`services/research/material_lookup.py`) serves the
 full mechanical property set for named alloys from the **first-party bundled
 registry** (`core/data/materials/registry.json`, ASM/MMPDS nominal values), cited,
-`confidence:"bundled"`, offline-safe. Verified live for the rover alloys:
+`confidence:"bundled"`, offline-safe. Verified live for common structural alloys:
 
 | alloy    | yield (MPa) | ultimate (MPa) | endurance/fatigue (MPa) | density (g/cm³) | E (MPa) |
 |----------|-------------|----------------|-------------------------|-----------------|---------|
@@ -18,12 +18,12 @@ registry** (`core/data/materials/registry.json`, ASM/MMPDS nominal values), cite
 | 4130     | 435 | 670 | 340 | 7.85 | 205 000 |
 | 7075-T6  | 503 | 572 | 159 | 2.81 | 71 700 |
 
-**Conclusion:** yield, fatigue (endurance limit), and density for the alloys a
-human-powered rover uses are already available first-party. **MatWeb is not
+**Conclusion:** yield, fatigue (endurance limit), and density for common aluminium and
+steel structural alloys are already available first-party. **MatWeb is not
 required for this.** The opt-in external web lookup
-(`material_web_lookup.py`, MakeItFrom) built under the prior owner directive is
+(`material_web_lookup.py`, MakeItFrom) is
 therefore **redundant for property lookup** and stays **disabled by default**
-(`CHUDWARE_ENABLE_MATERIAL_WEB` unset) — keep it only as an owner-opt-in
+(`CHUDWARE_ENABLE_MATERIAL_WEB` unset) — keep it only as a user-opt-in
 cross-check, not a needed path. To add an alloy that's missing, extend
 `registry.json` (first-party, cited) rather than scraping.
 

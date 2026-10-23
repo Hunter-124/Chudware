@@ -140,10 +140,6 @@ inline void wasmBootReady() {
 #include "ui/file_dialog.h" // Wave Y: native Save As / Open dialogs for .ecad+
 #include "ui/file_dialog.h" // W14: native Save-As for 2D export (flat-pattern DXF)
 #include "ui/file_explorer.h" // Wave 3: File Explorer + workspace/recent helpers
-#ifndef __EMSCRIPTEN__
-#include "ui/account_panel.h"
-#include "util/secret_store.h"  // entitlement_signout shot: proves the sealed token is erased
-#endif
 #include "ui/firmware/fw_workspace.h" // T-FIN5 Firmware workspace (drawFirmwareWorkspace + shot fixture)
 #include "ui/manufacture/manufacture_panel.h" // P4 manufacturing operator surface + RPC dispatch
 #include "ui/manufacture/mfg_mirror.h" // complete read-only manufacturing mirror type
@@ -2831,16 +2827,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 
   // ---------- application state (bundles what were run_gui locals) ----------
   AppState st;
-#ifdef __EMSCRIPTEN__
-  // The browser can load this client only after the gateway has authenticated
-  // and plan-gated every /app asset request. That revocable, server-side
-  // 30-day HttpOnly session is the authoritative entitlement boundary for the
-  // web surface; WASM has no desktop token to expose or verify again.
-  st.entitlementReadOnly = false;
-  st.entitlementSignedIn = true;
-  st.entitlementMutationVerified = true;
-  st.entitlementAiVerified = true;
-#endif
   st.mfgMirror = std::make_shared<ui::MfgMirror>();
   st.win = win;
   st.shot = shot;
@@ -3021,9 +3007,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   st.orthographic =
       st.settings
           .orthographic; // live projection mode mirrors the persisted setting
-#ifndef __EMSCRIPTEN__
-  ui::initializeAccountPanel(st);
-#endif
   // Liquid glass v2.1: install + resolve the persisted appearance config before
   // the first frame (idempotent; re-pushed every frame in the loop below so
   // runtime mutations self-heal).
@@ -3776,56 +3759,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   st.wantPlan = shot && shotMode && std::strcmp(shotMode, "plan") == 0;
   st.wantPick = shot && shotMode && std::strcmp(shotMode, "pick") == 0;
   st.wantRibbon = shot && shotMode && std::strcmp(shotMode, "ribbon") == 0;
-  const bool wantEntitlementReadonly =
-      shot && shotMode && std::strcmp(shotMode, "entitlement_readonly") == 0;
-  if (wantEntitlementReadonly) {
-    st.showRibbon = true;
-    st.entitlementReadOnly = true;
-    st.entitlementSignedIn = true;
-    st.entitlementStatus = "Desktop entitlement refused";
-    const bool pmWasActive = st.propertyManager && st.propertyManager->active();
-    st.ribbonDispatch("extrude_boss");
-    const bool editBlocked =
-        !st.propertyManager || st.propertyManager->active() == pmWasActive;
-    st.displayStyle = 0;
-    st.ribbonDispatch("display_wireframe");
-    const bool viewAllowed = st.displayStyle == 4;
-    st.entitlementMutationVerified = false;
-    st.ribbonDispatch("eval_measure");
-    const bool measureAllowed = !st.entitlementMutationVerified;
-    st.ribbonDispatch("sm_export_flat_dxf");
-    const bool exportAllowed = !st.entitlementMutationVerified;
-    std::printf("[entitlement-shot] edit_blocked=%d view_allowed=%d "
-                "measure_allowed=%d export_allowed=%d\n",
-                editBlocked, viewAllowed, measureAllowed, exportAllowed);
-    std::fflush(stdout);
-  }
-#ifndef __EMSCRIPTEN__
-  // Sign-out smoke: seed a stored session, sign out, and assert BOTH halves of the contract —
-  // the desktop is back to signed-out read-only, and the sealed token is gone from the store
-  // (a state-only reset would silently sign back in on the next launch).
-  if (shot && shotMode && std::strcmp(shotMode, "entitlement_signout") == 0) {
-    const std::string dataDir = appdataAppDir();
-    const std::vector<unsigned char> seeded{'s', 'e', 'e', 'd'};
-    chudware::secret_store::store("com.chudware.desktop", "entitlement", seeded, dataDir);
-    std::vector<unsigned char> probe;
-    const bool seededOk =
-        chudware::secret_store::load("com.chudware.desktop", "entitlement", probe, dataDir);
-    st.entitlementSignedIn = true;
-    st.entitlementReadOnly = false;
-    st.entitlementEmail = "shot@example.com";
-    st.entitlementPlan = "studio";
-    st.entitlementToken = "seed.token";
-    ui::signOutDesktopAccount(st);
-    const bool tokenGone =
-        !chudware::secret_store::load("com.chudware.desktop", "entitlement", probe, dataDir);
-    std::printf("[entitlement-signout-shot] seeded=%d signed_out=%d read_only=%d "
-                "token_cleared=%d store_erased=%d\n",
-                seededOk, !st.entitlementSignedIn, st.entitlementReadOnly,
-                st.entitlementToken.empty() && st.entitlementEmail.empty(), tokenGone);
-    std::fflush(stdout);
-  }
-#endif
 #ifndef __EMSCRIPTEN__
   if (shot && shotMode &&
       (std::strcmp(shotMode, "update_available") == 0 ||
@@ -3838,7 +3771,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     update.message = mandatory
                          ? "Chudware 1.1.0 or newer is required"
                          : "Update available \xe2\x80\x94 1.2.0";
-    update.downloadUrl = "https://chudware.com/releases/1.2.0";
+    update.downloadUrl = "https://github.com/Hunter-124/Chudware/releases/tag/v1.2.0";
     update.mandatory = mandatory;
     chudware::update::globalUpdater().setTestSnapshot(std::move(update));
     std::printf("[update-shot] mode=%s chip=Update-%s-1.2.0 auto_modal=%d\n",
@@ -4233,7 +4166,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         true; // ensure the left pane (which hosts the PM tab) is visible
     // T-G14 verification harness: optionally load a part into the viewport so
     // the docked panels sample a LIVE (light) backdrop — that regime (adaptive
-    // DARK text over the light viewport) is where Erik's dark-mode
+    // DARK text over the light viewport) is where the dark-mode
     // black-on-black actually manifests; without a loaded doc the panes fall
     // back to the theme palette (light text) and hide the bug. Gated on
     // CHUDWARE_PMBOX=1 so the default pmform shot is unchanged.
@@ -6823,8 +6756,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       // Ctrl+N creates a new part directly. The old "+" chooser lived in the
       // removed document strip; full document-type creation is still available
       // from File > New.
-      if (appShortcutsOk && !st.entitlementReadOnly &&
-          (io.KeyCtrl || io.KeySuper) && !io.KeyShift &&
+      if (appShortcutsOk && (io.KeyCtrl || io.KeySuper) && !io.KeyShift &&
           ImGui::IsKeyPressed(ImGuiKey_N, false))
         ui::createNewDoc(st, 0);
 
@@ -6878,11 +6810,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       if (appShortcutsOk && !ecadFocused && (io.KeyCtrl || io.KeySuper)) {
         if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_O, false))
           st.requestOpenDialog = true;
-        else if (!st.entitlementReadOnly && io.KeyShift &&
-                 ImGui::IsKeyPressed(ImGuiKey_S, false))
+        else if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_S, false))
           st.requestSaveAs = true;
-        else if (!st.entitlementReadOnly && !io.KeyShift &&
-                 ImGui::IsKeyPressed(ImGuiKey_S, false))
+        else if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_S, false))
           st.requestSave = true;
       }
 
@@ -7350,7 +7280,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     ui::setRibbonSketch3DActive(st.sketch3dMode && st.sketch3dMode->active());
     // [workspace-tabs seam] Drive the per-workspace ribbon filter from the
     // active title-bar workspace so Model shows modeling tools, Simulate shows
-    // sim tools, etc. (WIRE_REQUESTS).
+    // sim tools, etc.
     ui::setRibbonWorkspace(static_cast<int>(st.activeWorkspace));
     // The Drawing workspace always shows the drawing tabs (View Layout / Annotation), with or
     // without a drawing open, so it never lands on an unrelated modeling tab.
@@ -7387,27 +7317,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       ui::drawManufactureModeBar(st, vp->Pos.x, vp->Pos.y + barH + ribbonH,
                                  vp->Size.x, mfgBarH);
 
-    // ---------- read-only entitlement strip ----------
-    // Same treatment, same reason: as a floating overlay it covered whichever
-    // workspace element happened to sit at the top-left (the PLM hub's
-    // breadcrumb / Refresh / search row was the last casualty). Reserved height
-    // is the only placement that is correct for every workspace.
-    // entitlementBannerHeight() returns 0 when the account is in good standing.
-#ifndef __EMSCRIPTEN__
-    const float entBarH = ui::entitlementBannerHeight(st);
-    if (entBarH > 0.0f)
-      ui::drawEntitlementBanner(st, vp->Pos.x,
-                                vp->Pos.y + barH + ribbonH + mfgBarH, vp->Size.x,
-                                entBarH);
-#else
-    const float entBarH = 0.0f;
-#endif
-
+    // ---------- agent-lock strip ----------
+    // Reserved chrome for the same reason as the Manufacture strip: a floating
+    // overlay would cover whichever workspace element sits at the top-left.
     const float agentBarH = agentLockBannerHeight(st);
     if (agentBarH > 0.0f)
-      drawAgentLockBanner(st, vp->Pos.x,
-                         vp->Pos.y + barH + ribbonH + mfgBarH + entBarH,
-                         vp->Size.x, agentBarH);
+      drawAgentLockBanner(st, vp->Pos.x, vp->Pos.y + barH + ribbonH + mfgBarH,
+                          vp->Size.x, agentBarH);
 
     // ---------- default starter document ----------
     // Open straight into a fresh part on launch (non-shot) so the app is
@@ -7423,7 +7339,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // ---------- dockspace host (between the title bar+ribbon and the status
     // bar) ----------
     const float statusH = ImGui::GetTextLineHeight() + 8.0f * scale;
-    const float dockTopY = barH + ribbonH + mfgBarH + entBarH + agentBarH;
+    const float dockTopY = barH + ribbonH + mfgBarH + agentBarH;
 #ifdef __EMSCRIPTEN__
     const float mobileHudH = g_wasmMobile ? 56.0f : 0.0f;
 #else
@@ -7507,11 +7423,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     ui::drawStatusBar(st, &statusViewport, statusH, busy, hostFlags);
 #else
     ui::drawStatusBar(st, vp, statusH, busy, hostFlags);
-#endif
-#ifndef __EMSCRIPTEN__
-    ui::tickAccountPanel(st);
-    chudware::update::globalUpdater().setEntitlementToken(st.entitlementToken);
-    // The read-only strip is chrome (drawn above, before the dockspace).
 #endif
 
     // ---------- panels (pinned glass columns + floating dialogs over the
@@ -7598,7 +7509,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       st.showPcbTools = false;
     // The ECAD editor canvas + PCB Manager belong to the Electronics workspace
     // ONLY — an open board no longer bleeds its 2D canvas over the 3D viewport
-    // in Model/etc (Hunter round). The doc-tab strip drives the coupling the
+    // in Model/etc. The doc-tab strip drives the coupling the
     // other way: activating a PCB/Schematic tab switches the workspace to
     // Electronics (AppState::switchToTab), so a board is always reachable.
     const bool wsShowEcad = (ws == WS::Electronics);
@@ -7799,7 +7710,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       // widgets directly (no Begin of their own), so host them in ONE
       // borderless window spanning the whole central band — otherwise ImGui
       // dumps them into its fallback "Debug" window (a small box top-left,
-      // which is what Hunter saw). The band already stops left of the docked
+      // the reported symptom). The band already stops left of the docked
       // Copilot column, so the body fills the central region and Copilot stays
       // visible.
       const ui::OverlayBand &band = ui::overlayBand();

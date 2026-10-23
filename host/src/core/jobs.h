@@ -26,7 +26,7 @@ struct JobState;
 // `cam` (set when the copilot is launched from the Manufacture workspace) routes generic
 // "make a program"-style requests to the current part's CAM tools.
 // `extra` carries the model picker's provider/model/reasoning_effort override, attachments,
-// actor fields, and an `options` object. Online routing preserves that object and flattens its
+// and an `options` object. Online routing preserves that object and flattens its
 // worker-facing fields (history/session/workspace/mode/context) into `agent_admin_turn`.
 struct AgentJobRpcRoute {
     std::string method;

@@ -8,8 +8,7 @@ with whatever is installed on the machine running the suite. No network.
 What is actually pinned:
   * the outer `ar` member order and the deb control/md5sums/maintainer-script contents;
   * filename and version-field sanitisation for a release AND a prerelease, cross-checked
-    against Webservice/gateway/artifact_names.py — the module the gateway itself uses, so
-    a one-sided change to either breaks here;
+    against packaging/artifact_names.py, so the script can never hand-format a name;
   * rpm metadata (queried through rpm, skipped when rpmbuild is absent);
   * byte-for-byte determinism across two builds of the same AppDir;
   * payload preservation: the signed manifest still verifies against the tree unpacked
@@ -32,9 +31,8 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "packaging/linux/build_linux_packages.sh"
 sys.path.insert(0, str(REPO))
-sys.path.insert(0, str(REPO / "Webservice/gateway"))
 
-import artifact_names  # noqa: E402  (path set above; the gateway module is stdlib-only)
+import artifact_names  # noqa: E402  (packaging/ is this test's import root)
 from services.installer.payload_manifest import (  # noqa: E402
     build_manifest,
     verify_manifest_payload,
@@ -387,8 +385,8 @@ def test_shipped_desktop_entry_drops_appimage_and_developer_lines(deb: Path) -> 
         (PRERELEASE, "tar", "Chudware-0.1.0-beta.21-linux-x86_64.tar.zst"),
     ],
 )
-def test_filename_sanitisation_matches_the_gateway(version: str, fmt: str, expected: str) -> None:
-    """The gateway looks for a staged file by this exact name, so the script may not
+def test_filename_sanitisation_matches_artifact_names(version: str, fmt: str, expected: str) -> None:
+    """Release files are looked up by this exact name, so the script may not
     hand-format it and the two implementations may not drift apart."""
     printed = subprocess.run(
         ["bash", str(SCRIPT), "--print-name", "--version", version, "--format", fmt],
@@ -430,10 +428,12 @@ def test_rpm_metadata(built: Path, appdir: Path) -> None:
     package = built / artifact_names.canonical_artifact(PRERELEASE, "linux", "x86_64", "rpm")
     version, release = artifact_names.rpm_version_release(PRERELEASE)
     fields = _rpm_query(
-        package, "--qf", "%{NAME}\n%{VERSION}\n%{RELEASE}\n%{ARCH}\n%{BUILDHOST}\n%{BUILDTIME}\n"
+        package, "--qf",
+        "%{NAME}\n%{VERSION}\n%{RELEASE}\n%{ARCH}\n%{BUILDHOST}\n%{BUILDTIME}\n%{LICENSE}\n",
     ).splitlines()
-    name, got_version, got_release, arch, buildhost, buildtime = fields[:6]
+    name, got_version, got_release, arch, buildhost, buildtime, license_name = fields[:7]
     assert (name, got_version, got_release, arch) == ("chudware", version, release, "x86_64")
+    assert license_name == "MIT"
     assert buildhost == "chudware-release", "the build host must not leak into the package"
 
     created = json.loads((appdir / "payload-manifest.v1.json").read_text(encoding="utf-8"))
@@ -488,7 +488,7 @@ def test_two_builds_from_one_appdir_are_byte_identical(
 ) -> None:
     """The whole point of pinning mtimes, sort order, ownership and compressor threads.
 
-    A nightly that produced different bytes from identical inputs would make the
+    A release build that produced different bytes from identical inputs would make the
     published sha256 unverifiable by anyone rebuilding it.
     """
     second = _build(appdir, tmp_path_factory.mktemp("out2") / "packages", "all")

@@ -416,7 +416,6 @@ def _default_agent_fn(
         tier=tier,
         capability=capability,
         max_tokens=completion_cap_for_subagent(profile),
-        actor=context_pack.get("actor") or role,
         close_session=False,
     )
     return _RoleTurnAgentResult(turn)

@@ -15,12 +15,10 @@ project(CHUDWARE_Host
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # MSVC: <windows.h> defines min()/max() macros that clobber std::min, std::max and
-# std::numeric_limits<>::max. core/CMakeLists.txt:71 already suppresses this
+# std::numeric_limits<>::max. core/CMakeLists.txt already suppresses this
 # project-wide, but host/ is a SEPARATE CMake project that compiles several core
-# sources directly (core/util/entitlement.cpp, platform_paths.cpp, tweetnacl.c),
-# so it does not inherit that definition — which is exactly how the Windows host
-# build broke on entitlement.cpp's std::numeric_limits<std::size_t>::max() long
-# after core itself was green. Mirror it here.
+# sources directly (core/util/platform_paths.cpp, core/security/integrity.cpp,
+# tweetnacl.c), so it does not inherit that definition. Mirror it here.
 #
 # NOMINMAX only. Deliberately NOT WIN32_LEAN_AND_MEAN: core/doc/formats.cpp
 # documents that it needs <windows.h> pulled in FULL and that a lean include
@@ -181,7 +179,6 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/chudcode_session_actions.cpp   # Chudcode session recovery actions + link (GL-free; unit-tested)
   src/ui/oauth_capture.cpp  # in-app xAI multi-account CEF OAuth (Settings → Accounts)
   src/ui/web_capabilities.cpp  # T-RF12: WASM-build gap table (ui::webBuild / ui::webGapReason)
-  src/ui/web_provider_keys.cpp  # WASM-build per-account BYOK client (/api/providers/keys)
   src/ui/console_panel.cpp
   # --- W1-B: core infrastructure (toast / cursor manager / shared appearance picker) ---
   src/ui/toast.cpp
@@ -412,7 +409,7 @@ if(EMSCRIPTEN)
   set(CHUDWARE_WASM_SOURCES ${CHUDWARE_CORE_SOURCES})
   list(APPEND CHUDWARE_WASM_SOURCES
     src/wasm_stubs.cpp
-    ../core/util/tweetnacl.c   # app_commands mutation-token verification
+    ../core/util/tweetnacl.c
     ../core/util/randombytes.cpp
     ../services/ipc/ipc_transport_wasm.cpp
     src/ui/reveng/webcam_capture.cpp   # RE-19 widget (uses camera_stub under web)
@@ -423,16 +420,9 @@ if(EMSCRIPTEN)
 else()
   set(CHUDWARE_NATIVE_SOURCES ${CHUDWARE_CORE_SOURCES})
   list(APPEND CHUDWARE_NATIVE_SOURCES
-    src/ui/account_panel.cpp
-    ../core/util/entitlement.cpp
-    ../core/util/secret_store.cpp
-    ../core/util/device_identity.cpp
     ../core/util/randombytes.cpp
     ../core/util/tweetnacl.c
     ../core/security/integrity.cpp
-    ../core/security/containment.cpp
-    ../core/security/runtime_guard.cpp
-    ../core/security/event_queue.cpp
     ../core/agent/http.cpp
     src/update/updater.cpp
     src/update/windows_update_helper.cpp
@@ -542,7 +532,7 @@ if(EMSCRIPTEN)
     "SHELL:--preload-file=${_WASM_ASSETS}/logo_wordmark_dark.png@/assets/logo_wordmark_dark.png"
   )
   # Keep expensive runtime diagnostics for debug builds, not the MinSizeRel
-  # bundle shipped by install_webd.sh. Emscripten defaults vary by build type;
+  # bundle staged by ./build.sh wasm. Emscripten defaults vary by build type;
   # explicitly turn them off on production links so this never regresses.
   if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_link_options(Chudware PRIVATE
@@ -698,14 +688,14 @@ set_target_properties(test_agent_job_routing PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME test_agent_job_routing COMMAND test_agent_job_routing)
 
-add_executable(test_entitlement_commands
-  tests/test_entitlement_commands.cpp
+add_executable(test_command_capability
+  tests/test_command_capability.cpp
   src/ui/ribbon_def.cpp)
-target_include_directories(test_entitlement_commands PRIVATE
+target_include_directories(test_command_capability PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
-set_target_properties(test_entitlement_commands PROPERTIES
+set_target_properties(test_command_capability PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_test(NAME test_entitlement_commands COMMAND test_entitlement_commands)
+add_test(NAME test_command_capability COMMAND test_command_capability)
 
 # --- Signed desktop auto-update (GL-free security + semver contract) ---
 add_executable(test_updater
@@ -716,7 +706,6 @@ add_executable(test_updater
   src/update/apply_windows.cpp
   src/update/windows_update_helper.cpp
   src/update/apply_macos.cpp
-  ../core/util/entitlement.cpp
   ../core/util/randombytes.cpp
   ../core/util/tweetnacl.c
   ../core/agent/http.cpp)
@@ -738,16 +727,10 @@ set_target_properties(test_updater PROPERTIES
 add_executable(test_security
   tests/test_security.cpp
   ../core/security/integrity.cpp
-  ../core/security/containment.cpp
-  ../core/security/runtime_guard.cpp
-  ../core/security/event_queue.cpp
-  ../core/util/entitlement.cpp
   ../core/util/randombytes.cpp
-  ../core/util/tweetnacl.c
-  ../core/util/device_identity.cpp
-  ../core/util/secret_store.cpp)
-target_include_directories(test_security PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../core ${miniz_SOURCE_DIR})
-target_link_libraries(test_security PRIVATE nlohmann_json::nlohmann_json chudware_host_miniz)
+  ../core/util/tweetnacl.c)
+target_include_directories(test_security PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../core)
+target_link_libraries(test_security PRIVATE nlohmann_json::nlohmann_json)
 if(WIN32)
   target_link_libraries(test_security PRIVATE bcrypt crypt32)
 elseif(APPLE)
@@ -952,7 +935,6 @@ target_include_directories(test_async_rpc PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(test_async_rpc PRIVATE nlohmann_json::nlohmann_json)
 find_package(Threads REQUIRED)
-target_link_libraries(test_entitlement_commands PRIVATE Threads::Threads)
 target_link_libraries(test_async_rpc PRIVATE Threads::Threads)
 set_target_properties(test_async_rpc PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
@@ -983,14 +965,8 @@ if(UNIX AND CHUDWARE_DEVELOPER_BUILD)
     ../services/ipc/ipc_discovery.cpp
     ../core/util/platform_paths.cpp
     ../core/security/integrity.cpp
-    ../core/security/containment.cpp
-    ../core/security/runtime_guard.cpp
-    ../core/security/event_queue.cpp
-    ../core/util/entitlement.cpp
     ../core/util/randombytes.cpp
-    ../core/util/tweetnacl.c
-    ../core/util/device_identity.cpp
-    ../core/util/secret_store.cpp)
+    ../core/util/tweetnacl.c)
   target_include_directories(test_worker_long_run PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker

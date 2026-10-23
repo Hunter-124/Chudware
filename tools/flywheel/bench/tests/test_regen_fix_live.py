@@ -58,7 +58,7 @@ def test_perfect_fix_passes_live():
 
 def test_rebuildable_but_geometry_changed_scores_zero():
     """THE load-bearing property: a fix that rebuilds but ALTERED unaffected geometry scores 0,
-    even though the rebuild passes (T-H11 driver note; zero tolerance for silent intent change)."""
+    even though the rebuild passes (zero tolerance for silent intent change)."""
     good = _good()
     drifted = copy.deepcopy(good)
     # bump a design global -> still rebuilds, but the part is geometrically different from good

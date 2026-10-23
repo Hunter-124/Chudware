@@ -212,7 +212,7 @@ def _copy_portable_inputs(args: argparse.Namespace, staging: Path) -> tuple[Path
         if source.is_file():
             shutil.copyfile(source, support / name)
     snapshot = args.out / "builder"
-    for relative in ("packaging/finalize_release.py", "packaging/generate_release_evidence.py", "packaging/release_json.py", "packaging/platform_publishers.py", "scripts/run_release_ctest.py", "packaging/macos/build_app.sh", "packaging/macos/Chudware.icns", "packaging/macos/RELEASE_NOTES.md", "packaging/windows/chudware.iss", "packaging/windows/chudware.wxs", "services/installer/build_release.py", "services/installer/build_msi.py", "services/installer/payload_manifest.py", "LICENSE-EULA.txt"):
+    for relative in ("packaging/finalize_release.py", "packaging/generate_release_evidence.py", "packaging/release_json.py", "packaging/platform_publishers.py", "scripts/run_release_ctest.py", "packaging/macos/build_app.sh", "packaging/macos/Chudware.icns", "packaging/macos/RELEASE_NOTES.md", "packaging/windows/chudware.iss", "packaging/windows/chudware.wxs", "services/installer/build_release.py", "services/installer/build_msi.py", "services/installer/payload_manifest.py", "LICENSE", "THIRD_PARTY_NOTICES.md"):
         source = REPO / relative
         destination = snapshot / relative
         destination.parent.mkdir(parents=True, exist_ok=True)

@@ -587,8 +587,8 @@ void drawPlmWorkspace(AppState& st) {
     ImGui::BeginChild("##plm_page", ImVec2(-M, -M), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar();
-    // Tighter vertical rhythm across every page body (Hunter: "we NEED vertical
-    // compression"). Keep the horizontal item spacing; only squeeze the y gap.
+    // Tighter vertical rhythm across every page body (vertical compression).
+    // Keep the horizontal item spacing; only squeeze the y gap.
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                         ImVec2(ImGui::GetStyle().ItemSpacing.x, 3.0f * S));
     switch (g_plmHub.page) {

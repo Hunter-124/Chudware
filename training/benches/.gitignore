@@ -1,4 +1,0 @@
-# Full-run reports are regenerated; only curated smoke reports are committed.
-*/results/latest.json
-# Generated corpora (deterministic from a seed) are not committed — only their frozen spec.
-*/corpus/

@@ -7225,7 +7225,6 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         "mechanical" (gear_check/bearing_life — AGMA gear tooth stress + ISO 281 bearing life),
         "regen" (regen_diagnose — diagnose + propose fix-ops on rebuild failure),
         "code_compliance" (code_check — building-code compliance with RAG citations),
-        "serving" (serving_status/set_canary/promote/rollback — LoRA adapter routing),
         "design_review" (design_review — one-call geometry battery narrated verdict),
         "doc_diff" (doc_diff_tool — semantic feature-level diff between two revisions),
         "plm" (project-vault versioning stub — T-R2 fills this),

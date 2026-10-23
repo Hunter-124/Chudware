@@ -96,7 +96,7 @@ MANIFEST = {
             {"id": "AC2", "text": "knuckle bore matches pin with a running fit",
              "check": {"tool": "measure_part", "pass_rule": "pin bore > 0 with fit_class"}},
             {"id": "AC3", "text": "swing arc clears without collision",
-             # NOTE: intentionally check_interference per T-W27 spec (used by seed3 misuse).
+             # NOTE: intentionally check_interference (seed 3 exercises tool misuse against it).
              "check": {"tool": "check_interference", "pass_rule": "min_clearance>=0.5 @180deg"}},
             {"id": "AC4", "text": "assembly interference clean",
              "check": {"tool": "check_interference", "pass_rule": "clashes==0"}},

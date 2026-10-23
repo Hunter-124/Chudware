@@ -1,38 +1,24 @@
-# The cheapest gate in the repository, and the only one that runs everywhere.
+# Source-level audits on every pull request and every push to master.
 #
-# scripts/check.py is ten deterministic source-level audits — icon atlas
-# coverage, ribbon-command-to-handler routing, SW_PARITY_SPEC drift, the
-# agent event-kind and role-prompt catalogs, the services thin-client ratchet,
-# the Settings tool-panel tables, cross-platform path portability, and
-# advertised-tool reachability plus the shared-UI manifest and assets. Nine of
-# them parse source, docs and assets with nothing but the standard library.
+# scripts/check.py runs ten deterministic audits: icon atlas coverage,
+# ribbon-command-to-handler routing, SW_PARITY_SPEC drift, the agent event-kind
+# and role-prompt catalogs, the services thin-client ratchet, the Settings
+# tool-panel tables, cross-platform path portability, advertised-tool
+# reachability, and the shared-UI manifest and assets. Most of them need only
+# the standard library; advertised_tool_audit imports the live MCP registry and
+# therefore needs PyYAML, the MCP SDK, NumPy, SciPy, LangGraph and its SQLite
+# checkpointer. Those pins are read from requirements.txt so CI never tests a
+# different version than the product declares.
 #
-# advertised_tool_audit imports the live MCP registry: PyYAML, the MCP SDK,
-# NumPy and SciPy, plus LangGraph and its SQLite checkpointer for DAG tool
-# registration. Missing imports either fail the audit or leave a partial tool
-# catalog. Provision these six declared requirements from requirements.txt
-# into a job-local virtualenv under RUNNER_TEMP, without modifying the runner's
-# Python. VTK, OpenCV, PyVista and the rest of the product runtime are not needed
-# by these source audits.
-#
-# NumPy and SciPy require Python >= 3.11, so that is this gate's floor, and the
-# interpreter is chosen explicitly rather than taken from whatever `python3`
-# resolves to. macOS ships 3.9.6; the Intel Mac therefore carries a Homebrew
-# python@3.13 (shared read-only with the private test account), and this job
-# would fail loudly rather than mysteriously if it lost it.
-#
-# It runs on all three operating systems because these audits walk paths, read
-# files, and compare text. A separator or encoding assumption that only breaks
-# on Windows or macOS is exactly the drift this catches, and catching it here
-# costs seconds instead of a failed native build later.
-#
-# Every push and every pull request, on the self-hosted fleet only. Target is
-# under five minutes wall clock; anything slower belongs in linux-gate.
+# The matrix covers all three desktop platforms because these audits walk paths
+# and compare text; separator and encoding assumptions that only break on one
+# OS are exactly what this catches.
 name: fast-gate
 
 on:
-  push:
   pull_request:
+  push:
+    branches: [master]
   workflow_dispatch:
 
 permissions:
@@ -44,264 +30,41 @@ concurrency:
 
 jobs:
   check:
-    name: check.py (${{ matrix.label }})
-    # Every branch and PR runs inside a one-job disposable OS/VM. The group
-    # is an enforced scheduling boundary, not an alias for the signing fleet.
-    runs-on:
-      group: chudware-untrusted-ephemeral
-      labels: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", "${{ matrix.runner_label }}"]
+    name: check.py (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
-    env:
-      # scripts/check.py prints non-ASCII in audit names and findings. On
-      # Windows, Python encodes redirected stdout with the ANSI code page, so
-      # one U+2192 raised UnicodeEncodeError and killed the gate after seven
-      # clean audits, with the lines before it already mojibake. UTF-8 mode
-      # makes all three platforms byte-identical, which is exactly what a
-      # cross-platform text audit needs.
-      PYTHONUTF8: '1'
-      PYTHONIOENCODING: utf-8
     strategy:
-      # One platform's failure must not hide the other two: a path bug that
-      # only reproduces on Windows is the entire reason this matrix exists.
       fail-fast: false
       matrix:
-        include:
-          - label: Linux
-            runner_os: Linux
-            runner_arch: X64
-            runner_label: cc-linux-disposable
-          - label: Windows
-            runner_os: Windows
-            runner_arch: X64
-            runner_label: cc-win-disposable
-          # A separate disposable image preserves the gate-account identity;
-          # no writable Homebrew, interpreter, home or cache is signer-owned.
-          - label: macOS
-            runner_os: macOS
-            runner_arch: X64
-            runner_label: cc-mac-disposable-gate-intel
-            ci_user: ccci-chudware-gate
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    env:
+      # check.py prints non-ASCII audit names and findings; UTF-8 mode keeps
+      # redirected output identical on all three platforms.
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
     steps:
-      # Before checkout: a missing or too-old Python otherwise surfaces as a
-      # confusing traceback from an audit script rather than as the runner
-      # provisioning fault it is.
-      - name: Report runner identity and select an interpreter (POSIX)
-        if: runner.os != 'Windows'
-        shell: bash
-        env:
-          EXPECT_CI_USER: ${{ matrix.ci_user }}
-        run: |
-          set -euo pipefail
-          echo "runner=${RUNNER_NAME:-unknown} os=$RUNNER_OS arch=$RUNNER_ARCH host=$(hostname -s) user=$(id -un)"
-          uname -a
-
-          # A row that names a private CI account must actually be running as
-          # it, with the lane identity its launchd daemon exports.
-          if [ -n "${EXPECT_CI_USER}" ]; then
-            if [ "$(id -un)" != "${EXPECT_CI_USER}" ] || [ "${CC_CI_PRODUCT:-}" != Chudware ] || [ "${CC_CI_LANE:-}" != test ]; then
-              echo "::error::expected the private Chudware test account ${EXPECT_CI_USER} (CC_CI_PRODUCT=Chudware, CC_CI_LANE=test); got user=$(id -un) CC_CI_PRODUCT=${CC_CI_PRODUCT:-unset} CC_CI_LANE=${CC_CI_LANE:-unset}"
-              exit 1
-            fi
-          fi
-
-          # Newest first. macOS's /usr/bin/python3 is 3.9.6, which cannot
-          # install the pinned NumPy or SciPy at all, so `python3` is the last
-          # candidate rather than the only one.
-          gate_python=''
-          for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
-            command -v "${candidate}" >/dev/null 2>&1 || continue
-            if "${candidate}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
-              gate_python="$(command -v "${candidate}")"
-              break
-            fi
-            echo "  ${candidate} -> $("${candidate}" --version 2>&1) (too old)"
-          done
-
-          if [ -z "${gate_python}" ]; then
-            echo "::error::disposable image has no Python >= 3.11; rebuild and qualify the untrusted image, never provision or borrow the signer lane"
-            exit 1
-          fi
-
-          echo "gate-python=${gate_python} ($("${gate_python}" --version 2>&1))"
-          echo "GATE_PYTHON=${gate_python}" >> "$GITHUB_ENV"
-
-      # Windows PowerShell 5.1 only — these hosts have no pwsh, so `shell:
-      # pwsh` would fail to launch before any of this ran, and `shell: bash`
-      # resolves to an empty WSL shim that exits 0 without running anything.
-      - name: Report runner identity and select an interpreter (Windows)
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Write-Host "runner=$env:RUNNER_NAME os=$env:RUNNER_OS arch=$env:RUNNER_ARCH host=$env:COMPUTERNAME"
-          Write-Host "powershell=$($PSVersionTable.PSVersion)"
-
-          # This profile and tools tree belong to the disposable VM image.
-          # They must never be mounted from a persistent release runner.
-          $tools = Join-Path $env:USERPROFILE 'chudware-ci-tools'
-          foreach ($dir in @((Join-Path $tools 'bin'), (Join-Path $tools 'python'), (Join-Path $tools 'python\Scripts'))) {
-            if (Test-Path $dir) {
-              $env:PATH = "$dir;$env:PATH"
-              $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-              Write-Host "  path+ $dir"
-            }
-          }
-
-          $gatePython = ''
-          foreach ($candidate in @('python3', 'python')) {
-            $found = Get-Command $candidate -ErrorAction SilentlyContinue
-            if (-not $found) { continue }
-            & $found.Source -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'
-            if ($LASTEXITCODE -eq 0) { $gatePython = $found.Source; break }
-            $tooOld = (& $found.Source --version 2>&1) -join ' '
-            Write-Host "  $($found.Source) -> $tooOld (too old)"
-          }
-
-          if (-not $gatePython) {
-            Write-Host "::error::disposable image has no Python >= 3.11; rebuild and qualify the untrusted image"
-            exit 1
-          }
-
-          # ASCII only, here and in every PowerShell step: the runner writes
-          # the script as UTF-8 with no BOM and Windows PowerShell 5.1 decodes
-          # it as the ANSI code page, so a UTF-8 em dash arrives as a curly
-          # quote that silently terminates a string. Enforced by
-          # scripts/verify-ci-workflows.py.
-          $gatePythonVersion = (& $gatePython --version 2>&1) -join ' '
-          Write-Host "gate-python=$gatePython ($gatePythonVersion)"
-          "GATE_PYTHON=$gatePython" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
       - name: Check out repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # requirements.txt is the source of truth for these pins, so they are
-      # read out of it rather than restated here: a bump there cannot leave CI
-      # testing a different NumPy than the product ships.
-      - name: Provision the check.py import surface (POSIX)
-        if: runner.os != 'Windows'
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install the check.py import surface
         shell: bash
         run: |
           set -euo pipefail
-
           req="${RUNNER_TEMP}/check-requirements.txt"
-          # langgraph + its sqlite checkpointer are part of the REGISTRATION surface:
-          # services/mcp/server.py imports services.dag.mcp_tools mid-file, so without
-          # them registration stops there and every family declared after it is missing
-          # (415 of 487 tools on 2026-09-04). Declared with >= in requirements.txt.
-          grep -E '^(pyyaml|mcp|numpy|scipy)==|^(langgraph|langgraph-checkpoint-sqlite)>=' requirements.txt > "${req}"
-          found="$(wc -l < "${req}" | tr -d ' ')"
-          if [ "${found}" -ne 6 ]; then
-            echo "::error::expected pinned pyyaml, mcp, numpy, scipy, langgraph and langgraph-checkpoint-sqlite in requirements.txt, found ${found}; the audit's import surface is no longer declared where this job reads it"
-            exit 1
-          fi
+          grep -iE '^(pyyaml|mcp|numpy|scipy|langgraph|langgraph-checkpoint-sqlite)[ =<>~!;]' requirements.txt > "${req}"
           cat "${req}"
+          python -m pip install --disable-pip-version-check -r "${req}"
+          python -c 'import yaml, mcp, numpy, scipy, langgraph, langgraph.checkpoint.sqlite'
 
-          # Already importable (a developer workstation runner, typically)?
-          # Then nothing is installed and nothing is mutated.
-          if "${GATE_PYTHON}" -c 'import yaml, mcp, numpy, scipy, langgraph, langgraph.checkpoint.sqlite' 2>/dev/null; then
-            echo "import surface already present in ${GATE_PYTHON}"
-            echo "CHECK_PYTHON=${GATE_PYTHON}" >> "$GITHUB_ENV"
-            exit 0
-          fi
-
-          # RUNNER_TEMP is wiped between jobs, so this venv is job-local by
-          # construction and cannot drift into a later run or into the
-          # runner's own interpreter.
-          venv="${RUNNER_TEMP}/check-venv"
-          "${GATE_PYTHON}" -m venv "${venv}"
-          "${venv}/bin/python" -m pip install --quiet --disable-pip-version-check --upgrade pip
-          "${venv}/bin/python" -m pip install --quiet --disable-pip-version-check -r "${req}"
-          "${venv}/bin/python" -c 'import yaml, mcp, numpy, scipy, langgraph, langgraph.checkpoint.sqlite; print("import surface OK")'
-          echo "CHECK_PYTHON=${venv}/bin/python" >> "$GITHUB_ENV"
-
-      - name: Provision the check.py import surface (Windows)
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $req = Join-Path $env:RUNNER_TEMP 'check-requirements.txt'
-          # Same registration surface as the POSIX branch: langgraph gates every tool
-          # family services/mcp/server.py registers after services.dag.mcp_tools.
-          $pins = @(Select-String -Path requirements.txt -Pattern '^(pyyaml|mcp|numpy|scipy)==|^(langgraph|langgraph-checkpoint-sqlite)>=' |
-                    ForEach-Object { $_.Line })
-          if ($pins.Count -ne 6) {
-            Write-Host "::error::expected pinned pyyaml, mcp, numpy, scipy, langgraph and langgraph-checkpoint-sqlite in requirements.txt, found $($pins.Count); the audit's import surface is no longer declared where this job reads it"
-            exit 1
-          }
-          $pins | Out-File -FilePath $req -Encoding ascii
-          $pins | ForEach-Object { Write-Host $_ }
-
-          # This probe is EXPECTED to fail on a clean runner, and under
-          # $ErrorActionPreference = 'Stop' any native stderr write becomes a
-          # terminating NativeCommandError -- the missing-module traceback
-          # would kill the step instead of routing it to the venv branch. So
-          # the preference is relaxed across the probe and the verdict comes
-          # from the exit code alone.
-          $ErrorActionPreference = 'Continue'
-          & $env:GATE_PYTHON -c 'import yaml, mcp, numpy, scipy, langgraph, langgraph.checkpoint.sqlite' 2>&1 | Out-Null
-          $alreadyPresent = ($LASTEXITCODE -eq 0)
-          $ErrorActionPreference = 'Stop'
-          if ($alreadyPresent) {
-            Write-Host "import surface already present in $env:GATE_PYTHON"
-            "CHECK_PYTHON=$env:GATE_PYTHON" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            exit 0
-          }
-
-          $venv = Join-Path $env:RUNNER_TEMP 'check-venv'
-          & $env:GATE_PYTHON -m venv $venv
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $venvPython = Join-Path $venv 'Scripts\python.exe'
-          & $venvPython -m pip install --quiet --disable-pip-version-check --upgrade pip
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $venvPython -m pip install --quiet --disable-pip-version-check -r $req
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # No quotes or spaces inside the -c argument: Windows PowerShell 5.1
-          # re-splits a native command's arguments on whitespace after
-          # stripping embedded double quotes, so a print("...") in here reaches
-          # python as three broken tokens. PowerShell reports the result.
-          & $venvPython -c 'import yaml, mcp, numpy, scipy, langgraph, langgraph.checkpoint.sqlite'
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Write-Host "import surface OK in $venvPython"
-          "CHECK_PYTHON=$venvPython" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Run scripts/check.py (POSIX)
-        if: runner.os != 'Windows'
+      - name: Run scripts/check.py
         shell: bash
-        run: |
-          set -euo pipefail
-          log="${RUNNER_TEMP}/check.log"
-          status=0
-          "${CHECK_PYTHON}" scripts/check.py 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
-
-          # Step summaries and job logs are not metered; artifact storage is.
-          # Diagnostics live here, never in an upload.
-          {
-            echo '## check.py — ${{ matrix.label }}'
-            echo '```text'
-            tail -n 40 "${log}"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          exit "${status}"
-
-      - name: Run scripts/check.py (Windows)
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Continue'
-          $log = Join-Path $env:RUNNER_TEMP 'check.log'
-          & $env:CHECK_PYTHON scripts/check.py 2>&1 | Tee-Object -FilePath $log
-          $status = $LASTEXITCODE
-
-          $tail = (Get-Content $log -Tail 40) -join "`n"
-          @(
-            '## check.py -- ${{ matrix.label }}'
-            '```text'
-            $tail
-            '```'
-          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-
-          exit $status
+        run: python scripts/check.py

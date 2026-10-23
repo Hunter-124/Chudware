@@ -1,10 +1,10 @@
-"""Design-gym CLI + assess-adjust-rerun loop (T-W27).
+"""Design-gym CLI + assess-adjust-rerun loop.
 
   python3 -m tools.flywheel.bench.gym.cli run                # full cycle-1 matrix + report
   python3 -m tools.flywheel.bench.gym.cli run --smoke        # C1 only, local tier, seed 1
   python3 -m tools.flywheel.bench.gym.cli run --challenges C1,C3 --tiers local-24k
 
-Tokenmaxxing (2026-07-07): local tiers route to a specific bundled llama.cpp model
+Local tiers: each routes to a specific bundled llama.cpp model
 (services.agent.tiers.LOCAL_TIER_MODELS) — ``local-24k`` (qwen3-4b, fastest,
 no GBNF grammar), ``local-24k-gemma3-qat`` (gemma3-4b-qat, smallest footprint, full GBNF),
 ``local-24k-gemma4-e4b`` (gemma4-e4b, larger/slower GBNF backup, comparison-only). Run
@@ -173,7 +173,7 @@ def cmd_run(args) -> int:
     rep = report_mod.build_report(cr, applied_dials=applied, deltas=deltas)
     md, js = report_mod.write_report(rep, REPORTS_DIR)
 
-    # DoD step 6: wire the cycle into Pillar 16 telemetry (training signal).
+    # Record the cycle as telemetry events alongside the report.
     from .telemetry import write_cycle_telemetry
 
     tel = write_cycle_telemetry(rep, REPORTS_DIR / "runs" / cycle)
@@ -223,7 +223,7 @@ def cmd_diag(args) -> int:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Design gym (T-W27)")
+    ap = argparse.ArgumentParser(description="Design gym")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="run the challenge matrix + report")
     r.add_argument("--cycle", default="cycle-1")
@@ -231,7 +231,7 @@ def main(argv=None) -> int:
         "--tiers",
         default=None,
         help="comma list, e.g. local-24k,frontier-200k,openrouter:anthropic/claude-opus-4,xai:grok-4-5 "
-        "— local tokenmaxxing tiers: local-24k (qwen3-4b), "
+        "— local tiers: local-24k (qwen3-4b), "
         "local-24k-gemma3-qat (gemma3-4b-qat, full GBNF), "
         "local-24k-gemma4-e4b (gemma4-e4b, GBNF backup); "
         "paid: openrouter:<model-id> (OPENROUTER_API_KEY), xai:<model-id> (OAuth or XAI_API_KEY)",
@@ -249,7 +249,7 @@ def main(argv=None) -> int:
         action="store_true",
         help="REAL execution: execute_dag=True through Chudcode, or an "
         "explicit offline local provider, when the probe reports "
-        "real-runnable. T-W30.",
+        "real-runnable.",
     )
     r.add_argument(
         "--no-adjust", action="store_true", help="skip the assess-adjust-rerun step"
@@ -276,7 +276,7 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    # T-DP19: re-exec into the mcp-venv when this interpreter lacks the DAG deps, so
+    # Re-exec into the mcp-venv when this interpreter lacks the DAG deps, so
     # `--real` cells execute past PLAN instead of dying on the langgraph import.
     from tools.flywheel.bench.gym.runner import ensure_capable_interpreter
 

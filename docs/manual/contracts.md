@@ -28,7 +28,7 @@
 - `industrial_schema.md` — Contract: industrial process sizing RPCs (`vessel_size`, `duct_size`)
 - `interaction.md` — Contract: Interaction — `ask_user` — v1
 - `leaderboard.md` — Contract: Model Leaderboard (`aicad.leaderboard/1`)
-- `license_debt.md` — License debt register — cleanroom-before-SaaS
+- `license_debt.md` — License compliance register
 - `licenses.md` — Contract: Dependency License Ledger
 - `manufacturing_gateway.md` — Contract: Manufacturing Gateway — v1
 - `mesh_format.md` — Contract: AICM v1 — tessellation + overlay binary format

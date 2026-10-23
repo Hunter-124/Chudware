@@ -164,7 +164,7 @@ static const FmPalette& fmPalette() { return g_fmPal; }
 // Attempt to draw a named atlas icon; fall back to a text glyph if the atlas is absent.
 // C37-E: `alpha` dims the icon (suppressed / rolled-back rows get a faded icon, item 6).
 static void treeIcon(const char* name, const char* fallback, float size = 16.0f, float alpha = 1.0f) {
-    // Red-pen fix (Hunter round-2): the old ImGui::Image draw sat at the LINE TOP (too high in
+    // The old ImGui::Image draw sat at the LINE TOP (too high in
     // the frame-height row pill) and at the row's raw left edge (the Origin icon clipped into
     // the pill's rounded corner). Reserve a frame-height slot inset by FramePadding.x, then
     // paint the glyph draw-list-centered in it — same vertical math as treeIconInArrowSlot.
@@ -190,12 +190,12 @@ static void treeIcon(const char* name, const char* fallback, float size = 16.0f,
 }
 
 // ---- shared row hover paint (the ONE approved treatment, used panel-wide) ----
-// T-G18 (Erik round-1): the feature rows' hover — an accent-outline pill + a soft treeHover
+// T-G18: the feature rows' hover — an accent-outline pill + a soft treeHover
 // wash, inset 2/1 dp, 4 dp corners — is the ratified look. Every row in the panel (feature
 // rows AND the filename/equations/material/bodies/origin/plane meta rows) now routes through
 // THIS one function so the hover is pixel-identical everywhere; the meta rows used to fall
-// through to ImGui's default HeaderHovered paint, which read as the "terrible" hover Erik
-// flagged. `hovered` is passed in (not sampled here) because a feature row's last item is its
+// through to ImGui's default HeaderHovered paint, which read as a visibly inconsistent hover.
+// `hovered` is passed in (not sampled here) because a feature row's last item is its
 // status badge, not the node, so the caller captures IsItemHovered at the node.
 static void fmRowHoverPaint(ImVec2 rowMin, ImVec2 rowMax, bool hovered, bool selected) {
     if (selected || !hovered || ImGui::IsMouseDragging(ImGuiMouseButton_Left)) return;
@@ -618,7 +618,7 @@ bool fmSectionDividerCollapse(const char* label, bool* open, bool* rightClicked)
 // Section divider carrying a small square "+" button pinned at the right edge. The right hairline is
 // cut short so it stops before the button (leaving a clean gap) instead of running under it. Returns
 // true on the frame the button is clicked. Used by the ECAD PCB Manager's "Layers" header to add a
-// copper layer (Hunter round-5c).
+// copper layer.
 bool fmSectionDividerAddButton(const char* label, const char* btnId, const char* tooltip) {
     const auto& pal = fmPalette();
     const float S = ui::uiScale;
@@ -1561,7 +1561,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     RowResult res;
     const std::string& fid = c.fid;
     // Nested-child indent is now applied by drawOneRow AROUND the whole row (background pill
-    // included), not here — so the row background indents with the text+icon (Hunter task-4).
+    // included), not here — so the row background indents with the text+icon.
     // C37-E (item 6): suppressed/rolled-back rows get a faded icon (clearer than just the [S] tag).
     // The icon is drawn INTO the leaf node's arrow slot after TreeNodeEx (treeIconInArrowSlot) so
     // the label sits directly beside it instead of across a doubled icon+arrow gap.
@@ -1573,7 +1573,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         // (and its selection highlight) fit WITHIN the background pill and the text stays vertically
         // centered — the rename branch returns before the node's own FramePadding push, so without
         // this it inherited ambient padding (text sank below the pill) and a -1 width spilled past
-        // the pill's rounded bounds (Hunter red-pen). FramePadding.y = 2dp → frame is 2dp shorter
+        // the pill's rounded bounds. FramePadding.y = 2dp → frame is 2dp shorter
         // than the pill top+bottom, leaving a hair of margin so the highlight sits inside it.
         const float S = ui::uiScale;
         const float inset = 2.0f * S;
@@ -2796,7 +2796,7 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
     }
 
     // Nested children (feature history + sub-components) sit one indent step under the parent
-    // component so the hierarchy reads visually (Hunter nesting indentation).
+    // component so the hierarchy reads visually.
     const float nestIndent = 14.0f * ui::uiScale;
     ImGui::Indent(nestIndent);
 
@@ -3893,7 +3893,7 @@ static void doOpenDoc(AppState& st) {
 
 // Features section header — the SAME centred-label + twin-hairline + far-right chevron row as the
 // document / Reference headers (fmSectionHeaderRow), plus the Add Folder glass button in the lead
-// slot at the far left (Hunter red-pen placement); the left hairline starts just right of it.
+// slot at the far left; the left hairline starts just right of it.
 // Returns the (possibly toggled) open state; sets *addFolder on the frame its button is clicked.
 // addEn grays the button out (it still swallows its own clicks so a miss never collapses the list).
 static bool fmFeaturesHeader(bool* open, bool addEn, bool* addFolder, const char* disabledReason) {
@@ -4219,7 +4219,7 @@ void drawFeatureTreeBody(AppState& st,
     const std::string agentLockReason = st.agentLockReason(st.docMirror.docId());
 
     {
-        // Filename / References / Features are three INDEPENDENT collapsible sections (Hunter):
+        // Filename / References / Features are three INDEPENDENT collapsible sections:
         // collapsing the filename hides only its equations/material/solid-bodies, leaving the
         // References and Features sections in place. All three use the same section-header look.
         //
@@ -4913,7 +4913,7 @@ void drawFeatureTreeBody(AppState& st,
                                 st.sketchMode->addPlaneDimRef(st, pi);
                             } else {
                                 // Row click = SELECT only (toggle). Visibility is owned solely by
-                                // the eye toggle (Hunter): row click must not hide/show the plane.
+                                // the eye toggle: row click must not hide/show the plane.
                                 bool wasSel = (st.selectedFeatureId == kPlaneId[pi]);
                                 if (wasSel) {
                                     st.planeEmphasis = -1;
@@ -5212,7 +5212,7 @@ void drawFeatureTreeBody(AppState& st,
         {
             const bool isPartDoc = tree.is_object() && jfld(tree, "schema") != "aicad.asm/1";
             // Add Folder no longer requires a selection: with features selected it groups them; with
-            // nothing selected it drops a blank folder at the bottom to drag features into (Hunter).
+            // nothing selected it drops a blank folder at the bottom to drag features into.
             const bool addEn = canDocTree && isPartDoc;
             bool addClicked = false;
             fmFeaturesHeader(&s_featSecOpen, addEn, &addClicked, agentLockReason.c_str());
@@ -5522,8 +5522,8 @@ void drawFeatureTreeBody(AppState& st,
 
 
                         // Nested-child indent wraps the WHOLE row (background pill + text + icon) so
-                        // the tinted background steps in with the content, not just the glyphs
-                        // (Hunter task-4). Indent shifts both GetCursorScreenPos and
+                        // the tinted background steps in with the content, not just the glyphs.
+                        // Indent shifts both GetCursorScreenPos and
                         // GetContentRegionAvail, so the pill rect computed below is already inset.
                         const float nestIndent = 14.0f * ui::uiScale;
                         if (nested) ImGui::Indent(nestIndent);
@@ -5956,7 +5956,7 @@ void drawFeatureTreeBody(AppState& st,
                         const bool rowOpen = drawOneRow(f, /*nested=*/false);
 
                         // Nested-sketch children: render absorbed sketches indented under this row,
-                        // but only when the parent's collapse arrow is open (Hunter show/hide refs).
+                        // but only when the parent's collapse arrow is open.
                         auto kids = childrenOf.find(fid);
                         if (rowOpen && kids != childrenOf.end()) {
                             for (const auto& skId : kids->second) {

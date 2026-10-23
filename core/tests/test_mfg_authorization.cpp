@@ -332,7 +332,7 @@ TEST_CASE("commander lease is exclusive, renewable, expiring, and takeover-safe"
     TempDirectory temp;
     chudware::mfg::Journal journal(temp.path, chudware::device::LaneEpoch::mint("lease-test"));
     chudware::mfg::LeaseRegistry leases(journal);
-    const chudware::mfg::LeaseOwner first{"gui", "hunter@ws1", "one"};
+    const chudware::mfg::LeaseOwner first{"gui", "operator@ws1", "one"};
     const chudware::mfg::LeaseOwner second{"agent", "agent@ws1", "two"};
     const auto claimed = leases.claim("dev:x", first, 100, 1000, 100);
     REQUIRE(claimed.ok);

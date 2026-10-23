@@ -30,8 +30,6 @@ struct WizardState {
     int completedVersion = 0;
     int step = 0;
     int chosenWorkspace = -1;
-    bool accountActionBusy = false;
-    OnboardingAccountSummary account;
     char key[256] = "";
     int keyProvider = 0;
     bool keyBusy = false;
@@ -46,7 +44,10 @@ struct WizardState {
 };
 
 WizardState s_wizard;
-OnboardingAccountLoginSeam s_accountLogin;
+
+// Steps: 0 = power the copilot, 1 = live test, 2 = starting workspace.
+constexpr int kStepCount = 3;
+constexpr int kLastStep = kStepCount - 1;
 
 struct KeyProvider {
     const char* label;
@@ -154,75 +155,11 @@ void dimWrapped(const char* text) {
 
 bool beginCard(const char* id) {
     // Content-sized cards share the kit's padding and grow with wrapped copy and asynchronous
-    // account/provider messages. The wizard body owns scrolling; no nested fixed-height clip.
+    // provider messages. The wizard body owns scrolling; no nested fixed-height clip.
     return kit::cardBegin(id);
 }
 
 void endCard() { kit::cardEnd(); }
-
-void showAccountSummary() {
-    if (!s_wizard.account.signedIn) {
-        ImGui::TextUnformatted("Not signed in");
-        dimWrapped("Your plan will appear here after sign-in.");
-        return;
-    }
-    kit::keyValueRow("Plan", s_wizard.account.plan.empty() ? "Unknown" : s_wizard.account.plan.c_str(),
-                     kit::Tone::Ok);
-    if (!s_wizard.account.detail.empty()) dimWrapped(s_wizard.account.detail.c_str());
-}
-
-// What the account gates, stated from the entitlement contract (AppState::entitlementReadOnly):
-// signing in activates editing; opening, viewing, measuring and exporting never require it.
-void showAccountScope() {
-    kit::rule();
-    ImGui::TextUnformatted("Signing in activates");
-    kit::dimText("Creating, editing and saving documents, and the AI copilot.");
-    ImGui::Dummy(ImVec2(0, 4.0f * uiScale));
-    ImGui::TextUnformatted("Always available without an account");
-    kit::dimText("Opening, viewing, measuring and exporting existing work.");
-    ImGui::Dummy(ImVec2(0, 4.0f * uiScale));
-    ImGui::TextUnformatted("AI usage");
-    kit::dimText("The copilot runs on your own AI subscription or provider API key, which you "
-                 "connect in the next step.");
-}
-
-void refreshAccount(AppState& st) {
-    if (!s_accountLogin || s_wizard.accountActionBusy) return;
-    OnboardingAccountSummary refreshed = s_wizard.account;
-    if (s_accountLogin(st, OnboardingAccountAction::Refresh, refreshed))
-        s_wizard.account = std::move(refreshed);
-}
-
-void drawAccountStep(AppState& st) {
-    ImGui::TextUnformatted("Sign in to Chudware");
-    dimWrapped("Connect this desktop to your Chudware account. Authorization happens in your system browser, never inside the app.");
-    ImGui::Dummy(ImVec2(0, 8.0f * uiScale));
-    if (beginCard("##onboarding_account")) {
-        showAccountSummary();
-        ImGui::Dummy(ImVec2(0, 8.0f * uiScale));
-        if (!s_accountLogin) {
-            ImGui::PushStyleColor(ImGuiCol_Text, Palette::toU32(palette.statusWarn));
-            ImGui::TextWrapped("Account sign-in is not available in this build yet. You can continue without it; a later update will connect this desktop to your Chudware account.");
-            ImGui::PopStyleColor();
-        } else if (!s_wizard.account.signedIn) {
-            if (kit::primaryButton("Open Chudware sign-in in browser", true, nullptr,
-                                   ImVec2(-1, 0))) {
-                s_wizard.accountActionBusy = true;
-                OnboardingAccountSummary refreshed = s_wizard.account;
-                const bool accepted = s_accountLogin(st, OnboardingAccountAction::BeginLogin, refreshed);
-                s_wizard.account = std::move(refreshed);
-                s_wizard.accountActionBusy = false;
-                if (!accepted && s_wizard.account.detail.empty())
-                    s_wizard.account.detail = "Chudware sign-in could not be started.";
-            }
-        } else if (kit::secondaryButton("Refresh account", true, nullptr, ImVec2(-1, 0))) {
-            refreshAccount(st);
-        }
-        ImGui::Dummy(ImVec2(0, 6.0f * uiScale));
-        showAccountScope();
-    }
-    endCard();
-}
 
 void beginValidatedKeySave(AppState& st) {
     const std::string key = s_wizard.key;
@@ -482,20 +419,20 @@ void drawFooter(AppState& st) {
     ImGui::Separator();
     if (s_wizard.step > 0 && kit::secondaryButton("Back")) --s_wizard.step;
     if (s_wizard.step > 0) ImGui::SameLine();
-    const char* skip = s_wizard.step == 3 ? "Skip and finish" : "Skip this step";
+    const char* skip = s_wizard.step == kLastStep ? "Skip and finish" : "Skip this step";
     if (kit::secondaryButton(skip)) {
-        if (s_wizard.step < 3) ++s_wizard.step;
+        if (s_wizard.step < kLastStep) ++s_wizard.step;
         else finishWizard(st);
     }
     ImGui::SameLine();
     const float continueWidth = 150.0f * uiScale;
     ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(),
                                   ImGui::GetWindowContentRegionMax().x - continueWidth));
-    const char* next = s_wizard.step == 3 ? "Start here" : "Continue";
-    const bool canContinue = s_wizard.step != 3 || s_wizard.chosenWorkspace >= 0;
+    const char* next = s_wizard.step == kLastStep ? "Start here" : "Continue";
+    const bool canContinue = s_wizard.step != kLastStep || s_wizard.chosenWorkspace >= 0;
     if (kit::primaryButton(next, canContinue, "Choose a workspace, or select Skip and finish.",
                            ImVec2(continueWidth, 0))) {
-        if (s_wizard.step < 3) ++s_wizard.step;
+        if (s_wizard.step < kLastStep) ++s_wizard.step;
         else finishWizard(st);
     }
     if (!s_wizard.persistError.empty()) {
@@ -506,10 +443,6 @@ void drawFooter(AppState& st) {
 }
 
 }  // namespace
-
-void setOnboardingAccountLoginSeam(OnboardingAccountLoginSeam seam) {
-    s_accountLogin = std::move(seam);
-}
 
 bool persistOnboardingCompletion(const char* startingWorkspace) {
     const std::string workspace = startingWorkspace ? startingWorkspace : "";
@@ -526,12 +459,12 @@ bool persistOnboardingCompletion(const char* startingWorkspace) {
 void forceOnboardingForScenario(int step) {
     s_wizard.requestOpen = true;
     s_wizard.open = true;
-    s_wizard.step = std::clamp(step, 0, 3);
+    s_wizard.step = std::clamp(step, 0, kLastStep);
 }
 
 void drawOnboarding(AppState& st, bool appBusy) {
     // The gateway already authenticates web users. This wizard provisions desktop
-    // account/provider access; it must never open while browser state is loading.
+    // provider access; it must never open while browser state is loading.
     if (webBuild()) return;
 
     if (!s_wizard.gateRead) {
@@ -539,7 +472,7 @@ void drawOnboarding(AppState& st, bool appBusy) {
         s_wizard.completedVersion = readCompletedVersion();
         // A headless capture must show the surface under test. The wizard opens whenever the
         // config's completed version is stale, which covered two thirds of every PLM/graph
-        // shot with a sign-in step nobody was verifying. Scenarios that DO want it call
+        // shot with a setup step nobody was verifying. Scenarios that DO want it call
         // forceOnboardingForScenario, which sets requestOpen directly and is unaffected.
         const char* shot = std::getenv("CHUDWARE_SHOT");
         const bool headlessShot = shot && *shot;
@@ -566,19 +499,18 @@ void drawOnboarding(AppState& st, bool appBusy) {
     }
 
     ImGui::PushStyleColor(ImGuiCol_Text, Palette::toU32(palette.accent));
-    ImGui::Text("Step %d of 4", s_wizard.step + 1);
+    ImGui::Text("Step %d of %d", s_wizard.step + 1, kStepCount);
     ImGui::PopStyleColor();
     ImGui::SameLine();
-    ImGui::ProgressBar((s_wizard.step + 1) / 4.0f, ImVec2(-1, 0), "");
+    ImGui::ProgressBar((s_wizard.step + 1) / static_cast<float>(kStepCount), ImVec2(-1, 0), "");
     ImGui::Dummy(ImVec2(0, 8.0f * sc));
 
     const float footerReserve = 64.0f * sc;
     ImGui::BeginChild("##onboarding_body", ImVec2(0, -footerReserve),
                       ImGuiChildFlags_AlwaysUseWindowPadding);
     switch (s_wizard.step) {
-        case 0: drawAccountStep(st); break;
-        case 1: drawPowerStep(st); break;
-        case 2: drawTestStep(st, appBusy); break;
+        case 0: drawPowerStep(st); break;
+        case 1: drawTestStep(st, appBusy); break;
         default: drawWorkspaceStep(); break;
     }
     ImGui::EndChild();

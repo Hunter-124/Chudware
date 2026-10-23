@@ -1,38 +1,808 @@
-# Commercial release pipeline with an explicit offline owner-signing boundary.
-# Builders upload installer bytes only to the release staging store. GitHub Actions
-# artifacts contain bounded signing requests, manifests, and evidence only.
+# Build, sign and publish a release when a `v*` tag is pushed.
+#
+#   plan      derive the version from the tag
+#   linux     AppImage, .deb and .rpm (fedora:44 container)
+#   windows   Inno Setup installer and MSI
+#   macos     Apple-silicon app zip
+#   publish   signed update manifests, SHA256SUMS and the GitHub Release
+#
+# Every payload carries a manifest signed with the Ed25519 release key
+# (secret CHUDWARE_RELEASE_SIGNING_KEY, key id release-ci-v1). The publish job
+# signs one update-<platform>-<arch>.json per updater artifact with the same
+# key; the in-app updater fetches it from the latest release and verifies it
+# against core/security/release_keys.h before installing anything.
+#
+# Windows and macOS platform code signing is optional: it runs only when the
+# certificate secrets are configured, and the release notes state which
+# platforms shipped unsigned. See docs/RELEASING.md and docs/SIGNING.md.
 name: release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
   workflow_dispatch:
     inputs:
-      phase:
-        description: prepare bounded requests and stop for offline owner signing
+      tag:
+        description: Existing tag to build and publish (for example v0.2.0)
         required: true
-        type: choice
-        options: [prepare]
-      channel:
-        description: stable requires real platform credentials; unsigned targets are forced to beta
-        required: true
-        type: choice
-        options: [beta, stable]
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}-${{ inputs.phase || 'prepare' }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
+env:
+  CHUDWARE_RELEASE_KEY_ID: release-ci-v1
+  # Public half of release-ci-v1 (base64). Signing tools check the secret
+  # against it before signing, and the verifiers below use it.
+  CHUDWARE_RELEASE_PUBLIC_KEY: 10NNxn9NbhHNTIztm167zPLhR3tZSdUtdoW2ykOgEPY=
+  PYTHON_VERSION: '3.13'
+
 jobs:
-  prepare:
-    # Only jobs defined in the reusable workflow are group-authorized.
-    if: ${{ github.ref_protected && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
-    uses: ./.github/workflows/release-prepare.yml
-    with:
-      channel: ${{ inputs.channel || '' }}
-    secrets:
-      STRIPE_SANDBOX_ENV: ${{ secrets.STRIPE_SANDBOX_ENV }}
+  plan:
+    name: Plan release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      channel: ${{ steps.plan.outputs.channel }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+      commit: ${{ steps.plan.outputs.commit }}
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+
+      - name: Resolve version
+        id: plan
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::tag ${TAG} is not v<major>.<minor>.<patch>[-<prerelease>]"
+            exit 1
+          fi
+          version="${TAG#v}"
+          if [[ "${version}" == *-* ]]; then
+            channel=beta prerelease=true
+          else
+            channel=stable prerelease=false
+          fi
+          {
+            echo "tag=${TAG}"
+            echo "version=${version}"
+            echo "channel=${channel}"
+            echo "prerelease=${prerelease}"
+            echo "commit=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing ${version} (${channel}) from $(git rev-parse HEAD)"
+
+  linux:
+    name: Linux x86_64
+    needs: plan
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:44
+      # Large preinstalled host SDKs this job never uses; mounted only so the
+      # first step can delete them and free disk space for the build.
+      volumes:
+        - /usr/local/lib/android:/host/android
+        - /usr/share/dotnet:/host/dotnet
+        - /opt/ghc:/host/ghc
+    timeout-minutes: 330
+    env:
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+      RELEASE_CHANNEL: ${{ needs.plan.outputs.channel }}
+      RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+      RELEASE_PLATFORM: linux
+      RELEASE_ARCH: x86_64
+      CORE_PRESET: linux-core
+      HOST_BUILD_DIR: host/build-linux
+      # appimagetool is itself an AppImage; containers have no FUSE.
+      APPIMAGE_EXTRACT_AND_RUN: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Free disk space on the host
+        run: rm -rf /host/android/* /host/dotnet/* /host/ghc/*
+
+      - name: Install git
+        run: dnf -y install git
+
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: bash .github/scripts/install-fedora-deps.sh release
+
+      - name: Provision the release Python
+        run: |
+          set -euo pipefail
+          venv="${RUNNER_TEMP}/release-python"
+          python3.13 -m venv "${venv}"
+          "${venv}/bin/python" -m pip install --disable-pip-version-check \
+            -r requirements.txt -r packaging/requirements-release.txt
+          echo "CHUDWARE_RELEASE_PYTHON=${venv}/bin/python" >> "$GITHUB_ENV"
+
+      - name: Fetch the pinned Chudcode runtime
+        run: |
+          set -euo pipefail
+          "${CHUDWARE_RELEASE_PYTHON}" scripts/pin_chudcode.py ensure --target linux-x86_64 \
+            --cache-dir "${RUNNER_TEMP}/chudcode" > "${RUNNER_TEMP}/chudcode.json"
+          chud_bin="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])' "${RUNNER_TEMP}/chudcode.json")"
+          echo "CHUDWARE_CHUD_BIN=${chud_bin}" >> "$GITHUB_ENV"
+
+      - name: Build core and host at the release version
+        run: |
+          set -euo pipefail
+          protected_assets="${HOST_BUILD_DIR}/generated/protected-assets"
+          "${CHUDWARE_RELEASE_PYTHON}" packaging/embed_protected_assets.py --source-root . --output-dir "${protected_assets}"
+          release_flags=(
+            -DCHUDWARE_DEVELOPER_BUILD=OFF
+            -DCHUDWARE_LTO=ON
+            -DCHUDWARE_VERSION_OVERRIDE="${RELEASE_VERSION}"
+            -DCHUDWARE_PROTECTED_ASSETS_DIR="${GITHUB_WORKSPACE}/${protected_assets}"
+          )
+          cmake --preset "${CORE_PRESET}" "${release_flags[@]}"
+          cmake --build --preset "${CORE_PRESET}"
+
+          cef_root="$(bash scripts/fetch_cef_posix.sh --destination-root "${RUNNER_TEMP}/cef")"
+          cmake -S host -B "${HOST_BUILD_DIR}" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            "${release_flags[@]}" -DCEF_ROOT="${cef_root}"
+          cmake --build "${HOST_BUILD_DIR}"
+
+          grep -Fq "\"${RELEASE_VERSION}\"" "${HOST_BUILD_DIR}/generated/api/chudware_version.h" || {
+            echo "::error::generated version header does not contain ${RELEASE_VERSION}"; exit 1; }
+
+      - name: Run the core and host test suites
+        run: |
+          "${CHUDWARE_RELEASE_PYTHON}" scripts/run_release_ctest.py \
+            --core-dir "build/${CORE_PRESET}/core" --host-dir "${HOST_BUILD_DIR}" \
+            --out "${RUNNER_TEMP}/test-results"
+
+      - name: Stage the payload and sign its manifest
+        env:
+          CHUDWARE_RELEASE_SIGNING_KEY: ${{ secrets.CHUDWARE_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/prepared"
+          mkdir -p "${out}"
+          packaging/linux/build_appimage.sh --prepare-signing \
+            --key-id "${CHUDWARE_RELEASE_KEY_ID}" --out "${out}" \
+            --protected-assets-dir "${HOST_BUILD_DIR}/generated/protected-assets" \
+            --host-bin "${HOST_BUILD_DIR}/bin/chudware" \
+            --hostd-bin "build/${CORE_PRESET}/bin/chudware-hostd" \
+            --libchudware-bin "build/${CORE_PRESET}/bin/libchudware.so" \
+            --chud-bin "${CHUDWARE_CHUD_BIN}"
+
+          # The finalizer re-checks the test results and locked inputs bound here.
+          cp "${RUNNER_TEMP}/test-results/"* "${out}/"
+          mkdir -p "${out}/packaging" "${out}/vendor/chudcode"
+          cp CMakePresets.json "${out}/CMakePresets.json"
+          cp packaging/requirements-release.txt "${out}/packaging/requirements-release.txt"
+          cp vendor/chudcode/CHUDCODE_ARTIFACT.lock "${out}/vendor/chudcode/CHUDCODE_ARTIFACT.lock"
+          python3 - "${out}" <<'PY'
+          import hashlib, json, os, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          names = ('CMakePresets.json', 'packaging/requirements-release.txt', 'vendor/chudcode/CHUDCODE_ARTIFACT.lock',
+                   'test-results.json', 'core-junit.xml', 'host-junit.xml', 'core-ctest.log', 'host-ctest.log')
+          handoff = {
+              'schema': 'chudware-offline-handoff-v1',
+              'commit': os.environ['RELEASE_COMMIT'],
+              'version': os.environ['RELEASE_VERSION'],
+              'channel': os.environ['RELEASE_CHANNEL'],
+              'platform': os.environ['RELEASE_PLATFORM'],
+              'arch': os.environ['RELEASE_ARCH'],
+              'locked_inputs': [
+                  {'path': name, 'sha256': hashlib.sha256((root / name).read_bytes()).hexdigest()}
+                  for name in names
+              ],
+          }
+          (root / 'handoff.json').write_bytes(
+              json.dumps(handoff, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('ascii') + b'\n')
+          PY
+          tar -C "${out}" -cf "${RUNNER_TEMP}/prepared.tar" .
+
+          request="$(find "${out}" -type f -name '*payload-signing-request.bin' -print -quit)"
+          test -s "${request}" || { echo '::error::payload signing request missing'; exit 1; }
+          "${CHUDWARE_RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_PUBLIC_KEY}" \
+            --output "${RUNNER_TEMP}/payload.sig" sign payload "${request}" > /dev/null
+
+      - name: Finalize the AppImage
+        run: |
+          set -euo pipefail
+          final="${RUNNER_TEMP}/final"
+          "${CHUDWARE_RELEASE_PYTHON}" packaging/finalize_release.py "${RUNNER_TEMP}/prepared.tar" \
+            --payload-signature "${RUNNER_TEMP}/payload.sig" \
+            --release-public-key "${CHUDWARE_RELEASE_PUBLIC_KEY}" \
+            --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" \
+            --version "${RELEASE_VERSION}" --commit "${RELEASE_COMMIT}" --channel "${RELEASE_CHANNEL}" \
+            --handoff-metadata "${RUNNER_TEMP}/prepared/handoff.json" \
+            --out "${final}"
+          artifact="$(find "${final}" -type f -name "Chudware-${RELEASE_VERSION}-linux-x86_64.AppImage" -print -quit)"
+          test -s "${artifact}" || { echo '::error::finalization did not produce the AppImage'; exit 1; }
+          echo "APPIMAGE=${artifact}" >> "$GITHUB_ENV"
+
+      - name: Verify the AppImage
+        run: |
+          set -euo pipefail
+          work="${RUNNER_TEMP}/verify"
+          mkdir -p "${work}"
+          cp "${APPIMAGE}" "${work}/artifact.AppImage"
+          chmod +x "${work}/artifact.AppImage"
+          ( cd "${work}" && ./artifact.AppImage --appimage-extract > extract.log )
+          root="${work}/squashfs-root"
+          echo "APPDIR=${root}" >> "$GITHUB_ENV"
+
+          # Every shipped ELF file must resolve all of its libraries from the bundle or the base system.
+          mapfile -t elves < <(find "${root}/usr/bin" "${root}/usr/lib" -type f -exec sh -c 'file -b "$1" | grep -q ELF' _ {} \; -print)
+          [ "${#elves[@]}" -gt 0 ] || { echo '::error::extracted payload has no ELF binaries'; exit 1; }
+          unresolved="$(LD_LIBRARY_PATH="${root}/usr/lib" ldd "${elves[@]}" 2>/dev/null | awk '/not found/' || true)"
+          if [ -n "${unresolved}" ]; then
+            printf '%s\n' "${unresolved}"
+            echo '::error::extracted AppImage has unresolved libraries'; exit 1
+          fi
+
+          # hostd verifies the installed payload at startup and reports its version on stderr.
+          banner="$(LD_LIBRARY_PATH="${root}/usr/lib" CHUDWARE_LIBCHUDWARE="${root}/usr/lib/libchudware.so" \
+            "${root}/usr/bin/chudware-hostd" --status 2>&1 >/dev/null || true)"
+          printf '%s\n' "${banner}"
+          printf '%s' "${banner}" | grep -Fq "${RELEASE_VERSION}" || {
+            echo "::error::chudware-hostd did not load and report ${RELEASE_VERSION}"; exit 1; }
+
+          PYTHONPATH="${GITHUB_WORKSPACE}" "${CHUDWARE_RELEASE_PYTHON}" - "${root}" "${CHUDWARE_RELEASE_PUBLIC_KEY}" <<'PY'
+          import sys
+          from pathlib import Path
+          from services.installer.payload_manifest import read_manifest, verify_manifest_payload, verify_signature
+          root = Path(sys.argv[1])
+          manifest, canonical = read_manifest(root)
+          verify_manifest_payload(root, canonical)
+          verify_signature(key_id=str(manifest["key_id"]), canonical_json=canonical,
+                           signature_path=root / "payload-manifest.v1.sig", public_key=sys.argv[2])
+          print(f"payload manifest verified: {len(manifest['files'])} files, key_id {manifest['key_id']}")
+          PY
+
+      - name: Package the verified tree as .deb and .rpm
+        run: |
+          set -euo pipefail
+          dist="${RUNNER_TEMP}/dist"
+          mkdir -p "${dist}"
+          cp "${APPIMAGE}" "${dist}/"
+          for format in deb rpm; do
+            name="$(python3 packaging/artifact_names.py --version "${RELEASE_VERSION}" \
+              --platform "${RELEASE_PLATFORM}" --arch "${RELEASE_ARCH}" --format "${format}")"
+            packaging/linux/build_linux_packages.sh --appdir "${APPDIR}" \
+              --version "${RELEASE_VERSION}" --out "${dist}" --format "${format}"
+            test -s "${dist}/${name}" || { echo "::error::package output missing: ${name}"; exit 1; }
+          done
+          ls -l "${dist}"
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-linux
+          path: |
+            ${{ runner.temp }}/dist/*.AppImage
+            ${{ runner.temp }}/dist/*.deb
+            ${{ runner.temp }}/dist/*.rpm
+          if-no-files-found: error
+          retention-days: 3
+
+  windows:
+    name: Windows x86_64
+    needs: plan
+    runs-on: windows-2025
+    timeout-minutes: 330
+    outputs:
+      signed: ${{ steps.signing.outputs.signed }}
+    env:
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+      CORE_PRESET: windows-occt
+      HOST_BUILD_DIR: host/build-win
+      WIX_VERSION: 5.0.2
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Enter the MSVC x64 developer environment
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw 'No Visual Studio installation with the x64 C++ toolset' }
+          $before = @{}
+          Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          Import-Module (Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
+          Get-ChildItem env: | Where-Object { $before[$_.Name] -ne $_.Value } |
+            ForEach-Object { "$($_.Name)=$($_.Value)" } | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install packaging tools
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja --yes --no-progress }
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { choco install innosetup --yes --no-progress }
+          if (-not (Test-Path $iscc)) { throw "Inno Setup 6 is not available at $iscc" }
+          "ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $tools = Join-Path $env:RUNNER_TEMP 'wix'
+          dotnet tool install wix --version $env:WIX_VERSION --tool-path $tools
+          "WIX=$(Join-Path $tools 'wix.exe')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Provision the release Python
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $venv = Join-Path $env:RUNNER_TEMP 'release-python'
+          python -m venv $venv
+          $python = Join-Path $venv 'Scripts\python.exe'
+          & $python -m pip install --disable-pip-version-check -r requirements.txt -r packaging/requirements-release.txt
+          "CHUDWARE_RELEASE_PYTHON=$python" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Fetch the pinned Chudcode runtime
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $evidence = & $env:CHUDWARE_RELEASE_PYTHON scripts\pin_chudcode.py ensure --target windows-x86_64 `
+            --cache-dir (Join-Path $env:RUNNER_TEMP 'chudcode')
+          $chud = ($evidence | ConvertFrom-Json).path
+          "CHUDWARE_CHUD_BIN=$chud" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Import the code-signing certificate
+        id: signing
+        env:
+          CERTIFICATE: ${{ secrets.CHUDWARE_WINDOWS_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.CHUDWARE_WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:CERTIFICATE) {
+            Write-Host '::warning::CHUDWARE_WINDOWS_CERTIFICATE is not configured; the Windows installers will be unsigned'
+            'signed=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 0
+          }
+          $flags = [Security.Cryptography.X509Certificates.X509KeyStorageFlags]'PersistKeySet, UserKeySet'
+          $bundle = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+          $bundle.Import([Convert]::FromBase64String($env:CERTIFICATE), $env:CERTIFICATE_PASSWORD, $flags)
+          $store = [Security.Cryptography.X509Certificates.X509Store]::new('My', 'CurrentUser')
+          $store.Open('ReadWrite')
+          $store.AddRange($bundle)
+          $store.Close()
+          $cert = $bundle | Where-Object HasPrivateKey | Select-Object -First 1
+          if (-not $cert) { throw 'The certificate bundle contains no private key' }
+          $subject = $cert.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+          # build_release.py and build_msi.py sign with `signtool sign /n <subject>`.
+          "CHUDWARE_SIGN_IDENTITY=$subject" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          'signed=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Build core and host at the release version
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts\setup_windows_links.ps1
+          $protected = "$env:HOST_BUILD_DIR/generated/protected-assets"
+          & $env:CHUDWARE_RELEASE_PYTHON packaging\embed_protected_assets.py --source-root . --output-dir $protected
+          $releaseFlags = @(
+            '-DCHUDWARE_DEVELOPER_BUILD=OFF',
+            '-DCHUDWARE_LTO=ON',
+            "-DCHUDWARE_VERSION_OVERRIDE=$env:RELEASE_VERSION",
+            "-DCHUDWARE_PROTECTED_ASSETS_DIR=$env:GITHUB_WORKSPACE/$protected"
+          )
+          cmake --preset $env:CORE_PRESET @releaseFlags
+          cmake --build --preset $env:CORE_PRESET
+
+          $cefDestination = Join-Path $env:RUNNER_TEMP 'cef'
+          powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts\fetch_cef_windows.ps1 -DestinationRoot $cefDestination
+          $cefRoot = (Get-ChildItem -LiteralPath $cefDestination -Directory -Filter 'cef_binary_*_windows64_minimal' | Select-Object -First 1).FullName
+          if (-not $cefRoot) { throw "No CEF SDK under $cefDestination" }
+          cmake -S host -B $env:HOST_BUILD_DIR -G Ninja -DCMAKE_BUILD_TYPE=Release @releaseFlags "-DCEF_ROOT=$cefRoot"
+          cmake --build $env:HOST_BUILD_DIR
+          # The installer ships the whole host bin directory, so the engine, its
+          # OCCT DLLs and the daemon must sit beside chudware.exe.
+          Get-ChildItem -LiteralPath "build/$env:CORE_PRESET/bin" -File |
+            Where-Object { $_.Extension -eq '.dll' -or $_.Name -eq 'chudware-hostd.exe' } |
+            Copy-Item -Destination "$env:HOST_BUILD_DIR/bin" -Force
+
+          $header = Get-Content -Raw "$env:HOST_BUILD_DIR/generated/api/chudware_version.h"
+          if (-not $header.Contains("`"$env:RELEASE_VERSION`"")) { throw "generated version header does not contain $env:RELEASE_VERSION" }
+
+      - name: Run the core and host test suites
+        run: |
+          & $env:CHUDWARE_RELEASE_PYTHON scripts\run_release_ctest.py `
+            --core-dir "build/$env:CORE_PRESET/core" --host-dir $env:HOST_BUILD_DIR `
+            --out (Join-Path $env:RUNNER_TEMP 'test-results')
+
+      - name: Build the signed payload, installer and MSI
+        env:
+          CHUDWARE_RELEASE_SIGNING_KEY: ${{ secrets.CHUDWARE_RELEASE_SIGNING_KEY }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $python = $env:CHUDWARE_RELEASE_PYTHON
+          $out = Join-Path $env:RUNNER_TEMP 'installer'
+          $sidecars = Join-Path $env:RUNNER_TEMP 'sidecars'
+          $hostBin = "$env:HOST_BUILD_DIR/bin/chudware.exe"
+          $hostdBin = "build/$env:CORE_PRESET/bin/chudware-hostd.exe"
+          powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File packaging\windows\build_sidecars.ps1 `
+            -OutputDir $sidecars -HostBinary $hostBin -HostdBinary $hostdBin `
+            -EngineBinary "build/$env:CORE_PRESET/bin/libchudware.dll"
+
+          & $python -m services.installer.build_release --prepare-signing --payload-only `
+            --key-id $env:CHUDWARE_RELEASE_KEY_ID --version $env:RELEASE_VERSION --out $out `
+            --host-bin $hostBin --hostd-bin $hostdBin `
+            --worker-bin "$sidecars/chudware-worker.exe" `
+            --mcp-bin "$sidecars/chudware-mcp.exe" `
+            --chud-bin "$sidecars/chud.exe" `
+            --uninstall-helper-bin "$env:HOST_BUILD_DIR/bin/chudware-uninstall-helper.exe"
+          $request = Get-ChildItem -Path $out -Recurse -Filter 'payload-manifest.v1.preimage' | Select-Object -First 1
+          if (-not $request) { throw 'payload signing preimage missing' }
+          $payloadSig = Join-Path $env:RUNNER_TEMP 'payload.sig'
+          & $python packaging\ci_sign.py --expect-public-key $env:CHUDWARE_RELEASE_PUBLIC_KEY `
+            --output $payloadSig sign payload $request.FullName | Out-Null
+
+          # Embeds the signature, re-verifies every payload byte, then runs Inno Setup.
+          & $python -m services.installer.build_release --finalize-signing $payloadSig `
+            --release-public-key $env:CHUDWARE_RELEASE_PUBLIC_KEY --version $env:RELEASE_VERSION --out $out
+          $dist = Join-Path $env:RUNNER_TEMP 'dist'
+          & $python -m services.installer.build_msi --payload (Join-Path $out 'Chudware') --out $dist `
+            --version $env:RELEASE_VERSION --release-public-key $env:CHUDWARE_RELEASE_PUBLIC_KEY --wix $env:WIX
+
+          $installer = Join-Path $out "Chudware-Setup-$env:RELEASE_VERSION-x86_64.exe"
+          if (-not (Test-Path -LiteralPath $installer)) { throw "Inno Setup did not produce $installer" }
+          Copy-Item -LiteralPath $installer -Destination $dist
+          if (-not (Test-Path -LiteralPath (Join-Path $dist "Chudware-$env:RELEASE_VERSION-x86_64.msi"))) {
+            throw 'WiX did not produce the MSI'
+          }
+          Get-ChildItem -LiteralPath $dist -Filter 'Chudware*' | Format-Table Name, Length
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-windows
+          path: |
+            ${{ runner.temp }}/dist/Chudware-Setup-*.exe
+            ${{ runner.temp }}/dist/Chudware-*.msi
+          if-no-files-found: error
+          retention-days: 3
+
+  macos:
+    name: macOS arm64
+    needs: plan
+    runs-on: macos-15
+    timeout-minutes: 330
+    outputs:
+      signed: ${{ steps.signing.outputs.signed }}
+      notarized: ${{ steps.signing.outputs.notarized }}
+    env:
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+      RELEASE_ARCH: arm64
+      CORE_PRESET: macos-arm64
+      HOST_BUILD_DIR: host/build-macos-arm64
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build dependencies
+        run: brew install ninja opencascade
+
+      - name: Provision the release Python
+        run: |
+          set -euo pipefail
+          venv="${RUNNER_TEMP}/release-python"
+          python -m venv "${venv}"
+          "${venv}/bin/python" -m pip install --disable-pip-version-check \
+            -r requirements.txt -r packaging/requirements-release.txt
+          echo "CHUDWARE_RELEASE_PYTHON=${venv}/bin/python" >> "$GITHUB_ENV"
+
+      - name: Fetch the pinned Chudcode runtime
+        run: |
+          set -euo pipefail
+          "${CHUDWARE_RELEASE_PYTHON}" scripts/pin_chudcode.py ensure --target "macos-${RELEASE_ARCH}" \
+            --cache-dir "${RUNNER_TEMP}/chudcode" > "${RUNNER_TEMP}/chudcode.json"
+          chud_bin="$("${CHUDWARE_RELEASE_PYTHON}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])' "${RUNNER_TEMP}/chudcode.json")"
+          echo "CHUDWARE_CHUD_BIN=${chud_bin}" >> "$GITHUB_ENV"
+
+      - name: Import the signing certificate and notarization credentials
+        id: signing
+        env:
+          CERTIFICATE: ${{ secrets.CHUDWARE_MACOS_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.CHUDWARE_MACOS_CERTIFICATE_PASSWORD }}
+          NOTARY_APPLE_ID: ${{ secrets.CHUDWARE_NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.CHUDWARE_NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.CHUDWARE_NOTARY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CERTIFICATE}" ]; then
+            echo '::warning::CHUDWARE_MACOS_CERTIFICATE is not configured; the macOS app will be unsigned'
+            { echo 'signed=false'; echo 'notarized=false'; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          keychain="${RUNNER_TEMP}/signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          security create-keychain -p "${keychain_password}" "${keychain}"
+          security set-keychain-settings -lut 21600 "${keychain}"
+          security unlock-keychain -p "${keychain_password}" "${keychain}"
+          printf '%s' "${CERTIFICATE}" | base64 --decode > "${RUNNER_TEMP}/signing.p12"
+          security import "${RUNNER_TEMP}/signing.p12" -k "${keychain}" -P "${CERTIFICATE_PASSWORD}" -T /usr/bin/codesign
+          rm -f "${RUNNER_TEMP}/signing.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "${keychain_password}" "${keychain}" > /dev/null
+          security list-keychains -d user -s "${keychain}"
+          security default-keychain -s "${keychain}"
+          identity="$(security find-identity -v -p codesigning "${keychain}" | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+          [ -n "${identity}" ] || { echo '::error::the certificate bundle contains no Developer ID Application identity'; exit 1; }
+          # packaging/macos/build_app.sh signs with this identity and notarizes with this profile.
+          echo "CHUDWARE_SIGN_IDENTITY=${identity}" >> "$GITHUB_ENV"
+          echo 'signed=true' >> "$GITHUB_OUTPUT"
+          if [ -n "${NOTARY_APPLE_ID}" ]; then
+            xcrun notarytool store-credentials chudware-notary --apple-id "${NOTARY_APPLE_ID}" \
+              --team-id "${NOTARY_TEAM_ID}" --password "${NOTARY_PASSWORD}" --keychain "${keychain}"
+            echo 'CHUDWARE_NOTARIZE_PROFILE=chudware-notary' >> "$GITHUB_ENV"
+            echo 'notarized=true' >> "$GITHUB_OUTPUT"
+          else
+            echo '::warning::CHUDWARE_NOTARY_APPLE_ID is not configured; the macOS app will not be notarized'
+            echo 'notarized=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build core and host at the release version
+        run: |
+          set -euo pipefail
+          protected_assets="${HOST_BUILD_DIR}/generated/protected-assets"
+          "${CHUDWARE_RELEASE_PYTHON}" packaging/embed_protected_assets.py --source-root . --output-dir "${protected_assets}"
+          release_flags=(
+            -DCHUDWARE_DEVELOPER_BUILD=OFF
+            -DCHUDWARE_LTO=ON
+            -DCHUDWARE_VERSION_OVERRIDE="${RELEASE_VERSION}"
+            -DCHUDWARE_PROTECTED_ASSETS_DIR="${GITHUB_WORKSPACE}/${protected_assets}"
+          )
+          cmake --preset "${CORE_PRESET}" "${release_flags[@]}"
+          cmake --build --preset "${CORE_PRESET}"
+
+          cef_root="$(bash scripts/fetch_cef_posix.sh --destination-root "${RUNNER_TEMP}/cef")"
+          cmake -S host -B "${HOST_BUILD_DIR}" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            "${release_flags[@]}" -DCEF_ROOT="${cef_root}"
+          cmake --build "${HOST_BUILD_DIR}"
+
+          grep -Fq "\"${RELEASE_VERSION}\"" "${HOST_BUILD_DIR}/generated/api/chudware_version.h" || {
+            echo "::error::generated version header does not contain ${RELEASE_VERSION}"; exit 1; }
+
+      - name: Run the core and host test suites
+        run: |
+          "${CHUDWARE_RELEASE_PYTHON}" scripts/run_release_ctest.py \
+            --core-dir "build/${CORE_PRESET}/core" --host-dir "${HOST_BUILD_DIR}" \
+            --out "${RUNNER_TEMP}/test-results"
+
+      - name: Stage Chudware.app and sign its payload manifest
+        env:
+          CHUDWARE_RELEASE_SIGNING_KEY: ${{ secrets.CHUDWARE_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/prepared"
+          mkdir -p "${out}"
+          packaging/macos/build_app.sh --prepare-signing \
+            --key-id "${CHUDWARE_RELEASE_KEY_ID}" --chud-bin "${CHUDWARE_CHUD_BIN}" --out "${out}"
+          request="$(find "${out}" -type f -name '*payload-signing-request.bin' -print -quit)"
+          test -s "${request}" || { echo '::error::payload signing request missing'; exit 1; }
+          "${CHUDWARE_RELEASE_PYTHON}" packaging/ci_sign.py --expect-public-key "${CHUDWARE_RELEASE_PUBLIC_KEY}" \
+            --output "${RUNNER_TEMP}/payload.sig" sign payload "${request}" > /dev/null
+
+      - name: Seal the app into its zip
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/prepared"
+          packaging/macos/build_app.sh --finalize-signing "${RUNNER_TEMP}/payload.sig" \
+            --release-public-key "${CHUDWARE_RELEASE_PUBLIC_KEY}" --out "${out}"
+          artifact="${out}/Chudware-${RELEASE_VERSION}-macos-${RELEASE_ARCH}.zip"
+          test -s "${artifact}" || { echo "::error::build_app.sh did not produce ${artifact}"; exit 1; }
+          mkdir -p "${RUNNER_TEMP}/dist"
+          cp "${artifact}" "${RUNNER_TEMP}/dist/"
+
+      - name: Verify the app
+        run: |
+          set -euo pipefail
+          work="${RUNNER_TEMP}/verify"
+          mkdir -p "${work}"
+          ditto -x -k "${RUNNER_TEMP}/dist/Chudware-${RELEASE_VERSION}-macos-${RELEASE_ARCH}.zip" "${work}"
+          app="${work}/Chudware.app"
+          for required in Contents/MacOS/Chudware Contents/MacOS/chudware-hostd Contents/Frameworks/libchudware.dylib \
+            payload-manifest.v1.json payload-manifest.v1.sig; do
+            test -e "${app}/${required}" || { echo "::error::Chudware.app is missing ${required}"; exit 1; }
+          done
+
+          # No shipped Mach-O file may load a library from outside the bundle or the OS.
+          leaked=0
+          for binary in "${app}/Contents/MacOS/"* "${app}/Contents/Frameworks/"*.dylib; do
+            [ -f "${binary}" ] && otool -h "${binary}" > /dev/null 2>&1 || continue
+            outside="$(otool -L "${binary}" | sed -n '2,$p' | awk '{print $1}' \
+              | grep -v -e '^@' -e '^/System/' -e '^/usr/lib/' || true)"
+            if [ -n "${outside}" ]; then
+              printf '%s: %s\n' "${binary}" "${outside}"
+              leaked=1
+            fi
+          done
+          [ "${leaked}" -eq 0 ] || { echo '::error::shipped Mach-O files load libraries from outside the bundle'; exit 1; }
+
+          banner="$(CHUDWARE_LIBCHUDWARE="${app}/Contents/Frameworks/libchudware.dylib" \
+            "${app}/Contents/MacOS/chudware-hostd" --status 2>&1 >/dev/null || true)"
+          printf '%s\n' "${banner}"
+          printf '%s' "${banner}" | grep -Fq "${RELEASE_VERSION}" || {
+            echo "::error::chudware-hostd did not load and report ${RELEASE_VERSION}"; exit 1; }
+
+          PYTHONPATH="${GITHUB_WORKSPACE}" "${CHUDWARE_RELEASE_PYTHON}" - "${app}" "${CHUDWARE_RELEASE_PUBLIC_KEY}" <<'PY'
+          import sys
+          from pathlib import Path
+          from services.installer.payload_manifest import read_manifest, verify_manifest_payload, verify_signature
+          root = Path(sys.argv[1])
+          manifest, canonical = read_manifest(root)
+          verify_manifest_payload(root, canonical)
+          verify_signature(key_id=str(manifest["key_id"]), canonical_json=canonical,
+                           signature_path=root / "payload-manifest.v1.sig", public_key=sys.argv[2])
+          print(f"payload manifest verified: {len(manifest['files'])} files, key_id {manifest['key_id']}")
+          PY
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-macos
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Remove the signing keychain
+        if: always()
+        run: |
+          keychain="${RUNNER_TEMP}/signing.keychain-db"
+          if [ -f "${keychain}" ]; then security delete-keychain "${keychain}"; fi
+
+  publish:
+    name: Publish GitHub Release
+    needs: [plan, linux, windows, macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install the manifest signer's dependency
+        run: python -m pip install --disable-pip-version-check "$(grep -iE '^cryptography==' packaging/requirements-release.txt)"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Write signed update manifests
+        env:
+          CHUDWARE_RELEASE_SIGNING_KEY: ${{ secrets.CHUDWARE_RELEASE_SIGNING_KEY }}
+          # Installed versions older than this floor treat the update as mandatory.
+          MIN_SUPPORTED: ${{ vars.CHUDWARE_MIN_SUPPORTED_VERSION || '0.0.0' }}
+        run: |
+          set -euo pipefail
+          sign() {
+            python packaging/github_release_manifest.py "dist/$1" --platform "$2" --arch "$3" \
+              --version "${RELEASE_VERSION}" --tag "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --key-id "${CHUDWARE_RELEASE_KEY_ID}" --min-supported "${MIN_SUPPORTED}" --output-dir dist
+          }
+          sign "Chudware-${RELEASE_VERSION}-linux-x86_64.AppImage" linux x86_64
+          sign "Chudware-Setup-${RELEASE_VERSION}-x86_64.exe" windows x86_64
+          sign "Chudware-${RELEASE_VERSION}-macos-arm64.zip" macos arm64
+
+      - name: Add the Linux install script
+        run: install -m 0755 packaging/linux/install.sh dist/install.sh
+
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum -- * > "${RUNNER_TEMP}/SHA256SUMS"
+          mv "${RUNNER_TEMP}/SHA256SUMS" SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Write release notes
+        env:
+          WINDOWS_SIGNED: ${{ needs.windows.outputs.signed }}
+          MACOS_SIGNED: ${{ needs.macos.outputs.signed }}
+          MACOS_NOTARIZED: ${{ needs.macos.outputs.notarized }}
+        run: |
+          set -euo pipefail
+          v="${RELEASE_VERSION}"
+          if [ "${WINDOWS_SIGNED}" = true ]; then
+            windows_note='Authenticode-signed.'
+          else
+            windows_note='**Not code-signed.** Windows SmartScreen may warn on first launch; choose "More info", then "Run anyway".'
+          fi
+          if [ "${MACOS_SIGNED}" = true ] && [ "${MACOS_NOTARIZED}" = true ]; then
+            macos_note='Signed with a Developer ID certificate and notarized by Apple.'
+          elif [ "${MACOS_SIGNED}" = true ]; then
+            macos_note='Signed with a Developer ID certificate but **not notarized**. Gatekeeper blocks the first launch; allow it under System Settings > Privacy & Security > "Open Anyway".'
+          else
+            macos_note='**Not code-signed or notarized.** Gatekeeper blocks the first launch; allow it under System Settings > Privacy & Security > "Open Anyway", or run `xattr -dr com.apple.quarantine /Applications/Chudware.app`.'
+          fi
+          cat > "${RUNNER_TEMP}/notes.md" <<EOF
+          ## Downloads
+
+          | Platform | Files |
+          |---|---|
+          | Windows 10/11 (x86_64) | \`Chudware-Setup-${v}-x86_64.exe\` (installer), \`Chudware-${v}-x86_64.msi\` |
+          | macOS (Apple silicon) | \`Chudware-${v}-macos-arm64.zip\` |
+          | Linux (x86_64) | \`Chudware-${v}-linux-x86_64.AppImage\`, \`.deb\`, \`.rpm\` |
+
+          On Linux, \`install.sh\` downloads and verifies the right package for your distribution:
+          \`curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/install.sh | sh\`
+
+          ## Code signing
+
+          - **Windows:** ${windows_note}
+          - **macOS:** ${macos_note}
+          - **Linux:** packages are not GPG-signed; verify them with \`SHA256SUMS\`.
+
+          Every application payload carries a manifest signed with the Chudware Ed25519 release key
+          (\`release-ci-v1\`). The \`update-*.json\` files are the signed manifests the in-app updater
+          reads; it verifies the signature, size and SHA-256 before installing an update.
+
+          Verify a download with \`sha256sum --check --ignore-missing SHA256SUMS\`.
+          EOF
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            echo "::error::release ${TAG} already exists; delete it (or its draft) before re-running"
+            exit 1
+          fi
+          flags=(--repo "${GITHUB_REPOSITORY}" --verify-tag --title "Chudware ${RELEASE_VERSION}"
+                 --notes-file "${RUNNER_TEMP}/notes.md" --generate-notes)
+          if [ "${PRERELEASE}" = true ]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "${TAG}" "${flags[@]}" dist/*

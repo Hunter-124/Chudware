@@ -1,5 +1,5 @@
 # Release-build-only Python dependencies. Runtime dependencies remain in requirements.txt.
-# nightly-release.yml syncs this file into every leg's release Python before compiling.
+# .github/workflows/release.yml installs this file into each platform's release Python.
 Nuitka==4.1.3
 ordered-set==4.1.0
 zstandard==0.25.0

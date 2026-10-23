@@ -2175,9 +2175,6 @@ void submitTurn(AppState& st, const std::string& text) {
     // Slash commands: /compact /shake /handoff /btw /prewalk /skills /help — pure host+RPC,
     // no agent turn. Skills themselves (/skill:<name>) ride a normal turn and activate in-agent.
     if (tryHandleSlashCommand(st, text)) return;
-#ifndef __EMSCRIPTEN__
-    if (!st.verifyEntitlementForAi()) return;
-#endif
     // ONE live run per conversation. The composer normally queues a send while a turn is in
     // flight (drain at the top of drawComposer), so this only catches an out-of-band submit.
     if (st.convRunning(st.activeConvId())) {

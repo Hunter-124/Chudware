@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Rasterize the one brand mark (public/assets/logo.svg) into the favicon set
-# that chudware.com and app.chudware.com both serve.
+# that chudware.com serves.
 #
 # Google Search only shows a site's own icon when it can CRAWL one from the
 # hostname's home page; anything else gets the generic globe. That rules out a
-# data: URI and a file behind sign-in, and it wants raster sizes that are a
-# multiple of 48 px. So each host serves the same set at stable root paths:
+# data: URI, and it wants raster sizes that are a multiple of 48 px. So the site
+# serves the set at stable root paths:
 #   favicon.ico           16/32/48 px, the path every crawler and browser tries
 #   icon-192.png          192 px (4×48) raster for Search
 #   icon-512.png          Organization logo in the home page's structured data
@@ -17,7 +17,6 @@ set -euo pipefail
 
 SITE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SRC="$SITE/public/assets/logo.svg"
-GATEWAY_ICONS="$SITE/../gateway/static/icons"
 BG="#12181c"  # the mark's own tile colour
 
 render() {  # render <px> <out> [flatten]
@@ -36,7 +35,3 @@ render 180 "$out/apple-touch-icon.png" flatten
 
 install -m 0644 "$out/favicon.ico" "$out/icon-192.png" "$out/icon-512.png" \
   "$out/apple-touch-icon.png" "$SITE/public/"
-mkdir -p "$GATEWAY_ICONS"
-install -m 0644 "$SRC" "$GATEWAY_ICONS/favicon.svg"
-install -m 0644 "$out/favicon.ico" "$out/icon-192.png" \
-  "$out/apple-touch-icon.png" "$GATEWAY_ICONS/"

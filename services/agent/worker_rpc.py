@@ -21,8 +21,6 @@ traceback. GUI degrades to hidden when an RPC reports ``unknown_method``.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import logging
 import math
@@ -35,13 +33,11 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
 from typing import Any
 from contextvars import copy_context
 
 from services.agent.online_turn import (
-    activate_turn_env,
     compose_request_text,
     resolve_settings,
     resolve_workspace,
@@ -50,7 +46,7 @@ from services.agent.online_turn import (
 )
 from services.agent.chudcode_host import get_default_chudcode_host
 from services.agent.request_context import (
-    control_delegate, current_context, in_cell, mint_handle, require_handle, scoped_key,
+    bind_roots, control_delegate, in_cell, mint_handle, require_handle, scoped_key,
 )
 
 
@@ -346,7 +342,7 @@ def _cell_refusal(value: Any) -> dict[str, Any] | None:
         return None
     if isinstance(code, str) and code in {
         "not_found", "cell_refused", "forbidden_right", "revoked",
-        "credential_isolation_unsupported", "byok_credential_mismatch",
+        "credential_isolation_unsupported",
     }:
         return {"ok": False, "reason": code, "code": code}
     return None
@@ -1847,14 +1843,11 @@ def _agent_handles_new(params: dict, _emit: Callable) -> dict:
 
 def _control_credentials(params: Mapping) -> dict:
     if in_cell():
-        if any(key in params for key in ("api_key", "web_credential", "byok_key")):
+        if any(key in params for key in ("api_key", "byok_key")):
             raise ValueError("credential_isolation_unsupported")
         # The authenticated actor lane and opaque handle authorize controls.
-        # Key deletion must never strand a running turn's cancel or answer.
         return {}
-    return {"credential_params": params} if any(
-        key in params for key in ("web_actor", "web_credential", "byok_key")
-    ) else {}
+    return {"credential_params": params} if "byok_key" in params else {}
 
 
 def chudcode_control(action: str, params: dict) -> dict:
@@ -1905,8 +1898,7 @@ def chudcode_control(action: str, params: dict) -> dict:
         if isinstance(exc, KeyError) and str(exc).strip("'") == "not_found":
             return {"ok": False, "reason": "not_found", "code": "not_found"}
         if isinstance(exc, ValueError) and str(exc) in {
-                "cell_refused", "forbidden_right", "credential_isolation_unsupported",
-                "byok_credential_mismatch"}:
+                "cell_refused", "forbidden_right", "credential_isolation_unsupported"}:
             return {"ok": False, "reason": str(exc), "code": str(exc)}
         return {
             "ok": False,
@@ -1928,8 +1920,6 @@ _SENSITIVE_RESPONSE_KEYS = frozenset(
         "accesstoken",
         "refreshtoken",
         "controltoken",
-        "providergrant",
-        "webprovidergrant",
         "secret",
         "password",
     }
@@ -1992,7 +1982,7 @@ def _bounded_text(value: Any, limit: int) -> str | None:
 
 def _has_unknown_params(params: Mapping[str, Any], allowed: frozenset[str]) -> bool:
     if in_cell():
-        allowed = allowed | {"_chudware_actor", "provider", "model"}
+        allowed = allowed | {"provider", "model"}
     return bool(set(params) - allowed)
 
 
@@ -2328,40 +2318,19 @@ def _sanitize_model(item: Any) -> dict[str, Any] | None:
 
 
 def _chudcode_models_list(params: dict, _emit: Callable) -> dict:
-    unknown = set(params) - ({"providerId", "_provider_catalog"} if in_cell() else {"providerId"})
-    if unknown:
+    if set(params) - {"providerId"}:
         return {"ok": False, "reason": "chudcode_models_list has unknown params"}
+    if in_cell():
+        # Cells have no provider credential route, so no model is usable there.
+        return {"ok": True, "models": [], "refreshing": False}
     provider_id = _bounded_text(params.get("providerId"), 128)
     host = get_default_chudcode_host()
-    if in_cell():
-        catalog = params.get("_provider_catalog")
-        allowed = {"anthropic", "openai", "xai", "openrouter", "gemini"}
-        if not isinstance(catalog, dict) or set(catalog) - allowed:
-            return {"ok": False, "reason": "credential_isolation_unsupported"}
-        rows = []
-        for provider, grant in catalog.items():
-            native_provider = "google" if provider == "gemini" else provider
-            if provider_id is not None and provider_id != native_provider:
-                continue
-            try:
-                scoped = host.cell_catalog_models({
-                    "web_actor": True, "web_key_source": "byok",
-                    "web_tenant": current_context()["actor_key"],
-                    "web_provider": provider, "web_provider_grant": grant,
-                })
-            except Exception as exc:
-                return _cell_refusal(exc) or {
-                    "ok": False, "reason": f"Agent catalog discovery failed: {type(exc).__name__}"}
-            rows.extend(item for item in scoped["models"]
-                        if isinstance(item, dict) and item.get("provider") == native_provider)
-        raw, refreshing = {"ok": True, "models": rows}, False
-    else:
-        # Desktop discovery refreshes the runtime-owned registry off-lane.
-        try:
-            refreshing = host.refresh_catalog_if_stale()
-        except Exception:  # noqa: BLE001 - discovery must not hide the last good catalog
-            refreshing = False
-        raw = _chudcode_transient_call("get_available_models", {})
+    # Desktop discovery refreshes the runtime-owned registry off-lane.
+    try:
+        refreshing = host.refresh_catalog_if_stale()
+    except Exception:  # noqa: BLE001 - discovery must not hide the last good catalog
+        refreshing = False
+    raw = _chudcode_transient_call("get_available_models", {})
     if not raw.get("ok"):
         return raw
     models: list[dict[str, Any]] = []
@@ -2623,8 +2592,7 @@ def _chudcode_close_session(params: dict, _emit: Callable) -> dict:
         if isinstance(exc, KeyError) and exc.args == ("not_found",):
             return {"ok": False, "reason": "not_found", "code": "not_found"}
         if isinstance(exc, ValueError) and str(exc) in {
-                "cell_refused", "credential_isolation_unsupported",
-                "byok_credential_mismatch"}:
+                "cell_refused", "credential_isolation_unsupported"}:
             return {"ok": False, "reason": str(exc), "code": str(exc)}
         return {
             "ok": False,
@@ -3446,16 +3414,6 @@ def _terminal_text(host_result: Mapping[str, Any]) -> str:
     return ""
 
 
-def _clear_chudware_run_credentials(config_module: Any) -> None:
-    try:
-        config_module.clear_pooled_credentials()
-    except Exception as exc:  # noqa: BLE001 - credential cleanup must not mask failure
-        _LOG.warning(
-            "failed to clear run-scoped credentials (%s)",
-            type(exc).__name__,
-        )
-
-
 def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     """Run the ordinary online lane exclusively through persistent Chudcode RPC."""
     from services.mcp.daemon_bridge import TurnConnections, turn_connection_scope
@@ -3490,6 +3448,10 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
             require_handle(run_id, "run", session_id)
         except (KeyError, TypeError):
             return {"ok": False, "reason": "not_found", "code": "not_found"}
+        # Provider key bytes never enter a cell, so a cell has no credential
+        # route for an online turn.
+        return {"ok": False, "reason": "credential_isolation_unsupported",
+                "code": "credential_isolation_unsupported"}
     try:
         from services.agent.roles import RoleError, load_role
     except ImportError as exc:
@@ -3517,107 +3479,19 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
     except ImportError as exc:
         return {"ok": False, "reason": f"agent_admin_turn: import failed: {exc}"}
 
-    agent_config.clear_pooled_credentials()
-
-    def refuse_before_run(reason: str, **extra: Any) -> dict[str, Any]:
-        _clear_chudware_run_credentials(agent_config)
-        return {"ok": False, "reason": reason, **extra}
-    raw_actor = raw_params.get("_chudware_actor")
-    if in_cell():
-        if any(key in raw_params for key in ("api_key", "web_credential", "byok_key",
-                                             "web_provider_grant")):
-            return refuse_before_run("credential_isolation_unsupported",
-                                     code="credential_isolation_unsupported")
-        if not isinstance(raw_actor, dict) or raw_actor.get("key_source") != "byok":
-            return refuse_before_run("credential_isolation_unsupported",
-                                     code="credential_isolation_unsupported")
-    if raw_actor is None:
-        credit_actor = None
-    else:
-        if not isinstance(raw_actor, dict):
-            return refuse_before_run("invalid_chudware_actor")
-        if str(raw_actor.get("key_source") or "").strip().lower() not in {
-            "byok", "subscription", "pool"
-        }:
-            return refuse_before_run("web_credential_source_invalid")
-        try:
-            credit_actor = agent_config.Actor.from_mapping(raw_actor)
-        except ValueError:
-            return refuse_before_run("invalid_chudware_actor")
-    if credit_actor is not None and credit_actor.key_source != "byok" and raw_params.get("api_key") is not None:
-        return refuse_before_run("web_credential_source_invalid")
+    def refuse_before_run(reason: str) -> dict[str, Any]:
+        return {"ok": False, "reason": reason}
 
     cfg = dict(agent_config.load_config() or {})
     from services.agent.role_models import resolve_role_model
 
     byok_key = raw_params.get("api_key")
-    if not in_cell() and credit_actor is not None and credit_actor.key_source == "byok":
-        if not isinstance(byok_key, str) or not byok_key.strip():
-            return refuse_before_run("BYOK provider credential unavailable")
-    web_credential = None
-    web_provider = ""
-    web_provider_grant = None
-    if in_cell():
-        from services.agent.chudcode_host import _CELL_PROVIDER_BASES, _cell_provider_grant
-        web_provider = param_str("provider").lower()
-        if web_provider not in _CELL_PROVIDER_BASES:
-            return refuse_before_run("byok_unsupported_online")
-        if not param_str("model"):
-            return refuse_before_run("web_model_required")
-        try:
-            web_provider_grant = _cell_provider_grant({
-                "web_provider_grant": raw_params.get("provider_grant"),
-            })
-        except ValueError as exc:
-            return refuse_before_run(str(exc), code=str(exc))
-    elif credit_actor is not None:
-        source = credit_actor.key_source
-        if source == "subscription":
-            grant = raw_actor.get("_subscription")
-            if not isinstance(grant, dict):
-                return refuse_before_run("invalid_subscription_grant")
-            web_provider = str(grant.get("provider") or "").strip().lower()
-            web_credential = grant.get("access_token")
-            if web_provider != "anthropic-sub":
-                return refuse_before_run("subscription_isolation_unsupported")
-            proof = raw_actor.get("_subscription_token_sha256")
-            failure = "subscription_credential_mismatch"
-        elif source == "pool":
-            pool = raw_actor.get("_pool")
-            if not isinstance(pool, dict) or not str(pool.get("api_key") or "").strip():
-                return refuse_before_run(
-                    "pool_credential_unconfigured",
-                    hint="The managed AI pool is not configured. Contact the site operator or connect your own provider.",
-                )
-            web_provider = str(pool.get("provider") or "").strip().lower()
-            web_credential = pool.get("api_key")
-            proof = raw_actor.get("_pool_key_sha256")
-            failure = "pool_credential_mismatch"
-        else:
-            web_provider, web_credential = param_str("provider").lower(), byok_key
-            proof = raw_actor.get("_byok_key_sha256")
-            failure = "byok_credential_mismatch"
-        if not param_str("provider") or not param_str("model"):
-            return refuse_before_run("web_model_required")
-        if source == "subscription":
-            if param_str("provider").lower() not in {"anthropic", "anthropic-sub", "claude"}:
-                return refuse_before_run("subscription_credential_mismatch")
-        elif param_str("provider").lower() != web_provider:
-            return refuse_before_run(failure)
-        if not isinstance(web_credential, str) or not web_credential.strip():
-            return refuse_before_run(failure)
-        actual = hashlib.sha256(web_credential.encode("utf-8")).hexdigest()
-        if not isinstance(proof, str) or not hmac.compare_digest(proof, actual):
-            return refuse_before_run(failure)
-    if byok_key is not None and (
-        not isinstance(byok_key, str) or not byok_key.strip()
-        or (credit_actor is not None and not (param_str("provider") and param_str("model")))
-    ):
+    if byok_key is not None and (not isinstance(byok_key, str) or not byok_key.strip()):
         return refuse_before_run("byok_unsupported_online")
     try:
         (turn_preferences, provider_name, model_name, assignment,
          auto_candidates) = resolve_model_and_effort(
-            request, raw_params, cfg, credit_actor, byok_key,
+            request, raw_params, cfg, byok_key,
             _chudcode_transient_call, _auth_providers,
         )
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -3635,10 +3509,6 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
     resumed_session = bool(param_str("chudcode_session_file"))
     with _HISTORY_SEED_LOCK:
         history_already_seeded = scoped_key(session_id) in _HISTORY_SEEDED_SESSIONS
-    migration_candidate = (
-        "" if resumed_session or history_already_seeded
-        else _bounded_history_seed(raw_params.get("history"))
-    )
     options = {"project_dir": project_root} if project_root else {}
     options.update({"mode": turn_preferences.mode,
                     "advisor": turn_preferences.advisor,
@@ -3658,41 +3528,15 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
     if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool):
         if math.isfinite(raw_timeout) and raw_timeout > 0:
             budget_s = float(raw_timeout)
-    # Rendered once: resolving picked context reads the engine, and the preflight estimate
-    # must price exactly the text that is sent. A persisted conversation's first turn in this
-    # process leads with the live document ids: its transcript's ids died with the old engine.
+    # Rendered once: resolving picked context reads the engine. A persisted
+    # conversation's first turn in this process leads with the live document ids:
+    # its transcript's ids died with the old engine.
     editor_block = "\n\n".join(block for block in (
         _resumed_documents_block()
         if resumed_session and not history_already_seeded else "",
         _editor_context_block(raw_params),
         turn_budget_notice(budget_s, readonly=readonly_turn),
     ) if block)
-    preflight_prompt = compose_request_text(request, migration_candidate, editor_block)
-    try:
-        configured_max_tokens = max(0, int(cfg.get("max_output_tokens") or 0))
-    except (TypeError, ValueError):
-        configured_max_tokens = 0
-    turn_max_tokens = configured_max_tokens or 8192
-    credit_preflight: dict[str, Any] | None = None
-    if credit_actor is not None and credit_actor.key_source == "pool":
-        prompt_estimate = max(1, math.ceil(len(preflight_prompt.encode("utf-8")) / 4))
-        if credit_actor.rated_model and credit_actor.rated_model != model_name:
-            return refuse_before_run("insufficient_credits")
-        credit_preflight = agent_config.pooled_credit_preflight(
-            credit_actor,
-            prompt_tokens_estimate=prompt_estimate,
-            max_output_tokens=turn_max_tokens,
-        )
-        if not credit_preflight.get("ok"):
-            return refuse_before_run("insufficient_credits")
-        approved_output_tokens = max(
-            0, int(credit_preflight.get("max_output_tokens") or 0)
-        )
-        # RPC v2 has no per-turn output-cap field.  A reduced admission cannot
-        # be enforced downstream, so fail closed rather than overspend the
-        # gateway's reservation while pretending the smaller cap was applied.
-        if approved_output_tokens < turn_max_tokens:
-            return refuse_before_run("insufficient_credits")
 
     try:
         from services.agent.chudcode_events import RpcFrameState, map_rpc_frame
@@ -3727,7 +3571,6 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
             capability=turn_capability,
             tier=turn_tier,
             options=options or None,
-            chudware_actor=credit_actor,
         )
         system_prompt, allowed_tools = role_prompt(
             role,
@@ -3755,7 +3598,6 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
         "capability": turn_capability,
         "tier": turn_tier,
         "actor": role,
-        "chudware_actor": credit_actor,
         "ledger": getattr(mission_dispatch, "ledger", None),
         "run_id": run_id,
         # The skill-injection dedupe key: a trigger-matched skill body is
@@ -3809,18 +3651,7 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
         "attachments": attachments,
         "register_callbacks": register_callbacks,
     }
-    if credit_actor is not None:
-        host_params.update(
-            web_actor=True,
-            web_key_source=credit_actor.key_source,
-            web_provider=web_provider,
-            web_tenant=current_context()["actor_key"] if in_cell() else credit_actor.email,
-        )
-        if in_cell():
-            host_params["web_provider_grant"] = web_provider_grant
-        else:
-            host_params["web_credential"] = web_credential
-    elif byok_key is not None:
+    if byok_key is not None:
         host_params.update(
             byok_key=byok_key,
             byok_provider=provider_name,
@@ -3850,9 +3681,6 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
         host_params["interactive_questions"] = True
     if budget_s is not None:
         host_params["timeout"] = budget_s
-    if in_cell():
-        for key in ("chudcode_session_dir", "chudcode_session_file", "sessions_dir"):
-            host_params.pop(key, None)
 
     event_context = {
         "run_id": run_id,
@@ -3871,13 +3699,6 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
                 dict(payload) if isinstance(payload, Mapping) else {"payload": payload}
             )
             data["kind"] = kind
-            if in_cell():
-                data.pop("chudcode_session_file", None)
-                if "chudcode_session_id" in data:
-                    data["chudcode_session_id"] = session_id
-                if (kind == "run_finished" and raw.get("reason") == "manager_stop"
-                        and isinstance(raw.get("control_delegate"), Mapping)):
-                    data["control_delegate"] = dict(raw["control_delegate"])
             if kind == "agent.provider_usage":
                 token_usage.record_usage(
                     provider=str(data.get("provider") or ""),
@@ -3887,13 +3708,12 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
                     total_tokens=data.get("total_tokens"),
                     context_tokens=data.get("context_tokens"),
                     source=str(data.get("source") or "api"),
-                    actor=credit_actor,
                 )
             _emit(data)
 
-    turn_env = activate_turn_env(project_root, save_dir, agent_config)
+    turn_env = bind_roots(project_root, save_dir)
     try:
-        restore_errors = turn_env.__enter__()
+        turn_env.__enter__()
     except Exception as exc:  # noqa: BLE001
         if claimed_history_seed:
             with _HISTORY_SEED_LOCK:
@@ -3908,7 +3728,7 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
         from services.agent import subagent_registry
 
         sessions_dir = param_str("sessions_dir")
-        if sessions_dir and session_id and not in_cell():
+        if sessions_dir and session_id:
             subagent_registry.bind_session(
                 session_id, str(Path(sessions_dir) / f"{session_id}.subagents")
             )
@@ -3976,7 +3796,7 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
                 "completed actions.", "", turn_budget_notice(remaining, readonly=readonly_turn))
             host_result = chudcode_agent_turn(host_params, raw_emit)
         if not host_result.get("ok"):
-            response = _cell_refusal(host_result) or {
+            response = {
                 "ok": False,
                 "reason": str(host_result.get("reason") or "Agent turn failed"),
             }
@@ -4000,15 +3820,9 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
                 "terminal": host_result.get("terminal"),
                 "cancelled": cancelled,
             }
-            if in_cell():
-                turn.pop("chudcode_session_file", None)
-                turn["chudcode_session_id"] = session_id
-                if host_result.get("stop_reason") == "manager_stop":
-                    turn["stop_reason"] = "manager_stop"
-                    turn["control_delegate"] = dict(host_result["control_delegate"])
             response = {"ok": True, "turn": turn}
     except Exception as exc:  # noqa: BLE001 - crash path still persists documents
-        response = _cell_refusal(exc) or {
+        response = {
             "ok": False,
             "reason": f"agent_admin_turn failed: {type(exc).__name__}: {exc}",
         }
@@ -4053,23 +3867,11 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
             )
             finalization_errors.append(f"persistence: {reason}")
         turn_env.__exit__(None, None, None)
-        finalization_errors.extend(restore_errors)
 
         response["persistence"] = persistence
         response["usage"] = usage
-        credit_summary = None
-        if credit_preflight is not None:
-            credit_summary = {
-                "preflight": "approved",
-                "estimated_credits": int(
-                    credit_preflight.get("estimated_credits") or 0
-                ),
-            }
-            response["credit"] = credit_summary
         if isinstance(response.get("turn"), dict):
             response["turn"]["usage"] = usage
-            if credit_summary is not None:
-                response["turn"]["credit"] = credit_summary
         if finalization_errors:
             response["finalization_errors"] = finalization_errors
             joined = "; ".join(finalization_errors)

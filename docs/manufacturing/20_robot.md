@@ -1,7 +1,7 @@
 # Manufacturing Robot Architecture — ROS 2 / MoveIt Offline Planning
 
-Design-only. No repository file was edited, no build/test/gate/git command was run.
-Authority: `local://manufacturing-decisions.md` + `local://manufacturing-dod-v4.md` (v4 supersedes
+Design-only.
+Authority: `00_decisions.md` + `01_definition_of_done.md` (v4 supersedes
 every earlier amendment). Path ruling applied: production GUI only under
 `host/src/ui/manufacture/**`; cross-domain service root `services/manufacturing/**`; domain engines
 `core/<domain>/**`; RPC/events stay `mfg_*` / `mfg.*`; `host/src/ui/cam/**` remains offline-CAM
@@ -9,7 +9,7 @@ owner and is touched only through named seams.
 
 Evidence base actually read: `core/mate/mate.h`, `services/mcp/server.py`,
 `services/mcp/tool_registry.py`, `host/src/ui/viewport_panel.cpp`, `contracts/worker_rpc.md`,
-`agent://TwinReuseAudit`, `agent://ManufacturingBreadth`. Two supporting reads were taken to make
+the twin-reuse audit and the manufacturing-breadth research. Two supporting reads were taken to make
 file/API claims exact rather than guessed: `host/src/ui/cam/cam_mirror.h`,
 `host/src/render/overlays.h` (declarations only), `contracts/cam.md`, `contracts/events.md`,
 `contracts/licenses.md` (BOM table shape). Anything not directly observed is marked
@@ -63,7 +63,7 @@ versioned cell document, models frames/TCP/payload with explicit provenance, com
 reachability / singularity / collision, generates and previews a time-parameterised trajectory,
 exports that trajectory as a **non-executable** offline artifact, and optionally cross-checks
 itself against a user-installed ROS 2/MoveIt sidecar plus a `ros2_control` **mock-controller** CI
-run. It has **no command path to any robot**, at any layer, by construction. `ManufacturingBreadth`
+run. It has **no command path to any robot**, at any layer, by construction. The manufacturing-breadth research
 placed ROS 2/MoveIt in the `NEXT` tranche as *"URDF/SRDF import, reachability/collision analysis,
 trajectory preview/export and mock-controller CI ... keep all physical execution behind the vendor
 robot controller and independent safety system until Later"*. This design implements exactly that
@@ -97,15 +97,15 @@ Rationale, each point traceable:
   execution remains a separate service/process boundary. Putting the robot kernel in Python means
   there is *no* new exported native symbol to argue about and *no* new native target.
 - **DoD #1**: `scripts/gate.sh` must be green with SKIPs only for documented absent prerequisites,
-  and per Main's final ruling this wave adds **no new normal-gate SKIP at all** (`GW-ZERO-NEW-SKIP`). A hermetic Python
+  and per the final project ruling this wave adds **no new normal-gate SKIP at all** (`GW-ZERO-NEW-SKIP`). A hermetic Python
   kernel with numpy (already a BOM dependency) needs neither OCCT, nor emsdk, nor a twin binary,
   nor ROS. Stages E0–E3 are dependency-free by construction (E3's cross-check runs from a recorded
   transcript fixture, not a binary). The live ROS sidecar runs **only** from the opt-in
   `scripts/qualify_robot_e3.sh`, which `gate.sh` never calls — and
   `test_qualification_not_in_gate.py` asserts that.
 - **DoD #17 / licence posture**: zero new bundled or linked dependency, so nothing new enters the
-  commercial core's licence surface. ROS/MoveIt stay entirely subprocess-side.
-- **TwinReuseAudit** explicitly warns against reusing `solve_mates` as a runtime integrator
+  core libraries' licence surface. ROS/MoveIt stay entirely subprocess-side.
+- **The twin-reuse audit** explicitly warns against reusing `solve_mates` as a runtime integrator
   ("*Reuse the transform/residual math, not `solve_mates` as the runtime plant integrator*"). We
   reuse the **rotation formulation**, not the solver.
 
@@ -125,7 +125,7 @@ second rotation convention.
 fixed-axis XYZ convention, i.e. `R = Rz(yaw) · Ry(pitch) · Rx(roll)`. The importer composes that
 matrix, converts it via `mat_to_rotvec`, multiplies translations by 1000, and records
 `unit_source:"m"`, `rotation_source:"urdf_rpy_fixed_xyz"` on every frame. Downstream code sees only
-mm + rotvec. `TwinReuseAudit` mismatch #5 (frame/unit incompatibility) is closed by this single
+mm + rotvec. Twin-reuse audit mismatch #5 (frame/unit incompatibility) is closed by this single
 normalisation point, not by scattered conversions.
 
 ### 2.2 Tier B — optional out-of-process ROS 2 / MoveIt sidecar
@@ -156,7 +156,7 @@ services/manufacturing/robot/sidecar_ros/          # ament_cmake package `chudwa
   mismatch is a refusal, not a degradation.
 - **What it may do**: propose plans and run a mock controller. **What it may not do**: be the sole
   source of any gate-passing evidence, and be advertised as anything above `simulate`.
-  `ManufacturingBreadth` records MoveIt's own docs saying collision/smoothing checks *can be
+  The manufacturing-breadth research records MoveIt's own docs saying collision/smoothing checks *can be
   disabled* and that normal Linux is not well suited to hardware control; a planner collision check
   is not a safety-rated protective function.
 - **MoveIt Servo is excluded outright** — it is a realtime streaming controller, i.e. exactly the
@@ -169,7 +169,7 @@ services/manufacturing/robot/sidecar_ros/          # ament_cmake package `chudwa
 
 ### 2.3 Tier C — vendor controller + safety system
 
-Outside the product. `ManufacturingBreadth`: ISO 10218-2:2025 puts cell-level risk assessment on
+Outside the product. Per the manufacturing-breadth research, ISO 10218-2:2025 puts cell-level risk assessment on
 the **application/cell integrator**; ROS-Industrial's own framing is that it *combines* ROS
 high-level capability with the low-level reliability and safety of industrial controllers rather
 than replacing them. Section 8 below states the enforcement mechanisms that keep Tier C
@@ -253,7 +253,7 @@ struct RobotBackplot {
 | `services/mcp/tool_registry.py` | **not edited by robot** — the two `_RISK_OVERRIDES` rows (`:64-70`) are handed to Gateway, sole owner of this file's risk-class edit for the batch (`GW-RISK-TABLE-OWNER`) | See §5.2 — two tools persist artifacts and must be tightened to `RISK_WRITE` despite read-shaped names; five concurrent appenders would each break the others' unchanged-`classify_risk` assertion. |
 | `services/agent/config.py` | **not edited by robot.** The edit is exactly as analysed in §3.7 — **+1 entry** in `DEFAULT_TOOL_FAMILIES` (`:589-593`) and **+1 new** `DEFAULT_OFF_TOOL_FAMILIES = ("manufacture",)` consulted in the `else` branch of `get_tool_families` (`:1004-1005`) — but it is **Gateway-owned in W1.1** and lands before any MCP wave (`GW-FAMILY-MANUFACTURE`) | **Required, not cosmetic** — see the trap in §3.7. Robot's wave is not first, so robot cannot own the file that decides whether *every* domain's surface ships enabled. |
 | `host/CMakeLists.txt` | **+2 source entries** (`robot_panel.cpp`, `robot_mirror.cpp`) | No new target, no new dependency, no new link, no C ABI symbol. Top-level/root CMake is untouched. |
-| `services/worker_main.py` (or the doc-worker method registry that consumes `WORKER_METHODS`) | **+1 registration line** for `services.manufacturing.robot.worker_methods.WORKER_METHODS` | Same idiom `contracts/worker_rpc.md:251` documents for `drawing.WORKER_METHODS`. `[TO CONFIRM]` the exact registration call site in `services/worker_main.py`; the pattern is contract-documented, the line number is not in my read scope. |
+| `services/worker_main.py` (or the doc-worker method registry that consumes `WORKER_METHODS`) | **+1 registration line** for `services.manufacturing.robot.worker_methods.WORKER_METHODS` | Same idiom `contracts/worker_rpc.md:251` documents for `drawing.WORKER_METHODS`. `[TO CONFIRM]` the exact registration call site in `services/worker_main.py`; the pattern is contract-documented, the line number was not read for this design. |
 
 ### 3.6 New — fixtures (synthetic, project-owned)
 
@@ -282,7 +282,7 @@ keeps the licence BOM empty of third-party robot data.
 
 ### 3.7 The tool-family trap, and the two scripts
 
-Main's ruling is that the shared `manufacture` family is **OFF by default until commissioning**.
+The project ruling is that the shared `manufacture` family is **OFF by default until commissioning**.
 Reading `services/agent/config.py` shows that is *not* achievable by omission, and the reason is
 worth stating because getting it wrong ships an enabled manufacturing surface:
 
@@ -386,7 +386,7 @@ and `declared` evidence — which is exactly why no robot artifact can pass an e
 }
 ```
 
-**Frame graph is a graph with provenance**, per `ManufacturingBreadth` abstraction #2. A frame whose
+**Frame graph is a graph with provenance**, per abstraction #2 of the manufacturing-breadth research. A frame whose
 `provenance` is `declared` can be composed and previewed, but every *accuracy* claim derived from
 it is labelled `advisory` and cannot satisfy any gate — see §6.3.
 
@@ -412,7 +412,7 @@ is the difference between an honest planner and a fabricated one.
 ```
 
 `indeterminate` is a first-class outcome, never rounded into a boolean. This is the direct answer
-to `TwinReuseAudit`'s determinism finding that borderline `floor/ceil` + libm rounding can flip
+to the twin-reuse audit's determinism finding that borderline `floor/ceil` + libm rounding can flip
 counts between builds.
 
 ### 4.3 `aicad.robot_analysis/1`
@@ -506,7 +506,7 @@ likewise. A field that says "we did not check this" is worth more than a silent 
 ```
 
 The `proves` / `does_not_prove` pair is machine-readable and rendered in the GUI verbatim.
-`ManufacturingBreadth` cites the `ros2_control` docs calling mock components *"trivial
+The manufacturing-breadth research cites the `ros2_control` docs calling mock components *"trivial
 simulations"* with ideal command-to-state mirroring; encoding that in the artifact stops a green
 mock run from silently becoming a competence claim.
 
@@ -541,7 +541,7 @@ obvious next one": `mfg_robot_jog`, `mfg_robot_home`, `mfg_robot_enable`, `mfg_r
 ### 5.2 MCP tools — family `"manufacture"`
 
 Registered `register_robot_tools(_reg.view(mcp, "manufacture"))` — the single shared family for the
-whole manufacturing overhaul, per Main's final ruling: the wire prefix stays `mfg_*` / `mfg.*`, but
+whole manufacturing overhaul, per the final project ruling: the wire prefix stays `mfg_*` / `mfg.*`, but
 the user-facing/config family id is the existing product term **Manufacture**. The family is OFF by
 default, and default-off is established by the Gateway-owned `services/agent/config.py` edit in W1.1,
 not by this registration (`GW-FAMILY-MANUFACTURE`, §3.7). Risk classes verified
@@ -682,12 +682,12 @@ if (ui::robotTcpPoseAt(t, tcp)) st.overlays->drawCamToolMarker(renderer.camera()
 ```
 
 `[TO CONFIRM]` the exact palette role names beyond `camRapid`/`camCut`/`camLead`/`camStock`/
-`camTool`/`simMesh`/`accent`, all of which I observed in `viewport_panel.cpp:2567-2640`. If a
+`camTool`/`simMesh`/`accent`, all of which are observed in `viewport_panel.cpp:2567-2640`. If a
 dedicated robot role set is wanted, it is a `ui::Palette` append, not a renderer change.
 
 Ribbon: a **Robot** group on the existing Manufacture tab (Import Cell · Reach · Analyse · Plan ·
 Export · Mock Run · Capability). `[TO CONFIRM]` the Manufacture ribbon registration file — reading
-ribbon sources was outside my assigned read set. The requirement is fixed: no ribbon control is
+ribbon sources was outside the read set for this design. The requirement is fixed: no ribbon control is
 named or behaves like jog / home / enable / start / stop / reset.
 
 ---
@@ -797,7 +797,7 @@ one, so it must be **both** journaled and wrapped. Wrapping changes only what a 
 device-side levels stay `unsupported` with a `why` whatever envelope carries them, and no envelope field
 can raise a level (`GW-PF-SCOPE-4`, `GW-EMULATOR-CEILING`).
 
-**There is no `probed` robot row, and this design does not claim one.** My earlier draft asserted
+**There is no `probed` robot row, and this design does not claim one.** An earlier draft asserted
 `src:"probed"` for "procedural fact" rows. `GW-SRC-3` makes that structurally impossible,
 not merely discouraged: `probed` is settable only by transport code inside the daemon holding an
 open `ITransport`, so a pure-Python domain **cannot** produce probed evidence. The correction
@@ -853,7 +853,7 @@ machine_class[]}, why, missing_level?, remedy[]}`.
 to a class is **omitted** from that class's required set, never marked `not_applicable`. T0-R9's
 empty `remedy[]` is the honest encoding of "out of scope", and T0-R10 is the honest shape: a
 declared TCP is perfectly usable for previewing motion; what it cannot do is back a numeric accuracy
-assertion. `ManufacturingBreadth` cites NIST that traceability is a documented unbroken calibration
+assertion. The manufacturing-breadth research cites NIST that traceability is a documented unbroken calibration
 chain with uncertainty, and that traceability alone does not establish fitness for purpose.
 
 ### 6.4 Two-stage gates (DoD #5, #7, #8, #14, #21, #22)
@@ -981,11 +981,11 @@ leaving its old fact standing would keep a level `verified` after the check it c
 `robot_capability` is an **eighth kind added on this ruling** (`GW-CAP-KIND-REQUIRED`), and finding it was the point of the
 invariant. `robot.capability` is a `FreshValue` row a UI paints — journaled **and** published wrapped with
 `ttl_ms:null` per §6.2 — and `mfg.robot.capability_changed` is its event, so under DoD #10 it is a
-durable gateway-stamped result — my first seven kinds simply
+durable gateway-stamped result — the first seven kinds simply
 missed it, and an unregistered kind is refused `mfg_unregistered_result_kind` at append time. It is
 registered with `supersede_with_parent:false`, matching the `*capability` invariant.
 
-**One correction to what I submitted, and it is the substantive half of `GW-CAP-DERIVED-FROM-EVIDENCE`.** I first declared
+**One correction to the original submission, and it is the substantive half of `GW-CAP-DERIVED-FROM-EVIDENCE`.** The first draft declared
 `robot_capability.derived_from = [robot_cell]`, and Gateway accepted it as submitted. That is wrong,
 and `GW-CAP-DERIVED-FROM-EVIDENCE` is the stricter and correct reading: `derived_from` must be **the evidence rows the
 report cites**. With only `[robot_cell]`, falsifying a `robot_analysis` row would leave the
@@ -1067,7 +1067,7 @@ imports `synth6r`, builds a 25 mm reach map, plans a 4-goal mixed joint/Cartesia
 collision + singularity, exports all three formats, then prints the capability table, the Tier-0
 register, the Stage-1/Stage-2 gate table, the emitted `mfg.robot.*` event list, and the quantised
 `state_hash`. Requires numpy and trimesh only. This is what gets run to prove the wave works, and
-it is the artifact to paste into the wave's `docs/REFACTOR_LOG.md` entry (DoD #20).
+it is the evidence block for the wave's change summary (DoD #20).
 
 ---
 
@@ -1092,7 +1092,7 @@ Not a policy paragraph — six enforcement mechanisms, each independently testab
    named, because emitting a controller-executable program *is* an execute claim regardless of
    whether we transmit it.
 5. **Safety functions are not ours.** `safety_integration` is `unsupported` with
-   `why:"cell_integrator_owns_iso10218_2_risk_assessment"`. Per `ManufacturingBreadth`, ISO
+   `why:"cell_integrator_owns_iso10218_2_risk_assessment"`. Per the manufacturing-breadth research, ISO
    10218-2:2025 puts integration/commissioning/operation risk on the application integrator, and
    MoveIt collision avoidance is planning software — not a safety-rated monitored stop, speed-and-
    separation monitor, or power/force-limiting function. The GUI may **display** a safety envelope
@@ -1122,32 +1122,32 @@ unexplained gap.
 
 ## 9. Licence BOM
 
-Style matches `contracts/licenses.md:32-33`.
+Postures follow `contracts/licenses.md`.
 
 ### 9.1 Bundled / linked / in-process — new dependencies: **none**
 
 | dependency | licence | role | posture |
 |---|---|---|---|
-| numpy | BSD-3 | linear algebra: Jacobian, SVD, damped least squares | ok — **already in BOM** (`licenses.md:45`); no new dep |
-| trimesh | MIT | URDF-referenced STL/OBJ/DAE mesh load → triangle soup | ok — **already in BOM** (`licenses.md:37`), already the mesh-import lane |
-| networkx | BSD-3 | transitive `trimesh` scene-graph dep for multi-mesh DAE/OBJ | ok — **already in BOM** (`licenses.md:38`) |
+| numpy | BSD-3 | linear algebra: Jacobian, SVD, damped least squares | ok — **already in the ledger**; no new dep |
+| trimesh | MIT | URDF-referenced STL/OBJ/DAE mesh load → triangle soup | ok — **already in the ledger**, already the mesh-import lane |
+| networkx | BSD-3 | transitive `trimesh` scene-graph dep for multi-mesh DAE/OBJ | ok — **already in the ledger** |
 | `xml.etree.ElementTree` | PSF (stdlib) | URDF/SRDF XML parse, DTD/entity resolution disabled | ok — stdlib, no dep. Hardening is asserted by `test_urdf_import.py` |
-| `nlohmann::json` | MIT | `RobotMirror` JSON parse in the host | ok — **already in BOM** (`licenses.md:53`) |
-| URDF / SRDF **formats** | specification, not code | interchange | ok — **clean-room parser**. Same posture as the KiCad / BOLTS / IPC-7351 rows (`licenses.md:76-77`): we implement the documented format; no `urdfdom`, `srdfdom`, or reference-parser code enters the tree |
+| `nlohmann::json` | MIT | `RobotMirror` JSON parse in the host | ok — **already in the ledger** |
+| URDF / SRDF **formats** | specification, not code | interchange | ok — **clean-room parser**. Same posture as the ledger's KiCad / BOLTS / IPC-7351 rows: the documented format is implemented; no `urdfdom`, `srdfdom`, or reference-parser code enters the tree |
 
 The core kernel therefore ships with **zero new licence surface**. That is the primary reason Tier A
 is Python + numpy rather than a new native target with a C++ XML and collision dependency chain.
 
 ### 9.2 Optional, subprocess-only, never bundled and never linked (Tier B)
 
-Isolation policy identical to the existing ngspice / pandoc / LibreDWG / OpenMVS rows
-(`licenses.md:42,66,73,79-80`): PATH- or env-discovered, user-installed, never vendored, never
+Isolation policy identical to the existing ngspice / pandoc / LibreDWG / OpenMVS rows in
+`contracts/licenses.md`: PATH- or env-discovered, user-installed, never vendored, never
 imported in-process, absence degrades honestly.
 
 | dependency | licence | role | posture |
 |---|---|---|---|
 | ROS 2 core (`rclcpp`, `rcl`, `rmw`) | Apache-2.0 | sidecar runtime | **subprocess-only** via `CHUDWARE_ROS_SIDECAR_BIN`; never bundled/linked. A full ROS distro is a package-by-package BOM — see §9.4 |
-| MoveIt 2 | BSD-3-Clause | sidecar planners (OMPL pipeline) for cross-check | subprocess-only. `ManufacturingBreadth` verified BSD-3 and that MoveIt targets open commercial manipulation |
+| MoveIt 2 | BSD-3-Clause | sidecar planners (OMPL pipeline) for cross-check | subprocess-only. The manufacturing-breadth research verified BSD-3 and that MoveIt targets open commercial manipulation |
 | `ros2_control` / `controller_manager` / `hardware_interface` | Apache-2.0 | mock-component CI run | subprocess-only |
 | `urdfdom` / `urdfdom_headers` | BSD-3-Clause | sidecar-side URDF parse (ours stays clean-room) | subprocess-only |
 | OMPL | BSD-3-Clause | sampling planners inside MoveIt | subprocess-only |
@@ -1214,8 +1214,8 @@ content is specified so the integrator appends rather than designs.
 4. **`contracts/licenses.md`** — append §9.1–9.3 rows.
 5. **`scripts/gate.sh`** — **no change requested. This wave adds no new SKIP.** E0–E3 are
    hardware-free (E3 runs from the committed transcript fixture), and the live sidecar path lives
-   only in `scripts/qualify_robot_e3.sh`, which `gate.sh` never calls. My earlier request for a
-   `CHUDWARE_ROS_SIDECAR_BIN` SKIP is **withdrawn** per Main's ruling; the DoD #1 SKIP list is
+   only in `scripts/qualify_robot_e3.sh`, which `gate.sh` never calls. The earlier request for a
+   `CHUDWARE_ROS_SIDECAR_BIN` SKIP is **withdrawn** per the project ruling; the DoD #1 SKIP list is
    unchanged (OCCT / runtime venv / emsdk / `CHUDWARE_SLICER_BIN` / optional twin binary).
 6. **Gateway-owned types and RPCs — consumed, never redefined.** `core/device/capability.h`
    (`CapabilityTruth`, `CapabilityReport`), `core/manufacturing/tier0.h` (the PREREQ row),
@@ -1236,7 +1236,7 @@ content is specified so the integrator appends rather than designs.
 7. **Root `CMakeLists.txt` / public C ABI** — **no change requested.** No `mfg_*` symbol, no new
    native target, no new link dependency (DoD #16). The only CMake edit anywhere is two source
    entries in the existing host target.
-8. **`docs/REFACTOR_LOG.md` + maintained skills/maps** — appended in the same green commit as the
+8. **As-built map (`docs/manufacturing/README.md`) + developer docs** — updated in the same green commit as the
    wave (DoD #20), with the `smoke_offline` output as the evidence block.
 
 ---
@@ -1279,14 +1279,14 @@ content is specified so the integrator appends rather than designs.
     declared guard band and a declared sample density. Between-sample penetration is possible and is
     stated in the artifact, not hidden.
 12. **Bitwise cross-platform determinism.** Tolerance-bounded determinism with quantised hashing is
-    the contract (§6.4 `robot_determinism_replay`); `TwinReuseAudit` decision 3 is answered
+    the contract (§6.4 `robot_determinism_replay`); the twin-reuse audit's decision 3 is answered
     explicitly rather than left ambient.
 13. **Any physical robot pilot, dry run, or commissioning stage.** Emulator ceiling is E3; E4–E6 are
     not reached and not claimed.
 
 ---
 
-## 12. Decisions for Hunter (each has a working default already applied)
+## 12. Design decisions (each has a working default already applied)
 
 1. **Tier A language.** Default applied: Python + numpy, keeping the C ABI free of `mfg_*` symbols
    (DoD #16) and the BOM free of new dependencies. Alternative: a `core/robot/**` C++ kernel — which
@@ -1298,32 +1298,32 @@ content is specified so the integrator appends rather than designs.
 3. **Fixtures.** Default applied: fully synthetic, project-owned, zero vendored robot descriptions.
    Alternative: vendor BSD-3 descriptions for realism, at the cost of BOM rows and a borrowed FK
    oracle.
-4. **MCP family name — SETTLED by Main, not open.** Single shared family id `manufacture` for the
+4. **MCP family name — SETTLED, not open.** Single shared family id `manufacture` for the
    entire overhaul, **off by default** until commissioning; wire prefixes stay `mfg_*` / `mfg.*`.
    §3.7 documents the two `config.py` edits that make "off by default" actually true, because
    omission alone leaves the family enabled.
 5. **Sidecar source location.** Default applied: in-tree at
    `services/manufacturing/robot/sidecar_ros/**`, colcon-built by the user, never built or shipped
    by us. Alternative: a separate repository, which loses in-repo auditability of the boundary.
-6. **Gate posture — SETTLED by Main, not open.** No new normal-gate SKIP. E3 is reached in the
+6. **Gate posture — SETTLED, not open.** No new normal-gate SKIP. E3 is reached in the
    normal gate via the committed sidecar transcript; only E3-live needs the binary, and it runs from
    the opt-in qualification script.
 
 ---
 
-## 13. Loose ends I could not close from my read scope
+## 13. Loose ends not closed within this design's read scope
 
 Marked so nobody mistakes them for verified facts.
 
 - `[TO CONFIRM]` the `services/worker_main.py` registration call site for a `WORKER_METHODS` module. The
-  idiom is contract-documented (`contracts/worker_rpc.md:251`); the exact line is not in my read set.
+  idiom is contract-documented (`contracts/worker_rpc.md:251`); the exact line was not read.
 - `[TO CONFIRM]` the Manufacture ribbon group registration file, and whether a robot-specific
-  `ui::Palette` role set is preferred over reusing the CAM roles I observed at
+  `ui::Palette` role set is preferred over reusing the CAM roles observed at
   `viewport_panel.cpp:2567-2640`.
 - `[TO CONFIRM]` the host C++ test registration seam for `test_robot_mirror.cpp`.
 - `[INFERENCE]` the Pilz planner and `rosbag2` package licences in §9.2 — both must be verified by
   SBOM scan of the actually installed ROS packages at integration, not accepted from this document.
-- Peer boundaries, agreed over IRC and reflected above: `GatewayDesignRecovery` owns
+- Peer boundaries, agreed with the peer workstreams and reflected above: `GatewayDesignRecovery` owns
   `CapabilityTruth` / `CapabilityReport`, the Tier-0 PREREQ row type and totality check,
   `journal_client.py`, durable `seq` stamping, `src` derivation, and the `mfg_tier0_* / mfg_event_* /
   mfg_result_*` RPCs — this design composes all of them and redefines none.
@@ -1339,10 +1339,9 @@ Marked so nobody mistakes them for verified facts.
 
 ---
 
-## 14. Review closure — `local://manufacturing-plan-review.md`
+## 14. Review closure — architecture plan review
 
-Every row below is a change **already applied in this document**, not a plan. Design-only: no repository
-file was edited and no git, build, gate, linter, formatter or test command was run to produce it.
+Every row below is a change **already applied in this document**, not a plan.
 
 | finding | applies to robot? | how it is closed here | where |
 |---|---|---|---|

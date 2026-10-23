@@ -1,10 +1,10 @@
-"""Fixed cell/actor loopback transports; only the two own Unix sockets are dialed."""
+"""Fixed cell/actor loopback egress transport; only the cell's own Unix socket is dialed."""
 import socket
 import threading
 from cell_runtime import relay
 
 
-def _start_lane(port, path, *, provider=False):
+def _start_lane(port, path):
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -20,10 +20,7 @@ def _start_lane(port, path, *, provider=False):
         try:
             upstream.settimeout(10)
             upstream.connect(path)
-            # Provider SSE may legitimately pause for any length of time. The
-            # broker owns request bounds, cancellation and revocation, not a TTL.
-            relay(client, upstream, byte_limit=None if provider else 67108864,
-                  idle=None if provider else 120)
+            relay(client, upstream, byte_limit=67108864, idle=120)
         except (OSError, ValueError):
             pass
         finally:
@@ -46,13 +43,5 @@ def _start_lane(port, path, *, provider=False):
 
 
 def start():
-    """Bind both fixed lanes before launching any child; no caller endpoint input."""
-    listeners = []
-    try:
-        listeners.append(_start_lane(18080, "/run/egress.sock"))
-        listeners.append(_start_lane(18081, "/run/provider.sock", provider=True))
-        return listeners
-    except BaseException:
-        for listener in listeners:
-            listener.close()
-        raise
+    """Bind the fixed egress lane before launching any child; no caller endpoint input."""
+    return [_start_lane(18080, "/run/egress.sock")]

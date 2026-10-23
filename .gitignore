@@ -1,149 +1,82 @@
 # Python
 __pycache__/
 *.pyc
+*.egg-info/
 .venv/
 .venv-mcp/
 .pip-cache/
 .deps/
-
-# secrets
-.env
-
-# C++ host build output (parallel agent build dirs included)
-host/build*/
-
-# C++ core build tree (CMake FetchContent deps + binaries; regenerate with cmake)
-# build*/ covers build-linux, build-occt, build-occt-linux, etc.
-core/build*/
-
-# Root-level CMake preset build dirs (CMakePresets linux-core / linux-app → build/linux-*)
-/build/
-
-# Machine-local clangd compilation database / convenience symlink.
-/compile_commands.json
-
-# Test caches
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Generated PNG raster renders (binary).
-# The text SVGs in corpora/render/ are kept for diffable visual reference.
-corpora/render/png/
+# Secrets and local configuration
+.env
+config.json
+
+# OS / editor / tool state
+.DS_Store
+.idea/
+.cache/
+.omp/
+imgui.ini
+
+# C++ build trees (host/build-linux, core/build-linux, core/build-occt-linux, ...)
+host/build*/
+core/build*/
+# CMake preset build dirs (build/<preset>)
+/build/
+# clangd compilation database / convenience symlink
+/compile_commands.json
 
 # Release artifacts (regenerate with services/installer/build_release.py)
 dist/
 
-# Local config / secrets
-config.json
+# Fetched third-party SDKs and prebuilt binaries (provisioned by CMake / fetch scripts)
+third_party/
+OCCT/
+extern/cef/
 
-# This repo's OWN PLM vault — created by any run that treats the repo root as a project
-# (services/plm/gitbind.py VAULT_DIRNAME). It accumulated 3684 files of local object churn
-# before being untracked on 2026-08-27. Per-project vaults live beside their project, never here.
+# Node
+node_modules/
+
+# PLM vault and agent memory created when the repo root is opened as a project
 /.aicadvault/
+.plm/
 
-# Editor / app state
-imgui.ini
-
-# Per-machine MCP client configs (absolute paths) — regenerate with mcp_setup.bat.
-# The portable installer (mcp_setup.bat + services/installer/setup_mcp_clients.py) IS committed.
+# Per-machine MCP client configs (absolute paths); regenerate with
+# services/installer/setup_mcp_clients.py (Windows: mcp_setup.bat)
 /.mcp.json
 /opencode.json
 /.cursor/mcp.json
 /.cursor/mcp.json.disabled
 /.vscode/mcp.json
-# Grok project-scoped MCP config (absolute machine paths) — written by setup_mcp_clients.py
 /.grok/
+*.chudware-bak
 
-# Scratch + spike outputs
+# Scratch and runtime output
 scratch/
-#
-# Runtime outputs must never land at repository root.
 /preflight_events.jsonl
 /runs/
 /*.step+
+benchmarks/simsuite/results/
+tools/flywheel/bench/gym/reports/
+# Machine-local performance baseline written by tools/perf_regression.py
+tools/perf_baseline.json
 
+# Exported CAD files (regenerate via export)
+*.step
+*.stp
 
-# Promotional website (Astro). Source, public/ and the pinned package.json +
-# package-lock.json are tracked; installed deps and build output are not.
+# Promotional website (Astro): source, public/ and package-lock.json are tracked
 website/node_modules/
 website/dist/
 website/.astro/
 website/.wrangler/
 
-# Claude Code project state — CLAUDE.md, settings.json (shared graphify hook),
-# commands/, skills/ ARE tracked (team-shared config); only per-machine state is ignored.
-.claude/settings.local.json
-.claude/worktrees/
-
-# graphify knowledge-graph build output — regenerate locally with `/graphify .` or
-# `graphify update .`; bakes in absolute per-machine paths, never committed (README setup).
-graphify-out/
-
-# work/tools/teamsync.py local state (presence/message side-branch worktree + caches) —
-# team coordination truth lives on git branches, this is just the per-machine mirror.
-work/sync/
-.worksync/
-
-# Large local reference / research drops (kept locally, never committed)
-kicad/
-AI-gooning/
-sldprt reversing/
-.codex/
-_shot_*.png
-
-# Local MCP test-report parts + tester scratch (never committed)
-claude test parts/
-
-# Auto-provisioned OCCT (Open CASCADE) prebuilt binaries — fetched by CMake, never committed
-third_party/
-OCCT/
-
-# Loose build/debug artifacts that land in the repo root (never committed)
-/libtest*.obj
-/chudware_*.log
-/chain_dbg.json
-/session-continuation-prompt-*.txt
-core/build-occt/
-
-# FEA/CFD scratch debug output (logs, stderr/stdout dumps, verification screenshots)
-/fea_*.txt
-/fea_*.png
-
-# Exported CAD persistence (regenerate via export — never committed)
-*.step
-*.stp
-
-# MCP client-config backups (mcp_setup.bat writes these next to the regenerated configs)
-*.chudware-bak
-
-# Scratch render output from dev tools (leading-underscore convention, like _shot_*.png)
-tools/_*.png
-work/.claim.lock
-extern/cef/
-
-# simsuite baseline output (transient)
-benchmarks/simsuite/results/
-
-# never commit credentials
+# Web deployment credentials and per-deployment env files
 web/Cloudflare-info.txt
 web/secrets/
 web/gateway/.venv/
-# per-deployment env files hold live secrets — never commit
 web/**/*.env
 !web/gateway/config.example.env
-
-# local artifacts — never commit
-# `reports/runs/` alone is root-anchored (the mid-pattern slash), so it never matched the
-# nested gym tree: 391 raw per-seed ledger/mission/graded files accumulated under
-# tools/flywheel/bench/gym/reports/runs/ and were deleted on 2026-08-27. `**/` catches both.
-reports/runs/
-**/reports/runs/
-signal-desktop*
-services/corpora/
-repomix-output.*
-
-# Per-project agent memory (mnemopi SQLite) — runtime state, created on demand.
-.plm/
-
-# Convenience symlink for the Kimi CLI harness: it points at .claude/skills, and a
-# committed symlink does not survive a Windows checkout (portable_paths_audit).
-.kimi-code/

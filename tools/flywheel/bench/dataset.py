@@ -1,12 +1,12 @@
 """Frozen dataset specs for the bench suite.
 
 A bench dataset is *frozen* by a deterministic content hash computed over its sorted
-member files. Two properties this buys us (DoD: "reproducible from dataset hash on a
-second machine/OS"):
+member files. Two properties this buys us (reproducible from the dataset hash on a
+second machine/OS):
 
   * the same bytes on any OS -> the same hash, so a report's `dataset_hash` is a
     verifiable fingerprint of exactly what was scored;
-  * DVC (T-H5 infra) stores the bytes; this hash is what CI/gate asserts without needing
+  * DVC stores the bytes; this hash is what CI/gate asserts without needing
     a DVC remote — the hash travels in git inside the frozen `spec.json`.
 
 Pure stdlib. Hashing is byte-exact and path-relative (forward-slash normalized) so
@@ -40,7 +40,7 @@ def _iter_files(root: str, ignore: frozenset[str]) -> list[str]:
 
 # Text member extensions get their line endings normalized to LF before hashing, so a
 # git checkout that applies CRLF conversion on Windows (autocrlf) yields the SAME hash as
-# a Linux checkout — the exact property the "reproducible on a second OS" DoD tests.
+# a Linux checkout — the "reproducible on a second OS" property the tests check.
 # Binary members (renders, STEP, glTF) are hashed raw. `.gitattributes` in the corpus
 # dirs is the belt to this suspenders (forces `-text` so git stores bytes verbatim).
 _TEXT_EXTS = frozenset({".json", ".jsonl", ".txt", ".md", ".csv", ".req", ".yaml", ".yml"})
@@ -76,10 +76,10 @@ def content_hash(root: str, *, algo: str = "sha256",
 class DatasetSpec:
     """Frozen dataset descriptor. Serialized as `spec.json` next to the data.
 
-    dvc_ref:   the pointer T-H5's DVC infra resolves to fetch the bytes (e.g.
+    dvc_ref:   the pointer a DVC remote resolves to fetch the bytes (e.g.
                'corpus/regen_fix/v1'); optional until the remote exists.
     split:     name of the held-out split this spec addresses ('test' | 'smoke' | 'all').
-    structures: the held-out STRUCTURE keys covered (P13: split on structures, not
+    structures: the held-out STRUCTURE keys covered (split on structures, not
                samples). Documented so a reader can see the generalization boundary.
     """
     id: str

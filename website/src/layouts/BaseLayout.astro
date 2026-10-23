@@ -15,8 +15,10 @@ const canonical = new URL(path, Astro.site).href;
 // Link previews (Slack, LinkedIn, X, iMessage) show this; a real product capture
 // says more than a logo card.
 const shareImage = new URL('/images/modeling.png', Astro.site).href;
-// Organization gives Search the logo; WebSite gives it the site name. Google reads
-// both from the home page only.
+// Organization gives Search the logo; WebSite gives it the site name; the
+// SoftwareApplication entry describes the product itself. Google reads all three
+// from the home page only.
+const GITHUB = 'https://github.com/Hunter-124/Chudware';
 const structuredData = path === '/' ? JSON.stringify([
   {
     '@context': 'https://schema.org',
@@ -25,6 +27,7 @@ const structuredData = path === '/' ? JSON.stringify([
     name: 'Chudware',
     url: `${Astro.site}`,
     logo: new URL('/icon-512.png', Astro.site).href,
+    sameAs: [GITHUB],
   },
   {
     '@context': 'https://schema.org',
@@ -33,12 +36,25 @@ const structuredData = path === '/' ? JSON.stringify([
     url: `${Astro.site}`,
     publisher: { '@id': `${Astro.site}#organization` },
   },
+  {
+    '@context': 'https://schema.org',
+    '@type': 'SoftwareApplication',
+    name: 'Chudware',
+    url: `${Astro.site}`,
+    applicationCategory: 'DesignApplication',
+    operatingSystem: 'Windows, Linux, macOS',
+    downloadUrl: `${GITHUB}/releases/latest`,
+    license: 'https://opensource.org/license/mit',
+    isAccessibleForFree: true,
+    offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+    publisher: { '@id': `${Astro.site}#organization` },
+  },
 ]) : null;
 const nav = [
   { href: '/product/', label: 'Product' },
   { href: '/gallery/', label: 'Gallery' },
   { href: '/docs/', label: 'Docs' },
-  { href: '/pricing/', label: 'Pricing' },
+  { href: '/open-source/', label: 'Open source' },
   { href: '/about/', label: 'About' },
 ];
 const active = (href: string) => href === '/' ? path === '/' : path.startsWith(href);
@@ -81,15 +97,15 @@ const active = (href: string) => href === '/' ? path === '/' : path.startsWith(h
           {nav.map((item) => <a class="tap" href={item.href} aria-current={active(item.href) ? 'page' : undefined}>{item.label}</a>)}
         </nav>
         <div class="header-actions">
-          <a class="sign-in tap" href="https://app.chudware.com/signin">Sign in</a>
-          <a class="button button-small" href="https://app.chudware.com/signup">Create an account</a>
+          <a class="header-link tap" href={GITHUB}>GitHub</a>
+          <a class="button button-small" href="/download/">Download</a>
         </div>
         <details class="mobile-nav">
           <summary class="tap"><Icon name="menu" /><span>Menu</span></summary>
           <nav aria-label="Mobile primary">
             {nav.map((item) => <a class="tap" href={item.href} aria-current={active(item.href) ? 'page' : undefined}>{item.label}</a>)}
-            <a class="tap" href="https://app.chudware.com/signin">Sign in</a>
-            <a class="tap mobile-download" href="https://app.chudware.com/signup">Create an account</a>
+            <a class="tap" href={GITHUB}>GitHub</a>
+            <a class="tap mobile-download" href="/download/">Download</a>
           </nav>
         </details>
       </div>
@@ -99,7 +115,7 @@ const active = (href: string) => href === '/' ? path === '/' : path.startsWith(h
       <div class="wrap footer-grid">
         <div>
           <a class="brand tap" href="/"><img src="/assets/logo.svg" width="28" height="28" alt="" /><span>CHUDWARE</span></a>
-          <p>AI-first CAD for engineers. Dimension-driven models on exact solids, and a team of agents that works in your model.</p>
+          <p>AI-first CAD for engineers. Dimension-driven models on exact solids, and a team of agents that works in your model. Free and open source under the MIT License.</p>
         </div>
         <nav aria-label="Capability links">
           <strong>Capabilities</strong>
@@ -107,14 +123,14 @@ const active = (href: string) => href === '/' ? path === '/' : path.startsWith(h
         </nav>
         <nav aria-label="Explore links">
           <strong>Explore</strong>
-          <a class="tap" href="/product/">Overview</a><a class="tap" href="/gallery/">Gallery</a><a class="tap" href="/pricing/">Pricing</a><a class="tap" href="/download/">Download</a><a class="tap" href="/docs/">Docs</a><a class="tap" href="/faq/">FAQ</a><a class="tap" href="/changelog/">Changelog</a>
+          <a class="tap" href="/product/">Overview</a><a class="tap" href="/gallery/">Gallery</a><a class="tap" href="/download/">Download</a><a class="tap" href="/docs/">Docs</a><a class="tap" href="/faq/">FAQ</a><a class="tap" href="/changelog/">Changelog</a>
         </nav>
-        <nav aria-label="Company and legal links">
-          <strong>Company &amp; legal</strong>
-          <a class="tap" href="/about/">About</a><a class="tap" href="/open-source/">Open source</a><a class="tap" href="/security/">Security</a><a class="tap" href="/contact/">Contact</a><a class="tap" href="/legal/terms/">Terms</a><a class="tap" href="/legal/privacy/">Privacy</a><a class="tap" href="/legal/eula/">EULA</a><a class="tap" href="/legal/refunds/">Refunds</a>
+        <nav aria-label="Project links">
+          <strong>Project</strong>
+          <a class="tap" href="/about/">About</a><a class="tap" href="/open-source/">Open source</a><a class="tap" href={GITHUB}>GitHub</a><a class="tap" href={`${GITHUB}/blob/HEAD/LICENSE`}>License (MIT)</a><a class="tap" href={`${GITHUB}/security/policy`}>Security</a><a class="tap" href="/contact/">Contact</a><a class="tap" href="/legal/privacy/">Privacy</a>
         </nav>
       </div>
-      <div class="wrap footer-bottom"><span>© 2026 Chudware</span><span>AI-first CAD for engineers.</span></div>
+      <div class="wrap footer-bottom"><span>© 2026 Hunter Edmonds and Chudware contributors</span><span>Released under the MIT License.</span></div>
     </footer>
 
   </body>

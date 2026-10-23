@@ -33,6 +33,8 @@ def _binary(target: str) -> bytes:
         return bytes(data)
     if target == "macos-x86_64":
         return b"\xcf\xfa\xed\xfe" + struct.pack("<I", 0x01000007) + bytes(120)
+    if target == "macos-arm64":
+        return b"\xcf\xfa\xed\xfe" + struct.pack("<I", 0x0100000C) + bytes(120)
     raise AssertionError(f"unexpected release target: {target}")
 
 
@@ -105,23 +107,21 @@ def test_stage_needs_only_the_staged_targets_pin(
 def test_retained_legacy_lock_still_verifies_but_cannot_be_published(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Releases retained for rollback keep the lock they were deployed with; locks
-    # from before the x64-only matrix also list ARM targets. Rollback verifies them
-    # with the current script, so they must still load; publication must not.
+    # Locks retained from earlier releases may list targets that are no longer
+    # published. They must still load for verification; publication must not.
     lock, binaries = _lock(tmp_path)
     legacy = json.loads(lock.read_bytes())
-    legacy["artifacts"]["linux-aarch64"] = {"filename": "chud", "sha256": None, "url": None}
-    legacy["artifacts"]["macos-arm64"] = {
+    legacy["artifacts"]["linux-aarch64"] = {
         "filename": "chud",
         "sha256": "a" * 64,
-        "url": "https://releases.example.invalid/v0.2.0/macos-arm64/chud",
+        "url": "https://releases.example.invalid/v0.2.0/linux-aarch64/chud",
     }
     lock.write_bytes(pin._canonical_json(legacy))
     monkeypatch.setattr(pin, "_verify_executable_version", lambda *_args: "Chudcode v0.2.0")
 
     assert pin.verify_binary(binaries["linux-x86_64"], "linux-x86_64", lock_path=lock)
     assert pin.verify_notices(tmp_path, lock_path=lock, require_pinned=False)["notices"]
-    with pytest.raises(pin.ArtifactLockError, match="unexpected: linux-aarch64, macos-arm64"):
+    with pytest.raises(pin.ArtifactLockError, match="unexpected: linux-aarch64"):
         pin.load_lock(lock, strict_targets=True)
 
     legacy["artifacts"]["linux-riscv64"] = {"filename": "chud", "sha256": None, "url": None}
@@ -167,7 +167,7 @@ def test_verified_stage_is_offline_and_uses_canonical_filename(
 
 
 
-def test_notice_staging_has_five_target_parity_and_no_stale_omp_notice(
+def test_notice_staging_has_target_parity_and_no_stale_omp_notice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     lock, binaries = _lock(tmp_path)
@@ -350,10 +350,9 @@ def test_target_selector_requires_exactly_one_complete_mode() -> None:
             pin._selected_target(selector)
 
 
-def test_committed_lock_loads_and_pins_the_production_target() -> None:
-    # Production's deploy stages linux-x86_64 from the committed lock; a lock
-    # whose target set drifts from SUPPORTED_TARGETS makes every deploy fail
-    # at webd staging even though the binary itself is fine.
+def test_committed_lock_loads_and_pins_the_linux_target() -> None:
+    # The committed lock must keep the supported target set; a drifted set makes
+    # every stage/ensure fail even though the binary itself is fine.
     lock = pin.load_lock(pin.DEFAULT_LOCK, require_pinned=False)
     assert lock["artifacts"]["linux-x86_64"]["sha256"]
     pin.verify_notices(lock_path=pin.DEFAULT_LOCK, require_pinned=False)
@@ -394,6 +393,80 @@ def test_ensure_an_explicit_wrong_target_never_falls_back_to_the_cache(
             tmp_path / "cache", "linux-x86_64",
             source=binaries["windows-x86_64"], lock_path=lock_path,
         )
+
+
+class _Response:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def read(self, *_args):
+        body, self._body = self._body, b""
+        return body
+
+
+class _Opener:
+    """Records requested URLs; answers with a redirect or a body per URL."""
+
+    def __init__(self, routes: dict[str, object]) -> None:
+        self.routes = routes
+        self.requested: list[str] = []
+
+    def open(self, url, timeout=None):
+        self.requested.append(url)
+        route = self.routes[url]
+        if isinstance(route, bytes):
+            return _Response(route)
+        raise pin.urllib.error.HTTPError(url, 302, "Found", {"Location": route}, None)
+
+
+def _use_opener(monkeypatch: pytest.MonkeyPatch, routes: dict[str, object]) -> _Opener:
+    opener = _Opener(routes)
+    monkeypatch.setattr(pin.urllib.request, "build_opener", lambda *_handlers: opener)
+    return opener
+
+
+def test_fetch_follows_one_github_asset_redirect_without_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path, binaries = _lock(tmp_path)
+    url = "https://github.com/Hunter-124/chudcode/releases/download/chudcode-v0.2.0/chudcode-linux-x64"
+    cdn = "https://release-assets.githubusercontent.com/github-production-release-asset/1/2"
+    parsed = json.loads(lock_path.read_bytes())
+    parsed["artifacts"]["linux-x86_64"]["url"] = url
+    lock_path.write_bytes(pin._canonical_json(parsed))
+    opener = _use_opener(monkeypatch, {url: cdn, cdn: binaries["linux-x86_64"].read_bytes()})
+    monkeypatch.setattr(pin, "_verify_executable_version", lambda *_args: "Chudcode v0.2.0")
+
+    evidence = pin.ensure_artifact(tmp_path / "cache", "linux-x86_64", lock_path=lock_path)
+    assert opener.requested == [url, cdn]
+    assert Path(evidence["path"]).read_bytes() == binaries["linux-x86_64"].read_bytes()
+
+
+@pytest.mark.parametrize("pinned, location", [
+    ("https://github.com/Hunter-124/chudcode/releases/download/chudcode-v0.2.0/chudcode-linux-x64",
+     "https://attacker.example.invalid/chud"),
+    ("https://releases.example.invalid/v0.2.0/linux-x86_64/chud",
+     "https://release-assets.githubusercontent.com/github-production-release-asset/1/2"),
+])
+def test_fetch_refuses_untrusted_redirects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pinned: str, location: str
+) -> None:
+    lock_path, _ = _lock(tmp_path)
+    parsed = json.loads(lock_path.read_bytes())
+    parsed["artifacts"]["linux-x86_64"]["url"] = pinned
+    lock_path.write_bytes(pin._canonical_json(parsed))
+    opener = _use_opener(monkeypatch, {pinned: location})
+    with pytest.raises(pin.ArtifactLockError, match="redirected"):
+        pin.fetch_artifact(tmp_path / "out" / "chud", "linux-x86_64", lock_path=lock_path)
+    assert opener.requested == [pinned]
+    assert not (tmp_path / "out" / "chud").exists()
+
 
 @pytest.mark.parametrize("stage", [False, True])
 def test_replaced_input_is_never_executed_or_published(tmp_path, monkeypatch, stage):

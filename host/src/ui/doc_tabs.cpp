@@ -233,7 +233,7 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     // Only the ACTIVE tab (or a hovered / AI-pulsing one) paints its own glass-pill background.
     // Inactive middle tabs stay transparent against the shared band so no stray rounded background
     // bar shows behind them — the effect belongs to the active tab + the "+N" overflow chips, not to
-    // every file title (Hunter P4: a background was displaying where it isn't supposed to be).
+    // every file title (a background was displaying where it isn't supposed to be).
     if (active || hovered || t.aiPulse)
         ui::glassPanel(dl, tabRect, level, kTabRdp /*dp — glassPanel scales by uiScale*/, surf,
                        edgeA /*clipped pill dissolves its fill/border with the title*/);
@@ -1123,11 +1123,6 @@ float drawDocTabs(AppState& st, float availW) {
 // API. `kind` is a NewDocKind ordinal (0=Part,1=Assembly,2=Drawing,3=Schematic,4=PCB). Kept as a free
 // function (not a static) so app.cpp's Ctrl+N hook can request it via openNewDocChooser() instead.
 void createNewDoc(AppState& st, int kindOrd) {
-    if (st.entitlementReadOnly) {
-        st.toast(ui::ToastLevel::Warn,
-                 "Read-only mode — sign in or manage your subscription to create a document");
-        return;
-    }
 #ifndef __EMSCRIPTEN__
     // A deliberate New action supersedes the launch starter, even if this
     // document is closed before the background engine-readiness probe settles.

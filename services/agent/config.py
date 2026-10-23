@@ -18,14 +18,11 @@ state. config.json shape:
 from __future__ import annotations
 
 import contextlib
-import contextvars
 import copy
 import json
 import os
 import threading
 from collections.abc import Iterable
-from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -1546,248 +1543,6 @@ def _attach_catalog_meta(provider: Provider, caps: dict) -> Provider:
     return provider
 
 
-@dataclass(frozen=True)
-class Actor:
-    """Server-authoritative billing identity carried across the web/hostd seam."""
-
-    email: str
-    plan: str
-    credits_remaining: int
-    key_source: str
-    rated_model: str = ""
-    prompt_usd_per_mtok: Decimal | None = None
-    completion_usd_per_mtok: Decimal | None = None
-    reservation_credits: int = 0
-
-    @classmethod
-    def from_mapping(cls, value: object) -> "Actor":
-        if not isinstance(value, dict):
-            raise ValueError("_chudware_actor must be an object")
-        email = str(value.get("email") or "").strip().lower()
-        plan = str(value.get("plan") or "").strip().lower()
-        source = str(value.get("key_source") or "").strip().lower()
-        try:
-            remaining = max(0, int(value.get("credits_remaining") or 0))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "_chudware_actor credits_remaining must be an integer"
-            ) from exc
-        if not email or source not in {"byok", "pool", "subscription"}:
-            raise ValueError(
-                "_chudware_actor requires email and key_source=byok|pool|subscription"
-            )
-        raw_rate = value.get("_rate")
-        rated_model = ""
-        prompt_rate = completion_rate = None
-        if isinstance(raw_rate, dict):
-            rated_model = str(raw_rate.get("model") or "")
-            try:
-                prompt_rate = Decimal(str(raw_rate["prompt_usd_per_mtok"]))
-                completion_rate = Decimal(str(raw_rate["completion_usd_per_mtok"]))
-            except (KeyError, InvalidOperation, TypeError, ValueError):
-                prompt_rate = completion_rate = None
-        try:
-            reservation_credits = max(0, int(value.get("_reservation_credits") or 0))
-        except (TypeError, ValueError):
-            reservation_credits = 0
-        return cls(
-            email=email,
-            plan=plan,
-            credits_remaining=remaining,
-            key_source=source,
-            rated_model=rated_model,
-            prompt_usd_per_mtok=prompt_rate,
-            completion_usd_per_mtok=completion_rate,
-            reservation_credits=reservation_credits,
-        )
-
-
-def pooled_credit_preflight(
-    actor: Actor,
-    *,
-    prompt_tokens_estimate: int,
-    max_output_tokens: int,
-) -> dict[str, Any]:
-    """Pure worker-side guard; all money/rate authority arrived from gateway."""
-    requested = max(0, int(max_output_tokens or 0))
-    if actor.key_source != "pool":
-        return {"ok": True, "max_output_tokens": requested, "estimated_credits": 0}
-    if actor.prompt_usd_per_mtok is None or actor.completion_usd_per_mtok is None:
-        return {"ok": False, "reason": "insufficient_credits"}
-    prompt = max(0, int(prompt_tokens_estimate or 0))
-    estimate_value = (
-        Decimal(prompt) * actor.prompt_usd_per_mtok
-        + Decimal(requested) * actor.completion_usd_per_mtok
-    ) / Decimal(1000)
-    estimate = int(estimate_value.to_integral_value(rounding=ROUND_CEILING))
-    available = (
-        actor.reservation_credits
-        if actor.reservation_credits > 0
-        else max(0, int(actor.credits_remaining))
-    )
-    if estimate > available and actor.reservation_credits <= 0:
-        return {"ok": False, "reason": "insufficient_credits"}
-    prompt_cost = Decimal(prompt) * actor.prompt_usd_per_mtok / Decimal(1000)
-    if prompt_cost > Decimal(available):
-        return {"ok": False, "reason": "insufficient_credits"}
-    output_budget = max(Decimal(0), Decimal(available) - prompt_cost)
-    if actor.completion_usd_per_mtok > 0:
-        affordable = int(
-            (
-                output_budget * Decimal(1000) / actor.completion_usd_per_mtok
-            ).to_integral_value(rounding=ROUND_FLOOR)
-        )
-        requested = min(requested, max(0, affordable))
-    return {
-        "ok": True,
-        "max_output_tokens": requested,
-        "estimated_credits": min(estimate, available),
-    }
-
-
-_pooled_keys: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
-    "chudware_pooled_provider_keys", default={}
-)
-# The gateway's per-account subscription grant for THIS rpc only. Same run-scoped
-# lifetime as _pooled_keys: bound by worker_rpc after the actor is validated, zeroed
-# by clear_pooled_credentials() before the next rpc is accepted, so one web caller's
-# bearer can never carry a following caller's turn.
-_subscription_grant: contextvars.ContextVar[dict[str, str] | None] = (
-    contextvars.ContextVar("chudware_subscription_grant", default=None)
-)
-
-# Gateway grant provider id (Webservice/gateway/provider_accounts.SUBSCRIPTION_PROVIDERS)
-# to the native sub-provider class that can carry the explicit bearer.
-SUBSCRIPTION_GRANT_PROVIDERS = {
-    "anthropic-sub": "anthropic-sub",
-    "openai-codex": "codex-sub",
-}
-
-# cfg slot carrying the injected bearer from _subscription_provider_config into
-# _resolve_provider, mirroring _chudware_pool_api_key's named-slot convention.
-_SUBSCRIPTION_TOKEN_CFG_KEY = "_chudware_subscription_access_token"
-
-
-def clear_pooled_credentials() -> None:
-    """Clear every run-scoped web credential before a new worker RPC is accepted."""
-    _pooled_keys.set({})
-    _subscription_grant.set(None)
-
-
-def bind_subscription_grant(value: object) -> dict[str, str]:
-    """Validate the gateway-injected ``params["subscription"]`` and bind it to this run.
-
-    The worker never refreshes and never persists a gateway grant — the gateway owns
-    refresh and guarantees remaining lifetime. Anything malformed raises instead of
-    returning, so a bad grant refuses the turn rather than silently falling through to
-    the desktop user's own subscription credentials.
-    """
-    if in_cell():
-        raise ValueError("credential_isolation_unsupported")
-    if not isinstance(value, dict):
-        raise ValueError("subscription grant must be an object")
-    provider = str(value.get("provider") or "").strip().lower()
-    token = value.get("access_token")
-    if provider not in SUBSCRIPTION_GRANT_PROVIDERS:
-        raise ValueError(
-            "subscription grant provider must be anthropic-sub|openai-codex"
-        )
-    if not isinstance(token, str) or not token.strip():
-        raise ValueError("subscription grant requires a non-empty access_token")
-    grant = {"provider": provider, "access_token": token}
-    _subscription_grant.set(grant)
-    return grant
-
-
-def _subscription_provider_config(
-    name: str | None, cfg: dict, actor: Actor
-) -> tuple[str | None, dict]:
-    """Force this run onto the gateway's injected subscription grant.
-
-    Returns ``(provider_name, cfg)`` because ``_resolve_provider`` reads the explicit
-    *name* argument ahead of ``cfg["provider"]``: the browser selects a wire provider
-    ("anthropic"), while the grant names the subscription adapter ("anthropic-sub"),
-    and the grant is the authority. Never reads ambient credentials.
-    """
-    if in_cell() and actor.key_source == "subscription":
-        raise ValueError("credential_isolation_unsupported")
-    if actor.key_source != "subscription":
-        return name, cfg
-    grant = _subscription_grant.get() or {}
-    provider = SUBSCRIPTION_GRANT_PROVIDERS.get(str(grant.get("provider") or ""), "")
-    token = str(grant.get("access_token") or "")
-    if not provider or not token:
-        raise ValueError("subscription provider credential unavailable")
-    resolved = copy.deepcopy(cfg)
-    resolved["provider"] = provider
-    resolved[_SUBSCRIPTION_TOKEN_CFG_KEY] = token
-    return provider, resolved
-
-
-def _byok_provider_config(name: str | None, cfg: dict, actor: Actor) -> dict:
-    """Replace ambient credentials with this run's gateway-supplied BYOK key."""
-    if in_cell():
-        raise ValueError("provider_broker_route_required: use the owning Chudcode session")
-    if actor.key_source != "byok":
-        return cfg
-    provider_name = str(name or cfg.get("provider") or "").strip().lower()
-    explicit_key = str(cfg.get("_chudware_pool_api_key") or "").strip()
-    known_keys = dict(_pooled_keys.get())
-    if explicit_key and provider_name:
-        known_keys[provider_name] = explicit_key
-        _pooled_keys.set(known_keys)
-    key = explicit_key or known_keys.get(provider_name, "")
-    if not key:
-        raise ValueError("BYOK provider credential unavailable")
-    resolved = copy.deepcopy(cfg)
-    resolved.pop("_chudware_pool_api_key", None)
-    resolved["provider"] = provider_name
-    resolved["api_key"] = key
-    resolved["openrouter_api_key"] = key if provider_name == "openrouter" else None
-    keys = dict(resolved.get("keys") or {})
-    keys[provider_name] = key
-    resolved["keys"] = keys
-    section = dict(resolved.get(provider_name) or {})
-    section["api_key"] = key
-    resolved[provider_name] = section
-    return resolved
-
-
-def _pooled_provider_config(name: str | None, cfg: dict, actor: Actor) -> dict:
-    """Replace ambient user credentials with the operator-owned pooled key.
-
-    worker_rpc sets ``_chudware_pool_api_key`` only from the provider descriptor
-    resolved by hostd after the gateway stripped browser credentials. This named
-    slot makes the trust boundary explicit: a pooled turn never falls through to
-    a desktop user's config.json key.
-    """
-    if in_cell() and actor.key_source == "pool":
-        raise ValueError("credential_isolation_unsupported")
-    if actor.key_source != "pool":
-        return cfg
-    provider_name = str(name or cfg.get("provider") or "").strip().lower()
-    explicit_key = str(cfg.get("_chudware_pool_api_key") or "").strip()
-    known_keys = dict(_pooled_keys.get())
-    if explicit_key and provider_name:
-        known_keys[provider_name] = explicit_key
-        _pooled_keys.set(known_keys)
-    key = explicit_key or known_keys.get(provider_name, "")
-    if not key and provider_name != "mock":
-        raise ValueError("pooled provider credential unavailable")
-    pooled = copy.deepcopy(cfg)
-    pooled["provider"] = provider_name
-    pooled["api_key"] = key
-    pooled["openrouter_api_key"] = key if provider_name == "openrouter" else None
-    keys = dict(pooled.get("keys") or {})
-    if provider_name:
-        keys[provider_name] = key
-        section = dict(pooled.get(provider_name) or {})
-        section["api_key"] = key
-        pooled[provider_name] = section
-    pooled["keys"] = keys
-    return pooled
-
-
 def assert_offline_safe(provider: Provider, cfg: dict | None = None) -> None:
     """Defense-in-depth guard the agent loop calls before every run when offline mode is set.
 
@@ -1810,8 +1565,6 @@ def get_provider(
     name: str | None = None,
     cfg: dict | None = None,
     role: str | None = None,
-    *,
-    actor: Actor | None = None,
 ) -> Provider:
     """Resolve the configured provider, enforcing offline/local-only at two points: cloud
     providers are refused by name BEFORE construction, and the resolved provider is re-checked
@@ -1828,20 +1581,10 @@ def get_provider(
     non-loopback provider before the wrap.
     """
     if in_cell():
-        # Python vendor SDKs cannot inherit the session's native models.yml
-        # transport. Refuse before loading desktop config or constructing one.
-        raise ValueError("provider_broker_route_required: use the owning Chudcode session")
+        # Cells have no provider credential route; a vendor SDK here would read the
+        # host's ambient credentials. Refuse before loading config or constructing one.
+        raise ValueError("credential_isolation_unsupported")
     cfg = cfg if cfg is not None else load_config()
-    if actor is None or actor.key_source != "pool":
-        _pooled_keys.set({})
-    if actor is not None:
-        cfg = _byok_provider_config(name, cfg, actor)
-        cfg = _pooled_provider_config(name, cfg, actor)
-        # Last, and it may override *name*: the grant, not the browser's provider
-        # field, decides which subscription adapter runs a subscription turn.
-        name, cfg = _subscription_provider_config(name, cfg, actor)
-    # token_usage's event sink is request-scoped and bound by worker_rpc. Provider
-    # construction carries no gateway/database dependency.
     provider = _resolve_provider(name, cfg, role=role)
     # For local_only without offline_mode, temporarily treat as offline for the assert.
     if local_only_enabled(cfg):
@@ -2163,26 +1906,18 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
 
     if name == "anthropic-sub":
         # Subscription auth (§4.4): uses the user's Claude Pro/Max login, not an api_key.
-        # access_token is the gateway's per-account bearer on a web turn and None on the
-        # desktop, where the provider reads its own credential store exactly as before.
         from .providers.anthropic_sub_provider import (
             AnthropicSubProvider,
             DEFAULT_MODEL,
         )
 
-        return AnthropicSubProvider(
-            model=cfg.get("model", DEFAULT_MODEL),
-            access_token=cfg.get(_SUBSCRIPTION_TOKEN_CFG_KEY) or None,
-        )
+        return AnthropicSubProvider(model=cfg.get("model", DEFAULT_MODEL))
 
     if name == "codex-sub":
         # Subscription auth (§4.4): uses the user's ChatGPT Plus/Pro login.
         from .providers.codex_sub_provider import CodexSubProvider, DEFAULT_MODEL
 
-        return CodexSubProvider(
-            model=cfg.get("model", DEFAULT_MODEL),
-            access_token=cfg.get(_SUBSCRIPTION_TOKEN_CFG_KEY) or None,
-        )
+        return CodexSubProvider(model=cfg.get("model", DEFAULT_MODEL))
 
     if name == "cursor-sub":
         # Subscription auth (§4.4): uses the user's Cursor Pro login.

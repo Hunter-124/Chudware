@@ -1,17 +1,16 @@
 # ADR-001: Idea-to-Production Platform on Chudware
 
-**Status:** Adopted design record (`T-A1`, `T-D1`, `T-F1`..`T-F17` all `status: done`
-in `work/tasks/done/`). Board closure is scoped to those cards, not a blanket
-feature-shipping or certification claim.
+**Status:** Adopted design record. The decisions below were implemented; that is scoped to
+the decisions recorded here, not a blanket feature-shipping or certification claim.
 **Date:** 2026-07-02 (status updated 2026-08-17)
-**Deciders:** Bruh + team (4 people)
+**Deciders:** Chudware maintainers
 
 **Authority scope:** the context, implementation patterns and action-item checkboxes
 below are the original July architecture record. In particular, the Python engine
 pattern in the Decision section predates the native-engine consolidation; it is not
 an instruction to restore the retired engine. Current boundaries are in
 [ARCHITECTURE.md](../../ARCHITECTURE.md) and
-[chudware-dev](../../.claude/skills/chudware-dev/SKILL.md). Later simulation credibility
+[engineering notes](../dev/engineering-notes.md). Later simulation credibility
 notes in this ADR retain their own linked evidence and program scope.
 
 ## Context
@@ -23,7 +22,7 @@ a three-tier standard/vendor parts library, GSL (deterministic geometry descript
 low-capability models), a 100+-tool MCP server, and a C++ mission runner
 (`core/agent/mission.h`) that executes a *linear* task list end-to-end.
 
-We want to grow it into an idea-to-production suite. Five new pillars, in priority order:
+The goal is to grow it into an idea-to-production suite. New pillars, in priority order:
 
 1. **DAG workflow orchestrator** — projects as checkpointed graphs; limited-context models
    execute nodes; user chooses autonomy per node; explicit end conditions so loops terminate.
@@ -40,18 +39,18 @@ We want to grow it into an idea-to-production suite. Five new pillars, in priori
 Plus a seventh track (in flight externally): **proprietary CAD format reverse engineering**
 (SolidWorks / Creo / Fusion 360 underway) to break vendor lock-in.
 
-**Pillars 8–14 (AI tooling & infrastructure overhaul):** the layer under every pillar
+**AI tooling & infrastructure layer:** the layer under every pillar
 above — agent web-research/knowledge tools, a unified ask-user interaction contract,
 image/camera intake, total state→text narration (GSL parity for CAM/FEA/ECAD/assemblies),
 a converged provider/session layer with tool allow-listing, a trainable ≤4B local
 translator + NNUE-style evaluators track, and agentic-workflow completion (plan mutation,
-workflow templates, design-review battery). Decision record and execution map:
-[AI_TOOLING_MASTER_PLAN.md](../AI_TOOLING_MASTER_PLAN.md).
+workflow templates, design-review battery).
 
-**Constraints:** 4 people × 5 days for the first integrated cut; commercial closed-source
-desktop product (license hygiene matters — no GPL *linking*, subprocess only; no AGPL at all);
-steal from open source aggressively; sim credibility via V&V'd open solvers, not commercial
-certification.
+**Constraints:** a small team and a five-day window for the first integrated cut; a
+desktop product with strict license hygiene (no GPL *linking* — copyleft tools run
+subprocess-only, per [`contracts/licenses.md`](../../contracts/licenses.md); no AGPL at
+all); reuse open source aggressively; sim credibility via V&V'd open solvers, not
+commercial certification.
 
 ## Decision
 
@@ -105,7 +104,7 @@ FreeCAD/SimScale pattern): CalculiX & OpenFOAM (GPL, subprocess + source offer i
 Elmer (LGPL lib linkable), ngspice (BSD, bundleable), Verilator (Artistic-2.0 path, bundleable)
 + GHDL/Icarus (GPL, subprocess) for the FPGA pillar. The V&V harness uses independently
 derived analytic references and openly distributable cases; it records failures and skips
-without aggregate masking. The private-fork Polyhedral-FEA/PolyMesh family is reported
+without aggregate masking. The pinned Polyhedral-FEA/PolyMesh fork family is reported
 separately, with solver source and linked-binary revision, and remains a tet4/tet10
 discretization path into Chudware's solver rather than a VEM/polyhedral-solve claim.
 
@@ -154,11 +153,12 @@ Priority beyond the in-flight SW/Creo/Fusion effort, ranked by leverage ÷ effor
 | — | Revit .rvt | Defer — enormously complex; IFC via IfcOpenShell (LGPL) covers the BIM need. |
 
 Legal guardrails: interoperability reverse engineering is protected (DMCA §1201(f), EU Software
-Directive Art. 6) **if clean-room**: the friend documents formats in specs; whoever implements
+Directive Art. 6) **if clean-room**: one party documents formats in specs; whoever implements
 parsers never reads competitor source/SDKs; no EULA-bound tools used for the analysis; no DRM
-circumvention (Fusion cloud files fetched only by the customer's own account).
+circumvention (Fusion cloud files are fetched only by the user through their own Autodesk
+account).
 
-### Decision 6 — Piping/hydraulics stack (Workstream E, sprint 2)
+### Decision 6 — Piping/hydraulics stack (sprint 2)
 
 Entirely permissive-license territory — bundle freely: **EPANET 2.2/WNTR** (MIT/BSD, water
 networks), **pandapipes** (BSD-3, gas/heat), **`fluids`/`ht`/`thermo`** (MIT — ships ASME
@@ -168,7 +168,7 @@ data — ASME text itself is not bundleable). Oil-hydraulic circuits clone the E
 pattern (ISO 1219 symbols) simulated via **OpenHydraulics** (BSD-3) FMUs run through fmpy —
 avoiding the GPL OpenModelica runtime. 3D detail flows hand off to the existing LBM/OpenFOAM
 path via internal-volume extraction. No free pump-curve database exists: user-imported CSV
-curves + affinity-law scaling. Tasks T-E1..T-E5 in `work/`.
+curves + affinity-law scaling.
 
 ## Trade-off Analysis
 
@@ -196,9 +196,7 @@ accepted.
 
 1. [ ] Freeze `contracts/dag_schema.md`, `contracts/sourcing_schema.md`,
        `contracts/firmware_rpc.md`, `contracts/structural_schema.md` (day 1)
-0. [ ] Ratify [AI_TOOLING_MASTER_PLAN.md](../AI_TOOLING_MASTER_PLAN.md) (pillars 8–14) and
-       cut its Workstream F tasks into `work/`
-2. [ ] Execute the 5-day sprint plan (executed; doc pruned 2026-07-23)
+2. [ ] Execute the 5-day sprint plan (executed; the plan document was retired 2026-07-23)
 3. [ ] Add license manifest + notices generation to `installer/` and CI
 4. [ ] Apply for API keys now (lead-time risk): Nexar, Digi-Key, Mouser, Xometry, JLCPCB,
        McMaster eProcurement

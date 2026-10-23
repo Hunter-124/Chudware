@@ -38,7 +38,6 @@
 #include "agent/logging_provider.h"
 #include "agent/machine.h"
 #include "security/integrity.h"
-#include "security/runtime_guard.h"
 #include "util/platform_paths.h"
 #include "agent/mission.h"
 #include "agent/ops_emit.h"
@@ -661,20 +660,13 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
                             const json& provider_cfg, const std::string& workspace_dir,
                             const std::string& session_id, const std::string& sessions_dir,
                             const json& history, const json& attachments,
-                            const json& chudware_actor, RunEvents& events, json& turn_out,
+                            RunEvents& events, json& turn_out,
                             std::string& err, bool& crashed, bool& timed_out) {
     const auto executable = chudware::platform::executablePath();
     const auto integrity = chudware::security::verifyInstalledPayload(
         executable, chudware::security::VerifyMode::ProtectedOperation);
     if (!integrity.ok) {
         err = "worker spawn blocked: protected_file_hash_mismatch";
-        return false;
-    }
-    const auto security = chudware::security::inspectAndPersistRuntime(
-        chudware::security::SecurityCheckpoint::BeforeWorkerSpawn,
-        integrity.root, integrity.files, chudware::security::runtimeGuardStateDir().string());
-    if (!security.allowed()) {
-        err = "worker spawn blocked: " + security.denialReason;
         return false;
     }
     bool compiled_worker = false;
@@ -842,9 +834,6 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     // only place that can build them. Absent/empty array == previous behaviour
     // (no key sent at all).
     if (attachments.is_array() && !attachments.empty()) params["attachments"] = attachments;
-    // Commercial web identity is injected by the authenticated gateway under
-    // options. Desktop/local invocations omit it deliberately and remain BYOK.
-    if (chudware_actor.is_object()) params["_chudware_actor"] = chudware_actor;
     if (provider_cfg.is_object()) {
         auto put = [&](const char* cfg_key, const char* param_key) {
             const auto it = provider_cfg.find(cfg_key);
@@ -1025,7 +1014,7 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
 #else   // _WIN32
 bool call_admin_worker_turn(const std::string&, const std::string&, const json&,
                             const std::string&, const std::string&, const std::string&,
-                            const json&, const json&, const json&, RunEvents&, json&,
+                            const json&, const json&, RunEvents&, json&,
                             std::string& err, bool&, bool&) {
     err = "admin worker bridge unavailable on this platform";
     return false;
@@ -1272,12 +1261,8 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         const std::string sessions_dir = options.value("sessions_dir", std::string());
         const json history = options.value("history", json::array());
         const json attachments = options.value("attachments", json::array());
-        // Missing means a trusted desktop/BYOK turn. worker_actor_from_options keeps
-        // it JSON null so the worker omits the field; manufacturing `{}` here made
-        // every local general-agent request fail Actor validation.
-        const json chudware_actor = worker_actor_from_options(options);
         if (!call_admin_worker_turn(request, run_id, provider_cfg, ws_dir, session_id,
-                                    sessions_dir, history, attachments, chudware_actor,
+                                    sessions_dir, history, attachments,
                                     events, turn, worker_err, worker_crashed,
                                     worker_timed_out)) {
             if (worker_err == "cancelled" || run_ctl.cancelled()) {

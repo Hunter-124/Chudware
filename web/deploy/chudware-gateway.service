@@ -1,31 +1,24 @@
+# Chudware web gateway (systemd user unit). install_cells.sh substitutes
+# @REPO@, @WEB_HOME@ and @WORKSPACE@. Optional settings (see
+# web/gateway/config.example.env) go in ~/.config/chudware/gateway.env.
 [Unit]
-Description=chudware-web gateway (FastAPI / uvicorn on 127.0.0.1:8300)
-Documentation=file://%h/Repositories/CAD/Webservice/deploy/RUNBOOK.md
+Description=Chudware web gateway (uvicorn on 127.0.0.1:8300)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/Repositories/CAD/Webservice/gateway
-EnvironmentFile=%h/chudware-web-data/gateway.env
-EnvironmentFile=-%h/chudware-web/webd.env
-Environment=CHUDWARE_WEB_DATA=%h/chudware-web-data
-# systemd decrypts this into a private runtime credential directory. The key
-# never enters gateway.env, the database, the repository, or /proc environ.
-LoadCredentialEncrypted=entitlement.key:%h/.config/credstore.encrypted/chudware-entitlement.cred
-Environment=CHUDWARE_ENTITLEMENT_KEY_PATH=%d/entitlement.key
+WorkingDirectory=@REPO@/web/gateway
+Environment=CHUDWARE_WEB_HOME=@WEB_HOME@
+Environment=CHUDWARE_WORKSPACE_ROOT=@WORKSPACE@
 # Keep uvicorn's WebSocket frame ceiling identical to the gateway forwarding
-# budget. EnvironmentFile overrides this default when the operator tunes it.
+# budget. The env file overrides this default when the operator tunes it.
 Environment=CHUDWARE_WEB_WS_MAX_MESSAGE_BYTES=4194304
-# Validate protected operator input before authn/database initialization. This is
-# configuration readiness only; DNS/provider acceptance and receipt remain external.
-ExecStartPre=%h/Repositories/CAD/Webservice/gateway/.venv/bin/python %h/Repositories/CAD/Webservice/deploy/gateway_preflight.py validate --env-file %h/chudware-web-data/gateway.env --environment prod
-# venv + uvicorn; app module owned by GatewayCore
-ExecStart=%h/Repositories/CAD/Webservice/gateway/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8300 --proxy-headers --forwarded-allow-ips=127.0.0.1 --ws-max-size ${CHUDWARE_WEB_WS_MAX_MESSAGE_BYTES} --no-access-log
+EnvironmentFile=-%h/.config/chudware/gateway.env
+ExecStart=@REPO@/web/gateway/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8300 --ws-max-size ${CHUDWARE_WEB_WS_MAX_MESSAGE_BYTES} --no-access-log
 Restart=on-failure
 RestartSec=3
 MemoryMax=1G
-# Soft guard so the unit dies cleanly before the OOM killer thrash
 MemoryHigh=900M
 TasksMax=256
 TimeoutStopSec=30
@@ -35,16 +28,8 @@ PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=read-only
-# The gateway has five explicit writable roots under ProtectHome=read-only:
-# - chudware-web-data: database/config/runtime data
-# - chudware-web: staged web daemon data
-# - ME489: per-identity bucket roots
-# - Documents/ME489/.../CAD_Build: configured CAD workspaces, including new accounts
-# - chudware-releases: signed release staging (`incoming/`) and published installers
-#
-# Omitting the release root made `/api/releases/ci/upload/*` fail with EROFS even though
-# Unix ownership/mode were correct, so a multi-hour nightly build could never publish.
-ReadWritePaths=%h/chudware-web-data %h/chudware-web %h/ME489 %h/chudware-releases %h/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build
+# The gateway writes cell metadata under the web home and workspace files.
+ReadWritePaths=@WEB_HOME@ @WORKSPACE@
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -54,7 +39,6 @@ RestrictRealtime=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 UMask=0077
-
 
 [Install]
 WantedBy=default.target

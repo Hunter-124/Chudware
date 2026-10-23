@@ -1,19 +1,22 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
 import '../styles/company.css';
+
+const REPO = 'https://github.com/Hunter-124/Chudware';
 ---
-<BaseLayout title="FAQ" description="Answers about Chudware product scope, supported platforms, engineering files, AI provider configuration, subscriptions, and support.">
+<BaseLayout title="FAQ" description="Answers about Chudware product scope, the MIT license, contributing, building from source, supported platforms, engineering files, and AI provider configuration.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Frequently asked</p>
       <h1>Answers before you install.</h1>
-      <p class="lede">Product capabilities, supported platforms, accounts, and AI provider setup.</p>
+      <p class="lede">Product capabilities, licensing, supported platforms, files, and AI provider setup.</p>
       <ul class="co-faq-jump">
         <li><a href="#co-product">The product</a></li>
-        <li><a href="#co-access">Access and platforms</a></li>
+        <li><a href="#co-open-source">Open source</a></li>
+        <li><a href="#co-access">Platforms and installation</a></li>
         <li><a href="#co-files">Files and data</a></li>
         <li><a href="#co-ai">AI copilot</a></li>
-        <li><a href="#co-commercial">Commercial and support</a></li>
+        <li><a href="#co-help">Help</a></li>
       </ul>
     </div>
   </header>
@@ -21,110 +24,136 @@ import '../styles/company.css';
   <section class="section" aria-labelledby="co-product">
     <div class="co-faq-group wrap">
       <h2 id="co-product" class="co-anchor">The product</h2>
-      <details open>
-        <summary>What is Chudware?</summary>
-        <div class="co-answer"><p>Dimension-driven parametric CAD with assemblies, drawings, CAM, simulation, PLM, reverse engineering, and a team of AI agents in one document. The desktop app and the browser workspace are the same product with the same file format.</p></div>
-      </details>
-      <details>
-        <summary>Who is it for?</summary>
-        <div class="co-answer"><p>Engineers and technical teams who need to create, inspect, manufacture, or manage product data. The product spans mechanical design, manufacturing, electronics, simulation, and adjacent engineering work rather than assuming one job title.</p></div>
-      </details>
-      <details>
-        <summary>How mature is it?</summary>
-        <div class="co-answer"><p>Chudware is in commercial preview. Core workflows are available, but file-format coverage and advanced study types continue to change. Use the trial on representative projects before moving production work.</p></div>
-      </details>
-      <details>
-        <summary>What simulation studies are available?</summary>
-        <div class="co-answer"><p>The engine provides static, adaptive and mesh-convergence FEA; modal and frequency-response studies; high-cycle fatigue; steady and transient thermal conduction; linear buckling; and contact-aware static studies. Built-in flow is useful for directional comparisons, while the OpenFOAM path provides the higher-fidelity external-aerodynamics route when OpenFOAM is installed. Read each study's mesh, convergence, reaction, and provenance output before using a result for a decision.</p></div>
-      </details>
+      <div class="co-faq-list">
+        <details class="co-faq" open>
+          <summary>What is Chudware?</summary>
+          <div class="co-faq-answer"><p>Dimension-driven parametric CAD with assemblies, drawings, CAM, simulation, PLM, reverse engineering, and a team of AI agents in one document. It is a desktop application for Windows, Linux, and macOS, released as open source under the MIT License.</p></div>
+        </details>
+        <details class="co-faq">
+          <summary>Who is it for?</summary>
+          <div class="co-faq-answer"><p>Engineers and technical teams who need to create, inspect, manufacture, or manage product data. The product spans mechanical design, manufacturing, electronics, simulation, and adjacent engineering work rather than assuming one job title.</p></div>
+        </details>
+        <details class="co-faq">
+          <summary>How mature is it?</summary>
+          <div class="co-faq-answer"><p>Chudware is under active development. Core workflows are available, but file-format coverage and advanced study types continue to change. Test it on representative projects before moving production work.</p></div>
+        </details>
+        <details class="co-faq">
+          <summary>What simulation studies are available?</summary>
+          <div class="co-faq-answer"><p>The engine provides static, adaptive and mesh-convergence FEA; modal and frequency-response studies; high-cycle fatigue; steady and transient thermal conduction; linear buckling; and contact-aware static studies. Built-in flow is useful for directional comparisons, while the OpenFOAM path provides the higher-fidelity external-aerodynamics route when OpenFOAM is installed. Read each study's mesh, convergence, reaction, and provenance output before using a result for a decision.</p></div>
+        </details>
+      </div>
     </div>
   </section>
 
-  <section class="section section-alt" aria-labelledby="co-access">
+  <section class="section" aria-labelledby="co-open-source">
     <div class="co-faq-group wrap">
-      <h2 id="co-access" class="co-anchor">Access and platforms</h2>
-      <details open>
-        <summary>What does the 14-day trial include?</summary>
-        <div class="co-answer"><p>After email verification you get the browser workspace and the desktop app for 14 days with 5 GB of storage. No card required.</p></div>
-      </details>
-      <details>
-        <summary>Which operating systems have a desktop build?</summary>
-        <div class="co-answer"><p>Windows, Linux, and macOS, all x86-64. The <a href="/download/">download page</a> shows the current version, package format, size, and checksum for each.</p></div>
-      </details>
-      <details>
-        <summary>What is the difference between Desktop and Studio?</summary>
-        <div class="co-answer"><p>Desktop licenses the desktop app with 5 GB of storage. Studio includes Desktop, adds the browser workspace, and raises storage to 100 GB. Both plans have every workspace.</p></div>
-      </details>
-      <details>
-        <summary>How do desktop downloads work?</summary>
-        <div class="co-answer"><p>Sign in on the download page and pick the build for your platform. Download links are short-lived and tied to your account; the page shows the SHA-256 checksum so you can verify the file.</p></div>
-      </details>
+      <h2 id="co-open-source" class="co-anchor">Open source</h2>
+      <div class="co-faq-list">
+        <details class="co-faq" open>
+          <summary>What license is Chudware released under?</summary>
+          <div class="co-faq-answer"><p>The <a href={`${REPO}/blob/HEAD/LICENSE`}>MIT License</a>. You may use, copy, modify, and redistribute Chudware for any purpose, provided the copyright and license notice stay with the software. Third-party components keep their own licenses; the <a href="/open-source/">open-source page</a> lists the main ones.</p></div>
+        </details>
+        <details class="co-faq">
+          <summary>Does Chudware cost anything?</summary>
+          <div class="co-faq-answer"><p>No. Chudware is free to download and use, with no account, license key, or feature limits. If you use the AI copilot, your AI provider's own charges apply to that usage.</p></div>
+        </details>
+        <details class="co-faq">
+          <summary>How can I contribute?</summary>
+          <div class="co-faq-answer"><p>Report bugs and request features in <a href={`${REPO}/issues`}>GitHub issues</a>, and send changes as pull requests. Read the <a href={`${REPO}/blob/HEAD/CONTRIBUTING.md`}>contributing guide</a> before you start; it covers the development setup and what a change needs before review.</p></div>
+        </details>
+        <details class="co-faq">
+          <summary>Can I build it from source?</summary>
+          <div class="co-faq-answer"><p>Yes. The <a href={`${REPO}#building-from-source`}>Building from source</a> section of the README lists the toolchain and dependencies — a CMake-based C++20 toolchain, OpenCASCADE, and Python for the engine services — and the build commands for each platform.</p></div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="co-access">
+    <div class="co-faq-group wrap">
+      <h2 id="co-access" class="co-anchor">Platforms and installation</h2>
+      <div class="co-faq-list">
+        <details class="co-faq" open>
+          <summary>Do I need an account?</summary>
+          <div class="co-faq-answer"><p>No. Chudware has no accounts and no sign-in. The only sign-in you might use is with an AI provider, in Settings → Providers, if you prefer that to an API key.</p></div>
+        </details>
+        <details class="co-faq">
+          <summary>Which operating systems have a desktop build?</summary>
+          <div class="co-faq-answer"><p>Windows, Linux, and macOS, all x86-64. On Apple silicon the Intel build runs through Rosetta 2. The <a href="/download/">download page</a> lists the file formats for each platform.</p></div>
+        </details>
+        <details class="co-faq">
+          <summary>Where do I download it?</summary>
+          <div class="co-faq-answer"><p>From the project's <a href={`${REPO}/releases/latest`}>GitHub Releases</a>. GitHub shows a SHA-256 digest beside each release asset so you can verify the file. Once installed, the app checks GitHub for newer releases and verifies each update's Ed25519 signature before staging it.</p></div>
+        </details>
+      </div>
     </div>
   </section>
 
   <section class="section" aria-labelledby="co-files">
     <div class="co-faq-group wrap">
       <h2 id="co-files" class="co-anchor">Files and data</h2>
-      <details open>
-        <summary>What is a <code>.step+</code> file?</summary>
-        <div class="co-answer"><p>It is Chudware's portable project container. It carries neutral STEP geometry together with the feature recipe, parameters, metadata, thumbnails, and integrity information needed to continue editing in Chudware. The neutral STEP payload can be extracted or exported for exchange with another CAD system.</p></div>
-      </details>
-      <details>
-        <summary>Which exchange formats are supported?</summary>
-        <div class="co-answer"><p>STEP is the primary neutral solid format. IGES and BREP solids, and STL, OBJ, PLY, and glTF meshes, are supported where the workflow allows. The <a href="/product/modeling/#formats">modeling reference table</a> lists the current import and export directions.</p></div>
-      </details>
-      <details>
-        <summary>Where are projects stored?</summary>
-        <div class="co-answer"><p>Desktop documents can stay on your workstation. Projects opened in the browser workspace are stored in your Chudware account and count against its storage quota. Keep your own exports and backups of anything important.</p></div>
-      </details>
-      <details>
-        <summary>Can I migrate existing work?</summary>
-        <div class="co-answer"><p>Yes. Exchange a clean STEP model when you need exact solids, and use mesh formats only when a tessellated surface is sufficient. Imported neutral geometry does not recreate another CAD system's proprietary feature history, so retain the source file until the migrated project has been checked.</p></div>
-      </details>
+      <div class="co-faq-list">
+        <details class="co-faq" open>
+          <summary>What is a <code>.step+</code> file?</summary>
+          <div class="co-faq-answer"><p>It is Chudware's portable project container. It carries neutral STEP geometry together with the feature recipe, parameters, metadata, thumbnails, and integrity information needed to continue editing in Chudware. The neutral STEP payload can be extracted or exported for exchange with another CAD system.</p></div>
+        </details>
+        <details class="co-faq">
+          <summary>Which exchange formats are supported?</summary>
+          <div class="co-faq-answer"><p>STEP is the primary neutral solid format. IGES and BREP solids, and STL, OBJ, PLY, and glTF meshes, are supported where the workflow allows. The <a href="/product/modeling/#formats">modeling reference table</a> lists the current import and export directions.</p></div>
+        </details>
+        <details class="co-faq">
+          <summary>Where are projects stored?</summary>
+          <div class="co-faq-answer"><p>On your machine. Chudware saves documents as local files, and nothing leaves your workstation unless you send project context to an AI provider you configured. Keep your own exports and backups of anything important.</p></div>
+        </details>
+        <details class="co-faq">
+          <summary>Can I migrate existing work?</summary>
+          <div class="co-faq-answer"><p>Yes. Exchange a clean STEP model when you need exact solids, and use mesh formats only when a tessellated surface is sufficient. Imported neutral geometry does not recreate another CAD system's proprietary feature history, so retain the source file until the migrated project has been checked.</p></div>
+        </details>
+      </div>
     </div>
   </section>
 
-  <section class="section section-alt" aria-labelledby="co-ai">
+  <section class="section" aria-labelledby="co-ai">
     <div class="co-faq-group wrap">
       <h2 id="co-ai" class="co-anchor">AI copilot</h2>
-      <details open>
-        <summary>How does the copilot change a model?</summary>
-        <div class="co-answer"><p>The copilot is a team of agents. They plan the work, split it up, call the same modeling, simulation, and CAM tools you use, and read the structured results back. What they leave behind is a human-editable feature history with sketches fully defined. Every operation runs in the Chudware engine; an agent's text is never taken as proof that something succeeded.</p></div>
-      </details>
-      <details>
-        <summary>How do I connect an AI provider?</summary>
-        <div class="co-answer"><p>Open Settings → Providers and sign in with a supported provider account or paste your own API key. Enter credentials only there — never in chat, a prompt, or a project note.</p></div>
-      </details>
-      <details>
-        <summary>Who bills for AI usage?</summary>
-        <div class="co-answer"><p>Your provider does. Its plan, API prices, usage limits, and terms apply. Chudware doesn't sell tokens or resell model capacity.</p></div>
-      </details>
-      <details>
-        <summary>What is sent to the provider?</summary>
-        <div class="co-answer"><p>The prompt plus the project context and tool results needed for the current turn are sent to the provider you selected. Chudware does not send your provider credential as prompt text. Review the provider's privacy and retention terms before using confidential project data.</p></div>
-      </details>
-      <details>
-        <summary>Should I accept copilot output without review?</summary>
-        <div class="co-answer"><p>No. Open the feature tree, check the dimensions, toolpaths, boundary conditions, mesh quality, reactions, and exported evidence appropriate to the task. The agents can execute and inspect work; the engineer remains responsible for the design and release decision.</p></div>
-      </details>
+      <div class="co-faq-list">
+        <details class="co-faq" open>
+          <summary>How does the copilot change a model?</summary>
+          <div class="co-faq-answer"><p>The copilot is a team of agents. They plan the work, split it up, call the same modeling, simulation, and CAM tools you use, and read the structured results back. What they leave behind is a human-editable feature history with sketches fully defined. Every operation runs in the Chudware engine; an agent's text is never taken as proof that something succeeded.</p></div>
+        </details>
+        <details class="co-faq">
+          <summary>How do I connect an AI provider?</summary>
+          <div class="co-faq-answer"><p>Open Settings → Providers and sign in with a supported provider account or paste your own API key. Enter credentials only there — never in chat, a prompt, or a project note.</p></div>
+        </details>
+        <details class="co-faq">
+          <summary>Who pays for AI usage?</summary>
+          <div class="co-faq-answer"><p>You do, through your provider. Its plan, API prices, usage limits, and terms apply. Chudware doesn't sell tokens or resell model capacity.</p></div>
+        </details>
+        <details class="co-faq">
+          <summary>What is sent to the provider?</summary>
+          <div class="co-faq-answer"><p>The prompt plus the project context and tool results needed for the current turn are sent to the provider you selected. Chudware does not send your provider credential as prompt text. Review the provider's privacy and retention terms before using confidential project data.</p></div>
+        </details>
+        <details class="co-faq">
+          <summary>Should I accept copilot output without review?</summary>
+          <div class="co-faq-answer"><p>No. Open the feature tree, check the dimensions, toolpaths, boundary conditions, mesh quality, reactions, and exported evidence appropriate to the task. The agents can execute and inspect work; the engineer remains responsible for the design and release decision.</p></div>
+        </details>
+      </div>
     </div>
   </section>
 
-  <section class="section" aria-labelledby="co-commercial">
+  <section class="section" aria-labelledby="co-help">
     <div class="co-faq-group wrap">
-      <h2 id="co-commercial" class="co-anchor">Commercial and support</h2>
-      <details open>
-        <summary>How do I see the current subscription price?</summary>
-        <div class="co-answer"><p>Desktop and Studio are monthly subscriptions. Checkout shows the current price before you buy, including the education rate for a verified <code>.edu</code> account. Enterprise is arranged directly. See <a href="/pricing/">pricing</a> for what each plan includes.</p></div>
-      </details>
-      <details>
-        <summary>How do cancellation and refunds work?</summary>
-        <div class="co-answer"><p>You can cancel a subscription from the billing portal; access continues through the period already paid for. Refund requests are handled under the published <a href="/legal/refunds/">refund policy</a>.</p></div>
-      </details>
-      <details>
-        <summary>Where can I get help?</summary>
-        <div class="co-answer"><p>Start with the <a href="/docs/">documentation</a> and <a href="/docs/troubleshooting/">troubleshooting guide</a>. For account or product help, email <a href="mailto:support@chudware.com">support@chudware.com</a>. Security reports go to <a href="mailto:security@chudware.com">security@chudware.com</a>.</p></div>
-      </details>
+      <h2 id="co-help" class="co-anchor">Help</h2>
+      <div class="co-faq-list">
+        <details class="co-faq" open>
+          <summary>Where can I get help?</summary>
+          <div class="co-faq-answer"><p>Start with the <a href="/docs/">documentation</a> and the <a href="/docs/troubleshooting/">troubleshooting guide</a>. Report bugs and ask questions in <a href={`${REPO}/issues`}>GitHub issues</a>; include your OS, the Chudware version, the steps you took, and the exact error text.</p></div>
+        </details>
+        <details class="co-faq">
+          <summary>How do I report a security vulnerability?</summary>
+          <div class="co-faq-answer"><p>Report it privately through <a href={`${REPO}/security/advisories/new`}>GitHub's private vulnerability reporting</a>, as described in the <a href={`${REPO}/security/policy`}>security policy</a>. Do not open a public issue for a vulnerability.</p></div>
+        </details>
+      </div>
     </div>
   </section>
 
@@ -132,7 +161,7 @@ import '../styles/company.css';
     <div class="wrap section-heading">
       <p class="eyebrow">Still deciding?</p>
       <h2>Try it on a real project.</h2>
-      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Start the trial</a><a class="button button-secondary" href="/contact/">Contact Chudware</a></div>
+      <div class="actions"><a class="button" href="/download/">Download</a><a class="button button-secondary" href={REPO}>View on GitHub</a></div>
     </div>
   </section>
 </BaseLayout>

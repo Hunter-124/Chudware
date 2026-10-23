@@ -231,9 +231,9 @@ GOLDEN DEMO (living E2E worked example):
   on an STM32F4 sensor-node board: verification ladder (ERC/DRC/hostcheck/sicheck/FPGA/
   PDN) → firmware project + co-verify (fw_sim_run with fixture:i2c_temp_tmp103 when
   Renode is present) → ecad_thermal_handoff → heatsink_select(U1, tj_target_c=85) →
-  power_budget → make_report. Wired into scripts/gate.sh as stage 4.7
-  (CHUDWARE_SKIP_FIN25=1 to opt out). Narrative + artifacts:
-  docs/reference/FIN25_SENSOR_NODE_GOLDEN_DEMO.md. Prefer this script over
+  power_budget → make_report. Run by scripts/gate.sh as the sensor-node demo stage
+  (CHUDWARE_SKIP_SENSOR_DEMO=1 to opt out). Narrative + artifacts:
+  docs/reference/SENSOR_NODE_DEMO.md. Prefer this script over
   inventing a new end-to-end recipe when demonstrating the content is finished.
 
 TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ribbon tab, and
@@ -316,51 +316,14 @@ TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ri
       within the local element size refuses (symmetry_domain_mismatch).
 
   Manufacturing: intent vs enforcement vs measurement (result.manufacturing):
-    intent only — min_member_mm is a lower bound on member size: with no filter_radius_mm the
-      filter radius is max(min_member_mm / 2, 2 x median element size) (summary
-      filter_radius_source; min_member_filter_radius_mm / mesh_floor_radius_mm when the mesh
-      floor won). Member thickness is NOT measured by the solver (DFAM min_wall measures it).
+    intent only — min_member_mm sets the filter radius; member thickness is NOT measured.
     enforced — symmetry/extrusion ties; no_enclosed_voids (BESO and level set reject updates
       that enclose a void; SIMP/RAMP treat it as a feasibility check).
-    heuristic — build_direction (or build_plate) + overhang_angle_deg + overhang_penalty
-      penalize unsupported material; this never guarantees a support-free part.
+    heuristic — build_direction + overhang_angle_deg + overhang_penalty penalize unsupported
+      material; this never guarantees a support-free part.
     measured on the reconstructed geometry — closed manifold surface, single body, passive
       regions kept, enclosed cavities, unsupported-overhang fraction, reanalysis response
-      limits; each check row reads pass | fail | not_measured. With a build direction the
-      overhang block also reports surface_unsupported_area_mm2 / _fraction measured on the
-      displayed surface (surface_measured_on: print | reconstruction).
-
-  3D printing (both surfaces; same study keys):
-    print_process — a preset id from services/sim/topology_print_processes.json (fdm_0.4,
-      fdm_0.6, resin, powder; topology_capabilities lists them). A preset writes
-      min_member_mm, overhang_angle_deg, overhang_penalty and no_enclosed_voids (only keys
-      the method x physics pair offers; powder erases the overhang keys). The GUI Apply
-      button overwrites those keys; the model tool fills only keys the study does not set.
-      FDM leaves enclosed voids allowed; resin/powder forbid them (trapped resin/powder).
-      The preset overhang_penalty 2 was measured on two clamped-beam studies: 23-32 % less
-      support area on the print surface for at most 6 % more compliance.
-    build_plate {faces:[sel]} — the face that rests on the bed. The solver derives the build
-      direction from its outward normal (direction = -normal). Refusals: build_plate_empty,
-      build_plate_not_planar (normals differ > 2 deg), build_plate_direction_conflict (an
-      explicit build_direction differs > 2 deg), build_plate_not_lowest (material extends
-      below the face; the message gives the depth). Overhang settings need a build direction
-      OR a bed face. enforcement.overhang.build_direction_source = build_plate | build_direction.
-    Print surface — surface_print.stl (artifact surface_print_stl) is the validated surface
-      after pinned Taubin smoothing (12 iterations): vertices on original part faces never
-      move; triangles whose smoothing would cross another or degenerate are rolled back to
-      their raw positions with their one-ring (up to 8 rounds, rollback_vertices), then the
-      iteration count halves. The result must be a valid single manifold with no
-      self-intersecting triangles, else it is refused (print_surface_invalid) and only
-      surface.stl remains. reconstruction.print_surface reports iterations used, rollback,
-      maximum displacement and volume change. The reanalysis is of surface.stl's clipped domain, not
-      the smoothed surface. The viewport overlay shows the print surface when it is valid
-      and offers the "Needs support" overhang field (0..1 per vertex) with a build direction.
-    DFAM — model-tool runs and GUI runs (worker topology_dfam) run services.dfam on the print
-      surface (else surface.stl) with the preset's process, nozzle and layer height and the
-      effective build direction (+Z, marked build_dir_assumed, when none was set).
-    Handoff — finished model-tool runs return print_handoff {surface_path, build_dir,
-      slice_part:{path, build_dir, material?}, import_part:{path, as_solid:true}}; pass the
-      user's printer to slice_part. The GUI's Continue in CAD and Export use the print surface.
+      limits; each check row reads pass | fail | not_measured.
 
   Reading a result:
     ok = the computation finished, not a certified design. converged = a stationary design
@@ -382,9 +345,8 @@ TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ri
 
   Artifacts are created exclusively, SHA-256 hashed and never overwritten: run.json,
     study.json, normalized_spec.json, history.jsonl / history.json, checkpoint.json,
-    density.vtu, reanalysis.vtu, overlay.aicm (viewport), surface.stl and surface_print.stl
-    (only when the geometry is valid; the print surface only when it validates), result.json.
-    Model-tool runs live under
+    density.vtu, reanalysis.vtu, overlay.aicm (viewport), surface.stl (only when the geometry
+    is valid), result.json. Model-tool runs live under
     <project>/simulation/topology/<study>/<run_id>/ (or a project-relative
     topology.result_dir) with source.step, inputs/setup/provenance JSON. checkpoint.json holds
     retained optimizer state, but sim_run_topology takes no resume input: a cancelled,
@@ -395,9 +357,8 @@ TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ri
   Human workflow (Topology tab): New Study (needs an open part with solid geometry) → Method
     (physics, method, objective, volume budget, limits; only supported pairs) → Material →
     Fixture / Force / Pressure / Heat / Flow (pick faces in the viewport; load cases in the
-    boundary panel) → Preserve / Exclude → Mfg. Rules (print process preset + Apply, bed
-    face pick, build direction, overhang, enclosed voids) → Mesh → Run (progress, Cancel) →
-    Results: convergence history, constraints, manufacturing checks with DFAM rows, artifacts. "Show in
+    boundary panel) → Preserve / Exclude → Mfg. Rules → Mesh → Run (progress, Cancel) →
+    Results: convergence history, constraints, manufacturing checks, artifacts. "Show in
     viewport" overlays density/fields; Export copies a run file to a path you choose
     (surfaces only when geometry is valid); Compare sets a baseline run (metrics compare only
     for the same physics, objective and units); "Use these settings" restores a run's scalar
@@ -438,8 +399,8 @@ TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ri
       post-buckling or design-dependent convection.
     The output is a mesh surface plus fields, NOT a reconstructed parametric CAD feature
       history.
-    print_ready stays false. A DFAM check of the print surface is evidence, not a print gate,
-      and nothing is sliced automatically. Slice surface_print.stl (print_handoff) with
+    print_ready stays false. A DFAM check of the surface (model-tool runs) is evidence, not
+      a print gate, and nothing is sliced automatically. Slice the exported surface.stl with
       slice_part; only its passing G-code check makes a part print-ready.
 
 SIMULATE WORKSPACE (host GUI): every live simulation family has guided setup plus

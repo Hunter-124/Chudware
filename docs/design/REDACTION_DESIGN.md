@@ -1,11 +1,11 @@
-# Redaction / restricted-data compliance (WS3)
+# Redaction / restricted-data compliance
 
-> **WS3 design record; not a compliance certification or universal transport guarantee.**
+> **Design record; not a compliance certification or universal transport guarantee.**
 > The wrapper described below is `services/agent/redaction.py::RedactingProvider`,
 > applied by `services/agent/config.py::get_provider`. Its existence does not prove
 > that every outbound path traverses it, nor that a regex scrub makes cloud submission
 > of controlled data safe. Online agent turns follow
-> [Chudcode integration](../../.claude/skills/cad-chudcode-integration/SKILL.md), not a
+> [Chudcode integration](../dev/chudcode-integration.md), not a
 > second Python provider loop. Audit the actual transport and data boundary before
 > relying on this design for restricted-data handling; the limitations and v2 proposals
 > below remain part of the record, not shipped assurances.
@@ -88,7 +88,7 @@ Seam: `config.get_provider` wraps with `redaction.wrap_provider` when mode is
 
 ## Redaction role
 
-First-class role (WS2 `ai_roles.redaction` / `role_models.resolve_role_model`).
+First-class role (`ai_roles.redaction` / `role_models.resolve_role_model`).
 **Must** resolve to a loopback provider; cloud assignment is refused (hard).
 If unresolved or non-loopback, v1 runs deterministic-only.
 

@@ -464,7 +464,7 @@ std::string insert_error(const std::string& did, const std::string& source_path)
 
 // 2026-10-10 six-axis trace: sources copied from a SAVED assembly (`parts/redesign/x.step+`,
 // relative to its file) into a NEW unsaved assembly resolved against hostd's cwd and
-// failed "doc_open: no such file: /home/hunter/parts/...". An unsaved assembly resolves
+// failed "doc_open: no such file: $HOME/parts/...". An unsaved assembly resolves
 // relative sources against the project folder doc_new received, never the process cwd.
 TEST_CASE("unsaved assembly resolves relative component sources against its project folder") {
     const fs::path project = tmp("relative_source_project");

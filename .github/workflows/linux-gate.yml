@@ -1,302 +1,123 @@
-# The full Linux gate: everything scripts/gate.sh runs, plus the two suites it
-# has never run itself.
+# The full Linux gate: everything scripts/gate.sh runs (check.py, the OCCT core
+# build, the host GUI build, the WASM smoke, ctest, the hostd smoke, the Python
+# service suites and the headless screenshot smoke), plus the host GUI ctest
+# suite and the web/gateway and web/deploy tests, which gate.sh does not run itself.
 #
-# gate.sh is the repository's real build+test gate — check.py, the OCCT core
-# build, the host GUI build, the WASM smoke, ctest, the hostd daemon smoke, the
-# web-parity probe, the Python service suites, and the headless shot smoke.
-# Locally it is deliberately lenient: a box without OCCT, emsdk, or the service
-# venv reports SKIP and stays green, because a developer should not have to
-# provision the world to run it.
+# Locally gate.sh reports a missing toolchain as SKIP so developers do not have
+# to provision everything. CHUDWARE_GATE_STRICT=1 turns every such SKIP into a
+# failure here, so a broken CI environment can never pass by testing nothing.
 #
-# That leniency is a false green in CI. A runner that lost its toolchain would
-# report PASS having compiled and tested nothing, and nobody would look again
-# until a release failed. So this job sets CHUDWARE_GATE_STRICT=1, which turns
-# every environment SKIP — no cmake, no OCCT, no emsdk, no venv, no collected
-# tests — into a hard failure. Opt-in stages (the AppImage build, the
-# openEMS/Renode benches) stay opt-in; they are off by choice, not by fault.
-# Consequence: cc-linux-build must stay provisioned with cmake+ninja, system
-# OCCT, emsdk, and the service venv, and a red gate naming a missing capability
-# is a provisioning ticket, not a code defect.
-#
-# Two suites gate.sh has never invoked run here explicitly:
-#   * ctest --test-dir host/build-linux — the host GUI tree's own tests. gate.sh
-#     builds the native default targets, including these test binaries, but only
-#     ctests the core tree; this step runs the host suite.
-#   * pytest Webservice/gateway/tests — the FastAPI gateway suite. It lives
-#     outside the paths gate.sh sweeps and needs the gateway's own venv.
-#
-# master only. Pull requests get fast-gate; this one is expensive and holds the
-# Linux builder for the better part of an hour.
+# The job runs in a fedora:44 container because the core needs OCCT 7.9.x
+# (Fedora's opencascade-devel); .github/scripts/install-fedora-deps.sh lists
+# every system package.
 name: linux-gate
 
 on:
   push:
     branches: [master]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Never cancel: this gate is the merge signal for master, and a cancelled run
-# is indistinguishable from an unrun one.
 concurrency:
-  group: linux-gate-${{ github.ref }}
-  cancel-in-progress: false
+  group: linux-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   gate:
     name: Full Linux gate (strict)
-    # Manual dispatch may select branch code: this gate always uses a one-job
-    # disposable VM, including its HOME, Python and RUNNER_TOOL_CACHE.
-    runs-on:
-      group: chudware-untrusted-ephemeral
-      labels: [self-hosted, Linux, X64, cc-linux-disposable]
-    # The strict gate alone now takes ~2 h on livingroom-pc (host test binaries are built and
-    # run since 2026-10-01); 120 min cancelled the trailing Webservice pytest step.
-    timeout-minutes: 180
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:44
+      # Large preinstalled SDKs on the host that this job never uses. They are
+      # mounted only so the first step can delete them and free disk space.
+      volumes:
+        - /usr/local/lib/android:/host/android
+        - /usr/share/dotnet:/host/dotnet
+        - /opt/ghc:/host/ghc
+    timeout-minutes: 345
     env:
-      # The whole point of this job. See the header block above.
       CHUDWARE_GATE_STRICT: '1'
+      EMSDK_VERSION: 6.0.3
     steps:
-      - name: Check runner capabilities
-        shell: bash
-        run: |
-          set -euo pipefail
+      - name: Free disk space on the host
+        run: rm -rf /host/android/* /host/dotnet/* /host/ghc/*
 
-          # Named up front. Under CHUDWARE_GATE_STRICT=1 a missing tool fails the
-          # gate anyway, but it fails 20 minutes in with a stage label; here it
-          # fails in two seconds with the tool name.
-          missing=()
-          for tool in python3 cmake ninja ctest git tar xvfb-run; do
-            command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
-          done
-          if [ "${#missing[@]}" -ne 0 ]; then
-            echo "::error::runner ${RUNNER_NAME:-unknown} is missing required tools: ${missing[*]}"
-            exit 1
-          fi
-
-          if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
-            echo "::error::python3 must be >= 3.11; the pinned NumPy and SciPy needed by check.py do not support older interpreters"
-            exit 1
-          fi
-
-          # Reconstruct authenticated bytes immediately before trusted use;
-          # extracted-only caches and alternate SDK directories are not identities.
-          cef_root="$(bash scripts/fetch_cef_posix.sh \
-            --destination-root "${RUNNER_TEMP}/cef-authenticated-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")"
-          echo "CEF_ROOT=${cef_root}" >> "$GITHUB_ENV"
-          echo "cef-root=${cef_root}"
-
-          echo "runner=${RUNNER_NAME:-unknown} host=$(hostname -s)"
-          uname -a
-          python3 --version
-          cmake --version | head -n 1
-          ninja --version
-          df -h "${RUNNER_TEMP:-/tmp}" "$HOME"
-          # Keep gate logs and subprocess scratch on the per-job disk-backed
-          # runner temp; the shared /tmp user quota is already full of old
-          # simulation caches and must not make this gate fail silently.
-          echo "TMPDIR=${RUNNER_TEMP}" >> "$GITHUB_ENV"
-          echo "GATE_TMPDIR=${RUNNER_TEMP}/chudware-gate" >> "$GITHUB_ENV"
+      - name: Install git
+        run: dnf -y install git
 
       - name: Check out repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # gate.sh generates the version header from `git describe --tags`, so
-          # a shallow clone without tags would silently produce 0.0.0.
+          # gate.sh generates the version header from `git describe --tags`.
           fetch-depth: 0
 
-      - name: Provision ngspice for live circuit parity
+      - name: Install system dependencies
+        run: bash .github/scripts/install-fedora-deps.sh gate
+
+      - name: Fetch the pinned CEF SDK
         shell: bash
         run: |
           set -euo pipefail
-          ngspice_bin="$(command -v ngspice || true)"
-          if [ -z "${ngspice_bin}" ]; then
-            # Download the builder's real distro package without granting the
-            # CI service account root or weakening the live backend assertions.
-            if command -v apt-get >/dev/null 2>&1 && command -v dpkg-deb >/dev/null 2>&1; then
-              package_dir="$(mktemp -d "${RUNNER_TEMP}/gate-ngspice.XXXXXX")"
-              pushd "${package_dir}"
-              mkdir -p cache debs/partial
-              apt-get -o Debug::NoLocking=1 -o Dir::Cache="${package_dir}/cache" \
-                -o Dir::Cache::archives="${package_dir}/debs" \
-                --assume-yes --download-only install ngspice
-              for package in debs/*.deb; do
-                dpkg-deb --extract "${package}" root
-              done
-              popd
-              # Debian's spinit contains absolute code-model paths. Relocate the
-              # real models with the extracted package, not a substitute solver.
-              python3 - "${package_dir}/root" <<'PY'
-          import sys
-          from pathlib import Path
-          root = Path(sys.argv[1])
-          init = root / "usr/share/ngspice/scripts/spinit"
-          models = root / "usr/lib/x86_64-linux-gnu/ngspice"
-          init.write_text(init.read_text().replace("/usr/lib/x86_64-linux-gnu/ngspice/", f"{models}/"))
-          PY
-              ngspice_bin="${package_dir}/ngspice"
-              cat > "${ngspice_bin}" <<'SH'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-          export LD_LIBRARY_PATH="${here}/root/usr/lib/x86_64-linux-gnu:${here}/root/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-          export SPICE_SCRIPTS="${here}/root/usr/share/ngspice/scripts"
-          exec "${here}/root/usr/bin/ngspice" "$@"
-          SH
-              chmod +x "${ngspice_bin}"
-              echo "CHUDWARE_NGSPICE=${ngspice_bin}" >> "$GITHUB_ENV"
-            else
-              echo "::error::provision ngspice on this builder; rootless Debian package extraction is unavailable"
-              exit 1
-            fi
-          fi
-          "${ngspice_bin}" --version
+          cef_root="$(bash scripts/fetch_cef_posix.sh --destination-root "${RUNNER_TEMP}/cef")"
+          echo "CEF_ROOT=${cef_root}" >> "$GITHUB_ENV"
 
-      # Most check.py audits use only the standard library; advertised_tool_audit
-      # imports the live MCP registry and needs exactly these six packages (langgraph
-      # gates every family services/mcp/server.py registers after services.dag).
-      # Keep this identical to fast-gate and read pins from the product requirements.
-      - name: Provision the check.py import surface
+      - name: Install emsdk ${{ env.EMSDK_VERSION }}
         shell: bash
         run: |
           set -euo pipefail
+          emsdk="${RUNNER_TEMP}/emsdk"
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git "${emsdk}"
+          "${emsdk}/emsdk" install "${EMSDK_VERSION}"
+          "${emsdk}/emsdk" activate "${EMSDK_VERSION}"
+          echo "EMSDK=${emsdk}" >> "$GITHUB_ENV"
 
-          req="${RUNNER_TEMP}/check-requirements.txt"
-          grep -E '^(pyyaml|mcp|numpy|scipy)==|^(langgraph|langgraph-checkpoint-sqlite)>=' requirements.txt > "${req}"
-          found="$(wc -l < "${req}" | tr -d ' ')"
-          if [ "${found}" -ne 6 ]; then
-            echo "::error::expected pinned pyyaml, mcp, numpy, scipy, langgraph and langgraph-checkpoint-sqlite in requirements.txt, found ${found}"
-            exit 1
-          fi
-
-          if python3 -c 'import yaml, mcp, numpy, scipy, langgraph, langgraph.checkpoint.sqlite' 2>/dev/null; then
-            check_python="$(command -v python3)"
-            echo "import surface already present in ${check_python}"
-          else
-            venv="${RUNNER_TEMP}/check-venv"
-            python3 -m venv "${venv}"
-            "${venv}/bin/python" -m pip install --quiet --disable-pip-version-check --upgrade pip
-            "${venv}/bin/python" -m pip install --quiet --disable-pip-version-check -r "${req}"
-            "${venv}/bin/python" -c 'import yaml, mcp, numpy, scipy, langgraph, langgraph.checkpoint.sqlite; print("import surface OK")'
-            check_python="${venv}/bin/python"
-          fi
-          echo "CHECK_PYTHON=${check_python}" >> "$GITHUB_ENV"
-
-      - name: Refresh the service runtime and gate dependencies
+      - name: Provision the service virtualenv
         shell: bash
         run: |
           set -euo pipefail
-
-          # The image carries a reviewed offline wheelhouse, not private source
-          # credentials. All installed state dies with this one-job VM.
-          : "${CHUDWARE_WHEELHOUSE:?qualify the disposable image with an offline locked wheelhouse}"
-          venv="${RUNNER_TEMP}/gate-runtime"
-          VENV_DIR="${venv}" CHUDWARE_WHEELHOUSE="${CHUDWARE_WHEELHOUSE}" \
-            PYTHON="$(command -v python3)" bash scripts/provision_venv.sh
-          # CI's reviewed target snapshot includes pytest and DVC plus their
-          # complete wheel closure. Never mutate the authenticated runtime with
-          # a second pip install after its identity/stamp has been verified.
-          "${venv}/bin/python" -c 'from importlib.metadata import version; import pyproj, dvc, pytest; assert version("dvc") == "3.67.1", "CI requires reviewed DVC 3.67.1 wheels"; print("locked gate runtime imports OK")'
-          test -x "${venv}/bin/dvc"
+          venv="${RUNNER_TEMP}/gate-venv"
+          VENV_DIR="${venv}" PYTHON=python3.13 bash scripts/provision_venv.sh pytest==9.1.1 dvc==3.67.1
+          {
+            echo "CHUDWARE_GATE_PYTHON=${venv}/bin/python"
+            echo "CHECK_PYTHON=${venv}/bin/python"
+            echo "GATE_TMPDIR=${RUNNER_TEMP}/chudware-gate"
+          } >> "$GITHUB_ENV"
           echo "${venv}/bin" >> "$GITHUB_PATH"
-          echo "CHUDWARE_GATE_PYTHON=${venv}/bin/python" >> "$GITHUB_ENV"
 
-      - name: Run scripts/gate.sh (CHUDWARE_GATE_STRICT=1)
+      - name: Run scripts/gate.sh
         shell: bash
         run: |
           set -euo pipefail
-
           log="${RUNNER_TEMP}/gate.log"
           status=0
           bash scripts/gate.sh 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
-
-          # The summary block gate.sh prints is the whole verdict, one line per
-          # stage. Job logs and step summaries are not metered; artifacts are.
           {
             echo '## scripts/gate.sh (strict)'
             echo '```text'
             sed -n '/Chudware Linux gate — summary/,$p' "${log}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-
           exit "${status}"
 
-      - name: ctest — host GUI tree
+      - name: ctest host GUI tree
         shell: bash
         run: |
           set -euo pipefail
+          # gate.sh builds the host test binaries but only runs the core suite.
+          ctest --test-dir host/build-linux --output-on-failure --no-tests=error
 
-          # gate.sh builds the native default targets (GUI + test binaries), but
-          # only ctests the core tree. Run the host suite in that same build tree.
-          if [ ! -f host/build-linux/CTestTestfile.cmake ]; then
-            echo "::error::host/build-linux has no CTest configuration; the host build stage did not complete"
-            exit 1
-          fi
-
-          log="${RUNNER_TEMP}/host-ctest.log"
-          status=0
-          ctest --test-dir host/build-linux --output-on-failure 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
-
-          # Zero tests is a harness break, not a pass: this suite exists.
-          if grep -qE 'No tests were found' "${log}"; then
-            echo "::error::ctest found no tests in host/build-linux; the suite did not run"
-            exit 1
-          fi
-
-          {
-            echo '## ctest — host/build-linux'
-            echo '```text'
-            tail -n 30 "${log}"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          exit "${status}"
-
-      - name: pytest — Webservice gateway
+      - name: pytest web/gateway and web/deploy
         shell: bash
         run: |
           set -euo pipefail
-
-          # The gateway has its own venv with FastAPI and its test deps; the
-          # service venv gate.sh uses does not carry them. The venv is
-          # gitignored, so on a fresh CI checkout it never exists -- it is a
-          # build artifact, not a provisioning capability, and treating its
-          # absence as a provisioning failure would make this gate red on every
-          # clean runner forever. Build it, and be strict about the build
-          # FAILING: a venv that cannot be created is a real defect.
-          venv_py="Webservice/gateway/.venv/bin/python"
-          if [ ! -x "${venv_py}" ]; then
-            echo "creating Webservice/gateway/.venv"
-            python3 -m venv Webservice/gateway/.venv
-          fi
-          "${venv_py}" -m pip install --quiet --upgrade pip
-          "${venv_py}" -m pip install --quiet -r Webservice/gateway/requirements.txt
-          # Worker security/billing contracts build the live MCP tool registry.
-          # These are test prerequisites, not gateway deployment dependencies.
-          "${venv_py}" -m pip install --quiet -r "${RUNNER_TEMP}/check-requirements.txt"
-          if ! "${venv_py}" -c 'import pytest' 2>/dev/null; then
-            # pytest is a test-only dep and is deliberately absent from the
-            # pinned runtime requirements, which the deployment venv installs.
-            "${venv_py}" -m pip install --quiet pytest
-          fi
-
-          log="${RUNNER_TEMP}/gateway-pytest.log"
-          status=0
-          (cd Webservice/gateway && .venv/bin/python -m pytest tests -q) 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
-
-          # pytest exits 5 on "no tests collected". That is a harness break here.
-          if [ "${status}" -eq 5 ]; then
-            echo "::error::pytest collected zero tests under Webservice/gateway/tests; the suite did not run"
-            exit 1
-          fi
-
-          {
-            echo '## pytest — Webservice/gateway/tests'
-            echo '```text'
-            tail -n 30 "${log}"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          exit "${status}"
+          venv="${RUNNER_TEMP}/gateway-venv"
+          python3.13 -m venv "${venv}"
+          "${venv}/bin/python" -m pip install --disable-pip-version-check -r web/gateway/requirements.txt pytest==9.1.1
+          cd web/gateway
+          "${venv}/bin/python" -m pytest tests -q
+          # The real-kernel quota cases skip unless CHUDWARE_TEST_QUOTA_PLAN is set.
+          "${venv}/bin/python" -m pytest ../deploy/tests -q

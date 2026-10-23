@@ -3,13 +3,11 @@ from __future__ import annotations
 
 import io
 import json
-from pathlib import Path
 
 import pytest
 
 from services.agent.agent_turn import _bind_tool
 from tools.flywheel.bench import categories
-from tools.flywheel.bench import runner as bench_runner
 from tools.flywheel.bench.gym import challenges
 
 
@@ -124,42 +122,3 @@ def test_challenge_discovery_names_import_failure(monkeypatch):
     monkeypatch.setattr(challenges.importlib, "import_module", broken_import)
     with pytest.raises(ImportError, match=r"c13_sketch_repair.*SyntaxError"):
         challenges.load_challenges()
-
-
-def test_bench_discovery_records_errors_and_strict_mode_raises(monkeypatch):
-    real_import = bench_runner.importlib.import_module
-
-    def broken_import(name: str):
-        if name.endswith(".advisor_e2e"):
-            raise SyntaxError("planted syntax failure")
-        return real_import(name)
-
-    monkeypatch.setattr(bench_runner.importlib, "import_module", broken_import)
-    errors = bench_runner.discover_benches(strict=False)
-    assert errors == [{
-        "module": "tools.flywheel.bench.benches.advisor_e2e",
-        "error_type": "SyntaxError",
-        "error": "planted syntax failure",
-    }]
-    with pytest.raises(ImportError, match=r"advisor_e2e.*SyntaxError"):
-        bench_runner.discover_benches(strict=True)
-
-
-def test_runner_owned_temp_dir_is_removed_on_failure(tmp_path, monkeypatch):
-    owned = tmp_path / "runner-owned"
-
-    def make_owned(*, prefix: str) -> str:
-        owned.mkdir()
-        return str(owned)
-
-    class BrokenDriver:
-        @staticmethod
-        def run(smoke: bool, workdir: str):
-            assert Path(workdir) == owned
-            raise RuntimeError("boom")
-
-    monkeypatch.setattr(bench_runner.tempfile, "mkdtemp", make_owned)
-    monkeypatch.setitem(bench_runner.REGISTRY, "broken-cleanup", BrokenDriver())
-    with pytest.raises(RuntimeError, match="boom"):
-        bench_runner.run_bench("broken-cleanup", write=False)
-    assert not owned.exists()

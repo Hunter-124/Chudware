@@ -12,12 +12,15 @@ Engine-bound tools use `core_bridge.call`. It defaults to the shared
 in-process instead. There is no C++ MCP server.
 
 ## Canonical guidance
-- `.claude/skills/cad-chudcode-integration/SKILL.md` — host-tool projection, allowlist
-  tri-state, floors, CAD chokepoints, result envelopes.
-- `.claude/skills/chudware-dev/SKILL.md` — persistence/save invariants (`cad_common`),
+- `docs/dev/chudcode-integration.md` — host-tool projection, allowlist tri-state, floors,
+  CAD chokepoints, result envelopes.
+- `docs/dev/engineering-notes.md` — persistence/save invariants (`cad_common`),
   manufacturing/print rules.
-- `work/context/services-mcp.md` (`/ctx-services-mcp`) — the source map.
-- `work/WORKFLOW.md` §3 — the MCP freshness rule.
+- Tool-surface freshness: a change to an agent-facing tool, prompt, or workflow updates the
+  server instructions in `server.py` and the matching `cad_guide.py` topics in the same
+  change. `test_mcp_freshness.py` fails when a registered tool appears in neither;
+  `scripts/advertised_tool_audit.py` (run by `scripts/check.py`) audits the advertised
+  tool surface.
 
 ## Entry points
 - `python -m services.mcp.server` — the stdio server.

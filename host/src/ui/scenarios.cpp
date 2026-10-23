@@ -56,12 +56,6 @@
 #include "firmware/fw_workspace.h"
 #include "engine_backend.h"
 #include "ipc_client.h"
-#ifndef __EMSCRIPTEN__
-#include "account_panel.h"
-#include "security/event_queue.h"
-#include "util/device_identity.h"
-#include "util/secret_store.h"
-#endif
 
 namespace {
 
@@ -166,238 +160,6 @@ struct SceneShotInput {
         return true;
     }
 };
-
-#ifndef __EMSCRIPTEN__
-// CHUDWARE_SHOT=entitlement_delayed uses the ordinary tick-triggered refresh and
-// real HTTP worker against an owned held error response. The opaque bearer and
-// storage sentinels are NOT signed entitlement/policy/enforcement authority.
-struct DelayedAccountShot {
-    bool init = false, want = false, done = false, failed = false;
-    int step = 0;
-    std::chrono::steady_clock::time_point started;
-    std::filesystem::path root, control;
-    nlohmann::json report, signedOutState;
-    using Secret = std::pair<bool, std::vector<unsigned char>>;
-    std::map<std::string, Secret> signedOutSecrets;
-    std::map<std::string, std::string> signedOutFiles;
-} g_delayedAccount;
-
-const char* const kDelayedAccountSecrets[] = {
-    "entitlement", "entitlement-subject-v1", "security-policy-v1",
-    "device-signing-pending-v1", "device-signing-v1", "entitlement-seal-key-v1",
-    "security-state-v1", "security-event-counters-v1",
-};
-
-nlohmann::json delayedAccountState(const AppState& st) {
-    return {{"signed_in", st.entitlementSignedIn}, {"read_only", st.entitlementReadOnly},
-            {"token_empty", st.entitlementToken.empty()}, {"plan", st.entitlementPlan},
-            {"email", st.entitlementEmail}, {"status", st.entitlementStatus},
-            {"mutation_verified", st.entitlementMutationVerified},
-            {"ai_verified", st.entitlementAiVerified},
-            {"banner_height", ui::entitlementBannerHeight(st)}};
-}
-
-DelayedAccountShot::Secret delayedAccountSecret(const char* account) {
-    std::vector<unsigned char> bytes;
-    const bool present = chudware::secret_store::load(
-        "com.chudware.desktop", account, bytes, appdataAppDir());
-    return {present, std::move(bytes)};
-}
-
-std::map<std::string, std::string> delayedAccountFiles() {
-    std::map<std::string, std::string> files;
-    for (const char* relative : {"security/events.v1",
-            "secrets/com_chudware_desktop-device-refresh-sequence-v1.state"}) {
-        std::ifstream in(std::filesystem::path(appdataAppDir()) / relative, std::ios::binary);
-        std::ostringstream out;
-        out << in.rdbuf();
-        files.emplace(relative, out.str());
-    }
-    return files;
-}
-
-bool delayedAccountCheck(const char* name, bool ok, const nlohmann::json& evidence = {}) {
-    auto& P = g_delayedAccount;
-    P.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
-    std::printf("entitlement_delayed: %s %s\n", ok ? "PASS" : "FAIL", name);
-    std::fflush(stdout);
-    if (!ok) {
-        P.report["failure"] = name;
-        P.failed = P.done = true;
-    }
-    return ok;
-}
-
-nlohmann::json delayedAccountMarker(const char* name) {
-    std::ifstream in(g_delayedAccount.control / name);
-    if (!in) return {};
-    try { return nlohmann::json::parse(in); }
-    catch (...) { return {}; }
-}
-
-void delayedAccountTick(AppState& st) {
-    auto& P = g_delayedAccount;
-    if (!P.init) {
-        P.init = true;
-        const char* mode = std::getenv("CHUDWARE_SHOT");
-        P.want = st.shot && mode && std::strcmp(mode, "entitlement_delayed") == 0;
-        if (!P.want) return;
-        P.started = std::chrono::steady_clock::now();
-        P.report = {{"scenario", "entitlement_delayed"}, {"ok", false},
-                    {"proof", "real held HTTP error; no trusted entitlement fixture"},
-                    {"checks", nlohmann::json::array()}};
-        const char* root = std::getenv("CHUDWARE_ENTITLEMENT_DELAYED_ROOT");
-        P.root = root && *root ? std::filesystem::path(root) : std::filesystem::path();
-        P.control = P.root / "control";
-        auto ownedPath = [&](const char* path) {
-            if (!path || !*path || !P.root.is_absolute()) return false;
-            const auto relative = std::filesystem::path(path).lexically_normal()
-                .lexically_relative(P.root.lexically_normal());
-            return !relative.empty() && !relative.is_absolute() &&
-                *relative.begin() != ".." && relative != ".";
-        };
-        const char* daemon = std::getenv("CHUDWARE_ENGINE_DAEMON");
-        const char* endpoint = std::getenv("CHUDWARE_ENTITLEMENT_REFRESH_URL");
-        const auto fixture = delayedAccountMarker("fixture.json");
-        if (!delayedAccountCheck("owned_isolated_fixture",
-                ownedPath(appdataAppDir().c_str()) && ownedPath(std::getenv("HOME")) &&
-                ownedPath(std::getenv("CHUDWARE_SESSIONS_DIR")) &&
-                daemon && std::strcmp(daemon, "0") == 0 && endpoint && fixture.is_object() &&
-                fixture.value("scenario", "") == "entitlement_delayed" &&
-                fixture.value("loopback_only", false) &&
-                fixture.value("refresh_url", "") == endpoint &&
-                std::string(endpoint).rfind("http://127.0.0.1:", 0) == 0))
-            return;
-    }
-    if (!P.want || P.done) return;
-    if (std::chrono::steady_clock::now() - P.started > std::chrono::seconds(30)) {
-        delayedAccountCheck("completion_timeout", false, {{"step", P.step}});
-        return;
-    }
-    if (st.frame < 3) return;
-    switch (P.step) {
-    case 0: {
-        if (!delayedAccountCheck("initial_workers_idle", ui::desktopAccountRequestsIdle())) return;
-        const std::string dir = appdataAppDir();
-        const auto identity = chudware::device_identity::ensureForAuthorization(dir);
-        const auto candidate = chudware::device_identity::prepareAuthorizationKey(dir);
-        bool seeded = identity.status == chudware::device_identity::KeyStatus::Ready &&
-                      candidate.status == chudware::device_identity::KeyStatus::Ready;
-        const std::vector<unsigned char> sentinel{'o', 'w', 'n', 'e', 'd', '-', 'u', 'n', 's', 'i', 'g', 'n', 'e', 'd'};
-        for (const char* account : {"entitlement", "entitlement-subject-v1",
-                                    "security-policy-v1", "security-state-v1"})
-            seeded = chudware::secret_store::store("com.chudware.desktop", account, sentinel, dir) && seeded;
-        seeded = chudware::secret_store::store("com.chudware.desktop", "entitlement-seal-key-v1",
-                                              std::vector<unsigned char>(32, 0x5a), dir) && seeded;
-        chudware::security::EventQueue queue(dir);
-        std::string error;
-        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        seeded = queue.append({"heartbeat", now, chudware::security::securityEventScore("heartbeat")},
-                              &error) && seeded;
-        const auto batch = queue.prepareBatch("owned-fixture-subject", "standard",
-                                              "fixture", "linux", now, &error);
-        if (!delayedAccountCheck("real_owned_storage_and_device_key_seeded",
-                seeded && static_cast<bool>(batch) && queue.size() > 0,
-                {{"error", error}, {"pending_sequence", batch.sequence}})) return;
-        // The normal tick below launches startRefresh. No mailbox/result injection
-        // and no local grant of editing authority is involved.
-        st.entitlementSignedIn = true;
-        st.entitlementReadOnly = true;
-        st.entitlementToken = "unsigned-owned-fixture-bearer";
-        st.entitlementStatus = "Owned unsigned request fixture";
-        ++P.step;
-        return;
-    }
-    case 1: {
-        const auto received = delayedAccountMarker("received.json");
-        if (received.is_null()) return;
-        if (!delayedAccountCheck("real_refresh_request_held_before_signout",
-                received.value("request_index", 0) == 1 &&
-                received.value("signature_verified", false) &&
-                !ui::desktopAccountRequestsIdle(), received)) return;
-        std::map<std::string, DelayedAccountShot::Secret> beforeSecrets;
-        for (const char* account : kDelayedAccountSecrets)
-            beforeSecrets[account] = delayedAccountSecret(account);
-        const auto beforeFiles = delayedAccountFiles();
-        ui::signOutDesktopAccount(st);
-        P.signedOutState = delayedAccountState(st);
-        for (const char* account : kDelayedAccountSecrets)
-            P.signedOutSecrets[account] = delayedAccountSecret(account);
-        P.signedOutFiles = delayedAccountFiles();
-        const auto& secrets = P.signedOutSecrets;
-        bool erased = true;
-        for (const char* account : {"entitlement", "entitlement-subject-v1",
-                                    "security-policy-v1", "device-signing-pending-v1"})
-            erased = erased && !secrets.at(account).first;
-        bool retained = true;
-        for (const char* account : {"device-signing-v1", "entitlement-seal-key-v1",
-                                    "security-state-v1", "security-event-counters-v1"})
-            retained = retained && secrets.at(account).first &&
-                       secrets.at(account) == beforeSecrets.at(account);
-        if (!delayedAccountCheck("signout_erases_session_retains_identity_and_security",
-                erased && retained && !st.entitlementSignedIn && st.entitlementReadOnly &&
-                st.entitlementToken.empty() && P.signedOutFiles == beforeFiles &&
-                std::all_of(P.signedOutFiles.begin(), P.signedOutFiles.end(),
-                    [](const auto& entry) { return !entry.second.empty(); }), P.signedOutState)) return;
-        std::ofstream release(P.control / "release", std::ios::trunc);
-        release << "signed out\n";
-        release.close();
-        if (!delayedAccountCheck("held_response_released_after_signout", static_cast<bool>(release))) return;
-        ++P.step;
-        return;
-    }
-    case 2: {
-        const auto sent = delayedAccountMarker("sent.json");
-        if (sent.is_null() || !ui::desktopAccountRequestsIdle()) return;
-        if (!delayedAccountCheck("real_error_sent_and_worker_reaped",
-                sent.value("status", 0) == 503 && sent.value("released", false), sent)) return;
-        ui::tickAccountPanel(st);  // exercise the production UI-owner commit path once more
-        const auto after = delayedAccountState(st);
-        if (!delayedAccountCheck("late_completion_cannot_mutate_account_or_banner",
-                after == P.signedOutState, {{"signed_out", P.signedOutState}, {"after_tick", after}})) return;
-        nlohmann::json storage = nlohmann::json::object();
-        bool unchanged = true;
-        for (const char* account : kDelayedAccountSecrets) {
-            const bool same = delayedAccountSecret(account) == P.signedOutSecrets.at(account);
-            storage[account] = same;
-            unchanged = unchanged && same;
-        }
-        storage["event_queue_and_refresh_sequence_bytes"] = delayedAccountFiles() == P.signedOutFiles;
-        unchanged = unchanged && storage["event_queue_and_refresh_sequence_bytes"].get<bool>();
-        if (!delayedAccountCheck("late_completion_cannot_mutate_credentials_or_security",
-                                 unchanged, storage)) return;
-        P.report["ok"] = true;
-        P.done = true;
-        return;
-    }
-    }
-}
-
-bool delayedAccountEndFrame(AppState& st, int dw, int dh,
-                            const char* screenshotPath, bool& breakLoop) {
-    auto& P = g_delayedAccount;
-    if (!P.want) return false;
-    ++st.frame;
-    breakLoop = false;
-    if (P.done) {
-        writeBackbufferPng(screenshotPath, dw, dh);
-        std::ofstream out(P.root / "report.json", std::ios::trunc);
-        out << P.report.dump(2) << '\n';
-        out.close();
-        std::printf("entitlement_delayed: report -> %s ok=%d\n",
-                    (P.root / "report.json").string().c_str(), !P.failed);
-        std::fflush(stdout);
-        if (P.failed || !out) {
-            std::fflush(nullptr);
-            std::_Exit(EXIT_FAILURE);
-        }
-        breakLoop = true;
-    }
-    glfwSwapBuffers(st.win);
-    return true;
-}
-#endif
 
 // ---------- piping scenario (CHUDWARE_SHOT=piping) ----------
 // A fresh part with a 200 mm box in the way opens Simulate > Piping; a 2" sch 40 pipe is routed
@@ -3317,7 +3079,6 @@ void agentLockTick(AppState& st) {
     case 0: {
         st.showRibbon = true;
         st.activeWorkspace = AppState::Workspace::Model;
-        st.entitlementReadOnly = false;
         if (!agentLockCheck("new_part", st.docMirror.newPart(st.worker, err), {{"error", err}})) return;
         st.addDocTab(false);
         P.doc = st.docMirror.docId();
@@ -3615,7 +3376,6 @@ void featureStateTick(AppState& st) {
     case 0: {
         st.activeWorkspace = AppState::Workspace::Model;
         st.settings.units = Units::MMGS;
-        st.entitlementReadOnly = false;
         st.workspaceDir = std::filesystem::absolute(P.dir).string();
         const bool created = st.docMirror.newPart(st.worker, err);
         if (!featureStateCheck("new_part", created, {{"error", err}})) return;
@@ -9299,9 +9059,6 @@ void ScenarioRunner::tick(AppState& st) {
     steerStatusTick(st);
     chatInlineTick(st);
     copilotUiTick(st);
-#ifndef __EMSCRIPTEN__
-    delayedAccountTick(st);
-#endif
 
     // ---------- live document editing lock / keep-exit / takeover (CHUDWARE_SHOT=agentlock) ----------
     agentLockTick(st);
@@ -9336,19 +9093,18 @@ void ScenarioRunner::runOnboarding(AppState& st) {
     if (obSettle > 0) {
         // Reassert while settling. The first popup submission can coincide with startup popup
         // bookkeeping; repeatedly forcing the same step guarantees capture never races that frame.
-        forceOnboardingForScenario(std::clamp((obPhase - 1) / 2, 0, 3));
+        forceOnboardingForScenario(std::clamp((obPhase - 1) / 2, 0, 2));
         --obSettle;
         return;
     }
 
     static const char* kNames[] = {
-        "onboarding_01_account.png",
-        "onboarding_02_power.png",
-        "onboarding_03_test.png",
-        "onboarding_04_workspace.png",
+        "onboarding_01_power.png",
+        "onboarding_02_test.png",
+        "onboarding_03_workspace.png",
     };
     const int step = obPhase / 2;
-    if (step < 4) {
+    if (step < static_cast<int>(std::size(kNames))) {
         if ((obPhase % 2) == 0) {
             forceOnboardingForScenario(step);
             obSettle = 8;
@@ -10543,7 +10299,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
         ++st.frame;
         if (!obCapture.empty()) {
             const char* mirror =
-                obCapture.find("onboarding_04_workspace") != std::string::npos
+                obCapture.find("onboarding_03_workspace") != std::string::npos
                     ? screenshotPath
                     : nullptr;
             writeBackbufferPng(obCapture.c_str(), dw, dh, mirror);
@@ -10696,11 +10452,6 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
     bool featureStateBreak = false;
     if (featureStateEndFrame(st, dw, dh, screenshotPath, featureStateBreak))
         return featureStateBreak ? FrameAction::Break : FrameAction::Continue;
-#ifndef __EMSCRIPTEN__
-    bool delayedAccountBreak = false;
-    if (delayedAccountEndFrame(st, dw, dh, screenshotPath, delayedAccountBreak))
-        return delayedAccountBreak ? FrameAction::Break : FrameAction::Continue;
-#endif
 
     // simaudit: per-state captures + report; exits non-zero on any ID conflict.
     bool saBreak = false;

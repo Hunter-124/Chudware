@@ -2790,7 +2790,7 @@ static bool pmCompactLabel(const char* label, const char* suffix,
         ImGui::AlignTextToFramePadding();
         // T-G14: the field column starts at SameLine(labelW). If the label text is WIDER than the
         // column (e.g. "Tangent propagation"), the next widget lands ON TOP of the tail of the text
-        // (Erik's PM-tool-menu overlap). Truncate the drawn label to the column budget with an
+        // (the PM-tool-menu overlap). Truncate the drawn label to the column budget with an
         // ellipsis (full text stays in the hover tooltip, per this row's stated two-column intent)
         // so the widget at labelW never overlaps.
         const float gap    = ImGui::GetStyle().ItemInnerSpacing.x;
@@ -2887,7 +2887,7 @@ static bool pmSectionHeader(const char* label, const Palette& pal) {  // gui-lin
 }
 
 // T-G19: OK / Cancel command buttons, relocated ABOVE the PM into the left-pane top row (between
-// the Configurations tab and the collapse chevron — Erik round-1). Rendered by layout.cpp from that
+// the Configurations tab and the collapse chevron). Rendered by layout.cpp from that
 // row while a form is active. Wider than the old 26dp squares, with regenerated ok_check / cancel_x
 // glyphs. The cluster is right-aligned to END at `rightX`, vertically centered on `centerY`. Clicking
 // OK commits (commit() still guards form readiness + toasts on failure); Cancel reverts every preview
@@ -3256,8 +3256,8 @@ void PropertyManager::drawBody(AppState& st) {
         ImGui::TextUnformatted(title_.c_str());
         ImGui::PopStyleColor();
 
-        // T-G19: OK / Cancel buttons no longer live in this in-PM header strip. Per Erik's round-1
-        // walkthrough they were relocated ABOVE the PM — into the left-pane top row, between the
+        // T-G19: OK / Cancel buttons no longer live in this in-PM header strip. They were
+        // relocated ABOVE the PM — into the left-pane top row, between the
         // Configurations tab and the collapse chevron — and are rendered by drawChromeButtons(),
         // which layout.cpp calls from that row while a form is active. The keyboard Enter/Esc commit
         // path (below) is unchanged and still drives commit()/cancelEdits() directly.

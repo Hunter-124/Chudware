@@ -1,14 +1,14 @@
 """Baseline comparators for the bench suite.
 
-Every bench carries TWO baseline rows (survey §5.6):
+Every bench carries TWO baseline rows:
 
   * `deterministic` — the kill-switch comparator: a rule-based, no-model strategy that is
     always available offline. A candidate model must beat this to earn a promotion (the
     kill-switch rule: never ship below the deterministic path).
   * `frontier` — a frontier-model strategy. Offline / in CI there are no credentials and no
     network, so this row is recorded honestly as `status='pending'` (no fabricated scores),
-    to be filled once T-H7 frontier logging + provider credentials exist. Same honesty
-    posture as T-F13's flag-gated eval.
+    to be filled once frontier-provider logging + credentials are available. No score is
+    ever fabricated for an unavailable comparator.
 
 A Baseline is just a callable strategy the bench applies per example; the bench owns what
 "apply" means (propose a fix, produce a brief, etc.). This module only fixes the two-row
@@ -42,10 +42,10 @@ class Baseline:
             return BaselineRow(name=self.name, kind=self.kind, status="measured",
                                mean_score=mean_score, pass_rate=pass_rate, note=self.note)
         return BaselineRow(name=self.name, kind=self.kind, status="pending",
-                           note=self.note or "no credentials/network offline; fill via T-H7")
+                           note=self.note or "no credentials/network offline; frontier run required")
 
 
 def pending_frontier(name: str = "frontier",
-                     note: str = "frontier model; pending T-H7 logging + credentials") -> Baseline:
+                     note: str = "frontier model; pending provider logging + credentials") -> Baseline:
     """The standard honest-stub frontier row every bench uses offline."""
     return Baseline(name=name, kind="frontier", fn=None, available=False, note=note)

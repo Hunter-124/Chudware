@@ -30,14 +30,13 @@ def launch(cell_id):
     import stat
     cell_fd = open_path(cell)
     try:
-        for name in ("egress", "provider"):
-            broker_fd = os.open(name + ".sock", os.O_PATH | os.O_NOFOLLOW, dir_fd=cell_fd)
-            if not stat.S_ISSOCK(os.fstat(broker_fd).st_mode):
-                os.close(broker_fd)
-                raise ValueError(name + " broker socket required")
-            os.set_inheritable(broker_fd, False)
-            pins.append(broker_fd)
-            args += ["--ro-bind", "/proc/self/fd/" + str(broker_fd), "/run/" + name + ".sock"]
+        broker_fd = os.open("egress.sock", os.O_PATH | os.O_NOFOLLOW, dir_fd=cell_fd)
+        if not stat.S_ISSOCK(os.fstat(broker_fd).st_mode):
+            os.close(broker_fd)
+            raise ValueError("egress broker socket required")
+        os.set_inheritable(broker_fd, False)
+        pins.append(broker_fd)
+        args += ["--ro-bind", "/proc/self/fd/" + str(broker_fd), "/run/egress.sock"]
     finally:
         os.close(cell_fd)
     env = {**BASE_ENV, "CHUDWARE_CELL_ID": cell_id, "HOME": "/state/home", "XDG_DATA_HOME": "/state/data",

@@ -1,13 +1,13 @@
-"""vLLM per-task LoRA adapter provider (T-H9).
+"""vLLM per-task LoRA adapter provider.
 
-Server mode from ``docs/CUSTOM_MODEL_INTEGRATION_SURVEY.md`` §5.7-5.8: a single vLLM
-instance launched with ``--enable-lora --lora-modules <name>=<path> ...`` exposes an
-OpenAI-compatible API where **the LoRA adapter is selected by the ``model`` field** of the
-request (the served adapter name), and the base model is requested by its own served name.
+A single vLLM instance launched with ``--enable-lora --lora-modules <name>=<path> ...``
+exposes an OpenAI-compatible API where **the LoRA adapter is selected by the ``model``
+field** of the request (the served adapter name), and the base model is requested by its
+own served name.
 
 So a vLLM adapter provider IS just an OpenAI-compatible client (contract §2) pinned to the
 vLLM endpoint, with the served-model name set to the adapter (or base). It enters the app
-"as just another provider under the T-F9 contract with an ``adapter`` field" — no new
+as just another provider with an ``adapter`` field (``contracts/providers.md`` §7) — no new
 provider stack. :class:`services.agent.providers.logging_provider.LoggingProvider` wraps it
 unchanged.
 
@@ -15,8 +15,8 @@ Offline classification: vLLM runs locally, so it is offline-safe **iff its base_
 loopback** — handled name-by-name in ``services/agent/config.py:provider_offline_safe`` (the
 loopback-checked path, alongside ``openai``/``llamacpp``), NOT the never-offline cloud set.
 
-This module imports no model runtime; ``vllm`` itself is an external server the user launches
-(see ``docs/serving_runbook.md``). Talking to it is plain HTTP via the OpenAI SDK.
+This module imports no model runtime; ``vllm`` itself is an external server the user
+launches. Talking to it is plain HTTP via the OpenAI SDK.
 """
 from __future__ import annotations
 

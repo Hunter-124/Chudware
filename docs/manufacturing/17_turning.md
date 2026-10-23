@@ -4,8 +4,8 @@ Owner: `TurningArchitecture`. Domain id: **`cam.turn`**. P4 core implementation 
 `core/cam/turn/**` with direct headless coverage in `core/tests/test_cam_processes.cpp`.
 
 Evidence base: `core/cam/model.h`, `core/cam/op_turn.cpp`, `core/cam/post.cpp`, `core/cam/stock_sim.cpp`,
-`services/mcp/cam_tools.py`, `agent://CamKernelAudit`, `agent://ManufacturingBreadth`,
-`local://manufacturing-decisions.md`, `local://manufacturing-dod-v4.md`.
+`services/mcp/cam_tools.py`, the CAM-kernel audit, the manufacturing-breadth research,
+`00_decisions.md`, `01_definition_of_done.md`.
 
 P4 implementation scope is deliberately offline: single-spindle XZ validation, declared
 workholding and insert geometry, radius-internal/explicit diameter-or-radius NC semantics,
@@ -16,7 +16,7 @@ dialect; the planned `linuxcnc_lathe` registry id remains unadvertised until int
 qualification exists. Capability rows remain declared until gateway-stamped procedural
 evidence exists; parse, monitor, transport, execute, and safety integration are unsupported.
 
-Session rulings honoured:
+Project rulings honoured:
 * Production GUI only under `host/src/ui/manufacture/**`; no `ui/mfg`, no new canvas. `host/src/ui/cam/**`
   remains offline-CAM owner and gains exactly one named seam.
 * Cross-domain service root `services/manufacturing/**`; domain engine under `core/cam/turn/**`
@@ -79,7 +79,7 @@ producing a wrong artifact; *silent-substitution* = a plausible-but-wrong value 
 | D-T14 | **ID turning simulates as whole-diameter removal.** The axisymmetric model keeps one outer radius per slice; an ID/boring pass at small radius drives `rad[k]` down to the bore radius, so the sim reports the entire OD turned away — as a clean success. | `stock_sim.cpp:200`, `:224`, `:230-236` | **top-severity false-green** | §9 |
 | D-T15 | **A `Lathe` setup with box or `FromSolid` stock falls through to the mill dexel path**, where XZ moves are read as XYZ mill moves with `y=0`, producing meaningless removal numbers that still report `ok`. | `stock_sim.cpp:164`, `:197`, `:247-282` | false-green | §9 |
 | D-T16 | **`MillTurn` never reaches the turning sim** and lands in the same dexel path. | `stock_sim.cpp:197` | false-green | §9, §11 |
-| D-T17 | **The turning branch returns before setting `res.remaining`, so rest-stock lineage is broken.** The `from_sim` chain converts a remnant field to `FromSolid`; for a lathe that field is default/empty. The audit also reports `lastRemaining` survives edits. | `stock_sim.cpp:244`, `:490`; `CamKernelAudit` (`session.cpp:177-207`, `:291-327`) | false-green | §9 |
+| D-T17 | **The turning branch returns before setting `res.remaining`, so rest-stock lineage is broken.** The `from_sim` chain converts a remnant field to `FromSolid`; for a lathe that field is default/empty. The audit also reports `lastRemaining` survives edits. | `stock_sim.cpp:244`, `:490`; CAM-kernel audit (`session.cpp:177-207`, `:291-327`) | false-green | §9 |
 | D-T18 | **`geometry["stock_profile"]` has no producer.** `gen_turn_rough` reads it; `model.h:325-327`'s geometry-shape comment omits it, `cam_extract` does not emit it, `_GEOMETRY_SLOTS` lacks it. OD roughing therefore always uses the `stock_od()` fallback, which invents `prof_max_r + stl + 2.0`. | `op_turn.cpp:163`, `:75-79`; `cam_tools.py:307` | dead input / invented stock | §9 |
 | D-T19 | **Nose radius is never compensated.** `gen_turn_finish` feeds the tool *reference point* exactly along the profile points; `gen_turn_rough` clips Z against the raw profile. Every taper, radius and corner is off by up to the insert nose radius. | `op_turn.cpp:255-260`, `:180-190` | wrong geometry | §3 |
 | D-T20 | **Tool orientation, hand, insert width and lead angle do not exist.** `Tool` carries `diameter`/`corner_radius`/`flutes` and `effective_radius() = diameter*0.5`. A grooving or parting cut has no width; `PartingTool` kerf is unknown. | `model.h:155-181` | missing semantics | §3 |
@@ -299,7 +299,7 @@ simulation long-hand only, `id_op` unchanged.
 
 `MachineKind`, `ToolType` and `OpType` are **not** extended. New turning enums live in
 `chudware::cam::turn` and get `to_string`/`*_from_string` pairs in `core/cam/model.cpp` following the
-existing table style `[INFERENCE: table shape from CamKernelAudit's citation of core/cam/model.cpp:100;
+existing table style `[INFERENCE: table shape from the CAM-kernel audit's citation of core/cam/model.cpp:100;
 confirm at implementation]` — with one deliberate difference: **turning string lookups must not default.**
 An unknown value returns an error, never element 0. This is precisely the defect class
 `cam_tools.py:152-167` documents for `ToolType`, and it must not be reproduced in new code.
@@ -435,7 +435,7 @@ description "LinuxCNC 2.9 lathe (G18, G7, G96/G97, G95, G76)"
 
 `[INFERENCE]` — the LinuxCNC clamp form (`G96 S… D<max rpm>` rather than Fanuc's `G50 S…`) and the
 `G76 P… Z… I… J… K… R… Q… H… E… L…` argument set come from the LinuxCNC lathe documentation cited by
-`agent://ManufacturingBreadth`. **Neither is interpreter-verified in this design.** The E2 interpreter run
+the manufacturing-breadth research. **Neither is interpreter-verified in this design.** The E2 interpreter run
 (§8.3, §14) is the acceptance evidence, and until it passes and its trace is checked in, this dialect's
 `post` level is not advertised. `css_clamp` is deliberately left empty so the generic Fanuc `G50` block is
 not emitted into a control that does not use it.
@@ -864,7 +864,7 @@ argument set), and a threading canon envelope matching the simulated pass geomet
 
 Discovery follows the established idiom (`CHUDWARE_NGSPICE`, `OPENMVS_BIN`, `CHUDWARE_SLICER_BIN`):
 `CHUDWARE_LINUXCNC_BIN`. It runs **only** from the opt-in `scripts/qualify_turn_e2.sh`, which
-`scripts/gate.sh` never calls — with a test asserting that. Per Main's ruling, **turning requests no new
+`scripts/gate.sh` never calls — with a test asserting that. Per the project ruling, **turning requests no new
 normal-gate SKIP**; Stage A and Stage A' are hardware-free and dependency-free, so a missing binary
 degrades fixture richness, not coverage.
 
@@ -1124,7 +1124,7 @@ presented as current truth. No new canvas, no `ui/mfg`.
 **Modified (existing, extended through named seams):**
 `core/cam/model.h`, `core/cam/model.cpp`, `core/cam/op_common.h`
 `[INFERENCE: OpContext gains workholding + AxisSemantics; its exact current members beyond
-stock/tool/machine and the resolved_op/op_num helpers were outside my read scope]`,
+stock/tool/machine and the resolved_op/op_num helpers were not read for this design]`,
 `core/cam/op_turn.cpp`, `core/cam/post.h`, `core/cam/post.cpp`, `core/cam/stock_sim.h`,
 `core/cam/stock_sim.cpp`, `core/cam/session.cpp` (turning `from_sim` branch + `mfg_turn_*` registration),
 `services/mcp/cam_tools.py`, and `core/tests/test_cam.cpp` **only if** an existing case encodes the
@@ -1150,14 +1150,14 @@ called by the gate); `host/src/ui/manufacture/turning_panel.{h,cpp}`.
 **Deliberately NOT created:** `services/manufacturing/turning/tier0.py` (one authoring site, §11) and any
 per-domain copy of `services/manufacturing/rpc/journal_client.py` (gateway-owned, §13.3).
 
-**Coordination confirmed over IRC:** `TwinDesignRecovery` extracts only the milling sweep helpers
+**Coordination agreed with the twin and cutting workstreams:** `TwinDesignRecovery` extracts only the milling sweep helpers
 (`stock_sim.cpp:24-30`, `:339-388`) into `core/cam/stock_step.{h,cpp}` and refuses `MachineKind::Lathe`
-outright, so the axisymmetric branch (`:192-245`) plus the timing and frame code are mine and uncontested.
+outright, so the axisymmetric branch (`:192-245`) plus the timing and frame code belong to turning and are uncontested.
 `CuttingProcessArchitecture` owns `core/cam/cut/**` (disjoint from `core/cam/turn/**`) and the head branch
-of `post.cpp` (`:401-402`, `:454-470`, `:482`). The footer line `post.cpp:487` is **mine exclusively for
+of `post.cpp` (`:401-402`, `:454-470`, `:482`). The footer line `post.cpp:487` is **turning's exclusively for
 this wave** and is no longer a joint edit — the binding statement is **Appendix A.2**, which is the wave
 ownership record for that line and is recorded identically in
-`local://manufacturing-cutting-process-architecture.md`.
+`18_cutting.md` (Appendix A.2).
 `GatewayDesignRecovery` owns `CapabilityTruth`/`CapabilityReport` and the Tier-0 row type;
 `MonitoringArchitecture` owns `ObservationRecord`, of which turning consumes none.
 
@@ -1169,7 +1169,7 @@ ownership record for that line and is recorded identically in
    network or device node. `device_command_owner` null. LinuxCNC is an interpreter subprocess, never a controller.
 2. **Multi-channel, multi-spindle, mill-turn, live tooling, C-axis, polar interpolation, sub-spindle, bar
    feeder, part catcher, synchronised hand-off.** `MachineKind::MillTurn` refuses at Tier-0 (T0-T5) with
-   the missing level named. The channel/spindle/barrier/transfer schema that `agent://ManufacturingBreadth`
+   the missing level named. The channel/spindle/barrier/transfer schema that the manufacturing-breadth research
    recommends designing ahead is deliberately **not** added: an unused schema is the same
    declared-not-implemented defect this plan exists to close.
 3. **Tool/holder/turret/carriage collision detection.** `collision: unsupported` (§10).
@@ -1194,7 +1194,7 @@ ownership record for that line and is recorded identically in
   `off_axial`. `model.h:82`'s documented meaning ("per end") is the correct target, so the fix lands and
   any test encoding the old asymmetry is updated with a comment naming it as the bug. This is the only
   change in the plan that alters a non-turning result — flagged for the integrator.
-* **`post.cpp:487` is the one genuinely shared line in the batch, and it is now singly owned.** My change
+* **`post.cpp:487` is the one genuinely shared line in the batch, and it is now singly owned.** Turning's change
   deletes the `!g.lathe` condition so lathe programs stop the spindle; cutting's laser-condition
   adjustment is subsumed by that deletion and lands with it. One owner, one edit — see **Appendix A.2**.
   Residual risk is behavioural rather than textual: the footer is now reached by lathe setups too, so
@@ -1202,18 +1202,18 @@ ownership record for that line and is recorded identically in
 * **The LinuxCNC `G76` argument set and `G96` clamp form are documentation-derived, not
   interpreter-verified** (§7.1, §8.1). Largest correctness risk, and contained: the `post` level for
   `linuxcnc_lathe` is not advertised until E2 passes and its canon trace is checked in.
-* **`core/cam/op_common.h` was outside my read scope**, so the exact shape of the `OpContext` extension is
+* **`core/cam/op_common.h` was not read for this design**, so the exact shape of the `OpContext` extension is
   `[INFERENCE]`. It affects how workholding and axis semantics reach the generators, not what they do.
 * **Stage A' trace freshness** depends on a documented refresh procedure tied to a pinned LinuxCNC
   version; a stale trace reports `state:"stale"` rather than `ok`, so the failure mode is visible rather
-  than silent. Per Main's ruling this stays opt-in qualification and adds no gate SKIP.
+  than silent. Per the project ruling this stays opt-in qualification and adds no gate SKIP.
 
 ---
 
 ## Appendix A — Review closure (B10, B15, C9, C10)
 
-Closes the `ArchitectureConsistencyReviewer` findings assigned to this document in
-`local://manufacturing-plan-review.md`. No product scope changes: every turning deliverable, non-goal and
+Closes the architecture plan review findings assigned to this document. No product scope changes:
+every turning deliverable, non-goal and
 capability claim above stands exactly as accepted.
 
 ### A.1 Gateway rule-id register (replaces every gateway section-number cross-reference — closes C10)
@@ -1270,8 +1270,8 @@ region (`:403-410`) and the diameter-mode formatting (`:229-232`, `:252-254`). `
 (`:169-175`) stays the shared **append** point both documents already declared — cutting adds `process`
 and `power_bindings`, turning adds the per-dialect turning capability row — and this reconciliation does
 not change its ownership. This paragraph is the wave ownership record for the line, recorded identically
-in `local://manufacturing-turning-architecture.md` and
-`local://manufacturing-cutting-process-architecture.md`; it supersedes turning's earlier "that one line
+in `17_turning.md` and
+`18_cutting.md`; it supersedes turning's earlier "that one line
 needs a joint edit" note and cutting's earlier claim that its `post.cpp` seams are **disjoint** from
 turning's, which was false as written for `:487`.
 

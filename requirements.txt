@@ -1,13 +1,21 @@
-# Runtime declarations; installers consume only the reviewed complete wheel lock at
-# vendor/python/RUNTIME_WHEELS.lock. This file is NOT an online resolver input.
-# Even direct pip use must never consult a public index for our private RPC SDK.
---no-index
---only-binary=:all:
-# T-V4 pin note: build123d 0.10.0 not available for Python 3.14; 0.11.1 installed (API-compatible).
+# Python runtime dependencies of the Chudware services (worker, MCP server, agent tools).
+#
+# Development: scripts/provision_venv.sh creates .venv-mcp and installs this file from
+# PyPI (equivalently: `python -m pip install -r requirements.txt` in a fresh venv).
+# chudcode-rpc is not on PyPI; pip builds it from the public Chudcode repository at
+# the commit vendor/chudcode/CHUDCODE_ARTIFACT.lock pins (git must be installed).
+# Keep that commit and the one below identical.
+#
+# Reviewed offline installs: services/installer/provision.py installs only the
+# hash-locked wheel set in vendor/python/RUNTIME_WHEELS.lock (prepared with
+# scripts/prepare_runtime_wheels.py) and never consults a package index.
+#
+# build123d, cadquery-ocp-novtk, vtk and opencv-python-headless are pinned to the earliest
+# releases that publish Python 3.14 wheels. CI and releases use Python 3.13.
 build123d==0.11.1
-# T-V4 pin note: cadquery-ocp 7.8.1.1.post1 not available for Python 3.14; the novtk variant
-# cadquery-ocp-novtk==7.9.3.1.1 (+ cadquery-ocp-proxy) is what pip resolves on this platform.
-# The audit script matches by normalized name "cadquery-ocp" which the proxy satisfies at import time.
+# The novtk variant (plus cadquery-ocp-proxy) is what pip resolves on these Pythons;
+# scripts/mcp_runtime_audit.py matches the normalized name "cadquery-ocp", which the
+# proxy satisfies at import time.
 cadquery-ocp-novtk==7.9.3.1.1
 ocpsvg==0.6.0
 numpy==2.4.6
@@ -21,35 +29,30 @@ pywin32==312; sys_platform == "win32"
 pillow==12.3.0
 # headless rendering
 pyvista==0.48.4
-# T-V4 pin note: vtk==9.3.1 not available for Python 3.14; 9.6.2 is the earliest wheel that
-# exists for cp314 on manylinux. pyvista 0.48.4 is compatible with vtk 9.6.x.
+# pyvista 0.48.4 is compatible with vtk 9.6.x.
 vtk==9.6.2
-# vision & capture (Pillar 10 v1) — image ingestion + ArUco/ChArUco fiducial metrology.
+# vision & capture — image ingestion + ArUco/ChArUco fiducial metrology.
 # OpenCV CORE only (ArUco lives in objdetect since 4.7; NO opencv-contrib, NO GPU). Apache-2.0,
 # license-clean per contracts/licenses.md. Optional at runtime: engine.vision + the MCP vision
 # tools degrade to a contract-shaped {ok:false,reason,hint} when it is not provisioned.
-# T-V4 pin note: 4.11.0.86 not available for Python 3.14; 5.0.0.93 installed (same Apache-2.0 license).
 opencv-python-headless==5.0.0.93
 # Local Gaussian camera-pose reconstruction (BSD-3-Clause; CPU wheels).
 # Match the compiled-sidecar platform support; Intel macOS has no upstream wheel.
 pycolmap==3.13.0; (sys_platform == "linux" and platform_machine == "x86_64") or sys_platform == "win32" or (sys_platform == "darwin" and platform_machine == "arm64")
 # interfaces
 mcp==1.28.1
-# Persistent online-agent embedding.  The wheel owns protocol/process mechanics; the
+# Persistent online-agent embedding. The wheel owns protocol/process mechanics; the
 # separately signed payload supplies the adjacent compiled ``chud`` executable.
-# NOT on PyPI. Only an authenticated wheel with reviewed immutable bytes/source
-# provenance may supply it; no editable install or build backend during provisioning.
 # Without it every chudcode_* worker RPC refuses and Settings -> Providers reports a failed
 # service call rather than an empty provider set.
-chudcode-rpc==0.3.1       # MIT — typed RPC v2 client; compiled chud ships separately
+chudcode-rpc @ git+https://github.com/Hunter-124/chudcode.git@2eaba2f4606984172f31f108459d9529d4ee5e38#subdirectory=python/chudcode-rpc  # MIT, 0.3.1 — typed RPC v2 client
 # built-in agent provider adapters
 anthropic==0.107.1
 openai==2.41.0
 httpx==0.28.1
 # simulation pack (FEA mesh + solve).
-# NOTE: FEA tet meshing lives in the C++ core (core/sim/mesher.cpp), built on Netgen/nglib
-# (LGPL-2.1, dynamically linked — commercial-safe). There is NO Python mesher dependency; the
-# old gmsh (GPL-2+) binding + DLL were removed. See contracts/licenses.md (Netgen row).
+# NOTE: FEA tet meshing lives in the C++ core (core/sim/mesher.cpp, the Polyhedral-FEA
+# mesher); there is no Python mesher dependency.
 scikit-fem==12.0.2
 meshio==5.3.5
 pyamg==5.3.0
@@ -63,7 +66,7 @@ openpyxl==3.1.5             # MIT — .xlsx workbooks (live formulas)
 matplotlib==3.11.0          # PSF — charts/figures + csv/md preview rasterization
 reportlab==5.0.0            # BSD — direct PDF reports (in-process, no subprocess)
 pypdfium2==5.11.0           # BSD (pdfium) — PDF -> PNG page rasterization for previews
-# office_tools pack (T-office, contracts/office.md) — read+edit over EXISTING office files (as
+# office_tools pack (contracts/office.md) — read+edit over EXISTING office files (as
 # opposed to the deliverables pack above, which authors fresh artifacts from a spec). pypdf is
 # the only new dep: pypdfium2 above is render/extract-only, pypdf adds page-level PDF edit
 # (rotate/delete/merge/metadata). python-pptx/openpyxl/python-docx are reused from above.
@@ -75,8 +78,9 @@ office-oxide==0.1.8          # MIT/Apache-2.0 — fast Office text extraction (y
 # fitting geometry is a bundled CSV (public manufacturer dims); ASME text is not shipped.
 fluids==1.3.1
 
-# structural discipline module (engine_oracle/structural): member forces + deflections via
-# PyNiteFEA (MIT, in-process — see contracts/licenses.md row, T-D2).
+# structural frame checks: member forces + deflections via PyNiteFEA (MIT, in-process; see
+# contracts/licenses.md). The struct_* MCP tools run in the C++ core; PyNite backs the
+# scripts/sim_audit.py and scripts/vv_benchmark.py reference checks.
 PyNiteFEA==1.0.1
 
 # civil discipline module (services/civil/): CRS transforms + grid/combined scale factors via
@@ -89,40 +93,32 @@ pyproj==3.7.2
 # we take the Apache-2.0 arm (in-process-clean per contracts/licenses.md + the guardrails).
 # Chosen over pygit2/subprocess-git for zero-provisioning cross-platform (Fedora/Windows)
 # parity; a system `git` binary, when present, is an OPTIONAL subprocess accelerator only
-# (gc/repack) and is NEVER bundled. See docs/PLM_OSS_SURVEY.md + contracts/plm.md §7.
+# (gc/repack) and is NEVER bundled. See contracts/plm.md.
 dulwich==1.2.12
 websockets==16.1          # BSD-3-Clause — aicad.plm-live/1 self-hosted relay/client
 
-# Undeclared-but-installed transitive dependencies (T-V2 audit, T-V3 fix).
-# These were installed in mcp-venv but absent from requirements.txt; missing declaration
-# = silent breakage if the venv is rebuilt from scratch. All MIT-licensed (in-process OK).
+# Transitive dependencies that product code imports directly; declared so a venv rebuilt
+# from scratch has them. All permissively licensed (in-process OK).
 anyio==4.14.2         # MIT — async I/O transport used by services/mcp/server.py
 langgraph>=1.0.0      # MIT — DAG orchestration used by services/dag/
 langgraph-checkpoint-sqlite==3.1.1  # MIT — DAG sqlite checkpointer; fixes GHSA-47pj-3jcm-6whg
 pydantic>=2.0.0       # MIT — FastMCP tool arg schemas (indirect, via mcp package)
-qrcode>=7.0           # MIT — QR code generation used by engine_oracle/
-lib3mf>=2.5.0         # BSD — 3MF mesh file I/O (T-V4 audit: installed but undeclared)
-# pyyaml is a DIRECT import of product code, not a transitive or test-only dep: 17 files under
-# services/ import it, including services/agent/{routing,local_runtime,role_models,design_recipe,
-# roles,councils,effort,tiers}.py, services/agent/skills/__init__.py,
-# services/agent/advisor/triggers.py and services/parts/bolts_loader.py. It went undeclared until
-# the first CI run, where scripts/advertised_tool_audit.py importing services.mcp.tool_registry
-# raised ModuleNotFoundError("No module named 'yaml'") on every runner. Pinned to the same version
-# Webservice/gateway/requirements.txt uses so the two environments cannot drift.
+qrcode>=7.0           # BSD — QR codes for the phone capture pairing (services/vision/capture_server.py)
+lib3mf>=2.5.0         # BSD — 3MF mesh file I/O
+# pyyaml is a DIRECT import of product code (services/agent routing, roles, skills, advisor
+# triggers, services/parts/bolts_loader.py, ...), not a transitive or test-only dependency.
 pyyaml==6.0.3         # MIT — YAML config/catalog loader
 
-# user-authenticated headless-browser acquisition (T-X1, Hunter directive 2026-07-04).
-# Apache-2.0. Chosen over Selenium/Puppeteer-node: first-party async+sync Python API and
-# built-in persistent-context (storage_state) support, which is exactly the "save the
-# user's own logged-in session locally" primitive this workstream needs. Chromium browser
-# binary is a separate one-time `playwright install chromium` step, not a pip dependency
-# (see services/browser/README.md); services/browser/session.py lazy-imports this package
-# so its absence degrades cleanly instead of crashing MCP server startup.
+# User-authenticated headless-browser acquisition. Apache-2.0. Chosen over
+# Selenium/Puppeteer-node: first-party async+sync Python API and built-in
+# persistent-context (storage_state) support, i.e. saving the user's own logged-in
+# session locally. The Chromium binary is a separate one-time `playwright install
+# chromium` step, not a pip dependency (see services/browser/README.md);
+# services/browser/session.py lazy-imports this package so its absence degrades cleanly
+# instead of crashing MCP server startup.
 playwright==1.61.0
 
-# Security-pinned closure components from the 2026-10-12 installed-runtime audit.
-# These declarations still require a reviewed complete offline wheel lock; they
-# never authorize fetching public or private wheels during runtime provisioning.
+# Security-pinned closure components.
 PyJWT[crypto]==2.15.0  # MIT — MCP authentication; fixes GHSA-42vr-xj54-vc7v
 cryptography==50.0.0  # Apache-2.0/BSD — token verification and signed payloads
 urllib3==2.8.0        # MIT — Dulwich HTTP transport

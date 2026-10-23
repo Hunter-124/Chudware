@@ -1,6 +1,6 @@
 # Manufacturing Overhaul Definition of Done v4
 
-This file supersedes every earlier architecture-thread amendment.
+This revision supersedes every earlier amendment.
 
 ## Product choices
 - Runtime approval is selectable per job: `human_only` or `human_or_agent`, default `human_only`, bounded by commissioning policy. The arbiter enforces it and logs initiator provenance and nonce burn.
@@ -8,7 +8,7 @@ This file supersedes every earlier architecture-thread amendment.
 - Feedback-capable relay/VFD is required for automated spindle authority; otherwise motion can run only after explicit manual spindle confirmation.
 - Attendance is policy by machine class. Open/hobby machines require physical attendance; only separately qualified enclosed/interlocked machines may allow remote-attended/unattended policies.
 - Fixed multi-camera first; Shapeoko plus generic probes; no physical printer target until virtual qualification; 3D printing is the first predictive-model dataset.
-- Publish the MLDP model/training core; commercial-user data stays local by default with explicit opt-in export.
+- Publish the MLDP model/training core; user data stays local by default with explicit opt-in export.
 - PrusaSlicer fork remains an out-of-process AGPL sidecar with exact corresponding-source artifacts.
 
 ## Acceptance criteria
@@ -28,7 +28,7 @@ This file supersedes every earlier architecture-thread amendment.
 14. Simulation and perception never satisfy execute-side gates. Simulated conclusions are context only; Gateway may gate on procedural facts that a named check ran against a specific artifact/config/snapshot/seq.
 15. One command owner per device. Approval validation lives only in the deterministic arbiter, never in MCP guards or model prompts. Motion/safety risk is explicit-membership; safety actions have no model allow path.
 16. Public `libchudware` C ABI carries no `mfg_*` symbols. Gateway/device execution remains a separate service/process boundary.
-17. No GPL/AGPL/non-commercial code, weights, or datasets are linked or copied into the commercial core. Fast gate rejects in-process libslic3r/CuraEngine coupling. Every distributed slicer sidecar has matching source, hashes, build scripts, notices, and a live source URL.
+17. No GPL/AGPL/non-commercial code, weights, or datasets are linked or copied into the permissively licensed core. Fast gate rejects in-process libslic3r/CuraEngine coupling. Every distributed slicer sidecar has matching source, hashes, build scripts, notices, and a live source URL.
 18. Emulator progression is capability-gated: hardware-free E0-E3 in normal gates; pilot E6 before `execute` is advertised. No capability level may exceed the highest emulator/hardware stage actually passed.
 19. Tier-0 registers, guard source tables, prerequisite/corroborating/artifact-dependent columns, invalidation events, and durable schemas are contract-tested as policy boundaries.
-20. Major waves append `docs/REFACTOR_LOG.md` and update relevant maintained skills/maps in the same green commit.
+20. Major waves record their change summary and update the relevant developer documentation in the same green commit.

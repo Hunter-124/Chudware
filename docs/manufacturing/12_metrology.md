@@ -1,18 +1,18 @@
 # Probing & Quality Architecture — Chudware Manufacture Overhaul
 
-Owner: MetrologyArchitecture. Design-only; no repository files edited, no gates run.
-Snapshot 2026-08-08.
+Owner: MetrologyArchitecture. Design-only: this document specifies probing and quality; it
+records no implementation change by itself. Snapshot 2026-08-08.
 
-Bound to the session rulings: Gateway owns the controller wire/state vocabulary and the
+Bound to the accepted ownership rulings: Gateway owns the controller wire/state vocabulary and the
 Grbl parse seam; Twin owns deterministic emulation state under `core/twin/`; Metrology owns
 measurement/probe result schemas and offset proposals; UX owns `FreshValue<T>` and every
-GUI file; ExecutionPlanner owns wave slicing and the integrator-owned append-only seams.
+GUI file; wave slicing and the append-only integration seams are owned by the execution plan.
 
 **Gateway rules are cited by stable id, never by gateway section number** (review C10, which
 found three of five §24 cross-references pointing at unrelated rules). Every id below names a
-rule already ratified in `local://manufacturing-gateway-final.md`; `test_metrology_*` and
+rule already ratified in `10_gateway.md`; `test_metrology_*` and
 `contracts/manufacturing_metrology.md` key on the id, so a gateway renumbering cannot turn one
-of my assertions into a wrong one.
+of metrology's assertions into a wrong one.
 
 | Stable id | Rule as ratified |
 |---|---|
@@ -70,7 +70,7 @@ relaxes this.
 ## 1. Capability truth levels
 
 Metrology composes `CapabilityTruth` **verbatim** from `core/device/capability.h`
-(`GW-CAPABILITY-TRUTH`) and declares no second capability shape. My earlier per-level
+(`GW-CAPABILITY-TRUTH`) and declares no second capability shape. The earlier per-level
 `{source, freshness}` pair is **withdrawn**: `probed` is an observation `src`, not a capability
 truth (`GW-SRC-COMPUTED`), and `source` survives only inside the uncertainty budget of §3,
 where it is budget metadata on a different axis and never a gate value.
@@ -155,7 +155,7 @@ actually measured on an artifact.
 | `Q2_qualified` | Q1 + **directional** pretravel measured per axis-direction on a sphere/ring artifact of known size + ≥2-pass agreement. `machine_positioning` may remain `assumed` from the machine profile. | WCS origin offsets, tool-length offsets (both via approval); guardbanded conformance verdicts |
 | `Q3_traceable` | Q2 + machine artifact check with `machine_positioning` **measured** + certified artifact carrying a certificate uncertainty + recorded environment | Q2 + permission to use the word "traceable" in a report |
 
-**Why the machine artifact check sits at Q3, not Q2** (this moved after ExecutionPlanner
+**Why the machine artifact check sits at Q3, not Q2** (this moved after the execution plan
 set the offset floor at Q2). For a *work offset* you probe the part in the same place you
 are about to cut it, so machine positioning bias largely cancels and repeatability plus
 directional pretravel are what govern. For a *conformance verdict spanning travel*, bias
@@ -174,7 +174,7 @@ certified artifact; we never assert it on their behalf.
 prediction verdicts about a **program**. Backs nothing about a physical workpiece. It is
 not "advisory"; it is a third, disjoint class.
 
-### Mechanical binding to UX's `src` (ExecutionPlanner ruling 3)
+### Mechanical binding to UX's `src` (execution-plan ruling 3)
 
 | Tier | `src` | May enter an approval binding |
 |---|---|---|
@@ -183,10 +183,10 @@ not "advisory"; it is a third, disjoint class.
 | `Q0_unqualified`, `Q1_repeatable` | `probed` | **never** (below the Q2 floor) |
 | `Q2_qualified`, `Q3_traceable` | `probed` | yes, with a live approval |
 
-**Two-stage gate composition** (Main's correction; UX restated the same rule). Stage 1 is
+**Two-stage gate composition** (the project-wide correction; UX restated the same rule). Stage 1 is
 UX's freshness predicate `state=="ok" && src=="probed"` — plus `truth=="verified"` on the
 `execute` capability. Stage 1 is **necessary and never sufficient**: it only *admits* a
-value into gate evaluation. Stage 2 is my named domain guards, which decide, and which
+value into gate evaluation. Stage 2 is metrology's named domain guards, which decide, and which
 render by name. Every entry in `guards[]` therefore carries `"stage": 1|2` so the UI can
 say which stage rejected.
 
@@ -213,7 +213,7 @@ Contract: `contracts/manufacturing_metrology.md`, under the existing frozen-seam
 `contracts/README.md` (append-only, integrator sign-off, version bump). Schema ids use the
 established `aicad.<name>/1` form from `contracts/cam.md`.
 
-Every field the GUI paints is wrapped in UX's `FreshValue<T>`, verbatim, per Main's ruling and
+Every field the GUI paints is wrapped in UX's `FreshValue<T>`, verbatim, per the project ruling and
 `GW-FRESHVALUE-SOLE` — one envelope, no per-field translation table:
 
 ```jsonc
@@ -444,13 +444,13 @@ a golden test table over all six directions, because a sign flip here is a scrap
 
 #### Guard audit — three checks that fail in different directions
 
-Criterion 13 has three bullets and no two of them catch each other. I run all three.
+Criterion 13 has three bullets and no two of them catch each other. Metrology runs all three.
 
-**(i) Producer-side — could any value I produce ever PASS this guard?** If not, do not define
-it; document the absence. **(iii) Liveness — can I drive it to FAIL from some input?** If not,
-delete it. **(ii) Gate-side — can at least one of a gate's evidence sources pass stage 1?**
-That one is owned by the approval-path owner (UX for the offset row, Gateway for the arbiter
-preflight set), *not* by me, because unsatisfiability is a property of the gate's **source
+**(i) Producer-side — could any value metrology produces ever PASS this guard?** If not, do not
+define it; document the absence. **(iii) Liveness — can metrology drive it to FAIL from some
+input?** If not, delete it. **(ii) Gate-side — can at least one of a gate's evidence sources pass
+stage 1?** That one is owned by the approval-path owner (UX for the offset row, Gateway for the
+arbiter preflight set), *not* by metrology, because unsatisfiability is a property of the gate's **source
 set** and nobody who owns a single source can see the set. That is exactly how it fell between
 owners: Twin correctly declined to define execute-side guards, every producer answered its own
 audit truthfully, and an unsatisfiable gate survived anyway.
@@ -469,7 +469,7 @@ audit truthfully, and an unsatisfiable gate survived anyway.
 |---|---|
 | `register_writable` | Grbl 1.1 reports no per-register writability, so this could only ever be `not_applicable`, and `not_applicable` is not a pass. `readback_verified` is the check that actually proves the register took the value, so it does the work honestly |
 
-**Re-specified from conclusive to procedural** — the defect I had, and it was real:
+**Re-specified from conclusive to procedural** — a real defect in the earlier draft:
 
 `keep_out_intersection` and `dry_run_missing` were sourced from Twin's `twin_keepout_check`
 and a twin-executed dry run. Twin evidence is `src=="simulated"`, which never admits at stage
@@ -494,7 +494,7 @@ immutable artifact and the arbiter's tracked T-word, both satisfiable and both g
 failing when the program contains an `M3` or the wrong tool.
 
 **A near-miss worth recording.** `tier_at_least_q2` would itself have been unsatisfiable for
-most users had I left the certified-artifact requirement at Q2, since a hobby machinist owns a
+most users had the certified-artifact requirement stayed at Q2, since a hobby machinist owns a
 ring gauge but not a calibrated step artifact. Moving it to Q3 (§2) was argued on physical
 grounds, but it is the same defect class: a gate nobody can satisfy gets waived on every run
 until the waiver marker means nothing.
@@ -511,7 +511,7 @@ immutable joins between a trip and its cycle and cannot become false about thems
 carry no validity guard.
 
 `controller_homed`, `spindle_off_in_program` and `tool_number_matches_program` are **stage 2**,
-not stage 1 as I first labelled them. The stage-1 question is whether the corresponding
+not stage 1 as first labelled. The stage-1 question is whether the corresponding
 `ControllerSnapshot` field is fresh and probed; whether the fresh probed answer says "not
 homed" is a domain decision that genuinely fails. Stage-1 input failure reports separately as
 `input_unavailable:<field>`, keeping the two distinguishable.
@@ -564,7 +564,7 @@ this one authorizes an impossible *act* rather than skipping a *check*.
 #### Tier 0 — construction refusal, before any preflight table exists
 
 Prerequisites refuse at **construction**: not as a preflight row, not as a guard, not as
-`not_applicable`. If I am deciding prerequisite-vs-corroborating inside a preflight evaluator,
+`not_applicable`. If a preflight evaluator is deciding prerequisite-vs-corroborating,
 the prerequisite should already have prevented the object from existing. What Tier 0 refuses:
 
 | Refused at construction | Because |
@@ -584,7 +584,7 @@ refusing to construct it.
 #### Prerequisite-vs-corroborating is artifact-dependent, not a static guard property
 
 The same guard, on the same device, classifies oppositely depending on what the artifact
-requires. My case is `offset_kinds[]`: a proposal targeting only a WCS origin does not need
+requires. Metrology's case is `offset_kinds[]`: a proposal targeting only a WCS origin does not need
 `tool_length_dynamic` at all, so its absence is genuinely `not_applicable`; a proposal whose
 `target.kind` **is** `tool_length_dynamic` makes G43.1 a prerequisite that must refuse at
 construction. So the audit is not "classify each guard once" — it is "for each guard, determine
@@ -592,7 +592,7 @@ whether **this** artifact makes the capability a prerequisite, then evaluate acc
 
 #### `not_applicable` is honest only when the ACTION does not need the thing
 
-Not when the *sensor* for it is missing. Re-auditing my own three rows against that corrected
+Not when the *sensor* for it is missing. Re-auditing metrology's own three rows against that corrected
 form demoted two of them: the action does need the spindle off and the right tool, so
 `not_applicable` alone would have let approval proceed with no confirmation of either.
 
@@ -615,7 +615,7 @@ to touch the code flattens:
 | `qualification_live` | A qualification record exists and is unexpired | Recorded environment at qualification time |
 | `envelope_check_performed` | The arbiter computed program extents against the configured envelope | Whether the envelope itself was ever *measured* (it is `declared`; surfaced as a separate visible fact) |
 
-#### The fifth unsatisfiable row, found by applying UX's finding to my own list
+#### The fifth unsatisfiable row, found by applying UX's finding to metrology's own list
 
 `envelope_after_apply` asserted "the resulting WCS keeps programmed motion inside travel". But
 travel comes from `cam::Machine::travel`, a machine-profile value that is `declared` and never
@@ -638,13 +638,13 @@ hobby controllers and would have to be corroborating-only or off-path.
 than the sample** — the device, the environment, the configuration, or *the producer's own
 fidelity* — requires an **independent** corroborating source before it may be non-blocking. If
 the only witness to a limitation is the party who benefits from it being accepted, it fails
-closed. Applied to my one hardware-absence claim: a station reporting the camera absent must be
+closed. Applied to metrology's one hardware-absence claim: a station reporting the camera absent must be
 corroborated by the capability set lacking `monitor`; the same claim on a device reporting
 `monitor` present is a contract violation rendered `unknown` — "a camera is configured for this
 station but is not reporting" — a fault, not an absence. Otherwise an unplugged camera presents
 as "no camera is configured" and the operator never learns one was expected.
 
-#### Three dispositions, not two — and my honest enumeration
+#### Three dispositions, not two — and the enumeration for metrology
 
 All three look similar on screen, and conflating any pair is a defect:
 
@@ -658,11 +658,11 @@ All three look similar on screen, and conflating any pair is a defect:
 Routing a class-irrelevant check through `not_applicable` clutters every approval with irrelevant
 rows; routing a missing sensor through not-required silently drops a required check.
 
-My enumeration, with the reason for each rather than an assertion:
+The enumeration, with the reason for each rather than an assertion:
 
 | Row | Disposition when absent | Why |
 |---|---|---|
-| `environment_temp_reported` | `not_applicable` | The only genuinely inapplicable row I have. The action does not need it; it caps the tier via an `assumed` budget component |
+| `environment_temp_reported` | `not_applicable` | The only genuinely inapplicable row in metrology. The action does not need it; it caps the tier via an `assumed` budget component |
 | Spindle off / correct tool / fixture present | never `not_applicable` | The action needs them; satisfied by sensor **or** artifact proof **or** human attestation (§ above) |
 | `offset_kinds[]` for the requested `target.kind`, `supports_probe_g38`, stylus direction, transform resolvability | **Tier 0 construction refusal** | Prerequisites; the object cannot exist |
 | `envelope_check_performed`, `keepout_check_performed`, `dry_run_performed`, `readback_verified` | **`fail`** | Procedural facts; absence is missing evidence, which is a failure to prove |
@@ -671,7 +671,7 @@ My enumeration, with the reason for each rather than an assertion:
 | The entire probing row set on `Laser` / `Plasma` / `Waterjet` | **not-required-for-this-machine-class** | Those `cam::MachineKind` values have no stylus, no tool length and no probe-derived WCS path. The rows do not appear at all rather than appearing as `not_applicable` |
 
 Within `Mill3` / `Mill4` / `Router` — the kinds this phase supports — the required set is uniform,
-so I have **no** not-required-for-class rows in scope. The boundary above is stated so the first
+so metrology has **no** not-required-for-class rows in scope. The boundary above is stated so the first
 laser workspace does not reach for `not_applicable` instead.
 
 #### A corroborator must be bound and must itself pass stage 1
@@ -739,7 +739,7 @@ producer's own fidelity* — needs an independent corroborating source before it
 non-blocking. If the only witness to a limitation or a capability is the party who benefits from
 it being accepted, it fails closed.
 
-`AccuracyTier` is exactly such a claim: it is my subsystem asserting its own fidelity. So it is
+`AccuracyTier` is exactly such a claim: it is the metrology subsystem asserting its own fidelity. So it is
 corroborated, and the corroboration is **bound**, because a declaration not tied to what it
 describes can be satisfied by an unrelated declaration:
 
@@ -757,7 +757,7 @@ bindings are policy-boundary tests.
 output reaches it. The agent may request a cycle and explain a proposal; it cannot author
 one.
 
-**Q2 locality scope** (ExecutionPlanner's binding condition on the Q2 revision). Because
+**Q2 locality scope** (the execution plan's binding condition on the Q2 revision). Because
 `machine_positioning` stays `assumed` at Q2, the bias-cancellation argument is **local** —
 it holds only because the datum was probed near where the cut happens. So the proposal
 carries that assumption forward as data, not as a footnote: `locality.datum_location_machine`
@@ -953,7 +953,7 @@ Each is a **named** guard so UX renders the reason verbatim, not a generic error
 
 ### 5.0 Wave 1 — promoted out of this slice as standalone truthfulness fixes
 
-ExecutionPlanner promoted three items to land early, alone, each with its own commit and
+The execution plan promoted three items to land early, alone, each with its own commit and
 test. All three are the same defect class this overhaul exists to eliminate: the system
 asserting something it does not know.
 
@@ -983,7 +983,7 @@ in Wave 2 **on top of** the corrected `None` semantics, not underneath them.
 | `post_probe.h/.cpp` | Probe cycle → controller dialect; Grbl 1.1 first |
 
 Naming caution: `core/api/chudware_probe.cpp` already exists and is a **DLL-load smoke
-exe**, unrelated to touch probing. Nothing of mine lands in `core/api/` beyond appended
+exe**, unrelated to touch probing. Nothing from metrology lands in `core/api/` beyond appended
 entry points, and nothing there is named `probe`.
 
 ### 5.2 The `MoveKind` exhaustiveness invariant
@@ -993,9 +993,9 @@ entry points, and nothing there is named `probe`.
 entries. No field renamed or reordered. `OpType::Probe`, `ToolType::Probe` and
 `tool_class()→"probe"` already exist and are reused — no enum family invented.
 
-ExecutionPlanner grepped `MoveKind` across `core/cam`, `host/src`, `services/mcp` and
-`core/api`. The verified facts replace my earlier inference, and they are worse than what I
-assumed — **the failure mode is not a dropped move, it is a misclassified one:**
+A grep for `MoveKind` across `core/cam`, `host/src`, `services/mcp` and `core/api` replaced the
+earlier inference with verified facts, and they are worse than assumed — **the failure mode is
+not a dropped move, it is a misclassified one:**
 
 | Site | Verified behavior | Consequence for a new kind |
 |---|---|---|
@@ -1008,7 +1008,7 @@ assumed — **the failure mode is not a dropped move, it is a misclassified one:
 | `host/src/ui/cam/cam_mirror.cpp:173, 186-196` | Reads `jstr(m,"kind","cut")` and the if/else chain terminates in a cut-class `else` | **A second, independent unknown-becomes-cut fallback in another layer and language.** An unrecognized kind renders and times as a cutting move in the backplot |
 
 Two separate unknown-becomes-cut fallbacks — core and GUI — neither aware of the other.
-Both are WS-CAM files, paired on WS-CAM's Wave 2 defect list so my M2 enum change lands on
+Both are WS-CAM files, paired on WS-CAM's Wave 2 defect list so metrology's M2 enum change lands on
 corrected semantics. Required shape: unknown string ⇒ hard error at both
 `move_kind_from_string` and `cam_mirror`; predicate sites become explicit per-kind
 decisions; `post.cpp` becomes compiler-exhaustive.
@@ -1050,10 +1050,10 @@ invalidation triggers, A2 measurement.
 | `services/vision/fiducial.py` | Wave 2: `Detection` gains `inlier_count`, `inlier_ratio`, `residual_rms_px`, `residual_max_px`, `coverage_frac`, `homography_condition` (keep the RANSAC `_mask` discarded at line 104); capability-probe `cv2.aruco.CharucoDetector` rather than trusting the bare import at lines 22-29 |
 | `services/vision/measure.py` | Wave 2: accuracy tier, full capture provenance, endpoint-outside-hull refusal, A1 band per §2 |
 | `services/mcp/cam_tools.py` | Strict probe-cycle-id guard, mirroring the existing `_resolve_tool_type` / `_resolve_extract_kind` silent-fall-through guards already in that file |
-| `services/mcp/tool_registry.py` | **Not my edit.** Gateway is the single owner of this file for the wave (`GW-TOOL-REGISTRY-OWNER`); my rows land as data appended by that owner, or in a strictly later wave. What I submit is the row content: each `metrology_*` tool with its risk class, all inside family `manufacture` (§10) |
+| `services/mcp/tool_registry.py` | **Not a metrology edit.** Gateway is the single owner of this file for the wave (`GW-TOOL-REGISTRY-OWNER`); metrology's rows land as data appended by that owner, or in a strictly later wave. Metrology submits the row content: each `metrology_*` tool with its risk class, all inside family `manufacture` (§10) |
 | `host/src/platform/camera.h` + backends | Wave 2 (after W1-c): `CameraFrame` gains `sequence`, `device_id`, `mode_fourcc`; `lockForCapture()` must include `Zoom` or report it explicitly unlockable — a station profile is invalid if any metrology-relevant control is free |
 
-### 5.6 Integrator-owned append-only seams — exact rows I need appended
+### 5.6 Integrator-owned append-only seams — exact rows metrology needs appended
 
 | Seam | Symbols / sections |
 |---|---|
@@ -1061,7 +1061,7 @@ invalidation triggers, A2 measurement.
 | `core/CMakeLists.txt` | `chudware_metrology` target; 8 `test_metrology_*` registrations |
 | `contracts/cam.md` | New "§8 Probe operations" section: the four `MoveKind` values, `Operation.probe_cycle`, `Tool.probe_id` |
 | `contracts/reveng.md` §7 | Station profile + capture provenance additions |
-| `contracts/worker_rpc.md` | 21 `mfg_metrology_*` method rows, in the per-domain section Gateway allocates in W1.1 — I claim no section number of my own |
+| `contracts/worker_rpc.md` | 21 `mfg_metrology_*` method rows, in the per-domain section Gateway allocates in W1.1 — metrology claims no section number of its own |
 | `contracts/README.md` | Index entry for `manufacturing_metrology.md` |
 | `scripts/gate.sh` | 8 ctest binaries + 4 pytest files |
 | `contracts/manufacturing_gateway.md` | The 15 `metrology.*` durable-result-kind rows of §6.4, each carrying both reconciliation columns, its `derived_from` roots and its `supersede_with_parent` choice. Submitted as one block for W1.1: until they land, every metrology append is refused `mfg_unregistered_result_kind` and every §1 level above `unsupported` is refused `mfg_capability_requires_durable_kind` |
@@ -1117,13 +1117,13 @@ painted is the worst outcome available.
 
 **One event, not a name table** (`GW-INVALIDATION-ENVELOPE`; the plan-wide C3 ruling). Everything
 this domain retracts or demotes travels as the single event kind `mfg.metrology.invalidated`
-carrying the DoD-9 envelope. My earlier draft stated the correct rule — consumers branch on
+carrying the DoD-9 envelope. The earlier draft stated the correct rule — consumers branch on
 `class`, never on an event-name table — and then contradicted it with two per-trigger name tables
 of eleven and seven names. **Those tables are withdrawn**; their content survives verbatim as the
 `reason` enum below. The contradiction was not cosmetic: the consuming dispatch point is the host
 lane drain (`host/src/core/engine_events.h:3`, `engine_events.cpp:907-909`, drained at
 `host/src/app.cpp:3859`), and a name-keyed consumer there silently drops any name added later —
-precisely the failure mode I cited the rule to prevent.
+precisely the failure mode the rule was cited to prevent.
 
 ```jsonc
 {"event": "mfg.metrology.invalidated",
@@ -1208,7 +1208,7 @@ copy: a consumer branching control flow on `reason` fails the contract test, and
 ### 6.2a The classification test is "does this still assert something true"
 
 Not "did something newer arrive". Additive found the general form and it applies cleanly to
-one of my paths: a **single legitimate offset write** emits *both* classes for the same
+one of metrology's paths: a **single legitimate offset write** emits *both* classes for the same
 underlying edit.
 
 - `class:"superseded"`, `reason:"offset_record_superseded"` — the prior `OffsetProposal` /
@@ -1218,7 +1218,7 @@ underlying edit.
 - `class:"falsified"`, `reason:"current_offset_stale_after_write"` — the painted "G54 X is
   −312.407" is a claim about the machine *right now*. The moment a new value is written, that
   claim has stopped being true, so the number is cleared rather than dimmed. The root subject is
-  my last `metrology.offset_apply` row for that register — the row whose value the UI painted;
+  the last `metrology.offset_apply` row for that register — the row whose value the UI painted;
   Gateway's live snapshot lane refreshes the controller's own reading under its own epoch policy.
 
 Same edit, opposite classes, because they assert different things. Classifying by event
@@ -1227,7 +1227,7 @@ worse — a falsified current value quietly demoted while an operator reads it a
 
 ### 6.2 Expiry falsifies the tier claim, not the reading
 
-UX and I converged here from opposite directions, and the precise wording matters. Expiry is
+UX and metrology converged here from opposite directions, and the precise wording matters. Expiry is
 an admission of *ignorance*, not a finding of error: we cannot assert the probe drifted, so we
 cannot assert a day-1 reading was wrong. But we also can no longer vouch for it, and a number
 still painted as `Q2_qualified` behind an expired qualification is a sticky-truth bug.
@@ -1242,7 +1242,7 @@ expired — re-qualify before using these for an offset", which is distinct from
 
 ### 6.3 Seq-scoped application
 
-Every record I emit — observation, probe result, proposal, approval, inspection result —
+Every record metrology emits — observation, probe result, proposal, approval, inspection result —
 carries the `established_seq` at which it was durably appended. That number comes back from
 `mfg_event_append` and from nowhere else (`GW-SEQ-SOLE-SOURCE`): metrology mints no seq, derives
 none, and carries none it did not receive. Every falsification and supersession push carries
@@ -1257,23 +1257,23 @@ idempotent, which buys three things: **no synchronous hold is needed** for inval
 ordering, **replay is safe** (so a recovery drain cannot destroy fresh state), and
 **crash-recovery drain paths become safe rather than dangerous**.
 
-**Roots only — the gateway computes the closure** (`GW-CLOSURE-OWNED`). My earlier rule ("both
+**Roots only — the gateway computes the closure** (`GW-CLOSURE-OWNED`). The earlier rule ("both
 channels are transitive, and *the producer walks the graph* … one event per painted dependent,
 each carrying `cascade_from`") is **withdrawn**. Two parties computing the same closure is exactly
 how a dependent gets forgotten in one of them, and `affected[]` is defined as the gateway's
 closure, never the caller's best guess. The division of labour:
 
-1. **On append.** Every `mfg_event_append` I make carries `derived_from:[ResultRef]` naming its
+1. **On append.** Every metrology `mfg_event_append` carries `derived_from:[ResultRef]` naming its
    **immediate** parents — never a transitive list, never a guess. §6.4 declares the `derived_from`
    roots per kind, so the edge set is contract-tested rather than remembered at each call site.
-2. **On invalidation.** `mfg_result_invalidate` names **only the root subject**. I do not populate
+2. **On invalidation.** `mfg_result_invalidate` names **only the root subject**. Metrology does not populate
    `affected[]`; the gateway computes the transitive closure over `derived_from`, applies the
    notice to rows with `seq <= at_seq`, and returns the closure it computed.
-3. **On emission.** The gateway emits the durable notices. My `mfg.metrology.invalidated` is a
+3. **On emission.** The gateway emits the durable notices. `mfg.metrology.invalidated` is a
    **mirror** of that notice (`GW-DOMAIN-MIRROR`): it quotes the gateway's `at_seq` and `affected[]`
    verbatim, adds no row the gateway did not name, and is never read as a source of truth. If the
    mirror and the journal disagree, the journal is right and the mirror is the bug.
-4. **Class propagation is the gateway's rule, not mine.** Falsification always propagates along
+4. **Class propagation is the gateway's rule, not metrology's.** Falsification always propagates along
    `derived_from`; supersession propagates only for kinds that declared `supersede_with_parent`,
    which §6.4 declares explicitly per kind.
 
@@ -1310,7 +1310,7 @@ preference.** Metrology constructs no probed transport — Gateway's device lane
 transport and every lease (§1) — so this domain holds no lane-bound state for the epoch sweep to
 falsify, and its records survive a gateway restart intact. The live controller values a metrology
 surface paints (machine position, current offsets) are Gateway device-lane rows under Gateway's
-epoch policy, not mine. If metrology ever opens a transport of its own, every row below must be
+epoch policy, not metrology's. If metrology ever opens a transport of its own, every row below must be
 re-declared and the contract test fails until it is.
 
 | durable kind | (a) epoch policy | (b) runtime invalidation triggers | `derived_from` (immediate parents) | `supersede_with_parent` |
@@ -1334,7 +1334,7 @@ re-declared and the contract test fails until it is.
 Subjects are `res:metrology.<kind>:<ulid>` bound to the `art:`/`job:`/`res:` namespace the gateway
 enforces at append. `metrology.procedural_fact` carries the gateway's
 `ProceduralFact{check_name, artifact_hash, config_epoch, snapshot_id?, at_seq, outcome}` shape and
-is tagged `admission:"procedural_fact"` by the gateway, never by me (`GW-SRC-COMPUTED`) — it backs
+is tagged `admission:"procedural_fact"` by the gateway, never by metrology (`GW-SRC-COMPUTED`) — it backs
 `dry_run_performed`, `keepout_check_performed` and `envelope_check_performed` (§3.5), and it can
 never satisfy an execute-side subject.
 
@@ -1346,22 +1346,22 @@ never satisfy an execute-side subject.
 
 - `DeviceCommand` kinds `probe_cycle_run`, `offset_read`, `offset_write`.
 - Exclusive command-owner lease per machine; lease loss mid-cycle ⇒ `lease_lost` fault.
-- `ControllerSnapshot` fields I bind to: identity, homed/referenced state, machine position
+- `ControllerSnapshot` fields metrology binds to: identity, homed/referenced state, machine position
   + freshness, alarm state, last probe report, active WCS register, current offsets,
   spindle state, tool in spindle.
 - `ControllerEvent` for the trip, retaining the raw vendor payload.
-- **I consume `chudware::device::grbl_protocol.h`'s `parse_probe` / `parse_status` /
-  `parse_line`** and parse no controller bytes myself — the same seam Twin's
+- **Metrology consumes `chudware::device::grbl_protocol.h`'s `parse_probe` / `parse_status` /
+  `parse_line`** and parses no controller bytes itself — the same seam Twin's
   `test_twin_grbl.cpp` gates.
 - Capability flags `supports_probe_g38`, `offset_kinds[]`
   (`wcs_register` | `tool_length_dynamic` | `tool_table`), each probed, never assumed.
-- Gateway's approval-envelope type name, which I cite rather than defining my own.
-- **Journal seam, blocking every durable surface I have**: `mfg_event_append` (my only source of
+- Gateway's approval-envelope type name, which metrology cites rather than defining its own.
+- **Journal seam, blocking every metrology durable surface**: `mfg_event_append` (the only source of
   `seq` — `GW-SEQ-SOLE-SOURCE`), `mfg_result_invalidate` (called with the **root subject only**;
   the gateway returns the closure), `derived_from:[ResultRef]` accepted on every append, and the
-  §6.4 kind block accepted into the W1.1 durable-result-kind table. Without those rows my durable
+  §6.4 kind block accepted into the W1.1 durable-result-kind table. Without those rows the durable
   surface does nothing and §1's capability report cannot be advertised at all.
-- Gateway-emitted per-dependent invalidation notices. I emit none of my own beyond the mirror
+- Gateway-emitted per-dependent invalidation notices. Metrology emits none of its own beyond the mirror
   event of §6.1 (`GW-DOMAIN-MIRROR`).
 - Gateway-computed `src`/`admission` (`GW-SRC-COMPUTED`), including the
   `admission:"procedural_fact"` tagging of `dry_run_performed`, `keepout_check_performed` and
@@ -1384,7 +1384,7 @@ never satisfy an execute-side subject.
 
 ### Twin (blocking M3; a hard precondition for every real run)
 
-- Virtual touch probe emitting my `ProbeResult` with `evidence_class:"simulated"`,
+- Virtual touch probe emitting metrology's `ProbeResult` with `evidence_class:"simulated"`,
   `src:"simulated"`, `twin_snapshot_id` set, via
   `chudware::twin::GrblEmulatorTransport` (`SnapshotSource::Emulated`,
   `transport_kind="virtual"`, `execute` absent, no command lease).
@@ -1400,7 +1400,7 @@ never satisfy an execute-side subject.
 
 ### Perception
 
-Consumes my observation ids as advisory evidence foreign keys and reuses
+Consumes metrology observation ids as advisory evidence foreign keys and reuses
 `services/vision/{fiducial,calibrate,station}.py`. Emits nothing qualified.
 
 ---
@@ -1504,7 +1504,7 @@ schema change Python does not follow fails immediately.
 
 ## 10. GUI and agent entry points
 
-### GUI — UX-owned files, confirmed over IRC; I claim none
+### GUI — UX-owned files; metrology claims none
 
 1. **Probing panel** — `host/src/ui/manufacture/inspectors.cpp` (probe-routine inspector +
    library), feeding the Floor page's Verification tab. The mandatory twin dry-run renders
@@ -1528,12 +1528,12 @@ never remapped to other adjectives.
 ### Agent — MCP, `services/mcp/metrology_tools.py`, family `manufacture`
 
 Registered through `view(mcp, "manufacture")`: the one shared family for the entire overhaul
-(`GW-FAMILY-MANUFACTURE`), **off by default until commissioning**. My earlier draft named no
+(`GW-FAMILY-MANUFACTURE`), **off by default until commissioning**. The earlier draft named no
 family at all, and an unnamed family defaults **on** — which would have shipped this surface
 enabled alongside the motion-class tools. Granularity stays where every other domain puts it, in
 the existing per-tool `get_tool_options` toggles; there is no second family id and no
 metrology-specific opt-out. The registry rows are applied by the single owner of
-`services/mcp/tool_registry.py` (`GW-TOOL-REGISTRY-OWNER`); I supply row content, not an edit.
+`services/mcp/tool_registry.py` (`GW-TOOL-REGISTRY-OWNER`); metrology supplies row content, not an edit.
 
 Exposed: `metrology_probe_plan`, `metrology_probe_dryrun`, `metrology_probe_request_run`,
 `metrology_observations`, `metrology_propose_offset`, `metrology_explain_proposal`,
@@ -1622,7 +1622,7 @@ ones already accepted.
 | **C3** — invalidation dispatch specified five different ways | One invalidation event per domain carrying the DoD-9 envelope; `class` carries alarm-vs-quiet, `reason` the per-trigger distinction | §6 event list; §6.1 rewritten to one event plus two closed `reason` enums; call sites in §3.2, §3.6, §6.2 and §6.2a updated | 18 event names → 1 event (`mfg.metrology.invalidated`) + 27 reason codes. No dependent reason codes exist, because dependents arrive through the closure |
 | **C8** — capability/durable rows wrapped by some domains, never-wrapped by another | A durable authored row is journaled **and** published wrapped, `ttl_ms:null` and `state:"ok"` for rows that do not decay | §3 durable-rows paragraph; §1's capability row; §6.1's `published` block and the envelope-vs-payload split | Painted values stay `FreshValue`-wrapped; the notice fields themselves stay plain scalars, so nobody can ask whether a retraction is stale |
 
-**Still open and not mine:** B16. My "Guard audit" (ii) bullet assigns the whole-source-set
+**Still open and owned elsewhere:** B16. The "Guard audit" (ii) bullet assigns the whole-source-set
 unsatisfiability audit for run-approval rows to the approval-path owner, and UX's row set is not
 readable in the corpus. That obligation stays open against UX (or against Gateway, if it is
 reassigned in writing); nothing in this document can discharge it.

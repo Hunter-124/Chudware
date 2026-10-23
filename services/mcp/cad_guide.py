@@ -1,4 +1,4 @@
-"""cad_guide topic texts + the cad_guide_text(topic) dispatcher (T-RF8 split of cad_tools.py).
+"""cad_guide topic texts + the cad_guide_text(topic) dispatcher (split out of cad_tools.py).
 Consumed by the cad_guide tool (cad_doc_tools), tools/manual_gen.py, and re-exported
 through the cad_tools facade."""
 
@@ -262,9 +262,9 @@ GOLDEN DEMO (living E2E worked example):
   on an STM32F4 sensor-node board: verification ladder (ERC/DRC/hostcheck/sicheck/FPGA/
   PDN) → firmware project + co-verify (fw_sim_run with fixture:i2c_temp_tmp103 when
   Renode is present) → ecad_thermal_handoff → heatsink_select(U1, tj_target_c=85) →
-  power_budget → make_report. Wired into scripts/gate.sh as stage 4.7
-  (CHUDWARE_SKIP_FIN25=1 to opt out). Narrative + artifacts:
-  docs/reference/FIN25_SENSOR_NODE_GOLDEN_DEMO.md. Prefer this script over
+  power_budget → make_report. Run by scripts/gate.sh as the sensor-node demo stage
+  (CHUDWARE_SKIP_SENSOR_DEMO=1 to opt out). Narrative + artifacts:
+  docs/reference/SENSOR_NODE_DEMO.md. Prefer this script over
   inventing a new end-to-end recipe when demonstrating the content is finished.
 
 TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ribbon tab, and
@@ -1739,7 +1739,7 @@ def cad_guide_text(topic: str = "overview") -> str:
             "GOLDEN DEMO: scripts/demo_sensor_node.py builds an STM32F4 sensor-\n"
             "  node board, runs fw_new_project + fw_verify_board, and fw_sim_run with\n"
             "  fixture:i2c_temp_tmp103 when Renode is provisioned (honest SKIP markers\n"
-            "  otherwise). See docs/reference/FIN25_SENSOR_NODE_GOLDEN_DEMO.md +\n"
+            "  otherwise). See docs/reference/SENSOR_NODE_DEMO.md +\n"
             "  cad_guide('simulation')."
         )
     if topic in ("structural", "structure", "struct", "struct_analyze", "struct_check",
@@ -1785,26 +1785,6 @@ def cad_guide_text(topic: str = "overview") -> str:
             "BIAS: run code_check after struct_check for anything that will be permitted.\n"
             "  RAG citations are sourced from the research tools (research_fetch_page) —\n"
             "  the model never recalls code text from training."
-        )
-    if topic in ("serving", "serving_status", "adapter", "lora", "canary",
-                 "serving_promote", "serving_rollback", "serving_evaluate"):
-        return (
-            "ADAPTER SERVING — per-insertion-point LoRA routing: status, canary, promote, rollback\n\n"
-            "Tools: serving_status / serving_set_canary / serving_rollback /\n"
-            "       serving_evaluate / serving_promote\n\n"
-            "  serving_status()                      Show which adapter version is live at each\n"
-            "                                        insertion point + current canary %, eval\n"
-            "                                        scores, and promotion eligibility.\n"
-            "  serving_set_canary(insertion_point, pct)\n"
-            "                                        Dial canary traffic: 0=off, 100=full.\n"
-            "  serving_evaluate(insertion_point, shadow_log)\n"
-            "                                        Score a shadow log against the baseline.\n"
-            "  serving_promote(insertion_point, adapter_version, evidence)\n"
-            "                                        Promote after evidence + human sign-off.\n"
-            "                                        Auto-promote is disabled; always gated.\n"
-            "  serving_rollback(insertion_point, to_version?)\n"
-            "                                        Instantly revert to last stable version.\n\n"
-            "BIAS: evaluate before promote; rollback is always safe and instant."
         )
     if topic in ("tolerance_stackup", "stackup", "stackup_analyze", "tolerance_stack"):
         return (
@@ -2200,5 +2180,5 @@ def cad_guide_text(topic: str = "overview") -> str:
             f"interaction, sourcing, cost, spec, piping, industrial, hydraulic, firmware, structural, "
             f"drawings, "
             f"mechanical, "
-            f"regen, code_compliance, serving, design_review, doc_diff, plm, tolerance_stackup, "
+            f"regen, code_compliance, design_review, doc_diff, plm, tolerance_stackup, "
             f"evaluate, measure, sketch3d; or a feature cheatsheet: {avail}")

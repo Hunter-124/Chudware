@@ -1,22 +1,17 @@
 # Copilot Mission Pipeline — how a request becomes delivered parts
 
-Status: ratified 2026-07-04, authored by the lead session (Hunter directive:
-"figure out exactly how the copilot should work"). Companions:
-`docs/design/ADVISOR_ARCHITECTURE.md` (components), `contracts/advisor.md` (schemas —
-§16 deliverable manifest and §17 replan request were added for this pipeline).
-The canonical role system prompts live in `services/agent/roles/*.yaml` and are
-authored; T-W7 wires the loader around them VERBATIM, T-W19 wires this pipeline.
+Status: adopted design record (2026-07-04). Companions:
+[`ADVISOR_ARCHITECTURE.md`](ADVISOR_ARCHITECTURE.md) (components),
+[`contracts/advisor.md`](../../contracts/advisor.md) (schemas — §16 deliverable manifest
+and §17 replan request were added for this pipeline). The canonical role system prompts
+live in `services/agent/roles/*.yaml`; the role loader uses them verbatim.
 
-Adopted design record. The associated tasks are `status: done` on the board
-(`work/tasks/done/`): T-W1, T-W5, T-W7, T-W10, T-W12–T-W16, T-W18 and T-W19;
-T-BL50 is in `work/backlog/done/`. These are closure records, not blanket proof of
-every sentence below. Read the pipeline as design intent and check behavior against
-`services/agent/` before relying on a detail. The July role counts are dated; use the
-current `services/agent/roles/` catalog rather than a fixed count. Since 2026-08-31,
-role turns' online model execution runs inside the embedded Chudcode RPC runtime.
-The pipeline's phases, roles and governance stay
-Chudware-owned
-([omp-integration/01-DECISIONS.md, 2026-08-31 section](../omp-integration/01-DECISIONS.md#2026-08-31--superseding-architecture-chudcode-rpc-is-the-only-online-runtime)).
+The pipeline is implemented, but this document is design intent, not an as-built spec:
+check behavior against `services/agent/` before relying on a detail. The July role counts
+are dated; use the current `services/agent/roles/` catalog rather than a fixed count.
+Since 2026-08-31, role turns' online model execution runs inside the embedded Chudcode RPC
+runtime. The pipeline's phases, roles and governance stay Chudware-owned
+([Chudcode integration](../dev/chudcode-integration.md)).
 
 ## 0. Shape of the whole thing
 
@@ -28,7 +23,7 @@ user request
    ▼ Phase 2 SPECIFY     spec_writer per deliverable → engineering spec, overseer-audited
    ▼ Phase 3 PLAN        orchestrator + layout_engineer → mission DAG + build graphs
    ▼ Phase 4 BUILD       sketcher/feature_modeler/assembly_fit_engineer workers,
-   │                     parallel across part docs (leases), foreman advising every turn
+   │                     parallel across part docs (leases), advisory engine every turn
    ▼ Phase 5 VERIFY      reviewer runs the manifest's acceptance checks — literally
    ▼ Phase 6 CORRECT     failure cards → fixer (bounded) → escalation; change requests
    │                     re-enter here via the overseer          ↺ (loops with 4/5)
@@ -40,7 +35,7 @@ user request
 Two spines run through every phase:
 
 - **The ledger** carries all durable state. No role ever needs another role's chat.
-- **The foreman** (advisory engine) injects stage-appropriate advisories, computed
+- **The advisory engine** injects stage-appropriate advisories, computed
   numbers, and helper-tool pointers into every worker turn.
 
 And one valve keeps it flexible: **replan requests** (`aicad.replan/1`). Any role,
@@ -111,7 +106,7 @@ replan scope=org — the hierarchy serves the mission, not vice versa.
 
 - Assemblies first get a layout: layout_engineer builds the skeleton doc (envelopes
   as simple solids, interface planes/axes, clearance budgets) — the deterministic
-  fitment reference every part cites. (Aligns with the T-BL50 layout-first helper.)
+  fitment reference every part cites. (Aligns with the layout-first helper.)
 - Orchestrator turns specs into the mission DAG (services/dag) and per-part build
   graphs (aicad.buildgraph/1); the buildgraph validator must pass (missing
   prerequisites are findings, not surprises); role/model assignments come from
@@ -132,7 +127,7 @@ replan scope=org — the hierarchy serves the mission, not vice versa.
   tolerancing / fitment / simplicity — authored personas, run as cheap ponder
   delegations of the same model). Round 1: independent positions. Round 2: seats
   respond to each other. Chair synthesizes; must_haves become buildgraph
-  validator checks; DISSENTS are recorded with trigger_conditions the foreman
+  validator checks; DISSENTS are recorded with trigger_conditions the advisory engine
   watches — a minority report that re-raises itself if its condition occurs.
   This is the "figure out the best way to build it from all angles BEFORE
   building" gate.
@@ -144,7 +139,7 @@ replan scope=org — the hierarchy serves the mission, not vice versa.
 - Each worker turn receives exactly: role system prompt + ledger render scoped to
   ITS deliverable + its buildgraph node (with `why`) + stage state (describers) +
   [ADVISORY] block + playbook step (tier-dependent). Never the whole mission.
-- Foreman runs the stage battery after every tool call; preflight runs before
+- The advisory engine runs the stage battery after every tool call; preflight runs before
   mutations; auto-coincident keeps sketches closing; sketch_health / fit_calc /
   feeds_speeds numbers arrive already computed.
 - Node done ⇒ validated handoff → ledger; next ready node dispatches (possibly a
@@ -200,11 +195,11 @@ redirects work and escalates.
    ledger + describers. Compaction can drop anything at any time safely.
 4. **Structured out, structured in.** Handoffs are schema-validated (GBNF on local
    tiers); the next role receives the envelope, not prose.
-5. **Numbers are precomputed.** Foreman + calculators put the needed values in the
+5. **Numbers are precomputed.** The advisory engine + calculators put the needed values in the
    advisory block so a 4B model chooses between correct options instead of doing
    mental arithmetic.
 6. **Budgets are enforced, not suggested.** The tier profile's slot budgets are
-   asserted at assembly time (T-W10); overflow shrinks history first, never the
+   asserted at context-assembly time; overflow shrinks history first, never the
    advisory/system slots.
 7. **Flexibility has a schema.** Replan requests keep out-of-the-box thinking
    inside the ledger where the overseer and the human can see it.
@@ -237,7 +232,7 @@ me the CAM program for the bottom half in 6061."
   user (criterion changes). This is the flexibility valve working as intended.
 - Phase 3: layout skeleton (PCB envelope + parting plane + clearance budget);
   build graphs per half; lease plan for two part docs in parallel.
-- Phase 4–6: two workers build in parallel; foreman advisories carry wall/DFM and
+- Phase 4–6: two workers build in parallel; advisories carry wall/DFM and
   fit numbers; reviewer runs the AC checks; snap engagement fails → failure card →
   fixer adjusts per candidate fix once, works.
 - Phase 7: cam_programmer runs the deterministic path with feeds_speeds data;
@@ -245,10 +240,10 @@ me the CAM program for the bottom half in 6061."
 
 ## 5. Implementation pointers
 
-- Role prompts: `services/agent/roles/*.yaml` (13 files, authored — T-W7 loads
-  them verbatim; do not rewrite prompts in code).
-- Pipeline glue: T-W19 (phase state machine on top of services/dag + buildgraph +
-  ledger; intake validator; replan routing per §17).
-- Everything here composes from already-specified parts: T-W1 ledger, T-W5 foreman,
-  T-W7 roles, T-W12 preflight, T-W13 overseer, T-W14 delegation, T-W15 buildgraph,
-  T-W16 multi-doc, T-W18 PLM.
+- Role prompts: `services/agent/roles/*.yaml` (authored; the loader uses them
+  verbatim — do not rewrite prompts in code).
+- Pipeline glue: the phase state machine in `services/agent/pipeline/` on top of
+  `services/dag` + buildgraph + ledger; intake validator; replan routing per §17.
+- Everything here composes from already-specified parts: design ledger, advisory
+  engine, roles, preflight, overseer, delegation, buildgraph, multi-doc workspace and PLM
+  (see [`ADVISOR_ARCHITECTURE.md`](ADVISOR_ARCHITECTURE.md) §2).

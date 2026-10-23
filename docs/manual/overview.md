@@ -216,7 +216,7 @@ PRIMITIVES — box/cylinder/sphere/cone/torus. Centered on the origin by default
 
 SKETCH + a 2D-profile feature — this is how you make anything that is not a bare primitive.
   1) add_feature type "sketch", refs.plane = "plane.top" | "plane.front" | "plane.right"
-     (NEVER "XY"/"XZ"/"YZ"). plane.top = XY (+Z up), plane.front = XZ, plane.right = YZ.
+     (canonical names). plane.top = XY (+Z up), plane.front = XZ, plane.right = YZ.
      SKETCH ON AN EXISTING FACE: set refs.plane to a face QUERY — e.g. {"of":"face","side":
      "top"} ("sketch on the top face"). Your 2D origin (0,0) is then the CENTRE of that face,
      so draw relative to it — no need to know its world height. Optional `offset`:<mm> lifts
@@ -235,7 +235,18 @@ SKETCH + a 2D-profile feature — this is how you make anything that is not a ba
                 another edge.
         airfoil {naca:"2412" OR dat:"<path>", chord:<mm>, aoa:<deg>, points:50, closedTE:true}
                 — expands to the upper+lower aerofoil splines as one closed loop (see airfoil sheet).
-  3) Turn the sketch into a solid with ONE of:
+  3) Draw roughly → relations → functional driving dimensions → sketch_fully_define.
+     origin, axis.h and axis.v are valid refs. Example circle constraints:
+     {"id":"c1","type":"coincident","refs":["e1.center","origin"]},
+     {"id":"c2","type":"radius","refs":["e1"],"value":{"value":8,"expr":null}}.
+     Use unique eN/cN ids. Symmetric profiles use a construction centerline or axis.v;
+     dimension only independent half-sizes/spacing. Use real tangent arcs/lines for slots,
+     not faceted polylines/splines. Require check_sketch: closed, dof == 0, not pinned_only,
+     no conflicts/skipped constraints. Never blanket-fix authored profiles.
+     add_features defaults auto_define:true after explicit intent. Staged work opts out
+     with call auto_define:false or auto_define:false on feature/params/authoring op.
+     Then explicitly define before use; initial entity coordinates are not constraints.
+  4) Turn the checked sketch into a solid with ONE of:
      EXTRUDE  params {mode:"boss"|"cut", end:"blind"|"through_all", depth:<mm>},
               refs.profile = [{"kind":"region","sketch":"$<idx>"|"f<id>","centroid":[x,y],"hint_index":0}]
               (extrudes/cuts ALL the sketch's regions).
@@ -439,11 +450,11 @@ sketching ON a face, `offset` lifts along that face's outward normal.
 sketch_add_entity   {"op":"sketch_add_entity","sketch":"$0","entity":{...}}
                     Add a line/circle/arc/spline/polygon/rectangle/airfoil/point entity to a sketch.
 
-                    REGULAR POLYGON (hexagons, nuts, bolt-heads, prisms) — ALWAYS use this ONE
-                    entity; never hand-draw the sides as separate lines (slow + usually fails to
-                    close). It expands to N closed segments for you:
+                    REGULAR POLYGON (hexagons, nuts, bolt-heads, prisms) — prefer this
+                    closed composite; it expands to equal joined sides. Functional size
+                    and location still need dimensions/relations or residual definition:
                       {"op":"sketch_add_entity","sketch":"$0",
-                       "type":"hexagon","center":[0,0],"across_flats":16}
+                       "entity":{"type":"hexagon","center":[0,0],"across_flats":16}}
                     - type: "polygon"/"ngon" (needs "sides":N) OR a named n-gon that implies its
                       count: triangle, pentagon, hexagon, heptagon, octagon, nonagon, decagon,
                       dodecagon (an explicit "sides" still overrides).
@@ -452,10 +463,12 @@ sketch_add_entity   {"op":"sketch_add_entity","sketch":"$0","entity":{...}}
                       or "inradius"/"apothem" (centre→edge). "rotation":<deg> optional (default: a
                       vertex on +X; use rotation:90 to put a flat on top).
                     e.g. a hex prism 16mm across flats, 20mm tall:
-                      [{"op":"add_feature","type":"sketch","refs":{"plane":"plane.top"}},
-                       {"op":"sketch_add_entity","sketch":"$0","type":"hexagon","across_flats":16},
-                       {"op":"add_feature","type":"extrude","params":{"mode":"boss","end":"blind",
-                        "depth":20},"refs":{"profile":[{"kind":"region","sketch":"$0","hint_index":0}]}}]
+[
+ {"op":"add_feature","feature":{"type":"sketch","refs":{"plane":"plane.top"}}},
+ {"op":"sketch_add_entity","sketch":"$0","entity":{"type":"hexagon","center":[0,0],"across_flats":16}},
+ {"op":"sketch_fully_define","sketch":"$0"},
+ {"op":"add_feature","feature":{"type":"extrude","params":{"mode":"new","depth":20},"refs":{"profile":"$0"}}}
+]
 
                     RECTANGLE — PREFERRED over 4 hand-drawn lines (1 op, always closes):
                       {"op":"sketch_add_entity","sketch":"$0",
@@ -464,22 +477,46 @@ sketch_add_entity   {"op":"sketch_add_entity","sketch":"$0","entity":{...}}
                       may be bare numbers or {"value":N,"expr":null}. Optional rotation:<deg>.
                     - two-corner form: corner1:[x1,y1], corner2:[x2,y2] (order-independent).
                     - alias type "rect" also accepted. Expands to 4 CCW line segments.
-                    4 separate line entities remain valid if you already have corners pinned.
+                    Separate line entities are valid; define sizes/location, not fix-every-edge.
 
-sketch_convert      {"op":"sketch_convert","sketch":"<sketch-fid>","refs":[Ref,...],"construction":false,"fix":true}
-                    Project external geometry INTO an existing sketch (SolidWorks "Convert Entities").
-                    Each Ref is {"datum":"front"|"top"|"right"} for a datum plane (intersection line)
-                    OR {"kind":"face"|"edge","selector":{"sid":"<sid>"}} for solid geometry.
-                    A face ref projects ALL its boundary wires (outer + hole loops); oblique circular
-                    edges become ellipses; near-perpendicular edges collapse to a point.
-                    construction:false (default) = real, extrudable geometry; true = blue reference lines.
-                    fix:true (default) = each entity is pinned with a whole-entity fix relation.
-                    ONE-SHOT: projected entities do NOT update when the source model changes.
-                    id_map: first new entity → "$<op-index>"; rest → "$<op-index>#1", "$<op-index>#2", …
-                    e.g. project the front datum plane and one face's wires into sketch s2:
-                    {"op":"sketch_convert","sketch":"s2",
-                     "refs":[{"datum":"front"},{"kind":"face","selector":{"sid":"Fdb31d2"}}]}
-                    Use project_into_sketch() MCP tool for the ergonomic string-ref interface.
+sketch_add_constraint {"op":"sketch_add_constraint","sketch":"f1","constraint":
+                      {"id":"c20","type":"distance","refs":["e1","e2"],"value":{"value":8,"expr":null}}}
+                    Two lines: parallel-line separation. Other dimension types: length,
+                    radius, diameter, angle, arc_length; distance also accepts point-point,
+                    point-line and one line (length). Driving value = {value,expr}.
+                    Relations: coincident, horizontal/vertical, parallel/perpendicular,
+                    collinear, tangent, equal, concentric, coradial, midpoint, point_on,
+                    intersection, smooth, symmetric, equal_curve_length; fix only for
+                    deliberate reference pins. See cad_guide('sketch') for typed ref examples.
+sketch_set_dim     {"op":"sketch_set_dim","sketch":"f1","id":"c20","value":10}
+                    RETUNES an existing dimension; create one via sketch_add_constraint.
+sketch_fully_define {"op":"sketch_fully_define","sketch":"f1","relations":true,"dimensions":true,"anchor":"origin"}
+                    Residual definition AFTER explicit intent. Optional entities:[eid,...],
+                    anchor:"none". Check DOF and pinned_only afterwards; not a blanket fix.
+
+sketch_convert      {"op":"sketch_convert","sketch":"f1","refs":[{"kind":"edge","selector":{"sid":"<measured-sid>"}}],
+                     "construction":true,"fix":true,"associative":true}
+                    Project model references as construction, then relate the profile to them.
+                    Ref alternatives: {kind:"face"|"edge"|"vertex",selector:{sid:...}},
+                    {kind:"edge",selector:{sid:...},mode:"pierce",near:[u,v]},
+                    {datum:"front"|"top"|"right"|"origin"|"axis.x"|"axis.y"|"axis.z"},
+                    {kind:"sketch_entity",sketch:"f2",entity:"e1"}.
+                    Faces project all boundary wires; pierce needs a plane crossing.
+                    Associative by default: references follow source changes. fix:true pins
+                    only converted references, not authored geometry. id_map entries:
+                    "$<convert-index>", "$<convert-index>#1",… in ref order.
+                    Then use e.g. coincident refs:["e1.p1","$<convert-index>.p"] for a vertex.
+
+sketch_fillet       {"op":"sketch_fillet","sketch":"f1","e1":"e1","e2":"e2","radius":2}
+                    Line-line corners only; trims lines, adds true arc and tangent relations.
+sketch_trim         {"op":"sketch_trim","sketch":"f1","entity":"e3","point":[10,4],"keep_construction":true}
+                    Remove the span under point; optionally retain it as construction.
+sketch_mirror_entities {"op":"sketch_mirror_entities","sketch":"f1","entities":["e1"],"line":"e9"}
+                    e9 must be a REAL construction line entity, not axis.v; adds symmetry.
+sketch_pattern_entities {"op":"sketch_pattern_entities","sketch":"f1","entities":["e1"],"mode":"linear",
+                        "count":3,"dir":[1,0],"spacing":12}
+                    Circular: mode:"circular", count:4, center:[0,0], angle:360, equal_spacing:true
+                    (replace dir/spacing). Count includes seed. Define copies, then check.
 
 ----------------------------------------------------------------- EDIT an existing feature
   edit_feature   {"op":"edit_feature","id":"f1","params":{"length":{"value":80,"expr":null}}}
@@ -498,32 +535,25 @@ A — 40x40x20 block, then round ALL its edges 3mm:
 B — a 60x40 plate 6mm thick with four 3mm corner holes (sketch circles + extrude-cut):
 [
  {"op":"add_feature","feature":{"type":"box","name":"Plate","params":{"length":{"value":60,"expr":null},"width":{"value":40,"expr":null},"height":{"value":6,"expr":null}}}},
- {"op":"add_feature","feature":{"type":"sketch","name":"Holes","params":{"entities":[],"constraints":[]},"refs":{"plane":"plane.top"}}},
- {"op":"sketch_add_entity","sketch":"$1","entity":{"type":"circle","center":[24,14],"radius":3}},
- {"op":"sketch_add_entity","sketch":"$1","entity":{"type":"circle","center":[-24,14],"radius":3}},
- {"op":"sketch_add_entity","sketch":"$1","entity":{"type":"circle","center":[24,-14],"radius":3}},
- {"op":"sketch_add_entity","sketch":"$1","entity":{"type":"circle","center":[-24,-14],"radius":3}},
- {"op":"add_feature","feature":{"type":"extrude","name":"Drill","params":{"mode":"cut","end":"through_all"},"refs":{"profile":[{"kind":"region","sketch":"$1","centroid":[0,0],"hint_index":0}]}}}
+ {"op":"add_feature","feature":{"type":"sketch","name":"Holes","refs":{"plane":"plane.top"},"params":{"entities":[{"id":"e1","type":"circle","center":[24,14],"radius":3},{"id":"e2","type":"circle","center":[-24,14],"radius":3},{"id":"e3","type":"circle","center":[24,-14],"radius":3},{"id":"e4","type":"circle","center":[-24,-14],"radius":3}],"constraints":[{"id":"c1","type":"symmetric","refs":["e1","e2","axis.v"]},{"id":"c2","type":"symmetric","refs":["e1","e3","axis.h"]},{"id":"c3","type":"symmetric","refs":["e2","e4","axis.h"]},{"id":"c4","type":"distance","refs":["e1.center","e2.center"],"value":{"value":48,"expr":null}},{"id":"c5","type":"distance","refs":["e1.center","e3.center"],"value":{"value":28,"expr":null}},{"id":"c6","type":"radius","refs":["e1"],"value":{"value":3,"expr":null}}]}}},
+ {"op":"sketch_fully_define","sketch":"$1"},
+ {"op":"add_feature","feature":{"type":"extrude","name":"Drill","params":{"mode":"cut","end":"through_all"},"refs":{"profile":"$1"}}}
 ]
 
 C — a vase as a SOLID OF REVOLUTION. The half-profile must be a CLOSED region: the curved outer
 wall (a spline) plus a straight line back down the Z axis to close it. Revolve 360 about Z:
 [
- {"op":"add_feature","feature":{"type":"sketch","name":"Profile","params":{"entities":[],"constraints":[]},"refs":{"plane":"plane.front"}}},
- {"op":"sketch_add_entity","sketch":"$0","entity":{"type":"spline","points":[[0,0],[15,0],[18,20],[10,45],[12,60],[0,60]]}},
- {"op":"sketch_add_entity","sketch":"$0","entity":{"type":"line","p1":[0,60],"p2":[0,0]}},
+ {"op":"add_feature","feature":{"type":"sketch","name":"Profile","refs":{"plane":"plane.front"},"params":{"entities":[{"id":"e1","type":"spline","points":[[0,0],[15,0],[18,20],[10,45],[12,60],[0,60]]},{"id":"e2","type":"line","p1":[0,60],"p2":[0,0]}],"constraints":[{"id":"c1","type":"coincident","refs":["e1.start","e2.p2"]},{"id":"c2","type":"coincident","refs":["e1.end","e2.p1"]},{"id":"c3","type":"coincident","refs":["e2.p2","origin"]},{"id":"c4","type":"vertical","refs":["e2"]},{"id":"c5","type":"length","refs":["e2"],"value":{"value":60,"expr":null}}]}}},
+ {"op":"sketch_fully_define","sketch":"$0"},
  {"op":"add_feature","feature":{"type":"revolve","name":"Body","params":{"mode":"boss","angle":{"value":360,"expr":null}},"refs":{"profile":[{"kind":"region","sketch":"$0","centroid":[8,30],"hint_index":0}],"axis":{"kind":"datum","feature":"axis.z"}}}}
 ]
 
 D — a blended duct by LOFTING a circle into a square (two sketches on parallel planes):
 [
- {"op":"add_feature","feature":{"type":"sketch","name":"Bottom","params":{"entities":[],"constraints":[]},"refs":{"plane":"plane.top"}}},
- {"op":"sketch_add_entity","sketch":"$0","entity":{"type":"circle","center":[0,0],"radius":20}},
- {"op":"add_feature","feature":{"type":"sketch","name":"Top","params":{"entities":[],"constraints":[],"offset":{"value":50,"expr":null}},"refs":{"plane":"plane.top"}}},
- {"op":"sketch_add_entity","sketch":"$2","entity":{"type":"line","p1":[-15,-15],"p2":[15,-15]}},
- {"op":"sketch_add_entity","sketch":"$2","entity":{"type":"line","p1":[15,-15],"p2":[15,15]}},
- {"op":"sketch_add_entity","sketch":"$2","entity":{"type":"line","p1":[15,15],"p2":[-15,15]}},
- {"op":"sketch_add_entity","sketch":"$2","entity":{"type":"line","p1":[-15,15],"p2":[-15,-15]}},
+ {"op":"add_feature","feature":{"type":"sketch","name":"Bottom","refs":{"plane":"plane.top"},"params":{"entities":[{"id":"e1","type":"circle","center":[0,0],"radius":20}],"constraints":[{"id":"c1","type":"coincident","refs":["e1.center","origin"]},{"id":"c2","type":"radius","refs":["e1"],"value":{"value":20,"expr":null}}]}}},
+ {"op":"sketch_fully_define","sketch":"$0"},
+ {"op":"add_feature","feature":{"type":"sketch","name":"Top","params":{"entities":[{"type":"rectangle","center":[0,0],"width":30,"height":30}],"offset":{"value":50,"expr":null}},"refs":{"plane":"plane.top"}}},
+ {"op":"sketch_fully_define","sketch":"$2"},
  {"op":"add_feature","feature":{"type":"loft","name":"Blend","params":{"mode":"boss"},"refs":{"sections":[{"kind":"region","sketch":"$0","centroid":[0,0],"hint_index":0},{"kind":"region","sketch":"$2","centroid":[0,0],"hint_index":0}]}}}
 ]
 
@@ -531,8 +561,8 @@ E — 6 bosses evenly around the Z axis: make ONE as a sketch+extrude boss (a pr
 patterned), then circular-pattern that extrude feature about axis.z:
 [
  {"op":"add_feature","feature":{"type":"cylinder","name":"Base","params":{"radius":{"value":40,"expr":null},"height":{"value":5,"expr":null}}}},
- {"op":"add_feature","feature":{"type":"sketch","name":"BossSk","params":{"entities":[],"constraints":[]},"refs":{"plane":"plane.top"}}},
- {"op":"sketch_add_entity","sketch":"$1","entity":{"type":"circle","center":[30,0],"radius":4}},
+ {"op":"add_feature","feature":{"type":"sketch","name":"BossSk","refs":{"plane":"plane.top"},"params":{"entities":[{"id":"e1","type":"circle","center":[30,0],"radius":4}],"constraints":[{"id":"c1","type":"point_on","refs":["e1.center","axis.h"]},{"id":"c2","type":"distance","refs":["origin","e1.center"],"value":{"value":30,"expr":null}},{"id":"c3","type":"radius","refs":["e1"],"value":{"value":4,"expr":null}}]}}},
+ {"op":"sketch_fully_define","sketch":"$1"},
  {"op":"add_feature","feature":{"type":"extrude","name":"Boss","params":{"mode":"boss","end":"blind","depth":{"value":10,"expr":null}},"refs":{"profile":[{"kind":"region","sketch":"$1","centroid":[30,0],"hint_index":0}]}}},
  {"op":"add_feature","feature":{"type":"circular_pattern","name":"Ring","params":{"count":6,"angle":{"value":360,"expr":null},"equal_spacing":true},"refs":{"axis":{"kind":"datum","feature":"axis.z"},"features":["$3"]}}}
 ]

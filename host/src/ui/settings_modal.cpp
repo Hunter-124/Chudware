@@ -38,15 +38,11 @@
 #include "ai/ai_prefs.h"  // ui::aiUiVerbosity/aiFollowActiveSession/aiActiveWorkPreviews
 #include "model_registry.h"  // ui::localPresets (experimental vision-review model presets)
 #include "leaderboard_ui.h"  // aicad.leaderboard/1 compact table (Settings > Benchmarks)
-#include "onboarding.h"  // first-run guided account/provider/test/workspace flow
-#ifndef __EMSCRIPTEN__
-#include "account_panel.h"
-#endif
+#include "onboarding.h"  // first-run guided provider/test/workspace flow
 #ifndef __EMSCRIPTEN__
 #include "../update/updater.h"
 #endif
 #include "web_capabilities.h"  // ui::webGapReason (T-RF12: sign-in is desktop-only on web)
-#include "web_provider_keys.h" // ui::webProviderKey* — per-account BYOK on web
 #include "../core/async_rpc.h"  // core::RpcResult for skills/triggers RPCs
 #include "widgets/interwebz.h"  // Skills/Rules two-column editors
 #include "ui/provider_logos.h"  // ui::drawProviderLogo/providerBrandColor (Providers list badges)
@@ -2451,104 +2447,18 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
     ImGui::PopID();
 }
 
-// Settings -> Providers in the browser cannot use a machine-global Chudcode auth store shared
-// by every tenant. Standard web accounts use the gateway's per-account credential store below.
-//
-// This is that way: the gateway's account-scoped store (POST/GET/DELETE /api/providers/keys),
-// which validates a key with the provider, seals it to the account, and resolves it server-side
-// for that account's turns only. The six providers listed are exactly the ones the gateway has a
-// validation endpoint for, and each name is the wire provider an agent turn carries, which is how
-// the stored key gets found again.
-static void drawWebAccountProviderManager(AppState& st) {
-    const float sc = ui::uiScale;
-    const auto& pal = ui::palette;
-    static const char* kProviders[] = {
-        "anthropic", "openai", "gemini", "xai", "openrouter", "moonshot",
-    };
-    static std::string s_selected = kProviders[0];
-    static char s_keyBuf[4097] = {};
-    static std::string s_keyFor;
-
-    settingsGlassSectionBegin("##web_account_keys", "Your provider keys");
-    dimText("Your own API keys are validated and stored encrypted for your account only; they "
-            "are never shown to another user. Eligible trial-domain users may instead be "
-            "sponsored by admin-linked Claude subscriptions; subscription credentials never "
-            "reach their browsers. Turns using your own key spend no Chudware credits.");
-
-    const std::vector<ui::WebProviderKey>& stored = ui::webProviderKeys();
-    for (const char* id : kProviders) {
-        const bool selected = (s_selected == id);
-        std::string hint;
-        bool present = false;
-        for (const ui::WebProviderKey& k : stored)
-            if (k.provider == id) { present = true; hint = k.hint; break; }
-        // Same kit row as every other selectable Settings list; the stored-key hint rides in
-        // the row's right-aligned meta slot instead of a SameLine text that wrapped past it.
-        char title[160];
-        std::snprintf(title, sizeof(title), "%s  \xe2\x80\xa2 %s",
-                      ui::categoryLabel(id), present ? "key stored" : "no key");
-        const std::string meta = (present && !hint.empty()) ? "\xe2\x80\xa6" + hint : "";
-        ui::kit::RowStyle rs;
-        rs.selected = selected;
-        rs.meta = meta.empty() ? nullptr : meta.c_str();
-        ui::kit::pushDensity(ui::kit::Density::Compact);
-        const bool picked = ui::kit::row(id, title, rs);
-        ui::kit::popDensity();
-        if (picked) {
-            s_selected = id;
-            std::memset(s_keyBuf, 0, sizeof(s_keyBuf));
-            s_keyFor = id;
-        }
-    }
-
-    ImGui::Dummy(ImVec2(0, 6.0f * sc));
-    // Never carry a secret across a provider switch: the buffer belongs to exactly one name.
-    if (s_keyFor != s_selected) {
-        s_keyFor = s_selected;
-        std::memset(s_keyBuf, 0, sizeof(s_keyBuf));
-    }
-    const bool busy = ui::webProviderKeyBusy();
-    const bool present = ui::webProviderKeyPresent(s_selected);
-    ImGui::TextUnformatted(present ? "Replace API key" : "Add API key");
-    ImGui::SetNextItemWidth(-1);
-    const bool entered = ImGui::InputTextWithHint(
-        "##web_key", "Paste key\xe2\x80\xa6", s_keyBuf, sizeof(s_keyBuf),
-        ImGuiInputTextFlags_Password | ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::BeginDisabled(busy || s_keyBuf[0] == 0);
-    const bool clicked = ImGui::SmallButton(busy ? "Validating\xe2\x80\xa6" : "Validate \x26 add");
-    ImGui::EndDisabled();
-    if ((entered || clicked) && !busy && s_keyBuf[0] != 0) {
-        ui::webProviderKeySave(s_selected, s_keyBuf);
-        std::memset(s_keyBuf, 0, sizeof(s_keyBuf));  // out of the ImGui buffer immediately
-    }
-    if (present) {
-        ImGui::SameLine(0, 6.0f * sc);
-        ImGui::BeginDisabled(busy);
-        if (ImGui::SmallButton("Remove##web_key")) ui::webProviderKeyDelete(s_selected);
-        ImGui::EndDisabled();
-    }
-    const std::string& status = ui::webProviderKeyStatus();
-    if (!status.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(
-            ui::webProviderKeyStatusIsError() ? pal.statusErr : pal.statusOk));
-        ImGui::TextWrapped("%s", status.c_str());
-        ImGui::PopStyleColor();
-    }
-    if (const char* why = ui::webGapReason("account_signin")) dimText(why);
-    settingsGlassSectionEnd();
-}
-
 // Two-pane provider manager: left = provider list with sign-in state, right = detail
 // (Sign-in / Usage / Models). Footer = per-session cost strip. Single-column fallback under
 // 640*sc: the list collapses to a combo (design §3.1).
 static void drawOmpProviderManager(AppState& st) {
     const float sc = ui::uiScale;
     const auto& pal = ui::palette;
-    if (ui::webProviderKeysAvailable()) {
-        // Not merely hidden: the polls below drive chudcode_* auth RPCs every TTL tick, which a
-        // non-admin account cannot call at all and an admin should not be driving from a browser
-        // into the operator's own credential store.
-        drawWebAccountProviderManager(st);
+    if (const char* why = ui::webGapReason("account_signin")) {
+        // The browser build has no provider credential path: the polls below drive chudcode_*
+        // auth RPCs against the shared engine's own credential store.
+        settingsGlassSectionBegin("##web_providers", "Providers");
+        dimText(why);
+        settingsGlassSectionEnd();
         return;
     }
     enterOmpProviderView();
@@ -6921,10 +6831,6 @@ void drawSettingsModal(AppState& st, bool busy) {
             // ---- General page: Document (units) + System (engine readout, profiler) ----
             if (s_settingsPage == 1) {
                 settingsTabBodyBegin("##tab_general");
-#ifndef __EMSCRIPTEN__
-                settingsSectionHeader("Chudware account", /*first=*/true);
-                ui::drawAccountSettings(st);
-#endif
                 settingsGlassSectionBegin("##gen_document", "Document");
                 static const char* kUnitHelp =
                     "The unit system for dimension display and input. The model is always "
@@ -8872,13 +8778,8 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (s_settingsPage == 3) {
                 providerTabDrawn = true;
                 settingsTabBodyBegin("##tab_providers");
-                dimText(ui::webProviderKeysAvailable()
-                            ? "Your own API keys stay private to your account and are stored "
-                              "encrypted on the server, never in this browser. Eligible trial-domain "
-                              "users may be sponsored by admin-linked Claude subscriptions; "
-                              "subscription credentials never reach their browsers."
-                            : "API providers, sign-in, and model routing. Credentials are stored by "
-                              "the auth bridge \xe2\x80\x94 never written to config.json.");
+                dimText("API providers, sign-in, and model routing. Credentials are stored by "
+                        "the auth bridge \xe2\x80\x94 never written to config.json.");
                 // Generation knobs (reasoning effort / max response tokens / model context
                 // window) sit ABOVE the provider manager on purpose: drawOmpProviderManager's
                 // two-pane child is sized -footerH, i.e. it eats the whole remaining tab

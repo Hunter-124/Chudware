@@ -196,7 +196,7 @@ private:
 
     // ---------- first-run onboarding scenario (CHUDWARE_SHOT=onboarding) ----------
     // Forces each wizard step open explicitly, independent of ambient completed_version, and
-    // captures all four. Optional CHUDWARE_ONBOARDING_VERIFY_MERGE=1 persists completion through
+    // captures all three. Optional CHUDWARE_ONBOARDING_VERIFY_MERGE=1 persists completion through
     // the production merge writer after the captures (run only with an isolated XDG_DATA_HOME).
     void runOnboarding(AppState& st);
     bool obInit = false, obWant = false, obDone = false;

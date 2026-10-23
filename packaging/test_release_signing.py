@@ -26,15 +26,6 @@ def _load_signer():
 sign_release = _load_signer()
 
 
-def _load_publish():
-    path = Path(__file__).with_name("publish.py")
-    spec = importlib.util.spec_from_file_location("chudware_publish", path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def test_signer_rejects_wrong_domain_before_decrypt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     called = False
     def forbidden(*_args, **_kwargs):
@@ -71,35 +62,6 @@ def test_signer_accepts_only_age_file_and_never_passes_plaintext_path(tmp_path: 
     assert seen["kwargs"]["stdout"] is sign_release.subprocess.PIPE
 
 
-def test_publish_rejects_wrong_key_and_digest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    publish = _load_publish()
-    key = Ed25519PrivateKey.generate()
-    public = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    monkeypatch.setattr(publish, "_RELEASE_PUBLIC_KEYS", {"test": public})
-    digest = hashlib.sha256(b"artifact").hexdigest()
-    preimage = publish.artifact_signature_preimage(
-        "test", "1.2.3", "linux", "x86_64", digest
-    )
-    signature = key.sign(preimage)
-    publish.verify_artifact_signature(
-        "test", "1.2.3", "linux", "x86_64", digest, signature
-    )
-    with pytest.raises(publish.PublishError, match="unknown release key"):
-        publish.verify_artifact_signature(
-            "other", "1.2.3", "linux", "x86_64", digest, signature
-        )
-    for identity in (
-        ("1.2.4", "linux", "x86_64", digest),
-        ("1.2.3", "windows", "x86_64", digest),
-        ("1.2.3", "linux", "arm64", digest),
-        ("1.2.3", "linux", "x86_64", hashlib.sha256(b"changed").hexdigest()),
-    ):
-        with pytest.raises(publish.PublishError, match="does not match"):
-            publish.verify_artifact_signature("test", *identity, signature)
-
-
-
-
 def test_artifact_request_domain_is_not_payload_domain():
     key = Ed25519PrivateKey.generate()
     request = sign_release.DOMAINS["artifact"] + b"test\0" + b"a" * 64
@@ -118,22 +80,6 @@ def test_evidence_signing_requires_exact_single_lf_canonical_json(tmp_path: Path
             sign_release.validate_request("sbom", sign_release.DOMAINS["sbom"] + replacement)
 
 
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [("1.2.3", (1, 2, 3)), ("2.10.0", (2, 10, 0)), ("10.0.12", (10, 0, 12))],
-)
-def test_publisher_parses_canonical_release_versions(value: str, expected: tuple[int, int, int]):
-    publish = _load_publish()
-    assert publish.parse_release_version(value) == expected
-
-
-@pytest.mark.parametrize("value", ["01.2.3", "1.02.3", "1.2.03", "1.2", "1.2.3-rc.1", "1.2.3+build", "v1.2.3"])
-def test_publisher_rejects_noncanonical_or_prerelease_versions(value: str):
-    publish = _load_publish()
-    with pytest.raises(publish.PublishError, match="canonical major.minor.patch"):
-        publish.parse_release_version(value)
-
-
 def _load_ci_signer():
     path = Path(__file__).with_name("ci_sign.py")
     spec = importlib.util.spec_from_file_location("chudware_ci_sign", path)
@@ -144,7 +90,7 @@ def _load_ci_signer():
 
 
 def test_artifact_request_must_carry_the_full_verifier_identity():
-    # Every verifier (gateway, updater, publish.py) recomputes
+    # Every verifier (updater, packaging/github_release_manifest.py) recomputes
     # domain\0key_id\0version\0platform\0arch\0sha256. A shorter request would be
     # signed happily and then verify nowhere.
     digest = hashlib.sha256(b"artifact").hexdigest().encode("ascii")
@@ -162,7 +108,7 @@ def test_artifact_request_must_carry_the_full_verifier_identity():
             sign_release.validate_request("artifact", truncated)
 
 
-def test_ci_signer_signs_the_gateway_preimage_from_the_environment_seed(
+def test_ci_signer_signs_the_artifact_preimage_from_the_environment_seed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     ci_sign = _load_ci_signer()
@@ -171,7 +117,7 @@ def test_ci_signer_signs_the_gateway_preimage_from_the_environment_seed(
     public = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
     artifact = tmp_path / "Chudware-0.1.0-beta.42-linux-x86_64.AppImage"
     artifact.write_bytes(b"appimage")
-    monkeypatch.setenv("CHUDWARE_RELEASE_CI_KEY", base64.b64encode(seed).decode("ascii"))
+    monkeypatch.setenv("CHUDWARE_RELEASE_SIGNING_KEY", base64.b64encode(seed).decode("ascii"))
 
     request_path = tmp_path / "request.bin"
     assert ci_sign.main([
@@ -197,13 +143,13 @@ def test_ci_signer_refuses_a_seed_that_is_not_the_expected_release_key(
     other = Ed25519PrivateKey.generate().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
     request = tmp_path / "payload.bin"
     request.write_bytes(sign_release.DOMAINS["payload"] + b"body")
-    monkeypatch.setenv("CHUDWARE_RELEASE_CI_KEY", base64.b64encode(seed).decode("ascii"))
+    monkeypatch.setenv("CHUDWARE_RELEASE_SIGNING_KEY", base64.b64encode(seed).decode("ascii"))
     assert ci_sign.main(["--expect-public-key", other.hex(), "sign", "payload", str(request)]) == 2
     assert "does not match the expected release public key" in capsys.readouterr().err
 
-    monkeypatch.delenv("CHUDWARE_RELEASE_CI_KEY")
+    monkeypatch.delenv("CHUDWARE_RELEASE_SIGNING_KEY")
     assert ci_sign.main(["sign", "payload", str(request)]) == 2
-    assert "CHUDWARE_RELEASE_CI_KEY is not set" in capsys.readouterr().err
+    assert "CHUDWARE_RELEASE_SIGNING_KEY is not set" in capsys.readouterr().err
 
 
 def _publisher_policy_request():
@@ -258,7 +204,7 @@ def test_ci_cli_excludes_owner_policy_purpose_before_loading_seed(tmp_path, monk
     ci_sign = _load_ci_signer()
     def forbidden():
         raise AssertionError("CI must not load a key for owner-only publisher policy")
-    monkeypatch.setattr(ci_sign, "_load_ci_key", forbidden)
+    monkeypatch.setattr(ci_sign, "load_signing_key", forbidden)
     request = tmp_path / "policy-request.bin"
     request.write_bytes(_publisher_policy_request())
     with pytest.raises(SystemExit) as error:

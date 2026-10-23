@@ -2,11 +2,9 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import json
-import os
 from pathlib import Path
 import shutil
 import socket
-import subprocess
 import sys
 import tempfile
 import threading
@@ -35,7 +33,7 @@ def private_json(path, data):
 @pytest.fixture
 def layout():
     # AF_UNIX paths are limited to ~107 bytes; pytest's tmp roots can exceed that.
-    tmp_path = Path(tempfile.mkdtemp(prefix="cw-", dir=os.environ.get("CHUDWARE_TEST_CELL_STORAGE_ROOT", "/tmp"))).resolve()
+    tmp_path = Path(tempfile.mkdtemp(prefix="cw-", dir="/tmp")).resolve()
     cells = tmp_path / "cells"
     cells.mkdir(mode=0o700)
     work = tmp_path / "workspace"
@@ -53,34 +51,6 @@ def layout():
     private_json(config, cfg)
     yield tmp_path, cell, work, cell_id, cfg, config
     shutil.rmtree(tmp_path, ignore_errors=True)
-
-
-@pytest.fixture
-def quota_layout(layout):
-    # A fixture needs explicit kernel-quota infrastructure, never implicit sudo
-    # or a product admission bypass. The shared helper is root-authorized only
-    # inside the integrator's disposable private mount namespace.
-    if not os.environ.get("CHUDWARE_TEST_CELL_STORAGE_ROOT") and not os.environ.get("CHUDWARE_TEST_CELL_QUOTA_HELPER"):
-        pytest.skip("real kernel quota fixture requires an explicitly authorized private XFS/ext4 namespace/root helper")
-    from _two_tenant_support import fixture_storage_root, provision_test_quotas
-    fixture_storage_root()
-    base, cell, work, cell_id, cfg, config = layout
-    bucket = base / "bucket"
-    bucket.mkdir(mode=0o700)
-    key = json.loads((cell / "cell.json").read_text())["workspace_key"]
-    roots = []
-    for kind, path in (("workspace", work), ("state", cell / "state"), ("bucket", bucket)):
-        info = path.stat()
-        roots.append({"workspace_key": key, "kind": kind, "path": str(path),
-                      "device": info.st_dev, "inode": info.st_ino})
-    budget = 64 * 1024 * 1024
-    plan = {"schema": "chudware-cell-quota-plan-v1", "service_uid": os.getuid(),
-            "owners": [{"owner_key": key, "budget_bytes": budget, "budget_inodes": 1000,
-                        "groups": [{"project_id": 1, "hard_bytes": budget, "hard_inodes": 1000,
-                                    "roots": roots}]}]}
-    cfg["quota_proof_root"] = str(provision_test_quotas(plan))
-    private_json(config, cfg)
-    yield layout
 
 
 @pytest.mark.parametrize("value", ["", "a" * 31, "A" * 32, "g" * 32, "../" + "a" * 32, "a" * 32 + ".socket", None])
@@ -263,8 +233,6 @@ def test_active_relay_outlives_idle_budget():
         thread.join(timeout=2)
 
 
-
-
 def test_worker_bootstrap_isolated_argv_and_environment(monkeypatch):
     worker = load("chudware-worker")
     monkeypatch.setenv("CHUDWARE_CELL", "1")
@@ -299,189 +267,17 @@ def test_unit_resource_and_fixed_argv_policy():
     assert "SocketMode=0600" in socket_unit and "Accept=no" in socket_unit
 
 
-@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap absent")
-@pytest.mark.parametrize("access", ["ro", "rw"])
-def test_real_bwrap_cell_and_actor_escape_boundaries(quota_layout, access):
-    base, cell, work, cell_id, cfg, config = quota_layout
-    payload = base / "payload"
-    (payload / "bin").mkdir(parents=True)
-    for source in CELL.iterdir():
-        if source.is_file():
-            shutil.copy2(source, payload / "bin" / source.name)
-    actor = "a" * 32
-    sibling = "b" * 32
-    (cell / "state/actors").mkdir(mode=0o700)
-    for actor_id in (actor, sibling):
-        directory = cell / "state/actors" / actor_id
-        directory.mkdir(parents=True, mode=0o700)
-        (directory / "secret").write_text(actor_id)
-    sibling_cell = cell.parent / sibling
-    sibling_cell.mkdir()
-    (sibling_cell / "secret").write_text("sibling-cell")
-    gateway = base / "gateway-data"
-    gateway.mkdir()
-    (gateway / "secret").write_text("gateway")
-    for name, target in (("sibling", sibling_cell / "secret"), ("gateway", gateway / "secret"),
-                         ("other-actor", cell / "state/actors" / sibling / "secret")):
-        (work / name).symlink_to(target)
-    # These actual hostile links are refused at the quota boundary, not merely
-    # hidden by bwrap or masked by an unrelated missing-proof refusal.
-    from storage_quota import QuotaRefused, admit
-    with pytest.raises(QuotaRefused, match="symlink"):
-        admit(cell_id, str(work), str(cell / "state"), cfg["quota_proof_root"])
-    for name in ("sibling", "gateway", "other-actor"):
-        (work / name).unlink()
-    verified = admit(cell_id, str(work), str(cell / "state"), cfg["quota_proof_root"])
-    for descriptor in verified:
-        os.close(descriptor)
-    broker_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    broker_socket.bind(str(cell / "egress.sock"))
-    broker_socket.listen()
-    broker_socket.settimeout(5)
-    provider_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    provider_socket.bind(str(cell / "provider.sock"))
-    provider_socket.listen()
-    other_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    other_socket.bind(str(base / "other.sock"))
-    other_socket.listen()
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(str(cell / "gw.sock"))
-    listener.listen()
-    host_tcp = socket.socket()
-    host_tcp.bind(("127.0.0.1", 0))
-    host_tcp.listen()
-    host_port = host_tcp.getsockname()[1]
-    denied = [str(Path.home()), "/run/user", str(gateway), str(sibling_cell), str(base / "other.sock"),
-              str(cell / "gw.sock"), f"/proc/{os.getpid()}/environ"]
-    probe = f'''#!/usr/bin/python3 -I
-import errno, fcntl, os, pathlib, socket, struct, subprocess, sys
-assert "OPERATOR_ENV_SENTINEL" not in os.environ
-open_extra = []
-for descriptor in os.listdir("/proc/self/fd"):
-    fd = int(descriptor)
-    try:
-        os.fstat(fd)
-    except OSError:
-        continue
-    if fd > 2:
-        open_extra.append(fd)
-assert sorted(open_extra) == ([] if sys.argv[-1] == "actor" else [3]), open_extra
-# Even the owning actor cannot clear inheritance or change project IDs inside
-# a user namespace. Readonly Ask/Plan lanes may reject the ioctl earlier.
-quota_fd = os.open("/work", os.O_RDONLY | os.O_DIRECTORY)
-attributes = bytearray(28)
-fcntl.ioctl(quota_fd, 0x801C581F, attributes, True)
-fields = list(struct.unpack("=IIIII8s", attributes))
-assert fields[0] & 0x200 and fields[3] > 0
-fields[0] &= ~0x200
-fields[3] = 0
-try:
-    fcntl.ioctl(quota_fd, 0x401C5820, struct.pack("=IIIII8s", *fields))
-except OSError as exc:
-    assert exc.errno in (errno.EINVAL, errno.EPERM, errno.EACCES, errno.EROFS), exc
-else:
-    raise AssertionError("actor escaped project quota inheritance")
-after = bytearray(28)
-fcntl.ioctl(quota_fd, 0x801C581F, after, True)
-assert after == attributes
-os.close(quota_fd)
-for name in {denied!r} + ["/work/sibling", "/work/gateway", "/work/other-actor"]:
-    try:
-        pathlib.Path(name).read_bytes() if not pathlib.Path(name).is_dir() else list(pathlib.Path(name).iterdir())
-    except OSError:
-        pass
-    else:
-        raise AssertionError("host access: " + name)
-for address in [("127.0.0.1", {host_port}), ("8.8.8.8", 443)]:
-    sock = socket.socket(); sock.settimeout(.2)
-    assert sock.connect_ex(address) != 0
-    sock.close()
-result = subprocess.run(["/usr/bin/systemd-run", "--user", "--pipe", "/usr/bin/true"], capture_output=True)
-assert result.returncode != 0
-assert not pathlib.Path("/run/dbus/system_bus_socket").exists()
-if sys.argv[-1] == "actor":
-    assert not pathlib.Path("/state").exists()
-    assert pathlib.Path("/actor/secret").read_text() == {actor!r}
-    assert set(p.name for p in pathlib.Path("/dev").iterdir()) == {{"null", "zero", "urandom"}}
-    try:
-        pathlib.Path("/work/written").write_text("write")
-    except OSError:
-        assert {access!r} == "ro"
-    else:
-        assert {access!r} == "rw"
-    pathlib.Path("/actor/own-write").write_text("own")
-    proxy = socket.create_connection(("127.0.0.1", 18080), timeout=2)
-    proxy.sendall(b"CONNECT 127.0.0.1:443 HTTP/1.1\\r\\n\\r\\n")
-    assert proxy.recv(4096).startswith(b"HTTP/1.1 403")
-    proxy.close()
-    code = "import pathlib; assert not pathlib.Path('/state').exists(); assert pathlib.Path('/actor/secret').read_text()==" + repr({actor!r})
-    if {access!r} == "ro":
-        code += "; pathlib.Path('/work/nested-write').write_text('must-fail')"
-        nested = subprocess.run(["/opt/chudware/bin/chudware-actor-sandbox", {actor!r}, "rw", "--", "/usr/bin/python3", "-I", "-S", "-c", code], capture_output=True)
-        assert nested.returncode != 0 and b"Read-only file system" in nested.stderr
-    else:
-        subprocess.run(["/opt/chudware/bin/chudware-actor-sandbox", {actor!r}, "rw", "--", "/usr/bin/python3", "-I", "-S", "-c", code], check=True)
-else:
-    assert os.environ["HTTPS_PROXY"] == "http://127.0.0.1:18080"
-    assert os.environ["NO_PROXY"] == os.environ["no_proxy"] == "127.0.0.1,localhost,::1"
-    inherited = socket.socket(fileno=os.dup(3))
-    assert inherited.family == socket.AF_UNIX and inherited.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
-    inherited.close()
-    subprocess.run(["/opt/chudware/bin/chudware-actor-sandbox", {actor!r}, {access!r}, "--", "/opt/chudware/bin/chudware-hostd", "actor"], check=True)
-print("escape-probe-passed", flush=True)
-'''
-    (payload / "bin/chudware-hostd").write_text(probe)
-    (payload / "bin/chudware-hostd").chmod(0o755)
-    def reject():
-        try:
-            connection, _ = broker_socket.accept()
-        except OSError:
-            return
-        with connection:
-            connection.recv(8192)
-            connection.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
-    broker_thread = threading.Thread(target=reject)
-    broker_thread.start()
-    wrapper = "import os,sys;os.dup2(int(sys.argv[1]),3,inheritable=True);os.environ['LISTEN_PID']=str(os.getpid());os.execv(sys.argv[2],[sys.argv[2],sys.argv[3]])"
-    try:
-        result = subprocess.run([sys.executable, "-I", "-S", "-c", wrapper, str(listener.fileno()),
-            str(payload / "bin/chudware-cell-launch"), cell_id], pass_fds=(listener.fileno(),),
-            env={**os.environ, "CHUDWARE_CELL_CONFIG": str(config), "LISTEN_FDS": "1", "OPERATOR_ENV_SENTINEL": "must-not-leak"},
-            capture_output=True, text=True, timeout=20)
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert result.stdout.count("escape-probe-passed") == 2
-        assert (cell / "state/actors" / actor / "own-write").read_text() == "own"
-        assert (work / "written").exists() == (access == "rw")
-    finally:
-        for sock in (broker_socket, provider_socket, listener, other_socket, host_tcp):
-            sock.close()
-        broker_thread.join(timeout=6)
-
-
-def test_worker_accepts_only_scoped_provider_grant_and_fixed_endpoints(monkeypatch):
+def test_worker_environment_carries_no_operator_credentials_or_endpoints(monkeypatch):
     worker = load("chudware-worker")
     monkeypatch.setenv("CHUDWARE_CELL", "1")
-    monkeypatch.setenv("OPENAI_API_KEY", "operator-key-must-not-enter-cell")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "operator-key-must-not-enter-cell")
-    monkeypatch.setenv("OPENAI_BASE_URL", "http://169.254.169.254")
-    monkeypatch.setenv("HTTP_PROXY", "http://169.254.169.254")
-    monkeypatch.setenv("NO_PROXY", "*")
-    grant = "cpg1.c2NvcGVk." + "a" * 43
-    monkeypatch.setenv("CHUDWARE_PROVIDER_GRANT", grant)
-    for name in runtime.PROVIDER_ENDPOINT_ENV:
-        monkeypatch.setenv(name, "http://127.0.0.1:18081/anthropic/v1")
+    for name, value in (("OPENAI_API_KEY", "operator-key-must-not-enter-cell"),
+                        ("ANTHROPIC_API_KEY", "operator-key-must-not-enter-cell"),
+                        ("ANTHROPIC_BASE_URL", "http://169.254.169.254"),
+                        ("OPENAI_BASE_URL", "http://169.254.169.254"),
+                        ("HTTP_PROXY", "http://169.254.169.254"), ("NO_PROXY", "*")):
+        monkeypatch.setenv(name, value)
     _, _, environment = worker.worker_argv([])
-    assert environment["CHUDWARE_PROVIDER_GRANT"] == grant
-    assert not {"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_BASE_URL"} & environment.keys()
+    assert not {"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
+                "OPENAI_BASE_URL"} & environment.keys()
     assert environment["HTTP_PROXY"] == "http://127.0.0.1:18080"
     assert environment["NO_PROXY"] == environment["no_proxy"] == "127.0.0.1,localhost,::1"
-    for endpoint in ("http://127.0.0.1:18080/anthropic/v1", "http://169.254.169.254",
-                     "https://api.anthropic.com", "http://127.0.0.1:18081/anthropic/v1/"):
-        monkeypatch.setenv("ANTHROPIC_BASE_URL", endpoint)
-        with pytest.raises(ValueError, match="provider endpoint"):
-            worker.worker_argv([])
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:18081/anthropic/v1")
-    for value in ("", "sk-upstream-key", grant + "\n", "cpg1." + "a" * 4096 + "." + "a" * 43):
-        monkeypatch.setenv("CHUDWARE_PROVIDER_GRANT", value)
-        with pytest.raises(ValueError, match="provider grant"):
-            worker.worker_argv([])

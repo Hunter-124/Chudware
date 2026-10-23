@@ -3,8 +3,8 @@
 Browser SharedArrayBuffer / pthread builds need:
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
-on every asset under /app (html, js, wasm, data, …). Auth is enforced by
-AuthMiddleware — /app is intentionally NOT on the public allowlist.
+on every asset under /app (html, js, wasm, data, …). The tree is the bundle
+``./build.sh wasm`` stages (``CHUDWARE_WEB_APP``).
 """
 
 from __future__ import annotations
@@ -17,22 +17,12 @@ import re
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, RedirectResponse, Response
 
 try:
-    from . import orgs
-    from . import authn
-    from .accounts import get_account
-    from .auth import get_current_user
     from .config import settings
-    from .plans import limits_for
-except ImportError:  # uvicorn app:app from package dir
-    import orgs
-    import authn
-    from accounts import get_account
-    from auth import get_current_user
+except ImportError:  # uvicorn app:app from the package directory
     from config import settings
-    from plans import limits_for
 
 log = logging.getLogger("chudware-web.appserve")
 
@@ -112,10 +102,9 @@ _APP_CSP = (
 
 # The app's index.html carries inline bootstrap <script> blocks. Rather than
 # weakening script-src with 'unsafe-inline' (which would forfeit the XSS
-# protection on an authenticated surface), hash them and name the hashes. The
-# bundle is rebuilt by install_webd.sh, so the hashes are computed from the
-# file on disk and re-derived whenever its mtime/size changes — a rebuild can
-# never silently lock the client out again.
+# protection), hash them and name the hashes. The hashes are computed from the
+# file on disk and re-derived whenever its mtime/size changes, so restaging the
+# bundle can never silently lock the client out.
 _INLINE_SCRIPT_RE = re.compile(
     rb"<script(?![^>]*\bsrc\s*=)[^>]*>(.*?)</script\s*>",
     re.IGNORECASE | re.DOTALL,
@@ -209,6 +198,8 @@ def _negotiate(target: Path, request: Request) -> tuple[Path, str | None]:
         if gz is not None:
             return gz, "gzip"
     return target, None
+
+
 def _file_response(target: Path, request: Request) -> FileResponse:
     served, encoding = _negotiate(target, request)
     headers = _coop_headers(target)  # cache policy keys on the ORIGINAL suffix
@@ -224,39 +215,9 @@ def _file_response(target: Path, request: Request) -> FileResponse:
     )
 
 
-def _upgrade_response(request: Request) -> HTMLResponse | None:
-    """Return the cloud-plan upgrade page, or None when /app is entitled."""
-    user = get_current_user(request)
-    account = get_account(user.email)
-    if (orgs.university_eligible(user.email)
-            and orgs.selected_workspace_team(request, user.email) == settings.university_team_id):
-        return None
-    try:
-        if (account is not None and limits_for(account.plan).cloud
-                and not (account.plan == "trial" and authn.trial_expired(user.email))):
-            return None
-    except ValueError:
-        pass
-    return HTMLResponse(
-        status_code=403,
-        headers={"Cache-Control": "no-store"},
-        content="""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Cloud workspace upgrade required · Chudware</title></head>
-<body><main><h1>Your plan does not include the cloud workspace</h1>
-<p>The Desktop plan keeps the native app enabled. Upgrade to Studio to use
-Chudware in this browser.</p>
-<p><a href="/#pricing">Compare plans</a></p></main></body></html>""",
-    )
-
-
 @router.get("/app", response_model=None)
 async def app_redirect(request: Request) -> Response:
-    """Redirect entitled callers to the canonical slash form."""
-    upgrade = _upgrade_response(request)
-    if upgrade is not None:
-        return upgrade
+    """Redirect to the canonical slash form."""
     index = _resolve_under_app("")
     return RedirectResponse(
         url="/app/" + ("?" + request.url.query if request.url.query else ""),
@@ -268,26 +229,12 @@ async def app_redirect(request: Request) -> Response:
 @router.get("/app/", response_model=None)
 async def app_index(request: Request) -> Response:
     """Serve the WASM client entry (index.html)."""
-    upgrade = _upgrade_response(request)
-    if upgrade is not None:
-        return upgrade
-    response = _file_response(_resolve_under_app(""), request)
-    selection = request.query_params.get("team")
-    if selection is not None:
-        user = get_current_user(request)
-        if selection != "personal":
-            orgs.resolve_team_bucket(user.email, selection, write=False)
-        response.set_cookie("chudware_workspace", selection, httponly=True,
-                            secure=request.url.scheme == "https", samesite="lax", path="/")
-    return response
+    return _file_response(_resolve_under_app(""), request)
 
 
 @router.get("/app/{asset_path:path}", response_model=None)
 async def app_asset(asset_path: str, request: Request) -> Response:
     """Serve a file from the WASM client tree."""
-    upgrade = _upgrade_response(request)
-    if upgrade is not None:
-        return upgrade
     return _file_response(_resolve_under_app(asset_path), request)
 
 

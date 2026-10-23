@@ -18,17 +18,17 @@ def test_file_install_satisfies_pin_but_wrong_version_does_not(tmp_path, monkeyp
     metadata.mkdir()
     (metadata / "METADATA").write_text("Name: chudcode-rpc\nVersion: 0.2.0\n")
     (metadata / "direct_url.json").write_text(json.dumps({
-        "url": "file:///home/hunter/Repositories/omp/python/chudcode-rpc",
+        "url": (tmp_path / "src" / "chudcode-rpc").as_uri(),
         "dir_info": {"editable": True},
     }))
     distributions = importlib.metadata.distributions
     monkeypatch.setattr(importlib.metadata, "distributions", lambda: distributions(path=[str(tmp_path)]))
     requirements = tmp_path / "requirements.txt"
-    requirements.write_text("chudcode-rpc==0.2.0 # private editable package\n")
+    requirements.write_text("chudcode-rpc==0.2.0 # local editable package\n")
     assert check_dependencies(requirements)["declared_missing"] == []
     (metadata / "METADATA").write_text("Name: chudcode-rpc\nVersion: 0.1.0\n")
     assert check_dependencies(requirements)["declared_missing"] == [
-        {"pkg": "chudcode-rpc", "req_line": "chudcode-rpc==0.2.0 # private editable package"},
+        {"pkg": "chudcode-rpc", "req_line": "chudcode-rpc==0.2.0 # local editable package"},
     ]
 
 

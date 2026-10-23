@@ -1,28 +1,40 @@
 ---
 title: Install on Linux
-description: Install the published x86-64 Chudware build on Linux from your authenticated download page.
+description: Download the x86-64 Chudware build for Linux from GitHub Releases as an AppImage, a distribution package, or a plain archive.
 section: Installation
 order: 20
 ---
 ## Get the current build
 
-Sign in at [app.chudware.com](https://app.chudware.com/#downloads) and open the download page. It shows the published Linux x86-64 package, version, size, and SHA-256 digest for your account.
+Open the [latest release on GitHub](https://github.com/Hunter-124/Chudware/releases/latest) and download the Linux x86-64 file that fits your system. No account is needed. GitHub shows a SHA-256 digest beside each asset; compare it with the output of `sha256sum` before you install.
 
-The current Linux build is an **AppImage**. Download it, mark it executable, and run it:
+## AppImage
+
+The AppImage is one portable file with nothing to install. Mark it executable and run it:
 
 ```sh
-chmod +x Chudware-*.AppImage
-./Chudware-*.AppImage
+chmod +x Chudware-*-linux-x86_64.AppImage
+./Chudware-*-linux-x86_64.AppImage
 ```
 
-## Account-generated terminal command
+## Distribution packages
 
-The same page can generate a complete install command containing a personal, account-bound download token. The token expires after 15 minutes. Copy the ready-to-run command from the authenticated page rather than constructing one or sharing its token.
+On Debian and Ubuntu, install the `.deb` with apt:
+
+```sh
+sudo apt install ./chudware_*_amd64.deb
+```
+
+On Fedora and RHEL, install the `.rpm` with dnf (or zypper on openSUSE):
+
+```sh
+sudo dnf install ./chudware-*.x86_64.rpm
+```
+
+The `.tar.zst` archive runs on any distribution: unpack it and start Chudware from wherever you put it. Not every release carries every format; the release's asset list is authoritative.
+
+## Requirements and updates
 
 The build is 64-bit and needs a graphics driver capable of a modern hardware-accelerated 3D context; without one the application does not start.
 
-Do not install a package presented as an official Chudware release from a third-party source; the download page in your account is the only official source.
-
-## Or skip the install
-
-The browser client requires no desktop installation. [Create an account](https://app.chudware.com/signup) to use Chudware from a tab.
+Chudware checks GitHub for newer releases and verifies each update's Ed25519 signature before staging it. Only install Chudware from the project's GitHub releases or a build you made [from source](https://github.com/Hunter-124/Chudware#building-from-source).

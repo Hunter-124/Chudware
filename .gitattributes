@@ -3,8 +3,3 @@
 # core/tests/data/firmware/*.golden.h) to CRLF, breaking byte-exact generator/oracle
 # comparisons that assume LF (see docs/reference/BUILD_WINDOWS.md).
 * text=auto eol=lf
-
-services/mcp/server.py merge=union
-contracts/licenses.md merge=union
-requirements.txt merge=union
-work/FOREMAN.md merge=union

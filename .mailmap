@@ -1,16 +1,4 @@
-# Canonical identity map — the truth about who wrote this repo.
-#
-# All "sonnet-kier" and "Erik Meeks" commits were AI agent sessions running on
-# Hunter's machine under fabricated git identities (a model set them in
-# .git/config; the "Erik" persona was then propagated through docs). The human
-# behind all of that work is Hunter-124. The only other real contributor is
-# Moose in a Tree.
-#
-# This file corrects attribution in git tooling (shortlog/blame/log --use-mailmap)
-# and is the input for the one-shot git-filter-repo history rewrite.
+# Canonical author identities for git shortlog, blame, and log --use-mailmap.
 
-Hunter-124 <haedmonds69@gmail.com> sonnet-kier <sonnet-kier@ai-cad.local>
-Hunter-124 <haedmonds69@gmail.com> sonnet-kier <erikmeeks2012@gmail.com>
-Hunter-124 <haedmonds69@gmail.com> Erik Meeks <erikmeeks2012@gmail.com>
-Hunter-124 <haedmonds69@gmail.com> <sonnet-kier@ai-cad.local>
-Hunter-124 <haedmonds69@gmail.com> <erikmeeks2012@gmail.com>
+Hunter Edmonds <167375961+Hunter-124@users.noreply.github.com> <haedmonds69@gmail.com>
+Hunter Edmonds <167375961+Hunter-124@users.noreply.github.com> opus-fenn <noreply@anthropic.com>

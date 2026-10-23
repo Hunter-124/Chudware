@@ -41,14 +41,6 @@ _TOKEN_HEADERS = {
     "User-Agent": "anthropic-sdk-typescript/0.94.0 userOAuthProvider",
 }
 
-# Raised when an injected (caller-owned) bearer is refused: this process holds no
-# refresh token for it and must never write one, so the connection has to be
-# re-established where it was granted.
-_INJECTED_REJECTED = (
-    "Claude subscription connection is no longer valid — re-connect Claude "
-    "from the account portal."
-)
-
 
 class AnthropicSubProvider(Provider):
     """Anthropic Messages API backed by a Claude Pro/Max subscription OAuth token."""
@@ -56,16 +48,9 @@ class AnthropicSubProvider(Provider):
     name = "anthropic-sub"
     supports_vision = True
 
-    def __init__(self, model: str = DEFAULT_MODEL, *, access_token: str | None = None) -> None:
+    def __init__(self, model: str = DEFAULT_MODEL) -> None:
         self.model = model
-        # An injected bearer belongs to a web account, not to this machine's user: the
-        # gateway owns its refresh and its storage, so this process must neither read
-        # nor write the desktop credential store for that turn.
-        self._injected = bool(access_token)
-        if self._injected:
-            self._cred: dict | None = {"access_token": access_token}
-        else:
-            self._cred = sub_auth.load_credential(PROVIDER_ID)
+        self._cred: dict | None = sub_auth.load_credential(PROVIDER_ID)
 
     # ── Authentication ───────────────────────────────────────────────────────
 
@@ -126,10 +111,6 @@ class AnthropicSubProvider(Provider):
 
     def refresh(self) -> dict:
         """Exchange a refresh token for a new access token."""
-        if self._injected:
-            # Guarded here as well as in _ensure_auth so no future retry path can
-            # persist or rotate a credential this process does not own.
-            raise RuntimeError(_INJECTED_REJECTED)
         resp = sub_auth.post_json(
             TOKEN_URL,
             {
@@ -160,12 +141,6 @@ class AnthropicSubProvider(Provider):
         return cred
 
     def _ensure_auth(self) -> None:
-        if self._injected:
-            # No refresh_token was handed over and none is wanted: the caller that owns
-            # this grant refreshes it and guarantees remaining lifetime.
-            if not (self._cred or {}).get("access_token"):
-                raise RuntimeError(_INJECTED_REJECTED)
-            return
         if not self._cred:
             raise RuntimeError(
                 "Not logged in to Claude subscription. "

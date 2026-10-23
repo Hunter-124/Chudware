@@ -175,7 +175,7 @@ def integer(value, label, minimum=1, maximum=(1 << 63) - 1):
 
 def cell_id(workspace_key):
     if (not isinstance(workspace_key, str) or len(workspace_key) > 512
-            or not re.fullmatch(r"(?:user:[A-Za-z0-9_-]+|team:[A-Za-z0-9_-]+/[A-Za-z0-9_-]+)", workspace_key)):
+            or not re.fullmatch(r"user:[A-Za-z0-9_-]+", workspace_key)):
         raise QuotaRefused("invalid quota workspace identity")
     return hashlib.sha256(workspace_key.encode()).hexdigest()[:32]
 
@@ -221,7 +221,7 @@ def validate_policy(policy, schema):
                 raise QuotaRefused("too many quota roots")
             devices = set()
             for root in roots:
-                if not isinstance(root, dict) or root.get("kind") not in {"workspace", "state", "bucket"}:
+                if not isinstance(root, dict) or root.get("kind") not in {"workspace", "state"}:
                     raise QuotaRefused("invalid quota root kind")
                 workspace = root.get("workspace_key")
                 ident = cell_id(workspace)
@@ -253,9 +253,8 @@ def validate_policy(policy, schema):
         if total_bytes > budget_bytes or total_inodes > budget_inodes:
             raise QuotaRefused("split filesystem limits exceed the bounded owner budget")
         for workspace, kinds in workspaces.items():
-            required = {"workspace", "state", "bucket"} if workspace.startswith("user:") else {"workspace", "state"}
-            if not required <= kinds:
-                raise QuotaRefused("workspace/state/personal bucket charging is incomplete")
+            if kinds != {"workspace", "state"}:
+                raise QuotaRefused("workspace/state charging is incomplete")
     ordered = sorted(paths)
     if any(right.startswith(left + "/") for left, right in zip(ordered, ordered[1:])):
         raise QuotaRefused("overlapping quota roots are unsafe")

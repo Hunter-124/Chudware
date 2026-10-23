@@ -182,61 +182,8 @@ class PosixCefTests(unittest.TestCase):
             self.assertFalse(destination.exists())
 
 
-@unittest.skipUnless(shutil.which("bash"), "Bash is unavailable")
-class RunnerPythonBootstrapTests(unittest.TestCase):
-    def test_invalid_image_inputs_preserve_existing_venv_without_executing_it(self):
-        import os
-        import shlex
-        try:
-            import yaml
-        except ImportError:
-            self.skipTest("PyYAML is unavailable")
-        consumers = [
-            ("runner-provision.yml", "provision-macos",
-             "Provision authenticated complete release Python", "chudware-ci-tools/release-python"),
-            ("runner-provision.yml", "provision-linux",
-             "Provision authenticated complete release Python", "chudware-ci-tools/release-python"),
-            ("release-prepare.yml", "prepare",
-             "Provision authenticated release Python (POSIX)", "temp/release-python"),
-        ]
-        for workflow, job, step_name, venv_path in consumers:
-            doc = yaml.safe_load((ROOT / ".github/workflows" / workflow).read_text())
-            body = next(step["run"] for step in doc["jobs"][job]["steps"]
-                        if step.get("name") == step_name)
-            for invalid in ("missing", "relative"):
-                for variable in ("CHUDWARE_CI_BASE_PYTHON", "CHUDWARE_WHEELHOUSE"):
-                    with self.subTest(workflow=workflow, job=job, invalid=invalid, variable=variable), tempfile.TemporaryDirectory() as work:
-                        directory = Path(work)
-                        marker = directory / "python-executed.marker"
-                        base = directory / "image-python"
-                        base.write_text(f"#!/bin/sh\nprintf invoked > {shlex.quote(str(marker))}\nexit 99\n")
-                        base.chmod(0o700)
-                        stale = directory / venv_path / "bin/python"
-                        stale.parent.mkdir(parents=True)
-                        stale.write_bytes(b"unauthenticated existing venv; must remain untouched")
-                        environment = dict(os.environ)
-                        environment.update(HOME=str(directory), RUNNER_TEMP=str(directory / "temp"),
-                                           RELEASE_VENV_SUBDIR="chudware-ci-tools/release-python",
-                                           GITHUB_ENV=str(directory / "github-env"), GITHUB_PATH=str(directory / "github-path"),
-                                           CHUDWARE_CI_BASE_PYTHON=str(base), CHUDWARE_WHEELHOUSE=str(directory / "wheelhouse"))
-                        if invalid == "missing":
-                            environment.pop(variable, None)
-                        else:
-                            environment[variable] = "image-python" if variable == "CHUDWARE_CI_BASE_PYTHON" else "wheelhouse"
-                        result = subprocess.run(["bash", "-c", body], cwd=ROOT, env=environment,
-                                                capture_output=True, text=True, timeout=30)
-                        self.assertNotEqual(result.returncode, 0)
-                        if invalid == "missing":
-                            self.assertIn(variable, result.stderr)
-                        else:
-                            message = "base Python must be an absolute" if variable == "CHUDWARE_CI_BASE_PYTHON" else "wheelhouse must be an absolute"
-                            self.assertIn(message, result.stdout + result.stderr)
-                        self.assertFalse(marker.exists())
-                        self.assertEqual(stale.read_bytes(), b"unauthenticated existing venv; must remain untouched")
-
-
 @unittest.skipUnless(POWERSHELL, "PowerShell is unavailable")
-class PowerShellBootstrapTests(unittest.TestCase):
+class PowerShellCefTests(unittest.TestCase):
     def test_cef_rejects_tampered_cache_without_touching_extracted_sdk(self):
         with tempfile.TemporaryDirectory() as work:
             directory = Path(work)
@@ -251,43 +198,6 @@ class PowerShellBootstrapTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("SHA-256 mismatch", result.stderr)
             self.assertEqual(dll.read_bytes(), b"do not load")
-
-    def test_workflow_bootstraps_reject_cached_bytes_before_execution(self):
-        try:
-            import yaml
-        except ImportError:
-            self.skipTest("PyYAML is unavailable")
-        cases = [
-            ("chudcode-runtime-windows-build.yml", "build",
-             "Authenticate and install pinned Bun 1.4.0", "bun-windows-x64.zip", "temp"),
-            ("chudcode-runtime-windows-build.yml", "build",
-             "Authenticate rustup and install locked Rust toolchain", "rustup-init-1.28.2.exe", "temp"),
-            ("runner-provision.yml", "provision-windows",
-             "Unpack Inno Setup 6 (no admin needed)",
-             "chudware-ci-tools/bootstrap-archives/innosetup-6.7.3.exe", "profile"),
-        ]
-        for workflow, job, name, cache, home in cases:
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as work:
-                directory = Path(work)
-                doc = yaml.safe_load((ROOT / ".github/workflows" / workflow).read_text())
-                body = next(step["run"] for step in doc["jobs"][job]["steps"] if step.get("name") == name)
-                target = directory / home / cache
-                target.parent.mkdir(parents=True)
-                target.write_bytes(b"tampered bootstrap, never execute")
-                marker = directory / "extracted.marker"
-                script = directory / "bootstrap.ps1"
-                script.write_text(
-                    "$env:RUNNER_TEMP = '" + str(directory / "temp").replace("'", "''") + "'\n"
-                    "$env:USERPROFILE = '" + str(directory / "profile").replace("'", "''") + "'\n"
-                    "$env:RUST_TOOLCHAIN = 'nightly-2026-01-01'\n"
-                    "function Invoke-WebRequest { throw 'Network forbidden in offline smoke' }\n"
-                    "function Expand-Archive { Set-Content '" + str(marker).replace("'", "''") + "' 'unsafe'; throw 'Unexpected extraction' }\n"
-                    + body, encoding="utf-8")
-                result = subprocess.run([POWERSHELL, "-NoProfile", "-File", str(script)],
-                                        capture_output=True, text=True, timeout=30)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("SHA-256 mismatch", result.stderr)
-                self.assertFalse(marker.exists())
 
 
 if __name__ == "__main__":

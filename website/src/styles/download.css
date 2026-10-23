@@ -3,14 +3,11 @@
 
 @layer pages {
   .dl-primary { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: var(--s6); align-items: center; padding: var(--s6); }
-  .dl-primary[data-state="fallback"] { border-color: var(--line-hi); }
   .dl-mark { display: grid; place-items: center; width: var(--s8); height: var(--s8); flex: none; border: var(--border) solid var(--line-hi); border-radius: var(--radius); background: var(--bg-deep); color: var(--technical); }
   .dl-mark .icon { width: var(--s6); height: var(--s6); }
   .dl-primary-body { display: grid; gap: var(--s2); }
   .dl-primary-body h2 { font-size: var(--step-2); }
   .dl-note { max-width: var(--measure); color: var(--muted); }
-  .dl-note:empty { display: none; }
-  .release-meta:empty { display: none; }
 
   .dl-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s4); margin-top: var(--s6); }
   .dl-card { display: flex; min-width: 0; flex-direction: column; align-items: stretch; gap: var(--s4); padding: var(--s6); }
@@ -20,19 +17,15 @@
   .dl-card-head h3 { font-size: var(--step-1); }
   .dl-card > p { color: var(--muted); font-size: var(--step--1); }
   .dl-builds { display: grid; list-style: none; border-top: var(--border) solid var(--line); }
-  .dl-builds:empty { display: none; }
   .dl-builds li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--s1) var(--s4); padding-block: var(--s3); border-bottom: var(--border) solid var(--line); font-size: var(--step--1); }
   .dl-builds li span:first-child { color: var(--text); font-weight: 620; }
-  .dl-builds li span + span { color: var(--technical); font: var(--step--1)/1.5 var(--mono); }
-  /* Full-width plain line under a Windows build row: what the format is for. */
+  /* The release asset filename: mono, and free to break so a long name never
+     widens the card. */
+  .dl-builds li span + span { min-width: 0; overflow-wrap: anywhere; color: var(--technical); font: var(--step--1)/1.5 var(--mono); }
+  /* Full-width plain line under a build row: what the format is for. */
   .dl-builds li .dl-build-note { flex-basis: 100%; color: var(--muted); font: 400 var(--step--1)/1.55 var(--sans); }
-  /* The grid displays above would defeat the hidden attribute the format
-     gating relies on; a row hidden by the script must actually disappear. */
-  .dl-formats[hidden], .dl-formats > div[hidden] { display: none; }
   .dl-card .text-link { margin-top: auto; font-size: var(--step--1); }
   .dl-sysnote { margin-top: var(--s5); font-size: var(--step--1); }
-
-  .dl-token-note { margin-top: var(--s4); font-size: var(--step--1); }
 
   .dl-formats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--s7); align-content: start; margin-top: var(--s6); border-top: var(--border) solid var(--line); }
   .dl-formats > div { display: grid; grid-template-columns: minmax(8rem, .4fr) minmax(0, 1fr); gap: var(--s4); padding-block: var(--s4); border-bottom: var(--border) solid var(--line); }

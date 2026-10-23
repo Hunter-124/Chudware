@@ -154,7 +154,7 @@ def _seed_scripts() -> dict[int, dict[str, list[dict]]]:
                       "args": {"op": "bore", "diameter": 25.0, "through": True},
                       "hypothesis": "rebore unchanged"})
 
-    # seed 4 (T-W32): execution_stall — the cycle-1-real-r3 shape, LABELED: real
+    # seed 4: execution_stall — the shape observed in real runs, LABELED: real
     # agent turns whose every tool call failed to execute (resolution gaps), no
     # dimension/decision ever recorded → every AC fails with nothing built.
     # Distinct tools (no repeated fingerprint → not grind) and resolution-failure

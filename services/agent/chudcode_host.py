@@ -155,85 +155,31 @@ def byok_provider_env(provider: str) -> str | None:
     return _BYOK_PROVIDER_ENV.get(provider.strip().lower())
 
 
-_CELL_PROVIDER_BASES = {
-    "anthropic": "http://127.0.0.1:18081/anthropic/v1",
-    "openai": "http://127.0.0.1:18081/openai/v1",
-    "xai": "http://127.0.0.1:18081/xai/v1",
-    "openrouter": "http://127.0.0.1:18081/openrouter/v1",
-    "gemini": "http://127.0.0.1:18081/gemini",
-}
-_CELL_GRANT_ENV = "CHUDWARE_PROVIDER_GRANT"
-
-
-def _cell_provider_grant(params: Mapping[str, Any]) -> str:
-    if any(key in params for key in ("api_key", "web_credential", "byok_key")):
-        raise ValueError("credential_isolation_unsupported")
-    grant = params.get("web_provider_grant")
-    if (not isinstance(grant, str) or len(grant) > 4096
-            or re.fullmatch(r"cpg1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", grant) is None):
-        raise ValueError("provider_grant_missing")
-    return grant
-
-def _credential_scope(params: Mapping[str, Any]) -> tuple[str, str, str, str, str] | None:
-    """Return source, tenant, provider, secret, and Chudcode's credential env name."""
-    source = _nonempty_string(params.get("web_key_source"))
+def _credential_scope(params: Mapping[str, Any]) -> tuple[str, str, str, str] | None:
+    """Return the BYOK tenant, provider, key, and Chudcode's credential env name."""
     if tenancy.in_cell():
-        grant = _cell_provider_grant(params)
-        if source != "byok":
-            raise ValueError("credential_isolation_unsupported")
-        tenant = _nonempty_string(params.get("web_tenant"))
-        provider = (_nonempty_string(params.get("web_provider")) or "").lower()
-        if tenant != tenancy.current_context()["actor_key"]:
-            raise ValueError("provider_grant_scope_mismatch")
-        if provider not in _CELL_PROVIDER_BASES:
-            raise ValueError("byok_unsupported_online")
-        return source, tenant, provider, grant, _CELL_GRANT_ENV
-    if source is not None:
-        if source not in {"byok", "subscription", "pool"}:
-            raise ValueError("web_credential_source_invalid")
-        tenant = _nonempty_string(params.get("web_tenant"))
-        provider = _nonempty_string(params.get("web_provider"))
-        secret = _nonempty_string(params.get("web_credential"))
-        if not tenant or not provider or not secret:
-            raise ValueError("web_credential_missing")
-        provider = provider.lower()
-        if source == "subscription":
-            env_name = {"anthropic-sub": "ANTHROPIC_OAUTH_TOKEN"}.get(provider)
-            if env_name is None:
-                raise ValueError("subscription_isolation_unsupported")
-        else:
-            env_name = byok_provider_env(provider)
-            if env_name is None:
-                raise ValueError(f"{source}_unsupported_online")
-        return source, tenant, provider, secret, env_name
-    if params.get("web_actor"):
-        raise ValueError("web_credential_missing" if tenancy.in_cell() else "web_credential_source_invalid")
+        # Provider key bytes never enter a cell, so a cell has no credential route.
+        raise ValueError("credential_isolation_unsupported")
     key = _nonempty_string(params.get("byok_key"))
     if key is None:
-        if tenancy.in_cell():
-            raise ValueError("web_credential_missing")
         if params.get("byok_key") is not None:
             raise ValueError("byok_unsupported_online")
         return None
-    tenant = _nonempty_string(params.get("byok_tenant")) or (
-        tenancy.owner_key()[1] if tenancy.in_cell() else "desktop"
-    )
+    tenant = _nonempty_string(params.get("byok_tenant")) or "desktop"
     provider = (_nonempty_string(params.get("byok_provider")) or "").lower()
     env_name = byok_provider_env(provider)
     if env_name is None:
         raise ValueError("byok_unsupported_online")
-    return "byok", tenant, provider, key, env_name
+    return tenant, provider, key, env_name
 
 
 def _credential_identity(params: Mapping[str, Any]) -> str | None:
     scope = _credential_scope(params)
     if scope is None:
         return None
-    source, tenant, provider, secret, _ = scope
-    identity_scope = ([*tenancy.owner_key(), provider] if tenancy.in_cell()
-                      else [source, tenant, provider, secret])
+    tenant, provider, secret, _ = scope
     return hashlib.sha256(
-        json.dumps(identity_scope, separators=(",", ":")).encode()
+        json.dumps(["byok", tenant, provider, secret], separators=(",", ":")).encode()
     ).hexdigest()
 
 
@@ -244,25 +190,20 @@ def _credential_client_scope(
 
     scope = _credential_scope(params)
     if scope is None:
-        raise ValueError("web_credential_missing")
-    source, _, provider, secret, env_name = scope
+        raise ValueError("byok_unsupported_online")
+    _, _, secret, env_name = scope
     identity = _credential_identity(params)
-    root = tenancy.actor_state_root() / "Sessions" if tenancy.in_cell() else (
-        Path(session_dir) if session_dir else paths.ROOT / "Sessions"
-    )
-    if resume_file and session_dir is None and not tenancy.in_cell():
+    root = Path(session_dir) if session_dir else paths.ROOT / "Sessions"
+    if resume_file and session_dir is None:
         root = Path(resume_file).expanduser().parent.parent
-    scoped = root.expanduser() / f"{source}-{identity}"
+    scoped = root.expanduser() / f"byok-{identity}"
     if scoped.is_symlink():
         raise RuntimeError("credential session directory cannot be a symlink")
     if resume_file and Path(resume_file).expanduser().resolve().parent != scoped.resolve():
         raise RuntimeError("session file belongs to another credential scope")
     scoped.mkdir(mode=0o700, parents=True, exist_ok=True)
     scoped.chmod(0o700)
-    tempdir = tempfile.TemporaryDirectory(
-        prefix=f"chudware-{source}-",
-        dir=tenancy.actor_state_root() if tenancy.in_cell() else None,
-    )
+    tempdir = tempfile.TemporaryDirectory(prefix="chudware-byok-")
     home = Path(tempdir.name)
     agent, xdg = home / "agent", home / "xdg"
     agent.mkdir(mode=0o700)
@@ -281,42 +222,6 @@ def _credential_client_scope(
         "PI_CODING_AGENT_DIR": str(agent),
         env_name: secret,
     })
-    if tenancy.in_cell():
-        ctx = tenancy.current_context()
-        native_provider = "google" if provider == "gemini" else provider
-        override: dict[str, Any] = {
-            "baseUrl": _CELL_PROVIDER_BASES[provider],
-            "apiKey": _CELL_GRANT_ENV,
-        }
-        if provider == "anthropic":
-            override["compat"] = {
-                "supportsEagerToolInputStreaming": True,
-                "replayUnsignedThinking": False,
-            }
-            clean["ANTHROPIC_BASE_URL"] = _CELL_PROVIDER_BASES[provider]
-            clean["ANTHROPIC_SEARCH_BASE_URL"] = _CELL_PROVIDER_BASES[provider]
-        # JSON is YAML: provider overrides retain the pinned runtime's native
-        # catalog, signed-thinking replay and prompt-cache wire implementation.
-        model_config = agent / "models.yml"
-        model_config.write_text(
-            json.dumps({"providers": {native_provider: override}}), encoding="utf-8"
-        )
-        model_config.chmod(0o600)
-        clean["NO_PROXY"] = clean["no_proxy"] = "127.0.0.1,localhost,::1"
-        clean.update({
-            "CHUDWARE_CELL": "1",
-            "CHUDWARE_ACTOR_HEX": tenancy.actor_hex(),
-            "CHUDWARE_ACTOR_STATE": "/actor",
-            "CHUDWARE_ACTOR_KEY": ctx["actor_key"],
-            "CHUDWARE_WORKSPACE_KEY": ctx["workspace_key"],
-            "CHUDWARE_CELL_RIGHT": ctx["right"],
-            "CHUDWARE_CELL_EPOCH": str(ctx["epoch"]),
-        })
-        if os.environ.get("CHUDWARE_ACTOR_SANDBOX") == "1":
-            clean["CHUDWARE_ACTOR_SANDBOX"] = "1"
-        for name in ("CHUDWARE_HOSTD_WORKER_LANE", "CHUDWARE_WRITER_GROUP"):
-            if name in os.environ:
-                clean[name] = os.environ[name]
     return tempdir, str(scoped), clean
 
 
@@ -2160,11 +2065,6 @@ class ChudcodeSessionHost:
             if provider_session_id is not None:
                 kwargs["provider_session_id"] = provider_session_id
             if _credential_scope(scoped_params) is not None:
-                if tenancy.in_cell():
-                    selected = _credential_scope(scoped_params)[2]
-                    expected = "google" if selected == "gemini" else selected
-                    if provider_id != expected or not model_id:
-                        raise HelperCompletionError("provider_grant_scope_mismatch")
                 credential_dir, _, clean_env = _credential_client_scope(
                     scoped_params, workdir.name, None)
                 kwargs["env"] = clean_env
@@ -2559,7 +2459,6 @@ class ChudcodeSessionHost:
         *,
         no_session: bool,
         resume_file: str | None = None,
-        metadata_only: bool = False,
     ) -> Any:
         factory = self._rpc_factory()
 
@@ -2584,20 +2483,13 @@ class ChudcodeSessionHost:
         if no_session:
             from services.agent.config import memory_backend
 
-            memory = "off" if metadata_only else memory_backend()
-            if not metadata_only and binary is not None and not _binary_has_memory_backend(binary, memory):
+            memory = memory_backend()
+            if binary is not None and not _binary_has_memory_backend(binary, memory):
                 memory = "mnemo"
             if binary is not None and _binary_supports_flag(binary, "--config"):
                 overlay = _cad_session_overlay(memory)
                 if overlay is not None:
                     kwargs["extra_args"] = ("--config", overlay)
-        if metadata_only:
-            if tempdir is None or "--config" not in kwargs.get("extra_args", ()):
-                if tempdir is not None:
-                    tempdir.cleanup()
-                raise ValueError("credential_isolation_unsupported")
-            kwargs.update(tools=[], no_skills=True, no_rules=True, cwd=tempdir.name)
-            kwargs["extra_args"] = ("--no-lsp", "--no-mcp", *kwargs["extra_args"])
         if clean_env is not None:
             kwargs["env"] = clean_env
         if binary is not None:
@@ -2704,7 +2596,6 @@ class ChudcodeSessionHost:
         """
         settings = _turn_compaction_settings(params)
         sandbox_class = _sandbox_class(params)
-        # Upstream-key rotation is broker-owned and leaves this client intact.
         if (settings == session.compaction_settings
                 and sandbox_class == session.sandbox_class):
             return
@@ -2772,11 +2663,6 @@ class ChudcodeSessionHost:
             provider, model = model.split("/", 1)
         if provider:
             provider = _CHUDCODE_PROVIDER_ALIASES.get(provider, provider)
-        if tenancy.in_cell():
-            selected = _credential_scope(params)[2]
-            expected = "google" if selected == "gemini" else selected
-            if provider != expected or not model:
-                raise ValueError("provider_grant_scope_mismatch")
         if provider and model:
             try:
                 client.set_model(provider, model)
@@ -2844,30 +2730,6 @@ class ChudcodeSessionHost:
         if callable(registrar):
             registrar(client)
         session.launch_params = _client_launch_params(params)
-
-    def cell_catalog_models(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        """Read the native catalog with one actor/provider broker capability."""
-        if not tenancy.in_cell() or _delegate_refusal() is not None:
-            raise ValueError("cell_refused")
-        client = self._make_client({**params, "mode": "ask"}, no_session=True, metadata_only=True)
-        registered = False
-        try:
-            with self._lock:
-                if self._shutdown:
-                    raise RuntimeError("chudcode session host is shut down")
-                self._helper_clients.add(client)
-                registered = True
-                _start_client(client)
-            result = _json_value(_invoke_canonical(client, "get_available_models", {}))
-            if not isinstance(result, dict) or not isinstance(result.get("models"), list):
-                raise TypeError("native catalog returned an invalid model list")
-            return result
-        finally:
-            with self._lock:
-                owned = client in self._helper_clients
-                self._helper_clients.discard(client)
-                if owned or not registered:
-                    _stop_client(client)
 
     def _service_client_locked(self) -> Any:
         """Return the shared no-session process for the current GUI memory backend.
@@ -3650,8 +3512,6 @@ def _client_launch_params(params: Mapping[str, Any]) -> dict[str, Any]:
     # Retain process identity, not a turn's prompt, callbacks, or CAD tool bindings.
     launch = {key: params[key] for key in (
         "workspace_dir", "chudcode_session_dir", "system_prompt", "memory_backend",
-        "web_actor", "web_key_source", "web_tenant", "web_provider", "web_credential",
-        "web_provider_grant",
         "byok_key", "byok_tenant", "byok_provider",
         "mode", "plan_only", "turn_preferences",
     ) if key in params}
@@ -4196,9 +4056,7 @@ def _control_allowed(record, credential_params=None) -> bool:
                 else record.credential_identity)
     if not tenancy.owns(owner):
         return False
-    if credential_params is not None and any(
-        key in credential_params for key in ("web_key_source", "web_actor", "byok_key")
-    ):
+    if credential_params is not None and "byok_key" in credential_params:
         try:
             return identity == _credential_identity(credential_params)
         except ValueError:

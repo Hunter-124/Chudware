@@ -58,8 +58,8 @@ __all__ = [
 # Registry
 # ---------------------------------------------------------------------------
 
-# Per-model capability fields (T-W31, applying the T-W29 tokenmaxx bench —
-# benchmarks/tokenmaxx/REPORT.md, numbers copied verbatim, never re-derived):
+# Per-model capability fields, from the local-model throughput and grammar
+# benchmark (numbers copied verbatim, never re-derived):
 #
 #   structured_output  "gbnf" | "prompted_json" — how this model must produce
 #                      structured handoffs on the local llama.cpp runtime.
@@ -79,12 +79,12 @@ __all__ = [
 #   parallel_slots     recommended llama-server --parallel for this model on the
 #                      bundled CUDA runtime (12 GB has headroom past N=8).
 #
-# gemma4-e4b is NOT the shipped default for any role_shape (REPORT.md "TL;DR
-# recommendation": slower (115 tok/s) and larger (3464 MB) than gemma3-4b-qat
+# gemma4-e4b is NOT the shipped default for any role_shape (the benchmark measured it
+# slower (115 tok/s) and larger (3464 MB) than gemma3-4b-qat
 # with no measured upside for production role routing) — but it IS registered
 # here (unlike diffusiongemma, which is a hard NO-GO on 12 GB: 26B-A4B MoE,
 # smallest quant 16 GB, draft-CLI only, no server/grammar/parallel slots) so
-# the tokenmaxxing gym tiers (tools/flywheel/bench/gym) can address it as a
+# the benchmark gym tiers (tools/flywheel/bench/gym) can address it as a
 # backup GBNF-worker comparison point. Its role_shape is deliberately left
 # unset (not "gbnf_worker") so model_for_role_shape() never picks it as a
 # shipped default over gemma3-4b-qat.

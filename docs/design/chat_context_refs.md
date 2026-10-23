@@ -1,14 +1,14 @@
 # Chat Context References — copilot "context cube" picker
 
-Status: design + Wave-4 implementation (2026-07-16 session).
+Status: design and implementation record (2026-07-16).
 
 This is the July design/implementation record, not current toolbar layout or visual
 acceptance. Current payload ownership is `host/src/core/context_ref.{h,cpp}` and
 `host/src/ui/copilot/composer.cpp::submitTurn`; online engine-resolved context comes
 from `services/agent/worker_rpc.py::_editor_context_block` / `_picked_context_block`.
 The explicit offline route uses `services/agent/agent_turn.py::apply_context_refs`.
-Do not restore the removed `loop.py` helper from older references. The worker names and
-verification bullets below record the original task split and intended smoke, not a
+Do not restore the removed `loop.py` helper from older references. The component split and
+verification bullets below record the original implementation plan and intended smoke, not a
 claim that today's picker has been visually verified.
 
 Goal: let the user attach live model entities (parts/components, faces, edges, sketches,
@@ -37,10 +37,10 @@ Row order, filling the full width, evenly aligned (uiScale-aware):
 3. Esc, clicking the cube again, or sending the message disarms pick mode.
 4. Each chip: small kind icon + short label + `x` to remove. Chips persist until send.
 5. No-mode alternative: right-click a current selection in viewport/tree -> "Add to AI
-   context" pushes the same ContextRef(s). (Reuses the selection-dependent RMB menus from
-   Wave 1.)
+   context" pushes the same ContextRef(s). (Reuses the existing selection-dependent RMB
+   menus.)
 
-## Data model (added to host/src/core/app_state.h — DONE pre-dispatch)
+## Data model (in host/src/core/app_state.h)
 ```cpp
 struct ContextRef { std::string kind, id, docId, label; };
 std::vector<ContextRef> pendingContextRefs;  // consumed+cleared by submitTurn
@@ -57,15 +57,15 @@ submitTurn serializes pendingContextRefs into the turn RPC payload under `contex
 The agent turn includes a "Context references" block so the model can resolve/measure/target
 them (feed to describe_part/query_geometry/measure_* by id). Chips clear on send.
 
-## Scope split (Wave 4 workers, disjoint write-sets)
-- R_Icons: remade paperclip glyph + new logo-cube icon (black lines, transparent bg). Icon
-  draw files per gui-icons; returns icon id(s) -> integrator appends contracts/icons.md.
-- S_Composer: `host/src/ui/copilot/composer.cpp` — cube button, chips row, arm/disarm, chip x,
-  submit `context_refs`, toolbar fill/align. Consumes R's icon ids + app_state fields.
-- T_PickCapture: host/src/ui/viewport_panel.cpp + host/src/ui/feature_tree.cpp — when
+## Implementation split
+- Icons: remade paperclip glyph + new logo-cube icon (black lines, transparent bg), drawn
+  per the icon conventions and registered in `contracts/icons.md`.
+- Composer: `host/src/ui/copilot/composer.cpp` — cube button, chips row, arm/disarm, chip x,
+  submit `context_refs`, toolbar fill/align. Consumes the icon ids + app_state fields.
+- Pick capture: host/src/ui/viewport_panel.cpp + host/src/ui/feature_tree.cpp — when
   contextPickActive, route viewport picks / tree-row clicks into pendingContextRefs; RMB
-  "Add to AI context". Uses app_state fields (declared already).
-- U_AgentPayload: services/agent/ — accept + surface context_refs in the agent turn.
+  "Add to AI context". Uses the app_state fields.
+- Agent payload: services/agent/ — accept + surface context_refs in the agent turn.
 
 ## Verification
 - Cube button renders (both themes, toolbar + no dead gap); paperclip remade.

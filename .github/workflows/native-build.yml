@@ -1,908 +1,145 @@
-# Release-time per-platform configure + build + ctest. Ordinary master pushes
-# use fast-gate + linux-gate only; Windows and macOS runners are reserved for a
-# `v*` release tag (or an explicit manual dispatch).
+# Per-platform configure, build and ctest through the same CMake presets a
+# developer uses by hand, so a green row means the documented build command
+# works on a clean checkout.
 #
-# Each row configures through the CMake preset that platform actually ships
-# with, builds it, and then runs that tree's ctest. The presets are the same
-# ones a developer uses by hand, so a green release row means the documented
-# build command works on a clean checkout, not that a CI-only incantation does.
+#   Linux x86_64    fedora:44 container (system OCCT 7.9), core + host GUI
+#   Windows x86_64  windows-occt preset (pinned OCCT 7.9.3 SDK), core + host GUI
+#   macOS arm64     macos-arm64 preset (Homebrew OCCT), core only
 #
-# Every row says how its tests ran (matrix.test_mode), and nothing else may be
-# claimed for it:
-#   native        built and tested on the target OS and CPU
-#   qemu          aarch64 Linux cross-built on the x86_64 Linux builder and
-#                 all portable core tests run under qemu-user emulation;
-#                 ARM code paths, not ARM hardware
-#   compile-only  arm64 macOS cross-compiled and linked on the Intel Mac;
-#                 Mach-O architecture checked, nothing executed or tested
-# No row needs Apple-silicon hardware or waits for the offline M2: native
-# arm64 Darwin runtime is not qualified here.
-#
-# The ARM rows are hard-bounded: one job-wide deadline (timeout_minutes less
-# three minutes of cleanup room) caps every SDK, configure, build and test
-# command, each of which also has its own budget, through
-# scripts/run_bounded.py. An overrun stops that command's whole process group
-# (SIGTERM, SIGKILL 15 s later) and fails the step with status 124.
-#
-# Native rows run first. ARM qualification cannot claim the same private
-# runner before native checks finish; no native job depends on ARM.
-#
-# Nothing is uploaded. Build outputs are about 500 MB per platform and Actions
-# artifact storage is metered above the 500 MB shared with Packages, accrued
-# hourly and never refunded. Release artifacts go through release.yml's
-# authenticated handoff; diagnostics stay in the job log and step summary.
+# The host GUI is built with CEF disabled; the CEF backend is compiled by
+# release.yml, which builds against the pinned SDK. Nothing is uploaded.
 name: native-build
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [master]
+    paths:
+      - 'core/**'
+      - 'host/**'
+      - 'cmake/**'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - '.github/workflows/native-build.yml'
+      - '.github/scripts/install-fedora-deps.sh'
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Never cancel. This is a coherent multi-platform build of one commit; a
-# half-cancelled matrix leaves two platforms reporting on different trees, and
-# the whole value of the workflow is that the rows describe one commit.
 concurrency:
-  group: native-build-${{ github.run_id }}
-  cancel-in-progress: false
+  group: native-build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    name: ${{ matrix.label }}
-    # Manual branch builds and executable tests never share signing state.
-    runs-on:
-      group: chudware-untrusted-ephemeral
-      labels: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", "${{ matrix.runner_label }}"]
-    timeout-minutes: ${{ matrix.timeout_minutes }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: Linux x86_64
-            runner_os: Linux
-            runner_arch: X64
-            runner_label: cc-linux-disposable
-            preset: linux-core
-            test_mode: native
-            arm_sdk: ''
-            arm_sdk_seconds: 0
-            arm_build_seconds: 0
-            timeout_minutes: 180
-            build_host: true
-            host_build_dir: host/build-linux
-          - label: Windows x86_64
-            runner_os: Windows
-            runner_arch: X64
-            runner_label: cc-win-disposable
-            # Exercise the shipping geometry paths (doc_view_metrics, sections,
-            # drawing provenance); windows-core disables OCCT and misses them.
-            preset: windows-occt
-            test_mode: native
-            arm_sdk: ''
-            arm_sdk_seconds: 0
-            arm_build_seconds: 0
-            timeout_minutes: 180
-            build_host: true
-            host_build_dir: host/build-windows
-          # The disposable native Mac image retains the private test-account
-          # identity and resource caps asserted below. It has its own OS disk,
-          # home, interpreter and tool cache, not the operator/signing host's.
-          #
-          # Core only. The macOS host GUI is not a phase-1 target: the macOS
-          # presets build with CHUDWARE_ENABLE_CEF=OFF, and CEF's offscreen
-          # render path has no WKWebView equivalent. Bringing up the core
-          # tree is the whole macOS goal for now, so a host row here would be
-          # a known-red leg that trains everyone to ignore this workflow.
-          - label: macOS x86_64
-            runner_os: macOS
-            runner_arch: X64
-            runner_label: cc-mac-disposable-intel
-            ci_user: ccci-chudware
-            preset: macos-x86_64
-            test_mode: native
-            arm_sdk: ''
-            arm_sdk_seconds: 0
-            arm_build_seconds: 0
-            timeout_minutes: 180
-            build_host: false
-            host_build_dir: ''
-    steps: &build_steps
-      # First, so the deadline counts from the job's start. Three minutes short
-      # of timeout-minutes leave room for the 15 s kill grace, the step summary
-      # and post-job cleanup before Actions' own hard stop, which would report
-      # neither a status nor a stopped process group.
-      - name: Start the job-wide deadline (ARM rows)
-        if: matrix.arm_sdk != ''
-        shell: bash
-        run: |
-          set -euo pipefail
-          deadline=$(( $(date +%s) + (${{ matrix.timeout_minutes }} - 3) * 60 ))
-          echo "CHUDWARE_JOB_DEADLINE=${deadline}" >> "$GITHUB_ENV"
-          echo "every bounded command of this row ends within $(( ${{ matrix.timeout_minutes }} - 3 )) minutes (epoch ${deadline})"
-
-      # Before checkout: a missing compiler or an old CMake otherwise surfaces
-      # as a confusing configure error with no runner-state evidence attached.
-      - name: Check runner capabilities (POSIX)
-        if: runner.os != 'Windows'
-        shell: bash
-        env:
-          EXPECT_CI_USER: ${{ matrix.ci_user }}
-          ARM_SDK: ${{ matrix.arm_sdk }}
-        run: |
-          set -euo pipefail
-          echo "runner=${RUNNER_NAME:-unknown} os=$RUNNER_OS arch=$RUNNER_ARCH host=$(hostname -s) user=$(id -un)"
-          uname -a
-
-          # Disposable Mac images retain the private account and native CPU
-          # architecture (no Rosetta), uid/home permissions and compiler caps.
-          # A VM is required isolation, not a reason to bypass these checks.
-          if [ -n "${EXPECT_CI_USER}" ]; then
-            if [ "$(id -un)" != "${EXPECT_CI_USER}" ] || [ "${CC_CI_PRODUCT:-}" != Chudware ] || [ "${CC_CI_LANE:-}" != test ]; then
-              echo "::error::expected the private Chudware test account ${EXPECT_CI_USER} (CC_CI_PRODUCT=Chudware, CC_CI_LANE=test); got user=$(id -un) CC_CI_PRODUCT=${CC_CI_PRODUCT:-unset} CC_CI_LANE=${CC_CI_LANE:-unset}"
-              exit 1
-            fi
-            case "${RUNNER_ARCH}:$(uname -m)" in
-              X64:x86_64 | ARM64:arm64) ;;
-              *) echo "::error::runner arch ${RUNNER_ARCH} does not match the native machine $(uname -m)"; exit 1 ;;
-            esac
-            if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" != 0 ]; then
-              echo "::error::the disposable test image must use the native architecture, never Rosetta translation"
-              exit 1
-            fi
-            ci_uid="$(id -u)"
-            ci_home="/Library/CloudCastleCI/${EXPECT_CI_USER}"
-            home_mode="$(stat -f '%Lp %Su' "${ci_home}" 2>/dev/null || echo missing)"
-            if [ "${ci_uid}" -lt 420 ] || [ "${ci_uid}" -gt 499 ] || [ "${HOME}" != "${ci_home}" ] || [ "${home_mode}" != "700 ${EXPECT_CI_USER}" ]; then
-              echo "::error::expected uid 420-499 and the 0700 home ${ci_home}; got uid=${ci_uid} HOME=${HOME} home-mode=${home_mode}"
-              exit 1
-            fi
-            case "${CMAKE_BUILD_PARALLEL_LEVEL:-}" in
-              '' | *[!0-9]* | 0)
-                echo "::error::the private test account exports no CMAKE_BUILD_PARALLEL_LEVEL cap (${CMAKE_BUILD_PARALLEL_LEVEL:-unset}); re-run provision-macos-test-runner.sh restart"
-                exit 1
-                ;;
-            esac
-            echo "build caps: CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} CTEST_PARALLEL_LEVEL=${CTEST_PARALLEL_LEVEL:-unset}"
-          fi
-
-          missing=()
-          for tool in cmake ninja ctest git python3; do
-            command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
-          done
-          if [ "${#missing[@]}" -ne 0 ]; then
-            echo "::error::runner ${RUNNER_NAME:-unknown} is missing required tools: ${missing[*]}"
-            exit 1
-          fi
-
-          # CMakePresets.json requires 3.24 — core/CMakeLists.txt uses
-          # $<LINK_GROUP:RESCAN,...>, which older CMake silently mis-generates.
-          cmake_version="$(cmake --version | head -n 1 | awk '{print $3}')"
-          echo "cmake=${cmake_version} ninja=$(ninja --version)"
-          if [ "$(printf '%s\n3.24.0\n' "${cmake_version}" | sort -V | head -n 1)" != "3.24.0" ]; then
-            echo "::error::cmake ${cmake_version} is older than the 3.24 the presets require"
-            exit 1
-          fi
-
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            # These hosts carry Command Line Tools only — no full Xcode — so
-            # nothing here may reach for xcodebuild.
-            sw_vers
-            xcode-select -p
-            echo "sdk=$(xcrun --show-sdk-version) clang=$(xcrun --find clang)"
-            clang --version | head -n 1
-          fi
-
-          case "${ARM_SDK}" in
-            '')
-              if [ "$RUNNER_OS" = "macOS" ]; then
-                # On everything except Windows, ProvisionOCCT.cmake does not
-                # download anything — it goes straight to
-                # find_package(OpenCASCADE REQUIRED) against a system install,
-                # and the preset's CMAKE_PREFIX_PATH (/usr/local on Intel) is
-                # what lets it see the keg. Without the formula the configure
-                # dies on "Could not find a package configuration file
-                # provided by OpenCASCADE", which reads like a code defect and
-                # is not one. Named here instead, with the fix.
-                #
-                # Checked, not installed: `brew install opencascade` on a
-                # shared runner is a long, host-mutating operation that two
-                # concurrent jobs would race through brew's lock, and the
-                # private test account cannot write the operator-owned
-                # Homebrew prefix at all. A missing formula is a provisioning
-                # ticket for that Mac's operator lane (runner-provision.yml
-                # with cc-mac-intel), and runner-smoke reports it daily.
-                if ! brew list --versions opencascade >/dev/null 2>&1; then
-                  echo "::error::${RUNNER_NAME:-unknown} has no Homebrew opencascade; the ${{ matrix.preset }} preset configures with CHUDWARE_WITH_OCCT=ON and will fail at find_package. Fix from the Homebrew owner: dispatch runner-provision.yml with this Mac's operator label (cc-mac-intel), which runs brew install opencascade"
-                  exit 1
-                fi
-                echo "opencascade=$(brew list --versions opencascade)"
-                echo "brew-prefix=$(brew --prefix)"
-              fi
-              ;;
-            linux-aarch64)
-              # The GNU cross compiler, qemu-user and the guest kernel's
-              # binfmt_misc entry are root-owned prerequisites of the private
-              # Chudware guest (CloudCastle provision-nvme-linux-ci.sh); this
-              # account can neither install nor register them. binfmt is what
-              # lets the x86_64 /bin/sh start an aarch64 test child, as the
-              # AICM cross-process handoff test does.
-              missing=()
-              for tool in aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ qemu-aarch64-static perl make curl pkg-config gperf readelf; do
-                command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
-              done
-              [ -e /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1 ] || missing+=("/usr/aarch64-linux-gnu (libc6-arm64-cross)")
-              if [ "${#missing[@]}" -ne 0 ]; then
-                echo "::error::the aarch64 cross toolchain is incomplete on ${RUNNER_NAME:-unknown}: ${missing[*]}; install g++-aarch64-linux-gnu, qemu-user-static, perl, make, curl, pkg-config and gperf in the guest"
-                exit 1
-              fi
-              binfmt=/proc/sys/fs/binfmt_misc/qemu-aarch64
-              if [ "$(head -n 1 "${binfmt}" 2>/dev/null)" != enabled ]; then
-                echo "::error::no enabled qemu-aarch64 binfmt_misc entry in this guest's kernel (${binfmt}); aarch64 test children cannot start"
-                exit 1
-              fi
-              aarch64-linux-gnu-g++ --version | head -n 1
-              qemu-aarch64-static --version | head -n 1
-              cat "${binfmt}"
-              ;;
-            darwin-arm64)
-              # The CLT SDK provides arm64 slices of the system libraries the
-              # core links (libcurl among them); build_arm_sdk.sh provides the
-              # rest. Homebrew's x86_64-only prefix is never used.
-              sdk="$(xcrun --sdk macosx --show-sdk-path)"
-              if ! grep -q arm64 "${sdk}/usr/lib/libcurl.tbd"; then
-                echo "::error::${sdk} has no arm64 libcurl stub; this SDK cannot link arm64 macOS"
-                exit 1
-              fi
-              echo "arm64 sdk=${sdk}"
-              ;;
-          esac
-          df -h "${RUNNER_TEMP:-/tmp}" "$HOME"
-
-      - name: Check runner capabilities and enter the MSVC environment (Windows)
-        if: runner.os == 'Windows'
-        # Windows PowerShell 5.1 — these hosts have no pwsh.
-        shell: powershell
-        env:
-          # Per-process peaks for the windows-occt tree (cl on OCCT-heavy
-          # translation units, link with /DEBUG) and the memory left untouched
-          # for everything else on the box. See the budget block below.
-          CHUDWARE_BUILD_GB_PER_JOB: '2'
-          CHUDWARE_BUILD_RESERVE_GB: '8'
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Write-Host "runner=$env:RUNNER_NAME os=$env:RUNNER_OS arch=$env:RUNNER_ARCH host=$env:COMPUTERNAME"
-          Write-Host "powershell=$($PSVersionTable.PSVersion)"
-
-          # Image-owned tools in this disposable VM's non-admin profile, never
-          # mounted from the persistent packaging runner. Populate the qualified
-          # image offline; the runtime job only adds these paths to its own PATH.
-          $tools = Join-Path $env:USERPROFILE 'chudware-ci-tools'
-          foreach ($dir in @((Join-Path $tools 'bin'), (Join-Path $tools 'python'), (Join-Path $tools 'python\Scripts'))) {
-            if (Test-Path $dir) {
-              $env:PATH = "$dir;$env:PATH"
-              $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-              Write-Host "  path+ $dir"
-            }
-          }
-
-          foreach ($tool in @('cmake', 'ninja', 'ctest', 'git')) {
-            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-              Write-Host "::error::runner $env:RUNNER_NAME is missing required tool: $tool"
-              exit 1
-            }
-          }
-          $cmakeVersion = [version](((cmake --version) -split "`n")[0] -split ' ')[2]
-          Write-Host "cmake=$cmakeVersion"
-          if ($cmakeVersion -lt [version]'3.24.0') {
-            Write-Host "::error::cmake $cmakeVersion is older than the 3.24 the presets require"
-            exit 1
-          }
-
-          # The windows-core preset builds with MSVC + Ninja, which needs cl and
-          # link on PATH. Prefer vswhere when the Visual Studio Installer payload
-          # is present. Some Build Tools-only hosts retain a complete VC tree
-          # after the Installer directory is removed, so fall back to the
-          # authoritative vcvars64.bat location under the VS root.
-          $vsPath = $null
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          if (Test-Path $vswhere) {
-            $vsPath = & $vswhere -latest -products * `
-              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-              -property installationPath
-          }
-          if (-not $vsPath) {
-            $searchRoots = @(
-              (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio'),
-              (Join-Path $env:ProgramFiles 'Microsoft Visual Studio')
-            ) | Where-Object { Test-Path $_ }
-            $vcvars = $searchRoots |
-              ForEach-Object {
-                Get-ChildItem -Path $_ -Filter vcvars64.bat -File -Recurse `
-                  -ErrorAction SilentlyContinue
-              } |
-              Select-Object -First 1
-            if ($vcvars) {
-              $vsPath = $vcvars.Directory.Parent.Parent.Parent.FullName
-              Write-Host "::notice::vswhere unavailable or returned no x64 toolset; found vcvars64.bat at $($vcvars.FullName)"
-            }
-          }
-          if (-not $vsPath) {
-            Write-Host "::error::no Visual Studio installation with vcvars64.bat and the x64 C++ toolset on $env:RUNNER_NAME"
-            exit 1
-          }
-          Write-Host "visual-studio=$vsPath"
-
-          $before = @{}
-          Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
-          $devShellModule = Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
-          if (Test-Path $devShellModule) {
-            Import-Module $devShellModule
-            Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation `
-              -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
-          } else {
-            $vcvarsPath = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
-            if (-not (Test-Path $vcvarsPath)) {
-              Write-Host "::error::Visual Studio root $vsPath has neither DevShell nor vcvars64.bat"
-              exit 1
-            }
-            & cmd.exe /d /s /c "`"$vcvarsPath`" >nul && set" |
-              ForEach-Object {
-                if ($_ -match '^([^=]+)=(.*)$') {
-                  [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
-                }
-              }
-          }
-
-          # Persist only what the dev shell actually changed, so later steps in
-          # this job compile with the same toolchain without re-entering it.
-          Get-ChildItem env: | ForEach-Object {
-            if ($before[$_.Name] -ne $_.Value) {
-              "$($_.Name)=$($_.Value)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            }
-          }
-          # PowerShell 5.1 promotes native stderr merged into its pipeline to a
-          # NativeCommandError under Stop. cl writes its healthy banner to
-          # stderr, so let cmd merge it before PowerShell sees it, then judge
-          # the probe by cl's exit status rather than by which stream it used.
-          $compilerOutput = & cmd.exe /d /c 'cl.exe 2>&1'
-          $compilerStatus = $LASTEXITCODE
-          $compilerOutput | Select-Object -First 1
-          if ($compilerStatus -ne 0) { exit $compilerStatus }
-
-          # The Windows builder shares its machine with the CloudCastle and
-          # Chudcode runners and with customer inference. Ninja's default width
-          # (logical CPUs + 2) on that box starves all of them, so the build is
-          # held to half the logical processors and to the physical memory that
-          # is free right now, less a reserve, at one budgeted peak per job.
-          # cmake --build reads CMAKE_BUILD_PARALLEL_LEVEL; ctest stays serial.
-          $logical = [Environment]::ProcessorCount
-          $freeGiB = [math]::Floor((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB)
-          $byMemory = [math]::Floor(($freeGiB - [int]$env:CHUDWARE_BUILD_RESERVE_GB) / [int]$env:CHUDWARE_BUILD_GB_PER_JOB)
-          $jobs = [math]::Max(1, [math]::Min([math]::Floor($logical / 2), $byMemory))
-          Write-Host "build budget: $logical logical CPUs, $freeGiB GiB free -> $jobs parallel jobs"
-          "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          # /Zi targets write their PDBs through mspdbsrv. A run-unique
-          # endpoint gives this run its own server instead of attaching to (or
-          # leaving behind) an account-wide one shared with any other build.
-          "_MSPDBSRV_ENDPOINT_=chudware-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:GITHUB_JOB" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-24.04
+    container: fedora:44
+    timeout-minutes: 240
+    steps:
+      - name: Install git
+        run: dnf -y install git
 
       - name: Check out repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # chudware_version.h is generated at configure time from
-          # `git describe --tags`; a shallow clone without tags yields 0.0.0.
+          # chudware_version.h is generated from `git describe --tags`.
           fetch-depth: 0
 
-      # Cross-row SDKs live in this VM's private RUNNER_TOOL_CACHE. A reviewed
-      # immutable image may seed the pinned SDK; writable caches never cross
-      # jobs or the signing boundary. Cold builds retain their bounded budget.
-      - name: Build or reuse the ${{ matrix.arm_sdk }} SDK (POSIX, bounded)
-        if: matrix.arm_sdk != '' && runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          sdk="$(python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" ${{ matrix.arm_sdk_seconds }} \
-            scripts/build_arm_sdk.sh ${{ matrix.arm_sdk }})"
-          echo "CHUDWARE_ARM_SDK=${sdk}" >> "$GITHUB_ENV"
-          {
-            echo '## ${{ matrix.arm_sdk }} SDK'
-            echo '```text'
-            echo "${sdk}"
-            cat "${sdk}/.complete"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Install build dependencies
+        run: bash .github/scripts/install-fedora-deps.sh
 
-      # `shell:` must name a literal interpreter — actionlint rejects an
-      # expression there, and on these Windows hosts `bash` resolves to an
-      # empty WSL shim that exits 0 without running anything. CloudCastle
-      # learned that the expensive way (rmm-agent-packages.yml: "every push
-      # built a release that reached no endpoint"). So every step that runs on
-      # more than one OS is split in two, guarded by `if:`.
-      - name: Configure and build core (${{ matrix.preset }}) (POSIX)
-        if: runner.os != 'Windows' && matrix.arm_sdk == ''
-        shell: bash
+      - name: Configure and build core (linux-core)
         run: |
-          set -euo pipefail
-          cmake --preset ${{ matrix.preset }}
-          cmake --build --preset ${{ matrix.preset }}
+          cmake --preset linux-core
+          cmake --build --preset linux-core
 
-      # The configure fetches the pinned Polyhedral-FEA source; the build
-      # compiles and links every engine binary for the target. Neither runs
-      # anything it built.
-      - name: Cross-configure and build core (${{ matrix.preset }}) (ARM, bounded)
-        if: matrix.arm_sdk != '' && runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" 900 \
-            cmake --preset ${{ matrix.preset }}
-          python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" ${{ matrix.arm_build_seconds }} \
-            cmake --build --preset ${{ matrix.preset }}
+      - name: ctest core
+        run: ctest --test-dir build/linux-core/core --output-on-failure --no-tests=error
 
-      # A cross build that silently produced host binaries would make the
-      # emulated tests meaningless and the compile-only row a lie, so every
-      # engine binary must be the target architecture.
-      - name: Check target architecture (${{ matrix.preset }})
-        if: matrix.arm_sdk != '' && runner.os != 'Windows'
-        timeout-minutes: 5
-        shell: bash
+      - name: Configure and build host GUI
         run: |
-          set -euo pipefail
-          bin="build/${{ matrix.preset }}/bin"
-          bad=()
-          count=0
-          case "${{ matrix.arm_sdk }}" in
-            linux-aarch64)
-              want=AArch64
-              for f in "${bin}"/* "${CHUDWARE_ARM_SDK}/lib/libTKernel.so" "${CHUDWARE_ARM_SDK}/lib/libcurl.so"; do
-                [ -f "${f}" ] && [ "$(head -c 4 "${f}" | od -An -tx1 | tr -d ' ')" = 7f454c46 ] || continue
-                count=$((count + 1))
-                machine="$(readelf -h "${f}" | awk -F: '/Machine:/ {gsub(/^ +/, "", $2); print $2}')"
-                [ "${machine}" = "${want}" ] || bad+=("${f}: ${machine}")
-              done
-              evidence="$(readelf -h "${bin}/libchudware.so" | grep -E 'Class:|Type:|Machine:')"
-              ;;
-            darwin-arm64)
-              want=arm64
-              for f in "${bin}"/* "${CHUDWARE_ARM_SDK}/lib/libTKernel.dylib"; do
-                if [ ! -f "${f}" ] || ! lipo -archs "${f}" >/dev/null 2>&1; then
-                  continue
-                fi
-                count=$((count + 1))
-                archs="$(lipo -archs "${f}")"
-                [ "${archs}" = "${want}" ] || bad+=("${f}: ${archs}")
-              done
-              evidence="$(file -L "${bin}/libchudware.dylib")"
-              ;;
-          esac
-          echo "${evidence}"
-          if [ "${count}" -lt 3 ]; then
-            echo "::error::found only ${count} target binaries under ${bin}; the build did not produce the engine"
-            exit 1
-          fi
-          if [ "${#bad[@]}" -ne 0 ]; then
-            for b in "${bad[@]}"; do echo "::error::not ${want}: ${b}"; done
-            exit 1
-          fi
-          case "${{ matrix.test_mode }}" in
-            qemu) mode='Tests run next under qemu-user emulation on the x86_64 builder, not on ARM hardware.' ;;
-            compile-only) mode='Compile-only: nothing built here was executed or tested.' ;;
-          esac
-          {
-            echo '## Target architecture — ${{ matrix.label }}'
-            echo ''
-            echo "${count} binaries are ${want}. ${mode}"
-            echo '```text'
-            echo "${evidence}"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          cmake -S host -B host/build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_ENABLE_CEF=OFF
+          cmake --build host/build-linux
 
-      - name: Refresh Windows source junctions for OCCT
-        if: runner.os == 'Windows' && matrix.preset == 'windows-occt'
-        shell: powershell
+      - name: ctest host GUI
+        run: ctest --test-dir host/build-linux --output-on-failure --no-tests=error
+
+  windows:
+    name: Windows x86_64
+    runs-on: windows-2025
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Enter the MSVC x64 developer environment
         run: |
-          & powershell -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File scripts\setup_windows_links.ps1
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw 'No Visual Studio installation with the x64 C++ toolset' }
+          $before = @{}
+          Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          Import-Module (Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
+          # Persist only what the developer shell changed so later steps use the same toolchain.
+          Get-ChildItem env: | Where-Object { $before[$_.Name] -ne $_.Value } |
+            ForEach-Object { "$($_.Name)=$($_.Value)" } | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Refresh Windows source junctions
+        run: |
+          powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts\setup_windows_links.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Configure and build core (${{ matrix.preset }}) (Windows)
-        if: runner.os == 'Windows'
-        # Windows PowerShell 5.1 — these hosts have no pwsh.
-        shell: powershell
+      - name: Configure and build core (windows-occt)
         run: |
-          $ErrorActionPreference = 'Stop'
-          # Below-normal priority is inherited by cmake, ninja, cl and link, so
-          # a release build yields to customer workloads on the shared host.
-          (Get-Process -Id $PID).PriorityClass = 'BelowNormal'
-
-          # $ErrorActionPreference does not apply to native exit codes, so each
-          # cmake invocation is checked; otherwise a failed configure would run
-          # the build and report the build's status.
-          cmake --preset ${{ matrix.preset }}
+          cmake --preset windows-occt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build --preset ${{ matrix.preset }}
+          cmake --build --preset windows-occt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # Native rows only; the emulated row has its own bounded step below, and
-      # compile-only rows never run anything they built.
-      - name: ctest core (${{ matrix.preset }}) (POSIX)
-        if: runner.os != 'Windows' && matrix.test_mode == 'native'
-        shell: bash
+      - name: ctest core
+        run: ctest --test-dir build/windows-occt/core --output-on-failure --no-tests=error
+
+      - name: Configure and build host GUI
         run: |
-          set -euo pipefail
-
-          # The root dispatcher adds core/ as a subdirectory. enable_testing()
-          # lives there, so its CTestTestfile.cmake and registered suite are in
-          # build/<preset>/core rather than the dispatcher build directory.
-          tree="build/${{ matrix.preset }}/core"
-          log="${RUNNER_TEMP}/ctest-core.log"
-          status=0
-          ctest --test-dir "${tree}" --output-on-failure 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
-
-          # A configure that registered no tests would otherwise pass silently.
-          if grep -qE 'No tests were found' "${log}"; then
-            echo "::error::ctest found no tests in ${tree}; the configure did not register the suite"
-            exit 1
-          fi
-
-          {
-            echo '## ctest — ${{ matrix.label }} (${{ matrix.preset }})'
-            echo '```text'
-            tail -n 40 "${log}"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          exit "${status}"
-
-      # The emulated row: aarch64 test binaries under qemu-user on the x86_64
-      # builder. All portable core tests execute; this is not ARM hardware proof.
-      - name: ctest core under qemu-user (${{ matrix.preset }}, bounded)
-        if: matrix.test_mode == 'qemu'
-        shell: bash
-        run: |
-          set -euo pipefail
-          tree="build/${{ matrix.preset }}/core"
-          log="${RUNNER_TEMP}/ctest-core.log"
-
-          # ctest starts each test through the toolchain's
-          # CMAKE_CROSSCOMPILING_EMULATOR (cmake/toolchains/
-          # qemu-aarch64-run.sh: QEMU_LD_PREFIX plus a private TMPDIR per
-          # test); children a test spawns through /bin/sh reach qemu via
-          # binfmt_misc. The suite fills the guest's CPUs instead of running
-          # serially; the per-test TMPDIR is what makes that safe.
-          if ! grep -q 'qemu-aarch64-run.sh' "${tree}/CTestTestfile.cmake"; then
-            echo "::error::${tree}/CTestTestfile.cmake does not launch tests through qemu-aarch64-run.sh; the toolchain's CMAKE_CROSSCOMPILING_EMULATOR did not apply"
-            exit 1
-          fi
-
-          # Measured on 1a14f8311 (cached SDK, tests from minute 8 of the
-          # job): the parallel phase took 752 s, then the RUN_SERIAL chain
-          # firmware/mesh/mesher_advanced/tet10_thin_wall/mesh_mechanism ran
-          # 3+3203+5667+444+545 s, so mesh_mechanism ended at 10745 s. Left:
-          # mesh_sector (25.7 s native, about 850 s at the ~33x emulation the
-          # serial mesh tests showed), import_roundtrip and platform_parity
-          # (a few seconds native each), about 11950 s in all. 210 minutes
-          # (12600 s) covers that; minute 8 + 210 stays inside the 237-minute
-          # job deadline, which still clips a slower (cold SDK) start. Every
-          # test still runs, RUN_SERIAL stays, two hours per test.
-          #
-          # mesher_advanced's mesh+solve wall ceilings (90 s, 270 s for the
-          # bore) measured 92-1636 s here with identical element counts and
-          # physics; scale them eightfold for this emulated step only.
-          export CHUDWARE_TEST_WALL_SCALE=8
-          registered="$(ctest --test-dir "${tree}" -N | awk '/^Total Tests:/ {print $3}')"
-
-          # A directory a timed-out (SIGKILLed) wrapper could not remove stays
-          # in the job's own temp, which the runner wipes.
-          export TMPDIR="${RUNNER_TEMP}"
-          status=0
-          python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" 12600 \
-            ctest --test-dir "${tree}" --output-on-failure --parallel "$(nproc)" \
-            --timeout 7200 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
-
-          if grep -qE 'No tests were found' "${log}"; then
-            echo "::error::ctest found no tests in ${tree}; the configure did not register the suite"
-            exit 1
-          fi
-          ran="$(awk '/tests failed out of/ {print $NF}' "${log}")"
-
-          {
-            echo '## ctest — ${{ matrix.label }} (${{ matrix.preset }}, qemu-user)'
-            echo ''
-            if [ "${status}" -eq 124 ]; then
-              echo "**Incomplete: the run hit its 210-minute bound (or the job deadline) and was stopped.**"
-            fi
-            echo "Ran ${ran:-an incomplete set} of ${registered} registered core tests as aarch64 under qemu-user on the x86_64 builder; emulation, not ARM hardware. No portable core test is excluded."
-            echo '```text'
-            tail -n 40 "${log}"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          exit "${status}"
-
-      - name: ctest core (${{ matrix.preset }}) (Windows)
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Continue'
-
-          # The root dispatcher adds core/ as a subdirectory; its registered
-          # CTest suite is therefore rooted at build/<preset>/core.
-          $tree = 'build/${{ matrix.preset }}/core'
-          $log = Join-Path $env:RUNNER_TEMP 'ctest-core.log'
-          ctest --test-dir $tree --output-on-failure 2>&1 | Tee-Object -FilePath $log
-          $status = $LASTEXITCODE
-
-          if (Select-String -Path $log -Pattern 'No tests were found' -Quiet) {
-            Write-Host "::error::ctest found no tests in $tree; the configure did not register the suite"
-            exit 1
-          }
-
-          $tail = (Get-Content $log -Tail 40) -join "`n"
-          @(
-            '## ctest -- ${{ matrix.label }} (${{ matrix.preset }})'
-            '```text'
-            $tail
-            '```'
-          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-
-          exit $status
-
-      # This compile-and-test gate deliberately disables the 1.5 GB gitignored
-      # CEF SDK on every host configure; makeWebView then uses NullWebView.
-      # Consequence: native-build does not compile the CEF backend, so a
-      # CEF-only break surfaces at release time. release.yml intentionally
-      # remains CEF-enabled and must build against a provisioned SDK.
-      - name: Configure and build host GUI (POSIX)
-        if: matrix.build_host && runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cmake -S host -B ${{ matrix.host_build_dir }} -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_ENABLE_CEF=OFF
-          cmake --build ${{ matrix.host_build_dir }}
-
-      - name: Configure and build host GUI (Windows)
-        if: matrix.build_host && runner.os == 'Windows'
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          (Get-Process -Id $PID).PriorityClass = 'BelowNormal'
-          cmake -S host -B ${{ matrix.host_build_dir }} -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_ENABLE_CEF=OFF
+          cmake -S host -B host/build-windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_ENABLE_CEF=OFF
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build ${{ matrix.host_build_dir }}
+          cmake --build host/build-windows
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: ctest host GUI (POSIX)
-        if: matrix.build_host && runner.os != 'Windows'
-        shell: bash
+      - name: ctest host GUI
+        run: ctest --test-dir host/build-windows --output-on-failure --no-tests=error
+
+  macos:
+    name: macOS arm64
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: brew install ninja opencascade
+
+      - name: Configure and build core (macos-arm64)
         run: |
-          set -euo pipefail
+          cmake --preset macos-arm64
+          cmake --build --preset macos-arm64
 
-          tree="${{ matrix.host_build_dir }}"
-          if [ ! -f "${tree}/CTestTestfile.cmake" ]; then
-            echo "::error::${tree} has no CTest configuration; the host configure did not complete"
-            exit 1
-          fi
-
-          log="${RUNNER_TEMP}/ctest-host.log"
-          status=0
-          ctest --test-dir "${tree}" --output-on-failure 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
-
-          {
-            echo '## ctest — host GUI (${{ matrix.label }})'
-            echo '```text'
-            tail -n 40 "${log}"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          exit "${status}"
-
-      - name: clang-tidy first-party Linux sources
-        if: matrix.preset == 'linux-core'
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -euo pipefail
-          for tool in clang-tidy run-clang-tidy; do
-            command -v "${tool}" >/dev/null || {
-              echo "::error::${tool} is missing from the Linux build runner"
-              exit 1
-            }
-          done
-          clang-tidy --version | head -n 1
-          run-clang-tidy -p build/linux-core -j 0 -quiet \
-            '.*[/\\]core[/\\]'
-          run-clang-tidy -p ${{ matrix.host_build_dir }} -j 0 -quiet \
-            '.*[/\\](host|core|platform)[/\\]'
-
-      - name: ctest host GUI (Windows)
-        if: matrix.build_host && runner.os == 'Windows'
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Continue'
-
-          $tree = '${{ matrix.host_build_dir }}'
-          if (-not (Test-Path (Join-Path $tree 'CTestTestfile.cmake'))) {
-            Write-Host "::error::$tree has no CTest configuration; the host configure did not complete"
-            exit 1
-          }
-
-          $log = Join-Path $env:RUNNER_TEMP 'ctest-host.log'
-          ctest --test-dir $tree --output-on-failure 2>&1 | Tee-Object -FilePath $log
-          $status = $LASTEXITCODE
-
-          $tail = (Get-Content $log -Tail 40) -join "`n"
-          @(
-            '## ctest -- host GUI (${{ matrix.label }})'
-            '```text'
-            $tail
-            '```'
-          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-
-          exit $status
-
-      - name: Headless host GUI smoke (Windows)
-        if: matrix.build_host && runner.os == 'Windows'
-        timeout-minutes: 10
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Continue'
-
-          # The managed worker is forced unavailable and the engine daemon off,
-          # so the only engine a capture can reach is the in-process C++ core:
-          # this row's own DLL, never a runtime left behind on the persistent
-          # runner. Shot mode creates its window unmapped: nothing reaches any
-          # desktop.
-          $env:CHUDWARE_WORKER_BIN = Join-Path $env:RUNNER_TEMP 'missing-chudware-worker.exe'
-          $env:CHUDWARE_ENGINE_DAEMON = '0'
-          $env:CHUDWARE_HIDDEN = '1'
-
-          $hostBin = (Resolve-Path '.\${{ matrix.host_build_dir }}\bin').Path
-          $builtCore = (Resolve-Path 'build\${{ matrix.preset }}\bin\libchudware.dll').Path
-
-          function Invoke-Capture([string]$exe, [string]$scenario, [string]$shot) {
-            $env:CHUDWARE_SHOT = $scenario
-            Remove-Item -Force -ErrorAction SilentlyContinue $shot
-            & $exe --ui-screenshot $shot 2>&1 | Out-Host
-            return $LASTEXITCODE
-          }
-          function Test-Png([string]$path) {
-            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
-            $bytes = [IO.File]::ReadAllBytes($path)
-            $signature = @(137, 80, 78, 71, 13, 10, 26, 10)
-            if ($bytes.Length -lt $signature.Count) { return $false }
-            for ($i = 0; $i -lt $signature.Count; $i++) {
-              if ($bytes[$i] -ne $signature[$i]) { return $false }
-            }
-            return $true
-          }
-
-          # 1. The engine-dependent M1 scenario (new part, box, fillet, shell,
-          #    edit, save and reopen) against the DLL this row just built.
-          $m1Dir = Join-Path $env:RUNNER_TEMP 'chudware-m1'
-          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $m1Dir
-          New-Item -ItemType Directory -Path $m1Dir | Out-Null
-          $env:CHUDWARE_LIBCHUDWARE = $builtCore
-          $m1Shot = Join-Path $env:RUNNER_TEMP 'chudware-m1.png'
-          Push-Location $m1Dir
-          $status = Invoke-Capture (Join-Path $hostBin 'chudware.exe') 'm1' $m1Shot
-          Pop-Location
-          if ($status -ne 0) {
-            Write-Host "::error::M1 capture with $builtCore exited with status $status"
-            exit 1
-          }
-          if (-not (Test-Png $m1Shot)) {
-            Write-Host "::error::M1 capture with $builtCore wrote no PNG"
-            exit 1
-          }
-          $saved = Join-Path $m1Dir 'scratch\m1_shots\part.step+'
-          if (-not (Test-Path -LiteralPath $saved -PathType Leaf) -or
-              (Get-Item -LiteralPath $saved).Length -eq 0) {
-            Write-Host "::error::M1 capture with $builtCore did not save its part to $saved"
-            exit 1
-          }
-
-          # 2. The same GUI with no engine anywhere: a copy of the host bin
-          #    directory outside the checkout, so neither the adjacent nor the
-          #    build-tree libchudware candidates exist.
-          $noEngine = Join-Path $env:RUNNER_TEMP 'chudware-no-engine'
-          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $noEngine
-          New-Item -ItemType Directory -Path $noEngine | Out-Null
-          Copy-Item -Recurse -Path $hostBin -Destination (Join-Path $noEngine 'bin')
-          Get-ChildItem -Path $noEngine -Recurse -Filter 'libchudware*' | Remove-Item -Force
-          $env:CHUDWARE_LIBCHUDWARE = Join-Path $noEngine 'missing-libchudware.dll'
-          $noEngineExe = Join-Path $noEngine 'bin\chudware.exe'
-
-          $noEngineShot = Join-Path $env:RUNNER_TEMP 'chudware-m1-no-engine.png'
-          Push-Location $noEngine
-          $status = Invoke-Capture $noEngineExe 'm1' $noEngineShot
-          Pop-Location
-          if ($status -ne 1) {
-            Write-Host "::error::M1 capture without an engine exited with status $status, expected 1"
-            exit 1
-          }
-          if (Test-Path -LiteralPath $noEngineShot) {
-            Write-Host "::error::M1 capture without an engine wrote $noEngineShot"
-            exit 1
-          }
-
-          # 3. Static UI needs no engine: the chat capture still succeeds.
-          $chatShot = Join-Path $env:RUNNER_TEMP 'chudware-chat-no-engine.png'
-          Push-Location $noEngine
-          $status = Invoke-Capture $noEngineExe 'chat' $chatShot
-          Pop-Location
-          if ($status -ne 0) {
-            Write-Host "::error::chat capture without an engine exited with status $status"
-            exit 1
-          }
-          if (-not (Test-Png $chatShot)) {
-            Write-Host "::error::chat capture without an engine wrote no PNG"
-            exit 1
-          }
-
-          @(
-            '## Headless GUI smoke -- Windows x86_64'
-            ''
-            "M1 with ${builtCore}: exit 0, $((Get-Item -LiteralPath $m1Shot).Length)-byte PNG, part saved"
-            'M1 without an engine: exit 1, no capture'
-            "Chat without an engine: exit 0, $((Get-Item -LiteralPath $chatShot).Length)-byte PNG"
-          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-
-  arm:
-    name: ${{ matrix.label }}
-    needs: [build]
-    runs-on:
-      group: chudware-untrusted-ephemeral
-      labels: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", "${{ matrix.runner_label }}"]
-    timeout-minutes: ${{ matrix.timeout_minutes }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Cross-builds start on a fresh disposable VM after native baselines.
-          # An immutable image SDK may seed this job's private tool cache.
-          # A row's cold SDK, core build and (Linux) core suite share one hard
-          # deadline, timeout_minutes less three: 237 minutes on Linux, 327 on
-          # the Mac. Insufficient budget fails 124 instead of skipping tests.
-          - label: Linux aarch64 (QEMU-emulated tests)
-            runner_os: Linux
-            runner_arch: X64
-            runner_label: cc-linux-disposable
-            preset: linux-aarch64-qemu
-            test_mode: qemu
-            arm_sdk: linux-aarch64
-            arm_sdk_seconds: 3600
-            arm_build_seconds: 1800
-            timeout_minutes: 240
-            build_host: false
-            host_build_dir: ''
-          # arm64 macOS from the same Intel test account: AppleClang and the
-          # Command Line Tools SDK cross-compile and link the core against an
-          # arm64 SDK (pinned OCCT 7.9.3, FreeType, RapidJSON) that
-          # scripts/build_arm_sdk.sh builds into the account's own
-          # RUNNER_TOOL_CACHE. The Intel Mac has no Rosetta and could not run
-          # arm64 code anyway: the row checks the Mach-O architecture and
-          # executes nothing. It builds with the account's one compiler
-          # process. Cold OCCT measured about 1.45 s per Ninja action (1241 of
-          # 5476 in 30 minutes, about 133 minutes in all) and the cold native
-          # macos-x86_64 core build took 69 minutes, so the SDK gets 230
-          # minutes, the core build 120 and the row 330: a cold SDK plus the
-          # core is about 215 minutes; a cached SDK leaves only the core build.
-          - label: macOS arm64 (cross-compiled, compile-only)
-            runner_os: macOS
-            runner_arch: X64
-            runner_label: cc-mac-disposable-intel
-            ci_user: ccci-chudware
-            preset: macos-arm64-cross
-            test_mode: compile-only
-            arm_sdk: darwin-arm64
-            arm_sdk_seconds: 13800
-            arm_build_seconds: 7200
-            timeout_minutes: 330
-            build_host: false
-            host_build_dir: ''
-    steps: *build_steps
+      - name: ctest core
+        run: ctest --test-dir build/macos-arm64/core --output-on-failure --no-tests=error

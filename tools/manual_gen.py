@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tools/manual_gen.py — T-Q4 user-manual auto-generation.
+"""tools/manual_gen.py — user-manual auto-generation.
 
 Composes ``docs/manual/*.md`` (and, on request, a rendered ``user_manual`` PDF/DOCX via
 ``deliverables.make_report``) from three truth sources already in the repo — never invented

@@ -1,13 +1,15 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
 import '../styles/company.css';
+
+const REPO = 'https://github.com/Hunter-124/Chudware';
 ---
-<BaseLayout title="Contact" description="Contact Chudware for account support, subscriptions, organization deployment, security disclosure, privacy, and legal questions.">
+<BaseLayout title="Contact" description="Contact the Chudware project: general questions, bug reports and feature requests on GitHub, contributions, and private security disclosure.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Contact</p>
-      <h1>Send it to the right address.</h1>
-      <p class="lede">Use the address that matches the request. Do not include passwords, payment-card numbers, provider credentials, or confidential project files unless support has arranged a secure transfer.</p>
+      <h1>Send it to the right place.</h1>
+      <p class="lede">Bugs and feature requests belong in the public issue tracker, where others can find them. Do not include passwords, provider credentials, or confidential project files in an issue or an email.</p>
     </div>
   </header>
 
@@ -15,44 +17,32 @@ import '../styles/company.css';
     <div class="wrap">
       <header class="section-heading">
         <p class="eyebrow">Direct routes</p>
-        <h2 id="co-routes" class="co-anchor">Contact addresses.</h2>
+        <h2 id="co-routes" class="co-anchor">Where to reach the project.</h2>
       </header>
       <div class="co-routes">
         <article class="co-route">
-          <p class="eyebrow">Sales</p>
-          <h3>Plans and organization deployment</h3>
-          <p>Enterprise accounts, multi-user deployment, procurement, and any commercial question the pricing page doesn't answer.</p>
-          <a class="co-route-address" href="mailto:sales@chudware.com?subject=Chudware%20access">sales@chudware.com</a>
+          <p class="eyebrow">Bug reports</p>
+          <h3>Bugs and feature requests</h3>
+          <p>A failed workflow, a crash, a wrong result, or a capability you need. Search the existing issues first, then open a new one.</p>
+          <a class="co-route-address" href={`${REPO}/issues`}>github.com/Hunter-124/Chudware/issues</a>
         </article>
         <article class="co-route">
-          <p class="eyebrow">Support</p>
-          <h3>Product, account, and billing help</h3>
-          <p>Sign-in or access problems, a workspace that will not open, a failed workflow, or a billing issue.</p>
-          <a class="co-route-address" href="mailto:support@chudware.com?subject=Chudware%20support">support@chudware.com</a>
+          <p class="eyebrow">Contributions</p>
+          <h3>Code, docs, and fixes</h3>
+          <p>Send changes as pull requests. The contributing guide covers the development setup and what a change needs before review.</p>
+          <a class="co-route-address" href={`${REPO}/blob/HEAD/CONTRIBUTING.md`}>CONTRIBUTING.md</a>
         </article>
         <article class="co-route co-route-urgent">
           <p class="eyebrow">Security</p>
           <h3>Vulnerability disclosure</h3>
-          <p>Include what's affected, the impact, and steps to reproduce. Test only against accounts and data you're authorized to use. There is no bug bounty or response-time commitment yet.</p>
-          <a class="co-route-address" href="mailto:security@chudware.com?subject=Security%20report">security@chudware.com</a>
-        </article>
-        <article class="co-route">
-          <p class="eyebrow">Privacy</p>
-          <h3>Account and service data</h3>
-          <p>Access or deletion requests, hosted project data, sessions and devices, and provider connections.</p>
-          <a class="co-route-address" href="mailto:privacy@chudware.com?subject=Privacy%20request">privacy@chudware.com</a>
-        </article>
-        <article class="co-route">
-          <p class="eyebrow">Legal</p>
-          <h3>Terms and agreements</h3>
-          <p>Questions about the terms of service, privacy policy, EULA, or refund policy.</p>
-          <a class="co-route-address" href="mailto:legal@chudware.com?subject=Legal%20question">legal@chudware.com</a>
+          <p>Report vulnerabilities privately, never in a public issue. Include what's affected, the impact, and steps to reproduce. There is no bug bounty.</p>
+          <a class="co-route-address" href={`${REPO}/security/policy`}>Security policy</a>
         </article>
         <article class="co-route">
           <p class="eyebrow">General</p>
           <h3>Everything else</h3>
-          <p>Anything that doesn't fit one of the routes above.</p>
-          <a class="co-route-address" href="mailto:sales@chudware.com?subject=Chudware%20inquiry">sales@chudware.com</a>
+          <p>Questions about the project that don't fit an issue or a pull request.</p>
+          <a class="co-route-address" href="mailto:support@chudware.com?subject=Chudware%20inquiry">support@chudware.com</a>
         </article>
       </div>
     </div>
@@ -66,18 +56,17 @@ import '../styles/company.css';
           <h2 id="co-self" class="co-anchor">Answered already?</h2>
         </header>
         <ul class="co-selfserve">
-          <li><a class="text-link" href="/faq/">FAQ</a><p>Product scope, access, platforms, files, AI providers, subscriptions, and support.</p></li>
+          <li><a class="text-link" href="/faq/">FAQ</a><p>Product scope, licensing, platforms, files, and AI providers.</p></li>
           <li><a class="text-link" href="/docs/">Documentation</a><p>Installation and task guides for modeling, assemblies, CAM, PLM, reverse engineering, and the copilot.</p></li>
-          <li><a class="text-link" href="/security/">Security</a><p>What's enforced, what isn't claimed, and how to report a vulnerability.</p></li>
-          <li><a class="text-link" href="/pricing/">Pricing</a><p>Trial, Desktop, Studio, education eligibility, storage, and Enterprise access.</p></li>
+          <li><a class="text-link" href="/docs/troubleshooting/">Troubleshooting</a><p>Launch, graphics, modeling, and copilot problems.</p></li>
           <li><a class="text-link" href="/download/">Download</a><p>Desktop builds for Windows, Linux, and macOS.</p></li>
-          <li><a class="text-link" href="/changelog/">Changelog</a><p>Published release and product updates.</p></li>
+          <li><a class="text-link" href="/changelog/">Changelog</a><p>Published release and project updates.</p></li>
         </ul>
       </div>
       <div class="co-aside">
         <div class="co-note">
-          <p class="eyebrow">For a useful support report</p>
-          <p>Tell us whether it's the browser workspace or the desktop app, your OS, the product version, what you did, what you expected, what happened, and the exact error text. For a security report, include a minimal reproduction and its impact.</p>
+          <p class="eyebrow">For a useful bug report</p>
+          <p>Tell us your OS, the Chudware version, what you did, what you expected, what happened, and the exact error text. For a security report, include a minimal reproduction and its impact.</p>
         </div>
       </div>
     </div>
@@ -87,8 +76,8 @@ import '../styles/company.css';
     <div class="wrap section-heading">
       <p class="eyebrow">Evaluate first</p>
       <h2>Try it before you write.</h2>
-      <p class="lede">Start the trial or browse the gallery — it may answer the question faster.</p>
-      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/gallery/">View the gallery</a></div>
+      <p class="lede">Download the app or read the source — it may answer the question faster.</p>
+      <div class="actions"><a class="button" href="/download/">Download</a><a class="button button-secondary" href={REPO}>View on GitHub</a></div>
     </div>
   </section>
 </BaseLayout>

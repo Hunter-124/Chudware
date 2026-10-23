@@ -44,8 +44,8 @@ constexpr WebGap kWebGaps[] = {
      "Vendor sign-in is desktop-only: it drives an embedded browser session the web "
      "app cannot host. Sign in from the desktop app."},
     {"account_signin",
-     "Provider subscription sign-in is unavailable in the web app. "
-     "Add your own provider API key in your account settings."},
+     "Provider sign-in and API keys are unavailable in the web app: the shared engine "
+     "cannot hold provider credentials per user. Use the desktop app for online AI."},
 };
 
 bool allowedExternalHttpUrl(const std::string& url) {

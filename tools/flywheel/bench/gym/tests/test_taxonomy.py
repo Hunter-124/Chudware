@@ -1,4 +1,4 @@
-"""Unit tests for the failure-taxonomy classifier (T-W27).
+"""Unit tests for the failure-taxonomy classifier.
 
 These prove the CLASSIFIER LOGIC against HAND-AUTHORED replay ledgers — one per failure
 class. The ledgers are synthetic fixtures (explicitly labeled), not model output: the
@@ -176,7 +176,7 @@ def test_context_loss_cites_nonexistent_ref():
 
 
 def test_context_loss_manifest_ids_are_known():
-    """T-W32: REAL cells pass the manifest as an argument (no scripted manifest
+    """Real cells pass the manifest as an argument (no scripted manifest
     artifact event) — citing the manifest's own DL/AC ids must NOT be context_loss."""
     lg = _ledger([
         {"kind": "agent_turn", "payload": {"event": "done",
@@ -408,10 +408,10 @@ def test_advisory_ignored_real_shape_disputed_via_advisory_dispute_tool():
     assert not [c for c in res if c.failure_class == FailureClass.ADVISORY_IGNORED.value]
 
 
-# --- execution_stall (T-W32, foreman-sanctioned) -----------------------------
+# --- execution_stall --------------------------------------------------------
 
 def test_execution_stall_all_calls_failed_suppresses_incoherent():
-    """The cycle-1-real-r3 shape: every real tool call errored (agent_turn events),
+    """The real-run stall shape: every real tool call errored (agent_turn events),
     ACs failed — execution_stall must fire WITH evidence seqs, and
     incoherent_geometry (whose evidence would be empty) must be suppressed."""
     lg = _ledger([
@@ -482,7 +482,7 @@ def test_no_stall_on_passed_run_or_empty_ledger():
 
 
 def test_kwarg_error_call_is_also_tool_misuse_but_resolution_gap_is_not():
-    """T-W32 normalisation: an agent-turn call the tool REJECTED (bad kwargs) is
+    """Tool-call normalisation: an agent-turn call the tool REJECTED (bad kwargs) is
     tool_misuse; a pure resolution failure is a harness gap → stall only."""
     lg = _ledger([
         {"kind": "agent_turn", "payload": {"event": "tool_call", "tool": "add_features",

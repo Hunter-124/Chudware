@@ -3738,8 +3738,8 @@ static void editStageLaunchIfViewed(AppState& st) {
                           : "Message edited \xe2\x80\x94 no geometry checkpoint there, so the "
                             "part was left unchanged.");
     } else {
-        // The turn was refused (entitlement / runtime): the conversation is already rewound and
-        // the edited text stays in the box, so Send runs it.
+        // The turn was refused (e.g. a run is still in flight): the conversation is already
+        // rewound and the edited text stays in the box, so Send runs it.
         st.toast(ui::ToastLevel::Warn,
                  "The conversation was rewound, but the edited message wasn't sent \xe2\x80\x94 "
                  "press Send to run it.");

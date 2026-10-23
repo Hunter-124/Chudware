@@ -28,9 +28,9 @@
 #                          core/build-occt-$PLATFORM_SUFFIX tree (the full engine the
 #                          live daemon serves). Fails if that tree is not configured.
 #    ./build.sh all        core, then host GUI, then daemon.
-#    ./build.sh wasm       Emscripten WASM host (full app); stages to
-#                          ~/chudware-web/app/. Requires emsdk (~/.emsdk).
-#                          Linux-only (GNU sed / sha1sum).
+#    ./build.sh wasm       Emscripten WASM host (full app); stages the bundle into
+#                          host/build-wasm/app/ (override with CHUDWARE_WEB_APP).
+#                          Requires emsdk (~/.emsdk). Linux-only (GNU sed / sha1sum).
 #    ./build.sh stage      Deploy libchudware, its optional lib3mf/advisor runtime,
 #                          chudware-hostd and (when built) the polymesh CLI from
 #                          core/build-occt-$PLATFORM_SUFFIX/bin (falls back to the slim
@@ -324,7 +324,8 @@ build_app()  {
 }
 # Emscripten web client (full app). Sources emsdk, configures host/ with
 # emcmake (CEF off), builds Chudware, stages html/js/wasm/data into
-# ~/chudware-web/app/ (served by the gateway /app or host/wasm/coop_server.py).
+# $CHUDWARE_WEB_APP (default host/build-wasm/app/), which the web gateway serves
+# at /app (see web/README.md); host/wasm/coop_server.py serves it standalone.
 build_wasm() {
     local emsdk_dir="${EMSDK:-$HOME/.emsdk}"
     if [ ! -f "$emsdk_dir/emsdk_env.sh" ]; then
@@ -343,7 +344,7 @@ build_wasm() {
         -DCHUDWARE_ENABLE_CEF=OFF
     cmake --build "$ROOT/host/build-wasm" --target Chudware
     local out="$ROOT/host/build-wasm/bin"
-    local stage="${CHUDWARE_WEB_APP:-$HOME/chudware-web/app}"
+    local stage="${CHUDWARE_WEB_APP:-$ROOT/host/build-wasm/app}"
     mkdir -p "$stage"
     # Stage the emscripten bundle (html/js/wasm + any .data preload packs).
     # emcc embeds pthread workers in Chudware.js (no separate Chudware.worker.js); the app
@@ -399,15 +400,10 @@ build_wasm() {
         echo "[build] precompressed bundle (.br/.gz) for gateway content-encoding"
     fi
     # Parity gate. The web bundle bakes assets/ in at LINK time (the --preload-file flags
-    # in host/CMakeLists.txt), so a bundle is a DERIVED artifact that goes stale the moment
-    # any preloaded asset changes — and it goes stale silently, because the desktop build
-    # reads assets/ off disk at startup and therefore never notices. That is not
-    # hypothetical: 69690e57 (2026-08-17) re-rendered every ribbon tool icon, the served
-    # bundle was still the one linked 2026-08-07, and ten days of stale icons went
-    # unnoticed because nothing compared a bundle to its sources (it was finally caught by
-    # hand-scanning Chudware.data for PNG bytes). This runs against the directory we just
-    # staged and FAILS the build, so nobody walks away from `./build.sh wasm` believing
-    # they shipped current assets when they did not.
+    # in host/CMakeLists.txt), so a bundle is a derived artifact that goes stale silently
+    # the moment any preloaded asset changes: the desktop build reads assets/ off disk at
+    # startup and never notices. This compares the staged bundle against its sources and
+    # FAILS the build rather than leaving a stale bundle behind.
     local parity_rc=0
     python3 "$ROOT/scripts/check_web_parity.py" --bundle "$stage" || parity_rc=$?
     if [ "$parity_rc" -ne 0 ]; then
@@ -415,7 +411,7 @@ build_wasm() {
         echo "[build]        $stage is NOT deployable — fix the divergence reported above, then re-run ./build.sh wasm"
         return 1
     fi
-    echo "[build] WASM bundle ready: $stage  (serve with: python3 host/wasm/coop_server.py)"
+    echo "[build] WASM bundle ready: $stage  (serve with: python3 host/wasm/coop_server.py 8765 $stage)"
 }
 
 

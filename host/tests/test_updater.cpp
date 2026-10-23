@@ -103,12 +103,12 @@ void versionTests() {
     require(requiresMandatoryUpdate("1.0.0-rc.1", "1.0.0"),
             "prerelease build hits release kill switch");
     require(!requiresMandatoryUpdate("1.2.0", "1.0.0"), "supported release is not killed");
-    // Nightly CI publishes <base>-beta.<run>, so beta builds must order among
-    // themselves numerically and below the stable release they promote into.
+    // Prerelease builds such as <base>-beta.<n> must order among themselves
+    // numerically and below the release they promote into.
     require(compareVersions("0.1.0-beta.42", "0.1.0-beta.43") < 0,
-            "nightly beta builds order by run number");
+            "beta builds order by prerelease number");
     require(compareVersions("0.1.0-beta.43", "0.1.0") < 0,
-            "nightly beta sorts below the stable release it promotes into");
+            "a beta sorts below the release it promotes into");
     require(compareVersions("0.1.0-beta.9", "0.1.0-beta.10") < 0,
             "beta run numbers compare numerically, not lexically");
     require(!requiresMandatoryUpdate("0.1.0-beta.43", "0.1.0-beta.42"),
@@ -116,7 +116,7 @@ void versionTests() {
 }
 
 // The CI signing key must be trusted by packaged builds, not only developer
-// builds: every nightly beta artifact signature carries key id release-ci-v1.
+// builds: CI-built release artifacts carry key id release-ci-v1.
 void releaseKeyringTests() {
     using chudware::security::release::findKey;
     const auto* ci = findKey("release-ci-v1");
@@ -130,6 +130,51 @@ void releaseKeyringTests() {
     require(findKey("dev-test-v1") == nullptr,
             "developer test key must not be trusted by packaged builds");
 #endif
+}
+
+void setEnv(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    if (*value) setenv(name, value, 1);
+    else unsetenv(name);
+#endif
+}
+
+// The updater polls one GitHub release asset per target; the asset names are
+// the platform/arch identity the release workflow publishes and signs.
+void manifestUrlTests() {
+    using chudware::update::manifestUrl;
+    using chudware::update::releaseManifestUrl;
+    const std::string base = "https://github.com/Hunter-124/Chudware/releases/latest/download/";
+    require(releaseManifestUrl("linux", "x86_64") == base + "update-linux-x86_64.json",
+            "linux x86_64 manifest URL");
+    require(releaseManifestUrl("macos", "arm64") == base + "update-macos-arm64.json",
+            "macOS arm64 manifest URL");
+    require(releaseManifestUrl("macos", "x86_64") == base + "update-macos-x86_64.json",
+            "macOS x86_64 manifest URL");
+    require(releaseManifestUrl("windows", "x86_64") == base + "update-windows-x86_64.json",
+            "Windows x86_64 manifest URL");
+#if defined(_WIN32)
+    const char* platform = "windows";
+#elif defined(__APPLE__)
+    const char* platform = "macos";
+#else
+    const char* platform = "linux";
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const char* arch = "arm64";
+#else
+    const char* arch = "x86_64";
+#endif
+    setEnv("CHUDWARE_UPDATE_MANIFEST_URL", "");
+    require(manifestUrl() == releaseManifestUrl(platform, arch),
+            "default manifest URL must be this build's GitHub release asset");
+    const std::string custom = "https://updates.example.test/custom/update.json";
+    setEnv("CHUDWARE_UPDATE_MANIFEST_URL", custom.c_str());
+    require(manifestUrl() == custom,
+            "CHUDWARE_UPDATE_MANIFEST_URL must replace the default verbatim");
+    setEnv("CHUDWARE_UPDATE_MANIFEST_URL", "");
 }
 
 void stagedLifecycleTests(const fs::path& root) {
@@ -247,10 +292,20 @@ void localSecurityTests(const fs::path& root) {
     require(updater.snapshot().reportSerial == 3,
             "unknown release key id must be reported once");
 
+    Manifest truncated = wrongKeyManifest();
+    truncated.size = 23;
+    const fs::path shortDownload = root / "short.download";
+    writeFile(shortDownload, "signed artifact bytes\n");
+    require(!updater.verifyAndStageDownloaded(truncated, shortDownload, &error),
+            "artifact shorter than the manifest size must be rejected");
+    require(error.find("size does not match") != std::string::npos,
+            "size rejection must name the size check");
+    require(!fs::exists(shortDownload), "size-mismatched artifact must be deleted");
+
     require(readFile(running) == original, "running application was modified before verification");
     require(!fs::exists(root / "data/updates/staged.json"),
             "rejected artifact must never create staged metadata");
-    std::cout << "security: corrupt=rejected+deleted+reported-once wrong-key=rejected+deleted+reported-once running-app=untouched\n";
+    std::cout << "security: corrupt=rejected+deleted+reported-once wrong-key=rejected+deleted+reported-once size-mismatch=rejected+deleted running-app=untouched\n";
 }
 
 
@@ -355,19 +410,15 @@ void servedSecurityTest(const std::string& kind, const std::string& url,
               << " rejected=yes deleted=yes reported=1 running-app=untouched\n";
 }
 
-// The manifest endpoint answering 404 means "no release on this channel at
-// all". That is the normal state before the first publish and must read as a
+// A 404 for the manifest means no release for this target has been published
+// yet. That is the normal state before the first release and must read as a
 // quiet up-to-date, never as an HTTP error in the user's face.
-void emptyChannelTest(const std::string& endpoint, const fs::path& root) {
+void noReleaseTest(const std::string& endpoint, const fs::path& root) {
     fs::remove_all(root);
     fs::create_directories(root);
     const fs::path running = root / "running-app";
     writeFile(running, "RUNNING APP MUST STAY UNTOUCHED\n");
-#ifdef _WIN32
-    _putenv_s("CHUDWARE_UPDATE_MANIFEST_URL", endpoint.c_str());
-#else
-    setenv("CHUDWARE_UPDATE_MANIFEST_URL", endpoint.c_str(), 1);
-#endif
+    setEnv("CHUDWARE_UPDATE_MANIFEST_URL", endpoint.c_str());
     Updater updater;
     updater.configure("0.0.9", root / "data", running);
     updater.start();
@@ -377,9 +428,9 @@ void emptyChannelTest(const std::string& endpoint, const fs::path& root) {
         // Idle (worker not yet scheduled) and Checking are both non-terminal.
         if (snap.state != State::Idle && snap.state != State::Checking) {
             require(snap.state == State::Current,
-                    "empty channel (404) must map to Current, not Error");
+                    "missing release manifest (404) must map to Current, not Error");
             require(snap.message == "Chudware is up to date",
-                    "empty channel must not surface an HTTP status to the user");
+                    "missing release manifest must not surface an HTTP status to the user");
             break;
         }
         require(std::chrono::steady_clock::now() < deadline,
@@ -387,39 +438,31 @@ void emptyChannelTest(const std::string& endpoint, const fs::path& root) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     updater.stop();
-    std::cout << "check-once: empty-channel-404=current-quiet\n";
+    std::cout << "check-once: no-release-404=current-quiet\n";
 }
 
-// Ops verification against a REAL published release: point the production
-// check-and-stage path at a live manifest endpoint and require that it fetches
-// the manifest, downloads the artifact, and passes every verification gate
-// (size, SHA-256, Ed25519 over the release keyring, and the inner payload
-// manifest) before the atomic stage rename. Only runs when invoked with
-// --live, so ctest never depends on the network. An entitlement token, when
-// the endpoint needs one to hand out a download URL, comes from
-// CHUDWARE_UPDATE_ENTITLEMENT.
-void liveChannelTest(const std::string& endpoint, const std::string& currentVersion,
+// Release verification against a REAL published release: point the production
+// check-and-stage path at a live manifest URL (for example
+// releaseManifestUrl("linux", "x86_64")) and require that it fetches the
+// manifest, follows the release-asset redirect, downloads the artifact, and
+// passes every verification gate (size, SHA-256, Ed25519 over the release
+// keyring, and the inner payload manifest) before the atomic stage rename.
+// Only runs when invoked with --live, so ctest never depends on the network.
+void liveReleaseTest(const std::string& endpoint, const std::string& currentVersion,
                      const fs::path& root) {
     fs::remove_all(root);
     fs::create_directories(root);
     const fs::path running = root / "running-app";
     writeFile(running, "RUNNING APP MUST STAY UNTOUCHED\n");
-#ifdef _WIN32
-    _putenv_s("CHUDWARE_UPDATE_MANIFEST_URL", endpoint.c_str());
-#else
-    setenv("CHUDWARE_UPDATE_MANIFEST_URL", endpoint.c_str(), 1);
-#endif
+    setEnv("CHUDWARE_UPDATE_MANIFEST_URL", endpoint.c_str());
     Updater updater;
     updater.configure(currentVersion, root / "data", running);
-    if (const char* token = std::getenv("CHUDWARE_UPDATE_ENTITLEMENT"); token && *token)
-        updater.setEntitlementToken(token);
     updater.start();
     // A staged download is the assertion, not the reported state: once a
-    // release's min_supported outranks the running build (every 0.1.0-beta.N
-    // against min_supported 0.1.0), setStatus pins the state to Mandatory and
-    // only the message tracks check -> download -> staged. So poll for the
-    // staged transaction and, if the worker gives up first, report the message
-    // it left behind.
+    // release's min_supported outranks the running build, setStatus pins the
+    // state to Mandatory and only the message tracks check -> download ->
+    // staged. So poll for the staged transaction and, if the worker gives up
+    // first, report the message it left behind.
     const fs::path metadata = root / "data/updates/staged.json";
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(20);
     std::string last;
@@ -442,10 +485,10 @@ void liveChannelTest(const std::string& endpoint, const std::string& currentVers
         for (const char* marker : {"failed", "does not match", "invalid", "unknown",
                                    "exceeds", "not writable", "up to date"})
             require(last.find(marker) == std::string::npos,
-                    ("live channel did not stage an update: " + last).c_str());
+                    ("live release did not stage an update: " + last).c_str());
         require(snap.state != State::Error && snap.state != State::ManualDownload &&
                     snap.state != State::Current,
-                ("live channel did not stage an update: " + snap.message).c_str());
+                ("live release did not stage an update: " + snap.message).c_str());
         require(std::chrono::steady_clock::now() < deadline,
                 ("live update never staged; last status: " + last).c_str());
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -518,14 +561,15 @@ void applyStagedOnceTest(const fs::path& root, const fs::path& installed) {
 
 int main(int argc, char** argv) {
     versionTests();
+    manifestUrlTests();
     releaseKeyringTests();
     stagedLifecycleTests(fs::temp_directory_path() / "chudware-updater-state-test");
     if (argc == 5 && std::string(argv[1]) == "--served") {
         servedSecurityTest(argv[2], argv[3], argv[4]);
     } else if (argc == 4 && std::string(argv[1]) == "--check-once") {
-        emptyChannelTest(argv[2], argv[3]);
+        noReleaseTest(argv[2], argv[3]);
     } else if (argc == 5 && std::string(argv[1]) == "--live") {
-        liveChannelTest(argv[2], argv[3], argv[4]);
+        liveReleaseTest(argv[2], argv[3], argv[4]);
     } else if (argc == 4 && std::string(argv[1]) == "--apply-once") {
         applyStagedOnceTest(argv[2], argv[3]);
     } else {
@@ -539,6 +583,7 @@ int main(int argc, char** argv) {
         windowsRollbackTests(fs::temp_directory_path() / "chudware-updater-test");
 #endif
     std::cout << "versions: semver+prerelease+beta-order+0.0.0+min-supported=ok\n";
+    std::cout << "manifest-url: github-release-asset per platform/arch, env override=ok\n";
     std::cout << "keyring: release-v1+release-ci-v1 trusted, unknown rejected\n";
     return 0;
 }

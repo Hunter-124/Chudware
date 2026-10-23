@@ -1,12 +1,10 @@
 #!/bin/sh
 # Chudware for Linux — installer.
 #
-# Served at https://app.chudware.com/install.sh and meant to be run as
+# Downloads a release from GitHub Releases and installs it:
 #
-#   curl -fsSL https://app.chudware.com/install.sh | sh -s -- --token <token>
-#
-# Get the token from the Downloads section of the portal; it is valid for
-# fifteen minutes and is what authorises the download.
+#   curl -fsSL https://github.com/Hunter-124/Chudware/releases/latest/download/install.sh | sh
+#   sh install.sh --version 0.2.0 --format rpm
 #
 # Deliberately POSIX sh, not bash: this runs on whatever /bin/sh the machine
 # has, which on Debian and Ubuntu is dash. No arrays, no [[ ]], no ${x^^}, no
@@ -16,8 +14,12 @@
 # is written to be read:
 #   * every expansion is quoted, and nothing is ever passed through `eval`;
 #   * downloads land in a private mktemp directory removed by a trap on exit;
-#   * sha256 and the domain-separated Ed25519 artifact signature are verified
-#     against public keys pinned in this script BEFORE anything is installed;
+#   * the AppImage is checked against the release's signed update manifest
+#     (update-linux-x86_64.json): size, SHA-256 and the domain-separated Ed25519
+#     artifact signature against public keys pinned in this script;
+#   * .deb and .rpm packages are checked against the release's SHA256SUMS; the
+#     payload inside them carries the same signed manifest the application
+#     verifies at startup;
 #   * nothing is installed from a partial download — the verify step happens
 #     after the transfer completes, on the complete file;
 #   * privilege escalation is announced before it happens and never assumed.
@@ -26,11 +28,10 @@
 
 set -eu
 
-BASE_URL="${CHUDWARE_BASE_URL:-https://app.chudware.com}"
-CHANNEL="stable"
+REPO="${CHUDWARE_RELEASE_REPO:-Hunter-124/Chudware}"
+VERSION=""
 FORMAT="auto"
 PREFIX="${HOME:-/tmp}/.local/bin"
-TOKEN="${CHUDWARE_TOKEN:-}"
 DRY_RUN="no"
 TMP=""
 
@@ -42,32 +43,29 @@ usage() {
 Chudware for Linux — installer.
 
 Usage:
-  install.sh --token <token> [options]
+  install.sh [options]
 
 Options:
-  --token <token>     Download token from the portal's Downloads section.
-                      May also be given as CHUDWARE_TOKEN. Required to
-                      download; not required for --dry-run.
-  --channel <name>    stable (default) or beta.
+  --version <v>       Install this release (tag v<v>). Default: the latest release.
   --format <name>     auto (default), deb, rpm or appimage.
                       auto picks .deb on apt/dpkg systems, .rpm on
                       dnf/yum/zypper/rpm systems, and the AppImage otherwise
                       or whenever the packages cannot be installed.
   --prefix <dir>      Where the AppImage is installed. Default ~/.local/bin.
                       Ignored for .deb and .rpm, which install to /opt/chudware.
-  --base-url <url>    Gateway to install from. Default https://app.chudware.com,
-                      or CHUDWARE_BASE_URL. For staging and testing.
+  --repo <owner/name> GitHub repository to install from. Default
+                      Hunter-124/Chudware, or CHUDWARE_RELEASE_REPO.
   --dry-run           Resolve and print the download and verification plan,
-                      without downloading bytes or installing anything.
+                      without downloading the artifact or installing anything.
                       This does NOT authenticate the artifact.
   -h, --help          This text.
 
-Verification requires locally installed OpenSSL 3 or newer with Ed25519 support.
+The AppImage is verified with locally installed OpenSSL 3 or newer (Ed25519).
 No verifier is downloaded and no environment or manifest public key is trusted.
 
 Examples:
-  curl -fsSL https://app.chudware.com/install.sh | sh -s -- --token TOKEN
-  sh install.sh --token TOKEN --channel beta --format rpm
+  curl -fsSL https://github.com/Hunter-124/Chudware/releases/latest/download/install.sh | sh
+  sh install.sh --version 0.2.0 --format rpm
   sh install.sh --dry-run
 USAGE
 }
@@ -91,16 +89,11 @@ cleanup() {
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --token)
-            [ "$#" -ge 2 ] || die "--token needs a value"
-            TOKEN="$2"; shift 2 ;;
-        --token=*)
-            TOKEN="${1#--token=}"; shift ;;
-        --channel)
-            [ "$#" -ge 2 ] || die "--channel needs a value"
-            CHANNEL="$2"; shift 2 ;;
-        --channel=*)
-            CHANNEL="${1#--channel=}"; shift ;;
+        --version)
+            [ "$#" -ge 2 ] || die "--version needs a value"
+            VERSION="$2"; shift 2 ;;
+        --version=*)
+            VERSION="${1#--version=}"; shift ;;
         --format)
             [ "$#" -ge 2 ] || die "--format needs a value"
             FORMAT="$2"; shift 2 ;;
@@ -111,11 +104,11 @@ while [ "$#" -gt 0 ]; do
             PREFIX="$2"; shift 2 ;;
         --prefix=*)
             PREFIX="${1#--prefix=}"; shift ;;
-        --base-url)
-            [ "$#" -ge 2 ] || die "--base-url needs a value"
-            BASE_URL="$2"; shift 2 ;;
-        --base-url=*)
-            BASE_URL="${1#--base-url=}"; shift ;;
+        --repo)
+            [ "$#" -ge 2 ] || die "--repo needs a value"
+            REPO="$2"; shift 2 ;;
+        --repo=*)
+            REPO="${1#--repo=}"; shift ;;
         --dry-run)
             DRY_RUN="yes"; shift ;;
         -h|--help)
@@ -127,24 +120,30 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-case "$CHANNEL" in
-    stable|beta) ;;
-    *) die "--channel must be stable or beta (got '$CHANNEL')" ;;
-esac
-
 case "$FORMAT" in
     auto|deb|rpm|appimage) ;;
     *) die "--format must be auto, deb, rpm or appimage (got '$FORMAT')" ;;
 esac
 
-# Strip a trailing slash so every URL below is built the same way.
-while [ "${BASE_URL%/}" != "$BASE_URL" ]; do
-    BASE_URL="${BASE_URL%/}"
-done
-case "$BASE_URL" in
-    http://*|https://*) ;;
-    *) die "--base-url must be an http(s) URL (got '$BASE_URL')" ;;
+case "$REPO" in
+    */*/*|/*|*/|.*|*/.*|*[!A-Za-z0-9_./-]*) die "--repo must be OWNER/NAME (got '$REPO')" ;;
+    */*) ;;
+    *) die "--repo must be OWNER/NAME (got '$REPO')" ;;
 esac
+
+# Same shape packaging/artifact_names.py accepts: major.minor.patch[-prerelease].
+if [ -n "$VERSION" ]; then
+    printf '%s\n' "$VERSION" |
+        grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$' ||
+        die "--version must be major.minor.patch with an optional -prerelease (got '$VERSION')"
+fi
+
+RELEASES="https://github.com/$REPO/releases"
+if [ -n "$VERSION" ]; then
+    ASSETS="$RELEASES/download/v$VERSION"
+else
+    ASSETS="$RELEASES/latest/download"
+fi
 
 # ---------------------------------------------------------------------------
 # Machine
@@ -155,15 +154,14 @@ case "$MACHINE" in
     x86_64|amd64) ARCH="x86_64" ;;
     aarch64|arm64)
         die "Chudware does not publish an ARM64 Linux build yet (this machine reports '$MACHINE').
-       Nothing here will work on it, so this installer stops rather than
-       installing an x86_64 binary that cannot run.
-       Use the browser workspace at $BASE_URL in the meantime." ;;
+       This installer stops rather than installing an x86_64 binary that cannot
+       run. Build from source instead: https://github.com/$REPO" ;;
     *)
         die "unsupported CPU architecture '$MACHINE'; Chudware for Linux is x86_64 only" ;;
 esac
 
 if [ "$(uname -s 2>/dev/null || printf unknown)" != "Linux" ]; then
-    die "this installer is for Linux; download the macOS or Windows build from $BASE_URL"
+    die "this installer is for Linux; download the macOS or Windows build from $RELEASES"
 fi
 
 # ---------------------------------------------------------------------------
@@ -178,12 +176,13 @@ else
     die "neither curl nor wget is installed; one of them is required"
 fi
 
-# Body of a GET on stdout. Fails (non-zero) on any HTTP error status.
+# Body of a GET on stdout. Fails (non-zero) on any HTTP error status. GitHub
+# serves release assets through a redirect to its CDN, which both tools follow.
 http_body() {
     if [ "$DOWNLOADER" = "curl" ]; then
-        curl -fsSL --retry 2 --max-time 60 -- "$1"
+        curl -fsSL --proto '=https' --retry 2 --max-time 60 -- "$1"
     else
-        wget -q -O - --tries=3 --timeout=60 -- "$1"
+        wget -q -O - --https-only --tries=3 --timeout=60 -- "$1"
     fi
 }
 
@@ -194,9 +193,9 @@ http_download() {
     _dest="$2"
     rm -f "$_dest" "$_dest.part"
     if [ "$DOWNLOADER" = "curl" ]; then
-        curl -fSL --retry 2 --progress-bar -o "$_dest.part" -- "$_url"
+        curl -fSL --proto '=https' --retry 2 --progress-bar -o "$_dest.part" -- "$_url"
     else
-        wget -q --show-progress --tries=3 -O "$_dest.part" -- "$_url"
+        wget -q --show-progress --https-only --tries=3 -O "$_dest.part" -- "$_url"
     fi
     mv -- "$_dest.part" "$_dest"
 }
@@ -238,7 +237,7 @@ verify_artifact_signature() {
     printf '%s' "$PUBLIC_KEY" | openssl base64 -d -A > "$TMP/release-key.der" ||
         die "cannot decode the pinned release public key"
     # Frozen signing tuple: NUL separators, no terminal NUL, no format field.
-    # Use the requested identity and computed digest, NOT mutable manifest data.
+    # Use the resolved identity and computed digest, NOT mutable manifest data.
     printf '%s\000%s\000%s\000%s\000%s\000%s' \
         'chudware-artifact-v1' "$KEY_ID" "$VERSION" 'linux' "$ARCH" "$ACTUAL_SHA" \
         > "$TMP/artifact.preimage"
@@ -247,23 +246,22 @@ verify_artifact_signature() {
         -sigfile "$TMP/artifact.sig" > "$TMP/verify.log" 2>&1; then
         die "ARTIFACT SIGNATURE VERIFICATION FAILED for $KEY_ID/$VERSION/linux/$ARCH.
        Nothing has been installed. The signature must match the pinned release
-       key, requested identity and downloaded bytes. Verification requires local
+       key, release identity and downloaded bytes. Verification requires local
        OpenSSL 3 or newer with Ed25519 support."
     fi
     info "Ed25519 artifact signature OK: $KEY_ID/$VERSION/linux/$ARCH"
 }
 
-# Minimal JSON readers for this gateway's own compact responses. FastAPI emits
-# `{"a":1,"b":"x"}` with no whitespace and no nesting inside a build object, and
-# none of the values (platform, arch, format, version, digest, URL) can contain
-# a brace or a quote. That is a narrow enough contract to read with sed, and it
-# keeps this script free of a jq dependency it cannot assume.
+# Minimal readers for the update manifest packaging/github_release_manifest.py
+# writes: one flat JSON object, one "key": value pair per line, and no value
+# (version, digest, key id, base64 signature, URL) that contains a quote. That
+# is narrow enough to read with sed and keeps this script free of jq.
 json_string() {
-    printf '%s' "$2" | sed -n 's/.*"'"$1"'":"\([^"]*\)".*/\1/p'
+    printf '%s\n' "$2" | sed -n 's/^[[:space:]]*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
 json_number() {
-    printf '%s' "$2" | sed -n 's/.*"'"$1"'":\([0-9][0-9]*\).*/\1/p'
+    printf '%s\n' "$2" | sed -n 's/^[[:space:]]*"'"$1"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p'
 }
 
 human_bytes() {
@@ -281,15 +279,15 @@ human_bytes() {
 # Package manager detection
 # ---------------------------------------------------------------------------
 
-# Echoes the API format name this machine can install natively: "deb", "rpm",
-# or "default" (the AppImage) when no package manager matches.
+# Echoes the format this machine can install natively: "deb", "rpm", or
+# "appimage" when no package manager matches.
 detect_native_format() {
     if have apt-get && have dpkg; then
         printf 'deb'
     elif have dnf || have yum || have zypper || have rpm; then
         printf 'rpm'
     else
-        printf 'default'
+        printf 'appimage'
     fi
 }
 
@@ -302,165 +300,131 @@ elif have sudo; then
     CAN_ESCALATE="yes"
 fi
 
-WANT_FORMAT=""
-case "$FORMAT" in
-    appimage) WANT_FORMAT="default" ;;
-    deb) WANT_FORMAT="deb" ;;
-    rpm) WANT_FORMAT="rpm" ;;
-    auto)
-        WANT_FORMAT="$(detect_native_format)"
-        if [ "$WANT_FORMAT" != "default" ] && [ "$CAN_ESCALATE" = "no" ]; then
-            # A package install needs root. Without it, silently failing at the
-            # last step would waste a 325 MB download.
-            info "No root and no sudo, so the .$WANT_FORMAT package cannot be installed."
-            info "Falling back to the AppImage in $PREFIX."
-            WANT_FORMAT="default"
-        fi
-        ;;
-esac
+WANT_FORMAT="$FORMAT"
+if [ "$FORMAT" = "auto" ]; then
+    WANT_FORMAT="$(detect_native_format)"
+    if [ "$WANT_FORMAT" != "appimage" ] && [ "$CAN_ESCALATE" = "no" ]; then
+        # A package install needs root. Without it, silently failing at the
+        # last step would waste a large download.
+        info "No root and no sudo, so the .$WANT_FORMAT package cannot be installed."
+        info "Falling back to the AppImage in $PREFIX."
+        WANT_FORMAT="appimage"
+    fi
+fi
 
-if [ "$WANT_FORMAT" != "default" ] && [ "$CAN_ESCALATE" = "no" ]; then
+if [ "$WANT_FORMAT" != "appimage" ] && [ "$CAN_ESCALATE" = "no" ]; then
     die "--format $FORMAT installs a system package, which needs root; re-run with sudo, or use --format appimage"
 fi
 
 # ---------------------------------------------------------------------------
-# Resolve the build
+# Resolve the release
 # ---------------------------------------------------------------------------
 
-step "Asking $BASE_URL which $CHANNEL builds exist"
-AVAILABLE=""
-if ! AVAILABLE="$(http_body "$BASE_URL/api/releases/available?channel=$CHANNEL")"; then
-    die "could not reach $BASE_URL/api/releases/available (channel $CHANNEL)"
-fi
-
-# One build object per line: nothing in a value contains a brace, so splitting
-# on braces isolates them, and the platform key identifies a build line. Two tr
-# calls rather than one with a two-character SET2, whose padding behaviour POSIX
-# leaves undefined.
-BUILDS="$(printf '%s' "$AVAILABLE" | tr '{' '\n' | tr '}' '\n' | grep '"platform"' || true)"
-[ -n "$BUILDS" ] || die "$BASE_URL published no $CHANNEL builds at all"
-
-build_line() {
-    printf '%s\n' "$BUILDS" | while IFS= read -r line; do
-        [ "$(json_string platform "$line")" = "linux" ] || continue
-        [ "$(json_string arch "$line")" = "$ARCH" ] || continue
-        [ "$(json_string format "$line")" = "$1" ] || continue
-        printf '%s' "$line"
-        break
-    done
-}
-
-BUILD="$(build_line "$WANT_FORMAT")"
-if [ -z "$BUILD" ] && [ "$WANT_FORMAT" != "default" ]; then
-    warn "no .$WANT_FORMAT package is published for linux/$ARCH on the $CHANNEL channel"
-    info "Falling back to the AppImage."
-    WANT_FORMAT="default"
-    BUILD="$(build_line default)"
-fi
-[ -n "$BUILD" ] || die "no linux/$ARCH build is published on the $CHANNEL channel"
-
-VERSION="$(json_string version "$BUILD")"
-CATALOGUE_SHA="$(json_string sha256 "$BUILD")"
-SIZE="$(json_number size "$BUILD")"
-[ -n "$VERSION" ] || die "the release catalogue returned a build with no version"
-
-case "$WANT_FORMAT" in
-    deb) PLAN="install the .deb package with apt/dpkg into /opt/chudware" ;;
-    rpm) PLAN="install the .rpm package with dnf/yum/zypper/rpm into /opt/chudware" ;;
-    *) PLAN="install the AppImage as $PREFIX/$PROGRAM" ;;
-esac
-
-info ""
-info "  channel   $CHANNEL"
-info "  version   $VERSION"
-info "  target    linux/$ARCH"
-info "  format    $WANT_FORMAT"
-info "  size      $(human_bytes "$SIZE")"
-info "  sha256    $CATALOGUE_SHA"
-info "  plan      $PLAN"
-info ""
-
-# ---------------------------------------------------------------------------
-# Release metadata (authenticated only after artifact signature verification)
-# ---------------------------------------------------------------------------
-
-MANIFEST_URL="$BASE_URL/api/releases/latest?channel=$CHANNEL&platform=linux&arch=$ARCH&format=$WANT_FORMAT"
-if [ -n "$TOKEN" ]; then
-    # The token goes in the query string, not a header: a redirect to the
-    # artifact route drops headers, and both places are accepted.
-    MANIFEST_URL="$MANIFEST_URL&download_token=$TOKEN"
-fi
-
-step "Fetching the release manifest"
+step "Fetching the release manifest from $ASSETS"
 MANIFEST=""
-if ! MANIFEST="$(http_body "$MANIFEST_URL")"; then
-    die "could not fetch the release manifest for $CHANNEL linux/$ARCH ($WANT_FORMAT)"
+if ! MANIFEST="$(http_body "$ASSETS/update-linux-$ARCH.json")"; then
+    die "could not fetch $ASSETS/update-linux-$ARCH.json; is there a Linux build in that release?"
 fi
 
-EXPECTED_SHA="$(json_string sha256 "$MANIFEST")"
-EXPECTED_SIZE="$(json_number size "$MANIFEST")"
-ARTIFACT_URL="$(json_string url "$MANIFEST")"
+MANIFEST_VERSION="$(json_string version "$MANIFEST")"
+APPIMAGE_SHA="$(json_string sha256 "$MANIFEST")"
+APPIMAGE_SIZE="$(json_number size "$MANIFEST")"
 KEY_ID="$(json_string key_id "$MANIFEST")"
 SIGNATURE="$(json_string signature "$MANIFEST")"
 
-[ "$(json_string version "$MANIFEST")" = "$VERSION" ] &&
-    [ "$(json_string platform "$MANIFEST")" = "linux" ] &&
-    [ "$(json_string arch "$MANIFEST")" = "$ARCH" ] &&
-    [ "$(json_string format "$MANIFEST")" = "$WANT_FORMAT" ] ||
-    die "the release manifest does not match the requested release identity; refusing to install"
-[ -n "$KEY_ID" ] || die "missing artifact signing key_id; refusing to install"
-PUBLIC_KEY="$(release_public_key "$KEY_ID")" ||
-    die "unknown artifact signing key_id '$KEY_ID'; refusing to install"
-[ -n "$SIGNATURE" ] || die "missing artifact signature; refusing to install"
-case "$SIGNATURE" in
-    *[!A-Za-z0-9+/=]*) die "malformed artifact signature; refusing to install" ;;
+[ -n "$MANIFEST_VERSION" ] || die "the release manifest carries no version; refusing to install"
+if [ -n "$VERSION" ] && [ "$MANIFEST_VERSION" != "$VERSION" ]; then
+    die "the release manifest is for $MANIFEST_VERSION, not the requested $VERSION; refusing to install"
+fi
+VERSION="$MANIFEST_VERSION"
+[ "$(json_string platform "$MANIFEST")" = "linux" ] &&
+    [ "$(json_string arch "$MANIFEST")" = "$ARCH" ] ||
+    die "the release manifest does not describe linux/$ARCH; refusing to install"
+case "$APPIMAGE_SHA" in
+    *[!0-9a-f]*|'') die "the release manifest sha256 must be lowercase hexadecimal" ;;
 esac
-[ "${#SIGNATURE}" = "88" ] || die "malformed artifact signature; refusing to install"
-case "$SIGNATURE" in
-    *==) ;;
-    *) die "malformed artifact signature; refusing to install" ;;
+[ "${#APPIMAGE_SHA}" = "64" ] || die "the release manifest sha256 must have 64 characters"
+
+# The update manifest names exactly one artifact: the AppImage.
+APPIMAGE_NAME="Chudware-$VERSION-linux-$ARCH.AppImage"
+SUMS=""
+case "$WANT_FORMAT" in
+    deb|rpm)
+        step "Fetching SHA256SUMS"
+        SUMS="$(http_body "$ASSETS/SHA256SUMS")" ||
+            die "could not fetch $ASSETS/SHA256SUMS; the .$WANT_FORMAT package cannot be verified"
+        case "$WANT_FORMAT" in
+            deb) PATTERN='chudware_.*_amd64\.deb' ;;
+            *) PATTERN='chudware-.*\.x86_64\.rpm' ;;
+        esac
+        ENTRY="$(printf '%s\n' "$SUMS" | grep -E "^[0-9a-f]{64}  $PATTERN\$" || true)"
+        if [ -z "$ENTRY" ]; then
+            warn "no .$WANT_FORMAT package is published for linux/$ARCH in this release"
+            info "Falling back to the AppImage."
+            WANT_FORMAT="appimage"
+        else
+            [ "$(printf '%s\n' "$ENTRY" | wc -l | tr -d ' ')" = "1" ] ||
+                die "SHA256SUMS lists more than one .$WANT_FORMAT package; refusing to guess"
+            EXPECTED_SHA="${ENTRY%% *}"
+            ARTIFACT_NAME="${ENTRY#*  }"
+            EXPECTED_SIZE=""
+            # The checksum list must agree with the signed manifest about the AppImage.
+            LISTED_APPIMAGE="$(printf '%s\n' "$SUMS" | grep -F "  $APPIMAGE_NAME" | cut -d' ' -f1 || true)"
+            if [ -n "$LISTED_APPIMAGE" ] && [ "$LISTED_APPIMAGE" != "$APPIMAGE_SHA" ]; then
+                die "SHA256SUMS and the signed release manifest disagree about $APPIMAGE_NAME; refusing to continue"
+            fi
+        fi
+        ;;
+esac
+if [ "$WANT_FORMAT" = "appimage" ]; then
+    ARTIFACT_NAME="$APPIMAGE_NAME"
+    EXPECTED_SHA="$APPIMAGE_SHA"
+    EXPECTED_SIZE="$APPIMAGE_SIZE"
+    [ -n "$KEY_ID" ] || die "missing artifact signing key_id; refusing to install"
+    PUBLIC_KEY="$(release_public_key "$KEY_ID")" ||
+        die "unknown artifact signing key_id '$KEY_ID'; refusing to install"
+    case "$SIGNATURE" in
+        *[!A-Za-z0-9+/=]*|'') die "malformed artifact signature; refusing to install" ;;
+    esac
+    [ "${#SIGNATURE}" = "88" ] || die "malformed artifact signature; refusing to install"
+    case "$SIGNATURE" in
+        *==) ;;
+        *) die "malformed artifact signature; refusing to install" ;;
+    esac
+fi
+ARTIFACT_URL="$ASSETS/$ARTIFACT_NAME"
+
+case "$WANT_FORMAT" in
+    deb) PLAN="install the .deb package with apt/dpkg into /opt/chudware"
+         CHECK="SHA-256 from SHA256SUMS" ;;
+    rpm) PLAN="install the .rpm package with dnf/yum/zypper/rpm into /opt/chudware"
+         CHECK="SHA-256 from SHA256SUMS" ;;
+    *) PLAN="install the AppImage as $PREFIX/$PROGRAM"
+       CHECK="size, SHA-256 and Ed25519 signature (key $KEY_ID) from the signed manifest" ;;
 esac
 
-[ -n "$EXPECTED_SHA" ] || die "the release manifest carries no sha256; refusing to install unverifiable bytes"
-case "$EXPECTED_SHA" in
-    *[!0-9a-f]*) die "the release manifest sha256 must be lowercase hexadecimal" ;;
-esac
-[ "${#EXPECTED_SHA}" = "64" ] || die "the release manifest sha256 must have 64 characters"
-if [ -n "$CATALOGUE_SHA" ] && [ "$CATALOGUE_SHA" != "$EXPECTED_SHA" ]; then
-    die "the release catalogue and the release manifest disagree about the sha256 of $CHANNEL $VERSION ($WANT_FORMAT); refusing to continue"
-fi
+info ""
+info "  release   $VERSION ($RELEASES)"
+info "  target    linux/$ARCH"
+info "  artifact  $ARTIFACT_NAME"
+[ -z "$EXPECTED_SIZE" ] || info "  size      $(human_bytes "$EXPECTED_SIZE")"
+info "  sha256    $EXPECTED_SHA"
+info "  verify    $CHECK"
+info "  plan      $PLAN"
+info ""
 
 if [ "$DRY_RUN" = "yes" ]; then
     step "Dry run: stopping before any download or install"
-    if [ -z "$ARTIFACT_URL" ]; then
-        if [ -z "$TOKEN" ]; then
-            info "No download token was given, so the manifest carried no download URL."
-            info "A real run needs --token <token> from the portal's Downloads section."
-        else
-            info "The token was not accepted, so the manifest carried no download URL."
-        fi
-    else
-        info "Would download: $ARTIFACT_URL"
-    fi
-    info "Would verify sha256 $EXPECTED_SHA over $(human_bytes "$EXPECTED_SIZE")."
-    info "Would verify the Ed25519 artifact signature against pinned key $KEY_ID using local OpenSSL."
+    info "Would download: $ARTIFACT_URL"
     info "Artifact NOT authenticated: dry run does not download or verify bytes."
-    info "Would then $PLAN, only after both checks pass."
+    info "Would then $PLAN, only after verification passes."
     exit 0
 fi
 
-if [ -z "$ARTIFACT_URL" ]; then
-    if [ -z "$TOKEN" ]; then
-        die "no download token: pass --token <token> or set CHUDWARE_TOKEN.
-       Sign in at $BASE_URL, open Downloads, and copy the install command —
-       it already contains a fresh token."
-    fi
-    die "the download token was refused. Tokens expire after 15 minutes;
-       open Downloads at $BASE_URL and copy a fresh install command."
-fi
-
-have openssl || die "OpenSSL 3 or newer with Ed25519 support is required to verify artifact signatures.
+if [ "$WANT_FORMAT" = "appimage" ]; then
+    have openssl || die "OpenSSL 3 or newer with Ed25519 support is required to verify the AppImage signature.
        No verifier will be downloaded and nothing has been installed."
+fi
 
 # ---------------------------------------------------------------------------
 # Download and verify
@@ -490,24 +454,8 @@ case "$WANT_FORMAT" in
     *) ARTIFACT="$TMP/chudware.AppImage" ;;
 esac
 
-DOWNLOAD_URL="$ARTIFACT_URL"
-case "$ARTIFACT_URL" in
-    */api/releases/artifact/*)
-        # This gateway's own artifact route, which needs the token too. A CDN
-        # pre-signed URL is deliberately left untouched: it already carries its
-        # own authorisation, and an extra query parameter would invalidate the
-        # signature over it.
-        if [ -n "$TOKEN" ]; then
-            case "$ARTIFACT_URL" in
-                *\?*) DOWNLOAD_URL="$ARTIFACT_URL&download_token=$TOKEN" ;;
-                *) DOWNLOAD_URL="$ARTIFACT_URL?download_token=$TOKEN" ;;
-            esac
-        fi
-        ;;
-esac
-
-step "Downloading Chudware $VERSION ($(human_bytes "$EXPECTED_SIZE"))"
-http_download "$DOWNLOAD_URL" "$ARTIFACT" || die "download failed"
+step "Downloading $ARTIFACT_NAME"
+http_download "$ARTIFACT_URL" "$ARTIFACT" || die "download failed"
 
 step "Verifying sha256"
 ACTUAL_SHA="$(sha256_of "$ARTIFACT")"
@@ -517,11 +465,11 @@ if [ -z "$ACTUAL_SHA" ]; then
        Install coreutils and re-run."
 fi
 if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-    printf 'error: SHA256 MISMATCH — the download does not match the release manifest.\n' >&2
+    printf 'error: SHA256 MISMATCH — the download does not match the release metadata.\n' >&2
     printf '       expected %s\n' "$EXPECTED_SHA" >&2
     printf '       actual   %s\n' "$ACTUAL_SHA" >&2
     printf '       Nothing has been installed. Re-run; if it happens again, do NOT\n' >&2
-    printf '       install this file and report it at %s.\n' "$BASE_URL" >&2
+    printf '       install this file and report it at https://github.com/%s/issues.\n' "$REPO" >&2
     exit 1
 fi
 if [ -n "$EXPECTED_SIZE" ]; then
@@ -531,8 +479,10 @@ if [ -n "$EXPECTED_SIZE" ]; then
     fi
 fi
 info "sha256 OK: $ACTUAL_SHA"
-step "Verifying the Ed25519 artifact signature"
-verify_artifact_signature
+if [ "$WANT_FORMAT" = "appimage" ]; then
+    step "Verifying the Ed25519 artifact signature"
+    verify_artifact_signature
+fi
 # Same reason as the directory: apt's sandbox user must be able to read it.
 chmod 0644 "$ARTIFACT"
 
@@ -630,9 +580,9 @@ esac
 
 info ""
 step "Chudware $VERSION is installed"
-if [ "$WANT_FORMAT" = "default" ]; then
+if [ "$WANT_FORMAT" = "appimage" ]; then
     info "Run it with: $PREFIX/$PROGRAM"
 else
     info "Run it with: chudware"
 fi
-info "Release notes and your account: $BASE_URL"
+info "Release notes: $RELEASES/tag/v$VERSION"

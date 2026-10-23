@@ -15,11 +15,6 @@
 
 namespace chudware {
 namespace agent {
-json worker_actor_from_options(const json& options) {
-    if (!options.is_object()) return json(nullptr);
-    return options.value("_chudware_actor", json(nullptr));
-}
-
 // Sanitize a model-chosen part name into a short filename-safe display title.
 // Illegal path chars stripped; whitespace collapsed; capped at 48 chars.
 std::string sanitize_part_name(std::string name) {

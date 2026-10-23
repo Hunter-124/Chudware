@@ -50,7 +50,7 @@ void accentButtonColors() {
 // Each list card gets a translucent liquid-glass background tinted by the item's
 // standing. Only tasks/open-tasks have a real "priority"; the other lists map to
 // their natural status colour (severity, lifecycle, scope), which reads the same.
-// blue / yellow / red — low / med / high, per Hunter's explicit mapping (not the
+// blue / yellow / red — low / med / high, per the agreed mapping (not the
 // generic accent/dim/warn scheme used elsewhere in the hub).
 const float kPriorityLow[4] = {0.420f, 0.620f, 0.960f, 1.0f};
 const float* plmTintPriority(const std::string& pr) {

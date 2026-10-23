@@ -266,10 +266,6 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
         "vendor_status", "vendor_login", "browser_profiles",
         "scrape_enqueue", "scrape_queue_status", "import_artifact",
     },
-    "serving": {
-        "serving_status", "serving_set_canary", "serving_rollback",
-        "serving_evaluate", "serving_promote",
-    },
     "regen": {
         "regen_diagnose",
     },
@@ -347,7 +343,6 @@ _FAMILY_SIGNALS: dict[str, list[str]] = {
     "structural":    ["struct_analyze", "cad_guide('structural')", "structural"],
     "parts":         ["part_search", "part_place", "cad_guide('parts')",
                       "parts_taxonomy", "part_source"],
-    "serving":       ["serving_status", "cad_guide('serving')", "serving"],
     "regen":         ["regen_diagnose", "cad_guide('regen')", "regen"],
     "code_compliance": ["code_check", "cad_guide('code_compliance')", "code_compliance"],
     "dag":           ["dag_plan", "dag_run", "cad_guide('dag')", "dag"],
@@ -397,7 +392,7 @@ def _build_coverage_corpus() -> str:
             "narration", "parts", "reverse", "deliverables",
             "requirements", "dag", "verify", "interaction", "sourcing",
             "cost", "spec", "piping", "industrial", "hydraulic", "firmware", "structural",
-            "regen", "code_compliance", "serving", "design_review", "doc_diff", "plm",
+            "regen", "code_compliance", "design_review", "doc_diff", "plm",
             "tolerance_stackup",
             "mechanical",
         ]
@@ -491,7 +486,6 @@ class TestMCPFreshness(unittest.TestCase):
             "code_check",                           # compliance
             "bom_rollup",                           # sourcing
             "cam_cost_estimate",                    # cost
-            "serving_status",                       # adapter serving
             "buildgraph_plan",                      # build-order DAG planner
             "stackup_analyze",                      # tolerance stack-up
         ]
@@ -516,7 +510,7 @@ class TestMCPFreshness(unittest.TestCase):
         required_in_fallback = [
             "requirements", "dag", "verify", "interaction", "sourcing",
             "cost", "spec", "piping", "industrial", "hydraulic", "firmware", "structural",
-            "regen", "code_compliance", "serving", "design_review", "doc_diff", "plm",
+            "regen", "code_compliance", "design_review", "doc_diff", "plm",
             "tolerance_stackup",
             "mechanical",
         ]
@@ -533,7 +527,7 @@ class TestMCPFreshness(unittest.TestCase):
             "cad", "gsl", "recon", "intake", "interaction", "ecad", "cam",
             "doc_diff", "req", "verify", "research", "deliverables",
             "sourcing", "cost", "spec", "piping", "industrial", "hydraulic", "firmware",
-            "structural", "parts", "serving", "regen", "code_compliance",
+            "structural", "parts", "regen", "code_compliance",
             "dag", "design_review", "ledger", "tolerance_stackup", "mechanical",
             "sim", "mission", "plm", "reveng",
         }

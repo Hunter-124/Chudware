@@ -19,13 +19,11 @@ Offline/local-only helpers require an offline-safe provider, without online
 fallback; other SDK adapters retain explicitly bound standalone/bench uses.
 
 ## Canonical guidance
-- `.claude/skills/cad-chudcode-integration/SKILL.md` — authority boundary, topology,
-  files by responsibility, session/tool/event/recovery rules. Read it before touching
-  sessions, providers, auth/models, memory, host tools, events or recovery.
-- `.claude/skills/chudware-dev/SKILL.md` — repo rules, worker lanes, prompt-override
-  isolation, persistence/save invariants.
-- `work/context/services-agent.md` (`/ctx-services-agent`) — the source map.
-- `work/WORKFLOW.md` — canonical task policy and context/tool freshness ownership.
+- `docs/dev/chudcode-integration.md` — authority boundary, topology, files by
+  responsibility, session/tool/event/recovery rules. Read it before touching sessions,
+  providers, auth/models, memory, host tools, events or recovery.
+- `docs/dev/engineering-notes.md` — repo rules, worker lanes, prompt-override isolation,
+  persistence/save invariants.
 
 ## Entry points
 - `pytest services/agent -q` (service venv) — the package suite.

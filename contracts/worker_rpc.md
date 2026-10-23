@@ -1857,36 +1857,6 @@ compares endpoints of distinct open edges (not whole-edge proximity), and
 body is one with an empty findings list for enabled checks; an incomplete
 source is never presented as a complete clean document.
 
-## Web actor credential isolation (2026-09-24)
-
-For a web-origin `agent_admin_turn`, gateway-injected `_chudware_actor` carries
-`email`, `plan`, `credits_remaining`, and `key_source=byok|subscription|pool`.
-The gateway strips client secret/actor fields. `byok` supplies the user's key
-as `api_key` and actor `_byok_key_sha256`; `subscription` supplies actor
-`_subscription:{provider,access_token}` and `_subscription_token_sha256`;
-`pool` supplies actor `_pool:{provider,api_key}` and `_pool_key_sha256`.
-Each proof is lowercase SHA-256 hex over the exact UTF-8 credential bytes.
-Provider and model are explicit on every web turn. Pool provider is gateway
-configured (`CHUDWARE_WEB_POOL_PROVIDER`, default `openrouter`) and optional
-`CHUDWARE_WEB_POOL_MODEL` overrides the web model before credit reservation;
-`CHUDWARE_WEB_POOL_API_KEY` is gateway-only, never loaded from hostd ambient auth.
-
-The worker checks the digest, source, provider, and credential before calling
-Chudcode, then passes `web_actor`, `web_key_source`, `web_provider`,
-`web_tenant`, and `web_credential` to the host. The host creates a scoped
-mode-0700 session directory and a temporary mode-0700 HOME, XDG and
-`CHUDCODE_CODING_AGENT_DIR` for that credential; it blanks inherited environment
-variables and injects only the selected provider key/token. Credential identity
-includes source, tenant, provider, and credential fingerprint; a live session
-cannot change identity, and a resumed file cannot cross scope. Anthropic OAuth
-uses `ANTHROPIC_OAUTH_TOKEN`; Chudcode 0.3.0 has no isolated Codex bearer
-injection, so Codex subscription turns refuse `subscription_isolation_unsupported`.
-Missing pool key refuses `pool_credential_unconfigured` with a user-facing hint
-before reservation, missing/mismatched proofs refuse by source, and missing or
-unknown web source refuses `web_credential_source_invalid`. No web turn falls
-back to ambient auth. A desktop turn without `_chudware_actor` retains normal
-Chudcode ambient auth.
-
 ## Drawing Auto Balloon projection cost addendum (2026-09-24)
 
 Supersedes the component-field claim in Drawing Auto Balloon above: ordinary
@@ -2348,12 +2318,11 @@ do not establish viewer safety.
 
 Always refused tenant surfaces include `agent_spawn/agent_stop/agent_list`,
 `daemon_*`, `recovery_*`, `mfg_*`, firmware/device/serial operations,
-CLI providers (`claude_cli`/`codex_cli`), provider pool/subscription management,
+CLI providers (`claude_cli`/`codex_cli`), provider credential management,
 Box mirroring, `worker_control_info`, and test-only stall RPCs. CLI providers and
-pool/subscription credential selection embedded within another RPC's parameters
-must also refuse; method admission alone cannot authorize such credential modes.
-Cell AI uses actor-isolated BYOK credentials and returns
-`credential_isolation_unsupported` for unsupported credential scopes.
+credential selection embedded within another RPC's parameters must also refuse;
+method admission alone cannot authorize such credential modes. Cells currently
+have no AI credential route: AI turns refuse with `credential_isolation_unsupported`.
 Phone/LAN capture bridges are also refused: every `capture_*` method, plus
 `start_capture_session` and `stop_capture_session`. Offline reconstruction of
 workspace files remains available through the non-capture reverse-engineering RPCs.

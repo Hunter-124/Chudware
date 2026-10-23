@@ -242,8 +242,8 @@ def generate(args: argparse.Namespace) -> list[Path]:
         "subject": [{"name": args.artifact.name, "digest": {"sha256": args.artifact_sha256}}],
         "predicateType": "https://slsa.dev/provenance/v1",
         "predicate": {
-            "buildDefinition": {"buildType": "https://chudware.com/build/platform/v1", "externalParameters": {"version": args.version, "platform": args.platform, "arch": args.arch, "commit": args.commit}, "resolvedDependencies": [{"uri": component["name"], "digest": {"sha256": component["hashes"][0]["content"]}} for component in components]},
-            "runDetails": {"builder": {"id": "https://chudware.com/builders/platform-v1"}, "metadata": {"invocationId": f"{args.commit}:{args.platform}:{args.arch}"}},
+            "buildDefinition": {"buildType": "https://github.com/Hunter-124/Chudware/packaging/platform-build/v1", "externalParameters": {"version": args.version, "platform": args.platform, "arch": args.arch, "commit": args.commit}, "resolvedDependencies": [{"uri": component["name"], "digest": {"sha256": component["hashes"][0]["content"]}} for component in components]},
+            "runDetails": {"builder": {"id": "https://github.com/Hunter-124/Chudware/.github/workflows/release.yml"}, "metadata": {"invocationId": f"{args.commit}:{args.platform}:{args.arch}"}},
         },
     }
     if native_byproduct is not None:

@@ -1,4 +1,4 @@
-"""Frozen-dataset hashing is deterministic and OS-independent (reproducibility DoD)."""
+"""Frozen-dataset hashing is deterministic and OS-independent (reproducibility)."""
 import os
 
 from tools.flywheel.bench.dataset import DatasetSpec, content_hash
@@ -41,7 +41,7 @@ def test_freeze_verify_roundtrip(tmp_path):
 
 
 def test_hash_is_eol_invariant_for_text(tmp_path):
-    # The cross-OS DoD: a CRLF checkout (Windows autocrlf) must hash identically to LF.
+    # Cross-OS reproducibility: a CRLF checkout (Windows autocrlf) must hash identically to LF.
     root = _mk(tmp_path, {"document.json": '{"a": 1}\n{"b": 2}\n'})
     h_lf = content_hash(root)
     (tmp_path / "document.json").write_bytes(b'{"a": 1}\r\n{"b": 2}\r\n')

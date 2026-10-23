@@ -92,7 +92,7 @@ provisioning key is in `missing`, and all five banners are emitted.
 Not reported by `reveng_status()`; VLM/provider availability belongs to the
 agent provider layer.
 
-## License notes (summary — see `contracts/license_debt.md` rows 10–16 and 19)
+## License notes (summary — see `contracts/license_debt.md` items 10, 12, 13 and 19)
 
 | Backend | License (descriptor) | Policy in code |
 |---------|----------------------|----------------|
@@ -103,7 +103,7 @@ agent provider layer.
 | TRELLIS | MIT | as TripoSR |
 | VGGT | **UNVERIFIED** (possible CC-BY-NC) | discovery-only (`VGGT_WEIGHTS`) until the license is confirmed |
 | docling | MIT | Python dependency |
-| CAD-Recode v1.5 | **CC-BY-NC-4.0** | `strategy="ml"` rebuild backend (`services/vision/cad_recode.py`) authorized by license_debt row 19 with licensing deferred; weights are download-on-demand / user-provisioned, never bundled |
+| CAD-Recode v1.5 | **CC-BY-NC-4.0** | `strategy="ml"` rebuild backend (`services/vision/cad_recode.py`); open compliance item 19 in `contracts/license_debt.md`; weights are download-on-demand / user-provisioned, never bundled |
 
 These are descriptor and ledger summaries, not a new licensing determination.
 `contracts/licenses.md` and `contracts/license_debt.md` remain the authorities;

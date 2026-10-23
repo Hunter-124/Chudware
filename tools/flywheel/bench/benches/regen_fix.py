@@ -1,7 +1,7 @@
 """regen-fix bench (IP-18): can a strategy repair a corrupted doc so it rebuilds, without
 drifting design intent?
 
-Score per example (survey §6): fixed == rebuild passes AND unaffected bodies compare ≈100%
+Score per example: fixed == rebuild passes AND unaffected bodies compare ≈100%
 AND no intent-dimension drift. Corpus + ground truth come from
 `tools.flywheel.bench.corpus.regen_corpus`.
 
@@ -11,7 +11,7 @@ Two evaluation paths (see verify_fix):
   * live mode (core present, auto-detected): the AUTHORITATIVE binary verifier — the fix is
     rebuilt through the engine and compared (compare_parts / eval_compare) against the
     known-good part; pass iff it rebuilds AND matches ≈100%. A fix that rebuilds but altered
-    geometry scores 0 (T-H11 driver note; zero tolerance for silent intent changes). A live
+    geometry scores 0 (zero tolerance for silent intent changes). A live
     verification that cannot run (core fault, reference not rebuilding, degraded compare) is
     an ERROR row scored as not-fixed — never a structural pass — and marks the run
     ``degraded`` (not promotion evidence). Fixture mode is only used when no live verifier
@@ -25,8 +25,8 @@ available, is scored through the SAME verifier and recorded as the ``frontier`` 
 
 The deterministic baseline can repair `suppressed_parent`, `param_out_of_range`, and
 `circular_equation`; it deliberately cannot repair `dangling_ref` or `bad_selector` — those
-two are the measured RECOGNITION_RESIDUAL a trained model must beat before IP-18 training
-is greenlit.
+two are the measured residual a model-backed strategy must beat to justify itself over the
+deterministic path.
 """
 from __future__ import annotations
 
@@ -186,7 +186,7 @@ def _intent_preserved(document: dict, intent_dims: dict) -> bool:
 
 
 # ---- live-core binary verifier (guarded) ------------------------------------
-# The AUTHORITATIVE verifier (T-H11 driver note): apply candidate fix -> rebuild passes AND
+# The AUTHORITATIVE verifier: apply candidate fix -> rebuild passes AND
 # compare_parts ≈100% vs the known-good part on unaffected bodies. A fix that rebuilds but
 # altered geometry scores 0. Load via doc_new + canonical doc ops, remapping authored feature ids
 # to the engine's newly minted ids; failure surfaces as a raised CoreError (schema) OR
@@ -242,7 +242,7 @@ def _document_ops(tree: dict) -> list[dict]:
 def _make_live_verifier():
     """Return (opener, compare_fn) bound to the C++ core, or (None, None) when it can't be
     located/loaded — never a hardcoded path (resolution is core_bridge's, via
-    $CHUDWARE_LIBCHUDWARE / $CHUDWARE_DIST / build dirs). Mirrors spec_sketch._make_doc_id_opener.
+    $CHUDWARE_LIBCHUDWARE / $CHUDWARE_DIST / build dirs).
 
         opener(document) -> {"doc_id": str|None, "rebuilt": bool, "error": str|None}
         compare_fn(a, b) -> match_pct float|None   (100 == identical; None == degraded)
@@ -507,12 +507,12 @@ def run(corpus_dir: str, dataset_hash: str, *, split: str = "all", limit: Option
 def make_frontier_baseline(provider, *, available: bool = True, on_event=None,
                            consent_fn=None, run_id=None, name: str = "frontier") -> Baseline:
     """Build the IP-18 frontier Baseline from a Provider, wrapping
-    ``services.agent.regen_diagnosis.diagnose`` (which itself routes the call through T-H7's
+    ``services.agent.regen_diagnosis.diagnose`` (which itself routes the call through the
     LoggingProvider at IP-18, so every scored example is also a logged correction trace).
 
     ``available`` MUST reflect whether a REAL frontier provider (credentials + network) backs
     this — pass ``False`` for a mock/offline provider so ``run`` records the frontier row as
-    *pending* and never a fabricated score (baseline.py contract; the T-F13 honesty posture).
+    *pending* and never a fabricated score (baseline.py contract).
     """
     from services.agent.regen_diagnosis import diagnose
 

@@ -196,7 +196,7 @@ DesktopFsBackend& desktopInstance() {
 #endif  // !__EMSCRIPTEN__
 
 // ============================================================================
-// Web backend — gateway /workspace/* (see Webservice/gateway/workspace.py).
+// Web backend — gateway /workspace/* (see web/gateway/workspace.py).
 // ============================================================================
 #ifdef __EMSCRIPTEN__
 

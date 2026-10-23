@@ -1,7 +1,0 @@
-<svg viewBox="0 0 360 320" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif,system-ui" style="background:#fff">
-<line x1="26" y1="294.0" x2="334" y2="294.0" stroke="#e5e7eb" stroke-width="1"/>
-<line x1="26.0" y1="26" x2="26.0" y2="294" stroke="#e5e7eb" stroke-width="1"/>
-<circle cx="26.0" cy="294.0" r="2.5" fill="#9ca3af"/>
-<circle cx="26.00" cy="294.00" r="2.6" fill="#2563eb"/>
-<circle cx="334.00" cy="294.00" r="2.6" fill="#2563eb"/>
-</svg>

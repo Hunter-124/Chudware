@@ -13,7 +13,7 @@ if __name__ == "__main__":
         if len(sys.argv) < 3 or sys.argv[1] != "--" or not sys.argv[2].startswith("/"):
             raise ValueError("absolute actor argv required")
         close_extra_fds()
-        listeners = start()  # both lanes bind before any child; no unproxied fallback
+        listeners = start()  # the egress lane binds before any child; no unproxied fallback
         child = subprocess.Popen(sys.argv[2:], close_fds=True)
         def stop(signum, frame):
             if child.poll() is None:

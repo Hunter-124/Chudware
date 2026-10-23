@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 
 from services.agent import request_context as rc
-from services.agent.online_turn import activate_turn_env
 
 
 def principal(actor="alice", workspace="team:org/team", right="editor"):
@@ -68,8 +67,7 @@ def test_turn_roots_are_thread_local_without_global_mutation(tmp_path, monkeypat
     original_cwd = os.getcwd()
     def turn(name):
         path = str(tmp_path / name)
-        with activate_turn_env(path, path, SimpleNamespace(clear_pooled_credentials=lambda: None)) as errors:
-            assert not errors
+        with rc.bind_roots(path, path):
             assert rc.root_value("CHUDWARE_PROJECT_DIR") == path
             assert os.environ["CHUDWARE_PROJECT_DIR"] == "ambient-root"
             assert os.getcwd() == original_cwd
@@ -107,9 +105,7 @@ def test_worker_mint_and_control_hide_other_actor(tmp_path, monkeypatch):
     with rc.bind_context(principal()):
         handles = worker_rpc._agent_handles_new({}, lambda event: None)
         assert handles["ok"]
-        credentials = {"_chudware_actor": {"key_source": "byok"}}
-        assert worker_rpc.chudcode_control(
-            "cancel", {"run_id": handles["run_id"], **credentials})["ok"]
+        assert worker_rpc.chudcode_control("cancel", {"run_id": handles["run_id"]})["ok"]
     with rc.bind_context(principal("bob")):
         missing = worker_rpc.chudcode_control("cancel", {"run_id": "absent"})
         assert worker_rpc.chudcode_control("cancel", {"run_id": handles["run_id"]}) == missing
@@ -129,19 +125,13 @@ def test_history_seed_scope_does_not_collide(tmp_path, monkeypatch):
         worker_rpc._HISTORY_SEEDED_SESSIONS.clear()
 
 
-@pytest.mark.parametrize("source", ["pool", "subscription", "byok"])
-def test_cell_config_refuses_python_provider_before_ambient_loading(source, monkeypatch):
+def test_cell_config_refuses_python_provider_before_ambient_loading(monkeypatch):
     from services.agent import config
-    actor = config.Actor.from_mapping({"email": "fixture@example.test", "plan": "pro",
-                                      "credits_remaining": 10, "key_source": source})
     monkeypatch.setattr(config, "load_config", lambda: pytest.fail("loaded ambient provider config"))
     monkeypatch.setattr(config, "_resolve_provider", lambda *args, **kwargs: pytest.fail("constructed vendor SDK"))
     with rc.bind_context(principal()):
-        with pytest.raises(ValueError, match="provider_broker_route_required"):
-            config.get_provider("openai", actor=actor)
-        if source == "byok":
-            with pytest.raises(ValueError, match="provider_broker_route_required"):
-                config._byok_provider_config("openai", {"api_key": "forbidden-key"}, actor)
+        with pytest.raises(ValueError, match="credential_isolation_unsupported"):
+            config.get_provider("openai")
 
 
 def test_sandbox_argv_has_fixed_launcher_and_mode():
@@ -245,11 +235,11 @@ def test_vendor_source_paths_are_confined_before_dispatch(method, key, monkeypat
     assert calls == [{key: "/work/parts/fixture.step"}]
 
 
-def test_gateway_controls_authorize_actor_without_provider_key_or_grant():
+def test_cell_controls_authorize_actor_without_provider_key():
     from services.agent import worker_rpc
     with rc.bind_context(principal()):
         assert worker_rpc._control_credentials({}) == {}
-        for key in ("api_key", "web_credential", "byok_key"):
+        for key in ("api_key", "byok_key"):
             with pytest.raises(ValueError, match="credential_isolation_unsupported"):
                 worker_rpc._control_credentials({key: "upstream-key"})
 
@@ -340,7 +330,7 @@ def test_cell_refusal_adapter_preserves_only_failed_typed_responses():
         assert worker_rpc._cell_refusal({"ok": True, "reason": "not_found"}) is None
         assert worker_rpc._cell_refusal(ValueError("ordinary provider failure")) is None
         for code in ("not_found", "cell_refused", "forbidden_right", "revoked",
-                     "credential_isolation_unsupported", "byok_credential_mismatch"):
+                     "credential_isolation_unsupported"):
             refusal = {"ok": False, "reason": code, "code": code}
             assert worker_rpc._cell_refusal(refusal) == refusal
             assert worker_rpc._cell_refusal(

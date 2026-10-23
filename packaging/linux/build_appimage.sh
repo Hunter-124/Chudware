@@ -26,6 +26,11 @@
 #   --finalize-signing SIG  verify/embed detached signature and archive the retained AppDir
 #   --release-public-key KEY  PEM path or canonical base64 Ed25519 release public key
 #   --keep-appdir       retain AppDir after final archive creation
+#
+# Env: CHUDWARE_RELEASE_PYTHON (required) is the absolute interpreter of the release
+# compiler venv (requirements.txt + packaging/requirements-release.txt). When
+# CHUDWARE_WHEELHOUSE names a reviewed offline wheelhouse, CHUDWARE_BASE_PYTHON must
+# name the separate base interpreter that authenticates that venv first.
 set -euo pipefail
 # Clear startup/loader overrides before the first child process, including the
 # independently trusted base used to inspect the compiler runtime offline.
@@ -83,12 +88,16 @@ else
         echo "error: --release-public-key is required with --finalize-signing" >&2; exit 2;
     }
 fi
-case "$TRUSTED_BASE" in /*) ;; *) echo "error: CHUDWARE_BASE_PYTHON must identify a separately authenticated absolute base Python" >&2; exit 1 ;; esac
-case "$RELEASE_PYTHON" in /*) ;; *) echo "error: CHUDWARE_RELEASE_PYTHON must identify the managed compiler runtime" >&2; exit 1 ;; esac
-COMPILER_VENV="$(dirname "$(dirname "$RELEASE_PYTHON")")"
-"$TRUSTED_BASE" -I -S -c 'import sys;sys.path.insert(0,sys.argv[1]);from services.installer.provision import main;sys.exit(main(sys.argv[2:]))' \
-    "$REPO" --check-inputs --base-python "$TRUSTED_BASE" --venv-dir "$COMPILER_VENV" \
-    --wheelhouse "${CHUDWARE_WHEELHOUSE:-$REPO/wheelhouse}"
+case "$RELEASE_PYTHON" in /*) ;; *) echo "error: CHUDWARE_RELEASE_PYTHON must identify the release compiler runtime (absolute path)" >&2; exit 1 ;; esac
+# With a reviewed offline wheelhouse, authenticate the compiler runtime against
+# vendor/python/RUNTIME_WHEELS.lock from a separate base interpreter first.
+if [ -n "${CHUDWARE_WHEELHOUSE:-}" ]; then
+    case "$TRUSTED_BASE" in /*) ;; *) echo "error: CHUDWARE_BASE_PYTHON must identify a separately authenticated absolute base Python" >&2; exit 1 ;; esac
+    COMPILER_VENV="$(dirname "$(dirname "$RELEASE_PYTHON")")"
+    "$TRUSTED_BASE" -I -S -c 'import sys;sys.path.insert(0,sys.argv[1]);from services.installer.provision import main;sys.exit(main(sys.argv[2:]))' \
+        "$REPO" --check-inputs --base-python "$TRUSTED_BASE" --venv-dir "$COMPILER_VENV" \
+        --wheelhouse "$CHUDWARE_WHEELHOUSE"
+fi
 
 release_python() {
     "$RELEASE_PYTHON" -I -c 'import sys;sys.path.insert(0,sys.argv[1]);from services.installer.provision import run_python_entry;run_python_entry(sys.argv[1],sys.argv[2],sys.argv[3:])' \
@@ -580,14 +589,18 @@ build_python_sidecar mcp.server "$APPDIR/usr/bin/chudware-mcp"
 stage_chudcode "$APPDIR/usr/bin/chud"
 
 
-cp "$REPO/LICENSE-EULA.txt" "$APPDIR/usr/bin/LICENSE-EULA.txt"
+cp "$REPO/LICENSE" "$APPDIR/LICENSE"
+cp "$REPO/THIRD_PARTY_NOTICES.md" "$APPDIR/THIRD_PARTY_NOTICES.md"
 cat > "$APPDIR/README" <<'EOF'
 Chudware AppImage
 =================
 
-Launching this AppImage is subject to the Chudware End User License Agreement bundled at
-usr/bin/LICENSE-EULA.txt. Release payload ownership and integrity are recorded by the top-level
-payload-manifest.v1.json and payload-manifest.v1.sig files.
+Chudware is free software released under the MIT License (see LICENSE); bundled
+third-party components are listed in THIRD_PARTY_NOTICES.md and, for the Chudcode
+agent runtime, usr/bin/CHUDCODE-NOTICE. Release payload ownership and integrity are
+recorded by the top-level payload-manifest.v1.json and payload-manifest.v1.sig files.
+
+Source code: https://github.com/Hunter-124/Chudware
 EOF
 
 echo "==> writing AppRun + desktop entry + icon"
@@ -674,10 +687,8 @@ echo "==> staged ELF dependency check: ${#ldd_targets[@]} files, zero unresolved
 
 SIGN_IDENTITY="${CHUDWARE_SIGN_IDENTITY:-}"
 NOTARIZE_PROFILE="${CHUDWARE_NOTARIZE_PROFILE:-}"
-if [ -z "$SIGN_IDENTITY" ]; then
-    echo "WARNING: unsigned build — SmartScreen/Gatekeeper will warn users" >&2
-else
-    echo "==> CHUDWARE_SIGN_IDENTITY is set; Linux platform signing is supplied by packaging/publish.py's Ed25519 release signature"
+if [ -n "$SIGN_IDENTITY" ]; then
+    echo "==> CHUDWARE_SIGN_IDENTITY is ignored on Linux; the AppImage is authenticated by its Ed25519 release signature"
 fi
 [ -z "$NOTARIZE_PROFILE" ] || echo "==> CHUDWARE_NOTARIZE_PROFILE is macOS-only and is not used for this AppImage"
 
@@ -686,8 +697,8 @@ if ! ARCH=x86_64 VERSION="$VERSION" "$APPIMAGETOOL" "$APPDIR" "$OUTFILE" 2>"$OUT
     echo "==> direct run failed, retrying with --appimage-extract-and-run (no-FUSE environments)"
     # The first attempt gets as far as writing the AppImage (mksquashfs reaches 100%)
     # before its FUSE mount fails, and mksquashfs will not write over that leftover:
-    # the retry died with "mksquashfs exited with code 1 / sfs_mksquashfs error", which
-    # is how the nightly Linux beta failed on 2026-09-04. Start the retry from nothing.
+    # the retry died with "mksquashfs exited with code 1 / sfs_mksquashfs error".
+    # Start the retry from nothing.
     rm -f "$OUTFILE"
     ARCH=x86_64 VERSION="$VERSION" "$APPIMAGETOOL" --appimage-extract-and-run "$APPDIR" "$OUTFILE"
 fi

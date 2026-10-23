@@ -1,7 +1,7 @@
 """Consumer-visible offline provisioning checks, using only inert fixture wheels.
 
 The pip smoke creates a temporary venv, serves a synthetic public candidate on
-loopback, and never invokes a build backend or installs the real private SDK.
+loopback, and never invokes a build backend or installs the real chudcode-rpc SDK.
 Run in a disposable network-disabled environment; loopback must remain available.
 """
 from __future__ import annotations
@@ -22,8 +22,8 @@ import pytest
 
 from services.installer import provision
 from services.installer.wheelhouse import (
-    WheelhouseError, _packaging, install_command, pip_environment, target_key,
-    verified_wheelhouse,
+    CHUDCODE_REPOSITORY, WheelhouseError, _packaging, install_command, pip_environment,
+    target_key, verified_wheelhouse,
 )
 
 
@@ -56,13 +56,13 @@ def fixture_wheel(directory, name="chudcode-rpc", version="0.3.1", dependencies=
 def reviewed(tmp_path):
     requirements = tmp_path / "requirements.txt"
     requirements.write_text("--no-index\n--only-binary=:all:\nchudcode-rpc==0.3.1\n")
-    source = {"repository": "https://github.com/Hunter-124/chudcode.git", "repository_commit": "1" * 40}
+    source = {"repository": CHUDCODE_REPOSITORY, "repository_commit": "1" * 40}
     native = tmp_path / "CHUDCODE_ARTIFACT.lock"
     native.write_text(json.dumps(source))
     wheelhouse = tmp_path / "wheelhouse"
     vendored = {"chudcode_rpc/_vendor/inert_child.dist-info/INSTALLER": "reviewed vendored metadata\n"}
-    private = fixture_wheel(wheelhouse, dependencies=("inert-dependency==1.0",),
-                            extra_files=vendored)
+    sdk = fixture_wheel(wheelhouse, dependencies=("inert-dependency==1.0",),
+                        extra_files=vendored)
     dependency = fixture_wheel(wheelhouse, "inert-dependency", "1.0")
     markers, _, _, _, _, _ = _packaging()
     environment = markers.default_environment()
@@ -70,7 +70,7 @@ def reviewed(tmp_path):
     document = {"schema": "chudware-runtime-wheels-v1",
                 "requirements_sha256": hashlib.sha256(requirements.read_bytes()).hexdigest(),
                 "chudcode_source": source,
-                "targets": {target_key(environment): {"wheels": [private, dependency]}}}
+                "targets": {target_key(environment): {"wheels": [sdk, dependency]}}}
     lock.write_text(json.dumps(document))
     return {"wheelhouse": wheelhouse, "requirements": requirements, "lock_path": lock,
             "chudcode_lock": native, "document": document, "environment": environment}
@@ -83,6 +83,31 @@ def verify(inputs):
 
 def rewrite_lock(inputs):
     inputs["lock_path"].write_text(json.dumps(inputs["document"]))
+
+
+def _declare(inputs, text):
+    inputs["requirements"].write_text(text)
+    inputs["document"]["requirements_sha256"] = hashlib.sha256(inputs["requirements"].read_bytes()).hexdigest()
+    rewrite_lock(inputs)
+
+
+def test_sdk_direct_reference_to_the_reviewed_commit_is_satisfied_by_the_reviewed_wheel(reviewed):
+    _declare(reviewed, f"chudcode-rpc @ git+{CHUDCODE_REPOSITORY}@{'1' * 40}"
+                       "#subdirectory=python/chudcode-rpc  # developer source build\n")
+    with verify(reviewed) as identity:
+        assert identity["packages"]["chudcode-rpc"] == "0.3.1"
+
+
+@pytest.mark.parametrize("declaration", [
+    f"chudcode-rpc @ git+{CHUDCODE_REPOSITORY}@{'2' * 40}#subdirectory=python/chudcode-rpc\n",
+    "chudcode-rpc @ git+https://example.invalid/chudcode.git@" + "1" * 40 + "\n",
+    f"inert-dependency @ git+{CHUDCODE_REPOSITORY}@{'1' * 40}\n",
+])
+def test_other_direct_references_are_unreviewed(reviewed, declaration):
+    _declare(reviewed, declaration)
+    with pytest.raises(WheelhouseError, match="unreviewed direct URLs"):
+        with verify(reviewed):
+            pass
 
 
 def bind_provisioner(monkeypatch, inputs):
@@ -169,7 +194,7 @@ def test_synthetic_index_records_every_untagged_contact(tmp_path, method, path):
 
 
 @pytest.mark.parametrize("failure", ["absent", "tampered", "public-replacement"])
-def test_private_candidate_rejected_before_any_interpreter_or_install(reviewed, tmp_path, monkeypatch, failure):
+def test_sdk_candidate_rejected_before_any_interpreter_or_install(reviewed, tmp_path, monkeypatch, failure):
     bind_provisioner(monkeypatch, reviewed)
     wheel = reviewed["wheelhouse"] / reviewed["document"]["targets"][target_key(reviewed["environment"])]["wheels"][0]["filename"]
     if failure == "absent":
@@ -364,11 +389,11 @@ def test_real_pip_hash_gate_cannot_fall_back_to_synthetic_public_index(reviewed,
     python = venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
     with synthetic_public_index(tmp_path) as (index, requests, phase):
         with verify(reviewed) as identity:
-            private = identity["requirements"].parent / "chudcode_rpc-0.3.1-py3-none-any.whl"
+            snapshot = identity["requirements"].parent / "chudcode_rpc-0.3.1-py3-none-any.whl"
             if failure == "absent":
-                private.unlink()
+                snapshot.unlink()
             else:
-                with private.open("ab") as stream:
+                with snapshot.open("ab") as stream:
                     stream.write(b"changed after preflight")
             phase["name"] = "pip-hash-refusal"
             result = subprocess.run(install_command(python, identity["requirements"]) + ["--index-url", index],

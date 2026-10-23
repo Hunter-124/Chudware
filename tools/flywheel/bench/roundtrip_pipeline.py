@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Round-trip benchmark: Parts Library research → RevEng build → Parts Library store.
 
-WS1 category ``roundtrip``. Drives MCP seams with a fixture datasheet
+Benchmark category ``roundtrip``. Drives MCP seams with a fixture datasheet
 (``corpora/reveng/bearing_spec.pdf`` — ISO 6205 bearing). Honest degradation when
 backends (pdfplumber, dense mesh, engine) are unprovisioned: stages SKIP rather than
 crash, exit 0 with a report when no hard FAIL.
@@ -101,7 +101,7 @@ def _run_stage(name: str, fn: Callable[[Stage], None], stages: list[Stage]) -> S
 
 
 def _try_import_parts_search():
-    # parts_hub was re-homed to services/parts (T-RF19); engine_oracle is deleted.
+    # The parts hub lives in services/parts; prefer the module-level search, else the hub.
     try:
         from services.parts import search as hub_search  # type: ignore
         return hub_search

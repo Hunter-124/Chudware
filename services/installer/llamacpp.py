@@ -28,15 +28,15 @@ APP_LLAMA = paths.LLAMACPP
 SERVER_NAMES = ("llama-server.exe", "server.exe", "llama-server", "server")
 
 # ---------------------------------------------------------------------------
-# GPU / build-variant selection (T-W31)
+# GPU / build-variant selection
 #
 # The installed runtime at APP_LLAMA may carry per-variant build trees produced
 # from the pinned source checkout (tag b9860, commit fdb1db8):
 #
-#   APP_LLAMA/build-cuda/bin/llama-server   GGML_CUDA=ON  (sm_86; T-W29 bench +
-#                                           integrator smoke: gemma3-4b-qat
-#                                           -ngl 99 -np 8 -c 32768 -> ~4.8 GB
-#                                           VRAM, 482 tok/s aggregate vs 332 CPU)
+#   APP_LLAMA/build-cuda/bin/llama-server   GGML_CUDA=ON  (sm_86; measured with
+#                                           gemma3-4b-qat -ngl 99 -np 8 -c 32768
+#                                           -> ~4.8 GB VRAM, 482 tok/s aggregate
+#                                           vs 332 CPU)
 #   APP_LLAMA/build/bin/llama-server        GGML_CUDA=OFF (CPU-only)
 #   APP_LLAMA/llama-server[.exe]            flat legacy layout (variant unknown)
 #
@@ -191,12 +191,11 @@ def ensure_server_running(cfg: dict | None = None) -> dict:
     cfg keys: base_url, server_path, model_path, auto_start, port, host, ctx_size,
     gpu_layers, parallel, startup_timeout_sec.
 
-    Variant-aware defaults (T-W31): when the discovered binary is the CUDA build
-    and the caller did not set them, ``gpu_layers`` defaults to 99 (full offload)
-    and ``parallel``/``ctx_size`` default to 8/32768 — the exact configuration the
-    integrator smoke verified on the RTX 3080 Ti (health ok, ~4.8 GB VRAM, GBNF
-    valid, 482 tok/s aggregate; see benchmarks/tokenmaxx/REPORT.md + T-W31 notes).
-    Explicit cfg values always win (T-W28 user-override discipline).
+    Variant-aware defaults: when the discovered binary is the CUDA build and the
+    caller did not set them, ``gpu_layers`` defaults to 99 (full offload) and
+    ``parallel``/``ctx_size`` default to 8/32768 — the configuration verified on an
+    RTX 3080 Ti (health ok, ~4.8 GB VRAM, GBNF valid, 482 tok/s aggregate).
+    Explicit cfg values always win.
     """
     cfg = cfg or {}
     host = str(cfg.get("host") or "127.0.0.1")

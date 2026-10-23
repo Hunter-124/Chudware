@@ -2467,7 +2467,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         const float winTopY = ImGui::GetWindowPos().y;   // == dockspace top (central node fills it)
         // Full-bleed height runs to the WINDOW bottom (== status-bar top), not the content-region
         // bottom: the docked viewport's own WindowPadding.y inset cr1.y a few px above the window
-        // edge, leaving a thin strip of dead window background above the status bar (Hunter). The 3D
+        // edge, leaving a thin strip of dead window background above the status bar. The 3D
         // image, the FBO (renderer.resize) and the projection all key off vh, so extending it keeps
         // them consistent.
         const float winBotY = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
@@ -2781,7 +2781,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // body bbox doesn't include sketch entities, so an offset sketch would otherwise spin about
         // the origin). Off elsewhere — center_ (the model bbox centre) is already correct.
         {
-            // Drag dead zone (Hunter UX): the override tracks the sketch bbox centre, which MOVES
+            // Drag dead zone: the override tracks the sketch bbox centre, which MOVES
             // while an entity is being dragged — an unfrozen pivot re-translates the camera target
             // every frame, so the view "scrolls" under the drag. Freeze the pivot for the drag's
             // whole duration; on release, fold the pivot delta into pan so the handover to the new
@@ -4087,7 +4087,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             const bool ctrl = io.KeyCtrl, shift = io.KeyShift;
             // Deconflict: while a sketch entity/handle/group LMB drag is armed or live, ALL camera
             // input yields — no MMB orbit/pan/zoom and no wheel zoom. The sketch overlay's own
-            // edge auto-pan is the only thing allowed to move the view mid-drag (Hunter UX).
+            // edge auto-pan is the only thing allowed to move the view mid-drag.
             const bool skDrag = (inSketch && sketch != nullptr && sketch->entityDragActive()) ||
                                 (inSketch3d && sketch3d != nullptr && sketch3d->entityDragActive());
             if (!skDrag && ImGui::IsMouseDragging(ImGuiMouseButton_Middle) &&
@@ -4945,7 +4945,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
             float by0  = cr0.y + 6.0f * s;
             // Drop the toolbar below the doc-tab file strip that overlays the top of the viewport, so
-            // the file display never clips over these buttons (Hunter). docTabBandBottom() is the
+            // the file display never clips over these buttons. docTabBandBottom() is the
             // strip's live bottom edge in screen space (-1 when no strip this frame).
             {
                 const float dtb = ui::docTabBandBottom();
@@ -5675,7 +5675,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // T-G19: The far-right "Active Feature" dimension readout panel that used to be pinned
         // top-right (left of the Copilot column) was REMOVED. It mirrored the PM's dimension
         // fields (Depth, Draft angle, radii, …) for EVERY feature via dimCandidates(activeFid),
-        // producing the depth/draft double-display Erik reported (once in the PM, once behind the
+        // producing a depth/draft double-display (once in the PM, once behind the
         // Copilot tab). The PM form is the single source of truth for these values; the live
         // drag-time readout chip (above) still follows the cursor while a dim handle is dragged.
 

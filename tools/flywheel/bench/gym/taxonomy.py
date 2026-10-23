@@ -1,13 +1,13 @@
-"""Failure taxonomy classifier (T-W27).
+"""Failure taxonomy classifier.
 
 Classifies what went wrong on a design-gym challenge by REPLAYING the ledger events
 (schema ``{seq, ts, actor, kind, payload}`` — see services/agent/ledger.py) plus the
 gym's own acceptance-criteria grading and the validator/battery outputs the run
 recorded. Every classification carries EVIDENCE REFS (concrete event seq numbers + the
 kinds/fields that triggered it) so a reviewer can replay exactly why a class fired — no
-vibes, per the task's discipline rule.
+vibes.
 
-The eight classes (task spec):
+The eight classes:
 
   wrong_question      clarifier asked a useless question, or MISSED a critical one that
                       the manifest flagged blocking. Evidence: question events vs the
@@ -28,16 +28,15 @@ The eight classes (task spec):
   advisory_ignored    an advisory was injected and then contradicted by a later action
                       without a dispute/replan. Evidence: the advisory event + the
                       contradicting action.
-  execution_stall     (T-W32, foreman-sanctioned 2026-07-05) the run produced tool
-                      activity but NOT ONE tool call succeeded — the mission stalled
-                      before any geometry existed (pre-BUILD). Evidence: the errored
-                      tool-call event seqs. When this fires, incoherent_geometry is
-                      suppressed: with zero successful executions there is no geometry
-                      to be incoherent (the old behaviour classified these runs as
-                      incoherent_geometry with EMPTY evidence seqs — see
-                      cycle-1-real-r3).
+  execution_stall     the run produced tool activity but NOT ONE tool call succeeded —
+                      the mission stalled before any geometry existed (pre-BUILD).
+                      Evidence: the errored tool-call event seqs. When this fires,
+                      incoherent_geometry is suppressed: with zero successful
+                      executions there is no geometry to be incoherent (classifying
+                      these runs as incoherent_geometry would yield EMPTY evidence
+                      seqs).
 
-Tool-call reading (T-W32): real agent turns record tool calls as ``agent_turn``
+Tool-call reading: real agent turns record tool calls as ``agent_turn``
 events with ``payload.event == "tool_call"`` (services/agent/agent_turn._log), while
 scripted gym turns use ``kind == "tool_call"`` directly. The classifier normalises
 BOTH shapes (``_tool_call_events``) so real-run evidence is visible to the detectors.
@@ -115,7 +114,7 @@ def _ev_ref(e: dict, why: str) -> dict:
 
 
 def _tool_call_events(events: Iterable[dict]) -> list[tuple[dict, dict]]:
-    """Every tool call in the ledger as ``(event, call_payload)`` pairs (T-W32).
+    """Every tool call in the ledger as ``(event, call_payload)`` pairs.
 
     Normalises the two shapes tool calls land in:
       * scripted gym turns:   ``kind == "tool_call"``, payload IS the call;
@@ -256,7 +255,7 @@ def _known_ids(events: list[dict], manifest: dict | None = None) -> set[str]:
     ACROSS THE WHOLE LEDGER (unordered — see _detect_context_loss for the ordered,
     per-event view an id-cited-before-it-was-minted check needs).
 
-    T-W32: REAL cells don't replay the manifest as an artifact event (the mission
+    REAL cells don't replay the manifest as an artifact event (the mission
     pipeline records the manifest artifact without its deliverables payload), so
     ids the MANIFEST declares (DL/AC) are also known when the caller passes it —
     otherwise every real run citing its own deliverable id was a context_loss
@@ -323,7 +322,7 @@ def _amb_keyword(text: str) -> str:
 
 
 def _detect_execution_stall(events: list[dict], graded: dict) -> list[Classification]:
-    """Fire when executable tool attempts were made but none succeeded (T-W32)."""
+    """Fire when executable tool attempts were made but none succeeded."""
     if graded.get("passed"):
         return []
     if any(_terminal_infrastructure_status(e.get("payload") or {})
@@ -395,7 +394,7 @@ def _detect_tool_misuse(events: list[dict], manifest: dict | None) -> list[Class
             continue
         # (a) preflight rejected the call / the tool ran and errored.  A pure
         # RESOLUTION failure ("could not be resolved") is a dispatch-coverage gap
-        # (harness), not model misuse — it feeds execution_stall instead (T-W32).
+        # (harness), not model misuse — it feeds execution_stall instead.
         err = str(p.get("error") or "")
         if p.get("preflight") == "reject" or (err and "could not be resolved" not in err):
             out.append(Classification(
@@ -445,7 +444,7 @@ _CHECK_TOOLS = frozenset({
 def _detect_context_loss(events: list[dict],
                          manifest: dict | None = None) -> list[Classification]:
     out: list[Classification] = []
-    # Manifest ids are known from the start of the run (T-W32: real cells don't
+    # Manifest ids are known from the start of the run (real cells don't
     # replay a manifest artifact event). Ledger-MINTED ids are ORDERED: an id only
     # counts as known for events AFTER the event that minted it — citing an id
     # before it exists in the ledger IS the failure this detector exists to catch,
@@ -518,7 +517,7 @@ def _grind_target(p: dict) -> str:
 def _detect_grind(events: list[dict], grind_threshold: int = 3) -> list[Classification]:
     out: list[Classification] = []
     # Group tool_call / decision events by (target, action fingerprint).
-    # T-W32: tool calls are read through the normaliser so real agent-turn calls
+    # Tool calls are read through the normaliser so real agent-turn calls
     # (kind=agent_turn, payload.event=tool_call) count toward grind too.
     seen: dict[tuple, list[dict]] = {}
     pairs = [
@@ -688,10 +687,10 @@ def classify_ledger(ledger: dict[str, Any], *, manifest: dict | None = None,
     results: list[Classification] = []
     results += _detect_harness_outcomes(events, graded)
     results += _detect_wrong_question(events, manifest, graded)
-    # T-W32 (foreman-sanctioned): a pre-BUILD stall (no successful execution at
-    # all) is execution_stall, and SUPPRESSES incoherent_geometry — with nothing
-    # ever executed there is no geometry to be incoherent, and the old routing
-    # produced incoherent_geometry with empty evidence seqs.
+    # A pre-BUILD stall (no successful execution at all) is execution_stall, and
+    # SUPPRESSES incoherent_geometry — with nothing ever executed there is no
+    # geometry to be incoherent, and incoherent_geometry would carry empty
+    # evidence seqs.
     stall = _detect_execution_stall(events, graded)
     results += stall
     if not stall:

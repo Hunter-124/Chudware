@@ -37,8 +37,8 @@ Every preset configures the repository root (which adds `core/` as a subdirector
 |------|------------------|
 | `build/<preset>/bin/` | engine artifacts: `libchudware.dll`, `chudware-hostd.exe`, `polymesh.exe`, test executables |
 | `build/<preset>/core/` | the core's registered CTest suite — run `ctest` here, not on `build/<preset>` |
-| `host\build-windows` | host GUI tree used by `native-build.yml` and `release.yml` |
-| `host\build-win` | host GUI tree used by `scripts/build_windows.ps1`, `nightly-release.yml` and `services/installer/build_release.py` (packaging reads `host\build-win\bin\chudware.exe`) |
+| `host\build-windows` | host GUI tree used by `native-build.yml` |
+| `host\build-win` | host GUI tree used by `scripts/build_windows.ps1`, `release.yml` and `services/installer/build_release.py` (packaging reads `host\build-win\bin\chudware.exe`) |
 
 `libchudware.dll` and `chudware-hostd.exe` are only built when OCCT is on
 (`CHUDWARE_WITH_OCCT`), so `windows-core` is a fast core/test build, not a runnable engine
@@ -108,10 +108,11 @@ are preserved. The generated miniz export and embedded firmware-source headers
 are content-stable across unchanged configuration, so reconfiguring does not
 invalidate their consumers or force an otherwise unnecessary engine relink.
 
-Developer staging requires the complete engine/host binaries and reviewed runtime inputs,
-including `vendor/python/RUNTIME_WHEELS.lock`; it refuses missing prerequisites before
-changing `dist`. `robocopy` statuses 0–7 are successful; failure statuses are fatal.
-Staging success is not publisher approval or qualification of the installed release.
+Developer staging (`scripts/stage_windows.ps1`) requires the complete engine/host
+binaries and refuses missing prerequisites before changing `dist`. It copies the optional
+runtime wheel lock and offline wheelhouse only when they are present (see §5).
+`robocopy` statuses 0–7 are successful; failure statuses are fatal. Staging success is not
+qualification of an installed release.
 
 - **`/FI fix_math.h` quoting (fatal C1083).** Under the **Ninja + MSVC** generator a quoted
   force-include path leaks literal quote chars into the filename. `host/CMakeLists.txt` passes
@@ -139,107 +140,46 @@ Staging success is not publisher approval or qualification of the installed rele
 
 ## 5. Python runtime + tests
 
-Development provisioning uses **Python 3.11** and a complete reviewed offline
-wheelhouse, not `pip install -r requirements.txt`. Direct pip use of the root
-declarations is index-disabled as a defense against private-package fallback.
+Development uses a plain virtual environment installed from `requirements.txt`:
 
 ```powershell
-$base = (& py -3.11 -c "import sys;print(sys.executable)")
-$entry = "import sys;sys.path.insert(0,sys.argv[1]);from services.installer.provision import main;sys.exit(main(sys.argv[2:]))"
-& $base -I -S -c $entry (Get-Location).Path --base-python $base --venv-dir .venv `
-    --wheelhouse C:\reviewed-inputs\wheelhouse
-& $base -I -S -c $entry (Get-Location).Path --check-ready `
-    --venv-dir .venv --wheelhouse C:\reviewed-inputs\wheelhouse
-# Test-only tools must be additional reviewed target wheels, not post-install mutations.
-.\.venv\Scripts\python -X utf8 -m pytest services/agent -q --timeout=90
+py -3.13 -m venv .venv-mcp
+.venv-mcp\Scripts\python -m pip install -r requirements.txt
+$env:CHUDWARE_PYTHON = "$PWD\.venv-mcp\Scripts\python.exe"
+.venv-mcp\Scripts\python -X utf8 -m pytest services/agent -q --timeout=90
 ```
 
-On POSIX the same flow is `CHUDWARE_WHEELHOUSE=/reviewed/wheelhouse
-VENV_DIR=.venv-mcp PYTHON=python3.11 scripts/provision_venv.sh`. No private
-checkout is installed editable, no wheel is built during provisioning, and pip
-receives only verified local file URIs with `--no-index --no-deps
---require-hashes --only-binary=:all:`. Unlisted wheelhouse candidates are ignored.
-Optional browser binaries and simulation tools retain their explicit provisioning
-commands; dependency setup never silently downloads/builds them.
+`CHUDWARE_PYTHON` tells the build and staging scripts which interpreter hosts the
+Python services. On POSIX the equivalent is `python3 -m venv .venv-mcp &&
+.venv-mcp/bin/python -m pip install -r requirements.txt`. Optional browser binaries and
+simulation tools keep their explicit provisioning commands; dependency setup never
+silently downloads or builds them.
 
-### Reviewed runtime identity prerequisite
+### Optional: offline wheelhouse mode
 
-The trusted source/development payload must contain
-`vendor/python/RUNTIME_WHEELS.lock`, independently authenticated and reviewed,
-not supplied by the wheelhouse owner. Its JSON contract is:
+Maintainers who need a hash-pinned, index-free runtime can prepare one with
+`scripts/prepare_runtime_wheels.py`: its `candidate` step writes an unapproved review
+document, and after the operator reviews and approves it, `prepare` emits a bundle with
+`RUNTIME_WHEELS.lock` and a matching `wheelhouse/`. With that bundle,
+`services/installer/provision.py --wheelhouse <dir>` (POSIX front end:
+`CHUDWARE_WHEELHOUSE=<dir> scripts/provision_venv.sh`) installs only verified local wheels with
+`--no-index --no-deps --require-hashes --only-binary=:all:`, and
+`scripts/stage_windows.ps1` copies the lock and wheelhouse into `dist`. This is optional
+hardening; the default developer flow above does not need it.
 
-- `schema`: `chudware-runtime-wheels-v1`.
-- `requirements_sha256`: full SHA-256 of the root declarations, including comments
-  and offline options; changing them invalidates the lock.
-- `chudcode_source`: `repository` and forty-hex `repository_commit`, exactly matching
-  `vendor/chudcode/CHUDCODE_ARTIFACT.lock`.
-- `targets`: objects keyed by `<sys_platform>-<normalized machine>-cp<major><minor>`
-  (for example `win32-x86_64-cp311`, `linux-x86_64-cp311`, `darwin-arm64-cp311`).
-  Each target has `wheels`, a nonempty list of objects with exactly `filename`,
-  `name`, `version`, and full `sha256`. Every entry names one compatible wheel;
-  duplicate distribution names, source distributions, links, direct dependency
-  URLs and mismatched metadata are refused.
+The wheelhouse regression smoke uses synthetic wheel ZIPs, temporary venvs and a
+loopback-only fake index:
+`python -m pytest services/installer/test_wheelhouse.py scripts/test_mcp_runtime_audit.py -q`.
 
-Every declared dependency and applicable transitive dependency (including selected
-extras) must have a satisfying reviewed wheel. All listed wheels' dependency
-closures and selected interpreter tags/Requires-Python are checked before venv
-creation or pip installation. Wheels are copied to a disposable verified snapshot;
-pip never searches the supplied wheelhouse or an index. Ready-runtime reuse requires
-the full lock digest, target, installed versions, PEP 610 wheel hashes and actual
-installed package/library bytes compared to approved archive members, not
-self-reported RECORD hashes. Old editable/public-index SDKs are not accepted.
-Unapproved `.pth`, `sitecustomize` and `usercustomize` startup hooks are rejected by
-an isolated `-I -S` metadata/bytes probe before package imports or compilation.
-Unlisted package-tree files are rejected. Generated `.pyc` files must match the
-trusted interpreter's builtin compilation of the authenticated source; neither
-source nor a build backend is executed for that comparison.
-Pip-generated RECORD/INSTALLER/REQUESTED metadata and rewritten script/header
-installations are excluded from the package-byte comparison; their wheel inputs
-remain authenticated. Baseline bootstrap packages/hooks must exactly match the
-selected trusted base interpreter's ensurepip wheel payloads unless replaced by a
-reviewed runtime wheel. **Trust prerequisite:** the system/portable Python binary,
-the candidate venv interpreter (an original link/copy of that base), stdlib and
-ensurepip payload must already be authenticated by the operator; this flow neither
-fetches Python nor manufactures that trust from a version string.
-An unrecognized existing venv is left unchanged; `--force` explicitly permits its
-replacement only after all reviewed wheel inputs pass validation.
-
-Linux/macOS/Windows sidecar compiler scripts use a site-disabled `--check-inputs`
-gate before Nuitka, requiring the same lock/target, stamp and authenticated installed
-package bytes, and explicitly include `chudcode_rpc`. The approved target must also
-satisfy every applicable declaration/dependency in `packaging/requirements-release.txt`
-before any compiler/tool package is imported. Provision release and test tools as
-additional reviewed target wheels through the same locked source flow, not a
-subsequent public pip installation.
-Customer payloads remain source-free and do not receive a wheelhouse/provisioner.
-
-**Current missing inputs:** there is no committed complete `RUNTIME_WHEELS.lock`
-or authenticated `chudcode_rpc-0.3.1` wheel identity. The native Chudcode executable
-lock's source commit does not authenticate SDK wheel bytes. Provisioning and
-development payload staging therefore fail closed until maintainers authenticate
-the private wheel and complete per-target dependency sets and commit that reviewed
-lock. Do not generate an identity by executing an untrusted backend or deriving a
-hash from a public candidate. The inspected local SDK `uv.lock` is editable and
-still describes version 0.3.0; it is not a complete managed-runtime lock.
-
-The isolated regression smoke uses inert synthetic wheel ZIPs, temporary venvs and
-a loopback-only fake public index. Run
-`python -m pytest services/installer/test_wheelhouse.py scripts/test_mcp_runtime_audit.py -q`
-using the integrator's existing test interpreter in a network-disabled disposable
-environment. It installs no real SDK, invokes no build backend and must observe
-zero fake-index requests for positive installs and absent/tampered candidates.
-
-Customer installs use compiled worker/MCP sidecars and do not provision Python; the build
+Installed releases use compiled worker/MCP sidecars and do not provision Python; the build
 interpreter must import `packaging/requirements-release.txt` for those sidecars (see
-`PACKAGING_WINDOWS.md`). The retired `engine_oracle` suite is not a Windows test entry point;
-native engine regression coverage is CTest in `build/<preset>/core`.
+`PACKAGING_WINDOWS.md`). Native engine regression coverage is CTest in
+`build/<preset>/core`.
 
 ## Troubleshooting / gotchas
 
 - **`cl` / `cmake` "is not recognized"** — MSVC isn't on `PATH` in a normal shell. Build from the
   **x64 Native Tools Command Prompt for VS 2022** (Start menu) or run `vcvars64.bat` first.
-- **`freecad_parity`** — historically (T-WIN1) this ctest case differed between MSVC and GCC on
+- **`freecad_parity`** — historically this ctest case differed between MSVC and GCC on
   the point-on-ellipse solver case. Check the latest Windows CI row before treating a failure
   there as a new regression.
-- **Legacy `UnicodeEncodeError` on `work.py board`** was a cp1252-console bug, fixed on `master`
-  (`work.py` forces UTF-8 stdout). If you hit it on an old checkout, pull latest.

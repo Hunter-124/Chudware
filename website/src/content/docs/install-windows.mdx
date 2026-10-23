@@ -1,19 +1,18 @@
 ---
 title: Install on Windows
-description: Download and install the published signed x86-64 Chudware desktop app on Windows.
+description: Download and install the x86-64 Chudware desktop app on Windows from GitHub Releases.
 section: Installation
 order: 10
 ---
 ## Download the current installer
 
-Sign in at [app.chudware.com](https://app.chudware.com/#downloads) and open the download page. It shows the published Windows x86-64 build, version, size, and SHA-256 digest for your account.
+Open the [latest release on GitHub](https://github.com/Hunter-124/Chudware/releases/latest) and download the Windows x86-64 installer. No account is needed. GitHub shows a SHA-256 digest beside each asset; compare it with the output of `Get-FileHash` in PowerShell before you run the installer.
 
-The current Windows build is a signed **Setup (`.exe`)** installer. Download it, run the installer, and launch Chudware from the Start menu.
+- **Setup (`Chudware-Setup-<version>-x86_64.exe`)** is the interactive installer. Run it, then launch Chudware from the Start menu.
+- **Installer (`Chudware-<version>-x86_64.msi`)** is for managed and scripted deployment through Group Policy, Intune, or `msiexec`.
 
 The build is 64-bit and needs a GPU driver with hardware-accelerated 3D. Without one the app won't start.
 
-Do not install a package presented as an official Chudware release from a third-party source; the download page in your account is the only official source.
+## Updates
 
-## Or skip the install
-
-The browser client requires no desktop installation. [Create an account](https://app.chudware.com/signup) to use Chudware from a tab.
+Chudware checks GitHub for newer releases and verifies each update's Ed25519 signature before staging it. Only install Chudware from the project's GitHub releases or a build you made [from source](https://github.com/Hunter-124/Chudware#building-from-source).

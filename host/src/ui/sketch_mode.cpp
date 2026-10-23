@@ -7894,7 +7894,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 queueSketchDrag(st, std::move(extra));
             }
         }
-        // ---- Drag edge auto-pan (Hunter UX). While an entity/handle/group is being LMB-dragged,
+        // ---- Drag edge auto-pan. While an entity/handle/group is being LMB-dragged,
         // the camera holds perfectly still in the central "dead zone"; only when the cursor enters
         // a band along a visible viewport edge does the view pan toward that edge, with the speed
         // ramping quadratically from 0 at the band's inner boundary to a modest max at the edge.

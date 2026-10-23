@@ -21,16 +21,14 @@
     "vision": false
   },
   "telemetry_consent": "off",
-  "_telemetry_consent_note": "Telemetry capture consent tier: off (default — events stored locally only, never exported) | meta (event kinds + verifier scores + hashes, no geometry/prompts) | full (everything; team dogfood default). offline_mode always hard-forces off. External users default to off. See contracts/telemetry.md.",
+  "_telemetry_consent_note": "Telemetry capture consent tier: off (default — events stored locally only, never exported) | meta (event kinds + verifier scores + hashes, no geometry/prompts) | full (everything). offline_mode always hard-forces off. See contracts/telemetry.md.",
   "experimental": {
-    "_note": "Opt-in, default-off AI features. All run fully local (ITAR-safe) and are additive — omit this block for the standard copilot. Also settable in Settings → Experimental. See docs/EXPERIMENTAL_AI.md.",
+    "_note": "Opt-in, default-off AI features. They run fully local and are additive — omit this block for the standard copilot. Also settable in Settings → Experimental.",
     "vision_review": {
       "enabled": false,
-      "_note": "When enabled, a SEPARATE local OpenAI-compatible vision model judges the rendered viewport in the review/fix stages while the main provider plans + emits ops (the Seek-CAD split). The endpoint must be loopback when offline_mode is true. Served by llama.cpp with a vision projector (--mmproj); mmproj/model_path record which local GGUF the loopback server is serving. RATIFIED offline candidate: Qwen3-VL-4B-Instruct (Apache-2.0) — see tools/flywheel/vlm/candidates.py for provisioning. The VLM proposes coarse claims; deterministic code verifies (T-H10).",
+      "_note": "When enabled, a SEPARATE local OpenAI-compatible vision model judges the rendered viewport in the review/fix stages while the main provider plans + emits ops (the Seek-CAD split). The endpoint must be loopback when offline_mode is true. Serve it with llama.cpp and a vision projector (--mmproj), e.g. Qwen3-VL-4B-Instruct (Apache-2.0). The VLM proposes coarse claims; deterministic code verifies them.",
       "base_url": "http://localhost:1234/v1",
-      "model": "qwen3-vl-4b-instruct",
-      "mmproj": null,
-      "model_path": null
+      "model": "qwen3-vl-4b-instruct"
     },
     "cad_sequence_mode": false,
     "_cad_sequence_mode_note": "Nudge the modeler to build an editable parametric feature SEQUENCE (DeepCAD / CAD-Coder-style design history) over a monolithic solid."

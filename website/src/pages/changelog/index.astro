@@ -6,6 +6,6 @@ const releases = (await getCollection('changelog')).sort((a, b) => b.data.publis
 const date = new Intl.DateTimeFormat('en', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' });
 ---
 <BaseLayout title="Changelog" description="What changed in each Chudware release, with installation and compatibility notes.">
-  <header class="page-hero"><div class="wrap"><p class="eyebrow">Changelog</p><h1>What changed, and why it matters.</h1><p class="lede">Release notes for the desktop app, the browser workspace, and the account portal.</p></div></header>
+  <header class="page-hero"><div class="wrap"><p class="eyebrow">Changelog</p><h1>What changed, and why it matters.</h1><p class="lede">Project announcements and release notes for the Chudware desktop app. Builds are published as <a class="text-link" href="https://github.com/Hunter-124/Chudware/releases">GitHub releases</a>.</p></div></header>
   <section class="section"><div class="wrap release-list">{releases.map((release) => <article class="panel release-card"><p class="release-meta">{release.data.version} · {date.format(release.data.published)}</p><h2>{release.data.title}</h2><p class="lede">{release.data.description}</p><a class="text-link" href={`/changelog/${release.id}/`}>Read release notes <Icon name="arrow-right" /></a></article>)}</div></section>
 </BaseLayout>

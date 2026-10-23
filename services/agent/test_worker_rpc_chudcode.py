@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from pathlib import Path
 import hashlib
 
-import math
 import os
 import threading
 
@@ -20,7 +18,6 @@ from services.agent import (
     worker_rpc,
 )
 from services.mcp import cad_common
-from services.agent.test_chudcode_host import cell_launch_runtime
 
 
 def test_selected_nested_workspace_stays_authoritative(tmp_path, monkeypatch):
@@ -386,8 +383,6 @@ def online_lane(monkeypatch, tmp_path):
     monkeypatch.setattr(
         config, "load_config", lambda: {"provider": "openai", "model": "gpt-test"}
     )
-    monkeypatch.setattr(config, "clear_pooled_credentials", lambda: None)
-    monkeypatch.setattr(config, "bind_subscription_grant", lambda grant: None)
 
     real_dispatch = mission_dispatch.MissionDispatch
     class FakeDispatch:
@@ -754,140 +749,6 @@ def test_persistent_reuse_one_time_history_seed_and_mapped_streaming(online_lane
     assert len(online_lane.saved) == 2
 
 
-def test_credit_denial_never_reaches_chudcode(online_lane, monkeypatch):
-
-    monkeypatch.setattr(
-        config,
-        "pooled_credit_preflight",
-        lambda *args, **kwargs: {"ok": False, "reason": "insufficient_credits"},
-    )
-    actor = {
-        "email": "user@example.test",
-        "plan": "metered",
-        "credits_remaining": 0,
-        "key_source": "pool",
-        "_pool": {"provider": "openai", "api_key": "pool-test-key"},
-        "_pool_key_sha256": hashlib.sha256(b"pool-test-key").hexdigest(),
-        "_rate": {
-            "model": "gpt-test",
-            "prompt_usd_per_mtok": "1",
-            "completion_usd_per_mtok": "1",
-        },
-    }
-
-    result = worker_rpc._agent_admin_turn(
-        _params(online_lane, run_id="denied", _chudware_actor=actor), lambda event: None
-    )
-
-    assert result == {"ok": False, "reason": "insufficient_credits"}
-    assert online_lane.host.turns == []
-
-
-def test_subscription_requires_digest_and_only_passes_supported_token_to_host(online_lane):
-    actor = {
-        "email": "tenant-a@example.test", "plan": "studio",
-        "credits_remaining": 0, "key_source": "subscription",
-        "_subscription": {"provider": "anthropic-sub", "access_token": "tenant-a-bearer"},
-        "_subscription_token_sha256": hashlib.sha256(b"tenant-a-bearer").hexdigest(),
-    }
-    params = _params(online_lane, run_id="tenant-a", provider="anthropic",
-                     model="claude-sonnet-4", _chudware_actor=actor)
-    assert worker_rpc._agent_admin_turn(params, lambda event: None)["ok"]
-    host_turn = online_lane.host.turns[-1]
-    assert (host_turn["web_key_source"], host_turn["web_provider"],
-            host_turn["web_tenant"], host_turn["web_credential"]) == (
-                "subscription", "anthropic-sub", actor["email"], "tenant-a-bearer")
-    assert "byok_key" not in host_turn
-
-    for changed, reason in [
-        ({**actor, "_subscription_token_sha256": "0" * 64}, "subscription_credential_mismatch"),
-        ({**actor, "_subscription": None}, "invalid_subscription_grant"),
-        ({**actor, "_subscription": {"provider": "openai-codex", "access_token": "codex"}},
-         "subscription_isolation_unsupported"),
-    ]:
-        denied = worker_rpc._agent_admin_turn(
-            {**params, "_chudware_actor": changed, "run_id": reason}, lambda event: None)
-        assert denied["reason"] == reason
-    assert len(online_lane.host.turns) == 1
-
-
-def test_pool_requires_proven_credential_and_preserves_credit_preflight(online_lane, monkeypatch):
-    monkeypatch.setattr(config, "pooled_credit_preflight",
-                        lambda *_args, **_kw: {"ok": True, "max_output_tokens": 8192})
-    actor = {
-        "email": "tenant@example.test", "plan": "studio",
-        "credits_remaining": 100, "key_source": "pool",
-        "_pool": {"provider": "openrouter", "api_key": "pool-secret"},
-        "_pool_key_sha256": hashlib.sha256(b"pool-secret").hexdigest(),
-    }
-    params = _params(online_lane, run_id="pool", provider="openrouter",
-                     model="vendor/cheap", _chudware_actor=actor)
-    assert worker_rpc._agent_admin_turn(params, lambda event: None)["ok"]
-    host_turn = online_lane.host.turns[-1]
-    assert (host_turn["web_key_source"], host_turn["web_provider"],
-            host_turn["web_credential"]) == ("pool", "openrouter", "pool-secret")
-    for changed, reason in [
-        ({**actor, "_pool": None}, "pool_credential_unconfigured"),
-        ({**actor, "_pool_key_sha256": "0" * 64}, "pool_credential_mismatch"),
-        ({**actor, "key_source": ""}, "web_credential_source_invalid"),
-        ({**actor, "key_source": "unknown"}, "web_credential_source_invalid"),
-    ]:
-        denied = worker_rpc._agent_admin_turn(
-            {**params, "run_id": reason, "_chudware_actor": changed}, lambda event: None)
-        assert denied["reason"] == reason
-    assert len(online_lane.host.turns) == 1
-
-
-def test_pool_preflight_estimates_the_exact_sent_request(online_lane, monkeypatch):
-    from services.agent.online_turn import compose_request_text
-
-    actor = {
-        "email": "tenant@example.test", "plan": "studio",
-        "credits_remaining": 100, "key_source": "pool",
-        "_pool": {"provider": "openrouter", "api_key": "pool-secret"},
-        "_pool_key_sha256": hashlib.sha256(b"pool-secret").hexdigest(),
-    }
-    estimates = []
-
-    def preflight(_actor, *, prompt_tokens_estimate, max_output_tokens):
-        estimates.append(prompt_tokens_estimate)
-        return {"ok": True, "max_output_tokens": max_output_tokens}
-
-    monkeypatch.setattr(config, "pooled_credit_preflight", preflight)
-    result = worker_rpc._agent_admin_turn(
-        _params(
-            online_lane, run_id="preflight-same-text", provider="openrouter",
-            model="vendor/cheap", _chudware_actor=actor,
-            history=[{"role": "user", "text": "Earlier question"}],
-            scope={"doc_id": "selected-doc", "feature_ids": ["feature-7"]},
-        ),
-        lambda _event: None,
-    )
-    assert result["ok"]
-    sent = online_lane.host.turns[-1]["request"]
-    migration = worker_rpc._bounded_history_seed(
-        [{"role": "user", "text": "Earlier question"}]
-    )
-    editor = worker_rpc._editor_context_block(
-        {"scope": {"doc_id": "selected-doc", "feature_ids": ["feature-7"]}}
-    )
-    assert sent == compose_request_text("Do the work", migration, editor)
-    assert estimates == [max(1, math.ceil(len(sent.encode("utf-8")) / 4))]
-    followup = worker_rpc._agent_admin_turn(
-        _params(
-            online_lane, run_id="preflight-followup", provider="openrouter",
-            model="vendor/cheap", _chudware_actor=actor,
-            history=[{"role": "user", "text": "Earlier question"}],
-            scope={"doc_id": "selected-doc", "feature_ids": ["feature-7"]},
-        ),
-        lambda _event: None,
-    )
-    assert followup["ok"]
-    next_sent = online_lane.host.turns[-1]["request"]
-    assert next_sent == compose_request_text("Do the work", "", editor)
-    assert estimates[-1] == max(1, math.ceil(len(next_sent.encode("utf-8")) / 4))
-
-
 def test_turn_builds_root_tools_before_activation_and_callbacks_keep_selected_root(
     online_lane, tmp_path, monkeypatch,
 ):
@@ -986,14 +847,12 @@ def test_turn_builds_root_tools_before_activation_and_callbacks_keep_selected_ro
     assert [row["name"] for row in observed["fs_list"]["entries"]] == ["arm.stl"]
 
 
-def test_crashed_turn_restores_workspace_and_credentials(online_lane, monkeypatch):
+def test_crashed_turn_restores_workspace(online_lane):
     original_cwd = os.getcwd()
     original = {
         key: os.environ.get(key)
         for key in ("CHUDWARE_FS_ROOT", "CHUDWARE_PROJECT_DIR", "CHUDWARE_PROJECT_SAVE_DIR")
     }
-    clear_calls = []
-    monkeypatch.setattr(config, "clear_pooled_credentials", lambda: clear_calls.append(True))
     online_lane.host.mode = "crash"
     response = worker_rpc._agent_admin_turn(
         _params(online_lane, run_id="restore-after-crash"), lambda _event: None
@@ -1002,7 +861,6 @@ def test_crashed_turn_restores_workspace_and_credentials(online_lane, monkeypatc
     assert response["persistence"]["saved"] == ["part.step+"]
     assert os.getcwd() == original_cwd
     assert {key: os.environ.get(key) for key in original} == original
-    assert len(clear_calls) == 2
 
 
 @pytest.mark.parametrize(
@@ -1505,179 +1363,26 @@ def test_explicit_turn_budget_is_announced_in_the_assembled_prompt(online_lane, 
         assert online_lane.host.turns[-1]["timeout"] == 600.0
 
 
-@pytest.mark.parametrize("mode", ["ask", "plan", "agent"])
-def test_cell_single_turn_does_not_authorize_delegate(online_lane, monkeypatch, mode):
-    from services.agent import request_context as tenancy
-
-    monkeypatch.setenv("XDG_DATA_HOME", str(online_lane.workspace / "cell-state"))
-    monkeypatch.setattr(mission_dispatch, "MissionDispatch", online_lane.dispatch_type)
-    monkeypatch.setattr(worker_rpc, "resolve_workspace", lambda params: ("/work", "/work", None))
-    ctx = {"cell": True, "workspace_key": "team:worker/work", "actor_key": "alice",
-           "actor_hex": hashlib.sha256(b"alice").hexdigest()[:32], "right": "editor", "epoch": 1}
-    with tenancy.bind_context(ctx):
-        session = tenancy.mint_handle("session")
-        run_id = tenancy.mint_handle("run", parent=session)
-        result = worker_rpc._agent_admin_turn(_params(
-            online_lane, run_id=run_id, session_id=session, mode=mode,
-            _chudware_actor={"email": "alice@example.test", "plan": "pro",
-                             "credits_remaining": 10, "key_source": "byok"},
-            provider_grant="cpg1.fixture.signature",
-        ), lambda event: None)
-        assert result["ok"], result
-        dispatch = online_lane.tool_contexts[0]["mission_dispatch"]
-        assert dispatch.execution_options["max_subagent_depth"] == 0
-        refusal = dispatch.delegate(role="reviewer", brief="inspect only", budget_tokens=16000)
-        assert refusal["ok"] is False and refusal["reason"] == "spawn_depth_policy", refusal
-        assert len(online_lane.host.turns) == 1
-
-
-@pytest.mark.parametrize("mode", ["ask", "plan", "agent"])
-def test_cell_turn_delegate_uses_actual_parent_session_and_broker_scope(
-    online_lane, cell_launch_runtime, monkeypatch, mode
-):
-    from services.agent import chudcode_host, chudcode_roles, request_context as tenancy, role_models
-    from services.agent.test_chudcode_host import CellLaunchFactory
-
-    factory = CellLaunchFactory()
-    host = chudcode_host.ChudcodeSessionHost(client_factory=factory)
-    ctx = {"cell": True, "workspace_key": "team:worker/work", "actor_key": "alice",
-           "actor_hex": hashlib.sha256(b"alice").hexdigest()[:32], "right": "editor", "epoch": 1}
-    actor = {"email": "alice@example.test", "plan": "pro", "credits_remaining": 10,
-             "key_source": "byok"}
-    monkeypatch.setattr(mission_dispatch, "MissionDispatch", online_lane.dispatch_type)
-    monkeypatch.setattr(worker_rpc, "resolve_workspace", lambda params: ("/work", "/work", None))
-    monkeypatch.setattr(worker_rpc, "get_default_chudcode_host", lambda: host)
-    monkeypatch.setattr(role_models, "resolve_for_node", lambda *args, **kwargs: None)
-    monkeypatch.setattr(role_models, "resolve_role_model", lambda *args, **kwargs: None)
-    monkeypatch.setattr(config, "get_subagent_tool_call_budget", lambda: 0)
-    monkeypatch.setattr(config, "load_config", lambda: {
-        "provider": "openai", "model": "gpt-test",
-        "agent": {"compaction_strategy": "snapcompact"},
-    })
-    monkeypatch.setattr(chudcode_roles, "get_default_chudcode_host", lambda: host)
-    monkeypatch.setattr(chudcode_host, "get_default_chudcode_host", lambda: host)
-    try:
-        with tenancy.bind_context(ctx):
-            session = tenancy.mint_handle("session")
-            run_id = tenancy.mint_handle("run", parent=session)
-            params = _params(
-                online_lane, run_id=run_id, session_id=session, workspace_dir="/work",
-                request="Inspect two documents", doc_count=2,
-                mode=mode, _chudware_actor=actor, provider_grant="cpg1.fixture.signature",
-            )
-            result = worker_rpc._agent_admin_turn(params, lambda event: None)
-            assert result["ok"], result
-            dispatch = online_lane.tool_contexts[0]["mission_dispatch"]
-            assert dispatch.execution_options["session_id"] == session
-            parent = host.session_launch_params(session)
-            child = dispatch.delegate(role="reviewer", brief="inspect only", budget_tokens=16000)
-            if mode == "ask":
-                # Answer-only parents do not authorize delegation. Exercise the
-                # private live-parent role lane without changing that policy.
-                assert child["ok"] is False and child["reason"] == "spawn_depth_policy", child
-                assert len(factory.clients) == 1
-                child = chudcode_roles.run_role_turn(
-                    "inspect only", "reviewer", session_id=session, run_id="private-review",
-                )
-                assert child["success"], child
-            else:
-                assert child.get("executed") and child["subagent_status"] == "done", child
-            inherited = host.session_launch_params(child["session_id"])
-            assert child["session_id"] not in (session, run_id)
-            assert inherited["web_provider_grant"] == params["provider_grant"]
-            assert inherited["web_tenant"] == "alice"
-            assert inherited["mode"] == mode
-            assert inherited["settings"]["compaction_settings"] == parent["settings"]["compaction_settings"]
-            assert inherited["settings"]["compaction_settings"]["methodOrder"] == ["snapcompact"]
-            assert inherited["workspace_dir"] == "/work"
-            assert not {"api_key", "web_credential", "byok_key"} & inherited.keys()
-            client = factory.clients[-1]
-            assert client.kwargs["command"][:4] == [
-                "/opt/chudware/bin/chudware-actor-sandbox", ctx["actor_hex"],
-                "rw" if mode == "agent" else "ro", "--",
-            ]
-            assert client.kwargs["env"]["CHUDWARE_PROVIDER_GRANT"] == params["provider_grant"]
-            assert client.kwargs["env"]["ANTHROPIC_API_KEY"] == ""
-            assert "inspect only" in Path(client.session_file).read_text()
-            before = len(factory.clients)
-            assert chudcode_roles.run_role_turn(
-                "inspect", "reviewer", session_id=run_id, run_id="child"
-            )["stop_reason"] == "not_found"
-            assert len(factory.clients) == before
-            if mode == "agent":
-                pytest.importorskip("langgraph")
-                from services.agent.test_chudcode_tools import _Policy
-                assert host.release_session(child["session_id"]) == {"ok": True, "released": True}
-                # Real role bindings retain the owning roots after the turn exits.
-                # Preserve those roots here so the released-parent check is reached.
-                stale_child = chudcode_tools.HostToolBinding(
-                    "delegate", "Delegate from the owning role", {"type": "object"},
-                    context={"session_id": child["session_id"], "mode": "agent",
-                             "mission_dispatch": dispatch, "policy_registry": _Policy()},
-                    project_root="/work", save_root="/work",
-                )
-                refused = chudcode_tools.dispatch_host_tool(
-                    stale_child, {"role": "reviewer", "brief": "inspect only", "budget_tokens": 16000},
-                    None, None,
-                )
-                assert refused["ok"] is False and refused["stop_reason"] == "not_found", refused
-                assert len(factory.clients) == before
-                assert dispatch.execution_options["session_id"] == session
-                from services.dag.test_mcp_tools import _build_clients
-                from services.dag.test_executor import _two_node_graph
-                target = _build_clients()["dag_run"]
-                binding = chudcode_tools.HostToolBinding(
-                    "dag_run", "Run governed DAG", {"type": "object"}, handler=target,
-                    context={"session_id": session, "mode": "agent", "policy_registry": _Policy()},
-                    project_root="/work", save_root="/work",
-                )
-                dag_result = chudcode_tools.dispatch_host_tool(
-                    binding, {"graph_json": _two_node_graph(), "autonomy_default": "auto",
-                              "initial_state": {"session_id": "foreign-session"}}, None, None,
-                )
-                import json
-                dag_result = json.loads(dag_result) if isinstance(dag_result, str) else dag_result
-                assert dag_result["ok"], dag_result
-                assert dag_result["status"] == "done", dag_result
-                assert set(dag_result["nodes"]) == {"n_plan", "n_report"}
-                for node in dag_result["nodes"].values():
-                    assert node["status"] == "done", node
-                    turn = node["output"]["data"]["agent_result"]
-                    assert turn["success"] and turn["stop_reason"] == "completed", turn
-                    assert turn["session_id"] not in (session, run_id, "foreign-session")
-                    launched = host.session_launch_params(turn["session_id"])
-                    assert launched["web_provider_grant"] == params["provider_grant"]
-                    assert launched["settings"]["compaction_settings"] == parent["settings"]["compaction_settings"]
-                    assert launched["workspace_dir"] == "/work"
-                    assert Path(turn["chudcode_session_file"]).is_file()
-    finally:
-        host.shutdown()
-
-
-@pytest.mark.parametrize("field", ["api_key", "web_credential", "byok_key", "web_provider_grant"])
-def test_cell_worker_refuses_upstream_or_internal_credential_fields(online_lane, monkeypatch, field):
+def test_cell_turn_has_no_credential_route_and_never_reaches_chudcode(online_lane, monkeypatch):
     from services.agent import request_context as tenancy
     monkeypatch.setenv("XDG_DATA_HOME", str(online_lane.workspace / "cell-state"))
     ctx = {"cell": True, "workspace_key": "team:worker/work", "actor_key": "alice",
            "actor_hex": hashlib.sha256(b"alice").hexdigest()[:32], "right": "editor", "epoch": 1}
-    monkeypatch.setattr(worker_rpc, "resolve_workspace", lambda params: ("/work", "/work", None))
+    refusal = {"ok": False, "reason": "credential_isolation_unsupported",
+               "code": "credential_isolation_unsupported"}
     with tenancy.bind_context(ctx):
         session = tenancy.mint_handle("session")
         run_id = tenancy.mint_handle("run", parent=session)
-        result = worker_rpc._agent_admin_turn(
-            _params(online_lane, run_id=run_id, session_id=session,
-                    _chudware_actor={"key_source": "byok"}, **{field: "forbidden"}),
-            lambda event: None,
-        )
-        assert result["reason"] == "credential_isolation_unsupported"
-        assert not online_lane.host.turns
-
-
-def test_broker_grants_are_redacted_from_nested_service_results():
-    assert worker_rpc._redact_sensitive_response({
-        "nested": [{"provider_grant": "cpg1.actor.signature",
-                    "web_provider_grant": "cpg1.actor.signature", "session_id": "opaque"}]
-    }) == {
-        "nested": [{"provider_grant": "<redacted>", "web_provider_grant": "<redacted>",
-                    "session_id": "opaque"}]
-    }
+        for extra in ({}, {"api_key": "forbidden"}, {"byok_key": "forbidden"}):
+            assert worker_rpc._agent_admin_turn(
+                _params(online_lane, run_id=run_id, session_id=session, **extra),
+                lambda event: None,
+            ) == refusal
+        assert worker_rpc._agent_admin_turn(
+            _params(online_lane, run_id="absent", session_id=session), lambda event: None,
+        ) == {"ok": False, "reason": "not_found", "code": "not_found"}
+        assert worker_rpc._chudcode_models_list({}, lambda event: None) == {
+            "ok": True, "models": [], "refreshing": False,
+        }
+    assert not online_lane.host.turns
+    assert not online_lane.saved

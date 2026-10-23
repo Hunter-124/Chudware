@@ -18,7 +18,7 @@ three cantilever modes are three DISTINCT Euler-Bernoulli values):
                              it — see services/mcp/test_fea_modal_freq.py).
   free_free_first_elastic    first elastic free-free mode vs Euler-Bernoulli with
                              beta1 L = 4.73004 (free-free root, Rao Table 8.1).
-  freq_response_peak         T-FIN24 multiphysics worker path (engine_oracle/sim/
+  freq_response_peak         multiphysics worker path (engine_oracle/sim/
                              multiphysics_rpc.sim_freq_response): harmonic base-
                              excitation response must peak at the first natural
                              frequency (SDOF transmissibility maximum at r ~= 1,

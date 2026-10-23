@@ -5,8 +5,11 @@ of the app's canonical Python packages under ``services`` so the MCP server and 
 can run independent of the source tree. Idempotent and version-stamped: a ready
 runtime is detected and reused without re-installing.
 
-Development/source payloads use a reviewed, complete offline wheelhouse. Customer
-releases use compiled sidecars and do not ship this source provisioner.
+This provisioner installs only a reviewed, complete offline wheelhouse matching
+vendor/python/RUNTIME_WHEELS.lock (prepared by scripts/prepare_runtime_wheels.py) and
+never consults a package index. Source checkouts without that lock use a plain venv
+instead (scripts/provision_venv.sh, or ``pip install -r requirements.txt``). Release
+installers ship compiled sidecars and do not run this provisioner.
 
     python -m services.installer.provision [--check] [--force]
           [--base-python <exe>] [--wheelhouse <dir>] [--venv-dir <dir>]
@@ -167,7 +170,7 @@ def reveng_provisioning_status() -> dict:
 
 
 def ngspice_provisioning_status() -> dict:
-    """Availability of the OPTIONAL ngspice SPICE backend (T-FIN14) — never installs.
+    """Availability of the OPTIONAL ngspice SPICE backend — never installs.
 
     ngspice is subprocess-only: discovered via the ``CHUDWARE_NGSPICE`` env var or PATH,
     never bundled. Its absence is not an error — ecad_simulate/ecad_tf degrade honestly
@@ -410,9 +413,9 @@ def ensure_runtime(base_python: str | None = None, wheelhouse: Path | None = Non
     """Install only an authenticated, complete snapshot; never resolve online."""
     if not WHEEL_LOCK.is_file():
         raise WheelhouseError(
-            f"reviewed complete runtime wheel identity unavailable: {WHEEL_LOCK}; "
-            "authenticate chudcode-rpc==0.3.1 and every target dependency wheel "
-            "before committing the lock (no source-build/index fallback)"
+            f"reviewed runtime wheel lock unavailable: {WHEEL_LOCK}; prepare it with "
+            "scripts/prepare_runtime_wheels.py, or for a source checkout provision a "
+            "plain venv with scripts/provision_venv.sh (pip install -r requirements.txt)"
         )
     directory, py, stamp = _runtime_location(venv_dir)
     base = _trusted_base_path(base_python, directory)

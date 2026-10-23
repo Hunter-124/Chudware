@@ -1,8 +1,0 @@
-# GNN adapter scaffold deps (tools/gsl_gnn) — pinned majors only.
-#
-# CUDA wheel selection is user-side: install torch first for your CUDA
-# version per https://pytorch.org/get-started/locally/ (the local dev box
-# has an RTX 3080 Ti -> a cu12x wheel), THEN install the rest of this file
-# so torch-geometric's install picks up the already-installed torch build.
-torch>=2.2
-torch-geometric>=2.5

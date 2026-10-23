@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""T-FIN25 E2E golden demo — STM32 sensor-node board content smoke.
+"""Sensor-node demo — STM32 sensor-node board end-to-end content smoke.
 
-One scripted mission exercises the FIN content surface end-to-end:
+One scripted mission exercises the ECAD, firmware and simulation tool surface end-to-end:
 
   board (MCU + I2C temp sensor + regulator + FPGA-lite optional leg)
     → verification ladder (ERC/DRC/hostcheck/sicheck/FPGA/PDN)
@@ -14,8 +14,8 @@ Fast path (<5 min): uses dry-run-friendly legs where solvers are absent, live FE
 ``CHUDWARE_LIBCHUDWARE`` points at a sim-enabled libchudware, and honest SKIP markers for
 Renode/OpenFOAM-gated legs. Exit 0 on overall PASS (SKIPs allowed); exit 1 on FAIL.
 
-Gate wiring: ``scripts/gate.sh`` stage_fin_content invokes this with the mcp-venv.
-Artifacts land under ``$OUT_DIR`` (default ``scratch/fin25_sensor_node/``).
+Gate wiring: ``scripts/gate.sh`` stage_sensor_node_demo invokes this with the mcp-venv.
+Artifacts land under ``$OUT_DIR`` (default ``scratch/sensor_node_demo/``).
 
 Run:
   CHUDWARE_LIBCHUDWARE=$PWD/core/build-occt-linux/bin/libchudware.so \\
@@ -37,9 +37,9 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 OUT_DIR = Path(os.environ.get(
-    "CHUDWARE_FIN25_OUT", str(REPO / "scratch" / "fin25_sensor_node")))
+    "CHUDWARE_SENSOR_DEMO_OUT", str(REPO / "scratch" / "sensor_node_demo")))
 MARKER_DIR = Path(os.environ.get(
-    "CHUDWARE_FIN25_MARKERS", str(OUT_DIR / "markers")))
+    "CHUDWARE_SENSOR_DEMO_MARKERS", str(OUT_DIR / "markers")))
 
 
 # ── harness ──────────────────────────────────────────────────────────────────
@@ -118,7 +118,7 @@ def _pad(net: str, n: str = "1", size: float = 1.2, x: float = 0.0, y: float = 0
 def build_sensor_node_board(tools: dict, name: str = "sensor_node_stm32") -> str:
     """STM32F4 sensor-node: regulator U1, MCU U2, I2C temp sensor U3, FPGA-lite U4,
     decoupling caps, crystal, BOOT0 pull-down, closed outline + power/I2C nets."""
-    # T-RF21: the ecad session lives in the C++ core; the facade mirrors the old
+    # The ecad session lives in the C++ core; the facade mirrors the old
     # engine.ecad.session API, but doc mutations need an explicit swap_doc write-back.
     from services.mcp.ecad_common import ecad_session
     from services.mcp.ecad_tools import _ECAD
@@ -300,7 +300,7 @@ def main() -> int:
     for old in MARKER_DIR.glob("*.marker"):
         old.unlink()
 
-    print("=== T-FIN25 golden demo: STM32 sensor-node ===")
+    print("=== Sensor-node demo: STM32 sensor-node ===")
     print(f"  out: {OUT_DIR}")
     print(f"  CHUDWARE_LIBCHUDWARE={os.environ.get('CHUDWARE_LIBCHUDWARE', '<unset>')}")
 
@@ -506,7 +506,7 @@ def main() -> int:
         except ImportError:
             leg.skip("build123d not installed — FEA solid path unavailable")
             return
-        dry = os.environ.get("CHUDWARE_FIN25_THERMAL_DRY", "").strip() in ("1", "true", "yes")
+        dry = os.environ.get("CHUDWARE_SENSOR_DEMO_THERMAL_DRY", "").strip() in ("1", "true", "yes")
         r = _call(tools, "ecad_thermal_handoff", doc_id=state["pcb_doc_id"],
                   dry_run=dry, mesh_fineness=0.3)
         state["thermal"] = r
@@ -690,7 +690,7 @@ def main() -> int:
 
         outline = [
             {"type": "title", "body": [
-                "T-FIN25 golden demo — STM32F4 sensor-node board.",
+                "Sensor-node demo — STM32F4 sensor-node board.",
                 "Verification ladder + firmware co-verify + thermal FEA + "
                 "heatsink pick + system power budget.",
             ]},
@@ -742,7 +742,7 @@ def main() -> int:
 
         rec = d.make_report({
             "kind": "report",
-            "title": "T-FIN25 Sensor-Node Golden Demo",
+            "title": "Sensor-Node Demo",
             "template": "verification_report",
             "format": "docx",
             "outline": outline,

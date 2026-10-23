@@ -8,7 +8,7 @@ and unit-bearing; no cut family stores power in spindle RPM.
 Path ruling honored: production GUI only under `host/src/ui/manufacture/**`; cross-domain
 service root `services/manufacturing/**`; domain engine under `core/cam/cut/**`; RPCs
 `mfg_*`, events `mfg.*`; `host/src/ui/cam/**` extended only through one named seam.
-(This supersedes the flat `core/cam/process_cut.*` names in my earlier IRC claim; the
+(This supersedes the flat `core/cam/process_cut.*` names in an earlier draft; the
 engine lives in `core/cam/cut/**` so it cannot collide with `core/cam/turn/**`.)
 
 Implemented scope is bounded and offline: laser vector planning, GRBL laser-mode post and
@@ -59,7 +59,7 @@ All three "processes" are currently **one code path with one scalar**.
 | `cam_post`'s only release guard is the motion-line count; a laser job posted to `fanuc` counts motion lines and reports success | `services/mcp/cam_tools.py:782-801` |
 | `feeds_speeds` tool vocabulary is `endmill_flat\|endmill_ball\|drill\|tap\|face_mill`; `cam_check_feeds_envelope` speaks only `rpm`/`feed` | `services/mcp/cam_tools.py:904-910`, `:937-975` |
 
-Corroborating breadth research (`agent://ManufacturingBreadth`): laser is `NOW`
+Corroborating manufacturing-breadth research: laser is `NOW`
 (vector + post + parser/emulator, hardware streaming labeled unsupported); plasma is
 `NEXT` with an explicitly richer state machine (arc-ok, arc voltage, ohmic/float probe,
 THC, breakaway, consumables — "not laser with another icon"); waterjet is `LATER` with
@@ -131,7 +131,7 @@ previously denied**: the `core/cam/post.cpp` footer line `:487` is genuinely sha
 claim that these seams are "**disjoint**" from turning's was false as written. That line is owned
 **exclusively by `cam.turn`** for this wave and cutting edits it not at all; the binding ownership
 statement is **Appendix A.2**, recorded identically in
-`local://manufacturing-turning-architecture.md`. Every other seam below is disjoint exactly as stated.
+`17_turning.md` (Appendix A.2). Every other seam below is disjoint exactly as stated.
 
 **`core/cam/model.h`** — appends only. No field reordered, renamed, retyped, or removed
 (ABI + `.cam+` + C-ABI JSON are append-only, per DoD §16 and `model.h:14-16`).
@@ -219,7 +219,7 @@ fixtures/mfg/cut/plasma/stale_arc_ok.jsonl              FreshValue state != ok
 ```
 
 Recorded plasma ledgers are **data**, structurally modeled on the documented QtPlasmaC
-signal set (`agent://ManufacturingBreadth`). No QtPlasmaC (GPLv2) or grbl-sim (GPLv3)
+signal set (manufacturing-breadth research). No QtPlasmaC (GPLv2) or grbl-sim (GPLv3)
 source is copied, vendored, or linked; see §10.
 
 ---
@@ -364,7 +364,7 @@ struct CutRecipe {
 
 Lookup is **exact-row**. A miss returns a refusal naming the missing key — never an
 interpolated or nearest-neighbour value. A recipe is process data, never an authorization
-(`local://manufacturing-decisions.md`, abstraction #5 of `agent://ManufacturingBreadth`).
+(`00_decisions.md`, abstraction #5 of the manufacturing-breadth research).
 
 ### 4.3 Plasma process state
 
@@ -398,7 +398,7 @@ struct PlasmaReplayReport {
 
 ```cpp
 // Gateway owns both shared types (`MFG-CAPTRUTH-ONE-DEFINITION`; ratified in
-// `local://manufacturing-gateway-final.md`).
+// `10_gateway.md`).
 // This workstream COMPOSES them and never re-declares the level list or the row shape.
 //   core/device/capability.h    CapabilityTruth{level, truth, evidence_ref, emulator_stage,
 //                                              missing_level?, why?}, CapabilityReport
@@ -527,7 +527,7 @@ source.
 | `cam.cut.capability` | `CapabilityReport` | `epoch_invariant` | latest-per-domain; **any cited `evidence_ref` row falsified or superseded → re-derive and append a fresh capability row**, and the closure makes the prior one non-current, so a level cannot outlive the evidence under it (`MFG-CAPABILITY-DURABLE-KIND`) | `cam.cut.procedural_fact`, `cam.cut.emulate` | **no** — mandatory FALSE for `*capability` kinds (`MFG-CAPABILITY-NO-INHERIT`): a capability row re-derives from its own evidence and never inherits |
 | `cam.cut.procedural_fact` | `ProceduralFact` | `epoch_invariant` | falsification of the cited artifact propagates (falsify always propagates), which correctly un-verifies the level; no independent trigger | the cited artifact row — `cam.cut.plan` \| `post` \| `parse` \| `sim` \| `emulate`, whichever `check_name` ran against | **yes** — mandatory for `*procedural_fact` kinds (`MFG-PFACT-FOLLOWS-PARENT`): a fact left standing over a superseded parent would keep a level `verified` after the check it cites was re-run |
 
-Two rulings changed this table from my first submission and both are now general rules:
+Two rulings changed this table from the first submission and both are now general rules:
 `cam.cut.procedural_fact` was a parentless root with `supersede_with_parent` unset and
 described as "never falsified". Per `MFG-PFACT-FOLLOWS-PARENT` it now **declares the artifact it cites as its
 parent and sets `supersede_with_parent:true`** — registration refuses otherwise
@@ -575,7 +575,7 @@ Root-subject → class mapping (the gateway expands each to its closure):
 ### 5.3 MCP tools
 
 `services/manufacturing/cut/mcp_tools.py`. Tool family is the single shared
-**`manufacture`** family for the entire overhaul (Main's final ruling — the user-facing and
+**`manufacture`** family for the entire overhaul (the final project ruling — the user-facing and
 config family is the existing product term *Manufacture*, not the `mfg` wire prefix). The
 family is **OFF by default in `agent.tool_families` until commissioning**, so `enable_tools`
 cannot silently self-add manufacturing surface; per-tool Settings toggles retain granularity.
@@ -754,7 +754,7 @@ Rules that make this honest:
   author programs and to explain recorded runs. `PlasmaReplayReport::protective_function`
   is `false` by construction and asserted by a contract test. A state-machine "stop" is
   not a protective function (ISO 13849 / ISO 17916 exposure noted in
-  `agent://ManufacturingBreadth`).
+  the manufacturing-breadth research).
 - **Offline replay** (`mfg_plasma_state_replay`): a recorded ledger + the planned program
   produce per-transition timing, faults, THC corrections, unexplained transitions, and
   **coverage** (`states_covered`, `faults_covered`). Coverage is the DoD §8 guard-liveness
@@ -779,7 +779,7 @@ Explicitly **not** delivered, and stated in every response's fidelity manifest:
 - no cut-quality prediction beyond the recipe row that was actually looked up;
 - `grbl_waterjet` is **refused**: `M8` is a coolant word, not a pump command owner, and
   binding a pump to it would invent a device command owner this workstream does not have.
-- Out-of-table request → refusal, never extrapolation. `agent://ManufacturingBreadth`
+- Out-of-table request → refusal, never extrapolation. The manufacturing-breadth research
   found no mature open waterjet controller/emulator; the design therefore stops at E1 and
   claims nothing beyond it.
 
@@ -1053,7 +1053,7 @@ code and hardware own authorization.
 
 **Process scope**
 - No raster/photo/dithered engraving (data volume and scan planning are a different
-  problem, per `agent://ManufacturingBreadth`); no 3D/bevel/5-axis head; no tube, pipe, or
+  problem, per the manufacturing-breadth research); no 3D/bevel/5-axis head; no tube, pipe, or
   profile cutting; no nesting optimizer beyond within-operation ordering.
 
 **Execution**
@@ -1120,15 +1120,15 @@ code and hardware own authorization.
    `journal_client.py` + the three `cam_tools.py` guard edits + tests 23, 28, 32, 35, 36 +
    the MCP guard tests.
 6. `host/src/ui/manufacture/cut_process_panel.*` + the single `host/src/ui/cam/**` seam.
-7. `docs/REFACTOR_LOG.md` append + maintained skill/map updates in the same green commit
+7. As-built map (`docs/manufacturing/README.md`) and developer-doc updates in the same green commit
    (DoD §20).
 
 ---
 
 ## Appendix A — Review closure (B10, B15, C9, C10)
 
-Closes the `ArchitectureConsistencyReviewer` findings assigned to this document in
-`local://manufacturing-plan-review.md`. No product scope changes: every cutting deliverable, non-goal,
+Closes the architecture plan review findings assigned to this document. No product scope changes:
+every cutting deliverable, non-goal,
 capability claim and fidelity disclaimer above stands exactly as accepted.
 
 ### A.1 Gateway rule-id register (replaces every gateway section-number cross-reference — closes C10)
@@ -1187,8 +1187,8 @@ region (`:403-410`) and the diameter-mode formatting (`:229-232`, `:252-254`). `
 (`:169-175`) stays the shared **append** point both documents already declared — cutting adds `process`
 and `power_bindings`, turning adds the per-dialect turning capability row — and this reconciliation does
 not change its ownership. This paragraph is the wave ownership record for the line, recorded identically
-in `local://manufacturing-turning-architecture.md` and
-`local://manufacturing-cutting-process-architecture.md`; it supersedes turning's earlier "that one line
+in `17_turning.md` and
+`18_cutting.md`; it supersedes turning's earlier "that one line
 needs a joint edit" note and cutting's earlier claim that its `post.cpp` seams are **disjoint** from
 turning's, which was false as written for `:487`.
 

@@ -60,8 +60,6 @@ static void registryOwnership() {
     require(error["code"] == "forbidden_right", "viewer write refusal");
     require(!hostd::DocRegistry::isReadOnlyMethod("agent_run"), "agent prefix is not read authorization");
     require(!hostd::DocRegistry::isReadOnlyMethod("sim_study_add"), "sim prefix is not read authorization");
-    require(hostd::DocRegistry::isDesktopReadOnlyMethod("agent_run"), "desktop agent classification preserved");
-    require(hostd::DocRegistry::isDesktopReadOnlyMethod("sim_study_add"), "desktop study classification preserved");
     require(registry.preCall(2, "gui", "", "", "worker_read_probe", params, error, warning, true), "trusted exact cell policy admits document worker reads");
     require(!registry.preCall(2, "gui", "", "", "worker_read_probe", params, error, warning), "unlisted document worker method fails closed");
     json write = {{"revision", 1}, {"tree", json::object()}};

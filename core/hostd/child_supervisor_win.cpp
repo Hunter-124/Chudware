@@ -45,7 +45,6 @@
 #include "hostd_log.h"
 #include "../../services/ipc/ipc_private.h"
 #include "security/integrity.h"
-#include "security/runtime_guard.h"
 #include "util/platform_paths.h"
 
 namespace hostd {
@@ -336,17 +335,8 @@ void ChildSupervisor::doSpawn(SpawnReq& req) {
         executable, chudware::security::VerifyMode::ProtectedOperation);
     if (!integrity.ok) {
         isError = true;
-        result = json{{"code", "contained"},
+        result = json{{"code", "integrity_failed"},
                       {"message", "worker spawn blocked: protected_file_hash_mismatch"}};
-        return;
-    }
-    const auto security = chudware::security::inspectAndPersistRuntime(
-        chudware::security::SecurityCheckpoint::BeforeWorkerSpawn,
-        integrity.root, integrity.files, chudware::security::runtimeGuardStateDir().string());
-    if (!security.allowed()) {
-        isError = true;
-        result = json{{"code", "contained"},
-                      {"message", "worker spawn blocked: " + security.denialReason}};
         return;
     }
 

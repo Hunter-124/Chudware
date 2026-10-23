@@ -1,3 +1,5 @@
+# Printer Integration Research
+
 ## Executive recommendation
 
 Build a **local edge coordinator with capability-negotiated printer adapters**. The coordinator owns the durable job/event log, retries, reconciliation, notifications, and multi-printer view; each printer adapter remains thin and uses the printer stack's first-party local interface. Keep slicing/NC generation and webcam transport outside the execution adapter.
@@ -7,7 +9,7 @@ Recommended delivery order:
 1. **Moonraker/Klipper first.** It has the cleanest local control plane: documented upload and print-control REST/JSON-RPC, asynchronous object subscriptions, explicit job/temperature/progress/filament objects, webcam URL discovery, and Apprise notifications. Target Moonraker, not Klipper's Unix socket, and treat Mainsail/Fluidd as UX and conformance references.
 2. **OctoPrint 1.11.8 second.** Its REST job/file surface is stable and broad, its bundled virtual printer is excellent for adapter testing, and it reaches many Marlin-class machines. Isolate its explicitly changeable SockJS push interface behind the adapter and retain REST reconciliation.
 3. **PrusaLink local third, as a capability-probed family rather than one protocol.** Support only explicitly lab-certified model/firmware combinations. Start with local polling and file/job control. Do not promise camera, runout, push events, or identical authentication across Prusa generations.
-4. **Direct Marlin serial last.** It gives broad hardware reach but makes the product responsible for serial framing, line numbers/checksums/resends, command queues, compile-time feature variance, safety semantics, and host-vs-SD print continuity. Prefer OctoPrint in front of Marlin unless direct serial is a validated customer requirement.
+4. **Direct Marlin serial last.** It gives broad hardware reach but makes the product responsible for serial framing, line numbers/checksums/resends, command queues, compile-time feature variance, safety semantics, and host-vs-SD print continuity. Prefer OctoPrint in front of Marlin unless direct serial is a validated user requirement.
 5. Add **self-hosted Obico** as an optional, separately deployable vision/failure-monitoring service after reliable execution. Use Mainsail/Fluidd/OctoFarm as reference implementations, not execution backends.
 
 ## Architecture and capability matrix
@@ -78,10 +80,10 @@ Use a normalized adapter contract with explicit capability discovery rather than
 
 Implementing an independent network client from public documentation is ordinarily architecturally separate from these servers, but that is a legal inference, not legal advice. Do not copy implementation code or bundle/modify GPL/AGPL components until counsel reviews distribution and AGPL network-source obligations.
 
-## Founder decisions needed now
+## Open decisions
 
-1. **Protocol scope:** approve Moonraker → OctoPrint → capability-probed PrusaLink for V1, with direct Marlin deferred unless a named launch customer requires it.
+1. **Protocol scope:** approve Moonraker → OctoPrint → capability-probed PrusaLink for V1, with direct Marlin deferred unless a concrete user need requires it.
 2. **Offline guarantee:** define whether “offline” means only “no cloud/internet” or also survival of edge-host failure. The latter is impossible for Klipper and host-streamed OctoPrint/Marlin jobs; it requires printer-resident execution where available.
-3. **Prusa posture:** choose a small certified model/firmware matrix and local PrusaLink only, or fund a formal Prusa partner/API relationship. Do not base a product promise on Connect web endpoints.
+3. **Prusa posture:** choose a small certified model/firmware matrix and local PrusaLink only, or pursue a formally supported Prusa partner API. Do not base a product promise on Connect web endpoints.
 4. **Safety authority:** decide whether remote pause/cancel is convenience-only and vision is advisory by default (recommended), plus the physical-stop and human-confirmation requirements.
 5. **OSS deployment model:** choose between clean-room protocol clients only, optional user-installed OSS services, or product-bundled/modified servers; obtain license review before the latter two, especially for AGPL and Prusa `Freeware` components.

@@ -4,7 +4,7 @@
 // unsaved dot) that opens a popover to Checkpoint / Release / open the Project
 // Hub, without switching to the PLM workspace. Editing a Released document
 // auto-branches to a new-revision draft silently, with an actionable "Discard
-// draft" toast (Hunter's locked decision). Self-resolves the active document's
+// draft" toast (locked design decision). Self-resolves the active document's
 // item on document change (event-driven — never a per-frame RPC).
 #pragma once
 

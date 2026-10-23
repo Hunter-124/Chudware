@@ -167,5 +167,3 @@ current-format worker event log and terminal record.
   reference formulas; a PASS is not code certification.
 - A stale or differently built engine changes what is measured; trust only trials whose
   manifest shows no newer core sources (or compare cohorts with identical hashes).
-- Legacy results (`results/legacy/`) come from the retired prompt-set benchmark and are
-  not comparable; see `results/legacy/README.md`.

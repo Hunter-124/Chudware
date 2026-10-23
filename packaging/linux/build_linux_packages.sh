@@ -2,7 +2,7 @@
 # packaging/linux/build_linux_packages.sh — turn a verified Chudware AppDir into distro
 # packages (.deb, .rpm, .tar.zst) without touching one payload byte.
 #
-# The input is the SAME `squashfs-root` the nightly already extracted from the finished
+# The input is the SAME `squashfs-root` the release build already extracted from the finished
 # AppImage and verified (ldd clean, chudware-hostd loads, signed payload manifest
 # verifies). That tree is copied verbatim to /opt/chudware, so
 # payload-manifest.v1.json still verifies after the package is installed: the manifest
@@ -12,10 +12,8 @@
 # /usr/bin/chudware launcher symlink, the .desktop entry, the hicolor icons, the
 # copyright file — lives OUTSIDE that directory for exactly that reason.
 #
-# Filenames and the deb/rpm version fields come from
-# Webservice/gateway/artifact_names.py, the same module the gateway's
-# _canonical_artifact() uses. The gateway looks for a staged file by that exact name,
-# so this script must never hand-format a name; ask the module.
+# Filenames and the deb/rpm version fields come from packaging/artifact_names.py, the
+# single source of release file names; this script must never hand-format a name.
 #
 # Deterministic by construction: every mtime is pinned to SOURCE_DATE_EPOCH, tar entries
 # are name-sorted with numeric root ownership, compressors are single-threaded at a fixed
@@ -37,14 +35,14 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ARTIFACT_NAMES="$REPO/Webservice/gateway/artifact_names.py"
+ARTIFACT_NAMES="$REPO/packaging/artifact_names.py"
 PYTHON="${CHUDWARE_PACKAGING_PYTHON:-python3}"
 
 # Compression settings are part of the reproducibility contract, so they are constants,
 # not knobs: a caller that could change them could produce two different "identical"
 # builds. -T1 is mandatory (xz and zstd both vary their output with thread count).
-# xz -6 rather than -9: on a ~600 MB payload -9 costs several extra minutes of nightly
-# wall clock and ~640 MB of compressor memory for a low single-digit size win.
+# xz -6 rather than -9: on a ~600 MB payload -9 costs several extra minutes of release
+# build wall clock and ~640 MB of compressor memory for a low single-digit size win.
 DEB_XZ_LEVEL=6
 TAR_ZSTD_LEVEL=19
 
@@ -111,8 +109,8 @@ if [ -z "$VERSION" ]; then
     VERSION="$MANIFEST_VERSION"
 elif [ "$VERSION" != "$MANIFEST_VERSION" ]; then
     # A package whose filename claims one version while the signed payload inside it
-    # claims another is an auto-update trap: the gateway would serve it for a version
-    # the client then refuses to run.
+    # claims another is an auto-update trap: it would be offered for a version the
+    # client then refuses to run.
     echo "error: --version $VERSION disagrees with the AppDir manifest ($MANIFEST_VERSION)" >&2
     exit 1
 fi
@@ -542,17 +540,20 @@ def _desktop_entry(source: Path, version: str) -> str:
 
 
 def _copyright(license_path: Path) -> str:
+    # Machine-readable debian/copyright (DEP-5).
     return (
+        "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n"
         "Upstream-Name: Chudware\n"
-        "Source: https://chudware.com/\n"
+        "Upstream-Contact: Chudware contributors <167375961+Hunter-124@users.noreply.github.com>\n"
+        "Source: https://github.com/Hunter-124/Chudware\n"
+        "Comment: Bundled third-party components and their licenses are listed in\n"
+        " /opt/chudware/THIRD_PARTY_NOTICES.md and /opt/chudware/usr/bin/CHUDCODE-NOTICE.\n"
         "\n"
         "Files: *\n"
-        "Copyright: 2026 Chudware\n"
-        "License: Chudware-EULA\n"
-        " Use of this software is governed by the Chudware End User License Agreement\n"
-        " reproduced below.\n"
+        "Copyright: 2026 Hunter Edmonds and Chudware contributors\n"
+        "License: MIT\n"
         "\n"
-        "License: Chudware-EULA\n"
+        "License: MIT\n"
         + "".join(
             (" " + line if line.strip() else " .") + "\n"
             for line in license_path.read_text(encoding="utf-8").splitlines()
@@ -812,7 +813,7 @@ echo "==> staging /opt/chudware + desktop integration from $APPDIR"
 # assets/appicon carries the tesseract mark drawn natively at each size; pass it when
 # it exists and let the stager fall back to the AppDir's 256 master when it does not.
 STAGE_ARGS=(--appdir "$APPDIR" --root "$ROOT" --version "$VERSION"
-            --epoch "$SOURCE_DATE_EPOCH" --license "$REPO/LICENSE-EULA.txt")
+            --epoch "$SOURCE_DATE_EPOCH" --license "$REPO/LICENSE")
 [ -d "$REPO/assets/appicon" ] && STAGE_ARGS+=(--icon-set "$REPO/assets/appicon")
 STAGE_META="$(pkgtool stage "${STAGE_ARGS[@]}")"
 INSTALLED_SIZE_KIB="$("$PYTHON" -c 'import json,sys; print(json.loads(sys.argv[1])["installed_size_kib"])' "$STAGE_META")"
@@ -879,7 +880,7 @@ build_deb() {
         printf 'Package: chudware\n'
         printf 'Version: %s\n' "$debver"
         printf 'Architecture: amd64\n'
-        printf 'Maintainer: Chudware <support@chudware.com>\n'
+        printf 'Maintainer: Chudware contributors <167375961+Hunter-124@users.noreply.github.com>\n'
         printf 'Installed-Size: %s\n' "$INSTALLED_SIZE_KIB"
         printf 'Depends: %s\n' "$DEB_DEPENDS"
         printf 'Section: graphics\n'
@@ -891,9 +892,8 @@ build_deb() {
         printf ' assistant that drives the same tools a person does.\n'
         printf ' .\n'
         printf ' The application payload is installed under /opt/chudware and is covered by\n'
-        printf ' a signed manifest that it verifies at startup. Use of this software is\n'
-        printf ' governed by the Chudware End User License Agreement in\n'
-        printf ' /usr/share/doc/chudware/copyright.\n'
+        printf ' a signed manifest that it verifies at startup. Chudware is released under\n'
+        printf ' the MIT License; see /usr/share/doc/chudware/copyright.\n'
     } > "$control/control"
 
     pkgtool md5sums --root "$ROOT" > "$control/md5sums"
@@ -994,8 +994,8 @@ build_rpm() {
         printf 'Version:        %s\n' "$rpmver"
         printf 'Release:        %s\n' "$rpmrel"
         printf 'Summary:        AI-native parametric CAD\n'
-        printf 'License:        LicenseRef-Chudware-EULA\n'
-        printf 'URL:            https://chudware.com/\n'
+        printf 'License:        MIT\n'
+        printf 'URL:            https://github.com/Hunter-124/Chudware\n'
         printf 'BuildArch:      x86_64\n'
         # Explicit sonames instead of generated dependencies: the automatic generator
         # would also emit Requires for the ~130 libraries bundled under /opt/chudware
@@ -1013,8 +1013,8 @@ build_rpm() {
         printf 'the same tools a person does.\n'
         printf '\n'
         printf 'The application payload is installed under /opt/chudware and is covered by a\n'
-        printf 'signed manifest that it verifies at startup. Use of this software is governed by\n'
-        printf 'the Chudware End User License Agreement in %%{_docdir}/chudware/copyright.\n'
+        printf 'signed manifest that it verifies at startup. Chudware is released under the MIT\n'
+        printf 'License; see %%{_docdir}/chudware/copyright.\n'
         printf '\n'
         printf '%%install\n'
         # Hardlink rather than copy: the staged tree is hundreds of megabytes and rpm

@@ -136,9 +136,6 @@ inline AssemblyFinish classify_assembly_finish(int accepted_components, bool any
     if (accepted_components > 0) return {"done", "assembled"};
     return {"failed", first_failure.empty() ? "no_parts_built" : first_failure};
 }
-// Extract the optional web billing actor without manufacturing one for trusted
-// desktop/BYOK turns. Missing must remain JSON null so the worker omits the field.
-json worker_actor_from_options(const json& options);
 
 // run_design — drive the orchestrator against a LIVE doc session.
 //
@@ -182,9 +179,8 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 // "non_modeling_request" is reserved for the offline pre-flight that never reached
 // the worker. A worker that DIED, went SILENT, or rejected its request is Chudware
 // failing, not the user asking for something unrunnable: run-42508173312214 built
-// five real, auto-persisted features before its worker stopped responding, while
-// run-142525469607454 rejected an accidentally forwarded empty billing actor before
-// doing any work. Neither is a request-classification failure.
+// five real, auto-persisted features before its worker stopped responding. That is
+// not a request-classification failure.
 //
 // reached_worker  false only for the offline pre-flight refusal.
 struct WorkerStop {

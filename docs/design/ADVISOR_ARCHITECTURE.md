@@ -1,20 +1,15 @@
-# Pillar 20 — The Advisory Layer ("Foreman")
+# The Advisory Layer
 
-Status: ratified 2026-07-04 (Hunter directive, planned by lead session) and adopted.
-Frozen schemas live in `contracts/advisor.md`. Work was tracked as workstream **W**, lane
-`ai-copilot`. The workstream grew beyond the original T-W1 … T-W11. Board status on
-2026-10-04:
-
-- **Done** (`work/tasks/done/`): `T-W1`–`T-W10`, `T-W12`–`T-W19` and `T-W21`–`T-W32`.
-- **Still open:**
-  - `T-W11`, the end-to-end benchmark, is `review` (its 2026-08-04 results are Appendix A).
-  - `T-W20`, the MCP surface catch-up, is `todo` (deferred).
+Status: adopted design record (2026-07-04, updated 2026-10-04). Frozen schemas live in
+[`contracts/advisor.md`](../../contracts/advisor.md). The advisory engine is called the
+*foreman* in code (`services/agent/advisor/`). The components below are implemented; the
+end-to-end benchmark (Appendix A) and the MCP-surface catch-up for the newest components
+remain open.
 
 This document is design intent; component sections are not an as-built spec. Since
 2026-08-31, online model execution for the roles it routes runs inside the embedded
 Chudcode RPC runtime. Chudware keeps advisories, roles, councils and delegation
-governance; see
-[omp-integration/01-DECISIONS.md, 2026-08-31 section](../omp-integration/01-DECISIONS.md#2026-08-31--superseding-architecture-chudcode-rpc-is-the-only-online-runtime).
+governance; see [Chudcode integration](../dev/chudcode-integration.md).
 
 ## 0. Thesis
 
@@ -22,7 +17,7 @@ Today's loop is **generate → check → fail → guess again**. A checker that 
 "interference detected" forces the model to search dimension-space by trial and error —
 tolerable for Opus, fatal for a 24k-context 4B model.
 
-Pillar 20 inverts this: **deterministic helpers compute, models decide.** Every check
+The advisory layer inverts this: **deterministic helpers compute, models decide.** Every check
 failure arrives paired with solver-computed candidate fixes and the exact numbers needed
 (fit tables, equations, clearances). Every process stage arrives with the calculators,
 data tables, and playbook steps relevant to *that* stage, pre-filled from live model
@@ -34,14 +29,14 @@ Design rules:
 1. **Advise, never railroad.** Advisories are injected context, not control flow. A
    frontier model may ignore them; a small model leans on them. The same machinery
    serves both — only the *dial* (enforcement, verbosity, structure) changes per tier.
-2. **Numbers come from the kernel or a table, never from the LLM.** Same provenance
-   rule as Pillar 15.
+2. **Numbers come from the kernel or a table, never from the LLM.** Every number an
+   advisory carries has a recorded provenance.
 3. **State lives in the ledger, not the chat.** Chat history is a cache; the design
    ledger is the source of truth. Any role can be cold-started from ledger + describers
    inside a 24k window.
 4. **Every failure is a card, every card has candidate fixes, every retry is bounded.**
    After N attempts the loop escalates (ask_user or dag_replan) — never endless.
-5. **Freedom rule (Hunter, 2026-07-04).** Helpers, checkers, and oversight *inform,
+5. **Freedom rule.** Helpers, checkers, and oversight *inform,
    audit, and escalate — they never veto a model's action*. The only hard gates are
    the existing human-gated ones (kernel-fact dispute waivers §9.3, autonomy dial,
    destructive/external actions). Complexity goes into help, not restrictions; the
@@ -51,11 +46,11 @@ Design rules:
    visible in the transparency UI (§2.15) — troubleshooting the helpers is a
    first-class requirement.
 
-## 1. What we build on (reuse map — do not rebuild)
+## 1. What the layer builds on (reuse map — do not rebuild)
 
-| Existing | Where | Role in Pillar 20 |
+| Existing | Where | Role in the advisory layer |
 |---|---|---|
-| Agent loop (plan→code→render→verify, 4-level compaction) | `core/agent/run.cpp` (the loop behind the `agent_run_v2`/`agent_mission_v1` RPCs dispatched in `core/api/libchudware.cpp`; the Python `services/agent/loop.py` loop was removed in `T-RF5`) | Host for advisory injection (seam: message assembly before `provider.complete_ex`) |
+| Agent loop (plan→code→render→verify, 4-level compaction) | `core/agent/run.cpp` (the loop behind the `agent_run_v2`/`agent_mission_v1` RPCs dispatched in `core/api/libchudware.cpp`; it replaced the earlier Python agent loop) | Host for advisory injection (seam: message assembly before `provider.complete_ex`) |
 | DAG orchestrator, autonomy dial, `dag_replan` | `services/dag/` | Host for role cards per node; escalation target |
 | Tool registry w/ risk classes + allow-lists | `services/mcp/tool_registry.py` | Enforcement of role-card tool scopes (already supports `CHUDWARE_TOOLS_ALLOW` / node `tools:`) |
 | GSL describers (`describe_part/sketch/scene/...`) | `services/mcp/gsl_tools.py` | State→text for ledger snapshots and role handoffs |
@@ -64,18 +59,17 @@ Design rules:
 | Interference/overlap/mass/section/symmetry evals | `session.h` `doc_eval_*` | Raw signal for advisories & failure cards |
 | `regen_diagnose` / `regen_resolve` | `services/mcp/regen_tools.py` | First failure-card producer (rebuild class) |
 | `verify_battery`, `design_review` | verify/design_review tools | Stage-exit gates; advisory engine wraps their output |
-| Research tools (`web_search`, `material_lookup`, `thread_spec`, `eng_calc`, `unit_convert`) | Pillar 8 | Calculator registry extends `eng_calc`; web/data access for advisors |
+| Research tools (`web_search`, `material_lookup`, `thread_spec`, `eng_calc`, `unit_convert`) | `services/mcp/` research tools | Calculator registry extends `eng_calc`; web/data access for advisors |
 | Interaction contract (`ask_user`, answer ledger) | `services/agent/interaction.py` | Escalation transport; critical-dimension confirmation |
 | Materials registry | `services/sim/materials.json` | Inputs to DFM/tolerance/sim advisors |
-| Deterministic CAM fast-path (`deterministic_op_plan`) | `tools/flywheel/bench/benches/cam.py` | The proven "pre-defined process + model picks params" pattern we generalize |
 
-Confirmed gaps this pillar fills: auto-constraint inference, tolerance/fit tables (ISO
+Confirmed gaps this layer fills: auto-constraint inference, tolerance/fit tables (ISO
 286), feeds & speeds data, stage-aware advisory injection, role/playbook definitions,
 design ledger, failure-card unification, sim pre/post advisors.
 
 ## 2. Components
 
-### 2.1 Design Ledger (T-W1)
+### 2.1 Design Ledger
 
 A persistent, structured record of the mission — the anti-context-loss mechanism.
 Sections (schema frozen in contract §2): mission brief, requirements (linked to
@@ -91,7 +85,7 @@ open questions, stage log, artifact index (doc_ids, renders, study ids).
 - MCP tools: `ledger_get`, `ledger_note` (decision/dimension/question upserts). The
   advisory engine and roles write to it; humans see it in mission control.
 
-### 2.2 Stage model + Advisory Engine ("foreman") (T-W5)
+### 2.2 Stage model + Advisory Engine
 
 The process is a fixed vocabulary of stages (contract §1):
 `intake → spec → layout → sketch → feature → part_verify → assembly → sim → cam → deliver`
@@ -100,7 +94,7 @@ stages annotate *where inside a node's work* the agent currently is. Stage is in
 deterministically from the last tool calls (e.g. `add_features` w/ sketch ops ⇒ sketch;
 `run_fea_static` ⇒ sim) with an explicit `stage_set` override tool.
 
-After every tool call (loop.py seam) or node step (DAG seam), the engine:
+After every tool call (agent-loop seam) or node step (DAG seam), the engine:
 
 1. Runs the **stage's check battery** — cheap, deterministic, read-only (e.g. sketch
    stage: `analyze()` DOF + region closure; feature stage: `doc_eval_feature_overlap`;
@@ -119,7 +113,7 @@ The engine is deterministic Python — no LLM in the hot path. An optional "seni
 advisor" LLM pass (frontier model, off by default) can rank/expand advisories for
 ambiguous situations.
 
-### 2.3 Role cards (T-W7)
+### 2.3 Role cards
 
 Predefined sub-agent roles, data-driven (`services/agent/roles/*.yaml`), consumed by
 both the DAG node runner and standalone loop. Contract §4 fixes the schema:
@@ -127,7 +121,7 @@ both the DAG node runner and standalone loop. Contract §4 fixes the schema:
 ledger_sections (read/write), handoff_schema (structured JSON the role must emit),
 context_recipe (which describers at what budget), escalation_policy`.
 
-v1 roles (13, prompts AUTHORED by the lead in `services/agent/roles/*.yaml` —
+v1 roles (13, prompts authored in `services/agent/roles/*.yaml` —
 canonical, loaded verbatim): `intake_analyst`, `clarifier`, `spec_writer`,
 `orchestrator`, `layout_engineer`, `sketcher`, `feature_modeler`,
 `assembly_fit_engineer`, `sim_engineer`, `cam_programmer`, `reviewer`, `fixer`,
@@ -141,7 +135,7 @@ How they compose into a mission is specified in `docs/design/COPILOT_MISSION_PIP
 Handoffs are structured JSON (grammar-constrained for local models), written into the
 ledger — the next role never needs the previous role's chat.
 
-### 2.4 Playbooks (T-W7)
+### 2.4 Playbooks
 
 Pre-defined multi-step thinking scaffolds per operation type
 (`services/agent/playbooks/*.yaml`): ordered steps with `goal`, `helper_tools`,
@@ -160,24 +154,24 @@ Small models execute playbooks step-by-step (one step per turn); frontier models
 the playbook as a compact checklist and may batch steps. Enforcement level comes from
 the tier profile, not the playbook.
 
-### 2.5 Calculator & data registry (T-W3, T-W4, T-W6)
+### 2.5 Calculator & data registry
 
 Extends `research_eng_calc` into a keyed registry where the advisory engine can
 **pre-fill inputs from live geometry** (bore diameters, wall thickness, spans measured
-via `doc_eval_measure`). Every result uses the Pillar 8 envelope: `{answer, units,
+via `doc_eval_measure`). Every result uses the research-tool envelope: `{answer, units,
 equation, inputs, source, confidence}` — the equation is shown so the model (and human)
 can audit.
 
-- T-W3 data: ISO 286 fit/tolerance tables (H7/g6 & friends, IT grades), standard fit
+- Fit data: ISO 286 fit/tolerance tables (H7/g6 & friends, IT grades), standard fit
   recommendations by function (sliding/press/location), `fit_calc(nominal, fit)` and
   `suggest_dimension_scheme(sketch, process, material)`.
-- T-W4 calculators: bolted joint (preload/torque), thread engagement length, press-fit
+- Calculators: bolted joint (preload/torque), thread engagement length, press-fit
   interference stress, beam bending/deflection (also the sim cross-check), min wall
   thickness by process/material, snap-fit, shaft-hub. Auto-prefill layer.
-- T-W6 data: feeds & speeds by material/tool/operation (seed table + citation fields),
+- Machining data: feeds & speeds by material/tool/operation (seed table + citation fields),
   drill/tap charts; wired into the CAM fast-path and `cam_cost_estimate`.
 
-### 2.6 Sketch completion suite (T-W2)
+### 2.6 Sketch completion suite
 
 - **Auto-coincident**: a deterministic pass (`sketch_auto_constrain` RPC) that finds
   endpoint pairs within tolerance, proposes/applies `coincident` constraints, and
@@ -190,35 +184,35 @@ can audit.
   ordered constraint schedule (geometric → driving dims) to reach fully-constrained.
 - **`sketch_health`**: single MCP call returning the narrated status block (closure,
   DOF, per-entity status, advisor schedule) — the sketch-stage advisory source.
-- **Critical dimensions**: `suggest_dimension_scheme` (T-W3) chooses *which* dims to
+- **Critical dimensions**: `suggest_dimension_scheme` chooses *which* dims to
   drive based on function tags + manufacturing method (e.g. bolt-pattern
   center-to-center over edge-to-hole; process-appropriate default tolerances from the
   DFM profile), and marks dims needing user confirmation via `ask_user`.
 
-### 2.7 Failure cards + fixer loop (T-W8)
+### 2.7 Failure cards + fixer loop
 
 One schema (contract §5) for every failure class: rebuild error, solver
 conflict/divergence, interference, overlap, DFM violation, sim failure/margin miss,
 CAM gouge. Card = `{class, what, where (stable ids), why (deterministic diagnosis when
 available), candidate_fixes[{action, params, predicted_effect, confidence}], helper
-tools, attempt_count}`. `regen_diagnose` already produces the rebuild class — T-W8
-unifies the rest and adds the **bounded retry policy**: per-class attempt budget;
+tools, attempt_count}`. `regen_diagnose` already produces the rebuild class — failure
+cards unify the rest and add the **bounded retry policy**: per-class attempt budget;
 on exhaustion escalate to `ask_user` (with evidence) or `dag_replan`, never loop.
 The `fixer` role consumes cards; its prompt forbids shotgun edits ("change only what
 the card names; one candidate per attempt; report predicted vs measured effect").
 
-### 2.8 Simulation verification loop (T-W9)
+### 2.8 Simulation verification loop
 
 - **Pre-sim advisor**: BC lint (unconstrained bodies, load on suppressed face),
   mesh-size suggestion from feature size, and an **order-of-magnitude hand-calc
-  cross-check** using T-W4 calculators (beam/plate approximations) — the run is
+  cross-check** using the registry calculators (beam/plate approximations) — the run is
   annotated "expect ~X MPa" so garbage results are caught, not trusted.
 - **Post-sim narrator**: extends `describe_results` with margin policy per material
   (yield/endurance from registry), and geometry-linked suggestions ("max stress at
   fillet f_3 r=1; r=3 typically drops Kt 2.4→1.6 — candidate fix on feature F9").
 - Sim advisories feed failure cards when margins miss.
 
-### 2.9 Model tier profiles (T-W10)
+### 2.9 Model tier profiles
 
 `services/agent/tiers.yaml`: per-tier dials — context budget split (ledger/advisory/
 playbook/history token allocations), playbook enforcement (step-locked | checklist |
@@ -228,7 +222,7 @@ essential for small models), compaction aggressiveness. Ships with profiles:
 `local-24k`, `local-48k`, `mid`, `frontier`. Bench harness runs the same mission
 across tiers.
 
-### 2.10 Tool preflight — plans checked before they touch the doc (T-W12)
+### 2.10 Tool preflight — plans checked before they touch the doc
 
 Every mutating tool family gains a `preflight` capability: the planned ops are
 dry-run against a **shadow clone** of the document (serialize → clone → apply →
@@ -241,7 +235,7 @@ but "mutation applied after failed preflight, without a dispute" is recorded and
 an automatic audit trigger (§2.11). External MCP clients get it as an explicit
 `preflight_ops` tool; the internal loop runs it automatically.
 
-### 2.11 Overseer & plan audit (T-W13)
+### 2.11 Overseer & plan audit
 
 A supervisory role bound to the **highest-capability model available** in the user's
 configured sources (§2.12 routing). It does NOT review every turn (cost); it fires at
@@ -260,12 +254,12 @@ scoped change plan (with preflight), and dispatched to the right role(s) — so 
 the bore fit the new 25 mm shaft" edit touches exactly the bore feature, its ledger
 dimension, its fit calc, and re-runs only affected checks.
 
-### 2.12 Hierarchical delegation & model routing (T-W14)
+### 2.12 Hierarchical delegation & model routing
 
 Any agent may request a sub-agent (`role`, task brief, token/attempt budget). Depth-1
 requests from the orchestrator auto-approve; **deeper requests require approval from
-the mission overseer** (policy configurable: auto | overseer | human — the approval
-chain Hunter specified). The delegation tree — who spawned whom, why, with what
+the mission overseer** (policy configurable: auto | overseer | human). The delegation
+tree — who spawned whom, why, with what
 budget and model — is a ledger artifact rendered live in the transparency UI.
 
 Model routing: `services/agent/routing.yaml` maps role × tier → provider/model from
@@ -274,7 +268,7 @@ strongest source; orchestrator/reviewer → strong; sketcher/feature/cam roles �
 cheap/local; fixer → strong (it touches broken states). Budgets inherit down the tree
 (a sub-agent's spend counts against its parent's grant); depth cap default 3.
 
-### 2.13 Build-order DAG (T-W15)
+### 2.13 Build-order DAG
 
 A deterministic planner that turns a build plan into `aicad.buildgraph/1`: nodes are
 parts, features, and ops with **declared prerequisites** (datum before dependent
@@ -288,7 +282,7 @@ This is the fine-grained complement to `services/dag` missions: mission DAG = wh
 jobs; build graph = in what order inside a modeling job. `dag_plan` learns to emit
 build-graph nodes for modeling missions.
 
-### 2.14 Multi-document agent workspace (T-W16)
+### 2.14 Multi-document agent workspace
 
 Parallel part building for assemblies: a **doc ownership registry** (agent leases a
 doc_id; mutations by non-owners are rejected with the owner named; leases expire on
@@ -297,7 +291,7 @@ a per-doc event stream so the GUI can render N live viewports at once — the us
 watches every agent's part evolve simultaneously. Assembly-level roles (fit engineer,
 reviewer) take read leases; the world/assembly doc has a single writer at a time.
 
-### 2.15 Transparency & control UI (T-W17)
+### 2.15 Transparency & control UI
 
 Two GUI surfaces (`host/src/ui/`, per the pinned-glass-column design language):
 
@@ -311,30 +305,32 @@ Two GUI surfaces (`host/src/ui/`, per the pinned-glass-column design language):
   preflight toggles. Approval prompts (delegation, waivers) surface through the
   existing interaction contract transports.
 
-### 2.16 PLM / version-control integration (T-W18)
+### 2.16 PLM / version-control integration
 
-Pillar 19 (workstream R) integration, taken as a design input now:
+Integration with [PLM version control](PLM_VERSION_CONTROL_PLAN.md), taken as a design
+input:
 
 - **Milestone checkpoints**: stage-exit passes, audit-passed plans, and per-part
   completions in an assembly fan-out create history entries in the hidden git vault
-  (snapshot-based, per Pillar 19) — agents produce the same Project/History/Checkpoint
+  (snapshot-based) — agents produce the same Project/History/Checkpoint
   nouns humans do, never raw git.
 - **Plain-language annotations**: ledger decision/dimension events attach to history
   entries ("bore set to 20.02 for H7/g6 sliding fit on shaft S1 — advisory adv_…"),
-  which is exactly the AI-drafted history message tier Pillar 19 already planned.
+  which is exactly the AI-drafted history message tier the PLM design already planned.
 - **Change-requests reference checkpoints**: the overseer's change plans record which
   checkpoint they modify, so "undo that change" and "what did the agent change for
   this request" are answerable from the PLM timeline.
-- Feature-flagged against vault availability; codes to the workstream R contract.
+- Feature-flagged against vault availability; codes to the
+  [`contracts/plm.md`](../../contracts/plm.md) contract.
 
-### 2.17 Organization layer (1.3 — contract §18–§21, T-W21..T-W24)
+### 2.17 Organization layer (contract §18–§21)
 
 Departments (per deliverable cluster, chaired by the authored department_manager
 role) with auto-created inter-department channels and an enforced
 interface_change discipline; worker requests with mandatory explicit resolution
 and concern-aging into overseer audits; seated COUNCILS (authored personas:
 manufacturing/tolerancing/fitment/simplicity) gating build strategy before
-geometry, with recorded dissents the foreman watches; trigger-based context
+geometry, with recorded dissents the advisory engine watches; trigger-based context
 injection (keyword/tool/event → context packs + pre-run calcs); and the
 dimension DERIVATION TREE with linked-dimension eq_set binding and the
 deterministic mark_faulty impact walker. Deliberation dial is inverted: local
@@ -357,27 +353,25 @@ The invariant: any role turn is reconstructible from ledger + describers; histor
 disposable. This is what lets ten roles collaborate on one mission without any of them
 holding the mission in-context.
 
-## 4. Workstream W task map
+## 4. Component dependency map
 
 ```
-T-W1 ledger ─────┬─→ T-W5 advisory engine ─┬─→ T-W8 failure cards/fixer ─┐
-                 └─→ T-W7 roles+playbooks ─┼─→ T-W10 tier profiles       ├─→ T-W11 e2e bench
-T-W2 sketch suite ─────────────────────────┤                             │
-T-W3 fits/tolerance data ─→ T-W4 calculators ─→ T-W9 sim advisor ────────┘
-T-W6 feeds/speeds data ──────────────────────────────────────────────────┘ (via CAM path)
+design ledger ───┬─→ advisory engine ─┬─→ failure cards/fixer ─┐
+                 └─→ roles+playbooks ─┼─→ tier profiles        ├─→ end-to-end bench
+sketch suite ─────────────────────────┤                        │
+fit/tolerance data ─→ calculators ─→ sim advisor ──────────────┘
+feeds/speeds data ─────────────────────────────────────────────┘ (via CAM path)
 
-T-W12 preflight (no deps) ──────────────┬─→ T-W13 overseer/audit ─→ T-W14 delegation+routing
-T-W15 build-order DAG (no deps) ────────┤         (also ← T-W1, T-W5)      (also ← T-W7)
-T-W1 + T-W5 ────────────────────────────┘
-T-W5 ─→ T-W17 transparency UI + settings (app-gui)
-T-W7 ─→ T-W16 multi-doc workspace
-T-W1 ─→ T-W18 PLM integration (plm-projects, ← workstream R contract)
-T-W5 + T-W7 + T-W15 ─→ T-W19 mission pipeline glue (docs/design/COPILOT_MISSION_PIPELINE.md)
+preflight (no deps) ──────────┬─→ overseer/audit ─→ delegation+routing
+build-order DAG (no deps) ────┤    (also ← ledger, advisory engine)  (also ← roles)
+ledger + advisory engine ─────┘
+advisory engine ─→ transparency UI + settings
+roles ─→ multi-doc workspace
+ledger ─→ PLM integration (← contracts/plm.md)
+advisory engine + roles + build-order DAG ─→ mission pipeline (COPILOT_MISSION_PIPELINE.md)
 ```
 
-Wave 1 (launched 2026-07-04): T-W1, T-W2, T-W3, T-W6. Wave 1b (no deps): T-W12, T-W15.
-
-## 5. Beyond-the-competition bets (lead suggestions)
+## 5. Design bets
 
 1. **Fix-candidates-first checking.** Nobody ships checkers that answer "so what do I
    change." Pairing every failure with kernel-computed candidate fixes is the single
@@ -385,47 +379,45 @@ Wave 1 (launched 2026-07-04): T-W1, T-W2, T-W3, T-W6. Wave 1b (no deps): T-W12, 
    same cards in the app).
 2. **The ledger as a product feature.** "Why is this hole Ø20.02?" → the ledger has
    the decision, the fit class, and who confirmed it. That's design intent capture the
-   big CAD vendors bolt on badly; we get it free from the agent architecture, and it
-   feeds Pillar 19 (PLM) timelines and Pillar 16 training data.
+   big CAD vendors bolt on badly; the agent architecture yields it directly, and it
+   feeds PLM timelines and training data.
 3. **Grammar-constrained handoffs make 4B models composable.** Role → role JSON under
    GBNF means a 4B model's sloppiness can't corrupt the pipeline; correctness reduces
    to per-role competence, which playbooks + advisories directly boost.
 4. **Advisories as training signal.** Every (advisory shown → model action → check
-   outcome) triple is a labeled example for the Pillar 13/16 flywheel — the NNUE
-   next-action value head gets its dataset from normal operation.
-5. **Same advisory bus for the human GUI.** The foreman's advisory blocks are
+   outcome) triple is a labeled example for model training — a next-action value
+   model gets its dataset from normal operation.
+5. **Same advisory bus for the human GUI.** The advisory engine's blocks are
    render-able as in-app hints (the existing overlay/PropertyManager). One engine,
    two audiences.
 
 ---
 
-# Appendix A — T-W11 end-to-end results (2026-08-04)
+# Appendix A — End-to-end advisory benchmark (2026-08-04)
 
-Measured, not projected. Everything below came from
-`tools/flywheel/bench/benches/advisor_e2e.py` against live subscription models;
-the raw per-leg JSON is under `training/benches/advisor_e2e/results/`.
+Measured, not projected. The results below came from a live-model benchmark harness
+(research tooling that is not part of the public tree) run against hosted frontier and
+long-context models.
 
 ## What ran
 
 One frozen mission — *bearing mount bracket: 20 mm g6 sliding-fit bore, 4x M5
 clearance holes, aluminium, machined, survives a 500 N side load* — through both
-loops on two paid tiers:
+loops on two hosted model tiers:
 
 * **baseline** — one linear `general_agent` turn (`run_linear_role_turn`)
 * **advisory** — the orchestrator role over a compiled `aicad.dag/1` mission
-  graph with role nodes and the T-W5 foreman on (`dag.executor.run`)
+  graph with role nodes and the advisory engine on (`dag.executor.run`)
 
 Scoring is deterministic, no LLM judges: bore diameter through `fit_calc`
 (clearance fit on 20 g6), hole pattern by counting `concavity == "bore"` faces
 near Ø5.5 in `query_geometry`, `is_manifold` from the verifier battery, and
 `min_fos` from `run_fea_static` under the 500 N load.
 
-**Honest scope: ONE seed, not the three the card asks for.** Each advisory leg
-runs the full DAG (intake → plan → spec → build → verify → deliver) at
-~17–30 min, and Hunter's instruction was to come in under the authorized quota.
-Seeds 2 and 3 were not run. The matrix is seed-major precisely so the executed
-subset is a complete loop x tier block; the remaining seeds are one command:
-`CHUDWARE_BENCH_LIVE=1 python -m tools.flywheel.bench.runner advisor_e2e`.
+**Scope: one seed, not the planned three.** Each advisory leg runs the full DAG
+(intake → plan → spec → build → verify → deliver) at ~17–30 min, and the run was held
+under its model-usage budget. Seeds 2 and 3 were not run. The matrix is seed-major so
+the executed subset is a complete loop × tier block.
 
 ## Comparison
 
@@ -450,7 +442,7 @@ four — no bore face of the right size ever reached the document.
 **It does not show the advisory loop winning on quality.** At n=1 per cell the
 outcome is decided by the TIER, not the loop: opus-5 satisfied the mission on
 both loops, k3-256k on neither. That is a real finding and it is not the one the
-pillar's thesis predicted.
+layer's thesis predicted.
 
 **The token result is the interesting one.** The advisory loop used roughly HALF
 the tokens of the linear loop on both tiers (367k vs 701k on opus-5; 198k vs 398k
@@ -462,7 +454,7 @@ economic — more actions per token — rather than higher single-shot quality.
 **Do not read the failure rates as loop quality.** The advisory loop's higher
 rate (14.1% vs 7.3%) is dominated by mission-scoped tools its nodes are
 advertised but cannot resolve in a bench harness (`delegate`, `dag_status`,
-`buildgraph_status`) — see the gap ledger. That is a harness-shaped artifact of
+`buildgraph_status`). That is a harness-shaped artifact of
 how the bench drives the DAG, not evidence about the loop.
 
 ## Measurement caveats found the hard way
@@ -473,7 +465,7 @@ how the bench drives the DAG, not evidence about the loop.
   grading the BASELINE leg's finished bracket and reported 1.00 across the board.
   The corrected scorer only considers documents that did not exist when the leg
   started. The k3-256k 0.00 rows are what that contamination was hiding.
-* **Legs must hold a private daemon** (`private_hostd.private_daemon()`), or a
+* **Legs must hold a private daemon**, or a
   concurrent pytest run shares the engine and destroys the leg's document
   mid-run — observed, open-doc count climbing 2 → 15 under a leg.
 * **Doc-GC must be pinned off** (`CHUDWARE_DOC_GC=0`); hostd was logging
@@ -486,8 +478,8 @@ how the bench drives the DAG, not evidence about the loop.
 
 Not delivered. `dag.node.done` carried an `advisory` block on **zero** nodes
 across all four legs (`advisories = 0` in every leg record), so there were no
-advisory-shown → action → check-outcome triples to log. The T-W5 foreman is
+advisory-shown → action → check-outcome triples to log. The advisory engine is
 gated on `CHUDWARE_ADVISOR` (default on) AND on the node carrying a `doc_id`;
 `node_runner._run_advisory` no-ops without one. Establishing why no node
-qualified is prerequisite work for the Pillar-16 next-action dataset, and it is
-the first thing to chase before spending more quota on seeds 2 and 3.
+qualified is prerequisite work for a next-action training dataset, and it is
+the first thing to investigate before running seeds 2 and 3.

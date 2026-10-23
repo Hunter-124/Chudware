@@ -63,7 +63,7 @@ The following states are tracked independently:
 |---|---|---|---|
 | Registry and claim guard | Implemented in source | No production evidence registry is supplied; therefore S0 by default | Focused contract tests pass and a release owner approves the registry location/retention policy |
 | General V&V harness | Existing | Existing reports include visible failures/skips; they are not promoted by this document | Current full run records exact sources/revisions and has zero unexplained FAIL or unexpected SKIP |
-| PolyMesh/Polyhedral-FEA family | Harness cases implemented | Not executed or registered by this document | Both clean-room cases execute on the shipped binary, identify the binary hash/private-fork source revision, and meet their declared tolerances |
+| PolyMesh/Polyhedral-FEA family | Harness cases implemented | Not executed or registered by this document | Both clean-room cases execute on the shipped binary, identify the binary hash and the pinned Polyhedral-FEA fork revision, and meet their declared tolerances |
 | External QMS/accreditation | No qualifying repository implementation | Not started | Written external scope and decision from the relevant independent body |
 
 The known FEA uniform-pressure failure remains a failure/xfail until its root cause is fixed and
@@ -82,7 +82,7 @@ current evidence remains S0 regardless of nearby or similarly named evidence.
 | PolyMesh/Polyhedral-FEA integration | PM1 bending and PM2 axial clean-room references plus mesh-quality invariants | Same geometry solved on an independent discretizer; compare convergence, not one favorable mesh | Instrumented coupon across at least three mesh bands | Meshing V&V Owner |
 | Thermal, including transient | 1-D steady conduction and transient slab series solution; conservation | Elmer or CalculiX thermal on the same boundary conditions | Calibrated thermal coupon with sensor uncertainty | Thermal V&V Owner |
 | Native LBM CFD | Conservation and convergence cases; drag is trend-only until calibrated | OpenFOAM or another independently implemented CFD solver | Wind/water-tunnel dataset with geometry and fluid-property traceability | CFD V&V Owner |
-| OpenFOAM and private-fork CFD backends | Laminar channel/pipe, manufactured solution where available, mesh/time-step convergence | NASA TMR/public benchmark comparator or a distinct solver | Facility dataset with inlet, turbulence, and instrumentation uncertainty | CFD V&V Owner |
+| OpenFOAM and forked CFD backends | Laminar channel/pipe, manufactured solution where available, mesh/time-step convergence | NASA TMR/public benchmark comparator or a distinct solver | Facility dataset with inlet, turbulence, and instrumentation uncertainty | CFD V&V Owner |
 | Hydraulics and piping networks | Pump sizing; Darcy-Weisbach; topology/mass conservation; property-range boundaries | EPANET/WNTR or pandapipes as applicable | Logged loop/plant data with calibrated pressure and flow sensors | Fluids V&V Owner |
 | ECAD impedance and circuit/SPICE | Trace formulas; DC/AC/transient canonical circuits; convergence failures | ngspice or independently derived MNA result | Bench measurements with fixture/probe de-embedding notes | ECAD V&V Owner |
 | Electromagnetics | Waveguide/cavity/antenna canonical cases; energy balance; mesh convergence | openEMS or Elmer as applicable | VNA/chamber dataset with calibration records | EM V&V Owner |
@@ -91,7 +91,7 @@ current evidence remains S0 regardless of nearby or similarly named evidence.
 | Assembly motion/interference | Analytic joint motion, exact overlap fixtures, tolerance-boundary cases | Independent geometric/kinematic calculation | Metrology or motion-capture fixture where the use case warrants it | Assembly V&V Owner |
 
 PolyMesh is a mesher path into Chudware's supported tet4/tet10 solver contract. Its name and
-private-fork lineage do not mean that Chudware executed a VEM or general polyhedral-element
+fork lineage do not mean that Chudware executed a VEM or general polyhedral-element
 solve. The benchmark report must state both the solver source and the exact linked-binary hash.
 
 ## 5. Measurable internal gates and milestones

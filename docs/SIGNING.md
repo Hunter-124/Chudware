@@ -1,157 +1,135 @@
-# Release signing and notarization
+# Release signing
 
-Chudware has two independent trust layers:
+Chudware releases carry two independent kinds of signature:
 
-1. **Platform signing** makes Windows SmartScreen and macOS Gatekeeper recognize the publisher.
-2. **Release signing** creates the Ed25519 `.sig` consumed by the in-app updater. It signs the 64 lowercase ASCII characters of the artifact's SHA-256 digest, not the 32 raw digest bytes. The `.sig` file and release-manifest `signature` field use standard RFC 4648 base64.
+1. **Release signatures (required).** Ed25519 signatures over every payload
+   manifest and every update manifest. The application and the in-app updater
+   verify them against public keys compiled into
+   `core/security/release_keys.h`. They are what makes an update trustworthy.
+2. **Platform code signing (optional).** Authenticode on Windows and a
+   Developer ID signature plus notarization on macOS. These only affect
+   SmartScreen and Gatekeeper prompts; they add no trust the updater relies on.
 
-Unsigned packages remain buildable for internal testing. Every packager emits exactly:
+[RELEASING.md](RELEASING.md) describes the release workflow that uses these
+values; [reference/CI.md](reference/CI.md) lists every secret.
 
-```text
-WARNING: unsigned build — SmartScreen/Gatekeeper will warn users
-```
+## Ed25519 release keys
 
-An unsigned package is not a production trust signal. Publish it only through a controlled test channel and verify its SHA-256 and Ed25519 signature.
+`core/security/release_keys.h` trusts two keys:
 
-## CI custody prerequisite
-
-Do not enable signing based on workflow YAML, a fresh virtualenv, or separate
-runner users. [CI runner trust-boundary requirements](reference/CI_RUNNERS.md#execution-trust-boundary-supplychain-rs-2)
-are a release gate: authenticated restricted runner-group/workflow/ref
-configuration, one-job disposable branch workers, clean protected OS images,
-and externally checked interpreter/native-tool/SDK identities are required.
-No signing credentials may be delivered before that evidence is approved.
-
-The checked-in boundary is `chudware-untrusted-ephemeral` versus
-`chudware-trusted-protected`. All platform and CI release credentials belong
-only to the protected fleet's `chudware-release-protected` environment, with
-protected source refs and independent approval. Remove signing, R2 and gateway
-credentials from repository/organization secret scopes visible to branches;
-changing a workflow label does not revoke those secrets. Rebuild or quarantine
-previously shared Windows/Linux signing state before restoring credential
-access. A profile/Python/tool cache writable by a PR must never be mounted or
-reused by a signing job.
-
-Protected images must export the externally qualified absolute
-`CHUDWARE_CI_BASE_PYTHON` and reviewed offline `CHUDWARE_WHEELHOUSE`.
-Nightly and reusable release builders provision a job-local interpreter from
-the authenticated complete wheel snapshot and check all applicable
-`packaging/requirements-release.txt` compiler inputs before use. Never repair
-a missing compiler by publicly syncing pip packages into a signing interpreter
-or accepting an old home-directory venv by its import capabilities alone.
-The separately trusted base inspects candidate executable/launcher/pyvenv.cfg
-and installed package bytes offline before any candidate Python launch;
-bootstrap removes inherited Python/loader injection environment variables.
-
-Stable Windows/macOS prepared handoffs additionally retain the paired files
-selected by `CHUDWARE_PLATFORM_PUBLISHER_POLICY` and
-`CHUDWARE_PLATFORM_PUBLISHER_POLICY_SIGNATURE` as
-`platform-publishers.v1.json` / `.sig`, with both hashes in `locked_inputs`.
-The finalizer authenticates this policy against the fixed offline owner root
-and verifies the actual certificate/Apple team and bundle identity. A
-`CHUDWARE_SIGN_IDENTITY` subject selector is not publisher authority. These
-nonsecret, owner-authenticated files and real certificate/team inputs must be
-supplied operationally; source does not invent trusted publisher identities.
-
-Nightly Windows/macOS builds emit a signed native-publisher byproduct in SLSA.
-When the owner policy pair and platform signing/notarization inputs exist, the
-native evidence writer verifies the actual artifact before a positive report
-is attached. An attempted native verification failure stops the job; it cannot
-be downgraded to a negative report. Missing native inputs instead produce an
-explicit signed `verified:false` report: beta testing remains possible, but
-stable promotion must reject it. This is distinct from missing release/test
-evidence, which is always a failure.
-
-Tagged `release.yml` calls the protected reusable `release-prepare.yml`.
-Authorize the defining reusable builder and nested Stripe workflow at each
-exact approved tag, not merely the caller or a wildcard. It prepares bounded
-offline-owner signing requests; it never receives the offline owner's private
-key. Nightly signing uses its separate CI key only after the same operational
-runner gate. Native build/test jobs stay disposable even for release tags;
-their outputs are not downloaded into protected signing jobs.
-
-## Windows: what to buy
-
-Buy a currently trusted **Authenticode code-signing certificate** for the legal entity that publishes Chudware. An OV certificate is sufficient for cryptographic publisher identity; an EV certificate can improve reputation bootstrapping but does not remove every SmartScreen reputation check. The product needs Authenticode/code-signing use, SHA-256 support, and RFC 3161 timestamping—not a TLS/SSL certificate.
-
-Current CA/Browser Forum rules require newly issued public code-signing private keys to be held in approved hardware or a compliant cloud-signing service. Choose one of:
-
-- a CA-provided USB hardware token usable by `signtool.exe` through the Windows certificate store, or
-- a CA/cloud HSM service that exposes a `signtool.exe`-compatible certificate/provider on the self-hosted Windows runner.
-
-Do not export or commit a PFX merely to simplify CI. Install the certificate only for the clean, qualified `cc-win-package` account in `chudware-trusted-protected`, in `Cert:\CurrentUser\My`, including the private-key provider and chain. Ensure `signtool.exe` from the Windows 10/11 SDK is installed. Never expose that store/provider to a disposable worker.
-
-Set these GitHub Actions secrets/environment values:
-
-| Value | Where it goes | Meaning |
+| Key id | Private half | Used by |
 |---|---|---|
-| `CHUDWARE_SIGN_IDENTITY` | `chudware-release-protected` environment secret for the Windows packaging job | Exact certificate subject passed to `signtool sign /n`, for example `Chudware, Inc.` |
-| `SIGNTOOL` | Optional runner environment (not a secret) | Full path to `signtool.exe` when it is not on `PATH` |
+| `release-ci-v1` | `CHUDWARE_RELEASE_SIGNING_KEY` repository secret | `release.yml`, through `packaging/ci_sign.py` and `packaging/github_release_manifest.py` |
+| `release-v1` | Age-encrypted file kept offline by the maintainer | Signing a prepared request by hand with `packaging/sign_release.py` |
 
-`services/installer/build_release.py` invokes Inno Setup, then signs and verifies `Chudware-Setup-<version>-x86_64.exe` with SHA-256 and DigiCert's RFC 3161 timestamp service. Buying or rotating the certificate changes runner provisioning/secrets, not packaging code.
+The secret is the canonical base64 encoding of the 32-byte Ed25519 seed, not a
+PEM file. Every signing tool takes the expected public key and refuses to sign
+if the seed does not match it.
 
-## macOS: what to buy
+### Creating a key
 
-Enroll the publishing legal entity in the **Apple Developer Program** and issue a **Developer ID Application** certificate. Do not buy/use a Mac App Distribution or Mac Installer Distribution certificate: Chudware ships outside the Mac App Store as a signed `.app` inside a zip.
-
-Install the Developer ID Application certificate and private key only in the keychain of a clean, qualified protected Mac packaging runner, never the OS/home/tooling used by disposable test workers. Unlock that keychain for non-interactive signing and grant `/usr/bin/codesign` access to the key. Set:
-
-| Value | Where it goes | Meaning |
-|---|---|---|
-| `CHUDWARE_SIGN_IDENTITY` | `chudware-release-protected` environment secret | Full `codesign` identity, normally `Developer ID Application: Legal Entity (TEAMID)` |
-| `CHUDWARE_NOTARIZE_PROFILE` | `chudware-release-protected` environment secret | Name of a `notarytool` keychain profile stored only on the protected runner |
-
-Create the notarization profile once per runner. Either use an App Store Connect API key with Developer access, or an Apple ID plus team ID and app-specific password. For the Apple-ID route:
+Generate the seed on a trusted machine and send it straight to the repository
+secret:
 
 ```bash
-xcrun notarytool store-credentials chudware-notary \
-  --apple-id RELEASES@EXAMPLE.COM \
-  --team-id TEAMID \
-  --password APP_SPECIFIC_PASSWORD
+umask 077
+python3 - > release-key.b64 <<'PY'
+import base64
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+key = Ed25519PrivateKey.generate()
+seed = key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                         serialization.NoEncryption())
+public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+print(base64.b64encode(seed).decode())
+print("public key:", public.hex(), file=__import__("sys").stderr)
+PY
+gh secret set CHUDWARE_RELEASE_SIGNING_KEY --repo Hunter-124/Chudware < release-key.b64
+shred -u release-key.b64
 ```
 
-Enter `chudware-notary` as `CHUDWARE_NOTARIZE_PROFILE`; never put the Apple password itself in that variable. `packaging/macos/build_app.sh` applies hardened-runtime signing, submits the zip with `notarytool --wait`, staples the accepted ticket to the app, and recreates the canonical zip.
+Keep an encrypted offline backup of the seed if losing it would be a problem;
+GitHub secrets cannot be read back.
 
-## Ed25519 release key: what to create
+### Rotating a key
 
-Generate an offline Ed25519 owner release key dedicated to software updates. This is not an Authenticode or Apple certificate and cannot be purchased from a CA. Keep the owner private key encrypted and offline; never put it in Actions. The automatic nightly key is a separate CI identity and must be stored only in the protected release environment, after the runner boundary is qualified.
+Clients only trust keys compiled into them, so rotation takes two releases:
 
-One generation method is:
+1. Add the new public key under a new id (for example `release-ci-v2`) to
+   `core/security/release_keys.h` and to `RELEASE_PUBLIC_KEYS` in
+   `packaging/github_release_manifest.py`. Release that build, signed with the
+   old key.
+2. Once users have updated, replace the secret, set `CHUDWARE_RELEASE_KEY_ID`
+   and `CHUDWARE_RELEASE_PUBLIC_KEY` in `.github/workflows/release.yml` to the
+   new key, and release again.
 
-```bash
-openssl genpkey -algorithm ED25519 -out chudware-release-ed25519.pem
-openssl pkey -in chudware-release-ed25519.pem -pubout -out chudware-release-ed25519.pub.pem
-```
+Remove the old key from the trust ring only after no supported version still
+needs it. If a private key leaks, remove its public key in the next release
+and set `CHUDWARE_MIN_SUPPORTED_VERSION` so older clients are told to update.
 
-Set:
+## Windows code signing (optional)
 
-| Value | Where it goes | Meaning |
-|---|---|---|
-| Offline owner release key | Encrypted offline owner custody, not GitHub Actions | Used by `packaging/sign_release.py` for the bounded requests produced by `release-prepare.yml` |
-| `CHUDWARE_RELEASE_CI_KEY` | `chudware-release-protected` environment secret | Separate automatic nightly CI signing identity; not the offline owner key |
-| Release public key | Desktop updater trust store/build configuration | Public half corresponding to the private key; it is safe to distribute but changes require an updater trust-key rotation |
+Without a certificate the release ships unsigned installers, the build prints
+`WARNING: unsigned build — SmartScreen/Gatekeeper will warn users`, and the
+release notes say so.
 
-The offline owner signs verified request bytes using `packaging/sign_release.py`. Manual `packaging/publish.py upload` tooling accepts its signing key through the operator's controlled process environment; it is not a reason to place the owner key in repository secrets. Private keys must never reach R2, the gateway, or branch workers.
+To sign, obtain an Authenticode code-signing certificate (OV or EV) for the
+publishing entity and store it as two repository secrets:
 
-## R2 and gateway publication values
-
-These are transport/authentication secrets, not signing identities:
-
-| Value | Where it goes |
+| Secret | Value |
 |---|---|
-| `R2_ENDPOINT` | Release job environment; account-specific S3 endpoint |
-| `R2_ACCESS_KEY_ID` | `chudware-release-protected` environment secret, scoped to `chudware-releases` |
-| `R2_SECRET_ACCESS_KEY` | Matching protected release environment secret |
-| `CHUDWARE_GATEWAY_URL` | Release registration job environment, for example the production gateway origin |
-| `CHUDWARE_GATEWAY_RELEASE_TOKEN` | `chudware-release-protected` environment secret accepted by release publication endpoints |
+| `CHUDWARE_WINDOWS_CERTIFICATE` | Base64-encoded PFX containing the certificate, its chain and private key |
+| `CHUDWARE_WINDOWS_CERTIFICATE_PASSWORD` | The PFX password |
 
-R2 is not enabled for the account yet. Publication intentionally fails with an actionable message until R2 is enabled, the `chudware-releases` bucket exists, and the three R2 values are configured.
+The `windows` job imports the PFX into the runner's `CurrentUser\My` store and
+exports the certificate's subject as `CHUDWARE_SIGN_IDENTITY`.
+`services/installer/build_release.py` and `services/installer/build_msi.py` then
+run `signtool sign /n <subject> /fd SHA256 /tr http://timestamp.digicert.com /td SHA256`
+and `signtool verify /pa` on the installer and the MSI.
 
-## Rotation and verification
+Certificates issued since 2023 keep their private key in a hardware token or a
+cloud HSM and cannot be exported as a PFX. To use one of those, replace the
+import step in `release.yml` with the provider's signtool integration and keep
+exporting the certificate subject as `CHUDWARE_SIGN_IDENTITY`.
 
-- Renew platform certificates before expiry; timestamped older Windows releases remain verifiable after certificate expiry.
-- Rotate an R2 or gateway credential without rebuilding artifacts.
-- Treat Ed25519 private-key rotation as a product trust migration: ship the new public key through an update signed by the old key before using the new private key.
-- Verify Windows with `signtool verify /pa /v <installer>`.
-- Verify macOS with `codesign --verify --deep --strict --verbose=2 Chudware.app` and `spctl --assess --type execute --verbose=4 Chudware.app`.
-- Verify a release sidecar by hashing the artifact, then verifying the base64-decoded `.sig` over the lowercase ASCII digest with the pinned Ed25519 public key.
+Check a signed installer with `signtool verify /pa /v Chudware-Setup-<v>-x86_64.exe`.
+
+## macOS signing and notarization (optional)
+
+Without a certificate the app carries no Developer ID signature. Gatekeeper
+blocks the first launch until the user allows it under **System Settings >
+Privacy & Security > Open Anyway**, and the release notes say so.
+
+To sign, enroll in the Apple Developer Program, create a **Developer ID
+Application** certificate, export it with its private key as a `.p12`, and set:
+
+| Secret | Value |
+|---|---|
+| `CHUDWARE_MACOS_CERTIFICATE` | Base64-encoded `.p12` |
+| `CHUDWARE_MACOS_CERTIFICATE_PASSWORD` | The `.p12` password |
+| `CHUDWARE_NOTARY_APPLE_ID` | Apple ID used for notarization |
+| `CHUDWARE_NOTARY_TEAM_ID` | Developer team ID |
+| `CHUDWARE_NOTARY_PASSWORD` | App-specific password for that Apple ID |
+
+The `macos` job imports the identity into a temporary keychain, exports it as
+`CHUDWARE_SIGN_IDENTITY`, and stores the notarization credentials as the
+keychain profile named in `CHUDWARE_NOTARIZE_PROFILE`.
+`packaging/macos/build_app.sh` signs every nested Mach-O file and the bundle
+with the hardened runtime, submits the zip with `notarytool --wait`, staples
+the ticket and rebuilds the zip. It does not re-sign the bundled `chud`
+runtime, so notarization also needs a Chudcode release whose macOS binary
+already carries a valid Developer ID signature. The notarization secrets are
+optional; without them the app is signed but not notarized.
+
+Check a signed app with:
+
+```bash
+codesign --verify --deep --strict --verbose=2 Chudware.app
+spctl --assess --type execute --verbose=4 Chudware.app
+```
+
+## Linux
+
+AppImage, `.deb` and `.rpm` packages are not GPG-signed. Their integrity comes
+from `SHA256SUMS`, from the signed update manifest for the AppImage, and from
+the signed payload manifest that `chudware-hostd` verifies at startup.

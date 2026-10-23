@@ -88,7 +88,6 @@ def _dispatch(*, options=None, provider=None, tree=None, events=None):
         if events is not None
         else None,
         options={"session_id": "parent-session", **(options or {})},
-        chudware_actor="credit-actor",
     )
 
 
@@ -157,7 +156,6 @@ def test_online_delegate_uses_chudcode_with_scope_lineage_credits_and_events(
     assert call["run_id"] == "run-cutover"
     assert call["parent_id"] == "dg_cutover"
     assert call["max_total_tokens"] == 12000
-    assert call["actor"] == "credit-actor"
     assert call["close_session"] is False
     assert call["options"]["mission_dispatch"] is dispatch
     assert call["options"]["subagent_id"] == "dg_cutover"

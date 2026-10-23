@@ -1845,7 +1845,6 @@ def run_turn(
     max_total_tokens: int | None = None,
     ledger=None,
     actor: str | None = None,
-    credit_actor: Any | None = None,
     tool_dispatch: Callable[[str, dict], Any] | None = None,
     mission_dispatch: Any | None = None,
     tools_text: str | None = None,
@@ -1893,7 +1892,6 @@ def run_turn(
                 max_total_tokens=max_total_tokens,
                 ledger=ledger,
                 actor=actor,
-                credit_actor=credit_actor,
                 tool_dispatch=tool_dispatch,
                 mission_dispatch=mission_dispatch,
                 tools_text=tools_text,
@@ -1961,7 +1959,6 @@ def run_turn(
                 max_total_tokens=max_total_tokens,
                 ledger=ledger,
                 actor=actor,
-                credit_actor=credit_actor,
                 tool_dispatch=tool_dispatch,
                 mission_dispatch=mission_dispatch,
                 tools_text=tools_text,
@@ -2017,7 +2014,6 @@ def _run_turn_impl(
     max_total_tokens: int | None = None,
     ledger=None,
     actor: str | None = None,
-    credit_actor: Any | None = None,
     tool_dispatch: Callable[[str, dict], Any] | None = None,
     mission_dispatch: Any | None = None,
     tools_text: str | None = None,
@@ -3117,11 +3113,6 @@ def _run_turn_impl(
                         alt = agent_config.get_provider(
                             name=provider_override or None,
                             cfg=cfg2,
-                            **(
-                                {"actor": credit_actor}
-                                if credit_actor is not None
-                                else {}
-                            ),
                         )
                         old_model = current_model
                         provider = alt

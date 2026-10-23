@@ -2,14 +2,13 @@
 """CI release signer: signs prepared release requests with the pipeline seed.
 
 The owner-workstation signer (packaging/sign_release.py) sources its key from an
-age-encrypted file and is the only path allowed to sign a STABLE release. This
-signer is the automatic-nightly counterpart: the key material is a base64 32-byte
-Ed25519 seed in the environment variable CHUDWARE_RELEASE_CI_KEY (GitHub secret,
-key id release-ci-v1), and everything it signs is published to the beta channel.
+age-encrypted file. This signer is its CI counterpart: the key material is a base64
+32-byte Ed25519 seed in the environment variable CHUDWARE_RELEASE_SIGNING_KEY
+(GitHub Actions secret of the same name, key id release-ci-v1).
 
 Domain separation, request validation, and the signing operation itself are
 sign_release's — this module only sources the key, builds the artifact preimage
-that a beta/stable version pair needs twice per build, and prints base64.
+and prints base64.
 
   packaging/ci_sign.py sign payload PREPARED.payload-signing-request.bin
   packaging/ci_sign.py artifact --key-id release-ci-v1 --version 0.1.0-beta.42 \
@@ -43,20 +42,20 @@ except ImportError:  # direct execution from packaging/
         sign_request_with_key,
     )
 
-_KEY_ENV = "CHUDWARE_RELEASE_CI_KEY"
+KEY_ENV = "CHUDWARE_RELEASE_SIGNING_KEY"
 _PLATFORMS = ("linux", "windows", "macos")
 _ARCHES = ("x86_64", "arm64")
 
 
-def _load_ci_key() -> tuple[Any, bytearray]:
+def load_signing_key() -> tuple[Any, bytearray]:
     """Return the CI private key plus the raw buffer to zero once signing is done."""
-    value = os.environ.get(_KEY_ENV)
+    value = os.environ.get(KEY_ENV)
     if not value or not value.strip():
-        raise SigningError(f"{_KEY_ENV} is not set; CI signing needs the release-ci-v1 seed")
+        raise SigningError(f"{KEY_ENV} is not set; CI signing needs the release-ci-v1 seed")
     raw = bytearray(value.strip().encode("ascii", "strict"))
     if bytes(raw).startswith(b"-----BEGIN"):
         raise SigningError(
-            f"{_KEY_ENV} must be a canonical base64 32-byte Ed25519 seed, not PEM")
+            f"{KEY_ENV} must be a canonical base64 32-byte Ed25519 seed, not PEM")
     return load_private_key(bytes(raw)), raw
 
 
@@ -80,7 +79,7 @@ def _assert_key_identity(key: Any, expected: str) -> None:
     actual = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
     if actual != _expected_public_key(expected):
         raise SigningError(
-            f"{_KEY_ENV} does not match the expected release public key; "
+            f"{KEY_ENV} does not match the expected release public key; "
             "the CI secret and the shipped keyring disagree")
 
 
@@ -93,24 +92,30 @@ def _verify(key: Any, request: bytes, signature: str) -> None:
         raise SigningError("produced signature does not verify against its own request") from exc
 
 
-def artifact_request(key_id: str, version: str, platform: str, arch: str, artifact: Path) -> bytes:
+def artifact_preimage(key_id: str, version: str, platform: str, arch: str, sha256: str) -> bytes:
     """Build the exact artifact preimage every verifier recomputes.
 
-    Identical shape to packaging/linux/build_appimage.sh, packaging/finalize_release.py
-    and services/installer/build_release.py; CI needs it directly because one build
-    signs the same bytes twice, once under the beta version and once under the stable
-    version the promote step will publish.
+    Identical shape to packaging/linux/build_appimage.sh, packaging/finalize_release.py,
+    services/installer/build_release.py and host/src/update/updater.cpp.
     """
-    if not artifact.is_file():
-        raise SigningError(f"artifact does not exist: {artifact}")
-    digest = hashlib.sha256()
-    with artifact.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
     return b"\0".join((
         b"chudware-artifact-v1", key_id.encode("ascii"), version.encode("ascii"),
-        platform.encode("ascii"), arch.encode("ascii"), digest.hexdigest().encode("ascii"),
+        platform.encode("ascii"), arch.encode("ascii"), sha256.encode("ascii"),
     ))
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def artifact_request(key_id: str, version: str, platform: str, arch: str, artifact: Path) -> bytes:
+    if not artifact.is_file():
+        raise SigningError(f"artifact does not exist: {artifact}")
+    return artifact_preimage(key_id, version, platform, arch, file_sha256(artifact))
 
 
 def _write_exclusive(path: Path, text: str) -> None:
@@ -161,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.request_out is not None:
                 args.request_out.parent.mkdir(parents=True, exist_ok=True)
                 args.request_out.write_bytes(request)
-        key, key_bytes = _load_ci_key()
+        key, key_bytes = load_signing_key()
         if args.expect_public_key:
             _assert_key_identity(key, args.expect_public_key)
         signature = sign_request_with_key(kind, request, key)

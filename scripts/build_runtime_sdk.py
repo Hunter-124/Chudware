@@ -29,7 +29,7 @@ if str(REPO) not in sys.path:
 
 from scripts import prepare_runtime_wheels as preparation
 from services.installer.wheelhouse import (
-    WheelhouseError, _archive_files, _archive_members, _bytes, _copy_wheel,
+    CHUDCODE_REPOSITORY, WheelhouseError, _archive_files, _archive_members, _bytes, _copy_wheel,
     _keys, _packaging, _sha, _source_identity, install_command, local_path,
     verify_installed_runtime, verify_venv_interpreter,
 )
@@ -64,8 +64,8 @@ def _manifest(args, context):
     source = value["chudcode_source"]
     _keys(source, {"repository", "repository_commit"}, "SDK immutable source")
     _source_identity({"kind": "vcs", **source}, True, source)
-    if source["repository"] != "https://github.com/Hunter-124/chudcode.git":
-        raise WheelhouseError("SDK build source must be the reviewed private Chudcode repository")
+    if source["repository"] != CHUDCODE_REPOSITORY:
+        raise WheelhouseError(f"SDK build source must be the Chudcode repository {CHUDCODE_REPOSITORY}")
     base = value["base_python"]
     _keys(base, {"executable_sha256", "version", "identity_reference"}, "SDK build base")
     reference = base["identity_reference"]

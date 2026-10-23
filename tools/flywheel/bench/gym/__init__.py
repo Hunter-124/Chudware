@@ -1,6 +1,6 @@
-"""Design gym (T-W27): graded challenges + failure taxonomy + assess-adjust-rerun loop.
+"""Design gym: graded challenges + failure taxonomy + assess-adjust-rerun loop.
 
-The gym is the standing eval harness for the whole Pillar 20 stack (run_mission end
+The gym is the standing eval harness for the agent mission stack (run_mission end
 to end, deliberation=full). It is deliberately an INDEPENDENT GRADER: it does NOT trust
 the mission pipeline's own verify gate (which derives PASS structurally from node
 completion — see ``loop._phase_gate_context``). Instead the gym:
@@ -14,11 +14,11 @@ completion — see ``loop._phase_gate_context``). Instead the gym:
      evidence refs (event seq/kind), never vibes,
   4. emits a per-cycle markdown + JSON report: pass rates per challenge x tier, taxonomy
      counts, and RECOMMENDED DIAL ADJUSTMENTS (config/data only; prompt-wording changes
-     are lead-owned and filed as work notes, never applied here).
+     are reported as findings for human review, never applied here).
 
 HONESTY NOTE (read this before trusting a number). A genuine model-in-the-loop cycle
-needs (a) a real tool-executing agent_fn, (b) a provisioned model (local qwen3-4b via
-T-W26 or a frontier key), and (c) the C++ core for real geometry checks. In this
+needs (a) a real tool-executing agent_fn, (b) a provisioned model (a local model such
+as qwen3-4b, or a frontier key), and (c) the C++ core for real geometry checks. In this
 environment none of the three is present (see ``reports/`` cycle-1 for the exact probe).
 So Cycle 1 runs in MOCK mode: the agent_fn replays scripted per-role turns that emit
 ledger events. This proves the harness + classifier + report end to end and is labeled

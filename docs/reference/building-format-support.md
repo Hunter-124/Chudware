@@ -1,7 +1,7 @@
 # Building Format Support — License-Clean Paths
 
-> **Provenance:** folded in from the sibling clean-room project "Clean Engine"
-> (`D:\Clean Engine\ODA\03-build-your-own.md`). General, license-aware guidance for
+> **Provenance:** folded in from the separate clean-room research project "Clean Engine"
+> (its "build your own" guide). General, license-aware guidance for
 > implementing CAD format readers/writers from public specs and open-source
 > building blocks — not specific to any one codebase. See
 > `docs/reference/README.md` for how it maps onto this repo's actual interop
@@ -39,7 +39,7 @@ in this repo that check is `contracts/licenses.md`, not this file.
   `python3 scripts/provision_libredwg.py` builds from the SHA-pinned upstream release.
   LibreDWG is GPL-3.0, so it is subprocess-only, never linked or bundled
   (`contracts/licenses.md`). Whether to pursue an ODA membership for higher-fidelity DWG
-  is an open decision in `work/backlog/T-BL02.md`. If production DWG fidelity is needed
+  is an open decision. If production DWG fidelity is needed
   beyond that, the legitimate shortcut is licensing the ODA commercially — not
   decompiling anyone's DWG code.
 
@@ -120,8 +120,8 @@ model, and keep geometry/graphics swappable. **This repo already follows this
 shape**: `core/doc/formats.cpp` (`format_registry()` + the per-format import/export
 dispatch) is the isolated format-I/O layer; it feeds OCCT shapes into the document
 model (`contracts/doc_schema.md`); tessellation to AICM (`contracts/mesh_format.md`) is
-the Gi/Gs-equivalent boundary to the render backend. Adding a new format (per
-`work/backlog/T-BL02.md`) means adding its importer and a `format_registry()` row in
+the Gi/Gs-equivalent boundary to the render backend. Adding a new format
+means adding its importer and a `format_registry()` row in
 `core/doc/formats.cpp` with fixture round-trip tests — not touching the document
 model or renderer.
 

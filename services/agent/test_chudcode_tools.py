@@ -1995,8 +1995,8 @@ def test_initial_and_refreshed_sdk_threads_use_each_tenants_nested_roots(tmp_pat
                 self.tools = {tool["name"]: tool for tool in tools}
 
         client = Client()
-        # The real worker builds its initial tools before activate_turn_env.
-        # In particular, there is no bind_roots around this assembly.
+        # The real worker builds its initial tools before binding the turn roots,
+        # so there is no bind_roots around this assembly.
         with tenancy.bind_context(ctx):
             bindings = build_host_tools(context)
             client.set_custom_tools([

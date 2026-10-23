@@ -7,7 +7,6 @@
 #include "copilot_internal.h"
 
 #include "../web_capabilities.h"    // ui::webGapReason — subscription sign-in is not a web path
-#include "../web_provider_keys.h"   // per-account BYOK on web (/api/providers/keys)
 #include "../chudcode_descriptors.h" // ui::parseChudcode* — Chudcode worker payload parsing
 #ifdef __EMSCRIPTEN__
 #include "core/jobs.h"
@@ -320,98 +319,12 @@ std::vector<ModelInfo> providerPickerModels(AppState& st, int provider) {
     return out;
 }
 
-// The AI tab's credential surface in the browser. Desktop keeps its pointer to
-// Settings -> Providers; on web that pointer is a dead end, so this is the ONLY working path and
-// it has to be honest about which providers it can serve and what a stored key means.
-static void drawWebProviderKeyForm(AppState& st) {
-    Settings& s = st.settings;
-    const std::string provider = ui::webProviderKeyName(s.provider, s.baseUrl);
-    if (provider.empty()) {
-        dimText("There is no per-account credential for this provider in the browser: it is either "
-                "a subscription or agent-service grant held by the shared engine, or a service the "
-                "server has no validation endpoint for. Anthropic, OpenAI, Gemini, xAI, OpenRouter "
-                "and Moonshot take your own key \xe2\x80\x94 add it under Settings \xe2\x86\x92 "
-                "Providers.");
-        return;
-    }
-
-    // One buffer, cleared whenever the selected provider changes: a key typed for Anthropic must
-    // never be submitted under xAI's name because the provider combo moved underneath it.
-    static char keyBuf[4097] = {};
-    static std::string keyBufProvider;
-    static bool replacing = false;
-    if (keyBufProvider != provider) {
-        keyBufProvider = provider;
-        std::memset(keyBuf, 0, sizeof(keyBuf));
-        replacing = false;
-    }
-
-    const bool stored = ui::webProviderKeyPresent(provider);
-    const bool busy = ui::webProviderKeyBusy();
-
-    if (stored && !replacing) {
-        std::string hint;
-        for (const ui::WebProviderKey& k : ui::webProviderKeys())
-            if (k.provider == provider) { hint = k.hint; break; }
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusOk));
-        if (hint.empty())
-            ImGui::TextUnformatted("Your own key is stored for this account.");
-        else
-            ImGui::Text("Your own key is stored for this account (\xe2\x80\xa6%s).", hint.c_str());
-        ImGui::PopStyleColor();
-        dimText("Turns on this account use it directly and spend no Chudware credits.");
-        ImGui::BeginDisabled(busy);
-        if (ImGui::SmallButton("Replace##webkey")) replacing = true;
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Remove##webkey")) ui::webProviderKeyDelete(provider);
-        ImGui::EndDisabled();
-    } else {
-        dimText("Paste your own API key. The server validates it and stores it encrypted for "
-                "your account only; no other user can access that key. Eligible trial-domain "
-                "users may instead use an admin-linked Claude subscription, whose credentials "
-                "never reach their browsers.");
-        ImGui::SetNextItemWidth(-1);
-        const bool submitted = ImGui::InputText(
-            "##webproviderkey", keyBuf, sizeof(keyBuf),
-            ImGuiInputTextFlags_Password | ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::BeginDisabled(busy || keyBuf[0] == '\0');
-        const bool clicked = ImGui::Button(busy ? "Validating\xe2\x80\xa6" : "Validate and save",
-                                           ImVec2(-1, 0));
-        ImGui::EndDisabled();
-        if ((submitted || clicked) && !busy && keyBuf[0] != '\0') {
-            ui::webProviderKeySave(provider, keyBuf);
-            // Never leave the secret sitting in an ImGui buffer past the request that needs it.
-            std::memset(keyBuf, 0, sizeof(keyBuf));
-            // The outcome lands in the status line below either way; a rejection leaves any
-            // previously stored key intact, so returning to the stored row is not a lie.
-            replacing = false;
-        }
-        if (stored && ImGui::SmallButton("Keep the stored key##webkey")) replacing = false;
-    }
-
-    const std::string& status = ui::webProviderKeyStatus();
-    if (!status.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(
-            ui::webProviderKeyStatusIsError() ? ui::palette.statusErr : ui::palette.statusOk));
-        ImGui::TextWrapped("%s", status.c_str());
-        ImGui::PopStyleColor();
-    }
-}
-
-// Every provider card routes its credential copy through here, which is why the web path is
-// installed at this one seam: all of them gain the working form at once.
-//
-// Desktop: the AI tab never holds credentials. Settings -> Providers validates a key and the
-// Chudcode auth store persists it, so this is the pointer to that tab.
-//
-// Web: that tab cannot work. It drives chudcode_* auth RPCs, which the gateway refuses for every
-// account that is not an admin (Webservice/gateway/engine_bridge.py), and a credential written
-// through it would land in the ONE shared daemon's auth db belonging to the operator rather than
-// to the signed-in account. The account-scoped endpoint is the browser's real path, so on web
-// this draws that form instead of a link to a locked door.
+// Every provider card routes its credential copy through here. The AI tab never holds
+// credentials: Settings -> Providers validates a key and the Chudcode auth store persists it, so
+// this is the pointer to that tab. The browser build has no provider credential path; it says so.
 static void drawValidatedCredentialHint(AppState& st, const char* detail) {
-    if (ui::webProviderKeysAvailable()) {
-        drawWebProviderKeyForm(st);
+    if (const char* why = ui::webGapReason("account_signin")) {
+        dimText(why);
         return;
     }
     dimText(detail);
@@ -804,12 +717,9 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     } else if (s.provider == ui::PROV_FREELLMAPI) {
         if (drawFreeAiProviderCard(st)) changed = true;
     } else if (s.provider == ui::PROV_XAI && ui::webGapReason("account_signin")) {
-        // Web: the device-code flow signs the ONE shared engine process into an xAI account, so a
-        // tenant clicking it either hands the operator their subscription or overwrites the
-        // operator's for everybody. The gateway now refuses subscription_* for non-admins
-        // (engine_bridge.py), so the button could only fail — it is not drawn at all.
+        // Web: the device-code flow would sign the ONE shared engine process into an xAI
+        // account, so the button is not drawn at all.
         dimText(ui::webGapReason("account_signin"));
-        drawWebProviderKeyForm(st);
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
     } else if (s.provider == ui::PROV_XAI) {
         // xAI: SuperGrok / X Premium+ device-code OAuth AND/OR classic API key (console.x.ai).
@@ -1377,8 +1287,6 @@ static bool modelHidden(AppState& st, const std::string& id) {
 
 // File-static cache of subscription_status "connected" flags so the model picker can show
 // signed-in providers (xAI / Claude / Cursor / Codex / Kimi) without requiring an API key.
-// On web (__EMSCRIPTEN__), also merges GET /api/providers host-shared key/subscription
-// presence so the picker matches the daemon's signed-in accounts (WASM IDBFS has no real keys).
 namespace {
 struct SubConnectedCache {
     bool xai = false;
@@ -1386,91 +1294,12 @@ struct SubConnectedCache {
     bool cursor = false;
     bool codex = false;
     bool kimi = false;
-    // Host-shared API-key providers (web only; filled from GET /api/providers).
-    bool hostGemini = false;
-    bool hostAnthropic = false;
-    bool hostOpenai = false;
-    bool hostCloud = false;     // openrouter / cloud_compat
-    bool hostMoonshot = false;
-    bool hostXaiKey = false;    // xAI API key (distinct from xai-sub OAuth)
-    bool hostFetched = false;   // web: /api/providers completed at least once
 };
 static SubConnectedCache s_subConn;
-#ifdef __EMSCRIPTEN__
-// File-scope so emscripten_fetch callbacks (no-capture lambdas) can reset on retry.
-static bool s_hostProvidersFetchStarted = false;
-static int s_hostProvidersFetchFails = 0;
-#endif
-
-#ifdef __EMSCRIPTEN__
-// One-shot async GET /api/providers — names only (no secrets). Marks which host providers
-// are signed in so providerUsable() can show them without local key buffers.
-static void wasmKickHostProvidersFetch() {
-    if (s_subConn.hostFetched || s_hostProvidersFetchStarted) return;
-    s_hostProvidersFetchStarted = true;
-    emscripten_fetch_attr_t attr;
-    emscripten_fetch_attr_init(&attr);
-    std::strcpy(attr.requestMethod, "GET");
-    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY;
-    attr.onsuccess = [](emscripten_fetch_t* f) {
-        try {
-            if (f->status >= 200 && f->status < 300 && f->data && f->numBytes > 0) {
-                auto j = nlohmann::json::parse(f->data, f->data + f->numBytes);
-                if (j.is_object()) {
-                    // Reset host bits then apply.
-                    s_subConn.hostGemini = s_subConn.hostAnthropic = s_subConn.hostOpenai = false;
-                    s_subConn.hostCloud = s_subConn.hostMoonshot = s_subConn.hostXaiKey = false;
-                    auto applySub = [](const std::string& id) {
-                        if (id == "xai" || id == "xai-sub") s_subConn.xai = true;
-                        else if (id == "claude" || id == "anthropic-sub") s_subConn.claude = true;
-                        else if (id == "cursor" || id == "cursor-sub") s_subConn.cursor = true;
-                        else if (id == "codex" || id == "codex-sub") s_subConn.codex = true;
-                        else if (id == "kimi" || id == "kimi-sub") s_subConn.kimi = true;
-                    };
-                    auto applyKey = [](const std::string& id) {
-                        if (id == "gemini") s_subConn.hostGemini = true;
-                        else if (id == "anthropic") s_subConn.hostAnthropic = true;
-                        else if (id == "openai") s_subConn.hostOpenai = true;
-                        else if (id == "openrouter" || id == "cloud" || id == "cloud_compat")
-                            s_subConn.hostCloud = true;
-                        else if (id == "moonshot") s_subConn.hostMoonshot = true;
-                        else if (id == "xai") s_subConn.hostXaiKey = true;
-                    };
-                    if (j.contains("providers") && j["providers"].is_array()) {
-                        for (const auto& p : j["providers"]) {
-                            if (!p.is_object()) continue;
-                            std::string id = p.value("id", p.value("name", std::string()));
-                            if (id.empty()) continue;
-                            std::string auth = p.value("auth", std::string());
-                            const bool isSub = (auth == "subscription") ||
-                                (auth.empty() && id.find("-sub") != std::string::npos);
-                            if (isSub) applySub(id);
-                            else applyKey(id);
-                        }
-                    }
-                    s_subConn.hostFetched = true;
-                }
-            }
-        } catch (...) {
-        }
-        emscripten_fetch_close(f);
-    };
-    attr.onerror = [](emscripten_fetch_t* f) {
-        // Allow a few retries on transient failure; then stop.
-        if (++s_hostProvidersFetchFails < 5) s_hostProvidersFetchStarted = false;
-        emscripten_fetch_close(f);
-    };
-    emscripten_fetch(&attr, "/api/providers");
-}
-#endif
 
 static void pollSubConnected(AppState& st) {
-#ifdef __EMSCRIPTEN__
-    wasmKickHostProvidersFetch();
-#endif
-    // On web GET /api/providers already reports host-shared subscription presence, scrubbed of
-    // operator identity. The raw RPC is now refused for non-admin accounts (engine_bridge.py), so
-    // polling it every two seconds would only log a refusal per tick and learn nothing.
+    // The browser build has no provider sign-in path; the shared engine's subscription state
+    // belongs to the operator, so the web client never polls it.
     if (ui::webBuild()) return;
     ui::providerUsagePollStatus(st, 2.0, false);
     const auto& login = ui::providerUsageLogin();
@@ -1506,24 +1335,17 @@ bool providerUsable(AppState& st, int provider) {
             break;
         default: break;
     }
-    // A credential this account posted to the gateway is proof too, and on web it is the only
-    // credential the user CAN supply: the local key buffers live in a browser IDBFS config.json
-    // the shared engine never reads. Without this the BYOK web user stored a validated key and
-    // still watched every model stay greyed out.
-    const std::string accountKey = ui::webProviderKeyName(provider, st.settings.baseUrl);
-    if (!accountKey.empty() && ui::webProviderKeyPresent(accountKey)) return true;
     switch (provider) {
         case ui::PROV_GEMINI:
-            return st.settings.geminiKey[0] != 0 || s_subConn.hostGemini;
+            return st.settings.geminiKey[0] != 0;
         case ui::PROV_ANTHROPIC:
-            return st.settings.anthropicKey[0] != 0 || s_subConn.claude || s_subConn.hostAnthropic;
+            return st.settings.anthropicKey[0] != 0 || s_subConn.claude;
         case ui::PROV_OPENAI:
-            return st.settings.openaiKey[0] != 0 || s_subConn.codex || s_subConn.hostOpenai;
+            return st.settings.openaiKey[0] != 0 || s_subConn.codex;
         case ui::PROV_CLOUDCOMPAT:
-            return st.settings.cloudKey[0] != 0 || st.settings.moonshotKey[0] != 0 ||
-                   s_subConn.hostCloud || s_subConn.hostMoonshot;
+            return st.settings.cloudKey[0] != 0 || st.settings.moonshotKey[0] != 0;
         case ui::PROV_XAI:
-            return st.settings.xaiKey[0] != 0 || s_subConn.xai || s_subConn.hostXaiKey;
+            return st.settings.xaiKey[0] != 0 || s_subConn.xai;
         case ui::PROV_LOCAL:       return st.providerModels[ui::PROV_LOCAL].ok;
         case ui::PROV_LLAMACPP:    return st.providerModels[ui::PROV_LLAMACPP].ok;
         case ui::PROV_CURSOR:
@@ -1538,18 +1360,15 @@ bool providerUsable(AppState& st, int provider) {
     return false;
 }
 
-// Both gate picker rows on "is there a credential for this cloud slot at all", so both must also
-// see a key this account posted to the gateway — on web that is the only one it can have.
+// Both gate picker rows on "is there a credential for this cloud slot at all".
 bool cloudCompatKeyPresent(AppState& st) {
     pollSubConnected(st);
-    return st.settings.cloudKey[0] != 0 || s_subConn.hostCloud ||
-           ui::webProviderKeyPresent("openrouter");
+    return st.settings.cloudKey[0] != 0;
 }
 
 bool moonshotKeyPresent(AppState& st) {
     pollSubConnected(st);
-    return st.settings.moonshotKey[0] != 0 || s_subConn.hostMoonshot ||
-           ui::webProviderKeyPresent("moonshot");
+    return st.settings.moonshotKey[0] != 0;
 }
 
 // ============================ Chudcode model catalog + session cost (S-UI-PROV) ===
@@ -2357,21 +2176,13 @@ void drawModelDropdown(AppState& st, bool busy) {
     };
 
     const auto& catalog = ui::bridgeModelCatalog();
-    const auto& accountKeys = ui::webProviderKeys();
     if (!catalog.empty()) {
         for (const auto& m : catalog) {
             Route r = routeFor(m.provider);
             if (r.slot < 0) continue;                                        // no composer slot
-            if (ui::webBuild()) {
-                const auto key = std::find_if(accountKeys.begin(), accountKeys.end(),
-                    [&m](const ui::WebProviderKey& row) {
-                        return row.state == "validated" &&
-                            (m.provider == "google" ? row.provider == "gemini" : row.provider == m.provider);
-                    });
-                if (key == accountKeys.end()) continue;
-            } else if (st.signedInBridgeProviders.count(m.provider) == 0) {
-                continue;
-            }
+            // Signed-in providers only. The browser build has no provider credential path, so
+            // it never lists online catalog models.
+            if (ui::webBuild() || st.signedInBridgeProviders.count(m.provider) == 0) continue;
             std::string catk = (r.slot == ui::PROV_CLOUDCOMPAT) ? ui::cloudServiceKey(r.baseUrl)
                                                                 : ui::providerCatKey(r.slot);
             if (catOff(catk)) continue;                                      // provider bulk-disabled

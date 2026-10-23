@@ -1,7 +1,7 @@
 # CAD File Formats — Survey with Authoritative Public Specs
 
-> **Provenance:** folded in from the sibling clean-room project "Clean Engine"
-> (`D:\Clean Engine\ODA\01-file-formats.md`). That material is sourced *only* from
+> **Provenance:** folded in from the separate clean-room research project "Clean Engine"
+> (its file-format survey). That material is sourced *only* from
 > public specifications, ISO/ASTM/ASPRS standards, and vendor-published developer
 > docs — never from any proprietary binary or decompiled code (see the Clean Engine
 > README's clean-room statement). Treat this file the same way: it documents
@@ -50,7 +50,7 @@ short structural summary drawn from that public spec.
   provisioning script for the 2D entities. The Python helper `services/formats/formats_dwg.py`
   (parity oracle) prefers the ODA File Converter via `ezdxf.addons.odafc` before
   `dwg2dxf`; the C++ production path does not. The ODA-membership decision for full DWG
-  fidelity is still open in `work/backlog/T-BL02.md`.
+  fidelity is still open.
 
 ## 2. DXF — Drawing Exchange Format
 

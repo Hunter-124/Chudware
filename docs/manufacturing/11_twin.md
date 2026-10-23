@@ -1,17 +1,15 @@
 # Deterministic Engineering Twin — Final Design (DoD v4)
 
-Owner: `TwinArchitecture` / `TwinDesignRecovery`. Design-only; no repository file was edited and
-no build, test, gate, linter, formatter or git command was run to produce this document.
+Owner: `TwinArchitecture` / `TwinDesignRecovery`. Design-only: this document specifies the twin;
+it records no implementation change by itself.
 
-This file closes the interrupted `history://TwinArchitecture` thread. Everything below is bound to
-`local://manufacturing-decisions.md` and `local://manufacturing-dod-v4.md`, and to the rulings the
-interrupted thread already accepted (Gateway owns the controller vocabulary; UX owns the sole
+Everything below is bound to `00_decisions.md` and `01_definition_of_done.md`, and to the rulings
+already accepted across the design corpus (Gateway owns the controller vocabulary; UX owns the sole
 external `FreshValue<T>`; Gateway owns durable `seq`; Metrology owns offsets).
 
 Grounding: `core/cam/stock_sim.h`, `core/cam/stock_sim.cpp`, `core/mate/mate.h`,
-`core/firmware/sim_sensor_bridge.cpp`, `core/CMakeLists.txt` target wiring,
-`agent://TwinReuseAudit`, `agent://ControllerEcosystem`. Line references are to those files as read
-on 2026-08-08.
+`core/firmware/sim_sensor_bridge.cpp`, `core/CMakeLists.txt` target wiring, the twin-reuse audit
+and the controller-ecosystem research. Line references are to those files as read on 2026-08-08.
 
 ---
 
@@ -87,12 +85,12 @@ docs/TWIN.md                                # fidelity table + determinism contr
 | `core/CMakeLists.txt` | Append `add_library(chudware_twin STATIC ...)`, `cam/stock_step.cpp` into the existing `chudware_cam` source list (after `cam/stock_sim.cpp`, currently line 291), the eleven `test_twin_*` executables, and the optional `twin_cli`. | Append-only, integrator-owned. `chudware_twin` links `chudware_cam chudware_mate chudware_firmware chudware_device nlohmann_json::nlohmann_json` and needs `_USE_MATH_DEFINES` like `chudware_cam`. |
 | `contracts/README.md` | One registry row per new `aicad.twin_*` contract. | Append-only. |
 | `scripts/gate.sh` | Twin test executables appended to the existing test list. The twin adds **no new SKIP**: every suite is dependency-free. | Append-only, integrator-owned. |
-| `docs/REFACTOR_LOG.md`, maintained skills/maps | One entry per twin wave, in the same green commit (DoD v4 §20). | Required. |
+| `docs/manufacturing/README.md` as-built map, developer docs | One update per twin wave, in the same green commit (DoD v4 §20). | Required. |
 
 ### 1.3 Explicit non-ownership
 
 - No GUI. Twin adds nothing under `host/src/ui/**`; production twin UI, if any, belongs to
-  `host/src/ui/manufacture/**` and is not mine.
+  `host/src/ui/manufacture/**` and is outside the twin's scope.
 - No `core/device/**` file. Twin **consumes** `chudware::device` types.
 - No transport, no serial port, no socket, no device handle, no command owner. Twin cannot reach
   hardware by construction: `chudware_twin` links no I/O library and exposes no write path.
@@ -195,7 +193,7 @@ Canonical frames: `Machine` = MCS with origin at the homed position and Z+ away 
 base) so `cam::HeightField` indices map by pure integer arithmetic. Units are mm everywhere in
 geometry, integer Nm everywhere in the plant, and the conversion is exactly one function.
 
-**Frame/unit closure:** `agent://TwinReuseAudit` §5 records that mate (mm + rotvec), CAM (mm + s) and
+**Frame/unit closure:** the twin-reuse audit (§5) records that mate (mm + rotvec), CAM (mm + s) and
 the firmware bridge (NED metres, m/s, rad, ms) share no frame registry. `FrameTree` plus §2.1 is
 that registry. The firmware bridge's NED/geographic semantics are **not** joined to it — they are
 export-only (§6.4).
@@ -321,7 +319,7 @@ RNG is **counter-based, not stateful**: `splitmix64(run_seed ^ mix(fault_index, 
 There is no shared mutable RNG object, so fault sampling is independent of evaluation order and of
 how many ticks were stepped per call. `faults.cpp` contains the whole generator (≈20 lines,
 stdlib-only) and no dependency on `mate/numpy_rng.cpp` — the mate restart RNG
-(`agent://TwinReuseAudit`, mate.cpp:1379-1385) is numerical recovery, not fault injection, and the
+(twin-reuse audit, mate.cpp:1379-1385) is numerical recovery, not fault injection, and the
 two must not be conflated.
 
 ---
@@ -372,7 +370,7 @@ private:
 then calls the Gateway's `device::parse_grbl_line` to obtain `ControllerSnapshot` /
 `ControllerEvent`. Consequences:
 
-1. Exactly one Grbl vocabulary exists in the product, and it is the Gateway's (Main's ruling).
+1. Exactly one Grbl vocabulary exists in the product, and it is the Gateway's (the project ruling).
 2. The E0-E3 suites are simultaneously parser tests — the parser is exercised against
    hardware-shaped bytes with no hardware.
 3. Twin never invents wire ordering, `seq`, timestamps, dedup keys or gap semantics. It hands over an
@@ -380,7 +378,7 @@ then calls the Gateway's `device::parse_grbl_line` to obtain `ControllerSnapshot
 4. If the Gateway parser rejects a line the twin produced, that is a twin bug or a parser bug, and
    `test_twin_grbl.cpp` fails. No twin-local fallback parse exists.
 
-### 4.3 Modeled Grbl surface (from `agent://ControllerEcosystem`)
+### 4.3 Modeled Grbl surface (from the controller-ecosystem research)
 
 Supported, emulated: `G0 G1 G2 G3 G4 G10L2 G10L20 G17-19 G20 G21 G28 G30 G38.2-38.5 G43.1 G49
 G53 G54-G59 G80 G90 G91 G92 G93 G94`, `M0 M2 M3 M4 M5 M7 M8 M9 M30`, `$$ $# $G $I $N $H $X $C $J=`,
@@ -598,7 +596,7 @@ Deliberate divergences from `simulate_setup`, each of which is a bug fix, not a 
 `machine3` is a plain 3-axis Cartesian plant: tool tip position = axis positions ⊕ tool length
 offset ⊕ WCO, no joint chain, no IK, no singularities. It is **not** built on `solve_mates`, because
 per-tick nonlinear constraint projection would manufacture nonphysical motion
-(`agent://TwinReuseAudit`, conceptual mismatch 1) and because `solve_mates` accepts a wall-clock
+(twin-reuse audit, conceptual mismatch 1) and because `solve_mates` accepts a wall-clock
 `time_budget_ms` (`mate.h:85`) whose effect on iteration count is load-dependent.
 
 ### 6.3 Mate math, used exactly twice
@@ -851,7 +849,7 @@ There is deliberately **no** `mfg_twin_connect`, `mfg_twin_attach_device`, `mfg_
 be mistaken for machine authority. One command owner per device (DoD v4 §15); the twin is not a
 device and owns nothing.
 
-MCP tools, registered in the single shared family id **`manufacture`** (Main's final ruling: the
+MCP tools, registered in the single shared family id **`manufacture`** (the final project ruling: the
 user-facing/config family is the existing product term Manufacture, while `mfg_*` / `mfg.*` remain
 the wire prefix). The family is **OFF by default** in `agent.tool_families` until machine
 commissioning, so `enable_tools` cannot silently self-add manufacturing surface; per-tool toggles
@@ -872,7 +870,7 @@ approve/resume/jog/home/zero/unlock/override/interlock-bypass/E-stop — absence
 
 `mfg.twin.invalidated` carries the plan-wide envelope and nothing else:
 `{class:"falsified"|"superseded", reason, why, affected:[ids], at_seq, superseded_by?}`
-(DoD v4 §9). Consumers branch on `class`. The earlier proposal in the interrupted thread to split
+(DoD v4 §9). Consumers branch on `class`. An earlier proposal to split
 falsified/superseded into two event names is **superseded** by DoD v4 §9 and is not implemented.
 
 Producer obligations the twin accepts:
@@ -1212,7 +1210,7 @@ Each scenario lives in `fixtures/mfg/twin/e<N>/` with `config.json`, `program.nc
 
 ### E0 — Boot, identity, refusal (no motion)
 
-Reset a Shapeoko-3-XL-shaped profile (`agent://ControllerEcosystem`: 4 steppers, 3 inductive XYZ
+Reset a Shapeoko-3-XL-shaped profile (controller-ecosystem research: 4 steppers, 3 inductive XYZ
 switches, Grbl 1.1, Z-first homing then XY to back-right; profile marked *expert direct-Grbl mode,
 outside the documented Carbide Motion workflow*). Assert: banner, `$I`, `$$`, `$G`, `$#` all parse
 through the Gateway parser; `Idle` with `homed=false`; `Alarm` instead of `Idle` when the profile sets
@@ -1264,7 +1262,7 @@ stable; export to a `firmware::build_sensor_scenario` scenario succeeds and is o
 | **T3** | `machine3`, `grbl_emu`, `twin.cpp` reset/step/submit against the Gateway parser; `test_twin_grbl`, `test_twin_motion`; **E0, E1** | The emulator's bytes are accepted by the real Gateway parser; no twin-local parse exists. |
 | **T4** | `bodies`, `collide`, probe phase, stock integration; `test_twin_stock`, `test_twin_collide`; **E2** | Typed episodes, halting, and the `simulate_setup` equivalence test. |
 | **T5** | `faults`, `record` (snapshot/restore/trace/verify); `test_twin_faults`, `test_twin_replay`; **E3** | D2/D7/D10/D11/D12 all green with golden fixtures. |
-| **T6** | `vsensor`, `vcamera`, `twin_rpc`, `twin_cli`, `contracts/manufacturing_twin.md`, `test_twin_camera`, `test_twin_contracts`, `services/manufacturing/twin/**`, `train.h/.cpp`, `test_twin_env`, `docs/TWIN.md` | Contract tests treat every policy boundary in §9.3 as a test; REFACTOR_LOG + skills updated in the same green commit. |
+| **T6** | `vsensor`, `vcamera`, `twin_rpc`, `twin_cli`, `contracts/manufacturing_twin.md`, `test_twin_camera`, `test_twin_contracts`, `services/manufacturing/twin/**`, `train.h/.cpp`, `test_twin_env`, `docs/TWIN.md` | Contract tests treat every policy boundary in §9.3 as a test; as-built map and developer docs updated in the same green commit. |
 
 T1 and T2 are independent and may run concurrently. T3 depends on the Gateway having landed
 `core/device/grbl_protocol.h`; until then T3's parser calls are compiled against the header the
@@ -1320,7 +1318,7 @@ collision-free and not a safety function without making its own test unfireable.
 
 ---
 
-## 15. Review closure (`ArchitectureConsistencyReviewer`)
+## 15. Review closure (architecture plan review)
 
 Every row below is a reconciliation of statements already inside the accepted corpus. No product scope
 changed: the twin's ownership, fidelity table, RPC/event surface, E0-E3 set, wave order and non-goals

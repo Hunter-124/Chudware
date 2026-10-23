@@ -63,7 +63,6 @@ DEFAULT_EXEMPT_TOOLS: frozenset[str] = frozenset(
         "reveng_gate_status",
         "reveng_status",
         "scrape_queue_status",
-        "serving_status",
         "sim_jobs",
         "sim_status",
         "vendor_status",

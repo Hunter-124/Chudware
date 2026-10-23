@@ -4,13 +4,12 @@ This directory holds two distinct kinds of material, and the distinction is
 load-bearing.
 
 The **clean-room CAD format & data-model reference** was folded in from a
-sibling clean-room project, **Clean Engine**
-(`D:\Clean Engine\ODA\`), whose README states explicitly that its contents are
+separate clean-room research project, **Clean Engine**, whose contents are
 sourced *only* from public specifications, ISO/ASTM/ASPRS standards, and
 vendor-published developer documentation — never from any proprietary binary or
-decompiled code. That clean-room framing is preserved verbatim in each file below;
-treat it as load-bearing (it's what keeps this material safe to have in the tree
-alongside a product with license obligations — see `contracts/licenses.md`).
+decompiled code. That clean-room framing is preserved in each file below;
+treat it as load-bearing (it is what keeps this material safe to have in the tree
+alongside dependencies with license obligations — see `contracts/licenses.md`).
 
 The **clean-room CAD-format set** — the three files under **Contents** below —
 describes the public CAD format landscape and the classic AutoCAD-lineage data
@@ -30,18 +29,15 @@ to them, and they are not part of the clean-room set:
   on Windows.
 - **[PACKAGING_WINDOWS.md](PACKAGING_WINDOWS.md)** — the Windows release/installer
   pipeline and the manual runtime checklist.
-- **[CI_RUNNERS.md](CI_RUNNERS.md)** — the self-hosted CI runner fleet.
-- **[serving_runbook.md](serving_runbook.md)** — LoRA adapter serving, routing, canary
-  and rollback (T-H9).
+- **[CI.md](CI.md)** — continuous integration: workflows, gates and how to reproduce them
+  locally.
 - **[REVENG_DEGRADATION.md](REVENG_DEGRADATION.md)** — Reverse Engineering capability
   matrix and banners from `services/vision/reveng_provision.py`.
 - **[EM_SIMULATION.md](EM_SIMULATION.md)** — full-wave EM simulation family.
-- **[FIN25_SENSOR_NODE_GOLDEN_DEMO.md](FIN25_SENSOR_NODE_GOLDEN_DEMO.md)** — dated
-  (2026-07-10) STM32 sensor-node golden demo record.
+- **[SENSOR_NODE_DEMO.md](SENSOR_NODE_DEMO.md)** — dated (2026-07-10) STM32 sensor-node
+  end-to-end demo record.
 - **[parts_library_data_coverage.md](parts_library_data_coverage.md)** — dated
   (2026-07-08) Parts Library data-coverage findings.
-- **[rover_competition_ruleset.md](rover_competition_ruleset.md)** — cached snapshot of
-  the external NASA HERC ruleset.
 
 ## Contents
 
@@ -87,11 +83,10 @@ referenced — lives here:
   transforms. Imported bodies are baked into `.step+`, remain editable as native import
   features, export normally, and feed Polyhedral-FEA. Parasolid `.x_t`/`.x_b`
   still needs SolidWorks/NX conversion because it has no saved-display lane.
-- **`work/backlog/T-BL02.md`** — the format-interop backlog task tracking what
-  lands next (Parasolid payload extraction, CATIA V5, Inventor, Altium
-  clean-room parsers, and the DWG/Revit ODA-membership decision). This directory
-  is meant to give whoever picks up that task (or the next format) a running
-  start on the public-spec landscape without having to re-derive it.
+- **Planned format work** — Parasolid payload extraction, CATIA V5, Inventor and Altium
+  clean-room parsers, and a decision on ODA membership for higher-fidelity DWG/Revit.
+  This directory is meant to give whoever picks up the next format a running start on
+  the public-spec landscape without having to re-derive it.
 - **`contracts/licenses.md`** — the binding, append-only license ledger for every
   dependency this repo actually ships or links against. When a format-support
   library is added for real (not just referenced here), it needs a row there,
@@ -113,6 +108,5 @@ a proprietary binary, decompiled code, or a vendor SDK's internal (non-public)
 documentation. If a new format needs to be added to this reference set, source it
 the same way the original three files were sourced: the format's own public/ISO/ANSI/ASTM
 specification, or openly published vendor developer docs. This keeps
-`docs/reference/` safe to reference from anywhere in the repo, including from
-work that will eventually ship commercially (see the clean-room posture already
-recorded for KiCad and BOLTS in `contracts/licenses.md`).
+`docs/reference/` safe to reference from anywhere in the repo (see the clean-room
+posture recorded for KiCad and BOLTS in `contracts/licenses.md`).

@@ -58,7 +58,7 @@ This document extends what already ships. It does **not** invent a greenfield fo
 | `ai/memory.json` | no | Design intent / decisions digests |
 | unknown entries | — | Preserved verbatim |
 
-Canonical `document.json` rules (`doc_schema.md` Appendix A / T-H2):
+Canonical `document.json` rules (`doc_schema.md` Appendix A):
 
 - sorted keys, full round-trip numeric precision, indent=2, UTF-8 no BOM, **no wall-clock timestamps**.
 - C++: `canonical_doc_json()` uses `doc.dump(2)` without quantization (`stepplus.cpp`).
@@ -148,7 +148,7 @@ flowchart LR
 
 | Option | Pros | Cons | Recommendation |
 |---|---|---|---|
-| Keep `.step+` | Zero user migration; shell associations; already everywhere (missions, PLM, webservice) | Name suggests “STEP with extras,” not drawings/sim | **Keep** as primary extension |
+| Keep `.step+` | Zero user migration; shell associations; already everywhere (missions, PLM, web app) | Name suggests “STEP with extras,” not drawings/sim | **Keep** as primary extension |
 | Add alias `.chudware` / `.blt` | Clean brand | Dual extensions, dual filters forever | Optional Save-As alias later; same container magic |
 | Directory bundle (`.step+/` folder) | Git-friendly working tree | Breaks “single file share,” shell preview, atomic rename | **Not** the working format; PLM shadow tree already is the directory form |
 

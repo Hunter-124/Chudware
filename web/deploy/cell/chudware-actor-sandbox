@@ -29,14 +29,13 @@ def actor_argv(actor, access, command):
             pass
         check = open_path(source + "/" + name)
         os.close(check)
-    for name in ("egress", "provider"):
-        sockfd = os.open("/run/" + name + ".sock", os.O_PATH | os.O_NOFOLLOW)
-        if not stat.S_ISSOCK(os.fstat(sockfd).st_mode):
-            os.close(sockfd)
-            raise ValueError(name + " broker socket required")
-        os.set_inheritable(sockfd, False)
-        pins.append(sockfd)
-        args += ["--ro-bind", "/proc/self/fd/" + str(sockfd), "/run/" + name + ".sock"]
+    sockfd = os.open("/run/egress.sock", os.O_PATH | os.O_NOFOLLOW)
+    if not stat.S_ISSOCK(os.fstat(sockfd).st_mode):
+        os.close(sockfd)
+        raise ValueError("egress broker socket required")
+    os.set_inheritable(sockfd, False)
+    pins.append(sockfd)
+    args += ["--ro-bind", "/proc/self/fd/" + str(sockfd), "/run/egress.sock"]
     env = {**BASE_ENV, **actor_environment(),
            "CHUDWARE_ACTOR_HEX": actor, "CHUDWARE_ACTOR_STATE": "/actor", "CHUDWARE_ACTOR_SANDBOX": "1",
            "CHUDWARE_CHUDCODE_BIN": "/opt/chudware/bin/chud",

@@ -175,6 +175,8 @@ def stage_compiled_payload(
     _copy_required(
         uninstall_helper_bin, dst / "chudware-uninstall-helper.exe", "uninstall helper"
     )
+    for name in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
+        shutil.copy2(REPO / name, dst / name)
 
 
 def build(

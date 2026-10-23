@@ -1,17 +1,19 @@
-"""Benchmark category registry for Settings → Benchmarks tab (WS1).
+"""Benchmark category registry for the Settings → Benchmarks tab.
 
-Maps category id → runner invocation + last-result reader. Consumed by
-``engine_oracle.parts_hub.bench_rpc`` (``bench_categories`` / ``bench_run``
-with ``category``) and listed for the GUI coverage matrix.
+Maps category id → runner invocation + last-result reader. Consumed by the
+``bench_categories`` / ``bench_run`` (with ``category``) RPCs in
+``services/agent/worker_rpc.py`` and listed for the GUI coverage matrix.
 
-Contract (wave):
+RPC contract:
   bench_categories {} -> {ok, categories:[{id, label, description,
     tools_covered:[str], runnable:bool, last:{when, pass_rate, detail_path}|null}]}
-  bench_run gains optional category:<id> (mutually exclusive with tiers/mode).
+  bench_run accepts optional category:<id> (mutually exclusive with tiers/mode).
 
 Run a category from CLI (used by the RPC spawner)::
 
-    python3 -m tools.flywheel.bench.categories run <id> [--out DIR]
+    python3 -m tools.flywheel.bench.categories list [--json]
+    python3 -m tools.flywheel.bench.categories run <id> [--mode diag|smoke]
+    python3 -m tools.flywheel.bench.categories last <id>
 """
 from __future__ import annotations
 

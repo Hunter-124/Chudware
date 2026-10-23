@@ -4708,7 +4708,7 @@ std::string config_active_name(const json& doc);  // defined below (configuratio
 // uses that file's folder (the saved convention, contracts/doc_ops.md). An unsaved
 // document uses the project folder doc_new received. Never the process cwd: hostd's cwd
 // has no relation to the user's project (2026-10-10: `parts/redesign/claw_base.step+`,
-// copied from a saved assembly into a new one, opened as /home/hunter/parts/...).
+// copied from a saved assembly into a new one, opened as $HOME/parts/...).
 // Empty when the document has neither; compile_assembly then refuses relative sources.
 std::string component_source_base(const Session& s) {
     if (!s.path.empty())
@@ -8460,7 +8460,7 @@ constexpr int kSectionHatchPitch = 13;
 // labelled + colour-coded like the legacy iso render. `header`, when non-empty, is blitted top-left
 // (view name + units + bbox dims) so a multi-view contact sheet is self-describing. Returns false if
 // essentially nothing was drawn. This is the shared core behind render_iso_png / doc_render_view /
-// the contact sheet — one renderer, so headless and on-screen stay consistent (CLAUDE.md rule 3).
+// the contact sheet — one renderer, so headless and on-screen stay consistent.
 //
 // The three trailing params exist for doc_render_diff and are inert when omitted:
 //   `body_alpha`   — per-body 0-255 opacity (parallel to `bodies`). A fragment from a body with
@@ -18381,7 +18381,7 @@ json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
 namespace {
 
 // Is `sketch.auto_coincident` enabled for this doc? Stored in doc["meta"] (the
-// doc_meta_set/get key-value store); DEFAULT ON per the Hunter directive — absent or
+// doc_meta_set/get key-value store); DEFAULT ON — absent or
 // non-bool reads as true. Only an explicit `false` disables the on-edit auto pass.
 bool sketch_auto_coincident_enabled(const json& doc) {
     if (doc.contains("meta") && doc["meta"].is_object() &&

@@ -1,6 +1,6 @@
-"""Numpy inference for the ViewNet utility model v1 (the torch trainer must match it).
+"""Numpy inference for the ViewNet utility model v1 (any trainer must match it exactly).
 
-Architecture (contract, ViewNet §4) — a set encoder over face tokens conditioned on the
+Architecture — a set encoder over face tokens conditioned on the
 set-global and context vectors:
 
     x_f = (face_tokens - norm_face_mean) / norm_face_std

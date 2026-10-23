@@ -1,1 +1,1 @@
-"""T-H8 product-task eval benchmark suite."""
+"""Product-task eval benchmark suite."""

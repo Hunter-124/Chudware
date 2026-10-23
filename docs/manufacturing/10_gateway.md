@@ -1,27 +1,22 @@
 # Manufacturing Gateway — Final Design (DoD v4)
 
-Owner: `GatewayArchitecture`. Status: **closed**. Supersedes the never-persisted
-`local://manufacturing-gateway-design.md` (the prior thread's three `write` calls were all skipped by
-steering interrupts; nothing was ever written). Design-only: no repository file was edited, no git
-command, build, gate, linter, or test was run in producing this document.
+Owner: `GatewayArchitecture`. Status: **closed**. Design-only: this document specifies the
+gateway; it records no implementation change by itself.
 
-Recovered inputs actually read for this document: `history://GatewayArchitecture`,
-`services/mcp/tool_registry.py`, `services/worker/worker_client.h`, `services/worker/worker_client.cpp`,
-`contracts/worker_rpc.md`, `agent://AgentControlAudit`, `agent://ControllerEcosystem`,
-`agent://PrinterMonitoring` (**empty — subagent exited without yield**), plus
-`history://PrinterMonitoring` as the only surviving record of that research, and
-`local://manufacturing-decisions.md` + `local://manufacturing-dod-v4.md`.
+Inputs read for this document: `services/mcp/tool_registry.py`, `services/worker/worker_client.h`,
+`services/worker/worker_client.cpp`, `contracts/worker_rpc.md`, the agent-control and
+controller-ecosystem audits, the printer-monitoring research (summarized in
+`90_research_printers.md`), `00_decisions.md` and `01_definition_of_done.md`.
 
-**Amendment pass (this revision).** `ArchitectureConsistencyReviewer`'s
-`local://manufacturing-plan-review.md` returned NO-GO for W1.1 with sixteen blocking findings. This
-revision closes every gateway-owned one in place — B1, B2, B3, B4 (gateway half), B5, B10, B11, B12
-(gateway half), B13, B14/B15 ownership, C1's reservation table, C7 and C10 — and publishes the two
-registers the review asked the gateway to own: **§25** the stable rule ids, **§26** the
-finding-by-finding closure table, which names for every finding not closed here the document and owner
-that closes it. No product scope changed and no rule was invented: every change reconciles two
-statements already inside the accepted corpus, or one statement against DoD v4. Design-only, as before:
-no repository file was edited, and no git, build, gate, linter or test command was run — the one
-repository file read as evidence for this pass was `services/agent/config.py` (§17).
+**Amendment pass (this revision).** The architecture plan review returned NO-GO for W1.1 with
+sixteen blocking findings. This revision closes every gateway-owned one in place — B1, B2, B3, B4
+(gateway half), B5, B10, B11, B12 (gateway half), B13, B14/B15 ownership, C1's reservation table, C7
+and C10 — and publishes the two registers the review asked the gateway to own: **§25** the stable
+rule ids, **§26** the finding-by-finding closure table, which names for every finding not closed here
+the document and owner that closes it. No product scope changed and no rule was invented: every
+change reconciles two statements already inside the accepted corpus, or one statement against DoD
+v4. The one repository file read as additional evidence for this pass was `services/agent/config.py`
+(§17).
 
 ## 0. Bindings absorbed (all prior rulings, restated as constraints on this design)
 
@@ -43,7 +38,7 @@ repository file read as evidence for this pass was `services/agent/config.py` (�
    ceilinged by commissioning policy. Arbiter enforces and logs initiator provenance + nonce burn.
 7. One command owner per device. Approval validation lives **only** in the deterministic arbiter.
 8. Public `libchudware` C ABI carries no `mfg_*` symbols; the gateway is a separate process.
-9. **Path ruling (Main, latest):** production GUI additions live only under
+9. **Path ruling (latest):** production GUI additions live only under
    `host/src/ui/manufacture/**` (no `ui/mfg`, no new canvases); cross-domain service root is
    `services/manufacturing/**`; domain engines may use `core/<domain>/**`; RPC/events stay
    `mfg_*`/`mfg.*`; `host/src/ui/cam/**` remains offline-CAM owner, extended only via named seams.
@@ -171,7 +166,7 @@ batch-wide ownership assignments, including the two shared files this document d
 | `contracts/events.md` | Gateway, W1.1 (`MFG-SUB-1`) | append `mfg.*` event kinds **and** amend §5 so an accepted `*_subscribe` lane may emit events after the final response line for the life of the subscription | doc |
 | `core/CMakeLists.txt` | Gateway, per wave | `add_executable(test_grbl_protocol tests/test_grbl_protocol.cpp)` etc., doctest include, same pattern as line 458 | ~30 lines |
 | `scripts/gate.sh` | Gateway, per wave | append the gateway test/smoke block; **zero** new SKIP conditions (§24.4) | ~20 lines |
-| `docs/REFACTOR_LOG.md` | the wave's owner | one entry per wave (DoD 20) | doc |
+| `docs/manufacturing/README.md` as-built map | the wave's owner | one update per wave (DoD 20) | doc |
 
 One further new, gateway-owned file, added by `MFG-FAM-1` in W1.1:
 
@@ -480,7 +475,7 @@ confirmation for this resume. Violate any → the run goes `abandoned`.
 
 ```json
 {"lease_id":"lease:01J…","device_id":"dev:…",
- "owner":{"client_kind":"gui|mcp|agent|test|control","seat":"hunter@ws1","session":"01J…"},
+ "owner":{"client_kind":"gui|mcp|agent|test|control","seat":"operator@ws1","session":"01J…"},
  "role":"commander",
  "granted_at_seq":918001,"ttl_ms":15000,"heartbeat_ms":3000,
  "transport_kind":"serial","exclusive_endpoint":"/dev/ttyACM0"}
@@ -1006,8 +1001,8 @@ relies on polling or TTL expiry to correct a consumer.
 
 ## 17. MCP surface and risk gating (DoD 15)
 
-`services/mcp/mfg_tools.py`, registered `register_mfg_tools(view(mcp, "manufacture"))`. **Final ruling
-(Main): one shared family id `"manufacture"` covers the entire overhaul (`MFG-FAM-2`)** — and the
+`services/mcp/mfg_tools.py`, registered `register_mfg_tools(view(mcp, "manufacture"))`. **Final ruling:
+one shared family id `"manufacture"` covers the entire overhaul (`MFG-FAM-2`)** — and the
 enumeration is now **total over all ten domains**, so no later contributor can read it as exhaustive and
 conclude their domain is outside it: **gateway, monitoring, cutting, turning, PnP, robot, twin,
 additive, metrology, perception**. Every one of them registers through `view(mcp, "manufacture")`; none
@@ -1328,10 +1323,10 @@ binary degrades fixture richness, not coverage.
 | 14 | simulation/perception never satisfy execute-side gates; simulated conclusions are context; gating on procedural facts allowed | `kind()==emulator` **and** any endpoint recorded `endpoint_is_physical:false` → `src:"simulated"` (`MFG-SRC-2`); `procedural_fact` is a first-class Stage-1 admission class for the five offline levels and can never satisfy an execute-side subject or an approval-bound device guard (`MFG-ADMIT-1`/`MFG-ADMIT-2`, `MFG-PFFLIP-1`); the `emulated` class is not a physical execute-side subject and binds to no physical approval (`MFG-EMU-1`) | **yes** | §3.2, §10.1, §12, §14, §24.3(i) |
 | 15 | one command owner per device; approval validation only in the arbiter; motion/safety risk explicit-membership; safety has no model allow path | lease + static observer/write separation (the `observer` client kind is gateway-owned, W1.1 — `MFG-OBS-1`); arbiter-only validation; `_MOTION_TOOLS`/`_SAFETY_TOOLS` (safety empty) with `services/mcp/tool_registry.py` single-owned (§2.1); and the `manufacture` family is off by default **by mechanism** in `services/agent/config.py`, gateway-owned, landing in W1.1 ahead of every MCP wave (`MFG-FAM-1`) | **yes — mechanism named, owned and waved, not asserted** | §2, §2.1, §7, §11, §17, §19 |
 | 16 | public `libchudware` C ABI carries no `mfg_*`; gateway is a separate service/process | `chudware-mfgd`; `mfg_` early-`false` routing seam; `mfg-abi` smoke | **yes** | §1, §2, §20 |
-| 17 | no GPL/AGPL/non-commercial code, weights, or datasets in the commercial core; fast gate rejects in-process libslic3r/CuraEngine; sidecars carry matching source/hashes/scripts/notices/URL | printer adapters are HTTP/WS clients over public APIs only (Moonraker/Klipper GPLv3, OctoPrint AGPLv3, PrusaLink freeware — none linked or bundled); `mfg-license` smoke | **yes** | §13, §20 |
+| 17 | no GPL/AGPL/non-commercial code, weights, or datasets in the permissively licensed core; fast gate rejects in-process libslic3r/CuraEngine; sidecars carry matching source/hashes/scripts/notices/URL | printer adapters are HTTP/WS clients over public APIs only (Moonraker/Klipper GPLv3, OctoPrint AGPLv3, PrusaLink freeware — none linked or bundled); `mfg-license` smoke | **yes** | §13, §20 |
 | 18 | emulator progression capability-gated: E0-E3 in normal gates, pilot E6 before `execute`; no level exceeds the highest passed stage | stage table with an explicit machine-class ceiling axis; virtual qualification is a precondition for *attempting* E4 and raises no level on any physical class (`MFG-CEIL-2`); `emulator_stage_at_least` guard; `safety_integration` unlocked by no stage for any class (`MFG-SAFETY-1`) | **yes** | §13, §18, test 9 |
 | 19 | Tier-0 registers, guard source tables, prerequisite/corroborating/artifact-dependent columns, invalidation events, durable schemas are contract-tested as policy boundaries | `test_mfg_contracts.cpp` + `test_contract_parity.py` | **yes** | §20 |
-| 20 | major waves append `docs/REFACTOR_LOG.md` and update maintained skills/maps in the same green commit | one log entry per wave in §19; `skill://chudware-dev` map + `contracts/README.md` updated in the same commit | **yes** | §2, §19 |
+| 20 | major waves record their change summary and update the relevant developer documentation in the same green commit | one change summary per wave in §19; the as-built map in `docs/manufacturing/README.md` + `contracts/README.md` updated in the same commit | **yes** | §2, §19 |
 
 Standing rule for future state additions, accepted: any new durable result kind must land with a
 `ResultRegistry` policy row, a contract row, and a reconciliation test in the same commit; absent a
@@ -1585,7 +1580,7 @@ column:
 | `robot_capability` | `epoch_invariant`, `supersede_with_parent` **false** (§24.11) | falsify on parent cell change or on any cited `evidence_ref` being falsified; supersede on re-derivation from newer evidence; `derived_from:[robot_cell]` |
 
 **SKIP tally, corrected: this batch adds ZERO new `gate.sh` SKIPs.** `RobotArchitecture` withdrew
-`CHUDWARE_ROS_SIDECAR_BIN` after Main's opt-in-qualification ruling and made its rotation-parity test
+`CHUDWARE_ROS_SIDECAR_BIN` after the opt-in-qualification ruling and made its rotation-parity test
 hermetic against committed golden vectors; `cam.cut` keeps `CHUDWARE_GRBL_SIM_BIN` out of `gate.sh`
 behind `scripts/qualify_cut_e2.sh`; `pnp` does the same with `CHUDWARE_OPENPNP_BIN` behind
 `scripts/qualify_pnp_q1.sh`; the gateway adds none because E0-E3 are hardware-free and
@@ -1634,7 +1629,7 @@ Consequences, all intended:
    `services/manufacturing/monitor/**` constructs no socket and never writes `src` — so the Python side
    remains structurally incapable of manufacturing probed evidence.
 
-**Refinement of what I told Monitoring earlier** (it was right while monitor was capped at declared,
+**Refinement of the earlier guidance to Monitoring** (it was right while monitor was capped at declared,
 and would be wrong now): a *probed* monitor observation **may** be admitted at Stage 1 for the subject
 it directly measures. It still may not (a) corroborate itself or another observation from the same
 source or config epoch, (b) substitute for the device lane's own `ControllerSnapshot` where a gate is
@@ -1736,11 +1731,11 @@ could drift from.
 Two domains landed on opposite answers for the same shape and both defended it well:
 `RobotArchitecture` sets no `supersede_with_parent` on `robot_traj` ("an exported file is a historical
 artifact, not a live claim"), while `CuttingProcessArchitecture` sets it on `cam.cut.post` ("a no-op
-revision bump carries the whole chain forward without alarm"). My §24.7 example list named
-`cam.cut.post` on the must-not side, so this is a real conflict and I am resolving it rather than
-letting each doc quietly disagree.
+revision bump carries the whole chain forward without alarm"). The §24.7 example list named
+`cam.cut.post` on the must-not side, so this is a real conflict and it is resolved here rather than
+left for each doc to quietly disagree.
 
-The dividing line I first drew — artifact vs claim — is the wrong axis, because supersession is not an
+The dividing line first drawn — artifact vs claim — is the wrong axis, because supersession is not an
 accusation. Saying "this posted program is no longer the current derivation of its plan" is honest;
 *falsifying* it would not be. What actually matters for safety is a much narrower set of invariants:
 
@@ -1785,7 +1780,7 @@ row gets a `superseded_by` pointer to it. Same observable outcome, no gateway-in
 §24.6's table stands as written; the monitoring doc should read `falsify + retain_as_last_ok` for
 `monitor_condition`.
 
-Two confirmations while I am here. Nothing in this document ever called monitoring "context only" —
+Two confirmations. Nothing in this document ever called monitoring "context only" —
 that phrase belongs to *simulated* conclusions under DoD 14, and §24.5's refinement is the operative
 text for probed observations, with the four subject-binding limits Monitoring restated verbatim
 correct. And pinning capability to `assumed` with the missing level named when a collector is absent is
@@ -1796,7 +1791,7 @@ visible in the capability report instead of hidden in a gate exemption.
 
 `PnpArchitecture`, applying §24.7's converse rule, noticed it had never registered a capability kind at
 all — and since its GUI paints the capability truth table, the most truth-bearing surface in that track
-was the one unjournaled thing on screen. That is a **criterion-10 violation, and it is mine to close**,
+was the one unjournaled thing on screen. That is a **criterion-10 violation, and the gateway owns closing it**,
 because DoD 10 requires a gateway-stamped durable row for every durable result a UI may paint, not only
 telemetry. It is also not PnP-specific: `twin` and `monitor` both stated they register no `*capability`
 kind, `robot` composes a `CapabilityReport` without one, and every one of those reports is rendered.
@@ -1825,7 +1820,7 @@ Rule, effective for every domain in the batch:
    and must drop the affected level — no path where a level stays `verified` on falsified evidence.
 
 This is the second fabricated-competence path closed in this wave (the first being §24.7's stale
-procedural fact), and both were found by a peer applying my own rule back at me — which is the guard
+procedural fact), and both were found by a peer applying the gateway's own rule back to it — which is the guard
 audit working as intended rather than a hole in it.
 
 PnP's two `supersede_with_parent: false` decisions are also worth recording as the canonical worked
@@ -1896,7 +1891,7 @@ Peer citations to repair mechanically against this table: cut §6.1 and its test
 robot §6.1/§6.4 cite §24.4/§24.6 for what is `MFG-PFFLIP-1`; monitoring §2.1 cites §24.1 for what is
 `MFG-ROTRANSPORT-1`; turning §13.6 cites §24.10 for what is `MFG-SUBJNS-1`.
 
-## 26. Review closure table — every named finding in `local://manufacturing-plan-review.md`
+## 26. Review closure table — every named finding in the architecture plan review
 
 `closed here` = the corrected text is in this document, in this revision. `owned elsewhere` = by the
 review's own assignment the correction belongs to a peer document; the gateway-side half, where one
@@ -1919,7 +1914,7 @@ exists, is closed here and named. Nothing is deferred: every row names a documen
 | B13 `worker_rpc.md` §7 claimed twice; events amendment unowned | P1 | **closed here** — one section per domain allocated and published (gateway §7, monitoring §8, then cut, turn, PnP, robot, twin, additive, metrology, perception); the `contracts/events.md` §5 subscription-lane rule and the `observer` client kind are gateway-owned, and their **text lands in W1.1** so monitoring's W2 stream is never degraded to poll-only, with the streaming implementations still in W4.1 | §2, §2.1, §15, §19 (`MFG-SECT-1`, `MFG-SUB-1`, `MFG-OBS-1`) |
 | B14 `tool_registry.py` has five claimants | P1 | **closed here** — Gateway is sole owner for the risk-class change in one wave; the other four claimants' rows land as data supplied to that owner or in a strictly later wave; the unchanged-`classify_risk` assertion is the shared acceptance check for all five | §2, §2.1, §20 test 12 (`MFG-OWN-1`) |
 | B15 `core/cam/post.cpp:487` needs a joint edit | P1 | **ownership closed here** — the shared footer line is assigned to **turning** (it *deletes* the `!g.lathe` condition; cut only *adjusts* the laser condition) and recorded in the batch ownership table rather than in one document's coordination note; cut's "the seams are disjoint" claim is false for that line and is corrected in cut's own document | §2.1 (`MFG-OWN-1`); cut §3.2 → cutting owner |
-| B16 UX slice frozen by summary | P1 | **owned elsewhere** — UX's run-approval row set, the 8-row Tier-0 register, the downgradable/non-downgradable register and the 12 named existing files must be recovered into a `local://` artifact before W1.1 closes, or the run-approval bullet-(ii) audit reassigned to Gateway in writing. The gateway's own half of the DoD-8 obligation is discharged by B3's closure above | §10.5, §22 row 8; UX recovery → Main / UX owner |
+| B16 UX slice frozen by summary | P1 | **owned elsewhere** — UX's run-approval row set, the 8-row Tier-0 register, the downgradable/non-downgradable register and the 12 named existing files must be recovered into a checked-in document before W1.1 closes, or the run-approval bullet-(ii) audit reassigned to Gateway in writing. The gateway's own half of the DoD-8 obligation is discharged by B3's closure above | §10.5, §22 row 8; UX recovery → UX owner |
 | C1 additive path/prefix divergence; §0.10 incomplete | P2 | **reservation table closed here** — total over ten domains plus `mfg_tier0_*`/`mfg_result_*`, reserving additive's spellings as `mfg_print_*`/`mfg.print.*` and normalizing the `mfg.metrology.*`/`mfg.perception.*` event forms. Additive's `host/src/ui/print/**`, `print_*` and `services/gateway/**` spellings are non-conformances in additive's own document | §0.10 (`MFG-PREFIX-1`); additive §0/§2/§5/§9/§11/§12 → additive owner |
 | C2 DoD-16 ABI gate is lexical | P2 | **owned elsewhere**; recorded against §20 for the additive slice to mechanize — `mfg-abi` asserts the C ABI carries no transport, lease, run, approval or device-command entry point **regardless of prefix** | §20; additive §5.1 → additive owner |
 | C3 invalidation dispatch specified five ways | P2 | **owned elsewhere** — one `mfg.<domain>.invalidated` per domain, consumers branching on `class`; the gateway's `mfg.result.falsified`/`.superseded` pair is the single ratified exception and §16 already documents it as such | §5, §16; additive §8.2.1, perception §4.1, metrology §6.1 → their owners |

@@ -1,18 +1,17 @@
-"""Pure turn-assembly seams and the run-scoped workspace/credential lifetime."""
+"""Pure turn-assembly seams for the online agent lane."""
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
-from services.agent.request_context import bind_roots, cell_path, in_cell
+from services.agent.request_context import cell_path, in_cell
 
 
 # Host-call threads bind a caller-owned provider factory, never credential bytes in
-# tool arguments or a process-global actor. A bounded planner retains its provider.
+# tool arguments. A bounded planner retains its provider.
 _HELPER_RUNTIME: ContextVar[Any] = ContextVar("chudware_helper_runtime", default=None)
 _TOOL_SESSION_ID: ContextVar[str | None] = ContextVar("chudware_tool_session_id", default=None)
 
@@ -88,7 +87,6 @@ def resolve_model_and_effort(
     request: str,
     raw_params: Mapping[str, Any],
     cfg: Mapping[str, Any],
-    credit_actor: Any,
     byok_key: Any,
     transient_call: Any,
     auth_providers: Any,
@@ -141,8 +139,6 @@ def resolve_model_and_effort(
     else:
         provider = provider or str(cfg.get("provider") or "")
         model = model or str(cfg.get("model") or "")
-    if credit_actor is not None and credit_actor.key_source == "subscription":
-        provider = "anthropic"
     if preferences.local_only and not _auto_local_provider(provider, cfg):
         raise ValueError("This computer only requires a loopback model. Configure a local model in Accounts.")
     if byok_key is not None and byok_provider_env(provider) is None:
@@ -196,19 +192,3 @@ def resolve_settings(
     # progress watchdog through their forwarded `subagent_event` frames.
     settings.setdefault("subagent_subscription", "events")
     return settings
-
-
-@contextmanager
-def activate_turn_env(
-    project_root: str, save_dir: str, config_module: Any
-) -> Iterator[list[str]]:
-    """Bind explicit roots without mutating the worker's cwd or environment."""
-    errors: list[str] = []
-    try:
-        with bind_roots(project_root, save_dir):
-            yield errors
-    finally:
-        try:
-            config_module.clear_pooled_credentials()
-        except Exception as exc:  # noqa: BLE001 - attempt all remaining restores
-            errors.append(f"credential_reset: {type(exc).__name__}: {exc}")

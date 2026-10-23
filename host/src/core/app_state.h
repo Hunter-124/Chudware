@@ -288,11 +288,6 @@ void appstateInitPersist();
 bool appstatePersistReady();
 void appstatePersistSync();
 
-// The Gemini API key shipped as the out-of-box default (user-provided). Seeded into
-// config.json on first run when no Gemini key is configured, so the copilot works
-// immediately. Users can replace it in Settings → AI.
-extern const char* kSeededGeminiKey;
-
 // One provider's live availability, filled by the agent_list_models probe. Lets the model
 // picker hide providers that are down / unkeyed and list the local endpoint's loaded models.
 struct ProviderModels {
@@ -918,21 +913,6 @@ struct AppState {
     Tex wordmarkDark;   // dark-text "-CAD" variant for the light theme (white text washes out)
     Renderer* renderer = nullptr;     // owned by run_gui; AppState only borrows it
     chrome::HitLayout* hitLayout = nullptr;
-
-    // ---- signed desktop entitlement (commercial launch 4.1) ----
-    // One fail-closed flag is consulted by every command surface. It never
-    // prevents opening, viewing, orbiting, measuring, or exporting existing work.
-    bool entitlementReadOnly = true;
-    bool entitlementSignedIn = false;
-    std::string entitlementPlan;
-    std::string entitlementEmail;
-    std::string entitlementStatus;
-    std::string entitlementToken;  // verified compact token, memory-only
-    // Independent first-AI-dispatch verification; implemented in app_state.cpp
-    // with its own crypto_sign_open call rather than the launch/router helper.
-    bool entitlementMutationVerified = false;
-    bool entitlementAiVerified = false;
-    bool verifyEntitlementForAi();
 
     // ---- document mirror (C16) — worker-backed document state ----
     core::DocMirror docMirror;

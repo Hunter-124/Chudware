@@ -118,7 +118,7 @@ def _review(path: Path, digest: str, context: dict) -> tuple[dict, bytes]:
             or len(set(additional)) != len(additional)):
         raise WheelhouseError("invalid/duplicate reviewed additional declaration digests")
     source = manifest["chudcode_source"]
-    _keys(source, {"repository", "repository_commit"}, "reviewed private source")
+    _keys(source, {"repository", "repository_commit"}, "reviewed Chudcode source")
     _source_identity({"kind": "vcs", **source}, True, source)
     target = manifest["target"]
     _keys(target, {"environment", "tags", "wheels"}, "reviewed target")
@@ -167,7 +167,7 @@ def _declaration_inputs(manifest: dict, requirements: Path, additional: list[Pat
         raise WheelhouseError("native Chudcode lock changed since operator review")
     native_document = _document(native_bytes)
     if manifest["chudcode_source"] != {key: native_document.get(key) for key in manifest["chudcode_source"]}:
-        raise WheelhouseError("reviewed private RPC source differs from native Chudcode commit")
+        raise WheelhouseError("reviewed chudcode-rpc source differs from native Chudcode commit")
     return root, extras, native_bytes
 
 
@@ -246,7 +246,7 @@ def prepare(args) -> dict:
         with verified_wheelhouse(wheel_directory, declarations / "requirements.txt", temporary / "RUNTIME_WHEELS.lock",
                                  temporary / "CHUDCODE_ARTIFACT.lock", context["environment"], set(context["tags"]),
                                  additional_requirements=additional) as identity:
-            # Publish only authenticated private snapshot bytes, never reread candidates.
+            # Publish only authenticated snapshot bytes, never reread candidates.
             snapshot = identity["requirements"].parent
             for entry in manifest["target"]["wheels"]:
                 _copy_wheel(snapshot / entry["filename"], wheels / entry["filename"])

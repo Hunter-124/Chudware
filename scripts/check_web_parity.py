@@ -7,14 +7,8 @@ The desktop app reads ``assets/`` off disk at startup, so regenerating an asset
 ships to desktop the instant you rebuild. The web app does not: Emscripten bakes
 every asset into ``Chudware.data`` at LINK time (see the ``--preload-file`` flags
 in ``host/CMakeLists.txt``). So a web bundle is a *derived artifact* that goes
-stale silently the moment any preloaded asset changes.
-
-That is not hypothetical. On 2026-08-17 commit 69690e57 replaced every ribbon
-tool icon with an engine-rendered 3D tile. The desktop picked them up
-immediately. Production served a bundle linked on 2026-08-07 until 2026-08-22 —
-ten days of users looking at the old icons — and nothing anywhere noticed,
-because no CI job builds WASM and no check compares a bundle to its sources. It
-was found by hand-scanning ``Chudware.data`` for PNG bytes.
+stale silently the moment any preloaded asset changes, and nothing else compares
+a bundle to its sources.
 
 What it checks
 --------------
@@ -35,15 +29,14 @@ fixes:
   ORPHAN   pack carries an asset no longer preloaded -> relink (stale pack)
 
 It also verifies the precompressed ``.br``/``.gz`` siblings are not older than
-the files they encode. ``Webservice/gateway/appserve.py::_fresh_variant`` refuses
-to serve a stale variant, so a half-finished restage silently drops every client
+the files they encode. ``web/gateway/appserve.py::_fresh_variant`` refuses to
+serve a stale variant, so a half-finished restage silently drops every client
 to identity encoding.
 
 Usage
 -----
-  check_web_parity.py                      # default staged dir
+  check_web_parity.py                      # $CHUDWARE_WEB_APP, else host/build-wasm/app
   check_web_parity.py --bundle DIR         # a specific bundle dir
-  check_web_parity.py --url https://app.chudware.com   # what PROD actually serves
 """
 
 from __future__ import annotations
@@ -54,11 +47,11 @@ import json
 import os
 import re
 import sys
-import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 CMAKELISTS = REPO / "host" / "CMakeLists.txt"
+DEFAULT_BUNDLE = REPO / "host" / "build-wasm" / "app"
 
 # Emscripten's file table. Keys are UNQUOTED in the emitted JS (`filename:"/x"`),
 # so this is a targeted regex rather than a JSON parse.
@@ -136,40 +129,6 @@ class _LocalPack:
         return self._data[start:end]
 
 
-class _RemotePack:
-    """Reads a served bundle, using HTTP Range so a watch job pulls kilobytes."""
-
-    def __init__(self, base: str, cookie: str | None):
-        base = base.rstrip("/")
-        self.app = base if base.endswith("/app") else f"{base}/app"
-        self._hdr = {"Accept-Encoding": "identity", "User-Agent": "chudware-web-parity"}
-        if cookie:
-            self._hdr["Cookie"] = cookie
-        self.entries = _read_manifest(
-            _get_bytes(f"{self.app}/Chudware.js", cookie).decode("utf-8", "replace")
-        )
-        self.size = -1
-        self.label = self.app
-
-    def slice(self, start: int, end: int) -> bytes:
-        hdr = dict(self._hdr)
-        hdr["Range"] = f"bytes={start}-{end - 1}"
-        req = urllib.request.Request(f"{self.app}/Chudware.data", headers=hdr)
-        with urllib.request.urlopen(req, timeout=120) as r:
-            body = r.read()
-            # A server that ignores Range hands back the whole pack; slice locally
-            # rather than silently comparing the wrong bytes.
-            return body if r.status == 206 else body[start:end]
-
-
-def _get_bytes(url: str, cookie: str | None) -> bytes:
-    hdr = {"Accept-Encoding": "identity", "User-Agent": "chudware-web-parity"}
-    if cookie:
-        hdr["Cookie"] = cookie
-    with urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=60) as r:
-        return r.read()
-
-
 def check_compression_freshness(bundle: Path) -> list[str]:
     """Flag precompressed siblings the gateway will refuse to serve.
 
@@ -217,24 +176,15 @@ def verify(pack, expected: dict[str, Path]) -> dict[str, list[str]]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    g = ap.add_mutually_exclusive_group()
-    g.add_argument("--bundle", type=Path, help="staged bundle directory to verify")
-    g.add_argument("--url", help="base URL of a SERVED bundle (verifies what users actually get)")
-    ap.add_argument("--cookie", help="Cookie header for --url when /app is auth-gated")
+    ap.add_argument("--bundle", type=Path, help="staged bundle directory to verify")
     ap.add_argument("--json", action="store_true", help="machine-readable result")
     args = ap.parse_args()
 
     expected = preloaded_assets()
 
-    comp_problems: list[str] = []
-    if args.url:
-        pack = _RemotePack(args.url, args.cookie or os.environ.get("CHUDWARE_PARITY_COOKIE"))
-    else:
-        bundle = args.bundle or Path(
-            os.environ.get("CHUDWARE_WEB_APP", str(Path.home() / "chudware-web" / "app"))
-        )
-        pack = _LocalPack(bundle)
-        comp_problems = check_compression_freshness(bundle)
+    bundle = args.bundle or Path(os.environ.get("CHUDWARE_WEB_APP") or DEFAULT_BUNDLE)
+    pack = _LocalPack(bundle)
+    comp_problems = check_compression_freshness(bundle)
 
     res = verify(pack, expected)
     bad = res["stale"] + res["missing"] + res["orphan"]

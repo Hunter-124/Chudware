@@ -1288,7 +1288,7 @@ void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
         if (dragging_ && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
             updateDrag(st, io.MousePos, imgMin, vw, vh);
             st.requestCursor(ui::CursorKind::Hand);
-            // Edge auto-pan (Hunter UX): camera dead-still except a quadratic ramp inside the
+            // Edge auto-pan: camera dead-still except a quadratic ramp inside the
             // edge band — mirrors the 2D sketcher's tuning.
             const float kBandPx = 48.0f * ui::uiScale;
             const float kMaxPx = 540.0f * ui::uiScale;

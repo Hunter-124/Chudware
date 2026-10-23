@@ -1,26 +1,9 @@
-# Direct dependencies and security-pinned transport/crypto/installer closure.
-# EXACT pins prevent a reused deployment venv from retaining vulnerable
-# transitive packages. 2026-10-12 audit dispositions and deployment verification:
-# reports/security/2026-10-12/dependency-dispositions.md.
-#
-# Refresh policy: resolve explicit releases, install in a disposable dev venv,
-# run the gateway suite, and review advisories before deploying. These pins are
-# not a claim that the current deployment has been upgraded.
+# Gateway runtime dependencies. Exact pins keep a reused venv from retaining
+# vulnerable transitive packages; refresh them together and rerun the suite.
 
 fastapi==0.139.0
 uvicorn[standard]==0.51.0
-httpx==0.28.1
 websockets==16.1
-PyJWT[crypto]==2.15.0    # fixes GHSA-42vr-xj54-vc7v and the 2.14.0 claim-verification fixes
-pyyaml==6.0.3
-psycopg[binary]==3.3.4   # store; [binary] ships libpq so the host needs no libpq-devel
-psycopg_pool==3.3.1
-python-multipart==0.0.32   # >=0.0.30 fixes CVE-2026-53537/8/9; earlier fixes: 0.0.22 (CVE-2026-24486 path traversal), 0.0.26/0.0.27 (DoS)
-stripe==15.5.0
-argon2-cffi==25.1.0
-boto3==1.43.68           # R2 (S3-compatible) backup upload
-dulwich==1.2.12          # plm_seed.py imports it and it was never declared
+httpx==0.28.1              # fastapi.testclient transport for the test suite
+python-multipart==0.0.32   # >=0.0.30 fixes CVE-2026-53537/8/9
 anyio==4.14.2
-cryptography==50.0.0
-urllib3==2.8.0
-pip==26.2.0

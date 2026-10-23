@@ -99,7 +99,6 @@ def online_runtime(monkeypatch):
         _options,
         _tier,
         _capability,
-        _actor,
         _on_event,
     ):
         context = {"categories": [], "enabled_categories": []}
@@ -113,7 +112,7 @@ def online_runtime(monkeypatch):
         )
 
     monkeypatch.setattr(roles, "_assemble_role_runtime", assemble)
-    monkeypatch.setattr(roles, "_record_provider_usage", lambda _payload, _actor: None)
+    monkeypatch.setattr(roles, "_record_provider_usage", lambda _payload: None)
     return card
 
 
@@ -123,12 +122,11 @@ def test_online_role_prompt_tools_lineage_settings_history_attachments_and_resul
     host = _Host()
     monkeypatch.setattr(roles, "get_default_chudcode_host", lambda: host)
     events: list[tuple[str, dict]] = []
-    actor = object()
-    recorded: list[tuple[dict, object]] = []
+    recorded: list[dict] = []
     monkeypatch.setattr(
         roles,
         "_record_provider_usage",
-        lambda payload, value: recorded.append((dict(payload), value)),
+        lambda payload: recorded.append(dict(payload)),
     )
 
     result = roles.run_role_turn(
@@ -146,7 +144,6 @@ def test_online_role_prompt_tools_lineage_settings_history_attachments_and_resul
         attachments=[{"path": "/tmp/view.png", "kind": "image"}],
         max_tokens=4096,
         max_total_tokens=16000,
-        actor=actor,
     )
 
     call = host.calls[0]
@@ -208,7 +205,7 @@ def test_online_role_prompt_tools_lineage_settings_history_attachments_and_resul
     )
     assert usage_event["parent_id"] == "node-3"
     assert usage_event["session_id"] == call["session_id"]
-    assert recorded and recorded[0][1] is actor
+    assert recorded
 
 
 def test_persistent_child_session_is_stable_and_history_is_seeded_once(
@@ -339,7 +336,6 @@ def test_explicit_offline_uses_only_safe_local_role_loop(monkeypatch):
         attachments=[{"path": "/tmp/a.txt", "kind": "file"}],
         max_tokens=2000,
         max_total_tokens=8000,
-        actor="credit-actor",
     )
 
     assert not host_used
@@ -348,7 +344,6 @@ def test_explicit_offline_uses_only_safe_local_role_loop(monkeypatch):
     assert calls[0][3]["attachments"] == [{"path": "/tmp/a.txt", "kind": "file"}]
     assert calls[0][3]["max_tokens"] == 2000
     assert calls[0][3]["max_total_tokens"] == 8000
-    assert calls[0][3]["chudware_actor"] == "credit-actor"
     assert result["success"] is True
     assert result["result"] == {"handoff": {"status": "done"}}
     assert result["offline"] is True
@@ -493,7 +488,6 @@ def test_role_runtime_preserves_explicit_allowed_tool_tristate(
         None,
         None,
         None,
-        None,
     )
     assert captured["allowed_tools"] == expected
     assert captured["categories"] == ["analysis"]
@@ -546,7 +540,7 @@ def test_role_events_preserve_single_dict_live_sink(monkeypatch, online_runtime)
     assert all(event.get("parent_id") == "node" for event in events)
 
 
-def test_cell_role_history_seeds_and_credentials_are_actor_scoped(monkeypatch, online_runtime):
+def test_cell_role_history_seeds_are_actor_scoped(monkeypatch, online_runtime):
     import hashlib
     from services.agent import request_context as tenancy
 
@@ -559,11 +553,7 @@ def test_cell_role_history_seeds_and_credentials_are_actor_scoped(monkeypatch, o
             "actor_hex": hashlib.sha256(actor.encode()).hexdigest()[:32],
             "right": "editor", "epoch": 1,
         }
-        credential = {
-            "web_actor": True, "web_key_source": "byok", "web_tenant": actor,
-            "web_provider": "openai", "web_provider_grant": f"grant-{actor}",
-            "workspace_dir": "/work", "mode": "plan",
-        }
+        credential = {"workspace_dir": "/work", "mode": "plan"}
         monkeypatch.setattr(host, "session_launch_params", lambda session: dict(credential), raising=False)
         with tenancy.bind_context(ctx):
             first = roles.run_role_turn(
@@ -572,8 +562,6 @@ def test_cell_role_history_seeds_and_credentials_are_actor_scoped(monkeypatch, o
             )
             assert first["success"]
             assert "prior human request" in host.calls[-1]["request"]
-            assert host.calls[-1]["web_provider_grant"] == credential["web_provider_grant"]
-            assert host.calls[-1]["web_tenant"] == actor
             assert host.calls[-1]["mode"] == "plan"
             repeat = roles.run_role_turn(
                 "build", "general_agent", session_id="same", run_id="same-run",
@@ -584,7 +572,7 @@ def test_cell_role_history_seeds_and_credentials_are_actor_scoped(monkeypatch, o
     assert len(roles._HISTORY_SEEDED_SESSIONS) == 2
 
 
-def test_cell_nested_role_inherits_parent_credential_scope(monkeypatch, online_runtime):
+def test_cell_nested_role_inherits_parent_scope(monkeypatch, online_runtime):
     import hashlib
     from services.agent import request_context as tenancy
 
@@ -595,11 +583,7 @@ def test_cell_nested_role_inherits_parent_credential_scope(monkeypatch, online_r
         "right": "editor", "epoch": 1,
     }
     host = _Host()
-    inherited = {
-        "web_actor": True, "web_key_source": "byok", "web_tenant": actor,
-        "web_provider": "openai", "web_provider_grant": "parent-scoped-grant",
-        "workspace_dir": "/work",
-    }
+    inherited = {"workspace_dir": "/work"}
     monkeypatch.setattr(host, "session_launch_params", lambda session: dict(inherited), raising=False)
     monkeypatch.setattr(roles, "get_default_chudcode_host", lambda: host)
     with tenancy.bind_context(ctx):
@@ -608,7 +592,7 @@ def test_cell_nested_role_inherits_parent_credential_scope(monkeypatch, online_r
             options={"mode": "ask"}, close_session=True,
         )
     assert result["success"]
-    assert host.calls[-1]["web_provider_grant"] == "parent-scoped-grant"
+    assert host.calls[-1]["workspace_dir"] == "/work"
     assert host.calls[-1]["mode"] == "ask"
     assert host.closed == [host.calls[-1]["session_id"]]
 
@@ -643,7 +627,7 @@ def test_role_preserves_trusted_manager_stop_terminal_audit(monkeypatch, online_
 @pytest.mark.parametrize("parent_mode,child_mode,expected", [
     ("ask", "agent", "ask"), ("plan", "agent", "plan"), ("plan", "ask", "ask"),
 ])
-def test_cell_nested_role_cannot_change_parent_grant_mode_or_compaction(
+def test_cell_nested_role_cannot_change_parent_mode_or_compaction(
     monkeypatch, online_runtime, parent_mode, child_mode, expected
 ):
     import hashlib
@@ -653,8 +637,6 @@ def test_cell_nested_role_cannot_change_parent_grant_mode_or_compaction(
     ctx = {"cell": True, "workspace_key": "team:roles/work", "actor_key": "alice",
            "actor_hex": hashlib.sha256(b"alice").hexdigest()[:32], "right": "editor", "epoch": 1}
     parent = {
-        "web_actor": True, "web_key_source": "byok", "web_tenant": "alice",
-        "web_provider": "openai", "web_provider_grant": "cpg1.parent.signature",
         "workspace_dir": "/work", "mode": parent_mode,
         "settings": {"provider": "openai", "model": "selected",
                      "compaction_settings": {"methodOrder": ["snapcompact"]}},
@@ -671,14 +653,13 @@ def test_cell_nested_role_cannot_change_parent_grant_mode_or_compaction(
     with tenancy.bind_context(ctx):
         result = roles.run_role_turn(
             "advise", "general_agent", session_id="real-parent-session", run_id="different-run",
-            options={"mode": child_mode, "web_provider_grant": "cpg1.foreign.signature",
+            options={"mode": child_mode,
                      "workspace_dir": "/work/foreign", "provider": "anthropic", "model": "foreign",
                      "settings": {"provider": "anthropic", "model": "foreign",
                                   "compaction_settings": {"methodOrder": ["soft"]}}},
         )
         assert result["success"]
         call = host.calls[-1]
-        assert call["web_provider_grant"] == parent["web_provider_grant"]
         assert call["mode"] == expected
         assert call["settings"] == parent["settings"]
         assert call["workspace_dir"] == parent["workspace_dir"]

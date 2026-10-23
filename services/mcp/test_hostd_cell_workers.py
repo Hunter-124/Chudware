@@ -599,7 +599,12 @@ class GatewayConnection:
     def __init__(self, path, actor=None, workspace=None, epoch=0, right="editor", operator=False):
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.socket.settimeout(20)
-        self.socket.connect(str(path))
+        # sun_path holds ~107 bytes; pytest tmp paths can exceed it. Connect through a short
+        # symlink (path resolution follows it) instead of the socket's own long path.
+        with tempfile.TemporaryDirectory(prefix="cw-") as short_dir:
+            link = Path(short_dir) / "s"
+            link.symlink_to(path)
+            self.socket.connect(str(link))
         self.stream = self.socket.makefile("rb")
         self.next_id = 0
         self.events = []

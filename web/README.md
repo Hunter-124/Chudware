@@ -8,21 +8,26 @@ and the documented optional non-commercial backend retain their
 
 ## Quickstart
 
-Clone the public MIT source repository and enter its root:
+Get the deployment configuration, then download and start the complete public image:
+
+**Ubuntu 24.04+:** after cloning, complete the
+[AppArmor host setup](#ubuntu-2404-apparmor-setup) before the Compose command below.
 
 ```sh
-git clone https://github.com/Hunter-124/Chudware.git
+git clone --depth 1 https://github.com/Hunter-124/Chudware.git
 cd Chudware
-docker compose -f web/compose.yaml up --build -d --wait
+docker compose -f web/compose.yaml up --pull always --no-build -d --wait
 ```
 
-Open <http://127.0.0.1:8300/app/>. The first build compiles the native engine and browser
-client; it is not a download of an advertised public prebuilt Chudware image.
+Open <http://127.0.0.1:8300/app/>. No compilation, registry login, Chudware account,
+license key or provider token is needed. The image includes the browser client,
+native engine and general Python workers. The shallow clone only reduces download
+size; omit `--depth 1` for the repository's complete development history.
 
 ### Prerequisites and sizing
 
-- **Linux x86-64** with Docker Engine and the **Docker Compose v2 plugin, 2.24.4 or
-  newer**. The HTTPS override uses Compose's `!reset` support. The old `docker-compose`
+- **Git**, **Linux x86-64**, Docker Engine and the **Docker Compose v2 plugin, 2.24.4
+  or newer**. The HTTPS override uses Compose's `!reset` support. The old `docker-compose`
   Python command is not the supported interface. An ARM host would need x86-64
   emulation; that is not a supported native ARM deployment.
 - Unprivileged user namespaces and nested bubblewrap isolation must work inside the
@@ -32,34 +37,48 @@ client; it is not a download of an advertised public prebuilt Chudware image.
   are not assumed equivalent to a Linux Docker host. Rootless Podman can use
   `podman compose` with a compatible Compose provider, but must satisfy the same
   namespace and Compose-feature requirements.
-- Internet access during the build for Fedora packages, public C++ dependencies,
-  Python wheels and the Emscripten toolchain. The recommended container needs neither
-  the optional online-agent SDK nor its executable because online Copilot is unsupported
-  in this deployment; it retains the other root Python requirements and general workers.
-- Budget a substantial native/WASM build, not a tiny web-server image. As a planning
-  allowance, use **16 GiB RAM and 40 GiB free disk** for the build and caches; these
-  are estimates, not measured minimums. Large models need additional runtime memory
-  and storage. The default build parallelism is conservatively two jobs. To reduce
-  peak build memory, use:
-
-  ```sh
-  docker compose -f web/compose.yaml build --build-arg BUILD_JOBS=1
-  docker compose -f web/compose.yaml up -d --no-build
-  ```
+- Internet access to GitHub and GHCR for the initial checkout and image download.
+  Keep disk space for the image, its unpacked layers, saved models and backups.
+  Default runtime limits are four CPUs and 8 GiB RAM; leave room for the host OS
+  and size larger workloads separately. These limits are not measured minimums.
+- The container needs neither the optional online-agent SDK nor its executable
+  because online Copilot is unsupported in this deployment; it retains the other
+  root Python requirements and general workers.
 
 - A current browser with WebAssembly, WebGL2 and cross-origin-isolated shared memory
   (`SharedArrayBuffer`). Localhost HTTP is a secure-context exception; ordinary
   remote HTTP is not. Use [authenticated HTTPS](#remote-access-with-https-and-authentication)
   for another machine.
 
-The image uses Fedora 44, Python 3.13 and Emscripten 6.0.3. It builds the matching
-client/engine/contracts as one unit. It is a source/developer build, not a signed native
-release. Tags for OS packages/base images and some transitive dependency constraints
-can move: a source commit alone is not a byte-for-byte image lock. Record the source
-revision and retain the built image for repeatable upgrades/rollback. The default local
-image tag is `chudware-selfhost:local`; `CHUDWARE_IMAGE` can choose another locally built
-or independently verified image. No registry reference here implies a published public
-artifact.
+### Image channels and source builds
+
+The default image is `ghcr.io/hunter-124/chudware-web:edge`, the moving development
+channel. CI starts the complete image, exercises native CAD and a sandboxed Python
+worker, and verifies persistence across container recreation before publishing it.
+There is no `latest` or `stable` channel. For a repeatable installation, set
+`CHUDWARE_IMAGE` to a published `sha-<full-commit>` tag or registry digest and retain
+that selection for subsequent Compose commands. The
+[package page](https://github.com/users/Hunter-124/packages/container/package/chudware-web)
+lists published versions. Record your running image with
+`docker compose -f web/compose.yaml images`.
+
+To build a reviewed checkout yourself instead, use a separate local tag:
+
+```sh
+export CHUDWARE_IMAGE=chudware-selfhost:local
+docker compose -f web/compose.yaml build --pull
+docker compose -f web/compose.yaml up --pull never --no-build -d --wait
+```
+
+Source builds use Fedora 44, Python 3.13 and Emscripten 6.0.3 and need internet
+access for packages, public C++ dependencies, Python wheels and toolchains. As a
+planning allowance, use **16 GiB RAM and 40 GiB free disk** for the build and caches;
+these are estimates, not measured minimums. The default build parallelism is two
+jobs; add `--build-arg BUILD_JOBS=1` to the build command to reduce peak build memory.
+Base/package inputs can move, so a source commit is not a byte-for-byte image lock:
+record the resulting image ID and retain the image for rollback. Do not overwrite
+the public GHCR tags with locally built images. These browser images are not signed
+native desktop installers.
 
 ### Scope and trust
 
@@ -219,8 +238,10 @@ that has never been read.
 
 Restore **only into empty volumes**, using the same image/revision and operator that
 created the backup. Do not overlay a backup onto a live workspace: newer files would
-remain and state could be inconsistent. For example, choose a new, unused project
-name; stop the original project before starting this one because both use port 8300:
+remain and state could be inconsistent. Set `CHUDWARE_IMAGE` to the backup's retained
+local image tag or immutable published commit tag/digest before both commands, even
+if the installation normally uses the moving `edge` channel. Choose a new, unused
+project name; stop the original project first because both use port 8300:
 
 ```sh
 COMPOSE_PROJECT_NAME=chudware-restore docker compose -f web/compose.yaml \
@@ -230,8 +251,8 @@ COMPOSE_PROJECT_NAME=chudware-restore docker compose -f web/compose.yaml up -d -
 
 Do not reuse `chudware-restore` if it already has data; pick another unused project name.
 Open the restored saved documents and inspect them before retiring the original
-volumes. Keep the chosen new project name for subsequent operations. With a custom
-image, pass the same `CHUDWARE_IMAGE` to both commands.
+volumes. Keep the chosen new project name and the same `CHUDWARE_IMAGE` selection for
+subsequent operations.
 
 For HTTPS, use the same extra `-f web/compose.https.yaml` and `--env-file` options on
 all commands in this guide. The optional proxy also persists `caddy_data` (ACME
@@ -269,18 +290,20 @@ certificate reissuance/rate limits. Never commit credentials or backups.
    replace an installation with a moving branch. Run commands with the **same Compose
    project identity, operator and volumes**. Read that revision's release notes for
    file/state migrations. There is no automatic backwards-compatibility guarantee.
-3. Preserve the old default image tag, then build and start the new source:
+3. Preserve the image used by the existing container, then pull and start the selected
+   new image. Keep the same full Compose options, including the HTTPS override when used:
 
    ```sh
-   docker image tag chudware-selfhost:local chudware-selfhost:rollback
-   docker compose -f web/compose.yaml build --pull
-   docker compose -f web/compose.yaml up -d --no-build
+   docker image tag "$(docker compose -f web/compose.yaml images -q chudware)" chudware-selfhost:rollback
+   docker compose -f web/compose.yaml pull chudware
+   docker compose -f web/compose.yaml up --no-build -d --wait
    ```
 
-   If you set `CHUDWARE_IMAGE`, preserve/tag that image instead and consistently select
-   your new tag. `--pull` may update base/package inputs; record the resulting image ID,
-   not merely the source revision. An image upgrade does not intentionally remove the
-   named volumes.
+   For a pinned installation, set `CHUDWARE_IMAGE` to the newly reviewed published
+   commit tag/digest before pulling. For a source-built installation, retain your
+   local `CHUDWARE_IMAGE` tag and replace `pull chudware` with `build --pull`.
+   Record the resulting image ID, not merely the source revision. An image upgrade
+   does not intentionally remove the named volumes.
 
    For HTTPS, also retain/tag `chudware-selfhost-proxy:local` before rebuilding.
    `CHUDWARE_PROXY_IMAGE` selects that proxy image just as `CHUDWARE_IMAGE` selects
@@ -293,7 +316,7 @@ If the new image has not changed persisted formats, switch back using the old ch
 and the retained image without rebuilding it:
 
 ```sh
-CHUDWARE_IMAGE=chudware-selfhost:rollback docker compose -f web/compose.yaml up -d --no-build
+CHUDWARE_IMAGE=chudware-selfhost:rollback docker compose -f web/compose.yaml up --pull never --no-build -d --wait
 ```
 
 If it has written incompatible state/files, **stop it and restore the pre-upgrade backup
@@ -338,8 +361,16 @@ the repository root:
 
 ```sh
 docker compose --env-file "$HOME/.config/chudware-web.env" \
-  -f web/compose.yaml -f web/compose.https.yaml up --build -d --wait
+  -f web/compose.yaml -f web/compose.https.yaml pull chudware
+docker compose --env-file "$HOME/.config/chudware-web.env" \
+  -f web/compose.yaml -f web/compose.https.yaml build caddy
+docker compose --env-file "$HOME/.config/chudware-web.env" \
+  -f web/compose.yaml -f web/compose.https.yaml up --no-build -d --wait
 ```
+
+Only the small HTTPS proxy is built locally; the CAD application uses the public
+prebuilt image. For a source-built application, keep your local `CHUDWARE_IMAGE`
+selection and build `chudware` instead of pulling it.
 
 Open `https://` followed by your configured hostname and `/app/`, and log in with the
 username and original password. Use the same env file and both Compose files for

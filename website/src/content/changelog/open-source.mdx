@@ -1,6 +1,6 @@
 ---
 title: MIT licensing and deployment choices
-description: Chudware software is MIT licensed without account-based licensing; public source and desktop installer publication remain pending.
+description: Chudware is open source under MIT, with its development history preserved and a public prebuilt browser deployment. Paid hosting is optional project support.
 published: 2026-10-22
 version: MIT licensing
 ---
@@ -14,7 +14,7 @@ version: MIT licensing
 
 ## Getting started
 
-The [setup page](/download/) distinguishes desktop packaging, source builds, and experimental single-operator [browser self-hosting](/docs/self-hosting/). The browser guide uses `docker compose -f web/compose.yaml up --build -d` from a source checkout's repository root.
+The [setup page](/download/) distinguishes desktop packaging, source builds, and experimental single-operator [browser self-hosting](/docs/self-hosting/). The browser guide uses `docker compose -f web/compose.yaml up --pull always --no-build -d --wait` from a checkout's repository root, downloading the public prebuilt image instead of compiling CAD.
 
 Clone the [public repository](https://github.com/Hunter-124/Chudware) and use its build instructions, issue tracker, and contributing guide. Supported desktop SDK and native runtime dependencies are pinned release assets in this same repository; the macOS ARM64 native runtime remains unpinned. [Contact the project](/contact/) about optional paid, owner-operated hosting that supports development. Hosting is not required for the MIT software rights.
 

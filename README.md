@@ -8,7 +8,7 @@ ribbon UI, a feature tree, property panels, and a constraint-solver sketcher, bu
 CAM, ECAD, and simulation. A built-in AI copilot and an **MCP server** let the same document
 be driven by hand, by the copilot, or by any external agent (Claude Code, Cursor, …).
 
-Website: <https://chudware.com>
+Website: <https://chudware.com> · [Development history](https://github.com/Hunter-124/Chudware/commits/master/)
 
 ![Part modeling with the copilot panel](website/public/images/modeling.png)
 
@@ -18,21 +18,25 @@ Website: <https://chudware.com>
 
 ## Start in your browser
 
-The simplest self-hosted path builds the browser client, native CAD engine and Python
-workers together. Clone the public MIT source repository:
+The simplest self-hosted path downloads the complete browser client, native CAD engine
+and Python workers as one prebuilt image. Get the deployment configuration:
+
+**Ubuntu 24.04+:** after cloning, complete the
+[AppArmor host setup](web/README.md#ubuntu-2404-apparmor-setup) before starting Compose.
 
 ```bash
-git clone https://github.com/Hunter-124/Chudware.git
+git clone --depth 1 https://github.com/Hunter-124/Chudware.git
 cd Chudware
-docker compose -f web/compose.yaml up --build -d --wait
+docker compose -f web/compose.yaml up --pull always --no-build -d --wait
 ```
 
-Open <http://127.0.0.1:8300/app/>. You need Docker Engine with the Compose v2 plugin
-(2.24.4+), a Linux x86-64 host that permits nested unprivileged user namespaces, and
-enough memory and disk for a native C++/WebAssembly build. The first run compiles from source; there is
-no prebuilt public image assumed by this command. See the
-[web quickstart](web/README.md#quickstart) for prerequisites, build sizing, persistence,
-backups, upgrades and authenticated HTTPS.
+Open <http://127.0.0.1:8300/app/>. You need Git, Docker Engine with the Compose v2
+plugin (2.24.4+), and a Linux x86-64 host that permits nested unprivileged user
+namespaces. No compilation, Chudware account, license key or provider token is needed.
+The image uses the moving `edge` development channel; see the
+[web quickstart](web/README.md#quickstart) for sizing, image pinning, source builds,
+persistence, backups, upgrades and authenticated HTTPS. Omit `--depth 1` when cloning
+to download the complete existing commit history.
 
 The browser deployment is experimental and single-operator, not a multi-user service;
 online Copilot is unsupported there. Native/source alternatives are below in
@@ -203,7 +207,7 @@ and helpers with no C++ counterpart.
 ## Self-hosted web app (experimental)
 
 The same `host/src/ui` tree compiles to WebAssembly. The recommended
-[Compose deployment](web/README.md#quickstart) builds and runs that client, gateway,
+[Compose deployment](web/README.md#quickstart) runs the prebuilt client, gateway,
 native engine cell and general Python workers together without the online-agent
 runtime. The advanced systemd deployment remains available for Linux operators who
 need filesystem project-quota enforcement. Both are experimental; see

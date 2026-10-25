@@ -1,6 +1,6 @@
 services:
   chudware:
-    image: ${CHUDWARE_IMAGE:-chudware-selfhost:local}
+    image: ${CHUDWARE_IMAGE:-ghcr.io/hunter-124/chudware-web:edge}
     platform: linux/amd64
     build:
       context: ..

@@ -1,6 +1,6 @@
 # Requires Docker Compose >=2.24.4 (!reset). Missing TLS/auth settings refuse
 # interpolation before either service starts; there are no default credentials.
-# docker compose -f web/compose.yaml -f web/compose.https.yaml up --build -d --wait
+# See README.md: pull chudware, build caddy, then up --no-build -d --wait.
 services:
   chudware:
     # Remove even the loopback bypass when selecting authenticated hosting.

@@ -108,6 +108,7 @@ From the repository root, using a fresh isolated Compose project:
 
 ```bash
 export COMPOSE_PROJECT_NAME=chudware-acceptance
+export CHUDWARE_IMAGE=chudware-selfhost:acceptance
 docker compose -f web/compose.yaml up --build -d
 python3 -m venv .venv-smoke
 .venv-smoke/bin/python -m pip install httpx==0.28.1 websockets==16.1

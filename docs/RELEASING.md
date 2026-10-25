@@ -4,19 +4,40 @@ Browser containers and native installers have independent publication paths.
 The browser path is [`.github/workflows/self-host.yml`](../.github/workflows/self-host.yml);
 the native path is [`.github/workflows/release.yml`](../.github/workflows/release.yml).
 The public MIT source is at https://github.com/Hunter-124/Chudware.
-Configuring either workflow is **not evidence of public image/installer availability**:
-the existing releases are prereleases/runtime assets, not a public stable installer.
-Anonymous image/installer access must be established separately.
+The browser image is public at `ghcr.io/hunter-124/chudware-web`; the default
+quickstart downloads its `edge` channel. Existing native releases are
+prereleases/runtime assets, not a public stable desktop installer.
 
 Native installers use signed update and payload manifests. Signing keys and
 optional platform certificates remain described in [SIGNING.md](SIGNING.md).
 The complete workflow inventory is in [reference/CI.md](reference/CI.md).
 
+## Credential checks before publication
+
+Preserving development history also preserves old credential-bearing blobs. Revoke
+or rotate exposed project credentials **before** publishing source, tags or assets;
+deleting a file from the current checkout is not revocation.
+
+- Audit every reachable ref and release source/binary, plus available public issue,
+  pull-request and Actions-log content. Record unavailable evidence explicitly.
+- Require evidence for the exact credential: an authoritative provider revocation,
+  exact-resource deletion, or a supported verification endpoint's explicit rejection.
+  A missing token name, scanner `verified=false`, an unsupported token type, or a
+  failed network request is not proof. Classify public native OAuth client
+  configuration separately from user access/refresh tokens and service credentials.
+- Keep raw candidates and provider responses out of logs, commits and reports.
+  Use domain-separated fingerprints: a bare hash can itself be a credential
+  (Cloudflare R2 secret access keys are derived from API tokens).
+- Give replacement deployment credentials only the required permissions, install
+  them through the secret store, and exercise the real deployment before claiming
+  recovery. Keep GitHub secret scanning and push protection enabled.
+
 ## Browser container publication
 
-Build and run from the repository root:
+To build a candidate from the repository root without overwriting a public image tag:
 
 ```bash
+export CHUDWARE_IMAGE=chudware-selfhost:local
 docker compose -f web/compose.yaml up --build -d --wait
 ```
 
@@ -35,19 +56,19 @@ the saved model. A separate `packages: write` job loads that exact tested image;
 PR jobs have read-only repository permission and never log in to GHCR.
 No additional private checkout or private-repository token is needed.
 
-The **configured destination**, not a claim of a published/public package, is
-`ghcr.io/hunter-124/chudware-web` (Linux x86-64). Trusted runs in the canonical
-repository on `master` or a `v*` tag publish `sha-<full-commit>`. These tags are
+The public destination is `ghcr.io/hunter-124/chudware-web` (Linux x86-64).
+Trusted runs in the canonical repository on `master` or a `v*` tag publish
+`sha-<full-commit>`. These tags are
 immutable by workflow policy: an existing tag is refused rather than replaced,
 including on reruns. Keep a deployed digest or commit tag for rollback.
 Only pushes to `master`, or a manual run on `master` with `move_edge` explicitly
 selected, advance the moving `edge` channel. Tag runs do not advance it; there
 is no configured `latest` or `stable` browser channel.
 
-After an actual publication, the owner must set the GHCR package's visibility
-and verify an anonymous pull of the emitted commit reference/digest. A public
-source checkout or successful authenticated CI push does not establish public
-image access. Do not advertise a pull command as working until that check passes.
+After publication, verify an anonymous pull of the emitted commit reference/digest.
+For a new package or fork, its owner must also set the GHCR package's visibility.
+A public source checkout or successful authenticated CI push alone does not establish
+public image access. Do not advertise a pull command until the anonymous check passes.
 Optional owner-operated hosting is arranged through the existing contact
 route as project support, not a required license or an implemented checkout.
 

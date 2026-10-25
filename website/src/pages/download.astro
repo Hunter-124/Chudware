@@ -10,7 +10,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
     <div class="wrap">
       <p class="eyebrow">Desktop, source, or hosting</p>
       <h1>Choose where Chudware runs.</h1>
-      <p class="lede">Desktop use, source builds, and browser self-hosting have no Chudware software fee or license key. Clone the <a class="text-link" href={REPO}>public MIT source repository</a> to build it yourself. No public desktop installer is available yet. Optional paid, owner-operated hosting supports the project; <a class="text-link" href="/contact/">contact us about hosting</a>.</p>
+      <p class="lede">Desktop use, source builds, and browser self-hosting have no Chudware software fee or license key. Run the prebuilt browser image, or build from the <a class="text-link" href={REPO}>public MIT source repository</a>. No public desktop installer is available yet. Optional paid, owner-operated hosting supports the project; <a class="text-link" href="/contact/">contact us about hosting</a>.</p>
     </div>
   </header>
 
@@ -20,8 +20,8 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
         <span class="dl-mark" aria-hidden="true"><Icon name="download" /></span>
         <div class="dl-primary-body">
           <p class="eyebrow">Browser self-hosting · Experimental</p>
-          <h2>Build and run with Docker Compose</h2>
-          <p class="dl-note">From a source checkout on a supported Linux host, run <code>docker compose -f web/compose.yaml up --build -d</code> at the repository root. The guide covers prerequisites, persistence, and single-operator security. Online Copilot is not available in the browser.</p>
+          <h2>Download and run with Docker Compose</h2>
+          <p class="dl-note">From a checkout on a supported Linux host, run <code>docker compose -f web/compose.yaml up --pull always --no-build -d --wait</code> at the repository root. The public image includes the browser client and native CAD engine; no compilation or registry login is needed. The guide covers persistence and single-operator security. Online Copilot is not available in the browser.</p>
         </div>
         <a class="button" href="/docs/self-hosting/">Self-hosting guide</a>
       </article>

@@ -1,6 +1,6 @@
 ---
 title: Self-host in your browser
-description: Build an experimental single-operator Chudware browser deployment from a source checkout with Docker Compose.
+description: Start an experimental single-operator Chudware browser deployment with the public prebuilt image and Docker Compose.
 section: Installation
 order: 5
 ---
@@ -8,26 +8,29 @@ order: 5
 
 Desktop use, source builds, and browser self-hosting have no Chudware software fee or license key. Your infrastructure costs are your own. Optional paid, owner-operated hosting supports development; [contact the project](/contact/) to discuss availability and terms. Hosting is not required to use the MIT-licensed software.
 
-**The MIT source repository is public; public desktop installers are not yet available.** Build this browser deployment from a source checkout using the commands below. No public container image is promised.
+**The MIT source and prebuilt browser image are public; public desktop installers are not yet available.** The quickstart below downloads the complete browser deployment without compiling CAD.
 
 ## Prerequisites
 
-- A **Linux x86-64** host with Docker Engine and Docker Compose **2.24.4 or newer**, and enough disk and memory to compile the native engine and WebAssembly client. The first build downloads toolchains and dependencies and can take a while.
+- **Git**, a **Linux x86-64** host, Docker Engine and Docker Compose **2.24.4 or newer**. Allow disk space for the image, its unpacked layers and your designs. The default container limits are four CPUs and 8 GiB RAM; leave room for the host OS and larger workloads.
 - A kernel and container runtime that permit the nested unprivileged user namespaces required by **bubblewrap**. Rootless runtimes need working nested namespace support too. Docker Desktop and other host architectures are not the documented baseline.
+- **Ubuntu 24.04+:** after cloning, load the [container-specific AppArmor profile](https://github.com/Hunter-124/Chudware/blob/master/web/README.md#ubuntu-2404-apparmor-setup) before starting Compose. This permits the nested sandbox without disabling the host's namespace restriction.
 - A current browser with JavaScript, WebAssembly, and hardware-accelerated WebGL2. This documentation works without JavaScript, but the CAD application does not.
-- A trusted source checkout. The build includes the native C++ CAD engine and non-AI Python services; static WebAssembly assets alone are not a complete server.
+- Internet access to GitHub and GHCR for the initial download. The image includes the native C++ CAD engine and non-AI Python services; static WebAssembly assets alone are not a complete server.
 
-## Build and start
+## Download and start
 
-Clone the public repository, then build from its root:
+Get the deployment configuration, then start the public image:
 
 ```sh
-git clone https://github.com/Hunter-124/Chudware.git
+git clone --depth 1 https://github.com/Hunter-124/Chudware.git
 cd Chudware
-docker compose -f web/compose.yaml up --build -d --wait
+docker compose -f web/compose.yaml up --pull always --no-build -d --wait
 ```
 
 Open [http://127.0.0.1:8300/app/](http://127.0.0.1:8300/app/) in a browser **on that host**. The default port binding is loopback-only; it is not a public hosted service. No `.env` file or provider token is needed for this local deployment.
+
+No registry login or compilation is required. The default `edge` image is a moving development channel, not a stable desktop release. For image pinning, source builds and upgrades, follow [`web/README.md`](https://github.com/Hunter-124/Chudware/blob/master/web/README.md). Omit `--depth 1` when cloning if you want to download the full existing development history.
 
 To inspect startup messages or stop the service without deleting its volumes:
 

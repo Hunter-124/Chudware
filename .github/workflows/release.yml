@@ -91,6 +91,7 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: fedora:44
+      options: --init
       # Large preinstalled host SDKs this job never uses; mounted only so the
       # first step can delete them and free disk space for the build.
       volumes:
@@ -124,6 +125,9 @@ jobs:
           persist-credentials: false
           ref: refs/tags/${{ needs.plan.outputs.tag }}
           fetch-depth: 0
+
+      - name: Initialize private state and checkout trust
+        run: bash .github/scripts/prepare-linux-ci.sh
 
       - name: Install system dependencies
         run: bash .github/scripts/install-fedora-deps.sh release

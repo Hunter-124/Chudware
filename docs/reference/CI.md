@@ -22,14 +22,16 @@ Strict mode makes `gate.sh` fail instead of skipping when a toolchain is
 missing, so a broken CI image can never pass by testing nothing. Locally the
 same script skips unavailable stages.
 
-The strict container uses an init process to reap orphaned subprocesses after
-timeout/cancellation checks. Its `HOME`, `XDG_DATA_HOME` and `TMPDIR` are private
-directories beneath root-owned `/tmp`, not the runner's shared mounts: firmware
-storage validates ownership and permissions of every ancestor. Git trusts only
-the exact checkout through this private home's global configuration, established
-before version metadata is generated. Checkout's temporary Git configuration
-does not provide that trust to later shell steps. The Fedora `gate` profile also
-installs the RPM and Debian inspection tools exercised by the packaging suite.
+Linux gate, native-build and release containers use an init process to reap
+orphaned subprocesses after timeout/cancellation checks. The shared
+`.github/scripts/prepare-linux-ci.sh` gives them private `HOME`, `XDG_DATA_HOME`
+and `TMPDIR` directories beneath root-owned `/tmp`, not the runner's shared
+mounts: firmware storage validates ownership and permissions of every ancestor.
+Git trusts only the exact checkout through the disposable container's system
+configuration, established before version metadata is generated. That trust
+survives pytest's deliberate `HOME` isolation; checkout's temporary global
+configuration does not. The Fedora `gate` profile also installs the RPM and
+Debian inspection tools exercised by the packaging suite.
 
 ## Secrets and variables
 
@@ -86,7 +88,7 @@ Full Linux gate, inside the same container CI uses:
 ```bash
 podman run --rm -it --init -v "$PWD:/src:Z" -w /src fedora:44 bash
 bash .github/scripts/install-fedora-deps.sh gate
-git config --global --add safe.directory /src
+git config --system --add safe.directory /src
 VENV_DIR=/tmp/gate-venv PYTHON=python3.13 bash scripts/provision_venv.sh pytest==9.1.1
 CHUDWARE_GATE_PYTHON=/tmp/gate-venv/bin/python CHECK_PYTHON=/tmp/gate-venv/bin/python bash scripts/gate.sh
 ```

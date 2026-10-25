@@ -153,7 +153,7 @@ stage_check() {
         record "check.py            FAIL    exit $rc (fatal — see ${GATE_TMP}/check.out)"
         fail_fatal=1
         echo "  FAIL (exit $rc) — ${GATE_TMP}/check.out:"
-        tail -n 8 ${GATE_TMP}/check.out | sed 's/^/    /'
+        cat "${GATE_TMP}/check.out"
     fi
 }
 
@@ -307,7 +307,7 @@ stage_ctest() {
     fi
     if ! ctest --test-dir core/build-linux -C Release --output-on-failure > ${GATE_TMP}/ctest.out 2>&1; then
         record "ctest               FAIL    ctest failures (see ${GATE_TMP}/ctest.out)"
-        echo "  FAIL: ctest"; tail -n 20 ${GATE_TMP}/ctest.out | sed 's/^/    /'
+        echo "  FAIL: ctest"; cat "${GATE_TMP}/ctest.out"
         fail_fatal=1
         return 0
     fi
@@ -967,7 +967,7 @@ stage_sensor_node_demo() {
     else
         record "sensor-node demo    FAIL    exit=$rc $detail"
         echo "  FAIL: sensor-node demo (see ${GATE_TMP}/sensor_node_demo.out):"
-        tail -n 20 "${GATE_TMP}/sensor_node_demo.out" | sed 's/^/    /'
+        cat "${GATE_TMP}/sensor_node_demo.out"
         fail_fatal=1
     fi
 }

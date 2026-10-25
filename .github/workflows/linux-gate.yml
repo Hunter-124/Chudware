@@ -31,6 +31,8 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: fedora:44
+      # Reap orphaned subprocesses when timeout/process-group tests terminate parents.
+      options: --init
       # Large preinstalled SDKs on the host that this job never uses. They are
       # mounted only so the first step can delete them and free disk space.
       volumes:
@@ -54,6 +56,22 @@ jobs:
           persist-credentials: false
           # gate.sh generates the version header from `git describe --tags`.
           fetch-depth: 0
+
+      - name: Initialize private gate state and checkout trust
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="$(mktemp -d /tmp/chudware-ci.XXXXXXXX)"
+          install -d -m 700 "$state/home" "$state/data" "$state/tmp"
+          export HOME="$state/home" XDG_DATA_HOME="$state/data" TMPDIR="$state/tmp"
+          {
+            echo "HOME=$HOME"
+            echo "XDG_DATA_HOME=$XDG_DATA_HOME"
+            echo "TMPDIR=$TMPDIR"
+          } >> "$GITHUB_ENV"
+          # Checkout's temporary HOME does not establish trust for later shell steps.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" describe --tags --always --dirty
 
       - name: Install system dependencies
         run: bash .github/scripts/install-fedora-deps.sh gate

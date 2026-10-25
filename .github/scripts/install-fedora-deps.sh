@@ -34,7 +34,8 @@ cef_runtime=(
 for profile in "$@"; do
     case "${profile}" in
         gate)
-            packages+=("${cef_runtime[@]}" xorg-x11-server-Xvfb xorg-x11-xauth mesa-dri-drivers ngspice)
+            packages+=("${cef_runtime[@]}" xorg-x11-server-Xvfb xorg-x11-xauth mesa-dri-drivers
+                       ngspice rpm-build dpkg)
             ;;
         release)
             packages+=("${cef_runtime[@]}" xorg-x11-server-Xvfb xorg-x11-xauth mesa-dri-drivers

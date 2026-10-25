@@ -1,10 +1,10 @@
 # Python runtime dependencies of the Chudware services (worker, MCP server, agent tools).
 #
 # Development: scripts/provision_venv.sh creates .venv-mcp and installs this file from
-# PyPI (equivalently: `python -m pip install -r requirements.txt` in a fresh venv).
-# chudcode-rpc is not on PyPI; pip builds it from the public Chudcode repository at
-# the commit vendor/chudcode/CHUDCODE_ARTIFACT.lock pins (git must be installed).
-# Keep that commit and the one below identical.
+# PyPI plus the hash-pinned Chudware source archive below (equivalently:
+# `python -m pip install -r requirements.txt` in a fresh venv). chudcode-rpc is
+# built from its MIT source in that archive; no Git credentials or client are needed.
+# Keep its release version and commit aligned with vendor/chudcode/CHUDCODE_ARTIFACT.lock.
 #
 # Reviewed offline installs: services/installer/provision.py installs only the
 # hash-locked wheel set in vendor/python/RUNTIME_WHEELS.lock (prepared with
@@ -45,7 +45,7 @@ mcp==1.28.1
 # separately signed payload supplies the adjacent compiled ``chud`` executable.
 # Without it every chudcode_* worker RPC refuses and Settings -> Providers reports a failed
 # service call rather than an empty provider set.
-chudcode-rpc @ git+https://github.com/Hunter-124/chudcode.git@2eaba2f4606984172f31f108459d9529d4ee5e38#subdirectory=python/chudcode-rpc  # MIT, 0.3.1 — typed RPC v2 client
+chudcode-rpc @ https://github.com/Hunter-124/Chudware/releases/download/chudcode-runtime-v0.4.3/chudcode-source-2eaba2f4606984172f31f108459d9529d4ee5e38.tar.gz#sha256=a1d417b306cdcb8113420a0e7005de97fdf299908faf46a5668f49261c06aa60&subdirectory=python/chudcode-rpc  # MIT, 0.3.1 — typed RPC v2 client
 # built-in agent provider adapters
 anthropic==0.107.1
 openai==2.41.0

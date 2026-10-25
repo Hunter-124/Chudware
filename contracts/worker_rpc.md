@@ -2538,3 +2538,99 @@ print_ready:false,print_ready_reason}` or `{ok:false,code,error}`. The GUI merge
 into the finished run record of a geometry-valid GUI run and persists the study; agent run
 records are never rewritten. `print_ready` stays false: only `slice_part` G-code validation
 makes a part print-ready.
+
+## Single-operator container cell v1 (append-only, 2026-10-25)
+
+This additive deployment profile does not change the frozen tenant-cell protocol,
+the desktop daemon, or systemd cell quota admission. `CHUDWARE_WEB_CELL_BACKEND`
+accepts exactly `systemd` (the default) and `container`; any other value fails
+configuration. Only the deployment operator selects it, never a browser request.
+
+The container profile is a private, trusted, single-operator deployment, not
+hostile multi-user hosting. It has no application accounts or portable per-owner
+hard disk quotas: its persistent volumes can fill their backing filesystem.
+Every request retains the configured operator's owner grant, with
+`workspace_key="user:"+CHUDWARE_WEB_OPERATOR`, the same operator as `actor_key`,
+epoch zero, and the existing SHA-256-derived cell ID. Keep that operator identity
+stable with the data volumes. Remote access requires authentication for **all**
+HTTP and WebSocket routes at an HTTPS reverse proxy.
+
+### Boundary, admission, and persistence
+
+The supplied image's non-root PID-1 entrypoint is the outer isolation boundary.
+It requires both a real Docker/Podman boundary marker and the root-owned
+`/opt/chudware/container-runtime-v1` image marker. Running the Python entrypoint
+directly on a host, using a desktop daemon socket, or selecting `container`
+without its prepared private supervisor marker is refused. Mounting host homes,
+credentials, container-engine sockets, or privileged host namespaces is outside
+this profile.
+
+The supervisor prepares the existing private `cell.json` and owns the fixed
+`<home>/cells/<cell_id>/gw.sock` listener. It launches only `chudware-hostd --cell`
+with that inherited listener, plus one gateway worker. The gateway does not call
+systemd for this backend. It admits only the fixed operator principal and checks
+the supervisor-recorded socket device/inode, owner, private mode and no-follow
+directory walk before connecting. The trusted `hello`, authoritative
+`contracts/cell_methods.json` admission, credential-field rejection, document
+filtering and mesh grants remain unchanged. No desktop/raw forwarding fallback
+exists.
+
+The fixed persistent mount layout is:
+
+* `/data`: gateway home, cell identity and private transport metadata.
+* `/work`: saved workspace documents and hidden workspace metadata (including
+  recents/chat). Only this workspace is exposed to actor tools.
+* `/state`: private engine/actor state, recovery data, cache, logs and published
+  meshes. A durable `chudware-container-state-v1` identity record prevents
+  accidentally reusing the state volume for another operator/workspace.
+
+Engine-published `/state/mesh/<32hex>.aicm` paths resolve directly to the durable
+`/state/mesh` mount for that principal. The gateway still performs a no-follow
+walk and requires the existing per-document mesh grant. There is deliberately no
+symlink from `/data/cells/<cell_id>/state` to bypass filesystem confinement.
+Persist and back up all three volumes together. In-memory mesh grants are
+re-established on reconnect/reopen; they are not durable authorization records.
+
+### Workers, egress, and process lifetime
+
+General Python workers, including non-AI functionality, remain installed.
+Hostd's fixed adjacent worker bootstrap still enters the existing nested actor
+bubblewrap sandbox: only `/work` and that actor's private `/actor` are writable,
+with a separate network namespace and the same sanitized identity environment.
+No ambient environment, provider credentials or host authority is forwarded.
+The existing broker accepts only validated public `CONNECT hostname:443`
+destinations with DNS-address pinning and its existing bounded relay policy;
+the actor receives only its private broker socket and loopback forwarder.
+
+Startup probes the **actual** actor sandbox, worker imports, and a non-AI worker
+operation. Missing payloads/dependencies or blocked nested user namespaces,
+bubblewrap, seccomp or LSM policy fail startup with an actionable error. A failed
+sandbox never falls back to unisolated workers or silently removes non-AI
+features. The separately distributed optional agent runtime/SDK is not required for
+the native/general-worker path. Online browser Copilot remains unavailable:
+AI turns still refuse `credential_isolation_unsupported`.
+
+The supervisor retains its listener across hostd restarts and relaunches after
+both clean idle exit and failure. Closing a browser connection does not kill a
+task, and neither the supervisor nor actor tools impose an overall run lifetime
+cap. SIGTERM/SIGINT record shutdown intent; ordinary control flow forwards
+termination, waits, escalates only during shutdown, and reaps its own children.
+It never broadcasts termination to unrelated processes. Saved workspace/state
+survive container recreation; clean engine shutdown still follows the existing
+autosave contract and is not a substitute for saving documents.
+
+`runtime.py healthcheck` is bounded readiness admission: it validates the current
+supervisor/socket, complete browser/native/worker payload, native `hello` state
+`ready`, and gateway HTTP liveness. `/healthz` alone remains liveness, not proof of
+working CAD. Readiness connections can defer native idle exit; the supervisor
+must nevertheless handle idle exit whenever it occurs.
+
+## Control-plane shutdown clarification (append-only, 2026-10-25)
+
+Worker shutdown, including stdio EOF immediately after cancellation, stops admitting
+control requests before closing their transports. Already authenticated and authorized
+requests get a shared 0.5-second grace to finish their normal bounded reply, within a
+one-second total cleanup wait budget. Incomplete/unauthenticated clients are interrupted
+immediately; remaining transports (including nonreading peers) are interrupted when
+the grace expires. Named-pipe replies retain their bounded client-disconnect drain so
+shutdown does not discard an admitted reply before the client reads it.

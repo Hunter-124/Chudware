@@ -3760,23 +3760,15 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   st.wantPick = shot && shotMode && std::strcmp(shotMode, "pick") == 0;
   st.wantRibbon = shot && shotMode && std::strcmp(shotMode, "ribbon") == 0;
 #ifndef __EMSCRIPTEN__
-  if (shot && shotMode &&
-      (std::strcmp(shotMode, "update_available") == 0 ||
-       std::strcmp(shotMode, "update_mandatory") == 0)) {
-    const bool mandatory = std::strcmp(shotMode, "update_mandatory") == 0;
+  if (shot && shotMode && std::strcmp(shotMode, "update_available") == 0) {
     chudware::update::Snapshot update;
-    update.state = mandatory ? chudware::update::State::Mandatory
-                             : chudware::update::State::Available;
+    update.state = chudware::update::State::Available;
     update.version = "1.2.0";
-    update.message = mandatory
-                         ? "Chudware 1.1.0 or newer is required"
-                         : "Update available \xe2\x80\x94 1.2.0";
+    update.message = "Update available \xe2\x80\x94 1.2.0";
     update.downloadUrl = "https://github.com/Hunter-124/Chudware/releases/tag/v1.2.0";
-    update.mandatory = mandatory;
     chudware::update::globalUpdater().setTestSnapshot(std::move(update));
-    std::printf("[update-shot] mode=%s chip=Update-%s-1.2.0 auto_modal=%d\n",
-                shotMode, mandatory ? "required" : "available",
-                mandatory ? 1 : 0);
+    std::printf("[update-shot] mode=%s chip=Update-available-1.2.0 auto_modal=0\n",
+                shotMode);
     std::fflush(stdout);
   }
 #endif
@@ -8319,40 +8311,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 
     // ---------- modals ----------
     ui::drawSettingsModal(st, busy);
-#ifndef __EMSCRIPTEN__
-    {
-      const auto update = chudware::update::globalUpdater().snapshot();
-      if (update.mandatory) {
-        ImGui::SetNextWindowPos(vp->Pos, ImGuiCond_Always);
-        ImGui::SetNextWindowSize(vp->Size, ImGuiCond_Always);
-        ImGui::SetNextWindowViewport(vp->ID);
-        ImGui::Begin("##MandatoryUpdate", nullptr,
-                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                         ImGuiWindowFlags_NoSavedSettings |
-                         ImGuiWindowFlags_NoDocking);
-        const float width = std::min(520.0f * ui::uiScale,
-                                     ImGui::GetContentRegionAvail().x);
-        ImGui::SetCursorPos(
-            ImVec2((ImGui::GetWindowWidth() - width) * 0.5f,
-                   ImGui::GetWindowHeight() * 0.30f));
-        ImGui::BeginGroup();
-        ImGui::PushFont(st.fonts.h1);
-        ImGui::TextUnformatted("A mandatory update is required");
-        ImGui::PopFont();
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + width);
-        ImGui::TextWrapped("%s", update.message.c_str());
-        ImGui::TextWrapped(
-            "This version can no longer connect to Chudware services. "
-            "Your documents remain on this computer.");
-        ImGui::PopTextWrapPos();
-        if (!update.downloadUrl.empty() &&
-            ImGui::Button("Download update", ImVec2(180.0f * ui::uiScale, 0)))
-          ui::openExternalHttpUrl(update.downloadUrl);
-        ImGui::EndGroup();
-        ImGui::End();
-      }
-    }
-#endif
 
     // Provider brand icons: drain the requests queued by every drawProviderLogo() call this
     // frame (composer model chip, Settings rows, …). This MUST live in the always-drawn frame

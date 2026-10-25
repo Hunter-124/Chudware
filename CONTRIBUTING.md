@@ -34,6 +34,12 @@ manufacturing, twin, and print layers require C++20. CUDA is an optional LBM bac
 (`CHUDWARE_WITH_CUDA`, default OFF). Windows specifics are in
 [docs/reference/BUILD_WINDOWS.md](docs/reference/BUILD_WINDOWS.md).
 
+For browser work, start with [web/README.md](web/README.md). The Compose path builds
+the browser bundle, native engine and non-AI Python workers without the private
+online-agent SDK/runtime. The full native provisioning command currently still
+requires access to the private SDK repository; do not describe it as an anonymous
+public bootstrap.
+
 Enable the repository's pre-commit hook once per clone:
 
 ```bash
@@ -64,6 +70,45 @@ CHUDWARE_GATE_PYTHON=.venv-mcp/bin/python bash scripts/gate.sh   # full Linux ga
     `ctest --test-dir build/<preset>/core` (preset tree).
   - Python: `.venv-mcp/bin/python -X utf8 -m pytest services/agent -q` (any package dir).
   - GUI: the headless screenshot harness, `CHUDWARE_SHOT=<scenario>` under `xvfb-run`.
+  - Web gateway and deployment policy, from the repository root:
+
+    ```bash
+    .venv-mcp/bin/python -m pip install -r web/gateway/requirements.txt pytest
+    .venv-mcp/bin/python -m pytest web/gateway/tests web/deploy/tests -q
+    docker compose -f web/compose.yaml config --quiet
+    docker compose -f web/compose.yaml -f web/compose.https.yaml config --quiet
+    ```
+
+    The HTTPS configuration needs the hostname and hashed-auth settings described in
+    the web guide. A public-dependency-only web environment may be used instead of
+    `.venv-mcp`; install the gateway requirements and pytest there. Real systemd
+    quota/isolation tests need deliberately provisioned disposable quota roots and
+    may skip without them; passing ordinary unit tests is not proof of kernel
+    sandbox coverage.
+  - Browser client: `./build.sh wasm` builds and stages the bundle and runs the asset
+    parity check. It needs emsdk; the container build supplies its pinned toolchain.
+  - Container or gateway behavior: use a disposable Compose project/volumes, never a
+    running user's workspace. Exercise a real model operation and Python-backed
+    operation, save/reopen across restart, and workspace upload/download. `/healthz`
+    alone checks gateway liveness, not usable geometry.
+    The executable local deployment probe is:
+
+    ```bash
+    .venv-mcp/bin/python web/deploy/smoke.py http://127.0.0.1:8300
+    ```
+
+    It checks real browser assets/security, native geometry/save/reopen/mesh and a
+    general Python worker, creating/removing only its UUID-named smoke file. It does
+    not start a deployment. For persistence, run once with
+    `--keep --receipt /tmp/chudware-smoke.json` (choose a new receipt path), recreate
+    the scratch deployment without deleting volumes, then run with
+    `--resume /tmp/chudware-smoke.json` to reopen, verify and clean up. Do not point
+    this local unauthenticated probe at an authenticated public proxy.
+
+    For proxy changes, check
+    unauthenticated HTTP and WebSocket denial, authenticated access to every route,
+    same-origin enforcement, allowed hosts, and COOP/COEP headers. See the web guide's
+    [health and troubleshooting](web/README.md#health-logs-and-troubleshooting).
 
 Continuous integration runs the same checks on every pull request; see
 [docs/reference/CI.md](docs/reference/CI.md).

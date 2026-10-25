@@ -1,16 +1,18 @@
 ---
 title: Install on macOS
-description: Download the Chudware desktop app for macOS from GitHub Releases and install it.
+description: Current macOS desktop availability, the configured Apple-silicon target, and source-build platform differences.
 section: Installation
 order: 30
 ---
-## Download the app
+## Current availability
 
-Open the [latest release on GitHub](https://github.com/Hunter-124/Chudware/releases/latest) and download the macOS zip archive (`Chudware-<version>-macos-x86_64.zip`). No account is needed. GitHub shows a SHA-256 digest beside each asset; compare it with the output of `shasum -a 256` before you open the app.
+Public desktop installers are not yet available. Clone the [public MIT repository](https://github.com/Hunter-124/Chudware) and follow [Building from source](https://github.com/Hunter-124/Chudware#building-from-source) for native prerequisites, or use a Linux server for [experimental browser self-hosting](/docs/self-hosting/). The desktop SDK and supported macOS x86-64 native runtime use pinned release assets in this same repository; the macOS ARM64 native runtime remains unpinned. Source publication does not remove that ARM64 limitation. [Contact the project](/contact/) about optional paid hosting.
 
-Unpack the archive and drag Chudware into Applications. On Apple silicon the Intel build runs through Rosetta 2. A native Apple-silicon build is not published yet.
+## Configured packaging target
 
-If a build is not yet signed and notarized with an Apple Developer ID, Gatekeeper warns on first launch. Only open a file you downloaded from the project's GitHub releases and whose digest you checked.
+The release configuration targets ARM64 for Apple silicon, with the filename convention `Chudware-<version>-macos-arm64.zip`. This is not a currently available download or an Intel-through-Rosetta release.
+
+When an official macOS app is published, compare its SHA-256 digest with `shasum -a 256` before opening it, then unpack the archive and drag Chudware into Applications. Check that release's signing and notarization notes; do not bypass Gatekeeper for an untrusted or unverified build.
 
 ## Platform differences
 

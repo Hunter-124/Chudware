@@ -441,6 +441,77 @@ def test_control_cancel_and_steer_run_while_stdio_turn_is_blocked(
     assert not Path(info["endpoint"]).exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX accept-thread shutdown barrier")
+def test_stop_drains_admitted_reply_after_retiring_listener(
+    runtime_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    reading = threading.Event()
+    reply_ready = threading.Event()
+    listener_retired = threading.Event()
+    server = ControlServer(
+        lambda _action, _params: {"accepted": True}, runtime_dir, client_timeout=30
+    ).start()
+    info = server.info()
+    read_request = server._read_request
+    send_response = server._send_response
+    accept_thread = server._accept_thread
+    assert accept_thread is not None
+    join_accept = accept_thread.join
+
+    def observe_read(conn, deadline):
+        reading.set()
+        return read_request(conn, deadline)
+
+    def hold_reply(conn, response):
+        if response.get("ok"):
+            reply_ready.set()
+            assert listener_retired.wait(2)
+        return send_response(conn, response)
+
+    def retire_listener(timeout=None):
+        join_accept(timeout=timeout)
+        # The old shutdown closed every client before joining this thread.
+        # Holding the reply until here deterministically exposes that truncation.
+        listener_retired.set()
+
+    monkeypatch.setattr(server, "_read_request", observe_read)
+    monkeypatch.setattr(server, "_send_response", hold_reply)
+    monkeypatch.setattr(accept_thread, "join", retire_listener)
+    silent = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        silent.connect(info["endpoint"])
+        silent.sendall(b"{")
+        assert reading.wait(2)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(
+                _request, info, {"token": info["token"], "action": "cancel"}
+            )
+            try:
+                assert reply_ready.wait(2)
+                started = time.monotonic()
+                server.stop()
+                assert time.monotonic() - started < 1.5
+                response, wire = pending.result(timeout=2)
+            finally:
+                listener_retired.set()
+        assert response == {"ok": True, "result": {"accepted": True}}
+        assert len(wire) <= server._response_limit
+        assert info["token"].encode() not in wire
+        assert not server._active_clients
+        assert not server._clients
+        assert not server._client_threads
+        assert not accept_thread.is_alive()
+        assert not Path(info["endpoint"]).exists()
+        with pytest.raises(RuntimeError):
+            server.info()
+    finally:
+        listener_retired.set()
+        silent.close()
+        server.stop()
+
+
 class _YieldingStdout:
     def __init__(self) -> None:
         self.value = ""
@@ -732,6 +803,49 @@ def test_nonreading_peer_cannot_hold_response_writer(runtime_dir):
     finally:
         client.close()
         server.stop()
+
+
+def test_stop_bounds_admitted_nonreading_writer(runtime_dir: Path) -> None:
+    writing = threading.Event()
+    server = ControlServer(
+        lambda _action, _params: {"payload": "x" * 200000},
+        runtime_dir, client_timeout=30,
+    )
+    peer, client = socket.socketpair()
+    peer.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+
+    class ObservedWriter:
+        def __getattr__(self, name):
+            return getattr(peer, name)
+
+        def sendall(self, payload):
+            writing.set()
+            peer.sendall(payload)
+
+    conn = ObservedWriter()
+    assert server._slots.acquire(blocking=False)
+    thread = threading.Thread(target=server._serve_client, args=(conn,))
+    with server._state_lock:
+        server._clients.add(conn)
+        server._client_threads.add(thread)
+    try:
+        thread.start()
+        client.sendall(
+            json.dumps({"token": server._token, "action": "status"}).encode() + b"\n"
+        )
+        assert writing.wait(2)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 1.5
+        assert not thread.is_alive()
+        assert not server._active_clients
+        assert not server._clients
+        assert not server._client_threads
+        assert peer.fileno() == -1
+    finally:
+        client.close()
+        server.stop()
+        thread.join(timeout=2)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires genuine Windows pipe backpressure")

@@ -1,16 +1,17 @@
 ---
 import BaseLayout from '../../layouts/BaseLayout.astro';
 ---
-<BaseLayout title="Privacy" description="What chudware.com and the Chudware desktop app collect and send: no accounts, no trackers, and a short list of network requests.">
-  <div class="wrap legal-shell"><header><p class="eyebrow">Legal</p><h1>Privacy</h1><p class="effective">Effective October 22, 2026</p></header><div class="prose">
+<BaseLayout title="Privacy" description="How the static Chudware website, local desktop app, self-hosted browser server, and optional hosting differ in data handling.">
+  <div class="wrap legal-shell"><header><p class="eyebrow">Legal</p><h1>Privacy</h1><p class="effective">Effective October 25, 2026</p></header><div class="prose">
     <h2>This website</h2><p>chudware.com is a static website. It has no accounts, no forms, no analytics, and no advertising or tracking scripts. The hosting provider processes standard request data, such as IP addresses, to deliver pages and protect the site. Links to GitHub and other sites are governed by those sites' own policies.</p>
-    <h2>The desktop app</h2><p>Chudware has no accounts and sends no telemetry. Your projects are saved as local files on your machine. The app contacts other services only in these cases:</p>
+    <h2>The desktop app</h2><p>The desktop software requires no Chudware account and sends no product telemetry. Documents are saved as local files on your machine. Network requests include:</p>
     <ul>
       <li><strong>Update checks.</strong> The app fetches the signed update manifest for your platform from the project's GitHub releases, and downloads an update from GitHub when one is available. GitHub receives the request under its own privacy terms.</li>
       <li><strong>AI providers you configure.</strong> When you use the copilot, the prompt, the project context, and the tool results needed for that turn go to the provider you selected, under that provider's terms. Provider credentials are stored on your machine and sent only to that provider.</li>
       <li><strong>Sites and downloads you request.</strong> Parts Library vendor searches, web lookups the copilot runs at your request, and optional components you install, such as the agent runtime or model weights, are fetched directly from the vendor's or publisher's site.</li>
     </ul>
-    <p>Chudware does not run a server that receives your projects, prompts, or credentials.</p>
+    <h2>Browser self-hosting</h2><p>The browser sends modeling operations and project data to the server you connect to. Saved documents, conversations or recent-item metadata, engine caches, and logs can be stored on that server. Its operator and infrastructure providers may access the stored data and request logs; it is not a local-only browser application. Protect the server with authentication and TLS before remote use, restrict access to persistent storage, and maintain backups. Vendor lookups and requested downloads contact external services from the server. Online Copilot is not available in this browser deployment.</p>
+    <h2>Optional owner-operated hosting</h2><p>Paid hosting is an optional service, not a requirement for the MIT-licensed software. If you inquire about hosting, the project receives your email and the information you choose to send. Before using an arranged hosted instance, obtain its operating, access, retention, deletion, backup, and privacy terms directly from the operator. Hosted project data resides on that operator's infrastructure; desktop-local storage promises do not apply. Do not email credentials or confidential project files to request hosting.</p>
     <h2>Questions</h2><p>Send privacy questions to <a href="mailto:support@chudware.com">support@chudware.com</a>. We will post material changes on this page and update the effective date.</p>
   </div></div>
 </BaseLayout>

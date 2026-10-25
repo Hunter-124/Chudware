@@ -4,16 +4,16 @@ import '../styles/company.css';
 
 const REPO = 'https://github.com/Hunter-124/Chudware';
 ---
-<BaseLayout title="Open source" description="Chudware is open source under the MIT License. Source, license, contributing, the main third-party components, and the BSD-3-Clause PolyMesh project used for FEA meshing.">
+<BaseLayout title="Source and licenses" description="Chudware's MIT software rights, current source availability, free self-hosting, optional paid hosting, and the licenses of its third-party components.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Open source</p>
-      <h1>Chudware is open source under the MIT License.</h1>
-      <p class="lede">The whole desktop application — modeling, assemblies, simulation, CAM, PLM, reverse engineering, and the AI copilot — is developed in a public repository. Use it, study it, change it, and redistribute it under the MIT terms.</p>
+      <h1>MIT-licensed software. Your choice of deployment.</h1>
+      <p class="lede">Use, study, change, and redistribute Chudware under the MIT terms. Desktop use, source builds, and browser self-hosting have no Chudware software fee. Clone the public source repository to build and run it yourself; public desktop installers are not yet available.</p>
       <dl class="co-sec-facts">
         <div><dt>License</dt><dd>MIT</dd></div>
-        <div><dt>Source</dt><dd>github.com/Hunter-124/Chudware</dd></div>
-        <div><dt>Cost</dt><dd>Free; no account or license key</dd></div>
+        <div><dt>Source</dt><dd>Hunter-124/Chudware (public)</dd></div>
+        <div><dt>Hosting</dt><dd>Self-host free; optional paid operation</dd></div>
       </dl>
     </div>
   </header>
@@ -22,13 +22,14 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
     <div class="wrap co-about-body">
       <div class="co-prose">
         <h2 id="os-project" class="co-anchor">What the repository contains</h2>
-        <p>The C++ desktop application and geometry engine, the Python engine services behind simulation, CAM, parts, and the copilot tools, the packaging scripts for Windows, Linux, and macOS, and the workflows that build and sign each release. Release builds on GitHub are produced from the same source.</p>
+        <p>The C++ desktop and WebAssembly interfaces and native geometry engine, Python gateway, worker, and tool services, packaging scripts for Windows, Linux, and macOS, and release workflows. Browser modeling uses the native C++ engine on the server, with Python providing supporting services.</p>
+        <p>The <a class="text-link" href="/docs/self-hosting/">self-hosting guide</a> builds a single-operator browser deployment from a source checkout. Optional paid, owner-operated hosting supports development; <a class="text-link" href="/contact/">ask about hosting</a> without changing your MIT software rights.</p>
 
         <h2>License</h2>
         <p>The MIT License permits use, copying, modification, merging, publication, distribution, sublicensing, and sale of the software, provided the copyright notice and the permission notice are included in all copies or substantial portions of it. The software is provided without warranty. The repository's <a class="text-link" href={`${REPO}/blob/HEAD/LICENSE`}>LICENSE</a> file is the governing text.</p>
 
         <h2>Contributing</h2>
-        <p>Bug reports and feature requests go to <a class="text-link" href={`${REPO}/issues`}>GitHub issues</a>; changes arrive as pull requests. The <a class="text-link" href={`${REPO}/blob/HEAD/CONTRIBUTING.md`}>contributing guide</a> covers the development setup and review expectations, and the <a class="text-link" href={`${REPO}/security/policy`}>security policy</a> explains how to report a vulnerability privately.</p>
+        <p>Use <a class="text-link" href={`${REPO}/issues`}>GitHub issues</a>, pull requests, and the <a class="text-link" href={`${REPO}/blob/HEAD/CONTRIBUTING.md`}>contributing guide</a> in the public repository. For private security disclosure, <a class="text-link" href="/contact/">contact the project</a>. Never include secrets or confidential designs in a public report.</p>
       </div>
 
       <aside class="co-aside" aria-labelledby="os-repository">
@@ -40,7 +41,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
           <div><dt>Interface</dt><dd>Dear ImGui</dd></div>
           <div><dt>License</dt><dd>MIT</dd></div>
         </dl>
-        <div class="actions"><a class="button" href={REPO}>View on GitHub</a><a class="button button-secondary" href={`${REPO}#building-from-source`}>Build from source</a></div>
+        <div class="actions"><a class="button" href="/docs/self-hosting/">Self-hosting guide</a><a class="button button-secondary" href={`${REPO}#building-from-source`}>Native build guide</a></div>
       </aside>
     </div>
   </section>
@@ -73,13 +74,9 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
           <div><h3><a class="text-link" href="https://github.com/Hunter-124/Polyhedral-FEA">PolyMesh</a></h3><span class="co-source">BSD-3-Clause</span></div>
           <p>CAD-aware volume meshing in the FEA path, pinned to a public commit. The integration is described below.</p>
         </li>
-        <li>
-          <span class="co-controls-index">05</span>
-          <div><h3><a class="text-link" href="https://github.com/Hunter-124/chudcode">Chudcode</a></h3><span class="co-source">MIT</span></div>
-          <p>The agent runtime behind the AI copilot, a fork of the MIT-licensed Oh My Pi. Fetched from its public GitHub releases and checked against a pinned hash.</p>
-        </li>
       </ol>
       <p class="supporting-copy">Also used: nlohmann/json, Clipper2, miniz, stb, openNURBS, lib3mf, and the Chromium Embedded Framework.</p>
+      <p class="supporting-copy">AI is optional. Desktop Copilot needs its configured agent runtime and your own supported provider account or API key; provider charges and privacy terms apply. The browser container does not require that runtime, and online browser Copilot is unavailable. See <a class="text-link" href="/docs/ai-copilot/">AI setup and limits</a>. Distributed components retain their license notices whether or not AI is enabled.</p>
     </div>
   </section>
 
@@ -183,9 +180,9 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
   <section class="section cta-band">
     <div class="wrap section-heading">
       <p class="eyebrow">Inspect the source</p>
-      <h2>Read it, build it, and send improvements.</h2>
-      <p class="lede">The repository is the authority for build instructions, tests, and release notes.</p>
-      <div class="actions"><a class="button" href={REPO}>View on GitHub</a><a class="button button-secondary" href="/download/">Download</a></div>
+      <h2>Read the instructions, choose your setup.</h2>
+      <p class="lede">The public repository is the authority for build instructions. The website guides explain deployment choices and getting started without requiring a Chudware account.</p>
+      <div class="actions"><a class="button" href="/docs/self-hosting/">Self-hosting guide</a><a class="button button-secondary" href="/contact/">Ask about hosting</a></div>
     </div>
   </section>
 </BaseLayout>

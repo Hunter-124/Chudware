@@ -8869,8 +8869,7 @@ void drawSettingsModal(AppState& st, bool busy) {
             const auto update = chudware::update::globalUpdater().snapshot();
             if (update.state == chudware::update::State::Available ||
                 update.state == chudware::update::State::ManualDownload ||
-                update.state == chudware::update::State::Staged ||
-                update.state == chudware::update::State::Mandatory) {
+                update.state == chudware::update::State::Staged) {
                 const std::string updateLine =
                     update.state == chudware::update::State::Staged
                         ? "Update " + update.version + " is verified; restart to install"

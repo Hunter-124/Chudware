@@ -31,9 +31,15 @@ MAX_WHEEL_BYTES = 1024 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 2 * MAX_WHEEL_BYTES
 MAX_METADATA_BYTES = 1024 * 1024
 MAX_IDENTITY_BYTES = 4 * 1024 * 1024
-# The public repository the chudcode-rpc SDK wheel is built from (python/chudcode-rpc),
-# at the commit vendor/chudcode/CHUDCODE_ARTIFACT.lock pins for the native runtime.
+# Upstream source identity retained by offline review manifests, not an install URL.
+# The SDK source archive below carries the same commit as the locked native runtime.
 CHUDCODE_REPOSITORY = "https://github.com/Hunter-124/chudcode.git"
+CHUDCODE_SOURCE_ARCHIVE = (
+    "https://github.com/Hunter-124/Chudware/releases/download/"
+    "chudcode-runtime-v{version}/chudcode-source-{repository_commit}.tar.gz"
+    "#sha256=a1d417b306cdcb8113420a0e7005de97fdf299908faf46a5668f49261c06aa60"
+    "&subdirectory=python/chudcode-rpc"
+)
 
 
 def local_path(path: Path) -> Path:
@@ -265,9 +271,8 @@ def target_key(environment: dict) -> str:
     return f"{environment['sys_platform']}-{machine}-cp{environment['python_version'].replace('.', '')}"
 
 
-def _declarations(path: Path, environment: dict, chudcode_source: dict) -> list:
+def _declarations(path: Path, environment: dict, native_source: dict) -> list:
     _, requirements, utils, _, _, _ = _packaging()
-    pinned_sdk = f"git+{chudcode_source['repository']}@{chudcode_source['repository_commit']}"
     result = []
     for raw in _bytes(path).decode("utf-8").splitlines():
         # pip's comment rule: '#' starts a comment only at line start or after
@@ -280,12 +285,16 @@ def _declarations(path: Path, environment: dict, chudcode_source: dict) -> list:
         except ValueError as exc:
             raise WheelhouseError(f"invalid runtime requirement: {line}") from exc
         if req.url:
-            # Developers build the SDK from this direct reference; the reviewed
-            # chudcode-rpc wheel from the same commit satisfies it here.
+            # Offline installs substitute the reviewed wheel only for this exact
+            # SDK archive, including its hash and subdirectory. The release and
+            # commit must also match the separately trusted native runtime lock.
             if (utils.canonicalize_name(req.name) != "chudcode-rpc"
-                    or req.url.split("#", 1)[0] != pinned_sdk):
+                    or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+",
+                                        str(native_source.get("version", "")))
+                    or req.url != CHUDCODE_SOURCE_ARCHIVE.format(**native_source)):
                 raise WheelhouseError("runtime declarations cannot supply unreviewed direct URLs")
-            req = requirements.Requirement("chudcode-rpc" + (f"; {req.marker}" if req.marker else ""))
+            extras = f"[{','.join(sorted(req.extras))}]" if req.extras else ""
+            req = requirements.Requirement("chudcode-rpc" + extras + (f"; {req.marker}" if req.marker else ""))
         if not req.marker or req.marker.evaluate(environment):
             result.append(req)
     return result
@@ -418,9 +427,9 @@ def verified_wheelhouse(wheelhouse: Path, requirements: Path, lock_path: Path,
             lines.append(f"{copied.as_uri()} --hash=sha256:{digest}\n")
         if installed.get("chudcode-rpc", (None,))[0] != "0.3.1":
             raise WheelhouseError("reviewed chudcode-rpc==0.3.1 wheel is required")
-        pending = _declarations(requirements, environment, source)
+        pending = _declarations(requirements, environment, native)
         for path in additional:
-            pending.extend(_declarations(Path(path), environment, source))
+            pending.extend(_declarations(Path(path), environment, native))
         # Even additional reviewed wheels must have a complete dependency closure.
         pending.extend(req_parser.Requirement(f"{name}=={value[0]}") for name, value in installed.items())
         visited = set()

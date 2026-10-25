@@ -22,14 +22,16 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 try:
     from .appserve import router as appserve_router
-    from .config import settings
+    from .cells import container_runtime, resolve_workspace
+    from .config import CellBackend, settings
     from .engine_bridge import router as engine_router
     from .identity import SameOriginMiddleware
     from .limits import RequestBodyLimitMiddleware
     from .workspace import router as workspace_router
 except ImportError:  # uvicorn app:app from the package directory
     from appserve import router as appserve_router  # type: ignore
-    from config import settings  # type: ignore
+    from cells import container_runtime, resolve_workspace  # type: ignore
+    from config import CellBackend, settings  # type: ignore
     from engine_bridge import router as engine_router  # type: ignore
     from identity import SameOriginMiddleware  # type: ignore
     from limits import RequestBodyLimitMiddleware  # type: ignore
@@ -42,6 +44,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     settings.ensure_dirs()
+    if settings.cell_backend == CellBackend.CONTAINER:
+        container_runtime(resolve_workspace())
     log.info("gateway up: operator=%s workspace=%s app=%s",
              settings.operator, settings.workspace_root, settings.app_dir)
     yield

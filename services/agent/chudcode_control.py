@@ -61,6 +61,7 @@ class ControlServer:
         self._stop = threading.Event()
         self._accept_thread: threading.Thread | None = None
         self._clients: set = set()
+        self._active_clients: set = set()
         self._client_threads: set[threading.Thread] = set()
         self._state_lock = threading.Lock()
         self._auth_failures: deque[float] = deque()
@@ -139,19 +140,49 @@ class ControlServer:
         }
 
     def stop(self) -> None:
-        self._stop.set()
-        listener = self._socket
-        self._socket = None
+        cleanup_deadline = time.monotonic() + 1.0
+        drain_deadline = cleanup_deadline - 0.5
+        with self._state_lock:
+            self._stop.set()
+            protected = self._active_clients.copy()
+            listener = self._socket
+            self._socket = None
         if listener is not None:
             try:
                 listener.close()
             except OSError:
                 pass
+        # Stop admission and incomplete requests immediately, but let admitted
+        # handlers finish their bounded reply before interrupting their transport.
+        self._interrupt_clients(protected)
+        thread = self._accept_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0, drain_deadline - time.monotonic()))
+        with self._state_lock:
+            client_threads = tuple(self._client_threads)
+        for client_thread in client_threads:
+            if client_thread is not threading.current_thread():
+                client_thread.join(timeout=max(0, drain_deadline - time.monotonic()))
+        self._interrupt_clients(set())
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0, cleanup_deadline - time.monotonic()))
+        for client_thread in client_threads:
+            if client_thread is not threading.current_thread():
+                client_thread.join(timeout=max(0, cleanup_deadline - time.monotonic()))
         for pipe in self._pipes:
-            pipe.shutdown()
+            pipe.close()
+        self._pipes = []
+        self._unlink_owned_socket()
+
+    def _interrupt_clients(self, protected: set) -> None:
+        for pipe in self._pipes:
+            if pipe not in protected:
+                pipe.shutdown()
         with self._state_lock:
             clients = tuple(self._clients)
         for conn in clients:
+            if conn in protected:
+                continue
             try:
                 conn.shutdown(socket.SHUT_RDWR)
             except OSError:
@@ -160,19 +191,6 @@ class ControlServer:
                 conn.close()
             except OSError:
                 pass
-        cleanup_deadline = time.monotonic() + 1.0
-        thread = self._accept_thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=max(0, cleanup_deadline - time.monotonic()))
-        with self._state_lock:
-            client_threads = tuple(self._client_threads)
-        for client_thread in client_threads:
-            if client_thread is not threading.current_thread():
-                client_thread.join(timeout=max(0, cleanup_deadline - time.monotonic()))
-        for pipe in self._pipes:
-            pipe.close()
-        self._pipes = []
-        self._unlink_owned_socket()
 
     def _remove_stale_siblings(self, ppid: int, own_path: Path) -> None:
         assert self._runtime_dir is not None
@@ -240,9 +258,13 @@ class ControlServer:
                 daemon=True,
             )
             with self._state_lock:
+                if self._stop.is_set():
+                    conn.close()
+                    self._slots.release()
+                    break
                 self._clients.add(conn)
                 self._client_threads.add(thread)
-            thread.start()
+                thread.start()
 
     def _serve_pipe(self, pipe) -> None:
         try:
@@ -261,7 +283,7 @@ class ControlServer:
                         # A failed writer needs no extra grace.
                         deadline = time.monotonic() + self._client_timeout
                         try:
-                            while not self._stop.is_set():
+                            while True:
                                 remaining = deadline - time.monotonic()
                                 if remaining <= 0:
                                     break
@@ -272,6 +294,8 @@ class ControlServer:
                             pass
                 finally:
                     pipe.disconnect()
+                    with self._state_lock:
+                        self._active_clients.discard(pipe)
         finally:
             pipe.close()
             with self._state_lock:
@@ -282,20 +306,21 @@ class ControlServer:
         try:
             self._handle_client(conn)
         finally:
-            with self._state_lock:
-                self._clients.discard(conn)
-                self._client_threads.discard(current)
             try:
                 conn.close()
             except OSError:
                 pass
             self._slots.release()
+            with self._state_lock:
+                self._active_clients.discard(conn)
+                self._clients.discard(conn)
+                self._client_threads.discard(current)
 
     def _handle_client(self, conn) -> bool:
         try:
             request = self._read_request(conn, time.monotonic() + self._client_timeout)
             try:
-                response = self._dispatch(request)
+                response = self._dispatch(request, conn)
             except (TimeoutError, RequestError):
                 raise
             except Exception:  # noqa: BLE001 - redact handler errors, including OSError
@@ -310,7 +335,6 @@ class ControlServer:
         except Exception:  # noqa: BLE001 - redact handler failures before wire/log
             log.error("worker control request failed")
             response = self._error("internal", "control request failed")
-        conn.settimeout(self._client_timeout)
         return self._send_response(conn, response)
 
     def _read_request(self, conn: socket.socket, deadline: float | None = None) -> dict:
@@ -348,7 +372,7 @@ class ControlServer:
             raise RequestError("malformed", "control request must be an object")
         return request
 
-    def _dispatch(self, request: dict) -> dict:
+    def _dispatch(self, request: dict, conn) -> dict:
         supplied = request.get("token")
         authenticated = isinstance(supplied, str) and supplied.isascii() and hmac.compare_digest(
             supplied, self._token
@@ -367,6 +391,10 @@ class ControlServer:
         try:
             with bind_context(request.get("ctx")):
                 control_delegate(action)
+                with self._state_lock:
+                    if self._stop.is_set():
+                        raise RequestError("stopping", "control server is stopping")
+                    self._active_clients.add(conn)
                 result = self._handler(action, params)
         except (KeyError, ValueError) as exc:
             code = str(exc).strip("'")
@@ -408,6 +436,7 @@ class ControlServer:
                 separators=(",", ":"),
             ).encode("utf-8")
         try:
+            conn.settimeout(self._client_timeout)
             conn.sendall(payload + b"\n")
         except (OSError, TimeoutError):
             return False

@@ -1,0 +1,65 @@
+# Requires Docker Compose >=2.24.4 (!reset). Missing TLS/auth settings refuse
+# interpolation before either service starts; there are no default credentials.
+# docker compose -f web/compose.yaml -f web/compose.https.yaml up --build -d --wait
+services:
+  chudware:
+    # Remove even the loopback bypass when selecting authenticated hosting.
+    ports: !reset []
+    environment:
+      CHUDWARE_WEB_ALLOWED_HOSTS: localhost,127.0.0.1,${CHUDWARE_DOMAIN:?Set CHUDWARE_DOMAIN to the public DNS hostname}
+  caddy:
+    image: ${CHUDWARE_PROXY_IMAGE:-chudware-selfhost-proxy:local}
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: web/deploy/container/Dockerfile
+      target: https-proxy
+    user: "10001:10001"
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 0.5
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 128
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,uid=10001,gid=10001,mode=1777,size=32m
+    ports:
+      - "80:8080"
+      - "443:8443"
+    environment:
+      CHUDWARE_DOMAIN: ${CHUDWARE_DOMAIN:?Set CHUDWARE_DOMAIN to the public DNS hostname}
+      CHUDWARE_AUTH_USER: ${CHUDWARE_AUTH_USER:?Set CHUDWARE_AUTH_USER}
+      CHUDWARE_AUTH_HASH: ${CHUDWARE_AUTH_HASH:?Set CHUDWARE_AUTH_HASH to a Caddy bcrypt password hash}
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      chudware:
+        condition: service_healthy
+    healthcheck:
+      # Probe only loopback TLS and auth readiness, without credentials or DNS.
+      # Browsers still validate the public certificate; this is not a CA audit.
+      test:
+        - CMD-SHELL
+        - >-
+          test "$$(curl --silent --insecure --noproxy '*'
+          --output /dev/null --write-out '%{http_code}' --max-time 5
+          --resolve "$${CHUDWARE_DOMAIN}:8443:127.0.0.1"
+          "https://$${CHUDWARE_DOMAIN}:8443/healthz")" = 401
+      interval: 30s
+      timeout: 8s
+      start_period: 180s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  caddy_data:
+  caddy_config:

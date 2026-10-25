@@ -4,7 +4,7 @@
 #   scripts/provision_venv.sh [pip arguments...]
 #
 # Default (development): `python -m venv` plus `pip install -r requirements.txt` from
-# PyPI; chudcode-rpc is built from the Chudcode commit requirements.txt pins (needs git).
+# PyPI plus the hash-pinned MIT SDK source archive in requirements.txt (no git needed).
 # Extra arguments go to that pip call, e.g. `-r packaging/requirements-release.txt`
 # for a release compiler venv or `pytest` for running the test suites.
 #
@@ -33,7 +33,6 @@ if [ -n "${CHUDWARE_WHEELHOUSE:-}" ]; then
         "$ROOT" --base-python "$BASE_PYTHON" --venv-dir "$VENV_DIR" --wheelhouse "$CHUDWARE_WHEELHOUSE" "$@"
 else
     command -v "$BASE_PYTHON" >/dev/null 2>&1 || { echo "error: base Python not found: $BASE_PYTHON (set PYTHON)" >&2; exit 1; }
-    command -v git >/dev/null 2>&1 || { echo "error: git is required to build chudcode-rpc from the Chudcode repository" >&2; exit 1; }
     [ -x "$VENV_DIR/bin/python" ] || "$BASE_PYTHON" -m venv "$VENV_DIR"
     "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check -r "$ROOT/requirements.txt" "$@"
 fi

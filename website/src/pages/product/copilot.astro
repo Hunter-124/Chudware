@@ -3,7 +3,7 @@ import BaseLayout from '../../layouts/BaseLayout.astro';
 import '../../styles/product.css';
 import Icon from '../../components/Icon.astro';
 ---
-<BaseLayout title="AI copilot" description="A team of AI agents that works inside the open Chudware document, drives the same modeling, simulation, and CAM tools you use, and leaves behind a dimension-driven, human-editable feature history. Runs on your own provider account or API key.">
+<BaseLayout title="AI copilot" description="An optional desktop team of AI agents collaborating across your workspace and leaving a dimension-driven, human-editable feature history. Requires a compatible runtime and your own provider account or API key; online browser Copilot is unavailable.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Product / Collaborate</p>
@@ -12,8 +12,9 @@ import Icon from '../../components/Icon.astro';
       <ul class="product-hero-meta">
         <li>A team of agents working in the open document</li>
         <li>A human-editable, dimension-driven feature tree</li>
-        <li>Runs on your own AI provider account or API key</li>
+        <li>Optional desktop runtime and your own provider account or API key</li>
       </ul>
+      <p class="supporting-copy">Online Copilot is not available in the browser deployment. Public desktop installers and runtime availability must not be assumed; check <a href="/download/">current setup choices</a> and your source checkout's runtime instructions.</p>
     </div>
   </header>
 
@@ -135,7 +136,7 @@ import Icon from '../../components/Icon.astro';
           <p class="eyebrow" id="providers-title">Provider connection</p>
           <h2>Your provider. Your account. Your bill.</h2>
         </header>
-        <p class="product-body">In <strong>Settings → Providers</strong>, sign in with a supported provider account or paste your own API key. The prompt, the project context needed for that turn, and tool results go to the provider you picked — nowhere else.</p>
+        <p class="product-body">In a desktop build with its compatible copilot runtime configured, open <strong>Settings → Providers</strong> and connect a supported provider account or your own API key. The prompt, project context needed for that turn, and tool results are sent to the provider you select under its privacy terms.</p>
         <p class="product-body">Your provider's plan, API prices, usage limits, and privacy terms apply. Chudware doesn't sell tokens or resell model capacity.</p>
         <p class="product-body">Treat every provider credential as a secret. Enter it only in Provider settings—never in chat, a prompt, or a project note.</p>
         <p class="product-body"><a class="text-link" href="/docs/ai-copilot/">Provider setup guide <Icon name="arrow-right" /></a></p>
@@ -166,14 +167,14 @@ import Icon from '../../components/Icon.astro';
     <div class="wrap section-heading">
       <p class="eyebrow">Next</p>
       <h2>Try it against a model you can check.</h2>
-      <p class="lede">Install the desktop app, build the first part by hand, and then ask the copilot to revise it.</p>
-      <div class="actions"><a class="button" href="/download/">Download</a><a class="button button-secondary" href="/docs/first-part/">Build your first part</a></div>
+      <p class="lede">Check desktop setup and runtime prerequisites, build a first part by hand, then ask the configured copilot to revise it. Browser self-hosting does not enable online Copilot.</p>
+      <div class="actions"><a class="button" href="/download/">See setup choices</a><a class="button button-secondary" href="/docs/first-part/">Build your first part</a></div>
       <ul class="product-jump">
         <li><a href="/product/">All capabilities</a></li>
         <li><a href="/product/modeling/">Modeling</a></li>
         <li><a href="/product/assemblies/">Assemblies</a></li>
         <li><a href="/product/plm/">PLM</a></li>
-        <li><a href="/download/">Download</a></li>
+        <li><a href="/download/">Setup choices</a></li>
       </ul>
     </div>
   </section>

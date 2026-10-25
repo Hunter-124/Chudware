@@ -16,6 +16,35 @@ Website: <https://chudware.com>
 |---|---|
 | ![Static FEA results](website/public/images/fea.png) | ![CAM toolpaths](website/public/images/cam.png) |
 
+## Start in your browser
+
+The simplest self-hosted path builds the browser client, native CAD engine and Python
+workers together. Clone the public MIT source repository:
+
+```bash
+git clone https://github.com/Hunter-124/Chudware.git
+cd Chudware
+docker compose -f web/compose.yaml up --build -d --wait
+```
+
+Open <http://127.0.0.1:8300/app/>. You need Docker Engine with the Compose v2 plugin
+(2.24.4+), a Linux x86-64 host that permits nested unprivileged user namespaces, and
+enough memory and disk for a native C++/WebAssembly build. The first run compiles from source; there is
+no prebuilt public image assumed by this command. See the
+[web quickstart](web/README.md#quickstart) for prerequisites, build sizing, persistence,
+backups, upgrades and authenticated HTTPS.
+
+The browser deployment is experimental and single-operator, not a multi-user service;
+online Copilot is unsupported there. Native/source alternatives are below in
+[Building from source](#building-from-source).
+
+Chudware's own native and self-hosted software is free under the [MIT License](LICENSE),
+with the third-party terms and documented exception described under [License](#license).
+For optional owner-operated paid hosting, [contact the project](https://chudware.com/contact).
+Hosting pays for operation, convenience and support for the open-source project, never
+for unlocking software features. There is no public checkout or promised hosting
+availability.
+
 ## Features
 
 - **Mechanical CAD:** sketches with a constraint solver; extrude, revolve, sweep, loft, rib,
@@ -41,19 +70,10 @@ Website: <https://chudware.com>
 ## Project status
 
 Chudware is under active development and has not reached 1.0; file formats and APIs can
-still change between releases. The desktop app builds on Linux, Windows, and macOS.
-Prebuilt installers are published on
-[GitHub Releases](https://github.com/Hunter-124/Chudware/releases), and the in-app updater
-installs new releases after verifying their signed update manifest. No account is required.
-On Linux, the release install script downloads and verifies the right package for your
-distribution:
-
-```bash
-curl -fsSL https://github.com/Hunter-124/Chudware/releases/latest/download/install.sh | sh
-```
-
-It accepts `--version <V>` and `--format deb|rpm|appimage`. The browser build of the app is
-experimental (see [Self-hosted web app](#self-hosted-web-app-experimental)).
+still change between releases. The desktop app targets Linux, Windows, and macOS.
+Existing GitHub releases are prereleases; there is no current public stable installer
+or usable `/releases/latest` installation path to advertise. Build from the public
+source checkout, or use the [browser deployment](web/README.md).
 
 ## Building from source
 
@@ -66,6 +86,10 @@ Requirements:
   and X11/Wayland/OpenGL development headers on Linux;
 - Python 3.13 (3.12 also works) and `git` on `PATH` for the Python services: the MCP
   server, the copilot's agent host, and the test suites.
+- Internet access for the pinned optional online-agent SDK source archive and native
+  runtime release assets hosted in this repository's GitHub releases; no companion
+  repository access is required. The browser container omits the SDK and executable
+  because online Copilot is unsupported there.
 
 On Fedora, `sudo .github/scripts/install-fedora-deps.sh` installs the same packages CI uses
 (add `gate` for the extra tools `scripts/gate.sh` runs).
@@ -86,11 +110,14 @@ PYTHON=python3.13 scripts/provision_venv.sh pytest
 ```
 
 `scripts/provision_venv.sh` creates `.venv-mcp`, installs `requirements.txt` from PyPI
-(`chudcode-rpc` is built from the pinned Chudcode commit, hence `git`), and runs the runtime
-dependency audit; `python3.13 -m venv .venv-mcp && .venv-mcp/bin/python -m pip install -r
-requirements.txt` is the manual equivalent. `./build.sh` is a thin wrapper over CMake; its
-header lists every mode (`app|core|daemon|wasm|all|stage|clean`), and bare `./build.sh`
-rebuilds only the GUI.
+plus the SHA-256-pinned `chudcode-rpc` source archive from this repository's
+[`chudcode-runtime-v0.4.3` release](https://github.com/Hunter-124/Chudware/releases/tag/chudcode-runtime-v0.4.3),
+and runs the runtime dependency audit. Native runtime binaries use the pinned assets
+recorded in `vendor/chudcode/CHUDCODE_ARTIFACT.lock`; `macos-arm64` remains unpinned.
+`python3.13 -m venv .venv-mcp && .venv-mcp/bin/python -m pip install -r requirements.txt`
+installs the same public dependencies. `./build.sh` is a thin wrapper over CMake; its header
+lists every mode (`app|core|daemon|wasm|all|stage|clean`), and bare `./build.sh` rebuilds
+only the GUI.
 Core-only builds can also use the CMake presets in [CMakePresets.json](CMakePresets.json)
 (`cmake --preset linux-core`). Windows builds use the `windows-*` presets from a Visual
 Studio 2022 developer prompt; see [docs/reference/BUILD_WINDOWS.md](docs/reference/BUILD_WINDOWS.md).
@@ -105,10 +132,10 @@ CHUDWARE_PYTHON="$PWD/.venv-mcp/bin/python" CHUDWARE_REPO="$PWD" ./host/build-li
 The GUI starts the shared engine daemon `chudware-hostd` on demand and attaches to it over
 local IPC; see [docs/reference/HOSTD.md](docs/reference/HOSTD.md) for its lifecycle.
 
-The copilot's online agent runtime, [Chudcode](https://github.com/Hunter-124/chudcode), is
-a separate binary (`chud`) pinned by `vendor/chudcode/CHUDCODE_ARTIFACT.lock`; release
-packages ship it beside the bundled Python runtime. For a source build, download and verify
-the pinned release and point Chudware at it:
+The native copilot's optional online agent runtime is a separate binary (`chud`) pinned
+by `vendor/chudcode/CHUDCODE_ARTIFACT.lock`. Its verified source archive and supported
+platform binaries are hosted in this repository's releases; no companion repository
+access is needed. Download and verify the runtime, then point Chudware at it:
 
 ```bash
 .venv-mcp/bin/python scripts/pin_chudcode.py ensure --target linux-x86_64 \
@@ -116,9 +143,10 @@ the pinned release and point Chudware at it:
 export CHUDWARE_CHUDCODE_BIN=<path printed above>
 ```
 
-Targets are `linux-x86_64`, `macos-x86_64`, and `windows-x86_64` (`macos-arm64` is not
-pinned yet). Without the runtime, online copilot turns are unavailable; the offline
-local-model fallback still works.
+The lock includes `linux-x86_64`, `macos-x86_64`, and `windows-x86_64`;
+`macos-arm64` is not pinned. Online Copilot is unavailable without the runtime and SDK.
+The native local-model fallback is separate and needs its own model setup; this does
+not make online Copilot available in the browser.
 
 ### Testing
 
@@ -151,8 +179,8 @@ both attach to the same `chudware-hostd` engine.
 The C++ kernel **`libchudware`** ([core/](core)) is the engine. The C++ GUI ([host/](host))
 talks to the shared **`chudware-hostd`** daemon, which loads `libchudware`, over local IPC.
 Python under [services/](services) provides the MCP server, the copilot's agent host
-(online turns run in the embedded [Chudcode](https://github.com/Hunter-124/chudcode)
-runtime), the services worker, the installer, and helpers with no C++ counterpart.
+(online turns use a separate optional agent runtime), the services worker, the installer,
+and helpers with no C++ counterpart.
 
 ```
             ┌──────────────────────────────────────────────────────┐
@@ -174,10 +202,12 @@ runtime), the services worker, the installer, and helpers with no C++ counterpar
 
 ## Self-hosted web app (experimental)
 
-The same `host/src/ui` tree compiles to WebAssembly. The browser build is served by a small
-gateway that connects each session to a `chudware-hostd` tenant cell. It is intended to
-become self-hostable; today it is experimental and not feature-complete. See
-[web/README.md](web/README.md).
+The same `host/src/ui` tree compiles to WebAssembly. The recommended
+[Compose deployment](web/README.md#quickstart) builds and runs that client, gateway,
+native engine cell and general Python workers together without the online-agent
+runtime. The advanced systemd deployment remains available for Linux operators who
+need filesystem project-quota enforcement. Both are experimental; see
+[web/README.md](web/README.md) for the actual trust boundary and feature limitations.
 
 ## Repository layout
 

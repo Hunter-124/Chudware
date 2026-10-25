@@ -721,14 +721,12 @@ jobs:
       - name: Write signed update manifests
         env:
           CHUDWARE_RELEASE_SIGNING_KEY: ${{ secrets.CHUDWARE_RELEASE_SIGNING_KEY }}
-          # Installed versions older than this floor treat the update as mandatory.
-          MIN_SUPPORTED: ${{ vars.CHUDWARE_MIN_SUPPORTED_VERSION || '0.0.0' }}
         run: |
           set -euo pipefail
           sign() {
             python packaging/github_release_manifest.py "dist/$1" --platform "$2" --arch "$3" \
               --version "${RELEASE_VERSION}" --tag "${TAG}" --repo "${GITHUB_REPOSITORY}" \
-              --key-id "${CHUDWARE_RELEASE_KEY_ID}" --min-supported "${MIN_SUPPORTED}" --output-dir dist
+              --key-id "${CHUDWARE_RELEASE_KEY_ID}" --output-dir dist
           }
           sign "Chudware-${RELEASE_VERSION}-linux-x86_64.AppImage" linux x86_64
           sign "Chudware-Setup-${RELEASE_VERSION}-x86_64.exe" windows x86_64

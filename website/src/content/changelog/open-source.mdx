@@ -1,23 +1,23 @@
 ---
-title: Chudware is open source
-description: Chudware is now open source under the MIT License, with free desktop builds on GitHub Releases and no account required.
+title: MIT licensing and deployment choices
+description: Chudware software is MIT licensed without account-based licensing; public source and desktop installer publication remain pending.
 published: 2026-10-22
-version: Open source
+version: MIT licensing
 ---
 ## Highlights
 
-- The complete Chudware source code is public on [GitHub](https://github.com/Hunter-124/Chudware) under the MIT License.
-- Accounts, sign-in, and license checks are gone. The desktop app runs fully without an account.
-- Desktop builds for Windows, Linux, and macOS are published on [GitHub Releases](https://github.com/Hunter-124/Chudware/releases/latest).
-- The in-app updater reads a signed update manifest from the latest GitHub release and verifies the update's Ed25519 signature before staging it.
-- The [Chudcode](https://github.com/Hunter-124/chudcode) agent runtime behind the copilot is public too, and the app fetches it from its GitHub releases.
+- Chudware's own code is covered by the MIT License; third-party components retain their licenses and notices.
+- Account-based licensing and software fees have been removed. Desktop use, source builds, and self-hosting do not require a Chudware license key.
+- The MIT source repository is public and can be cloned without an access request. No public desktop installer release is available. Existing runtime or beta prereleases must not be presented as a general desktop download.
+- The desktop updater verifies signed update manifests and update payload signatures; that mechanism does not make unpublished installers available.
+- AI is optional. Desktop Copilot requires its configured compatible runtime and your own supported provider account or API key. Online Copilot is not available in the browser deployment.
 
 ## Getting started
 
-The [download page](/download/) explains which release file to pick for each platform. To build Chudware yourself, follow [Building from source](https://github.com/Hunter-124/Chudware#building-from-source) in the README.
+The [setup page](/download/) distinguishes desktop packaging, source builds, and experimental single-operator [browser self-hosting](/docs/self-hosting/). The browser guide uses `docker compose -f web/compose.yaml up --build -d` from a source checkout's repository root.
 
-Bug reports and feature requests go to [GitHub issues](https://github.com/Hunter-124/Chudware/issues). Read the [contributing guide](https://github.com/Hunter-124/Chudware/blob/HEAD/CONTRIBUTING.md) before sending a pull request.
+Clone the [public repository](https://github.com/Hunter-124/Chudware) and use its build instructions, issue tracker, and contributing guide. Supported desktop SDK and native runtime dependencies are pinned release assets in this same repository; the macOS ARM64 native runtime remains unpinned. [Contact the project](/contact/) about optional paid, owner-operated hosting that supports development. Hosting is not required for the MIT software rights.
 
 ## AI provider setup
 
-- The copilot runs on your own supported AI provider account or API key, configured in **Settings → Providers**.
+- Configure desktop provider credentials only in **Settings → Providers**, never in chat or project files. Your provider's charges and privacy terms apply; Chudware does not sell AI tokens. Hosting does not remove the browser AI limitation.

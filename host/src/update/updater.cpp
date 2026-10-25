@@ -344,7 +344,7 @@ bool manifestFromJson(const std::string& body, Manifest& out, std::string& error
     try {
         const json value = json::parse(body);
         out.version = value.at("version").get<std::string>();
-        out.minSupported = value.at("min_supported").get<std::string>();
+        // Legacy min_supported metadata is ignored; releases cannot disable CAD.
         out.platform = value.at("platform").get<std::string>();
         out.arch = value.at("arch").get<std::string>();
         out.keyId = value.at("key_id").get<std::string>();
@@ -353,7 +353,7 @@ bool manifestFromJson(const std::string& body, Manifest& out, std::string& error
         out.signature = value.at("signature").get<std::string>();
         out.notesUrl = value.at("notes_url").get<std::string>();
         out.url = value.value("url", std::string());
-        if (!parseVersion(out.version) || !parseVersion(out.minSupported) ||
+        if (!parseVersion(out.version) ||
             out.platform != platformName() || out.arch != architectureName() ||
             out.keyId.empty() || out.sha256.size() != 64 || out.size == 0 ||
             out.signature.empty())
@@ -516,11 +516,6 @@ int compareVersions(const std::string& lhs, const std::string& rhs) {
     return compareParsed(*a, *b);
 }
 
-bool requiresMandatoryUpdate(const std::string& current,
-                             const std::string& minSupported) {
-    return compareVersions(current, minSupported) < 0;
-}
-
 struct Updater::Impl {
     mutable std::mutex mutex;
     std::condition_variable wake;
@@ -529,7 +524,6 @@ struct Updater::Impl {
     bool running = false;
     bool stopping = false;
     bool forceCheck = false;
-    bool mandatoryActive = false;
     std::string currentVersion;
     std::filesystem::path dataDir;
     std::filesystem::path executablePath;
@@ -543,13 +537,10 @@ struct Updater::Impl {
     void setStatus(State state, const Manifest* manifest, std::string message,
                    std::string url = {}) {
         std::lock_guard<std::mutex> lock(mutex);
-        if (state == State::Mandatory) mandatoryActive = true;
-        else if (state == State::Current) mandatoryActive = false;
-        status.state = mandatoryActive ? State::Mandatory : state;
+        status.state = state;
         if (manifest) status.version = manifest->version;
         status.message = std::move(message);
         status.downloadUrl = std::move(url);
-        status.mandatory = mandatoryActive;
     }
 
     bool stopRequested() const {
@@ -657,8 +648,8 @@ struct Updater::Impl {
     bool writeStagedMetadata(const Manifest& manifest, const std::filesystem::path& artifact,
                              std::string& error) {
         const json value = {{"state", "staged"}, {"version", manifest.version},
-            {"min_supported", manifest.minSupported}, {"platform", manifest.platform},
-            {"arch", manifest.arch}, {"key_id", manifest.keyId}, {"sha256", manifest.sha256},
+            {"platform", manifest.platform}, {"arch", manifest.arch},
+            {"key_id", manifest.keyId}, {"sha256", manifest.sha256},
             {"size", manifest.size}, {"signature", manifest.signature},
             {"notes_url", manifest.notesUrl}, {"url", manifest.url},
             {"artifact", artifact.filename().string()}};
@@ -883,12 +874,7 @@ struct Updater::Impl {
             setStatus(State::Error, nullptr, error);
             return false;
         }
-        if (requiresMandatoryUpdate(version, manifest.minSupported)) {
-            setStatus(State::Mandatory, &manifest,
-                "Chudware " + manifest.minSupported + " or newer is required",
-                manifest.url.empty() ? manifest.notesUrl : manifest.url);
-            if (manifest.url.empty()) return true;
-        } else if (compareVersions(version, manifest.version) >= 0) {
+        if (compareVersions(version, manifest.version) >= 0) {
             setStatus(State::Current, &manifest, "Chudware is up to date");
             return true;
         } else {
@@ -930,10 +916,8 @@ struct Updater::Impl {
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 if (stopping) break;
-                if (!mandatoryActive) {
-                    status.state = State::Checking;
-                    status.message = "Checking for updates";
-                }
+                status.state = State::Checking;
+                status.message = "Checking for updates";
             }
             const bool ok = checkOnce();
             const auto delay = ok
@@ -967,7 +951,6 @@ void Updater::configure(std::string currentVersion, std::filesystem::path dataDi
     impl_->loadReports();
     impl_->configured = true;
     impl_->stopping = false;
-    impl_->mandatoryActive = false;
     impl_->status = {};
     // A verified replacement launch finalizes the transaction left by the old
     // process. Cleanup happens only after the new executable has started.
@@ -1016,7 +999,6 @@ ApplyResult Updater::applyStagedBeforeWindow() {
             if (state == "applying") return ApplyResult::NothingStaged;
             if (state != "staged") throw std::runtime_error("invalid staged state");
             manifest.version = metadata.at("version").get<std::string>();
-            manifest.minSupported = metadata.at("min_supported").get<std::string>();
             manifest.platform = metadata.at("platform").get<std::string>();
             manifest.arch = metadata.at("arch").get<std::string>();
             manifest.keyId = metadata.at("key_id").get<std::string>();
@@ -1030,8 +1012,6 @@ ApplyResult Updater::applyStagedBeforeWindow() {
             std::filesystem::remove(impl_->stagedMetadata());
             return ApplyResult::Rejected;
         }
-        impl_->mandatoryActive =
-            requiresMandatoryUpdate(impl_->currentVersion, manifest.minSupported);
     }
     std::string error;
     const auto current = parseVersion(impl_->currentVersion);
@@ -1112,7 +1092,6 @@ void Updater::setTestSnapshot(Snapshot value) {
     stop();
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->status = std::move(value);
-    impl_->mandatoryActive = value.mandatory;
 }
 
 Updater& globalUpdater() {

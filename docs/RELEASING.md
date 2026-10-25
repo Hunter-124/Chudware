@@ -1,13 +1,104 @@
 # Releasing Chudware
 
-Releases are built by [`.github/workflows/release.yml`](../.github/workflows/release.yml)
-on GitHub-hosted runners and published as
-[GitHub Releases](https://github.com/Hunter-124/Chudware/releases). The in-app
-updater reads signed manifests attached to the latest release. Signing keys and
-optional platform certificates are described in [SIGNING.md](SIGNING.md); the
-other workflows are described in [reference/CI.md](reference/CI.md).
+Browser containers and native installers have independent publication paths.
+The browser path is [`.github/workflows/self-host.yml`](../.github/workflows/self-host.yml);
+the native path is [`.github/workflows/release.yml`](../.github/workflows/release.yml).
+The public MIT source is at https://github.com/Hunter-124/Chudware.
+Configuring either workflow is **not evidence of public image/installer availability**:
+the existing releases are prereleases/runtime assets, not a public stable installer.
+Anonymous image/installer access must be established separately.
 
-## Cutting a release
+Native installers use signed update and payload manifests. Signing keys and
+optional platform certificates remain described in [SIGNING.md](SIGNING.md).
+The complete workflow inventory is in [reference/CI.md](reference/CI.md).
+
+## Browser container publication
+
+Build and run from the repository root:
+
+```bash
+docker compose -f web/compose.yaml up --build -d --wait
+```
+
+This builds the complete browser client, native engine, gateway and non-AI
+Python workers from the whole repository context using
+`web/deploy/container/Dockerfile`. It does not depend on desktop release jobs,
+native signing secrets, or downloading the optional agent runtime/SDK. Browser
+online Copilot remains unsupported; the image is not a desktop installer.
+[The deployment guide](../web/README.md) covers storage, authentication/TLS,
+container isolation requirements and upgrade/rollback.
+
+`self-host.yml` builds on pull requests, `master`, `v*` tags and manual runs.
+Before any publication it starts an isolated Compose project, exercises the
+complete image, recreates the container with its volumes retained, and reopens
+the saved model. A separate `packages: write` job loads that exact tested image;
+PR jobs have read-only repository permission and never log in to GHCR.
+No additional private checkout or private-repository token is needed.
+
+The **configured destination**, not a claim of a published/public package, is
+`ghcr.io/hunter-124/chudware-web` (Linux x86-64). Trusted runs in the canonical
+repository on `master` or a `v*` tag publish `sha-<full-commit>`. These tags are
+immutable by workflow policy: an existing tag is refused rather than replaced,
+including on reruns. Keep a deployed digest or commit tag for rollback.
+Only pushes to `master`, or a manual run on `master` with `move_edge` explicitly
+selected, advance the moving `edge` channel. Tag runs do not advance it; there
+is no configured `latest` or `stable` browser channel.
+
+After an actual publication, the owner must set the GHCR package's visibility
+and verify an anonymous pull of the emitted commit reference/digest. A public
+source checkout or successful authenticated CI push does not establish public
+image access. Do not advertise a pull command as working until that check passes.
+Optional owner-operated hosting is arranged through the existing contact
+route as project support, not a required license or an implemented checkout.
+
+### Operational and persistence acceptance
+
+The consumer-visible command targets an already-running isolated deployment;
+it never starts/stops a daemon or touches unrelated documents, recents or chats:
+
+```bash
+python3 -m venv .venv-smoke
+.venv-smoke/bin/python -m pip install httpx==0.28.1 websockets==16.1
+.venv-smoke/bin/python web/deploy/smoke.py http://127.0.0.1:8300
+```
+
+It verifies health, nonempty HTML/JS/WASM/data with MIME/isolation/cache/CSP
+headers, hostile Host and HTTP/WebSocket Origin refusal, a real native 10 mm box
+build, authorized AICM download, native save/download/reopen and the non-AI
+`parts_list_categories` Python worker. Loading states and asynchronous events
+are handled explicitly; a health response or `hello` alone cannot pass it.
+It uses one fresh `chudware-smoke-<uuid>.step+` name and closes only its own
+documents. By default it deletes only that exact unchanged file.
+
+For restart acceptance, explicitly keep its file and a new local receipt:
+
+```bash
+.venv-smoke/bin/python web/deploy/smoke.py http://127.0.0.1:8300 \
+  --keep --receipt /tmp/chudware-smoke.json
+docker compose -f web/compose.yaml down
+docker compose -f web/compose.yaml up --no-build -d --force-recreate
+.venv-smoke/bin/python web/deploy/smoke.py http://127.0.0.1:8300 \
+  --resume /tmp/chudware-smoke.json
+```
+
+Do **not** use `down --volumes`: this acceptance checks the retained data,
+workspace and engine-state volumes. Resume verifies the saved bytes against
+the receipt before reopening and removes the unchanged smoke file on success;
+the local receipt can then be removed. `--resume ... --keep` retains it for
+another restart. Use a new receipt path for each fresh run. A changed or
+unverified file is left untouched and fails acceptance. This operational
+command is not a browser-rendering, multi-user security, or complete feature
+qualification suite.
+
+## Cutting a native release
+
+Native public release remains blocked by the unpinned `macos-arm64` runtime lock
+entry. The SDK source archive and pinned Linux, Windows and macOS x64 runtime
+binaries are hosted in this repository's `chudcode-runtime-v0.4.3` release; no
+private companion repository is required. All platform jobs must succeed, so
+browser-image publication must not be routed through this pipeline. The following
+is the configured maintainer procedure, not a claim that public installers are
+currently available.
 
 1. Make sure `master` is green: `fast-gate`, `linux-gate` and `native-build`.
 2. Pick the version. Tags are `v<major>.<minor>.<patch>` with an optional
@@ -74,7 +165,6 @@ Each manifest is written by `packaging/github_release_manifest.py`:
 ```json
 {
   "version": "0.3.0",
-  "min_supported": "0.0.0",
   "platform": "linux",
   "arch": "x86_64",
   "key_id": "release-ci-v1",
@@ -96,9 +186,11 @@ The updater accepts a manifest only if `key_id` names a key compiled into
 `core/security/release_keys.h`, the signature verifies, and `platform` and
 `arch` match the running build. It then downloads `url`, checks `size` and
 `sha256`, verifies the payload manifest inside the downloaded package, and only
-then stages the update. An installed version older than `min_supported` is told
-the update is mandatory; set the repository variable
-`CHUDWARE_MIN_SUPPORTED_VERSION` before tagging to raise that floor.
+then stages the update. Updates remain optional: an old or missing manifest and
+offline operation do not disable the application. Published manifests contain
+no minimum supported version, and the release workflow has no enforced upgrade
+floor. Current clients also ignore any `min_supported` field in historical
+manifests. Updates are not a license check or support deadline.
 
 ### Checking a published release
 
@@ -149,24 +241,28 @@ The value must match `^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$` or configure
 fails. The full string, prerelease included, is used for artifact names and
 manifests; CMake's `project(VERSION ...)` receives only the numeric triple.
 
-## Chudcode runtime
+## Native agent runtime prerequisites
 
-The agent runtime `chud` comes from the
-[Chudcode](https://github.com/Hunter-124/chudcode) project.
-`vendor/chudcode/CHUDCODE_ARTIFACT.lock` pins one release per target
+Native bundles include the agent runtime `chud`; this is an internal packaging
+dependency, not a separate product or a prerequisite for browser self-hosting.
+The pinned `chudcode-rpc` SDK source archive and supported native binaries are
+published in this repository's runtime release, requiring no companion repository access.
+`vendor/chudcode/CHUDCODE_ARTIFACT.lock` records each target
 (`linux-x86_64`, `macos-arm64`, `macos-x86_64`, `windows-x86_64`) by URL and
-SHA-256, and release jobs fetch it with:
+SHA-256, and release jobs fetch pinned targets with:
 
 ```bash
 python3 scripts/pin_chudcode.py ensure --target linux-x86_64 --cache-dir /tmp/chudcode
 ```
 
 The download is verified against the lock before packaging; a target whose
-lock row is unpinned fails the release. To move to a new Chudcode release,
-download its assets and repin every target in one step:
+lock row is unpinned fails the release. The `macos-arm64` row is currently
+unpinned, which blocks the all-platform native publisher independently of
+signing credentials. Publish reviewed source and binary assets in this repository's
+runtime release before repinning every supported target:
 
 ```bash
-base=https://github.com/Hunter-124/chudcode/releases/download/chudcode-vX.Y.Z
+base=https://github.com/Hunter-124/Chudware/releases/download/chudcode-runtime-vX.Y.Z
 python3 scripts/pin_chudcode.py pin \
   --version X.Y.Z --rpc-protocol 2 --repository-commit <commit> \
   --artifact linux-x86_64=chudcode-linux-x64 --url linux-x86_64=$base/chudcode-linux-x64 \

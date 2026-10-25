@@ -1,12 +1,11 @@
 """The operator's engine cell: admission, filesystem pinning and activation.
 
-The browser never reaches a shared daemon. Its engine is a hostd running inside
-an OS-isolated cell (web/deploy/cell): a socket-activated systemd user unit,
-``chudware-cell@<id>``, that sandboxes hostd with bubblewrap and mounts only the
-operator's workspace as /work. The gateway prepares the cell directory, writes
-its ``cell.json`` identity, asks the user manager to start the socket, and
-connects to ``gw.sock``. Every path step is a no-follow descriptor walk, so a
-symlink in the workspace or cell tree can never redirect the gateway.
+The browser never reaches a shared desktop daemon. By default its engine is a
+socket-activated systemd user cell with a quota-admitted bubblewrap root. The
+explicit container backend instead connects to the single private listener
+owned by the image's PID-1 supervisor. Both retain the same cell metadata,
+principal admission and nested actor sandbox. Every path step is a no-follow
+descriptor walk; a symlink cannot redirect the gateway.
 """
 from __future__ import annotations
 
@@ -24,10 +23,10 @@ from pathlib import Path
 from fastapi import HTTPException
 
 try:
-    from .config import settings
+    from .config import CellBackend, settings
     from .identity import current_operator
 except ImportError:  # uvicorn app:app from the package directory
-    from config import settings
+    from config import CellBackend, settings
     from identity import current_operator
 
 CELL_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -35,6 +34,9 @@ RIGHTS = {"viewer": {"read"}, "editor": {"read", "write", "run"},
           "manager": {"read", "write", "run", "manage"},
           "owner": {"read", "write", "run", "manage"}}
 POLICY_PATH = Path(__file__).resolve().parents[2] / "contracts" / "cell_methods.json"
+CONTAINER_MARKER = Path("/run/chudware/runtime.json")
+CONTAINER_STATE = Path("/state")
+CONTAINER_IMAGE_MARKER = Path("/opt/chudware/container-runtime-v1")
 
 
 @dataclass(frozen=True)
@@ -195,6 +197,55 @@ def prepare_cell(principal: CellPrincipal) -> Path:
     return directory
 
 
+def container_runtime(principal: CellPrincipal) -> dict:
+    """Admit only the prepared fixed operator, never an arbitrary host socket."""
+    expected_key = "user:" + settings.operator
+    if (settings.cell_backend != CellBackend.CONTAINER
+            or principal.workspace_key != expected_key or principal.actor_key != settings.operator
+            or principal.right != "owner" or principal.epoch != 0
+            or principal.cell_id != hashlib.sha256(expected_key.encode()).hexdigest()[:32]
+            or principal.root != settings.workspace_root.absolute()):
+        raise HTTPException(403, "container principal refused")
+    try:
+        image_fd, image_info = open_beneath(CONTAINER_IMAGE_MARKER.parent,
+                                           CONTAINER_IMAGE_MARKER.name, max_bytes=128)
+        with os.fdopen(image_fd, "rb") as handle:
+            if (image_info.st_uid != 0 or image_info.st_mode & 0o022
+                    or handle.read() != b"chudware-container-v1\n"):
+                raise ValueError("invalid image marker")
+        marker_fd, marker_info = open_beneath(CONTAINER_MARKER.parent,
+                                             CONTAINER_MARKER.name, max_bytes=8192)
+        with os.fdopen(marker_fd, "rb") as handle:
+            if marker_info.st_uid != os.getuid() or marker_info.st_mode & 0o077:
+                raise ValueError("unsafe supervisor marker")
+            marker = json.load(handle)
+        if not isinstance(marker, dict) or any(marker.get(key) != value for key, value in {
+            "schema": "chudware-container-v1", "supervisor_pid": 1,
+            "uid": os.getuid(), "home": str(settings.home), "root": str(principal.root),
+            "state": str(CONTAINER_STATE), "cell_id": principal.cell_id,
+            "workspace_key": principal.workspace_key,
+        }.items()):
+            raise ValueError("supervisor identity mismatch")
+        state_fd = directory_beneath(CONTAINER_STATE)
+        try:
+            info = os.fstat(state_fd)
+            if info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise ValueError("unsafe container state")
+        finally:
+            os.close(state_fd)
+        os.kill(1, 0)
+        return marker
+    except (OSError, ValueError, HTTPException):
+        raise HTTPException(503, "container runtime unavailable; start the supplied container entrypoint") from None
+
+
+def state_root(principal: CellPrincipal) -> Path:
+    if settings.cell_backend == CellBackend.CONTAINER:
+        container_runtime(principal)
+        return CONTAINER_STATE
+    return settings.cells_root / principal.cell_id / "state"
+
+
 async def start_cell(cell_id: str) -> None:
     if not CELL_ID.fullmatch(cell_id):
         raise HTTPException(403, "cell id refused")
@@ -213,7 +264,8 @@ async def start_cell(cell_id: str) -> None:
         raise HTTPException(503, "cell activation unavailable")
 
 
-def _connect_pinned(directory: Path, filename: str = "gw.sock") -> socket.socket:
+def _connect_pinned(directory: Path, filename: str = "gw.sock", *,
+                    expected_socket: tuple[int, int] | None = None) -> socket.socket:
     parent = directory_beneath(directory)
     fd = None
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -222,6 +274,8 @@ def _connect_pinned(directory: Path, filename: str = "gw.sock") -> socket.socket
         info = os.fstat(fd)
         if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise HTTPException(403, "unsafe cell socket")
+        if expected_socket is not None and (info.st_dev, info.st_ino) != expected_socket:
+            raise HTTPException(403, "container socket identity changed")
         sock.settimeout(10)
         sock.connect(f"/proc/self/fd/{fd}")
         sock.setblocking(False)
@@ -236,7 +290,10 @@ def _connect_pinned(directory: Path, filename: str = "gw.sock") -> socket.socket
 
 
 async def connect_cell(principal: CellPrincipal):
+    marker = container_runtime(principal) if settings.cell_backend == CellBackend.CONTAINER else None
     directory = prepare_cell(principal)
-    await start_cell(principal.cell_id)
-    sock = await asyncio.to_thread(_connect_pinned, directory)
+    if settings.cell_backend == CellBackend.SYSTEMD:
+        await start_cell(principal.cell_id)
+    expected = None if marker is None else (marker.get("socket_device"), marker.get("socket_inode"))
+    sock = await asyncio.to_thread(_connect_pinned, directory, expected_socket=expected)
     return await asyncio.open_unix_connection(sock=sock, limit=settings.ws_max_message_bytes)

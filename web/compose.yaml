@@ -1,0 +1,71 @@
+services:
+  chudware:
+    image: ${CHUDWARE_IMAGE:-chudware-selfhost:local}
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: web/deploy/container/Dockerfile
+      target: runtime
+      args:
+        BUILD_JOBS: ${BUILD_JOBS:-2}
+    user: "10001:10001"
+    # runtime.py supervises hostd and the gateway as PID 1 and reaps children.
+    restart: unless-stopped
+    stop_grace_period: 2m
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      # Nested bwrap needs namespace syscalls, mounts and an unmasked parent /proc.
+      # Keep its user/PID/network/mount isolation; relax only this outer container.
+      # Never replace a failed probe with privileged, SYS_ADMIN or a host worker.
+      - seccomp:unconfined
+      - apparmor=unconfined
+      - systempaths=unconfined
+    cpus: ${CHUDWARE_CPUS:-4}
+    mem_limit: ${CHUDWARE_MEMORY:-8g}
+    memswap_limit: ${CHUDWARE_MEMORY:-8g}
+    pids_limit: 512
+    shm_size: 256m
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
+      core: 0
+    tmpfs:
+      - /run:rw,nosuid,nodev,uid=10001,gid=10001,mode=0700,size=64m
+      - /tmp:rw,nosuid,nodev,uid=10001,gid=10001,mode=1777,size=1g
+    ports:
+      - "127.0.0.1:8300:8300"
+    environment:
+      CHUDWARE_WEB_CELL_BACKEND: container
+      CHUDWARE_CONTAINER_RUNTIME: "1"
+      CHUDWARE_WEB_OPERATOR: ${CHUDWARE_WEB_OPERATOR:-operator}
+      CHUDWARE_WEB_ALLOWED_HOSTS: localhost,127.0.0.1
+      CHUDWARE_WEB_HOME: /data
+      CHUDWARE_WORKSPACE_ROOT: /work
+      CHUDWARE_WEB_APP: /opt/chudware/app
+    volumes:
+      - data:/data
+      - work:/work
+      - state:/state
+    healthcheck:
+      test: ["CMD", "/opt/chudware/venv/bin/python", "/opt/chudware/web/deploy/container/runtime.py", "healthcheck"]
+      interval: 30s
+      timeout: 12s
+      start_period: 180s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Named volumes contain only this installation's metadata, saved files and
+# engine/actor state. No host home, credentials, daemon socket or runtime mount.
+# Resource limits are NOT disk quotas: keep free space on the volume filesystem.
+volumes:
+  data:
+  work:
+  state:

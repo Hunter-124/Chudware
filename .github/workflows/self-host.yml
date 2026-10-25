@@ -1,0 +1,202 @@
+# Browser/native-engine image only: no desktop signing or online-agent runtime.
+name: self-host
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      move_edge:
+        description: Move the supported edge channel after smoke (master only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: self-host-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build and exercise complete Linux browser image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    outputs:
+      commit: ${{ steps.identity.outputs.commit }}
+      image_id: ${{ steps.identity.outputs.image_id }}
+    env:
+      COMPOSE_PROJECT_NAME: chudware-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      CHUDWARE_IMAGE: chudware-selfhost:${{ github.sha }}
+    steps:
+      - name: Check out this source tree without retained credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up smoke client Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+
+      - name: Free unused runner SDK space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+
+      - name: Install operational smoke client
+        run: python -m pip install --disable-pip-version-check httpx==0.28.1 websockets==16.1
+
+      - name: Build whole-repository container context
+        run: docker compose -f web/compose.yaml build --pull
+
+      - name: Start a scratch deployment
+        run: docker compose -f web/compose.yaml up --no-build -d
+
+      - name: Exercise HTTP, security, native CAD and sandboxed Python worker
+        run: python web/deploy/smoke.py http://127.0.0.1:8300 --keep --receipt "${RUNNER_TEMP}/self-host-smoke.json"
+
+      - name: Recreate the deployment while retaining all volumes
+        run: |
+          set -euo pipefail
+          docker compose -f web/compose.yaml down --timeout 30
+          docker compose -f web/compose.yaml up --no-build -d --force-recreate
+
+      - name: Prove saved-file persistence and clean only smoke data
+        run: python web/deploy/smoke.py http://127.0.0.1:8300 --resume "${RUNNER_TEMP}/self-host-smoke.json"
+
+      - name: Identify the exact tested image
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "image_id=$(docker image inspect --format '{{.Id}}' "$CHUDWARE_IMAGE")" >> "$GITHUB_OUTPUT"
+
+      - name: Export tested image for trusted publication
+        if: >-
+          github.repository == 'Hunter-124/Chudware' &&
+          github.event_name != 'pull_request' &&
+          (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker save "$CHUDWARE_IMAGE" | gzip -1 > "${RUNNER_TEMP}/self-host-image.tar.gz"
+
+      - name: Transfer tested image, not a privileged rebuild
+        if: >-
+          github.repository == 'Hunter-124/Chudware' &&
+          github.event_name != 'pull_request' &&
+          (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: self-host-tested-image
+          path: ${{ runner.temp }}/self-host-image.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Show scratch deployment diagnostics
+        if: failure()
+        run: docker compose -f web/compose.yaml logs --no-color --tail 250
+
+      - name: Remove only this job's scratch deployment and volumes
+        if: always()
+        run: docker compose -f web/compose.yaml down --volumes --timeout 30
+
+  publish:
+    name: Publish already-smoked image to GHCR
+    needs: build
+    if: >-
+      github.repository == 'Hunter-124/Chudware' &&
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Serialize the existence check and push across branch/tag/manual runs.
+    concurrency:
+      group: self-host-ghcr-publication
+      cancel-in-progress: false
+    permissions:
+      packages: write
+    env:
+      SOURCE_COMMIT: ${{ needs.build.outputs.commit }}
+      TESTED_IMAGE_ID: ${{ needs.build.outputs.image_id }}
+      LOCAL_IMAGE: chudware-selfhost:${{ github.sha }}
+      IMAGE: ghcr.io/hunter-124/chudware-web
+    steps:
+      - name: Download this run's tested image
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: self-host-tested-image
+          path: ${{ runner.temp }}/self-host-image
+
+      - name: Load and match the tested image identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker load --input "${RUNNER_TEMP}/self-host-image/self-host-image.tar.gz"
+          test "$(docker image inspect --format '{{.Id}}' "$LOCAL_IMAGE")" = "$TESTED_IMAGE_ID"
+
+      - name: Authenticate only the publication job
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USER" --password-stdin
+
+      - name: Refuse replacement of immutable commit tags
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
+        shell: python
+        run: |
+          import base64
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          repository = os.environ['IMAGE'].removeprefix('ghcr.io/')
+          credentials = (os.environ['GHCR_USER'] + ':' + os.environ['GHCR_TOKEN']).encode()
+          token_url = 'https://ghcr.io/token?' + urllib.parse.urlencode({
+              'service': 'ghcr.io', 'scope': f'repository:{repository}:pull,push'})
+          request = urllib.request.Request(token_url, headers={
+              'Authorization': 'Basic ' + base64.b64encode(credentials).decode()})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              token = json.load(response)['token']
+          tag = 'sha-' + os.environ['SOURCE_COMMIT']
+          request = urllib.request.Request(f'https://ghcr.io/v2/{repository}/manifests/{tag}',
+              method='HEAD', headers={'Authorization': 'Bearer ' + token,
+              'Accept': 'application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'})
+          try:
+              with urllib.request.urlopen(request, timeout=30):
+                  raise SystemExit(f'Refusing to replace existing immutable {tag}; use that image or publish a new commit')
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+
+      - name: Publish immutable commit image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker tag "$LOCAL_IMAGE" "$IMAGE:sha-$SOURCE_COMMIT"
+          docker push "$IMAGE:sha-$SOURCE_COMMIT"
+          echo "Tested image: \`$IMAGE:sha-$SOURCE_COMMIT\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deliberately advance the supported edge channel
+        if: >-
+          github.ref == 'refs/heads/master' &&
+          (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.move_edge))
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker tag "$LOCAL_IMAGE" "$IMAGE:edge"
+          docker push "$IMAGE:edge"
+          echo 'Advanced the edge channel; no latest/stable channel is published.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove publication credentials
+        if: always()
+        run: docker logout ghcr.io

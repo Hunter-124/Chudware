@@ -274,8 +274,6 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
             label = "Update available \xe2\x80\x94 " + update.version;
         else if (update.state == chudware::update::State::Staged)
             label = "Restart to update \xe2\x80\x94 " + update.version;
-        else if (update.state == chudware::update::State::Mandatory)
-            label = "Update required \xe2\x80\x94 " + update.version;
         else if (update.state == chudware::update::State::Downloading)
             label = "Downloading update \xe2\x80\x94 " + update.version;
         if (!label.empty()) {

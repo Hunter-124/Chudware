@@ -70,20 +70,23 @@ tracked in [`contracts/license_debt.md`](contracts/license_debt.md).
 | coi-serviceworker | 0.1.7 | MIT | vendored (`host/wasm/coi-serviceworker.js`) | https://github.com/gzuidhof/coi-serviceworker |
 | libcurl | build-host version | curl | system library | https://curl.se/ |
 | Linux runtime libraries (libstdc++, libgcc, libgomp, X11/Wayland client libraries, zlib, and the rest of the dependency closure) | build-host versions | per distribution package (libstdc++, libgcc, libgomp: GPL-3.0-or-later WITH GCC-exception-3.1) | system libraries bundled in the Linux AppImage | the build host's distribution |
-| Emscripten runtime (musl libc, libc++, libc++abi, compiler-rt) | the building developer's `emsdk` | MIT OR NCSA (Emscripten); MIT (musl); Apache-2.0 WITH LLVM-exception (LLVM runtimes) | linked into the experimental WASM web client | https://emscripten.org/ |
+| Emscripten runtime (musl libc, libc++, libc++abi, compiler-rt) | 6.0.3 in the browser container; otherwise the building developer's `emsdk` | MIT OR NCSA (Emscripten); MIT (musl); Apache-2.0 WITH LLVM-exception (LLVM runtimes) | linked into the experimental WASM web client; toolchain image `emscripten/emsdk:6.0.3` is build-only | https://emscripten.org/ |
 
 ## 2. Agent runtime (Chudcode)
 
-Chudcode is a public, MIT-licensed agent runtime that Chudware runs as a separate process.
-Its notices are hash-locked by `vendor/chudcode/CHUDCODE_ARTIFACT.lock` and shipped with every
-desktop and web payload.
+The optional native online-agent runtime is MIT-licensed and runs as a separate
+process. Its pinned source archive and native binary assets are hosted in this
+repository's [runtime release](https://github.com/Hunter-124/Chudware/releases/tag/chudcode-runtime-v0.4.3).
+The notices are hash-locked by `vendor/chudcode/CHUDCODE_ARTIFACT.lock` and must
+accompany any payload that includes the runtime. The recommended browser container
+ships neither this binary nor the `chudcode-rpc` SDK because online Copilot is unsupported there.
 
 | Component | Version | License (SPDX) | How incorporated | Upstream |
 |---|---|---|---|---|
-| Chudcode (`chud` binary) | 0.4.3, commit `2eaba2f4606984172f31f108459d9529d4ee5e38` | MIT | prebuilt binary downloaded from the project's GitHub releases at packaging/provisioning time, SHA-256 verified; subprocess over RPC | repository and release URLs recorded in `vendor/chudcode/CHUDCODE_ARTIFACT.lock` |
+| Chudcode (`chud` binary) | 0.4.3, commit `2eaba2f4606984172f31f108459d9529d4ee5e38` | MIT | optional native prebuilt binary, obtained from this repository's runtime release at packaging/provisioning time and SHA-256 verified; subprocess over RPC; not in the recommended browser container | repository and release URLs recorded in `vendor/chudcode/CHUDCODE_ARTIFACT.lock` (`macos-arm64` is not pinned) |
 | Oh My Pi (modified by Chudcode) | as included in Chudcode 0.4.3 | MIT | inside the Chudcode binary | https://github.com/can1357/oh-my-pi |
 | Bun runtime, bundled packages and fonts | as included in Chudcode 0.4.3 | see `vendor/chudcode/CHUDCODE-THIRD-PARTY-NOTICES.txt` | inside the Chudcode binary | see the notices file |
-| chudcode-rpc | 0.3.1 | MIT | Python runtime package, built from the Chudcode repository at the locked commit | same lock file |
+| chudcode-rpc | 0.3.1 | MIT | optional online-agent Python SDK, built from the SHA-256-pinned source archive at the locked commit in this repository's runtime release; required by native provisioning, omitted from the browser container | https://github.com/Hunter-124/Chudware/releases/tag/chudcode-runtime-v0.4.3 |
 
 ## 3. Python runtime packages (`requirements.txt`)
 
@@ -92,6 +95,10 @@ confirmed: *metadata* = read from the installed package's metadata in a developm
 (the inspected version may differ slightly from the pin); *PyPI* = the PyPI metadata for the pinned
 version; *repository* = the upstream source repository; *requirements* = only stated in a
 `requirements.txt` comment and not otherwise verified.
+
+The browser container installs these requirements except the optional
+`chudcode-rpc` source-archive dependency. Their presence does not imply that optional external
+programs, separately installed models or browser-incompatible features are provided.
 
 | Package | Version | License (SPDX) | Basis | Notes |
 |---|---|---|---|---|
@@ -166,6 +173,10 @@ and mapanything packages, and the openEMS/CSXCAD modules) are listed with their 
 | pagefind | 1.5.2 | MIT | website build; its search UI is part of the generated site | https://pagefind.app/ |
 | wrangler | 4.149.0 | MIT OR Apache-2.0 | website deployment tool | https://github.com/cloudflare/workers-sdk |
 | sharp, @img/sharp-libvips | 0.35.5, 1.3.4 | Apache-2.0; LGPL-3.0-or-later | website build-time image processing; nothing from it is served | https://sharp.pixelplumbing.com/ |
+| Docker Engine (Moby), Docker Compose v2 | user-installed; Compose 2.24.4+ for the HTTPS override | Apache-2.0; Docker Desktop has separate product terms | host-side tooling for the self-hosted container build/orchestration; not part of the Chudware application image | https://github.com/moby/moby ; https://github.com/docker/compose |
+| Fedora container OS packages | Fedora 44; installed versions in the image RPM inventory | per-package licenses, including LGPL libraries and GPL OS tools | build/runtime environment for `web/deploy/container/Dockerfile`; package metadata and `/usr/share/licenses` retain upstream notices; image redistribution must meet the packages' own source/license obligations | https://packages.fedoraproject.org/ |
+| bubblewrap | Fedora package version in the image | LGPL-2.0-or-later | separate OS executable for actor/worker isolation, installed in the browser container; never linked or imported into Chudware; user-installed for the advanced systemd path | https://github.com/containers/bubblewrap ; https://github.com/containers/bubblewrap/blob/main/COPYING |
+| Caddy | 2.10.2 (`caddy:2.10.2-alpine`) | Apache-2.0; Alpine OS packages retain their own licenses | optional separate upstream TLS/authentication proxy image selected by `web/compose.https.yaml`; not part of the Chudware or desktop process | https://github.com/caddyserver/caddy ; https://github.com/caddyserver/caddy-docker |
 
 ## 5. Fonts and data
 
@@ -202,11 +213,13 @@ One first-party file contains code that is **not** covered by Chudware's MIT Lic
 
 ## 7. Subprocess-only optional tools
 
-Chudware can drive the following programs when the user has installed them. They are not
-distributed with Chudware, not linked into it, and not imported into its processes; Chudware
-exchanges files, command-line arguments and standard streams with them. Each program is governed by
-its own license, and copyleft obligations (GPL source offers, the AGPL network clause) apply to
-whoever distributes or hosts that program. Licenses below are as published upstream.
+Chudware drives the following separate programs through files, command-line arguments,
+standard streams or local sockets; it never links or imports them into its processes.
+They are user-installed unless a row explicitly notes a container OS package. The
+browser image installs ngspice as a separate Fedora executable, not in a Chudware
+binary. Each program retains its own license; copyleft obligations (GPL source offers,
+the AGPL network clause) apply to whoever distributes or hosts that program. Licenses
+below are as published upstream.
 
 | Tool | License (SPDX) | How it is obtained |
 |---|---|---|
@@ -215,7 +228,7 @@ whoever distributes or hosts that program. Licenses below are as published upstr
 | CalculiX (`ccx`) | GPL-2.0-or-later | user install, `PATH` or `CHUDWARE_CCX` |
 | OpenFOAM | GPL-3.0-or-later | user install, or `tools/provision_openfoam.py --install` creates a conda-forge environment for the user |
 | LibreDWG `dwg2dxf` | GPL-3.0-or-later | `PATH`, or `scripts/provision_libredwg.py` builds the SHA-256-pinned 0.14 release on the user's machine |
-| ngspice | BSD-3-Clause with GPL-licensed parts | user install, `PATH` or `CHUDWARE_NGSPICE` |
+| ngspice | BSD-3-Clause with GPL-licensed parts | user install for desktop (`PATH` or `CHUDWARE_NGSPICE`); separate Fedora OS package in the browser image, with its package notices and source obligations |
 | pandoc | GPL-2.0-or-later | user install |
 | LibreOffice (headless) | MPL-2.0 | user install |
 | ODA File Converter | proprietary freeware | user install |

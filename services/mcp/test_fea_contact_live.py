@@ -110,13 +110,18 @@ def _plate_bushing_pin(tools: dict, name: str) -> str:
 def _contact_result(tools: dict, out: dict) -> dict:
     if out.get("job_id") and "provenance" not in out:
         job_id = out["job_id"]
-        deadline = time.monotonic() + 300
-        while time.monotonic() < deadline:
+        try:
+            # A wait deadline ends only the wait, not the nonlinear solve.
+            # These checks require terminal physics results, not a timing SLA.
+            while True:
+                status = json.loads(tools["wait_job"](job_id, timeout_s=900))
+                if not status.get("still_running"):
+                    return json.loads(tools["sim_results"](job_id))
+        finally:
             status = json.loads(tools["sim_status"](job_id))
-            if status.get("state") not in ("queued", "running"):
-                break
-            time.sleep(0.2)
-        return json.loads(tools["sim_results"](job_id))
+            if status.get("state") in ("queued", "running"):
+                cancelled = json.loads(tools["sim_cancel"](job_id))
+                assert cancelled.get("ok"), cancelled
     return out
 
 

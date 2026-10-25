@@ -65,7 +65,9 @@ Clients only trust keys compiled into them, so rotation takes two releases:
 
 Remove the old key from the trust ring only after no supported version still
 needs it. If a private key leaks, remove its public key in the next release
-and set `CHUDWARE_MIN_SUPPORTED_VERSION` so older clients are told to update.
+and publish a security advisory directing users to a verified replacement.
+Already-installed clients cannot have their compiled trust keys remotely revoked.
+Updates remain optional; there is no minimum-version lockout.
 
 ## Windows code signing (optional)
 

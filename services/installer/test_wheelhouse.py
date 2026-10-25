@@ -25,6 +25,17 @@ from services.installer.wheelhouse import (
     CHUDCODE_REPOSITORY, WheelhouseError, _packaging, install_command, pip_environment,
     target_key, verified_wheelhouse,
 )
+from web.deploy.container.stage import public_requirements
+
+
+SDK_COMMIT = "2eaba2f4606984172f31f108459d9529d4ee5e38"
+SDK_RUNTIME_VERSION = "0.4.3"
+SDK_ARCHIVE_SHA256 = "a1d417b306cdcb8113420a0e7005de97fdf299908faf46a5668f49261c06aa60"
+SDK_ARCHIVE = (
+    "https://github.com/Hunter-124/Chudware/releases/download/"
+    f"chudcode-runtime-v{SDK_RUNTIME_VERSION}/chudcode-source-{SDK_COMMIT}.tar.gz"
+    f"#sha256={SDK_ARCHIVE_SHA256}&subdirectory=python/chudcode-rpc"
+)
 
 
 def fixture_wheel(directory, name="chudcode-rpc", version="0.3.1", dependencies=(),
@@ -56,9 +67,9 @@ def fixture_wheel(directory, name="chudcode-rpc", version="0.3.1", dependencies=
 def reviewed(tmp_path):
     requirements = tmp_path / "requirements.txt"
     requirements.write_text("--no-index\n--only-binary=:all:\nchudcode-rpc==0.3.1\n")
-    source = {"repository": CHUDCODE_REPOSITORY, "repository_commit": "1" * 40}
+    source = {"repository": CHUDCODE_REPOSITORY, "repository_commit": SDK_COMMIT}
     native = tmp_path / "CHUDCODE_ARTIFACT.lock"
-    native.write_text(json.dumps(source))
+    native.write_text(json.dumps({**source, "version": SDK_RUNTIME_VERSION}))
     wheelhouse = tmp_path / "wheelhouse"
     vendored = {"chudcode_rpc/_vendor/inert_child.dist-info/INSTALLER": "reviewed vendored metadata\n"}
     sdk = fixture_wheel(wheelhouse, dependencies=("inert-dependency==1.0",),
@@ -91,23 +102,140 @@ def _declare(inputs, text):
     rewrite_lock(inputs)
 
 
-def test_sdk_direct_reference_to_the_reviewed_commit_is_satisfied_by_the_reviewed_wheel(reviewed):
-    _declare(reviewed, f"chudcode-rpc @ git+{CHUDCODE_REPOSITORY}@{'1' * 40}"
-                       "#subdirectory=python/chudcode-rpc  # developer source build\n")
+@pytest.mark.parametrize("suffix", [
+    "  # developer source build\n",
+    ' ; python_version >= "3.0"  # active marker and URL hash survive comment stripping\n',
+])
+def test_sdk_archive_reference_is_satisfied_by_the_reviewed_wheel(reviewed, suffix):
+    _declare(reviewed, f"chudcode-rpc @ {SDK_ARCHIVE}{suffix}")
     with verify(reviewed) as identity:
         assert identity["packages"]["chudcode-rpc"] == "0.3.1"
+        assert SDK_ARCHIVE not in identity["requirements"].read_text()
+
+
+@pytest.mark.parametrize(("original", "replacement"), [
+    pytest.param(SDK_COMMIT, "2" * 40, id="wrong-commit"),
+    pytest.param("chudcode-runtime-v0.4.3", "chudcode-runtime-v0.4.4", id="wrong-release"),
+    pytest.param("https://github.com/", "https://example.invalid/", id="wrong-host"),
+    pytest.param("https://github.com/", "https://github.com.example.invalid/", id="host-suffix"),
+    pytest.param("https://github.com/", "https://github.com@example.invalid/", id="userinfo-host"),
+    pytest.param("https://github.com/", "https://user:secret@github.com/", id="credentials"),
+    pytest.param("https://", "http://", id="insecure-scheme"),
+    pytest.param("/Hunter-124/Chudware/", "/Hunter-124/chudcode/", id="wrong-repository"),
+    pytest.param("releases/download/", "archive/refs/tags/", id="other-archive-path"),
+    pytest.param(".tar.gz#", ".tar.gz?download=1#", id="query"),
+    pytest.param(f"sha256={SDK_ARCHIVE_SHA256}&", "", id="missing-hash"),
+    pytest.param(SDK_ARCHIVE_SHA256, "0" * 64, id="wrong-hash"),
+    pytest.param(SDK_ARCHIVE_SHA256, SDK_ARCHIVE_SHA256[:-1], id="short-hash"),
+    pytest.param("sha256=", "sha512=", id="other-hash-algorithm"),
+    pytest.param("&subdirectory=python/chudcode-rpc", "", id="missing-subdirectory"),
+    pytest.param("subdirectory=python/chudcode-rpc", "subdirectory=python", id="wrong-subdirectory"),
+    pytest.param("subdirectory=python/chudcode-rpc", "subdirectory=python/chudcode-rpc/../other",
+                 id="subdirectory-traversal"),
+    pytest.param("subdirectory=python/chudcode-rpc", "subdirectory=python%2Fchudcode-rpc",
+                 id="encoded-subdirectory"),
+    pytest.param("subdirectory=python/chudcode-rpc", "subdirectory=python/chudcode-rpc&subdirectory=other",
+                 id="duplicate-subdirectory"),
+    pytest.param(f"sha256={SDK_ARCHIVE_SHA256}", f"sha256={SDK_ARCHIVE_SHA256}&sha256={'0' * 64}",
+                 id="duplicate-hash"),
+    pytest.param(f"sha256={SDK_ARCHIVE_SHA256}&subdirectory=python/chudcode-rpc",
+                 f"subdirectory=python/chudcode-rpc&sha256={SDK_ARCHIVE_SHA256}",
+                 id="noncanonical-fragment"),
+])
+def test_sdk_archive_reference_rejects_provenance_boundary_changes(reviewed, original, replacement):
+    _declare(reviewed, f"chudcode-rpc @ {SDK_ARCHIVE.replace(original, replacement)}\n")
+    with pytest.raises(WheelhouseError, match="unreviewed direct URLs"):
+        with verify(reviewed):
+            pass
 
 
 @pytest.mark.parametrize("declaration", [
-    f"chudcode-rpc @ git+{CHUDCODE_REPOSITORY}@{'2' * 40}#subdirectory=python/chudcode-rpc\n",
-    "chudcode-rpc @ git+https://example.invalid/chudcode.git@" + "1" * 40 + "\n",
-    f"inert-dependency @ git+{CHUDCODE_REPOSITORY}@{'1' * 40}\n",
+    f"chudcode-rpc @ git+{CHUDCODE_REPOSITORY}@{SDK_COMMIT}#subdirectory=python/chudcode-rpc\n",
+    f"chudcode-rpc @ git+{CHUDCODE_REPOSITORY}@main#subdirectory=python/chudcode-rpc\n",
+    f"chudcode-rpc @ git+{CHUDCODE_REPOSITORY}@v0.4.3#subdirectory=python/chudcode-rpc\n",
+    "chudcode-rpc @ https://example.invalid/chudcode_rpc-0.3.1-py3-none-any.whl\n",
+    "chudcode-rpc @ file:///tmp/chudcode-source.tar.gz\n",
+    f"inert-dependency @ {SDK_ARCHIVE}\n",
+    f'chudcode-rpc @ {SDK_ARCHIVE.replace(SDK_COMMIT, "2" * 40)} ; python_version < "3.0"\n',
 ])
-def test_other_direct_references_are_unreviewed(reviewed, declaration):
+def test_other_direct_references_are_unreviewed_even_with_inactive_markers(reviewed, declaration):
     _declare(reviewed, declaration)
     with pytest.raises(WheelhouseError, match="unreviewed direct URLs"):
         with verify(reviewed):
             pass
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("version", "0.4.4"), ("version", None), ("version", ""),
+    ("version", "0.4.3/../other"), ("repository_commit", "2" * 40),
+])
+def test_sdk_archive_must_match_native_runtime_release_and_commit(reviewed, field, value):
+    native = json.loads(reviewed["chudcode_lock"].read_text())
+    native[field] = value
+    reviewed["chudcode_lock"].write_text(json.dumps(native))
+    if field == "repository_commit":
+        reviewed["document"]["chudcode_source"][field] = value
+    _declare(reviewed, f"chudcode-rpc @ {SDK_ARCHIVE}\n")
+    with pytest.raises(WheelhouseError, match="unreviewed direct URLs"):
+        with verify(reviewed):
+            pass
+
+
+@pytest.mark.parametrize("active", [True, False])
+def test_sdk_archive_preserves_extras_and_environment_markers(reviewed, active):
+    marker = 'python_version >= "3.0"' if active else 'python_version < "3.0"'
+    _declare(reviewed, f"chudcode-rpc[feature] @ {SDK_ARCHIVE} ; {marker}\n")
+    target = reviewed["document"]["targets"][target_key(reviewed["environment"])]
+    target["wheels"][0] = fixture_wheel(reviewed["wheelhouse"],
+                                      dependencies=('absent-extra==1.0; extra == "feature"',))
+    rewrite_lock(reviewed)
+    if active:
+        with pytest.raises(WheelhouseError, match="absent-extra"):
+            with verify(reviewed):
+                pass
+    else:
+        with verify(reviewed) as identity:
+            assert identity["packages"]["chudcode-rpc"] == "0.3.1"
+
+
+def test_additional_declarations_apply_the_same_archive_provenance_rules(reviewed, tmp_path):
+    additional = tmp_path / "additional.txt"
+    additional.write_text(f"chudcode-rpc @ {SDK_ARCHIVE}\n")
+    inputs = {key: reviewed[key] for key in ("wheelhouse", "requirements", "lock_path", "chudcode_lock")}
+    with verified_wheelhouse(**inputs, additional_requirements=additional) as identity:
+        assert identity["packages"]["chudcode-rpc"] == "0.3.1"
+    additional.write_text(f"chudcode-rpc @ {SDK_ARCHIVE.split('#', 1)[0]}\n")
+    with pytest.raises(WheelhouseError, match="unreviewed direct URLs"):
+        with verified_wheelhouse(**inputs, additional_requirements=additional):
+            pass
+
+
+def test_container_omits_only_the_exact_optional_sdk_declaration(tmp_path):
+    source = tmp_path / "requirements.txt"
+    destination = tmp_path / "public-requirements.txt"
+    retained = ("# Keep dependency comments and every non-SDK declaration.\n"
+                "build123d==0.11.1\n"
+                "inert-package @ https://example.invalid/package.whl#sha256=other\n"
+                'pywin32==312; sys_platform == "win32"  # platform marker\n')
+    source.write_text(retained + f"chudcode-rpc @ {SDK_ARCHIVE}  # optional SDK\n")
+    public_requirements(source, destination)
+    assert destination.read_text() == retained
+
+
+@pytest.mark.parametrize("declaration", [
+    "",
+    f"chudcode-rpc @ {SDK_ARCHIVE}\n" * 2,
+    f"chudcode-rpc @ {SDK_ARCHIVE.replace(SDK_COMMIT, '2' * 40)}\n",
+    f"chudcode-rpc @ {SDK_ARCHIVE.split('#', 1)[0]}\n",
+    f"chudcode-rpc @ git+{CHUDCODE_REPOSITORY}@{SDK_COMMIT}#subdirectory=python/chudcode-rpc\n",
+])
+def test_container_refuses_missing_duplicate_or_unrecognized_sdk_declarations(tmp_path, declaration):
+    source = tmp_path / "requirements.txt"
+    destination = tmp_path / "public-requirements.txt"
+    source.write_text("build123d==0.11.1\n" + declaration)
+    with pytest.raises(ValueError, match="exactly the optional hash-pinned"):
+        public_requirements(source, destination)
+    assert not destination.exists()
 
 
 def bind_provisioner(monkeypatch, inputs):

@@ -43,10 +43,7 @@ const structuredData = path === '/' ? JSON.stringify([
     url: `${Astro.site}`,
     applicationCategory: 'DesignApplication',
     operatingSystem: 'Windows, Linux, macOS',
-    downloadUrl: `${GITHUB}/releases/latest`,
     license: 'https://opensource.org/license/mit',
-    isAccessibleForFree: true,
-    offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
     publisher: { '@id': `${Astro.site}#organization` },
   },
 ]) : null;
@@ -97,15 +94,15 @@ const active = (href: string) => href === '/' ? path === '/' : path.startsWith(h
           {nav.map((item) => <a class="tap" href={item.href} aria-current={active(item.href) ? 'page' : undefined}>{item.label}</a>)}
         </nav>
         <div class="header-actions">
-          <a class="header-link tap" href={GITHUB}>GitHub</a>
-          <a class="button button-small" href="/download/">Download</a>
+          <a class="header-link tap" href="/docs/self-hosting/">Self-host</a>
+          <a class="button button-small" href="/download/">Get started</a>
         </div>
         <details class="mobile-nav">
           <summary class="tap"><Icon name="menu" /><span>Menu</span></summary>
           <nav aria-label="Mobile primary">
             {nav.map((item) => <a class="tap" href={item.href} aria-current={active(item.href) ? 'page' : undefined}>{item.label}</a>)}
-            <a class="tap" href={GITHUB}>GitHub</a>
-            <a class="tap mobile-download" href="/download/">Download</a>
+            <a class="tap" href="/docs/self-hosting/">Self-host</a>
+            <a class="tap mobile-download" href="/download/">Get started</a>
           </nav>
         </details>
       </div>
@@ -115,7 +112,7 @@ const active = (href: string) => href === '/' ? path === '/' : path.startsWith(h
       <div class="wrap footer-grid">
         <div>
           <a class="brand tap" href="/"><img src="/assets/logo.svg" width="28" height="28" alt="" /><span>CHUDWARE</span></a>
-          <p>AI-first CAD for engineers. Dimension-driven models on exact solids, and a team of agents that works in your model. Free and open source under the MIT License.</p>
+          <p>AI-first CAD for engineers. Exact solids, dimension-driven models, and a team of agents collaborating across your workspace. MIT-licensed software, free to run yourself; optional paid hosting supports the project.</p>
         </div>
         <nav aria-label="Capability links">
           <strong>Capabilities</strong>
@@ -123,14 +120,14 @@ const active = (href: string) => href === '/' ? path === '/' : path.startsWith(h
         </nav>
         <nav aria-label="Explore links">
           <strong>Explore</strong>
-          <a class="tap" href="/product/">Overview</a><a class="tap" href="/gallery/">Gallery</a><a class="tap" href="/download/">Download</a><a class="tap" href="/docs/">Docs</a><a class="tap" href="/faq/">FAQ</a><a class="tap" href="/changelog/">Changelog</a>
+          <a class="tap" href="/product/">Overview</a><a class="tap" href="/gallery/">Gallery</a><a class="tap" href="/download/">Get started</a><a class="tap" href="/docs/">Docs</a><a class="tap" href="/faq/">FAQ</a><a class="tap" href="/changelog/">Changelog</a>
         </nav>
         <nav aria-label="Project links">
           <strong>Project</strong>
-          <a class="tap" href="/about/">About</a><a class="tap" href="/open-source/">Open source</a><a class="tap" href={GITHUB}>GitHub</a><a class="tap" href={`${GITHUB}/blob/HEAD/LICENSE`}>License (MIT)</a><a class="tap" href={`${GITHUB}/security/policy`}>Security</a><a class="tap" href="/contact/">Contact</a><a class="tap" href="/legal/privacy/">Privacy</a>
+          <a class="tap" href="/about/">About</a><a class="tap" href="/open-source/">Source and licenses</a><a class="tap" href="/docs/self-hosting/">Self-hosting</a><a class="tap" href="/contact/">Hosting inquiries</a><a class="tap" href="/contact/">Contact and security</a><a class="tap" href="/legal/privacy/">Privacy</a>
         </nav>
       </div>
-      <div class="wrap footer-bottom"><span>© 2026 Hunter Edmonds and Chudware contributors</span><span>Released under the MIT License.</span></div>
+      <div class="wrap footer-bottom"><span>© 2026 Hunter Edmonds and Chudware contributors</span><span>Public MIT-licensed source.</span></div>
     </footer>
 
   </body>

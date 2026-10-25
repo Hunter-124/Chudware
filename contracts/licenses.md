@@ -72,12 +72,15 @@ Rules:
 | libcurl (system) | curl | HTTP client for model-provider and update requests | **dynamic**, system library. |
 | Platform runtime libraries bundled in the Linux AppImage dependency closure (for example libstdc++, libgcc, libgomp, X11/Wayland client libraries, zlib) | each under its distribution license (libstdc++/libgomp: GPL-3.0-or-later WITH GCC-exception-3.1) | C/C++ runtime, OpenMP threading, windowing | **dynamic**. `packaging/linux/build_appimage.sh` copies the `ldd` closure minus the AppImage excludelist; the exact set depends on the build host. Notices are covered by the open item in `license_debt.md`. |
 | CUDA Toolkit (optional) | LicenseRef-NVIDIA-CUDA-EULA | CUDA lattice-Boltzmann backend | system, opt-in `CHUDWARE_WITH_CUDA` (default OFF); the CUDA runtime is not bundled by any packaging script. |
-| Emscripten toolchain runtime (version of the developer's `emsdk`) | Emscripten: MIT OR NCSA; musl libc: MIT; libc++/libc++abi/compiler-rt: Apache-2.0 WITH LLVM-exception (per upstream) | runtime libraries linked into the experimental WASM web client | in-process (static in the WASM output). |
+| Emscripten toolchain runtime (6.0.3 in the browser container; otherwise the developer's `emsdk`) | Emscripten: MIT OR NCSA; musl libc: MIT; libc++/libc++abi/compiler-rt: Apache-2.0 WITH LLVM-exception (per upstream) | runtime libraries linked into the experimental WASM web client | in-process (static in the WASM output); the container toolchain stage uses `emscripten/emsdk:6.0.3`, not the runtime service image. |
 
 ## Python runtime packages (`requirements.txt`)
 
-All are installed from wheels into the Chudware Python runtime; none is vendored in the
-repository. Optional packages that are feature-detected at run time are listed in the next table.
+Runtime packages are installed from wheels (or the SDK source described below) into the
+Chudware Python runtime; none is vendored in the repository. The browser container
+installs the root requirements except the optional `chudcode-rpc` source-archive line,
+retaining non-AI Python-backed features. Optional packages that are feature-detected
+at run time are listed in the next table.
 
 | dependency | license | role | posture |
 |---|---|---|---|
@@ -96,7 +99,7 @@ repository. Optional packages that are feature-detected at run time are listed i
 | opencv-python-headless | Apache-2.0 (wheels bundle FFmpeg under LGPL-2.1-or-later, per upstream) | ChArUco/ArUco fiducial detection and pixel-to-millimetre homography; OpenCV core only, no contrib modules | in-process; optional at run time (vision tools degrade when absent) |
 | pycolmap (Linux x86-64, Windows, macOS arm64) | BSD-3-Clause | sparse structure-from-motion for reverse engineering | in-process; also force-included in the compiled sidecars by `packaging/requirements-release.txt` |
 | mcp | MIT | MCP server and tool schemas | in-process |
-| chudcode-rpc 0.3.1 | MIT | typed RPC client for the Chudcode runtime | in-process; built from the Chudcode repository at the commit in `vendor/chudcode/CHUDCODE_ARTIFACT.lock`; not published on PyPI |
+| chudcode-rpc 0.3.1 | MIT | typed RPC client for the optional native online-agent runtime | in-process; built from the SHA-256-pinned source archive at commit `2eaba2f4606984172f31f108459d9529d4ee5e38`, hosted in https://github.com/Hunter-124/Chudware/releases/tag/chudcode-runtime-v0.4.3; not published on PyPI. No private companion repository access is required. The browser container omits this optional SDK because online Copilot is unsupported there. |
 | anthropic / openai / httpx | MIT / Apache-2.0 / BSD-3-Clause | model-provider SDKs and HTTP | in-process |
 | scikit-fem / meshio / pyamg | BSD-3-Clause / MIT / MIT | Python-side FEA assembly, mesh I/O, AMG preconditioner | in-process |
 | python-pptx / python-docx / openpyxl | MIT | `.pptx` / `.docx` / `.xlsx` deliverables and edits | in-process |
@@ -144,27 +147,33 @@ repository. Optional packages that are feature-detected at run time are listed i
 | astro / @astrojs/mdx / pagefind / wrangler | MIT / MIT / MIT / MIT OR Apache-2.0 | static build and search index for the promotional website (`website/package.json`) | build tools; the generated site includes Pagefind's search UI (MIT) |
 | sharp (npm override) with prebuilt libvips | Apache-2.0; libvips binaries LGPL-3.0-or-later | image processing during the website build | build tool only; nothing from it is served |
 | `coi-serviceworker.js` 0.1.7 | MIT | sets COOP/COEP headers client-side so the WASM web client can use `SharedArrayBuffer` | in-process, vendored as `host/wasm/coi-serviceworker.js` (upstream `gzuidhof/coi-serviceworker`) |
+| Docker Engine / Docker Compose v2 (Compose 2.24.4+ for the HTTPS override) | Apache-2.0 (Moby/Compose; Docker Desktop has separate product terms) | host-side build and orchestration for `web/compose.yaml` | user-installed tooling, not linked into Chudware or included in its application image. A compatible Podman/Compose provider is an alternative under its own license. |
+| Fedora 44 container packages | per-package licenses (including LGPL libraries and GPL OS tools) | native build stage and Linux runtime environment in `web/deploy/container/Dockerfile` | operating-system packages, not relicensed by Chudware's MIT license. Preserve their package license files and metadata; redistribution/source obligations apply to each package. Exact installed versions are the image's RPM inventory, not a fixed whole-distribution license. |
+| bubblewrap (Fedora package) | LGPL-2.0-or-later | isolated actor/worker subprocesses in the browser container and advanced systemd deployment | separate OS executable, never linked or imported into Chudware. Installed in the container runtime; user-installed for systemd. Preserve the package's license and corresponding-source information when redistributing the image. Upstream: https://github.com/containers/bubblewrap. |
+| Caddy 2.10.2 (`caddy:2.10.2-alpine`) | Apache-2.0 (Caddy); image OS packages retain their own licenses | optional TLS and HTTP Basic authentication proxy in `web/compose.https.yaml` | separate upstream container image, not part of the Chudware process or desktop payload. Preserve upstream image/package notices when redistributing. Upstream: https://github.com/caddyserver/caddy. |
 
 ## Agent runtime
 
 | dependency | license | role | posture |
 |---|---|---|---|
-| **Chudcode** 0.4.3 (commit `2eaba2f4606984172f31f108459d9529d4ee5e38`; engine 18.4.4; RPC protocol 2) | MIT (Chudcode modifies Oh My Pi, also MIT) | compiled online agent runtime: providers, sessions, memory, compaction, browser/computer use, speech-to-text, host-tool orchestration | **subprocess** over RPC. The public release binary for each platform is downloaded and verified against the SHA-256 values in `vendor/chudcode/CHUDCODE_ARTIFACT.lock`; Chudware never imports or vendors the Chudcode engine source. The binary embeds the Bun runtime and bundled packages and fonts, all covered by `vendor/chudcode/CHUDCODE-NOTICE` and `vendor/chudcode/CHUDCODE-THIRD-PARTY-NOTICES.txt`; both files are hash-locked and required in every desktop and web payload. |
+| **Chudcode** 0.4.3 (commit `2eaba2f4606984172f31f108459d9529d4ee5e38`; engine 18.4.4; RPC protocol 2) | MIT (Chudcode modifies Oh My Pi, also MIT) | optional native online-agent runtime: providers, sessions, memory, compaction, browser/computer use, speech-to-text, host-tool orchestration | **subprocess** over RPC. Source and release artifacts are currently private; authorized native packaging/provisioning verifies available binaries against `vendor/chudcode/CHUDCODE_ARTIFACT.lock` (`macos-arm64` is not pinned). Chudware never imports or vendors the engine source. The binary embeds Bun and bundled packages/fonts, covered by the hash-locked `vendor/chudcode/CHUDCODE-NOTICE` and `vendor/chudcode/CHUDCODE-THIRD-PARTY-NOTICES.txt`; include them wherever that binary is shipped. The recommended browser container includes neither this runtime nor its SDK and does not provide online Copilot. |
 
 ## External tools (subprocess only)
 
-None of these is linked, imported, vendored or bundled. Each is discovered on `PATH`, through an
-environment variable, or in a per-user install that a provisioning script creates on the user's
-machine at the user's request. Absence degrades the feature with an actionable message. The
-licenses in this table are those published by each upstream project; none of these tools has a
-copy of its license in this repository because none is distributed with Chudware.
+These tools run as separate programs, never linked or imported into Chudware. Unless a
+row says otherwise, they are user-installed, discovered on `PATH` or through an
+environment variable, or provisioned into the user's environment on request; they
+are not shipped in desktop artifacts. The browser container additionally installs
+ngspice as a separate Fedora OS package, retaining its package notices and source
+obligations. Absence of an optional tool degrades its feature with an actionable message.
+The licenses below are those published by each upstream project.
 
 | tool | license | role | posture |
 |---|---|---|---|
 | PrusaSlicer 2.9.6 (stock) | AGPL-3.0-or-later | FFF slicing for `slice_part` (`services/manufacturing/slicer/prusaslicer.py`); vendor profiles are read from the installed slicer, never copied into the repository | subprocess; user-installed (Flathub per-user install on Linux) |
 | CalculiX (`ccx`) | GPL-2.0-or-later | thermal and contact FEA tools (`services/mcp/fea_advanced.py`) and the V&V cross-check (`scripts/vv_benchmark.py`) | subprocess; `PATH` or `CHUDWARE_CCX`. Input decks are generated from Chudware geometry in the public Abaqus/CalculiX syntax; no CalculiX decks or templates are copied. Linear buckling uses Chudware's in-process Spectra solver, not CalculiX. |
 | OpenFOAM | GPL-3.0-or-later | accurate CFD and conjugate heat transfer backend (`services/sim/foam_runner.py`) | subprocess; user install, or `tools/provision_openfoam.py --install` creates a conda-forge environment for the user. Case files are plain OpenFOAM input dictionaries. |
-| ngspice | BSD-3-Clause with GPL-licensed parts (per upstream) | optional circuit-simulation backend for vendor `.SUBCKT` models (`services/installer/ngspice_backend.py`) | subprocess; `PATH` or `CHUDWARE_NGSPICE`. The native MNA solver (`core/sim/spice.cpp`) is the default. |
+| ngspice | BSD-3-Clause with GPL-licensed parts (per upstream) | optional circuit-simulation backend for vendor `.SUBCKT` models (`services/installer/ngspice_backend.py`) | separate executable; `PATH` or `CHUDWARE_NGSPICE`. User-installed for desktop; installed as a Fedora OS package in the browser container, with package license/source obligations preserved. The native MNA solver (`core/sim/spice.cpp`) is the default. |
 | LibreDWG `dwg2dxf` 0.14 | GPL-3.0-or-later | DWG read and independent re-read of written DWG files | subprocess; `PATH`, else the per-user install that `scripts/provision_libredwg.py` builds from the SHA-256-pinned upstream release. DWG writing is Chudware's own encoder (`core/doc/dwg_write.cpp`). |
 | ODA File Converter | proprietary freeware | DWG to DXF conversion for `services/formats/formats_dwg.py` via `ezdxf.addons.odafc` | subprocess; user-installed |
 | pandoc | GPL-2.0-or-later | markup conversion for deliverables | subprocess; `PATH` |

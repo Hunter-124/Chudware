@@ -4,14 +4,13 @@ import Icon from '../components/Icon.astro';
 import '../styles/download.css';
 
 const REPO = 'https://github.com/Hunter-124/Chudware';
-const LATEST = `${REPO}/releases/latest`;
 ---
-<BaseLayout title="Download Chudware" description="Download the free, open-source Chudware desktop app for Windows, Linux, and macOS from GitHub Releases, or build it from source.">
+<BaseLayout title="Get Chudware" description="Clone the public MIT source for desktop builds or browser self-hosting, or ask about optional paid hosting. Public desktop installers are not yet available.">
   <header class="page-hero">
     <div class="wrap">
-      <p class="eyebrow">Desktop app</p>
-      <h1>Download Chudware.</h1>
-      <p class="lede">Free, open-source builds for Windows, Linux, and macOS, published on GitHub Releases. No account, no license key.</p>
+      <p class="eyebrow">Desktop, source, or hosting</p>
+      <h1>Choose where Chudware runs.</h1>
+      <p class="lede">Desktop use, source builds, and browser self-hosting have no Chudware software fee or license key. Clone the <a class="text-link" href={REPO}>public MIT source repository</a> to build it yourself. No public desktop installer is available yet. Optional paid, owner-operated hosting supports the project; <a class="text-link" href="/contact/">contact us about hosting</a>.</p>
     </div>
   </header>
 
@@ -20,55 +19,53 @@ const LATEST = `${REPO}/releases/latest`;
       <article class="panel dl-primary">
         <span class="dl-mark" aria-hidden="true"><Icon name="download" /></span>
         <div class="dl-primary-body">
-          <p class="eyebrow">Latest release</p>
-          <h2>Chudware desktop</h2>
-          <p class="dl-note">The latest GitHub release lists every installer and package it ships. Pick the file for your platform using the guide below.</p>
+          <p class="eyebrow">Browser self-hosting · Experimental</p>
+          <h2>Build and run with Docker Compose</h2>
+          <p class="dl-note">From a source checkout on a supported Linux host, run <code>docker compose -f web/compose.yaml up --build -d</code> at the repository root. The guide covers prerequisites, persistence, and single-operator security. Online Copilot is not available in the browser.</p>
         </div>
-        <a class="button" href={LATEST}>Download from GitHub</a>
+        <a class="button" href="/docs/self-hosting/">Self-hosting guide</a>
       </article>
 
-      {/* Filenames follow packaging/artifact_names.py, the single source of truth
-          for release asset names. */}
+      {/* Configured desktop packaging targets; these are not public download links. */}
       <div class="dl-grid">
         <article class="panel dl-card">
           <header class="dl-card-head">
             <span class="dl-mark" aria-hidden="true"><Icon name="windows" /></span>
             <h3>Windows</h3>
           </header>
-          <p>x86-64 installers: an interactive setup program and an MSI package.</p>
+          <p>Configured x86-64 packaging targets, not currently published installers:</p>
           <ul class="dl-builds">
             <li><span>Setup (.exe)</span><span>Chudware-Setup-&lt;version&gt;-x86_64.exe</span><span class="dl-build-note">For an ordinary interactive install.</span></li>
             <li><span>Installer (.msi)</span><span>Chudware-&lt;version&gt;-x86_64.msi</span><span class="dl-build-note">For managed and scripted deployment — Group Policy, Intune, msiexec.</span></li>
           </ul>
-          <a class="text-link" href={LATEST}>Download for Windows <Icon name="arrow-right" /></a>
+          <a class="text-link" href="/docs/install-windows/">Windows setup notes <Icon name="arrow-right" /></a>
         </article>
         <article class="panel dl-card">
           <header class="dl-card-head">
             <span class="dl-mark" aria-hidden="true"><Icon name="linux" /></span>
             <h3>Linux</h3>
           </header>
-          <p>x86-64 builds as an AppImage, distribution packages, and a plain archive.</p>
+          <p>Configured x86-64 release packaging targets:</p>
           <ul class="dl-builds">
             <li><span>AppImage</span><span>Chudware-&lt;version&gt;-linux-x86_64.AppImage</span></li>
             <li><span>.deb</span><span>chudware_&lt;version&gt;_amd64.deb</span></li>
             <li><span>.rpm</span><span>chudware-&lt;version&gt;-&lt;release&gt;.x86_64.rpm</span></li>
-            <li><span>.tar.zst</span><span>Chudware-&lt;version&gt;-linux-x86_64.tar.zst</span></li>
           </ul>
-          <a class="text-link" href={LATEST}>Download for Linux <Icon name="arrow-right" /></a>
+          <a class="text-link" href="/docs/install-linux/">Linux setup notes <Icon name="arrow-right" /></a>
         </article>
         <article class="panel dl-card">
           <header class="dl-card-head">
             <span class="dl-mark" aria-hidden="true"><Icon name="apple" /></span>
             <h3>macOS</h3>
           </header>
-          <p>x86-64 zip archive. Runs on Intel Macs, and on Apple silicon through Rosetta 2.</p>
+          <p>Configured ARM64 target for Apple silicon; public packaging is not yet available.</p>
           <ul class="dl-builds">
-            <li><span>App (.zip)</span><span>Chudware-&lt;version&gt;-macos-x86_64.zip</span><span class="dl-build-note">Unpack it and drag Chudware into Applications.</span></li>
+            <li><span>App (.zip)</span><span>Chudware-&lt;version&gt;-macos-arm64.zip</span><span class="dl-build-note">Unpack a trusted build and drag Chudware into Applications.</span></li>
           </ul>
-          <a class="text-link" href={LATEST}>Download for macOS <Icon name="arrow-right" /></a>
+          <a class="text-link" href="/docs/install-macos/">macOS setup notes <Icon name="arrow-right" /></a>
         </article>
       </div>
-      <p class="supporting-copy dl-sysnote">All desktop builds are 64-bit and need a GPU driver with hardware-accelerated 3D. Without one the app won't start. Not every release carries every format; the release's asset list is authoritative.</p>
+      <p class="supporting-copy dl-sysnote">These filenames describe packaging conventions, not available downloads. Desktop builds need hardware-accelerated 3D graphics. Existing prereleases and runtime artifacts are not a public desktop installer release.</p>
     </div>
   </section>
 
@@ -76,14 +73,13 @@ const LATEST = `${REPO}/releases/latest`;
     <div class="wrap">
       <header class="section-heading">
         <p class="eyebrow">Linux packages</p>
-        <h2 id="dl-linux-title">Pick the format that fits your distribution.</h2>
-        <p class="lede">Each format carries the same application. Distribution packages integrate with your package manager; the AppImage and archive run without installing anything.</p>
+        <h2 id="dl-linux-title">When a desktop package is available.</h2>
+        <p class="lede">Use only an installer actually listed for your platform in a verified release. Distribution packages integrate with your package manager; an AppImage can run without a system install.</p>
       </header>
       <dl class="dl-formats">
         <div><dt><Icon name="package" /> .deb</dt><dd>For Debian and Ubuntu. Install with <code>sudo apt install ./chudware_&lt;version&gt;_amd64.deb</code>; removes cleanly with apt.</dd></div>
         <div><dt><Icon name="package" /> .rpm</dt><dd>For Fedora, RHEL, and openSUSE. Install with <code>sudo dnf install ./chudware-&lt;version&gt;-&lt;release&gt;.x86_64.rpm</code> or zypper.</dd></div>
         <div><dt><Icon name="download" /> AppImage</dt><dd>One portable file with nothing to install. Mark it executable with <code>chmod +x</code> and run it.</dd></div>
-        <div><dt><Icon name="archive" /> .tar.zst</dt><dd>Plain archive for any distribution; unpack and run from anywhere.</dd></div>
       </dl>
     </div>
   </section>
@@ -97,8 +93,8 @@ const LATEST = `${REPO}/releases/latest`;
       </header>
       <div class="note-panel">
         <p class="eyebrow">In-app updates</p>
-        <p>The desktop app checks the latest GitHub release for a signed update manifest. A downloaded update must match the manifest's size and SHA-256 digest and carry a valid Ed25519 signature from the Chudware release key before the app stages it for installation.</p>
-        <p>Only download Chudware from the project's GitHub releases or build it yourself from source.</p>
+        <p>The desktop updater requires a signed update manifest. A downloaded update must match the manifest's size and SHA-256 digest and carry a valid Ed25519 signature from the Chudware release key before the app stages it for installation. An updater does not make unpublished installers available.</p>
+        <p>Use a source build you trust or an official installer after publication; do not treat a runtime-only prerelease as the desktop app.</p>
       </div>
     </div>
   </section>
@@ -107,23 +103,23 @@ const LATEST = `${REPO}/releases/latest`;
     <div class="wrap split">
       <header class="section-heading">
         <p class="eyebrow">Build from source</p>
-        <h2 id="dl-source-title">Or build it yourself.</h2>
-        <p class="lede">Chudware is open source under the MIT License. The repository README covers the toolchain, dependencies, and build commands for each platform.</p>
+        <h2 id="dl-source-title">Free software, built on your own machine.</h2>
+        <p class="lede">Chudware's MIT License permits use, modification, and redistribution; third-party components retain their own terms. The public repository README documents native build prerequisites and commands. Supported desktop SDK and native runtime dependencies are pinned release assets in this same repository, not a private companion repository.</p>
       </header>
       <div class="note-panel">
         <p class="eyebrow">Source code</p>
-        <p>The C++ application, the Python engine services, the packaging scripts, and the release workflows are all in one public repository.</p>
-        <a class="text-link" href={`${REPO}#building-from-source`}>Building from source <Icon name="arrow-right" /></a>
+        <p>The geometry engine and UI are C++; Python provides gateway, worker, and tool services. A static WebAssembly client alone is not a complete CAD deployment: browser CAD uses the native engine on your server.</p>
+        <a class="text-link" href={`${REPO}#building-from-source`}>Native build instructions <Icon name="arrow-right" /></a>
       </div>
     </div>
   </section>
 
   <section class="section cta-band">
     <div class="wrap section-heading">
-      <p class="eyebrow">Get started</p>
-      <h2>Install it, then build your first part.</h2>
-      <p class="lede">The install guides walk through each platform; the first-part guide takes it from there.</p>
-      <div class="actions"><a class="button" href={LATEST}>Download from GitHub</a><a class="button button-secondary" href="/docs/">Read the install guides</a></div>
+      <p class="eyebrow">Optional project support</p>
+      <h2>Prefer someone else to operate the server?</h2>
+      <p class="lede">Ask about paid, owner-operated hosting to support development. Availability, operating terms, and data handling are discussed directly; there is no online checkout or signup. Hosting is optional, not a requirement or a software license fee.</p>
+      <div class="actions"><a class="button" href="/contact/">Ask about hosting</a><a class="button button-secondary" href="/docs/self-hosting/">Run it yourself</a></div>
     </div>
   </section>
 </BaseLayout>

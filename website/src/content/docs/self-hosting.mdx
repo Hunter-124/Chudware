@@ -1,0 +1,59 @@
+---
+title: Self-host in your browser
+description: Build an experimental single-operator Chudware browser deployment from a source checkout with Docker Compose.
+section: Installation
+order: 5
+---
+## Choose your deployment
+
+Desktop use, source builds, and browser self-hosting have no Chudware software fee or license key. Your infrastructure costs are your own. Optional paid, owner-operated hosting supports development; [contact the project](/contact/) to discuss availability and terms. Hosting is not required to use the MIT-licensed software.
+
+**The MIT source repository is public; public desktop installers are not yet available.** Build this browser deployment from a source checkout using the commands below. No public container image is promised.
+
+## Prerequisites
+
+- A **Linux x86-64** host with Docker Engine and Docker Compose **2.24.4 or newer**, and enough disk and memory to compile the native engine and WebAssembly client. The first build downloads toolchains and dependencies and can take a while.
+- A kernel and container runtime that permit the nested unprivileged user namespaces required by **bubblewrap**. Rootless runtimes need working nested namespace support too. Docker Desktop and other host architectures are not the documented baseline.
+- A current browser with JavaScript, WebAssembly, and hardware-accelerated WebGL2. This documentation works without JavaScript, but the CAD application does not.
+- A trusted source checkout. The build includes the native C++ CAD engine and non-AI Python services; static WebAssembly assets alone are not a complete server.
+
+## Build and start
+
+Clone the public repository, then build from its root:
+
+```sh
+git clone https://github.com/Hunter-124/Chudware.git
+cd Chudware
+docker compose -f web/compose.yaml up --build -d --wait
+```
+
+Open [http://127.0.0.1:8300/app/](http://127.0.0.1:8300/app/) in a browser **on that host**. The default port binding is loopback-only; it is not a public hosted service. No `.env` file or provider token is needed for this local deployment.
+
+To inspect startup messages or stop the service without deleting its volumes:
+
+```sh
+docker compose -f web/compose.yaml logs --tail=100 chudware
+docker compose -f web/compose.yaml down
+```
+
+Startup refuses to run without the required worker sandbox. If namespace or bubblewrap setup fails, use a compatible host configuration rather than disabling isolation. An HTTP liveness response is not proof that a CAD operation has succeeded; create and save a representative part before relying on the deployment.
+
+## Keep your work
+
+Compose persists three named volumes, with names prefixed by its project name:
+
+- `data` at `/data`: private operator metadata and home data.
+- `work` at `/work`: saved workspace files, including hidden recent-item and conversation metadata.
+- `state` at `/state`: engine state, cached geometry, published meshes, and logs.
+
+Back up all three together while the service is stopped, and retain exports of important designs. Do not use `docker compose down -v` unless you intend to erase the stored data. Changing the Compose project name selects different volume names, so keep it stable when restarting or upgrading. Browser data lives on the server, not only on your workstation; read [privacy](/legal/privacy/) before using sensitive data.
+
+## Security and current limits
+
+This is an **experimental, single-trusted-operator** deployment, not a public multi-user CAD service. Worker isolation and egress restrictions do not establish a hostile multi-tenant boundary, and portable per-user hard disk quotas are not supplied.
+
+The Compose configuration relaxes the outer container's seccomp/AppArmor profiles and system-path masks so nested bubblewrap can create namespaces and mount its isolated filesystem and `/proc`. It still uses a non-root user, drops capabilities, prevents privilege escalation, and makes the container root filesystem read-only. These are real reductions in outer-container protection, not hardened multi-tenant isolation. Do not replace a sandbox failure with an unsandboxed worker or mount a host container-daemon socket.
+
+**Do not expose port 8300 directly to the internet.** For remote use, follow the authenticated HTTPS override and domain setup in your checkout's [`web/README.md`](https://github.com/Hunter-124/Chudware/blob/master/web/README.md). The operator must supply authentication and TLS, protect persistent data, and manage backups. Hosting operators and their infrastructure providers can access server-side project data.
+
+**Online Copilot is not available in this browser deployment.** Provider credentials or a hosting arrangement do not enable it. The browser container runs native CAD and non-AI Python tools without the separate desktop agent runtime or SDK; do not supply desktop provider credentials to it. Desktop AI remains optional and uses your own supported provider account or API key under that provider's charges and terms; see [AI setup and limits](/docs/ai-copilot/).

@@ -172,7 +172,7 @@ def _mesh_location(principal, path):
     if not isinstance(path, str):
         return None, ""
     if re.fullmatch(r"/state/mesh/[0-9a-f]{32}\.aicm", path):
-        return settings.cells_root / principal.cell_id / "state" / "mesh", Path(path).name
+        return cells.state_root(principal) / "mesh", Path(path).name
     relative = path[len("/work/"):] if path.startswith("/work/") else path
     if relative.startswith("/") or "\\" in relative or any(p in {"", ".", ".."} for p in relative.split("/")):
         return None, ""

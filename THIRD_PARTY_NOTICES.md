@@ -177,6 +177,7 @@ and mapanything packages, and the openEMS/CSXCAD modules) are listed with their 
 | Fedora container OS packages | Fedora 44; installed versions in the image RPM inventory | per-package licenses, including LGPL libraries and GPL OS tools | build/runtime environment for `web/deploy/container/Dockerfile`; package metadata and `/usr/share/licenses` retain upstream notices; image redistribution must meet the packages' own source/license obligations | https://packages.fedoraproject.org/ |
 | bubblewrap | Fedora package version in the image | LGPL-2.0-or-later | separate OS executable for actor/worker isolation, installed in the browser container; never linked or imported into Chudware; user-installed for the advanced systemd path | https://github.com/containers/bubblewrap ; https://github.com/containers/bubblewrap/blob/main/COPYING |
 | Caddy | 2.10.2 (`caddy:2.10.2-alpine`) | Apache-2.0; Alpine OS packages retain their own licenses | optional separate upstream TLS/authentication proxy image selected by `web/compose.https.yaml`; not part of the Chudware or desktop process | https://github.com/caddyserver/caddy ; https://github.com/caddyserver/caddy-docker |
+| AppArmor parser | host-installed 4.x | GPL-2.0-only; host dependencies retain their own licenses | optional host-side subprocess loading the named container profile on Ubuntu 24.04+ and other namespace-restricting AppArmor hosts; not linked, imported or bundled in the Chudware image | https://gitlab.com/apparmor/apparmor |
 
 ## 5. Fonts and data
 

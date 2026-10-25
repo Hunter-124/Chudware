@@ -110,6 +110,35 @@ Payment covers operation, convenience and support for the open-source project; i
 never unlocks native or self-hosted software. No checkout, price, automatic provisioning
 or current hosting availability is implied.
 
+## Ubuntu 24.04+ AppArmor setup
+
+Ubuntu's [unprivileged user-namespace policy](https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions)
+can let bubblewrap create a namespace but deny its loopback setup with
+`bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`. Merely selecting
+`apparmor=unconfined` does not grant the required namespace capabilities.
+
+On an AppArmor 4 host with this restriction, review and install the supplied
+**container-specific** profile before starting Compose:
+
+```sh
+sudo install -m 0644 web/deploy/container/chudware-selfhost.apparmor /etc/apparmor.d/chudware-selfhost
+sudo apparmor_parser --replace /etc/apparmor.d/chudware-selfhost
+export CHUDWARE_APPARMOR_PROFILE=chudware-selfhost
+```
+
+Keep that variable set for subsequent Compose commands, or put
+`CHUDWARE_APPARMOR_PROFILE=chudware-selfhost` in your external Compose environment
+file and consistently use `--env-file`. If you maintain your own profile, add its
+required namespace permission rather than overwriting it. Hosts without AppArmor
+do not need this step and retain the default `unconfined` selection.
+
+The profile uses AppArmor's unconfined mode plus `userns` for this named container
+only; it is not a claim of additional outer MAC hardening. It leaves Ubuntu's
+system-wide restriction enabled. The container remains non-root with all Docker
+capabilities dropped, and workers retain their private user/PID/network/mount
+namespaces and egress broker. Do not disable AppArmor globally, add capabilities,
+share the host network, or bypass the actor sandbox to fix this error.
+
 ## Persistence and saving
 
 Compose creates three named volumes (their actual names have the Compose project prefix):

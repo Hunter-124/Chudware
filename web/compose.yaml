@@ -21,7 +21,8 @@ services:
       # Keep its user/PID/network/mount isolation; relax only this outer container.
       # Never replace a failed probe with privileged, SYS_ADMIN or a host worker.
       - seccomp:unconfined
-      - apparmor=unconfined
+      # Ubuntu 24.04+ needs the named profile from the host-setup section.
+      - apparmor=${CHUDWARE_APPARMOR_PROFILE:-unconfined}
       - systempaths=unconfined
     cpus: ${CHUDWARE_CPUS:-4}
     mem_limit: ${CHUDWARE_MEMORY:-8g}

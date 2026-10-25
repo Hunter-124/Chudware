@@ -31,6 +31,7 @@ jobs:
     env:
       COMPOSE_PROJECT_NAME: chudware-ci-${{ github.run_id }}-${{ github.run_attempt }}
       CHUDWARE_IMAGE: chudware-selfhost:${{ github.sha }}
+      CHUDWARE_APPARMOR_PROFILE: chudware-selfhost
     steps:
       - name: Check out this source tree without retained credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -45,6 +46,11 @@ jobs:
 
       - name: Free unused runner SDK space
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+
+      - name: Permit nested namespaces only for the Chudware container
+        run: |
+          sudo apparmor_parser --replace web/deploy/container/chudware-selfhost.apparmor
+          sysctl kernel.apparmor_restrict_unprivileged_userns
 
       - name: Install operational smoke client
         run: python -m pip install --disable-pip-version-check httpx==0.28.1 websockets==16.1

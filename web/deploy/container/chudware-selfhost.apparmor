@@ -1,0 +1,9 @@
+# Load on AppArmor 4 hosts, then select CHUDWARE_APPARMOR_PROFILE=chudware-selfhost.
+# This names the existing unconfined outer-container policy and grants nested
+# user namespaces without disabling the host's restriction for other programs.
+# Docker capability drops and the inner bubblewrap sandbox still apply.
+abi <abi/4.0>,
+
+profile chudware-selfhost flags=(unconfined) {
+  userns,
+}

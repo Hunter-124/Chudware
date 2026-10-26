@@ -116,13 +116,13 @@ endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PinnedGitSource.cmake")
 
 # --- Eigen (header-only linear algebra; replaces numpy/scipy.linalg) ---------
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
-set(EIGEN_BUILD_PKGCONFIG OFF CACHE BOOL "" FORCE)
 # Primary tag identity: https://gitlab.com/api/v4/projects/libeigen%2Feigen/repository/tags/3.4.0
 chudware_populate_pinned_git(eigen https://gitlab.com/libeigen/eigen.git
   3147391d946bb4b6c68edd901f2add6ac1f31f8c)
-add_subdirectory("${eigen_SOURCE_DIR}" "${eigen_BINARY_DIR}" EXCLUDE_FROM_ALL)
+# Consume only the headers; upstream also configures unused BLAS/LAPACK and Fortran.
+add_library(eigen INTERFACE)
+target_include_directories(eigen INTERFACE "${eigen_SOURCE_DIR}")
+add_library(Eigen3::Eigen ALIAS eigen)
 
 # --- nlohmann/json (fixture / sketch dict parsing; same lib the host uses) ----
 set(JSON_BuildTests OFF CACHE INTERNAL "")

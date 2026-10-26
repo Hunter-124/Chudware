@@ -30,8 +30,10 @@ mounts: firmware storage validates ownership and permissions of every ancestor.
 Git trusts only the exact checkout through the disposable container's system
 configuration, established before version metadata is generated. That trust
 survives pytest's deliberate `HOME` isolation; checkout's temporary global
-configuration does not. The Fedora `gate` profile also installs the RPM and
-Debian inspection tools exercised by the packaging suite.
+configuration does not. All Fedora profiles install the OpenSSL command-line
+tool required by the updater HTTPS regression fixture; its libraries alone
+are insufficient. The `gate` profile also installs the RPM and Debian inspection
+tools exercised by the packaging suite.
 
 ## Secrets and variables
 
@@ -113,6 +115,11 @@ ctest --test-dir build/linux-core/core --output-on-failure
 On Windows, run the same commands with `windows-occt` from a Visual Studio x64
 developer prompt after `scripts\setup_windows_links.ps1`; on Apple silicon,
 `brew install ninja opencascade` and use `macos-arm64`.
+
+Eigen is consumed as pinned headers through `Eigen3::Eigen`, without configuring
+its unused BLAS/LAPACK implementations. This avoids probing an unrelated MinGW
+Fortran compiler in an MSVC build and does not change the application's system
+BLAS/CHOLMOD acceleration.
 
 ### Complete self-host image
 

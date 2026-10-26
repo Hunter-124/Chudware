@@ -9,6 +9,7 @@ import os
 import secrets
 import socket
 import stat
+import tempfile
 import threading
 import time
 from collections import deque
@@ -54,6 +55,7 @@ class ControlServer:
         self._token = secrets.token_hex(32)
         self._socket: socket.socket | None = None
         self._socket_path: Path | None = None
+        self._temporary_socket_dir: Path | None = None
         self._pipes: list = []
         self._socket_inode: int | None = None
         self._endpoint = ""
@@ -99,11 +101,20 @@ class ControlServer:
             self._runtime_dir.mkdir(parents=True, exist_ok=True)
             ppid = os.getppid()
             path = self._runtime_dir / f"chudcode-worker-{ppid}-{os.getpid()}.sock"
-            self._remove_stale_siblings(ppid, path)
-            self._remove_stale_socket(path)
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
+                # Match the native client's portable sockaddr_un limit, in bytes.
+                # TMPDIR itself may be too long; use a private short directory.
+                if len(os.fsencode(path)) > 103:
+                    self._temporary_socket_dir = Path(
+                        tempfile.mkdtemp(prefix="cwctl-", dir="/tmp")
+                    )
+                    path = self._temporary_socket_dir / path.name
+                self._remove_stale_siblings(ppid, path)
+                self._remove_stale_socket(path)
                 listener.bind(str(path))
+                self._socket_path = path
+                self._socket_inode = path.stat().st_ino
                 os.chmod(path, 0o600)
                 listener.listen(self._max_connections)
                 mode = stat.S_IMODE(path.stat().st_mode)
@@ -111,13 +122,8 @@ class ControlServer:
                     raise PermissionError("control socket permissions are not private")
             except Exception:
                 listener.close()
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                self._unlink_owned_socket()
                 raise
-            self._socket_path = path
-            self._socket_inode = path.stat().st_ino
             self._transport = "unix"
             self._endpoint = str(path)
         listener.settimeout(0.2)
@@ -193,9 +199,8 @@ class ControlServer:
                 pass
 
     def _remove_stale_siblings(self, ppid: int, own_path: Path) -> None:
-        assert self._runtime_dir is not None
         prefix = f"chudcode-worker-{ppid}-"
-        for path in self._runtime_dir.glob(f"{prefix}*.sock"):
+        for path in own_path.parent.glob(f"{prefix}*.sock"):
             if path == own_path:
                 continue
             try:
@@ -223,17 +228,27 @@ class ControlServer:
         inode = self._socket_inode
         self._socket_path = None
         self._socket_inode = None
-        if path is None or inode is None:
-            return
-        try:
-            if path.lstat().st_ino == inode:
-                path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            log.warning(
-                "failed to remove worker control socket: %s", type(exc).__name__
-            )
+        if path is not None and inode is not None:
+            try:
+                if path.lstat().st_ino == inode:
+                    path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.warning(
+                    "failed to remove worker control socket: %s", type(exc).__name__
+                )
+        directory = self._temporary_socket_dir
+        self._temporary_socket_dir = None
+        if directory is not None:
+            try:
+                directory.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.warning(
+                    "failed to remove worker control directory: %s", type(exc).__name__
+                )
 
     def _accept_loop(self) -> None:
         while not self._stop.is_set():

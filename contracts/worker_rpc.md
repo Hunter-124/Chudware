@@ -2634,3 +2634,17 @@ one-second total cleanup wait budget. Incomplete/unauthenticated clients are int
 immediately; remaining transports (including nonreading peers) are interrupted when
 the grace expires. Named-pipe replies retain their bounded client-disconnect drain so
 shutdown does not discard an admitted reply before the client reads it.
+
+## Long POSIX control paths (append-only, 2026-10-26)
+
+The Unix control endpoint is at most 103 encoded bytes, matching the native
+client and the smallest supported `sockaddr_un::sun_path`. When the configured
+runtime directory would exceed that limit, the worker allocates a unique
+mode-0700 directory directly under `/tmp`, independent of `TMPDIR`. Its socket
+keeps the `chudcode-worker-<ppid>-<pid>.sock` name, mode 0600 and existing
+token authentication; the endpoint returned by `worker_control_info` remains
+authoritative. Windows named-pipe behavior is unchanged.
+
+Socket setup failure and normal shutdown remove only the owned socket inode and
+then the empty temporary directory, never recursively deleting other contents.
+The configured runtime directory and persistent application data are retained.

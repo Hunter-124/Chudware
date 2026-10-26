@@ -91,6 +91,40 @@ def test_posix_endpoint_is_private_and_authenticated(runtime_dir: Path) -> None:
     assert not endpoint.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX Unix socket path limits")
+def test_long_runtime_keeps_private_authenticated_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="cwctl-test-", dir="/tmp") as root:
+        name = f"chudcode-worker-{os.getppid()}-{os.getpid()}.sock"
+        # Characters fit sun_path, but the encoded path does not.
+        component = "é" * (102 - len(os.fsencode(Path(root) / name)))
+        runtime = Path(root) / component
+        assert len(str(runtime / name)) == 103
+        assert len(os.fsencode(runtime / name)) > 103
+        monkeypatch.setattr(tempfile, "tempdir", str(runtime))
+        server = ControlServer(
+            lambda _action, _params: {"state": "idle"}, runtime
+        ).start()
+        try:
+            info = server.info()
+            endpoint = Path(info["endpoint"])
+            assert len(os.fsencode(endpoint)) <= 103
+            assert stat.S_IMODE(endpoint.parent.stat().st_mode) == 0o700
+            assert endpoint.parent.stat().st_uid == os.geteuid()
+            assert stat.S_IMODE(endpoint.stat().st_mode) == 0o600
+            denied, _ = _request(info, {"token": "wrong", "action": "status"})
+            assert denied["error"]["code"] == "unauthorized"
+            accepted, _ = _request(
+                info, {"token": info["token"], "action": "status", "params": {}}
+            )
+            assert accepted == {"ok": True, "result": {"state": "idle"}}
+        finally:
+            server.stop()
+        assert not endpoint.parent.exists()
+        assert runtime.is_dir()
+
+
 def test_release_action_dispatches_to_the_session_host(runtime_dir, monkeypatch):
     from services.agent import worker_rpc
     from services.agent.chudcode_host import ChudcodeSessionHost

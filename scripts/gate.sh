@@ -312,7 +312,7 @@ stage_ctest() {
         return 0
     fi
     local passed
-    passed="$(rg -o '[0-9]+% tests passed' ${GATE_TMP}/ctest.out | head -1 || true)"
+    passed="$(grep -m 1 -oE '[0-9]+% tests passed' "${GATE_TMP}/ctest.out" || true)"
     record "ctest               PASS    ${passed:-all tests passed}"
     echo "  PASS (${passed:-ok})"
 }

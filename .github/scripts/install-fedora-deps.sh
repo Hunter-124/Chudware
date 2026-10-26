@@ -23,7 +23,7 @@ packages=(
     libxkbcommon-devel wayland-devel wayland-protocols-devel mesa-libGL-devel mesa-libEGL-devel
     libappindicator-gtk3-devel
     # Archive and inspection tools used by fetch scripts and tests
-    tar xz bzip2 zstd zip unzip curl file which findutils hostname procps-ng
+    tar xz bzip2 zstd zip unzip curl file which findutils hostname procps-ng openssl
 )
 
 cef_runtime=(

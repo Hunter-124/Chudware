@@ -121,6 +121,10 @@ On Windows, run the same commands with `windows-occt` from a Visual Studio x64
 developer prompt after `scripts\setup_windows_links.ps1`; on Apple silicon,
 `brew install ninja opencascade` and use `macos-arm64`.
 
+The Windows job allows six hours for the full Release/LTO build, core tests and
+host GUI tests. The former four-hour limit canceled a progressing linker before
+tests began; production optimization and test coverage remain enabled.
+
 Eigen is consumed as pinned headers through `Eigen3::Eigen`, without configuring
 its unused BLAS/LAPACK implementations. This avoids probing an unrelated MinGW
 Fortran compiler in an MSVC build and does not change the application's system

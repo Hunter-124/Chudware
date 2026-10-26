@@ -76,7 +76,8 @@ jobs:
   windows:
     name: Windows x86_64
     runs-on: windows-2025
-    timeout-minutes: 240
+    # Full MSVC Release/LTO links can exceed four hours on hosted runners.
+    timeout-minutes: 360
     defaults:
       run:
         shell: pwsh

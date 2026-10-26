@@ -115,7 +115,7 @@ PYTHON=python3.13 scripts/provision_venv.sh pytest
 
 `scripts/provision_venv.sh` creates `.venv-mcp`, installs `requirements.txt` from PyPI
 plus the SHA-256-pinned `chudcode-rpc` source archive from this repository's
-[`chudcode-runtime-v0.4.3` release](https://github.com/Hunter-124/Chudware/releases/tag/chudcode-runtime-v0.4.3),
+[`chudcode-runtime-v0.4.4` release](https://github.com/Hunter-124/Chudware/releases/tag/chudcode-runtime-v0.4.4),
 and runs the runtime dependency audit. Native runtime binaries use the pinned assets
 recorded in `vendor/chudcode/CHUDCODE_ARTIFACT.lock`; `macos-arm64` remains unpinned.
 `python3.13 -m venv .venv-mcp && .venv-mcp/bin/python -m pip install -r requirements.txt`

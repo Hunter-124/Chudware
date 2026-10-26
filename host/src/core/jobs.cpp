@@ -79,21 +79,6 @@ bool mintCellAgentHandles(WorkerClient& worker, const std::shared_ptr<JobState>&
     return true;
 }
 
-bool explicitOffline(const nlohmann::json& extra, const nlohmann::json& options) {
-    auto enabled = [](const nlohmann::json& value, const char* key) {
-        return value.is_object() && value.contains(key) && value[key].is_boolean() &&
-               value[key].get<bool>();
-    };
-    if (enabled(extra, "offline") || enabled(extra, "offline_mode") ||
-        enabled(options, "offline") || enabled(options, "offline_mode"))
-        return true;
-    const auto modeIsOffline = [](const nlohmann::json& value) {
-        return value.is_object() && value.contains("mode") && value["mode"].is_string() &&
-               value["mode"].get<std::string>() == "offline";
-    };
-    return modeIsOffline(extra) || modeIsOffline(options);
-}
-
 std::string nextAgentRunId() {
     static std::atomic<unsigned long long> sequence{0};
     const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -127,6 +112,21 @@ std::string transportStopReason(const std::string& err) {
 }
 
 }  // namespace
+bool agentJobExplicitOffline(const nlohmann::json& extra, const nlohmann::json& options) {
+    auto enabled = [](const nlohmann::json& value, const char* key) {
+        return value.is_object() && value.contains(key) && value[key].is_boolean() &&
+               value[key].get<bool>();
+    };
+    if (enabled(extra, "offline") || enabled(extra, "offline_mode") ||
+        enabled(options, "offline") || enabled(options, "offline_mode"))
+        return true;
+    const auto modeIsOffline = [](const nlohmann::json& value) {
+        return value.is_object() && value.contains("mode") && value["mode"].is_string() &&
+               value["mode"].get<std::string>() == "offline";
+    };
+    return modeIsOffline(extra) || modeIsOffline(options);
+}
+
 std::string cellAgentSessionHandle(const std::string& convId) {
     std::lock_guard<std::mutex> lock(cellHandlesMutex);
     const auto it = cellSessions.find(convId);
@@ -202,7 +202,7 @@ AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::st
 
     AgentJobRpcRoute route;
     route.cell = cell;
-    route.online = !explicitOffline(extra, options);
+    route.online = !agentJobExplicitOffline(extra, options);
     route.method = route.online ? "agent_admin_turn"
                                 : (mission ? "agent_mission_v1" : "agent_run_v2");
     route.params = {{"request", request}, {"doc_id", docId}, {"options", options}};
@@ -433,6 +433,9 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
         job->converged = true; job->stopReason.clear(); job->errorDetail.clear();
         job->errorHuman.clear();
         job->isMission = false; job->missionVerdict.clear();
+        job->isCompaction = extra.is_object() && extra.contains("compact") &&
+                            extra["compact"].is_object();
+        job->compactionTurn = nullptr;
         job->generalLane = false; job->agentSummary.clear();
         job->missionPartial = false;
         job->missionTasksCompleted = 0;
@@ -508,6 +511,21 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
             if (job->errorDetail.empty()) job->errorDetail = err;
             if (orphanCancelled)
                 job->errorDetail += " (orphaned run auto-cancelled after transport loss)";
+        } else if (job->isCompaction) {
+            // Maintenance has no answer prose, plan gate, or geometry result to interpret.
+            if (result.contains("turn") && result["turn"].is_object())
+                job->compactionTurn = std::move(result["turn"]);
+            job->converged = jstr(result, "status") == "done";
+            job->stopReason = jstr(result, "stop_reason");
+            if (!job->converged && job->stopReason != "cancelled") {
+                job->errorDetail = jstr(result, "error_detail");
+                if (job->errorDetail.empty()) job->errorDetail = jstr(result, "error");
+                if (job->errorDetail.empty()) job->errorDetail = jstr(result, "reason");
+                if (job->errorDetail.empty())
+                    job->errorDetail = job->stopReason.empty()
+                                           ? "Compaction failed" : job->stopReason;
+                job->error = job->errorDetail;
+            }
         } else {
             // Online agent_admin_turn results are normalized above to the legacy JobState shape;
             // explicit offline core results already use it. Both may return {ok:false,error}.
@@ -657,6 +675,7 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
         job->errorHuman.clear();
         job->createdDocPath.clear();
         job->isMission = true; job->missionVerdict.clear();
+        job->isCompaction = false; job->compactionTurn = nullptr;
         job->generalLane = false; job->agentSummary.clear();
         job->missionPartial = false;
         job->missionTasksCompleted = 0;

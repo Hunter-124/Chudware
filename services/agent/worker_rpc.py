@@ -348,49 +348,63 @@ def _cell_refusal(value: Any) -> dict[str, Any] | None:
     return None
 
 
-def _online_manual_compaction_refusal(requested: str | None, configured: str) -> str | None:
-    """Why an online manual compaction cannot honour the requested strategy, if it can't.
+# Chudware Compaction strategy → Chudcode `/compact <mode>` for a manual compaction.
+# "auto" runs the session's own configured method order (no mode).
+_MANUAL_COMPACT_MODES = {"summary": "soft", "snapcompact": "snapcompact", "auto": None}
 
-    Chudcode's ``compact`` command has no per-call method: it runs the session process's
-    configured ``compaction.methodOrder``, which is the persisted Compaction setting
-    (``agent.compaction_strategy``), and its manual pass never runs ``shake``.
+
+def _online_manual_compaction(
+    requested: str | None, configured: str
+) -> tuple[str, str | None] | str:
+    """``(strategy, chudcode_mode)`` for one online manual compaction, or a refusal.
+
+    No argument runs the persisted Compaction setting; an explicit ``summary`` or
+    ``snapcompact`` runs that one method for this compaction only. Chudcode's manual
+    pass never runs ``shake``, and ``off`` has no method to run: both are refused
+    rather than compacting with a method the user did not choose.
     """
-    if requested is not None and requested != configured:
+    strategy = requested or configured
+    if strategy == "shake":
         return (
-            f"compaction_strategy_mismatch: this session compacts with the "
-            f"'{configured}' Compaction setting; set Compaction to '{requested}' in "
-            "Settings → AI to compact with it (applies from the next turn)"
+            "manual_shake_unavailable: Shake runs only as automatic compaction; "
+            "use /compact summary or /compact snapcompact"
         )
-    if configured == "shake":
+    if strategy == "off":
         return (
-            "manual_shake_unavailable: the agent service runs Shake only as automatic "
-            "compaction; a manual compaction needs Summary or Snapcompact"
+            "compaction_off: Compaction is Off in Settings → AI; "
+            "use /compact summary or /compact snapcompact"
         )
-    if configured == "off":
-        return "compaction_off: Compaction is Off in Settings → AI"
-    return None
+    if requested == "auto" or strategy not in _MANUAL_COMPACT_MODES:
+        return f"invalid_compaction_strategy: {requested!r}"
+    return strategy, _MANUAL_COMPACT_MODES[strategy]
 
 
 def _session_compact(params: dict, _emit: Callable) -> dict:
-    """Route live compaction to Chudcode; local rewriting is explicit offline only.
+    """Local transcript compaction for explicit offline/standalone use only.
 
-    Without an explicit ``strategy`` the persisted Compaction setting applies. Online,
-    the result reports ``strategy`` (the setting the session ran with) and ``method``
-    only when the agent service reported the method it actually used.
+    Online conversations compact through ``agent_admin_turn`` with ``compact`` — a
+    cancellable run on the conversation's own Chudcode session.
     """
     try:
         p = params or {}
         messages = _as_list(p.get("messages"))
+        commands = _cmds()
+        explicit_local = bool(p.get("standalone") or p.get("offline"))
+        if (
+            not explicit_local
+            and not getattr(commands, "_offline_enabled", lambda: False)()
+        ):
+            return {
+                "ok": False,
+                "reason": "session_compact is unavailable for online agent sessions",
+                "owner": "chudcode",
+                "hint": "online sessions compact through agent_admin_turn with compact",
+            }
         from services.agent import config as agent_config
 
         try:
-            configured_strategy, compaction_settings = (
-                agent_config.online_compaction_settings()
-            )
+            configured_strategy = agent_config.get_compaction_strategy()
         except ValueError as exc:
-            refusal = _cell_refusal(exc)
-            if refusal is not None:
-                return refusal
             return {"ok": False, "reason": f"invalid_compaction_strategy: {exc}", "hint": ""}
         raw_requested = p.get("strategy")
         requested_strategy = (
@@ -406,66 +420,26 @@ def _session_compact(params: dict, _emit: Callable) -> dict:
         prior = p.get("prior_archive")
         if prior is not None and not isinstance(prior, dict):
             prior = None
-        commands = _cmds()
-        explicit_local = bool(p.get("standalone") or p.get("offline"))
-        configured_offline = bool(
-            getattr(commands, "_offline_enabled", lambda: False)()
+        result = commands.compact_session(
+            messages,
+            requested_strategy or configured_strategy,
+            keep_recent_tokens=keep_i,
+            supersede_reads=bool(p.get("supersede_reads", True)),
+            drop_useless=bool(p.get("drop_useless", True)),
+            prior_archive=prior,
+            standalone=explicit_local,
         )
-        local = explicit_local or configured_offline
-        if local:
-            strategy = requested_strategy or configured_strategy
-        else:
-            refusal = _online_manual_compaction_refusal(
-                requested_strategy, configured_strategy
-            )
-            if refusal:
-                return {"ok": False, "reason": refusal, "hint": ""}
-            strategy = "chudcode"
-        compact_kwargs: dict[str, Any] = {
-            "keep_recent_tokens": keep_i,
-            "supersede_reads": bool(p.get("supersede_reads", True)),
-            "drop_useless": bool(p.get("drop_useless", True)),
-            "prior_archive": prior,
-            "session_id": str(p.get("session_id") or "") or None,
-            "instructions": p.get("instructions"),
-            "standalone": explicit_local,
-        }
-        if not local:
-            compact_kwargs["compaction_settings"] = compaction_settings
-        result = commands.compact_session(messages, strategy, **compact_kwargs)
         out = {
             "ok": True,
             "summary": result.get("summary") or "",
-            "short_summary": result.get("short_summary")
-            or result.get("shortSummary")
-            or "",
+            "short_summary": result.get("short_summary") or "",
+            "kept_messages": result.get("kept_messages") or [],
         }
-        if not local:
-            out["strategy"] = configured_strategy
-            # The method the agent service recorded on the compaction entry; never
-            # derived from the request or the setting.
-            method = result.get("method")
-            if isinstance(method, str) and method:
-                out["method"] = method
-        passthrough_keys = (
-            "archive",
-            "cut_index",
-            "saved_tokens",
-            "firstKeptEntryId",
-            "tokensBefore",
-        )
-        if local:
-            out["kept_messages"] = result.get("kept_messages") or []
-            if "messages" in result:
-                out["messages"] = result["messages"]
-        for key in passthrough_keys:
+        for key in ("messages", "archive", "cut_index", "saved_tokens"):
             if key in result:
                 out[key] = result[key]
         return out
     except Exception as exc:  # noqa: BLE001
-        refusal = _cell_refusal(exc)
-        if refusal is not None:
-            return refusal
         return {"ok": False, "reason": f"session_compact failed: {exc}", "hint": ""}
 
 
@@ -1806,8 +1780,17 @@ def _remember_session_tool_loads(session_id: str, categories: Any) -> None:
 
 def chudcode_agent_turn(params: dict, emit: Callable) -> dict:
     """Run one online turn through the authoritative persistent Chudcode host."""
+    return _session_host_run("run_turn", params, emit)
+
+
+def chudcode_compaction(params: dict, emit: Callable) -> dict:
+    """Run one manual compaction through the authoritative persistent Chudcode host."""
+    return _session_host_run("run_compaction", params, emit)
+
+
+def _session_host_run(method: str, params: dict, emit: Callable) -> dict:
     try:
-        result = get_default_chudcode_host().run_turn(params, emit)
+        result = getattr(get_default_chudcode_host(), method)(params, emit)
         if not isinstance(result, dict):
             return {
                 "ok": False,
@@ -3414,6 +3397,137 @@ def _terminal_text(host_result: Mapping[str, Any]) -> str:
     return ""
 
 
+def _session_launch_params(
+    raw_params: Mapping[str, Any],
+    *,
+    run_id: str,
+    session_id: str,
+    options: Mapping[str, Any],
+    system_prompt: Any,
+    settings: dict[str, Any],
+    project_root: str | None,
+    byok_key: str | None,
+    provider_name: str | None,
+) -> dict[str, Any]:
+    """Host params naming the conversation's Chudcode session process.
+
+    A turn and a manual compaction share them, so whichever of the two starts or
+    resumes the session gives the process the identity the next turn expects.
+    """
+    params: dict[str, Any] = {
+        "run_id": run_id,
+        "session_id": session_id,
+        "mode": options["mode"],
+        "plan_only": options.get("plan_only"),
+        "system_prompt": system_prompt,
+        "settings": settings,
+    }
+    if byok_key is not None:
+        params.update(byok_key=byok_key, byok_provider=provider_name, byok_tenant="desktop")
+    if project_root:
+        params["workspace_dir"] = project_root
+    try:
+        from services.agent.config import memory_backend
+
+        params["memory_backend"] = memory_backend()
+    except (ImportError, OSError, ValueError) as exc:
+        _LOG.debug("memory backend setting unavailable; using the default: %s", exc)
+    for key, source in (
+        ("chudcode_session_dir", ("chudcode_session_dir", "sessions_dir")),
+        ("chudcode_session_file", ("chudcode_session_file",)),
+    ):
+        value = next((
+            raw_params[name].strip() for name in source
+            if isinstance(raw_params.get(name), str) and raw_params[name].strip()
+        ), None)
+        if value:
+            params[key] = value
+    return params
+
+
+def _rpc_event_emitter(event_context: Mapping[str, Any], emit: Callable) -> Callable[[Any], None]:
+    """Map raw Chudcode frames to Chudware agent events and forward them to ``emit``."""
+    from services.agent.chudcode_events import RpcFrameState, map_rpc_frame
+    from services.agent.providers import token_usage
+
+    state = RpcFrameState()
+
+    def raw_emit(frame: Any) -> None:
+        raw = frame if isinstance(frame, Mapping) else {"type": "unknown", "value": frame}
+        for kind, payload in map_rpc_frame(raw, event_context, state):
+            data = dict(payload) if isinstance(payload, Mapping) else {"payload": payload}
+            data["kind"] = kind
+            if kind == "agent.provider_usage":
+                token_usage.record_usage(
+                    provider=str(data.get("provider") or ""),
+                    model=str(data.get("model") or ""),
+                    prompt_tokens=data.get("prompt_tokens"),
+                    completion_tokens=data.get("completion_tokens"),
+                    total_tokens=data.get("total_tokens"),
+                    context_tokens=data.get("context_tokens"),
+                    source=str(data.get("source") or "api"),
+                )
+            emit(data)
+
+    return raw_emit
+
+
+def _admin_compaction(
+    compact: Any, launch_params: dict[str, Any], raw_emit: Callable[[Any], None]
+) -> dict:
+    """Manual ``/compact``: one cancellable compaction run on the conversation's session.
+
+    ``compact`` is ``{strategy?, instructions?}``. Without a strategy the persisted
+    Compaction setting applies; an explicit ``summary``/``snapcompact`` runs for this
+    compaction only. ``instructions`` focuses the summary. The reply is the turn shape
+    with ``turn.compaction`` instead of answer text.
+    """
+    if not isinstance(compact, Mapping) or set(compact) - {"strategy", "instructions"}:
+        return {"ok": False, "reason": "compact must be {strategy?, instructions?}"}
+    raw_strategy = compact.get("strategy")
+    instructions = compact.get("instructions")
+    if raw_strategy is not None and not isinstance(raw_strategy, str):
+        return {"ok": False, "reason": "compact strategy must be a string"}
+    if instructions is not None and not isinstance(instructions, str):
+        return {"ok": False, "reason": "compact instructions must be a string"}
+    requested = raw_strategy.strip().lower() if raw_strategy and raw_strategy.strip() else None
+    chosen = _online_manual_compaction(
+        requested, launch_params["settings"]["compaction_strategy"]
+    )
+    if isinstance(chosen, str):
+        return {"ok": False, "reason": chosen, "stop_reason": "compaction_refused"}
+    strategy, mode = chosen
+    focus = instructions.strip() if instructions else ""
+    host_result = chudcode_compaction(
+        {**launch_params, "compact": {"mode": mode, "instructions": focus or None}},
+        raw_emit,
+    )
+    if not host_result.get("ok"):
+        return {
+            "ok": False,
+            "reason": str(host_result.get("reason") or "Compaction failed"),
+            "stop_reason": str(host_result.get("stop_reason") or "compaction_failed"),
+        }
+    cancelled = bool(host_result.get("cancelled"))
+    compaction = dict(host_result.get("compaction") or {})
+    if not cancelled:
+        compaction["strategy"] = strategy
+    return {
+        "ok": True,
+        "turn": {
+            "success": not cancelled,
+            "stop_reason": "cancelled" if cancelled else "completed",
+            "result": "",
+            "run_id": host_result.get("run_id") or launch_params["run_id"],
+            "session_id": host_result.get("session_id") or launch_params["session_id"],
+            "chudcode_session_id": host_result.get("chudcode_session_id"),
+            "chudcode_session_file": host_result.get("chudcode_session_file"),
+            "cancelled": cancelled,
+            "compaction": compaction,
+        },
+    }
+
+
 def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     """Run the ordinary online lane exclusively through persistent Chudcode RPC."""
     from services.mcp.daemon_bridge import TurnConnections, turn_connection_scope
@@ -3528,18 +3642,8 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
     if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool):
         if math.isfinite(raw_timeout) and raw_timeout > 0:
             budget_s = float(raw_timeout)
-    # Rendered once: resolving picked context reads the engine. A persisted
-    # conversation's first turn in this process leads with the live document ids:
-    # its transcript's ids died with the old engine.
-    editor_block = "\n\n".join(block for block in (
-        _resumed_documents_block()
-        if resumed_session and not history_already_seeded else "",
-        _editor_context_block(raw_params),
-        turn_budget_notice(budget_s, readonly=readonly_turn),
-    ) if block)
 
     try:
-        from services.agent.chudcode_events import RpcFrameState, map_rpc_frame
         from services.agent.chudcode_tools import build_host_tools
         from services.agent.mission_dispatch import MissionDispatch, role_prompt
         from services.agent.providers import token_usage
@@ -3564,14 +3668,6 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
         )
 
     try:
-        mission_dispatch = MissionDispatch(
-            run_id=run_id,
-            provider=None,
-            on_event=None,
-            capability=turn_capability,
-            tier=turn_tier,
-            options=options or None,
-        )
         system_prompt, allowed_tools = role_prompt(
             role,
             card=card,
@@ -3589,6 +3685,46 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
         )
     except ValueError as exc:
         return refuse_before_run(f"invalid_compaction_strategy: {exc}")
+
+    launch_params = _session_launch_params(
+        raw_params, run_id=run_id, session_id=session_id, options=options,
+        system_prompt=system_prompt, settings=settings, project_root=project_root,
+        byok_key=byok_key, provider_name=provider_name,
+    )
+    event_context = {
+        "run_id": run_id,
+        "session_id": session_id,
+        "role": role,
+        "project_root": project_root,
+    }
+    if "compact" in raw_params:
+        return _admin_compaction(
+            raw_params["compact"], launch_params, _rpc_event_emitter(event_context, _emit)
+        )
+
+    try:
+        mission_dispatch = MissionDispatch(
+            run_id=run_id,
+            provider=None,
+            on_event=None,
+            capability=turn_capability,
+            tier=turn_tier,
+            options=options or None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return refuse_before_run(
+            f"agent_admin_turn: prompt assembly failed: {type(exc).__name__}: {exc}"
+        )
+
+    # Rendered once: resolving picked context reads the engine. A persisted
+    # conversation's first turn in this process leads with the live document ids:
+    # its transcript's ids died with the old engine.
+    editor_block = "\n\n".join(block for block in (
+        _resumed_documents_block()
+        if resumed_session and not history_already_seeded else "",
+        _editor_context_block(raw_params),
+        turn_budget_notice(budget_s, readonly=readonly_turn),
+    ) if block)
 
     categories = _turn_tool_categories(session_id, raw_params.get("categories"))
     tool_context: dict[str, Any] = {
@@ -3640,37 +3776,12 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
     )
     prompt = compose_request_text(request, migration, editor_block)
     host_params: dict[str, Any] = {
+        **launch_params,
         "request": prompt,
-        "run_id": run_id,
-        "session_id": session_id,
-        "mode": options["mode"],
-        "plan_only": options.get("plan_only"),
-        "system_prompt": system_prompt,
         "host_tools": host_tools,
-        "settings": settings,
         "attachments": attachments,
         "register_callbacks": register_callbacks,
     }
-    if byok_key is not None:
-        host_params.update(
-            byok_key=byok_key,
-            byok_provider=provider_name,
-            byok_tenant="desktop",
-        )
-    if project_root:
-        host_params["workspace_dir"] = project_root
-    try:
-        from services.agent.config import memory_backend
-
-        host_params["memory_backend"] = memory_backend()
-    except (ImportError, OSError, ValueError) as exc:
-        _LOG.debug("memory backend setting unavailable; using the default: %s", exc)
-    session_dir = param_str("chudcode_session_dir") or param_str("sessions_dir")
-    if session_dir:
-        host_params["chudcode_session_dir"] = session_dir
-    session_file = param_str("chudcode_session_file")
-    if session_file:
-        host_params["chudcode_session_file"] = session_file
     if isinstance(raw_params.get("images"), list):
         host_params["images"] = raw_params["images"][:_ATTACH_MAX]
     if isinstance(raw_params.get("host_uris"), list):
@@ -3681,35 +3792,7 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
         host_params["interactive_questions"] = True
     if budget_s is not None:
         host_params["timeout"] = budget_s
-
-    event_context = {
-        "run_id": run_id,
-        "session_id": session_id,
-        "role": role,
-        "project_root": project_root,
-    }
-    event_state = RpcFrameState()
-
-    def raw_emit(frame: Any) -> None:
-        raw = (
-            frame if isinstance(frame, Mapping) else {"type": "unknown", "value": frame}
-        )
-        for kind, payload in map_rpc_frame(raw, event_context, event_state):
-            data = (
-                dict(payload) if isinstance(payload, Mapping) else {"payload": payload}
-            )
-            data["kind"] = kind
-            if kind == "agent.provider_usage":
-                token_usage.record_usage(
-                    provider=str(data.get("provider") or ""),
-                    model=str(data.get("model") or ""),
-                    prompt_tokens=data.get("prompt_tokens"),
-                    completion_tokens=data.get("completion_tokens"),
-                    total_tokens=data.get("total_tokens"),
-                    context_tokens=data.get("context_tokens"),
-                    source=str(data.get("source") or "api"),
-                )
-            _emit(data)
+    raw_emit = _rpc_event_emitter(event_context, _emit)
 
     turn_env = bind_roots(project_root, save_dir)
     try:

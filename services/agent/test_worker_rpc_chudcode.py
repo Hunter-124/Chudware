@@ -44,6 +44,7 @@ class _Binding:
 class _FakeHost:
     def __init__(self):
         self.turns: list[dict] = []
+        self.compactions: list[dict] = []
         self.sessions: dict[str, object] = {}
         self.mode = "success"
         self.cancel_calls: list[str] = []
@@ -56,6 +57,18 @@ class _FakeHost:
         self.recovery_calls: list[tuple] = []
         self.stt_states: dict[str, str] = {}
         self.shutdown_count = 0
+
+    def run_compaction(self, params, emit):
+        self.compactions.append(params)
+        emit({"type": "compaction_start"})
+        emit({"type": "compaction_end", "result": {"tokensBefore": 120_000}})
+        return {
+            "ok": True,
+            "run_id": params["run_id"],
+            "session_id": params["session_id"],
+            "cancelled": False,
+            "compaction": {"summary": "trimmed", "tokensBefore": 120_000, "tokensAfter": 9_000},
+        }
 
     def run_turn(self, params, emit):
         self.turns.append(params)
@@ -480,9 +493,9 @@ def test_admin_turn_retires_only_its_preflight_and_finalization_connections(
 
     online_lane.host.run_turn = nested_turn
     if outcome == "preflight":
-        def failed_prompt(*args, **kwargs):
-            raise RuntimeError("prompt assembly failed after the CAD preflight")
-        monkeypatch.setattr(mission_dispatch, "role_prompt", failed_prompt)
+        def failed_tools(*args, **kwargs):
+            raise RuntimeError("host tool assembly failed after the CAD preflight")
+        monkeypatch.setattr(chudcode_tools, "build_host_tools", failed_tools)
     else:
         online_lane.host.mode = outcome
     try:
@@ -1245,21 +1258,12 @@ def test_legacy_session_adapters_never_rewrite_online_chudcode_history(monkeypat
         lambda _event: None,
     )
 
-    assert compact == {
-        "ok": True,
-        "summary": "trimmed",
-        "short_summary": "short",
-        "strategy": "summary",
-        "firstKeptEntryId": "entry-3",
-        "tokensBefore": 400,
-    }
-    assert compact_calls[0][2]["compaction_settings"]["methodOrder"] == ["soft"]
-    assert compact_calls[0][1] == "chudcode"
-    assert compact_calls[0][2]["session_id"] == "live"
-    assert compact_calls[0][2]["instructions"] == "Keep decisions"
-    assert "provider" not in compact_calls[0][2]
-    assert "messages" not in compact
-    assert "kept_messages" not in compact
+    # Online conversations compact through the agent_admin_turn compaction run; the
+    # transcript-rewriting adapters refuse instead of touching Chudcode's history.
+    for refused in (compact, shake):
+        assert refused["ok"] is False
+        assert refused["owner"] == "chudcode"
+    assert compact_calls == []
     assert shake["ok"] is False
     assert shake["owner"] == "chudcode"
     assert shake_calls == []

@@ -2685,7 +2685,7 @@ ui::kit::Status spineStatusOf(const ActivityItem& a, bool turnRunning, bool fron
     if (a.status == "fail" || a.status == "error") return ui::kit::Status::Failed;
     if (a.status == "running" || (turnRunning && frontier)) return ui::kit::Status::Running;
     if (a.status == "done" || a.status == "ok" || a.status == "pass") return ui::kit::Status::Done;
-    if (a.status == "skipped") return ui::kit::Status::Skipped;
+    if (a.status == "skipped" || a.status == "cancelled") return ui::kit::Status::Skipped;
     if (a.status == "retry") return ui::kit::Status::Retry;
     return ui::kit::Status::Pending;
 }

@@ -85,6 +85,8 @@ _UNBOUNDED_WAIT_SLICE_SECONDS = 30.0
 _BUDGET_ABORT_GRACE_SECONDS = 30.0
 # Clock for that post-cancel grace (tests substitute a controlled clock).
 _monotonic = time.monotonic
+# Chudcode's `/compact <mode>` subcommands (session/compact-modes.ts COMPACT_MODES).
+_COMPACT_MODES = frozenset({"soft", "remote", "snapcompact"})
 # The shared RPC service keeps its model registry in memory. A catalog RPC alone never
 # re-discovers models; refresh Chudcode's own cache periodically, off the worker call lane.
 _CATALOG_REFRESH_SECONDS = 2 * 60 * 60.0
@@ -445,6 +447,9 @@ class _Run:
     credential_identity: str | None = None
     registry_key: str = ""
     session_key: str = ""
+    resume_file: str | None = None
+    # False for a maintenance run (manual compaction): a steer would start a turn.
+    steerable: bool = True
 
 
 class ChudcodeSessionHost:
@@ -513,41 +518,12 @@ class ChudcodeSessionHost:
         prompt = params.get("request", params.get("prompt", params.get("message")))
         if not isinstance(prompt, str) or not prompt.strip():
             return {"ok": False, "reason": "chudcode turn prompt is empty"}
-        session_id = _nonempty_string(params.get("session_id")) or "default"
-        run_id = _nonempty_string(params.get("run_id")) or uuid.uuid4().hex
-        resume_file = _nonempty_string(params.get("chudcode_session_file"))
-        session_key, run_key = tenancy.scoped_key(session_id), tenancy.scoped_key(run_id)
-        if tenancy.in_cell() and resume_file is not None:
-            return {"ok": False, "reason": "cell_refused", "code": "cell_refused"}
-        try:
-            credential_identity = _credential_identity(params)
-            if tenancy.in_cell():
-                resume_file = _session_link(session_id, credential_identity)
-        except KeyError:
-            return _not_found()
-        except ValueError as exc:
-            return {"ok": False, "reason": str(exc), "code": str(exc)}
-
-        with self._lock:
-            if self._shutdown:
-                return {"ok": False, "reason": "chudcode session host is shut down"}
-            if run_key in self._runs:
-                return {
-                    "ok": False,
-                    "run_id": run_id,
-                    "reason": "chudcode run_id is already active",
-                }
-            self._completed_runs.pop(run_key, None)
-            run = _Run(
-                run_id=run_id, session_id=session_id,
-                credential_identity=credential_identity,
-                registry_key=run_key, session_key=session_key,
-                cancel_requested=run_key in self._prestart_cancels,
-                control_delegate=self._prestart_cancels.get(run_key),
-                cancel_reason="manager_stop" if self._prestart_cancels.get(run_key) else "",
-            )
-            self._runs[run_key] = run
-            self._prestart_cancels.pop(run_key, None)
+        run = self._register_run(params)
+        if isinstance(run, dict):
+            return run
+        session_id, run_id = run.session_id, run.run_id
+        session_key = run.session_key
+        resume_file = run.resume_file
 
         session: _Session | None = None
         unsubscribe: Callable[[], None] | None = None
@@ -1045,27 +1021,172 @@ class ChudcodeSessionHost:
                 context.pop("daemon_connections", None)
             if daemon_connections is not None:
                 daemon_connections.close()
-            dispose = False
-            with self._lock:
-                if session is not None:
-                    dispose = self._release_session_locked(session)
-                self._runs.pop(run_key, None)
-                completed = {
+            self._retire_run(run, session)
+
+    def _register_run(self, params: Mapping[str, Any], *, steerable: bool = True) -> _Run | dict:
+        """Register one controllable run, or return the refusal that prevents it.
+
+        The run is cancellable from ``cancel(run_id)`` from here on, before its session
+        exists; ``_retire_run`` must follow on every path that got a ``_Run``.
+        """
+        session_id = _nonempty_string(params.get("session_id")) or "default"
+        run_id = _nonempty_string(params.get("run_id")) or uuid.uuid4().hex
+        resume_file = _nonempty_string(params.get("chudcode_session_file"))
+        session_key, run_key = tenancy.scoped_key(session_id), tenancy.scoped_key(run_id)
+        if tenancy.in_cell() and resume_file is not None:
+            return {"ok": False, "reason": "cell_refused", "code": "cell_refused"}
+        try:
+            credential_identity = _credential_identity(params)
+            if tenancy.in_cell():
+                resume_file = _session_link(session_id, credential_identity)
+        except KeyError:
+            return _not_found()
+        except ValueError as exc:
+            return {"ok": False, "reason": str(exc), "code": str(exc)}
+
+        with self._lock:
+            if self._shutdown:
+                return {"ok": False, "reason": "chudcode session host is shut down"}
+            if run_key in self._runs:
+                return {
+                    "ok": False,
                     "run_id": run_id,
-                    "session_id": session_id,
-                    "cancelled": run.cancel_requested,
-                    "started": run.started,
-                    "_owner": run.owner,
-                    "_credential_identity": run.credential_identity,
+                    "reason": "chudcode run_id is already active",
                 }
-                completed.update(_stop_audit(run))
-                self._completed_runs[run_key] = completed
-                owned_completed = [key for key, value in self._completed_runs.items()
-                                   if value["_owner"] == run.owner]
-                for key in owned_completed[:-self._max_sessions * 8]:
-                    self._completed_runs.pop(key)
-            if dispose:
-                _stop_client(session.client)
+            self._completed_runs.pop(run_key, None)
+            run = _Run(
+                run_id=run_id, session_id=session_id,
+                credential_identity=credential_identity,
+                registry_key=run_key, session_key=session_key,
+                resume_file=resume_file, steerable=steerable,
+                cancel_requested=run_key in self._prestart_cancels,
+                control_delegate=self._prestart_cancels.get(run_key),
+                cancel_reason="manager_stop" if self._prestart_cancels.get(run_key) else "",
+            )
+            self._runs[run_key] = run
+            self._prestart_cancels.pop(run_key, None)
+        return run
+
+    def _retire_run(self, run: _Run, session: _Session | None) -> None:
+        """Release the run's session claim and record it as completed."""
+        dispose = False
+        with self._lock:
+            if session is not None:
+                dispose = self._release_session_locked(session)
+            self._runs.pop(run.registry_key, None)
+            completed = {
+                "run_id": run.run_id,
+                "session_id": run.session_id,
+                "cancelled": run.cancel_requested,
+                "started": run.started,
+                "_owner": run.owner,
+                "_credential_identity": run.credential_identity,
+            }
+            completed.update(_stop_audit(run))
+            self._completed_runs[run.registry_key] = completed
+            owned_completed = [key for key, value in self._completed_runs.items()
+                               if value["_owner"] == run.owner]
+            for key in owned_completed[:-self._max_sessions * 8]:
+                self._completed_runs.pop(key)
+        if dispose:
+            _stop_client(session.client)
+
+    def run_compaction(self, params, emit) -> dict:
+        """Compact one conversation's session as a cancellable run (manual ``/compact``).
+
+        The session is the conversation's own: one that is not live resumes its persisted
+        ``chudcode_session_file`` with the turn launch parameters ``params`` carries and
+        stays live for the next turn. ``compact.mode`` runs one Chudcode ``/compact`` mode
+        for this compaction only (absent: the session's configured method order) and
+        ``compact.instructions`` focuses the summary. The runtime request has no time
+        limit; ``cancel(run_id)`` aborts it. Emits ``compaction_start``, then
+        ``compaction_end``/``compaction_failed`` and the post-compaction context frame.
+        """
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
+        if not isinstance(params, Mapping):
+            return {"ok": False, "reason": "chudcode compaction params must be an object"}
+        if not callable(emit):
+            return {"ok": False, "reason": "chudcode compaction emit callback is required"}
+        emit = _context_callback(emit)
+        compact = params.get("compact")
+        if not isinstance(compact, Mapping):
+            return {"ok": False, "reason": "compact must be an object"}
+        mode = compact.get("mode")
+        instructions = compact.get("instructions")
+        if mode is not None and mode not in _COMPACT_MODES:
+            return {"ok": False, "reason": f"compact mode must be one of {sorted(_COMPACT_MODES)}"}
+        if instructions is not None and not isinstance(instructions, str):
+            return {"ok": False, "reason": "compact instructions must be a string"}
+        run = self._register_run(params, steerable=False)
+        if isinstance(run, dict):
+            return run
+        refusal = {"ok": False, "run_id": run.run_id, "session_id": run.session_id}
+        session: _Session | None = None
+        try:
+            session = self._get_or_create_session(run.session_id, params, run.resume_file)
+            with session.turn_lock:
+                self._refresh_compaction(session, params)
+                with self._lock:
+                    if session.closed:
+                        raise RuntimeError("chudcode RPC session was closed")
+                    run.client = session.client
+                    self._sessions.move_to_end(run.session_key)
+                self._configure_turn(session, params)
+                with self._lock:
+                    cancelled_early = run.cancel_requested
+                    run.started = not cancelled_early
+                if cancelled_early:
+                    return {**refusal, "ok": True, "cancelled": True, **_stop_audit(run)}
+                emit({"type": "compaction_start"})
+                try:
+                    outcome = _json_value(
+                        session.client.compact(instructions or None, mode=mode)
+                    )
+                except Exception as exc:  # noqa: BLE001 - classified below
+                    error = getattr(exc, "error", None)
+                    if not isinstance(error, str):
+                        # Not the runtime's answer (process death, transport): the
+                        # session's state is unknown, so it is never reused.
+                        with self._lock:
+                            session.closed = True
+                        raise
+                    if run.cancel_requested:
+                        emit({"type": "compaction_end", "aborted": True})
+                        return {**refusal, "ok": True, "cancelled": True,
+                                **_stop_audit(run), **_session_identity(session.client)}
+                    emit({"type": "compaction_failed", "errorMessage": error})
+                    return {**refusal, "stop_reason": "compaction_failed", "reason": error,
+                            **_session_identity(session.client)}
+                outcome = outcome if isinstance(outcome, dict) else {}
+                emit({"type": "compaction_end", "result": outcome})
+                state = _safe_client_state(session.client)
+                context_frame = _context_frame(state)
+                if context_frame is not None:
+                    emit(context_frame)
+                usage = state.get("contextUsage")
+                usage = usage if isinstance(usage, Mapping) else {}
+                compaction = {
+                    "summary": outcome.get("summary") or "",
+                    "shortSummary": outcome.get("shortSummary"),
+                    "firstKeptEntryId": outcome.get("firstKeptEntryId"),
+                    "tokensBefore": outcome.get("tokensBefore"),
+                    "tokensAfter": usage.get("tokens"),
+                    "contextWindow": usage.get("contextWindow"),
+                }
+                method = _last_compaction_method(session.client)
+                if method is not None:
+                    compaction["method"] = method
+                return {
+                    **refusal, "ok": True, "cancelled": False, "compaction": compaction,
+                    **_session_identity(session.client),
+                }
+        except KeyError:
+            return _not_found()
+        except Exception as exc:  # noqa: BLE001 - worker RPC boundary returns failures
+            return {**refusal, "reason": str(exc) or type(exc).__name__}
+        finally:
+            self._retire_run(run, session)
 
     def _await_turn_idle(self, run: _Run, session: _Session, budget_s: float | None) -> str:
         """Wait for the prompt to settle: ``"idle"``, ``"budget"`` or ``"cancel_unsettled"``.
@@ -1404,6 +1525,16 @@ class ChudcodeSessionHost:
                     "steer_id": steer_key,
                     "steered": False,
                     "active": False,
+                }
+            if not run.steerable:
+                # Chudcode would queue it and start a turn once the compaction ends.
+                return {
+                    "ok": False,
+                    "run_id": run_key,
+                    "steer_id": steer_key,
+                    "steered": False,
+                    "active": True,
+                    "reason": "compaction_in_progress",
                 }
         # A user message sent while the agent waits on its question form IS the answer:
         # steering it instead would queue behind the blocked ask_user call forever.
@@ -2182,7 +2313,7 @@ class ChudcodeSessionHost:
             if workdir is not None:
                 workdir.cleanup()
 
-    def session_call(self, session_id, command, params=None, *, compaction_settings=None) -> dict[str, Any]:
+    def session_call(self, session_id, command, params=None) -> dict[str, Any]:
         """Call one named live session; these calls never create or resume sessions."""
         if _delegate_refusal() is not None:
             return _delegate_refusal()
@@ -2227,11 +2358,6 @@ class ChudcodeSessionHost:
             try:
                 if session.closed:
                     return _missing_session()
-                if command_name == "compact" and compaction_settings is not None:
-                    self._refresh_compaction(session, {
-                        **session.launch_params,
-                        "settings": {"compaction_settings": compaction_settings},
-                    })
                 result = _invoke_session_canonical(
                     session.client, command_name, payload
                 )
@@ -2250,12 +2376,9 @@ class ChudcodeSessionHost:
                     else:
                         session.auto_retry = payload["enabled"]
                 if command_name == "compact":
-                    listing = _json_value(session.client.request_raw("get_entries"))
-                    if isinstance(listing, Mapping) and isinstance(listing.get("entries"), list):
-                        branch = _active_branch(listing["entries"], listing.get("leafId"))
-                        entry = next((row for row in reversed(branch) if row.get("type") == "compaction"), None)
-                        if entry is not None and entry.get("method"):
-                            normalized["method"] = entry["method"]
+                    method = _last_compaction_method(session.client)
+                    if method is not None:
+                        normalized["method"] = method
                 if command_name == "get_state":
                     normalized["_hostToolNames"] = sorted(
                         _session_host_tool_names(session)
@@ -2263,11 +2386,6 @@ class ChudcodeSessionHost:
                 return normalized
             finally:
                 session.turn_lock.release()
-        except Exception as exc:
-            if command_name == "compact" and _is_wait_timeout(exc):
-                with self._lock:
-                    session.closed = True
-            raise
         finally:
             self._release_live_session(session)
 
@@ -2362,7 +2480,7 @@ class ChudcodeSessionHost:
                                 raise RuntimeError(
                                     f"persisted agent session file does not exist: {resume_path}"
                                 )
-                            client.switch_session(str(resume_path))
+                            _resume_session(client, str(resume_path))
                         with self._lock:
                             if self._shutdown:
                                 raise RuntimeError("chudcode session host is shut down")
@@ -2449,7 +2567,7 @@ class ChudcodeSessionHost:
         except ImportError as exc:
             raise RuntimeError(
                 "Agent service RPC support is unavailable; install the managed "
-                "chudcode-rpc==0.3.1 runtime dependency"
+                "chudcode-rpc==0.3.2 runtime dependency"
             ) from exc
         return RpcClient
 
@@ -2620,7 +2738,7 @@ class ChudcodeSessionHost:
         _stop_client(old_client)
         try:
             if resume_file is not None:
-                replacement.switch_session(resume_file)
+                _resume_session(replacement, resume_file)
             if settings.get("enabled", True) and session.auto_compaction is not None:
                 replacement.set_auto_compaction(session.auto_compaction)
             if session.auto_retry is not None:
@@ -2718,7 +2836,7 @@ class ChudcodeSessionHost:
                         from chudcode_rpc import host_tool  # type: ignore
                     except ImportError as exc:
                         raise RuntimeError(
-                            "chudcode-rpc==0.3.1 is required to register CAD host tools"
+                            "chudcode-rpc==0.3.2 is required to register CAD host tools"
                         ) from exc
                     binding = converter(host_tool)
                 converted_tools.append(binding)
@@ -2916,6 +3034,45 @@ def _project_export_path(
 
 def _same_path(left: str, right: str) -> bool:
     return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
+
+
+def _resume_session(client: Any, session_file: str) -> None:
+    """Switch ``client`` to a persisted session, or raise when Chudcode refuses.
+
+    Chudcode cancels a resume whose recorded working directory differs from the
+    process's and stays on a fresh, empty session. Continuing on that session would
+    run the conversation with no history, so the refusal is an error.
+    """
+    outcome = _json_value(client.switch_session(session_file))
+    if isinstance(outcome, Mapping) and outcome.get("cancelled") is True:
+        raise RuntimeError(
+            f"session_file_mismatch: the agent service would not resume {session_file}; "
+            "it was recorded in a different project folder than this conversation's"
+        )
+
+
+def _session_identity(client: Any) -> dict[str, Any]:
+    """The runtime session id and file a result reports, when the runtime knows them."""
+    state = _safe_client_state(client)
+    identity: dict[str, Any] = {}
+    session_id = state.get("sessionId") or state.get("session_id")
+    session_file = state.get("sessionFile") or state.get("session_file")
+    if session_id:
+        identity["chudcode_session_id"] = session_id
+    if session_file:
+        identity["chudcode_session_file"] = session_file
+    return identity
+
+
+def _last_compaction_method(client: Any) -> str | None:
+    """The method recorded on the active branch's latest compaction entry, if any."""
+    listing = _json_value(client.request_raw("get_entries"))
+    if not isinstance(listing, Mapping) or not isinstance(listing.get("entries"), list):
+        return None
+    branch = _active_branch(listing["entries"], listing.get("leafId"))
+    entry = next((row for row in reversed(branch) if row.get("type") == "compaction"), None)
+    method = entry.get("method") if entry is not None else None
+    return method if isinstance(method, str) and method else None
 
 
 def _active_branch(entries: Any, leaf_id: Any) -> list[Mapping[str, Any]]:

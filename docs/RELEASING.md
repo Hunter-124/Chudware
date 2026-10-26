@@ -115,7 +115,7 @@ qualification suite.
 
 Native public release remains blocked by the unpinned `macos-arm64` runtime lock
 entry. The SDK source archive and pinned Linux, Windows and macOS x64 runtime
-binaries are hosted in this repository's `chudcode-runtime-v0.4.3` release; no
+binaries are hosted in this repository's `chudcode-runtime-v0.4.4` release; no
 private companion repository is required. All platform jobs must succeed, so
 browser-image publication must not be routed through this pipeline. The following
 is the configured maintainer procedure, not a claim that public installers are

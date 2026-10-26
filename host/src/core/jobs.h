@@ -41,6 +41,8 @@ constexpr bool kBrowserCellClient = true;
 #else
 constexpr bool kBrowserCellClient = false;
 #endif
+// Shared with maintenance commands so only an explicit offline turn uses local session transforms.
+bool agentJobExplicitOffline(const nlohmann::json& extra, const nlohmann::json& options);
 AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::string& docId,
                                       const std::string& convId, bool cam,
                                       const nlohmann::json& extra, bool mission,

@@ -37,7 +37,7 @@ CHUDCODE_REPOSITORY = "https://github.com/Hunter-124/chudcode.git"
 CHUDCODE_SOURCE_ARCHIVE = (
     "https://github.com/Hunter-124/Chudware/releases/download/"
     "chudcode-runtime-v{version}/chudcode-source-{repository_commit}.tar.gz"
-    "#sha256=a1d417b306cdcb8113420a0e7005de97fdf299908faf46a5668f49261c06aa60"
+    "#sha256=0951e7be9e32eb83019941c432cb38c02addd086ff35c112aac6e71b1ced8997"
     "&subdirectory=python/chudcode-rpc"
 )
 
@@ -425,8 +425,8 @@ def verified_wheelhouse(wheelhouse: Path, requirements: Path, lock_path: Path,
                 dependencies.append(dependency)
             installed[canonical] = (version, dependencies)
             lines.append(f"{copied.as_uri()} --hash=sha256:{digest}\n")
-        if installed.get("chudcode-rpc", (None,))[0] != "0.3.1":
-            raise WheelhouseError("reviewed chudcode-rpc==0.3.1 wheel is required")
+        if installed.get("chudcode-rpc", (None,))[0] != "0.3.2":
+            raise WheelhouseError("reviewed chudcode-rpc==0.3.2 wheel is required")
         pending = _declarations(requirements, environment, native)
         for path in additional:
             pending.extend(_declarations(Path(path), environment, native))

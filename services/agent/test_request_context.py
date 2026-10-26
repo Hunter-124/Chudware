@@ -277,7 +277,6 @@ def test_delegated_stop_is_trusted_cancel_only_without_provider_secret(monkeypat
 @pytest.mark.parametrize(("method", "extra"), [
     ("session_handoff", {}),
     ("session_btw", {"question": "What changed?"}),
-    ("session_compact", {}),
     ("chudcode_export_session", {}),
     ("chudcode_branch_session", {"entry_id": "entry"}),
     ("chudcode_rewind_session", {"user_text": "prompt", "occurrence": 0}),

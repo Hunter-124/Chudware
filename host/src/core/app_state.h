@@ -493,6 +493,9 @@ struct JobState {
     // instead of the generic design summary; createdDocPath still carries any assembly tab to open.
     bool isMission = false;
     std::string missionVerdict;       // the report/verdict prose to show as the assistant reply
+    // Manual context maintenance shares turn transport/Stop, but never produces CAD or a plan.
+    bool isCompaction = false;
+    nlohmann::json compactionTurn;  // authoritative turn envelope (method/token counts/session link)
     // General-agent lane (core/agent/run.cpp pre-flight): the turn ran tools over
     // files/PLM/packs and never entered the geometry pipeline, so ITS handoff is the
     // only truthful reply. Non-empty => the drain prints this instead of the built-
@@ -699,6 +702,7 @@ struct ChatMsg {
     double ts = chatNowEpoch();    // send/receive time (epoch s); 0 = legacy/unknown (no age label)
     std::string text;              // user prompt, or the assistant's final summary
     bool running = false;          // assistant turn still streaming
+    bool compactionRun = false;    // GUI-only owner marker for the maintenance activity/notice
     // Assistant turn closed early because the user steered the run: the SAME run continues in
     // the next assistant message, below the steer. Its empty text is not an empty turn.
     bool steerSplit = false;
@@ -1514,6 +1518,8 @@ struct AppState {
     // file open/save, provider switch) that must never race ANY in-flight run, not just the
     // viewed one's.
     bool anyRunActive() const;
+    // True if any running run can edit documents: a manual compaction run cannot.
+    bool anyEditingRunActive() const;
     // True if THAT SPECIFIC conversation's run is running — for Send/Stop/busy UI scoped to
     // whichever conversation is on screen, so an unrelated background run never blocks it.
     bool convRunning(const std::string& convId) const;

@@ -76,17 +76,17 @@ tracked in [`contracts/license_debt.md`](contracts/license_debt.md).
 
 The optional native online-agent runtime is MIT-licensed and runs as a separate
 process. Its pinned source archive and native binary assets are hosted in this
-repository's [runtime release](https://github.com/Hunter-124/Chudware/releases/tag/chudcode-runtime-v0.4.3).
+repository's [runtime release](https://github.com/Hunter-124/Chudware/releases/tag/chudcode-runtime-v0.4.4).
 The notices are hash-locked by `vendor/chudcode/CHUDCODE_ARTIFACT.lock` and must
 accompany any payload that includes the runtime. The recommended browser container
 ships neither this binary nor the `chudcode-rpc` SDK because online Copilot is unsupported there.
 
 | Component | Version | License (SPDX) | How incorporated | Upstream |
 |---|---|---|---|---|
-| Chudcode (`chud` binary) | 0.4.3, commit `2eaba2f4606984172f31f108459d9529d4ee5e38` | MIT | optional native prebuilt binary, obtained from this repository's runtime release at packaging/provisioning time and SHA-256 verified; subprocess over RPC; not in the recommended browser container | repository and release URLs recorded in `vendor/chudcode/CHUDCODE_ARTIFACT.lock` (`macos-arm64` is not pinned) |
-| Oh My Pi (modified by Chudcode) | as included in Chudcode 0.4.3 | MIT | inside the Chudcode binary | https://github.com/can1357/oh-my-pi |
-| Bun runtime, bundled packages and fonts | as included in Chudcode 0.4.3 | see `vendor/chudcode/CHUDCODE-THIRD-PARTY-NOTICES.txt` | inside the Chudcode binary | see the notices file |
-| chudcode-rpc | 0.3.1 | MIT | optional online-agent Python SDK, built from the SHA-256-pinned source archive at the locked commit in this repository's runtime release; required by native provisioning, omitted from the browser container | https://github.com/Hunter-124/Chudware/releases/tag/chudcode-runtime-v0.4.3 |
+| Chudcode (`chud` binary) | 0.4.4, commit `8f70d216879be0cfe6bfeb5520f2370521224330` | MIT | optional native prebuilt binary, obtained from this repository's runtime release at packaging/provisioning time and SHA-256 verified; subprocess over RPC; not in the recommended browser container | repository and release URLs recorded in `vendor/chudcode/CHUDCODE_ARTIFACT.lock` (`macos-arm64` is not pinned) |
+| Oh My Pi (modified by Chudcode) | as included in Chudcode 0.4.4 | MIT | inside the Chudcode binary | https://github.com/can1357/oh-my-pi |
+| Bun runtime, bundled packages and fonts | as included in Chudcode 0.4.4 | see `vendor/chudcode/CHUDCODE-THIRD-PARTY-NOTICES.txt` | inside the Chudcode binary | see the notices file |
+| chudcode-rpc | 0.3.2 | MIT | optional online-agent Python SDK, built from the SHA-256-pinned source archive at the locked commit in this repository's runtime release; required by native provisioning, omitted from the browser container | https://github.com/Hunter-124/Chudware/releases/tag/chudcode-runtime-v0.4.4 |
 
 ## 3. Python runtime packages (`requirements.txt`)
 

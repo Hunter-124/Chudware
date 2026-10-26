@@ -13,8 +13,8 @@ def public_requirements(source: Path, destination: Path) -> None:
     lines = source.read_text().splitlines(keepends=True)
     sdk = (
         "chudcode-rpc @ https://github.com/Hunter-124/Chudware/releases/download/"
-        "chudcode-runtime-v0.4.3/chudcode-source-2eaba2f4606984172f31f108459d9529d4ee5e38.tar.gz"
-        "#sha256=a1d417b306cdcb8113420a0e7005de97fdf299908faf46a5668f49261c06aa60"
+        "chudcode-runtime-v0.4.4/chudcode-source-8f70d216879be0cfe6bfeb5520f2370521224330.tar.gz"
+        "#sha256=0951e7be9e32eb83019941c432cb38c02addd086ff35c112aac6e71b1ced8997"
         "&subdirectory=python/chudcode-rpc"
     )
     omitted = [index for index, line in enumerate(lines)

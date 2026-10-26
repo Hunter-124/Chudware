@@ -299,7 +299,6 @@ def _chudcode_session_call(
     session_id: str | None,
     command: str,
     params: dict[str, Any] | None = None,
-    **host_options: Any,
 ) -> dict[str, Any]:
     key = str(session_id or "").strip()
     if not key:
@@ -312,9 +311,7 @@ def _chudcode_session_call(
             get_default_chudcode_host,
         )
 
-        result = get_default_chudcode_host().session_call(
-            key, command, params, **host_options
-        )
+        result = get_default_chudcode_host().session_call(key, command, params)
     except Exception as exc:  # noqa: BLE001 - process boundary
         code = getattr(exc, "code", None)
         if code is None:
@@ -444,19 +441,17 @@ def compact_session(
     supersede_reads: bool = True,
     drop_useless: bool = True,
     prior_archive: dict | None = None,
-    session_id: str | None = None,
-    instructions: str | None = None,
     standalone: bool = False,
-    compaction_settings: dict[str, Any] | None = None,
 ) -> dict:
-    """Compact one session without creating a second compaction authority.
+    """Compact a transcript locally, only for explicit offline/standalone use.
 
-    A live online session delegates to Chudcode's ``compact`` command, run with
-    ``compaction_settings`` (Chudcode ``compaction.*`` sub-keys of the persisted
-    Compaction setting) so the method is the user's current choice. Local
-    transcript rewriting is available only with ``standalone=True`` or when
-    Chudware is explicitly offline.
+    Online conversations compact on their own Chudcode session through the
+    ``agent_admin_turn`` compaction run, never here.
     """
+    if not _local_compaction(standalone):
+        raise SessionCommandUnavailable(
+            "local session compaction is unavailable for online agent sessions"
+        )
     msgs = _snapshot_messages(messages)
     strat = (strategy or "off").strip().lower()
     if strat in ("off", "", "none", "disabled"):
@@ -465,16 +460,6 @@ def compact_session(
             "summary": "",
             "short_summary": "",
         }
-    if not _local_compaction(standalone):
-        payload = {}
-        note = str(instructions or "").strip()
-        if note:
-            payload["customInstructions"] = note
-        if compaction_settings is None:
-            return _chudcode_session_call(session_id, "compact", payload)
-        return _chudcode_session_call(
-            session_id, "compact", payload, compaction_settings=compaction_settings
-        )
 
     comp = importlib.import_module("services.agent.compaction")
     if strat == "shake":

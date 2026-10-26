@@ -212,6 +212,40 @@ void setContextWindowSource(const std::string &src);
 // =====================================================================================
 namespace {
 
+std::string compactionNotice(const nlohmann::json& compaction) {
+  const std::string method = jstr(compaction, "method");
+  std::string label;
+  if (method == "soft") label = "summary";
+  else if (method == "snapcompact") label = "snapcompact";
+  else if (method == "remote") label = "provider-native compaction";
+  else {
+    label = jstr(compaction, "strategy");
+    if (label == "auto") label.clear();
+  }
+  std::string notice = "Context compacted";
+  if (!label.empty()) notice += " (" + label + ")";
+  const auto before = compaction.find("tokensBefore");
+  const auto after = compaction.find("tokensAfter");
+  const bool hasBefore = before != compaction.end() && before->is_number_integer() &&
+                         before->get<int>() >= 0;
+  const bool hasAfter = after != compaction.end() && after->is_number_integer() &&
+                        after->get<int>() >= 0;
+  auto tokens = [](int count) {
+    char buffer[32];
+    if (count >= 1000) std::snprintf(buffer, sizeof(buffer), "%.1fk", count / 1000.0);
+    else std::snprintf(buffer, sizeof(buffer), "%d", count);
+    return std::string(buffer);
+  };
+  if (hasBefore && hasAfter)
+    notice += ": " + tokens(before->get<int>()) + " \xe2\x86\x92 " +
+              tokens(after->get<int>()) + " tokens";
+  else if (hasBefore)
+    notice += ", was " + tokens(before->get<int>()) + " tokens";
+  else if (hasAfter)
+    notice += ": " + tokens(after->get<int>()) + " tokens";
+  return notice + ".";
+}
+
 // Reserved document-lock chrome: unlike a viewport overlay it never covers a workspace's
 // controls, document tabs or Copilot. Stop intentionally covers all live in-app conversations:
 // foreign writes do not carry a reliable conversation owner (including parallel sub-agents).
@@ -5185,6 +5219,81 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       if (isViewedDoc) {
         st.livePhase.clear();
         st.agentV2Status.clear();
+      }
+      if (job.isCompaction) {
+        // Maintenance never adopts/refreshes documents, invents answer prose, or asks for a plan.
+        const bool isViewedConv = runConvId == st.activeConvId();
+        const bool stopped = job.stopRequested.load() || job.stopReason == "cancelled";
+        const nlohmann::json& compaction =
+            job.compactionTurn.contains("compaction") &&
+                    job.compactionTurn["compaction"].is_object()
+                ? job.compactionTurn["compaction"] : job.compactionTurn;
+        std::string notice;
+        if (stopped) {
+          notice = "Compaction stopped.";
+        } else if (job.converged && job.error.empty()) {
+          notice = compactionNotice(compaction);
+        } else {
+          const std::string reason = !job.errorDetail.empty() ? job.errorDetail
+                                   : !job.error.empty() ? job.error
+                                   : job.stopReason.empty() ? "Compaction failed" : job.stopReason;
+          notice = "Couldn't compact this conversation: " + reason;
+          st.toast(ui::ToastLevel::Warn, notice);
+        }
+        if (isViewedConv) {
+          st.livePhase.clear();
+          st.agentV2Status.clear();
+          st.status = stopped ? "Compaction stopped."
+                              : job.converged && job.error.empty() ? "Context compacted."
+                                                                  : "Compaction failed.";
+          st.statusKind = stopped || !job.converged || !job.error.empty() ? 1 : 0;
+        }
+        if (const auto after = compaction.find("tokensAfter");
+            after != compaction.end() && after->is_number_integer() && after->get<int>() >= 0) {
+          if (isViewedConv) st.lastContextTokens = after->get<int>();
+          else for (auto& conv : st.conversations)
+            if (conv.id == runConvId) {
+              conv.lastContextTokens = after->get<int>();
+              break;
+            }
+        }
+        // A resumed maintenance session remains live, including when no agent.session event landed.
+#ifdef __EMSCRIPTEN__
+        if (const std::string handle = cellAgentSessionHandle(runConvId); !handle.empty()) {
+          auto& link = ui::chudcodeSessionLinkEnsure(runConvId);
+          link.sessionId = handle;
+          link.sessionFile.clear();
+          link.runtimeLive = true;
+        }
+#else
+        if (const std::string file = jstr(job.compactionTurn, "chudcode_session_file");
+            !file.empty()) {
+          auto& link = ui::chudcodeSessionLinkEnsure(runConvId);
+          link.sessionFile = file;
+          const std::string sessionId = jstr(job.compactionTurn, "chudcode_session_id");
+          if (!sessionId.empty()) link.sessionId = sessionId;
+          link.runtimeLive = true;
+        }
+#endif
+        if (msgsPtr) for (auto it = msgsPtr->rbegin(); it != msgsPtr->rend(); ++it)
+          if (!it->fromUser && it->compactionRun) {
+            it->running = false;
+            it->liveStatus.clear();
+            it->errKind = ERR_NONE;
+            it->errorHuman.clear();
+            it->errorFull.clear();
+            it->planApprovePending = false;
+            it->text = std::move(notice);
+            break;
+          }
+        job.stopRequested = false;
+        job.runId.clear();
+        st.agentV2Running = st.anyRunActive();
+        st.addLog(stopped ? "[..] /compact stopped"
+                         : job.converged && job.error.empty() ? "[..] /compact ok"
+                                                             : "[..] /compact failed");
+        ui::persistChatHistory(st);
+        continue;
       }
       if (job.stopRequested.load() || job.stopReason == "cancelled") {
         // The user stopped this run (or engine returned cancel_result after

@@ -985,12 +985,18 @@ static const char* copilotModeName(int mode) {
     }
 }
 
+static void compactOfflineSession(AppState& st, const nlohmann::json& compact);
+
 // ONE Chudcode general_agent turn for `request` on the active conversation. It never creates or
 // replaces a document: whether to new_part or edit the open doc is the AGENT's decision, made
 // with the full CAD tool loadout, so the host must not pre-empt it with a blank part.
 // `extra` is merged on top of the provider override (attachments / context_refs / options…);
 // options.mode defaults to the composer's current mode name.
 void launchAgentTurn(AppState& st, const std::string& request, nlohmann::json extra) {
+    const bool compaction = extra.is_object() && extra.contains("compact") &&
+                            extra["compact"].is_object();
+    // The worker reads the persisted provider/compaction choice from config.json.
+    if (compaction) saveSettings(st.settings);
     // Pin the picker's provider/model/effort explicitly in the worker payload so ambient provider
     // configuration cannot beat the visible selection. Merge attachments/context refs on top.
     nlohmann::json payload = agentProviderOverride(st.settings);
@@ -1010,8 +1016,28 @@ void launchAgentTurn(AppState& st, const std::string& request, nlohmann::json ex
         if (!opts.contains("advisor")) opts["advisor"] = true;
         // corporate_mode mirrors Settings → AI → Behavior (default off — no auto company).
         opts["corporate_mode"] = st.settings.corporateMode;
+        if (compaction && agentJobExplicitOffline(payload, opts)) {
+            compactOfflineSession(st, payload["compact"]);
+            return;
+        }
         attachAgentConversationOptions(st, opts);
         payload["options"] = std::move(opts);
+    }
+    if (compaction) {
+        // Maintenance has one activity host and no user prompt/answer bubble.
+        st.activeRun()->stopRequested = false;
+        ChatMsg activity;
+        activity.running = true;
+        activity.compactionRun = true;
+        activity.liveStatus = "Compacting context\xe2\x80\xa6";
+        st.chat.push_back(std::move(activity));
+        appendChatRawMessage(st, st.chat.back());
+        st.designStarted = true;
+        chatLogResetStick();
+        ui::persistChatHistory(st);
+        st.status = "Compacting context...";
+        st.statusKind = 0;
+        st.livePhase = "Compacting context\xe2\x80\xa6";
     }
     // Single online agent entry: jobs.cpp flattens this payload into `agent_admin_turn`; only an
     // explicit offline request retains the native `agent_run_v2` modeling fallback.
@@ -1029,8 +1055,8 @@ void launchAgentTurn(AppState& st, const std::string& request, nlohmann::json ex
 // answers into the request; "Skip" uses suggested defaults.
 
 // ============================ session slash commands (/compact /shake /handoff /btw /prewalk) ===
-// Host owns the ChatMsg store; session_* RPCs are pure transforms (PySessionCmds). We convert
-// ChatMsg → OpenAI-style role+content messages[], call the RPC, then apply the result.
+// Online /compact is a maintenance turn. Offline compaction and the other session_* commands
+// transform the host's ChatMsg store through OpenAI-style role+content messages[].
 
 struct BtwPanelState {
     bool open = false;
@@ -1128,8 +1154,11 @@ struct SlashItem {
     // Its service call shares the agent lane a running turn holds: unavailable during a run.
     bool        needsIdle = false;
     // Free-form argument syntax: /help, usage refusals, and the hint painted after `/cmd `.
+    // With `args` too, the first token may be one of them and any other text is free-form
+    // (`/compact [summary|snapcompact] [focus]`).
     const char* argHint = nullptr;
-    // Enumerated arguments: `/cmd ` opens the options menu; any other value is refused.
+    // Enumerated arguments: `/cmd ` opens the options menu; any other value is refused
+    // unless `argHint` admits free text.
     std::vector<SlashArg> args;
     // What a bare `/cmd` does (options menu header). Set = the argument is optional, so the
     // menu opens with nothing picked and Enter alone runs the command.
@@ -1264,11 +1293,10 @@ static bool tryHandleSkillsListCommand(AppState& st) {
 // notation); enumerated arguments get their own options menu with plain-word rows.
 static const SlashItem kSessionSlashItems[] = {
     {SlashKind::Session, "/compact ", "/compact",
-     "Summarize older messages to free up context", "ai_panel", true, nullptr,
+     "Summarize older messages to free up context", "ai_panel", true, "[focus]",
      {{"summary", "The model writes a summary that replaces older messages"},
-      {"snapcompact", "Archive older history as images (image-capable models only)"},
-      {"shake", "Drop recoverable heavy tool output, no model call"}},
-     "Enter alone uses your Compaction setting"},
+      {"snapcompact", "Archive older history as images (image-capable models only)"}},
+     "Enter alone uses your Compaction setting; other text tells the summary what to keep"},
     {SlashKind::Session, "/shake ", "/shake",
      "Drop bulky tool output and old images to free up context", "ai_panel", true, nullptr,
      {{"elide", "Replace bulky tool output with short placeholders"},
@@ -1314,7 +1342,8 @@ static std::string slashUsage(const SlashItem& cmd) {
             u += cmd.args[i].value;
         }
         u += cmd.noArgDetail ? "]" : ">";
-    } else if (cmd.argHint) {
+    }
+    if (cmd.argHint) {
         u += " ";
         u += cmd.argHint;
     }
@@ -1822,6 +1851,55 @@ static void askBtw(AppState& st, const std::string& q) {
     }, 180000);
 }
 
+static void compactOfflineSession(AppState& st, const nlohmann::json& compact) {
+    nlohmann::json params = {{"messages", chatMsgsToWireMessages(st.chat)}, {"offline", true}};
+    if (const std::string strategy = jstr(compact, "strategy"); !strategy.empty())
+        params["strategy"] = strategy;
+    // Honor Agents-tab agent.compaction.* (defaults match the local transform contract).
+    int keepRecent = 20000;
+    bool supersedeReads = true;
+    bool dropUseless = true;
+    try {
+        std::ifstream in(configPath());
+        if (in) {
+            nlohmann::json j;
+            in >> j;
+            const auto agent = j.is_object() ? j.value("agent", nlohmann::json::object())
+                                             : nlohmann::json::object();
+            const auto comp = agent.is_object()
+                                  ? agent.value("compaction", nlohmann::json::object())
+                                  : nlohmann::json::object();
+            if (comp.is_object()) {
+                if (comp.contains("keep_recent_tokens") &&
+                    comp["keep_recent_tokens"].is_number_integer())
+                    keepRecent = comp["keep_recent_tokens"].get<int>();
+                if (comp.contains("supersede_reads") && comp["supersede_reads"].is_boolean())
+                    supersedeReads = comp["supersede_reads"].get<bool>();
+                if (comp.contains("drop_useless") && comp["drop_useless"].is_boolean())
+                    dropUseless = comp["drop_useless"].get<bool>();
+            }
+        }
+    } catch (...) {}
+    params["keep_recent_tokens"] = keepRecent;
+    params["supersede_reads"] = supersedeReads;
+    params["drop_useless"] = dropUseless;
+    st.rpc.call("session_compact", params, [&st](const core::RpcResult& r) {
+        if (slashRpcFailed(st, r, "Couldn't compact this session.")) return;
+        if (!r.result.is_object()) {
+            st.toast(ui::ToastLevel::Error, "Couldn't compact this session.");
+            return;
+        }
+        if (const nlohmann::json* repl = ui::chudcodeCompactReplacement(r.result))
+            applyWireMessagesToChat(st, *repl);
+        std::string notice = jstr(r.result, "short_summary");
+        if (notice.empty()) notice = jstr(r.result, "summary");
+        if (notice.empty()) notice = "Compacted.";
+        pushSessionNotice(st, notice);
+        st.addLog("[..] /compact offline ok");
+    }, 180000);
+    st.toast(ui::ToastLevel::Info, "Compacting...");
+}
+
 // Returns true if `text` was a slash command (handled; do not run a normal turn).
 static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
     if (text.empty() || text[0] != '/') return false;
@@ -1848,9 +1926,11 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
     };
 
     // An argument outside a command's options is refused by name, never replaced by the
-    // default: a typo must not run a different compaction method than the one asked for.
+    // default. A command that also takes free text (argHint) reads it as that text instead:
+    // `/compact keep the bracket dims` is focus for the configured method.
     const SlashItem* spec = slashCommandFor(cmd);
-    if (spec && !spec->args.empty() && !rest.empty() && !slashArgFor(*spec, slashLower(rest))) {
+    if (spec && !spec->args.empty() && !spec->argHint && !rest.empty() &&
+        !slashArgFor(*spec, slashLower(rest))) {
         st.toast(ui::ToastLevel::Warn, "Usage: " + slashUsage(*spec));
         return true;
     }
@@ -1914,94 +1994,31 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
 
     if (cmd == "/compact") {
         if (!needIdle()) return true;
-        // No argument = the Compaction setting (Settings > AI). An explicit argument (one of
-        // the options, checked above) is sent as-is; the worker refuses one the session
-        // cannot honour rather than compacting with a different method.
-        const std::string strategy = slashLower(rest);
-        nlohmann::json params = nlohmann::json::object();
-        params["messages"] = chatMsgsToWireMessages(st.chat);
-        if (!strategy.empty()) params["strategy"] = strategy;
-        // Honor Agents-tab agent.compaction.* (defaults match shared contract).
-        int keepRecent = 20000;
-        bool supersedeReads = true;
-        bool dropUseless = true;
-        try {
-            std::ifstream in(configPath());
-            if (in) {
-                nlohmann::json j;
-                in >> j;
-                if (j.is_object()) {
-                    auto agent = j.value("agent", nlohmann::json::object());
-                    if (agent.is_object()) {
-                        auto comp = agent.value("compaction", nlohmann::json::object());
-                        if (comp.is_object()) {
-                            if (comp.contains("keep_recent_tokens") &&
-                                comp["keep_recent_tokens"].is_number_integer())
-                                keepRecent = comp["keep_recent_tokens"].get<int>();
-                            if (comp.contains("supersede_reads") &&
-                                comp["supersede_reads"].is_boolean())
-                                supersedeReads = comp["supersede_reads"].get<bool>();
-                            if (comp.contains("drop_useless") &&
-                                comp["drop_useless"].is_boolean())
-                                dropUseless = comp["drop_useless"].get<bool>();
-                        }
-                    }
-                }
-            }
-        } catch (...) {}
-        params["keep_recent_tokens"] = keepRecent;
-        params["supersede_reads"] = supersedeReads;
-        params["drop_useless"] = dropUseless;
-        // Anchor the compaction to this conversation's session: the Chudcode host owns the
-        // service-side transcript, so session_id (= conversation id, same value
-        // agent_admin_turn rides) is what lets an online compact rewrite the session it
-        // actually belongs to. Provider/model overrides pin summary rendering.
+        // `/compact [summary|snapcompact] [focus]`, as in Chudcode: a leading option runs that
+        // method for this compaction only; no option = the Compaction setting (Settings > AI);
+        // any other text is focus for the summary. The worker refuses a method the session
+        // cannot run rather than compacting with a different one.
+        std::string strategy, focus = rest;
         {
-            nlohmann::json pov = agentProviderOverride(st.settings);
-            for (auto& el : pov.items()) params[el.key()] = el.value();
-            if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size() &&
-                !st.conversations[st.activeConv].id.empty()) {
-#ifdef __EMSCRIPTEN__
-                params["session_id"] = cellAgentSessionHandle(st.conversations[st.activeConv].id);
-#else
-                params["session_id"] = st.conversations[st.activeConv].id;
-#endif
+            const size_t sp = rest.find_first_of(" \t\n");
+            const std::string first = slashLower(rest.substr(0, sp));
+            if (slashArgFor(*spec, first)) {
+                strategy = first;
+                focus = sp == std::string::npos ? std::string() : rest.substr(sp + 1);
+                while (!focus.empty() && (focus[0] == ' ' || focus[0] == '\t' || focus[0] == '\n'))
+                    focus.erase(focus.begin());
             }
         }
-        st.rpc.call("session_compact", params, [&st](const core::RpcResult& r) {
-            if (slashRpcFailed(st, r, "Couldn't compact this session.")) return;
-            if (!r.result.is_object()) {
-                st.toast(ui::ToastLevel::Error, "Couldn't compact this session.");
-                return;
-            }
-            // Replace the visible chat ONLY when the result carries an explicit nonempty
-            // replacement payload (ui::chudcodeCompactReplacement: rebuilt "messages"
-            // first, legacy bare "kept_messages" tail second). Chudcode online compaction
-            // rewrites the service-side session and returns NEITHER — the visible chat
-            // must stay intact then, and a present-but-empty array must never wipe it.
-            if (const nlohmann::json* repl = ui::chudcodeCompactReplacement(r.result))
-                applyWireMessagesToChat(st, *repl);
-            std::string notice;
-            if (r.result.contains("short_summary") && r.result["short_summary"].is_string())
-                notice = r.result["short_summary"].get<std::string>();
-            else if (r.result.contains("summary") && r.result["summary"].is_string())
-                notice = r.result["summary"].get<std::string>();
-            // Name only the method the agent service reports it used (the runtime's
-            // compaction entry), never the requested or configured one.
-            const auto methodIt = r.result.find("method");
-            const std::string method = (methodIt != r.result.end() && methodIt->is_string())
-                                           ? methodIt->get<std::string>()
-                                           : std::string();
-            std::string methodLabel = method;
-            if (method == "soft") methodLabel = "summary";
-            else if (method == "remote") methodLabel = "provider-native compaction";
-            if (notice.empty())
-                notice = methodLabel.empty() ? "Compacted." : "Compacted (" + methodLabel + ").";
-            pushSessionNotice(st, notice);
-            st.addLog("[..] /compact ok" + (methodLabel.empty() ? std::string()
-                                                                : " (" + methodLabel + ")"));
-        }, 180000);
-        st.toast(ui::ToastLevel::Info, "Compacting...");
+        if (strategy == "snapcompact" && !focus.empty()) {
+            st.toast(ui::ToastLevel::Warn,
+                     "/compact snapcompact archives history without a summary, so it takes no "
+                     "focus text.");
+            return true;
+        }
+        nlohmann::json compact = nlohmann::json::object();
+        if (!strategy.empty()) compact["strategy"] = strategy;
+        if (!focus.empty()) compact["instructions"] = focus;
+        launchAgentTurn(st, text, {{"compact", std::move(compact)}});
         return true;
     }
 
@@ -2163,6 +2180,20 @@ void drawBtwPanel(AppState& st) {
     s_btw.open = open;
 }
 
+static void queueComposerPrompt(AppState& st, const std::string& text) {
+    // Freeze this prompt's exact roster; a later draft is independent.
+    st.queuedPromptDrafts.resize(st.queuedPrompts.size(), nlohmann::json::object());
+    st.queuedPrompts.emplace_back(text);
+    st.queuedPromptDrafts.push_back({
+        {"attachments", std::move(st.pendingAttachments)},
+        {"inline_images", std::move(st.pendingInlineImagePaths)},
+        {"context_refs", core::contextRefsToJson(st.pendingContextRefs)}});
+    markChatHistoryDirty();
+    st.pendingAttachments.clear();
+    st.pendingInlineImagePaths.clear();
+    st.pendingContextRefs.clear();
+}
+
 // Launch the active turn for `text`: ONE Chudcode general_agent turn in the mode the USER picked
 // in the composer (Agent | Plan | Ask). The host never inspects the request text — no intent
 // sniffing, no auto-routing, no mode promotion, no CFD hijack: the agent decides for itself
@@ -2170,11 +2201,17 @@ void drawBtwPanel(AppState& st) {
 // implies. Pushes the user + live-assistant ChatMsgs, then hands off to launchAgentTurn.
 void submitTurn(AppState& st, const std::string& text) {
     if (text.empty() && st.pendingAttachments.empty() && st.pendingContextRefs.empty()) return;
-    // A fresh turn always clears a lingering stop latch (e.g. worker never drained after cancel).
-    st.activeRun()->stopRequested = false;
-    // Slash commands: /compact /shake /handoff /btw /prewalk /skills /help — pure host+RPC,
-    // no agent turn. Skills themselves (/skill:<name>) ride a normal turn and activate in-agent.
+    const auto run = st.activeRun();
+    const bool compacting = run->isCompaction && (run->running.load() || run->ready.load());
+    // A queued follow-up must not clear the maintenance run's Stop latch.
+    if (!compacting) run->stopRequested = false;
+    // Session commands handle themselves; /compact uses a maintenance turn. Skills
+    // (/skill:<name>) ride a normal turn and activate in-agent.
     if (tryHandleSlashCommand(st, text)) return;
+    if (compacting) {
+        queueComposerPrompt(st, text);
+        return;
+    }
     // ONE live run per conversation. The composer normally queues a send while a turn is in
     // flight (drain at the top of drawComposer), so this only catches an out-of-band submit.
     if (st.convRunning(st.activeConvId())) {
@@ -4203,7 +4240,11 @@ static void finalizeStoppedTurnActivity(ChatMsg& m) {
     for (auto& a : m.activity) {
         if (a.rowKind == 2 && (a.streaming || a.status == "running" || a.status.empty()))
             finalizeThoughtBox(a);
-        else if (a.streaming || a.status == "running" || a.status.empty()) {
+        else if (a.rowKind == 17 && a.status == "running") {
+            // An in-flight sub-run (e.g. a compaction) did not finish: never show it as done.
+            a.status = "cancelled";
+            a.reason = "cancelled";
+        } else if (a.streaming || a.status == "running" || a.status.empty()) {
             a.status = "done";
             a.streaming = false;
         }
@@ -4304,7 +4345,9 @@ void requestStopRunFor(AppState& st, const std::string& convId) {
             it->errKind = ERR_NONE;  // user stop is not an error card
             // Finalize any live stream boxes so the busy mark / streaming chrome stops.
             finalizeStoppedTurnActivity(*it);
-            if (it->text.empty())
+            if (run->isCompaction)
+                it->text = "Compaction stopped.";
+            else if (it->text.empty())
                 it->text = "Stopped.";
             else if (it->text.find("(Stopped by you.)") == std::string::npos)
                 it->text += "\n\n(Stopped by you.)";
@@ -4321,7 +4364,7 @@ void requestStopRunFor(AppState& st, const std::string& convId) {
     // Cosmetic global flag: other conversations may still be running, so recompute it instead
     // of forcing it false.
     st.agentV2Running = st.anyRunActive();
-    st.status = "Stopped.";
+    st.status = run->isCompaction ? "Compaction stopped." : "Stopped.";
     st.statusKind = 1;
     st.addLog("[..] stop requested by user");
     markChatHistoryDirty();
@@ -4999,20 +5042,20 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
             // rather than being steered into the live run as literal text.
             clearComposerBox();
         } else if (active) {
-            // A turn is running — STEER it mid-run when the engine knows the run_id
-            // (agent_steer: text is folded into the live turn at its next step). Fall
-            // back to next-turn queueing only when no run_id is available (e.g. the
-            // run hasn't announced itself yet). Never both — that would double-send.
-            // Attachments ride with the steer, so a picture alone is a valid follow-up.
+            // Ordinary turns accept a steer when their run_id is known. Compaction is
+            // maintenance, not an answer turn: always queue its follow-ups instead.
+            // Attachments ride with either route, so a picture alone is a valid follow-up.
             const bool hasChips = !st.pendingAttachments.empty() || !st.pendingContextRefs.empty();
             if (!text.empty() || hasChips) {
                 std::string runId;
+                bool compaction = false;
                 {
                     auto steerRun = st.activeRun();
                     std::lock_guard<std::mutex> lk(steerRun->mtx);
                     runId = steerRun->runId;
+                    compaction = steerRun->isCompaction;
                 }
-                if (!runId.empty() && st.workerStarted) {
+                if (!compaction && !runId.empty() && st.workerStarted) {
                     std::string sendText = text;
                     std::string bubbleText;
                     nlohmann::json attachments =
@@ -5032,17 +5075,7 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
                                             attachments, std::move(contextRefs), steerId);
                     agentControlDispatch(st, runId, sendText, std::move(attachments), steerId);
                 } else {
-                    // Freeze this prompt's exact roster; a later draft is independent.
-                    st.queuedPromptDrafts.resize(st.queuedPrompts.size(), nlohmann::json::object());
-                    st.queuedPrompts.emplace_back(text);
-                    st.queuedPromptDrafts.push_back({
-                        {"attachments", std::move(st.pendingAttachments)},
-                        {"inline_images", std::move(st.pendingInlineImagePaths)},
-                        {"context_refs", core::contextRefsToJson(st.pendingContextRefs)}});
-                    markChatHistoryDirty();
-                    st.pendingAttachments.clear();
-                    st.pendingInlineImagePaths.clear();
-                    st.pendingContextRefs.clear();
+                    queueComposerPrompt(st, text);
                 }
                 clearComposerBox();
             } else if (!st.queuedPrompts.empty()) {

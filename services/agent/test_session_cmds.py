@@ -237,11 +237,11 @@ class TestCompactShakeDelegation(unittest.TestCase):
         from services.agent import session_cmds as sc
 
         msgs = _history()
-        out = sc.compact_session(msgs, strategy="off")
+        out = sc.compact_session(msgs, strategy="off", standalone=True)
         self.assertEqual(out["kept_messages"], msgs)
         self.assertIsNot(out["kept_messages"], msgs)
 
-    def test_online_compact_uses_live_chudcode_once(self) -> None:
+    def test_online_compaction_is_refused_without_touching_host_or_transcript(self) -> None:
         from services.agent import chudcode_host
         from services.agent import session_cmds as sc
 
@@ -261,50 +261,14 @@ class TestCompactShakeDelegation(unittest.TestCase):
                 side_effect=AssertionError("online compact invoked local compaction"),
             ),
         ):
-            out = sc.compact_session(
-                messages,
-                strategy="snapcompact",
-                session_id="session-7",
-                instructions="preserve CAD decisions",
-            )
-
-        self.assertEqual(out, {"ok": True, "compacted": True})
-        self.assertEqual(
-            host.calls,
-            [
-                (
-                    "session-7",
-                    "compact",
-                    {"customInstructions": "preserve CAD decisions"},
-                )
-            ],
-        )
-        self.assertEqual(messages, before)
-
-    def test_online_compact_without_live_session_is_honest(self) -> None:
-        from services.agent import session_cmds as sc
-
-        with self.assertRaisesRegex(
-            sc.SessionCommandUnavailable, "requires a live agent session_id"
-        ):
-            sc.compact_session(_history(), strategy="summary")
-
-    def test_online_compact_propagates_unavailable_result(self) -> None:
-        from services.agent import chudcode_host
-        from services.agent import session_cmds as sc
-
-        host = _FakeChudcodeHost()
-        host.result = {"ok": False, "reason": "session not live"}
-        with patch.object(
-            chudcode_host,
-            "get_default_chudcode_host",
-            return_value=host,
-            create=True,
-        ):
+            # Online conversations compact through the agent_admin_turn compaction run.
             with self.assertRaisesRegex(
-                sc.SessionCommandUnavailable, "session not live"
+                sc.SessionCommandUnavailable, "unavailable for online agent sessions"
             ):
-                sc.compact_session(_history(), strategy="summary", session_id="closed")
+                sc.compact_session(messages, strategy="summary")
+
+        self.assertEqual(host.calls, [])
+        self.assertEqual(messages, before)
 
     def test_compaction_and_retry_toggles_use_chudcode(self) -> None:
         from services.agent import chudcode_host

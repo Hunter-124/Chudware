@@ -3450,7 +3450,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // Task 02: while the in-app copilot is driving the doc, paint an "AI editing" badge over the
         // view so the live edits are clearly attributed to the AI (not the user). Same run-lifecycle
         // signal as the Activity panel; non-intrusive top-center pill.
-        if (st.agentV2Running) drawAiActivityBadge(cr0, cr1, st.agentV2Status);
+        if (st.agentV2Running && st.anyEditingRunActive())
+            drawAiActivityBadge(cr0, cr1, st.agentV2Status);
         // Subtle quality readout while the adaptive ladder is holding a reduced step
         // (hidden at FULL or when adaptive is off — native default). Bottom-right, dim text.
         if (renderer.adaptiveQuality() && renderer.qualityStep() != Renderer::QualityStep::Full) {

@@ -256,6 +256,7 @@ Host passes its ChatMsg transcript as messages[]; RPCs are pure transforms, host
 - session_shake {messages, mode(elide|images), aggressive?} -> {ok, messages, saved_tokens, notice}
 - session_handoff {messages, focus?, provider, model} -> {ok, document} (## Goal/Constraints/Progress/Key Decisions/Critical Context/Next Steps; new-session is host-side)
 - session_btw {messages, question, provider, model} -> {ok, answer} (ephemeral; never mutates history)
+- Manual compaction (2026-10-26, additive): online `/compact` is `agent_admin_turn` with `compact: {strategy?: "summary"|"snapcompact", instructions?}` (request = the typed slash text). It streams the `sub_run` compaction row and `agent.context`, is cancelled by `agent_cancel(run_id)`, and replies `{ok, turn:{..., result:"", cancelled, compaction:{strategy, method?, summary, shortSummary?, tokensBefore?, tokensAfter?, contextWindow?, firstKeptEntryId?}}}` or `{ok:false, reason, stop_reason: "compaction_failed"|"compaction_refused"}`. `session_compact` serves explicit offline/standalone compaction only.
 
 ## plan_state (batch 2c, additive; C++ agent harness)
 Event `kind:"plan_state"` { shape:"build_plan"|"checklist"|"phased_todo"|"objectives"|"dag", title, summary?, revision, items:[{id, title(<=10 words), desc(tooltip: purpose/dims/assignment), status:"pending"|"running"|"pass"|"fail"|"done"|"abandoned", kind:"part"|"step"|"task"|"objective"|"node"|"subagent", phase?, parent_id?, meta?}], edges?:[{from,to}] (dag only) }

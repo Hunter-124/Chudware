@@ -166,7 +166,17 @@ Never hand-edit session JSONL, invent an entry id, or report a repair the doctor
     enables browser/computer eval preludes.
 11. The user's compaction choice governs (Summary, Shake, Snapcompact, Off; Automatic leaves
     runtime policy). Overlays are immutable; a changed choice refreshes only an idle
-    connection at the next turn, resuming the exact history.
+    connection at the next turn, resuming the exact history. Manual
+    `/compact [summary|snapcompact] [focus]` is a run, not a side RPC: `agent_admin_turn`
+    with `compact: {strategy?, instructions?}` builds the turn's session launch parameters
+    (`_session_launch_params`) and calls `ChudcodeSessionHost.run_compaction`, which resumes
+    a conversation that is not live (it stays live for the next turn) and sends Chudcode
+    `compact` with the `/compact` mode (`summary`→`soft`) for that compaction only. The
+    request has no time limit; Stop (`cancel(run_id)`) aborts it, and steers are refused
+    (`compaction_in_progress`). Shake and Off are refused for manual compaction rather than
+    substituted. `session_compact` is offline/standalone-only.
+    A resume Chudcode cancels (recorded in another project folder) fails the run or turn
+    with `session_file_mismatch` instead of continuing in an empty session.
 12. Task sub-agents inherit host tools over the same client with `agent_id`/`parent_agent_id`;
     explicit `tools:` allowlists narrow them; restricted/plan children get none. Each call
     runs inside `cad_common.agent_doc_context`, so each sub-agent has its own current part.

@@ -159,63 +159,83 @@ def test_invalid_choice_refuses_before_the_agent_service_runs(
 
 
 # ---------------------------------------------------------------------------
-# Worker: manual /compact uses the choice and reports only the runtime's method
+# Worker: manual /compact is a run on the conversation's session
 # ---------------------------------------------------------------------------
 
 
-def _manual(monkeypatch, strategy, result=None):
-    calls: list = []
-
-    def compact_session(messages, strategy_arg, **kwargs):
-        calls.append((strategy_arg, kwargs))
-        return dict(result or {"summary": "", "tokensBefore": 199160})
-
-    commands = SimpleNamespace(_offline_enabled=lambda: False, compact_session=compact_session)
-    monkeypatch.setattr(worker_rpc, "_cmds", lambda: commands)
-    monkeypatch.setattr(
-        agent_config, "load_config", lambda: {"agent": {"compaction_strategy": strategy}}
-    )
-    return calls
-
-
-def _compact(**params):
-    return worker_rpc.SESSION_METHODS["session_compact"](
-        {"session_id": "live", "messages": [], **params}, lambda _e: None
+def _compact(lane, **compact):
+    return worker_rpc._agent_admin_turn(
+        _params(lane, run_id="compact-1", request="/compact", compact=compact),
+        lambda _e: None,
     )
 
 
+def test_manual_compact_never_invents_a_method(online_lane, monkeypatch):  # noqa: F811
+    _set_strategy(monkeypatch, "auto")
 
-
-def test_manual_compact_never_invents_a_method(monkeypatch):
-    _manual(monkeypatch, "auto", {"summary": "", "tokensBefore": 199160})
-
-    out = _compact()
+    out = _compact(online_lane)
 
     assert out["ok"] is True
-    assert "method" not in out
-    assert out["tokensBefore"] == 199160
+    assert "method" not in out["turn"]["compaction"]
+    assert out["turn"]["compaction"]["tokensBefore"] == 120_000
 
 
 @pytest.mark.parametrize(
     ("configured", "requested", "reason"),
     [
-        ("summary", "snapcompact", "compaction_strategy_mismatch"),
-        ("auto", "summary", "compaction_strategy_mismatch"),
+        ("summary", "shake", "manual_shake_unavailable"),
         ("shake", None, "manual_shake_unavailable"),
         ("off", None, "compaction_off"),
+        ("auto", "squash", "invalid_compaction_strategy"),
+        ("auto", "auto", "invalid_compaction_strategy"),
     ],
 )
 def test_manual_compact_refuses_what_the_session_cannot_honour(
-    monkeypatch, configured, requested, reason
+    online_lane, monkeypatch, configured, requested, reason  # noqa: F811
 ):
-    calls = _manual(monkeypatch, configured)
+    _set_strategy(monkeypatch, configured)
 
-    out = _compact(**({"strategy": requested} if requested else {}))
+    out = _compact(online_lane, **({"strategy": requested} if requested else {}))
 
     assert out["ok"] is False
     assert out["reason"].startswith(reason)
-    assert calls == []
+    assert online_lane.host.compactions == []
 
 
+@pytest.mark.parametrize(
+    ("configured", "requested", "mode"),
+    [
+        ("auto", "summary", "soft"),
+        ("summary", "snapcompact", "snapcompact"),
+        ("off", "summary", "soft"),
+        ("snapcompact", None, "snapcompact"),
+        ("summary", None, "soft"),
+        ("auto", None, None),
+    ],
+)
+def test_manual_compact_runs_exactly_the_requested_method(
+    online_lane, monkeypatch, configured, requested, mode  # noqa: F811
+):
+    _set_strategy(monkeypatch, configured)
 
+    out = _compact(online_lane, **({"strategy": requested} if requested else {}))
+
+    assert out["ok"] is True
+    assert out["turn"]["compaction"]["strategy"] == (requested or configured)
+    [sent] = online_lane.host.compactions
+    assert sent["compact"]["mode"] == mode
+
+
+def test_compaction_starts_the_session_a_turn_would(online_lane, monkeypatch):  # noqa: F811
+    # A compaction may be what starts or resumes the conversation's process; the next
+    # turn reuses it, so its launch identity must be the turn's.
+    _set_strategy(monkeypatch, "summary")
+    _compact(online_lane, instructions="keep the bracket dims")
+    worker_rpc._agent_admin_turn(_params(online_lane, run_id="turn-1"), lambda _e: None)
+
+    [compaction] = online_lane.host.compactions
+    [turn] = online_lane.host.turns
+    for key in ("session_id", "workspace_dir", "system_prompt", "settings", "mode"):
+        assert compaction[key] == turn[key], key
+    assert compaction["compact"]["instructions"] == "keep the bracket dims"
 

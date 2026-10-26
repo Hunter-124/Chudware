@@ -36,6 +36,7 @@ class FakeClient:
         self.doctor_summaries = []
         self.prompted = threading.Event()
         self.release = threading.Event()
+        self.compact_started = threading.Event()
         self.block = factory.block
         self.events = [
             {"type": "agent_start"},
@@ -285,8 +286,15 @@ class FakeClient:
             "cost": 0.01,
         }
 
-    def compact(self, custom_instructions=None):
-        self.calls.append(("compact", {"customInstructions": custom_instructions}))
+    def compact(self, custom_instructions=None, *, mode=None, timeout=None):
+        self.calls.append(("compact", {"customInstructions": custom_instructions, "mode": mode}))
+        self.compact_started.set()
+        if self.block:
+            # A long summary: only abort() ends it, as Chudcode cancels the compaction.
+            self.release.wait(2.0)
+            from chudcode_rpc import RpcCommandError
+
+            raise RpcCommandError(command="compact", error="Compaction cancelled", code=None)
         return {
             "summary": "trimmed",
             "firstKeptEntryId": "entry-2",
@@ -1595,7 +1603,7 @@ def test_missing_dependency_and_binary_are_actionable(monkeypatch, tmp_path):
         {"request": "hi", "session_id": "s", "run_id": "r"}, lambda _frame: None
     )
     assert result["ok"] is False
-    assert "chudcode-rpc==0.3.1" in result["reason"]
+    assert "chudcode-rpc==0.3.2" in result["reason"]
 
     missing_binary = ChudcodeSessionHost(
         client_factory=FakeFactory(), binary=tmp_path / "missing-chud"
@@ -1945,6 +1953,105 @@ def test_recovery_methods_refuse_inactive_sessions_without_creating_processes():
     }
     assert host.close_session("missing") == {"ok": True}
     assert factory.clients == []
+
+
+def _wait_for_client(factory, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while not factory.clients and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return factory.clients[0]
+
+
+def _compaction_params(persisted, workspace, **compact):
+    return {
+        "session_id": "c1",
+        "run_id": "compact-1",
+        "chudcode_session_file": str(persisted),
+        "workspace_dir": str(workspace),
+        "system_prompt": "ROLE PROMPT",
+        "compact": compact,
+    }
+
+
+def test_compaction_resumes_a_conversation_that_is_not_live_and_keeps_it_live(tmp_path):
+    persisted = tmp_path / "conversation.jsonl"
+    persisted.write_text("{}\n", encoding="utf-8")
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+    emitted = []
+
+    try:
+        result = host.run_compaction(
+            _compaction_params(persisted, tmp_path, mode="soft", instructions="keep the dims"),
+            emitted.append,
+        )
+
+        assert result["ok"] is True and result["cancelled"] is False
+        assert result["compaction"]["summary"] == "trimmed"
+        [client] = factory.clients
+        names = call_names(client)
+        assert names.index("switch_session") < names.index("compact")
+        assert ("compact", {"customInstructions": "keep the dims", "mode": "soft"}) in client.calls
+        assert [frame["type"] for frame in emitted][:2] == ["compaction_start", "compaction_end"]
+        # The compaction started the conversation's own process: the next turn reuses it.
+        turn, _ = run(host, "c1", "turn-1", chudcode_session_file=str(persisted))
+        assert turn["ok"] is True
+        assert factory.clients == [client] and client.stop_count == 0
+    finally:
+        host.shutdown()
+
+
+def test_stop_aborts_a_running_compaction_and_steers_cannot_start_a_turn(tmp_path):
+    persisted = tmp_path / "conversation.jsonl"
+    persisted.write_text("{}\n", encoding="utf-8")
+    factory = FakeFactory(block=True)
+    host = ChudcodeSessionHost(client_factory=factory)
+    emitted = []
+    outcome = {}
+    worker = threading.Thread(target=lambda: outcome.update(
+        host.run_compaction(_compaction_params(persisted, tmp_path), emitted.append)
+    ))
+
+    try:
+        worker.start()
+        assert _wait_for_client(factory).compact_started.wait(2.0)
+        steer = host.steer("compact-1", "also do this")
+        assert steer["steered"] is False and steer["reason"] == "compaction_in_progress"
+        assert host.cancel("compact-1")["cancelled"] is True
+        worker.join(2.0)
+
+        assert outcome["ok"] is True and outcome["cancelled"] is True
+        assert "abort" in call_names(factory.clients[0])
+        assert "steer" not in call_names(factory.clients[0])
+        assert emitted[-1] == {"type": "compaction_end", "aborted": True}
+    finally:
+        host.shutdown()
+
+
+def test_a_refused_resume_never_continues_in_an_empty_session(tmp_path):
+    persisted = tmp_path / "conversation.jsonl"
+    persisted.write_text("{}\n", encoding="utf-8")
+    factory = FakeFactory()
+
+    def make_client(**kwargs):
+        client = factory(**kwargs)
+        # Chudcode cancels a resume recorded in another cwd and stays on a fresh session.
+        client.switch_session = lambda path: {"cancelled": True}
+        return client
+
+    host = ChudcodeSessionHost(client_factory=make_client)
+    try:
+        compacted = host.run_compaction(_compaction_params(persisted, tmp_path), lambda _f: None)
+        turn, _ = run(host, "c1", "turn-1", chudcode_session_file=str(persisted))
+
+        for result in (compacted, turn):
+            assert result["ok"] is False
+            assert result["reason"].startswith("session_file_mismatch")
+        assert all("compact" not in call_names(c) and "prompt" not in call_names(c)
+                   for c in factory.clients)
+        assert all(c.stop_count == 1 for c in factory.clients)
+    finally:
+        host.shutdown()
 
 
 def test_export_is_project_contained_and_atomically_published(monkeypatch, tmp_path):

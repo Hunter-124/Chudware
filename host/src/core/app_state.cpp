@@ -1406,6 +1406,12 @@ bool AppState::anyRunActive() const {
     return false;
 }
 
+bool AppState::anyEditingRunActive() const {
+    for (const auto& kv : runs)
+        if (kv.second && kv.second->running.load() && !kv.second->isCompaction) return true;
+    return false;
+}
+
 bool AppState::convRunning(const std::string& convId) const {
     auto it = runs.find(convId);
     return it != runs.end() && it->second && it->second->running.load();

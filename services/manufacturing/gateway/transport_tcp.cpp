@@ -566,6 +566,8 @@ device::PollResult TcpTransport::poll(device::Deadline deadline) {
         return result;
     }
     if (impl_->socket == kInvalidSocket) return result;
+    if (deadline != device::Deadline::max() && deadline <= std::chrono::steady_clock::now())
+        return result;
 
 #ifdef _WIN32
     WSAPOLLFD descriptor{};
@@ -623,6 +625,8 @@ device::PollResult TcpTransport::poll(device::Deadline deadline) {
                                               : "device_lost: TCP read failed: " + error_text(error));
             break;
         }
+        // POLLHUP can accompany unread bytes. Only recv() returning zero proves
+        // EOF; reaching the deadline or byte budget must leave those bytes queued.
         if (saw_eof)
             impl_->terminal(device::TransportEvent::Kind::Closed,
                             "device_lost: peer half-closed TCP connection");
@@ -636,9 +640,6 @@ device::PollResult TcpTransport::poll(device::Deadline deadline) {
                             peer_reset(error) ? "device_lost: TCP peer reset"
                                               : "device_lost: TCP socket error: " + error_text(error));
         }
-        if (impl_->socket != kInvalidSocket && (descriptor.revents & POLLHUP) != 0)
-            impl_->terminal(device::TransportEvent::Kind::Closed,
-                            "device_lost: peer half-closed TCP connection");
 #endif
     }
     if (impl_->terminal_event_pending) {

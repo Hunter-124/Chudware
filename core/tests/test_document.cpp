@@ -6893,7 +6893,8 @@ TEST_CASE("measure and solid health agree that an internal imprint edge keeps a 
 
 namespace {
 struct DocumentRootPolicyFixture {
-    std::filesystem::path dir = std::filesystem::temp_directory_path() /
+    // Rooted RPCs use canonical OS paths, not the temp directory's OS alias.
+    std::filesystem::path dir = std::filesystem::canonical(std::filesystem::temp_directory_path()) /
         ("chudware_document_root_" + std::to_string(
             std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::path root = dir / "work";

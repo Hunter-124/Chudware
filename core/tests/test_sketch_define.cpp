@@ -30,7 +30,10 @@ json arc(const std::string& id, double x, double y, double r, double start, doub
 json point(const std::string& id, double x, double y) {
     return {{"id", id}, {"type", "point"}, {"p", {x, y}}};
 }
-json sketch(json entities) { return {{"entities", std::move(entities)}, {"constraints", json::array()}}; }
+json sketch(json::initializer_list_t entities) {
+    // A singleton {json-returning-call()} can copy the object in C++17 instead of wrapping it.
+    return {{"entities", json::array(entities)}, {"constraints", json::array()}};
+}
 json rectangle(double x = 13, double y = 17) {
     return sketch({line("e1", x, y, x + 40, y), line("e2", x + 40, y, x + 40, y + 20),
                    line("e3", x + 40, y + 20, x, y + 20), line("e4", x, y + 20, x, y)});
@@ -406,7 +409,7 @@ TEST_CASE("fully define reports free spline coordinates when dimensioning is dis
 }
 
 TEST_CASE("fully define batches a 200-entity sketch") {
-    auto input = sketch(json::array());
+    auto input = sketch({});
     for (int i = 0; i < 50; ++i) {
         double x = i * 100 + 13, y = i * 100 + 17;
         double w = 10 + i * 0.01, h = 5 + i * 0.013;

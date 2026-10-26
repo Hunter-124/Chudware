@@ -475,34 +475,48 @@ TEST_CASE("TCP refuses uncommissioned endpoints before any connection attempt") 
 }
 
 TEST_CASE("TCP preserves final payload until a fresh poll and reports EOF after its bytes") {
-    FakeServer server([](Socket peer) { send_all(peer, "final payload"); });
+    std::string payload = "final payload";
+    bool close_before_poll = true;
+    SUBCASE("closed peer has final bytes ready") {}
+    SUBCASE("final bytes span the per-poll budget") {
+        payload.append(TcpTransport::kMaxPollBytes, 'x');
+        close_before_poll = false;
+    }
+    FakeServer server([&payload](Socket peer) { send_all(peer, payload); });
     CommissionedEndpoint commissioned(TransportKind::Tcp, server.port());
     TcpTransport transport(commissioned.allowlist, MachineClass::OpenFrameMill, 1s);
     REQUIRE(transport.open(tcp_endpoint(server.port())).ok);
-    server.finish();  // The peer is already closed before the first receive.
-    CHECK(transport.poll(std::chrono::steady_clock::now()).events.empty());
+    if (close_before_poll) server.finish();  // Closed before the first receive.
+    const auto expired = std::chrono::steady_clock::now();
+    CHECK(transport.poll(expired).events.empty());
+    CHECK(transport.poll(expired - 1s).events.empty());
 
     std::string received;
     bool closed = false;
     const auto deadline = std::chrono::steady_clock::now() + 2s;
     while (!closed && std::chrono::steady_clock::now() < deadline) {
         const auto batch = transport.poll(deadline);
+        std::size_t batch_bytes = 0;
         for (const auto& event : batch.events) {
             CAPTURE(event.why);
             CHECK_FALSE(closed);
             if (event.kind == TransportEvent::Kind::Data) {
                 CHECK(event.raw.empty());
+                batch_bytes += event.data.size();
                 received.append(reinterpret_cast<const char*>(event.data.data()), event.data.size());
             } else {
                 REQUIRE(event.kind == TransportEvent::Kind::Closed);
                 CHECK(event.why.find("device_lost") != std::string::npos);
+                CHECK(received == payload);
                 closed = true;
             }
         }
+        CHECK(batch_bytes <= TcpTransport::kMaxPollBytes);
     }
-    CHECK(received == "final payload");
+    CHECK(received == payload);
     CHECK(closed);
     CHECK_FALSE(transport.write(bytes("resume")).ok);
+    server.finish();
 }
 
 TEST_CASE("TCP detects a peer half-close as terminal device_lost") {

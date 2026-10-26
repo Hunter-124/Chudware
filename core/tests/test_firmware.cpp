@@ -97,7 +97,9 @@ bool emulator_timed_out(const json& r) {
 struct FirmwareRootGuard {
     fs::path dir;
     FirmwareRootGuard() {
-        dir = fs::temp_directory_path() /
+        // Resolve the OS-selected temp base before enforcing the no-symlink policy;
+        // on Darwin, TMPDIR commonly starts with the /var -> /private/var alias.
+        dir = fs::canonical(fs::temp_directory_path()) /
               ("chudware-fwtest-" + std::to_string(static_cast<long long>(
                    std::chrono::system_clock::now().time_since_epoch().count())));
         chudware::firmware::private_directory(dir);
@@ -767,8 +769,8 @@ TEST_CASE("Renode refuses unavailable timestamped GPIO observation") {
 
 TEST_CASE("backend process faults cannot become successful simulation") {
 #ifndef _WIN32
-    fs::path dir = fs::temp_directory_path() / "chudware-fault-emulator";
-    fs::create_directories(dir);
+    FirmwareRootGuard root;
+    const auto& dir = root.dir;
     fs::path qemu = dir / "qemu-system-arm";
     {
         std::ofstream script(qemu, std::ios::binary | std::ios::trunc);
@@ -804,11 +806,10 @@ TEST_CASE("backend process faults cannot become successful simulation") {
     else
         chudware::test::unsetEnvironment("PATH");
 
+    INFO(result.uart_log);
     CHECK(result.passed == false);
     CHECK(result.uart_log.find("emulator_fault: qemu-system-arm exited with code 7") == 0);
     CHECK(result.uart_log.find("synthetic-emulator-fault") != std::string::npos);
-    std::error_code ec;
-    fs::remove_all(dir, ec);
 #else
     CHECK(true);
 #endif

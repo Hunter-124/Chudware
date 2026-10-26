@@ -224,6 +224,7 @@ target_link_libraries(chudware_geom PUBLIC Eigen3::Eigen)
 # platform_paths / parent_death: the one spelling per OS of "where am I", "is that
 # pid alive", and "bind this child's life to mine" — see util/platform_paths.h.
 add_library(chudware_util STATIC
+  doc/native_policy.cpp
   util/expr.cpp
   util/aicm_handoff.cpp
   util/resource_governor.cpp
@@ -1081,7 +1082,7 @@ add_library(chudware_piping STATIC
   piping/spec.cpp
   piping/vessel.cpp)
 target_include_directories(chudware_piping PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(chudware_piping PUBLIC nlohmann_json::nlohmann_json)
+target_link_libraries(chudware_piping PUBLIC nlohmann_json::nlohmann_json chudware_util)
 if(MSVC)
   # MSVC only defines M_PI et al. in <cmath> when _USE_MATH_DEFINES is set.
   target_compile_definitions(chudware_piping PUBLIC _USE_MATH_DEFINES)

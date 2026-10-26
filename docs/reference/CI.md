@@ -135,6 +135,20 @@ Constraint diagnostic closures explicitly capture their inputs for MSVC. Native
 test variables must not shadow C functions used by assertion macros: on Darwin,
 doctest calls `raise(SIGTRAP)`.
 
+The native regressions also cover canonical private temporary roots on Darwin
+without relaxing document-controlled symlink rejection, explicit singleton JSON
+arrays, and one initialization owner for policy state shared by C++17/C++20 code.
+Worker checks retain fast-child completion, crash and timeout containment; TCP
+checks retain final bytes across expired deadlines and per-poll byte limits.
+Rendering checks require opaque faces to cover shared triangle edges without
+revealing an opposite face's finish.
+
+Managed PolyMesh sources receive an authenticated, idempotent constant-sizing
+grid correction during configure. Both the pinned original and exact corrected
+source are hash-checked; explicit developer source overrides are never modified.
+The meshing regressions require positive-quality two-body geometry for interface
+sizes equal to or coarser than the background, not a particular error message.
+
 ### Complete self-host image
 
 From the repository root, using a fresh isolated Compose project:

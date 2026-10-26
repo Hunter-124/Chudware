@@ -20,9 +20,11 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <thread>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -514,13 +516,18 @@ TEST_CASE("advisory isolation returns payload without changing parent inputs") {
     using namespace std::chrono_literals;
     using chudware::util::IsolatedTaskStatus;
     int source = 7;
+    std::string expected = "candidate diagnostics";
+    SUBCASE("text payload") { expected = "candidate diagnostics"; }
+    SUBCASE("empty payload") { expected.clear(); }
+    SUBCASE("binary payload") { expected = std::string("a\0b", 3); }
+    SUBCASE("payload larger than the pipe buffer") { expected.assign(128 * 1024, 'x'); }
     const auto result = chudware::util::isolate_task([&] {
         source = 99;
-        return std::string("candidate diagnostics");
+        return expected;
     }, std::chrono::steady_clock::now() + 2s);
 #if defined(__unix__) || defined(__APPLE__)
     REQUIRE(result.status == IsolatedTaskStatus::completed);
-    CHECK(result.payload == "candidate diagnostics");
+    CHECK(result.payload == expected);
 #else
     CHECK(result.status == IsolatedTaskStatus::unavailable);
 #endif
@@ -572,6 +579,34 @@ TEST_CASE("advisory isolation kills cumulative slow probes without a parent fall
     shared->~Shared();
     ::munmap(memory, sizeof(Shared));
     // A timeout does not retire isolation or launch an unbounded retry.
+    const auto healthy = chudware::util::isolate_task([] { return std::string("ok"); },
+                                                     std::chrono::steady_clock::now() + 2s);
+    CHECK(healthy.status == chudware::util::IsolatedTaskStatus::completed);
+    CHECK(healthy.payload == "ok");
+#endif
+}
+
+TEST_CASE("advisory isolation contains crashes and rejects oversized output") {
+#if defined(__unix__) || defined(__APPLE__)
+    using namespace std::chrono_literals;
+    std::function<std::string()> task;
+    SUBCASE("native crash") {
+        task = [] {
+            ::raise(SIGSEGV);
+            return std::string("must not escape");
+        };
+    }
+    SUBCASE("callback exception") {
+        task = []() -> std::string { throw std::runtime_error("isolated failure"); };
+    }
+    SUBCASE("payload exceeds the result limit") {
+        task = [] { return std::string(16 * 1024 * 1024 + 1, 'x'); };
+    }
+    const auto started = std::chrono::steady_clock::now();
+    const auto result = chudware::util::isolate_task(task, started + 2s);
+    CHECK(result.status == chudware::util::IsolatedTaskStatus::failed);
+    CHECK(result.payload.empty());
+    CHECK(std::chrono::steady_clock::now() - started < 3s);
     const auto healthy = chudware::util::isolate_task([] { return std::string("ok"); },
                                                      std::chrono::steady_clock::now() + 2s);
     CHECK(healthy.status == chudware::util::IsolatedTaskStatus::completed);

@@ -8408,15 +8408,36 @@ void raster_projected_triangle(const ViewProjection& vp, const ProjectedVertex& 
     maxx = std::min(maxx, W - 1); maxy = std::min(maxy, H - 1);
     double area = (su1 - su0) * (sv2 - sv0) - (su2 - su0) * (sv1 - sv0);
     if (std::abs(area) < 1e-9) return;
+    struct RasterEdge {
+        double dx, dy, offset, inverse_area;
+        double weight(double x, double y) const {
+            return (dx * x + dy * y + offset) * inverse_area;
+        }
+    };
+    auto edge = [area](double x0, double y0, double x1, double y1) {
+        double direction = 1.0;
+        if (x0 > x1 || (x0 == x1 && y0 > y1)) {
+            std::swap(x0, x1);
+            std::swap(y0, y1);
+            direction = -1.0;
+        }
+        return RasterEdge{y0 - y1, x1 - x0, x0 * y1 - y0 * x1, direction / area};
+    };
+    // Canonical endpoints give adjacent triangles the same edge equation. Test
+    // all three edges: deriving a2 as 1-a0-a1 can round below zero on a shared
+    // diagonal and expose the opposite face through otherwise opaque geometry.
+    const auto e0 = edge(su1, sv1, su2, sv2);
+    const auto e1 = edge(su2, sv2, su0, sv0);
+    const auto e2 = edge(su0, sv0, su1, sv1);
     const double d0 = perspective ? 1.0 / p0.pd : p0.pd;
     const double d1 = perspective ? 1.0 / p1.pd : p1.pd;
     const double d2 = perspective ? 1.0 / p2.pd : p2.pd;
     for (int py = miny; py <= maxy; ++py)
         for (int px = minx; px <= maxx; ++px) {
             double fx = px + 0.5, fy = py + 0.5;
-            double a0 = ((su1 - fx) * (sv2 - fy) - (su2 - fx) * (sv1 - fy)) / area;
-            double a1 = ((su2 - fx) * (sv0 - fy) - (su0 - fx) * (sv2 - fy)) / area;
-            double a2 = 1.0 - a0 - a1;
+            double a0 = e0.weight(fx, fy);
+            double a1 = e1.weight(fx, fy);
+            double a2 = e2.weight(fx, fy);
             if (a0 < 0 || a1 < 0 || a2 < 0) continue;
             double depth = a0 * d0 + a1 * d1 + a2 * d2;
             if (!perspective && depth > clip_depth) continue;

@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <string>
+#include <utility>
 #include <vector>
 
 using chudware::sketch3d::drag3;
@@ -431,18 +432,18 @@ TEST_CASE("3D coradial aligns both the center and radius") {
 TEST_CASE("3D on_plane uses the engine datum convention and constrains whole curves") {
     json entities, c;
     SUBCASE("front is XZ") {
-        entities = {point("e1", 1, 2, 3)};
+        entities = json::array({point("e1", 1, 2, 3)});
         c = plane_rel("on_plane", {"e1"}, "front");
     }
     SUBCASE("top is XY") {
-        entities = {line("e1", 1, 2, 3, 4, 5, 6)};
+        entities = json::array({line("e1", 1, 2, 3, 4, 5, 6)});
         c = plane_rel("on_plane", {"e1"}, "top");
     }
     SUBCASE("right is YZ") {
-        entities = {arc3("e1", {1, 0, 0}, {2, 5, 5}, {1, 10, 0})};
+        entities = json::array({arc3("e1", {1, 0, 0}, {2, 5, 5}, {1, 10, 0})});
         c = plane_rel("on_plane", {"e1"}, "right");
     }
-    json sk{{"entities", entities}, {"constraints", {c}}};
+    json sk{{"entities", std::move(entities)}, {"constraints", json::array({c})}};
     auto sol = solve_sketch3d(sk, json::object());
     REQUIRE(sol.converged);
     CHECK(sol.skipped.empty());

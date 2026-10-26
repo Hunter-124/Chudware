@@ -37,6 +37,9 @@ public:
     device::OpenResult open(const device::Endpoint& endpoint) override;
     void close() override;
     device::WriteResult write(std::span<const std::byte> bytes) override;
+    // An expired finite deadline performs no socket I/O; an already pending
+    // terminal event is still delivered. Deadline::max() polls without waiting.
+    // Final data precedes Closed, including across deadline/byte-budget boundaries.
     device::PollResult poll(device::Deadline deadline) override;
     device::TransportKind kind() const override { return device::TransportKind::Tcp; }
 

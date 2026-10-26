@@ -23,12 +23,14 @@ set(POLYMESH_COMMIT "a9fe080daf6e15187ab9d31ce7acedb93d6d7fe7"
 set(POLYMESH_REPOSITORY "https://github.com/Hunter-124/Polyhedral-FEA.git"
     CACHE STRING "Polyhedral-FEA fetch repository")
 
-# Files this module WRITES into the managed checkout (see the ONNX Runtime digest block
-# below). Git refuses to move HEAD over a locally modified tracked file, so without a
+# Files this module WRITES into the managed checkout (audited transforms below).
+# Git refuses to move HEAD over a locally modified tracked file, so without a
 # targeted restore the first patch would block every future POLYMESH_COMMIT bump until
 # someone cleaned the tree by hand. Keep this list in sync with anything that writes to
 # ${_pm_src}: it is the exhaustive set of paths the checkout below is allowed to discard.
-set(_pm_managed_patch_files "src/advisor/CMakeLists.txt")
+set(_pm_managed_patch_files
+    "src/advisor/CMakeLists.txt"
+    "src/adapt/src/graded_sizing.cpp")
 
 # --- local development source override ---------------------------------------
 # POLYMESH_SOURCE_DIR is a developer's live Polyhedral-FEA checkout (the repository root
@@ -134,13 +136,15 @@ if(NOT _pm_root_is_override)
   endif()
   # Replacement refs can make a pinned commit name resolve to other objects, and
   # unmanaged worktree edits are not the pinned source. Only the module's own
-  # managed patch may differ from authenticated HEAD.
+  # managed patches may differ from authenticated HEAD.
   chudware_require_pinned_git("${_pm_src}" "${POLYMESH_COMMIT}")
   execute_process(
     COMMAND "${GIT_EXECUTABLE}" --no-replace-objects -C "${_pm_src}" status --porcelain=v1
             --untracked-files=all
     RESULT_VARIABLE _pm_status_rc OUTPUT_VARIABLE _pm_status OUTPUT_STRIP_TRAILING_WHITESPACE)
-  string(REPLACE " M src/advisor/CMakeLists.txt" "" _pm_status "${_pm_status}")
+  foreach(_pm_patched IN LISTS _pm_managed_patch_files)
+    string(REPLACE " M ${_pm_patched}" "" _pm_status "${_pm_status}")
+  endforeach()
   string(STRIP "${_pm_status}" _pm_status)
   if(NOT _pm_status_rc EQUAL 0 OR _pm_status)
     message(FATAL_ERROR "[polymesh] managed checkout differs from pinned source: ${_pm_status}")
@@ -247,6 +251,40 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8)
         "${_pm_advisor_cmake}; upstream layout changed")
     endif()
     file(WRITE "${_pm_advisor_cmake}" "${_pm_advisor_pinned}")
+  endif()
+endif()
+
+# A constant GradedSizing already returns h_min without querying its sources.
+# Upstream nevertheless builds the hash grid first: coplanar interface seeds
+# have zero volume and h_min == h_max gives zero influence radius, producing
+# enormous/overflowing grid dimensions and std::bad_alloc on Apple silicon.
+# Apply the same constant-field predicate before grid construction. Both the
+# pinned original and exact derived source are authenticated, making repeated
+# configure a no-op without accepting arbitrary managed-source modifications.
+# Explicit source overrides remain the caller's tree and are never patched.
+if(NOT _pm_root_is_override)
+  set(_pm_graded_source "${_pm_src}/src/adapt/src/graded_sizing.cpp")
+  set(_pm_graded_original_hash
+      "046ffbb3c17317362200acf7eaf11b042d674eae652bac7abf1ff5d82f98be55")
+  set(_pm_graded_corrected_hash
+      "6467537f25b5024eb7e0d3339dde013733eb668884c95e80f11938fe1f11854a")
+  file(SHA256 "${_pm_graded_source}" _pm_graded_hash)
+  if(_pm_graded_hash STREQUAL _pm_graded_original_hash)
+    file(READ "${_pm_graded_source}" _pm_graded_text)
+    string(REPLACE
+      "    grid_nx_ = grid_ny_ = grid_nz_ = 0;\n    if (sources_.empty()) {"
+      "    grid_nx_ = grid_ny_ = grid_nz_ = 0;\n    if (sources_.empty() || h_max_ - h_min_ <= 1e-30) {"
+      _pm_graded_corrected "${_pm_graded_text}")
+    string(SHA256 _pm_graded_derived_hash "${_pm_graded_corrected}")
+    if(NOT _pm_graded_derived_hash STREQUAL _pm_graded_corrected_hash)
+      message(FATAL_ERROR
+        "[polymesh] constant-field grid correction did not produce the audited source")
+    endif()
+    file(WRITE "${_pm_graded_source}" "${_pm_graded_corrected}")
+  elseif(NOT _pm_graded_hash STREQUAL _pm_graded_corrected_hash)
+    message(FATAL_ERROR
+      "[polymesh] graded sizing source differs from the pinned original and audited "
+      "constant-field correction; update the managed transform for the new upstream source")
   endif()
 endif()
 

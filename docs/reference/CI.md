@@ -148,8 +148,9 @@ Rendering checks require opaque faces to cover shared triangle edges without
 revealing an opposite face's finish.
 
 Managed PolyMesh sources receive an authenticated, idempotent constant-sizing
-grid correction during configure. Both the pinned original and exact corrected
-source are hash-checked; explicit developer source overrides are never modified.
+grid correction during configure. Hashes authenticate the pinned original or exact
+corrected source after normalizing Git's LF/CRLF checkout line endings; explicit
+developer source overrides are never modified.
 The meshing regressions require positive-quality two-body geometry for interface
 sizes equal to or coarser than the background, not a particular error message.
 

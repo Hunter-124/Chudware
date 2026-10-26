@@ -268,9 +268,11 @@ if(NOT _pm_root_is_override)
       "046ffbb3c17317362200acf7eaf11b042d674eae652bac7abf1ff5d82f98be55")
   set(_pm_graded_corrected_hash
       "6467537f25b5024eb7e0d3339dde013733eb668884c95e80f11938fe1f11854a")
-  file(SHA256 "${_pm_graded_source}" _pm_graded_hash)
+  file(READ "${_pm_graded_source}" _pm_graded_text)
+  # Authenticate canonical LF content, including Git's Windows CRLF checkouts.
+  string(REPLACE "\r\n" "\n" _pm_graded_text "${_pm_graded_text}")
+  string(SHA256 _pm_graded_hash "${_pm_graded_text}")
   if(_pm_graded_hash STREQUAL _pm_graded_original_hash)
-    file(READ "${_pm_graded_source}" _pm_graded_text)
     string(REPLACE
       "    grid_nx_ = grid_ny_ = grid_nz_ = 0;\n    if (sources_.empty()) {"
       "    grid_nx_ = grid_ny_ = grid_nz_ = 0;\n    if (sources_.empty() || h_max_ - h_min_ <= 1e-30) {"

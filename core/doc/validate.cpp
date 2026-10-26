@@ -1168,7 +1168,7 @@ vector<string> validate_constraint(const json& c, const string& where,
         return {has_dot, et};
     };
 
-    auto bad_ref = [&](size_t i, const string& expected) {
+    auto bad_ref = [&errs, &where, &refs, &ctype](size_t i, const string& expected) {
         errs.push_back(where + ".refs[" + std::to_string(i) + "]: '" +
                        (refs[i].is_string() ? refs[i].get<string>() : refs[i].dump()) +
                        "' " + ctype + " needs " + expected);

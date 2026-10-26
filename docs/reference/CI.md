@@ -22,6 +22,11 @@ Strict mode makes `gate.sh` fail instead of skipping when a toolchain is
 missing, so a broken CI image can never pass by testing nothing. Locally the
 same script skips unavailable stages.
 
+Native builds ask Ninja to finish independent targets after a compiler failure
+(`-k 0`), so one clean-runner log reports the independent failures instead of
+revealing them one at a time. The build still exits unsuccessfully and tests
+are not run against incomplete output.
+
 Linux gate, native-build and release containers use an init process to reap
 orphaned subprocesses after timeout/cancellation checks. The shared
 `.github/scripts/prepare-linux-ci.sh` gives them private `HOME`, `XDG_DATA_HOME`
@@ -108,7 +113,7 @@ failed physical result. Interrupting a check cancels only its own unfinished job
 Native builds use the same presets as `native-build.yml`:
 
 ```bash
-cmake --preset linux-core && cmake --build --preset linux-core
+cmake --preset linux-core && cmake --build --preset linux-core -- -k 0
 ctest --test-dir build/linux-core/core --output-on-failure
 ```
 
@@ -126,6 +131,9 @@ locale-independent numeric reader for SAT imports, with a bounded input view
 rather than a token-string copy. Native parser tests cover decimal points,
 exponents, partial input and exact token boundaries. Geometry identifiers avoid
 the Windows SDK's `near` macro; the public JSON `near` selection hint is unchanged.
+Constraint diagnostic closures explicitly capture their inputs for MSVC. Native
+test variables must not shadow C functions used by assertion macros: on Darwin,
+doctest calls `raise(SIGTRAP)`.
 
 ### Complete self-host image
 

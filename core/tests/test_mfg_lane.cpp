@@ -1484,8 +1484,8 @@ TEST_CASE("attention retries do not append and re-raise retains cumulative accou
         ManufacturingLane lane(temp.path);
         const auto device = call(lane, "mfg_device_list").at("devices").at(0).at("device_id");
         call(lane, "mfg_device_claim", {{"device_id", device}});
-        const json raise{{"id", "attention:retry"}, {"reason", "fault"}, {"why", "inspect"}};
-        call(lane, "mfg_attention_raise", raise);
+        const json raise_request{{"id", "attention:retry"}, {"reason", "fault"}, {"why", "inspect"}};
+        call(lane, "mfg_attention_raise", raise_request);
         const json request{{"id", "attention:retry"},
                            {"delivery", {{"channel", "desktop"}, {"attempt", 1},
                                          {"status", "delivered"}}}};
@@ -1504,7 +1504,7 @@ TEST_CASE("attention retries do not append and re-raise retains cumulative accou
               resolved.at("attention").at("resolved_seq"));
         CHECK(call(lane, "mfg_journal_query").at("head_seq") == before.at("head_seq"));
         CHECK(std::filesystem::file_size(temp.path / "journal.jsonl") == file_bytes);
-        final_item = call(lane, "mfg_attention_raise", raise).at("attention");
+        final_item = call(lane, "mfg_attention_raise", raise_request).at("attention");
         CHECK(final_item.at("occurrence_count") == 2);
         CHECK(final_item.at("delivery_count") == 1);
         CHECK(final_item.at("deliveries") == delivery.at("attention").at("deliveries"));

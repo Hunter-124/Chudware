@@ -1,4 +1,7 @@
 // Standalone production SAT tokenizer regressions; no OCCT, daemon, or geometry.
+#ifdef __APPLE__
+#include "../device/numeric_parse.h"
+#endif
 #include <array>
 #include <charconv>
 #include <cctype>
@@ -23,6 +26,16 @@ void require(bool value, const char* message) {
 void regressions() {
     using namespace chudware::doc;
     const std::string prefix = "700 0 1 0\n1 1e-6 1e-10\nbody ";
+    const auto numbers = parse_sat(prefix + "-3 +.25 1.5e+2 #\n");
+    require(numbers.recs.size() == 1 && numbers.recs[0].t.size() == 3,
+            "numeric SAT record changed its token boundaries");
+    const auto& tokens = numbers.recs[0].t;
+    require(tokens[0].k == TK::Num && tokens[0].integral && tokens[0].i == -3,
+            "signed SAT integer lost its integer identity");
+    require(tokens[1].k == TK::Num && !tokens[1].integral && tokens[1].d == 0.25,
+            "leading-plus SAT decimal was not parsed exactly");
+    require(tokens[2].k == TK::Num && !tokens[2].integral && tokens[2].d == 150.0,
+            "SAT exponent was not parsed exactly");
     for (const std::string& token : {"@18446744073709551594 x", "@184467440737095516160 x",
                                    "@99 x", "@1x", "@999999999999999999999999 x"}) {
         bool refused = false;

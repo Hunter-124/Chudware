@@ -121,6 +121,12 @@ its unused BLAS/LAPACK implementations. This avoids probing an unrelated MinGW
 Fortran compiler in an MSVC build and does not change the application's system
 BLAS/CHOLMOD acceleration.
 
+Apple SDKs without floating-point `std::from_chars` use the existing
+locale-independent numeric reader for SAT imports, with a bounded input view
+rather than a token-string copy. Native parser tests cover decimal points,
+exponents, partial input and exact token boundaries. Geometry identifiers avoid
+the Windows SDK's `near` macro; the public JSON `near` selection hint is unchanged.
+
 ### Complete self-host image
 
 From the repository root, using a fresh isolated Compose project:

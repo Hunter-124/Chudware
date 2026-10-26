@@ -2,9 +2,9 @@
 
 #include <cmath>
 #include <cstddef>
+#include <istream>
 #include <locale>
-#include <sstream>
-#include <string>
+#include <streambuf>
 #include <string_view>
 
 namespace chudware::device {
@@ -18,18 +18,21 @@ inline bool parseFiniteDoublePrefix(std::string_view text, double& value,
   if (text.empty() || text.front() == '+') return false;
 
   // Apple libc++ still deletes the floating-point from_chars overloads on some toolchains.
-  std::istringstream input{std::string(text)};
+  class ViewBuffer final : public std::streambuf {
+   public:
+    explicit ViewBuffer(std::string_view view) {
+      // Only the get area is exposed: extraction never writes through this pointer.
+      auto* begin = const_cast<char*>(view.data());
+      setg(begin, begin, begin + view.size());
+    }
+    std::size_t consumed() const { return static_cast<std::size_t>(gptr() - eback()); }
+  } buffer(text);
+  std::istream input(&buffer);
   input.imbue(std::locale::classic());
   input >> std::noskipws >> value;
   if (!input || !std::isfinite(value)) return false;
 
-  if (input.eof()) {
-    consumed = text.size();
-  } else {
-    const auto position = input.tellg();
-    if (position < 0) return false;
-    consumed = static_cast<std::size_t>(position);
-  }
+  consumed = buffer.consumed();
   return consumed != 0;
 }
 

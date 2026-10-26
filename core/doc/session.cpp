@@ -19273,10 +19273,10 @@ json project_external_refs(const json& doc, const chudware::geom::SketchPlane& p
             TopoDS_Shape sub = resolve_sub(sel, "edge");
             TopoDS_Edge edge = TopoDS::Edge(sub);
             if (ref.value("mode", std::string()) == "pierce") {
-                std::optional<Eigen::Vector2d> near;
+                std::optional<Eigen::Vector2d> preferred_point;
                 if (ref.contains("near") && ref["near"].is_array() && ref["near"].size() == 2)
-                    near = Eigen::Vector2d(ref["near"][0].get<double>(), ref["near"][1].get<double>());
-                const auto point = pierce_edge_to_plane(edge, plane, near);
+                    preferred_point = Eigen::Vector2d(ref["near"][0].get<double>(), ref["near"][1].get<double>());
+                const auto point = pierce_edge_to_plane(edge, plane, preferred_point);
                 if (!point)
                     throw OpError("convert_failed", "no_pierce: edge has no plane crossing",
                                   {{"reason", "no plane crossing"}});

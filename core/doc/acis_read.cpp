@@ -22,6 +22,9 @@
 // tools/crypt.py).
 
 #include "doc/acis_read.h"
+#ifdef __APPLE__
+#include "device/numeric_parse.h"
+#endif
 
 #include <BRepBuilderAPI_GTransform.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>

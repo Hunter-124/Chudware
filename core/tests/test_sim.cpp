@@ -1031,6 +1031,104 @@ TEST_CASE("sim_cancel registry: running job cancels, unknown/finished reports cl
     CHECK_FALSE(done.value("cancelled", true));
 }
 
+TEST_CASE("sim_cancel isolates actors and preserves owned job generations") {
+    using namespace chudware::sim;
+    CellPrincipal a{"team:one", "a", false}, b{"team:one", "b", false};
+    CellPrincipal manager{"team:one", "manager", true}, foreignManager{"team:two", "manager", true};
+    SimCancelToken aToken, bToken;
+    {
+        CellRequestScope scope(&a);
+        aToken = sim_job_register("a-job");
+        REQUIRE(aToken != nullptr);
+    }
+    {
+        CellRequestScope scope(&b);
+        bToken = sim_job_register("b-job");
+        REQUIRE(bToken != nullptr);
+        CHECK(sim_cancel("a-job")["code"] == "not_found");
+        CHECK(sim_cancel("missing")["code"] == "not_found");
+        CHECK_THROWS_AS(sim_job_register("a-job"), CellOwnershipError);
+        CHECK_FALSE(aToken->load());
+        CHECK(sim_cancel("")["count"] == 1);
+        CHECK(bToken->load());
+        CHECK_FALSE(aToken->load());
+        sim_job_unregister("a-job", aToken);
+    }
+    {
+        CellRequestScope scope(&foreignManager);
+        CHECK(sim_cancel("a-job")["code"] == "not_found");
+    }
+    {
+        CellRequestScope scope(&manager);
+        CHECK(sim_cancel("")["count"] == 0);
+        CHECK(sim_cancel("a-job")["cancelled"] == true);
+    }
+    {
+        CellRequestScope scope(&a);
+        auto newer = sim_job_register("a-job");
+        REQUIRE(newer != nullptr);
+        sim_job_unregister("a-job", aToken);
+        CHECK(sim_cancel("a-job")["cancelled"] == true);
+        CHECK(newer->load());
+        sim_job_unregister("a-job", newer);
+    }
+    {
+        CellRequestScope scope(&b);
+        sim_job_unregister("b-job", bToken);
+    }
+    CHECK(current_cell_principal() == nullptr);
+    CHECK(sim_cancel("absent")["cancelled"] == false);
+    auto desktop = sim_job_register("desktop");
+    REQUIRE(desktop != nullptr);
+    CHECK(sim_cancel("")["cancelled"] == false);
+    CHECK_FALSE(desktop->load());
+    CHECK(sim_cancel("desktop")["cancelled"] == true);
+    sim_job_unregister("desktop", desktop);
+}
+
+TEST_CASE("sim_cancel retains revocation tombstones without blocking newer epochs") {
+    using namespace chudware::sim;
+    CellPrincipal current{"team:revocation", "actor", false, 2};
+    CellPrincipal stale{"team:revocation", "actor", false, 1};
+    SimCancelToken token, anonymous;
+    {
+        CellRequestScope scope(&current);
+        token = sim_job_register("epoch-two");
+        anonymous = sim_job_register("");
+        REQUIRE(token != nullptr);
+        REQUIRE(anonymous != nullptr);
+        CHECK(sim_cancel("", 1)["count"] == 0);
+        CHECK_FALSE(token->load());
+        CHECK_FALSE(anonymous->load());
+        sim_cancel("", 0);
+    }
+    for (const char* id : {"late-named", ""}) {
+        CellRequestScope scope(&stale);
+        CHECK_THROWS_AS(sim_job_register(id), CellRevokedError);
+        CHECK(cell_request_revoked());
+    }
+    {
+        CellRequestScope scope(&current);
+        auto fresh = sim_job_register("fresh-epoch-two");
+        REQUIRE(fresh != nullptr);
+        sim_job_unregister("fresh-epoch-two", fresh);
+        CHECK(sim_cancel("", 2)["count"] == 2);
+        CHECK(token->load());
+        CHECK(anonymous->load());
+        sim_job_unregister("epoch-two", token);
+        sim_job_unregister("", anonymous);
+        CHECK_THROWS_AS(sim_job_register("late-after-full-revoke"), CellRevokedError);
+    }
+    current.epoch = 3;
+    {
+        CellRequestScope scope(&current);
+        auto next = sim_job_register("epoch-three");
+        REQUIRE(next != nullptr);
+        CHECK_FALSE(cell_request_revoked());
+        sim_job_unregister("epoch-three", next);
+    }
+}
+
 TEST_CASE("lbm_run stops at a checkpoint when should_cancel fires") {
     using chudware::sim::lbm_run;
     using chudware::sim::LbmParams;

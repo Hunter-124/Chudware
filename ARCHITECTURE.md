@@ -110,6 +110,10 @@ The Python engine (`engine_oracle/`) is deleted; `scripts/check.py`'s
 - Core trees: CMake presets ([CMakePresets.json](CMakePresets.json)) build into
   `build/<preset>` (`ctest --test-dir build/<preset>/core`); the gate, GUI, and hostd
   consume `core/build-linux` / `core/build-occt-linux` (`ctest --test-dir core/build-linux`).
+- Cell-ownership coverage keeps simulation ownership, cancellation, and revocation checks
+  in the statically linked `test_sim` suite. `test_hostd_cell_ownership` exercises the
+  real document registry and native C ABI, without linking engine static modules alongside
+  `libchudware`; internal C++ exception RTTI is not a cross-library contract.
 - Python suites via the service venv the gate resolves (default
   `~/.local/share/Chudware/mcp-venv/bin/python -m pytest <dir> -q`; override with
   `CHUDWARE_GATE_PYTHON`).

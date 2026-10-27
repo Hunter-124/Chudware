@@ -1,5 +1,4 @@
 #include "hostd/doc_registry.h"
-#include "sim/sim_cancel.h"
 #include "api/libchudware.h"
 
 #include <chrono>
@@ -12,7 +11,6 @@
 #include <vector>
 
 using nlohmann::json;
-using namespace chudware::sim;
 
 static void require(bool value, const char* message) {
     if (!value) { std::cerr << "FAILED: " << message << '\n'; std::exit(1); }
@@ -103,95 +101,6 @@ static void registryOwnership() {
     registry.handleMethod(2, "gui", "edit_hold", params, result, isError);
     require(isError && result["code"] == "forbidden_right", "viewer cannot acquire write hold");
     registry.onDisconnect(2, "gui");
-}
-
-static void simulationOwnership() {
-    CellPrincipal a{"team:one", "a", false}, b{"team:one", "b", false};
-    CellPrincipal manager{"team:one", "manager", true}, foreignManager{"team:two", "manager", true};
-    SimCancelToken aToken, bToken;
-    {
-        CellRequestScope scope(&a);
-        aToken = sim_job_register("a-job");
-    }
-    {
-        CellRequestScope scope(&b);
-        bToken = sim_job_register("b-job");
-        require(sim_cancel("a-job")["code"] == "not_found", "foreign sim cancel hidden");
-        require(sim_cancel("missing")["code"] == "not_found", "absent and foreign sim errors match");
-        bool refused = false;
-        try { sim_job_register("a-job"); } catch (const CellOwnershipError&) { refused = true; }
-        require(refused && !aToken->load(), "foreign register cannot replace or cancel owner token");
-        require(sim_cancel("")["count"] == 1, "empty cancel only own sim jobs");
-        require(bToken->load() && !aToken->load(), "own empty cancel does not affect another actor");
-        sim_job_unregister("a-job", aToken);
-    }
-    {
-        CellRequestScope scope(&foreignManager);
-        require(sim_cancel("a-job")["code"] == "not_found", "manager cannot cross workspace");
-    }
-    {
-        CellRequestScope scope(&manager);
-        require(sim_cancel("")["count"] == 0, "manager empty cancel remains own only");
-        require(sim_cancel("a-job")["cancelled"] == true, "workspace manager can cancel named job");
-    }
-    {
-        CellRequestScope scope(&a);
-        auto newer = sim_job_register("a-job");
-        sim_job_unregister("a-job", aToken);
-        require(sim_cancel("a-job")["cancelled"] == true && newer->load(), "stale unregister cannot erase new owner generation");
-        sim_job_unregister("a-job", newer);
-    }
-    {
-        CellRequestScope scope(&b);
-        sim_job_unregister("b-job", bToken);
-    }
-    require(current_cell_principal() == nullptr, "request context restored after scopes");
-    require(sim_cancel("absent")["cancelled"] == false, "desktop absent cancel stays idempotent");
-    auto desktop = sim_job_register("desktop");
-    require(sim_cancel("")["cancelled"] == false && !desktop->load(), "desktop empty sim cancellation unchanged");
-    require(sim_cancel("desktop")["cancelled"] == true, "desktop named cancellation unchanged");
-    sim_job_unregister("desktop", desktop);
-}
-
-static void simulationRevocation() {
-    CellPrincipal current{"team:revocation", "actor", false, 2};
-    CellPrincipal stale{"team:revocation", "actor", false, 1};
-    SimCancelToken token, anonymous;
-    {
-        CellRequestScope scope(&current);
-        token = sim_job_register("epoch-two");
-        anonymous = sim_job_register("");
-        require(anonymous != nullptr, "cell anonymous simulation receives cancellation token");
-        require(sim_cancel("", 1)["count"] == 0 && !token->load() && !anonymous->load(),
-            "role-update cutoff preserves newer epoch jobs");
-        sim_cancel("", 0);
-    }
-    for (const char* id : {"late-named", ""}) {
-        CellRequestScope scope(&stale);
-        bool revoked = false;
-        try { sim_job_register(id); } catch (const CellRevokedError&) { revoked = true; }
-        require(revoked && cell_request_revoked(), "late stale named/anonymous simulation refused");
-    }
-    {
-        CellRequestScope scope(&current);
-        auto fresh = sim_job_register("fresh-epoch-two");
-        require(fresh != nullptr, "new epoch simulation admitted after update");
-        sim_job_unregister("fresh-epoch-two", fresh);
-        require(sim_cancel("", 2)["count"] == 2 && token->load() && anonymous->load(),
-            "revocation stops both named and anonymous owned simulations");
-        sim_job_unregister("epoch-two", token);
-        sim_job_unregister("", anonymous);
-        bool revoked = false;
-        try { sim_job_register("late-after-full-revoke"); } catch (const CellRevokedError&) { revoked = true; }
-        require(revoked, "empty live set retains revocation tombstone");
-    }
-    current.epoch = 3;
-    {
-        CellRequestScope scope(&current);
-        auto next = sim_job_register("epoch-three");
-        require(next != nullptr && !cell_request_revoked(), "new simulation epoch restores clean request context");
-        sim_job_unregister("epoch-three", next);
-    }
 }
 
 struct LiveRun {
@@ -299,8 +208,6 @@ int main() {
     setenv("XDG_DATA_HOME", root.string().c_str(), 1);
 #endif
     registryOwnership();
-    simulationOwnership();
-    simulationRevocation();
     nativeOwnership();
     std::filesystem::remove_all(root);
     std::cout << "hostd cell ownership tests passed\n";

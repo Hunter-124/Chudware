@@ -2413,7 +2413,8 @@ if(CHUDWARE_WITH_OCCT)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_dependencies(chudware-hostd chudware)  # engine staged before the daemon can serve it
 
-  # Offline cell-ownership regressions over the real DocRegistry, native run/sim controls.
+  # Offline cell-ownership regressions over the real DocRegistry and native C ABI.
+  # Keep internal C++ simulation checks in test_sim, not across the shared-library boundary.
   if(NOT WIN32)
     add_executable(test_hostd_cell_ownership
       ${CMAKE_CURRENT_SOURCE_DIR}/../host/tests/test_hostd_cell_ownership.cpp
@@ -2422,7 +2423,7 @@ if(CHUDWARE_WITH_OCCT)
     target_include_directories(test_hostd_cell_ownership PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR} ${CHUDWARE_GENERATED_INCLUDE_DIR})
     target_link_libraries(test_hostd_cell_ownership PRIVATE
-      chudware chudware_sim chudware_agent Threads::Threads nlohmann_json::nlohmann_json)
+      chudware Threads::Threads nlohmann_json::nlohmann_json)
     set_target_properties(test_hostd_cell_ownership PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
     add_test(NAME hostd_cell_ownership COMMAND test_hostd_cell_ownership)

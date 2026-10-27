@@ -136,10 +136,15 @@ CHUDWARE_PYTHON="$PWD/.venv-mcp/bin/python" CHUDWARE_REPO="$PWD" ./host/build-li
 The GUI starts the shared engine daemon `chudware-hostd` on demand and attaches to it over
 local IPC; see [docs/reference/HOSTD.md](docs/reference/HOSTD.md) for its lifecycle.
 
-The native copilot's optional online agent runtime is a separate binary (`chud`) pinned
-by `vendor/chudcode/CHUDCODE_ARTIFACT.lock`. Its verified source archive and supported
-platform binaries are hosted in this repository's releases; no companion repository
-access is needed. Download and verify the runtime, then point Chudware at it:
+The native copilot's optional online agent runtime is
+[Chudcode](https://github.com/Hunter-124/chudcode), an MIT-licensed dependency
+running as a separate binary (`chud`) pinned by
+`vendor/chudcode/CHUDCODE_ARTIFACT.lock`. See its
+[contribution guide](https://github.com/Hunter-124/chudcode/blob/main/CONTRIBUTING.md)
+for runtime changes. Chudware's verified source archive and supported platform
+binaries remain hosted in this repository's releases; no companion repository
+checkout or private access is needed. Download and verify the runtime, then point
+Chudware at it:
 
 ```bash
 .venv-mcp/bin/python scripts/pin_chudcode.py ensure --target linux-x86_64 \

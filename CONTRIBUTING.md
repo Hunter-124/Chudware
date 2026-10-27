@@ -35,10 +35,15 @@ manufacturing, twin, and print layers require C++20. CUDA is an optional LBM bac
 [docs/reference/BUILD_WINDOWS.md](docs/reference/BUILD_WINDOWS.md).
 
 For browser work, start with [web/README.md](web/README.md). The Compose path builds
-the browser bundle, native engine and non-AI Python workers without the private
-online-agent SDK/runtime. The full native provisioning command currently still
-requires access to the private SDK repository; do not describe it as an anonymous
-public bootstrap.
+the browser bundle, native engine and non-AI Python workers without the optional
+online-agent SDK/runtime. Native provisioning uses the SHA-256-pinned SDK source
+archive and runtime assets in Chudware's
+[`chudcode-runtime-v0.4.4` release](https://github.com/Hunter-124/Chudware/releases/tag/chudcode-runtime-v0.4.4);
+no private repository access is required. The MIT runtime dependency's
+[source and contribution guide](https://github.com/Hunter-124/chudcode) are public
+entrypoints for runtime changes. Keep Chudware's mirrored URLs, source revision
+and hash requirements intact; see [runtime setup](README.md#running) and the
+[integration boundary](docs/dev/chudcode-integration.md).
 
 Enable the repository's pre-commit hook once per clone:
 

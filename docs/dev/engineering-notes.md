@@ -93,6 +93,9 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   non-destructive booleans share untouched sub-shapes with their arguments. OCCT
   UnifySameDomain edits its input's edges in place, so unify runs on a `BRepBuilderAPI_Copy`
   (`geom::unify_same_domain`, the `dress.cpp` join) with the copy's history recorded.
+- Embedded BREP base64 decoding uses an unsigned rolling bit accumulator. Signed
+  overflow/left shifts are undefined in C++17 even when only the low output byte
+  is retained; preserve the unsigned accumulator when changing persistence code.
 - `core/agent/run.cpp` calls doc ops in-process; every direct `doc::doc_new`/`doc_apply_ops`
   site invokes the `chudware_set_doc_publish_sink` callback, or its result stays invisible to
   clients until the run ends. `internal:true` keeps propagating (preflight shadow clone).

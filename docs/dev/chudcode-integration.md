@@ -10,6 +10,16 @@ Version-specific runtime behavior described here is checked against
 re-verify it when the lock moves. Daemon, document and simulation invariants are in
 [engineering-notes.md](engineering-notes.md).
 
+Runtime source, native build instructions and contribution policy are in
+[`Hunter-124/chudcode`](https://github.com/Hunter-124/chudcode); report runtime
+vulnerabilities through its
+[private advisory route](https://github.com/Hunter-124/chudcode/security/advisories/new).
+Chudware provisioning continues to use the immutable, SHA-256-pinned SDK source
+archive and native binaries in
+[Chudware's `chudcode-runtime-v0.4.4` release](https://github.com/Hunter-124/Chudware/releases/tag/chudcode-runtime-v0.4.4),
+not a moving upstream checkout or a private SDK. Preserve the mirror URLs,
+source commit and hash requirements when working on this boundary.
+
 ## Authority boundary
 
 - **Chudcode owns** online agent turns and nested agents: provider calls, provider auth,

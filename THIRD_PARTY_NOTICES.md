@@ -81,6 +81,10 @@ The notices are hash-locked by `vendor/chudcode/CHUDCODE_ARTIFACT.lock` and must
 accompany any payload that includes the runtime. The recommended browser container
 ships neither this binary nor the `chudcode-rpc` SDK because online Copilot is unsupported there.
 
+Runtime source and contribution instructions are available at
+[`Hunter-124/chudcode`](https://github.com/Hunter-124/chudcode). Public source
+availability does not change the mirrored artifact URLs or notice/hash locks.
+
 | Component | Version | License (SPDX) | How incorporated | Upstream |
 |---|---|---|---|---|
 | Chudcode (`chud` binary) | 0.4.4, commit `8f70d216879be0cfe6bfeb5520f2370521224330` | MIT | optional native prebuilt binary, obtained from this repository's runtime release at packaging/provisioning time and SHA-256 verified; subprocess over RPC; not in the recommended browser container | repository and release URLs recorded in `vendor/chudcode/CHUDCODE_ARTIFACT.lock` (`macos-arm64` is not pinned) |
@@ -119,7 +123,7 @@ programs, separately installed models or browser-incompatible features are provi
 | opencv-python-headless | 5.0.0.93 | Apache-2.0 | metadata | Wheels bundle FFmpeg under LGPL-2.1-or-later (per upstream) |
 | pycolmap | 3.13.0 | BSD-3-Clause | PyPI | |
 | mcp | 1.28.1 | MIT | metadata | |
-| chudcode-rpc | 0.3.1 | MIT | metadata | See section 2 |
+| chudcode-rpc | 0.3.2 | MIT | requirements | SHA-256-pinned source archive; see section 2 |
 | anthropic | 0.107.1 | MIT | PyPI | |
 | openai | 2.41.0 | Apache-2.0 | metadata | |
 | httpx | 0.28.1 | BSD-3-Clause | metadata | |

@@ -4047,7 +4047,8 @@ std::string b64_decode(const std::string& in) {
     }
     std::string out;
     out.reserve(in.size() / 4 * 3);
-    int val = 0, bits = -8;
+    uint32_t val = 0;
+    int bits = -8;
     for (unsigned char c : in) {
         if (c == '=' || rev[c] < 0) {
             if (c == '=') break;

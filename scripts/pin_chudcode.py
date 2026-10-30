@@ -492,17 +492,15 @@ def fetch_artifact(
     lock = load_lock(lock_path, require_pinned=False)
     artifact = _pinned_artifact(lock, target)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
+    stream = tempfile.NamedTemporaryFile(
         prefix="chudcode-", delete=False, dir=destination.parent
-    ) as stream:
-        temporary = Path(stream.name)
-        try:
+    )
+    temporary = Path(stream.name)
+    try:
+        # Windows cannot unlink an open temporary file, including on transfer failure.
+        with stream:
             with _open_pinned_url(artifact["url"]) as response:
                 shutil.copyfileobj(response, stream)
-        except Exception:
-            temporary.unlink(missing_ok=True)
-            raise
-    try:
         if not target.startswith("windows-"):
             temporary.chmod(temporary.stat().st_mode | 0o111)
         return stage_binary(temporary, destination, target, lock_path=lock_path)

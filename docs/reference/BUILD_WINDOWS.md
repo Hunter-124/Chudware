@@ -26,6 +26,11 @@ or `core.symlinks` override.
   ```powershell
   winget install Kitware.CMake Ninja-build.Ninja
   ```
+- **Python 3.13 x64** for the services and developer checks (use the same version as CI):
+  ```powershell
+  winget install --id Python.Python.3.13 --exact --scope user
+  py -3.13 --version
+  ```
 
 ## 2. Build trees
 
@@ -144,8 +149,10 @@ Development uses a plain virtual environment installed from `requirements.txt`:
 
 ```powershell
 py -3.13 -m venv .venv-mcp
-.venv-mcp\Scripts\python -m pip install -r requirements.txt
+.venv-mcp\Scripts\python -m pip install -r requirements.txt pytest pytest-timeout
 $env:CHUDWARE_PYTHON = "$PWD\.venv-mcp\Scripts\python.exe"
+.venv-mcp\Scripts\python -m pip check
+.venv-mcp\Scripts\python scripts\mcp_runtime_audit.py --deps-only
 .venv-mcp\Scripts\python -X utf8 -m pytest services/agent -q --timeout=90
 ```
 
@@ -154,6 +161,40 @@ Python services. On POSIX the equivalent is `python3 -m venv .venv-mcp &&
 .venv-mcp/bin/python -m pip install -r requirements.txt`. Optional browser binaries and
 simulation tools keep their explicit provisioning commands; dependency setup never
 silently downloads or builds them.
+
+### Launch a developer build with the service runtime
+
+After building and provisioning above, run from the checkout root in PowerShell:
+
+```powershell
+$env:CHUDWARE_REPO = (Get-Location).Path
+$env:CHUDWARE_PYTHON = "$PWD\.venv-mcp\Scripts\python.exe"
+$runtime = & $env:CHUDWARE_PYTHON scripts\pin_chudcode.py ensure --target windows-x86_64 --cache-dir "$env:LOCALAPPDATA\Chudware\chudcode"
+if ($LASTEXITCODE -ne 0) { throw "Chudcode provisioning failed" }
+$env:CHUDWARE_CHUDCODE_BIN = ($runtime | ConvertFrom-Json).path
+& .\dist\Chudware\chudware.exe
+```
+
+The first `ensure` downloads the pinned executable; subsequent launches verify the
+digest-keyed cache. Interrupted downloads close their temporary file before cleanup,
+so Windows reports the original transfer error rather than `WinError 32`, leaves no
+partial download, and does not replace an existing installation. Provider login is a
+separate user action in Settings; provisioning does not authenticate or send a prompt.
+These environment variables apply to this shell and its children, not every application
+on the machine. Keep the checkout root as `CHUDWARE_REPO` when running a staged
+developer build so Python services resolve from the complete source tree.
+
+Windows setup and artifact regressions can be run independently:
+
+```powershell
+.venv-mcp\Scripts\python -m pytest scripts/test_windows_build.py scripts/test_pin_chudcode.py -q --timeout=90
+```
+
+The pinned v0.4.4 Windows runtime's full `--smoke-test` currently fails in its bundled
+stats dashboard with HTTP 500 ([upstream issue](https://github.com/Hunter-124/chudcode/issues/2)).
+RPC v2 startup and SDK requests can work independently; that does not qualify the
+full runtime bundle or a provider turn. Do not bypass this failure for release qualification.
+
 
 ### Optional: offline wheelhouse mode
 
@@ -183,3 +224,8 @@ interpreter must import `packaging/requirements-release.txt` for those sidecars 
 - **`freecad_parity`** — historically this ctest case differed between MSVC and GCC on
   the point-on-ellipse solver case. Check the latest Windows CI row before treating a failure
   there as a new regression.
+- **pip cache deserialization / missing unpacked metadata** — if a fresh venv encounters
+  `Cache entry deserialization failed` or a missing `pip-unpack-...\*.metadata`, retry
+  the install with `--no-cache-dir`. Do not delete another environment or its package
+  cache. Transient DNS/TLS failures are download failures, not missing package versions;
+  preserve the pinned requirements and SDK SHA-256 checks when retrying.

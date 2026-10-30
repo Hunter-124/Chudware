@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import struct
 import sys
 from pathlib import Path
@@ -163,7 +164,8 @@ def test_verified_stage_is_offline_and_uses_canonical_filename(
     assert evidence["rpc_protocol"] == 2
     assert evidence["version"] == "0.2.0"
     assert evidence["engine_version"] == "18.0.8"
-    assert destination.stat().st_mode & 0o111
+    if os.name != "nt":
+        assert destination.stat().st_mode & 0o111
 
 
 
@@ -468,6 +470,35 @@ def test_fetch_refuses_untrusted_redirects(
     assert not (tmp_path / "out" / "chud").exists()
 
 
+@pytest.mark.parametrize("failure", ["open", "read"])
+def test_failed_download_preserves_error_and_destination_without_partial_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    lock, _ = _lock(tmp_path)
+    destination = tmp_path / "out" / "chud.exe"
+    destination.parent.mkdir()
+    destination.write_bytes(b"retained installation")
+    error = TimeoutError("interrupted artifact transfer")
+
+    class InterruptedResponse(_Response):
+        def read(self, *_args):
+            if self._body:
+                return super().read()
+            raise error
+
+    def open_artifact(_url):
+        if failure == "open":
+            raise error
+        return InterruptedResponse(b"partial download")
+
+    monkeypatch.setattr(pin, "_open_pinned_url", open_artifact)
+    with pytest.raises(TimeoutError) as caught:
+        pin.fetch_artifact(destination, "windows-x86_64", lock_path=lock)
+    assert caught.value is error
+    assert destination.read_bytes() == b"retained installation"
+    assert list(destination.parent.iterdir()) == [destination]
+
+
 @pytest.mark.parametrize("stage", [False, True])
 def test_replaced_input_is_never_executed_or_published(tmp_path, monkeypatch, stage):
     lock, binaries = _lock(tmp_path)
@@ -479,7 +510,8 @@ def test_replaced_input_is_never_executed_or_published(tmp_path, monkeypatch, st
         observed.append(snapshot)
         assert snapshot != source
         assert snapshot.read_bytes() == approved
-        assert snapshot.parent.stat().st_mode & 0o077 == 0
+        if os.name != "nt":
+            assert snapshot.parent.stat().st_mode & 0o077 == 0
         return "Chudcode v0.2.0"
     monkeypatch.setattr(pin, "_verify_executable_version", verify_private_snapshot)
     if stage:

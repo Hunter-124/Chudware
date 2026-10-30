@@ -71,13 +71,15 @@ def _ps_literal(value: Path) -> str:
 
 
 @pytest.fixture
-def native_scripts(tmp_path):
+def native_scripts(tmp_path, monkeypatch):
     # Derive the trusted system inspector exactly as release verification does;
     # this also refuses Wine rather than accepting an executable named powershell.
     try:
         from packaging.platform_publishers import _windows_powershell_executable
     except ImportError:
         import importlib.util
+        # pytest imports PyPI's packaging first; load our script with its sibling imports.
+        monkeypatch.syspath_prepend(str(ROOT / "packaging"))
         spec = importlib.util.spec_from_file_location("windows_build_publishers", ROOT / "packaging/platform_publishers.py")
         assert spec and spec.loader
         module = importlib.util.module_from_spec(spec)

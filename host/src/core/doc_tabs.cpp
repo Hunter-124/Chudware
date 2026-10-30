@@ -9,7 +9,6 @@
 // and restored with the same switch so an in-progress edit resumes in the correct document.
 #include <algorithm>
 #include <chrono>
-#include <cstdio>
 #include <set>
 #include <string>
 #include <vector>
@@ -155,12 +154,6 @@ static int reresolveTabIndex(AppState& st, int idx, const std::string& docId) {
 // switchToTab for the same doc while its rebuild drains must not post the toast again — dedup here,
 // erased in the rebuild-completion callback.
 static std::set<std::string> loadingToastInFlight;
-
-static void logTabPerf(AppState& st, const std::string& line) {
-    st.addLog(line);
-    std::fprintf(stderr, "%s\n", line.c_str());
-    std::fflush(stderr);
-}
 
 // The display title for a document: its tree "name", else a kind-appropriate default.
 static std::string docTitle(const nlohmann::json& tree, bool isAssembly) {
@@ -456,8 +449,8 @@ void AppState::switchToTab(int idx) {
             loadDocMeshAsync(dst.session->cachedAicmPath);
             const double shellMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - switchStarted).count();
-            logTabPerf(*this, "[perf] tab_switch doc=" + dst.docId +
-                       " path=cached-async shell=" + std::to_string(shellMs) + "ms");
+            addLog("[perf] tab_switch doc=" + dst.docId +
+                   " path=cached-async shell=" + std::to_string(shellMs) + "ms");
             return;
         }
     }
@@ -484,8 +477,8 @@ void AppState::switchToTab(int idx) {
         loadDocMeshAsync(dst.session->cachedAicmPath);
         const double shellMs = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - switchStarted).count();
-        logTabPerf(*this, "[perf] tab_switch doc=" + dst.docId +
-                   " path=pushed-async shell=" + std::to_string(shellMs) + "ms");
+        addLog("[perf] tab_switch doc=" + dst.docId +
+               " path=pushed-async shell=" + std::to_string(shellMs) + "ms");
         return;
     }
     if (!ok) {
@@ -542,9 +535,9 @@ void AppState::switchToTab(int idx) {
             pendingActivateGeneration = gen;
             const double shellMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - switchStarted).count();
-            logTabPerf(*this, "[perf] tab_switch doc=" + rebuildDocId +
-                       " path=async-rebuild-coalesced gen=" + std::to_string(gen) +
-                       " shell=" + std::to_string(shellMs) + "ms");
+            addLog("[perf] tab_switch doc=" + rebuildDocId +
+                   " path=async-rebuild-coalesced gen=" + std::to_string(gen) +
+                   " shell=" + std::to_string(shellMs) + "ms");
             return;
         }
         activationInFlight = true;
@@ -552,9 +545,9 @@ void AppState::switchToTab(int idx) {
         const auto rebuildQueuedAt = std::chrono::steady_clock::now();
         const double shellMs = std::chrono::duration<double, std::milli>(
             rebuildQueuedAt - switchStarted).count();
-        logTabPerf(*this, "[perf] tab_switch doc=" + rebuildDocId +
-                   " path=async-rebuild gen=" + std::to_string(gen) +
-                   " shell=" + std::to_string(shellMs) + "ms");
+        addLog("[perf] tab_switch doc=" + rebuildDocId +
+               " path=async-rebuild gen=" + std::to_string(gen) +
+               " shell=" + std::to_string(shellMs) + "ms");
         activateTabDocAsync(rebuildDocId, rebuildTabIdx, gen, rebuildQueuedAt);
         return;
     }
@@ -636,8 +629,8 @@ void AppState::switchToTab(int idx) {
            ", rev " + std::to_string(docMirror.revision()) + ")");
     const double totalMs = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - switchStarted).count();
-    logTabPerf(*this, "[perf] tab_switch doc=" + dst.docId + " path=gpu-cache mesh=" +
-                       std::to_string(meshBindMs) + "ms total=" + std::to_string(totalMs) + "ms");
+    addLog("[perf] tab_switch doc=" + dst.docId + " path=gpu-cache mesh=" +
+           std::to_string(meshBindMs) + "ms total=" + std::to_string(totalMs) + "ms");
 }
 
 void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_t generation,
@@ -676,9 +669,9 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                  }
                  const double rebuildMs = std::chrono::duration<double, std::milli>(
                      std::chrono::steady_clock::now() - queuedAt).count();
-                 logTabPerf(*this, "[perf] tab_switch_rebuild doc=" + docId +
-                                  " gen=" + std::to_string(generation) +
-                                  " total=" + std::to_string(rebuildMs) + "ms");
+                 addLog("[perf] tab_switch_rebuild doc=" + docId +
+                        " gen=" + std::to_string(generation) +
+                        " total=" + std::to_string(rebuildMs) + "ms");
                  loadingToastInFlight.erase(docId);
                  // tabIdx was captured at dispatch time; re-resolve by docId (see
                  // reresolveTabIndex above) instead of trusting it directly — a closeDocTab for

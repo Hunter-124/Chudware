@@ -67,6 +67,8 @@ Windows portability notes baked into the build:
   hides `M_PI` behind `_USE_MATH_DEFINES`). `chudware_cam` and `chudware_firmware` also export
   `_USE_MATH_DEFINES` to their consumers.
 - The core and host targets link `nlohmann_json` explicitly (no ambient system include on Windows).
+- MSVC builds use `/bigobj` for `core/doc/session.cpp` and `host/src/ui/scenarios.cpp`,
+  whose generated object sections can exceed the default compiler limit.
 - `test_cam` uses `temp_directory_path()` instead of a hardcoded `/tmp`.
 
 ## 3b. Build the core WITH the OCCT geometry kernel

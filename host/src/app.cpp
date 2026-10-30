@@ -146,6 +146,7 @@ inline void wasmBootReady() {
 #include "ui/anim.h" // shared motion language + the continuous-redraw frame request
 #include "ui/icons.h"
 #include "ui/layout.h" // Wave 1C/1D: buildDefaultLayout + tabbed left pane (drawLeftPane)
+#include "ui/onboarding.h"
 #include "ui/property_manager.h"
 #include "ui/reveng/dim_review.h" // RE-22 dimension-confirm review + deviation panels
 #include "ui/reveng/reveng_internal.h" // RE-22: S() + Stage enum for shot seeding
@@ -3836,8 +3837,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     st.showRibbon = true;
     st.showFeatureTree = true;
   }
-  // Tab-switch perf harness: 2 real parts + many A<->B switches; logTabPerf
-  // prints to stderr.
+  // Tab-switch perf harness: 2 real parts + many A<->B switches; timings go to
+  // the in-app log and the optional CHUDWARE_LOG_FILE tee.
   st.wantTabPerf = shot && shotMode && std::strcmp(shotMode, "tabperf") == 0;
   if (st.wantTabPerf) {
     st.showRibbon = true;
@@ -7760,7 +7761,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       // camActiveBackplot viewport overlay ("Show in 3D").
       const bool skipViewport = (ws == WS::Electronics);
       if (!skipViewport) {
-        if (st.wantFocusViewport > 0) {
+        // Focusing the viewport would dismiss any open popup, including startup modals.
+        // Keep the request pending until the user closes it.
+        if (st.wantFocusViewport > 0 &&
+            !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
+                                             ImGuiPopupFlags_AnyPopupLevel)) {
           ImGui::SetNextWindowFocus();
           st.wantFocusViewport--;
         }
@@ -8145,9 +8150,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // path); Discard drops them daemon-side; Later just dismisses — the daemon
     // keeps the entries, so the prompt returns on the next app start.
     {
-      if (std::string configWarning = takeConfigCorruptionWarning();
-          !configWarning.empty())
-        st.toast(ui::ToastLevel::Warn, std::move(configWarning));
+      // The warning drain shares the config writer's lock. While onboarding saves in the
+      // background, wait for its completion instead of stalling the GUI on that same lock.
+      if (!ui::onboardingCompletionWritePending()) {
+        if (std::string configWarning = takeConfigCorruptionWarning();
+            !configWarning.empty())
+          st.toast(ui::ToastLevel::Warn, std::move(configWarning));
+      }
       static int s_recoveryCount = 0;
       // Never raise it during a headless capture: this modal is centred and app-modal, so it
       // covered the very panel every CHUDWARE_SHOT scenario exists to photograph (the reveng_*

@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -40,10 +43,70 @@ struct WizardState {
     bool testError = false;
     std::string testReply;
     unsigned long long testGeneration = 0;
-    std::string persistError;
 };
 
 WizardState s_wizard;
+
+// The GL thread owns the list; each worker waits for the preceding write before starting
+// its own. This preserves request order even if the GUI stops drawing with writes pending.
+// The list is initialized only when first needed, after the app's config-warning drain has
+// initialized the config lock; its futures are therefore destroyed before that lock.
+bool s_completionPending = false;
+
+std::vector<std::shared_future<bool>>& completionWrites() {
+    static std::vector<std::shared_future<bool>> writes;
+    return writes;
+}
+
+void warnCompletionSaveFailed(AppState& st) {
+    const char* message =
+        "Setup progress could not be saved; the welcome may appear again next time.";
+    st.toast(ToastLevel::Warn, message);
+    st.addLog(std::string("[warn] ") + message);
+}
+
+void queueCompletion(AppState& st, const char* workspace) {
+    auto& writes = completionWrites();
+    const std::shared_future<bool> previous = writes.empty() ? std::shared_future<bool>{}
+                                                             : writes.back();
+    try {
+        const std::string selectedWorkspace = workspace ? workspace : "";
+        // Reserve before launching, so an allocation failure cannot destroy and wait on
+        // a just-launched future on the GUI thread.
+        if (writes.size() == writes.capacity())
+            writes.reserve(std::max(std::size_t{1}, writes.capacity() * 2));
+        writes.push_back(std::async(std::launch::async, [previous, selectedWorkspace] {
+            if (previous.valid()) previous.wait();
+            return persistOnboardingCompletion(selectedWorkspace.empty()
+                                                    ? nullptr : selectedWorkspace.c_str());
+        }).share());
+        s_completionPending = true;
+    } catch (...) {
+        // A thread launch failure must not keep the user out of local CAD.
+        warnCompletionSaveFailed(st);
+    }
+}
+
+void pollCompletion(AppState& st) {
+    if (!s_completionPending) return;
+    auto& writes = completionWrites();
+    std::size_t finished = 0;
+    for (const auto& write : writes) {
+        if (write.wait_for(std::chrono::seconds(0)) != std::future_status::ready) break;
+        bool saved = false;
+        try {
+            saved = write.get();
+        } catch (...) {
+            // Treat an unexpected writer exception like any other failed save.
+        }
+        if (!saved) warnCompletionSaveFailed(st);
+        ++finished;
+    }
+    writes.erase(writes.begin(), writes.begin() + finished);
+    s_completionPending = !writes.empty();
+}
+
+void finishWizard(AppState& st);
 
 // Steps: 0 = power the copilot, 1 = live test, 2 = starting workspace.
 constexpr int kStepCount = 3;
@@ -204,8 +267,18 @@ void beginValidatedKeySave(AppState& st) {
 void drawPowerStep(AppState& st) {
     const ExternalProviderSignInStatus oauth = pollExternalProviderSignIn(st);
 
-    ImGui::TextUnformatted("Choose how the copilot is powered");
-    dimWrapped("Bring your own AI: sign in to a subscription you already pay for, or paste a provider API key.");
+    ImGui::TextUnformatted("Start modeling locally");
+    dimWrapped("Local CAD needs no account, API key, or internet connection.");
+    if (kit::primaryButton("Start without an account", true, nullptr,
+                           ImVec2(-1, 42.0f * uiScale))) {
+        s_wizard.chosenWorkspace = 0;  // Model workspace
+        finishWizard(st);
+        return;
+    }
+    ImGui::Dummy(ImVec2(0, 8.0f * uiScale));
+    ImGui::Separator();
+    ImGui::TextUnformatted("Optional: set up Copilot");
+    dimWrapped("Connect an AI provider now, or later in Settings > Providers.");
     ImGui::Dummy(ImVec2(0, 6.0f * uiScale));
 
     if (beginCard("##onboarding_oauth")) {
@@ -397,22 +470,18 @@ void drawWorkspaceStep() {
     kit::popDensity();
 }
 
-bool finishWizard(AppState& st) {
+void finishWizard(AppState& st) {
     const char* workspace = s_wizard.chosenWorkspace >= 0
                                 ? kWorkspaces[s_wizard.chosenWorkspace].configName
                                 : nullptr;
-    if (!persistOnboardingCompletion(workspace)) {
-        s_wizard.persistError = "Chudware could not save setup progress. Your existing config was left unchanged.";
-        return false;
-    }
+    queueCompletion(st, workspace);
     if (s_wizard.chosenWorkspace >= 0)
         st.activeWorkspace = kWorkspaces[s_wizard.chosenWorkspace].workspace;
-    s_wizard.completedVersion = kOnboardingVersion;
+    s_wizard.completedVersion = kOnboardingVersion;  // Session only until the write succeeds.
     s_wizard.open = false;
     s_wizard.requestOpen = false;
-    s_wizard.persistError.clear();
+    std::memset(s_wizard.key, 0, sizeof(s_wizard.key));
     ImGui::CloseCurrentPopup();
-    return true;
 }
 
 void drawFooter(AppState& st) {
@@ -435,11 +504,6 @@ void drawFooter(AppState& st) {
         if (s_wizard.step < kLastStep) ++s_wizard.step;
         else finishWizard(st);
     }
-    if (!s_wizard.persistError.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, Palette::toU32(palette.statusErr));
-        ImGui::TextWrapped("%s", s_wizard.persistError.c_str());
-        ImGui::PopStyleColor();
-    }
 }
 
 }  // namespace
@@ -456,6 +520,10 @@ bool persistOnboardingCompletion(const char* startingWorkspace) {
     });
 }
 
+bool onboardingCompletionWritePending() {
+    return s_completionPending;
+}
+
 void forceOnboardingForScenario(int step) {
     s_wizard.requestOpen = true;
     s_wizard.open = true;
@@ -463,6 +531,8 @@ void forceOnboardingForScenario(int step) {
 }
 
 void drawOnboarding(AppState& st, bool appBusy) {
+    // Keep draining after the wizard closes. This must run even if the modal is not open.
+    pollCompletion(st);
     // The gateway already authenticates web users. This wizard provisions desktop
     // provider access; it must never open while browser state is loading.
     if (webBuild()) return;
@@ -514,7 +584,7 @@ void drawOnboarding(AppState& st, bool appBusy) {
         default: drawWorkspaceStep(); break;
     }
     ImGui::EndChild();
-    drawFooter(st);
+    if (s_wizard.open) drawFooter(st);
     ImGui::EndPopup();
 }
 

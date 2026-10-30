@@ -52,6 +52,8 @@ endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(MSVC)
   add_compile_options(/utf-8 /MP)
+  # JSON-heavy document persistence exceeds the normal COFF section count.
+  set_source_files_properties(doc/session.cpp PROPERTIES COMPILE_OPTIONS /bigobj)
 endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")

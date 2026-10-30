@@ -621,6 +621,8 @@ if(WIN32)
   # speed bump against casual patching, not an anti-tamper claim.
   if(MSVC)
     target_link_options(Chudware PRIVATE $<$<CONFIG:Release>:/OPT:REF /OPT:ICF>)
+    # Real-UI scenarios instantiate enough JSON code to exceed COFF's section limit.
+    set_source_files_properties(src/ui/scenarios.cpp PROPERTIES COMPILE_OPTIONS /bigobj)
     # MSVC 14.51 (VS 2026): UCRT <cmath> is missing C99 float math declarations in the
     # global namespace; force-include the shim on C++ TUs only (see extern/fix_math.h).
     # Do NOT quote the path inside /FI — under Ninja+MSVC the quotes become part of the

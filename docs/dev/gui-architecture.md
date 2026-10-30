@@ -47,6 +47,23 @@ These files are shared by many features; change them deliberately and keep edits
 - Streaming logs stick to the bottom via `ui::chatLogStickToBottom("<region id>")` with a
   unique id per surface (two surfaces sharing an id fight over the flag).
 
+## First-run entry and diagnostics
+
+Desktop onboarding offers **Start without an account** as the immediate path to Model:
+local CAD needs no account, API key, or internet connection. Copilot provider sign-in and
+testing are optional during setup and remain available through Settings → Providers.
+Completing the wizard marks the current session complete immediately; its durable config
+merge runs on a background worker. Completion writes are serialized, with the latest queued
+workspace choice winning, and are polled every frame even after the modal closes. A failed
+write warns the user without blocking CAD; onboarding may appear again on the next launch.
+The config-corruption warning drain waits until that background write finishes because it
+shares the config-writer lock. The public persistence helper remains synchronous for
+callers that need to know when the write has completed.
+
+Tab-switch timings go to `AppState::addLog` and the in-app console, not unconditionally to
+stderr on the GUI thread. `CHUDWARE_LOG_FILE` can opt into the existing file tee when
+diagnosing an issue; that tee itself performs file I/O.
+
 ## Verification: lint and the scenario harness
 
 ```bash
@@ -145,6 +162,8 @@ feature ops consume it. Background tabs keep their parsed mesh on `DocSession::c
   the clear region between the overlay columns each frame and calls
   `Renderer::setFramingRegion(shiftX, shiftY, scale)` (a lens shift; picking and overlays
   follow). Wheel/area zoom pivot on that region's centre.
+- **Focus and popups.** A deferred viewport focus request remains pending while any popup is
+  open at any level; applying it earlier can dismiss first-run or recovery modals.
 - Pane controls that stand for a face call `ui::claimViewportHoverFace(body, face)` every
   hovered frame; UI code never writes `AppState::hover` directly.
 - **CAM overlays** are drawn by `viewport_panel.cpp` through `Overlays` inside the renderer's

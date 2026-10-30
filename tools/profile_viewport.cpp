@@ -504,7 +504,7 @@ Result runMode(const Options& o, const std::string& mode, std::ostream* hits) {
     facesOnly = false;
     stage("full-topology-restored");
     auto badCam = cam;
-    badCam.ssWidth = 0;
+    badCam.vpWidth = badCam.ssWidth = 0;  // Neither final pixels nor legacy fallback is drawable.
     guard("failed-render-return", !pass.render(badCam));
     // Old code leaves a readable stale frame here; report it without contaminating A/B hit CSVs.
     unrenderedGuard("failed-render-invalidates");

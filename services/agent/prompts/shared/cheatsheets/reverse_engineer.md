@@ -189,8 +189,10 @@ STEP 4 — RECONSTRUCT
   final pass and continue polling until done or failed. Brush exports splats, not a mesh.
   reveng_splat_to_mesh(session_id, method="auto") uses Gaussian-depth TSDF only when matching
   undistorted training poses are proven; without them it returns a Poisson fallback and
-  fallback_reason. method="poisson" explicitly selects the center-based method. Both are
-  approximate: examine the mesh for sheets/holes and independently measure critical features.
+  fallback_reason. method="poisson" explicitly selects the center-based method. The TSDF fuses
+  the whole splat's median depth from up to 120 views, drops the plane the subject stands on
+  (remove_floor=false for a flat subject) and takes minutes. Both are approximate: examine
+  the mesh for sheets/holes and independently measure critical features.
   What the stages mean:
   * SPARSE — structure-from-motion (COLMAP). Solves where each camera was and produces a sparse
     point cloud. If fewer than 60% register, a feed-forward fallback is attempted but only

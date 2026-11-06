@@ -1071,3 +1071,45 @@ transport pins `wait=false`; the MCP default stays `wait=true` (blocking, full r
   when no `exact` / `strong` candidate or standard part was found. The library flow then
   returns `{ok, session_id, part_ref, model_present: false, existing_models, standard_part,
   hint}`; `force_build=true` skips the search.
+
+## 21. Gaussian median-depth fusion — v8 amendment (2026-11-05)
+
+This amendment supersedes the TSDF details of §17 for `reveng_splat_to_mesh` and the
+reconstruct pipeline's splat fallback; method selection, pruning and the `prune`,
+`points_path` and `pruned_splat_path` results are unchanged.
+
+- Region: the TSDF renders every Gaussian of the raw splat inside the subject bounds, the
+  pruned subject's 0.5-99.5 percentile box grown by 15 % of its largest side. Pruning
+  only fixes that region; no splat the optimizer used to form a surface is dropped.
+- Depth: up to 120 registered views (greedy coverage of viewing direction and distance)
+  are rendered at 960 px on the long side in parallel worker processes. A pixel's depth
+  is where transmittance crosses 1/2, using each footprint's ray-conditional depth; it is
+  located with two levels of per-pixel optical-depth histograms (2048 depth cells), so it
+  does not depend on splat order. Transmittance that never reaches 1/2 is no depth.
+- Subject: a pixel is fused when its surface lies inside the bounds, more than three times
+  the plane noise above the support plane (when `remove_floor` is true), is seen within 80°
+  of its normal, is not next to a depth jump, a hole or the silhouette, and is reproduced
+  by at least two of its six nearest similar-direction views. The support plane is the most
+  populated of up to five RANSAC planes that the cameras see from one side, with more
+  material on that side than behind it, and at least a fifth of whose inliers have no
+  material above them; otherwise there is none and `support_plane` is `null`.
+- Fusion: Open3D `VoxelBlockGrid` (CUDA when available), 4-voxel truncation, colors from
+  the dataset's undistorted photographs. The voxel defaults to 1.5 times the median pixel
+  footprint on the subject. Vertices that at least three views, and 30 % of the views that
+  see them, look through are removed. Kept components are the largest and those within
+  2 % of its extent, each at least 1 % of its size; with a support plane, components that
+  never rise ten noise levels (or eight voxels) above it are dropped.
+- Results add `support_plane` (`{normal, offset, noise}` or `null`), `selected_views`,
+  `render_workers`, `fragments`, `render_seconds`, `subject_pixels`,
+  `inconsistent_pixels`, `pixel_footprint`, `voxel_size`, `carved_vertices`, and
+  component counts. The wall-clock budget is 1500 s; the MCP call timeout is 1800 s.
+- Background meshing: `reveng_splat_to_mesh(path_or_session, ..., wait=true)`. For a
+  session, `wait=false` holds the session claim, returns `{ok, session_id, pending: true}`
+  at once and records `session.mesh_job` = `{status: "running", started_at}`, then
+  `"done"` (adding `finished_at`, `mesh_path`, `raw_mesh_path`, `points_path`,
+  `pruned_splat_path`, `method`, `units`, `vertices`, `triangles`, `voxel_size`,
+  `support_plane`, and `fallback_reason` / `warning` when present) or `"failed"` (with
+  `error`), and only then releases the claim. A file path with `wait=false` is refused
+  (`reason: "wait_false_requires_session"`). The GUI worker transport pins `wait=false`
+  because worker stdio dispatch is serialized. `get_reveng_session` reports a `running`
+  job whose session claim is gone as `failed` with an `interrupted` error.

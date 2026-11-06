@@ -69,7 +69,8 @@ Lane B ends in geometry, so once a session produces a solid the Lane A tools
    Separate Brush job: reveng_start_splat → reveng_splat_status → reveng_finish_splat,
    then poll status to completion. Brush exports no mesh. reveng_splat_to_mesh(method="auto")
    uses TSDF only with proven matching undistorted poses, otherwise Poisson and fallback_reason;
-   explicit method="poisson" selects that fallback. Both surfaces are approximate.
+   explicit method="poisson" selects that fallback. TSDF fuses the full splat's median depth
+   from up to 120 views and drops the support plane (minutes). Both surfaces are approximate.
    session.sfm_dataset (get_reveng_session) pairs the undistorted sparse_dir + images_dir and
    reports registered, points3D, mean_reprojection_error_px and cameras. Analyse only that pair.
 5. reveng_set_scale(session_id, method, ...)    aruco_mat | two_point | known_dim

@@ -128,6 +128,7 @@ struct ShellState {
     SourceFile pendingSourceKind = SourceFile::Other;
     uint64_t sourceRequestSerial = 0;
     bool splatActionPending = false, splatActionError = false;
+    std::string meshJobFinished;  // finished_at of the last session.mesh_job already reported
     int splatExportFormat = 0;
     float splatMinOpacity = 0.5f;
     bool splatAutoOpacity = true;
@@ -1045,6 +1046,33 @@ void loadSessionDetail(AppState& st, bool force = false) {
         // session.reference (§2) — the last existing-model search and the chosen model.
         if (sess.contains("reference") && sess["reference"].is_object())
             mirrorReference(sess["reference"]);
+
+        // session.mesh_job — background reveng_splat_to_mesh (running → done | failed).
+        if (sess.contains("mesh_job") && sess["mesh_job"].is_object()) {
+            const auto& job = sess["mesh_job"];
+            const std::string status = job.value("status", std::string());
+            auto& sh = SH();
+            if (status == "running") {
+                sh.splatActionPending = true;
+                sh.splatActionError = false;
+                if (sh.splatActionMsg.empty())
+                    sh.splatActionMsg = "Extracting an approximate mesh in the background...";
+            } else if ((status == "done" || status == "failed") &&
+                       job.value("finished_at", std::string()) != sh.meshJobFinished) {
+                // Report only a job this view was waiting for, not one finished earlier.
+                const bool waiting = sh.splatActionPending;
+                sh.meshJobFinished = job.value("finished_at", std::string());
+                if (waiting) {
+                    sh.splatActionPending = false;
+                    sh.splatActionError = status == "failed";
+                    sh.splatActionMsg = status == "failed"
+                        ? job.value("error", std::string("Mesh extraction failed."))
+                        : "Pruned point cloud saved: " + job.value("points_path", std::string()) +
+                          "  Approximate mesh: " + job.value("mesh_path", std::string());
+                    S().lastListT = -100.0;
+                }
+            }
+        }
 
         // Pick the intake lane ONCE per session from session.lane, so reopening a reference
         // session lands on its search, but the user's own lane switch is never overridden by
@@ -2182,19 +2210,18 @@ void drawGaussianPanel(AppState& st) {
                 [sid, epoch](const core::RpcResult& r) {
                     if (!selectedSession(sid) || SH().sessionEpoch != epoch) return;
                     auto& sh2 = SH();
-                    sh2.splatActionPending = false;
                     if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+                        sh2.splatActionPending = false;
                         sh2.splatActionError = true;
                         sh2.splatActionMsg = r.ok && r.result.is_object()
                             ? r.result.value("reason", std::string("Mesh extraction failed."))
                             : (r.err.empty() ? std::string("Mesh extraction failed.") : r.err);
                         return;
                     }
-                    sh2.splatActionMsg = "Pruned point cloud saved: " +
-                        r.result.value("points_path", std::string()) + "  Approximate mesh: " +
-                        r.result.value("mesh_path", std::string());
+                    // The worker meshes in the background (wait=false is pinned for the GUI);
+                    // session.mesh_job reports the outcome through the session detail poll.
+                    sh2.splatActionMsg = "Extracting an approximate mesh in the background...";
                     S().lastDetailT = -100.0;
-                    S().lastListT = -100.0;
                 }, core::kLongEngineCallTimeoutMs);
         }
         static const char* formats[] = {"Gaussian PLY", ".splat"};
@@ -3330,6 +3357,7 @@ void resetForSessionChange(RevEngState& s) {
     SH().splatActionPending = false;
     SH().splatActionError = false;
     SH().splatActionMsg.clear();
+    SH().meshJobFinished.clear();
     SH().gaussianRight = {1, 0, 0};
     SH().gaussianUp = {0, 1, 0};
     SH().gaussianBack = {0, 0, 1};

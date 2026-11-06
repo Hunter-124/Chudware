@@ -2893,8 +2893,8 @@
    "prompt_note": "Nonblocking durable job status and latest immutable Gaussian preview. A preview during training is not a finished full-quality result."
   },
   "reveng_splat_to_mesh": {
-   "prompt_note": "Prunes the splat to its subject first (adaptive opacity, camera-orbit region, floor, floaters) and writes points_path and pruned_splat_path, then meshes: auto uses TSDF only with proven matching undistorted poses, otherwise Poisson with fallback_reason; method='poisson' is explicit. No method makes Gaussian geometry a metrology-grade measurement.",
-   "timeout_s": 300
+   "prompt_note": "Prunes the splat to its subject first (adaptive opacity, camera-orbit region, floor, floaters) and writes points_path and pruned_splat_path, then meshes: auto uses TSDF only with proven matching undistorted poses, otherwise Poisson with fallback_reason; method='poisson' is explicit. TSDF fuses the full splat's median depth from up to 120 views, removes the support plane (remove_floor) and takes minutes. No method makes Gaussian geometry a metrology-grade measurement.",
+   "timeout_s": 1800
   },
   "reveng_start_session": {
    "prompt_note": "First call of any RE flow; search for existing models before research or building. part_ref can seed photos/datasheet from the parts hub."

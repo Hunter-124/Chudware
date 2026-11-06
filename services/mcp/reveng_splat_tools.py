@@ -219,9 +219,107 @@ def register_reveng_splat_tools(mcp) -> None:
         except Exception as exc:
             return _err(exc)
 
+    def _mesh(src: Path, dest: Path, session_id: str | None, sparse_dir, kwargs: dict) -> dict:
+        """Mesh one splat; with a session, attach the raw mesh. The caller holds the claim."""
+        cloud = load_splat(src)
+        if sparse_dir:
+            kwargs = {**kwargs, "sparse_dir": sparse_dir}
+        try:
+            result = splat_to_mesh(cloud, dest, **kwargs)
+            if not result.get("ok"):
+                dest.unlink(missing_ok=True)
+                return result
+            if not dest.is_file():
+                raise ValueError("mesher returned no mesh artifact")
+            session = None
+            if session_id is not None:
+                # Re-read: fusion runs for minutes and other writers may have saved meanwhile.
+                session = _load_session(session_id)
+                if session is None:
+                    raise ValueError("session disappeared while meshing")
+                _invalidate_downstream(session)
+                artifacts = session.setdefault("artifacts", {})
+                artifacts.pop("mesh_materialization", None)
+                artifacts.update(mesh_path=str(dest.resolve()), raw_mesh_path=str(dest.resolve()),
+                                 mesh_units="reconstruction", mesh_transform_applied=False)
+                session.setdefault("honesty", {})["approximate"] = True
+                session.setdefault("stages", {})["reconstruct"] = "done"
+                session.setdefault("provenance", []).append({"step": "splat_to_mesh", "source": str(src),
+                                                              "mesh_path": str(dest.resolve()),
+                                                              "method": result.get("method", kwargs["method"]),
+                                                              "approximate": True,
+                                                              "ts": _now_iso()})
+                _save_session(session)
+        except Exception:
+            dest.unlink(missing_ok=True)
+            raise
+        result["raw_mesh_path"] = str(dest.resolve())
+        result["mesh_path"] = str(dest.resolve())
+        result["units"] = "reconstruction"
+        if session is not None and (session.get("recon_transform") or {}).get("confirmed"):
+            try:
+                metric_path, failure = _metric_mesh(session)
+                if failure:
+                    result["warning"] = "Metric mesh materialization failed; raw reconstruction units retained: " + str(failure)
+                elif metric_path:
+                    result["mesh_path"] = str(Path(metric_path).resolve())
+                    result["units"] = "mm"
+            except Exception as exc:
+                result["warning"] = "Metric mesh materialization failed; raw reconstruction units retained: " + str(exc)
+        result["source_format"] = cloud.source_format
+        result["lossy"] = list(cloud.lossy)
+        if session_id is not None:
+            result["session_id"] = session_id
+        return result
+
+    def _mesh_in_background(session_id: str, reservation: str, src: Path, dest: Path,
+                            sparse_dir, kwargs: dict) -> None:
+        """Run ``_mesh`` off the request thread and record the outcome as session.mesh_job.
+
+        Worker stdio dispatch is serialized, so a conversion lasting minutes would stall
+        every other GUI request. The session claim is held until the job is recorded.
+        """
+        import contextvars
+        import json
+        import threading
+
+        started = _now_iso()
+
+        def run() -> None:
+            try:
+                try:
+                    result = _mesh(src, dest, session_id, sparse_dir, kwargs)
+                except Exception as exc:  # noqa: BLE001 — reported through the session
+                    result = json.loads(_err(exc))
+                job = {"status": "done" if result.get("ok") else "failed", "started_at": started,
+                       "finished_at": _now_iso()}
+                if result.get("ok"):
+                    job.update({key: result[key] for key in
+                                ("mesh_path", "raw_mesh_path", "points_path", "pruned_splat_path",
+                                 "method", "units", "vertices", "triangles", "voxel_size",
+                                 "support_plane", "fallback_reason", "warning")
+                                if key in result})
+                else:
+                    job["error"] = " — ".join(str(result[key]) for key in ("reason", "hint", "error")
+                                              if result.get(key)) or "mesh extraction failed"
+                current = _load_session(session_id)
+                if current is not None:
+                    current["mesh_job"] = job
+                    _save_session(current)
+            except Exception:  # noqa: BLE001 — a daemon thread has no caller to report to
+                import logging
+                logging.getLogger(__name__).exception("splat meshing for %s failed", session_id)
+            finally:
+                _release_mission(session_id, reservation)
+
+        context = contextvars.copy_context()   # carries the caller's owner / project binding
+        threading.Thread(target=context.run, args=(run,), name=f"reveng-mesh-{session_id}",
+                         daemon=True).start()
+
     @mcp.tool()
     def reveng_splat_to_mesh(path_or_session: str, min_opacity: Optional[float] = None,
-                             method: str = "auto", remove_floor: bool = True) -> str:
+                             method: str = "auto", remove_floor: bool = True,
+                             wait: bool = True) -> str:
         """Prune a Gaussian reconstruction to its subject, then extract a point cloud and mesh.
 
         Pruning drops low-opacity haze, everything outside the camera orbit, oversized
@@ -231,7 +329,12 @@ def register_reveng_splat_tools(mcp) -> None:
         discards almost every splat of a Brush reconstruction, whose opacities are low.
         ``auto`` uses matching registered views for depth fusion when available,
         otherwise reports a Poisson fallback. Explicit ``tsdf``, ``poisson``
-        and ``ball_pivoting`` methods are also available.
+        and ``ball_pivoting`` methods are also available. Depth fusion renders the
+        whole splat's median depth inside the pruned subject's bounds from up to 120
+        registered views, drops the support plane the subject stands on
+        (``remove_floor``), steep views, depth jumps and surfaces only one view
+        renders, and colors the mesh from the dataset photographs; it runs for
+        minutes, in parallel worker processes.
         A session's raw splat is used so its persisted similarity transform is
         applied only once by the CAD fitting pipeline. The raw mesh is attached
         to the session with explicit reconstruction-unit metadata.
@@ -241,18 +344,24 @@ def register_reveng_splat_tools(mcp) -> None:
         the pruned Gaussians, both in reconstruction units. Gaussian centers are
         not a measured physical surface, hidden surfaces cannot be recovered,
         and splat-only dimensions must be independently calibrated/verified.
+        For a session, ``wait=False`` returns ``{ok, session_id, pending: true}`` at once;
+        get_reveng_session's ``session.mesh_job`` then goes ``running`` → ``done`` (with
+        mesh_path, points_path, ...) or ``failed`` (with ``error``).
         Open3D must be provisioned in the services runtime.
         """
         reservation = None
         try:
-            session = None
             sparse_dir = None
+            session_id = None
             try:
                 candidate = _rc.cell_path(path_or_session)
                 is_file = candidate.is_file()
             except (ValueError, OSError):
                 is_file = False
             if is_file:
+                if not wait:
+                    return _dumps({"ok": False, "reason": "wait_false_requires_session",
+                                   "hint": "Background meshing reports through a session; pass a session ID."})
                 src = _input_path(path_or_session)
                 dest = src.with_name(f"{src.stem}-approx-{uuid.uuid4().hex[:8]}.ply")
             else:
@@ -265,6 +374,7 @@ def register_reveng_splat_tools(mcp) -> None:
                 session = _load_session(path_or_session)
                 if session is None:
                     return _dumps({"ok": False, "reason": "session_not_found_or_splat_path_invalid"})
+                session_id = path_or_session
                 root = _session_path(path_or_session)
                 artifacts = session.get("artifacts") or {}
                 raw = artifacts.get("raw_splat_path") or artifacts.get("splat_path")
@@ -275,52 +385,14 @@ def register_reveng_splat_tools(mcp) -> None:
                 mesh_dir.mkdir(parents=True, exist_ok=True)
                 dest = mesh_dir / ("splat-approx-" + uuid.uuid4().hex + ".ply")
                 sparse_dir = _splat_sparse_dir(session, str(src))
-            cloud = load_splat(src)
-            try:
-                kwargs = {"method": method, "min_opacity": min_opacity, "remove_floor": remove_floor}
-                if sparse_dir:
-                    kwargs["sparse_dir"] = sparse_dir
-                result = splat_to_mesh(cloud, dest, **kwargs)
-                if not result.get("ok"):
-                    dest.unlink(missing_ok=True)
-                    return _dumps(result)
-                if not dest.is_file():
-                    raise ValueError("mesher returned no mesh artifact")
-                if session is not None:
-                    _invalidate_downstream(session)
-                    artifacts = session.setdefault("artifacts", {})
-                    artifacts.pop("mesh_materialization", None)
-                    artifacts.update(mesh_path=str(dest.resolve()), raw_mesh_path=str(dest.resolve()),
-                                     mesh_units="reconstruction", mesh_transform_applied=False)
-                    session.setdefault("honesty", {})["approximate"] = True
-                    session.setdefault("stages", {})["reconstruct"] = "done"
-                    session.setdefault("provenance", []).append({"step": "splat_to_mesh", "source": str(src),
-                                                                  "mesh_path": str(dest.resolve()),
-                                                                  "method": result.get("method", method),
-                                                                  "approximate": True,
-                                                                  "ts": _now_iso()})
-                    _save_session(session)
-            except Exception:
-                dest.unlink(missing_ok=True)
-                raise
-            result["raw_mesh_path"] = str(dest.resolve())
-            result["mesh_path"] = str(dest.resolve())
-            result["units"] = "reconstruction"
-            if session is not None and (session.get("recon_transform") or {}).get("confirmed"):
-                try:
-                    metric_path, failure = _metric_mesh(session)
-                    if failure:
-                        result["warning"] = "Metric mesh materialization failed; raw reconstruction units retained: " + str(failure)
-                    elif metric_path:
-                        result["mesh_path"] = str(Path(metric_path).resolve())
-                        result["units"] = "mm"
-                except Exception as exc:
-                    result["warning"] = "Metric mesh materialization failed; raw reconstruction units retained: " + str(exc)
-            result["source_format"] = cloud.source_format
-            result["lossy"] = list(cloud.lossy)
-            if session is not None:
-                result["session_id"] = path_or_session
-            return _dumps(result)
+            kwargs = {"method": method, "min_opacity": min_opacity, "remove_floor": remove_floor}
+            if not wait:
+                session["mesh_job"] = {"status": "running", "started_at": _now_iso()}
+                _save_session(session)
+                _mesh_in_background(session_id, reservation, src, dest, sparse_dir, kwargs)
+                reservation = None  # Released by the background job.
+                return _dumps({"ok": True, "session_id": session_id, "pending": True})
+            return _dumps(_mesh(src, dest, session_id, sparse_dir, kwargs))
         except Exception as exc:
             return _err(exc)
         finally:

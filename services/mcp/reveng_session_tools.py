@@ -25,6 +25,7 @@ from .reveng_common import (
     _load_session,
     _list_sessions,
     _make_session,
+    _mission_running,
     _new_session_id,
     _not_provisioned,
     _start_reference_search,
@@ -815,6 +816,14 @@ def register_reveng_session_tools(mcp: FastMCP) -> None:
         s = _load_session(session_id)
         if s is None:
             return _dumps({"ok": False, "reason": f"session {session_id!r} not found"})
+        job = s.get("mesh_job")
+        if isinstance(job, dict) and job.get("status") == "running" and not str(
+                _mission_running(session_id) or "").startswith("splat_edit_"):
+            # A background mesh holds its session claim until it records the outcome, so a
+            # running job without that claim died with an earlier worker.
+            job.update(status="failed", finished_at=_now_iso(),
+                       error="interrupted: the worker stopped before meshing finished")
+            _save_session(s)
         source_images = _source_image_gallery(session_id, s)
         return _dumps({"ok": True, "session": s, "source_images": source_images})
 

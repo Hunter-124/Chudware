@@ -200,10 +200,11 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Prunes the splat to its subject first (adaptive opacity, camera-orbit region, floor, "
             "floaters) and writes points_path and pruned_splat_path, then meshes: auto uses TSDF "
             "only with proven matching undistorted poses, otherwise Poisson with fallback_reason; "
-            "method='poisson' is explicit. No method makes Gaussian geometry a metrology-grade "
-            "measurement."
+            "method='poisson' is explicit. TSDF fuses the full splat's median depth from up to "
+            "120 views, removes the support plane (remove_floor) and takes minutes. No method "
+            "makes Gaussian geometry a metrology-grade measurement."
         ),
-        "timeout_s": 300,
+        "timeout_s": 1800,
     },
     "reveng_sparse_preview": {
         "prompt_note": (

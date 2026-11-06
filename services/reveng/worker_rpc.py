@@ -369,12 +369,14 @@ _BRIDGED_TOOLS: tuple[str, ...] = (
 # Transport-specific defaults. The RE tab adds the collected photos to the session
 # itself (via reveng_add_images), so the GUI must NOT trigger photogrammetry on
 # stop — whereas an agent calling the MCP tool directly still gets the historical
-# run_reconstruction=True. The CAD-library search takes a minute or more and worker
-# stdio is serialized, so the GUI runs it in the background and polls the session.
+# run_reconstruction=True. The CAD-library search takes a minute or more, Gaussian
+# depth-fusion meshing several, and worker stdio is serialized, so the GUI runs both
+# in the background and polls the session.
 # Same implementation, same registry, one pinned default each.
 _PINNED_ARGS: dict[str, dict] = {
     "stop_capture_session": {"run_reconstruction": False},
     "reveng_find_models": {"wait": False},
+    "reveng_splat_to_mesh": {"wait": False},
 }
 
 

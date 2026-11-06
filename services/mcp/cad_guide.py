@@ -1686,6 +1686,8 @@ def cad_guide_text(topic: str = "") -> str:
             "approximate=True and is labeled approximate. For a PLY/STL/OBJ file use "
             "add_mesh_reference(doc_id, path, transform=...), where transform specifies "
             "mm_per_unit, rotation and translation_mm; omitted transform assumes mm and identity. "
+            "import_part or a GUI open of an open STL/OBJ/PLY over 50,000 triangles creates such a "
+            "reference (identity transform) instead of a body. "
             "list_mesh_references(doc_id) reports ids and bounds; "
             "update_mesh_reference(doc_id, id, visible=False) hides it, and visible=True shows it. "
             "Update placement, opacity, color or name as needed; remove_mesh_reference deletes it. "

@@ -831,6 +831,34 @@ TEST_CASE("mesh sewing preserves disconnected solids and nested cavities") {
     }
 }
 
+// The sewing limit only applies to soups that need sewing: a closed tetrahedron over the limit
+// still takes the direct solid lane, while the same soup opened is refused rather than sewn.
+TEST_CASE("mesh_to_shape refuses to sew an open soup over the sewing limit") {
+    using chudware::doc::MeshData;
+    using chudware::doc::mesh_to_shape;
+    MeshData closed;
+    closed.verts = {0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3};
+    closed.tris = {0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3};
+    const TopoDS_Shape solid = mesh_to_shape(closed, 1);
+    REQUIRE_FALSE(solid.IsNull());
+    CHECK(TopExp_Explorer(solid, TopAbs_SOLID).More());
+    CHECK(vol(solid) == doctest::Approx(1.0).epsilon(1e-9));
+
+    MeshData open = closed;
+    open.tris.resize(open.tris.size() - 3);
+    try {
+        mesh_to_shape(open, 2);
+        FAIL("an open soup over the sewing limit was sewn");
+    } catch (const chudware::doc::OpError& e) {
+        CHECK(e.code == "mesh_too_large");
+        CHECK(e.detail.at("triangles") == 3);
+        CHECK(e.detail.at("limit") == 2);
+    }
+    const TopoDS_Shape shell = mesh_to_shape(open, 3);
+    REQUIRE_FALSE(shell.IsNull());
+    CHECK_FALSE(TopExp_Explorer(shell, TopAbs_SOLID).More());
+}
+
 // A faceted cylinder wound INSIDE-OUT — exactly the shape a SolidWorks saved-display import
 // arrived in (signed volume -374963 mm³ on a 375017 mm³ spacer, so eval_mass was 28% wrong).
 // mesh_to_shape must hand back a solid with POSITIVE volume, merge each coplanar facet set

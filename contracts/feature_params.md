@@ -866,3 +866,19 @@ change earlier frozen sections. The compiler is
 
 See [stepplus.md §25](stepplus.md#25-real-thread-geometry-cache-epoch) for
 cache invalidation and failed-rebuild persistence.
+
+## Large open mesh imports (append-only, 2026-11-06)
+
+Amends the `import` feature for mesh files. A mesh that is not one closed, consistently wound
+shell is sewn face by face, and sewing is super-linear in triangle count, so:
+
+- A mesh file (`stl`, `obj`, `ply`, `gltf`, `glb`) that needs sewing and has more than
+  `kMaxSewnMeshTriangles` (50,000, `core/doc/formats.h`) triangles MUST NOT be sewn.
+  `mesh_to_shape` refuses it with `OpError("mesh_too_large")`, details `{triangles, limit}`.
+- `doc_import_file` (File > Open, drag and drop, `doc_open` of a non-native path, `import_part`)
+  then adds an STL, OBJ or PLY as a mesh reference (`doc_mesh_ref_add` semantics, identity
+  transform, named after the file stem) instead of an `import` feature. The response carries
+  `import_fidelity: "mesh_reference"`, the reference `id`, `triangles`, `bbox_mm` and a
+  `warnings` entry. A NEW document that fails to take the reference is discarded.
+- glTF and GLB have no mesh-reference format and fail with `mesh_too_large`.
+- Closed single-shell meshes keep the direct solid lane at any size.

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -14,6 +15,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "doc/formats.h"
 #include "doc/session.h"
 #include "doc/stepplus.h"
 
@@ -589,4 +591,61 @@ TEST_CASE("reference-only part is nonempty and survives save and reopen") {
     CHECK(summary.at("mesh_reference_count") == 1);
     check_mesh(doc::doc_mesh_ref_mesh(id, {{"id", ref_id}}),
                {100, 200, 300, 100, 202, 300, 96, 200, 300, 100, 200, 306});
+}
+
+// A scan-sized open mesh used to be sewn face by face on open, which ran for hours inside the
+// shared engine. Over the sewing limit it opens as a reference instead: as a new part, and
+// imported into an existing part without touching its body.
+TEST_CASE("an open mesh over the sewing limit opens as a mesh reference") {
+    Fixture f;
+    constexpr int kCellsX = 159, kCellsY = 158;  // 50,244 triangles in an open grid
+    constexpr std::uint32_t kTriangles = 2u * kCellsX * kCellsY;
+    static_assert(kTriangles > doc::kMaxSewnMeshTriangles, "grid must exceed the sewing limit");
+    const fs::path stl = f.dir / "scan.stl";
+    {
+        std::ofstream out(stl, std::ios::binary);
+        const std::string header(80, ' ');
+        out.write(header.data(), 80);
+        out.write(reinterpret_cast<const char*>(&kTriangles), 4);
+        auto corner = [&](int x, int y) {
+            const float p[3] = {static_cast<float>(x), static_cast<float>(y), 0.0f};
+            out.write(reinterpret_cast<const char*>(p), sizeof(p));
+        };
+        const float normal[3] = {0.0f, 0.0f, 1.0f};
+        const std::uint16_t attribute = 0;
+        for (int x = 0; x < kCellsX; ++x)
+            for (int y = 0; y < kCellsY; ++y)
+                for (const auto& tri : {std::array<int, 6>{x, y, x + 1, y, x + 1, y + 1},
+                                        std::array<int, 6>{x, y, x + 1, y + 1, x, y + 1}}) {
+                    out.write(reinterpret_cast<const char*>(normal), sizeof(normal));
+                    for (int k = 0; k < 6; k += 2) corner(tri[k], tri[k + 1]);
+                    out.write(reinterpret_cast<const char*>(&attribute), 2);
+                }
+        REQUIRE(out.good());
+    }
+
+    const json opened = doc::doc_open(stl.string());
+    const std::string id = f.remember(opened);
+    CHECK(opened.at("ok") == true);
+    CHECK(opened.at("import_fidelity") == "mesh_reference");
+    CHECK(opened.at("triangles") == kTriangles);
+    REQUIRE(opened.at("warnings").size() == 1);
+    json summary = doc_summary(id);
+    CHECK(summary.at("feature_count") == 0);
+    CHECK(summary.at("mesh_reference_count") == 1);
+    json refs = doc::doc_mesh_ref_list(id).at("refs");
+    REQUIRE(refs.size() == 1);
+    CHECK(refs[0].at("name") == "scan");
+    CHECK(refs[0].at("triangles") == kTriangles);
+    check_bbox(refs[0].at("bbox_mm"), {0, 0, 0}, {kCellsX, kCellsY, 0});
+    CHECK(doc::doc_tessellate_bodies(id).empty());
+
+    const std::string part = f.box();
+    const json imported = doc::doc_import_file(stl.string(), part, false, "");
+    CHECK(imported.at("doc_id") == part);
+    CHECK(imported.at("import_fidelity") == "mesh_reference");
+    summary = doc_summary(part);
+    CHECK(summary.at("feature_count") == 1);
+    CHECK(summary.at("mesh_reference_count") == 1);
+    check_solid(part, kBoxVolume);
 }

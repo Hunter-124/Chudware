@@ -25,7 +25,8 @@ the heuristics NEVER hide evidence: unclaimed source faces are saved in a comple
 
 THE ONE-CALL PATH
   reverse_engineer(source) — source is a file path (STEP/IGES/BREP/STL/OBJ/…) or the doc_id of
-  an already-imported part. It imports (meshes are sewn to a solid), recognizes, rebuilds the
+  an already-imported part. It imports (meshes are sewn to a solid; an open mesh over 50,000
+  triangles only becomes a mesh reference, which has no body to recognize), recognizes, rebuilds the
   recognized features into a NEW part, and verifies EVERY batch with a boolean compare against
   the source. The new part is made current; the imported source doc stays open as the reference.
 

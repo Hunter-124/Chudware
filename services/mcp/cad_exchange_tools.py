@@ -269,7 +269,10 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         Lets you assemble components built or exported separately, or recover geometry from a file
         after a session reset. `into` = an existing doc_id to add the body to the CURRENT part
         (for assembly); omit it to open the file as a NEW part (made current). `as_solid` sews a
-        mesh (STL/OBJ/…) into a solid on import; B-rep formats already import as solids.
+        mesh (STL/OBJ/…) into a solid on import; B-rep formats already import as solids. An open
+        or non-manifold mesh over 50,000 triangles (a scan) is not sewn: STL/OBJ/PLY land as a
+        mesh reference instead (`import_fidelity="mesh_reference"`, see cad_guide('scan_reference')),
+        and glTF fails with `mesh_too_large`.
         Relative paths use the selected session workspace, not the worker's working
         directory. Without a configured workspace, supply an absolute path.
 

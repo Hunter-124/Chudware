@@ -10981,9 +10981,8 @@ std::uint64_t mesh_ref_nonnegative(const json& value, const char* name) {
 }
 }  // namespace
 
-json doc_mesh_ref_add(const std::string& doc_id, const json& args) {
-    DocLock lk;
-    Session& s = require_session(doc_id);
+// doc_mesh_ref_add on a session the caller's DocLock already holds.
+static json mesh_ref_add_locked(Session& s, const json& args) {
     mesh_ref_part(s);
     if (!args.is_object() || !args.contains("path") || !args["path"].is_string() ||
         args["path"].get_ref<const std::string&>().empty())
@@ -11120,6 +11119,11 @@ json doc_mesh_ref_add(const std::string& doc_id, const json& args) {
     response["triangles"] = triangles;
     response["bbox_mm"] = bbox;
     return response;
+}
+
+json doc_mesh_ref_add(const std::string& doc_id, const json& args) {
+    DocLock lk;
+    return mesh_ref_add_locked(require_session(doc_id), args);
 }
 
 json doc_mesh_ref_list(const std::string& doc_id) {
@@ -22159,6 +22163,25 @@ static std::string unique_feature_name(const Session& s, const std::string& base
     }
 }
 
+// A failed import into a NEW session removes it before the caller's DocLock releases it, so an
+// empty failed import can never be adopted as an opened document.
+struct FailedImportCleanup {
+    Session* target;
+    bool armed;
+    ~FailedImportCleanup() noexcept {
+        if (!armed) return;
+        try {
+            {
+                std::lock_guard<std::mutex> reg(g_registry_mtx);
+                auto it = g_sessions.find(target->doc_id);
+                if (it != g_sessions.end() && it->second.get() == target)
+                    g_sessions.erase(it);
+            }
+            chudware::aicm_handoff::release_doc(target->doc_id);
+        } catch (...) {}
+    }
+};
+
 json doc_import_file(const std::string& path, const std::string& into, bool as_solid,
                      const std::string& fmt, const json& body_select) {
     const std::string authored_path = native_policy::authored_reference(path);
@@ -22241,24 +22264,8 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
             ? new_part_session_locked(stem.empty() ? std::string("Imported") : stem)
             : require_session(into);
         // The new session is registered while its document lock is held. If any
-        // stage fails, remove it before releasing that lock so an empty failed
-        // import can never be adopted as an opened document.
-        struct FailedImportCleanup {
-            Session* target;
-            bool armed;
-            ~FailedImportCleanup() noexcept {
-                if (!armed) return;
-                try {
-                    {
-                        std::lock_guard<std::mutex> reg(g_registry_mtx);
-                        auto it = g_sessions.find(target->doc_id);
-                        if (it != g_sessions.end() && it->second.get() == target)
-                            g_sessions.erase(it);
-                    }
-                    chudware::aicm_handoff::release_doc(target->doc_id);
-                } catch (...) {}
-            }
-        } cleanup{&target, into.empty()};
+        // stage fails, remove it before releasing that lock.
+        FailedImportCleanup cleanup{&target, into.empty()};
         const std::string name = unique_feature_name(target, stem.empty() ? "OpenSCAD" : stem);
         json ops = json::array();
         if (params.contains("native_projection")) {
@@ -22334,6 +22341,7 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
     // provenance and a rebuild fallback. Fail-soft: if the read throws, we leave the
     // feature path-only (the compiler will then read the source as before).
     std::vector<std::string> import_warnings;
+    bool mesh_reference = false;
     try {
         int source_units = 0;
         auto bodies = import_bodies(import_path_, f, &import_warnings, &source_units);
@@ -22359,6 +22367,13 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
                 params["embedded_body_names"] = std::move(embedded_names);
             }
         }
+    } catch (const OpError& e) {
+        // A large open mesh (typically a scan) is refused by the sewing limit; STL/OBJ/PLY
+        // open as a mesh reference instead of a body. Other failures leave it path-only.
+        if (e.code == "mesh_too_large") {
+            if (f != "stl" && f != "obj" && f != "ply") throw;
+            mesh_reference = true;
+        }
     } catch (...) {
         // leave path-only; compiler falls back to source_path
     }
@@ -22367,6 +22382,19 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
         s = &require_session(into);  // append to an existing C++ session
     else
         s = &new_part_session_locked(stem.empty() ? std::string("Imported") : stem);
+    if (mesh_reference) {
+        FailedImportCleanup cleanup{s, into.empty()};
+        json resp = mesh_ref_add_locked(*s, {{"path", path}, {"name", stem}});
+        cleanup.armed = false;
+        resp["import_fidelity"] = "mesh_reference";
+        resp["warnings"] = json::array({
+            "Opened as a mesh reference (" + std::to_string(resp.value("triangles", 0)) +
+            " triangles): the mesh is open or not a single closed shell, and meshes over " +
+            std::to_string(kMaxSewnMeshTriangles) +
+            " triangles are not sewn into a body. Model against it, or close and simplify it "
+            "to import a body."});
+        return resp;
+    }
 
     // Uniquify the feature name against the target doc (Issue 10) so repeated imports of the
     // same file don't all share one name (and trip the duplicate-name warning every time).

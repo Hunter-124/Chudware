@@ -20,7 +20,9 @@
 // Windows COM -> STEP preferred for exact analytic B-rep; Parasolid still requires COM.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -135,8 +137,15 @@ std::vector<std::pair<std::string, MeshData>> read_mesh_raw(const std::string& p
 // Build a TopoDS_Shape from a triangle soup. A welded, closed, consistently wound single-
 // shell mesh becomes a SOLID directly, one planar face per coplanar triangle set (curved
 // regions stay faceted); any other soup is sewn into a shell and promoted to a SOLID when
-// the shell is closed (the "as_solid" path). Empty mesh -> a null shape.
-TopoDS_Shape mesh_to_shape(const MeshData& mesh);
+// the shell is closed (the "as_solid" path). Empty mesh -> a null shape. A soup that needs
+// sewing and has more than `max_sewn_triangles` triangles throws OpError("mesh_too_large").
+TopoDS_Shape mesh_to_shape(const MeshData& mesh,
+                           std::size_t max_sewn_triangles = std::numeric_limits<std::size_t>::max());
+
+// Sewing limit for opened/imported mesh files (STL/OBJ/PLY/glTF). Sewing is super-linear
+// in triangle count (an open 100k-triangle grid sews in 25 s, a scan of that size far
+// slower), so a larger open or non-manifold mesh is refused instead of tying up the engine.
+constexpr std::size_t kMaxSewnMeshTriangles = 50000;
 
 // Write surviving solid and non-solid bodies to `path` in `fmt`. Supported: step, iges,
 // brep, stl, obj, ply, gltf, glb, 3mf, 3dm, dxf, dwg, sat (mesh formats tessellate at `tess`).

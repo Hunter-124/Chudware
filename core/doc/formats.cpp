@@ -3244,7 +3244,7 @@ TopoDS_Shape closed_mesh_solid(const MeshData& mesh, const MeshSmoothNormals& sn
 
 }  // namespace
 
-TopoDS_Shape mesh_to_shape(const MeshData& mesh) {
+TopoDS_Shape mesh_to_shape(const MeshData& mesh, std::size_t max_sewn_triangles) {
     if (mesh.verts.size() % 3 != 0 || mesh.tris.size() % 3 != 0)
         throw OpError("import_failed", "Mesh has an incomplete vertex or triangle");
     if (!std::all_of(mesh.verts.begin(), mesh.verts.end(),
@@ -3266,12 +3266,18 @@ TopoDS_Shape mesh_to_shape(const MeshData& mesh) {
     } catch (const Standard_Failure&) {
         // fall through to sewing
     }
+    const std::size_t nt = mesh.triangle_count();
+    if (nt > max_sewn_triangles)
+        throw OpError("mesh_too_large",
+                      "Mesh is open or not a single closed shell and has " + std::to_string(nt) +
+                          " triangles; sewing more than " + std::to_string(max_sewn_triangles) +
+                          " such triangles into a body is not supported",
+                      {{"triangles", nt}, {"limit", max_sewn_triangles}});
     // Build one triangular FACE per triangle (degenerate ones dropped), sew them into a
     // shell, then promote to a SOLID when the shell is closed (the "as_solid" path). The
     // resulting B-rep carries a real volume/bbox so it flows through the import feature
     // exactly like a B-rep body.
     BRepBuilderAPI_Sewing sew(1e-6);
-    const std::size_t nt = mesh.triangle_count();
     int added = 0;
     for (std::size_t i = 0; i < nt; ++i) {
         const uint32_t a = mesh.tris[3 * i], b = mesh.tris[3 * i + 1], c = mesh.tris[3 * i + 2];
@@ -3984,7 +3990,7 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(
             if (mesh.triangle_count() == 0)
                 throw OpError("import_failed", "import: no triangles in '" + path + "'",
                               {{"path", path}, {"format", fmt}});
-            TopoDS_Shape shape = mesh_to_shape(mesh);
+            TopoDS_Shape shape = mesh_to_shape(mesh, kMaxSewnMeshTriangles);
             if (shape.IsNull())
                 throw OpError("import_failed",
                               "import: mesh in '" + path + "' could not be sewn into a body",
